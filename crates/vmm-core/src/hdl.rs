@@ -1,0 +1,388 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Safe wrapper over a bhyve VMM instance file descriptor.
+//!
+//! All kernel ioctls are exposed as typed, safe methods. The raw ioctl
+//! interface is intentionally kept private — callers should use the
+//! typed methods, and new operations should be added here rather than
+//! exposed via a generic ioctl escape hatch.
+
+use std::io::{Error, ErrorKind, Result};
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bhyve_api::{
+    ApiVersion, VmmCtlFd, VmmFd,
+    vm_create_req, VCF_RESERVOIR_MEM, VCF_TRACK_DIRTY,
+    vm_capability, vm_suspend, vm_memseg, vm_memmap,
+    vm_isa_irq, vm_lapic_msi, vm_rtc_data,
+    vmm_dirty_tracker,
+    vm_npt_operation, VNO_OP_SET_DIRTY, VNO_FLAG_BITMAP_IN,
+    VM_MEMMAP_F_WIRED, VM_MAX_SEG_NAMELEN,
+    ioctls,
+};
+
+use crate::mem::Prot;
+
+/// Options for creating a new VM instance.
+#[derive(Debug, Clone, Default)]
+pub struct CreateOpts {
+    /// Force creation even if a VM with this name already exists.
+    pub force: bool,
+    /// Allocate memory from the VMM reservoir.
+    pub use_reservoir: bool,
+    /// Enable dirty page tracking (required for live migration).
+    pub track_dirty: bool,
+}
+
+/// Handle to a bhyve VMM instance.
+///
+/// Wraps the kernel `/dev/vmm/{name}` file descriptor and provides safe
+/// typed methods for all VM operations. The raw ioctl interface is
+/// private — all operations must go through the methods on this type.
+pub struct VmmHdl {
+    inner: VmmFd,
+    name: String,
+}
+
+impl VmmHdl {
+    /// Create a new VM instance and open a handle to it.
+    pub fn create(name: &str, opts: &CreateOpts) -> Result<Self> {
+        let ctl = VmmCtlFd::open()?;
+
+        if opts.force {
+            // Best-effort destroy of any existing VM with this name.
+            // Failure is expected if no VM exists.
+            let _ = ctl.vm_destroy(name.as_bytes());
+        }
+
+        let mut req = vm_create_req::new(name.as_bytes())?;
+        if opts.use_reservoir {
+            req.flags |= VCF_RESERVOIR_MEM;
+        }
+        if opts.track_dirty {
+            req.flags |= VCF_TRACK_DIRTY;
+        }
+
+        // Safety: vm_create_req is the correct struct for VMM_CREATE_VM.
+        unsafe { ctl.ioctl(ioctls::VMM_CREATE_VM, &mut req) }?;
+
+        let fd = VmmFd::open(name)?;
+        Ok(Self { inner: fd, name: name.to_string() })
+    }
+
+    /// Open an existing VM instance.
+    pub fn open(name: &str) -> Result<Self> {
+        let fd = VmmFd::open(name)?;
+        Ok(Self { inner: fd, name: name.to_string() })
+    }
+
+    /// Get the VM name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get the bhyve API version from the kernel.
+    pub fn api_version(&self) -> Result<u32> {
+        self.inner.api_version()
+    }
+
+    // ---------------------------------------------------------------
+    // Memory segment management
+    // ---------------------------------------------------------------
+
+    /// Allocate a guest memory segment in the kernel.
+    ///
+    /// Returns an error if the segment name exceeds the kernel's
+    /// maximum length.
+    pub fn create_memseg(
+        &self,
+        segid: i32,
+        len: usize,
+        name: &str,
+    ) -> Result<()> {
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() >= VM_MAX_SEG_NAMELEN {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "segment name '{}' exceeds max length {}",
+                    name, VM_MAX_SEG_NAMELEN - 1,
+                ),
+            ));
+        }
+
+        let mut seg = vm_memseg {
+            segid,
+            len,
+            name: [0u8; VM_MAX_SEG_NAMELEN],
+        };
+        seg.name[..name_bytes.len()].copy_from_slice(name_bytes);
+
+        // Safety: vm_memseg is the correct struct for VM_ALLOC_MEMSEG.
+        unsafe { self.inner.ioctl(ioctls::VM_ALLOC_MEMSEG, &mut seg) }?;
+        Ok(())
+    }
+
+    /// Map a memory segment into the guest physical address space.
+    pub fn map_memseg(
+        &self,
+        segid: i32,
+        gpa: u64,
+        len: usize,
+        segoff: i64,
+        prot: Prot,
+    ) -> Result<()> {
+        let mut map = vm_memmap {
+            gpa,
+            segid,
+            segoff,
+            len,
+            prot: prot.bits(),
+            flags: VM_MEMMAP_F_WIRED,
+        };
+        // Safety: vm_memmap is the correct struct for VM_MMAP_MEMSEG.
+        unsafe { self.inner.ioctl(ioctls::VM_MMAP_MEMSEG, &mut map) }?;
+        Ok(())
+    }
+
+    /// Get the mmap offset for a device memory segment.
+    pub fn devmem_offset(&self, segid: i32) -> Result<i64> {
+        let mut dmo = bhyve_api::vm_devmem_offset { segid, offset: 0 };
+        // Safety: vm_devmem_offset is the correct struct.
+        unsafe { self.inner.ioctl(ioctls::VM_DEVMEM_GETOFFSET, &mut dmo) }?;
+        Ok(dmo.offset)
+    }
+
+    // ---------------------------------------------------------------
+    // RTC
+    // ---------------------------------------------------------------
+
+    /// Set the time reported by the virtual RTC.
+    pub fn rtc_settime(&self, time: Duration) -> Result<()> {
+        self.inner.rtc_settime(time)
+    }
+
+    /// Read a byte from the virtual RTC at the given offset.
+    pub fn rtc_read(&self, offset: i32) -> Result<u8> {
+        let mut data = vm_rtc_data { offset, value: 0 };
+        // Safety: vm_rtc_data is the correct struct for VM_RTC_READ.
+        unsafe { self.inner.ioctl(ioctls::VM_RTC_READ, &mut data) }?;
+        Ok(data.value)
+    }
+
+    /// Write a byte to the virtual RTC at the given offset.
+    pub fn rtc_write(&self, offset: i32, value: u8) -> Result<()> {
+        let mut data = vm_rtc_data { offset, value };
+        // Safety: vm_rtc_data is the correct struct for VM_RTC_WRITE.
+        unsafe { self.inner.ioctl(ioctls::VM_RTC_WRITE, &mut data) }?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // Interrupts
+    // ---------------------------------------------------------------
+
+    /// Assert an ISA IRQ (edge: assert + deassert).
+    pub fn isa_assert_irq(
+        &self,
+        atpic_irq: i32,
+        ioapic_irq: i32,
+    ) -> Result<()> {
+        self.isa_irq_op(ioctls::VM_ISA_ASSERT_IRQ, atpic_irq, ioapic_irq)
+    }
+
+    /// Deassert an ISA IRQ.
+    pub fn isa_deassert_irq(
+        &self,
+        atpic_irq: i32,
+        ioapic_irq: i32,
+    ) -> Result<()> {
+        self.isa_irq_op(ioctls::VM_ISA_DEASSERT_IRQ, atpic_irq, ioapic_irq)
+    }
+
+    /// Pulse an ISA IRQ (assert then immediately deassert).
+    pub fn isa_pulse_irq(
+        &self,
+        atpic_irq: i32,
+        ioapic_irq: i32,
+    ) -> Result<()> {
+        self.isa_irq_op(ioctls::VM_ISA_PULSE_IRQ, atpic_irq, ioapic_irq)
+    }
+
+    fn isa_irq_op(
+        &self,
+        cmd: i32,
+        atpic_irq: i32,
+        ioapic_irq: i32,
+    ) -> Result<()> {
+        let mut irq = vm_isa_irq { atpic_irq, ioapic_irq };
+        // Safety: vm_isa_irq is the correct struct for ISA IRQ ioctls.
+        unsafe { self.inner.ioctl(cmd, &mut irq) }?;
+        Ok(())
+    }
+
+    /// Deliver a LAPIC MSI (message signaled interrupt).
+    pub fn lapic_msi(&self, addr: u64, msg: u64) -> Result<()> {
+        let mut msi = vm_lapic_msi { addr, msg };
+        // Safety: vm_lapic_msi is the correct struct for VM_LAPIC_MSI.
+        unsafe { self.inner.ioctl(ioctls::VM_LAPIC_MSI, &mut msi) }?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // VM capabilities and lifecycle
+    // ---------------------------------------------------------------
+
+    /// Set a VM capability (e.g., halt-on-exit, pause-on-exit).
+    pub fn set_capability(
+        &self,
+        cpuid: i32,
+        captype: i32,
+        capval: i32,
+    ) -> Result<()> {
+        let mut cap =
+            vm_capability { cpuid, captype, capval, allcpus: 0 };
+        // Safety: vm_capability is the correct struct.
+        unsafe { self.inner.ioctl(ioctls::VM_SET_CAPABILITY, &mut cap) }?;
+        Ok(())
+    }
+
+    /// Pause the VM (all vCPUs and kernel timers).
+    pub fn pause(&self) -> Result<()> {
+        self.inner.ioctl_usize(ioctls::VM_PAUSE, 0)?;
+        Ok(())
+    }
+
+    /// Resume the VM after pause.
+    pub fn resume(&self) -> Result<()> {
+        self.inner.ioctl_usize(ioctls::VM_RESUME, 0)?;
+        Ok(())
+    }
+
+    /// Request VM destruction.
+    pub fn destroy(&self) -> Result<()> {
+        self.inner.ioctl_usize(ioctls::VM_DESTROY_SELF, 0)?;
+        Ok(())
+    }
+
+    /// Set the VM to auto-destruct when the fd is closed.
+    ///
+    /// This ensures the kernel VM resources are cleaned up even if
+    /// the process crashes.
+    pub fn set_autodestruct(&self) -> Result<()> {
+        self.inner.ioctl_usize(ioctls::VM_SET_AUTODESTRUCT, 0)?;
+        Ok(())
+    }
+
+    /// Suspend the VM (power-off, reset, halt, or triple-fault).
+    pub fn suspend(&self, how: u32, source: i32) -> Result<()> {
+        let mut req = vm_suspend { how, source };
+        // Safety: vm_suspend is the correct struct for VM_SUSPEND.
+        unsafe { self.inner.ioctl(ioctls::VM_SUSPEND, &mut req) }?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // Dirty page tracking (for live migration)
+    // ---------------------------------------------------------------
+
+    /// Track dirty pages for a memory region.
+    ///
+    /// Returns a bitmap where each bit represents a 4 KiB page.
+    /// Calling this atomically reads and clears the dirty bits.
+    ///
+    /// The `bitmap` buffer must be large enough to hold one bit per
+    /// page in the region: `ceil(len / 4096 / 8)` bytes.
+    pub fn track_dirty_pages(
+        &self,
+        start_gpa: u64,
+        len: usize,
+        bitmap: &mut [u8],
+    ) -> Result<()> {
+        let pages = (len + 4095) / 4096;
+        let required_bytes = (pages + 7) / 8;
+        if bitmap.len() < required_bytes {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "bitmap too small: need {} bytes for {} pages, got {}",
+                    required_bytes, pages, bitmap.len(),
+                ),
+            ));
+        }
+
+        let mut tracker = vmm_dirty_tracker {
+            vdt_start_gpa: start_gpa,
+            vdt_len: len,
+            // Safety: bitmap is a valid mutable slice that outlives this
+            // ioctl call (we block until it completes).
+            vdt_pfns: bitmap.as_mut_ptr() as *mut _,
+        };
+        // Safety: vmm_dirty_tracker is the correct struct.
+        unsafe { self.inner.ioctl(ioctls::VM_TRACK_DIRTY_PAGES, &mut tracker) }?;
+        Ok(())
+    }
+
+    /// Set pages as dirty in the NPT (for migration re-dirtying).
+    ///
+    /// Requires bhyve API version >= 17. Returns an error if the
+    /// kernel does not support this operation.
+    pub fn set_dirty_pages(
+        &self,
+        gpa: u64,
+        len: u64,
+        bitmap: &[u8],
+    ) -> Result<()> {
+        let api_ver = self.api_version()?;
+        if api_ver < ApiVersion::V17 as u32 {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!(
+                    "set_dirty_pages requires API v17+, have v{}",
+                    api_ver,
+                ),
+            ));
+        }
+
+        let mut op = vm_npt_operation {
+            vno_gpa: gpa,
+            vno_len: len,
+            // Safety: bitmap is a valid slice that outlives this ioctl.
+            // The const-to-mut cast is required by the kernel interface
+            // but the kernel only reads from the bitmap when
+            // VNO_FLAG_BITMAP_IN is set.
+            vno_bitmap: bitmap.as_ptr() as *mut u8,
+            vno_operation: VNO_OP_SET_DIRTY | VNO_FLAG_BITMAP_IN,
+        };
+        // Safety: vm_npt_operation is the correct struct.
+        unsafe { self.inner.ioctl(ioctls::VM_NPT_OPERATION, &mut op) }?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // VMM data interface (state export/import for migration)
+    // ---------------------------------------------------------------
+
+    /// Build a vmm-data read/write operation.
+    pub fn data_op(&self, class: u16, version: u16) -> bhyve_api::VmmDataOp<'_> {
+        self.inner.data_op(class, version)
+    }
+}
+
+impl AsRawFd for VmmHdl {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.inner.as_raw_fd()
+    }
+}
+
+/// Shared reference to a VmmHdl.
+pub type VmmHdlRef = Arc<VmmHdl>;
+
+// VmmHdl intentionally does NOT expose a generic ioctl method.
+// All operations must go through typed methods above.
+// To add new operations, add a new method here rather than
+// using a raw ioctl escape hatch.

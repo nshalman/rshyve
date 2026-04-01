@@ -1,0 +1,17 @@
+[package]
+name = "vmm_devices"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+
+[dependencies]
+vmm_core.workspace = true
+bhyve_api.workspace = true
+bitflags.workspace = true
+anyhow.workspace = true
+erased-serde.workspace = true
+libc.workspace = true
+futures.workspace = true
+serde.workspace = true
+slog.workspace = true
+thiserror.workspace = true
