@@ -147,7 +147,16 @@ impl I440FxChipset {
         self.cfg_decoder.service_data(
             port,
             rwo,
-            |bdf, offset, rwo| match rwo {
+            |bdf, offset, rwo| {
+                if bdf.dev() == 4 {
+                    // Device at slot 4 = our virtio-blk
+                    eprintln!(
+                        "[pci-cfg] {} bdf={} offset={:#x}",
+                        if rwo.is_read() { "read" } else { "write" },
+                        bdf, offset,
+                    );
+                }
+                match rwo {
                 RWOp::Read(ro) => {
                     let val =
                         bus.config_read(bdf, offset, ro.len() as u8);
@@ -166,7 +175,7 @@ impl I440FxChipset {
                         wo.read_u32(),
                     );
                 }
-            },
+            }},
         );
     }
 

@@ -13,6 +13,7 @@ vmm_core.workspace = true
 vmm_config.workspace = true
 vmm_devices.workspace = true
 bhyve_api.workspace = true
+viona_api.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true

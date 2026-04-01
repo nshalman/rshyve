@@ -246,3 +246,48 @@ impl IntrPin for NoOpPin {
         false
     }
 }
+
+/// An interrupt pin backed by the IOAPIC for PCI GSI delivery.
+///
+/// Used for PCI devices whose interrupts are routed through the
+/// IOAPIC (GSIs >= 16) rather than the legacy ISA PIC.
+pub struct IoApicPin {
+    irq: i32,
+    asserted: Mutex<bool>,
+    hdl: Arc<VmmHdl>,
+}
+
+impl IoApicPin {
+    /// Create a new IOAPIC pin for the given GSI.
+    pub fn new(gsi: u8, hdl: Arc<VmmHdl>) -> Arc<Self> {
+        Arc::new(Self {
+            irq: gsi as i32,
+            asserted: Mutex::new(false),
+            hdl,
+        })
+    }
+}
+
+impl IntrPin for IoApicPin {
+    fn assert(&self) {
+        let mut asserted = self.asserted.lock()
+            .expect("ioapic pin lock poisoned");
+        if !*asserted {
+            *asserted = true;
+            let _ = self.hdl.ioapic_assert_irq(self.irq);
+        }
+    }
+
+    fn deassert(&self) {
+        let mut asserted = self.asserted.lock()
+            .expect("ioapic pin lock poisoned");
+        if *asserted {
+            *asserted = false;
+            let _ = self.hdl.ioapic_deassert_irq(self.irq);
+        }
+    }
+
+    fn is_asserted(&self) -> bool {
+        *self.asserted.lock().expect("ioapic pin lock poisoned")
+    }
+}

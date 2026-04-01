@@ -73,8 +73,14 @@ impl UartState {
 ///
 /// Wraps [`Uart`] with PIO bus registration and interrupt pin
 /// synchronisation.
+/// Callback for synchronous TX output (called in PIO handler context).
+pub type TxSink = Box<dyn Fn(u8) + Send + Sync>;
+
 pub struct LpcUart {
     state: Mutex<UartState>,
+    /// Optional synchronous sink for TX bytes. Called on every THR write
+    /// in PIO handler context. If set, bytes go here instead of the TX FIFO.
+    tx_sink: Mutex<Option<TxSink>>,
 }
 
 impl LpcUart {
@@ -85,7 +91,17 @@ impl LpcUart {
                 uart: Uart::new(),
                 irq_pin,
             }),
+            tx_sink: Mutex::new(None),
         })
+    }
+
+    /// Set a synchronous TX sink that receives bytes immediately when
+    /// the guest writes to THR. This bypasses the TX FIFO buffering.
+    ///
+    /// Used for `com1,stdio` style output where bytes must go directly
+    /// to the host without buffering delays.
+    pub fn set_tx_sink(&self, sink: TxSink) {
+        *self.tx_sink.lock().expect("tx_sink lock") = Some(sink);
     }
 
     /// Register PIO handlers on `bus` at the given `base` port address.
@@ -138,8 +154,6 @@ impl LpcUart {
 
     /// Handle a PIO read or write from a vCPU thread.
     fn pio_rw(&self, offset: u16, rwo: RWOp<'_>) {
-        // Offset is already validated to 0..REGISTER_LEN by the PioBus,
-        // but we mask to u8 defensively.
         let reg_offset = (offset & 0x07) as u8;
 
         let mut state = self.state.lock().unwrap();
@@ -150,6 +164,17 @@ impl LpcUart {
             }
             RWOp::Write(wo) => {
                 state.uart.reg_write(reg_offset, wo.read_u8());
+            }
+        }
+
+        // If a TX sink is set, drain all pending TX bytes synchronously.
+        // This provides C bhyve-style immediate serial output without
+        // buffering delays.
+        if let Ok(sink) = self.tx_sink.lock() {
+            if let Some(ref sink_fn) = *sink {
+                while let Some(b) = state.uart.data_read() {
+                    sink_fn(b);
+                }
             }
         }
 

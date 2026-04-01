@@ -136,16 +136,12 @@ fn vcpu_run_loop(
         exit_count += 1;
 
         // Periodic stats
-        if exit_count % 50_000 == 0 {
+        if exit_count % 10_000 == 0 {
             let elapsed = start_time.elapsed();
-            info!(log, "vCPU stats";
-                "exits" => exit_count,
-                "pio" => pio_count,
-                "mmio" => mmio_count,
-                "bogus" => bogus_count,
-                "inst_emul" => inst_emul_count,
-                "elapsed_ms" => elapsed.as_millis(),
-                "rip" => format!("{:#x}", exit.rip),
+            eprintln!(
+                "[stats] exits={} pio={} mmio={} bogus={} inst_emul={} ms={} rip={:#x}",
+                exit_count, pio_count, mmio_count, bogus_count,
+                inst_emul_count, elapsed.as_millis(), exit.rip,
             );
         }
 
@@ -157,9 +153,9 @@ fn vcpu_run_loop(
 
             VmExitKind::Inout(ref req) => {
                 pio_count += 1;
-                // Log first few PIO accesses for debugging
-                if pio_count <= 5 {
-                    eprintln!("[vcpu-{}] PIO {:?}", vcpu_id, req);
+                // Trace kernel-phase PIO accesses
+                if exit_count > 30000 && exit_count < 30020 {
+                    eprintln!("[pio-trace] #{} {:?} rip={:#x}", exit_count, req, exit.rip);
                 }
                 let res = handle_inout(req, bus_pio);
                 VmEntry::InoutFulfill(res)
@@ -172,18 +168,20 @@ fn vcpu_run_loop(
             }
 
             VmExitKind::Rdmsr(code) => {
-                // Unhandled MSRs: return 0 and continue.
-                // The guest may probe MSRs that we don't emulate.
-                debug!(log, "unhandled RDMSR"; "msr" => format!("{:#x}", code));
-                // TODO: set RAX:RDX = 0 via register write, then re-enter
+                // Unhandled MSRs: return 0 in RAX:RDX.
+                // The kernel auto-advances RIP past the RDMSR instruction.
+                let _ = vcpu.set_reg(
+                    bhyve_api::vm_reg_name::VM_REG_GUEST_RAX, 0,
+                );
+                let _ = vcpu.set_reg(
+                    bhyve_api::vm_reg_name::VM_REG_GUEST_RDX, 0,
+                );
                 VmEntry::Run
             }
 
-            VmExitKind::Wrmsr(code, val) => {
-                debug!(log, "unhandled WRMSR";
-                    "msr" => format!("{:#x}", code),
-                    "val" => format!("{:#x}", val),
-                );
+            VmExitKind::Wrmsr(_code, _val) => {
+                // Unhandled MSRs: silently ignore the write.
+                // The kernel auto-advances RIP past the WRMSR instruction.
                 VmEntry::Run
             }
 

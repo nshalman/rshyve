@@ -204,6 +204,24 @@ impl VmmHdl {
         self.isa_irq_op(ioctls::VM_ISA_DEASSERT_IRQ, atpic_irq, ioapic_irq)
     }
 
+    /// Set an ISA IRQ trigger mode (edge or level).
+    pub fn isa_set_irq_trigger(
+        &self,
+        irq: i32,
+        level_trigger: bool,
+    ) -> Result<()> {
+        let mut trigger = bhyve_api::vm_isa_irq_trigger {
+            atpic_irq: irq,
+            trigger: if level_trigger { 1 } else { 0 },
+        };
+        // Safety: vm_isa_irq_trigger is the correct struct.
+        unsafe {
+            self.inner
+                .ioctl(ioctls::VM_ISA_SET_IRQ_TRIGGER, &mut trigger)
+        }?;
+        Ok(())
+    }
+
     /// Pulse an ISA IRQ (assert then immediately deassert).
     pub fn isa_pulse_irq(
         &self,
@@ -225,6 +243,24 @@ impl VmmHdl {
         Ok(())
     }
 
+    /// Assert an IOAPIC IRQ (for PCI device GSI delivery).
+    pub fn ioapic_assert_irq(&self, irq: i32) -> Result<()> {
+        let mut req = bhyve_api::vm_ioapic_irq { irq };
+        unsafe {
+            self.inner.ioctl(ioctls::VM_IOAPIC_ASSERT_IRQ, &mut req)
+        }?;
+        Ok(())
+    }
+
+    /// Deassert an IOAPIC IRQ.
+    pub fn ioapic_deassert_irq(&self, irq: i32) -> Result<()> {
+        let mut req = bhyve_api::vm_ioapic_irq { irq };
+        unsafe {
+            self.inner.ioctl(ioctls::VM_IOAPIC_DEASSERT_IRQ, &mut req)
+        }?;
+        Ok(())
+    }
+
     /// Deliver a LAPIC MSI (message signaled interrupt).
     pub fn lapic_msi(&self, addr: u64, msg: u64) -> Result<()> {
         let mut msi = vm_lapic_msi { addr, msg };
@@ -236,6 +272,24 @@ impl VmmHdl {
     // ---------------------------------------------------------------
     // VM capabilities and lifecycle
     // ---------------------------------------------------------------
+
+    /// Set the CPU topology (sockets, cores, threads per core).
+    pub fn set_topology(
+        &self,
+        sockets: u16,
+        cores: u16,
+        threads: u16,
+        maxcpus: u16,
+    ) -> Result<()> {
+        // struct vm_cpu_topology { u16 sockets, cores, threads, maxcpus }
+        let mut topo: [u16; 4] = [sockets, cores, threads, maxcpus];
+        // Safety: passing a 4×u16 struct matching vm_cpu_topology.
+        unsafe {
+            self.inner
+                .ioctl(ioctls::VM_SET_TOPOLOGY, topo.as_mut_ptr())
+        }?;
+        Ok(())
+    }
 
     /// Set a VM capability (e.g., halt-on-exit, pause-on-exit).
     pub fn set_capability(

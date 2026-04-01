@@ -7,12 +7,18 @@
 //! All emulated devices implement the [`Lifecycle`] trait which provides
 //! hooks for VM state transitions and migration support.
 
+pub mod acpi;
+pub mod acpi_pm;
+pub mod aml;
 pub mod bhyve;
 pub mod chipset;
+pub mod fwcfg;
 pub mod lifecycle;
 pub mod migrate;
 pub mod pci;
+pub mod smbios;
 pub mod uart;
+pub mod virtio;
 
 pub use lifecycle::{IndicatedState, Indicator, Lifecycle};
 pub use migrate::{

@@ -691,20 +691,18 @@ mod tests {
         uart.reg_write(REG_IER, 0);
         assert!(!uart.intr_state());
 
-        // Write data to THR, then enable THRE interrupt.
+        // Write data to THR — THRE is set immediately (instant TX model).
         uart.reg_write(REG_THR, tval);
+        // Enable THRE interrupt — fires immediately since THRE is set.
         uart.reg_write(REG_IER, IER_ETBEI);
-        assert!(!uart.intr_state());
-        assert_eq!(uart.reg_read(REG_IIR) & MASK_IIR, IIR_NONE);
-
-        // External consumer drains TX FIFO.
-        assert_eq!(uart.data_read(), Some(tval));
         assert!(uart.intr_state());
         assert_eq!(uart.reg_read(REG_IIR) & MASK_IIR, IIR_THRE);
 
         // Cleared after IIR read.
         assert!(!uart.intr_state());
-        assert_eq!(uart.reg_read(REG_IIR) & MASK_IIR, IIR_NONE);
+
+        // External consumer can still drain TX FIFO.
+        assert_eq!(uart.data_read(), Some(tval));
     }
 
     #[test]
@@ -741,10 +739,12 @@ mod tests {
         assert_eq!(uart.reg_read(REG_IIR), IIR_THRE);
 
         // Leave loopback, queue outgoing data.
+        // With instant TX, THRE stays set after THR write.
         uart.reg_write(REG_MCR, 0);
         let tval = 0x40;
         uart.reg_write(REG_THR, tval);
-        assert_eq!(uart.reg_read(REG_IIR) & MASK_IIR, IIR_NONE);
+        // THRE interrupt fires since ETBEI is enabled and THRE is set
+        assert_eq!(uart.reg_read(REG_IIR) & MASK_IIR, IIR_THRE);
         assert_eq!(uart.data_read(), Some(tval));
     }
 
