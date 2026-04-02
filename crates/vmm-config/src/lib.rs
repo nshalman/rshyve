@@ -103,6 +103,18 @@ pub struct Cli {
     #[arg(long)]
     pub track_dirty: bool,
 
+    /// Direct boot: Linux kernel bzImage path (bypasses UEFI firmware)
+    #[arg(long)]
+    pub kernel: Option<PathBuf>,
+
+    /// Direct boot: kernel command line
+    #[arg(long)]
+    pub cmdline: Option<String>,
+
+    /// Direct boot: initrd/initramfs path
+    #[arg(long)]
+    pub initrd: Option<PathBuf>,
+
     /// VM name
     pub vm_name: String,
 }

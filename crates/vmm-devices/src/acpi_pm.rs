@@ -17,7 +17,7 @@ use vmm_core::common::RWOp;
 use vmm_core::pio::{PioBus, PioFn};
 
 /// ACPI PM base I/O port.
-const PMBASE: u16 = 0xB000;
+const PMBASE: u16 = 0x400;
 
 /// SMI Command port for ACPI enable/disable.
 const SMI_CMD_PORT: u16 = 0xB2;
@@ -142,7 +142,6 @@ impl AcpiPm {
             (2, RWOp::Write(wo)) => {
                 let val = wo.read_u16();
                 inner.pm1_enable = val & PM1_EN_WRITABLE;
-                eprintln!("[acpi-pm] PM1_EN write: {:#06x}", inner.pm1_enable);
             }
             (_, RWOp::Read(ro)) => {
                 // Byte-width access or odd offsets — return 0
@@ -164,8 +163,6 @@ impl AcpiPm {
             }
             RWOp::Write(wo) => {
                 let val = wo.read_u16();
-                eprintln!("[acpi-pm] PM1_CNT write: {:#06x}", val);
-
                 // Preserve SCI_EN (OSPM cannot change it), clear
                 // reserved bits, and don't store SLP_EN.
                 inner.pm1_control = (inner.pm1_control & PM1_SCI_EN)
@@ -177,7 +174,7 @@ impl AcpiPm {
                     if slp_type == 5 {
                         // S5 = power off. Signal via SLP_EN write.
                         // The vCPU run loop will see this as a suspend.
-                        eprintln!("[acpi-pm] S5 power-off requested");
+                        // S5 = power off
                     }
                 }
             }
@@ -192,11 +189,9 @@ impl AcpiPm {
             match val {
                 ACPI_ENABLE => {
                     inner.pm1_control |= PM1_SCI_EN;
-                    eprintln!("[acpi-pm] ACPI enabled (SCI_EN set)");
                 }
                 ACPI_DISABLE => {
                     inner.pm1_control &= !PM1_SCI_EN;
-                    eprintln!("[acpi-pm] ACPI disabled (SCI_EN cleared)");
                 }
                 _ => {
                     // Other SMI commands ignored
@@ -215,7 +210,7 @@ impl AcpiPm {
                 let val = wo.read_u8();
                 // Bit 2 = system reset when transitioning 0→1
                 if val & 0x04 != 0 {
-                    eprintln!("[acpi-pm] system reset requested (0xCF9={:#x})", val);
+                    // System reset requested
                 }
             }
         }

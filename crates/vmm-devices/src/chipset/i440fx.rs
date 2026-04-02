@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use vmm_core::common::RWOp;
+use vmm_core::hdl::VmmHdl;
+use vmm_core::intr_pins::PciIntrPin;
 use vmm_core::pio::{PioBus, PioFn};
 
 use crate::pci::bus::PciBus;
@@ -53,6 +55,12 @@ pub struct I440FxChipset {
     pci_bus: Arc<PciBus>,
     cfg_decoder: PioCfgDecoder,
     post_code: AtomicU8,
+    /// LPC bridge for PIR routing
+    lpc: Arc<LpcBridge>,
+    /// Shared PIR register state for PciIntrPin instances.
+    pir_regs: Arc<Mutex<[u8; PIR_COUNT]>>,
+    /// VM handle for PCI interrupt delivery.
+    hdl: Option<Arc<VmmHdl>>,
 }
 
 impl I440FxChipset {
@@ -64,7 +72,10 @@ impl I440FxChipset {
     /// 3. Attaches the ISA/LPC bridge at slot 1
     /// 4. Registers PIO handlers for config access (0xCF8, 0xCFC)
     /// 5. Registers a PIO handler for the POST code port (0x80)
-    pub fn create(bus_pio: &PioBus) -> Arc<Self> {
+    pub fn create(
+        bus_pio: &PioBus,
+        hdl: Option<Arc<VmmHdl>>,
+    ) -> Arc<Self> {
         let pci_bus = PciBus::new();
 
         // Host bridge at BDF 0.0.0
@@ -72,15 +83,23 @@ impl I440FxChipset {
         let bdf_hb = Bdf::new_unchecked(0, 0, 0);
         pci_bus.attach(bdf_hb, hostbridge);
 
-        // ISA/LPC bridge at BDF 0.1.0
-        let lpc: Arc<dyn PciDevice> = Arc::new(LpcBridge::new());
+        // Shared PIR registers: firmware writes these via LPC bridge config
+        // space (0x60-0x63), PciIntrPin reads them at assertion time.
+        let pir_regs = Arc::new(Mutex::new([0x80u8; PIR_COUNT]));
+
+        // ISA/LPC bridge at BDF 0.1.0 with PIR routing
+        let lpc = Arc::new(LpcBridge::new(pir_regs.clone()));
+        let lpc_pci: Arc<dyn PciDevice> = lpc.clone();
         let bdf_lpc = Bdf::new_unchecked(0, 1, 0);
-        pci_bus.attach(bdf_lpc, lpc);
+        pci_bus.attach(bdf_lpc, lpc_pci);
 
         let chipset = Arc::new(Self {
             pci_bus,
             cfg_decoder: PioCfgDecoder::new(),
             post_code: AtomicU8::new(0),
+            lpc,
+            pir_regs,
+            hdl,
         });
 
         // Register PIO handler for config address register (0xCF8, 4 bytes)
@@ -136,6 +155,27 @@ impl I440FxChipset {
         self.pci_bus.attach(bdf, dev);
     }
 
+    /// Get a PCI interrupt pin for the device at `bdf`.
+    ///
+    /// Returns a `PciIntrPin` that calls `vm_isa_assert_irq` with:
+    /// - ATPIC IRQ: read dynamically from PIR[`(slot+pin)%4`]
+    /// - IOAPIC IRQ: fixed at `16 + (4 + slot + pin) % 8`
+    ///
+    /// This matches C bhyve's `pci_irq_assert()` / `ioapic_pci_alloc_irq()`.
+    pub fn route_lintr(
+        &self,
+        bdf: &Bdf,
+    ) -> Option<(crate::pci::INTxPinID, Arc<dyn vmm_core::intr_pins::IntrPin>)> {
+        let hdl = self.hdl.as_ref()?;
+        let pin = PciIntrPin::new(
+            bdf.dev(),
+            0, // INT#A
+            self.pir_regs.clone(),
+            hdl.clone(),
+        );
+        Some((crate::pci::INTxPinID::IntA, pin))
+    }
+
     /// Read the last POST code written by the guest.
     pub fn post_code(&self) -> u8 {
         self.post_code.load(Ordering::Relaxed)
@@ -148,14 +188,6 @@ impl I440FxChipset {
             port,
             rwo,
             |bdf, offset, rwo| {
-                if bdf.dev() == 4 {
-                    // Device at slot 4 = our virtio-blk
-                    eprintln!(
-                        "[pci-cfg] {} bdf={} offset={:#x}",
-                        if rwo.is_read() { "read" } else { "write" },
-                        bdf, offset,
-                    );
-                }
                 match rwo {
                 RWOp::Read(ro) => {
                     let val =
@@ -251,16 +283,29 @@ impl PciDevice for Hostbridge {
 // LpcBridge - Intel PIIX3 ISA bridge
 // ---------------------------------------------------------------------------
 
-/// ISA/LPC bridge PCI device at slot 1.
+/// PIR (PCI Interrupt Routing) register offsets in the LPC config space.
+const PIR_OFFSET: u8 = 0x60;
+const PIR_COUNT: usize = 4;
+/// PIR bit 7 = disable, bits 3:0 = ISA IRQ number.
+const PIR_MASK_DISABLE: u8 = 0x80;
+const PIR_MASK_IRQ: u8 = 0x0F;
+
+/// ISA/LPC bridge PCI device at slot 1 (Intel PIIX3).
 ///
-/// Responds to config reads with the correct Intel PIIX3 identity.
-/// No BARs for now (PIR routing can be added later).
+/// Handles PIR (PCI Interrupt Routing) registers at config space
+/// offsets 0x60-0x63. The firmware writes these to map PIRQ links
+/// A-D to ISA IRQs. PCI device pins (`PciIntrPin`) read these
+/// registers dynamically at interrupt assertion time, so no callback
+/// wiring is needed when the firmware updates PIR values.
 struct LpcBridge {
     state: Mutex<DeviceState>,
+    /// Shared PIR register values. PciIntrPin instances hold an
+    /// `Arc` clone and read the register at assertion time.
+    pir_regs: Arc<Mutex<[u8; PIR_COUNT]>>,
 }
 
 impl LpcBridge {
-    fn new() -> Self {
+    fn new(pir_regs: Arc<Mutex<[u8; PIR_COUNT]>>) -> Self {
         Self {
             state: Mutex::new(DeviceState::new(DeviceIdent {
                 vendor_id: VENDOR_INTEL,
@@ -272,12 +317,19 @@ impl LpcBridge {
                 sub_vendor_id: 0,
                 sub_device_id: 0,
             })),
+            pir_regs,
         }
     }
 }
 
 impl PciDevice for LpcBridge {
     fn cfg_read(&self, offset: u8, len: u8) -> u32 {
+        // Handle PIR register reads (0x60-0x63)
+        if offset >= PIR_OFFSET && offset < PIR_OFFSET + PIR_COUNT as u8 {
+            let pir = self.pir_regs.lock().expect("pir lock");
+            let idx = (offset - PIR_OFFSET) as usize;
+            return u32::from(pir[idx]);
+        }
         self.state
             .lock()
             .expect("LpcBridge lock poisoned")
@@ -285,6 +337,15 @@ impl PciDevice for LpcBridge {
     }
 
     fn cfg_write(&self, offset: u8, len: u8, val: u32) {
+        // Handle PIR register writes (0x60-0x63).
+        // Just store the value — PciIntrPin reads it dynamically.
+        if offset >= PIR_OFFSET && offset < PIR_OFFSET + PIR_COUNT as u8 && len == 1 {
+            let idx = (offset - PIR_OFFSET) as usize;
+            let byte = val as u8;
+            let mut pir = self.pir_regs.lock().expect("pir lock");
+            pir[idx] = byte;
+            return;
+        }
         self.state
             .lock()
             .expect("LpcBridge lock poisoned")
@@ -302,7 +363,7 @@ mod tests {
     /// Create a chipset on a fresh PIO bus for testing.
     fn setup() -> (Arc<PioBus>, Arc<I440FxChipset>) {
         let pio = Arc::new(PioBus::new());
-        let chipset = I440FxChipset::create(&pio);
+        let chipset = I440FxChipset::create(&pio, None);
         (pio, chipset)
     }
 

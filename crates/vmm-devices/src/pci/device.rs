@@ -91,6 +91,8 @@ pub struct DeviceState {
     intr_line: u8,
     intr_pin: u8,
     header_type: u8,
+    /// Offset of the first capability in config space (0 = none).
+    cap_ptr: u8,
 }
 
 impl DeviceState {
@@ -106,6 +108,7 @@ impl DeviceState {
             intr_line: 0xFF,
             intr_pin: 0,
             header_type: bits::HEADER_TYPE_DEVICE,
+            cap_ptr: 0,
         }
     }
 
@@ -120,8 +123,19 @@ impl DeviceState {
     }
 
     /// Set the header type (e.g., multi-function flag).
+    /// Set the PCI Interrupt Line register (0x3C).
+    pub fn set_intr_line(&mut self, irq: u8) {
+        self.intr_line = irq;
+    }
+
     pub fn set_header_type(&mut self, htype: u8) {
         self.header_type = htype;
+    }
+
+    /// Set the capabilities pointer. This also sets the CAP_LIST
+    /// bit in the status register on subsequent reads.
+    pub fn set_cap_ptr(&mut self, offset: u8) {
+        self.cap_ptr = offset;
     }
 
     /// Get a reference to the BAR state.
@@ -162,11 +176,10 @@ impl DeviceState {
             }
             // 0x04: Command (low 16) | Status (high 16)
             0x04 => {
-                let status = if self.bars.get(BarN::BAR0).is_some() {
-                    bits::RegStatus::empty()
-                } else {
-                    bits::RegStatus::empty()
-                };
+                let mut status = bits::RegStatus::empty();
+                if self.cap_ptr != 0 {
+                    status |= bits::RegStatus::CAP_LIST;
+                }
                 u32::from(self.command.bits())
                     | (u32::from(status.bits()) << 16)
             }
@@ -198,7 +211,7 @@ impl DeviceState {
             // 0x30: Expansion ROM Base Address
             0x30 => 0,
             // 0x34: Capabilities Pointer (low 8) | Reserved (24)
-            0x34 => 0,
+            0x34 => u32::from(self.cap_ptr),
             // 0x38: Reserved
             0x38 => 0,
             // 0x3C: Intr Line (8) | Intr Pin (8) | Min Grant (8) | Max Lat (8)
@@ -292,7 +305,7 @@ mod tests {
             subclass: bits::SUBCLASS_BRIDGE_HOST,
             prog_if: 0,
             revision: 0x02,
-            sub_vendor_id: 0x1DE,
+            sub_vendor_id: 0xFB5D,
             sub_device_id: 0x0001,
         }
     }
@@ -406,7 +419,7 @@ mod tests {
     fn sub_vendor_device_id() {
         let state = DeviceState::new(test_ident());
         let val = state.cfg_read(0x2C, 4);
-        assert_eq!(val & 0xFFFF, 0x1DE);
+        assert_eq!(val & 0xFFFF, 0xFB5D);
         assert_eq!((val >> 16) & 0xFFFF, 0x0001);
     }
 

@@ -158,14 +158,6 @@ impl FwCfg {
                 (0, RWOp::Write(wo)) => {
                     let sel = wo.read_u16();
                     let mut inner = this.inner.lock().unwrap();
-                    // Trace selector access for debugging firmware fw_cfg usage
-                    let item_size = inner.items.get(&sel).map(|v| v.len()).unwrap_or(0);
-                    if sel != 0 {
-                        eprintln!(
-                            "[fwcfg] select {:#06x} (size={})",
-                            sel, item_size,
-                        );
-                    }
                     inner.cur_selector = sel;
                     inner.cur_offset = 0;
                 }

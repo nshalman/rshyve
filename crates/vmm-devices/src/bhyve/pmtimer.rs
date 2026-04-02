@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use vmm_core::hdl::VmmHdl;
 
-/// Standard ACPI PM base port (PIIX3/4 convention).
-pub const PMBASE_DEFAULT: u16 = 0xB000;
+/// Standard ACPI PM base port (matches C bhyve's IO_PMTMR).
+pub const PMBASE_DEFAULT: u16 = 0x400;
 
 /// Offset of the PM timer register within the PMBASE region.
 const PM_TMR_OFFSET: u16 = 0x08;

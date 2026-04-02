@@ -60,6 +60,15 @@ pub const VM_MMAP_MEMSEG: i32 = VMM_LOCK_IOC_BASE | 0x06;
 pub const VM_PMTMR_LOCATE: i32 = VMM_LOCK_IOC_BASE | 0x07;
 pub const VM_MUNMAP_MEMSEG: i32 = VMM_LOCK_IOC_BASE | 0x08;
 pub const VM_UNMAP_PPTDEV_MMIO: i32 = VMM_LOCK_IOC_BASE | 0x09;
+pub const VM_PPTDEV_DISABLE_MSIX: i32 = VMM_IOC_BASE | 0x1f;
+
+// PPT device ioctls (on /dev/pptN fd, not VM fd)
+pub const PPT_IOC_BASE: i32 = 0x5054_00;
+pub const PPT_CFG_READ: i32 = PPT_IOC_BASE | 0x01;
+pub const PPT_CFG_WRITE: i32 = PPT_IOC_BASE | 0x02;
+pub const PPT_BAR_QUERY: i32 = PPT_IOC_BASE | 0x03;
+pub const PPT_BAR_READ: i32 = PPT_IOC_BASE | 0x04;
+pub const PPT_BAR_WRITE: i32 = PPT_IOC_BASE | 0x05;
 pub const VM_PAUSE: i32 = VMM_LOCK_IOC_BASE | 0x0a;
 pub const VM_RESUME: i32 = VMM_LOCK_IOC_BASE | 0x0b;
 

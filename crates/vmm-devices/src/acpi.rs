@@ -28,7 +28,7 @@ const HPET_ADDR: u32 = 0xFED0_0000;
 // ── ACPI PM I/O ports (must match BhyvePmTimer / kernel config) ───
 
 /// ACPI PM base port (matches PMBASE_DEFAULT in pmtimer.rs).
-const PMBASE: u32 = 0xB000;
+const PMBASE: u32 = 0x400;
 /// PM1a event block port.
 const PM1A_EVT_ADDR: u32 = PMBASE;
 /// PM1a control block port.
@@ -202,25 +202,18 @@ fn build_dsdt() -> Vec<u8> {
                 );
             });
 
-            // ── PCI interrupt routing (APIC mode) ─────────
-            // Generate _PRT entries for PCI slots 1-31.
-            // Each slot has 4 pins (INTA-INTD), routed to
-            // GSI 16-23 using round-robin: GSI = 16 + ((slot + pin) % 8)
-            //
-            // We only generate the APIC-mode table. Since our VM
-            // always uses APIC mode, we don't need the PIRQ-based
-            // table.
+            // ── PCI interrupt routing ─────────────────────
+            // Use IOAPIC pins 16+ for PCI devices, matching C bhyve's
+            // ioapic_pci_alloc_irq(): ioapic_irq = 16 + (4 + slot + pin) % 8
             let mut storage: Vec<[AmlValue; 4]> = Vec::new();
 
-            // Generate entries for slots 1-31 (slot 0 is the host bridge
-            // and doesn't generate interrupts)
             for slot in 1u32..32 {
                 for pin in 0u32..4 {
-                    let gsi = 16 + ((slot + pin) % 8);
+                    let gsi = 16 + (4 + slot + pin) % 8;
                     storage.push([
                         AmlValue::DWord((slot << 16) | 0xFFFF),
                         AmlValue::Byte(pin as u8),
-                        AmlValue::Zero, // Source (Zero = hardwired)
+                        AmlValue::Zero,
                         AmlValue::DWord(gsi),
                     ]);
                 }
@@ -775,14 +768,12 @@ const FOUR_GIB: u64 = 0x1_0000_0000;
 /// Default lowmem limit (below MMIO hole).
 const LOWMEM_LIMIT: u64 = 0xC000_0000;
 
-/// Build E820 memory map entries from total VM memory size.
+/// Build structured E820 entries from total VM memory size.
 ///
-/// Creates entries for:
-/// - Low RAM: [0, min(mem_size, LOWMEM_LIMIT))
-///   - With a hole at [0xA0000, 0x100000) for VGA/ROM
-/// - High RAM: [4GiB, 4GiB + highmem) if memory > LOWMEM_LIMIT
-pub fn build_e820(mem_size: usize) -> Vec<u8> {
-    let mut entries: Vec<E820Entry> = Vec::new();
+/// Returns the entry list for reuse by both fw_cfg and direct boot
+/// (Linux boot_params zero page).
+pub fn build_e820_entries(mem_size: usize) -> Vec<E820Entry> {
+    let mut entries = Vec::with_capacity(4);
 
     let lowmem = (mem_size as u64).min(LOWMEM_LIMIT);
     let highmem = if mem_size as u64 > LOWMEM_LIMIT {
@@ -828,15 +819,18 @@ pub fn build_e820(mem_size: usize) -> Vec<u8> {
         });
     }
 
-    // Serialize entries to bytes
-    let entry_size = std::mem::size_of::<E820Entry>();
-    let mut buf = Vec::with_capacity(entries.len() * entry_size);
+    entries
+}
+
+/// Build E820 memory map as bytes for fw_cfg "etc/e820".
+pub fn build_e820(mem_size: usize) -> Vec<u8> {
+    let entries = build_e820_entries(mem_size);
+    let mut buf = Vec::with_capacity(entries.len() * std::mem::size_of::<E820Entry>());
     for entry in &entries {
         buf.extend_from_slice(&entry.addr.to_le_bytes());
         buf.extend_from_slice(&entry.size.to_le_bytes());
         buf.extend_from_slice(&entry.type_.to_le_bytes());
     }
-
     buf
 }
 
@@ -1586,7 +1580,7 @@ mod tests {
             fadt[76], fadt[77], fadt[78], fadt[79],
         ]);
         assert_eq!(pmtmr, IO_PMTMR);
-        assert_eq!(pmtmr, 0xB008);
+        assert_eq!(pmtmr, 0x408);
     }
 
     #[test]

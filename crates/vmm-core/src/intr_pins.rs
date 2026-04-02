@@ -274,7 +274,9 @@ impl IntrPin for IoApicPin {
             .expect("ioapic pin lock poisoned");
         if !*asserted {
             *asserted = true;
-            let _ = self.hdl.ioapic_assert_irq(self.irq);
+            if let Err(e) = self.hdl.ioapic_assert_irq(self.irq) {
+                eprintln!("[ioapic] assert GSI {} FAILED: {}", self.irq, e);
+            }
         }
     }
 
@@ -289,5 +291,121 @@ impl IntrPin for IoApicPin {
 
     fn is_asserted(&self) -> bool {
         *self.asserted.lock().expect("ioapic pin lock poisoned")
+    }
+}
+
+/// PCI interrupt pin routed through the i440fx/PIIX3 PIRQ mechanism.
+///
+/// Matches C bhyve's `pci_irq_assert()` behavior: calls
+/// `vm_isa_assert_irq(atpic_irq, ioapic_irq)` where:
+/// - `atpic_irq` is read dynamically from the PIR register (programmed
+///    by firmware at config offsets 0x60-0x63 of the LPC bridge)
+/// - `ioapic_irq` is fixed per device slot: `16 + (4 + slot + pin) % 8`
+///
+/// The PIR register is read at assertion time so that firmware can
+/// reprogram routing without invalidating existing pin handles.
+pub struct PciIntrPin {
+    /// Index into PIR registers (0-3), from `(slot + pin) % 4`.
+    pirq_idx: usize,
+    /// Fixed IOAPIC pin number: `16 + (4 + slot + pin) % 8`.
+    ioapic_irq: i32,
+    /// Shared PIR register state (from LPC bridge config space).
+    pir_regs: Arc<Mutex<[u8; 4]>>,
+    /// VM handle for kernel IRQ ioctls.
+    hdl: Arc<VmmHdl>,
+    /// Per-pin asserted state.
+    asserted: Mutex<bool>,
+}
+
+/// PIR register bit 7: disable routing.
+const PIR_DISABLE: u8 = 0x80;
+/// PIR register bits 3:0: ISA IRQ number.
+const PIR_IRQ_MASK: u8 = 0x0F;
+
+impl PciIntrPin {
+    /// Create a new PCI interrupt pin for a device at the given slot.
+    ///
+    /// # Arguments
+    /// - `slot` - PCI device number (0-31)
+    /// - `pin` - INTx pin (0=INTA, 1=INTB, 2=INTC, 3=INTD)
+    /// - `pir_regs` - Shared reference to the LPC bridge PIR registers
+    /// - `hdl` - VM handle for kernel IRQ delivery
+    pub fn new(
+        slot: u8,
+        pin: u8,
+        pir_regs: Arc<Mutex<[u8; 4]>>,
+        hdl: Arc<VmmHdl>,
+    ) -> Arc<Self> {
+        let pirq_idx = ((slot as usize) + (pin as usize)) % 4;
+        let ioapic_irq = 16 + ((4 + slot as i32 + pin as i32) % 8);
+        Arc::new(Self {
+            pirq_idx,
+            ioapic_irq,
+            pir_regs,
+            hdl,
+            asserted: Mutex::new(false),
+        })
+    }
+
+    /// Read the current ATPIC IRQ from the PIR register.
+    ///
+    /// Returns `Some(irq)` if the route is enabled, `None` if disabled.
+    fn atpic_irq(&self) -> Option<i32> {
+        let pir = self.pir_regs.lock().expect("pir lock");
+        let val = pir[self.pirq_idx];
+        if val & PIR_DISABLE != 0 {
+            return None;
+        }
+        let irq = (val & PIR_IRQ_MASK) as i32;
+        if irq > 0 { Some(irq) } else { None }
+    }
+}
+
+impl IntrPin for PciIntrPin {
+    fn assert(&self) {
+        let mut asserted = self.asserted.lock().expect("pci pin lock");
+        if !*asserted {
+            *asserted = true;
+            match self.atpic_irq() {
+                Some(atpic_irq) => {
+                    // PIR enabled: route through both ATPIC and IOAPIC
+                    if let Err(e) = self.hdl.isa_assert_irq(
+                        atpic_irq,
+                        self.ioapic_irq,
+                    ) {
+                        eprintln!(
+                            "[pci-intr] assert PIRQ[{}] atpic={} ioapic={} FAILED: {}",
+                            self.pirq_idx, atpic_irq, self.ioapic_irq, e,
+                        );
+                    }
+                }
+                None => {
+                    // PIR disabled (no firmware, or direct boot mode):
+                    // assert IOAPIC pin directly. The guest kernel
+                    // programs IOAPIC via ACPI _PRT regardless of PIR.
+                    let _ = self.hdl.ioapic_assert_irq(self.ioapic_irq);
+                }
+            }
+        }
+    }
+
+    fn deassert(&self) {
+        let mut asserted = self.asserted.lock().expect("pci pin lock");
+        *asserted = false;
+        match self.atpic_irq() {
+            Some(atpic_irq) => {
+                let _ = self.hdl.isa_deassert_irq(
+                    atpic_irq,
+                    self.ioapic_irq,
+                );
+            }
+            None => {
+                let _ = self.hdl.ioapic_deassert_irq(self.ioapic_irq);
+            }
+        }
+    }
+
+    fn is_asserted(&self) -> bool {
+        *self.asserted.lock().expect("pci pin lock")
     }
 }

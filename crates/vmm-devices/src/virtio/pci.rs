@@ -167,9 +167,12 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         let bar_size_aligned = bar_size.next_power_of_two().max(32);
         pci_state.define_bar(BarN::BAR0, BarDefine::Pio(bar_size_aligned));
 
-        // Set interrupt pin if provided
+        // Set interrupt pin and line register
         let intr_pin = if let Some((pin_id, pin)) = lintr_cfg {
             pci_state.set_intr_pin(pin_id as u8);
+            // Pre-set the interrupt line register. The kernel reads
+            // this to determine the IRQ when ACPI _PRT is unavailable.
+            pci_state.set_intr_line(10); // Default IRQ 10 for PCI devices
             Some(pin)
         } else {
             None
@@ -211,19 +214,13 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
 
         // Unregister old handler if present
         if let Some(old_port) = reg.take() {
-            if let Err(e) = self.bus_pio.unregister(old_port) {
-                eprintln!("[virtio-pci] BAR0 unregister failed at {:#x}: {:?}", old_port, e);
-            }
+            let _ = self.bus_pio.unregister(old_port);
         }
 
         // Register new handler if IO is enabled and BAR has an address
         if io_enabled {
             if let Some((BarDefine::Pio(size), addr)) = bar_info {
                 let port = addr as u16;
-                eprintln!(
-                    "[virtio-pci] BAR0 register: io_enabled={} port={:#x} size={}",
-                    io_enabled, port, size,
-                );
                 if port != 0 {
                     let dev = Arc::clone(self);
                     let handler: Arc<PioFn> =
@@ -238,12 +235,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                         Ok(()) => {
                             *reg = Some(port);
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "[virtio-pci] BAR0 register FAILED at {:#x}: {:?}",
-                                port, e,
-                            );
-                        }
+                        Err(_) => {}
                     }
                 }
             }
@@ -251,9 +243,21 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     }
 
     /// Assert the legacy interrupt to notify the guest.
+    ///
+    /// Uses edge-triggered delivery: deassert then reassert to generate
+    /// a new edge. The PciIntrPin calls `vm_isa_assert_irq(atpic, ioapic)`
+    /// which delivers through both the legacy PIC and IOAPIC paths.
     fn raise_interrupt(&self) {
         if let Some(pin) = &self.intr_pin {
-            pin.pulse();
+            pin.deassert();
+            pin.assert();
+        }
+    }
+
+    /// Deassert the interrupt after ISR is read or on device reset.
+    fn lower_interrupt(&self) {
+        if let Some(pin) = &self.intr_pin {
+            pin.deassert();
         }
     }
 
@@ -295,10 +299,14 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 u32::from(vs.status)
             }
             bits::LEGACY_REG_ISR_STATUS => {
-                // Reading ISR clears it
                 let val = vs.isr_status;
-                vs.isr_status = 0;
-                u32::from(val)
+                if val != 0 {
+                    vs.isr_status = 0;
+                    drop(vs);
+                    self.lower_interrupt();
+                    return u32::from(val);
+                }
+                0
             }
             _ => 0,
         }
@@ -325,7 +333,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             }
             bits::LEGACY_REG_QUEUE_PFN => {
                 let queue_sel = vs.queue_select;
-                eprintln!("[virtio-pci] QUEUE_PFN write: queue={} pfn={:#x}", queue_sel, val);
                 if let Some(q) = vs.selected_queue_mut() {
                     q.set_addr_legacy(val);
                     // Notify the device of the new queue address
@@ -339,9 +346,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             }
             bits::LEGACY_REG_QUEUE_NOTIFY => {
                 let queue_idx = val as u16;
-                // Only process if device is in DRIVER_OK state.
-                // Kicking queues before the device is ready can
-                // cause kernel panics (e.g., viona NULL deref in mac).
                 if vs.status & bits::STATUS_DRIVER_OK == 0 {
                     return;
                 }
@@ -351,7 +355,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     &self.physmap,
                 );
                 if did_work {
-                    // Set ISR and raise interrupt
                     vs.isr_status |= bits::ISR_QUEUE_INTR;
                     drop(vs);
                     self.raise_interrupt();
@@ -359,10 +362,14 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             }
             bits::LEGACY_REG_DEVICE_STATUS => {
                 let new_status = val as u8;
-                eprintln!("[virtio-pci] STATUS write: {:#x}", new_status);
                 if new_status == 0 {
                     vs.reset();
                     self.device.reset();
+                    drop(vs);
+                    // Ensure interrupt line is low on reset so the
+                    // next driver doesn't see a spurious assertion
+                    // when it enables the IOAPIC pin.
+                    self.lower_interrupt();
                 } else {
                     vs.status = new_status;
                 }
@@ -384,7 +391,6 @@ impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
     }
 
     fn cfg_write(&self, offset: u8, len: u8, val: u32) {
-        eprintln!("[virtio-cfg] write offset={:#x} val={:#x} len={}", offset, val, len);
         let mut pci = self.pci_state.lock().expect("pci lock poisoned");
         pci.cfg_write(offset, len, val);
 
@@ -393,19 +399,12 @@ impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
         // bus registration.
         let dword_off = offset & 0xFC;
         if dword_off == 0x04 || (0x10..=0x24).contains(&dword_off) {
-            eprintln!(
-                "[virtio-pci] cfg_write offset={:#x} val={:#x} - checking BAR",
-                offset, val,
-            );
-            // Upgrade weak ref to get Arc<Self> for closure capture
             let weak = self.self_ref.lock().expect("self_ref lock");
             if let Some(arc_self) = weak.as_ref().and_then(|w| w.upgrade()) {
                 drop(pci);
                 arc_self.update_bar_registration(
                     &arc_self.pci_state.lock().expect("pci lock"),
                 );
-            } else {
-                eprintln!("[virtio-pci] WARNING: weak self-ref upgrade failed!");
             }
         }
     }
@@ -413,23 +412,6 @@ impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
     fn bar_rw(&self, bar: BarN, offset: usize, rwo: RWOp<'_>) {
         if bar != BarN::BAR0 {
             return;
-        }
-
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static BAR_IO_COUNT: AtomicU64 = AtomicU64::new(0);
-        let count = BAR_IO_COUNT.fetch_add(1, Ordering::Relaxed);
-        if count < 50 || count % 1000 == 0 {
-            match &rwo {
-                RWOp::Read(_) => {
-                    eprintln!("[virtio-bar] #{} read offset={:#x}", count, offset);
-                }
-                RWOp::Write(wo) => {
-                    eprintln!(
-                        "[virtio-bar] #{} write offset={:#x} val={:#x}",
-                        count, offset, wo.read_u32(),
-                    );
-                }
-            }
         }
 
         match rwo {

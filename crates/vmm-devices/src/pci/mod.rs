@@ -19,6 +19,7 @@ pub mod bar;
 pub mod bits;
 pub mod bus;
 pub mod device;
+pub mod msix;
 
 pub use bar::{BarDefine, BarWriteResult, Bars};
 pub use bus::PciBus;

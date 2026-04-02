@@ -108,12 +108,6 @@ fn vcpu_run_loop(
 
     let mut next_entry = VmEntry::Run;
     info!(log, "vCPU run loop starting");
-    let mut exit_count: u64 = 0;
-    let mut pio_count: u64 = 0;
-    let mut mmio_count: u64 = 0;
-    let mut bogus_count: u64 = 0;
-    let mut inst_emul_count: u64 = 0;
-    let start_time = std::time::Instant::now();
 
     loop {
         let exit = match vcpu.enter(&next_entry, api_version) {
@@ -133,36 +127,17 @@ fn vcpu_run_loop(
             }
         };
 
-        exit_count += 1;
-
-        // Periodic stats
-        if exit_count % 10_000 == 0 {
-            let elapsed = start_time.elapsed();
-            eprintln!(
-                "[stats] exits={} pio={} mmio={} bogus={} inst_emul={} ms={} rip={:#x}",
-                exit_count, pio_count, mmio_count, bogus_count,
-                inst_emul_count, elapsed.as_millis(), exit.rip,
-            );
-        }
-
         next_entry = match exit.kind {
             VmExitKind::Bogus | VmExitKind::Debug => {
-                bogus_count += 1;
                 VmEntry::Run
             }
 
             VmExitKind::Inout(ref req) => {
-                pio_count += 1;
-                // Trace kernel-phase PIO accesses
-                if exit_count > 30000 && exit_count < 30020 {
-                    eprintln!("[pio-trace] #{} {:?} rip={:#x}", exit_count, req, exit.rip);
-                }
                 let res = handle_inout(req, bus_pio);
                 VmEntry::InoutFulfill(res)
             }
 
             VmExitKind::Mmio(req) => {
-                mmio_count += 1;
                 let res = handle_mmio(&req, bus_mmio);
                 VmEntry::MmioFulfill(res)
             }
@@ -198,7 +173,6 @@ fn vcpu_run_loop(
             }
 
             VmExitKind::InstEmul { inst, num_valid } => {
-                inst_emul_count += 1;
                 match inst_emul::emulate_inst(
                     vcpu, exit.rip, &inst, num_valid,
                     physmap, bus_mmio,

@@ -131,6 +131,33 @@ impl VirtioViona {
         })
     }
 
+    /// Enable promiscuous mode on the viona device.
+    ///
+    /// When `promiscphys` is true, the VNIC receives all physical
+    /// traffic (MAC spoofing). This is required for VMs with
+    /// `allow_mac_spoofing=true` in the zone config.
+    #[cfg(target_os = "illumos")]
+    pub fn set_promisc(&self, enable: bool) -> std::io::Result<()> {
+        let inner = self.inner.lock().expect("viona lock");
+        let mut mode: i32 = if enable {
+            viona_api::VIONA_PROMISC_ALL
+        } else {
+            viona_api::VIONA_PROMISC_NONE
+        };
+        unsafe {
+            inner.viona_fd.ioctl(
+                viona_api::VNA_IOC_SET_PROMISC,
+                &mut mode,
+            )
+        }?;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    pub fn set_promisc(&self, _enable: bool) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Stub constructor for non-illumos platforms.
     #[cfg(not(target_os = "illumos"))]
     pub fn new(

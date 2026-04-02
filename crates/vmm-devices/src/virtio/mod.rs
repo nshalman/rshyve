@@ -30,11 +30,13 @@ pub mod bits;
 pub mod block;
 pub mod pci;
 pub mod queue;
+pub mod rng;
 pub mod viona;
 
 pub use block::VirtioBlock;
 pub use pci::VirtioPciDevice;
 pub use queue::VirtQueue;
+pub use rng::VirtioRng;
 pub use viona::VirtioViona;
 
 use vmm_core::mem::PhysMap;

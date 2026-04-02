@@ -12,13 +12,17 @@ pub mod acpi_pm;
 pub mod aml;
 pub mod bhyve;
 pub mod chipset;
+pub mod fbuf;
 pub mod fwcfg;
 pub mod lifecycle;
 pub mod migrate;
+pub mod nvme;
 pub mod pci;
 pub mod smbios;
 pub mod uart;
 pub mod virtio;
+pub mod passthru;
+pub mod xhci;
 
 pub use lifecycle::{IndicatedState, Indicator, Lifecycle};
 pub use migrate::{

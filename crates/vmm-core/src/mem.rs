@@ -142,6 +142,20 @@ impl SubMapping {
         }
     }
 
+    /// Get the raw host pointer to the start of this mapping.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer aliases guest memory that vCPUs access
+    /// concurrently. It must only be used as a target for raw I/O
+    /// operations (`pread`, `pwrite`, `preadv`, `pwritev`) — never
+    /// dereferenced as a Rust reference. The caller must keep this
+    /// `SubMapping` alive for the duration of the I/O.
+    #[inline]
+    pub unsafe fn as_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
     /// Create a sub-region within this mapping.
     ///
     /// Returns `None` if `offset + len` exceeds the mapping bounds.

@@ -15,7 +15,7 @@ use slog::{info, warn, error, o, Drain, Logger};
 
 use vmm_config::Cli;
 use vmm_core::hdl::CreateOpts;
-use vmm_core::intr_pins::{IoApicPin, LegacyPIC, NoOpPin};
+use vmm_core::intr_pins::{LegacyPIC, NoOpPin};
 use vmm_core::machine::Builder;
 use vmm_devices::bhyve::{
     BhyveAtPic, BhyveAtPit, BhyveHpet, BhyveIoApic, BhyveRtc,
@@ -25,13 +25,15 @@ use vmm_devices::acpi;
 use vmm_devices::chipset::i440fx::I440FxChipset;
 use vmm_devices::fwcfg::FwCfg;
 use vmm_devices::smbios;
-use vmm_devices::pci::{Bdf, BarN};
+use vmm_devices::pci::Bdf;
 use vmm_devices::uart::lpc::{self, LpcUart};
-use vmm_devices::virtio::block::VirtioBlock;
+use vmm_devices::virtio::block::{VirtioBlock, VirtioBlockOpts};
 use vmm_devices::virtio::pci::VirtioPciDevice;
 use vmm_devices::virtio::viona::VirtioViona;
 
 mod bootrom;
+mod control;
+mod direct_boot;
 mod vcpu_tasks;
 
 fn setup_logger() -> Logger {
@@ -94,7 +96,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
 
     let opts = CreateOpts {
         force: true,
-        use_reservoir: false,
+        use_reservoir: cli.wire_memory,
         track_dirty: cli.track_dirty,
     };
 
@@ -106,21 +108,40 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         .build()
         .context("failed to create VM")?;
 
-    // Phase 2: Load bootrom
-    let rom_path = bootrom::find_bootrom_path(&cli.lpc);
-    info!(log, "loading bootrom"; "path" => rom_path.display().to_string());
+    // Phase 2: Load kernel or bootrom
+    let direct_boot_mode = cli.kernel.is_some();
 
-    let rom = bootrom::BootromFile::open(&rom_path)?;
-    info!(log, "bootrom validated";
-        "size" => rom.size(),
-        "path" => rom.path().display().to_string(),
-    );
+    // Parse direct boot images before finalize (need mutable map access).
+    // In direct boot mode, kernel loading happens after device init so
+    // ACPI tables are ready. For bootrom mode, load ROM now.
+    let kernel_image = if let Some(ref kpath) = cli.kernel {
+        info!(log, "direct boot mode"; "kernel" => kpath.display().to_string());
+        let ki = direct_boot::KernelImage::open(kpath)?;
+        info!(log, "kernel validated";
+            "entry" => format!("{:#x}", ki.entry_point_64()),
+        );
+        Some(ki)
+    } else {
+        None
+    };
 
-    {
+    let initrd_image = if let Some(ref ipath) = cli.initrd {
+        Some(direct_boot::InitrdImage::open(ipath)?)
+    } else {
+        None
+    };
+
+    if !direct_boot_mode {
+        let rom_path = bootrom::find_bootrom_path(&cli.lpc);
+        info!(log, "loading bootrom"; "path" => rom_path.display().to_string());
+        let rom = bootrom::BootromFile::open(&rom_path)?;
+        info!(log, "bootrom validated";
+            "size" => rom.size(),
+            "path" => rom.path().display().to_string(),
+        );
         let hdl = setup.hdl().clone();
         bootrom::load_bootrom(setup.map_mut(), &hdl, &rom)?;
     }
-    drop(rom);
 
     // Finalize: wrap PhysMap in Arc, create vCPUs and buses
     let machine = setup.finalize();
@@ -153,7 +174,10 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     let pic = LegacyPIC::new(machine.hdl().clone());
 
     // Create i440fx chipset (host bridge + ISA bridge + PCI config ports)
-    let chipset = I440FxChipset::create(machine.bus_pio());
+    let chipset = I440FxChipset::create(
+        machine.bus_pio(),
+        Some(machine.hdl().clone()),
+    );
     info!(log, "chipset initialized"; "type" => "i440fx");
 
     // Create bhyve kernel-emulated devices.
@@ -191,14 +215,20 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         .context("failed to configure PM timer")?;
 
     // Set SCI IRQ (9) to level-triggered mode in the kernel ATPIC.
-    // This is required for ACPI SCI delivery to work correctly.
     machine.hdl().isa_set_irq_trigger(9, true)
         .context("failed to set SCI IRQ trigger mode")?;
+
+    // Set PCI IRQs 10 and 11 to level-triggered (firmware assigns these
+    // via PIR registers to PIRQ links A-D).
+    machine.hdl().isa_set_irq_trigger(10, true)
+        .context("failed to set IRQ 10 trigger mode")?;
+    machine.hdl().isa_set_irq_trigger(11, true)
+        .context("failed to set IRQ 11 trigger mode")?;
     info!(log, "PM timer attached"; "port" => format!("{:#x}", pmtimer.port()));
 
     // Create ACPI PM1 event/enable/control registers + reset handler
     let _acpi_pm = vmm_devices::acpi_pm::AcpiPm::create_and_attach(machine.bus_pio());
-    info!(log, "ACPI PM registers attached"; "pmbase" => format!("{:#x}", 0xB000));
+    info!(log, "ACPI PM registers attached"; "pmbase" => format!("{:#x}", 0x400));
 
     // Create COM1 UART (IRQ 4, base port 0x3F8)
     let com1_irq: Arc<dyn vmm_core::intr_pins::IntrPin> =
@@ -228,6 +258,26 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         let _ = std::io::stdout().write_all(&[b]);
         let _ = std::io::stdout().flush();
     }));
+
+    // Spawn stdin→COM1 input thread (serial console input)
+    {
+        let com1_input = com1.clone();
+        thread::Builder::new()
+            .name("serial-input".into())
+            .spawn(move || {
+                use std::io::Read;
+                let stdin = std::io::stdin();
+                let mut buf = [0u8; 1];
+                loop {
+                    match stdin.lock().read(&mut buf) {
+                        Ok(0) => break, // EOF
+                        Ok(_) => { com1_input.input_byte(buf[0]); }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .expect("failed to spawn serial input thread");
+    }
 
     // ----- fw_cfg, E820, and ACPI table setup -----
 
@@ -303,7 +353,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
             info!(log, "legacy ACPI tables at 0xF2400"; "size" => legacy_tables.data.len());
         }
         // Also write RSDP at 0xE0000 for easier scan discovery
-        let rsdp_start = 0; // RSDP is at the start of legacy_tables.data
+        let _rsdp_start = 0; // RSDP is at the start of legacy_tables.data
         let rsdp_size = 36;
         if legacy_tables.data.len() >= rsdp_size {
             if let Err(e) = machine.memctx().write(0xE0000, &legacy_tables.data[..rsdp_size]) {
@@ -356,9 +406,9 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
             slot_spec,
             &chipset,
             machine.bus_pio(),
+            machine.bus_mmio(),
             machine.physmap(),
             machine.hdl(),
-            &pic,
             log,
         ) {
             Ok(Some(dev)) => _pci_devices.push(dev),
@@ -376,20 +426,61 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     // Keep chipset alive for the duration
     let _chipset = chipset;
 
+    // ----- Direct boot: load kernel into guest RAM -----
+
+    if let Some(ref kernel) = kernel_image {
+        let cmdline = cli.cmdline.as_deref()
+            .unwrap_or("console=ttyS0 earlyprintk=serial");
+        let acpi_rsdp_addr = acpi::BHYVE_ACPI_BASE as u64;
+        let entry = direct_boot::load_kernel(
+            machine.memctx(),
+            kernel,
+            cmdline,
+            initrd_image.as_ref(),
+            mem_size,
+            acpi_rsdp_addr,
+        )?;
+        info!(log, "kernel loaded for direct boot";
+            "entry" => format!("{:#x}", entry),
+            "cmdline" => cmdline,
+        );
+    }
+
     // ----- vCPU startup -----
 
-    // Activate and initialize all vCPUs
+    // Activate all vCPUs and set capabilities
     for vcpu in machine.vcpus() {
         vcpu.activate()
             .with_context(|| format!("failed to activate vCPU {}", vcpu.id()))?;
-        vcpu.reboot_state()
-            .with_context(|| format!("failed to reset vCPU {}", vcpu.id()))?;
+
+        // -H: exit on HLT instead of idling in-kernel
+        if cli.vmexit_on_hlt {
+            machine.hdl().set_capability(
+                vcpu.id(),
+                bhyve_api::vm_cap_type::VM_CAP_HALT_EXIT as i32,
+                1,
+            ).with_context(|| format!("failed to set HALT_EXIT on vCPU {}", vcpu.id()))?;
+        }
     }
 
-    // Set up BSP (vCPU 0) for boot
-    if let Some(bsp) = machine.vcpus().first() {
-        bsp.setup_bsp()
-            .context("failed to set up BSP")?;
+    // Set up BSP based on boot mode
+    if let Some(ref kernel) = kernel_image {
+        // Direct boot: configure BSP for 64-bit long mode entry
+        if let Some(bsp) = machine.vcpus().first() {
+            direct_boot::setup_direct_boot_bsp(bsp, kernel.entry_point_64())
+                .context("failed to set up BSP for direct boot")?;
+        }
+        info!(log, "BSP configured for direct boot");
+    } else {
+        // UEFI boot: standard x86 reset vector entry
+        for vcpu in machine.vcpus() {
+            vcpu.reboot_state()
+                .with_context(|| format!("failed to reset vCPU {}", vcpu.id()))?;
+        }
+        if let Some(bsp) = machine.vcpus().first() {
+            bsp.setup_bsp()
+                .context("failed to set up BSP")?;
+        }
     }
 
     info!(log, "starting vCPU threads");
@@ -403,6 +494,28 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         api_version,
         log,
     );
+
+    // Spawn control socket if --control-socket was specified
+    let control_cleanup = if let Some(ref sock_path) = cli.control_socket {
+        let ctrl = control::VmController::new(
+            machine.hdl().clone(),
+            cli.vm_name.clone(),
+            num_cpus,
+            mem_size,
+        );
+        match control::spawn_control_thread(sock_path, ctrl, log.clone()) {
+            Ok((_handle, path)) => {
+                info!(log, "control socket listening"; "path" => path.display().to_string());
+                Some(path)
+            }
+            Err(e) => {
+                error!(log, "failed to start control socket"; "error" => %e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Wait for the first vCPU event
     match event_rx.recv() {
@@ -428,7 +541,12 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         let _ = handle.join();
     }
 
-    // Clean up
+    // Clean up control socket
+    if let Some(ref path) = control_cleanup {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // Clean up VM
     if let Err(e) = machine.hdl().destroy() {
         warn!(log, "failed to destroy VM"; "error" => %e);
     }
@@ -447,9 +565,9 @@ fn parse_and_create_pci_device(
     spec: &str,
     chipset: &I440FxChipset,
     bus_pio: &Arc<vmm_core::pio::PioBus>,
+    bus_mmio: &Arc<vmm_core::mmio::MmioBus>,
     physmap: &Arc<vmm_core::mem::PhysMap>,
     vmm_hdl: &Arc<vmm_core::hdl::VmmHdl>,
-    pic: &Arc<LegacyPIC>,
     log: &Logger,
 ) -> anyhow::Result<Option<Arc<dyn vmm_devices::pci::PciDevice>>> {
     let parts: Vec<&str> = spec.splitn(3, ',').collect();
@@ -467,32 +585,29 @@ fn parse_and_create_pci_device(
             if config.is_empty() {
                 anyhow::bail!("virtio-blk requires a disk path");
             }
+            // Parse config: path[,nodelete][,sectorsize=N][,ro]
+            let (path, opts) = parse_blk_config(config);
             use std::fs::OpenOptions;
             let file = OpenOptions::new()
                 .read(true)
-                .write(true)
-                .open(config)
-                .with_context(|| format!("failed to open disk: {}", config))?;
-            let blk = VirtioBlock::new(file, false)
-                .with_context(|| format!("failed to create virtio-blk for: {}", config))?;
+                .write(!opts.read_only)
+                .open(path)
+                .with_context(|| format!("failed to open disk: {}", path))?;
+            let blk = VirtioBlock::new(file, &opts)
+                .with_context(|| format!("failed to create virtio-blk for: {}", path))?;
 
-            // PCI interrupt routing: DSDT _PRT maps slot N, pin A to
-            // GSI = 16 + ((slot - 1) % 8). Must match the APRT table in DSDT.
-            // Use IOAPIC for GSI >= 16 (PCI interrupts).
-            let gsi = 16 + ((bdf.dev() as u8) % 8);
-            let irq_pin: Arc<dyn vmm_core::intr_pins::IntrPin> =
-                IoApicPin::new(gsi, Arc::clone(vmm_hdl));
-            let lintr = Some((
-                vmm_devices::pci::INTxPinID::IntA,
-                irq_pin,
-            ));
+            // Get PIRQ-routed interrupt pin from the chipset.
+            // The firmware programs PIR registers to map PIRQ links
+            // to ISA IRQs. The chipset handles the routing dynamically.
+            let lintr = chipset.route_lintr(&bdf);
 
+            let cfg_size = blk.config_size();
             let pci_dev = VirtioPciDevice::new(
                 blk,
                 vmm_devices::virtio::bits::VIRTIO_DEV_TYPE_BLOCK,
                 1,    // 1 queue for block
                 128,  // queue size
-                8,    // device config size (capacity u64)
+                cfg_size,
                 lintr,
                 Arc::clone(physmap),
                 Arc::clone(bus_pio),
@@ -502,7 +617,7 @@ fn parse_and_create_pci_device(
             info!(log, "virtio-blk attached";
                 "bdf" => %bdf,
                 "path" => config,
-                "gsi" => gsi,
+                "pirq" => "via chipset",
             );
             Ok(Some(pci_dev))
         }
@@ -510,20 +625,28 @@ fn parse_and_create_pci_device(
             if config.is_empty() {
                 anyhow::bail!("virtio-net-viona requires a VNIC name");
             }
+            // Parse config: vnic_name[,promiscphys=true]
+            let (vnic_name, promiscphys) = if let Some(comma) = config.find(',') {
+                let name = &config[..comma];
+                let promisc = config[comma + 1..].split(',')
+                    .any(|opt| opt == "promiscphys" || opt == "promiscphys=true");
+                (name, promisc)
+            } else {
+                (config, false)
+            };
+
             use std::os::fd::AsRawFd;
-            let viona = VirtioViona::new(config, vmm_hdl.as_raw_fd())
+            let viona = VirtioViona::new(vnic_name, vmm_hdl.as_raw_fd())
                 .with_context(|| {
-                    format!("failed to create viona device for VNIC: {}", config)
+                    format!("failed to create viona device for VNIC: {}", vnic_name)
                 })?;
 
-            // PCI interrupt routing via IOAPIC (must match DSDT _PRT)
-            let gsi = 16 + ((bdf.dev() as u8) % 8);
-            let irq_pin: Arc<dyn vmm_core::intr_pins::IntrPin> =
-                IoApicPin::new(gsi, Arc::clone(vmm_hdl));
-            let lintr = Some((
-                vmm_devices::pci::INTxPinID::IntA,
-                irq_pin,
-            ));
+            if promiscphys {
+                viona.set_promisc(true)
+                    .with_context(|| format!("failed to set promiscphys on {}", vnic_name))?;
+            }
+
+            let lintr = chipset.route_lintr(&bdf);
 
             let pci_dev = VirtioPciDevice::new(
                 viona,
@@ -539,10 +662,120 @@ fn parse_and_create_pci_device(
             chipset.attach_device(bdf, pci_dev.clone());
             info!(log, "virtio-net-viona attached";
                 "bdf" => %bdf,
-                "vnic" => config,
-                "gsi" => gsi,
+                "vnic" => vnic_name,
+                "promiscphys" => promiscphys,
             );
             Ok(Some(pci_dev))
+        }
+        "nvme" => {
+            if config.is_empty() {
+                anyhow::bail!("nvme requires a disk path");
+            }
+            let (path, blk_opts) = parse_blk_config(config);
+            use std::fs::OpenOptions;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(!blk_opts.read_only)
+                .open(path)
+                .with_context(|| format!("failed to open disk: {}", path))?;
+
+            let nvme = vmm_devices::nvme::NvmeController::new(
+                file,
+                blk_opts.read_only,
+                bdf.dev(), // unique instance ID per slot
+                Arc::clone(physmap),
+                Arc::clone(vmm_hdl),
+                Arc::clone(bus_mmio),
+            );
+
+            chipset.attach_device(bdf, nvme.clone());
+            info!(log, "nvme attached";
+                "bdf" => %bdf,
+                "path" => path,
+            );
+            Ok(Some(nvme))
+        }
+        "virtio-rnd" => {
+            let rng = vmm_devices::virtio::VirtioRng::new();
+            let lintr = chipset.route_lintr(&bdf);
+            let pci_dev = VirtioPciDevice::new(
+                rng,
+                vmm_devices::virtio::bits::VIRTIO_DEV_TYPE_RNG,
+                1,    // 1 queue
+                64,   // queue size
+                0,    // no device-specific config
+                lintr,
+                Arc::clone(physmap),
+                Arc::clone(bus_pio),
+            );
+            chipset.attach_device(bdf, pci_dev.clone());
+            info!(log, "virtio-rnd attached"; "bdf" => %bdf);
+            Ok(Some(pci_dev))
+        }
+        "fbuf" => {
+            // Parse config: vga=off,unix=/path[,password=pwd][,w=N][,h=N]
+            let mut vnc_path = std::path::PathBuf::from("/tmp/vm.vnc");
+            let mut vnc_password = None;
+            let mut width: u16 = 1024;
+            let mut height: u16 = 768;
+            for opt in config.split(',') {
+                if let Some(p) = opt.strip_prefix("unix=") {
+                    vnc_path = std::path::PathBuf::from(p);
+                } else if let Some(p) = opt.strip_prefix("password=") {
+                    vnc_password = Some(p.to_string());
+                } else if let Some(w) = opt.strip_prefix("w=") {
+                    width = w.parse().unwrap_or(1024);
+                } else if let Some(h) = opt.strip_prefix("h=") {
+                    height = h.parse().unwrap_or(768);
+                }
+                // vga=off is the default, ignore
+            }
+
+            let fbuf = vmm_devices::fbuf::Framebuffer::new(
+                width,
+                height,
+                &vnc_path,
+                vnc_password,
+                Arc::clone(bus_mmio),
+            );
+            chipset.attach_device(bdf, fbuf.clone());
+            info!(log, "fbuf attached";
+                "bdf" => %bdf,
+                "vnc" => vnc_path.display().to_string(),
+                "resolution" => format!("{}x{}", width, height),
+            );
+            Ok(Some(fbuf))
+        }
+        "xhci" => {
+            // xHCI USB controller with tablet device
+            // Config is just "tablet" (the attached USB device)
+            let lintr = chipset.route_lintr(&bdf);
+            let intr_pin = lintr.map(|(_, pin)| pin);
+            let xhci = vmm_devices::xhci::XhciController::new(
+                Arc::clone(physmap),
+                Arc::clone(bus_mmio),
+                intr_pin,
+            );
+            chipset.attach_device(bdf, xhci.clone());
+            info!(log, "xhci tablet attached"; "bdf" => %bdf);
+            Ok(Some(xhci))
+        }
+        "passthru" => {
+            if config.is_empty() {
+                anyhow::bail!("passthru requires a device path (e.g., /dev/ppt0)");
+            }
+            // Config is just the path to /dev/pptN
+            let path = config.split(',').next().unwrap_or(config);
+            let dev = vmm_devices::passthru::PciPassthru::new(
+                path,
+                Arc::clone(vmm_hdl),
+            ).with_context(|| format!("failed to init passthru device: {}", path))?;
+            chipset.attach_device(bdf, dev.clone());
+            info!(log, "passthru attached";
+                "bdf" => %bdf,
+                "path" => path,
+            );
+            Ok(Some(dev))
         }
         "hostbridge" => {
             // Already created by chipset, skip
@@ -560,6 +793,36 @@ fn parse_and_create_pci_device(
             Ok(None)
         }
     }
+}
+
+/// Parse a virtio-blk config string: `path[,nodelete][,sectorsize=N][,ro]`
+///
+/// Returns the disk path and options struct.
+fn parse_blk_config(config: &str) -> (&str, VirtioBlockOpts) {
+    let mut opts = VirtioBlockOpts::default();
+    let mut path = config;
+
+    // The first comma-separated token is the path; the rest are options.
+    // But paths can't contain commas, so split on comma is safe.
+    if let Some(comma) = config.find(',') {
+        path = &config[..comma];
+        for opt in config[comma + 1..].split(',') {
+            match opt {
+                "nodelete" => opts.nodelete = true,
+                "ro" => opts.read_only = true,
+                s if s.starts_with("sectorsize=") => {
+                    if let Ok(sz) = s["sectorsize=".len()..].parse::<u32>() {
+                        if sz.is_power_of_two() && sz >= 512 {
+                            opts.sector_size = sz;
+                        }
+                    }
+                }
+                _ => {} // ignore unknown options (forward compat)
+            }
+        }
+    }
+
+    (path, opts)
 }
 
 /// Parse a BDF string: "dev", "dev:func", or "bus:dev:func"

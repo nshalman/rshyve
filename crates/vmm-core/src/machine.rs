@@ -193,8 +193,9 @@ impl Builder {
     /// adding ROM and other regions before finalization.
     pub fn build(self) -> anyhow::Result<MachineSetup> {
         anyhow::ensure!(
-            self.num_cpus > 0 && self.num_cpus <= 32,
-            "num_cpus must be 1..=32, got {}",
+            self.num_cpus > 0 && self.num_cpus <= bhyve_api::VM_MAXCPU as u32,
+            "num_cpus must be 1..={}, got {}",
+            bhyve_api::VM_MAXCPU,
             self.num_cpus,
         );
         anyhow::ensure!(

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use bhyve_api::{
     ioctls,
-    vm_exit, vm_register, vm_run_state,
+    vm_exit, vm_register, vm_run_state, vm_seg_desc, seg_desc,
     vm_reg_name, VRS_RUN,
 };
 
@@ -160,6 +160,28 @@ impl Vcpu {
         // Safety: vm_vcpu_reset is the correct struct for VM_RESET_CPU.
         let res = unsafe {
             libc::ioctl(fd, ioctls::VM_RESET_CPU as _, &mut vvr)
+        };
+        if res == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Set a guest segment descriptor (CS, DS, SS, ES, FS, GS, TR, LDTR, GDTR, IDTR).
+    pub fn set_segment_desc(
+        &self,
+        reg: vm_reg_name,
+        desc: &seg_desc,
+    ) -> std::io::Result<()> {
+        let mut vsd = vm_seg_desc {
+            cpuid: self.id,
+            regnum: reg as i32,
+            desc: *desc,
+        };
+        let fd = self.hdl.as_raw_fd();
+        // Safety: vm_seg_desc is the correct struct for VM_SET_SEGMENT_DESCRIPTOR.
+        let res = unsafe {
+            libc::ioctl(fd, ioctls::VM_SET_SEGMENT_DESCRIPTOR as _, &mut vsd)
         };
         if res == -1 {
             return Err(std::io::Error::last_os_error());

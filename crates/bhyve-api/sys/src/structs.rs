@@ -611,3 +611,90 @@ pub const VNO_OP_EN_TRACK_DIRTY: u32 = 0x21;
 pub const VNO_OP_DIS_TRACK_DIRTY: u32 = 0x22;
 pub const VNO_FLAG_BITMAP_IN: u32 = 1 << 30;
 pub const VNO_FLAG_BITMAP_OUT: u32 = 1 << 31;
+
+// ── PCI passthrough (PPT) device structs ─────────────────────────
+
+/// Bind/unbind a PPT device to/from a VM.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct vm_pptdev {
+    pub pptfd: c_int,
+}
+
+/// Map/unmap PPT device MMIO into guest physical address space.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct vm_pptdev_mmio {
+    pub pptfd: c_int,
+    pub gpa: u64,
+    pub hpa: u64,
+    pub len: size_t,
+}
+
+/// Configure MSI interrupt delivery for a PPT device.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct vm_pptdev_msi {
+    pub vcpu: c_int,
+    pub pptfd: c_int,
+    pub numvec: c_int,
+    pub msg: u64,
+    pub addr: u64,
+}
+
+/// Configure a single MSI-X vector for a PPT device.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct vm_pptdev_msix {
+    pub vcpu: c_int,
+    pub pptfd: c_int,
+    pub idx: c_int,
+    pub msg: u64,
+    pub vector_control: u32,
+    pub addr: u64,
+}
+
+/// Query MSI/MSI-X interrupt limits for a PPT device.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct vm_pptdev_limits {
+    pub pptfd: c_int,
+    pub msi_limit: c_int,
+    pub msix_limit: c_int,
+}
+
+// ── PPT device ioctls (on /dev/pptN fd) ─────────────────────────
+
+/// PPT device config space read.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct ppt_cfg_io {
+    pub pci_off: u64,
+    pub pci_width: u32,
+    pub pci_data: u32,
+}
+
+/// PPT device BAR query.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct ppt_bar_query {
+    pub pbq_baridx: u32,
+    pub pbq_type: u32,
+    pub pbq_base: u64,
+    pub pbq_size: u64,
+}
+
+/// PPT device BAR I/O.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct ppt_bar_io {
+    pub pbi_bar: u32,
+    pub pbi_off: u32,
+    pub pbi_width: u32,
+    pub pbi_data: u32,
+}
+
+/// PPT BAR type constants.
+pub const PCI_ADDR_IO: u32 = 1;
+pub const PCI_ADDR_MEM32: u32 = 2;
+pub const PCI_ADDR_MEM64: u32 = 3;

@@ -12,7 +12,8 @@ pub use ioctls::*;
 pub use structs::*;
 pub use vmm_data::*;
 
-pub const VM_MAXCPU: usize = 32;
+/// Maximum vCPUs per VM (matches kernel's VM_MAXCPU).
+pub const VM_MAXCPU: usize = 64;
 
 /// This is the VMM interface version which bhyve_api expects to operate
 /// against.  All constants and structs defined by the crate are done so in

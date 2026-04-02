@@ -116,6 +116,8 @@ pub const VIRTIO_PCI_VENDOR_ID: u16 = 0x1AF4;
 pub const VIRTIO_DEV_TYPE_NET: u16 = 1;
 /// Block device.
 pub const VIRTIO_DEV_TYPE_BLOCK: u16 = 2;
+/// Entropy (RNG) device.
+pub const VIRTIO_DEV_TYPE_RNG: u16 = 4;
 
 /// Sector size for virtio-block (always 512 bytes).
 pub const SECTOR_SIZE: u64 = 512;

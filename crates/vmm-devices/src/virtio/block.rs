@@ -47,6 +47,28 @@ struct VirtioBlkReqHdr {
     sector: u64,
 }
 
+/// Configuration options for a virtio-blk device.
+#[derive(Debug, Clone)]
+pub struct VirtioBlockOpts {
+    /// Disk is read-only.
+    pub read_only: bool,
+    /// Disable TRIM/discard (nodelete). When true, the device does
+    /// not advertise the discard feature.
+    pub nodelete: bool,
+    /// Logical sector size in bytes (default 512).
+    pub sector_size: u32,
+}
+
+impl Default for VirtioBlockOpts {
+    fn default() -> Self {
+        Self {
+            read_only: false,
+            nodelete: false,
+            sector_size: 512,
+        }
+    }
+}
+
 /// VirtIO block device backed by a file.
 pub struct VirtioBlock {
     inner: Mutex<VirtioBlockInner>,
@@ -59,32 +81,51 @@ struct VirtioBlockInner {
     capacity: u64,
     /// Whether the device is read-only.
     read_only: bool,
+    /// Logical sector size in bytes.
+    sector_size: u32,
+    /// Whether discard/TRIM is disabled.
+    nodelete: bool,
     /// Features negotiated by the guest.
     negotiated_features: u32,
 }
 
+/// Size of the extended config when BLK_SIZE feature is advertised.
+/// capacity(8) + size_max(4) + seg_max(4) + geometry(8) + blk_size(4) = 28
+pub const BLK_CONFIG_SIZE_EXT: u16 = 28;
+
 impl VirtioBlock {
     /// Create a new virtio-block device from an open file.
     ///
-    /// The file's size determines the device capacity. If `read_only`
-    /// is true, write requests from the guest will be rejected.
+    /// The file's size determines the device capacity.
     ///
     /// # Errors
     ///
     /// Returns an error if the file metadata cannot be read.
-    pub fn new(file: File, read_only: bool) -> std::io::Result<Self> {
+    pub fn new(file: File, opts: &VirtioBlockOpts) -> std::io::Result<Self> {
         let metadata = file.metadata()?;
         let size = metadata.len();
-        let capacity = size / bits::SECTOR_SIZE;
+        let capacity = size / u64::from(opts.sector_size);
 
         Ok(Self {
             inner: Mutex::new(VirtioBlockInner {
                 file,
                 capacity,
-                read_only,
+                read_only: opts.read_only,
+                sector_size: opts.sector_size,
+                nodelete: opts.nodelete,
                 negotiated_features: 0,
             }),
         })
+    }
+
+    /// Config space size based on whether BLK_SIZE is advertised.
+    pub fn config_size(&self) -> u16 {
+        let inner = self.inner.lock().expect("block lock");
+        if inner.sector_size != 512 {
+            BLK_CONFIG_SIZE_EXT
+        } else {
+            BLK_CONFIG_SIZE
+        }
     }
 
     /// Process a single block request from the virtqueue.
@@ -101,20 +142,8 @@ impl VirtioBlock {
         // Collect the descriptor chain
         let chain = match queue.collect_chain(physmap, head) {
             Some(c) => c,
-            None => {
-                eprintln!("[blk] no chain for head={}", head);
-                return 0;
-            }
+            None => return 0,
         };
-
-        {
-            use std::sync::atomic::{AtomicU64, Ordering as AO};
-            static REQ_N: AtomicU64 = AtomicU64::new(0);
-            let n = REQ_N.fetch_add(1, AO::Relaxed);
-            if n < 3 || n % 100 == 0 {
-                eprintln!("[blk] req#{} head={}", n, head);
-            }
-        }
 
         if chain.len() < 2 {
             // Need at least header + status
@@ -173,17 +202,6 @@ impl VirtioBlock {
         };
 
         drop(inner);
-
-        use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
-        static REQ_COUNT: AtomicU64 = AtomicU64::new(0);
-        let n = REQ_COUNT.fetch_add(1, AtOrd::Relaxed);
-        if n < 5 || status != 0 {
-            eprintln!(
-                "[blk] req#{} type={} sector={} status={} chain_len={}",
-                n, header.rtype, header.sector, status, chain.len(),
-            );
-        }
-
         self.write_status(physmap, &chain, status)
     }
 
@@ -342,6 +360,10 @@ impl VirtioDevice for VirtioBlock {
         if inner.read_only {
             features |= bits::VIRTIO_BLK_F_RO as u32;
         }
+        if inner.sector_size != 512 {
+            features |= bits::VIRTIO_BLK_F_BLK_SIZE as u32;
+        }
+        // nodelete: we simply don't advertise discard features
         features
     }
 
@@ -353,20 +375,27 @@ impl VirtioDevice for VirtioBlock {
     fn cfg_read(&self, offset: u16, len: u8) -> u32 {
         let inner = self.inner.lock().expect("block lock poisoned");
 
-        // Device config is the capacity as a u64 at offset 0.
-        // The guest may read it byte-by-byte, word, or dword.
-        let cap_bytes = inner.capacity.to_le_bytes();
+        // Device config layout (virtio 1.2 sec 5.2.4):
+        //   0x00: capacity (u64, 8 bytes)
+        //   0x08: size_max (u32) — not used
+        //   0x0C: seg_max (u32) — not used
+        //   0x10: geometry (8 bytes) — not used
+        //   0x18: blk_size (u32) — sector size if BLK_SIZE feature
+        let mut config = [0u8; 28];
+        config[..8].copy_from_slice(&inner.capacity.to_le_bytes());
+        if inner.sector_size != 512 {
+            config[0x18..0x1C].copy_from_slice(&inner.sector_size.to_le_bytes());
+        }
         let off = offset as usize;
 
-        if off >= cap_bytes.len() {
+        if off >= config.len() {
             return 0;
         }
 
-        // Read 1, 2, or 4 bytes from the capacity, little-endian
         let mut result = 0u32;
         for i in 0..len.min(4) as usize {
-            if off + i < cap_bytes.len() {
-                result |= (cap_bytes[off + i] as u32) << (i * 8);
+            if off + i < config.len() {
+                result |= (config[off + i] as u32) << (i * 8);
             }
         }
         result
@@ -401,14 +430,17 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn make_test_block(size: u64) -> (VirtioBlock, NamedTempFile) {
+        make_test_block_opts(size, &VirtioBlockOpts::default())
+    }
+
+    fn make_test_block_opts(size: u64, opts: &VirtioBlockOpts) -> (VirtioBlock, NamedTempFile) {
         let mut tmp = NamedTempFile::new().unwrap();
-        // Write `size` bytes of zeros
         let zeros = vec![0u8; size as usize];
         tmp.write_all(&zeros).unwrap();
         tmp.flush().unwrap();
 
         let file = tmp.reopen().unwrap();
-        let blk = VirtioBlock::new(file, false).unwrap();
+        let blk = VirtioBlock::new(file, opts).unwrap();
         (blk, tmp)
     }
 
@@ -445,7 +477,10 @@ mod tests {
             f.write_all(&[0u8; 512]).unwrap();
         }
         let file = tmp.reopen().unwrap();
-        let blk = VirtioBlock::new(file, true).unwrap();
+        let blk = VirtioBlock::new(file, &VirtioBlockOpts {
+            read_only: true,
+            ..Default::default()
+        }).unwrap();
         let features = blk.device_features();
         assert_ne!(features & bits::VIRTIO_BLK_F_RO as u32, 0);
     }
