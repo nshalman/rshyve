@@ -1431,10 +1431,12 @@ dependencies = [
  "slog-async",
  "slog-term",
  "thiserror",
+ "tokio",
  "viona_api",
  "vmm_config",
  "vmm_core",
  "vmm_devices",
+ "vmm_migrate",
 ]
 
 [[package]]

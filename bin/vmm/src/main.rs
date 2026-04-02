@@ -131,7 +131,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         None
     };
 
-    if !direct_boot_mode {
+    if !direct_boot_mode && cli.migrate_listen.is_none() {
         let rom_path = bootrom::find_bootrom_path(&cli.lpc);
         info!(log, "loading bootrom"; "path" => rom_path.display().to_string());
         let rom = bootrom::BootromFile::open(&rom_path)?;
@@ -446,40 +446,111 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         );
     }
 
-    // ----- vCPU startup -----
+    // ----- Migration destination mode -----
+    //
+    // If --migrate-listen is set, we skip bootrom/vCPU setup and instead
+    // wait for migration data. After importing state, we start vCPUs
+    // with the imported register/device state.
+    if let Some(ref listen_addr) = cli.migrate_listen {
+        info!(log, "migration destination mode"; "listen" => listen_addr);
 
-    // Activate all vCPUs and set capabilities
-    for vcpu in machine.vcpus() {
-        vcpu.activate()
-            .with_context(|| format!("failed to activate vCPU {}", vcpu.id()))?;
-
-        // -H: exit on HLT instead of idling in-kernel
-        if cli.vmexit_on_hlt {
-            machine.hdl().set_capability(
-                vcpu.id(),
-                bhyve_api::vm_cap_type::VM_CAP_HALT_EXIT as i32,
-                1,
-            ).with_context(|| format!("failed to set HALT_EXIT on vCPU {}", vcpu.id()))?;
-        }
-    }
-
-    // Set up BSP based on boot mode
-    if let Some(ref kernel) = kernel_image {
-        // Direct boot: configure BSP for 64-bit long mode entry
-        if let Some(bsp) = machine.vcpus().first() {
-            direct_boot::setup_direct_boot_bsp(bsp, kernel.entry_point_64())
-                .context("failed to set up BSP for direct boot")?;
-        }
-        info!(log, "BSP configured for direct boot");
-    } else {
-        // UEFI boot: standard x86 reset vector entry
+        // Activate and reset vCPUs. The reset initializes the VMCS/VMCB
+        // host-state fields. The migration import then overwrites the
+        // guest-state fields with the source's values.
         for vcpu in machine.vcpus() {
+            vcpu.activate()
+                .with_context(|| format!("failed to activate vCPU {}", vcpu.id()))?;
             vcpu.reboot_state()
                 .with_context(|| format!("failed to reset vCPU {}", vcpu.id()))?;
         }
-        if let Some(bsp) = machine.vcpus().first() {
-            bsp.setup_bsp()
-                .context("failed to set up BSP")?;
+
+        // Listen for migration connection
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create tokio runtime")?;
+
+        let listen_addr_clone = listen_addr.clone();
+        let hdl = machine.hdl().clone();
+        let physmap = machine.physmap().clone();
+        let migrate_num_cpus = num_cpus;
+        let migrate_mem_size = mem_size as u64;
+        let status = std::sync::Arc::new(std::sync::Mutex::new(
+            vmm_migrate::MigrationStatus::default(),
+        ));
+
+        info!(log, "waiting for migration connection"; "addr" => &listen_addr_clone);
+
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind(&listen_addr_clone)
+                .await
+                .context("failed to bind migration listener")?;
+
+            let (stream, peer) = listener.accept()
+                .await
+                .context("failed to accept migration connection")?;
+
+            info!(log, "migration connection from"; "peer" => %peer);
+
+            vmm_migrate::destination::run_destination(
+                stream,
+                hdl.clone(),
+                &vmm_core::mem::MemCtx::new(physmap),
+                migrate_num_cpus,
+                migrate_mem_size,
+                status,
+            )
+            .await
+            .context("migration import failed")
+        })?;
+
+        info!(log, "migration import complete, starting vCPUs");
+
+        // After import, vCPU state is set by the migration. Set run state
+        // and kick each vCPU with a LAPIC self-IPI to wake from HLT.
+        // The imported LAPIC timer deadline is in the past (time moved
+        // during migration), but the kernel's timer callout isn't
+        // automatically re-armed on import.
+        for vcpu in machine.vcpus() {
+            vcpu.set_run_state(bhyve_api::VRS_RUN)
+                .with_context(|| format!("failed to set run state for vCPU {}", vcpu.id()))?;
+        }
+        // Interrupt injection happens AFTER vCPU threads are spawned
+        // (see below). Injecting before spawn loses the kick.
+    } else {
+        // ----- Normal vCPU startup -----
+
+        // Activate all vCPUs and set capabilities
+        for vcpu in machine.vcpus() {
+            vcpu.activate()
+                .with_context(|| format!("failed to activate vCPU {}", vcpu.id()))?;
+
+            if cli.vmexit_on_hlt {
+                machine.hdl().set_capability(
+                    vcpu.id(),
+                    bhyve_api::vm_cap_type::VM_CAP_HALT_EXIT as i32,
+                    1,
+                ).with_context(|| format!("failed to set HALT_EXIT on vCPU {}", vcpu.id()))?;
+            }
+        }
+
+        // Set up BSP based on boot mode
+        if let Some(ref kernel) = kernel_image {
+            if let Some(bsp) = machine.vcpus().first() {
+                direct_boot::setup_direct_boot_bsp(bsp, kernel.entry_point_64())
+                    .context("failed to set up BSP for direct boot")?;
+            }
+            info!(log, "BSP configured for direct boot");
+        } else {
+            // UEFI boot: only the BSP gets reset + RIP set.
+            // APs must NOT be reset — they start in INIT state and
+            // wait for SIPI from the BSP. Calling reboot_state() on
+            // APs disrupts the kernel's INIT/SIPI handling and causes
+            // massive SMP boot delays.
+            if let Some(bsp) = machine.vcpus().first() {
+                bsp.setup_bsp()
+                    .context("failed to set up BSP")?;
+            }
         }
     }
 
@@ -495,10 +566,26 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         log,
     );
 
+    // After migration: inject timer interrupt to restart the scheduler tick.
+    // In nohz/tickless mode the LAPIC timer was stopped when the guest went
+    // idle. timer_fire_when=0 means vlapic_resume() won't arm a callout.
+    // We inject LOCAL_TIMER_VECTOR directly into the LAPIC after the vCPU
+    // thread has started and entered VM_RUN/HLT.
+    if cli.migrate_listen.is_some() {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        for vcpu in machine.vcpus() {
+            match machine.hdl().lapic_irq(vcpu.id(), 0xEC) {
+                Ok(()) => info!(log, "post-migration timer kick"; "vcpu" => vcpu.id()),
+                Err(e) => warn!(log, "timer kick failed"; "vcpu" => vcpu.id(), "error" => %e),
+            }
+        }
+    }
+
     // Spawn control socket if --control-socket was specified
     let control_cleanup = if let Some(ref sock_path) = cli.control_socket {
         let ctrl = control::VmController::new(
             machine.hdl().clone(),
+            machine.physmap().clone(),
             cli.vm_name.clone(),
             num_cpus,
             mem_size,

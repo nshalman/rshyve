@@ -8,7 +8,10 @@
 //! transfer with dirty page tracking, and device state serialization.
 
 pub mod codec;
+pub mod destination;
 pub mod protocol;
+pub mod source;
+pub mod state;
 
 /// Migration phases, executed in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

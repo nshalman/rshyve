@@ -27,7 +27,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use slog::{error, info, warn, Logger};
 
 use vmm_core::hdl::VmmHdl;
+use vmm_core::mem::{MemCtx, PhysMap};
 
 // ── Error type ──────────────────────────────────────────────────────
 
@@ -52,10 +53,11 @@ pub enum ControlError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VmRunState {
-    Running  = 0,
-    Paused   = 1,
-    Stopping = 2,
-    Stopped  = 3,
+    Running   = 0,
+    Paused    = 1,
+    Stopping  = 2,
+    Stopped   = 3,
+    Migrating = 4,
 }
 
 impl VmRunState {
@@ -65,6 +67,7 @@ impl VmRunState {
             1 => Self::Paused,
             2 => Self::Stopping,
             3 => Self::Stopped,
+            4 => Self::Migrating,
             _ => Self::Stopped,
         }
     }
@@ -74,29 +77,35 @@ impl VmRunState {
 pub struct VmController {
     state: AtomicU8,
     hdl: Arc<VmmHdl>,
+    physmap: Arc<PhysMap>,
     /// Leaked to `&'static str` at construction for zero-cost serde.
     vm_name: &'static str,
     num_cpus: u32,
     mem_size: usize,
     start_time: Instant,
+    /// Migration progress, shared with the migration task.
+    migrate_status: Mutex<Option<Arc<Mutex<vmm_migrate::MigrationStatus>>>>,
 }
 
 impl VmController {
     pub fn new(
         hdl: Arc<VmmHdl>,
+        physmap: Arc<PhysMap>,
         vm_name: String,
         num_cpus: u32,
         mem_size: usize,
     ) -> Arc<Self> {
-        // Leak the name once — the controller lives for the process lifetime.
+        // Leak the name once -- the controller lives for the process lifetime.
         let name: &'static str = Box::leak(vm_name.into_boxed_str());
         Arc::new(Self {
             state: AtomicU8::new(VmRunState::Running as u8),
             hdl,
+            physmap,
             vm_name: name,
             num_cpus,
             mem_size,
             start_time: Instant::now(),
+            migrate_status: Mutex::new(None),
         })
     }
 
@@ -132,13 +141,19 @@ enum Command {
     Shutdown,
     #[serde(rename = "stop")]
     Stop,
+    #[serde(rename = "migrate-source")]
+    MigrateSource { target_addr: String },
+    #[serde(rename = "migrate-dest")]
+    MigrateDest { listen_addr: String },
+    #[serde(rename = "migrate-status")]
+    MigrateStatus,
 }
 
 #[derive(Debug, Serialize)]
 struct Response {
     success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<&'static str>,
+    error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<VmRunState>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,6 +164,12 @@ struct Response {
     memory_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     uptime_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    migrate_phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    migrate_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    migrate_pages: Option<u64>,
 }
 
 impl Response {
@@ -161,18 +182,24 @@ impl Response {
             num_cpus: None,
             memory_bytes: None,
             uptime_secs: None,
+            migrate_phase: None,
+            migrate_bytes: None,
+            migrate_pages: None,
         }
     }
 
-    fn err(msg: &'static str) -> Self {
+    fn err(msg: &str) -> Self {
         Self {
             success: false,
-            error: Some(msg),
+            error: Some(msg.to_string()),
             state: None,
             vm_name: None,
             num_cpus: None,
             memory_bytes: None,
             uptime_secs: None,
+            migrate_phase: None,
+            migrate_bytes: None,
+            migrate_pages: None,
         }
     }
 }
@@ -288,6 +315,279 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                 }
             }
         }
+
+        Command::MigrateSource { target_addr } => {
+            if !ctrl.transition(VmRunState::Running, VmRunState::Migrating) {
+                return Response::err("VM must be running to start migration");
+            }
+
+            let status = Arc::new(Mutex::new(
+                vmm_migrate::MigrationStatus::default(),
+            ));
+
+            // Store status for later query
+            if let Ok(mut ms) = ctrl.migrate_status.lock() {
+                *ms = Some(Arc::clone(&status));
+            }
+
+            let hdl = Arc::clone(&ctrl.hdl);
+            let memctx = MemCtx::new(Arc::clone(&ctrl.physmap));
+            let num_cpus = ctrl.num_cpus;
+            let mem_size = ctrl.mem_size as u64;
+            // We need a reference to the AtomicU8 for the spawned thread
+            // to restore state on failure. Use a raw pointer (safe because
+            // VmController lives for the process lifetime).
+            let state_ptr = &ctrl.state as *const AtomicU8 as usize;
+
+            thread::Builder::new()
+                .name("migrate-source".into())
+                .spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            eprintln!("[migrate] failed to create runtime: {e}");
+                            // Safety: VmController outlives this thread.
+                            let state = unsafe {
+                                &*(state_ptr as *const AtomicU8)
+                            };
+                            state.store(
+                                VmRunState::Running as u8,
+                                Ordering::Release,
+                            );
+                            return;
+                        }
+                    };
+
+                    rt.block_on(async {
+                        let stream = match tokio::net::TcpStream::connect(
+                            &target_addr,
+                        )
+                        .await
+                        {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!(
+                                    "[migrate] connect to {target_addr} \
+                                     failed: {e}"
+                                );
+                                let state = unsafe {
+                                    &*(state_ptr as *const AtomicU8)
+                                };
+                                state.store(
+                                    VmRunState::Running as u8,
+                                    Ordering::Release,
+                                );
+                                return;
+                            }
+                        };
+
+                        match vmm_migrate::source::run_source(
+                            stream,
+                            hdl,
+                            &memctx,
+                            num_cpus,
+                            mem_size,
+                            status,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                eprintln!(
+                                    "[migrate] source migration complete"
+                                );
+                                // VM is paused and should be destroyed.
+                                // Transition to Stopped.
+                                let state = unsafe {
+                                    &*(state_ptr as *const AtomicU8)
+                                };
+                                state.store(
+                                    VmRunState::Stopped as u8,
+                                    Ordering::Release,
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[migrate] source migration failed: {e}"
+                                );
+                                // run_source already resumed on failure.
+                                let state = unsafe {
+                                    &*(state_ptr as *const AtomicU8)
+                                };
+                                state.store(
+                                    VmRunState::Running as u8,
+                                    Ordering::Release,
+                                );
+                            }
+                        }
+                    });
+                })
+                .ok();
+
+            let mut r = Response::ok();
+            r.state = Some(VmRunState::Migrating);
+            r
+        }
+
+        Command::MigrateDest { listen_addr } => {
+            if ctrl.state() != VmRunState::Paused
+                && ctrl.state() != VmRunState::Running
+            {
+                return Response::err(
+                    "VM must be running or paused to receive migration",
+                );
+            }
+            ctrl.state.store(
+                VmRunState::Migrating as u8,
+                Ordering::Release,
+            );
+
+            let status = Arc::new(Mutex::new(
+                vmm_migrate::MigrationStatus::default(),
+            ));
+            if let Ok(mut ms) = ctrl.migrate_status.lock() {
+                *ms = Some(Arc::clone(&status));
+            }
+
+            let hdl = Arc::clone(&ctrl.hdl);
+            let memctx = MemCtx::new(Arc::clone(&ctrl.physmap));
+            let num_cpus = ctrl.num_cpus;
+            let mem_size = ctrl.mem_size as u64;
+            let state_ptr = &ctrl.state as *const AtomicU8 as usize;
+
+            thread::Builder::new()
+                .name("migrate-dest".into())
+                .spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            eprintln!("[migrate] failed to create runtime: {e}");
+                            let state = unsafe {
+                                &*(state_ptr as *const AtomicU8)
+                            };
+                            state.store(
+                                VmRunState::Stopped as u8,
+                                Ordering::Release,
+                            );
+                            return;
+                        }
+                    };
+
+                    rt.block_on(async {
+                        let listener = match tokio::net::TcpListener::bind(
+                            &listen_addr,
+                        )
+                        .await
+                        {
+                            Ok(l) => l,
+                            Err(e) => {
+                                eprintln!(
+                                    "[migrate] bind {listen_addr} failed: {e}"
+                                );
+                                let state = unsafe {
+                                    &*(state_ptr as *const AtomicU8)
+                                };
+                                state.store(
+                                    VmRunState::Stopped as u8,
+                                    Ordering::Release,
+                                );
+                                return;
+                            }
+                        };
+
+                        let (stream, peer) = match listener.accept().await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!(
+                                    "[migrate] accept failed: {e}"
+                                );
+                                let state = unsafe {
+                                    &*(state_ptr as *const AtomicU8)
+                                };
+                                state.store(
+                                    VmRunState::Stopped as u8,
+                                    Ordering::Release,
+                                );
+                                return;
+                            }
+                        };
+
+                        eprintln!(
+                            "[migrate] accepted connection from {peer}"
+                        );
+
+                        match vmm_migrate::destination::run_destination(
+                            stream,
+                            hdl,
+                            &memctx,
+                            num_cpus,
+                            mem_size,
+                            status,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                eprintln!(
+                                    "[migrate] destination migration \
+                                     complete, VM running"
+                                );
+                                let state = unsafe {
+                                    &*(state_ptr as *const AtomicU8)
+                                };
+                                state.store(
+                                    VmRunState::Running as u8,
+                                    Ordering::Release,
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[migrate] destination migration \
+                                     failed: {e}"
+                                );
+                                let state = unsafe {
+                                    &*(state_ptr as *const AtomicU8)
+                                };
+                                state.store(
+                                    VmRunState::Stopped as u8,
+                                    Ordering::Release,
+                                );
+                            }
+                        }
+                    });
+                })
+                .ok();
+
+            let mut r = Response::ok();
+            r.state = Some(VmRunState::Migrating);
+            r
+        }
+
+        Command::MigrateStatus => {
+            let phase_info = ctrl.migrate_status.lock().ok().and_then(|ms| {
+                ms.as_ref().and_then(|s| s.lock().ok().map(|s| s.clone()))
+            });
+
+            match phase_info {
+                Some(s) => {
+                    let mut r = Response::ok();
+                    r.state = Some(ctrl.state());
+                    r.migrate_phase = Some(s.phase.to_string());
+                    r.migrate_bytes = Some(s.bytes_transferred);
+                    r.migrate_pages = Some(s.pages_transferred);
+                    r
+                }
+                None => {
+                    let mut r = Response::ok();
+                    r.state = Some(ctrl.state());
+                    r
+                }
+            }
+        }
     }
 }
 
@@ -386,6 +686,7 @@ mod tests {
             VmRunState::Paused,
             VmRunState::Stopping,
             VmRunState::Stopped,
+            VmRunState::Migrating,
         ] {
             assert_eq!(VmRunState::from_u8(state as u8), state);
         }
@@ -444,5 +745,34 @@ mod tests {
         assert_eq!(json, r#""running""#);
         let json = serde_json::to_string(&VmRunState::Paused).unwrap();
         assert_eq!(json, r#""paused""#);
+        let json = serde_json::to_string(&VmRunState::Migrating).unwrap();
+        assert_eq!(json, r#""migrating""#);
+    }
+
+    #[test]
+    fn command_deserialize_migrate_source() {
+        let cmd: Command = serde_json::from_str(
+            r#"{"command":"migrate-source","target_addr":"10.0.0.2:1234"}"#,
+        )
+        .unwrap();
+        assert!(matches!(cmd, Command::MigrateSource { .. }));
+    }
+
+    #[test]
+    fn command_deserialize_migrate_dest() {
+        let cmd: Command = serde_json::from_str(
+            r#"{"command":"migrate-dest","listen_addr":"0.0.0.0:1234"}"#,
+        )
+        .unwrap();
+        assert!(matches!(cmd, Command::MigrateDest { .. }));
+    }
+
+    #[test]
+    fn command_deserialize_migrate_status() {
+        let cmd: Command = serde_json::from_str(
+            r#"{"command":"migrate-status"}"#,
+        )
+        .unwrap();
+        assert!(matches!(cmd, Command::MigrateStatus));
     }
 }

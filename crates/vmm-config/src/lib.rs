@@ -115,6 +115,12 @@ pub struct Cli {
     #[arg(long)]
     pub initrd: Option<PathBuf>,
 
+    /// Migration destination: listen for incoming migration on this address
+    /// (e.g., "0.0.0.0:4567"). When set, the VM is created with RAM but
+    /// does NOT start vCPUs — it waits for migration data.
+    #[arg(long)]
+    pub migrate_listen: Option<String>,
+
     /// VM name
     pub vm_name: String,
 }

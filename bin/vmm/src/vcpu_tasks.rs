@@ -118,6 +118,13 @@ fn vcpu_run_loop(
                     next_entry = VmEntry::Run;
                     continue;
                 }
+                // EBUSY means the VM is paused (e.g., during migration).
+                // Sleep briefly and retry — resume() will unblock us.
+                if e.raw_os_error() == Some(libc::EBUSY) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    next_entry = VmEntry::Run;
+                    continue;
+                }
                 error!(log, "VM_RUN failed"; "error" => %e);
                 let _ = events.send(VcpuEvent::Error {
                     vcpu_id,

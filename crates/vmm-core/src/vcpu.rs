@@ -189,6 +189,26 @@ impl Vcpu {
         Ok(())
     }
 
+    /// Get a guest segment descriptor (CS, DS, SS, ES, FS, GS, TR, LDTR, GDTR, IDTR).
+    pub fn get_segment_desc(
+        &self,
+        reg: vm_reg_name,
+    ) -> std::io::Result<seg_desc> {
+        let mut vsd = vm_seg_desc {
+            cpuid: self.id,
+            regnum: reg as i32,
+            desc: seg_desc::default(),
+        };
+        let fd = self.hdl.as_raw_fd();
+        let res = unsafe {
+            libc::ioctl(fd, ioctls::VM_GET_SEGMENT_DESCRIPTOR as _, &mut vsd)
+        };
+        if res == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(vsd.desc)
+    }
+
     /// Set up the BSP (bootstrap processor, vCPU 0) for initial boot.
     ///
     /// Initializes x86 reset state, then sets:

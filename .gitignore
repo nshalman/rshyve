@@ -1,1 +1,3 @@
 target/
+kernel/linux-*.tar.xz
+kernel/vmlinuz-*

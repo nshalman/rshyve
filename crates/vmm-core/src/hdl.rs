@@ -269,6 +269,28 @@ impl VmmHdl {
         Ok(())
     }
 
+    /// Inject an interrupt directly into a vCPU's LAPIC.
+    ///
+    /// Sets the IRR bit for the given vector and kicks the vCPU
+    /// out of HLT via vcpu_notify_event(). More direct than
+    /// lapic_msi() for targeted vCPU interrupt delivery.
+    pub fn lapic_irq(&self, cpuid: i32, vector: i32) -> Result<()> {
+        let mut irq = bhyve_api::vm_lapic_irq { cpuid, vector };
+        unsafe { self.inner.ioctl(ioctls::VM_LAPIC_IRQ, &mut irq) }?;
+        Ok(())
+    }
+
+    /// Inject a Non-Maskable Interrupt into a vCPU.
+    ///
+    /// NMIs unconditionally wake a HLTed vCPU. Used after migration
+    /// to kick the guest out of HLT when the LAPIC timer isn't
+    /// automatically re-armed.
+    pub fn inject_nmi(&self, cpuid: i32) -> Result<()> {
+        let mut nmi = bhyve_api::vm_nmi { cpuid };
+        unsafe { self.inner.ioctl(ioctls::VM_INJECT_NMI, &mut nmi) }?;
+        Ok(())
+    }
+
     // ---------------------------------------------------------------
     // VM capabilities and lifecycle
     // ---------------------------------------------------------------
