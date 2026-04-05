@@ -124,15 +124,42 @@ impl Vcpu {
         Ok(vr.regval)
     }
 
+    /// Get the vCPU run state and SIPI vector.
+    pub fn get_run_state(&self) -> std::io::Result<(u32, u8)> {
+        let mut rs = vm_run_state {
+            vcpuid: self.id,
+            state: 0,
+            sipi_vector: 0,
+            _pad: [0; 3],
+        };
+        let fd = self.hdl.as_raw_fd();
+        let res = unsafe {
+            libc::ioctl(fd, ioctls::VM_GET_RUN_STATE as _, &mut rs)
+        };
+        if res == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((rs.state, rs.sipi_vector))
+    }
+
     /// Set the vCPU run state (e.g., VRS_RUN to mark it runnable).
     pub fn set_run_state(
         &self,
         state: u32,
     ) -> std::io::Result<()> {
+        self.set_run_state_full(state, 0)
+    }
+
+    /// Set the vCPU run state with SIPI vector.
+    pub fn set_run_state_full(
+        &self,
+        state: u32,
+        sipi_vector: u8,
+    ) -> std::io::Result<()> {
         let mut rs = vm_run_state {
             vcpuid: self.id,
             state,
-            sipi_vector: 0,
+            sipi_vector,
             _pad: [0; 3],
         };
         let fd = self.hdl.as_raw_fd();

@@ -78,9 +78,13 @@ impl Uart {
             reg_div_high: 0,
             thre_intr: false,
             intr_pin: false,
-            // Single-byte FIFOs (no 16550A FIFO mode yet).
-            rx_fifo: Fifo::new(1),
-            tx_fifo: Fifo::new(1),
+            // Oversized FIFOs for mdata protocol support.
+            // A real 16550A has 16-byte FIFOs, but we need to buffer
+            // entire V2 protocol frames (~100+ bytes) on both sides
+            // to avoid dropping bytes between the guest serial driver
+            // and the mdata agent polling loop.
+            rx_fifo: Fifo::new(256),
+            tx_fifo: Fifo::new(256),
         }
     }
 
@@ -721,9 +725,11 @@ mod tests {
         // Enable loopback so we can trigger OE.
         uart.reg_write(REG_MCR, MCR_LOOP);
 
-        // Loopback data to assert DR.
+        // Loopback data to fill the RX FIFO and assert DR.
         let rval = 0x20;
-        uart.reg_write(REG_THR, rval);
+        for _ in 0..256 {
+            uart.reg_write(REG_THR, rval);
+        }
         assert_eq!(uart.reg_read(REG_IIR), IIR_DR);
 
         // Overrun: write again with RX FIFO full.
@@ -734,8 +740,10 @@ mod tests {
         assert_ne!(uart.reg_read(REG_LSR) & LSR_OE, 0);
         assert_eq!(uart.reg_read(REG_IIR), IIR_DR);
 
-        // Clear DR by reading RBR.
-        assert_eq!(uart.reg_read(REG_RBR), rval);
+        // Clear DR by reading all RBR bytes.
+        for _ in 0..256 {
+            assert_eq!(uart.reg_read(REG_RBR), rval);
+        }
         assert_eq!(uart.reg_read(REG_IIR), IIR_THRE);
 
         // Leave loopback, queue outgoing data.
@@ -790,9 +798,12 @@ mod tests {
     #[test]
     fn data_write_returns_false_when_full() {
         let mut uart = Uart::new();
-        assert!(uart.data_write(0x01));
-        // FIFO capacity is 1, second write should fail.
-        assert!(!uart.data_write(0x02));
+        // Fill the FIFO (256 bytes)
+        for i in 0..256 {
+            assert!(uart.data_write(i as u8), "write {i} should succeed");
+        }
+        // Next write should fail — FIFO full.
+        assert!(!uart.data_write(0xFF));
     }
 
     #[test]

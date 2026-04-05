@@ -58,6 +58,7 @@ const SMBIOS_MDF_UNKNOWN: u16 = 0x0004;
 const ENTRY_POINT_LEN: u8 = 0x1F;
 
 /// Configuration for SMBIOS table generation.
+#[derive(Default)]
 pub struct SmbiosConfig {
     /// VM name, used as the product name in Type 1.
     pub vm_name: String,
@@ -68,6 +69,72 @@ pub struct SmbiosConfig {
     pub num_cpus: u32,
     /// Total guest memory in megabytes.
     pub memory_mb: u64,
+    /// Type 1 manufacturer (from -B flag).
+    pub manufacturer: Option<String>,
+    /// Type 1 product name (from -B flag, overrides vm_name).
+    pub product: Option<String>,
+    /// Type 1 version string (from -B flag).
+    pub version: Option<String>,
+    /// Type 1 serial number (from -B flag).
+    pub serial: Option<String>,
+    /// Type 1 SKU number (from -B flag).
+    pub sku: Option<String>,
+    /// Type 1 family (from -B flag).
+    pub family: Option<String>,
+}
+
+/// Parse the bhyve `-B` SMBIOS string.
+///
+/// Format: `type,key=value,key=value,...`
+/// Example: `1,manufacturer=Joyent,product=SmartDC HVM,serial=myzone`
+///
+/// Only type 1 (System Information) is supported. Other types are
+/// silently ignored.
+pub fn parse_smbios_flag(s: &str) -> SmbiosConfig {
+    let mut config = SmbiosConfig {
+        vm_name: String::new(),
+        uuid: None,
+        num_cpus: 1,
+        memory_mb: 256,
+        manufacturer: None,
+        product: None,
+        version: None,
+        serial: None,
+        sku: None,
+        family: None,
+    };
+
+    // First token is the type number
+    let parts: Vec<&str> = s.splitn(2, ',').collect();
+    if parts.is_empty() {
+        return config;
+    }
+
+    // Only handle type 1 (System Information)
+    let type_num = parts[0].trim();
+    if type_num != "1" {
+        return config;
+    }
+
+    if let Some(kvs) = parts.get(1) {
+        for kv in kvs.split(',') {
+            if let Some(eq) = kv.find('=') {
+                let key = &kv[..eq];
+                let val = &kv[eq + 1..];
+                match key {
+                    "manufacturer" => config.manufacturer = Some(val.to_string()),
+                    "product" => config.product = Some(val.to_string()),
+                    "version" => config.version = Some(val.to_string()),
+                    "serial" => config.serial = Some(val.to_string()),
+                    "sku" => config.sku = Some(val.to_string()),
+                    "family" => config.family = Some(val.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    config
 }
 
 /// Generate SMBIOS tables suitable for fw_cfg delivery.
@@ -233,16 +300,25 @@ fn build_type1(config: &SmbiosConfig, handle: &mut u16) -> Vec<u8> {
     let h = next_handle(handle);
     let mut strings = Vec::new();
 
-    let mfr_idx = push_string(&mut strings, "SmartOS");
-    let prod_idx = push_string(&mut strings, &config.vm_name);
-    let ver_idx = push_string(&mut strings, "1.0");
+    let mfr = config.manufacturer.as_deref().unwrap_or("Joyent");
+    let mfr_idx = push_string(&mut strings, mfr);
 
-    // Use UUID as serial if available, otherwise "None"
-    let serial_str = config.uuid.as_deref().unwrap_or("None");
-    let serial_idx = push_string(&mut strings, serial_str);
+    let prod = config.product.as_deref().unwrap_or("SmartDC HVM");
+    let prod_idx = push_string(&mut strings, prod);
 
-    let sku_idx = push_string(&mut strings, "None");
-    let family_idx = push_string(&mut strings, "Virtual Machine");
+    let ver = config.version.as_deref().unwrap_or("1.0");
+    let ver_idx = push_string(&mut strings, ver);
+
+    let serial = config.serial.as_deref()
+        .or(config.uuid.as_deref())
+        .unwrap_or("None");
+    let serial_idx = push_string(&mut strings, serial);
+
+    let sku = config.sku.as_deref().unwrap_or("None");
+    let sku_idx = push_string(&mut strings, sku);
+
+    let family = config.family.as_deref().unwrap_or("Virtual Machine");
+    let family_idx = push_string(&mut strings, family);
 
     // Formatted area: 21 bytes after header
     let formatted_len = 21;
@@ -657,9 +733,9 @@ mod tests {
     fn entry_point_signature() {
         let config = SmbiosConfig {
             vm_name: "test-vm".to_string(),
-            uuid: None,
             num_cpus: 1,
             memory_mb: 256,
+            ..Default::default()
         };
         let (anchor, _tables) = generate_smbios(&config);
 
@@ -672,9 +748,9 @@ mod tests {
     fn entry_point_checksums_valid() {
         let config = SmbiosConfig {
             vm_name: "test-vm".to_string(),
-            uuid: None,
             num_cpus: 2,
             memory_mb: 1024,
+            ..Default::default()
         };
         let (anchor, _) = generate_smbios(&config);
 
@@ -695,9 +771,9 @@ mod tests {
     fn entry_point_version() {
         let config = SmbiosConfig {
             vm_name: "vm".to_string(),
-            uuid: None,
             num_cpus: 1,
             memory_mb: 256,
+            ..Default::default()
         };
         let (anchor, _) = generate_smbios(&config);
 
@@ -710,9 +786,9 @@ mod tests {
     fn tables_end_with_type127() {
         let config = SmbiosConfig {
             vm_name: "vm".to_string(),
-            uuid: None,
             num_cpus: 1,
             memory_mb: 256,
+            ..Default::default()
         };
         let (_, tables) = generate_smbios(&config);
 
@@ -731,9 +807,9 @@ mod tests {
     fn table_count_matches_entry_point() {
         let config = SmbiosConfig {
             vm_name: "vm".to_string(),
-            uuid: None,
             num_cpus: 4,
             memory_mb: 2048,
+            ..Default::default()
         };
         let (anchor, _) = generate_smbios(&config);
 
@@ -778,9 +854,9 @@ mod tests {
     fn structures_have_double_nul_termination() {
         let config = SmbiosConfig {
             vm_name: "test".to_string(),
-            uuid: None,
             num_cpus: 1,
             memory_mb: 256,
+            ..Default::default()
         };
         let (_, tables) = generate_smbios(&config);
 
@@ -828,9 +904,9 @@ mod tests {
     fn table_length_matches_entry_point() {
         let config = SmbiosConfig {
             vm_name: "vm".to_string(),
-            uuid: None,
             num_cpus: 1,
             memory_mb: 512,
+            ..Default::default()
         };
         let (anchor, tables) = generate_smbios(&config);
 

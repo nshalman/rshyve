@@ -192,6 +192,12 @@ impl SubMapping {
                 "mapping too small for requested type",
             ));
         }
+        if (self.ptr.as_ptr() as usize) % std::mem::align_of::<T>() != 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "mapping not aligned for requested type",
+            ));
+        }
 
         // Safety: bounds and alignment checked above. We use
         // read_volatile because guest vCPUs may write concurrently.
@@ -217,8 +223,15 @@ impl SubMapping {
                 "mapping too small for requested type",
             ));
         }
+        if (self.ptr.as_ptr() as usize) % std::mem::align_of::<T>() != 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "mapping not aligned for requested type",
+            ));
+        }
 
-        // Safety: bounds checked above. write_volatile for concurrency.
+        // Safety: bounds and alignment checked above. write_volatile
+        // for concurrency.
         unsafe {
             std::ptr::write_volatile(self.ptr.as_ptr() as *mut T, *val);
         }
@@ -526,5 +539,128 @@ impl MemCtx {
     /// Get all memory regions for migration dirty page tracking.
     pub fn regions(&self) -> Vec<(u64, usize, RegionKind)> {
         self.map.regions()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a test SubMapping backed by anonymous mmap (no VmmHdl needed).
+    fn make_test_mapping(size: usize) -> Arc<Mapping> {
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED);
+        let ptr = NonNull::new(raw as *mut u8).unwrap();
+        Arc::new(Mapping {
+            ptr,
+            len: size,
+            prot: Prot::RW,
+        })
+    }
+
+    #[test]
+    fn read_aligned_u32() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        // Page-aligned pointer can read u32
+        let val = sub.read::<u32>();
+        assert!(val.is_ok());
+    }
+
+    #[test]
+    fn read_unaligned_u32_fails() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        // Offset by 1 byte to create misalignment for u32 (align=4)
+        let unaligned = sub.subregion(1, 4).unwrap();
+        let result = unaligned.read::<u32>();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn write_unaligned_u32_fails() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        let unaligned = sub.subregion(1, 4).unwrap();
+        let result = unaligned.write::<u32>(&42);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn read_aligned_u16_at_offset() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        // Offset by 2 is still aligned for u16 (align=2)
+        let aligned = sub.subregion(2, 2).unwrap();
+        assert!(aligned.read::<u16>().is_ok());
+    }
+
+    #[test]
+    fn read_unaligned_u16_fails() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        // Offset by 1 is misaligned for u16 (align=2)
+        let unaligned = sub.subregion(1, 2).unwrap();
+        assert!(unaligned.read::<u16>().is_err());
+    }
+
+    #[test]
+    fn read_u8_always_aligned() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        // u8 has align=1, so any offset works
+        let at_offset_1 = sub.subregion(1, 1).unwrap();
+        assert!(at_offset_1.read::<u8>().is_ok());
+    }
+
+    #[test]
+    fn read_write_bytes_ignores_alignment() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        let unaligned = sub.subregion(1, 4).unwrap();
+        // read_bytes and write_bytes work at any alignment
+        let mut buf = [0u8; 4];
+        assert!(unaligned.read_bytes(&mut buf).is_ok());
+        assert!(unaligned.write_bytes(&[1, 2, 3, 4]).is_ok());
+    }
+
+    #[test]
+    fn read_write_roundtrip() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        sub.write::<u32>(&0xDEAD_BEEF).unwrap();
+        let val = sub.read::<u32>().unwrap();
+        assert_eq!(val, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn subregion_bounds_check() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        // Exactly at end: should succeed
+        assert!(sub.subregion(4092, 4).is_some());
+        // Past end: should fail
+        assert!(sub.subregion(4093, 4).is_none());
+        // Overflow: should fail
+        assert!(sub.subregion(usize::MAX, 1).is_none());
+    }
+
+    #[test]
+    fn read_too_small_fails() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        let tiny = sub.subregion(0, 2).unwrap();
+        assert!(tiny.read::<u32>().is_err());
     }
 }

@@ -97,13 +97,32 @@ pub trait VirtioDevice: Send + Sync + 'static {
             Some(q) => q,
             None => return false,
         };
+
+        // Record used_idx before processing for interrupt suppression.
+        let old_used_idx = queue.read_used_idx(physmap);
+
         let mut did_work = false;
-        while let Some(head) = queue.pop_avail(physmap) {
-            let written = self.process_queue(queue_idx, queue, head, physmap);
-            queue.push_used(physmap, head, written);
-            did_work = true;
+
+        // EVENT_IDX re-check loop (VirtIO 1.3 sec 2.7.10):
+        // After draining the ring and setting used_event, re-read
+        // avail_idx. If the guest added entries during the race
+        // window, it may have decided not to kick — so we must
+        // process them here.
+        loop {
+            while let Some(head) = queue.pop_avail(physmap) {
+                let written = self.process_queue(queue_idx, queue, head, physmap);
+                queue.push_used(physmap, head, written);
+                did_work = true;
+            }
+            queue.update_used_event(physmap);
+            if !queue.has_new_avail(physmap) {
+                break;
+            }
         }
-        did_work
+
+        // With EVENT_IDX, suppress the interrupt unless the used
+        // index crossed the guest's avail_event threshold.
+        did_work && queue.should_notify_guest(physmap, old_used_idx)
     }
 
     /// Called when the guest sets a queue address (PFN) during setup.

@@ -78,13 +78,13 @@ pub struct VmController {
     state: AtomicU8,
     hdl: Arc<VmmHdl>,
     physmap: Arc<PhysMap>,
-    /// Leaked to `&'static str` at construction for zero-cost serde.
     vm_name: &'static str,
     num_cpus: u32,
     mem_size: usize,
     start_time: Instant,
-    /// Migration progress, shared with the migration task.
     migrate_status: Mutex<Option<Arc<Mutex<vmm_migrate::MigrationStatus>>>>,
+    /// Per-vCPU metrics, shared with vCPU threads.
+    vcpu_metrics: Vec<Arc<vmm_devices::metrics::VcpuMetrics>>,
 }
 
 impl VmController {
@@ -94,8 +94,8 @@ impl VmController {
         vm_name: String,
         num_cpus: u32,
         mem_size: usize,
+        vcpu_metrics: Vec<Arc<vmm_devices::metrics::VcpuMetrics>>,
     ) -> Arc<Self> {
-        // Leak the name once -- the controller lives for the process lifetime.
         let name: &'static str = Box::leak(vm_name.into_boxed_str());
         Arc::new(Self {
             state: AtomicU8::new(VmRunState::Running as u8),
@@ -106,6 +106,7 @@ impl VmController {
             mem_size,
             start_time: Instant::now(),
             migrate_status: Mutex::new(None),
+            vcpu_metrics,
         })
     }
 
@@ -147,6 +148,10 @@ enum Command {
     MigrateDest { listen_addr: String },
     #[serde(rename = "migrate-status")]
     MigrateStatus,
+    #[serde(rename = "metrics")]
+    Metrics,
+    #[serde(rename = "metrics-prometheus")]
+    MetricsPrometheus,
 }
 
 #[derive(Debug, Serialize)]
@@ -339,7 +344,7 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
             // VmController lives for the process lifetime).
             let state_ptr = &ctrl.state as *const AtomicU8 as usize;
 
-            thread::Builder::new()
+            if let Err(e) = thread::Builder::new()
                 .name("migrate-source".into())
                 .spawn(move || {
                     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -424,7 +429,15 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                         }
                     });
                 })
-                .ok();
+            {
+                ctrl.state.store(
+                    VmRunState::Running as u8,
+                    Ordering::Release,
+                );
+                return Response::err(
+                    &format!("failed to spawn migration thread: {}", e),
+                );
+            }
 
             let mut r = Response::ok();
             r.state = Some(VmRunState::Migrating);
@@ -432,8 +445,9 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
         }
 
         Command::MigrateDest { listen_addr } => {
-            if ctrl.state() != VmRunState::Paused
-                && ctrl.state() != VmRunState::Running
+            let prev_state = ctrl.state();
+            if prev_state != VmRunState::Paused
+                && prev_state != VmRunState::Running
             {
                 return Response::err(
                     "VM must be running or paused to receive migration",
@@ -457,7 +471,7 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
             let mem_size = ctrl.mem_size as u64;
             let state_ptr = &ctrl.state as *const AtomicU8 as usize;
 
-            thread::Builder::new()
+            if let Err(e) = thread::Builder::new()
                 .name("migrate-dest".into())
                 .spawn(move || {
                     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -560,10 +574,26 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                         }
                     });
                 })
-                .ok();
+            {
+                ctrl.state.store(
+                    prev_state as u8,
+                    Ordering::Release,
+                );
+                return Response::err(
+                    &format!("failed to spawn migration thread: {}", e),
+                );
+            }
 
             let mut r = Response::ok();
             r.state = Some(VmRunState::Migrating);
+            r
+        }
+
+        Command::Metrics | Command::MetricsPrometheus => {
+            // Metrics are returned as raw text — not via the typed
+            // Response struct. The caller handles this specially.
+            let mut r = Response::ok();
+            r.state = Some(ctrl.state());
             r
         }
 
@@ -653,21 +683,57 @@ fn handle_connection(
             continue;
         }
 
-        let response = match serde_json::from_str::<Command>(&read_line) {
+        match serde_json::from_str::<Command>(&read_line) {
             Ok(cmd) => {
                 info!(log, "control command"; "command" => &read_line);
-                dispatch(ctrl, cmd)
+
+                // Metrics commands return raw text, bypass Response serialization
+                let raw = match &cmd {
+                    Command::Metrics => {
+                        let uptime = ctrl.start_time.elapsed().as_secs();
+                        let vcpus: Vec<String> = ctrl.vcpu_metrics.iter()
+                            .enumerate()
+                            .map(|(i, v)| v.to_json(i as i32))
+                            .collect();
+                        Some(format!(
+                            r#"{{"success":true,"uptime_secs":{},"vcpus":[{}]}}"#,
+                            uptime, vcpus.join(","),
+                        ))
+                    }
+                    Command::MetricsPrometheus => {
+                        let mut out = format!(
+                            "# HELP vmm_uptime_seconds VMM uptime\n\
+                             # TYPE vmm_uptime_seconds gauge\n\
+                             vmm_uptime_seconds {}\n",
+                            ctrl.start_time.elapsed().as_secs(),
+                        );
+                        for (i, v) in ctrl.vcpu_metrics.iter().enumerate() {
+                            out.push_str(&v.to_prometheus(i as i32));
+                        }
+                        Some(out)
+                    }
+                    _ => None,
+                };
+
+                let mut out = if let Some(raw) = raw {
+                    raw.into_bytes()
+                } else {
+                    let response = dispatch(ctrl, cmd);
+                    serde_json::to_vec(&response)?
+                };
+                out.push(b'\n');
+                writer.write_all(&out)?;
+                writer.flush()?;
             }
             Err(e) => {
                 warn!(log, "invalid control command"; "error" => %e, "line" => &read_line);
-                Response::err("invalid command")
+                let response = Response::err("invalid command");
+                let mut out = serde_json::to_vec(&response)?;
+                out.push(b'\n');
+                writer.write_all(&out)?;
+                writer.flush()?;
             }
         };
-
-        let mut out = serde_json::to_vec(&response)?;
-        out.push(b'\n');
-        writer.write_all(&out)?;
-        writer.flush()?;
     }
 
     Ok(())

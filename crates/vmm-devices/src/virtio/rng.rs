@@ -93,24 +93,28 @@ impl VirtioDevice for VirtioRng {
 /// Uses `getrandom(2)` on illumos, `getentropy(2)` on macOS.
 #[cfg(target_os = "illumos")]
 fn getrandom(buf: &mut [u8]) {
-    // getrandom(2) on illumos — no flags needed, always blocks
-    // until enough entropy is available.
-    unsafe {
+    let ret = unsafe {
         libc::getrandom(
             buf.as_mut_ptr().cast(),
             buf.len(),
-            0, // no flags
-        );
-    }
+            0,
+        )
+    };
+    assert!(
+        ret as usize == buf.len(),
+        "getrandom failed: expected {} bytes, got {}",
+        buf.len(),
+        ret,
+    );
 }
 
 #[cfg(not(target_os = "illumos"))]
 fn getrandom(buf: &mut [u8]) {
-    // Fallback: read from /dev/urandom
     use std::io::Read;
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(buf);
-    }
+    let mut f = std::fs::File::open("/dev/urandom")
+        .expect("failed to open /dev/urandom");
+    f.read_exact(buf)
+        .expect("failed to read from /dev/urandom");
 }
 
 #[cfg(test)]

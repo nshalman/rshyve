@@ -21,6 +21,12 @@ use std::sync::{Arc, Mutex};
 use crate::aspace::{ASpace, Error as ASpaceError};
 use crate::common::{RWOp, ReadOp, WriteOp};
 
+#[usdt::provider(provider = "vmm")]
+mod probes {
+    fn pio_in(port: u16, bytes: u8, value: u32, handled: u8) {}
+    fn pio_out(port: u16, bytes: u8, value: u32, handled: u8) {}
+}
+
 /// Handler function type for port I/O.
 ///
 /// The first argument is the offset within the registered port range.
@@ -78,21 +84,26 @@ impl PioBus {
     pub fn handle_in(&self, port: u16, bytes: u8) -> u32 {
         let mut ro = ReadOp::new(bytes as usize);
 
-        if let Some((offset, handler)) = self.lookup(port) {
+        let handled = if let Some((offset, handler)) = self.lookup(port) {
             handler(offset, RWOp::Read(&mut ro));
+            1u8
         } else {
             // Unregistered port: fill with 1s (x86 bus float)
             ro.write_u32(0xFFFF_FFFF);
-        }
+            0u8
+        };
 
         // Extract the value from the ReadOp buffer
         let buf = ro.buf();
-        match bytes {
+        let value = match bytes {
             1 => buf[0] as u32,
             2 => u16::from_le_bytes([buf[0], buf[1]]) as u32,
             4 => u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
             _ => 0xFFFF_FFFF,
-        }
+        };
+
+        probes::pio_in!(|| (port, bytes, value, handled));
+        value
     }
 
     /// Handle an OUT instruction (guest writes to port).
@@ -103,10 +114,14 @@ impl PioBus {
         let data = &val.to_le_bytes()[..bytes as usize];
         let wo = WriteOp::from_buf(data);
 
-        if let Some((offset, handler)) = self.lookup(port) {
+        let handled = if let Some((offset, handler)) = self.lookup(port) {
             handler(offset, RWOp::Write(&wo));
-        }
-        // Unregistered port: silently ignore
+            1u8
+        } else {
+            0u8
+        };
+
+        probes::pio_out!(|| (port, bytes, val, handled));
     }
 
     /// Look up the handler for a port, clone the Arc, and drop the lock.

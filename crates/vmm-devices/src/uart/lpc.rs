@@ -234,10 +234,12 @@ mod tests {
         let pin = TestPin::new();
         let uart = LpcUart::new(pin);
 
-        // Feed a byte in.
-        assert!(uart.input_byte(0x42));
-        // FIFO full.
-        assert!(!uart.input_byte(0x43));
+        // Feed bytes in until FIFO is full (256 bytes).
+        for i in 0..256u16 {
+            assert!(uart.input_byte(i as u8), "input_byte {i} should succeed");
+        }
+        // FIFO full — next byte rejected.
+        assert!(!uart.input_byte(0xFF));
 
         // Nothing in TX yet.
         assert_eq!(uart.output_byte(), None);

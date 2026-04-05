@@ -136,6 +136,25 @@ pub enum VmExitKind {
 }
 
 impl VmExitKind {
+    /// Numeric exit code for DTrace probes.
+    pub fn exit_code(&self) -> u32 {
+        match self {
+            Self::Bogus => 0,
+            Self::Inout(_) => 1,
+            Self::Mmio(_) => 2,
+            Self::Rdmsr(_) => 3,
+            Self::Wrmsr(_, _) => 4,
+            Self::Suspended(_) => 5,
+            Self::VmxError(_) => 6,
+            Self::SvmError(_) => 7,
+            Self::Debug => 8,
+            Self::Paging(_, _) => 9,
+            Self::InstEmul { .. } => 10,
+            Self::Hlt => 11,
+            Self::Unknown(c) => *c as u32,
+        }
+    }
+
     /// Parse the raw `vm_exit` into a `VmExitKind`.
     ///
     /// # Safety (internal)

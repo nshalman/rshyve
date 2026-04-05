@@ -110,6 +110,44 @@ async fn run_destination_inner(
         return Err(err);
     }
 
+    // Check CPU feature compatibility: destination must support all
+    // features the source exposes to the guest.
+    if let Some(ref src_cpu) = preamble.cpu_features {
+        let (dst_l1_ecx, dst_l1_edx, dst_l7_ebx, dst_l7_ecx, dst_l7_edx, dst_xcr0) =
+            vmm_core::cpuid::query_host_features();
+
+        // Mask out deprecated/irrelevant features that don't affect
+        // guest instruction compatibility:
+        // - leaf7 EBX bit 2: SGX (enclave, not migrated)
+        // - leaf7 EBX bit 14: MPX (deprecated, removed from newer CPUs)
+        // - xcr0 bits 3,4: MPX BNDREGS/BNDCSR
+        const IGNORE_L7_EBX: u32 = (1 << 2) | (1 << 14);
+        const IGNORE_XCR0: u32 = (1 << 3) | (1 << 4);
+
+        let missing_l1_ecx = src_cpu.leaf1_ecx & !dst_l1_ecx;
+        let missing_l1_edx = src_cpu.leaf1_edx & !dst_l1_edx;
+        let missing_l7_ebx = (src_cpu.leaf7_ebx & !IGNORE_L7_EBX) & !dst_l7_ebx;
+        let missing_l7_ecx = src_cpu.leaf7_ecx & !dst_l7_ecx;
+        let missing_l7_edx = src_cpu.leaf7_edx & !dst_l7_edx;
+        let missing_xcr0 = (src_cpu.xcr0 & !IGNORE_XCR0) & !dst_xcr0;
+
+        if missing_l1_ecx != 0 || missing_l1_edx != 0
+            || missing_l7_ebx != 0 || missing_l7_ecx != 0
+            || missing_l7_edx != 0 || missing_xcr0 != 0
+        {
+            let err = MigrateError::PreambleMismatch(format!(
+                "CPU feature mismatch: source requires features not \
+                 available on destination (leaf1_ecx={missing_l1_ecx:#x} \
+                 leaf1_edx={missing_l1_edx:#x} leaf7_ebx={missing_l7_ebx:#x} \
+                 leaf7_ecx={missing_l7_ecx:#x} leaf7_edx={missing_l7_edx:#x} \
+                 xcr0={missing_xcr0:#x})"
+            ));
+            ws.send(Message::Error(err.clone()).encode()).await?;
+            return Err(err);
+        }
+        eprintln!("[migrate] dest: CPU feature check passed");
+    }
+
     // Preamble accepted
     ws.send(Message::Okay.encode()).await?;
 
@@ -125,7 +163,7 @@ async fn run_destination_inner(
     // the kernel's vlapic_data_write() checks vm_is_paused() and
     // defers timer callout scheduling to VM_RESUME. Without this,
     // the LAPIC timer is never re-armed after migration.
-    eprintln!("[migrate] pausing VM before state import");
+    eprintln!("[migrate] dest: pausing VM before state import");
     hdl.pause().map_err(|e| {
         MigrateError::Io(format!("pause before import: {e}"))
     })?;
@@ -149,11 +187,11 @@ async fn run_destination_inner(
     // Resume the VM. This triggers vlapic_resume() in the kernel,
     // which calls vlapic_callout_reset() to re-arm the LAPIC timer.
     // Also resumes HPET, PIT, and RTC timers.
-    eprintln!("[migrate] resuming VM after state import (triggers timer re-arm)");
+    eprintln!("[migrate] dest: resuming VM after state import (triggers timer re-arm)");
     hdl.resume().map_err(|e| {
         MigrateError::Io(format!("resume after import: {e}"))
     })?;
-    eprintln!("[migrate] VM resumed successfully");
+    eprintln!("[migrate] dest: VM resumed successfully");
 
     // ── Phase: RamPull ────────────────────────────────────────────
     set_phase(status, MigrationPhase::RamPull);

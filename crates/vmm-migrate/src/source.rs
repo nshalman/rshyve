@@ -25,8 +25,8 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::{MemCtx, RegionKind};
 
 use crate::codec::{
-    MemRegionDesc, Message, MigrateError, MigrationPreamble, ProtocolOffer,
-    ProtocolSelect,
+    CpuFeatures, MemRegionDesc, Message, MigrateError, MigrationPreamble,
+    ProtocolOffer, ProtocolSelect,
 };
 use crate::protocol::{PAGE_SIZE, PROTOCOL_RON_V0};
 use crate::state;
@@ -106,11 +106,21 @@ async fn run_source_inner(
         )));
     }
 
-    // Send preamble
+    // Send preamble with CPU feature info for compatibility check
+    let (l1_ecx, l1_edx, l7_ebx, l7_ecx, l7_edx, xcr0) =
+        vmm_core::cpuid::query_host_features();
     let preamble = MigrationPreamble {
         num_cpus,
         mem_size,
         devices: Vec::new(),
+        cpu_features: Some(CpuFeatures {
+            leaf1_ecx: l1_ecx,
+            leaf1_edx: l1_edx,
+            leaf7_ebx: l7_ebx,
+            leaf7_ecx: l7_ecx,
+            leaf7_edx: l7_edx,
+            xcr0,
+        }),
     };
     let preamble_msg = Message::serialized(&preamble)?;
     ws.send(preamble_msg.encode()).await?;

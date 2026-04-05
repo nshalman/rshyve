@@ -21,6 +21,7 @@ use bhyve_api::{
     vm_isa_irq, vm_lapic_msi, vm_rtc_data,
     vmm_dirty_tracker,
     vm_npt_operation, VNO_OP_SET_DIRTY, VNO_FLAG_BITMAP_IN,
+    vcpu_cpuid_entry, vm_vcpu_cpuid_config,
     VM_MEMMAP_F_WIRED, VM_MAX_SEG_NAMELEN,
     ioctls,
 };
@@ -446,6 +447,35 @@ impl VmmHdl {
     /// Build a vmm-data read/write operation.
     pub fn data_op(&self, class: u16, version: u16) -> bhyve_api::VmmDataOp<'_> {
         self.inner.data_op(class, version)
+    }
+
+    // ---------------------------------------------------------------
+    // CPUID control
+    // ---------------------------------------------------------------
+
+    /// Set custom CPUID entries for a vCPU.
+    ///
+    /// The entries must be sorted by function/index (use
+    /// `vcpu_cpuid_entry::eval_sort`). The kernel will use these
+    /// entries to emulate CPUID for the guest instead of passing
+    /// through host values.
+    ///
+    /// Requires bhyve API version >= 5.
+    pub fn set_cpuid(
+        &self,
+        vcpuid: i32,
+        entries: &mut [vcpu_cpuid_entry],
+        flags: u32,
+    ) -> Result<()> {
+        let mut config = vm_vcpu_cpuid_config {
+            vvcc_vcpuid: vcpuid,
+            vvcc_flags: flags,
+            vvcc_nent: entries.len() as u32,
+            _pad: 0,
+            vvcc_entries: entries.as_mut_ptr() as *mut std::ffi::c_void,
+        };
+        unsafe { self.inner.ioctl(ioctls::VM_SET_CPUID, &mut config) }?;
+        Ok(())
     }
 }
 

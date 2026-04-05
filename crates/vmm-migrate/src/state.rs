@@ -178,7 +178,7 @@ fn import_vcpu_regs(vcpu: &Vcpu, data: &[u8]) -> Result<(), MigrateError> {
             // Some registers may fail on cross-host migration due to
             // CPU feature differences (e.g., XCR0 with AVX bits on a
             // host that doesn't support AVX). Log and continue.
-            eprintln!("[migrate] set_reg {:?} = {:#x} failed: {e} (continuing)", reg, val);
+            eprintln!("[migrate] vcpu-regs: set_reg {:?} = {:#x} failed: {e} (continuing)", reg, val);
         }
         pos += 12;
     }
@@ -246,7 +246,7 @@ fn write_class_vcpu(
 /// Export time synchronization data from the kernel.
 pub fn export_time_data(hdl: &Arc<VmmHdl>) -> Result<TimeData, MigrateError> {
     let vmm_time = read_class_all(hdl, VDC_VMM_TIME, 1)?;
-    eprintln!("[migrate] exported VMM_TIME: {} bytes", vmm_time.len());
+    eprintln!("[migrate] time: exported VMM_TIME ({} bytes)", vmm_time.len());
     Ok(TimeData { vmm_time })
 }
 
@@ -309,7 +309,7 @@ pub fn import_time_data(
     let new_guest_tsc = scaled_guest_tsc.wrapping_add(tsc_delta);
 
     eprintln!(
-        "[migrate] VMM_TIME adjust: guest_uptime={}ms migrate_delta={}ms new_boot_hrtime={} tsc_delta={}",
+        "[migrate] time: VMM_TIME adjust guest_uptime={}ms migrate_delta={}ms boot_hrtime={} tsc_delta={}",
         guest_uptime / 1_000_000,
         migrate_delta_ns / 1_000_000,
         new_boot_hrtime,
@@ -321,7 +321,7 @@ pub fn import_time_data(
     // (EPERM). TSC frequency scaling is handled by the kernel.
     let guest_freq = if dst.vt_guest_freq != src.vt_guest_freq {
         eprintln!(
-            "[migrate] TSC freq mismatch: src={}Hz dst={}Hz, using dst",
+            "[migrate] time: TSC freq mismatch src={}Hz dst={}Hz, using destination",
             src.vt_guest_freq, dst.vt_guest_freq,
         );
         dst.vt_guest_freq
@@ -346,7 +346,7 @@ pub fn import_time_data(
         )
     };
     write_class_all(hdl, VDC_VMM_TIME, 1, adjusted_bytes)?;
-    eprintln!("[migrate] VMM_TIME import OK (adjusted)");
+    eprintln!("[migrate] time: VMM_TIME import complete (adjusted)");
     Ok(())
 }
 
@@ -371,30 +371,14 @@ pub fn export_device_state(
         // LAPIC: per-vCPU struct-based, works with read_all
         let lapic = match read_class_vcpu(hdl, VDC_LAPIC, 1, vcpuid) {
             Ok(data) => {
-                // Dump timer fields at correct offsets
-                if data.len() >= 192 {
-                    let lvt_timer = u32::from_le_bytes(data[144..148].try_into().unwrap_or([0;4]));
-                    let icr_timer = u32::from_le_bytes(data[168..172].try_into().unwrap_or([0;4]));
-                    let timer_target = i64::from_le_bytes(data[184..192].try_into().unwrap_or([0;8]));
-                    eprintln!("[migrate] LAPIC vcpu {vcpuid}: lvt_timer={lvt_timer:#x} icr_timer={icr_timer} timer_target={timer_target}");
-                }
-                // Dump vl_timer_target (i64 at offset 168 in vdi_lapic_v1)
-                if data.len() >= 176 {
-                    let timer_target = i64::from_le_bytes(
-                        data[168..176].try_into().unwrap_or([0;8])
-                    );
-                    let icr_timer = u32::from_le_bytes(
-                        data[152..156].try_into().unwrap_or([0;4])
-                    );
-                    let lvt_timer = u32::from_le_bytes(
-                        data[128..132].try_into().unwrap_or([0;4])
-                    );
-                    eprintln!("[migrate] LAPIC vcpu {vcpuid}: timer_target={timer_target} icr_timer={icr_timer} lvt_timer={lvt_timer:#x}");
-                }
+                eprintln!(
+                    "[migrate] export: LAPIC vcpu {} ({} bytes)",
+                    vcpuid, data.len(),
+                );
                 data
             }
             Err(e) => {
-                eprintln!("[migrate] warning: LAPIC export vcpu {vcpuid}: {e}");
+                eprintln!("[migrate] export: LAPIC vcpu {} failed: {e}", vcpuid);
                 Vec::new()
             }
         };
@@ -405,7 +389,7 @@ pub fn export_device_state(
             .read_all::<vdi_field_entry_v1>()
         {
             Ok(entries) => {
-                eprintln!("[migrate] exported {} MSRs for vcpu {vcpuid}", entries.len());
+                eprintln!("[migrate] export: {} MSRs for vcpu {}", entries.len(), vcpuid);
                 let mut buf = Vec::with_capacity(entries.len() * 16);
                 for entry in &entries {
                     buf.extend_from_slice(&entry.vfe_ident.to_le_bytes());
@@ -415,7 +399,7 @@ pub fn export_device_state(
                 buf
             }
             Err(e) => {
-                eprintln!("[migrate] warning: MSR export vcpu {vcpuid}: {e:?}");
+                eprintln!("[migrate] export: MSR vcpu {} failed: {e:?}", vcpuid);
                 Vec::new()
             }
         };
@@ -432,17 +416,36 @@ pub fn export_device_state(
                     buf.extend_from_slice(&entry._pad.to_le_bytes());
                     buf.extend_from_slice(&entry.vfe_value.to_le_bytes());
                 }
-                eprintln!("[migrate] exported {} VMM_ARCH fields for vcpu {vcpuid}", entries.len());
+                eprintln!("[migrate] export: {} VMM_ARCH fields for vcpu {}", entries.len(), vcpuid);
                 buf
             }
             Err(e) => {
-                eprintln!("[migrate] VMM_ARCH export vcpu {vcpuid}: {e:?}");
+                eprintln!("[migrate] export: VMM_ARCH vcpu {} failed: {e:?}", vcpuid);
                 Vec::new()
             }
         };
 
         // FPU: skip for now (need VM_GET_FPU ioctl)
         let fpu = Vec::new();
+
+        // Run state: needed to correctly restore AP vCPUs that are
+        // in HLT or INIT state (not actively running).
+        let (run_state, sipi_vector) = match vcpu.get_run_state() {
+            Ok((rs, sv)) => {
+                eprintln!(
+                    "[migrate] export: vcpu {} run_state={:#x} sipi_vector={}",
+                    vcpuid, rs, sv,
+                );
+                (rs, sv)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[migrate] export: get_run_state vcpu {} failed: {e}",
+                    vcpuid,
+                );
+                (bhyve_api::VRS_RUN, 0)
+            }
+        };
 
         vcpus.push(VcpuStatePayload {
             vcpuid,
@@ -451,6 +454,8 @@ pub fn export_device_state(
             fpu,
             lapic,
             vmm_arch,
+            run_state,
+            sipi_vector,
         });
     }
 
@@ -467,8 +472,8 @@ pub fn export_device_state(
                 });
             }
             Err(e) => {
-                // Log but continue — some classes may not be available
-                eprintln!("[migrate] warning: failed to export {name}: {e}");
+                // Log but continue -- some classes may not be available
+                eprintln!("[migrate] export: device {} failed: {e}", name);
             }
         }
     }
@@ -487,7 +492,7 @@ pub fn import_device_state(
     for dev in &state.devices {
         if !dev.data.is_empty() {
             if let Err(e) = write_class_all(hdl, dev.class, dev.version, &dev.data) {
-                eprintln!("[migrate] system device import {}: {e}", dev.name);
+                eprintln!("[migrate] import: device {} failed: {e}", dev.name);
             }
         }
     }
@@ -508,7 +513,7 @@ pub fn import_device_state(
             let entry_size = std::mem::size_of::<vdi_field_entry_v1>();
             if vcpu_state.msrs.len() % entry_size == 0 {
                 if let Err(e) = write_class_vcpu(hdl, VDC_MSR, 1, vcpu_state.vcpuid, &vcpu_state.msrs) {
-                    eprintln!("[migrate] MSR import vcpu {}: {e}", vcpu_state.vcpuid);
+                    eprintln!("[migrate] import: MSR vcpu {} failed: {e}", vcpu_state.vcpuid);
                 }
             }
         }
@@ -521,17 +526,29 @@ pub fn import_device_state(
             // even when the callout fires. Unmask it so the first
             // timer interrupt wakes the guest scheduler.
             let mut lapic_data = vcpu_state.lapic.clone();
-            // Import LAPIC state verbatim — no timer hacks needed.
+            // Import LAPIC state verbatim -- no timer hacks needed.
             // With correct VMM_TIME adjustment, the kernel's
             // vm_denormalize_hrtime() produces correct absolute times.
             // vlapic_resume() handles timer re-arming.
-            eprintln!("[migrate] importing LAPIC for vcpu {}: {} bytes", vcpu_state.vcpuid, lapic_data.len());
+            eprintln!(
+                "[migrate] import: LAPIC vcpu {} ({} bytes)",
+                vcpu_state.vcpuid, lapic_data.len(),
+            );
             match write_class_vcpu(hdl, VDC_LAPIC, 1, vcpu_state.vcpuid, &lapic_data) {
-                Ok(()) => eprintln!("[migrate] LAPIC import OK for vcpu {}", vcpu_state.vcpuid),
-                Err(e) => eprintln!("[migrate] LAPIC import FAILED vcpu {}: {e}", vcpu_state.vcpuid),
+                Ok(()) => eprintln!(
+                    "[migrate] import: LAPIC vcpu {} complete",
+                    vcpu_state.vcpuid,
+                ),
+                Err(e) => eprintln!(
+                    "[migrate] import: LAPIC vcpu {} failed: {e}",
+                    vcpu_state.vcpuid,
+                ),
             }
         } else {
-            eprintln!("[migrate] WARNING: no LAPIC data for vcpu {}", vcpu_state.vcpuid);
+            eprintln!(
+                "[migrate] import: no LAPIC data for vcpu {}",
+                vcpu_state.vcpuid,
+            );
         }
 
         // 3. Registers (includes segment descriptors)
@@ -539,14 +556,35 @@ pub fn import_device_state(
             import_vcpu_regs(&vcpu, &vcpu_state.registers)?;
         }
 
-        // 4. VMM_ARCH (pending interrupt state)
+        // 4. Run state -- restore HALT/INIT/RUN per-vCPU
+        if vcpu_state.run_state != 0 {
+            eprintln!(
+                "[migrate] import: vcpu {} run_state={:#x} sipi_vector={}",
+                vcpu_state.vcpuid, vcpu_state.run_state,
+                vcpu_state.sipi_vector,
+            );
+            if let Err(e) = vcpu.set_run_state_full(
+                vcpu_state.run_state,
+                vcpu_state.sipi_vector,
+            ) {
+                eprintln!(
+                    "[migrate] import: set_run_state vcpu {} failed: {e}",
+                    vcpu_state.vcpuid,
+                );
+            }
+        }
+
+        // 5. VMM_ARCH (pending interrupt state)
         if !vcpu_state.vmm_arch.is_empty() {
             let entry_size = std::mem::size_of::<vdi_field_entry_v1>();
             if vcpu_state.vmm_arch.len() % entry_size == 0 {
                 if let Err(e) = write_class_vcpu(
                     hdl, bhyve_api::VDC_VMM_ARCH, 1, vcpu_state.vcpuid, &vcpu_state.vmm_arch
                 ) {
-                    eprintln!("[migrate] VMM_ARCH import vcpu {}: {e}", vcpu_state.vcpuid);
+                    eprintln!(
+                        "[migrate] import: VMM_ARCH vcpu {} failed: {e}",
+                        vcpu_state.vcpuid,
+                    );
                 }
             }
         }

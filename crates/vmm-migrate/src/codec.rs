@@ -143,6 +143,16 @@ pub struct VcpuStatePayload {
     pub lapic: Vec<u8>,
     /// VDC_VMM_ARCH data.
     pub vmm_arch: Vec<u8>,
+    /// Run state (VRS_HALT, VRS_INIT, VRS_RUN, etc.)
+    #[serde(default = "default_run_state")]
+    pub run_state: u32,
+    /// SIPI vector (for APs in INIT/SIPI wait)
+    #[serde(default)]
+    pub sipi_vector: u8,
+}
+
+fn default_run_state() -> u32 {
+    bhyve_api::VRS_RUN
 }
 
 /// A named system device state blob.
@@ -416,6 +426,31 @@ pub struct MigrationPreamble {
     pub mem_size: u64,
     /// Device list for compatibility.
     pub devices: Vec<String>,
+    /// CPU feature bits from the source host for compatibility check.
+    /// The destination rejects migration if it lacks any of these features.
+    #[serde(default)]
+    pub cpu_features: Option<CpuFeatures>,
+}
+
+/// CPU feature summary for migration compatibility checking.
+///
+/// Contains the key CPUID leaf values that affect guest instruction
+/// compatibility. The destination must support all features the source
+/// exposes to the guest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CpuFeatures {
+    /// CPUID leaf 1 ECX (SSE3, SSE4.1, SSE4.2, AVX, FMA, etc.)
+    pub leaf1_ecx: u32,
+    /// CPUID leaf 1 EDX (SSE, SSE2, etc.)
+    pub leaf1_edx: u32,
+    /// CPUID leaf 7 subleaf 0 EBX (AVX2, AVX-512F, etc.)
+    pub leaf7_ebx: u32,
+    /// CPUID leaf 7 subleaf 0 ECX (AVX-512VBMI, etc.)
+    pub leaf7_ecx: u32,
+    /// CPUID leaf 7 subleaf 0 EDX (AVX-512 4VNNIW, etc.)
+    pub leaf7_edx: u32,
+    /// XCR0 supported bits (XSAVE components)
+    pub xcr0: u32,
 }
 
 #[cfg(test)]
@@ -553,6 +588,7 @@ mod tests {
             num_cpus: 4,
             mem_size: 1024 * 1024 * 1024,
             devices: vec!["virtio-blk".to_string()],
+            cpu_features: None,
         };
         let msg = Message::serialized(&preamble).unwrap();
         let out = roundtrip(&msg);

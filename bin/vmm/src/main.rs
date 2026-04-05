@@ -34,7 +34,18 @@ use vmm_devices::virtio::viona::VirtioViona;
 mod bootrom;
 mod control;
 mod direct_boot;
+mod mdata;
 mod vcpu_tasks;
+
+/// Atomic flag set by the SIGTERM signal handler.
+static SIGTERM_RECEIVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Signal handler for SIGTERM — just sets the atomic flag.
+/// The actual shutdown logic runs in a separate thread that polls this flag.
+extern "C" fn sigterm_handler(_sig: libc::c_int) {
+    SIGTERM_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 
 fn setup_logger() -> Logger {
     let decorator = slog_term::TermDecorator::new().build();
@@ -87,6 +98,9 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     let num_cpus = cli.num_cpus()?;
     let mem_size = cli.mem_size()?;
 
+    info!(log, "vmm starting";
+        "version" => version_string(),
+    );
     info!(log, "creating VM";
         "name" => &cli.vm_name,
         "cpus" => num_cpus,
@@ -156,10 +170,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
             ver
         }
         Err(e) => {
-            warn!(log, "API version query failed, assuming v18";
-                "error" => %e,
-            );
-            18
+            anyhow::bail!("failed to query bhyve API version: {}", e);
         }
     };
 
@@ -167,6 +178,21 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     // maxcpus must be 0 (kernel ignores it and uses VM_MAXCPU)
     machine.hdl().set_topology(1, num_cpus as u16, 1, 0)
         .context("failed to set CPU topology")?;
+
+    // Apply CPU feature masking for migration compatibility
+    let cpu_baseline = vmm_core::cpuid::CpuBaseline::from_str(&cli.cpu_baseline)
+        .ok_or_else(|| anyhow::anyhow!(
+            "unknown CPU baseline '{}' (valid: host, avx2, no-avx512, sse42)",
+            cli.cpu_baseline,
+        ))?;
+    if cpu_baseline != vmm_core::cpuid::CpuBaseline::Host {
+        info!(log, "applying CPU baseline"; "baseline" => &cli.cpu_baseline);
+    }
+    vmm_core::cpuid::apply_cpuid_baseline(
+        machine.hdl(),
+        num_cpus,
+        cpu_baseline,
+    ).context("failed to apply CPU baseline")?;
 
     // ----- Device initialization -----
 
@@ -250,33 +276,30 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     com2.attach(machine.bus_pio(), lpc::COM2_BASE);
     info!(log, "COM2 attached"; "port" => format!("{:#x}", lpc::COM2_BASE));
 
-    // Spawn serial console drain (COM1 output → stderr)
-    // Set up synchronous serial output: bytes go directly to stdout
-    // in the PIO handler context, matching C bhyve's com1,stdio behavior.
-    com1.set_tx_sink(Box::new(|b: u8| {
-        use std::io::Write;
-        let _ = std::io::stdout().write_all(&[b]);
-        let _ = std::io::stdout().flush();
-    }));
+    // Parse COM port paths from -l flags
+    let com1_path = find_lpc_device(&cli.lpc, "com1");
+    let com2_path = find_lpc_device(&cli.lpc, "com2");
 
-    // Spawn stdin→COM1 input thread (serial console input)
-    {
-        let com1_input = com1.clone();
-        thread::Builder::new()
-            .name("serial-input".into())
-            .spawn(move || {
-                use std::io::Read;
-                let stdin = std::io::stdin();
-                let mut buf = [0u8; 1];
-                loop {
-                    match stdin.lock().read(&mut buf) {
-                        Ok(0) => break, // EOF
-                        Ok(_) => { com1_input.input_byte(buf[0]); }
-                        Err(_) => break,
-                    }
-                }
-            })
-            .expect("failed to spawn serial input thread");
+    // Set up COM1 serial I/O based on -l com1,<config>
+    setup_serial_io(&com1, com1_path.as_deref(), "com1", &log);
+
+    // Set up COM2: if a path is specified, use it; otherwise start
+    // the built-in mdata agent for guest configuration.
+    if let Some(ref path) = com2_path {
+        setup_serial_io(&com2, Some(path.as_str()), "com2", &log);
+    } else {
+        // Start mdata agent on COM2 — this serves network config,
+        // hostname, SSH keys to the guest via the SmartOS metadata protocol.
+        let mdata_store = Arc::new(mdata::build_store_from_zone_config(
+            &cli.vm_name,
+            cli.uuid.as_deref(),
+            cli.mdata_nics.as_deref(),
+            cli.mdata_resolvers.as_deref(),
+            cli.mdata_ssh_keys.as_deref(),
+            cli.mdata_root_pw.as_deref(),
+        ));
+        mdata::start_mdata_agent(com2.clone(), mdata_store, log.clone());
+        info!(log, "mdata agent started on COM2");
     }
 
     // ----- fw_cfg, E820, and ACPI table setup -----
@@ -380,19 +403,74 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     }
 
     // Generate SMBIOS tables and add to fw_cfg
-    let smbios_config = smbios::SmbiosConfig {
-        vm_name: cli.vm_name.clone(),
-        uuid: cli.uuid.clone(),
-        num_cpus,
-        memory_mb: (mem_size / (1024 * 1024)) as u64,
+    let smbios_config = if let Some(ref b_flag) = cli.smbios {
+        let mut cfg = smbios::parse_smbios_flag(b_flag);
+        cfg.vm_name = cli.vm_name.clone();
+        cfg.uuid = cli.uuid.clone();
+        cfg.num_cpus = num_cpus;
+        cfg.memory_mb = (mem_size / (1024 * 1024)) as u64;
+        cfg
+    } else {
+        smbios::SmbiosConfig {
+            vm_name: cli.vm_name.clone(),
+            uuid: cli.uuid.clone(),
+            num_cpus,
+            memory_mb: (mem_size / (1024 * 1024)) as u64,
+            manufacturer: None,
+            product: None,
+            version: None,
+            serial: None,
+            sku: None,
+            family: None,
+        }
     };
     let (smbios_anchor, smbios_tables) = smbios::generate_smbios(&smbios_config);
-    fwcfg.insert_named("etc/smbios/smbios-anchor", smbios_anchor);
+    fwcfg.insert_named("etc/smbios/smbios-anchor", smbios_anchor.clone());
     fwcfg.insert_named("etc/smbios/smbios-tables", smbios_tables.clone());
     info!(log, "SMBIOS tables added to fw_cfg";
-        "anchor_size" => 31,
+        "anchor_size" => smbios_anchor.len(),
         "tables_size" => smbios_tables.len(),
     );
+
+    // Write SMBIOS tables to guest memory in the legacy scan area.
+    // Linux scans 0xF0000-0xFFFFF for the "_SM_" entry point signature.
+    // Write tables first (at 0xF1000), then the entry point (at 0xF0000)
+    // with the table address patched in.
+    {
+        const SMBIOS_EP_GPA: u64 = 0xF0000;
+        const SMBIOS_TABLE_GPA: u64 = 0xF1000;
+
+        // Write structure tables
+        if let Err(e) = machine.memctx().write(SMBIOS_TABLE_GPA, &smbios_tables) {
+            warn!(log, "failed to write SMBIOS tables to guest memory"; "error" => %e);
+        }
+
+        // Patch the entry point with the actual table address
+        let mut ep = smbios_anchor;
+        if ep.len() >= 0x1F {
+            // 0x18: Structure table address (4 bytes, little-endian)
+            ep[0x18..0x1C].copy_from_slice(&(SMBIOS_TABLE_GPA as u32).to_le_bytes());
+
+            // Recompute intermediate checksum (bytes 0x10..0x1F)
+            ep[0x15] = 0;
+            let sum: u8 = ep[0x10..0x1F].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+            ep[0x15] = 0u8.wrapping_sub(sum);
+
+            // Recompute entry point checksum (bytes 0x00..0x10)
+            ep[0x04] = 0;
+            let sum: u8 = ep[0x00..0x10].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+            ep[0x04] = 0u8.wrapping_sub(sum);
+        }
+
+        if let Err(e) = machine.memctx().write(SMBIOS_EP_GPA, &ep) {
+            warn!(log, "failed to write SMBIOS entry point to guest memory"; "error" => %e);
+        } else {
+            info!(log, "SMBIOS written to guest memory";
+                "entry_point" => format!("{:#x}", SMBIOS_EP_GPA),
+                "tables" => format!("{:#x}", SMBIOS_TABLE_GPA),
+            );
+        }
+    }
 
     // Keep fw_cfg alive for the duration of the VM
     let _fwcfg = fwcfg;
@@ -506,15 +584,9 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
 
         info!(log, "migration import complete, starting vCPUs");
 
-        // After import, vCPU state is set by the migration. Set run state
-        // and kick each vCPU with a LAPIC self-IPI to wake from HLT.
-        // The imported LAPIC timer deadline is in the past (time moved
-        // during migration), but the kernel's timer callout isn't
-        // automatically re-armed on import.
-        for vcpu in machine.vcpus() {
-            vcpu.set_run_state(bhyve_api::VRS_RUN)
-                .with_context(|| format!("failed to set run state for vCPU {}", vcpu.id()))?;
-        }
+        // Run state was restored per-vCPU during import_device_state.
+        // No need to force VRS_RUN here — vCPUs in HLT/INIT stay
+        // in that state and will be resumed by the kernel when needed.
         // Interrupt injection happens AFTER vCPU threads are spawned
         // (see below). Injecting before spawn loses the kick.
     } else {
@@ -556,6 +628,11 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
 
     info!(log, "starting vCPU threads");
 
+    // Create per-vCPU metrics
+    let vcpu_metrics: Vec<Arc<vmm_devices::metrics::VcpuMetrics>> = (0..num_cpus)
+        .map(|_| Arc::new(vmm_devices::metrics::VcpuMetrics::new()))
+        .collect();
+
     // Spawn vCPU threads and run until suspend/error
     let (event_rx, handles) = vcpu_tasks::spawn_vcpu_threads(
         machine.vcpus(),
@@ -563,6 +640,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         machine.bus_mmio(),
         machine.physmap(),
         api_version,
+        &vcpu_metrics,
         log,
     );
 
@@ -589,6 +667,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
             cli.vm_name.clone(),
             num_cpus,
             mem_size,
+            vcpu_metrics.clone(),
         );
         match control::spawn_control_thread(sock_path, ctrl, log.clone()) {
             Ok((_handle, path)) => {
@@ -603,6 +682,35 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // Set up SIGTERM handler for clean shutdown.
+    // When zoneadmd sends SIGTERM, trigger ACPI poweroff so the guest
+    // can shut down gracefully.
+    {
+        let hdl_sig = machine.hdl().clone();
+        let log_sig = log.clone();
+        let _ = unsafe {
+            libc::signal(libc::SIGTERM, sigterm_handler as libc::sighandler_t)
+        };
+        // Spawn a thread to wait for the signal flag
+        let hdl_sig2 = hdl_sig.clone();
+        thread::Builder::new()
+            .name("sigterm-handler".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(std::time::Duration::from_millis(500));
+                    if SIGTERM_RECEIVED.load(std::sync::atomic::Ordering::Relaxed) {
+                        info!(log_sig, "SIGTERM received, triggering ACPI poweroff");
+                        let _ = hdl_sig2.suspend(
+                            bhyve_api::vm_suspend_how::VM_SUSPEND_POWEROFF as u32,
+                            0,
+                        );
+                        break;
+                    }
+                }
+            })
+            .expect("failed to spawn sigterm handler thread");
+    }
 
     // Wait for the first vCPU event
     match event_rx.recv() {
@@ -642,6 +750,60 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Create a virtio-blk PCI device from a config string.
+///
+/// Shared between the `virtio-blk` and `ahci-cd`/`ahci-hd` (fallback) paths.
+fn create_virtio_blk_device(
+    config: &str,
+    bdf: Bdf,
+    read_only_override: bool,
+    chipset: &I440FxChipset,
+    physmap: &Arc<vmm_core::mem::PhysMap>,
+    bus_pio: &Arc<vmm_core::pio::PioBus>,
+) -> anyhow::Result<Arc<VirtioPciDevice<VirtioBlock>>> {
+    let (path, mut opts) = parse_blk_config(config);
+    if read_only_override {
+        opts.read_only = true;
+    }
+
+    use std::fs::OpenOptions;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(!opts.read_only)
+        .open(path)
+        .with_context(|| format!("failed to open disk: {}", path))?;
+    let blk = VirtioBlock::new(file, &opts, Arc::clone(physmap))
+        .with_context(|| format!("failed to create virtio-blk for: {}", path))?;
+
+    let lintr = chipset.route_lintr(&bdf);
+    let cfg_size = blk.config_size();
+    let blk_intr = Arc::clone(&blk.interrupt);
+
+    let pci_dev = VirtioPciDevice::new(
+        blk,
+        vmm_devices::virtio::bits::VIRTIO_DEV_TYPE_BLOCK,
+        1,    // 1 queue for block
+        128,  // queue size
+        cfg_size,
+        lintr,
+        Arc::clone(physmap),
+        Arc::clone(bus_pio),
+    );
+
+    // Wire interrupt: workers call this after pushing used ring
+    {
+        let pci_weak = Arc::downgrade(&pci_dev);
+        *blk_intr.lock().expect("lock") = Some(Arc::new(move || {
+            if let Some(dev) = pci_weak.upgrade() {
+                dev.raise_queue_interrupt();
+            }
+        }));
+    }
+
+    chipset.attach_device(bdf, pci_dev.clone());
+    Ok(pci_dev)
+}
+
 /// Parse a `-s` PCI slot specification and create the device.
 ///
 /// Format: `[bus:]dev[:func],driver[,config...]`
@@ -672,35 +834,9 @@ fn parse_and_create_pci_device(
             if config.is_empty() {
                 anyhow::bail!("virtio-blk requires a disk path");
             }
-            // Parse config: path[,nodelete][,sectorsize=N][,ro]
-            let (path, opts) = parse_blk_config(config);
-            use std::fs::OpenOptions;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(!opts.read_only)
-                .open(path)
-                .with_context(|| format!("failed to open disk: {}", path))?;
-            let blk = VirtioBlock::new(file, &opts)
-                .with_context(|| format!("failed to create virtio-blk for: {}", path))?;
-
-            // Get PIRQ-routed interrupt pin from the chipset.
-            // The firmware programs PIR registers to map PIRQ links
-            // to ISA IRQs. The chipset handles the routing dynamically.
-            let lintr = chipset.route_lintr(&bdf);
-
-            let cfg_size = blk.config_size();
-            let pci_dev = VirtioPciDevice::new(
-                blk,
-                vmm_devices::virtio::bits::VIRTIO_DEV_TYPE_BLOCK,
-                1,    // 1 queue for block
-                128,  // queue size
-                cfg_size,
-                lintr,
-                Arc::clone(physmap),
-                Arc::clone(bus_pio),
-            );
-
-            chipset.attach_device(bdf, pci_dev.clone());
+            let pci_dev = create_virtio_blk_device(
+                config, bdf, false, chipset, physmap, bus_pio,
+            )?;
             info!(log, "virtio-blk attached";
                 "bdf" => %bdf,
                 "path" => config,
@@ -733,6 +869,23 @@ fn parse_and_create_pci_device(
                     .with_context(|| format!("failed to set promiscphys on {}", vnic_name))?;
             }
 
+            // Start interrupt polling BEFORE moving viona into PCI device.
+            // The polling thread needs the viona fd, and we pass a callback
+            // that will raise the PCI interrupt when viona completes I/O.
+            // We use a Mutex<Option<Weak>> to defer the PCI device reference
+            // until after construction.
+            let intr_hook: Arc<std::sync::Mutex<Option<std::sync::Weak<VirtioPciDevice<VirtioViona>>>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let hook_clone = Arc::clone(&intr_hook);
+            let raise_fn: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                if let Some(weak) = hook_clone.lock().ok().and_then(|g| g.clone()) {
+                    if let Some(dev) = weak.upgrade() {
+                        dev.raise_queue_interrupt();
+                    }
+                }
+            });
+            viona.start_intr_poll(raise_fn);
+
             let lintr = chipset.route_lintr(&bdf);
 
             let pci_dev = VirtioPciDevice::new(
@@ -745,6 +898,11 @@ fn parse_and_create_pci_device(
                 Arc::clone(physmap),
                 Arc::clone(bus_pio),
             );
+
+            // Now wire up the interrupt hook with a weak reference
+            if let Ok(mut hook) = intr_hook.lock() {
+                *hook = Some(Arc::downgrade(&pci_dev));
+            }
 
             chipset.attach_device(bdf, pci_dev.clone());
             info!(log, "virtio-net-viona attached";
@@ -864,6 +1022,12 @@ fn parse_and_create_pci_device(
             );
             Ok(Some(dev))
         }
+        "ahci-cd" | "ahci-hd" => {
+            anyhow::bail!(
+                "AHCI device type '{}' is not yet implemented; use virtio-blk instead",
+                driver,
+            );
+        }
         "hostbridge" => {
             // Already created by chipset, skip
             Ok(None)
@@ -899,7 +1063,7 @@ fn parse_blk_config(config: &str) -> (&str, VirtioBlockOpts) {
                 "ro" => opts.read_only = true,
                 s if s.starts_with("sectorsize=") => {
                     if let Ok(sz) = s["sectorsize=".len()..].parse::<u32>() {
-                        if sz.is_power_of_two() && sz >= 512 {
+                        if sz.is_power_of_two() && sz >= 512 && sz <= 65536 {
                             opts.sector_size = sz;
                         }
                     }
@@ -935,7 +1099,130 @@ fn parse_bdf(s: &str) -> Option<Bdf> {
     }
 }
 
+/// Extract a device config from `-l` flags (e.g., `com1,/dev/zconsole`).
+fn find_lpc_device(lpc_args: &[String], device: &str) -> Option<String> {
+    let prefix = format!("{},", device);
+    for arg in lpc_args {
+        if let Some(config) = arg.strip_prefix(&prefix) {
+            return Some(config.to_string());
+        }
+    }
+    None
+}
+
+/// Set up serial I/O for a COM port.
+///
+/// Supports:
+/// - `stdio` or absent → stdout/stdin
+/// - `/dev/zconsole` or any path → open as read/write device
+fn setup_serial_io(
+    uart: &Arc<LpcUart>,
+    config: Option<&str>,
+    name: &str,
+    log: &Logger,
+) {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    // Strip "socket," prefix (boot.c passes "-l com2,socket,/tmp/vm.ttyb")
+    let config = config.map(|c| c.strip_prefix("socket,").unwrap_or(c));
+
+    match config {
+        None | Some("stdio") => {
+            // stdout for TX, stdin for RX
+            uart.set_tx_sink(Box::new(|b: u8| {
+                let _ = std::io::stdout().write_all(&[b]);
+                let _ = std::io::stdout().flush();
+            }));
+
+            let uart_input = uart.clone();
+            let name_owned = name.to_string();
+            thread::Builder::new()
+                .name(format!("{name}-input"))
+                .spawn(move || {
+                    let stdin = std::io::stdin();
+                    let mut buf = [0u8; 1];
+                    loop {
+                        match stdin.lock().read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(_) => { uart_input.input_byte(buf[0]); }
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .expect("failed to spawn serial input thread");
+            info!(log, "{name} connected to stdio");
+        }
+        Some(path) => {
+            // Open as a device/file for both read and write
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+            {
+                Ok(file) => {
+                    // TX: write to device
+                    let fd = file.as_raw_fd();
+                    // Dup the fd so we can have separate read/write handles
+                    let write_fd = unsafe { libc::dup(fd) };
+                    let write_file = std::sync::Mutex::new(unsafe {
+                        std::fs::File::from_raw_fd(write_fd)
+                    });
+                    uart.set_tx_sink(Box::new(move |b: u8| {
+                        if let Ok(mut f) = write_file.lock() {
+                            let _ = f.write_all(&[b]);
+                        }
+                    }));
+
+                    // RX: read from device in a thread
+                    let uart_input = uart.clone();
+                    let path_owned = path.to_string();
+                    thread::Builder::new()
+                        .name(format!("{name}-input"))
+                        .spawn(move || {
+                            let mut buf = [0u8; 1];
+                            let mut reader = file;
+                            loop {
+                                match reader.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(_) => { uart_input.input_byte(buf[0]); }
+                                    Err(_) => break,
+                                }
+                            }
+                        })
+                        .expect("failed to spawn serial input thread");
+                    info!(log, "{name} connected to {path}");
+                }
+                Err(e) => {
+                    warn!(log, "failed to open {name} device";
+                        "path" => path,
+                        "error" => %e,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Version string including git commit hash (set by build.rs).
+fn version_string() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let commit = env!("VMM_GIT_COMMIT");
+    format!("{version} ({commit})")
+}
+
 fn main() -> ExitCode {
+    // Check for --version before full CLI parse so it works
+    // even when required args are missing.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("vmm {}", version_string());
+        return ExitCode::SUCCESS;
+    }
+
+    // Register USDT probes before any device setup
+    usdt::register_probes().expect("failed to register USDT probes");
+
     let cli = Cli::parse();
     let log = setup_logger();
 

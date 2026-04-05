@@ -4,53 +4,55 @@
 
 A new Rust-based bhyve userspace VMM, replacing the existing C `bhyve` command. Designed for live migration as a first-class feature, with CLI compatibility for vmadm/boot.c integration. Architecture informed by Oxide's propolis, purpose-built for Triton.
 
-**~20K LOC Rust | 266 tests | 7 crates | 54 source files**
-
 ## What works today
 
-**Full guest boot** — Alpine Linux 3.21 boots to login prompt through both paths:
+**Full Ubuntu 24.04 guest** — Boots from ZFS zvol with UEFI, NVMe disk, virtio-net networking, cloud-init SmartOS datasource, SSH access via mdata-delivered keys. Tested with 2 vCPUs, 1 GB RAM.
 
-| Boot mode | Time to login | vs C bhyve |
-|-----------|---------------|------------|
-| `--kernel` (direct boot) | **2.9s** | 2.1x faster |
-| `-l bootrom` (UEFI) | **4.3s** | 1.4x faster |
-| C bhyve (UEFI) | 6.1s | baseline |
+**Performance (NVMe, dd O_DIRECT):**
 
-**Devices:** i440fx chipset, PIIX3 LPC bridge with PIRQ routing, virtio-blk (file-backed), virtio-net (viona kernel-accelerated), dual 16550 UARTs, ACPI (RSDP/RSDT/XSDT/FADT/MADT/HPET/DSDT/SPCR with full AML generation), SMBIOS 2.8, fw_cfg with table-loader protocol, E820, bhyve kernel devices (ATPIC, ATPIT, HPET, IOAPIC, RTC, PM timer), ACPI PM1 registers.
+| Test | Rust VMM | C bhyve | Notes |
+|------|----------|---------|-------|
+| Sequential Read 1M | **2.8 GB/s** | 2.8 GB/s | Parity (ARC-cached) |
 
-**Direct boot mode** — `--kernel`/`--initrd`/`--cmdline` flags load a Linux bzImage directly into 64-bit long mode, bypassing UEFI entirely. With a minimal initramfs, kernel reaches init in **460ms guest time** (970ms wall clock). Path to sub-125ms boot exists with a custom-compiled kernel.
+**Devices:** i440fx chipset, NVMe controller (async I/O, zero-copy preadv/pwritev, 8 worker threads), virtio-blk, virtio-net (viona kernel-accelerated with interrupt polling), virtio-rng, framebuffer/VNC (Unix socket), xHCI USB tablet, PCI passthrough (Intel VT-d + AMD IOMMU), dual 16550 UARTs (256-byte FIFO), ACPI tables (table-loader + legacy), SMBIOS 2.8 (SmartDC HVM), fw_cfg, E820, bhyve kernel devices (LAPIC, IOAPIC, ATPIC, ATPIT, HPET, RTC, PM timer), ACPI PM1 registers.
 
-**PCI interrupt delivery** — `PciIntrPin` calls `vm_isa_assert_irq(atpic, ioapic)` with correct separate values, matching C bhyve's `pci_irq_assert()`. Works with and without firmware-programmed PIR registers (direct boot compatibility).
+**Live migration** — WebSocket protocol with iterative dirty page transfer. Works same-host and cross-host with TSC frequency scaling. CPU feature compatibility check rejects incompatible migrations. CPUID masking (`--cpu-baseline avx2`) for cross-generation migration.
+
+**Metadata agent** — Built-in SmartOS mdata V2 protocol on COM2 for testing. Serves sdc:nics, sdc:hostname, sdc:resolvers, SSH keys. Cloud-init SmartOS datasource detects via SMBIOS and configures network automatically. In production, the external metadata agent is used instead.
+
+**Platform integration** — All boot.c CLI flags supported. SMBIOS defaults to "SmartDC HVM" / "Joyent" for cloud-init detection. SIGTERM triggers ACPI poweroff. Serial console supports stdio and device paths (-l com1,/dev/zconsole).
 
 ## Crate structure
 
 ```
 vmmnew/
-  crates/bhyve-api/        Kernel VMM ioctl FFI (forked from propolis)
+  bin/vmm/                  Main binary + mdata agent + control socket
+  crates/bhyve-api/         Kernel VMM ioctl FFI (forked from propolis)
   crates/viona-api/         viona NIC driver FFI (forked from propolis)
-  crates/vmm-core/          VmmHdl, PhysMap, MemCtx, Vcpu, PIO/MMIO buses, interrupt pins
-  crates/vmm-devices/       PCI bus, i440fx chipset, virtio, UART, ACPI, SMBIOS, fw_cfg
-  crates/vmm-migrate/       Migration protocol + dirty page tracking (scaffolding)
+  crates/vmm-core/          VmmHdl, PhysMap, MemCtx, Vcpu, CPUID masking
+  crates/vmm-devices/       PCI, chipset, virtio, NVMe, UART, fbuf, xHCI, passthru
+  crates/vmm-migrate/       Migration protocol, codec, state export/import
   crates/vmm-config/        CLI parsing (clap, bhyve flag-compatible)
-  bin/vmm/                  Main binary — wires everything together
 ```
 
-## What's next
+## Phase status
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| **Phase 3: Control socket** | Unix socket at `/var/run/vmm/{name}.sock`, JSON protocol (status, shutdown, console, migrate-start/accept) | Not started |
-| **Phase 4: Live migration** | WebSocket transport, iterative dirty page push, pause + device state export/import, destination resume | Not started |
-| **Phase 5: Additional devices** | NVMe, framebuffer/VNC, PCI passthrough, DTrace USDT probes | Not started |
-| **Phase 6: Production** | boot.c integration, VMAPI migration workflow, performance tuning, hardening | Not started |
+| **Phase 1: Foundation** | VmmHdl, PhysMap, MemCtx, Builder, Vcpu | Complete |
+| **Phase 2: Essential devices** | All PCI/LPC devices, virtio, ACPI, SMBIOS | Complete |
+| **Phase 3: Control + state** | Unix socket, JSON protocol, pause/resume, shutdown | Complete |
+| **Phase 4: Live migration** | WebSocket, dirty pages, state export/import, time sync | Complete |
+| **Phase 5: Additional devices** | NVMe, framebuffer/VNC, xHCI, PCI passthrough | Complete |
+| **Phase 6: Production** | boot.c integration, mdata, CPUID masking, networking | In progress |
 
-### Near-term items
+## Remaining work for platform image
 
-- **Debug trace cleanup** — remove `eprintln!` debug output throughout device code
-- **Sub-125ms boot** — custom kernel config (`CONFIG_TINY`, static drivers, no module loading)
-- **Multi-vCPU testing** — AP startup via INIT/SIPI, verify SMP guests
-- **Disk write support** — currently read-only virtio-blk for ISO boot; need r/w for zvol-backed disks
-- **vmadm drop-in** — boot.c changes to invoke `vmm` instead of `bhyve`, `--control-socket` flag
+- Build integration (Cargo release build into platform image at /usr/sbin/vmm)
+- boot.c modification to exec `vmm` instead of `bhyve`
+- AHCI native implementation (currently falls back to virtio-blk)
+- FPU/XSAVE state transfer during migration
+- Large VM testing (>32 GB RAM, >16 vCPUs)
 
 ## Build & test
 
@@ -59,18 +61,37 @@ vmmnew/
 cargo test
 
 # SmartOS headnode (actual VM execution)
-ssh root@$VMM_HEADNODE
+ssh root@<headnode>
 export PATH=/opt/tools/bin:$PATH
-cd /opt/vmmnew && CARGO_HOME=/opt/.cargo cargo build --release
+cd /opt/vmmnew && cargo build --release
 
-# UEFI boot
-./target/release/vmm -c 1 -m 512M \
-  -s 0,hostbridge -s 4,virtio-blk,/path/to/disk.iso -s 31,lpc \
-  -l bootrom,/usr/share/bhyve/uefi-rom.bin testvm
+# Boot Ubuntu 24.04 from ZFS zvol with networking
+./target/release/vmm -H -c 2 -m 1G \
+  -s 0,hostbridge \
+  -s 4,nvme,/dev/zvol/dsk/zones/vmm-test-disk \
+  -s 6,virtio-net-viona,vmm_test0 \
+  -s 31,lpc \
+  -l bootrom,/usr/share/bhyve/uefi-rom.bin \
+  -l com1,stdio \
+  --mdata-nics '[{"interface":"net0","mac":"...","ips":["10.0.0.5/24"],"gateways":["10.0.0.1"],"primary":true}]' \
+  --mdata-ssh-keys "ssh-rsa AAAA..." \
+  testvm
 
-# Direct boot (fast)
-./target/release/vmm -c 1 -m 512M \
-  -s 0,hostbridge -s 4,virtio-blk,/path/to/disk.iso -s 31,lpc \
-  --kernel /path/to/vmlinuz --initrd /path/to/initramfs.gz \
-  --cmdline "console=ttyS0" testvm
+# Live migration (source)
+./target/release/vmm ... --track-dirty --control-socket /tmp/vm.sock testvm
+echo '{"command":"migrate-source","target_addr":"dest:4567"}' | socat - UNIX-CONNECT:/tmp/vm.sock
+
+# Live migration (destination)
+./target/release/vmm ... --track-dirty --migrate-listen 0.0.0.0:4567 testvm
 ```
+
+## Documentation
+
+See [docs/](docs/) for detailed documentation:
+- [Architecture](docs/architecture.md) — Crate structure, key types, data flow
+- [CLI Reference](docs/cli.md) — All flags and options
+- [Devices](docs/devices.md) — Supported PCI and LPC devices
+- [Live Migration](docs/migration.md) — Protocol, CPU baseline, usage
+- [Metadata Agent](docs/mdata.md) — V2 protocol, NIC JSON format
+- [Platform Integration](docs/platform.md) — boot.c integration guide
+- [Feature Status](docs/status.md) — Detailed feature matrix

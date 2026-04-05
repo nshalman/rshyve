@@ -15,6 +15,7 @@
 
 pub mod aspace;
 pub mod common;
+pub mod cpuid;
 pub mod exits;
 pub mod hdl;
 pub mod inst_emul;

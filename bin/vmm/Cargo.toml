@@ -25,3 +25,4 @@ slog-async.workspace = true
 slog-term.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+usdt.workspace = true

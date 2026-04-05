@@ -17,7 +17,8 @@
 //! - Queue 0: RX (receive)
 //! - Queue 1: TX (transmit)
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use vmm_core::mem::PhysMap;
 
@@ -192,6 +193,37 @@ impl VirtioViona {
 
     #[cfg(not(target_os = "illumos"))]
     fn ring_kick(_inner: &VionaInner, _queue_idx: u16) {}
+
+    /// Start the interrupt polling thread.
+    ///
+    /// Viona completes I/O in-kernel and signals readiness via
+    /// `POLLRDBAND` on the device fd. This thread polls for that
+    /// event, calls `VNA_IOC_INTR_POLL` to discover which queues
+    /// have pending interrupts, clears them, and raises the PCI
+    /// legacy interrupt so the guest processes the used ring.
+    #[cfg(target_os = "illumos")]
+    pub fn start_intr_poll(
+        &self,
+        raise_intr: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        use std::os::fd::AsRawFd;
+        let inner = self.inner.lock().expect("viona lock");
+        let fd = inner.viona_fd.as_raw_fd();
+
+        thread::Builder::new()
+            .name("viona-intr-poll".into())
+            .spawn(move || {
+                viona_intr_poll_loop(fd, raise_intr);
+            })
+            .expect("failed to spawn viona-intr-poll thread");
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    pub fn start_intr_poll(
+        &self,
+        _raise_intr: Arc<dyn Fn() + Send + Sync>,
+    ) {
+    }
 
     /// Program the ring addresses for a queue into the kernel.
     #[cfg(target_os = "illumos")]
@@ -417,28 +449,24 @@ fn lookup_vnic(
         ));
     }
 
-    // Get MAC address via dladm show-vnic (CLI, since the FFI for
-    // MAC address retrieval is more complex)
-    let mac_output = Command::new("/usr/sbin/dladm")
+    // Get MAC address via dladm CLI. This may fail inside a zone
+    // (EPERM) — in that case we use a zero MAC and let the guest
+    // discover the real MAC from the viona device.
+    let mut mac_addr = [0u8; ETHERADDRL];
+    if let Ok(mac_output) = Command::new("/usr/sbin/dladm")
         .args(["show-vnic", "-p", "-o", "MACADDRESS"])
         .arg(name)
         .stderr(Stdio::null())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .output()
-        .map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("failed to run dladm show-vnic for '{}': {}", name, e),
-            )
-        })?;
-
-    let mut mac_addr = [0u8; ETHERADDRL];
-    if mac_output.status.success() {
-        if let Some(Ok(mac_line)) =
-            BufReader::new(&mac_output.stdout[..]).lines().next()
-        {
-            parse_mac(&mac_line, &mut mac_addr);
+    {
+        if mac_output.status.success() {
+            if let Some(Ok(mac_line)) =
+                BufReader::new(&mac_output.stdout[..]).lines().next()
+            {
+                parse_mac(&mac_line, &mut mac_addr);
+            }
         }
     }
 
@@ -459,6 +487,86 @@ extern "C" {
         classp: *mut libc::c_int,
         mediap: *mut u32,
     ) -> libc::c_int;
+}
+
+/// Interrupt polling loop for the viona kernel driver.
+///
+/// Uses `poll(2)` with `POLLRDBAND` to wait for the kernel to signal
+/// that completed I/O is ready. When signaled, reads the interrupt
+/// bitmap via `VNA_IOC_INTR_POLL`, clears each pending queue's
+/// interrupt state, and calls the provided callback to raise the
+/// PCI interrupt.
+#[cfg(target_os = "illumos")]
+fn viona_intr_poll_loop(
+    fd: std::os::fd::RawFd,
+    raise_intr: Arc<dyn Fn() + Send + Sync>,
+) {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        // Wait for POLLRDBAND — viona's signal that interrupts are pending
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLRDBAND,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            // Device closed or fatal error — exit thread
+            eprintln!("[viona] poll error: {err}");
+            break;
+        }
+        if ret == 0 {
+            continue;
+        }
+
+        if pfd.revents & libc::POLLRDBAND == 0 {
+            // Spurious wakeup or POLLHUP/POLLERR
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                break;
+            }
+            continue;
+        }
+
+        // Read which queues have pending interrupts
+        let mut poll_data = viona_api::vioc_intr_poll::default();
+        let rc = unsafe {
+            libc::ioctl(
+                fd,
+                viona_api::VNA_IOC_INTR_POLL as _,
+                &mut poll_data as *mut _,
+            )
+        };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("[viona] VNA_IOC_INTR_POLL failed: {err}");
+            continue;
+        }
+
+        // Process each queue with a pending interrupt
+        let mut any_pending = false;
+        for i in 0..viona_api::VIONA_VQ_MAX as usize {
+            if poll_data.vip_status[i] != 0 {
+                any_pending = true;
+                // Clear the in-kernel interrupt state for this queue
+                let _ = unsafe {
+                    libc::ioctl(
+                        fd,
+                        viona_api::VNA_IOC_RING_INTR_CLR as _,
+                        i,
+                    )
+                };
+            }
+        }
+
+        if any_pending {
+            raise_intr();
+        }
+    }
 }
 
 /// Parse a colon-separated MAC address string into a byte array.

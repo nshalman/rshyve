@@ -102,6 +102,16 @@ pub struct vioc_ring_msi {
     pub rm_msg: u64,
 }
 
+/// Maximum number of virtqueues (RX + TX).
+pub const VIONA_VQ_MAX: u16 = 2;
+
+/// Interrupt poll result for legacy single-pair viona.
+#[repr(C)]
+#[derive(Default)]
+pub struct vioc_intr_poll {
+    pub vip_status: [u32; VIONA_VQ_MAX as usize],
+}
+
 #[repr(C)]
 #[derive(Default)]
 pub struct vioc_intr_poll_mq {

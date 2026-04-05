@@ -40,7 +40,7 @@ pub fn parse_mem_size(s: &str) -> anyhow::Result<usize> {
 
 /// New Rust-based bhyve VMM with live migration support.
 #[derive(Parser, Debug)]
-#[command(name = "vmm", version, about)]
+#[command(name = "vmm", about)]
 pub struct Cli {
     /// CPU count or topology: N or cpus=N,sockets=M,cores=C,threads=T
     #[arg(short = 'c')]
@@ -120,6 +120,33 @@ pub struct Cli {
     /// does NOT start vCPUs — it waits for migration data.
     #[arg(long)]
     pub migrate_listen: Option<String>,
+
+    /// Network config for mdata agent (JSON, e.g. from zone config).
+    /// Format: '[{"ip":"10.0.0.5","netmask":"255.255.255.0","gateway":"10.0.0.1","primary":true}]'
+    #[arg(long)]
+    pub mdata_nics: Option<String>,
+
+    /// DNS resolvers for mdata agent (JSON array, e.g. '["8.8.8.8"]')
+    #[arg(long)]
+    pub mdata_resolvers: Option<String>,
+
+    /// SSH authorized keys for mdata agent (raw keys text)
+    #[arg(long)]
+    pub mdata_ssh_keys: Option<String>,
+
+    /// Root password for mdata agent (plaintext, set via cloud-init)
+    #[arg(long)]
+    pub mdata_root_pw: Option<String>,
+
+    /// CPU baseline profile for migration compatibility.
+    /// Masks out CPU features above the specified level so VMs can
+    /// migrate between hosts with different CPU generations.
+    ///
+    /// Values: "host" (no masking, default), "avx2" (mask AVX-512),
+    /// "sse42" (mask AVX-512 + AVX2, maximum compatibility).
+    /// Alias: "no-avx512" = "avx2".
+    #[arg(long, default_value = "host")]
+    pub cpu_baseline: String,
 
     /// VM name
     pub vm_name: String,

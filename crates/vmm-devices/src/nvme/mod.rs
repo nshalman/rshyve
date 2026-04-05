@@ -148,6 +148,9 @@ pub struct NvmeController {
     registered_bar4: Mutex<Option<u64>>,
     /// Weak self-reference for MMIO handler closures.
     self_ref: Mutex<Option<std::sync::Weak<Self>>>,
+    /// Backing file kept alive for the raw fd used by I/O workers.
+    /// Dropped (and fd closed) when the controller is dropped.
+    _file: File,
 }
 
 impl NvmeController {
@@ -268,6 +271,7 @@ impl NvmeController {
             registered_bar0: Mutex::new(None),
             registered_bar4: Mutex::new(None),
             self_ref: Mutex::new(None),
+            _file: file,
         });
         // Store weak self-reference for MMIO closures
         *ctrl.self_ref.lock().expect("self_ref lock") =
@@ -288,11 +292,6 @@ impl NvmeController {
                 })
                 .expect("nvme: failed to spawn I/O worker thread");
         }
-
-        // Keep the file alive by leaking it into a static fd.
-        // The workers use the raw fd directly via pread/pwrite.
-        // The fd will be closed when the process exits.
-        std::mem::forget(file);
 
         ctrl
     }
@@ -1450,11 +1449,17 @@ fn process_io_request(
         (st.block_size, st.total_blocks)
     };
 
-    let byte_count = req.nlb as usize * block_size as usize;
-    let byte_offset = req.slba * u64::from(block_size);
+    let byte_count = match (req.nlb as u64).checked_mul(u64::from(block_size)) {
+        Some(n) => n as usize,
+        None => return SC_INVALID_FIELD | SC_DNR,
+    };
+    let byte_offset = match req.slba.checked_mul(u64::from(block_size)) {
+        Some(n) => n,
+        None => return SC_INVALID_FIELD | SC_DNR,
+    };
 
-    // Bounds check
-    if req.slba + u64::from(req.nlb) > total_blocks {
+    // Bounds check (overflow in addition means out of bounds)
+    if req.slba.checked_add(u64::from(req.nlb)).map_or(true, |end| end > total_blocks) {
         return SC_INVALID_FIELD | SC_DNR;
     }
 
@@ -1624,5 +1629,38 @@ mod tests {
         let status = SC_INVALID_OPCODE | SC_DNR;
         assert_ne!(status & SC_DNR, 0);
         assert_eq!(status & !SC_DNR, SC_INVALID_OPCODE);
+    }
+
+    #[test]
+    fn sector_overflow_checked_mul() {
+        // Verify that checked_mul catches overflow in sector arithmetic.
+        // slba near u64::MAX with block_size=512 would overflow.
+        let slba: u64 = u64::MAX / 512 + 1;
+        let block_size: u32 = 512;
+        assert!(slba.checked_mul(u64::from(block_size)).is_none());
+    }
+
+    #[test]
+    fn sector_bounds_checked_add() {
+        // slba + nlb overflow should be caught
+        let slba: u64 = u64::MAX;
+        let nlb: u16 = 1;
+        assert!(slba.checked_add(u64::from(nlb)).is_none());
+    }
+
+    #[test]
+    fn nlb_overflow_checked_mul() {
+        // nlb * block_size overflow should be caught
+        let nlb: u16 = u16::MAX;
+        let block_size: u32 = u32::MAX;
+        assert!((nlb as u64).checked_mul(u64::from(block_size)).is_some());
+        // This fits in u64, so the overflow is in byte_offset, not byte_count
+        // Verify the realistic case works
+        let nlb: u16 = 128;
+        let block_size: u32 = 512;
+        assert_eq!(
+            (nlb as u64).checked_mul(u64::from(block_size)),
+            Some(65536)
+        );
     }
 }

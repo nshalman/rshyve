@@ -45,8 +45,6 @@ struct VirtioPciState {
     queue_select: u16,
     /// Device status register.
     status: u8,
-    /// ISR status (read clears).
-    isr_status: u8,
     /// Features negotiated by the guest.
     guest_features: u32,
     /// Device-owned virtqueues.
@@ -61,7 +59,6 @@ impl VirtioPciState {
         Self {
             queue_select: 0,
             status: 0,
-            isr_status: 0,
             guest_features: 0,
             queues,
         }
@@ -78,7 +75,6 @@ impl VirtioPciState {
     fn reset(&mut self) {
         self.queue_select = 0;
         self.status = 0;
-        self.isr_status = 0;
         self.guest_features = 0;
         for q in &mut self.queues {
             q.reset();
@@ -97,6 +93,10 @@ pub struct VirtioPciDevice<D: VirtioDevice> {
     virtio_state: Mutex<VirtioPciState>,
     /// The backend device (e.g., block, net).
     device: D,
+    /// ISR status — lock-free AtomicU8.
+    /// Workers set via fetch_or, guest reads via swap(0).
+    /// Eliminates Mutex contention between workers and vCPU.
+    isr_status: std::sync::atomic::AtomicU8,
     /// Interrupt pin for legacy INTx delivery.
     intr_pin: Option<Arc<dyn IntrPin>>,
     /// Reference to guest physical memory for queue processing.
@@ -185,6 +185,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 queue_size,
             )),
             device,
+            isr_status: std::sync::atomic::AtomicU8::new(0),
             intr_pin,
             physmap,
             bus_pio,
@@ -247,11 +248,28 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// Uses edge-triggered delivery: deassert then reassert to generate
     /// a new edge. The PciIntrPin calls `vm_isa_assert_irq(atpic, ioapic)`
     /// which delivers through both the legacy PIC and IOAPIC paths.
-    fn raise_interrupt(&self) {
+    ///
+    /// Assert the PCI interrupt pin (level-triggered).
+    ///
+    /// PCI INTx is level-triggered: assert when work is pending,
+    /// deassert when the guest reads ISR (clears the pending flag).
+    /// No deassert here — that prevents the spurious IRQ race where
+    /// deassert+assert creates a second edge that the guest sees
+    /// with ISR=0, causing "nobody cared" → IRQ disable.
+    pub fn raise_interrupt(&self) {
         if let Some(pin) = &self.intr_pin {
-            pin.deassert();
             pin.assert();
         }
+    }
+
+    /// Raise a queue interrupt: set ISR status and assert the pin.
+    ///
+    /// Uses AtomicU8 for ISR to avoid locking virtio_state on the
+    /// hot path. Workers and vCPU can set ISR concurrently without
+    /// Mutex contention.
+    pub fn raise_queue_interrupt(&self) {
+        self.isr_status.fetch_or(bits::ISR_QUEUE_INTR, std::sync::atomic::Ordering::Release);
+        self.raise_interrupt();
     }
 
     /// Deassert the interrupt after ISR is read or on device reset.
@@ -274,6 +292,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         match offset {
             bits::LEGACY_REG_DEVICE_FEATURES => {
                 self.device.device_features()
+                    | bits::VIRTIO_F_RING_EVENT_IDX as u32
             }
             bits::LEGACY_REG_GUEST_FEATURES => {
                 u32::from(vs.guest_features)
@@ -299,11 +318,17 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 u32::from(vs.status)
             }
             bits::LEGACY_REG_ISR_STATUS => {
-                let val = vs.isr_status;
+                // Atomic swap: read and clear ISR in one operation.
+                let val = self.isr_status.swap(0, std::sync::atomic::Ordering::AcqRel);
                 if val != 0 {
-                    vs.isr_status = 0;
                     drop(vs);
                     self.lower_interrupt();
+                    // Re-check: a worker may have set ISR between our
+                    // swap and deassert. If so, re-assert the pin so
+                    // the guest gets another interrupt for the new work.
+                    if self.isr_status.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                        self.raise_interrupt();
+                    }
                     return u32::from(val);
                 }
                 0
@@ -330,6 +355,13 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             bits::LEGACY_REG_GUEST_FEATURES => {
                 vs.guest_features = val;
                 self.device.set_features(val);
+
+                // Propagate event_idx to all queues so they know
+                // whether to use notification suppression.
+                let event_idx = val & bits::VIRTIO_F_RING_EVENT_IDX as u32 != 0;
+                for q in &mut vs.queues {
+                    q.set_event_idx(event_idx);
+                }
             }
             bits::LEGACY_REG_QUEUE_PFN => {
                 let queue_sel = vs.queue_select;
@@ -355,7 +387,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     &self.physmap,
                 );
                 if did_work {
-                    vs.isr_status |= bits::ISR_QUEUE_INTR;
+                    self.isr_status.fetch_or(bits::ISR_QUEUE_INTR, std::sync::atomic::Ordering::Release);
                     drop(vs);
                     self.raise_interrupt();
                 }
@@ -365,6 +397,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 if new_status == 0 {
                     vs.reset();
                     self.device.reset();
+                    self.isr_status.store(0, std::sync::atomic::Ordering::Relaxed);
                     drop(vs);
                     // Ensure interrupt line is low on reset so the
                     // next driver doesn't see a spurious assertion
@@ -533,7 +566,8 @@ mod tests {
         let val = u32::from_le_bytes([
             ro.buf()[0], ro.buf()[1], ro.buf()[2], ro.buf()[3],
         ]);
-        assert_eq!(val, 0x42);
+        // Device features = 0x42 from test device + RING_EVENT_IDX (bit 29)
+        assert_eq!(val, 0x42 | bits::VIRTIO_F_RING_EVENT_IDX as u32);
     }
 
     #[test]
@@ -576,10 +610,7 @@ mod tests {
         let dev = make_test_device();
 
         // Manually set ISR
-        {
-            let mut vs = dev.virtio_state.lock().unwrap();
-            vs.isr_status = bits::ISR_QUEUE_INTR;
-        }
+        dev.isr_status.store(bits::ISR_QUEUE_INTR, std::sync::atomic::Ordering::Relaxed);
 
         // First read should return the value
         let mut ro = ReadOp::new(1);

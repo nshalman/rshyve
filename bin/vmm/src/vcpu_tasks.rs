@@ -20,6 +20,13 @@ use std::thread;
 
 use slog::{debug, error, info, warn, Logger};
 
+#[usdt::provider(provider = "vmm")]
+mod probes {
+    fn vm_entry(vcpuid: u32) {}
+    fn vm_exit(vcpuid: u32, rip: u64, exit_code: u32) {}
+    fn vcpu_suspended(vcpuid: u32, kind: u8) {}
+}
+
 use vmm_core::exits::{
     InoutReq, InoutRes, MmioReq, MmioRes, Suspend,
     VmEntry, VmExitKind,
@@ -28,6 +35,7 @@ use vmm_core::inst_emul;
 use vmm_core::mem::PhysMap;
 use vmm_core::pio::PioBus;
 use vmm_core::mmio::MmioBus;
+use vmm_devices::metrics::VcpuMetrics;
 use vmm_core::vcpu::Vcpu;
 
 /// Events sent from vCPU threads to the main thread.
@@ -48,12 +56,13 @@ pub fn spawn_vcpu_threads(
     bus_mmio: &Arc<MmioBus>,
     physmap: &Arc<PhysMap>,
     api_version: u32,
+    vcpu_metrics: &[Arc<VcpuMetrics>],
     log: &Logger,
 ) -> (mpsc::Receiver<VcpuEvent>, Vec<thread::JoinHandle<()>>) {
     let (tx, rx) = mpsc::channel();
     let mut handles = Vec::with_capacity(vcpus.len());
 
-    for vcpu in vcpus {
+    for (idx, vcpu) in vcpus.iter().enumerate() {
         let vcpu_id = vcpu.id();
         let vcpu_log = log.new(slog::o!("vcpu" => vcpu_id));
 
@@ -61,6 +70,7 @@ pub fn spawn_vcpu_threads(
         let bus_pio = Arc::clone(bus_pio);
         let bus_mmio = Arc::clone(bus_mmio);
         let physmap = Arc::clone(physmap);
+        let metrics = Arc::clone(&vcpu_metrics[idx]);
         let tx = tx.clone();
         let hdl = Arc::clone(vcpu.hdl());
 
@@ -79,6 +89,7 @@ pub fn spawn_vcpu_threads(
                     &bus_mmio,
                     &physmap,
                     api_version,
+                    &metrics,
                     &tx,
                     &vcpu_log,
                 );
@@ -100,6 +111,7 @@ fn vcpu_run_loop(
     bus_mmio: &MmioBus,
     physmap: &PhysMap,
     api_version: u32,
+    metrics: &VcpuMetrics,
     events: &mpsc::Sender<VcpuEvent>,
     log: &Logger,
 ) {
@@ -110,6 +122,7 @@ fn vcpu_run_loop(
     info!(log, "vCPU run loop starting");
 
     loop {
+        probes::vm_entry!(|| (vcpu_id as u32));
         let exit = match vcpu.enter(&next_entry, api_version) {
             Ok(exit) => exit,
             Err(e) => {
@@ -133,6 +146,10 @@ fn vcpu_run_loop(
                 return;
             }
         };
+
+        let exit_code = exit.kind.exit_code();
+        probes::vm_exit!(|| (vcpu_id as u32, exit.rip, exit_code));
+        metrics.record_exit(exit_code);
 
         next_entry = match exit.kind {
             VmExitKind::Bogus | VmExitKind::Debug => {

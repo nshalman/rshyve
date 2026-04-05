@@ -17,7 +17,11 @@ inherits = "dev"
 panic = "abort"
 
 [profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
 panic = "abort"
+strip = true
 
 [workspace.dependencies]
 # Internal crates
@@ -31,6 +35,7 @@ vmm_config = { path = "crates/vmm-config" }
 
 # External dependencies
 anyhow = "1.0"
+usdt = { version = "0.5", default-features = false }
 bitflags = "2.4"
 clap = { version = "4.2", features = ["derive"] }
 futures = "0.3"
