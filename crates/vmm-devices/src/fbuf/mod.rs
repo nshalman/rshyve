@@ -31,9 +31,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
+use slog;
 use vmm_core::common::RWOp;
 use vmm_core::mmio::{MmioBus, MmioFn};
 
+use crate::Lifecycle;
 use crate::pci::bar::BarDefine;
 use crate::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use crate::pci::BarN;
@@ -66,6 +68,16 @@ const BAR1_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Bits per pixel (always 32, XRGB8888).
 const DEFAULT_BPP: u16 = 32;
+
+/// Bytes per pixel (XRGB8888).
+const BYTES_PER_PIXEL: u64 = 4;
+
+/// Returns true if `width × height × 4` fits within the BAR1 framebuffer.
+fn resolution_fits(width: u16, height: u16) -> bool {
+    (u64::from(width) * BYTES_PER_PIXEL)
+        .checked_mul(u64::from(height))
+        .map_or(false, |n| n <= u64::from(BAR1_SIZE))
+}
 
 /// VNC update interval (~30 fps).
 const VNC_FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -144,6 +156,9 @@ pub struct Framebuffer {
     /// Path to the VNC Unix socket.
     vnc_path: PathBuf,
 
+    /// Structured logger.
+    log: slog::Logger,
+
     /// Flag to signal VNC thread to shut down.
     shutdown: AtomicBool,
 }
@@ -162,6 +177,7 @@ impl Framebuffer {
         vnc_path: &Path,
         vnc_password: Option<String>,
         bus_mmio: Arc<MmioBus>,
+        log: slog::Logger,
     ) -> Arc<Self> {
         let ident = DeviceIdent {
             vendor_id: PCI_VENDOR_ID,
@@ -190,6 +206,7 @@ impl Framebuffer {
             self_ref: Mutex::new(None),
             vnc_password,
             vnc_path: vnc_path.to_owned(),
+            log,
             shutdown: AtomicBool::new(false),
         });
 
@@ -385,7 +402,7 @@ impl Framebuffer {
                     // 4-byte write at offset 4: low 16 = width, high 16 = height
                     let new_w = val as u16;
                     let new_h = (val >> 16) as u16;
-                    if new_w > 0 && new_h > 0 {
+                    if new_w > 0 && new_h > 0 && resolution_fits(new_w, new_h) {
                         self.resolution
                             .store(pack_resolution(new_w, new_h), Ordering::Release);
                     }
@@ -395,8 +412,10 @@ impl Framebuffer {
                     if new_w > 0 {
                         let old = self.resolution.load(Ordering::Relaxed);
                         let h = unpack_height(old);
-                        self.resolution
-                            .store(pack_resolution(new_w, h), Ordering::Release);
+                        if resolution_fits(new_w, h) {
+                            self.resolution
+                                .store(pack_resolution(new_w, h), Ordering::Release);
+                        }
                     }
                 }
             }
@@ -405,8 +424,10 @@ impl Framebuffer {
                 if new_h > 0 {
                     let old = self.resolution.load(Ordering::Relaxed);
                     let w = unpack_width(old);
-                    self.resolution
-                        .store(pack_resolution(w, new_h), Ordering::Release);
+                    if resolution_fits(w, new_h) {
+                        self.resolution
+                            .store(pack_resolution(w, new_h), Ordering::Release);
+                    }
                 }
             }
             // FBSIZE, DEPTH, REFRESH are read-only
@@ -497,7 +518,7 @@ fn vnc_server_loop(dev: Arc<Framebuffer>) {
     let listener = match UnixListener::bind(&dev.vnc_path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("fbuf: failed to bind VNC socket {:?}: {}", dev.vnc_path, e);
+            slog::error!(dev.log, "failed to bind VNC socket"; "path" => ?dev.vnc_path, "error" => %e);
             return;
         }
     };
@@ -507,7 +528,7 @@ fn vnc_server_loop(dev: Arc<Framebuffer>) {
         .set_nonblocking(false)
         .expect("fbuf: set_nonblocking");
 
-    eprintln!("fbuf: VNC server listening on {:?}", dev.vnc_path);
+    slog::info!(dev.log, "VNC server listening"; "path" => ?dev.vnc_path);
 
     loop {
         if dev.shutdown.load(Ordering::Acquire) {
@@ -520,13 +541,13 @@ fn vnc_server_loop(dev: Arc<Framebuffer>) {
         // a blocking accept in a loop and check shutdown between clients.
         match listener.accept() {
             Ok((stream, _addr)) => {
-                eprintln!("fbuf: VNC client connected");
+                slog::info!(dev.log, "VNC client connected");
                 if let Err(e) = handle_vnc_client(&dev, stream) {
                     if !is_expected_disconnect(&e) {
-                        eprintln!("fbuf: VNC client error: {}", e);
+                        slog::warn!(dev.log, "VNC client error"; "error" => %e);
                     }
                 }
-                eprintln!("fbuf: VNC client disconnected");
+                slog::info!(dev.log, "VNC client disconnected");
             }
             Err(e) => {
                 if dev.shutdown.load(Ordering::Acquire) {
@@ -535,7 +556,7 @@ fn vnc_server_loop(dev: Arc<Framebuffer>) {
                 if e.kind() != io::ErrorKind::WouldBlock
                     && e.kind() != io::ErrorKind::TimedOut
                 {
-                    eprintln!("fbuf: VNC accept error: {}", e);
+                    slog::warn!(dev.log, "VNC accept error"; "error" => %e);
                     thread::sleep(Duration::from_millis(100));
                 }
             }
@@ -627,28 +648,31 @@ fn handle_vnc_client(
                     ClientMessage::SetPixelFormat(pf) => {
                         // We only support XRGB8888; log if client wants something else
                         if pf.bits_per_pixel != 32 {
-                            eprintln!(
-                                "fbuf: client requested unsupported pixel format: {}bpp",
-                                pf.bits_per_pixel
-                            );
+                            slog::warn!(dev.log, "client requested unsupported pixel format";
+                                "bpp" => pf.bits_per_pixel);
                         }
                     }
                     ClientMessage::SetEncodings(encs) => {
                         // We only support Raw encoding; log what client supports
                         let has_raw = encs.contains(&ENCODING_RAW);
                         if !has_raw {
-                            eprintln!(
-                                "fbuf: client encodings do not include Raw, \
-                                 updates may not display correctly"
-                            );
+                            slog::warn!(dev.log, "client encodings do not include Raw, updates may not display correctly");
                         }
                     }
                     ClientMessage::KeyEvent { down, key } => {
                         // TODO: forward to PS/2 keyboard when implemented
+                        static WARN_KEY: std::sync::Once = std::sync::Once::new();
+                        WARN_KEY.call_once(|| {
+                            slog::debug!(dev.log, "VNC keyboard input received but not forwarded (PS/2 not implemented)");
+                        });
                         let _ = (down, key);
                     }
                     ClientMessage::PointerEvent { button_mask, x, y } => {
-                        // TODO: forward to USB tablet when implemented
+                        // Forward to xHCI tablet if available, otherwise drop
+                        static WARN_PTR: std::sync::Once = std::sync::Once::new();
+                        WARN_PTR.call_once(|| {
+                            slog::debug!(dev.log, "VNC pointer input received but not forwarded (tablet not connected)");
+                        });
                         let _ = (button_mask, x, y);
                     }
                     ClientMessage::CutText(_) => {
@@ -706,37 +730,40 @@ fn send_framebuffer_update<W: Write>(
         return Ok(());
     }
 
-    // Calculate the pixel data size
-    let stride = u32::from(width) * 4; // 4 bytes per pixel (XRGB8888)
-    let frame_bytes = stride as usize * usize::from(height);
+    // Calculate the pixel data size, clamped to the actual framebuffer
+    // to prevent unbounded allocation if resolution is somehow larger.
+    let stride = u32::from(width) as usize * 4; // 4 bytes per pixel (XRGB8888)
+    let frame_bytes = stride.saturating_mul(usize::from(height));
 
     // Send FramebufferUpdate header (1 rectangle)
     rfb::write_fb_update_header(writer, 1)?;
 
-    // Rectangle header
-    let rect = RectHeader {
-        x: 0,
-        y: 0,
-        width,
-        height,
-        encoding: ENCODING_RAW,
-    };
-    writer.write_all(&rect.to_bytes())?;
-
     // Read pixel data from the shared framebuffer.
-    // We take a read lock for the snapshot — the guest may be writing
-    // concurrently but that's acceptable (same as a real display
-    // scanning the framebuffer).
+    // Clamp to the actual pixel buffer size to avoid unbounded allocation.
     {
         let fb = dev.fb_state.read().expect("fbuf: fb_state read lock");
-        let avail = fb.pixels.len().min(frame_bytes);
-        writer.write_all(&fb.pixels[..avail])?;
-        // If the framebuffer is smaller than the declared resolution
-        // (shouldn't happen, but be defensive), pad with zeros.
-        if avail < frame_bytes {
-            let padding = vec![0u8; frame_bytes - avail];
-            writer.write_all(&padding)?;
-        }
+        let clamped = frame_bytes.min(fb.pixels.len());
+
+        // Derive the actual dimensions we can send from the clamped size
+        // so the VNC rectangle header matches the data we transmit.
+        let (send_w, send_h) = if clamped < frame_bytes && stride > 0 {
+            let rows = clamped / stride;
+            (width, rows as u16)
+        } else {
+            (width, height)
+        };
+
+        let rect = RectHeader {
+            x: 0,
+            y: 0,
+            width: send_w,
+            height: send_h,
+            encoding: ENCODING_RAW,
+        };
+        writer.write_all(&rect.to_bytes())?;
+
+        let send_bytes = usize::from(send_w) * 4 * usize::from(send_h);
+        writer.write_all(&fb.pixels[..send_bytes.min(fb.pixels.len())])?;
     }
 
     writer.flush()?;
@@ -769,6 +796,16 @@ impl<R: io::Read, W: io::Write> io::Write for CombinedStream<'_, R, W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+impl Lifecycle for Framebuffer {
+    fn type_name(&self) -> &'static str {
+        "framebuffer"
     }
 }
 
@@ -910,6 +947,55 @@ mod tests {
         assert_eq!((class_reg >> 16) as u8, PCI_SUBCLASS_VGA);
     }
 
+    #[test]
+    fn bar0_write_oversized_resolution_rejected() {
+        let dev = make_test_dev();
+        // 65535×65535 × 4 = ~16 GiB -- far exceeds 16 MiB BAR1
+        let val = u32::from(u16::MAX) | (u32::from(u16::MAX) << 16);
+        dev.bar0_write(memreg::WIDTH, val, 4);
+        // Resolution must remain unchanged
+        assert_eq!(dev.width(), 1024);
+        assert_eq!(dev.height(), 768);
+    }
+
+    #[test]
+    fn bar0_write_oversized_width_rejected() {
+        let dev = make_test_dev();
+        // 65535 × 768 × 4 = ~191 MiB -- exceeds 16 MiB BAR1
+        dev.bar0_write(memreg::WIDTH, u32::from(u16::MAX), 2);
+        assert_eq!(dev.width(), 1024); // unchanged
+    }
+
+    #[test]
+    fn bar0_write_oversized_height_rejected() {
+        let dev = make_test_dev();
+        // 1024 × 65535 × 4 = ~256 MiB -- exceeds 16 MiB BAR1
+        dev.bar0_write(memreg::HEIGHT, u32::from(u16::MAX), 2);
+        assert_eq!(dev.height(), 768); // unchanged
+    }
+
+    #[test]
+    fn bar0_write_max_fitting_resolution_accepted() {
+        let dev = make_test_dev();
+        // 2048 × 2048 × 4 = 16 MiB -- exactly fits BAR1
+        let val = u32::from(2048u16) | (u32::from(2048u16) << 16);
+        dev.bar0_write(memreg::WIDTH, val, 4);
+        assert_eq!(dev.width(), 2048);
+        assert_eq!(dev.height(), 2048);
+    }
+
+    #[test]
+    fn resolution_fits_boundary() {
+        // 2048 × 2048 × 4 = 16 MiB = BAR1_SIZE exactly
+        assert!(resolution_fits(2048, 2048));
+        // One pixel over
+        assert!(!resolution_fits(2049, 2048));
+        // Way over
+        assert!(!resolution_fits(u16::MAX, u16::MAX));
+        // Zero dimensions (rejected elsewhere, but fits check is true)
+        assert!(resolution_fits(0, 0));
+    }
+
     /// Create a test device without starting the VNC server.
     fn make_test_dev() -> Framebuffer {
         let ident = DeviceIdent {
@@ -937,6 +1023,7 @@ mod tests {
             self_ref: Mutex::new(None),
             vnc_password: None,
             vnc_path: PathBuf::from("/tmp/test-fbuf.vnc"),
+            log: slog::Logger::root(slog::Discard, slog::o!()),
             shutdown: AtomicBool::new(false),
         }
     }

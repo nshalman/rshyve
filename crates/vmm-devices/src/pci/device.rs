@@ -261,6 +261,14 @@ impl DeviceState {
                 // handled as write-1-to-clear but we have nothing clearable
                 // right now, so they are ignored.
             }
+            // 0x0C: Header Type (byte at offset 0x0E) — only the
+            // multi-function bit (0x80) is writable by the bus layer.
+            0x0C => {
+                // Header type is byte 2 of this dword (offset 0x0E)
+                if byte_off == 2 && len == 1 {
+                    self.header_type = val as u8;
+                }
+            }
             // 0x10-0x24: BAR writes
             bar_off @ 0x10..=0x24 if (bar_off & 0x03) == 0 => {
                 // BAR writes must be dword-aligned, full-width

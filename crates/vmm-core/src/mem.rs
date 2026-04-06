@@ -253,14 +253,15 @@ impl SubMapping {
             ));
         }
 
-        // Safety: bounds checked above. copy_nonoverlapping is safe
-        // because src (guest) and dst (our buf) don't overlap.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.ptr.as_ptr(),
-                buf.as_mut_ptr(),
-                buf.len(),
-            );
+        // Safety: bounds checked above. We use volatile reads because
+        // guest memory is concurrently mutable by vCPUs; non-volatile
+        // copies may be optimized in ways that miss concurrent writes.
+        let src = self.ptr.as_ptr();
+        let n = buf.len();
+        for i in 0..n {
+            unsafe {
+                buf[i] = std::ptr::read_volatile(src.add(i));
+            }
         }
         Ok(())
     }
@@ -280,14 +281,15 @@ impl SubMapping {
             ));
         }
 
-        // Safety: bounds checked above. copy_nonoverlapping is safe
-        // because src (our data) and dst (guest) don't overlap.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                self.ptr.as_ptr(),
-                data.len(),
-            );
+        // Safety: bounds checked above. We use volatile writes because
+        // guest memory is concurrently readable by vCPUs; non-volatile
+        // copies may be reordered or elided by the optimizer.
+        let dst = self.ptr.as_ptr();
+        let n = data.len();
+        for i in 0..n {
+            unsafe {
+                std::ptr::write_volatile(dst.add(i), data[i]);
+            }
         }
         Ok(())
     }
@@ -662,5 +664,182 @@ mod tests {
         let sub = SubMapping::new(&mapping);
         let tiny = sub.subregion(0, 2).unwrap();
         assert!(tiny.read::<u32>().is_err());
+    }
+
+    #[test]
+    fn write_u32_too_small_fails() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        let tiny = sub.subregion(0, 2).unwrap();
+        let result = tiny.write::<u32>(&0xDEAD);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn read_u16_aligned_roundtrip() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        // Write at aligned offset, read back
+        let region = sub.subregion(0, 2).unwrap();
+        region.write::<u16>(&0xBEEF).unwrap();
+        let val = region.read::<u16>().unwrap();
+        assert_eq!(val, 0xBEEF);
+    }
+
+    #[test]
+    fn read_u16_at_aligned_offset_roundtrip() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        // Offset 4 is aligned for u16
+        let region = sub.subregion(4, 2).unwrap();
+        region.write::<u16>(&0xCAFE).unwrap();
+        let val = region.read::<u16>().unwrap();
+        assert_eq!(val, 0xCAFE);
+    }
+
+    #[test]
+    fn write_bytes_read_bytes_roundtrip() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        let data = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
+        sub.write_bytes(&data).unwrap();
+        let mut buf = [0u8; 8];
+        sub.read_bytes(&mut buf).unwrap();
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn write_bytes_read_bytes_at_offset() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        // Write at an unaligned offset via subregion
+        let region = sub.subregion(3, 5).unwrap();
+        let data = [1, 2, 3, 4, 5];
+        region.write_bytes(&data).unwrap();
+        let mut buf = [0u8; 5];
+        region.read_bytes(&mut buf).unwrap();
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn read_bytes_exceeds_bounds() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        let tiny = sub.subregion(0, 4).unwrap();
+        let mut buf = [0u8; 8];
+        let result = tiny.read_bytes(&mut buf);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn write_bytes_exceeds_bounds() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        let tiny = sub.subregion(0, 4).unwrap();
+        let result = tiny.write_bytes(&[0u8; 8]);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn subregion_exact_end() {
+        let mapping = make_test_mapping(256);
+        let sub = SubMapping::new(&mapping);
+        // Exactly the full mapping
+        assert!(sub.subregion(0, 256).is_some());
+        // One byte past the end
+        assert!(sub.subregion(0, 257).is_none());
+        // Last byte
+        assert!(sub.subregion(255, 1).is_some());
+        // Zero-length at end
+        assert!(sub.subregion(256, 0).is_some());
+    }
+
+    #[test]
+    fn subregion_nested() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        // Create a subregion, then a subregion of that
+        let outer = sub.subregion(100, 200).unwrap();
+        let inner = outer.subregion(50, 100).unwrap();
+        assert_eq!(inner.len(), 100);
+        // Inner subregion cannot exceed outer
+        assert!(outer.subregion(150, 100).is_none());
+    }
+
+    #[test]
+    fn read_from_write_only_mapping_fails() {
+        // Create a write-only mapping
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED);
+        let ptr = NonNull::new(raw as *mut u8).unwrap();
+        let mapping = Arc::new(Mapping {
+            ptr,
+            len: 4096,
+            prot: Prot::WRITE,
+        });
+        let sub = SubMapping::new(&mapping);
+        let result = sub.read::<u32>();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn write_to_read_only_mapping_fails() {
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED);
+        let ptr = NonNull::new(raw as *mut u8).unwrap();
+        let mapping = Arc::new(Mapping {
+            ptr,
+            len: 4096,
+            prot: Prot::READ,
+        });
+        let sub = SubMapping::new(&mapping);
+        let result = sub.write::<u32>(&42);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn len_and_is_empty() {
+        let mapping = make_test_mapping(4096);
+        let sub = SubMapping::new(&mapping);
+        assert_eq!(sub.len(), 4096);
+        assert!(!sub.is_empty());
+
+        let zero = sub.subregion(0, 0).unwrap();
+        assert_eq!(zero.len(), 0);
+        assert!(zero.is_empty());
+    }
+
+    #[test]
+    fn phys_map_empty() {
+        let map = PhysMap::new();
+        assert_eq!(map.num_regions(), 0);
+        assert_eq!(map.total_memory(), 0);
+        assert!(map.regions().is_empty());
+        // Lookup in empty map returns None
+        assert!(map.lookup(0, 1).is_none());
+        assert!(map.lookup(0x1000, 4096).is_none());
     }
 }

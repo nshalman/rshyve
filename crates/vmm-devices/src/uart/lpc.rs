@@ -30,6 +30,8 @@ use vmm_core::common::RWOp;
 use vmm_core::intr_pins::IntrPin;
 use vmm_core::pio::{PioBus, PioFn};
 
+use crate::Lifecycle;
+
 use super::uart16550::Uart;
 
 /// Number of I/O ports occupied by a 16550 UART (offsets 0-7).
@@ -179,6 +181,12 @@ impl LpcUart {
         }
 
         state.sync_intr_pin();
+    }
+}
+
+impl Lifecycle for LpcUart {
+    fn type_name(&self) -> &'static str {
+        "lpc-uart"
     }
 }
 

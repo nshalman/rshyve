@@ -11,8 +11,9 @@
 use bhyve_api::{
     VDC_ATPIC, VDC_ATPIT, VDC_HPET, VDC_IOAPIC,
     VDC_LAPIC, VDC_MSR, VDC_PM_TIMER, VDC_RTC, VDC_VMM_TIME,
-    vdi_field_entry_v1, vm_reg_name, seg_desc,
+    vdi_field_entry_v1, vm_reg_name,
 };
+use slog;
 use std::sync::Arc;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::vcpu::Vcpu;
@@ -120,7 +121,11 @@ fn export_vcpu_regs(vcpu: &Vcpu) -> Result<Vec<u8>, MigrateError> {
 
 /// Import registers for a vCPU from (reg_id, value) pairs,
 /// followed by segment descriptors after a marker.
-fn import_vcpu_regs(vcpu: &Vcpu, data: &[u8]) -> Result<(), MigrateError> {
+fn import_vcpu_regs(
+    vcpu: &Vcpu,
+    data: &[u8],
+    log: &slog::Logger,
+) -> Result<(), MigrateError> {
     let mut pos = 0;
 
     // Read general registers (12 bytes each: 4 id + 8 value)
@@ -154,8 +159,13 @@ fn import_vcpu_regs(vcpu: &Vcpu, data: &[u8]) -> Result<(), MigrateError> {
                 let access = u32::from_le_bytes(
                     data[pos + 16..pos + 20].try_into().expect("4 bytes"),
                 );
-                let reg: vm_reg_name = unsafe {
-                    std::mem::transmute(seg_id as i32)
+                let reg: vm_reg_name = match vm_reg_name::from_repr(seg_id as i32) {
+                    Some(r) if !matches!(r, vm_reg_name::VM_REG_LAST) => r,
+                    _ => {
+                        return Err(MigrateError::VmmData(format!(
+                            "invalid segment reg id: {seg_id}"
+                        )));
+                    }
                 };
                 let desc = bhyve_api::seg_desc { base, limit, access };
                 vcpu.set_segment_desc(reg, &desc).map_err(|e| {
@@ -173,12 +183,19 @@ fn import_vcpu_regs(vcpu: &Vcpu, data: &[u8]) -> Result<(), MigrateError> {
         let val = u64::from_le_bytes(
             data[pos + 4..pos + 12].try_into().expect("8 bytes"),
         );
-        let reg: vm_reg_name = unsafe { std::mem::transmute(reg_id as i32) };
+        let reg: vm_reg_name = match vm_reg_name::from_repr(reg_id as i32) {
+            Some(r) if !matches!(r, vm_reg_name::VM_REG_LAST) => r,
+            _ => {
+                return Err(MigrateError::VmmData(format!(
+                    "invalid reg id: {reg_id}"
+                )));
+            }
+        };
         if let Err(e) = vcpu.set_reg(reg, val) {
             // Some registers may fail on cross-host migration due to
             // CPU feature differences (e.g., XCR0 with AVX bits on a
             // host that doesn't support AVX). Log and continue.
-            eprintln!("[migrate] vcpu-regs: set_reg {:?} = {:#x} failed: {e} (continuing)", reg, val);
+            slog::warn!(log, "set_reg failed"; "reg" => ?reg, "value" => format!("{:#x}", val), "error" => %e);
         }
         pos += 12;
     }
@@ -244,9 +261,12 @@ fn write_class_vcpu(
 }
 
 /// Export time synchronization data from the kernel.
-pub fn export_time_data(hdl: &Arc<VmmHdl>) -> Result<TimeData, MigrateError> {
+pub fn export_time_data(
+    hdl: &Arc<VmmHdl>,
+    log: &slog::Logger,
+) -> Result<TimeData, MigrateError> {
     let vmm_time = read_class_all(hdl, VDC_VMM_TIME, 1)?;
-    eprintln!("[migrate] time: exported VMM_TIME ({} bytes)", vmm_time.len());
+    slog::info!(log, "exported VMM_TIME"; "bytes" => vmm_time.len());
     Ok(TimeData { vmm_time })
 }
 
@@ -257,6 +277,7 @@ pub fn export_time_data(hdl: &Arc<VmmHdl>) -> Result<TimeData, MigrateError> {
 pub fn import_time_data(
     hdl: &Arc<VmmHdl>,
     time: &TimeData,
+    log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     use bhyve_api::vdi_time_info_v1;
 
@@ -265,7 +286,7 @@ pub fn import_time_data(
         return Err(MigrateError::VmmData("VMM_TIME too small".into()));
     }
     let src: vdi_time_info_v1 = unsafe {
-        std::ptr::read(time.vmm_time.as_ptr() as *const vdi_time_info_v1)
+        std::ptr::read_unaligned(time.vmm_time.as_ptr() as *const vdi_time_info_v1)
     };
 
     // Read destination's current host time snapshot
@@ -308,21 +329,20 @@ pub fn import_time_data(
     };
     let new_guest_tsc = scaled_guest_tsc.wrapping_add(tsc_delta);
 
-    eprintln!(
-        "[migrate] time: VMM_TIME adjust guest_uptime={}ms migrate_delta={}ms boot_hrtime={} tsc_delta={}",
-        guest_uptime / 1_000_000,
-        migrate_delta_ns / 1_000_000,
-        new_boot_hrtime,
-        tsc_delta,
+    slog::info!(log, "VMM_TIME adjust";
+        "guest_uptime_ms" => guest_uptime / 1_000_000,
+        "migrate_delta_ms" => migrate_delta_ns / 1_000_000,
+        "boot_hrtime" => new_boot_hrtime,
+        "tsc_delta" => tsc_delta,
     );
 
     // Use destination's guest_freq if it differs from source.
     // The kernel may reject writes with a mismatched frequency
     // (EPERM). TSC frequency scaling is handled by the kernel.
     let guest_freq = if dst.vt_guest_freq != src.vt_guest_freq {
-        eprintln!(
-            "[migrate] time: TSC freq mismatch src={}Hz dst={}Hz, using destination",
-            src.vt_guest_freq, dst.vt_guest_freq,
+        slog::warn!(log, "TSC freq mismatch, using destination";
+            "src_freq_hz" => src.vt_guest_freq,
+            "dst_freq_hz" => dst.vt_guest_freq,
         );
         dst.vt_guest_freq
     } else {
@@ -346,7 +366,7 @@ pub fn import_time_data(
         )
     };
     write_class_all(hdl, VDC_VMM_TIME, 1, adjusted_bytes)?;
-    eprintln!("[migrate] time: VMM_TIME import complete (adjusted)");
+    slog::info!(log, "VMM_TIME import complete (adjusted)");
     Ok(())
 }
 
@@ -359,6 +379,7 @@ pub fn import_time_data(
 pub fn export_device_state(
     hdl: &Arc<VmmHdl>,
     num_cpus: u32,
+    log: &slog::Logger,
 ) -> Result<DeviceState, MigrateError> {
     // Export per-vCPU state using individual register reads
     let mut vcpus = Vec::with_capacity(num_cpus as usize);
@@ -371,14 +392,15 @@ pub fn export_device_state(
         // LAPIC: per-vCPU struct-based, works with read_all
         let lapic = match read_class_vcpu(hdl, VDC_LAPIC, 1, vcpuid) {
             Ok(data) => {
-                eprintln!(
-                    "[migrate] export: LAPIC vcpu {} ({} bytes)",
-                    vcpuid, data.len(),
+                slog::debug!(log, "LAPIC export";
+                    "vcpu" => vcpuid, "bytes" => data.len(),
                 );
                 data
             }
             Err(e) => {
-                eprintln!("[migrate] export: LAPIC vcpu {} failed: {e}", vcpuid);
+                slog::warn!(log, "LAPIC export failed";
+                    "vcpu" => vcpuid, "error" => %e,
+                );
                 Vec::new()
             }
         };
@@ -389,7 +411,9 @@ pub fn export_device_state(
             .read_all::<vdi_field_entry_v1>()
         {
             Ok(entries) => {
-                eprintln!("[migrate] export: {} MSRs for vcpu {}", entries.len(), vcpuid);
+                slog::debug!(log, "MSR export";
+                    "vcpu" => vcpuid, "count" => entries.len(),
+                );
                 let mut buf = Vec::with_capacity(entries.len() * 16);
                 for entry in &entries {
                     buf.extend_from_slice(&entry.vfe_ident.to_le_bytes());
@@ -399,7 +423,9 @@ pub fn export_device_state(
                 buf
             }
             Err(e) => {
-                eprintln!("[migrate] export: MSR vcpu {} failed: {e:?}", vcpuid);
+                slog::warn!(log, "MSR export failed";
+                    "vcpu" => vcpuid, "error" => ?e,
+                );
                 Vec::new()
             }
         };
@@ -416,11 +442,15 @@ pub fn export_device_state(
                     buf.extend_from_slice(&entry._pad.to_le_bytes());
                     buf.extend_from_slice(&entry.vfe_value.to_le_bytes());
                 }
-                eprintln!("[migrate] export: {} VMM_ARCH fields for vcpu {}", entries.len(), vcpuid);
+                slog::debug!(log, "VMM_ARCH export";
+                    "vcpu" => vcpuid, "fields" => entries.len(),
+                );
                 buf
             }
             Err(e) => {
-                eprintln!("[migrate] export: VMM_ARCH vcpu {} failed: {e:?}", vcpuid);
+                slog::warn!(log, "VMM_ARCH export failed";
+                    "vcpu" => vcpuid, "error" => ?e,
+                );
                 Vec::new()
             }
         };
@@ -432,16 +462,16 @@ pub fn export_device_state(
         // in HLT or INIT state (not actively running).
         let (run_state, sipi_vector) = match vcpu.get_run_state() {
             Ok((rs, sv)) => {
-                eprintln!(
-                    "[migrate] export: vcpu {} run_state={:#x} sipi_vector={}",
-                    vcpuid, rs, sv,
+                slog::debug!(log, "vcpu run_state export";
+                    "vcpu" => vcpuid,
+                    "run_state" => format!("{:#x}", rs),
+                    "sipi_vector" => sv,
                 );
                 (rs, sv)
             }
             Err(e) => {
-                eprintln!(
-                    "[migrate] export: get_run_state vcpu {} failed: {e}",
-                    vcpuid,
+                slog::warn!(log, "get_run_state failed";
+                    "vcpu" => vcpuid, "error" => %e,
                 );
                 (bhyve_api::VRS_RUN, 0)
             }
@@ -473,7 +503,9 @@ pub fn export_device_state(
             }
             Err(e) => {
                 // Log but continue -- some classes may not be available
-                eprintln!("[migrate] export: device {} failed: {e}", name);
+                slog::warn!(log, "device export failed";
+                    "device" => name, "error" => %e,
+                );
             }
         }
     }
@@ -487,12 +519,15 @@ pub fn export_device_state(
 pub fn import_device_state(
     hdl: &Arc<VmmHdl>,
     state: &DeviceState,
+    log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     // Import system device state FIRST (IOAPIC must be ready before LAPIC)
     for dev in &state.devices {
         if !dev.data.is_empty() {
             if let Err(e) = write_class_all(hdl, dev.class, dev.version, &dev.data) {
-                eprintln!("[migrate] import: device {} failed: {e}", dev.name);
+                slog::warn!(log, "device import failed";
+                    "device" => &dev.name, "error" => %e,
+                );
             }
         }
     }
@@ -513,7 +548,9 @@ pub fn import_device_state(
             let entry_size = std::mem::size_of::<vdi_field_entry_v1>();
             if vcpu_state.msrs.len() % entry_size == 0 {
                 if let Err(e) = write_class_vcpu(hdl, VDC_MSR, 1, vcpu_state.vcpuid, &vcpu_state.msrs) {
-                    eprintln!("[migrate] import: MSR vcpu {} failed: {e}", vcpu_state.vcpuid);
+                    slog::warn!(log, "MSR import failed";
+                        "vcpu" => vcpu_state.vcpuid, "error" => %e,
+                    );
                 }
             }
         }
@@ -525,51 +562,46 @@ pub fn import_device_state(
             // masked, vlapic_fire_timer won't deliver the interrupt
             // even when the callout fires. Unmask it so the first
             // timer interrupt wakes the guest scheduler.
-            let mut lapic_data = vcpu_state.lapic.clone();
+            let lapic_data = vcpu_state.lapic.clone();
             // Import LAPIC state verbatim -- no timer hacks needed.
             // With correct VMM_TIME adjustment, the kernel's
             // vm_denormalize_hrtime() produces correct absolute times.
             // vlapic_resume() handles timer re-arming.
-            eprintln!(
-                "[migrate] import: LAPIC vcpu {} ({} bytes)",
-                vcpu_state.vcpuid, lapic_data.len(),
+            slog::debug!(log, "LAPIC import";
+                "vcpu" => vcpu_state.vcpuid, "bytes" => lapic_data.len(),
             );
             match write_class_vcpu(hdl, VDC_LAPIC, 1, vcpu_state.vcpuid, &lapic_data) {
-                Ok(()) => eprintln!(
-                    "[migrate] import: LAPIC vcpu {} complete",
-                    vcpu_state.vcpuid,
+                Ok(()) => slog::debug!(log, "LAPIC import complete";
+                    "vcpu" => vcpu_state.vcpuid,
                 ),
-                Err(e) => eprintln!(
-                    "[migrate] import: LAPIC vcpu {} failed: {e}",
-                    vcpu_state.vcpuid,
+                Err(e) => slog::warn!(log, "LAPIC import failed";
+                    "vcpu" => vcpu_state.vcpuid, "error" => %e,
                 ),
             }
         } else {
-            eprintln!(
-                "[migrate] import: no LAPIC data for vcpu {}",
-                vcpu_state.vcpuid,
+            slog::warn!(log, "no LAPIC data for vcpu";
+                "vcpu" => vcpu_state.vcpuid,
             );
         }
 
         // 3. Registers (includes segment descriptors)
         if !vcpu_state.registers.is_empty() {
-            import_vcpu_regs(&vcpu, &vcpu_state.registers)?;
+            import_vcpu_regs(&vcpu, &vcpu_state.registers, log)?;
         }
 
         // 4. Run state -- restore HALT/INIT/RUN per-vCPU
         if vcpu_state.run_state != 0 {
-            eprintln!(
-                "[migrate] import: vcpu {} run_state={:#x} sipi_vector={}",
-                vcpu_state.vcpuid, vcpu_state.run_state,
-                vcpu_state.sipi_vector,
+            slog::debug!(log, "vcpu run_state import";
+                "vcpu" => vcpu_state.vcpuid,
+                "run_state" => format!("{:#x}", vcpu_state.run_state),
+                "sipi_vector" => vcpu_state.sipi_vector,
             );
             if let Err(e) = vcpu.set_run_state_full(
                 vcpu_state.run_state,
                 vcpu_state.sipi_vector,
             ) {
-                eprintln!(
-                    "[migrate] import: set_run_state vcpu {} failed: {e}",
-                    vcpu_state.vcpuid,
+                slog::warn!(log, "set_run_state failed";
+                    "vcpu" => vcpu_state.vcpuid, "error" => %e,
                 );
             }
         }
@@ -581,9 +613,8 @@ pub fn import_device_state(
                 if let Err(e) = write_class_vcpu(
                     hdl, bhyve_api::VDC_VMM_ARCH, 1, vcpu_state.vcpuid, &vcpu_state.vmm_arch
                 ) {
-                    eprintln!(
-                        "[migrate] import: VMM_ARCH vcpu {} failed: {e}",
-                        vcpu_state.vcpuid,
+                    slog::warn!(log, "VMM_ARCH import failed";
+                        "vcpu" => vcpu_state.vcpuid, "error" => %e,
                     );
                 }
             }

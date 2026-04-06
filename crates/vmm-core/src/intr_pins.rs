@@ -14,6 +14,8 @@
 
 use std::sync::{Arc, Mutex, Weak};
 
+use slog;
+
 use crate::hdl::VmmHdl;
 
 /// Number of ISA IRQ lines (IRQ 0-15).
@@ -110,14 +112,16 @@ impl Entry {
 pub struct LegacyPIC {
     inner: Mutex<[Entry; PIN_COUNT as usize]>,
     hdl: Arc<VmmHdl>,
+    log: slog::Logger,
 }
 
 impl LegacyPIC {
     /// Create a new `LegacyPIC` backed by the given VM handle.
-    pub fn new(hdl: Arc<VmmHdl>) -> Arc<Self> {
+    pub fn new(hdl: Arc<VmmHdl>, log: slog::Logger) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new([Entry::default(); PIN_COUNT as usize]),
             hdl,
+            log,
         })
     }
 
@@ -157,7 +161,7 @@ impl LegacyPIC {
             if let Err(e) = result {
                 // Log but don't panic -- IRQ delivery failure in the
                 // kernel is not recoverable but should not crash the VMM.
-                eprintln!("LegacyPIC: failed to deliver IRQ {irq}: {e}");
+                slog::warn!(self.log, "failed to deliver IRQ"; "irq" => irq, "error" => %e);
             }
         }
     }
@@ -255,15 +259,17 @@ pub struct IoApicPin {
     irq: i32,
     asserted: Mutex<bool>,
     hdl: Arc<VmmHdl>,
+    log: slog::Logger,
 }
 
 impl IoApicPin {
     /// Create a new IOAPIC pin for the given GSI.
-    pub fn new(gsi: u8, hdl: Arc<VmmHdl>) -> Arc<Self> {
+    pub fn new(gsi: u8, hdl: Arc<VmmHdl>, log: slog::Logger) -> Arc<Self> {
         Arc::new(Self {
             irq: gsi as i32,
             asserted: Mutex::new(false),
             hdl,
+            log,
         })
     }
 }
@@ -275,7 +281,7 @@ impl IntrPin for IoApicPin {
         if !*asserted {
             *asserted = true;
             if let Err(e) = self.hdl.ioapic_assert_irq(self.irq) {
-                eprintln!("[ioapic] assert GSI {} FAILED: {}", self.irq, e);
+                slog::warn!(self.log, "assert GSI failed"; "gsi" => self.irq, "error" => %e);
             }
         }
     }
@@ -285,6 +291,7 @@ impl IntrPin for IoApicPin {
             .expect("ioapic pin lock poisoned");
         if *asserted {
             *asserted = false;
+            // best-effort IRQ delivery via kernel ioctl
             let _ = self.hdl.ioapic_deassert_irq(self.irq);
         }
     }
@@ -315,6 +322,8 @@ pub struct PciIntrPin {
     hdl: Arc<VmmHdl>,
     /// Per-pin asserted state.
     asserted: Mutex<bool>,
+    /// Logger for interrupt delivery errors.
+    log: slog::Logger,
 }
 
 /// PIR register bit 7: disable routing.
@@ -335,6 +344,7 @@ impl PciIntrPin {
         pin: u8,
         pir_regs: Arc<Mutex<[u8; 4]>>,
         hdl: Arc<VmmHdl>,
+        log: slog::Logger,
     ) -> Arc<Self> {
         let pirq_idx = ((slot as usize) + (pin as usize)) % 4;
         let ioapic_irq = 16 + ((4 + slot as i32 + pin as i32) % 8);
@@ -344,6 +354,7 @@ impl PciIntrPin {
             pir_regs,
             hdl,
             asserted: Mutex::new(false),
+            log,
         })
     }
 
@@ -373,9 +384,11 @@ impl IntrPin for PciIntrPin {
                         atpic_irq,
                         self.ioapic_irq,
                     ) {
-                        eprintln!(
-                            "[pci-intr] assert PIRQ[{}] atpic={} ioapic={} FAILED: {}",
-                            self.pirq_idx, atpic_irq, self.ioapic_irq, e,
+                        slog::warn!(self.log, "assert PIRQ failed";
+                            "pirq_idx" => self.pirq_idx,
+                            "atpic_irq" => atpic_irq,
+                            "ioapic_irq" => self.ioapic_irq,
+                            "error" => %e,
                         );
                     }
                 }
@@ -383,6 +396,7 @@ impl IntrPin for PciIntrPin {
                     // PIR disabled (no firmware, or direct boot mode):
                     // assert IOAPIC pin directly. The guest kernel
                     // programs IOAPIC via ACPI _PRT regardless of PIR.
+                    // best-effort IRQ delivery via kernel ioctl
                     let _ = self.hdl.ioapic_assert_irq(self.ioapic_irq);
                 }
             }
@@ -394,12 +408,14 @@ impl IntrPin for PciIntrPin {
         *asserted = false;
         match self.atpic_irq() {
             Some(atpic_irq) => {
+                // best-effort IRQ delivery via kernel ioctl
                 let _ = self.hdl.isa_deassert_irq(
                     atpic_irq,
                     self.ioapic_irq,
                 );
             }
             None => {
+                // best-effort IRQ delivery via kernel ioctl
                 let _ = self.hdl.ioapic_deassert_irq(self.ioapic_irq);
             }
         }

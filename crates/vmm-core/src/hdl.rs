@@ -55,8 +55,8 @@ impl VmmHdl {
         let ctl = VmmCtlFd::open()?;
 
         if opts.force {
-            // Best-effort destroy of any existing VM with this name.
-            // Failure is expected if no VM exists.
+            // Best-effort destroy of any existing VM with this name;
+            // failure is expected if no VM exists
             let _ = ctl.vm_destroy(name.as_bytes());
         }
 

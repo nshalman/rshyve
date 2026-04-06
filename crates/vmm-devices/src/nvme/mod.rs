@@ -24,9 +24,13 @@ pub mod bits;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
+
+use futures::future::BoxFuture;
 
 use vmm_core::common::RWOp;
 
@@ -36,6 +40,8 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::{MemCtx, PhysMap, SubMapping};
 use vmm_core::mmio::{MmioBus, MmioFn};
 
+use crate::Lifecycle;
+use crate::lifecycle::Indicator;
 use crate::pci::bar::BarDefine;
 use crate::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use crate::pci::msix::MsixTable;
@@ -151,6 +157,12 @@ pub struct NvmeController {
     /// Backing file kept alive for the raw fd used by I/O workers.
     /// Dropped (and fd closed) when the controller is dropped.
     _file: File,
+    /// Lifecycle state indicator.
+    indicator: Indicator,
+    /// When true, worker threads should quiesce.
+    paused: Arc<AtomicBool>,
+    /// Count of workers currently active (not paused).
+    workers_active: Arc<AtomicUsize>,
 }
 
 impl NvmeController {
@@ -261,6 +273,9 @@ impl NvmeController {
         // Create the I/O submission channel
         let (tx, rx) = mpsc::channel::<IoRequest>();
 
+        let paused = Arc::new(AtomicBool::new(false));
+        let workers_active = Arc::new(AtomicUsize::new(NUM_WORKERS));
+
         let ctrl = Arc::new(Self {
             pci_state: Mutex::new(pci_state),
             msix: Arc::clone(&msix),
@@ -272,6 +287,9 @@ impl NvmeController {
             registered_bar4: Mutex::new(None),
             self_ref: Mutex::new(None),
             _file: file,
+            indicator: Indicator::new(),
+            paused: Arc::clone(&paused),
+            workers_active: Arc::clone(&workers_active),
         });
         // Store weak self-reference for MMIO closures
         *ctrl.self_ref.lock().expect("self_ref lock") =
@@ -284,11 +302,16 @@ impl NvmeController {
             let physmap = Arc::clone(&physmap);
             let msix = Arc::clone(&msix);
             let state_ref = Arc::clone(&ctrl);
+            let paused = Arc::clone(&paused);
+            let workers_active = Arc::clone(&workers_active);
 
             thread::Builder::new()
                 .name(format!("nvme-io-{}", i))
                 .spawn(move || {
-                    io_worker(rx, raw_fd, read_only, physmap, msix, state_ref);
+                    io_worker(
+                        rx, raw_fd, read_only, physmap, msix, state_ref,
+                        paused, workers_active,
+                    );
                 })
                 .expect("nvme: failed to spawn I/O worker thread");
         }
@@ -622,13 +645,17 @@ impl NvmeController {
         let mut st = self.state.lock().expect("nvme: state lock");
         if qid == ADMIN_QUEUE_ID {
             if let Some(cq) = &mut st.admin_cq {
-                cq.head = new_head;
+                if new_head < cq.size {
+                    cq.head = new_head;
+                }
             }
         } else {
             let idx = (qid - 1) as usize;
             if idx < MAX_IO_QUEUES {
                 if let Some(cq) = &mut st.io_cqs[idx] {
-                    cq.head = new_head;
+                    if new_head < cq.size {
+                        cq.head = new_head;
+                    }
                 }
             }
         }
@@ -639,9 +666,14 @@ impl NvmeController {
         let mem = MemCtx::new(Arc::clone(&self.physmap));
         let mut st = self.state.lock().expect("nvme: state lock");
 
-        // Update the tail pointer
+        // Update the tail pointer (validate against queue size)
         match &mut st.admin_sq {
-            Some(sq) => sq.tail = new_tail,
+            Some(sq) => {
+                if new_tail >= sq.size {
+                    return;
+                }
+                sq.tail = new_tail;
+            }
             None => return,
         }
 
@@ -839,6 +871,13 @@ impl NvmeController {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
 
+        // Validate that the queue base GPA is page-aligned and non-zero.
+        // A malicious guest could point CQ base at an MMIO region of
+        // another device, causing cross-device confusion.
+        if prp1 == 0 || (prp1 & 0xFFF) != 0 {
+            return (SC_INVALID_FIELD | SC_DNR, 0);
+        }
+
         st.io_cqs[idx] = Some(CompQueue {
             base: prp1,
             size: qsize,
@@ -879,6 +918,11 @@ impl NvmeController {
         let cq_idx = (cq_id - 1) as usize;
         if cq_id == 0 || cq_idx >= MAX_IO_QUEUES || st.io_cqs[cq_idx].is_none()
         {
+            return (SC_INVALID_FIELD | SC_DNR, 0);
+        }
+
+        // Validate that the queue base GPA is page-aligned and non-zero.
+        if prp1 == 0 || (prp1 & 0xFFF) != 0 {
             return (SC_INVALID_FIELD | SC_DNR, 0);
         }
 
@@ -1017,6 +1061,9 @@ impl NvmeController {
         };
 
         let cq_id = sq.cq_id;
+        if new_tail >= sq.size {
+            return;
+        }
         sq.tail = new_tail;
 
         // Collect all new SQEs before releasing the lock
@@ -1144,6 +1191,13 @@ fn post_completion(
         Some(cq) => cq,
         None => return,
     };
+
+    // Check if CQ is full: (tail + 1) % size == head
+    let next_tail = if cq.tail + 1 >= cq.size { 0 } else { cq.tail + 1 };
+    if next_tail == cq.head {
+        // CQ full -- drop the completion (guest must drain the queue)
+        return;
+    }
 
     let cqe_offset = u64::from(cq.tail) * CQE_SIZE as u64;
     let cqe_gpa = cq.base + cqe_offset;
@@ -1382,14 +1436,29 @@ fn io_worker(
     physmap: Arc<PhysMap>,
     msix: Arc<MsixTable>,
     ctrl: Arc<NvmeController>,
+    paused: Arc<AtomicBool>,
+    workers_active: Arc<AtomicUsize>,
 ) {
+    use std::sync::mpsc::RecvTimeoutError;
+
     loop {
         // Acquire the receiver lock only to get the next message
         let req = {
             let rx_guard = rx.lock().expect("nvme: io_rx lock");
-            match rx_guard.recv() {
+            match rx_guard.recv_timeout(Duration::from_millis(50)) {
                 Ok(req) => req,
-                Err(_) => return, // Channel closed, exit worker
+                Err(RecvTimeoutError::Timeout) => {
+                    drop(rx_guard); // release Mutex before parking
+                    if paused.load(Ordering::Acquire) {
+                        workers_active.fetch_sub(1, Ordering::AcqRel);
+                        while paused.load(Ordering::Acquire) {
+                            thread::park_timeout(Duration::from_millis(50));
+                        }
+                        workers_active.fetch_add(1, Ordering::AcqRel);
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
             }
         };
 
@@ -1453,6 +1522,11 @@ fn process_io_request(
         Some(n) => n as usize,
         None => return SC_INVALID_FIELD | SC_DNR,
     };
+    // MDTS check: 2^9 pages = 2 MiB max transfer
+    const MAX_XFER_SIZE: usize = (1 << 9) * 4096;
+    if byte_count > MAX_XFER_SIZE {
+        return SC_INVALID_FIELD | SC_DNR;
+    }
     let byte_offset = match req.slba.checked_mul(u64::from(block_size)) {
         Some(n) => n,
         None => return SC_INVALID_FIELD | SC_DNR,
@@ -1548,6 +1622,47 @@ impl Default for NvmeState {
             block_size: 512,
             total_blocks: 0,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle implementation
+// ---------------------------------------------------------------------------
+
+impl Lifecycle for NvmeController {
+    fn type_name(&self) -> &'static str {
+        "nvme"
+    }
+
+    fn start(&self) -> anyhow::Result<()> {
+        self.indicator.start();
+        Ok(())
+    }
+
+    fn pause(&self) {
+        self.indicator.pause();
+        self.paused.store(true, Ordering::Release);
+    }
+
+    fn paused(&self) -> BoxFuture<'static, ()> {
+        let workers_active = Arc::clone(&self.workers_active);
+        Box::pin(async move {
+            // Spin-poll until all workers have quiesced.
+            // Workers decrement workers_active when they observe
+            // the paused flag and park themselves.
+            while workers_active.load(Ordering::Acquire) > 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    }
+
+    fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
+        self.indicator.resume();
+    }
+
+    fn halt(&self) {
+        self.indicator.halt();
     }
 }
 

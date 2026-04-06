@@ -116,10 +116,9 @@ fn vcpu_run_loop(
     log: &Logger,
 ) {
     let vcpu_id = vcpu.id();
-    debug!(log, "vCPU run loop starting");
 
     let mut next_entry = VmEntry::Run;
-    info!(log, "vCPU run loop starting");
+    info!(log, "vCPU run loop starting"; "vcpu" => vcpu_id);
 
     loop {
         probes::vm_entry!(|| (vcpu_id as u32));
@@ -139,6 +138,7 @@ fn vcpu_run_loop(
                     continue;
                 }
                 error!(log, "VM_RUN failed"; "error" => %e);
+                // receiver dropped during shutdown; safe to ignore
                 let _ = events.send(VcpuEvent::Error {
                     vcpu_id,
                     error: e.to_string(),
@@ -169,6 +169,7 @@ fn vcpu_run_loop(
             VmExitKind::Rdmsr(code) => {
                 // Unhandled MSRs: return 0 in RAX:RDX.
                 // The kernel auto-advances RIP past the RDMSR instruction.
+                // set_reg fails only if vcpu fd is closed; unrecoverable
                 let _ = vcpu.set_reg(
                     bhyve_api::vm_reg_name::VM_REG_GUEST_RAX, 0,
                 );
@@ -189,6 +190,7 @@ fn vcpu_run_loop(
                     "kind" => ?detail.kind,
                     "when_ns" => detail.when.as_nanos(),
                 );
+                // receiver dropped during shutdown; safe to ignore
                 let _ = events.send(VcpuEvent::Suspended {
                     vcpu_id,
                     kind: detail.kind,
@@ -217,6 +219,7 @@ fn vcpu_run_loop(
                             "rip" => format!("{:#x}", exit.rip),
                             "bytes" => &inst_hex,
                         );
+                        // receiver dropped during shutdown; safe to ignore
                         let _ = events.send(VcpuEvent::Error {
                             vcpu_id,
                             error: format!(
@@ -231,6 +234,7 @@ fn vcpu_run_loop(
                             "rip" => format!("{:#x}", exit.rip),
                             "error" => %e,
                         );
+                        // receiver dropped during shutdown; safe to ignore
                         let _ = events.send(VcpuEvent::Error {
                             vcpu_id,
                             error: format!(
@@ -252,6 +256,7 @@ fn vcpu_run_loop(
 
             VmExitKind::VmxError(status) => {
                 error!(log, "VMX error"; "status" => status);
+                // receiver dropped during shutdown; safe to ignore
                 let _ = events.send(VcpuEvent::Error {
                     vcpu_id,
                     error: format!("VMX error, status {}", status),
@@ -261,6 +266,7 @@ fn vcpu_run_loop(
 
             VmExitKind::SvmError(code) => {
                 error!(log, "SVM error"; "code" => code);
+                // receiver dropped during shutdown; safe to ignore
                 let _ = events.send(VcpuEvent::Error {
                     vcpu_id,
                     error: format!("SVM error, code {}", code),
@@ -274,6 +280,7 @@ fn vcpu_run_loop(
                     "fault_type" => fault_type,
                 );
                 // Treat as fatal
+                // receiver dropped during shutdown; safe to ignore
                 let _ = events.send(VcpuEvent::Error {
                     vcpu_id,
                     error: format!(
@@ -286,6 +293,7 @@ fn vcpu_run_loop(
 
             VmExitKind::Unknown(code) => {
                 error!(log, "unknown VM exit"; "code" => code);
+                // receiver dropped during shutdown; safe to ignore
                 let _ = events.send(VcpuEvent::Error {
                     vcpu_id,
                     error: format!("unknown exit code {}", code),

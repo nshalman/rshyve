@@ -28,6 +28,7 @@
 
 pub mod bits;
 pub mod block;
+pub mod packed_queue;
 pub mod pci;
 pub mod queue;
 pub mod rng;
@@ -48,11 +49,11 @@ use vmm_core::mem::PhysMap;
 /// ([`VirtioPciDevice`]) handles the PCI identity, BAR layout, and
 /// virtqueue management.
 pub trait VirtioDevice: Send + Sync + 'static {
-    /// Return the device feature bits (32-bit for legacy transport).
-    fn device_features(&self) -> u32;
+    /// Return the device feature bits (u64 for spec compliance).
+    fn device_features(&self) -> u64;
 
     /// Called when the guest writes the negotiated features.
-    fn set_features(&self, features: u32);
+    fn set_features(&self, features: u64);
 
     /// Read from device-specific configuration space.
     ///

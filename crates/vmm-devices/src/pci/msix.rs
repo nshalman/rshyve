@@ -101,24 +101,16 @@ impl MsixTable {
     /// unmasked.
     #[inline]
     pub fn fire(&self, vector: u16) {
-        let inner = self.inner.lock().expect("msix lock");
+        let mut inner = self.inner.lock().expect("msix lock");
         let idx = vector as usize;
-        if idx >= inner.entries.len() {
-            return;
-        }
-
-        if !inner.enabled {
+        if idx >= inner.entries.len() || !inner.enabled {
             return;
         }
 
         let entry = &inner.entries[idx];
         if inner.func_masked || (entry.control & VECTOR_CTRL_MASK) != 0 {
-            // Masked — set pending bit
             let qword = idx / 64;
             let bit = idx % 64;
-            // Need mutable access, drop and reacquire
-            drop(inner);
-            let mut inner = self.inner.lock().expect("msix lock");
             inner.pba[qword] |= 1 << bit;
             return;
         }
@@ -128,6 +120,28 @@ impl MsixTable {
         drop(inner);
 
         let _ = self.hdl.lapic_msi(addr, data);
+    }
+
+    /// Returns true if MSI-X is enabled (Message Control bit 15).
+    pub fn is_enabled(&self) -> bool {
+        self.inner.lock().expect("msix lock").enabled
+    }
+
+    /// Read the address and data for a vector entry.
+    ///
+    /// Returns `(addr, data)` where addr is the 64-bit MSI address
+    /// and data is the MSI message. Used for programming kernel
+    /// devices (e.g., viona) with MSI delivery info.
+    pub fn read_entry(&self, vector: u16) -> (u64, u64) {
+        let inner = self.inner.lock().expect("msix lock");
+        let idx = vector as usize;
+        if idx >= inner.entries.len() {
+            return (0, 0);
+        }
+        let e = &inner.entries[idx];
+        let addr = u64::from(e.addr_lo) | (u64::from(e.addr_hi) << 32);
+        let data = u64::from(e.data);
+        (addr, data)
     }
 
     /// Read from the MSI-X table BAR.
@@ -180,6 +194,7 @@ impl MsixTable {
                 let addr = u64::from(e.addr_lo) | (u64::from(e.addr_hi) << 32);
                 let data = u64::from(e.data);
                 drop(inner);
+                // best-effort MSI delivery; kernel error if this fails
                 let _ = self.hdl.lapic_msi(addr, data);
             }
         }

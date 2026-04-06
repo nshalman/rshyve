@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
+use slog;
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 
@@ -42,6 +43,7 @@ pub async fn run_destination(
     num_cpus: u32,
     mem_size: u64,
     status: Arc<Mutex<MigrationStatus>>,
+    log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     // Upgrade TCP to WebSocket (server role)
     let ws = tokio_tungstenite::accept_async(stream)
@@ -51,7 +53,7 @@ pub async fn run_destination(
         )))?;
 
     run_destination_inner(
-        ws, &hdl, memctx, num_cpus, mem_size, &status,
+        ws, &hdl, memctx, num_cpus, mem_size, &status, log,
     )
     .await
 }
@@ -64,6 +66,7 @@ async fn run_destination_inner(
     num_cpus: u32,
     mem_size: u64,
     status: &Arc<Mutex<MigrationStatus>>,
+    log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     // ── Phase: Sync ────────────────────────────────────────────────
     set_phase(status, MigrationPhase::Sync);
@@ -145,7 +148,7 @@ async fn run_destination_inner(
             ws.send(Message::Error(err.clone()).encode()).await?;
             return Err(err);
         }
-        eprintln!("[migrate] dest: CPU feature check passed");
+        slog::info!(log, "CPU feature check passed");
     }
 
     // Preamble accepted
@@ -163,7 +166,7 @@ async fn run_destination_inner(
     // the kernel's vlapic_data_write() checks vm_is_paused() and
     // defers timer callout scheduling to VM_RESUME. Without this,
     // the LAPIC timer is never re-armed after migration.
-    eprintln!("[migrate] dest: pausing VM before state import");
+    slog::info!(log, "pausing VM before state import");
     hdl.pause().map_err(|e| {
         MigrateError::Io(format!("pause before import: {e}"))
     })?;
@@ -175,23 +178,23 @@ async fn run_destination_inner(
     let time_msg = recv(&mut ws).await?;
     let time_data_bytes = expect_serialized(time_msg)?;
     let time_data: TimeData = Message::deserialize(&time_data_bytes)?;
-    state::import_time_data(hdl, &time_data)?;
+    state::import_time_data(hdl, &time_data, log)?;
 
     // ── Phase: DeviceState ────────────────────────────────────────
     set_phase(status, MigrationPhase::DeviceState);
     let dev_msg = recv(&mut ws).await?;
     let dev_data_bytes = expect_serialized(dev_msg)?;
     let device_state: DeviceState = Message::deserialize(&dev_data_bytes)?;
-    state::import_device_state(hdl, &device_state)?;
+    state::import_device_state(hdl, &device_state, log)?;
 
     // Resume the VM. This triggers vlapic_resume() in the kernel,
     // which calls vlapic_callout_reset() to re-arm the LAPIC timer.
     // Also resumes HPET, PIT, and RTC timers.
-    eprintln!("[migrate] dest: resuming VM after state import (triggers timer re-arm)");
+    slog::info!(log, "resuming VM after state import (triggers timer re-arm)");
     hdl.resume().map_err(|e| {
         MigrateError::Io(format!("resume after import: {e}"))
     })?;
-    eprintln!("[migrate] dest: VM resumed successfully");
+    slog::info!(log, "VM resumed successfully");
 
     // ── Phase: RamPull ────────────────────────────────────────────
     set_phase(status, MigrationPhase::RamPull);

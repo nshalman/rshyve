@@ -28,6 +28,7 @@ use vmm_core::common::RWOp;
 use vmm_core::mem::PhysMap;
 use vmm_core::mmio::{MmioBus, MmioFn};
 
+use crate::Lifecycle;
 use crate::pci::bar::BarDefine;
 use crate::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use crate::pci::{BarN, IntrPin};
@@ -281,8 +282,17 @@ impl XhciController {
         }
 
         let idx = st.event_ring_enqueue;
+        if idx >= st.event_ring_size {
+            // Enqueue pointer out of bounds — reset to avoid
+            // writing to arbitrary guest memory.
+            st.event_ring_enqueue = 0;
+            return;
+        }
         let offset = u64::from(idx) * TRB_SIZE as u64;
-        let gpa = st.event_ring_base + offset;
+        let gpa = match st.event_ring_base.checked_add(offset) {
+            Some(a) => a,
+            None => return,
+        };
 
         // Build the TRB with the producer cycle state
         let mut trb = event;
@@ -385,6 +395,16 @@ impl XhciController {
         let base_lo = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let base_hi = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
         let size = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+
+        // Cap event ring size to prevent a malicious guest from setting
+        // an enormous size that allows the enqueue pointer to sweep across
+        // a huge range of guest physical addresses before wrapping.
+        // xHCI spec says ERST entries can define large rings, but 4096
+        // entries (64 KiB of TRBs) is more than sufficient.
+        const MAX_EVENT_RING_SIZE: u32 = 4096;
+        if size == 0 || size > MAX_EVENT_RING_SIZE {
+            return;
+        }
 
         st.event_ring_base = u64::from(base_lo) | (u64::from(base_hi) << 32);
         st.event_ring_size = size;
@@ -1308,6 +1328,16 @@ impl PciDevice for XhciController {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+impl Lifecycle for XhciController {
+    fn type_name(&self) -> &'static str {
+        "xhci"
     }
 }
 

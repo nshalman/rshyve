@@ -13,6 +13,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use slog;
 use vmm_core::common::RWOp;
 use vmm_core::pio::{PioBus, PioFn};
 
@@ -58,6 +59,7 @@ const PM1_ALWAYS_ZERO: u16 = 0xC003;
 
 /// ACPI PM1 register state.
 pub struct AcpiPm {
+    log: slog::Logger,
     inner: Mutex<AcpiPmInner>,
 }
 
@@ -75,8 +77,9 @@ impl AcpiPm {
     /// - PM1 Enable at PMBASE+2 (0xB002, 2 bytes)
     /// - PM1 Control at PMBASE+4 (0xB004, 2 bytes)
     /// - Reset register at 0xCF9 (1 byte)
-    pub fn create_and_attach(bus_pio: &PioBus) -> Arc<Self> {
+    pub fn create_and_attach(bus_pio: &PioBus, log: slog::Logger) -> Arc<Self> {
         let pm = Arc::new(Self {
+            log,
             inner: Mutex::new(AcpiPmInner {
                 pm1_status: 0,
                 pm1_enable: 0,
@@ -91,7 +94,9 @@ impl AcpiPm {
             Arc::new(move |offset: u16, rwo: RWOp<'_>| {
                 pm_evt.handle_pm1_evt(offset, rwo);
             });
-        let _ = bus_pio.register(PMBASE, 4, evt_handler);
+        if let Err(e) = bus_pio.register(PMBASE, 4, evt_handler) {
+            slog::warn!(pm.log, "failed to register PM1 event handler"; "error" => %e);
+        }
 
         // PM1 Control block: 2 bytes at PMBASE+4
         let pm_cnt = Arc::clone(&pm);
@@ -99,7 +104,9 @@ impl AcpiPm {
             Arc::new(move |offset: u16, rwo: RWOp<'_>| {
                 pm_cnt.handle_pm1_cnt(offset, rwo);
             });
-        let _ = bus_pio.register(PMBASE + 4, 2, cnt_handler);
+        if let Err(e) = bus_pio.register(PMBASE + 4, 2, cnt_handler) {
+            slog::warn!(pm.log, "failed to register PM1 control handler"; "error" => %e);
+        }
 
         // Reset register at 0xCF9
         let pm_rst = Arc::clone(&pm);
@@ -107,7 +114,9 @@ impl AcpiPm {
             Arc::new(move |_offset: u16, rwo: RWOp<'_>| {
                 pm_rst.handle_reset(rwo);
             });
-        let _ = bus_pio.register(0xCF9, 1, rst_handler);
+        if let Err(e) = bus_pio.register(0xCF9, 1, rst_handler) {
+            slog::warn!(pm.log, "failed to register reset handler"; "error" => %e);
+        }
 
         // SMI Command port at 0xB2 (ACPI enable/disable)
         let pm_smi = Arc::clone(&pm);
@@ -115,7 +124,9 @@ impl AcpiPm {
             Arc::new(move |_offset: u16, rwo: RWOp<'_>| {
                 pm_smi.handle_smi_cmd(rwo);
             });
-        let _ = bus_pio.register(SMI_CMD_PORT, 1, smi_handler);
+        if let Err(e) = bus_pio.register(SMI_CMD_PORT, 1, smi_handler) {
+            slog::warn!(pm.log, "failed to register SMI command handler"; "error" => %e);
+        }
 
         pm
     }

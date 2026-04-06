@@ -12,6 +12,8 @@ use bhyve_api::{
     VCC_FLAG_INTEL_FALLBACK,
 };
 
+use slog;
+
 use crate::hdl::VmmHdl;
 
 /// CPU baseline profiles for migration compatibility.
@@ -282,6 +284,7 @@ pub fn apply_cpuid_baseline(
     hdl: &VmmHdl,
     num_cpus: u32,
     baseline: CpuBaseline,
+    log: &slog::Logger,
 ) -> std::io::Result<()> {
     if baseline == CpuBaseline::Host {
         return Ok(());
@@ -299,9 +302,10 @@ pub fn apply_cpuid_baseline(
         && ecx == 0x6c65_746e;
     let flags = if is_intel { VCC_FLAG_INTEL_FALLBACK } else { 0 };
 
-    eprintln!(
-        "[cpuid] applying {:?} baseline ({} entries) to {} vCPUs",
-        baseline, entries.len(), num_cpus,
+    slog::info!(log, "applying CPU baseline";
+        "baseline" => ?baseline,
+        "entries" => entries.len(),
+        "vcpus" => num_cpus,
     );
 
     for vcpuid in 0..num_cpus as i32 {

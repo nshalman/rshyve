@@ -79,6 +79,66 @@ const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_PAGE_SIZE: u64 = 1 << 7; // 2MB large page
 
+// ── x86 control register bits ──────────────────────────────────────
+
+const CR0_PE: u64 = 1 << 0;  // Protection Enable
+const CR0_ET: u64 = 1 << 4;  // Extension Type (387 coprocessor)
+const CR0_NE: u64 = 1 << 5;  // Numeric Error (native FPU error reporting)
+const CR0_PG: u64 = 1 << 31; // Paging
+
+const CR4_PAE: u64 = 1 << 5; // Physical Address Extension
+
+const EFER_LME: u64 = 1 << 8;  // Long Mode Enable
+const EFER_LMA: u64 = 1 << 10; // Long Mode Active
+
+// ── GDT entries ────────────────────────────────────────────────────
+//
+// 64-bit GDT entry format (8 bytes):
+//   bits 0-15:  limit [15:0]
+//   bits 16-39: base [23:0]
+//   bits 40-47: access byte (type, S, DPL, P)
+//   bits 48-51: limit [19:16]
+//   bits 52-55: flags (AVL, L, DB, G)
+//   bits 56-63: base [31:24]
+
+/// 64-bit code segment: Base=0, Limit=0xFFFFF, Type=0x0B (exec/read/accessed),
+/// S=1, DPL=0, P=1, L=1, G=1
+const GDT_CODE64: u64 = 0x00AF_9B00_0000_FFFF;
+
+/// 64-bit data segment: Base=0, Limit=0xFFFFF, Type=0x03 (read/write/accessed),
+/// S=1, DPL=0, P=1, DB=1, G=1
+const GDT_DATA64: u64 = 0x00CF_9300_0000_FFFF;
+
+/// GDT selector for the 64-bit code segment (entry 1).
+const GDT_SEL_CODE64: u64 = 0x08;
+
+/// GDT selector for the 64-bit data segment (entry 2).
+const GDT_SEL_DATA64: u64 = 0x10;
+
+/// GDT byte size: 3 entries (null + code + data) * 8 bytes each.
+const GDT_SIZE: usize = 24;
+
+/// GDTR limit = GDT_SIZE - 1.
+const GDTR_LIMIT: u32 = (GDT_SIZE as u32) - 1;
+
+// ── Segment descriptor type bits ───────────────────────────────────
+//
+// These are the low 4 bits of the segment access byte.
+
+/// Execute/Read/Accessed (code segment).
+const SEG_TYPE_CODE_XRA: u32 = 0x0B;
+
+/// Read/Write/Accessed (data segment).
+const SEG_TYPE_DATA_RWA: u32 = 0x03;
+
+/// Busy 64-bit TSS.
+const SEG_TYPE_TSS_BUSY64: u32 = 0x0B;
+
+// ── Miscellaneous register values ──────────────────────────────────
+
+/// RFLAGS initial value: bit 1 is architecturally reserved as 1.
+const RFLAGS_RESERVED_BIT1: u64 = 0x02;
+
 // ── Parsed bzImage ──────────────────────────────────────────────────
 
 /// A parsed Linux bzImage ready for direct loading.
@@ -286,21 +346,15 @@ fn write_page_tables(mem: &MemCtx) -> Result<()> {
 
 /// Write a minimal GDT: null + 64-bit code + 64-bit data.
 fn write_gdt(mem: &MemCtx) -> Result<()> {
-    let mut gdt = [0u8; 24];
+    let mut gdt = [0u8; GDT_SIZE];
 
     // Entry 0: null descriptor (all zeros)
 
-    // Entry 1 (selector 0x08): 64-bit code segment
-    // Base=0, Limit=0xFFFFF, Type=0x0B (exec/read/accessed),
-    // S=1, DPL=0, P=1, L=1, G=1
-    let code64: u64 = 0x00AF_9B00_0000_FFFF;
-    gdt[8..16].copy_from_slice(&code64.to_le_bytes());
+    // Entry 1 (selector GDT_SEL_CODE64): 64-bit code segment
+    gdt[8..16].copy_from_slice(&GDT_CODE64.to_le_bytes());
 
-    // Entry 2 (selector 0x10): 64-bit data segment
-    // Base=0, Limit=0xFFFFF, Type=0x03 (read/write/accessed),
-    // S=1, DPL=0, P=1, DB=1, G=1
-    let data64: u64 = 0x00CF_9300_0000_FFFF;
-    gdt[16..24].copy_from_slice(&data64.to_le_bytes());
+    // Entry 2 (selector GDT_SEL_DATA64): 64-bit data segment
+    gdt[16..24].copy_from_slice(&GDT_DATA64.to_le_bytes());
 
     mem.write(GPA_GDT, &gdt).context("GDT")?;
     Ok(())
@@ -372,25 +426,27 @@ pub fn setup_direct_boot_bsp(vcpu: &Vcpu, entry_point: u64) -> Result<()> {
         .context("reboot_state")?;
 
     // Control registers for 64-bit long mode
-    vcpu.set_reg(VM_REG_GUEST_CR0, 0x8000_0031)?;  // PG | ET | NE | PE
-    vcpu.set_reg(VM_REG_GUEST_CR3, GPA_PML4)?;      // PML4 address
-    vcpu.set_reg(VM_REG_GUEST_CR4, 0x20)?;           // PAE
-    vcpu.set_reg(VM_REG_GUEST_EFER, 0x500)?;         // LMA | LME
+    vcpu.set_reg(VM_REG_GUEST_CR0, CR0_PG | CR0_NE | CR0_ET | CR0_PE)?;
+    vcpu.set_reg(VM_REG_GUEST_CR3, GPA_PML4)?;
+    vcpu.set_reg(VM_REG_GUEST_CR4, CR4_PAE)?;
+    vcpu.set_reg(VM_REG_GUEST_EFER, EFER_LMA | EFER_LME)?;
 
-    // 64-bit code segment (selector 0x08)
-    let code64_access = SEG_ACCESS_P | SEG_ACCESS_S | SEG_ACCESS_L | SEG_ACCESS_G | 0x0B;
+    // 64-bit code segment
+    let code64_access =
+        SEG_ACCESS_P | SEG_ACCESS_S | SEG_ACCESS_L | SEG_ACCESS_G | SEG_TYPE_CODE_XRA;
     vcpu.set_segment_desc(VM_REG_GUEST_CS, &seg_desc {
         base: 0,
-        limit: 0xFFFF_FFFF,
+        limit: u32::MAX,
         access: code64_access,
     })?;
-    vcpu.set_reg(VM_REG_GUEST_CS, 0x08)?;
+    vcpu.set_reg(VM_REG_GUEST_CS, GDT_SEL_CODE64)?;
 
-    // Data segments (selector 0x10)
-    let data_access = SEG_ACCESS_P | SEG_ACCESS_S | SEG_ACCESS_DB | SEG_ACCESS_G | 0x03;
+    // Data segments
+    let data_access =
+        SEG_ACCESS_P | SEG_ACCESS_S | SEG_ACCESS_DB | SEG_ACCESS_G | SEG_TYPE_DATA_RWA;
     let data_desc = seg_desc {
         base: 0,
-        limit: 0xFFFF_FFFF,
+        limit: u32::MAX,
         access: data_access,
     };
     for reg in [
@@ -398,21 +454,21 @@ pub fn setup_direct_boot_bsp(vcpu: &Vcpu, entry_point: u64) -> Result<()> {
         VM_REG_GUEST_GS, VM_REG_GUEST_SS,
     ] {
         vcpu.set_segment_desc(reg, &data_desc)?;
-        vcpu.set_reg(reg, 0x10)?;
+        vcpu.set_reg(reg, GDT_SEL_DATA64)?;
     }
 
     // GDTR
     vcpu.set_segment_desc(VM_REG_GUEST_GDTR, &seg_desc {
         base: GPA_GDT,
-        limit: 23, // 3 entries * 8 bytes - 1
+        limit: GDTR_LIMIT,
         access: 0,
     })?;
 
     // TR (busy 64-bit TSS) — VMX requires a valid, present TR
     vcpu.set_segment_desc(VM_REG_GUEST_TR, &seg_desc {
         base: 0,
-        limit: 0xFFFF,
-        access: SEG_ACCESS_P | 0x0B, // type=busy 64-bit TSS, present
+        limit: u16::MAX as u32,
+        access: SEG_ACCESS_P | SEG_TYPE_TSS_BUSY64,
     })?;
     vcpu.set_reg(VM_REG_GUEST_TR, 0)?;
 
@@ -427,14 +483,14 @@ pub fn setup_direct_boot_bsp(vcpu: &Vcpu, entry_point: u64) -> Result<()> {
     // IDTR — no IDT initially (kernel will set it up)
     vcpu.set_segment_desc(VM_REG_GUEST_IDTR, &seg_desc {
         base: 0,
-        limit: 0xFFFF,
+        limit: u16::MAX as u32,
         access: 0,
     })?;
 
     // Entry point and boot protocol registers
     vcpu.set_reg(VM_REG_GUEST_RIP, entry_point)?;
     vcpu.set_reg(VM_REG_GUEST_RSI, GPA_BOOT_PARAMS)?; // boot_params pointer
-    vcpu.set_reg(VM_REG_GUEST_RFLAGS, 0x02)?;
+    vcpu.set_reg(VM_REG_GUEST_RFLAGS, RFLAGS_RESERVED_BIT1)?;
     vcpu.set_reg(VM_REG_GUEST_RSP, 0)?;
     vcpu.set_reg(VM_REG_GUEST_RBP, 0)?;
     vcpu.set_reg(VM_REG_GUEST_RDI, 0)?;
@@ -477,19 +533,17 @@ mod tests {
 
     #[test]
     fn gdt_entries() {
-        let mut gdt = [0u8; 24];
-        let code64: u64 = 0x00AF_9B00_0000_FFFF;
-        let data64: u64 = 0x00CF_9300_0000_FFFF;
-        gdt[8..16].copy_from_slice(&code64.to_le_bytes());
-        gdt[16..24].copy_from_slice(&data64.to_le_bytes());
+        let mut gdt = [0u8; GDT_SIZE];
+        gdt[8..16].copy_from_slice(&GDT_CODE64.to_le_bytes());
+        gdt[16..24].copy_from_slice(&GDT_DATA64.to_le_bytes());
 
         // Null descriptor
         assert_eq!(&gdt[..8], &[0u8; 8]);
         // Code64: check L bit (bit 53) is set, DB bit (bit 54) is clear
-        assert_ne!(code64 & (1 << 53), 0, "L bit must be set for 64-bit code");
-        assert_eq!(code64 & (1 << 54), 0, "DB bit must be clear for 64-bit code");
+        assert_ne!(GDT_CODE64 & (1 << 53), 0, "L bit must be set for 64-bit code");
+        assert_eq!(GDT_CODE64 & (1 << 54), 0, "DB bit must be clear for 64-bit code");
         // Data64: check DB bit is set
-        assert_ne!(data64 & (1 << 54), 0, "DB bit must be set for data segment");
+        assert_ne!(GDT_DATA64 & (1 << 54), 0, "DB bit must be set for data segment");
     }
 
     #[test]
@@ -509,8 +563,8 @@ mod tests {
 
     #[test]
     fn guest_addresses_dont_overlap() {
-        // GDT at 0x500 (24 bytes) doesn't overlap boot_params at 0x7000
-        assert!(GPA_GDT + 24 < GPA_BOOT_PARAMS);
+        // GDT at 0x500 doesn't overlap boot_params at 0x7000
+        assert!(GPA_GDT + GDT_SIZE as u64 <= GPA_BOOT_PARAMS);
         // boot_params at 0x7000 (4096) doesn't overlap PML4 at 0x9000
         assert!(GPA_BOOT_PARAMS + 4096 <= GPA_PML4);
         // Page tables: PML4(4K) + PDPT(4K) + 4*PD(4K) = 24K, 0x9000..0xF000

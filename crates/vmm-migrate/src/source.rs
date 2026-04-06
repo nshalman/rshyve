@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
+use slog;
 use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 
@@ -48,6 +49,7 @@ pub async fn run_source(
     num_cpus: u32,
     mem_size: u64,
     status: Arc<Mutex<MigrationStatus>>,
+    log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     // Upgrade TCP to WebSocket (client role)
     let (ws, _) = tokio_tungstenite::client_async(
@@ -60,7 +62,7 @@ pub async fn run_source(
     )))?;
 
     let result = run_source_inner(
-        ws, &hdl, memctx, num_cpus, mem_size, &status,
+        ws, &hdl, memctx, num_cpus, mem_size, &status, log,
     )
     .await;
 
@@ -68,6 +70,7 @@ pub async fn run_source(
     if result.is_err() {
         let phase = status.lock().map(|s| s.phase).unwrap_or(MigrationPhase::Error);
         if phase as u8 >= MigrationPhase::Pause as u8 {
+            // best-effort: if resume fails, VM is already in bad state
             let _ = hdl.resume();
         }
     }
@@ -84,6 +87,7 @@ async fn run_source_inner(
     num_cpus: u32,
     mem_size: u64,
     status: &Arc<Mutex<MigrationStatus>>,
+    log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     // ── Phase: Sync ────────────────────────────────────────────────
     set_phase(status, MigrationPhase::Sync);
@@ -149,13 +153,13 @@ async fn run_source_inner(
 
     // ── Phase: TimeData ───────────────────────────────────────────
     set_phase(status, MigrationPhase::TimeData);
-    let time_data = state::export_time_data(hdl)?;
+    let time_data = state::export_time_data(hdl, log)?;
     let time_msg = Message::serialized(&time_data)?;
     ws.send(time_msg.encode()).await?;
 
     // ── Phase: DeviceState ────────────────────────────────────────
     set_phase(status, MigrationPhase::DeviceState);
-    let device_state = state::export_device_state(hdl, num_cpus)?;
+    let device_state = state::export_device_state(hdl, num_cpus, log)?;
     let dev_msg = Message::serialized(&device_state)?;
     ws.send(dev_msg.encode()).await?;
 
@@ -202,6 +206,7 @@ async fn push_ram_all(
         // Read and clear the dirty bitmap (so post-pause only sees new dirt)
         let bitmap_len = crate::protocol::bitmap_size(len);
         let mut bitmap = vec![0u8; bitmap_len];
+        // best-effort: dirty tracking may not be enabled yet
         let _ = hdl.track_dirty_pages(gpa, len, &mut bitmap);
 
         // Set ALL bits — we're sending everything

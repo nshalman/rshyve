@@ -85,8 +85,16 @@ pub struct VirtQueue {
     used_addr: u64,
     /// Last available index we processed.
     last_avail_idx: u16,
+    /// Device-side shadow of the used ring index.
+    ///
+    /// Tracking this locally prevents TOCTOU attacks where a malicious
+    /// guest modifies the used_idx in shared memory between our read
+    /// and write, causing entries to be placed at wrong ring slots.
+    shadow_used_idx: u16,
     /// Whether VIRTIO_F_RING_EVENT_IDX is negotiated.
     event_idx: bool,
+    /// Whether VIRTIO_F_RING_INDIRECT_DESC is negotiated.
+    indirect_supported: bool,
 }
 
 impl VirtQueue {
@@ -106,7 +114,9 @@ impl VirtQueue {
             avail_addr: 0,
             used_addr: 0,
             last_avail_idx: 0,
+            shadow_used_idx: 0,
             event_idx: false,
+            indirect_supported: false,
         }
     }
 
@@ -135,6 +145,16 @@ impl VirtQueue {
         self.event_idx
     }
 
+    /// Enable/disable indirect descriptor support.
+    pub fn set_indirect_supported(&mut self, supported: bool) {
+        self.indirect_supported = supported;
+    }
+
+    /// Return the guest physical address of the available ring.
+    pub fn avail_addr(&self) -> u64 {
+        self.avail_addr
+    }
+
     /// Set the queue addresses from a legacy PFN (page frame number).
     ///
     /// In legacy mode, the guest writes a single PFN and the device
@@ -149,6 +169,7 @@ impl VirtQueue {
             self.avail_addr = 0;
             self.used_addr = 0;
             self.last_avail_idx = 0;
+            self.shadow_used_idx = 0;
             return;
         }
 
@@ -161,9 +182,33 @@ impl VirtQueue {
         self.avail_addr = base + u64::from(self.size) * 16;
 
         // Used ring is page-aligned after the available ring
+        // avail: flags(2) + idx(2) + ring(2*size) + used_event(2)
         let avail_end =
-            self.avail_addr + 4 + u64::from(self.size) * 2;
+            self.avail_addr + 6 + u64::from(self.size) * 2;
         self.used_addr = align_up(avail_end, PAGE_SIZE as u64);
+    }
+
+    /// Set queue addresses directly (modern transport).
+    ///
+    /// Modern (VirtIO 1.0+) transport provides separate addresses for
+    /// the descriptor table, available ring, and used ring instead of
+    /// computing them from a single PFN.
+    pub fn set_addr_modern(&mut self, desc: u64, avail: u64, used: u64) {
+        self.desc_addr = desc;
+        self.avail_addr = avail;
+        self.used_addr = used;
+        self.last_avail_idx = 0;
+        self.shadow_used_idx = 0;
+    }
+
+    /// Get the descriptor table address.
+    pub fn desc_addr(&self) -> u64 {
+        self.desc_addr
+    }
+
+    /// Get the used ring address.
+    pub fn used_addr(&self) -> u64 {
+        self.used_addr
     }
 
     /// Get the legacy PFN for this queue (desc_addr / PAGE_SIZE).
@@ -181,6 +226,7 @@ impl VirtQueue {
         self.avail_addr = 0;
         self.used_addr = 0;
         self.last_avail_idx = 0;
+        self.shadow_used_idx = 0;
     }
 
     /// Read a descriptor from the descriptor table.
@@ -218,6 +264,7 @@ impl VirtQueue {
             return None;
         }
 
+
         // Read the descriptor index from the ring
         let ring_offset =
             u64::from(self.last_avail_idx % self.size) * 2;
@@ -235,11 +282,14 @@ impl VirtQueue {
         Some(desc_idx)
     }
 
-    /// Update `used_event` to tell the guest when to kick next.
+    /// Write `avail_event` in the used ring to suppress guest kicks.
     ///
     /// Call AFTER draining all available entries (not per-pop).
-    /// Sets `used_event = last_avail_idx` so the guest kicks
+    /// Sets `avail_event = last_avail_idx` so the guest kicks
     /// when it adds ANY new entry past what we've already seen.
+    ///
+    /// VirtIO 1.3 sec 2.7.7: `avail_event` is in the used ring
+    /// (device→driver), at offset: flags(2) + idx(2) + entries(8*N).
     ///
     /// Includes a full memory barrier (SeqCst) after the write so
     /// that the caller's subsequent `has_new_avail()` re-check sees
@@ -251,12 +301,11 @@ impl VirtQueue {
         if !self.event_idx {
             return;
         }
-        let used_event_gpa = self.avail_addr + 4 + u64::from(self.size) * 2;
-        if let Some(sub) = physmap.lookup(used_event_gpa, 2) {
+        // avail_event is at end of used ring: used_addr + 4 + size*8
+        let avail_event_gpa = self.used_addr + 4 + u64::from(self.size) * 8;
+        if let Some(sub) = physmap.lookup(avail_event_gpa, 2) {
             let _ = sub.write::<u16>(&self.last_avail_idx);
         }
-        // Full barrier: ensure used_event is visible to the guest
-        // before we re-read avail_idx in has_new_avail().
         fence(Ordering::SeqCst);
     }
 
@@ -283,20 +332,20 @@ impl VirtQueue {
         }
     }
 
-    /// Read the current used ring index from guest memory.
-    pub fn read_used_idx(&self, physmap: &PhysMap) -> u16 {
-        let used_idx_gpa = self.used_addr + 2;
-        physmap
-            .lookup(used_idx_gpa, 2)
-            .and_then(|sub| sub.read::<u16>().ok())
-            .unwrap_or(0)
+    /// Return the current used ring index from the device-side shadow.
+    ///
+    /// Does not read from guest memory — uses the trusted shadow value
+    /// to prevent a malicious guest from influencing notification decisions.
+    pub fn read_used_idx(&self, _physmap: &PhysMap) -> u16 {
+        self.shadow_used_idx
     }
 
     /// Check if the guest expects an interrupt after used ring updates.
     ///
-    /// With EVENT_IDX: reads `avail_event` from the used ring and
-    /// applies the VirtIO 1.3 sec 2.7.7.1 wrapping comparison.
-    /// Without EVENT_IDX: always returns true.
+    /// With EVENT_IDX: reads `used_event` from the avail ring (the
+    /// driver's threshold) and applies the VirtIO 1.3 sec 2.7.7.1
+    /// wrapping comparison.
+    /// Without EVENT_IDX: checks VIRTQ_AVAIL_F_NO_INTERRUPT flag.
     ///
     /// `old_used_idx` is the used index before the device started
     /// processing. The current used index is read from guest memory.
@@ -306,22 +355,32 @@ impl VirtQueue {
         old_used_idx: u16,
     ) -> bool {
         if !self.event_idx {
+            // Without EVENT_IDX, check the avail ring flags field.
+            // If VIRTQ_AVAIL_F_NO_INTERRUPT is set, the driver doesn't
+            // want used-buffer notifications right now.
+            if self.avail_addr != 0 {
+                if let Some(sub) = physmap.lookup(self.avail_addr, 2) {
+                    if let Ok(flags) = sub.read::<u16>() {
+                        return flags & bits::VIRTQ_AVAIL_F_NO_INTERRUPT == 0;
+                    }
+                }
+            }
             return true;
         }
 
         // Full barrier: ensure our used_idx writes (from push_used)
-        // are visible to the guest before we read avail_event.
+        // are visible to the guest before we read used_event.
         // QEMU: smp_mb() in virtio_split_should_notify().
         fence(Ordering::SeqCst);
 
         let new_used_idx = self.read_used_idx(physmap);
 
-        // Read avail_event from the used ring (after the ring entries).
-        // Layout: flags(2) + idx(2) + entries(8*N) + avail_event(2)
-        let avail_event_gpa =
-            self.used_addr + 4 + u64::from(self.size) * 8;
-        let avail_event = match physmap
-            .lookup(avail_event_gpa, 2)
+        // Read used_event from the avail ring (driver's threshold).
+        // Layout: flags(2) + idx(2) + ring(2*N) + used_event(2)
+        let used_event_gpa =
+            self.avail_addr + 4 + u64::from(self.size) * 2;
+        let used_event = match physmap
+            .lookup(used_event_gpa, 2)
             .and_then(|sub| sub.read::<u16>().ok())
         {
             Some(v) => v,
@@ -330,32 +389,26 @@ impl VirtQueue {
 
         // VirtIO 1.3 sec 2.7.7.1 (vring_need_event):
         // Interrupt iff (new - event - 1) < (new - old)
-        vring_need_event(avail_event, new_used_idx, old_used_idx)
+        vring_need_event(used_event, new_used_idx, old_used_idx)
     }
 
     /// Push an entry onto the used ring.
     ///
     /// `desc_idx` is the head descriptor index, `len` is the total
     /// number of bytes written to device-writable buffers.
-    pub fn push_used(&self, physmap: &PhysMap, desc_idx: u16, len: u32) {
-        // Read current used index
-        let used_idx_gpa = self.used_addr + 2;
-        let used_idx = match physmap.lookup(used_idx_gpa, 2) {
-            Some(sub) => match sub.read::<u16>() {
-                Ok(v) => v,
-                Err(_) => return,
-            },
-            None => return,
-        };
+    ///
+    /// Uses a device-side shadow of used_idx to prevent TOCTOU attacks
+    /// where a malicious guest modifies the shared used_idx between
+    /// our read and write.
+    pub fn push_used(&mut self, physmap: &PhysMap, desc_idx: u16, len: u32) {
+        let used_idx = self.shadow_used_idx;
 
         // Write the used ring entry: id (u32) + len (u32)
         let ring_offset =
             u64::from(used_idx % self.size) * 8;
         let entry_gpa = self.used_addr + 4 + ring_offset;
         if let Some(sub) = physmap.lookup(entry_gpa, 8) {
-            // Write id (descriptor index as u32)
             let _ = sub.write::<u32>(&(u32::from(desc_idx)));
-            // Write len at offset 4
             if let Some(len_sub) = sub.subregion(4, 4) {
                 let _ = len_sub.write::<u32>(&len);
             }
@@ -365,10 +418,11 @@ impl VirtQueue {
         // guest before the updated used_idx (VirtIO 2.7.8).
         fence(Ordering::Release);
 
-        // Increment the used index
-        let new_used_idx = used_idx.wrapping_add(1);
+        // Increment the shadow and write to guest memory
+        self.shadow_used_idx = used_idx.wrapping_add(1);
+        let used_idx_gpa = self.used_addr + 2;
         if let Some(sub) = physmap.lookup(used_idx_gpa, 2) {
-            let _ = sub.write::<u16>(&new_used_idx);
+            let _ = sub.write::<u16>(&self.shadow_used_idx);
         }
     }
 
@@ -378,6 +432,63 @@ impl VirtQueue {
     /// full VirtQueue struct.
     pub fn used_ring_info(&self) -> (u64, u16) {
         (self.used_addr, self.size)
+    }
+
+    /// Walk an indirect descriptor table starting at `gpa` with `len` bytes.
+    ///
+    /// Each indirect descriptor is 16 bytes. The table contains
+    /// `len / 16` descriptors chained via NEXT flags. INDIRECT flag
+    /// inside the table is invalid (VirtIO 1.3 sec 2.7.5.3.1).
+    fn walk_indirect_table(
+        &self,
+        physmap: &PhysMap,
+        gpa: u64,
+        len: u32,
+    ) -> Option<Vec<ChainBuf>> {
+        let num_descs = len as usize / 16;
+        if num_descs == 0 || (len as usize) % 16 != 0 {
+            return None;
+        }
+
+        let mut bufs = Vec::new();
+        let mut idx: usize = 0;
+        let mut iterations: usize = 0;
+
+        loop {
+            if idx >= num_descs || iterations >= num_descs {
+                return None; // Out of bounds or cycle detected
+            }
+            iterations += 1;
+
+            let desc_gpa = gpa.checked_add((idx as u64).checked_mul(16)?)?;
+            let sub = physmap.lookup(desc_gpa, 16)?;
+            let desc: VirtqDesc = sub.read::<VirtqDesc>().ok()?;
+
+            // INDIRECT inside indirect is invalid
+            if desc.is_indirect() {
+                return None;
+            }
+
+            if desc.is_write() {
+                bufs.push(ChainBuf::Writable {
+                    addr: desc.addr,
+                    len: desc.len,
+                });
+            } else {
+                bufs.push(ChainBuf::Readable {
+                    addr: desc.addr,
+                    len: desc.len,
+                });
+            }
+
+            if desc.has_next() {
+                idx = desc.next as usize;
+            } else {
+                break;
+            }
+        }
+
+        Some(bufs)
     }
 
     /// Walk a descriptor chain starting from `head`, collecting buffers.
@@ -404,11 +515,15 @@ impl VirtQueue {
             let desc = self.read_desc(physmap, idx)?;
             count += 1;
 
-            // Reject indirect descriptors -- not supported. A malicious
-            // guest setting this flag would cause us to misinterpret an
-            // indirect table pointer as a regular buffer address.
             if desc.is_indirect() {
-                return None;
+                if !self.indirect_supported {
+                    return None;
+                }
+                // INDIRECT + NEXT is invalid (VirtIO 1.3 sec 2.7.5.3)
+                if desc.has_next() {
+                    return None;
+                }
+                return self.walk_indirect_table(physmap, desc.addr, desc.len);
             }
 
             if desc.is_write() {
@@ -512,7 +627,7 @@ mod tests {
         // Avail at base + 256 * 16 = base + 4096 = 8192
         assert_eq!(q.avail_addr, 4096 + 256 * 16);
         // Used at next page boundary after avail ring
-        let avail_end = q.avail_addr + 4 + 256 * 2;
+        let avail_end = q.avail_addr + 6 + 256 * 2;
         let expected_used = align_up(avail_end, PAGE_SIZE as u64);
         assert_eq!(q.used_addr, expected_used);
     }
@@ -697,6 +812,7 @@ mod tests {
 /// Create one per virtqueue via `VirtioCompletion::new()`.
 pub struct VirtioCompletion {
     used_addr: u64,
+    avail_addr: u64,
     queue_size: u16,
     write_idx: std::sync::Mutex<u16>,
     physmap: Arc<PhysMap>,
@@ -717,6 +833,7 @@ impl VirtioCompletion {
         interrupt: impl Fn() + Send + Sync + 'static,
     ) -> Arc<Self> {
         let (used_addr, queue_size) = queue.used_ring_info();
+        let avail_addr = queue.avail_addr();
         let idx_gpa = used_addr + 2;
         let initial_idx = physmap
             .lookup(idx_gpa, 2)
@@ -726,6 +843,7 @@ impl VirtioCompletion {
         let event_idx = queue.event_idx_enabled();
         Arc::new(Self {
             used_addr,
+            avail_addr,
             queue_size,
             write_idx: std::sync::Mutex::new(initial_idx),
             physmap,
@@ -791,20 +909,28 @@ impl VirtioCompletion {
     /// Without event_idx: always interrupt (no suppression).
     fn should_interrupt(&self, old_idx: u16, new_idx: u16) -> bool {
         if !self.event_idx {
+            // Without EVENT_IDX, check the avail ring flags field.
+            if self.avail_addr != 0 {
+                if let Some(sub) = self.physmap.lookup(self.avail_addr, 2) {
+                    if let Ok(flags) = sub.read::<u16>() {
+                        return flags & bits::VIRTQ_AVAIL_F_NO_INTERRUPT == 0;
+                    }
+                }
+            }
             return true;
         }
 
         // Full barrier: ensure our used_idx write (in write_used_entry)
-        // is visible to the guest before we read avail_event. Without
+        // is visible to the guest before we read used_event. Without
         // this, a Store-Load reorder could cause us to read a stale
-        // avail_event and skip an interrupt the guest expects.
+        // used_event and skip an interrupt the guest expects.
         // QEMU: smp_mb() in virtio_split_should_notify().
         std::sync::atomic::fence(Ordering::SeqCst);
 
-        // Read avail_event from the used ring (after the ring entries).
-        // Layout: flags(2) + idx(2) + entries(8*N) + avail_event(2)
-        let avail_event_gpa = self.used_addr + 4 + u64::from(self.queue_size) * 8;
-        let avail_event = match self.physmap.lookup(avail_event_gpa, 2)
+        // Read used_event from the avail ring (driver's threshold).
+        // Layout: flags(2) + idx(2) + ring(2*N) + used_event(2)
+        let used_event_gpa = self.avail_addr + 4 + u64::from(self.queue_size) * 2;
+        let used_event = match self.physmap.lookup(used_event_gpa, 2)
             .and_then(|sub| sub.read::<u16>().ok())
         {
             Some(v) => v,
@@ -813,7 +939,7 @@ impl VirtioCompletion {
 
         // VirtIO 1.3 sec 2.7.7.1 (vring_need_event):
         // Interrupt when the used index crosses the guest's threshold.
-        vring_need_event(avail_event, new_idx, old_idx)
+        vring_need_event(used_event, new_idx, old_idx)
     }
 
     /// Write one entry and advance the index. Caller holds Mutex.
@@ -822,6 +948,7 @@ impl VirtioCompletion {
         let entry_gpa = self.used_addr + 4 + slot * 8;
 
         if let Some(sub) = self.physmap.lookup(entry_gpa, 8) {
+            // write to guest memory; no recovery if unmapped
             let _ = sub.write::<u32>(&u32::from(desc_idx));
             if let Some(len_sub) = sub.subregion(4, 4) {
                 let _ = len_sub.write::<u32>(&len);
@@ -836,6 +963,7 @@ impl VirtioCompletion {
         *idx = idx.wrapping_add(1);
         let idx_gpa = self.used_addr + 2;
         if let Some(sub) = self.physmap.lookup(idx_gpa, 2) {
+            // write to guest memory; no recovery if unmapped
             let _ = sub.write::<u16>(idx);
         }
     }

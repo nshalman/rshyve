@@ -86,6 +86,7 @@ dependencies = [
  "bhyve_api_sys",
  "libc",
  "strum",
+ "vmm_api_common",
 ]
 
 [[package]]
@@ -159,6 +160,16 @@ dependencies = [
  "num-traits",
  "wasm-bindgen",
  "windows-link",
+]
+
+[[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common",
+ "inout",
 ]
 
 [[package]]
@@ -260,6 +271,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "powerfmt",
+]
+
+[[package]]
+name = "des"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffdd80ce8ce993de27e9f063a444a4d53ce8e8db4c1f00cc03af5ad5a9867a1e"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
@@ -689,6 +709,15 @@ dependencies = [
  "hashbrown 0.16.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "generic-array",
 ]
 
 [[package]]
@@ -1639,6 +1668,7 @@ name = "viona_api"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "vmm_api_common",
 ]
 
 [[package]]
@@ -1648,6 +1678,7 @@ dependencies = [
  "anyhow",
  "bhyve_api",
  "clap",
+ "futures",
  "libc",
  "serde",
  "serde_json",
@@ -1662,6 +1693,13 @@ dependencies = [
  "vmm_core",
  "vmm_devices",
  "vmm_migrate",
+]
+
+[[package]]
+name = "vmm_api_common"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -1697,6 +1735,7 @@ dependencies = [
  "anyhow",
  "bhyve_api",
  "bitflags",
+ "des",
  "erased-serde 0.4.10",
  "futures",
  "libc",

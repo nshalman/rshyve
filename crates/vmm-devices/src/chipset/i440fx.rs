@@ -15,6 +15,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
+use slog;
 use vmm_core::common::RWOp;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::intr_pins::PciIntrPin;
@@ -61,6 +62,8 @@ pub struct I440FxChipset {
     pir_regs: Arc<Mutex<[u8; PIR_COUNT]>>,
     /// VM handle for PCI interrupt delivery.
     hdl: Option<Arc<VmmHdl>>,
+    /// Logger for chipset and child interrupt pins.
+    log: slog::Logger,
 }
 
 impl I440FxChipset {
@@ -75,6 +78,7 @@ impl I440FxChipset {
     pub fn create(
         bus_pio: &PioBus,
         hdl: Option<Arc<VmmHdl>>,
+        log: slog::Logger,
     ) -> Arc<Self> {
         let pci_bus = PciBus::new();
 
@@ -100,6 +104,7 @@ impl I440FxChipset {
             lpc,
             pir_regs,
             hdl,
+            log,
         });
 
         // Register PIO handler for config address register (0xCF8, 4 bytes)
@@ -172,6 +177,7 @@ impl I440FxChipset {
             0, // INT#A
             self.pir_regs.clone(),
             hdl.clone(),
+            self.log.new(slog::o!("component" => "pci-intr", "slot" => bdf.dev())),
         );
         Some((crate::pci::INTxPinID::IntA, pin))
     }
@@ -363,7 +369,11 @@ mod tests {
     /// Create a chipset on a fresh PIO bus for testing.
     fn setup() -> (Arc<PioBus>, Arc<I440FxChipset>) {
         let pio = Arc::new(PioBus::new());
-        let chipset = I440FxChipset::create(&pio, None);
+        let chipset = I440FxChipset::create(
+            &pio,
+            None,
+            slog::Logger::root(slog::Discard, slog::o!()),
+        );
         (pio, chipset)
     }
 

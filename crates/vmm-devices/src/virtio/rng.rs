@@ -14,6 +14,7 @@
 
 use vmm_core::mem::PhysMap;
 
+use crate::Lifecycle;
 use super::queue::VirtQueue;
 use super::VirtioDevice;
 
@@ -27,11 +28,13 @@ impl VirtioRng {
 }
 
 impl VirtioDevice for VirtioRng {
-    fn device_features(&self) -> u32 {
-        0 // No feature bits for RNG
+    fn device_features(&self) -> u64 {
+        // Ring features: legacy transport strips these in pci.rs.
+        super::bits::VIRTIO_F_RING_EVENT_IDX
+            | super::bits::VIRTIO_F_RING_INDIRECT_DESC
     }
 
-    fn set_features(&self, _features: u32) {}
+    fn set_features(&self, _features: u64) {}
 
     fn cfg_read(&self, _offset: u16, _len: u8) -> u32 {
         0 // No device-specific config
@@ -72,12 +75,13 @@ impl VirtioDevice for VirtioRng {
                     getrandom(&mut rand_buf);
 
                     if let Some(sub) = physmap.lookup(*addr + offset, n) {
+                        // write to guest memory; no recovery if unmapped
                         let _ = sub.write_bytes(&rand_buf);
                     }
 
                     offset += n as u64;
                     remaining -= n;
-                    total_written += n as u32;
+                    total_written = total_written.saturating_add(n as u32);
                 }
             }
         }
@@ -88,24 +92,36 @@ impl VirtioDevice for VirtioRng {
     fn reset(&self) {}
 }
 
+impl Lifecycle for VirtioRng {
+    fn type_name(&self) -> &'static str {
+        "virtio-rng"
+    }
+}
+
 /// Fill a buffer with cryptographically secure random bytes.
 ///
 /// Uses `getrandom(2)` on illumos, `getentropy(2)` on macOS.
+/// Retries on partial reads and EINTR.
 #[cfg(target_os = "illumos")]
 fn getrandom(buf: &mut [u8]) {
-    let ret = unsafe {
-        libc::getrandom(
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            0,
-        )
-    };
-    assert!(
-        ret as usize == buf.len(),
-        "getrandom failed: expected {} bytes, got {}",
-        buf.len(),
-        ret,
-    );
+    let mut filled = 0;
+    while filled < buf.len() {
+        let ret = unsafe {
+            libc::getrandom(
+                buf[filled..].as_mut_ptr().cast(),
+                buf.len() - filled,
+                0,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            panic!("getrandom failed: {err}");
+        }
+        filled += ret as usize;
+    }
 }
 
 #[cfg(not(target_os = "illumos"))]
@@ -122,9 +138,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn features_are_zero() {
+    fn features_include_event_idx_and_indirect() {
+        use crate::virtio::bits;
         let rng = VirtioRng::new();
-        assert_eq!(rng.device_features(), 0);
+        let f = rng.device_features();
+        assert_ne!(f & bits::VIRTIO_F_RING_EVENT_IDX, 0);
+        assert_ne!(f & bits::VIRTIO_F_RING_INDIRECT_DESC, 0);
     }
 
     #[test]

@@ -5,9 +5,11 @@
 //! vmm - New Rust-based bhyve VMM with live migration support.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::thread;
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
 
 use anyhow::Context;
 use clap::Parser;
@@ -16,7 +18,7 @@ use slog::{info, warn, error, o, Drain, Logger};
 use vmm_config::Cli;
 use vmm_core::hdl::CreateOpts;
 use vmm_core::intr_pins::{LegacyPIC, NoOpPin};
-use vmm_core::machine::Builder;
+use vmm_core::machine::{Builder, Machine, MachineSetup};
 use vmm_devices::bhyve::{
     BhyveAtPic, BhyveAtPit, BhyveHpet, BhyveIoApic, BhyveRtc,
     pmtimer::{BhyvePmTimer, PMBASE_DEFAULT},
@@ -26,6 +28,7 @@ use vmm_devices::chipset::i440fx::I440FxChipset;
 use vmm_devices::fwcfg::FwCfg;
 use vmm_devices::smbios;
 use vmm_devices::pci::Bdf;
+use vmm_devices::pci::msix::MsixTable;
 use vmm_devices::uart::lpc::{self, LpcUart};
 use vmm_devices::virtio::block::{VirtioBlock, VirtioBlockOpts};
 use vmm_devices::virtio::pci::VirtioPciDevice;
@@ -59,17 +62,22 @@ fn setup_logger() -> Logger {
 /// guest writes to COM1.
 fn spawn_serial_drain(
     uart: Arc<LpcUart>,
-    _log: Logger,
+    log: Logger,
     output_path: Option<&std::path::Path>,
 ) -> thread::JoinHandle<()> {
-    // Open serial output file if specified, otherwise use stdout
+    // Open serial output file if specified, otherwise use stderr
+    // (stderr avoids interleaving with interactive console input on stdout)
     let output: Box<dyn Write + Send> = if let Some(path) = output_path {
         match std::fs::File::create(path) {
             Ok(f) => Box::new(f),
-            Err(_) => Box::new(std::io::stdout()),
+            Err(e) => {
+                warn!(log, "failed to open serial output file, using stderr";
+                    "path" => path.display().to_string(), "error" => %e);
+                Box::new(std::io::stderr())
+            }
         }
     } else {
-        Box::new(std::io::stdout())
+        Box::new(std::io::stderr())
     };
     let output = std::sync::Mutex::new(output);
 
@@ -80,7 +88,9 @@ fn spawn_serial_drain(
                 match uart.output_byte() {
                     Some(b) => {
                         if let Ok(mut out) = output.lock() {
-                            let _ = out.write_all(&[b]);
+                            if let Err(e) = out.write_all(&[b]) {
+                                eprintln!("[serial-drain] write error: {}", e);
+                            }
                             let _ = out.flush();
                         }
                     }
@@ -94,7 +104,20 @@ fn spawn_serial_drain(
         .expect("failed to spawn serial drain thread")
 }
 
-fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
+/// Result of `create_machine`: the finalized Machine plus metadata needed
+/// by later stages.
+struct MachineCreation {
+    machine: Machine,
+    api_version: u32,
+    num_cpus: u32,
+    mem_size: usize,
+    kernel_image: Option<direct_boot::KernelImage>,
+    initrd_image: Option<direct_boot::InitrdImage>,
+}
+
+/// Build the VM, load bootrom/kernel images, finalize memory, and apply
+/// CPU topology and baseline masking.
+fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
     let num_cpus = cli.num_cpus()?;
     let mem_size = cli.mem_size()?;
 
@@ -146,15 +169,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     };
 
     if !direct_boot_mode && cli.migrate_listen.is_none() {
-        let rom_path = bootrom::find_bootrom_path(&cli.lpc);
-        info!(log, "loading bootrom"; "path" => rom_path.display().to_string());
-        let rom = bootrom::BootromFile::open(&rom_path)?;
-        info!(log, "bootrom validated";
-            "size" => rom.size(),
-            "path" => rom.path().display().to_string(),
-        );
-        let hdl = setup.hdl().clone();
-        bootrom::load_bootrom(setup.map_mut(), &hdl, &rom)?;
+        load_bootrom(&mut setup, &cli.lpc, log)?;
     }
 
     // Finalize: wrap PhysMap in Arc, create vCPUs and buses
@@ -192,26 +207,74 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         machine.hdl(),
         num_cpus,
         cpu_baseline,
+        log,
     ).context("failed to apply CPU baseline")?;
 
-    // ----- Device initialization -----
+    Ok(MachineCreation {
+        machine,
+        api_version,
+        num_cpus,
+        mem_size,
+        kernel_image,
+        initrd_image,
+    })
+}
 
+/// Load the bootrom image into guest memory (pre-finalize).
+fn load_bootrom(
+    setup: &mut MachineSetup,
+    lpc_args: &[String],
+    log: &Logger,
+) -> anyhow::Result<()> {
+    let rom_path = bootrom::find_bootrom_path(lpc_args);
+    info!(log, "loading bootrom"; "path" => rom_path.display().to_string());
+    let rom = bootrom::BootromFile::open(&rom_path)?;
+    info!(log, "bootrom validated";
+        "size" => rom.size(),
+        "path" => rom.path().display().to_string(),
+    );
+    let hdl = setup.hdl().clone();
+    bootrom::load_bootrom(setup.map_mut(), &hdl, &rom)?;
+    Ok(())
+}
+
+/// Chipset and kernel-emulated device handles that must be kept alive
+/// for the VM's lifetime.
+#[allow(dead_code)]
+struct ChipsetDevices {
+    chipset: Arc<I440FxChipset>,
+    pic: Arc<LegacyPIC>,
+    atpic: Arc<BhyveAtPic>,
+    atpit: Arc<BhyveAtPit>,
+    hpet: Arc<BhyveHpet>,
+    ioapic: Arc<BhyveIoApic>,
+    rtc: Arc<BhyveRtc>,
+}
+
+/// Create the i440fx chipset, legacy PIC, and all bhyve kernel-emulated
+/// devices (ATPIC, ATPIT, HPET, IOAPIC, RTC). Writes memory size to
+/// RTC NVRAM and sets RTC time.
+fn init_chipset(machine: &Machine, log: &Logger) -> anyhow::Result<ChipsetDevices> {
     // Create legacy PIC for ISA interrupt delivery
-    let pic = LegacyPIC::new(machine.hdl().clone());
+    let pic = LegacyPIC::new(
+        machine.hdl().clone(),
+        log.new(slog::o!("component" => "legacy-pic")),
+    );
 
     // Create i440fx chipset (host bridge + ISA bridge + PCI config ports)
     let chipset = I440FxChipset::create(
         machine.bus_pio(),
         Some(machine.hdl().clone()),
+        log.new(slog::o!("component" => "chipset")),
     );
     info!(log, "chipset initialized"; "type" => "i440fx");
 
     // Create bhyve kernel-emulated devices.
     // These are emulated in-kernel; we just hold references for lifecycle.
-    let _atpic = BhyveAtPic::create(machine.hdl().clone());
-    let _atpit = BhyveAtPit::create(machine.hdl().clone());
-    let _hpet = BhyveHpet::create(machine.hdl().clone());
-    let _ioapic = BhyveIoApic::create(machine.hdl().clone());
+    let atpic = BhyveAtPic::create(machine.hdl().clone());
+    let atpit = BhyveAtPit::create(machine.hdl().clone());
+    let hpet = BhyveHpet::create(machine.hdl().clone());
+    let ioapic = BhyveIoApic::create(machine.hdl().clone());
     let rtc = BhyveRtc::create(machine.hdl().clone());
 
     // Write memory size to RTC NVRAM for UEFI discovery
@@ -235,6 +298,24 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         "highmem_mb" => highmem / (1024 * 1024),
     );
 
+    Ok(ChipsetDevices { chipset, pic, atpic, atpit, hpet, ioapic, rtc })
+}
+
+/// Timer and power-management device handles kept alive for the VM's
+/// lifetime.
+#[allow(dead_code)]
+struct TimerAndPmDevices {
+    pmtimer: Arc<BhyvePmTimer>,
+    acpi_pm: Arc<vmm_devices::acpi_pm::AcpiPm>,
+    pvpanic: Arc<vmm_devices::pvpanic::PvPanic>,
+}
+
+/// Configure the ACPI PM timer, ISA IRQ trigger modes for SCI and PCI,
+/// ACPI PM1 registers, and the pvpanic PIO device.
+fn setup_timers_and_pm(
+    machine: &Machine,
+    log: &Logger,
+) -> anyhow::Result<TimerAndPmDevices> {
     // Configure ACPI PM timer in kernel
     let pmtimer = BhyvePmTimer::create(machine.hdl().clone(), PMBASE_DEFAULT);
     pmtimer.attach()
@@ -253,9 +334,46 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     info!(log, "PM timer attached"; "port" => format!("{:#x}", pmtimer.port()));
 
     // Create ACPI PM1 event/enable/control registers + reset handler
-    let _acpi_pm = vmm_devices::acpi_pm::AcpiPm::create_and_attach(machine.bus_pio());
+    let acpi_pm = vmm_devices::acpi_pm::AcpiPm::create_and_attach(
+        machine.bus_pio(),
+        log.new(slog::o!("component" => "acpi-pm")),
+    );
     info!(log, "ACPI PM registers attached"; "pmbase" => format!("{:#x}", 0x400));
 
+    // pvpanic device — guest writes to port 0x505 on kernel panic
+    let pvpanic = vmm_devices::pvpanic::PvPanic::new(log.clone());
+    {
+        let pvpanic = Arc::clone(&pvpanic);
+        let handler: Arc<vmm_core::pio::PioFn> = Arc::new(move |_offset, rwo| {
+            match rwo {
+                vmm_core::common::RWOp::Read(ro) => {
+                    ro.write_u8(pvpanic.pio_read());
+                }
+                vmm_core::common::RWOp::Write(wo) => {
+                    pvpanic.pio_write(wo.read_u8());
+                }
+            }
+        });
+        if let Err(e) = machine.bus_pio().register(
+            vmm_devices::pvpanic::PVPANIC_IOPORT,
+            1,
+            handler,
+        ) {
+            slog::warn!(log, "failed to register pvpanic PIO handler"; "error" => %e);
+        }
+    }
+
+    Ok(TimerAndPmDevices { pmtimer, acpi_pm, pvpanic })
+}
+
+/// Create and attach COM1/COM2 UARTs, set up serial I/O paths, and
+/// optionally start the mdata agent on COM2.
+fn setup_serial(
+    machine: &Machine,
+    pic: &Arc<LegacyPIC>,
+    cli: &Cli,
+    log: &Logger,
+) -> (Arc<LpcUart>, Arc<LpcUart>) {
     // Create COM1 UART (IRQ 4, base port 0x3F8)
     let com1_irq: Arc<dyn vmm_core::intr_pins::IntrPin> =
         match pic.pin_handle(lpc::COM1_IRQ) {
@@ -281,15 +399,23 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     let com2_path = find_lpc_device(&cli.lpc, "com2");
 
     // Set up COM1 serial I/O based on -l com1,<config>
-    setup_serial_io(&com1, com1_path.as_deref(), "com1", &log);
+    setup_serial_io(&com1, com1_path.as_deref(), "com1", log);
 
-    // Set up COM2: if a path is specified, use it; otherwise start
-    // the built-in mdata agent for guest configuration.
+    // Set up COM2:
+    // - "socket,/path" → Unix socket for host-side metadata agent
+    // - absent/no --mdata-nics → built-in mdata agent
+    // - other path → raw file I/O
     if let Some(ref path) = com2_path {
-        setup_serial_io(&com2, Some(path.as_str()), "com2", &log);
+        if path.starts_with("socket,") {
+            // Production zone: create Unix socket so the host-side
+            // metadata agent (vmadmd) can connect and serve sdc:nics,
+            // SSH keys, etc. to the guest via COM2.
+            setup_serial_io(&com2, Some(path.as_str()), "com2", log);
+        } else {
+            setup_serial_io(&com2, Some(path.as_str()), "com2", log);
+        }
     } else {
-        // Start mdata agent on COM2 — this serves network config,
-        // hostname, SSH keys to the guest via the SmartOS metadata protocol.
+        // Standalone mode: start built-in mdata agent using CLI flags.
         let mdata_store = Arc::new(mdata::build_store_from_zone_config(
             &cli.vm_name,
             cli.uuid.as_deref(),
@@ -302,8 +428,19 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         info!(log, "mdata agent started on COM2");
     }
 
-    // ----- fw_cfg, E820, and ACPI table setup -----
+    (com1, com2)
+}
 
+/// Set up fw_cfg device with E820 memory map, ACPI tables (both
+/// table-loader protocol and legacy GPA), SMBIOS tables, and boot order.
+/// Returns the FwCfg handle (must be kept alive for the VM's lifetime).
+fn setup_fwcfg_and_acpi(
+    machine: &Machine,
+    cli: &Cli,
+    num_cpus: u32,
+    mem_size: usize,
+    log: &Logger,
+) -> Arc<FwCfg> {
     // Create fw_cfg device and attach to PIO bus
     let fwcfg = FwCfg::new();
     fwcfg.attach(machine.bus_pio());
@@ -325,17 +462,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     // The layout produces two separate blobs (tables + rsdp) with
     // blob-relative offsets that the UEFI firmware patches via the
     // etc/table-loader commands.
-    // Try to load iasl-compiled DSDT override for testing
-    let dsdt_override = std::fs::read("/opt/vmmnew/test_dsdt.aml").ok();
-    if dsdt_override.is_some() {
-        info!(log, "using iasl-compiled DSDT override";
-            "size" => dsdt_override.as_ref().map(|d| d.len()).unwrap_or(0),
-        );
-    }
-    let acpi_layout = acpi::generate_acpi_layout_with_dsdt(
-        num_cpus,
-        dsdt_override,
-    );
+    let acpi_layout = acpi::generate_acpi_layout(num_cpus);
     info!(log, "ACPI layout generated for table-loader protocol";
         "tables_size" => acpi_layout.tables.len(),
         "rsdp_size" => acpi_layout.rsdp.len(),
@@ -363,33 +490,38 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     fwcfg.insert_named("bootorder", b"/pci@i0cf8/pci@4,0\n".to_vec());
     info!(log, "boot order configured via fw_cfg");
 
-    // Write RSDP to the BIOS-scannable region (0xE0000-0xFFFFF).
-    // The Linux kernel's legacy ACPI scan looks here for the RSDP
-    // signature "RSD PTR ". This serves as a fallback if the table-loader
-    // protocol doesn't properly install the RSDP.
-    {
-        let legacy_tables = acpi::generate_acpi_tables(num_cpus);
-        // Write RSDP at 0xF2400 (legacy bhyve location)
-        if let Err(e) = machine.memctx().write(0xF2400, &legacy_tables.data) {
-            warn!(log, "failed to write legacy ACPI tables"; "error" => %e);
+    // Write legacy GPA-based ACPI tables to guest memory
+    write_legacy_acpi_tables(machine, num_cpus, log);
+
+    // Generate and write SMBIOS tables
+    write_smbios_tables(machine, &fwcfg, cli, num_cpus, mem_size, log);
+
+    fwcfg
+}
+
+/// Generate legacy GPA-based ACPI tables and write to multiple guest
+/// memory locations for compatibility with both UEFI and BIOS scan paths.
+fn write_legacy_acpi_tables(machine: &Machine, num_cpus: u32, log: &Logger) {
+    let acpi_tables = acpi::generate_acpi_tables(num_cpus);
+
+    // Write to BIOS-scannable region (0xE0000-0xFFFFF) as fallback
+    // if the table-loader protocol doesn't properly install the RSDP.
+    if let Err(e) = machine.memctx().write(0xF2400, &acpi_tables.data) {
+        warn!(log, "failed to write legacy ACPI tables"; "error" => %e);
+    } else {
+        info!(log, "legacy ACPI tables at 0xF2400"; "size" => acpi_tables.data.len());
+    }
+    // Write RSDP at 0xE0000 for easier scan discovery
+    let rsdp_size = 36;
+    if acpi_tables.data.len() >= rsdp_size {
+        if let Err(e) = machine.memctx().write(0xE0000, &acpi_tables.data[..rsdp_size]) {
+            warn!(log, "failed to write RSDP at 0xE0000"; "error" => %e);
         } else {
-            info!(log, "legacy ACPI tables at 0xF2400"; "size" => legacy_tables.data.len());
-        }
-        // Also write RSDP at 0xE0000 for easier scan discovery
-        let _rsdp_start = 0; // RSDP is at the start of legacy_tables.data
-        let rsdp_size = 36;
-        if legacy_tables.data.len() >= rsdp_size {
-            if let Err(e) = machine.memctx().write(0xE0000, &legacy_tables.data[..rsdp_size]) {
-                warn!(log, "failed to write RSDP at 0xE0000"; "error" => %e);
-            } else {
-                info!(log, "RSDP written at 0xE0000");
-            }
+            info!(log, "RSDP written at 0xE0000");
         }
     }
 
-    // Also generate legacy GPA-based tables and write to guest memory
-    // as a fallback for non-UEFI or direct-mapped scenarios.
-    let acpi_tables = acpi::generate_acpi_tables(num_cpus);
+    // Write full tables to bhyve legacy base for non-UEFI/direct-mapped scenarios.
     if let Err(e) = machine.memctx().write(acpi::BHYVE_ACPI_BASE, &acpi_tables.data) {
         warn!(log, "failed to write ACPI tables to guest memory (may be OK if region not mapped)";
             "gpa" => format!("{:#x}", acpi::BHYVE_ACPI_BASE),
@@ -401,8 +533,18 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
             "size" => acpi_tables.data.len(),
         );
     }
+}
 
-    // Generate SMBIOS tables and add to fw_cfg
+/// Generate SMBIOS tables, add to fw_cfg, and write to the legacy scan
+/// area in guest memory.
+fn write_smbios_tables(
+    machine: &Machine,
+    fwcfg: &FwCfg,
+    cli: &Cli,
+    num_cpus: u32,
+    mem_size: usize,
+    log: &Logger,
+) {
     let smbios_config = if let Some(ref b_flag) = cli.smbios {
         let mut cfg = smbios::parse_smbios_flag(b_flag);
         cfg.vm_name = cli.vm_name.clone();
@@ -471,26 +613,40 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
             );
         }
     }
+}
 
-    // Keep fw_cfg alive for the duration of the VM
-    let _fwcfg = fwcfg;
-
-    // ----- PCI device creation from -s flags -----
-    // Keep devices alive by collecting them
-    let mut _pci_devices: Vec<Arc<dyn vmm_devices::pci::PciDevice>> = Vec::new();
+/// Parse all `-s` PCI slot specifications and create the corresponding
+/// devices. Returns PCI handles (must be kept alive) and lifecycle handles
+/// for pause/resume orchestration.
+fn init_pci_devices(
+    machine: &Machine,
+    chipset: &I440FxChipset,
+    cli: &Cli,
+    log: &Logger,
+) -> anyhow::Result<(
+    Vec<Arc<dyn vmm_devices::pci::PciDevice>>,
+    Vec<Arc<dyn vmm_devices::Lifecycle>>,
+)> {
+    let mut pci_devices: Vec<Arc<dyn vmm_devices::pci::PciDevice>> = Vec::new();
+    let mut lifecycle_devices: Vec<Arc<dyn vmm_devices::Lifecycle>> = Vec::new();
 
     for slot_spec in &cli.pci_slot {
         match parse_and_create_pci_device(
             slot_spec,
-            &chipset,
+            chipset,
             machine.bus_pio(),
             machine.bus_mmio(),
             machine.physmap(),
             machine.hdl(),
             log,
         ) {
-            Ok(Some(dev)) => _pci_devices.push(dev),
-            Ok(None) => {} // recognized but no Arc to hold
+            Ok((Some(pci), lifecycle)) => {
+                pci_devices.push(pci);
+                if let Some(lc) = lifecycle {
+                    lifecycle_devices.push(lc);
+                }
+            }
+            Ok((None, _)) => {} // recognized but no Arc to hold
             Err(e) => {
                 error!(log, "failed to create PCI device";
                     "spec" => slot_spec,
@@ -501,11 +657,19 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         }
     }
 
-    // Keep chipset alive for the duration
-    let _chipset = chipset;
+    Ok((pci_devices, lifecycle_devices))
+}
 
-    // ----- Direct boot: load kernel into guest RAM -----
-
+/// If direct-booting a kernel, load it into guest RAM and return the
+/// entry point address.
+fn load_direct_boot_kernel(
+    machine: &Machine,
+    cli: &Cli,
+    kernel_image: &Option<direct_boot::KernelImage>,
+    initrd_image: &Option<direct_boot::InitrdImage>,
+    mem_size: usize,
+    log: &Logger,
+) -> anyhow::Result<()> {
     if let Some(ref kernel) = kernel_image {
         let cmdline = cli.cmdline.as_deref()
             .unwrap_or("console=ttyS0 earlyprintk=serial");
@@ -523,109 +687,135 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
             "cmdline" => cmdline,
         );
     }
+    Ok(())
+}
 
-    // ----- Migration destination mode -----
-    //
-    // If --migrate-listen is set, we skip bootrom/vCPU setup and instead
-    // wait for migration data. After importing state, we start vCPUs
-    // with the imported register/device state.
-    if let Some(ref listen_addr) = cli.migrate_listen {
-        info!(log, "migration destination mode"; "listen" => listen_addr);
+/// Handle migration destination mode: activate vCPUs, listen for a
+/// migration connection, and import VM state from the source.
+fn run_migration_destination(
+    machine: &Machine,
+    listen_addr: &str,
+    num_cpus: u32,
+    mem_size: usize,
+    log: &Logger,
+) -> anyhow::Result<()> {
+    info!(log, "migration destination mode"; "listen" => listen_addr);
 
-        // Activate and reset vCPUs. The reset initializes the VMCS/VMCB
-        // host-state fields. The migration import then overwrites the
-        // guest-state fields with the source's values.
-        for vcpu in machine.vcpus() {
-            vcpu.activate()
-                .with_context(|| format!("failed to activate vCPU {}", vcpu.id()))?;
-            vcpu.reboot_state()
-                .with_context(|| format!("failed to reset vCPU {}", vcpu.id()))?;
-        }
+    // Activate and reset vCPUs. The reset initializes the VMCS/VMCB
+    // host-state fields. The migration import then overwrites the
+    // guest-state fields with the source's values.
+    for vcpu in machine.vcpus() {
+        vcpu.activate()
+            .with_context(|| format!("failed to activate vCPU {}", vcpu.id()))?;
+        vcpu.reboot_state()
+            .with_context(|| format!("failed to reset vCPU {}", vcpu.id()))?;
+    }
 
-        // Listen for migration connection
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create tokio runtime")?;
+    // Listen for migration connection
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create tokio runtime")?;
 
-        let listen_addr_clone = listen_addr.clone();
-        let hdl = machine.hdl().clone();
-        let physmap = machine.physmap().clone();
-        let migrate_num_cpus = num_cpus;
-        let migrate_mem_size = mem_size as u64;
-        let status = std::sync::Arc::new(std::sync::Mutex::new(
-            vmm_migrate::MigrationStatus::default(),
-        ));
+    let listen_addr_owned = listen_addr.to_string();
+    let hdl = machine.hdl().clone();
+    let physmap = machine.physmap().clone();
+    let migrate_mem_size = mem_size as u64;
+    let status = Arc::new(std::sync::Mutex::new(
+        vmm_migrate::MigrationStatus::default(),
+    ));
 
-        info!(log, "waiting for migration connection"; "addr" => &listen_addr_clone);
+    info!(log, "waiting for migration connection"; "addr" => listen_addr);
 
-        rt.block_on(async {
-            let listener = tokio::net::TcpListener::bind(&listen_addr_clone)
-                .await
-                .context("failed to bind migration listener")?;
-
-            let (stream, peer) = listener.accept()
-                .await
-                .context("failed to accept migration connection")?;
-
-            info!(log, "migration connection from"; "peer" => %peer);
-
-            vmm_migrate::destination::run_destination(
-                stream,
-                hdl.clone(),
-                &vmm_core::mem::MemCtx::new(physmap),
-                migrate_num_cpus,
-                migrate_mem_size,
-                status,
-            )
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind(&listen_addr_owned)
             .await
-            .context("migration import failed")
-        })?;
+            .context("failed to bind migration listener")?;
 
-        info!(log, "migration import complete, starting vCPUs");
+        let (stream, peer) = listener.accept()
+            .await
+            .context("failed to accept migration connection")?;
 
-        // Run state was restored per-vCPU during import_device_state.
-        // No need to force VRS_RUN here — vCPUs in HLT/INIT stay
-        // in that state and will be resumed by the kernel when needed.
-        // Interrupt injection happens AFTER vCPU threads are spawned
-        // (see below). Injecting before spawn loses the kick.
-    } else {
-        // ----- Normal vCPU startup -----
+        info!(log, "migration connection from"; "peer" => %peer);
 
-        // Activate all vCPUs and set capabilities
-        for vcpu in machine.vcpus() {
-            vcpu.activate()
-                .with_context(|| format!("failed to activate vCPU {}", vcpu.id()))?;
+        vmm_migrate::destination::run_destination(
+            stream,
+            hdl.clone(),
+            &vmm_core::mem::MemCtx::new(physmap),
+            num_cpus,
+            migrate_mem_size,
+            status,
+            log,
+        )
+        .await
+        .context("migration import failed")
+    })?;
 
-            if cli.vmexit_on_hlt {
-                machine.hdl().set_capability(
-                    vcpu.id(),
-                    bhyve_api::vm_cap_type::VM_CAP_HALT_EXIT as i32,
-                    1,
-                ).with_context(|| format!("failed to set HALT_EXIT on vCPU {}", vcpu.id()))?;
-            }
-        }
+    info!(log, "migration import complete, starting vCPUs");
 
-        // Set up BSP based on boot mode
-        if let Some(ref kernel) = kernel_image {
-            if let Some(bsp) = machine.vcpus().first() {
-                direct_boot::setup_direct_boot_bsp(bsp, kernel.entry_point_64())
-                    .context("failed to set up BSP for direct boot")?;
-            }
-            info!(log, "BSP configured for direct boot");
-        } else {
-            // UEFI boot: only the BSP gets reset + RIP set.
-            // APs must NOT be reset — they start in INIT state and
-            // wait for SIPI from the BSP. Calling reboot_state() on
-            // APs disrupts the kernel's INIT/SIPI handling and causes
-            // massive SMP boot delays.
-            if let Some(bsp) = machine.vcpus().first() {
-                bsp.setup_bsp()
-                    .context("failed to set up BSP")?;
-            }
+    // Run state was restored per-vCPU during import_device_state.
+    // No need to force VRS_RUN here — vCPUs in HLT/INIT stay
+    // in that state and will be resumed by the kernel when needed.
+    // Interrupt injection happens AFTER vCPU threads are spawned
+    // (see below). Injecting before spawn loses the kick.
+    Ok(())
+}
+
+/// Normal (non-migration) vCPU activation: activate all vCPUs, set
+/// capabilities, and configure the BSP for either direct-boot or UEFI.
+fn activate_vcpus(
+    machine: &Machine,
+    cli: &Cli,
+    kernel_image: &Option<direct_boot::KernelImage>,
+    log: &Logger,
+) -> anyhow::Result<()> {
+    // Activate all vCPUs and set capabilities
+    for vcpu in machine.vcpus() {
+        vcpu.activate()
+            .with_context(|| format!("failed to activate vCPU {}", vcpu.id()))?;
+
+        if cli.vmexit_on_hlt {
+            machine.hdl().set_capability(
+                vcpu.id(),
+                bhyve_api::vm_cap_type::VM_CAP_HALT_EXIT as i32,
+                1,
+            ).with_context(|| format!("failed to set HALT_EXIT on vCPU {}", vcpu.id()))?;
         }
     }
 
+    // Set up BSP based on boot mode
+    if let Some(ref kernel) = kernel_image {
+        if let Some(bsp) = machine.vcpus().first() {
+            direct_boot::setup_direct_boot_bsp(bsp, kernel.entry_point_64())
+                .context("failed to set up BSP for direct boot")?;
+        }
+        info!(log, "BSP configured for direct boot");
+    } else {
+        // UEFI boot: only the BSP gets reset + RIP set.
+        // APs must NOT be reset — they start in INIT state and
+        // wait for SIPI from the BSP. Calling reboot_state() on
+        // APs disrupts the kernel's INIT/SIPI handling and causes
+        // massive SMP boot delays.
+        if let Some(bsp) = machine.vcpus().first() {
+            bsp.setup_bsp()
+                .context("failed to set up BSP")?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Spawn per-vCPU threads and return the event channel and join handles.
+fn spawn_vcpus(
+    machine: &Machine,
+    num_cpus: u32,
+    api_version: u32,
+    log: &Logger,
+) -> (
+    mpsc::Receiver<vcpu_tasks::VcpuEvent>,
+    Vec<JoinHandle<()>>,
+    Vec<Arc<vmm_devices::metrics::VcpuMetrics>>,
+) {
     info!(log, "starting vCPU threads");
 
     // Create per-vCPU metrics
@@ -644,74 +834,92 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         log,
     );
 
-    // After migration: inject timer interrupt to restart the scheduler tick.
-    // In nohz/tickless mode the LAPIC timer was stopped when the guest went
-    // idle. timer_fire_when=0 means vlapic_resume() won't arm a callout.
-    // We inject LOCAL_TIMER_VECTOR directly into the LAPIC after the vCPU
-    // thread has started and entered VM_RUN/HLT.
-    if cli.migrate_listen.is_some() {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        for vcpu in machine.vcpus() {
-            match machine.hdl().lapic_irq(vcpu.id(), 0xEC) {
-                Ok(()) => info!(log, "post-migration timer kick"; "vcpu" => vcpu.id()),
-                Err(e) => warn!(log, "timer kick failed"; "vcpu" => vcpu.id(), "error" => %e),
-            }
+    (event_rx, handles, vcpu_metrics)
+}
+
+/// After migration, inject a timer interrupt to restart the scheduler tick
+/// in the guest (nohz/tickless mode workaround).
+fn post_migration_timer_kick(machine: &Machine, log: &Logger) {
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    for vcpu in machine.vcpus() {
+        match machine.hdl().lapic_irq(vcpu.id(), 0xEC) {
+            Ok(()) => info!(log, "post-migration timer kick"; "vcpu" => vcpu.id()),
+            Err(e) => warn!(log, "timer kick failed"; "vcpu" => vcpu.id(), "error" => %e),
         }
     }
+}
 
-    // Spawn control socket if --control-socket was specified
-    let control_cleanup = if let Some(ref sock_path) = cli.control_socket {
-        let ctrl = control::VmController::new(
-            machine.hdl().clone(),
-            machine.physmap().clone(),
-            cli.vm_name.clone(),
-            num_cpus,
-            mem_size,
-            vcpu_metrics.clone(),
-        );
-        match control::spawn_control_thread(sock_path, ctrl, log.clone()) {
-            Ok((_handle, path)) => {
-                info!(log, "control socket listening"; "path" => path.display().to_string());
-                Some(path)
-            }
-            Err(e) => {
-                error!(log, "failed to start control socket"; "error" => %e);
-                None
-            }
+/// Optionally spawn the control socket listener thread.
+fn spawn_control_socket(
+    machine: &Machine,
+    cli: &Cli,
+    num_cpus: u32,
+    mem_size: usize,
+    vcpu_metrics: &[Arc<vmm_devices::metrics::VcpuMetrics>],
+    devices: Vec<Arc<dyn vmm_devices::Lifecycle>>,
+    log: &Logger,
+) -> Option<PathBuf> {
+    let sock_path = cli.control_socket.as_ref()?;
+    let ctrl = control::VmController::new(
+        machine.hdl().clone(),
+        machine.physmap().clone(),
+        cli.vm_name.clone(),
+        num_cpus,
+        mem_size,
+        vcpu_metrics.to_vec(),
+        devices,
+        log.clone(),
+    );
+    match control::spawn_control_thread(sock_path, ctrl, log.clone()) {
+        Ok((_handle, path)) => {
+            info!(log, "control socket listening"; "path" => path.display().to_string());
+            Some(path)
         }
-    } else {
-        None
+        Err(e) => {
+            error!(log, "failed to start control socket"; "error" => %e);
+            None
+        }
+    }
+}
+
+/// Install the SIGTERM signal handler and spawn a poller thread that
+/// triggers ACPI poweroff when the signal is received.
+fn install_sigterm_handler(machine: &Machine, log: &Logger) {
+    let log_sig = log.clone();
+    // libc::signal returns SIG_ERR on failure; safe to ignore
+    let _ = unsafe {
+        libc::signal(libc::SIGTERM, sigterm_handler as libc::sighandler_t)
     };
-
-    // Set up SIGTERM handler for clean shutdown.
-    // When zoneadmd sends SIGTERM, trigger ACPI poweroff so the guest
-    // can shut down gracefully.
-    {
-        let hdl_sig = machine.hdl().clone();
-        let log_sig = log.clone();
-        let _ = unsafe {
-            libc::signal(libc::SIGTERM, sigterm_handler as libc::sighandler_t)
-        };
-        // Spawn a thread to wait for the signal flag
-        let hdl_sig2 = hdl_sig.clone();
-        thread::Builder::new()
-            .name("sigterm-handler".into())
-            .spawn(move || {
-                loop {
-                    thread::sleep(std::time::Duration::from_millis(500));
-                    if SIGTERM_RECEIVED.load(std::sync::atomic::Ordering::Relaxed) {
-                        info!(log_sig, "SIGTERM received, triggering ACPI poweroff");
-                        let _ = hdl_sig2.suspend(
-                            bhyve_api::vm_suspend_how::VM_SUSPEND_POWEROFF as u32,
-                            0,
-                        );
-                        break;
-                    }
+    // Spawn a thread to wait for the signal flag
+    let hdl_sig = machine.hdl().clone();
+    thread::Builder::new()
+        .name("sigterm-handler".into())
+        .spawn(move || {
+            loop {
+                thread::sleep(std::time::Duration::from_millis(500));
+                if SIGTERM_RECEIVED.load(std::sync::atomic::Ordering::Relaxed) {
+                    info!(log_sig, "SIGTERM received, triggering ACPI poweroff");
+                    // best-effort: if suspend fails, VM is already gone
+                    let _ = hdl_sig.suspend(
+                        bhyve_api::vm_suspend_how::VM_SUSPEND_POWEROFF as u32,
+                        0,
+                    );
+                    break;
                 }
-            })
-            .expect("failed to spawn sigterm handler thread");
-    }
+            }
+        })
+        .expect("failed to spawn sigterm handler thread");
+}
 
+/// Wait for vCPU events, join all threads, clean up control socket and
+/// destroy the VM.
+fn run_event_loop(
+    machine: &Machine,
+    event_rx: mpsc::Receiver<vcpu_tasks::VcpuEvent>,
+    handles: Vec<JoinHandle<()>>,
+    control_cleanup: Option<PathBuf>,
+    log: &Logger,
+) {
     // Wait for the first vCPU event
     match event_rx.recv() {
         Ok(vcpu_tasks::VcpuEvent::Suspended { vcpu_id, kind }) => {
@@ -733,10 +941,11 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
 
     // Wait for all vCPU threads to finish
     for handle in handles {
+        // thread panic is non-recoverable at this point
         let _ = handle.join();
     }
 
-    // Clean up control socket
+    // Clean up control socket (best-effort; may already be removed)
     if let Some(ref path) = control_cleanup {
         let _ = std::fs::remove_file(path);
     }
@@ -747,6 +956,66 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     }
 
     info!(log, "VM shutdown complete");
+}
+
+fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
+    // Phase 1: Create VM, load bootrom/kernel, finalize memory
+    let creation = create_machine(&cli, log)?;
+    let MachineCreation {
+        machine,
+        api_version,
+        num_cpus,
+        mem_size,
+        kernel_image,
+        initrd_image,
+    } = creation;
+
+    // Phase 2: Initialize chipset and kernel-emulated devices
+    let chipset_devs = init_chipset(&machine, log)?;
+
+    // Phase 3: Timers, PM, pvpanic
+    let _timer_pm_devs = setup_timers_and_pm(&machine, log)?;
+
+    // Phase 4: Serial ports and mdata agent
+    let (_com1, _com2) = setup_serial(&machine, &chipset_devs.pic, &cli, log);
+
+    // Phase 5: fw_cfg, ACPI tables, SMBIOS, E820, boot order
+    let _fwcfg = setup_fwcfg_and_acpi(&machine, &cli, num_cpus, mem_size, log);
+
+    // Phase 6: PCI devices
+    let (_pci_devices, lifecycle_devices) = init_pci_devices(&machine, &chipset_devs.chipset, &cli, log)?;
+
+    // Phase 7: Direct boot kernel loading (after ACPI tables are ready)
+    load_direct_boot_kernel(&machine, &cli, &kernel_image, &initrd_image, mem_size, log)?;
+
+    // Phase 8: vCPU activation (migration or normal)
+    if let Some(ref listen_addr) = cli.migrate_listen {
+        run_migration_destination(&machine, listen_addr, num_cpus, mem_size, log)?;
+    } else {
+        activate_vcpus(&machine, &cli, &kernel_image, log)?;
+    }
+
+    // Phase 9: Spawn vCPU threads
+    let (event_rx, handles, vcpu_metrics) = spawn_vcpus(
+        &machine, num_cpus, api_version, log,
+    );
+
+    // Phase 10: Post-migration timer kick
+    if cli.migrate_listen.is_some() {
+        post_migration_timer_kick(&machine, log);
+    }
+
+    // Phase 11: Control socket
+    let control_cleanup = spawn_control_socket(
+        &machine, &cli, num_cpus, mem_size, &vcpu_metrics, lifecycle_devices, log,
+    );
+
+    // Phase 12: Signal handling
+    install_sigterm_handler(&machine, log);
+
+    // Phase 13: Main event loop and cleanup
+    run_event_loop(&machine, event_rx, handles, control_cleanup, log);
+
     Ok(())
 }
 
@@ -760,6 +1029,8 @@ fn create_virtio_blk_device(
     chipset: &I440FxChipset,
     physmap: &Arc<vmm_core::mem::PhysMap>,
     bus_pio: &Arc<vmm_core::pio::PioBus>,
+    bus_mmio: &Arc<vmm_core::mmio::MmioBus>,
+    vmm_hdl: &Arc<vmm_core::hdl::VmmHdl>,
 ) -> anyhow::Result<Arc<VirtioPciDevice<VirtioBlock>>> {
     let (path, mut opts) = parse_blk_config(config);
     if read_only_override {
@@ -772,30 +1043,38 @@ fn create_virtio_blk_device(
         .write(!opts.read_only)
         .open(path)
         .with_context(|| format!("failed to open disk: {}", path))?;
-    let blk = VirtioBlock::new(file, &opts, Arc::clone(physmap))
+    let num_queues: u16 = 1;
+    let blk = VirtioBlock::new(file, &opts, Arc::clone(physmap), num_queues)
         .with_context(|| format!("failed to create virtio-blk for: {}", path))?;
 
     let lintr = chipset.route_lintr(&bdf);
     let cfg_size = blk.config_size();
     let blk_intr = Arc::clone(&blk.interrupt);
 
+    // MSI-X: one vector per queue + one for config change
+    let num_msix_vectors = num_queues + 1;
+    let msix = Arc::new(MsixTable::new(num_msix_vectors, Arc::clone(vmm_hdl)));
+
     let pci_dev = VirtioPciDevice::new(
         blk,
         vmm_devices::virtio::bits::VIRTIO_DEV_TYPE_BLOCK,
-        1,    // 1 queue for block
+        num_queues as usize,
         128,  // queue size
         cfg_size,
         lintr,
         Arc::clone(physmap),
         Arc::clone(bus_pio),
+        Arc::clone(bus_mmio),
+        Some(msix),
     );
 
-    // Wire interrupt: workers call this after pushing used ring
+    // Wire interrupt: workers call raise_queue_interrupt_for() to
+    // route via MSI-X vector when enabled, fallback to legacy INTx.
     {
         let pci_weak = Arc::downgrade(&pci_dev);
         *blk_intr.lock().expect("lock") = Some(Arc::new(move || {
             if let Some(dev) = pci_weak.upgrade() {
-                dev.raise_queue_interrupt();
+                dev.raise_queue_interrupt_for(0);
             }
         }));
     }
@@ -818,7 +1097,7 @@ fn parse_and_create_pci_device(
     physmap: &Arc<vmm_core::mem::PhysMap>,
     vmm_hdl: &Arc<vmm_core::hdl::VmmHdl>,
     log: &Logger,
-) -> anyhow::Result<Option<Arc<dyn vmm_devices::pci::PciDevice>>> {
+) -> anyhow::Result<(Option<Arc<dyn vmm_devices::pci::PciDevice>>, Option<Arc<dyn vmm_devices::Lifecycle>>)> {
     let parts: Vec<&str> = spec.splitn(3, ',').collect();
     if parts.len() < 2 {
         anyhow::bail!("invalid PCI slot spec '{}': need slot,driver[,config]", spec);
@@ -835,14 +1114,14 @@ fn parse_and_create_pci_device(
                 anyhow::bail!("virtio-blk requires a disk path");
             }
             let pci_dev = create_virtio_blk_device(
-                config, bdf, false, chipset, physmap, bus_pio,
+                config, bdf, false, chipset, physmap, bus_pio, bus_mmio, vmm_hdl,
             )?;
             info!(log, "virtio-blk attached";
                 "bdf" => %bdf,
                 "path" => config,
-                "pirq" => "via chipset",
+                "msix" => "2 vectors",
             );
-            Ok(Some(pci_dev))
+            Ok((Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>), Some(pci_dev as Arc<dyn vmm_devices::Lifecycle>)))
         }
         "virtio-net-viona" => {
             if config.is_empty() {
@@ -869,22 +1148,30 @@ fn parse_and_create_pci_device(
                     .with_context(|| format!("failed to set promiscphys on {}", vnic_name))?;
             }
 
+            // MSI-X: one vector per queue (rx + tx) + config change
+            let num_viona_queues = vmm_devices::virtio::viona::NET_NUM_QUEUES as u16;
+            let msix = Arc::new(MsixTable::new(
+                num_viona_queues + 1,
+                Arc::clone(vmm_hdl),
+            ));
+
             // Start interrupt polling BEFORE moving viona into PCI device.
-            // The polling thread needs the viona fd, and we pass a callback
-            // that will raise the PCI interrupt when viona completes I/O.
-            // We use a Mutex<Option<Weak>> to defer the PCI device reference
-            // until after construction.
+            // The polling thread needs the viona fd, and we pass a per-queue
+            // callback that routes via the correct MSI-X vector.
             let intr_hook: Arc<std::sync::Mutex<Option<std::sync::Weak<VirtioPciDevice<VirtioViona>>>>> =
                 Arc::new(std::sync::Mutex::new(None));
             let hook_clone = Arc::clone(&intr_hook);
-            let raise_fn: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let raise_fn: Arc<dyn Fn(u16) + Send + Sync> = Arc::new(move |queue_idx: u16| {
                 if let Some(weak) = hook_clone.lock().ok().and_then(|g| g.clone()) {
                     if let Some(dev) = weak.upgrade() {
-                        dev.raise_queue_interrupt();
+                        dev.raise_queue_interrupt_for(queue_idx);
                     }
                 }
             });
-            viona.start_intr_poll(raise_fn);
+            viona.start_intr_poll(
+                raise_fn,
+                log.new(slog::o!("component" => "viona-intr")),
+            );
 
             let lintr = chipset.route_lintr(&bdf);
 
@@ -897,6 +1184,8 @@ fn parse_and_create_pci_device(
                 lintr,
                 Arc::clone(physmap),
                 Arc::clone(bus_pio),
+                Arc::clone(bus_mmio),
+                Some(msix),
             );
 
             // Now wire up the interrupt hook with a weak reference
@@ -909,8 +1198,9 @@ fn parse_and_create_pci_device(
                 "bdf" => %bdf,
                 "vnic" => vnic_name,
                 "promiscphys" => promiscphys,
+                "msix" => "3 vectors",
             );
-            Ok(Some(pci_dev))
+            Ok((Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>), Some(pci_dev as Arc<dyn vmm_devices::Lifecycle>)))
         }
         "nvme" => {
             if config.is_empty() {
@@ -938,11 +1228,13 @@ fn parse_and_create_pci_device(
                 "bdf" => %bdf,
                 "path" => path,
             );
-            Ok(Some(nvme))
+            Ok((Some(nvme.clone() as Arc<dyn vmm_devices::pci::PciDevice>), Some(nvme as Arc<dyn vmm_devices::Lifecycle>)))
         }
         "virtio-rnd" => {
             let rng = vmm_devices::virtio::VirtioRng::new();
             let lintr = chipset.route_lintr(&bdf);
+            // MSI-X: 1 queue + config change = 2 vectors
+            let msix = Arc::new(MsixTable::new(2, Arc::clone(vmm_hdl)));
             let pci_dev = VirtioPciDevice::new(
                 rng,
                 vmm_devices::virtio::bits::VIRTIO_DEV_TYPE_RNG,
@@ -952,10 +1244,12 @@ fn parse_and_create_pci_device(
                 lintr,
                 Arc::clone(physmap),
                 Arc::clone(bus_pio),
+                Arc::clone(bus_mmio),
+                Some(msix),
             );
             chipset.attach_device(bdf, pci_dev.clone());
-            info!(log, "virtio-rnd attached"; "bdf" => %bdf);
-            Ok(Some(pci_dev))
+            info!(log, "virtio-rnd attached"; "bdf" => %bdf, "msix" => "2 vectors");
+            Ok((Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>), Some(pci_dev as Arc<dyn vmm_devices::Lifecycle>)))
         }
         "fbuf" => {
             // Parse config: vga=off,unix=/path[,password=pwd][,w=N][,h=N]
@@ -982,6 +1276,7 @@ fn parse_and_create_pci_device(
                 &vnc_path,
                 vnc_password,
                 Arc::clone(bus_mmio),
+                log.new(slog::o!("component" => "fbuf")),
             );
             chipset.attach_device(bdf, fbuf.clone());
             info!(log, "fbuf attached";
@@ -989,7 +1284,7 @@ fn parse_and_create_pci_device(
                 "vnc" => vnc_path.display().to_string(),
                 "resolution" => format!("{}x{}", width, height),
             );
-            Ok(Some(fbuf))
+            Ok((Some(fbuf.clone() as Arc<dyn vmm_devices::pci::PciDevice>), Some(fbuf as Arc<dyn vmm_devices::Lifecycle>)))
         }
         "xhci" => {
             // xHCI USB controller with tablet device
@@ -1003,7 +1298,7 @@ fn parse_and_create_pci_device(
             );
             chipset.attach_device(bdf, xhci.clone());
             info!(log, "xhci tablet attached"; "bdf" => %bdf);
-            Ok(Some(xhci))
+            Ok((Some(xhci.clone() as Arc<dyn vmm_devices::pci::PciDevice>), Some(xhci as Arc<dyn vmm_devices::Lifecycle>)))
         }
         "passthru" => {
             if config.is_empty() {
@@ -1020,7 +1315,7 @@ fn parse_and_create_pci_device(
                 "bdf" => %bdf,
                 "path" => path,
             );
-            Ok(Some(dev))
+            Ok((Some(dev as Arc<dyn vmm_devices::pci::PciDevice>), None))
         }
         "ahci-cd" | "ahci-hd" => {
             anyhow::bail!(
@@ -1030,18 +1325,18 @@ fn parse_and_create_pci_device(
         }
         "hostbridge" => {
             // Already created by chipset, skip
-            Ok(None)
+            Ok((None, None))
         }
         "lpc" => {
             // Already created by chipset, skip
-            Ok(None)
+            Ok((None, None))
         }
         other => {
             warn!(log, "unknown PCI driver, skipping";
                 "driver" => other,
                 "bdf" => %bdf,
             );
-            Ok(None)
+            Ok((None, None))
         }
     }
 }
@@ -1114,6 +1409,7 @@ fn find_lpc_device(lpc_args: &[String], device: &str) -> Option<String> {
 ///
 /// Supports:
 /// - `stdio` or absent → stdout/stdin
+/// - `socket,/path` → Unix domain socket (host metadata agent connects)
 /// - `/dev/zconsole` or any path → open as read/write device
 fn setup_serial_io(
     uart: &Arc<LpcUart>,
@@ -1124,14 +1420,20 @@ fn setup_serial_io(
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd};
 
-    // Strip "socket," prefix (boot.c passes "-l com2,socket,/tmp/vm.ttyb")
-    let config = config.map(|c| c.strip_prefix("socket,").unwrap_or(c));
+    // Handle "socket,/path" — create a Unix domain socket listener
+    // that the host-side metadata agent connects to.
+    if let Some(path) = config.and_then(|c| c.strip_prefix("socket,")) {
+        setup_serial_socket(uart, path, name, log);
+        return;
+    }
 
     match config {
         None | Some("stdio") => {
             // stdout for TX, stdin for RX
             uart.set_tx_sink(Box::new(|b: u8| {
-                let _ = std::io::stdout().write_all(&[b]);
+                if let Err(e) = std::io::stdout().write_all(&[b]) {
+                    eprintln!("[serial] stdout write error: {}", e);
+                }
                 let _ = std::io::stdout().flush();
             }));
 
@@ -1170,7 +1472,9 @@ fn setup_serial_io(
                     });
                     uart.set_tx_sink(Box::new(move |b: u8| {
                         if let Ok(mut f) = write_file.lock() {
-                            let _ = f.write_all(&[b]);
+                            if let Err(e) = f.write_all(&[b]) {
+                                eprintln!("[serial] device write error: {}", e);
+                            }
                         }
                     }));
 
@@ -1204,6 +1508,95 @@ fn setup_serial_io(
     }
 }
 
+/// Set up a Unix domain socket backend for a COM port.
+///
+/// Creates a listening socket at `path`, accepts one connection at a
+/// time, and bridges it to the UART. The host-side metadata agent
+/// connects to this socket to serve the SmartOS metadata protocol
+/// (sdc:nics, SSH keys, etc.) to the guest via COM2.
+fn setup_serial_socket(
+    uart: &Arc<LpcUart>,
+    path: &str,
+    name: &str,
+    log: &Logger,
+) {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    // Remove stale socket from a previous run
+    let _ = std::fs::remove_file(path);
+
+    let listener = match UnixListener::bind(path) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(log, "failed to bind {name} socket";
+                "path" => path, "error" => %e);
+            return;
+        }
+    };
+    info!(log, "{name} socket listening"; "path" => path);
+
+    // TX: buffer writes until a client connects. Use a shared
+    // optional stream protected by a mutex.
+    let tx_stream: Arc<std::sync::Mutex<Option<std::os::unix::net::UnixStream>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let tx_clone = Arc::clone(&tx_stream);
+    uart.set_tx_sink(Box::new(move |b: u8| {
+        if let Ok(guard) = tx_clone.lock() {
+            if let Some(ref stream) = *guard {
+                // best-effort write; drop bytes if client disconnected
+                let _ = (&*stream).write_all(&[b]);
+            }
+        }
+    }));
+
+    // Accept loop: each connection gets bridged to the UART.
+    // When a client disconnects, wait for the next one.
+    let uart_rx = uart.clone();
+    let tx_accept = Arc::clone(&tx_stream);
+    let name_owned = name.to_string();
+    let log_clone = log.clone();
+    thread::Builder::new()
+        .name(format!("{name}-socket"))
+        .spawn(move || {
+            for conn in listener.incoming() {
+                match conn {
+                    Ok(stream) => {
+                        info!(log_clone, "{name_owned} client connected");
+                        // Install this stream for TX
+                        if let Ok(mut guard) = tx_accept.lock() {
+                            *guard = stream.try_clone().ok();
+                        }
+                        // RX: read from client → UART input
+                        let mut reader = stream;
+                        let mut buf = [0u8; 64];
+                        loop {
+                            match reader.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    for &b in &buf[..n] {
+                                        uart_rx.input_byte(b);
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        info!(log_clone, "{name_owned} client disconnected");
+                        // Clear TX stream so bytes are dropped until next client
+                        if let Ok(mut guard) = tx_accept.lock() {
+                            *guard = None;
+                        }
+                    }
+                    Err(e) => {
+                        slog::warn!(log_clone, "{name_owned} accept error";
+                            "error" => %e);
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn serial socket thread");
+}
+
 /// Version string including git commit hash (set by build.rs).
 fn version_string() -> String {
     let version = env!("CARGO_PKG_VERSION");
@@ -1220,8 +1613,11 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Register USDT probes before any device setup
-    usdt::register_probes().expect("failed to register USDT probes");
+    // Register USDT probes before any device setup.
+    // Non-fatal: /dev/dtrace/helper may not exist inside zones.
+    if let Err(e) = usdt::register_probes() {
+        eprintln!("[vmm] USDT probe registration skipped: {e}");
+    }
 
     let cli = Cli::parse();
     let log = setup_logger();

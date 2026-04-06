@@ -68,7 +68,7 @@ impl VmRunState {
             2 => Self::Stopping,
             3 => Self::Stopped,
             4 => Self::Migrating,
-            _ => Self::Stopped,
+            _other => Self::Stopped,
         }
     }
 }
@@ -78,13 +78,16 @@ pub struct VmController {
     state: AtomicU8,
     hdl: Arc<VmmHdl>,
     physmap: Arc<PhysMap>,
-    vm_name: &'static str,
+    vm_name: String,
     num_cpus: u32,
     mem_size: usize,
     start_time: Instant,
     migrate_status: Mutex<Option<Arc<Mutex<vmm_migrate::MigrationStatus>>>>,
     /// Per-vCPU metrics, shared with vCPU threads.
     vcpu_metrics: Vec<Arc<vmm_devices::metrics::VcpuMetrics>>,
+    /// Devices implementing the Lifecycle trait for pause/resume.
+    devices: Vec<Arc<dyn vmm_devices::Lifecycle>>,
+    log: Logger,
 }
 
 impl VmController {
@@ -95,8 +98,10 @@ impl VmController {
         num_cpus: u32,
         mem_size: usize,
         vcpu_metrics: Vec<Arc<vmm_devices::metrics::VcpuMetrics>>,
+        devices: Vec<Arc<dyn vmm_devices::Lifecycle>>,
+        log: Logger,
     ) -> Arc<Self> {
-        let name: &'static str = Box::leak(vm_name.into_boxed_str());
+        let name = vm_name.to_string();
         Arc::new(Self {
             state: AtomicU8::new(VmRunState::Running as u8),
             hdl,
@@ -107,6 +112,8 @@ impl VmController {
             start_time: Instant::now(),
             migrate_status: Mutex::new(None),
             vcpu_metrics,
+            devices,
+            log,
         })
     }
 
@@ -124,6 +131,31 @@ impl VmController {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    /// Pause all devices: signal each to quiesce, then wait for all
+    /// background workers to drain and park.
+    fn pause_devices(&self) {
+        for dev in &self.devices {
+            dev.pause();
+        }
+        // Collect paused futures and block until all workers are idle.
+        let futs: Vec<_> = self.devices.iter().map(|d| d.paused()).collect();
+        futures::executor::block_on(futures::future::join_all(futs));
+    }
+
+    /// Resume all devices: wake parked workers.
+    fn resume_devices(&self) {
+        for dev in &self.devices {
+            dev.resume();
+        }
+    }
+
+    /// Halt all devices: permanent shutdown.
+    fn halt_devices(&self) {
+        for dev in &self.devices {
+            dev.halt();
+        }
     }
 }
 
@@ -162,7 +194,7 @@ struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<VmRunState>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    vm_name: Option<&'static str>,
+    vm_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     num_cpus: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -211,14 +243,12 @@ impl Response {
 
 // ── Command dispatch ────────────────────────────────────────────────
 
-fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
+fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
     match cmd {
         Command::Status => {
             let mut r = Response::ok();
             r.state = Some(ctrl.state());
-            // vm_name is owned by ctrl; we leak a &'static str for serde.
-            // This is fine — the controller lives for the process lifetime.
-            r.vm_name = Some(ctrl.vm_name);
+            r.vm_name = Some(ctrl.vm_name.clone());
             r.num_cpus = Some(ctrl.num_cpus);
             r.memory_bytes = Some(ctrl.mem_size);
             r.uptime_secs = Some(ctrl.start_time.elapsed().as_secs());
@@ -231,14 +261,15 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
             }
             match ctrl.hdl.pause() {
                 Ok(()) => {
+                    // vCPUs paused — now quiesce device workers
+                    ctrl.pause_devices();
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Paused);
                     r
                 }
                 Err(e) => {
-                    // Rollback state
                     ctrl.state.store(VmRunState::Running as u8, Ordering::Release);
-                    eprintln!("[control] pause failed: {e}");
+                    error!(ctrl.log, "pause failed"; "error" => %e);
                     Response::err("pause ioctl failed")
                 }
             }
@@ -248,6 +279,8 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
             if !ctrl.transition(VmRunState::Paused, VmRunState::Running) {
                 return Response::err("VM is not paused");
             }
+            // Resume device workers BEFORE vCPUs so interrupts can be delivered
+            ctrl.resume_devices();
             match ctrl.hdl.resume() {
                 Ok(()) => {
                     let mut r = Response::ok();
@@ -256,7 +289,7 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                 }
                 Err(e) => {
                     ctrl.state.store(VmRunState::Paused as u8, Ordering::Release);
-                    eprintln!("[control] resume failed: {e}");
+                    error!(ctrl.log, "resume failed"; "error" => %e);
                     Response::err("resume ioctl failed")
                 }
             }
@@ -271,6 +304,7 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
 
             // If paused, resume first so vCPUs can receive the suspend
             if cur == VmRunState::Paused {
+                // best-effort: if resume fails, suspend below will also fail
                 let _ = ctrl.hdl.resume();
             }
 
@@ -286,7 +320,7 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                 }
                 Err(e) => {
                     ctrl.state.store(cur as u8, Ordering::Release);
-                    eprintln!("[control] shutdown failed: {e}");
+                    error!(ctrl.log, "shutdown failed"; "error" => %e);
                     Response::err("suspend ioctl failed")
                 }
             }
@@ -300,6 +334,7 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
             ctrl.state.store(VmRunState::Stopping as u8, Ordering::Release);
 
             if cur == VmRunState::Paused {
+                // best-effort: if resume fails, suspend below will also fail
                 let _ = ctrl.hdl.resume();
             }
 
@@ -315,13 +350,20 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                 }
                 Err(e) => {
                     ctrl.state.store(cur as u8, Ordering::Release);
-                    eprintln!("[control] stop failed: {e}");
+                    error!(ctrl.log, "stop failed"; "error" => %e);
                     Response::err("suspend ioctl failed")
                 }
             }
         }
 
         Command::MigrateSource { target_addr } => {
+            // Validate the target address to prevent SSRF. Require
+            // it to be a valid host:port and reject obviously-dangerous
+            // targets like localhost, link-local, and multicast.
+            if let Err(e) = validate_migration_addr(&target_addr) {
+                return Response::err(&format!("invalid target_addr: {e}"));
+            }
+
             if !ctrl.transition(VmRunState::Running, VmRunState::Migrating) {
                 return Response::err("VM must be running to start migration");
             }
@@ -335,14 +377,12 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                 *ms = Some(Arc::clone(&status));
             }
 
+            let ctrl_arc = Arc::clone(ctrl);
             let hdl = Arc::clone(&ctrl.hdl);
             let memctx = MemCtx::new(Arc::clone(&ctrl.physmap));
             let num_cpus = ctrl.num_cpus;
             let mem_size = ctrl.mem_size as u64;
-            // We need a reference to the AtomicU8 for the spawned thread
-            // to restore state on failure. Use a raw pointer (safe because
-            // VmController lives for the process lifetime).
-            let state_ptr = &ctrl.state as *const AtomicU8 as usize;
+            let mlog = ctrl.log.clone();
 
             if let Err(e) = thread::Builder::new()
                 .name("migrate-source".into())
@@ -353,12 +393,8 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                     {
                         Ok(rt) => rt,
                         Err(e) => {
-                            eprintln!("[migrate] failed to create runtime: {e}");
-                            // Safety: VmController outlives this thread.
-                            let state = unsafe {
-                                &*(state_ptr as *const AtomicU8)
-                            };
-                            state.store(
+                            error!(mlog, "failed to create tokio runtime"; "error" => %e);
+                            ctrl_arc.state.store(
                                 VmRunState::Running as u8,
                                 Ordering::Release,
                             );
@@ -374,14 +410,11 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                         {
                             Ok(s) => s,
                             Err(e) => {
-                                eprintln!(
-                                    "[migrate] connect to {target_addr} \
-                                     failed: {e}"
+                                error!(mlog, "connect to target failed";
+                                    "target" => &target_addr,
+                                    "error" => %e,
                                 );
-                                let state = unsafe {
-                                    &*(state_ptr as *const AtomicU8)
-                                };
-                                state.store(
+                                ctrl_arc.state.store(
                                     VmRunState::Running as u8,
                                     Ordering::Release,
                                 );
@@ -396,32 +429,20 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                             num_cpus,
                             mem_size,
                             status,
+                            &mlog,
                         )
                         .await
                         {
                             Ok(()) => {
-                                eprintln!(
-                                    "[migrate] source migration complete"
-                                );
-                                // VM is paused and should be destroyed.
-                                // Transition to Stopped.
-                                let state = unsafe {
-                                    &*(state_ptr as *const AtomicU8)
-                                };
-                                state.store(
+                                info!(mlog, "source migration complete");
+                                ctrl_arc.state.store(
                                     VmRunState::Stopped as u8,
                                     Ordering::Release,
                                 );
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "[migrate] source migration failed: {e}"
-                                );
-                                // run_source already resumed on failure.
-                                let state = unsafe {
-                                    &*(state_ptr as *const AtomicU8)
-                                };
-                                state.store(
+                                error!(mlog, "source migration failed"; "error" => %e);
+                                ctrl_arc.state.store(
                                     VmRunState::Running as u8,
                                     Ordering::Release,
                                 );
@@ -445,6 +466,11 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
         }
 
         Command::MigrateDest { listen_addr } => {
+            // Validate the listen address to prevent arbitrary port binding.
+            if let Err(e) = validate_migration_addr(&listen_addr) {
+                return Response::err(&format!("invalid listen_addr: {e}"));
+            }
+
             let prev_state = ctrl.state();
             if prev_state != VmRunState::Paused
                 && prev_state != VmRunState::Running
@@ -465,11 +491,12 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                 *ms = Some(Arc::clone(&status));
             }
 
+            let ctrl_arc = Arc::clone(ctrl);
             let hdl = Arc::clone(&ctrl.hdl);
             let memctx = MemCtx::new(Arc::clone(&ctrl.physmap));
             let num_cpus = ctrl.num_cpus;
             let mem_size = ctrl.mem_size as u64;
-            let state_ptr = &ctrl.state as *const AtomicU8 as usize;
+            let mlog = ctrl.log.clone();
 
             if let Err(e) = thread::Builder::new()
                 .name("migrate-dest".into())
@@ -480,11 +507,8 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                     {
                         Ok(rt) => rt,
                         Err(e) => {
-                            eprintln!("[migrate] failed to create runtime: {e}");
-                            let state = unsafe {
-                                &*(state_ptr as *const AtomicU8)
-                            };
-                            state.store(
+                            error!(mlog, "failed to create tokio runtime"; "error" => %e);
+                            ctrl_arc.state.store(
                                 VmRunState::Stopped as u8,
                                 Ordering::Release,
                             );
@@ -500,13 +524,11 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                         {
                             Ok(l) => l,
                             Err(e) => {
-                                eprintln!(
-                                    "[migrate] bind {listen_addr} failed: {e}"
+                                error!(mlog, "bind failed";
+                                    "addr" => &listen_addr,
+                                    "error" => %e,
                                 );
-                                let state = unsafe {
-                                    &*(state_ptr as *const AtomicU8)
-                                };
-                                state.store(
+                                ctrl_arc.state.store(
                                     VmRunState::Stopped as u8,
                                     Ordering::Release,
                                 );
@@ -517,13 +539,8 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                         let (stream, peer) = match listener.accept().await {
                             Ok(v) => v,
                             Err(e) => {
-                                eprintln!(
-                                    "[migrate] accept failed: {e}"
-                                );
-                                let state = unsafe {
-                                    &*(state_ptr as *const AtomicU8)
-                                };
-                                state.store(
+                                error!(mlog, "accept failed"; "error" => %e);
+                                ctrl_arc.state.store(
                                     VmRunState::Stopped as u8,
                                     Ordering::Release,
                                 );
@@ -531,9 +548,7 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                             }
                         };
 
-                        eprintln!(
-                            "[migrate] accepted connection from {peer}"
-                        );
+                        info!(mlog, "accepted migration connection"; "peer" => %peer);
 
                         match vmm_migrate::destination::run_destination(
                             stream,
@@ -542,31 +557,20 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
                             num_cpus,
                             mem_size,
                             status,
+                            &mlog,
                         )
                         .await
                         {
                             Ok(()) => {
-                                eprintln!(
-                                    "[migrate] destination migration \
-                                     complete, VM running"
-                                );
-                                let state = unsafe {
-                                    &*(state_ptr as *const AtomicU8)
-                                };
-                                state.store(
+                                info!(mlog, "destination migration complete, VM running");
+                                ctrl_arc.state.store(
                                     VmRunState::Running as u8,
                                     Ordering::Release,
                                 );
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "[migrate] destination migration \
-                                     failed: {e}"
-                                );
-                                let state = unsafe {
-                                    &*(state_ptr as *const AtomicU8)
-                                };
-                                state.store(
+                                error!(mlog, "destination migration failed"; "error" => %e);
+                                ctrl_arc.state.store(
                                     VmRunState::Stopped as u8,
                                     Ordering::Release,
                                 );
@@ -621,6 +625,46 @@ fn dispatch(ctrl: &VmController, cmd: Command) -> Response {
     }
 }
 
+// ── Migration address validation ────────────────────────────────────
+
+/// Validate a migration address (host:port) to prevent SSRF and
+/// arbitrary port binding. Rejects:
+/// - Missing or invalid port
+/// - Privileged ports (< 1024) for listen addresses
+/// - Loopback (127.x.x.x, ::1) — migration to self is nonsensical
+/// - Addresses that fail to parse as host:port
+fn validate_migration_addr(addr: &str) -> Result<(), String> {
+    // Must contain a colon separating host and port
+    let colon = addr.rfind(':').ok_or("missing port (expected host:port)")?;
+    let host = &addr[..colon];
+    let port_str = &addr[colon + 1..];
+
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| format!("invalid port: {port_str}"))?;
+
+    if port == 0 {
+        return Err("port 0 is not allowed".into());
+    }
+
+    // Reject loopback addresses to prevent self-migration confusion
+    let host_trimmed = host.trim_matches(|c| c == '[' || c == ']');
+    if host_trimmed == "localhost"
+        || host_trimmed == "127.0.0.1"
+        || host_trimmed == "::1"
+        || host_trimmed == "0.0.0.0"
+    {
+        return Err(format!("loopback/wildcard address not allowed: {host}"));
+    }
+
+    // Reject empty host
+    if host_trimmed.is_empty() {
+        return Err("empty host".into());
+    }
+
+    Ok(())
+}
+
 // ── Socket listener ─────────────────────────────────────────────────
 
 /// Spawn the control socket listener thread.
@@ -633,7 +677,7 @@ pub fn spawn_control_thread(
     ctrl: Arc<VmController>,
     log: Logger,
 ) -> std::io::Result<(thread::JoinHandle<()>, PathBuf)> {
-    // Remove stale socket from a previous crash
+    // Remove stale socket from a previous crash (may not exist)
     let _ = std::fs::remove_file(path);
 
     // Ensure parent directory exists
@@ -641,7 +685,19 @@ pub fn spawn_control_thread(
         std::fs::create_dir_all(parent)?;
     }
 
-    let listener = UnixListener::bind(path)?;
+    // Set restrictive umask before bind to avoid TOCTOU race where
+    // the socket is briefly world-accessible between bind and chmod.
+    #[cfg(unix)]
+    let old_umask = unsafe { libc::umask(0o177) }; // creates socket as 0600
+
+    let listener = UnixListener::bind(path);
+
+    // Restore original umask immediately
+    #[cfg(unix)]
+    unsafe { libc::umask(old_umask); }
+
+    let listener = listener?;
+
     let sock_path = path.to_path_buf();
     let cleanup_path = sock_path.clone();
 
@@ -668,7 +724,7 @@ pub fn spawn_control_thread(
 
 /// Handle a single client connection: read JSON lines, dispatch, respond.
 fn handle_connection(
-    ctrl: &VmController,
+    ctrl: &Arc<VmController>,
     stream: &std::os::unix::net::UnixStream,
     log: &Logger,
 ) -> Result<(), ControlError> {

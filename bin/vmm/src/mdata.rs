@@ -137,6 +137,7 @@ fn send_byte_paced(uart: &LpcUart, b: u8) {
         thread::sleep(std::time::Duration::from_micros(100));
     }
     // Last resort — drop the byte (guest isn't reading)
+    eprintln!("[mdata] dropped byte: retry limit exceeded");
 }
 
 /// Process a V2 framed request.
@@ -417,6 +418,9 @@ pub fn build_store_from_zone_config(
     if let Some(resolvers) = resolvers_json {
         store.set("sdc:resolvers", resolvers);
     } else {
+        // Default public resolvers used when no --resolvers flag is
+        // passed.  Acceptable for dev/test; production zones should
+        // always supply explicit resolvers via the CLI.
         store.set("sdc:resolvers", r#"["8.8.8.8","1.1.1.1"]"#);
     }
 

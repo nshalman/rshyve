@@ -16,6 +16,7 @@ vmm_migrate.workspace = true
 bhyve_api.workspace = true
 viona_api.workspace = true
 anyhow.workspace = true
+futures.workspace = true
 clap.workspace = true
 libc.workspace = true
 serde.workspace = true

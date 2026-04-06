@@ -23,6 +23,7 @@ pub mod smbios;
 pub mod uart;
 pub mod virtio;
 pub mod passthru;
+pub mod pvpanic;
 pub mod xhci;
 
 pub use lifecycle::{IndicatedState, Indicator, Lifecycle};

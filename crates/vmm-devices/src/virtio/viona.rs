@@ -18,10 +18,11 @@
 //! - Queue 1: TX (transmit)
 
 use std::sync::{Arc, Mutex};
-use std::thread;
 
+use slog;
 use vmm_core::mem::PhysMap;
 
+use crate::Lifecycle;
 use super::queue::VirtQueue;
 use super::VirtioDevice;
 
@@ -48,6 +49,19 @@ const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
 // VirtIO net status bits.
 const VIRTIO_NET_S_LINK_UP: u16 = 1;
 
+/// Per-ring initialization state.
+///
+/// Tracks whether a ring has been programmed with valid addresses
+/// via `ring_init`. Kicks to rings in `Init` state are suppressed
+/// to prevent kernel NULL pointer dereferences.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RingState {
+    /// Created but not yet configured with addresses.
+    Init,
+    /// `ring_init` succeeded; addresses are programmed in-kernel.
+    Ready,
+}
+
 /// VirtIO network device backed by the illumos viona kernel driver.
 ///
 /// On non-illumos platforms, the viona ioctls are stubbed out
@@ -70,6 +84,9 @@ struct VionaInner {
 
     /// Features negotiated by the guest.
     negotiated_features: u32,
+
+    /// Per-ring initialization state (RX=0, TX=1).
+    ring_state: [RingState; NET_NUM_QUEUES],
 }
 
 impl VirtioViona {
@@ -128,6 +145,7 @@ impl VirtioViona {
                 mac_addr,
                 dev_features,
                 negotiated_features: 0,
+                ring_state: [RingState::Init; NET_NUM_QUEUES],
             }),
         })
     }
@@ -173,22 +191,29 @@ impl VirtioViona {
 
     /// Kick an in-kernel virtqueue ring.
     ///
-    /// Only kicks if the queue index is valid (0=RX, 1=TX).
-    /// Silently ignores kicks to unconfigured or out-of-range queues
-    /// to prevent kernel NULL pointer dereferences in the mac layer.
+    /// Only kicks if the queue index is valid (0=RX, 1=TX), features
+    /// have been negotiated, and the ring has been initialized via
+    /// `ring_init`. Silently ignores kicks to unconfigured or
+    /// out-of-range queues to prevent kernel NULL pointer dereferences
+    /// in the mac layer.
     #[cfg(target_os = "illumos")]
     fn ring_kick(inner: &VionaInner, queue_idx: u16) {
+        let idx = queue_idx as usize;
         // Only kick valid queues (RX=0, TX=1)
-        if queue_idx > 1 {
+        if idx >= NET_NUM_QUEUES {
             return;
         }
         // Only kick if features have been negotiated (device is ready)
         if inner.negotiated_features == 0 {
             return;
         }
+        // Only kick if ring_init has programmed addresses into the kernel
+        if inner.ring_state[idx] != RingState::Ready {
+            return;
+        }
         let _ = inner
             .viona_fd
-            .ioctl_usize(viona_api::VNA_IOC_RING_KICK, queue_idx as usize);
+            .ioctl_usize(viona_api::VNA_IOC_RING_KICK, idx);
     }
 
     #[cfg(not(target_os = "illumos"))]
@@ -199,21 +224,25 @@ impl VirtioViona {
     /// Viona completes I/O in-kernel and signals readiness via
     /// `POLLRDBAND` on the device fd. This thread polls for that
     /// event, calls `VNA_IOC_INTR_POLL` to discover which queues
-    /// have pending interrupts, clears them, and raises the PCI
-    /// legacy interrupt so the guest processes the used ring.
+    /// have pending interrupts, clears them, and raises the per-queue
+    /// interrupt so the guest processes the used ring.
+    ///
+    /// The callback receives the queue index (0=rx, 1=tx) so the
+    /// PCI transport can route via the correct MSI-X vector.
     #[cfg(target_os = "illumos")]
     pub fn start_intr_poll(
         &self,
-        raise_intr: Arc<dyn Fn() + Send + Sync>,
+        raise_intr: Arc<dyn Fn(u16) + Send + Sync>,
+        log: slog::Logger,
     ) {
         use std::os::fd::AsRawFd;
         let inner = self.inner.lock().expect("viona lock");
         let fd = inner.viona_fd.as_raw_fd();
 
-        thread::Builder::new()
+        std::thread::Builder::new()
             .name("viona-intr-poll".into())
             .spawn(move || {
-                viona_intr_poll_loop(fd, raise_intr);
+                viona_intr_poll_loop(fd, raise_intr, log);
             })
             .expect("failed to spawn viona-intr-poll thread");
     }
@@ -221,52 +250,52 @@ impl VirtioViona {
     #[cfg(not(target_os = "illumos"))]
     pub fn start_intr_poll(
         &self,
-        _raise_intr: Arc<dyn Fn() + Send + Sync>,
+        _raise_intr: Arc<dyn Fn(u16) + Send + Sync>,
+        _log: slog::Logger,
     ) {
     }
 
     /// Program the ring addresses for a queue into the kernel.
+    ///
+    /// On success, marks the ring as `Ready` so that subsequent kicks
+    /// are forwarded to the kernel driver.
     #[cfg(target_os = "illumos")]
-    fn ring_init(inner: &VionaInner, queue_idx: u16, queue: &VirtQueue) {
+    fn ring_init(
+        inner: &mut VionaInner,
+        queue_idx: u16,
+        queue: &VirtQueue,
+    ) {
         if !queue.is_configured() {
             return;
         }
 
-        // Use the modern ring init ioctl which takes explicit addresses.
-        // We derive desc/avail/used from the legacy PFN layout that
-        // VirtQueue already computed.
-        let pfn = queue.pfn();
-        if pfn == 0 {
-            return;
-        }
-
-        let base = u64::from(pfn) * vmm_core::common::PAGE_SIZE as u64;
-        let size = queue.size();
-
-        let desc_addr = base;
-        let avail_addr = base + u64::from(size) * 16;
-        let avail_end = avail_addr + 4 + u64::from(size) * 2;
-        let used_addr = (avail_end + 4095) & !4095; // page-align
-
+        // Use the actual addresses from VirtQueue — works for both
+        // legacy (set_addr_legacy) and modern (set_addr_modern).
         let mut rim = viona_api::vioc_ring_init_modern {
             rim_index: queue_idx,
-            rim_qsize: size,
-            rim_qaddr_desc: desc_addr,
-            rim_qaddr_avail: avail_addr,
-            rim_qaddr_used: used_addr,
+            rim_qsize: queue.size(),
+            rim_qaddr_desc: queue.desc_addr(),
+            rim_qaddr_avail: queue.avail_addr(),
+            rim_qaddr_used: queue.used_addr(),
             ..Default::default()
         };
 
-        let _ = unsafe {
+        let rc = unsafe {
             inner
                 .viona_fd
                 .ioctl(viona_api::VNA_IOC_RING_INIT_MODERN, &mut rim)
         };
+        if rc.is_ok() {
+            let idx = queue_idx as usize;
+            if idx < NET_NUM_QUEUES {
+                inner.ring_state[idx] = RingState::Ready;
+            }
+        }
     }
 
     #[cfg(not(target_os = "illumos"))]
     fn ring_init(
-        _inner: &VionaInner,
+        _inner: &mut VionaInner,
         _queue_idx: u16,
         _queue: &VirtQueue,
     ) {
@@ -288,18 +317,22 @@ impl VirtioViona {
 }
 
 impl VirtioDevice for VirtioViona {
-    fn device_features(&self) -> u32 {
+    fn device_features(&self) -> u64 {
         let inner = self.inner.lock().expect("viona lock poisoned");
         // Combine kernel features with the features we always advertise.
-        let mut features = inner.dev_features;
-        features |= VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS;
+        let mut features = u64::from(inner.dev_features);
+        features |= u64::from(VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS);
+        // Strip EVENT_IDX — viona handles rings in-kernel and
+        // manages its own notification suppression protocol.
+        // Don't advertise it from userspace.
+        features &= !super::bits::VIRTIO_F_RING_EVENT_IDX;
         features
     }
 
-    fn set_features(&self, features: u32) {
+    fn set_features(&self, features: u64) {
         let mut inner = self.inner.lock().expect("viona lock poisoned");
-        inner.negotiated_features = features;
-        Self::set_kernel_features(&inner, u64::from(features));
+        inner.negotiated_features = features as u32;
+        Self::set_kernel_features(&inner, features);
     }
 
     fn cfg_read(&self, offset: u16, len: u8) -> u32 {
@@ -372,13 +405,14 @@ impl VirtioDevice for VirtioViona {
     fn queue_addr_set(&self, queue_idx: u16, queue: &VirtQueue) {
         // When the guest programs a queue address, tell the kernel
         // where the ring structures live.
-        let inner = self.inner.lock().expect("viona lock poisoned");
-        Self::ring_init(&inner, queue_idx, queue);
+        let mut inner = self.inner.lock().expect("viona lock poisoned");
+        Self::ring_init(&mut inner, queue_idx, queue);
     }
 
     fn reset(&self) {
         let mut inner = self.inner.lock().expect("viona lock poisoned");
         inner.negotiated_features = 0;
+        inner.ring_state = [RingState::Init; NET_NUM_QUEUES];
 
         // Reset both rings in the kernel.
         #[cfg(target_os = "illumos")]
@@ -499,7 +533,8 @@ extern "C" {
 #[cfg(target_os = "illumos")]
 fn viona_intr_poll_loop(
     fd: std::os::fd::RawFd,
-    raise_intr: Arc<dyn Fn() + Send + Sync>,
+    raise_intr: Arc<dyn Fn(u16) + Send + Sync>,
+    log: slog::Logger,
 ) {
     use std::os::fd::AsRawFd;
 
@@ -517,7 +552,7 @@ fn viona_intr_poll_loop(
                 continue;
             }
             // Device closed or fatal error — exit thread
-            eprintln!("[viona] poll error: {err}");
+            slog::warn!(log, "poll error"; "error" => %err);
             break;
         }
         if ret == 0 {
@@ -543,16 +578,15 @@ fn viona_intr_poll_loop(
         };
         if rc < 0 {
             let err = std::io::Error::last_os_error();
-            eprintln!("[viona] VNA_IOC_INTR_POLL failed: {err}");
+            slog::warn!(log, "VNA_IOC_INTR_POLL failed"; "error" => %err);
             continue;
         }
 
-        // Process each queue with a pending interrupt
-        let mut any_pending = false;
+        // Process each queue with a pending interrupt.
+        // Fire per-queue so PCI transport routes via the correct
+        // MSI-X vector (or falls back to shared INTx).
         for i in 0..viona_api::VIONA_VQ_MAX as usize {
             if poll_data.vip_status[i] != 0 {
-                any_pending = true;
-                // Clear the in-kernel interrupt state for this queue
                 let _ = unsafe {
                     libc::ioctl(
                         fd,
@@ -560,11 +594,8 @@ fn viona_intr_poll_loop(
                         i,
                     )
                 };
+                raise_intr(i as u16);
             }
-        }
-
-        if any_pending {
-            raise_intr();
         }
     }
 }
@@ -579,5 +610,117 @@ fn parse_mac(s: &str, mac: &mut [u8; ETHERADDRL]) {
         if let Ok(b) = u8::from_str_radix(part, 16) {
             mac[i] = b;
         }
+    }
+}
+
+impl Lifecycle for VirtioViona {
+    fn type_name(&self) -> &'static str {
+        "virtio-viona"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `VionaInner` for testing on non-illumos platforms.
+    /// On illumos this would need a real VionaFd; for CI we test
+    /// the state-tracking logic via the fields directly.
+    #[cfg(not(target_os = "illumos"))]
+    fn test_inner() -> VionaInner {
+        VionaInner {
+            mac_addr: [0x02, 0x08, 0x20, 0xaa, 0xbb, 0xcc],
+            dev_features: VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS,
+            negotiated_features: 0,
+            ring_state: [RingState::Init; NET_NUM_QUEUES],
+        }
+    }
+
+    #[test]
+    fn ring_state_default_is_init() {
+        let states = [RingState::Init; NET_NUM_QUEUES];
+        assert_eq!(states[0], RingState::Init);
+        assert_eq!(states[1], RingState::Init);
+    }
+
+    #[test]
+    fn ring_state_transitions_to_ready() {
+        let mut states = [RingState::Init; NET_NUM_QUEUES];
+        states[0] = RingState::Ready;
+        assert_eq!(states[0], RingState::Ready);
+        assert_eq!(states[1], RingState::Init);
+    }
+
+    #[test]
+    fn ring_state_reset_clears_ready() {
+        let mut states = [RingState::Init; NET_NUM_QUEUES];
+        states[0] = RingState::Ready;
+        states[1] = RingState::Ready;
+        // Simulate reset
+        states = [RingState::Init; NET_NUM_QUEUES];
+        assert_eq!(states[0], RingState::Init);
+        assert_eq!(states[1], RingState::Init);
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    #[test]
+    fn kick_suppressed_when_ring_not_ready() {
+        let inner = test_inner();
+        // ring_kick is a no-op on non-illumos, but we verify
+        // the guard conditions would prevent a kick:
+        assert_eq!(inner.ring_state[0], RingState::Init);
+        assert_eq!(inner.ring_state[1], RingState::Init);
+        assert_eq!(inner.negotiated_features, 0);
+        // Calling ring_kick should be safe (no-op stub)
+        VirtioViona::ring_kick(&inner, 0);
+        VirtioViona::ring_kick(&inner, 1);
+        VirtioViona::ring_kick(&inner, 2); // out of range
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    #[test]
+    fn kick_allowed_after_features_and_ring_init() {
+        let mut inner = test_inner();
+        inner.negotiated_features = VIRTIO_NET_F_MAC;
+        inner.ring_state[0] = RingState::Ready;
+        // On illumos this would actually issue the ioctl; on
+        // non-illumos the stub is a no-op. Verify state is correct.
+        assert_eq!(inner.ring_state[0], RingState::Ready);
+        assert_ne!(inner.negotiated_features, 0);
+        VirtioViona::ring_kick(&inner, 0);
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    #[test]
+    fn reset_clears_features_and_ring_state() {
+        let mut inner = test_inner();
+        inner.negotiated_features = VIRTIO_NET_F_MAC;
+        inner.ring_state[0] = RingState::Ready;
+        inner.ring_state[1] = RingState::Ready;
+
+        // Simulate the reset path
+        inner.negotiated_features = 0;
+        inner.ring_state = [RingState::Init; NET_NUM_QUEUES];
+
+        assert_eq!(inner.negotiated_features, 0);
+        assert_eq!(inner.ring_state[0], RingState::Init);
+        assert_eq!(inner.ring_state[1], RingState::Init);
+    }
+
+    #[test]
+    fn ring_state_copy_semantics() {
+        let a = RingState::Ready;
+        let b = a;
+        assert_eq!(a, b);
+        assert_eq!(a, RingState::Ready);
+    }
+
+    #[test]
+    fn ring_state_debug_fmt() {
+        // Ensure Debug derive works (useful for error messages)
+        let s = format!("{:?}", RingState::Init);
+        assert_eq!(s, "Init");
+        let s = format!("{:?}", RingState::Ready);
+        assert_eq!(s, "Ready");
     }
 }

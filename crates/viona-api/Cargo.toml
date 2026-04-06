@@ -9,3 +9,4 @@ doctest = false
 
 [dependencies]
 libc.workspace = true
+vmm_api_common.workspace = true

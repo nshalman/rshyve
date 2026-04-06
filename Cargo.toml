@@ -5,6 +5,7 @@ members = [
     "crates/bhyve-api",
     "crates/bhyve-api/sys",
     "crates/viona-api",
+    "crates/vmm-api-common",
     "crates/vmm-core",
     "crates/vmm-devices",
     "crates/vmm-migrate",
@@ -21,13 +22,14 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = "debuginfo"
 
 [workspace.dependencies]
 # Internal crates
 bhyve_api = { path = "crates/bhyve-api" }
 bhyve_api_sys = { path = "crates/bhyve-api/sys" }
 viona_api = { path = "crates/viona-api" }
+vmm_api_common = { path = "crates/vmm-api-common" }
 vmm_core = { path = "crates/vmm-core" }
 vmm_devices = { path = "crates/vmm-devices" }
 vmm_migrate = { path = "crates/vmm-migrate" }
@@ -45,7 +47,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 slog = "2.7"
 slog-async = "2.8"
-slog-bunyan = "2.4"
 slog-term = "2.8"
 strum = "0.26"
 thiserror = "1.0"
@@ -53,4 +54,5 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.21"
 toml = "0.8"
 uuid = { version = "1.3", features = ["v4"] }
+des = "0.8"
 erased-serde = "0.4"

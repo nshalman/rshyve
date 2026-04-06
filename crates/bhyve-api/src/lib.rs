@@ -8,7 +8,7 @@ use std::mem::{size_of, size_of_val};
 use std::os::fd::*;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use vmm_api_common::CachedVersion;
 use std::time::Duration;
 
 pub use bhyve_api_sys::*;
@@ -52,7 +52,7 @@ impl VmmCtlFd {
 
     /// Query the API version exposed by the kernel VMM.
     pub fn api_version(&self) -> Result<u32> {
-        cache_api_version(|| -> Result<u32> { self.query_api_version() })
+        VERSION_CACHE.get_or_init(|| -> Result<u32> { self.query_api_version() })
     }
 
     /// Perform the actual query of the API version
@@ -193,7 +193,7 @@ impl VmmFd {
 
     /// Query the API version exposed by the kernel VMM.
     pub fn api_version(&self) -> Result<u32> {
-        cache_api_version(|| -> Result<u32> {
+        VERSION_CACHE.get_or_init(|| -> Result<u32> {
             match self.ioctl_usize(ioctls::VMM_INTERFACE_VERSION, 0) {
                 Ok(v) => {
                     assert!(v > 0);
@@ -473,11 +473,7 @@ impl From<VmmDataError> for Error {
     }
 }
 
-/// Store a cached copy of the queried API version.  Negative values indicate an
-/// error occurred during query (and hold the corresponding negated `errno`).
-/// A positive value indicates the cached version, and should be less than
-/// `u32::MAX`.  A value of 0 indicates that no query has been performed yet.
-static VERSION_CACHE: AtomicI64 = AtomicI64::new(0);
+static VERSION_CACHE: CachedVersion = CachedVersion::new();
 
 /// Query the API version from the kernel VMM component on the system.
 ///
@@ -485,38 +481,11 @@ static VERSION_CACHE: AtomicI64 = AtomicI64::new(0);
 /// may be used at runtime in operating the virtual machine, where the delay to
 /// query again would be more directly guest-impactful.
 pub fn api_version() -> Result<u32> {
-    cache_api_version(|| -> Result<u32> {
+    VERSION_CACHE.get_or_init(|| -> Result<u32> {
         let ctl = VmmCtlFd::open()?;
         let vers = ctl.query_api_version()?;
         Ok(vers)
     })
-}
-
-fn cache_api_version(do_query: impl FnOnce() -> Result<u32>) -> Result<u32> {
-    if VERSION_CACHE.load(Ordering::Acquire) == 0 {
-        let newval = match do_query() {
-            Ok(x) => i64::from(x),
-            Err(e) => -i64::from(e.raw_os_error().unwrap_or(libc::ENOENT)),
-        };
-        let _ = VERSION_CACHE.compare_exchange(
-            0,
-            newval,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-    }
-
-    match VERSION_CACHE.load(Ordering::Acquire) {
-        0 => {
-            panic!("expected VERSION_CACHE to be initialized")
-        }
-        x if x < 0 => Err(Error::from_raw_os_error(-x as i32)),
-        y => {
-            assert!(y < i64::from(u32::MAX));
-
-            Ok(y as u32)
-        }
-    }
 }
 
 #[cfg(target_os = "illumos")]

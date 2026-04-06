@@ -28,6 +28,9 @@ pub const STATUS_FAILED: u8 = 128;
 // VirtQueue descriptor flags (VirtIO 1.2 sec 2.7.5)
 // ---------------------------------------------------------------------------
 
+/// Available ring: driver sets this to suppress used-buffer notifications.
+pub const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
+
 /// This marks a buffer as continuing via the `next` field.
 pub const VRING_DESC_F_NEXT: u16 = 1;
 /// This marks a buffer as device write-only (otherwise device read-only).
@@ -43,8 +46,14 @@ pub const VRING_DESC_F_INDIRECT: u16 = 4;
 pub const VIRTIO_F_RING_INDIRECT_DESC: u64 = 1 << 28;
 /// Device supports the event index feature for suppressing notifications.
 pub const VIRTIO_F_RING_EVENT_IDX: u64 = 1 << 29;
+/// RING_INDIRECT_DESC as u32 for legacy transport feature advertisement.
+pub const VIRTIO_F_RING_INDIRECT_DESC_U32: u32 = 1 << 28;
+/// RING_EVENT_IDX as u32 for legacy transport feature advertisement.
+pub const VIRTIO_F_RING_EVENT_IDX_U32: u32 = 1 << 29;
 /// Device complies with VirtIO 1.0+ specification.
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+/// Device supports packed virtqueues (virtio 1.1+).
+pub const VIRTIO_F_RING_PACKED: u64 = 1 << 34;
 
 // ---------------------------------------------------------------------------
 // VirtIO block request types (VirtIO 1.2 sec 5.2.6)
@@ -56,6 +65,9 @@ pub const VIRTIO_BLK_T_IN: u32 = 0;
 pub const VIRTIO_BLK_T_OUT: u32 = 1;
 /// Flush write cache.
 pub const VIRTIO_BLK_T_FLUSH: u32 = 4;
+pub const VIRTIO_BLK_T_GET_ID: u32 = 8;
+pub const VIRTIO_BLK_T_DISCARD: u32 = 11;
+pub const VIRTIO_BLK_T_WRITE_ZEROES: u32 = 13;
 
 /// Block request status: success.
 pub const VIRTIO_BLK_S_OK: u8 = 0;
@@ -74,6 +86,12 @@ pub const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 pub const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 /// Device exports block size.
 pub const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
+pub const VIRTIO_BLK_F_SIZE_MAX: u64 = 1 << 1;
+pub const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
+pub const VIRTIO_BLK_F_DISCARD: u64 = 1 << 13;
+pub const VIRTIO_BLK_F_WRITE_ZEROES: u64 = 1 << 14;
+/// Block device supports multiple request queues.
+pub const VIRTIO_BLK_F_MQ: u64 = 1 << 12;
 
 // ---------------------------------------------------------------------------
 // Legacy PCI transport register offsets (VirtIO 1.2 sec 4.1.4.8)
@@ -100,6 +118,100 @@ pub const LEGACY_REG_DEVICE_CONFIG: u16 = 0x14;
 
 /// Size of legacy common config registers (excluding device-specific).
 pub const LEGACY_COMMON_SIZE: u16 = 0x14;
+
+/// Size of legacy common config with MSI-X vector registers.
+pub const LEGACY_COMMON_SIZE_MSIX: u16 = 0x18;
+/// MSI-X "no vector" sentinel.
+pub const VIRTIO_MSI_NO_VECTOR: u16 = 0xFFFF;
+/// MSI-X config vector register offset in legacy transport.
+pub const LEGACY_REG_MSIX_CONFIG_VECTOR: u16 = 0x14;
+/// MSI-X queue vector register offset in legacy transport.
+pub const LEGACY_REG_MSIX_QUEUE_VECTOR: u16 = 0x16;
+/// Device config start when MSI-X is present.
+pub const LEGACY_REG_DEVICE_CONFIG_MSIX: u16 = 0x18;
+
+// ---------------------------------------------------------------------------
+// Modern PCI transport: capability types (VirtIO 1.3 sec 4.1.4.4)
+// ---------------------------------------------------------------------------
+
+/// PCI capability ID for vendor-specific (used by virtio).
+pub const PCI_CAP_ID_VNDR: u8 = 0x09;
+
+/// Common configuration capability.
+pub const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
+/// Notification capability.
+pub const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
+/// ISR status capability.
+pub const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
+/// Device-specific configuration capability.
+pub const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+
+/// Size of a virtio PCI capability structure (16 bytes).
+pub const VIRTIO_PCI_CAP_SIZE: u8 = 16;
+/// Size of the notify capability (16 + 4 byte multiplier = 20 bytes).
+pub const VIRTIO_PCI_NOTIFY_CAP_SIZE: u8 = 20;
+
+// ---------------------------------------------------------------------------
+// Modern common config register offsets (VirtIO 1.3 sec 4.1.4.3)
+// ---------------------------------------------------------------------------
+
+/// Selects which 32-bit half of device_feature to read (0=low, 1=high).
+pub const COMMON_CFG_DEVICE_FEATURE_SELECT: u16 = 0x00;
+/// Device features (read-only, selected by device_feature_select).
+pub const COMMON_CFG_DEVICE_FEATURE: u16 = 0x04;
+/// Selects which 32-bit half of driver_feature to write.
+pub const COMMON_CFG_DRIVER_FEATURE_SELECT: u16 = 0x08;
+/// Driver features (write, selected by driver_feature_select).
+pub const COMMON_CFG_DRIVER_FEATURE: u16 = 0x0C;
+/// MSI-X vector for config changes.
+pub const COMMON_CFG_MSIX_CONFIG: u16 = 0x10;
+/// Number of virtqueues (read-only).
+pub const COMMON_CFG_NUM_QUEUES: u16 = 0x12;
+/// Device status register.
+pub const COMMON_CFG_DEVICE_STATUS: u16 = 0x14;
+/// Configuration generation counter (read-only).
+pub const COMMON_CFG_CONFIG_GENERATION: u16 = 0x15;
+/// Queue select register.
+pub const COMMON_CFG_QUEUE_SELECT: u16 = 0x16;
+/// Queue size.
+pub const COMMON_CFG_QUEUE_SIZE: u16 = 0x18;
+/// MSI-X vector for selected queue.
+pub const COMMON_CFG_QUEUE_MSIX_VECTOR: u16 = 0x1A;
+/// Queue enable (0=disabled, 1=enabled).
+pub const COMMON_CFG_QUEUE_ENABLE: u16 = 0x1C;
+/// Queue notify offset (multiplied by notify_off_multiplier).
+pub const COMMON_CFG_QUEUE_NOTIFY_OFF: u16 = 0x1E;
+/// Queue descriptor table address (low 32 bits).
+pub const COMMON_CFG_QUEUE_DESC_LO: u16 = 0x20;
+/// Queue descriptor table address (high 32 bits).
+pub const COMMON_CFG_QUEUE_DESC_HI: u16 = 0x24;
+/// Queue available ring address (low 32 bits).
+pub const COMMON_CFG_QUEUE_AVAIL_LO: u16 = 0x28;
+/// Queue available ring address (high 32 bits).
+pub const COMMON_CFG_QUEUE_AVAIL_HI: u16 = 0x2C;
+/// Queue used ring address (low 32 bits).
+pub const COMMON_CFG_QUEUE_USED_LO: u16 = 0x30;
+/// Queue used ring address (high 32 bits).
+pub const COMMON_CFG_QUEUE_USED_HI: u16 = 0x34;
+/// Size of the common config structure.
+pub const COMMON_CFG_SIZE: u16 = 0x38;
+
+// ---------------------------------------------------------------------------
+// Modern transport BAR2 layout (4 pages = 16 KB MMIO)
+// ---------------------------------------------------------------------------
+
+/// Common config at start of BAR2.
+pub const MODERN_BAR_COMMON_OFFSET: u32 = 0x0000;
+/// Device-specific config at page 1.
+pub const MODERN_BAR_DEVICE_OFFSET: u32 = 0x1000;
+/// Notification register at page 2.
+pub const MODERN_BAR_NOTIFY_OFFSET: u32 = 0x2000;
+/// ISR status register at page 3.
+pub const MODERN_BAR_ISR_OFFSET: u32 = 0x3000;
+/// Total BAR2 size (4 pages).
+pub const MODERN_BAR_SIZE: u32 = 0x4000;
+/// BAR index for modern config.
+pub const MODERN_BAR_IDX: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // PCI identity for VirtIO devices

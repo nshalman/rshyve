@@ -45,6 +45,22 @@ impl PciBus {
     /// Panics if a device is already attached at this BDF.
     pub fn attach(&self, bdf: Bdf, dev: Arc<dyn PciDevice>) {
         let mut inner = self.inner.lock().expect("PciBus lock poisoned");
+
+        // When attaching at function > 0, set the multi-function bit
+        // on function 0's header type so the guest scans all functions.
+        if bdf.func() > 0 {
+            if let Some(func0) = inner.slots[bdf.dev() as usize][0].clone() {
+                let cur = func0.cfg_read(super::bits::REG_HEADER_TYPE, 1) as u8;
+                if cur & super::bits::HEADER_TYPE_MULTIFUNC == 0 {
+                    func0.cfg_write(
+                        super::bits::REG_HEADER_TYPE,
+                        1,
+                        u32::from(cur | super::bits::HEADER_TYPE_MULTIFUNC),
+                    );
+                }
+            }
+        }
+
         let slot = &mut inner.slots[bdf.dev() as usize][bdf.func() as usize];
         assert!(
             slot.is_none(),
