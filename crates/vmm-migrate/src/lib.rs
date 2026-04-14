@@ -12,6 +12,62 @@ pub mod destination;
 pub mod protocol;
 pub mod source;
 pub mod state;
+pub mod sync_source;
+pub mod sync_destination;
+
+/// A stream that can be either a TCP connection or a Unix socket.
+/// Implements AsyncRead + AsyncWrite so it can be used with the
+/// generic migration protocol.
+pub enum MigrateStream {
+    Tcp(tokio::net::TcpStream),
+    Unix(tokio::net::UnixStream),
+}
+
+impl tokio::io::AsyncRead for MigrateStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MigrateStream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            MigrateStream::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for MigrateStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            MigrateStream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            MigrateStream::Unix(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MigrateStream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            MigrateStream::Unix(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MigrateStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            MigrateStream::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 /// Migration phases, executed in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

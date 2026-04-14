@@ -83,10 +83,15 @@ struct VionaInner {
     dev_features: u32,
 
     /// Features negotiated by the guest.
-    negotiated_features: u32,
+    negotiated_features: u64,
 
     /// Per-ring initialization state (RX=0, TX=1).
     ring_state: [RingState; NET_NUM_QUEUES],
+
+    /// Deferred interrupt poll state for migration destinations.
+    /// Stores the raise_fn and logger so the poll thread can be
+    /// started after ring state is restored.
+    deferred_poll: Option<(Arc<dyn Fn(u16) + Send + Sync>, slog::Logger)>,
 }
 
 impl VirtioViona {
@@ -146,8 +151,158 @@ impl VirtioViona {
                 dev_features,
                 negotiated_features: 0,
                 ring_state: [RingState::Init; NET_NUM_QUEUES],
+                deferred_poll: None,
             }),
         })
+    }
+
+    /// Restore ring state after migration using VNA_IOC_RING_SET_STATE.
+    /// This programs ring addresses AND indices into the kernel, unlike
+    /// ring_init which resets indices to 0.
+    /// Reset all viona rings (pause + reset). Call before ring_set_state.
+    #[cfg(target_os = "illumos")]
+    pub fn reset_all_rings(&self) {
+        let inner = self.inner.lock().expect("viona lock");
+        for idx in 0..NET_NUM_QUEUES {
+            let _ = inner.viona_fd.ioctl_usize(
+                viona_api::VNA_IOC_RING_PAUSE, idx);
+            let _ = inner.viona_fd.ioctl_usize(
+                viona_api::VNA_IOC_RING_RESET, idx);
+        }
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    pub fn reset_all_rings(&self) {}
+
+    #[cfg(target_os = "illumos")]
+    pub fn ring_set_state(
+        &self,
+        queue_idx: u16,
+        size: u16,
+        desc: u64,
+        avail: u64,
+        used: u64,
+        avail_idx: u16,
+        used_idx: u16,
+        msix_addr: u64,
+        msix_data: u32,
+    ) {
+        let mut inner = self.inner.lock().expect("viona lock");
+
+        // Set features (VERSION_1 sets l_modern in kernel)
+        if inner.negotiated_features != 0 {
+            Self::set_kernel_features(&inner, inner.negotiated_features);
+        }
+
+        // Program ring state (addresses + indices).
+        //
+        // vrs_avail_idx sets vr_cur_aidx, the kernel's consumption
+        // cursor. The kernel computes available entries as:
+        //   num_avail = guest_memory_avail_idx - vr_cur_aidx
+        //
+        // We must use the REAL avail_idx from the source (not used_idx)
+        // because descriptors between used_idx and avail_idx may have
+        // been reclaimed by the guest driver. Replaying them causes
+        // "id N is not a head!" errors in the guest.
+        //
+        // If avail_idx == used_idx (zero available buffers), the guest
+        // driver must re-post buffers via the post-restore interrupt.
+        let mut state = viona_api::vioc_ring_state {
+            vrs_index: queue_idx,
+            vrs_avail_idx: avail_idx,
+            vrs_used_idx: used_idx,
+            vrs_qsize: size,
+            vrs_qaddr_desc: desc,
+            vrs_qaddr_avail: avail,
+            vrs_qaddr_used: used,
+        };
+        let rc = unsafe {
+            inner.viona_fd.ioctl(viona_api::VNA_IOC_RING_SET_STATE, &mut state)
+        };
+        if rc.is_ok() {
+            let idx = queue_idx as usize;
+            if idx < NET_NUM_QUEUES {
+                inner.ring_state[idx] = RingState::Ready;
+            }
+
+            // Program MSI-X interrupt delivery for this queue
+            if msix_addr != 0 {
+                let mut msi = viona_api::vioc_ring_msi {
+                    rm_index: queue_idx,
+                    rm_addr: msix_addr,
+                    rm_msg: msix_data as u64,
+                    ..Default::default()
+                };
+                let msi_rc = unsafe {
+                    inner.viona_fd.ioctl(viona_api::VNA_IOC_RING_SET_MSI, &mut msi)
+                };
+                if let Err(ref e) = msi_rc {
+                    eprintln!("[viona] ring_set_msi q={} failed: {}", queue_idx, e);
+                }
+            }
+
+            Self::ring_kick(&inner, queue_idx);
+            eprintln!("[viona] ring_set_state q={} OK: avail={} used={} msi_addr={:#x}",
+                queue_idx, avail_idx, used_idx, msix_addr);
+        } else {
+            eprintln!("[viona] ring_set_state q={} failed: {:?}", queue_idx, rc);
+        }
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    pub fn ring_set_state(&self, _: u16, _: u16, _: u64, _: u64, _: u64, _: u16, _: u16, _: u64, _: u32) {}
+
+    /// Program the notification I/O port and MMIO address in the kernel.
+    #[cfg(target_os = "illumos")]
+    pub fn set_notify_addrs(&self, pio_port: u16, mmio_addr: u64) {
+        let inner = self.inner.lock().expect("viona lock");
+        if pio_port != 0 {
+            let _ = inner.viona_fd.ioctl_usize(
+                viona_api::VNA_IOC_SET_NOTIFY_IOP, pio_port as usize);
+        }
+        if mmio_addr != 0 {
+            let mut vim = viona_api::vioc_notify_mmio {
+                vim_address: mmio_addr,
+                vim_size: 0x1000,
+            };
+            let _ = unsafe {
+                inner.viona_fd.ioctl(viona_api::VNA_IOC_SET_NOTIFY_MMIO, &mut vim)
+            };
+        }
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    pub fn set_notify_addrs(&self, _: u16, _: u64) {}
+
+    /// Get ring state from kernel (avail_idx, used_idx) for migration export.
+    #[cfg(target_os = "illumos")]
+    pub fn get_kernel_ring_state(&self, queue_idx: u16) -> (u16, u16) {
+        let inner = self.inner.lock().expect("viona lock");
+        let mut state = viona_api::vioc_ring_state {
+            vrs_index: queue_idx,
+            ..Default::default()
+        };
+        let rc = unsafe {
+            inner.viona_fd.ioctl(viona_api::VNA_IOC_RING_GET_STATE, &mut state)
+        };
+        if rc.is_ok() {
+            (state.vrs_avail_idx, state.vrs_used_idx)
+        } else {
+            (0, 0)
+        }
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    pub fn get_kernel_ring_state(&self, _queue_idx: u16) -> (u16, u16) { (0, 0) }
+
+    /// Kick all ready queues after migration to wake kernel processing.
+    pub fn kick_all_queues(&self) {
+        let inner = self.inner.lock().expect("viona lock");
+        for idx in 0..NET_NUM_QUEUES as u16 {
+            if inner.ring_state[idx as usize] == RingState::Ready {
+                Self::ring_kick(&inner, idx);
+            }
+        }
     }
 
     /// Enable promiscuous mode on the viona device.
@@ -255,6 +410,62 @@ impl VirtioViona {
     ) {
     }
 
+    /// Store the interrupt poll parameters for deferred start.
+    ///
+    /// On migration destinations, the poll thread cannot start at device
+    /// creation time because the rings haven't been programmed yet
+    /// (and starting it would make them EBUSY). Instead, store the
+    /// raise_fn and logger here, then call `start_poll_deferred()` after
+    /// ring state is fully restored.
+    pub fn store_poll_fn(
+        &self,
+        raise_intr: Arc<dyn Fn(u16) + Send + Sync>,
+        log: slog::Logger,
+    ) {
+        let mut inner = self.inner.lock().expect("viona lock");
+        inner.deferred_poll = Some((raise_intr, log));
+    }
+
+    /// Start the interrupt poll thread using previously stored parameters.
+    ///
+    /// Called after migration restore has programmed all ring state,
+    /// MSI-X vectors, and notification addresses. This is the final
+    /// step that enables viona to deliver completion interrupts to
+    /// the guest.
+    #[cfg(target_os = "illumos")]
+    pub fn start_poll_deferred(&self) {
+        use std::os::fd::AsRawFd;
+        let mut inner = self.inner.lock().expect("viona lock");
+        if let Some((raise_intr, log)) = inner.deferred_poll.take() {
+            let fd = inner.viona_fd.as_raw_fd();
+            slog::info!(log, "starting deferred viona interrupt poll thread");
+            std::thread::Builder::new()
+                .name("viona-intr-poll".into())
+                .spawn(move || {
+                    viona_intr_poll_loop(fd, raise_intr, log);
+                })
+                .expect("failed to spawn viona-intr-poll thread");
+
+            // Re-kick all rings after starting the poll thread.
+            // VNA_IOC_RING_SET_STATE programs indices but may not
+            // activate the kernel ring worker. A second kick after
+            // the poll thread is running ensures the worker processes
+            // available entries.
+            for idx in 0..NET_NUM_QUEUES {
+                if inner.ring_state[idx] == RingState::Ready {
+                    let _ = inner.viona_fd.ioctl_usize(
+                        viona_api::VNA_IOC_RING_KICK, idx);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    pub fn start_poll_deferred(&self) {
+        let mut inner = self.inner.lock().expect("viona lock");
+        inner.deferred_poll.take();
+    }
+
     /// Program the ring addresses for a queue into the kernel.
     ///
     /// On success, marks the ring as `Ready` so that subsequent kicks
@@ -331,7 +542,7 @@ impl VirtioDevice for VirtioViona {
 
     fn set_features(&self, features: u64) {
         let mut inner = self.inner.lock().expect("viona lock poisoned");
-        inner.negotiated_features = features as u32;
+        inner.negotiated_features = features;
         Self::set_kernel_features(&inner, features);
     }
 
@@ -402,6 +613,40 @@ impl VirtioDevice for VirtioViona {
         false
     }
 
+    fn get_kernel_ring_indices(&self, queue_idx: u16) -> (u16, u16) {
+        self.get_kernel_ring_state(queue_idx)
+    }
+
+    fn reset_all_rings(&self) {
+        self.reset_all_rings();
+    }
+
+    fn restore_ring_state(
+        &self, queue_idx: u16, size: u16, desc: u64, avail: u64, used: u64,
+        avail_idx: u16, used_idx: u16, msix_addr: u64, msix_data: u32,
+    ) {
+        self.ring_set_state(queue_idx, size, desc, avail, used, avail_idx, used_idx, msix_addr, msix_data);
+    }
+
+    fn pause_rings_for_export(&self) {
+        #[cfg(target_os = "illumos")]
+        {
+            let inner = self.inner.lock().expect("viona lock");
+            for idx in 0..NET_NUM_QUEUES {
+                let _ = inner.viona_fd.ioctl_usize(
+                    viona_api::VNA_IOC_RING_PAUSE, idx);
+            }
+        }
+    }
+
+    fn set_notify_addrs(&self, pio_port: u16, mmio_addr: u64) {
+        self.set_notify_addrs(pio_port, mmio_addr);
+    }
+
+    fn start_poll_deferred(&self) {
+        self.start_poll_deferred();
+    }
+
     fn queue_addr_set(&self, queue_idx: u16, queue: &VirtQueue) {
         // When the guest programs a queue address, tell the kernel
         // where the ring structures live.
@@ -437,8 +682,6 @@ fn lookup_vnic(
     name: &str,
 ) -> std::io::Result<(u32, [u8; ETHERADDRL])> {
     use std::ffi::CString;
-    use std::io::{BufRead, BufReader};
-    use std::process::{Command, Stdio};
 
     // Open a dladm handle and resolve the link name to a datalink_id.
     let name_cstr = CString::new(name).map_err(|_| {
@@ -483,28 +726,54 @@ fn lookup_vnic(
         ));
     }
 
-    // Get MAC address via dladm CLI. This may fail inside a zone
-    // (EPERM) — in that case we use a zero MAC and let the guest
-    // discover the real MAC from the viona device.
+    // Get MAC address via libdladm FFI (dladm_vnic_info ioctl).
+    // This works inside bhyve zones where `dladm show-vnic` fails
+    // due to missing privileges.
     let mut mac_addr = [0u8; ETHERADDRL];
-    if let Ok(mac_output) = Command::new("/usr/sbin/dladm")
-        .args(["show-vnic", "-p", "-o", "MACADDRESS"])
-        .arg(name)
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .output()
-    {
-        if mac_output.status.success() {
-            if let Some(Ok(mac_line)) =
-                BufReader::new(&mac_output.stdout[..]).lines().next()
-            {
-                parse_mac(&mac_line, &mut mac_addr);
-            }
+
+    // Re-open handle for the vnic_info call
+    let mut dladm_hdl2: *mut libc::c_void = std::ptr::null_mut();
+    let rc2 = unsafe { dladm_open(&mut dladm_hdl2) };
+    if rc2 == 0 {
+        let mut vnic_attr: DladmVnicAttr = unsafe { std::mem::zeroed() };
+        let rc3 = unsafe {
+            dladm_vnic_info(
+                dladm_hdl2,
+                link_id,
+                &mut vnic_attr,
+                1, // DLADM_OPT_ACTIVE
+            )
+        };
+        if rc3 == 0 && vnic_attr.va_mac_len as usize >= ETHERADDRL {
+            mac_addr.copy_from_slice(&vnic_attr.va_mac_addr[..ETHERADDRL]);
         }
+        unsafe { dladm_close(dladm_hdl2) };
     }
 
     Ok((link_id, mac_addr))
+}
+
+/// libdladm VNIC attributes returned by dladm_vnic_info().
+///
+/// The actual struct is 15,488 bytes due to the trailing
+/// mac_resource_props_t (15,428 bytes). We only need the first
+/// few fields (MAC addr at offset 16, MAC len at offset 12).
+#[cfg(target_os = "illumos")]
+#[repr(C)]
+struct DladmVnicAttr {
+    va_vnic_id: u32,           // offset 0
+    va_link_id: u32,           // offset 4
+    va_mac_addr_type: libc::c_int, // offset 8
+    va_mac_len: libc::c_uint,  // offset 12
+    va_mac_addr: [u8; 20],     // offset 16, MAXMACADDRLEN
+    va_mac_slot: libc::c_int,  // offset 36
+    va_mac_prefix_len: libc::c_uint, // offset 40
+    va_vid: u16,               // offset 44
+    va_force: libc::c_int,     // offset 48 (with padding)
+    va_vrid: u32,
+    va_af: libc::c_int,
+    // mac_resource_props_t (15,428 bytes) follows.
+    _pad: [u8; 15432],
 }
 
 // libdladm FFI declarations
@@ -520,6 +789,12 @@ extern "C" {
         flagp: *mut u32,
         classp: *mut libc::c_int,
         mediap: *mut u32,
+    ) -> libc::c_int;
+    fn dladm_vnic_info(
+        handle: *mut libc::c_void,
+        linkid: u32,
+        attrp: *mut DladmVnicAttr,
+        flags: u32,
     ) -> libc::c_int;
 }
 
@@ -602,6 +877,7 @@ fn viona_intr_poll_loop(
 
 /// Parse a colon-separated MAC address string into a byte array.
 #[cfg(target_os = "illumos")]
+#[allow(dead_code)]
 fn parse_mac(s: &str, mac: &mut [u8; ETHERADDRL]) {
     for (i, part) in s.split(':').enumerate() {
         if i >= ETHERADDRL {
@@ -633,6 +909,7 @@ mod tests {
             dev_features: VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS,
             negotiated_features: 0,
             ring_state: [RingState::Init; NET_NUM_QUEUES],
+            deferred_poll: None,
         }
     }
 
@@ -681,7 +958,7 @@ mod tests {
     #[test]
     fn kick_allowed_after_features_and_ring_init() {
         let mut inner = test_inner();
-        inner.negotiated_features = VIRTIO_NET_F_MAC;
+        inner.negotiated_features = VIRTIO_NET_F_MAC as u64;
         inner.ring_state[0] = RingState::Ready;
         // On illumos this would actually issue the ioctl; on
         // non-illumos the stub is a no-op. Verify state is correct.
@@ -694,7 +971,7 @@ mod tests {
     #[test]
     fn reset_clears_features_and_ring_state() {
         let mut inner = test_inner();
-        inner.negotiated_features = VIRTIO_NET_F_MAC;
+        inner.negotiated_features = VIRTIO_NET_F_MAC as u64;
         inner.ring_state[0] = RingState::Ready;
         inner.ring_state[1] = RingState::Ready;
 

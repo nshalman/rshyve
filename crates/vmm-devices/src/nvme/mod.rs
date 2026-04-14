@@ -41,6 +41,7 @@ use vmm_core::mem::{MemCtx, PhysMap, SubMapping};
 use vmm_core::mmio::{MmioBus, MmioFn};
 
 use crate::Lifecycle;
+use crate::blkdev::DiskCache;
 use crate::lifecycle::Indicator;
 use crate::pci::bar::BarDefine;
 use crate::pci::device::{DeviceIdent, DeviceState, PciDevice};
@@ -54,6 +55,18 @@ const NUM_WORKERS: usize = 8;
 
 /// MSI-X capability offset in PCI config space.
 const MSIX_CAP_OFFSET: u8 = 0x40;
+
+/// Platform-appropriate data sync: metadata is not required by NVMe FUA/FLUSH
+/// semantics, so `fdatasync` suffices on illumos. macOS lacks it, so fall back
+/// to `fsync`.
+#[cfg(target_os = "illumos")]
+fn datasync(fd: i32) -> i32 {
+    unsafe { libc::fdatasync(fd) }
+}
+#[cfg(not(target_os = "illumos"))]
+fn datasync(fd: i32) -> i32 {
+    unsafe { libc::fsync(fd) }
+}
 
 // ---------------------------------------------------------------------------
 // Queue structures
@@ -101,6 +114,11 @@ struct IoRequest {
     sqid: u16,
     cid: u16,
     cq_id: u16,
+    /// Force Unit Access (NVMe 5.13, CDW12 bit 30). When set on a write
+    /// we must fsync after pwritev so the data is durable before
+    /// completion — the contract we're on the hook for because the
+    /// Identify Controller page advertises VWC=1.
+    fua: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +172,9 @@ pub struct NvmeController {
     registered_bar4: Mutex<Option<u64>>,
     /// Weak self-reference for MMIO handler closures.
     self_ref: Mutex<Option<std::sync::Weak<Self>>>,
+    /// Zvol write-cache control. Declared BEFORE `_file` so Drop runs
+    /// `DKIOCSETWCE` restore while the fd is still open.
+    _cache: DiskCache,
     /// Backing file kept alive for the raw fd used by I/O workers.
     /// Dropped (and fd closed) when the controller is dropped.
     _file: File,
@@ -183,6 +204,11 @@ impl NvmeController {
         bus_mmio: Arc<MmioBus>,
     ) -> Arc<Self> {
         let raw_fd = file.as_raw_fd();
+
+        // Enable zvol writeback cache (DKIOCSETWCE=1). NVMe's protocol has
+        // explicit FLUSH semantics, matching the writeback contract. Must
+        // happen before any I/O so first writes hit the fast path.
+        let cache = DiskCache::new(raw_fd, read_only);
 
         // Determine disk geometry
         let file_len = file
@@ -286,6 +312,7 @@ impl NvmeController {
             registered_bar0: Mutex::new(None),
             registered_bar4: Mutex::new(None),
             self_ref: Mutex::new(None),
+            _cache: cache,
             _file: file,
             indicator: Indicator::new(),
             paused: Arc::clone(&paused),
@@ -1117,6 +1144,8 @@ impl NvmeController {
                         .expect("4 bytes"),
                 )) << 32);
             let nlb = (cdw12 & 0xFFFF) + 1; // Convert 0-based to 1-based
+            // NVMe 5.13: CDW12 bit 30 = Force Unit Access.
+            let fua = (cdw12 & (1u32 << 30)) != 0;
 
             sq.head = (sq.head + 1) % sq.size;
 
@@ -1130,6 +1159,7 @@ impl NvmeController {
                 sqid: qid,
                 cid,
                 cq_id: cq_id,
+                fua,
             });
         }
 
@@ -1582,12 +1612,17 @@ fn process_io_request(
             if nwritten < 0 || nwritten as usize != byte_count {
                 return SC_DATA_XFER_ERROR;
             }
+            // FUA: Identify Controller advertises VWC=1, so FUA writes
+            // must be durable before completion. Without this, a guest
+            // filesystem journal commit can report success while the data
+            // still lives in zvol writeback cache.
+            if req.fua && datasync(raw_fd) != 0 {
+                return SC_INTERNAL_ERROR;
+            }
             SC_SUCCESS
         }
         NVM_OPC_FLUSH => {
-            // fsync the backing file
-            let ret = unsafe { libc::fsync(raw_fd) };
-            if ret != 0 {
+            if datasync(raw_fd) != 0 {
                 return SC_INTERNAL_ERROR;
             }
             SC_SUCCESS
@@ -1663,6 +1698,180 @@ impl Lifecycle for NvmeController {
 
     fn halt(&self) {
         self.indicator.halt();
+    }
+
+    fn flush_backing(&self) {
+        use std::time::Instant;
+        // Drain workers before syncing so the fdatasync barrier covers
+        // every pwritev whose CQE the guest has observed. Restore only
+        // the pause state we changed so a non-migration caller that had
+        // the device paused keeps its state.
+        let was_paused = self.paused.swap(true, Ordering::AcqRel);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while self.workers_active.load(Ordering::Acquire) > 0
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = datasync(self._file.as_raw_fd());
+        if !was_paused {
+            self.paused.store(false, Ordering::Release);
+        }
+    }
+
+    fn export_nvme_state(
+        &self,
+    ) -> Option<crate::lifecycle::NvmeMigrateState> {
+        use crate::lifecycle::{NvmeMigrateCq, NvmeMigrateSq, NvmeMigrateState};
+
+        let st = self.state.lock().expect("nvme state lock");
+
+        // Only export if the controller is enabled (has active queues)
+        if (st.cc & CC_EN) == 0 {
+            return None;
+        }
+
+        let admin_sq = st.admin_sq.as_ref().map(|sq| NvmeMigrateSq {
+            base: sq.base, size: sq.size, head: sq.head,
+            tail: sq.tail, cq_id: sq.cq_id,
+        });
+        let admin_cq = st.admin_cq.as_ref().map(|cq| NvmeMigrateCq {
+            base: cq.base, size: cq.size, head: cq.head,
+            tail: cq.tail, phase: cq.phase, iv: cq.iv,
+        });
+        let io_sqs = st.io_sqs.iter().map(|sq| {
+            sq.as_ref().map(|sq| NvmeMigrateSq {
+                base: sq.base, size: sq.size, head: sq.head,
+                tail: sq.tail, cq_id: sq.cq_id,
+            })
+        }).collect();
+        let io_cqs = st.io_cqs.iter().map(|cq| {
+            cq.as_ref().map(|cq| NvmeMigrateCq {
+                base: cq.base, size: cq.size, head: cq.head,
+                tail: cq.tail, phase: cq.phase, iv: cq.iv,
+            })
+        }).collect();
+
+        // Export PCI state
+        let pci = self.pci_state.lock().expect("pci lock");
+        let mut pci_bar_addrs = [0u64; 6];
+        for (idx, addr) in pci_bar_addrs.iter_mut().enumerate() {
+            let bar = BarN::try_from(idx as u8).expect("valid BAR");
+            *addr = pci.bars().get(bar).map(|(_, v)| v).unwrap_or(0);
+        }
+        let pci_command = pci.command().bits();
+        drop(pci);
+
+        // Export MSI-X table entries
+        let msix_count = self.msix.count();
+        let msix_entries: Vec<(u64, u64)> = (0..msix_count)
+            .map(|v| self.msix.read_entry(v))
+            .collect();
+        let msix_enabled = self.msix.is_enabled();
+
+        eprintln!(
+            "[nvme-export] cc={:#x} csts={:#x} aqa={:#x} io_queues={} msix_enabled={}",
+            st.cc, st.csts, st.aqa, st.num_io_queues, msix_enabled,
+        );
+
+        Some(NvmeMigrateState {
+            cc: st.cc,
+            csts: st.csts,
+            aqa: st.aqa,
+            asq_base: st.asq_base,
+            acq_base: st.acq_base,
+            admin_sq,
+            admin_cq,
+            io_sqs,
+            io_cqs,
+            num_io_queues: st.num_io_queues,
+            pci_command,
+            pci_bar_addrs,
+            msix_entries,
+            msix_enabled,
+        })
+    }
+
+    fn restore_nvme_state(
+        &self,
+        mig: &crate::lifecycle::NvmeMigrateState,
+    ) {
+        eprintln!(
+            "[nvme-restore] cc={:#x} csts={:#x} aqa={:#x} io_queues={} msix_enabled={}",
+            mig.cc, mig.csts, mig.aqa, mig.num_io_queues, mig.msix_enabled,
+        );
+
+        // Restore PCI BAR addresses and command register
+        {
+            use crate::pci::bar::BarDefine;
+            let pci = self.pci_state.lock().expect("pci lock");
+            let mut bar_writes = Vec::new();
+            for (idx, &addr) in mig.pci_bar_addrs.iter().enumerate() {
+                let bar = BarN::try_from(idx as u8).expect("valid BAR");
+                let Some((def, _)) = pci.bars().get(bar) else { continue };
+                let offset = crate::pci::bits::REG_BAR0 + (idx as u8 * 4);
+                match def {
+                    BarDefine::Pio(_) | BarDefine::Mmio(_) => {
+                        bar_writes.push((offset, addr as u32));
+                    }
+                    BarDefine::Mmio64(_) => {
+                        bar_writes.push((offset, addr as u32));
+                        bar_writes.push((offset + 4, (addr >> 32) as u32));
+                    }
+                }
+            }
+            drop(pci);
+            for (off, val) in &bar_writes {
+                self.cfg_write(*off, 4, *val);
+            }
+            self.cfg_write(
+                crate::pci::bits::REG_COMMAND, 2, u32::from(mig.pci_command),
+            );
+        }
+
+        // Restore controller state
+        let mut st = self.state.lock().expect("nvme state lock");
+        st.cc = mig.cc;
+        st.csts = mig.csts;
+        st.aqa = mig.aqa;
+        st.asq_base = mig.asq_base;
+        st.acq_base = mig.acq_base;
+        st.num_io_queues = mig.num_io_queues;
+
+        // Restore admin queues
+        st.admin_sq = mig.admin_sq.as_ref().map(|sq| SubQueue {
+            base: sq.base, size: sq.size, head: sq.head,
+            tail: sq.tail, cq_id: sq.cq_id,
+        });
+        st.admin_cq = mig.admin_cq.as_ref().map(|cq| CompQueue {
+            base: cq.base, size: cq.size, head: cq.head,
+            tail: cq.tail, phase: cq.phase, iv: cq.iv,
+        });
+
+        // Restore I/O queues
+        for (idx, sq_opt) in mig.io_sqs.iter().enumerate() {
+            if idx < MAX_IO_QUEUES {
+                st.io_sqs[idx] = sq_opt.as_ref().map(|sq| SubQueue {
+                    base: sq.base, size: sq.size, head: sq.head,
+                    tail: sq.tail, cq_id: sq.cq_id,
+                });
+            }
+        }
+        for (idx, cq_opt) in mig.io_cqs.iter().enumerate() {
+            if idx < MAX_IO_QUEUES {
+                st.io_cqs[idx] = cq_opt.as_ref().map(|cq| CompQueue {
+                    base: cq.base, size: cq.size, head: cq.head,
+                    tail: cq.tail, phase: cq.phase, iv: cq.iv,
+                });
+            }
+        }
+        drop(st);
+
+        // Restore MSI-X table entries and enable flag
+        for (v, &(addr, data)) in mig.msix_entries.iter().enumerate() {
+            self.msix.write_entry(v as u16, addr, data);
+        }
+        self.msix.set_enabled(mig.msix_enabled);
     }
 }
 

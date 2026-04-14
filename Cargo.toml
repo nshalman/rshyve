@@ -11,6 +11,7 @@ members = [
     "crates/vmm-migrate",
     "crates/vmm-config",
     "bin/vmm",
+    "bin/vmm-migrate-agent",
 ]
 
 [profile.dev-abort]

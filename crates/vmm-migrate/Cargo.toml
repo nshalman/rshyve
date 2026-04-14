@@ -17,3 +17,5 @@ slog.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
+tungstenite = "0.24"
+zstd = "0.13"

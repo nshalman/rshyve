@@ -71,6 +71,8 @@ compatibility between different CPU generations:
 - Per-vCPU: registers, MSRs, LAPIC, VMM_ARCH
 - Per-vCPU: run state (HALT/INIT/RUN) and SIPI vector
 - VMM_TIME with boot_hrtime and TSC frequency adjustment
+- Virtio queue state, PCI BAR addresses, and PCI command bits for
+  post-migration viona ring reprogramming
 
 ### Time Adjustment
 

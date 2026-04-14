@@ -128,13 +128,14 @@ fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
         "name" => &cli.vm_name,
         "cpus" => num_cpus,
         "memory_mb" => mem_size / (1024 * 1024),
-        "track_dirty" => cli.track_dirty,
+        "track_dirty" => cli.track_dirty && !cli.no_track_dirty,
     );
 
+    let track_dirty = cli.track_dirty && !cli.no_track_dirty;
     let opts = CreateOpts {
         force: true,
         use_reservoir: cli.wire_memory,
-        track_dirty: cli.track_dirty,
+        track_dirty,
     };
 
     // Phase 1: Build VM with RAM
@@ -622,6 +623,7 @@ fn init_pci_devices(
     machine: &Machine,
     chipset: &I440FxChipset,
     cli: &Cli,
+    num_vcpus: u32,
     log: &Logger,
 ) -> anyhow::Result<(
     Vec<Arc<dyn vmm_devices::pci::PciDevice>>,
@@ -629,15 +631,19 @@ fn init_pci_devices(
 )> {
     let mut pci_devices: Vec<Arc<dyn vmm_devices::pci::PciDevice>> = Vec::new();
     let mut lifecycle_devices: Vec<Arc<dyn vmm_devices::Lifecycle>> = Vec::new();
+    let is_migrate = cli.migrate_listen.is_some();
+    eprintln!("[vmm] init_pci_devices: migrate_listen={:?} is_migrate={}", cli.migrate_listen, is_migrate);
 
     for slot_spec in &cli.pci_slot {
         match parse_and_create_pci_device(
             slot_spec,
+            num_vcpus,
             chipset,
             machine.bus_pio(),
             machine.bus_mmio(),
             machine.physmap(),
             machine.hdl(),
+            cli.migrate_listen.is_some(),
             log,
         ) {
             Ok((Some(pci), lifecycle)) => {
@@ -697,6 +703,7 @@ fn run_migration_destination(
     listen_addr: &str,
     num_cpus: u32,
     mem_size: usize,
+    devices: &[Arc<dyn vmm_devices::Lifecycle>],
     log: &Logger,
 ) -> anyhow::Result<()> {
     info!(log, "migration destination mode"; "listen" => listen_addr);
@@ -712,11 +719,6 @@ fn run_migration_destination(
     }
 
     // Listen for migration connection
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to create tokio runtime")?;
-
     let listen_addr_owned = listen_addr.to_string();
     let hdl = machine.hdl().clone();
     let physmap = machine.physmap().clone();
@@ -725,31 +727,124 @@ fn run_migration_destination(
         vmm_migrate::MigrationStatus::default(),
     ));
 
-    info!(log, "waiting for migration connection"; "addr" => listen_addr);
+    let is_unix = listen_addr.starts_with('/') || listen_addr.ends_with(".sock");
 
-    rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind(&listen_addr_owned)
-            .await
-            .context("failed to bind migration listener")?;
+    if is_unix {
+        // Synchronous Unix socket -- no tokio needed (works in bhyve zones).
+        info!(log, "connecting to migration socket"; "path" => listen_addr);
+        let stream = {
+            let mut retries = 0;
+            loop {
+                match std::os::unix::net::UnixStream::connect(listen_addr) {
+                    Ok(s) => break s,
+                    Err(_) if retries < 30 => {
+                        retries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    Err(e) => anyhow::bail!("connect to {listen_addr}: {e}"),
+                }
+            }
+        };
+        info!(log, "connected to migration socket");
+        // Build restore callback that reprograms device queue state
+        // on destination devices (virtio rings + NVMe controller).
+        let devs: Vec<Arc<dyn vmm_devices::Lifecycle>> = devices.to_vec();
+        let restore_fn: vmm_migrate::sync_destination::DeviceRestoreFn =
+            Box::new(move |queue_states, nvme_states| {
+                // Restore virtio queue state
+                let migq: Vec<_> = queue_states.iter().map(|qs| {
+                    vmm_devices::lifecycle::VirtioMigrateQueue {
+                        queue_idx: qs.queue_idx,
+                        queue_size: qs.queue_size,
+                        desc_addr: qs.desc_addr,
+                        avail_addr: qs.avail_addr,
+                        used_addr: qs.used_addr,
+                        enabled: qs.enabled,
+                        features: qs.features,
+                        avail_idx: qs.avail_idx,
+                        used_idx: qs.used_idx,
+                        msix_addr: qs.msix_addr,
+                        msix_data: qs.msix_data,
+                        msix_vector: qs.msix_vector,
+                        pci_state: qs.pci_state.clone().map(|pci| {
+                            vmm_devices::lifecycle::VirtioMigratePciState {
+                                command: pci.command,
+                                bar_addrs: pci.bar_addrs,
+                            }
+                        }),
+                    }
+                }).collect();
+                for dev in &devs {
+                    dev.restore_virtio_state(&migq);
+                }
+                // Restore NVMe controller state
+                for nvme in nvme_states {
+                    use vmm_devices::lifecycle::{
+                        NvmeMigrateCq, NvmeMigrateSq, NvmeMigrateState,
+                    };
+                    let mig = NvmeMigrateState {
+                        cc: nvme.cc,
+                        csts: nvme.csts,
+                        aqa: nvme.aqa,
+                        asq_base: nvme.asq_base,
+                        acq_base: nvme.acq_base,
+                        admin_sq: nvme.admin_sq.as_ref().map(|sq| NvmeMigrateSq {
+                            base: sq.base, size: sq.size, head: sq.head,
+                            tail: sq.tail, cq_id: sq.cq_id,
+                        }),
+                        admin_cq: nvme.admin_cq.as_ref().map(|cq| NvmeMigrateCq {
+                            base: cq.base, size: cq.size, head: cq.head,
+                            tail: cq.tail, phase: cq.phase, iv: cq.iv,
+                        }),
+                        io_sqs: nvme.io_sqs.iter().map(|sq| {
+                            sq.as_ref().map(|sq| NvmeMigrateSq {
+                                base: sq.base, size: sq.size, head: sq.head,
+                                tail: sq.tail, cq_id: sq.cq_id,
+                            })
+                        }).collect(),
+                        io_cqs: nvme.io_cqs.iter().map(|cq| {
+                            cq.as_ref().map(|cq| NvmeMigrateCq {
+                                base: cq.base, size: cq.size, head: cq.head,
+                                tail: cq.tail, phase: cq.phase, iv: cq.iv,
+                            })
+                        }).collect(),
+                        num_io_queues: nvme.num_io_queues,
+                        pci_command: nvme.pci_command,
+                        pci_bar_addrs: nvme.pci_bar_addrs,
+                        msix_entries: nvme.msix_entries.clone(),
+                        msix_enabled: nvme.msix_enabled,
+                    };
+                    for dev in &devs {
+                        dev.restore_nvme_state(&mig);
+                    }
+                }
+            });
 
-        let (stream, peer) = listener.accept()
-            .await
-            .context("failed to accept migration connection")?;
-
-        info!(log, "migration connection from"; "peer" => %peer);
-
-        vmm_migrate::destination::run_destination(
-            stream,
-            hdl.clone(),
-            &vmm_core::mem::MemCtx::new(physmap),
-            num_cpus,
-            migrate_mem_size,
-            status,
-            log,
-        )
-        .await
-        .context("migration import failed")
-    })?;
+        vmm_migrate::sync_destination::run_destination_sync(
+            stream, hdl, &vmm_core::mem::MemCtx::new(physmap),
+            num_cpus, migrate_mem_size, status, log,
+            Some(restore_fn),
+        ).context("migration import failed")?;
+    } else {
+        // Async TCP path -- for GZ or manual testing.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build()
+            .context("failed to create tokio runtime")?;
+        let addr = listen_addr.to_string();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind(&addr).await
+                .context("bind failed")?;
+            info!(log, "waiting for migration"; "addr" => &addr);
+            let (stream, peer) = listener.accept().await
+                .context("accept failed")?;
+            info!(log, "migration connection"; "peer" => %peer);
+            vmm_migrate::destination::run_destination(
+                vmm_migrate::MigrateStream::Tcp(stream),
+                hdl.clone(), &vmm_core::mem::MemCtx::new(physmap.clone()),
+                num_cpus, migrate_mem_size, status, log,
+            ).await.context("migration failed")
+        })?;
+    }
 
     info!(log, "migration import complete, starting vCPUs");
 
@@ -868,6 +963,9 @@ fn spawn_control_socket(
         mem_size,
         vcpu_metrics.to_vec(),
         devices,
+        cli.pci_slot.clone(),
+        cli.lpc.clone(),
+        cli.cpu_baseline.clone(),
         log.clone(),
     );
     match control::spawn_control_thread(sock_path, ctrl, log.clone()) {
@@ -983,14 +1081,14 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     let _fwcfg = setup_fwcfg_and_acpi(&machine, &cli, num_cpus, mem_size, log);
 
     // Phase 6: PCI devices
-    let (_pci_devices, lifecycle_devices) = init_pci_devices(&machine, &chipset_devs.chipset, &cli, log)?;
+    let (_pci_devices, lifecycle_devices) = init_pci_devices(&machine, &chipset_devs.chipset, &cli, num_cpus, log)?;
 
     // Phase 7: Direct boot kernel loading (after ACPI tables are ready)
     load_direct_boot_kernel(&machine, &cli, &kernel_image, &initrd_image, mem_size, log)?;
 
     // Phase 8: vCPU activation (migration or normal)
     if let Some(ref listen_addr) = cli.migrate_listen {
-        run_migration_destination(&machine, listen_addr, num_cpus, mem_size, log)?;
+        run_migration_destination(&machine, listen_addr, num_cpus, mem_size, &lifecycle_devices, log)?;
     } else {
         activate_vcpus(&machine, &cli, &kernel_image, log)?;
     }
@@ -1000,9 +1098,27 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         &machine, num_cpus, api_version, log,
     );
 
-    // Phase 10: Post-migration timer kick
+    // Phase 10: Post-migration timer kick + delayed virtio interrupt
     if cli.migrate_listen.is_some() {
         post_migration_timer_kick(&machine, log);
+
+        // Re-inject virtio interrupts periodically after vCPUs start.
+        // The initial post-restore interrupt fires before resume but
+        // may not be sufficient for virtio-blk (the guest's blk driver
+        // may need multiple interrupt cycles to fully process stale
+        // used ring entries and resume I/O).
+        let devs = lifecycle_devices.clone();
+        std::thread::Builder::new()
+            .name("post-migrate-virtio-kick".into())
+            .spawn(move || {
+                for _ in 0..10 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    for dev in &devs {
+                        dev.post_restore_kick();
+                    }
+                }
+            })
+            .ok();
     }
 
     // Phase 11: Control socket
@@ -1026,6 +1142,7 @@ fn create_virtio_blk_device(
     config: &str,
     bdf: Bdf,
     read_only_override: bool,
+    num_vcpus: u32,
     chipset: &I440FxChipset,
     physmap: &Arc<vmm_core::mem::PhysMap>,
     bus_pio: &Arc<vmm_core::pio::PioBus>,
@@ -1043,7 +1160,12 @@ fn create_virtio_blk_device(
         .write(!opts.read_only)
         .open(path)
         .with_context(|| format!("failed to open disk: {}", path))?;
-    let num_queues: u16 = 1;
+    // Default num_queues: min(vcpus, 4). A zvol has one SPA sync pipeline
+    // so beyond ~4 queues there's no throughput gain. Caller can override
+    // via `num-queues=N` (1..=8) on the `-s` config string.
+    let num_queues: u16 = opts
+        .num_queues
+        .unwrap_or_else(|| std::cmp::min(num_vcpus as u16, 4).max(1));
     let blk = VirtioBlock::new(file, &opts, Arc::clone(physmap), num_queues)
         .with_context(|| format!("failed to create virtio-blk for: {}", path))?;
 
@@ -1091,11 +1213,13 @@ fn create_virtio_blk_device(
 ///   `0:5:0,virtio-blk,/path/to/disk.raw`
 fn parse_and_create_pci_device(
     spec: &str,
+    num_vcpus: u32,
     chipset: &I440FxChipset,
     bus_pio: &Arc<vmm_core::pio::PioBus>,
     bus_mmio: &Arc<vmm_core::mmio::MmioBus>,
     physmap: &Arc<vmm_core::mem::PhysMap>,
     vmm_hdl: &Arc<vmm_core::hdl::VmmHdl>,
+    is_migrate_dest: bool,
     log: &Logger,
 ) -> anyhow::Result<(Option<Arc<dyn vmm_devices::pci::PciDevice>>, Option<Arc<dyn vmm_devices::Lifecycle>>)> {
     let parts: Vec<&str> = spec.splitn(3, ',').collect();
@@ -1114,7 +1238,7 @@ fn parse_and_create_pci_device(
                 anyhow::bail!("virtio-blk requires a disk path");
             }
             let pci_dev = create_virtio_blk_device(
-                config, bdf, false, chipset, physmap, bus_pio, bus_mmio, vmm_hdl,
+                config, bdf, false, num_vcpus, chipset, physmap, bus_pio, bus_mmio, vmm_hdl,
             )?;
             info!(log, "virtio-blk attached";
                 "bdf" => %bdf,
@@ -1168,10 +1292,20 @@ fn parse_and_create_pci_device(
                     }
                 }
             });
-            viona.start_intr_poll(
-                raise_fn,
-                log.new(slog::o!("component" => "viona-intr")),
-            );
+            // On migrate dest, store the poll parameters but don't start
+            // the thread yet — rings haven't been programmed. The thread
+            // will be started by start_poll_deferred() after restore.
+            if is_migrate_dest {
+                viona.store_poll_fn(
+                    raise_fn,
+                    log.new(slog::o!("component" => "viona-intr")),
+                );
+            } else {
+                viona.start_intr_poll(
+                    raise_fn,
+                    log.new(slog::o!("component" => "viona-intr")),
+                );
+            }
 
             let lintr = chipset.route_lintr(&bdf);
 
@@ -1363,6 +1497,13 @@ fn parse_blk_config(config: &str) -> (&str, VirtioBlockOpts) {
                         }
                     }
                 }
+                s if s.starts_with("num-queues=") => {
+                    if let Ok(n) = s["num-queues=".len()..].parse::<u16>() {
+                        if n >= 1 && n <= 8 {
+                            opts.num_queues = Some(n);
+                        }
+                    }
+                }
                 _ => {} // ignore unknown options (forward compat)
             }
         }
@@ -1456,53 +1597,106 @@ fn setup_serial_io(
             info!(log, "{name} connected to stdio");
         }
         Some(path) => {
-            // Open as a device/file for both read and write
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-            {
-                Ok(file) => {
-                    // TX: write to device
-                    let fd = file.as_raw_fd();
-                    // Dup the fd so we can have separate read/write handles
+            // Open using libc::open() like C-bhyve to ensure proper
+            // pty initialization on illumos. Rust's File::open may
+            // not trigger the same STREAMS module setup.
+            let c_path = std::ffi::CString::new(path).unwrap();
+            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+            if fd >= 0 {
+                {
+
+                    // Match C-bhyve: cfmakeraw + CLOCAL, blocking mode.
+                    // C-bhyve opens with O_NONBLOCK but then leaves it
+                    // in blocking mode (the O_NONBLOCK is only for the
+                    // open() call to avoid carrier wait). Blocking writes
+                    // to zconsole work because zoneadmd holds the master
+                    // side open, preventing buffer-full stalls.
+                    #[cfg(target_os = "illumos")]
+                    unsafe {
+                        let mut termios: libc::termios = std::mem::zeroed();
+                        if libc::tcgetattr(fd, &mut termios) == 0 {
+                            libc::cfmakeraw(&mut termios);
+                            termios.c_cflag |= libc::CLOCAL;
+                            libc::tcsetattr(fd, libc::TCSANOW, &termios);
+                        }
+                        // Keep O_NONBLOCK set. On illumos, open() with
+                        // O_NONBLOCK is transient, but we explicitly set
+                        // it for writes: zconsole writes must not block
+                        // the vCPU when no console client is connected
+                        // (pty buffer full). The read path uses poll()
+                        // so EAGAIN is handled correctly.
+                        libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                    }
+
+                    let is_tty = unsafe { libc::isatty(fd) } != 0;
+                    eprintln!("[serial] fd={} isatty={} path={}", fd, is_tty, path);
+
+                    // TX: dup the fd for writes
                     let write_fd = unsafe { libc::dup(fd) };
-                    let write_file = std::sync::Mutex::new(unsafe {
-                        std::fs::File::from_raw_fd(write_fd)
-                    });
+                    // TX: write directly from vCPU using non-blocking write.
+                    let tx_err_count = std::sync::atomic::AtomicU32::new(0);
                     uart.set_tx_sink(Box::new(move |b: u8| {
-                        if let Ok(mut f) = write_file.lock() {
-                            if let Err(e) = f.write_all(&[b]) {
-                                eprintln!("[serial] device write error: {}", e);
+                        let ret = unsafe { libc::write(write_fd, &b as *const u8 as *const _, 1) };
+                        if ret < 0 {
+                            let n = tx_err_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 3 {
+                                let err = std::io::Error::last_os_error();
+                                eprintln!("[serial-tx] write error: {} (fd={})", err, write_fd);
                             }
                         }
                     }));
 
-                    // RX: read from device in a thread
+                    // RX: dup the fd for reading. We use poll() with a
+                    // blocking fd — do NOT set O_NONBLOCK because dup'd
+                    // fds share the file status flags and nonblock would
+                    // affect the write path too (causing dropped console data).
                     let uart_input = uart.clone();
                     let path_owned = path.to_string();
+                    let read_fd_dup = unsafe { libc::dup(fd) };
                     thread::Builder::new()
                         .name(format!("{name}-input"))
                         .spawn(move || {
-                            let mut buf = [0u8; 1];
-                            let mut reader = file;
+                            let mut buf = [0u8; 64];
                             loop {
-                                match reader.read(&mut buf) {
-                                    Ok(0) => break,
-                                    Ok(_) => { uart_input.input_byte(buf[0]); }
-                                    Err(_) => break,
+                                // Poll for readable data
+                                let mut pfd = libc::pollfd {
+                                    fd: read_fd_dup,
+                                    events: libc::POLLIN,
+                                    revents: 0,
+                                };
+                                let ret = unsafe { libc::poll(&mut pfd, 1, 1000) };
+                                if ret < 0 {
+                                    let err = std::io::Error::last_os_error();
+                                    if err.kind() == std::io::ErrorKind::Interrupted { continue; }
+                                    break;
+                                }
+                                if ret == 0 { continue; } // timeout
+                                if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 { break; }
+                                if pfd.revents & libc::POLLIN != 0 {
+                                    let n = unsafe {
+                                        libc::read(read_fd_dup, buf.as_mut_ptr() as *mut _, buf.len())
+                                    };
+                                    if n <= 0 {
+                                        if n < 0 {
+                                            let err = std::io::Error::last_os_error();
+                                            if err.kind() == std::io::ErrorKind::WouldBlock { continue; }
+                                        }
+                                        break;
+                                    }
+                                    for i in 0..n as usize {
+                                        uart_input.input_byte(buf[i]);
+                                    }
                                 }
                             }
                         })
                         .expect("failed to spawn serial input thread");
                     info!(log, "{name} connected to {path}");
                 }
-                Err(e) => {
-                    warn!(log, "failed to open {name} device";
-                        "path" => path,
-                        "error" => %e,
-                    );
-                }
+            } else {
+                warn!(log, "failed to open {name} device";
+                    "path" => path,
+                    "error" => std::io::Error::last_os_error(),
+                );
             }
         }
     }
@@ -1568,6 +1762,10 @@ fn setup_serial_socket(
                             *guard = stream.try_clone().ok();
                         }
                         // RX: read from client → UART input
+                        // Back-pressure: if the RX FIFO is full, wait
+                        // for the guest to drain it before pushing more
+                        // bytes.  c-bhyve does this via mevent_disable/
+                        // enable; we use a simple retry loop instead.
                         let mut reader = stream;
                         let mut buf = [0u8; 64];
                         loop {
@@ -1575,7 +1773,11 @@ fn setup_serial_socket(
                                 Ok(0) => break,
                                 Ok(n) => {
                                     for &b in &buf[..n] {
-                                        uart_rx.input_byte(b);
+                                        while !uart_rx.input_byte(b) {
+                                            std::thread::sleep(
+                                                std::time::Duration::from_micros(100),
+                                            );
+                                        }
                                     }
                                 }
                                 Err(_) => break,

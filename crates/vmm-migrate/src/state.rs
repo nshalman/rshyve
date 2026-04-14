@@ -510,7 +510,7 @@ pub fn export_device_state(
         }
     }
 
-    Ok(DeviceState { vcpus, devices })
+    Ok(DeviceState { vcpus, devices, virtio_queues: Vec::new(), nvme_controllers: Vec::new() })
 }
 
 /// Import all kernel device state (per-vCPU + system devices).
@@ -640,10 +640,7 @@ mod tests {
         assert!(!SYSTEM_DEVICES.is_empty());
     }
 
-    #[test]
-    fn vcpu_classes_are_non_empty() {
-        assert!(!_VCPU_CLASSES.is_empty());
-    }
+    // vcpu_classes test removed — constant was inlined into export functions
 
     #[test]
     fn system_device_classes_are_unique() {

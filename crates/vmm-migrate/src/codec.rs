@@ -42,7 +42,18 @@ pub enum MessageType {
     MemEnd = 9,
     /// Memory transfer complete acknowledgement.
     MemDone = 10,
+    /// Batch of memory pages (optionally zstd-compressed).
+    ///
+    /// Wire format: `[base_gpa: u64][page_count: u32][flags: u32][data...]`
+    /// flags bit 0: ZSTD_COMPRESSED (data is zstd-compressed)
+    /// data: page_count * 4096 bytes (uncompressed) or zstd stream
+    PageBatch = 11,
+    /// Source has paused; next RAM pass is the final one.
+    PauseSignal = 12,
 }
+
+/// PageBatch flag: data payload is zstd-compressed.
+pub const PAGE_BATCH_FLAG_ZSTD: u32 = 1 << 0;
 
 impl MessageType {
     /// Convert a raw tag byte to a MessageType.
@@ -59,6 +70,8 @@ impl MessageType {
             8 => Some(Self::MemXfer),
             9 => Some(Self::MemEnd),
             10 => Some(Self::MemDone),
+            11 => Some(Self::PageBatch),
+            12 => Some(Self::PauseSignal),
             _ => None,
         }
     }
@@ -127,6 +140,120 @@ pub struct DeviceState {
     pub vcpus: Vec<VcpuStatePayload>,
     /// System device state payloads (IOAPIC, ATPIT, etc.).
     pub devices: Vec<DevicePayload>,
+    /// Virtio queue state for viona ring reprogramming on destination.
+    #[serde(default)]
+    pub virtio_queues: Vec<VirtioQueueState>,
+    /// NVMe controller state for disk device restoration on destination.
+    #[serde(default)]
+    pub nvme_controllers: Vec<NvmeControllerState>,
+}
+
+/// Virtio PCI transport state needed to restore BAR decoding after migration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct VirtioMigratePciState {
+    /// PCI command register bits that gate BAR decoding and bus mastering.
+    pub command: u16,
+    /// BAR base addresses indexed by BAR number (BAR0..BAR5).
+    pub bar_addrs: [u64; 6],
+}
+
+/// Virtio queue ring addresses for post-migration restoration.
+///
+/// After migration, the destination's viona kernel driver needs
+/// the ring GPAs to be reprogrammed. These addresses were configured
+/// by the guest on the source and must be transferred explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtioQueueState {
+    /// PCI BDF slot of the virtio device (to match on destination).
+    pub pci_slot: u8,
+    /// Queue index (0=RX, 1=TX for viona).
+    pub queue_idx: u16,
+    /// Queue size (number of descriptors).
+    pub queue_size: u16,
+    /// Guest physical address of descriptor table.
+    pub desc_addr: u64,
+    /// Guest physical address of available ring.
+    pub avail_addr: u64,
+    /// Guest physical address of used ring.
+    pub used_addr: u64,
+    /// Whether this queue is enabled.
+    pub enabled: bool,
+    /// Negotiated features for the device.
+    pub features: u64,
+    /// Current available ring index (device-side).
+    #[serde(default)]
+    pub avail_idx: u16,
+    /// Current used ring index (device-side shadow).
+    #[serde(default)]
+    pub used_idx: u16,
+    /// MSI-X table entry address for this queue's interrupt vector.
+    #[serde(default)]
+    pub msix_addr: u64,
+    /// MSI-X table entry data for this queue's interrupt vector.
+    #[serde(default)]
+    pub msix_data: u32,
+    /// MSI-X vector number for this queue (0xFFFF = no vector).
+    #[serde(default = "default_msix_no_vector")]
+    pub msix_vector: u16,
+    /// PCI BAR addresses and command register bits for the device.
+    #[serde(default)]
+    pub pci_state: Option<VirtioMigratePciState>,
+}
+
+fn default_msix_no_vector() -> u16 { 0xFFFF }
+
+/// NVMe controller state for migration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NvmeControllerState {
+    /// Controller Configuration register.
+    pub cc: u32,
+    /// Controller Status register.
+    pub csts: u32,
+    /// Admin Queue Attributes register.
+    pub aqa: u32,
+    /// Admin Submission Queue base address.
+    pub asq_base: u64,
+    /// Admin Completion Queue base address.
+    pub acq_base: u64,
+    /// Admin submission queue state.
+    pub admin_sq: Option<NvmeSqState>,
+    /// Admin completion queue state.
+    pub admin_cq: Option<NvmeCqState>,
+    /// I/O submission queue states (index 0 = qid 1).
+    pub io_sqs: Vec<Option<NvmeSqState>>,
+    /// I/O completion queue states (index 0 = qid 1).
+    pub io_cqs: Vec<Option<NvmeCqState>>,
+    /// Number of I/O queue pairs negotiated with guest.
+    pub num_io_queues: u16,
+    /// PCI command register.
+    pub pci_command: u16,
+    /// PCI BAR base addresses (BAR0..BAR5).
+    pub pci_bar_addrs: [u64; 6],
+    /// MSI-X table entries: (addr, data) per vector.
+    pub msix_entries: Vec<(u64, u64)>,
+    /// Whether MSI-X is globally enabled.
+    pub msix_enabled: bool,
+}
+
+/// NVMe submission queue state for migration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NvmeSqState {
+    pub base: u64,
+    pub size: u16,
+    pub head: u16,
+    pub tail: u16,
+    pub cq_id: u16,
+}
+
+/// NVMe completion queue state for migration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NvmeCqState {
+    pub base: u64,
+    pub size: u16,
+    pub head: u16,
+    pub tail: u16,
+    pub phase: bool,
+    pub iv: u16,
 }
 
 /// State data for a single vCPU.
@@ -204,6 +331,19 @@ pub enum Message {
     MemEnd,
     /// Memory transfer complete acknowledgement.
     MemDone,
+    /// Batch of memory pages, optionally zstd-compressed.
+    PageBatch {
+        /// GPA of the first page in the batch.
+        base_gpa: u64,
+        /// Number of pages (each 4 KiB).
+        page_count: u32,
+        /// Flags (bit 0 = ZSTD_COMPRESSED).
+        flags: u32,
+        /// Page data (compressed or raw).
+        data: Vec<u8>,
+    },
+    /// Source has paused the VM; next RAM pass is final.
+    PauseSignal,
 }
 
 impl Message {
@@ -256,6 +396,15 @@ impl Message {
             }
             Message::MemEnd => (MessageType::MemEnd, Vec::new()),
             Message::MemDone => (MessageType::MemDone, Vec::new()),
+            Message::PageBatch { base_gpa, page_count, flags, ref data } => {
+                let mut payload = Vec::with_capacity(16 + data.len());
+                payload.extend_from_slice(&base_gpa.to_le_bytes());
+                payload.extend_from_slice(&page_count.to_le_bytes());
+                payload.extend_from_slice(&flags.to_le_bytes());
+                payload.extend_from_slice(data);
+                (MessageType::PageBatch, payload)
+            }
+            Message::PauseSignal => (MessageType::PauseSignal, Vec::new()),
         };
 
         let mut frame = payload;
@@ -372,6 +521,25 @@ impl Message {
             }
             MessageType::MemEnd => Ok(Message::MemEnd),
             MessageType::MemDone => Ok(Message::MemDone),
+            MessageType::PageBatch => {
+                if payload.len() < 16 {
+                    return Err(MigrateError::Codec(
+                        "PageBatch too short for header".to_string(),
+                    ));
+                }
+                let base_gpa = u64::from_le_bytes(
+                    payload[..8].try_into().unwrap(),
+                );
+                let page_count = u32::from_le_bytes(
+                    payload[8..12].try_into().unwrap(),
+                );
+                let flags = u32::from_le_bytes(
+                    payload[12..16].try_into().unwrap(),
+                );
+                let data = payload[16..].to_vec();
+                Ok(Message::PageBatch { base_gpa, page_count, flags, data })
+            }
+            MessageType::PauseSignal => Ok(Message::PauseSignal),
         }
     }
 
@@ -575,6 +743,33 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_page_batch() {
+        let data = vec![0xABu8; 4096 * 4]; // 4 pages
+        let msg = Message::PageBatch {
+            base_gpa: 0x10_0000,
+            page_count: 4,
+            flags: PAGE_BATCH_FLAG_ZSTD,
+            data: data.clone(),
+        };
+        let out = roundtrip(&msg);
+        match out {
+            Message::PageBatch { base_gpa, page_count, flags, data: d } => {
+                assert_eq!(base_gpa, 0x10_0000);
+                assert_eq!(page_count, 4);
+                assert_eq!(flags, PAGE_BATCH_FLAG_ZSTD);
+                assert_eq!(d, data);
+            }
+            other => panic!("expected PageBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_pause_signal() {
+        let out = roundtrip(&Message::PauseSignal);
+        assert!(matches!(out, Message::PauseSignal));
+    }
+
+    #[test]
     fn decode_unknown_tag_fails() {
         let ws =
             tokio_tungstenite::tungstenite::Message::Binary(vec![0xFF]);
@@ -602,5 +797,26 @@ mod tests {
             }
             other => panic!("expected Serialized, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn virtio_queue_state_defaults_missing_pci_state() {
+        let encoded = r#"(
+            pci_slot: 0,
+            queue_idx: 0,
+            queue_size: 256,
+            desc_addr: 4096,
+            avail_addr: 8192,
+            used_addr: 12288,
+            enabled: true,
+            features: 4294967296,
+            avail_idx: 7,
+            used_idx: 5,
+            msix_addr: 0,
+            msix_data: 0,
+        )"#;
+
+        let decoded: VirtioQueueState = ron::from_str(encoded).unwrap();
+        assert!(decoded.pci_state.is_none());
     }
 }

@@ -99,9 +99,14 @@ pub struct Cli {
     #[arg(long)]
     pub json_config: Option<PathBuf>,
 
-    /// Enable dirty page tracking for live migration
-    #[arg(long)]
+    /// Enable dirty page tracking for live migration (default: on).
+    /// Disable with --no-track-dirty for benchmarking or non-migratable VMs.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::SetTrue)]
     pub track_dirty: bool,
+
+    /// Disable dirty page tracking (opt-out from default --track-dirty)
+    #[arg(long = "no-track-dirty", action = clap::ArgAction::SetTrue)]
+    pub no_track_dirty: bool,
 
     /// Direct boot: Linux kernel bzImage path (bypasses UEFI firmware)
     #[arg(long)]

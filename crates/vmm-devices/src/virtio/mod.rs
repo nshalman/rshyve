@@ -138,6 +138,36 @@ pub trait VirtioDevice: Send + Sync + 'static {
         // Default: nothing to do for software-emulated devices
     }
 
+    /// Get kernel ring indices for migration export. Returns (avail_idx, used_idx).
+    /// Software devices return the VirtQueue indices; kernel devices query the kernel.
+    fn get_kernel_ring_indices(&self, _queue_idx: u16) -> (u16, u16) { (0, 0) }
+
+    /// Reset all rings before migration restore. Kernel-accelerated
+    /// devices pause and reset all ring processing.
+    fn reset_all_rings(&self) {}
+
+    /// Restore ring state after migration with current indices + MSI-X.
+    fn restore_ring_state(
+        &self,
+        _queue_idx: u16, _size: u16,
+        _desc: u64, _avail: u64, _used: u64,
+        _avail_idx: u16, _used_idx: u16,
+        _msix_addr: u64, _msix_data: u32,
+    ) {}
+
+    /// Pause kernel ring threads for migration export.
+    /// Must be called after vCPU pause to quiesce kernel I/O before
+    /// reading ring state. Only kernel-accelerated devices need this.
+    fn pause_rings_for_export(&self) {}
+
+    /// Program notification addresses after migration.
+    fn set_notify_addrs(&self, _pio_port: u16, _mmio_addr: u64) {}
+
+    /// Start the deferred interrupt poll thread after migration restore.
+    /// Kernel-accelerated devices (viona) use this to start the poll
+    /// thread that was skipped during device creation.
+    fn start_poll_deferred(&self) {}
+
     /// Reset the device to its initial state.
     fn reset(&self);
 }

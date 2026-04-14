@@ -87,6 +87,11 @@ pub struct VmController {
     vcpu_metrics: Vec<Arc<vmm_devices::metrics::VcpuMetrics>>,
     /// Devices implementing the Lifecycle trait for pause/resume.
     devices: Vec<Arc<dyn vmm_devices::Lifecycle>>,
+    /// Original CLI args for migrate-config reconstruction.
+    cli_pci_slots: Vec<String>,
+    cli_lpc: Vec<String>,
+    /// CPU baseline for migration feature masking.
+    cpu_baseline: String,
     log: Logger,
 }
 
@@ -99,6 +104,9 @@ impl VmController {
         mem_size: usize,
         vcpu_metrics: Vec<Arc<vmm_devices::metrics::VcpuMetrics>>,
         devices: Vec<Arc<dyn vmm_devices::Lifecycle>>,
+        cli_pci_slots: Vec<String>,
+        cli_lpc: Vec<String>,
+        cpu_baseline: String,
         log: Logger,
     ) -> Arc<Self> {
         let name = vm_name.to_string();
@@ -113,8 +121,102 @@ impl VmController {
             migrate_status: Mutex::new(None),
             vcpu_metrics,
             devices,
+            cli_pci_slots,
+            cli_lpc,
+            cpu_baseline,
             log,
         })
+    }
+
+    fn export_device_queues(&self) -> vmm_migrate::sync_source::DeviceQueueExport {
+        // Pause all devices so in-flight I/O completes before we
+        // snapshot ring indices. Without this, requests popped from
+        // the avail ring but not yet completed would be lost — the
+        // guest would wait forever for their completions.
+        for dev in &self.devices {
+            dev.pause();
+        }
+        // Wait for all workers to finish (typically < 100ms)
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        for _ in 0..100 {
+            let all_paused = self.devices.iter().all(|dev| {
+                let mut fut = dev.paused();
+                matches!(
+                    fut.as_mut().poll(&mut cx),
+                    std::task::Poll::Ready(())
+                )
+            });
+            if all_paused { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let mut virtio_queues = Vec::new();
+        let mut nvme_controllers = Vec::new();
+
+        for dev in &self.devices {
+            for q in dev.export_virtio_state() {
+                virtio_queues.push(vmm_migrate::codec::VirtioQueueState {
+                    pci_slot: 0,
+                    queue_idx: q.queue_idx,
+                    queue_size: q.queue_size,
+                    desc_addr: q.desc_addr,
+                    avail_addr: q.avail_addr,
+                    used_addr: q.used_addr,
+                    enabled: q.enabled,
+                    features: q.features,
+                    avail_idx: q.avail_idx,
+                    used_idx: q.used_idx,
+                    msix_addr: q.msix_addr,
+                    msix_data: q.msix_data,
+                    msix_vector: q.msix_vector,
+                    pci_state: q.pci_state.clone().map(|pci| {
+                        vmm_migrate::codec::VirtioMigratePciState {
+                            command: pci.command,
+                            bar_addrs: pci.bar_addrs,
+                        }
+                    }),
+                });
+            }
+            if let Some(nvme) = dev.export_nvme_state() {
+                nvme_controllers.push(vmm_migrate::codec::NvmeControllerState {
+                    cc: nvme.cc,
+                    csts: nvme.csts,
+                    aqa: nvme.aqa,
+                    asq_base: nvme.asq_base,
+                    acq_base: nvme.acq_base,
+                    admin_sq: nvme.admin_sq.map(|sq| vmm_migrate::codec::NvmeSqState {
+                        base: sq.base, size: sq.size, head: sq.head,
+                        tail: sq.tail, cq_id: sq.cq_id,
+                    }),
+                    admin_cq: nvme.admin_cq.map(|cq| vmm_migrate::codec::NvmeCqState {
+                        base: cq.base, size: cq.size, head: cq.head,
+                        tail: cq.tail, phase: cq.phase, iv: cq.iv,
+                    }),
+                    io_sqs: nvme.io_sqs.into_iter().map(|sq| {
+                        sq.map(|sq| vmm_migrate::codec::NvmeSqState {
+                            base: sq.base, size: sq.size, head: sq.head,
+                            tail: sq.tail, cq_id: sq.cq_id,
+                        })
+                    }).collect(),
+                    io_cqs: nvme.io_cqs.into_iter().map(|cq| {
+                        cq.map(|cq| vmm_migrate::codec::NvmeCqState {
+                            base: cq.base, size: cq.size, head: cq.head,
+                            tail: cq.tail, phase: cq.phase, iv: cq.iv,
+                        })
+                    }).collect(),
+                    num_io_queues: nvme.num_io_queues,
+                    pci_command: nvme.pci_command,
+                    pci_bar_addrs: nvme.pci_bar_addrs,
+                    msix_entries: nvme.msix_entries,
+                    msix_enabled: nvme.msix_enabled,
+                });
+            }
+        }
+        vmm_migrate::sync_source::DeviceQueueExport {
+            virtio_queues,
+            nvme_controllers,
+        }
     }
 
     fn state(&self) -> VmRunState {
@@ -175,11 +277,19 @@ enum Command {
     #[serde(rename = "stop")]
     Stop,
     #[serde(rename = "migrate-source")]
-    MigrateSource { target_addr: String },
+    MigrateSource {
+        target_addr: String,
+        /// Unix socket path for post-pause ZFS sync barrier.
+        /// VMM connects after vCPU pause; agent writes back when ZFS done.
+        #[serde(default)]
+        zfs_barrier: Option<String>,
+    },
     #[serde(rename = "migrate-dest")]
     MigrateDest { listen_addr: String },
     #[serde(rename = "migrate-status")]
     MigrateStatus,
+    #[serde(rename = "migrate-config")]
+    MigrateConfig,
     #[serde(rename = "metrics")]
     Metrics,
     #[serde(rename = "metrics-prometheus")]
@@ -207,6 +317,8 @@ struct Response {
     migrate_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     migrate_pages: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config: Option<serde_json::Value>,
 }
 
 impl Response {
@@ -222,6 +334,7 @@ impl Response {
             migrate_phase: None,
             migrate_bytes: None,
             migrate_pages: None,
+            config: None,
         }
     }
 
@@ -237,6 +350,7 @@ impl Response {
             migrate_phase: None,
             migrate_bytes: None,
             migrate_pages: None,
+            config: None,
         }
     }
 }
@@ -356,12 +470,15 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             }
         }
 
-        Command::MigrateSource { target_addr } => {
+        Command::MigrateSource { target_addr, zfs_barrier } => {
             // Validate the target address to prevent SSRF. Require
             // it to be a valid host:port and reject obviously-dangerous
             // targets like localhost, link-local, and multicast.
-            if let Err(e) = validate_migration_addr(&target_addr) {
-                return Response::err(&format!("invalid target_addr: {e}"));
+            // Skip TCP validation for Unix socket paths
+            if !target_addr.starts_with('/') && !target_addr.ends_with(".sock") {
+                if let Err(e) = validate_migration_addr(&target_addr) {
+                    return Response::err(&format!("invalid target_addr: {e}"));
+                }
             }
 
             if !ctrl.transition(VmRunState::Running, VmRunState::Migrating) {
@@ -384,36 +501,24 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             let mem_size = ctrl.mem_size as u64;
             let mlog = ctrl.log.clone();
 
+            let is_unix = target_addr.starts_with('/')
+                || target_addr.ends_with(".sock");
+
             if let Err(e) = thread::Builder::new()
                 .name("migrate-source".into())
                 .spawn(move || {
-                    let rt = match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            error!(mlog, "failed to create tokio runtime"; "error" => %e);
-                            ctrl_arc.state.store(
-                                VmRunState::Running as u8,
-                                Ordering::Release,
-                            );
-                            return;
-                        }
-                    };
-
-                    rt.block_on(async {
-                        let stream = match tokio::net::TcpStream::connect(
+                    if is_unix {
+                        // Synchronous path for Unix sockets (works in
+                        // bhyve zones without /dev/poll).
+                        info!(mlog, "connecting to migration socket";
+                            "path" => &target_addr);
+                        let stream = match std::os::unix::net::UnixStream::connect(
                             &target_addr,
-                        )
-                        .await
-                        {
+                        ) {
                             Ok(s) => s,
                             Err(e) => {
-                                error!(mlog, "connect to target failed";
-                                    "target" => &target_addr,
-                                    "error" => %e,
-                                );
+                                error!(mlog, "connect failed";
+                                    "path" => &target_addr, "error" => %e);
                                 ctrl_arc.state.store(
                                     VmRunState::Running as u8,
                                     Ordering::Release,
@@ -422,17 +527,28 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                             }
                         };
 
-                        match vmm_migrate::source::run_source(
-                            stream,
-                            hdl,
-                            &memctx,
-                            num_cpus,
-                            mem_size,
-                            status,
-                            &mlog,
-                        )
-                        .await
-                        {
+                        let ctrl_for_prepause = ctrl_arc.clone();
+                        let pre_pause_fn: vmm_migrate::sync_source::DevicePrePauseFn =
+                            Box::new(move || {
+                                for dev in &ctrl_for_prepause.devices {
+                                    dev.pause_for_migration();
+                                }
+                            });
+                        let ctrl_for_flush = ctrl_arc.clone();
+                        let flush_fn: vmm_migrate::sync_source::DeviceFlushFn =
+                            Box::new(move || {
+                                for dev in &ctrl_for_flush.devices {
+                                    dev.flush_backing();
+                                }
+                            });
+                        let ctrl_for_export = ctrl_arc.clone();
+                        let export_fn: vmm_migrate::sync_source::DeviceExportFn =
+                            Box::new(move || ctrl_for_export.export_device_queues());
+                        match vmm_migrate::sync_source::run_source_sync(
+                            stream, hdl, &memctx, num_cpus, mem_size,
+                            status, &mlog, &ctrl_arc.cpu_baseline,
+                            pre_pause_fn, flush_fn, export_fn, zfs_barrier,
+                        ) {
                             Ok(()) => {
                                 info!(mlog, "source migration complete");
                                 ctrl_arc.state.store(
@@ -441,14 +557,67 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                                 );
                             }
                             Err(e) => {
-                                error!(mlog, "source migration failed"; "error" => %e);
+                                error!(mlog, "source migration failed";
+                                    "error" => %e);
                                 ctrl_arc.state.store(
                                     VmRunState::Running as u8,
                                     Ordering::Release,
                                 );
                             }
                         }
-                    });
+                    } else {
+                        // Async path for TCP (GZ or manual testing)
+                        let rt = match tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            Ok(rt) => rt,
+                            Err(e) => {
+                                error!(mlog, "tokio runtime failed"; "error" => %e);
+                                ctrl_arc.state.store(
+                                    VmRunState::Running as u8,
+                                    Ordering::Release,
+                                );
+                                return;
+                            }
+                        };
+                        rt.block_on(async {
+                            let stream = match tokio::net::TcpStream::connect(
+                                &target_addr,
+                            ).await {
+                                Ok(s) => vmm_migrate::MigrateStream::Tcp(s),
+                                Err(e) => {
+                                    error!(mlog, "connect failed";
+                                        "target" => &target_addr, "error" => %e);
+                                    ctrl_arc.state.store(
+                                        VmRunState::Running as u8,
+                                        Ordering::Release,
+                                    );
+                                    return;
+                                }
+                            };
+                            match vmm_migrate::source::run_source(
+                                stream, hdl, &memctx, num_cpus, mem_size,
+                                status, &mlog, &ctrl_arc.cpu_baseline,
+                            ).await {
+                                Ok(()) => {
+                                    info!(mlog, "source migration complete");
+                                    ctrl_arc.state.store(
+                                        VmRunState::Stopped as u8,
+                                        Ordering::Release,
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(mlog, "source migration failed";
+                                        "error" => %e);
+                                    ctrl_arc.state.store(
+                                        VmRunState::Running as u8,
+                                        Ordering::Release,
+                                    );
+                                }
+                            }
+                        });
+                    }
                 })
             {
                 ctrl.state.store(
@@ -621,6 +790,19 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                     r
                 }
             }
+        }
+
+        Command::MigrateConfig => {
+            let config = serde_json::json!({
+                "vm_name": ctrl.vm_name,
+                "num_cpus": ctrl.num_cpus,
+                "memory_mb": ctrl.mem_size / (1024 * 1024),
+                "pci_slots": ctrl.cli_pci_slots,
+                "lpc_devices": ctrl.cli_lpc,
+            });
+            let mut r = Response::ok();
+            r.config = Some(config);
+            r
         }
     }
 }

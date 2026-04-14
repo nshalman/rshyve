@@ -29,7 +29,7 @@ A SmartOS platform image with this VMM replacing `/usr/sbin/bhyve` is
 available for testing:
 
 ```
-https://$MANTA_URL/nick.wilkens@mnxsolutions.com/public/platforms/platform-20260402T214615Z.tgz
+https://$MANTA_URL/nick.wilkens@mnxsolutions.com/public/platforms/platform-20260406T135607Z.tgz
 ```
 
 Install via `sdcadm platform install <url>` and assign to a compute node.

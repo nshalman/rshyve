@@ -27,6 +27,74 @@ use futures::future::{self, BoxFuture};
 
 use crate::migrate::Migrator;
 
+/// Virtio PCI transport state for migration export/import.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VirtioMigratePciState {
+    /// PCI command register bits that gate BAR decoding and bus mastering.
+    pub command: u16,
+    /// BAR base addresses indexed by BAR number (BAR0..BAR5).
+    pub bar_addrs: [u64; 6],
+}
+
+/// Virtio queue state for migration export/import.
+#[derive(Debug, Clone, Default)]
+pub struct VirtioMigrateQueue {
+    pub queue_idx: u16,
+    pub queue_size: u16,
+    pub desc_addr: u64,
+    pub avail_addr: u64,
+    pub used_addr: u64,
+    pub enabled: bool,
+    pub features: u64,
+    pub avail_idx: u16,
+    pub used_idx: u16,
+    pub msix_addr: u64,
+    pub msix_data: u32,
+    /// MSI-X vector number for this queue (VIRTIO_MSI_NO_VECTOR = 0xFFFF if none).
+    pub msix_vector: u16,
+    pub pci_state: Option<VirtioMigratePciState>,
+}
+
+/// NVMe controller state for migration export/import.
+#[derive(Debug, Clone, Default)]
+pub struct NvmeMigrateState {
+    pub cc: u32,
+    pub csts: u32,
+    pub aqa: u32,
+    pub asq_base: u64,
+    pub acq_base: u64,
+    pub admin_sq: Option<NvmeMigrateSq>,
+    pub admin_cq: Option<NvmeMigrateCq>,
+    pub io_sqs: Vec<Option<NvmeMigrateSq>>,
+    pub io_cqs: Vec<Option<NvmeMigrateCq>>,
+    pub num_io_queues: u16,
+    pub pci_command: u16,
+    pub pci_bar_addrs: [u64; 6],
+    pub msix_entries: Vec<(u64, u64)>,
+    pub msix_enabled: bool,
+}
+
+/// NVMe submission queue state for migration.
+#[derive(Debug, Clone)]
+pub struct NvmeMigrateSq {
+    pub base: u64,
+    pub size: u16,
+    pub head: u16,
+    pub tail: u16,
+    pub cq_id: u16,
+}
+
+/// NVMe completion queue state for migration.
+#[derive(Debug, Clone)]
+pub struct NvmeMigrateCq {
+    pub base: u64,
+    pub size: u16,
+    pub head: u16,
+    pub tail: u16,
+    pub phase: bool,
+    pub iv: u16,
+}
+
 /// General trait for emulated devices in the system.
 ///
 /// As the VM goes through its lifecycle, the emulated devices which it
@@ -74,6 +142,47 @@ pub trait Lifecycle: Send + Sync + 'static {
     fn migrate(&'_ self) -> Migrator<'_> {
         Migrator::Empty
     }
+
+    /// Pause device rings before vCPU pause for migration.
+    /// Kernel-accelerated devices (viona) pause their ring threads
+    /// so no entries are consumed between this call and state export.
+    fn pause_for_migration(&self) {}
+
+    /// Flush any device-level writeback cache to durable storage.
+    ///
+    /// Called during migration pause AFTER `hdl.pause()` has quiesced
+    /// vCPUs and BEFORE device state is exported / the ZFS barrier is
+    /// hit. Default: no-op.
+    ///
+    /// With zvol `DKIOCSETWCE=1` (enabled by `blkdev::DiskCache`), writes
+    /// return OK from the zvol cache without hitting the ZFS pool. A
+    /// `zfs send` incremental only captures pool state, so any buffered
+    /// writes not fsynced before the send would be lost on the destination.
+    ///
+    /// Implementors must also ensure in-flight worker writes complete
+    /// before syncing so the fsync barrier covers the same set of writes
+    /// the guest saw completions for.
+    fn flush_backing(&self) {}
+
+    /// Export virtio queue state for migration.
+    fn export_virtio_state(&self) -> Vec<VirtioMigrateQueue> {
+        Vec::new()
+    }
+
+    /// Restore virtio queue state after migration import.
+    fn restore_virtio_state(&self, _states: &[VirtioMigrateQueue]) {}
+
+    /// Post-restore kick: called after restore_virtio_state to wake
+    /// rings and start interrupt polling. Default: no-op.
+    fn post_restore_kick(&self) {}
+
+    /// Export NVMe controller state for migration.
+    fn export_nvme_state(&self) -> Option<NvmeMigrateState> {
+        None
+    }
+
+    /// Restore NVMe controller state after migration import.
+    fn restore_nvme_state(&self, _state: &NvmeMigrateState) {}
 }
 
 /// Indicator for tracking [`Lifecycle`] states.

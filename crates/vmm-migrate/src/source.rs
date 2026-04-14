@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use slog;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 
 use vmm_core::hdl::VmmHdl;
@@ -27,12 +27,17 @@ use vmm_core::mem::{MemCtx, RegionKind};
 
 use crate::codec::{
     CpuFeatures, MemRegionDesc, Message, MigrateError, MigrationPreamble,
-    ProtocolOffer, ProtocolSelect,
+    ProtocolOffer, ProtocolSelect, PAGE_BATCH_FLAG_ZSTD,
 };
-use crate::protocol::{PAGE_SIZE, PROTOCOL_RON_V0};
+use crate::protocol::{PageIter, PAGE_SIZE, PROTOCOL_RON_V0};
 use crate::state;
 use crate::MigrationPhase;
 use crate::MigrationStatus;
+
+/// Number of pages per batch for PageBatch messages.
+const BATCH_SIZE: usize = 64;
+/// zstd compression level (1 = fastest, good ratio for RAM).
+const ZSTD_LEVEL: i32 = 1;
 
 /// Run the source side of live migration.
 ///
@@ -42,16 +47,20 @@ use crate::MigrationStatus;
 /// On success, the VM is paused and should be destroyed by the caller.
 /// On failure, the VM is resumed (if it was paused) and the error is
 /// returned.
-pub async fn run_source(
-    stream: TcpStream,
+pub async fn run_source<S>(
+    stream: S,
     hdl: Arc<VmmHdl>,
     memctx: &MemCtx,
     num_cpus: u32,
     mem_size: u64,
     status: Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
-) -> Result<(), MigrateError> {
-    // Upgrade TCP to WebSocket (client role)
+    cpu_baseline: &str,
+) -> Result<(), MigrateError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // Upgrade to WebSocket (client role)
     let (ws, _) = tokio_tungstenite::client_async(
         "ws://migration/live",
         stream,
@@ -62,7 +71,7 @@ pub async fn run_source(
     )))?;
 
     let result = run_source_inner(
-        ws, &hdl, memctx, num_cpus, mem_size, &status, log,
+        ws, &hdl, memctx, num_cpus, mem_size, &status, log, cpu_baseline,
     )
     .await;
 
@@ -80,14 +89,15 @@ pub async fn run_source(
 
 /// Inner protocol driver, separated for clean error-recovery in the
 /// outer function.
-async fn run_source_inner(
-    mut ws: WebSocketStream<TcpStream>,
+async fn run_source_inner<S: AsyncRead + AsyncWrite + Unpin>(
+    mut ws: WebSocketStream<S>,
     hdl: &Arc<VmmHdl>,
     memctx: &MemCtx,
     num_cpus: u32,
     mem_size: u64,
     status: &Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
+    cpu_baseline: &str,
 ) -> Result<(), MigrateError> {
     // ── Phase: Sync ────────────────────────────────────────────────
     set_phase(status, MigrationPhase::Sync);
@@ -110,9 +120,12 @@ async fn run_source_inner(
         )));
     }
 
-    // Send preamble with CPU feature info for compatibility check
+    // Send preamble with CPU features masked by the baseline.
+    // This reflects what the guest sees, not the raw host features.
+    let baseline = vmm_core::cpuid::CpuBaseline::from_str(cpu_baseline)
+        .unwrap_or(vmm_core::cpuid::CpuBaseline::Host);
     let (l1_ecx, l1_edx, l7_ebx, l7_ecx, l7_edx, xcr0) =
-        vmm_core::cpuid::query_host_features();
+        vmm_core::cpuid::query_masked_features(baseline);
     let preamble = MigrationPreamble {
         num_cpus,
         mem_size,
@@ -134,12 +147,40 @@ async fn run_source_inner(
     expect_okay(ack)?;
 
     // ── Phase: RamPushPrePause ─────────────────────────────────────
-    // First pass: send ALL pages unconditionally (like QEMU).
-    // The dirty bitmap from track_dirty_pages() may not cover pages
-    // that were mapped read-only or never faulted into EPT. Sending
-    // everything on the first pass ensures no pages are missed.
+    // First pass: send ALL pages unconditionally. The dirty bitmap
+    // from track_dirty_pages() may not cover pages mapped read-only
+    // or never faulted into EPT. Sending everything on the first
+    // pass ensures no pages are missed.
     set_phase(status, MigrationPhase::RamPushPrePause);
     push_ram_all(&mut ws, hdl, memctx, status).await?;
+
+    // ── Iterative convergence ────────────────────────────────────
+    // Send dirty pages in a loop until the dirty rate converges
+    // (< 1024 pages = 4 MiB) or we hit the max iteration count.
+    // This minimizes the final post-pause delta.
+    const MAX_PRE_PAUSE_ITERATIONS: u32 = 5;
+    const CONVERGENCE_THRESHOLD: u64 = 1024; // pages
+
+    for iteration in 1..=MAX_PRE_PAUSE_ITERATIONS {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let dirty_count = push_ram(&mut ws, hdl, memctx, status).await?;
+        slog::info!(log, "pre-pause convergence iteration";
+            "iteration" => iteration,
+            "dirty_pages" => dirty_count,
+        );
+
+        if dirty_count <= CONVERGENCE_THRESHOLD {
+            slog::info!(log, "converged, proceeding to pause";
+                "iterations" => iteration,
+                "final_dirty" => dirty_count,
+            );
+            break;
+        }
+    }
+
+    // Signal destination: source is about to pause, next pass is final
+    ws.send(Message::PauseSignal.encode()).await?;
 
     // ── Phase: Pause ──────────────────────────────────────────────
     set_phase(status, MigrationPhase::Pause);
@@ -149,7 +190,8 @@ async fn run_source_inner(
 
     // ── Phase: RamPushPostPause ───────────────────────────────────
     set_phase(status, MigrationPhase::RamPushPostPause);
-    push_ram(&mut ws, hdl, memctx, status).await?;
+    let final_dirty = push_ram(&mut ws, hdl, memctx, status).await?;
+    slog::info!(log, "post-pause dirty pages sent"; "pages" => final_dirty);
 
     // ── Phase: TimeData ───────────────────────────────────────────
     set_phase(status, MigrationPhase::TimeData);
@@ -186,12 +228,11 @@ async fn run_source_inner(
 
 /// Push ALL RAM pages to the destination (first pass).
 ///
-/// Sends every page in every RAM region, regardless of dirty status.
-/// This ensures the destination has a complete copy of guest memory.
-/// The dirty bitmap is still read (and cleared) so that the post-pause
-/// pass only transfers pages dirtied since this point.
-async fn push_ram_all(
-    ws: &mut WebSocketStream<TcpStream>,
+/// Sends every page in every RAM region using batched, zstd-compressed
+/// PageBatch messages. The dirty bitmap is read and cleared so the
+/// post-pause pass only transfers pages dirtied after this point.
+async fn push_ram_all<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
     hdl: &Arc<VmmHdl>,
     memctx: &MemCtx,
     status: &Arc<Mutex<MigrationStatus>>,
@@ -206,59 +247,33 @@ async fn push_ram_all(
         // Read and clear the dirty bitmap (so post-pause only sees new dirt)
         let bitmap_len = crate::protocol::bitmap_size(len);
         let mut bitmap = vec![0u8; bitmap_len];
-        // best-effort: dirty tracking may not be enabled yet
         let _ = hdl.track_dirty_pages(gpa, len, &mut bitmap);
 
-        // Set ALL bits — we're sending everything
-        let all_dirty = vec![0xFFu8; bitmap_len];
-
+        // Send ALL pages as batched PageBatch messages
         let num_pages = len / PAGE_SIZE;
-        if let Ok(mut s) = status.lock() {
-            s.dirty_pages_remaining += num_pages as u64;
-        }
+        let mut page_offset = 0usize;
 
-        let offer = Message::MemOffer {
-            region: MemRegionDesc { gpa, len: len as u64 },
-            bitmap: all_dirty,
-        };
-        ws.send(offer.encode()).await?;
+        while page_offset < num_pages {
+            let batch_count = BATCH_SIZE.min(num_pages - page_offset);
+            let batch_gpa = gpa + (page_offset * PAGE_SIZE) as u64;
+
+            send_page_batch(ws, memctx, batch_gpa, batch_count, status).await?;
+            page_offset += batch_count;
+        }
     }
 
+    // Signal end of this RAM pass
     ws.send(Message::MemEnd.encode()).await?;
 
-    // Serve page requests
-    loop {
-        let msg = recv(ws).await?;
-        match msg {
-            Message::MemDone => break,
-            Message::MemFetch(gpas) => {
-                let count = gpas.len() as u32;
-                let xfer_gpa = gpas.first().copied().unwrap_or(0);
-                ws.send(Message::MemXfer { gpa: xfer_gpa, count }.encode()).await?;
-
-                for page_gpa in &gpas {
-                    let mut page_buf = vec![0u8; PAGE_SIZE];
-                    if let Err(_) = memctx.read(*page_gpa, &mut page_buf) {
-                        // Page not mapped — send zeros
-                        page_buf.fill(0);
-                    }
-                    ws.send(Message::Page(page_buf).encode()).await?;
-
-                    if let Ok(mut s) = status.lock() {
-                        s.pages_transferred += 1;
-                        s.bytes_transferred += PAGE_SIZE as u64;
-                        if s.dirty_pages_remaining > 0 {
-                            s.dirty_pages_remaining -= 1;
-                        }
-                    }
-                }
-            }
-            other => {
-                return Err(MigrateError::UnexpectedMessage {
-                    expected: "MemFetch or MemDone".to_string(),
-                    got: format!("{other:?}"),
-                });
-            }
+    // Wait for destination acknowledgement
+    let ack = recv(ws).await?;
+    match ack {
+        Message::MemDone => {}
+        other => {
+            return Err(MigrateError::UnexpectedMessage {
+                expected: "MemDone".to_string(),
+                got: format!("{other:?}"),
+            });
         }
     }
 
@@ -267,21 +282,18 @@ async fn push_ram_all(
 
 /// Push dirty RAM pages to the destination.
 ///
-/// For each memory region:
-/// 1. Read the dirty bitmap from the kernel.
-/// 2. Send a MemOffer with the region descriptor and bitmap.
-/// 3. Send MemEnd to signal end of offers.
-/// 4. Receive MemFetch requests and respond with MemXfer + Page data.
-/// 5. Receive MemDone when the destination is satisfied.
-async fn push_ram(
-    ws: &mut WebSocketStream<TcpStream>,
+/// Reads the dirty bitmap from the kernel, iterates dirty pages,
+/// and sends them as batched zstd-compressed PageBatch messages.
+/// Returns the number of dirty pages found.
+async fn push_ram<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
     hdl: &VmmHdl,
     memctx: &MemCtx,
     status: &Arc<Mutex<MigrationStatus>>,
-) -> Result<(), MigrateError> {
+) -> Result<u64, MigrateError> {
     let regions = memctx.regions();
+    let mut total_dirty: u64 = 0;
 
-    // Send MemOffer for each RAM region with its dirty bitmap
     for &(gpa, len, kind) in &regions {
         if kind != RegionKind::Ram {
             continue;
@@ -296,69 +308,149 @@ async fn push_ram(
             ))
         })?;
 
-        // Count dirty pages for status
-        let dirty_count: u64 = bitmap.iter().map(|b| b.count_ones() as u64).sum();
-        if let Ok(mut s) = status.lock() {
-            s.dirty_pages_remaining += dirty_count;
+        // Collect dirty page GPAs from bitmap and send in batches
+        let mut batch_gpas: Vec<u64> = Vec::with_capacity(BATCH_SIZE);
+
+        for dirty_gpa in PageIter::new(&bitmap, gpa, len) {
+            batch_gpas.push(dirty_gpa);
+            total_dirty += 1;
+
+            if batch_gpas.len() >= BATCH_SIZE {
+                send_page_batch_sparse(ws, memctx, &batch_gpas, status).await?;
+                batch_gpas.clear();
+            }
         }
 
-        let offer = Message::MemOffer {
-            region: MemRegionDesc { gpa, len: len as u64 },
-            bitmap,
-        };
-        ws.send(offer.encode()).await?;
+        // Flush remaining partial batch
+        if !batch_gpas.is_empty() {
+            send_page_batch_sparse(ws, memctx, &batch_gpas, status).await?;
+        }
     }
 
-    // Signal end of offers
+    // Signal end of this RAM pass
     ws.send(Message::MemEnd.encode()).await?;
 
-    // Serve MemFetch requests until we get MemDone
-    loop {
-        let msg = recv(ws).await?;
-        match msg {
-            Message::MemDone => break,
-            Message::MemFetch(gpas) => {
-                // Send MemXfer header
-                let count = gpas.len() as u32;
-                let xfer_gpa = gpas.first().copied().unwrap_or(0);
-                let xfer = Message::MemXfer { gpa: xfer_gpa, count };
-                ws.send(xfer.encode()).await?;
-
-                // Send each page
-                for page_gpa in &gpas {
-                    let mut page_buf = vec![0u8; PAGE_SIZE];
-                    memctx.read(*page_gpa, &mut page_buf).map_err(|e| {
-                        MigrateError::Io(format!(
-                            "read page gpa={page_gpa:#x}: {e}"
-                        ))
-                    })?;
-                    ws.send(Message::Page(page_buf).encode()).await?;
-
-                    // Update status
-                    if let Ok(mut s) = status.lock() {
-                        s.pages_transferred += 1;
-                        s.bytes_transferred += PAGE_SIZE as u64;
-                        if s.dirty_pages_remaining > 0 {
-                            s.dirty_pages_remaining -= 1;
-                        }
-                    }
-                }
-            }
-            other => {
-                return Err(MigrateError::UnexpectedMessage {
-                    expected: "MemFetch or MemDone".to_string(),
-                    got: format!("{other:?}"),
-                });
-            }
+    // Wait for destination acknowledgement
+    let ack = recv(ws).await?;
+    match ack {
+        Message::MemDone => {}
+        other => {
+            return Err(MigrateError::UnexpectedMessage {
+                expected: "MemDone".to_string(),
+                got: format!("{other:?}"),
+            });
         }
+    }
+
+    Ok(total_dirty)
+}
+
+/// Send a batch of contiguous pages as a single PageBatch message.
+async fn send_page_batch<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+    memctx: &MemCtx,
+    base_gpa: u64,
+    count: usize,
+    status: &Arc<Mutex<MigrationStatus>>,
+) -> Result<(), MigrateError> {
+    let raw_size = count * PAGE_SIZE;
+    let mut buf = vec![0u8; raw_size];
+
+    for i in 0..count {
+        let page_gpa = base_gpa + (i * PAGE_SIZE) as u64;
+        let offset = i * PAGE_SIZE;
+        if memctx.read(page_gpa, &mut buf[offset..offset + PAGE_SIZE]).is_err() {
+            // Unmapped page — zeros already in buffer
+        }
+    }
+
+    let (data, flags) = compress_batch(&buf);
+
+    ws.send(Message::PageBatch {
+        base_gpa,
+        page_count: count as u32,
+        flags,
+        data,
+    }.encode()).await?;
+
+    if let Ok(mut s) = status.lock() {
+        s.pages_transferred += count as u64;
+        s.bytes_transferred += raw_size as u64;
     }
 
     Ok(())
 }
 
+/// Send a batch of non-contiguous dirty pages as a PageBatch message.
+///
+/// Pages are packed contiguously in the data buffer. The base_gpa is
+/// the first page's GPA; for sparse batches the destination uses the
+/// accompanying GPA list (sent as a MemXfer header before the batch).
+async fn send_page_batch_sparse<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+    memctx: &MemCtx,
+    gpas: &[u64],
+    status: &Arc<Mutex<MigrationStatus>>,
+) -> Result<(), MigrateError> {
+    if gpas.is_empty() {
+        return Ok(());
+    }
+
+    // Check if pages are contiguous — use simple batch if so
+    let base = gpas[0];
+    let is_contiguous = gpas.iter().enumerate().all(|(i, &g)| {
+        g == base + (i * PAGE_SIZE) as u64
+    });
+
+    if is_contiguous {
+        return send_page_batch(ws, memctx, base, gpas.len(), status).await;
+    }
+
+    // Sparse: send GPA list as MemXfer header, then PageBatch with packed data
+    let count = gpas.len();
+    let raw_size = count * PAGE_SIZE;
+    let mut buf = vec![0u8; raw_size];
+
+    for (i, &gpa) in gpas.iter().enumerate() {
+        let offset = i * PAGE_SIZE;
+        if memctx.read(gpa, &mut buf[offset..offset + PAGE_SIZE]).is_err() {
+            // zeros for unmapped
+        }
+    }
+
+    let (data, flags) = compress_batch(&buf);
+
+    // Send GPA list so destination knows where each page goes
+    ws.send(Message::MemFetch(gpas.to_vec()).encode()).await?;
+    ws.send(Message::PageBatch {
+        base_gpa: base,
+        page_count: count as u32,
+        flags,
+        data,
+    }.encode()).await?;
+
+    if let Ok(mut s) = status.lock() {
+        s.pages_transferred += count as u64;
+        s.bytes_transferred += raw_size as u64;
+    }
+
+    Ok(())
+}
+
+/// Compress a batch of page data with zstd. If compression doesn't
+/// help (compressed >= raw), return uncompressed with flags=0.
+fn compress_batch(raw: &[u8]) -> (Vec<u8>, u32) {
+    match zstd::bulk::compress(raw, ZSTD_LEVEL) {
+        Ok(compressed) if compressed.len() < raw.len() => {
+            (compressed, PAGE_BATCH_FLAG_ZSTD)
+        }
+        _ => (raw.to_vec(), 0),
+    }
+}
+
 /// Receive a single message from the WebSocket.
-async fn recv(
-    ws: &mut WebSocketStream<TcpStream>,
+async fn recv<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
 ) -> Result<Message, MigrateError> {
     let frame = ws.next().await.ok_or_else(|| {
         MigrateError::WebSocket("connection closed unexpectedly".to_string())

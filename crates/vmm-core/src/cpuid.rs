@@ -319,6 +319,43 @@ pub fn apply_cpuid_baseline(
 /// Query the host CPU's key feature bits for migration compatibility.
 ///
 /// Returns (leaf1_ecx, leaf1_edx, leaf7_ebx, leaf7_ecx, leaf7_edx, xcr0).
+/// Query host CPU features with baseline masking applied.
+///
+/// Returns the same tuple as `query_host_features()` but with the
+/// given baseline mask applied. This reflects what the guest actually
+/// sees and should be sent in migration preambles.
+pub fn query_masked_features(baseline: CpuBaseline) -> (u32, u32, u32, u32, u32, u32) {
+    let (mut ecx1, edx1, mut ebx7, mut ecx7, mut edx7, mut xcr0) =
+        query_host_features();
+
+    if baseline == CpuBaseline::Sse42 {
+        ecx1 &= !(1 << 28 | 1 << 12 | 1 << 29 | 1 << 30);
+    }
+
+    if baseline != CpuBaseline::Host {
+        const AVX512_EBX: u32 = (1 << 16) | (1 << 17) | (1 << 21) |
+            (1 << 26) | (1 << 27) | (1 << 28) | (1 << 30) | (1 << 31);
+        const AVX512_ECX: u32 = (1 << 1) | (1 << 6) | (1 << 11) |
+            (1 << 12) | (1 << 14);
+        const AVX512_EDX: u32 = (1 << 2) | (1 << 3) | (1 << 8) |
+            (1 << 23) | (1 << 24) | (1 << 25);
+        // AVX-512 XCR0 components (ZMM/opmask)
+        const AVX512_XCR0: u32 = (1 << 5) | (1 << 6) | (1 << 7);
+
+        ebx7 &= !AVX512_EBX;
+        ecx7 &= !AVX512_ECX;
+        edx7 &= !AVX512_EDX;
+        xcr0 &= !AVX512_XCR0;
+
+        if baseline == CpuBaseline::Sse42 {
+            ebx7 &= !((1 << 3) | (1 << 5) | (1 << 8)); // BMI1, AVX2, BMI2
+            xcr0 &= !(1 << 2); // AVX YMM state
+        }
+    }
+
+    (ecx1, edx1, ebx7, ecx7, edx7, xcr0)
+}
+
 pub fn query_host_features() -> (u32, u32, u32, u32, u32, u32) {
     let (_, _, ecx1, edx1) = host_cpuid(1, 0);
 

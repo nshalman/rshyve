@@ -127,6 +127,13 @@ impl MsixTable {
         self.inner.lock().expect("msix lock").enabled
     }
 
+    /// Enable MSI-X. Used during migration restore to set the enabled
+    /// state without going through PCI config writes.
+    pub fn set_enabled(&self, enabled: bool) {
+        let mut inner = self.inner.lock().expect("msix lock");
+        inner.enabled = enabled;
+    }
+
     /// Read the address and data for a vector entry.
     ///
     /// Returns `(addr, data)` where addr is the 64-bit MSI address
@@ -142,6 +149,23 @@ impl MsixTable {
         let addr = u64::from(e.addr_lo) | (u64::from(e.addr_hi) << 32);
         let data = u64::from(e.data);
         (addr, data)
+    }
+
+    /// Write the address and data for a vector entry.
+    ///
+    /// Used during migration restore to program the MSI-X table with
+    /// the source's interrupt routing state.
+    pub fn write_entry(&self, vector: u16, addr: u64, data: u64) {
+        let mut inner = self.inner.lock().expect("msix lock");
+        let idx = vector as usize;
+        if idx >= inner.entries.len() {
+            return;
+        }
+        inner.entries[idx].addr_lo = addr as u32;
+        inner.entries[idx].addr_hi = (addr >> 32) as u32;
+        inner.entries[idx].data = data as u32;
+        // Unmask the vector so it can fire
+        inner.entries[idx].control &= !VECTOR_CTRL_MASK;
     }
 
     /// Read from the MSI-X table BAR.

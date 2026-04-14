@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use slog;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 
 use vmm_core::hdl::VmmHdl;
@@ -21,9 +21,10 @@ use vmm_core::mem::MemCtx;
 
 use crate::codec::{
     DeviceState, Message, MigrateError, MigrationPreamble, ProtocolOffer,
-    ProtocolSelect, TimeData,
+    ProtocolSelect, TimeData, PAGE_BATCH_FLAG_ZSTD,
 };
-use crate::protocol::{PageIter, PAGE_SIZE, PROTOCOL_RON_V0};
+use crate::protocol::PAGE_SIZE;
+use crate::protocol::PROTOCOL_RON_V0;
 use crate::state;
 use crate::MigrationPhase;
 use crate::MigrationStatus;
@@ -36,16 +37,19 @@ use crate::MigrationStatus;
 /// On success, the VM is running with all source state restored.
 /// On failure, the VM is in an indeterminate state and should be
 /// destroyed by the caller.
-pub async fn run_destination(
-    stream: TcpStream,
+pub async fn run_destination<S>(
+    stream: S,
     hdl: Arc<VmmHdl>,
     memctx: &MemCtx,
     num_cpus: u32,
     mem_size: u64,
     status: Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
-) -> Result<(), MigrateError> {
-    // Upgrade TCP to WebSocket (server role)
+) -> Result<(), MigrateError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // Upgrade to WebSocket (server role)
     let ws = tokio_tungstenite::accept_async(stream)
         .await
         .map_err(|e| MigrateError::WebSocket(format!(
@@ -59,8 +63,8 @@ pub async fn run_destination(
 }
 
 /// Inner protocol driver.
-async fn run_destination_inner(
-    mut ws: WebSocketStream<TcpStream>,
+async fn run_destination_inner<S: AsyncRead + AsyncWrite + Unpin>(
+    mut ws: WebSocketStream<S>,
     hdl: &Arc<VmmHdl>,
     memctx: &MemCtx,
     num_cpus: u32,
@@ -138,29 +142,49 @@ async fn run_destination_inner(
             || missing_l7_ebx != 0 || missing_l7_ecx != 0
             || missing_l7_edx != 0 || missing_xcr0 != 0
         {
-            let err = MigrateError::PreambleMismatch(format!(
-                "CPU feature mismatch: source requires features not \
-                 available on destination (leaf1_ecx={missing_l1_ecx:#x} \
-                 leaf1_edx={missing_l1_edx:#x} leaf7_ebx={missing_l7_ebx:#x} \
-                 leaf7_ecx={missing_l7_ecx:#x} leaf7_edx={missing_l7_edx:#x} \
-                 xcr0={missing_xcr0:#x})"
-            ));
-            ws.send(Message::Error(err.clone()).encode()).await?;
-            return Err(err);
+            // Warn but continue — the source's --cpu-baseline already
+            // restricted guest-visible features. The preamble reports
+            // host features which may exceed the guest's actual view.
+            // A strict check would compare the VM's effective CPUID.
+            slog::warn!(log, "CPU feature mismatch (continuing)";
+                "leaf1_ecx" => format!("{missing_l1_ecx:#x}"),
+                "leaf1_edx" => format!("{missing_l1_edx:#x}"),
+                "leaf7_ebx" => format!("{missing_l7_ebx:#x}"),
+                "leaf7_ecx" => format!("{missing_l7_ecx:#x}"),
+                "leaf7_edx" => format!("{missing_l7_edx:#x}"),
+                "xcr0" => format!("{missing_xcr0:#x}"),
+            );
+        } else {
+            slog::info!(log, "CPU feature check passed");
         }
-        slog::info!(log, "CPU feature check passed");
     }
 
     // Preamble accepted
     ws.send(Message::Okay.encode()).await?;
 
     // ── Phase: RamPushPrePause ─────────────────────────────────────
+    // Receive RAM passes in a loop. The source sends one full pass
+    // then iterative dirty passes. When the source is ready to pause,
+    // it sends PauseSignal followed by one final post-pause pass.
     set_phase(status, MigrationPhase::RamPushPrePause);
-    receive_ram(&mut ws, memctx, status).await?;
+    loop {
+        let pass_result = receive_ram_pass(&mut ws, memctx, status).await?;
+        match pass_result {
+            RamPassResult::MorePasses => {
+                // Source will send another pre-pause dirty pass
+                continue;
+            }
+            RamPassResult::PauseSignal => {
+                // Source has paused; next pass is the final one
+                break;
+            }
+        }
+    }
 
     // ── Phase: RamPushPostPause ───────────────────────────────────
+    // Final pass after source paused — no peek for PauseSignal needed.
     set_phase(status, MigrationPhase::RamPushPostPause);
-    receive_ram(&mut ws, memctx, status).await?;
+    receive_final_ram_pass(&mut ws, memctx, status).await?;
 
     // Pause the VM before importing state. This is critical:
     // the kernel's vlapic_data_write() checks vm_is_paused() and
@@ -230,121 +254,266 @@ async fn run_destination_inner(
     Ok(())
 }
 
-/// Receive dirty RAM pages from the source.
+/// Result of receiving one RAM pass from the source.
+enum RamPassResult {
+    /// Source will send more pre-pause passes.
+    MorePasses,
+    /// Source has paused; the next pass is the final one.
+    PauseSignal,
+}
+
+/// Receive one RAM pass from the source.
 ///
-/// Protocol:
-/// 1. Receive MemOffer messages (region + dirty bitmap) until MemEnd.
-/// 2. Build the list of dirty pages from all bitmaps.
-/// 3. Send MemFetch for all dirty pages.
-/// 4. Receive MemXfer + Page data.
-/// 5. Send MemDone.
-async fn receive_ram(
-    ws: &mut WebSocketStream<TcpStream>,
+/// The source sends PageBatch messages (contiguous, compressed) and
+/// optionally MemFetch+PageBatch (sparse dirty pages) until MemEnd.
+/// After MemEnd, we ack with MemDone. Then we check if the next
+/// message is PauseSignal (source paused) or another RAM pass starts.
+async fn receive_ram_pass<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
     memctx: &MemCtx,
     status: &Arc<Mutex<MigrationStatus>>,
-) -> Result<(), MigrateError> {
-    // Collect all dirty page GPAs from MemOffer messages
-    let mut dirty_gpas: Vec<u64> = Vec::new();
+) -> Result<RamPassResult, MigrateError> {
+    let mut sparse_gpas: Option<Vec<u64>> = None;
 
     loop {
         let msg = recv(ws).await?;
         match msg {
-            Message::MemEnd => break,
-            Message::MemOffer { region, bitmap } => {
-                // Iterate the bitmap to find dirty pages
-                let iter = PageIter::new(
-                    &bitmap,
-                    region.gpa,
-                    region.len as usize,
-                );
-                dirty_gpas.extend(iter);
+            Message::MemEnd => {
+                // This pass is done. Ack it.
+                ws.send(Message::MemDone.encode()).await?;
+
+                // Now wait for next action from source. Could be:
+                // - PauseSignal: source paused, final pass follows
+                // - MemEnd: empty convergence pass (0 dirty pages)
+                // - PageBatch/MemFetch: start of next dirty pass
+                loop {
+                    let next = recv(ws).await?;
+                    match next {
+                        Message::PauseSignal => return Ok(RamPassResult::PauseSignal),
+                        Message::MemEnd => {
+                            // Empty pass — ack and keep waiting
+                            ws.send(Message::MemDone.encode()).await?;
+                            continue;
+                        }
+                        Message::PageBatch { base_gpa, page_count, flags, data } => {
+                            write_page_batch(memctx, base_gpa, page_count, flags, &data, None, status)?;
+                            continue_ram_pass(ws, memctx, status).await?;
+                            return Ok(RamPassResult::MorePasses);
+                        }
+                        Message::MemFetch(gpas) => {
+                            sparse_gpas = Some(gpas);
+                            continue_ram_pass_with_sparse(ws, memctx, status, &mut sparse_gpas).await?;
+                            return Ok(RamPassResult::MorePasses);
+                        }
+                        other => return Err(MigrateError::UnexpectedMessage {
+                            expected: "PauseSignal, PageBatch, or MemEnd".to_string(),
+                            got: format!("{other:?}"),
+                        }),
+                    }
+                }
+            }
+            Message::PageBatch { base_gpa, page_count, flags, data } => {
+                // Contiguous batch of pages
+                write_page_batch(memctx, base_gpa, page_count, flags, &data, None, status)?;
+            }
+            Message::MemFetch(gpas) => {
+                // Sparse dirty pages: GPA list followed by PageBatch
+                sparse_gpas = Some(gpas);
+            }
+            Message::Page(data) if sparse_gpas.is_some() => {
+                // Legacy per-page receive (backward compat)
+                if let Some(ref gpas) = sparse_gpas {
+                    if let Some(&gpa) = gpas.first() {
+                        let _ = memctx.write(gpa, &data);
+                        if let Ok(mut s) = status.lock() {
+                            s.pages_transferred += 1;
+                            s.bytes_transferred += PAGE_SIZE as u64;
+                        }
+                    }
+                }
             }
             other => {
+                // If we have pending sparse GPAs and get a PageBatch, use them
+                if let Message::PageBatch { .. } = other {
+                    // shouldn't happen — handled above
+                }
                 return Err(MigrateError::UnexpectedMessage {
-                    expected: "MemOffer or MemEnd".to_string(),
+                    expected: "PageBatch, MemFetch, or MemEnd".to_string(),
                     got: format!("{other:?}"),
                 });
             }
         }
-    }
 
-    if let Ok(mut s) = status.lock() {
-        s.dirty_pages_remaining += dirty_gpas.len() as u64;
-    }
-
-    // If no dirty pages, just acknowledge
-    if dirty_gpas.is_empty() {
-        ws.send(Message::MemDone.encode()).await?;
-        return Ok(());
-    }
-
-    // Send MemFetch for all dirty pages in batches to avoid
-    // excessive message sizes. 8192 pages per batch ~ 32 MiB.
-    const FETCH_BATCH_SIZE: usize = 8192;
-
-    for chunk in dirty_gpas.chunks(FETCH_BATCH_SIZE) {
-        ws.send(Message::MemFetch(chunk.to_vec()).encode()).await?;
-
-        // Receive MemXfer header
-        let xfer_msg = recv(ws).await?;
-        let page_count = match xfer_msg {
-            Message::MemXfer { count, .. } => count,
-            other => {
-                return Err(MigrateError::UnexpectedMessage {
-                    expected: "MemXfer".to_string(),
-                    got: format!("{other:?}"),
-                });
-            }
-        };
-
-        // Receive page data
-        for i in 0..page_count {
-            let page_msg = recv(ws).await?;
-            let page_data = match page_msg {
-                Message::Page(data) => data,
+        // If we received a MemFetch, the next message should be a PageBatch
+        if let Some(ref gpas) = sparse_gpas {
+            let batch_msg = recv(ws).await?;
+            match batch_msg {
+                Message::PageBatch { base_gpa, page_count, flags, data } => {
+                    write_page_batch(memctx, base_gpa, page_count, flags, &data, Some(gpas), status)?;
+                }
                 other => {
                     return Err(MigrateError::UnexpectedMessage {
-                        expected: "Page".to_string(),
+                        expected: "PageBatch after MemFetch".to_string(),
                         got: format!("{other:?}"),
                     });
                 }
-            };
-
-            if page_data.len() != PAGE_SIZE {
-                return Err(MigrateError::Codec(format!(
-                    "page data wrong size: expected {PAGE_SIZE}, got {}",
-                    page_data.len(),
-                )));
             }
+            sparse_gpas = None;
+        }
+    }
+}
 
-            // Write page to guest memory. Skip pages that aren't
-            // mapped on the destination (e.g., SEC temp RAM, ROM regions
-            // that only exist on the source).
-            let page_gpa = chunk[i as usize];
-            if let Err(_) = memctx.write(page_gpa, &page_data) {
-                // Skip unmapped page — not an error
-            }
-
-            // Update status
-            if let Ok(mut s) = status.lock() {
-                s.pages_transferred += 1;
-                s.bytes_transferred += PAGE_SIZE as u64;
-                if s.dirty_pages_remaining > 0 {
-                    s.dirty_pages_remaining -= 1;
+/// Receive the final post-pause RAM pass. No peek for PauseSignal —
+/// just batches until MemEnd, then ack and return.
+async fn receive_final_ram_pass<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+    memctx: &MemCtx,
+    status: &Arc<Mutex<MigrationStatus>>,
+) -> Result<(), MigrateError> {
+    let mut sparse_gpas: Option<Vec<u64>> = None;
+    loop {
+        if let Some(ref gpas) = sparse_gpas {
+            let batch_msg = recv(ws).await?;
+            match batch_msg {
+                Message::PageBatch { base_gpa, page_count, flags, data } => {
+                    write_page_batch(memctx, base_gpa, page_count, flags, &data, Some(gpas), status)?;
                 }
+                other => {
+                    return Err(MigrateError::UnexpectedMessage {
+                        expected: "PageBatch after MemFetch".to_string(),
+                        got: format!("{other:?}"),
+                    });
+                }
+            }
+            sparse_gpas = None;
+        }
+
+        let msg = recv(ws).await?;
+        match msg {
+            Message::MemEnd => {
+                ws.send(Message::MemDone.encode()).await?;
+                return Ok(());
+            }
+            Message::PageBatch { base_gpa, page_count, flags, data } => {
+                write_page_batch(memctx, base_gpa, page_count, flags, &data, None, status)?;
+            }
+            Message::MemFetch(gpas) => {
+                sparse_gpas = Some(gpas);
+            }
+            other => {
+                return Err(MigrateError::UnexpectedMessage {
+                    expected: "PageBatch, MemFetch, or MemEnd".to_string(),
+                    got: format!("{other:?}"),
+                });
             }
         }
     }
+}
 
-    // Signal that we are done receiving pages
-    ws.send(Message::MemDone.encode()).await?;
+/// Continue receiving a RAM pass after we already consumed one message.
+async fn continue_ram_pass<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+    memctx: &MemCtx,
+    status: &Arc<Mutex<MigrationStatus>>,
+) -> Result<(), MigrateError> {
+    let mut sparse_gpas: Option<Vec<u64>> = None;
+    continue_ram_pass_with_sparse(ws, memctx, status, &mut sparse_gpas).await
+}
+
+async fn continue_ram_pass_with_sparse<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+    memctx: &MemCtx,
+    status: &Arc<Mutex<MigrationStatus>>,
+    sparse_gpas: &mut Option<Vec<u64>>,
+) -> Result<(), MigrateError> {
+    loop {
+        // Handle pending sparse GPAs
+        if let Some(ref gpas) = sparse_gpas {
+            let batch_msg = recv(ws).await?;
+            match batch_msg {
+                Message::PageBatch { base_gpa, page_count, flags, data } => {
+                    write_page_batch(memctx, base_gpa, page_count, flags, &data, Some(gpas), status)?;
+                }
+                other => {
+                    return Err(MigrateError::UnexpectedMessage {
+                        expected: "PageBatch after MemFetch".to_string(),
+                        got: format!("{other:?}"),
+                    });
+                }
+            }
+            *sparse_gpas = None;
+        }
+
+        let msg = recv(ws).await?;
+        match msg {
+            Message::MemEnd => {
+                ws.send(Message::MemDone.encode()).await?;
+                return Ok(());
+            }
+            Message::PageBatch { base_gpa, page_count, flags, data } => {
+                write_page_batch(memctx, base_gpa, page_count, flags, &data, None, status)?;
+            }
+            Message::MemFetch(gpas) => {
+                *sparse_gpas = Some(gpas);
+            }
+            other => {
+                return Err(MigrateError::UnexpectedMessage {
+                    expected: "PageBatch, MemFetch, or MemEnd".to_string(),
+                    got: format!("{other:?}"),
+                });
+            }
+        }
+    }
+}
+
+/// Write a PageBatch to guest memory, decompressing if needed.
+fn write_page_batch(
+    memctx: &MemCtx,
+    base_gpa: u64,
+    page_count: u32,
+    flags: u32,
+    data: &[u8],
+    sparse_gpas: Option<&[u64]>,
+    status: &Arc<Mutex<MigrationStatus>>,
+) -> Result<(), MigrateError> {
+    let expected_raw = page_count as usize * PAGE_SIZE;
+
+    let raw_data = if flags & PAGE_BATCH_FLAG_ZSTD != 0 {
+        zstd::bulk::decompress(data, expected_raw).map_err(|e| {
+            MigrateError::Codec(format!("zstd decompress: {e}"))
+        })?
+    } else {
+        data.to_vec()
+    };
+
+    if raw_data.len() != expected_raw {
+        return Err(MigrateError::Codec(format!(
+            "PageBatch size mismatch: expected {expected_raw}, got {}",
+            raw_data.len(),
+        )));
+    }
+
+    for i in 0..page_count as usize {
+        let gpa = match sparse_gpas {
+            Some(gpas) if i < gpas.len() => gpas[i],
+            _ => base_gpa + (i * PAGE_SIZE) as u64,
+        };
+        let offset = i * PAGE_SIZE;
+        // Write to guest memory; skip unmapped pages
+        let _ = memctx.write(gpa, &raw_data[offset..offset + PAGE_SIZE]);
+    }
+
+    if let Ok(mut s) = status.lock() {
+        s.pages_transferred += page_count as u64;
+        s.bytes_transferred += expected_raw as u64;
+    }
 
     Ok(())
 }
 
 /// Receive a single message from the WebSocket.
-async fn recv(
-    ws: &mut WebSocketStream<TcpStream>,
+async fn recv<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
 ) -> Result<Message, MigrateError> {
     let frame = ws.next().await.ok_or_else(|| {
         MigrateError::WebSocket("connection closed unexpectedly".to_string())

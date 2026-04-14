@@ -26,6 +26,7 @@ use std::thread;
 use futures::future::BoxFuture;
 
 use crate::Lifecycle;
+use crate::blkdev::DiskCache;
 use crate::lifecycle::Indicator;
 
 use vmm_core::mem::{PhysMap, SubMapping};
@@ -42,7 +43,13 @@ use super::bits;
 use super::queue::{ChainBuf, VirtioCompletion, VirtQueue};
 use super::VirtioDevice;
 
-const NUM_WORKERS: usize = 4;
+/// Default I/O workers for a single-queue virtio-blk device.
+///
+/// Matches propolis's default (`propolis-server/src/lib/initializer.rs:61`).
+/// bhyve's 16 is a shared pool across all disks; ours and propolis's are
+/// per-disk. 8 is enough parallel syscalls for deep queues without hotspotting
+/// the `VirtioCompletion` Mutex<u16>.
+const NUM_WORKERS: usize = 8;
 pub const BLK_CONFIG_SIZE: u16 = 8;
 /// Extended config size covering all VirtIO 1.3 block config fields
 /// (capacity through write_zeroes_may_unmap at offset 0x38+1=0x3C).
@@ -82,11 +89,20 @@ pub struct VirtioBlockOpts {
     pub read_only: bool,
     pub nodelete: bool,
     pub sector_size: u32,
+    /// Number of virtqueues. `None` means "caller decides" (typically
+    /// `min(num_vcpus, 4)`). Capped at 8 — a zvol has one SPA sync pipeline
+    /// so more queues don't add throughput but do add worker threads.
+    pub num_queues: Option<u16>,
 }
 
 impl Default for VirtioBlockOpts {
     fn default() -> Self {
-        Self { read_only: false, nodelete: false, sector_size: 512 }
+        Self {
+            read_only: false,
+            nodelete: false,
+            sector_size: 512,
+            num_queues: None,
+        }
     }
 }
 
@@ -122,6 +138,9 @@ pub struct VirtioBlock {
     pub interrupt: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
     /// Per-queue completion handlers, created on first notification.
     completions: Mutex<Vec<Option<Arc<VirtioCompletion>>>>,
+    /// Zvol write-cache control. Declared BEFORE `_file` so Drop runs
+    /// `DKIOCSETWCE` restore while the fd is still open.
+    _cache: DiskCache,
     _file: File,
     /// Lifecycle state indicator.
     indicator: Indicator,
@@ -146,7 +165,11 @@ impl VirtioBlock {
         let read_only = opts.read_only;
         let raw_fd = file.as_raw_fd();
 
-        // Workers per queue: 4 for single queue, 2 per queue for MQ.
+        // Enable zvol writeback cache (DKIOCSETWCE=1). Must happen before
+        // any I/O so the first guest writes already hit the fast path.
+        let cache = DiskCache::new(raw_fd, read_only);
+
+        // Workers per queue: NUM_WORKERS for single queue, 2 per queue for MQ.
         let workers_per_queue = if num_queues <= 1 { NUM_WORKERS } else { 2 };
         let total_workers = num_queues as usize * workers_per_queue;
         let paused = Arc::new(AtomicBool::new(false));
@@ -189,6 +212,7 @@ impl VirtioBlock {
             physmap,
             interrupt: Arc::new(Mutex::new(None)),
             completions: Mutex::new(completions),
+            _cache: cache,
             _file: file,
             indicator: Indicator::new(),
             paused,
@@ -239,6 +263,11 @@ impl VirtioBlock {
             Arc::clone(&self.physmap),
             interrupt_fn,
         );
+        // Force-interrupt the first 32 completions so the guest's
+        // blk driver always gets notified after migration. Without
+        // this, EVENT_IDX suppression can cause the guest to miss
+        // completions and stall disk I/O.
+        c.set_force_interrupt(32);
         if idx < slots.len() {
             slots[idx] = Some(Arc::clone(&c));
         }
@@ -367,6 +396,15 @@ impl VirtioDevice for VirtioBlock {
             None => return false,
         };
 
+        // Debug: log first few notify calls after migration
+        static NOTIFY_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let count = NOTIFY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count < 5 {
+            let guest_avail = queue.read_avail_idx(physmap);
+            eprintln!("[blk-notify] q={} last_avail={} guest_avail={} shadow_used={}",
+                queue_idx, queue.last_avail_idx(), guest_avail, queue.shadow_used_idx());
+        }
+
         let completion = self.get_completion(queue_idx, queue);
 
         // Collect all pending requests (may loop for EVENT_IDX re-check)
@@ -442,10 +480,17 @@ impl VirtioDevice for VirtioBlock {
 
         probes::vioblk_notify!(|| (queue_idx, requests.len() as u32));
 
-        // Small batch: inline fast path (no channel overhead).
-        // Up to 4 requests are processed in the vCPU thread to avoid
-        // the latency of dispatching through the mpsc channel.
-        if requests.len() <= 4 {
+        // Small batch inline fast path: reads and metadata ops only.
+        //
+        // Writes and flushes always dispatch to workers — they may block
+        // the thread for milliseconds on ZIL commit, and running inline
+        // would stall the guest vCPU. Reads are near-zero-cost from the
+        // ARC so keeping them inline preserves iodepth=1 read latency.
+        let all_inline_safe = requests.iter().all(|(_, h, _)| {
+            h.rtype != bits::VIRTIO_BLK_T_OUT
+                && h.rtype != bits::VIRTIO_BLK_T_FLUSH
+        });
+        if requests.len() <= 4 && all_inline_safe {
             for &(head, ref header, ref chain) in &requests {
                 probes::vioblk_inline!(|| (head, header.rtype, header.sector));
                 let (status, written) = self.process_inline(header, chain, physmap);
@@ -523,6 +568,30 @@ impl Lifecycle for VirtioBlock {
 
     fn halt(&self) {
         self.indicator.halt();
+    }
+
+    fn flush_backing(&self) {
+        use std::time::{Duration, Instant};
+        // Drain workers so the fdatasync barrier covers every pwritev
+        // whose completion the guest has observed. Workers see `paused`
+        // at the 50ms recv_timeout boundary and decrement workers_active.
+        //
+        // Use swap so we restore only the state we changed — if the
+        // device was already paused by the lifecycle layer, leave it
+        // paused for the caller to resume on its own schedule.
+        let was_paused = self.paused.swap(true, Ordering::AcqRel);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while self.workers_active.load(Ordering::Acquire) > 0
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Best-effort: if fdatasync fails here, logging lives at the
+        // caller (migration layer) since it has the full context.
+        let _ = datasync(self.fd);
+        if !was_paused {
+            self.paused.store(false, Ordering::Release);
+        }
     }
 }
 

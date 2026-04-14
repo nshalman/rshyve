@@ -12,6 +12,7 @@ pub mod acpi_pm;
 pub mod metrics;
 pub mod aml;
 pub mod bhyve;
+pub mod blkdev;
 pub mod chipset;
 pub mod fbuf;
 pub mod fwcfg;

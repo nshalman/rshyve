@@ -145,6 +145,11 @@ impl VirtQueue {
         self.event_idx
     }
 
+    /// Returns whether indirect descriptor support is enabled.
+    pub fn indirect_supported(&self) -> bool {
+        self.indirect_supported
+    }
+
     /// Enable/disable indirect descriptor support.
     pub fn set_indirect_supported(&mut self, supported: bool) {
         self.indirect_supported = supported;
@@ -153,6 +158,20 @@ impl VirtQueue {
     /// Return the guest physical address of the available ring.
     pub fn avail_addr(&self) -> u64 {
         self.avail_addr
+    }
+
+    /// Read the avail ring idx from guest memory.
+    ///
+    /// Returns the guest driver's avail_idx which may be ahead of the
+    /// kernel's cached value (the kernel may have consumed all pending
+    /// buffers). Used during migration export to capture the true
+    /// number of available buffers.
+    pub fn read_avail_idx(&self, physmap: &PhysMap) -> u16 {
+        if self.avail_addr == 0 { return 0; }
+        let gpa = self.avail_addr + 2;
+        physmap.lookup(gpa, 2)
+            .and_then(|sub| sub.read::<u16>().ok())
+            .unwrap_or(0)
     }
 
     /// Set the queue addresses from a legacy PFN (page frame number).
@@ -201,6 +220,29 @@ impl VirtQueue {
         self.shadow_used_idx = 0;
     }
 
+    /// Set the last consumed avail index (for migration restore).
+    pub fn set_last_avail_idx(&mut self, idx: u16) {
+        self.last_avail_idx = idx;
+    }
+
+    /// Set the shadow used index (for migration restore).
+    pub fn set_shadow_used_idx(&mut self, idx: u16) {
+        self.shadow_used_idx = idx;
+    }
+
+    /// Read the used ring idx from guest memory.
+    ///
+    /// For devices using VirtioCompletion (like virtio-blk), the
+    /// VirtQueue's shadow_used_idx is never updated. This reads the
+    /// actual used_ring->idx that VirtioCompletion wrote to guest memory.
+    pub fn read_used_ring_idx(&self, physmap: &PhysMap) -> u16 {
+        if self.used_addr == 0 { return 0; }
+        let gpa = self.used_addr + 2;
+        physmap.lookup(gpa, 2)
+            .and_then(|sub| sub.read::<u16>().ok())
+            .unwrap_or(0)
+    }
+
     /// Get the descriptor table address.
     pub fn desc_addr(&self) -> u64 {
         self.desc_addr
@@ -209,6 +251,16 @@ impl VirtQueue {
     /// Get the used ring address.
     pub fn used_addr(&self) -> u64 {
         self.used_addr
+    }
+
+    /// Get the last available ring index processed by the device.
+    pub fn last_avail_idx(&self) -> u16 {
+        self.last_avail_idx
+    }
+
+    /// Get the device-side shadow of the used ring index.
+    pub fn shadow_used_idx(&self) -> u16 {
+        self.shadow_used_idx
     }
 
     /// Get the legacy PFN for this queue (desc_addr / PAGE_SIZE).
@@ -819,6 +871,10 @@ pub struct VirtioCompletion {
     interrupt: Box<dyn Fn() + Send + Sync>,
     /// Whether VIRTIO_F_RING_EVENT_IDX is negotiated.
     event_idx: bool,
+    /// Force-interrupt counter: always fire interrupt for the first
+    /// N completions. Used after migration to ensure the guest
+    /// processes completions even when EVENT_IDX would suppress them.
+    force_intr_count: std::sync::atomic::AtomicU32,
 }
 
 impl VirtioCompletion {
@@ -849,6 +905,7 @@ impl VirtioCompletion {
             physmap,
             interrupt: Box::new(interrupt),
             event_idx,
+            force_intr_count: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -900,6 +957,13 @@ impl VirtioCompletion {
         }
     }
 
+    /// Force the next N completions to always fire an interrupt,
+    /// bypassing EVENT_IDX suppression. Used after migration to
+    /// ensure the guest processes stale used entries.
+    pub fn set_force_interrupt(&self, count: u32) {
+        self.force_intr_count.store(count, Ordering::Release);
+    }
+
     /// Check if the guest needs an interrupt.
     ///
     /// With event_idx: only interrupt when `new_idx` crosses the
@@ -908,6 +972,12 @@ impl VirtioCompletion {
     ///
     /// Without event_idx: always interrupt (no suppression).
     fn should_interrupt(&self, old_idx: u16, new_idx: u16) -> bool {
+        // Force-interrupt mode: always fire for the first N completions
+        let force = self.force_intr_count.load(Ordering::Acquire);
+        if force > 0 {
+            self.force_intr_count.fetch_sub(1, Ordering::AcqRel);
+            return true;
+        }
         if !self.event_idx {
             // Without EVENT_IDX, check the avail ring flags field.
             if self.avail_addr != 0 {
