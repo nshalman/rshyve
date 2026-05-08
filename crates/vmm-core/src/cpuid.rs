@@ -286,25 +286,51 @@ pub fn apply_cpuid_baseline(
     baseline: CpuBaseline,
     log: &slog::Logger,
 ) -> std::io::Result<()> {
-    if baseline == CpuBaseline::Host {
-        return Ok(());
-    }
+    apply_cpuid(hdl, num_cpus, baseline, &[], log)
+}
 
-    let entries = build_cpuid_entries(baseline);
+/// Apply a CPUID baseline plus a list of additional vendor-defined
+/// entries (e.g. Hyper-V leaves 0x4000_0000+) to every vCPU.
+///
+/// `extra` may be empty. When `baseline == Host` and `extra` is
+/// non-empty, this builds a full host-passthrough table first so the
+/// kernel does not lose the standard leaves: `set_cpuid` replaces the
+/// kernel's table wholesale, so we cannot ship a partial override.
+pub fn apply_cpuid(
+    hdl: &VmmHdl,
+    num_cpus: u32,
+    baseline: CpuBaseline,
+    extra: &[vcpu_cpuid_entry],
+    log: &slog::Logger,
+) -> std::io::Result<()> {
+    let mut entries = if baseline == CpuBaseline::Host {
+        if extra.is_empty() {
+            // Pure native passthrough: nothing to program.
+            return Ok(());
+        }
+        build_passthrough_entries()
+    } else {
+        build_cpuid_entries(baseline)
+    };
+
+    if !extra.is_empty() {
+        entries.extend_from_slice(extra);
+        entries.sort_by(vcpu_cpuid_entry::eval_sort);
+    }
     if entries.is_empty() {
         return Ok(());
     }
 
-    // Intel fallback for Intel CPUs
     let (_, ebx, ecx, edx) = host_cpuid(0, 0);
     let is_intel = ebx == 0x756e_6547
         && edx == 0x4965_6e69
         && ecx == 0x6c65_746e;
     let flags = if is_intel { VCC_FLAG_INTEL_FALLBACK } else { 0 };
 
-    slog::info!(log, "applying CPU baseline";
+    slog::info!(log, "applying CPUID";
         "baseline" => ?baseline,
         "entries" => entries.len(),
+        "extra" => extra.len(),
         "vcpus" => num_cpus,
     );
 
@@ -314,6 +340,95 @@ pub fn apply_cpuid_baseline(
     }
 
     Ok(())
+}
+
+/// Build a full CPUID table from native host values, without applying
+/// any baseline masking. Used when a caller (e.g. the Hyper-V
+/// enlightenment) needs to inject hypervisor leaves on an otherwise
+/// `Host`-baseline VM.
+pub fn build_passthrough_entries() -> Vec<vcpu_cpuid_entry> {
+    // Sse42 reaches the same code path as Avx2 for the bulk of the
+    // table, so we just call build with Avx2 and unwind any masking
+    // that doesn't apply to a passthrough build by re-reading host
+    // CPUID for the affected leaves. Simpler: do a private build.
+    build_full_table_native()
+}
+
+fn build_full_table_native() -> Vec<vcpu_cpuid_entry> {
+    let mut entries = Vec::with_capacity(64);
+
+    let (max_leaf, ebx, ecx, edx) = host_cpuid(0, 0);
+    entries.push(entry(0, 0, 0, max_leaf, ebx, ecx, edx));
+
+    let is_intel = ebx == 0x756e_6547
+        && edx == 0x4965_6e69
+        && ecx == 0x6c65_746e;
+
+    let (a, b, c, d) = host_cpuid(1, 0);
+    entries.push(entry(1, 0, 0, a, b, c, d));
+
+    if is_intel {
+        let (a, b, c, d) = host_cpuid(2, 0);
+        entries.push(entry(2, 0, 0, a, b, c, d));
+    }
+
+    if is_intel && max_leaf >= 4 {
+        for idx in 0..8u32 {
+            let (a, b, c, d) = host_cpuid(4, idx);
+            if a & 0x1f == 0 { break; }
+            entries.push(entry(4, idx, VCE_FLAG_MATCH_INDEX, a, b, c, d));
+        }
+    }
+
+    if max_leaf >= 5 {
+        let (a, b, c, d) = host_cpuid(5, 0);
+        entries.push(entry(5, 0, 0, a, b, c, d));
+    }
+    if max_leaf >= 6 {
+        let (a, b, c, d) = host_cpuid(6, 0);
+        entries.push(entry(6, 0, 0, a, b, c, d));
+    }
+    if max_leaf >= 7 {
+        let (a, b, c, d) = host_cpuid(7, 0);
+        entries.push(entry(7, 0, VCE_FLAG_MATCH_INDEX, a, b, c, d));
+    }
+    if max_leaf >= 0xB {
+        for idx in 0..8u32 {
+            let (a, b, c, d) = host_cpuid(0xB, idx);
+            if (b & 0xFFFF) == 0 { break; }
+            entries.push(entry(0xB, idx, VCE_FLAG_MATCH_INDEX, a, b, c, d));
+        }
+    }
+    if max_leaf >= 0xD {
+        let (a, b, c, d) = host_cpuid(0xD, 0);
+        entries.push(entry(0xD, 0, VCE_FLAG_MATCH_INDEX, a, b, c, d));
+        let (a2, b2, c2, d2) = host_cpuid(0xD, 1);
+        entries.push(entry(0xD, 1, VCE_FLAG_MATCH_INDEX, a2, b2, c2, d2));
+    }
+
+    let (max_ext, _, _, _) = host_cpuid(0x8000_0000, 0);
+    entries.push(entry(0x8000_0000, 0, 0, max_ext, 0, 0, 0));
+    if max_ext >= 0x8000_0001 {
+        let (a, b, c, d) = host_cpuid(0x8000_0001, 0);
+        entries.push(entry(0x8000_0001, 0, 0, a, b, c, d));
+    }
+    for leaf in [0x8000_0002, 0x8000_0003, 0x8000_0004] {
+        if max_ext >= leaf {
+            let (a, b, c, d) = host_cpuid(leaf, 0);
+            entries.push(entry(leaf, 0, 0, a, b, c, d));
+        }
+    }
+    if max_ext >= 0x8000_0007 {
+        let (a, b, c, d) = host_cpuid(0x8000_0007, 0);
+        entries.push(entry(0x8000_0007, 0, 0, a, b, c, d));
+    }
+    if max_ext >= 0x8000_0008 {
+        let (a, b, c, d) = host_cpuid(0x8000_0008, 0);
+        entries.push(entry(0x8000_0008, 0, 0, a, b, c, d));
+    }
+
+    entries.sort_by(vcpu_cpuid_entry::eval_sort);
+    entries
 }
 
 /// Query the host CPU's key feature bits for migration compatibility.

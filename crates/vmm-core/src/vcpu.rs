@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use bhyve_api::{
     ioctls,
-    vm_exit, vm_register, vm_run_state, vm_seg_desc, seg_desc,
-    vm_reg_name, VRS_RUN,
+    vm_exception, vm_exit, vm_register, vm_run_state, vm_seg_desc,
+    seg_desc, vm_reg_name, VRS_RUN,
 };
 
 use crate::exits::{VmEntry, VmExit};
@@ -96,6 +96,32 @@ impl Vcpu {
         // Safety: vm_register is the correct struct for VM_SET_REGISTER.
         let res = unsafe {
             libc::ioctl(fd, ioctls::VM_SET_REGISTER as _, &mut vr)
+        };
+        if res == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Inject a `#GP(0)` (general protection) exception on the next
+    /// re-entry. Used for spec-mandated MSR access faults — for
+    /// example writing a Hyper-V MSR with reserved bits set.
+    ///
+    /// `restart_instruction = 0` so the kernel does not rewind RIP:
+    /// the WRMSR/RDMSR has already been decoded by the time we get
+    /// here, and the guest expects to see the fault at the next
+    /// instruction (TLFS 14.6).
+    pub fn inject_gp(&self) -> std::io::Result<()> {
+        let mut exc = vm_exception {
+            cpuid: self.id,
+            vector: 13,
+            error_code: 0,
+            error_code_valid: 1,
+            restart_instruction: 0,
+        };
+        let fd = self.hdl.as_raw_fd();
+        let res = unsafe {
+            libc::ioctl(fd, ioctls::VM_INJECT_EXCEPTION as _, &mut exc)
         };
         if res == -1 {
             return Err(std::io::Error::last_os_error());

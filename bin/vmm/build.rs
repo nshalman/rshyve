@@ -33,4 +33,26 @@ fn main() {
     // Rerun if git HEAD changes
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/refs/");
+
+    // Embed a runpath for OpenSSL so the resulting `vmm` binary
+    // loads `libcrypto.so.3` from the SmartOS pkgsrc location
+    // (typically `/opt/tools/lib`) without `LD_LIBRARY_PATH` set.
+    // We discover the directory ourselves rather than relying on
+    // build-script metadata propagation: `cargo:KEY=VAL` from a
+    // sibling lib's build script is exposed as `DEP_<LINK>_<KEY>`
+    // env, but only when the consumer's build.rs runs *after* the
+    // producer's, and we don't want to take a hard order dependency.
+    let pkgconfig = std::env::var("PKG_CONFIG").unwrap_or_else(|_| "pkg-config".into());
+    if let Ok(out) = Command::new(&pkgconfig)
+        .args(["--libs-only-L", "openssl"])
+        .output()
+    {
+        if out.status.success() {
+            for arg in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                if let Some(dir) = arg.strip_prefix("-L") {
+                    println!("cargo:rustc-link-arg=-Wl,-R,{}", dir);
+                }
+            }
+        }
+    }
 }

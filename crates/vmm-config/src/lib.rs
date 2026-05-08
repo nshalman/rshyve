@@ -153,6 +153,36 @@ pub struct Cli {
     #[arg(long, default_value = "host")]
     pub cpu_baseline: String,
 
+    /// Enable Microsoft Hyper-V enlightenments (Tier 1: CPUID
+    /// identification, hypercall stub, reference TSC, VP_INDEX,
+    /// reset and crash MSRs). Required for good Windows guest
+    /// performance and stability. Inert for Linux guests.
+    #[arg(long)]
+    pub hyperv: bool,
+
+    /// Guest TSC frequency in Hz, used to compute the reference-TSC
+    /// page scaling factor when --hyperv is set. Defaults to the
+    /// host TSC frequency probed via CPUID 0x15/0x16. Set explicitly
+    /// when migrating between hosts with different TSC frequencies.
+    #[arg(long)]
+    pub tsc_freq_hz: Option<u64>,
+
+    /// Enable a virtual TPM 2.0 device backed by the in-process
+    /// libtpms emulator. Required for Windows 11 / Server 2022+
+    /// installs and for any guest that uses BitLocker, measured
+    /// boot, or attestation. Inert for guests that do not look for
+    /// a TPM. Exposes a TCG CRB MMIO interface at 0xFED40000 plus
+    /// the TPM2 ACPI table.
+    #[arg(long)]
+    pub vtpm: bool,
+
+    /// Directory for the vTPM's persistent NV state. Defaults to
+    /// `/var/db/vmm/<vm_name>/tpm`. The directory is created if
+    /// missing; existing state is reused so guest TPM keys survive
+    /// VMM restarts.
+    #[arg(long)]
+    pub vtpm_state_dir: Option<PathBuf>,
+
     /// VM name
     pub vm_name: String,
 }

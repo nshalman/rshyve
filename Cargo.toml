@@ -10,6 +10,9 @@ members = [
     "crates/vmm-devices",
     "crates/vmm-migrate",
     "crates/vmm-config",
+    "crates/vmm-hyperv",
+    "crates/vmm-tpm-sys",
+    "crates/vmm-tpm",
     "bin/vmm",
     "bin/vmm-migrate-agent",
 ]
@@ -35,6 +38,9 @@ vmm_core = { path = "crates/vmm-core" }
 vmm_devices = { path = "crates/vmm-devices" }
 vmm_migrate = { path = "crates/vmm-migrate" }
 vmm_config = { path = "crates/vmm-config" }
+vmm_hyperv = { path = "crates/vmm-hyperv" }
+vmm_tpm_sys = { path = "crates/vmm-tpm-sys" }
+vmm_tpm = { path = "crates/vmm-tpm" }
 
 # External dependencies
 anyhow = "1.0"

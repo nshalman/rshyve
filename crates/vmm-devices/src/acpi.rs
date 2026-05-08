@@ -850,6 +850,23 @@ pub struct AcpiTables {
 /// Returns the concatenated blob and individual table data for
 /// fw_cfg registration.
 pub fn generate_acpi_tables(num_cpus: u32) -> AcpiTables {
+    generate_acpi_tables_inner(num_cpus, None)
+}
+
+/// Variant of `generate_acpi_tables` that includes a TPM2 ACPI
+/// table. Used when the VM is booted with `--vtpm`. `tpm2_table`
+/// should be the bytes from `vmm_tpm::build_tpm2_table()`.
+pub fn generate_acpi_tables_with_tpm2(
+    num_cpus: u32,
+    tpm2_table: Option<Vec<u8>>,
+) -> AcpiTables {
+    generate_acpi_tables_inner(num_cpus, tpm2_table)
+}
+
+fn generate_acpi_tables_inner(
+    num_cpus: u32,
+    tpm2_table: Option<Vec<u8>>,
+) -> AcpiTables {
     let base = BHYVE_ACPI_BASE;
     let mut blob = Vec::new();
 
@@ -901,15 +918,36 @@ pub fn generate_acpi_tables(num_cpus: u32) -> AcpiTables {
     blob.extend_from_slice(&spcr);
     let spcr_gpa = base + spcr_offset as u64;
 
-    // RSDT (pointers to FADT, MADT, HPET, SPCR as u32)
+    // TPM2 (optional). Inserted before RSDT/XSDT so its GPA is
+    // stable while we compute the entry lists.
+    let tpm2_gpa: Option<u64> = tpm2_table.as_ref().map(|bytes| {
+        let off = blob.len();
+        blob.extend_from_slice(bytes);
+        base + off as u64
+    });
+
+    // Build RSDT/XSDT entry lists, conditionally including TPM2.
+    let mut rsdt_entries: Vec<u32> = vec![
+        fadt_gpa as u32,
+        madt_gpa as u32,
+        hpet_gpa as u32,
+        spcr_gpa as u32,
+    ];
+    let mut xsdt_entries: Vec<u64> = vec![fadt_gpa, madt_gpa, hpet_gpa, spcr_gpa];
+    if let Some(g) = tpm2_gpa {
+        rsdt_entries.push(g as u32);
+        xsdt_entries.push(g);
+    }
+
+    // RSDT (pointers to FADT, MADT, HPET, SPCR, [TPM2] as u32)
     let rsdt_offset = blob.len();
-    let rsdt = build_rsdt(&[fadt_gpa as u32, madt_gpa as u32, hpet_gpa as u32, spcr_gpa as u32]);
+    let rsdt = build_rsdt(&rsdt_entries);
     blob.extend_from_slice(&rsdt);
     let rsdt_gpa = base + rsdt_offset as u64;
 
-    // XSDT (pointers to FADT, MADT, HPET, SPCR as u64)
+    // XSDT (pointers to FADT, MADT, HPET, SPCR, [TPM2] as u64)
     let xsdt_offset = blob.len();
-    let xsdt = build_xsdt(&[fadt_gpa, madt_gpa, hpet_gpa, spcr_gpa]);
+    let xsdt = build_xsdt(&xsdt_entries);
     blob.extend_from_slice(&xsdt);
     let xsdt_gpa = base + xsdt_offset as u64;
 
@@ -1000,6 +1038,12 @@ pub struct AcpiLayout {
     pub spcr_offset: usize,
     /// Size of SPCR.
     pub spcr_size: usize,
+    /// Offset of TPM2 within `tables`. Zero if no TPM is configured;
+    /// `tpm2_size` is the source of truth for "is the TPM2 table
+    /// present?".
+    pub tpm2_offset: usize,
+    /// Size of TPM2 in bytes (0 means "not present").
+    pub tpm2_size: usize,
     /// Offset of XSDT within `tables`.
     pub xsdt_offset: usize,
     /// Size of XSDT.
@@ -1026,16 +1070,33 @@ pub fn generate_acpi_layout_with_dsdt(
     num_cpus: u32,
     dsdt_override: Option<Vec<u8>>,
 ) -> AcpiLayout {
-    generate_acpi_layout_inner(num_cpus, dsdt_override)
+    generate_acpi_layout_inner(num_cpus, dsdt_override, None)
 }
 
 pub fn generate_acpi_layout(num_cpus: u32) -> AcpiLayout {
-    generate_acpi_layout_inner(num_cpus, None)
+    generate_acpi_layout_inner(num_cpus, None, None)
+}
+
+/// Generate ACPI layout with an optional TPM2 ACPI table.
+///
+/// `tpm2_table` should be the bytes produced by
+/// `vmm_tpm::build_tpm2_table()` (or any other TPM2-shaped table).
+/// Pass `None` when no TPM is configured. The TPM2 table goes
+/// between SPCR and RSDT in the layout, gets its checksum recomputed
+/// by the firmware via the table-loader, and is added to the
+/// RSDT/XSDT pointer arrays.
+pub fn generate_acpi_layout_with_tpm2(
+    num_cpus: u32,
+    dsdt_override: Option<Vec<u8>>,
+    tpm2_table: Option<Vec<u8>>,
+) -> AcpiLayout {
+    generate_acpi_layout_inner(num_cpus, dsdt_override, tpm2_table)
 }
 
 fn generate_acpi_layout_inner(
     num_cpus: u32,
     dsdt_override: Option<Vec<u8>>,
+    tpm2_table: Option<Vec<u8>>,
 ) -> AcpiLayout {
     let mut tables = Vec::new();
 
@@ -1099,27 +1160,49 @@ fn generate_acpi_layout_inner(
     tables.extend_from_slice(&spcr);
     tables[spcr_offset + 9] = 0; // Clear SPCR checksum
 
-    // RSDT: entries are u32 blob offsets to FADT, MADT, HPET, SPCR
-    let rsdt_offset = tables.len();
-    let rsdt = build_rsdt(&[
+    // TPM2 (optional). Inserted before RSDT/XSDT so its offset is
+    // stable while we compute the entry lists below.
+    let (tpm2_offset, tpm2_size) = match &tpm2_table {
+        Some(bytes) => {
+            let off = tables.len();
+            tables.extend_from_slice(bytes);
+            tables[off + 9] = 0; // checksum will be recomputed by the loader
+            (off, bytes.len())
+        }
+        None => (0, 0),
+    };
+
+    // Build the RSDT/XSDT entry lists. TPM2 is included only when
+    // present so we don't ship a dangling entry pointing into the
+    // SPCR header.
+    let mut rsdt_entries: Vec<u32> = vec![
         fadt_offset as u32,
         madt_offset as u32,
         hpet_offset as u32,
         spcr_offset as u32,
-    ]);
+    ];
+    let mut xsdt_entries: Vec<u64> = vec![
+        fadt_offset as u64,
+        madt_offset as u64,
+        hpet_offset as u64,
+        spcr_offset as u64,
+    ];
+    if tpm2_size > 0 {
+        rsdt_entries.push(tpm2_offset as u32);
+        xsdt_entries.push(tpm2_offset as u64);
+    }
+
+    // RSDT: u32 blob offsets to FADT, MADT, HPET, SPCR, [TPM2]
+    let rsdt_offset = tables.len();
+    let rsdt = build_rsdt(&rsdt_entries);
     let rsdt_size = rsdt.len();
     tables.extend_from_slice(&rsdt);
     // Clear RSDT checksum
     tables[rsdt_offset + 9] = 0;
 
-    // XSDT: entries are u64 blob offsets to FADT, MADT, HPET, SPCR
+    // XSDT: u64 blob offsets to FADT, MADT, HPET, SPCR, [TPM2]
     let xsdt_offset = tables.len();
-    let xsdt = build_xsdt(&[
-        fadt_offset as u64,
-        madt_offset as u64,
-        hpet_offset as u64,
-        spcr_offset as u64,
-    ]);
+    let xsdt = build_xsdt(&xsdt_entries);
     let xsdt_size = xsdt.len();
     tables.extend_from_slice(&xsdt);
     // Clear XSDT checksum
@@ -1151,6 +1234,8 @@ fn generate_acpi_layout_inner(
         hpet_size,
         spcr_offset,
         spcr_size,
+        tpm2_offset,
+        tpm2_size,
         rsdt_offset,
         rsdt_size,
         xsdt_offset,
@@ -1338,16 +1423,18 @@ pub fn generate_table_loader(layout: &AcpiLayout) -> Vec<u8> {
         8,
     ));
 
-    // ── 4. ADD_POINTER: RSDT entries → FADT, MADT, HPET ──────
-    // RSDT entries are 4-byte pointers starting at offset 36
-    // (after the 36-byte ACPI header). Order: FADT, MADT, HPET.
+    // ── 4. ADD_POINTER: RSDT entries → FADT, MADT, HPET, SPCR,
+    // [TPM2]. The entry list must match the order used by
+    // `generate_acpi_layout_inner` when it built the RSDT body —
+    // mismatches here mean the firmware patches the wrong slot and
+    // the resulting RSDT points into garbage.
 
-    for (i, _table_offset) in [
-        layout.fadt_offset,
-        layout.madt_offset,
-        layout.hpet_offset,
-        layout.spcr_offset,
-    ].iter().enumerate() {
+    let mut sdt_entry_count = 4; // FADT, MADT, HPET, SPCR
+    if layout.tpm2_size > 0 {
+        sdt_entry_count += 1;
+    }
+
+    for i in 0..sdt_entry_count {
         loader.extend_from_slice(&loader_add_pointer_cmd(
             TABLES_BLOB_NAME,
             TABLES_BLOB_NAME,
@@ -1356,15 +1443,8 @@ pub fn generate_table_loader(layout: &AcpiLayout) -> Vec<u8> {
         ));
     }
 
-    // ── 5. ADD_POINTER: XSDT entries → FADT, MADT, HPET, SPCR ──
-    // XSDT entries are 8-byte pointers starting at offset 36.
-
-    for (i, _table_offset) in [
-        layout.fadt_offset,
-        layout.madt_offset,
-        layout.hpet_offset,
-        layout.spcr_offset,
-    ].iter().enumerate() {
+    // ── 5. ADD_POINTER: XSDT entries — same set as RSDT, 8 bytes.
+    for i in 0..sdt_entry_count {
         loader.extend_from_slice(&loader_add_pointer_cmd(
             TABLES_BLOB_NAME,
             TABLES_BLOB_NAME,
@@ -1426,6 +1506,18 @@ pub fn generate_table_loader(layout: &AcpiLayout) -> Vec<u8> {
         layout.spcr_offset as u32,
         layout.spcr_size as u32,
     ));
+
+    // TPM2 checksum (only when configured). Must come BEFORE the
+    // RSDT/XSDT checksum because those tables include a pointer to
+    // TPM2 and their checksums depend on the TPM2 pointer fixups.
+    if layout.tpm2_size > 0 {
+        loader.extend_from_slice(&loader_add_checksum_cmd(
+            TABLES_BLOB_NAME,
+            (layout.tpm2_offset + 9) as u32,
+            layout.tpm2_offset as u32,
+            layout.tpm2_size as u32,
+        ));
+    }
 
     // RSDT checksum
     loader.extend_from_slice(&loader_add_checksum_cmd(
@@ -2051,6 +2143,52 @@ mod tests {
         //   7 ADD_CHECKSUM (FADT, DSDT, MADT, HPET, SPCR, RSDT, XSDT)
         // Total: 25
         assert_eq!(count, 25, "expected 25 loader commands, got {}", count);
+    }
+
+    #[test]
+    fn layout_with_tpm2_includes_table_and_routes_pointers() {
+        // Build a minimal but valid TPM2-shaped table — 76 bytes,
+        // signature "TPM2", length field, otherwise zero. This is
+        // enough to exercise the layout/loader plumbing without
+        // pulling in the vmm-tpm crate.
+        let mut tpm2 = vec![0u8; 76];
+        tpm2[0..4].copy_from_slice(b"TPM2");
+        tpm2[4..8].copy_from_slice(&76u32.to_le_bytes());
+
+        let layout = generate_acpi_layout_with_tpm2(2, None, Some(tpm2.clone()));
+        assert_eq!(layout.tpm2_size, 76);
+        assert!(layout.tpm2_offset > layout.spcr_offset);
+
+        // TPM2 must land in the tables blob and keep its signature.
+        assert_eq!(
+            &layout.tables[layout.tpm2_offset..layout.tpm2_offset + 4],
+            b"TPM2"
+        );
+
+        // RSDT/XSDT entry counts grow by one when TPM2 is present.
+        // RSDT has a 36-byte ACPI header followed by N u32 entries;
+        // SDT length minus header divided by 4 == entry count.
+        let rsdt_len = u32::from_le_bytes(
+            layout.tables[layout.rsdt_offset + 4..layout.rsdt_offset + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let rsdt_entry_count = (rsdt_len - ACPI_HDR_SIZE) / 4;
+        assert_eq!(rsdt_entry_count, 5, "FADT, MADT, HPET, SPCR, TPM2");
+
+        let xsdt_len = u32::from_le_bytes(
+            layout.tables[layout.xsdt_offset + 4..layout.xsdt_offset + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let xsdt_entry_count = (xsdt_len - ACPI_HDR_SIZE) / 8;
+        assert_eq!(xsdt_entry_count, 5);
+
+        // Loader picks up the extra entries: +1 RSDT pointer fixup,
+        // +1 XSDT pointer fixup, +1 TPM2 checksum command.
+        let loader = generate_table_loader(&layout);
+        let count = loader.len() / LOADER_ENTRY_SIZE;
+        assert_eq!(count, 28, "expected 28 loader commands with TPM2");
     }
 
     #[test]

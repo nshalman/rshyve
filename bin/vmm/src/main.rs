@@ -113,6 +113,11 @@ struct MachineCreation {
     mem_size: usize,
     kernel_image: Option<direct_boot::KernelImage>,
     initrd_image: Option<direct_boot::InitrdImage>,
+    hyperv: Option<Arc<vmm_hyperv::HyperV>>,
+    /// Bytes of the TPM2 ACPI table when --vtpm is enabled. Threaded
+    /// through to `setup_fwcfg_and_acpi` so the guest's ACPI scan
+    /// finds the device. None when the VM has no vTPM.
+    tpm2_acpi: Option<Vec<u8>>,
 }
 
 /// Build the VM, load bootrom/kernel images, finalize memory, and apply
@@ -204,12 +209,86 @@ fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
     if cpu_baseline != vmm_core::cpuid::CpuBaseline::Host {
         info!(log, "applying CPU baseline"; "baseline" => &cli.cpu_baseline);
     }
-    vmm_core::cpuid::apply_cpuid_baseline(
-        machine.hdl(),
-        num_cpus,
-        cpu_baseline,
-        log,
-    ).context("failed to apply CPU baseline")?;
+
+    let hyperv = if cli.hyperv {
+        let tsc_freq_hz = cli.tsc_freq_hz.unwrap_or_else(|| {
+            host_tsc_frequency_hz().unwrap_or_else(|| {
+                warn!(log, "host TSC freq probe failed, reference-TSC page will be invalid; \
+                            pass --tsc-freq-hz to override");
+                0
+            })
+        });
+        let features = vmm_hyperv::Features {
+            reference_tsc: tsc_freq_hz != 0,
+            reset: true,
+            frequencies: true,
+            tsc_freq_hz,
+        };
+        info!(log, "enabling Hyper-V enlightenments";
+            "tsc_freq_hz" => tsc_freq_hz,
+            "reference_tsc" => features.reference_tsc,
+        );
+        let hv = vmm_hyperv::HyperV::new(
+            log.new(o!("module" => "hyperv")),
+            machine.physmap().clone(),
+            features,
+        );
+        let mut extra = Vec::new();
+        hv.add_cpuid(&mut extra);
+        vmm_core::cpuid::apply_cpuid(
+            machine.hdl(),
+            num_cpus,
+            cpu_baseline,
+            &extra,
+            log,
+        ).context("failed to apply CPUID with Hyper-V leaves")?;
+        Some(hv)
+    } else {
+        vmm_core::cpuid::apply_cpuid_baseline(
+            machine.hdl(),
+            num_cpus,
+            cpu_baseline,
+            log,
+        ).context("failed to apply CPU baseline")?;
+        None
+    };
+
+    let tpm2_acpi = if cli.vtpm {
+        let state_dir = cli.vtpm_state_dir.clone().unwrap_or_else(|| {
+            PathBuf::from("/var/db/vmm")
+                .join(&cli.vm_name)
+                .join("tpm")
+        });
+        let tpm = vmm_tpm::Tpm::new(
+            state_dir.clone(),
+            log.new(o!("module" => "vtpm")),
+        )
+        .with_context(|| format!(
+            "failed to initialize vTPM (state_dir={})",
+            state_dir.display(),
+        ))?;
+
+        // Register the CRB MMIO region. The handler clones an Arc to
+        // the Crb device so the vCPU dispatch can fire reads/writes
+        // without any locks held in the bus path.
+        let crb = tpm.crb.clone();
+        machine
+            .bus_mmio()
+            .register(
+                vmm_tpm::CRB_BASE,
+                vmm_tpm::CRB_REGION_LEN,
+                Arc::new(move |offset, op| crb.handle(offset, op)),
+            )
+            .context("registering vTPM CRB MMIO region")?;
+        info!(log, "vTPM CRB MMIO region registered";
+            "base" => format!("{:#x}", vmm_tpm::CRB_BASE),
+            "len" => format!("{:#x}", vmm_tpm::CRB_REGION_LEN),
+        );
+
+        Some(vmm_tpm::build_tpm2_table())
+    } else {
+        None
+    };
 
     Ok(MachineCreation {
         machine,
@@ -218,7 +297,43 @@ fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
         mem_size,
         kernel_image,
         initrd_image,
+        hyperv,
+        tpm2_acpi,
     })
+}
+
+/// Probe the host TSC frequency in Hz from CPUID leaf 0x16, falling
+/// back to leaf 0x15 (TSC/core ratio).
+///
+/// Returns `None` on non-x86_64 builds or when the host does not
+/// expose the frequency CPUID leaves.
+fn host_tsc_frequency_hz() -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let leaf16 = unsafe { std::arch::x86_64::__cpuid(0) };
+        if leaf16.eax >= 0x16 {
+            let r = unsafe { std::arch::x86_64::__cpuid(0x16) };
+            // EAX = base frequency in MHz.
+            if r.eax != 0 {
+                return Some(r.eax as u64 * 1_000_000);
+            }
+        }
+        if leaf16.eax >= 0x15 {
+            // Leaf 0x15: EBX/EAX = TSC/core ratio, ECX = nominal core
+            // crystal Hz. Skip if any field is zero.
+            let r = unsafe { std::arch::x86_64::__cpuid(0x15) };
+            if r.eax != 0 && r.ebx != 0 && r.ecx != 0 {
+                return Some(
+                    r.ecx as u64 * r.ebx as u64 / r.eax as u64,
+                );
+            }
+        }
+        None
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        None
+    }
 }
 
 /// Load the bootrom image into guest memory (pre-finalize).
@@ -440,6 +555,7 @@ fn setup_fwcfg_and_acpi(
     cli: &Cli,
     num_cpus: u32,
     mem_size: usize,
+    tpm2_acpi: Option<Vec<u8>>,
     log: &Logger,
 ) -> Arc<FwCfg> {
     // Create fw_cfg device and attach to PIO bus
@@ -462,12 +578,16 @@ fn setup_fwcfg_and_acpi(
     // Generate ACPI tables with table-loader protocol support.
     // The layout produces two separate blobs (tables + rsdp) with
     // blob-relative offsets that the UEFI firmware patches via the
-    // etc/table-loader commands.
-    let acpi_layout = acpi::generate_acpi_layout(num_cpus);
+    // etc/table-loader commands. When --vtpm is on, the TPM2 ACPI
+    // table is appended (between SPCR and RSDT) so OVMF surfaces
+    // the device to the guest.
+    let acpi_layout =
+        acpi::generate_acpi_layout_with_tpm2(num_cpus, None, tpm2_acpi.clone());
     info!(log, "ACPI layout generated for table-loader protocol";
         "tables_size" => acpi_layout.tables.len(),
         "rsdp_size" => acpi_layout.rsdp.len(),
         "num_cpus" => num_cpus,
+        "with_tpm2" => tpm2_acpi.is_some(),
     );
 
     // Register the ACPI blobs as fw_cfg named entries
@@ -491,8 +611,9 @@ fn setup_fwcfg_and_acpi(
     fwcfg.insert_named("bootorder", b"/pci@i0cf8/pci@4,0\n".to_vec());
     info!(log, "boot order configured via fw_cfg");
 
-    // Write legacy GPA-based ACPI tables to guest memory
-    write_legacy_acpi_tables(machine, num_cpus, log);
+    // Write legacy GPA-based ACPI tables to guest memory. Threading
+    // the TPM2 bytes here keeps the BIOS-scan and UEFI views in sync.
+    write_legacy_acpi_tables(machine, num_cpus, tpm2_acpi, log);
 
     // Generate and write SMBIOS tables
     write_smbios_tables(machine, &fwcfg, cli, num_cpus, mem_size, log);
@@ -502,8 +623,13 @@ fn setup_fwcfg_and_acpi(
 
 /// Generate legacy GPA-based ACPI tables and write to multiple guest
 /// memory locations for compatibility with both UEFI and BIOS scan paths.
-fn write_legacy_acpi_tables(machine: &Machine, num_cpus: u32, log: &Logger) {
-    let acpi_tables = acpi::generate_acpi_tables(num_cpus);
+fn write_legacy_acpi_tables(
+    machine: &Machine,
+    num_cpus: u32,
+    tpm2_acpi: Option<Vec<u8>>,
+    log: &Logger,
+) {
+    let acpi_tables = acpi::generate_acpi_tables_with_tpm2(num_cpus, tpm2_acpi);
 
     // Write to BIOS-scannable region (0xE0000-0xFFFFF) as fallback
     // if the table-loader protocol doesn't properly install the RSDP.
@@ -905,6 +1031,7 @@ fn spawn_vcpus(
     machine: &Machine,
     num_cpus: u32,
     api_version: u32,
+    hyperv: Option<Arc<vmm_hyperv::HyperV>>,
     log: &Logger,
 ) -> (
     mpsc::Receiver<vcpu_tasks::VcpuEvent>,
@@ -924,8 +1051,10 @@ fn spawn_vcpus(
         machine.bus_pio(),
         machine.bus_mmio(),
         machine.physmap(),
+        machine.hdl().clone(),
         api_version,
         &vcpu_metrics,
+        hyperv,
         log,
     );
 
@@ -1066,6 +1195,8 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
         mem_size,
         kernel_image,
         initrd_image,
+        hyperv,
+        tpm2_acpi,
     } = creation;
 
     // Phase 2: Initialize chipset and kernel-emulated devices
@@ -1078,7 +1209,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     let (_com1, _com2) = setup_serial(&machine, &chipset_devs.pic, &cli, log);
 
     // Phase 5: fw_cfg, ACPI tables, SMBIOS, E820, boot order
-    let _fwcfg = setup_fwcfg_and_acpi(&machine, &cli, num_cpus, mem_size, log);
+    let _fwcfg = setup_fwcfg_and_acpi(&machine, &cli, num_cpus, mem_size, tpm2_acpi.clone(), log);
 
     // Phase 6: PCI devices
     let (_pci_devices, lifecycle_devices) = init_pci_devices(&machine, &chipset_devs.chipset, &cli, num_cpus, log)?;
@@ -1095,7 +1226,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
 
     // Phase 9: Spawn vCPU threads
     let (event_rx, handles, vcpu_metrics) = spawn_vcpus(
-        &machine, num_cpus, api_version, log,
+        &machine, num_cpus, api_version, hyperv.clone(), log,
     );
 
     // Phase 10: Post-migration timer kick + delayed virtio interrupt

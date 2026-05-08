@@ -31,12 +31,14 @@ use vmm_core::exits::{
     InoutReq, InoutRes, MmioReq, MmioRes, Suspend,
     VmEntry, VmExitKind,
 };
+use vmm_core::hdl::VmmHdl;
 use vmm_core::inst_emul;
 use vmm_core::mem::PhysMap;
 use vmm_core::pio::PioBus;
 use vmm_core::mmio::MmioBus;
 use vmm_devices::metrics::VcpuMetrics;
 use vmm_core::vcpu::Vcpu;
+use vmm_hyperv::{HyperV, RdmsrOutcome, WrmsrOutcome};
 
 /// Events sent from vCPU threads to the main thread.
 #[derive(Debug)]
@@ -55,8 +57,10 @@ pub fn spawn_vcpu_threads(
     bus_pio: &Arc<PioBus>,
     bus_mmio: &Arc<MmioBus>,
     physmap: &Arc<PhysMap>,
+    hdl: Arc<VmmHdl>,
     api_version: u32,
     vcpu_metrics: &[Arc<VcpuMetrics>],
+    hyperv: Option<Arc<HyperV>>,
     log: &Logger,
 ) -> (mpsc::Receiver<VcpuEvent>, Vec<thread::JoinHandle<()>>) {
     let (tx, rx) = mpsc::channel();
@@ -72,13 +76,11 @@ pub fn spawn_vcpu_threads(
         let physmap = Arc::clone(physmap);
         let metrics = Arc::clone(&vcpu_metrics[idx]);
         let tx = tx.clone();
-        let hdl = Arc::clone(vcpu.hdl());
+        let vcpu_hdl = Arc::clone(vcpu.hdl());
+        let vmm_hdl = Arc::clone(&hdl);
+        let hyperv = hyperv.clone();
 
-        // We need to create a new Vcpu for the thread since Vcpu
-        // is not Send (it holds an Arc but we need the ioctl fd).
-        // Actually, Vcpu IS Send because it only holds Arc<VmmHdl>.
-        // But we can't move the borrow — create a new handle.
-        let thread_vcpu = vmm_core::Vcpu::new_for_thread(vcpu_id, hdl);
+        let thread_vcpu = vmm_core::Vcpu::new_for_thread(vcpu_id, vcpu_hdl);
 
         let handle = thread::Builder::new()
             .name(format!("vcpu-{}", vcpu_id))
@@ -88,8 +90,10 @@ pub fn spawn_vcpu_threads(
                     &bus_pio,
                     &bus_mmio,
                     &physmap,
+                    &vmm_hdl,
                     api_version,
                     &metrics,
+                    hyperv.as_deref(),
                     &tx,
                     &vcpu_log,
                 );
@@ -110,8 +114,10 @@ fn vcpu_run_loop(
     bus_pio: &PioBus,
     bus_mmio: &MmioBus,
     physmap: &PhysMap,
+    hdl: &VmmHdl,
     api_version: u32,
     metrics: &VcpuMetrics,
+    hyperv: Option<&HyperV>,
     events: &mpsc::Sender<VcpuEvent>,
     log: &Logger,
 ) {
@@ -167,21 +173,12 @@ fn vcpu_run_loop(
             }
 
             VmExitKind::Rdmsr(code) => {
-                // Unhandled MSRs: return 0 in RAX:RDX.
-                // The kernel auto-advances RIP past the RDMSR instruction.
-                // set_reg fails only if vcpu fd is closed; unrecoverable
-                let _ = vcpu.set_reg(
-                    bhyve_api::vm_reg_name::VM_REG_GUEST_RAX, 0,
-                );
-                let _ = vcpu.set_reg(
-                    bhyve_api::vm_reg_name::VM_REG_GUEST_RDX, 0,
-                );
+                handle_rdmsr(vcpu, vcpu_id, code, hyperv, log);
                 VmEntry::Run
             }
 
-            VmExitKind::Wrmsr(_code, _val) => {
-                // Unhandled MSRs: silently ignore the write.
-                // The kernel auto-advances RIP past the WRMSR instruction.
+            VmExitKind::Wrmsr(code, val) => {
+                handle_wrmsr(vcpu, vcpu_id, code, val, hdl, hyperv, log);
                 VmEntry::Run
             }
 
@@ -337,4 +334,68 @@ fn handle_mmio(req: &MmioReq, bus: &MmioBus) -> MmioRes {
             }
         }
     }
+}
+
+fn write_msr_result(vcpu: &Vcpu, value: u64) {
+    let lo = value as u32 as u64;
+    let hi = (value >> 32) as u32 as u64;
+    let _ = vcpu.set_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RAX, lo);
+    let _ = vcpu.set_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RDX, hi);
+}
+
+fn handle_rdmsr(
+    vcpu: &Vcpu,
+    vcpu_id: i32,
+    code: u32,
+    hyperv: Option<&HyperV>,
+    log: &Logger,
+) {
+    if let Some(hv) = hyperv {
+        match hv.rdmsr(vcpu_id, code) {
+            RdmsrOutcome::Handled(value) => {
+                write_msr_result(vcpu, value);
+                return;
+            }
+            RdmsrOutcome::GpException => {
+                if let Err(e) = vcpu.inject_gp() {
+                    warn!(log, "failed to inject #GP for rdmsr"; "msr" => format!("{:#x}", code), "error" => %e);
+                }
+                return;
+            }
+            RdmsrOutcome::NotHandled => { /* fall through */ }
+        }
+    }
+    debug!(log, "unhandled rdmsr"; "msr" => format!("{:#x}", code));
+    write_msr_result(vcpu, 0);
+}
+
+fn handle_wrmsr(
+    vcpu: &Vcpu,
+    vcpu_id: i32,
+    code: u32,
+    val: u64,
+    hdl: &VmmHdl,
+    hyperv: Option<&HyperV>,
+    log: &Logger,
+) {
+    if let Some(hv) = hyperv {
+        match hv.wrmsr(vcpu_id, code, val) {
+            WrmsrOutcome::Handled => return,
+            WrmsrOutcome::GpException => {
+                if let Err(e) = vcpu.inject_gp() {
+                    warn!(log, "failed to inject #GP for wrmsr"; "msr" => format!("{:#x}", code), "error" => %e);
+                }
+                return;
+            }
+            WrmsrOutcome::Reset => {
+                use bhyve_api::vm_suspend_how;
+                if let Err(e) = hdl.suspend(vm_suspend_how::VM_SUSPEND_RESET as u32, vcpu_id) {
+                    warn!(log, "reset suspend failed"; "error" => %e);
+                }
+                return;
+            }
+            WrmsrOutcome::NotHandled => { /* fall through */ }
+        }
+    }
+    debug!(log, "unhandled wrmsr"; "msr" => format!("{:#x}", code), "val" => format!("{:#x}", val));
 }
