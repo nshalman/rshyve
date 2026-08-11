@@ -158,6 +158,15 @@ impl XhciState {
             ep1_in_has_trbs: false,
         }
     }
+
+    fn enable_slot(&mut self) -> (u32, u8) {
+        if self.slot_state != SlotState::Disabled {
+            return (TRB_CC_NO_SLOTS_AVAILABLE, 0);
+        }
+
+        self.slot_state = SlotState::Enabled;
+        (TRB_CC_SUCCESS, 1)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -461,8 +470,8 @@ impl XhciController {
                 }
 
                 TRB_TYPE_ENABLE_SLOT => {
-                    st.slot_state = SlotState::Enabled;
-                    self.post_cmd_completion(st, trb_addr, TRB_CC_SUCCESS, 1);
+                    let (cc, slot_id) = st.enable_slot();
+                    self.post_cmd_completion(st, trb_addr, cc, slot_id);
                 }
 
                 TRB_TYPE_ADDRESS_DEVICE => {
@@ -1055,7 +1064,8 @@ impl XhciController {
                             | (u64::from(val) << 32);
                     }
                     OP_CONFIG => {
-                        st.config = val & 0xFF; // MaxSlotsEn
+                        st.config = (val & 0xFF)
+                            .min(u32::from(bits::MAX_SLOTS));
                     }
                     _ => {}
                 }
@@ -1145,6 +1155,9 @@ impl XhciController {
             }
             RWOp::Write(wo) => {
                 let db_idx = db_off / DB_REG_SIZE;
+                if db_idx > usize::from(bits::MAX_SLOTS) {
+                    return;
+                }
                 let val = wo.read_u32();
                 let mut st = self.state.lock().expect("xhci: state lock");
 
@@ -1331,6 +1344,13 @@ impl PciDevice for XhciController {
     }
 }
 
+impl crate::PointerSink for XhciController {
+    fn pointer_event(&self, buttons: u8, x: u16, y: u16) {
+        self.tablet().pointer_event(buttons, x, y);
+        self.notify_pointer_event();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -1348,11 +1368,19 @@ impl Lifecycle for XhciController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vmm_core::common::ReadOp;
+    use vmm_core::common::{ReadOp, WriteOp};
 
     /// Helper to create an XhciState for testing register logic.
     fn test_state() -> XhciState {
         XhciState::new()
+    }
+
+    fn test_controller() -> Arc<XhciController> {
+        XhciController::new(
+            Arc::new(PhysMap::new()),
+            Arc::new(MmioBus::new()),
+            None,
+        )
     }
 
     #[test]
@@ -1366,6 +1394,13 @@ mod tests {
     fn slot_starts_disabled() {
         let st = test_state();
         assert_eq!(st.slot_state, SlotState::Disabled);
+    }
+
+    #[test]
+    fn enable_slot_twice_reports_no_slots() {
+        let mut st = test_state();
+        assert_eq!(st.enable_slot(), (TRB_CC_SUCCESS, 1));
+        assert_eq!(st.enable_slot(), (TRB_CC_NO_SLOTS_AVAILABLE, 0));
     }
 
     #[test]
@@ -1392,8 +1427,8 @@ mod tests {
     #[test]
     fn cap_hcsparams1() {
         let val = hcsparams1();
-        // MaxSlots = 1
-        assert_eq!(val & 0xFF, 1);
+        // MaxSlots = 64
+        assert_eq!(val & 0xFF, 64);
         // MaxIntrs = 1
         assert_eq!((val >> 8) & 0x3FF, 1);
         // MaxPorts = 2
@@ -1409,7 +1444,56 @@ mod tests {
     #[test]
     fn cap_dboff_rtsoff() {
         assert_eq!(DBOFF, 0x440);
-        assert_eq!(RTSOFF, 0x480);
+        assert_eq!(RTSOFF, 0x560);
+    }
+
+    #[test]
+    fn config_max_slots_is_clamped() {
+        let ctrl = test_controller();
+        let wo = WriteOp::from_buf(&u32::MAX.to_le_bytes());
+        ctrl.bar0_rw(OP_BASE + OP_CONFIG, RWOp::Write(&wo));
+
+        let st = ctrl.state.lock().expect("xhci: state lock");
+        assert_eq!(st.config, u32::from(bits::MAX_SLOTS));
+    }
+
+    #[test]
+    fn doorbell_beyond_max_slots_is_ignored() {
+        let ctrl = test_controller();
+        let original_erstba = 0x1122_3344_5566_7780;
+        ctrl.state.lock().expect("xhci: state lock").erstba = original_erstba;
+
+        let wo = WriteOp::from_buf(&20u32.to_le_bytes());
+        ctrl.bar0_rw(
+            DBOFF as usize + 20 * DB_REG_SIZE,
+            RWOp::Write(&wo),
+        );
+        assert_eq!(
+            ctrl.state.lock().expect("xhci: state lock").erstba,
+            original_erstba,
+        );
+
+        // IR0_BASE means the old layout's ERSTBA collision was slot 28.
+        let wo = WriteOp::from_buf(&28u32.to_le_bytes());
+        ctrl.bar0_rw(
+            DBOFF as usize + 28 * DB_REG_SIZE,
+            RWOp::Write(&wo),
+        );
+        assert_eq!(
+            ctrl.state.lock().expect("xhci: state lock").erstba,
+            original_erstba,
+        );
+
+        let beyond_max = usize::from(bits::MAX_SLOTS) + 1;
+        let wo = WriteOp::from_buf(&(beyond_max as u32).to_le_bytes());
+        ctrl.bar0_rw(
+            DBOFF as usize + beyond_max * DB_REG_SIZE,
+            RWOp::Write(&wo),
+        );
+        assert_eq!(
+            ctrl.state.lock().expect("xhci: state lock").erstba,
+            original_erstba,
+        );
     }
 
     #[test]

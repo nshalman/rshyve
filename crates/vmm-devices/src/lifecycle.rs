@@ -23,9 +23,31 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use futures::future::{self, BoxFuture};
-
 use crate::migrate::Migrator;
+
+/// Durability required from a device backing-file flush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushIntent {
+    /// Migration: the fsync barrier MUST cover every write the guest saw
+    /// completed. Failing loudly beats shipping an unsynced disk.
+    Durable,
+    /// Teardown: dropping unflushed writes is power-loss equivalent and
+    /// within the volatile-write-cache contract we advertise (VWC=1 at
+    /// nvme/bits.rs:253, VIRTIO_BLK_F_FLUSH at virtio/block.rs:326).
+    /// C bhyve does not flush here at all (vmexit.c:536-546 calls exit(0)).
+    BestEffort,
+}
+
+/// Failure to quiesce or sync a device backing file.
+#[derive(Debug)]
+pub enum FlushError {
+    /// Device workers did not quiesce before the intent-specific deadline.
+    NotQuiesced(&'static str),
+    /// The backing file could not be cloned or synced.
+    Sync(std::io::Error),
+    /// A best-effort sync outlived its teardown watchdog.
+    TimedOut,
+}
 
 /// Virtio PCI transport state for migration export/import.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -104,17 +126,27 @@ pub struct NvmeMigrateCq {
 /// Default implementations are provided for most methods. Devices that
 /// hold no internal state can rely on the defaults. Devices with
 /// background tasks or internal state **must** implement at least
-/// `pause` and `paused` to ensure clean quiescence.
+/// `pause` and `is_quiesced` to ensure clean quiescence.
 pub trait Lifecycle: Send + Sync + 'static {
     /// Unique name for devices of a given type.
     fn type_name(&self) -> &'static str;
 
-    /// Return a future that completes when the device has finished pausing.
+    /// Return the device's tracked lifecycle state, if it has one.
     ///
-    /// Devices with background tasks should return a future that resolves
-    /// only after those tasks have quiesced.
-    fn paused(&self) -> BoxFuture<'static, ()> {
-        Box::pin(future::ready(()))
+    /// Stateless devices may use the default. Devices backed by an
+    /// [`Indicator`] should expose its state so lifecycle coordinators can
+    /// avoid requesting a transition that has already completed.
+    fn lifecycle_state(&self) -> Option<IndicatedState> {
+        None
+    }
+
+    /// Returns true once the device's background work has drained.
+    ///
+    /// MUST NOT BLOCK. Callers poll this against a deadline; a device that
+    /// waits inside this method makes that deadline unenforceable. Implement
+    /// it as an atomic load. If you need to join a thread, do it in `halt()`.
+    fn is_quiesced(&self) -> bool {
+        true
     }
 
     /// Called when an instance is about to begin running, just before any
@@ -150,9 +182,10 @@ pub trait Lifecycle: Send + Sync + 'static {
 
     /// Flush any device-level writeback cache to durable storage.
     ///
-    /// Called during migration pause AFTER `hdl.pause()` has quiesced
-    /// vCPUs and BEFORE device state is exported / the ZFS barrier is
-    /// hit. Default: no-op.
+    /// Called with [`FlushIntent::Durable`] during migration pause AFTER
+    /// `hdl.pause()` has quiesced vCPUs and BEFORE device state is exported /
+    /// the ZFS barrier is hit. Teardown uses [`FlushIntent::BestEffort`].
+    /// Default: no-op.
     ///
     /// With zvol `DKIOCSETWCE=1` (enabled by `blkdev::DiskCache`), writes
     /// return OK from the zvol cache without hitting the ZFS pool. A
@@ -162,7 +195,9 @@ pub trait Lifecycle: Send + Sync + 'static {
     /// Implementors must also ensure in-flight worker writes complete
     /// before syncing so the fsync barrier covers the same set of writes
     /// the guest saw completions for.
-    fn flush_backing(&self) {}
+    fn flush_backing(&self, _intent: FlushIntent) -> Result<(), FlushError> {
+        Ok(())
+    }
 
     /// Export virtio queue state for migration.
     fn export_virtio_state(&self) -> Vec<VirtioMigrateQueue> {

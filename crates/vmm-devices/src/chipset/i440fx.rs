@@ -107,7 +107,7 @@ impl I440FxChipset {
             log,
         });
 
-        // Register PIO handler for config address register (0xCF8, 4 bytes)
+        // Only port 0xCF8 is claimed; dword accesses still reach this handler.
         let cs = Arc::clone(&chipset);
         let addr_handler: Arc<PioFn> =
             Arc::new(move |offset: u16, rwo: RWOp<'_>| {

@@ -47,7 +47,10 @@ pub type DeviceExportFn = Box<dyn FnOnce() -> DeviceQueueExport + Send>;
 /// Callback to flush device writeback caches. Called after `hdl.pause()`
 /// has quiesced vCPUs and before the ZFS barrier / device-state export
 /// so `zfs send` sees every write the guest was told was complete.
-pub type DeviceFlushFn = Box<dyn FnOnce() + Send>;
+pub type DeviceFlushFn = Box<dyn FnOnce() -> Result<(), String> + Send>;
+
+/// Callback to resume device workers when a paused migration aborts.
+pub type DeviceResumeFn = Box<dyn Fn() + Send>;
 
 pub fn run_source_sync<S: Read + Write>(
     stream: S,
@@ -60,6 +63,7 @@ pub fn run_source_sync<S: Read + Write>(
     cpu_baseline: &str,
     device_pre_pause_fn: DevicePrePauseFn,
     device_flush_fn: DeviceFlushFn,
+    device_resume_fn: DeviceResumeFn,
     device_export_fn: DeviceExportFn,
     zfs_barrier: Option<String>,
 ) -> Result<(), MigrateError> {
@@ -74,10 +78,33 @@ pub fn run_source_sync<S: Read + Write>(
         device_pre_pause_fn, device_flush_fn, device_export_fn, zfs_barrier,
     );
 
-    if result.is_err() {
-        let phase = status.lock().map(|s| s.phase).unwrap_or(MigrationPhase::Error);
-        if phase as u8 >= MigrationPhase::Pause as u8 {
-            let _ = hdl.resume();
+    let phase = status.lock().map(|s| s.phase).unwrap_or(MigrationPhase::Error);
+    finish_source_sync(
+        result,
+        phase,
+        log,
+        device_resume_fn,
+        || hdl.resume(),
+    )
+}
+
+fn finish_source_sync<E, F>(
+    result: Result<(), MigrateError>,
+    phase: MigrationPhase,
+    log: &slog::Logger,
+    device_resume_fn: DeviceResumeFn,
+    resume_vm: F,
+) -> Result<(), MigrateError>
+where
+    E: std::fmt::Display,
+    F: FnOnce() -> Result<(), E>,
+{
+    if result.is_err() && phase as u8 >= MigrationPhase::Pause as u8 {
+        // Device workers must be available before vCPUs can issue more I/O.
+        device_resume_fn();
+        if let Err(error) = resume_vm() {
+            slog::warn!(log, "failed to resume source VM after migration abort";
+                "error" => %error);
         }
     }
 
@@ -165,7 +192,8 @@ fn run_inner<S: Read + Write>(
     // incremental — otherwise the destination would see a disk that's
     // older than the guest memory we're about to ship.
     slog::info!(log, "flushing device backing caches");
-    device_flush_fn();
+    device_flush_fn()
+        .map_err(|error| MigrateError::Io(format!("device flush failed: {error}")))?;
 
     // ── Post-pause ZFS barrier ──
     // Wait for the GZ agent to complete the final ZFS incremental.
@@ -403,4 +431,48 @@ fn expect_mem_done(msg: Message) -> Result<(), MigrateError> {
 
 fn set_phase(status: &Arc<Mutex<MigrationStatus>>, phase: MigrationPhase) {
     if let Ok(mut s) = status.lock() { s.phase = phase; }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn flush_failure_resumes_devices_and_vcpus() {
+        let flush_fn: DeviceFlushFn =
+            Box::new(|| Err("virtio-blk: not quiesced".to_string()));
+        let result = flush_fn().map_err(|error| {
+            MigrateError::Io(format!("device flush failed: {error}"))
+        });
+        let devices_resumed = Arc::new(AtomicBool::new(false));
+        let vcpus_resumed = Arc::new(AtomicBool::new(false));
+        let devices_resumed_by_callback = Arc::clone(&devices_resumed);
+        let vcpus_resumed_by_callback = Arc::clone(&vcpus_resumed);
+        let devices_resumed_before_vcpus = Arc::clone(&devices_resumed);
+        let resume_fn: DeviceResumeFn = Box::new(move || {
+            devices_resumed_by_callback.store(true, Ordering::Release);
+        });
+        let log = slog::Logger::root(slog::Discard, slog::o!());
+
+        let result = finish_source_sync(
+            result,
+            MigrationPhase::Pause,
+            &log,
+            resume_fn,
+            move || {
+                assert!(devices_resumed_before_vcpus.load(Ordering::Acquire));
+                vcpus_resumed_by_callback.store(true, Ordering::Release);
+                Ok::<(), &'static str>(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(MigrateError::Io(ref error))
+                if error == "device flush failed: virtio-blk: not quiesced"
+        ));
+        assert!(devices_resumed.load(Ordering::Acquire));
+        assert!(vcpus_resumed.load(Ordering::Acquire));
+    }
 }

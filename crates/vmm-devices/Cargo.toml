@@ -10,6 +10,7 @@ bhyve_api.workspace = true
 viona_api.workspace = true
 bitflags.workspace = true
 anyhow.workspace = true
+ascii.workspace = true
 des.workspace = true
 erased-serde.workspace = true
 libc.workspace = true

@@ -57,9 +57,52 @@ const PM1_SLP_TYP_MASK: u16 = 0x1C00;
 const PM1_SLP_EN: u16 = 0x2000;
 const PM1_ALWAYS_ZERO: u16 = 0xC003;
 
+/// Sink for guest-initiated power transitions.
+///
+/// Indirected through a trait so the register emulation is unit-testable
+/// without a live /dev/vmm handle.
+pub trait SuspendSink: Send + Sync + 'static {
+    /// `how` is a `bhyve_api::vm_suspend_how` discriminant.
+    fn suspend(&self, how: u32);
+}
+
+/// Suspend sink backed by a live vmm handle.
+pub struct HdlSuspendSink {
+    hdl: Arc<vmm_core::hdl::VmmHdl>,
+    log: slog::Logger,
+}
+
+impl HdlSuspendSink {
+    /// Create a suspend sink for the VM handle.
+    pub fn new(
+        hdl: Arc<vmm_core::hdl::VmmHdl>,
+        log: slog::Logger,
+    ) -> Arc<Self> {
+        Arc::new(Self { hdl, log })
+    }
+}
+
+impl SuspendSink for HdlSuspendSink {
+    fn suspend(&self, how: u32) {
+        // A device request is not attributable to a specific vCPU.
+        match self.hdl.suspend(how, -1) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EALREADY) => {
+                // Another vCPU may have already latched the transition.
+                slog::debug!(self.log, "VM suspend already latched"; "how" => how);
+            }
+            Err(e) => {
+                slog::error!(self.log, "failed to suspend VM";
+                    "how" => how, "error" => %e);
+            }
+        }
+    }
+}
+
 /// ACPI PM1 register state.
 pub struct AcpiPm {
     log: slog::Logger,
+    sink: Arc<dyn SuspendSink>,
     inner: Mutex<AcpiPmInner>,
 }
 
@@ -67,24 +110,28 @@ struct AcpiPmInner {
     pm1_status: u16,
     pm1_enable: u16,
     pm1_control: u16,
+    reset_control: u8,
 }
 
 impl AcpiPm {
     /// Create and attach the ACPI PM registers to the PIO bus.
     ///
-    /// Registers handlers for:
-    /// - PM1 Status at PMBASE (0xB000, 2 bytes)
-    /// - PM1 Enable at PMBASE+2 (0xB002, 2 bytes)
-    /// - PM1 Control at PMBASE+4 (0xB004, 2 bytes)
-    /// - Reset register at 0xCF9 (1 byte)
-    pub fn create_and_attach(bus_pio: &PioBus, log: slog::Logger) -> Arc<Self> {
+    /// Claims the PM1 event (0x400, 4 bytes), control (0x404, 2 bytes),
+    /// reset (0xCF9), and SMI command (0xB2) ports.
+    pub fn create_and_attach(
+        bus_pio: &PioBus,
+        sink: Arc<dyn SuspendSink>,
+        log: slog::Logger,
+    ) -> anyhow::Result<Arc<Self>> {
         let pm = Arc::new(Self {
             log,
+            sink,
             inner: Mutex::new(AcpiPmInner {
                 pm1_status: 0,
                 pm1_enable: 0,
                 // SCI_EN starts clear — OS sets it via SMI_CMD write
                 pm1_control: 0,
+                reset_control: 0,
             }),
         });
 
@@ -94,9 +141,10 @@ impl AcpiPm {
             Arc::new(move |offset: u16, rwo: RWOp<'_>| {
                 pm_evt.handle_pm1_evt(offset, rwo);
             });
-        if let Err(e) = bus_pio.register(PMBASE, 4, evt_handler) {
-            slog::warn!(pm.log, "failed to register PM1 event handler"; "error" => %e);
-        }
+        bus_pio.register(PMBASE, 4, evt_handler)
+            .map_err(|e| anyhow::anyhow!(
+                "acpi-pm: cannot claim port {:#x}: {e}", PMBASE
+            ))?;
 
         // PM1 Control block: 2 bytes at PMBASE+4
         let pm_cnt = Arc::clone(&pm);
@@ -104,9 +152,10 @@ impl AcpiPm {
             Arc::new(move |offset: u16, rwo: RWOp<'_>| {
                 pm_cnt.handle_pm1_cnt(offset, rwo);
             });
-        if let Err(e) = bus_pio.register(PMBASE + 4, 2, cnt_handler) {
-            slog::warn!(pm.log, "failed to register PM1 control handler"; "error" => %e);
-        }
+        bus_pio.register(PMBASE + 4, 2, cnt_handler)
+            .map_err(|e| anyhow::anyhow!(
+                "acpi-pm: cannot claim port {:#x}: {e}", PMBASE + 4
+            ))?;
 
         // Reset register at 0xCF9
         let pm_rst = Arc::clone(&pm);
@@ -114,9 +163,10 @@ impl AcpiPm {
             Arc::new(move |_offset: u16, rwo: RWOp<'_>| {
                 pm_rst.handle_reset(rwo);
             });
-        if let Err(e) = bus_pio.register(0xCF9, 1, rst_handler) {
-            slog::warn!(pm.log, "failed to register reset handler"; "error" => %e);
-        }
+        bus_pio.register(0xCF9, 1, rst_handler)
+            .map_err(|e| anyhow::anyhow!(
+                "acpi-pm: cannot claim port {:#x}: {e}", 0xCF9
+            ))?;
 
         // SMI Command port at 0xB2 (ACPI enable/disable)
         let pm_smi = Arc::clone(&pm);
@@ -124,11 +174,12 @@ impl AcpiPm {
             Arc::new(move |_offset: u16, rwo: RWOp<'_>| {
                 pm_smi.handle_smi_cmd(rwo);
             });
-        if let Err(e) = bus_pio.register(SMI_CMD_PORT, 1, smi_handler) {
-            slog::warn!(pm.log, "failed to register SMI command handler"; "error" => %e);
-        }
+        bus_pio.register(SMI_CMD_PORT, 1, smi_handler)
+            .map_err(|e| anyhow::anyhow!(
+                "acpi-pm: cannot claim port {:#x}: {e}", SMI_CMD_PORT
+            ))?;
 
-        pm
+        Ok(pm)
     }
 
     /// Handle PM1 Event block I/O (status at offset 0, enable at offset 2).
@@ -174,19 +225,19 @@ impl AcpiPm {
             }
             RWOp::Write(wo) => {
                 let val = wo.read_u16();
+                let slp_typ = (val & PM1_SLP_TYP_MASK) >> 10;
                 // Preserve SCI_EN (OSPM cannot change it), clear
                 // reserved bits, and don't store SLP_EN.
                 inner.pm1_control = (inner.pm1_control & PM1_SCI_EN)
                     | (val & !(PM1_SLP_EN | PM1_ALWAYS_ZERO));
 
-                // Check for sleep/poweroff request
-                if val & PM1_SLP_EN != 0 {
-                    let slp_type = (inner.pm1_control & PM1_SLP_TYP_MASK) >> 10;
-                    if slp_type == 5 {
-                        // S5 = power off. Signal via SLP_EN write.
-                        // The vCPU run loop will see this as a suspend.
-                        // S5 = power off
-                    }
+                if val & PM1_SLP_EN != 0 && slp_typ == 5 {
+                    slog::info!(self.log, "guest requested ACPI S5 poweroff");
+                    // Avoid blocking another vCPU on device state during the suspend ioctl.
+                    drop(inner);
+                    self.sink.suspend(
+                        bhyve_api::vm_suspend_how::VM_SUSPEND_POWEROFF as u32,
+                    );
                 }
             }
         }
@@ -213,17 +264,141 @@ impl AcpiPm {
 
     /// Handle reset register I/O at 0xCF9.
     fn handle_reset(&self, rwo: RWOp<'_>) {
+        let mut inner = self.inner.lock().expect("pm lock poisoned");
+
         match rwo {
             RWOp::Read(ro) => {
-                ro.write_u8(0);
+                ro.write_u8(inner.reset_control);
             }
             RWOp::Write(wo) => {
                 let val = wo.read_u8();
-                // Bit 2 = system reset when transitioning 0→1
+                inner.reset_control = val;
                 if val & 0x04 != 0 {
-                    // System reset requested
+                    slog::info!(self.log, "guest requested reset via 0xCF9");
+                    // Avoid blocking another vCPU on device state during the suspend ioctl.
+                    drop(inner);
+                    self.sink.suspend(
+                        bhyve_api::vm_suspend_how::VM_SUSPEND_RESET as u32,
+                    );
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RecordingSink(Mutex<Vec<u32>>);
+
+    impl RecordingSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self(Mutex::new(Vec::new())))
+        }
+
+        fn recorded(&self) -> Vec<u32> {
+            self.0.lock().expect("recording lock poisoned").clone()
+        }
+    }
+
+    impl SuspendSink for RecordingSink {
+        fn suspend(&self, how: u32) {
+            self.0.lock().expect("recording lock poisoned").push(how);
+        }
+    }
+
+    fn test_log() -> slog::Logger {
+        slog::Logger::root(slog::Discard, slog::o!())
+    }
+
+    fn attached_bus() -> (PioBus, Arc<RecordingSink>) {
+        let bus = PioBus::new();
+        let sink = RecordingSink::new();
+        let sink_arg: Arc<dyn SuspendSink> = sink.clone();
+        AcpiPm::create_and_attach(&bus, sink_arg, test_log())
+            .expect("ACPI PM registers should attach");
+        (bus, sink)
+    }
+
+    #[test]
+    fn s5_write_triggers_poweroff() {
+        let (bus, sink) = attached_bus();
+
+        bus.handle_out(
+            PMBASE + 4,
+            2,
+            (PM1_SLP_EN | (5 << 10)) as u32,
+        );
+
+        assert_eq!(
+            sink.recorded(),
+            vec![bhyve_api::vm_suspend_how::VM_SUSPEND_POWEROFF as u32]
+        );
+    }
+
+    #[test]
+    fn s1_write_is_inert() {
+        let (bus, sink) = attached_bus();
+
+        bus.handle_out(
+            PMBASE + 4,
+            2,
+            (PM1_SLP_EN | (1 << 10)) as u32,
+        );
+
+        assert!(sink.recorded().is_empty());
+    }
+
+    #[test]
+    fn slp_typ5_without_slp_en_is_inert() {
+        let (bus, sink) = attached_bus();
+
+        bus.handle_out(PMBASE + 4, 2, (5 << 10) as u32);
+
+        assert!(sink.recorded().is_empty());
+    }
+
+    #[test]
+    fn cf9_bit2_triggers_reset() {
+        let (bus, sink) = attached_bus();
+
+        bus.handle_out(0xCF9, 1, 0x06);
+
+        assert_eq!(
+            sink.recorded(),
+            vec![bhyve_api::vm_suspend_how::VM_SUSPEND_RESET as u32]
+        );
+    }
+
+    #[test]
+    fn cf9_without_bit2_is_inert() {
+        let (bus, sink) = attached_bus();
+
+        bus.handle_out(0xCF9, 1, 0x02);
+
+        assert!(sink.recorded().is_empty());
+    }
+
+    #[test]
+    fn cf9_reads_back_last_write() {
+        let (bus, _sink) = attached_bus();
+
+        bus.handle_out(0xCF9, 1, 0x06);
+
+        assert_eq!(bus.handle_in(0xCF9, 1), 6);
+    }
+
+    #[test]
+    fn attach_fails_when_cf9_is_claimed() {
+        let bus = PioBus::new();
+        let handler: Arc<PioFn> = Arc::new(|_, _| {});
+        bus.register(0xCF9, 1, handler)
+            .expect("dummy reset handler should attach");
+        let sink: Arc<dyn SuspendSink> = RecordingSink::new();
+
+        let result = AcpiPm::create_and_attach(&bus, sink, test_log());
+
+        assert!(result.is_err());
     }
 }

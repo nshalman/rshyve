@@ -16,8 +16,11 @@ use bitflags::bitflags;
 /// Port address for the PCI configuration address register.
 pub const PORT_PCI_CONFIG_ADDR: u16 = 0xCF8;
 
-/// Length (in bytes) of the PCI configuration address register.
-pub const LEN_PCI_CONFIG_ADDR: u16 = 4;
+/// CONFIG_ADDRESS is 32 bits wide but occupies one dispatch port because 0xCF9
+/// is ACPI PM Reset Control. illumos bhyve separately registers pci_emul.c's
+/// `INOUT_PORT(pci_cfgaddr, CONF1_ADDR_PORT, ...)` and amd64/pm.c's
+/// `INOUT_PORT(reset_reg, 0xCF9, ...)`, leaving 0xCFA-0xCFB unregistered.
+pub const LEN_PCI_CONFIG_ADDR: u16 = 1;
 
 /// Port address for the PCI configuration data register.
 pub const PORT_PCI_CONFIG_DATA: u16 = 0xCFC;

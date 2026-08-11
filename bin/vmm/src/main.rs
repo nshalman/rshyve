@@ -4,18 +4,20 @@
 
 //! vmm - New Rust-based bhyve VMM with live migration support.
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use anyhow::Context;
 use clap::Parser;
-use slog::{info, warn, error, o, Drain, Logger};
+use slog::{error, info, o, warn, Drain, Logger};
 
 use vmm_config::Cli;
+use vmm_core::exits::Suspend;
 use vmm_core::hdl::CreateOpts;
 use vmm_core::intr_pins::{LegacyPIC, NoOpPin};
 use vmm_core::machine::{Builder, Machine, MachineSetup};
@@ -24,21 +26,30 @@ use vmm_devices::bhyve::{
     pmtimer::{BhyvePmTimer, PMBASE_DEFAULT},
 };
 use vmm_devices::acpi;
+use vmm_devices::acpi_pm::SuspendSink;
 use vmm_devices::chipset::i440fx::I440FxChipset;
 use vmm_devices::fwcfg::FwCfg;
-use vmm_devices::smbios;
 use vmm_devices::pci::Bdf;
 use vmm_devices::pci::msix::MsixTable;
+use vmm_devices::smbios;
 use vmm_devices::uart::lpc::{self, LpcUart};
 use vmm_devices::virtio::block::{VirtioBlock, VirtioBlockOpts};
 use vmm_devices::virtio::pci::VirtioPciDevice;
 use vmm_devices::virtio::viona::VirtioViona;
+use vmm_devices::InputBroker;
 
 mod bootrom;
 mod control;
 mod direct_boot;
+mod input;
 mod mdata;
+mod reboot;
 mod vcpu_tasks;
+
+use reboot::{
+    join_vcpus_bounded, quiesce_devices, reexec_for_reboot, RunOutcome,
+};
+use input::setup_ps2;
 
 /// Atomic flag set by the SIGTERM signal handler.
 static SIGTERM_RECEIVED: std::sync::atomic::AtomicBool =
@@ -424,6 +435,7 @@ struct TimerAndPmDevices {
     pmtimer: Arc<BhyvePmTimer>,
     acpi_pm: Arc<vmm_devices::acpi_pm::AcpiPm>,
     pvpanic: Arc<vmm_devices::pvpanic::PvPanic>,
+    suspend_sink: Arc<dyn SuspendSink>,
 }
 
 /// Configure the ACPI PM timer, ISA IRQ trigger modes for SCI and PCI,
@@ -450,10 +462,17 @@ fn setup_timers_and_pm(
     info!(log, "PM timer attached"; "port" => format!("{:#x}", pmtimer.port()));
 
     // Create ACPI PM1 event/enable/control registers + reset handler
+    let suspend_sink: Arc<dyn SuspendSink> =
+        vmm_devices::acpi_pm::HdlSuspendSink::new(
+            machine.hdl().clone(),
+            log.new(slog::o!("component" => "acpi-pm")),
+        );
     let acpi_pm = vmm_devices::acpi_pm::AcpiPm::create_and_attach(
         machine.bus_pio(),
+        Arc::clone(&suspend_sink),
         log.new(slog::o!("component" => "acpi-pm")),
-    );
+    )
+    .context("failed to attach ACPI PM registers")?;
     info!(log, "ACPI PM registers attached"; "pmbase" => format!("{:#x}", 0x400));
 
     // pvpanic device — guest writes to port 0x505 on kernel panic
@@ -479,7 +498,12 @@ fn setup_timers_and_pm(
         }
     }
 
-    Ok(TimerAndPmDevices { pmtimer, acpi_pm, pvpanic })
+    Ok(TimerAndPmDevices {
+        pmtimer,
+        acpi_pm,
+        pvpanic,
+        suspend_sink,
+    })
 }
 
 /// Create and attach COM1/COM2 UARTs, set up serial I/O paths, and
@@ -750,6 +774,7 @@ fn init_pci_devices(
     chipset: &I440FxChipset,
     cli: &Cli,
     num_vcpus: u32,
+    input: &Arc<InputBroker>,
     log: &Logger,
 ) -> anyhow::Result<(
     Vec<Arc<dyn vmm_devices::pci::PciDevice>>,
@@ -760,6 +785,8 @@ fn init_pci_devices(
     let is_migrate = cli.migrate_listen.is_some();
     eprintln!("[vmm] init_pci_devices: migrate_listen={:?} is_migrate={}", cli.migrate_listen, is_migrate);
 
+    reject_fbuf_migration_destination(is_migrate, &cli.pci_slot)?;
+
     for slot_spec in &cli.pci_slot {
         match parse_and_create_pci_device(
             slot_spec,
@@ -769,7 +796,9 @@ fn init_pci_devices(
             machine.bus_mmio(),
             machine.physmap(),
             machine.hdl(),
+            machine.segids(),
             cli.migrate_listen.is_some(),
+            input,
             log,
         ) {
             Ok((Some(pci), lifecycle)) => {
@@ -790,6 +819,24 @@ fn init_pci_devices(
     }
 
     Ok((pci_devices, lifecycle_devices))
+}
+
+fn pci_spec_driver(spec: &str) -> Option<&str> {
+    spec.splitn(3, ',').nth(1)
+}
+
+fn reject_fbuf_migration_destination(
+    is_migrate_dest: bool,
+    specs: &[String],
+) -> anyhow::Result<()> {
+    if is_migrate_dest
+        && specs
+            .iter()
+            .any(|spec| pci_spec_driver(spec) == Some("fbuf"))
+    {
+        anyhow::bail!("fbuf is not supported on a migration destination");
+    }
+    Ok(())
 }
 
 /// If direct-booting a kernel, load it into guest RAM and return the
@@ -1050,7 +1097,6 @@ fn spawn_vcpus(
         machine.vcpus(),
         machine.bus_pio(),
         machine.bus_mmio(),
-        machine.physmap(),
         machine.hdl().clone(),
         api_version,
         &vcpu_metrics,
@@ -1145,31 +1191,41 @@ fn run_event_loop(
     event_rx: mpsc::Receiver<vcpu_tasks::VcpuEvent>,
     handles: Vec<JoinHandle<()>>,
     control_cleanup: Option<PathBuf>,
+    devices: &[Arc<dyn vmm_devices::Lifecycle>],
     log: &Logger,
-) {
+) -> anyhow::Result<RunOutcome> {
     // Wait for the first vCPU event
-    match event_rx.recv() {
+    let outcome = match event_rx.recv() {
         Ok(vcpu_tasks::VcpuEvent::Suspended { vcpu_id, kind }) => {
             info!(log, "VM suspended";
                 "vcpu" => vcpu_id,
                 "kind" => ?kind,
             );
+            Ok(match kind {
+                Suspend::Reset => RunOutcome::Reboot,
+                Suspend::PowerOff => RunOutcome::PowerOff,
+                Suspend::Halt => RunOutcome::Halt,
+                Suspend::TripleFault(src) => RunOutcome::TripleFault(src),
+            })
         }
         Ok(vcpu_tasks::VcpuEvent::Error { vcpu_id, error: err }) => {
             error!(log, "vCPU error";
                 "vcpu" => vcpu_id,
                 "error" => &err,
             );
+            Ok(RunOutcome::GuestFault)
         }
         Err(_) => {
             warn!(log, "all vCPU threads exited without events");
+            Ok(RunOutcome::Halt)
         }
-    }
+    };
 
-    // Wait for all vCPU threads to finish
-    for handle in handles {
-        // thread panic is non-recoverable at this point
-        let _ = handle.join();
+    // A wedged backend must not prevent release of the bhyve instance.
+    let _report = quiesce_devices(devices, log);
+
+    if !join_vcpus_bounded(handles, std::time::Duration::from_secs(5)) {
+        warn!(log, "vCPU threads did not exit; destroying VM anyway");
     }
 
     // Clean up control socket (best-effort; may already be removed)
@@ -1183,9 +1239,10 @@ fn run_event_loop(
     }
 
     info!(log, "VM shutdown complete");
+    outcome
 }
 
-fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
+fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunOutcome> {
     // Phase 1: Create VM, load bootrom/kernel, finalize memory
     let creation = create_machine(&cli, log)?;
     let MachineCreation {
@@ -1205,14 +1262,30 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
     // Phase 3: Timers, PM, pvpanic
     let _timer_pm_devs = setup_timers_and_pm(&machine, log)?;
 
+    let input = Arc::new(InputBroker::default());
+
     // Phase 4: Serial ports and mdata agent
     let (_com1, _com2) = setup_serial(&machine, &chipset_devs.pic, &cli, log);
+    let _ps2 = setup_ps2(
+        &machine,
+        &chipset_devs.pic,
+        Arc::clone(&_timer_pm_devs.suspend_sink),
+        &input,
+        log,
+    );
 
     // Phase 5: fw_cfg, ACPI tables, SMBIOS, E820, boot order
     let _fwcfg = setup_fwcfg_and_acpi(&machine, &cli, num_cpus, mem_size, tpm2_acpi.clone(), log);
 
     // Phase 6: PCI devices
-    let (_pci_devices, lifecycle_devices) = init_pci_devices(&machine, &chipset_devs.chipset, &cli, num_cpus, log)?;
+    let (_pci_devices, lifecycle_devices) = init_pci_devices(
+        &machine,
+        &chipset_devs.chipset,
+        &cli,
+        num_cpus,
+        &input,
+        log,
+    )?;
 
     // Phase 7: Direct boot kernel loading (after ACPI tables are ready)
     load_direct_boot_kernel(&machine, &cli, &kernel_image, &initrd_image, mem_size, log)?;
@@ -1254,16 +1327,22 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<()> {
 
     // Phase 11: Control socket
     let control_cleanup = spawn_control_socket(
-        &machine, &cli, num_cpus, mem_size, &vcpu_metrics, lifecycle_devices, log,
+        &machine, &cli, num_cpus, mem_size, &vcpu_metrics,
+        lifecycle_devices.clone(), log,
     );
 
     // Phase 12: Signal handling
     install_sigterm_handler(&machine, log);
 
     // Phase 13: Main event loop and cleanup
-    run_event_loop(&machine, event_rx, handles, control_cleanup, log);
-
-    Ok(())
+    run_event_loop(
+        &machine,
+        event_rx,
+        handles,
+        control_cleanup,
+        &lifecycle_devices,
+        log,
+    )
 }
 
 /// Create a virtio-blk PCI device from a config string.
@@ -1350,7 +1429,9 @@ fn parse_and_create_pci_device(
     bus_mmio: &Arc<vmm_core::mmio::MmioBus>,
     physmap: &Arc<vmm_core::mem::PhysMap>,
     vmm_hdl: &Arc<vmm_core::hdl::VmmHdl>,
+    segids: &vmm_core::mem::SegidAlloc,
     is_migrate_dest: bool,
+    input: &Arc<InputBroker>,
     log: &Logger,
 ) -> anyhow::Result<(Option<Arc<dyn vmm_devices::pci::PciDevice>>, Option<Arc<dyn vmm_devices::Lifecycle>>)> {
     let parts: Vec<&str> = spec.splitn(3, ',').collect();
@@ -1517,6 +1598,13 @@ fn parse_and_create_pci_device(
             Ok((Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>), Some(pci_dev as Arc<dyn vmm_devices::Lifecycle>)))
         }
         "fbuf" => {
+            let segid = segids.alloc().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no free memory segment for fbuf (kernel limit is {} per VM)",
+                    vmm_core::mem::VM_MAX_MEMSEGS
+                )
+            })?;
+
             // Parse config: vga=off,unix=/path[,password=pwd][,w=N][,h=N]
             let mut vnc_path = std::path::PathBuf::from("/tmp/vm.vnc");
             let mut vnc_password = None;
@@ -1541,8 +1629,11 @@ fn parse_and_create_pci_device(
                 &vnc_path,
                 vnc_password,
                 Arc::clone(bus_mmio),
+                Arc::clone(vmm_hdl),
+                segid,
+                Arc::clone(input),
                 log.new(slog::o!("component" => "fbuf")),
-            );
+            )?;
             chipset.attach_device(bdf, fbuf.clone());
             info!(log, "fbuf attached";
                 "bdf" => %bdf,
@@ -1562,6 +1653,7 @@ fn parse_and_create_pci_device(
                 intr_pin,
             );
             chipset.attach_device(bdf, xhci.clone());
+            input.set_pointer(xhci.clone());
             info!(log, "xhci tablet attached"; "bdf" => %bdf);
             Ok((Some(xhci.clone() as Arc<dyn vmm_devices::pci::PciDevice>), Some(xhci as Arc<dyn vmm_devices::Lifecycle>)))
         }
@@ -1732,7 +1824,12 @@ fn setup_serial_io(
             // pty initialization on illumos. Rust's File::open may
             // not trigger the same STREAMS module setup.
             let c_path = std::ffi::CString::new(path).unwrap();
-            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+            let fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
             if fd >= 0 {
                 {
 
@@ -1763,7 +1860,10 @@ fn setup_serial_io(
                     eprintln!("[serial] fd={} isatty={} path={}", fd, is_tty, path);
 
                     // TX: dup the fd for writes
-                    let write_fd = unsafe { libc::dup(fd) };
+                    // Guest-reset re-exec must not inherit backend fds.
+                    let write_fd = unsafe {
+                        libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0)
+                    };
                     // TX: write directly from vCPU using non-blocking write.
                     let tx_err_count = std::sync::atomic::AtomicU32::new(0);
                     uart.set_tx_sink(Box::new(move |b: u8| {
@@ -1783,7 +1883,10 @@ fn setup_serial_io(
                     // affect the write path too (causing dropped console data).
                     let uart_input = uart.clone();
                     let path_owned = path.to_string();
-                    let read_fd_dup = unsafe { libc::dup(fd) };
+                    // Guest-reset re-exec must not inherit backend fds.
+                    let read_fd_dup = unsafe {
+                        libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0)
+                    };
                     thread::Builder::new()
                         .name(format!("{name}-input"))
                         .spawn(move || {
@@ -1938,10 +2041,16 @@ fn version_string() -> String {
 }
 
 fn main() -> ExitCode {
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| PathBuf::from(&args[0]));
+
     // Check for --version before full CLI parse so it works
     // even when required args are missing.
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--version" || a == "-V") {
+    if args.iter().any(|arg| {
+        arg.as_os_str() == std::ffi::OsStr::new("--version")
+            || arg.as_os_str() == std::ffi::OsStr::new("-V")
+    }) {
         println!("vmm {}", version_string());
         return ExitCode::SUCCESS;
     }
@@ -1956,10 +2065,42 @@ fn main() -> ExitCode {
     let log = setup_logger();
 
     match run(cli, &log) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(RunOutcome::Reboot) => {
+            reexec_for_reboot(&exe, &args, &SIGTERM_RECEIVED, &log)
+        }
+        // Preserve vmadm/SIGTERM success semantics instead of adopting
+        // bhyve's distinct clean-shutdown exit codes.
+        Ok(RunOutcome::PowerOff | RunOutcome::Halt) => ExitCode::SUCCESS,
+        Ok(RunOutcome::TripleFault(src)) => {
+            error!(log, "VM triple fault"; "source_vcpu" => src);
+            ExitCode::from(3)
+        }
+        // Keep a guest-caused fatal exit distinct from an internal VMM error.
+        Ok(RunOutcome::GuestFault) => ExitCode::from(2),
         Err(e) => {
             slog::error!(log, "fatal error"; "error" => format!("{:#}", e));
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fbuf_rejects_migration_destination() {
+        let fbuf = vec!["30,fbuf,unix=/tmp/vm.vnc".to_string()];
+        let other = vec!["4,virtio-blk,/dev/dsk/test".to_string()];
+        let fbuf_in_config = vec!["4,nvme,/tmp/fbuf".to_string()];
+
+        let err = reject_fbuf_migration_destination(true, &fbuf).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "fbuf is not supported on a migration destination"
+        );
+        assert!(reject_fbuf_migration_destination(false, &fbuf).is_ok());
+        assert!(reject_fbuf_migration_destination(true, &other).is_ok());
+        assert!(reject_fbuf_migration_destination(true, &fbuf_in_config).is_ok());
     }
 }

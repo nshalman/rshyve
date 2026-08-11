@@ -210,6 +210,35 @@ mod tests {
     }
 
     #[test]
+    fn pci_cfg_and_reset_ports_coexist() {
+        let bus = PioBus::new();
+        let h: Arc<PioFn> = Arc::new(|_, _| {});
+
+        assert!(bus.register(0xCF8, 1, h.clone()).is_ok());
+        assert!(bus.register(0xCF9, 1, h.clone()).is_ok());
+        assert!(bus.register(0xCFC, 4, h).is_ok());
+    }
+
+    #[test]
+    fn four_byte_access_at_cf8_reaches_one_byte_registration() {
+        let bus = PioBus::new();
+        let seen_offset = Arc::new(AtomicU32::new(u32::MAX));
+        let seen_len = Arc::new(AtomicU32::new(0));
+        let offset_clone = seen_offset.clone();
+        let len_clone = seen_len.clone();
+        let handler: Arc<PioFn> = Arc::new(move |offset, rwo| {
+            offset_clone.store(offset as u32, Ordering::SeqCst);
+            len_clone.store(rwo.len() as u32, Ordering::SeqCst);
+        });
+        bus.register(0xCF8, 1, handler).unwrap();
+
+        bus.handle_out(0xCF8, 4, 0x8000_0000);
+
+        assert_eq!(seen_offset.load(Ordering::SeqCst), 0);
+        assert_eq!(seen_len.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
     fn unregister() {
         let bus = PioBus::new();
         let h: Arc<PioFn> = Arc::new(|_, rwop| {

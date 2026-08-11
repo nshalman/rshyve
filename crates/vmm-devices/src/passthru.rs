@@ -139,7 +139,13 @@ impl PciPassthru {
                 Error::new(ErrorKind::InvalidInput, "invalid ppt path")
             })?;
             // Safety: opening a device node with valid C string.
-            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
+            // Guest-reset re-exec must not inherit passthrough descriptors.
+            let fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_RDWR | libc::O_CLOEXEC,
+                )
+            };
             if fd < 0 {
                 return Err(Error::last_os_error());
             }

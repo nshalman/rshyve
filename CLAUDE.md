@@ -205,6 +205,48 @@ Both headnode and nuc1 have `vmm_test0` VNICs with MAC `02:08:20:aa:bb:cc`.
 4. **Migration test**: nuc1→headnode (old→new CPU) succeeds
 5. **SIGTERM test**: `kill -TERM <pid>` triggers ACPI poweroff
 6. **Metrics test**: `echo '{"command":"metrics"}' | socat - UNIX-CONNECT:/tmp/vmm-testvm.sock`
+7. **Windows boot test**: `tools/win-boot-test.sh start` then `wait 'Press any key to boot' 120` - see below
+
+### Windows Boot Test
+
+`tools/win-boot-test.sh` manages the file-backed Windows boot/reset test VM. Its
+subcommands start and stop the VM, wait for serial-log output, send input to
+COM1, inspect the log, and report process/device status:
+
+```bash
+tools/win-boot-test.sh start
+tools/win-boot-test.sh wait 'Press any key to boot' 120
+tools/win-boot-test.sh send '\r'
+tools/win-boot-test.sh log 4000
+tools/win-boot-test.sh status
+tools/win-boot-test.sh stop
+```
+
+The build host is `root@$VMM_BUILD_HOST`, with sources at `/opt/vmmnew`. Cargo is
+in **`/opt/local/bin`** on this host, not `/opt/tools/bin` (the headnode path).
+
+Only one bhyve VM may exist at a time in that zone. A second `VM_CREATE` returns
+`EINVAL`, and killing `vmm` leaks its instance. Before starting, check
+`ls /dev/vmm/` and destroy any stale instance with
+`bhyvectl --vm=<name> --destroy`.
+
+When killing the VMM by command line, always bracket a letter:
+`pkill -9 -f 'relea[s]e/vmm'`. Without the brackets, `pkill` matches its own ssh
+command line, kills the session, and ssh returns 255. illumos does not provide
+`setsid`; use `nohup ... </dev/null &` instead.
+
+- The COM1 FIFO writer-holder must be `nohup ... > $FIFO < /dev/null 2>/dev/null &`. Without `nohup` it dies with the ssh session and the guest's COM1 stdin sees EOF; without the stderr redirect it holds the ssh channel open and `start` never returns.
+
+The Windows assets are `/opt/winassets/winsrv2025-eval.iso` and
+`/opt/winassets/virtio-win.iso`; the persistent test disk is
+`/opt/wintest/win.raw`.
+
+Measured baseline as of commit `212a83c` (known-broken behavior this harness is
+intended to catch):
+
+- Boot logs contain `WARN failed to register reset handler, error: would conflict with existing entry`.
+- The EFI Shell `reset` command leaves the `vmm` process alive and the guest wedged.
+- OVMF falls through from the hardcoded slot-4 bootorder entry to slot 5, which is how the ISO boots.
 
 ### Common Issues
 

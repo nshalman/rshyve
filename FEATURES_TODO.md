@@ -1,13 +1,20 @@
 # vmmnew feature backlog
 
-Living document. Update status as items land. Effort estimates assume one
-focused engineer; pad accordingly for context-switches.
+Living document. Update status as items land and record the validation that
+justifies moving an item to shipped.
+
+**Current Windows baseline:** Headless Windows Server works today. Windows
+Server 2025 evaluation WinPE boots from an ISO on a read-only NVMe namespace
+and reaches SAC on COM1. The remaining hard blockers are in the graphical
+console path. After those come Windows device visibility and platform fidelity,
+especially ACPI TPM discovery, writable UEFI variables, and boot ordering.
 
 Conventions:
-- ✅ shipped — committed and validated
-- 🚧 in progress — branch open or partially landed
-- ⏳ planned — agreed scope, not yet started
-- ❓ considered — open question whether to do at all
+
+- ✅ shipped: committed and validated
+- 🚧 in progress: branch open or partially landed
+- ⏳ planned: accepted backlog, not yet started
+- ❓ considered: valid gap whose priority or scope is still open
 
 ---
 
@@ -15,70 +22,142 @@ Conventions:
 
 | Item | Notes |
 |---|---|
-| ✅ Hyper-V Tier 1 enlightenments | CPUID + `hv-relaxed` + hypercall stub + reference-TSC + VP_INDEX + reset MSR + crash MSRs. Commit `d24ad41`. Synic/stimer/vAPIC/TLB-flush/IPI deferred to Tier 2. |
+| ✅ Hyper-V Tier 1 enlightenments | CPUID identification, relaxed timing, hypercall stub, reference TSC, VP_INDEX, reset MSR, and crash MSRs. Commit `d24ad41`. Tier 2 remains kernel-blocked. |
+| ✅ virtio-rng | Implemented in `crates/vmm-devices/src/virtio/rng.rs` and wired as `-s N,virtio-rnd`. Landed in `192a345`. |
+| ✅ Framebuffer/VNC and xHCI tablet device | `fbuf/` provides framebuffer output and an RFB server; `xhci/` provides a USB HID tablet. Landed in `192a345`. This does not mean the graphical Windows path is complete: wide framebuffer MMIO stores are fatal, keyboard input does not exist, and pointer events are not connected to the tablet. |
+| ✅ SMBIOS table set | `smbios.rs` emits Types 0, 1, 2, 3, 4, 16, 17, and 19, plus Types 32 and 127. Landed in `bc28ae8`. Type 4 topology fields still need correction. |
+| ✅ PCI passthrough | PPT-backed passthrough is implemented in `passthru.rs` and wired as `-s N,passthru,<path>`. Landed in `192a345`. |
+| ✅ vTPM 2.0 | Commits `018c723..212a83c` vendor libtpms in `third_party/libtpms`, add `vmm-tpm-sys` FFI, and add a TCG PTP CRB at `0xFED40000`, a TPM2 ACPI table, file-backed NV state, and `--vtpm` / `--vtpm-state-dir`. End-to-end CRB and libtpms tests landed. Windows discovery is still blocked by the missing `MSFT0101` DSDT device. |
+| ✅ Guest power-off and reset | Commits `68f5bd9`, `8e4cfd9`, `b47f5cb`, `ecd987b`, and `5a5bea6` fix the `0xCF9` port conflict, wire ACPI S5 and reset into VM suspend, separate power-off from halt, re-exec the VMM after guest reset, and expose `{"command":"reset"}`. The former four-port PCI address claim at `0xCF8` swallowed `0xCF9`, so ACPI reset registration always failed and guest reset left a live VM burning a vCPU. |
+| ✅ Kernel-owned MMIO instruction decoding | The illumos vmm kernel decodes MMIO instructions and delivers `VM_EXITCODE_MMIO` with the GPA and operands. `VM_EXITCODE_INST_EMUL` is a diagnostic-only fallback containing 15 raw instruction bytes and a valid-byte count, with no GPA or operands. Userspace does not decode it. |
+
+### Validated Windows Server 2025 baseline
+
+Validated on the illumos build host against Windows Server 2025 evaluation
+media at commit `5a5bea6`:
+
+- Windows Setup WinPE boots and reaches the SAC prompt on COM1. The ISO's BCD
+  entry is `Windows Setup [EMS Enabled]`, and SAC creates `SACSetupAct` and
+  `SACSetupErr` channels without a framebuffer or keyboard.
+- The ISO is attached as `-s N,nvme,<iso>,ro`. OVMF `PartitionDxe` finds the El
+  Torito catalog on the plain NVMe namespace. ATAPI or AHCI CD-ROM emulation is
+  not required for Windows installation.
+- EFI Shell `reset` and control socket `{"command":"reset"}` both reboot a live
+  WinPE guest. The process keeps the same PID because reset uses `execvp`; the
+  kernel VM is recreated, a second boot is observed, and the guest returns.
 
 ## In progress
 
-| Item | Status | Notes |
-|---|---|---|
-| 🚧 vTPM 2.0 (Microsoft TLFS-compliant CRB) | libtpms backend builds on illumos with 4 patches, vendoring next | See `crates/vmm-tpm-sys/` plan below. Verified `libtpms.so.0.11.0` + `libtpms.a` produced on the dedicated build host. |
+No feature is currently recorded as in progress.
 
-## Tier 1 — high-leverage, ship within a few months
+## Tier 1 - Windows readiness and high-leverage platform work
 
-Order roughly reflects sequencing: hot-plug infrastructure unlocks several others.
+### Hard blockers for a graphical Windows guest
 
-| Item | Effort | Why |
-|---|---|---|
-| ⏳ virtio-rng | ~3 days | Every guest. Linux blocks on entropy at boot without it. Trivial. |
-| ⏳ PCI hot-plug | ~2 weeks | Cloud must-have. Triton VMs today require reboot to attach a disk. Touches PCI bridge + ACPI `_GPE`. Unlocks several Tier 1 items below. |
-| ⏳ virtio-scsi | ~2 weeks | Windows storage UX: named LUNs, UNMAP/TRIM, hot-plug, multi-target per controller. NVMe stays the perf path; virtio-scsi for many-disk workloads. Build on hot-plug. |
-| ⏳ virtio-balloon | ~1 week | Memory overcommit. Critical for Triton density. Mature drivers in Linux + Windows. |
-| ⏳ Block I/O throttling (per-disk IOPS/BPS caps) | ~1 week | Multitenant isolation. Token bucket on virtio-blk + NVMe submission paths. |
-| ⏳ Hugepage memory backing (2 MB / 1 GB) | ~3 days | TLB miss reduction for big VMs. illumos has the support; just wire `MAP_HUGETLB`-equivalent. Real win for >32 GB VMs. |
-| ⏳ Watchdog device (`i6300esb`) | ~1 week | Guest stall detection. Pokes the host; we suspend/reset on timeout. |
-| ⏳ Comprehensive SMBIOS tables | ~3 days | Type-2 baseboard, type-3 chassis, type-4 processor with full feature flags, type-16/17/19 memory devices. Windows Server licensing reads these. |
+Headless Server works without these. Attaching `fbuf` currently makes the
+graphical path unusable.
 
-## Tier 2 — strategic, multi-week each
+| Item | Why / tree evidence |
+|---|---|
+| ⏳ Add a keyboard device and wire VNC key events | `crates/vmm-devices/src/fbuf/mod.rs` receives RFB `KeyEvent` messages and discards them. No i8042 or PS/2 keyboard exists in the tree. Propolis has a Rust implementation suitable as a porting reference. |
+| ⏳ Wire VNC pointer events to the xHCI tablet | `crates/vmm-devices/src/fbuf/mod.rs` discards RFB `PointerEvent` messages. `crates/vmm-devices/src/xhci/tablet.rs` already exposes `pointer_event(buttons, x, y)`, but the RFB server never receives a tablet handle. |
+| ⏳ Raise xHCI MaxSlots to the Windows minimum | `crates/vmm-devices/src/xhci/bits.rs` advertises `MaxSlots = 1` in HCSPARAMS1. Windows `USBXHCI.SYS` requires at least 64 slots, matching bhyve's advertised value. |
 
-| Item | Effort | Why |
-|---|---|---|
-| ⏳ VNC server + virtio-input | ~3 weeks | Graphical console. Currently serial-only. Major UX win for Windows install/recovery and any non-headless workflow. |
-| ⏳ QMP-style JSON monitor | ~2 weeks | Replace hand-rolled control socket with introspectable JSON-RPC. Unlocks libvirt-style tooling. |
-| ⏳ Disk I/O multipathing / mirror | ~3 weeks | Today live migration assumes ZFS send+receive on the same dataset name. blockdev-mirror lets us migrate to a different storage backend. Useful when going beyond Triton-on-Triton. |
-| ⏳ Hyper-V Tier 2 (synic + stimer) | ~3 weeks | Requires kernel cooperation in `vmm.ko`. Only worth doing if measurements show Windows is bottlenecked on APIC timer / synthetic interrupts. |
+### Major Windows visibility and platform fidelity
 
-## Tier 3 — would consider but not soon
+| Item | Why / tree evidence |
+|---|---|
+| ⏳ Add a DSDT TPM device with `_HID "MSFT0101"` | `crates/vmm-tpm/src/acpi.rs` emits only the TPM2 table and incorrectly says a DSDT node is unnecessary. Windows binds `TPM.SYS` through `ACPI\MSFT0101`, so the shipped CRB is currently invisible to the guest it targets. |
+| ⏳ Add a writable UEFI variable store and Secure Boot path | `bin/vmm/src/bootrom.rs` maps one firmware image read-only, and `-l bootrom,<rom>` cannot express bhyve's `rom,varfile` form. The default `/usr/share/bhyve/uefi-rom.bin` is CODE-only. This blocks persistent Windows boot entries, Secure Boot, and the Windows 11 / Server 2025 hardware-check path. |
+| ⏳ Add per-device bootindex and generate fw_cfg bootorder | `setup_fwcfg_and_acpi()` hardcodes one bootorder entry for PCI slot 4. The live Windows test reached the ISO only because OVMF fell through from slot 4 to slot 5. |
+| ⏳ Add a userspace MSR emulation table with architectural faults | Unclaimed RDMSR returns zero and unclaimed WRMSR is dropped in `bin/vmm/src/vcpu_tasks.rs`; bhyve instead injects `#GP`. In particular, reading `MSR_IA32_FEATURE_CONTROL` as zero is not a valid real-hardware state and Windows checks it. |
 
-| Item | Effort | Why |
-|---|---|---|
-| ❓ virtio-fs | ~2 weeks | Modern 9p replacement. Useful for dev workflows; less so for production tenants. |
-| ❓ virtio-vsock | ~1 week | Host↔guest socket channel without IP. Cloud agents use it; we have mdata-over-COM2 today. |
-| ❓ qcow2 backing format | ~3-4 weeks | Copy-on-write images with internal snapshots. ZFS already provides this for zvol-backed guests; value is mostly off-Triton. |
-| ❓ PCI passthrough (illumos VFIO equivalent) | ~4+ weeks | High-perf NICs/GPUs. illumos bhyve has limited support; significant integration. Niche. |
-| ❓ CPU hot-plug | ~3 weeks | Possible but value-to-complexity ratio is poor. Just size VMs sensibly. |
-| ❓ Memory hot-plug (separate from balloon) | ~3 weeks | Same. Use balloon for elasticity; hot-plug if/when justified. |
+### Moderate Windows gaps
 
-## Skip — out of scope for vmmnew
+| Item | Why / tree evidence |
+|---|---|
+| ❓ Make ACPI publication use one generator | ACPI is generated once for fw_cfg table-loader and again for fixed guest-memory locations through separate functions. The two paths can drift. |
+| ❓ Add a VM Generation Counter device | No VM Generation Counter device exists. Windows AD domain controllers and CNG consumers use it to detect snapshot rollback. |
+| ❓ Make the RTC basis configurable | `main.rs` always initializes the RTC from Unix UTC. Windows interprets RTC as local time by default, producing a wall-clock offset unless the guest policy is changed. |
+| ⏳ Correct SMBIOS Type 4 topology | `smbios.rs` emits cores per socket, enabled cores, and threads per socket as zero while `main.rs` configures CPU topology separately. Windows Server licensing consumes these fields. |
+| ❓ Add an inbox-driver Windows NIC | The only emulated network path is viona-backed virtio-net. A fresh Windows install needs NetKVM from virtio-win before it has networking; there is no e1000 or comparable inbox-driver NIC. |
+| ❓ Add framebuffer and xHCI migration state | Both devices implement only `type_name()` in `Lifecycle`; neither exports or restores device state for live migration. |
+| ⏳ Migrate vTPM NV state | The file-backed vTPM NV directory is outside the migration protocol and does not travel with the VM. |
 
-- **TCG / multi-arch** — we're x86_64-only, hardware-virt only.
-- **SEV/SEV-ES/SEV-SNP/TDX** — illumos `vmm.ko` doesn't expose the AMD-V / VMX hooks. Wait until upstream lands.
-- **Nested virtualization** — bhyve on illumos doesn't fully support it.
-- **Sound, legacy USB, ARM/RISC-V targets, vhost-user** — outside vmmnew's mission.
+### Remaining Tier 1 platform work
+
+| Item | Why / tree evidence |
+|---|---|
+| ⏳ PCI hot-plug | PCI devices are created only from startup `-s` arguments. There is no ACPI hot-plug or control-socket attach/detach path. This is required for disk attachment without a reboot. |
+| ⏳ virtio-scsi | No virtio-scsi device exists. It remains the useful Windows path for named LUNs, UNMAP/TRIM, hot-plug, and many targets, while NVMe remains the performance path. |
+| ⏳ virtio-balloon | No balloon device exists. It is needed before guest-cooperative memory reclaim or overcommit is possible. |
+| ⏳ Block I/O throttling | NVMe and virtio-blk have no per-disk IOPS or bandwidth limiter. Multitenant rate isolation remains absent. |
+| ⏳ Hugepage memory backing | Guest RAM setup has no hugepage backing option. Any illumos implementation needs measurement and an explicit fallback policy. |
+| ⏳ Watchdog device | No guest watchdog such as `i6300esb` exists. Guest stall detection and watchdog-triggered reset remain absent. |
+
+## Blocked on illumos kernel work
+
+| Item | Boundary |
+|---|---|
+| ⏳ Hyper-V Tier 2 | SynIC, synthetic timers, virtual APIC support, TLB-flush hypercalls, and IPI hypercalls require cooperation from `vmm.ko`. They are out of scope for the userspace backlog until the kernel interfaces exist. |
+
+## Tier 2 - strategic, multi-week work
+
+| Item | Why / tree evidence |
+|---|---|
+| ⏳ QMP-style JSON monitor | The current control socket is a fixed, newline-delimited command enum. A versioned, introspectable JSON-RPC monitor would support richer external tooling. |
+| ⏳ Disk I/O mirror / backend-independent migration | Storage migration is ZFS-zvol specific. There is no block mirror or backend-independent copy path for migration to different storage. |
+
+## Tier 3 - would consider but not soon
+
+| Item | Why |
+|---|---|
+| ❓ virtio-fs | Modern 9p replacement. Useful for development workflows; less important for production tenants. |
+| ❓ virtio-vsock | Host-to-guest socket channel without IP. Cloud agents can use it; vmmnew has mdata over COM2 today. |
+| ❓ qcow2 backing format | Useful for portable layered images and internal snapshots. ZFS already supplies copy-on-write storage for the primary Triton deployment. |
+| ❓ CPU hot-plug | Possible, but the value-to-complexity ratio is poor for the current platform. |
+| ❓ Memory hot-plug, separate from balloon | Ballooning is the simpler elasticity mechanism. Revisit physical memory hot-plug only with a concrete workload. |
+
+## Skip - out of scope for vmmnew
+
+- **TCG / multi-arch:** vmmnew is x86_64-only and hardware-virtualization-only.
+- **SEV, SEV-ES, SEV-SNP, and TDX:** illumos `vmm.ko` does not expose the
+  required AMD-V or VMX hooks. Wait for kernel support.
+- **Nested virtualization:** illumos bhyve does not provide the required full
+  nested-virtualization support.
+- **Sound, legacy USB, ARM/RISC-V targets, and vhost-user:** outside vmmnew's
+  mission.
 
 ## Validation backlog (cross-cutting)
 
-These are not features, but quality work that should follow features:
+These are validation gates, not new features:
 
-- ⏳ Validate Hyper-V Tier 1 against Windows Server 2022 (need a Windows install on nuc0)
-- ⏳ Migration plumbing for HyperV state (currently lost on migrate; guest re-writes overlays)
-- ⏳ Migration plumbing for vTPM state (when vTPM lands, NV blob must travel with the VM)
+- ⏳ Validate Hyper-V Tier 1 against an installed Windows Server workload.
+  The WinPE boot/reset test did not exercise the Hyper-V path.
+- ⏳ Complete a Windows Server installation after writable UEFI variables and
+  bootindex land, then verify that the guest's boot entry persists.
+- ⏳ Validate graphical Windows boot, keyboard, and pointer input after the
+  listed graphical-console blockers are fixed.
+- ⏳ Add migration coverage for Hyper-V state, framebuffer/xHCI state, and
+  vTPM NV state as each migration path lands.
 
 ---
 
 ## How to use this file
 
 When picking up new work:
-1. Check the in-progress column first — finish or hand off, don't add another.
-2. From Tier 1, take the highest-row not blocked.
-3. Move it to "in progress", land it, then move to "shipped" with the commit hash.
-4. Don't promote Tier 2 or Tier 3 items without a written rationale (cost-benefit trended).
+
+1. Check the in-progress section first. Finish or hand off before starting
+   another item.
+2. From Tier 1, take the highest listed item that is not blocked.
+3. Move it to in progress, land it, then move it to shipped with commit hashes
+   and concrete validation evidence.
+4. Do not promote Tier 2 or Tier 3 items without a written cost-benefit
+   rationale.
+5. Update the Windows baseline whenever host validation changes what is known
+   to boot or work.
+
+When working with virtio, use the
+[Virtio 1.3 specification](https://docs.oasis-open.org/virtio/virtio/v1.3/csd01/virtio-v1.3-csd01.html).
+
+Propolis is available as a reference in `https://github.com/oxidecomputer/propolis`.

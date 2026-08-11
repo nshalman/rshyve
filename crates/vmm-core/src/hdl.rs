@@ -68,8 +68,27 @@ impl VmmHdl {
             req.flags |= VCF_TRACK_DIRTY;
         }
 
-        // Safety: vm_create_req is the correct struct for VMM_CREATE_VM.
-        unsafe { ctl.ioctl(ioctls::VMM_CREATE_VM, &mut req) }?;
+        let mut retries = 0;
+        loop {
+            // Safety: vm_create_req is the correct struct for VMM_CREATE_VM.
+            match unsafe { ctl.ioctl(ioctls::VMM_CREATE_VM, &mut req) } {
+                Ok(_) => break,
+                Err(err)
+                    if opts.force
+                        && matches!(
+                            err.raw_os_error(),
+                            Some(libc::EEXIST) | Some(libc::EBUSY)
+                        )
+                        && retries < 20 =>
+                {
+                    // A destroyed VM can remain visible until kernel teardown
+                    // releases its final reference.
+                    retries += 1;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(err) => return Err(err),
+            }
+        }
 
         let fd = VmmFd::open(name)?;
         Ok(Self { inner: fd, name: name.to_string() })
@@ -156,6 +175,17 @@ impl VmmHdl {
         // Safety: vm_devmem_offset is the correct struct.
         unsafe { self.inner.ioctl(ioctls::VM_DEVMEM_GETOFFSET, &mut dmo) }?;
         Ok(dmo.offset)
+    }
+
+    /// Remove a memory segment mapping from the guest physical address space.
+    ///
+    /// The kernel matches an exact `(gpa, len)` pair, so the caller must pass
+    /// the same values used for [`Self::map_memseg`].
+    pub fn munmap_memseg(&self, gpa: u64, len: usize) -> Result<()> {
+        let mut arg = bhyve_api::vm_munmap { gpa, len };
+        // Safety: vm_munmap is the correct struct for VM_MUNMAP_MEMSEG.
+        unsafe { self.inner.ioctl(ioctls::VM_MUNMAP_MEMSEG, &mut arg) }?;
+        Ok(())
     }
 
     // ---------------------------------------------------------------

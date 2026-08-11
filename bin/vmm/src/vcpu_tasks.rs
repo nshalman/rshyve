@@ -14,10 +14,11 @@
 //! The loop terminates on suspend events (halt, reset, triple-fault)
 //! which are sent to the main thread via a channel.
 
-use std::sync::mpsc;
+use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
 
+use bhyve_api::{vm_reg_name, vm_suspend_how};
 use slog::{debug, error, info, warn, Logger};
 
 #[usdt::provider(provider = "vmm")]
@@ -32,12 +33,10 @@ use vmm_core::exits::{
     VmEntry, VmExitKind,
 };
 use vmm_core::hdl::VmmHdl;
-use vmm_core::inst_emul;
-use vmm_core::mem::PhysMap;
-use vmm_core::pio::PioBus;
 use vmm_core::mmio::MmioBus;
-use vmm_devices::metrics::VcpuMetrics;
+use vmm_core::pio::PioBus;
 use vmm_core::vcpu::Vcpu;
+use vmm_devices::metrics::VcpuMetrics;
 use vmm_hyperv::{HyperV, RdmsrOutcome, WrmsrOutcome};
 
 /// Events sent from vCPU threads to the main thread.
@@ -49,6 +48,87 @@ pub enum VcpuEvent {
     Error { vcpu_id: i32, error: String },
 }
 
+fn diagnostic_reg(vcpu: &Vcpu, reg: vm_reg_name) -> String {
+    match vcpu.get_reg(reg) {
+        Ok(value) => format!("{value:#018x}"),
+        Err(error) => format!("unavailable: {error}"),
+    }
+}
+
+fn diagnostic_cs(vcpu: &Vcpu) -> String {
+    match vcpu.get_segment_desc(vm_reg_name::VM_REG_GUEST_CS) {
+        Ok(desc) => format!(
+            "base={:#018x} limit={:#010x} access={:#010x}",
+            desc.base, desc.limit, desc.access,
+        ),
+        Err(error) => format!("unavailable: {error}"),
+    }
+}
+
+fn fatal_exit(
+    vcpu: &Vcpu,
+    vcpu_id: i32,
+    hdl: &VmmHdl,
+    events: &Sender<VcpuEvent>,
+    reason: String,
+    log: &Logger,
+) {
+    error!(log, "fatal vCPU exit";
+        "reason" => &reason,
+        "rax" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_RAX),
+        "rbx" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_RBX),
+        "rcx" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_RCX),
+        "rdx" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_RDX),
+        "rsi" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_RSI),
+        "rdi" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_RDI),
+        "rbp" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_RBP),
+        "r8" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_R8),
+        "r9" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_R9),
+        "r10" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_R10),
+        "r11" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_R11),
+        "r12" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_R12),
+        "r13" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_R13),
+        "r14" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_R14),
+        "r15" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_R15),
+        "rip" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_RIP),
+        "rsp" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_RSP),
+        "rflags" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_RFLAGS),
+        "cr0" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_CR0),
+        "cr2" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_CR2),
+        "cr3" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_CR3),
+        "cr4" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_CR4),
+        "efer" => diagnostic_reg(vcpu, vm_reg_name::VM_REG_GUEST_EFER),
+        "cs" => diagnostic_cs(vcpu),
+    );
+
+    match hdl.suspend(
+        vm_suspend_how::VM_SUSPEND_HALT as u32,
+        vcpu_id,
+    ) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EALREADY) => {
+            debug!(log, "VM suspend already latched";
+                "how" => vm_suspend_how::VM_SUSPEND_HALT as u32);
+        }
+        Err(error) => {
+            error!(log, "failed to halt VM after fatal vCPU exit";
+                "error" => %error);
+        }
+    }
+
+    // The receiver can be gone only after shutdown has already begun.
+    let _ = events.send(VcpuEvent::Error { vcpu_id, error: reason });
+}
+
+fn should_discard_once(rip: u64, last: &mut Option<u64>) -> bool {
+    if *last == Some(rip) {
+        false
+    } else {
+        *last = Some(rip);
+        true
+    }
+}
+
 /// Spawn a thread for each vCPU and run the exit-dispatch loop.
 ///
 /// Returns a channel receiver for vCPU events and the join handles.
@@ -56,7 +136,6 @@ pub fn spawn_vcpu_threads(
     vcpus: &[Vcpu],
     bus_pio: &Arc<PioBus>,
     bus_mmio: &Arc<MmioBus>,
-    physmap: &Arc<PhysMap>,
     hdl: Arc<VmmHdl>,
     api_version: u32,
     vcpu_metrics: &[Arc<VcpuMetrics>],
@@ -73,7 +152,6 @@ pub fn spawn_vcpu_threads(
         // Clone Arcs for the thread
         let bus_pio = Arc::clone(bus_pio);
         let bus_mmio = Arc::clone(bus_mmio);
-        let physmap = Arc::clone(physmap);
         let metrics = Arc::clone(&vcpu_metrics[idx]);
         let tx = tx.clone();
         let vcpu_hdl = Arc::clone(vcpu.hdl());
@@ -89,7 +167,6 @@ pub fn spawn_vcpu_threads(
                     &thread_vcpu,
                     &bus_pio,
                     &bus_mmio,
-                    &physmap,
                     &vmm_hdl,
                     api_version,
                     &metrics,
@@ -113,7 +190,6 @@ fn vcpu_run_loop(
     vcpu: &Vcpu,
     bus_pio: &PioBus,
     bus_mmio: &MmioBus,
-    physmap: &PhysMap,
     hdl: &VmmHdl,
     api_version: u32,
     metrics: &VcpuMetrics,
@@ -124,6 +200,7 @@ fn vcpu_run_loop(
     let vcpu_id = vcpu.id();
 
     let mut next_entry = VmEntry::Run;
+    let mut discarded_at: Option<u64> = None;
     info!(log, "vCPU run loop starting"; "vcpu" => vcpu_id);
 
     loop {
@@ -196,51 +273,29 @@ fn vcpu_run_loop(
             }
 
             VmExitKind::InstEmul { inst, num_valid } => {
-                match inst_emul::emulate_inst(
-                    vcpu, exit.rip, &inst, num_valid,
-                    physmap, bus_mmio,
-                ) {
-                    Ok(true) => {
-                        // Successfully emulated — re-enter without
-                        // advancing RIP (emulator already did it)
-                        VmEntry::Run
-                    }
-                    Ok(false) => {
-                        // Instruction not supported
-                        let inst_hex: String = inst[..num_valid as usize]
-                            .iter()
-                            .map(|b| format!("{:02x}", b))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        error!(log, "unsupported instruction emulation";
-                            "rip" => format!("{:#x}", exit.rip),
-                            "bytes" => &inst_hex,
-                        );
-                        // receiver dropped during shutdown; safe to ignore
-                        let _ = events.send(VcpuEvent::Error {
-                            vcpu_id,
-                            error: format!(
-                                "unsupported instruction at RIP {:#x}: [{}]",
-                                exit.rip, inst_hex,
-                            ),
-                        });
-                        return;
-                    }
-                    Err(e) => {
-                        error!(log, "instruction emulation failed";
-                            "rip" => format!("{:#x}", exit.rip),
-                            "error" => %e,
-                        );
-                        // receiver dropped during shutdown; safe to ignore
-                        let _ = events.send(VcpuEvent::Error {
-                            vcpu_id,
-                            error: format!(
-                                "instruction emulation failed at {:#x}: {}",
-                                exit.rip, e,
-                            ),
-                        });
-                        return;
-                    }
+                let valid_len = usize::from(num_valid).min(inst.len());
+                let inst_hex: String = inst[..valid_len]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if should_discard_once(exit.rip, &mut discarded_at) {
+                    // A userspace-fallback exit leaves kernel decode state
+                    // pending until it is explicitly discarded.
+                    VmEntry::DiscardInstr
+                } else {
+                    fatal_exit(
+                        vcpu,
+                        vcpu_id,
+                        hdl,
+                        events,
+                        format!(
+                            "unsupported instruction at RIP {:#x}: [{}]",
+                            exit.rip, inst_hex,
+                        ),
+                        log,
+                    );
+                    return;
                 }
             }
 
@@ -252,52 +307,69 @@ fn vcpu_run_loop(
             }
 
             VmExitKind::VmxError(status) => {
-                error!(log, "VMX error"; "status" => status);
-                // receiver dropped during shutdown; safe to ignore
-                let _ = events.send(VcpuEvent::Error {
+                fatal_exit(
+                    vcpu,
                     vcpu_id,
-                    error: format!("VMX error, status {}", status),
-                });
+                    hdl,
+                    events,
+                    format!("VMX error, status {}", status),
+                    log,
+                );
                 return;
             }
 
             VmExitKind::SvmError(code) => {
-                error!(log, "SVM error"; "code" => code);
-                // receiver dropped during shutdown; safe to ignore
-                let _ = events.send(VcpuEvent::Error {
+                fatal_exit(
+                    vcpu,
                     vcpu_id,
-                    error: format!("SVM error, code {}", code),
-                });
+                    hdl,
+                    events,
+                    format!("SVM error, code {}", code),
+                    log,
+                );
                 return;
             }
 
             VmExitKind::Paging(gpa, fault_type) => {
-                warn!(log, "unhandled paging exit";
-                    "gpa" => format!("{:#x}", gpa),
-                    "fault_type" => fault_type,
-                );
-                // Treat as fatal
-                // receiver dropped during shutdown; safe to ignore
-                let _ = events.send(VcpuEvent::Error {
+                fatal_exit(
+                    vcpu,
                     vcpu_id,
-                    error: format!(
-                        "unhandled paging fault at GPA {:#x}",
-                        gpa
+                    hdl,
+                    events,
+                    format!(
+                        "unhandled paging fault at GPA {:#x}, fault type {}",
+                        gpa, fault_type,
                     ),
-                });
+                    log,
+                );
                 return;
             }
 
             VmExitKind::Unknown(code) => {
-                error!(log, "unknown VM exit"; "code" => code);
-                // receiver dropped during shutdown; safe to ignore
-                let _ = events.send(VcpuEvent::Error {
+                fatal_exit(
+                    vcpu,
                     vcpu_id,
-                    error: format!("unknown exit code {}", code),
-                });
+                    hdl,
+                    events,
+                    format!("unknown exit code {}", code),
+                    log,
+                );
                 return;
             }
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_discard_once;
+
+    #[test]
+    fn instruction_is_discarded_once_per_repeating_rip() {
+        let mut last = None;
+
+        assert!(should_discard_once(0x1234, &mut last));
+        assert!(!should_discard_once(0x1234, &mut last));
     }
 }
 

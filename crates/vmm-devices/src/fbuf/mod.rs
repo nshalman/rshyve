@@ -9,10 +9,10 @@
 //!
 //! - **BAR0** (128 bytes): mode control registers (width, height, depth,
 //!   framebuffer size)
-//! - **BAR1** (16 MiB): raw XRGB8888 pixel framebuffer
+//! - **BAR1** (16 MiB): devmem-backed XRGB8888 pixel framebuffer
 //!
 //! A VNC server runs in a dedicated thread, listening on a Unix domain
-//! socket. It reads pixels from the shared framebuffer and streams them
+//! socket. It reads pixels from the devmem host view and streams them
 //! to connected VNC clients using the RFB 3.8 protocol with Raw encoding.
 //!
 //! # PCI Identity
@@ -27,15 +27,17 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use slog;
 use vmm_core::common::RWOp;
+use vmm_core::hdl::VmmHdl;
+use vmm_core::mem::DevMemSeg;
 use vmm_core::mmio::{MmioBus, MmioFn};
 
-use crate::Lifecycle;
+use crate::{InputBroker, Lifecycle};
 use crate::pci::bar::BarDefine;
 use crate::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use crate::pci::BarN;
@@ -104,25 +106,6 @@ mod memreg {
 }
 
 // ---------------------------------------------------------------------------
-// Shared framebuffer state
-// ---------------------------------------------------------------------------
-
-/// Shared framebuffer state accessed by both the PCI device (writes from
-/// guest) and the VNC server thread (reads for display).
-struct FramebufferState {
-    /// Raw pixel data, XRGB8888 format, row-major.
-    pixels: Vec<u8>,
-}
-
-impl FramebufferState {
-    fn new(size: usize) -> Self {
-        Self {
-            pixels: vec![0u8; size],
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Framebuffer PCI device
 // ---------------------------------------------------------------------------
 
@@ -135,17 +118,17 @@ pub struct Framebuffer {
     /// high 16 bits = width, low 16 bits = height.
     resolution: AtomicU32,
 
-    /// Shared pixel buffer (BAR1 backing store).
-    fb_state: RwLock<FramebufferState>,
+    /// Device memory segment backing BAR1.
+    fb: DevMemSeg,
+
+    /// VM handle retained for the device memory segment lifetime.
+    hdl: Option<Arc<VmmHdl>>,
 
     /// MMIO bus for BAR registration/unregistration.
     bus_mmio: Arc<MmioBus>,
 
     /// Currently registered BAR0 base address (if any).
     registered_bar0: Mutex<Option<u64>>,
-
-    /// Currently registered BAR1 base address (if any).
-    registered_bar1: Mutex<Option<u64>>,
 
     /// Weak self-reference for MMIO handler closures.
     self_ref: Mutex<Option<std::sync::Weak<Self>>>,
@@ -159,6 +142,9 @@ pub struct Framebuffer {
     /// Structured logger.
     log: slog::Logger,
 
+    /// Late-bound remote input destinations.
+    input: Arc<InputBroker>,
+
     /// Flag to signal VNC thread to shut down.
     shutdown: AtomicBool,
 }
@@ -169,16 +155,23 @@ impl Framebuffer {
     /// The VNC server listens on a Unix domain socket at `vnc_path`.
     /// If `vnc_password` is `Some`, VNC authentication is required.
     ///
-    /// Returns `Arc<Self>` because the device is shared between the
-    /// PCI bus, MMIO handlers, and the VNC server thread.
+    /// The returned device is shared between the PCI bus, MMIO handlers, and
+    /// the VNC server thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the framebuffer devmem segment cannot be created.
     pub fn new(
         width: u16,
         height: u16,
         vnc_path: &Path,
         vnc_password: Option<String>,
         bus_mmio: Arc<MmioBus>,
+        hdl: Arc<VmmHdl>,
+        segid: i32,
+        input: Arc<InputBroker>,
         log: slog::Logger,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         let ident = DeviceIdent {
             vendor_id: PCI_VENDOR_ID,
             device_id: PCI_DEVICE_ID,
@@ -195,18 +188,25 @@ impl Framebuffer {
         pci_state.define_bar(BarN::BAR1, BarDefine::Mmio(BAR1_SIZE));
 
         let resolution = pack_resolution(width, height);
+        let fb = DevMemSeg::new(
+            Arc::clone(&hdl),
+            segid,
+            "framebuffer",
+            BAR1_SIZE as usize,
+        )?;
 
         let dev = Arc::new(Self {
             pci_state: Mutex::new(pci_state),
             resolution: AtomicU32::new(resolution),
-            fb_state: RwLock::new(FramebufferState::new(BAR1_SIZE as usize)),
+            fb,
+            hdl: Some(hdl),
             bus_mmio,
             registered_bar0: Mutex::new(None),
-            registered_bar1: Mutex::new(None),
             self_ref: Mutex::new(None),
             vnc_password,
             vnc_path: vnc_path.to_owned(),
             log,
+            input,
             shutdown: AtomicBool::new(false),
         });
 
@@ -223,7 +223,7 @@ impl Framebuffer {
             })
             .expect("fbuf: failed to spawn VNC server thread");
 
-        dev
+        Ok(dev)
     }
 
     /// Get the current display width.
@@ -252,6 +252,11 @@ fn pack_resolution(width: u16, height: u16) -> u32 {
 
 fn unpack_width(packed: u32) -> u16 {
     (packed >> 16) as u16
+}
+
+fn scale_abs(v: u16, extent: u16) -> u16 {
+    let divisor = u32::from(extent.saturating_sub(1)).max(1);
+    ((u32::from(v) * 0x7FFF) / divisor).min(0x7FFF) as u16
 }
 
 fn unpack_height(packed: u32) -> u16 {
@@ -286,7 +291,6 @@ impl PciDevice for Framebuffer {
     fn bar_rw(&self, bar: BarN, offset: usize, rwo: RWOp<'_>) {
         match bar {
             BarN::BAR0 => self.bar0_rw(offset, rwo),
-            BarN::BAR1 => self.bar1_rw(offset, rwo),
             _ => {
                 if let RWOp::Read(ro) = rwo {
                     ro.write_u32(0);
@@ -301,7 +305,7 @@ impl PciDevice for Framebuffer {
 // ---------------------------------------------------------------------------
 
 impl Framebuffer {
-    /// Update MMIO bus registration for BAR0 and BAR1.
+    /// Update BAR0 MMIO registration and the BAR1 devmem mapping.
     ///
     /// Called when the PCI command register or BAR addresses change.
     /// Uses the same weak-self pattern as NVMe to avoid Arc cycles.
@@ -310,36 +314,51 @@ impl Framebuffer {
         let mmio_enabled =
             pci.command().contains(crate::pci::bits::RegCmd::MMIO_EN);
 
-        for (bar_n, reg_mutex) in [
-            (BarN::BAR0, &self.registered_bar0),
-            (BarN::BAR1, &self.registered_bar1),
-        ] {
-            let mut reg = reg_mutex.lock().expect("fbuf: bar reg lock");
-            if let Some(old_addr) = reg.take() {
-                let _ = self.bus_mmio.unregister(old_addr);
-            }
-            if mmio_enabled {
-                if let Some((def, addr)) = pci.bars().get(bar_n) {
-                    if addr != 0 && def.is_mmio() {
-                        let size = def.size();
-                        let dev = Arc::clone(self);
-                        let bar = bar_n;
-                        let handler: Arc<MmioFn> =
-                            Arc::new(move |offset: usize, rwo: RWOp<'_>| {
-                                dev.bar_rw(bar, offset, rwo);
-                            });
-                        if self
-                            .bus_mmio
-                            .register(addr, size, handler)
-                            .is_ok()
-                        {
-                            *reg = Some(addr);
-                        }
+        let mut reg = self.registered_bar0.lock().expect("fbuf: bar reg lock");
+        if let Some(old_addr) = reg.take() {
+            let _ = self.bus_mmio.unregister(old_addr);
+        }
+        if mmio_enabled {
+            if let Some((def, addr)) = pci.bars().get(BarN::BAR0) {
+                if addr != 0 && def.is_mmio() {
+                    let size = def.size();
+                    let dev = Arc::clone(self);
+                    let handler: Arc<MmioFn> =
+                        Arc::new(move |offset: usize, rwo: RWOp<'_>| {
+                            dev.bar_rw(BarN::BAR0, offset, rwo);
+                        });
+                    if self.bus_mmio.register(addr, size, handler).is_ok() {
+                        *reg = Some(addr);
                     }
                 }
             }
         }
+        drop(reg);
+
+        let bar1_addr = pci
+            .bars()
+            .get(BarN::BAR1)
+            .map(|(_, addr)| addr)
+            .unwrap_or(0);
+        let want = bar1_target(mmio_enabled, bar1_addr);
+        if self.fb.mapped_gpa() != want {
+            if let Err(e) = self.fb.unmap() {
+                slog::warn!(self.log, "fbuf: framebuffer unmap failed"; "error" => %e);
+            }
+            if let Some(gpa) = want {
+                if let Err(e) = self.fb.map_at(gpa) {
+                    // The guest may transiently select a GPA that overlaps ROM
+                    // while sizing the BAR, so a rejected mapping is not fatal.
+                    slog::warn!(self.log, "fbuf: framebuffer map failed, BAR1 undecoded";
+                        "gpa" => format!("{gpa:#x}"), "error" => %e);
+                }
+            }
+        }
     }
+}
+
+fn bar1_target(mmio_enabled: bool, addr: u64) -> Option<u64> {
+    (mmio_enabled && addr != 0).then_some(addr)
 }
 
 // ---------------------------------------------------------------------------
@@ -437,73 +456,6 @@ impl Framebuffer {
 }
 
 // ---------------------------------------------------------------------------
-// BAR1: pixel framebuffer
-// ---------------------------------------------------------------------------
-
-impl Framebuffer {
-    /// Handle BAR1 MMIO access (raw pixel framebuffer).
-    fn bar1_rw(&self, offset: usize, rwo: RWOp<'_>) {
-        match rwo {
-            RWOp::Read(ro) => {
-                let fb = self
-                    .fb_state
-                    .read()
-                    .expect("fbuf: fb_state read lock");
-                let len = ro.len();
-                if offset + len <= fb.pixels.len() {
-                    match len {
-                        1 => ro.write_u8(fb.pixels[offset]),
-                        2 => {
-                            let val = u16::from_le_bytes([
-                                fb.pixels[offset],
-                                fb.pixels[offset + 1],
-                            ]);
-                            ro.write_u16(val);
-                        }
-                        4 => {
-                            let val = u32::from_le_bytes([
-                                fb.pixels[offset],
-                                fb.pixels[offset + 1],
-                                fb.pixels[offset + 2],
-                                fb.pixels[offset + 3],
-                            ]);
-                            ro.write_u32(val);
-                        }
-                        8 => {
-                            let val = u64::from_le_bytes([
-                                fb.pixels[offset],
-                                fb.pixels[offset + 1],
-                                fb.pixels[offset + 2],
-                                fb.pixels[offset + 3],
-                                fb.pixels[offset + 4],
-                                fb.pixels[offset + 5],
-                                fb.pixels[offset + 6],
-                                fb.pixels[offset + 7],
-                            ]);
-                            ro.write_u64(val);
-                        }
-                        _ => ro.write_u32(0),
-                    }
-                } else {
-                    ro.write_u32(0);
-                }
-            }
-            RWOp::Write(wo) => {
-                let mut fb = self
-                    .fb_state
-                    .write()
-                    .expect("fbuf: fb_state write lock");
-                let data = wo.buf();
-                let len = data.len();
-                if offset + len <= fb.pixels.len() {
-                    fb.pixels[offset..offset + len].copy_from_slice(data);
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // VNC server
 // ---------------------------------------------------------------------------
 
@@ -577,6 +529,40 @@ fn is_expected_disconnect(e: &io::Error) -> bool {
     )
 }
 
+/// Dispatch a VNC message and report whether it requested a display update.
+fn dispatch_client_message(dev: &Framebuffer, msg: ClientMessage) -> bool {
+    match msg {
+        ClientMessage::FbUpdateRequest { .. } => true,
+        ClientMessage::SetPixelFormat(pf) => {
+            if pf.bits_per_pixel != 32 {
+                slog::warn!(dev.log, "client requested unsupported pixel format";
+                    "bpp" => pf.bits_per_pixel);
+            }
+            false
+        }
+        ClientMessage::SetEncodings(encs) => {
+            if !encs.contains(&ENCODING_RAW) {
+                slog::warn!(dev.log, "client encodings do not include Raw, updates may not display correctly");
+            }
+            false
+        }
+        ClientMessage::KeyEvent { down, key } => {
+            dev.input.key_event(down, key);
+            false
+        }
+        ClientMessage::PointerEvent { button_mask, x, y } => {
+            // The tablet only clamps values, so scaling must use fbuf's
+            // current resolution before the event reaches the input broker.
+            let res = dev.resolution.load(Ordering::Acquire);
+            let sx = scale_abs(x, unpack_width(res));
+            let sy = scale_abs(y, unpack_height(res));
+            dev.input.pointer_event(button_mask, sx, sy);
+            false
+        }
+        ClientMessage::CutText(_) => false,
+    }
+}
+
 /// Handle a single VNC client connection.
 fn handle_vnc_client(
     dev: &Arc<Framebuffer>,
@@ -589,6 +575,7 @@ fn handle_vnc_client(
     let read_stream = stream.try_clone()?;
     let mut writer = BufWriter::new(&stream);
     let mut reader = BufReader::new(read_stream);
+    let mut framebuffer_scratch = Vec::new();
 
     // --- RFB handshake ---
 
@@ -641,43 +628,8 @@ fn handle_vnc_client(
         // Poll for client messages (non-blocking due to timeout)
         match rfb::read_client_message(&mut reader) {
             Ok(Some(msg)) => {
-                match msg {
-                    ClientMessage::FbUpdateRequest { .. } => {
-                        update_requested.store(true, Ordering::Release);
-                    }
-                    ClientMessage::SetPixelFormat(pf) => {
-                        // We only support XRGB8888; log if client wants something else
-                        if pf.bits_per_pixel != 32 {
-                            slog::warn!(dev.log, "client requested unsupported pixel format";
-                                "bpp" => pf.bits_per_pixel);
-                        }
-                    }
-                    ClientMessage::SetEncodings(encs) => {
-                        // We only support Raw encoding; log what client supports
-                        let has_raw = encs.contains(&ENCODING_RAW);
-                        if !has_raw {
-                            slog::warn!(dev.log, "client encodings do not include Raw, updates may not display correctly");
-                        }
-                    }
-                    ClientMessage::KeyEvent { down, key } => {
-                        // TODO: forward to PS/2 keyboard when implemented
-                        static WARN_KEY: std::sync::Once = std::sync::Once::new();
-                        WARN_KEY.call_once(|| {
-                            slog::debug!(dev.log, "VNC keyboard input received but not forwarded (PS/2 not implemented)");
-                        });
-                        let _ = (down, key);
-                    }
-                    ClientMessage::PointerEvent { button_mask, x, y } => {
-                        // Forward to xHCI tablet if available, otherwise drop
-                        static WARN_PTR: std::sync::Once = std::sync::Once::new();
-                        WARN_PTR.call_once(|| {
-                            slog::debug!(dev.log, "VNC pointer input received but not forwarded (tablet not connected)");
-                        });
-                        let _ = (button_mask, x, y);
-                    }
-                    ClientMessage::CutText(_) => {
-                        // Clipboard: ignored
-                    }
+                if dispatch_client_message(dev, msg) {
+                    update_requested.store(true, Ordering::Release);
                 }
             }
             Ok(None) => {
@@ -698,7 +650,11 @@ fn handle_vnc_client(
 
         // Send framebuffer update if requested
         if update_requested.swap(false, Ordering::AcqRel) {
-            if let Err(e) = send_framebuffer_update(dev, &mut writer) {
+            if let Err(e) = send_framebuffer_update(
+                dev,
+                &mut writer,
+                &mut framebuffer_scratch,
+            ) {
                 if is_expected_disconnect(&e) {
                     client_alive.store(false, Ordering::Release);
                     break;
@@ -721,6 +677,7 @@ fn handle_vnc_client(
 fn send_framebuffer_update<W: Write>(
     dev: &Arc<Framebuffer>,
     writer: &mut BufWriter<W>,
+    scratch: &mut Vec<u8>,
 ) -> io::Result<()> {
     let res = dev.resolution.load(Ordering::Acquire);
     let width = unpack_width(res);
@@ -735,36 +692,40 @@ fn send_framebuffer_update<W: Write>(
     let stride = u32::from(width) as usize * 4; // 4 bytes per pixel (XRGB8888)
     let frame_bytes = stride.saturating_mul(usize::from(height));
 
-    // Send FramebufferUpdate header (1 rectangle)
+    let clamped = frame_bytes.min(dev.fb.len());
+
+    // Derive the actual dimensions we can send from the clamped size
+    // so the VNC rectangle header matches the data we transmit.
+    let (send_w, send_h) = if clamped < frame_bytes && stride > 0 {
+        let rows = clamped / stride;
+        (width, rows as u16)
+    } else {
+        (width, height)
+    };
+
+    let send_bytes = usize::from(send_w) * 4 * usize::from(send_h);
+    scratch.resize(send_bytes, 0);
+    dev.fb
+        .view()
+        .subregion(0, send_bytes)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "framebuffer update exceeds devmem bounds",
+            )
+        })?
+        .copy_out(scratch)?;
+
     rfb::write_fb_update_header(writer, 1)?;
-
-    // Read pixel data from the shared framebuffer.
-    // Clamp to the actual pixel buffer size to avoid unbounded allocation.
-    {
-        let fb = dev.fb_state.read().expect("fbuf: fb_state read lock");
-        let clamped = frame_bytes.min(fb.pixels.len());
-
-        // Derive the actual dimensions we can send from the clamped size
-        // so the VNC rectangle header matches the data we transmit.
-        let (send_w, send_h) = if clamped < frame_bytes && stride > 0 {
-            let rows = clamped / stride;
-            (width, rows as u16)
-        } else {
-            (width, height)
-        };
-
-        let rect = RectHeader {
-            x: 0,
-            y: 0,
-            width: send_w,
-            height: send_h,
-            encoding: ENCODING_RAW,
-        };
-        writer.write_all(&rect.to_bytes())?;
-
-        let send_bytes = usize::from(send_w) * 4 * usize::from(send_h);
-        writer.write_all(&fb.pixels[..send_bytes.min(fb.pixels.len())])?;
-    }
+    let rect = RectHeader {
+        x: 0,
+        y: 0,
+        width: send_w,
+        height: send_h,
+        encoding: ENCODING_RAW,
+    };
+    writer.write_all(&rect.to_bytes())?;
+    writer.write_all(scratch)?;
 
     writer.flush()?;
 
@@ -804,6 +765,7 @@ impl<R: io::Read, W: io::Write> io::Write for CombinedStream<'_, R, W> {
 // ---------------------------------------------------------------------------
 
 impl Lifecycle for Framebuffer {
+    // The VNC thread holds no guest state that must drain or migrate.
     fn type_name(&self) -> &'static str {
         "framebuffer"
     }
@@ -816,6 +778,24 @@ impl Lifecycle for Framebuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingKeyboard(Mutex<Vec<(bool, u32)>>);
+
+    impl RecordingKeyboard {
+        fn events(&self) -> Vec<(bool, u32)> {
+            self.0.lock().expect("recording keyboard lock").clone()
+        }
+    }
+
+    impl crate::KeyboardSink for RecordingKeyboard {
+        fn key_event(&self, down: bool, keysym: u32) {
+            self.0
+                .lock()
+                .expect("recording keyboard lock")
+                .push((down, keysym));
+        }
+    }
 
     #[test]
     fn resolution_packing() {
@@ -836,6 +816,47 @@ mod tests {
         let packed = pack_resolution(0, 0);
         assert_eq!(unpack_width(packed), 0);
         assert_eq!(unpack_height(packed), 0);
+    }
+
+    #[test]
+    fn absolute_pointer_scaling() {
+        assert_eq!(scale_abs(0, 1024), 0);
+        assert_eq!(scale_abs(1023, 1024), 0x7FFF);
+
+        let midpoint = scale_abs(512, 1024);
+        assert!((0x3FE0..=0x4020).contains(&midpoint));
+    }
+
+    #[test]
+    fn absolute_pointer_scaling_handles_degenerate_extents() {
+        assert_eq!(scale_abs(0, 0), 0);
+        assert_eq!(scale_abs(5, 1), 0x7FFF);
+    }
+
+    #[test]
+    fn absolute_pointer_scaling_never_exceeds_tablet_range() {
+        for extent in [0, 1, 2, 768, 1024, u16::MAX] {
+            for value in 0..=u16::MAX {
+                assert!(scale_abs(value, extent) <= 0x7FFF);
+            }
+        }
+    }
+
+    #[test]
+    fn key_message_reaches_input_broker() {
+        let input = Arc::new(InputBroker::default());
+        let keyboard = Arc::new(RecordingKeyboard::default());
+        input.set_keyboard(keyboard.clone());
+        let dev = make_test_dev_with_input(input);
+
+        assert!(!dispatch_client_message(
+            &dev,
+            ClientMessage::KeyEvent {
+                down: true,
+                key: 0xff0d,
+            },
+        ));
+        assert_eq!(keyboard.events(), vec![(true, 0xff0d)]);
     }
 
     #[test]
@@ -914,27 +935,6 @@ mod tests {
     }
 
     #[test]
-    fn bar1_write_and_read() {
-        let dev = make_test_dev();
-
-        // Write 4 bytes at offset 0
-        {
-            let mut fb = dev.fb_state.write().expect("write lock");
-            fb.pixels[0] = 0xFF;
-            fb.pixels[1] = 0x00;
-            fb.pixels[2] = 0x80;
-            fb.pixels[3] = 0x00;
-        }
-
-        // Read them back via bar1_rw
-        let fb = dev.fb_state.read().expect("read lock");
-        assert_eq!(fb.pixels[0], 0xFF);
-        assert_eq!(fb.pixels[1], 0x00);
-        assert_eq!(fb.pixels[2], 0x80);
-        assert_eq!(fb.pixels[3], 0x00);
-    }
-
-    #[test]
     fn pci_ident_reads() {
         let dev = make_test_dev();
         // Vendor ID
@@ -996,8 +996,40 @@ mod tests {
         assert!(resolution_fits(0, 0));
     }
 
+    #[test]
+    fn bar1_is_not_registered_on_the_mmio_bus() {
+        let dev = make_test_dev();
+        let bar0_addr = 0xE000_0000;
+        let bar1_addr = 0xE100_0000;
+
+        dev.cfg_write(0x10, 4, bar0_addr as u32);
+        dev.cfg_write(0x14, 4, bar1_addr as u32);
+        dev.cfg_write(
+            0x04,
+            2,
+            u32::from(crate::pci::bits::RegCmd::MMIO_EN.bits()),
+        );
+
+        assert_eq!(dev.bus_mmio.handle_read(bar0_addr, 4), u64::from(BAR1_SIZE));
+        assert_eq!(dev.bus_mmio.handle_read(bar1_addr, 4), u64::from(u32::MAX));
+    }
+
+    #[test]
+    fn bar1_remap_is_gated_on_mmio_en() {
+        let addr = 0xE100_0000;
+
+        assert_eq!(bar1_target(false, addr), None);
+        assert_eq!(bar1_target(true, 0), None);
+        assert_eq!(bar1_target(true, addr), Some(addr));
+        assert_eq!(bar1_target(false, addr), None);
+    }
+
     /// Create a test device without starting the VNC server.
-    fn make_test_dev() -> Framebuffer {
+    fn make_test_dev() -> Arc<Framebuffer> {
+        make_test_dev_with_input(Arc::new(InputBroker::default()))
+    }
+
+    fn make_test_dev_with_input(input: Arc<InputBroker>) -> Arc<Framebuffer> {
         let ident = DeviceIdent {
             vendor_id: PCI_VENDOR_ID,
             device_id: PCI_DEVICE_ID,
@@ -1013,18 +1045,22 @@ mod tests {
         pci_state.define_bar(BarN::BAR0, BarDefine::Mmio(BAR0_SIZE));
         pci_state.define_bar(BarN::BAR1, BarDefine::Mmio(BAR1_SIZE));
 
-        Framebuffer {
+        let dev = Arc::new(Framebuffer {
             pci_state: Mutex::new(pci_state),
             resolution: AtomicU32::new(pack_resolution(1024, 768)),
-            fb_state: RwLock::new(FramebufferState::new(BAR1_SIZE as usize)),
+            fb: DevMemSeg::new_anon(BAR1_SIZE as usize).unwrap(),
+            hdl: None,
             bus_mmio: Arc::new(MmioBus::new()),
             registered_bar0: Mutex::new(None),
-            registered_bar1: Mutex::new(None),
             self_ref: Mutex::new(None),
             vnc_password: None,
             vnc_path: PathBuf::from("/tmp/test-fbuf.vnc"),
             log: slog::Logger::root(slog::Discard, slog::o!()),
+            input,
             shutdown: AtomicBool::new(false),
-        }
+        });
+        *dev.self_ref.lock().expect("fbuf: self_ref lock") =
+            Some(Arc::downgrade(&dev));
+        dev
     }
 }

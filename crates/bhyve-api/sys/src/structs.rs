@@ -198,6 +198,13 @@ pub struct vm_devmem_offset {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
+pub struct vm_munmap {
+    pub gpa: u64,
+    pub len: size_t,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct vm_register {
     pub cpuid: c_int,
     pub regnum: c_int,
@@ -698,3 +705,13 @@ pub struct ppt_bar_io {
 pub const PCI_ADDR_IO: u32 = 1;
 pub const PCI_ADDR_MEM32: u32 = 2;
 pub const PCI_ADDR_MEM64: u32 = 3;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vm_munmap_layout() {
+        assert_eq!(std::mem::size_of::<vm_munmap>(), 16);
+    }
+}

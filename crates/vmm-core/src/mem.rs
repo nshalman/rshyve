@@ -64,6 +64,29 @@ unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
+    /// Create anonymous read/write backing without a VMM file descriptor.
+    fn anon(size: usize) -> Result<Self> {
+        // Safety: NULL addr lets the OS choose a non-conflicting location.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                Prot::RW.bits(),
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+
+        if raw == libc::MAP_FAILED {
+            return Err(Error::last_os_error());
+        }
+
+        let ptr =
+            NonNull::new(raw as *mut u8).expect("mmap returned non-NULL");
+        Ok(Self { ptr, len: size, prot: Prot::RW })
+    }
+
     /// Create a new memory mapping from a VMM file descriptor.
     ///
     /// # Arguments
@@ -266,6 +289,39 @@ impl SubMapping {
         Ok(())
     }
 
+    /// Bulk copy out of guest-visible memory into a host buffer.
+    ///
+    /// Unlike the byte-at-a-time volatile loop in [`Self::read_bytes`], this
+    /// is for display capture, where a vCPU may paint the framebuffer during
+    /// the copy. A torn frame is acceptable there, and volatile byte reads are
+    /// too costly for multi-megabyte captures. Do not use this where a torn
+    /// read is a correctness bug.
+    pub fn copy_out(&self, dst: &mut [u8]) -> Result<()> {
+        if !self.prot.contains(Prot::READ) {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "mapping is not readable",
+            ));
+        }
+        if dst.len() > self.len {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "copy exceeds mapping bounds",
+            ));
+        }
+
+        // Safety: bounds are checked above, and callers cannot obtain an
+        // overlapping destination through the safe SubMapping API.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.ptr.as_ptr(),
+                dst.as_mut_ptr(),
+                dst.len(),
+            );
+        }
+        Ok(())
+    }
+
     /// Write bytes from a buffer into this mapping.
     pub fn write_bytes(&self, data: &[u8]) -> Result<()> {
         if !self.prot.contains(Prot::WRITE) {
@@ -344,6 +400,11 @@ impl PhysMap {
             regions: Vec::new(),
             next_segid: 0,
         }
+    }
+
+    /// Next unused kernel memory-segment ID.
+    pub fn next_segid(&self) -> i32 {
+        self.next_segid
     }
 
     /// Add a RAM region backed by a new bhyve memory segment.
@@ -488,6 +549,149 @@ impl PhysMap {
     }
 }
 
+/// `VM_MAX_MEMSEGS` from illumos `uts/intel/io/vmm/vmm.c`.
+pub const VM_MAX_MEMSEGS: i32 = 5;
+
+/// Hands out kernel memory-segment IDs after the [`PhysMap`] is sealed.
+///
+/// This does not live in `PhysMap` because `MachineSetup::finalize` freezes
+/// that map before devices are constructed.
+pub struct SegidAlloc {
+    next: std::sync::atomic::AtomicI32,
+}
+
+impl SegidAlloc {
+    /// Start allocating at the next unused segment ID from [`PhysMap`].
+    pub fn new(start: i32) -> Self {
+        Self { next: std::sync::atomic::AtomicI32::new(start) }
+    }
+
+    /// Allocate a segment ID, or return `None` at the kernel limit.
+    ///
+    /// Reporting exhaustion here gives startup a useful error instead of an
+    /// unexplained `EINVAL` from `VM_ALLOC_MEMSEG`.
+    pub fn alloc(&self) -> Option<i32> {
+        self.next
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |next| {
+                    if next < VM_MAX_MEMSEGS {
+                        Some(next + 1)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .ok()
+    }
+}
+
+/// A named bhyve memory segment whose guest mapping is under device control.
+///
+/// A device BAR backed by this segment is served by EPT without an MMIO exit.
+/// This is required for wide stores because the kernel MMIO exit carries only
+/// one `u64` and cannot represent a 16-byte framebuffer store.
+pub struct DevMemSeg {
+    segid: i32,
+    len: usize,
+    host: Arc<Mapping>,
+    hdl: Option<Arc<VmmHdl>>,
+    mapped_gpa: std::sync::Mutex<Option<u64>>,
+}
+
+impl DevMemSeg {
+    /// Allocate the segment and map only its host view.
+    pub fn new(
+        hdl: Arc<VmmHdl>,
+        segid: i32,
+        name: &str,
+        len: usize,
+    ) -> Result<Self> {
+        hdl.create_memseg(segid, len, name)?;
+        let offset = hdl.devmem_offset(segid)?;
+        let host = Arc::new(Mapping::new(len, Prot::RW, &hdl, offset)?);
+
+        Ok(Self {
+            segid,
+            len,
+            host,
+            hdl: Some(hdl),
+            mapped_gpa: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Create anonymous backing without a guest for unit tests.
+    ///
+    /// [`Self::map_at`] and [`Self::unmap`] are no-ops for this segment.
+    #[doc(hidden)]
+    pub fn new_anon(len: usize) -> Result<Self> {
+        Ok(Self {
+            segid: -1,
+            len,
+            host: Arc::new(Mapping::anon(len)?),
+            hdl: None,
+            mapped_gpa: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Length of the memory segment in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Return a guest-visible view of the host mapping.
+    pub fn view(&self) -> SubMapping {
+        SubMapping::new(&self.host)
+    }
+
+    /// Return the GPA where the segment is currently mapped, if any.
+    pub fn mapped_gpa(&self) -> Option<u64> {
+        *self.mapped_gpa.lock().expect("devmem mapping lock poisoned")
+    }
+
+    /// Map the segment into the guest physical address space.
+    ///
+    /// Mapping at the current GPA is idempotent. Kernel mapping errors are
+    /// returned because a guest-selected GPA may collide with another region.
+    pub fn map_at(&self, gpa: u64) -> Result<()> {
+        let Some(hdl) = &self.hdl else {
+            return Ok(());
+        };
+
+        let mut mapped =
+            self.mapped_gpa.lock().expect("devmem mapping lock poisoned");
+        if *mapped == Some(gpa) {
+            return Ok(());
+        }
+
+        hdl.map_memseg(self.segid, gpa, self.len, 0, Prot::RW)?;
+        *mapped = Some(gpa);
+        Ok(())
+    }
+
+    /// Remove the segment's current guest mapping, if any.
+    ///
+    /// The recorded GPA and length are reused because the kernel requires the
+    /// pair to match the original mapping exactly.
+    pub fn unmap(&self) -> Result<()> {
+        let Some(hdl) = &self.hdl else {
+            return Ok(());
+        };
+
+        let Some(gpa) = self
+            .mapped_gpa
+            .lock()
+            .expect("devmem mapping lock poisoned")
+            .take()
+        else {
+            return Ok(());
+        };
+
+        hdl.munmap_memseg(gpa, self.len)
+    }
+}
+
 /// Context for accessing guest memory.
 ///
 /// Wraps a shared reference to the PhysMap and provides convenience
@@ -545,301 +749,4 @@ impl MemCtx {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Create a test SubMapping backed by anonymous mmap (no VmmHdl needed).
-    fn make_test_mapping(size: usize) -> Arc<Mapping> {
-        let raw = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(raw, libc::MAP_FAILED);
-        let ptr = NonNull::new(raw as *mut u8).unwrap();
-        Arc::new(Mapping {
-            ptr,
-            len: size,
-            prot: Prot::RW,
-        })
-    }
-
-    #[test]
-    fn read_aligned_u32() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        // Page-aligned pointer can read u32
-        let val = sub.read::<u32>();
-        assert!(val.is_ok());
-    }
-
-    #[test]
-    fn read_unaligned_u32_fails() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        // Offset by 1 byte to create misalignment for u32 (align=4)
-        let unaligned = sub.subregion(1, 4).unwrap();
-        let result = unaligned.read::<u32>();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn write_unaligned_u32_fails() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        let unaligned = sub.subregion(1, 4).unwrap();
-        let result = unaligned.write::<u32>(&42);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn read_aligned_u16_at_offset() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        // Offset by 2 is still aligned for u16 (align=2)
-        let aligned = sub.subregion(2, 2).unwrap();
-        assert!(aligned.read::<u16>().is_ok());
-    }
-
-    #[test]
-    fn read_unaligned_u16_fails() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        // Offset by 1 is misaligned for u16 (align=2)
-        let unaligned = sub.subregion(1, 2).unwrap();
-        assert!(unaligned.read::<u16>().is_err());
-    }
-
-    #[test]
-    fn read_u8_always_aligned() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        // u8 has align=1, so any offset works
-        let at_offset_1 = sub.subregion(1, 1).unwrap();
-        assert!(at_offset_1.read::<u8>().is_ok());
-    }
-
-    #[test]
-    fn read_write_bytes_ignores_alignment() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        let unaligned = sub.subregion(1, 4).unwrap();
-        // read_bytes and write_bytes work at any alignment
-        let mut buf = [0u8; 4];
-        assert!(unaligned.read_bytes(&mut buf).is_ok());
-        assert!(unaligned.write_bytes(&[1, 2, 3, 4]).is_ok());
-    }
-
-    #[test]
-    fn read_write_roundtrip() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        sub.write::<u32>(&0xDEAD_BEEF).unwrap();
-        let val = sub.read::<u32>().unwrap();
-        assert_eq!(val, 0xDEAD_BEEF);
-    }
-
-    #[test]
-    fn subregion_bounds_check() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        // Exactly at end: should succeed
-        assert!(sub.subregion(4092, 4).is_some());
-        // Past end: should fail
-        assert!(sub.subregion(4093, 4).is_none());
-        // Overflow: should fail
-        assert!(sub.subregion(usize::MAX, 1).is_none());
-    }
-
-    #[test]
-    fn read_too_small_fails() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        let tiny = sub.subregion(0, 2).unwrap();
-        assert!(tiny.read::<u32>().is_err());
-    }
-
-    #[test]
-    fn write_u32_too_small_fails() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        let tiny = sub.subregion(0, 2).unwrap();
-        let result = tiny.write::<u32>(&0xDEAD);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn read_u16_aligned_roundtrip() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        // Write at aligned offset, read back
-        let region = sub.subregion(0, 2).unwrap();
-        region.write::<u16>(&0xBEEF).unwrap();
-        let val = region.read::<u16>().unwrap();
-        assert_eq!(val, 0xBEEF);
-    }
-
-    #[test]
-    fn read_u16_at_aligned_offset_roundtrip() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        // Offset 4 is aligned for u16
-        let region = sub.subregion(4, 2).unwrap();
-        region.write::<u16>(&0xCAFE).unwrap();
-        let val = region.read::<u16>().unwrap();
-        assert_eq!(val, 0xCAFE);
-    }
-
-    #[test]
-    fn write_bytes_read_bytes_roundtrip() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        let data = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
-        sub.write_bytes(&data).unwrap();
-        let mut buf = [0u8; 8];
-        sub.read_bytes(&mut buf).unwrap();
-        assert_eq!(buf, data);
-    }
-
-    #[test]
-    fn write_bytes_read_bytes_at_offset() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        // Write at an unaligned offset via subregion
-        let region = sub.subregion(3, 5).unwrap();
-        let data = [1, 2, 3, 4, 5];
-        region.write_bytes(&data).unwrap();
-        let mut buf = [0u8; 5];
-        region.read_bytes(&mut buf).unwrap();
-        assert_eq!(buf, data);
-    }
-
-    #[test]
-    fn read_bytes_exceeds_bounds() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        let tiny = sub.subregion(0, 4).unwrap();
-        let mut buf = [0u8; 8];
-        let result = tiny.read_bytes(&mut buf);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn write_bytes_exceeds_bounds() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        let tiny = sub.subregion(0, 4).unwrap();
-        let result = tiny.write_bytes(&[0u8; 8]);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn subregion_exact_end() {
-        let mapping = make_test_mapping(256);
-        let sub = SubMapping::new(&mapping);
-        // Exactly the full mapping
-        assert!(sub.subregion(0, 256).is_some());
-        // One byte past the end
-        assert!(sub.subregion(0, 257).is_none());
-        // Last byte
-        assert!(sub.subregion(255, 1).is_some());
-        // Zero-length at end
-        assert!(sub.subregion(256, 0).is_some());
-    }
-
-    #[test]
-    fn subregion_nested() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        // Create a subregion, then a subregion of that
-        let outer = sub.subregion(100, 200).unwrap();
-        let inner = outer.subregion(50, 100).unwrap();
-        assert_eq!(inner.len(), 100);
-        // Inner subregion cannot exceed outer
-        assert!(outer.subregion(150, 100).is_none());
-    }
-
-    #[test]
-    fn read_from_write_only_mapping_fails() {
-        // Create a write-only mapping
-        let raw = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                4096,
-                libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(raw, libc::MAP_FAILED);
-        let ptr = NonNull::new(raw as *mut u8).unwrap();
-        let mapping = Arc::new(Mapping {
-            ptr,
-            len: 4096,
-            prot: Prot::WRITE,
-        });
-        let sub = SubMapping::new(&mapping);
-        let result = sub.read::<u32>();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), ErrorKind::PermissionDenied);
-    }
-
-    #[test]
-    fn write_to_read_only_mapping_fails() {
-        let raw = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                4096,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(raw, libc::MAP_FAILED);
-        let ptr = NonNull::new(raw as *mut u8).unwrap();
-        let mapping = Arc::new(Mapping {
-            ptr,
-            len: 4096,
-            prot: Prot::READ,
-        });
-        let sub = SubMapping::new(&mapping);
-        let result = sub.write::<u32>(&42);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), ErrorKind::PermissionDenied);
-    }
-
-    #[test]
-    fn len_and_is_empty() {
-        let mapping = make_test_mapping(4096);
-        let sub = SubMapping::new(&mapping);
-        assert_eq!(sub.len(), 4096);
-        assert!(!sub.is_empty());
-
-        let zero = sub.subregion(0, 0).unwrap();
-        assert_eq!(zero.len(), 0);
-        assert!(zero.is_empty());
-    }
-
-    #[test]
-    fn phys_map_empty() {
-        let map = PhysMap::new();
-        assert_eq!(map.num_regions(), 0);
-        assert_eq!(map.total_memory(), 0);
-        assert!(map.regions().is_empty());
-        // Lookup in empty map returns None
-        assert!(map.lookup(0, 1).is_none());
-        assert!(map.lookup(0x1000, 4096).is_none());
-    }
-}
+mod tests;

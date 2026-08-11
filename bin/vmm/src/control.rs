@@ -21,6 +21,7 @@
 //! | `pause`    | Pauses all vCPUs and kernel timers           |
 //! | `resume`   | Resumes a paused VM                         |
 //! | `shutdown` | Graceful ACPI poweroff (VM_SUSPEND_POWEROFF) |
+//! | `reset`    | Guest restart (VM_SUSPEND_RESET); VMM re-execs |
 //! | `stop`     | Immediate VM halt (VM_SUSPEND_HALT)          |
 
 use std::io::{BufRead, BufReader, Write};
@@ -29,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use slog::{error, info, warn, Logger};
@@ -128,7 +129,9 @@ impl VmController {
         })
     }
 
-    fn export_device_queues(&self) -> vmm_migrate::sync_source::DeviceQueueExport {
+    fn export_device_queues(
+        &self,
+    ) -> Result<vmm_migrate::sync_source::DeviceQueueExport, String> {
         // Pause all devices so in-flight I/O completes before we
         // snapshot ring indices. Without this, requests popped from
         // the avail ring but not yet completed would be lost — the
@@ -136,19 +139,12 @@ impl VmController {
         for dev in &self.devices {
             dev.pause();
         }
-        // Wait for all workers to finish (typically < 100ms)
-        let waker = futures::task::noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-        for _ in 0..100 {
-            let all_paused = self.devices.iter().all(|dev| {
-                let mut fut = dev.paused();
-                matches!(
-                    fut.as_mut().poll(&mut cx),
-                    std::task::Poll::Ready(())
-                )
-            });
-            if all_paused { break; }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        let report = vmm_devices::wait_all_quiesced(
+            &self.devices,
+            Duration::from_secs(30),
+        );
+        if !report.is_empty() {
+            return Err(format!("devices did not quiesce: {:?}", report.stuck));
         }
 
         let mut virtio_queues = Vec::new();
@@ -213,10 +209,10 @@ impl VmController {
                 });
             }
         }
-        vmm_migrate::sync_source::DeviceQueueExport {
+        Ok(vmm_migrate::sync_source::DeviceQueueExport {
             virtio_queues,
             nvme_controllers,
-        }
+        })
     }
 
     fn state(&self) -> VmRunState {
@@ -237,26 +233,47 @@ impl VmController {
 
     /// Pause all devices: signal each to quiesce, then wait for all
     /// background workers to drain and park.
-    fn pause_devices(&self) {
-        for dev in &self.devices {
-            dev.pause();
-        }
-        // Collect paused futures and block until all workers are idle.
-        let futs: Vec<_> = self.devices.iter().map(|d| d.paused()).collect();
-        futures::executor::block_on(futures::future::join_all(futs));
+    fn pause_devices(&self) -> Result<(), Vec<&'static str>> {
+        pause_device_set(&self.devices, Duration::from_secs(5))
     }
 
     /// Resume all devices: wake parked workers.
     fn resume_devices(&self) {
-        for dev in &self.devices {
-            dev.resume();
-        }
+        resume_device_set(&self.devices);
     }
 
     /// Halt all devices: permanent shutdown.
     fn halt_devices(&self) {
         for dev in &self.devices {
             dev.halt();
+        }
+    }
+}
+
+fn pause_device_set(
+    devices: &[Arc<dyn vmm_devices::Lifecycle>],
+    budget: Duration,
+) -> Result<(), Vec<&'static str>> {
+    for dev in devices {
+        if dev.lifecycle_state() != Some(vmm_devices::IndicatedState::Pause) {
+            dev.pause();
+        }
+    }
+    let report = vmm_devices::wait_all_quiesced(devices, budget);
+    if !report.is_empty() {
+        resume_device_set(devices);
+        return Err(report.stuck);
+    }
+    Ok(())
+}
+
+fn resume_device_set(devices: &[Arc<dyn vmm_devices::Lifecycle>]) {
+    for dev in devices {
+        if matches!(
+            dev.lifecycle_state(),
+            None | Some(vmm_devices::IndicatedState::Pause)
+        ) {
+            dev.resume();
         }
     }
 }
@@ -274,6 +291,8 @@ enum Command {
     Resume,
     #[serde(rename = "shutdown")]
     Shutdown,
+    #[serde(rename = "reset")]
+    Reset,
     #[serde(rename = "stop")]
     Stop,
     #[serde(rename = "migrate-source")]
@@ -373,15 +392,21 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             if !ctrl.transition(VmRunState::Running, VmRunState::Paused) {
                 return Response::err("VM is not running");
             }
+            if let Err(stuck) = ctrl.pause_devices() {
+                ctrl.state.store(VmRunState::Running as u8, Ordering::Release);
+                return Response::err(&format!(
+                    "device pause timed out: {:?}",
+                    stuck,
+                ));
+            }
             match ctrl.hdl.pause() {
                 Ok(()) => {
-                    // vCPUs paused — now quiesce device workers
-                    ctrl.pause_devices();
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Paused);
                     r
                 }
                 Err(e) => {
+                    ctrl.resume_devices();
                     ctrl.state.store(VmRunState::Running as u8, Ordering::Release);
                     error!(ctrl.log, "pause failed"; "error" => %e);
                     Response::err("pause ioctl failed")
@@ -435,6 +460,37 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                 Err(e) => {
                     ctrl.state.store(cur as u8, Ordering::Release);
                     error!(ctrl.log, "shutdown failed"; "error" => %e);
+                    Response::err("suspend ioctl failed")
+                }
+            }
+        }
+
+        Command::Reset => {
+            let cur = ctrl.state();
+            if cur != VmRunState::Running && cur != VmRunState::Paused {
+                return Response::err("VM is not running or paused");
+            }
+            ctrl.state.store(VmRunState::Stopping as u8, Ordering::Release);
+
+            // If paused, resume first so vCPUs can receive the suspend
+            if cur == VmRunState::Paused {
+                // best-effort: if resume fails, suspend below will also fail
+                let _ = ctrl.hdl.resume();
+            }
+
+            use bhyve_api::vm_suspend_how;
+            match ctrl.hdl.suspend(
+                vm_suspend_how::VM_SUSPEND_RESET as u32,
+                -1,
+            ) {
+                Ok(()) => {
+                    let mut r = Response::ok();
+                    r.state = Some(VmRunState::Stopping);
+                    r
+                }
+                Err(e) => {
+                    ctrl.state.store(cur as u8, Ordering::Release);
+                    error!(ctrl.log, "reset failed"; "error" => %e);
                     Response::err("suspend ioctl failed")
                 }
             }
@@ -538,16 +594,40 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                         let flush_fn: vmm_migrate::sync_source::DeviceFlushFn =
                             Box::new(move || {
                                 for dev in &ctrl_for_flush.devices {
-                                    dev.flush_backing();
+                                    dev.flush_backing(vmm_devices::FlushIntent::Durable)
+                                        .map_err(|error| {
+                                            format!("{}: {:?}", dev.type_name(), error)
+                                        })?;
                                 }
+                                Ok(())
                             });
+                        let ctrl_for_resume = ctrl_arc.clone();
+                        let resume_fn: vmm_migrate::sync_source::DeviceResumeFn =
+                            Box::new(move || ctrl_for_resume.resume_devices());
                         let ctrl_for_export = ctrl_arc.clone();
                         let export_fn: vmm_migrate::sync_source::DeviceExportFn =
-                            Box::new(move || ctrl_for_export.export_device_queues());
+                            Box::new(move || {
+                                match ctrl_for_export.export_device_queues() {
+                                    Ok(export) => export,
+                                    Err(error) => {
+                                        error!(ctrl_for_export.log,
+                                            "device queue export failed";
+                                            "error" => %error);
+                                        // DeviceExportFn is infallible until the
+                                        // migration layer can propagate this error.
+                                        // Empty state avoids racing live ring indices.
+                                        vmm_migrate::sync_source::DeviceQueueExport {
+                                            virtio_queues: Vec::new(),
+                                            nvme_controllers: Vec::new(),
+                                        }
+                                    }
+                                }
+                            });
                         match vmm_migrate::sync_source::run_source_sync(
                             stream, hdl, &memctx, num_cpus, mem_size,
                             status, &mlog, &ctrl_arc.cpu_baseline,
-                            pre_pause_fn, flush_fn, export_fn, zfs_barrier,
+                            pre_pause_fn, flush_fn, resume_fn, export_fn,
+                            zfs_barrier,
                         ) {
                             Ok(()) => {
                                 info!(mlog, "source migration complete");
@@ -982,6 +1062,67 @@ fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    struct NeverQuiesces {
+        paused: AtomicBool,
+        resume_calls: AtomicUsize,
+    }
+
+    impl vmm_devices::Lifecycle for NeverQuiesces {
+        fn type_name(&self) -> &'static str {
+            "never"
+        }
+
+        fn lifecycle_state(&self) -> Option<vmm_devices::IndicatedState> {
+            Some(if self.paused.load(Ordering::Acquire) {
+                vmm_devices::IndicatedState::Pause
+            } else {
+                vmm_devices::IndicatedState::Run
+            })
+        }
+
+        fn pause(&self) {
+            self.paused.store(true, Ordering::Release);
+        }
+
+        fn resume(&self) {
+            self.resume_calls.fetch_add(1, Ordering::AcqRel);
+            self.paused.store(false, Ordering::Release);
+        }
+
+        fn is_quiesced(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn pause_devices_times_out_and_resumes_devices() {
+        let device = Arc::new(NeverQuiesces {
+            paused: AtomicBool::new(false),
+            resume_calls: AtomicUsize::new(0),
+        });
+        let devices: Vec<Arc<dyn vmm_devices::Lifecycle>> = vec![device.clone()];
+
+        let result = pause_device_set(&devices, Duration::from_millis(20));
+
+        assert_eq!(result, Err(vec!["never"]));
+        assert!(!device.paused.load(Ordering::Acquire));
+        assert_eq!(device.resume_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn resume_devices_skips_tracked_devices_that_are_running() {
+        let device = Arc::new(NeverQuiesces {
+            paused: AtomicBool::new(false),
+            resume_calls: AtomicUsize::new(0),
+        });
+        let devices: Vec<Arc<dyn vmm_devices::Lifecycle>> = vec![device.clone()];
+
+        resume_device_set(&devices);
+
+        assert_eq!(device.resume_calls.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn vm_state_roundtrip() {
@@ -1020,8 +1161,14 @@ mod tests {
     }
 
     #[test]
-    fn command_deserialize_invalid() {
-        let result = serde_json::from_str::<Command>(r#"{"command":"explode"}"#);
+    fn parse_reset_command() {
+        let cmd: Command = serde_json::from_str(r#"{"command":"reset"}"#).unwrap();
+        assert!(matches!(cmd, Command::Reset));
+    }
+
+    #[test]
+    fn unknown_command_is_rejected() {
+        let result = serde_json::from_str::<Command>(r#"{"command":"reboot"}"#);
         assert!(result.is_err());
     }
 

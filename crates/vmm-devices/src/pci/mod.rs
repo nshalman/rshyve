@@ -376,6 +376,22 @@ mod tests {
     }
 
     #[test]
+    fn service_addr_latches_dword() {
+        let decoder = PioCfgDecoder::new();
+        let addr = 0x8000_1000u32;
+        let wo = WriteOp::from_buf(&addr.to_le_bytes());
+        decoder.service_addr(0xCF8, RWOp::Write(&wo));
+
+        let mut ro = ReadOp::new(4);
+        decoder.service_addr(0xCF8, RWOp::Read(&mut ro));
+        assert_eq!(u32::from_le_bytes(ro.buf().try_into().unwrap()), addr);
+
+        let ignored = WriteOp::from_buf(&[0]);
+        decoder.service_addr(0xCF9, RWOp::Write(&ignored));
+        assert_eq!(decoder.addr(), addr);
+    }
+
+    #[test]
     fn pio_cfg_decoder_sub_dword_addr_ignored() {
         let dec = PioCfgDecoder::new();
 

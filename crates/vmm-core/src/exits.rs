@@ -88,6 +88,7 @@ pub enum MmioReq {
 #[derive(Copy, Clone, Debug)]
 pub enum Suspend {
     Halt,
+    PowerOff,
     Reset,
     TripleFault(i32),
 }
@@ -225,8 +226,10 @@ impl VmExitKind {
                         Some(vm_suspend_how::VM_SUSPEND_RESET) => {
                             Suspend::Reset
                         }
-                        Some(vm_suspend_how::VM_SUSPEND_POWEROFF)
-                        | Some(vm_suspend_how::VM_SUSPEND_HALT) => {
+                        Some(vm_suspend_how::VM_SUSPEND_POWEROFF) => {
+                            Suspend::PowerOff
+                        }
+                        Some(vm_suspend_how::VM_SUSPEND_HALT) => {
                             Suspend::Halt
                         }
                         Some(vm_suspend_how::VM_SUSPEND_TRIPLEFAULT) => {
@@ -334,6 +337,8 @@ impl MmioRes {
 pub enum VmEntry {
     /// Normal re-entry (no pending fulfillment).
     Run,
+    /// Abandon pending in-kernel instruction emulation state.
+    DiscardInstr,
     /// Re-enter with IN/OUT result.
     InoutFulfill(InoutRes),
     /// Re-enter with MMIO result.
@@ -355,6 +360,7 @@ impl VmEntry {
         let mut payload = vm_entry_payload::default();
         let cmd = match self {
             VmEntry::Run => vm_entry_cmds::VEC_DEFAULT,
+            VmEntry::DiscardInstr => vm_entry_cmds::VEC_DISCARD_INSTR,
 
             VmEntry::InoutFulfill(res) => {
                 let io = match res {
@@ -397,5 +403,118 @@ impl VmEntry {
             u: payload,
             exit_data: exit_ptr as *mut c_void,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bhyve_api::{vm_exit_payload, vm_exit_suspend};
+
+    fn suspend_exit(how: bhyve_api::vm_suspend_how) -> vm_exit {
+        vm_exit {
+            exitcode: vm_exitcode::VM_EXITCODE_SUSPENDED
+                as std::os::raw::c_int,
+            inst_length: 0,
+            rip: 0,
+            u: vm_exit_payload {
+                suspend: vm_exit_suspend {
+                    how: how as std::os::raw::c_int,
+                    source: -1,
+                    when: 1234,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn parse_suspend_poweroff() {
+        let exit = suspend_exit(vm_suspend_how::VM_SUSPEND_POWEROFF);
+
+        assert!(matches!(
+            VmExitKind::parse(&exit, ApiVersion::V16 as u32),
+            VmExitKind::Suspended(SuspendDetail {
+                kind: Suspend::PowerOff,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_suspend_halt() {
+        let exit = suspend_exit(vm_suspend_how::VM_SUSPEND_HALT);
+
+        assert!(matches!(
+            VmExitKind::parse(&exit, ApiVersion::V16 as u32),
+            VmExitKind::Suspended(SuspendDetail {
+                kind: Suspend::Halt,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_suspend_reset() {
+        let exit = suspend_exit(vm_suspend_how::VM_SUSPEND_RESET);
+
+        assert!(matches!(
+            VmExitKind::parse(&exit, ApiVersion::V16 as u32),
+            VmExitKind::Suspended(SuspendDetail {
+                kind: Suspend::Reset,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_suspend_triplefault_carries_source() {
+        let exit = suspend_exit(vm_suspend_how::VM_SUSPEND_TRIPLEFAULT);
+
+        assert!(matches!(
+            VmExitKind::parse(&exit, ApiVersion::V16 as u32),
+            VmExitKind::Suspended(SuspendDetail {
+                kind: Suspend::TripleFault(-1),
+                ..
+            })
+        ));
+        assert!(matches!(
+            VmExitKind::parse(&exit, ApiVersion::V15 as u32),
+            VmExitKind::Suspended(SuspendDetail {
+                kind: Suspend::TripleFault(-1),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_suspend_when_is_nanos() {
+        let exit = suspend_exit(vm_suspend_how::VM_SUSPEND_HALT);
+
+        let VmExitKind::Suspended(v16_detail) =
+            VmExitKind::parse(&exit, ApiVersion::V16 as u32)
+        else {
+            panic!("expected suspended exit");
+        };
+        let VmExitKind::Suspended(v15_detail) =
+            VmExitKind::parse(&exit, ApiVersion::V15 as u32)
+        else {
+            panic!("expected suspended exit");
+        };
+
+        assert_eq!(v16_detail.when, Duration::from_nanos(1234));
+        assert_eq!(v15_detail.when, Duration::ZERO);
+    }
+
+    #[test]
+    fn discard_instruction_entry_preserves_payload() {
+        let raw = VmEntry::DiscardInstr.to_raw(0, std::ptr::null_mut());
+        let payload = unsafe { raw.u.mmio };
+
+        assert_eq!(raw.cmd, vm_entry_cmds::VEC_DISCARD_INSTR as u32);
+        assert_eq!(payload.bytes, 0);
+        assert_eq!(payload.read, 0);
+        assert_eq!(payload._pad, [0u16; 3]);
+        assert_eq!(payload.gpa, 0);
+        assert_eq!(payload.data, 0);
     }
 }

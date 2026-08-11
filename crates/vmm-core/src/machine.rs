@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use crate::hdl::{CreateOpts, VmmHdl};
-use crate::mem::{MemCtx, PhysMap};
+use crate::mem::{MemCtx, PhysMap, SegidAlloc};
 use crate::mmio::MmioBus;
 use crate::pio::PioBus;
 use crate::vcpu::Vcpu;
@@ -51,6 +51,7 @@ pub struct Machine {
     mem_size: usize,
     bus_pio: Arc<PioBus>,
     bus_mmio: Arc<MmioBus>,
+    segids: SegidAlloc,
 }
 
 impl Machine {
@@ -89,6 +90,10 @@ impl Machine {
     pub fn bus_mmio(&self) -> &Arc<MmioBus> {
         &self.bus_mmio
     }
+
+    pub fn segids(&self) -> &SegidAlloc {
+        &self.segids
+    }
 }
 
 /// Intermediate state: VM created with RAM, but not yet finalized.
@@ -122,6 +127,7 @@ impl MachineSetup {
     /// After this, the PhysMap is wrapped in Arc and no further
     /// memory regions can be added.
     pub fn finalize(self) -> Machine {
+        let segids = SegidAlloc::new(self.map.next_segid());
         let map = Arc::new(self.map);
         let memctx = MemCtx::new(map.clone());
 
@@ -141,6 +147,7 @@ impl MachineSetup {
             mem_size: self.mem_size,
             bus_pio,
             bus_mmio,
+            segids,
         }
     }
 }

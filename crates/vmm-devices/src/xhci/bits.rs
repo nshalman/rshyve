@@ -28,12 +28,15 @@ pub const BAR0_SIZE: u32 = 0x2000;
 pub const CAPLENGTH: u8 = 0x20;
 pub const HCIVERSION: u16 = 0x0100;
 
+/// Windows xHCI drivers require the controller to advertise at least 64 slots.
+pub const MAX_SLOTS: u8 = 64;
+
 /// Structural Parameters 1 (HCSPARAMS1) at offset 0x04.
-/// Bits [7:0]   = MaxSlots (1)
+/// Bits [7:0]   = MaxSlots (64)
 /// Bits [17:8]  = MaxIntrs (1)
 /// Bits [31:24] = MaxPorts (2)
 pub fn hcsparams1() -> u32 {
-    let max_slots: u32 = 1;
+    let max_slots = u32::from(MAX_SLOTS);
     let max_intrs: u32 = 1;
     let max_ports: u32 = 2;
     max_slots | (max_intrs << 8) | (max_ports << 24)
@@ -64,10 +67,10 @@ pub const HCSPARAMS3: u32 = 0;
 /// Bit  [6] = LTC (latency tolerance messaging) = 0
 /// Bit  [7] = NSS (no secondary SID support) = 0
 /// Bits [15:12] = xECP (extended capabilities pointer, in dwords from BAR)
-///   We place extended caps at offset 0x500 => 0x500/4 = 0x140 dwords
+///   We place extended caps at XCAP_BASE.
 pub fn hccparams1() -> u32 {
     let ac64: u32 = 1;
-    let xecp: u32 = 0x500 / 4; // dword offset to extended caps
+    let xecp: u32 = XCAP_BASE as u32 / 4;
     ac64 | (xecp << 16)
 }
 
@@ -75,7 +78,7 @@ pub fn hccparams1() -> u32 {
 pub const DBOFF: u32 = 0x440;
 
 /// Runtime Register Space Offset (RTSOFF) at offset 0x18.
-pub const RTSOFF: u32 = 0x480;
+pub const RTSOFF: u32 = 0x560;
 
 /// Capability Parameters 2 (HCCPARAMS2) at offset 0x1C.
 pub const HCCPARAMS2: u32 = 0;
@@ -163,7 +166,7 @@ pub const SPEED_SUPER: u32 = 4;       // SuperSpeed (5 Gbps)
 /// Size of each doorbell register (4 bytes).
 pub const DB_REG_SIZE: usize = 4;
 
-// ---- Runtime register offsets (base = RTSOFF = 0x480) ---------------------
+// ---- Runtime register offsets (base = RTSOFF = 0x560) ---------------------
 
 /// Microframe Index Register.
 pub const RT_MFINDEX: usize = 0x00;
@@ -187,10 +190,10 @@ pub const IR_ERDP: usize = 0x18;
 pub const IMAN_IP: u32 = 1 << 0;  // Interrupt Pending
 pub const IMAN_IE: u32 = 1 << 1;  // Interrupt Enable
 
-// ---- Extended Capability structures (base = 0x500) -----------------------
+// ---- Extended Capability structures (base = 0x600) -----------------------
 
 /// Offset of first extended capability (USB2 supported protocol).
-pub const XCAP_BASE: usize = 0x500;
+pub const XCAP_BASE: usize = 0x600;
 
 /// Size of a Supported Protocol capability (16 bytes).
 pub const XCAP_PROTO_SIZE: usize = 16;
@@ -260,6 +263,7 @@ pub const TRB_TYPE_PORT_STATUS_CHANGE: u32 = 34;
 
 pub const TRB_CC_INVALID: u32 = 0;
 pub const TRB_CC_SUCCESS: u32 = 1;
+pub const TRB_CC_NO_SLOTS_AVAILABLE: u32 = 9;
 pub const TRB_CC_SHORT_PACKET: u32 = 13;
 pub const TRB_CC_TRB_ERROR: u32 = 5;
 pub const TRB_CC_STALL: u32 = 6;
@@ -402,7 +406,7 @@ mod tests {
     #[test]
     fn hcsparams1_fields() {
         let val = hcsparams1();
-        assert_eq!(val & 0xFF, 1);           // MaxSlots = 1
+        assert_eq!(val & 0xFF, 64);          // MaxSlots = 64
         assert_eq!((val >> 8) & 0x3FF, 1);   // MaxIntrs = 1
         assert_eq!((val >> 24) & 0xFF, 2);   // MaxPorts = 2
     }
@@ -414,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn hccparams1_xecp_points_to_500() {
+    fn hccparams1_xecp_points_to_xcap_base() {
         let val = hccparams1();
         let xecp = (val >> 16) & 0xFFFF;
         assert_eq!(xecp * 4, XCAP_BASE as u32);
@@ -494,14 +498,18 @@ mod tests {
         let op_end = 0x400;                 // operational regs end at port base
         let port_end = 0x400 + 2 * PORT_REG_SIZE; // 2 ports
         let db_start = DBOFF as usize;      // 0x440
-        let rt_start = RTSOFF as usize;     // 0x480
-        let xcap_start = XCAP_BASE;         // 0x500
+        let db_end = db_start
+            + (usize::from(MAX_SLOTS) + 1) * DB_REG_SIZE;
+        let rt_start = RTSOFF as usize;     // 0x560
+        let runtime_window_len = IR0_BASE + 0x20;
+        let xcap_start = XCAP_BASE;         // 0x600
 
         assert!(cap_end <= OP_BASE + OP_USBCMD);
         assert!(op_end <= db_start);
         assert!(port_end <= db_start);
-        assert!(db_start < rt_start);
-        assert!(rt_start < xcap_start);
+        assert!(db_end <= rt_start);
+        assert_eq!(rt_start % 32, 0);
+        assert!(rt_start + runtime_window_len <= xcap_start);
         assert!(xcap_start + 2 * XCAP_PROTO_SIZE <= BAR0_SIZE as usize);
     }
 }

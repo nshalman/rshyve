@@ -19,15 +19,14 @@
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
-use futures::future::BoxFuture;
-
-use crate::Lifecycle;
 use crate::blkdev::DiskCache;
 use crate::lifecycle::Indicator;
+use crate::quiesce::datasync;
+use crate::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
 
 use vmm_core::mem::{PhysMap, SubMapping};
 
@@ -64,17 +63,6 @@ const SIZE_MAX: u32 = 128 * 1024;
 const SEG_MAX: u32 = 126;
 /// VirtIO block device serial ID length.
 const VIRTIO_BLK_ID_BYTES: usize = 20;
-
-/// Platform-appropriate data sync (fdatasync on illumos, fsync on macOS).
-#[cfg(target_os = "illumos")]
-fn datasync(fd: i32) -> i32 {
-    unsafe { libc::fdatasync(fd) }
-}
-#[cfg(not(target_os = "illumos"))]
-fn datasync(fd: i32) -> i32 {
-    // macOS does not have fdatasync; use fsync instead.
-    unsafe { libc::fsync(fd) }
-}
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -144,13 +132,7 @@ pub struct VirtioBlock {
     _file: File,
     /// Lifecycle state indicator.
     indicator: Indicator,
-    /// When true, worker threads should quiesce.
-    paused: Arc<AtomicBool>,
-    /// Count of workers currently active (not paused).
-    workers_active: Arc<AtomicUsize>,
-    /// Total number of I/O worker threads.
-    #[allow(dead_code)]
-    total_workers: usize,
+    gate: Arc<QuiesceGate>,
 }
 
 impl VirtioBlock {
@@ -172,8 +154,7 @@ impl VirtioBlock {
         // Workers per queue: NUM_WORKERS for single queue, 2 per queue for MQ.
         let workers_per_queue = if num_queues <= 1 { NUM_WORKERS } else { 2 };
         let total_workers = num_queues as usize * workers_per_queue;
-        let paused = Arc::new(AtomicBool::new(false));
-        let workers_active = Arc::new(AtomicUsize::new(total_workers));
+        let gate = Arc::new(QuiesceGate::new(total_workers));
         let mut io_txs = Vec::with_capacity(total_workers);
         let mut next_worker = Vec::with_capacity(num_queues as usize);
 
@@ -181,13 +162,12 @@ impl VirtioBlock {
             for i in 0..workers_per_queue {
                 let (tx, rx) = mpsc::channel::<BlkIoRequest>();
                 let physmap = Arc::clone(&physmap);
-                let paused = Arc::clone(&paused);
-                let workers_active = Arc::clone(&workers_active);
+                let gate = Arc::clone(&gate);
 
                 thread::Builder::new()
                     .name(format!("virtio-blk-q{q}-io-{i}"))
                     .spawn(move || {
-                        blk_io_worker(rx, raw_fd, read_only, physmap, paused, workers_active);
+                        blk_io_worker(rx, raw_fd, read_only, physmap, gate);
                     })
                     .expect("failed to spawn virtio-blk I/O worker");
 
@@ -215,9 +195,7 @@ impl VirtioBlock {
             _cache: cache,
             _file: file,
             indicator: Indicator::new(),
-            paused,
-            workers_active,
-            total_workers,
+            gate,
         })
     }
 
@@ -539,6 +517,10 @@ impl Lifecycle for VirtioBlock {
         "virtio-blk"
     }
 
+    fn lifecycle_state(&self) -> Option<crate::lifecycle::IndicatedState> {
+        Some(self.indicator.state())
+    }
+
     fn start(&self) -> anyhow::Result<()> {
         self.indicator.start();
         Ok(())
@@ -546,52 +528,24 @@ impl Lifecycle for VirtioBlock {
 
     fn pause(&self) {
         self.indicator.pause();
-        self.paused.store(true, Ordering::Release);
+        self.gate.pause();
     }
 
-    fn paused(&self) -> BoxFuture<'static, ()> {
-        let active = Arc::clone(&self.workers_active);
-        Box::pin(futures::future::poll_fn(move |cx| {
-            if active.load(Ordering::Acquire) == 0 {
-                std::task::Poll::Ready(())
-            } else {
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-        }))
+    fn is_quiesced(&self) -> bool {
+        self.gate.is_quiesced()
     }
 
     fn resume(&self) {
+        self.gate.resume();
         self.indicator.resume();
-        self.paused.store(false, Ordering::Release);
     }
 
     fn halt(&self) {
         self.indicator.halt();
     }
 
-    fn flush_backing(&self) {
-        use std::time::{Duration, Instant};
-        // Drain workers so the fdatasync barrier covers every pwritev
-        // whose completion the guest has observed. Workers see `paused`
-        // at the 50ms recv_timeout boundary and decrement workers_active.
-        //
-        // Use swap so we restore only the state we changed — if the
-        // device was already paused by the lifecycle layer, leave it
-        // paused for the caller to resume on its own schedule.
-        let was_paused = self.paused.swap(true, Ordering::AcqRel);
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while self.workers_active.load(Ordering::Acquire) > 0
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // Best-effort: if fdatasync fails here, logging lives at the
-        // caller (migration layer) since it has the full context.
-        let _ = datasync(self.fd);
-        if !was_paused {
-            self.paused.store(false, Ordering::Release);
-        }
+    fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
+        crate::quiesce::flush_file(&self.gate, &self._file, intent, "virtio-blk")
     }
 }
 
@@ -604,8 +558,7 @@ fn blk_io_worker(
     fd: i32,
     read_only: bool,
     physmap: Arc<PhysMap>,
-    paused: Arc<AtomicBool>,
-    workers_active: Arc<AtomicUsize>,
+    gate: Arc<QuiesceGate>,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
 
@@ -613,13 +566,7 @@ fn blk_io_worker(
         let req = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
-                if paused.load(Ordering::Acquire) {
-                    workers_active.fetch_sub(1, Ordering::AcqRel);
-                    while paused.load(Ordering::Acquire) {
-                        std::thread::park_timeout(std::time::Duration::from_millis(50));
-                    }
-                    workers_active.fetch_add(1, Ordering::AcqRel);
-                }
+                gate.park_if_paused();
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => return,
@@ -885,6 +832,34 @@ fn write_status(physmap: &PhysMap, chain: &[ChainBuf], status: u8) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiesce_query_is_non_blocking_with_active_worker() {
+        let file = tempfile::tempfile().expect("create tempfile");
+        let fd = file.as_raw_fd();
+        let device: Arc<dyn Lifecycle> = Arc::new(VirtioBlock {
+            fd,
+            capacity: 0,
+            sector_size: 512,
+            read_only: true,
+            nodelete: false,
+            num_queues: 0,
+            workers_per_queue: 0,
+            negotiated_features: Mutex::new(0),
+            io_txs: Vec::new(),
+            next_worker: Vec::new(),
+            physmap: Arc::new(PhysMap::new()),
+            interrupt: Arc::new(Mutex::new(None)),
+            completions: Mutex::new(Vec::new()),
+            _cache: DiskCache::new(fd, true),
+            _file: file,
+            indicator: Indicator::new(),
+            gate: Arc::new(QuiesceGate::new(1)),
+        });
+
+        crate::quiesce::testing::assert_query_non_blocking(&device);
+        assert!(!device.is_quiesced());
+    }
 
     #[test]
     fn default_opts() {

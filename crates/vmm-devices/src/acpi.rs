@@ -275,6 +275,30 @@ fn build_dsdt() -> Vec<u8> {
                     });
                 });
 
+                isa.device("KBD", |kbd| {
+                    kbd.name_val(
+                        "_HID",
+                        AmlValue::DWord(Aml::eisa_id("PNP0303")),
+                    );
+                    kbd.name_resource_template("_CRS", |r| {
+                        r.io_resource(0x60, 0x60, 1, 1);
+                        r.io_resource(0x64, 0x64, 1, 1);
+                        r.irq_no_flags(1);
+                    });
+                });
+
+                isa.device("MOU", |mou| {
+                    mou.name_val(
+                        "_HID",
+                        AmlValue::DWord(Aml::eisa_id("PNP0F13")),
+                    );
+                    mou.name_resource_template("_CRS", |r| {
+                        r.io_resource(0x60, 0x60, 1, 1);
+                        r.io_resource(0x64, 0x64, 1, 1);
+                        r.irq_no_flags(12);
+                    });
+                });
+
                 // 8259 PIC (0x20-0x21, 0xA0-0xA1, IRQ 2)
                 isa.device("PIC_", |pic| {
                     pic.name_val(
@@ -1629,6 +1653,22 @@ mod tests {
             count >= 2,
             "DSDT should contain at least 2 PNP0501 (UART) EISA IDs, found {}",
             count,
+        );
+    }
+
+    #[test]
+    fn dsdt_contains_ps2_eisa_ids() {
+        let dsdt = build_dsdt();
+        let keyboard_id = 0x0303D041u32.to_le_bytes();
+        let mouse_id = 0x130FD041u32.to_le_bytes();
+
+        assert!(
+            dsdt.windows(4).any(|w| w == keyboard_id),
+            "DSDT should contain PNP0303 (PS/2 keyboard) EISA ID",
+        );
+        assert!(
+            dsdt.windows(4).any(|w| w == mouse_id),
+            "DSDT should contain PNP0F13 (PS/2 mouse) EISA ID",
         );
     }
 

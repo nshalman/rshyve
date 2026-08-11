@@ -1383,11 +1383,13 @@ impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
 
 use crate::Lifecycle;
 use crate::migrate::Migrator;
-use futures::future::BoxFuture;
-
 impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
     fn type_name(&self) -> &'static str {
         Lifecycle::type_name(&self.device)
+    }
+
+    fn lifecycle_state(&self) -> Option<crate::lifecycle::IndicatedState> {
+        Lifecycle::lifecycle_state(&self.device)
     }
 
     fn start(&self) -> anyhow::Result<()> {
@@ -1398,8 +1400,8 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
         Lifecycle::pause(&self.device)
     }
 
-    fn paused(&self) -> BoxFuture<'static, ()> {
-        Lifecycle::paused(&self.device)
+    fn is_quiesced(&self) -> bool {
+        Lifecycle::is_quiesced(&self.device)
     }
 
     fn resume(&self) {
@@ -1418,8 +1420,11 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
         self.device.pause_rings_for_export();
     }
 
-    fn flush_backing(&self) {
-        Lifecycle::flush_backing(&self.device)
+    fn flush_backing(
+        &self,
+        intent: crate::FlushIntent,
+    ) -> Result<(), crate::FlushError> {
+        Lifecycle::flush_backing(&self.device, intent)
     }
 
     fn post_restore_kick(&self) {
