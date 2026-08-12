@@ -7,7 +7,7 @@ justifies moving an item to shipped.
 Server 2025 evaluation WinPE boots from an ISO on a read-only NVMe namespace
 and reaches SAC on COM1. The remaining hard blockers are in the graphical
 console path. After those come Windows device visibility and platform fidelity,
-especially ACPI TPM discovery, writable UEFI variables, and boot ordering.
+especially ACPI TPM discovery and firmware validation.
 
 Conventions:
 
@@ -30,6 +30,8 @@ Conventions:
 | ✅ vTPM 2.0 | Commits `018c723..212a83c` vendor libtpms in `third_party/libtpms`, add `vmm-tpm-sys` FFI, and add a TCG PTP CRB at `0xFED40000`, a TPM2 ACPI table, file-backed NV state, and `--vtpm` / `--vtpm-state-dir`. End-to-end CRB and libtpms tests landed. Windows discovery is still blocked by the missing `MSFT0101` DSDT device. |
 | ✅ Guest power-off and reset | Commits `68f5bd9`, `8e4cfd9`, `b47f5cb`, `ecd987b`, and `5a5bea6` fix the `0xCF9` port conflict, wire ACPI S5 and reset into VM suspend, separate power-off from halt, re-exec the VMM after guest reset, and expose `{"command":"reset"}`. The former four-port PCI address claim at `0xCF8` swallowed `0xCF9`, so ACPI reset registration always failed and guest reset left a live VM burning a vCPU. |
 | ✅ Kernel-owned MMIO instruction decoding | The illumos vmm kernel decodes MMIO instructions and delivers `VM_EXITCODE_MMIO` with the GPA and operands. `VM_EXITCODE_INST_EMUL` is a diagnostic-only fallback containing 15 raw instruction bytes and a valid-byte count, with no GPA or operands. Userspace does not decode it. |
+| ✅ Writable UEFI variable store | Commits `854efb7`, `d1ed5e5`, and `e82d6c1` add `-l bootrom,<rom>,<varfile>`, size-derived flash layout, and locked CFI-backed persistence. A pristine template and a size-valid, page-aligned erased image filled with `0xFF` are both accepted. Secure Boot enrollment still requires host validation. |
+| ✅ Per-device fw_cfg boot order | An optional `bootindex=N` token on a `-s` specification generates ordered PCI device paths and is stripped before driver parsing. Configurations without a boot index retain the legacy slot-4 payload byte for byte. Live firmware validation remains in the validation backlog. |
 
 ### Validated Windows Server 2025 baseline
 
@@ -45,6 +47,26 @@ media at commit `5a5bea6`:
 - EFI Shell `reset` and control socket `{"command":"reset"}` both reboot a live
   WinPE guest. The process keeps the same PID because reset uses `execvp`; the
   kernel VM is recreated, a second boot is observed, and the guest returns.
+
+### UEFI variable-store recovery
+
+Each VM uses a private writable `VARS.fd`. To clear persistent firmware state,
+stop the VM and replace that file from the pristine template:
+
+```console
+# cp /opt/fw/BHYVE_UEFI_VARS.pristine.fd /var/db/vmm/<vm>/VARS.fd
+```
+
+A size-valid, page-aligned erased image filled entirely with `0xFF` is also
+valid; firmware formats it on first boot. There is intentionally no one-shot
+reset flag because guest reset re-executes the VMM with its existing argv.
+Leaving such a flag in a Triton VM configuration would erase the variable store
+on every reboot.
+
+EDK2 culls auto-generated boot options when their device paths stop resolving.
+It does not cull an OS-created Windows Boot Manager entry when a disk is wiped
+or replaced. Per-VM variable files and this stopped-VM reset procedure recover
+that state; the fw_cfg boot order does not remove persistent OS-created entries.
 
 ## In progress
 
@@ -68,8 +90,7 @@ graphical path unusable.
 | Item | Why / tree evidence |
 |---|---|
 | ⏳ Add a DSDT TPM device with `_HID "MSFT0101"` | `crates/vmm-tpm/src/acpi.rs` emits only the TPM2 table and incorrectly says a DSDT node is unnecessary. Windows binds `TPM.SYS` through `ACPI\MSFT0101`, so the shipped CRB is currently invisible to the guest it targets. |
-| ⏳ Add a writable UEFI variable store and Secure Boot path | `bin/vmm/src/bootrom.rs` maps one firmware image read-only, and `-l bootrom,<rom>` cannot express bhyve's `rom,varfile` form. The default `/usr/share/bhyve/uefi-rom.bin` is CODE-only. This blocks persistent Windows boot entries, Secure Boot, and the Windows 11 / Server 2025 hardware-check path. |
-| ⏳ Add per-device bootindex and generate fw_cfg bootorder | `setup_fwcfg_and_acpi()` hardcodes one bootorder entry for PCI slot 4. The live Windows test reached the ISO only because OVMF fell through from slot 4 to slot 5. |
+| ⏳ Validate Secure Boot enrollment and Windows hardware checks | Writable UEFI variables now persist, but Secure Boot key enrollment and the Windows 11 / Server 2025 hardware-check path have not been validated on the illumos host. |
 | ⏳ Add a userspace MSR emulation table with architectural faults | Unclaimed RDMSR returns zero and unclaimed WRMSR is dropped in `bin/vmm/src/vcpu_tasks.rs`; bhyve instead injects `#GP`. In particular, reading `MSR_IA32_FEATURE_CONTROL` as zero is not a valid real-hardware state and Windows checks it. |
 
 ### Moderate Windows gaps
@@ -83,6 +104,7 @@ graphical path unusable.
 | ❓ Add an inbox-driver Windows NIC | The only emulated network path is viona-backed virtio-net. A fresh Windows install needs NetKVM from virtio-win before it has networking; there is no e1000 or comparable inbox-driver NIC. |
 | ❓ Add framebuffer and xHCI migration state | Both devices implement only `type_name()` in `Lifecycle`; neither exports or restores device state for live migration. |
 | ⏳ Migrate vTPM NV state | The file-backed vTPM NV directory is outside the migration protocol and does not travel with the VM. |
+| ❓ Provide a FreeBSD-firmware utility image | The FreeBSD edk2-bhyve build has no EFI Internal Shell. If one is needed, place `ShellX64.efi` at `\\EFI\\BOOT\\BOOTX64.EFI` on a small FAT image attached as a second read-only NVMe namespace; it can also carry Secure Boot key-enrollment files. |
 
 ### Remaining Tier 1 platform work
 
@@ -134,8 +156,8 @@ These are validation gates, not new features:
 
 - ⏳ Validate Hyper-V Tier 1 against an installed Windows Server workload.
   The WinPE boot/reset test did not exercise the Hyper-V path.
-- ⏳ Complete a Windows Server installation after writable UEFI variables and
-  bootindex land, then verify that the guest's boot entry persists.
+- ⏳ Complete a Windows Server installation using writable UEFI variables and
+  bootindex, then verify that the guest's boot entry persists.
 - ⏳ Validate graphical Windows boot, keyboard, and pointer input after the
   listed graphical-console blockers are fixed.
 - ⏳ Add migration coverage for Hyper-V state, framebuffer/xHCI state, and

@@ -38,6 +38,8 @@ use slog::{error, info, warn, Logger};
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::{MemCtx, PhysMap};
 
+use crate::host_state::HostLocalState;
+
 // ── Error type ──────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -88,16 +90,19 @@ pub struct VmController {
     vcpu_metrics: Vec<Arc<vmm_devices::metrics::VcpuMetrics>>,
     /// Devices implementing the Lifecycle trait for pause/resume.
     devices: Vec<Arc<dyn vmm_devices::Lifecycle>>,
+    /// AHCI state has no migration payload, so attached media blocks migration.
+    has_ahci_cd: bool,
     /// Original CLI args for migrate-config reconstruction.
     cli_pci_slots: Vec<String>,
     cli_lpc: Vec<String>,
     /// CPU baseline for migration feature masking.
     cpu_baseline: String,
+    host_local_state: HostLocalState,
     log: Logger,
 }
 
 impl VmController {
-    pub fn new(
+    pub(crate) fn new(
         hdl: Arc<VmmHdl>,
         physmap: Arc<PhysMap>,
         vm_name: String,
@@ -105,9 +110,11 @@ impl VmController {
         mem_size: usize,
         vcpu_metrics: Vec<Arc<vmm_devices::metrics::VcpuMetrics>>,
         devices: Vec<Arc<dyn vmm_devices::Lifecycle>>,
+        has_ahci_cd: bool,
         cli_pci_slots: Vec<String>,
         cli_lpc: Vec<String>,
         cpu_baseline: String,
+        host_local_state: HostLocalState,
         log: Logger,
     ) -> Arc<Self> {
         let name = vm_name.to_string();
@@ -122,9 +129,11 @@ impl VmController {
             migrate_status: Mutex::new(None),
             vcpu_metrics,
             devices,
+            has_ahci_cd,
             cli_pci_slots,
             cli_lpc,
             cpu_baseline,
+            host_local_state,
             log,
         })
     }
@@ -374,9 +383,31 @@ impl Response {
     }
 }
 
+fn migration_source_guard(
+    state: HostLocalState,
+    has_ahci_cd: bool,
+    command: &Command,
+) -> Option<Response> {
+    if !matches!(command, Command::MigrateSource { .. }) {
+        return None;
+    }
+    if has_ahci_cd {
+        return Some(Response::err(
+            "ahci-cd is not supported on a migration source",
+        ));
+    }
+    state.migration_blocker().map(Response::err)
+}
+
 // ── Command dispatch ────────────────────────────────────────────────
 
 fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
+    if let Some(response) =
+        migration_source_guard(ctrl.host_local_state, ctrl.has_ahci_cd, &cmd)
+    {
+        return response;
+    }
+
     match cmd {
         Command::Status => {
             let mut r = Response::ok();
@@ -1207,6 +1238,49 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(cmd, Command::MigrateSource { .. }));
+    }
+
+    #[test]
+    fn migrate_source_rejects_host_local_state() {
+        let command = Command::MigrateSource {
+            target_addr: "192.0.2.10:4567".to_string(),
+            zfs_barrier: None,
+        };
+
+        for state in [
+            HostLocalState::new(true, false),
+            HostLocalState::new(false, true),
+            HostLocalState::new(true, true),
+        ] {
+            let response = migration_source_guard(state, false, &command)
+                .expect("host-local state must block migration");
+            assert!(!response.success);
+            assert!(response
+                .error
+                .as_deref()
+                .expect("error response must explain rejection")
+                .contains("host-local state is not carried by migration"));
+        }
+
+        assert!(
+            migration_source_guard(HostLocalState::default(), false, &command).is_none()
+        );
+    }
+
+    #[test]
+    fn migrate_source_rejects_ahci_cd() {
+        let command = Command::MigrateSource {
+            target_addr: "192.0.2.10:4567".to_string(),
+            zfs_barrier: None,
+        };
+
+        let response = migration_source_guard(HostLocalState::default(), true, &command)
+            .expect("AHCI CD must block migration");
+        assert!(!response.success);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("ahci-cd is not supported on a migration source")
+        );
     }
 
     #[test]

@@ -159,6 +159,7 @@ pub const CLASS_MEMORY: u8 = 5;
 pub const CLASS_BRIDGE: u8 = 6;
 
 // Sub-classes under CLASS_STORAGE
+pub const SUBCLASS_STORAGE_SATA: u8 = 6;
 pub const SUBCLASS_STORAGE_NVM: u8 = 8;
 
 // Sub-classes under CLASS_BRIDGE
@@ -168,6 +169,7 @@ pub const SUBCLASS_BRIDGE_PCI: u8 = 4;
 pub const SUBCLASS_BRIDGE_OTHER: u8 = 0x80;
 
 // Programming interfaces
+pub const PROGIF_SATA_AHCI_1_0: u8 = 1;
 pub const PROGIF_ENTERPRISE_NVME: u8 = 2;
 
 // ---------------------------------------------------------------------------

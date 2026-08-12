@@ -1165,9 +1165,14 @@ impl NvmeController {
 impl NvmeController {
     /// Handle BAR4 MMIO access (MSI-X table + PBA).
     fn bar4_rw(&self, offset: usize, rwo: RWOp<'_>) {
+        let pba_offset = self.msix.pba_offset();
         match rwo {
             RWOp::Read(ro) => {
-                let val = self.msix.table_read(offset);
+                let val = if offset >= pba_offset {
+                    self.msix.pba_read(offset - pba_offset)
+                } else {
+                    self.msix.table_read(offset)
+                };
                 match ro.len() {
                     1 => ro.write_u8(val as u8),
                     2 => ro.write_u16(val as u16),
@@ -1176,7 +1181,16 @@ impl NvmeController {
                 }
             }
             RWOp::Write(wo) => {
-                self.msix.table_write(offset, wo.read_u32());
+                let val = match wo.len() {
+                    1 => u32::from(wo.read_u8()),
+                    2 => u32::from(wo.read_u16()),
+                    4 => wo.read_u32(),
+                    _ => wo.read_u32(),
+                };
+                // The PBA is read-only to the guest.
+                if offset < pba_offset {
+                    self.msix.table_write(offset, val);
+                }
             }
         }
     }

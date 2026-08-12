@@ -1292,8 +1292,7 @@ impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
         // BAR4: MSI-X table + PBA access
         if bar == BarN::BAR4 {
             if let Some(ref msix) = self.msix {
-                let table_bytes = msix.count() as usize * 16;
-                let pba_offset = (table_bytes + 0xFFF) & !0xFFF;
+                let pba_offset = msix.pba_offset();
                 match rwo {
                     RWOp::Read(ro) => {
                         let val = if offset >= pba_offset {

@@ -402,6 +402,35 @@ impl PhysMap {
         }
     }
 
+    /// Device tests need real `PhysMap::lookup` boundaries without creating a
+    /// kernel VM, which is unavailable on non-illumos test hosts.
+    #[doc(hidden)]
+    pub fn new_anon(gpa: u64, len: usize) -> Result<Self> {
+        if len == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "region length must be non-zero",
+            ));
+        }
+        let len64 = u64::try_from(len).map_err(|_| {
+            Error::new(ErrorKind::InvalidInput, "region length exceeds u64")
+        })?;
+        gpa.checked_add(len64).ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "region overflows address space")
+        })?;
+
+        Ok(Self {
+            regions: vec![Region {
+                gpa,
+                len,
+                kind: RegionKind::Ram,
+                segid: -1,
+                mapping: Arc::new(Mapping::anon(len)?),
+            }],
+            next_segid: 0,
+        })
+    }
+
     /// Next unused kernel memory-segment ID.
     pub fn next_segid(&self) -> i32 {
         self.next_segid

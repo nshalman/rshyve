@@ -18,8 +18,10 @@
 //! one VM, so this is fine. Per-VM state lives behind a `OnceLock`.
 
 use std::ffi::CStr;
+use std::fs::File;
+use std::io::{self, Write};
 use std::os::raw::c_char;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
@@ -275,20 +277,12 @@ unsafe extern "C" fn cb_nvram_storedata(
         unsafe { std::slice::from_raw_parts(data, length as usize) }
     };
 
-    // Atomic write: stage to .tmp then rename, so we never observe a
-    // half-written NV blob across crashes.
-    let tmp = path.with_extension("tmp");
-    if let Err(e) = std::fs::write(&tmp, bytes) {
-        warn!(s.log, "tpm nv storedata write failed";
-            "path" => %tmp.display(),
-            "error" => %e
-        );
-        return TPM_FAIL;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        warn!(s.log, "tpm nv storedata rename failed";
-            "from" => %tmp.display(),
-            "to" => %path.display(),
+    // Rename prevents partial blobs, but file and directory syncs are needed
+    // to survive host failure. Lost TPM NV state can make a BitLocker VMK
+    // unrecoverable.
+    if let Err(e) = durable_replace(&path, bytes) {
+        warn!(s.log, "tpm nv storedata failed";
+            "path" => %path.display(),
             "error" => %e
         );
         return TPM_FAIL;
@@ -336,6 +330,57 @@ unsafe extern "C" fn cb_nvram_deletename(
 // Helpers
 // ---------------------------------------------------------------
 
+fn durable_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut file = File::create(&tmp).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("creating TPM NV temp file {}: {e}", tmp.display()),
+        )
+    })?;
+    file.write_all(bytes).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("writing TPM NV temp file {}: {e}", tmp.display()),
+        )
+    })?;
+    file.sync_all().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("syncing TPM NV temp file {}: {e}", tmp.display()),
+        )
+    })?;
+    drop(file);
+
+    std::fs::rename(&tmp, path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "renaming TPM NV temp file {} to {}: {e}",
+                tmp.display(),
+                path.display(),
+            ),
+        )
+    })?;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = File::open(parent).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("opening TPM NV state directory {}: {e}", parent.display()),
+        )
+    })?;
+    directory.sync_all().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("syncing TPM NV state directory {}: {e}", parent.display()),
+        )
+    })
+}
+
 fn nv_path(s: &CallbackState, name: *const c_char) -> Option<PathBuf> {
     if name.is_null() {
         return None;
@@ -366,3 +411,54 @@ const _: () = assert!(
      check field count and order against libtpms tpm_library.h"
 );
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
+
+    struct ScratchDir {
+        path: PathBuf,
+    }
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let sequence = NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "vmm-tpm-callbacks-test-{}-{sequence}",
+                std::process::id(),
+            ));
+            std::fs::create_dir(&path).expect("create scratch directory");
+            Self { path }
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            drop(std::fs::remove_dir_all(&self.path));
+        }
+    }
+
+    #[test]
+    fn durable_replace_writes_and_replaces_contents() {
+        let scratch = ScratchDir::new();
+        let path = scratch.path.join("tpm2-00.permall");
+
+        // This exercises both sync calls and verifies replacement completes
+        // without a leftover temp file. It cannot prove observation atomicity
+        // or persistence across a sudden host power loss.
+        durable_replace(&path, b"first state").expect("write initial state");
+        assert_eq!(
+            std::fs::read(&path).expect("read initial state"),
+            b"first state"
+        );
+
+        durable_replace(&path, b"replacement state").expect("replace state");
+        assert_eq!(
+            std::fs::read(&path).expect("read replacement state"),
+            b"replacement state",
+        );
+        assert!(!path.with_extension("tmp").exists());
+    }
+}

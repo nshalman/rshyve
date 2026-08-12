@@ -10,9 +10,6 @@
 //!     writing the START bit in the Control Area
 //!   * Control Area Address = `CRB_BASE + 0x40` (the CTRL_REQ register;
 //!     the rest of the CRB layout is fixed offset from there)
-//!
-//! We do not emit a DSDT TPM device node here; QEMU's CRB path skips
-//! it too. Windows finds the device through the TPM2 table alone.
 
 use crate::crb::CRB_BASE;
 

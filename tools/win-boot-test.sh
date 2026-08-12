@@ -7,6 +7,8 @@ VMM=${VMM:-/opt/vmmnew/target/release/vmm}
 DISK=${DISK:-/tmp/wintest.img}
 ISO=${ISO:-/opt/winassets/winsrv2025-eval.iso}
 ROM=${ROM:-/usr/share/bhyve/uefi-rom.bin}
+VARS=${VARS:-}
+VARS_TEMPLATE=${VARS_TEMPLATE:-/opt/fw/BHYVE_UEFI_VARS.pristine.fd}
 LOGFILE=${LOGFILE:-/tmp/${VM}.log}
 FIFO=${FIFO:-/tmp/${VM}.in}
 MEM=${MEM:-4G}
@@ -14,7 +16,7 @@ CPUS=${CPUS:-2}
 HOLDER=/tmp/${VM}.holder
 
 usage() {
-	printf 'usage: %s {start|send STRING|log [BYTES]|wait PATTERN [SECS]|status|stop}\n' "$0" >&2
+	printf 'usage: %s {start|send STRING|log [BYTES]|wait PATTERN [SECS]|status|vars|stop}\n' "$0" >&2
 	exit 2
 }
 
@@ -34,6 +36,13 @@ teardown() {
 start() {
 	teardown
 	[ -f "$DISK" ] || mkfile -n 40g "$DISK"
+	if [ -n "$VARS" ]; then
+		cp "$VARS_TEMPLATE" "$VARS"
+		chmod 600 "$VARS"
+		BOOTROM_ARG="bootrom,$ROM,$VARS"
+	else
+		BOOTROM_ARG="bootrom,$ROM"
+	fi
 	mkfifo "$FIFO"
 	# nohup keeps the holder alive after ssh exits; redirecting stderr lets ssh return.
 	nohup sleep 100000 > "$FIFO" < /dev/null 2>/dev/null &
@@ -41,7 +50,7 @@ start() {
 	# There is no input path for fbuf/xhci here, so they would only add vmexits.
 	nohup "$VMM" -H -c "$CPUS" -m "$MEM" \
 		-s 0,hostbridge -s 4,nvme,"$DISK" -s 5,nvme,"$ISO",ro \
-		-s 31,lpc -l bootrom,"$ROM" -l com1,stdio "$VM" \
+		-s 31,lpc -l "$BOOTROM_ARG" -l com1,stdio "$VM" \
 		> "$LOGFILE" 2>&1 < "$FIFO" &
 	printf '%s\n' "$!"
 }
@@ -90,6 +99,10 @@ case $1 in
 			ps -o pid,pcpu,args -p $pids || :
 		fi
 		ls /dev/vmm/ || :
+		;;
+	vars)
+		[ "$#" -eq 1 ] || usage
+		digest -a sha256 "$VARS"
 		;;
 	stop)
 		[ "$#" -eq 1 ] || usage

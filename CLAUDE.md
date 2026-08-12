@@ -219,8 +219,32 @@ tools/win-boot-test.sh wait 'Press any key to boot' 120
 tools/win-boot-test.sh send '\r'
 tools/win-boot-test.sh log 4000
 tools/win-boot-test.sh status
+VARS=/tmp/wintest-vars.fd tools/win-boot-test.sh vars
 tools/win-boot-test.sh stop
 ```
+
+To boot Windows Setup with the install ISO exposed as a CD-ROM, replace the
+fixed NVMe ISO namespace in the harness command with this attachment:
+
+```bash
+/opt/vmmnew/target/release/vmm -H -c 2 -m 4G \
+  -s 0,hostbridge -s 4,nvme,/tmp/wintest.img \
+  -s 5,ahci-cd,/opt/winassets/winsrv2025-eval.iso \
+  -s 31,lpc -l bootrom,/usr/share/bhyve/uefi-rom.bin -l com1,stdio wintest
+```
+
+At the Windows SAC command prompt, verify that Plug and Play reports a CD-ROM
+and that DiskPart mounted the ISO as a CD-ROM volume:
+
+```text
+pnputil /enum-devices /connected /class CDROM
+diskpart
+list volume
+exit
+```
+
+For the Server 2025 evaluation ISO, `list volume` should report
+`SSS_X64FREE`, `UDF`, `CD-ROM`, and `Healthy` on the mounted volume.
 
 The build host is `root@$VMM_BUILD_HOST`, with sources at `/opt/vmmnew`. Cargo is
 in **`/opt/local/bin`** on this host, not `/opt/tools/bin` (the headnode path).
@@ -240,6 +264,53 @@ command line, kills the session, and ssh returns 255. illumos does not provide
 The Windows assets are `/opt/winassets/winsrv2025-eval.iso` and
 `/opt/winassets/virtio-win.iso`; the persistent test disk is
 `/opt/wintest/win.raw`.
+
+### Firmware
+
+Two UEFI code images are supported:
+
+- `/usr/share/bhyve/uefi-rom.bin` is the illumos bhyve firmware and includes
+  the EFI Internal Shell.
+- `/opt/fw/BHYVE_UEFI_CODE.fd` is the pinned FreeBSD edk2-bhyve firmware
+  installed by `tools/fetch-edk2-bhyve.sh`. It has TPM and Secure Boot modules
+  but no EFI Internal Shell.
+
+The bootrom grammar is `-l bootrom,<rom>[,<varfile>]`. A varfile is writable
+guest state, so every VM must use a private copy. Never share a varfile between
+VMs; the VMM's whole-file `fcntl` write lock refuses a second user.
+
+With the VM stopped, reset its firmware state from the pristine template and
+restrict the new writable copy:
+
+```bash
+cp /opt/fw/BHYVE_UEFI_VARS.pristine.fd /var/db/vmm/<vm>/VARS.fd
+chmod 600 /var/db/vmm/<vm>/VARS.fd
+```
+
+This procedure resets all UEFI variable state. A BitLocker-protected guest will
+prompt for its recovery key on the next boot.
+
+`VARS.fd` and the vTPM state directory are one atomic unit of VM state. If
+either is lost, the other is useless. Snapshots and backups must capture both
+together.
+
+A size-valid, page-aligned image filled entirely with `0xFF` is also accepted
+as erased flash and is formatted by firmware on first boot. Do not add a
+`--bootvars-reset` flag. Guest reset re-executes the VMM with its existing argv,
+so a flag retained in a Triton VM configuration would wipe persistent state on
+every reboot.
+
+For the Windows harness, set `ROM=/opt/fw/BHYVE_UEFI_CODE.fd` and `VARS` to a
+VM-private path. Each `start` copies `VARS_TEMPLATE` to `VARS`; `vars` prints
+the current SHA-256 digest. Do not rerun `start` when testing persistence across
+a guest reset.
+
+The EFI Shell `reset` path applies only to the illumos firmware. With the
+FreeBSD firmware, configure a control socket and send `{"command":"reset"}`
+instead. If an interactive shell is needed, put `ShellX64.efi` at
+`\\EFI\\BOOT\\BOOTX64.EFI` on a small FAT image attached as a second read-only
+NVMe namespace. The same image can later carry Secure Boot key-enrollment
+files, so rebuilding edk2 is unnecessary.
 
 Measured baseline as of commit `212a83c` (known-broken behavior this harness is
 intended to catch):

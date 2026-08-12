@@ -38,12 +38,15 @@ use vmm_devices::virtio::pci::VirtioPciDevice;
 use vmm_devices::virtio::viona::VirtioViona;
 use vmm_devices::InputBroker;
 
+mod bootorder;
 mod bootrom;
 mod control;
 mod direct_boot;
+mod host_state;
 mod input;
 mod mdata;
 mod reboot;
+mod varstore;
 mod vcpu_tasks;
 
 use reboot::{
@@ -125,15 +128,17 @@ struct MachineCreation {
     kernel_image: Option<direct_boot::KernelImage>,
     initrd_image: Option<direct_boot::InitrdImage>,
     hyperv: Option<Arc<vmm_hyperv::HyperV>>,
-    /// Bytes of the TPM2 ACPI table when --vtpm is enabled. Threaded
-    /// through to `setup_fwcfg_and_acpi` so the guest's ACPI scan
-    /// finds the device. None when the VM has no vTPM.
-    tpm2_acpi: Option<Vec<u8>>,
+    varstore: Option<Arc<varstore::VarStore>>,
+    /// TPM2 table and DSDT device description when --vtpm is enabled.
+    tpm_acpi: Option<acpi::TpmAcpi>,
+    host_local_state: host_state::HostLocalState,
 }
 
 /// Build the VM, load bootrom/kernel images, finalize memory, and apply
 /// CPU topology and baseline masking.
 fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
+    host_state::validate_startup(cli)?;
+
     let num_cpus = cli.num_cpus()?;
     let mem_size = cli.mem_size()?;
 
@@ -185,9 +190,24 @@ fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
         None
     };
 
-    if !direct_boot_mode && cli.migrate_listen.is_none() {
-        load_bootrom(&mut setup, &cli.lpc, log)?;
+    let bootrom_spec = if direct_boot_mode {
+        None
+    } else {
+        Some(bootrom::find_bootrom_spec(&cli.lpc)?)
+    };
+    if bootrom_spec.is_some() {
+        bootrom::log_bootrom_diagnostics(&cli.lpc, log);
     }
+    if let Some(spec) = &bootrom_spec {
+        anyhow::ensure!(
+            !(cli.migrate_listen.is_some() && spec.vars.is_some()),
+            "--migrate-listen with a bootrom variable store is not supported: the varstore is host-file state that live migration does not carry",
+        );
+    }
+    let varfile = match (&bootrom_spec, cli.migrate_listen.is_none()) {
+        (Some(spec), true) => load_bootrom(&mut setup, spec, log)?,
+        _ => None,
+    };
 
     // Finalize: wrap PhysMap in Arc, create vCPUs and buses
     let machine = setup.finalize();
@@ -264,7 +284,7 @@ fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
         None
     };
 
-    let tpm2_acpi = if cli.vtpm {
+    let tpm_acpi = if cli.vtpm {
         let state_dir = cli.vtpm_state_dir.clone().unwrap_or_else(|| {
             PathBuf::from("/var/db/vmm")
                 .join(&cli.vm_name)
@@ -295,11 +315,55 @@ fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
             "base" => format!("{:#x}", vmm_tpm::CRB_BASE),
             "len" => format!("{:#x}", vmm_tpm::CRB_REGION_LEN),
         );
+        if let Some(spec) = &bootrom_spec {
+            if bootrom::should_warn_missing_tcg2(&spec.rom) {
+                warn!(log, "vTPM requires TCG2-capable firmware; {} leaves the guest TPM uninitialized", spec.rom.display();
+                    "recommended_firmware" => "BHYVE_UEFI_CODE.fd",
+                );
+            }
+        }
 
-        Some(vmm_tpm::build_tpm2_table())
+        Some(acpi::TpmAcpi {
+            table: vmm_tpm::build_tpm2_table(),
+            device: acpi::TpmDevice {
+                crb_base: u32::try_from(vmm_tpm::CRB_BASE)
+                    .expect("CRB_BASE below 4 GiB"),
+                crb_len: u32::try_from(vmm_tpm::CRB_REGION_LEN)
+                    .expect("CRB_REGION_LEN fits u32"),
+            },
+        })
     } else {
         None
     };
+
+    let varstore = varfile
+        .map(|(vf, gpa)| -> anyhow::Result<Arc<varstore::VarStore>> {
+            let vs = Arc::new(varstore::VarStore::new(
+                vf,
+                gpa,
+                log.new(o!("module" => "varstore")),
+            ));
+            let gpa = vs.gpa();
+            let len = vs.len();
+            let handler = Arc::clone(&vs);
+            machine
+                .bus_mmio()
+                .register(
+                    gpa,
+                    len as u64,
+                    Arc::new(move |offset, op| handler.handle(offset, op)),
+                )
+                .context("registering UEFI variable store MMIO region")?;
+            info!(log, "UEFI variable store registered";
+                "base" => format!("{gpa:#x}"),
+                "len" => format!("{len:#x}"));
+            Ok(vs)
+        })
+        .transpose()?;
+    let host_local_state = host_state::HostLocalState::new(
+        tpm_acpi.is_some(),
+        varstore.is_some(),
+    );
 
     Ok(MachineCreation {
         machine,
@@ -309,7 +373,9 @@ fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
         kernel_image,
         initrd_image,
         hyperv,
-        tpm2_acpi,
+        varstore,
+        tpm_acpi,
+        host_local_state,
     })
 }
 
@@ -350,19 +416,34 @@ fn host_tsc_frequency_hz() -> Option<u64> {
 /// Load the bootrom image into guest memory (pre-finalize).
 fn load_bootrom(
     setup: &mut MachineSetup,
-    lpc_args: &[String],
+    spec: &bootrom::BootromSpec,
     log: &Logger,
-) -> anyhow::Result<()> {
-    let rom_path = bootrom::find_bootrom_path(lpc_args);
-    info!(log, "loading bootrom"; "path" => rom_path.display().to_string());
-    let rom = bootrom::BootromFile::open(&rom_path)?;
-    info!(log, "bootrom validated";
-        "size" => rom.size(),
-        "path" => rom.path().display().to_string(),
+) -> anyhow::Result<Option<(varstore::VarFile, u64)>> {
+    info!(log, "loading bootrom"; "path" => spec.rom.display().to_string());
+    let rom = bootrom::BootromFile::open(&spec.rom)?;
+    let varfile = spec
+        .vars
+        .as_deref()
+        .map(varstore::VarFile::open)
+        .transpose()?;
+    let var_size = varfile.as_ref().map(|file| file.len()).unwrap_or(0);
+    let layout = bootrom::compute_layout(rom.size(), var_size)?;
+    bootrom::log_flash_layout(
+        rom.path(),
+        spec.vars.as_deref(),
+        &layout,
+        log,
     );
     let hdl = setup.hdl().clone();
-    bootrom::load_bootrom(setup.map_mut(), &hdl, &rom)?;
-    Ok(())
+    bootrom::load_bootrom(setup.map_mut(), &hdl, &rom, &layout)?;
+    varfile
+        .map(|file| {
+            let gpa = layout.var_gpa.context(
+                "variable store layout is missing its guest address",
+            )?;
+            Ok((file, gpa))
+        })
+        .transpose()
 }
 
 /// Chipset and kernel-emulated device handles that must be kept alive
@@ -579,9 +660,9 @@ fn setup_fwcfg_and_acpi(
     cli: &Cli,
     num_cpus: u32,
     mem_size: usize,
-    tpm2_acpi: Option<Vec<u8>>,
+    tpm_acpi: Option<acpi::TpmAcpi>,
     log: &Logger,
-) -> Arc<FwCfg> {
+) -> anyhow::Result<Arc<FwCfg>> {
     // Create fw_cfg device and attach to PIO bus
     let fwcfg = FwCfg::new();
     fwcfg.attach(machine.bus_pio());
@@ -606,12 +687,12 @@ fn setup_fwcfg_and_acpi(
     // table is appended (between SPCR and RSDT) so OVMF surfaces
     // the device to the guest.
     let acpi_layout =
-        acpi::generate_acpi_layout_with_tpm2(num_cpus, None, tpm2_acpi.clone());
+        acpi::generate_acpi_layout_with_tpm2(num_cpus, None, tpm_acpi.clone());
     info!(log, "ACPI layout generated for table-loader protocol";
         "tables_size" => acpi_layout.tables.len(),
         "rsdp_size" => acpi_layout.rsdp.len(),
         "num_cpus" => num_cpus,
-        "with_tpm2" => tpm2_acpi.is_some(),
+        "with_tpm2" => tpm_acpi.is_some(),
     );
 
     // Register the ACPI blobs as fw_cfg named entries
@@ -632,36 +713,29 @@ fn setup_fwcfg_and_acpi(
 
     // Add boot order — tell firmware which device to boot from.
     // Format matches bhyve's pci_emul.c: /pci@i0cf8/pci@<slot>,<func>
-    fwcfg.insert_named("bootorder", b"/pci@i0cf8/pci@4,0\n".to_vec());
+    fwcfg.insert_named("bootorder", bootorder::build_bootorder(&cli.pci_slot)?);
     info!(log, "boot order configured via fw_cfg");
 
-    // Write legacy GPA-based ACPI tables to guest memory. Threading
-    // the TPM2 bytes here keeps the BIOS-scan and UEFI views in sync.
-    write_legacy_acpi_tables(machine, num_cpus, tpm2_acpi, log);
+    // Write legacy GPA-based ACPI tables to guest memory. Threading the
+    // same TPM description here keeps the BIOS-scan and UEFI views in sync.
+    write_legacy_acpi_tables(machine, num_cpus, tpm_acpi, log);
 
     // Generate and write SMBIOS tables
     write_smbios_tables(machine, &fwcfg, cli, num_cpus, mem_size, log);
 
-    fwcfg
+    Ok(fwcfg)
 }
 
-/// Generate legacy GPA-based ACPI tables and write to multiple guest
-/// memory locations for compatibility with both UEFI and BIOS scan paths.
+/// Generate legacy GPA-based ACPI tables and place their RSDP in the BIOS
+/// scan area for compatibility with both UEFI and BIOS discovery paths.
 fn write_legacy_acpi_tables(
     machine: &Machine,
     num_cpus: u32,
-    tpm2_acpi: Option<Vec<u8>>,
+    tpm_acpi: Option<acpi::TpmAcpi>,
     log: &Logger,
 ) {
-    let acpi_tables = acpi::generate_acpi_tables_with_tpm2(num_cpus, tpm2_acpi);
+    let acpi_tables = acpi::generate_acpi_tables_with_tpm2(num_cpus, tpm_acpi);
 
-    // Write to BIOS-scannable region (0xE0000-0xFFFFF) as fallback
-    // if the table-loader protocol doesn't properly install the RSDP.
-    if let Err(e) = machine.memctx().write(0xF2400, &acpi_tables.data) {
-        warn!(log, "failed to write legacy ACPI tables"; "error" => %e);
-    } else {
-        info!(log, "legacy ACPI tables at 0xF2400"; "size" => acpi_tables.data.len());
-    }
     // Write RSDP at 0xE0000 for easier scan discovery
     let rsdp_size = 36;
     if acpi_tables.data.len() >= rsdp_size {
@@ -768,7 +842,8 @@ fn write_smbios_tables(
 
 /// Parse all `-s` PCI slot specifications and create the corresponding
 /// devices. Returns PCI handles (must be kept alive) and lifecycle handles
-/// for pause/resume orchestration.
+/// for pause/resume orchestration. The AHCI flag lets the control path reject
+/// migration without re-parsing the original specifications.
 fn init_pci_devices(
     machine: &Machine,
     chipset: &I440FxChipset,
@@ -779,17 +854,20 @@ fn init_pci_devices(
 ) -> anyhow::Result<(
     Vec<Arc<dyn vmm_devices::pci::PciDevice>>,
     Vec<Arc<dyn vmm_devices::Lifecycle>>,
+    bool,
 )> {
     let mut pci_devices: Vec<Arc<dyn vmm_devices::pci::PciDevice>> = Vec::new();
     let mut lifecycle_devices: Vec<Arc<dyn vmm_devices::Lifecycle>> = Vec::new();
+    let mut has_ahci_cd = false;
     let is_migrate = cli.migrate_listen.is_some();
     eprintln!("[vmm] init_pci_devices: migrate_listen={:?} is_migrate={}", cli.migrate_listen, is_migrate);
 
-    reject_fbuf_migration_destination(is_migrate, &cli.pci_slot)?;
+    reject_unmigratable_destination(is_migrate, &cli.pci_slot)?;
 
     for slot_spec in &cli.pci_slot {
+        let (device_spec, _) = bootorder::strip_bootindex(slot_spec)?;
         match parse_and_create_pci_device(
-            slot_spec,
+            &device_spec,
             num_vcpus,
             chipset,
             machine.bus_pio(),
@@ -802,6 +880,7 @@ fn init_pci_devices(
             log,
         ) {
             Ok((Some(pci), lifecycle)) => {
+                has_ahci_cd |= pci_spec_driver(&device_spec) == Some("ahci-cd");
                 pci_devices.push(pci);
                 if let Some(lc) = lifecycle {
                     lifecycle_devices.push(lc);
@@ -818,23 +897,24 @@ fn init_pci_devices(
         }
     }
 
-    Ok((pci_devices, lifecycle_devices))
+    Ok((pci_devices, lifecycle_devices, has_ahci_cd))
 }
 
 fn pci_spec_driver(spec: &str) -> Option<&str> {
     spec.splitn(3, ',').nth(1)
 }
 
-fn reject_fbuf_migration_destination(
+fn reject_unmigratable_destination(
     is_migrate_dest: bool,
     specs: &[String],
 ) -> anyhow::Result<()> {
-    if is_migrate_dest
-        && specs
-            .iter()
-            .any(|spec| pci_spec_driver(spec) == Some("fbuf"))
-    {
-        anyhow::bail!("fbuf is not supported on a migration destination");
+    if is_migrate_dest {
+        if let Some(driver) = specs.iter().find_map(|spec| {
+            let driver = pci_spec_driver(spec)?;
+            matches!(driver, "fbuf" | "ahci-cd").then_some(driver)
+        }) {
+            anyhow::bail!("{} is not supported on a migration destination", driver);
+        }
     }
     Ok(())
 }
@@ -1127,6 +1207,8 @@ fn spawn_control_socket(
     mem_size: usize,
     vcpu_metrics: &[Arc<vmm_devices::metrics::VcpuMetrics>],
     devices: Vec<Arc<dyn vmm_devices::Lifecycle>>,
+    has_ahci_cd: bool,
+    host_local_state: host_state::HostLocalState,
     log: &Logger,
 ) -> Option<PathBuf> {
     let sock_path = cli.control_socket.as_ref()?;
@@ -1138,9 +1220,11 @@ fn spawn_control_socket(
         mem_size,
         vcpu_metrics.to_vec(),
         devices,
+        has_ahci_cd,
         cli.pci_slot.clone(),
         cli.lpc.clone(),
         cli.cpu_baseline.clone(),
+        host_local_state,
         log.clone(),
     );
     match control::spawn_control_thread(sock_path, ctrl, log.clone()) {
@@ -1253,7 +1337,9 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunOutcome> {
         kernel_image,
         initrd_image,
         hyperv,
-        tpm2_acpi,
+        varstore,
+        tpm_acpi,
+        host_local_state,
     } = creation;
 
     // Phase 2: Initialize chipset and kernel-emulated devices
@@ -1275,10 +1361,17 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunOutcome> {
     );
 
     // Phase 5: fw_cfg, ACPI tables, SMBIOS, E820, boot order
-    let _fwcfg = setup_fwcfg_and_acpi(&machine, &cli, num_cpus, mem_size, tpm2_acpi.clone(), log);
+    let _fwcfg = setup_fwcfg_and_acpi(
+        &machine,
+        &cli,
+        num_cpus,
+        mem_size,
+        tpm_acpi.clone(),
+        log,
+    )?;
 
     // Phase 6: PCI devices
-    let (_pci_devices, lifecycle_devices) = init_pci_devices(
+    let (_pci_devices, mut lifecycle_devices, has_ahci_cd) = init_pci_devices(
         &machine,
         &chipset_devs.chipset,
         &cli,
@@ -1286,6 +1379,9 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunOutcome> {
         &input,
         log,
     )?;
+    if let Some(vs) = varstore.clone() {
+        lifecycle_devices.push(vs as Arc<dyn vmm_devices::Lifecycle>);
+    }
 
     // Phase 7: Direct boot kernel loading (after ACPI tables are ready)
     load_direct_boot_kernel(&machine, &cli, &kernel_image, &initrd_image, mem_size, log)?;
@@ -1328,7 +1424,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunOutcome> {
     // Phase 11: Control socket
     let control_cleanup = spawn_control_socket(
         &machine, &cli, num_cpus, mem_size, &vcpu_metrics,
-        lifecycle_devices.clone(), log,
+        lifecycle_devices.clone(), has_ahci_cd, host_local_state, log,
     );
 
     // Phase 12: Signal handling
@@ -1346,12 +1442,9 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunOutcome> {
 }
 
 /// Create a virtio-blk PCI device from a config string.
-///
-/// Shared between the `virtio-blk` and `ahci-cd`/`ahci-hd` (fallback) paths.
 fn create_virtio_blk_device(
     config: &str,
     bdf: Bdf,
-    read_only_override: bool,
     num_vcpus: u32,
     chipset: &I440FxChipset,
     physmap: &Arc<vmm_core::mem::PhysMap>,
@@ -1359,10 +1452,7 @@ fn create_virtio_blk_device(
     bus_mmio: &Arc<vmm_core::mmio::MmioBus>,
     vmm_hdl: &Arc<vmm_core::hdl::VmmHdl>,
 ) -> anyhow::Result<Arc<VirtioPciDevice<VirtioBlock>>> {
-    let (path, mut opts) = parse_blk_config(config);
-    if read_only_override {
-        opts.read_only = true;
-    }
+    let (path, opts) = parse_blk_config(config);
 
     use std::fs::OpenOptions;
     let file = OpenOptions::new()
@@ -1415,6 +1505,25 @@ fn create_virtio_blk_device(
     Ok(pci_dev)
 }
 
+fn parse_ahci_cd_path(config: &str) -> anyhow::Result<&str> {
+    if config.is_empty() {
+        anyhow::bail!("ahci-cd requires an ISO path");
+    }
+    let path = config.split(',').next().unwrap_or(config);
+    for opt in config.split(',').skip(1).filter(|o| !o.is_empty()) {
+        // Rejecting unknown options prevents a read-only device from
+        // appearing to honor a writable configuration.
+        anyhow::bail!("ahci-cd takes no options, got '{}'", opt);
+    }
+    Ok(path)
+}
+
+fn reject_ahci_hd<T>() -> anyhow::Result<T> {
+    anyhow::bail!(
+        "AHCI device type 'ahci-hd' is not implemented; use virtio-blk or nvme"
+    );
+}
+
 /// Parse a `-s` PCI slot specification and create the device.
 ///
 /// Format: `[bus:]dev[:func],driver[,config...]`
@@ -1450,7 +1559,7 @@ fn parse_and_create_pci_device(
                 anyhow::bail!("virtio-blk requires a disk path");
             }
             let pci_dev = create_virtio_blk_device(
-                config, bdf, false, num_vcpus, chipset, physmap, bus_pio, bus_mmio, vmm_hdl,
+                config, bdf, num_vcpus, chipset, physmap, bus_pio, bus_mmio, vmm_hdl,
             )?;
             info!(log, "virtio-blk attached";
                 "bdf" => %bdf,
@@ -1674,12 +1783,28 @@ fn parse_and_create_pci_device(
             );
             Ok((Some(dev as Arc<dyn vmm_devices::pci::PciDevice>), None))
         }
-        "ahci-cd" | "ahci-hd" => {
-            anyhow::bail!(
-                "AHCI device type '{}' is not yet implemented; use virtio-blk instead",
-                driver,
+        "ahci-cd" => {
+            let path = parse_ahci_cd_path(config)?;
+            let media = vmm_devices::ahci::media::IsoMedia::open(std::path::Path::new(path))
+                .with_context(|| format!("failed to open ISO: {}", path))?;
+            let lintr = chipset.route_lintr(&bdf);
+            let ahci = vmm_devices::ahci::AhciCtrl::new(
+                media,
+                Arc::clone(physmap),
+                Arc::clone(bus_mmio),
+                lintr.map(|(_, pin)| pin),
+                log.new(slog::o!("component" => "ahci-cd")),
             );
+            chipset.attach_device(bdf, ahci.clone());
+            info!(log, "ahci-cd attached"; "bdf" => %bdf, "path" => path);
+            Ok((
+                Some(ahci.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
+                Some(ahci as Arc<dyn vmm_devices::Lifecycle>),
+            ))
         }
+        // A separate arm prevents an unsupported disk from silently becoming
+        // a read-only ATAPI device with different guest-visible semantics.
+        "ahci-hd" => reject_ahci_hd(),
         "hostbridge" => {
             // Already created by chipset, skip
             Ok((None, None))
@@ -2089,18 +2214,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fbuf_rejects_migration_destination() {
-        let fbuf = vec!["30,fbuf,unix=/tmp/vm.vnc".to_string()];
-        let other = vec!["4,virtio-blk,/dev/dsk/test".to_string()];
-        let fbuf_in_config = vec!["4,nvme,/tmp/fbuf".to_string()];
+    fn ahci_hd_is_rejected() {
+        let error = reject_ahci_hd::<()>().unwrap_err();
+        let message = error.to_string();
 
-        let err = reject_fbuf_migration_destination(true, &fbuf).unwrap_err();
+        assert!(message.contains("not implemented"));
+        assert!(!message.contains("use virtio-blk instead"));
+    }
+
+    #[test]
+    fn ahci_cd_requires_path() {
+        let error = parse_ahci_cd_path("").unwrap_err();
+
+        assert_eq!(error.to_string(), "ahci-cd requires an ISO path");
+    }
+
+    #[test]
+    fn ahci_cd_rejects_options() {
+        let error = parse_ahci_cd_path("/x.iso,rw").unwrap_err();
+
+        assert_eq!(error.to_string(), "ahci-cd takes no options, got 'rw'");
+    }
+
+    #[test]
+    fn reject_unmigratable_destination_rejects_ahci_cd() {
+        let specs = vec!["5,ahci-cd,/x.iso".to_string()];
+
+        let error = reject_unmigratable_destination(true, &specs).unwrap_err();
+        assert!(error.to_string().contains("ahci-cd"));
+    }
+
+    #[test]
+    fn reject_unmigratable_destination_still_rejects_fbuf() {
+        let fbuf = vec!["30,fbuf,unix=/tmp/vm.vnc".to_string()];
+
+        let err = reject_unmigratable_destination(true, &fbuf).unwrap_err();
         assert_eq!(
             err.to_string(),
             "fbuf is not supported on a migration destination"
         );
-        assert!(reject_fbuf_migration_destination(false, &fbuf).is_ok());
-        assert!(reject_fbuf_migration_destination(true, &other).is_ok());
-        assert!(reject_fbuf_migration_destination(true, &fbuf_in_config).is_ok());
+        assert!(reject_unmigratable_destination(false, &fbuf).is_ok());
+    }
+
+    #[test]
+    fn reject_unmigratable_destination_allows_normal_specs() {
+        let specs = vec![
+            "4,virtio-blk,/dev/dsk/test".to_string(),
+            "5,nvme,/tmp/fbuf".to_string(),
+        ];
+
+        assert!(reject_unmigratable_destination(true, &specs).is_ok());
+    }
+
+    #[test]
+    fn bootorder_indexes_ahci_cd() {
+        let specs = vec!["5,ahci-cd,/x.iso,bootindex=1".to_string()];
+
+        assert_eq!(
+            bootorder::build_bootorder(&specs).unwrap(),
+            b"/pci@i0cf8/pci@5,0\n"
+        );
     }
 }

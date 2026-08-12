@@ -9,6 +9,7 @@
 
 pub mod acpi;
 pub mod acpi_pm;
+pub mod ahci;
 pub mod metrics;
 pub mod aml;
 pub mod bhyve;

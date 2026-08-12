@@ -665,6 +665,250 @@ impl Aml {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn walk_aml(buf: &[u8]) -> Result<(), String> {
+    let mut walker = AmlWalker { buf, pos: 0 };
+    walker.walk_terms(buf.len())?;
+    if walker.pos != buf.len() {
+        return Err(format!(
+            "AML has {} trailing bytes at offset {}",
+            buf.len() - walker.pos,
+            walker.pos,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+struct AmlWalker<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+#[cfg(test)]
+impl AmlWalker<'_> {
+    fn fail(&self, message: &str) -> String {
+        format!("AML offset {}: {message}", self.pos)
+    }
+
+    fn read_byte(&mut self, end: usize) -> Result<u8, String> {
+        if self.pos >= end || self.pos >= self.buf.len() {
+            return Err(self.fail("unexpected end of input"));
+        }
+        let byte = self.buf[self.pos];
+        self.pos += 1;
+        Ok(byte)
+    }
+
+    fn skip(&mut self, count: usize, end: usize) -> Result<(), String> {
+        let next = self
+            .pos
+            .checked_add(count)
+            .ok_or_else(|| self.fail("offset overflow"))?;
+        if next > end || next > self.buf.len() {
+            return Err(self.fail("object exceeds enclosing package"));
+        }
+        self.pos = next;
+        Ok(())
+    }
+
+    fn package_end(&mut self, enclosing_end: usize) -> Result<usize, String> {
+        let start = self.pos;
+        let lead = self.read_byte(enclosing_end)?;
+        let follow = usize::from(lead >> 6);
+        if follow > 0 && lead & 0x30 != 0 {
+            return Err(self.fail("reserved PkgLength bits are set"));
+        }
+
+        let mut length = if follow == 0 {
+            usize::from(lead & 0x3f)
+        } else {
+            usize::from(lead & 0x0f)
+        };
+        for index in 0..follow {
+            let byte = usize::from(self.read_byte(enclosing_end)?);
+            length |= byte << (4 + index * 8);
+        }
+
+        let encoded_size = follow + 1;
+        if length < encoded_size {
+            return Err(self.fail("PkgLength ends inside its own encoding"));
+        }
+        let package_end = start
+            .checked_add(length)
+            .ok_or_else(|| self.fail("PkgLength overflow"))?;
+        if package_end > enclosing_end || package_end > self.buf.len() {
+            return Err(self.fail("PkgLength exceeds enclosing package"));
+        }
+        Ok(package_end)
+    }
+
+    fn name_string(&mut self, end: usize) -> Result<(), String> {
+        while self.pos < end && matches!(self.buf[self.pos], 0x5c | 0x5e) {
+            self.pos += 1;
+        }
+        let lead = self.read_byte(end)?;
+        match lead {
+            0x00 => Ok(()),
+            0x2e => self.skip(8, end),
+            0x2f => {
+                let segments = usize::from(self.read_byte(end)?);
+                self.skip(
+                    segments
+                        .checked_mul(4)
+                        .ok_or_else(|| self.fail("NameString overflow"))?,
+                    end,
+                )
+            }
+            _ => self.skip(3, end),
+        }
+    }
+
+    fn integer(&mut self, end: usize) -> Result<u64, String> {
+        let opcode = self.read_byte(end)?;
+        let width = match opcode {
+            AML_ZERO_OP => return Ok(0),
+            AML_ONE_OP => return Ok(1),
+            AML_BYTE_PREFIX => 1,
+            AML_WORD_PREFIX => 2,
+            AML_DWORD_PREFIX => 4,
+            AML_QWORD_PREFIX => 8,
+            _ => return Err(self.fail("expected integer object")),
+        };
+        let start = self.pos;
+        self.skip(width, end)?;
+        let mut value = 0u64;
+        for (shift, byte) in self.buf[start..self.pos].iter().enumerate() {
+            value |= u64::from(*byte) << (shift * 8);
+        }
+        Ok(value)
+    }
+
+    fn data_object(&mut self, end: usize) -> Result<(), String> {
+        if self.pos >= end {
+            return Err(self.fail("missing data object"));
+        }
+        match self.buf[self.pos] {
+            AML_ZERO_OP | AML_ONE_OP | AML_BYTE_PREFIX | AML_WORD_PREFIX
+            | AML_DWORD_PREFIX | AML_QWORD_PREFIX => {
+                self.integer(end)?;
+                Ok(())
+            }
+            AML_STRING_PREFIX => {
+                self.pos += 1;
+                let nul = self.buf[self.pos..end]
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .ok_or_else(|| self.fail("unterminated string"))?;
+                self.skip(nul + 1, end)
+            }
+            AML_PACKAGE_OP => {
+                self.pos += 1;
+                let package_end = self.package_end(end)?;
+                let elements = usize::from(self.read_byte(package_end)?);
+                for _ in 0..elements {
+                    self.data_object(package_end)?;
+                }
+                if self.pos != package_end {
+                    return Err(self.fail("Package child did not end at PkgLength"));
+                }
+                Ok(())
+            }
+            AML_BUFFER_OP => {
+                self.pos += 1;
+                let package_end = self.package_end(end)?;
+                let declared_size = self.integer(package_end)?;
+                let actual_size = package_end - self.pos;
+                if declared_size != actual_size as u64 {
+                    return Err(self.fail("Buffer size does not match PkgLength"));
+                }
+                self.pos = package_end;
+                Ok(())
+            }
+            _ => Err(self.fail("unsupported data object")),
+        }
+    }
+
+    fn term_arg(&mut self, end: usize) -> Result<(), String> {
+        if self.pos >= end {
+            return Err(self.fail("missing term argument"));
+        }
+        match self.buf[self.pos] {
+            AML_ZERO_OP | AML_ONE_OP | AML_BYTE_PREFIX | AML_WORD_PREFIX
+            | AML_DWORD_PREFIX | AML_QWORD_PREFIX | AML_STRING_PREFIX
+            | AML_PACKAGE_OP | AML_BUFFER_OP => self.data_object(end),
+            AML_LEQUAL_OP => {
+                self.pos += 1;
+                self.term_arg(end)?;
+                self.term_arg(end)
+            }
+            AML_ARG0 => {
+                self.pos += 1;
+                Ok(())
+            }
+            _ => self.name_string(end),
+        }
+    }
+
+    fn package_terms(
+        &mut self,
+        enclosing_end: usize,
+        has_name: bool,
+        has_flags: bool,
+    ) -> Result<(), String> {
+        let package_end = self.package_end(enclosing_end)?;
+        if has_name {
+            self.name_string(package_end)?;
+        }
+        if has_flags {
+            self.read_byte(package_end)?;
+        }
+        self.walk_terms(package_end)?;
+        if self.pos != package_end {
+            return Err(self.fail("child did not end at PkgLength"));
+        }
+        Ok(())
+    }
+
+    fn walk_terms(&mut self, end: usize) -> Result<(), String> {
+        while self.pos < end {
+            let opcode = self.read_byte(end)?;
+            match opcode {
+                AML_SCOPE_OP => self.package_terms(end, true, false)?,
+                AML_EXT_PREFIX => {
+                    if self.read_byte(end)? != AML_DEVICE_OP {
+                        return Err(self.fail("unsupported extended opcode"));
+                    }
+                    self.package_terms(end, true, false)?;
+                }
+                AML_METHOD_OP => self.package_terms(end, true, true)?,
+                AML_IF_OP => {
+                    let package_end = self.package_end(end)?;
+                    self.term_arg(package_end)?;
+                    self.walk_terms(package_end)?;
+                    if self.pos != package_end {
+                        return Err(self.fail("If child did not end at PkgLength"));
+                    }
+                }
+                AML_NAME_OP => {
+                    self.name_string(end)?;
+                    self.data_object(end)?;
+                }
+                AML_RETURN_OP => self.term_arg(end)?,
+                AML_STORE_OP => {
+                    self.term_arg(end)?;
+                    self.term_arg(end)?;
+                }
+                _ => return Err(self.fail("unsupported term opcode")),
+            }
+        }
+        if self.pos != end {
+            return Err(self.fail("term list crossed PkgLength boundary"));
+        }
+        Ok(())
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]

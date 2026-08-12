@@ -42,6 +42,22 @@ const SCI_INT: u16 = 9;
 /// Reset register port.
 const RESET_REG_PORT: u64 = 0x0CF9;
 
+/// MMIO resources exposed by the DSDT TPM device node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TpmDevice {
+    pub crb_base: u32,
+    pub crb_len: u32,
+}
+
+/// ACPI-visible description of a configured vTPM. The TPM2 table and the
+/// DSDT device node are both derived from this one value, so "table but no
+/// node" is unrepresentable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TpmAcpi {
+    pub table: Vec<u8>,
+    pub device: TpmDevice,
+}
+
 // ── ACPI table header ─────────────────────────────────────────────
 
 const ACPI_HDR_SIZE: usize = 36;
@@ -145,7 +161,7 @@ fn build_facs() -> Vec<u8> {
 /// - PCI host bridge (PCI0) with bus resources and interrupt routing
 /// - HPET device
 /// - ISA/LPC bridge with COM1, COM2, PIC, Timer, and RTC devices
-fn build_dsdt() -> Vec<u8> {
+fn build_dsdt(tpm: Option<TpmDevice>) -> Vec<u8> {
     use crate::aml::{Aml, AmlValue};
 
     let mut aml = Aml::new();
@@ -337,6 +353,10 @@ fn build_dsdt() -> Vec<u8> {
                 });
             });
         });
+
+        if let Some(t) = tpm {
+            emit_tpm_device(sb, t);
+        }
     });
 
     // ── Wrap in DSDT header ────────────────────────────────────
@@ -347,6 +367,18 @@ fn build_dsdt() -> Vec<u8> {
     buf.extend_from_slice(&aml_body);
     fix_checksum(&mut buf, 0, total_length);
     buf
+}
+
+fn emit_tpm_device(parent: &mut crate::aml::Aml, tpm: TpmDevice) {
+    use crate::aml::AmlValue;
+
+    parent.device("TPM", |device| {
+        device.name_val("_HID", AmlValue::String("MSFT0101"));
+        device.name_val("_STA", AmlValue::Byte(0x0F));
+        device.name_resource_template("_CRS", |resources| {
+            resources.memory32_fixed(tpm.crb_base, tpm.crb_len);
+        });
+    });
 }
 
 // ── FADT ──────────────────────────────────────────────────────────
@@ -877,20 +909,21 @@ pub fn generate_acpi_tables(num_cpus: u32) -> AcpiTables {
     generate_acpi_tables_inner(num_cpus, None)
 }
 
-/// Variant of `generate_acpi_tables` that includes a TPM2 ACPI
-/// table. Used when the VM is booted with `--vtpm`. `tpm2_table`
-/// should be the bytes from `vmm_tpm::build_tpm2_table()`.
+/// Variant of `generate_acpi_tables` that includes a TPM2 ACPI table and
+/// its matching DSDT device node. Used when the VM is booted with `--vtpm`.
 pub fn generate_acpi_tables_with_tpm2(
     num_cpus: u32,
-    tpm2_table: Option<Vec<u8>>,
+    tpm: Option<TpmAcpi>,
 ) -> AcpiTables {
-    generate_acpi_tables_inner(num_cpus, tpm2_table)
+    generate_acpi_tables_inner(num_cpus, tpm)
 }
 
 fn generate_acpi_tables_inner(
     num_cpus: u32,
-    tpm2_table: Option<Vec<u8>>,
+    tpm: Option<TpmAcpi>,
 ) -> AcpiTables {
+    let tpm_device = tpm.as_ref().map(|t| t.device);
+    let tpm2_table = tpm.map(|t| t.table);
     let base = BHYVE_ACPI_BASE;
     let mut blob = Vec::new();
 
@@ -914,7 +947,7 @@ fn generate_acpi_tables_inner(
 
     // DSDT
     let dsdt_offset = blob.len();
-    let dsdt = build_dsdt();
+    let dsdt = build_dsdt(tpm_device);
     blob.extend_from_slice(&dsdt);
     let dsdt_gpa = base + dsdt_offset as u64;
 
@@ -1101,27 +1134,29 @@ pub fn generate_acpi_layout(num_cpus: u32) -> AcpiLayout {
     generate_acpi_layout_inner(num_cpus, None, None)
 }
 
-/// Generate ACPI layout with an optional TPM2 ACPI table.
-///
-/// `tpm2_table` should be the bytes produced by
-/// `vmm_tpm::build_tpm2_table()` (or any other TPM2-shaped table).
-/// Pass `None` when no TPM is configured. The TPM2 table goes
-/// between SPCR and RSDT in the layout, gets its checksum recomputed
-/// by the firmware via the table-loader, and is added to the
-/// RSDT/XSDT pointer arrays.
+/// Generate ACPI layout with an optional TPM2 ACPI table and matching DSDT
+/// device node. The TPM2 table goes between SPCR and RSDT in the layout,
+/// gets its checksum recomputed by the firmware via the table-loader, and
+/// is added to the RSDT/XSDT pointer arrays.
 pub fn generate_acpi_layout_with_tpm2(
     num_cpus: u32,
     dsdt_override: Option<Vec<u8>>,
-    tpm2_table: Option<Vec<u8>>,
+    tpm: Option<TpmAcpi>,
 ) -> AcpiLayout {
-    generate_acpi_layout_inner(num_cpus, dsdt_override, tpm2_table)
+    generate_acpi_layout_inner(num_cpus, dsdt_override, tpm)
 }
 
 fn generate_acpi_layout_inner(
     num_cpus: u32,
     dsdt_override: Option<Vec<u8>>,
-    tpm2_table: Option<Vec<u8>>,
+    tpm: Option<TpmAcpi>,
 ) -> AcpiLayout {
+    assert!(
+        dsdt_override.is_none() || tpm.is_none(),
+        "DSDT override cannot be combined with a vTPM",
+    );
+    let tpm_device = tpm.as_ref().map(|t| t.device);
+    let tpm2_table = tpm.map(|t| t.table);
     let mut tables = Vec::new();
 
     // Layout order in the tables blob:
@@ -1137,7 +1172,7 @@ fn generate_acpi_layout_inner(
 
     // DSDT (self-contained, no cross-table pointers)
     let dsdt_offset = tables.len();
-    let dsdt = dsdt_override.unwrap_or_else(build_dsdt);
+    let dsdt = dsdt_override.unwrap_or_else(|| build_dsdt(tpm_device));
     let dsdt_size = dsdt.len();
     tables.extend_from_slice(&dsdt);
 
@@ -1569,10 +1604,157 @@ pub fn generate_table_loader(layout: &AcpiLayout) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aml::{walk_aml, Aml};
+
+    const TEST_TPM_DEVICE: TpmDevice = TpmDevice {
+        crb_base: 0xFED4_0000,
+        crb_len: 0x1000,
+    };
+    const TPM_HID_AML: &[u8] = b"\x0dMSFT0101\0";
+    const TPM_DEVICE_AML: [u8; 55] = [
+        0x5B, 0x82, 0x35,
+        b'T', b'P', b'M', b'_',
+        0x08, b'_', b'H', b'I', b'D', 0x0D,
+        b'M', b'S', b'F', b'T', b'0', b'1', b'0', b'1', 0x00,
+        0x08, b'_', b'S', b'T', b'A', 0x0A, 0x0F,
+        0x08, b'_', b'C', b'R', b'S', 0x11, 0x14,
+        0x0C, 0x0E, 0x00, 0x00, 0x00,
+        0x86, 0x09, 0x00, 0x01,
+        0x00, 0x00, 0xD4, 0xFE,
+        0x00, 0x10, 0x00, 0x00,
+        0x79, 0x00,
+    ];
 
     /// Verify that the sum of all bytes in a range is 0 mod 256.
     fn verify_checksum(data: &[u8]) -> bool {
         data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b)) == 0
+    }
+
+    fn test_tpm_acpi() -> TpmAcpi {
+        let mut table = vec![0u8; 76];
+        table[0..4].copy_from_slice(b"TPM2");
+        table[4..8].copy_from_slice(&76u32.to_le_bytes());
+        let control_area = u64::from(TEST_TPM_DEVICE.crb_base) + 0x40;
+        table[40..48].copy_from_slice(&control_area.to_le_bytes());
+        TpmAcpi {
+            table,
+            device: TEST_TPM_DEVICE,
+        }
+    }
+
+    fn contains_tpm_hid(buf: &[u8]) -> bool {
+        buf.windows(TPM_HID_AML.len())
+            .any(|window| window == TPM_HID_AML)
+    }
+
+    fn tpm_crs_window(buf: &[u8], expected_base: u32) -> (u32, u32) {
+        for descriptor in buf.windows(12) {
+            if descriptor[0] != 0x86 {
+                continue;
+            }
+            let base = u32::from_le_bytes(descriptor[4..8].try_into().unwrap());
+            if base != expected_base {
+                continue;
+            }
+            assert_eq!(
+                u16::from_le_bytes(descriptor[1..3].try_into().unwrap()),
+                9,
+            );
+            let len = u32::from_le_bytes(descriptor[8..12].try_into().unwrap());
+            return (base, len);
+        }
+        panic!("TPM Memory32Fixed descriptor not found");
+    }
+
+    #[test]
+    fn tpm_device_node_exact_bytes() {
+        let mut aml = Aml::new();
+        emit_tpm_device(&mut aml, TEST_TPM_DEVICE);
+        assert_eq!(aml.into_bytes().as_slice(), TPM_DEVICE_AML.as_slice());
+    }
+
+    #[test]
+    fn dsdt_structure_valid() {
+        for tpm in [None, Some(TEST_TPM_DEVICE)] {
+            let dsdt = build_dsdt(tpm);
+            let header_len =
+                u32::from_le_bytes(dsdt[4..8].try_into().unwrap()) as usize;
+            assert_eq!(header_len, dsdt.len());
+            assert!(verify_checksum(&dsdt));
+            walk_aml(&dsdt[ACPI_HDR_SIZE..]).unwrap();
+        }
+    }
+
+    #[test]
+    fn dsdt_tpm_node_gated() {
+        assert!(!contains_tpm_hid(&build_dsdt(None)));
+        assert!(contains_tpm_hid(&build_dsdt(Some(TEST_TPM_DEVICE))));
+    }
+
+    #[test]
+    fn dsdt_tpm_node_costs_55_bytes() {
+        let without_tpm = build_dsdt(None);
+        let with_tpm = build_dsdt(Some(TEST_TPM_DEVICE));
+        assert_eq!(with_tpm.len() - without_tpm.len(), TPM_DEVICE_AML.len());
+    }
+
+    #[test]
+    fn dsdt_tpm_crs_covers_control_area() {
+        let dsdt = build_dsdt(Some(TEST_TPM_DEVICE));
+        let (base, len) = tpm_crs_window(&dsdt, TEST_TPM_DEVICE.crb_base);
+        let control_area = base + 0x40;
+        assert!(base <= control_area);
+        assert!(control_area + 0x38 <= base + len);
+        assert_eq!(len, TEST_TPM_DEVICE.crb_len);
+    }
+
+    #[test]
+    fn layout_tpm2_and_dsdt_agree() {
+        let layout = generate_acpi_layout_with_tpm2(
+            2,
+            None,
+            Some(test_tpm_acpi()),
+        );
+        assert!(layout.tpm2_size > 0);
+        let dsdt = &layout.tables
+            [layout.dsdt_offset..layout.dsdt_offset + layout.dsdt_size];
+        assert!(contains_tpm_hid(dsdt));
+        let (base, len) = tpm_crs_window(dsdt, TEST_TPM_DEVICE.crb_base);
+        let control_area = u64::from_le_bytes(
+            layout.tables[layout.tpm2_offset + 40..layout.tpm2_offset + 48]
+                .try_into()
+                .unwrap(),
+        );
+        assert!(control_area >= u64::from(base));
+        assert!(control_area + 0x38 <= u64::from(base) + u64::from(len));
+
+        let without_tpm = generate_acpi_layout_with_tpm2(2, None, None);
+        assert_eq!(without_tpm.tpm2_size, 0);
+        let dsdt = &without_tpm.tables[
+            without_tpm.dsdt_offset..without_tpm.dsdt_offset + without_tpm.dsdt_size
+        ];
+        assert!(!contains_tpm_hid(dsdt));
+    }
+
+    #[test]
+    fn legacy_tables_carry_tpm_node() {
+        let tables = generate_acpi_tables_with_tpm2(2, Some(test_tpm_acpi()));
+        assert!(tables.data.windows(4).any(|window| window == b"TPM2"));
+        assert!(contains_tpm_hid(&tables.data));
+
+        let without_tpm = generate_acpi_tables_with_tpm2(2, None);
+        assert!(!without_tpm.data.windows(4).any(|window| window == b"TPM2"));
+        assert!(!contains_tpm_hid(&without_tpm.data));
+    }
+
+    #[test]
+    #[should_panic(expected = "DSDT override cannot be combined with a vTPM")]
+    fn layout_rejects_tpm_with_dsdt_override() {
+        generate_acpi_layout_with_tpm2(
+            1,
+            Some(build_dsdt(None)),
+            Some(test_tpm_acpi()),
+        );
     }
 
     #[test]
@@ -1586,14 +1768,14 @@ mod tests {
 
     #[test]
     fn dsdt_checksum() {
-        let dsdt = build_dsdt();
+        let dsdt = build_dsdt(None);
         assert_eq!(&dsdt[0..4], b"DSDT");
         assert!(verify_checksum(&dsdt));
     }
 
     #[test]
     fn dsdt_has_aml_body() {
-        let dsdt = build_dsdt();
+        let dsdt = build_dsdt(None);
         // The new DSDT should be larger than just the header
         assert!(
             dsdt.len() > ACPI_HDR_SIZE,
@@ -1609,7 +1791,7 @@ mod tests {
 
     #[test]
     fn dsdt_contains_scope_op() {
-        let dsdt = build_dsdt();
+        let dsdt = build_dsdt(None);
         let body = &dsdt[ACPI_HDR_SIZE..];
         // The AML body should contain a ScopeOp (0x10) for \_SB
         assert!(
@@ -1620,7 +1802,7 @@ mod tests {
 
     #[test]
     fn dsdt_contains_device_ops() {
-        let dsdt = build_dsdt();
+        let dsdt = build_dsdt(None);
         let body = &dsdt[ACPI_HDR_SIZE..];
         // DeviceOp is ExtPrefix(0x5B) + 0x82
         let has_device = body.windows(2).any(|w| w == [0x5B, 0x82]);
@@ -1632,7 +1814,7 @@ mod tests {
 
     #[test]
     fn dsdt_contains_pci_eisa_id() {
-        let dsdt = build_dsdt();
+        let dsdt = build_dsdt(None);
         // PNP0A03 EISA ID = 0x030AD041 in LE bytes: [0x41, 0xD0, 0x0A, 0x03]
         let eisa_bytes = 0x030AD041u32.to_le_bytes();
         let has_pci_id = dsdt.windows(4).any(|w| w == eisa_bytes);
@@ -1644,7 +1826,7 @@ mod tests {
 
     #[test]
     fn dsdt_contains_uart_eisa_id() {
-        let dsdt = build_dsdt();
+        let dsdt = build_dsdt(None);
         // PNP0501 EISA ID = 0x0105D041
         let eisa_bytes = 0x0105D041u32.to_le_bytes();
         let count = dsdt.windows(4).filter(|w| *w == eisa_bytes).count();
@@ -1658,7 +1840,7 @@ mod tests {
 
     #[test]
     fn dsdt_contains_ps2_eisa_ids() {
-        let dsdt = build_dsdt();
+        let dsdt = build_dsdt(None);
         let keyboard_id = 0x0303D041u32.to_le_bytes();
         let mouse_id = 0x130FD041u32.to_le_bytes();
 
@@ -1674,7 +1856,7 @@ mod tests {
 
     #[test]
     fn dsdt_contains_hpet_address() {
-        let dsdt = build_dsdt();
+        let dsdt = build_dsdt(None);
         let hpet_bytes = HPET_ADDR.to_le_bytes();
         let has_hpet = dsdt.windows(4).any(|w| w == hpet_bytes);
         assert!(
@@ -1686,7 +1868,7 @@ mod tests {
 
     #[test]
     fn dsdt_contains_com1_port() {
-        let dsdt = build_dsdt();
+        let dsdt = build_dsdt(None);
         // COM1 at 0x3F8
         let port_bytes = 0x03F8u16.to_le_bytes();
         let has_com1 = dsdt.windows(2).any(|w| w == port_bytes);
@@ -2195,7 +2377,14 @@ mod tests {
         tpm2[0..4].copy_from_slice(b"TPM2");
         tpm2[4..8].copy_from_slice(&76u32.to_le_bytes());
 
-        let layout = generate_acpi_layout_with_tpm2(2, None, Some(tpm2.clone()));
+        let layout = generate_acpi_layout_with_tpm2(
+            2,
+            None,
+            Some(TpmAcpi {
+                table: tpm2.clone(),
+                device: TEST_TPM_DEVICE,
+            }),
+        );
         assert_eq!(layout.tpm2_size, 76);
         assert!(layout.tpm2_offset > layout.spcr_offset);
 

@@ -32,6 +32,31 @@ const VECTOR_CTRL_MASK: u32 = 1;
 const MSG_CTRL_ENABLE: u16 = 1 << 15;
 const MSG_CTRL_FUNC_MASK: u16 = 1 << 14;
 
+/// Byte offset of the PBA within the MSI-X BAR for `count` vectors.
+///
+/// PCI 3.0 section 6.8.2 forbids the table and the PBA from sharing a
+/// naturally aligned 4 KiB region, so the PBA starts at the first page
+/// boundary past the table.
+fn pba_offset_for(count: u16) -> usize {
+    ((count as usize * ENTRY_SIZE) + 0xFFF) & !0xFFF
+}
+
+/// Bytes the PBA occupies for `count` vectors (one bit per vector).
+fn pba_bytes_for(count: u16) -> usize {
+    (count as usize + 7) / 8
+}
+
+/// BAR size that contains both the table and the PBA.
+///
+/// Sizing from the table length alone puts the PBA past the end of its
+/// own BAR; Windows rejects that capability and leaves stornvme.sys with
+/// no interrupt resource, so StartDevice fails.
+fn bar_size_for(count: u16) -> usize {
+    (pba_offset_for(count) + pba_bytes_for(count))
+        .next_power_of_two()
+        .max(4096)
+}
+
 /// A single MSI-X vector entry.
 #[derive(Debug, Clone, Copy)]
 struct MsixEntry {
@@ -60,6 +85,9 @@ impl Default for MsixEntry {
 pub struct MsixTable {
     inner: Mutex<MsixInner>,
     hdl: Arc<VmmHdl>,
+    /// Fixed at construction; cached outside the lock so the BAR decode
+    /// path can compute the PBA offset without contending on the mutex.
+    count: u16,
 }
 
 struct MsixInner {
@@ -85,13 +113,13 @@ impl MsixTable {
                 pba: vec![0; pba_qwords],
             }),
             hdl,
+            count,
         }
     }
 
     /// Number of vectors in the table.
     pub fn count(&self) -> u16 {
-        let inner = self.inner.lock().expect("msix lock");
-        inner.entries.len() as u16
+        self.count
     }
 
     /// Fire an MSI-X interrupt for the given vector.
@@ -239,6 +267,14 @@ impl MsixTable {
         }
     }
 
+    /// Byte offset of the PBA within the MSI-X BAR.
+    ///
+    /// Single source of truth: BAR decode and the capability structure must
+    /// agree or the PBA is unreachable.
+    pub fn pba_offset(&self) -> usize {
+        pba_offset_for(self.count)
+    }
+
     // ── Config space capability reads/writes ────────────────────
 
     /// Read the MSI-X capability structure (12 bytes starting at `cap_offset`).
@@ -273,13 +309,8 @@ impl MsixTable {
                 // Table in BAR4 at offset 0
                 Some(4) // BIR = 4 (BAR4), offset = 0
             }
-            // Bytes 8-11: PBA Offset/BIR
-            8 => {
-                // PBA in BAR4, after the table
-                let table_bytes = inner.entries.len() * ENTRY_SIZE;
-                let pba_offset = ((table_bytes + 0xFFF) & !0xFFF) as u32; // page-align
-                Some(pba_offset | 4) // BIR = 4, offset = page-aligned after table
-            }
+            // Bytes 8-11: PBA Offset/BIR (BIR = 4)
+            8 => Some(pba_offset_for(self.count) as u32 | 4),
             _ => None,
         }
     }
@@ -302,12 +333,7 @@ impl MsixTable {
 
     /// Total BAR size needed for MSI-X table + PBA.
     pub fn bar_size(&self) -> usize {
-        let inner = self.inner.lock().expect("msix lock");
-        let table_bytes = inner.entries.len() * ENTRY_SIZE;
-        let pba_bytes = (inner.entries.len() + 7) / 8;
-        let total = table_bytes + pba_bytes;
-        // Round up to next power of 2, minimum 4K
-        total.next_power_of_two().max(4096)
+        bar_size_for(self.count)
     }
 }
 
@@ -324,13 +350,22 @@ mod tests {
     }
 
     #[test]
-    fn bar_size_minimum_4k() {
-        // Need a VmmHdl for MsixTable, so test the math directly
-        let count = 4u16;
-        let table_bytes = count as usize * ENTRY_SIZE;
-        let pba_bytes = (count as usize + 7) / 8;
-        let total = table_bytes + pba_bytes;
-        assert!(total.next_power_of_two().max(4096) >= 4096);
+    fn pba_lies_inside_bar() {
+        for count in [1u16, 2, 4, 8, 16, 17, 32, 64, 255, 256, 257, 1024, 2048] {
+            let end = pba_offset_for(count) + pba_bytes_for(count);
+            let size = bar_size_for(count);
+            assert!(end <= size, "count {count}: pba ends {end:#x}, bar {size:#x}");
+            assert!(size.is_power_of_two(), "count {count}: bar {size:#x}");
+            assert!(size >= 4096, "count {count}: bar {size:#x}");
+        }
+    }
+
+    #[test]
+    fn nvme_vector_count_needs_8k_bar() {
+        // 17 vectors: 272 B table, PBA page-aligned to 0x1000, BAR must reach it.
+        assert_eq!(pba_offset_for(17), 0x1000);
+        assert_eq!(pba_bytes_for(17), 3);
+        assert_eq!(bar_size_for(17), 0x2000);
     }
 
     #[test]
