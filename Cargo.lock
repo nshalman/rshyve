@@ -63,9 +63,15 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
+name = "ascii"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
 
 [[package]]
 name = "autocfg"
@@ -833,6 +839,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1517,7 +1532,7 @@ dependencies = [
  "futures-util",
  "log",
  "tokio",
- "tungstenite 0.21.0",
+ "tungstenite",
 ]
 
 [[package]]
@@ -1577,24 +1592,6 @@ dependencies = [
  "sha1",
  "thiserror 1.0.69",
  "url",
- "utf-8",
-]
-
-[[package]]
-name = "tungstenite"
-version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18e5b8366ee7a95b16d32197d0b2604b43a0be89dc5fac9f8e96ccafbaedda8a"
-dependencies = [
- "byteorder",
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand",
- "sha1",
- "thiserror 1.0.69",
  "utf-8",
 ]
 
@@ -1756,6 +1753,7 @@ dependencies = [
  "clap",
  "futures",
  "libc",
+ "memmap2",
  "serde",
  "serde_json",
  "slog",
@@ -1770,6 +1768,7 @@ dependencies = [
  "vmm_devices",
  "vmm_hyperv",
  "vmm_migrate",
+ "vmm_tpm",
 ]
 
 [[package]]
@@ -1811,6 +1810,7 @@ dependencies = [
  "bitflags",
  "libc",
  "slog",
+ "tempfile",
  "thiserror 1.0.69",
  "usdt",
 ]
@@ -1820,6 +1820,7 @@ name = "vmm_devices"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ascii",
  "bhyve_api",
  "bitflags",
  "des",
@@ -1827,6 +1828,7 @@ dependencies = [
  "futures",
  "libc",
  "serde",
+ "serde_json",
  "slog",
  "tempfile",
  "thiserror 1.0.69",
@@ -1861,7 +1863,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",
- "tungstenite 0.24.0",
+ "tungstenite",
  "vmm_core",
  "vmm_devices",
  "zstd",

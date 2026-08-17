@@ -2,7 +2,7 @@
 
 ## What it is
 
-A new Rust-based bhyve userspace VMM, replacing the existing C `bhyve` command. Designed for live migration as a first-class feature, with CLI compatibility for vmadm/boot.c integration. Architecture informed by Oxide's propolis, purpose-built for Triton.
+A new Rust-based bhyve userspace VMM, replacing the existing C `bhyve` command. Designed for live migration as a first-class feature, with CLI compatibility for vmadm/boot.c integration. Built on [Oxide's Propolis](https://github.com/oxidecomputer/propolis) (MPL-2.0) and purpose-built for Triton: the bhyve and viona kernel bindings, the address space manager, and the PS/2 models come from there largely unchanged. See NOTICE and THIRD_PARTY.md.
 
 ## What works today
 
@@ -16,7 +16,7 @@ A new Rust-based bhyve userspace VMM, replacing the existing C `bhyve` command. 
 
 **Devices:** i440fx chipset, NVMe controller (async I/O, zero-copy preadv/pwritev, 8 worker threads), virtio-blk, virtio-net (viona kernel-accelerated with interrupt polling), virtio-rng, framebuffer/VNC (Unix socket), xHCI USB tablet, PCI passthrough (Intel VT-d + AMD IOMMU), dual 16550 UARTs (256-byte FIFO), ACPI tables (table-loader + legacy), SMBIOS 2.8 (SmartDC HVM), fw_cfg, E820, bhyve kernel devices (LAPIC, IOAPIC, ATPIC, ATPIT, HPET, RTC, PM timer), ACPI PM1 registers.
 
-**Live migration** — WebSocket protocol with iterative dirty page transfer. Works same-host and cross-host with TSC frequency scaling. CPU feature compatibility check rejects incompatible migrations. CPUID masking (`--cpu-baseline avx2`) for cross-generation migration.
+**Live migration** — Experimental. WebSocket protocol with iterative dirty page transfer. Works same-host and cross-host with TSC frequency scaling. CPUID masking (`--cpu-baseline avx2`) for cross-generation migration. The destination compares CPU features at the preamble but **warns and continues** on a mismatch rather than rejecting it, FPU/XSAVE state is not transferred, and the transport is neither authenticated nor encrypted. See [SECURITY.md](SECURITY.md).
 
 **Metadata agent** — Built-in SmartOS mdata V2 protocol on COM2 for testing. Serves sdc:nics, sdc:hostname, sdc:resolvers, SSH keys. Cloud-init SmartOS datasource detects via SMBIOS and configures network automatically. In production, the external metadata agent is used instead.
 

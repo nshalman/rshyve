@@ -10,6 +10,8 @@
 //! Windows otherwise uses; this is the largest single perf win in the
 //! Tier 1 enlightenment set.
 
+use std::mem::size_of;
+
 use crate::overlay::PAGE_SIZE;
 
 /// REFERENCE_TSC MSR layout (same shape as HYPERCALL — see TLFS 12.7.1).
@@ -52,7 +54,7 @@ impl ReferenceTscPage {
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 &self as *const Self as *const u8,
-                std::mem::size_of::<Self>(),
+                size_of::<Self>(),
             )
         };
         page[..bytes.len()].copy_from_slice(bytes);
@@ -118,7 +120,7 @@ mod tests {
     #[test]
     fn page_layout_matches_tlfs() {
         // sequence=4, reserved=4, scale=8, offset=8 → 24 bytes.
-        assert_eq!(std::mem::size_of::<ReferenceTscPage>(), 24);
+        assert_eq!(size_of::<ReferenceTscPage>(), 24);
     }
 
     #[test]

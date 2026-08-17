@@ -42,7 +42,8 @@ fn main() {
     // sibling lib's build script is exposed as `DEP_<LINK>_<KEY>`
     // env, but only when the consumer's build.rs runs *after* the
     // producer's, and we don't want to take a hard order dependency.
-    let pkgconfig = std::env::var("PKG_CONFIG").unwrap_or_else(|_| "pkg-config".into());
+    let pkgconfig =
+        std::env::var("PKG_CONFIG").unwrap_or_else(|_| "pkg-config".into());
     if let Ok(out) = Command::new(&pkgconfig)
         .args(["--libs-only-L", "openssl"])
         .output()

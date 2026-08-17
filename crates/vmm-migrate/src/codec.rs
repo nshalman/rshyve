@@ -16,6 +16,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::limits;
+
 /// Message types in the migration protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -108,8 +110,8 @@ impl From<std::io::Error> for MigrateError {
     }
 }
 
-impl From<tokio_tungstenite::tungstenite::Error> for MigrateError {
-    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
+impl From<tungstenite::Error> for MigrateError {
+    fn from(e: tungstenite::Error) -> Self {
         Self::WebSocket(e.to_string())
     }
 }
@@ -200,7 +202,9 @@ pub struct VirtioQueueState {
     pub pci_state: Option<VirtioMigratePciState>,
 }
 
-fn default_msix_no_vector() -> u16 { 0xFFFF }
+fn default_msix_no_vector() -> u16 {
+    0xFFFF
+}
 
 /// NVMe controller state for migration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -323,10 +327,7 @@ pub enum Message {
     /// Request specific pages by GPA list.
     MemFetch(Vec<u64>),
     /// Page data transfer header (GPA + count).
-    MemXfer {
-        gpa: u64,
-        count: u32,
-    },
+    MemXfer { gpa: u64, count: u32 },
     /// End of memory transfer phase.
     MemEnd,
     /// Memory transfer complete acknowledgement.
@@ -350,7 +351,7 @@ impl Message {
     /// Encode this message into a WebSocket binary frame.
     ///
     /// Format: `[payload bytes...][tag byte]`
-    pub fn encode(&self) -> tokio_tungstenite::tungstenite::Message {
+    pub fn encode(&self) -> tungstenite::Message {
         let (tag, payload) = match self {
             Message::Okay => (MessageType::Okay, Vec::new()),
             Message::Error(e) => {
@@ -375,9 +376,8 @@ impl Message {
                     .unwrap_or_else(|_| "()".to_string());
                 let region_bytes = region_data.as_bytes();
                 let len_bytes = (region_bytes.len() as u32).to_le_bytes();
-                let mut payload = Vec::with_capacity(
-                    4 + region_bytes.len() + bitmap.len(),
-                );
+                let mut payload =
+                    Vec::with_capacity(4 + region_bytes.len() + bitmap.len());
                 payload.extend_from_slice(&len_bytes);
                 payload.extend_from_slice(region_bytes);
                 payload.extend_from_slice(bitmap);
@@ -396,7 +396,12 @@ impl Message {
             }
             Message::MemEnd => (MessageType::MemEnd, Vec::new()),
             Message::MemDone => (MessageType::MemDone, Vec::new()),
-            Message::PageBatch { base_gpa, page_count, flags, ref data } => {
+            Message::PageBatch {
+                base_gpa,
+                page_count,
+                flags,
+                ref data,
+            } => {
                 let mut payload = Vec::with_capacity(16 + data.len());
                 payload.extend_from_slice(&base_gpa.to_le_bytes());
                 payload.extend_from_slice(&page_count.to_le_bytes());
@@ -409,16 +414,14 @@ impl Message {
 
         let mut frame = payload;
         frame.push(tag as u8);
-        tokio_tungstenite::tungstenite::Message::Binary(frame)
+        tungstenite::Message::Binary(frame)
     }
 
     /// Decode a WebSocket binary frame into a Message.
-    pub fn decode(
-        ws_msg: tokio_tungstenite::tungstenite::Message,
-    ) -> Result<Self, MigrateError> {
+    pub fn decode(ws_msg: tungstenite::Message) -> Result<Self, MigrateError> {
         let data = match ws_msg {
-            tokio_tungstenite::tungstenite::Message::Binary(d) => d,
-            tokio_tungstenite::tungstenite::Message::Close(_) => {
+            tungstenite::Message::Binary(d) => d,
+            tungstenite::Message::Close(_) => {
                 return Err(MigrateError::WebSocket(
                     "connection closed".to_string(),
                 ));
@@ -483,13 +486,14 @@ impl Message {
                         "MemOffer truncated region data".to_string(),
                     ));
                 }
-                let region_text =
-                    std::str::from_utf8(&payload[4..4 + region_len])
-                        .map_err(|e| {
-                            MigrateError::Codec(format!(
-                                "invalid UTF-8 in MemOffer region: {e}"
-                            ))
-                        })?;
+                let region_text = std::str::from_utf8(
+                    &payload[4..4 + region_len],
+                )
+                .map_err(|e| {
+                    MigrateError::Codec(format!(
+                        "invalid UTF-8 in MemOffer region: {e}"
+                    ))
+                })?;
                 let region: MemRegionDesc = ron::from_str(region_text)?;
                 let bitmap = payload[4 + region_len..].to_vec();
                 Ok(Message::MemOffer { region, bitmap })
@@ -499,6 +503,12 @@ impl Message {
                     MigrateError::Codec(format!("invalid UTF-8: {e}"))
                 })?;
                 let gpas: Vec<u64> = ron::from_str(text)?;
+                if gpas.len() > limits::MAX_SPARSE_GPAS {
+                    return Err(MigrateError::Codec(format!(
+                        "MemFetch has too many GPAs: {}",
+                        gpas.len(),
+                    )));
+                }
                 Ok(Message::MemFetch(gpas))
             }
             MessageType::MemXfer => {
@@ -507,16 +517,13 @@ impl Message {
                         "MemXfer too short".to_string(),
                     ));
                 }
-                let gpa = u64::from_le_bytes(
-                    payload[..8].try_into().map_err(|_| {
-                        MigrateError::Codec("MemXfer gpa".to_string())
-                    })?,
-                );
-                let count = u32::from_le_bytes(
-                    payload[8..12].try_into().map_err(|_| {
-                        MigrateError::Codec("MemXfer count".to_string())
-                    })?,
-                );
+                let gpa = u64::from_le_bytes(payload[..8].try_into().map_err(
+                    |_| MigrateError::Codec("MemXfer gpa".to_string()),
+                )?);
+                let count =
+                    u32::from_le_bytes(payload[8..12].try_into().map_err(
+                        |_| MigrateError::Codec("MemXfer count".to_string()),
+                    )?);
                 Ok(Message::MemXfer { gpa, count })
             }
             MessageType::MemEnd => Ok(Message::MemEnd),
@@ -527,17 +534,29 @@ impl Message {
                         "PageBatch too short for header".to_string(),
                     ));
                 }
-                let base_gpa = u64::from_le_bytes(
-                    payload[..8].try_into().unwrap(),
-                );
-                let page_count = u32::from_le_bytes(
-                    payload[8..12].try_into().unwrap(),
-                );
-                let flags = u32::from_le_bytes(
-                    payload[12..16].try_into().unwrap(),
-                );
+                let base_gpa =
+                    u64::from_le_bytes(payload[..8].try_into().unwrap());
+                let page_count =
+                    u32::from_le_bytes(payload[8..12].try_into().unwrap());
+                let flags =
+                    u32::from_le_bytes(payload[12..16].try_into().unwrap());
+                if page_count == 0 || page_count > limits::MAX_PAGES_PER_BATCH {
+                    return Err(MigrateError::Codec(format!(
+                        "invalid PageBatch page count: {page_count}",
+                    )));
+                }
+                if flags & !PAGE_BATCH_FLAG_ZSTD != 0 {
+                    return Err(MigrateError::Codec(format!(
+                        "unknown PageBatch flags: {flags:#x}",
+                    )));
+                }
                 let data = payload[16..].to_vec();
-                Ok(Message::PageBatch { base_gpa, page_count, flags, data })
+                Ok(Message::PageBatch {
+                    base_gpa,
+                    page_count,
+                    flags,
+                    data,
+                })
             }
             MessageType::PauseSignal => Ok(Message::PauseSignal),
         }
@@ -545,9 +564,8 @@ impl Message {
 
     /// Encode a serializable value as a Serialized message.
     pub fn serialized<T: Serialize>(val: &T) -> Result<Self, MigrateError> {
-        let data = ron::ser::to_string(val).map_err(|e| {
-            MigrateError::Codec(format!("RON serialize: {e}"))
-        })?;
+        let data = ron::ser::to_string(val)
+            .map_err(|e| MigrateError::Codec(format!("RON serialize: {e}")))?;
         Ok(Message::Serialized(data.into_bytes()))
     }
 
@@ -555,9 +573,8 @@ impl Message {
     pub fn deserialize<T: for<'de> Deserialize<'de>>(
         data: &[u8],
     ) -> Result<T, MigrateError> {
-        let text = std::str::from_utf8(data).map_err(|e| {
-            MigrateError::Codec(format!("invalid UTF-8: {e}"))
-        })?;
+        let text = std::str::from_utf8(data)
+            .map_err(|e| MigrateError::Codec(format!("invalid UTF-8: {e}")))?;
         let val: T = ron::from_str(text)?;
         Ok(val)
     }
@@ -691,7 +708,10 @@ mod tests {
 
     #[test]
     fn roundtrip_mem_offer() {
-        let region = MemRegionDesc { gpa: 0x1000, len: 0x8000 };
+        let region = MemRegionDesc {
+            gpa: 0x1000,
+            len: 0x8000,
+        };
         let bitmap = vec![0xFF, 0x01];
         let msg = Message::MemOffer {
             region: region.clone(),
@@ -722,8 +742,17 @@ mod tests {
     }
 
     #[test]
+    fn decode_mem_fetch_rejects_too_many_gpas() {
+        let msg = Message::MemFetch(vec![0; limits::MAX_SPARSE_GPAS + 1]);
+        assert!(Message::decode(msg.encode()).is_err());
+    }
+
+    #[test]
     fn roundtrip_mem_xfer() {
-        let msg = Message::MemXfer { gpa: 0xDEAD_0000, count: 42 };
+        let msg = Message::MemXfer {
+            gpa: 0xDEAD_0000,
+            count: 42,
+        };
         let out = roundtrip(&msg);
         match out {
             Message::MemXfer { gpa, count } => {
@@ -736,8 +765,7 @@ mod tests {
 
     #[test]
     fn decode_empty_frame_fails() {
-        let ws =
-            tokio_tungstenite::tungstenite::Message::Binary(Vec::new());
+        let ws = tungstenite::Message::Binary(Vec::new());
         let result = Message::decode(ws);
         assert!(result.is_err());
     }
@@ -753,7 +781,12 @@ mod tests {
         };
         let out = roundtrip(&msg);
         match out {
-            Message::PageBatch { base_gpa, page_count, flags, data: d } => {
+            Message::PageBatch {
+                base_gpa,
+                page_count,
+                flags,
+                data: d,
+            } => {
                 assert_eq!(base_gpa, 0x10_0000);
                 assert_eq!(page_count, 4);
                 assert_eq!(flags, PAGE_BATCH_FLAG_ZSTD);
@@ -764,6 +797,28 @@ mod tests {
     }
 
     #[test]
+    fn decode_page_batch_rejects_out_of_range_page_count() {
+        let msg = Message::PageBatch {
+            base_gpa: 0,
+            page_count: limits::MAX_PAGES_PER_BATCH + 1,
+            flags: 0,
+            data: Vec::new(),
+        };
+        assert!(Message::decode(msg.encode()).is_err());
+    }
+
+    #[test]
+    fn decode_page_batch_rejects_unknown_flags() {
+        let msg = Message::PageBatch {
+            base_gpa: 0,
+            page_count: 1,
+            flags: 1 << 1,
+            data: vec![0; 4096],
+        };
+        assert!(Message::decode(msg.encode()).is_err());
+    }
+
+    #[test]
     fn roundtrip_pause_signal() {
         let out = roundtrip(&Message::PauseSignal);
         assert!(matches!(out, Message::PauseSignal));
@@ -771,8 +826,7 @@ mod tests {
 
     #[test]
     fn decode_unknown_tag_fails() {
-        let ws =
-            tokio_tungstenite::tungstenite::Message::Binary(vec![0xFF]);
+        let ws = tungstenite::Message::Binary(vec![0xFF]);
         let result = Message::decode(ws);
         assert!(result.is_err());
     }

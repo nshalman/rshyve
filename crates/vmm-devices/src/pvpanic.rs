@@ -68,7 +68,7 @@ mod tests {
     use super::*;
 
     fn test_logger() -> Logger {
-        slog::Logger::root(slog::Discard, slog::o!())
+        Logger::root(slog::Discard, slog::o!())
     }
 
     #[test]

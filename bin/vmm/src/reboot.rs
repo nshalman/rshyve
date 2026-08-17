@@ -53,7 +53,8 @@ pub(super) fn quiesce_devices(
     for device in devices {
         // Teardown may follow an operator pause. Keep Indicator's transition
         // validation strict while making repeated quiescence idempotent.
-        if device.lifecycle_state() != Some(vmm_devices::IndicatedState::Pause) {
+        if device.lifecycle_state() != Some(vmm_devices::IndicatedState::Pause)
+        {
             device.pause();
         }
     }
@@ -65,7 +66,9 @@ pub(super) fn quiesce_devices(
     }
 
     for device in devices {
-        if let Err(error) = device.flush_backing(vmm_devices::FlushIntent::BestEffort) {
+        if let Err(error) =
+            device.flush_backing(vmm_devices::FlushIntent::BestEffort)
+        {
             warn!(log, "device flush incomplete at teardown";
                 "device" => device.type_name(),
                 "error" => ?error);
@@ -75,16 +78,20 @@ pub(super) fn quiesce_devices(
     report
 }
 
-pub(super) fn join_vcpus_bounded(handles: Vec<JoinHandle<()>>, budget: Duration) -> bool {
+pub(super) fn join_vcpus_bounded(
+    handles: Vec<JoinHandle<()>>,
+    budget: Duration,
+) -> bool {
     let (tx, rx) = mpsc::channel();
-    let worker = thread::Builder::new()
-        .name("vcpu-join".into())
-        .spawn(move || {
-            for handle in handles {
-                drop(handle.join());
-            }
-            drop(tx.send(()));
-        });
+    let worker =
+        thread::Builder::new()
+            .name("vcpu-join".into())
+            .spawn(move || {
+                for handle in handles {
+                    drop(handle.join());
+                }
+                let _ = tx.send(());
+            });
     if worker.is_err() {
         return false;
     }
@@ -100,9 +107,15 @@ pub(super) fn operator_stop_preempts_reboot(
 }
 
 /// Apply the reset budget and return the state to carry across re-execs.
-fn reset_budget(now_ms: u64, window_start_ms: Option<u64>, prev_count: u32) -> Option<(u64, u32)> {
+fn reset_budget(
+    now_ms: u64,
+    window_start_ms: Option<u64>,
+    prev_count: u32,
+) -> Option<(u64, u32)> {
     let (window_start_ms, prev_count) = match window_start_ms {
-        Some(start) if now_ms.saturating_sub(start) <= RESET_WINDOW_MS => (start, prev_count),
+        Some(start) if now_ms.saturating_sub(start) <= RESET_WINDOW_MS => {
+            (start, prev_count)
+        }
         _ => (now_ms, 0),
     };
 
@@ -161,7 +174,8 @@ pub(super) fn reexec_for_reboot(
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
 
-    let Some((start, count)) = reset_budget(now_ms, prev_start, prev_count) else {
+    let Some((start, count)) = reset_budget(now_ms, prev_start, prev_count)
+    else {
         error!(log, "reset rate limit exceeded, refusing to reboot";
             "limit" => RESET_MAX_PER_WINDOW,
             "window_ms" => RESET_WINDOW_MS);
@@ -250,7 +264,8 @@ mod tests {
         });
         device.start().expect("test device should start");
         device.pause();
-        let devices: Vec<Arc<dyn vmm_devices::Lifecycle>> = vec![device.clone()];
+        let devices: Vec<Arc<dyn vmm_devices::Lifecycle>> =
+            vec![device.clone()];
         let log = Logger::root(slog::Discard, slog::o!());
 
         let report = quiesce_devices(&devices, &log);
@@ -345,7 +360,12 @@ mod tests {
     #[test]
     fn strips_separate_migrate_listen() {
         assert_eq!(
-            reboot_argv(&argv(&["vmm", "--migrate-listen", "0.0.0.0:4567", "vm",])),
+            reboot_argv(&argv(&[
+                "vmm",
+                "--migrate-listen",
+                "0.0.0.0:4567",
+                "vm",
+            ])),
             argv(&["vmm", "vm"]),
         );
     }
@@ -353,7 +373,9 @@ mod tests {
     #[test]
     fn strips_equals_migrate_listen() {
         assert_eq!(
-            reboot_argv(&argv(&["vmm", "--migrate-listen=0.0.0.0:4567", "vm",])),
+            reboot_argv(&argv(
+                &["vmm", "--migrate-listen=0.0.0.0:4567", "vm",]
+            )),
             argv(&["vmm", "vm"]),
         );
     }

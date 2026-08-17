@@ -37,7 +37,10 @@ impl ReadOp {
     #[inline]
     pub fn new(len: usize) -> Self {
         assert!(len > 0 && len <= 8);
-        Self { buf: [0u8; 8], len: len as u8 }
+        Self {
+            buf: [0u8; 8],
+            len: len as u8,
+        }
     }
 
     /// Write a `u8` value into the buffer.
@@ -111,7 +114,10 @@ impl WriteOp {
         assert!(!data.is_empty() && data.len() <= 8);
         let mut buf = [0u8; 8];
         buf[..data.len()].copy_from_slice(data);
-        Self { buf, len: data.len() as u8 }
+        Self {
+            buf,
+            len: data.len() as u8,
+        }
     }
 
     /// Read a `u8` value from the buffer.
@@ -129,12 +135,7 @@ impl WriteOp {
     /// Read a `u32` value from the buffer in little-endian byte order.
     #[inline]
     pub fn read_u32(&self) -> u32 {
-        u32::from_le_bytes([
-            self.buf[0],
-            self.buf[1],
-            self.buf[2],
-            self.buf[3],
-        ])
+        u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
     }
 
     /// Read a `u64` value from the buffer in little-endian byte order.
@@ -193,6 +194,12 @@ impl RWOp<'_> {
             RWOp::Read(ro) => ro.len(),
             RWOp::Write(wo) => wo.len(),
         }
+    }
+
+    /// Returns `true` if the operation has zero width.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -254,8 +261,9 @@ mod test {
 
     #[test]
     fn write_op_u64() {
-        let op =
-            WriteOp::from_buf(&[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        let op = WriteOp::from_buf(&[
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+        ]);
         assert_eq!(op.len(), 8);
         assert_eq!(op.read_u64(), 0x0102_0304_0506_0708);
     }

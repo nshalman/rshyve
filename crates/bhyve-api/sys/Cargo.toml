@@ -3,10 +3,14 @@ name = "bhyve_api_sys"
 version = "0.1.0"
 license = "MPL-2.0"
 edition = "2021"
+rust-version.workspace = true
 
 [lib]
 test = false
 doctest = false
+
+[lints]
+workspace = true
 
 [dependencies]
 libc.workspace = true

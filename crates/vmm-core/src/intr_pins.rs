@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Portions derived from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: lib/propolis/src/intr_pins.rs
+// https://github.com/oxidecomputer/propolis
 
 //! Interrupt pin abstractions for virtual device IRQ delivery.
 //!
@@ -140,23 +144,14 @@ impl LegacyPIC {
     /// Perform an IRQ operation, calling the kernel ioctl only on
     /// level transitions.
     fn do_irq(&self, op: PinOp, irq: u8) {
-        let mut pins = self
-            .inner
-            .lock()
-            .expect("LegacyPIC lock poisoned");
+        let mut pins = self.inner.lock().expect("LegacyPIC lock poisoned");
 
         if pins[irq as usize].process_op(&op) {
             let irq_i32 = i32::from(irq);
             let result = match op {
-                PinOp::Assert => {
-                    self.hdl.isa_assert_irq(irq_i32, irq_i32)
-                }
-                PinOp::Deassert => {
-                    self.hdl.isa_deassert_irq(irq_i32, irq_i32)
-                }
-                PinOp::Pulse => {
-                    self.hdl.isa_pulse_irq(irq_i32, irq_i32)
-                }
+                PinOp::Assert => self.hdl.isa_assert_irq(irq_i32, irq_i32),
+                PinOp::Deassert => self.hdl.isa_deassert_irq(irq_i32, irq_i32),
+                PinOp::Pulse => self.hdl.isa_pulse_irq(irq_i32, irq_i32),
             };
             if let Err(e) = result {
                 // Log but don't panic -- IRQ delivery failure in the
@@ -191,10 +186,8 @@ impl LegacyPin {
 
 impl IntrPin for LegacyPin {
     fn assert(&self) {
-        let mut asserted = self
-            .asserted
-            .lock()
-            .expect("LegacyPin lock poisoned");
+        let mut asserted =
+            self.asserted.lock().expect("LegacyPin lock poisoned");
         if !*asserted {
             *asserted = true;
             if let Some(pic) = self.pic.upgrade() {
@@ -204,10 +197,8 @@ impl IntrPin for LegacyPin {
     }
 
     fn deassert(&self) {
-        let mut asserted = self
-            .asserted
-            .lock()
-            .expect("LegacyPin lock poisoned");
+        let mut asserted =
+            self.asserted.lock().expect("LegacyPin lock poisoned");
         if *asserted {
             *asserted = false;
             if let Some(pic) = self.pic.upgrade() {
@@ -217,10 +208,7 @@ impl IntrPin for LegacyPin {
     }
 
     fn pulse(&self) {
-        let asserted = self
-            .asserted
-            .lock()
-            .expect("LegacyPin lock poisoned");
+        let asserted = self.asserted.lock().expect("LegacyPin lock poisoned");
         if !*asserted {
             if let Some(pic) = self.pic.upgrade() {
                 pic.do_irq(PinOp::Pulse, self.irq);
@@ -229,10 +217,7 @@ impl IntrPin for LegacyPin {
     }
 
     fn is_asserted(&self) -> bool {
-        *self
-            .asserted
-            .lock()
-            .expect("LegacyPin lock poisoned")
+        *self.asserted.lock().expect("LegacyPin lock poisoned")
     }
 }
 
@@ -276,8 +261,8 @@ impl IoApicPin {
 
 impl IntrPin for IoApicPin {
     fn assert(&self) {
-        let mut asserted = self.asserted.lock()
-            .expect("ioapic pin lock poisoned");
+        let mut asserted =
+            self.asserted.lock().expect("ioapic pin lock poisoned");
         if !*asserted {
             *asserted = true;
             if let Err(e) = self.hdl.ioapic_assert_irq(self.irq) {
@@ -287,8 +272,8 @@ impl IntrPin for IoApicPin {
     }
 
     fn deassert(&self) {
-        let mut asserted = self.asserted.lock()
-            .expect("ioapic pin lock poisoned");
+        let mut asserted =
+            self.asserted.lock().expect("ioapic pin lock poisoned");
         if *asserted {
             *asserted = false;
             // best-effort IRQ delivery via kernel ioctl
@@ -306,7 +291,7 @@ impl IntrPin for IoApicPin {
 /// Matches C bhyve's `pci_irq_assert()` behavior: calls
 /// `vm_isa_assert_irq(atpic_irq, ioapic_irq)` where:
 /// - `atpic_irq` is read dynamically from the PIR register (programmed
-///    by firmware at config offsets 0x60-0x63 of the LPC bridge)
+///   by firmware at config offsets 0x60-0x63 of the LPC bridge)
 /// - `ioapic_irq` is fixed per device slot: `16 + (4 + slot + pin) % 8`
 ///
 /// The PIR register is read at assertion time so that firmware can
@@ -368,7 +353,11 @@ impl PciIntrPin {
             return None;
         }
         let irq = (val & PIR_IRQ_MASK) as i32;
-        if irq > 0 { Some(irq) } else { None }
+        if irq > 0 {
+            Some(irq)
+        } else {
+            None
+        }
     }
 }
 
@@ -380,10 +369,9 @@ impl IntrPin for PciIntrPin {
             match self.atpic_irq() {
                 Some(atpic_irq) => {
                     // PIR enabled: route through both ATPIC and IOAPIC
-                    if let Err(e) = self.hdl.isa_assert_irq(
-                        atpic_irq,
-                        self.ioapic_irq,
-                    ) {
+                    if let Err(e) =
+                        self.hdl.isa_assert_irq(atpic_irq, self.ioapic_irq)
+                    {
                         slog::warn!(self.log, "assert PIRQ failed";
                             "pirq_idx" => self.pirq_idx,
                             "atpic_irq" => atpic_irq,
@@ -409,10 +397,7 @@ impl IntrPin for PciIntrPin {
         match self.atpic_irq() {
             Some(atpic_irq) => {
                 // best-effort IRQ delivery via kernel ioctl
-                let _ = self.hdl.isa_deassert_irq(
-                    atpic_irq,
-                    self.ioapic_irq,
-                );
+                let _ = self.hdl.isa_deassert_irq(atpic_irq, self.ioapic_irq);
             }
             None => {
                 // best-effort IRQ delivery via kernel ioctl

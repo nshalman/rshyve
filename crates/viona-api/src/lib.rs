@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copied from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: crates/viona-api/src/lib.rs
+// https://github.com/oxidecomputer/propolis
 
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Result};
@@ -20,15 +24,20 @@ impl VionaFd {
     pub fn new(link_id: u32, vm_fd: RawFd) -> Result<Self> {
         let this = Self::open()?;
 
-        let mut vna_create = vioc_create { c_linkid: link_id, c_vmfd: vm_fd };
+        let mut vna_create = vioc_create {
+            c_linkid: link_id,
+            c_vmfd: vm_fd,
+        };
         let _ = unsafe { this.ioctl(VNA_IOC_CREATE, &mut vna_create) }?;
         Ok(this)
     }
 
     /// Open viona device instance without performing any other initialization
     pub fn open() -> Result<Self> {
-        let fp =
-            OpenOptions::new().read(true).write(true).open(VIONA_DEV_PATH)?;
+        let fp = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(VIONA_DEV_PATH)?;
 
         Ok(Self(fp))
     }

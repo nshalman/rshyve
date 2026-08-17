@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Portions derived from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: lib/propolis/src/hw/pci/bar.rs
+// https://github.com/oxidecomputer/propolis
 
 //! PCI Base Address Register (BAR) management.
 //!
@@ -74,7 +78,10 @@ struct Entry {
 
 impl Default for Entry {
     fn default() -> Self {
-        Self { kind: EntryKind::Empty, value: 0 }
+        Self {
+            kind: EntryKind::Empty,
+            value: 0,
+        }
     }
 }
 
@@ -102,7 +109,9 @@ pub struct Bars {
 impl Bars {
     /// Create a new BAR set with no BARs defined.
     pub fn new() -> Self {
-        Self { entries: Default::default() }
+        Self {
+            entries: Default::default(),
+        }
     }
 
     /// Define a BAR.
@@ -123,7 +132,10 @@ impl Bars {
 
         match def {
             BarDefine::Pio(sz) => {
-                assert!(sz.is_power_of_two(), "PIO BAR size must be power of 2");
+                assert!(
+                    sz.is_power_of_two(),
+                    "PIO BAR size must be power of 2"
+                );
                 self.entries[idx].kind = EntryKind::Pio(sz);
             }
             BarDefine::Mmio(sz) => {
@@ -143,10 +155,7 @@ impl Bars {
                     "64-bit BAR cannot start at BAR5"
                 );
                 assert!(
-                    matches!(
-                        self.entries[idx + 1].kind,
-                        EntryKind::Empty
-                    ),
+                    matches!(self.entries[idx + 1].kind, EntryKind::Empty),
                     "BAR{} (high half for 64-bit) is already defined",
                     idx + 1
                 );
@@ -186,11 +195,7 @@ impl Bars {
     ///
     /// Returns `Some(BarWriteResult)` if the address actually changed,
     /// or `None` if the BAR is empty or the address did not change.
-    pub fn reg_write(
-        &mut self,
-        bar: BarN,
-        val: u32,
-    ) -> Option<BarWriteResult> {
+    pub fn reg_write(&mut self, bar: BarN, val: u32) -> Option<BarWriteResult> {
         let idx = bar as usize;
         let ent = &mut self.entries[idx];
         let (id, def, val_old, val_new) = match ent.kind {
@@ -217,8 +222,8 @@ impl Bars {
             EntryKind::Mmio64High => {
                 assert!(idx > 0);
                 let real_idx = idx - 1;
-                let id = BarN::try_from(real_idx as u8)
-                    .expect("valid BAR index");
+                let id =
+                    BarN::try_from(real_idx as u8).expect("valid BAR index");
                 let ent = &mut self.entries[real_idx];
                 let size = match ent.kind {
                     EntryKind::Mmio64(sz) => sz,
@@ -363,10 +368,7 @@ mod tests {
 
         // Write all-ones to probe size
         for i in 0..=5u8 {
-            bars.reg_write(
-                BarN::try_from(i).unwrap(),
-                0xFFFF_FFFF,
-            );
+            bars.reg_write(BarN::try_from(i).unwrap(), 0xFFFF_FFFF);
         }
 
         // PIO size 0x100: mask = ~(0x100 - 1) = 0xFFFF_FF00, | IO bit

@@ -2,11 +2,13 @@
 #
 # Build and test vmmnew on the illumos build host.
 #
-# The workspace only compiles on illumos: vmm-tpm-sys drives an autotools
+# The vmm binary only builds on illumos: vmm-tpm-sys drives an autotools
 # build of vendored libtpms, bhyve-api binds SunOS ioctls, and viona-api
-# needs libdladm. Developing on macOS therefore means every build is a
-# remote build. This script makes that one command so it can be driven
-# from an editor, a test loop, or an agent.
+# needs libdladm. The library crates other than vmm-tpm-sys and vmm-tpm
+# do build and test on macOS, which is enough for most unit work; the
+# full workspace build and every platform test have to happen here.
+# This script makes that one command so it can be driven from an editor,
+# a test loop, or an agent.
 #
 #   tools/remote-build.sh build              # cargo build --release
 #   tools/remote-build.sh test               # cargo test --workspace
@@ -21,14 +23,17 @@
 
 set -euo pipefail
 
-HOST="${VMM_BUILD_HOST:-root@$VMM_BUILD_HOST}"
-KEY="${VMM_BUILD_KEY:-$HOME/.ssh/$VMM_BUILD_KEY}"
+# No defaults: the build host is site-specific and must not be baked in.
+HOST="${VMM_BUILD_HOST:?set VMM_BUILD_HOST to user@host of your illumos build host}"
+KEY="${VMM_BUILD_KEY:?set VMM_BUILD_KEY to the SSH key for that host}"
 REMOTE_DIR="${VMM_BUILD_DIR:-/opt/vmmnew}"
 PROFILE="${VMM_BUILD_PROFILE:---release}"
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-SSH=(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i "$KEY" "$HOST")
+# Host key verification stays on. Add the build host to known_hosts once,
+# after checking its fingerprint out of band.
+SSH=(ssh -o ConnectTimeout=15 -i "$KEY" "$HOST")
 
 # /opt/tools/bin and /opt/local/bin hold the pkgsrc toolchain (cargo, gcc,
 # autoconf, gmake, pkg-config); none of them are on root's default PATH.
@@ -41,7 +46,7 @@ sync_sources() {
     # cargo's fingerprints; without it edited files silently fail to rebuild.
     rsync -az --checksum --delete \
         --exclude target --exclude .git --exclude 'kernel/linux-*' \
-        -e "ssh -o StrictHostKeyChecking=no -i $KEY" \
+        -e "ssh -i $KEY" \
         "$SRC_DIR/" "$HOST:$REMOTE_DIR/"
 }
 

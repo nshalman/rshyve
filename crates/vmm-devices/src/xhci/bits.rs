@@ -104,23 +104,23 @@ pub const OP_DCBAAP: usize = 0x30;
 pub const OP_CONFIG: usize = 0x38;
 
 // USBCMD bits
-pub const USBCMD_RS: u32 = 1 << 0;    // Run/Stop
+pub const USBCMD_RS: u32 = 1 << 0; // Run/Stop
 pub const USBCMD_HCRST: u32 = 1 << 1; // Host Controller Reset
-pub const USBCMD_INTE: u32 = 1 << 2;  // Interrupter Enable
-pub const USBCMD_HSEE: u32 = 1 << 3;  // Host System Error Enable
+pub const USBCMD_INTE: u32 = 1 << 2; // Interrupter Enable
+pub const USBCMD_HSEE: u32 = 1 << 3; // Host System Error Enable
 
 // USBSTS bits
-pub const USBSTS_HCH: u32 = 1 << 0;   // HCHalted
-pub const USBSTS_EINT: u32 = 1 << 3;  // Event Interrupt
-pub const USBSTS_PCD: u32 = 1 << 4;   // Port Change Detect
-pub const USBSTS_CNR: u32 = 1 << 11;  // Controller Not Ready
+pub const USBSTS_HCH: u32 = 1 << 0; // HCHalted
+pub const USBSTS_EINT: u32 = 1 << 3; // Event Interrupt
+pub const USBSTS_PCD: u32 = 1 << 4; // Port Change Detect
+pub const USBSTS_CNR: u32 = 1 << 11; // Controller Not Ready
 
 // CRCR bits
-pub const CRCR_RCS: u64 = 1 << 0;     // Ring Cycle State
-pub const CRCR_CS: u64 = 1 << 1;      // Command Stop
-pub const CRCR_CA: u64 = 1 << 2;      // Command Abort
-pub const CRCR_CRR: u64 = 1 << 3;     // Command Ring Running
-pub const CRCR_PTR_MASK: u64 = !0x3F;  // Pointer mask (64-byte aligned)
+pub const CRCR_RCS: u64 = 1 << 0; // Ring Cycle State
+pub const CRCR_CS: u64 = 1 << 1; // Command Stop
+pub const CRCR_CA: u64 = 1 << 2; // Command Abort
+pub const CRCR_CRR: u64 = 1 << 3; // Command Ring Running
+pub const CRCR_PTR_MASK: u64 = !0x3F; // Pointer mask (64-byte aligned)
 
 // ---- Port Status Register offsets (relative to OP_BASE) -------------------
 
@@ -137,29 +137,29 @@ pub const PORTSC_PORTHLPMC: usize = 0x0C;
 pub const PORT_REG_SIZE: usize = 16;
 
 // PORTSC bits
-pub const PORTSC_CCS: u32 = 1 << 0;   // Current Connect Status
-pub const PORTSC_PED: u32 = 1 << 1;   // Port Enabled/Disabled
-pub const PORTSC_PR: u32 = 1 << 4;    // Port Reset
-pub const PORTSC_PLS_SHIFT: u32 = 5;  // Port Link State (bits 8:5)
+pub const PORTSC_CCS: u32 = 1 << 0; // Current Connect Status
+pub const PORTSC_PED: u32 = 1 << 1; // Port Enabled/Disabled
+pub const PORTSC_PR: u32 = 1 << 4; // Port Reset
+pub const PORTSC_PLS_SHIFT: u32 = 5; // Port Link State (bits 8:5)
 pub const PORTSC_PLS_MASK: u32 = 0xF;
-pub const PORTSC_PP: u32 = 1 << 9;    // Port Power
+pub const PORTSC_PP: u32 = 1 << 9; // Port Power
 pub const PORTSC_SPEED_SHIFT: u32 = 10; // Port Speed (bits 13:10)
 pub const PORTSC_SPEED_MASK: u32 = 0xF;
-pub const PORTSC_LWS: u32 = 1 << 16;  // Port Link State Write Strobe
-pub const PORTSC_CSC: u32 = 1 << 17;  // Connect Status Change
-pub const PORTSC_PRC: u32 = 1 << 21;  // Port Reset Change
-pub const PORTSC_WRC: u32 = 1 << 19;  // Warm Port Reset Change
+pub const PORTSC_LWS: u32 = 1 << 16; // Port Link State Write Strobe
+pub const PORTSC_CSC: u32 = 1 << 17; // Connect Status Change
+pub const PORTSC_PRC: u32 = 1 << 21; // Port Reset Change
+pub const PORTSC_WRC: u32 = 1 << 19; // Warm Port Reset Change
 
 // Port Link State values
-pub const PLS_U0: u32 = 0;            // U0 (active)
-pub const PLS_RXDETECT: u32 = 5;      // RxDetect
-pub const PLS_DISABLED: u32 = 4;      // Disabled
+pub const PLS_U0: u32 = 0; // U0 (active)
+pub const PLS_RXDETECT: u32 = 5; // RxDetect
+pub const PLS_DISABLED: u32 = 4; // Disabled
 
 // Port Speed values
 pub const SPEED_NONE: u32 = 0;
-pub const SPEED_FULL: u32 = 1;        // Full-speed (12 Mbps)
-pub const SPEED_HIGH: u32 = 3;        // High-speed (480 Mbps)
-pub const SPEED_SUPER: u32 = 4;       // SuperSpeed (5 Gbps)
+pub const SPEED_FULL: u32 = 1; // Full-speed (12 Mbps)
+pub const SPEED_HIGH: u32 = 3; // High-speed (480 Mbps)
+pub const SPEED_SUPER: u32 = 4; // SuperSpeed (5 Gbps)
 
 // ---- Doorbell register offsets (base = DBOFF = 0x440) ---------------------
 
@@ -187,8 +187,8 @@ pub const IR_ERSTBA: usize = 0x10;
 pub const IR_ERDP: usize = 0x18;
 
 // IMAN bits
-pub const IMAN_IP: u32 = 1 << 0;  // Interrupt Pending
-pub const IMAN_IE: u32 = 1 << 1;  // Interrupt Enable
+pub const IMAN_IP: u32 = 1 << 0; // Interrupt Pending
+pub const IMAN_IE: u32 = 1 << 1; // Interrupt Enable
 
 // ---- Extended Capability structures (base = 0x600) -----------------------
 
@@ -203,7 +203,8 @@ pub const XCAP_PROTO_SIZE: usize = 16;
 /// ID=2, Next=16 bytes, revision=2.0, name="USB ", port offset=1, port count=1
 pub fn xcap_usb2() -> [u32; 4] {
     let id_next: u32 = 0x02 | ((XCAP_PROTO_SIZE as u32 / 4) << 8);
-    let rev_name0: u32 = 0x0200 | (u32::from(b'U') << 16) | (u32::from(b'S') << 24);
+    let rev_name0: u32 =
+        0x0200 | (u32::from(b'U') << 16) | (u32::from(b'S') << 24);
     let name1: u32 = u32::from(b'B') | (u32::from(b' ') << 8);
     // Port offset = 1, port count = 1
     let ports: u32 = 1 | (1 << 8);
@@ -215,7 +216,8 @@ pub fn xcap_usb2() -> [u32; 4] {
 /// ID=2, Next=0 (end of chain), revision=3.0, name="USB ", port offset=2, port count=1
 pub fn xcap_usb3() -> [u32; 4] {
     let id_next: u32 = 0x02; // Next = 0 (last capability)
-    let rev_name0: u32 = 0x0300 | (u32::from(b'U') << 16) | (u32::from(b'S') << 24);
+    let rev_name0: u32 =
+        0x0300 | (u32::from(b'U') << 16) | (u32::from(b'S') << 24);
     let name1: u32 = u32::from(b'B') | (u32::from(b' ') << 8);
     // Port offset = 2, port count = 1
     let ports: u32 = 2 | (1 << 8);
@@ -270,8 +272,8 @@ pub const TRB_CC_STALL: u32 = 6;
 pub const TRB_CC_SLOT_NOT_ENABLED: u32 = 11;
 
 // Setup Stage TRB fields
-pub const TRB_SETUP_IDT: u32 = 1 << 6;   // Immediate Data in TRB
-pub const TRB_SETUP_TRT_SHIFT: u32 = 16;  // Transfer Type (bits 17:16 of dword3)
+pub const TRB_SETUP_IDT: u32 = 1 << 6; // Immediate Data in TRB
+pub const TRB_SETUP_TRT_SHIFT: u32 = 16; // Transfer Type (bits 17:16 of dword3)
 pub const TRB_SETUP_TRT_NO_DATA: u32 = 0;
 pub const TRB_SETUP_TRT_IN: u32 = 3;
 pub const TRB_SETUP_TRT_OUT: u32 = 2;
@@ -392,23 +394,24 @@ pub const SLOT_STATE_CONFIGURED: u32 = 3;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::size_of;
 
     #[test]
     fn trb_size_is_16() {
-        assert_eq!(std::mem::size_of::<RawTrb>(), TRB_SIZE);
+        assert_eq!(size_of::<RawTrb>(), TRB_SIZE);
     }
 
     #[test]
     fn erst_entry_size_is_16() {
-        assert_eq!(std::mem::size_of::<ErstEntry>(), 16);
+        assert_eq!(size_of::<ErstEntry>(), 16);
     }
 
     #[test]
     fn hcsparams1_fields() {
         let val = hcsparams1();
-        assert_eq!(val & 0xFF, 64);          // MaxSlots = 64
-        assert_eq!((val >> 8) & 0x3FF, 1);   // MaxIntrs = 1
-        assert_eq!((val >> 24) & 0xFF, 2);   // MaxPorts = 2
+        assert_eq!(val & 0xFF, 64); // MaxSlots = 64
+        assert_eq!((val >> 8) & 0x3FF, 1); // MaxIntrs = 1
+        assert_eq!((val >> 24) & 0xFF, 2); // MaxPorts = 2
     }
 
     #[test]
@@ -494,15 +497,14 @@ mod tests {
     #[test]
     fn register_layout_no_overlap() {
         // Verify the register regions don't overlap
-        let cap_end = CAPLENGTH as usize;   // 0x20
-        let op_end = 0x400;                 // operational regs end at port base
+        let cap_end = CAPLENGTH as usize; // 0x20
+        let op_end = 0x400; // operational regs end at port base
         let port_end = 0x400 + 2 * PORT_REG_SIZE; // 2 ports
-        let db_start = DBOFF as usize;      // 0x440
-        let db_end = db_start
-            + (usize::from(MAX_SLOTS) + 1) * DB_REG_SIZE;
-        let rt_start = RTSOFF as usize;     // 0x560
+        let db_start = DBOFF as usize; // 0x440
+        let db_end = db_start + (usize::from(MAX_SLOTS) + 1) * DB_REG_SIZE;
+        let rt_start = RTSOFF as usize; // 0x560
         let runtime_window_len = IR0_BASE + 0x20;
-        let xcap_start = XCAP_BASE;         // 0x600
+        let xcap_start = XCAP_BASE; // 0x600
 
         assert!(cap_end <= OP_BASE + OP_USBCMD);
         assert!(op_end <= db_start);

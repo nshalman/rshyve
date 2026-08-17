@@ -122,7 +122,9 @@ pub fn parse_smbios_flag(s: &str) -> SmbiosConfig {
                 let key = &kv[..eq];
                 let val = &kv[eq + 1..];
                 match key {
-                    "manufacturer" => config.manufacturer = Some(val.to_string()),
+                    "manufacturer" => {
+                        config.manufacturer = Some(val.to_string())
+                    }
                     "product" => config.product = Some(val.to_string()),
                     "version" => config.version = Some(val.to_string()),
                     "serial" => config.serial = Some(val.to_string()),
@@ -195,11 +197,8 @@ pub fn generate_smbios(config: &SmbiosConfig) -> (Vec<u8>, Vec<u8>) {
     emit(build_type127(&mut handle));
 
     // Build the 31-byte entry point (anchor)
-    let anchor = build_entry_point(
-        max_struct_size,
-        tables.len() as u16,
-        num_structures,
-    );
+    let anchor =
+        build_entry_point(max_struct_size, tables.len() as u16, num_structures);
 
     (anchor, tables)
 }
@@ -268,15 +267,18 @@ fn build_type0(handle: &mut u16) -> Vec<u8> {
     let formatted_len = 20;
     let mut buf = start_struct(SMBIOS_TYPE_BIOS, formatted_len, h);
 
-    buf.push(vendor_idx);           // vendor string
-    buf.push(version_idx);          // version string
+    buf.push(vendor_idx); // vendor string
+    buf.push(version_idx); // version string
     buf.extend_from_slice(&0xF000u16.to_le_bytes()); // address segment
-    buf.push(date_idx);             // release date string
-    buf.push(0x00);                 // BIOS size (64k * (n+1))
+    buf.push(date_idx); // release date string
+    buf.push(0x00); // BIOS size (64k * (n+1))
 
     // BIOS characteristics (8 bytes)
-    let cflags: u64 = SMBIOS_FL_ISA | SMBIOS_FL_PCI | SMBIOS_FL_SHADOW
-        | SMBIOS_FL_CDBOOT | SMBIOS_FL_EDD;
+    let cflags: u64 = SMBIOS_FL_ISA
+        | SMBIOS_FL_PCI
+        | SMBIOS_FL_SHADOW
+        | SMBIOS_FL_CDBOOT
+        | SMBIOS_FL_EDD;
     buf.extend_from_slice(&cflags.to_le_bytes());
 
     // Extension bytes
@@ -309,7 +311,9 @@ fn build_type1(config: &SmbiosConfig, handle: &mut u16) -> Vec<u8> {
     let ver = config.version.as_deref().unwrap_or("1.0");
     let ver_idx = push_string(&mut strings, ver);
 
-    let serial = config.serial.as_deref()
+    let serial = config
+        .serial
+        .as_deref()
         .or(config.uuid.as_deref())
         .unwrap_or("None");
     let serial_idx = push_string(&mut strings, serial);
@@ -324,18 +328,18 @@ fn build_type1(config: &SmbiosConfig, handle: &mut u16) -> Vec<u8> {
     let formatted_len = 21;
     let mut buf = start_struct(SMBIOS_TYPE_SYSTEM, formatted_len, h);
 
-    buf.push(mfr_idx);     // manufacturer
-    buf.push(prod_idx);    // product name
-    buf.push(ver_idx);     // version
-    buf.push(serial_idx);  // serial number
+    buf.push(mfr_idx); // manufacturer
+    buf.push(prod_idx); // product name
+    buf.push(ver_idx); // version
+    buf.push(serial_idx); // serial number
 
     // UUID (16 bytes) — parse from config or zero-fill
     let uuid_bytes = parse_uuid(config.uuid.as_deref());
     buf.extend_from_slice(&uuid_bytes);
 
-    buf.push(0x06);        // wake-up type: power switch
-    buf.push(sku_idx);     // SKU
-    buf.push(family_idx);  // family
+    buf.push(0x06); // wake-up type: power switch
+    buf.push(sku_idx); // SKU
+    buf.push(family_idx); // family
 
     finalize_struct(&mut buf, &strings);
     buf
@@ -399,16 +403,16 @@ fn build_type2(chassis_handle: u16, handle: &mut u16) -> Vec<u8> {
     let formatted_len = 11;
     let mut buf = start_struct(SMBIOS_TYPE_BOARD, formatted_len, h);
 
-    buf.push(mfr_idx);     // manufacturer
-    buf.push(prod_idx);    // product name
-    buf.push(ver_idx);     // version
-    buf.push(serial_idx);  // serial number
-    buf.push(asset_idx);   // asset tag
-    buf.push(0x01);        // feature flags: hosting board
-    buf.push(loc_idx);     // location in chassis
+    buf.push(mfr_idx); // manufacturer
+    buf.push(prod_idx); // product name
+    buf.push(ver_idx); // version
+    buf.push(serial_idx); // serial number
+    buf.push(asset_idx); // asset tag
+    buf.push(0x01); // feature flags: hosting board
+    buf.push(loc_idx); // location in chassis
     buf.extend_from_slice(&chassis_handle.to_le_bytes()); // chassis handle
-    buf.push(0x0A);        // board type: motherboard
-    buf.push(0);           // number of contained object handles
+    buf.push(0x0A); // board type: motherboard
+    buf.push(0); // number of contained object handles
 
     finalize_struct(&mut buf, &strings);
     buf
@@ -430,21 +434,21 @@ fn build_type3(handle: &mut u16) -> Vec<u8> {
     let formatted_len = 17;
     let mut buf = start_struct(SMBIOS_TYPE_CHASSIS, formatted_len, h);
 
-    buf.push(mfr_idx);     // manufacturer
-    buf.push(0x02);        // type: unknown
-    buf.push(ver_idx);     // version
-    buf.push(serial_idx);  // serial number
-    buf.push(asset_idx);   // asset tag
-    buf.push(0x03);        // boot-up state: safe
-    buf.push(0x03);        // power supply state: safe
-    buf.push(0x03);        // thermal state: safe
-    buf.push(0x03);        // security status: none
+    buf.push(mfr_idx); // manufacturer
+    buf.push(0x02); // type: unknown
+    buf.push(ver_idx); // version
+    buf.push(serial_idx); // serial number
+    buf.push(asset_idx); // asset tag
+    buf.push(0x03); // boot-up state: safe
+    buf.push(0x03); // power supply state: safe
+    buf.push(0x03); // thermal state: safe
+    buf.push(0x03); // security status: none
     buf.extend_from_slice(&0u32.to_le_bytes()); // OEM-specific data
-    buf.push(0);           // height in U's
-    buf.push(0);           // number of power cords
-    buf.push(0);           // number of contained elements
-    buf.push(0);           // contained element record length
-    buf.push(sku_idx);     // SKU number
+    buf.push(0); // height in U's
+    buf.push(0); // number of power cords
+    buf.push(0); // number of contained elements
+    buf.push(0); // contained element record length
+    buf.push(sku_idx); // SKU number
 
     finalize_struct(&mut buf, &strings);
     buf
@@ -468,27 +472,27 @@ fn build_type4(cpu_idx: u32, handle: &mut u16) -> Vec<u8> {
     let formatted_len = 38;
     let mut buf = start_struct(SMBIOS_TYPE_PROCESSOR, formatted_len, h);
 
-    buf.push(socket_idx);                  // socket designation
-    buf.push(SMBIOS_PRT_CENTRAL);          // processor type
-    buf.push(SMBIOS_PRF_OTHER);            // processor family
-    buf.push(mfr_idx);                     // manufacturer
+    buf.push(socket_idx); // socket designation
+    buf.push(SMBIOS_PRT_CENTRAL); // processor type
+    buf.push(SMBIOS_PRF_OTHER); // processor family
+    buf.push(mfr_idx); // manufacturer
     buf.extend_from_slice(&0u64.to_le_bytes()); // processor ID (cpuid)
-    buf.push(ver_idx);                     // version
-    buf.push(0);                           // voltage
+    buf.push(ver_idx); // version
+    buf.push(0); // voltage
     buf.extend_from_slice(&0u16.to_le_bytes()); // external clock (MHz)
     buf.extend_from_slice(&0u16.to_le_bytes()); // max speed (MHz)
     buf.extend_from_slice(&0u16.to_le_bytes()); // current speed (MHz)
     buf.push(SMBIOS_PRS_PRESENT | SMBIOS_PRS_ENABLED); // status
-    buf.push(SMBIOS_PRU_NONE);             // upgrade
+    buf.push(SMBIOS_PRU_NONE); // upgrade
     buf.extend_from_slice(&0xFFFFu16.to_le_bytes()); // L1 cache handle
     buf.extend_from_slice(&0xFFFFu16.to_le_bytes()); // L2 cache handle
     buf.extend_from_slice(&0xFFFFu16.to_le_bytes()); // L3 cache handle
-    buf.push(serial_idx);                  // serial number
-    buf.push(asset_idx);                   // asset tag
-    buf.push(part_idx);                    // part number
-    buf.push(0);                           // cores per socket
-    buf.push(0);                           // enabled cores
-    buf.push(0);                           // threads per socket
+    buf.push(serial_idx); // serial number
+    buf.push(asset_idx); // asset tag
+    buf.push(part_idx); // part number
+    buf.push(0); // cores per socket
+    buf.push(0); // enabled cores
+    buf.push(0); // threads per socket
     buf.extend_from_slice(&SMBIOS_PFL_64B.to_le_bytes()); // proc characteristics
     buf.extend_from_slice(&(SMBIOS_PRF_OTHER as u16).to_le_bytes()); // family 2
 
@@ -505,9 +509,9 @@ fn build_type16(config: &SmbiosConfig, handle: &mut u16) -> Vec<u8> {
     let formatted_len = 11;
     let mut buf = start_struct(SMBIOS_TYPE_MEMARRAY, formatted_len, h);
 
-    buf.push(SMBIOS_MAL_SYSMB);        // location: system board
-    buf.push(SMBIOS_MAU_SYSTEM);        // use: system memory
-    buf.push(SMBIOS_MAE_NONE);          // error correction: none
+    buf.push(SMBIOS_MAL_SYSMB); // location: system board
+    buf.push(SMBIOS_MAU_SYSTEM); // use: system memory
+    buf.push(SMBIOS_MAE_NONE); // error correction: none
 
     // Maximum capacity in KB (0x80000000 = use extended field)
     buf.extend_from_slice(&0x8000_0000u32.to_le_bytes());
@@ -567,18 +571,18 @@ fn build_type17(
         buf.extend_from_slice(&0x7FFFu16.to_le_bytes());
     }
 
-    buf.push(SMBIOS_MDFF_UNKNOWN);     // form factor
-    buf.push(0);                        // set (0 = none)
-    buf.push(dloc_idx);                 // device locator
-    buf.push(bloc_idx);                 // bank locator
-    buf.push(SMBIOS_MDT_UNKNOWN);       // memory type
+    buf.push(SMBIOS_MDFF_UNKNOWN); // form factor
+    buf.push(0); // set (0 = none)
+    buf.push(dloc_idx); // device locator
+    buf.push(bloc_idx); // bank locator
+    buf.push(SMBIOS_MDT_UNKNOWN); // memory type
     buf.extend_from_slice(&SMBIOS_MDF_UNKNOWN.to_le_bytes()); // type detail
     buf.extend_from_slice(&0u16.to_le_bytes()); // max speed (MHz)
-    buf.push(mfr_idx);                  // manufacturer
-    buf.push(serial_idx);               // serial number
-    buf.push(asset_idx);                // asset tag
-    buf.push(part_idx);                 // part number
-    buf.push(0);                        // attributes (rank unknown)
+    buf.push(mfr_idx); // manufacturer
+    buf.push(serial_idx); // serial number
+    buf.push(asset_idx); // asset tag
+    buf.push(part_idx); // part number
+    buf.push(0); // attributes (rank unknown)
 
     finalize_struct(&mut buf, &strings);
     buf
@@ -602,7 +606,7 @@ fn build_type19(
 
     if mem_kb <= 0xFFFF_FFFE {
         // Use KB-based addresses
-        buf.extend_from_slice(&0u32.to_le_bytes());                // starting addr (KB)
+        buf.extend_from_slice(&0u32.to_le_bytes()); // starting addr (KB)
         buf.extend_from_slice(&((mem_kb - 1) as u32).to_le_bytes()); // ending addr (KB)
     } else {
         // Use extended addresses
@@ -611,11 +615,11 @@ fn build_type19(
     }
 
     buf.extend_from_slice(&memarray_handle.to_le_bytes()); // array handle
-    buf.push(1);                        // partition width
+    buf.push(1); // partition width
 
     // Extended addresses (bytes)
-    buf.extend_from_slice(&0u64.to_le_bytes());                    // extended start
-    buf.extend_from_slice(&(mem_bytes - 1).to_le_bytes());         // extended end
+    buf.extend_from_slice(&0u64.to_le_bytes()); // extended start
+    buf.extend_from_slice(&(mem_bytes - 1).to_le_bytes()); // extended end
 
     finalize_struct(&mut buf, &[]);
     buf
@@ -717,7 +721,12 @@ fn build_entry_point(
 
 /// Set the byte at `cksum_offset` so that the sum of all bytes in
 /// `buf[start..start+len]` is 0 mod 256.
-fn fix_checksum_at(buf: &mut [u8], cksum_offset: usize, start: usize, len: usize) {
+fn fix_checksum_at(
+    buf: &mut [u8],
+    cksum_offset: usize,
+    start: usize,
+    len: usize,
+) {
     buf[cksum_offset] = 0;
     let sum: u8 = buf[start..start + len]
         .iter()
@@ -798,7 +807,7 @@ mod tests {
         let eot_start = tables.len() - 6;
         assert_eq!(tables[eot_start], SMBIOS_TYPE_EOT);
         assert_eq!(tables[eot_start + 1], 4); // length = header only
-        // Double-NUL termination
+                                              // Double-NUL termination
         assert_eq!(tables[tables.len() - 2], 0);
         assert_eq!(tables[tables.len() - 1], 0);
     }
@@ -813,8 +822,7 @@ mod tests {
         };
         let (anchor, _) = generate_smbios(&config);
 
-        let num_structs =
-            u16::from_le_bytes([anchor[0x1C], anchor[0x1D]]);
+        let num_structs = u16::from_le_bytes([anchor[0x1C], anchor[0x1D]]);
         // Types: 0, 1, 2, 3, 4*4, 16, 17, 19, 32, 127 = 13
         assert_eq!(num_structs, 13);
     }
@@ -870,7 +878,10 @@ mod tests {
             );
             let stype = tables[offset];
             let slen = tables[offset + 1] as usize;
-            assert!(slen >= 4, "structure #{count} (type {stype}) has length < 4");
+            assert!(
+                slen >= 4,
+                "structure #{count} (type {stype}) has length < 4"
+            );
 
             // Skip past formatted area to string section
             let mut pos = offset + slen;
@@ -910,8 +921,7 @@ mod tests {
         };
         let (anchor, tables) = generate_smbios(&config);
 
-        let recorded_len =
-            u16::from_le_bytes([anchor[0x16], anchor[0x17]]);
+        let recorded_len = u16::from_le_bytes([anchor[0x16], anchor[0x17]]);
         assert_eq!(recorded_len as usize, tables.len());
     }
 }

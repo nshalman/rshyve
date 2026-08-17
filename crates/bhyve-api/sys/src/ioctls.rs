@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copied from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: crates/bhyve-api/sys/src/ioctls.rs
+// https://github.com/oxidecomputer/propolis
 
 // Define constants from machine/vmm_dev.h
 
@@ -63,7 +67,7 @@ pub const VM_UNMAP_PPTDEV_MMIO: i32 = VMM_LOCK_IOC_BASE | 0x09;
 pub const VM_PPTDEV_DISABLE_MSIX: i32 = VMM_IOC_BASE | 0x1f;
 
 // PPT device ioctls (on /dev/pptN fd, not VM fd)
-pub const PPT_IOC_BASE: i32 = 0x5054_00;
+pub const PPT_IOC_BASE: i32 = 0x0050_5400;
 pub const PPT_CFG_READ: i32 = PPT_IOC_BASE | 0x01;
 pub const PPT_CFG_WRITE: i32 = PPT_IOC_BASE | 0x02;
 pub const PPT_BAR_QUERY: i32 = PPT_IOC_BASE | 0x03;

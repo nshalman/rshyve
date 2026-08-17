@@ -17,6 +17,31 @@ members = [
     "bin/vmm-migrate-agent",
 ]
 
+[workspace.package]
+# The oldest toolchain this is built with is the illumos build host's
+# 1.94.1. Verified by the msrv job in CI; raise both together.
+rust-version = "1.94"
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+# The one deny-by-default clippy group, and the one that catches
+# undefined behaviour (uninit_assumed_init, invalid_null_ptr_usage,
+# size_of_in_element_count). The baseline is clean, so denying it costs
+# nothing and is worth more than a warning in a hypervisor.
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+# `const _: () = assert!(...)` is an intentional compile-time layout check.
+assertions_on_constants = "allow"
+# Callback and device registry shapes are clearer at their use sites unless a
+# domain-specific alias has an obvious name.
+type_complexity = "allow"
+
 [profile.dev-abort]
 inherits = "dev"
 panic = "abort"

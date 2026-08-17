@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copied from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: lib/propolis/src/hw/ps2/keyboard/scan_code_2.rs
+// https://github.com/oxidecomputer/propolis
 
 // Scan Code Set 2 codes
 

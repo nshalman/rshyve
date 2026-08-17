@@ -17,8 +17,8 @@ pub const PAGES_PER_BYTE: usize = 8;
 
 /// Calculate the bitmap size needed for a given memory region.
 pub fn bitmap_size(region_len: usize) -> usize {
-    let num_pages = (region_len + PAGE_SIZE - 1) / PAGE_SIZE;
-    (num_pages + PAGES_PER_BYTE - 1) / PAGES_PER_BYTE
+    let num_pages = region_len.div_ceil(PAGE_SIZE);
+    num_pages.div_ceil(PAGES_PER_BYTE)
 }
 
 /// Iterator over set bits in a dirty page bitmap.
@@ -54,7 +54,8 @@ impl<'a> Iterator for PageIter<'a> {
             if byte_idx < self.bitmap.len()
                 && (self.bitmap[byte_idx] & (1 << bit_idx)) != 0
             {
-                let page_offset = (self.bit_index - 1) as u64 * PAGE_SIZE as u64;
+                let page_offset =
+                    (self.bit_index - 1) as u64 * PAGE_SIZE as u64;
                 return Some(self.base_gpa + page_offset);
             }
         }
@@ -84,7 +85,8 @@ mod tests {
     #[test]
     fn test_page_iter_all_dirty() {
         let bitmap = [0xFFu8; 1];
-        let pages: Vec<u64> = PageIter::new(&bitmap, 0, PAGE_SIZE * 8).collect();
+        let pages: Vec<u64> =
+            PageIter::new(&bitmap, 0, PAGE_SIZE * 8).collect();
         assert_eq!(pages.len(), 8);
         assert_eq!(pages[0], 0);
         assert_eq!(pages[7], 7 * PAGE_SIZE as u64);

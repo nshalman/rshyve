@@ -283,8 +283,7 @@ impl PackedVirtQueue {
     ) {
         let _ = head_idx; // Available for future use (e.g., in-order completion)
 
-        let gpa =
-            self.desc_addr + u64::from(self.next_used) * DESC_SIZE as u64;
+        let gpa = self.desc_addr + u64::from(self.next_used) * DESC_SIZE as u64;
 
         // Build the flags: both AVAIL and USED match used_wrap_counter
         // to signal completion. No NEXT/WRITE/INDIRECT flags on used.

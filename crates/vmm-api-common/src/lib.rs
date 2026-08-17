@@ -17,6 +17,12 @@ use std::sync::atomic::{AtomicI64, Ordering};
 /// - `<0` -- negated `errno` from a failed query
 pub struct CachedVersion(AtomicI64);
 
+impl Default for CachedVersion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CachedVersion {
     /// Create a new, uninitialized cache.
     pub const fn new() -> Self {
@@ -27,13 +33,14 @@ impl CachedVersion {
     ///
     /// Concurrent callers may race to fill the cache; only one value wins via
     /// `compare_exchange`, and all callers see the same result afterwards.
-    pub fn get_or_init(&self, query: impl FnOnce() -> Result<u32>) -> Result<u32> {
+    pub fn get_or_init(
+        &self,
+        query: impl FnOnce() -> Result<u32>,
+    ) -> Result<u32> {
         if self.0.load(Ordering::Acquire) == 0 {
             let newval = match query() {
                 Ok(x) => i64::from(x),
-                Err(e) => {
-                    -i64::from(e.raw_os_error().unwrap_or(libc::ENOENT))
-                }
+                Err(e) => -i64::from(e.raw_os_error().unwrap_or(libc::ENOENT)),
             };
             // CAS failure means another thread already cached the value
             let _ = self.0.compare_exchange(

@@ -47,7 +47,7 @@ pub trait PciDevice: Send + Sync + 'static {
 // ---------------------------------------------------------------------------
 
 /// Static identification fields for a PCI device.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DeviceIdent {
     pub vendor_id: u16,
     pub device_id: u16,
@@ -57,21 +57,6 @@ pub struct DeviceIdent {
     pub revision: u8,
     pub sub_vendor_id: u16,
     pub sub_device_id: u16,
-}
-
-impl Default for DeviceIdent {
-    fn default() -> Self {
-        Self {
-            vendor_id: 0,
-            device_id: 0,
-            class: 0,
-            subclass: 0,
-            prog_if: 0,
-            revision: 0,
-            sub_vendor_id: 0,
-            sub_device_id: 0,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +180,7 @@ impl DeviceState {
             // 0x10-0x24: BARs 0-5
             bar_off @ 0x10..=0x24 if (bar_off & 0x03) == 0 => {
                 let bar_idx = (bar_off - 0x10) / 4;
-                if let Ok(bar_n) = BarN::try_from(bar_idx as u8) {
+                if let Ok(bar_n) = BarN::try_from(bar_idx) {
                     self.bars.reg_read(bar_n)
                 } else {
                     0
@@ -215,10 +200,7 @@ impl DeviceState {
             // 0x38: Reserved
             0x38 => 0,
             // 0x3C: Intr Line (8) | Intr Pin (8) | Min Grant (8) | Max Lat (8)
-            0x3C => {
-                u32::from(self.intr_line)
-                    | (u32::from(self.intr_pin) << 8)
-            }
+            0x3C => u32::from(self.intr_line) | (u32::from(self.intr_pin) << 8),
             _ => 0,
         };
 
@@ -240,50 +222,44 @@ impl DeviceState {
 
         match dword_off {
             // 0x04: Command register (low 16 bits writable)
-            0x04 => {
-                if byte_off < 2 {
-                    // Build a full 16-bit value considering byte offset
-                    let shift = byte_off * 8;
-                    let mask = size_mask(len) << shift;
-                    let old_bits = u32::from(self.command.bits());
-                    let new_bits = (old_bits & !mask) | ((val << shift) & mask);
-                    // Only the defined command bits are writable
-                    let writable = bits::RegCmd::IO_EN
-                        | bits::RegCmd::MMIO_EN
-                        | bits::RegCmd::BUSMSTR_EN
-                        | bits::RegCmd::INTX_DIS;
-                    self.command = bits::RegCmd::from_bits_truncate(
-                        (new_bits as u16) & writable.bits()
-                            | self.command.bits() & !writable.bits(),
-                    );
-                }
+            0x04 if byte_off < 2 => {
+                // Build a full 16-bit value considering byte offset
+                let shift = byte_off * 8;
+                let mask = size_mask(len) << shift;
+                let old_bits = u32::from(self.command.bits());
+                let new_bits = (old_bits & !mask) | ((val << shift) & mask);
+                // Only the defined command bits are writable
+                let writable = bits::RegCmd::IO_EN
+                    | bits::RegCmd::MMIO_EN
+                    | bits::RegCmd::BUSMSTR_EN
+                    | bits::RegCmd::INTX_DIS;
+                self.command = bits::RegCmd::from_bits_truncate(
+                    (new_bits as u16) & writable.bits()
+                        | self.command.bits() & !writable.bits(),
+                );
                 // Writes to the status register (offset 0x06-0x07) are
                 // handled as write-1-to-clear but we have nothing clearable
                 // right now, so they are ignored.
             }
             // 0x0C: Header Type (byte at offset 0x0E) — only the
             // multi-function bit (0x80) is writable by the bus layer.
-            0x0C => {
-                // Header type is byte 2 of this dword (offset 0x0E)
-                if byte_off == 2 && len == 1 {
-                    self.header_type = val as u8;
-                }
+            // Header type is byte 2 of this dword (offset 0x0E).
+            0x0C if byte_off == 2 && len == 1 => {
+                self.header_type = val as u8;
             }
             // 0x10-0x24: BAR writes
-            bar_off @ 0x10..=0x24 if (bar_off & 0x03) == 0 => {
-                // BAR writes must be dword-aligned, full-width
-                if byte_off == 0 && len == 4 {
-                    let bar_idx = (bar_off - 0x10) / 4;
-                    if let Ok(bar_n) = BarN::try_from(bar_idx as u8) {
-                        self.bars.reg_write(bar_n, val);
-                    }
+            bar_off @ 0x10..=0x24
+                if (bar_off & 0x03) == 0 && byte_off == 0 && len == 4 =>
+            {
+                // BAR writes must be dword-aligned and full-width.
+                let bar_idx = (bar_off - 0x10) / 4;
+                if let Ok(bar_n) = BarN::try_from(bar_idx) {
+                    self.bars.reg_write(bar_n, val);
                 }
             }
             // 0x3C: Interrupt Line (byte at offset 0x3C is writable)
-            0x3C => {
-                if byte_off == 0 && len >= 1 {
-                    self.intr_line = val as u8;
-                }
+            0x3C if byte_off == 0 && len >= 1 => {
+                self.intr_line = val as u8;
             }
             // All other fields: read-only, ignored
             _ => {}

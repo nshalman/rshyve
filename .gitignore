@@ -1,3 +1,15 @@
 target/
+
+# Kernel fast-boot experiment artifacts. The bzImage is GPL-2.0 and its
+# source is not tracked, so it must never be committed.
 kernel/linux-*.tar.xz
 kernel/vmlinuz-*
+
+# Agent and editor scratch state
+/.claude/
+/.codex/
+CLAUDE.local.md
+*.local.md
+
+# Operator-specific test configuration
+/.env

@@ -1,0 +1,30 @@
+# gitleaks configuration.
+#
+# Starts from the upstream rule set and narrows the paths that are not
+# ours to fix. A full-history scan over this repository was clean at the
+# time this file was added; the job exists to keep it that way.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Paths that are vendored, archived, or intentionally sample data"
+
+paths = [
+  # Vendored upstream C. Not ours to rewrite, and its test vectors trip
+  # entropy heuristics constantly.
+  '''^third_party/''',
+  # Historical LLM audit output, explicitly marked non-authoritative.
+  '''^docs/archive/''',
+  # Verbatim OASIS specification.
+  '''^docs/virtio-v1\.3-csd01\.html$''',
+  # Pinned upstream artifact digests, not credentials.
+  '''^THIRD_PARTY\.md$''',
+  '''^tools/fetch-edk2-bhyve\.sh$''',
+]
+
+regexes = [
+  # docs/testing.md uses a fixed MAC for the lab test VNIC. It is not a
+  # credential and it is not routable off the test network.
+  '''02:08:20:aa:bb:cc''',
+]

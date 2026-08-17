@@ -9,11 +9,13 @@
 
 pub mod codec;
 pub mod destination;
+pub mod limits;
+pub mod pages;
 pub mod protocol;
 pub mod source;
 pub mod state;
-pub mod sync_source;
 pub mod sync_destination;
+pub mod sync_source;
 
 /// A stream that can be either a TCP connection or a Unix socket.
 /// Implements AsyncRead + AsyncWrite so it can be used with the

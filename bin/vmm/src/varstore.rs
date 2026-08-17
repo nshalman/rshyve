@@ -27,8 +27,8 @@ const CFI_BCS_READ_ARRAY: u8 = 0xFF;
 const PAGE_SIZE: usize = 4096;
 const MAX_VARSTORE_SIZE: u64 = 16 * 1024 * 1024;
 const EFI_SYSTEM_NV_DATA_FV_GUID: [u8; 16] = [
-    0x8d, 0x2b, 0xf1, 0xff, 0x96, 0x76, 0x8b, 0x4c,
-    0xa9, 0x85, 0x27, 0x47, 0x07, 0x5b, 0x4f, 0x50,
+    0x8d, 0x2b, 0xf1, 0xff, 0x96, 0x76, 0x8b, 0x4c, 0xa9, 0x85, 0x27, 0x47,
+    0x07, 0x5b, 0x4f, 0x50,
 ];
 
 struct Cfi {
@@ -115,10 +115,7 @@ impl VarFile {
         Self::open_with_logger(path, &log)
     }
 
-    fn open_with_logger(
-        path: &Path,
-        log: &Logger,
-    ) -> anyhow::Result<Self> {
+    fn open_with_logger(path: &Path, log: &Logger) -> anyhow::Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -152,7 +149,7 @@ impl VarFile {
             MAX_VARSTORE_SIZE,
         );
         ensure!(
-            file_len % PAGE_SIZE as u64 == 0,
+            file_len.is_multiple_of(PAGE_SIZE as u64),
             "variable store {} size ({} bytes) is not page-aligned (must be multiple of {})",
             path.display(),
             file_len,
@@ -235,8 +232,8 @@ fn validate_header(
         path.display(),
     );
     let fv_length = u64::from_le_bytes([
-        header[32], header[33], header[34], header[35],
-        header[36], header[37], header[38], header[39],
+        header[32], header[33], header[34], header[35], header[36], header[37],
+        header[38], header[39],
     ]);
     ensure!(
         fv_length == len as u64,
@@ -251,7 +248,7 @@ fn validate_header(
 
     let header_len = u16::from_le_bytes([header[48], header[49]]) as usize;
     ensure!(
-        (56..=len).contains(&header_len) && header_len % 8 == 0,
+        (56..=len).contains(&header_len) && header_len.is_multiple_of(8),
         "variable store {} has invalid firmware volume header length ({header_len})",
         path.display(),
     );
@@ -267,9 +264,10 @@ fn validate_header(
         header[55],
     );
 
-    file.seek(SeekFrom::Start(header_len as u64)).with_context(|| {
-        format!("cannot seek variable store header: {}", path.display())
-    })?;
+    file.seek(SeekFrom::Start(header_len as u64))
+        .with_context(|| {
+            format!("cannot seek variable store header: {}", path.display())
+        })?;
     let mut store_header = [0u8; 22];
     file.read_exact(&mut store_header).with_context(|| {
         format!("cannot read variable store metadata: {}", path.display())
@@ -351,8 +349,7 @@ impl Lifecycle for VarStore {
 
     fn flush_backing(&self, _intent: FlushIntent) -> Result<(), FlushError> {
         let mut inner = self.inner.lock().map_err(|_| {
-            FlushError::Sync(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            FlushError::Sync(std::io::Error::other(
                 "variable store lock was poisoned",
             ))
         })?;
@@ -426,11 +423,9 @@ mod tests {
 
     fn valid_store(len: usize) -> Vec<u8> {
         let mut store = vec![0xFF; len];
-        store[..PRISTINE_PROLOGUE.len()]
-            .copy_from_slice(&PRISTINE_PROLOGUE);
+        store[..PRISTINE_PROLOGUE.len()].copy_from_slice(&PRISTINE_PROLOGUE);
         store[32..40].copy_from_slice(&(len as u64).to_le_bytes());
-        store[88..92]
-            .copy_from_slice(&((len - 0x48) as u32).to_le_bytes());
+        store[88..92].copy_from_slice(&((len - 0x48) as u32).to_le_bytes());
         store
     }
 
@@ -576,12 +571,8 @@ mod tests {
     fn offset_usize_overflow_is_rejected() {
         let mut cfi = Cfi::new();
         let mut store = vec![0xFF; 16];
-        let (accepted, bytes) = cfi_read(
-            &mut cfi,
-            &mut store,
-            usize::MAX - 3,
-            8,
-        );
+        let (accepted, bytes) =
+            cfi_read(&mut cfi, &mut store, usize::MAX - 3, 8);
         assert!(!accepted);
         assert_eq!(bytes, [0; 8]);
     }
@@ -684,8 +675,7 @@ mod tests {
     #[test]
     fn accepts_pristine_header() {
         let mut store = vec![0xFF; PRISTINE_LEN];
-        store[..PRISTINE_PROLOGUE.len()]
-            .copy_from_slice(&PRISTINE_PROLOGUE);
+        store[..PRISTINE_PROLOGUE.len()].copy_from_slice(&PRISTINE_PROLOGUE);
         let scratch = ScratchFile::with_contents(&store);
         let file = VarFile::open(&scratch.path).expect("open pristine store");
         assert_eq!(file.len(), PRISTINE_LEN);
@@ -698,20 +688,24 @@ mod tests {
                 Ok(_) => panic!("second process acquired variable store lock"),
                 Err(error) => error,
             };
-            assert!(error.to_string().contains("locked by another vmm process"));
+            assert!(error
+                .to_string()
+                .contains("locked by another vmm process"));
             return;
         }
 
         let scratch = ScratchFile::with_contents(&vec![0xFF; PAGE_SIZE]);
         let held = VarFile::open(&scratch.path).expect("open first store");
-        let output = Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "varstore::tests::second_open_of_same_path_fails_with_lock_error",
-            ])
-            .env(LOCK_PROBE_PATH, &scratch.path)
-            .output()
-            .expect("run lock probe");
+        let output = Command::new(
+            std::env::current_exe().expect("test executable"),
+        )
+        .args([
+            "--exact",
+            "varstore::tests::second_open_of_same_path_fails_with_lock_error",
+        ])
+        .env(LOCK_PROBE_PATH, &scratch.path)
+        .output()
+        .expect("run lock probe");
         assert!(
             output.status.success(),
             "lock probe failed: {}",

@@ -6,7 +6,7 @@
 //!
 //! Listens on a path specified by `--control-socket` and accepts
 //! newline-delimited JSON commands. Each command produces a single
-//! JSON response line. Only one client connection is served at a time.
+//! JSON response line. Up to eight client connections are served concurrently.
 //!
 //! # Protocol
 //!
@@ -24,10 +24,10 @@
 //! | `reset`    | Guest restart (VM_SUSPEND_RESET); VMM re-execs |
 //! | `stop`     | Immediate VM halt (VM_SUSPEND_HALT)          |
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,13 +39,19 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::{MemCtx, PhysMap};
 
 use crate::host_state::HostLocalState;
+use crate::peercred::PeerCred;
+
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_CONNECTIONS: usize = 8;
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Error type ──────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
     #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -56,10 +62,10 @@ pub enum ControlError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VmRunState {
-    Running   = 0,
-    Paused    = 1,
-    Stopping  = 2,
-    Stopped   = 3,
+    Running = 0,
+    Paused = 1,
+    Stopping = 2,
+    Stopped = 3,
     Migrating = 4,
 }
 
@@ -102,6 +108,8 @@ pub struct VmController {
 }
 
 impl VmController {
+    // Construction mirrors the independently owned VM subsystems.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         hdl: Arc<VmmHdl>,
         physmap: Arc<PhysMap>,
@@ -184,38 +192,66 @@ impl VmController {
                 });
             }
             if let Some(nvme) = dev.export_nvme_state() {
-                nvme_controllers.push(vmm_migrate::codec::NvmeControllerState {
-                    cc: nvme.cc,
-                    csts: nvme.csts,
-                    aqa: nvme.aqa,
-                    asq_base: nvme.asq_base,
-                    acq_base: nvme.acq_base,
-                    admin_sq: nvme.admin_sq.map(|sq| vmm_migrate::codec::NvmeSqState {
-                        base: sq.base, size: sq.size, head: sq.head,
-                        tail: sq.tail, cq_id: sq.cq_id,
-                    }),
-                    admin_cq: nvme.admin_cq.map(|cq| vmm_migrate::codec::NvmeCqState {
-                        base: cq.base, size: cq.size, head: cq.head,
-                        tail: cq.tail, phase: cq.phase, iv: cq.iv,
-                    }),
-                    io_sqs: nvme.io_sqs.into_iter().map(|sq| {
-                        sq.map(|sq| vmm_migrate::codec::NvmeSqState {
-                            base: sq.base, size: sq.size, head: sq.head,
-                            tail: sq.tail, cq_id: sq.cq_id,
-                        })
-                    }).collect(),
-                    io_cqs: nvme.io_cqs.into_iter().map(|cq| {
-                        cq.map(|cq| vmm_migrate::codec::NvmeCqState {
-                            base: cq.base, size: cq.size, head: cq.head,
-                            tail: cq.tail, phase: cq.phase, iv: cq.iv,
-                        })
-                    }).collect(),
-                    num_io_queues: nvme.num_io_queues,
-                    pci_command: nvme.pci_command,
-                    pci_bar_addrs: nvme.pci_bar_addrs,
-                    msix_entries: nvme.msix_entries,
-                    msix_enabled: nvme.msix_enabled,
-                });
+                nvme_controllers.push(
+                    vmm_migrate::codec::NvmeControllerState {
+                        cc: nvme.cc,
+                        csts: nvme.csts,
+                        aqa: nvme.aqa,
+                        asq_base: nvme.asq_base,
+                        acq_base: nvme.acq_base,
+                        admin_sq: nvme.admin_sq.map(|sq| {
+                            vmm_migrate::codec::NvmeSqState {
+                                base: sq.base,
+                                size: sq.size,
+                                head: sq.head,
+                                tail: sq.tail,
+                                cq_id: sq.cq_id,
+                            }
+                        }),
+                        admin_cq: nvme.admin_cq.map(|cq| {
+                            vmm_migrate::codec::NvmeCqState {
+                                base: cq.base,
+                                size: cq.size,
+                                head: cq.head,
+                                tail: cq.tail,
+                                phase: cq.phase,
+                                iv: cq.iv,
+                            }
+                        }),
+                        io_sqs: nvme
+                            .io_sqs
+                            .into_iter()
+                            .map(|sq| {
+                                sq.map(|sq| vmm_migrate::codec::NvmeSqState {
+                                    base: sq.base,
+                                    size: sq.size,
+                                    head: sq.head,
+                                    tail: sq.tail,
+                                    cq_id: sq.cq_id,
+                                })
+                            })
+                            .collect(),
+                        io_cqs: nvme
+                            .io_cqs
+                            .into_iter()
+                            .map(|cq| {
+                                cq.map(|cq| vmm_migrate::codec::NvmeCqState {
+                                    base: cq.base,
+                                    size: cq.size,
+                                    head: cq.head,
+                                    tail: cq.tail,
+                                    phase: cq.phase,
+                                    iv: cq.iv,
+                                })
+                            })
+                            .collect(),
+                        num_io_queues: nvme.num_io_queues,
+                        pci_command: nvme.pci_command,
+                        pci_bar_addrs: nvme.pci_bar_addrs,
+                        msix_entries: nvme.msix_entries,
+                        msix_enabled: nvme.msix_enabled,
+                    },
+                );
             }
         }
         Ok(vmm_migrate::sync_source::DeviceQueueExport {
@@ -252,6 +288,8 @@ impl VmController {
     }
 
     /// Halt all devices: permanent shutdown.
+    // Kept for the pending graceful device-stop sequence.
+    #[allow(dead_code)]
     fn halt_devices(&self) {
         for dev in &self.devices {
             dev.halt();
@@ -322,6 +360,25 @@ enum Command {
     Metrics,
     #[serde(rename = "metrics-prometheus")]
     MetricsPrometheus,
+}
+
+impl Command {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Shutdown => "shutdown",
+            Self::Reset => "reset",
+            Self::Stop => "stop",
+            Self::MigrateSource { .. } => "migrate-source",
+            Self::MigrateDest { .. } => "migrate-dest",
+            Self::MigrateStatus => "migrate-status",
+            Self::MigrateConfig => "migrate-config",
+            Self::Metrics => "metrics",
+            Self::MetricsPrometheus => "metrics-prometheus",
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -424,7 +481,8 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                 return Response::err("VM is not running");
             }
             if let Err(stuck) = ctrl.pause_devices() {
-                ctrl.state.store(VmRunState::Running as u8, Ordering::Release);
+                ctrl.state
+                    .store(VmRunState::Running as u8, Ordering::Release);
                 return Response::err(&format!(
                     "device pause timed out: {:?}",
                     stuck,
@@ -438,7 +496,8 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                 }
                 Err(e) => {
                     ctrl.resume_devices();
-                    ctrl.state.store(VmRunState::Running as u8, Ordering::Release);
+                    ctrl.state
+                        .store(VmRunState::Running as u8, Ordering::Release);
                     error!(ctrl.log, "pause failed"; "error" => %e);
                     Response::err("pause ioctl failed")
                 }
@@ -458,7 +517,8 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                     r
                 }
                 Err(e) => {
-                    ctrl.state.store(VmRunState::Paused as u8, Ordering::Release);
+                    ctrl.state
+                        .store(VmRunState::Paused as u8, Ordering::Release);
                     error!(ctrl.log, "resume failed"; "error" => %e);
                     Response::err("resume ioctl failed")
                 }
@@ -470,7 +530,8 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             if cur != VmRunState::Running && cur != VmRunState::Paused {
                 return Response::err("VM is not running or paused");
             }
-            ctrl.state.store(VmRunState::Stopping as u8, Ordering::Release);
+            ctrl.state
+                .store(VmRunState::Stopping as u8, Ordering::Release);
 
             // If paused, resume first so vCPUs can receive the suspend
             if cur == VmRunState::Paused {
@@ -479,10 +540,10 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             }
 
             use bhyve_api::vm_suspend_how;
-            match ctrl.hdl.suspend(
-                vm_suspend_how::VM_SUSPEND_POWEROFF as u32,
-                0,
-            ) {
+            match ctrl
+                .hdl
+                .suspend(vm_suspend_how::VM_SUSPEND_POWEROFF as u32, 0)
+            {
                 Ok(()) => {
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Stopping);
@@ -501,7 +562,8 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             if cur != VmRunState::Running && cur != VmRunState::Paused {
                 return Response::err("VM is not running or paused");
             }
-            ctrl.state.store(VmRunState::Stopping as u8, Ordering::Release);
+            ctrl.state
+                .store(VmRunState::Stopping as u8, Ordering::Release);
 
             // If paused, resume first so vCPUs can receive the suspend
             if cur == VmRunState::Paused {
@@ -510,10 +572,10 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             }
 
             use bhyve_api::vm_suspend_how;
-            match ctrl.hdl.suspend(
-                vm_suspend_how::VM_SUSPEND_RESET as u32,
-                -1,
-            ) {
+            match ctrl
+                .hdl
+                .suspend(vm_suspend_how::VM_SUSPEND_RESET as u32, -1)
+            {
                 Ok(()) => {
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Stopping);
@@ -532,7 +594,8 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             if cur == VmRunState::Stopped || cur == VmRunState::Stopping {
                 return Response::err("VM is already stopped/stopping");
             }
-            ctrl.state.store(VmRunState::Stopping as u8, Ordering::Release);
+            ctrl.state
+                .store(VmRunState::Stopping as u8, Ordering::Release);
 
             if cur == VmRunState::Paused {
                 // best-effort: if resume fails, suspend below will also fail
@@ -540,10 +603,7 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             }
 
             use bhyve_api::vm_suspend_how;
-            match ctrl.hdl.suspend(
-                vm_suspend_how::VM_SUSPEND_HALT as u32,
-                0,
-            ) {
+            match ctrl.hdl.suspend(vm_suspend_how::VM_SUSPEND_HALT as u32, 0) {
                 Ok(()) => {
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Stopping);
@@ -557,12 +617,16 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             }
         }
 
-        Command::MigrateSource { target_addr, zfs_barrier } => {
+        Command::MigrateSource {
+            target_addr,
+            zfs_barrier,
+        } => {
             // Validate the target address to prevent SSRF. Require
             // it to be a valid host:port and reject obviously-dangerous
             // targets like localhost, link-local, and multicast.
             // Skip TCP validation for Unix socket paths
-            if !target_addr.starts_with('/') && !target_addr.ends_with(".sock") {
+            if !target_addr.starts_with('/') && !target_addr.ends_with(".sock")
+            {
                 if let Err(e) = validate_migration_addr(&target_addr) {
                     return Response::err(&format!("invalid target_addr: {e}"));
                 }
@@ -572,9 +636,8 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                 return Response::err("VM must be running to start migration");
             }
 
-            let status = Arc::new(Mutex::new(
-                vmm_migrate::MigrationStatus::default(),
-            ));
+            let status =
+                Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
 
             // Store status for later query
             if let Ok(mut ms) = ctrl.migrate_status.lock() {
@@ -588,8 +651,8 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             let mem_size = ctrl.mem_size as u64;
             let mlog = ctrl.log.clone();
 
-            let is_unix = target_addr.starts_with('/')
-                || target_addr.ends_with(".sock");
+            let is_unix =
+                target_addr.starts_with('/') || target_addr.ends_with(".sock");
 
             if let Err(e) = thread::Builder::new()
                 .name("migrate-source".into())
@@ -599,7 +662,7 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                         // bhyve zones without /dev/poll).
                         info!(mlog, "connecting to migration socket";
                             "path" => &target_addr);
-                        let stream = match std::os::unix::net::UnixStream::connect(
+                        let stream = match UnixStream::connect(
                             &target_addr,
                         ) {
                             Ok(s) => s,
@@ -759,14 +822,11 @@ fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                     "VM must be running or paused to receive migration",
                 );
             }
-            ctrl.state.store(
-                VmRunState::Migrating as u8,
-                Ordering::Release,
-            );
+            ctrl.state
+                .store(VmRunState::Migrating as u8, Ordering::Release);
 
-            let status = Arc::new(Mutex::new(
-                vmm_migrate::MigrationStatus::default(),
-            ));
+            let status =
+                Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
             if let Ok(mut ms) = ctrl.migrate_status.lock() {
                 *ms = Some(Arc::clone(&status));
             }
@@ -969,27 +1029,11 @@ pub fn spawn_control_thread(
     path: &Path,
     ctrl: Arc<VmController>,
     log: Logger,
-) -> std::io::Result<(thread::JoinHandle<()>, PathBuf)> {
-    // Remove stale socket from a previous crash (may not exist)
-    let _ = std::fs::remove_file(path);
-
-    // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Set restrictive umask before bind to avoid TOCTOU race where
-    // the socket is briefly world-accessible between bind and chmod.
-    #[cfg(unix)]
-    let old_umask = unsafe { libc::umask(0o177) }; // creates socket as 0600
-
-    let listener = UnixListener::bind(path);
-
-    // Restore original umask immediately
-    #[cfg(unix)]
-    unsafe { libc::umask(old_umask); }
-
-    let listener = listener?;
+) -> io::Result<(thread::JoinHandle<()>, PathBuf)> {
+    let listener = vmm_core::unixsock::bind_restricted(
+        path,
+        vmm_core::unixsock::SocketPolicy::default(),
+    )?;
 
     let sock_path = path.to_path_buf();
     let cleanup_path = sock_path.clone();
@@ -997,56 +1041,217 @@ pub fn spawn_control_thread(
     let handle = thread::Builder::new()
         .name("control".into())
         .spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        if let Err(e) = handle_connection(&ctrl, &stream, &log) {
-                            warn!(log, "control connection error"; "error" => %e);
-                        }
-                    }
-                    Err(e) => {
-                        error!(log, "control accept error"; "error" => %e);
-                        break;
-                    }
+            let connection_log = log.clone();
+            serve_connections(listener, log, move |stream| {
+                if let Err(e) = handle_connection(&ctrl, &stream, &connection_log) {
+                    warn!(connection_log, "control connection error"; "error" => %e);
                 }
-            }
+            });
         })?;
 
     Ok((handle, cleanup_path))
 }
 
-/// Handle a single client connection: read JSON lines, dispatch, respond.
-fn handle_connection(
-    ctrl: &Arc<VmController>,
-    stream: &std::os::unix::net::UnixStream,
-    log: &Logger,
-) -> Result<(), ControlError> {
-    let reader = BufReader::new(stream);
-    let mut writer = stream;
-    let mut line = String::with_capacity(256);
+struct ConnectionGuard {
+    active: Arc<AtomicUsize>,
+}
 
-    for result in reader.lines() {
-        line.clear();
-        let read_line = result?;
-        if read_line.is_empty() {
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn acquire_connection(active: &Arc<AtomicUsize>) -> Option<ConnectionGuard> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < MAX_CONNECTIONS).then_some(current + 1)
+        })
+        .ok()?;
+    Some(ConnectionGuard {
+        active: Arc::clone(active),
+    })
+}
+
+fn set_connection_deadlines(stream: &UnixStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    Ok(())
+}
+
+fn serve_connections<F>(listener: UnixListener, log: Logger, handler: F)
+where
+    F: Fn(UnixStream) + Send + Sync + 'static,
+{
+    let active = Arc::new(AtomicUsize::new(0));
+    let handler = Arc::new(handler);
+
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!(log, "control accept error"; "error" => %e);
+                break;
+            }
+        };
+
+        if let Err(e) = set_connection_deadlines(&stream) {
+            warn!(log, "failed to set control connection deadlines"; "error" => %e);
             continue;
         }
 
-        match serde_json::from_str::<Command>(&read_line) {
+        let Some(connection_guard) = acquire_connection(&active) else {
+            if let Err(e) =
+                write_error_response(&stream, "too many connections")
+            {
+                warn!(log, "failed to reject excess control connection"; "error" => %e);
+            }
+            continue;
+        };
+
+        let handler = Arc::clone(&handler);
+        let thread_log = log.clone();
+        if let Err(e) = thread::Builder::new()
+            .name("control-connection".into())
+            .spawn(move || {
+                let _guard = connection_guard;
+                handler(stream);
+            })
+        {
+            warn!(thread_log, "failed to spawn control connection thread"; "error" => %e);
+        }
+    }
+}
+
+/// illumos global zone id. A global-zone peer already has full authority
+/// over this zone, so refusing it would protect nothing and would break
+/// vmm-migrate-agent, which runs in the GZ and drives the control socket
+/// of a VMM inside a zone.
+const GLOBAL_ZONEID: i32 = 0;
+
+fn peer_is_authorized(peer: &PeerCred, euid: u32, zoneid: Option<i32>) -> bool {
+    if peer.uid != euid {
+        return false;
+    }
+    match (peer.zoneid, zoneid) {
+        (Some(peer_zone), Some(own_zone)) => {
+            peer_zone == own_zone || peer_zone == GLOBAL_ZONEID
+        }
+        // Platforms without zones: the uid check is the whole policy.
+        (None, None) => true,
+        // One side reported a zone and the other did not. Fail closed.
+        _ => false,
+    }
+}
+
+fn request_too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "control request exceeds maximum size",
+    )
+}
+
+/// Read one newline-delimited request without allowing `buf` to exceed the cap.
+/// Returns `false` only when EOF is reached before any request bytes are read.
+fn read_request<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> io::Result<bool> {
+    buf.clear();
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(!buf.is_empty());
+        }
+
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n')
+        {
+            let consumed = newline + 1;
+            if consumed > MAX_REQUEST_BYTES - buf.len() {
+                return Err(request_too_large());
+            }
+            buf.extend_from_slice(&available[..consumed]);
+            reader.consume(consumed);
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Ok(true);
+        }
+
+        if available.len() > MAX_REQUEST_BYTES - buf.len() {
+            return Err(request_too_large());
+        }
+        let consumed = available.len();
+        buf.extend_from_slice(available);
+        reader.consume(consumed);
+    }
+}
+
+fn write_error_response(
+    stream: &UnixStream,
+    message: &str,
+) -> Result<(), ControlError> {
+    let response = Response::err(message);
+    let mut out = serde_json::to_vec(&response)?;
+    out.push(b'\n');
+    let mut writer = stream;
+    writer.write_all(&out)?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Handle a single client connection: read JSON lines, dispatch, respond.
+fn handle_connection(
+    ctrl: &Arc<VmController>,
+    stream: &UnixStream,
+    log: &Logger,
+) -> Result<(), ControlError> {
+    let peer = crate::peercred::peer_cred(stream)?;
+    let euid = unsafe { libc::geteuid() };
+    let zoneid = crate::peercred::process_zoneid()?;
+    if !peer_is_authorized(&peer, euid, zoneid) {
+        warn!(log, "rejected control connection"; "uid" => peer.uid);
+        return Ok(());
+    }
+
+    let mut reader = BufReader::new(stream);
+    let mut writer = stream;
+    let mut request = Vec::with_capacity(256);
+
+    loop {
+        match read_request(&mut reader, &mut request) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                write_error_response(stream, "request too large")?;
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        }
+        if request.is_empty() {
+            continue;
+        }
+
+        match serde_json::from_slice::<Command>(&request) {
             Ok(cmd) => {
-                info!(log, "control command"; "command" => &read_line);
+                info!(log, "control command"; "command" => cmd.name());
 
                 // Metrics commands return raw text, bypass Response serialization
                 let raw = match &cmd {
                     Command::Metrics => {
                         let uptime = ctrl.start_time.elapsed().as_secs();
-                        let vcpus: Vec<String> = ctrl.vcpu_metrics.iter()
+                        let vcpus: Vec<String> = ctrl
+                            .vcpu_metrics
+                            .iter()
                             .enumerate()
                             .map(|(i, v)| v.to_json(i as i32))
                             .collect();
                         Some(format!(
                             r#"{{"success":true,"uptime_secs":{},"vcpus":[{}]}}"#,
-                            uptime, vcpus.join(","),
+                            uptime,
+                            vcpus.join(","),
                         ))
                     }
                     Command::MetricsPrometheus => {
@@ -1075,14 +1280,17 @@ fn handle_connection(
                 writer.flush()?;
             }
             Err(e) => {
-                warn!(log, "invalid control command"; "error" => %e, "line" => &read_line);
+                warn!(log, "invalid control command";
+                    "error" => %e,
+                    "bytes" => request.len(),
+                );
                 let response = Response::err("invalid command");
                 let mut out = serde_json::to_vec(&response)?;
                 out.push(b'\n');
                 writer.write_all(&out)?;
                 writer.flush()?;
             }
-        };
+        }
     }
 
     Ok(())
@@ -1093,7 +1301,9 @@ fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::mpsc;
 
     struct NeverQuiesces {
         paused: AtomicBool,
@@ -1133,7 +1343,8 @@ mod tests {
             paused: AtomicBool::new(false),
             resume_calls: AtomicUsize::new(0),
         });
-        let devices: Vec<Arc<dyn vmm_devices::Lifecycle>> = vec![device.clone()];
+        let devices: Vec<Arc<dyn vmm_devices::Lifecycle>> =
+            vec![device.clone()];
 
         let result = pause_device_set(&devices, Duration::from_millis(20));
 
@@ -1148,7 +1359,8 @@ mod tests {
             paused: AtomicBool::new(false),
             resume_calls: AtomicUsize::new(0),
         });
-        let devices: Vec<Arc<dyn vmm_devices::Lifecycle>> = vec![device.clone()];
+        let devices: Vec<Arc<dyn vmm_devices::Lifecycle>> =
+            vec![device.clone()];
 
         resume_device_set(&devices);
 
@@ -1174,26 +1386,185 @@ mod tests {
     }
 
     #[test]
+    fn read_request_rejects_oversize_line() {
+        let mut input = vec![b'x'; MAX_REQUEST_BYTES];
+        input.push(b'\n');
+        let mut reader = BufReader::with_capacity(1024, Cursor::new(input));
+        let mut request = Vec::new();
+
+        let error = read_request(&mut reader, &mut request)
+            .expect_err("oversize request must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(request.len() <= MAX_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn read_request_accepts_max_size_line() {
+        let mut input = vec![b'x'; MAX_REQUEST_BYTES - 1];
+        input.push(b'\n');
+        let mut reader = BufReader::with_capacity(1024, Cursor::new(input));
+        let mut request = Vec::new();
+
+        let present = read_request(&mut reader, &mut request)
+            .expect("maximum-size request must be accepted");
+
+        assert!(present);
+        assert_eq!(request.len(), MAX_REQUEST_BYTES - 1);
+    }
+
+    #[test]
+    fn peer_authorization_checks_uid_and_zone() {
+        let local = PeerCred {
+            uid: 42,
+            gid: 7,
+            zoneid: None,
+        };
+        let foreign_uid = PeerCred {
+            uid: 43,
+            gid: 7,
+            zoneid: None,
+        };
+        let same_zone = PeerCred {
+            uid: 42,
+            gid: 7,
+            zoneid: Some(3),
+        };
+        let foreign_zone = PeerCred {
+            uid: 42,
+            gid: 7,
+            zoneid: Some(4),
+        };
+
+        assert!(peer_is_authorized(&local, 42, None));
+        assert!(!peer_is_authorized(&foreign_uid, 42, None));
+        assert!(peer_is_authorized(&same_zone, 42, Some(3)));
+        assert!(!peer_is_authorized(&foreign_zone, 42, Some(3)));
+    }
+
+    #[test]
+    fn global_zone_peer_is_authorized_against_a_zoned_vmm() {
+        // vmm-migrate-agent runs in the GZ and drives the control socket
+        // of a VMM inside a zone. Rejecting it would break migration.
+        let gz_peer = PeerCred {
+            uid: 0,
+            gid: 0,
+            zoneid: Some(GLOBAL_ZONEID),
+        };
+        assert!(peer_is_authorized(&gz_peer, 0, Some(7)));
+
+        // A sibling zone is still refused.
+        let sibling = PeerCred {
+            uid: 0,
+            gid: 0,
+            zoneid: Some(8),
+        };
+        assert!(!peer_is_authorized(&sibling, 0, Some(7)));
+
+        // A GZ peer with the wrong uid is still refused.
+        let wrong_uid = PeerCred {
+            uid: 1,
+            gid: 0,
+            zoneid: Some(GLOBAL_ZONEID),
+        };
+        assert!(!peer_is_authorized(&wrong_uid, 0, Some(7)));
+    }
+
+    #[test]
+    fn mismatched_zone_reporting_fails_closed() {
+        let zoned = PeerCred {
+            uid: 0,
+            gid: 0,
+            zoneid: Some(0),
+        };
+        assert!(!peer_is_authorized(&zoned, 0, None));
+
+        let unzoned = PeerCred {
+            uid: 0,
+            gid: 0,
+            zoneid: None,
+        };
+        assert!(!peer_is_authorized(&unzoned, 0, Some(0)));
+    }
+
+    #[test]
+    fn second_client_is_served_while_first_is_idle() {
+        static NEXT_SOCKET: AtomicUsize = AtomicUsize::new(0);
+
+        let id = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
+        let temp_dir = std::env::temp_dir().join(format!(
+            "vmm-control-concurrency-{}-{id}",
+            std::process::id(),
+        ));
+        std::fs::create_dir(&temp_dir).expect("create control test directory");
+        let path = temp_dir.join("control.sock");
+        let listener =
+            UnixListener::bind(&path).expect("bind control test socket");
+        let log = Logger::root(slog::Discard, slog::o!());
+        let first_connection = Arc::new(AtomicBool::new(true));
+        let first_for_handler = Arc::clone(&first_connection);
+        let (started_tx, started_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            serve_connections(listener, log, move |stream| {
+                if first_for_handler.swap(false, Ordering::AcqRel) {
+                    started_tx.send(()).expect("signal first connection start");
+                }
+                let mut reader = BufReader::new(&stream);
+                let mut request = Vec::new();
+                if matches!(read_request(&mut reader, &mut request), Ok(true)) {
+                    let mut writer = &stream;
+                    writer.write_all(b"ok\n").expect("write test response");
+                }
+            });
+        });
+
+        let _idle = UnixStream::connect(&path).expect("connect idle client");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("idle client handler must start");
+
+        let mut second =
+            UnixStream::connect(&path).expect("connect second client");
+        second
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set test read timeout");
+        second.write_all(b"status\n").expect("write second request");
+        let mut response = String::new();
+        BufReader::new(&second)
+            .read_line(&mut response)
+            .expect("read second response");
+
+        assert_eq!(response, "ok\n");
+        std::fs::remove_file(&path).expect("remove control test socket");
+        std::fs::remove_dir(&temp_dir).expect("remove control test directory");
+    }
+
+    #[test]
     fn command_deserialize_status() {
-        let cmd: Command = serde_json::from_str(r#"{"command":"status"}"#).unwrap();
+        let cmd: Command =
+            serde_json::from_str(r#"{"command":"status"}"#).unwrap();
         assert!(matches!(cmd, Command::Status));
     }
 
     #[test]
     fn command_deserialize_pause() {
-        let cmd: Command = serde_json::from_str(r#"{"command":"pause"}"#).unwrap();
+        let cmd: Command =
+            serde_json::from_str(r#"{"command":"pause"}"#).unwrap();
         assert!(matches!(cmd, Command::Pause));
     }
 
     #[test]
     fn command_deserialize_shutdown() {
-        let cmd: Command = serde_json::from_str(r#"{"command":"shutdown"}"#).unwrap();
+        let cmd: Command =
+            serde_json::from_str(r#"{"command":"shutdown"}"#).unwrap();
         assert!(matches!(cmd, Command::Shutdown));
     }
 
     #[test]
     fn parse_reset_command() {
-        let cmd: Command = serde_json::from_str(r#"{"command":"reset"}"#).unwrap();
+        let cmd: Command =
+            serde_json::from_str(r#"{"command":"reset"}"#).unwrap();
         assert!(matches!(cmd, Command::Reset));
     }
 
@@ -1262,9 +1633,12 @@ mod tests {
                 .contains("host-local state is not carried by migration"));
         }
 
-        assert!(
-            migration_source_guard(HostLocalState::default(), false, &command).is_none()
-        );
+        assert!(migration_source_guard(
+            HostLocalState::default(),
+            false,
+            &command
+        )
+        .is_none());
     }
 
     #[test]
@@ -1274,8 +1648,9 @@ mod tests {
             zfs_barrier: None,
         };
 
-        let response = migration_source_guard(HostLocalState::default(), true, &command)
-            .expect("AHCI CD must block migration");
+        let response =
+            migration_source_guard(HostLocalState::default(), true, &command)
+                .expect("AHCI CD must block migration");
         assert!(!response.success);
         assert_eq!(
             response.error.as_deref(),
@@ -1294,10 +1669,8 @@ mod tests {
 
     #[test]
     fn command_deserialize_migrate_status() {
-        let cmd: Command = serde_json::from_str(
-            r#"{"command":"migrate-status"}"#,
-        )
-        .unwrap();
+        let cmd: Command =
+            serde_json::from_str(r#"{"command":"migrate-status"}"#).unwrap();
         assert!(matches!(cmd, Command::MigrateStatus));
     }
 }

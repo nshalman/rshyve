@@ -9,15 +9,15 @@
 
 // ── Controller register offsets (BAR0) ──────────────────────────
 
-pub const REG_CAP: usize = 0x00;      // Controller Capabilities (8 bytes)
-pub const REG_VS: usize = 0x08;       // Version (4 bytes)
-pub const REG_INTMS: usize = 0x0C;    // Interrupt Mask Set (4 bytes)
-pub const REG_INTMC: usize = 0x10;    // Interrupt Mask Clear (4 bytes)
-pub const REG_CC: usize = 0x14;       // Controller Configuration (4 bytes)
-pub const REG_CSTS: usize = 0x1C;     // Controller Status (4 bytes)
-pub const REG_AQA: usize = 0x24;      // Admin Queue Attributes (4 bytes)
-pub const REG_ASQ: usize = 0x28;      // Admin Submission Queue Base (8 bytes)
-pub const REG_ACQ: usize = 0x30;      // Admin Completion Queue Base (8 bytes)
+pub const REG_CAP: usize = 0x00; // Controller Capabilities (8 bytes)
+pub const REG_VS: usize = 0x08; // Version (4 bytes)
+pub const REG_INTMS: usize = 0x0C; // Interrupt Mask Set (4 bytes)
+pub const REG_INTMC: usize = 0x10; // Interrupt Mask Clear (4 bytes)
+pub const REG_CC: usize = 0x14; // Controller Configuration (4 bytes)
+pub const REG_CSTS: usize = 0x1C; // Controller Status (4 bytes)
+pub const REG_AQA: usize = 0x24; // Admin Queue Attributes (4 bytes)
+pub const REG_ASQ: usize = 0x28; // Admin Submission Queue Base (8 bytes)
+pub const REG_ACQ: usize = 0x30; // Admin Completion Queue Base (8 bytes)
 pub const REG_DOORBELL_BASE: usize = 0x1000; // Start of doorbell registers
 
 /// NVMe version 1.0
@@ -145,29 +145,29 @@ pub const SCT_CMD_SPECIFIC: u16 = 1;
 pub const SQE_SIZE: usize = 64;
 
 /// Offsets within a Submission Queue Entry.
-pub const SQE_OPC: usize = 0;      // Opcode (byte)
-pub const SQE_FLAGS: usize = 1;    // Fused + PSDT
-pub const SQE_CID: usize = 2;      // Command ID (u16)
-pub const SQE_NSID: usize = 4;     // Namespace ID (u32)
-pub const SQE_PRP1: usize = 24;    // PRP Entry 1 (u64)
-pub const SQE_PRP2: usize = 32;    // PRP Entry 2 (u64)
-pub const SQE_CDW10: usize = 40;   // Command DWord 10 (u32)
-pub const SQE_CDW11: usize = 44;   // Command DWord 11 (u32)
-pub const SQE_CDW12: usize = 48;   // Command DWord 12 (u32)
-pub const SQE_CDW13: usize = 52;   // Command DWord 13 (u32)
-pub const SQE_CDW14: usize = 56;   // Command DWord 14 (u32)
-pub const SQE_CDW15: usize = 60;   // Command DWord 15 (u32)
+pub const SQE_OPC: usize = 0; // Opcode (byte)
+pub const SQE_FLAGS: usize = 1; // Fused + PSDT
+pub const SQE_CID: usize = 2; // Command ID (u16)
+pub const SQE_NSID: usize = 4; // Namespace ID (u32)
+pub const SQE_PRP1: usize = 24; // PRP Entry 1 (u64)
+pub const SQE_PRP2: usize = 32; // PRP Entry 2 (u64)
+pub const SQE_CDW10: usize = 40; // Command DWord 10 (u32)
+pub const SQE_CDW11: usize = 44; // Command DWord 11 (u32)
+pub const SQE_CDW12: usize = 48; // Command DWord 12 (u32)
+pub const SQE_CDW13: usize = 52; // Command DWord 13 (u32)
+pub const SQE_CDW14: usize = 56; // Command DWord 14 (u32)
+pub const SQE_CDW15: usize = 60; // Command DWord 15 (u32)
 
 // ── Completion Queue Entry (16 bytes) ──────────────────────────
 
 pub const CQE_SIZE: usize = 16;
 
-pub const CQE_DW0: usize = 0;      // Command-specific result
-pub const CQE_DW1: usize = 4;      // Reserved
-pub const CQE_SQHD: usize = 8;     // SQ Head Pointer (u16)
-pub const CQE_SQID: usize = 10;    // SQ Identifier (u16)
-pub const CQE_CID: usize = 12;     // Command Identifier (u16)
-pub const CQE_STATUS: usize = 14;  // Status Field (u16, includes phase bit)
+pub const CQE_DW0: usize = 0; // Command-specific result
+pub const CQE_DW1: usize = 4; // Reserved
+pub const CQE_SQHD: usize = 8; // SQ Head Pointer (u16)
+pub const CQE_SQID: usize = 10; // SQ Identifier (u16)
+pub const CQE_CID: usize = 12; // Command Identifier (u16)
+pub const CQE_STATUS: usize = 14; // Status Field (u16, includes phase bit)
 
 // ── Queue limits ───────────────────────────────────────────────
 
@@ -206,7 +206,7 @@ pub fn build_identify_controller(
     firmware: &str,
     max_namespaces: u32,
     mdts: u8,
-    max_io_queues: u16,
+    _max_io_queues: u16,
 ) -> [u8; IDENT_CTRL_SIZE] {
     let mut data = [0u8; IDENT_CTRL_SIZE];
 
@@ -228,8 +228,13 @@ pub fn build_identify_controller(
     data[64..72].copy_from_slice(&fr.as_bytes()[..8]);
 
     // CNTLID - Controller ID (bytes 78-79), must be unique per subsystem
-    let cntlid = (serial.as_bytes()[serial.len() - 1] as u16)
-        .wrapping_add(serial.as_bytes().get(serial.len() - 2).copied().unwrap_or(0) as u16);
+    let cntlid = (serial.as_bytes()[serial.len() - 1] as u16).wrapping_add(
+        serial
+            .as_bytes()
+            .get(serial.len() - 2)
+            .copied()
+            .unwrap_or(0) as u16,
+    );
     data[78..80].copy_from_slice(&cntlid.to_le_bytes());
 
     // MDTS - Maximum Data Transfer Size (byte 77)
@@ -286,7 +291,7 @@ pub fn build_identify_namespace(
     // bits 23:16 = LBADS (LBA Data Size, log2)
     // bits 1:0 = RP (Relative Performance) = 0 (best)
     let lbads = block_size.trailing_zeros() as u8; // e.g., 512 → 9, 4096 → 12
-    data[128..132].copy_from_slice(&((u32::from(lbads) << 16)).to_le_bytes());
+    data[128..132].copy_from_slice(&(u32::from(lbads) << 16).to_le_bytes());
 
     data
 }
@@ -305,7 +310,8 @@ mod tests {
 
     #[test]
     fn identify_controller_serial() {
-        let data = build_identify_controller("SN001", "VMM NVMe", "1.0", 1, 5, 15);
+        let data =
+            build_identify_controller("SN001", "VMM NVMe", "1.0", 1, 5, 15);
         let sn = std::str::from_utf8(&data[4..24]).unwrap();
         assert!(sn.starts_with("SN001"));
     }

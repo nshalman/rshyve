@@ -78,7 +78,7 @@ impl PS2Mouse {
                     self.resolution = v;
                 }
                 _ => {
-                    panic!("bad multi-part ps2 cmd {}", cmd);
+                    debug_assert!(false, "bad multi-part ps2 cmd {}", cmd);
                 }
             }
         } else {

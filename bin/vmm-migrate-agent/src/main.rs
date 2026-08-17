@@ -54,7 +54,7 @@ enum Cli {
         max_syncs: u32,
 
         /// SSH key for remote ZFS operations
-        #[arg(long, default_value = "$VMM_LAB_KEY")]
+        #[arg(long)]
         ssh_key: PathBuf,
 
         /// Path to VMM control socket (default: /zones/<uuid>/root/tmp/vmm-migrate.sock)
@@ -82,23 +82,39 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli {
         Cli::Source {
-            uuid, dest_host, dest_port, disk_dataset, dest_dataset,
-            max_syncs, ssh_key, control_socket, skip_zfs,
+            uuid,
+            dest_host,
+            dest_port,
+            disk_dataset,
+            dest_dataset,
+            max_syncs,
+            ssh_key,
+            control_socket,
+            skip_zfs,
         } => {
-            let src_disk = disk_dataset.unwrap_or_else(|| format!("zones/{uuid}/disk0"));
+            let src_disk =
+                disk_dataset.unwrap_or_else(|| format!("zones/{uuid}/disk0"));
             let dst_disk = dest_dataset.unwrap_or_else(|| src_disk.clone());
             let ctl = control_socket.unwrap_or_else(|| {
-                PathBuf::from(format!("/zones/{uuid}/root/tmp/vmm-migrate.sock"))
+                PathBuf::from(format!(
+                    "/zones/{uuid}/root/tmp/vmm-migrate.sock"
+                ))
             });
-            let mig_sock = format!("/zones/{uuid}/root/tmp/vmm-migrate-data.sock");
-            let ssh = format!("ssh -i {} -o StrictHostKeyChecking=no -o IdentitiesOnly=yes",
-                ssh_key.display());
+            let mig_sock =
+                format!("/zones/{uuid}/root/tmp/vmm-migrate-data.sock");
+            let ssh = format!(
+                "ssh -i {} -o StrictHostKeyChecking=no -o IdentitiesOnly=yes",
+                ssh_key.display()
+            );
 
-            run_source(&uuid, &dest_host, dest_port, &src_disk, &dst_disk,
-                max_syncs, &ssh, &ctl, &mig_sock, skip_zfs)
+            run_source(
+                &uuid, &dest_host, dest_port, &src_disk, &dst_disk, max_syncs,
+                &ssh, &ctl, &mig_sock, skip_zfs,
+            )
         }
         Cli::Dest { uuid, port } => {
-            let mig_sock = format!("/zones/{uuid}/root/tmp/vmm-migrate-data.sock");
+            let mig_sock =
+                format!("/zones/{uuid}/root/tmp/vmm-migrate-data.sock");
             run_dest(&uuid, port, &mig_sock)
         }
     }
@@ -109,31 +125,50 @@ fn log(msg: &str) {
 }
 
 fn now() -> String {
-    Command::new("date").arg("+%T").output().ok()
+    Command::new("date")
+        .arg("+%T")
+        .output()
+        .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default().trim().to_string()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 fn run_source(
-    uuid: &str, dest_host: &str, dest_port: u16,
-    src_disk: &str, dst_disk: &str, max_syncs: u32,
-    ssh: &str, ctl: &std::path::Path, mig_sock: &str,
+    uuid: &str,
+    dest_host: &str,
+    dest_port: u16,
+    src_disk: &str,
+    dst_disk: &str,
+    max_syncs: u32,
+    ssh: &str,
+    ctl: &std::path::Path,
+    mig_sock: &str,
     skip_zfs: bool,
 ) -> anyhow::Result<()> {
-
     // ── Phase 1-3: ZFS sync ─────────────────────────────────────
     // Dest VM must NOT be running during ZFS recv (zvol would be busy).
     // The source agent starts the dest VM after ZFS is complete.
     if !skip_zfs {
         log("Phase 1: ZFS snapshot + full send");
-        let zone_ds = src_disk.rsplit_once('/').map(|(p, _)| p).unwrap_or(src_disk);
+        let zone_ds = src_disk
+            .rsplit_once('/')
+            .map(|(p, _)| p)
+            .unwrap_or(src_disk);
         let _ = sh(&format!("zfs set quota=none {zone_ds}"));
         let _ = sh(&format!("zfs set refreservation=none {src_disk}"));
 
         // Clean ALL old migration snapshots on both sides
-        for snap in &["vmm-mig-base", "vmm-mig-final",
-                      "vmm-mig-iter-1", "vmm-mig-iter-2", "vmm-mig-iter-3",
-                      "vmm-mig-live", "vmm-mig-fresh"] {
+        for snap in &[
+            "vmm-mig-base",
+            "vmm-mig-final",
+            "vmm-mig-iter-1",
+            "vmm-mig-iter-2",
+            "vmm-mig-iter-3",
+            "vmm-mig-live",
+            "vmm-mig-fresh",
+        ] {
             let _ = sh(&format!("zfs destroy {src_disk}@{snap} 2>/dev/null"));
             let _ = sh(&format!("{ssh} root@{dest_host} 'zfs destroy {dst_disk}@{snap} 2>/dev/null'"));
         }
@@ -171,7 +206,9 @@ fn run_source(
     ));
     match start_result {
         Ok(()) => log("  dest VM started"),
-        Err(e) => log(&format!("  dest VM start (may be already running): {e}")),
+        Err(e) => {
+            log(&format!("  dest VM start (may be already running): {e}"))
+        }
     }
     // Give the VMM a moment to boot and connect to the Unix socket
     std::thread::sleep(std::time::Duration::from_secs(3));
@@ -300,8 +337,10 @@ fn run_dest(_uuid: &str, port: u16, mig_sock: &str) -> anyhow::Result<()> {
             .context("bind VMM socket")?;
         log(&format!("  created {mig_sock}"));
 
-        let tcp_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await
-            .context("bind TCP")?;
+        let tcp_listener =
+            tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+                .await
+                .context("bind TCP")?;
         log(&format!("  listening on 0.0.0.0:{port}"));
         log("  waiting for source agent + dest VMM connections...");
 
@@ -335,7 +374,9 @@ fn run_dest(_uuid: &str, port: u16, mig_sock: &str) -> anyhow::Result<()> {
 }
 
 fn sh(cmd: &str) -> anyhow::Result<()> {
-    let st = Command::new("bash").args(["-c", cmd]).status()
+    let st = Command::new("bash")
+        .args(["-c", cmd])
+        .status()
         .with_context(|| format!("run: {cmd}"))?;
     if !st.success() {
         bail!("exit {}: {}", st.code().unwrap_or(-1), cmd);

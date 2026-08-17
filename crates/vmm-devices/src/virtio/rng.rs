@@ -14,12 +14,18 @@
 
 use vmm_core::mem::PhysMap;
 
-use crate::Lifecycle;
 use super::queue::VirtQueue;
 use super::VirtioDevice;
+use crate::Lifecycle;
 
 /// VirtIO entropy device (type 4).
 pub struct VirtioRng;
+
+impl Default for VirtioRng {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl VirtioRng {
     pub fn new() -> Self {
@@ -129,8 +135,7 @@ fn getrandom(buf: &mut [u8]) {
     use std::io::Read;
     let mut f = std::fs::File::open("/dev/urandom")
         .expect("failed to open /dev/urandom");
-    f.read_exact(buf)
-        .expect("failed to read from /dev/urandom");
+    f.read_exact(buf).expect("failed to read from /dev/urandom");
 }
 
 #[cfg(test)]

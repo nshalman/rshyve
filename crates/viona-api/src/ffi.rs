@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copied from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: crates/viona-api/src/ffi.rs
+// https://github.com/oxidecomputer/propolis
 
 #![allow(non_camel_case_types)]
 
@@ -45,16 +49,6 @@ pub const VNA_IOC_GET_PAIRS: i32 = vna_ioc(0x30);
 pub const VNA_IOC_SET_PAIRS: i32 = vna_ioc(0x31);
 pub const VNA_IOC_GET_USEPAIRS: i32 = vna_ioc(0x32);
 pub const VNA_IOC_SET_USEPAIRS: i32 = vna_ioc(0x33);
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_vna_ioc() {
-        assert_eq!(vna_ioc(0x22), 0x00_56_43_22);
-    }
-}
 
 /// The minimum number of queue pairs supported by a device.
 pub const VIONA_MIN_QPAIR: usize = 1;
@@ -167,3 +161,13 @@ pub const VIONA_CURRENT_INTERFACE_VERSION: u32 = 6;
 
 /// Maximum size of packed nvlists used in viona parameter ioctls
 pub const VIONA_MAX_PARAM_NVLIST_SZ: usize = 4096;
+
+#[cfg(test)]
+mod test {
+    use super::vna_ioc;
+
+    #[test]
+    fn test_vna_ioc() {
+        assert_eq!(vna_ioc(0x22), 0x00_56_43_22);
+    }
+}

@@ -1,9 +1,12 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Portions derived from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: lib/propolis/src/hw/ps2/ctrl.rs
+// https://github.com/oxidecomputer/propolis
 
 use std::convert::TryFrom;
-use std::mem::replace;
 use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
@@ -100,8 +103,21 @@ mod probes {
     fn ps2ctrl_pulse_aux() {}
 
     // keyboard event probes
-    fn ps2ctrl_keyevent(keysym_raw: u32, scan_code_set: u8, s0: u8, s1: u8, s2: u8, s3: u8) {}
-    fn ps2ctrl_keyevent_dropped(keysym_raw: u32, is_pressed: u8, scan_code_set: u8) {}
+    fn ps2ctrl_keyevent(
+        keysym_raw: u32,
+        scan_code_set: u8,
+        s0: u8,
+        s1: u8,
+        s2: u8,
+        s3: u8,
+    ) {
+    }
+    fn ps2ctrl_keyevent_dropped(
+        keysym_raw: u32,
+        is_pressed: u8,
+        scan_code_set: u8,
+    ) {
+    }
 
     // internal device buffer writes
     fn ps2ctrl_keyboard_data(v: u8) {}
@@ -317,7 +333,12 @@ const PS2C_CMD_WRITE_AUX_IN: u8 = 0xd4;
 const PS2C_CMD_PULSE_START: u8 = 0xf0;
 const PS2C_CMD_PULSE_END: u8 = 0xff;
 
-const PS2C_RAM_LEN: usize = (PS2C_CMD_WRITE_RAM_END - PS2C_CMD_WRITE_RAM_START) as usize;
+const PS2C_RAM_LEN: usize =
+    (PS2C_CMD_WRITE_RAM_END - PS2C_CMD_WRITE_RAM_START) as usize + 1;
+const _: () = assert!(
+    PS2C_RAM_LEN
+        == (PS2C_CMD_READ_RAM_END - PS2C_CMD_READ_RAM_START) as usize + 1
+);
 
 #[derive(Default)]
 struct PS2State {
@@ -353,16 +374,18 @@ impl PS2Ctrl {
         reset_sink: Option<Arc<dyn SuspendSink>>,
     ) {
         let data_ctrl = Arc::clone(self);
-        let data_handler: Arc<PioFn> = Arc::new(move |_offset: u16, rwo: RWOp<'_>| {
-            data_ctrl.pio_rw(PORT_PS2_DATA, rwo);
-        });
+        let data_handler: Arc<PioFn> =
+            Arc::new(move |_offset: u16, rwo: RWOp<'_>| {
+                data_ctrl.pio_rw(PORT_PS2_DATA, rwo);
+            });
         bus.register(PORT_PS2_DATA, 1, data_handler)
             .expect("PS2Ctrl: data port conflict during attach");
 
         let status_ctrl = Arc::clone(self);
-        let status_handler: Arc<PioFn> = Arc::new(move |_offset: u16, rwo: RWOp<'_>| {
-            status_ctrl.pio_rw(PORT_PS2_CMD_STATUS, rwo);
-        });
+        let status_handler: Arc<PioFn> =
+            Arc::new(move |_offset: u16, rwo: RWOp<'_>| {
+                status_ctrl.pio_rw(PORT_PS2_CMD_STATUS, rwo);
+            });
         bus.register(PORT_PS2_CMD_STATUS, 1, status_handler)
             .expect("PS2Ctrl: command/status port conflict during attach");
 
@@ -375,12 +398,8 @@ impl PS2Ctrl {
     pub fn key_event(&self, ke: KeyEvent) {
         let mut state = self.state.lock().unwrap();
         let translate = state.ctrl_cfg.contains(CtrlCfg::PRI_XLATE_EN);
-        let key_rep;
-
-        match KeyEventRep::try_from(ke) {
-            Ok(kr) => {
-                key_rep = kr;
-            }
+        let key_rep = match KeyEventRep::try_from(ke) {
+            Ok(kr) => kr,
             Err(_) => {
                 // ignore any unrecognized keys
                 probes::ps2ctrl_keyevent_dropped!(|| {
@@ -432,8 +451,7 @@ impl PS2Ctrl {
         self.update_intr(&mut state);
     }
 
-    fn pio_rw(&self, port: u16, rwo: RWOp) {
-        assert_eq!(rwo.len(), 1);
+    fn pio_rw(&self, port: u16, rwo: RWOp<'_>) {
         match port {
             PORT_PS2_DATA => match rwo {
                 RWOp::Read(ro) => ro.write_u8(self.data_read()),
@@ -445,14 +463,14 @@ impl PS2Ctrl {
                 RWOp::Write(wo) => self.cmd_write(wo.read_u8()),
             },
             _ => {
-                panic!("unexpected pio in {:x}", port);
+                debug_assert!(false, "unexpected pio in {:x}", port);
             }
         }
     }
 
     fn data_write(&self, v: u8) {
         let mut state = self.state.lock().unwrap();
-        let cmd_prefix = replace(&mut state.cmd_prefix, None);
+        let cmd_prefix = state.cmd_prefix.take();
 
         probes::ps2ctrl_data_write!(|| v);
 
@@ -468,8 +486,10 @@ impl PS2Ctrl {
                     state.ctrl_cfg = cfg;
                 }
                 PS2C_CMD_WRITE_RAM_START..=PS2C_CMD_WRITE_RAM_END => {
-                    let off = v - PS2C_CMD_WRITE_RAM_START;
-                    state.ram[off as usize] = v;
+                    let off = (prefix - PS2C_CMD_WRITE_RAM_START) as usize;
+                    if let Some(byte) = state.ram.get_mut(off) {
+                        *byte = v;
+                    }
                 }
                 PS2C_CMD_WRITE_CTLR_OUT => {
                     state.ctrl_out_port = CtrlOutPort::from_bits_truncate(v);
@@ -485,7 +505,7 @@ impl PS2Ctrl {
                     state.aux_port.cmd_input(v);
                 }
                 _ => {
-                    panic!("unexpected chain cmd {:x}", prefix);
+                    debug_assert!(false, "unexpected chain cmd {:x}", prefix);
                 }
             }
         } else {
@@ -522,8 +542,8 @@ impl PS2Ctrl {
                 state.resp = Some(state.ctrl_cfg.bits());
             }
             PS2C_CMD_READ_RAM_START..=PS2C_CMD_READ_RAM_END => {
-                let off = v - PS2C_CMD_READ_RAM_START;
-                state.resp = Some(state.ram[off as usize])
+                let off = (v - PS2C_CMD_READ_RAM_START) as usize;
+                state.resp = Some(state.ram.get(off).copied().unwrap_or(0))
             }
             PS2C_CMD_CTRL_TEST => {
                 state.resp = Some(PS2C_R_CTRL_TEST_PASS);
@@ -559,7 +579,9 @@ impl PS2Ctrl {
             | PS2C_CMD_WRITE_PRI_OUT
             | PS2C_CMD_WRITE_AUX_OUT
             | PS2C_CMD_WRITE_AUX_IN
-            | PS2C_CMD_WRITE_RAM_START..=PS2C_CMD_WRITE_RAM_END => state.cmd_prefix = Some(v),
+            | PS2C_CMD_WRITE_RAM_START..=PS2C_CMD_WRITE_RAM_END => {
+                state.cmd_prefix = Some(v)
+            }
 
             PS2C_CMD_PULSE_START..=PS2C_CMD_PULSE_END => {
                 let to_pulse = v - PS2C_CMD_PULSE_START;
@@ -567,9 +589,10 @@ impl PS2Ctrl {
                     let reset_sink = state.reset_sink.clone();
                     drop(state);
                     if let Some(sink) = reset_sink {
-                        sink.suspend(bhyve_api::vm_suspend_how::VM_SUSPEND_RESET as u32);
+                        sink.suspend(
+                            bhyve_api::vm_suspend_how::VM_SUSPEND_RESET as u32,
+                        );
                     }
-                    return;
                 }
             }
 
@@ -584,7 +607,10 @@ impl PS2Ctrl {
         // Always report unlocked
         let mut val = CtrlStatus::UNLOCKED;
 
-        if state.resp.is_some() || state.pri_port.has_output() || state.aux_port.has_output() {
+        if state.resp.is_some()
+            || state.pri_port.has_output()
+            || state.aux_port.has_output()
+        {
             val.insert(CtrlStatus::OUT_FULL);
         }
         val.set(CtrlStatus::AUX_FULL, state.aux_port.has_output());
@@ -611,7 +637,9 @@ impl PS2Ctrl {
         }
 
         let aux_pin = state.aux_pin.as_ref().unwrap();
-        if state.ctrl_cfg.contains(CtrlCfg::AUX_INTR_EN) && state.aux_port.has_output() {
+        if state.ctrl_cfg.contains(CtrlCfg::AUX_INTR_EN)
+            && state.aux_port.has_output()
+        {
             probes::ps2ctrl_pulse_aux!(|| {});
             aux_pin.pulse();
         }
@@ -633,10 +661,13 @@ impl PS2Ctrl {
 
 impl crate::KeyboardSink for PS2Ctrl {
     fn key_event(&self, down: bool, keysym: u32) {
-        PS2Ctrl::key_event(self, KeyEvent {
-            keysym_raw: keysym,
-            is_pressed: down,
-        });
+        PS2Ctrl::key_event(
+            self,
+            KeyEvent {
+                keysym_raw: keysym,
+                is_pressed: down,
+            },
+        );
     }
 }
 
@@ -761,6 +792,24 @@ mod tests {
     }
 
     #[test]
+    fn wide_port_accesses_use_the_low_byte() {
+        for bytes in [2, 4] {
+            let (bus, _ctrl, _primary) = attached(None);
+
+            bus.handle_out(
+                PORT_PS2_CMD_STATUS,
+                bytes,
+                PS2C_CMD_CTRL_TEST.into(),
+            );
+
+            assert_eq!(
+                bus.handle_in(PORT_PS2_DATA, bytes),
+                u32::from(PS2C_R_CTRL_TEST_PASS)
+            );
+        }
+    }
+
+    #[test]
     fn primary_port_test_passes() {
         let (bus, _ctrl, _primary) = attached(None);
 
@@ -784,6 +833,79 @@ mod tests {
         bus.handle_out(PORT_PS2_CMD_STATUS, 1, PS2C_CMD_READ_CTRL_CFG.into());
 
         assert_eq!(bus.handle_in(PORT_PS2_DATA, 1), u32::from(cfg.bits()));
+    }
+
+    #[test]
+    fn read_ram_top_of_range_does_not_panic() {
+        let (bus, _ctrl, _primary) = attached(None);
+
+        bus.handle_out(PORT_PS2_CMD_STATUS, 1, PS2C_CMD_READ_RAM_END.into());
+
+        assert_eq!(bus.handle_in(PORT_PS2_DATA, 1), 0);
+    }
+
+    #[test]
+    fn ram_round_trips_over_full_command_range() {
+        let (bus, _ctrl, _primary) = attached(None);
+
+        for n in 0..PS2C_RAM_LEN as u8 {
+            bus.handle_out(
+                PORT_PS2_CMD_STATUS,
+                1,
+                (PS2C_CMD_WRITE_RAM_START + n).into(),
+            );
+            bus.handle_out(PORT_PS2_DATA, 1, n.into());
+        }
+
+        for n in 0..PS2C_RAM_LEN as u8 {
+            bus.handle_out(
+                PORT_PS2_CMD_STATUS,
+                1,
+                (PS2C_CMD_READ_RAM_START + n).into(),
+            );
+            assert_eq!(bus.handle_in(PORT_PS2_DATA, 1), u32::from(n));
+        }
+    }
+
+    #[test]
+    fn write_ram_uses_command_prefix_not_data_byte() {
+        let (bus, _ctrl, _primary) = attached(None);
+
+        for n in 0..PS2C_RAM_LEN as u8 {
+            bus.handle_out(
+                PORT_PS2_CMD_STATUS,
+                1,
+                (PS2C_CMD_WRITE_RAM_START + n).into(),
+            );
+            bus.handle_out(PORT_PS2_DATA, 1, 0xff);
+        }
+
+        bus.handle_out(PORT_PS2_CMD_STATUS, 1, PS2C_CMD_WRITE_RAM_START.into());
+        bus.handle_out(PORT_PS2_DATA, 1, 0x00);
+
+        for n in 0..PS2C_RAM_LEN as u8 {
+            bus.handle_out(
+                PORT_PS2_CMD_STATUS,
+                1,
+                (PS2C_CMD_READ_RAM_START + n).into(),
+            );
+            let expected = if n == 0 { 0x00 } else { 0xff };
+            assert_eq!(bus.handle_in(PORT_PS2_DATA, 1), expected);
+        }
+    }
+
+    #[test]
+    fn every_data_byte_after_write_ram_prefix_is_safe() {
+        let (bus, _ctrl, _primary) = attached(None);
+
+        for v in u8::MIN..=u8::MAX {
+            bus.handle_out(
+                PORT_PS2_CMD_STATUS,
+                1,
+                PS2C_CMD_WRITE_RAM_START.into(),
+            );
+            bus.handle_out(PORT_PS2_DATA, 1, v.into());
+        }
     }
 
     #[test]

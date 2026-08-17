@@ -199,7 +199,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-
     /// A test interrupt pin that tracks assertion state.
     struct TestPin {
         asserted: AtomicBool,

@@ -81,6 +81,12 @@ pub struct Aml {
     buf: Vec<u8>,
 }
 
+impl Default for Aml {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Aml {
     /// Create a new empty AML builder with pre-allocated capacity.
     pub fn new() -> Self {
@@ -97,6 +103,11 @@ impl Aml {
     /// Return the current length of accumulated bytecode.
     pub fn len(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Return whether the builder contains no AML bytecode.
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
     }
 
     // ── Package length encoding ─────────────────────────────────
@@ -381,8 +392,7 @@ impl Aml {
             let inner_total = inner_pkg_size + inner_len;
 
             outer_body.push(AML_PACKAGE_OP);
-            outer_body
-                .extend_from_slice(&Self::encode_pkg_length(inner_total));
+            outer_body.extend_from_slice(&Self::encode_pkg_length(inner_total));
             outer_body.extend_from_slice(&inner_body);
         }
 
@@ -469,15 +479,10 @@ impl Aml {
     ///
     /// WordBusNumber(ResourceProducer, MinFixed, MaxFixed, PosDecode,
     ///   granularity=0, min, max, translation=0, len)
-    pub fn word_bus_number(
-        &mut self,
-        min: u16,
-        max: u16,
-        len: u16,
-    ) {
+    pub fn word_bus_number(&mut self, min: u16, max: u16, len: u16) {
         self.buf.push(0x88); // Word address space descriptor
         self.buf.extend_from_slice(&13u16.to_le_bytes()); // body length
-        // Resource type = 2 (Bus number range)
+                                                          // Resource type = 2 (Bus number range)
         self.buf.push(0x02);
         // General flags: ResourceProducer=0, PosDecode=0, MinFixed=1, MaxFixed=1
         // Bits [7:4]=type-specific, [3]=MinFixed, [2]=MaxFixed, [1:0]=consumer/producer
@@ -501,15 +506,10 @@ impl Aml {
     ///
     /// WordIO(ResourceProducer, MinFixed, MaxFixed, PosDecode,
     ///   EntireRange, granularity=0, min, max, translation=0, len)
-    pub fn word_io(
-        &mut self,
-        min: u16,
-        max: u16,
-        len: u16,
-    ) {
+    pub fn word_io(&mut self, min: u16, max: u16, len: u16) {
         self.buf.push(0x88); // Word address space descriptor
         self.buf.extend_from_slice(&13u16.to_le_bytes()); // body length
-        // Resource type = 1 (IO range)
+                                                          // Resource type = 1 (IO range)
         self.buf.push(0x01);
         // General flags: MinFixed | MaxFixed
         self.buf.push(0x0C);
@@ -532,15 +532,10 @@ impl Aml {
     /// DWordMemory(ResourceProducer, PosDecode, MinFixed, MaxFixed,
     ///   NonCacheable, ReadWrite, granularity=0, min, max,
     ///   translation=0, len)
-    pub fn dword_memory(
-        &mut self,
-        min: u32,
-        max: u32,
-        len: u32,
-    ) {
+    pub fn dword_memory(&mut self, min: u32, max: u32, len: u32) {
         self.buf.push(0x87); // DWord address space descriptor
         self.buf.extend_from_slice(&23u16.to_le_bytes()); // body length
-        // Resource type = 0 (Memory range)
+                                                          // Resource type = 0 (Memory range)
         self.buf.push(0x00);
         // General flags: MinFixed | MaxFixed
         self.buf.push(0x0C);
@@ -810,7 +805,9 @@ impl AmlWalker<'_> {
                     self.data_object(package_end)?;
                 }
                 if self.pos != package_end {
-                    return Err(self.fail("Package child did not end at PkgLength"));
+                    return Err(
+                        self.fail("Package child did not end at PkgLength")
+                    );
                 }
                 Ok(())
             }
@@ -820,7 +817,9 @@ impl AmlWalker<'_> {
                 let declared_size = self.integer(package_end)?;
                 let actual_size = package_end - self.pos;
                 if declared_size != actual_size as u64 {
-                    return Err(self.fail("Buffer size does not match PkgLength"));
+                    return Err(
+                        self.fail("Buffer size does not match PkgLength")
+                    );
                 }
                 self.pos = package_end;
                 Ok(())
@@ -887,7 +886,9 @@ impl AmlWalker<'_> {
                     self.term_arg(package_end)?;
                     self.walk_terms(package_end)?;
                     if self.pos != package_end {
-                        return Err(self.fail("If child did not end at PkgLength"));
+                        return Err(
+                            self.fail("If child did not end at PkgLength")
+                        );
                     }
                 }
                 AML_NAME_OP => {
@@ -1023,10 +1024,7 @@ mod tests {
     #[test]
     fn value_dword() {
         let enc = Aml::encode_value(&AmlValue::DWord(0x12345678));
-        assert_eq!(
-            enc,
-            vec![AML_DWORD_PREFIX, 0x78, 0x56, 0x34, 0x12]
-        );
+        assert_eq!(enc, vec![AML_DWORD_PREFIX, 0x78, 0x56, 0x34, 0x12]);
     }
 
     #[test]

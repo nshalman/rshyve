@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Portions derived from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: lib/propolis/src/exits.rs
+// https://github.com/oxidecomputer/propolis
 
 //! VM exit and entry types.
 //!
@@ -183,7 +187,10 @@ impl VmExitKind {
             vm_exitcode::VM_EXITCODE_INOUT => {
                 // Safety: exit code guarantees the inout variant is active.
                 let inout = unsafe { &exit.u.inout };
-                let port = IoPort { port: inout.port, bytes: inout.bytes };
+                let port = IoPort {
+                    port: inout.port,
+                    bytes: inout.bytes,
+                };
                 if inout.flags & INOUT_IN != 0 {
                     VmExitKind::Inout(InoutReq::In(port))
                 } else {
@@ -219,34 +226,26 @@ impl VmExitKind {
 
             vm_exitcode::VM_EXITCODE_SUSPENDED => {
                 let detail = unsafe { &exit.u.suspend };
-                let valid_detail =
-                    api_version >= ApiVersion::V16 as u32;
-                let kind =
-                    match vm_suspend_how::from_repr(detail.how as u32) {
-                        Some(vm_suspend_how::VM_SUSPEND_RESET) => {
-                            Suspend::Reset
-                        }
-                        Some(vm_suspend_how::VM_SUSPEND_POWEROFF) => {
-                            Suspend::PowerOff
-                        }
-                        Some(vm_suspend_how::VM_SUSPEND_HALT) => {
-                            Suspend::Halt
-                        }
-                        Some(vm_suspend_how::VM_SUSPEND_TRIPLEFAULT) => {
-                            let src = if valid_detail {
-                                detail.source
-                            } else {
-                                -1
-                            };
-                            Suspend::TripleFault(src)
-                        }
-                        _ => {
-                            return VmExitKind::Unknown(exit.exitcode);
-                        }
-                    };
-                let when = Duration::from_nanos(
-                    if valid_detail { detail.when } else { 0 },
-                );
+                let valid_detail = api_version >= ApiVersion::V16 as u32;
+                let kind = match vm_suspend_how::from_repr(detail.how as u32) {
+                    Some(vm_suspend_how::VM_SUSPEND_RESET) => Suspend::Reset,
+                    Some(vm_suspend_how::VM_SUSPEND_POWEROFF) => {
+                        Suspend::PowerOff
+                    }
+                    Some(vm_suspend_how::VM_SUSPEND_HALT) => Suspend::Halt,
+                    Some(vm_suspend_how::VM_SUSPEND_TRIPLEFAULT) => {
+                        let src = if valid_detail { detail.source } else { -1 };
+                        Suspend::TripleFault(src)
+                    }
+                    _ => {
+                        return VmExitKind::Unknown(exit.exitcode);
+                    }
+                };
+                let when = Duration::from_nanos(if valid_detail {
+                    detail.when
+                } else {
+                    0
+                });
                 VmExitKind::Suspended(SuspendDetail { kind, when })
             }
 
@@ -352,11 +351,7 @@ impl VmEntry {
     /// - `cpuid`: vCPU identifier
     /// - `exit_ptr`: pointer to the `vm_exit` struct for the kernel
     ///   to write exit data into
-    pub fn to_raw(
-        &self,
-        cpuid: i32,
-        exit_ptr: *mut vm_exit,
-    ) -> vm_entry {
+    pub fn to_raw(&self, cpuid: i32, exit_ptr: *mut vm_exit) -> vm_entry {
         let mut payload = vm_entry_payload::default();
         let cmd = match self {
             VmEntry::Run => vm_entry_cmds::VEC_DEFAULT,
@@ -387,9 +382,7 @@ impl VmEntry {
                         payload.mmio.data = *data;
                         (*addr, *bytes)
                     }
-                    MmioRes::Write { addr, bytes, .. } => {
-                        (*addr, *bytes)
-                    }
+                    MmioRes::Write { addr, bytes, .. } => (*addr, *bytes),
                 };
                 payload.mmio.gpa = addr;
                 payload.mmio.bytes = bytes;
@@ -411,10 +404,9 @@ mod tests {
     use super::*;
     use bhyve_api::{vm_exit_payload, vm_exit_suspend};
 
-    fn suspend_exit(how: bhyve_api::vm_suspend_how) -> vm_exit {
+    fn suspend_exit(how: vm_suspend_how) -> vm_exit {
         vm_exit {
-            exitcode: vm_exitcode::VM_EXITCODE_SUSPENDED
-                as std::os::raw::c_int,
+            exitcode: vm_exitcode::VM_EXITCODE_SUSPENDED as std::os::raw::c_int,
             inst_length: 0,
             rip: 0,
             u: vm_exit_payload {

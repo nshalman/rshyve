@@ -28,8 +28,12 @@ const ACPI_ENABLE: u8 = 0xA0;
 const ACPI_DISABLE: u8 = 0xA1;
 
 /// PM1 Status register bit definitions.
+// Timer/global status and sleep-button enable are part of the modeled ACPI
+// register layout even though no current event source raises them.
+#[allow(dead_code)]
 const PM1_TMR_STS: u16 = 0x0001;
 const PM1_BM_STS: u16 = 0x0010;
+#[allow(dead_code)]
 const PM1_GBL_STS: u16 = 0x0020;
 const PM1_PWRBTN_STS: u16 = 0x0100;
 const PM1_SLPBTN_STS: u16 = 0x0200;
@@ -44,6 +48,7 @@ const PM1_STS_CLEARABLE: u16 =
 const PM1_TMR_EN: u16 = 0x0001;
 const PM1_GBL_EN: u16 = 0x0020;
 const PM1_PWRBTN_EN: u16 = 0x0100;
+#[allow(dead_code)]
 const PM1_SLPBTN_EN: u16 = 0x0200;
 const PM1_RTC_EN: u16 = 0x0400;
 
@@ -141,10 +146,9 @@ impl AcpiPm {
             Arc::new(move |offset: u16, rwo: RWOp<'_>| {
                 pm_evt.handle_pm1_evt(offset, rwo);
             });
-        bus_pio.register(PMBASE, 4, evt_handler)
-            .map_err(|e| anyhow::anyhow!(
-                "acpi-pm: cannot claim port {:#x}: {e}", PMBASE
-            ))?;
+        bus_pio.register(PMBASE, 4, evt_handler).map_err(|e| {
+            anyhow::anyhow!("acpi-pm: cannot claim port {:#x}: {e}", PMBASE)
+        })?;
 
         // PM1 Control block: 2 bytes at PMBASE+4
         let pm_cnt = Arc::clone(&pm);
@@ -152,10 +156,9 @@ impl AcpiPm {
             Arc::new(move |offset: u16, rwo: RWOp<'_>| {
                 pm_cnt.handle_pm1_cnt(offset, rwo);
             });
-        bus_pio.register(PMBASE + 4, 2, cnt_handler)
-            .map_err(|e| anyhow::anyhow!(
-                "acpi-pm: cannot claim port {:#x}: {e}", PMBASE + 4
-            ))?;
+        bus_pio.register(PMBASE + 4, 2, cnt_handler).map_err(|e| {
+            anyhow::anyhow!("acpi-pm: cannot claim port {:#x}: {e}", PMBASE + 4)
+        })?;
 
         // Reset register at 0xCF9
         let pm_rst = Arc::clone(&pm);
@@ -163,10 +166,9 @@ impl AcpiPm {
             Arc::new(move |_offset: u16, rwo: RWOp<'_>| {
                 pm_rst.handle_reset(rwo);
             });
-        bus_pio.register(0xCF9, 1, rst_handler)
-            .map_err(|e| anyhow::anyhow!(
-                "acpi-pm: cannot claim port {:#x}: {e}", 0xCF9
-            ))?;
+        bus_pio.register(0xCF9, 1, rst_handler).map_err(|e| {
+            anyhow::anyhow!("acpi-pm: cannot claim port {:#x}: {e}", 0xCF9)
+        })?;
 
         // SMI Command port at 0xB2 (ACPI enable/disable)
         let pm_smi = Arc::clone(&pm);
@@ -174,10 +176,14 @@ impl AcpiPm {
             Arc::new(move |_offset: u16, rwo: RWOp<'_>| {
                 pm_smi.handle_smi_cmd(rwo);
             });
-        bus_pio.register(SMI_CMD_PORT, 1, smi_handler)
-            .map_err(|e| anyhow::anyhow!(
-                "acpi-pm: cannot claim port {:#x}: {e}", SMI_CMD_PORT
-            ))?;
+        bus_pio
+            .register(SMI_CMD_PORT, 1, smi_handler)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "acpi-pm: cannot claim port {:#x}: {e}",
+                    SMI_CMD_PORT
+                )
+            })?;
 
         Ok(pm)
     }
@@ -325,11 +331,7 @@ mod tests {
     fn s5_write_triggers_poweroff() {
         let (bus, sink) = attached_bus();
 
-        bus.handle_out(
-            PMBASE + 4,
-            2,
-            (PM1_SLP_EN | (5 << 10)) as u32,
-        );
+        bus.handle_out(PMBASE + 4, 2, (PM1_SLP_EN | (5 << 10)) as u32);
 
         assert_eq!(
             sink.recorded(),
@@ -341,11 +343,7 @@ mod tests {
     fn s1_write_is_inert() {
         let (bus, sink) = attached_bus();
 
-        bus.handle_out(
-            PMBASE + 4,
-            2,
-            (PM1_SLP_EN | (1 << 10)) as u32,
-        );
+        bus.handle_out(PMBASE + 4, 2, (PM1_SLP_EN | (1 << 10)) as u32);
 
         assert!(sink.recorded().is_empty());
     }

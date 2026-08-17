@@ -86,6 +86,11 @@ struct CompQueue {
     iv: u16,
 }
 
+fn io_queue_index(qid: u16) -> Option<usize> {
+    let idx = usize::from(qid.checked_sub(1)?);
+    (idx < MAX_IO_QUEUES).then_some(idx)
+}
+
 // ---------------------------------------------------------------------------
 // I/O request submitted to worker threads
 // ---------------------------------------------------------------------------
@@ -207,8 +212,8 @@ impl NvmeController {
             &serial,
             "Triton VMM NVMe Controller",
             "1.0.0",
-            1,  // max_namespaces
-            9,  // mdts: 2^9 pages = 2 MiB max transfer (matches C bhyve)
+            1, // max_namespaces
+            9, // mdts: 2^9 pages = 2 MiB max transfer (matches C bhyve)
             MAX_IO_QUEUES as u16,
         );
         let ns_ident = build_identify_namespace(total_blocks, block_size);
@@ -316,8 +321,7 @@ impl NvmeController {
                 .name(format!("nvme-io-{}", i))
                 .spawn(move || {
                     io_worker(
-                        rx, raw_fd, read_only, physmap, msix, state_ref,
-                        gate,
+                        rx, raw_fd, read_only, physmap, msix, state_ref, gate,
                     );
                 })
                 .expect("nvme: failed to spawn I/O worker thread");
@@ -342,7 +346,9 @@ impl PciDevice for NvmeController {
         // MSI-X capability: 0x40..0x4B
         // cap_read returns a full dword; extract the requested bytes.
         let dword_offset = offset & 0xFC;
-        if let Some(dword_val) = self.msix.cap_read(dword_offset, MSIX_CAP_OFFSET) {
+        if let Some(dword_val) =
+            self.msix.cap_read(dword_offset, MSIX_CAP_OFFSET)
+        {
             let byte_off = (offset & 0x03) as u32;
             let mask = match len {
                 1 => 0xFF,
@@ -357,15 +363,15 @@ impl PciDevice for NvmeController {
 
     fn cfg_write(&self, offset: u8, len: u8, val: u32) {
         if offset < 0x40 {
-            let mut pci =
-                self.pci_state.lock().expect("nvme: pci_state lock");
+            let mut pci = self.pci_state.lock().expect("nvme: pci_state lock");
             pci.cfg_write(offset, len, val);
 
             // Check if BAR or command register changed
             let dword_off = offset & 0xFC;
             if dword_off == 0x04 || (0x10..=0x24).contains(&dword_off) {
                 let weak = self.self_ref.lock().expect("self_ref lock");
-                if let Some(arc_self) = weak.as_ref().and_then(|w| w.upgrade()) {
+                if let Some(arc_self) = weak.as_ref().and_then(|w| w.upgrade())
+                {
                     drop(pci);
                     arc_self.update_mmio_registration();
                 }
@@ -377,7 +383,9 @@ impl PciDevice for NvmeController {
         // by reading the current dword and merging the written bytes.
         let dword_offset = offset & 0xFC;
         let byte_off = (offset & 0x03) as u32;
-        if let Some(cur_dword) = self.msix.cap_read(dword_offset, MSIX_CAP_OFFSET) {
+        if let Some(cur_dword) =
+            self.msix.cap_read(dword_offset, MSIX_CAP_OFFSET)
+        {
             let mask = match len {
                 1 => 0xFFu32,
                 2 => 0xFFFFu32,
@@ -412,7 +420,8 @@ impl NvmeController {
     /// Update MMIO bus registration for BAR0 and BAR4.
     fn update_mmio_registration(self: &Arc<Self>) {
         let pci = self.pci_state.lock().expect("nvme: pci lock");
-        let mmio_enabled = pci.command().contains(crate::pci::bits::RegCmd::MMIO_EN);
+        let mmio_enabled =
+            pci.command().contains(crate::pci::bits::RegCmd::MMIO_EN);
 
         // Register both BAR0 and BAR4 on the MMIO bus
         for (bar_n, reg_mutex) in [
@@ -506,45 +515,30 @@ impl NvmeController {
                         st.cc = val32;
                         self.handle_cc_write(&mut st, old_cc, val32);
                     }
-                    REG_AQA => {
-                        if (st.cc & CC_EN) == 0 {
-                            st.aqa = val32;
+                    REG_AQA if (st.cc & CC_EN) == 0 => st.aqa = val32,
+                    REG_ASQ if (st.cc & CC_EN) == 0 => {
+                        if wo.len() == 8 {
+                            st.asq_base = wo.read_u64();
+                        } else {
+                            st.asq_base = (st.asq_base & 0xFFFF_FFFF_0000_0000)
+                                | u64::from(val32);
                         }
                     }
-                    REG_ASQ => {
-                        if (st.cc & CC_EN) == 0 {
-                            if wo.len() == 8 {
-                                st.asq_base = wo.read_u64();
-                            } else {
-                                st.asq_base =
-                                    (st.asq_base & 0xFFFF_FFFF_0000_0000)
-                                        | u64::from(val32);
-                            }
+                    0x2C if (st.cc & CC_EN) == 0 => {
+                        st.asq_base = (st.asq_base & 0x0000_0000_FFFF_FFFF)
+                            | (u64::from(val32) << 32);
+                    }
+                    REG_ACQ if (st.cc & CC_EN) == 0 => {
+                        if wo.len() == 8 {
+                            st.acq_base = wo.read_u64();
+                        } else {
+                            st.acq_base = (st.acq_base & 0xFFFF_FFFF_0000_0000)
+                                | u64::from(val32);
                         }
                     }
-                    0x2C => {
-                        if (st.cc & CC_EN) == 0 {
-                            st.asq_base = (st.asq_base & 0x0000_0000_FFFF_FFFF)
-                                | (u64::from(val32) << 32);
-                        }
-                    }
-                    REG_ACQ => {
-                        if (st.cc & CC_EN) == 0 {
-                            if wo.len() == 8 {
-                                st.acq_base = wo.read_u64();
-                            } else {
-                                st.acq_base =
-                                    (st.acq_base & 0xFFFF_FFFF_0000_0000)
-                                        | u64::from(val32);
-                            }
-                        }
-                    }
-                    0x34 => {
-                        if (st.cc & CC_EN) == 0 {
-                            st.acq_base =
-                                (st.acq_base & 0x0000_0000_FFFF_FFFF)
-                                    | (u64::from(val32) << 32);
-                        }
+                    0x34 if (st.cc & CC_EN) == 0 => {
+                        st.acq_base = (st.acq_base & 0x0000_0000_FFFF_FFFF)
+                            | (u64::from(val32) << 32);
                     }
                     // INTMS, INTMC: ignored (MSI-X mode)
                     _ => {}
@@ -554,12 +548,7 @@ impl NvmeController {
     }
 
     /// Handle CC register write transitions (enable/disable/shutdown).
-    fn handle_cc_write(
-        &self,
-        st: &mut NvmeState,
-        old_cc: u32,
-        new_cc: u32,
-    ) {
+    fn handle_cc_write(&self, st: &mut NvmeState, old_cc: u32, new_cc: u32) {
         let was_enabled = (old_cc & CC_EN) != 0;
         let now_enabled = (new_cc & CC_EN) != 0;
 
@@ -626,7 +615,7 @@ impl NvmeController {
         let db_offset = offset - REG_DOORBELL_BASE;
         let db_index = db_offset / 4;
         let qid = (db_index / 2) as u16;
-        let is_sq = (db_index % 2) == 0;
+        let is_sq = db_index.is_multiple_of(2);
         let new_val = wo.read_u32() as u16;
 
         if is_sq {
@@ -657,8 +646,7 @@ impl NvmeController {
                 }
             }
         } else {
-            let idx = (qid - 1) as usize;
-            if idx < MAX_IO_QUEUES {
+            if let Some(idx) = io_queue_index(qid) {
                 if let Some(cq) = &mut st.io_cqs[idx] {
                     if new_head < cq.size {
                         cq.head = new_head;
@@ -711,23 +699,16 @@ impl NvmeController {
             }
 
             let opcode = sqe_buf[SQE_OPC];
-            let cid = u16::from_le_bytes(
-                [sqe_buf[SQE_CID], sqe_buf[SQE_CID + 1]],
-            );
+            let cid =
+                u16::from_le_bytes([sqe_buf[SQE_CID], sqe_buf[SQE_CID + 1]]);
             let nsid = u32::from_le_bytes(
-                sqe_buf[SQE_NSID..SQE_NSID + 4]
-                    .try_into()
-                    .expect("4 bytes"),
+                sqe_buf[SQE_NSID..SQE_NSID + 4].try_into().expect("4 bytes"),
             );
             let prp1 = u64::from_le_bytes(
-                sqe_buf[SQE_PRP1..SQE_PRP1 + 8]
-                    .try_into()
-                    .expect("8 bytes"),
+                sqe_buf[SQE_PRP1..SQE_PRP1 + 8].try_into().expect("8 bytes"),
             );
             let prp2 = u64::from_le_bytes(
-                sqe_buf[SQE_PRP2..SQE_PRP2 + 8]
-                    .try_into()
-                    .expect("8 bytes"),
+                sqe_buf[SQE_PRP2..SQE_PRP2 + 8].try_into().expect("8 bytes"),
             );
             let cdw10 = u32::from_le_bytes(
                 sqe_buf[SQE_CDW10..SQE_CDW10 + 4]
@@ -747,15 +728,7 @@ impl NvmeController {
 
             // Now process the command with full NvmeState access
             let (status, cdw0) = self.process_admin_cmd(
-                &mut st,
-                &mem,
-                opcode,
-                cid,
-                nsid,
-                prp1,
-                prp2,
-                cdw10,
-                cdw11,
+                &mut st, &mem, opcode, cid, nsid, prp1, prp2, cdw10, cdw11,
             );
 
             // Write CQE to admin CQ
@@ -786,27 +759,21 @@ impl NvmeController {
         cdw11: u32,
     ) -> (u16, u32) {
         let _ = cid;
-        let result = match opcode {
+        match opcode {
             ADMIN_OPC_IDENTIFY => {
                 self.admin_identify(st, mem, nsid, prp1, prp2, cdw10)
             }
             ADMIN_OPC_CREATE_IO_CQ => {
-                self.admin_create_io_cq(st, prp1, cdw10, cdw11)
+                Self::admin_create_io_cq(st, prp1, cdw10, cdw11)
             }
             ADMIN_OPC_CREATE_IO_SQ => {
-                self.admin_create_io_sq(st, prp1, cdw10, cdw11)
+                Self::admin_create_io_sq(st, prp1, cdw10, cdw11)
             }
-            ADMIN_OPC_DELETE_IO_SQ => {
-                self.admin_delete_io_sq(st, cdw10)
-            }
-            ADMIN_OPC_DELETE_IO_CQ => {
-                self.admin_delete_io_cq(st, cdw10)
-            }
-            ADMIN_OPC_GET_FEATURES => {
-                self.admin_get_features(st, cdw10)
-            }
+            ADMIN_OPC_DELETE_IO_SQ => self.admin_delete_io_sq(st, cdw10),
+            ADMIN_OPC_DELETE_IO_CQ => self.admin_delete_io_cq(st, cdw10),
+            ADMIN_OPC_GET_FEATURES => Self::admin_get_features(st, cdw10),
             ADMIN_OPC_SET_FEATURES => {
-                self.admin_set_features(st, cdw10, cdw11)
+                Self::admin_set_features(st, cdw10, cdw11)
             }
             ADMIN_OPC_ABORT => {
                 // Abort: always report "command not found" (success).
@@ -821,8 +788,7 @@ impl NvmeController {
                 (SC_SUCCESS, 0)
             }
             _ => (SC_INVALID_OPCODE | (SC_DNR), 0),
-        };
-        result
+        }
     }
 
     /// Identify command (CNS 0 = namespace, CNS 1 = controller).
@@ -856,24 +822,23 @@ impl NvmeController {
 
     /// Create I/O Completion Queue.
     fn admin_create_io_cq(
-        &self,
         st: &mut NvmeState,
         prp1: u64,
         cdw10: u32,
         cdw11: u32,
     ) -> (u16, u32) {
         let qid = (cdw10 & 0xFFFF) as u16;
-        let qsize = ((cdw10 >> 16) & 0xFFFF) as u16 + 1; // Convert 0-based to 1-based
+        let qsize = ((cdw10 >> 16) & 0xFFFF) + 1; // Convert 0-based to 1-based
         let iv = ((cdw11 >> 16) & 0xFFFF) as u16;
 
-        if qid == 0 || qid as usize > MAX_IO_QUEUES {
+        let Some(idx) = io_queue_index(qid) else {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-        }
-        if qsize < 2 || qsize > MAX_QUEUE_SIZE {
+        };
+        if qsize < 2 || qsize > u32::from(MAX_QUEUE_SIZE) {
             return (SC_INVALID_QUEUE_SIZE | SC_DNR, 0);
         }
+        let qsize = qsize as u16;
 
-        let idx = (qid - 1) as usize;
         if st.io_cqs[idx].is_some() {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
@@ -899,32 +864,32 @@ impl NvmeController {
 
     /// Create I/O Submission Queue.
     fn admin_create_io_sq(
-        &self,
         st: &mut NvmeState,
         prp1: u64,
         cdw10: u32,
         cdw11: u32,
     ) -> (u16, u32) {
         let qid = (cdw10 & 0xFFFF) as u16;
-        let qsize = ((cdw10 >> 16) & 0xFFFF) as u16 + 1;
+        let qsize = ((cdw10 >> 16) & 0xFFFF) + 1;
         let cq_id = ((cdw11 >> 16) & 0xFFFF) as u16;
 
-        if qid == 0 || qid as usize > MAX_IO_QUEUES {
+        let Some(idx) = io_queue_index(qid) else {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-        }
-        if qsize < 2 || qsize > MAX_QUEUE_SIZE {
+        };
+        if qsize < 2 || qsize > u32::from(MAX_QUEUE_SIZE) {
             return (SC_INVALID_QUEUE_SIZE | SC_DNR, 0);
         }
+        let qsize = qsize as u16;
 
-        let idx = (qid - 1) as usize;
         if st.io_sqs[idx].is_some() {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
 
         // Verify the associated CQ exists
-        let cq_idx = (cq_id - 1) as usize;
-        if cq_id == 0 || cq_idx >= MAX_IO_QUEUES || st.io_cqs[cq_idx].is_none()
-        {
+        let Some(cq_idx) = io_queue_index(cq_id) else {
+            return (SC_INVALID_FIELD | SC_DNR, 0);
+        };
+        if st.io_cqs[cq_idx].is_none() {
             return (SC_INVALID_FIELD | SC_DNR, 0);
         }
 
@@ -945,16 +910,11 @@ impl NvmeController {
     }
 
     /// Delete I/O Submission Queue.
-    fn admin_delete_io_sq(
-        &self,
-        st: &mut NvmeState,
-        cdw10: u32,
-    ) -> (u16, u32) {
+    fn admin_delete_io_sq(&self, st: &mut NvmeState, cdw10: u32) -> (u16, u32) {
         let qid = (cdw10 & 0xFFFF) as u16;
-        if qid == 0 || qid as usize > MAX_IO_QUEUES {
+        let Some(idx) = io_queue_index(qid) else {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-        }
-        let idx = (qid - 1) as usize;
+        };
         if st.io_sqs[idx].is_none() {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
@@ -963,25 +923,18 @@ impl NvmeController {
     }
 
     /// Delete I/O Completion Queue.
-    fn admin_delete_io_cq(
-        &self,
-        st: &mut NvmeState,
-        cdw10: u32,
-    ) -> (u16, u32) {
+    fn admin_delete_io_cq(&self, st: &mut NvmeState, cdw10: u32) -> (u16, u32) {
         let qid = (cdw10 & 0xFFFF) as u16;
-        if qid == 0 || qid as usize > MAX_IO_QUEUES {
+        let Some(idx) = io_queue_index(qid) else {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-        }
-        let idx = (qid - 1) as usize;
+        };
         if st.io_cqs[idx].is_none() {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
         // Verify no SQs reference this CQ
-        for sq in &st.io_sqs {
-            if let Some(sq) = sq {
-                if sq.cq_id == qid {
-                    return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-                }
+        for sq in st.io_sqs.iter().flatten() {
+            if sq.cq_id == qid {
+                return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
             }
         }
         st.io_cqs[idx] = None;
@@ -989,30 +942,22 @@ impl NvmeController {
     }
 
     /// Get Features command.
-    fn admin_get_features(
-        &self,
-        st: &NvmeState,
-        cdw10: u32,
-    ) -> (u16, u32) {
+    fn admin_get_features(st: &NvmeState, cdw10: u32) -> (u16, u32) {
         let fid = (cdw10 & 0xFF) as u8;
         match fid {
             FEAT_NUM_QUEUES => {
                 // CDW0 bits 31:16 = num CQs allocated (0-based)
                 // CDW0 bits 15:0  = num SQs allocated (0-based)
-                let nq = u32::from(st.num_io_queues - 1);
+                let nq = u32::from(st.num_io_queues.saturating_sub(1));
                 (SC_SUCCESS, nq | (nq << 16))
             }
             FEAT_VOLATILE_WC => {
                 // Volatile write cache: report enabled
                 (SC_SUCCESS, 1)
             }
-            FEAT_TEMP_THRESHOLD
-            | FEAT_ERROR_RECOVERY
-            | FEAT_POWER_MGMT
-            | FEAT_ARBITRATION
-            | FEAT_INTR_COALESCING
-            | FEAT_INTR_VECTOR_CFG
-            | FEAT_WRITE_ATOMICITY
+            FEAT_TEMP_THRESHOLD | FEAT_ERROR_RECOVERY | FEAT_POWER_MGMT
+            | FEAT_ARBITRATION | FEAT_INTR_COALESCING
+            | FEAT_INTR_VECTOR_CFG | FEAT_WRITE_ATOMICITY
             | FEAT_ASYNC_EVENT_CFG => (SC_SUCCESS, 0),
             _ => (SC_INVALID_FIELD | SC_DNR, 0),
         }
@@ -1020,7 +965,6 @@ impl NvmeController {
 
     /// Set Features command.
     fn admin_set_features(
-        &self,
         st: &mut NvmeState,
         cdw10: u32,
         cdw11: u32,
@@ -1029,24 +973,20 @@ impl NvmeController {
         match fid {
             FEAT_NUM_QUEUES => {
                 // Guest requests N SQs and N CQs (0-based in CDW11)
-                let requested_sq = (cdw11 & 0xFFFF) as u16 + 1;
-                let requested_cq = ((cdw11 >> 16) & 0xFFFF) as u16 + 1;
-                let max = MAX_IO_QUEUES as u16;
+                let requested_sq = (cdw11 & 0xFFFF) + 1;
+                let requested_cq = ((cdw11 >> 16) & 0xFFFF) + 1;
+                let max = MAX_IO_QUEUES as u32;
                 let alloc_sq = requested_sq.min(max);
                 let alloc_cq = requested_cq.min(max);
-                st.num_io_queues = alloc_sq.min(alloc_cq);
-                let result_sq = u32::from(alloc_sq - 1);
-                let result_cq = u32::from(alloc_cq - 1);
+                st.num_io_queues = alloc_sq.min(alloc_cq) as u16;
+                let result_sq = alloc_sq.saturating_sub(1);
+                let result_cq = alloc_cq.saturating_sub(1);
                 (SC_SUCCESS, result_sq | (result_cq << 16))
             }
             FEAT_VOLATILE_WC => (SC_SUCCESS, 0),
-            FEAT_TEMP_THRESHOLD
-            | FEAT_ERROR_RECOVERY
-            | FEAT_POWER_MGMT
-            | FEAT_ARBITRATION
-            | FEAT_INTR_COALESCING
-            | FEAT_INTR_VECTOR_CFG
-            | FEAT_WRITE_ATOMICITY
+            FEAT_TEMP_THRESHOLD | FEAT_ERROR_RECOVERY | FEAT_POWER_MGMT
+            | FEAT_ARBITRATION | FEAT_INTR_COALESCING
+            | FEAT_INTR_VECTOR_CFG | FEAT_WRITE_ATOMICITY
             | FEAT_ASYNC_EVENT_CFG => (SC_SUCCESS, 0),
             _ => (SC_INVALID_FIELD | SC_DNR, 0),
         }
@@ -1057,10 +997,9 @@ impl NvmeController {
         let mem = MemCtx::new(Arc::clone(&self.physmap));
         let mut st = self.state.lock().expect("nvme: state lock");
 
-        let idx = (qid - 1) as usize;
-        if idx >= MAX_IO_QUEUES {
+        let Some(idx) = io_queue_index(qid) else {
             return;
-        }
+        };
 
         let sq = match &mut st.io_sqs[idx] {
             Some(sq) => sq,
@@ -1087,23 +1026,16 @@ impl NvmeController {
             }
 
             let opcode = sqe_buf[SQE_OPC];
-            let cid = u16::from_le_bytes(
-                [sqe_buf[SQE_CID], sqe_buf[SQE_CID + 1]],
-            );
+            let cid =
+                u16::from_le_bytes([sqe_buf[SQE_CID], sqe_buf[SQE_CID + 1]]);
             let nsid = u32::from_le_bytes(
-                sqe_buf[SQE_NSID..SQE_NSID + 4]
-                    .try_into()
-                    .expect("4 bytes"),
+                sqe_buf[SQE_NSID..SQE_NSID + 4].try_into().expect("4 bytes"),
             );
             let prp1 = u64::from_le_bytes(
-                sqe_buf[SQE_PRP1..SQE_PRP1 + 8]
-                    .try_into()
-                    .expect("8 bytes"),
+                sqe_buf[SQE_PRP1..SQE_PRP1 + 8].try_into().expect("8 bytes"),
             );
             let prp2 = u64::from_le_bytes(
-                sqe_buf[SQE_PRP2..SQE_PRP2 + 8]
-                    .try_into()
-                    .expect("8 bytes"),
+                sqe_buf[SQE_PRP2..SQE_PRP2 + 8].try_into().expect("8 bytes"),
             );
             let cdw10 = u32::from_le_bytes(
                 sqe_buf[SQE_CDW10..SQE_CDW10 + 4]
@@ -1124,7 +1056,7 @@ impl NvmeController {
                         .expect("4 bytes"),
                 )) << 32);
             let nlb = (cdw12 & 0xFFFF) + 1; // Convert 0-based to 1-based
-            // NVMe 5.13: CDW12 bit 30 = Force Unit Access.
+                                            // NVMe 5.13: CDW12 bit 30 = Force Unit Access.
             let fua = (cdw12 & (1u32 << 30)) != 0;
 
             sq.head = (sq.head + 1) % sq.size;
@@ -1138,7 +1070,7 @@ impl NvmeController {
                 prp2,
                 sqid: qid,
                 cid,
-                cq_id: cq_id,
+                cq_id,
                 fua,
             });
         }
@@ -1217,7 +1149,11 @@ fn post_completion(
     };
 
     // Check if CQ is full: (tail + 1) % size == head
-    let next_tail = if cq.tail + 1 >= cq.size { 0 } else { cq.tail + 1 };
+    let next_tail = if cq.tail + 1 >= cq.size {
+        0
+    } else {
+        cq.tail + 1
+    };
     if next_tail == cq.head {
         // CQ full -- drop the completion (guest must drain the queue)
         return;
@@ -1430,6 +1366,8 @@ fn write_to_prp(
 }
 
 /// Read data from guest memory using PRP entries.
+// Retained for the pending non-worker admin data-in path.
+#[allow(dead_code)]
 fn read_from_prp(
     mem: &MemCtx,
     prp1: u64,
@@ -1479,19 +1417,13 @@ fn io_worker(
             }
         };
 
-        let status = process_io_request(
-            &req,
-            raw_fd,
-            read_only,
-            &physmap,
-            &ctrl,
-        );
+        let status =
+            process_io_request(&req, raw_fd, read_only, &physmap, &ctrl);
         // Post completion: need to lock state briefly to access the CQ
         let mem = MemCtx::new(Arc::clone(&physmap));
         let sq_head = {
             let st = ctrl.state.lock().expect("nvme: state lock");
-            let idx = (req.sqid - 1) as usize;
-            if idx < MAX_IO_QUEUES {
+            if let Some(idx) = io_queue_index(req.sqid) {
                 st.io_sqs[idx].as_ref().map(|sq| sq.head).unwrap_or(0)
             } else {
                 0
@@ -1499,8 +1431,7 @@ fn io_worker(
         };
 
         let mut st = ctrl.state.lock().expect("nvme: state lock");
-        let cq_idx = (req.cq_id - 1) as usize;
-        if cq_idx < MAX_IO_QUEUES {
+        if let Some(cq_idx) = io_queue_index(req.cq_id) {
             post_completion(
                 &mem,
                 &msix,
@@ -1550,18 +1481,24 @@ fn process_io_request(
     };
 
     // Bounds check (overflow in addition means out of bounds)
-    if req.slba.checked_add(u64::from(req.nlb)).map_or(true, |end| end > total_blocks) {
+    if req
+        .slba
+        .checked_add(u64::from(req.nlb))
+        .is_none_or(|end| end > total_blocks)
+    {
         return SC_INVALID_FIELD | SC_DNR;
     }
 
     match req.opcode {
         NVM_OPC_READ => {
             // Zero-copy: preadv directly into guest mmap'd pages
-            let iovecs_subs = match prp_to_iovecs(physmap, req.prp1, req.prp2, byte_count) {
-                Ok(v) => v,
-                Err(_) => return SC_DATA_XFER_ERROR,
-            };
-            let iovecs: Vec<libc::iovec> = iovecs_subs.iter().map(|(iov, _)| *iov).collect();
+            let iovecs_subs =
+                match prp_to_iovecs(physmap, req.prp1, req.prp2, byte_count) {
+                    Ok(v) => v,
+                    Err(_) => return SC_DATA_XFER_ERROR,
+                };
+            let iovecs: Vec<libc::iovec> =
+                iovecs_subs.iter().map(|(iov, _)| *iov).collect();
             let nread = unsafe {
                 libc::preadv(
                     raw_fd,
@@ -1582,11 +1519,13 @@ fn process_io_request(
                 return SC_DATA_XFER_ERROR;
             }
             // Zero-copy: pwritev directly from guest mmap'd pages
-            let iovecs_subs = match prp_to_iovecs(physmap, req.prp1, req.prp2, byte_count) {
-                Ok(v) => v,
-                Err(_) => return SC_DATA_XFER_ERROR,
-            };
-            let iovecs: Vec<libc::iovec> = iovecs_subs.iter().map(|(iov, _)| *iov).collect();
+            let iovecs_subs =
+                match prp_to_iovecs(physmap, req.prp1, req.prp2, byte_count) {
+                    Ok(v) => v,
+                    Err(_) => return SC_DATA_XFER_ERROR,
+                };
+            let iovecs: Vec<libc::iovec> =
+                iovecs_subs.iter().map(|(iov, _)| *iov).collect();
             let nwritten = unsafe {
                 libc::pwritev(
                     raw_fd,
@@ -1640,7 +1579,7 @@ impl Default for NvmeState {
             io_cqs: Default::default(),
             ctrl_ident: [0u8; IDENT_CTRL_SIZE],
             ns_ident: [0u8; IDENT_NS_SIZE],
-            num_io_queues: 0,
+            num_io_queues: MAX_IO_QUEUES as u16,
             block_size: 512,
             total_blocks: 0,
         }
@@ -1687,10 +1626,10 @@ impl Lifecycle for NvmeController {
         crate::quiesce::flush_file(&self.gate, &self._file, intent, "nvme")
     }
 
-    fn export_nvme_state(
-        &self,
-    ) -> Option<crate::lifecycle::NvmeMigrateState> {
-        use crate::lifecycle::{NvmeMigrateCq, NvmeMigrateSq, NvmeMigrateState};
+    fn export_nvme_state(&self) -> Option<crate::lifecycle::NvmeMigrateState> {
+        use crate::lifecycle::{
+            NvmeMigrateCq, NvmeMigrateSq, NvmeMigrateState,
+        };
 
         let st = self.state.lock().expect("nvme state lock");
 
@@ -1700,25 +1639,47 @@ impl Lifecycle for NvmeController {
         }
 
         let admin_sq = st.admin_sq.as_ref().map(|sq| NvmeMigrateSq {
-            base: sq.base, size: sq.size, head: sq.head,
-            tail: sq.tail, cq_id: sq.cq_id,
+            base: sq.base,
+            size: sq.size,
+            head: sq.head,
+            tail: sq.tail,
+            cq_id: sq.cq_id,
         });
         let admin_cq = st.admin_cq.as_ref().map(|cq| NvmeMigrateCq {
-            base: cq.base, size: cq.size, head: cq.head,
-            tail: cq.tail, phase: cq.phase, iv: cq.iv,
+            base: cq.base,
+            size: cq.size,
+            head: cq.head,
+            tail: cq.tail,
+            phase: cq.phase,
+            iv: cq.iv,
         });
-        let io_sqs = st.io_sqs.iter().map(|sq| {
-            sq.as_ref().map(|sq| NvmeMigrateSq {
-                base: sq.base, size: sq.size, head: sq.head,
-                tail: sq.tail, cq_id: sq.cq_id,
+        let io_sqs = st
+            .io_sqs
+            .iter()
+            .map(|sq| {
+                sq.as_ref().map(|sq| NvmeMigrateSq {
+                    base: sq.base,
+                    size: sq.size,
+                    head: sq.head,
+                    tail: sq.tail,
+                    cq_id: sq.cq_id,
+                })
             })
-        }).collect();
-        let io_cqs = st.io_cqs.iter().map(|cq| {
-            cq.as_ref().map(|cq| NvmeMigrateCq {
-                base: cq.base, size: cq.size, head: cq.head,
-                tail: cq.tail, phase: cq.phase, iv: cq.iv,
+            .collect();
+        let io_cqs = st
+            .io_cqs
+            .iter()
+            .map(|cq| {
+                cq.as_ref().map(|cq| NvmeMigrateCq {
+                    base: cq.base,
+                    size: cq.size,
+                    head: cq.head,
+                    tail: cq.tail,
+                    phase: cq.phase,
+                    iv: cq.iv,
+                })
             })
-        }).collect();
+            .collect();
 
         // Export PCI state
         let pci = self.pci_state.lock().expect("pci lock");
@@ -1732,9 +1693,8 @@ impl Lifecycle for NvmeController {
 
         // Export MSI-X table entries
         let msix_count = self.msix.count();
-        let msix_entries: Vec<(u64, u64)> = (0..msix_count)
-            .map(|v| self.msix.read_entry(v))
-            .collect();
+        let msix_entries: Vec<(u64, u64)> =
+            (0..msix_count).map(|v| self.msix.read_entry(v)).collect();
         let msix_enabled = self.msix.is_enabled();
 
         eprintln!(
@@ -1760,10 +1720,7 @@ impl Lifecycle for NvmeController {
         })
     }
 
-    fn restore_nvme_state(
-        &self,
-        mig: &crate::lifecycle::NvmeMigrateState,
-    ) {
+    fn restore_nvme_state(&self, mig: &crate::lifecycle::NvmeMigrateState) {
         eprintln!(
             "[nvme-restore] cc={:#x} csts={:#x} aqa={:#x} io_queues={} msix_enabled={}",
             mig.cc, mig.csts, mig.aqa, mig.num_io_queues, mig.msix_enabled,
@@ -1776,7 +1733,9 @@ impl Lifecycle for NvmeController {
             let mut bar_writes = Vec::new();
             for (idx, &addr) in mig.pci_bar_addrs.iter().enumerate() {
                 let bar = BarN::try_from(idx as u8).expect("valid BAR");
-                let Some((def, _)) = pci.bars().get(bar) else { continue };
+                let Some((def, _)) = pci.bars().get(bar) else {
+                    continue;
+                };
                 let offset = crate::pci::bits::REG_BAR0 + (idx as u8 * 4);
                 match def {
                     BarDefine::Pio(_) | BarDefine::Mmio(_) => {
@@ -1793,7 +1752,9 @@ impl Lifecycle for NvmeController {
                 self.cfg_write(*off, 4, *val);
             }
             self.cfg_write(
-                crate::pci::bits::REG_COMMAND, 2, u32::from(mig.pci_command),
+                crate::pci::bits::REG_COMMAND,
+                2,
+                u32::from(mig.pci_command),
             );
         }
 
@@ -1804,32 +1765,46 @@ impl Lifecycle for NvmeController {
         st.aqa = mig.aqa;
         st.asq_base = mig.asq_base;
         st.acq_base = mig.acq_base;
-        st.num_io_queues = mig.num_io_queues;
+        st.num_io_queues = mig.num_io_queues.clamp(1, MAX_IO_QUEUES as u16);
 
         // Restore admin queues
         st.admin_sq = mig.admin_sq.as_ref().map(|sq| SubQueue {
-            base: sq.base, size: sq.size, head: sq.head,
-            tail: sq.tail, cq_id: sq.cq_id,
+            base: sq.base,
+            size: sq.size,
+            head: sq.head,
+            tail: sq.tail,
+            cq_id: sq.cq_id,
         });
         st.admin_cq = mig.admin_cq.as_ref().map(|cq| CompQueue {
-            base: cq.base, size: cq.size, head: cq.head,
-            tail: cq.tail, phase: cq.phase, iv: cq.iv,
+            base: cq.base,
+            size: cq.size,
+            head: cq.head,
+            tail: cq.tail,
+            phase: cq.phase,
+            iv: cq.iv,
         });
 
         // Restore I/O queues
         for (idx, sq_opt) in mig.io_sqs.iter().enumerate() {
             if idx < MAX_IO_QUEUES {
                 st.io_sqs[idx] = sq_opt.as_ref().map(|sq| SubQueue {
-                    base: sq.base, size: sq.size, head: sq.head,
-                    tail: sq.tail, cq_id: sq.cq_id,
+                    base: sq.base,
+                    size: sq.size,
+                    head: sq.head,
+                    tail: sq.tail,
+                    cq_id: sq.cq_id,
                 });
             }
         }
         for (idx, cq_opt) in mig.io_cqs.iter().enumerate() {
             if idx < MAX_IO_QUEUES {
                 st.io_cqs[idx] = cq_opt.as_ref().map(|cq| CompQueue {
-                    base: cq.base, size: cq.size, head: cq.head,
-                    tail: cq.tail, phase: cq.phase, iv: cq.iv,
+                    base: cq.base,
+                    size: cq.size,
+                    head: cq.head,
+                    tail: cq.tail,
+                    phase: cq.phase,
+                    iv: cq.iv,
                 });
             }
         }
@@ -1904,7 +1879,7 @@ mod tests {
         let db_offset = offset - REG_DOORBELL_BASE;
         let db_index = db_offset / 4;
         let qid = db_index / 2;
-        let is_sq = (db_index % 2) == 0;
+        let is_sq = db_index.is_multiple_of(2);
         assert_eq!(qid, 0);
         assert!(is_sq);
 
@@ -1913,7 +1888,7 @@ mod tests {
         let db_offset = offset - REG_DOORBELL_BASE;
         let db_index = db_offset / 4;
         let qid = db_index / 2;
-        let is_sq = (db_index % 2) == 0;
+        let is_sq = db_index.is_multiple_of(2);
         assert_eq!(qid, 0);
         assert!(!is_sq);
 
@@ -1922,7 +1897,7 @@ mod tests {
         let db_offset = offset - REG_DOORBELL_BASE;
         let db_index = db_offset / 4;
         let qid = db_index / 2;
-        let is_sq = (db_index % 2) == 0;
+        let is_sq = db_index.is_multiple_of(2);
         assert_eq!(qid, 1);
         assert!(is_sq);
     }
@@ -1945,6 +1920,68 @@ mod tests {
         let status = SC_INVALID_OPCODE | SC_DNR;
         assert_ne!(status & SC_DNR, 0);
         assert_eq!(status & !SC_DNR, SC_INVALID_OPCODE);
+    }
+
+    #[test]
+    fn create_io_cq_with_cq_id_zero_is_rejected() {
+        let mut state = NvmeState::default();
+        let qid = 1u32;
+        let qsize = 1u32 << 16;
+        let cq_id = 0u32 << 16;
+
+        let status = NvmeController::admin_create_io_sq(
+            &mut state,
+            0x1000,
+            qid | qsize,
+            cq_id,
+        );
+
+        assert_eq!(status, (SC_INVALID_FIELD | SC_DNR, 0));
+    }
+
+    #[test]
+    fn num_queues_max_request_stays_nonzero() {
+        let mut state = NvmeState::default();
+
+        let set_result = NvmeController::admin_set_features(
+            &mut state,
+            u32::from(FEAT_NUM_QUEUES),
+            u32::MAX,
+        );
+
+        let allocated = (MAX_IO_QUEUES as u32) - 1;
+        assert_eq!(set_result, (SC_SUCCESS, allocated | (allocated << 16)));
+        assert_eq!(state.num_io_queues, MAX_IO_QUEUES as u16);
+        assert_ne!(state.num_io_queues, 0);
+        assert_eq!(
+            NvmeController::admin_get_features(
+                &state,
+                u32::from(FEAT_NUM_QUEUES),
+            ),
+            set_result
+        );
+    }
+
+    #[test]
+    fn create_io_queues_reject_max_qsize_without_overflow() {
+        let cdw10 = 1 | (u32::from(u16::MAX) << 16);
+
+        let mut cq_state = NvmeState::default();
+        assert_eq!(
+            NvmeController::admin_create_io_cq(&mut cq_state, 0x1000, cdw10, 0,),
+            (SC_INVALID_QUEUE_SIZE | SC_DNR, 0)
+        );
+
+        let mut sq_state = NvmeState::default();
+        assert_eq!(
+            NvmeController::admin_create_io_sq(
+                &mut sq_state,
+                0x1000,
+                cdw10,
+                1 << 16,
+            ),
+            (SC_INVALID_QUEUE_SIZE | SC_DNR, 0)
+        );
     }
 
     #[test]

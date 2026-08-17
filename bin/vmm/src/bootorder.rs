@@ -60,7 +60,9 @@ pub fn build_bootorder(specs: &[String]) -> anyhow::Result<Vec<u8>> {
         };
         let bdf_field = cleaned_spec.split(',').next().unwrap_or("");
         let bdf = crate::parse_bdf(bdf_field).ok_or_else(|| {
-            anyhow::anyhow!("invalid BDF '{bdf_field}' in PCI slot spec '{spec}'")
+            anyhow::anyhow!(
+                "invalid BDF '{bdf_field}' in PCI slot spec '{spec}'"
+            )
         })?;
 
         if let Some((first_spec, _)) = indexed.get(&index) {
@@ -99,7 +101,8 @@ mod tests {
 
     #[test]
     fn single_bootindex_emits_that_slot() {
-        let result = build_bootorder(&specs(&["5,nvme,/iso,bootindex=1"])).unwrap();
+        let result =
+            build_bootorder(&specs(&["5,nvme,/iso,bootindex=1"])).unwrap();
         assert_eq!(result, b"/pci@i0cf8/pci@5,0\n");
     }
 
@@ -141,19 +144,23 @@ mod tests {
 
     #[test]
     fn two_bootindex_tokens_in_one_spec_is_error() {
-        assert!(strip_bootindex("4,nvme,/disk,bootindex=1,bootindex=2").is_err());
+        assert!(
+            strip_bootindex("4,nvme,/disk,bootindex=1,bootindex=2").is_err()
+        );
     }
 
     #[test]
     fn bootindex_is_stripped_from_device_config() {
-        let (cleaned, index) = strip_bootindex("4,nvme,/disk,bootindex=2").unwrap();
+        let (cleaned, index) =
+            strip_bootindex("4,nvme,/disk,bootindex=2").unwrap();
         assert_eq!(cleaned, "4,nvme,/disk");
         assert_eq!(index, Some(2));
     }
 
     #[test]
     fn bootindex_stripped_mid_config() {
-        let (cleaned, index) = strip_bootindex("5,nvme,/iso,bootindex=1,ro").unwrap();
+        let (cleaned, index) =
+            strip_bootindex("5,nvme,/iso,bootindex=1,ro").unwrap();
         assert_eq!(cleaned, "5,nvme,/iso,ro");
         assert_eq!(index, Some(1));
     }
@@ -168,7 +175,8 @@ mod tests {
 
     #[test]
     fn bootindex_with_explicit_func() {
-        let result = build_bootorder(&specs(&["0:5:1,nvme,/iso,bootindex=1"])).unwrap();
+        let result =
+            build_bootorder(&specs(&["0:5:1,nvme,/iso,bootindex=1"])).unwrap();
         assert_eq!(result, b"/pci@i0cf8/pci@5,1\n");
     }
 }

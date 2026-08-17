@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copied from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: crates/bhyve-api/sys/src/enums.rs
+// https://github.com/oxidecomputer/propolis
 
 use strum::FromRepr;
 

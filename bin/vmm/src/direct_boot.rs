@@ -24,7 +24,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 
 use vmm_core::mem::MemCtx;
 use vmm_core::vcpu::Vcpu;
@@ -38,6 +38,8 @@ const GPA_PML4: u64 = 0x9000;
 const GPA_PDPT: u64 = 0xA000;
 const GPA_PD_BASE: u64 = 0xB000;
 const GPA_CMDLINE: u64 = 0x2_0000;
+// Reserved for the pending fixed-address kernel placement path.
+#[allow(dead_code)]
 const GPA_KERNEL: u64 = 0x10_0000;
 const CMDLINE_MAX: usize = 4096;
 
@@ -81,14 +83,14 @@ const PTE_PAGE_SIZE: u64 = 1 << 7; // 2MB large page
 
 // ── x86 control register bits ──────────────────────────────────────
 
-const CR0_PE: u64 = 1 << 0;  // Protection Enable
-const CR0_ET: u64 = 1 << 4;  // Extension Type (387 coprocessor)
-const CR0_NE: u64 = 1 << 5;  // Numeric Error (native FPU error reporting)
+const CR0_PE: u64 = 1 << 0; // Protection Enable
+const CR0_ET: u64 = 1 << 4; // Extension Type (387 coprocessor)
+const CR0_NE: u64 = 1 << 5; // Numeric Error (native FPU error reporting)
 const CR0_PG: u64 = 1 << 31; // Paging
 
 const CR4_PAE: u64 = 1 << 5; // Physical Address Extension
 
-const EFER_LME: u64 = 1 << 8;  // Long Mode Enable
+const EFER_LME: u64 = 1 << 8; // Long Mode Enable
 const EFER_LMA: u64 = 1 << 10; // Long Mode Active
 
 // ── GDT entries ────────────────────────────────────────────────────
@@ -156,10 +158,14 @@ pub struct KernelImage {
 impl KernelImage {
     /// Open and validate a bzImage file.
     pub fn open(path: &Path) -> Result<Self> {
-        let data = fs::read(path)
-            .with_context(|| format!("failed to read kernel: {}", path.display()))?;
+        let data = fs::read(path).with_context(|| {
+            format!("failed to read kernel: {}", path.display())
+        })?;
 
-        ensure!(data.len() > SETUP_HEADER_END, "kernel too small to be a bzImage");
+        ensure!(
+            data.len() > SETUP_HEADER_END,
+            "kernel too small to be a bzImage"
+        );
 
         // Verify "HdrS" magic
         let magic = u32::from_le_bytes(
@@ -173,9 +179,7 @@ impl KernelImage {
         );
 
         let version = u16::from_le_bytes(
-            data[VERSION_OFFSET..VERSION_OFFSET + 2]
-                .try_into()
-                .unwrap(),
+            data[VERSION_OFFSET..VERSION_OFFSET + 2].try_into().unwrap(),
         );
         ensure!(
             version >= 0x020C,
@@ -240,8 +244,9 @@ pub struct InitrdImage {
 
 impl InitrdImage {
     pub fn open(path: &Path) -> Result<Self> {
-        let data = fs::read(path)
-            .with_context(|| format!("failed to read initrd: {}", path.display()))?;
+        let data = fs::read(path).with_context(|| {
+            format!("failed to read initrd: {}", path.display())
+        })?;
         ensure!(!data.is_empty(), "initrd is empty");
         Ok(Self { data })
     }
@@ -269,7 +274,11 @@ pub fn load_kernel(
         .context("failed to write kernel to guest memory")?;
 
     // 2. Write kernel command line
-    ensure!(cmdline.len() < CMDLINE_MAX, "cmdline too long (max {})", CMDLINE_MAX);
+    ensure!(
+        cmdline.len() < CMDLINE_MAX,
+        "cmdline too long (max {})",
+        CMDLINE_MAX
+    );
     let mut cmdline_buf = cmdline.as_bytes().to_vec();
     cmdline_buf.push(0); // NUL terminate
     mem.write(GPA_CMDLINE, &cmdline_buf)
@@ -299,7 +308,12 @@ pub fn load_kernel(
 
     // 6. Write boot_params (zero page) at 0x7000
     write_boot_params(
-        mem, kernel, cmdline.len(), initrd_addr, mem_size, acpi_rsdp_addr,
+        mem,
+        kernel,
+        cmdline.len(),
+        initrd_addr,
+        mem_size,
+        acpi_rsdp_addr,
     )?;
 
     Ok(kernel.entry_point_64())
@@ -364,7 +378,7 @@ fn write_gdt(mem: &MemCtx) -> Result<()> {
 fn write_boot_params(
     mem: &MemCtx,
     kernel: &KernelImage,
-    cmdline_len: usize,
+    _cmdline_len: usize,
     initrd: Option<(u64, usize)>,
     mem_size: usize,
     acpi_rsdp_addr: u64,
@@ -417,13 +431,11 @@ fn write_boot_params(
 /// Configure vCPU 0 for 64-bit long mode entry into the kernel.
 pub fn setup_direct_boot_bsp(vcpu: &Vcpu, entry_point: u64) -> Result<()> {
     use bhyve_api::{
-        seg_desc, vm_reg_name::*,
-        SEG_ACCESS_P, SEG_ACCESS_S, SEG_ACCESS_L, SEG_ACCESS_DB, SEG_ACCESS_G,
-        SEG_ACCESS_UNUSABLE,
+        seg_desc, vm_reg_name::*, SEG_ACCESS_DB, SEG_ACCESS_G, SEG_ACCESS_L,
+        SEG_ACCESS_P, SEG_ACCESS_S, SEG_ACCESS_UNUSABLE,
     };
 
-    vcpu.reboot_state()
-        .context("reboot_state")?;
+    vcpu.reboot_state().context("reboot_state")?;
 
     // Control registers for 64-bit long mode
     vcpu.set_reg(VM_REG_GUEST_CR0, CR0_PG | CR0_NE | CR0_ET | CR0_PE)?;
@@ -432,60 +444,84 @@ pub fn setup_direct_boot_bsp(vcpu: &Vcpu, entry_point: u64) -> Result<()> {
     vcpu.set_reg(VM_REG_GUEST_EFER, EFER_LMA | EFER_LME)?;
 
     // 64-bit code segment
-    let code64_access =
-        SEG_ACCESS_P | SEG_ACCESS_S | SEG_ACCESS_L | SEG_ACCESS_G | SEG_TYPE_CODE_XRA;
-    vcpu.set_segment_desc(VM_REG_GUEST_CS, &seg_desc {
-        base: 0,
-        limit: u32::MAX,
-        access: code64_access,
-    })?;
+    let code64_access = SEG_ACCESS_P
+        | SEG_ACCESS_S
+        | SEG_ACCESS_L
+        | SEG_ACCESS_G
+        | SEG_TYPE_CODE_XRA;
+    vcpu.set_segment_desc(
+        VM_REG_GUEST_CS,
+        &seg_desc {
+            base: 0,
+            limit: u32::MAX,
+            access: code64_access,
+        },
+    )?;
     vcpu.set_reg(VM_REG_GUEST_CS, GDT_SEL_CODE64)?;
 
     // Data segments
-    let data_access =
-        SEG_ACCESS_P | SEG_ACCESS_S | SEG_ACCESS_DB | SEG_ACCESS_G | SEG_TYPE_DATA_RWA;
+    let data_access = SEG_ACCESS_P
+        | SEG_ACCESS_S
+        | SEG_ACCESS_DB
+        | SEG_ACCESS_G
+        | SEG_TYPE_DATA_RWA;
     let data_desc = seg_desc {
         base: 0,
         limit: u32::MAX,
         access: data_access,
     };
     for reg in [
-        VM_REG_GUEST_DS, VM_REG_GUEST_ES, VM_REG_GUEST_FS,
-        VM_REG_GUEST_GS, VM_REG_GUEST_SS,
+        VM_REG_GUEST_DS,
+        VM_REG_GUEST_ES,
+        VM_REG_GUEST_FS,
+        VM_REG_GUEST_GS,
+        VM_REG_GUEST_SS,
     ] {
         vcpu.set_segment_desc(reg, &data_desc)?;
         vcpu.set_reg(reg, GDT_SEL_DATA64)?;
     }
 
     // GDTR
-    vcpu.set_segment_desc(VM_REG_GUEST_GDTR, &seg_desc {
-        base: GPA_GDT,
-        limit: GDTR_LIMIT,
-        access: 0,
-    })?;
+    vcpu.set_segment_desc(
+        VM_REG_GUEST_GDTR,
+        &seg_desc {
+            base: GPA_GDT,
+            limit: GDTR_LIMIT,
+            access: 0,
+        },
+    )?;
 
     // TR (busy 64-bit TSS) — VMX requires a valid, present TR
-    vcpu.set_segment_desc(VM_REG_GUEST_TR, &seg_desc {
-        base: 0,
-        limit: u16::MAX as u32,
-        access: SEG_ACCESS_P | SEG_TYPE_TSS_BUSY64,
-    })?;
+    vcpu.set_segment_desc(
+        VM_REG_GUEST_TR,
+        &seg_desc {
+            base: 0,
+            limit: u16::MAX as u32,
+            access: SEG_ACCESS_P | SEG_TYPE_TSS_BUSY64,
+        },
+    )?;
     vcpu.set_reg(VM_REG_GUEST_TR, 0)?;
 
     // LDTR — mark unusable (VMX requires UNUSABLE bit when not loaded)
-    vcpu.set_segment_desc(VM_REG_GUEST_LDTR, &seg_desc {
-        base: 0,
-        limit: 0,
-        access: SEG_ACCESS_UNUSABLE,
-    })?;
+    vcpu.set_segment_desc(
+        VM_REG_GUEST_LDTR,
+        &seg_desc {
+            base: 0,
+            limit: 0,
+            access: SEG_ACCESS_UNUSABLE,
+        },
+    )?;
     vcpu.set_reg(VM_REG_GUEST_LDTR, 0)?;
 
     // IDTR — no IDT initially (kernel will set it up)
-    vcpu.set_segment_desc(VM_REG_GUEST_IDTR, &seg_desc {
-        base: 0,
-        limit: u16::MAX as u32,
-        access: 0,
-    })?;
+    vcpu.set_segment_desc(
+        VM_REG_GUEST_IDTR,
+        &seg_desc {
+            base: 0,
+            limit: u16::MAX as u32,
+            access: 0,
+        },
+    )?;
 
     // Entry point and boot protocol registers
     vcpu.set_reg(VM_REG_GUEST_RIP, entry_point)?;
@@ -540,10 +576,22 @@ mod tests {
         // Null descriptor
         assert_eq!(&gdt[..8], &[0u8; 8]);
         // Code64: check L bit (bit 53) is set, DB bit (bit 54) is clear
-        assert_ne!(GDT_CODE64 & (1 << 53), 0, "L bit must be set for 64-bit code");
-        assert_eq!(GDT_CODE64 & (1 << 54), 0, "DB bit must be clear for 64-bit code");
+        assert_ne!(
+            GDT_CODE64 & (1 << 53),
+            0,
+            "L bit must be set for 64-bit code"
+        );
+        assert_eq!(
+            GDT_CODE64 & (1 << 54),
+            0,
+            "DB bit must be clear for 64-bit code"
+        );
         // Data64: check DB bit is set
-        assert_ne!(GDT_DATA64 & (1 << 54), 0, "DB bit must be set for data segment");
+        assert_ne!(
+            GDT_DATA64 & (1 << 54),
+            0,
+            "DB bit must be set for data segment"
+        );
     }
 
     #[test]

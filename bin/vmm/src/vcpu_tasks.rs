@@ -29,8 +29,7 @@ mod probes {
 }
 
 use vmm_core::exits::{
-    InoutReq, InoutRes, MmioReq, MmioRes, Suspend,
-    VmEntry, VmExitKind,
+    InoutReq, InoutRes, MmioReq, MmioRes, Suspend, VmEntry, VmExitKind,
 };
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mmio::MmioBus;
@@ -101,10 +100,7 @@ fn fatal_exit(
         "cs" => diagnostic_cs(vcpu),
     );
 
-    match hdl.suspend(
-        vm_suspend_how::VM_SUSPEND_HALT as u32,
-        vcpu_id,
-    ) {
+    match hdl.suspend(vm_suspend_how::VM_SUSPEND_HALT as u32, vcpu_id) {
         Ok(()) => {}
         Err(error) if error.raw_os_error() == Some(libc::EALREADY) => {
             debug!(log, "VM suspend already latched";
@@ -117,7 +113,10 @@ fn fatal_exit(
     }
 
     // The receiver can be gone only after shutdown has already begun.
-    let _ = events.send(VcpuEvent::Error { vcpu_id, error: reason });
+    let _ = events.send(VcpuEvent::Error {
+        vcpu_id,
+        error: reason,
+    });
 }
 
 fn should_discard_once(rip: u64, last: &mut Option<u64>) -> bool {
@@ -158,7 +157,7 @@ pub fn spawn_vcpu_threads(
         let vmm_hdl = Arc::clone(&hdl);
         let hyperv = hyperv.clone();
 
-        let thread_vcpu = vmm_core::Vcpu::new_for_thread(vcpu_id, vcpu_hdl);
+        let thread_vcpu = Vcpu::new_for_thread(vcpu_id, vcpu_hdl);
 
         let handle = thread::Builder::new()
             .name(format!("vcpu-{}", vcpu_id))
@@ -194,7 +193,7 @@ fn vcpu_run_loop(
     api_version: u32,
     metrics: &VcpuMetrics,
     hyperv: Option<&HyperV>,
-    events: &mpsc::Sender<VcpuEvent>,
+    events: &Sender<VcpuEvent>,
     log: &Logger,
 ) {
     let vcpu_id = vcpu.id();
@@ -204,7 +203,7 @@ fn vcpu_run_loop(
     info!(log, "vCPU run loop starting"; "vcpu" => vcpu_id);
 
     loop {
-        probes::vm_entry!(|| (vcpu_id as u32));
+        probes::vm_entry!(|| vcpu_id as u32);
         let exit = match vcpu.enter(&next_entry, api_version) {
             Ok(exit) => exit,
             Err(e) => {
@@ -216,7 +215,7 @@ fn vcpu_run_loop(
                 // EBUSY means the VM is paused (e.g., during migration).
                 // Sleep briefly and retry — resume() will unblock us.
                 if e.raw_os_error() == Some(libc::EBUSY) {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    thread::sleep(std::time::Duration::from_millis(10));
                     next_entry = VmEntry::Run;
                     continue;
                 }
@@ -235,9 +234,7 @@ fn vcpu_run_loop(
         metrics.record_exit(exit_code);
 
         next_entry = match exit.kind {
-            VmExitKind::Bogus | VmExitKind::Debug => {
-                VmEntry::Run
-            }
+            VmExitKind::Bogus | VmExitKind::Debug => VmEntry::Run,
 
             VmExitKind::Inout(ref req) => {
                 let res = handle_inout(req, bus_pio);
@@ -360,19 +357,6 @@ fn vcpu_run_loop(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::should_discard_once;
-
-    #[test]
-    fn instruction_is_discarded_once_per_repeating_rip() {
-        let mut last = None;
-
-        assert!(should_discard_once(0x1234, &mut last));
-        assert!(!should_discard_once(0x1234, &mut last));
-    }
-}
-
 /// Dispatch an IN/OUT instruction to the PIO bus.
 fn handle_inout(req: &InoutReq, bus: &PioBus) -> InoutRes {
     match req {
@@ -411,8 +395,8 @@ fn handle_mmio(req: &MmioReq, bus: &MmioBus) -> MmioRes {
 fn write_msr_result(vcpu: &Vcpu, value: u64) {
     let lo = value as u32 as u64;
     let hi = (value >> 32) as u32 as u64;
-    let _ = vcpu.set_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RAX, lo);
-    let _ = vcpu.set_reg(bhyve_api::vm_reg_name::VM_REG_GUEST_RDX, hi);
+    let _ = vcpu.set_reg(vm_reg_name::VM_REG_GUEST_RAX, lo);
+    let _ = vcpu.set_reg(vm_reg_name::VM_REG_GUEST_RDX, hi);
 }
 
 fn handle_rdmsr(
@@ -461,7 +445,9 @@ fn handle_wrmsr(
             }
             WrmsrOutcome::Reset => {
                 use bhyve_api::vm_suspend_how;
-                if let Err(e) = hdl.suspend(vm_suspend_how::VM_SUSPEND_RESET as u32, vcpu_id) {
+                if let Err(e) = hdl
+                    .suspend(vm_suspend_how::VM_SUSPEND_RESET as u32, vcpu_id)
+                {
                     warn!(log, "reset suspend failed"; "error" => %e);
                 }
                 return;
@@ -470,4 +456,17 @@ fn handle_wrmsr(
         }
     }
     debug!(log, "unhandled wrmsr"; "msr" => format!("{:#x}", code), "val" => format!("{:#x}", val));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_discard_once;
+
+    #[test]
+    fn instruction_is_discarded_once_per_repeating_rip() {
+        let mut last = None;
+
+        assert!(should_discard_once(0x1234, &mut last));
+        assert!(!should_discard_once(0x1234, &mut last));
+    }
 }

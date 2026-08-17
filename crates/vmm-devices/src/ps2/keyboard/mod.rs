@@ -1,14 +1,18 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copied from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: lib/propolis/src/hw/ps2/keyboard/mod.rs
+// https://github.com/oxidecomputer/propolis
 
 mod scan_code_1;
 mod scan_code_2;
 
 use std::convert::TryFrom;
 
-use anyhow::{anyhow, Result};
 use super::keysym::{self, AsciiChar, KeySym::*};
+use anyhow::{anyhow, Result};
 
 use scan_code_1::*;
 use scan_code_2::*;
@@ -22,6 +26,9 @@ pub struct KeyEvent {
 }
 
 impl KeyEvent {
+    // `KeySym`'s `TryFrom<u32>` deliberately uses `()` for an unrecognized
+    // X11 keysym; callers only distinguish recognized from unrecognized.
+    #[allow(clippy::result_unit_err)]
     pub fn keysym(&self) -> std::result::Result<keysym::KeySym, ()> {
         keysym::KeySym::try_from(self.keysym_raw)
     }
@@ -115,10 +122,7 @@ impl TryFrom<KeyEvent> for KeyEventRep {
 
     fn try_from(keyevent: KeyEvent) -> Result<Self, Self::Error> {
         let keysym = keyevent.keysym().map_err(|()| {
-            anyhow!(
-                "unrecognized keysym value: 0x{:x}",
-                keyevent.keysym_raw
-            )
+            anyhow!("unrecognized keysym value: 0x{:x}", keyevent.keysym_raw)
         })?;
         let (base_val_1, base_val_2) = match keysym {
             Ascii(ascii_char) => match ascii_char {
@@ -328,8 +332,14 @@ impl TryFrom<KeyEvent> for KeyEventRep {
             _ => None,
         };
 
-        let sc1 = ScanCodeBase { base_val: base_val_1, prefix: prefix_1 };
-        let sc2 = ScanCodeBase { base_val: base_val_2, prefix: prefix_2 };
+        let sc1 = ScanCodeBase {
+            base_val: base_val_1,
+            prefix: prefix_1,
+        };
+        let sc2 = ScanCodeBase {
+            base_val: base_val_2,
+            prefix: prefix_2,
+        };
 
         Ok(Self {
             keysym_raw: keyevent.keysym_raw,

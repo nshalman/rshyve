@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copied from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: crates/bhyve-api/sys/src/vmm_data.rs
+// https://github.com/oxidecomputer/propolis
 
 #![allow(non_camel_case_types)]
 // VMM Data Classes
@@ -48,7 +52,11 @@ impl vdi_field_entry_v1 {
 
     /// Create a `vdi_field_entry_v1` from `ident` and `value`
     pub const fn new(ident: u32, value: u64) -> Self {
-        Self { vfe_ident: ident, _pad: 0, vfe_value: value }
+        Self {
+            vfe_ident: ident,
+            _pad: 0,
+            vfe_value: value,
+        }
     }
 }
 

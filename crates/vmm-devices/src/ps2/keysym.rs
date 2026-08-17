@@ -3,6 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // Copyright 2022 Oxide Computer Company
+//
+// Copied from Propolis, used under MPL-2.0.
+// Upstream: crates/rfb/src/keysym.rs
+// https://github.com/oxidecomputer/propolis
 
 pub use ascii::AsciiChar;
 use ascii::ToAsciiChar;
@@ -77,7 +81,7 @@ const KEYSYM_KP_DELETE: u32 = 0xff9f;
 
 #[derive(Debug, Copy, Clone)]
 pub enum KeySym {
-    Ascii(ascii::AsciiChar),
+    Ascii(AsciiChar),
     Backspace,
     Tab,
     ReturnOrEnter,

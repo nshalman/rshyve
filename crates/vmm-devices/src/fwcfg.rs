@@ -152,31 +152,32 @@ impl FwCfg {
     /// - Port 0x511: data (1-byte read)
     pub fn attach(self: &Arc<Self>, pio: &PioBus) {
         let this = Arc::clone(self);
-        let handler: Arc<PioFn> = Arc::new(move |offset: u16, rwop: RWOp<'_>| {
-            match (offset, rwop) {
-                // Selector port write (0x510)
-                (0, RWOp::Write(wo)) => {
-                    let sel = wo.read_u16();
-                    let mut inner = this.inner.lock().unwrap();
-                    inner.cur_selector = sel;
-                    inner.cur_offset = 0;
+        let handler: Arc<PioFn> =
+            Arc::new(move |offset: u16, rwop: RWOp<'_>| {
+                match (offset, rwop) {
+                    // Selector port write (0x510)
+                    (0, RWOp::Write(wo)) => {
+                        let sel = wo.read_u16();
+                        let mut inner = this.inner.lock().unwrap();
+                        inner.cur_selector = sel;
+                        inner.cur_offset = 0;
+                    }
+                    // Selector port read (0x510)
+                    (0, RWOp::Read(ro)) => {
+                        let inner = this.inner.lock().unwrap();
+                        ro.write_u16(inner.cur_selector);
+                    }
+                    // Data port read (0x511)
+                    (1, RWOp::Read(ro)) => {
+                        let mut inner = this.inner.lock().unwrap();
+                        let byte = Self::read_data_byte(&mut inner);
+                        ro.write_u8(byte);
+                    }
+                    // Data port write (0x511) - ignored per QEMU spec
+                    (1, RWOp::Write(_)) => {}
+                    _ => {}
                 }
-                // Selector port read (0x510)
-                (0, RWOp::Read(ro)) => {
-                    let inner = this.inner.lock().unwrap();
-                    ro.write_u16(inner.cur_selector);
-                }
-                // Data port read (0x511)
-                (1, RWOp::Read(ro)) => {
-                    let mut inner = this.inner.lock().unwrap();
-                    let byte = Self::read_data_byte(&mut inner);
-                    ro.write_u8(byte);
-                }
-                // Data port write (0x511) - ignored per QEMU spec
-                (1, RWOp::Write(_)) => {}
-                _ => {}
-            }
-        });
+            });
 
         pio.register(FWCFG_PORT_SEL, 2, handler).unwrap();
     }
@@ -232,9 +233,7 @@ impl FwCfg {
             let copy_len = name_bytes.len().min(MAX_NAME_LEN - 1);
             buf.extend_from_slice(&name_bytes[..copy_len]);
             // Pad remaining bytes with zeroes
-            for _ in copy_len..MAX_NAME_LEN {
-                buf.push(0);
-            }
+            buf.resize(buf.len() + MAX_NAME_LEN - copy_len, 0);
         }
 
         // We must drop inner before re-locking to insert

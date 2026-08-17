@@ -28,10 +28,10 @@ use vmm_core::common::RWOp;
 use vmm_core::mem::PhysMap;
 use vmm_core::mmio::{MmioBus, MmioFn};
 
-use crate::Lifecycle;
 use crate::pci::bar::BarDefine;
 use crate::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use crate::pci::{BarN, IntrPin};
+use crate::Lifecycle;
 
 use bits::*;
 use tablet::TabletDevice;
@@ -76,8 +76,8 @@ struct XhciState {
     usbcmd: u32,
     usbsts: u32,
     dnctrl: u32,
-    crcr: u64,          // Command Ring Control Register
-    dcbaap: u64,         // Device Context Base Address Array Pointer
+    crcr: u64,   // Command Ring Control Register
+    dcbaap: u64, // Device Context Base Address Array Pointer
     config: u32,
 
     // ---- Port state ----
@@ -129,8 +129,7 @@ impl XhciState {
             config: 0,
 
             // Port 1 (USB2): not connected, powered
-            port1_sc: PORTSC_PP
-                | (PLS_RXDETECT << PORTSC_PLS_SHIFT),
+            port1_sc: PORTSC_PP | (PLS_RXDETECT << PORTSC_PLS_SHIFT),
             // Port 2 (USB3): connected, powered, SuperSpeed
             port2_sc: PORTSC_CCS
                 | PORTSC_PP
@@ -312,9 +311,7 @@ impl XhciController {
         }
 
         // Write TRB to guest memory
-        let trb_bytes: [u8; TRB_SIZE] = unsafe {
-            std::mem::transmute(trb)
-        };
+        let trb_bytes: [u8; TRB_SIZE] = unsafe { std::mem::transmute(trb) };
         if let Some(sub) = self.physmap.lookup(gpa, TRB_SIZE) {
             let _ = sub.write_bytes(&trb_bytes);
         }
@@ -344,7 +341,7 @@ impl XhciController {
             dword0: cmd_trb_addr as u32,
             dword1: (cmd_trb_addr >> 32) as u32,
             dword2: (cc << 24),
-            dword3: (u32::from(TRB_TYPE_CMD_COMPLETION) << TRB_TYPE_SHIFT)
+            dword3: (TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT)
                 | (u32::from(slot_id) << 24),
         };
         self.post_event(st, event);
@@ -356,7 +353,7 @@ impl XhciController {
             dword0: 0,
             dword1: 0,
             dword2: TRB_CC_SUCCESS << 24,
-            dword3: (u32::from(TRB_TYPE_PORT_STATUS_CHANGE) << TRB_TYPE_SHIFT)
+            dword3: (TRB_TYPE_PORT_STATUS_CHANGE << TRB_TYPE_SHIFT)
                 | (u32::from(port_id) << 24),
         };
         self.post_event(st, event);
@@ -376,7 +373,7 @@ impl XhciController {
             dword0: trb_addr as u32,
             dword1: (trb_addr >> 32) as u32,
             dword2: (cc << 24) | (transfer_len & 0xFFFFFF),
-            dword3: (u32::from(TRB_TYPE_TRANSFER_EVENT) << TRB_TYPE_SHIFT)
+            dword3: (TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT)
                 | (u32::from(slot_id) << 24)
                 | (u32::from(ep_id) << 16),
         };
@@ -576,21 +573,27 @@ impl XhciController {
     }
 
     /// Parse the Input Context to extract the EP0 transfer ring dequeue pointer.
-    fn parse_input_context_for_ep0(&self, st: &mut XhciState, input_ctx_addr: u64) {
+    fn parse_input_context_for_ep0(
+        &self,
+        st: &mut XhciState,
+        input_ctx_addr: u64,
+    ) {
         // Input Context layout (32-byte contexts):
         //   [0x00..0x1F] Input Control Context
         //   [0x20..0x3F] Slot Context
         //   [0x40..0x5F] EP0 Context (DCI 1)
-        let ep0_ctx_addr = input_ctx_addr + INPUT_CTRL_CTX_SIZE as u64
-            + SLOT_CTX_SIZE as u64;
+        let ep0_ctx_addr =
+            input_ctx_addr + INPUT_CTRL_CTX_SIZE as u64 + SLOT_CTX_SIZE as u64;
 
         // EP Context dword 2 (offset 0x08): TR Dequeue Pointer low
         // EP Context dword 3 (offset 0x0C): TR Dequeue Pointer high
         let mut buf = [0u8; EP_CTX_SIZE];
         if let Some(sub) = self.physmap.lookup(ep0_ctx_addr, EP_CTX_SIZE) {
             if sub.read_bytes(&mut buf).is_ok() {
-                let deq_lo = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-                let deq_hi = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+                let deq_lo =
+                    u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                let deq_hi =
+                    u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
                 let deq = u64::from(deq_lo) | (u64::from(deq_hi) << 32);
                 st.ep0_ring.dequeue = deq & !0xF;
                 st.ep0_ring.ccs = (deq & 1) != 0;
@@ -600,7 +603,11 @@ impl XhciController {
     }
 
     /// Parse the Input Context to extract the EP1 IN transfer ring dequeue pointer.
-    fn parse_input_context_for_ep1(&self, st: &mut XhciState, input_ctx_addr: u64) {
+    fn parse_input_context_for_ep1(
+        &self,
+        st: &mut XhciState,
+        input_ctx_addr: u64,
+    ) {
         // EP1 IN = DCI 3, so it's the 4th context entry (after input ctrl, slot, EP0)
         // Offset = InputCtrl(32) + Slot(32) + EP0(32) + EP1OUT(32) = 128
         // But for our device there is no EP1 OUT, so the guest should
@@ -614,8 +621,10 @@ impl XhciController {
         let mut buf = [0u8; EP_CTX_SIZE];
         if let Some(sub) = self.physmap.lookup(ep1_in_ctx_addr, EP_CTX_SIZE) {
             if sub.read_bytes(&mut buf).is_ok() {
-                let deq_lo = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-                let deq_hi = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+                let deq_lo =
+                    u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                let deq_hi =
+                    u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
                 let deq = u64::from(deq_lo) | (u64::from(deq_hi) << 32);
                 st.ep1_in_ring.dequeue = deq & !0xF;
                 st.ep1_in_ring.ccs = (deq & 1) != 0;
@@ -761,9 +770,7 @@ impl XhciController {
                         residual = 0;
                     }
 
-                    self.post_transfer_event(
-                        st, trb_addr, cc, residual, 1, 1,
-                    );
+                    self.post_transfer_event(st, trb_addr, cc, residual, 1, 1);
                     st.ep0_ring.dequeue += TRB_SIZE as u64;
                 }
 
@@ -831,8 +838,7 @@ impl XhciController {
                     let data_buf_addr = trb.parameter();
                     let trb_transfer_len = trb.transfer_length();
                     let report = self.tablet.get_report();
-                    let copy_len =
-                        report.len().min(trb_transfer_len as usize);
+                    let copy_len = report.len().min(trb_transfer_len as usize);
 
                     if let Some(sub) =
                         self.physmap.lookup(data_buf_addr, copy_len)
@@ -849,9 +855,7 @@ impl XhciController {
                     };
 
                     // EP1 IN = DCI 3
-                    self.post_transfer_event(
-                        st, trb_addr, cc, residual, 1, 3,
-                    );
+                    self.post_transfer_event(st, trb_addr, cc, residual, 1, 3);
                     st.ep1_in_ring.dequeue += TRB_SIZE as u64;
                     st.ep1_in_has_trbs = false;
                     return;
@@ -914,8 +918,7 @@ impl XhciController {
                 let val = match offset & !0x3 {
                     // CAPLENGTH (8) | reserved (8) | HCIVERSION (16)
                     0x00 => {
-                        u32::from(CAPLENGTH)
-                            | (u32::from(HCIVERSION) << 16)
+                        u32::from(CAPLENGTH) | (u32::from(HCIVERSION) << 16)
                     }
                     0x04 => hcsparams1(),
                     0x08 => hcsparams2(),
@@ -989,7 +992,9 @@ impl XhciController {
                             // Post port status change for port 2 (USB3, connected)
                             st.port2_sc |= PORTSC_CSC;
                             self.post_port_status_change(&mut st, 2);
-                        } else if (val & USBCMD_RS) == 0 && (old & USBCMD_RS) != 0 {
+                        } else if (val & USBCMD_RS) == 0
+                            && (old & USBCMD_RS) != 0
+                        {
                             // Stopping: set HCHalted
                             st.usbsts |= USBSTS_HCH;
                         }
@@ -1032,16 +1037,15 @@ impl XhciController {
                     OP_DNCTRL => {
                         st.dnctrl = val;
                     }
-                    OP_CRCR => {
-                        if (val as u64 & CRCR_CRR) == 0 {
-                            // Only update when ring is not running
-                            let ptr = u64::from(val) & CRCR_PTR_MASK;
-                            let ccs = (val & 1) != 0;
-                            st.crcr = (st.crcr & 0xFFFF_FFFF_0000_0000) | u64::from(val);
-                            st.cmd_ring_base = ptr;
-                            st.cmd_ring_dequeue = ptr;
-                            st.cmd_ring_ccs = ccs;
-                        }
+                    OP_CRCR if (val as u64 & CRCR_CRR) == 0 => {
+                        // Only update when ring is not running
+                        let ptr = u64::from(val) & CRCR_PTR_MASK;
+                        let ccs = (val & 1) != 0;
+                        st.crcr =
+                            (st.crcr & 0xFFFF_FFFF_0000_0000) | u64::from(val);
+                        st.cmd_ring_base = ptr;
+                        st.cmd_ring_dequeue = ptr;
+                        st.cmd_ring_ccs = ccs;
                     }
                     0x1C => {
                         // CRCR high dword
@@ -1064,8 +1068,7 @@ impl XhciController {
                             | (u64::from(val) << 32);
                     }
                     OP_CONFIG => {
-                        st.config = (val & 0xFF)
-                            .min(u32::from(bits::MAX_SLOTS));
+                        st.config = (val & 0xFF).min(u32::from(MAX_SLOTS));
                     }
                     _ => {}
                 }
@@ -1126,7 +1129,8 @@ impl XhciController {
 
                     // Handle port link state write
                     if (val & PORTSC_LWS) != 0 {
-                        let new_pls = (val >> PORTSC_PLS_SHIFT) & PORTSC_PLS_MASK;
+                        let new_pls =
+                            (val >> PORTSC_PLS_SHIFT) & PORTSC_PLS_MASK;
                         let portsc = match port_idx {
                             0 => &mut st.port1_sc,
                             1 => &mut st.port2_sc,
@@ -1155,7 +1159,7 @@ impl XhciController {
             }
             RWOp::Write(wo) => {
                 let db_idx = db_off / DB_REG_SIZE;
-                if db_idx > usize::from(bits::MAX_SLOTS) {
+                if db_idx > usize::from(MAX_SLOTS) {
                     return;
                 }
                 let val = wo.read_u32();
@@ -1260,7 +1264,7 @@ impl XhciController {
                     IR_ERDP => {
                         st.erdp = (st.erdp & 0xFFFF_FFFF_0000_0000)
                             | u64::from(val & !0x7); // 8-byte aligned, clear EHB
-                        // Clear Event Handler Busy bit (bit 3)
+                                                     // Clear Event Handler Busy bit (bit 3)
                     }
                     0x1C => {
                         // ERDP high
@@ -1282,12 +1286,20 @@ impl XhciController {
                     // USB2 Supported Protocol
                     let dw_idx = xcap_off / 4;
                     let usb2 = xcap_usb2();
-                    if dw_idx < usb2.len() { usb2[dw_idx] } else { 0 }
+                    if dw_idx < usb2.len() {
+                        usb2[dw_idx]
+                    } else {
+                        0
+                    }
                 } else if xcap_off < 2 * XCAP_PROTO_SIZE {
                     // USB3 Supported Protocol
                     let dw_idx = (xcap_off - XCAP_PROTO_SIZE) / 4;
                     let usb3 = xcap_usb3();
-                    if dw_idx < usb3.len() { usb3[dw_idx] } else { 0 }
+                    if dw_idx < usb3.len() {
+                        usb3[dw_idx]
+                    } else {
+                        0
+                    }
                 } else {
                     0
                 };
@@ -1368,7 +1380,7 @@ impl Lifecycle for XhciController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vmm_core::common::{ReadOp, WriteOp};
+    use vmm_core::common::WriteOp;
 
     /// Helper to create an XhciState for testing register logic.
     fn test_state() -> XhciState {
@@ -1454,7 +1466,7 @@ mod tests {
         ctrl.bar0_rw(OP_BASE + OP_CONFIG, RWOp::Write(&wo));
 
         let st = ctrl.state.lock().expect("xhci: state lock");
-        assert_eq!(st.config, u32::from(bits::MAX_SLOTS));
+        assert_eq!(st.config, u32::from(MAX_SLOTS));
     }
 
     #[test]
@@ -1464,10 +1476,7 @@ mod tests {
         ctrl.state.lock().expect("xhci: state lock").erstba = original_erstba;
 
         let wo = WriteOp::from_buf(&20u32.to_le_bytes());
-        ctrl.bar0_rw(
-            DBOFF as usize + 20 * DB_REG_SIZE,
-            RWOp::Write(&wo),
-        );
+        ctrl.bar0_rw(DBOFF as usize + 20 * DB_REG_SIZE, RWOp::Write(&wo));
         assert_eq!(
             ctrl.state.lock().expect("xhci: state lock").erstba,
             original_erstba,
@@ -1475,16 +1484,13 @@ mod tests {
 
         // IR0_BASE means the old layout's ERSTBA collision was slot 28.
         let wo = WriteOp::from_buf(&28u32.to_le_bytes());
-        ctrl.bar0_rw(
-            DBOFF as usize + 28 * DB_REG_SIZE,
-            RWOp::Write(&wo),
-        );
+        ctrl.bar0_rw(DBOFF as usize + 28 * DB_REG_SIZE, RWOp::Write(&wo));
         assert_eq!(
             ctrl.state.lock().expect("xhci: state lock").erstba,
             original_erstba,
         );
 
-        let beyond_max = usize::from(bits::MAX_SLOTS) + 1;
+        let beyond_max = usize::from(MAX_SLOTS) + 1;
         let wo = WriteOp::from_buf(&(beyond_max as u32).to_le_bytes());
         ctrl.bar0_rw(
             DBOFF as usize + beyond_max * DB_REG_SIZE,

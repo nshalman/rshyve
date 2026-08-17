@@ -16,6 +16,8 @@
 //! The [`build_e820`] function generates an E820 table suitable for
 //! inclusion in the fw_cfg device as "etc/e820".
 
+use std::mem::size_of;
+
 /// Guest physical address where ACPI tables are placed.
 pub const BHYVE_ACPI_BASE: u64 = 0xF2400;
 
@@ -80,14 +82,14 @@ fn write_header(
     revision: u8,
 ) {
     let start = buf.len();
-    buf.extend_from_slice(signature);        // 0: signature
+    buf.extend_from_slice(signature); // 0: signature
     buf.extend_from_slice(&length.to_le_bytes()); // 4: length
-    buf.push(revision);                      // 8: revision
-    buf.push(0);                             // 9: checksum (filled later)
-    buf.extend_from_slice(OEM_ID);           // 10: oem_id
-    buf.extend_from_slice(OEM_TABLE_ID);     // 16: oem_table_id
+    buf.push(revision); // 8: revision
+    buf.push(0); // 9: checksum (filled later)
+    buf.extend_from_slice(OEM_ID); // 10: oem_id
+    buf.extend_from_slice(OEM_TABLE_ID); // 16: oem_table_id
     buf.extend_from_slice(&1u32.to_le_bytes()); // 24: oem_revision
-    buf.extend_from_slice(CREATOR_ID);       // 28: creator_id
+    buf.extend_from_slice(CREATOR_ID); // 28: creator_id
     buf.extend_from_slice(&1u32.to_le_bytes()); // 32: creator_revision
     debug_assert_eq!(buf.len() - start, ACPI_HDR_SIZE);
 }
@@ -104,7 +106,12 @@ fn fix_checksum(buf: &mut [u8], start: usize, len: usize) {
 }
 
 /// Fix a checksum at a specific byte position.
-fn fix_checksum_at(buf: &mut [u8], cksum_offset: usize, start: usize, len: usize) {
+fn fix_checksum_at(
+    buf: &mut [u8],
+    cksum_offset: usize,
+    start: usize,
+    len: usize,
+) {
     buf[cksum_offset] = 0;
     let sum: u8 = buf[start..start + len]
         .iter()
@@ -184,10 +191,7 @@ fn build_dsdt(tpm: Option<TpmDevice>) -> Vec<u8> {
         // ── PCI Host Bridge: Device(PCI0) ──────────────────
         sb.device("PC00", |pci| {
             // _HID = PNP0A03 (PCI host bridge)
-            pci.name_val(
-                "_HID",
-                AmlValue::DWord(Aml::eisa_id("PNP0A03")),
-            );
+            pci.name_val("_HID", AmlValue::DWord(Aml::eisa_id("PNP0A03")));
             // _ADR = 0
             pci.name_val("_ADR", AmlValue::Zero);
 
@@ -211,11 +215,7 @@ fn build_dsdt(tpm: Option<TpmDevice>) -> Vec<u8> {
                 r.word_io(0x0D00, 0xFFFF, 0xF300);
 
                 // 32-bit MMIO window
-                r.dword_memory(
-                    0xC000_0000,
-                    0xFEBF_FFFF,
-                    0x3EC0_0000,
-                );
+                r.dword_memory(0xC000_0000, 0xFEBF_FFFF, 0x3EC0_0000);
             });
 
             // ── PCI interrupt routing ─────────────────────
@@ -247,10 +247,7 @@ fn build_dsdt(tpm: Option<TpmDevice>) -> Vec<u8> {
 
             // ── HPET device ───────────────────────────────
             pci.device("HPET", |hpet| {
-                hpet.name_val(
-                    "_HID",
-                    AmlValue::DWord(Aml::eisa_id("PNP0103")),
-                );
+                hpet.name_val("_HID", AmlValue::DWord(Aml::eisa_id("PNP0103")));
                 hpet.name_val("_UID", AmlValue::Zero);
                 hpet.name_resource_template("_CRS", |r| {
                     r.memory32_fixed(HPET_ADDR, 0x400);
@@ -260,10 +257,7 @@ fn build_dsdt(tpm: Option<TpmDevice>) -> Vec<u8> {
             // ── ISA/LPC bridge ────────────────────────────
             // LPC bridge at slot 1, function 0
             pci.device("ISA_", |isa| {
-                isa.name_val(
-                    "_ADR",
-                    AmlValue::DWord(0x0001_0000),
-                );
+                isa.name_val("_ADR", AmlValue::DWord(0x0001_0000));
 
                 // COM1 UART (0x3F8, IRQ 4)
                 isa.device("COM1", |com| {
@@ -492,12 +486,23 @@ fn build_fadt(facs_gpa: u32, dsdt_gpa: u32) -> Vec<u8> {
     buf.push(0);
 
     // offset 112: Flags (u32 LE)
-    let flags = FADT_WBINVD | FADT_PROC_C1 | FADT_SLP_BUTTON
-        | FADT_TMR_VAL_EXT | FADT_RESET_REG_SUP | FADT_HEADLESS;
+    let flags = FADT_WBINVD
+        | FADT_PROC_C1
+        | FADT_SLP_BUTTON
+        | FADT_TMR_VAL_EXT
+        | FADT_RESET_REG_SUP
+        | FADT_HEADLESS;
     buf.extend_from_slice(&flags.to_le_bytes());
 
     // offset 116: RESET_REG (12-byte GAS)
-    write_gas(&mut buf, ACPI_AS_SYSTEM_IO, 8, 0, ACPI_GAS_BYTE, RESET_REG_PORT);
+    write_gas(
+        &mut buf,
+        ACPI_AS_SYSTEM_IO,
+        8,
+        0,
+        ACPI_GAS_BYTE,
+        RESET_REG_PORT,
+    );
 
     // offset 128: RESET_VALUE
     buf.push(6); // Writing 6 to 0xCF9 triggers system reset
@@ -514,17 +519,38 @@ fn build_fadt(facs_gpa: u32, dsdt_gpa: u32) -> Vec<u8> {
     buf.extend_from_slice(&(dsdt_gpa as u64).to_le_bytes());
 
     // offset 148: X_PM1a_EVT_BLK (GAS, 12 bytes)
-    write_gas(&mut buf, ACPI_AS_SYSTEM_IO, 0x20, 0, ACPI_GAS_WORD, PM1A_EVT_ADDR as u64);
+    write_gas(
+        &mut buf,
+        ACPI_AS_SYSTEM_IO,
+        0x20,
+        0,
+        ACPI_GAS_WORD,
+        PM1A_EVT_ADDR as u64,
+    );
     // offset 160: X_PM1b_EVT_BLK
     write_gas_zero(&mut buf);
     // offset 172: X_PM1a_CNT_BLK
-    write_gas(&mut buf, ACPI_AS_SYSTEM_IO, 0x10, 0, ACPI_GAS_WORD, PM1A_CNT_ADDR as u64);
+    write_gas(
+        &mut buf,
+        ACPI_AS_SYSTEM_IO,
+        0x10,
+        0,
+        ACPI_GAS_WORD,
+        PM1A_CNT_ADDR as u64,
+    );
     // offset 184: X_PM1b_CNT_BLK
     write_gas_zero(&mut buf);
     // offset 196: X_PM2_CNT_BLK
     write_gas_zero(&mut buf);
     // offset 208: X_PM_TMR_BLK
-    write_gas(&mut buf, ACPI_AS_SYSTEM_IO, 0x20, 0, ACPI_GAS_DWORD, IO_PMTMR as u64);
+    write_gas(
+        &mut buf,
+        ACPI_AS_SYSTEM_IO,
+        0x20,
+        0,
+        ACPI_GAS_DWORD,
+        IO_PMTMR as u64,
+    );
     // offset 220: X_GPE0_BLK
     write_gas_zero(&mut buf);
     // offset 232: X_GPE1_BLK
@@ -573,8 +599,12 @@ fn build_madt(num_cpus: u32) -> Vec<u8> {
     let ioapic_entry = 12usize;
     let irq_overrides = 2 * 10usize;
     let lapic_nmi = 6usize;
-    let total = ACPI_HDR_SIZE + madt_specific + lapic_entries
-        + ioapic_entry + irq_overrides + lapic_nmi;
+    let total = ACPI_HDR_SIZE
+        + madt_specific
+        + lapic_entries
+        + ioapic_entry
+        + irq_overrides
+        + lapic_nmi;
 
     let mut buf = Vec::with_capacity(total);
 
@@ -589,46 +619,46 @@ fn build_madt(num_cpus: u32) -> Vec<u8> {
 
     // Local APIC entries (one per CPU)
     for i in 0..num_cpus {
-        buf.push(MADT_TYPE_LOCAL_APIC);   // type
-        buf.push(8);                       // length
-        buf.push(i as u8);                 // processor ID
-        buf.push(i as u8);                 // APIC ID
+        buf.push(MADT_TYPE_LOCAL_APIC); // type
+        buf.push(8); // length
+        buf.push(i as u8); // processor ID
+        buf.push(i as u8); // APIC ID
         buf.extend_from_slice(&MADT_LAPIC_ENABLED.to_le_bytes()); // flags
     }
 
     // I/O APIC entry
-    buf.push(MADT_TYPE_IO_APIC);  // type
-    buf.push(12);                  // length
-    buf.push(0);                   // I/O APIC ID
-    buf.push(0);                   // reserved
+    buf.push(MADT_TYPE_IO_APIC); // type
+    buf.push(12); // length
+    buf.push(0); // I/O APIC ID
+    buf.push(0); // reserved
     buf.extend_from_slice(&IOAPIC_ADDR.to_le_bytes()); // address
-    buf.extend_from_slice(&0u32.to_le_bytes());        // GSI base
+    buf.extend_from_slice(&0u32.to_le_bytes()); // GSI base
 
     // Interrupt override: IRQ 0 -> GSI 2 (edge, active-high)
     buf.push(MADT_TYPE_INT_OVERRIDE); // type
-    buf.push(10);                      // length
-    buf.push(0);                       // bus (ISA)
-    buf.push(0);                       // source IRQ
+    buf.push(10); // length
+    buf.push(0); // bus (ISA)
+    buf.push(0); // source IRQ
     buf.extend_from_slice(&2u32.to_le_bytes()); // GSI
     let inti_flags = MADT_POLARITY_ACTIVE_HIGH | MADT_TRIGGER_EDGE;
     buf.extend_from_slice(&inti_flags.to_le_bytes());
 
     // Interrupt override: SCI IRQ 9 -> GSI 9 (level, active-low)
     buf.push(MADT_TYPE_INT_OVERRIDE); // type
-    buf.push(10);                      // length
-    buf.push(0);                       // bus (ISA)
-    buf.push(SCI_INT as u8);          // source IRQ
+    buf.push(10); // length
+    buf.push(0); // bus (ISA)
+    buf.push(SCI_INT as u8); // source IRQ
     buf.extend_from_slice(&(SCI_INT as u32).to_le_bytes()); // GSI
     let inti_flags = MADT_POLARITY_ACTIVE_LOW | MADT_TRIGGER_LEVEL;
     buf.extend_from_slice(&inti_flags.to_le_bytes());
 
     // Local APIC NMI: LINT1 for all CPUs
     buf.push(MADT_TYPE_LOCAL_APIC_NMI); // type
-    buf.push(6);                         // length
-    buf.push(0xFF);                      // processor ID (all)
+    buf.push(6); // length
+    buf.push(0xFF); // processor ID (all)
     let nmi_flags = MADT_POLARITY_ACTIVE_HIGH | MADT_TRIGGER_EDGE;
     buf.extend_from_slice(&nmi_flags.to_le_bytes()); // flags
-    buf.push(1);                         // LINT# (LINT1)
+    buf.push(1); // LINT# (LINT1)
 
     assert_eq!(buf.len(), total);
     fix_checksum(&mut buf, 0, total);
@@ -682,7 +712,7 @@ fn build_spcr() -> Vec<u8> {
 
     // offset 36: Interface Type (1B) = 16550 compatible
     buf.push(0x00); // Full 16550
-    // offset 37-39: Reserved
+                    // offset 37-39: Reserved
     buf.extend_from_slice(&[0u8; 3]);
 
     // offset 40: Base Address (GAS, 12 bytes) - I/O port 0x3F8
@@ -690,7 +720,7 @@ fn build_spcr() -> Vec<u8> {
 
     // offset 52: Interrupt Type (1B)
     buf.push(0x01); // Dual-8259 compatible
-    // offset 53: IRQ (1B) - ISA IRQ 4
+                    // offset 53: IRQ (1B) - ISA IRQ 4
     buf.push(4);
     // offset 54-57: Global System Interrupt (4B LE)
     buf.extend_from_slice(&4u32.to_le_bytes());
@@ -832,11 +862,7 @@ pub fn build_e820_entries(mem_size: usize) -> Vec<E820Entry> {
     let mut entries = Vec::with_capacity(4);
 
     let lowmem = (mem_size as u64).min(LOWMEM_LIMIT);
-    let highmem = if mem_size as u64 > LOWMEM_LIMIT {
-        mem_size as u64 - LOWMEM_LIMIT
-    } else {
-        0
-    };
+    let highmem = (mem_size as u64).saturating_sub(LOWMEM_LIMIT);
 
     // Low RAM below VGA hole
     if lowmem > 0 {
@@ -881,7 +907,7 @@ pub fn build_e820_entries(mem_size: usize) -> Vec<E820Entry> {
 /// Build E820 memory map as bytes for fw_cfg "etc/e820".
 pub fn build_e820(mem_size: usize) -> Vec<u8> {
     let entries = build_e820_entries(mem_size);
-    let mut buf = Vec::with_capacity(entries.len() * std::mem::size_of::<E820Entry>());
+    let mut buf = Vec::with_capacity(entries.len() * size_of::<E820Entry>());
     for entry in &entries {
         buf.extend_from_slice(&entry.addr.to_le_bytes());
         buf.extend_from_slice(&entry.size.to_le_bytes());
@@ -990,7 +1016,8 @@ fn generate_acpi_tables_inner(
         hpet_gpa as u32,
         spcr_gpa as u32,
     ];
-    let mut xsdt_entries: Vec<u64> = vec![fadt_gpa, madt_gpa, hpet_gpa, spcr_gpa];
+    let mut xsdt_entries: Vec<u64> =
+        vec![fadt_gpa, madt_gpa, hpet_gpa, spcr_gpa];
     if let Some(g) = tpm2_gpa {
         rsdt_entries.push(g as u32);
         xsdt_entries.push(g);
@@ -1013,10 +1040,8 @@ fn generate_acpi_tables_inner(
     blob[rsdp_offset..rsdp_offset + RSDP_SIZE].copy_from_slice(&rsdp);
 
     // Build fw_cfg entries for ACPI table loader protocol
-    let fwcfg_entries = vec![
-        ("etc/acpi/rsdp", rsdp),
-        ("etc/acpi/tables", blob.clone()),
-    ];
+    let fwcfg_entries =
+        vec![("etc/acpi/rsdp", rsdp), ("etc/acpi/tables", blob.clone())];
 
     let _ = rsdp_gpa; // used only to place in memory
 
@@ -1318,7 +1343,11 @@ fn write_loader_name(buf: &mut [u8; LOADER_MAX_NAME], name: &str) {
 }
 
 /// Build an ALLOC loader command.
-fn loader_alloc_cmd(name: &str, alignment: u32, zone: u8) -> [u8; LOADER_ENTRY_SIZE] {
+fn loader_alloc_cmd(
+    name: &str,
+    alignment: u32,
+    zone: u8,
+) -> [u8; LOADER_ENTRY_SIZE] {
     let mut entry = [0u8; LOADER_ENTRY_SIZE];
 
     // offset 0: command (u32 LE)
@@ -1419,13 +1448,17 @@ pub fn generate_table_loader(layout: &AcpiLayout) -> Vec<u8> {
 
     // Allocate the tables blob (64-byte aligned, above 1MB)
     loader.extend_from_slice(&loader_alloc_cmd(
-        TABLES_BLOB_NAME, 0x40, ZONE_HIGH,
+        TABLES_BLOB_NAME,
+        0x40,
+        ZONE_HIGH,
     ));
 
     // Allocate the RSDP (16-byte aligned, FSEG zone for legacy
     // BIOS compatibility, though OVMF doesn't strictly require it)
     loader.extend_from_slice(&loader_alloc_cmd(
-        RSDP_BLOB_NAME, 0x10, ZONE_FSEG,
+        RSDP_BLOB_NAME,
+        0x10,
+        ZONE_FSEG,
     ));
 
     // ── 2. ADD_POINTER: RSDP → tables blob ────────────────────
@@ -1520,10 +1553,16 @@ pub fn generate_table_loader(layout: &AcpiLayout) -> Vec<u8> {
     //   offset 8: covers bytes 0..20 (legacy RSDP v1 portion)
     //   offset 32: covers bytes 0..36 (full RSDP v2)
     loader.extend_from_slice(&loader_add_checksum_cmd(
-        RSDP_BLOB_NAME, 8, 0, 20,
+        RSDP_BLOB_NAME,
+        8,
+        0,
+        20,
     ));
     loader.extend_from_slice(&loader_add_checksum_cmd(
-        RSDP_BLOB_NAME, 32, 0, RSDP_SIZE as u32,
+        RSDP_BLOB_NAME,
+        32,
+        0,
+        RSDP_SIZE as u32,
     ));
 
     // FADT checksum (offset 9 relative to start of FADT)
@@ -1612,17 +1651,11 @@ mod tests {
     };
     const TPM_HID_AML: &[u8] = b"\x0dMSFT0101\0";
     const TPM_DEVICE_AML: [u8; 55] = [
-        0x5B, 0x82, 0x35,
-        b'T', b'P', b'M', b'_',
-        0x08, b'_', b'H', b'I', b'D', 0x0D,
-        b'M', b'S', b'F', b'T', b'0', b'1', b'0', b'1', 0x00,
-        0x08, b'_', b'S', b'T', b'A', 0x0A, 0x0F,
-        0x08, b'_', b'C', b'R', b'S', 0x11, 0x14,
-        0x0C, 0x0E, 0x00, 0x00, 0x00,
-        0x86, 0x09, 0x00, 0x01,
-        0x00, 0x00, 0xD4, 0xFE,
-        0x00, 0x10, 0x00, 0x00,
-        0x79, 0x00,
+        0x5B, 0x82, 0x35, b'T', b'P', b'M', b'_', 0x08, b'_', b'H', b'I', b'D',
+        0x0D, b'M', b'S', b'F', b'T', b'0', b'1', b'0', b'1', 0x00, 0x08, b'_',
+        b'S', b'T', b'A', 0x0A, 0x0F, 0x08, b'_', b'C', b'R', b'S', 0x11, 0x14,
+        0x0C, 0x0E, 0x00, 0x00, 0x00, 0x86, 0x09, 0x00, 0x01, 0x00, 0x00, 0xD4,
+        0xFE, 0x00, 0x10, 0x00, 0x00, 0x79, 0x00,
     ];
 
     /// Verify that the sum of all bytes in a range is 0 mod 256.
@@ -1710,11 +1743,8 @@ mod tests {
 
     #[test]
     fn layout_tpm2_and_dsdt_agree() {
-        let layout = generate_acpi_layout_with_tpm2(
-            2,
-            None,
-            Some(test_tpm_acpi()),
-        );
+        let layout =
+            generate_acpi_layout_with_tpm2(2, None, Some(test_tpm_acpi()));
         assert!(layout.tpm2_size > 0);
         let dsdt = &layout.tables
             [layout.dsdt_offset..layout.dsdt_offset + layout.dsdt_size];
@@ -1730,9 +1760,8 @@ mod tests {
 
         let without_tpm = generate_acpi_layout_with_tpm2(2, None, None);
         assert_eq!(without_tpm.tpm2_size, 0);
-        let dsdt = &without_tpm.tables[
-            without_tpm.dsdt_offset..without_tpm.dsdt_offset + without_tpm.dsdt_size
-        ];
+        let dsdt = &without_tpm.tables[without_tpm.dsdt_offset
+            ..without_tpm.dsdt_offset + without_tpm.dsdt_size];
         assert!(!contains_tpm_hid(dsdt));
     }
 
@@ -1783,9 +1812,8 @@ mod tests {
             dsdt.len(),
         );
         // Verify header length field matches actual length
-        let hdr_len = u32::from_le_bytes([
-            dsdt[4], dsdt[5], dsdt[6], dsdt[7],
-        ]) as usize;
+        let hdr_len =
+            u32::from_le_bytes([dsdt[4], dsdt[5], dsdt[6], dsdt[7]]) as usize;
         assert_eq!(hdr_len, dsdt.len());
     }
 
@@ -1794,10 +1822,7 @@ mod tests {
         let dsdt = build_dsdt(None);
         let body = &dsdt[ACPI_HDR_SIZE..];
         // The AML body should contain a ScopeOp (0x10) for \_SB
-        assert!(
-            body.contains(&0x10),
-            "DSDT body should contain ScopeOp",
-        );
+        assert!(body.contains(&0x10), "DSDT body should contain ScopeOp",);
     }
 
     #[test]
@@ -1806,10 +1831,7 @@ mod tests {
         let body = &dsdt[ACPI_HDR_SIZE..];
         // DeviceOp is ExtPrefix(0x5B) + 0x82
         let has_device = body.windows(2).any(|w| w == [0x5B, 0x82]);
-        assert!(
-            has_device,
-            "DSDT body should contain at least one DeviceOp",
-        );
+        assert!(has_device, "DSDT body should contain at least one DeviceOp",);
     }
 
     #[test]
@@ -1872,10 +1894,7 @@ mod tests {
         // COM1 at 0x3F8
         let port_bytes = 0x03F8u16.to_le_bytes();
         let has_com1 = dsdt.windows(2).any(|w| w == port_bytes);
-        assert!(
-            has_com1,
-            "DSDT should contain COM1 I/O port 0x3F8",
-        );
+        assert!(has_com1, "DSDT should contain COM1 I/O port 0x3F8",);
     }
 
     #[test]
@@ -1890,9 +1909,8 @@ mod tests {
     fn fadt_pm_timer_port() {
         let fadt = build_fadt(0x1000, 0x2000);
         // PM_TMR_BLK is at offset 76
-        let pmtmr = u32::from_le_bytes([
-            fadt[76], fadt[77], fadt[78], fadt[79],
-        ]);
+        let pmtmr =
+            u32::from_le_bytes([fadt[76], fadt[77], fadt[78], fadt[79]]);
         assert_eq!(pmtmr, IO_PMTMR);
         assert_eq!(pmtmr, 0x408);
     }
@@ -1901,14 +1919,12 @@ mod tests {
     fn fadt_facs_dsdt_pointers() {
         let fadt = build_fadt(0xAAAA, 0xBBBB);
         // FACS at offset 36
-        let facs_ptr = u32::from_le_bytes([
-            fadt[36], fadt[37], fadt[38], fadt[39],
-        ]);
+        let facs_ptr =
+            u32::from_le_bytes([fadt[36], fadt[37], fadt[38], fadt[39]]);
         assert_eq!(facs_ptr, 0xAAAA);
         // DSDT at offset 40
-        let dsdt_ptr = u32::from_le_bytes([
-            fadt[40], fadt[41], fadt[42], fadt[43],
-        ]);
+        let dsdt_ptr =
+            u32::from_le_bytes([fadt[40], fadt[41], fadt[42], fadt[43]]);
         assert_eq!(dsdt_ptr, 0xBBBB);
     }
 
@@ -1982,15 +1998,12 @@ mod tests {
         assert_eq!(&rsdp[0..8], b"RSD PTR ");
 
         // First 20 bytes must checksum to 0
-        let sum20: u8 = rsdp[..20]
-            .iter()
-            .fold(0u8, |acc, &b| acc.wrapping_add(b));
+        let sum20: u8 =
+            rsdp[..20].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum20, 0);
 
         // All 36 bytes must checksum to 0
-        let sum36: u8 = rsdp
-            .iter()
-            .fold(0u8, |acc, &b| acc.wrapping_add(b));
+        let sum36: u8 = rsdp.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum36, 0);
     }
 
@@ -2046,13 +2059,13 @@ mod tests {
         // Last entry should be high memory
         let last_off = 3 * entry_size;
         let addr = u64::from_le_bytes(
-            data[last_off..last_off + 8].try_into().unwrap()
+            data[last_off..last_off + 8].try_into().unwrap(),
         );
         let size = u64::from_le_bytes(
-            data[last_off + 8..last_off + 16].try_into().unwrap()
+            data[last_off + 8..last_off + 16].try_into().unwrap(),
         );
         let type_ = u32::from_le_bytes(
-            data[last_off + 16..last_off + 20].try_into().unwrap()
+            data[last_off + 16..last_off + 20].try_into().unwrap(),
         );
         assert_eq!(addr, FOUR_GIB);
         assert_eq!(size, mem as u64 - LOWMEM_LIMIT);
@@ -2069,15 +2082,16 @@ mod tests {
         for i in 1..count {
             let prev_addr = u64::from_le_bytes(
                 data[(i - 1) * entry_size..(i - 1) * entry_size + 8]
-                    .try_into().unwrap()
+                    .try_into()
+                    .unwrap(),
             );
             let prev_size = u64::from_le_bytes(
                 data[(i - 1) * entry_size + 8..(i - 1) * entry_size + 16]
-                    .try_into().unwrap()
+                    .try_into()
+                    .unwrap(),
             );
             let cur_addr = u64::from_le_bytes(
-                data[i * entry_size..i * entry_size + 8]
-                    .try_into().unwrap()
+                data[i * entry_size..i * entry_size + 8].try_into().unwrap(),
             );
             assert!(
                 prev_addr + prev_size <= cur_addr,
@@ -2105,13 +2119,10 @@ mod tests {
         assert_eq!(&rsdp[0..8], b"RSD PTR ");
 
         // Verify checksums
-        let sum20: u8 = rsdp[..20]
-            .iter()
-            .fold(0u8, |acc, &b| acc.wrapping_add(b));
+        let sum20: u8 =
+            rsdp[..20].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum20, 0);
-        let sum36: u8 = rsdp
-            .iter()
-            .fold(0u8, |acc, &b| acc.wrapping_add(b));
+        let sum36: u8 = rsdp.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         assert_eq!(sum36, 0);
     }
 
@@ -2152,28 +2163,32 @@ mod tests {
         // FADT.firmware_ctrl (offset 36) should be facs_offset
         let facs_ptr = u32::from_le_bytes(
             t[layout.fadt_offset + 36..layout.fadt_offset + 40]
-                .try_into().unwrap()
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(facs_ptr as usize, layout.facs_offset);
 
         // FADT.dsdt (offset 40) should be dsdt_offset
         let dsdt_ptr = u32::from_le_bytes(
             t[layout.fadt_offset + 40..layout.fadt_offset + 44]
-                .try_into().unwrap()
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(dsdt_ptr as usize, layout.dsdt_offset);
 
         // FADT.x_firmware_ctrl (offset 132) should be facs_offset
         let x_facs = u64::from_le_bytes(
             t[layout.fadt_offset + 132..layout.fadt_offset + 140]
-                .try_into().unwrap()
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(x_facs as usize, layout.facs_offset);
 
         // FADT.x_dsdt (offset 140) should be dsdt_offset
         let x_dsdt = u64::from_le_bytes(
             t[layout.fadt_offset + 140..layout.fadt_offset + 148]
-                .try_into().unwrap()
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(x_dsdt as usize, layout.dsdt_offset);
     }
@@ -2186,15 +2201,18 @@ mod tests {
         // RSDT entries at offset 36 (after header): 3 x u32
         let entry0 = u32::from_le_bytes(
             t[layout.rsdt_offset + 36..layout.rsdt_offset + 40]
-                .try_into().unwrap()
+                .try_into()
+                .unwrap(),
         );
         let entry1 = u32::from_le_bytes(
             t[layout.rsdt_offset + 40..layout.rsdt_offset + 44]
-                .try_into().unwrap()
+                .try_into()
+                .unwrap(),
         );
         let entry2 = u32::from_le_bytes(
             t[layout.rsdt_offset + 44..layout.rsdt_offset + 48]
-                .try_into().unwrap()
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(entry0 as usize, layout.fadt_offset);
         assert_eq!(entry1 as usize, layout.madt_offset);
@@ -2209,15 +2227,18 @@ mod tests {
         // XSDT entries at offset 36 (after header): 3 x u64
         let entry0 = u64::from_le_bytes(
             t[layout.xsdt_offset + 36..layout.xsdt_offset + 44]
-                .try_into().unwrap()
+                .try_into()
+                .unwrap(),
         );
         let entry1 = u64::from_le_bytes(
             t[layout.xsdt_offset + 44..layout.xsdt_offset + 52]
-                .try_into().unwrap()
+                .try_into()
+                .unwrap(),
         );
         let entry2 = u64::from_le_bytes(
             t[layout.xsdt_offset + 52..layout.xsdt_offset + 60]
-                .try_into().unwrap()
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(entry0 as usize, layout.fadt_offset);
         assert_eq!(entry1 as usize, layout.madt_offset);
@@ -2229,15 +2250,13 @@ mod tests {
         let layout = generate_acpi_layout(2);
 
         // RSDP.rsdt_addr (offset 16) should be rsdt_offset
-        let rsdt_addr = u32::from_le_bytes(
-            layout.rsdp[16..20].try_into().unwrap()
-        );
+        let rsdt_addr =
+            u32::from_le_bytes(layout.rsdp[16..20].try_into().unwrap());
         assert_eq!(rsdt_addr as usize, layout.rsdt_offset);
 
         // RSDP.xsdt_addr (offset 24) should be xsdt_offset
-        let xsdt_addr = u64::from_le_bytes(
-            layout.rsdp[24..32].try_into().unwrap()
-        );
+        let xsdt_addr =
+            u64::from_le_bytes(layout.rsdp[24..32].try_into().unwrap());
         assert_eq!(xsdt_addr as usize, layout.xsdt_offset);
     }
 
@@ -2262,10 +2281,7 @@ mod tests {
     #[test]
     fn loader_entry_size_is_128() {
         assert_eq!(LOADER_ENTRY_SIZE, 128);
-        assert_eq!(
-            std::mem::size_of::<[u8; LOADER_ENTRY_SIZE]>(),
-            128,
-        );
+        assert_eq!(size_of::<[u8; LOADER_ENTRY_SIZE]>(), 128,);
     }
 
     #[test]
@@ -2296,9 +2312,8 @@ mod tests {
 
     #[test]
     fn loader_add_pointer_cmd_format() {
-        let cmd = loader_add_pointer_cmd(
-            "etc/acpi/rsdp", "etc/acpi/tables", 16, 4,
-        );
+        let cmd =
+            loader_add_pointer_cmd("etc/acpi/rsdp", "etc/acpi/tables", 16, 4);
         assert_eq!(cmd.len(), 128);
 
         let cmd_type = u32::from_le_bytes(cmd[0..4].try_into().unwrap());
@@ -2426,19 +2441,13 @@ mod tests {
         let loader = generate_table_loader(&layout);
 
         // First two entries should be ALLOC commands
-        let cmd0 = u32::from_le_bytes(
-            loader[0..4].try_into().unwrap()
-        );
-        let cmd1 = u32::from_le_bytes(
-            loader[128..132].try_into().unwrap()
-        );
+        let cmd0 = u32::from_le_bytes(loader[0..4].try_into().unwrap());
+        let cmd1 = u32::from_le_bytes(loader[128..132].try_into().unwrap());
         assert_eq!(cmd0, LOADER_CMD_ALLOC);
         assert_eq!(cmd1, LOADER_CMD_ALLOC);
 
         // Third entry should NOT be an ALLOC
-        let cmd2 = u32::from_le_bytes(
-            loader[256..260].try_into().unwrap()
-        );
+        let cmd2 = u32::from_le_bytes(loader[256..260].try_into().unwrap());
         assert_ne!(cmd2, LOADER_CMD_ALLOC);
     }
 
@@ -2462,31 +2471,19 @@ mod tests {
         // Patch FADT.firmware_ctrl: currently holds facs_offset,
         // firmware adds tables_base
         let off = layout.fadt_offset + 36;
-        let val = u32::from_le_bytes(
-            tables[off..off + 4].try_into().unwrap()
-        );
+        let val = u32::from_le_bytes(tables[off..off + 4].try_into().unwrap());
         assert_eq!(val as usize, layout.facs_offset);
         let patched = val as u64 + tables_base;
-        tables[off..off + 4].copy_from_slice(
-            &(patched as u32).to_le_bytes()
-        );
+        tables[off..off + 4].copy_from_slice(&(patched as u32).to_le_bytes());
 
         // The patched value should be the GPA of FACS
-        assert_eq!(
-            patched,
-            tables_base + layout.facs_offset as u64,
-        );
+        assert_eq!(patched, tables_base + layout.facs_offset as u64,);
 
         // Same for RSDT entry 0 (FADT)
         let off = layout.rsdt_offset + ACPI_HDR_SIZE;
-        let val = u32::from_le_bytes(
-            tables[off..off + 4].try_into().unwrap()
-        );
+        let val = u32::from_le_bytes(tables[off..off + 4].try_into().unwrap());
         assert_eq!(val as usize, layout.fadt_offset);
         let patched = val as u64 + tables_base;
-        assert_eq!(
-            patched,
-            tables_base + layout.fadt_offset as u64,
-        );
+        assert_eq!(patched, tables_base + layout.fadt_offset as u64,);
     }
 }

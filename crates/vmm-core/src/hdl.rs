@@ -15,15 +15,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bhyve_api::{
-    ApiVersion, VmmCtlFd, VmmFd,
-    vm_create_req, VCF_RESERVOIR_MEM, VCF_TRACK_DIRTY,
-    vm_capability, vm_suspend, vm_memseg, vm_memmap,
-    vm_isa_irq, vm_lapic_msi, vm_rtc_data,
-    vmm_dirty_tracker,
-    vm_npt_operation, VNO_OP_SET_DIRTY, VNO_FLAG_BITMAP_IN,
-    vcpu_cpuid_entry, vm_vcpu_cpuid_config,
-    VM_MEMMAP_F_WIRED, VM_MAX_SEG_NAMELEN,
-    ioctls,
+    ioctls, vcpu_cpuid_entry, vm_capability, vm_create_req, vm_isa_irq,
+    vm_lapic_msi, vm_memmap, vm_memseg, vm_npt_operation, vm_rtc_data,
+    vm_suspend, vm_vcpu_cpuid_config, vmm_dirty_tracker, ApiVersion, VmmCtlFd,
+    VmmFd, VCF_RESERVOIR_MEM, VCF_TRACK_DIRTY, VM_MAX_SEG_NAMELEN,
+    VM_MEMMAP_F_WIRED, VNO_FLAG_BITMAP_IN, VNO_OP_SET_DIRTY,
 };
 
 use crate::mem::Prot;
@@ -91,13 +87,19 @@ impl VmmHdl {
         }
 
         let fd = VmmFd::open(name)?;
-        Ok(Self { inner: fd, name: name.to_string() })
+        Ok(Self {
+            inner: fd,
+            name: name.to_string(),
+        })
     }
 
     /// Open an existing VM instance.
     pub fn open(name: &str) -> Result<Self> {
         let fd = VmmFd::open(name)?;
-        Ok(Self { inner: fd, name: name.to_string() })
+        Ok(Self {
+            inner: fd,
+            name: name.to_string(),
+        })
     }
 
     /// Get the VM name.
@@ -130,7 +132,8 @@ impl VmmHdl {
                 ErrorKind::InvalidInput,
                 format!(
                     "segment name '{}' exceeds max length {}",
-                    name, VM_MAX_SEG_NAMELEN - 1,
+                    name,
+                    VM_MAX_SEG_NAMELEN - 1,
                 ),
             ));
         }
@@ -254,11 +257,7 @@ impl VmmHdl {
     }
 
     /// Pulse an ISA IRQ (assert then immediately deassert).
-    pub fn isa_pulse_irq(
-        &self,
-        atpic_irq: i32,
-        ioapic_irq: i32,
-    ) -> Result<()> {
+    pub fn isa_pulse_irq(&self, atpic_irq: i32, ioapic_irq: i32) -> Result<()> {
         self.isa_irq_op(ioctls::VM_ISA_PULSE_IRQ, atpic_irq, ioapic_irq)
     }
 
@@ -268,7 +267,10 @@ impl VmmHdl {
         atpic_irq: i32,
         ioapic_irq: i32,
     ) -> Result<()> {
-        let mut irq = vm_isa_irq { atpic_irq, ioapic_irq };
+        let mut irq = vm_isa_irq {
+            atpic_irq,
+            ioapic_irq,
+        };
         // Safety: vm_isa_irq is the correct struct for ISA IRQ ioctls.
         unsafe { self.inner.ioctl(cmd, &mut irq) }?;
         Ok(())
@@ -277,18 +279,14 @@ impl VmmHdl {
     /// Assert an IOAPIC IRQ (for PCI device GSI delivery).
     pub fn ioapic_assert_irq(&self, irq: i32) -> Result<()> {
         let mut req = bhyve_api::vm_ioapic_irq { irq };
-        unsafe {
-            self.inner.ioctl(ioctls::VM_IOAPIC_ASSERT_IRQ, &mut req)
-        }?;
+        unsafe { self.inner.ioctl(ioctls::VM_IOAPIC_ASSERT_IRQ, &mut req) }?;
         Ok(())
     }
 
     /// Deassert an IOAPIC IRQ.
     pub fn ioapic_deassert_irq(&self, irq: i32) -> Result<()> {
         let mut req = bhyve_api::vm_ioapic_irq { irq };
-        unsafe {
-            self.inner.ioctl(ioctls::VM_IOAPIC_DEASSERT_IRQ, &mut req)
-        }?;
+        unsafe { self.inner.ioctl(ioctls::VM_IOAPIC_DEASSERT_IRQ, &mut req) }?;
         Ok(())
     }
 
@@ -338,8 +336,7 @@ impl VmmHdl {
         let mut topo: [u16; 4] = [sockets, cores, threads, maxcpus];
         // Safety: passing a 4×u16 struct matching vm_cpu_topology.
         unsafe {
-            self.inner
-                .ioctl(ioctls::VM_SET_TOPOLOGY, topo.as_mut_ptr())
+            self.inner.ioctl(ioctls::VM_SET_TOPOLOGY, topo.as_mut_ptr())
         }?;
         Ok(())
     }
@@ -351,8 +348,12 @@ impl VmmHdl {
         captype: i32,
         capval: i32,
     ) -> Result<()> {
-        let mut cap =
-            vm_capability { cpuid, captype, capval, allcpus: 0 };
+        let mut cap = vm_capability {
+            cpuid,
+            captype,
+            capval,
+            allcpus: 0,
+        };
         // Safety: vm_capability is the correct struct.
         unsafe { self.inner.ioctl(ioctls::VM_SET_CAPABILITY, &mut cap) }?;
         Ok(())
@@ -410,14 +411,16 @@ impl VmmHdl {
         len: usize,
         bitmap: &mut [u8],
     ) -> Result<()> {
-        let pages = (len + 4095) / 4096;
-        let required_bytes = (pages + 7) / 8;
+        let pages = len.div_ceil(4096);
+        let required_bytes = pages.div_ceil(8);
         if bitmap.len() < required_bytes {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!(
                     "bitmap too small: need {} bytes for {} pages, got {}",
-                    required_bytes, pages, bitmap.len(),
+                    required_bytes,
+                    pages,
+                    bitmap.len(),
                 ),
             ));
         }
@@ -430,7 +433,9 @@ impl VmmHdl {
             vdt_pfns: bitmap.as_mut_ptr() as *mut _,
         };
         // Safety: vmm_dirty_tracker is the correct struct.
-        unsafe { self.inner.ioctl(ioctls::VM_TRACK_DIRTY_PAGES, &mut tracker) }?;
+        unsafe {
+            self.inner.ioctl(ioctls::VM_TRACK_DIRTY_PAGES, &mut tracker)
+        }?;
         Ok(())
     }
 
@@ -448,10 +453,7 @@ impl VmmHdl {
         if api_ver < ApiVersion::V17 as u32 {
             return Err(Error::new(
                 ErrorKind::Unsupported,
-                format!(
-                    "set_dirty_pages requires API v17+, have v{}",
-                    api_ver,
-                ),
+                format!("set_dirty_pages requires API v17+, have v{}", api_ver,),
             ));
         }
 
@@ -475,7 +477,11 @@ impl VmmHdl {
     // ---------------------------------------------------------------
 
     /// Build a vmm-data read/write operation.
-    pub fn data_op(&self, class: u16, version: u16) -> bhyve_api::VmmDataOp<'_> {
+    pub fn data_op(
+        &self,
+        class: u16,
+        version: u16,
+    ) -> bhyve_api::VmmDataOp<'_> {
         self.inner.data_op(class, version)
     }
 

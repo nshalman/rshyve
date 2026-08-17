@@ -84,7 +84,7 @@ impl PS2Kbd {
                     self.resp(PS2K_R_ACK);
                 }
                 _ => {
-                    panic!("bad multi-part ps2 cmd {}", cmd);
+                    debug_assert!(false, "bad multi-part ps2 cmd {}", cmd);
                 }
             }
         } else {

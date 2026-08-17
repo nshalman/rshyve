@@ -16,8 +16,12 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::{MemCtx, RegionKind};
 
 use crate::codec::{
-    CpuFeatures, MemRegionDesc, Message, MigrateError, MigrationPreamble,
-    ProtocolOffer, ProtocolSelect, PAGE_BATCH_FLAG_ZSTD,
+    CpuFeatures, Message, MigrateError, MigrationPreamble, ProtocolOffer,
+    ProtocolSelect, PAGE_BATCH_FLAG_ZSTD,
+};
+use crate::limits;
+use crate::pages::{
+    are_contiguous, build_contiguous_gpas, page_buffer_len, read_pages,
 };
 use crate::protocol::{PageIter, PAGE_SIZE, PROTOCOL_RON_V0};
 use crate::state;
@@ -25,6 +29,7 @@ use crate::MigrationPhase;
 use crate::MigrationStatus;
 
 const BATCH_SIZE: usize = 64;
+const _: () = assert!(BATCH_SIZE <= limits::MAX_PAGES_PER_BATCH as usize);
 const ZSTD_LEVEL: i32 = 1;
 
 /// Run the source side of live migration over a synchronous stream.
@@ -52,6 +57,8 @@ pub type DeviceFlushFn = Box<dyn FnOnce() -> Result<(), String> + Send>;
 /// Callback to resume device workers when a paused migration aborts.
 pub type DeviceResumeFn = Box<dyn Fn() + Send>;
 
+// These parameters are distinct migration inputs and lifecycle callbacks.
+#[allow(clippy::too_many_arguments)]
 pub fn run_source_sync<S: Read + Write>(
     stream: S,
     hdl: Arc<VmmHdl>,
@@ -70,22 +77,29 @@ pub fn run_source_sync<S: Read + Write>(
     let mut ws = WebSocket::from_raw_socket(
         stream,
         tungstenite::protocol::Role::Client,
-        None,
+        Some(limits::ws_config()),
     );
 
     let result = run_inner(
-        &mut ws, &hdl, memctx, num_cpus, mem_size, &status, log, cpu_baseline,
-        device_pre_pause_fn, device_flush_fn, device_export_fn, zfs_barrier,
+        &mut ws,
+        &hdl,
+        memctx,
+        num_cpus,
+        mem_size,
+        &status,
+        log,
+        cpu_baseline,
+        device_pre_pause_fn,
+        device_flush_fn,
+        device_export_fn,
+        zfs_barrier,
     );
 
-    let phase = status.lock().map(|s| s.phase).unwrap_or(MigrationPhase::Error);
-    finish_source_sync(
-        result,
-        phase,
-        log,
-        device_resume_fn,
-        || hdl.resume(),
-    )
+    let phase = status
+        .lock()
+        .map(|s| s.phase)
+        .unwrap_or(MigrationPhase::Error);
+    finish_source_sync(result, phase, log, device_resume_fn, || hdl.resume())
 }
 
 fn finish_source_sync<E, F>(
@@ -139,7 +153,7 @@ fn run_inner<S: Read + Write>(
         return Err(MigrateError::ProtocolMismatch(sel.protocol));
     }
 
-    let baseline = vmm_core::cpuid::CpuBaseline::from_str(cpu_baseline)
+    let baseline = vmm_core::cpuid::CpuBaseline::parse(cpu_baseline)
         .unwrap_or(vmm_core::cpuid::CpuBaseline::Host);
     let (l1_ecx, l1_edx, l7_ebx, l7_ecx, l7_edx, xcr0) =
         vmm_core::cpuid::query_masked_features(baseline);
@@ -149,8 +163,11 @@ fn run_inner<S: Read + Write>(
         mem_size,
         devices: Vec::new(),
         cpu_features: Some(CpuFeatures {
-            leaf1_ecx: l1_ecx, leaf1_edx: l1_edx,
-            leaf7_ebx: l7_ebx, leaf7_ecx: l7_ecx, leaf7_edx: l7_edx,
+            leaf1_ecx: l1_ecx,
+            leaf1_edx: l1_edx,
+            leaf7_ebx: l7_ebx,
+            leaf7_ecx: l7_ecx,
+            leaf7_edx: l7_edx,
             xcr0,
         }),
     };
@@ -183,7 +200,8 @@ fn run_inner<S: Read + Write>(
     // between vCPU pause and state capture.
     set_phase(status, MigrationPhase::Pause);
     device_pre_pause_fn();
-    hdl.pause().map_err(|e| MigrateError::Io(format!("pause: {e}")))?;
+    hdl.pause()
+        .map_err(|e| MigrateError::Io(format!("pause: {e}")))?;
 
     // ── Flush device writeback caches ──
     // zvol WCE=1 means writes we told the guest were complete may still
@@ -192,8 +210,9 @@ fn run_inner<S: Read + Write>(
     // incremental — otherwise the destination would see a disk that's
     // older than the guest memory we're about to ship.
     slog::info!(log, "flushing device backing caches");
-    device_flush_fn()
-        .map_err(|error| MigrateError::Io(format!("device flush failed: {error}")))?;
+    device_flush_fn().map_err(|error| {
+        MigrateError::Io(format!("device flush failed: {error}"))
+    })?;
 
     // ── Post-pause ZFS barrier ──
     // Wait for the GZ agent to complete the final ZFS incremental.
@@ -205,13 +224,16 @@ fn run_inner<S: Read + Write>(
         slog::info!(log, "waiting for post-pause ZFS sync"; "barrier" => barrier_path);
         match std::os::unix::net::UnixStream::connect(barrier_path) {
             Ok(mut stream) => {
-                stream.set_read_timeout(Some(std::time::Duration::from_secs(120)))
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(120)))
                     .ok();
                 let mut buf = [0u8; 1];
-                match std::io::Read::read_exact(&mut stream, &mut buf) {
+                match stream.read_exact(&mut buf) {
                     Ok(()) => slog::info!(log, "post-pause ZFS sync complete"),
-                    Err(e) => slog::warn!(log, "ZFS barrier read failed (continuing)";
-                        "error" => %e),
+                    Err(e) => {
+                        slog::warn!(log, "ZFS barrier read failed (continuing)";
+                        "error" => %e)
+                    }
                 }
             }
             Err(e) => {
@@ -267,7 +289,9 @@ fn push_ram_all<S: Read + Write>(
     status: &Arc<Mutex<MigrationStatus>>,
 ) -> Result<(), MigrateError> {
     for &(gpa, len, kind) in &memctx.regions() {
-        if kind != RegionKind::Ram { continue; }
+        if kind != RegionKind::Ram {
+            continue;
+        }
         let bm_len = crate::protocol::bitmap_size(len);
         let mut bm = vec![0u8; bm_len];
         let _ = hdl.track_dirty_pages(gpa, len, &mut bm);
@@ -294,12 +318,13 @@ fn push_ram<S: Read + Write>(
 ) -> Result<u64, MigrateError> {
     let mut total: u64 = 0;
     for &(gpa, len, kind) in &memctx.regions() {
-        if kind != RegionKind::Ram { continue; }
+        if kind != RegionKind::Ram {
+            continue;
+        }
         let bm_len = crate::protocol::bitmap_size(len);
         let mut bm = vec![0u8; bm_len];
-        hdl.track_dirty_pages(gpa, len, &mut bm).map_err(|e| {
-            MigrateError::Io(format!("track_dirty: {e}"))
-        })?;
+        hdl.track_dirty_pages(gpa, len, &mut bm)
+            .map_err(|e| MigrateError::Io(format!("track_dirty: {e}")))?;
 
         let mut batch: Vec<u64> = Vec::with_capacity(BATCH_SIZE);
         for dirty_gpa in PageIter::new(&bm, gpa, len) {
@@ -326,15 +351,22 @@ fn send_batch<S: Read + Write>(
     count: usize,
     status: &Arc<Mutex<MigrationStatus>>,
 ) -> Result<(), MigrateError> {
-    let raw_size = count * PAGE_SIZE;
+    let raw_size = page_buffer_len(count)?;
+    let gpas = build_contiguous_gpas(base_gpa, count)?;
     let mut buf = vec![0u8; raw_size];
-    for i in 0..count {
-        let _ = memctx.read(base_gpa + (i * PAGE_SIZE) as u64, &mut buf[i * PAGE_SIZE..(i + 1) * PAGE_SIZE]);
-    }
+    read_pages(memctx, &gpas, &mut buf)?;
     let (data, flags) = compress(&buf);
-    send(ws, &Message::PageBatch {
-        base_gpa, page_count: count as u32, flags, data,
-    })?;
+    send(
+        ws,
+        &Message::PageBatch {
+            base_gpa,
+            page_count: u32::try_from(count).map_err(|_| {
+                MigrateError::Codec(format!("invalid page count: {count}"))
+            })?,
+            flags,
+            data,
+        },
+    )?;
     if let Ok(mut s) = status.lock() {
         s.pages_transferred += count as u64;
         s.bytes_transferred += raw_size as u64;
@@ -348,25 +380,34 @@ fn send_batch_sparse<S: Read + Write>(
     gpas: &[u64],
     status: &Arc<Mutex<MigrationStatus>>,
 ) -> Result<(), MigrateError> {
-    if gpas.is_empty() { return Ok(()); }
+    if gpas.is_empty() {
+        return Ok(());
+    }
+    let raw_size = page_buffer_len(gpas.len())?;
     let base = gpas[0];
-    let contig = gpas.iter().enumerate().all(|(i, &g)| g == base + (i * PAGE_SIZE) as u64);
+    let contig = are_contiguous(gpas);
     if contig {
         return send_batch(ws, memctx, base, gpas.len(), status);
     }
     let count = gpas.len();
-    let mut buf = vec![0u8; count * PAGE_SIZE];
-    for (i, &gpa) in gpas.iter().enumerate() {
-        let _ = memctx.read(gpa, &mut buf[i * PAGE_SIZE..(i + 1) * PAGE_SIZE]);
-    }
+    let mut buf = vec![0u8; raw_size];
+    read_pages(memctx, gpas, &mut buf)?;
     let (data, flags) = compress(&buf);
     send(ws, &Message::MemFetch(gpas.to_vec()))?;
-    send(ws, &Message::PageBatch {
-        base_gpa: base, page_count: count as u32, flags, data,
-    })?;
+    send(
+        ws,
+        &Message::PageBatch {
+            base_gpa: base,
+            page_count: u32::try_from(count).map_err(|_| {
+                MigrateError::Codec(format!("invalid page count: {count}"))
+            })?,
+            flags,
+            data,
+        },
+    )?;
     if let Ok(mut s) = status.lock() {
         s.pages_transferred += count as u64;
-        s.bytes_transferred += (count * PAGE_SIZE) as u64;
+        s.bytes_transferred += raw_size as u64;
     }
     Ok(())
 }
@@ -378,18 +419,25 @@ fn compress(raw: &[u8]) -> (Vec<u8>, u32) {
     }
 }
 
-fn send<S: Read + Write>(ws: &mut WebSocket<S>, msg: &Message) -> Result<(), MigrateError> {
+fn send<S: Read + Write>(
+    ws: &mut WebSocket<S>,
+    msg: &Message,
+) -> Result<(), MigrateError> {
     let encoded = msg.encode();
     let data = match encoded {
-        tokio_tungstenite::tungstenite::Message::Binary(d) => d,
+        tungstenite::Message::Binary(d) => d,
         _ => return Err(MigrateError::Codec("non-binary encode".into())),
     };
-    ws.send(tungstenite::Message::Binary(data.into()))
+    ws.send(tungstenite::Message::Binary(data))
         .map_err(|e| MigrateError::WebSocket(e.to_string()))
 }
 
-fn recv<S: Read + Write>(ws: &mut WebSocket<S>) -> Result<Message, MigrateError> {
-    let frame = ws.read().map_err(|e| MigrateError::WebSocket(e.to_string()))?;
+fn recv<S: Read + Write>(
+    ws: &mut WebSocket<S>,
+) -> Result<Message, MigrateError> {
+    let frame = ws
+        .read()
+        .map_err(|e| MigrateError::WebSocket(e.to_string()))?;
     let data = match frame {
         tungstenite::Message::Binary(d) => d.to_vec(),
         tungstenite::Message::Close(_) => {
@@ -397,7 +445,7 @@ fn recv<S: Read + Write>(ws: &mut WebSocket<S>) -> Result<Message, MigrateError>
         }
         _ => return Err(MigrateError::Codec("non-binary frame".into())),
     };
-    Message::decode(tokio_tungstenite::tungstenite::Message::Binary(data))
+    Message::decode(tungstenite::Message::Binary(data))
 }
 
 fn expect_okay(msg: Message) -> Result<(), MigrateError> {
@@ -405,7 +453,8 @@ fn expect_okay(msg: Message) -> Result<(), MigrateError> {
         Message::Okay => Ok(()),
         Message::Error(e) => Err(MigrateError::RemoteError(e.to_string())),
         other => Err(MigrateError::UnexpectedMessage {
-            expected: "Okay".into(), got: format!("{other:?}"),
+            expected: "Okay".into(),
+            got: format!("{other:?}"),
         }),
     }
 }
@@ -415,7 +464,8 @@ fn expect_serialized(msg: Message) -> Result<Vec<u8>, MigrateError> {
         Message::Serialized(d) => Ok(d),
         Message::Error(e) => Err(MigrateError::RemoteError(e.to_string())),
         other => Err(MigrateError::UnexpectedMessage {
-            expected: "Serialized".into(), got: format!("{other:?}"),
+            expected: "Serialized".into(),
+            got: format!("{other:?}"),
         }),
     }
 }
@@ -424,13 +474,16 @@ fn expect_mem_done(msg: Message) -> Result<(), MigrateError> {
     match msg {
         Message::MemDone => Ok(()),
         other => Err(MigrateError::UnexpectedMessage {
-            expected: "MemDone".into(), got: format!("{other:?}"),
+            expected: "MemDone".into(),
+            got: format!("{other:?}"),
         }),
     }
 }
 
 fn set_phase(status: &Arc<Mutex<MigrationStatus>>, phase: MigrationPhase) {
-    if let Ok(mut s) = status.lock() { s.phase = phase; }
+    if let Ok(mut s) = status.lock() {
+        s.phase = phase;
+    }
 }
 
 #[cfg(test)]

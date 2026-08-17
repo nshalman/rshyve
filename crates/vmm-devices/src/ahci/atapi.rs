@@ -7,9 +7,10 @@
 
 use super::bits::{
     ASC_INVALID_FIELD_IN_CDB, ASC_INVALID_OPCODE, ASC_MEDIA_REMOVAL_PREVENTED,
-    ASC_SAVING_PARAMS_NOT_SUPPORTED, MODEPAGE_CD_CAPABILITIES, MODEPAGE_RW_ERROR_RECOVERY,
-    SCSI_GET_EVENT_STATUS, SCSI_INQUIRY, SCSI_MODE_SENSE_10, SCSI_PREVENT_ALLOW, SCSI_READ_10,
-    SCSI_READ_12, SCSI_READ_CAPACITY, SCSI_READ_TOC, SCSI_REPORT_LUNS, SCSI_REQUEST_SENSE,
+    ASC_SAVING_PARAMS_NOT_SUPPORTED, MODEPAGE_CD_CAPABILITIES,
+    MODEPAGE_RW_ERROR_RECOVERY, SCSI_GET_EVENT_STATUS, SCSI_INQUIRY,
+    SCSI_MODE_SENSE_10, SCSI_PREVENT_ALLOW, SCSI_READ_10, SCSI_READ_12,
+    SCSI_READ_CAPACITY, SCSI_READ_TOC, SCSI_REPORT_LUNS, SCSI_REQUEST_SENSE,
     SCSI_START_STOP_UNIT, SCSI_TEST_UNIT_READY, SENSE_ILLEGAL_REQUEST,
 };
 
@@ -27,7 +28,11 @@ pub enum AtapiOutcome {
     Check { sense_key: u8, asc: u8 },
 }
 
-pub fn dispatch(acmd: &[u8; 16], blocks: u64, sense: &mut SenseState) -> AtapiOutcome {
+pub fn dispatch(
+    acmd: &[u8; 16],
+    blocks: u64,
+    sense: &mut SenseState,
+) -> AtapiOutcome {
     let outcome = match acmd[0] {
         SCSI_TEST_UNIT_READY | SCSI_PREVENT_ALLOW => AtapiOutcome::Ok,
         SCSI_REQUEST_SENSE => request_sense(acmd, sense),
@@ -42,11 +47,15 @@ pub fn dispatch(acmd: &[u8; 16], blocks: u64, sense: &mut SenseState) -> AtapiOu
         },
         SCSI_READ_CAPACITY => read_capacity(blocks),
         SCSI_READ_10 => AtapiOutcome::ReadBlocks {
-            lba: u64::from(u32::from_be_bytes([acmd[2], acmd[3], acmd[4], acmd[5]])),
+            lba: u64::from(u32::from_be_bytes([
+                acmd[2], acmd[3], acmd[4], acmd[5],
+            ])),
             count: u32::from(u16::from_be_bytes([acmd[7], acmd[8]])),
         },
         SCSI_READ_12 => AtapiOutcome::ReadBlocks {
-            lba: u64::from(u32::from_be_bytes([acmd[2], acmd[3], acmd[4], acmd[5]])),
+            lba: u64::from(u32::from_be_bytes([
+                acmd[2], acmd[3], acmd[4], acmd[5],
+            ])),
             count: u32::from_be_bytes([acmd[6], acmd[7], acmd[8], acmd[9]]),
         },
         SCSI_READ_TOC => read_toc(acmd, blocks),
@@ -147,7 +156,11 @@ fn read_toc(acmd: &[u8; 16], blocks: u64) -> AtapiOutcome {
     }
 }
 
-fn read_toc_format0(acmd: &[u8; 16], blocks: u64, alloc_len: usize) -> AtapiOutcome {
+fn read_toc_format0(
+    acmd: &[u8; 16],
+    blocks: u64,
+    alloc_len: usize,
+) -> AtapiOutcome {
     let start_track = acmd[6];
     if start_track > 1 && start_track != 0xaa {
         return AtapiOutcome::Check {
@@ -279,8 +292,9 @@ fn lba_to_msf(lba: u64) -> [u8; 3] {
 mod tests {
     use super::*;
     use crate::ahci::bits::{
-        ASC_INVALID_FIELD_IN_CDB, ASC_INVALID_OPCODE, ASC_MEDIA_REMOVAL_PREVENTED,
-        ASC_SAVING_PARAMS_NOT_SUPPORTED, SENSE_ILLEGAL_REQUEST,
+        ASC_INVALID_FIELD_IN_CDB, ASC_INVALID_OPCODE,
+        ASC_MEDIA_REMOVAL_PREVENTED, ASC_SAVING_PARAMS_NOT_SUPPORTED,
+        SENSE_ILLEGAL_REQUEST,
     };
     use crate::ahci::media::checked_read_range;
 
@@ -354,7 +368,10 @@ mod tests {
             let mut sense = SenseState::default();
             let buf = data(dispatch(&cdb(&[0x25]), blocks, &mut sense));
 
-            assert_eq!(u32::from_be_bytes(buf[0..4].try_into().unwrap()), last_lba);
+            assert_eq!(
+                u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+                last_lba
+            );
         }
     }
 
@@ -429,7 +446,11 @@ mod tests {
             32_256,
             &mut sense,
         ));
-        let invalid = dispatch(&cdb(&[0x43, 0, 0, 0, 0, 0, 2, 0, 20]), 32_256, &mut sense);
+        let invalid = dispatch(
+            &cdb(&[0x43, 0, 0, 0, 0, 0, 2, 0, 20]),
+            32_256,
+            &mut sense,
+        );
 
         assert_eq!(full.len(), 20);
         assert_eq!(u16::from_be_bytes([full[0], full[1]]), 18);
@@ -498,7 +519,8 @@ mod tests {
     #[test]
     fn gesn_requires_polled_bit() {
         let mut sense = SenseState::default();
-        let asynchronous = dispatch(&cdb(&[0x4a, 0, 0, 0, 0, 0, 0, 0, 8]), 1, &mut sense);
+        let asynchronous =
+            dispatch(&cdb(&[0x4a, 0, 0, 0, 0, 0, 0, 0, 8]), 1, &mut sense);
         let polled = data(dispatch(
             &cdb(&[0x4a, 1, 0, 0, 0, 0, 0, 0, 8]),
             1,
@@ -553,7 +575,8 @@ mod tests {
     #[test]
     fn mode_sense_page3f_is_illegal_request() {
         let mut sense = SenseState::default();
-        let outcome = dispatch(&cdb(&[0x5a, 0, 0x3f, 0, 0, 0, 0, 0, 30]), 1, &mut sense);
+        let outcome =
+            dispatch(&cdb(&[0x5a, 0, 0x3f, 0, 0, 0, 0, 0, 30]), 1, &mut sense);
 
         assert_eq!(
             outcome,
@@ -567,7 +590,8 @@ mod tests {
     #[test]
     fn mode_sense_pc3_returns_asc_39() {
         let mut sense = SenseState::default();
-        let outcome = dispatch(&cdb(&[0x5a, 0, 0xc1, 0, 0, 0, 0, 0, 16]), 1, &mut sense);
+        let outcome =
+            dispatch(&cdb(&[0x5a, 0, 0xc1, 0, 0, 0, 0, 0, 16]), 1, &mut sense);
 
         assert_eq!(
             outcome,

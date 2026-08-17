@@ -61,7 +61,8 @@ mod tests {
             "test-vm",
         ]);
         let vtpm = cli(&["vmm", "--vtpm", "test-vm"]);
-        let migrate = cli(&["vmm", "--migrate-listen", "192.0.2.10:4567", "test-vm"]);
+        let migrate =
+            cli(&["vmm", "--migrate-listen", "192.0.2.10:4567", "test-vm"]);
 
         let error = validate_startup(&both).expect_err("combination must fail");
         assert!(error.to_string().contains("--vtpm"));

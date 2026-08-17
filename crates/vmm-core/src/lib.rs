@@ -23,6 +23,7 @@ pub mod machine;
 pub mod mem;
 pub mod mmio;
 pub mod pio;
+pub mod unixsock;
 pub mod vcpu;
 
 pub use common::{RWOp, ReadOp, WriteOp};

@@ -2,7 +2,11 @@
 name = "vmm_core"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 license = "MPL-2.0"
+
+[lints]
+workspace = true
 
 [dependencies]
 bhyve_api.workspace = true
@@ -12,3 +16,6 @@ libc.workspace = true
 slog.workspace = true
 thiserror.workspace = true
 usdt = { workspace = true, features = ["asm"] }
+
+[dev-dependencies]
+tempfile = "3"

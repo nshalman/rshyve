@@ -67,7 +67,11 @@ impl MmioBus {
 
     /// Unregister the handler whose registration starts at `addr`.
     pub fn unregister(&self, addr: u64) -> Result<(), ASpaceError> {
-        self.map.lock().unwrap().unregister(addr as usize).map(|_| ())
+        self.map
+            .lock()
+            .unwrap()
+            .unregister(addr as usize)
+            .map(|_| ())
     }
 
     /// Handle an MMIO read (guest reads from a physical address).
@@ -75,6 +79,11 @@ impl MmioBus {
     /// Returns the value read. If no handler is registered, returns
     /// all 1s, matching bus-float behavior.
     pub fn handle_read(&self, addr: u64, bytes: u8) -> u64 {
+        match bytes {
+            1 | 2 | 4 | 8 => {}
+            _ => return 0xFFFF_FFFF_FFFF_FFFF,
+        }
+
         let mut ro = ReadOp::new(bytes as usize);
 
         if let Some((offset, handler)) = self.lookup(addr) {
@@ -100,6 +109,11 @@ impl MmioBus {
     ///
     /// If no handler is registered, the write is silently ignored.
     pub fn handle_write(&self, addr: u64, bytes: u8, val: u64) {
+        match bytes {
+            1 | 2 | 4 | 8 => {}
+            _ => return,
+        }
+
         let data = &val.to_le_bytes()[..bytes as usize];
         let wo = WriteOp::from_buf(data);
 
@@ -179,6 +193,87 @@ mod tests {
 
         bus.handle_write(0xFEE0_0000, 8, 0x0102_0304_0506_0708);
         assert_eq!(captured.load(Ordering::SeqCst), 0x0102_0304_0506_0708);
+    }
+
+    #[test]
+    fn handle_write_rejects_oversized_width() {
+        let bus = MmioBus::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let handler: Arc<MmioFn> = Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        bus.register(0x1000, 0x100, handler).unwrap();
+
+        bus.handle_write(0x1000, 9, 0);
+        bus.handle_write(0x1000, 255, 0);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn handle_read_rejects_oversized_width() {
+        let bus = MmioBus::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let handler: Arc<MmioFn> = Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        bus.register(0x1000, 0x100, handler).unwrap();
+
+        assert_eq!(bus.handle_read(0x1000, 9), 0xFFFF_FFFF_FFFF_FFFF);
+        assert_eq!(bus.handle_read(0x1000, 255), 0xFFFF_FFFF_FFFF_FFFF);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn handle_write_rejects_zero_width() {
+        let bus = MmioBus::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let handler: Arc<MmioFn> = Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        bus.register(0x1000, 0x100, handler).unwrap();
+
+        bus.handle_write(0x1000, 0, 0);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn handle_read_rejects_zero_width() {
+        let bus = MmioBus::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let handler: Arc<MmioFn> = Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        bus.register(0x1000, 0x100, handler).unwrap();
+
+        assert_eq!(bus.handle_read(0x1000, 0), 0xFFFF_FFFF_FFFF_FFFF);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn handle_write_accepts_legal_widths() {
+        let bus = MmioBus::new();
+        let widths = Arc::new(Mutex::new(Vec::new()));
+        let widths_clone = Arc::clone(&widths);
+        let handler: Arc<MmioFn> = Arc::new(move |_, rwop| {
+            if let RWOp::Write(wo) = rwop {
+                widths_clone.lock().unwrap().push(wo.len());
+            }
+        });
+        bus.register(0x1000, 0x100, handler).unwrap();
+
+        for bytes in [1, 2, 4, 8] {
+            bus.handle_write(0x1000, bytes, u64::MAX);
+        }
+
+        assert_eq!(*widths.lock().unwrap(), [1, 2, 4, 8]);
     }
 
     #[test]

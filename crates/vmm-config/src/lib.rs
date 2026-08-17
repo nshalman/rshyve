@@ -29,13 +29,12 @@ pub fn parse_mem_size(s: &str) -> anyhow::Result<usize> {
         _ => (s, 1024 * 1024),
     };
 
-    let num: usize = num_str.parse().map_err(|e| {
-        anyhow::anyhow!("invalid memory size '{s}': {e}")
-    })?;
+    let num: usize = num_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid memory size '{s}': {e}"))?;
 
-    num.checked_mul(multiplier).ok_or_else(|| {
-        anyhow::anyhow!("memory size '{s}' overflows")
-    })
+    num.checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("memory size '{s}' overflows"))
 }
 
 /// New Rust-based bhyve VMM with live migration support.

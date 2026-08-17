@@ -70,7 +70,10 @@ impl DiskCache {
             // GET worked but SET refused — leave state alone.
             return Self { fd, initial: None };
         }
-        Self { fd, initial: Some(false) }
+        Self {
+            fd,
+            initial: Some(false),
+        }
     }
 
     #[cfg(not(target_os = "illumos"))]
@@ -96,7 +99,11 @@ impl Drop for DiskCache {
 /// Passes `&mut c_int` explicitly so the integer doesn't hit variadic
 /// type promotion and the kernel reads/writes the expected 4 bytes.
 #[cfg(target_os = "illumos")]
-fn dkioc_wce(fd: RawFd, cmd: libc::c_int, v: &mut libc::c_int) -> io::Result<()> {
+fn dkioc_wce(
+    fd: RawFd,
+    cmd: libc::c_int,
+    v: &mut libc::c_int,
+) -> io::Result<()> {
     // SAFETY: caller holds `fd` open for the duration of the call; `v`
     // lives through the call and is the correct size for DKIOC{GET,SET}WCE.
     let r = unsafe { libc::ioctl(fd, cmd, v as *mut libc::c_int) };

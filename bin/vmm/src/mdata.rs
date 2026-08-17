@@ -65,7 +65,10 @@ fn mdata_loop(uart: &LpcUart, store: &MdataStore, log: &Logger) {
     let mut line_buf = Vec::with_capacity(256);
     let mut v2_mode = false;
 
-    info!(log, "mdata agent loop started, waiting for guest requests on COM2");
+    info!(
+        log,
+        "mdata agent loop started, waiting for guest requests on COM2"
+    );
 
     loop {
         match uart.output_byte() {
@@ -102,10 +105,8 @@ fn mdata_loop(uart: &LpcUart, store: &MdataStore, log: &Logger) {
             Some(b) => {
                 // Only buffer printable ASCII. Drop control chars
                 // (ESC sequences from UEFI firmware probing COM2).
-                if b >= 0x20 && b < 0x7F {
-                    if line_buf.len() < 4096 {
-                        line_buf.push(b);
-                    }
+                if (0x20..0x7F).contains(&b) && line_buf.len() < 4096 {
+                    line_buf.push(b);
                 }
             }
             None => {
@@ -162,7 +163,7 @@ fn process_v2_frame(line: &str, store: &MdataStore, log: &Logger) -> String {
 
     match command {
         "GET" => {
-            let key = match b64_arg.and_then(|a| b64_decode(a)) {
+            let key = match b64_arg.and_then(b64_decode) {
                 Some(k) => k,
                 None => return build_v2_response(reqid, "FAILURE", None),
             };
@@ -191,7 +192,9 @@ fn process_v2_frame(line: &str, store: &MdataStore, log: &Logger) -> String {
 /// Build a V2 response frame.
 fn build_v2_response(reqid: &str, status: &str, data: Option<&str>) -> String {
     let body = match data {
-        Some(d) if !d.is_empty() => format!("{} {} {}", reqid, status, b64_encode(d)),
+        Some(d) if !d.is_empty() => {
+            format!("{} {} {}", reqid, status, b64_encode(d))
+        }
         _ => format!("{} {}", reqid, status),
     };
     let crc = crc32(&body);
@@ -267,11 +270,20 @@ fn base64_decode_bytes(input: &str) -> Option<Vec<u8>> {
     const TABLE: [u8; 128] = {
         let mut t = [0xFFu8; 128];
         let mut i = 0u8;
-        while i < 26 { t[(b'A' + i) as usize] = i; i += 1; }
+        while i < 26 {
+            t[(b'A' + i) as usize] = i;
+            i += 1;
+        }
         i = 0;
-        while i < 26 { t[(b'a' + i) as usize] = 26 + i; i += 1; }
+        while i < 26 {
+            t[(b'a' + i) as usize] = 26 + i;
+            i += 1;
+        }
         i = 0;
-        while i < 10 { t[(b'0' + i) as usize] = 52 + i; i += 1; }
+        while i < 10 {
+            t[(b'0' + i) as usize] = 52 + i;
+            i += 1;
+        }
         t[b'+' as usize] = 62;
         t[b'/' as usize] = 63;
         t
@@ -284,11 +296,13 @@ fn base64_decode_bytes(input: &str) -> Option<Vec<u8>> {
     while i + 3 < bytes.len() {
         let (a, b, c, d) = (
             *TABLE.get(*bytes.get(i)? as usize)?,
-            *TABLE.get(*bytes.get(i+1)? as usize)?,
-            *TABLE.get(*bytes.get(i+2)? as usize)?,
-            *TABLE.get(*bytes.get(i+3)? as usize)?,
+            *TABLE.get(*bytes.get(i + 1)? as usize)?,
+            *TABLE.get(*bytes.get(i + 2)? as usize)?,
+            *TABLE.get(*bytes.get(i + 3)? as usize)?,
         );
-        if a == 0xFF || b == 0xFF || c == 0xFF || d == 0xFF { return None; }
+        if a == 0xFF || b == 0xFF || c == 0xFF || d == 0xFF {
+            return None;
+        }
         out.push((a << 2) | (b >> 4));
         out.push((b << 4) | (c >> 2));
         out.push((c << 6) | d);
@@ -297,12 +311,16 @@ fn base64_decode_bytes(input: &str) -> Option<Vec<u8>> {
     let rem = bytes.len() - i;
     if rem >= 2 {
         let a = *TABLE.get(*bytes.get(i)? as usize)?;
-        let b = *TABLE.get(*bytes.get(i+1)? as usize)?;
-        if a == 0xFF || b == 0xFF { return None; }
+        let b = *TABLE.get(*bytes.get(i + 1)? as usize)?;
+        if a == 0xFF || b == 0xFF {
+            return None;
+        }
         out.push((a << 2) | (b >> 4));
         if rem >= 3 {
-            let c = *TABLE.get(*bytes.get(i+2)? as usize)?;
-            if c == 0xFF { return None; }
+            let c = *TABLE.get(*bytes.get(i + 2)? as usize)?;
+            if c == 0xFF {
+                return None;
+            }
             out.push((b << 4) | (c >> 2));
         }
     }
@@ -317,10 +335,15 @@ struct Base64Encoder<'a> {
 
 impl<'a> Base64Encoder<'a> {
     fn new(buf: &'a mut Vec<u8>) -> Self {
-        Self { buf, pending: [0; 3], pending_len: 0 }
+        Self {
+            buf,
+            pending: [0; 3],
+            pending_len: 0,
+        }
     }
     fn finish(mut self) -> Result<(), std::io::Error> {
-        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const CHARS: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         if self.pending_len == 1 {
             let a = self.pending[0];
             self.buf.push(CHARS[(a >> 2) as usize]);
@@ -341,7 +364,8 @@ impl<'a> Base64Encoder<'a> {
 
 impl<'a> std::io::Write for Base64Encoder<'a> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const CHARS: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut i = 0;
         // First, fill pending buffer
         while self.pending_len < 3 && i < data.len() {
@@ -359,7 +383,7 @@ impl<'a> std::io::Write for Base64Encoder<'a> {
         }
         // Process remaining full triplets
         while i + 2 < data.len() {
-            let (a, b, c) = (data[i], data[i+1], data[i+2]);
+            let (a, b, c) = (data[i], data[i + 1], data[i + 2]);
             self.buf.push(CHARS[(a >> 2) as usize]);
             self.buf.push(CHARS[((a & 0x03) << 4 | b >> 4) as usize]);
             self.buf.push(CHARS[((b & 0x0F) << 2 | c >> 6) as usize]);
@@ -374,7 +398,9 @@ impl<'a> std::io::Write for Base64Encoder<'a> {
         }
         Ok(data.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// CRC32 (ISO 3309 / ITU-T V.42, same as zlib).
@@ -481,7 +507,7 @@ mod tests {
     fn v1_get_existing() {
         let mut store = MdataStore::new();
         store.set("test-key", "test-value");
-        let log = slog::Logger::root(slog::Discard, slog::o!());
+        let log = Logger::root(slog::Discard, slog::o!());
         let resp = process_v1_command("GET test-key", &store, &log);
         assert_eq!(resp, "SUCCESS\ntest-value\n.");
     }
@@ -489,7 +515,7 @@ mod tests {
     #[test]
     fn v1_get_missing() {
         let store = MdataStore::new();
-        let log = slog::Logger::root(slog::Discard, slog::o!());
+        let log = Logger::root(slog::Discard, slog::o!());
         let resp = process_v1_command("GET missing", &store, &log);
         assert_eq!(resp, "NOTFOUND");
     }

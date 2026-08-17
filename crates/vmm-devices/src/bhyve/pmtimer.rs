@@ -41,11 +41,7 @@ impl BhyvePmTimer {
         let fd = std::os::fd::AsRawFd::as_raw_fd(&*self.hdl);
         let port = self.port as usize;
         let res = unsafe {
-            libc::ioctl(
-                fd,
-                bhyve_api::ioctls::VM_PMTMR_LOCATE as _,
-                port,
-            )
+            libc::ioctl(fd, bhyve_api::ioctls::VM_PMTMR_LOCATE as _, port)
         };
         if res == -1 {
             return Err(std::io::Error::last_os_error());

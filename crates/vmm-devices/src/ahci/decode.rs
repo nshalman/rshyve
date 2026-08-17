@@ -58,7 +58,8 @@ pub fn parse_cmd_hdr(raw: &[u8; CL_ENTRY_SIZE]) -> Result<CmdHdr, HdrError> {
 }
 
 pub fn cmd_table_len(prdtl: u16) -> Option<usize> {
-    CMD_TBL_PRDT_OFF.checked_add(usize::from(prdtl).checked_mul(PRD_ENTRY_SIZE)?)
+    CMD_TBL_PRDT_OFF
+        .checked_add(usize::from(prdtl).checked_mul(PRD_ENTRY_SIZE)?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,12 +90,16 @@ pub fn parse_prdt(raw: &[u8], prdtl: u16) -> Result<Vec<Prd>, PrdtError> {
         .take(usize::from(prdtl))
         .enumerate()
     {
-        let dba = u64::from_le_bytes(entry[0..8].try_into().expect("PRDT DBA has fixed width"));
+        let dba = u64::from_le_bytes(
+            entry[0..8].try_into().expect("PRDT DBA has fixed width"),
+        );
         if dba & 1 != 0 {
             return Err(PrdtError::DbaMisaligned(dba));
         }
 
-        let dbc = u32::from_le_bytes(entry[12..16].try_into().expect("PRDT DBC has fixed width"));
+        let dbc = u32::from_le_bytes(
+            entry[12..16].try_into().expect("PRDT DBC has fixed width"),
+        );
         let len = (dbc & DBCMASK) + 1;
         if len == 0 || len & 1 != 0 {
             return Err(PrdtError::ZeroOrOddLength(index));
@@ -167,7 +172,10 @@ mod tests {
         for prdtl in [MAX_PRDTL + 1, u16::MAX] {
             let mut raw = valid_cmd_hdr();
             raw[2..4].copy_from_slice(&prdtl.to_le_bytes());
-            assert_eq!(parse_cmd_hdr(&raw), Err(HdrError::PrdtlTooLarge(prdtl)));
+            assert_eq!(
+                parse_cmd_hdr(&raw),
+                Err(HdrError::PrdtlTooLarge(prdtl))
+            );
         }
     }
 
@@ -187,7 +195,8 @@ mod tests {
     #[test]
     fn parse_prdt_rejects_truncated_buffer() {
         let mut raw = prdt_table(1);
-        raw[CMD_TBL_PRDT_OFF + 12..CMD_TBL_PRDT_OFF + 16].copy_from_slice(&1u32.to_le_bytes());
+        raw[CMD_TBL_PRDT_OFF + 12..CMD_TBL_PRDT_OFF + 16]
+            .copy_from_slice(&1u32.to_le_bytes());
         assert_eq!(parse_prdt(&raw, 2), Err(PrdtError::Truncated));
     }
 
@@ -200,8 +209,10 @@ mod tests {
     #[test]
     fn parse_prdt_rejects_unaligned_dba() {
         let mut raw = prdt_table(1);
-        raw[CMD_TBL_PRDT_OFF..CMD_TBL_PRDT_OFF + 8].copy_from_slice(&0x1001u64.to_le_bytes());
-        raw[CMD_TBL_PRDT_OFF + 12..CMD_TBL_PRDT_OFF + 16].copy_from_slice(&1u32.to_le_bytes());
+        raw[CMD_TBL_PRDT_OFF..CMD_TBL_PRDT_OFF + 8]
+            .copy_from_slice(&0x1001u64.to_le_bytes());
+        raw[CMD_TBL_PRDT_OFF + 12..CMD_TBL_PRDT_OFF + 16]
+            .copy_from_slice(&1u32.to_le_bytes());
         assert_eq!(parse_prdt(&raw, 1), Err(PrdtError::DbaMisaligned(0x1001)));
     }
 
@@ -217,7 +228,8 @@ mod tests {
     #[test]
     fn parse_prdt_rejects_single_entry_over_max() {
         let mut raw = prdt_table(1);
-        raw[CMD_TBL_PRDT_OFF + 12..CMD_TBL_PRDT_OFF + 16].copy_from_slice(&DBCMASK.to_le_bytes());
+        raw[CMD_TBL_PRDT_OFF + 12..CMD_TBL_PRDT_OFF + 16]
+            .copy_from_slice(&DBCMASK.to_le_bytes());
         assert_eq!(DBCMASK + 1, 0x0040_0000);
         assert_eq!(parse_prdt(&raw, 1), Err(PrdtError::TotalTooLarge));
     }

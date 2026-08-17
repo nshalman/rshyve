@@ -419,16 +419,9 @@ pub enum ClientMessage {
         height: u16,
     },
     /// KeyEvent.
-    KeyEvent {
-        down: bool,
-        key: u32,
-    },
+    KeyEvent { down: bool, key: u32 },
     /// PointerEvent.
-    PointerEvent {
-        button_mask: u8,
-        x: u16,
-        y: u16,
-    },
+    PointerEvent { button_mask: u8, x: u16, y: u16 },
     /// ClientCutText.
     CutText(String),
 }
@@ -436,7 +429,9 @@ pub enum ClientMessage {
 /// Read and parse a single client message.
 ///
 /// Returns `None` on EOF (client disconnected).
-pub fn read_client_message<R: BufRead>(r: &mut R) -> io::Result<Option<ClientMessage>> {
+pub fn read_client_message<R: BufRead>(
+    r: &mut R,
+) -> io::Result<Option<ClientMessage>> {
     let mut msg_type = [0u8; 1];
     match r.read_exact(&mut msg_type) {
         Ok(()) => {}
@@ -541,7 +536,7 @@ pub fn read_client_message<R: BufRead>(r: &mut R) -> io::Result<Option<ClientMes
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{BufReader, Cursor};
 
     #[test]
     fn pixel_format_roundtrip() {
@@ -581,7 +576,10 @@ mod tests {
         assert_eq!(bytes.len(), 12);
         assert_eq!(u16::from_be_bytes([bytes[4], bytes[5]]), 1024);
         assert_eq!(u16::from_be_bytes([bytes[6], bytes[7]]), 768);
-        assert_eq!(i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]), 0);
+        assert_eq!(
+            i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            0
+        );
     }
 
     #[test]
@@ -598,8 +596,7 @@ mod tests {
         server_out.extend_from_slice(RFB_VERSION);
 
         // Parse client version from client_data
-        let minor_str =
-            std::str::from_utf8(&client_data[8..11]).expect("utf8");
+        let minor_str = std::str::from_utf8(&client_data[8..11]).expect("utf8");
         let minor = minor_str.parse::<u16>().expect("parse minor");
         assert_eq!(minor, 8);
     }
@@ -615,7 +612,7 @@ mod tests {
         data.extend_from_slice(&1024u16.to_be_bytes()); // width
         data.extend_from_slice(&768u16.to_be_bytes()); // height
 
-        let mut reader = io::BufReader::new(io::Cursor::new(data));
+        let mut reader = BufReader::new(Cursor::new(data));
         let msg = read_client_message(&mut reader)
             .expect("read")
             .expect("some");
@@ -645,7 +642,7 @@ mod tests {
         data.extend_from_slice(&[0, 0]); // padding
         data.extend_from_slice(&0x0041u32.to_be_bytes()); // key 'A'
 
-        let mut reader = io::BufReader::new(io::Cursor::new(data));
+        let mut reader = BufReader::new(Cursor::new(data));
         let msg = read_client_message(&mut reader)
             .expect("read")
             .expect("some");
@@ -666,16 +663,12 @@ mod tests {
         data.extend_from_slice(&100u16.to_be_bytes()); // x
         data.extend_from_slice(&200u16.to_be_bytes()); // y
 
-        let mut reader = io::BufReader::new(io::Cursor::new(data));
+        let mut reader = BufReader::new(Cursor::new(data));
         let msg = read_client_message(&mut reader)
             .expect("read")
             .expect("some");
         match msg {
-            ClientMessage::PointerEvent {
-                button_mask,
-                x,
-                y,
-            } => {
+            ClientMessage::PointerEvent { button_mask, x, y } => {
                 assert_eq!(button_mask, 0x01);
                 assert_eq!(x, 100);
                 assert_eq!(y, 200);
@@ -687,7 +680,7 @@ mod tests {
     #[test]
     fn eof_returns_none() {
         let data: Vec<u8> = vec![];
-        let mut reader = io::BufReader::new(io::Cursor::new(data));
+        let mut reader = BufReader::new(Cursor::new(data));
         let result = read_client_message(&mut reader).expect("no error");
         assert!(result.is_none());
     }
@@ -695,7 +688,7 @@ mod tests {
     #[test]
     fn unknown_msg_type_is_error() {
         let data = vec![0xFF_u8]; // unknown type
-        let mut reader = io::BufReader::new(io::Cursor::new(data));
+        let mut reader = BufReader::new(Cursor::new(data));
         let result = read_client_message(&mut reader);
         assert!(result.is_err());
     }
@@ -714,8 +707,8 @@ mod tests {
         // and that encrypting then "decrypting" with DES gives back
         // the original challenge.
         let challenge: [u8; 16] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+            0x0C, 0x0D, 0x0E, 0x0F, 0x10,
         ];
         let result = vnc_des_encrypt("password", &challenge);
 
@@ -746,7 +739,10 @@ mod tests {
         let (first, second) = decrypted.split_at_mut(8);
         cipher.decrypt_block(first.into());
         cipher.decrypt_block(second.into());
-        assert_eq!(decrypted, challenge, "DES round-trip must recover challenge");
+        assert_eq!(
+            decrypted, challenge,
+            "DES round-trip must recover challenge"
+        );
     }
 
     #[test]

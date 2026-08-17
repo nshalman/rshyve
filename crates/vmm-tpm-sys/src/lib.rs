@@ -115,7 +115,9 @@ mod tests {
     fn smoke_get_random() {
         unsafe {
             assert_eq!(
-                TPMLIB_ChooseTPMVersion(TPMLIB_TPMVersion::TPMLIB_TPM_VERSION_2),
+                TPMLIB_ChooseTPMVersion(
+                    TPMLIB_TPMVersion::TPMLIB_TPM_VERSION_2
+                ),
                 TPM_SUCCESS,
                 "ChooseTPMVersion"
             );
@@ -128,15 +130,18 @@ mod tests {
             // accepting commands. 12-byte command:
             //   tag=8001 size=0000000C cc=00000144 startup=0000
             let startup: [u8; 12] = [
-                0x80, 0x01, 0x00, 0x00, 0x00, 0x0C,
-                0x00, 0x00, 0x01, 0x44, 0x00, 0x00,
+                0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x44,
+                0x00, 0x00,
             ];
             let mut resp: *mut u8 = std::ptr::null_mut();
             let mut resp_size: u32 = 0;
             let mut resp_buf: u32 = 4096;
             let r = TPMLIB_Process(
-                &mut resp, &mut resp_size, &mut resp_buf,
-                startup.as_ptr(), startup.len() as u32,
+                &mut resp,
+                &mut resp_size,
+                &mut resp_buf,
+                startup.as_ptr(),
+                startup.len() as u32,
             );
             assert_eq!(r, TPM_SUCCESS, "Startup process");
             assert!(!resp.is_null() && resp_size >= 10);
@@ -145,15 +150,18 @@ mod tests {
             // TPM2_GetRandom(4) — 12-byte command:
             //   tag=8001 size=0000000C cc=0000017B bytes=0004
             let cmd: [u8; 12] = [
-                0x80, 0x01, 0x00, 0x00, 0x00, 0x0C,
-                0x00, 0x00, 0x01, 0x7B, 0x00, 0x04,
+                0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x7B,
+                0x00, 0x04,
             ];
             let mut resp: *mut u8 = std::ptr::null_mut();
             let mut resp_size: u32 = 0;
             let mut resp_buf: u32 = 4096;
             let r = TPMLIB_Process(
-                &mut resp, &mut resp_size, &mut resp_buf,
-                cmd.as_ptr(), cmd.len() as u32,
+                &mut resp,
+                &mut resp_size,
+                &mut resp_buf,
+                cmd.as_ptr(),
+                cmd.len() as u32,
             );
             assert_eq!(r, TPM_SUCCESS, "GetRandom process");
             assert!(!resp.is_null());

@@ -64,7 +64,8 @@ pub fn build_page() -> Box<[u8; PAGE_SIZE]> {
     let mut page = Box::new([0u8; PAGE_SIZE]);
     // 48 c7 c0 02 00 00 00   mov rax, 2
     // c3                     ret
-    page[0..8].copy_from_slice(&[0x48, 0xc7, 0xc0, 0x02, 0x00, 0x00, 0x00, 0xc3]);
+    page[0..8]
+        .copy_from_slice(&[0x48, 0xc7, 0xc0, 0x02, 0x00, 0x00, 0x00, 0xc3]);
     page
 }
 
@@ -74,7 +75,9 @@ mod tests {
 
     #[test]
     fn locked_bit_is_sticky() {
-        let v = MsrHypercallValue(MsrHypercallValue::LOCKED | MsrHypercallValue::ENABLED);
+        let v = MsrHypercallValue(
+            MsrHypercallValue::LOCKED | MsrHypercallValue::ENABLED,
+        );
         assert!(v.locked());
         // Guest tries to clear locked + disable; both ignored.
         let v2 = v.apply_write(0);
@@ -86,7 +89,8 @@ mod tests {
     #[test]
     fn unlocked_writes_pass_through() {
         let v = MsrHypercallValue(0);
-        let new = MsrHypercallValue::ENABLED | (0xdead_0000 & MsrHypercallValue::PFN_MASK);
+        let new = MsrHypercallValue::ENABLED
+            | (0xdead_0000 & MsrHypercallValue::PFN_MASK);
         let v2 = v.apply_write(new);
         assert!(v2.enabled());
         assert_eq!(v2.gpa(), 0xdead_0000);
@@ -95,7 +99,10 @@ mod tests {
     #[test]
     fn page_starts_with_mov_ret() {
         let page = build_page();
-        assert_eq!(&page[0..8], &[0x48, 0xc7, 0xc0, 0x02, 0x00, 0x00, 0x00, 0xc3]);
+        assert_eq!(
+            &page[0..8],
+            &[0x48, 0xc7, 0xc0, 0x02, 0x00, 0x00, 0x00, 0xc3]
+        );
         assert!(page[8..].iter().all(|&b| b == 0));
     }
 }

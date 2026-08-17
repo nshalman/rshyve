@@ -9,11 +9,12 @@
 //! to read the blobs on the source and write them on the destination.
 
 use bhyve_api::{
-    VDC_ATPIC, VDC_ATPIT, VDC_HPET, VDC_IOAPIC,
-    VDC_LAPIC, VDC_MSR, VDC_PM_TIMER, VDC_RTC, VDC_VMM_TIME,
-    vdi_field_entry_v1, vm_reg_name,
+    vdi_field_entry_v1, vm_reg_name, VDC_ATPIC, VDC_ATPIT, VDC_HPET,
+    VDC_IOAPIC, VDC_LAPIC, VDC_MSR, VDC_PM_TIMER, VDC_RTC, VDC_VMM_TIME,
 };
 use slog;
+use std::mem::size_of;
+use std::slice;
 use std::sync::Arc;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::vcpu::Vcpu;
@@ -87,9 +88,8 @@ const VCPU_SEG_DESCS: &[vm_reg_name] = &[
 /// Export all registers for a vCPU as (reg_id, value) pairs,
 /// plus segment descriptors as (reg_id, base, limit, access) tuples.
 fn export_vcpu_regs(vcpu: &Vcpu) -> Result<Vec<u8>, MigrateError> {
-    let mut data = Vec::with_capacity(
-        VCPU_REGS.len() * 12 + VCPU_SEG_DESCS.len() * 20,
-    );
+    let mut data =
+        Vec::with_capacity(VCPU_REGS.len() * 12 + VCPU_SEG_DESCS.len() * 20);
 
     // General registers: 4 bytes id + 8 bytes value = 12 bytes each
     for &reg in VCPU_REGS {
@@ -130,9 +130,8 @@ fn import_vcpu_regs(
 
     // Read general registers (12 bytes each: 4 id + 8 value)
     while pos + 12 <= data.len() {
-        let reg_id = u32::from_le_bytes(
-            data[pos..pos + 4].try_into().expect("4 bytes"),
-        );
+        let reg_id =
+            u32::from_le_bytes(data[pos..pos + 4].try_into().expect("4 bytes"));
 
         // Check for segment descriptor marker
         if reg_id == 0xFFFF_FFFF {
@@ -159,18 +158,24 @@ fn import_vcpu_regs(
                 let access = u32::from_le_bytes(
                     data[pos + 16..pos + 20].try_into().expect("4 bytes"),
                 );
-                let reg: vm_reg_name = match vm_reg_name::from_repr(seg_id as i32) {
-                    Some(r) if !matches!(r, vm_reg_name::VM_REG_LAST) => r,
-                    _ => {
-                        return Err(MigrateError::VmmData(format!(
-                            "invalid segment reg id: {seg_id}"
-                        )));
-                    }
+                let reg: vm_reg_name =
+                    match vm_reg_name::from_repr(seg_id as i32) {
+                        Some(r) if !matches!(r, vm_reg_name::VM_REG_LAST) => r,
+                        _ => {
+                            return Err(MigrateError::VmmData(format!(
+                                "invalid segment reg id: {seg_id}"
+                            )));
+                        }
+                    };
+                let desc = bhyve_api::seg_desc {
+                    base,
+                    limit,
+                    access,
                 };
-                let desc = bhyve_api::seg_desc { base, limit, access };
                 vcpu.set_segment_desc(reg, &desc).map_err(|e| {
                     MigrateError::VmmData(format!(
-                        "set_segment_desc {:?}: {e}", reg
+                        "set_segment_desc {:?}: {e}",
+                        reg
                     ))
                 })?;
                 // Don't touch selectors here — they're already set
@@ -208,11 +213,11 @@ fn read_class_all(
     class: u16,
     version: u16,
 ) -> Result<Vec<u8>, MigrateError> {
-    hdl.data_op(class, version)
-        .read_all::<u8>()
-        .map_err(|e| MigrateError::VmmData(format!(
+    hdl.data_op(class, version).read_all::<u8>().map_err(|e| {
+        MigrateError::VmmData(format!(
             "read_all class={class} version={version}: {e:?}"
-        )))
+        ))
+    })
 }
 
 /// Read a per-vCPU vmm-data class as raw bytes.
@@ -225,9 +230,11 @@ fn read_class_vcpu(
     hdl.data_op(class, version)
         .for_vcpu(vcpuid)
         .read_all::<u8>()
-        .map_err(|e| MigrateError::VmmData(format!(
+        .map_err(|e| {
+            MigrateError::VmmData(format!(
             "read_vcpu class={class} version={version} vcpu={vcpuid}: {e:?}"
-        )))
+        ))
+        })
 }
 
 /// Write raw bytes to a vmm-data class/version.
@@ -237,11 +244,11 @@ fn write_class_all(
     version: u16,
     data: &[u8],
 ) -> Result<(), MigrateError> {
-    hdl.data_op(class, version)
-        .write_many(data)
-        .map_err(|e| MigrateError::VmmData(format!(
+    hdl.data_op(class, version).write_many(data).map_err(|e| {
+        MigrateError::VmmData(format!(
             "write class={class} version={version}: {e:?}"
-        )))
+        ))
+    })
 }
 
 /// Write per-vCPU vmm-data class.
@@ -255,9 +262,11 @@ fn write_class_vcpu(
     hdl.data_op(class, version)
         .for_vcpu(vcpuid)
         .write_many(data)
-        .map_err(|e| MigrateError::VmmData(format!(
+        .map_err(|e| {
+            MigrateError::VmmData(format!(
             "write_vcpu class={class} version={version} vcpu={vcpuid}: {e:?}"
-        )))
+        ))
+        })
 }
 
 /// Export time synchronization data from the kernel.
@@ -282,17 +291,22 @@ pub fn import_time_data(
     use bhyve_api::vdi_time_info_v1;
 
     // Parse source time data
-    if time.vmm_time.len() < std::mem::size_of::<vdi_time_info_v1>() {
+    if time.vmm_time.len() < size_of::<vdi_time_info_v1>() {
         return Err(MigrateError::VmmData("VMM_TIME too small".into()));
     }
     let src: vdi_time_info_v1 = unsafe {
-        std::ptr::read_unaligned(time.vmm_time.as_ptr() as *const vdi_time_info_v1)
+        std::ptr::read_unaligned(
+            time.vmm_time.as_ptr() as *const vdi_time_info_v1
+        )
     };
 
     // Read destination's current host time snapshot
-    let dst = hdl.data_op(VDC_VMM_TIME, 1)
+    let dst = hdl
+        .data_op(VDC_VMM_TIME, 1)
         .read::<vdi_time_info_v1>()
-        .map_err(|e| MigrateError::VmmData(format!("read dst VMM_TIME: {e:?}")))?;
+        .map_err(|e| {
+            MigrateError::VmmData(format!("read dst VMM_TIME: {e:?}"))
+        })?;
 
     // Adjust boot_hrtime for the destination host (Propolis pattern):
     //
@@ -302,8 +316,10 @@ pub fn import_time_data(
     // new_guest_tsc = src.guest_tsc + tsc_ticks_during_migration
     let guest_uptime = src.vt_hrtime - src.vt_boot_hrtime;
 
-    let src_wc_ns = (src.vt_hres_sec as i64) * 1_000_000_000 + (src.vt_hres_ns as i64);
-    let dst_wc_ns = (dst.vt_hres_sec as i64) * 1_000_000_000 + (dst.vt_hres_ns as i64);
+    let src_wc_ns =
+        (src.vt_hres_sec as i64) * 1_000_000_000 + (src.vt_hres_ns as i64);
+    let dst_wc_ns =
+        (dst.vt_hres_sec as i64) * 1_000_000_000 + (dst.vt_hres_ns as i64);
     let migrate_delta_ns = (dst_wc_ns - src_wc_ns).max(0);
 
     let new_boot_hrtime = dst.vt_hrtime - (guest_uptime + migrate_delta_ns);
@@ -322,11 +338,13 @@ pub fn import_time_data(
         0
     };
     // Scale the source TSC to the destination's frequency
-    let scaled_guest_tsc = if dst.vt_guest_freq != src.vt_guest_freq && src.vt_guest_freq > 0 {
-        (src.vt_guest_tsc as u128 * dst.vt_guest_freq as u128 / src.vt_guest_freq as u128) as u64
-    } else {
-        src.vt_guest_tsc
-    };
+    let scaled_guest_tsc =
+        if dst.vt_guest_freq != src.vt_guest_freq && src.vt_guest_freq > 0 {
+            (src.vt_guest_tsc as u128 * dst.vt_guest_freq as u128
+                / src.vt_guest_freq as u128) as u64
+        } else {
+            src.vt_guest_tsc
+        };
     let new_guest_tsc = scaled_guest_tsc.wrapping_add(tsc_delta);
 
     slog::info!(log, "VMM_TIME adjust";
@@ -360,9 +378,9 @@ pub fn import_time_data(
 
     // Write adjusted time data
     let adjusted_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(
+        slice::from_raw_parts(
             &adjusted as *const _ as *const u8,
-            std::mem::size_of::<vdi_time_info_v1>(),
+            size_of::<vdi_time_info_v1>(),
         )
     };
     write_class_all(hdl, VDC_VMM_TIME, 1, adjusted_bytes)?;
@@ -406,7 +424,8 @@ pub fn export_device_state(
         };
 
         // MSRs: bulk read via VDC_MSR returns vdi_field_entry_v1 array
-        let msrs = match hdl.data_op(VDC_MSR, 1)
+        let msrs = match hdl
+            .data_op(VDC_MSR, 1)
             .for_vcpu(vcpuid)
             .read_all::<vdi_field_entry_v1>()
         {
@@ -431,7 +450,8 @@ pub fn export_device_state(
         };
 
         // VMM_ARCH: pending interrupt state (NMI, EXTINT, exceptions)
-        let vmm_arch = match hdl.data_op(bhyve_api::VDC_VMM_ARCH, 1)
+        let vmm_arch = match hdl
+            .data_op(bhyve_api::VDC_VMM_ARCH, 1)
             .for_vcpu(vcpuid)
             .read_all::<vdi_field_entry_v1>()
         {
@@ -510,7 +530,12 @@ pub fn export_device_state(
         }
     }
 
-    Ok(DeviceState { vcpus, devices, virtio_queues: Vec::new(), nvme_controllers: Vec::new() })
+    Ok(DeviceState {
+        vcpus,
+        devices,
+        virtio_queues: Vec::new(),
+        nvme_controllers: Vec::new(),
+    })
 }
 
 /// Import all kernel device state (per-vCPU + system devices).
@@ -524,7 +549,9 @@ pub fn import_device_state(
     // Import system device state FIRST (IOAPIC must be ready before LAPIC)
     for dev in &state.devices {
         if !dev.data.is_empty() {
-            if let Err(e) = write_class_all(hdl, dev.class, dev.version, &dev.data) {
+            if let Err(e) =
+                write_class_all(hdl, dev.class, dev.version, &dev.data)
+            {
                 slog::warn!(log, "device import failed";
                     "device" => &dev.name, "error" => %e,
                 );
@@ -538,16 +565,19 @@ pub fn import_device_state(
     // MSRs before registers for GS_BASE/KERNEL_GS_BASE/STAR/LSTAR.
     // LAPIC before registers so timer state is correct.
     for vcpu_state in &state.vcpus {
-        let vcpu = Vcpu::new_for_thread(
-            vcpu_state.vcpuid,
-            Arc::clone(hdl),
-        );
+        let vcpu = Vcpu::new_for_thread(vcpu_state.vcpuid, Arc::clone(hdl));
 
         // 1. MSRs first
         if !vcpu_state.msrs.is_empty() {
-            let entry_size = std::mem::size_of::<vdi_field_entry_v1>();
-            if vcpu_state.msrs.len() % entry_size == 0 {
-                if let Err(e) = write_class_vcpu(hdl, VDC_MSR, 1, vcpu_state.vcpuid, &vcpu_state.msrs) {
+            let entry_size = size_of::<vdi_field_entry_v1>();
+            if vcpu_state.msrs.len().is_multiple_of(entry_size) {
+                if let Err(e) = write_class_vcpu(
+                    hdl,
+                    VDC_MSR,
+                    1,
+                    vcpu_state.vcpuid,
+                    &vcpu_state.msrs,
+                ) {
                     slog::warn!(log, "MSR import failed";
                         "vcpu" => vcpu_state.vcpuid, "error" => %e,
                     );
@@ -570,7 +600,13 @@ pub fn import_device_state(
             slog::debug!(log, "LAPIC import";
                 "vcpu" => vcpu_state.vcpuid, "bytes" => lapic_data.len(),
             );
-            match write_class_vcpu(hdl, VDC_LAPIC, 1, vcpu_state.vcpuid, &lapic_data) {
+            match write_class_vcpu(
+                hdl,
+                VDC_LAPIC,
+                1,
+                vcpu_state.vcpuid,
+                &lapic_data,
+            ) {
                 Ok(()) => slog::debug!(log, "LAPIC import complete";
                     "vcpu" => vcpu_state.vcpuid,
                 ),
@@ -608,10 +644,14 @@ pub fn import_device_state(
 
         // 5. VMM_ARCH (pending interrupt state)
         if !vcpu_state.vmm_arch.is_empty() {
-            let entry_size = std::mem::size_of::<vdi_field_entry_v1>();
-            if vcpu_state.vmm_arch.len() % entry_size == 0 {
+            let entry_size = size_of::<vdi_field_entry_v1>();
+            if vcpu_state.vmm_arch.len().is_multiple_of(entry_size) {
                 if let Err(e) = write_class_vcpu(
-                    hdl, bhyve_api::VDC_VMM_ARCH, 1, vcpu_state.vcpuid, &vcpu_state.vmm_arch
+                    hdl,
+                    bhyve_api::VDC_VMM_ARCH,
+                    1,
+                    vcpu_state.vcpuid,
+                    &vcpu_state.vmm_arch,
                 ) {
                     slog::warn!(log, "VMM_ARCH import failed";
                         "vcpu" => vcpu_state.vcpuid, "error" => %e,
@@ -623,7 +663,6 @@ pub fn import_device_state(
 
     Ok(())
 }
-
 
 // Suppress unused import warnings for the constants list -- they
 // document which classes we *could* use even if VCPU_CLASSES is

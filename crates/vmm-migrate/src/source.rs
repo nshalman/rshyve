@@ -26,8 +26,12 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::{MemCtx, RegionKind};
 
 use crate::codec::{
-    CpuFeatures, MemRegionDesc, Message, MigrateError, MigrationPreamble,
-    ProtocolOffer, ProtocolSelect, PAGE_BATCH_FLAG_ZSTD,
+    CpuFeatures, Message, MigrateError, MigrationPreamble, ProtocolOffer,
+    ProtocolSelect, PAGE_BATCH_FLAG_ZSTD,
+};
+use crate::limits;
+use crate::pages::{
+    are_contiguous, build_contiguous_gpas, page_buffer_len, read_pages,
 };
 use crate::protocol::{PageIter, PAGE_SIZE, PROTOCOL_RON_V0};
 use crate::state;
@@ -36,6 +40,7 @@ use crate::MigrationStatus;
 
 /// Number of pages per batch for PageBatch messages.
 const BATCH_SIZE: usize = 64;
+const _: () = assert!(BATCH_SIZE <= limits::MAX_PAGES_PER_BATCH as usize);
 /// zstd compression level (1 = fastest, good ratio for RAM).
 const ZSTD_LEVEL: i32 = 1;
 
@@ -61,23 +66,34 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // Upgrade to WebSocket (client role)
-    let (ws, _) = tokio_tungstenite::client_async(
+    let (ws, _) = tokio_tungstenite::client_async_with_config(
         "ws://migration/live",
         stream,
+        Some(limits::ws_config()),
     )
     .await
-    .map_err(|e| MigrateError::WebSocket(format!(
-        "WebSocket upgrade failed: {e}"
-    )))?;
+    .map_err(|e| {
+        MigrateError::WebSocket(format!("WebSocket upgrade failed: {e}"))
+    })?;
 
     let result = run_source_inner(
-        ws, &hdl, memctx, num_cpus, mem_size, &status, log, cpu_baseline,
+        ws,
+        &hdl,
+        memctx,
+        num_cpus,
+        mem_size,
+        &status,
+        log,
+        cpu_baseline,
     )
     .await;
 
     // On error after pause, resume the VM so the guest keeps running.
     if result.is_err() {
-        let phase = status.lock().map(|s| s.phase).unwrap_or(MigrationPhase::Error);
+        let phase = status
+            .lock()
+            .map(|s| s.phase)
+            .unwrap_or(MigrationPhase::Error);
         if phase as u8 >= MigrationPhase::Pause as u8 {
             // best-effort: if resume fails, VM is already in bad state
             let _ = hdl.resume();
@@ -122,7 +138,7 @@ async fn run_source_inner<S: AsyncRead + AsyncWrite + Unpin>(
 
     // Send preamble with CPU features masked by the baseline.
     // This reflects what the guest sees, not the raw host features.
-    let baseline = vmm_core::cpuid::CpuBaseline::from_str(cpu_baseline)
+    let baseline = vmm_core::cpuid::CpuBaseline::parse(cpu_baseline)
         .unwrap_or(vmm_core::cpuid::CpuBaseline::Host);
     let (l1_ecx, l1_edx, l7_ebx, l7_ecx, l7_edx, xcr0) =
         vmm_core::cpuid::query_masked_features(baseline);
@@ -184,9 +200,8 @@ async fn run_source_inner<S: AsyncRead + AsyncWrite + Unpin>(
 
     // ── Phase: Pause ──────────────────────────────────────────────
     set_phase(status, MigrationPhase::Pause);
-    hdl.pause().map_err(|e| {
-        MigrateError::Io(format!("pause failed: {e}"))
-    })?;
+    hdl.pause()
+        .map_err(|e| MigrateError::Io(format!("pause failed: {e}")))?;
 
     // ── Phase: RamPushPostPause ───────────────────────────────────
     set_phase(status, MigrationPhase::RamPushPostPause);
@@ -353,25 +368,25 @@ async fn send_page_batch<S: AsyncRead + AsyncWrite + Unpin>(
     count: usize,
     status: &Arc<Mutex<MigrationStatus>>,
 ) -> Result<(), MigrateError> {
-    let raw_size = count * PAGE_SIZE;
+    let raw_size = page_buffer_len(count)?;
+    let gpas = build_contiguous_gpas(base_gpa, count)?;
     let mut buf = vec![0u8; raw_size];
-
-    for i in 0..count {
-        let page_gpa = base_gpa + (i * PAGE_SIZE) as u64;
-        let offset = i * PAGE_SIZE;
-        if memctx.read(page_gpa, &mut buf[offset..offset + PAGE_SIZE]).is_err() {
-            // Unmapped page — zeros already in buffer
-        }
-    }
+    read_pages(memctx, &gpas, &mut buf)?;
 
     let (data, flags) = compress_batch(&buf);
 
-    ws.send(Message::PageBatch {
-        base_gpa,
-        page_count: count as u32,
-        flags,
-        data,
-    }.encode()).await?;
+    ws.send(
+        Message::PageBatch {
+            base_gpa,
+            page_count: u32::try_from(count).map_err(|_| {
+                MigrateError::Codec(format!("invalid page count: {count}"))
+            })?,
+            flags,
+            data,
+        }
+        .encode(),
+    )
+    .await?;
 
     if let Ok(mut s) = status.lock() {
         s.pages_transferred += count as u64;
@@ -396,11 +411,11 @@ async fn send_page_batch_sparse<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     }
 
+    let raw_size = page_buffer_len(gpas.len())?;
+
     // Check if pages are contiguous — use simple batch if so
     let base = gpas[0];
-    let is_contiguous = gpas.iter().enumerate().all(|(i, &g)| {
-        g == base + (i * PAGE_SIZE) as u64
-    });
+    let is_contiguous = are_contiguous(gpas);
 
     if is_contiguous {
         return send_page_batch(ws, memctx, base, gpas.len(), status).await;
@@ -408,26 +423,25 @@ async fn send_page_batch_sparse<S: AsyncRead + AsyncWrite + Unpin>(
 
     // Sparse: send GPA list as MemXfer header, then PageBatch with packed data
     let count = gpas.len();
-    let raw_size = count * PAGE_SIZE;
     let mut buf = vec![0u8; raw_size];
-
-    for (i, &gpa) in gpas.iter().enumerate() {
-        let offset = i * PAGE_SIZE;
-        if memctx.read(gpa, &mut buf[offset..offset + PAGE_SIZE]).is_err() {
-            // zeros for unmapped
-        }
-    }
+    read_pages(memctx, gpas, &mut buf)?;
 
     let (data, flags) = compress_batch(&buf);
 
     // Send GPA list so destination knows where each page goes
     ws.send(Message::MemFetch(gpas.to_vec()).encode()).await?;
-    ws.send(Message::PageBatch {
-        base_gpa: base,
-        page_count: count as u32,
-        flags,
-        data,
-    }.encode()).await?;
+    ws.send(
+        Message::PageBatch {
+            base_gpa: base,
+            page_count: u32::try_from(count).map_err(|_| {
+                MigrateError::Codec(format!("invalid page count: {count}"))
+            })?,
+            flags,
+            data,
+        }
+        .encode(),
+    )
+    .await?;
 
     if let Ok(mut s) = status.lock() {
         s.pages_transferred += count as u64;

@@ -55,7 +55,11 @@ impl IsoMedia {
     }
 }
 
-pub fn checked_read_range(lba: u64, count: u32, blocks: u64) -> Option<(u64, usize)> {
+pub fn checked_read_range(
+    lba: u64,
+    count: u32,
+    blocks: u64,
+) -> Option<(u64, usize)> {
     let count64 = u64::from(count);
     let end = lba.checked_add(count64)?;
     if end > blocks {
@@ -143,7 +147,8 @@ mod tests {
 
     #[test]
     fn open_rejects_empty_file() {
-        let file = tempfile::NamedTempFile::new().expect("create temporary ISO");
+        let file =
+            tempfile::NamedTempFile::new().expect("create temporary ISO");
         let error = IsoMedia::open(file.path())
             .err()
             .expect("empty ISO must be rejected");
@@ -154,7 +159,8 @@ mod tests {
 
     #[test]
     fn open_computes_block_count() {
-        let file = tempfile::NamedTempFile::new().expect("create temporary ISO");
+        let file =
+            tempfile::NamedTempFile::new().expect("create temporary ISO");
         file.as_file().set_len(4096).expect("size temporary ISO");
 
         let media = IsoMedia::open(file.path()).expect("open temporary ISO");
@@ -163,7 +169,8 @@ mod tests {
 
     #[test]
     fn open_floors_partial_trailing_block() {
-        let file = tempfile::NamedTempFile::new().expect("create temporary ISO");
+        let file =
+            tempfile::NamedTempFile::new().expect("create temporary ISO");
         file.as_file().set_len(4097).expect("size temporary ISO");
 
         let media = IsoMedia::open(file.path()).expect("open temporary ISO");

@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copied from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: crates/bhyve-api/src/lib.rs
+// https://github.com/oxidecomputer/propolis
 
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Result};
@@ -8,8 +12,8 @@ use std::mem::{size_of, size_of_val};
 use std::os::fd::*;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use vmm_api_common::CachedVersion;
 use std::time::Duration;
+use vmm_api_common::CachedVersion;
 
 pub use bhyve_api_sys::*;
 
@@ -52,12 +56,13 @@ impl VmmCtlFd {
 
     /// Query the API version exposed by the kernel VMM.
     pub fn api_version(&self) -> Result<u32> {
-        VERSION_CACHE.get_or_init(|| -> Result<u32> { self.query_api_version() })
+        VERSION_CACHE
+            .get_or_init(|| -> Result<u32> { self.query_api_version() })
     }
 
     /// Perform the actual query of the API version
     fn query_api_version(&self) -> Result<u32> {
-        let vers = self.ioctl_usize(ioctls::VMM_INTERFACE_VERSION, 0)?;
+        let vers = self.ioctl_usize(VMM_INTERFACE_VERSION, 0)?;
 
         // We expect and demand a positive version number from the
         // VMM_INTERFACE_VERSION interface.
@@ -83,7 +88,7 @@ impl VmmCtlFd {
         };
 
         // Safety: We are using the appropriate struct for this ioctl
-        let res = unsafe { self.ioctl(ioctls::VMM_RESV_SET_TARGET, &mut req) };
+        let res = unsafe { self.ioctl(VMM_RESV_SET_TARGET, &mut req) };
 
         match res {
             Err(e) if e.kind() == ErrorKind::Interrupted => {
@@ -100,7 +105,7 @@ impl VmmCtlFd {
         let mut req = vmm_resv_query::default();
 
         // Safety: We are using the appropriate struct for this ioctl
-        unsafe { self.ioctl(ioctls::VMM_RESV_QUERY, &mut req) }?;
+        unsafe { self.ioctl(VMM_RESV_QUERY, &mut req) }?;
 
         Ok(req)
     }
@@ -108,14 +113,14 @@ impl VmmCtlFd {
     /// Destroy VM instance
     pub fn vm_destroy(&self, name: &[u8]) -> Result<()> {
         let mut req = vm_destroy_req::new(name)?;
-        unsafe { self.ioctl(ioctls::VMM_DESTROY_VM, &mut req)? };
+        unsafe { self.ioctl(VMM_DESTROY_VM, &mut req)? };
         Ok(())
     }
 
     /// Check VMM ioctl command against those known to not require any
     /// copyin/copyout to function.
     const fn ioctl_usize_safe(cmd: i32) -> bool {
-        matches!(cmd, ioctls::VMM_INTERFACE_VERSION,)
+        matches!(cmd, VMM_INTERFACE_VERSION,)
     }
 }
 
@@ -194,7 +199,7 @@ impl VmmFd {
     /// Query the API version exposed by the kernel VMM.
     pub fn api_version(&self) -> Result<u32> {
         VERSION_CACHE.get_or_init(|| -> Result<u32> {
-            match self.ioctl_usize(ioctls::VMM_INTERFACE_VERSION, 0) {
+            match self.ioctl_usize(VMM_INTERFACE_VERSION, 0) {
                 Ok(v) => {
                     assert!(v > 0);
                     Ok(v as u32)
@@ -221,12 +226,12 @@ impl VmmFd {
                 tv_sec: time.as_secs() as i64,
                 tv_nsec: i64::from(time.subsec_nanos()),
             };
-            unsafe { self.ioctl(ioctls::VM_RTC_SETTIME, &mut ts) }?;
+            unsafe { self.ioctl(VM_RTC_SETTIME, &mut ts) }?;
             Ok(())
         } else {
             // The old RTC_SETTIME only support seconds precision
             let mut time_sec: u64 = time.as_secs();
-            unsafe { self.ioctl(ioctls::VM_RTC_SETTIME, &mut time_sec) }?;
+            unsafe { self.ioctl(VM_RTC_SETTIME, &mut time_sec) }?;
             Ok(())
         }
     }
@@ -242,12 +247,12 @@ impl VmmFd {
     const fn ioctl_usize_safe(cmd: i32) -> bool {
         matches!(
             cmd,
-            ioctls::VM_PAUSE
-                | ioctls::VM_RESUME
-                | ioctls::VM_DESTROY_SELF
-                | ioctls::VM_SET_AUTODESTRUCT
-                | ioctls::VMM_INTERFACE_VERSION
-                | ioctls::VM_VCPU_BARRIER,
+            VM_PAUSE
+                | VM_RESUME
+                | VM_DESTROY_SELF
+                | VM_SET_AUTODESTRUCT
+                | VMM_INTERFACE_VERSION
+                | VM_VCPU_BARRIER,
         )
     }
 }
@@ -273,7 +278,12 @@ pub struct VmmDataOp<'a> {
 
 impl<'a> VmmDataOp<'a> {
     pub fn new(fd: &'a VmmFd, class: u16, version: u16) -> Self {
-        Self { fd, class, version, vcpuid: None }
+        Self {
+            fd,
+            class,
+            version,
+            vcpuid: None,
+        }
     }
 }
 

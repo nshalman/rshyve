@@ -23,9 +23,9 @@ use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 
 use bhyve_api::{
-    ioctls, ppt_bar_io, ppt_bar_query, ppt_cfg_io, vm_pptdev,
-    vm_pptdev_limits, vm_pptdev_mmio, vm_pptdev_msi, vm_pptdev_msix,
-    PCI_ADDR_IO, PCI_ADDR_MEM32, PCI_ADDR_MEM64,
+    ioctls, ppt_bar_io, ppt_bar_query, ppt_cfg_io, vm_pptdev, vm_pptdev_limits,
+    vm_pptdev_mmio, vm_pptdev_msi, vm_pptdev_msix, PCI_ADDR_IO, PCI_ADDR_MEM32,
+    PCI_ADDR_MEM64,
 };
 
 use vmm_core::common::RWOp;
@@ -141,10 +141,7 @@ impl PciPassthru {
             // Safety: opening a device node with valid C string.
             // Guest-reset re-exec must not inherit passthrough descriptors.
             let fd = unsafe {
-                libc::open(
-                    c_path.as_ptr(),
-                    libc::O_RDWR | libc::O_CLOEXEC,
-                )
+                libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
             };
             if fd < 0 {
                 return Err(Error::last_os_error());
@@ -157,16 +154,11 @@ impl PciPassthru {
         // Safety: vm_pptdev is the correct struct for VM_BIND_PPTDEV.
         // The VM fd and PPT fd are both valid at this point.
         unsafe {
-            ioctl_on_hdl(
-                hdl.as_raw_fd(),
-                ioctls::VM_BIND_PPTDEV,
-                &mut bind_req,
-            )
+            ioctl_on_hdl(hdl.as_raw_fd(), ioctls::VM_BIND_PPTDEV, &mut bind_req)
         }
-        .map_err(|e| {
+        .inspect_err(|_| {
             // Clean up the fd on bind failure.
             unsafe { libc::close(ppt_fd) };
-            e
         })?;
 
         // Query MSI/MSI-X limits.
@@ -202,7 +194,7 @@ impl PciPassthru {
 
         // Query all 6 BARs.
         let mut bars = [BarInfo::default(); BAR_COUNT];
-        for i in 0..BAR_COUNT {
+        for (i, bar) in bars.iter_mut().enumerate() {
             let mut query = ppt_bar_query {
                 pbq_baridx: i as u32,
                 pbq_type: 0,
@@ -210,10 +202,8 @@ impl PciPassthru {
                 pbq_size: 0,
             };
             // Safety: ppt_bar_query is correct for PPT_BAR_QUERY.
-            unsafe {
-                ioctl_on_fd(ppt_fd, ioctls::PPT_BAR_QUERY, &mut query)
-            }?;
-            bars[i] = BarInfo {
+            unsafe { ioctl_on_fd(ppt_fd, ioctls::PPT_BAR_QUERY, &mut query) }?;
+            *bar = BarInfo {
                 bar_type: query.pbq_type,
                 hpa: query.pbq_base,
                 size: query.pbq_size,
@@ -228,14 +218,8 @@ impl PciPassthru {
             prog_if: phys_cfg[9],
             subclass: phys_cfg[0x0A],
             class: phys_cfg[0x0B],
-            sub_vendor_id: u16::from_le_bytes([
-                phys_cfg[0x2C],
-                phys_cfg[0x2D],
-            ]),
-            sub_device_id: u16::from_le_bytes([
-                phys_cfg[0x2E],
-                phys_cfg[0x2F],
-            ]),
+            sub_vendor_id: u16::from_le_bytes([phys_cfg[0x2C], phys_cfg[0x2D]]),
+            sub_device_id: u16::from_le_bytes([phys_cfg[0x2E], phys_cfg[0x2F]]),
         };
         let mut dev_state = DeviceState::new(ident);
 
@@ -355,24 +339,23 @@ impl PciPassthru {
 
     /// Read a register from the physical device config space via ioctl.
     fn ppt_cfg_read(&self, offset: u64, width: u32) -> Result<u32> {
-        let mut cfg_io =
-            ppt_cfg_io { pci_off: offset, pci_width: width, pci_data: 0 };
+        let mut cfg_io = ppt_cfg_io {
+            pci_off: offset,
+            pci_width: width,
+            pci_data: 0,
+        };
         // Safety: ppt_cfg_io is correct for PPT_CFG_READ on our ppt_fd.
-        unsafe {
-            ioctl_on_fd(self.ppt_fd, ioctls::PPT_CFG_READ, &mut cfg_io)
-        }?;
+        unsafe { ioctl_on_fd(self.ppt_fd, ioctls::PPT_CFG_READ, &mut cfg_io) }?;
         Ok(cfg_io.pci_data)
     }
 
     /// Write a register to the physical device config space via ioctl.
-    fn ppt_cfg_write(
-        &self,
-        offset: u64,
-        width: u32,
-        data: u32,
-    ) -> Result<()> {
-        let mut cfg_io =
-            ppt_cfg_io { pci_off: offset, pci_width: width, pci_data: data };
+    fn ppt_cfg_write(&self, offset: u64, width: u32, data: u32) -> Result<()> {
+        let mut cfg_io = ppt_cfg_io {
+            pci_off: offset,
+            pci_width: width,
+            pci_data: data,
+        };
         // Safety: ppt_cfg_io is correct for PPT_CFG_WRITE on our ppt_fd.
         unsafe {
             ioctl_on_fd(self.ppt_fd, ioctls::PPT_CFG_WRITE, &mut cfg_io)
@@ -381,12 +364,7 @@ impl PciPassthru {
     }
 
     /// Map a PPT device BAR into guest physical address space via EPT.
-    fn map_bar_mmio(
-        &self,
-        bar_idx: usize,
-        gpa: u64,
-        len: u64,
-    ) -> Result<()> {
+    fn map_bar_mmio(&self, bar_idx: usize, gpa: u64, len: u64) -> Result<()> {
         let hpa = self.bars[bar_idx].hpa;
         let mut mmio = vm_pptdev_mmio {
             pptfd: self.ppt_fd,
@@ -426,8 +404,7 @@ impl PciPassthru {
 
     /// Program an MSI-X vector in the kernel/hardware.
     fn program_msix_vector(&self, idx: usize, entry: &MsixTableEntry) {
-        let addr =
-            u64::from(entry.addr_lo) | (u64::from(entry.addr_hi) << 32);
+        let addr = u64::from(entry.addr_lo) | (u64::from(entry.addr_hi) << 32);
         let mut msix_req = vm_pptdev_msix {
             vcpu: 0,
             pptfd: self.ppt_fd,
@@ -476,10 +453,8 @@ impl PciPassthru {
             _ => false,
         };
 
-        if should_map {
-            if self.map_bar_mmio(bar_idx, new_gpa, size).is_ok() {
-                mapped[bar_idx] = Some((new_gpa, size));
-            }
+        if should_map && self.map_bar_mmio(bar_idx, new_gpa, size).is_ok() {
+            mapped[bar_idx] = Some((new_gpa, size));
         }
     }
 
@@ -487,8 +462,7 @@ impl PciPassthru {
     fn update_bar_mappings(&self, old_cmd: u16, new_cmd: u16) {
         let mmio_changed =
             (old_cmd & PCI_CMD_MMIO_EN) != (new_cmd & PCI_CMD_MMIO_EN);
-        let io_changed =
-            (old_cmd & PCI_CMD_IO_EN) != (new_cmd & PCI_CMD_IO_EN);
+        let io_changed = (old_cmd & PCI_CMD_IO_EN) != (new_cmd & PCI_CMD_IO_EN);
 
         if !mmio_changed && !io_changed {
             return;
@@ -503,10 +477,8 @@ impl PciPassthru {
                 continue;
             }
 
-            let is_mmio = matches!(
-                bar_info.bar_type,
-                PCI_ADDR_MEM32 | PCI_ADDR_MEM64
-            );
+            let is_mmio =
+                matches!(bar_info.bar_type, PCI_ADDR_MEM32 | PCI_ADDR_MEM64);
             let is_io = bar_info.bar_type == PCI_ADDR_IO;
 
             if (is_mmio && !mmio_changed) || (is_io && !io_changed) {
@@ -523,13 +495,10 @@ impl PciPassthru {
 
                     if now_enabled && addr != 0 {
                         // Map.
-                        if mapped[i].is_none() {
-                            if self
-                                .map_bar_mmio(i, addr, bar_info.size)
-                                .is_ok()
-                            {
-                                mapped[i] = Some((addr, bar_info.size));
-                            }
+                        if mapped[i].is_none()
+                            && self.map_bar_mmio(i, addr, bar_info.size).is_ok()
+                        {
+                            mapped[i] = Some((addr, bar_info.size));
                         }
                     } else {
                         // Unmap.
@@ -549,7 +518,9 @@ impl PciPassthru {
         }
         // MSI cap is 10-14 bytes depending on 64-bit/per-vector mask support.
         // Conservative: check against 24 bytes (max MSI cap size).
-        offset >= self.msi_cap_off && offset < self.msi_cap_off + 24
+        let offset = usize::from(offset);
+        let cap_off = usize::from(self.msi_cap_off);
+        offset >= cap_off && offset < cap_off + 24
     }
 
     /// Check whether an offset falls in the MSI-X capability range.
@@ -558,7 +529,9 @@ impl PciPassthru {
             return false;
         }
         // MSI-X cap is 12 bytes.
-        offset >= self.msix_cap_off && offset < self.msix_cap_off + 12
+        let offset = usize::from(offset);
+        let cap_off = usize::from(self.msix_cap_off);
+        offset >= cap_off && offset < cap_off + 12
     }
 
     /// Read from the emulated MSI-X table.
@@ -609,9 +582,8 @@ impl PciPassthru {
             pbi_data: 0,
         };
         // Safety: ppt_bar_io is correct for PPT_BAR_READ.
-        let _ = unsafe {
-            ioctl_on_fd(self.ppt_fd, ioctls::PPT_BAR_READ, &mut io)
-        };
+        let _ =
+            unsafe { ioctl_on_fd(self.ppt_fd, ioctls::PPT_BAR_READ, &mut io) };
         io.pbi_data
     }
 
@@ -624,9 +596,8 @@ impl PciPassthru {
             pbi_data: data,
         };
         // Safety: ppt_bar_io is correct for PPT_BAR_WRITE.
-        let _ = unsafe {
-            ioctl_on_fd(self.ppt_fd, ioctls::PPT_BAR_WRITE, &mut io)
-        };
+        let _ =
+            unsafe { ioctl_on_fd(self.ppt_fd, ioctls::PPT_BAR_WRITE, &mut io) };
     }
 }
 
@@ -650,10 +621,7 @@ impl PciDevice for PciPassthru {
             // physical status (high 16).
             0x04 => {
                 let cmd = *self.command.lock().expect("command lock");
-                let status = self
-                    .ppt_cfg_read(0x06, 2)
-                    .unwrap_or(0)
-                    as u16;
+                let status = self.ppt_cfg_read(0x06, 2).unwrap_or(0) as u16;
                 let val = u32::from(cmd) | (u32::from(status) << 16);
                 extract_bytes(val, offset, len)
             }
@@ -672,8 +640,7 @@ impl PciDevice for PciPassthru {
             // BARs: return from DeviceState (guest-programmed values).
             bar_off @ 0x10..=0x24 if (bar_off & 0x03) == 0 => {
                 let state = self.state.lock().expect("state lock");
-                let val = state.cfg_read(offset, len);
-                val
+                state.cfg_read(offset, len)
             }
 
             // Capabilities pointer: return from cache.
@@ -683,9 +650,7 @@ impl PciDevice for PciPassthru {
             }
 
             // MSI-X capability: return emulated values.
-            off if self.in_msix_cap(off) => {
-                self.cfg_read_msix_cap(offset, len)
-            }
+            off if self.in_msix_cap(off) => self.cfg_read_msix_cap(offset, len),
 
             // MSI capability: return emulated/physical values.
             off if self.in_msi_cap(off) => {
@@ -712,8 +677,8 @@ impl PciDevice for PciPassthru {
                 // Merge the written bytes into the command register.
                 let byte_off = (offset & 0x03) as u32;
                 let mask = size_mask(len) << (byte_off * 8);
-                let merged =
-                    (u32::from(old_cmd) & !mask) | ((val << (byte_off * 8)) & mask);
+                let merged = (u32::from(old_cmd) & !mask)
+                    | ((val << (byte_off * 8)) & mask);
                 let new_cmd = merged as u16;
                 *self.command.lock().expect("command lock") = new_cmd;
 
@@ -728,7 +693,7 @@ impl PciDevice for PciPassthru {
             bar_off @ 0x10..=0x24 if (bar_off & 0x03) == 0 => {
                 let mut state = self.state.lock().expect("state lock");
                 // Capture old address before write.
-                let bar_idx = ((bar_off - 0x10) / 4) as u8;
+                let bar_idx = (bar_off - 0x10) / 4;
                 // For the high half of a 64-bit BAR, we need the real bar index.
                 let _real_idx = bar_idx;
                 // Perform the write via DeviceState.
@@ -768,11 +733,8 @@ impl PciDevice for PciPassthru {
 
             // Everything else: write to physical device.
             _ => {
-                let _ = self.ppt_cfg_write(
-                    u64::from(offset),
-                    u32::from(len),
-                    val,
-                );
+                let _ =
+                    self.ppt_cfg_write(u64::from(offset), u32::from(len), val);
             }
         }
     }
@@ -782,13 +744,10 @@ impl PciDevice for PciPassthru {
         let bar_info = &self.bars[bar_idx];
 
         // Check if this access hits the MSI-X table region.
-        if self.msix_cap_off != 0
-            && bar_idx == self.msix_table_bar as usize
-        {
+        if self.msix_cap_off != 0 && bar_idx == self.msix_table_bar as usize {
             let table_start = self.msix_table_offset as usize;
             let table = self.msix_table.lock().expect("msix_table lock");
-            let table_end =
-                table_start + table.len() * MSIX_ENTRY_SIZE;
+            let table_end = table_start + table.len() * MSIX_ENTRY_SIZE;
             drop(table);
 
             if offset >= table_start && offset < table_end {
@@ -801,15 +760,11 @@ impl PciDevice for PciPassthru {
                         match ro.len() {
                             1 => {
                                 let byte_off = table_off & 0x3;
-                                ro.write_u8(
-                                    (val >> (byte_off * 8)) as u8,
-                                );
+                                ro.write_u8((val >> (byte_off * 8)) as u8);
                             }
                             2 => {
                                 let byte_off = table_off & 0x3;
-                                ro.write_u16(
-                                    (val >> (byte_off * 8)) as u16,
-                                );
+                                ro.write_u16((val >> (byte_off * 8)) as u16);
                             }
                             4 => ro.write_u32(val),
                             _ => ro.write_u32(val),
@@ -898,44 +853,17 @@ impl PciDevice for PciPassthru {
 impl PciPassthru {
     /// Read from the emulated MSI-X capability in config space.
     fn cfg_read_msix_cap(&self, offset: u8, len: u8) -> u32 {
-        let cap_off = self.msix_cap_off;
-        let rel = offset - cap_off;
-        let dword_off = rel & 0xFC;
-
-        match dword_off {
-            // Byte 0: Cap ID, Byte 1: Next Ptr, Bytes 2-3: Message Control.
-            0 => {
-                let cap_id = self.phys_cfg[cap_off as usize];
-                let next_ptr = self.phys_cfg[(cap_off + 1) as usize];
-                let table = self.msix_table.lock().expect("msix_table lock");
-                let table_size =
-                    (table.len() as u16).saturating_sub(1) & 0x7FF;
-                // We always report MSI-X as disabled from the cap read;
-                // the guest enables it via writes.
-                let msg_ctrl = table_size;
-                let val = u32::from(cap_id)
-                    | (u32::from(next_ptr) << 8)
-                    | (u32::from(msg_ctrl) << 16);
-                extract_bytes(val, offset, len)
-            }
-            // Table Offset/BIR.
-            4 => {
-                let val = (self.msix_table_offset & !0x7)
-                    | u32::from(self.msix_table_bar & 0x7);
-                extract_bytes(val, offset, len)
-            }
-            // PBA Offset/BIR: read physical.
-            8 => {
-                let val = u32::from_le_bytes([
-                    self.phys_cfg[(cap_off + 8) as usize],
-                    self.phys_cfg[(cap_off + 9) as usize],
-                    self.phys_cfg[(cap_off + 10) as usize],
-                    self.phys_cfg[(cap_off + 11) as usize],
-                ]);
-                extract_bytes(val, offset, len)
-            }
-            _ => 0,
-        }
+        let table = self.msix_table.lock().expect("msix_table lock");
+        let table_size = (table.len() as u16).saturating_sub(1) & 0x7FF;
+        read_msix_cap(
+            &self.phys_cfg,
+            self.msix_cap_off,
+            self.msix_table_bar,
+            self.msix_table_offset,
+            table_size,
+            offset,
+            len,
+        )
     }
 
     /// Write to the MSI-X capability in config space.
@@ -943,7 +871,10 @@ impl PciPassthru {
     /// Only the Message Control register (enable + function mask) is writable.
     fn cfg_write_msix_cap(&self, offset: u8, len: u8, val: u32) {
         let cap_off = self.msix_cap_off;
-        let dword_off = (offset - cap_off) & 0xFC;
+        let Some(rel) = offset.checked_sub(cap_off) else {
+            return;
+        };
+        let dword_off = rel & 0xFC;
 
         if dword_off == 0 {
             // The writable bits are in Message Control (bytes 2-3 of the
@@ -952,11 +883,7 @@ impl PciPassthru {
             //
             // Write-through to the physical device so the hardware
             // enables/disables MSI-X.
-            let _ = self.ppt_cfg_write(
-                u64::from(offset),
-                u32::from(len),
-                val,
-            );
+            let _ = self.ppt_cfg_write(u64::from(offset), u32::from(len), val);
         }
         // Table BIR and PBA BIR are read-only: ignore writes.
     }
@@ -969,26 +896,19 @@ impl PciPassthru {
         let cap_off = self.msi_cap_off;
 
         // Write through to physical device config space.
-        let _ =
-            self.ppt_cfg_write(u64::from(offset), u32::from(len), val);
+        let _ = self.ppt_cfg_write(u64::from(offset), u32::from(len), val);
 
         // After writing, read back the full MSI config to program the
         // kernel with the complete MSI configuration.
         let msg_ctrl = self
-            .ppt_cfg_read(
-                u64::from(cap_off) + u64::from(MSI_MSG_CTRL_OFF),
-                2,
-            )
+            .ppt_cfg_read(u64::from(cap_off) + u64::from(MSI_MSG_CTRL_OFF), 2)
             .unwrap_or(0) as u16;
         let is_64bit = (msg_ctrl & MSI_MSG_CTRL_64BIT) != 0;
         let numvec_pow = ((msg_ctrl >> 4) & 0x7) as u32;
         let numvec = 1i32 << numvec_pow;
 
         let addr_lo = self
-            .ppt_cfg_read(
-                u64::from(cap_off) + u64::from(MSI_MSG_ADDR_OFF),
-                4,
-            )
+            .ppt_cfg_read(u64::from(cap_off) + u64::from(MSI_MSG_ADDR_OFF), 4)
             .unwrap_or(0);
 
         let (addr, data) = if is_64bit {
@@ -1004,8 +924,7 @@ impl PciPassthru {
                     2,
                 )
                 .unwrap_or(0);
-            let full_addr =
-                u64::from(addr_lo) | (u64::from(addr_hi) << 32);
+            let full_addr = u64::from(addr_lo) | (u64::from(addr_hi) << 32);
             (full_addr, u64::from(data))
         } else {
             let data = self
@@ -1036,14 +955,64 @@ impl PciPassthru {
     }
 }
 
+fn read_msix_cap(
+    phys_cfg: &[u8],
+    cap_off: u8,
+    table_bar: u8,
+    table_offset: u32,
+    table_size: u16,
+    offset: u8,
+    len: u8,
+) -> u32 {
+    let Some(rel) = offset.checked_sub(cap_off) else {
+        return 0;
+    };
+    let dword_off = rel & 0xFC;
+    let cap_idx = usize::from(cap_off);
+
+    match dword_off {
+        // Byte 0: Cap ID, Byte 1: Next Ptr, Bytes 2-3: Message Control.
+        0 => {
+            let cap_id = phys_cfg.get(cap_idx).copied().unwrap_or(0);
+            let next_ptr = cap_idx
+                .checked_add(1)
+                .and_then(|idx| phys_cfg.get(idx))
+                .copied()
+                .unwrap_or(0);
+            // We always report MSI-X as disabled from the cap read;
+            // the guest enables it via writes.
+            let msg_ctrl = table_size;
+            let val = u32::from(cap_id)
+                | (u32::from(next_ptr) << 8)
+                | (u32::from(msg_ctrl) << 16);
+            extract_bytes(val, offset, len)
+        }
+        // Table Offset/BIR.
+        4 => {
+            let val = (table_offset & !0x7) | u32::from(table_bar & 0x7);
+            extract_bytes(val, offset, len)
+        }
+        // PBA Offset/BIR: read physical.
+        8 => {
+            let val = cap_idx
+                .checked_add(8)
+                .and_then(|start| start.checked_add(4).map(|end| (start, end)))
+                .and_then(|(start, end)| phys_cfg.get(start..end))
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(u32::from_le_bytes)
+                .unwrap_or(0);
+            extract_bytes(val, offset, len)
+        }
+        _ => 0,
+    }
+}
+
 impl Drop for PciPassthru {
     fn drop(&mut self) {
         // Unmap all mapped BARs.
         let mapped = self.mapped_bars.lock().expect("mapped_bars lock");
-        for mapping in mapped.iter() {
-            if let Some((gpa, len)) = mapping {
-                let _ = self.unmap_bar_mmio(*gpa, *len);
-            }
+        for (gpa, len) in mapped.iter().flatten() {
+            let _ = self.unmap_bar_mmio(*gpa, *len);
         }
         drop(mapped);
 
@@ -1076,7 +1045,11 @@ unsafe fn ioctl_on_hdl<T>(fd: RawFd, cmd: i32, data: &mut T) -> Result<i32> {
     #[cfg(target_os = "illumos")]
     let ret = libc::ioctl(fd, cmd, data as *mut T as *mut libc::c_void);
     #[cfg(not(target_os = "illumos"))]
-    let ret = libc::ioctl(fd, cmd as libc::c_ulong, data as *mut T as *mut libc::c_void);
+    let ret = libc::ioctl(
+        fd,
+        cmd as libc::c_ulong,
+        data as *mut T as *mut libc::c_void,
+    );
     if ret < 0 {
         Err(Error::last_os_error())
     } else {
@@ -1094,7 +1067,11 @@ unsafe fn ioctl_on_fd<T>(fd: RawFd, cmd: i32, data: &mut T) -> Result<i32> {
     #[cfg(target_os = "illumos")]
     let ret = libc::ioctl(fd, cmd, data as *mut T as *mut libc::c_void);
     #[cfg(not(target_os = "illumos"))]
-    let ret = libc::ioctl(fd, cmd as libc::c_ulong, data as *mut T as *mut libc::c_void);
+    let ret = libc::ioctl(
+        fd,
+        cmd as libc::c_ulong,
+        data as *mut T as *mut libc::c_void,
+    );
     if ret < 0 {
         Err(Error::last_os_error())
     } else {
@@ -1172,7 +1149,7 @@ mod tests {
         // Message Control: table size = 31 (32 vectors, N-1), enable=0
         cfg[0x62] = 0x1F; // bits 7:0 of msg ctrl
         cfg[0x63] = 0x00; // bits 15:8 of msg ctrl
-        // Table Offset/BIR: BAR1, offset 0
+                          // Table Offset/BIR: BAR1, offset 0
         cfg[0x64] = 0x01; // BIR = 1
         cfg[0x65] = 0x00;
         cfg[0x66] = 0x00;
@@ -1279,12 +1256,19 @@ mod tests {
     #[test]
     fn bar_define_from_bar_info() {
         // Test that we correctly create BarDefine from BarInfo.
-        let io_bar = BarInfo { bar_type: PCI_ADDR_IO, hpa: 0x3000, size: 256 };
+        let io_bar = BarInfo {
+            bar_type: PCI_ADDR_IO,
+            hpa: 0x3000,
+            size: 256,
+        };
         assert_eq!(io_bar.bar_type, PCI_ADDR_IO);
         assert!(io_bar.size <= u64::from(u16::MAX));
 
-        let mem32_bar =
-            BarInfo { bar_type: PCI_ADDR_MEM32, hpa: 0xFE00_0000, size: 0x100_0000 };
+        let mem32_bar = BarInfo {
+            bar_type: PCI_ADDR_MEM32,
+            hpa: 0xFE00_0000,
+            size: 0x100_0000,
+        };
         assert_eq!(mem32_bar.bar_type, PCI_ADDR_MEM32);
 
         // 64-bit BAR with 64 GB size (e.g., H100 GPU)
@@ -1319,6 +1303,24 @@ mod tests {
             control: MSIX_VEC_CTRL_MASK,
         };
         assert_ne!(entry.control & MSIX_VEC_CTRL_MASK, 0);
+    }
+
+    #[test]
+    fn passthru_cap_offset_underflow_returns_zero() {
+        let cfg = fake_phys_cfg();
+
+        let value = read_msix_cap(&cfg, 0x60, 1, 0, 31, 0x5F, 4);
+
+        assert_eq!(value, 0);
+    }
+
+    #[test]
+    fn passthru_cap_offset_near_end_of_config_space_does_not_panic() {
+        let cfg = fake_phys_cfg();
+
+        let value = read_msix_cap(&cfg, 0xF7, 1, 0, 31, 0xFF, 4);
+
+        assert_eq!(value, 0);
     }
 
     #[test]

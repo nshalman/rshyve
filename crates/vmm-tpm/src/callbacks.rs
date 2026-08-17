@@ -20,6 +20,7 @@
 use std::ffi::CStr;
 use std::fs::File;
 use std::io::{self, Write};
+use std::mem::size_of;
 use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -61,16 +62,10 @@ pub struct LibtpmsCallbacks {
     >,
     pub tpm_io_init: Option<unsafe extern "C" fn() -> TPM_RESULT>,
     pub tpm_io_getlocality: Option<
-        unsafe extern "C" fn(
-            locality: *mut u32,
-            tpm_number: u32,
-        ) -> TPM_RESULT,
+        unsafe extern "C" fn(locality: *mut u32, tpm_number: u32) -> TPM_RESULT,
     >,
     pub tpm_io_getphysicalpresence: Option<
-        unsafe extern "C" fn(
-            present: *mut u8,
-            tpm_number: u32,
-        ) -> TPM_RESULT,
+        unsafe extern "C" fn(present: *mut u8, tpm_number: u32) -> TPM_RESULT,
     >,
 }
 
@@ -102,15 +97,11 @@ static STATE: OnceLock<CallbackState> = OnceLock::new();
 /// `TPMLIB_MainInit`. Returns an error if libtpms rejects the table
 /// (usually a struct-size mismatch — verify `LibtpmsCallbacks` has
 /// the same field count and layout as the C declaration).
-pub fn register(state_dir: PathBuf, log: Logger) -> Result<(), std::io::Error> {
+pub fn register(state_dir: PathBuf, log: Logger) -> Result<(), io::Error> {
     std::fs::create_dir_all(&state_dir).map_err(|e| {
-        std::io::Error::new(
+        io::Error::new(
             e.kind(),
-            format!(
-                "creating TPM state dir {}: {}",
-                state_dir.display(),
-                e
-            ),
+            format!("creating TPM state dir {}: {}", state_dir.display(), e),
         )
     })?;
 
@@ -121,14 +112,14 @@ pub fn register(state_dir: PathBuf, log: Logger) -> Result<(), std::io::Error> {
             log,
         })
         .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
                 "TPM callbacks already registered",
             )
         })?;
 
     let mut cbs = LibtpmsCallbacks {
-        size_of_struct: std::mem::size_of::<LibtpmsCallbacks>() as i32,
+        size_of_struct: size_of::<LibtpmsCallbacks>() as i32,
         tpm_nvram_init: Some(cb_nvram_init),
         tpm_nvram_loaddata: Some(cb_nvram_loaddata),
         tpm_nvram_storedata: Some(cb_nvram_storedata),
@@ -140,10 +131,10 @@ pub fn register(state_dir: PathBuf, log: Logger) -> Result<(), std::io::Error> {
 
     let rc = unsafe { TPMLIB_RegisterCallbacks(&mut cbs) };
     if rc != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("TPMLIB_RegisterCallbacks failed: {:#x}", rc),
-        ));
+        return Err(io::Error::other(format!(
+            "TPMLIB_RegisterCallbacks failed: {:#x}",
+            rc
+        )));
     }
     Ok(())
 }
@@ -236,7 +227,7 @@ unsafe extern "C" fn cb_nvram_loaddata(
             debug!(s.log, "tpm nv loaddata"; "name" => display_name(name), "bytes" => len);
             0
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
             debug!(s.log, "tpm nv loaddata: no file (fresh state)"; "name" => display_name(name));
             // Tell libtpms: nothing stored. Library manufactures
             // fresh TPM state on the next MainInit.
@@ -306,7 +297,7 @@ unsafe extern "C" fn cb_nvram_deletename(
     };
     match std::fs::remove_file(&path) {
         Ok(()) => 0,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
             // libtpms passes mustExist when it expects the file to be
             // there; a missing file then is a real error. Otherwise
             // not finding the file is fine.
@@ -406,7 +397,7 @@ fn display_name(name: *const c_char) -> String {
 // int padded to 8 bytes, total 64 bytes on x86-64. Mismatch here
 // silently corrupts callbacks at runtime, so make it a build error.
 const _: () = assert!(
-    std::mem::size_of::<LibtpmsCallbacks>() == 64,
+    size_of::<LibtpmsCallbacks>() == 64,
     "LibtpmsCallbacks must be exactly 64 bytes on 64-bit targets — \
      check field count and order against libtpms tpm_library.h"
 );

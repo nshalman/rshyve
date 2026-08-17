@@ -19,6 +19,7 @@
 //! borrows from, preventing use-after-unmap.
 
 use std::io::{Error, ErrorKind, Result};
+use std::mem::{align_of, size_of};
 use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -82,9 +83,12 @@ impl Mapping {
             return Err(Error::last_os_error());
         }
 
-        let ptr =
-            NonNull::new(raw as *mut u8).expect("mmap returned non-NULL");
-        Ok(Self { ptr, len: size, prot: Prot::RW })
+        let ptr = NonNull::new(raw as *mut u8).expect("mmap returned non-NULL");
+        Ok(Self {
+            ptr,
+            len: size,
+            prot: Prot::RW,
+        })
     }
 
     /// Create a new memory mapping from a VMM file descriptor.
@@ -118,10 +122,13 @@ impl Mapping {
             return Err(Error::last_os_error());
         }
 
-        let ptr =
-            NonNull::new(raw as *mut u8).expect("mmap returned non-NULL");
+        let ptr = NonNull::new(raw as *mut u8).expect("mmap returned non-NULL");
 
-        Ok(Self { ptr, len: size, prot })
+        Ok(Self {
+            ptr,
+            len: size,
+            prot,
+        })
     }
 }
 
@@ -209,13 +216,13 @@ impl SubMapping {
                 "mapping is not readable",
             ));
         }
-        if self.len < std::mem::size_of::<T>() {
+        if self.len < size_of::<T>() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "mapping too small for requested type",
             ));
         }
-        if (self.ptr.as_ptr() as usize) % std::mem::align_of::<T>() != 0 {
+        if !(self.ptr.as_ptr() as usize).is_multiple_of(align_of::<T>()) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "mapping not aligned for requested type",
@@ -224,9 +231,8 @@ impl SubMapping {
 
         // Safety: bounds and alignment checked above. We use
         // read_volatile because guest vCPUs may write concurrently.
-        let val = unsafe {
-            std::ptr::read_volatile(self.ptr.as_ptr() as *const T)
-        };
+        let val =
+            unsafe { std::ptr::read_volatile(self.ptr.as_ptr() as *const T) };
         Ok(val)
     }
 
@@ -240,13 +246,13 @@ impl SubMapping {
                 "mapping is not writable",
             ));
         }
-        if self.len < std::mem::size_of::<T>() {
+        if self.len < size_of::<T>() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "mapping too small for requested type",
             ));
         }
-        if (self.ptr.as_ptr() as usize) % std::mem::align_of::<T>() != 0 {
+        if !(self.ptr.as_ptr() as usize).is_multiple_of(align_of::<T>()) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "mapping not aligned for requested type",
@@ -280,10 +286,9 @@ impl SubMapping {
         // guest memory is concurrently mutable by vCPUs; non-volatile
         // copies may be optimized in ways that miss concurrent writes.
         let src = self.ptr.as_ptr();
-        let n = buf.len();
-        for i in 0..n {
+        for (i, byte) in buf.iter_mut().enumerate() {
             unsafe {
-                buf[i] = std::ptr::read_volatile(src.add(i));
+                *byte = std::ptr::read_volatile(src.add(i));
             }
         }
         Ok(())
@@ -341,10 +346,9 @@ impl SubMapping {
         // guest memory is concurrently readable by vCPUs; non-volatile
         // copies may be reordered or elided by the optimizer.
         let dst = self.ptr.as_ptr();
-        let n = data.len();
-        for i in 0..n {
+        for (i, byte) in data.iter().enumerate() {
             unsafe {
-                std::ptr::write_volatile(dst.add(i), data[i]);
+                std::ptr::write_volatile(dst.add(i), *byte);
             }
         }
         Ok(())
@@ -394,6 +398,12 @@ pub struct PhysMap {
     next_segid: i32,
 }
 
+impl Default for PhysMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PhysMap {
     pub fn new() -> Self {
         Self {
@@ -416,7 +426,10 @@ impl PhysMap {
             Error::new(ErrorKind::InvalidInput, "region length exceeds u64")
         })?;
         gpa.checked_add(len64).ok_or_else(|| {
-            Error::new(ErrorKind::InvalidInput, "region overflows address space")
+            Error::new(
+                ErrorKind::InvalidInput,
+                "region overflows address space",
+            )
         })?;
 
         Ok(Self {
@@ -473,7 +486,10 @@ impl PhysMap {
 
         // Check for overlap with existing regions
         let end = gpa.checked_add(len as u64).ok_or_else(|| {
-            Error::new(ErrorKind::InvalidInput, "region overflows address space")
+            Error::new(
+                ErrorKind::InvalidInput,
+                "region overflows address space",
+            )
         })?;
         for r in &self.regions {
             let r_end = r.gpa + r.len as u64;
@@ -510,13 +526,16 @@ impl PhysMap {
             .binary_search_by_key(&gpa, |r| r.gpa)
             .unwrap_or_else(|idx| idx);
 
-        self.regions.insert(insert_idx, Region {
-            gpa,
-            len,
-            kind,
-            segid,
-            mapping: Arc::new(mapping),
-        });
+        self.regions.insert(
+            insert_idx,
+            Region {
+                gpa,
+                len,
+                kind,
+                segid,
+                mapping: Arc::new(mapping),
+            },
+        );
 
         Ok(())
     }
@@ -592,7 +611,9 @@ pub struct SegidAlloc {
 impl SegidAlloc {
     /// Start allocating at the next unused segment ID from [`PhysMap`].
     pub fn new(start: i32) -> Self {
-        Self { next: std::sync::atomic::AtomicI32::new(start) }
+        Self {
+            next: std::sync::atomic::AtomicI32::new(start),
+        }
     }
 
     /// Allocate a segment ID, or return `None` at the kernel limit.
@@ -669,6 +690,11 @@ impl DevMemSeg {
         self.len
     }
 
+    /// Whether the memory segment is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Return a guest-visible view of the host mapping.
     pub fn view(&self) -> SubMapping {
         SubMapping::new(&self.host)
@@ -676,7 +702,10 @@ impl DevMemSeg {
 
     /// Return the GPA where the segment is currently mapped, if any.
     pub fn mapped_gpa(&self) -> Option<u64> {
-        *self.mapped_gpa.lock().expect("devmem mapping lock poisoned")
+        *self
+            .mapped_gpa
+            .lock()
+            .expect("devmem mapping lock poisoned")
     }
 
     /// Map the segment into the guest physical address space.
@@ -688,8 +717,10 @@ impl DevMemSeg {
             return Ok(());
         };
 
-        let mut mapped =
-            self.mapped_gpa.lock().expect("devmem mapping lock poisoned");
+        let mut mapped = self
+            .mapped_gpa
+            .lock()
+            .expect("devmem mapping lock poisoned");
         if *mapped == Some(gpa) {
             return Ok(());
         }

@@ -11,9 +11,14 @@ pub use super::decode::{
     cmd_table_len, parse_cmd_hdr, parse_prdt, CmdHdr, HdrError, Prd, PrdtError,
 };
 use super::{reset_port_state, AhciCtrl, AhciState};
+use std::mem::size_of;
 use vmm_core::mem::SubMapping;
 
-pub fn build_d2h_fis(cfis: &[u8; FIS_D2H_LEN], tfd: u32, intr: bool) -> [u8; FIS_D2H_LEN] {
+pub fn build_d2h_fis(
+    cfis: &[u8; FIS_D2H_LEN],
+    tfd: u32,
+    intr: bool,
+) -> [u8; FIS_D2H_LEN] {
     let mut fis = [0u8; FIS_D2H_LEN];
     fis[0] = FIS_TYPE_REGD2H;
     fis[1] = if intr { 0x40 } else { 0 };
@@ -145,7 +150,7 @@ impl AhciCtrl {
         let Some(address) = base.checked_add(offset as u64) else {
             return false;
         };
-        let Some(sub) = self.physmap.lookup(address, std::mem::size_of::<u32>()) else {
+        let Some(sub) = self.physmap.lookup(address, size_of::<u32>()) else {
             return false;
         };
         sub.write_bytes(&bytes.to_le_bytes()).is_ok()
@@ -200,22 +205,16 @@ impl AhciCtrl {
     fn scatter_to_prdt(&self, prds: &[Prd], data: &[u8]) -> Option<usize> {
         let mut transferred = 0usize;
         for prd in prds {
-            let Some(remaining) = data.get(transferred..) else {
-                return None;
-            };
+            let remaining = data.get(transferred..)?;
             if remaining.is_empty() {
                 break;
             }
             let chunk = remaining.len().min(prd.len as usize);
-            let Some(sub) = self.physmap.lookup(prd.dba, chunk) else {
-                return None;
-            };
+            let sub = self.physmap.lookup(prd.dba, chunk)?;
             if sub.write_bytes(&remaining[..chunk]).is_err() {
                 return None;
             }
-            let Some(next) = transferred.checked_add(chunk) else {
-                return None;
-            };
+            let next = transferred.checked_add(chunk)?;
             transferred = next;
         }
         Some(transferred)
@@ -275,7 +274,8 @@ impl AhciCtrl {
             );
         };
 
-        let mut subs: Vec<(libc::iovec, SubMapping)> = Vec::with_capacity(prds.len());
+        let mut subs: Vec<(libc::iovec, SubMapping)> =
+            Vec::with_capacity(prds.len());
         let mut remaining = bytes;
         for prd in &prds {
             if remaining == 0 {
@@ -304,7 +304,8 @@ impl AhciCtrl {
         }
 
         let want = bytes - remaining;
-        let iovecs: Vec<libc::iovec> = subs.iter().map(|(iov, _)| *iov).collect();
+        let iovecs: Vec<libc::iovec> =
+            subs.iter().map(|(iov, _)| *iov).collect();
         // MMIO dispatch drops its address-space lock before invoking us, so
         // synchronous reads stall only the issuing vCPU and leave no I/O for
         // lifecycle quiescence or reboot paths to drain.
@@ -343,7 +344,9 @@ impl AhciCtrl {
         prdtl: u16,
     ) -> bool {
         let mut acmd = [0u8; ACMD_LEN];
-        acmd.copy_from_slice(&table[CMD_TBL_ACMD_OFF..CMD_TBL_ACMD_OFF + ACMD_LEN]);
+        acmd.copy_from_slice(
+            &table[CMD_TBL_ACMD_OFF..CMD_TBL_ACMD_OFF + ACMD_LEN],
+        );
         let mut sense = SenseState {
             key: st.port.sense_key,
             asc: st.port.asc,
@@ -367,7 +370,8 @@ impl AhciCtrl {
                         ASC_INVALID_FIELD_IN_CDB,
                     );
                 };
-                let Some(transferred) = self.scatter_to_prdt(&prds, &buf) else {
+                let Some(transferred) = self.scatter_to_prdt(&prds, &buf)
+                else {
                     return self.complete_packet_check(
                         st,
                         slot,
@@ -379,9 +383,8 @@ impl AhciCtrl {
                 self.record_prdbc(st, slot, transferred as u32);
                 self.complete_atapi(st, slot, cfis, TFD_OK)
             }
-            AtapiOutcome::ReadBlocks { lba, count } => {
-                self.read_packet_blocks(st, slot, cfis, table, prdtl, lba, count)
-            }
+            AtapiOutcome::ReadBlocks { lba, count } => self
+                .read_packet_blocks(st, slot, cfis, table, prdtl, lba, count),
             AtapiOutcome::Check { sense_key, asc } => {
                 self.complete_packet_check(st, slot, cfis, sense_key, asc)
             }
@@ -470,7 +473,8 @@ impl AhciCtrl {
                 let mut needs_intr =
                     self.write_fis(st, FIS_OFF_PSFIS, &build_piosetup_fis());
                 let identify = identify_packet_device(self.media.serial());
-                let Some(transferred) = self.scatter_to_prdt(&prds, &identify) else {
+                let Some(transferred) = self.scatter_to_prdt(&prds, &identify)
+                else {
                     return self.complete_packet_check(
                         st,
                         slot,
@@ -483,10 +487,16 @@ impl AhciCtrl {
                 needs_intr |= self.complete_atapi(st, slot, &mut cfis, TFD_OK);
                 needs_intr
             }
-            ATA_PACKET_CMD => self.handle_packet_command(st, slot, &mut cfis, table, prdtl),
-            ATA_ATA_IDENTIFY => self.complete_atapi(st, slot, &mut cfis, TFD_ABORT),
+            ATA_PACKET_CMD => {
+                self.handle_packet_command(st, slot, &mut cfis, table, prdtl)
+            }
+            ATA_ATA_IDENTIFY => {
+                self.complete_atapi(st, slot, &mut cfis, TFD_ABORT)
+            }
             ATA_SETFEATURES => {
-                let tfd = if cfis[3] == 0x03 || (cfis[3] == 0x10 && cfis[12] == 0x05) {
+                let tfd = if cfis[3] == 0x03
+                    || (cfis[3] == 0x10 && cfis[12] == 0x05)
+                {
                     TFD_OK
                 } else {
                     TFD_ABORT
@@ -503,7 +513,9 @@ impl AhciCtrl {
             | ATA_IDLE_CMD
             | ATA_SLEEP
             | ATA_READ_VERIFY
-            | ATA_READ_VERIFY48 => self.complete_atapi(st, slot, &mut cfis, TFD_OK),
+            | ATA_READ_VERIFY48 => {
+                self.complete_atapi(st, slot, &mut cfis, TFD_OK)
+            }
             ATA_NOP | ATA_SMART_CMD | ATA_SECURITY_FREEZE_LOCK => {
                 self.complete_atapi(st, slot, &mut cfis, TFD_ABORT)
             }
@@ -543,8 +555,8 @@ impl AhciCtrl {
                 break;
             }
             let ccs = st.port.ci.trailing_zeros() as usize;
-            st.port.cmd =
-                (st.port.cmd & !PXCMD_CCS_MASK) | ((ccs as u32) << PXCMD_CCS_SHIFT);
+            st.port.cmd = (st.port.cmd & !PXCMD_CCS_MASK)
+                | ((ccs as u32) << PXCMD_CCS_SHIFT);
             needs_intr |= self.handle_slot(st, ccs);
         }
         needs_intr
@@ -566,7 +578,8 @@ mod tests {
     const TEST_CTBA: u64 = 0x3000;
 
     fn test_controller(physmap: Arc<PhysMap>) -> Arc<AhciCtrl> {
-        let file = tempfile::NamedTempFile::new().expect("create temporary ISO");
+        let file =
+            tempfile::NamedTempFile::new().expect("create temporary ISO");
         file.as_file().set_len(4096).expect("size temporary ISO");
         AhciCtrl::new(
             IsoMedia::open(file.path()).expect("open temporary ISO"),
@@ -603,7 +616,8 @@ mod tests {
     fn packet_table(prdtl: u16, cdb: &[u8]) -> Vec<u8> {
         let mut table = vec![0u8; cmd_table_len(prdtl).expect("bounded PRDTL")];
         table[..FIS_D2H_LEN].copy_from_slice(&command_fis(ATA_PACKET_CMD));
-        table[CMD_TBL_ACMD_OFF..CMD_TBL_ACMD_OFF + cdb.len()].copy_from_slice(cdb);
+        table[CMD_TBL_ACMD_OFF..CMD_TBL_ACMD_OFF + cdb.len()]
+            .copy_from_slice(cdb);
         table
     }
 
@@ -630,8 +644,13 @@ mod tests {
         st.port.cmd = PXCMD_ST | PXCMD_CR | PXCMD_FRE | PXCMD_FR;
         st.port.ci = 1;
 
-        let needs_intr =
-            ctrl.handle_command_fis(&mut st, 0, command_fis(ATA_PACKET_CMD), table, prdtl);
+        let needs_intr = ctrl.handle_command_fis(
+            &mut st,
+            0,
+            command_fis(ATA_PACKET_CMD),
+            table,
+            prdtl,
+        );
 
         assert!(!needs_intr);
         assert_ne!(st.port.tfd & ATA_S_ERROR, 0);
@@ -775,7 +794,8 @@ mod tests {
     #[test]
     fn command_table_straddling_region_aborts_and_clears_ci() {
         let region_end = TEST_CTBA + CMD_TBL_PRDT_OFF as u64 - 1;
-        let ctrl = anonymous_controller(TEST_CLB, (region_end - TEST_CLB) as usize);
+        let ctrl =
+            anonymous_controller(TEST_CLB, (region_end - TEST_CLB) as usize);
         write_guest(&ctrl, TEST_CLB, &command_header(0, TEST_CTBA));
 
         let needs_intr = start_slot_zero(&ctrl, TEST_CLB);
@@ -804,8 +824,10 @@ mod tests {
     #[test]
     fn max_dba_with_nonzero_dbc_completes_with_error() {
         let mut table = packet_table(1, &[SCSI_INQUIRY, 0, 0, 0, 36]);
-        table[CMD_TBL_PRDT_OFF..CMD_TBL_PRDT_OFF + 8].copy_from_slice(&u64::MAX.to_le_bytes());
-        table[CMD_TBL_PRDT_OFF + 12..CMD_TBL_PRDT_OFF + 16].copy_from_slice(&1u32.to_le_bytes());
+        table[CMD_TBL_PRDT_OFF..CMD_TBL_PRDT_OFF + 8]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        table[CMD_TBL_PRDT_OFF + 12..CMD_TBL_PRDT_OFF + 16]
+            .copy_from_slice(&1u32.to_le_bytes());
 
         assert_packet_table_error(&table, 1);
     }
@@ -815,7 +837,8 @@ mod tests {
         let mut table = packet_table(1, &[SCSI_INQUIRY, 0, 0, 0, 36]);
         table[CMD_TBL_PRDT_OFF..CMD_TBL_PRDT_OFF + 8]
             .copy_from_slice(&(u64::MAX - 1).to_le_bytes());
-        table[CMD_TBL_PRDT_OFF + 12..CMD_TBL_PRDT_OFF + 16].copy_from_slice(&1u32.to_le_bytes());
+        table[CMD_TBL_PRDT_OFF + 12..CMD_TBL_PRDT_OFF + 16]
+            .copy_from_slice(&1u32.to_le_bytes());
 
         assert_packet_table_error(&table, 1);
     }

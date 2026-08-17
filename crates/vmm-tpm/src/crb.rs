@@ -28,9 +28,7 @@ use std::sync::Mutex;
 
 use slog::{debug, info, warn, Logger};
 use vmm_core::common::{RWOp, ReadOp, WriteOp};
-use vmm_tpm_sys::{
-    tpmlib_free, TPMLIB_Process, TPM_RESULT, TPM_SUCCESS,
-};
+use vmm_tpm_sys::{tpmlib_free, TPMLIB_Process, TPM_RESULT, TPM_SUCCESS};
 
 use crate::callbacks;
 
@@ -80,6 +78,8 @@ const LOC_STS_BEEN_SEIZED: u32 = 1 << 1;
 const CTRL_REQ_CMD_READY: u32 = 1 << 0;
 const CTRL_REQ_GO_IDLE: u32 = 1 << 1;
 
+// Retained for the architected CRB status bit even though only IDLE is emitted.
+#[allow(dead_code)]
 const CTRL_STS_TPM_STS: u32 = 1 << 0;
 const CTRL_STS_TPM_IDLE: u32 = 1 << 1;
 
@@ -101,16 +101,16 @@ const CTRL_CANCEL_INVOKE: u32 = 1 << 0;
 ///   InterfaceSelector = 1 (CRB selected)
 ///   RID = 0
 fn intf_id_value() -> u32 {
-    let interface_type = 1u32;        // bits 0..3
-    let interface_version = 1u32;     // bits 4..7
-    let cap_locality = 0u32;          // bit 8
-    let cap_crb_idle_bypass = 0u32;   // bit 9
-    let cap_data_xfer = 3u32;         // bits 11..12
-    let cap_fifo = 0u32;              // bit 13
-    let cap_crb = 1u32;               // bit 14
-    let interface_selector = 1u32;    // bits 17..18
-    let intf_sel_lock = 0u32;         // bit 19
-    let rid = 0u32;                   // bits 24..31
+    let interface_type = 1u32; // bits 0..3
+    let interface_version = 1u32; // bits 4..7
+    let cap_locality = 0u32; // bit 8
+    let cap_crb_idle_bypass = 0u32; // bit 9
+    let cap_data_xfer = 3u32; // bits 11..12
+    let cap_fifo = 0u32; // bit 13
+    let cap_crb = 1u32; // bit 14
+    let interface_selector = 1u32; // bits 17..18
+    let intf_sel_lock = 0u32; // bit 19
+    let rid = 0u32; // bits 24..31
 
     interface_type
         | (interface_version << 4)
@@ -203,8 +203,9 @@ impl Crb {
                 let n = ro.len();
                 if buf_off < BUF_LEN {
                     let take = n.min(BUF_LEN - buf_off);
-                    tmp[..take]
-                        .copy_from_slice(&state.buffer[buf_off..buf_off + take]);
+                    tmp[..take].copy_from_slice(
+                        &state.buffer[buf_off..buf_off + take],
+                    );
                 }
                 match n {
                     1 => ro.write_u8(tmp[0]),
@@ -267,7 +268,12 @@ impl Crb {
         let val = match wo.len() {
             1 => wo.buf()[0] as u32,
             2 => u16::from_le_bytes([wo.buf()[0], wo.buf()[1]]) as u32,
-            4 => u32::from_le_bytes([wo.buf()[0], wo.buf()[1], wo.buf()[2], wo.buf()[3]]),
+            4 => u32::from_le_bytes([
+                wo.buf()[0],
+                wo.buf()[1],
+                wo.buf()[2],
+                wo.buf()[3],
+            ]),
             _ => return, // ignore odd-sized writes; spec disallows them
         };
 
@@ -391,7 +397,10 @@ impl Crb {
 
 #[allow(dead_code)]
 fn _info(log: &Logger) {
-    info!(log, "CRB region @ {:#x}, len {:#x}", CRB_BASE, CRB_REGION_LEN);
+    info!(
+        log,
+        "CRB region @ {:#x}, len {:#x}", CRB_BASE, CRB_REGION_LEN
+    );
 }
 
 #[cfg(test)]
@@ -442,7 +451,10 @@ mod tests {
         let mut i = 0;
         while i + 4 <= bytes.len() {
             let word = u32::from_le_bytes([
-                bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3],
+                bytes[i],
+                bytes[i + 1],
+                bytes[i + 2],
+                bytes[i + 3],
             ]);
             let wo = WriteOp::from_buf(&word.to_le_bytes());
             crb.handle(BUF_OFFSET + i, RWOp::Write(&wo));
@@ -541,9 +553,8 @@ mod tests {
         // Use a unique state directory per run so we always hit the
         // first-boot manufacturing path, irrespective of leftover
         // state from earlier test runs.
-        let dir = std::env::temp_dir().join(format!(
-            "vmm-tpm-crbtest-{}", std::process::id(),
-        ));
+        let dir = std::env::temp_dir()
+            .join(format!("vmm-tpm-crbtest-{}", std::process::id(),));
         let _ = std::fs::remove_dir_all(&dir);
         let tpm = match crate::Tpm::new(dir.clone(), null_logger()) {
             Ok(t) => t,
@@ -570,8 +581,8 @@ mod tests {
         //    after power-on. 12 bytes:
         //       tag=8001  size=0000000C  cc=00000144  startup=0000
         let startup: [u8; 12] = [
-            0x80, 0x01, 0x00, 0x00, 0x00, 0x0C,
-            0x00, 0x00, 0x01, 0x44, 0x00, 0x00,
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x44, 0x00,
+            0x00,
         ];
         write_buffer(crb, &startup);
         write_reg(crb, REG_CTRL_START, CTRL_START_INVOKE);
@@ -584,8 +595,8 @@ mod tests {
 
         // 4. TPM2_GetRandom(8) — request 8 random bytes.
         let cmd: [u8; 12] = [
-            0x80, 0x01, 0x00, 0x00, 0x00, 0x0C,
-            0x00, 0x00, 0x01, 0x7B, 0x00, 0x08,
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x7B, 0x00,
+            0x08,
         ];
         write_buffer(crb, &cmd);
         write_reg(crb, REG_CTRL_START, CTRL_START_INVOKE);

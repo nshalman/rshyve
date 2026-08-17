@@ -27,8 +27,7 @@ pub use crate::acpi::build_tpm2_table;
 pub use crate::crb::{Crb, CRB_BASE, CRB_REGION_LEN};
 
 use vmm_tpm_sys::{
-    TPMLIB_ChooseTPMVersion, TPMLIB_MainInit,
-    TPMLIB_TPMVersion, TPM_SUCCESS,
+    TPMLIB_ChooseTPMVersion, TPMLIB_MainInit, TPMLIB_TPMVersion, TPM_SUCCESS,
 };
 
 /// Top-level TPM device. Owns the CRB frontend; libtpms backend is

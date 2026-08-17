@@ -10,7 +10,6 @@
 pub mod acpi;
 pub mod acpi_pm;
 pub mod ahci;
-pub mod metrics;
 pub mod aml;
 pub mod bhyve;
 pub mod blkdev;
@@ -19,23 +18,26 @@ pub mod fbuf;
 pub mod fwcfg;
 pub mod input;
 pub mod lifecycle;
+pub mod metrics;
 pub mod migrate;
 pub mod nvme;
+pub mod passthru;
 pub mod pci;
 pub mod ps2;
+pub mod pvpanic;
 pub mod quiesce;
 pub mod smbios;
 pub mod uart;
 pub mod virtio;
-pub mod passthru;
-pub mod pvpanic;
 pub mod xhci;
 
 pub use input::{InputBroker, KeyboardSink, PointerSink};
-pub use lifecycle::{FlushError, FlushIntent, IndicatedState, Indicator, Lifecycle};
-pub use quiesce::{wait_all_quiesced, QuiesceGate, QuiesceReport};
-pub use migrate::{
-    MigrateCtx, MigrateMulti, MigrateSingle, MigrateStateError,
-    Migrator, PayloadOffer, PayloadOffers, PayloadOutput, PayloadOutputs,
-    Schema, SchemaId,
+pub use lifecycle::{
+    FlushError, FlushIntent, IndicatedState, Indicator, Lifecycle,
 };
+pub use migrate::{
+    MigrateCtx, MigrateMulti, MigrateSingle, MigrateStateError, Migrator,
+    PayloadOffer, PayloadOffers, PayloadOutput, PayloadOutputs, Schema,
+    SchemaId,
+};
+pub use quiesce::{wait_all_quiesced, QuiesceGate, QuiesceReport};

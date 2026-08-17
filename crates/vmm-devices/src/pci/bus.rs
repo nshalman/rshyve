@@ -16,6 +16,9 @@ use super::Bdf;
 const SLOTS_PER_BUS: usize = 32;
 const FUNCS_PER_SLOT: usize = 8;
 
+type PciSlot = [Option<Arc<dyn PciDevice>>; FUNCS_PER_SLOT];
+type PciSlots = [PciSlot; SLOTS_PER_BUS];
+
 /// PCI bus holding up to 32 device slots, each with up to 8 functions.
 pub struct PciBus {
     inner: Mutex<PciBusInner>,
@@ -23,16 +26,15 @@ pub struct PciBus {
 
 struct PciBusInner {
     /// 32 slots x 8 functions.
-    slots: Box<[[Option<Arc<dyn PciDevice>>; FUNCS_PER_SLOT]; SLOTS_PER_BUS]>,
+    slots: Box<PciSlots>,
 }
 
 impl PciBus {
     /// Create a new, empty PCI bus.
     pub fn new() -> Arc<Self> {
         // Use Box to avoid a large stack allocation (32 * 8 * sizeof(Option<Arc>)).
-        let slots = Box::new(std::array::from_fn(|_| {
-            std::array::from_fn(|_| None)
-        }));
+        let slots =
+            Box::new(std::array::from_fn(|_| std::array::from_fn(|_| None)));
         Arc::new(Self {
             inner: Mutex::new(PciBusInner { slots }),
         })
@@ -62,11 +64,7 @@ impl PciBus {
         }
 
         let slot = &mut inner.slots[bdf.dev() as usize][bdf.func() as usize];
-        assert!(
-            slot.is_none(),
-            "device already attached at BDF {}",
-            bdf
-        );
+        assert!(slot.is_none(), "device already attached at BDF {}", bdf);
         *slot = Some(dev);
     }
 
@@ -117,9 +115,8 @@ impl PciBus {
 impl Default for PciBus {
     fn default() -> Self {
         // Return the inner PciBus, not an Arc<PciBus>
-        let slots = Box::new(std::array::from_fn(|_| {
-            std::array::from_fn(|_| None)
-        }));
+        let slots =
+            Box::new(std::array::from_fn(|_| std::array::from_fn(|_| None)));
         Self {
             inner: Mutex::new(PciBusInner { slots }),
         }
@@ -182,7 +179,9 @@ mod tests {
                     bus.config_read(&bdf, 0x00, 4),
                     0xFFFF_FFFF,
                     "expected bus float at {}.{}.{}",
-                    0, dev, func,
+                    0,
+                    dev,
+                    func,
                 );
             }
         }

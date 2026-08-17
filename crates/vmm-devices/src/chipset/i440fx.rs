@@ -21,10 +21,10 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::intr_pins::PciIntrPin;
 use vmm_core::pio::{PioBus, PioFn};
 
+use crate::pci::bits;
 use crate::pci::bus::PciBus;
 use crate::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use crate::pci::{BarN, Bdf, PioCfgDecoder};
-use crate::pci::bits;
 
 // ---------------------------------------------------------------------------
 // Intel device IDs
@@ -56,7 +56,8 @@ pub struct I440FxChipset {
     pci_bus: Arc<PciBus>,
     cfg_decoder: PioCfgDecoder,
     post_code: AtomicU8,
-    /// LPC bridge for PIR routing
+    /// LPC bridge retained for future chipset migration-state export.
+    #[allow(dead_code)]
     lpc: Arc<LpcBridge>,
     /// Shared PIR register state for PciIntrPin instances.
     pir_regs: Arc<Mutex<[u8; PIR_COUNT]>>,
@@ -170,14 +171,16 @@ impl I440FxChipset {
     pub fn route_lintr(
         &self,
         bdf: &Bdf,
-    ) -> Option<(crate::pci::INTxPinID, Arc<dyn vmm_core::intr_pins::IntrPin>)> {
+    ) -> Option<(crate::pci::INTxPinID, Arc<dyn vmm_core::intr_pins::IntrPin>)>
+    {
         let hdl = self.hdl.as_ref()?;
         let pin = PciIntrPin::new(
             bdf.dev(),
             0, // INT#A
             self.pir_regs.clone(),
             hdl.clone(),
-            self.log.new(slog::o!("component" => "pci-intr", "slot" => bdf.dev())),
+            self.log
+                .new(slog::o!("component" => "pci-intr", "slot" => bdf.dev())),
         );
         Some((crate::pci::INTxPinID::IntA, pin))
     }
@@ -193,11 +196,9 @@ impl I440FxChipset {
         self.cfg_decoder.service_data(
             port,
             rwo,
-            |bdf, offset, rwo| {
-                match rwo {
+            |bdf, offset, rwo| match rwo {
                 RWOp::Read(ro) => {
-                    let val =
-                        bus.config_read(bdf, offset, ro.len() as u8);
+                    let val = bus.config_read(bdf, offset, ro.len() as u8);
                     match ro.len() {
                         1 => ro.write_u8(val as u8),
                         2 => ro.write_u16(val as u16),
@@ -213,7 +214,7 @@ impl I440FxChipset {
                         wo.read_u32(),
                     );
                 }
-            }},
+            },
         );
     }
 
@@ -293,7 +294,11 @@ impl PciDevice for Hostbridge {
 const PIR_OFFSET: u8 = 0x60;
 const PIR_COUNT: usize = 4;
 /// PIR bit 7 = disable, bits 3:0 = ISA IRQ number.
+// Keep the masks next to the register definition for the pending firmware PIR
+// validation path.
+#[allow(dead_code)]
 const PIR_MASK_DISABLE: u8 = 0x80;
+#[allow(dead_code)]
 const PIR_MASK_IRQ: u8 = 0x0F;
 
 /// ISA/LPC bridge PCI device at slot 1 (Intel PIIX3).
@@ -345,7 +350,10 @@ impl PciDevice for LpcBridge {
     fn cfg_write(&self, offset: u8, len: u8, val: u32) {
         // Handle PIR register writes (0x60-0x63).
         // Just store the value — PciIntrPin reads it dynamically.
-        if offset >= PIR_OFFSET && offset < PIR_OFFSET + PIR_COUNT as u8 && len == 1 {
+        if offset >= PIR_OFFSET
+            && offset < PIR_OFFSET + PIR_COUNT as u8
+            && len == 1
+        {
             let idx = (offset - PIR_OFFSET) as usize;
             let byte = val as u8;
             let mut pir = self.pir_regs.lock().expect("pir lock");
@@ -378,7 +386,13 @@ mod tests {
     }
 
     /// Helper: write a config address, then read 4 bytes of config data.
-    fn cfg_read_dword(pio: &PioBus, bus: u8, dev: u8, func: u8, reg: u8) -> u32 {
+    fn cfg_read_dword(
+        pio: &PioBus,
+        bus: u8,
+        dev: u8,
+        func: u8,
+        reg: u8,
+    ) -> u32 {
         let addr: u32 = 0x8000_0000
             | (u32::from(bus) << 16)
             | (u32::from(dev) << 11)
@@ -456,10 +470,7 @@ mod tests {
         // Slots 2-31 are all empty
         for dev in 2..32u8 {
             let val = cfg_read_dword(&pio, 0, dev, 0, 0x00);
-            assert_eq!(
-                val, 0xFFFF_FFFF,
-                "expected bus float at slot {dev}"
-            );
+            assert_eq!(val, 0xFFFF_FFFF, "expected bus float at slot {dev}");
         }
     }
 
@@ -504,15 +515,14 @@ mod tests {
             fn bar_rw(&self, _: BarN, _: usize, _: RWOp<'_>) {}
         }
 
-        let dev: Arc<dyn PciDevice> = Arc::new(DummyDev(Mutex::new(
-            DeviceState::new(DeviceIdent {
+        let dev: Arc<dyn PciDevice> =
+            Arc::new(DummyDev(Mutex::new(DeviceState::new(DeviceIdent {
                 vendor_id: 0x1AF4,
                 device_id: 0x1000,
                 class: bits::CLASS_NETWORK,
                 subclass: 0,
                 ..Default::default()
-            }),
-        )));
+            }))));
         let bdf = Bdf::new_unchecked(0, 3, 0);
         cs.attach_device(bdf, dev);
 
@@ -542,8 +552,7 @@ mod tests {
             ..Default::default()
         });
         ds.define_bar(BarN::BAR0, crate::pci::BarDefine::Mmio(0x1000));
-        let dev: Arc<dyn PciDevice> =
-            Arc::new(BarDev(Mutex::new(ds)));
+        let dev: Arc<dyn PciDevice> = Arc::new(BarDev(Mutex::new(ds)));
         cs.attach_device(Bdf::new_unchecked(0, 4, 0), dev);
 
         // Write all-ones to BAR0 to probe size

@@ -18,63 +18,67 @@ use super::bits;
 
 /// Device descriptor (18 bytes).
 const DEVICE_DESC: [u8; 18] = [
-    18,                        // bLength
-    bits::USB_DT_DEVICE,       // bDescriptorType
-    0x00, 0x02,                // bcdUSB = 2.00
-    0x00,                      // bDeviceClass (defined at interface level)
-    0x00,                      // bDeviceSubClass
-    0x00,                      // bDeviceProtocol
-    64,                        // bMaxPacketSize0
-    0x5D, 0xFB,                // idVendor = 0xFB5D (little-endian)
-    0x01, 0x00,                // idProduct = 0x0001
-    0x00, 0x01,                // bcdDevice = 1.00
-    1,                         // iManufacturer (string index)
-    2,                         // iProduct (string index)
-    0,                         // iSerialNumber
-    1,                         // bNumConfigurations
+    18,                  // bLength
+    bits::USB_DT_DEVICE, // bDescriptorType
+    0x00,
+    0x02, // bcdUSB = 2.00
+    0x00, // bDeviceClass (defined at interface level)
+    0x00, // bDeviceSubClass
+    0x00, // bDeviceProtocol
+    64,   // bMaxPacketSize0
+    0x5D,
+    0xFB, // idVendor = 0xFB5D (little-endian)
+    0x01,
+    0x00, // idProduct = 0x0001
+    0x00,
+    0x01, // bcdDevice = 1.00
+    1,    // iManufacturer (string index)
+    2,    // iProduct (string index)
+    0,    // iSerialNumber
+    1,    // bNumConfigurations
 ];
 
 /// Configuration descriptor + interface + HID + endpoint (total 34 bytes).
 const CONFIG_DESC: [u8; 34] = [
     // Configuration descriptor (9 bytes)
-    9,                         // bLength
-    bits::USB_DT_CONFIG,       // bDescriptorType
-    34, 0,                     // wTotalLength = 34
-    1,                         // bNumInterfaces
-    1,                         // bConfigurationValue
-    0,                         // iConfiguration
-    0xA0,                      // bmAttributes (bus-powered, remote wakeup)
-    50,                        // bMaxPower (100 mA)
-
+    9,                   // bLength
+    bits::USB_DT_CONFIG, // bDescriptorType
+    34,
+    0,    // wTotalLength = 34
+    1,    // bNumInterfaces
+    1,    // bConfigurationValue
+    0,    // iConfiguration
+    0xA0, // bmAttributes (bus-powered, remote wakeup)
+    50,   // bMaxPower (100 mA)
     // Interface descriptor (9 bytes)
-    9,                         // bLength
-    bits::USB_DT_INTERFACE,    // bDescriptorType
-    0,                         // bInterfaceNumber
-    0,                         // bAlternateSetting
-    1,                         // bNumEndpoints
-    0x03,                      // bInterfaceClass (HID)
-    0x00,                      // bInterfaceSubClass (no boot)
-    0x00,                      // bInterfaceProtocol (none)
-    0,                         // iInterface
-
+    9,                      // bLength
+    bits::USB_DT_INTERFACE, // bDescriptorType
+    0,                      // bInterfaceNumber
+    0,                      // bAlternateSetting
+    1,                      // bNumEndpoints
+    0x03,                   // bInterfaceClass (HID)
+    0x00,                   // bInterfaceSubClass (no boot)
+    0x00,                   // bInterfaceProtocol (none)
+    0,                      // iInterface
     // HID descriptor (9 bytes)
-    9,                         // bLength
-    bits::USB_DT_HID,          // bDescriptorType
-    0x10, 0x01,                // bcdHID = 1.10
-    0,                         // bCountryCode
-    1,                         // bNumDescriptors
-    bits::USB_DT_HID_REPORT,   // bDescriptorType (report)
+    9,                // bLength
+    bits::USB_DT_HID, // bDescriptorType
+    0x10,
+    0x01,                    // bcdHID = 1.10
+    0,                       // bCountryCode
+    1,                       // bNumDescriptors
+    bits::USB_DT_HID_REPORT, // bDescriptorType (report)
     // wDescriptorLength = length of HID_REPORT_DESC
     HID_REPORT_DESC_LEN as u8,
     (HID_REPORT_DESC_LEN >> 8) as u8,
-
     // Endpoint descriptor (7 bytes)
-    7,                         // bLength
-    bits::USB_DT_ENDPOINT,     // bDescriptorType
-    0x81,                      // bEndpointAddress (EP1 IN)
-    0x03,                      // bmAttributes (interrupt)
-    8, 0,                      // wMaxPacketSize = 8
-    10,                        // bInterval (10 ms)
+    7,                     // bLength
+    bits::USB_DT_ENDPOINT, // bDescriptorType
+    0x81,                  // bEndpointAddress (EP1 IN)
+    0x03,                  // bmAttributes (interrupt)
+    8,
+    0,  // wMaxPacketSize = 8
+    10, // bInterval (10 ms)
 ];
 
 /// HID Report Descriptor for absolute pointer tablet.
@@ -90,51 +94,51 @@ const CONFIG_DESC: [u8; 34] = [
 ///         End Collection
 ///     End Collection
 const HID_REPORT_DESC: [u8; 84] = [
-    0x05, 0x01,        // Usage Page (Generic Desktop)
-    0x09, 0x02,        // Usage (Mouse)
-    0xA1, 0x01,        // Collection (Application)
-    0x09, 0x01,        //   Usage (Pointer)
-    0xA1, 0x00,        //   Collection (Physical)
+    0x05, 0x01, // Usage Page (Generic Desktop)
+    0x09, 0x02, // Usage (Mouse)
+    0xA1, 0x01, // Collection (Application)
+    0x09, 0x01, //   Usage (Pointer)
+    0xA1, 0x00, //   Collection (Physical)
     // Buttons (3 buttons, 1 bit each + 5 padding bits)
-    0x05, 0x09,        //     Usage Page (Button)
-    0x19, 0x01,        //     Usage Minimum (Button 1)
-    0x29, 0x03,        //     Usage Maximum (Button 3)
-    0x15, 0x00,        //     Logical Minimum (0)
-    0x25, 0x01,        //     Logical Maximum (1)
-    0x95, 0x03,        //     Report Count (3)
-    0x75, 0x01,        //     Report Size (1)
-    0x81, 0x02,        //     Input (Data, Var, Abs)
-    0x95, 0x01,        //     Report Count (1)
-    0x75, 0x05,        //     Report Size (5) -- padding
-    0x81, 0x01,        //     Input (Const, Array, Abs)
+    0x05, 0x09, //     Usage Page (Button)
+    0x19, 0x01, //     Usage Minimum (Button 1)
+    0x29, 0x03, //     Usage Maximum (Button 3)
+    0x15, 0x00, //     Logical Minimum (0)
+    0x25, 0x01, //     Logical Maximum (1)
+    0x95, 0x03, //     Report Count (3)
+    0x75, 0x01, //     Report Size (1)
+    0x81, 0x02, //     Input (Data, Var, Abs)
+    0x95, 0x01, //     Report Count (1)
+    0x75, 0x05, //     Report Size (5) -- padding
+    0x81, 0x01, //     Input (Const, Array, Abs)
     // X axis (absolute, 16-bit, 0..0x7FFF)
-    0x05, 0x01,        //     Usage Page (Generic Desktop)
-    0x09, 0x30,        //     Usage (X)
-    0x15, 0x00,        //     Logical Minimum (0)
-    0x26, 0xFF, 0x7F,  //     Logical Maximum (32767)
-    0x35, 0x00,        //     Physical Minimum (0)
-    0x46, 0xFF, 0x7F,  //     Physical Maximum (32767)
-    0x75, 0x10,        //     Report Size (16)
-    0x95, 0x01,        //     Report Count (1)
-    0x81, 0x02,        //     Input (Data, Var, Abs)
+    0x05, 0x01, //     Usage Page (Generic Desktop)
+    0x09, 0x30, //     Usage (X)
+    0x15, 0x00, //     Logical Minimum (0)
+    0x26, 0xFF, 0x7F, //     Logical Maximum (32767)
+    0x35, 0x00, //     Physical Minimum (0)
+    0x46, 0xFF, 0x7F, //     Physical Maximum (32767)
+    0x75, 0x10, //     Report Size (16)
+    0x95, 0x01, //     Report Count (1)
+    0x81, 0x02, //     Input (Data, Var, Abs)
     // Y axis (absolute, 16-bit, 0..0x7FFF)
-    0x09, 0x31,        //     Usage (Y)
-    0x15, 0x00,        //     Logical Minimum (0)
-    0x26, 0xFF, 0x7F,  //     Logical Maximum (32767)
-    0x35, 0x00,        //     Physical Minimum (0)
-    0x46, 0xFF, 0x7F,  //     Physical Maximum (32767)
-    0x75, 0x10,        //     Report Size (16)
-    0x95, 0x01,        //     Report Count (1)
-    0x81, 0x02,        //     Input (Data, Var, Abs)
+    0x09, 0x31, //     Usage (Y)
+    0x15, 0x00, //     Logical Minimum (0)
+    0x26, 0xFF, 0x7F, //     Logical Maximum (32767)
+    0x35, 0x00, //     Physical Minimum (0)
+    0x46, 0xFF, 0x7F, //     Physical Maximum (32767)
+    0x75, 0x10, //     Report Size (16)
+    0x95, 0x01, //     Report Count (1)
+    0x81, 0x02, //     Input (Data, Var, Abs)
     // Scroll wheel (relative, 8-bit, -127..127)
-    0x09, 0x38,        //     Usage (Wheel)
-    0x15, 0x81,        //     Logical Minimum (-127)
-    0x25, 0x7F,        //     Logical Maximum (127)
-    0x75, 0x08,        //     Report Size (8)
-    0x95, 0x01,        //     Report Count (1)
-    0x81, 0x06,        //     Input (Data, Var, Rel)
-    0xC0,              //   End Collection
-    0xC0,              // End Collection
+    0x09, 0x38, //     Usage (Wheel)
+    0x15, 0x81, //     Logical Minimum (-127)
+    0x25, 0x7F, //     Logical Maximum (127)
+    0x75, 0x08, //     Report Size (8)
+    0x95, 0x01, //     Report Count (1)
+    0x81, 0x06, //     Input (Data, Var, Rel)
+    0xC0, //   End Collection
+    0xC0, // End Collection
 ];
 
 const HID_REPORT_DESC_LEN: usize = HID_REPORT_DESC.len();
@@ -191,6 +195,12 @@ pub struct TabletDevice {
     string_descs: [Vec<u8>; 3],
 }
 
+impl Default for TabletDevice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TabletDevice {
     /// Create a new tablet device.
     pub fn new() -> Self {
@@ -239,9 +249,7 @@ impl TabletDevice {
         let x_bytes = st.x.to_le_bytes();
         let y_bytes = st.y.to_le_bytes();
         [
-            st.buttons,
-            x_bytes[0], x_bytes[1],
-            y_bytes[0], y_bytes[1],
+            st.buttons, x_bytes[0], x_bytes[1], y_bytes[0], y_bytes[1],
             0, // wheel (always 0 for now)
         ]
     }
@@ -268,7 +276,9 @@ impl TabletDevice {
 
         match (req_type, b_request) {
             // Standard device requests
-            (bits::USB_TYPE_STANDARD, bits::USB_REQ_GET_DESCRIPTOR) if dir_in => {
+            (bits::USB_TYPE_STANDARD, bits::USB_REQ_GET_DESCRIPTOR)
+                if dir_in =>
+            {
                 let desc_type = (w_value >> 8) as u8;
                 let desc_index = (w_value & 0xFF) as u8;
                 self.get_descriptor(desc_type, desc_index, w_length)
@@ -288,7 +298,9 @@ impl TabletDevice {
                 Some(Vec::new())
             }
 
-            (bits::USB_TYPE_STANDARD, bits::USB_REQ_GET_CONFIGURATION) if dir_in => {
+            (bits::USB_TYPE_STANDARD, bits::USB_REQ_GET_CONFIGURATION)
+                if dir_in =>
+            {
                 let st = self.inner.lock().expect("tablet lock");
                 Some(vec![st.configuration])
             }
@@ -338,7 +350,8 @@ impl TabletDevice {
             {
                 let desc_type = (w_value >> 8) as u8;
                 if desc_type == bits::USB_DT_HID_REPORT {
-                    let len = w_length.min(HID_REPORT_DESC.len() as u16) as usize;
+                    let len =
+                        w_length.min(HID_REPORT_DESC.len() as u16) as usize;
                     Some(HID_REPORT_DESC[..len].to_vec())
                 } else {
                     None

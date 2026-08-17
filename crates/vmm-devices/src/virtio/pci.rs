@@ -58,7 +58,6 @@ struct VirtioPciState {
     queue_msix_vectors: Vec<u16>,
 
     // -- Modern transport state --
-
     /// Selects which 32-bit half of device features to read (0=low, 1=high).
     device_feature_select: u32,
     /// Selects which 32-bit half of driver features to write.
@@ -138,6 +137,8 @@ impl VirtioPciState {
     }
 
     /// Returns true if the guest negotiated VERSION_1 (modern transport).
+    // Retained for the pending transport-mode validation path.
+    #[allow(dead_code)]
     fn is_modern(&self) -> bool {
         self.guest_features & bits::VIRTIO_F_VERSION_1 != 0
     }
@@ -167,18 +168,18 @@ impl CapOffsets {
                 first: 0x40,
                 msix: 0x40,
                 common: 0x4C,
-                notify: 0x5C,  // 0x4C + 16
-                isr: 0x70,     // 0x5C + 20
-                device: 0x80,  // 0x70 + 16
+                notify: 0x5C, // 0x4C + 16
+                isr: 0x70,    // 0x5C + 20
+                device: 0x80, // 0x70 + 16
             }
         } else {
             Self {
                 first: 0x40,
                 msix: 0,
                 common: 0x40,
-                notify: 0x50,  // 0x40 + 16
-                isr: 0x64,     // 0x50 + 20
-                device: 0x74,  // 0x64 + 16
+                notify: 0x50, // 0x40 + 16
+                isr: 0x64,    // 0x50 + 20
+                device: 0x74, // 0x64 + 16
             }
         }
     }
@@ -300,10 +301,8 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         pci_state.define_bar(BarN::BAR0, BarDefine::Pio(bar_size_aligned));
 
         // BAR2: MMIO for modern transport config (16 KB, 4 pages)
-        pci_state.define_bar(
-            BarN::BAR2,
-            BarDefine::Mmio(bits::MODERN_BAR_SIZE),
-        );
+        pci_state
+            .define_bar(BarN::BAR2, BarDefine::Mmio(bits::MODERN_BAR_SIZE));
 
         // BAR4: MMIO for MSI-X table + PBA
         if let Some(ref msix_table) = msix {
@@ -327,22 +326,26 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             None
         };
 
-        let msix_queue_vectors: Vec<std::sync::atomic::AtomicU16> = (0..num_queues)
-            .map(|_| std::sync::atomic::AtomicU16::new(bits::VIRTIO_MSI_NO_VECTOR))
+        let msix_queue_vectors: Vec<std::sync::atomic::AtomicU16> = (0
+            ..num_queues)
+            .map(|_| {
+                std::sync::atomic::AtomicU16::new(bits::VIRTIO_MSI_NO_VECTOR)
+            })
             .collect();
 
         let dev = Arc::new(Self {
             pci_state: Mutex::new(pci_state),
             virtio_state: Mutex::new(VirtioPciState::new(
-                num_queues,
-                queue_size,
+                num_queues, queue_size,
             )),
             device,
             isr_status: std::sync::atomic::AtomicU8::new(0),
             intr_pin,
             msix,
             msix_queue_vectors,
-            msix_config_vector: std::sync::atomic::AtomicU16::new(bits::VIRTIO_MSI_NO_VECTOR),
+            msix_config_vector: std::sync::atomic::AtomicU16::new(
+                bits::VIRTIO_MSI_NO_VECTOR,
+            ),
             physmap,
             bus_pio,
             bus_mmio,
@@ -364,16 +367,12 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     ///
     /// Must be called with an Arc<Self> available. Registers or
     /// unregisters the PIO handler as needed.
-    fn update_bar_registration(
-        self: &Arc<Self>,
-        pci: &DeviceState,
-    ) {
+    fn update_bar_registration(self: &Arc<Self>, pci: &DeviceState) {
         let io_enabled =
             pci.command().contains(crate::pci::bits::RegCmd::IO_EN);
         let bar_info = pci.bars().get(BarN::BAR0);
 
-        let mut reg = self.registered_bar.lock()
-            .expect("bar lock poisoned");
+        let mut reg = self.registered_bar.lock().expect("bar lock poisoned");
 
         // Unregister old handler if present
         if let Some(old_port) = reg.take() {
@@ -389,17 +388,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     let dev = Arc::clone(self);
                     let handler: Arc<PioFn> =
                         Arc::new(move |offset: u16, rwo: RWOp<'_>| {
-                            dev.bar_rw(
-                                BarN::BAR0,
-                                offset as usize,
-                                rwo,
-                            );
+                            dev.bar_rw(BarN::BAR0, offset as usize, rwo);
                         });
-                    match self.bus_pio.register(port, size, handler) {
-                        Ok(()) => {
-                            *reg = Some(port);
-                        }
-                        Err(_) => {}
+                    if let Ok(()) = self.bus_pio.register(port, size, handler) {
+                        *reg = Some(port);
                     }
                 }
             }
@@ -659,15 +651,16 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             0x2000 => 0, // notify is write-only
             0x3000 => {
                 // ISR status (same semantics as legacy: read clears)
-                let val = self.isr_status.swap(
-                    0,
-                    std::sync::atomic::Ordering::AcqRel,
-                );
+                let val = self
+                    .isr_status
+                    .swap(0, std::sync::atomic::Ordering::AcqRel);
                 if val != 0 {
                     self.lower_interrupt();
-                    if self.isr_status.load(
-                        std::sync::atomic::Ordering::Acquire,
-                    ) != 0 {
+                    if self
+                        .isr_status
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        != 0
+                    {
                         self.raise_interrupt();
                     }
                 }
@@ -726,23 +719,22 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 }
             }
             bits::COMMON_CFG_DRIVER_FEATURE_SELECT => vs.driver_feature_select,
-            bits::COMMON_CFG_DRIVER_FEATURE => {
-                match vs.driver_feature_select {
-                    0 => vs.guest_features as u32,
-                    1 => (vs.guest_features >> 32) as u32,
-                    _ => 0,
-                }
-            }
+            bits::COMMON_CFG_DRIVER_FEATURE => match vs.driver_feature_select {
+                0 => vs.guest_features as u32,
+                1 => (vs.guest_features >> 32) as u32,
+                _ => 0,
+            },
             bits::COMMON_CFG_MSIX_CONFIG => u32::from(vs.config_msix_vector),
             bits::COMMON_CFG_NUM_QUEUES => u32::from(self.num_queues),
             bits::COMMON_CFG_DEVICE_STATUS => u32::from(vs.status),
-            bits::COMMON_CFG_CONFIG_GENERATION => u32::from(vs.config_generation),
-            bits::COMMON_CFG_QUEUE_SELECT => u32::from(vs.queue_select),
-            bits::COMMON_CFG_QUEUE_SIZE => {
-                vs.selected_queue()
-                    .map(|q| u32::from(q.size()))
-                    .unwrap_or(0)
+            bits::COMMON_CFG_CONFIG_GENERATION => {
+                u32::from(vs.config_generation)
             }
+            bits::COMMON_CFG_QUEUE_SELECT => u32::from(vs.queue_select),
+            bits::COMMON_CFG_QUEUE_SIZE => vs
+                .selected_queue()
+                .map(|q| u32::from(q.size()))
+                .unwrap_or(0),
             bits::COMMON_CFG_QUEUE_MSIX_VECTOR => {
                 let idx = vs.queue_select as usize;
                 u32::from(
@@ -755,7 +747,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             bits::COMMON_CFG_QUEUE_ENABLE => {
                 let idx = vs.queue_select as usize;
                 u32::from(
-                    vs.queue_enabled.get(idx).copied().unwrap_or(false) as u16,
+                    vs.queue_enabled.get(idx).copied().unwrap_or(false) as u16
                 )
             }
             bits::COMMON_CFG_QUEUE_NOTIFY_OFF => {
@@ -791,6 +783,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     }
 
     /// Write to the modern common configuration structure.
+    // Virtio 1.3 section 3.1.1 requires FEATURES_OK validation here. The two
+    // paths must remain distinct until the correct behavior has a guest test
+    // matrix covering accepted and rejected feature sets.
+    #[allow(clippy::if_same_then_else)]
     fn modern_common_write(&self, offset: u16, val: u32, _len: usize) {
         let mut vs = self.virtio_state.lock().expect("virtio lock");
 
@@ -807,14 +803,14 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 match vs.driver_feature_select {
                     0 => {
                         let accepted = val & (offered as u32);
-                        vs.guest_features =
-                            (vs.guest_features & 0xFFFF_FFFF_0000_0000)
+                        vs.guest_features = (vs.guest_features
+                            & 0xFFFF_FFFF_0000_0000)
                             | u64::from(accepted);
                     }
                     1 => {
                         let accepted = val & ((offered >> 32) as u32);
-                        vs.guest_features =
-                            (vs.guest_features & 0x0000_0000_FFFF_FFFF)
+                        vs.guest_features = (vs.guest_features
+                            & 0x0000_0000_FFFF_FFFF)
                             | (u64::from(accepted) << 32);
                     }
                     _ => {}
@@ -822,8 +818,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 // Propagate to device and queues
                 let features = vs.guest_features;
                 self.device.set_features(features);
-                let event_idx =
-                    features & bits::VIRTIO_F_RING_EVENT_IDX != 0;
+                let event_idx = features & bits::VIRTIO_F_RING_EVENT_IDX != 0;
                 let indirect =
                     features & bits::VIRTIO_F_RING_INDIRECT_DESC != 0;
                 for q in &mut vs.queues {
@@ -833,21 +828,26 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             }
             bits::COMMON_CFG_MSIX_CONFIG => {
                 vs.config_msix_vector = val as u16;
-                self.msix_config_vector.store(val as u16, std::sync::atomic::Ordering::Release);
+                self.msix_config_vector
+                    .store(val as u16, std::sync::atomic::Ordering::Release);
             }
             bits::COMMON_CFG_DEVICE_STATUS => {
                 let new_status = val as u8;
                 if new_status == 0 {
                     vs.reset();
                     self.device.reset();
-                    self.isr_status.store(
-                        0,
+                    self.isr_status
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    // Clear atomic MSI-X vector cache
+                    self.msix_config_vector.store(
+                        bits::VIRTIO_MSI_NO_VECTOR,
                         std::sync::atomic::Ordering::Relaxed,
                     );
-                    // Clear atomic MSI-X vector cache
-                    self.msix_config_vector.store(bits::VIRTIO_MSI_NO_VECTOR, std::sync::atomic::Ordering::Relaxed);
                     for a in &self.msix_queue_vectors {
-                        a.store(bits::VIRTIO_MSI_NO_VECTOR, std::sync::atomic::Ordering::Relaxed);
+                        a.store(
+                            bits::VIRTIO_MSI_NO_VECTOR,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     drop(vs);
                     self.lower_interrupt();
@@ -873,7 +873,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 if idx < vs.queue_msix_vectors.len() {
                     vs.queue_msix_vectors[idx] = val as u16;
                     if let Some(a) = self.msix_queue_vectors.get(idx) {
-                        a.store(val as u16, std::sync::atomic::Ordering::Release);
+                        a.store(
+                            val as u16,
+                            std::sync::atomic::Ordering::Release,
+                        );
                     }
                 }
             }
@@ -956,7 +959,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// hot path. Workers and vCPU can set ISR concurrently without
     /// Mutex contention.
     pub fn raise_queue_interrupt(&self) {
-        self.isr_status.fetch_or(bits::ISR_QUEUE_INTR, std::sync::atomic::Ordering::Release);
+        self.isr_status.fetch_or(
+            bits::ISR_QUEUE_INTR,
+            std::sync::atomic::Ordering::Release,
+        );
         self.raise_interrupt();
     }
 
@@ -986,7 +992,8 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         if let Some(ref msix) = self.msix {
             // Read vector from lock-free atomic cache (no virtio_state lock
             // needed — safe to call from inside notify_queue callbacks).
-            let vector = self.msix_queue_vectors
+            let vector = self
+                .msix_queue_vectors
                 .get(queue_idx as usize)
                 .map(|a| a.load(std::sync::atomic::Ordering::Acquire))
                 .unwrap_or(bits::VIRTIO_MSI_NO_VECTOR);
@@ -994,7 +1001,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 msix.fire(vector);
                 return;
             }
-            eprintln!("[virtio-intr] q={} vector=NO_VECTOR, falling back to INTx", queue_idx);
+            eprintln!(
+                "[virtio-intr] q={} vector=NO_VECTOR, falling back to INTx",
+                queue_idx
+            );
         } else {
             eprintln!("[virtio-intr] q={} no msix, using INTx", queue_idx);
         }
@@ -1006,7 +1016,9 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     #[allow(dead_code)]
     pub fn signal_config_change(&self) {
         if let Some(ref msix) = self.msix {
-            let vector = self.msix_config_vector.load(std::sync::atomic::Ordering::Acquire);
+            let vector = self
+                .msix_config_vector
+                .load(std::sync::atomic::Ordering::Acquire);
             if vector != bits::VIRTIO_MSI_NO_VECTOR {
                 msix.fire(vector);
                 return;
@@ -1053,39 +1065,36 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     & !bits::VIRTIO_F_RING_EVENT_IDX_U32
                     & !bits::VIRTIO_F_RING_INDIRECT_DESC_U32
             }
-            bits::LEGACY_REG_GUEST_FEATURES => {
-                vs.guest_features_u32()
-            }
+            bits::LEGACY_REG_GUEST_FEATURES => vs.guest_features_u32(),
             bits::LEGACY_REG_QUEUE_PFN => {
-                vs.selected_queue()
-                    .map(|q| q.pfn())
-                    .unwrap_or(0)
+                vs.selected_queue().map(|q| q.pfn()).unwrap_or(0)
             }
-            bits::LEGACY_REG_QUEUE_SIZE => {
-                vs.selected_queue()
-                    .map(|q| u32::from(q.size()))
-                    .unwrap_or(0)
-            }
-            bits::LEGACY_REG_QUEUE_SELECT => {
-                u32::from(vs.queue_select)
-            }
+            bits::LEGACY_REG_QUEUE_SIZE => vs
+                .selected_queue()
+                .map(|q| u32::from(q.size()))
+                .unwrap_or(0),
+            bits::LEGACY_REG_QUEUE_SELECT => u32::from(vs.queue_select),
             bits::LEGACY_REG_QUEUE_NOTIFY => {
                 // Write-only register, read returns 0
                 0
             }
-            bits::LEGACY_REG_DEVICE_STATUS => {
-                u32::from(vs.status)
-            }
+            bits::LEGACY_REG_DEVICE_STATUS => u32::from(vs.status),
             bits::LEGACY_REG_ISR_STATUS => {
                 // Atomic swap: read and clear ISR in one operation.
-                let val = self.isr_status.swap(0, std::sync::atomic::Ordering::AcqRel);
+                let val = self
+                    .isr_status
+                    .swap(0, std::sync::atomic::Ordering::AcqRel);
                 if val != 0 {
                     drop(vs);
                     self.lower_interrupt();
                     // Re-check: a worker may have set ISR between our
                     // swap and deassert. If so, re-assert the pin so
                     // the guest gets another interrupt for the new work.
-                    if self.isr_status.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                    if self
+                        .isr_status
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        != 0
+                    {
                         self.raise_interrupt();
                     }
                     return u32::from(val);
@@ -1138,7 +1147,8 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 // queues so they know the negotiated capabilities.
                 let accepted64 = vs.guest_features;
                 let event_idx = accepted64 & bits::VIRTIO_F_RING_EVENT_IDX != 0;
-                let indirect = accepted64 & bits::VIRTIO_F_RING_INDIRECT_DESC != 0;
+                let indirect =
+                    accepted64 & bits::VIRTIO_F_RING_INDIRECT_DESC != 0;
                 for q in &mut vs.queues {
                     q.set_event_idx(event_idx);
                     q.set_indirect_supported(indirect);
@@ -1177,10 +1187,17 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 if new_status == 0 {
                     vs.reset();
                     self.device.reset();
-                    self.isr_status.store(0, std::sync::atomic::Ordering::Relaxed);
-                    self.msix_config_vector.store(bits::VIRTIO_MSI_NO_VECTOR, std::sync::atomic::Ordering::Relaxed);
+                    self.isr_status
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    self.msix_config_vector.store(
+                        bits::VIRTIO_MSI_NO_VECTOR,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     for a in &self.msix_queue_vectors {
-                        a.store(bits::VIRTIO_MSI_NO_VECTOR, std::sync::atomic::Ordering::Relaxed);
+                        a.store(
+                            bits::VIRTIO_MSI_NO_VECTOR,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     drop(vs);
                     // Ensure interrupt line is low on reset so the
@@ -1209,14 +1226,18 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             }
             bits::LEGACY_REG_MSIX_CONFIG_VECTOR if self.msix.is_some() => {
                 vs.config_msix_vector = val as u16;
-                self.msix_config_vector.store(val as u16, std::sync::atomic::Ordering::Release);
+                self.msix_config_vector
+                    .store(val as u16, std::sync::atomic::Ordering::Release);
             }
             bits::LEGACY_REG_MSIX_QUEUE_VECTOR if self.msix.is_some() => {
                 let idx = vs.queue_select as usize;
                 if idx < vs.queue_msix_vectors.len() {
                     vs.queue_msix_vectors[idx] = val as u16;
                     if let Some(a) = self.msix_queue_vectors.get(idx) {
-                        a.store(val as u16, std::sync::atomic::Ordering::Release);
+                        a.store(
+                            val as u16,
+                            std::sync::atomic::Ordering::Release,
+                        );
                     }
                 }
             }
@@ -1380,8 +1401,8 @@ impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
 // Lifecycle delegation — forward VM lifecycle calls to the inner device.
 // ---------------------------------------------------------------------------
 
-use crate::Lifecycle;
 use crate::migrate::Migrator;
+use crate::Lifecycle;
 impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
     fn type_name(&self) -> &'static str {
         Lifecycle::type_name(&self.device)
@@ -1432,7 +1453,9 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
         // replenishes rx buffers.
         let vs = self.virtio_state.lock().expect("virtio lock");
         let enabled: Vec<u16> = (0..self.num_queues)
-            .filter(|&idx| vs.queue_enabled.get(idx as usize).copied().unwrap_or(false))
+            .filter(|&idx| {
+                vs.queue_enabled.get(idx as usize).copied().unwrap_or(false)
+            })
             .collect();
         drop(vs);
         for idx in enabled {
@@ -1455,7 +1478,8 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
         for idx in 0..self.num_queues as usize {
             let q = &vs.queues[idx];
             if q.is_configured() {
-                let (k_avail, k_used) = self.device.get_kernel_ring_indices(idx as u16);
+                let (k_avail, k_used) =
+                    self.device.get_kernel_ring_indices(idx as u16);
                 // For software devices (blk), read used_idx from guest
                 // memory because VirtioCompletion manages the used ring
                 // separately from VirtQueue's shadow_used_idx.
@@ -1463,7 +1487,11 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
                     k_used
                 } else {
                     let guest_used = q.read_used_ring_idx(&self.physmap);
-                    if guest_used != 0 { guest_used } else { q.shadow_used_idx() }
+                    if guest_used != 0 {
+                        guest_used
+                    } else {
+                        q.shadow_used_idx()
+                    }
                 };
                 // For kernel-managed queues (viona), use the kernel's
                 // actual consumed position (k_avail). The delta between
@@ -1481,15 +1509,20 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
                 };
 
                 // Get MSI-X entry for this queue's vector
-                let vector = self.msix_queue_vectors
+                let vector = self
+                    .msix_queue_vectors
                     .get(idx)
                     .map(|a| a.load(std::sync::atomic::Ordering::Acquire))
                     .unwrap_or(bits::VIRTIO_MSI_NO_VECTOR);
                 let (msix_addr, msix_data) = if let Some(ref msix) = self.msix {
                     if vector != bits::VIRTIO_MSI_NO_VECTOR {
                         msix.read_entry(vector)
-                    } else { (0, 0) }
-                } else { (0, 0) };
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                };
 
                 result.push(VirtioMigrateQueue {
                     queue_idx: idx as u16,
@@ -1497,7 +1530,11 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
                     desc_addr: q.desc_addr(),
                     avail_addr: q.avail_addr(),
                     used_addr: q.used_addr(),
-                    enabled: vs.queue_enabled.get(idx).copied().unwrap_or(false),
+                    enabled: vs
+                        .queue_enabled
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(false),
                     features: vs.guest_features,
                     avail_idx,
                     used_idx,
@@ -1517,19 +1554,28 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
                     let mut ids = Vec::new();
                     for slot in 0..qsize.min(16) {
                         let gpa = q.avail_addr() + 4 + u64::from(slot) * 2;
-                        if let Some(id) = self.physmap.lookup(gpa, 2)
-                            .and_then(|s| s.read::<u16>().ok()) {
+                        if let Some(id) = self
+                            .physmap
+                            .lookup(gpa, 2)
+                            .and_then(|s| s.read::<u16>().ok())
+                        {
                             ids.push(id);
                         }
                     }
-                    eprintln!("[virtio-export] q={} DRAINED avail_ring[0..15]={:?}", idx, ids);
+                    eprintln!(
+                        "[virtio-export] q={} DRAINED avail_ring[0..15]={:?}",
+                        idx, ids
+                    );
                 }
             }
         }
         result
     }
 
-    fn restore_virtio_state(&self, states: &[crate::lifecycle::VirtioMigrateQueue]) {
+    fn restore_virtio_state(
+        &self,
+        states: &[crate::lifecycle::VirtioMigrateQueue],
+    ) {
         // Group by queue_idx=0 starts, find group matching our queue count
         let my_nq = self.num_queues as usize;
         let matching: Vec<_> = {
@@ -1541,15 +1587,28 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
                 }
                 cur.push(s.clone());
             }
-            if !cur.is_empty() { groups.push(cur); }
-            groups.into_iter().find(|g| g.len() == my_nq).unwrap_or_default()
+            if !cur.is_empty() {
+                groups.push(cur);
+            }
+            groups
+                .into_iter()
+                .find(|g| g.len() == my_nq)
+                .unwrap_or_default()
         };
 
-        if let Some(pci_state) = matching.iter().find_map(|qs| qs.pci_state.as_ref()) {
-            eprintln!("[virtio-restore] restoring PCI: cmd={:#x} bars={:?}", pci_state.command, pci_state.bar_addrs);
+        if let Some(pci_state) =
+            matching.iter().find_map(|qs| qs.pci_state.as_ref())
+        {
+            eprintln!(
+                "[virtio-restore] restoring PCI: cmd={:#x} bars={:?}",
+                pci_state.command, pci_state.bar_addrs
+            );
             self.restore_migrate_pci_state(pci_state);
         } else {
-            eprintln!("[virtio-restore] NO pci_state in matching queues (nq={})", my_nq);
+            eprintln!(
+                "[virtio-restore] NO pci_state in matching queues (nq={})",
+                my_nq
+            );
         }
 
         let mut vs = self.virtio_state.lock().expect("virtio lock");
@@ -1557,7 +1616,9 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
 
         for qs in &matching {
             let idx = qs.queue_idx as usize;
-            if idx >= vs.queues.len() { continue; }
+            if idx >= vs.queues.len() {
+                continue;
+            }
 
             if vs.guest_features == 0 && qs.features != 0 {
                 vs.guest_features = qs.features;
@@ -1578,7 +1639,11 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
                 }
             }
 
-            vs.queues[idx].set_addr_modern(qs.desc_addr, qs.avail_addr, qs.used_addr);
+            vs.queues[idx].set_addr_modern(
+                qs.desc_addr,
+                qs.avail_addr,
+                qs.used_addr,
+            );
             // Restore ring indices for software-emulated devices.
             // set_addr_modern resets indices to 0, but after migration
             // we need to continue from the source's position.
@@ -1602,11 +1667,18 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
                     vs.queue_msix_vectors[idx] = qs.msix_vector;
                 }
                 if let Some(a) = self.msix_queue_vectors.get(idx) {
-                    a.store(qs.msix_vector, std::sync::atomic::Ordering::Release);
+                    a.store(
+                        qs.msix_vector,
+                        std::sync::atomic::Ordering::Release,
+                    );
                 }
                 // Write the MSI-X table entry so fire() can inject the interrupt
                 if let Some(ref msix) = self.msix {
-                    msix.write_entry(qs.msix_vector, qs.msix_addr, qs.msix_data as u64);
+                    msix.write_entry(
+                        qs.msix_vector,
+                        qs.msix_addr,
+                        qs.msix_data as u64,
+                    );
                 }
             }
 
@@ -1614,10 +1686,16 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
                 // Log ring state for debugging
                 let guest_avail_gpa = qs.avail_addr + 2;
                 let guest_used_gpa = qs.used_addr + 2;
-                let ga = self.physmap.lookup(guest_avail_gpa, 2)
-                    .and_then(|s| s.read::<u16>().ok()).unwrap_or(0);
-                let gu = self.physmap.lookup(guest_used_gpa, 2)
-                    .and_then(|s| s.read::<u16>().ok()).unwrap_or(0);
+                let ga = self
+                    .physmap
+                    .lookup(guest_avail_gpa, 2)
+                    .and_then(|s| s.read::<u16>().ok())
+                    .unwrap_or(0);
+                let gu = self
+                    .physmap
+                    .lookup(guest_used_gpa, 2)
+                    .and_then(|s| s.read::<u16>().ok())
+                    .unwrap_or(0);
                 let avail_delta = ga.wrapping_sub(qs.avail_idx);
                 eprintln!(
                     "[virtio-restore] q={} kernel(avail={} used={}) guest_mem(avail={} used={}) available={}",
@@ -1625,10 +1703,15 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
                 );
 
                 self.device.restore_ring_state(
-                    qs.queue_idx, qs.queue_size,
-                    qs.desc_addr, qs.avail_addr, qs.used_addr,
-                    qs.avail_idx, qs.used_idx,
-                    qs.msix_addr, qs.msix_data,
+                    qs.queue_idx,
+                    qs.queue_size,
+                    qs.desc_addr,
+                    qs.avail_addr,
+                    qs.used_addr,
+                    qs.avail_idx,
+                    qs.used_idx,
+                    qs.msix_addr,
+                    qs.msix_data,
                 );
             }
         }
@@ -1647,18 +1730,41 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
 
         // Program notification addresses from current BAR state
         let pci = self.pci_state.lock().expect("pci lock");
-        let bar0_port = pci.bars().get(BarN::BAR0)
-            .and_then(|(def, addr)| if def.is_pio() { Some(addr as u16) } else { None })
+        let bar0_port = pci
+            .bars()
+            .get(BarN::BAR0)
+            .and_then(|(def, addr)| {
+                if def.is_pio() {
+                    Some(addr as u16)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(0);
-        let bar2_addr = pci.bars().get(BarN::BAR2)
-            .and_then(|(def, addr)| if def.is_mmio() { Some(addr) } else { None })
+        let bar2_addr = pci
+            .bars()
+            .get(BarN::BAR2)
+            .and_then(
+                |(def, addr)| if def.is_mmio() { Some(addr) } else { None },
+            )
             .unwrap_or(0);
         drop(pci);
-        eprintln!("[virtio-restore] BAR0={:#x} BAR2={:#x}", bar0_port, bar2_addr);
+        eprintln!(
+            "[virtio-restore] BAR0={:#x} BAR2={:#x}",
+            bar0_port, bar2_addr
+        );
 
         if bar0_port != 0 || bar2_addr != 0 {
-            let notify_pio = if bar0_port != 0 { bar0_port + bits::LEGACY_REG_QUEUE_NOTIFY } else { 0 };
-            let notify_mmio = if bar2_addr != 0 { bar2_addr + bits::MODERN_BAR_NOTIFY_OFFSET as u64 } else { 0 };
+            let notify_pio = if bar0_port != 0 {
+                bar0_port + bits::LEGACY_REG_QUEUE_NOTIFY
+            } else {
+                0
+            };
+            let notify_mmio = if bar2_addr != 0 {
+                bar2_addr + bits::MODERN_BAR_NOTIFY_OFFSET as u64
+            } else {
+                0
+            };
             self.device.set_notify_addrs(notify_pio, notify_mmio);
         }
 
@@ -1675,7 +1781,10 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
         drop(vs);
         for qs in &matching {
             if qs.enabled {
-                eprintln!("[virtio-restore] injecting post-restore interrupt q={}", qs.queue_idx);
+                eprintln!(
+                    "[virtio-restore] injecting post-restore interrupt q={}",
+                    qs.queue_idx
+                );
                 self.raise_queue_interrupt_for(qs.queue_idx);
             }
         }
@@ -1718,7 +1827,7 @@ mod tests {
         fn reset(&self) {}
     }
 
-    impl crate::Lifecycle for TestVirtioDevice {
+    impl Lifecycle for TestVirtioDevice {
         fn type_name(&self) -> &'static str {
             "test-virtio"
         }
@@ -1737,12 +1846,12 @@ mod tests {
             bits::VIRTIO_DEV_TYPE_BLOCK,
             1,
             256,
-            8,  // 8 bytes of device config
+            8, // 8 bytes of device config
             None,
             physmap,
             bus_pio,
             bus_mmio,
-            None,  // no MSI-X
+            None, // no MSI-X
         )
     }
 
@@ -1848,7 +1957,7 @@ mod tests {
         fn reset(&self) {}
     }
 
-    impl crate::Lifecycle for TrackingVirtioDevice {
+    impl Lifecycle for TrackingVirtioDevice {
         fn type_name(&self) -> &'static str {
             "tracking-virtio"
         }
@@ -1918,7 +2027,10 @@ mod tests {
         let mut ro = ReadOp::new(4);
         dev.bar_rw(BarN::BAR0, 0x00, RWOp::Read(&mut ro));
         let val = u32::from_le_bytes([
-            ro.buf()[0], ro.buf()[1], ro.buf()[2], ro.buf()[3],
+            ro.buf()[0],
+            ro.buf()[1],
+            ro.buf()[2],
+            ro.buf()[3],
         ]);
         // Device features = 0x42 from test device (EVENT_IDX disabled pending investigation)
         assert_eq!(val, 0x42);
@@ -1945,7 +2057,10 @@ mod tests {
         let dev = make_test_device();
 
         // Set some status
-        let wo = WriteOp::from_buf(&[bits::STATUS_ACKNOWLEDGE | bits::STATUS_DRIVER]);
+        let wo =
+            WriteOp::from_buf(
+                &[bits::STATUS_ACKNOWLEDGE | bits::STATUS_DRIVER],
+            );
         dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
 
         // Reset by writing 0
@@ -1964,7 +2079,8 @@ mod tests {
         let dev = make_test_device();
 
         // Manually set ISR
-        dev.isr_status.store(bits::ISR_QUEUE_INTR, std::sync::atomic::Ordering::Relaxed);
+        dev.isr_status
+            .store(bits::ISR_QUEUE_INTR, std::sync::atomic::Ordering::Relaxed);
 
         // First read should return the value
         let mut ro = ReadOp::new(1);
@@ -2011,7 +2127,10 @@ mod tests {
         let mut ro = ReadOp::new(4);
         dev.bar_rw(BarN::BAR0, 0x14, RWOp::Read(&mut ro));
         let val = u32::from_le_bytes([
-            ro.buf()[0], ro.buf()[1], ro.buf()[2], ro.buf()[3],
+            ro.buf()[0],
+            ro.buf()[1],
+            ro.buf()[2],
+            ro.buf()[3],
         ]);
         // TestVirtioDevice returns offset as value
         assert_eq!(val, 0);
@@ -2020,7 +2139,10 @@ mod tests {
         let mut ro = ReadOp::new(4);
         dev.bar_rw(BarN::BAR0, 0x18, RWOp::Read(&mut ro));
         let val = u32::from_le_bytes([
-            ro.buf()[0], ro.buf()[1], ro.buf()[2], ro.buf()[3],
+            ro.buf()[0],
+            ro.buf()[1],
+            ro.buf()[2],
+            ro.buf()[3],
         ]);
         assert_eq!(val, 4);
     }
@@ -2037,7 +2159,10 @@ mod tests {
         let mut ro = ReadOp::new(4);
         dev.bar_rw(BarN::BAR0, 0x04, RWOp::Read(&mut ro));
         let val = u32::from_le_bytes([
-            ro.buf()[0], ro.buf()[1], ro.buf()[2], ro.buf()[3],
+            ro.buf()[0],
+            ro.buf()[1],
+            ro.buf()[2],
+            ro.buf()[3],
         ]);
         assert_eq!(val, 0x42);
     }
@@ -2054,9 +2179,15 @@ mod tests {
         let mut ro = ReadOp::new(4);
         dev.bar_rw(BarN::BAR0, 0x04, RWOp::Read(&mut ro));
         let val = u32::from_le_bytes([
-            ro.buf()[0], ro.buf()[1], ro.buf()[2], ro.buf()[3],
+            ro.buf()[0],
+            ro.buf()[1],
+            ro.buf()[2],
+            ro.buf()[3],
         ]);
-        assert_eq!(val, 0x42, "guest features should be masked to offered 0x42");
+        assert_eq!(
+            val, 0x42,
+            "guest features should be masked to offered 0x42"
+        );
     }
 
     #[test]
@@ -2071,7 +2202,10 @@ mod tests {
         let mut ro = ReadOp::new(4);
         dev.bar_rw(BarN::BAR0, 0x04, RWOp::Read(&mut ro));
         let val = u32::from_le_bytes([
-            ro.buf()[0], ro.buf()[1], ro.buf()[2], ro.buf()[3],
+            ro.buf()[0],
+            ro.buf()[1],
+            ro.buf()[2],
+            ro.buf()[3],
         ]);
         // Only offered features survive masking
         assert_eq!(val, 0x00);
@@ -2093,7 +2227,8 @@ mod tests {
         assert_eq!(bits::LEGACY_REG_DEVICE_CONFIG_MSIX, 0x18);
         // The difference is 4 bytes (two 16-bit vector registers)
         assert_eq!(
-            bits::LEGACY_REG_DEVICE_CONFIG_MSIX - bits::LEGACY_REG_DEVICE_CONFIG,
+            bits::LEGACY_REG_DEVICE_CONFIG_MSIX
+                - bits::LEGACY_REG_DEVICE_CONFIG,
             4,
         );
     }
@@ -2117,7 +2252,10 @@ mod tests {
         let mut ro = ReadOp::new(4);
         dev.bar_rw(BarN::BAR0, 0x08, RWOp::Read(&mut ro));
         let pfn = u32::from_le_bytes([
-            ro.buf()[0], ro.buf()[1], ro.buf()[2], ro.buf()[3],
+            ro.buf()[0],
+            ro.buf()[1],
+            ro.buf()[2],
+            ro.buf()[3],
         ]);
         assert_eq!(pfn, 0, "invalid queue index should report PFN 0");
     }
@@ -2131,16 +2269,15 @@ mod tests {
         let wo = WriteOp::from_buf(&[bits::STATUS_ACKNOWLEDGE]);
         dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
 
-        let wo = WriteOp::from_buf(&[
-            bits::STATUS_ACKNOWLEDGE | bits::STATUS_DRIVER,
-        ]);
+        let wo =
+            WriteOp::from_buf(
+                &[bits::STATUS_ACKNOWLEDGE | bits::STATUS_DRIVER],
+            );
         dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
 
-        let wo = WriteOp::from_buf(&[
-            bits::STATUS_ACKNOWLEDGE
-                | bits::STATUS_DRIVER
-                | bits::STATUS_FEATURES_OK,
-        ]);
+        let wo = WriteOp::from_buf(&[bits::STATUS_ACKNOWLEDGE
+            | bits::STATUS_DRIVER
+            | bits::STATUS_FEATURES_OK]);
         dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
 
         // Read back — FEATURES_OK should be set
@@ -2170,10 +2307,8 @@ mod tests {
         let dev = make_test_device();
 
         // Set config change ISR bit
-        dev.isr_status.store(
-            bits::ISR_CFG_CHANGE,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        dev.isr_status
+            .store(bits::ISR_CFG_CHANGE, std::sync::atomic::Ordering::Relaxed);
 
         let mut ro = ReadOp::new(1);
         dev.bar_rw(BarN::BAR0, 0x13, RWOp::Read(&mut ro));
@@ -2198,10 +2333,7 @@ mod tests {
 
         let mut ro = ReadOp::new(1);
         dev.bar_rw(BarN::BAR0, 0x13, RWOp::Read(&mut ro));
-        assert_eq!(
-            ro.buf()[0],
-            bits::ISR_QUEUE_INTR | bits::ISR_CFG_CHANGE,
-        );
+        assert_eq!(ro.buf()[0], bits::ISR_QUEUE_INTR | bits::ISR_CFG_CHANGE,);
     }
 
     #[test]
@@ -2217,7 +2349,10 @@ mod tests {
         let mut ro = ReadOp::new(4);
         dev.bar_rw(BarN::BAR0, 0x00, RWOp::Read(&mut ro));
         let val = u32::from_le_bytes([
-            ro.buf()[0], ro.buf()[1], ro.buf()[2], ro.buf()[3],
+            ro.buf()[0],
+            ro.buf()[1],
+            ro.buf()[2],
+            ro.buf()[3],
         ]);
         assert_eq!(val, 0x42, "device features should be read-only");
     }
@@ -2251,7 +2386,11 @@ mod tests {
             | crate::pci::bits::RegCmd::INTX_DIS;
         dev.cfg_write(crate::pci::bits::REG_BAR0, 4, 0xC120);
         dev.cfg_write(crate::pci::bits::REG_BAR2, 4, 0xFEC0_0000);
-        dev.cfg_write(crate::pci::bits::REG_COMMAND, 2, u32::from(command.bits()));
+        dev.cfg_write(
+            crate::pci::bits::REG_COMMAND,
+            2,
+            u32::from(command.bits()),
+        );
 
         let exported = dev.export_virtio_state();
         assert_eq!(exported.len(), 1);
@@ -2447,7 +2586,10 @@ mod tests {
         let mut ro = ReadOp::new(4);
         dev.bar_rw(BarN::BAR2, 0x04, RWOp::Read(&mut ro));
         let high = u32::from_le_bytes([
-            ro.buf()[0], ro.buf()[1], ro.buf()[2], ro.buf()[3],
+            ro.buf()[0],
+            ro.buf()[1],
+            ro.buf()[2],
+            ro.buf()[3],
         ]);
         // VERSION_1 = bit 32 → bit 0 of high word
         assert_ne!(high & 1, 0, "VERSION_1 should be in modern features");
@@ -2462,7 +2604,10 @@ mod tests {
         let mut ro = ReadOp::new(4);
         dev.bar_rw(BarN::BAR2, 0x04, RWOp::Read(&mut ro));
         let low = u32::from_le_bytes([
-            ro.buf()[0], ro.buf()[1], ro.buf()[2], ro.buf()[3],
+            ro.buf()[0],
+            ro.buf()[1],
+            ro.buf()[2],
+            ro.buf()[3],
         ]);
         // EVENT_IDX = bit 29
         assert_ne!(
@@ -2487,7 +2632,10 @@ mod tests {
         let mut ro = ReadOp::new(4);
         dev.bar_rw(BarN::BAR0, 0x00, RWOp::Read(&mut ro));
         let val = u32::from_le_bytes([
-            ro.buf()[0], ro.buf()[1], ro.buf()[2], ro.buf()[3],
+            ro.buf()[0],
+            ro.buf()[1],
+            ro.buf()[2],
+            ro.buf()[3],
         ]);
         // Legacy should NOT include EVENT_IDX (bit 29)
         assert_eq!(

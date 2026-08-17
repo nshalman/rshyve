@@ -74,7 +74,11 @@ impl PioBus {
 
     /// Unregister the handler whose registration starts at `port`.
     pub fn unregister(&self, port: u16) -> Result<(), ASpaceError> {
-        self.map.lock().unwrap().unregister(port as usize).map(|_| ())
+        self.map
+            .lock()
+            .unwrap()
+            .unregister(port as usize)
+            .map(|_| ())
     }
 
     /// Handle an IN instruction (guest reads from port).
@@ -82,6 +86,11 @@ impl PioBus {
     /// Returns the value read. If no handler is registered for the port,
     /// returns `0xFFFF_FFFF` (all 1s), matching x86 floating-bus behavior.
     pub fn handle_in(&self, port: u16, bytes: u8) -> u32 {
+        match bytes {
+            1 | 2 | 4 => {}
+            _ => return 0xFFFF_FFFF,
+        }
+
         let mut ro = ReadOp::new(bytes as usize);
 
         let handled = if let Some((offset, handler)) = self.lookup(port) {
@@ -111,6 +120,11 @@ impl PioBus {
     /// If no handler is registered for the port, the write is silently
     /// ignored, matching x86 bus behavior.
     pub fn handle_out(&self, port: u16, bytes: u8, val: u32) {
+        match bytes {
+            1 | 2 | 4 => {}
+            _ => return,
+        }
+
         let data = &val.to_le_bytes()[..bytes as usize];
         let wo = WriteOp::from_buf(data);
 
@@ -199,6 +213,68 @@ mod tests {
 
         bus.handle_out(0x3F8, 4, 0xDEAD_BEEF);
         assert_eq!(captured.load(Ordering::SeqCst), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn handle_in_rejects_oversized_width() {
+        let bus = PioBus::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let handler: Arc<PioFn> = Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        bus.register(0x100, 1, handler).unwrap();
+
+        assert_eq!(bus.handle_in(0x100, 5), 0xFFFF_FFFF);
+        assert_eq!(bus.handle_in(0x100, 255), 0xFFFF_FFFF);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn handle_in_rejects_zero_width() {
+        let bus = PioBus::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let handler: Arc<PioFn> = Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        bus.register(0x100, 1, handler).unwrap();
+
+        assert_eq!(bus.handle_in(0x100, 0), 0xFFFF_FFFF);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn handle_out_rejects_oversized_width() {
+        let bus = PioBus::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let handler: Arc<PioFn> = Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        bus.register(0x100, 1, handler).unwrap();
+
+        bus.handle_out(0x100, 5, 0);
+        bus.handle_out(0x100, 255, 0);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn handle_out_rejects_zero_width() {
+        let bus = PioBus::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let handler: Arc<PioFn> = Arc::new(move |_, _| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        bus.register(0x100, 1, handler).unwrap();
+
+        bus.handle_out(0x100, 0, 0);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

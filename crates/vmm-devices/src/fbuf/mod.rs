@@ -22,7 +22,7 @@
 
 pub mod rfb;
 
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -37,14 +37,12 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::DevMemSeg;
 use vmm_core::mmio::{MmioBus, MmioFn};
 
-use crate::{InputBroker, Lifecycle};
 use crate::pci::bar::BarDefine;
 use crate::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use crate::pci::BarN;
+use crate::{InputBroker, Lifecycle};
 
-use rfb::{
-    ClientMessage, PixelFormat, RectHeader, ENCODING_RAW,
-};
+use rfb::{ClientMessage, PixelFormat, RectHeader, ENCODING_RAW};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -78,7 +76,7 @@ const BYTES_PER_PIXEL: u64 = 4;
 fn resolution_fits(width: u16, height: u16) -> bool {
     (u64::from(width) * BYTES_PER_PIXEL)
         .checked_mul(u64::from(height))
-        .map_or(false, |n| n <= u64::from(BAR1_SIZE))
+        .is_some_and(|n| n <= u64::from(BAR1_SIZE))
 }
 
 /// VNC update interval (~30 fps).
@@ -122,6 +120,7 @@ pub struct Framebuffer {
     fb: DevMemSeg,
 
     /// VM handle retained for the device memory segment lifetime.
+    #[allow(dead_code)]
     hdl: Option<Arc<VmmHdl>>,
 
     /// MMIO bus for BAR registration/unregistration.
@@ -214,12 +213,17 @@ impl Framebuffer {
         *dev.self_ref.lock().expect("fbuf: self_ref lock") =
             Some(Arc::downgrade(&dev));
 
+        let listener = vmm_core::unixsock::bind_restricted(
+            vnc_path,
+            vmm_core::unixsock::SocketPolicy::default(),
+        )?;
+
         // Start VNC server thread
         let vnc_dev = Arc::clone(&dev);
         thread::Builder::new()
             .name("fbuf-vnc".into())
             .spawn(move || {
-                vnc_server_loop(vnc_dev);
+                vnc_server_loop(vnc_dev, listener);
             })
             .expect("fbuf: failed to spawn VNC server thread");
 
@@ -385,6 +389,9 @@ impl Framebuffer {
     }
 
     /// Read a value from the BAR0 register space.
+    // A 32-bit depth read will eventually include refresh in the high half;
+    // preserve the width split until that register behavior is implemented.
+    #[allow(clippy::if_same_then_else)]
     fn bar0_read(&self, offset: usize, len: usize) -> u32 {
         let res = self.resolution.load(Ordering::Relaxed);
         let width = unpack_width(res);
@@ -422,8 +429,10 @@ impl Framebuffer {
                     let new_w = val as u16;
                     let new_h = (val >> 16) as u16;
                     if new_w > 0 && new_h > 0 && resolution_fits(new_w, new_h) {
-                        self.resolution
-                            .store(pack_resolution(new_w, new_h), Ordering::Release);
+                        self.resolution.store(
+                            pack_resolution(new_w, new_h),
+                            Ordering::Release,
+                        );
                     }
                 } else {
                     // 2-byte write: just width
@@ -432,8 +441,10 @@ impl Framebuffer {
                         let old = self.resolution.load(Ordering::Relaxed);
                         let h = unpack_height(old);
                         if resolution_fits(new_w, h) {
-                            self.resolution
-                                .store(pack_resolution(new_w, h), Ordering::Release);
+                            self.resolution.store(
+                                pack_resolution(new_w, h),
+                                Ordering::Release,
+                            );
                         }
                     }
                 }
@@ -444,8 +455,10 @@ impl Framebuffer {
                     let old = self.resolution.load(Ordering::Relaxed);
                     let w = unpack_width(old);
                     if resolution_fits(w, new_h) {
-                        self.resolution
-                            .store(pack_resolution(w, new_h), Ordering::Release);
+                        self.resolution.store(
+                            pack_resolution(w, new_h),
+                            Ordering::Release,
+                        );
                     }
                 }
             }
@@ -463,18 +476,7 @@ impl Framebuffer {
 ///
 /// Listens on a Unix domain socket and handles one client at a time.
 /// When a client disconnects, the server waits for a new connection.
-fn vnc_server_loop(dev: Arc<Framebuffer>) {
-    // Remove any stale socket file
-    let _ = std::fs::remove_file(&dev.vnc_path);
-
-    let listener = match UnixListener::bind(&dev.vnc_path) {
-        Ok(l) => l,
-        Err(e) => {
-            slog::error!(dev.log, "failed to bind VNC socket"; "path" => ?dev.vnc_path, "error" => %e);
-            return;
-        }
-    };
-
+fn vnc_server_loop(dev: Arc<Framebuffer>, listener: UnixListener) {
     // Set a timeout on accept so we can check the shutdown flag
     listener
         .set_nonblocking(false)
@@ -624,7 +626,9 @@ fn handle_vnc_client(
     // but some viewers (like macOS Screen Sharing) send it after init.
     // We'll send an initial update after a brief wait.
 
-    while !shutdown_ref.load(Ordering::Relaxed) && client_alive.load(Ordering::Relaxed) {
+    while !shutdown_ref.load(Ordering::Relaxed)
+        && client_alive.load(Ordering::Relaxed)
+    {
         // Poll for client messages (non-blocking due to timeout)
         match rfb::read_client_message(&mut reader) {
             Ok(Some(msg)) => {
@@ -739,18 +743,18 @@ fn send_framebuffer_update<W: Write>(
 /// Wrapper that implements `Read + Write` by combining a BufReader and
 /// BufWriter, needed for the handshake functions which want a single
 /// stream that can both read and write.
-struct CombinedStream<'a, R: io::Read, W: io::Write> {
+struct CombinedStream<'a, R: Read, W: Write> {
     reader: &'a mut BufReader<R>,
     writer: &'a mut BufWriter<W>,
 }
 
-impl<R: io::Read, W: io::Write> io::Read for CombinedStream<'_, R, W> {
+impl<R: Read, W: Write> Read for CombinedStream<'_, R, W> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.reader.read(buf)
     }
 }
 
-impl<R: io::Read, W: io::Write> io::Write for CombinedStream<'_, R, W> {
+impl<R: Read, W: Write> Write for CombinedStream<'_, R, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.writer.write(buf)
     }
@@ -1010,7 +1014,10 @@ mod tests {
             u32::from(crate::pci::bits::RegCmd::MMIO_EN.bits()),
         );
 
-        assert_eq!(dev.bus_mmio.handle_read(bar0_addr, 4), u64::from(BAR1_SIZE));
+        assert_eq!(
+            dev.bus_mmio.handle_read(bar0_addr, 4),
+            u64::from(BAR1_SIZE)
+        );
         assert_eq!(dev.bus_mmio.handle_read(bar1_addr, 4), u64::from(u32::MAX));
     }
 

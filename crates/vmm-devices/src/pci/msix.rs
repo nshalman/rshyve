@@ -43,7 +43,7 @@ fn pba_offset_for(count: u16) -> usize {
 
 /// Bytes the PBA occupies for `count` vectors (one bit per vector).
 fn pba_bytes_for(count: u16) -> usize {
-    (count as usize + 7) / 8
+    (count as usize).div_ceil(8)
 }
 
 /// BAR size that contains both the table and the PBA.
@@ -104,7 +104,7 @@ impl MsixTable {
     /// Create a new MSI-X table with `count` vectors.
     pub fn new(count: u16, hdl: Arc<VmmHdl>) -> Self {
         let entries = vec![MsixEntry::default(); count as usize];
-        let pba_qwords = (count as usize + 63) / 64;
+        let pba_qwords = (count as usize).div_ceil(64);
         Self {
             inner: Mutex::new(MsixInner {
                 entries,
@@ -299,10 +299,7 @@ impl MsixTable {
                 if inner.func_masked {
                     msg_ctrl |= MSG_CTRL_FUNC_MASK;
                 }
-                Some(
-                    u32::from(MSIX_CAP_ID)
-                        | (u32::from(msg_ctrl) << 16),
-                )
+                Some(u32::from(MSIX_CAP_ID) | (u32::from(msg_ctrl) << 16))
             }
             // Bytes 4-7: Table Offset/BIR
             4 => {
@@ -351,10 +348,14 @@ mod tests {
 
     #[test]
     fn pba_lies_inside_bar() {
-        for count in [1u16, 2, 4, 8, 16, 17, 32, 64, 255, 256, 257, 1024, 2048] {
+        for count in [1u16, 2, 4, 8, 16, 17, 32, 64, 255, 256, 257, 1024, 2048]
+        {
             let end = pba_offset_for(count) + pba_bytes_for(count);
             let size = bar_size_for(count);
-            assert!(end <= size, "count {count}: pba ends {end:#x}, bar {size:#x}");
+            assert!(
+                end <= size,
+                "count {count}: pba ends {end:#x}, bar {size:#x}"
+            );
             assert!(size.is_power_of_two(), "count {count}: bar {size:#x}");
             assert!(size >= 4096, "count {count}: bar {size:#x}");
         }

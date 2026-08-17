@@ -208,14 +208,16 @@ impl AhciCtrl {
             completion_count: Mutex::new(0),
         });
 
-        *ctrl.self_ref.lock().expect("ahci: self_ref lock") = Some(Arc::downgrade(&ctrl));
+        *ctrl.self_ref.lock().expect("ahci: self_ref lock") =
+            Some(Arc::downgrade(&ctrl));
 
         ctrl
     }
 
     fn update_mmio_registration(self: &Arc<Self>) {
         let pci = self.pci_state.lock().expect("ahci: pci lock");
-        let mmio_enabled = pci.command().contains(crate::pci::bits::RegCmd::MMIO_EN);
+        let mmio_enabled =
+            pci.command().contains(crate::pci::bits::RegCmd::MMIO_EN);
 
         let mut reg = self.registered_abar.lock().expect("ahci: abar reg lock");
         if let Some(old_addr) = reg.take() {
@@ -227,9 +229,10 @@ impl AhciCtrl {
                 if addr != 0 && def.is_mmio() {
                     let size = def.size();
                     let dev = Arc::clone(self);
-                    let handler: Arc<MmioFn> = Arc::new(move |offset: usize, rwo: RWOp<'_>| {
-                        dev.bar_rw(BarN::BAR5, offset, rwo);
-                    });
+                    let handler: Arc<MmioFn> =
+                        Arc::new(move |offset: usize, rwo: RWOp<'_>| {
+                            dev.bar_rw(BarN::BAR5, offset, rwo);
+                        });
                     if self.bus_mmio.register(addr, size, handler).is_ok() {
                         *reg = Some(addr);
                     }
@@ -295,7 +298,7 @@ impl AhciCtrl {
     }
 
     fn abar_write(&self, offset: usize, wo: &WriteOp) {
-        if offset % 4 != 0 || wo.len() != 4 {
+        if !offset.is_multiple_of(4) || wo.len() != 4 {
             slog::debug!(self.log, "ahci: ignored invalid ABAR write";
                 "offset" => offset,
                 "len" => wo.len(),
@@ -359,7 +362,8 @@ impl AhciCtrl {
                         true
                     }
                     PX_CMD => {
-                        st.port.cmd = (st.port.cmd & !PXCMD_WMASK) | (val & PXCMD_WMASK);
+                        st.port.cmd =
+                            (st.port.cmd & !PXCMD_WMASK) | (val & PXCMD_WMASK);
                         if val & PXCMD_ST != 0 {
                             st.port.cmd |= PXCMD_CR;
                         } else {
@@ -527,7 +531,8 @@ mod tests {
     }
 
     fn test_controller(intr_pin: Option<Arc<dyn IntrPin>>) -> Arc<AhciCtrl> {
-        let file = tempfile::NamedTempFile::new().expect("create temporary ISO");
+        let file =
+            tempfile::NamedTempFile::new().expect("create temporary ISO");
         file.as_file().set_len(4096).expect("size temporary ISO");
         let media = IsoMedia::open(file.path()).expect("open temporary ISO");
 
@@ -549,7 +554,9 @@ mod tests {
             4 => u64::from(u32::from_le_bytes(
                 ro.buf().try_into().expect("four-byte ABAR read"),
             )),
-            8 => u64::from_le_bytes(ro.buf().try_into().expect("eight-byte ABAR read")),
+            8 => u64::from_le_bytes(
+                ro.buf().try_into().expect("eight-byte ABAR read"),
+            ),
             _ => unreachable!("unsupported test ABAR read width"),
         }
     }
@@ -723,7 +730,8 @@ mod tests {
     #[test]
     fn pxcmd_clo_clears_bsy_drq() {
         let ctrl = test_controller(None);
-        ctrl.state.lock().expect("ahci: state lock").port.tfd |= ATA_S_BUSY | ATA_S_DRQ;
+        ctrl.state.lock().expect("ahci: state lock").port.tfd |=
+            ATA_S_BUSY | ATA_S_DRQ;
 
         abar_write_u32(&ctrl, AHCI_OFFSET + PX_CMD, PXCMD_CLO);
         let tfd = abar_read(&ctrl, AHCI_OFFSET + PX_TFD, 4) as u32;
@@ -765,7 +773,10 @@ mod tests {
 
         abar_write_u32(&ctrl, AHCI_OFFSET + PX_CI, 1);
 
-        assert_eq!(abar_read(&ctrl, AHCI_OFFSET + PX_TFD, 4), u64::from(TFD_ABORT));
+        assert_eq!(
+            abar_read(&ctrl, AHCI_OFFSET + PX_TFD, 4),
+            u64::from(TFD_ABORT)
+        );
         assert_eq!(abar_read(&ctrl, AHCI_OFFSET + PX_CI, 4), 0);
     }
 
@@ -798,7 +809,10 @@ mod tests {
 
         abar_write_u32(&ctrl, AHCI_OFFSET + PX_CI, u32::MAX);
 
-        assert_eq!(abar_read(&ctrl, AHCI_OFFSET + PX_TFD, 4), u64::from(TFD_ABORT));
+        assert_eq!(
+            abar_read(&ctrl, AHCI_OFFSET + PX_TFD, 4),
+            u64::from(TFD_ABORT)
+        );
         assert_eq!(abar_read(&ctrl, AHCI_OFFSET + PX_CI, 4), 0);
     }
 

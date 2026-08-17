@@ -135,7 +135,11 @@ impl Inner {
 }
 
 impl HyperV {
-    pub fn new(log: Logger, physmap: Arc<PhysMap>, features: Features) -> Arc<Self> {
+    pub fn new(
+        log: Logger,
+        physmap: Arc<PhysMap>,
+        features: Features,
+    ) -> Arc<Self> {
         Arc::new(Self {
             log,
             physmap,
@@ -159,7 +163,8 @@ impl HyperV {
 
         // 0x4000_0000: vendor signature.
         entries.push(cpuid_entry(
-            0x4000_0000, 0,
+            0x4000_0000,
+            0,
             max_leaf,
             HV_CPUID_VENDOR_EBX,
             HV_CPUID_VENDOR_ECX,
@@ -167,7 +172,14 @@ impl HyperV {
         ));
 
         // 0x4000_0001: interface signature ("Hv#1").
-        entries.push(cpuid_entry(0x4000_0001, 0, HV_CPUID_INTERFACE_EAX, 0, 0, 0));
+        entries.push(cpuid_entry(
+            0x4000_0001,
+            0,
+            HV_CPUID_INTERFACE_EAX,
+            0,
+            0,
+            0,
+        ));
 
         // 0x4000_0002: hypervisor version. Zeroed to avoid having to
         // reason about specific version semantics across migration.
@@ -211,8 +223,12 @@ impl HyperV {
         }
         let inner = self.inner.lock().unwrap();
         match msr {
-            HV_X64_MSR_GUEST_OS_ID => RdmsrOutcome::Handled(inner.msr_guest_os_id),
-            HV_X64_MSR_HYPERCALL => RdmsrOutcome::Handled(inner.msr_hypercall.raw()),
+            HV_X64_MSR_GUEST_OS_ID => {
+                RdmsrOutcome::Handled(inner.msr_guest_os_id)
+            }
+            HV_X64_MSR_HYPERCALL => {
+                RdmsrOutcome::Handled(inner.msr_hypercall.raw())
+            }
             HV_X64_MSR_VP_INDEX => RdmsrOutcome::Handled(vcpu_id as u64),
 
             // Read-only counter; gated on the reference-TSC feature
@@ -280,11 +296,26 @@ impl HyperV {
             }
             HV_X64_MSR_REFERENCE_TSC => WrmsrOutcome::GpException,
 
-            HV_X64_MSR_CRASH_P0 => { inner.crash_p[0] = value; WrmsrOutcome::Handled }
-            HV_X64_MSR_CRASH_P1 => { inner.crash_p[1] = value; WrmsrOutcome::Handled }
-            HV_X64_MSR_CRASH_P2 => { inner.crash_p[2] = value; WrmsrOutcome::Handled }
-            HV_X64_MSR_CRASH_P3 => { inner.crash_p[3] = value; WrmsrOutcome::Handled }
-            HV_X64_MSR_CRASH_P4 => { inner.crash_p[4] = value; WrmsrOutcome::Handled }
+            HV_X64_MSR_CRASH_P0 => {
+                inner.crash_p[0] = value;
+                WrmsrOutcome::Handled
+            }
+            HV_X64_MSR_CRASH_P1 => {
+                inner.crash_p[1] = value;
+                WrmsrOutcome::Handled
+            }
+            HV_X64_MSR_CRASH_P2 => {
+                inner.crash_p[2] = value;
+                WrmsrOutcome::Handled
+            }
+            HV_X64_MSR_CRASH_P3 => {
+                inner.crash_p[3] = value;
+                WrmsrOutcome::Handled
+            }
+            HV_X64_MSR_CRASH_P4 => {
+                inner.crash_p[4] = value;
+                WrmsrOutcome::Handled
+            }
             HV_X64_MSR_CRASH_CTL => {
                 if value & HV_CRASH_CTL_NOTIFY != 0 {
                     self.log_crash(&inner);
@@ -387,9 +418,19 @@ impl HyperV {
         let gpa = msr.gpa();
         let page = if scale == 0 {
             // Sequence=0 means "page invalid"; guest falls back.
-            ReferenceTscPage { sequence: 0, reserved: 0, scale: 0, offset: 0 }
+            ReferenceTscPage {
+                sequence: 0,
+                reserved: 0,
+                scale: 0,
+                offset: 0,
+            }
         } else {
-            ReferenceTscPage { sequence: 1, reserved: 0, scale, offset: 0 }
+            ReferenceTscPage {
+                sequence: 1,
+                reserved: 0,
+                scale,
+                offset: 0,
+            }
         }
         .into_page();
 
@@ -446,9 +487,15 @@ impl HyperV {
         let mut inner = self.inner.lock().unwrap();
         if inner.msr_guest_os_id != 0 && inner.msr_hypercall.enabled() {
             let payload = hypercall::build_page();
-            match overlay::install(&self.physmap, inner.msr_hypercall.gpa(), &payload) {
+            match overlay::install(
+                &self.physmap,
+                inner.msr_hypercall.gpa(),
+                &payload,
+            ) {
                 Ok(ov) => inner.hypercall_overlay = Some(ov),
-                Err(e) => warn!(self.log, "resume hypercall overlay failed"; "error" => %e),
+                Err(e) => {
+                    warn!(self.log, "resume hypercall overlay failed"; "error" => %e)
+                }
             }
         }
         if self.features.reference_tsc && inner.msr_reference_tsc.enabled() {

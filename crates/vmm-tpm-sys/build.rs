@@ -26,7 +26,8 @@ fn main() {
         src.display()
     );
 
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR set by cargo"));
+    let out_dir =
+        PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR set by cargo"));
     // Copy the vendored source into OUT_DIR so autoreconf can write
     // generated files (configure, Makefile.in, …) without polluting
     // the checked-in tree.
@@ -166,8 +167,8 @@ fn run_configure(src: &Path, build: &Path) {
         for prefix in ["/opt/tools", "/opt/local", "/usr/local"] {
             let inc = format!("{prefix}/include/openssl");
             let lib = format!("{prefix}/lib");
-            if std::path::Path::new(&inc).is_dir()
-                && std::path::Path::new(&lib).join("libcrypto.so").exists()
+            if Path::new(&inc).is_dir()
+                && Path::new(&lib).join("libcrypto.so").exists()
             {
                 cflags.push_str(&format!(" -I{prefix}/include"));
                 ldflags.push_str(&format!("-L{prefix}/lib"));

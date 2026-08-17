@@ -79,7 +79,7 @@ pub fn compute_layout(
 ) -> anyhow::Result<BootromLayout> {
     ensure!(rom_size != 0, "bootrom size must be non-zero");
     ensure!(
-        rom_size % 4096 == 0,
+        rom_size.is_multiple_of(4096),
         "bootrom size ({rom_size} bytes) is not page-aligned"
     );
     ensure!(
@@ -91,7 +91,7 @@ pub fn compute_layout(
         "variable store size ({var_size} bytes) is smaller than one page"
     );
     ensure!(
-        var_size % 4096 == 0,
+        var_size.is_multiple_of(4096),
         "variable store size ({var_size} bytes) is not page-aligned"
     );
     ensure!(
@@ -119,10 +119,7 @@ pub fn compute_layout(
 }
 
 /// Check whether a ROM and variable store resemble a matched firmware pair.
-pub fn flash_window_looks_consistent(
-    rom_size: usize,
-    var_size: usize,
-) -> bool {
+pub fn flash_window_looks_consistent(rom_size: usize, var_size: usize) -> bool {
     if var_size == 0 {
         return true;
     }
@@ -136,7 +133,7 @@ pub fn flash_window_looks_consistent(
 
     total_size <= GUEST_4GIB
         && total_size.is_power_of_two()
-        && (GUEST_4GIB - total_size) % total_size == 0
+        && (GUEST_4GIB - total_size).is_multiple_of(total_size)
 }
 
 /// Log the flash layout and flag firmware files that appear mismatched.
@@ -197,40 +194,49 @@ impl BootromFile {
     /// - File size is within bounds (4 KiB to 16 MiB)
     /// - File size is page-aligned (multiple of 4096)
     pub fn open(path: &Path) -> anyhow::Result<Self> {
-        let mut file = File::open(path)
-            .with_context(|| format!("cannot open bootrom: {}", path.display()))?;
+        let mut file = File::open(path).with_context(|| {
+            format!("cannot open bootrom: {}", path.display())
+        })?;
 
-        let metadata = file.metadata()
-            .with_context(|| format!("cannot stat bootrom: {}", path.display()))?;
+        let metadata = file.metadata().with_context(|| {
+            format!("cannot stat bootrom: {}", path.display())
+        })?;
 
         let size = metadata.len() as usize;
 
         ensure!(
             size >= MIN_ROM_FILE_SIZE,
             "bootrom {} is too small ({} bytes, minimum {})",
-            path.display(), size, MIN_ROM_FILE_SIZE,
+            path.display(),
+            size,
+            MIN_ROM_FILE_SIZE,
         );
 
         ensure!(
             size <= MAX_ROM_FILE_SIZE,
             "bootrom {} is too large ({} bytes, maximum {})",
-            path.display(), size, MAX_ROM_FILE_SIZE,
+            path.display(),
+            size,
+            MAX_ROM_FILE_SIZE,
         );
 
         ensure!(
-            size % 4096 == 0,
+            size.is_multiple_of(4096),
             "bootrom {} size ({} bytes) is not page-aligned (must be multiple of 4096)",
             path.display(), size,
         );
 
         let mut data = Vec::with_capacity(size);
-        file.read_to_end(&mut data)
-            .with_context(|| format!("failed to read bootrom: {}", path.display()))?;
+        file.read_to_end(&mut data).with_context(|| {
+            format!("failed to read bootrom: {}", path.display())
+        })?;
 
         ensure!(
             data.len() == size,
             "bootrom {} short read: expected {} bytes, got {}",
-            path.display(), size, data.len(),
+            path.display(),
+            size,
+            data.len(),
         );
 
         Ok(Self {
@@ -263,7 +269,8 @@ pub fn load_bootrom(
     ensure!(
         rom.size() == layout.rom_size,
         "bootrom size ({} bytes) does not match layout size ({} bytes)",
-        rom.size(), layout.rom_size,
+        rom.size(),
+        layout.rom_size,
     );
 
     // Add SEC temp RAM below the ROM for firmware PEI-phase stack/heap.
@@ -275,11 +282,13 @@ pub fn load_bootrom(
     map.add_rom(hdl, layout.rom_gpa, layout.rom_size)
         .context("failed to map ROM region into guest address space")?;
 
-    let sub = map.lookup(layout.rom_gpa, layout.rom_size)
-        .ok_or_else(|| anyhow::anyhow!(
+    let sub = map.lookup(layout.rom_gpa, layout.rom_size).ok_or_else(|| {
+        anyhow::anyhow!(
             "ROM region at GPA {:#x} len {} not found after mapping",
-            layout.rom_gpa, layout.rom_size,
-        ))?;
+            layout.rom_gpa,
+            layout.rom_size,
+        )
+    })?;
 
     sub.write_bytes(&rom.data)
         .context("failed to write bootrom data into guest memory")?;
@@ -460,10 +469,7 @@ mod tests {
             (0x1E0000, 0x40000),
         ] {
             let layout = compute_layout(rom_size, var_size).unwrap();
-            assert_eq!(
-                layout.rom_gpa + layout.rom_size as u64,
-                GUEST_4GIB,
-            );
+            assert_eq!(layout.rom_gpa + layout.rom_size as u64, GUEST_4GIB,);
         }
     }
 
@@ -525,13 +531,11 @@ mod tests {
 
     #[test]
     fn rom_and_varfile() {
-        let args = vec!["bootrom,/fw/CODE.fd,/var/db/vmm/x/VARS.fd".to_string()];
+        let args =
+            vec!["bootrom,/fw/CODE.fd,/var/db/vmm/x/VARS.fd".to_string()];
         let spec = find_bootrom_spec(&args).unwrap();
         assert_eq!(spec.rom, PathBuf::from("/fw/CODE.fd"));
-        assert_eq!(
-            spec.vars,
-            Some(PathBuf::from("/var/db/vmm/x/VARS.fd"))
-        );
+        assert_eq!(spec.vars, Some(PathBuf::from("/var/db/vmm/x/VARS.fd")));
     }
 
     #[test]

@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copied from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: lib/propolis/src/util/aspace.rs
+// https://github.com/oxidecomputer/propolis
 
 //! Generic address space container.
 //!
@@ -51,7 +55,11 @@ impl<T> ASpace<T> {
     /// Panics if `start > end`.
     pub const fn new(start: usize, end: usize) -> Self {
         assert!(start <= end);
-        Self { start, end, map: BTreeMap::new() }
+        Self {
+            start,
+            end,
+            map: BTreeMap::new(),
+        }
     }
 
     /// Register a region starting at `start` with length `len`.
@@ -70,7 +78,11 @@ impl<T> ASpace<T> {
         }
 
         // Do any entries conflict with the registration?
-        if self.covered_by((Included(start), Included(end))).next().is_some() {
+        if self
+            .covered_by((Included(start), Included(end)))
+            .next()
+            .is_some()
+        {
             return Err(Error::Conflict);
         }
 
@@ -104,7 +116,9 @@ impl<T> ASpace<T> {
 
     /// Get an iterator for items in the space, sorted by starting point.
     pub fn iter(&self) -> Iter<'_, T> {
-        Iter { inner: self.map.iter() }
+        Iter {
+            inner: self.map.iter(),
+        }
     }
 
     /// Return the lowest starting address matching the predicate.
@@ -122,8 +136,11 @@ impl<T> ASpace<T> {
     where
         P: FnMut(&T) -> bool,
     {
-        let (&k, &(len, _)) =
-            self.map.iter().rev().find(|(_, (_, entry))| predicate(entry))?;
+        let (&k, &(len, _)) = self
+            .map
+            .iter()
+            .rev()
+            .find(|(_, (_, entry))| predicate(entry))?;
         Some(k + len - 1)
     }
 
@@ -131,7 +148,11 @@ impl<T> ASpace<T> {
     ///
     /// Returns all space which does not overlap with registered regions.
     pub fn inverse_iter(&self) -> InverseIter<'_, T> {
-        InverseIter { inner: self.map.iter(), next: 0, end: self.end }
+        InverseIter {
+            inner: self.map.iter(),
+            next: 0,
+            end: self.end,
+        }
     }
 
     /// Get iterator for regions which are (partially or totally) covered by
@@ -165,7 +186,9 @@ impl<T> ASpace<T> {
             Excluded(a) => Excluded(*a),
             Included(a) => Included(*a),
         };
-        Range { inner: self.map.range((fixed_front, tail)) }
+        Range {
+            inner: self.map.range((fixed_front, tail)),
+        }
     }
 
     /// Clear all items from the space.
@@ -263,8 +286,10 @@ impl<T> Iterator for InverseIter<'_, T> {
                 }
                 None => {
                     // No more registered regions; return everything to end.
-                    let extent =
-                        Extent { start: self.next, len: self.end - self.next };
+                    let extent = Extent {
+                        start: self.next,
+                        len: self.end - self.next,
+                    };
                     self.next = self.end;
                     return Some(extent);
                 }

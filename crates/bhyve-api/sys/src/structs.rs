@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Derived from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: crates/bhyve-api/sys/src/structs.rs
+// https://github.com/oxidecomputer/propolis
 
 use std::io::{Error, ErrorKind, Result};
 use std::os::raw::{c_int, c_uint, c_void};
@@ -531,12 +535,18 @@ pub struct vm_create_req {
 }
 impl Default for vm_create_req {
     fn default() -> Self {
-        Self { name: [0u8; VM_MAX_NAMELEN], flags: 0 }
+        Self {
+            name: [0u8; VM_MAX_NAMELEN],
+            flags: 0,
+        }
     }
 }
 impl vm_create_req {
     pub fn new(name: &[u8]) -> Result<Self> {
-        Ok(Self { name: validate_name(name)?, flags: 0 })
+        Ok(Self {
+            name: validate_name(name)?,
+            flags: 0,
+        })
     }
 }
 
@@ -556,12 +566,16 @@ pub struct vm_destroy_req {
 }
 impl Default for vm_destroy_req {
     fn default() -> Self {
-        Self { name: [0u8; VM_MAX_NAMELEN] }
+        Self {
+            name: [0u8; VM_MAX_NAMELEN],
+        }
     }
 }
 impl vm_destroy_req {
     pub fn new(name: &[u8]) -> Result<Self> {
-        Ok(Self { name: validate_name(name)? })
+        Ok(Self {
+            name: validate_name(name)?,
+        })
     }
 }
 
@@ -709,9 +723,10 @@ pub const PCI_ADDR_MEM64: u32 = 3;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::size_of;
 
     #[test]
     fn vm_munmap_layout() {
-        assert_eq!(std::mem::size_of::<vm_munmap>(), 16);
+        assert_eq!(size_of::<vm_munmap>(), 16);
     }
 }

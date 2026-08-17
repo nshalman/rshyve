@@ -23,18 +23,18 @@
 #
 # Example:
 #   vmm-migrate.sh \
-#     --source-host $VMM_HEADNODE \
-#     --dest-host $VMM_MIGRATE_HOST \
+#     --source-host source.example \
+#     --dest-host dest.example \
 #     --source-dataset zones/vmm-test-disk \
 #     --control-socket /tmp/vmm-testvm.sock \
 #     --vmm-args '-H -c 2 -m 1G -s 0,hostbridge -s 4,virtio-blk,/dev/zvol/dsk/zones/vmm-test-disk -s 6,virtio-net-viona,vmm_test0 -s 31,lpc -l bootrom,/usr/share/bhyve/uefi-rom.bin' \
-#     --ssh-key $VMM_LAB_KEY
+#     --ssh-key ~/.ssh/id_lab
 
 set -o errexit
 set -o pipefail
 
 # Defaults
-SSH_KEY="${HOME}/.ssh/$VMM_LAB_KEY"
+SSH_KEY="${VMM_LAB_KEY:-}"   # required; pass --ssh-key or set VMM_LAB_KEY
 MIGRATE_PORT=4567
 MAX_SYNCS=3
 VMM_BIN_SRC="/opt/vmmnew/target/release/vmm"
@@ -59,14 +59,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Validate required args
-for var in SRC_HOST DST_HOST SRC_DATASET CTL_SOCK VMM_ARGS; do
+for var in SRC_HOST DST_HOST SRC_DATASET CTL_SOCK VMM_ARGS SSH_KEY; do
     if [[ -z "${!var}" ]]; then
         echo "Missing required argument: --$(echo $var | tr '_' '-' | tr 'A-Z' 'a-z')" >&2
         exit 1
     fi
 done
 
-SSH="ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=5"
+# Host key verification stays on: this script pipes zfs send streams of
+# guest disks to a remote root shell. Add both hosts to known_hosts first.
+SSH="ssh -i ${SSH_KEY} -o ConnectTimeout=5"
 DST_DATASET="${SRC_DATASET}"
 
 log() { echo "[$(date +%T)] $*"; }

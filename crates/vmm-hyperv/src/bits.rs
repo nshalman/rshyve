@@ -75,23 +75,23 @@ bitflags! {
 
 // ---- MSR addresses ----
 
-pub const HV_X64_MSR_GUEST_OS_ID:     u32 = 0x4000_0000;
-pub const HV_X64_MSR_HYPERCALL:       u32 = 0x4000_0001;
-pub const HV_X64_MSR_VP_INDEX:        u32 = 0x4000_0002;
-pub const HV_X64_MSR_RESET:           u32 = 0x4000_0003;
+pub const HV_X64_MSR_GUEST_OS_ID: u32 = 0x4000_0000;
+pub const HV_X64_MSR_HYPERCALL: u32 = 0x4000_0001;
+pub const HV_X64_MSR_VP_INDEX: u32 = 0x4000_0002;
+pub const HV_X64_MSR_RESET: u32 = 0x4000_0003;
 
-pub const HV_X64_MSR_TIME_REF_COUNT:  u32 = 0x4000_0020;
-pub const HV_X64_MSR_REFERENCE_TSC:   u32 = 0x4000_0021;
+pub const HV_X64_MSR_TIME_REF_COUNT: u32 = 0x4000_0020;
+pub const HV_X64_MSR_REFERENCE_TSC: u32 = 0x4000_0021;
 
 /// Crash dump MSRs. Windows writes BSOD parameters here before the
 /// triple fault, then sets the NOTIFY bit on `CRASH_CTL`. We log the
 /// parameters via slog and otherwise treat them as opaque.
-pub const HV_X64_MSR_CRASH_P0:        u32 = 0x4000_0100;
-pub const HV_X64_MSR_CRASH_P1:        u32 = 0x4000_0101;
-pub const HV_X64_MSR_CRASH_P2:        u32 = 0x4000_0102;
-pub const HV_X64_MSR_CRASH_P3:        u32 = 0x4000_0103;
-pub const HV_X64_MSR_CRASH_P4:        u32 = 0x4000_0104;
-pub const HV_X64_MSR_CRASH_CTL:       u32 = 0x4000_0105;
+pub const HV_X64_MSR_CRASH_P0: u32 = 0x4000_0100;
+pub const HV_X64_MSR_CRASH_P1: u32 = 0x4000_0101;
+pub const HV_X64_MSR_CRASH_P2: u32 = 0x4000_0102;
+pub const HV_X64_MSR_CRASH_P3: u32 = 0x4000_0103;
+pub const HV_X64_MSR_CRASH_P4: u32 = 0x4000_0104;
+pub const HV_X64_MSR_CRASH_CTL: u32 = 0x4000_0105;
 
 /// Bit 63 of CRASH_CTL: written by the guest to signal "crash data
 /// has been published".

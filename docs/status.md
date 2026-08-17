@@ -28,7 +28,8 @@
 | Framebuffer/VNC | Complete | Unix socket, password, resolution |
 | xHCI USB tablet | Complete | HID pointer device |
 | PCI passthrough | Complete | Intel VT-d + AMD IOMMU |
-| AHCI CD/HD | Stub | Falls back to virtio-blk |
+| AHCI CD-ROM (`ahci-cd`) | Complete | ATAPI SCSI/MMC, zero-copy reads |
+| AHCI disk (`ahci-hd`) | Not implemented | Rejected at startup; use virtio-blk or nvme |
 | LAPIC/IOAPIC/PIC/PIT | Complete | Kernel-emulated |
 | HPET | Complete | Kernel-emulated |
 | RTC | Complete | Memory size in NVRAM |
@@ -65,7 +66,7 @@
 | Same-host migration | Complete |
 | Cross-host (old->new CPU) | Complete |
 | Cross-host (new->old CPU) | Requires --cpu-baseline |
-| CPU feature check at preamble | Complete |
+| CPU feature check at preamble | Warns only | Does not reject a mismatch; sync and async paths compare differently |
 | CPUID masking (--cpu-baseline) | Complete (host, avx2, sse42) |
 | RAM transfer (pre/post pause) | Complete |
 | Kernel device state | Complete (IOAPIC, ATPIT, ATPIC, HPET, RTC, PM Timer) |
@@ -90,8 +91,9 @@
 
 ## Known Limitations
 
-- AHCI not natively implemented (falls back to virtio-blk with warning)
+- `ahci-hd` not implemented (`ahci-cd` is); use virtio-blk or nvme for disks
 - FPU/XSAVE state not transferred during migration
+- Migration transport is unauthenticated and unencrypted; see SECURITY.md
 - NVList/zhyve.cmd reader not implemented (boot.c integration uses CLI flags directly)
 - Large VMs (>32 GB) not tested with migration
 - virtio-net TX may show initial delay on first packet (viona interrupt poll startup)

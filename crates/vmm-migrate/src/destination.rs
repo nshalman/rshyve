@@ -21,9 +21,9 @@ use vmm_core::mem::MemCtx;
 
 use crate::codec::{
     DeviceState, Message, MigrateError, MigrationPreamble, ProtocolOffer,
-    ProtocolSelect, TimeData, PAGE_BATCH_FLAG_ZSTD,
+    ProtocolSelect, TimeData,
 };
-use crate::protocol::PAGE_SIZE;
+use crate::pages::apply_page_batch;
 use crate::protocol::PROTOCOL_RON_V0;
 use crate::state;
 use crate::MigrationPhase;
@@ -50,16 +50,17 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // Upgrade to WebSocket (server role)
-    let ws = tokio_tungstenite::accept_async(stream)
-        .await
-        .map_err(|e| MigrateError::WebSocket(format!(
-            "WebSocket accept failed: {e}"
-        )))?;
-
-    run_destination_inner(
-        ws, &hdl, memctx, num_cpus, mem_size, &status, log,
+    let ws = tokio_tungstenite::accept_async_with_config(
+        stream,
+        Some(crate::limits::ws_config()),
     )
     .await
+    .map_err(|e| {
+        MigrateError::WebSocket(format!("WebSocket accept failed: {e}"))
+    })?;
+
+    run_destination_inner(ws, &hdl, memctx, num_cpus, mem_size, &status, log)
+        .await
 }
 
 /// Inner protocol driver.
@@ -90,7 +91,9 @@ async fn run_destination_inner<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(err);
     }
 
-    let sel = ProtocolSelect { protocol: PROTOCOL_RON_V0.to_string() };
+    let sel = ProtocolSelect {
+        protocol: PROTOCOL_RON_V0.to_string(),
+    };
     let sel_msg = Message::serialized(&sel)?;
     ws.send(sel_msg.encode()).await?;
 
@@ -120,8 +123,14 @@ async fn run_destination_inner<S: AsyncRead + AsyncWrite + Unpin>(
     // Check CPU feature compatibility: destination must support all
     // features the source exposes to the guest.
     if let Some(ref src_cpu) = preamble.cpu_features {
-        let (dst_l1_ecx, dst_l1_edx, dst_l7_ebx, dst_l7_ecx, dst_l7_edx, dst_xcr0) =
-            vmm_core::cpuid::query_host_features();
+        let (
+            dst_l1_ecx,
+            dst_l1_edx,
+            dst_l7_ebx,
+            dst_l7_ecx,
+            dst_l7_edx,
+            dst_xcr0,
+        ) = vmm_core::cpuid::query_host_features();
 
         // Mask out deprecated/irrelevant features that don't affect
         // guest instruction compatibility:
@@ -138,9 +147,12 @@ async fn run_destination_inner<S: AsyncRead + AsyncWrite + Unpin>(
         let missing_l7_edx = src_cpu.leaf7_edx & !dst_l7_edx;
         let missing_xcr0 = (src_cpu.xcr0 & !IGNORE_XCR0) & !dst_xcr0;
 
-        if missing_l1_ecx != 0 || missing_l1_edx != 0
-            || missing_l7_ebx != 0 || missing_l7_ecx != 0
-            || missing_l7_edx != 0 || missing_xcr0 != 0
+        if missing_l1_ecx != 0
+            || missing_l1_edx != 0
+            || missing_l7_ebx != 0
+            || missing_l7_ecx != 0
+            || missing_l7_edx != 0
+            || missing_xcr0 != 0
         {
             // Warn but continue — the source's --cpu-baseline already
             // restricted guest-visible features. The preamble reports
@@ -191,9 +203,8 @@ async fn run_destination_inner<S: AsyncRead + AsyncWrite + Unpin>(
     // defers timer callout scheduling to VM_RESUME. Without this,
     // the LAPIC timer is never re-armed after migration.
     slog::info!(log, "pausing VM before state import");
-    hdl.pause().map_err(|e| {
-        MigrateError::Io(format!("pause before import: {e}"))
-    })?;
+    hdl.pause()
+        .map_err(|e| MigrateError::Io(format!("pause before import: {e}")))?;
 
     // ── Phase: TimeData ───────────────────────────────────────────
     // Time data MUST be imported before device state because LAPIC
@@ -214,10 +225,12 @@ async fn run_destination_inner<S: AsyncRead + AsyncWrite + Unpin>(
     // Resume the VM. This triggers vlapic_resume() in the kernel,
     // which calls vlapic_callout_reset() to re-arm the LAPIC timer.
     // Also resumes HPET, PIT, and RTC timers.
-    slog::info!(log, "resuming VM after state import (triggers timer re-arm)");
-    hdl.resume().map_err(|e| {
-        MigrateError::Io(format!("resume after import: {e}"))
-    })?;
+    slog::info!(
+        log,
+        "resuming VM after state import (triggers timer re-arm)"
+    );
+    hdl.resume()
+        .map_err(|e| MigrateError::Io(format!("resume after import: {e}")))?;
     slog::info!(log, "VM resumed successfully");
 
     // ── Phase: RamPull ────────────────────────────────────────────
@@ -289,54 +302,64 @@ async fn receive_ram_pass<S: AsyncRead + AsyncWrite + Unpin>(
                 loop {
                     let next = recv(ws).await?;
                     match next {
-                        Message::PauseSignal => return Ok(RamPassResult::PauseSignal),
+                        Message::PauseSignal => {
+                            return Ok(RamPassResult::PauseSignal)
+                        }
                         Message::MemEnd => {
                             // Empty pass — ack and keep waiting
                             ws.send(Message::MemDone.encode()).await?;
                             continue;
                         }
-                        Message::PageBatch { base_gpa, page_count, flags, data } => {
-                            write_page_batch(memctx, base_gpa, page_count, flags, &data, None, status)?;
+                        Message::PageBatch {
+                            base_gpa,
+                            page_count,
+                            flags,
+                            data,
+                        } => {
+                            apply_page_batch(
+                                memctx, base_gpa, page_count, flags, &data,
+                                None, status,
+                            )?;
                             continue_ram_pass(ws, memctx, status).await?;
                             return Ok(RamPassResult::MorePasses);
                         }
                         Message::MemFetch(gpas) => {
                             sparse_gpas = Some(gpas);
-                            continue_ram_pass_with_sparse(ws, memctx, status, &mut sparse_gpas).await?;
+                            continue_ram_pass_with_sparse(
+                                ws,
+                                memctx,
+                                status,
+                                &mut sparse_gpas,
+                            )
+                            .await?;
                             return Ok(RamPassResult::MorePasses);
                         }
-                        other => return Err(MigrateError::UnexpectedMessage {
-                            expected: "PauseSignal, PageBatch, or MemEnd".to_string(),
-                            got: format!("{other:?}"),
-                        }),
+                        other => {
+                            return Err(MigrateError::UnexpectedMessage {
+                                expected: "PauseSignal, PageBatch, or MemEnd"
+                                    .to_string(),
+                                got: format!("{other:?}"),
+                            })
+                        }
                     }
                 }
             }
-            Message::PageBatch { base_gpa, page_count, flags, data } => {
+            Message::PageBatch {
+                base_gpa,
+                page_count,
+                flags,
+                data,
+            } => {
                 // Contiguous batch of pages
-                write_page_batch(memctx, base_gpa, page_count, flags, &data, None, status)?;
+                apply_page_batch(
+                    memctx, base_gpa, page_count, flags, &data, None, status,
+                )?;
             }
             Message::MemFetch(gpas) => {
                 // Sparse dirty pages: GPA list followed by PageBatch
                 sparse_gpas = Some(gpas);
             }
-            Message::Page(data) if sparse_gpas.is_some() => {
-                // Legacy per-page receive (backward compat)
-                if let Some(ref gpas) = sparse_gpas {
-                    if let Some(&gpa) = gpas.first() {
-                        let _ = memctx.write(gpa, &data);
-                        if let Ok(mut s) = status.lock() {
-                            s.pages_transferred += 1;
-                            s.bytes_transferred += PAGE_SIZE as u64;
-                        }
-                    }
-                }
-            }
             other => {
-                // If we have pending sparse GPAs and get a PageBatch, use them
-                if let Message::PageBatch { .. } = other {
-                    // shouldn't happen — handled above
-                }
                 return Err(MigrateError::UnexpectedMessage {
                     expected: "PageBatch, MemFetch, or MemEnd".to_string(),
                     got: format!("{other:?}"),
@@ -348,8 +371,21 @@ async fn receive_ram_pass<S: AsyncRead + AsyncWrite + Unpin>(
         if let Some(ref gpas) = sparse_gpas {
             let batch_msg = recv(ws).await?;
             match batch_msg {
-                Message::PageBatch { base_gpa, page_count, flags, data } => {
-                    write_page_batch(memctx, base_gpa, page_count, flags, &data, Some(gpas), status)?;
+                Message::PageBatch {
+                    base_gpa,
+                    page_count,
+                    flags,
+                    data,
+                } => {
+                    apply_page_batch(
+                        memctx,
+                        base_gpa,
+                        page_count,
+                        flags,
+                        &data,
+                        Some(gpas),
+                        status,
+                    )?;
                 }
                 other => {
                     return Err(MigrateError::UnexpectedMessage {
@@ -375,8 +411,21 @@ async fn receive_final_ram_pass<S: AsyncRead + AsyncWrite + Unpin>(
         if let Some(ref gpas) = sparse_gpas {
             let batch_msg = recv(ws).await?;
             match batch_msg {
-                Message::PageBatch { base_gpa, page_count, flags, data } => {
-                    write_page_batch(memctx, base_gpa, page_count, flags, &data, Some(gpas), status)?;
+                Message::PageBatch {
+                    base_gpa,
+                    page_count,
+                    flags,
+                    data,
+                } => {
+                    apply_page_batch(
+                        memctx,
+                        base_gpa,
+                        page_count,
+                        flags,
+                        &data,
+                        Some(gpas),
+                        status,
+                    )?;
                 }
                 other => {
                     return Err(MigrateError::UnexpectedMessage {
@@ -394,8 +443,15 @@ async fn receive_final_ram_pass<S: AsyncRead + AsyncWrite + Unpin>(
                 ws.send(Message::MemDone.encode()).await?;
                 return Ok(());
             }
-            Message::PageBatch { base_gpa, page_count, flags, data } => {
-                write_page_batch(memctx, base_gpa, page_count, flags, &data, None, status)?;
+            Message::PageBatch {
+                base_gpa,
+                page_count,
+                flags,
+                data,
+            } => {
+                apply_page_batch(
+                    memctx, base_gpa, page_count, flags, &data, None, status,
+                )?;
             }
             Message::MemFetch(gpas) => {
                 sparse_gpas = Some(gpas);
@@ -431,8 +487,21 @@ async fn continue_ram_pass_with_sparse<S: AsyncRead + AsyncWrite + Unpin>(
         if let Some(ref gpas) = sparse_gpas {
             let batch_msg = recv(ws).await?;
             match batch_msg {
-                Message::PageBatch { base_gpa, page_count, flags, data } => {
-                    write_page_batch(memctx, base_gpa, page_count, flags, &data, Some(gpas), status)?;
+                Message::PageBatch {
+                    base_gpa,
+                    page_count,
+                    flags,
+                    data,
+                } => {
+                    apply_page_batch(
+                        memctx,
+                        base_gpa,
+                        page_count,
+                        flags,
+                        &data,
+                        Some(gpas),
+                        status,
+                    )?;
                 }
                 other => {
                     return Err(MigrateError::UnexpectedMessage {
@@ -450,8 +519,15 @@ async fn continue_ram_pass_with_sparse<S: AsyncRead + AsyncWrite + Unpin>(
                 ws.send(Message::MemDone.encode()).await?;
                 return Ok(());
             }
-            Message::PageBatch { base_gpa, page_count, flags, data } => {
-                write_page_batch(memctx, base_gpa, page_count, flags, &data, None, status)?;
+            Message::PageBatch {
+                base_gpa,
+                page_count,
+                flags,
+                data,
+            } => {
+                apply_page_batch(
+                    memctx, base_gpa, page_count, flags, &data, None, status,
+                )?;
             }
             Message::MemFetch(gpas) => {
                 *sparse_gpas = Some(gpas);
@@ -464,51 +540,6 @@ async fn continue_ram_pass_with_sparse<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
-}
-
-/// Write a PageBatch to guest memory, decompressing if needed.
-fn write_page_batch(
-    memctx: &MemCtx,
-    base_gpa: u64,
-    page_count: u32,
-    flags: u32,
-    data: &[u8],
-    sparse_gpas: Option<&[u64]>,
-    status: &Arc<Mutex<MigrationStatus>>,
-) -> Result<(), MigrateError> {
-    let expected_raw = page_count as usize * PAGE_SIZE;
-
-    let raw_data = if flags & PAGE_BATCH_FLAG_ZSTD != 0 {
-        zstd::bulk::decompress(data, expected_raw).map_err(|e| {
-            MigrateError::Codec(format!("zstd decompress: {e}"))
-        })?
-    } else {
-        data.to_vec()
-    };
-
-    if raw_data.len() != expected_raw {
-        return Err(MigrateError::Codec(format!(
-            "PageBatch size mismatch: expected {expected_raw}, got {}",
-            raw_data.len(),
-        )));
-    }
-
-    for i in 0..page_count as usize {
-        let gpa = match sparse_gpas {
-            Some(gpas) if i < gpas.len() => gpas[i],
-            _ => base_gpa + (i * PAGE_SIZE) as u64,
-        };
-        let offset = i * PAGE_SIZE;
-        // Write to guest memory; skip unmapped pages
-        let _ = memctx.write(gpa, &raw_data[offset..offset + PAGE_SIZE]);
-    }
-
-    if let Ok(mut s) = status.lock() {
-        s.pages_transferred += page_count as u64;
-        s.bytes_transferred += expected_raw as u64;
-    }
-
-    Ok(())
 }
 
 /// Receive a single message from the WebSocket.

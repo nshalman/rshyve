@@ -172,7 +172,9 @@ pub struct PioCfgDecoder {
 impl PioCfgDecoder {
     /// Create a new decoder with the address register cleared.
     pub fn new() -> Self {
-        Self { addr: Mutex::new(0) }
+        Self {
+            addr: Mutex::new(0),
+        }
     }
 
     /// Handle an access to the config address register (port 0xCF8).

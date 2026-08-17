@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Portions derived from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: lib/propolis/src/hw/uart/uart16550.rs
+// https://github.com/oxidecomputer/propolis
 
 //! 16550 UART register emulation.
 //!
@@ -110,7 +114,7 @@ impl Uart {
             Some(Reg::IntrEnable) => self.reg_intr_enable.bits(),
             Some(Reg::IntrIdent) => {
                 let val = self.reg_intr_ident;
-                if val.get_intr() == Some(IntrIdent::THRE) {
+                if val.get_intr() == Some(IntrIdent::Thre) {
                     // Reading the IIR clears the THRE interrupt source,
                     // but leaves the THRE/TEMT bits in LSR.
                     self.thre_intr = false;
@@ -189,8 +193,7 @@ impl Uart {
                 self.reg_line_ctrl = LineCtrlReg::from_bits_retain(data);
             }
             Some(Reg::ModemCtrl) => {
-                self.reg_modem_ctrl =
-                    ModemCtrlReg::from_bits_truncate(data);
+                self.reg_modem_ctrl = ModemCtrlReg::from_bits_truncate(data);
             }
             Some(Reg::Scratch) => {
                 self.reg_scratch = data;
@@ -281,7 +284,7 @@ impl Uart {
         if self.reg_intr_enable.contains(IntrEnaReg::ELSI)
             && self.reg_line_status.contains(LineStatusReg::OE)
         {
-            Some(IntrIdent::RLS)
+            Some(IntrIdent::Rls)
         } else if self.reg_intr_enable.contains(IntrEnaReg::ERBFI)
             && self.reg_line_status.contains(LineStatusReg::DR)
         {
@@ -289,11 +292,11 @@ impl Uart {
         } else if self.reg_intr_enable.contains(IntrEnaReg::ETBEI)
             && self.thre_intr
         {
-            Some(IntrIdent::THRE)
+            Some(IntrIdent::Thre)
         } else if self.reg_intr_enable.contains(IntrEnaReg::EDSSI)
             && self.reg_modem_status != 0
         {
-            Some(IntrIdent::MDM)
+            Some(IntrIdent::Mdm)
         } else {
             None
         }
@@ -514,23 +517,23 @@ bitflags! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IntrIdent {
     /// Modem Status -- priority 4 (lowest).
-    MDM  = 0b0000,
+    Mdm = 0b0000,
     /// Transmitter Holding Register Empty -- priority 3.
-    THRE = 0b0010,
+    Thre = 0b0010,
     /// Data Ready -- priority 2.
-    DR   = 0b0100,
+    DR = 0b0100,
     /// Receiver Line Status -- priority 1 (highest).
-    RLS  = 0b0110,
+    Rls = 0b0110,
 }
 
 impl IntrIdent {
     /// Try to decode a raw IIR INTID field value.
     const fn from_bits(val: u8) -> Option<Self> {
         match val {
-            0b0000 => Some(Self::MDM),
-            0b0010 => Some(Self::THRE),
+            0b0000 => Some(Self::Mdm),
+            0b0010 => Some(Self::Thre),
             0b0100 => Some(Self::DR),
-            0b0110 => Some(Self::RLS),
+            0b0110 => Some(Self::Rls),
             _ => None,
         }
     }
@@ -557,9 +560,7 @@ impl IntrIdentReg {
         if self.contains(IntrIdentReg::NOPEND) {
             None
         } else {
-            IntrIdent::from_bits(
-                self.intersection(IntrIdentReg::INTID).bits(),
-            )
+            IntrIdent::from_bits(self.intersection(IntrIdentReg::INTID).bits())
         }
     }
 }
@@ -714,10 +715,7 @@ mod tests {
         let mut uart = Uart::new();
 
         // Enable all interrupt sources.
-        uart.reg_write(
-            REG_IER,
-            IER_ERBFI | IER_ETBEI | IER_ELSI | IER_EDSSI,
-        );
+        uart.reg_write(REG_IER, IER_ERBFI | IER_ETBEI | IER_ELSI | IER_EDSSI);
 
         // TX empty so THRE fires.
         assert_eq!(uart.reg_read(REG_IIR), IIR_THRE);
@@ -824,9 +822,6 @@ mod tests {
         assert_eq!(uart.reg_read(REG_SCR), 0);
         assert_eq!(uart.reg_read(REG_IIR), IIR_NONE);
         assert!(!uart.intr_state());
-        assert_eq!(
-            uart.reg_read(REG_LSR),
-            LSR_THRE | LSR_TEMT,
-        );
+        assert_eq!(uart.reg_read(REG_LSR), LSR_THRE | LSR_TEMT,);
     }
 }

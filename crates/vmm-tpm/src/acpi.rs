@@ -83,7 +83,10 @@ mod tests {
     fn header_fields_present() {
         let t = build_tpm2_table();
         assert_eq!(&t[0..4], SIGNATURE);
-        assert_eq!(u32::from_le_bytes(t[4..8].try_into().unwrap()), TPM2_TABLE_LEN);
+        assert_eq!(
+            u32::from_le_bytes(t[4..8].try_into().unwrap()),
+            TPM2_TABLE_LEN
+        );
         assert_eq!(t[8], REVISION);
         assert_eq!(&t[10..16], OEM_ID);
         assert_eq!(&t[16..24], OEM_TABLE_ID);

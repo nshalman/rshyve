@@ -32,22 +32,14 @@ impl InputBroker {
     }
 
     pub fn key_event(&self, down: bool, keysym: u32) {
-        let sink = self
-            .kbd
-            .lock()
-            .expect("input broker keyboard lock")
-            .clone();
+        let sink = self.kbd.lock().expect("input broker keyboard lock").clone();
         if let Some(sink) = sink {
             sink.key_event(down, keysym);
         }
     }
 
     pub fn pointer_event(&self, buttons: u8, x: u16, y: u16) {
-        let sink = self
-            .ptr
-            .lock()
-            .expect("input broker pointer lock")
-            .clone();
+        let sink = self.ptr.lock().expect("input broker pointer lock").clone();
         if let Some(sink) = sink {
             sink.pointer_event(buttons, x, y);
         }

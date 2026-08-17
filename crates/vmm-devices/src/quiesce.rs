@@ -86,7 +86,9 @@ impl QuiesceGate {
         let guard = self.lock.lock().expect("quiesce gate lock");
         let (_guard, _result) = self
             .cv
-            .wait_timeout_while(guard, budget, |_| self.active.load(Ordering::Acquire) > 0)
+            .wait_timeout_while(guard, budget, |_| {
+                self.active.load(Ordering::Acquire) > 0
+            })
             .expect("quiesce gate lock");
         self.active.load(Ordering::Acquire) == 0
     }
@@ -171,16 +173,19 @@ where
                 });
             match worker {
                 Err(error) => Err(FlushError::Sync(error)),
-                Ok(_handle) => match rx.recv_timeout(budgets.best_effort_sync) {
-                    Ok(result) => result.map_err(FlushError::Sync),
-                    Err(mpsc::RecvTimeoutError::Timeout) => Err(FlushError::TimedOut),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        Err(FlushError::Sync(io::Error::new(
-                            io::ErrorKind::Other,
-                            "device sync watchdog exited without a result",
-                        )))
+                Ok(_handle) => {
+                    match rx.recv_timeout(budgets.best_effort_sync) {
+                        Ok(result) => result.map_err(FlushError::Sync),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            Err(FlushError::TimedOut)
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            Err(FlushError::Sync(io::Error::other(
+                                "device sync watchdog exited without a result",
+                            )))
+                        }
                     }
-                },
+                }
             }
         }
     };
@@ -205,7 +210,10 @@ impl QuiesceReport {
 ///
 /// A per-device budget would serialize to the number of devices times the
 /// budget.
-pub fn wait_all_quiesced(devs: &[Arc<dyn Lifecycle>], budget: Duration) -> QuiesceReport {
+pub fn wait_all_quiesced(
+    devs: &[Arc<dyn Lifecycle>],
+    budget: Duration,
+) -> QuiesceReport {
     let deadline = Instant::now() + budget;
     let mut stuck = Vec::new();
     for dev in devs {
@@ -218,7 +226,7 @@ pub fn wait_all_quiesced(devs: &[Arc<dyn Lifecycle>], budget: Duration) -> Quies
                 stuck.push(dev.type_name());
                 break;
             }
-            std::thread::sleep(Duration::from_millis(5).min(deadline - now));
+            thread::sleep(Duration::from_millis(5).min(deadline - now));
         }
     }
     QuiesceReport { stuck }
@@ -231,7 +239,7 @@ pub mod testing {
     pub fn assert_query_non_blocking(dev: &Arc<dyn Lifecycle>) {
         let dev = Arc::clone(dev);
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             let result = dev.is_quiesced();
             tx.send(result).expect("is_quiesced result receiver");
         });
@@ -256,7 +264,11 @@ mod tests {
     }
 
     impl FlushTestDevice {
-        fn new(workers: usize, sync_delay: Duration, budgets: FlushBudgets) -> Self {
+        fn new(
+            workers: usize,
+            sync_delay: Duration,
+            budgets: FlushBudgets,
+        ) -> Self {
             Self {
                 gate: QuiesceGate::new(workers),
                 file: tempfile::tempfile().expect("create flush test file"),
@@ -315,7 +327,7 @@ mod tests {
         let handles: Vec<_> = (0..2)
             .map(|_| {
                 let gate = Arc::clone(&gate);
-                std::thread::spawn(move || gate.park_if_paused())
+                thread::spawn(move || gate.park_if_paused())
             })
             .collect();
 
@@ -334,7 +346,7 @@ mod tests {
 
         gate.pause();
         let worker_gate = Arc::clone(&gate);
-        let handle = std::thread::spawn(move || worker_gate.park_if_paused());
+        let handle = thread::spawn(move || worker_gate.park_if_paused());
         assert!(gate.wait_quiesced(Duration::from_secs(1)));
 
         gate.resume();
@@ -349,10 +361,10 @@ mod tests {
             .map(|_| {
                 let gate = Arc::clone(&gate);
                 let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
+                thread::spawn(move || {
                     while !stop.load(Ordering::Acquire) {
                         gate.park_if_paused();
-                        std::thread::yield_now();
+                        thread::yield_now();
                     }
                 })
             })
@@ -364,8 +376,10 @@ mod tests {
             gate.resume();
 
             let deadline = Instant::now() + Duration::from_secs(1);
-            while gate.active.load(Ordering::Acquire) != 2 && Instant::now() < deadline {
-                std::thread::yield_now();
+            while gate.active.load(Ordering::Acquire) != 2
+                && Instant::now() < deadline
+            {
+                thread::yield_now();
             }
             assert_eq!(gate.active.load(Ordering::Acquire), 2);
         }
@@ -434,7 +448,8 @@ mod tests {
         file.write_all(b"durable data")
             .expect("write durable flush file");
 
-        let result = flush_file(&gate, &file, FlushIntent::Durable, "real-file");
+        let result =
+            flush_file(&gate, &file, FlushIntent::Durable, "real-file");
 
         assert!(result.is_ok());
     }

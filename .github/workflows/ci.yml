@@ -1,0 +1,160 @@
+name: CI
+
+# What this gate does and does not prove.
+#
+# The target platform is illumos. GitHub offers no illumos runner, and
+# the vmm binary cannot be built anywhere else: vmm-tpm-sys drives an
+# autotools build of vendored libtpms, bhyve-api binds SunOS ioctls, and
+# viona-api needs libdladm.
+#
+# So a green run here means: the tree is formatted, the portable crates
+# are clippy-clean and their tests pass, the illumos FFI binding crates
+# type-check against the illumos target, the lockfile is current, and
+# the dependency and public-surface policies hold.
+#
+# It does NOT mean the VMM builds, boots a guest, or passes a platform
+# test. Those still run on the illumos build host; see docs/testing.md.
+# Do not read this badge as platform coverage.
+#
+# Why the cross-check is scoped the way it is: vmm_migrate pulls in
+# zstd-sys, which needs a cross C toolchain, and vmm_core, vmm_devices
+# and vmm_hyperv pull in usdt with the asm feature. Both are awkward to
+# cross-build on a hosted runner. Those crates are portable, so they are
+# covered by the host-target clippy and test jobs instead, and their
+# illumos code paths are covered by the build host.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lock:
+    name: lockfile is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo metadata --locked --format-version 1 > /dev/null
+      - name: Cargo.lock unchanged
+        run: git diff --exit-code Cargo.lock
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (portable crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy
+      - run: >
+          cargo clippy --locked --all-targets
+          -p vmm_api_common -p vmm_core -p vmm_devices
+          -p vmm_config -p vmm_migrate -p vmm_hyperv
+          -- -D warnings
+
+  cross-check:
+    name: illumos bindings type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-unknown-illumos
+      # The FFI crates: ioctl definitions, struct layouts, and the viona
+      # bindings. This is the code most likely to break against the
+      # target and it has no C or asm dependencies. No linker is needed
+      # because check does not link.
+      - run: >
+          cargo check --locked --all-targets
+          --target x86_64-unknown-illumos
+          -p bhyve_api_sys -p bhyve_api -p viona_api -p vmm_api_common -p vmm_config
+
+  test:
+    name: portable tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Codecs, bounds checks, device register models, and the migration
+      # protocol. Nothing here touches bhyve or viona.
+      - run: >
+          cargo test --locked
+          -p vmm_core -p vmm_devices -p vmm_config -p vmm_migrate -p vmm_hyperv
+
+  msrv:
+    name: builds on the declared MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Cargo.toml is attacker-controlled on a fork pull request, so the
+      # value is validated to a bare version number before it is used,
+      # and passed through the environment rather than interpolated into
+      # a shell command.
+      - name: read and validate rust-version
+        id: msrv
+        run: |
+          v=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          printf '%s' "$v" | grep -qxE '[0-9]+\.[0-9]+(\.[0-9]+)?' \
+            || { echo "refusing to use rust-version '$v'" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: install the MSRV toolchain
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: rustup toolchain install "$MSRV" --profile minimal
+      - name: check on the MSRV toolchain
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: >
+          cargo "+$MSRV" check --locked
+          -p vmm_api_common -p vmm_core -p vmm_devices
+          -p vmm_config -p vmm_migrate -p vmm_hyperv
+
+  supply-chain:
+    name: advisories, licenses, sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    env:
+      # Pinned by version and digest. The gitleaks binary is MIT; the
+      # gitleaks-action wrapper is deliberately not used because it
+      # requires a paid license key for repositories owned by an
+      # organization and exits 1 without one, which would make this a
+      # permanently red required check.
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: install gitleaks
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL "$url" -o gitleaks.tar.gz
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar xzf gitleaks.tar.gz gitleaks
+      # Scans the working tree and the full history reachable from it.
+      - run: ./gitleaks detect --source . --config .gitleaks.toml --redact --no-banner
+
+  public-surface:
+    name: public surface guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: tools/public-surface.sh

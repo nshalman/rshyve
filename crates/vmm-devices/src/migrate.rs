@@ -1,6 +1,10 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Derived from Propolis, Copyright Oxide Computer Company,
+// used under MPL-2.0. Upstream: lib/propolis/src/migrate.rs
+// https://github.com/oxidecomputer/propolis
 
 //! Migration state serialization framework.
 //!
@@ -59,12 +63,12 @@ pub enum Migrator<'a> {
 pub trait MigrateSingle: Send + Sync + 'static {
     fn export(
         &self,
-        ctx: &MigrateCtx,
+        ctx: &MigrateCtx<'_>,
     ) -> Result<PayloadOutput, MigrateStateError>;
     fn import(
         &self,
-        offer: PayloadOffer,
-        ctx: &MigrateCtx,
+        offer: PayloadOffer<'_>,
+        ctx: &MigrateCtx<'_>,
     ) -> Result<(), MigrateStateError>;
 }
 
@@ -73,12 +77,12 @@ pub trait MigrateMulti: Send + Sync {
     fn export(
         &self,
         output: &mut PayloadOutputs,
-        ctx: &MigrateCtx,
+        ctx: &MigrateCtx<'_>,
     ) -> Result<(), MigrateStateError>;
     fn import(
         &self,
-        offer: &mut PayloadOffers,
-        ctx: &MigrateCtx,
+        offer: &mut PayloadOffers<'_>,
+        ctx: &MigrateCtx<'_>,
     ) -> Result<(), MigrateStateError>;
 }
 
@@ -165,6 +169,12 @@ pub struct PayloadOutput {
 /// Collection of [`PayloadOutput`] instances for multi-payload export.
 pub struct PayloadOutputs(Vec<PayloadOutput>);
 
+impl Default for PayloadOutputs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PayloadOutputs {
     pub fn new() -> Self {
         Self(Vec::new())
@@ -199,6 +209,10 @@ pub trait Schema<'de>: Serialize + Deserialize<'de> + Sized + 'static {
 impl<'a, T: Schema<'a>> From<T> for PayloadOutput {
     fn from(value: T) -> Self {
         let id = T::id();
-        PayloadOutput { kind: id.0, version: id.1, payload: Box::new(value) }
+        PayloadOutput {
+            kind: id.0,
+            version: id.1,
+            payload: Box::new(value),
+        }
     }
 }

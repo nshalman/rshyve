@@ -8,8 +8,7 @@
 //! and programs the masked entries into the kernel VMM via `VM_SET_CPUID`.
 
 use bhyve_api::{
-    vcpu_cpuid_entry, VCE_FLAG_MATCH_INDEX,
-    VCC_FLAG_INTEL_FALLBACK,
+    vcpu_cpuid_entry, VCC_FLAG_INTEL_FALLBACK, VCE_FLAG_MATCH_INDEX,
 };
 
 use slog;
@@ -30,7 +29,7 @@ pub enum CpuBaseline {
 }
 
 impl CpuBaseline {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "host" | "native" => Some(Self::Host),
             "avx2" | "no-avx512" => Some(Self::Avx2),
@@ -46,9 +45,7 @@ impl CpuBaseline {
 fn host_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     #[cfg(target_arch = "x86_64")]
     {
-        let result = unsafe {
-            std::arch::x86_64::__cpuid_count(leaf, subleaf)
-        };
+        let result = std::arch::x86_64::__cpuid_count(leaf, subleaf);
         (result.eax, result.ebx, result.ecx, result.edx)
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -59,8 +56,13 @@ fn host_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
 }
 
 fn entry(
-    func: u32, index: u32, flags: u32,
-    eax: u32, ebx: u32, ecx: u32, edx: u32,
+    func: u32,
+    index: u32,
+    flags: u32,
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
 ) -> vcpu_cpuid_entry {
     vcpu_cpuid_entry {
         vce_function: func,
@@ -92,7 +94,7 @@ pub fn build_cpuid_entries(baseline: CpuBaseline) -> Vec<vcpu_cpuid_entry> {
 
     let is_intel = ebx == 0x756e_6547 // "Genu"
         && edx == 0x4965_6e69         // "ineI"
-        && ecx == 0x6c65_746e;        // "ntel"
+        && ecx == 0x6c65_746e; // "ntel"
 
     // Leaf 1: basic features
     let (eax1, ebx1, mut ecx1, edx1) = host_cpuid(1, 0);
@@ -112,7 +114,9 @@ pub fn build_cpuid_entries(baseline: CpuBaseline) -> Vec<vcpu_cpuid_entry> {
     if is_intel && max_leaf >= 4 {
         for idx in 0..8u32 {
             let (a, b, c, d) = host_cpuid(4, idx);
-            if a & 0x1f == 0 { break; }
+            if a & 0x1f == 0 {
+                break;
+            }
             entries.push(entry(4, idx, VCE_FLAG_MATCH_INDEX, a, b, c, d));
         }
     }
@@ -134,14 +138,20 @@ pub fn build_cpuid_entries(baseline: CpuBaseline) -> Vec<vcpu_cpuid_entry> {
         let (eax7, mut ebx7, mut ecx7, mut edx7) = host_cpuid(7, 0);
 
         // AVX-512 bits in EBX
-        const AVX512_EBX: u32 = (1 << 16) | (1 << 17) | (1 << 21) |
-            (1 << 26) | (1 << 27) | (1 << 28) | (1 << 30) | (1 << 31);
+        const AVX512_EBX: u32 = (1 << 16)
+            | (1 << 17)
+            | (1 << 21)
+            | (1 << 26)
+            | (1 << 27)
+            | (1 << 28)
+            | (1 << 30)
+            | (1 << 31);
         // AVX-512 bits in ECX
-        const AVX512_ECX: u32 = (1 << 1) | (1 << 6) | (1 << 11) |
-            (1 << 12) | (1 << 14);
+        const AVX512_ECX: u32 =
+            (1 << 1) | (1 << 6) | (1 << 11) | (1 << 12) | (1 << 14);
         // AVX-512 + AMX bits in EDX
-        const AVX512_EDX: u32 = (1 << 2) | (1 << 3) | (1 << 8) |
-            (1 << 23) | (1 << 24) | (1 << 25);
+        const AVX512_EDX: u32 =
+            (1 << 2) | (1 << 3) | (1 << 8) | (1 << 23) | (1 << 24) | (1 << 25);
 
         match baseline {
             CpuBaseline::Avx2 => {
@@ -165,7 +175,15 @@ pub fn build_cpuid_entries(baseline: CpuBaseline) -> Vec<vcpu_cpuid_entry> {
             let (mut eax71, ebx71, ecx71, edx71) = host_cpuid(7, 1);
             // AVX-512_BF16 (5), AVX-VNNI (4), AVX-IFMA (23)
             eax71 &= !(1 << 4 | 1 << 5 | 1 << 23);
-            entries.push(entry(7, 1, VCE_FLAG_MATCH_INDEX, eax71, ebx71, ecx71, edx71));
+            entries.push(entry(
+                7,
+                1,
+                VCE_FLAG_MATCH_INDEX,
+                eax71,
+                ebx71,
+                ecx71,
+                edx71,
+            ));
         }
     }
 
@@ -179,7 +197,9 @@ pub fn build_cpuid_entries(baseline: CpuBaseline) -> Vec<vcpu_cpuid_entry> {
     if max_leaf >= 0xB {
         for idx in 0..4u32 {
             let (a, b, c, d) = host_cpuid(0xB, idx);
-            if a == 0 && b == 0 { break; }
+            if a == 0 && b == 0 {
+                break;
+            }
             entries.push(entry(0xB, idx, VCE_FLAG_MATCH_INDEX, a, b, c, d));
         }
     }
@@ -195,8 +215,8 @@ pub fn build_cpuid_entries(baseline: CpuBaseline) -> Vec<vcpu_cpuid_entry> {
             }
             CpuBaseline::Sse42 => {
                 // Clear AVX (2), AVX-512 (5-7), AMX (17-18)
-                eax_d0 &= !(1 << 2 | 1 << 5 | 1 << 6 | 1 << 7 |
-                             1 << 17 | 1 << 18);
+                eax_d0 &=
+                    !(1 << 2 | 1 << 5 | 1 << 6 | 1 << 7 | 1 << 17 | 1 << 18);
             }
             CpuBaseline::Host => unreachable!(),
         }
@@ -209,7 +229,15 @@ pub fn build_cpuid_entries(baseline: CpuBaseline) -> Vec<vcpu_cpuid_entry> {
         ebx_d0 = xsave_size;
         ecx_d0 = xsave_size;
 
-        entries.push(entry(0xD, 0, VCE_FLAG_MATCH_INDEX, eax_d0, ebx_d0, ecx_d0, edx_d0));
+        entries.push(entry(
+            0xD,
+            0,
+            VCE_FLAG_MATCH_INDEX,
+            eax_d0,
+            ebx_d0,
+            ecx_d0,
+            edx_d0,
+        ));
 
         // Subleaf 1: XSAVE features
         let (a, b, c, d) = host_cpuid(0xD, 1);
@@ -217,9 +245,13 @@ pub fn build_cpuid_entries(baseline: CpuBaseline) -> Vec<vcpu_cpuid_entry> {
 
         // Subleaf 2+: per-component info (only for enabled components)
         for bit in 2..32u32 {
-            if eax_d0 & (1 << bit) == 0 { continue; }
+            if eax_d0 & (1 << bit) == 0 {
+                continue;
+            }
             let (a, b, c, d) = host_cpuid(0xD, bit);
-            if a == 0 { continue; }
+            if a == 0 {
+                continue;
+            }
             entries.push(entry(0xD, bit, VCE_FLAG_MATCH_INDEX, a, b, c, d));
         }
     }
@@ -322,9 +354,8 @@ pub fn apply_cpuid(
     }
 
     let (_, ebx, ecx, edx) = host_cpuid(0, 0);
-    let is_intel = ebx == 0x756e_6547
-        && edx == 0x4965_6e69
-        && ecx == 0x6c65_746e;
+    let is_intel =
+        ebx == 0x756e_6547 && edx == 0x4965_6e69 && ecx == 0x6c65_746e;
     let flags = if is_intel { VCC_FLAG_INTEL_FALLBACK } else { 0 };
 
     slog::info!(log, "applying CPUID";
@@ -360,9 +391,8 @@ fn build_full_table_native() -> Vec<vcpu_cpuid_entry> {
     let (max_leaf, ebx, ecx, edx) = host_cpuid(0, 0);
     entries.push(entry(0, 0, 0, max_leaf, ebx, ecx, edx));
 
-    let is_intel = ebx == 0x756e_6547
-        && edx == 0x4965_6e69
-        && ecx == 0x6c65_746e;
+    let is_intel =
+        ebx == 0x756e_6547 && edx == 0x4965_6e69 && ecx == 0x6c65_746e;
 
     let (a, b, c, d) = host_cpuid(1, 0);
     entries.push(entry(1, 0, 0, a, b, c, d));
@@ -375,7 +405,9 @@ fn build_full_table_native() -> Vec<vcpu_cpuid_entry> {
     if is_intel && max_leaf >= 4 {
         for idx in 0..8u32 {
             let (a, b, c, d) = host_cpuid(4, idx);
-            if a & 0x1f == 0 { break; }
+            if a & 0x1f == 0 {
+                break;
+            }
             entries.push(entry(4, idx, VCE_FLAG_MATCH_INDEX, a, b, c, d));
         }
     }
@@ -395,7 +427,9 @@ fn build_full_table_native() -> Vec<vcpu_cpuid_entry> {
     if max_leaf >= 0xB {
         for idx in 0..8u32 {
             let (a, b, c, d) = host_cpuid(0xB, idx);
-            if (b & 0xFFFF) == 0 { break; }
+            if (b & 0xFFFF) == 0 {
+                break;
+            }
             entries.push(entry(0xB, idx, VCE_FLAG_MATCH_INDEX, a, b, c, d));
         }
     }
@@ -439,7 +473,9 @@ fn build_full_table_native() -> Vec<vcpu_cpuid_entry> {
 /// Returns the same tuple as `query_host_features()` but with the
 /// given baseline mask applied. This reflects what the guest actually
 /// sees and should be sent in migration preambles.
-pub fn query_masked_features(baseline: CpuBaseline) -> (u32, u32, u32, u32, u32, u32) {
+pub fn query_masked_features(
+    baseline: CpuBaseline,
+) -> (u32, u32, u32, u32, u32, u32) {
     let (mut ecx1, edx1, mut ebx7, mut ecx7, mut edx7, mut xcr0) =
         query_host_features();
 
@@ -448,12 +484,18 @@ pub fn query_masked_features(baseline: CpuBaseline) -> (u32, u32, u32, u32, u32,
     }
 
     if baseline != CpuBaseline::Host {
-        const AVX512_EBX: u32 = (1 << 16) | (1 << 17) | (1 << 21) |
-            (1 << 26) | (1 << 27) | (1 << 28) | (1 << 30) | (1 << 31);
-        const AVX512_ECX: u32 = (1 << 1) | (1 << 6) | (1 << 11) |
-            (1 << 12) | (1 << 14);
-        const AVX512_EDX: u32 = (1 << 2) | (1 << 3) | (1 << 8) |
-            (1 << 23) | (1 << 24) | (1 << 25);
+        const AVX512_EBX: u32 = (1 << 16)
+            | (1 << 17)
+            | (1 << 21)
+            | (1 << 26)
+            | (1 << 27)
+            | (1 << 28)
+            | (1 << 30)
+            | (1 << 31);
+        const AVX512_ECX: u32 =
+            (1 << 1) | (1 << 6) | (1 << 11) | (1 << 12) | (1 << 14);
+        const AVX512_EDX: u32 =
+            (1 << 2) | (1 << 3) | (1 << 8) | (1 << 23) | (1 << 24) | (1 << 25);
         // AVX-512 XCR0 components (ZMM/opmask)
         const AVX512_XCR0: u32 = (1 << 5) | (1 << 6) | (1 << 7);
 

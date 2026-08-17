@@ -1,0 +1,5 @@
+# Device models take wide constructor signatures because PCI/virtio
+# devices genuinely need that many distinct inputs, and bundling them
+# into a struct just moves the argument list somewhere else. 12 keeps
+# the lint useful without flagging every device constructor.
+too-many-arguments-threshold = 12

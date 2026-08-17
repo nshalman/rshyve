@@ -19,9 +19,8 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use bhyve_api::{
-    ioctls,
-    vm_exception, vm_exit, vm_register, vm_run_state, vm_seg_desc,
-    seg_desc, vm_reg_name, VRS_RUN,
+    ioctls, seg_desc, vm_exception, vm_exit, vm_reg_name, vm_register,
+    vm_run_state, vm_seg_desc, VRS_RUN,
 };
 
 use crate::exits::{VmEntry, VmExit};
@@ -68,9 +67,8 @@ impl Vcpu {
         let fd = self.hdl.as_raw_fd();
         let mut cpu = self.id;
         // Safety: VM_ACTIVATE_CPU takes a pointer to the vCPU id.
-        let res = unsafe {
-            libc::ioctl(fd, ioctls::VM_ACTIVATE_CPU as _, &mut cpu)
-        };
+        let res =
+            unsafe { libc::ioctl(fd, ioctls::VM_ACTIVATE_CPU as _, &mut cpu) };
         if res == -1 {
             return Err(std::io::Error::last_os_error());
         }
@@ -82,11 +80,7 @@ impl Vcpu {
     // ---------------------------------------------------------------
 
     /// Set a guest register value.
-    pub fn set_reg(
-        &self,
-        reg: vm_reg_name,
-        val: u64,
-    ) -> std::io::Result<()> {
+    pub fn set_reg(&self, reg: vm_reg_name, val: u64) -> std::io::Result<()> {
         let mut vr = vm_register {
             cpuid: self.id,
             regnum: reg as i32,
@@ -94,9 +88,8 @@ impl Vcpu {
         };
         let fd = self.hdl.as_raw_fd();
         // Safety: vm_register is the correct struct for VM_SET_REGISTER.
-        let res = unsafe {
-            libc::ioctl(fd, ioctls::VM_SET_REGISTER as _, &mut vr)
-        };
+        let res =
+            unsafe { libc::ioctl(fd, ioctls::VM_SET_REGISTER as _, &mut vr) };
         if res == -1 {
             return Err(std::io::Error::last_os_error());
         }
@@ -130,10 +123,7 @@ impl Vcpu {
     }
 
     /// Get a guest register value.
-    pub fn get_reg(
-        &self,
-        reg: vm_reg_name,
-    ) -> std::io::Result<u64> {
+    pub fn get_reg(&self, reg: vm_reg_name) -> std::io::Result<u64> {
         let mut vr = vm_register {
             cpuid: self.id,
             regnum: reg as i32,
@@ -141,9 +131,8 @@ impl Vcpu {
         };
         let fd = self.hdl.as_raw_fd();
         // Safety: vm_register is the correct struct for VM_GET_REGISTER.
-        let res = unsafe {
-            libc::ioctl(fd, ioctls::VM_GET_REGISTER as _, &mut vr)
-        };
+        let res =
+            unsafe { libc::ioctl(fd, ioctls::VM_GET_REGISTER as _, &mut vr) };
         if res == -1 {
             return Err(std::io::Error::last_os_error());
         }
@@ -159,9 +148,8 @@ impl Vcpu {
             _pad: [0; 3],
         };
         let fd = self.hdl.as_raw_fd();
-        let res = unsafe {
-            libc::ioctl(fd, ioctls::VM_GET_RUN_STATE as _, &mut rs)
-        };
+        let res =
+            unsafe { libc::ioctl(fd, ioctls::VM_GET_RUN_STATE as _, &mut rs) };
         if res == -1 {
             return Err(std::io::Error::last_os_error());
         }
@@ -169,10 +157,7 @@ impl Vcpu {
     }
 
     /// Set the vCPU run state (e.g., VRS_RUN to mark it runnable).
-    pub fn set_run_state(
-        &self,
-        state: u32,
-    ) -> std::io::Result<()> {
+    pub fn set_run_state(&self, state: u32) -> std::io::Result<()> {
         self.set_run_state_full(state, 0)
     }
 
@@ -190,9 +175,8 @@ impl Vcpu {
         };
         let fd = self.hdl.as_raw_fd();
         // Safety: vm_run_state is the correct struct for VM_SET_RUN_STATE.
-        let res = unsafe {
-            libc::ioctl(fd, ioctls::VM_SET_RUN_STATE as _, &mut rs)
-        };
+        let res =
+            unsafe { libc::ioctl(fd, ioctls::VM_SET_RUN_STATE as _, &mut rs) };
         if res == -1 {
             return Err(std::io::Error::last_os_error());
         }
@@ -211,9 +195,8 @@ impl Vcpu {
         };
         let fd = self.hdl.as_raw_fd();
         // Safety: vm_vcpu_reset is the correct struct for VM_RESET_CPU.
-        let res = unsafe {
-            libc::ioctl(fd, ioctls::VM_RESET_CPU as _, &mut vvr)
-        };
+        let res =
+            unsafe { libc::ioctl(fd, ioctls::VM_RESET_CPU as _, &mut vvr) };
         if res == -1 {
             return Err(std::io::Error::last_os_error());
         }
@@ -296,18 +279,15 @@ impl Vcpu {
         api_version: u32,
     ) -> std::io::Result<VmExit> {
         let mut raw_exit = vm_exit::default();
-        let mut raw_entry = entry.to_raw(
-            self.id,
-            &mut raw_exit as *mut vm_exit,
-        );
+        let mut raw_entry =
+            entry.to_raw(self.id, &mut raw_exit as *mut vm_exit);
 
         let fd = self.hdl.as_raw_fd();
         // Safety: VM_RUN takes a vm_entry pointer. raw_exit is
         // stack-local and outlives the ioctl. raw_entry.exit_data
         // points to raw_exit.
-        let res = unsafe {
-            libc::ioctl(fd, ioctls::VM_RUN as _, &mut raw_entry)
-        };
+        let res =
+            unsafe { libc::ioctl(fd, ioctls::VM_RUN as _, &mut raw_entry) };
         if res == -1 {
             return Err(std::io::Error::last_os_error());
         }

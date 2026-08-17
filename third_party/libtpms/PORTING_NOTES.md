@@ -1,12 +1,25 @@
 # libtpms vendoring notes
 
-Source: https://github.com/stefanberger/libtpms (v0.11.0)
+Source: https://github.com/stefanberger/libtpms
+Revision: `521c51073fe6f7c56023db78e56961fcaf7906e8` (untagged `master`, 2026-03-13)
 
-License: BSD (see LICENSE in this directory).
+There is no upstream `v0.11.0` tag; 0.11.0 is only the in-development
+version string in `configure.ac`. This file previously recorded that
+string as the source revision. The commit above is authoritative and was
+recovered by diffing the vendored tree against upstream archives.
+
+License: BSD-3-Clause (see LICENSE in this directory). Note that
+`m4/ax_check_linker_flag.m4` is GPL-2.0-or-later with the Autoconf Macro
+exception; see `THIRD_PARTY.md`.
+
+This revision predates the fixes for CVE-2026-6726 and CVE-2026-6727,
+both of which are present in this tree. See `THIRD_PARTY.md` and
+`docs/security/open-findings.md`.
 
 ## Patches applied for illumos
 
-These are the only changes to the upstream tree:
+Reproduced as applicable diffs in `patches/`. These are the only changes
+to the upstream tree:
 
 1. **`src/tpm2/TPMCmd/TpmConfiguration/TpmConfiguration/TpmProfile_Common.h`**
    Added `__sun` / `__illumos__` block to the OS endian-detection cascade.
@@ -33,6 +46,13 @@ CFLAGS="-D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D__EXTENSIONS__"
 
 ## Updating to a newer libtpms
 
-Re-fetch upstream, re-apply the two patches above, re-run a build,
-update the version string in this file. The patches are deliberately
-minimal so they should rebase cleanly across upstream versions.
+Re-fetch upstream, re-apply `patches/*.patch`, re-run a build, and
+update the revision recorded above and in `THIRD_PARTY.md`. The patches
+are deliberately minimal so they should rebase cleanly across upstream
+versions.
+
+`src/tpm2/NVMarshal.c` is the vTPM state serializer, and vTPM state is
+the root of a BitLocker-protected guest's disk encryption. A refresh
+that changes the state format locks such guests out. Any update must be
+validated by resuming an existing vTPM state blob, not only by booting a
+fresh guest.
