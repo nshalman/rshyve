@@ -155,11 +155,15 @@ jobs:
     name: both binaries type-check
     runs-on: ubuntu-latest
     steps:
+      # The only job that builds rshyve, so the only one that needs the
+      # libtpms submodule. Everything else names portable packages.
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - run: rustup target add x86_64-unknown-illumos
-      # vmm-tpm-sys drives an autotools build of vendored libtpms for
-      # rshyve. The runner image already carries these, but naming them
-      # makes the dependency visible when the image changes.
+      # vmm-tpm-sys drives an autotools build of the libtpms submodule
+      # for rshyve. The runner image already carries these, but naming
+      # them makes the dependency visible when the image changes.
       - name: install the libtpms build dependencies
         run: |
           sudo apt-get update
@@ -172,8 +176,8 @@ jobs:
       - run: >
           cargo check --locked --all-targets
           --target x86_64-unknown-illumos -p firehyve
-      # rshyve additionally pulls zstd-sys and the vendored libtpms
-      # autotools build, which need a C toolchain for the target, and
+      # rshyve additionally pulls zstd-sys and the libtpms autotools
+      # build, which need a C toolchain for the target, and
       # there is no illumos cross-cc here. The host target compiles those
       # natively instead, which still type-checks every line of rshyve.
       - run: >

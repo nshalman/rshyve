@@ -33,9 +33,10 @@ Copyright (c) Trusted Computing Group and its contributors, 2022-2025
 Licensed under the 3-clause BSD license.
 https://github.com/stefanberger/libtpms
 
-Vendored in third_party/libtpms and statically linked into the vmm
-binary to provide the virtual TPM. The full license text, covering all
-three grants, is at third_party/libtpms/LICENSE.
+A submodule at third_party/libtpms, statically linked into the vmm
+binary to provide the virtual TPM. The source is not redistributed here,
+so the full license text, covering all three grants, is reproduced at
+LICENSES/BSD-3-Clause-libtpms.txt.
 
 Binary redistributions of this software must reproduce the libtpms
 copyright notices and license text in the accompanying documentation or

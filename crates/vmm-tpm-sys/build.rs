@@ -2,12 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Drive the autotools build of vendored libtpms.
+//! Drive the autotools build of libtpms.
 //!
-//! The vendored source lives at `third_party/libtpms` (relative to the
-//! workspace root). We run `autogen.sh && configure && gmake` once into
-//! `OUT_DIR`, then tell cargo to link against the resulting static
-//! archives.
+//! `third_party/libtpms` is a submodule pinned to pristine upstream. We
+//! copy it into `OUT_DIR`, apply the illumos patches from
+//! `third_party/libtpms-illumos/patches`, then run `autogen.sh &&
+//! configure && gmake` once and link against the static archives. The
+//! submodule is never modified, so the patch set stays the complete and
+//! auditable statement of what this project changes.
 //!
 //! # Which OpenSSL libtpms links against
 //!
@@ -49,9 +51,14 @@ fn main() {
     let src = workspace_root.join("third_party").join("libtpms");
     assert!(
         src.join("configure.ac").is_file(),
-        "vendored libtpms missing at {} — did you forget to vendor third_party/libtpms?",
+        "libtpms submodule is empty at {}. Run:\n    \
+         git submodule update --init third_party/libtpms",
         src.display()
     );
+    let patches = workspace_root
+        .join("third_party")
+        .join("libtpms-illumos")
+        .join("patches");
 
     let out_dir =
         PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR set by cargo"));
@@ -62,6 +69,7 @@ fn main() {
     let build_dir = out_dir.join("libtpms-build");
 
     println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-changed={}", patches.display());
     println!("cargo:rerun-if-changed={SMARTOS_CRYPTO}");
 
     let crypto = select_crypto(&out_dir);
@@ -74,6 +82,7 @@ fn main() {
     let fingerprint = crypto.fingerprint();
     if std::fs::read_to_string(&marker).ok().as_deref() != Some(&fingerprint) {
         copy_tree(&src, &work_src);
+        apply_patches(&patches, &work_src);
         // Wipe the build directory as well: an autotools build tree
         // hard-codes its srcdir, so Makefiles left by an earlier
         // configure point at a path that may no longer exist.
@@ -454,6 +463,44 @@ fn copy_tree(src: &Path, dst: &Path) {
         .status()
         .expect("spawn cp");
     assert!(status.success(), "cp -R libtpms source failed");
+}
+
+/// Apply the illumos patches to the copy in `OUT_DIR`.
+///
+/// Ordered by file name, and every patch must apply: a silently skipped
+/// patch would produce a libtpms that does not compile on illumos, or
+/// worse, one that does but behaves differently from the reviewed tree.
+fn apply_patches(patches: &Path, work_src: &Path) {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(patches)
+        .unwrap_or_else(|e| panic!("read {}: {e}", patches.display()))
+        .map(|e| e.expect("read patch dir entry").path())
+        .filter(|p| p.extension().is_some_and(|e| e == "patch"))
+        .collect();
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "no patches found in {} — the illumos build needs them",
+        patches.display()
+    );
+
+    for patch in &files {
+        let file = std::fs::File::open(patch)
+            .unwrap_or_else(|e| panic!("open {}: {e}", patch.display()));
+        let status = Command::new("patch")
+            .arg("-p1")
+            .arg("--batch")
+            .current_dir(work_src)
+            .stdin(file)
+            .status()
+            .expect("spawn patch");
+        assert!(
+            status.success(),
+            "{} did not apply cleanly. The submodule revision and the \
+             patch set have diverged; see third_party/libtpms-illumos/\
+             PORTING_NOTES.md",
+            patch.display()
+        );
+    }
 }
 
 fn run_make(build: &Path) {

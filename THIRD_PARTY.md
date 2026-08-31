@@ -102,7 +102,7 @@ Upstream also builds release with `panic = "abort"`, so the impact there
 is the same: an unprivileged guest can abort the VMM. Coordinate
 disclosure with Oxide before publishing this repository.
 
-## Vendored source: libtpms
+## Submodule: libtpms
 
 | | |
 |---|---|
@@ -110,20 +110,23 @@ disclosure with Oxide before publishing this repository.
 | Revision | `521c51073fe6f7c56023db78e56961fcaf7906e8` (untagged `master`, 2026-03-13) |
 | License | BSD-3-Clause |
 | Copyright | IBM Corporation 2006-2011; Microsoft Corporation 2010-2022; Trusted Computing Group and contributors 2022-2025 |
-| Location | `third_party/libtpms/` (1,631 files) |
+| Location | `third_party/libtpms` (submodule, pinned to the revision above) |
+| License text | `LICENSES/BSD-3-Clause-libtpms.txt` (source not redistributed here) |
+| Local changes | `third_party/libtpms-illumos/patches/`, applied at build time |
 | Linkage | Static, via `crates/vmm-tpm-sys/build.rs` |
 
-Verify the vendored tree against upstream:
+The submodule is pristine upstream, so there is no vendored copy to
+audit. Confirm the pin and that the patches still apply:
 
 ```sh
-curl -sLO https://github.com/stefanberger/libtpms/archive/521c51073fe6f7c56023db78e56961fcaf7906e8.tar.gz
-tar xzf 521c51073fe6f7c56023db78e56961fcaf7906e8.tar.gz
-diff -rq libtpms-521c51073fe6f7c56023db78e56961fcaf7906e8 third_party/libtpms
+git -C third_party/libtpms rev-parse HEAD    # must match the revision above
+git submodule status third_party/libtpms     # a leading '+' means drift
 ```
 
-The only differences are `.github/` and `.gitignore` (dropped),
-`PORTING_NOTES.md` (added), and the two illumos patches in
-`third_party/libtpms/patches/`.
+`crates/vmm-tpm-sys/build.rs` copies the submodule into `OUT_DIR` and
+applies every patch there, failing the build if one does not apply. The
+submodule is never modified, so the patch set below is the complete and
+mechanically enforced statement of what this project changes.
 
 `PORTING_NOTES.md` previously recorded the source as "v0.11.0". No such
 upstream tag exists; 0.11.0 is the in-development version string in
@@ -132,7 +135,8 @@ is authoritative.
 
 ### Local patches
 
-Both are reproduced as applicable diffs in `third_party/libtpms/patches/`:
+Both live in `third_party/libtpms-illumos/patches/` and are applied to
+the `OUT_DIR` copy by `build.rs`:
 
 1. `0001-illumos-strchr.patch` — `src/tpm2/RuntimeProfile.c` uses
    `strchr()` instead of the legacy `index()`, which illumos does not
@@ -142,12 +146,14 @@ Both are reproduced as applicable diffs in `third_party/libtpms/patches/`:
 
 ### License exception inside the vendored tree
 
-`third_party/libtpms/m4/ax_check_linker_flag.m4` is GPL-2.0-or-later
+`m4/ax_check_linker_flag.m4` inside the libtpms submodule is
+GPL-2.0-or-later
 with the Autoconf Macro exception (Copyright 2008 Guido U. Draheim,
 2011 Maarten Bosmans). The exception means it does not affect the
 license of the build output. It is the only GPL-licensed file in the
 tree and is called out here so a license scan of this repository has an
-explanation to match against.
+explanation to match against. It reaches a build host through the
+submodule, not through this repository's own tracked files.
 
 ### Outstanding security exposure
 
