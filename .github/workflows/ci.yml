@@ -2,26 +2,34 @@ name: CI
 
 # What this gate does and does not prove.
 #
-# The target platform is illumos. GitHub offers no illumos runner, and
-# the vmm binary cannot be built anywhere else: vmm-tpm-sys drives an
-# autotools build of vendored libtpms, bhyve-api binds SunOS ioctls, and
-# viona-api needs libdladm.
+# The target platform is illumos, and GitHub offers no illumos runner.
+# Neither binary LINKS anywhere but illumos: bhyve-api binds SunOS
+# ioctls and viona-api needs libdladm. Both do type-check here, though.
+# firehyve cross-checks against the illumos target, and rshyve checks on
+# the host target where its C dependencies (zstd-sys, the vendored
+# libtpms that vmm-tpm-sys builds) compile natively. See the `binaries`
+# job.
 #
 # So a green run here means: the tree is formatted, the portable crates
 # are clippy-clean and their tests pass, the illumos FFI binding crates
 # type-check against the illumos target, the lockfile is current, and
-# the dependency and public-surface policies hold.
+# the dependency and public-surface policies hold. tools/fhrun-init is
+# excluded from the workspace, so the guest-init job covers it on its
+# own.
 #
 # It does NOT mean the VMM builds, boots a guest, or passes a platform
 # test. Those still run on the illumos build host; see docs/testing.md.
 # Do not read this badge as platform coverage.
 #
 # Why the cross-check is scoped the way it is: vmm_migrate pulls in
-# zstd-sys, which needs a cross C toolchain, and vmm_core, vmm_devices
-# and vmm_hyperv pull in usdt with the asm feature. Both are awkward to
-# cross-build on a hosted runner. Those crates are portable, so they are
-# covered by the host-target clippy and test jobs instead, and their
-# illumos code paths are covered by the build host.
+# zstd-sys, which needs a cross C toolchain. Those crates are portable,
+# so they are covered by the host-target clippy and test jobs instead,
+# and their illumos code paths are covered by the build host.
+#
+# One thing the cross-check cannot prove: usdt's probe macros expand
+# from a HOST-built usdt-impl, which selects its backend from the host
+# OS. On a linux runner every probe expands to a no-op. Probe emission
+# is verified on the build host with `dtrace -l -P vmm`.
 
 on:
   push:
@@ -60,8 +68,10 @@ jobs:
       - run: rustup component add clippy
       - run: >
           cargo clippy --locked --all-targets
-          -p vmm_api_common -p vmm_core -p vmm_devices
-          -p vmm_config -p vmm_migrate -p vmm_hyperv
+          -p vmm_api_common -p vmm_core -p vmm_devices -p vmm_devices_testsupport
+          -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
+          -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
+          -p fhrun
           -- -D warnings
 
   cross-check:
@@ -88,7 +98,28 @@ jobs:
       # protocol. Nothing here touches bhyve or viona.
       - run: >
           cargo test --locked
-          -p vmm_core -p vmm_devices -p vmm_config -p vmm_migrate -p vmm_hyperv
+          -p vmm_api_common -p vmm_core -p vmm_devices -p vmm_devices_testsupport
+          -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
+          -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
+          -p fhrun
+
+  guest-init:
+    name: guest init (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: rustup component add clippy rustfmt
+      # tools/fhrun-init is excluded from the root workspace, so no
+      # other job here reaches it: it would be unformatted, unlinted and
+      # untested code that CI reports green. The runner is x86_64 Linux,
+      # so the musl-static test binary also runs natively.
+      - name: format, lint and test the guest init
+        working-directory: tools/fhrun-init
+        run: |
+          cargo fmt -- --check
+          cargo clippy --locked --all-targets --target x86_64-unknown-linux-musl -- -D warnings
+          cargo test --locked --target x86_64-unknown-linux-musl
 
   msrv:
     name: builds on the declared MSRV
@@ -115,8 +146,39 @@ jobs:
           MSRV: ${{ steps.msrv.outputs.version }}
         run: >
           cargo "+$MSRV" check --locked
-          -p vmm_api_common -p vmm_core -p vmm_devices
-          -p vmm_config -p vmm_migrate -p vmm_hyperv
+          -p vmm_api_common -p vmm_core -p vmm_devices -p vmm_devices_testsupport
+          -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
+          -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
+          -p fhrun
+
+  binaries:
+    name: both binaries type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-unknown-illumos
+      # vmm-tpm-sys drives an autotools build of vendored libtpms for
+      # rshyve. The runner image already carries these, but naming them
+      # makes the dependency visible when the image changes.
+      - name: install the libtpms build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool pkg-config libssl-dev
+      # firehyve has no C dependencies, so it type-checks against the
+      # real target. usdt's probe macros expand from a HOST-built
+      # usdt-impl, so on a linux runner they expand to no-ops: this
+      # checks every line of firehyve but not the illumos DTrace codegen
+      # path, which is covered on the build host.
+      - run: >
+          cargo check --locked --all-targets
+          --target x86_64-unknown-illumos -p firehyve
+      # rshyve additionally pulls zstd-sys and the vendored libtpms
+      # autotools build, which need a C toolchain for the target, and
+      # there is no illumos cross-cc here. The host target compiles those
+      # natively instead, which still type-checks every line of rshyve.
+      - run: >
+          cargo check --locked --all-targets
+          -p rshyve -p vmm-migrate-agent
 
   supply-chain:
     name: advisories, licenses, sources
@@ -151,6 +213,51 @@ jobs:
           tar xzf gitleaks.tar.gz gitleaks
       # Scans the working tree and the full history reachable from it.
       - run: ./gitleaks detect --source . --config .gitleaks.toml --redact --no-banner
+
+  boundary:
+    name: firehyve dependency boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Scoping the crate graph to one workspace member is what makes
+      # this a per-binary gate. `cargo tree -i` cannot serve here: it
+      # exits 0 both when a crate is present and when it is filtered out.
+      #
+      # Setting `arguments` drops the action's default --all-features,
+      # which is intended. All-features would enable optional
+      # dependencies a real firehyve build never links, so this job sees
+      # a different dependency view from the supply-chain job above.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: ./bin/firehyve/Cargo.toml
+          arguments: --locked --config deny-firehyve.toml --target x86_64-unknown-illumos --exclude-dev
+          command: check bans
+      # Two silent failures cargo-deny cannot report: an unmatched `deny`
+      # entry, and a missing --config that falls back to the default.
+      - run: tools/check-boundary-bans.sh
+
+  platform-deps:
+    name: stock-PI dependency gate self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The gate itself runs on the illumos build host, where rshyve is
+      # actually linked; see tools/remote-build.sh. What CI can prove is
+      # that the script is not silently broken, which is the failure
+      # that would matter most: a gate that always passes is worse than
+      # no gate. A syntax error and a missed rejection are both caught
+      # here. Any Linux binary needs libc.so.6, which no platform image
+      # ships, so the script must reject it.
+      - run: sh -n tools/check-needed.sh
+      - name: the gate rejects a binary the platform image cannot run
+        run: |
+          # Without readelf the script exits 1 for want of a reader,
+          # which would pass the test below for the wrong reason.
+          command -v readelf
+          if tools/check-needed.sh "$(command -v true)"; then
+            echo "check-needed.sh accepted a non-illumos binary" >&2
+            exit 1
+          fi
 
   public-surface:
     name: public surface guard

@@ -8,16 +8,12 @@
 useDefault = true
 
 [allowlist]
-description = "Paths that are vendored, archived, or intentionally sample data"
+description = "Paths that are vendored or intentionally sample data"
 
 paths = [
   # Vendored upstream C. Not ours to rewrite, and its test vectors trip
   # entropy heuristics constantly.
   '''^third_party/''',
-  # Historical LLM audit output, explicitly marked non-authoritative.
-  '''^docs/archive/''',
-  # Verbatim OASIS specification.
-  '''^docs/virtio-v1\.3-csd01\.html$''',
   # Pinned upstream artifact digests, not credentials.
   '''^THIRD_PARTY\.md$''',
   '''^tools/fetch-edk2-bhyve\.sh$''',

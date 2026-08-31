@@ -100,7 +100,7 @@ pub fn apply_page_batch(
         })?;
     }
 
-    for (&gpa, page) in gpas.iter().zip(raw.chunks_exact(PAGE_SIZE)) {
+    for (&gpa, page) in gpas.iter().zip(raw.as_chunks::<PAGE_SIZE>().0) {
         memctx.write(gpa, page).map_err(|e| {
             MigrateError::Io(format!("guest memory write gpa={gpa:#x}: {e}",))
         })?;
@@ -127,7 +127,7 @@ pub fn read_pages(
         )));
     }
 
-    for (&gpa, page) in gpas.iter().zip(buf.chunks_exact_mut(PAGE_SIZE)) {
+    for (&gpa, page) in gpas.iter().zip(buf.as_chunks_mut::<PAGE_SIZE>().0) {
         memctx.read(gpa, page).map_err(|e| {
             MigrateError::Io(format!("guest memory read gpa={gpa:#x}: {e}",))
         })?;

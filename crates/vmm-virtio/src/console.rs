@@ -1,0 +1,1049 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Single-port VirtIO console (device type 3).
+//!
+//! The host side is a Unix domain socket, one client at a time. The
+//! guest sees one port and gets `/dev/hvc0`.
+//!
+//! No `VIRTIO_CONSOLE_F_MULTIPORT` and no `VIRTIO_CONSOLE_F_SIZE`: with
+//! neither feature the control queues do not exist and the device needs
+//! exactly two queues, which fits under the transport's four-queue cap.
+//! The device config region is still advertised at its full spec size,
+//! because the modern Linux driver checks `offset + len` against the
+//! advertised length before it reads.
+
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::net::Shutdown;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use anyhow::Context;
+use slog::warn;
+use vmm_core::mem::PhysMap;
+use vmm_core::unixsock::{bind_restricted, SocketPolicy};
+
+use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
+use super::{queue_drain_should_stop, VirtioDevice};
+use vmm_devices::lifecycle::{IndicatedState, Indicator};
+use vmm_devices::{Lifecycle, QuiesceGate};
+
+/// receiveq and transmitq. Under the transport's four-queue cap.
+pub const CONSOLE_NUM_QUEUES: usize = 2;
+/// receiveq: host to guest.
+pub const CONSOLE_RX_QUEUE: u16 = 0;
+/// transmitq: guest to host.
+pub const CONSOLE_TX_QUEUE: u16 = 1;
+/// Must be a power of two: `VirtQueue::new` panics otherwise.
+pub const CONSOLE_QUEUE_SIZE: u16 = 128;
+/// Full `virtio_console_config`: cols, rows, max_nr_ports, emerg_wr.
+///
+/// Every field reads zero, but the whole struct is advertised because
+/// the modern Linux driver bounds-checks against this length.
+pub const CONSOLE_CONFIG_SIZE: u16 = 12;
+/// One vector per queue plus one for config change.
+pub const CONSOLE_MSIX_VECTORS: u16 = 3;
+/// Host bytes buffered while the guest has posted no RX chain.
+///
+/// A cap is required: without one a fast host writer grows VMM memory
+/// without limit while the guest is not reading.
+pub const CONSOLE_RX_BACKLOG_MAX: usize = 64 * 1024;
+
+/// Guest output is copied through a fixed buffer, so a descriptor
+/// length the guest picked never becomes an allocation size.
+const TX_CHUNK: usize = 4096;
+/// How long a client may stall before it loses its console.
+///
+/// The transmit queue drains on the vCPU thread, so an unbounded write
+/// would let an idle terminal hold a guest CPU.
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+/// How long the accept thread waits before it re-reads the shutdown
+/// flag. Bounds how long `halt` waits for that thread to return.
+const ACCEPT_POLL_MS: i32 = 50;
+/// Pause after an accept that failed for a reason retrying cannot fix.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Interrupt callback, installed by the binary after the transport
+/// exists. Clone the slot before the device is moved into the transport.
+pub type ConsoleInterrupt = Arc<dyn Fn() + Send + Sync>;
+
+/// State shared with the accept and reader threads.
+struct ConsoleShared {
+    socket_path: PathBuf,
+    physmap: Arc<PhysMap>,
+    /// The attached client, if any. TX writes go here.
+    client: Mutex<Option<UnixStream>>,
+    /// Host bytes with no guest RX chain to land in yet.
+    backlog: Mutex<VecDeque<u8>>,
+    /// Guest RX chains with no host bytes to fill them yet.
+    pending_rx: Mutex<VecDeque<(u16, Vec<ChainBuf>)>>,
+    rx_completion: Mutex<Option<Arc<VirtioCompletion>>>,
+    interrupt: Arc<Mutex<Option<ConsoleInterrupt>>>,
+    /// Reader threads, one per client that has been attached.
+    readers: Mutex<Vec<JoinHandle<()>>>,
+    shutdown: AtomicBool,
+    gate: Arc<QuiesceGate>,
+    /// Set while the backlog is over its cap, so the warning is emitted
+    /// once per overflow burst rather than once per read.
+    overflowed: AtomicBool,
+    log: slog::Logger,
+}
+
+impl ConsoleShared {
+    /// Move host bytes into posted guest RX chains and publish them.
+    fn deliver_rx(&self) {
+        // A paused device must not touch guest memory. Bytes stay in
+        // the backlog and are delivered on resume.
+        if self.gate.is_paused() {
+            return;
+        }
+        let completion = {
+            let guard = self.rx_completion.lock().expect("rx completion lock");
+            match guard.as_ref() {
+                Some(c) => Arc::clone(c),
+                None => return,
+            }
+        };
+
+        loop {
+            let mut backlog = self.backlog.lock().expect("backlog lock");
+            if backlog.is_empty() {
+                return;
+            }
+            let next = {
+                let mut pending =
+                    self.pending_rx.lock().expect("pending rx lock");
+                pending.pop_front()
+            };
+            let Some((head, bufs)) = next else {
+                return;
+            };
+
+            let mut written = 0u32;
+            for buf in &bufs {
+                let ChainBuf::Writable { addr, len } = buf else {
+                    continue;
+                };
+                let want = (*len as usize).min(backlog.len());
+                if want == 0 {
+                    break;
+                }
+                // Look the buffer up before the bytes leave the
+                // backlog, so an unmapped chain does not eat them.
+                let Some(sub) = self.physmap.lookup(*addr, want) else {
+                    break;
+                };
+                let chunk: Vec<u8> = backlog.drain(..want).collect();
+                if sub.write_bytes(&chunk).is_err() {
+                    break;
+                }
+                written = written.saturating_add(want as u32);
+            }
+            drop(backlog);
+            completion.complete(head, written);
+        }
+    }
+
+    /// Write guest output to the attached client, if there is one.
+    fn write_host(&self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let mut guard = self.client.lock().expect("client lock");
+        let Some(stream) = guard.as_mut() else {
+            // No client attached. Console output is best-effort.
+            return;
+        };
+        if let Err(error) = stream.write_all(data) {
+            warn!(self.log, "virtio-console client write failed";
+                "error" => %error);
+            // Shutting the socket down also wakes this client's reader.
+            if let Some(stream) = guard.take() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    /// Install `stream` as the client and shut down the one it
+    /// replaces, so that its reader thread wakes and returns.
+    fn replace_client(&self, stream: Option<UnixStream>) {
+        let previous = std::mem::replace(
+            &mut *self.client.lock().expect("client lock"),
+            stream,
+        );
+        if let Some(old) = previous {
+            // The peer may already be gone; there is nothing to do.
+            let _ = old.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// Join the readers whose clients have gone, so a long-lived
+    /// console does not accumulate thread handles.
+    fn reap_readers(&self) {
+        let done = {
+            let mut readers = self.readers.lock().expect("reader lock");
+            let (done, alive): (Vec<_>, Vec<_>) =
+                readers.drain(..).partition(JoinHandle::is_finished);
+            *readers = alive;
+            done
+        };
+        for handle in done {
+            // A panicked reader must not abort the accept loop.
+            let _ = handle.join();
+        }
+    }
+
+    /// Take over as the single client and start reading from it.
+    fn attach_client(self: &Arc<Self>, stream: UnixStream) {
+        // An accepted socket inherits the listener's non-blocking flag
+        // on some platforms, and the reader needs a blocking read.
+        if let Err(error) = stream.set_nonblocking(false) {
+            warn!(self.log, "virtio-console client setup failed";
+                "error" => %error);
+            return;
+        }
+        if let Err(error) = stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))
+        {
+            warn!(self.log, "virtio-console write timeout not set";
+                "error" => %error);
+            return;
+        }
+        let reader = match stream.try_clone() {
+            Ok(r) => r,
+            Err(error) => {
+                warn!(self.log, "virtio-console client clone failed";
+                    "error" => %error);
+                return;
+            }
+        };
+
+        self.replace_client(Some(stream));
+        self.reap_readers();
+
+        let worker = Arc::clone(self);
+        match std::thread::Builder::new()
+            .name("virtio-console-rx".into())
+            .spawn(move || reader_loop(worker, reader))
+        {
+            Ok(handle) => {
+                self.readers.lock().expect("reader lock").push(handle)
+            }
+            Err(error) => {
+                warn!(self.log, "virtio-console reader spawn failed";
+                    "error" => %error);
+                self.replace_client(None);
+            }
+        }
+    }
+}
+
+/// Wait for events on `fd`, or for `timeout_ms` to pass.
+///
+/// A blocking `accept` can only be broken by racing a connect against
+/// the listener, and a connect that fails leaves the thread blocked
+/// forever, which would hang VM teardown.
+fn poll_events(fd: RawFd, timeout_ms: i32) -> libc::c_short {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // A timeout or EINTR reports nothing, and the caller then re-reads
+    // the shutdown flag.
+    if unsafe { libc::poll(&mut pfd, 1, timeout_ms) } <= 0 {
+        return 0;
+    }
+    pfd.revents
+}
+
+fn accept_loop(shared: Arc<ConsoleShared>, listener: UnixListener) {
+    if let Err(error) = listener.set_nonblocking(true) {
+        warn!(shared.log, "virtio-console listener setup failed";
+            "error" => %error);
+        return;
+    }
+    let fd = listener.as_raw_fd();
+
+    while !shared.shutdown.load(Ordering::Acquire) {
+        let revents = poll_events(fd, ACCEPT_POLL_MS);
+        // A dead listener reports its condition on every call, so the
+        // loop must leave rather than spin on it.
+        if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            warn!(shared.log, "virtio-console listener is unusable";
+                "revents" => i32::from(revents));
+            return;
+        }
+        if revents & libc::POLLIN == 0 {
+            continue;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => shared.attach_client(stream),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => {
+                warn!(shared.log, "virtio-console accept failed";
+                    "error" => %error);
+                // Out of file descriptors leaves the connection
+                // pending, so back off instead of spinning on it.
+                std::thread::sleep(ACCEPT_BACKOFF);
+            }
+        }
+    }
+}
+
+fn reader_loop(shared: Arc<ConsoleShared>, mut stream: UnixStream) {
+    let mut buf = [0u8; 4096];
+    loop {
+        if shared.shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        let n = match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                continue
+            }
+            Err(_) => break,
+        };
+        {
+            let mut backlog = shared.backlog.lock().expect("backlog lock");
+            let room = CONSOLE_RX_BACKLOG_MAX.saturating_sub(backlog.len());
+            let take = n.min(room);
+            if take < n {
+                if !shared.overflowed.swap(true, Ordering::Relaxed) {
+                    warn!(shared.log,
+                        "virtio-console RX backlog full, dropping input";
+                        "dropped" => n.saturating_sub(take));
+                }
+            } else {
+                shared.overflowed.store(false, Ordering::Relaxed);
+            }
+            backlog.extend(&buf[..take]);
+        }
+        shared.deliver_rx();
+    }
+    // The client slot is not cleared here: a newer client may already
+    // own it, and the write path drops a dead one on its own.
+}
+
+/// Parse the config half of `-s <slot>,virtio-console,<socket-path>`.
+pub fn parse_console_config(config: &str) -> anyhow::Result<&str> {
+    if config.is_empty() {
+        anyhow::bail!("virtio-console requires a socket path");
+    }
+    let mut parts = config.split(',');
+    let path = parts.next().unwrap_or(config);
+    if let Some(opt) = parts.next() {
+        // Rejecting unknown options stops a misspelled flag from
+        // looking as though it were honored.
+        anyhow::bail!("virtio-console takes no options, got '{}'", opt);
+    }
+    Ok(path)
+}
+
+/// Single-port VirtIO console backed by a Unix domain socket.
+pub struct VirtioConsole {
+    shared: Arc<ConsoleShared>,
+    accept: Mutex<Option<JoinHandle<()>>>,
+    negotiated_features: Mutex<u64>,
+    indicator: Indicator,
+}
+
+impl VirtioConsole {
+    /// Bind the host socket and start accepting clients.
+    ///
+    /// Returns by value: `VirtioPciDevice::new` takes the backend by
+    /// value, so clone [`interrupt`](Self::interrupt) and read
+    /// [`config_size`](Self::config_size) before the move.
+    pub fn new(
+        socket_path: &Path,
+        physmap: Arc<PhysMap>,
+        log: slog::Logger,
+    ) -> anyhow::Result<Self> {
+        // 0600 socket in a 0700 directory, same policy as the control
+        // socket. Do not use a bare UnixListener::bind here.
+        let listener = bind_restricted(socket_path, SocketPolicy::default())
+            .with_context(|| {
+                format!("bind virtio-console socket {}", socket_path.display())
+            })?;
+
+        // Zero registered workers: the accept and reader threads block
+        // on the socket, outside the gate, and a console holds no
+        // durable in-flight work. The gate's job here is `is_paused`.
+        let shared = Arc::new(ConsoleShared {
+            socket_path: socket_path.to_path_buf(),
+            physmap,
+            client: Mutex::new(None),
+            backlog: Mutex::new(VecDeque::new()),
+            pending_rx: Mutex::new(VecDeque::new()),
+            rx_completion: Mutex::new(None),
+            interrupt: Arc::new(Mutex::new(None)),
+            readers: Mutex::new(Vec::new()),
+            shutdown: AtomicBool::new(false),
+            gate: Arc::new(QuiesceGate::new(0)),
+            overflowed: AtomicBool::new(false),
+            log,
+        });
+
+        let accept_shared = Arc::clone(&shared);
+        let accept = std::thread::Builder::new()
+            .name("virtio-console-accept".into())
+            .spawn(move || accept_loop(accept_shared, listener))
+            .context("spawn virtio-console accept thread")?;
+
+        Ok(Self {
+            shared,
+            accept: Mutex::new(Some(accept)),
+            negotiated_features: Mutex::new(0),
+            indicator: Indicator::new(),
+        })
+    }
+
+    /// The interrupt slot, for the binary to fill after the transport
+    /// exists. Clone this before moving the device into the transport.
+    pub fn interrupt(&self) -> Arc<Mutex<Option<ConsoleInterrupt>>> {
+        Arc::clone(&self.shared.interrupt)
+    }
+
+    pub const fn config_size(&self) -> u16 {
+        CONSOLE_CONFIG_SIZE
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.shared.socket_path
+    }
+
+    fn ensure_rx_completion(&self, queue: &VirtQueue) {
+        let mut slot = self
+            .shared
+            .rx_completion
+            .lock()
+            .expect("rx completion lock");
+        if slot.is_some() {
+            return;
+        }
+        let intr = Arc::clone(&self.shared.interrupt);
+        let completion = VirtioCompletion::new(
+            queue,
+            Arc::clone(&self.shared.physmap),
+            move || {
+                if let Ok(guard) = intr.lock() {
+                    if let Some(ref raise) = *guard {
+                        raise();
+                    }
+                }
+            },
+        );
+        // Force the first completions through EVENT_IDX suppression so
+        // an idle guest console always wakes on its first input.
+        completion.set_force_interrupt(32);
+        *slot = Some(completion);
+    }
+
+    /// Pop RX chains and hold them until host bytes arrive.
+    fn stash_rx(&self, queue: &mut VirtQueue, physmap: &PhysMap) {
+        self.ensure_rx_completion(queue);
+
+        // A stashed chain is only completed once host bytes land in
+        // it, so the stash needs a bound of its own: a guest can
+        // otherwise publish one descriptor over and over and grow VMM
+        // memory without limit.
+        let max_requests = usize::from(queue.size());
+        let max_pending = max_requests;
+        let mut popped = 0usize;
+        loop {
+            let before = queue.last_avail_idx();
+            {
+                let mut pending =
+                    self.shared.pending_rx.lock().expect("pending rx lock");
+                while popped < max_requests && pending.len() < max_pending {
+                    let Some(head) = queue.pop_avail(physmap) else {
+                        break;
+                    };
+                    popped += 1;
+                    let Some(chain) = queue.collect_chain(physmap, head) else {
+                        continue;
+                    };
+                    pending.push_back((head, chain));
+                }
+            }
+            let hit_request_cap = popped >= max_requests;
+            if !hit_request_cap {
+                queue.update_used_event(physmap);
+            }
+            if queue_drain_should_stop(queue, before, hit_request_cap, physmap)
+            {
+                break;
+            }
+        }
+
+        self.shared.deliver_rx();
+    }
+
+    /// Drain guest output inline on the vCPU thread.
+    fn drain_tx(&self, queue: &mut VirtQueue, physmap: &PhysMap) -> bool {
+        let old_used_idx = queue.read_used_idx(physmap);
+        let max_requests = usize::from(queue.size());
+        let mut popped = 0usize;
+        let mut did_work = false;
+        let mut chunk = [0u8; TX_CHUNK];
+
+        loop {
+            let before = queue.last_avail_idx();
+            while popped < max_requests {
+                let Some(head) = queue.pop_avail(physmap) else {
+                    break;
+                };
+                popped += 1;
+                if let Some(chain) = queue.collect_chain(physmap, head) {
+                    for buf in &chain {
+                        let ChainBuf::Readable { addr, len } = buf else {
+                            continue;
+                        };
+                        self.write_chain_buf(physmap, *addr, *len, &mut chunk);
+                    }
+                }
+                // The chain is entirely device-readable, so the used
+                // length is zero.
+                queue.push_used(physmap, head, 0);
+                did_work = true;
+            }
+            let hit_request_cap = popped >= max_requests;
+            if !hit_request_cap {
+                queue.update_used_event(physmap);
+            }
+            if queue_drain_should_stop(queue, before, hit_request_cap, physmap)
+            {
+                break;
+            }
+        }
+
+        did_work && queue.should_notify_guest(physmap, old_used_idx)
+    }
+
+    /// Copy one device-readable buffer out to the client, in chunks.
+    fn write_chain_buf(
+        &self,
+        physmap: &PhysMap,
+        addr: u64,
+        len: u32,
+        chunk: &mut [u8; TX_CHUNK],
+    ) {
+        let mut remaining = len as usize;
+        let mut offset = 0u64;
+        while remaining > 0 {
+            let n = remaining.min(TX_CHUNK);
+            let Some(gpa) = addr.checked_add(offset) else {
+                return;
+            };
+            let Some(sub) = physmap.lookup(gpa, n) else {
+                return;
+            };
+            if sub.read_bytes(&mut chunk[..n]).is_err() {
+                return;
+            }
+            self.shared.write_host(&chunk[..n]);
+            offset = offset.saturating_add(n as u64);
+            remaining = remaining.saturating_sub(n);
+        }
+    }
+}
+
+impl VirtioDevice for VirtioConsole {
+    fn device_features(&self) -> u64 {
+        // Ring features only. The transport adds VERSION_1 and strips
+        // these two on the legacy path.
+        super::bits::VIRTIO_F_RING_EVENT_IDX
+            | super::bits::VIRTIO_F_RING_INDIRECT_DESC
+    }
+
+    fn set_features(&self, features: u64) {
+        // Store only: the modern transport calls this twice, once per
+        // 32-bit half, with a partial value on the first call.
+        *self.negotiated_features.lock().expect("features lock") = features;
+    }
+
+    fn cfg_read(&self, _offset: u16, _len: u8) -> u32 {
+        // cols, rows, max_nr_ports and emerg_wr all read zero.
+        0
+    }
+
+    fn cfg_write(&self, _offset: u16, _val: u32, _len: u8) {}
+
+    fn process_queue(
+        &self,
+        _queue_idx: u16,
+        _queue: &mut VirtQueue,
+        _head: u16,
+        _physmap: &PhysMap,
+    ) -> u32 {
+        0 // not called: notify_queue is overridden
+    }
+
+    fn notify_queue(
+        &self,
+        queue_idx: u16,
+        queues: &mut [VirtQueue],
+        physmap: &PhysMap,
+    ) -> bool {
+        let Some(queue) = queues.get_mut(queue_idx as usize) else {
+            return false;
+        };
+        match queue_idx {
+            CONSOLE_RX_QUEUE => {
+                self.stash_rx(queue, physmap);
+                // The completion handler raises the interrupt later.
+                false
+            }
+            CONSOLE_TX_QUEUE => self.drain_tx(queue, physmap),
+            _ => false,
+        }
+    }
+
+    fn reset(&self) {
+        *self.negotiated_features.lock().expect("features lock") = 0;
+        *self
+            .shared
+            .rx_completion
+            .lock()
+            .expect("rx completion lock") = None;
+        // Chains posted before the reset are dropped, not completed:
+        // the guest abandons its rings across a reset and reposts.
+        self.shared
+            .pending_rx
+            .lock()
+            .expect("pending rx lock")
+            .clear();
+        // The host-side backlog survives a guest reset: those bytes
+        // were accepted from the client and are still owed to the guest.
+    }
+}
+
+impl Lifecycle for VirtioConsole {
+    fn type_name(&self) -> &'static str {
+        "virtio-console"
+    }
+
+    fn lifecycle_state(&self) -> Option<IndicatedState> {
+        Some(self.indicator.state())
+    }
+
+    fn start(&self) -> anyhow::Result<()> {
+        self.indicator.start();
+        Ok(())
+    }
+
+    fn pause(&self) {
+        self.indicator.pause();
+        self.shared.gate.pause();
+    }
+
+    fn is_quiesced(&self) -> bool {
+        // Non-blocking atomic load. Joining happens in halt().
+        self.shared.gate.is_quiesced()
+    }
+
+    fn resume(&self) {
+        self.shared.gate.resume();
+        self.indicator.resume();
+        // Bytes buffered during the pause are owed to the guest.
+        self.shared.deliver_rx();
+    }
+
+    fn halt(&self) {
+        self.indicator.halt();
+        self.shared.shutdown.store(true, Ordering::Release);
+
+        // The accept thread polls the flag, so it returns on its own.
+        // Nothing here races a connect that could fail and leave that
+        // thread blocked in accept() for the rest of teardown.
+        if let Some(handle) = self.accept.lock().expect("accept lock").take() {
+            let _ = handle.join();
+        }
+
+        // Shutting the socket down wakes the reader blocked on read().
+        // The accept thread has returned, so no reader is added after
+        // this point.
+        self.shared.replace_client(None);
+        let readers: Vec<_> = self
+            .shared
+            .readers
+            .lock()
+            .expect("reader lock")
+            .drain(..)
+            .collect();
+        for handle in readers {
+            // A panicked reader must not abort teardown.
+            let _ = handle.join();
+        }
+
+        // The socket may already be gone if the path was reused.
+        let _ = std::fs::remove_file(&self.shared.socket_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bits;
+    use crate::queue::VirtqDesc;
+    use std::io::Write;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::MutexGuard;
+    use std::time::{Duration, Instant};
+    use vmm_core::mem::PhysMap;
+    use vmm_devices::Lifecycle;
+
+    /// `bind_restricted` sets the process umask around its `bind`, so a
+    /// directory created by another thread in that window loses its
+    /// execute bit and every later bind inside it fails. Hold this over
+    /// the temporary directory and the bind together.
+    static BIND_LOCK: Mutex<()> = Mutex::new(());
+
+    const DESC_GPA: u64 = 0x1000;
+    const AVAIL_GPA: u64 = 0x1100;
+    const USED_GPA: u64 = 0x1200;
+    const DATA_GPA: u64 = 0x2000;
+    const DATA_B_GPA: u64 = 0x2100;
+
+    fn test_logger() -> slog::Logger {
+        slog::Logger::root(slog::Discard, slog::o!())
+    }
+
+    fn bind_lock() -> MutexGuard<'static, ()> {
+        // A panicking test must not cascade into every later one.
+        BIND_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn console_in_tempdir(
+        physmap: Arc<PhysMap>,
+    ) -> (tempfile::TempDir, VirtioConsole) {
+        let _guard = bind_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("console.sock");
+        let console = VirtioConsole::new(&sock, physmap, test_logger())
+            .expect("create console");
+        (dir, console)
+    }
+
+    /// One configured queue whose descriptor 0 points at `DATA_GPA`.
+    fn make_queue(
+        queue_size: u16,
+        avail_idx: u16,
+        flags: u16,
+        len: u32,
+    ) -> (Arc<PhysMap>, VirtQueue) {
+        let physmap = Arc::new(
+            PhysMap::new_anon(DESC_GPA, 0x2000).expect("create queue memory"),
+        );
+        let mut queue = VirtQueue::new(queue_size);
+        queue.set_addr_modern(DESC_GPA, AVAIL_GPA, USED_GPA);
+        queue.set_event_idx(true);
+
+        write_desc(&physmap, 0, DATA_GPA, len, flags);
+        physmap
+            .lookup(AVAIL_GPA + 2, 2)
+            .expect("mapped avail index")
+            .write::<u16>(&avail_idx)
+            .expect("write avail index");
+        for idx in 0..queue_size {
+            physmap
+                .lookup(AVAIL_GPA + 4 + u64::from(idx) * 2, 2)
+                .expect("mapped avail entry")
+                .write::<u16>(&0)
+                .expect("write avail entry");
+        }
+        (physmap, queue)
+    }
+
+    /// One configured queue whose single descriptor is a 4-byte
+    /// device-readable buffer holding "ping".
+    fn make_tx_queue(
+        queue_size: u16,
+        avail_idx: u16,
+    ) -> (Arc<PhysMap>, VirtQueue) {
+        let (physmap, queue) = make_queue(queue_size, avail_idx, 0, 4);
+        physmap
+            .lookup(DATA_GPA, 4)
+            .expect("mapped payload")
+            .write_bytes(b"ping")
+            .expect("write payload");
+        (physmap, queue)
+    }
+
+    fn write_desc(
+        physmap: &PhysMap,
+        idx: u64,
+        addr: u64,
+        len: u32,
+        flags: u16,
+    ) {
+        physmap
+            .lookup(DESC_GPA + idx * 16, 16)
+            .expect("mapped descriptor")
+            .write(&VirtqDesc {
+                addr,
+                len,
+                flags,
+                next: 0,
+            })
+            .expect("write descriptor");
+    }
+
+    fn publish_avail(physmap: &PhysMap, slot: u64, desc: u16, avail_idx: u16) {
+        physmap
+            .lookup(AVAIL_GPA + 4 + slot * 2, 2)
+            .expect("mapped avail entry")
+            .write::<u16>(&desc)
+            .expect("write avail entry");
+        physmap
+            .lookup(AVAIL_GPA + 2, 2)
+            .expect("mapped avail index")
+            .write::<u16>(&avail_idx)
+            .expect("write avail index");
+    }
+
+    fn read_bytes(physmap: &PhysMap, gpa: u64, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        physmap
+            .lookup(gpa, len)
+            .expect("mapped region")
+            .read_bytes(&mut buf)
+            .expect("read region");
+        buf
+    }
+
+    /// The used ring entry at `slot`, as (descriptor id, length).
+    fn read_used_entry(physmap: &PhysMap, slot: u64) -> (u32, u32) {
+        let entry = physmap
+            .lookup(USED_GPA + 4 + slot * 8, 8)
+            .expect("mapped used entry");
+        let id = entry.read::<u32>().expect("read used id");
+        let len = entry
+            .subregion(4, 4)
+            .expect("used length")
+            .read::<u32>()
+            .expect("read used length");
+        (id, len)
+    }
+
+    fn wait_for(mut ready: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        false
+    }
+
+    #[test]
+    fn parse_console_config_requires_a_path() {
+        let err = parse_console_config("").expect_err("empty must fail");
+        assert_eq!(err.to_string(), "virtio-console requires a socket path");
+    }
+
+    #[test]
+    fn parse_console_config_rejects_options() {
+        let err = parse_console_config("/tmp/c.sock,rw")
+            .expect_err("option must fail");
+        assert_eq!(
+            err.to_string(),
+            "virtio-console takes no options, got 'rw'"
+        );
+    }
+
+    #[test]
+    fn parse_console_config_rejects_a_trailing_comma() {
+        // A trailing comma is a typo, not an empty option list.
+        let err = parse_console_config("/tmp/c.sock,")
+            .expect_err("trailing comma must fail");
+        assert_eq!(err.to_string(), "virtio-console takes no options, got ''");
+    }
+
+    #[test]
+    fn parse_console_config_returns_the_path() {
+        assert_eq!(
+            parse_console_config("/tmp/c.sock").expect("path"),
+            "/tmp/c.sock"
+        );
+    }
+
+    #[test]
+    fn tx_notify_drains_ring_and_updates_avail_event() {
+        let (physmap, tx_queue) = make_tx_queue(4, 2);
+        let avail_event_gpa =
+            tx_queue.used_addr() + 4 + u64::from(tx_queue.size()) * 8;
+        let (_dir, console) = console_in_tempdir(Arc::clone(&physmap));
+
+        // TX is queue index 1, so the slice needs both slots.
+        let mut queues = [VirtQueue::new(4), tx_queue];
+        console.notify_queue(CONSOLE_TX_QUEUE, &mut queues, &physmap);
+
+        assert_eq!(queues[1].last_avail_idx(), 2);
+        assert_eq!(queues[1].read_used_ring_idx(&physmap), 2);
+        assert_eq!(
+            physmap
+                .lookup(avail_event_gpa, 2)
+                .expect("mapped avail event")
+                .read::<u16>()
+                .expect("read avail event"),
+            2,
+        );
+        console.pause();
+        console.halt();
+    }
+
+    #[test]
+    fn rx_notify_stashes_chains_without_completing_them() {
+        let (physmap, rx_queue) = make_tx_queue(4, 2);
+        let (_dir, console) = console_in_tempdir(Arc::clone(&physmap));
+
+        let mut queues = [rx_queue, VirtQueue::new(4)];
+        let notify =
+            console.notify_queue(CONSOLE_RX_QUEUE, &mut queues, &physmap);
+
+        // No host bytes are waiting, so nothing may be published.
+        assert!(!notify);
+        assert_eq!(queues[0].last_avail_idx(), 2);
+        assert_eq!(queues[0].read_used_ring_idx(&physmap), 0);
+        console.pause();
+        console.halt();
+    }
+
+    #[test]
+    fn host_bytes_reach_guest_memory() {
+        let (physmap, rx_queue) = make_queue(4, 1, bits::VRING_DESC_F_WRITE, 8);
+        let (dir, console) = console_in_tempdir(Arc::clone(&physmap));
+        let raised = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&raised);
+        *console.interrupt().lock().expect("interrupt lock") =
+            Some(Arc::new(move || {
+                counter.fetch_add(1, Ordering::Release);
+            }));
+
+        let mut queues = [rx_queue, VirtQueue::new(4)];
+        assert!(!console.notify_queue(CONSOLE_RX_QUEUE, &mut queues, &physmap));
+        assert_eq!(queues[0].read_used_ring_idx(&physmap), 0);
+
+        let mut client = UnixStream::connect(dir.path().join("console.sock"))
+            .expect("connect console client");
+        client.write_all(b"hi").expect("write host bytes");
+        client.flush().expect("flush host bytes");
+
+        assert!(
+            wait_for(|| queues[0].read_used_ring_idx(&physmap) == 1),
+            "host bytes were never published to the guest",
+        );
+        assert_eq!(read_bytes(&physmap, DATA_GPA, 2), b"hi");
+        assert_eq!(read_used_entry(&physmap, 0), (0, 2));
+        assert!(raised.load(Ordering::Acquire) >= 1);
+
+        console.pause();
+        console.halt();
+    }
+
+    #[test]
+    fn reset_drops_posted_rx_chains() {
+        let (physmap, rx_queue) = make_queue(4, 1, bits::VRING_DESC_F_WRITE, 8);
+        let (dir, console) = console_in_tempdir(Arc::clone(&physmap));
+        let mut queues = [rx_queue, VirtQueue::new(4)];
+        console.notify_queue(CONSOLE_RX_QUEUE, &mut queues, &physmap);
+
+        VirtioDevice::reset(&console);
+
+        // A second chain, into a different buffer. Host bytes must land
+        // here, which they cannot do if the dropped chain still leads.
+        write_desc(&physmap, 1, DATA_B_GPA, 8, bits::VRING_DESC_F_WRITE);
+        publish_avail(&physmap, 1, 1, 2);
+        console.notify_queue(CONSOLE_RX_QUEUE, &mut queues, &physmap);
+
+        let mut client = UnixStream::connect(dir.path().join("console.sock"))
+            .expect("connect console client");
+        client.write_all(b"hi").expect("write host bytes");
+        client.flush().expect("flush host bytes");
+
+        assert!(
+            wait_for(|| queues[0].read_used_ring_idx(&physmap) == 1),
+            "host bytes were never published to the guest",
+        );
+        assert_eq!(read_used_entry(&physmap, 0), (1, 2));
+        assert_eq!(read_bytes(&physmap, DATA_B_GPA, 2), b"hi");
+        assert_eq!(read_bytes(&physmap, DATA_GPA, 8), vec![0u8; 8]);
+
+        console.pause();
+        console.halt();
+    }
+
+    #[test]
+    fn quiesce_query_is_non_blocking() {
+        let (_dir, console) = console_in_tempdir(Arc::new(PhysMap::new()));
+        let device: Arc<dyn Lifecycle> = Arc::new(console);
+
+        device.pause();
+        let probe = Arc::clone(&device);
+        assert!(vmm_devices_testsupport::assert_query_non_blocking(
+            move || probe.is_quiesced()
+        ));
+        device.resume();
+        device.pause();
+        device.halt();
+    }
+
+    #[test]
+    fn virtio_console_is_documented_for_operators() {
+        // Built from CARGO_MANIFEST_DIR, not from this file's depth, so
+        // the check survives a move of the module into another crate.
+        let devices = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/devices.md"
+        ));
+        assert!(
+            devices.contains("| `virtio-console` |"),
+            "docs/devices.md needs a virtio-console row in the PCI table"
+        );
+        assert!(
+            devices.contains("### virtio-console"),
+            "docs/devices.md needs a virtio-console section"
+        );
+        assert!(
+            devices.contains("/dev/hvc0"),
+            "docs/devices.md must name the guest device node"
+        );
+        let cli = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/cli.md"
+        ));
+        assert!(
+            cli.contains("virtio-console"),
+            "docs/cli.md needs a virtio-console -s example"
+        );
+    }
+
+    #[test]
+    fn features_are_ring_only() {
+        let (_dir, console) = console_in_tempdir(Arc::new(PhysMap::new()));
+        let f = console.device_features();
+        assert_ne!(f & bits::VIRTIO_F_RING_EVENT_IDX, 0);
+        assert_ne!(f & bits::VIRTIO_F_RING_INDIRECT_DESC, 0);
+        // No F_SIZE, no MULTIPORT, no EMERG_WRITE, and VERSION_1 is
+        // the transport's to add.
+        assert_eq!(f & bits::VIRTIO_F_VERSION_1, 0);
+        assert_eq!(console.config_size(), CONSOLE_CONFIG_SIZE);
+        console.pause();
+        console.halt();
+    }
+}

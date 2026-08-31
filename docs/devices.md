@@ -2,19 +2,32 @@
 
 ## PCI Devices
 
-| Driver | Type | Description |
-|--------|------|-------------|
-| `hostbridge` | Chipset | i440fx host bridge (slot 0) |
-| `lpc` | Chipset | ISA/LPC bridge (slot 31) |
-| `virtio-blk` | Storage | VirtIO legacy block device |
-| `nvme` | Storage | NVMe 1.0 controller with async I/O |
-| `ahci-cd` | Storage | CD-ROM (falls back to virtio-blk) |
-| `ahci-hd` | Storage | AHCI disk (falls back to virtio-blk) |
-| `virtio-net-viona` | Network | VirtIO network via viona kernel driver |
-| `virtio-rnd` | Misc | VirtIO entropy source (/dev/random) |
-| `fbuf` | Display | Framebuffer with RFB/VNC server |
-| `xhci` | USB | xHCI USB 3.0 controller (tablet input) |
-| `passthru` | Passthrough | PCI device passthrough via PPT |
+`rshyve` accepts every driver below. `firehyve` accepts only the eight
+marked "both" and fails at startup on the rest, naming the driver.
+
+| Driver | Binaries | Type | Description |
+|--------|----------|------|-------------|
+| `hostbridge` | both | Chipset | i440fx host bridge, already attached at 0.0.0 |
+| `lpc` | both | Chipset | ISA/LPC bridge, already attached at slot 1 |
+| `virtio-blk` | both | Storage | VirtIO block device, multiqueue |
+| `virtio-net-viona` | both | Network | VirtIO network via the viona kernel driver |
+| `virtio-rnd` | both | Misc | VirtIO entropy source |
+| `virtio-console` | both | Serial | VirtIO console on a Unix socket |
+| `virtio-fs` | both | Filesystem | FUSE passthrough of a host directory |
+| `virtio-blk-pci` | both | Storage | Alias for `virtio-blk` |
+| `nvme` | rshyve | Storage | NVMe 1.0 controller with async I/O |
+| `ahci-cd` | rshyve | Storage | ATAPI CD-ROM, read only |
+| `ahci-hd` | neither | Storage | Not implemented. A hard startup error, not a fallback |
+| `fbuf` | rshyve | Display | Framebuffer with an RFB/VNC server on a Unix socket |
+| `xhci` | rshyve | USB | xHCI USB 3.0 controller with an absolute tablet |
+| `passthru` | rshyve | Passthrough | PCI device passthrough via PPT |
+
+An unrecognized driver name behaves differently per binary: `firehyve`
+refuses to start, while `rshyve` logs a warning, skips the device, and
+boots without it. A typo in `-s` therefore yields a VM with a missing
+disk rather than an error.
+
+See [features.md](features.md) for option keys, defaults and limits.
 
 ## LPC Devices
 
@@ -52,9 +65,13 @@ for lifecycle management and state export/import during migration.
 
 ### virtio-blk
 
-- VirtIO legacy PCI transport
-- Supports `nodelete` (disable TRIM) and `sectorsize=N` options
-- Single queue, 128 entries
+- Transitional VirtIO PCI transport, legacy and modern
+- Options: `ro`, `sectorsize=N`, `num-queues=N` (1..=8), `nodelete`
+- Multiqueue. The default queue count is `min(vcpus, 4)`, at least 1
+- 128 descriptors per queue
+- `nodelete` parses and is then never read. DISCARD and WRITE_ZEROES
+  advertise their feature bits and return success without touching the
+  file, so an in-guest `fstrim` reports success and frees nothing
 
 ### Disk Options
 
@@ -65,6 +82,36 @@ for lifecycle management and state export/import during migration.
 -s 4,virtio-blk,/path/to/disk,ro         # read-only
 -s 4,nvme,/path/to/disk                  # NVMe (recommended)
 ```
+
+## Serial Details
+
+### virtio-console
+
+A single-port VirtIO console. The host end is a Unix domain socket
+created with 0600 permissions inside a 0700 directory; the guest sees
+one port at `/dev/hvc0`.
+
+```
+-s 8,virtio-console,/var/run/rshyve/<vm>/console.sock
+```
+
+The config takes a socket path and nothing else. Any comma-separated
+option after the path is rejected.
+
+Attach from the host with:
+
+```
+socat - UNIX-CONNECT:/var/run/rshyve/<vm>/console.sock
+```
+
+Only one client may be attached at a time. Guest output written while no
+client is attached is discarded. Host input that arrives while the guest
+has posted no receive buffer is held, up to 64 KiB, and delivered when
+the guest posts one.
+
+`VIRTIO_CONSOLE_F_MULTIPORT` and `VIRTIO_CONSOLE_F_SIZE` are not
+offered, so there are no control queues and no terminal-size reporting.
+Console state is not carried across a live migration.
 
 ## Network Details
 
@@ -98,6 +145,9 @@ pointer input.
 -s 30:1,xhci,tablet
 ```
 
+`vga=` is accepted for bhyve compatibility and then discarded. There is
+no VGA emulation to enable, so every value behaves the same.
+
 ## PCI Passthrough
 
 Requires PPT (PCI PassThrough) kernel driver. Works on both Intel
@@ -107,5 +157,44 @@ Requires PPT (PCI PassThrough) kernel driver. Works on both Intel
 -s 5,passthru,/dev/ppt0
 ```
 
-Automatically adds `-S` (wire memory) and `-A` (ACPI) when passthrough
-devices are present.
+`-S` (wire memory) must be passed explicitly when using passthrough.
+Nothing adds it automatically, and `-A` is accepted but never read.
+
+## Filesystem
+
+### virtio-fs
+
+Exports a host directory to the guest as a FUSE filesystem over a
+virtqueue. No DAX and no shared-memory window: every reply travels
+through the request queue.
+
+```
+-s 12,virtio-fs,/export/shared                       # tag "shared", rw
+-s 12,virtio-fs,/export/data,tag=data,ro             # read-only
+-s 12,virtio-fs,/export/data,queue-size=256          # deeper queue
+```
+
+Options are `tag=<name>` (defaults to the last path component, at most 36
+bytes, no NUL), `ro`, and `queue-size=<n>` (8..=1024, rounded up to a
+power of two). An unrecognized option is an error.
+
+Mount it in a Linux guest with:
+
+```
+mount -t virtiofs <tag> /mnt
+```
+
+Limitations:
+
+- The device advertises EVENT_IDX and INDIRECT_DESC, which the PCI
+  transport strips on the legacy path. A legacy-only guest therefore
+  negotiates a smaller feature set than a VERSION_1 guest.
+- One worker serves both queues, so the hiprio queue gives no priority:
+  a `FUSE_INTERRUPT` or `FUSE_FORGET` waits behind the request already
+  in flight.
+- `FUSE_ACCESS` is granted whenever the node can be stat'd, so the
+  `mask` argument is not enforced on a read-write export.
+- Hardlink creation inside the export uses the `/proc/self/fd` idiom and
+  is not guaranteed on illumos.
+- No migration state is exported, so in-flight requests do not survive a
+  migration.

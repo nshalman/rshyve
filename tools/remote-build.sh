@@ -2,7 +2,7 @@
 #
 # Build and test vmmnew on the illumos build host.
 #
-# The vmm binary only builds on illumos: vmm-tpm-sys drives an autotools
+# The rshyve binary only builds on illumos: vmm-tpm-sys drives an autotools
 # build of vendored libtpms, bhyve-api binds SunOS ioctls, and viona-api
 # needs libdladm. The library crates other than vmm-tpm-sys and vmm-tpm
 # do build and test on macOS, which is enough for most unit work; the
@@ -15,8 +15,9 @@
 #   tools/remote-build.sh test -p vmm_tpm    # extra args pass through
 #   tools/remote-build.sh clippy
 #   tools/remote-build.sh check
+#   tools/remote-build.sh needed             # stock-PI dependency gate
 #   tools/remote-build.sh sync               # push sources, build nothing
-#   tools/remote-build.sh run -- -H -c 2 ... # run the built vmm
+#   tools/remote-build.sh run -- -H -c 2 ... # run the built rshyve
 #   tools/remote-build.sh sh 'arbitrary command'
 #
 # Override the target with VMM_BUILD_HOST / VMM_BUILD_KEY / VMM_BUILD_DIR.
@@ -26,7 +27,7 @@ set -euo pipefail
 # No defaults: the build host is site-specific and must not be baked in.
 HOST="${VMM_BUILD_HOST:?set VMM_BUILD_HOST to user@host of your illumos build host}"
 KEY="${VMM_BUILD_KEY:?set VMM_BUILD_KEY to the SSH key for that host}"
-REMOTE_DIR="${VMM_BUILD_DIR:-/opt/vmmnew}"
+REMOTE_DIR="${VMM_BUILD_DIR:-/opt/rust-bhyve}"
 PROFILE="${VMM_BUILD_PROFILE:---release}"
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,7 +40,7 @@ SSH=(ssh -o ConnectTimeout=15 -i "$KEY" "$HOST")
 # autoconf, gmake, pkg-config); none of them are on root's default PATH.
 REMOTE_ENV="export PATH=/opt/tools/bin:/opt/local/bin:/usr/bin:/usr/sbin:\$PATH; cd $REMOTE_DIR"
 
-usage() { sed -n '3,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '3,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 
 sync_sources() {
     # --checksum because rsync-over-ssh timestamps do not reliably invalidate
@@ -60,9 +61,25 @@ case "$cmd" in
         sync_sources
         echo "synced $SRC_DIR -> $HOST:$REMOTE_DIR"
         ;;
-    build|check|clippy)
+    build)
+        sync_sources
+        remote "cargo build $PROFILE $*" 2>&1
+        # A binary that needs a library the platform image does not
+        # ship links fine here and then fails to exec on a node, so
+        # gate every build rather than only the packaging step.
+        remote "set -- ; for b in target/release/rshyve target/release/firehyve; do \
+                    if [ -f \$b ]; then set -- \"\$@\" \$b; fi; \
+                done; \
+                if [ \$# -gt 0 ]; then tools/check-needed.sh \"\$@\"; \
+                else echo 'no release binary to check'; fi" 2>&1
+        ;;
+    check|clippy)
         sync_sources
         remote "cargo $cmd $PROFILE $*" 2>&1
+        ;;
+    needed)
+        sync_sources
+        remote "tools/check-needed.sh ${*:-target/release/rshyve target/release/firehyve}" 2>&1
         ;;
     test)
         sync_sources
@@ -77,7 +94,7 @@ case "$cmd" in
     run)
         sync_sources
         remote "cargo build $PROFILE" 2>&1
-        remote "./target/release/vmm $*" 2>&1
+        remote "./target/release/rshyve $*" 2>&1
         ;;
     sh)
         remote "$*" 2>&1

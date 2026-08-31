@@ -3,7 +3,7 @@
 set -eu
 
 VM=${VM:-wintest}
-VMM=${VMM:-/opt/vmmnew/target/release/vmm}
+VMM=${VMM:-/opt/rust-bhyve/target/release/rshyve}
 DISK=${DISK:-/tmp/wintest.img}
 ISO=${ISO:-/opt/winassets/winsrv2025-eval.iso}
 ROM=${ROM:-/usr/share/bhyve/uefi-rom.bin}
@@ -22,7 +22,7 @@ usage() {
 
 teardown() {
 	# Brackets keep pkill from matching the remote ssh shell that invoked it.
-	pkill -9 -f 'relea[s]e/vmm' >/dev/null 2>&1 || :
+	pkill -9 -f 'rshyv[e]' >/dev/null 2>&1 || :
 	/usr/sbin/bhyvectl --vm="$VM" --destroy >/dev/null 2>&1 || :
 	if [ -f "$HOLDER" ]; then
 		holder_pid=$(cat "$HOLDER" 2>/dev/null || :)
@@ -93,8 +93,8 @@ case $1 in
 		;;
 	status)
 		[ "$#" -eq 1 ] || usage
-		pids=$(pgrep -f 'relea[s]e/vmm' 2>/dev/null || :)
-		printf 'vmm pid: %s\n' "${pids:-not running}"
+		pids=$(pgrep -f 'rshyv[e]' 2>/dev/null || :)
+		printf 'rshyve pid: %s\n' "${pids:-not running}"
 		if [ -n "$pids" ]; then
 			ps -o pid,pcpu,args -p $pids || :
 		fi

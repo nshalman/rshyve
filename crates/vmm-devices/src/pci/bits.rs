@@ -161,6 +161,7 @@ pub const CLASS_DISPLAY: u8 = 3;
 pub const CLASS_MULTIMEDIA: u8 = 4;
 pub const CLASS_MEMORY: u8 = 5;
 pub const CLASS_BRIDGE: u8 = 6;
+pub const CLASS_COMMUNICATION: u8 = 7;
 
 // Sub-classes under CLASS_STORAGE
 pub const SUBCLASS_STORAGE_SATA: u8 = 6;
@@ -171,6 +172,9 @@ pub const SUBCLASS_BRIDGE_HOST: u8 = 0;
 pub const SUBCLASS_BRIDGE_ISA: u8 = 1;
 pub const SUBCLASS_BRIDGE_PCI: u8 = 4;
 pub const SUBCLASS_BRIDGE_OTHER: u8 = 0x80;
+
+// Sub-classes under CLASS_COMMUNICATION
+pub const SUBCLASS_COMMUNICATION_OTHER: u8 = 0x80;
 
 // Programming interfaces
 pub const PROGIF_SATA_AHCI_1_0: u8 = 1;

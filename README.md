@@ -1,4 +1,4 @@
-# vmm - Rust bhyve VMM for Triton/SmartOS
+# rshyve - Rust bhyve VMM for Triton/SmartOS
 
 A Rust userspace VMM for illumos bhyve, CLI-compatible with the C
 `bhyve` command so it can be dropped into a Triton/SmartOS compute node
@@ -13,11 +13,10 @@ Read [SECURITY.md](SECURITY.md) before running an untrusted guest on it.
 ## Built on Propolis
 
 This project stands on [Propolis](https://github.com/oxidecomputer/propolis),
-Oxide Computer Company's bhyve VMM, and would not exist without it. The
-bhyve and viona kernel ioctl bindings, the address space manager, and
-the PS/2 device models are taken from Propolis largely unchanged; parts
-of the PCI, UART, and VM-exit layers derive from it too. Both projects
-are MPL-2.0.
+Oxide Computer Company's bhyve VMM. The bhyve and viona kernel ioctl bindings,
+the address space manager, and the PS/2 device models are from Propolis 
+largely unchanged; parts of the PCI, UART, and VM-exit layers derive from it
+too. Both projects are MPL-2.0.
 
 Nineteen files, about 3,500 significant lines. Each carries a header
 naming its upstream counterpart, [THIRD_PARTY.md](THIRD_PARTY.md) lists
@@ -28,7 +27,7 @@ checked rather than trusted.
 ## Quick Start
 
 ```bash
-vmm -c 2 -m 2G \
+rshyve -c 2 -m 2G \
   -s 4,nvme,/dev/zvol/dsk/zones/disk0 \
   -s 6,virtio-net-viona,net0 \
   -l bootrom,/usr/share/bhyve/uefi-rom.bin \
@@ -36,10 +35,19 @@ vmm -c 2 -m 2G \
   myvm
 ```
 
+## Two binaries
+
+`rshyve` is the full bhyve-parity VMM described above. `firehyve` is a
+microVM over the same crates: direct kernel boot, virtio devices, and a
+stdio serial console, with no UEFI, migration, control socket or
+passthrough. It shares the flag grammar and rejects what it cannot
+honor at startup. See [docs/cli.md](docs/cli.md#firehyve).
+
 ## Documentation
 
 - [Architecture](docs/architecture.md) - Crate structure and design
 - [CLI Reference](docs/cli.md) - All flags and options
+- [Feature reference](docs/features.md) - What each binary supports, with limits and caveats
 - [Devices](docs/devices.md) - Supported PCI and LPC devices
 - [Live Migration](docs/migration.md) - Cross-host VM migration
 - [Metadata Agent](docs/mdata.md) - Guest configuration via COM2
@@ -47,7 +55,7 @@ vmm -c 2 -m 2G \
 
 ## Building and testing
 
-The `vmm` binary builds only on illumos: `vmm-tpm-sys` runs an autotools
+The `rshyve` binary builds only on illumos: `vmm-tpm-sys` runs an autotools
 build of vendored libtpms, `bhyve-api` binds SunOS ioctls, and
 `viona-api` needs libdladm. Everything else in the workspace builds and
 tests on any host.

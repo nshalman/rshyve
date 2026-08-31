@@ -3,7 +3,7 @@
 ## Synopsis
 
 ```
-vmm [OPTIONS] <VM_NAME>
+rshyve [OPTIONS] <VM_NAME>
 ```
 
 ## bhyve-compatible Flags
@@ -50,7 +50,7 @@ runs on COM2 using these values:
 
 | Flag | Description |
 |------|-------------|
-| `--kernel <PATH>` | Linux bzImage (bypasses UEFI) |
+| `--kernel <PATH>` | Linux bzImage or PVH ELF, classified from the file (bypasses UEFI) |
 | `--initrd <PATH>` | initrd/initramfs |
 | `--cmdline <STRING>` | Kernel command line |
 
@@ -64,6 +64,8 @@ Examples:
 -s 6,virtio-net-viona,net0,promiscphys
 -s 0:5:0,passthru,/dev/ppt0
 -s 30:0,fbuf,vga=off,unix=/tmp/vm.vnc
+-s 8,virtio-console,/var/run/rshyve/myvm/console.sock
+-s 12,virtio-fs,/export/shared,tag=shared,ro
 ```
 
 ## LPC Device Syntax
@@ -96,12 +98,43 @@ echo '{"command":"migrate-source","target_addr":"10.0.0.2:4567"}' | socat - ...
 echo '{"command":"migrate-status"}' | socat - ...
 ```
 
+## firehyve
+
+`firehyve` is the second binary in this workspace: a microVM over the
+same crates, with a much smaller device surface. It shares this flag
+grammar, so a `-c/-m/-s/-l` command line reads the same, but it rejects
+at startup every flag it cannot honor rather than ignoring it.
+
+```
+firehyve [OPTIONS] --kernel <PATH> <VM_NAME>
+```
+
+| Difference | Detail |
+|------------|--------|
+| `--kernel` | Required. There is no UEFI path, so `-l bootrom,...` is rejected |
+| `-l com1` | `stdio` only. `/dev/zconsole` and `socket,<path>` are rejected |
+| `-l com2` | Not attached. There is no metadata agent, so `--mdata-*` is rejected |
+| `-s <slot>,<driver>` | `virtio-blk` (alias `virtio-blk-pci`), `virtio-net-viona`, `virtio-rnd`, `virtio-console`, `virtio-fs`, `hostbridge` and `lpc` only. `nvme`, `ahci-*`, `fbuf`, `xhci` and `passthru` are rejected, not skipped |
+| `-s ...,bootindex=N` | Rejected. A directly booted kernel has no firmware boot order |
+| Migration | Not supported: `--migrate-listen` and `--control-socket` are rejected |
+| Other | `--vtpm`, `--hyperv` and `--json-config` are rejected |
+
+Example:
+
+```bash
+firehyve -c 2 -m 512M \
+  -s 4,virtio-blk,/dev/zvol/rdsk/zones/$UUID/disk0 \
+  -l com1,stdio \
+  --kernel /var/tmp/vmlinux --cmdline "console=ttyS0 root=/dev/vda" \
+  guest
+```
+
 ## Example: boot.c Equivalent
 
 The following matches what `boot.c` constructs for a typical Triton VM:
 
 ```bash
-vmm -H \
+rshyve -H \
   -U $UUID \
   -B "1,manufacturer=Joyent,product=SmartDC HVM,serial=$ZONENAME" \
   -c $VCPUS -m ${RAM}M \

@@ -5,10 +5,6 @@ entry states the boundary it crosses, the evidence, and what closing it
 requires. Resolved entries move to the "Resolved" section with the
 commit that closed them.
 
-This file supersedes the generated audit corpus archived under
-`docs/archive/`, which is unverified model output and must not be read
-as a current findings list.
-
 ## Open
 
 ### OSF-1 — Live migration has no peer authentication or encryption

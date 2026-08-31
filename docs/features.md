@@ -1,0 +1,540 @@
+# Feature reference
+
+`rshyve` and `firehyve` are two binaries built from one workspace. `rshyve` is a drop-in replacement for the illumos `bhyve(8)` command: UEFI firmware, NVMe, AHCI CD-ROM, a VNC framebuffer, PCI passthrough, a control socket, and live migration. `firehyve` is a microVM that boots a Linux kernel directly and links a deliberately smaller crate set; it accepts eight PCI drivers and rejects everything else at startup instead of skipping it. Choose `firehyve` when the guest is a Linux kernel you supply and the device list is virtio only; choose `rshyve` for anything that needs firmware, a graphical console, or migration.
+
+Everything below is traced to code. Where a shipped document contradicts the code, the code wins and the contradiction is listed at the end.
+
+## At a glance
+
+Markers: **yes** works, **caveat** works with a condition named in the matching section, **exp** present but experimental, **no** absent, **reject** a startup error naming the unsupported item (not a silent skip).
+
+| Capability | rshyve | firehyve | Implemented at |
+|---|---|---|---|
+| **Boot** | | | |
+| Direct Linux bzImage (`--kernel`) | yes | yes (required) | `crates/vmm-boot/src/direct.rs` `KernelImage::from_bytes` |
+| PVH ELF kernel (`--kernel`) | yes | yes | `crates/vmm-boot/src/elf.rs` `PvhKernel::from_bytes` |
+| `--initrd` / `--cmdline` | yes | yes | `crates/vmm-boot/src/initrd.rs`, `direct.rs:326`, `pvh.rs:209` |
+| UEFI bootrom (`-l bootrom,...`) | yes | reject | `bin/rshyve/src/bootrom.rs:196`; `bin/firehyve/src/main.rs:68` |
+| Persistent UEFI variable store | caveat | reject | `bin/rshyve/src/varstore.rs:118` |
+| `bootindex=N` fw_cfg boot order | yes | reject | `bin/rshyve/src/bootorder.rs:53`; `bin/firehyve/src/main.rs:75` |
+| In-place guest reboot | yes (re-exec) | no (exits 0) | `bin/rshyve/src/reboot.rs`; `bin/firehyve/src/main.rs:263` |
+| **Storage** | | | |
+| `virtio-blk` / `virtio-blk-pci` | yes | yes | `crates/vmm-virtio/src/block.rs`, `attach.rs:91` |
+| `nvme` | caveat | reject | `crates/vmm-storage/src/nvme/mod.rs:185`; `bin/rshyve/src/main.rs:1064` |
+| `ahci-cd` (ATAPI CD-ROM, read only) | yes | reject | `crates/vmm-storage/src/ahci/`; `bin/rshyve/src/main.rs:1231` |
+| `ahci-hd` | no (hard error) | reject | `bin/rshyve/src/main.rs:974` `reject_ahci_hd` |
+| Disk hotplug, qcow2, I/O throttling | no | no | attach runs once, `crates/vmm-machine/src/pci.rs:126` |
+| **Network** | | | |
+| `virtio-net-viona` | yes | yes | `crates/vmm-virtio/src/viona.rs`, `attach.rs:170` |
+| Any other NIC model (e1000, tap, slirp) | no | reject | no match arm exists |
+| **Serial and console** | | | |
+| `-l com1,stdio` | yes | yes | `bin/rshyve/src/main.rs:1279`; `bin/firehyve/src/console.rs:60` |
+| `-l com1,socket,<path>` | yes | reject | `bin/rshyve/src/main.rs:1459`; `console.rs:46` |
+| `-l com1,<device path>` (`/dev/zconsole`) | yes | reject | `bin/rshyve/src/main.rs:1279`; `console.rs:46` |
+| COM2 as a general backend | yes | no (fixed) | firehyve COM2 is transmit only to stdout, `console.rs:111` |
+| `virtio-console` (Unix socket) | yes | yes | `crates/vmm-virtio/src/console.rs` |
+| **Filesystem** | | | |
+| `virtio-fs` host passthrough | yes | yes | `crates/vmm-virtio/src/fs/` |
+| virtio-fs DAX, xattrs, ACLs, locking | no | no | `fs/server.rs:112` dispatch |
+| **Display** | | | |
+| `fbuf` framebuffer plus VNC on a Unix socket | caveat | reject | `crates/vmm-hid/src/fbuf/mod.rs:163` |
+| VNC over TCP, bhyve `wait`, VGA emulation | no | no | no `TcpListener` in `crates/vmm-hid`; no 0x3C0/0x3D4 handlers |
+| **Input** | | | |
+| PS/2 keyboard (always present, no flag) | yes | no | `bin/rshyve/src/input.rs` `setup_ps2` |
+| `xhci` USB 3.0 with absolute tablet | caveat | reject | `crates/vmm-hid/src/xhci/mod.rs:198` |
+| USB keyboard | no | no | absent from the tree |
+| PS/2 mouse motion | no | no | `ps2/mouse.rs` `movement()` returns zeros |
+| **Migration and control** | | | |
+| Live migration, Unix socket path | exp | reject | `crates/vmm-migrate/src/sync_source.rs` |
+| Live migration, TCP path | exp, incomplete | reject | `crates/vmm-migrate/src/source.rs` (ships no device state) |
+| Control socket (`--control-socket`) | yes | reject | `bin/rshyve/src/control.rs`; `bin/firehyve/src/main.rs:46` |
+| Dirty page tracking | on by default | never | `bin/rshyve/src/main.rs:175`; `bin/firehyve/src/main.rs:116` |
+| **Platform** | | | |
+| vTPM 2.0 (`--vtpm`) | caveat | reject | `crates/vmm-tpm/src/crb.rs`; `bin/firehyve/src/main.rs:53` |
+| Hyper-V enlightenments (`--hyperv`) | exp | reject | `crates/vmm-hyperv/src/lib.rs`; `main.rs:57` |
+| `--cpu-baseline` CPUID masking | yes | yes | `crates/vmm-core/src/cpuid.rs:32` |
+| PCI passthrough (`passthru,/dev/pptN`) | caveat | reject | `crates/vmm-passthru/`; `bin/rshyve/src/main.rs:1212` |
+| `virtio-rnd` | yes | yes | `crates/vmm-virtio/src/attach.rs:341` |
+| SmartOS metadata agent on COM2 | yes | no (rejects only `--mdata-*`) | `bin/rshyve/src/mdata.rs` |
+| `--json-config`, `-k`, `-o` | accepted, no reader | reject (`--json-config`) | `crates/vmm-config/src/lib.rs:65,78,99` |
+
+### What firehyve rejects at startup
+
+`validate_cli` (`bin/firehyve/src/main.rs:40-89`) errors on: a missing `--kernel`, `--migrate-listen`, `--control-socket`, `--json-config`, every `--mdata-*` flag, `--vtpm`, `--vtpm-state-dir`, `--hyperv`, `--tsc-freq-hz`, any `-l` argument beginning with the literal lowercase `bootrom,`, any `-l com1`/`com2` backend other than `stdio`, and any `-s` spec containing a `bootindex=` token. `bin/firehyve/src/devices.rs:54` then rejects any PCI driver outside its eight-name `SUPPORTED` list.
+
+Because both binaries share one clap derive (`crates/vmm-config/src/lib.rs`), `firehyve --help` still lists the rshyve-only flags. The refusal happens at runtime, not in the parser.
+
+## Device specs
+
+Both binaries parse `-s <addr>,<driver>[,<config>]` with the same helper (`crates/vmm-machine/src/parse.rs:10` `parse_bdf`, `splitn(3, ',')` in each binary). Address forms: `dev`, `dev:func`, or `bus:dev:func`. Decimal only, no `0x`. `dev` is 0..=31 and `func` is 0..=7 (`crates/vmm-devices/src/pci/mod.rs:45`).
+
+Slots 0 and 1 are already taken by the chipset (host bridge at 0.0.0, LPC bridge at 0.1.0, `crates/vmm-devices/src/chipset/i440fx.rs:87,96`). `-s 0,hostbridge` and `-s 31,lpc` are accepted and attach nothing, but `-s 0,<real driver>` or `-s 1,<real driver>` panics on the duplicate-BDF assert at `crates/vmm-devices/src/pci/bus.rs:67`. The LPC bridge is at slot **1**, not slot 31, whatever the spec text says.
+
+Option strictness is not uniform, and this matters:
+
+| Driver | Unknown option |
+|---|---|
+| `virtio-blk`, `virtio-blk-pci`, `nvme` | silently ignored (`attach.rs:78`) |
+| `virtio-net-viona` | silently ignored (`attach.rs:157`) |
+| `fbuf`, `passthru`, `xhci`, `virtio-rnd`, `hostbridge`, `lpc` | silently ignored or never read |
+| `virtio-console` | hard error (`console.rs:346`) |
+| `virtio-fs` | hard error (`fs/mod.rs:117`) |
+| `ahci-cd` | hard error (`bin/rshyve/src/main.rs:966`) |
+
+An unknown **driver name** is a hard error in firehyve and a `warn`-level log line in rshyve, which then boots the VM without that device (`bin/rshyve/src/main.rs:1263`). Only `ahci-hd` has a dedicated error arm ahead of that catch-all.
+
+Attach order is argv order. The first device-creation failure aborts the whole pass, so no later spec is built (`crates/vmm-machine/src/pci.rs:103-132`).
+
+## Boot
+
+There is no `--boot` or `--protocol` flag. `crates/vmm-boot/src/image.rs:42` classifies the file: `\x7fELF` means PVH, otherwise `HdrS` at offset 0x202 means bzImage, otherwise startup fails with "unrecognized kernel image". ELF magic wins first, so an ELF without a Xen `PHYS32_ENTRY` note is not retried as a bzImage.
+
+**bzImage requirements**: file longer than 0x290 bytes, protocol version at 0x206 >= 0x020C, `XLF_KERNEL_64` set at 0x236, `setup_sects` consistent with the file length. The image is written verbatim at its own `pref_address` with entry `pref_address + 0x200`; there is no relocation and `relocatable_kernel` / `kernel_alignment` are never read.
+
+**PVH requirements**: ELF64, little endian, `EM_X86_64`, at least one `PT_LOAD` with a non-zero `p_filesz`, and a `PT_NOTE` carrying `XEN_ELFNOTE_PHYS32_ENTRY` (`CONFIG_PVH=y`). Only `p_filesz` bytes are copied; BSS relies on guest RAM being zero.
+
+`--cmdline` defaults to `console=ttyS0 earlyprintk=serial` in both binaries and is written to GPA 0x20000. `--initrd` is placed at the highest page-aligned address below `min(mem_size, 0xC000_0000)`.
+
+In rshyve, `--kernel` suppresses all UEFI setup and any co-supplied `-l bootrom,...` is ignored with no warning (`bin/rshyve/src/main.rs:132,152`). `--initrd` is opened and validated even with no `--kernel`, then never used.
+
+### UEFI (rshyve only)
+
+```
+-l bootrom,<rom>[,<varfile>]
+-l bootrom,uefi        # alias for /usr/share/bhyve/uefi-rom.bin
+-l bootrom,bios        # alias for /usr/share/bhyve/uefi-csm-rom.bin
+```
+
+With no `--kernel` and no bootrom argument at all, `/usr/share/bhyve/uefi-rom.bin` is used (`bootrom.rs:309,330`). The device token match is case insensitive. A third field containing `=` is treated as a legacy option, debug-logged, and dropped; the symbolic names are not expanded in the varfile position. If several bootrom arguments are given, the first wins and the rest are warned about.
+
+The variable store is emulated CFI flash (commands 0x10, 0x50/0x70, 0xFF) mapped immediately below the ROM. The file is `MAP_SHARED`, holds an `fcntl` write lock so two VMMs cannot share it, and is validated for the `EFI_SYSTEM_NV_DATA_FV` GUID and `_FVH` signature unless it is all 0xFF (blank). Persistence is `msync` on teardown and on the control socket's durable flush.
+
+### Worked command lines
+
+rshyve, UEFI guest with a VNC console:
+
+```
+rshyve -c 4 -m 8G \
+  -l bootrom,/usr/share/bhyve/uefi-rom.bin,/zones/vm0/vars.fd \
+  -l com1,socket,/var/run/rshyve/vm0/console.sock \
+  -s 4,virtio-blk,/dev/zvol/rdsk/zones/vm0/disk0,num-queues=4 \
+  -s 5,ahci-cd,/zones/vm0/install.iso,bootindex=1 \
+  -s 6,virtio-net-viona,vm0_net0 \
+  -s 30:0,fbuf,unix=/var/run/rshyve/vm0/vnc.sock,w=1280,h=1024 \
+  -s 30:1,xhci \
+  --control-socket /var/run/rshyve/vm0/control.sock \
+  vm0
+```
+
+firehyve, direct-boot microVM:
+
+```
+firehyve -c 2 -m 512M \
+  --kernel /var/lib/firehyve/vmlinux \
+  --initrd /var/lib/firehyve/initramfs.cpio \
+  --cmdline "console=ttyS0 root=/dev/ram0 panic=-1" \
+  -l com1,stdio \
+  -s 4,virtio-blk,/var/lib/firehyve/rootfs.img,ro \
+  -s 7,virtio-net-viona,fh0 \
+  -s 12,virtio-fs,/export/share,tag=share,ro \
+  -s 15,virtio-console,/var/run/fh/console0.sock \
+  fh0
+```
+
+## Storage
+
+### virtio-blk (both binaries)
+
+```
+-s <slot>,virtio-blk,<path>[,ro][,nodelete][,sectorsize=N][,num-queues=N]
+```
+
+`parse_blk_config` (`crates/vmm-virtio/src/attach.rs:55`) parses exactly those four keys. Defaults: writable, `sectorsize` 512, `num-queues` = `min(num_vcpus, 4)` floored at 1. `sectorsize=N` is applied only if N is a power of two in 512..=65536; `num-queues=N` only if N is in 1..=8. Out-of-range values are discarded with no diagnostic and the default stands.
+
+The backing store is opened as a plain file: a raw image, a zvol device node, or an ISO all work. Capacity comes from `fstat` alone; there is no `DKIOCGMEDIAINFO` fallback anywhere in the tree, so a backing store whose stat size is 0 presents as a zero-capacity disk. Transport is transitional PCI (device id 0x1001 with modern capability structures), ring size 128, MSI-X vectors `num_queues + 1`.
+
+`ro` is enforced three times: the file is opened without write, `VIRTIO_BLK_F_RO` is set, and `T_OUT` returns `VIRTIO_BLK_S_IOERR` (`block.rs:315,272,646`). It also suppresses DISCARD advertisement and skips the zvol write-cache ioctl.
+
+Two traps in this parser:
+
+- `nodelete` is parsed, stored, and never read. The field carries `#[allow(dead_code)]` at `block.rs:113`.
+- `sectorsize=4096` reports a disk one eighth of its true size. `block.rs:147` divides the file length by the configured sector size, but the virtio config `capacity` field is defined in 512-byte units. The range check uses the same shrunken value, so the guest is confined to part of the device rather than corrupting anything, but the geometry is wrong.
+
+The guest-visible serial from `VIRTIO_BLK_T_GET_ID` is the constant string `vmm-virtio-blk` for every disk in the VM (`block.rs:206`), so a guest cannot tell two virtio-blk disks apart by serial.
+
+### NVMe (rshyve only)
+
+```
+-s <slot>,nvme,<path>[,ro]
+```
+
+The arm calls the shared `parse_blk_config`, so `nodelete`, `sectorsize=` and `num-queues=` all **parse and are then discarded**. Only `read_only` reaches `NvmeController::new` (`bin/rshyve/src/main.rs:1077`). Logical block size is hardcoded to 512 at `crates/vmm-storage/src/nvme/mod.rs:205`, so `sectorsize=4096` silently yields a 512-byte-LBA namespace.
+
+One namespace, NSID must be 1. Zero-copy `preadv`/`pwritev` straight into guest pages, 8 worker threads, MDTS 9 (2 MiB), up to 15 I/O queues of up to 4096 entries. Admin commands implemented: Identify (CNS 0 and 1 only), Create/Delete IO SQ and CQ, Get/Set Features, Abort (always reports not found), Get Log Page (a stub that writes zeros). I/O opcodes: READ, WRITE, FLUSH. Dataset Management, Write Zeroes and Compare are absent and `ONCS` is correctly left at zero.
+
+`-s N,nvme,<iso>,ro` is the tested path for presenting installation media to a UEFI guest (`FEATURES_TODO.md:44`). A write to a read-only namespace returns `SC_DATA_XFER_ERROR`, not the spec-correct 0x82 "Attempted Write to Read Only Range", so guest logs show a transfer error rather than a permission error.
+
+Serial is `TRITON-NVME-{:04}` derived from the PCI **device number only** (`main.rs:1080`), so two NVMe controllers at different functions of one slot get identical serials.
+
+### AHCI CD-ROM (rshyve only)
+
+```
+-s <slot>,ahci-cd,<iso-path>
+```
+
+No options. Any non-empty field after the path is a hard error. `bootindex=N` is the one token that coexists, because it is stripped before this parse.
+
+Real ATAPI over an Intel ICH8 AHCI controller (vendor 0x8086, device 0x2821, BAR5 ABAR). Read-only by construction: `IsoMedia` opens with `read(true)` and refuses a file under 2048 bytes. One port, one fixed ISO, no media change or tray simulation beyond an eject `CHECK CONDITION`. INTx only, no MSI-X. Reads are synchronous `preadv` on the vCPU thread with no worker pool, so a slow ISO read stalls a vCPU. Max transfer 1 MiB, PRDTL 512 entries.
+
+SCSI/MMC commands implemented: TEST UNIT READY, REQUEST SENSE, INQUIRY, START/STOP UNIT, PREVENT/ALLOW MEDIUM REMOVAL, READ CAPACITY, READ(10), READ TOC (formats 0 and 1; formats 2 and 3 return ILLEGAL REQUEST), GET EVENT STATUS NOTIFICATION, MODE SENSE(10) pages 0x01 and 0x2A, REPORT LUNS, READ(12). Everything else is an ILLEGAL REQUEST.
+
+### zvol write cache
+
+Any writable virtio-blk or NVMe backing fd gets a best-effort `DKIOCGETWCE`/`DKIOCSETWCE` pass (`crates/vmm-devices/src/blkdev.rs:47`). Regular files and non-disk backing stores are skipped silently. The original value is restored on drop. Skipped entirely under `ro`. `ahci-cd` does not use it.
+
+## Network
+
+```
+-s <slot>,virtio-net-viona,<vnic>[,promiscphys]
+```
+
+The only network driver either binary matches. `parse_viona_config` (`attach.rs:154`) recognizes the VNIC name and the literal `promiscphys` or `promiscphys=true`. `promiscphys=false` does not match and therefore leaves promiscuous mode off. Anything else, including `mtu=9000`, is ignored.
+
+Host requirements, all hard: illumos, an openable `/dev/viona`, `libdladm` linked in, and a VNIC that already exists. Neither binary creates or configures a VNIC.
+
+Two rx/tx queues of 256 entries, 3 MSI-X vectors (rx, tx, config change), one `viona-intr-poll` thread per device. `EVENT_IDX` is deliberately stripped because viona manages notification suppression in the kernel. Only the low 32 bits of the kernel feature word are used, so any kernel-offered bit at 32 or above is dropped; `VERSION_1` is re-added by the PCI transport.
+
+Two facts an operator should know. Link status is hardcoded `VIRTIO_NET_S_LINK_UP` (`viona.rs:50`); there is no link-down reporting. And if `dladm_vnic_info` fails while `dladm_name2info` succeeded, the MAC is left as all zeros with no error and no log line (`viona.rs:710`), so the guest reads `00:00:00:00:00:00` out of device config.
+
+There is no multiqueue, no MTU setting, and no `VIRTIO_NET_F_CTRL_VQ`. The `VNA_IOC_GET_PAIRS`/`SET_MTU` ioctls exist in `crates/viona-api` and nothing outside that crate calls them. The viona interface version is likewise never checked at startup, so a mismatched kernel module surfaces as a raw ioctl errno.
+
+Per-binary difference in behavior, not acceptance: rshyve passes `defer_poll = cli.migrate_listen.is_some()` so the kernel poll thread waits for ring restore on a migration destination; firehyve hardcodes `defer_poll = false` because it is never a destination.
+
+## Serial and console
+
+### LPC UARTs
+
+COM1 is 16550 at 0x3F8 IRQ 4; COM2 at 0x2F8 IRQ 3 (`crates/vmm-devices/src/uart/lpc.rs`).
+
+rshyve backends (`bin/rshyve/src/main.rs:1279` `setup_serial_io`):
+
+| Form | Behavior |
+|---|---|
+| absent or `-l com1,stdio` | stdout for TX, a thread reading stdin |
+| `-l com1,socket,<path>` | Unix listener, socket 0600 in a 0700 directory |
+| `-l com1,<anything else>` | treated as a device path, opened `O_RDWR|O_NONBLOCK|O_CLOEXEC`, `cfmakeraw` plus `CLOCAL` on illumos (this is the `/dev/zconsole` path) |
+
+The `-l` grammar as a whole is not validated. Only the `bootrom`, `com1` and `com2` prefixes are ever looked up (`crates/vmm-machine/src/parse.rs:33`), so `-l com3,stdio` or a misspelling is silently ignored.
+
+The socket backend serializes clients: the accept loop bridges one connection fully and a second connect waits in the backlog. TX is a blocking `write_all` on the vCPU thread with no write timeout, so a connected peer that stops reading can stall a guest vCPU. Guest output with no client attached is dropped.
+
+If no `-l com2,<backend>` is given, rshyve starts the built-in metadata agent on COM2 instead. Any `-l com2` value routes COM2 to that backend and the agent never runs.
+
+firehyve accepts only an absent backend or `stdio` on either port (`bin/firehyve/src/console.rs:46` `require_stdio_backend`). COM2 is **always attached**, transmit only, mirrored to the process stdout, with no stdin reader; it exists so `fhrun-init` can write boot markers to `/dev/ttyS1` that never pass through the kernel console.
+
+### virtio-console
+
+```
+-s <slot>,virtio-console,<unix-socket-path>
+```
+
+No options, and this is enforced: any comma-separated field after the path is a hard error, as is an empty config. A socket path containing a comma cannot be expressed.
+
+Single port. No `VIRTIO_CONSOLE_F_MULTIPORT`, no `F_SIZE`, no control queues, so there is no terminal-size reporting and no way to ask for a second port. Two queues of 128, 3 MSI-X vectors. The 12-byte config region reads all zeros. Guest device is `/dev/hvc0`.
+
+One client at a time, and a new connection **evicts** the incumbent rather than queueing (`console.rs` `replace_client`). Guest output with no client attached is discarded. Host input with no posted guest RX chain is buffered up to 64 KiB then dropped with one warning per burst. Writes to the client have a 250 ms timeout; a stalled client loses its console.
+
+## Shared filesystem
+
+```
+-s <slot>,virtio-fs,<host-dir>[,tag=NAME][,ro][,queue-size=N]
+```
+
+Exactly three options (`crates/vmm-virtio/src/fs/mod.rs:85`). `tag` defaults to the last path component of the host directory, is capped at 36 bytes, and must contain no NUL. `queue-size` defaults to 128, must be in 8..=1024 or startup fails, and is then rounded **up** to a power of two, so `queue-size=100` yields 128. An unknown option is a hard error.
+
+Mount in Linux with `mount -t virtiofs <tag> /mnt`.
+
+Two queues (hiprio and one request queue) served by a single worker thread, so the hiprio queue confers no real priority: a `FUSE_INTERRUPT` waits behind whatever is in flight. No DAX and no shared-memory window; every reply travels through the request queue.
+
+Opcodes implemented: INIT, DESTROY, LOOKUP, FORGET, BATCH_FORGET, GETATTR, STATFS, ACCESS, READLINK, OPEN, RELEASE, READ, OPENDIR, RELEASEDIR, READDIR, READDIRPLUS, FLUSH, FSYNC, FSYNCDIR, WRITE, CREATE, MKDIR, MKNOD, UNLINK, RMDIR, RENAME, RENAME2, SETATTR, SYMLINK, LINK. GETXATTR and LISTXATTR return ENOTSUP; everything else returns ENOSYS. FLUSH and DESTROY are accepted and do nothing (`fs/server.rs:114,138`), which is normal for a passthrough but means neither flushes host state. Negotiated limits: max_write 512 KiB, max_background 64, and a hard 1 MiB cap on any single request body.
+
+Path-escape defense is real and tested. `validate_name` (`fs/passthrough.rs:1318`) rejects empty, `.`, `..`, any embedded `/`, and any NUL as EINVAL, and is called from every op that takes a name. The share root is pinned by an fd opened `O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` and every access is an `*at()` syscall with `O_NOFOLLOW`, so host symlinks are never traversed. LOOKUP admits only regular files, directories and symlinks; device nodes, FIFOs and sockets are refused with ENOTSUP.
+
+`ro` returns EROFS from CREATE, MKNOD, MKDIR, UNLINK, RMDIR, RENAME, RENAME2, SYMLINK, LINK, SETATTR, WRITE, and any OPEN whose access mode is not `O_RDONLY`. OPEN also refuses `O_TRUNC` even alongside `O_RDONLY`, because POSIX leaves that combination undefined and illumos truncates. That is checked twice and pinned by a test that asserts the host file is unchanged.
+
+**A writable share grants the guest the VMM's own credentials.** Every file operation runs as the VMM's euid, which is root in a bhyve zone, and there is no uid/gid squashing or idmapping anywhere in the module. `FUSE_SETATTR` passes guest-supplied values straight through: `fchown(fd, uid, gid)` with any uid and gid, and `fchmod(fd, mode & 0o7777)`, where the mask keeps the setuid, setgid and sticky bits (`fs/passthrough.rs:853,871`). A guest can therefore create a setuid-root file inside the shared directory, and any host user who can reach that directory can run it. Export read-write only to a guest you would trust with root on that subtree, and prefer `ro` otherwise.
+
+`FUSE_ACCESS` ignores its `mask` argument and grants access whenever the node can be stat'd (`passthrough.rs:421`), so on a read-write export the guest's `access()` answers are not authoritative.
+
+## Display and input (rshyve only)
+
+### fbuf and VNC
+
+```
+-s <slot>[:<func>],fbuf[,unix=<path>][,password=<pw>][,w=<n>][,h=<n>]
+```
+
+Those four keys are the whole parser (`bin/rshyve/src/main.rs:1163`). Defaults: socket `/var/run/rshyve/<vm_name>/vnc.sock`, no password, 1024x768. `w=abc` silently gives 1024. Every other key is ignored, **including `vga=`**: there is no VGA emulation to turn on, and `vga=on` does nothing. bhyve's `tcp=`, `rfb=` and `wait` are also ignored rather than rejected, so `-s 30:0,fbuf,tcp=0.0.0.0:5900` starts a VNC server on the default Unix socket with no diagnostic.
+
+PCI identity 0xFB5D:0x40FB matches C bhyve's `pci_fbuf`, so the OVMF bhyve GOP driver binds. BAR1 is a fixed 16 MiB XRGB8888 framebuffer backed by a devmem segment mapped into the guest, not a trapping MMIO region. Each fbuf consumes one VM memory segment; exhausting them fails attach.
+
+The RFB server always speaks 3.8 framing, always sends XRGB8888, and always sends a single full-screen Raw rectangle. `SetPixelFormat` and `SetEncodings` are parsed, warned about, and ignored; the `incremental` flag is discarded. The frame loop sleeps 33 ms and parses at most one client message per pass, so input is capped near 30 events per second. One client at a time, strictly sequential.
+
+Guest writes to BAR0 can change resolution (2-byte writes at 0x04 and 0x06, or one 4-byte write at 0x04) and are validated against the 16 MiB BAR, giving a 2048x2048 ceiling. The CLI `w=`/`h=` path skips that check; an oversized CLI resolution produces a vertically truncated picture rather than an error. A resolution change is never pushed to a connected client; there is no DesktopSize pseudo-encoding.
+
+Authentication exists but is legacy RFB VncAuth. With no password the server offers only security type None and refuses a client that selects VncAuth; with a password it offers only VncAuth and refuses None, so there is no downgrade path. The password value is used verbatim (no base64) and the RFB DES scheme truncates it to 8 bytes. There is no transport encryption and no attempt rate limiting. The socket is 0600 in a 0700 directory with no peer-credential check, unlike the control socket.
+
+Clipboard text is read off the wire and thrown away. `Framebuffer::shutdown()` exists and nothing calls it, so the VNC thread lives until process exit and the socket file is left on disk until the next bind unlinks it.
+
+### xHCI tablet
+
+```
+-s <slot>[:<func>],xhci
+```
+
+**No options are parsed.** The config field is never read, so `,tablet`, `,keyboard` and nothing at all all produce the same single absolute-pointer tablet. The `,tablet` in the docs and in bhyve-shaped command lines is decorative.
+
+Intel 0x8086:0x1E31, BAR0 8 KiB MMIO, INTx only (no MSI or MSI-X). `HCSPARAMS1` advertises MaxSlots 64, but only one device slot is implemented: a second Enable Slot returns `TRB_CC_NO_SLOTS_AVAILABLE`. Two ports (USB2 disconnected, USB3 with the tablet), one interrupter, EP0 control and EP1 IN only.
+
+The tablet reports 3 buttons and 16-bit absolute X/Y. `bInterfaceSubClass` is 0, so there is no boot-protocol fallback for firmware that speaks only boot mouse. The HID descriptor declares a wheel field but `get_report` always emits 0, so VNC scroll does nothing.
+
+### PS/2
+
+A PS/2 controller with keyboard is created for **every** rshyve VM. There is no `-s` spec and no way to disable it (`bin/rshyve/src/input.rs` `setup_ps2`). Ports 0x60/0x64, IRQ 1 and 12. VNC key events reach the guest only through this path; there is no USB keyboard anywhere in the tree. Keysyms with no scan-code mapping are dropped with a USDT probe and no log line. Scan code set 3 is not implemented.
+
+The PS/2 aux device parses and ACKs the standard mouse command set, so a guest driver binds successfully, but `PS2Mouse::movement()` is hardcoded to report zero motion and nothing ever injects host movement. A guest with PS/2 and no xhci has a mouse that never moves.
+
+## vTPM, CPUID, Hyper-V
+
+### vTPM (rshyve only)
+
+```
+rshyve --vtpm [--vtpm-state-dir <PATH>] <vm_name>
+```
+
+TPM 2.0 only, backed by vendored libtpms compiled into the process. Guest interface is a TCG PTP 2.0 CRB at 0xFED40000, **locality 0 only**, with a 3968-byte command buffer; a longer command is truncated. No interrupts (INT_ENABLED and INT_STS read 0), so the guest polls CTRL_START. `TPM2_Cancel` is recorded and ignored. `TPMLIB_Process` runs synchronously inside the vCPU's MMIO write handler, so an RSA keygen blocks that vCPU.
+
+Discovery is complete: a TPM2 ACPI table (Start Method 7, CRB) plus a DSDT `Device(TPM)` with `_HID "MSFT0101"`, `_STA 0x0F` and a `_CRS` covering the control area (`crates/vmm-devices/src/acpi.rs:366`). The TPM2 table declares no event log.
+
+NV state defaults to `/var/db/rshyve/<vm_name>/tpm` and survives a VMM restart. Writes are temp-file plus fsync plus rename. Two things to know: the state directory is created under the process umask with no explicit mode, unlike the control socket; and pointing `--vtpm-state-dir` at a wrong or empty directory is **not an error**, because a missing NV file makes libtpms manufacture a fresh TPM. A guest that used BitLocker will not find its keys and will not be told why.
+
+One VM per process: libtpms is single-instance and a second `Tpm::new` fails.
+
+### `--cpu-baseline` (both binaries)
+
+Accepted values, case insensitive (`crates/vmm-core/src/cpuid.rs:33`): `host`/`native`, `avx2`/`no-avx512`, `sse42`/`sse4.2`/`westmere`. Default `host`, which is a true no-op that leaves native CPUID in place. An unknown value is a startup error in both binaries. There is no per-leaf or per-bit override and no CPU-model impersonation.
+
+`avx2` clears the AVX-512 and AMX sets in leaf 7 and the matching leaf 0xD components. `sse42` additionally clears AVX, FMA, F16C, RDRAND, BMI1, AVX2 and BMI2. Both profiles clear AVX-VNNI, AVX-512_BF16 and AVX-IFMA in leaf 7 subleaf 1, so AVX-VNNI disappears even at the `avx2` baseline. `sse42` does **not** clear the leaf 1 SSE4.2 or POPCNT bits and does not touch leaf 0x80000001.
+
+### Hyper-V enlightenments (rshyve only)
+
+`--hyperv [--tsc-freq-hz <HZ>]`. Tier 1 only and all-or-nothing: `reset` and `frequencies` are hardcoded on and `reference_tsc` follows from a non-zero TSC frequency. There is no per-feature flag.
+
+CPUID leaves 0x40000000-0x40000006 are published with vendor `Microsoft Hv`. Leaf 0x40000006 is advertised and returns all zeros. MSRs handled: GUEST_OS_ID, HYPERCALL, VP_INDEX, RESET, TIME_REF_COUNT, REFERENCE_TSC, CRASH_P0-P4 and CRASH_CTL (writing NOTIFY logs the bugcheck parameters through slog).
+
+The hypercall page is a deliberate stub: `mov rax, 2; ret`, which is `HV_STATUS_INVALID_HYPERCALL_CODE`. It satisfies the Windows boot probe and performs no hypercall. SynIC, synthetic timers, virtual APIC, TLB-flush hypercalls and IPI hypercalls are absent.
+
+If the host TSC frequency probe fails and `--tsc-freq-hz` is not given, rshyve warns and disables reference-TSC entirely, at which point both timing MSRs inject #GP.
+
+## Migration and the control socket (rshyve only)
+
+### Control socket
+
+`--control-socket <PATH>`, newline-delimited JSON, one response line per request. Twelve commands (`bin/rshyve/src/control.rs:328`): `status`, `pause`, `resume`, `shutdown`, `reset`, `stop`, `migrate-source`, `migrate-dest`, `migrate-status`, `migrate-config`, `metrics`, `metrics-prometheus`. Anything else returns `{"success":false,"error":"invalid command"}`.
+
+Authorization is uid plus zone, not a capability: the peer's uid must equal the VMM's euid, and on illumos its zone must match ours or be the global zone (zone 0 is allowed deliberately so a global-zone migration agent can drive an in-zone VMM). There is no token and no per-command authorization, so any peer that passes that check can issue `migrate-source`, `stop` or `reset`. The socket itself is 0600 in a 0700 directory, re-stat'd after bind and unlinked if the mode or owner is wrong.
+
+`pause` and `resume` are state CAS operations with a 5 second device quiesce budget; on timeout the devices are resumed, state rolls back to Running, and the error names the stuck device types. `shutdown`, `reset` and `stop` map to `VM_SUSPEND_POWEROFF`, `VM_SUSPEND_RESET` and `VM_SUSPEND_HALT` and do **not** halt devices first.
+
+`metrics-prometheus` emits a multi-line body on a protocol otherwise defined as one line per request, so a strict line-oriented client will mis-frame it.
+
+### Live migration
+
+Two implementations. The production path is the synchronous Unix-socket source and destination (`crates/vmm-migrate/src/sync_source.rs`), which uses `tungstenite` with no tokio because a bhyve-brand zone has no `/dev/poll`. The TCP path (`source.rs`, `destination.rs`) is tokio-based and described in its own comment as "for GZ or manual testing".
+
+**Only the Unix path carries emulated-device state.** `state::export_device_state` on the TCP path hardcodes `virtio_queues: Vec::new(), nvme_controllers: Vec::new()`, and the matching destination has no restore callback, so a TCP migration ships zero virtio ring state and zero NVMe state and the guest arrives with unprogrammed rings.
+
+The Unix sequence is: full RAM pass, up to 5 dirty convergence iterations (500 ms apart, 1024-page threshold), pause devices, pause vCPUs, durable flush of every device, an optional ZFS barrier, a final dirty pass, then time data, device state and the exported queue state. If anything after pause fails, devices and vCPUs are resumed so the guest survives.
+
+Kernel state transferred: the ioapic, atpit, atpic, hpet, pm_timer and rtc system devices; per vCPU the 33 registers, 10 segment descriptors, MSRs, LAPIC, VMM_ARCH, run state and SIPI vector; and VMM time with boot_hrtime re-basing and TSC rescaling.
+
+Guarded refusals that work correctly: a vTPM, a bootrom variable store, or an `ahci-cd` device each block `migrate-source`; `--migrate-listen` combined with `--vtpm`, a varstore, or an `fbuf`/`ahci-cd` spec is a startup error. Note the asymmetry: `fbuf` blocks a destination but not a source, and `xhci` is on neither list, so a destination will accept an `xhci` spec and start with a fresh unrestored controller.
+
+`vmm-migrate-agent` is a separate binary that runs in the global zone and orchestrates the ZFS send/recv plus a Unix-to-TCP bridge. Its flags: `source --uuid --dest-host [--dest-port 4567] [--disk-dataset] [--dest-dataset] [--max-syncs 3] --ssh-key [--control-socket] [--skip-zfs]`, and `dest --uuid [--port 4567]`.
+
+## Metadata agent (rshyve only)
+
+Not a network service. A host thread drives the COM2 UART; the guest talks to it over `/dev/ttyS1` on Linux or `/dev/term/b` on SmartOS. It starts only when no `-l com2,<backend>` is present.
+
+Store contents (`bin/rshyve/src/mdata.rs` `build_store_from_zone_config`): `sdc:hostname` from the positional VM name, `sdc:uuid` from `-U` falling back to the hostname, `sdc:nics` from `--mdata-nics`, `sdc:resolvers` from `--mdata-resolvers` (default `8.8.8.8`, `1.1.1.1`), `root_authorized_keys` from `--mdata-ssh-keys`, `root_pw` from `--mdata-root-pw`, plus fixed empty entries for `user-script`, `user-data`, `sdc:vendor-data`, `sdc:operator-script`, `sdc:routes` and `sdc:dns_domain`.
+
+Protocol: V2 NEGOTIATE, GET and KEYS work; PUT and DELETE return FAILURE because the store is read-only. V1 GET and KEYS work as a fallback. The V2 frame parser **ignores the declared body length and the request CRC32**; it computes a CRC only for responses.
+
+In production the agent is expected to be unused, because `-l com2,/.zonecontrol/metadata.sock` routes COM2 to the external global-zone agent instead.
+
+## fhrun
+
+`fhrun <manifest.json>` boots a microVM around a Linux binary and waits for it. Flags: `--check`, `--print-argv`, `--emit-initramfs <out.cpio>`.
+
+Manifest keys as parsed (`tools/fhrun/src/manifest.rs`). Required: `name` (1..=127 chars, no NUL), `bin`, `kernel`, `init` (all three must be existing files). Optional: `args` (default `[]`), `env` (default `{}`), `workdir` (default `/`), `vcpus` (default 1), `memory` (default `128M`, never parsed by fhrun), `extra_files`, `net`, `nics`, `consoles`, `guest_metadata`, `vmm` (default the bare name `firehyve`, resolved through PATH; accepts the legacy key `firehyve`), `kernel_extra_cmdline` (append only).
+
+NIC keys: `vnic` (required), `mac` (required), `ip` (CIDR, required), `gateway`, `role`. Validation is shape only. `mac` is checked for six colon-separated fields and is then **never used**: it is not in the VMM argv and the guest discards it, because viona programs the address on the host. `ip` is checked only for containing `/`.
+
+Console keys: `socket_path` (default `<runtime-dir>/console<N>.sock`), `guest_device` (default `/dev/hvc<N>`, a declaration only), `role`.
+
+Emitted argv is fixed: `-c -m --kernel --initrd --cmdline --no-track-dirty -l com1,stdio`, then one `-s <7+i>,virtio-net-viona,<vnic>` per NIC and one `-s <15+i>,virtio-console,<socket>` per console, then the VM name. There is no manifest field that requests a disk, a virtio-fs share, or an RNG, even though firehyve implements all three.
+
+The kernel command line is fhrun-owned and cannot be edited, only appended to: `console=ttyS0 earlyprintk=ttyS0 root=/dev/ram0 init=/init rdinit=/init panic=-1 fhrun=1 tsc=reliable`.
+
+`fhrun-init` is a separate Cargo workspace excluded from the root, so `cargo build --workspace` never builds it. It must be cross-compiled to `x86_64-unknown-linux-musl` and named in the manifest's `init` field. It mounts devtmpfs, `/proc` and `/sys`, configures IPv4 statically by ioctl, redirects stdio to `/dev/console`, and `execve`s the payload. It does not fork, so the payload's exit status can never be observed or propagated.
+
+## Limits
+
+| Area | Number |
+|---|---|
+| PCI address range | dev 0..=31, func 0..=7; bus parsed 0..=255 but **not honored** (flat 32x8 array in `pci/bus.rs`) |
+| Reserved slots | 0 (host bridge) and 1 (LPC bridge); a real driver there panics on the duplicate-BDF assert |
+| Kernel command line | strictly under 4096 bytes, at GPA 0x20000; the kernel's own `cmdline_size` is never consulted |
+| initrd placement | below `min(mem_size, 0xC000_0000)`, so a 3 GiB ceiling regardless of VM RAM |
+| E820 handoff | PVH hard-errors above 64 entries; bzImage silently truncates at 128 |
+| Direct-boot page tables | identity map the first 4 GiB with 2 MiB pages |
+| Bootrom file | 4 KiB to 16 MiB, multiple of 4096; ROM plus varstore must also fit 16 MiB; 4 MiB of SEC RAM is consumed at 0xFCC00000 |
+| Variable store file | 4 KiB to 16 MiB, page aligned, regular file, exclusively `fcntl`-locked |
+| virtio-blk | ring 128; `sectorsize` power of two 512..=65536; `num-queues` 1..=8; 8 workers for one queue, 2 per queue for MQ |
+| NVMe | 1 namespace, 512-byte LBA, 15 I/O queues of up to 4096, MDTS 9 (2 MiB), 8 workers |
+| ahci-cd | 1 port, 1 ISO, PRDTL 512, 1 MiB max transfer, 2048-byte blocks |
+| viona | 2 queues of 256, 3 MSI-X vectors |
+| virtio-console | 2 queues of 128, 64 KiB host-input backlog, 250 ms client write timeout, 1 client |
+| virtio-fs | `queue-size` 8..=1024 rounded up to a power of two (default 128), tag 36 bytes, max_write 512 KiB, max_background 64, 1 MiB per request body |
+| fbuf | BAR1 fixed at 16 MiB, so 2048x2048 max; 33 ms frame tick capping input near 30 events/s; VNC password truncated to 8 bytes; 1 client |
+| xHCI | MaxSlots 64 advertised, 1 implemented; BAR0 8 KiB; INTx only |
+| vTPM | locality 0 only, 3968-byte command buffer, one VM per process |
+| Control socket | 8 concurrent connections, 64 KiB per request line, 30 s read, 10 s write |
+| Migration | 64 pages per batch (cap 256), 8 MiB max serialized payload, 5 convergence iterations at 500 ms with a 1024-page threshold, 5 s pause quiesce, 30 s queue-export budget, 120 s ZFS barrier |
+| mdata | 4096-byte input lines, printable ASCII only, 256-byte UART FIFOs |
+| fhrun | 4 NICs (PCI slots 7..=10), 2 consoles (slots 15..=16) |
+| Host | one bhyve VM instance per non-global zone; a second `VM_CREATE` returns EINVAL |
+
+## Not supported
+
+Absent, with no partial path:
+
+- **`ahci-hd`.** rshyve fails at startup with "AHCI device type 'ahci-hd' is not implemented; use virtio-blk or nvme" (`bin/rshyve/src/main.rs:974`). There is no AHCI hard-disk code in `crates/vmm-storage`; the module is ATAPI only.
+- **Any emulated NIC other than viona-backed virtio-net.** No e1000, rtl8139, vmxnet, tap, netgraph or slirp.
+- **virtio-scsi, virtio-9p, virtio-balloon, virtio-vsock, virtio-input, virtio-gpu.**
+- **PCI hotplug and disk hotplug.** Devices are attached once over the `-s` list at startup and `PciBus` exposes no detach.
+- **qcow2 or any non-raw image format.** Every backend does raw offset arithmetic on a plain file.
+- **Block I/O throttling.**
+- **VGA emulation, a VGA BIOS, and text mode.** No handlers exist for 0x3C0 or 0x3D4.
+- **VNC over TCP**, and the bhyve `wait` option that holds boot for a client.
+- **A USB keyboard.** VNC key events reach the guest only through PS/2, so a guest or firmware with no PS/2 keyboard driver has no keyboard.
+- **PS/2 mouse motion.** The aux device answers commands and reports zero movement forever.
+- **Clipboard integration** in either direction.
+- **A boot-protocol flag.** The kernel file decides. No multiboot, no raw vmlinux without a PVH note, no real-mode entry, no bzImage protocol older than 2.12, no 32-bit-only bzImage.
+- **Kernel relocation or KASLR placement**, initrd above 4 GiB, and multiple initrd modules.
+- **UEFI in firehyve**, in any form: no bootrom, no variable store, no CSM.
+- **Migration of the UEFI variable store, vTPM NV state, framebuffer state, xHCI state, AHCI state, Hyper-V state, virtio-fs state, virtio-console state, or LPC UART state.** The first three are hard refusals; the rest are simply not in the protocol and not on any reject list.
+- **Migration of disk contents.** The protocol carries no block data. Disks move separately by ZFS send/recv, and only for ZFS zvols.
+- **FPU/XSAVE state transfer.** `state.rs` sets `let fpu = Vec::new();`.
+- **A migration cancel command**, migration IDs, expiry, and replay protection.
+- **vTPM state export, TPM 1.2, localities 1-4, TPM interrupts, `TPM2_Cancel`, and a hypervisor-supplied TCG event log.**
+- **Real Hyper-V hypercalls, SynIC, synthetic timers, and virtual APIC.**
+- **Per-bit or per-leaf CPUID overrides.** Only the three `--cpu-baseline` profiles exist.
+- **Any host OS but illumos, and any architecture but x86_64, at run time.** Both binaries type-check on Linux in CI; only illumos can link and run them.
+- **A prebuilt platform image, a published release, or an installer.** Integration is manual.
+
+### Accepted by the CLI and then ignored
+
+These parse without complaint and do nothing. Each one is a way to believe you configured something you did not.
+
+| Input | Reality |
+|---|---|
+| `--json-config <PATH>` | No reader exists anywhere in the tree (rshyve). firehyve at least rejects it. |
+| `-k` / `--config-file`, `-o` / `--config-option` | Declared in `crates/vmm-config/src/lib.rs:63,75`; no consumer. Only `-s` configures devices. |
+| `-D` / `--destroy-on-poweroff` | Declared at `crates/vmm-config/src/lib.rs:79` and read nowhere. A whole-tree grep finds only that line. vmadm and boot.c pass `-D`, so this is the one an operator is most likely to trust. The instance is in fact reclaimed when the process exits, because the VMM arms the kernel autodestruct flag, but that happens whether or not `-D` was given. |
+| `-A` / `--acpi` | Declared at `crates/vmm-config/src/lib.rs:91` and read nowhere. ACPI tables are built unconditionally, so the flag is redundant rather than harmful. |
+| `nvme,...,sectorsize=N` | Parsed by the shared block parser, then discarded. NVMe LBA is hardcoded 512. |
+| `nvme,...,num-queues=N`, `nvme,...,nodelete` | Parsed and discarded. |
+| `virtio-blk,...,nodelete` | Parsed, stored, never read (`block.rs:113`, `#[allow(dead_code)]`). |
+| virtio-blk DISCARD / WRITE_ZEROES | Feature bits are advertised on every writable disk and the handlers return OK without touching the file. `fstrim` reports success and does nothing. The related config fields at offset 0x24 and beyond read zero. |
+| `fbuf,...,vga=on` / `vga=off` / `vga=io` | Discarded. There is nothing to enable. |
+| `fbuf,...,tcp=...`, `fbuf,...,wait` | Ignored, not rejected. VNC still binds the default Unix socket. |
+| `xhci,tablet` / `xhci,keyboard` / anything | The config field is never read. |
+| `passthru,<path>,<anything>` | Only the first field is used. |
+| `virtio-rnd,<anything>` | The config is never read. |
+| `-s 7,hostbridge`, `-s 31,lpc` | The slot number is ignored; the chipset places these at 0.0.0 and 0.1.0 regardless. |
+| `-l com3,...`, any `-l` device that is not `bootrom`, `com1` or `com2` | Silently ignored, no diagnostic. |
+| `-l bootrom,...` together with `--kernel` (rshyve) | The bootrom is never looked up. No warning. |
+| `--cmdline` with UEFI boot (rshyve) | Only the direct-boot loader reads it. |
+| A misspelled `-s` driver name (rshyve) | `warn`-level log and skip. The VM boots without the device. |
+
+## Known caveats
+
+**Live migration is experimental and its transport is unauthenticated and unencrypted.** Guest RAM, all vCPU register and MSR state, and device state cross the wire in cleartext with no peer identity, no session binding, no migration ID and no replay protection. The destination resumes whatever the first connecting peer sends, subject only to a `num_cpus` and `mem_size` equality check. `SECURITY.md` states this and `docs/security/open-findings.md` tracks it as OSF-1 (high). The only mitigation available today is external: migrate over a separately authenticated tunnel, ideally an SSH-forwarded Unix socket so the VMM never binds TCP. `vmm-migrate-agent` compounds this: it disables `StrictHostKeyChecking` and builds every command by string interpolation into `bash -c`, so a shell metacharacter in `--uuid`, `--dest-host` or a dataset name runs as root in the global zone (OSF-1b).
+
+**A writable virtio-fs share is a root-equivalent grant over that subtree.** File operations run as the VMM's euid with no uid/gid squashing, and the guest chooses the uid, gid and mode on SETATTR, setuid bit included. Treat a read-write export the way you would treat handing the guest a root shell scoped to that directory. `ro` shares carry none of this: every mutating opcode returns EROFS, including an `O_TRUNC` open.
+
+**The CPU feature check never rejects.** Both destinations log "CPU feature mismatch (continuing)" and proceed. The sync destination, which is the one production uses, compares only leaf 7 and has no ignore masks. The comparison is also structurally wrong: the source sends baseline-masked guest features while the destination compares them against raw host features (OSF-3).
+
+**Device identity is not carried across migration.** Exported virtio queue records all have `pci_slot` hardcoded to 0, and `restore_virtio_state` matches by queue-count grouping, taking the first group whose length equals the device's queue count. NVMe records carry no slot at all and every controller's state is applied to every device. Two virtio-blk disks with the same queue count, or two NVMe controllers, will not restore to the right devices. Separately, if the 30 second queue-export budget expires, empty device state is substituted and the migration continues after an error-level log naming the stuck devices.
+
+**The vTPM ships two unpatched libtpms CVEs.** The vendored tree is libtpms at revision `521c5107` and carries CVE-2026-6726 (CVSS 8.5, `ObjectFlush()` leaves key material in a freed object slot) and CVE-2026-6727 (CVSS 8.3, `OaepDecode()` retains early-exit comparisons reachable from a guest-issued `TPM2_RSA_Decrypt`). Both are guest-to-host through the vTPM command interface, cross-referenced to CERT VU#431093, and recorded in `THIRD_PARTY.md:148-159` and OSF-4. `THIRD_PARTY.md` states both must be resolved before the vTPM is presented as production-ready.
+
+**A vTPM state directory and a UEFI `VARS.fd` are one unit of VM state.** Losing either makes the other useless. Nothing in the code enforces this; snapshots and backups must capture both together (`docs/testing.md:300`).
+
+**Hyper-V enlightenments have never been validated against an installed Windows workload** (`FEATURES_TODO.md:157`), and `--hyperv` is **not** blocked from migration even though no Hyper-V state is in the protocol. A migrated guest's overlay pages travel inside RAM while the MSR state describing them does not.
+
+**`-S` does not mean what its help text says.** It is documented as "Wire guest memory (don't swap)", but guest memory is mapped `VM_MEMMAP_F_WIRED` unconditionally. What `-S` actually does is set `VCF_RESERVOIR_MEM` at VM create, which means the host VMM reservoir must already be sized out of band. With an empty reservoir, VM create with `-S` fails.
+
+**Both binaries destroy a same-named VM instance on startup.** `force: true` is hardcoded, not a flag, and `VmmHdl::create` retries 20 times at 100 ms after a best-effort destroy. Do not reuse the name of a live VM.
+
+**No minimum bhyve API version is enforced.** The version is queried and logged, then execution continues. Real gates exist at v12 (sub-second RTC), v16 (triple-fault source) and v17 (`set_dirty_pages`, which returns Unsupported below that). On an older kernel the binaries start and degrade silently. v18 is the only version with test evidence behind it. The viona interface version is never checked at all, so a mismatched module surfaces as a raw ioctl errno.
+
+**Dirty page tracking is on by default in rshyve** (`--track-dirty` defaults true; the real control is the `--no-track-dirty` opt-out), and it asks the kernel for `VCF_TRACK_DIRTY` at VM create. Nothing probes for hardware support first or degrades if the flag is refused.
+
+**TCP migration cannot run inside a bhyve-brand zone.** It constructs a tokio runtime, and the project's premise is that such a zone has no `/dev/poll`. Booting a guest, the control socket, the serial console and the VNC server all avoid tokio; only TCP migration does not. In-zone migration must use the Unix sync path with a global-zone agent bridging to TCP. firehyve's crate graph contains no tokio at all.
+
+**CI type-checks; it does not link or boot.** A green run proves formatting, portable-crate clippy and tests, illumos type-checking of the FFI crates, a current lockfile, and the dependency and public-surface policies. It does not prove the VMM builds, boots a guest, or passes a platform test. USDT probe emission is a no-op on the Linux runner and is verified only on the build host. The stock-platform-image shared-library gate (`tools/check-needed.sh`) runs on the build host, not in CI, so CI never sees a real illumos ELF. `tools/check-ci-crates.sh`, the guard that asserts CI covers every portable crate, is not invoked by any CI job. Every runtime claim in `docs/testing.md` is lab-verified against an untracked host list, not reproducible publicly.
+
+**The MSRV (1.94) is unverified for both shipping binaries.** The MSRV job's crate list omits `rshyve`, `firehyve`, `vmm_tpm`, `vmm_tpm_sys` and `vmm-migrate-agent`. There is no `rust-toolchain.toml`, and `tools/fhrun-init` declares no `rust-version` at all.
+
+**Build on a platform image no newer than the oldest node you deploy to.** `tools/check-needed.sh` pins `MAX_OPENSSL_SMARTOS=3.0.9`, because `ld.so.1` refuses a binary whose recorded `OPENSSL_SMARTOS_<ver>` the node's library does not define. The platform-OpenSSL link path is taken only when host and target match and `/lib/amd64/libcrypto-smartos.so.3` exists; a cross build silently falls back to pkg-config, which is the configuration that once produced a binary recording `NEEDED libcrypto.so.3` that no platform image ships.
+
+**virtio-fs and virtio-console lose backend state across a migration and neither is on the destination reject list.** In-flight FUSE requests, the console backlog and the attached client are gone, with no error.
+
+## Documentation that contradicts the code
+
+Treat `STATUS.md` as historical. It still titles the project "vmmnew", predates the two-binary split, never mentions `firehyve`, `fhrun` or `vmm-migrate-agent`, and maps fbuf, xHCI, NVMe and passthru to a monolithic `crates/vmm-devices/` that no longer holds them.
+
+| Claim | Where | Reality |
+|---|---|---|
+| "`ahci-hd` falls back to virtio-blk" | `docs/devices.md:14` | Hard startup error, `bin/rshyve/src/main.rs:974`. A test asserts the message does **not** suggest virtio-blk. The most dangerous stale line in the docs. |
+| "`ahci-cd` falls back to virtio-blk" | `docs/devices.md:13` | A real ATAPI AHCI controller, `crates/vmm-storage/src/ahci/`, attached at `main.rs:1231`. `docs/status.md:31` gets it right, so two shipped docs disagree. |
+| "LPC bridge at slot 31" | `docs/devices.md:8` | BDF 0.1.0, slot **1**, `chipset/i440fx.rs:96`, agreeing with `acpi.rs:258`. Slot 1 is the unusable one, not 31. |
+| "virtio-blk: single queue, 128 entries" | `docs/devices.md:60` | Multiqueue up to 8, default `min(num_vcpus,4)`. 128 is the ring size, not the queue count. |
+| virtio-blk options are `nodelete` and `sectorsize` | `docs/devices.md:59` | The parser also honors `ro` and `num-queues=N`; `num-queues` appears nowhere in the docs. `nodelete` is inert. |
+| "Automatically adds -S and -A when passthrough devices are present" | `docs/devices.md` | No such code. `cli.wire_memory` is read once and nothing inspects the `-s` specs. An operator relying on this runs passthrough over unwired memory. |
+| One device table with no per-binary column | `docs/devices.md` | firehyve accepts 8 of 13 drivers and hard-errors on the rest. `docs/cli.md:117` states this correctly. |
+| "firehyve `-l com2`: not attached" | `docs/cli.md:116` | COM2 is always attached, transmit only, mirrored to stdout (`bin/firehyve/src/console.rs:111`). The "no metadata agent" half is right. |
+| "`--track-dirty` enables dirty page tracking" | `docs/cli.md` | It defaults to true; the operator control is `--no-track-dirty`, which the doc does not mention. |
+| `--cpu-baseline` values are host, avx2, sse42 | `docs/cli.md:35` | `native`, `no-avx512`, `sse4.2` and `westmere` are also accepted, case insensitively. |
+| Bootrom grammar is `-l bootrom,<path>|uefi|bios` | `docs/cli.md:74` | The varfile field (`-l bootrom,<rom>,<varfile>`) is omitted entirely, as is the `=`-containing legacy-option field. |
+| "The destination rejects a CPU feature mismatch with a detailed error" | `docs/migration.md` | Both destinations warn and continue. `docs/status.md` contradicts itself on the same page: line 13 says rejected, line 68 says warns only. |
+| Migration RAM flow is MemOffer/MemFetch/MemXfer | `docs/migration.md` | None of MemOffer, MemXfer or Page is ever sent. The real flow is PageBatch plus MemFetch, ended by MemEnd/MemDone. Five of the thirteen wire message types are decodable and never constructed. |
+| Migration examples invoke a binary called `vmm` | `docs/migration.md` | The binary is `rshyve`. |
+| `--migrate-listen 0.0.0.0:4567` as the destination | `docs/migration.md`, `docs/cli.md` | Works only because the CLI flag applies no validation; the `migrate-dest` control command runs the same address through a validator that rejects `0.0.0.0`. Two entry points to one feature disagree. |
+| Control socket has 4-5 commands | `docs/cli.md` | Twelve exist. `shutdown`, `reset`, `stop`, `migrate-dest`, `migrate-config`, `metrics` and `metrics-prometheus` are undocumented, as is `migrate-source`'s `zfs_barrier` field. |
+| `password=<b64>` for fbuf | `docs/platform.md:30` | The value is used verbatim; there is no base64 decode. `docs/devices.md:128` gets it right. |
+| `-s 30:1,xhci,tablet` selects the device | `docs/platform.md:31`, `docs/devices.md:130` | The config field is never read. |
+| Framebuffer/VNC and xHCI are "Complete" and at parity with C bhyve | `docs/status.md:28`, `docs/platform.md:151` | No VGA, no TCP listener, no `wait`, Raw encoding only, one client, one xHCI slot, no scroll wheel, no migration state. |
+| "MSFT0101 DSDT device is still missing" | `FEATURES_TODO.md:10,30,92` | Landed. `crates/vmm-devices/src/acpi.rs:366` with five tests. |
+| "Keyboard input does not exist and pointer events are not connected" | `FEATURES_TODO.md:27` | Both wired. PS/2 keyboard at `bin/rshyve/src/input.rs`, tablet pointer at `main.rs:1205`. The same line's claim that wide framebuffer stores are fatal is also stale; BAR1 is devmem-backed. |
+| "xHCI advertises MaxSlots = 1" | `FEATURES_TODO.md:86` | `MAX_SLOTS = 64` at `crates/vmm-hid/src/xhci/bits.rs:32`, with a test. Only one slot is implemented, which is the real remaining limit. |
+| virtio-fs listed as a future idea | `FEATURES_TODO.md:137` | Implemented and wired into both catalogs. |
+| "`bhyve` API v5+" | `docs/platform.md` | Nothing implements a v5 floor. Real gates are v12, v16 and v17. |
+| "AHCI: fallback to virtio-blk" in the feature comparison | `docs/platform.md` | Contradicted by both the code and `docs/status.md` in the same repository. |
+| fhrun boot numbers reproducible from a manifest | `docs/firehyve-whitepaper.md:174` | The measured command line ("no `console=`", plus `no_timer_check noapictimer`) is unreachable: `launcher.rs:53` always emits `console=ttyS0` and `kernel_extra_cmdline` can only append. |
+| fhrun exit codes are 0/1/2 | `docs/fhrun.md:75` | The VMM's code passes through, and firehyve exits 2 on a guest fault and 3 on a triple fault, so 2 is ambiguous and 3 is undocumented. |
+| `guest_metadata` "reaches the payload untouched" | `docs/fhrun.md:102` | Nothing delivers it. The payload gets only argv and env; the metadata is readable only if the payload opens `/firehyve-spec.json` itself, which is mode 0644 inside the guest. |
+
+Several source comments are stale in the same way and are worth knowing if you read the code: `bin/rshyve/src/bootrom.rs:50` describes 48 MiB of SEC RAM at 0xFC000000 while the code maps 4 MiB at 0xFCC00000; `crates/vmm-boot/src/direct.rs:43` keeps a `GPA_KERNEL` constant for a fixed-address placement path that does not exist; and `crates/vmm-virtio/src/lib.rs` still calls the transport "legacy" when it is transitional.

@@ -37,6 +37,125 @@ fn copy_out_roundtrip_and_bounds() {
 }
 
 #[test]
+fn copy_in_matches_write_bytes() {
+    // copy_in is the fast path the boot loaders take. It must land the
+    // same bytes as the volatile loop it replaces, or a kernel image
+    // loads subtly corrupt.
+    let pattern: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+
+    let volatile_mapping = make_test_mapping(4096);
+    let volatile_sub = SubMapping::new(&volatile_mapping);
+    volatile_sub.write_bytes(&pattern).unwrap();
+    let mut via_write_bytes = vec![0; pattern.len()];
+    volatile_sub.copy_out(&mut via_write_bytes).unwrap();
+
+    let bulk_mapping = make_test_mapping(4096);
+    let bulk_sub = SubMapping::new(&bulk_mapping);
+    bulk_sub.copy_in(&pattern).unwrap();
+    let mut via_copy_in = vec![0; pattern.len()];
+    bulk_sub.copy_out(&mut via_copy_in).unwrap();
+
+    assert_eq!(via_copy_in, via_write_bytes);
+    assert_eq!(via_copy_in, pattern);
+}
+
+#[test]
+fn copy_in_rejects_oversized_source() {
+    let mapping = make_test_mapping(4096);
+    let sub = SubMapping::new(&mapping);
+    let err = sub.copy_in(&vec![0u8; 4097]).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+}
+
+#[test]
+fn copy_in_checks_write_permission() {
+    let mapping = make_test_mapping(4096);
+    let mut write_only = SubMapping::new(&mapping);
+    write_only.prot = Prot::WRITE;
+    assert!(write_only.copy_in(&[0; 16]).is_ok());
+
+    let mut read_only = SubMapping::new(&mapping);
+    read_only.prot = Prot::READ;
+    let err = read_only.copy_in(&[0; 16]).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+}
+
+/// Write `payload` to a scratch file and hand back the open handle.
+fn scratch_file(name: &str, payload: &[u8]) -> std::fs::File {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vmm-core-mem-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(payload).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    std::fs::File::open(&path).unwrap()
+}
+
+#[test]
+fn read_exact_from_fills_the_mapping() {
+    let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    let file = scratch_file("full.bin", &payload);
+
+    let mapping = make_test_mapping(4096);
+    let sub = SubMapping::new(&mapping);
+    sub.read_exact_from(&file, 0, payload.len()).unwrap();
+
+    let mut got = vec![0; payload.len()];
+    sub.copy_out(&mut got).unwrap();
+    assert_eq!(got, payload);
+}
+
+#[test]
+fn read_exact_from_honors_the_file_offset() {
+    let payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+    let file = scratch_file("offset.bin", &payload);
+
+    let mapping = make_test_mapping(4096);
+    let sub = SubMapping::new(&mapping);
+    sub.read_exact_from(&file, 512, 512).unwrap();
+
+    let mut got = vec![0; 512];
+    sub.copy_out(&mut got).unwrap();
+    assert_eq!(got, &payload[512..1024]);
+}
+
+#[test]
+fn read_exact_from_rejects_a_segment_past_end_of_file() {
+    // A PT_LOAD claiming more bytes than its file holds must fail, not
+    // fill part of the range and leave the tail as it was. Silently
+    // short-filling would leak whatever the guest page held before.
+    let file = scratch_file("short.bin", &[0xAB; 100]);
+
+    let mapping = make_test_mapping(4096);
+    let sub = SubMapping::new(&mapping);
+    let err = sub.read_exact_from(&file, 0, 200).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+}
+
+#[test]
+fn read_exact_from_rejects_a_length_past_the_mapping() {
+    let file = scratch_file("big.bin", &[0xCD; 8192]);
+
+    let mapping = make_test_mapping(4096);
+    let sub = SubMapping::new(&mapping);
+    let err = sub.read_exact_from(&file, 0, 4097).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+}
+
+#[test]
+fn read_exact_from_checks_write_permission() {
+    let file = scratch_file("perm.bin", &[0xEF; 64]);
+
+    let mapping = make_test_mapping(4096);
+    let mut read_only = SubMapping::new(&mapping);
+    read_only.prot = Prot::READ;
+    let err = read_only.read_exact_from(&file, 0, 64).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+}
+
+#[test]
 fn copy_out_checks_read_permission() {
     let mapping = make_test_mapping(4096);
     let mut read_only = SubMapping::new(&mapping);

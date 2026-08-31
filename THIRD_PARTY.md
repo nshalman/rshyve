@@ -5,12 +5,6 @@ repository, with its upstream revision, license, and local changes.
 `NOTICE` carries the attribution text required for redistribution; this
 file carries the detail needed to audit or refresh a component.
 
-Verify the recorded digests before trusting a component:
-
-```sh
-shasum -a 256 docs/virtio-v1.3-csd01.html
-```
-
 ## Derived source: Propolis
 
 | | |
@@ -41,10 +35,10 @@ Copied essentially verbatim:
 | `crates/viona-api/src/lib.rs` | `crates/viona-api/src/lib.rs` |
 | `crates/viona-api/src/ffi.rs` | `crates/viona-api/src/ffi.rs` |
 | `crates/vmm-core/src/aspace.rs` | `lib/propolis/src/util/aspace.rs` |
-| `crates/vmm-devices/src/ps2/keysym.rs` | `crates/rfb/src/keysym.rs` |
-| `crates/vmm-devices/src/ps2/keyboard/mod.rs` | `lib/propolis/src/hw/ps2/keyboard/mod.rs` |
-| `crates/vmm-devices/src/ps2/keyboard/scan_code_1.rs` | same path upstream |
-| `crates/vmm-devices/src/ps2/keyboard/scan_code_2.rs` | same path upstream |
+| `crates/vmm-hid/src/ps2/keysym.rs` | `crates/rfb/src/keysym.rs` |
+| `crates/vmm-hid/src/ps2/keyboard/mod.rs` | `lib/propolis/src/hw/ps2/keyboard/mod.rs` |
+| `crates/vmm-hid/src/ps2/keyboard/scan_code_1.rs` | same path upstream |
+| `crates/vmm-hid/src/ps2/keyboard/scan_code_2.rs` | same path upstream |
 
 Substantially derived:
 
@@ -59,16 +53,26 @@ Partly derived:
 |---|---|---|
 | `crates/vmm-devices/src/pci/bits.rs` | 53% | `lib/propolis/src/hw/pci/bits.rs` |
 | `crates/vmm-core/src/exits.rs` | 48% | `lib/propolis/src/exits.rs` |
-| `crates/vmm-devices/src/ps2/ctrl.rs` | 46% | `lib/propolis/src/hw/ps2/ctrl.rs` |
+| `crates/vmm-hid/src/ps2/ctrl.rs` | 46% | `lib/propolis/src/hw/ps2/ctrl.rs` |
+| `crates/vmm-hid/src/ps2/kbd.rs` | split | `lib/propolis/src/hw/ps2/ctrl.rs` (`PS2Kbd`) |
+| `crates/vmm-hid/src/ps2/mouse.rs` | split | `lib/propolis/src/hw/ps2/ctrl.rs` (`PS2Mouse`) |
 | `crates/vmm-devices/src/pci/bar.rs` | 41% | `lib/propolis/src/hw/pci/bar.rs` |
 | `crates/vmm-core/src/intr_pins.rs` | 39% | `lib/propolis/src/intr_pins.rs` |
 | `crates/vmm-devices/src/uart/uart16550.rs` | 36% | `lib/propolis/src/hw/uart/uart16550.rs` |
+
+`kbd.rs` and `mouse.rs` hold the `PS2Kbd` and `PS2Mouse` models, which
+upstream keeps inside `ctrl.rs`. Splitting them across three files puts
+each below the 30% per-file reporting threshold, so the tool does not
+list them separately. They are derived all the same.
 
 Reproduce the whole table with:
 
 ```sh
 tools/propolis-derivation.py /path/to/propolis
 ```
+
+Scores move as upstream moves, so record the Propolis revision measured
+whenever this table is regenerated.
 
 ### Licensing
 
@@ -158,20 +162,15 @@ and unpatched in the vendored tree:
 See CERT VU#431093. Both are tracked in `docs/security/open-findings.md`
 and must be resolved before the vTPM is presented as production-ready.
 
-## Redistributed document: VIRTIO 1.3 specification
+## Referenced specification: VIRTIO 1.3
 
 | | |
 |---|---|
 | Upstream | https://docs.oasis-open.org/virtio/virtio/v1.3/csd01/virtio-v1.3-csd01.html |
-| File | `docs/virtio-v1.3-csd01.html` (3,085,187 bytes) |
-| SHA-256 | `3423e9507f2c363fc8e7bbdd013afc0436ed2954b79aa34db55cbf9afa07d45d` |
 | Copyright | OASIS Open 2023. All Rights Reserved. |
 
-Redistribution is permitted by the specification's own Notices section,
-which allows the document to be copied and furnished to others in whole
-or in part without restriction, provided the copyright notice and that
-section are included and the document is not modified. The tracked file
-is the unmodified upstream HTML, so the condition is met.
+Not redistributed. The virtio device models are written against this
+specification and cite it by section number.
 
 ## Fetched at build time: edk2-bhyve firmware
 

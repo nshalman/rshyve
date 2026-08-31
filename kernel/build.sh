@@ -3,7 +3,12 @@
 # Runs inside Docker (Alpine container) with full Linux build toolchain.
 #
 # Usage: ./build.sh [kernel_version]
-# Output: ./vmlinuz-fastboot
+# Output: ./vmlinuz-fastboot  bzImage, gzip self-decompressing
+#         ./vmlinux-fastboot  uncompressed ELF with the PVH entry note
+#
+# Both come from one compile. The PVH image skips the real-mode stub
+# and the self-decompression, which the Firecracker NSDI paper measures
+# at about 40 ms.
 
 set -euo pipefail
 
@@ -46,14 +51,28 @@ echo '=== Config summary ==='
 grep -c '=y' .config | xargs printf 'Static options: %s\n'
 grep -c '=m' .config | xargs printf 'Module options: %s (should be 0)\n'
 
+# olddefconfig silently drops an option whose dependencies are unmet.
+# Catch that here rather than after a full build and a failed boot.
+grep -q '^CONFIG_PVH=y' .config || {
+    echo 'BUILD-FAIL: CONFIG_PVH was dropped by olddefconfig'
+    exit 1
+}
+
 # Build
 make ARCH=x86_64 -j\$(nproc) bzImage 2>&1 | tail -20
 
-# Copy output
+# Copy output. --strip-all keeps allocatable sections, so the PT_NOTE
+# carrying the PVH entry survives.
 cp arch/x86_64/boot/bzImage /build/vmlinuz-fastboot
-ls -la /build/vmlinuz-fastboot
-echo '=== Kernel built successfully ==='
+objcopy --strip-all vmlinux /build/vmlinux-fastboot
 
-# Show size comparison
-echo \"Fast-boot kernel: \$(du -h /build/vmlinuz-fastboot | cut -f1)\"
+readelf -n /build/vmlinux-fastboot | grep -qi xen || {
+    echo 'BUILD-FAIL: vmlinux carries no Xen PVH note'
+    exit 1
+}
+
+ls -la /build/vmlinuz-fastboot /build/vmlinux-fastboot
+echo '=== Kernels built successfully ==='
+echo \"bzImage: \$(du -h /build/vmlinuz-fastboot | cut -f1)\"
+echo \"PVH ELF: \$(du -h /build/vmlinux-fastboot | cut -f1)\"
 "

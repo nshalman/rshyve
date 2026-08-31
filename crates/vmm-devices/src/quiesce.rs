@@ -16,21 +16,10 @@ const DURABLE_QUIESCE_BUDGET: Duration = Duration::from_secs(30);
 const BEST_EFFORT_QUIESCE_BUDGET: Duration = Duration::from_secs(2);
 const BEST_EFFORT_SYNC_BUDGET: Duration = Duration::from_secs(5);
 
-/// Platform-appropriate data sync for block-device flush operations.
-#[cfg(target_os = "illumos")]
-pub(crate) fn datasync(fd: i32) -> i32 {
-    unsafe { libc::fdatasync(fd) }
-}
-
-#[cfg(not(target_os = "illumos"))]
-pub(crate) fn datasync(fd: i32) -> i32 {
-    unsafe { libc::fsync(fd) }
-}
-
 /// Shared pause/drain gate for devices with I/O worker threads.
 ///
 /// WHY a bool predicate and not a future: no caller in this tree is async
-/// (`bin/vmm/src/reboot.rs`, `bin/vmm/src/control.rs` both drive it from a
+/// (`bin/rshyve/src/reboot.rs`, `bin/rshyve/src/control.rs` both drive it from a
 /// blocking thread), and a caller can only observe its own deadline if the
 /// callee cooperates by yielding. A predicate makes the blocking-inside-poll
 /// defect unrepresentable.
@@ -118,7 +107,7 @@ pub fn flush_file(
     device: &'static str,
 ) -> Result<(), FlushError> {
     flush_file_with(gate, file, intent, device, FLUSH_BUDGETS, |file| {
-        if datasync(file.as_raw_fd()) == 0 {
+        if crate::blkdev::datasync(file.as_raw_fd()) == 0 {
             Ok(())
         } else {
             Err(io::Error::last_os_error())
@@ -230,22 +219,6 @@ pub fn wait_all_quiesced(
         }
     }
     QuiesceReport { stuck }
-}
-
-#[cfg(test)]
-pub mod testing {
-    use super::*;
-
-    pub fn assert_query_non_blocking(dev: &Arc<dyn Lifecycle>) {
-        let dev = Arc::clone(dev);
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let result = dev.is_quiesced();
-            tx.send(result).expect("is_quiesced result receiver");
-        });
-        rx.recv_timeout(Duration::from_millis(250))
-            .expect("is_quiesced must not block");
-    }
 }
 
 #[cfg(test)]

@@ -86,7 +86,15 @@ impl VmmHdl {
             }
         }
 
-        let fd = VmmFd::open(name)?;
+        // VMM_CREATE_VM has succeeded, so a failed open leaves an instance
+        // that no fd owns and no autodestruct can reclaim. Destroy it here.
+        let fd = match VmmFd::open(name) {
+            Ok(fd) => fd,
+            Err(err) => {
+                let _ = ctl.vm_destroy(name.as_bytes());
+                return Err(err);
+            }
+        };
         Ok(Self {
             inner: fd,
             name: name.to_string(),
@@ -377,12 +385,16 @@ impl VmmHdl {
         Ok(())
     }
 
-    /// Set the VM to auto-destruct when the fd is closed.
+    /// Arm or disarm destruction of the instance when the last handle
+    /// closes.
     ///
-    /// This ensures the kernel VM resources are cleaned up even if
-    /// the process crashes.
-    pub fn set_autodestruct(&self) -> Result<()> {
-        self.inner.ioctl_usize(ioctls::VM_SET_AUTODESTRUCT, 0)?;
+    /// WHY the argument matters: the kernel sets the VMM_AUTODESTROY flag
+    /// for a non-zero argument and CLEARS it for zero (`vmm_sol_dev.c`,
+    /// `VM_SET_AUTODESTRUCT`). A call that always sent zero disarmed the
+    /// only reclaimer that survives a crash or a SIGKILL.
+    pub fn set_autodestruct(&self, enable: bool) -> Result<()> {
+        self.inner
+            .ioctl_usize(ioctls::VM_SET_AUTODESTRUCT, usize::from(enable))?;
         Ok(())
     }
 

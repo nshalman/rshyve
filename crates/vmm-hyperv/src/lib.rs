@@ -34,41 +34,12 @@ use std::time::Instant;
 use bhyve_api::vcpu_cpuid_entry;
 use slog::{info, warn, Logger};
 use vmm_core::mem::PhysMap;
+use vmm_core::msr::{MsrHandler, RdmsrOutcome, WrmsrOutcome};
 
 use crate::bits::*;
 use crate::hypercall::MsrHypercallValue;
 use crate::overlay::{Overlay, PAGE_SIZE};
 use crate::tsc::{MsrReferenceTscValue, ReferenceTscPage};
-
-/// Outcome of a `rdmsr` dispatch.
-#[derive(Debug)]
-pub enum RdmsrOutcome {
-    /// MSR was handled; deliver `value` to the guest.
-    Handled(u64),
-    /// MSR is outside this enlightenment's range. Caller should fall
-    /// through to its default RDMSR behavior.
-    NotHandled,
-    /// MSR is a Hyper-V address but the guest's read is forbidden by
-    /// TLFS (e.g. write-only MSR or feature disabled). Caller should
-    /// inject `#GP`.
-    GpException,
-}
-
-/// Outcome of a `wrmsr` dispatch.
-#[derive(Debug)]
-pub enum WrmsrOutcome {
-    /// Write absorbed; resume execution.
-    Handled,
-    /// MSR is outside this enlightenment's range. Caller should fall
-    /// through to its default WRMSR behavior.
-    NotHandled,
-    /// Reserved bits set, write to a read-only MSR, or feature
-    /// disabled. Caller should inject `#GP`.
-    GpException,
-    /// Guest wrote the reset MSR. Caller should suspend the VM with
-    /// `VM_SUSPEND_RESET`.
-    Reset,
-}
 
 /// Feature gates for the enlightenment.
 #[derive(Debug, Clone, Copy)]
@@ -214,116 +185,6 @@ impl HyperV {
         // is invisible because we capped max_leaf at 0x4000_0005.
         if self.features.frequencies {
             entries.push(cpuid_entry(0x4000_0006, 0, 0, 0, 0, 0));
-        }
-    }
-
-    pub fn rdmsr(&self, vcpu_id: i32, msr: u32) -> RdmsrOutcome {
-        if !is_hyperv_msr(msr) {
-            return RdmsrOutcome::NotHandled;
-        }
-        let inner = self.inner.lock().unwrap();
-        match msr {
-            HV_X64_MSR_GUEST_OS_ID => {
-                RdmsrOutcome::Handled(inner.msr_guest_os_id)
-            }
-            HV_X64_MSR_HYPERCALL => {
-                RdmsrOutcome::Handled(inner.msr_hypercall.raw())
-            }
-            HV_X64_MSR_VP_INDEX => RdmsrOutcome::Handled(vcpu_id as u64),
-
-            // Read-only counter; gated on the reference-TSC feature
-            // because TLFS leaf 0x4000_0003 EAX bit 1 governs both.
-            HV_X64_MSR_TIME_REF_COUNT if self.features.reference_tsc => {
-                let elapsed_100ns = self.boot.elapsed().as_nanos() / 100;
-                RdmsrOutcome::Handled(elapsed_100ns as u64)
-            }
-            HV_X64_MSR_REFERENCE_TSC if self.features.reference_tsc => {
-                RdmsrOutcome::Handled(inner.msr_reference_tsc.raw())
-            }
-            HV_X64_MSR_TIME_REF_COUNT | HV_X64_MSR_REFERENCE_TSC => {
-                RdmsrOutcome::GpException
-            }
-
-            // Reset MSR is write-triggered; reading returns the magic
-            // signature `0` (no reset in progress).
-            HV_X64_MSR_RESET if self.features.reset => RdmsrOutcome::Handled(0),
-            HV_X64_MSR_RESET => RdmsrOutcome::GpException,
-
-            // Crash MSRs: the guest reads back what it last wrote.
-            HV_X64_MSR_CRASH_P0 => RdmsrOutcome::Handled(inner.crash_p[0]),
-            HV_X64_MSR_CRASH_P1 => RdmsrOutcome::Handled(inner.crash_p[1]),
-            HV_X64_MSR_CRASH_P2 => RdmsrOutcome::Handled(inner.crash_p[2]),
-            HV_X64_MSR_CRASH_P3 => RdmsrOutcome::Handled(inner.crash_p[3]),
-            HV_X64_MSR_CRASH_P4 => RdmsrOutcome::Handled(inner.crash_p[4]),
-            // CRASH_CTL: bit 63 (NOTIFY) reads back as set so the guest
-            // knows we accept its writes. Lower bits zeroed.
-            HV_X64_MSR_CRASH_CTL => RdmsrOutcome::Handled(HV_CRASH_CTL_NOTIFY),
-
-            _ => RdmsrOutcome::NotHandled,
-        }
-    }
-
-    pub fn wrmsr(&self, _vcpu_id: i32, msr: u32, value: u64) -> WrmsrOutcome {
-        if !is_hyperv_msr(msr) {
-            return WrmsrOutcome::NotHandled;
-        }
-        let mut inner = self.inner.lock().unwrap();
-        match msr {
-            HV_X64_MSR_GUEST_OS_ID => {
-                self.handle_wr_guest_os_id(&mut inner, value);
-                WrmsrOutcome::Handled
-            }
-            HV_X64_MSR_HYPERCALL => {
-                self.handle_wr_hypercall(&mut inner, value);
-                WrmsrOutcome::Handled
-            }
-            HV_X64_MSR_VP_INDEX => WrmsrOutcome::GpException,
-
-            HV_X64_MSR_RESET if self.features.reset => {
-                if value & 1 != 0 {
-                    info!(self.log, "guest requested reset via Hyper-V MSR");
-                    WrmsrOutcome::Reset
-                } else {
-                    WrmsrOutcome::Handled
-                }
-            }
-            HV_X64_MSR_RESET => WrmsrOutcome::GpException,
-
-            HV_X64_MSR_TIME_REF_COUNT => WrmsrOutcome::GpException,
-            HV_X64_MSR_REFERENCE_TSC if self.features.reference_tsc => {
-                self.handle_wr_reference_tsc(&mut inner, value);
-                WrmsrOutcome::Handled
-            }
-            HV_X64_MSR_REFERENCE_TSC => WrmsrOutcome::GpException,
-
-            HV_X64_MSR_CRASH_P0 => {
-                inner.crash_p[0] = value;
-                WrmsrOutcome::Handled
-            }
-            HV_X64_MSR_CRASH_P1 => {
-                inner.crash_p[1] = value;
-                WrmsrOutcome::Handled
-            }
-            HV_X64_MSR_CRASH_P2 => {
-                inner.crash_p[2] = value;
-                WrmsrOutcome::Handled
-            }
-            HV_X64_MSR_CRASH_P3 => {
-                inner.crash_p[3] = value;
-                WrmsrOutcome::Handled
-            }
-            HV_X64_MSR_CRASH_P4 => {
-                inner.crash_p[4] = value;
-                WrmsrOutcome::Handled
-            }
-            HV_X64_MSR_CRASH_CTL => {
-                if value & HV_CRASH_CTL_NOTIFY != 0 {
-                    self.log_crash(&inner);
-                }
-                WrmsrOutcome::Handled
-            }
-
-            _ => WrmsrOutcome::NotHandled,
         }
     }
 
@@ -515,6 +376,118 @@ impl HyperV {
         self.pause_overlays();
         let mut inner = self.inner.lock().unwrap();
         *inner = Inner::new();
+    }
+}
+
+impl MsrHandler for HyperV {
+    fn rdmsr(&self, vcpu_id: i32, msr: u32) -> RdmsrOutcome {
+        if !is_hyperv_msr(msr) {
+            return RdmsrOutcome::NotHandled;
+        }
+        let inner = self.inner.lock().unwrap();
+        match msr {
+            HV_X64_MSR_GUEST_OS_ID => {
+                RdmsrOutcome::Handled(inner.msr_guest_os_id)
+            }
+            HV_X64_MSR_HYPERCALL => {
+                RdmsrOutcome::Handled(inner.msr_hypercall.raw())
+            }
+            HV_X64_MSR_VP_INDEX => RdmsrOutcome::Handled(vcpu_id as u64),
+
+            // Read-only counter; gated on the reference-TSC feature
+            // because TLFS leaf 0x4000_0003 EAX bit 1 governs both.
+            HV_X64_MSR_TIME_REF_COUNT if self.features.reference_tsc => {
+                let elapsed_100ns = self.boot.elapsed().as_nanos() / 100;
+                RdmsrOutcome::Handled(elapsed_100ns as u64)
+            }
+            HV_X64_MSR_REFERENCE_TSC if self.features.reference_tsc => {
+                RdmsrOutcome::Handled(inner.msr_reference_tsc.raw())
+            }
+            HV_X64_MSR_TIME_REF_COUNT | HV_X64_MSR_REFERENCE_TSC => {
+                RdmsrOutcome::GpException
+            }
+
+            // Reset MSR is write-triggered; reading returns the magic
+            // signature `0` (no reset in progress).
+            HV_X64_MSR_RESET if self.features.reset => RdmsrOutcome::Handled(0),
+            HV_X64_MSR_RESET => RdmsrOutcome::GpException,
+
+            // Crash MSRs: the guest reads back what it last wrote.
+            HV_X64_MSR_CRASH_P0 => RdmsrOutcome::Handled(inner.crash_p[0]),
+            HV_X64_MSR_CRASH_P1 => RdmsrOutcome::Handled(inner.crash_p[1]),
+            HV_X64_MSR_CRASH_P2 => RdmsrOutcome::Handled(inner.crash_p[2]),
+            HV_X64_MSR_CRASH_P3 => RdmsrOutcome::Handled(inner.crash_p[3]),
+            HV_X64_MSR_CRASH_P4 => RdmsrOutcome::Handled(inner.crash_p[4]),
+            // CRASH_CTL: bit 63 (NOTIFY) reads back as set so the guest
+            // knows we accept its writes. Lower bits zeroed.
+            HV_X64_MSR_CRASH_CTL => RdmsrOutcome::Handled(HV_CRASH_CTL_NOTIFY),
+
+            _ => RdmsrOutcome::NotHandled,
+        }
+    }
+
+    fn wrmsr(&self, _vcpu_id: i32, msr: u32, value: u64) -> WrmsrOutcome {
+        if !is_hyperv_msr(msr) {
+            return WrmsrOutcome::NotHandled;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        match msr {
+            HV_X64_MSR_GUEST_OS_ID => {
+                self.handle_wr_guest_os_id(&mut inner, value);
+                WrmsrOutcome::Handled
+            }
+            HV_X64_MSR_HYPERCALL => {
+                self.handle_wr_hypercall(&mut inner, value);
+                WrmsrOutcome::Handled
+            }
+            HV_X64_MSR_VP_INDEX => WrmsrOutcome::GpException,
+
+            HV_X64_MSR_RESET if self.features.reset => {
+                if value & 1 != 0 {
+                    info!(self.log, "guest requested reset via Hyper-V MSR");
+                    WrmsrOutcome::Reset
+                } else {
+                    WrmsrOutcome::Handled
+                }
+            }
+            HV_X64_MSR_RESET => WrmsrOutcome::GpException,
+
+            HV_X64_MSR_TIME_REF_COUNT => WrmsrOutcome::GpException,
+            HV_X64_MSR_REFERENCE_TSC if self.features.reference_tsc => {
+                self.handle_wr_reference_tsc(&mut inner, value);
+                WrmsrOutcome::Handled
+            }
+            HV_X64_MSR_REFERENCE_TSC => WrmsrOutcome::GpException,
+
+            HV_X64_MSR_CRASH_P0 => {
+                inner.crash_p[0] = value;
+                WrmsrOutcome::Handled
+            }
+            HV_X64_MSR_CRASH_P1 => {
+                inner.crash_p[1] = value;
+                WrmsrOutcome::Handled
+            }
+            HV_X64_MSR_CRASH_P2 => {
+                inner.crash_p[2] = value;
+                WrmsrOutcome::Handled
+            }
+            HV_X64_MSR_CRASH_P3 => {
+                inner.crash_p[3] = value;
+                WrmsrOutcome::Handled
+            }
+            HV_X64_MSR_CRASH_P4 => {
+                inner.crash_p[4] = value;
+                WrmsrOutcome::Handled
+            }
+            HV_X64_MSR_CRASH_CTL => {
+                if value & HV_CRASH_CTL_NOTIFY != 0 {
+                    self.log_crash(&inner);
+                }
+                WrmsrOutcome::Handled
+            }
+
+            _ => WrmsrOutcome::NotHandled,
+        }
     }
 }
 

@@ -22,6 +22,7 @@ pub mod intr_pins;
 pub mod machine;
 pub mod mem;
 pub mod mmio;
+pub mod msr;
 pub mod pio;
 pub mod unixsock;
 pub mod vcpu;

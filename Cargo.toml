@@ -8,14 +8,29 @@ members = [
     "crates/vmm-api-common",
     "crates/vmm-core",
     "crates/vmm-devices",
+    "crates/vmm-virtio",
+    "crates/vmm-storage",
+    "crates/vmm-hid",
+    "crates/vmm-passthru",
+    "crates/vmm-metrics",
+    "crates/vmm-devices-testsupport",
+    "crates/vmm-boot",
     "crates/vmm-migrate",
     "crates/vmm-config",
     "crates/vmm-hyperv",
     "crates/vmm-tpm-sys",
     "crates/vmm-tpm",
-    "bin/vmm",
+    "crates/vmm-machine",
+    "bin/rshyve",
+    "bin/firehyve",
     "bin/vmm-migrate-agent",
+    "tools/fhrun",
 ]
+
+# fhrun-init cross-compiles to x86_64-unknown-linux-musl and carries
+# its own workspace and lockfile. Excluding it keeps a host
+# `cargo build --workspace` off the Linux toolchain.
+exclude = ["tools/fhrun-init"]
 
 [workspace.package]
 # The oldest toolchain this is built with is the illumos build host's
@@ -61,11 +76,19 @@ viona_api = { path = "crates/viona-api" }
 vmm_api_common = { path = "crates/vmm-api-common" }
 vmm_core = { path = "crates/vmm-core" }
 vmm_devices = { path = "crates/vmm-devices" }
+vmm_virtio = { path = "crates/vmm-virtio" }
+vmm_storage = { path = "crates/vmm-storage" }
+vmm_hid = { path = "crates/vmm-hid" }
+vmm_passthru = { path = "crates/vmm-passthru" }
+vmm_metrics = { path = "crates/vmm-metrics" }
+vmm_devices_testsupport = { path = "crates/vmm-devices-testsupport" }
+vmm_boot = { path = "crates/vmm-boot" }
 vmm_migrate = { path = "crates/vmm-migrate" }
 vmm_config = { path = "crates/vmm-config" }
 vmm_hyperv = { path = "crates/vmm-hyperv" }
 vmm_tpm_sys = { path = "crates/vmm-tpm-sys" }
 vmm_tpm = { path = "crates/vmm-tpm" }
+vmm_machine = { path = "crates/vmm-machine" }
 
 # External dependencies
 anyhow = "1.0"

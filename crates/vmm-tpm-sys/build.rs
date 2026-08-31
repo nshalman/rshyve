@@ -9,13 +9,40 @@
 //! `OUT_DIR`, then tell cargo to link against the resulting static
 //! archives.
 //!
-//! This intentionally does *not* shell out for every cargo invocation:
-//! we mark the output `libtpms.a` as the build's output, and cargo's
-//! own freshness logic handles re-builds.
+//! # Which OpenSSL libtpms links against
+//!
+//! A stock SmartOS platform image ships no `libcrypto.so.3`. Its
+//! OpenSSL is `libcrypto-smartos.so.3`, whose exports are almost all
+//! renamed with a `sunw_` prefix so that a zone's pkgsrc OpenSSL and
+//! the platform's cannot collide in one process. A binary that records
+//! `NEEDED libcrypto.so.3` therefore cannot start on a stock node.
+//!
+//! So on SmartOS we link libtpms against the platform library the same
+//! way every other platform binary does: force-include a generated
+//! `#pragma redefine_extname` header so plain `EVP_*`/`AES_*` calls
+//! bind to the `sunw_`-prefixed names, and resolve `-lcrypto` through
+//! a link farm whose one entry points at the platform library. `ld`
+//! records that library's SONAME, so the binary resolves crypto from
+//! base `/lib` with no `LD_LIBRARY_PATH` and no pkgsrc.
+//!
+//! Anywhere else (a Linux CI runner, a dev host) pkg-config still
+//! decides, unchanged.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The platform OpenSSL shipped in a SmartOS platform image.
+const SMARTOS_CRYPTO: &str = "/lib/amd64/libcrypto-smartos.so.3";
+
+/// How libtpms reaches OpenSSL.
+enum Crypto {
+    /// SmartOS platform OpenSSL, reached through a generated symbol
+    /// prefix header and a link farm.
+    SmartOs { header: PathBuf, linkfarm: PathBuf },
+    /// Whatever pkg-config points at.
+    PkgConfig,
+}
 
 fn main() {
     let workspace_root = workspace_root();
@@ -35,44 +62,50 @@ fn main() {
     let build_dir = out_dir.join("libtpms-build");
 
     println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-changed={SMARTOS_CRYPTO}");
 
+    let crypto = select_crypto(&out_dir);
+
+    // The stamp records which OpenSSL the archive in OUT_DIR was built
+    // against. OUT_DIR survives a change to this file, so a bare
+    // "already built" marker would keep handing back an archive linked
+    // against the wrong library.
     let marker = build_dir.join(".vmm-tpm-built.stamp");
-    if !marker.is_file() {
+    let fingerprint = crypto.fingerprint();
+    if std::fs::read_to_string(&marker).ok().as_deref() != Some(&fingerprint) {
         copy_tree(&src, &work_src);
+        // Wipe the build directory as well: an autotools build tree
+        // hard-codes its srcdir, so Makefiles left by an earlier
+        // configure point at a path that may no longer exist.
+        let _ = std::fs::remove_dir_all(&build_dir);
         std::fs::create_dir_all(&build_dir).expect("mkdir libtpms-build");
         run_autogen(&work_src);
-        run_configure(&work_src, &build_dir);
+        run_configure(&work_src, &build_dir, &crypto);
         run_make(&build_dir);
-        std::fs::write(&marker, b"ok").expect("write marker");
+        std::fs::write(&marker, &fingerprint).expect("write marker");
     }
 
     let lib_dir = build_dir.join("src").join(".libs");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
-    // OpenSSL lives outside `/usr/lib` on illumos hosts (typically
-    // /opt/tools/lib via SmartOS pkgsrc). Surface its directory to
-    // rustc as both a search path and a runpath so `ld` finds
-    // libcrypto.so.0 and the resulting binary loads it at runtime
-    // without LD_LIBRARY_PATH.
-    if let Ok(out) = Command::new("pkg-config")
-        .args(["--libs-only-L", "openssl"])
-        .output()
-    {
-        if out.status.success() {
-            let dirs: Vec<&str> = String::from_utf8_lossy(&out.stdout)
+    match &crypto {
+        Crypto::SmartOs { linkfarm, .. } => {
+            // Only the link farm goes on the search path. Naming the
+            // pkgsrc directory as well would let `ld` pick pkgsrc's
+            // libcrypto.so first and silently record the wrong NEEDED
+            // entry; tools/check-needed.sh is the backstop for that.
+            println!("cargo:rustc-link-search=native={}", linkfarm.display());
+        }
+        Crypto::PkgConfig => {
+            // OpenSSL lives outside `/usr/lib` on illumos hosts
+            // (typically /opt/local/lib via pkgsrc). Surface its
+            // directory to rustc so `ld` finds libcrypto.
+            for dir in pkg_config(&["--libs-only-L", "openssl"])
                 .split_whitespace()
                 .filter_map(|a| a.strip_prefix("-L"))
-                .map(|s| Box::leak(s.to_string().into_boxed_str()) as &str)
-                .collect();
-            for dir in &dirs {
-                println!("cargo:rustc-link-search=native={}", dir);
+            {
+                println!("cargo:rustc-link-search=native={dir}");
             }
-            // Tell downstream binaries (e.g. bin/vmm) where the openssl
-            // libs live, so they can emit a runpath via their own
-            // build.rs. `links = "tpms"` in our Cargo.toml means cargo
-            // exports anything we print as `cargo:KEY=VAL` to dependent
-            // crates as `DEP_TPMS_KEY` env vars.
-            println!("cargo:openssl_libdirs={}", dirs.join(":"));
         }
     }
 
@@ -85,6 +118,214 @@ fn main() {
     // Expose include path to dependents (e.g. for bindgen if we add it).
     println!("cargo:include={}", src.join("include").display());
 }
+
+impl Crypto {
+    /// Identify the OpenSSL this archive was built against, so a
+    /// cached OUT_DIR from a different choice is rebuilt rather than
+    /// reused.
+    fn fingerprint(&self) -> String {
+        match self {
+            Crypto::SmartOs { header, .. } => {
+                let syms = std::fs::read_to_string(header)
+                    .expect("read generated prefix header")
+                    .lines()
+                    .count();
+                format!("smartos {SMARTOS_CRYPTO} {syms}")
+            }
+            Crypto::PkgConfig => format!(
+                "pkg-config {} {}",
+                pkg_config(&["--modversion", "openssl"]),
+                pkg_config(&["--libs-only-L", "openssl"])
+            ),
+        }
+    }
+}
+
+/// Pick the OpenSSL the vendored libtpms builds against, and prove the
+/// choice works before anything is compiled against it.
+fn select_crypto(out_dir: &Path) -> Crypto {
+    // Cross builds cannot run the probe below, and a host that merely
+    // happens to be SmartOS says nothing about the target. Only take
+    // the platform path when we are building natively for it.
+    let native = env::var("HOST") == env::var("TARGET");
+    if !(native && Path::new(SMARTOS_CRYPTO).is_file()) {
+        return Crypto::PkgConfig;
+    }
+
+    let header = out_dir.join("sunw_prefix.h");
+    let linkfarm = out_dir.join("smartos-crypto");
+    gen_prefix_header(&header);
+    make_linkfarm(&linkfarm);
+    check_abi(out_dir, &header, &linkfarm);
+    Crypto::SmartOs { header, linkfarm }
+}
+
+/// Emit a `#pragma redefine_extname` header from the platform
+/// library's own export list, so libtpms' plain `EVP_*`/`AES_*` calls
+/// bind to the `sunw_`-prefixed names the platform actually exports.
+///
+/// Deriving the list from the library rather than vendoring illumos-
+/// extra's `openssl3/sunw_prefix.h` keeps the mangling in step with
+/// whatever platform image the build host runs.
+fn gen_prefix_header(header: &Path) {
+    let out = Command::new("/usr/bin/nm")
+        .args(["-DPg", SMARTOS_CRYPTO])
+        .output()
+        .expect("spawn nm");
+    assert!(out.status.success(), "nm on {SMARTOS_CRYPTO} failed");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut names: Vec<&str> = text
+        .lines()
+        .filter_map(|line| {
+            let mut field = line.split_whitespace();
+            let name = field.next()?;
+            // Functions, initialized data and bss. Anything else is
+            // not an entry point libtpms can call.
+            if !matches!(field.next()?, "T" | "D" | "B") {
+                return None;
+            }
+            name.strip_prefix("sunw_")
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    assert!(
+        names.len() > 1000,
+        "implausibly few sunw_ exports ({}) in {SMARTOS_CRYPTO}: \
+         refusing to build a half-mangled libtpms",
+        names.len()
+    );
+
+    let mut buf = String::from(
+        "/* Generated by vmm-tpm-sys/build.rs from the platform \
+         libcrypto. Do not edit. */\n\
+         #ifndef _VMM_SUNW_PREFIX_H\n#define _VMM_SUNW_PREFIX_H\n",
+    );
+    for name in &names {
+        buf.push_str(&format!("#pragma redefine_extname {name} sunw_{name}\n"));
+    }
+    buf.push_str("#endif\n");
+    std::fs::write(header, buf).expect("write sunw_prefix.h");
+}
+
+/// A directory holding one `libcrypto.so` symlink at the platform
+/// library, so both libtpms' configure probes and rustc's `-lcrypto`
+/// resolve to it rather than to pkgsrc.
+fn make_linkfarm(dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).expect("mkdir linkfarm");
+    std::os::unix::fs::symlink(SMARTOS_CRYPTO, dir.join("libcrypto.so"))
+        .expect("symlink platform libcrypto");
+}
+
+/// Compile and run one C program against the platform library through
+/// the generated header.
+///
+/// The headers come from pkgsrc and the library from the platform
+/// image, and the two track different OpenSSL releases. Within the
+/// OpenSSL 3 series that is supported, but a build host whose pkgsrc
+/// has moved to OpenSSL 4 would otherwise link cleanly and then
+/// misbehave at run time. Catch the mismatch here, where the message
+/// can say what to do about it, and prove the mangling resolves at the
+/// same time.
+fn check_abi(out_dir: &Path, header: &Path, linkfarm: &Path) {
+    let probe_src = out_dir.join("smartos-crypto-probe.c");
+    std::fs::write(&probe_src, ABI_PROBE_C).expect("write probe source");
+    let probe_bin = out_dir.join("smartos-crypto-probe");
+
+    let cc = env::var("CC").unwrap_or_else(|_| "cc".into());
+    let mut cmd = Command::new(&cc);
+    cmd.arg(&probe_src)
+        .arg("-o")
+        .arg(&probe_bin)
+        .arg(format!("-include{}", header.display()));
+    for flag in pkg_config(&["--cflags-only-I", "openssl"]).split_whitespace() {
+        cmd.arg(flag);
+    }
+    cmd.arg(format!("-L{}", linkfarm.display())).arg("-lcrypto");
+    let out = cmd.output().expect("spawn cc for the OpenSSL ABI probe");
+    assert!(
+        out.status.success(),
+        "cannot build against {SMARTOS_CRYPTO}:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(&probe_bin).output().expect("spawn ABI probe");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the OpenSSL ABI probe failed against {SMARTOS_CRYPTO}. The \
+         pkgsrc headers and the platform library disagree, so a vTPM \
+         built here would not work. Build on a host whose pkgsrc \
+         OpenSSL major version matches the platform image.\n{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // One line, so a build log always names the OpenSSL that was
+    // actually used. The rest of the probe output only matters when it
+    // fails, and it is in the panic message above.
+    if let Some(versions) = stdout.lines().next() {
+        println!("cargo:warning=vmm-tpm-sys: {versions}");
+    }
+}
+
+/// Header/library agreement plus a known-answer test over the calls
+/// libtpms actually makes. Prints one `version` line for the build log.
+const ABI_PROBE_C: &str = r#"
+#include <stdio.h>
+#include <string.h>
+#include <openssl/aes.h>
+#include <openssl/bn.h>
+#include <openssl/crypto.h>
+#include <openssl/ec.h>
+#include <openssl/evp.h>
+#include <openssl/opensslv.h>
+#include <openssl/param_build.h>
+#include <openssl/rand.h>
+#include <openssl/rsa.h>
+#include <openssl/sha.h>
+
+/* SHA-256("abc") */
+static const unsigned char kat[32] = {
+ 0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,
+ 0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad };
+
+int main(void) {
+    unsigned long hv = OPENSSL_VERSION_NUMBER;
+    unsigned long lv = OpenSSL_version_num();
+    unsigned char md[32], key[32] = {0}, rb[8];
+    SHA256_CTX sha; AES_KEY ak; EVP_CIPHER_CTX *cc;
+    EVP_KDF *kdf; OSSL_PARAM_BLD *bld; RSA *rsa; BIGNUM *bn; EC_KEY *ec;
+
+    printf("openssl headers 0x%08lx, platform library 0x%08lx (%s)\n",
+           hv, lv, OpenSSL_version(OPENSSL_VERSION));
+    if ((hv >> 28) != (lv >> 28)) {
+        printf("FAIL: OpenSSL major version differs between the headers "
+               "and the platform library\n");
+        return 1;
+    }
+    if (SHA256_Init(&sha) != 1) { puts("FAIL SHA256_Init"); return 1; }
+    SHA256_Update(&sha, "abc", 3);
+    SHA256_Final(md, &sha);
+    if (memcmp(md, kat, sizeof kat) != 0) { puts("FAIL SHA256 KAT"); return 1; }
+    if (AES_set_encrypt_key(key, 256, &ak) != 0) { puts("FAIL AES"); return 1; }
+    cc = EVP_CIPHER_CTX_new(); if (!cc) { puts("FAIL EVP ctx"); return 1; }
+    if (EVP_EncryptInit_ex(cc, EVP_aes_256_cbc(), NULL, key, key) != 1) {
+        puts("FAIL EVP_EncryptInit_ex"); return 1; }
+    EVP_CIPHER_CTX_free(cc);
+    rsa = RSA_new(); if (!rsa) { puts("FAIL RSA"); return 1; } RSA_free(rsa);
+    bn = BN_new(); if (!bn) { puts("FAIL BN"); return 1; } BN_free(bn);
+    ec = EC_KEY_new(); if (!ec) { puts("FAIL EC"); return 1; } EC_KEY_free(ec);
+    kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
+    if (!kdf) { puts("FAIL EVP_KDF_fetch"); return 1; } EVP_KDF_free(kdf);
+    bld = OSSL_PARAM_BLD_new();
+    if (!bld) { puts("FAIL OSSL_PARAM_BLD_new"); return 1; }
+    OSSL_PARAM_BLD_free(bld);
+    if (RAND_bytes(rb, sizeof rb) != 1) { puts("FAIL RAND_bytes"); return 1; }
+    puts("platform libcrypto resolves and passes the SHA-256 KAT");
+    return 0;
+}
+"#;
 
 fn run_autogen(src: &Path) {
     // libtpms' autogen.sh runs autoreconf in $srcdir then optionally
@@ -99,7 +340,7 @@ fn run_autogen(src: &Path) {
     assert!(status.success(), "libtpms autogen.sh failed");
 }
 
-fn run_configure(src: &Path, build: &Path) {
+fn run_configure(src: &Path, build: &Path, crypto: &Crypto) {
     let configure = src.join("configure");
     assert!(
         configure.is_file(),
@@ -113,66 +354,56 @@ fn run_configure(src: &Path, build: &Path) {
     let mut ldflags = String::new();
     let mut libs = String::new();
 
-    // libtpms's autoconf checks `AES_set_encrypt_key in -lcrypto` to
-    // verify OpenSSL. On illumos hosts the headers/libs live under
-    // /opt/tools or /opt/local rather than the default /usr/include
-    // and /usr/lib search paths, so configure fails to find them
-    // unless we give it CPPFLAGS/LDFLAGS. Discover via pkg-config and
-    // append to the configure-time flags.
-    if let Ok(out) = Command::new("pkg-config")
-        .args(["--cflags-only-I", "openssl"])
-        .output()
-    {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            cflags.push(' ');
-            cflags.push_str(s.trim());
-        }
-    }
-    if let Ok(out) = Command::new("pkg-config")
-        .args(["--libs-only-L", "openssl"])
-        .output()
-    {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            ldflags.push_str(s.trim());
-            // Mirror -L flags as -R runpath entries so the autoconf
-            // "can run compiled program" check (which builds and
-            // executes a tiny test binary) finds libcrypto/libssl at
-            // runtime without LD_LIBRARY_PATH set in the environment.
-            for arg in s.split_whitespace() {
-                if let Some(dir) = arg.strip_prefix("-L") {
-                    if !ldflags.is_empty() {
-                        ldflags.push(' ');
-                    }
-                    ldflags.push_str(&format!("-Wl,-R,{}", dir));
-                }
-            }
-        }
-    }
-    if let Ok(out) = Command::new("pkg-config")
-        .args(["--libs-only-l", "openssl"])
-        .output()
-    {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            libs.push_str(s.trim());
-        }
+    // libtpms' autoconf checks `AES_set_encrypt_key in -lcrypto` to
+    // verify OpenSSL. On illumos hosts the headers live under
+    // /opt/local or /opt/tools rather than the default /usr/include
+    // search path, so configure fails to find them unless we pass
+    // CPPFLAGS. A platform image ships no OpenSSL headers at all, so
+    // pkg-config supplies them in both modes.
+    let includes = pkg_config(&["--cflags-only-I", "openssl"]);
+    if !includes.is_empty() {
+        cflags.push(' ');
+        cflags.push_str(&includes);
     }
 
-    // Fallback: if pkg-config didn't surface anything (it might not
-    // on hosts without an openssl.pc file), explicitly probe a couple
-    // of common illumos prefixes so the build still works.
-    if ldflags.is_empty() {
-        for prefix in ["/opt/tools", "/opt/local", "/usr/local"] {
-            let inc = format!("{prefix}/include/openssl");
-            let lib = format!("{prefix}/lib");
-            if Path::new(&inc).is_dir()
-                && Path::new(&lib).join("libcrypto.so").exists()
+    match crypto {
+        Crypto::SmartOs { header, linkfarm } => {
+            cflags.push_str(&format!(" -include {}", header.display()));
+            ldflags.push_str(&format!("-L{}", linkfarm.display()));
+            libs.push_str("-lcrypto");
+        }
+        Crypto::PkgConfig => {
+            let dirs = pkg_config(&["--libs-only-L", "openssl"]);
+            ldflags.push_str(&dirs);
+            // Mirror -L flags as -R runpath entries so the autoconf
+            // "can run compiled program" check (which builds and
+            // executes a tiny test binary) finds libcrypto at run time
+            // without LD_LIBRARY_PATH set in the environment.
+            for dir in
+                dirs.split_whitespace().filter_map(|a| a.strip_prefix("-L"))
             {
-                cflags.push_str(&format!(" -I{prefix}/include"));
-                ldflags.push_str(&format!("-L{prefix}/lib"));
-                break;
+                if !ldflags.is_empty() {
+                    ldflags.push(' ');
+                }
+                ldflags.push_str(&format!("-Wl,-R,{dir}"));
+            }
+            libs.push_str(&pkg_config(&["--libs-only-l", "openssl"]));
+
+            // Fallback: pkg-config may have no openssl.pc. Probe a
+            // couple of common illumos prefixes so the build still
+            // works.
+            if ldflags.is_empty() {
+                for prefix in ["/opt/tools", "/opt/local", "/usr/local"] {
+                    let inc = format!("{prefix}/include/openssl");
+                    let lib = format!("{prefix}/lib");
+                    if Path::new(&inc).is_dir()
+                        && Path::new(&lib).join("libcrypto.so").exists()
+                    {
+                        cflags.push_str(&format!(" -I{prefix}/include"));
+                        ldflags.push_str(&format!("-L{prefix}/lib"));
+                        break;
+                    }
+                }
             }
         }
     }
@@ -195,6 +426,18 @@ fn run_configure(src: &Path, build: &Path) {
     }
     let status = cmd.status().expect("spawn configure");
     assert!(status.success(), "libtpms configure failed");
+}
+
+/// Run pkg-config and return its trimmed stdout, or an empty string if
+/// it is missing or fails.
+fn pkg_config(args: &[&str]) -> String {
+    let tool = env::var("PKG_CONFIG").unwrap_or_else(|_| "pkg-config".into());
+    match Command::new(tool).args(args).output() {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        _ => String::new(),
+    }
 }
 
 fn copy_tree(src: &Path, dst: &Path) {

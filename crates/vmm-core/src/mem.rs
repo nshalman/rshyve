@@ -354,6 +354,128 @@ impl SubMapping {
         Ok(())
     }
 
+    /// Bulk copy a host buffer into guest-visible memory.
+    ///
+    /// The write-side counterpart to [`Self::copy_out`]. The
+    /// byte-at-a-time volatile loop in [`Self::write_bytes`] cannot be
+    /// coalesced by the optimizer, which is the point of volatile, so it
+    /// costs about one store instruction per byte. That is far too slow
+    /// for the multi-megabyte writes on the boot path: loading a 9.3 MiB
+    /// PVH kernel that way measured about 14 ms slower than a memcpy.
+    ///
+    /// Only for writes that no vCPU can observe partially, which in
+    /// practice means before the vCPU threads start. Do not use this
+    /// where a torn write is a correctness bug.
+    pub fn copy_in(&self, src: &[u8]) -> Result<()> {
+        if !self.prot.contains(Prot::WRITE) {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "mapping is not writable",
+            ));
+        }
+        if src.len() > self.len {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "copy exceeds mapping bounds",
+            ));
+        }
+
+        // Safety: bounds are checked above. `copy` rather than
+        // `copy_nonoverlapping` because a caller may legitimately stage
+        // bytes that alias guest memory, and memmove costs nothing extra
+        // when the ranges do not overlap.
+        unsafe {
+            std::ptr::copy(src.as_ptr(), self.ptr.as_ptr(), src.len());
+        }
+        // Keep the copy from sinking past the stores that publish it,
+        // such as the vCPU start that follows on the boot path.
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Fill the first `len` bytes of this mapping from `file`, starting
+    /// at `file_offset`.
+    ///
+    /// Reads straight from the file descriptor into guest memory, so a
+    /// multi-megabyte boot image is never staged in the VMM's address
+    /// space. Uses `pread` on the raw pointer rather than a slice: the
+    /// safety model at the top of this module forbids forming a Rust
+    /// reference to guest memory, and that holds here too.
+    ///
+    /// Carries the same constraint as [`Self::copy_in`]: only for
+    /// writes no vCPU can observe partially, which on the boot path
+    /// means before the vCPU threads start.
+    ///
+    /// Short reads are resumed and `EINTR` is retried. End of file
+    /// before `len` bytes is an error rather than a short fill: a
+    /// segment claiming more bytes than its file holds must not leave
+    /// the tail holding whatever the guest page had before.
+    pub fn read_exact_from(
+        &self,
+        file: &std::fs::File,
+        file_offset: u64,
+        len: usize,
+    ) -> Result<()> {
+        if !self.prot.contains(Prot::WRITE) {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "mapping is not writable",
+            ));
+        }
+        if len > self.len {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "read exceeds mapping bounds",
+            ));
+        }
+
+        let fd = file.as_raw_fd();
+        let mut done: usize = 0;
+        while done < len {
+            let offset = file_offset
+                .checked_add(done as u64)
+                .and_then(|o| i64::try_from(o).ok())
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "file offset is out of range",
+                    )
+                })?;
+            // Safety: `done < len <= self.len`, so the destination stays
+            // inside the mapping, and the remaining count cannot run
+            // past its end. No Rust reference to guest memory is formed.
+            let got = unsafe {
+                libc::pread(
+                    fd,
+                    self.ptr.as_ptr().add(done) as *mut libc::c_void,
+                    len - done,
+                    offset,
+                )
+            };
+            if got < 0 {
+                let e = Error::last_os_error();
+                if e.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if got == 0 {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    format!(
+                        "image ended {} bytes before the segment did",
+                        len - done
+                    ),
+                ));
+            }
+            done += got as usize;
+        }
+        // Keep the fill from sinking past the stores that publish it,
+        // such as the vCPU start that follows on the boot path.
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     /// Length of this mapping in bytes.
     pub fn len(&self) -> usize {
         self.len
@@ -792,6 +914,45 @@ impl MemCtx {
             )
         })?;
         sub.write_bytes(data)
+    }
+
+    /// Bulk write to guest memory at the given GPA.
+    ///
+    /// Uses [`SubMapping::copy_in`], so it carries that method's
+    /// constraint: only for writes no vCPU can observe partially. Meant
+    /// for the multi-megabyte boot-path writes, which all happen before
+    /// the vCPU threads start.
+    pub fn write_bulk(&self, gpa: u64, data: &[u8]) -> Result<()> {
+        let sub = self.map.lookup(gpa, data.len()).ok_or_else(|| {
+            Error::new(
+                ErrorKind::AddrNotAvailable,
+                format!("GPA {:#x} len {} not mapped", gpa, data.len()),
+            )
+        })?;
+        sub.copy_in(data)
+    }
+
+    /// Load `len` bytes at `file_offset` in `file` into guest memory at
+    /// `gpa`.
+    ///
+    /// The GPA range is validated as mapped and writable before any
+    /// byte is read, so a segment header cannot steer the read outside
+    /// guest RAM. Uses [`SubMapping::read_exact_from`] and carries its
+    /// constraint: only before the vCPU threads start.
+    pub fn load_from_file(
+        &self,
+        gpa: u64,
+        file: &std::fs::File,
+        file_offset: u64,
+        len: usize,
+    ) -> Result<()> {
+        let sub = self.map.lookup(gpa, len).ok_or_else(|| {
+            Error::new(
+                ErrorKind::AddrNotAvailable,
+                format!("GPA {gpa:#x} len {len} not mapped"),
+            )
+        })?;
+        sub.read_exact_from(file, file_offset, len)
     }
 
     /// Look up a GPA range and return a SubMapping for direct access.

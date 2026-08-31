@@ -6,7 +6,7 @@
 # Otherwise fall back to the stock illumos bhyve (bhyve.orig).
 #
 # To deploy a Rust vmmctl for testing:
-#   cp vmm /zones/<uuid>/root/bhyve.rust
+#   cp rshyve /zones/<uuid>/root/bhyve.rust
 #   chmod 0555 /zones/<uuid>/root/bhyve.rust
 #
 

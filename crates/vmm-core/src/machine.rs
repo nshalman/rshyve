@@ -20,6 +20,8 @@
 
 use std::sync::Arc;
 
+use anyhow::Context as _;
+
 use crate::hdl::{CreateOpts, VmmHdl};
 use crate::mem::{MemCtx, PhysMap, SegidAlloc};
 use crate::mmio::MmioBus;
@@ -224,7 +226,11 @@ impl Builder {
         );
 
         let hdl = Arc::new(VmmHdl::create(&self.name, &self.opts)?);
-        hdl.set_autodestruct()?;
+        // Arm the kernel reclaimer before any later step can fail. It is the
+        // only thing that releases the instance if the process dies without
+        // teardown.
+        hdl.set_autodestruct(true)
+            .context("failed to arm VM autodestruct")?;
 
         let mut map = PhysMap::new();
 

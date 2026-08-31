@@ -1,0 +1,21 @@
+[package]
+name = "vmm_hid"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+license = "MPL-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+vmm_devices.workspace = true
+vmm_core.workspace = true
+bhyve_api.workspace = true
+anyhow.workspace = true
+ascii.workspace = true
+bitflags.workspace = true
+des.workspace = true
+libc.workspace = true
+slog.workspace = true
+usdt = { workspace = true, features = ["asm"] }

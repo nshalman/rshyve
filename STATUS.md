@@ -1,4 +1,4 @@
-# vmmnew — Rust bhyve VMM for Triton/SmartOS
+# rust-bhyve — rshyve and firehyve for Triton/SmartOS
 
 ## What it is
 
@@ -25,15 +25,32 @@ A new Rust-based bhyve userspace VMM, replacing the existing C `bhyve` command. 
 ## Crate structure
 
 ```
-vmmnew/
-  bin/vmm/                  Main binary + mdata agent + control socket
+rust-bhyve/
+  bin/rshyve/               Parity binary: mdata agent, control socket, bootrom
+  bin/firehyve/             microVM binary: short device catalog, no control socket
+  tools/fhrun/              Runs a Linux binary in a microVM like a child process
+  tools/fhrun-init/         In-guest PID 1 for fhrun (linux-musl, excluded workspace)
+
   crates/bhyve-api/         Kernel VMM ioctl FFI (forked from propolis)
   crates/viona-api/         viona NIC driver FFI (forked from propolis)
-  crates/vmm-core/          VmmHdl, PhysMap, MemCtx, Vcpu, CPUID masking
-  crates/vmm-devices/       PCI, chipset, virtio, NVMe, UART, fbuf, xHCI, passthru
-  crates/vmm-migrate/       Migration protocol, codec, state export/import
-  crates/vmm-config/        CLI parsing (clap, bhyve flag-compatible)
+  crates/vmm-core/          VmmHdl, PhysMap, MemCtx, Vcpu, CPUID masking, MsrHandler
+  crates/vmm-machine/       Device-agnostic machine construction. Names no driver
+  crates/vmm-boot/          Direct bzImage and PVH kernel loading
+  crates/vmm-devices/       Base: PCI, chipset, ACPI, fw_cfg, SMBIOS, UART, pvpanic
+  crates/vmm-virtio/        virtio transport and queues: blk, viona, rng, console, fs
+  crates/vmm-config/        CLI parsing (clap, bhyve flag-compatible), shared
+
+  crates/vmm-storage/       AHCI and NVMe                      rshyve only
+  crates/vmm-hid/           xHCI, PS/2, framebuffer            rshyve only
+  crates/vmm-passthru/      PCI passthrough                    rshyve only
+  crates/vmm-migrate/       Migration protocol and state       rshyve only
+  crates/vmm-hyperv/        Hyper-V enlightenments             rshyve only
+  crates/vmm-tpm/           vTPM 2.0 over libtpms              rshyve only
 ```
+
+`bin/firehyve` has no dependency path to the five rshyve-only crates.
+CI enforces that with `cargo-deny` scoped to that binary, so the
+microVM cannot regain the parity attack surface by accident.
 
 ## Phase status
 
@@ -48,8 +65,8 @@ vmmnew/
 
 ## Remaining work for platform image
 
-- Build integration (Cargo release build into platform image at /usr/sbin/vmm)
-- boot.c modification to exec `vmm` instead of `bhyve`
+- Build integration (Cargo release build into platform image at /usr/sbin/rshyve)
+- boot.c modification to exec `rshyve` instead of `bhyve`
 - AHCI native implementation (currently falls back to virtio-blk)
 - FPU/XSAVE state transfer during migration
 - Large VM testing (>32 GB RAM, >16 vCPUs)
@@ -63,10 +80,10 @@ cargo test
 # SmartOS headnode (actual VM execution)
 ssh root@<headnode>
 export PATH=/opt/tools/bin:$PATH
-cd /opt/vmmnew && cargo build --release
+cd /opt/rust-bhyve && cargo build --release
 
 # Boot Ubuntu 24.04 from ZFS zvol with networking
-./target/release/vmm -H -c 2 -m 1G \
+./target/release/rshyve -H -c 2 -m 1G \
   -s 0,hostbridge \
   -s 4,nvme,/dev/zvol/dsk/zones/vmm-test-disk \
   -s 6,virtio-net-viona,vmm_test0 \
@@ -78,11 +95,11 @@ cd /opt/vmmnew && cargo build --release
   testvm
 
 # Live migration (source)
-./target/release/vmm ... --track-dirty --control-socket /tmp/vm.sock testvm
+./target/release/rshyve ... --track-dirty --control-socket /tmp/vm.sock testvm
 echo '{"command":"migrate-source","target_addr":"dest:4567"}' | socat - UNIX-CONNECT:/tmp/vm.sock
 
 # Live migration (destination)
-./target/release/vmm ... --track-dirty --migrate-listen 0.0.0.0:4567 testvm
+./target/release/rshyve ... --track-dirty --migrate-listen 0.0.0.0:4567 testvm
 ```
 
 ## Documentation

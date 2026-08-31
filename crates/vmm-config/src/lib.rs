@@ -39,7 +39,7 @@ pub fn parse_mem_size(s: &str) -> anyhow::Result<usize> {
 
 /// New Rust-based bhyve VMM with live migration support.
 #[derive(Parser, Debug)]
-#[command(name = "vmm", about)]
+#[command(about)]
 pub struct Cli {
     /// CPU count or topology: N or cpus=N,sockets=M,cores=C,threads=T
     #[arg(short = 'c')]
@@ -107,7 +107,8 @@ pub struct Cli {
     #[arg(long = "no-track-dirty", action = clap::ArgAction::SetTrue)]
     pub no_track_dirty: bool,
 
-    /// Direct boot: Linux kernel bzImage path (bypasses UEFI firmware)
+    /// Direct boot: kernel image, a Linux bzImage or a PVH ELF.
+    /// The protocol is read from the file (bypasses UEFI firmware)
     #[arg(long)]
     pub kernel: Option<PathBuf>,
 
@@ -176,7 +177,7 @@ pub struct Cli {
     pub vtpm: bool,
 
     /// Directory for the vTPM's persistent NV state. Defaults to
-    /// `/var/db/vmm/<vm_name>/tpm`. The directory is created if
+    /// `/var/db/rshyve/<vm_name>/tpm`. The directory is created if
     /// missing; existing state is reused so guest TPM keys survive
     /// VMM restarts.
     #[arg(long)]
@@ -187,6 +188,22 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Build the clap command presenting `name` as the program name.
+    ///
+    /// One derive serves two binaries, so the program name cannot be
+    /// baked into the attribute.
+    pub fn command_named(name: &'static str) -> clap::Command {
+        use clap::CommandFactory;
+        Self::command().name(name).bin_name(name)
+    }
+
+    /// Parse argv, presenting `name` in help output and error messages.
+    pub fn parse_named(name: &'static str) -> Self {
+        use clap::FromArgMatches;
+        let matches = Self::command_named(name).get_matches();
+        Self::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+    }
+
     /// Parse the CPU count from the -c argument.
     ///
     /// Returns an error if the argument is present but unparseable.
@@ -243,5 +260,30 @@ mod tests {
         assert!(parse_mem_size("").is_err());
         assert!(parse_mem_size("abc").is_err());
         assert!(parse_mem_size("-1M").is_err());
+    }
+
+    #[test]
+    fn parse_named_uses_the_binary_name() {
+        use clap::FromArgMatches;
+        let matches = Cli::command_named("firehyve")
+            .try_get_matches_from([
+                "firehyve", "-c", "2", "-m", "512M", "guest",
+            ])
+            .expect("valid argv parses");
+        let cli = Cli::from_arg_matches(&matches).expect("from_arg_matches");
+        assert_eq!(cli.vm_name, "guest");
+        assert_eq!(cli.num_cpus().unwrap(), 2);
+        assert_eq!(cli.mem_size().unwrap(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_named_reports_the_binary_name_in_errors() {
+        let err = Cli::command_named("firehyve")
+            .try_get_matches_from(["firehyve"])
+            .expect_err("vm_name is required");
+        assert!(
+            err.to_string().contains("firehyve"),
+            "error should name the binary, got: {err}"
+        );
     }
 }

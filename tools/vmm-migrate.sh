@@ -37,7 +37,7 @@ set -o pipefail
 SSH_KEY="${VMM_LAB_KEY:-}"   # required; pass --ssh-key or set VMM_LAB_KEY
 MIGRATE_PORT=4567
 MAX_SYNCS=3
-VMM_BIN_SRC="/opt/vmmnew/target/release/vmm"
+VMM_BIN_SRC="/opt/rust-bhyve/target/release/rshyve"
 VMM_BIN_DST="/opt/vmm-new"
 SNAP_PREFIX="vmm-mig"
 
@@ -140,7 +140,7 @@ $SSH root@${SRC_HOST} "zfs destroy ${SRC_DATASET}@${LAST_SNAP}" 2>/dev/null || t
 
 log "Phase 4: Starting destination VMM on ${DST_HOST}"
 
-$SSH root@${DST_HOST} "pkill -9 vmm 2>/dev/null; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null; true"
+$SSH root@${DST_HOST} "pkill -9 rshyve 2>/dev/null; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null; true"
 sleep 2
 
 $SSH root@${DST_HOST} "nohup ${VMM_BIN_DST} ${VMM_ARGS} \
@@ -203,4 +203,4 @@ log "  RAM migration: $(( MIG_END - MIG_START ))s"
 log "  Destination VMM running on ${DST_HOST}"
 log ""
 log "  Verify: ssh -i ${SSH_KEY} root@${DST_HOST} 'tail -5 /tmp/vmm-dest.log'"
-log "  Cleanup source: ssh -i ${SSH_KEY} root@${SRC_HOST} 'pkill -9 vmm; /usr/sbin/bhyvectl --vm=testvm --destroy'"
+log "  Cleanup source: ssh -i ${SSH_KEY} root@${SRC_HOST} 'pkill -9 rshyve; /usr/sbin/bhyvectl --vm=testvm --destroy'"

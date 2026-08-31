@@ -32,10 +32,18 @@ they read `ssh $VMM_HEADNODE ...` rather than `ssh root@$VMM_HEADNODE`.
 
 ### Build on Headnode
 
-```bash
-rsync -az --checksum --exclude target $VMM_SRC/ $VMM_HEADNODE:/opt/vmmnew/
+Do this one time if the host still holds the checkout with its old name.
+An rsync to the new path does not move the old `target/` cache, and a
+full rebuild on this host is slow.
 
-ssh $VMM_HEADNODE 'cd /opt/vmmnew && export PATH=/opt/tools/bin:$PATH && cargo build --release 2>&1 | tail -1'
+```bash
+ssh $VMM_HEADNODE 'test -d /opt/rust-bhyve || mv /opt/vmmnew /opt/rust-bhyve'
+```
+
+```bash
+rsync -az --checksum --exclude target $VMM_SRC/ $VMM_HEADNODE:/opt/rust-bhyve/
+
+ssh $VMM_HEADNODE 'cd /opt/rust-bhyve && export PATH=/opt/tools/bin:$PATH && cargo build --release 2>&1 | tail -1'
 ```
 
 Note: rsync may not update timestamps. Use `--checksum` or `touch` changed files before `cargo build` to force recompilation.
@@ -43,9 +51,9 @@ Note: rsync may not update timestamps. Use `--checksum` or `touch` changed files
 ### Boot a Test VM
 
 ```bash
-ssh $VMM_HEADNODE 'pkill -9 vmm; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null; sleep 1; \
+ssh $VMM_HEADNODE 'pkill -9 rshyve; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null; sleep 1; \
 zfs rollback zones/vmm-test-disk@final 2>/dev/null; \
-nohup /opt/vmmnew/target/release/vmm \
+nohup /opt/rust-bhyve/target/release/rshyve \
   -H -c 2 -m 1G \
   -s 0,hostbridge -s 4,virtio-blk,/dev/zvol/dsk/zones/vmm-test-disk \
   -s 6,virtio-net-viona,vmm_test0 -s 31,lpc \
@@ -88,7 +96,7 @@ ssh -i $VMM_LAB_KEY -o StrictHostKeyChecking=no root@$VMM_GUEST_IP "COMMAND"
 
 ```bash
 # Process status
-ssh $VMM_HEADNODE 'ps -ef | grep "[v]mm.*testvm"'
+ssh $VMM_HEADNODE 'ps -ef | grep "[r]shyve.*testvm"'
 
 # Boot log
 ssh $VMM_HEADNODE 'tail -10 /tmp/vmm-test.log'
@@ -149,9 +157,22 @@ ssh $VMM_HEADNODE 'export PATH=/opt/tools/bin:$PATH; \
 ### Cleanup Test VMs
 
 ```bash
-ssh $VMM_HEADNODE 'pkill -9 vmm; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null'
-ssh -i $VMM_LAB_KEY $VMM_MIGRATE_HOST 'pkill -9 vmm; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null'
+ssh $VMM_HEADNODE 'pkill -9 rshyve; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null'
+ssh -i $VMM_LAB_KEY $VMM_MIGRATE_HOST 'pkill -9 rshyve; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null'
 ```
+
+### Boot-Time Profiling
+
+DTrace harness and recorded baselines for the two direct-boot paths.
+Needs a global zone: the harness reads a kernel probe.
+
+```sh
+export VMM_PROFILE_BIN=/opt/rust-bhyve/target/release/firehyve
+tools/profile/run.sh -d 10 -o /var/tmp/pvh -- <vmm-argv...>
+```
+
+See [tools/profile/README.md](../tools/profile/README.md) and
+[boot-baseline.md](boot-baseline.md).
 
 ### Sync to Build Host
 
@@ -213,7 +234,7 @@ To boot Windows Setup with the install ISO exposed as a CD-ROM, replace the
 fixed NVMe ISO namespace in the harness command with this attachment:
 
 ```bash
-/opt/vmmnew/target/release/vmm -H -c 2 -m 4G \
+/opt/rust-bhyve/target/release/rshyve -H -c 2 -m 4G \
   -s 0,hostbridge -s 4,nvme,/tmp/wintest.img \
   -s 5,ahci-cd,/opt/winassets/winsrv2025-eval.iso \
   -s 31,lpc -l bootrom,/usr/share/bhyve/uefi-rom.bin -l com1,stdio wintest
@@ -232,16 +253,16 @@ exit
 For the Server 2025 evaluation ISO, `list volume` should report
 `SSS_X64FREE`, `UDF`, `CD-ROM`, and `Healthy` on the mounted volume.
 
-The build host is `$VMM_BUILD_HOST`, with sources at `/opt/vmmnew`. Cargo is
+The build host is `$VMM_BUILD_HOST`, with sources at `/opt/rust-bhyve`. Cargo is
 in **`/opt/local/bin`** on this host, not `/opt/tools/bin` (the headnode path).
 
 Only one bhyve VM may exist at a time in that zone. A second `VM_CREATE` returns
-`EINVAL`, and killing `vmm` leaks its instance. Before starting, check
+`EINVAL`, and killing `rshyve` leaks its instance. Before starting, check
 `ls /dev/vmm/` and destroy any stale instance with
 `bhyvectl --vm=<name> --destroy`.
 
 When killing the VMM by command line, always bracket a letter:
-`pkill -9 -f 'relea[s]e/vmm'`. Without the brackets, `pkill` matches its own ssh
+`pkill -9 -f 'rshyv[e]'`. Without the brackets, `pkill` matches its own ssh
 command line, kills the session, and ssh returns 255. illumos does not provide
 `setsid`; use `nohup ... </dev/null &` instead.
 
@@ -302,7 +323,7 @@ Measured baseline as of commit `212a83c` (known-broken behavior this harness is
 intended to catch):
 
 - Boot logs contain `WARN failed to register reset handler, error: would conflict with existing entry`.
-- The EFI Shell `reset` command leaves the `vmm` process alive and the guest wedged.
+- The EFI Shell `reset` command leaves the `rshyve` process alive and the guest wedged.
 - OVMF falls through from the hardcoded slot-4 bootorder entry to slot 5, which is how the ISO boots.
 
 ### Common Issues

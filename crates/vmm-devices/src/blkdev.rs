@@ -21,6 +21,22 @@
 use std::io;
 use std::os::fd::RawFd;
 
+/// Platform-appropriate data sync for block-device flush operations.
+///
+/// This lives with `DiskCache` because both own the raw backing fd, and
+/// because virtio-blk and NVMe each call it directly.
+#[cfg(target_os = "illumos")]
+pub fn datasync(fd: RawFd) -> i32 {
+    // SAFETY: the caller holds `fd` open for the duration of the call.
+    unsafe { libc::fdatasync(fd) }
+}
+
+#[cfg(not(target_os = "illumos"))]
+pub fn datasync(fd: RawFd) -> i32 {
+    // SAFETY: the caller holds `fd` open for the duration of the call.
+    unsafe { libc::fsync(fd) }
+}
+
 #[cfg(target_os = "illumos")]
 const DKIOC: libc::c_int = 0x04 << 8; // 0x0400
 #[cfg(target_os = "illumos")]

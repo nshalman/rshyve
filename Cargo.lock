@@ -379,10 +379,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
+name = "fhrun"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "vmm_config",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "firehyve"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "slog",
+ "slog-async",
+ "slog-term",
+ "usdt",
+ "vmm_boot",
+ "vmm_config",
+ "vmm_core",
+ "vmm_devices",
+ "vmm_machine",
+ "vmm_virtio",
+]
 
 [[package]]
 name = "foldhash"
@@ -1099,6 +1129,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "rshyve"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bhyve_api",
+ "clap",
+ "libc",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "slog",
+ "slog-async",
+ "slog-term",
+ "thiserror 1.0.69",
+ "tokio",
+ "usdt",
+ "viona_api",
+ "vmm_boot",
+ "vmm_config",
+ "vmm_core",
+ "vmm_devices",
+ "vmm_hid",
+ "vmm_hyperv",
+ "vmm_machine",
+ "vmm_migrate",
+ "vmm_passthru",
+ "vmm_storage",
+ "vmm_tpm",
+ "vmm_virtio",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1745,33 +1807,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vmm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bhyve_api",
- "clap",
- "futures",
- "libc",
- "memmap2",
- "serde",
- "serde_json",
- "slog",
- "slog-async",
- "slog-term",
- "thiserror 1.0.69",
- "tokio",
- "usdt",
- "viona_api",
- "vmm_config",
- "vmm_core",
- "vmm_devices",
- "vmm_hyperv",
- "vmm_migrate",
- "vmm_tpm",
-]
-
-[[package]]
 name = "vmm-migrate-agent"
 version = "0.1.0"
 dependencies = [
@@ -1786,6 +1821,17 @@ name = "vmm_api_common"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "vmm_boot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bhyve_api",
+ "memmap2",
+ "vmm_core",
+ "vmm_devices",
 ]
 
 [[package]]
@@ -1820,21 +1866,36 @@ name = "vmm_devices"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bhyve_api",
+ "bitflags",
+ "erased-serde 0.4.10",
+ "libc",
+ "serde",
+ "slog",
+ "tempfile",
+ "thiserror 1.0.69",
+ "vmm_core",
+ "vmm_metrics",
+]
+
+[[package]]
+name = "vmm_devices_testsupport"
+version = "0.1.0"
+
+[[package]]
+name = "vmm_hid"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "ascii",
  "bhyve_api",
  "bitflags",
  "des",
- "erased-serde 0.4.10",
- "futures",
  "libc",
- "serde",
- "serde_json",
  "slog",
- "tempfile",
- "thiserror 1.0.69",
  "usdt",
- "viona_api",
  "vmm_core",
+ "vmm_devices",
 ]
 
 [[package]]
@@ -1847,6 +1908,28 @@ dependencies = [
  "slog",
  "thiserror 1.0.69",
  "vmm_core",
+]
+
+[[package]]
+name = "vmm_machine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bhyve_api",
+ "libc",
+ "slog",
+ "usdt",
+ "vmm_config",
+ "vmm_core",
+ "vmm_devices",
+]
+
+[[package]]
+name = "vmm_metrics"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1865,8 +1948,30 @@ dependencies = [
  "tokio-tungstenite",
  "tungstenite",
  "vmm_core",
- "vmm_devices",
  "zstd",
+]
+
+[[package]]
+name = "vmm_passthru"
+version = "0.1.0"
+dependencies = [
+ "bhyve_api",
+ "libc",
+ "vmm_core",
+ "vmm_devices",
+]
+
+[[package]]
+name = "vmm_storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "slog",
+ "tempfile",
+ "vmm_core",
+ "vmm_devices",
+ "vmm_devices_testsupport",
 ]
 
 [[package]]
@@ -1885,6 +1990,22 @@ name = "vmm_tpm_sys"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "vmm_virtio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "slog",
+ "tempfile",
+ "thiserror 1.0.69",
+ "usdt",
+ "viona_api",
+ "vmm_core",
+ "vmm_devices",
+ "vmm_devices_testsupport",
 ]
 
 [[package]]
