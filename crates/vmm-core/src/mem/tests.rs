@@ -690,8 +690,8 @@ fn the_boot_and_run_time_paths_share_one_overlap_rule() {
         1,
         "check_free is called from one place",
     );
-    // add_rom_with_ram_tail takes two, and add_region, claim_ram and
-    // add_region_anon one each.
+    // add_rom_with_ram_tail takes two, and add_region, claim_ram,
+    // add_region_anon and add_region_split_anon one each.
     assert_eq!(
         src.matches("fn claim(").count(),
         1,
@@ -699,7 +699,7 @@ fn the_boot_and_run_time_paths_share_one_overlap_rule() {
     );
     assert_eq!(
         src.matches("self.claim(").count(),
-        5,
+        6,
         "every path that takes a range goes through claim",
     );
 }
@@ -733,4 +733,102 @@ fn a_segid_that_was_never_used_goes_back() {
     assert!(full.release(VM_MAX_MEMSEGS - 1));
     assert_eq!(full.alloc(), Some(VM_MAX_MEMSEGS - 1));
     assert!(!full.release(i32::MAX));
+}
+
+#[test]
+fn lookup_hands_out_the_tracked_view() {
+    // Every device write to guest RAM goes through `lookup`. The kernel
+    // marks a page dirty only when the write goes through the guest
+    // physical mapping, so a `lookup` that hands out the devmem mapping
+    // loses that page from a live migration.
+    let map = PhysMap::new();
+    map.add_region_split_anon(0, 0x2000).unwrap();
+
+    map.lookup(0, 4)
+        .unwrap()
+        .write_bytes(&[1, 2, 3, 4])
+        .unwrap();
+
+    let mut tracked = [0u8; 4];
+    map.lookup(0, 4).unwrap().read_bytes(&mut tracked).unwrap();
+    assert_eq!(tracked, [1, 2, 3, 4]);
+
+    // The two views of a split anonymous region do not alias, which is
+    // what lets a test tell them apart. A real VM maps the same pages
+    // twice, so both views read the same bytes there.
+    let mut direct = [0u8; 4];
+    map.lookup_untracked(0, 4)
+        .unwrap()
+        .read_bytes(&mut direct)
+        .unwrap();
+    assert_eq!(direct, [0, 0, 0, 0]);
+}
+
+#[test]
+fn the_boot_loaders_write_through_the_untracked_view() {
+    // `write_bulk` and `load_from_file` run before any vCPU starts, so
+    // they have nothing to report to migration and take the cheaper
+    // devmem mapping.
+    let map = Arc::new(PhysMap::new());
+    map.add_region_split_anon(0, 0x2000).unwrap();
+    let mem = MemCtx::new(Arc::clone(&map));
+
+    mem.write_bulk(0, &[7; 8]).unwrap();
+
+    let mut direct = [0u8; 8];
+    map.lookup_untracked(0, 8)
+        .unwrap()
+        .read_bytes(&mut direct)
+        .unwrap();
+    assert_eq!(direct, [7; 8]);
+
+    let mut tracked = [0u8; 8];
+    map.lookup(0, 8).unwrap().read_bytes(&mut tracked).unwrap();
+    assert_eq!(tracked, [0; 8]);
+}
+
+#[test]
+fn a_bulk_read_of_guest_memory_leaves_the_tracked_view_alone() {
+    // A read fault on the tracked mapping marks the page dirty, because
+    // `segvmm_fault_space` holds every page writable. The migration
+    // source reads all of RAM each pass, so a tracked read would report
+    // all of RAM dirty again and the migration would never converge.
+    let map = Arc::new(PhysMap::new());
+    map.add_region_split_anon(0, 0x2000).unwrap();
+    let mem = MemCtx::new(Arc::clone(&map));
+
+    map.lookup(0, 4)
+        .unwrap()
+        .write_bytes(&[9, 9, 9, 9])
+        .unwrap();
+    map.lookup_untracked(0, 4)
+        .unwrap()
+        .write_bytes(&[1, 2, 3, 4])
+        .unwrap();
+
+    let mut got = [0u8; 4];
+    mem.read(0, &mut got).unwrap();
+    assert_eq!(got, [1, 2, 3, 4]);
+}
+
+#[test]
+fn a_rom_region_stays_writable_through_lookup() {
+    // The guest cannot write a ROM, so there is nothing to track there,
+    // and the bootrom loader needs the writable view that `lookup` has
+    // always returned.
+    let map = PhysMap::new();
+    map.add_region_anon(0x1000, 0x1000, RegionKind::Rom)
+        .unwrap();
+
+    map.lookup(0x1000, 4)
+        .unwrap()
+        .write_bytes(&[1, 2, 3, 4])
+        .unwrap();
+
+    let mut got = [0u8; 4];
+    map.lookup_untracked(0x1000, 4)
+        .unwrap()
+        .read_bytes(&mut got)
+        .unwrap();
+    assert_eq!(got, [1, 2, 3, 4]);
 }

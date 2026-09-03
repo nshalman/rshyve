@@ -17,6 +17,28 @@
 //!
 //! The lifetime of a [`SubMapping`] is bounded by the `Mapping` it
 //! borrows from, preventing use-after-unmap.
+//!
+//! # Why every region is mapped twice
+//!
+//! The kernel gives two ways to reach the pages of a memory segment,
+//! and they do not behave the same.
+//!
+//! A mapping of the guest physical address space (`vm_segmap_space` in
+//! `uts/intel/io/vmm/vmm_vm.c`) faults through `segvmm_fault_space`,
+//! which holds each page with `vmc_hold` and releases it with
+//! `vmp_release`. That release is the one place that sets the dirty bit
+//! in the nested page tables, and the dirty bitmap is all that live
+//! migration has to find pages the VMM changed.
+//!
+//! A mapping of the devmem object (`vm_segmap_obj`) faults through
+//! `segvmm_fault_obj`, which does a bare `hat_devload` on the raw page
+//! frame. The kernel never sees a write through it.
+//!
+//! So each region keeps both: [`PhysMap::lookup`] hands out the tracked
+//! view for device emulation, and [`PhysMap::lookup_untracked`] hands
+//! out the devmem view for the boot-image loaders, which run before any
+//! vCPU and before a migration can start. This mirrors Propolis, whose
+//! `map_guest` and `map_seg` pair this is adapted from.
 
 use std::io::{Error, ErrorKind, Result};
 use std::sync::{Arc, RwLock};
@@ -24,10 +46,16 @@ use std::sync::{Arc, RwLock};
 use crate::common::PAGE_SIZE;
 use crate::hdl::VmmHdl;
 
+mod ctx;
+mod devmem;
 mod mapping;
+mod segid;
 
+pub use ctx::MemCtx;
+pub use devmem::DevMemSeg;
 use mapping::Mapping;
 pub use mapping::{Prot, SubMapping};
+pub use segid::{SegidAlloc, VM_MAX_MEMSEGS};
 
 /// Type of a guest physical memory region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,9 +76,25 @@ struct Region {
     /// Kernel segment ID, used for migration state export.
     #[allow(dead_code)]
     segid: i32,
-    /// Full R/W mapping of the memory segment, used by the VMM for
-    /// device emulation and migration.
-    mapping: Arc<Mapping>,
+    /// Mapping of the guest physical address space. A write through
+    /// this one is what the kernel marks dirty. See the module comment.
+    tracked: Arc<Mapping>,
+    /// Mapping of the memory segment itself. Always writable, and
+    /// outside the kernel's dirty tracking.
+    direct: Arc<Mapping>,
+}
+
+impl Region {
+    /// The first guest address past this region.
+    fn end(&self) -> u64 {
+        self.gpa + self.len as u64
+    }
+}
+
+/// The two host mappings of one region.
+struct RegionViews {
+    tracked: Arc<Mapping>,
+    direct: Arc<Mapping>,
 }
 
 /// Start of the 32-bit MMIO hole.
@@ -135,21 +179,9 @@ impl PhysMap {
     /// kernel VM, which is unavailable on non-illumos test hosts.
     #[doc(hidden)]
     pub fn new_anon(gpa: u64, len: usize) -> Result<Self> {
-        let _ = region_end(gpa, len)?;
-
-        Ok(Self {
-            space: RwLock::new(AddressSpace {
-                regions: vec![Region {
-                    gpa,
-                    len,
-                    kind: RegionKind::Ram,
-                    segid: -1,
-                    mapping: Arc::new(Mapping::anon(len)?),
-                }],
-                claims: Vec::new(),
-            }),
-            next_segid: 0,
-        })
+        let map = Self::new();
+        map.add_region_anon(gpa, len, RegionKind::Ram)?;
+        Ok(map)
     }
 
     /// Next unused kernel memory-segment ID.
@@ -356,6 +388,9 @@ impl PhysMap {
     ///
     /// Tests on a host with no kernel VM need real `lookup` boundaries.
     /// This is the multi-region form of [`Self::new_anon`].
+    ///
+    /// Both views share one buffer, as they alias the same pages on a
+    /// real VM.
     #[doc(hidden)]
     pub fn add_region_anon(
         &self,
@@ -366,7 +401,39 @@ impl PhysMap {
         let claim =
             self.claim(gpa, len, kind, Prot::RWX, Placement::Firmware)?;
         let mapping = Arc::new(Mapping::anon(len)?);
-        self.publish_claim(claim, -1, mapping);
+        self.publish_claim(
+            claim,
+            -1,
+            RegionViews {
+                tracked: Arc::clone(&mapping),
+                direct: mapping,
+            },
+        );
+        Ok(())
+    }
+
+    /// Publish an anonymous region whose two views do not alias.
+    ///
+    /// Only this makes the two views tell apart without a kernel VM. A
+    /// real VM maps the same pages twice, so nothing outside a test may
+    /// depend on the views holding different bytes.
+    #[cfg(test)]
+    fn add_region_split_anon(&self, gpa: u64, len: usize) -> Result<()> {
+        let claim = self.claim(
+            gpa,
+            len,
+            RegionKind::Ram,
+            Prot::RWX,
+            Placement::Firmware,
+        )?;
+        self.publish_claim(
+            claim,
+            -1,
+            RegionViews {
+                tracked: Arc::new(Mapping::anon(len)?),
+                direct: Arc::new(Mapping::anon(len)?),
+            },
+        );
         Ok(())
     }
 
@@ -379,7 +446,7 @@ impl PhysMap {
         &self,
         mut claim: RamClaim<'_>,
         segid: i32,
-        mapping: Arc<Mapping>,
+        views: RegionViews,
     ) {
         let mut space = self.write_space();
         if let Some(idx) =
@@ -401,7 +468,8 @@ impl PhysMap {
                 len: claim.len,
                 kind: claim.kind,
                 segid,
-                mapping,
+                tracked: views.tracked,
+                direct: views.direct,
             },
         );
     }
@@ -419,7 +487,32 @@ impl PhysMap {
     ///
     /// The returned SubMapping is offset to start at `gpa` with length
     /// `len`. Returns `None` if no region contains the full range.
+    ///
+    /// This is the view every device gets. Writes through it are
+    /// visible to the kernel's dirty page tracking, which is what live
+    /// migration reads. See the module comment.
     pub fn lookup(&self, gpa: u64, len: usize) -> Option<SubMapping> {
+        self.lookup_view(gpa, len, |region| &region.tracked)
+    }
+
+    /// Look up a range in the mapping of the memory segment itself.
+    ///
+    /// The kernel does not see writes through this view, so a live
+    /// migration would leave the page behind. Only for writes that
+    /// finish before any vCPU runs, and for reads, which must not
+    /// disturb the dirty bitmap. Propolis calls this pair
+    /// `direct_writable_region` and `direct_readable_region`.
+    pub fn lookup_untracked(&self, gpa: u64, len: usize) -> Option<SubMapping> {
+        self.lookup_view(gpa, len, |region| &region.direct)
+    }
+
+    /// Shared body of [`Self::lookup`] and [`Self::lookup_untracked`].
+    fn lookup_view(
+        &self,
+        gpa: u64,
+        len: usize,
+        pick: fn(&Region) -> &Arc<Mapping>,
+    ) -> Option<SubMapping> {
         let end = gpa.checked_add(len as u64)?;
 
         // The guard is released when this call returns: `SubMapping` owns
@@ -432,7 +525,7 @@ impl PhysMap {
             .binary_search_by(|r| {
                 if gpa < r.gpa {
                     std::cmp::Ordering::Greater
-                } else if gpa >= r.gpa + r.len as u64 {
+                } else if gpa >= r.end() {
                     std::cmp::Ordering::Less
                 } else {
                     std::cmp::Ordering::Equal
@@ -441,15 +534,14 @@ impl PhysMap {
             .ok()?;
 
         let region = &space.regions[idx];
-        let r_end = region.gpa + region.len as u64;
 
         // Verify the entire requested range falls within this region
-        if end > r_end {
+        if end > region.end() {
             return None;
         }
 
         let offset = (gpa - region.gpa) as usize;
-        SubMapping::new(&region.mapping).subregion(offset, len)
+        SubMapping::new(pick(region)).subregion(offset, len)
     }
 
     /// Get a summary of all memory regions (for migration/diagnostics).
@@ -520,14 +612,24 @@ impl RamClaim<'_> {
         }
         let (map, gpa, len) = (self.map, self.gpa, self.len);
 
+        // The tracked mapping comes before the kernel mapping. The
+        // kernel faults its pages in one at a time on first use, so a
+        // mapping of guest addresses that are not backed yet is legal,
+        // and one that cannot be made costs nothing to abandon.
+        let tracked = tracked_view(hdl, gpa, len, self.kind, self.guest_prot)?;
+
         hdl.map_memseg(segid, gpa, len, segoff, self.guest_prot)?;
 
         // The guest can reach the memory from here on, so a failure has
         // to take the mapping back out. A guest mapping the physical map
         // does not know about would be handed out a second time.
-        match host_view(hdl, segid, segoff, len) {
-            Ok(mapping) => {
-                map.publish_claim(self, segid, mapping);
+        match devmem_view(hdl, segid, segoff, len) {
+            Ok(direct) => {
+                // A region the guest cannot write has nothing to track,
+                // and the bootrom loader needs `lookup` to stay
+                // writable, so it keeps one view.
+                let tracked = tracked.unwrap_or_else(|| Arc::clone(&direct));
+                map.publish_claim(self, segid, RegionViews { tracked, direct });
                 Ok(())
             }
             Err(e) => match hdl.munmap_memseg(gpa, len) {
@@ -547,8 +649,11 @@ impl RamClaim<'_> {
     }
 }
 
-/// Map a region into this process, for device emulation.
-fn host_view(
+/// Map the memory segment itself into this process.
+///
+/// The kernel does not track writes through this mapping. See the
+/// module comment.
+fn devmem_view(
     hdl: &VmmHdl,
     segid: i32,
     segoff: i64,
@@ -559,6 +664,31 @@ fn host_view(
         Error::new(ErrorKind::InvalidInput, "device memory offset overflows")
     })?;
     Ok(Arc::new(Mapping::new(len, Prot::RW, hdl, offset)?))
+}
+
+/// Map a slice of the guest physical address space into this process.
+///
+/// This is the view the kernel tracks. `None` for a region the guest
+/// cannot write: there is nothing to track, and the mapping would carry
+/// the guest's own read-only protection, which the bootrom loader needs
+/// `lookup` not to have.
+fn tracked_view(
+    hdl: &VmmHdl,
+    gpa: u64,
+    len: usize,
+    kind: RegionKind,
+    guest_prot: Prot,
+) -> Result<Option<Arc<Mapping>>> {
+    if kind != RegionKind::Ram {
+        return Ok(None);
+    }
+    let offset = i64::try_from(gpa).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("guest address {gpa:#x} exceeds i64"),
+        )
+    })?;
+    Ok(Some(Arc::new(Mapping::new(len, guest_prot, hdl, offset)?)))
 }
 
 impl Drop for RamClaim<'_> {
@@ -599,280 +729,6 @@ fn overlaps(gpa: u64, end: u64, o_gpa: u64, o_end: u64, what: &str) -> Error {
              [{o_gpa:#x}, {o_end:#x})",
         ),
     )
-}
-
-/// `VM_MAX_MEMSEGS` from illumos `uts/intel/io/vmm/vmm.c`.
-pub const VM_MAX_MEMSEGS: i32 = 5;
-
-/// Hands out kernel memory-segment IDs after the [`PhysMap`] is sealed.
-///
-/// This does not live in `PhysMap` because `MachineSetup::finalize` freezes
-/// that map before devices are constructed.
-pub struct SegidAlloc {
-    next: std::sync::atomic::AtomicI32,
-}
-
-impl SegidAlloc {
-    /// Start allocating at the next unused segment ID from [`PhysMap`].
-    pub fn new(start: i32) -> Self {
-        Self {
-            next: std::sync::atomic::AtomicI32::new(start),
-        }
-    }
-
-    /// Give back an ID whose segment was never created.
-    ///
-    /// Only the ID handed out last can come back, which is all a failed
-    /// allocation needs. Reports whether it was taken: another caller
-    /// may have allocated in between, and then the ID stays spent.
-    ///
-    /// Never call this for a segment `VM_ALLOC_MEMSEG` created. The
-    /// kernel has no ioctl that frees one, so reusing the ID would
-    /// answer `EEXIST` or, worse, hand out memory that is already in
-    /// use.
-    pub fn release(&self, segid: i32) -> bool {
-        let Some(next) = segid.checked_add(1) else {
-            return false;
-        };
-        self.next
-            .compare_exchange(
-                next,
-                segid,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_ok()
-    }
-
-    /// Allocate a segment ID, or return `None` at the kernel limit.
-    ///
-    /// Reporting exhaustion here gives startup a useful error instead
-    /// of an unexplained `EINVAL` from `VM_ALLOC_MEMSEG`.
-    pub fn alloc(&self) -> Option<i32> {
-        self.next
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |next| {
-                    if next < VM_MAX_MEMSEGS {
-                        Some(next + 1)
-                    } else {
-                        None
-                    }
-                },
-            )
-            .ok()
-    }
-}
-
-/// A named bhyve memory segment whose guest mapping is under device control.
-///
-/// A device BAR backed by this segment is served by EPT without an MMIO exit.
-/// This is required for wide stores because the kernel MMIO exit carries only
-/// one `u64` and cannot represent a 16-byte framebuffer store.
-pub struct DevMemSeg {
-    segid: i32,
-    len: usize,
-    host: Arc<Mapping>,
-    hdl: Option<Arc<VmmHdl>>,
-    mapped_gpa: std::sync::Mutex<Option<u64>>,
-}
-
-impl DevMemSeg {
-    /// Allocate the segment and map only its host view.
-    pub fn new(
-        hdl: Arc<VmmHdl>,
-        segid: i32,
-        name: &str,
-        len: usize,
-    ) -> Result<Self> {
-        hdl.create_memseg(segid, len, name)?;
-        let offset = hdl.devmem_offset(segid)?;
-        let host = Arc::new(Mapping::new(len, Prot::RW, &hdl, offset)?);
-
-        Ok(Self {
-            segid,
-            len,
-            host,
-            hdl: Some(hdl),
-            mapped_gpa: std::sync::Mutex::new(None),
-        })
-    }
-
-    /// Create anonymous backing without a guest for unit tests.
-    ///
-    /// [`Self::map_at`] and [`Self::unmap`] are no-ops for this segment.
-    #[doc(hidden)]
-    pub fn new_anon(len: usize) -> Result<Self> {
-        Ok(Self {
-            segid: -1,
-            len,
-            host: Arc::new(Mapping::anon(len)?),
-            hdl: None,
-            mapped_gpa: std::sync::Mutex::new(None),
-        })
-    }
-
-    /// Length of the memory segment in bytes.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Whether the memory segment is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Return a guest-visible view of the host mapping.
-    pub fn view(&self) -> SubMapping {
-        SubMapping::new(&self.host)
-    }
-
-    /// Return the GPA where the segment is currently mapped, if any.
-    pub fn mapped_gpa(&self) -> Option<u64> {
-        *self
-            .mapped_gpa
-            .lock()
-            .expect("devmem mapping lock poisoned")
-    }
-
-    /// Map the segment into the guest physical address space.
-    ///
-    /// Mapping at the current GPA is idempotent. Kernel mapping errors are
-    /// returned because a guest-selected GPA may collide with another region.
-    pub fn map_at(&self, gpa: u64) -> Result<()> {
-        let Some(hdl) = &self.hdl else {
-            return Ok(());
-        };
-
-        let mut mapped = self
-            .mapped_gpa
-            .lock()
-            .expect("devmem mapping lock poisoned");
-        if *mapped == Some(gpa) {
-            return Ok(());
-        }
-
-        hdl.map_memseg(self.segid, gpa, self.len, 0, Prot::RW)?;
-        *mapped = Some(gpa);
-        Ok(())
-    }
-
-    /// Remove the segment's current guest mapping, if any.
-    ///
-    /// The recorded GPA and length are reused because the kernel requires the
-    /// pair to match the original mapping exactly.
-    pub fn unmap(&self) -> Result<()> {
-        let Some(hdl) = &self.hdl else {
-            return Ok(());
-        };
-
-        let Some(gpa) = self
-            .mapped_gpa
-            .lock()
-            .expect("devmem mapping lock poisoned")
-            .take()
-        else {
-            return Ok(());
-        };
-
-        hdl.munmap_memseg(gpa, self.len)
-    }
-}
-
-/// Context for accessing guest memory.
-///
-/// Wraps a shared reference to the PhysMap and provides convenience
-/// methods for reading/writing guest physical addresses.
-///
-/// All memory access is bounds-checked and uses volatile operations
-/// appropriate for concurrently-mutable guest memory.
-pub struct MemCtx {
-    map: Arc<PhysMap>,
-}
-
-impl MemCtx {
-    pub fn new(map: Arc<PhysMap>) -> Self {
-        Self { map }
-    }
-
-    /// Read bytes from guest memory at the given GPA.
-    ///
-    /// Returns an error if the GPA range is not mapped or not readable.
-    pub fn read(&self, gpa: u64, buf: &mut [u8]) -> Result<()> {
-        let sub = self.map.lookup(gpa, buf.len()).ok_or_else(|| {
-            Error::new(
-                ErrorKind::AddrNotAvailable,
-                format!("GPA {:#x} len {} not mapped", gpa, buf.len()),
-            )
-        })?;
-        sub.read_bytes(buf)
-    }
-
-    /// Write bytes to guest memory at the given GPA.
-    ///
-    /// Returns an error if the GPA range is not mapped or not writable.
-    pub fn write(&self, gpa: u64, data: &[u8]) -> Result<()> {
-        let sub = self.map.lookup(gpa, data.len()).ok_or_else(|| {
-            Error::new(
-                ErrorKind::AddrNotAvailable,
-                format!("GPA {:#x} len {} not mapped", gpa, data.len()),
-            )
-        })?;
-        sub.write_bytes(data)
-    }
-
-    /// Bulk write to guest memory at the given GPA.
-    ///
-    /// Uses [`SubMapping::copy_in`], so it carries that method's
-    /// constraint: only for writes no vCPU can observe partially. Meant
-    /// for the multi-megabyte boot-path writes, which all happen before
-    /// the vCPU threads start.
-    pub fn write_bulk(&self, gpa: u64, data: &[u8]) -> Result<()> {
-        let sub = self.map.lookup(gpa, data.len()).ok_or_else(|| {
-            Error::new(
-                ErrorKind::AddrNotAvailable,
-                format!("GPA {:#x} len {} not mapped", gpa, data.len()),
-            )
-        })?;
-        sub.copy_in(data)
-    }
-
-    /// Load `len` bytes at `file_offset` in `file` into guest memory at
-    /// `gpa`.
-    ///
-    /// The GPA range is validated as mapped and writable before any
-    /// byte is read, so a segment header cannot steer the read outside
-    /// guest RAM. Uses [`SubMapping::read_exact_from`] and carries its
-    /// constraint: only before the vCPU threads start.
-    pub fn load_from_file(
-        &self,
-        gpa: u64,
-        file: &std::fs::File,
-        file_offset: u64,
-        len: usize,
-    ) -> Result<()> {
-        let sub = self.map.lookup(gpa, len).ok_or_else(|| {
-            Error::new(
-                ErrorKind::AddrNotAvailable,
-                format!("GPA {gpa:#x} len {len} not mapped"),
-            )
-        })?;
-        sub.read_exact_from(file, file_offset, len)
-    }
-
-    /// Look up a GPA range and return a SubMapping for direct access.
-    ///
-    /// The returned SubMapping is lifetime-bounded to this MemCtx,
-    /// preventing use-after-unmap.
-    pub fn lookup(&self, gpa: u64, len: usize) -> Option<SubMapping> {
-        self.map.lookup(gpa, len)
-    }
-
-    /// Get all memory regions for migration dirty page tracking.
-    pub fn regions(&self) -> Vec<(u64, usize, RegionKind)> {
-        self.map.regions()
-    }
 }
 
 #[cfg(test)]
