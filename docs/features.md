@@ -63,7 +63,7 @@ Markers: **yes** works, **caveat** works with a condition named in the matching 
 | vTPM 2.0 (`--vtpm`) | caveat | reject | `crates/vmm-tpm/src/crb.rs`; `bin/firehyve/src/main.rs:53` |
 | Hyper-V enlightenments (`--hyperv`) | exp | reject | `crates/vmm-hyperv/src/lib.rs`; `main.rs:57` |
 | `--cpu-baseline` CPUID masking | yes | yes | `crates/vmm-core/src/cpuid.rs:32` |
-| PCI passthrough (`passthru,/dev/pptN`) | caveat | reject | `crates/vmm-passthru/`; `bin/rshyve/src/main.rs:1212` |
+| PCI passthrough (`passthru,/dev/pptN`) | caveat | reject | Intel only, no MSI-X device; `crates/vmm-passthru/`; `bin/rshyve/src/main.rs:1412` |
 | `virtio-rnd` | yes | yes | `crates/vmm-virtio/src/attach.rs:341` |
 | SmartOS metadata agent on COM2 | yes | no (rejects only `--mdata-*`) | `bin/rshyve/src/mdata.rs` |
 | `--json-config`, `-k` | accepted, no reader | reject (`--json-config`) | `crates/vmm-config/src/lib.rs` |
@@ -347,6 +347,74 @@ The hypercall page is a deliberate stub: `mov rax, 2; ret`, which is `HV_STATUS_
 
 If the host TSC frequency probe fails and `--tsc-freq-hz` is not given, rshyve warns and disables reference-TSC entirely, at which point both timing MSRs inject #GP.
 
+## PCI passthrough (rshyve only)
+
+`-s <slot>,passthru,/dev/pptN` binds a real PCI function to the VM
+(`crates/vmm-passthru/src/lib.rs`, attached at `bin/rshyve/src/main.rs:1412`).
+The device needs the illumos PPT driver. Pass `-S` yourself: nothing
+inspects the `-s` specs and adds it for you.
+
+**Intel VT-d only. There is no AMD IOMMU backend.** `iommu_init()` opens
+`misc/vmm_vtd` on an Intel host and `misc/vmm_amdvi` on an AMD one, and
+only the first exists: the illumos tree ships a `vmm_vtd` module
+directory and `VMM_VTD_OBJS = vtd.o` in `Makefile.files`, with no AMD
+counterpart in either place. `amdvi_hw.c` sits in the source tree
+unbuilt, next to the comment "Use the expected name for if/when this is
+ported". On an AMD host `ddi_modopen` fails, `iommu_init` returns that
+error, and passthrough does not work. Both `docs/devices.md` and
+`docs/status.md` claimed AMD support until this was checked.
+
+**A device that advertises MSI-X is refused at attach**, with
+`ErrorKind::Unsupported` and the text "device advertises MSI-X, which
+this VMM cannot isolate" (`check_passthrough_supported`). The reason is
+not tidiness. `update_bar_mappings` maps a whole BAR into the guest with
+`VM_MAP_PPTDEV_MMIO`, and on an MSI-X device that BAR holds the physical
+MSI-X table; the illumos kernel checks only that the range is inside a
+BAR (`ppt_map_mmio`), and carves nothing out. illumos VT-d remaps DMA
+and not interrupts: there is no IRTA or IRTE code anywhere in `vtd.c`.
+So a guest that writes that table makes the device post a message to a
+host physical address of its choice, which is an interrupt at a vector
+of its choice on the host APIC. Linux gates exactly this behind
+`allow_unsafe_interrupts`; cloud-hypervisor carves the table and PBA out
+of the mapped region. This VMM refuses the device. Most modern PCIe
+devices advertise MSI-X, so this rules most of them out. MSI and INTx
+devices still attach.
+
+The userspace MSI-X table emulation that used to sit in
+`crates/vmm-passthru/` has been deleted, not left in place. It could
+never run: nothing
+registered the device on the MMIO bus, so `bar_rw` was never called,
+`VM_PPTDEV_MSIX` was never issued, and the kernel never installed a host
+interrupt handler. Finishing it needs the carve-out, an MMIO-bus
+registration, and a host with an assigned device to test on.
+
+**Config-space writes are deny by default.** `classify_cfg_write` admits
+the command register, the six BARs, the interrupt line byte and the MSI
+capability, and drops everything else with a `warn` line. The default
+matters because the illumos PPT driver adds no filter: `PPT_CFG_WRITE`
+is a bare `pci_config_put32(cfg, cio.pci_off, cio.pci_data)`. Before
+this, the catch-all arm forwarded any offset verbatim, so a guest could
+set PCIe DEVCTL Initiate FLR and reset a device the host still owned,
+write PMCSR and move it to D3, or point the Expansion ROM BAR at host
+physical memory. The MSI capability window is now sized from its own
+Message Control rather than a fixed 24 bytes, so it can no longer be
+used to write the capability that follows it. Guest MSI Enable is
+stripped from the write-through, because `ppt_setup_msi` has the DDI
+framework put a host address and a host vector in those registers; the
+guest's address and data are used for guest-side injection only.
+Multiple Message Enable is clamped to the kernel's `msi_limit`.
+
+**An I/O BAR decodes nothing.** `bar_rw` handles PIO, but nothing
+registers this device on the PIO bus, unlike `crates/vmm-virtio/src/pci.rs`
+which registers its own BAR handlers. MMIO BARs do not need it, because
+EPT maps them straight to hardware. An I/O BAR does, so its ports reach
+neither hardware nor emulation.
+
+`PciPassthru::new` takes no logger and `bin/rshyve/src/main.rs:1420`
+calls it, so dropped config writes and failed unmaps are currently
+recorded nowhere. `PciPassthru::new_with_logger` exists for the caller to
+switch to.
+
 ## Migration and the control socket (rshyve only)
 
 ### Control socket
@@ -507,6 +575,8 @@ Absent, with no partial path:
 - **`ahci-hd`.** rshyve fails at startup with "AHCI device type 'ahci-hd' is not implemented; use virtio-blk or nvme" (`bin/rshyve/src/main.rs:974`). There is no AHCI hard-disk code in `crates/vmm-storage`; the module is ATAPI only.
 - **Any emulated NIC other than viona-backed virtio-net.** No e1000, rtl8139, vmxnet, tap, netgraph or slirp.
 - **virtio-scsi, virtio-9p, virtio-balloon, virtio-input, virtio-gpu.**
+- **PCI passthrough on an AMD host**, and passthrough of any device that advertises MSI-X. Neither is a gap in this VMM alone: illumos builds no `vmm_amdvi` module, and its VT-d driver does no interrupt remapping. See [PCI passthrough](#pci-passthrough-rshyve-only).
+- **Interrupt remapping for a passed-through device**, and therefore any equivalent of the Linux `allow_unsafe_interrupts` override. There is no knob to turn the MSI-X refusal off.
 - **Hot-remove of a CPU or of memory.** Both are impossible at the illumos kernel boundary, not merely unimplemented: there is no `vm_deactivate_cpu` and no `VM_FREE_MEMSEG`. Both commands exist and are refused with that reason. See [Hotplug](#hotplug-both-binaries). Hot-ADD of a PCI device, a CPU or memory is supported behind `--hotplug`, and PCI hot-remove works when the guest runs `_EJ0`.
 - **qcow2 or any non-raw image format.** Every backend does raw offset arithmetic on a plain file.
 - **Block I/O throttling.**
