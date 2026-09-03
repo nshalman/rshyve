@@ -4,13 +4,15 @@
 
 //! Kernel state export/import via the vmm-data interface.
 //!
-//! All device state is transferred as raw bytes with embedded version
-//! information. The kernel handles struct versioning -- we just need
-//! to read the blobs on the source and write them on the destination.
+//! State travels as raw class blobs, tagged with the class and version
+//! the source kernel used. The kernel does not convert between struct
+//! versions, so the destination checks every blob against its own class
+//! table before it writes any of them. See [`checks`].
 
 use bhyve_api::{
-    vdi_field_entry_v1, vm_reg_name, VDC_ATPIC, VDC_ATPIT, VDC_HPET,
-    VDC_IOAPIC, VDC_LAPIC, VDC_MSR, VDC_PM_TIMER, VDC_RTC, VDC_VMM_TIME,
+    vdi_field_entry_v1, vdi_version_entry_v1, vm_reg_name, VDC_ATPIC,
+    VDC_ATPIT, VDC_HPET, VDC_IOAPIC, VDC_LAPIC, VDC_MSR, VDC_PM_TIMER, VDC_RTC,
+    VDC_VMM_TIME,
 };
 use slog;
 use std::mem::size_of;
@@ -21,6 +23,13 @@ use vmm_core::vcpu::Vcpu;
 
 use crate::codec::{
     DevicePayload, DeviceState, MigrateError, TimeData, VcpuStatePayload,
+};
+
+mod checks;
+
+use checks::{
+    check_class_blob, check_device_state, parse_vcpu_regs, read_class_layouts,
+    RegWrite,
 };
 
 /// System device descriptors for state export/import.
@@ -119,94 +128,6 @@ fn export_vcpu_regs(vcpu: &Vcpu) -> Result<Vec<u8>, MigrateError> {
     Ok(data)
 }
 
-/// Import registers for a vCPU from (reg_id, value) pairs,
-/// followed by segment descriptors after a marker.
-fn import_vcpu_regs(
-    vcpu: &Vcpu,
-    data: &[u8],
-    log: &slog::Logger,
-) -> Result<(), MigrateError> {
-    let mut pos = 0;
-
-    // Read general registers (12 bytes each: 4 id + 8 value)
-    while pos + 12 <= data.len() {
-        let reg_id =
-            u32::from_le_bytes(data[pos..pos + 4].try_into().expect("4 bytes"));
-
-        // Check for segment descriptor marker
-        if reg_id == 0xFFFF_FFFF {
-            pos += 4;
-            let count = u64::from_le_bytes(
-                data[pos..pos + 8].try_into().expect("8 bytes"),
-            ) as usize;
-            pos += 8;
-
-            // Read segment descriptors (20 bytes each: 4 id + 8 base + 4 limit + 4 access)
-            for _ in 0..count {
-                if pos + 20 > data.len() {
-                    break;
-                }
-                let seg_id = u32::from_le_bytes(
-                    data[pos..pos + 4].try_into().expect("4 bytes"),
-                );
-                let base = u64::from_le_bytes(
-                    data[pos + 4..pos + 12].try_into().expect("8 bytes"),
-                );
-                let limit = u32::from_le_bytes(
-                    data[pos + 12..pos + 16].try_into().expect("4 bytes"),
-                );
-                let access = u32::from_le_bytes(
-                    data[pos + 16..pos + 20].try_into().expect("4 bytes"),
-                );
-                let reg: vm_reg_name =
-                    match vm_reg_name::from_repr(seg_id as i32) {
-                        Some(r) if !matches!(r, vm_reg_name::VM_REG_LAST) => r,
-                        _ => {
-                            return Err(MigrateError::VmmData(format!(
-                                "invalid segment reg id: {seg_id}"
-                            )));
-                        }
-                    };
-                let desc = bhyve_api::seg_desc {
-                    base,
-                    limit,
-                    access,
-                };
-                vcpu.set_segment_desc(reg, &desc).map_err(|e| {
-                    MigrateError::VmmData(format!(
-                        "set_segment_desc {:?}: {e}",
-                        reg
-                    ))
-                })?;
-                // Don't touch selectors here — they're already set
-                // by the general register import (VCPU_REGS includes CS-LDTR).
-                pos += 20;
-            }
-            break;
-        }
-
-        let val = u64::from_le_bytes(
-            data[pos + 4..pos + 12].try_into().expect("8 bytes"),
-        );
-        let reg: vm_reg_name = match vm_reg_name::from_repr(reg_id as i32) {
-            Some(r) if !matches!(r, vm_reg_name::VM_REG_LAST) => r,
-            _ => {
-                return Err(MigrateError::VmmData(format!(
-                    "invalid reg id: {reg_id}"
-                )));
-            }
-        };
-        if let Err(e) = vcpu.set_reg(reg, val) {
-            // Some registers may fail on cross-host migration due to
-            // CPU feature differences (e.g., XCR0 with AVX bits on a
-            // host that doesn't support AVX). Log and continue.
-            slog::warn!(log, "set_reg failed"; "reg" => ?reg, "value" => format!("{:#x}", val), "error" => %e);
-        }
-        pos += 12;
-    }
-    Ok(())
-}
-
 /// Read a vmm-data class/version as raw bytes (for system devices).
 fn read_class_all(
     hdl: &VmmHdl,
@@ -251,22 +172,134 @@ fn write_class_all(
     })
 }
 
-/// Write per-vCPU vmm-data class.
-fn write_class_vcpu(
+/// The kernel writes that a state import performs.
+///
+/// Only [`KernelSink`] is used in production. Tests use a recording
+/// implementation, which is the only way to drive the import decisions
+/// without a live bhyve instance.
+trait ImportSink {
+    fn write_class(
+        &self,
+        class: u16,
+        version: u16,
+        vcpuid: Option<i32>,
+        data: &[u8],
+    ) -> Result<(), MigrateError>;
+
+    /// Segment selectors are not written here. The plain register
+    /// list already carries CS through LDTR.
+    fn write_reg(
+        &self,
+        vcpuid: i32,
+        write: RegWrite,
+    ) -> Result<(), MigrateError>;
+
+    fn set_run_state(
+        &self,
+        vcpuid: i32,
+        run_state: u32,
+        sipi_vector: u8,
+    ) -> Result<(), MigrateError>;
+}
+
+/// Applies imported state to a live bhyve instance.
+struct KernelSink<'a> {
+    hdl: &'a Arc<VmmHdl>,
+}
+
+impl KernelSink<'_> {
+    fn vcpu(&self, vcpuid: i32) -> Vcpu {
+        Vcpu::new_for_thread(vcpuid, Arc::clone(self.hdl))
+    }
+}
+
+impl ImportSink for KernelSink<'_> {
+    fn write_class(
+        &self,
+        class: u16,
+        version: u16,
+        vcpuid: Option<i32>,
+        data: &[u8],
+    ) -> Result<(), MigrateError> {
+        let op = self.hdl.data_op(class, version);
+        let op = match vcpuid {
+            Some(id) => op.for_vcpu(id),
+            None => op,
+        };
+        op.write_many(data).map_err(|e| {
+            MigrateError::State(format!(
+                "write class={class} version={version} vcpu={vcpuid:?}: {e:?}"
+            ))
+        })
+    }
+
+    fn write_reg(
+        &self,
+        vcpuid: i32,
+        write: RegWrite,
+    ) -> Result<(), MigrateError> {
+        let vcpu = self.vcpu(vcpuid);
+        match write {
+            RegWrite::Reg(reg, value) => {
+                vcpu.set_reg(reg, value).map_err(|e| {
+                    MigrateError::State(format!(
+                        "vcpu {vcpuid}: set {reg:?}={value:#x}: {e}"
+                    ))
+                })
+            }
+            RegWrite::Seg(reg, base, limit, access) => {
+                let desc = bhyve_api::seg_desc {
+                    base,
+                    limit,
+                    access,
+                };
+                vcpu.set_segment_desc(reg, &desc).map_err(|e| {
+                    MigrateError::State(format!(
+                        "vcpu {vcpuid}: set {reg:?} descriptor: {e}"
+                    ))
+                })
+            }
+        }
+    }
+
+    fn set_run_state(
+        &self,
+        vcpuid: i32,
+        run_state: u32,
+        sipi_vector: u8,
+    ) -> Result<(), MigrateError> {
+        self.vcpu(vcpuid)
+            .set_run_state_full(run_state, sipi_vector)
+            .map_err(|e| {
+                MigrateError::VmmData(format!(
+                    "set_run_state vcpu={vcpuid} state={run_state:#x}: {e}"
+                ))
+            })
+    }
+}
+
+/// Read a per-vCPU field-entry class and serialize it for the wire.
+fn read_field_entries(
     hdl: &VmmHdl,
     class: u16,
-    version: u16,
     vcpuid: i32,
-    data: &[u8],
-) -> Result<(), MigrateError> {
-    hdl.data_op(class, version)
+    what: &str,
+) -> Result<Vec<u8>, MigrateError> {
+    let entries = hdl
+        .data_op(class, 1)
         .for_vcpu(vcpuid)
-        .write_many(data)
+        .read_all::<vdi_field_entry_v1>()
         .map_err(|e| {
-            MigrateError::VmmData(format!(
-            "write_vcpu class={class} version={version} vcpu={vcpuid}: {e:?}"
-        ))
-        })
+            MigrateError::State(format!("export {what} vcpu={vcpuid}: {e:?}"))
+        })?;
+    let mut buf =
+        Vec::with_capacity(entries.len() * size_of::<vdi_field_entry_v1>());
+    for entry in &entries {
+        buf.extend_from_slice(&entry.vfe_ident.to_le_bytes());
+        buf.extend_from_slice(&entry._pad.to_le_bytes());
+        buf.extend_from_slice(&entry.vfe_value.to_le_bytes());
+    }
+    Ok(buf)
 }
 
 /// Export time synchronization data from the kernel.
@@ -290,9 +323,23 @@ pub fn import_time_data(
 ) -> Result<(), MigrateError> {
     use bhyve_api::vdi_time_info_v1;
 
-    // Parse source time data
-    if time.vmm_time.len() < size_of::<vdi_time_info_v1>() {
-        return Err(MigrateError::VmmData("VMM_TIME too small".into()));
+    // The payload is a raw vdi_time_info_v1 from the source kernel. A
+    // different length is a different struct, and reading it as ours
+    // would give nonsense timer targets.
+    let layouts = read_class_layouts(hdl)?;
+    check_class_blob(
+        &layouts,
+        "VMM_TIME",
+        VDC_VMM_TIME,
+        1,
+        time.vmm_time.len(),
+    )?;
+    if time.vmm_time.len() != size_of::<vdi_time_info_v1>() {
+        return Err(MigrateError::State(format!(
+            "VMM_TIME: payload has {} bytes, this build reads {}",
+            time.vmm_time.len(),
+            size_of::<vdi_time_info_v1>()
+        )));
     }
     let src: vdi_time_info_v1 = unsafe {
         std::ptr::read_unaligned(
@@ -407,96 +454,33 @@ pub fn export_device_state(
         // Registers via get_reg (reliable, avoids vmm-data field format issues)
         let registers = export_vcpu_regs(&vcpu)?;
 
-        // LAPIC: per-vCPU struct-based, works with read_all
-        let lapic = match read_class_vcpu(hdl, VDC_LAPIC, 1, vcpuid) {
-            Ok(data) => {
-                slog::debug!(log, "LAPIC export";
-                    "vcpu" => vcpuid, "bytes" => data.len(),
-                );
-                data
-            }
-            Err(e) => {
-                slog::warn!(log, "LAPIC export failed";
-                    "vcpu" => vcpuid, "error" => %e,
-                );
-                Vec::new()
-            }
-        };
-
-        // MSRs: bulk read via VDC_MSR returns vdi_field_entry_v1 array
-        let msrs = match hdl
-            .data_op(VDC_MSR, 1)
-            .for_vcpu(vcpuid)
-            .read_all::<vdi_field_entry_v1>()
-        {
-            Ok(entries) => {
-                slog::debug!(log, "MSR export";
-                    "vcpu" => vcpuid, "count" => entries.len(),
-                );
-                let mut buf = Vec::with_capacity(entries.len() * 16);
-                for entry in &entries {
-                    buf.extend_from_slice(&entry.vfe_ident.to_le_bytes());
-                    buf.extend_from_slice(&entry._pad.to_le_bytes());
-                    buf.extend_from_slice(&entry.vfe_value.to_le_bytes());
-                }
-                buf
-            }
-            Err(e) => {
-                slog::warn!(log, "MSR export failed";
-                    "vcpu" => vcpuid, "error" => ?e,
-                );
-                Vec::new()
-            }
-        };
-
-        // VMM_ARCH: pending interrupt state (NMI, EXTINT, exceptions)
-        let vmm_arch = match hdl
-            .data_op(bhyve_api::VDC_VMM_ARCH, 1)
-            .for_vcpu(vcpuid)
-            .read_all::<vdi_field_entry_v1>()
-        {
-            Ok(entries) => {
-                let mut buf = Vec::with_capacity(entries.len() * 16);
-                for entry in &entries {
-                    buf.extend_from_slice(&entry.vfe_ident.to_le_bytes());
-                    buf.extend_from_slice(&entry._pad.to_le_bytes());
-                    buf.extend_from_slice(&entry.vfe_value.to_le_bytes());
-                }
-                slog::debug!(log, "VMM_ARCH export";
-                    "vcpu" => vcpuid, "fields" => entries.len(),
-                );
-                buf
-            }
-            Err(e) => {
-                slog::warn!(log, "VMM_ARCH export failed";
-                    "vcpu" => vcpuid, "error" => ?e,
-                );
-                Vec::new()
-            }
-        };
+        // Every class below is required. A snapshot that silently
+        // drops one resumes the guest with default state for it.
+        let lapic = read_class_vcpu(hdl, VDC_LAPIC, 1, vcpuid)?;
+        let msrs = read_field_entries(hdl, VDC_MSR, vcpuid, "MSR")?;
+        let vmm_arch = read_field_entries(
+            hdl,
+            bhyve_api::VDC_VMM_ARCH,
+            vcpuid,
+            "VMM_ARCH",
+        )?;
 
         // Not transferred yet. OSF-2 in docs/security/open-findings.md
         // tracks this; the VM_GET_FPU/VM_SET_FPU bindings already exist.
         let fpu = Vec::new();
 
-        // Run state: needed to correctly restore AP vCPUs that are
-        // in HLT or INIT state (not actively running).
-        let (run_state, sipi_vector) = match vcpu.get_run_state() {
-            Ok((rs, sv)) => {
-                slog::debug!(log, "vcpu run_state export";
-                    "vcpu" => vcpuid,
-                    "run_state" => format!("{:#x}", rs),
-                    "sipi_vector" => sv,
-                );
-                (rs, sv)
-            }
-            Err(e) => {
-                slog::warn!(log, "get_run_state failed";
-                    "vcpu" => vcpuid, "error" => %e,
-                );
-                (bhyve_api::VRS_RUN, 0)
-            }
-        };
+        // Run state restores an AP that is in HLT or INIT, not running.
+        let (run_state, sipi_vector) = vcpu.get_run_state().map_err(|e| {
+            MigrateError::VmmData(format!("get_run_state vcpu={vcpuid}: {e}"))
+        })?;
+
+        slog::debug!(log, "vcpu state exported";
+            "vcpu" => vcpuid,
+            "lapic_bytes" => lapic.len(),
+            "msr_bytes" => msrs.len(),
+            "vmm_arch_bytes" => vmm_arch.len(),
+            "run_state" => format!("{run_state:#x}"),
+        );
 
         vcpus.push(VcpuStatePayload {
             vcpuid,
@@ -510,25 +494,19 @@ pub fn export_device_state(
         });
     }
 
-    // Export system device state (struct-based classes work with read_all)
+    // System devices. A class that fails to read is a failed export:
+    // the destination cannot tell a missing class from an absent one.
     let mut devices = Vec::with_capacity(SYSTEM_DEVICES.len());
     for &(name, class, version) in SYSTEM_DEVICES {
-        match read_class_all(hdl, class, version) {
-            Ok(data) => {
-                devices.push(DevicePayload {
-                    name: name.to_string(),
-                    class,
-                    version,
-                    data,
-                });
-            }
-            Err(e) => {
-                // Log but continue -- some classes may not be available
-                slog::warn!(log, "device export failed";
-                    "device" => name, "error" => %e,
-                );
-            }
-        }
+        let data = read_class_all(hdl, class, version).map_err(|e| {
+            MigrateError::State(format!("export device {name}: {e}"))
+        })?;
+        devices.push(DevicePayload {
+            name: name.to_string(),
+            class,
+            version,
+            data,
+        });
     }
 
     Ok(DeviceState {
@@ -547,140 +525,154 @@ pub fn import_device_state(
     state: &DeviceState,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
-    // Import system device state FIRST (IOAPIC must be ready before LAPIC)
-    for dev in &state.devices {
-        if !dev.data.is_empty() {
-            if let Err(e) =
-                write_class_all(hdl, dev.class, dev.version, &dev.data)
-            {
-                slog::warn!(log, "device import failed";
-                    "device" => &dev.name, "error" => %e,
-                );
-            }
-        }
+    let layouts = read_class_layouts(hdl)?;
+    import_device_state_into(&KernelSink { hdl }, &layouts, state, log)
+}
+
+/// Check the payload against the local kernel, then apply all of it.
+///
+/// Every write is fatal on failure. The caller aborts the migration and
+/// the source VM stays alive.
+fn import_device_state_into(
+    sink: &dyn ImportSink,
+    layouts: &[vdi_version_entry_v1],
+    state: &DeviceState,
+    log: &slog::Logger,
+) -> Result<(), MigrateError> {
+    check_device_state(state, layouts)?;
+
+    // The payload carries no FPU/XSAVE state. OSF-2 in
+    // docs/security/open-findings.md tracks the gap.
+    slog::warn!(log, "importing without FPU/XSAVE state");
+
+    // System devices first, in the local order: the IOAPIC must be
+    // ready before the LAPICs, and the payload's order is the peer's
+    // choice.
+    for &(name, class, _) in SYSTEM_DEVICES {
+        let Some(dev) = state.devices.iter().find(|d| d.class == class) else {
+            return Err(MigrateError::State(format!(
+                "{name}: class {class} state is missing from the payload"
+            )));
+        };
+        sink.write_class(dev.class, dev.version, None, &dev.data)?;
     }
 
-    // Import per-vCPU state.
-    //
-    // Order: MSRs → LAPIC → Registers
-    // MSRs before registers for GS_BASE/KERNEL_GS_BASE/STAR/LSTAR.
-    // LAPIC before registers so timer state is correct.
-    for vcpu_state in &state.vcpus {
-        let vcpu = Vcpu::new_for_thread(vcpu_state.vcpuid, Arc::clone(hdl));
-
-        // 1. MSRs first
-        if !vcpu_state.msrs.is_empty() {
-            let entry_size = size_of::<vdi_field_entry_v1>();
-            if vcpu_state.msrs.len().is_multiple_of(entry_size) {
-                if let Err(e) = write_class_vcpu(
-                    hdl,
-                    VDC_MSR,
-                    1,
-                    vcpu_state.vcpuid,
-                    &vcpu_state.msrs,
-                ) {
-                    slog::warn!(log, "MSR import failed";
-                        "vcpu" => vcpu_state.vcpuid, "error" => %e,
-                    );
-                }
-            }
+    // Per vCPU: MSRs before the registers for GS_BASE, KERNEL_GS_BASE,
+    // STAR and LSTAR. LAPIC before the registers so timer state is
+    // correct. VMM_ARCH last, because it carries pending interrupts.
+    for vcpu in &state.vcpus {
+        let id = vcpu.vcpuid;
+        sink.write_class(VDC_MSR, 1, Some(id), &vcpu.msrs)?;
+        sink.write_class(VDC_LAPIC, 1, Some(id), &vcpu.lapic)?;
+        for write in parse_vcpu_regs(id, &vcpu.registers)? {
+            sink.write_reg(id, write)?;
         }
-
-        // 2. LAPIC
-        if !vcpu_state.lapic.is_empty() {
-            // The guest kernel may have masked the LAPIC timer when it
-            // went idle (lvt_timer bit 16 = masked). If the timer is
-            // masked, vlapic_fire_timer won't deliver the interrupt
-            // even when the callout fires. Unmask it so the first
-            // timer interrupt wakes the guest scheduler.
-            let lapic_data = vcpu_state.lapic.clone();
-            // Import LAPIC state verbatim -- no timer hacks needed.
-            // With correct VMM_TIME adjustment, the kernel's
-            // vm_denormalize_hrtime() produces correct absolute times.
-            // vlapic_resume() handles timer re-arming.
-            slog::debug!(log, "LAPIC import";
-                "vcpu" => vcpu_state.vcpuid, "bytes" => lapic_data.len(),
-            );
-            match write_class_vcpu(
-                hdl,
-                VDC_LAPIC,
-                1,
-                vcpu_state.vcpuid,
-                &lapic_data,
-            ) {
-                Ok(()) => slog::debug!(log, "LAPIC import complete";
-                    "vcpu" => vcpu_state.vcpuid,
-                ),
-                Err(e) => slog::warn!(log, "LAPIC import failed";
-                    "vcpu" => vcpu_state.vcpuid, "error" => %e,
-                ),
-            }
-        } else {
-            slog::warn!(log, "no LAPIC data for vcpu";
-                "vcpu" => vcpu_state.vcpuid,
-            );
-        }
-
-        // 3. Registers (includes segment descriptors)
-        if !vcpu_state.registers.is_empty() {
-            import_vcpu_regs(&vcpu, &vcpu_state.registers, log)?;
-        }
-
-        // 4. Run state -- restore HALT/INIT/RUN per-vCPU
-        if vcpu_state.run_state != 0 {
-            slog::debug!(log, "vcpu run_state import";
-                "vcpu" => vcpu_state.vcpuid,
-                "run_state" => format!("{:#x}", vcpu_state.run_state),
-                "sipi_vector" => vcpu_state.sipi_vector,
-            );
-            if let Err(e) = vcpu.set_run_state_full(
-                vcpu_state.run_state,
-                vcpu_state.sipi_vector,
-            ) {
-                slog::warn!(log, "set_run_state failed";
-                    "vcpu" => vcpu_state.vcpuid, "error" => %e,
-                );
-            }
-        }
-
-        // 5. VMM_ARCH (pending interrupt state)
-        if !vcpu_state.vmm_arch.is_empty() {
-            let entry_size = size_of::<vdi_field_entry_v1>();
-            if vcpu_state.vmm_arch.len().is_multiple_of(entry_size) {
-                if let Err(e) = write_class_vcpu(
-                    hdl,
-                    bhyve_api::VDC_VMM_ARCH,
-                    1,
-                    vcpu_state.vcpuid,
-                    &vcpu_state.vmm_arch,
-                ) {
-                    slog::warn!(log, "VMM_ARCH import failed";
-                        "vcpu" => vcpu_state.vcpuid, "error" => %e,
-                    );
-                }
-            }
-        }
+        // VRS_HALT is 0, so a halted vCPU must be restored too.
+        sink.set_run_state(id, vcpu.run_state, vcpu.sipi_vector)?;
+        sink.write_class(bhyve_api::VDC_VMM_ARCH, 1, Some(id), &vcpu.vmm_arch)?;
+        slog::debug!(log, "vcpu state imported";
+            "vcpu" => id,
+            "msr_bytes" => vcpu.msrs.len(),
+            "run_state" => format!("{:#x}", vcpu.run_state),
+        );
     }
 
     Ok(())
 }
 
-// Suppress unused import warnings for the constants list -- they
-// document which classes we *could* use even if VCPU_CLASSES is
-// consumed only by the array literal above.
-#[allow(unused_imports)]
-use bhyve_api::VDC_VERSION;
-
 #[cfg(test)]
 mod tests {
+    use super::checks::fixtures::*;
     use super::*;
+    use std::cell::RefCell;
+
+    /// Records what an import applied, so the import decisions can be
+    /// checked without a live bhyve instance.
+    #[derive(Default)]
+    struct RecordingSink {
+        classes: RefCell<Vec<(u16, u16, Option<i32>, usize)>>,
+        regs: RefCell<Vec<(i32, String)>>,
+        run_states: RefCell<Vec<(i32, u32, u8)>>,
+    }
+
+    impl RecordingSink {
+        fn wrote_class(&self, class: u16, vcpuid: Option<i32>) -> bool {
+            self.classes
+                .borrow()
+                .iter()
+                .any(|&(c, _, v, _)| c == class && v == vcpuid)
+        }
+
+        fn applied_nothing(&self) -> bool {
+            self.classes.borrow().is_empty()
+                && self.regs.borrow().is_empty()
+                && self.run_states.borrow().is_empty()
+        }
+    }
+
+    impl ImportSink for RecordingSink {
+        fn write_class(
+            &self,
+            class: u16,
+            version: u16,
+            vcpuid: Option<i32>,
+            data: &[u8],
+        ) -> Result<(), MigrateError> {
+            self.classes.borrow_mut().push((
+                class,
+                version,
+                vcpuid,
+                data.len(),
+            ));
+            Ok(())
+        }
+
+        fn write_reg(
+            &self,
+            vcpuid: i32,
+            write: RegWrite,
+        ) -> Result<(), MigrateError> {
+            self.regs.borrow_mut().push((vcpuid, format!("{write:?}")));
+            Ok(())
+        }
+
+        fn set_run_state(
+            &self,
+            vcpuid: i32,
+            run_state: u32,
+            sipi_vector: u8,
+        ) -> Result<(), MigrateError> {
+            self.run_states
+                .borrow_mut()
+                .push((vcpuid, run_state, sipi_vector));
+            Ok(())
+        }
+    }
+
+    fn test_log() -> slog::Logger {
+        slog::Logger::root(slog::Discard, slog::o!())
+    }
+
+    fn import(
+        state: &DeviceState,
+    ) -> (RecordingSink, Result<(), MigrateError>) {
+        import_with_layouts(state, &kernel_layouts())
+    }
+
+    fn import_with_layouts(
+        state: &DeviceState,
+        layouts: &[vdi_version_entry_v1],
+    ) -> (RecordingSink, Result<(), MigrateError>) {
+        let sink = RecordingSink::default();
+        let result =
+            import_device_state_into(&sink, layouts, state, &test_log());
+        (sink, result)
+    }
 
     #[test]
     fn system_devices_are_non_empty() {
         assert!(!SYSTEM_DEVICES.is_empty());
     }
-
-    // vcpu_classes test removed — constant was inlined into export functions
 
     #[test]
     fn system_device_classes_are_unique() {
@@ -691,5 +683,141 @@ mod tests {
                 "duplicate system device class: {class}"
             );
         }
+    }
+
+    #[test]
+    fn well_formed_payload_imports() {
+        let (sink, result) = import(&good_state());
+        assert!(result.is_ok(), "{result:?}");
+        assert!(sink.wrote_class(VDC_MSR, Some(0)));
+        assert!(sink.wrote_class(VDC_LAPIC, Some(0)));
+        assert!(sink.wrote_class(bhyve_api::VDC_VMM_ARCH, Some(0)));
+        for &(_, class, _) in SYSTEM_DEVICES {
+            assert!(sink.wrote_class(class, None), "class {class} not written");
+        }
+        assert_eq!(sink.regs.borrow().len(), 2);
+        assert_eq!(sink.run_states.borrow().len(), 1);
+    }
+
+    /// A destination kernel with a different `vdi_field_entry_v1` size
+    /// leaves an MSR blob that is not a whole number of entries. That
+    /// used to skip the write and report success, so the guest resumed
+    /// with default MSRs.
+    #[test]
+    fn unaligned_msr_blob_fails_import() {
+        let mut state = good_state();
+        let mut msrs = field_entries(3);
+        msrs.truncate(msrs.len() - 5);
+        state.vcpus[0].msrs = msrs;
+
+        let (sink, result) = import(&state);
+        let err = result.expect_err("unaligned MSR blob must fail");
+        let text = err.to_string();
+        assert!(text.contains("MSR"), "{text}");
+        assert!(sink.applied_nothing(), "state applied before the check");
+    }
+
+    /// The kernel's own element size is the authority, not ours.
+    #[test]
+    fn msr_entry_size_mismatch_fails_import() {
+        let mut layouts = kernel_layouts();
+        for e in layouts.iter_mut() {
+            if e.vve_class == VDC_MSR {
+                e.vve_len_per_item = 8;
+            }
+        }
+        let (sink, result) = import_with_layouts(&good_state(), &layouts);
+        assert!(result.is_err(), "entry size mismatch must fail");
+        assert!(sink.applied_nothing());
+    }
+
+    #[test]
+    fn missing_class_version_fails_import() {
+        let mut layouts = kernel_layouts();
+        for e in layouts.iter_mut() {
+            if e.vve_class == VDC_LAPIC {
+                e.vve_version = 2;
+            }
+        }
+        let (sink, result) = import_with_layouts(&good_state(), &layouts);
+        let err = result.expect_err("unknown LAPIC version must fail");
+        assert!(err.to_string().contains("LAPIC"), "{err}");
+        assert!(sink.applied_nothing());
+    }
+
+    #[test]
+    fn wrong_fixed_length_fails_import() {
+        let mut state = good_state();
+        state.devices[0].data.push(0);
+        let (sink, result) = import(&state);
+        assert!(result.is_err(), "wrong fixed length must fail");
+        assert!(sink.applied_nothing());
+    }
+
+    #[test]
+    fn unknown_device_class_fails_import() {
+        let mut state = good_state();
+        state.devices.push(DevicePayload {
+            name: "mystery".to_string(),
+            class: 0xFFFF,
+            version: 1,
+            data: vec![0u8; TEST_DEV_LEN],
+        });
+        let (sink, result) = import(&state);
+        assert!(result.is_err(), "unknown device class must fail");
+        assert!(sink.applied_nothing());
+    }
+
+    #[test]
+    fn missing_system_device_fails_import() {
+        let mut state = good_state();
+        state.devices.pop();
+        let (sink, result) = import(&state);
+        assert!(result.is_err(), "missing device class must fail");
+        assert!(sink.applied_nothing());
+    }
+
+    #[test]
+    fn empty_lapic_fails_import() {
+        let mut state = good_state();
+        state.vcpus[0].lapic.clear();
+        let (sink, result) = import(&state);
+        assert!(result.is_err(), "missing LAPIC state must fail");
+        assert!(sink.applied_nothing());
+    }
+
+    #[test]
+    fn truncated_segment_descriptors_fail_import() {
+        let mut state = good_state();
+        let mut blob = default_reg_blob();
+        blob.truncate(blob.len() - 4);
+        state.vcpus[0].registers = blob;
+        let (sink, result) = import(&state);
+        assert!(result.is_err(), "truncated register blob must fail");
+        assert!(sink.applied_nothing());
+    }
+
+    #[test]
+    fn duplicate_vcpu_id_fails_import() {
+        let mut state = good_state();
+        state.vcpus.push(vcpu_payload(0));
+        let (sink, result) = import(&state);
+        assert!(result.is_err(), "duplicate vcpu id must fail");
+        assert!(sink.applied_nothing());
+    }
+
+    /// VRS_HALT is 0. A halted vCPU must still have its run state
+    /// restored, or it resumes in whatever state the fresh destination
+    /// vCPU had.
+    #[test]
+    fn halted_run_state_is_applied() {
+        let mut state = good_state();
+        state.vcpus[0].run_state = bhyve_api::VRS_HALT;
+        let (sink, result) = import(&state);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            sink.run_states.borrow().as_slice(),
+            &[(0, bhyve_api::VRS_HALT, 0)]
+        );
     }
 }
