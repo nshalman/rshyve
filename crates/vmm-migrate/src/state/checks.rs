@@ -230,6 +230,14 @@ fn check_field_entry_blob(
 /// Import is all or nothing. A guest that resumes with part of its CPU
 /// state is worse than a migration that fails, because a failed
 /// migration leaves the source running.
+///
+/// Checked: one state per vCPU with a usable id, every class the
+/// destination kernel needs at a class and version that kernel has,
+/// each blob the length that kernel expects, a register blob that
+/// decodes whole, and every system device class present exactly once.
+/// Not checked: the values inside the blobs, which only the kernel can
+/// judge, and the FPU/XSAVE state, which the payload never carries.
+/// See OSF-2 in docs/security/open-findings.md for that gap.
 pub(super) fn check_device_state(
     state: &DeviceState,
     layouts: &[vdi_version_entry_v1],
