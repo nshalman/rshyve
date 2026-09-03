@@ -289,6 +289,23 @@ mod tests {
 
     use super::*;
 
+    /// Assert the server ended the session.
+    ///
+    /// A close that leaves bytes unread in the receive queue makes the
+    /// kernel send RST instead of FIN, so the peer reads
+    /// ConnectionReset rather than a clean end of file. Linux does
+    /// this; illumos and macOS report the clean end. The server will
+    /// not drain a hostile peer's unbounded input before closing, so
+    /// both answers mean the same thing.
+    fn assert_session_closed(reader: &mut impl BufRead) {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => {}
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("expected a closed session, got {other:?}"),
+        }
+    }
+
     /// Echoes what it was given, so a test sees the exact request the
     /// device passed on.
     struct EchoSink;
@@ -407,8 +424,9 @@ mod tests {
         reader.read_line(&mut line).expect("answer");
 
         assert_eq!(line, "ERR request line too long\n");
-        line.clear();
-        assert_eq!(reader.read_line(&mut line).expect("eof"), 0);
+        // The capped read left the rest of the request unread, so this
+        // close is the RST case assert_session_closed documents.
+        assert_session_closed(&mut reader);
         handle.join().expect("session thread");
     }
 
