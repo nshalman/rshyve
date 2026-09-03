@@ -832,3 +832,106 @@ fn a_rom_region_stays_writable_through_lookup() {
         .unwrap();
     assert_eq!(got, [1, 2, 3, 4]);
 }
+
+#[test]
+fn lookup_answers_a_range_across_two_abutting_ram_regions() {
+    // Hot-added RAM abuts the region below it, and one slot abuts the
+    // next. A guest buffer over the seam is ordinary: `blk_rq_map_sg`
+    // merges physically adjacent pages into one scatter-gather entry.
+    // A `lookup` that refused it would make virtio-blk report a disk
+    // fault for legal memory.
+    let map = PhysMap::new();
+    insert_ram(&map, 0x1_0000_0000, 0x2000).unwrap();
+    insert_ram(&map, 0x1_0000_2000, 0x2000).unwrap();
+
+    let across = map
+        .lookup(0x1_0000_1000, 0x2000)
+        .expect("a buffer over the seam is legal memory");
+    across.write_bytes(&[0xAB; 0x2000]).unwrap();
+
+    // The bytes past the seam belong to the second region.
+    let mut got = [0u8; 4];
+    map.lookup(0x1_0000_2000, 4)
+        .unwrap()
+        .read_bytes(&mut got)
+        .unwrap();
+    assert_eq!(got, [0xAB; 4]);
+}
+
+#[test]
+fn a_region_added_later_joins_the_run_below_it() {
+    // Each hot-add slot abuts the one before it, so the run has to grow
+    // with every add and not only on the first.
+    let map = PhysMap::new();
+    insert_ram(&map, 0x1_0000_0000, 0x1000).unwrap();
+    insert_ram(&map, 0x1_0000_1000, 0x1000).unwrap();
+    insert_ram(&map, 0x1_0000_2000, 0x1000).unwrap();
+
+    assert!(map.lookup(0x1_0000_0000, 0x3000).is_some());
+    assert!(map.lookup(0x1_0000_0800, 0x2000).is_some());
+    // Nothing is mapped past the last region.
+    assert!(map.lookup(0x1_0000_2800, 0x1000).is_none());
+}
+
+#[test]
+fn a_region_added_below_a_run_takes_the_run_with_it() {
+    // Boot maps low memory first, but nothing promises that order.
+    let map = PhysMap::new();
+    insert_ram(&map, 0x1_0000_1000, 0x1000).unwrap();
+    insert_ram(&map, 0x1_0000_2000, 0x1000).unwrap();
+    insert_ram(&map, 0x1_0000_0000, 0x1000).unwrap();
+
+    assert!(map.lookup(0x1_0000_0000, 0x3000).is_some());
+}
+
+#[test]
+fn a_run_stops_at_a_region_of_another_kind() {
+    // Only RAM regions share one mapping. A ROM carries the guest's
+    // read-only protection and a reservation has no backing at all.
+    let map = PhysMap::new();
+    insert_ram(&map, 0x1_0000_0000, 0x1000).unwrap();
+    map.add_region_anon(0x1_0000_1000, 0x1000, RegionKind::Rom)
+        .unwrap();
+    insert_ram(&map, 0x1_0000_2000, 0x1000).unwrap();
+
+    assert!(map.lookup(0x1_0000_0800, 0x1000).is_none());
+    assert!(map.lookup(0x1_0000_1800, 0x1000).is_none());
+}
+
+#[test]
+fn the_untracked_view_stops_at_the_region_boundary() {
+    // The devmem mapping is one kernel memory segment. It cannot span
+    // two of them, so this view keeps the old bounds.
+    let map = PhysMap::new();
+    insert_ram(&map, 0x1_0000_0000, 0x1000).unwrap();
+    insert_ram(&map, 0x1_0000_1000, 0x1000).unwrap();
+
+    assert!(map.lookup(0x1_0000_0800, 0x1000).is_some());
+    assert!(map.lookup_untracked(0x1_0000_0800, 0x1000).is_none());
+}
+
+#[test]
+fn two_adds_of_abutting_ram_still_end_in_one_run() {
+    // The run is read and adopted under one gate. Two adds that both
+    // read the region list before either published would each build a
+    // run of one, and the seam between them would refuse a lookup.
+    let map = Arc::new(PhysMap::new());
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+
+    let handles: Vec<_> = [0x1_0000_1000u64, 0x1_0000_2000]
+        .into_iter()
+        .map(|gpa| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                insert_ram(&map, gpa, 0x1000)
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+
+    assert!(map.lookup(0x1_0000_1800, 0x1000).is_some());
+}

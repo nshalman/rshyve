@@ -78,7 +78,7 @@ struct Region {
     segid: i32,
     /// Mapping of the guest physical address space. A write through
     /// this one is what the kernel marks dirty. See the module comment.
-    tracked: Arc<Mapping>,
+    tracked: TrackedRun,
     /// Mapping of the memory segment itself. Always writable, and
     /// outside the kernel's dirty tracking.
     direct: Arc<Mapping>,
@@ -91,9 +91,40 @@ impl Region {
     }
 }
 
+/// One mapping over a run of abutting RAM regions.
+///
+/// Hot-added RAM abuts the region below it, and one slot abuts the
+/// next. A guest buffer over such a seam is ordinary, because
+/// `blk_rq_map_sg` merges physically adjacent pages into one
+/// scatter-gather entry. One mapping over the whole run is what lets
+/// [`PhysMap::lookup`] answer that buffer with a single [`SubMapping`],
+/// which is all its callers can use. Without it virtio-blk reports a
+/// disk fault for legal memory.
+///
+/// The kernel allows this because the guest physical address space is
+/// linear: `vm_segmap_space` takes any page-aligned range and
+/// `segvmm_fault_space` resolves each page on its own, so one mapping
+/// may cross several memory segments.
+///
+/// A region of any other kind gets a run of itself. A ROM carries the
+/// guest's read-only protection and a reservation has no backing.
+#[derive(Clone)]
+struct TrackedRun {
+    /// The guest address the mapping starts at.
+    gpa: u64,
+    mapping: Arc<Mapping>,
+}
+
+impl TrackedRun {
+    /// The first guest address past this run.
+    fn end(&self) -> u64 {
+        self.gpa + self.mapping.len as u64
+    }
+}
+
 /// The two host mappings of one region.
 struct RegionViews {
-    tracked: Arc<Mapping>,
+    tracked: TrackedRun,
     direct: Arc<Mapping>,
 }
 
@@ -158,6 +189,11 @@ impl AddressSpace {
 /// translation. Regions are non-overlapping and sorted by GPA.
 pub struct PhysMap {
     space: RwLock<AddressSpace>,
+    /// Held for a whole publish, so the run a region joins cannot grow
+    /// between the moment its mapping is made and the moment the
+    /// regions adopt it. `lookup` never takes this, so no guest memory
+    /// access waits on an add.
+    publish: std::sync::Mutex<()>,
     next_segid: i32,
 }
 
@@ -171,6 +207,7 @@ impl PhysMap {
     pub fn new() -> Self {
         Self {
             space: RwLock::new(AddressSpace::default()),
+            publish: std::sync::Mutex::new(()),
             next_segid: 0,
         }
     }
@@ -389,8 +426,10 @@ impl PhysMap {
     /// Tests on a host with no kernel VM need real `lookup` boundaries.
     /// This is the multi-region form of [`Self::new_anon`].
     ///
-    /// Both views share one buffer, as they alias the same pages on a
-    /// real VM.
+    /// A region on its own gets one buffer for both views, as they
+    /// alias the same pages on a real VM. A region that joins a run
+    /// needs a second buffer for the run, which a real VM does not:
+    /// there the run mapping covers the same pages again.
     #[doc(hidden)]
     pub fn add_region_anon(
         &self,
@@ -398,17 +437,23 @@ impl PhysMap {
         len: usize,
         kind: RegionKind,
     ) -> Result<()> {
+        let publish = self.publish_gate();
         let claim =
             self.claim(gpa, len, kind, Prot::RWX, Placement::Firmware)?;
-        let mapping = Arc::new(Mapping::anon(len)?);
-        self.publish_claim(
-            claim,
-            -1,
-            RegionViews {
-                tracked: Arc::clone(&mapping),
-                direct: mapping,
-            },
-        );
+        let direct = Arc::new(Mapping::anon(len)?);
+        let (run_gpa, run_len) = self.run_bounds(gpa, len, kind);
+        let tracked = if (run_gpa, run_len) == (gpa, len) {
+            TrackedRun {
+                gpa,
+                mapping: Arc::clone(&direct),
+            }
+        } else {
+            TrackedRun {
+                gpa: run_gpa,
+                mapping: Arc::new(Mapping::anon(run_len)?),
+            }
+        };
+        self.publish_claim(publish, claim, -1, RegionViews { tracked, direct });
         Ok(())
     }
 
@@ -419,6 +464,7 @@ impl PhysMap {
     /// depend on the views holding different bytes.
     #[cfg(test)]
     fn add_region_split_anon(&self, gpa: u64, len: usize) -> Result<()> {
+        let publish = self.publish_gate();
         let claim = self.claim(
             gpa,
             len,
@@ -427,10 +473,14 @@ impl PhysMap {
             Placement::Firmware,
         )?;
         self.publish_claim(
+            publish,
             claim,
             -1,
             RegionViews {
-                tracked: Arc::new(Mapping::anon(len)?),
+                tracked: TrackedRun {
+                    gpa,
+                    mapping: Arc::new(Mapping::anon(len)?),
+                },
                 direct: Arc::new(Mapping::anon(len)?),
             },
         );
@@ -442,8 +492,12 @@ impl PhysMap {
     /// The range was checked when the claim was taken and the claim has
     /// held it since, so there is nothing left to refuse here. The list
     /// stays sorted by GPA for the binary search in `lookup`.
+    ///
+    /// Takes the publish gate the caller built the run under, so no
+    /// other add can have grown the run in between.
     fn publish_claim(
         &self,
+        _publish: std::sync::MutexGuard<'_, ()>,
         mut claim: RamClaim<'_>,
         segid: i32,
         views: RegionViews,
@@ -468,10 +522,68 @@ impl PhysMap {
                 len: claim.len,
                 kind: claim.kind,
                 segid,
-                tracked: views.tracked,
+                tracked: views.tracked.clone(),
                 direct: views.direct,
             },
         );
+        Self::adopt_run(&mut space, &views.tracked);
+    }
+
+    /// Hold off any other publish. Always taken before the region lock.
+    fn publish_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.publish.lock().expect("physmap publish lock poisoned")
+    }
+
+    /// The guest addresses one tracked mapping has to cover for a new
+    /// region at `[gpa, gpa + len)`.
+    ///
+    /// The caller holds the publish gate, so the answer stays true
+    /// until it publishes. See [`TrackedRun`].
+    fn run_bounds(
+        &self,
+        gpa: u64,
+        len: usize,
+        kind: RegionKind,
+    ) -> (u64, usize) {
+        if kind != RegionKind::Ram {
+            return (gpa, len);
+        }
+
+        let space = self.read_space();
+        let mut start = gpa;
+        let mut end = gpa + len as u64;
+        let ram = |r: &&Region| r.kind == RegionKind::Ram;
+
+        // Regions do not overlap, so at most one meets each end, and
+        // the walk gives up ground it can never take back.
+        while let Some(below) =
+            space.regions.iter().filter(ram).find(|r| r.end() == start)
+        {
+            start = below.gpa;
+        }
+        while let Some(above) =
+            space.regions.iter().filter(ram).find(|r| r.gpa == end)
+        {
+            end = above.end();
+        }
+
+        // `end - start` spans published regions plus this claim, and
+        // every one of them was checked against `usize` when it was
+        // taken.
+        (start, (end - start) as usize)
+    }
+
+    /// Give every region of `run` the run's mapping.
+    ///
+    /// The regions inside the bounds are exactly the ones the run was
+    /// built from, because the caller holds the publish gate.
+    fn adopt_run(space: &mut AddressSpace, run: &TrackedRun) {
+        let end = run.end();
+        for region in space.regions.iter_mut() {
+            if region.gpa >= run.gpa && region.end() <= end {
+                region.tracked = run.clone();
+            }
+        }
     }
 
     fn read_space(&self) -> std::sync::RwLockReadGuard<'_, AddressSpace> {
@@ -491,8 +603,24 @@ impl PhysMap {
     /// This is the view every device gets. Writes through it are
     /// visible to the kernel's dirty page tracking, which is what live
     /// migration reads. See the module comment.
+    ///
+    /// A range that runs from one RAM region into the next is answered,
+    /// because both share one mapping. See [`TrackedRun`].
     pub fn lookup(&self, gpa: u64, len: usize) -> Option<SubMapping> {
-        self.lookup_view(gpa, len, |region| &region.tracked)
+        let end = gpa.checked_add(len as u64)?;
+
+        // The guard is released when this call returns: `SubMapping` owns
+        // an `Arc<Mapping>` and borrows nothing from the region list.
+        let space = self.read_space();
+        let region = Self::region_at(&space.regions, gpa)?;
+        let run = &region.tracked;
+
+        if end > run.end() {
+            return None;
+        }
+
+        let offset = (gpa - run.gpa) as usize;
+        SubMapping::new(&run.mapping).subregion(offset, len)
     }
 
     /// Look up a range in the mapping of the memory segment itself.
@@ -502,26 +630,26 @@ impl PhysMap {
     /// finish before any vCPU runs, and for reads, which must not
     /// disturb the dirty bitmap. Propolis calls this pair
     /// `direct_writable_region` and `direct_readable_region`.
+    ///
+    /// This view is one kernel memory segment, so unlike [`Self::lookup`]
+    /// it stops at the end of the region.
     pub fn lookup_untracked(&self, gpa: u64, len: usize) -> Option<SubMapping> {
-        self.lookup_view(gpa, len, |region| &region.direct)
-    }
-
-    /// Shared body of [`Self::lookup`] and [`Self::lookup_untracked`].
-    fn lookup_view(
-        &self,
-        gpa: u64,
-        len: usize,
-        pick: fn(&Region) -> &Arc<Mapping>,
-    ) -> Option<SubMapping> {
         let end = gpa.checked_add(len as u64)?;
 
-        // The guard is released when this call returns: `SubMapping` owns
-        // an `Arc<Mapping>` and borrows nothing from the region list.
         let space = self.read_space();
+        let region = Self::region_at(&space.regions, gpa)?;
 
-        // Binary search for the region containing this GPA
-        let idx = space
-            .regions
+        if end > region.end() {
+            return None;
+        }
+
+        let offset = (gpa - region.gpa) as usize;
+        SubMapping::new(&region.direct).subregion(offset, len)
+    }
+
+    /// The region holding `gpa`, by binary search over the sorted list.
+    fn region_at(regions: &[Region], gpa: u64) -> Option<&Region> {
+        let idx = regions
             .binary_search_by(|r| {
                 if gpa < r.gpa {
                     std::cmp::Ordering::Greater
@@ -532,16 +660,7 @@ impl PhysMap {
                 }
             })
             .ok()?;
-
-        let region = &space.regions[idx];
-
-        // Verify the entire requested range falls within this region
-        if end > region.end() {
-            return None;
-        }
-
-        let offset = (gpa - region.gpa) as usize;
-        SubMapping::new(pick(region)).subregion(offset, len)
+        regions.get(idx)
     }
 
     /// Get a summary of all memory regions (for migration/diagnostics).
@@ -612,11 +731,17 @@ impl RamClaim<'_> {
         }
         let (map, gpa, len) = (self.map, self.gpa, self.len);
 
+        // Held until the regions adopt the run, so no other add can
+        // grow it in between.
+        let publish = map.publish_gate();
+        let (run_gpa, run_len) = map.run_bounds(gpa, len, self.kind);
+
         // The tracked mapping comes before the kernel mapping. The
         // kernel faults its pages in one at a time on first use, so a
         // mapping of guest addresses that are not backed yet is legal,
         // and one that cannot be made costs nothing to abandon.
-        let tracked = tracked_view(hdl, gpa, len, self.kind, self.guest_prot)?;
+        let tracked =
+            tracked_view(hdl, run_gpa, run_len, self.kind, self.guest_prot)?;
 
         hdl.map_memseg(segid, gpa, len, segoff, self.guest_prot)?;
 
@@ -628,8 +753,16 @@ impl RamClaim<'_> {
                 // A region the guest cannot write has nothing to track,
                 // and the bootrom loader needs `lookup` to stay
                 // writable, so it keeps one view.
-                let tracked = tracked.unwrap_or_else(|| Arc::clone(&direct));
-                map.publish_claim(self, segid, RegionViews { tracked, direct });
+                let tracked = tracked.unwrap_or_else(|| TrackedRun {
+                    gpa,
+                    mapping: Arc::clone(&direct),
+                });
+                map.publish_claim(
+                    publish,
+                    self,
+                    segid,
+                    RegionViews { tracked, direct },
+                );
                 Ok(())
             }
             Err(e) => match hdl.munmap_memseg(gpa, len) {
@@ -666,7 +799,7 @@ fn devmem_view(
     Ok(Arc::new(Mapping::new(len, Prot::RW, hdl, offset)?))
 }
 
-/// Map a slice of the guest physical address space into this process.
+/// Map a run of the guest physical address space into this process.
 ///
 /// This is the view the kernel tracks. `None` for a region the guest
 /// cannot write: there is nothing to track, and the mapping would carry
@@ -678,7 +811,7 @@ fn tracked_view(
     len: usize,
     kind: RegionKind,
     guest_prot: Prot,
-) -> Result<Option<Arc<Mapping>>> {
+) -> Result<Option<TrackedRun>> {
     if kind != RegionKind::Ram {
         return Ok(None);
     }
@@ -688,7 +821,10 @@ fn tracked_view(
             format!("guest address {gpa:#x} exceeds i64"),
         )
     })?;
-    Ok(Some(Arc::new(Mapping::new(len, guest_prot, hdl, offset)?)))
+    Ok(Some(TrackedRun {
+        gpa,
+        mapping: Arc::new(Mapping::new(len, guest_prot, hdl, offset)?),
+    }))
 }
 
 impl Drop for RamClaim<'_> {
