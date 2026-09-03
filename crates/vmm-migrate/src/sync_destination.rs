@@ -153,21 +153,38 @@ fn run_inner<S: Read + Write>(
     set_phase(status, MigrationPhase::TimeData);
     let time_bytes = expect_serialized(recv(ws)?)?;
     let time_data: TimeData = Message::deserialize(&time_bytes)?;
-    state::import_time_data(hdl, &time_data, log)?;
+    if let Err(e) = state::import_time_data(hdl, &time_data, log) {
+        report_failure(ws, &e, log);
+        return Err(e);
+    }
 
     // ── DeviceState ──
     set_phase(status, MigrationPhase::DeviceState);
     let dev_bytes = expect_serialized(recv(ws)?)?;
     let dev_state: DeviceState = Message::deserialize(&dev_bytes)?;
-    state::import_device_state(hdl, &dev_state, log)?;
 
-    // ── Restore device queue state BEFORE resume ──
-    // The guest's vCPUs must not run until virtio rings and NVMe
-    // queues are fully programmed. If we resume first, the guest
-    // immediately tries disk/network I/O with uninitialized state,
-    // causing filesystem hangs (jbd2 blocked) and network death.
+    // The guest's vCPUs must not run until virtio rings and NVMe queues
+    // are programmed. Without the callback nothing can program them, and
+    // the guest resumes into filesystem and network hangs, so refuse.
     let has_virtio = !dev_state.virtio_queues.is_empty();
     let has_nvme = !dev_state.nvme_controllers.is_empty();
+    if (has_virtio || has_nvme) && device_restore.is_none() {
+        let e = MigrateError::State(format!(
+            "payload has {} virtio queues and {} NVMe controllers, but no \
+             device restore callback was installed",
+            dev_state.virtio_queues.len(),
+            dev_state.nvme_controllers.len(),
+        ));
+        report_failure(ws, &e, log);
+        return Err(e);
+    }
+
+    if let Err(e) = state::import_device_state(hdl, &dev_state, log) {
+        report_failure(ws, &e, log);
+        return Err(e);
+    }
+
+    // ── Restore device queue state BEFORE resume ──
     if has_virtio || has_nvme {
         slog::info!(log, "restoring device queue state";
             "virtio_queues" => dev_state.virtio_queues.len(),
@@ -201,6 +218,24 @@ fn run_inner<S: Read + Write>(
     expect_okay(recv(ws)?)?;
     let _ = ws.close(None);
     Ok(())
+}
+
+/// Tell the source why the import stopped.
+///
+/// The source resumes the guest when the migration aborts. It needs the
+/// reason: a dropped connection alone does not say whether the state
+/// was rejected or the network failed.
+fn report_failure<S: Read + Write>(
+    ws: &mut WebSocket<S>,
+    err: &MigrateError,
+    log: &slog::Logger,
+) {
+    slog::error!(log, "migration import failed"; "error" => %err);
+    if let Err(send_err) = send(ws, &Message::Error(err.clone())) {
+        slog::warn!(log, "could not report the failure to the source";
+            "error" => %send_err,
+        );
+    }
 }
 
 #[derive(PartialEq)]
