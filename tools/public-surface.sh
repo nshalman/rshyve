@@ -20,13 +20,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 status=0
 
-# Paths excluded from every rule. None of these are ours to rewrite:
-# vendored upstream C, a verbatim OASIS specification, and archived
-# audit output that is explicitly marked non-authoritative.
+# Paths excluded from every rule: vendored upstream C, which is not ours
+# to rewrite, and this script, which necessarily holds the patterns.
 BASE_EXCLUDES=(
     ':!third_party/*'
-    ':!docs/archive/*'
-    ':!docs/virtio-v1.3-csd01.html'
     ':!tools/public-surface.sh'
 )
 
@@ -58,7 +55,7 @@ report "named lab or build host" \
     '142\.147\.4\.194|us-central\.manta\.mnx\.io'
 
 report "personal or workstation-specific path" \
-    '/Users/[a-z]|sdc\.id_rsa|id_rsa-decrypt'
+    '/Users/[a-z]|~/workspace|sdc\.id_rsa|id_rsa-decrypt'
 
 report "personal identifier" \
     '[A-Za-z0-9._%+-]+@(mnxsolutions|joyent)\.com'

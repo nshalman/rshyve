@@ -475,7 +475,8 @@ pub fn export_device_state(
             }
         };
 
-        // FPU: skip for now (need VM_GET_FPU ioctl)
+        // Not transferred yet. OSF-2 in docs/security/open-findings.md
+        // tracks this; the VM_GET_FPU/VM_SET_FPU bindings already exist.
         let fpu = Vec::new();
 
         // Run state: needed to correctly restore AP vCPUs that are

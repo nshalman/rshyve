@@ -703,9 +703,8 @@ mod tests {
         //   's'=0x73 -> 0xCE, 'w'=0x77 -> 0xEE, 'o'=0x6F -> 0xF6,
         //   'r'=0x72 -> 0x4E, 'd'=0x64 -> 0x26
         //
-        // We verify the result is not just XOR (which was the old bug)
-        // and that encrypting then "decrypting" with DES gives back
-        // the original challenge.
+        // The result must be real DES, not XOR, and encrypting then
+        // "decrypting" must give back the original challenge.
         let challenge: [u8; 16] = [
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
             0x0C, 0x0D, 0x0E, 0x0F, 0x10,
