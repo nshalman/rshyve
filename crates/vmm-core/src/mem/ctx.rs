@@ -37,9 +37,17 @@ impl MemCtx {
     ///
     /// Takes the untracked view. A read fault on the tracked mapping
     /// marks the page dirty, because `segvmm_fault_space` holds every
-    /// page writable. The migration source reads all of RAM on each
-    /// pass, so a tracked read would report all of RAM dirty again and
-    /// the migration would never converge.
+    /// page with the segment's protection, which is writable. The
+    /// migration source reads all of RAM on each pass, so a tracked
+    /// read would report all of RAM dirty again and the migration
+    /// would never converge.
+    ///
+    /// Device emulation also reads through here, so mind the bound the
+    /// untracked view carries: it stops at the end of one region, while
+    /// [`PhysMap::lookup`] spans a run of abutting RAM. Every caller
+    /// today reads inside one page, and regions are page aligned, so
+    /// none can meet a seam. A caller that needs more than a page at
+    /// once must take [`Self::lookup`] instead.
     ///
     /// Returns an error if the GPA range is not mapped.
     pub fn read(&self, gpa: u64, buf: &mut [u8]) -> Result<()> {

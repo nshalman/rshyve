@@ -1968,6 +1968,7 @@ version = "0.1.0"
 dependencies = [
  "bhyve_api",
  "libc",
+ "slog",
  "vmm_core",
  "vmm_devices",
 ]
