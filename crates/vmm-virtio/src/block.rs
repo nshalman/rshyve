@@ -41,6 +41,10 @@ use super::bits;
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::{queue_drain_should_stop, VirtioDevice};
 
+mod discard;
+#[cfg(test)]
+mod tests;
+
 /// Default I/O workers for a single-queue virtio-blk device.
 ///
 /// Matches propolis's default (`propolis-server/src/lib/initializer.rs:61`).
@@ -93,6 +97,15 @@ impl Default for VirtioBlockOpts {
     }
 }
 
+/// Backing-store properties a request is checked against. Copied into
+/// each I/O worker so a request can be bounded without the device handle.
+#[derive(Debug, Clone, Copy)]
+struct DiskLimits {
+    capacity: u64,
+    read_only: bool,
+    nodelete: bool,
+}
+
 /// I/O request sent to worker threads.
 struct BlkIoRequest {
     rtype: u32,
@@ -110,7 +123,7 @@ pub struct VirtioBlock {
     capacity: u64,
     sector_size: u32,
     read_only: bool,
-    #[allow(dead_code)]
+    /// Suppress DISCARD, matching bhyve's `nodelete` block-device option.
     nodelete: bool,
     /// Number of request queues (1 = single queue, >1 = multiqueue).
     num_queues: u16,
@@ -153,6 +166,11 @@ impl VirtioBlock {
         let cache = DiskCache::new(raw_fd, read_only);
 
         // Workers per queue: NUM_WORKERS for single queue, 2 per queue for MQ.
+        let limits = DiskLimits {
+            capacity,
+            read_only,
+            nodelete: opts.nodelete,
+        };
         let workers_per_queue = if num_queues <= 1 { NUM_WORKERS } else { 2 };
         let total_workers = num_queues as usize * workers_per_queue;
         let gate = Arc::new(QuiesceGate::new(total_workers));
@@ -168,7 +186,7 @@ impl VirtioBlock {
                 thread::Builder::new()
                     .name(format!("virtio-blk-q{q}-io-{i}"))
                     .spawn(move || {
-                        blk_io_worker(rx, raw_fd, read_only, physmap, gate);
+                        blk_io_worker(rx, raw_fd, limits, physmap, gate);
                     })
                     .expect("failed to spawn virtio-blk I/O worker");
 
@@ -198,6 +216,14 @@ impl VirtioBlock {
             indicator: Indicator::new(),
             gate,
         })
+    }
+
+    fn limits(&self) -> DiskLimits {
+        DiskLimits {
+            capacity: self.capacity,
+            read_only: self.read_only,
+            nodelete: self.nodelete,
+        }
     }
 
     /// Number of request queues.
@@ -296,10 +322,13 @@ impl VirtioBlock {
                 (bits::VIRTIO_BLK_S_IOERR, 1)
             }
             bits::VIRTIO_BLK_T_DISCARD | bits::VIRTIO_BLK_T_WRITE_ZEROES => {
-                // Accept but treat as no-op for now. The guest gets
-                // success so it can use these hints; actual hole-
-                // punching / zero-fill can be added later.
-                (bits::VIRTIO_BLK_S_OK, 1)
+                discard::execute(
+                    self.fd,
+                    &self.limits(),
+                    header.rtype,
+                    chain,
+                    physmap,
+                )
             }
             _ => (bits::VIRTIO_BLK_S_UNSUPP, 1),
         }
@@ -318,7 +347,10 @@ impl VirtioDevice for VirtioBlock {
             f |= bits::VIRTIO_BLK_F_BLK_SIZE;
         }
         if !self.read_only {
-            f |= bits::VIRTIO_BLK_F_DISCARD | bits::VIRTIO_BLK_F_WRITE_ZEROES;
+            f |= bits::VIRTIO_BLK_F_WRITE_ZEROES;
+            if !self.nodelete {
+                f |= bits::VIRTIO_BLK_F_DISCARD;
+            }
         }
         if self.num_queues > 1 {
             f |= bits::VIRTIO_BLK_F_MQ;
@@ -347,6 +379,29 @@ impl VirtioDevice for VirtioBlock {
         config[0x14..0x18].copy_from_slice(&self.sector_size.to_le_bytes());
         // num_queues at offset 0x22 (2 bytes) — VirtIO block MQ config
         config[0x22..0x24].copy_from_slice(&self.num_queues.to_le_bytes());
+        // DISCARD and WRITE_ZEROES limits (VirtIO 1.3 sec 5.2.4). Linux
+        // reads a zero here as "no limit" (drivers/block/virtio_blk.c),
+        // so every field a negotiated feature implies must be non-zero.
+        if !self.read_only {
+            if !self.nodelete {
+                config[0x24..0x28].copy_from_slice(
+                    &discard::MAX_DISCARD_SECTORS.to_le_bytes(),
+                );
+                config[0x28..0x2C]
+                    .copy_from_slice(&discard::MAX_SEG.to_le_bytes());
+                // Alignment is counted in 512-byte sectors.
+                let align = u64::from(self.sector_size)
+                    .div_ceil(bits::SECTOR_SIZE)
+                    .max(1) as u32;
+                config[0x2C..0x30].copy_from_slice(&align.to_le_bytes());
+            }
+            config[0x30..0x34].copy_from_slice(
+                &discard::MAX_WRITE_ZEROES_SECTORS.to_le_bytes(),
+            );
+            config[0x34..0x38].copy_from_slice(&discard::MAX_SEG.to_le_bytes());
+            // We write zeros instead of deallocating, so never unmap.
+            config[0x38] = 0;
+        }
         let off = offset as usize;
         if off >= config.len() {
             return 0;
@@ -480,11 +535,13 @@ impl VirtioDevice for VirtioBlock {
         //
         // Writes and flushes always dispatch to workers — they may block
         // the thread for milliseconds on ZIL commit, and running inline
-        // would stall the guest vCPU. Reads are near-zero-cost from the
-        // ARC so keeping them inline preserves iodepth=1 read latency.
+        // would stall the guest vCPU. WRITE_ZEROES joins them because it
+        // writes up to 8 MiB per segment. Reads are near-zero-cost from
+        // the ARC so keeping them inline preserves iodepth=1 read latency.
         let all_inline_safe = requests.iter().all(|(_, h, _)| {
             h.rtype != bits::VIRTIO_BLK_T_OUT
                 && h.rtype != bits::VIRTIO_BLK_T_FLUSH
+                && h.rtype != bits::VIRTIO_BLK_T_WRITE_ZEROES
         });
         if requests.len() <= 4 && all_inline_safe {
             for &(head, ref header, ref chain) in &requests {
@@ -588,7 +645,7 @@ impl Lifecycle for VirtioBlock {
 fn blk_io_worker(
     rx: mpsc::Receiver<BlkIoRequest>,
     fd: i32,
-    read_only: bool,
+    limits: DiskLimits,
     physmap: Arc<PhysMap>,
     gate: Arc<QuiesceGate>,
 ) {
@@ -606,7 +663,7 @@ fn blk_io_worker(
 
         // Process first request
         let completion = Arc::clone(&req.completion);
-        let first = process_one_request(fd, read_only, &physmap, req);
+        let first = process_one_request(fd, &limits, &physmap, req);
 
         // Try to drain more pending requests for batching.
         // This reduces Mutex acquisitions in VirtioCompletion:
@@ -616,9 +673,7 @@ fn blk_io_worker(
         while batch.len() < 16 {
             match rx.try_recv() {
                 Ok(req) => {
-                    batch.push(process_one_request(
-                        fd, read_only, &physmap, req,
-                    ));
+                    batch.push(process_one_request(fd, &limits, &physmap, req));
                 }
                 Err(_) => break,
             }
@@ -637,13 +692,13 @@ fn blk_io_worker(
 /// Returns (head, written) for completion batching.
 fn process_one_request(
     fd: i32,
-    read_only: bool,
+    limits: &DiskLimits,
     physmap: &PhysMap,
     req: BlkIoRequest,
 ) -> (u16, u32) {
     let (status, written) = match req.rtype {
         bits::VIRTIO_BLK_T_IN => do_pread(fd, req.sector, &req.chain, physmap),
-        bits::VIRTIO_BLK_T_OUT if !read_only => {
+        bits::VIRTIO_BLK_T_OUT if !limits.read_only => {
             do_pwrite(fd, req.sector, &req.chain, physmap)
         }
         bits::VIRTIO_BLK_T_OUT => (bits::VIRTIO_BLK_S_IOERR, 1),
@@ -655,7 +710,7 @@ fn process_one_request(
             }
         }
         bits::VIRTIO_BLK_T_DISCARD | bits::VIRTIO_BLK_T_WRITE_ZEROES => {
-            (bits::VIRTIO_BLK_S_OK, 1)
+            discard::execute(fd, limits, req.rtype, &req.chain, physmap)
         }
         _ => (bits::VIRTIO_BLK_S_UNSUPP, 1),
     };
@@ -892,395 +947,4 @@ fn write_status(physmap: &PhysMap, chain: &[ChainBuf], status: u8) -> u32 {
         }
     }
     1
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::queue::VirtqDesc;
-    use super::*;
-
-    #[test]
-    fn quiesce_query_is_non_blocking_with_active_worker() {
-        let file = tempfile::tempfile().expect("create tempfile");
-        let fd = file.as_raw_fd();
-        let device: Arc<dyn Lifecycle> = Arc::new(VirtioBlock {
-            fd,
-            capacity: 0,
-            sector_size: 512,
-            read_only: true,
-            nodelete: false,
-            num_queues: 0,
-            workers_per_queue: 0,
-            negotiated_features: Mutex::new(0),
-            io_txs: Vec::new(),
-            next_worker: Vec::new(),
-            physmap: Arc::new(PhysMap::new()),
-            interrupt: Arc::new(Mutex::new(None)),
-            completions: Mutex::new(Vec::new()),
-            _cache: DiskCache::new(fd, true),
-            _file: file,
-            indicator: Indicator::new(),
-            gate: Arc::new(QuiesceGate::new(1)),
-        });
-
-        let probe = Arc::clone(&device);
-        assert!(!vmm_devices_testsupport::assert_query_non_blocking(
-            move || probe.is_quiesced()
-        ));
-    }
-
-    #[test]
-    fn default_opts() {
-        let opts = VirtioBlockOpts::default();
-        assert!(!opts.read_only);
-        assert!(!opts.nodelete);
-        assert_eq!(opts.sector_size, 512);
-    }
-
-    #[test]
-    fn sector_offset_overflow_returns_ioerr() {
-        // sector * SECTOR_SIZE would overflow u64
-        let huge_sector: u64 = u64::MAX / bits::SECTOR_SIZE + 1;
-        assert!(huge_sector.checked_mul(bits::SECTOR_SIZE).is_none());
-    }
-
-    #[test]
-    fn sector_offset_valid() {
-        // Normal sector values should not overflow
-        let sector: u64 = 1_000_000;
-        let offset = sector.checked_mul(bits::SECTOR_SIZE);
-        assert_eq!(offset, Some(512_000_000));
-    }
-
-    #[test]
-    fn bounds_check_overflow() {
-        // sector + sectors_needed overflows u64
-        let sector: u64 = u64::MAX;
-        let sectors_needed: u64 = 1;
-        assert!(sector.checked_add(sectors_needed).is_none());
-    }
-
-    #[test]
-    fn bounds_check_past_capacity() {
-        // sector + sectors_needed > capacity
-        let capacity: u64 = 1000;
-        let sector: u64 = 999;
-        let sectors_needed: u64 = 2;
-        assert!(sector
-            .checked_add(sectors_needed)
-            .is_none_or(|end| end > capacity));
-    }
-
-    #[test]
-    fn bounds_check_exact_fit() {
-        // sector + sectors_needed == capacity should be OK
-        let capacity: u64 = 1000;
-        let sector: u64 = 998;
-        let sectors_needed: u64 = 2;
-        assert!(sector
-            .checked_add(sectors_needed)
-            .is_some_and(|end| end <= capacity));
-    }
-
-    /// Helper: create a VirtioBlock backed by a temporary file.
-    fn make_test_block(size_bytes: u64) -> VirtioBlock {
-        use std::io::Write;
-        let mut tmpfile = tempfile::tempfile().expect("create tempfile");
-        tmpfile.set_len(size_bytes).expect("set file length");
-        // Ensure the file has some content so metadata().len() works
-        tmpfile.write_all(&[0u8; 1]).expect("write to tempfile");
-        tmpfile.flush().expect("flush tempfile");
-        let physmap = Arc::new(PhysMap::new());
-        let opts = VirtioBlockOpts::default();
-        VirtioBlock::new(tmpfile, &opts, physmap, 1)
-            .expect("create VirtioBlock")
-    }
-
-    fn make_get_id_queue(
-        queue_size: u16,
-        avail_idx: u16,
-    ) -> (Arc<PhysMap>, VirtQueue, VirtioBlock) {
-        const DESC_GPA: u64 = 0x1000;
-        const AVAIL_GPA: u64 = 0x1100;
-        const USED_GPA: u64 = 0x1200;
-        const HEADER_GPA: u64 = 0x2000;
-        const DATA_GPA: u64 = 0x3000;
-
-        let physmap = Arc::new(
-            PhysMap::new_anon(DESC_GPA, 0x3000).expect("create queue memory"),
-        );
-        let mut queue = VirtQueue::new(queue_size);
-        queue.set_addr_modern(DESC_GPA, AVAIL_GPA, USED_GPA);
-        queue.set_event_idx(true);
-
-        let header = VirtioBlkReqHdr {
-            rtype: bits::VIRTIO_BLK_T_GET_ID,
-            _reserved: 0,
-            sector: 0,
-        };
-        physmap
-            .lookup(HEADER_GPA, BLK_REQ_HEADER_SIZE)
-            .expect("mapped request header")
-            .write(&header)
-            .expect("write request header");
-        physmap
-            .lookup(DESC_GPA, 16)
-            .expect("mapped header descriptor")
-            .write(&VirtqDesc {
-                addr: HEADER_GPA,
-                len: BLK_REQ_HEADER_SIZE as u32,
-                flags: bits::VRING_DESC_F_NEXT,
-                next: 1,
-            })
-            .expect("write header descriptor");
-        physmap
-            .lookup(DESC_GPA + 16, 16)
-            .expect("mapped data descriptor")
-            .write(&VirtqDesc {
-                addr: DATA_GPA,
-                len: VIRTIO_BLK_ID_BYTES as u32,
-                flags: bits::VRING_DESC_F_WRITE,
-                next: 0,
-            })
-            .expect("write data descriptor");
-
-        physmap
-            .lookup(AVAIL_GPA + 2, 2)
-            .expect("mapped avail index")
-            .write::<u16>(&avail_idx)
-            .expect("write avail index");
-        for idx in 0..queue_size {
-            physmap
-                .lookup(AVAIL_GPA + 4 + u64::from(idx) * 2, 2)
-                .expect("mapped avail entry")
-                .write::<u16>(&0)
-                .expect("write avail entry");
-        }
-
-        let file = tempfile::tempfile().expect("create tempfile");
-        file.set_len(512).expect("set file length");
-        let opts = VirtioBlockOpts::default();
-        let block = VirtioBlock::new(file, &opts, Arc::clone(&physmap), 1)
-            .expect("create VirtioBlock");
-        (physmap, queue, block)
-    }
-
-    #[test]
-    fn notify_queue_caps_collection_at_queue_size() {
-        const AVAIL_EVENT_SENTINEL: u16 = 0x55aa;
-
-        // Four published entries keep has_new_avail() true after this
-        // two-entry queue has processed one queue's worth of work.
-        let (physmap, queue, block) = make_get_id_queue(2, 4);
-        let mut queues = [queue];
-        let avail_event_gpa =
-            queues[0].used_addr() + 4 + u64::from(queues[0].size()) * 8;
-        physmap
-            .lookup(avail_event_gpa, 2)
-            .expect("mapped avail event")
-            .write::<u16>(&AVAIL_EVENT_SENTINEL)
-            .expect("write avail event sentinel");
-
-        block.notify_queue(0, &mut queues, &physmap);
-
-        assert_eq!(queues[0].last_avail_idx(), queues[0].size());
-        assert!(queues[0].has_new_avail(&physmap));
-        assert_eq!(queues[0].read_used_ring_idx(&physmap), queues[0].size());
-        assert_eq!(
-            physmap
-                .lookup(avail_event_gpa, 2)
-                .expect("mapped avail event")
-                .read::<u16>()
-                .expect("read avail event"),
-            AVAIL_EVENT_SENTINEL,
-        );
-    }
-
-    #[test]
-    fn notify_queue_drains_ring_and_updates_avail_event() {
-        let (physmap, queue, block) = make_get_id_queue(4, 2);
-        let mut queues = [queue];
-        let avail_event_gpa =
-            queues[0].used_addr() + 4 + u64::from(queues[0].size()) * 8;
-
-        block.notify_queue(0, &mut queues, &physmap);
-
-        assert_eq!(queues[0].last_avail_idx(), 2);
-        assert_eq!(queues[0].read_used_ring_idx(&physmap), 2);
-        assert_eq!(
-            physmap
-                .lookup(avail_event_gpa, 2)
-                .expect("mapped avail event")
-                .read::<u16>()
-                .expect("read avail event"),
-            2,
-        );
-    }
-
-    #[test]
-    fn device_id_returns_valid_20_bytes() {
-        let blk = make_test_block(512 * 1024);
-        let id = blk.device_id();
-        assert_eq!(id.len(), VIRTIO_BLK_ID_BYTES);
-        assert_eq!(id.len(), 20);
-        // Should start with "vmm-virtio-blk"
-        let s = std::str::from_utf8(&id[..14]).unwrap();
-        assert_eq!(s, "vmm-virtio-blk");
-        // Remaining bytes should be zero-padded
-        for &b in &id[14..] {
-            assert_eq!(b, 0);
-        }
-    }
-
-    #[test]
-    fn config_size_returns_ext() {
-        let blk = make_test_block(512 * 1024);
-        assert_eq!(blk.config_size(), BLK_CONFIG_SIZE_EXT);
-        assert_eq!(blk.config_size(), 60);
-    }
-
-    #[test]
-    fn device_features_includes_expected_bits() {
-        let blk = make_test_block(512 * 1024);
-        let f = blk.device_features();
-        // Must have FLUSH, SIZE_MAX, SEG_MAX
-        assert_ne!(f & bits::VIRTIO_BLK_F_FLUSH, 0, "FLUSH not set");
-        assert_ne!(f & bits::VIRTIO_BLK_F_SIZE_MAX, 0, "SIZE_MAX not set");
-        assert_ne!(f & bits::VIRTIO_BLK_F_SEG_MAX, 0, "SEG_MAX not set");
-    }
-
-    #[test]
-    fn device_features_includes_discard_write_zeroes() {
-        let blk = make_test_block(512 * 1024);
-        let f = blk.device_features();
-        // Non-readonly device should have DISCARD and WRITE_ZEROES
-        assert_ne!(f & bits::VIRTIO_BLK_F_DISCARD, 0, "DISCARD not set");
-        assert_ne!(
-            f & bits::VIRTIO_BLK_F_WRITE_ZEROES,
-            0,
-            "WRITE_ZEROES not set"
-        );
-    }
-
-    #[test]
-    fn device_features_includes_event_idx_and_indirect() {
-        let blk = make_test_block(512 * 1024);
-        let f = blk.device_features();
-        // EVENT_IDX and INDIRECT_DESC are included in device features.
-        // Legacy transport strips them in pci.rs; modern advertises them.
-        assert_ne!(
-            f & bits::VIRTIO_F_RING_EVENT_IDX,
-            0,
-            "EVENT_IDX should be in device features"
-        );
-        assert_ne!(
-            f & bits::VIRTIO_F_RING_INDIRECT_DESC,
-            0,
-            "INDIRECT_DESC should be in device features"
-        );
-    }
-
-    #[test]
-    fn device_features_excludes_ro_for_writable() {
-        let blk = make_test_block(512 * 1024);
-        let f = blk.device_features();
-        assert_eq!(
-            f & bits::VIRTIO_BLK_F_RO,
-            0,
-            "RO should not be set for writable device"
-        );
-    }
-
-    #[test]
-    fn device_features_includes_ro_for_readonly() {
-        use std::io::Write;
-        let mut tmpfile = tempfile::tempfile().expect("create tempfile");
-        tmpfile.set_len(512 * 1024).expect("set file length");
-        tmpfile.write_all(&[0u8; 1]).expect("write");
-        tmpfile.flush().expect("flush");
-        let physmap = Arc::new(PhysMap::new());
-        let opts = VirtioBlockOpts {
-            read_only: true,
-            ..Default::default()
-        };
-        let blk = VirtioBlock::new(tmpfile, &opts, physmap, 1).unwrap();
-        let f = blk.device_features();
-        assert_ne!(
-            f & bits::VIRTIO_BLK_F_RO,
-            0,
-            "RO should be set for readonly device"
-        );
-        // Readonly should NOT have DISCARD or WRITE_ZEROES
-        assert_eq!(f & bits::VIRTIO_BLK_F_DISCARD, 0);
-        assert_eq!(f & bits::VIRTIO_BLK_F_WRITE_ZEROES, 0);
-    }
-
-    #[test]
-    fn cfg_read_capacity() {
-        // 512 * 1024 bytes / 512 sector_size = 1024 sectors
-        let blk = make_test_block(512 * 1024);
-        // Capacity is at config offset 0x00, 8 bytes (little-endian u64)
-        let lo = blk.cfg_read(0x00, 4);
-        let hi = blk.cfg_read(0x04, 4);
-        let capacity = u64::from(lo) | (u64::from(hi) << 32);
-        assert_eq!(capacity, 1024);
-    }
-
-    #[test]
-    fn cfg_read_size_max() {
-        let blk = make_test_block(512 * 1024);
-        // size_max at offset 0x08
-        let val = blk.cfg_read(0x08, 4);
-        assert_eq!(val, SIZE_MAX);
-        assert_eq!(val, 128 * 1024);
-    }
-
-    #[test]
-    fn cfg_read_seg_max() {
-        let blk = make_test_block(512 * 1024);
-        // seg_max at offset 0x0C
-        let val = blk.cfg_read(0x0C, 4);
-        assert_eq!(val, SEG_MAX);
-        assert_eq!(val, 126);
-    }
-
-    #[test]
-    fn cfg_read_blk_size() {
-        let blk = make_test_block(512 * 1024);
-        // blk_size at offset 0x14
-        let val = blk.cfg_read(0x14, 4);
-        assert_eq!(val, 512);
-    }
-
-    #[test]
-    fn cfg_read_out_of_range() {
-        let blk = make_test_block(512 * 1024);
-        // Reading past config space should return 0
-        let val = blk.cfg_read(0xFF, 4);
-        assert_eq!(val, 0);
-    }
-
-    #[test]
-    fn num_queues_single() {
-        let blk = make_test_block(512 * 1024);
-        assert_eq!(blk.num_queues(), 1);
-    }
-
-    #[test]
-    fn device_features_mq_only_with_multiple_queues() {
-        use std::io::Write;
-        // Single queue: MQ should not be set
-        let blk_single = make_test_block(512 * 1024);
-        assert_eq!(blk_single.device_features() & bits::VIRTIO_BLK_F_MQ, 0);
-
-        // Multiple queues: MQ should be set
-        let mut tmpfile = tempfile::tempfile().expect("create tempfile");
-        tmpfile.set_len(512 * 1024).expect("set len");
-        tmpfile.write_all(&[0u8; 1]).expect("write");
-        tmpfile.flush().expect("flush");
-        let physmap = Arc::new(PhysMap::new());
-        let opts = VirtioBlockOpts::default();
-        let blk_mq = VirtioBlock::new(tmpfile, &opts, physmap, 2).unwrap();
-        assert_ne!(blk_mq.device_features() & bits::VIRTIO_BLK_F_MQ, 0);
-    }
 }
