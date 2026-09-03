@@ -8,12 +8,14 @@
 //! hooks for VM state transitions and migration support.
 
 pub mod acpi;
+pub mod acpi_gpe;
 pub mod acpi_pm;
 pub mod aml;
 pub mod bhyve;
 pub mod blkdev;
 pub mod chipset;
 pub mod fwcfg;
+pub mod hotplug;
 pub mod input;
 pub mod lifecycle;
 pub mod migrate;

@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -185,13 +186,83 @@ where
     result
 }
 
+/// A device, with the id its owner knows it by.
+///
+/// A type name alone cannot tell two virtio-blk devices apart.
+#[derive(Clone)]
+pub struct NamedDevice {
+    pub id: Option<String>,
+    pub device: Arc<dyn Lifecycle>,
+}
+
+/// One device that missed the quiesce deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StuckDevice {
+    pub type_name: &'static str,
+    /// Registry id, when the caller had one.
+    pub id: Option<String>,
+}
+
+impl fmt::Display for StuckDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.id {
+            Some(id) => write!(f, "{} ({id})", self.type_name),
+            None => f.write_str(self.type_name),
+        }
+    }
+}
+
 pub struct QuiesceReport {
+    /// Type names of the stuck devices, in wait order. Read
+    /// [`devices`](Self::devices) to tell two of a type apart.
     pub stuck: Vec<&'static str>,
+    devices: Vec<StuckDevice>,
 }
 
 impl QuiesceReport {
+    /// Build a report from type names, for a caller that has no ids.
+    pub fn new(stuck: Vec<&'static str>) -> Self {
+        Self::from_devices(
+            stuck
+                .into_iter()
+                .map(|type_name| StuckDevice {
+                    type_name,
+                    id: None,
+                })
+                .collect(),
+        )
+    }
+
+    pub fn from_devices(devices: Vec<StuckDevice>) -> Self {
+        let stuck = devices.iter().map(|dev| dev.type_name).collect();
+        Self { stuck, devices }
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.stuck.is_empty()
+        self.devices.is_empty()
+    }
+
+    pub fn devices(&self) -> &[StuckDevice] {
+        &self.devices
+    }
+
+    /// Names for a log line: id when there is one, type name otherwise.
+    pub fn names(&self) -> Vec<String> {
+        self.devices.iter().map(StuckDevice::to_string).collect()
+    }
+}
+
+/// Wait for one device, returning false when the deadline passed first.
+fn wait_quiesced(dev: &dyn Lifecycle, deadline: Instant) -> bool {
+    loop {
+        if dev.is_quiesced() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5).min(deadline - now));
     }
 }
 
@@ -206,19 +277,32 @@ pub fn wait_all_quiesced(
     let deadline = Instant::now() + budget;
     let mut stuck = Vec::new();
     for dev in devs {
-        loop {
-            if dev.is_quiesced() {
-                break;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                stuck.push(dev.type_name());
-                break;
-            }
-            thread::sleep(Duration::from_millis(5).min(deadline - now));
+        if !wait_quiesced(dev.as_ref(), deadline) {
+            stuck.push(StuckDevice {
+                type_name: dev.type_name(),
+                id: None,
+            });
         }
     }
-    QuiesceReport { stuck }
+    QuiesceReport::from_devices(stuck)
+}
+
+/// The same wait, for a caller that can name each device.
+pub fn wait_all_quiesced_named(
+    devs: &[NamedDevice],
+    budget: Duration,
+) -> QuiesceReport {
+    let deadline = Instant::now() + budget;
+    let mut stuck = Vec::new();
+    for named in devs {
+        if !wait_quiesced(named.device.as_ref(), deadline) {
+            stuck.push(StuckDevice {
+                type_name: named.device.type_name(),
+                id: named.id.clone(),
+            });
+        }
+    }
+    QuiesceReport::from_devices(stuck)
 }
 
 #[cfg(test)]
@@ -374,6 +458,57 @@ mod tests {
 
         assert_eq!(report.stuck, vec!["never"]);
         assert!(started.elapsed() <= budget * 2);
+    }
+
+    #[test]
+    fn named_wait_tells_two_devices_of_one_type_apart() {
+        // Two virtio-blk devices share a type name, so only the id can
+        // say which one is wedged.
+        let devices = vec![
+            NamedDevice {
+                id: Some("blk@4".to_string()),
+                device: Arc::new(NeverQuiesces) as Arc<dyn Lifecycle>,
+            },
+            NamedDevice {
+                id: Some("blk@5".to_string()),
+                device: Arc::new(NeverQuiesces) as Arc<dyn Lifecycle>,
+            },
+        ];
+
+        let report =
+            wait_all_quiesced_named(&devices, Duration::from_millis(20));
+
+        assert_eq!(report.stuck, vec!["never", "never"]);
+        assert_eq!(report.names(), ["never (blk@4)", "never (blk@5)"]);
+        assert_eq!(report.devices()[0].id.as_deref(), Some("blk@4"));
+    }
+
+    #[test]
+    fn a_report_with_no_ids_names_the_type() {
+        let report = QuiesceReport::new(vec!["virtio-blk"]);
+
+        assert!(!report.is_empty());
+        assert_eq!(report.stuck, vec!["virtio-blk"]);
+        assert_eq!(report.names(), ["virtio-blk"]);
+        assert!(QuiesceReport::new(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn a_quiesced_device_is_not_reported() {
+        let devices = vec![NamedDevice {
+            id: Some("stub@4".to_string()),
+            device: Arc::new(FlushTestDevice::new(
+                0,
+                Duration::ZERO,
+                SHORT_BUDGETS,
+            )) as Arc<dyn Lifecycle>,
+        }];
+
+        let report =
+            wait_all_quiesced_named(&devices, Duration::from_millis(20));
+
+        assert!(report.is_empty());
+        assert!(report.devices().is_empty());
     }
 
     #[test]

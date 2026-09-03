@@ -43,6 +43,27 @@ impl AcpiTables {
     }
 }
 
+/// Whether this VM publishes the ACPI hotplug interface.
+///
+/// The FADT GPE0_BLK field, the DSDT `\_GPE` methods and the I/O port
+/// claims in [`crate::pm::setup_timers_and_pm`] must agree. All of them
+/// read this one decision from the same `Cli`, so a VM can never claim
+/// a port that its own tables do not name.
+pub fn hotplug_enabled(cli: &Cli) -> bool {
+    cli.hotplug
+}
+
+/// The fw_cfg NB_CPUS and MAX_CPUS words.
+///
+/// OVMF sizes its per-CPU structures from MAX_CPUS, so that word follows
+/// the MADT slot count and not the boot CPU count.
+fn fw_cfg_cpu_counts(cfg: &acpi::AcpiConfig) -> (Vec<u8>, Vec<u8>) {
+    (
+        (cfg.num_cpus as u16).to_le_bytes().to_vec(),
+        (cfg.max_cpus as u16).to_le_bytes().to_vec(),
+    )
+}
+
 /// Set up the fw_cfg device with the E820 memory map, ACPI tables (both
 /// table-loader protocol and legacy GPA), SMBIOS tables, and boot order.
 ///
@@ -57,14 +78,19 @@ pub fn setup_fwcfg_and_acpi(
     tpm_acpi: Option<acpi::TpmAcpi>,
     log: &Logger,
 ) -> anyhow::Result<(Arc<FwCfg>, AcpiTables)> {
+    // A CPU ceiling the kernel cannot honour must stop the boot here,
+    // not reach the guest as a MADT full of slots it cannot use.
+    let acpi_cfg = acpi::AcpiConfig::new(num_cpus, cli.max_cpus()?)?
+        .with_hotplug(hotplug_enabled(cli));
+
     let fwcfg = FwCfg::new();
     fwcfg.attach(machine.bus_pio());
     info!(log, "fw_cfg attached"; "selector_port" => "0x510", "data_port" => "0x511");
 
     // OVMF reads these for SMP initialization.
-    let nb_cpus = (num_cpus as u16).to_le_bytes().to_vec();
-    fwcfg.insert_legacy(0x05, nb_cpus.clone()); // NB_CPUS
-    fwcfg.insert_legacy(0x0F, nb_cpus); // MAX_CPUS
+    let (nb_cpus, max_cpus) = fw_cfg_cpu_counts(&acpi_cfg);
+    fwcfg.insert_legacy(0x05, nb_cpus); // NB_CPUS
+    fwcfg.insert_legacy(0x0F, max_cpus); // MAX_CPUS
 
     let e820_data = acpi::build_e820(machine.mem_size());
     fwcfg.insert_named("etc/e820", e820_data);
@@ -76,12 +102,16 @@ pub fn setup_fwcfg_and_acpi(
     // blob-relative offsets that the UEFI firmware patches through the
     // etc/table-loader commands. With --vtpm on, the TPM2 ACPI table is
     // appended so OVMF surfaces the device to the guest.
-    let acpi_layout =
-        acpi::generate_acpi_layout_with_tpm2(num_cpus, None, tpm_acpi.clone());
+    let acpi_layout = acpi::generate_acpi_layout_for_config(
+        &acpi_cfg,
+        None,
+        tpm_acpi.clone(),
+    );
     info!(log, "ACPI layout generated for table-loader protocol";
         "tables_size" => acpi_layout.tables.len(),
         "rsdp_size" => acpi_layout.rsdp.len(),
         "num_cpus" => num_cpus,
+        "max_cpus" => acpi_cfg.max_cpus,
         "with_tpm2" => tpm_acpi.is_some(),
     );
 
@@ -104,7 +134,7 @@ pub fn setup_fwcfg_and_acpi(
 
     // Threading the same TPM description here keeps the BIOS-scan and
     // UEFI views in sync.
-    write_legacy_acpi_tables(machine, num_cpus, tpm_acpi, log);
+    write_legacy_acpi_tables(machine, &acpi_cfg, tpm_acpi, log);
 
     write_smbios_tables(machine, &fwcfg, cli, num_cpus, mem_size, log);
 
@@ -115,11 +145,11 @@ pub fn setup_fwcfg_and_acpi(
 /// scan area for compatibility with both UEFI and BIOS discovery paths.
 pub fn write_legacy_acpi_tables(
     machine: &Machine,
-    num_cpus: u32,
+    acpi_cfg: &acpi::AcpiConfig,
     tpm_acpi: Option<acpi::TpmAcpi>,
     log: &Logger,
 ) {
-    let acpi_tables = acpi::generate_acpi_tables_with_tpm2(num_cpus, tpm_acpi);
+    let acpi_tables = acpi::generate_acpi_tables_for_config(acpi_cfg, tpm_acpi);
 
     // A second RSDP at 0xE0000 is easier for a scanning guest to find.
     let rsdp_size = 36;
@@ -230,7 +260,14 @@ pub fn write_smbios_tables(
 mod tests {
     use vmm_devices::acpi::BHYVE_ACPI_BASE;
 
-    use super::{AcpiTables, SMBIOS_EP_GPA, SMBIOS_TABLE_GPA};
+    use super::{
+        fw_cfg_cpu_counts, hotplug_enabled, AcpiTables, Cli, SMBIOS_EP_GPA,
+        SMBIOS_TABLE_GPA,
+    };
+
+    fn cli(argv: &[&str]) -> Cli {
+        Cli::try_parse_named("rshyve", argv).expect("valid argv parses")
+    }
 
     /// The token invariants below cannot be exercised without a live VM,
     /// so read them out of the source instead. The slice stops at the
@@ -260,6 +297,60 @@ mod tests {
         // One field declaration and one construction. A second
         // construction could name an address the tables never went to.
         assert_eq!(src.matches("rsdp_addr:").count(), 2);
+    }
+
+    #[test]
+    fn fw_cfg_max_cpus_follows_the_madt_slot_count() {
+        use vmm_devices::acpi::AcpiConfig;
+
+        let cfg = AcpiConfig::new(2, 8).expect("2 boot CPUs of 8 slots");
+        let (nb_cpus, max_cpus) = fw_cfg_cpu_counts(&cfg);
+        assert_eq!(nb_cpus, 2u16.to_le_bytes());
+        assert_eq!(max_cpus, 8u16.to_le_bytes());
+
+        // Today's VMs ask for no spare slots, so both words match and the
+        // firmware sees what it always did.
+        let (nb_cpus, max_cpus) = fw_cfg_cpu_counts(&AcpiConfig::boot_only(4));
+        assert_eq!(nb_cpus, 4u16.to_le_bytes());
+        assert_eq!(nb_cpus, max_cpus);
+    }
+
+    #[test]
+    fn only_an_operator_publishes_the_hotplug_interface() {
+        // Without --hotplug the FADT keeps GPE0_BLK = 0 and the GPE0,
+        // PCI and CPU ports stay free for the guest.
+        assert!(!hotplug_enabled(&cli(&["rshyve", "guest"])));
+        assert!(hotplug_enabled(&cli(&["rshyve", "--hotplug", "guest"])));
+    }
+
+    #[test]
+    fn the_tables_read_the_shared_hotplug_decision() {
+        // A live VM is needed to call setup_fwcfg_and_acpi, so read the
+        // source instead. One AcpiConfig, built from hotplug_enabled(),
+        // is what keeps the tables and the GPE0 port claim in step.
+        let src = implementation();
+        assert_eq!(src.matches("AcpiConfig::new(").count(), 1);
+        assert_eq!(
+            src.matches(".with_hotplug(hotplug_enabled(cli))").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_madt_slot_count_is_the_ceiling_the_registers_read() {
+        // The MADT LAPIC entries and the CPU hotplug AML both read
+        // AcpiConfig::max_cpus, and the register file reads
+        // Cli::max_cpus through HotplugOpts::from_cli. A ceiling built
+        // here from anything else would describe a machine with slots
+        // the register file has not got, or hide slots the hot-add
+        // engine will fill. A live VM is needed to call
+        // setup_fwcfg_and_acpi, so the one construction is pinned in
+        // the source.
+        assert!(
+            implementation()
+                .contains("AcpiConfig::new(num_cpus, cli.max_cpus()?)"),
+            "the tables no longer read Cli::max_cpus",
+        );
     }
 
     #[test]

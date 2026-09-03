@@ -6,6 +6,15 @@
 # Output: ./vmlinuz-fastboot  bzImage, gzip self-decompressing
 #         ./vmlinux-fastboot  uncompressed ELF with the PVH entry note
 #
+# KERNEL_EXTRA_CONFIG layers further config fragments on fastboot.config
+# and KERNEL_OUT_SUFFIX renames the output, which builds a variant
+# without disturbing the kernel the boot benchmarks measure. Several
+# fragments can be given, separated by spaces, and are applied in order:
+#
+#   KERNEL_EXTRA_CONFIG=virtiofs.config KERNEL_OUT_SUFFIX=-virtiofs ./build.sh
+#   KERNEL_EXTRA_CONFIG="virtiofs.config msi.config" \
+#       KERNEL_OUT_SUFFIX=-virtiofs-msi ./build.sh
+#
 # Both come from one compile. The PVH image skips the real-mode stub
 # and the self-decompression, which the Firecracker NSDI paper measures
 # at about 40 ms.
@@ -15,8 +24,17 @@ set -euo pipefail
 KERNEL_VERSION="${1:-6.12.13}"
 KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+EXTRA_CONFIG="${KERNEL_EXTRA_CONFIG:-}"
+OUT_SUFFIX="${KERNEL_OUT_SUFFIX:-}"
 
-echo "=== Building Linux ${KERNEL_VERSION} fast-boot kernel ==="
+for frag in $EXTRA_CONFIG; do
+    if [ ! -f "$SCRIPT_DIR/$frag" ]; then
+        echo "BUILD-FAIL: no config fragment at $SCRIPT_DIR/$frag"
+        exit 1
+    fi
+done
+
+echo "=== Building Linux ${KERNEL_VERSION} fast-boot kernel ${EXTRA_CONFIG:+(+ $EXTRA_CONFIG)} ==="
 
 docker run --rm \
     --platform linux/amd64 \
@@ -42,8 +60,13 @@ cd linux-${KERNEL_VERSION}
 # Start from tinyconfig (absolute minimum) then layer our config
 make ARCH=x86_64 tinyconfig
 
-# Apply our fast-boot config on top
+# Apply our fast-boot config on top. kconfig keeps the last assignment
+# of an option, so a fragment appended here overrides fastboot.config.
 cat /build/fastboot.config >> .config
+EXTRA=\"${EXTRA_CONFIG}\"
+for frag in \$EXTRA; do
+    cat /build/\$frag >> .config
+done
 make ARCH=x86_64 olddefconfig
 
 # Show kernel size estimate
@@ -58,21 +81,32 @@ grep -q '^CONFIG_PVH=y' .config || {
     exit 1
 }
 
+# Same check for every option the fragment asked for. olddefconfig drops
+# an option whose dependencies are unmet without saying so.
+for frag in \$EXTRA; do
+    for opt in \$(grep -o '^CONFIG_[A-Z0-9_]*=y' /build/\$frag); do
+        grep -q \"^\$opt\" .config || {
+            echo \"BUILD-FAIL: \$opt was dropped by olddefconfig\"
+            exit 1
+        }
+    done
+done
+
 # Build
 make ARCH=x86_64 -j\$(nproc) bzImage 2>&1 | tail -20
 
 # Copy output. --strip-all keeps allocatable sections, so the PT_NOTE
 # carrying the PVH entry survives.
-cp arch/x86_64/boot/bzImage /build/vmlinuz-fastboot
-objcopy --strip-all vmlinux /build/vmlinux-fastboot
+cp arch/x86_64/boot/bzImage /build/vmlinuz-fastboot${OUT_SUFFIX}
+objcopy --strip-all vmlinux /build/vmlinux-fastboot${OUT_SUFFIX}
 
-readelf -n /build/vmlinux-fastboot | grep -qi xen || {
+readelf -n /build/vmlinux-fastboot${OUT_SUFFIX} | grep -qi xen || {
     echo 'BUILD-FAIL: vmlinux carries no Xen PVH note'
     exit 1
 }
 
-ls -la /build/vmlinuz-fastboot /build/vmlinux-fastboot
+ls -la /build/vmlinuz-fastboot${OUT_SUFFIX} /build/vmlinux-fastboot${OUT_SUFFIX}
 echo '=== Kernels built successfully ==='
-echo \"bzImage: \$(du -h /build/vmlinuz-fastboot | cut -f1)\"
-echo \"PVH ELF: \$(du -h /build/vmlinux-fastboot | cut -f1)\"
+echo \"bzImage: \$(du -h /build/vmlinuz-fastboot${OUT_SUFFIX} | cut -f1)\"
+echo \"PVH ELF: \$(du -h /build/vmlinux-fastboot${OUT_SUFFIX} | cut -f1)\"
 "

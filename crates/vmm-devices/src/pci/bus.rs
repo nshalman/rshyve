@@ -10,6 +10,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use thiserror::Error;
+
+use super::bits;
 use super::device::PciDevice;
 use super::Bdf;
 
@@ -19,6 +22,14 @@ const FUNCS_PER_SLOT: usize = 8;
 type PciSlot = [Option<Arc<dyn PciDevice>>; FUNCS_PER_SLOT];
 type PciSlots = [PciSlot; SLOTS_PER_BUS];
 
+/// Reason an attach request was refused.
+#[derive(Debug, Error)]
+pub enum AttachError {
+    /// Another device holds this BDF.
+    #[error("device already attached at BDF {0}")]
+    SlotOccupied(Bdf),
+}
+
 /// PCI bus holding up to 32 device slots, each with up to 8 functions.
 pub struct PciBus {
     inner: Mutex<PciBusInner>,
@@ -27,6 +38,22 @@ pub struct PciBus {
 struct PciBusInner {
     /// 32 slots x 8 functions.
     slots: Box<PciSlots>,
+}
+
+/// Set or clear the multi-function bit in function 0's header type.
+///
+/// The caller must not hold the bus lock: a device config access can
+/// re-enter the PIO/MMIO buses.
+fn set_multifunc(func0: &Arc<dyn PciDevice>, multifunc: bool) {
+    let cur = func0.cfg_read(bits::REG_HEADER_TYPE, 1) as u8;
+    let new = if multifunc {
+        cur | bits::HEADER_TYPE_MULTIFUNC
+    } else {
+        cur & !bits::HEADER_TYPE_MULTIFUNC
+    };
+    if new != cur {
+        func0.cfg_write(bits::REG_HEADER_TYPE, 1, u32::from(new));
+    }
 }
 
 impl PciBus {
@@ -44,28 +71,70 @@ impl PciBus {
     ///
     /// # Panics
     ///
-    /// Panics if a device is already attached at this BDF.
+    /// Panics if a device is already attached at this BDF. Use
+    /// [`try_attach`](Self::try_attach) when the BDF comes from a
+    /// request at run time.
     pub fn attach(&self, bdf: Bdf, dev: Arc<dyn PciDevice>) {
-        let mut inner = self.inner.lock().expect("PciBus lock poisoned");
-
-        // When attaching at function > 0, set the multi-function bit
-        // on function 0's header type so the guest scans all functions.
-        if bdf.func() > 0 {
-            if let Some(func0) = inner.slots[bdf.dev() as usize][0].clone() {
-                let cur = func0.cfg_read(super::bits::REG_HEADER_TYPE, 1) as u8;
-                if cur & super::bits::HEADER_TYPE_MULTIFUNC == 0 {
-                    func0.cfg_write(
-                        super::bits::REG_HEADER_TYPE,
-                        1,
-                        u32::from(cur | super::bits::HEADER_TYPE_MULTIFUNC),
-                    );
-                }
-            }
+        if let Err(e) = self.try_attach(bdf, dev) {
+            panic!("{e}");
         }
+    }
 
-        let slot = &mut inner.slots[bdf.dev() as usize][bdf.func() as usize];
-        assert!(slot.is_none(), "device already attached at BDF {}", bdf);
-        *slot = Some(dev);
+    /// Attach a PCI device, returning an error if the BDF is occupied.
+    pub fn try_attach(
+        &self,
+        bdf: Bdf,
+        dev: Arc<dyn PciDevice>,
+    ) -> Result<(), AttachError> {
+        let func0 = {
+            let mut inner = self.inner.lock().expect("PciBus lock poisoned");
+            let slot =
+                &mut inner.slots[bdf.dev() as usize][bdf.func() as usize];
+            if slot.is_some() {
+                return Err(AttachError::SlotOccupied(bdf));
+            }
+            *slot = Some(dev);
+
+            // A device at function > 0 is only scanned by the guest when
+            // function 0 reports multi-function.
+            if bdf.func() > 0 {
+                inner.slots[bdf.dev() as usize][0].clone()
+            } else {
+                None
+            }
+        };
+
+        if let Some(func0) = func0 {
+            set_multifunc(&func0, true);
+        }
+        Ok(())
+    }
+
+    /// Remove the device at the given BDF and return it.
+    ///
+    /// Returns `None` if the slot is empty.
+    pub fn detach(&self, bdf: &Bdf) -> Option<Arc<dyn PciDevice>> {
+        let mut inner = self.inner.lock().expect("PciBus lock poisoned");
+        let dev =
+            inner.slots[bdf.dev() as usize][bdf.func() as usize].take()?;
+
+        // The slot stops being multi-function when the last function > 0
+        // leaves.
+        let func0 = if bdf.func() > 0
+            && inner.slots[bdf.dev() as usize][1..]
+                .iter()
+                .all(Option::is_none)
+        {
+            inner.slots[bdf.dev() as usize][0].clone()
+        } else {
+            None
+        };
+        drop(inner);
+
+        if let Some(func0) = func0 {
+            set_multifunc(&func0, false);
+        }
+        Some(dev)
     }
 
     /// Read from PCI configuration space.
@@ -160,6 +229,41 @@ mod tests {
 
     use super::super::BarN;
 
+    /// Test device that stores the header type byte written to it.
+    struct HeaderDevice {
+        header_type: Mutex<u8>,
+    }
+
+    impl HeaderDevice {
+        fn new() -> Self {
+            Self {
+                header_type: Mutex::new(bits::HEADER_TYPE_DEVICE),
+            }
+        }
+
+        fn header_type(&self) -> u8 {
+            *self.header_type.lock().expect("header lock poisoned")
+        }
+    }
+
+    impl PciDevice for HeaderDevice {
+        fn cfg_read(&self, offset: u8, _len: u8) -> u32 {
+            match offset {
+                bits::REG_HEADER_TYPE => u32::from(self.header_type()),
+                _ => 0,
+            }
+        }
+
+        fn cfg_write(&self, offset: u8, _len: u8, val: u32) {
+            if offset == bits::REG_HEADER_TYPE {
+                *self.header_type.lock().expect("header lock poisoned") =
+                    val as u8;
+            }
+        }
+
+        fn bar_rw(&self, _bar: BarN, _offset: usize, _rwo: RWOp<'_>) {}
+    }
+
     #[test]
     fn empty_slot_returns_all_ones() {
         let bus = PciBus::new();
@@ -244,6 +348,83 @@ mod tests {
         });
         bus.attach(bdf, dev1);
         bus.attach(bdf, dev2);
+    }
+
+    #[test]
+    fn try_attach_occupied_keeps_first_device() {
+        let bus = PciBus::new();
+        let bdf = Bdf::new_unchecked(0, 0, 0);
+        let dev1: Arc<dyn PciDevice> = Arc::new(TestDevice {
+            vendor_id: 0x1111,
+            device_id: 0x2222,
+        });
+        let dev2: Arc<dyn PciDevice> = Arc::new(TestDevice {
+            vendor_id: 0x3333,
+            device_id: 0x4444,
+        });
+        bus.try_attach(bdf, dev1).expect("first attach");
+
+        let err = bus.try_attach(bdf, dev2).expect_err("slot is occupied");
+        assert!(matches!(err, AttachError::SlotOccupied(b) if b == bdf));
+        assert_eq!(bus.config_read(&bdf, 0x00, 2), 0x1111);
+    }
+
+    #[test]
+    fn detach_returns_the_device() {
+        let bus = PciBus::new();
+        let bdf = Bdf::new_unchecked(0, 6, 0);
+        let dev: Arc<dyn PciDevice> = Arc::new(TestDevice {
+            vendor_id: 0x1AF4,
+            device_id: 0x1000,
+        });
+        bus.attach(bdf, Arc::clone(&dev));
+
+        let removed = bus.detach(&bdf).expect("device was attached");
+        assert!(Arc::ptr_eq(&removed, &dev));
+        assert!(bus.device_at(&bdf).is_none());
+        assert_eq!(bus.config_read(&bdf, 0x00, 4), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn detach_empty_slot_returns_none() {
+        let bus = PciBus::new();
+        let bdf = Bdf::new_unchecked(0, 7, 0);
+        assert!(bus.detach(&bdf).is_none());
+    }
+
+    #[test]
+    fn attach_at_func1_sets_multifunc() {
+        let bus = PciBus::new();
+        let func0 = Arc::new(HeaderDevice::new());
+        bus.attach(Bdf::new_unchecked(0, 8, 0), func0.clone());
+        assert_eq!(func0.header_type(), bits::HEADER_TYPE_DEVICE);
+
+        bus.attach(Bdf::new_unchecked(0, 8, 1), Arc::new(HeaderDevice::new()));
+        assert_eq!(
+            func0.header_type() & bits::HEADER_TYPE_MULTIFUNC,
+            bits::HEADER_TYPE_MULTIFUNC
+        );
+    }
+
+    #[test]
+    fn detach_of_last_upper_func_clears_multifunc() {
+        let bus = PciBus::new();
+        let func0 = Arc::new(HeaderDevice::new());
+        let bdf1 = Bdf::new_unchecked(0, 9, 1);
+        let bdf2 = Bdf::new_unchecked(0, 9, 2);
+        bus.attach(Bdf::new_unchecked(0, 9, 0), func0.clone());
+        bus.attach(bdf1, Arc::new(HeaderDevice::new()));
+        bus.attach(bdf2, Arc::new(HeaderDevice::new()));
+
+        // One function > 0 remains, so the slot is still multi-function.
+        bus.detach(&bdf2).expect("func 2 was attached");
+        assert_eq!(
+            func0.header_type() & bits::HEADER_TYPE_MULTIFUNC,
+            bits::HEADER_TYPE_MULTIFUNC
+        );
+
+        bus.detach(&bdf1).expect("func 1 was attached");
+        assert_eq!(func0.header_type(), bits::HEADER_TYPE_DEVICE);
     }
 
     #[test]

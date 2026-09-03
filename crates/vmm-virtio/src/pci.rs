@@ -216,6 +216,8 @@ pub struct VirtioPciDevice<D: VirtioDevice> {
     registered_bar4: Mutex<Option<u64>>,
     /// Weak self-reference for BAR registration closures.
     self_ref: Mutex<Option<std::sync::Weak<Self>>>,
+    /// Structured logger for bus registration diagnostics.
+    log: slog::Logger,
     /// Capability chain offsets in PCI config space.
     cap_offsets: CapOffsets,
     /// Size of device-specific config region (for cap advertisement).
@@ -239,6 +241,9 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// - `bus_pio` - PIO bus for BAR0
     /// - `bus_mmio` - MMIO bus for BAR2 (modern config) and BAR4 (MSI-X)
     /// - `msix` - Optional MSI-X table
+    ///
+    /// Bus registration failures go to a discarding logger. Use
+    /// [`new_with_logger`](Self::new_with_logger) to see them.
     pub fn new(
         device: D,
         dev_type: u16,
@@ -250,6 +255,36 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         bus_pio: Arc<PioBus>,
         bus_mmio: Arc<MmioBus>,
         msix: Option<Arc<MsixTable>>,
+    ) -> Arc<Self> {
+        Self::new_with_logger(
+            device,
+            dev_type,
+            num_queues,
+            queue_size,
+            dev_config_size,
+            lintr_cfg,
+            physmap,
+            bus_pio,
+            bus_mmio,
+            msix,
+            slog::Logger::root(slog::Discard, slog::o!()),
+        )
+    }
+
+    /// Create a new VirtIO PCI device with a logger for bus
+    /// registration diagnostics.
+    pub fn new_with_logger(
+        device: D,
+        dev_type: u16,
+        num_queues: usize,
+        queue_size: u16,
+        dev_config_size: u16,
+        lintr_cfg: Option<LintrCfg>,
+        physmap: Arc<PhysMap>,
+        bus_pio: Arc<PioBus>,
+        bus_mmio: Arc<MmioBus>,
+        msix: Option<Arc<MsixTable>>,
+        log: slog::Logger,
     ) -> Arc<Self> {
         assert!(
             num_queues <= MAX_QUEUES,
@@ -338,6 +373,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             registered_bar2: Mutex::new(None),
             registered_bar4: Mutex::new(None),
             self_ref: Mutex::new(None),
+            log,
             cap_offsets,
             dev_config_size,
             num_queues: num_queues as u16,
@@ -346,6 +382,30 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         *dev.self_ref.lock().expect("self_ref lock") =
             Some(Arc::downgrade(&dev));
         dev
+    }
+
+    /// Unregister the recorded BAR0 PIO base and clear the record.
+    fn release_pio(&self, reg: &mut Option<u16>) {
+        if let Some(port) = reg.take() {
+            if let Err(e) = self.bus_pio.unregister(port) {
+                slog::warn!(self.log, "virtio-pci: PIO unregister failed";
+                    "bar" => ?BarN::BAR0,
+                    "port" => format!("{port:#x}"),
+                    "error" => %e);
+            }
+        }
+    }
+
+    /// Unregister a recorded MMIO base and clear the record.
+    fn release_mmio(&self, bar: BarN, reg: &mut Option<u64>) {
+        if let Some(addr) = reg.take() {
+            if let Err(e) = self.bus_mmio.unregister(addr) {
+                slog::warn!(self.log, "virtio-pci: MMIO unregister failed";
+                    "bar" => ?bar,
+                    "addr" => format!("{addr:#x}"),
+                    "error" => %e);
+            }
+        }
     }
 
     /// Update PIO bus registration for BAR0 based on current state.
@@ -359,12 +419,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         let bar_info = pci.bars().get(BarN::BAR0);
 
         let mut reg = self.registered_bar.lock().expect("bar lock poisoned");
-
-        // Unregister old handler if present
-        if let Some(old_port) = reg.take() {
-            // best-effort: old handler may already be gone
-            let _ = self.bus_pio.unregister(old_port);
-        }
+        self.release_pio(&mut reg);
 
         // Register new handler if IO is enabled and BAR has an address
         if io_enabled {
@@ -376,8 +431,17 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                         Arc::new(move |offset: u16, rwo: RWOp<'_>| {
                             dev.bar_rw(BarN::BAR0, offset as usize, rwo);
                         });
-                    if let Ok(()) = self.bus_pio.register(port, size, handler) {
-                        *reg = Some(port);
+                    match self.bus_pio.register(port, size, handler) {
+                        Ok(()) => *reg = Some(port),
+                        // The device now decodes nothing on BAR0.
+                        Err(e) => {
+                            slog::error!(self.log,
+                                "virtio-pci: PIO register failed, BAR0 dark";
+                                "bar" => ?BarN::BAR0,
+                                "port" => format!("{port:#x}"),
+                                "size" => size,
+                                "error" => %e);
+                        }
                     }
                 }
             }
@@ -393,46 +457,51 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         // BAR2: modern transport config
         {
             let mut reg = self.registered_bar2.lock().expect("bar2 lock");
-            if let Some(old_addr) = reg.take() {
-                let _ = self.bus_mmio.unregister(old_addr);
-            }
+            self.release_mmio(BarN::BAR2, &mut reg);
             if mmio_enabled {
-                if let Some((def, addr)) = pci.bars().get(BarN::BAR2) {
-                    if addr != 0 && def.is_mmio() {
-                        let size = def.size();
-                        let dev = Arc::clone(self);
-                        let handler: Arc<MmioFn> =
-                            Arc::new(move |offset: usize, rwo: RWOp<'_>| {
-                                dev.bar_rw(BarN::BAR2, offset, rwo);
-                            });
-                        if self.bus_mmio.register(addr, size, handler).is_ok() {
-                            *reg = Some(addr);
-                        }
-                    }
-                }
+                self.register_mmio(BarN::BAR2, pci, &mut reg);
             }
         }
 
         // BAR4: MSI-X table + PBA
         if self.msix.is_some() {
             let mut reg = self.registered_bar4.lock().expect("bar4 lock");
-            if let Some(old_addr) = reg.take() {
-                let _ = self.bus_mmio.unregister(old_addr);
-            }
+            self.release_mmio(BarN::BAR4, &mut reg);
             if mmio_enabled {
-                if let Some((def, addr)) = pci.bars().get(BarN::BAR4) {
-                    if addr != 0 && def.is_mmio() {
-                        let size = def.size();
-                        let dev = Arc::clone(self);
-                        let handler: Arc<MmioFn> =
-                            Arc::new(move |offset: usize, rwo: RWOp<'_>| {
-                                dev.bar_rw(BarN::BAR4, offset, rwo);
-                            });
-                        if self.bus_mmio.register(addr, size, handler).is_ok() {
-                            *reg = Some(addr);
-                        }
-                    }
-                }
+                self.register_mmio(BarN::BAR4, pci, &mut reg);
+            }
+        }
+    }
+
+    /// Register one MMIO BAR and record its base on success.
+    fn register_mmio(
+        self: &Arc<Self>,
+        bar: BarN,
+        pci: &DeviceState,
+        reg: &mut Option<u64>,
+    ) {
+        let Some((def, addr)) = pci.bars().get(bar) else {
+            return;
+        };
+        if addr == 0 || !def.is_mmio() {
+            return;
+        }
+        let size = def.size();
+        let dev = Arc::clone(self);
+        let handler: Arc<MmioFn> =
+            Arc::new(move |offset: usize, rwo: RWOp<'_>| {
+                dev.bar_rw(bar, offset, rwo);
+            });
+        match self.bus_mmio.register(addr, size, handler) {
+            Ok(()) => *reg = Some(addr),
+            // The device now decodes nothing on this BAR.
+            Err(e) => {
+                slog::error!(self.log,
+                    "virtio-pci: MMIO register failed, BAR dark";
+                    "bar" => ?bar,
+                    "addr" => format!("{addr:#x}"),
+                    "size" => size,
+                    "error" => %e);
             }
         }
     }
@@ -504,6 +573,17 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
 
     // -- PCI capability chain read/write --
 
+    /// Whether this device presents a VIRTIO_PCI_CAP_DEVICE_CFG.
+    ///
+    /// VIRTIO 1.3 4.1.4.6 makes the capability conditional on the device
+    /// having device-specific configuration. virtio-rnd has none, and a
+    /// capability advertising length 0 is not merely ignored: Linux's
+    /// `map_capability()` rejects `length <= start` and fails the whole
+    /// probe with -EINVAL, so the device never binds.
+    fn has_device_cfg_cap(&self) -> bool {
+        self.dev_config_size != 0
+    }
+
     /// Read a dword from a virtio PCI capability structure.
     ///
     /// Returns `Some(val)` if `offset` falls within a virtio or MSI-X
@@ -557,7 +637,13 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             return Some(self.read_virtio_cap(
                 offset - co.isr,
                 bits::VIRTIO_PCI_CAP_ISR_CFG,
-                co.device,
+                // With no device-specific config there is no device-config
+                // capability, so ISR ends the chain.
+                if self.has_device_cfg_cap() {
+                    co.device
+                } else {
+                    0
+                },
                 bits::MODERN_BAR_IDX,
                 bits::MODERN_BAR_ISR_OFFSET,
                 4,
@@ -565,7 +651,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         }
 
         // Virtio device config cap (16 bytes)
-        if offset >= co.device && offset < co.device + 16 {
+        if self.has_device_cfg_cap()
+            && offset >= co.device
+            && offset < co.device + 16
+        {
             return Some(self.read_virtio_cap(
                 offset - co.device,
                 bits::VIRTIO_PCI_CAP_DEVICE_CFG,
@@ -988,14 +1077,11 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 msix.fire(vector);
                 return;
             }
-            eprintln!(
-                "[virtio-intr] q={} vector=NO_VECTOR, falling back to INTx",
-                queue_idx
-            );
-        } else {
-            eprintln!("[virtio-intr] q={} no msix, using INTx", queue_idx);
         }
-        // Fallback to legacy INTx
+        // No MSI-X vector for this queue, so fall back to legacy INTx.
+        // This is normal operation, not an error: a guest built without
+        // CONFIG_PCI_MSI never assigns a vector, and this runs once per
+        // interrupt, so it must stay silent and lock-free.
         self.raise_queue_interrupt();
     }
 
@@ -1380,6 +1466,22 @@ impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
                 };
                 self.bar_write(offset as u16, val, wo.len());
             }
+        }
+    }
+
+    fn detach_regions(&self) {
+        {
+            let mut reg =
+                self.registered_bar.lock().expect("bar lock poisoned");
+            self.release_pio(&mut reg);
+        }
+        {
+            let mut reg = self.registered_bar2.lock().expect("bar2 lock");
+            self.release_mmio(BarN::BAR2, &mut reg);
+        }
+        {
+            let mut reg = self.registered_bar4.lock().expect("bar4 lock");
+            self.release_mmio(BarN::BAR4, &mut reg);
         }
     }
 }
@@ -2002,8 +2104,8 @@ mod tests {
     fn pci_identity_rng() {
         let dev = make_device_of_type(bits::VIRTIO_DEV_TYPE_RNG);
         let id = dev.cfg_read(0x00, 4);
-        // 0x1003 belongs to virtio-console, so a formula that lands
-        // there is wrong.
+        // Regression: the old formula advertised 0x1003, which belongs to
+        // virtio-console.
         assert_eq!((id >> 16) & 0xFFFF, 0x1005);
     }
 
@@ -2029,6 +2131,95 @@ mod tests {
         let class_reg = dev.cfg_read(0x08, 4);
         let class = (class_reg >> 24) & 0xFF;
         assert_eq!(class, vmm_devices::pci::bits::CLASS_STORAGE as u32);
+    }
+
+    /// Build a device with no device-specific config, as virtio-rnd has.
+    fn make_device_without_config() -> Arc<VirtioPciDevice<TestVirtioDevice>> {
+        let physmap = Arc::new(PhysMap::new());
+        VirtioPciDevice::new(
+            TestVirtioDevice { features: 0 },
+            bits::VIRTIO_DEV_TYPE_RNG,
+            1,
+            64,
+            0, // no device config, like virtio-rnd
+            None,
+            physmap,
+            Arc::new(PioBus::new()),
+            Arc::new(MmioBus::new()),
+            None,
+        )
+    }
+
+    /// Walk the capability chain, returning (cfg_type, length) per virtio
+    /// capability in link order.
+    fn walk_virtio_caps<D: VirtioDevice>(
+        dev: &VirtioPciDevice<D>,
+    ) -> Vec<(u8, u32)> {
+        let mut out = Vec::new();
+        // Capabilities pointer at 0x34, low byte.
+        let mut pos = (dev.cfg_read(0x34, 4) & 0xFF) as u8;
+        // Bounded: a malformed chain must not spin the test forever.
+        for _ in 0..16 {
+            if pos == 0 {
+                break;
+            }
+            let hdr = dev.cfg_read(pos, 4);
+            let cap_id = (hdr & 0xFF) as u8;
+            let next = ((hdr >> 8) & 0xFF) as u8;
+            if cap_id == bits::PCI_CAP_ID_VNDR {
+                let cfg_type = ((hdr >> 24) & 0xFF) as u8;
+                let length = dev.cfg_read(pos + 12, 4);
+                out.push((cfg_type, length));
+            }
+            pos = next;
+        }
+        out
+    }
+
+    /// A capability advertising length 0 is not ignored by Linux: its
+    /// `map_capability()` rejects `length <= start` and fails the whole
+    /// probe, so the device never binds. VIRTIO 1.3 4.1.4.6 makes the
+    /// device-config capability conditional on having such config.
+    #[test]
+    fn device_without_config_omits_the_device_cfg_cap() {
+        let dev = make_device_without_config();
+        let caps = walk_virtio_caps(&dev);
+
+        assert!(
+            !caps
+                .iter()
+                .any(|(t, _)| *t == bits::VIRTIO_PCI_CAP_DEVICE_CFG),
+            "device with no config still advertises a device-cfg cap: {caps:?}"
+        );
+        // Whatever is advertised must be usable.
+        for (cfg_type, length) in &caps {
+            assert_ne!(*length, 0, "cap type {cfg_type} has length 0");
+        }
+        // The chain must still reach the caps a driver needs.
+        for want in [
+            bits::VIRTIO_PCI_CAP_COMMON_CFG,
+            bits::VIRTIO_PCI_CAP_NOTIFY_CFG,
+            bits::VIRTIO_PCI_CAP_ISR_CFG,
+        ] {
+            assert!(
+                caps.iter().any(|(t, _)| *t == want),
+                "cap type {want} missing from {caps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_with_config_keeps_the_device_cfg_cap() {
+        let dev = make_test_device();
+        let caps = walk_virtio_caps(&dev);
+        let found = caps
+            .iter()
+            .find(|(t, _)| *t == bits::VIRTIO_PCI_CAP_DEVICE_CFG)
+            .expect("device-cfg cap present");
+        assert_eq!(
+            found.1, 8,
+            "device-cfg cap length should be the config size"
+        );
     }
 
     #[test]
@@ -2702,5 +2893,77 @@ mod tests {
         let mut ro = ReadOp::new(1);
         dev.bar_rw(BarN::BAR2, 0x14, RWOp::Read(&mut ro));
         assert_eq!(ro.buf()[0], bits::STATUS_ACKNOWLEDGE);
+    }
+
+    // -- BAR teardown tests --
+
+    const TEST_BAR0_PORT: u16 = 0x2000;
+    const TEST_BAR2_ADDR: u64 = 0xE000_0000;
+
+    /// Build a device and keep handles to the buses it registers on.
+    fn make_device_with_buses() -> (
+        Arc<VirtioPciDevice<TestVirtioDevice>>,
+        Arc<PioBus>,
+        Arc<MmioBus>,
+    ) {
+        let bus_pio = Arc::new(PioBus::new());
+        let bus_mmio = Arc::new(MmioBus::new());
+        let dev = VirtioPciDevice::new(
+            TestVirtioDevice { features: 0 },
+            bits::VIRTIO_DEV_TYPE_BLOCK,
+            1,
+            256,
+            8,
+            None,
+            Arc::new(PhysMap::new()),
+            Arc::clone(&bus_pio),
+            Arc::clone(&bus_mmio),
+            None,
+        );
+        (dev, bus_pio, bus_mmio)
+    }
+
+    /// Program BAR0 and BAR2, then enable IO and MMIO decoding.
+    fn enable_bars(dev: &Arc<VirtioPciDevice<TestVirtioDevice>>) {
+        dev.cfg_write(0x10, 4, u32::from(TEST_BAR0_PORT));
+        dev.cfg_write(0x18, 4, TEST_BAR2_ADDR as u32);
+        let cmd = vmm_devices::pci::bits::RegCmd::IO_EN
+            | vmm_devices::pci::bits::RegCmd::MMIO_EN;
+        dev.cfg_write(0x04, 2, u32::from(cmd.bits()));
+        assert!(dev.registered_bar.lock().expect("bar lock").is_some());
+        assert!(dev.registered_bar2.lock().expect("bar2 lock").is_some());
+    }
+
+    /// Every live BAR handler holds a strong self reference, so the
+    /// device cannot drop while one stays registered.
+    #[test]
+    fn bar_registration_holds_a_strong_self_reference() {
+        let (dev, _bus_pio, _bus_mmio) = make_device_with_buses();
+        assert_eq!(Arc::strong_count(&dev), 1);
+        enable_bars(&dev);
+        // One handler for BAR0 (PIO) and one for BAR2 (MMIO).
+        assert_eq!(Arc::strong_count(&dev), 3);
+    }
+
+    #[test]
+    fn detach_regions_lets_the_device_drop() {
+        let (dev, bus_pio, bus_mmio) = make_device_with_buses();
+        enable_bars(&dev);
+
+        let weak = Arc::downgrade(&dev);
+        dev.detach_regions();
+        // A second call must not unregister a base twice.
+        dev.detach_regions();
+        assert_eq!(Arc::strong_count(&dev), 1);
+
+        drop(dev);
+        assert!(weak.upgrade().is_none(), "device outlived its last handle");
+
+        // The buses must no longer decode the old BAR ranges.
+        assert_eq!(bus_pio.handle_in(TEST_BAR0_PORT, 1), 0xFF);
+        assert_eq!(
+            bus_mmio.handle_read(TEST_BAR2_ADDR, 4),
+            u64::from(u32::MAX)
+        );
     }
 }

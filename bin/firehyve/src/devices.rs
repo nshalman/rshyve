@@ -14,6 +14,7 @@ use slog::info;
 
 use vmm_devices::pci::Bdf;
 use vmm_virtio::attach;
+use vmm_virtio::vsock::control::ControlSlot;
 
 /// Driver names this binary implements, plus the two the chipset
 /// already creates. One list so the parse gate and the operator-facing
@@ -25,6 +26,7 @@ const SUPPORTED: &[&str] = &[
     "virtio-rnd",
     "virtio-console",
     "virtio-fs",
+    "virtio-vsock",
     "hostbridge",
     "lpc",
 ];
@@ -59,10 +61,19 @@ pub(crate) fn split_spec(spec: &str) -> anyhow::Result<(Bdf, &str, &str)> {
 }
 
 /// Build one PCI device from its spec string.
+///
+/// A vsock device also carries the control slot that answers the
+/// `CONTROL` verb, so `control` collects one slot per vsock device. The
+/// caller fills the slots once the device registry is complete.
+///
+/// Every attach here is the fallible one. The panicking `attach_device`
+/// would take the whole VM down through a poisoned bus lock, and this
+/// runs on a control thread as well as on the startup path.
 pub(crate) fn create_pci_device(
     spec: &str,
     num_vcpus: u32,
     ctx: &vmm_machine::PciDeviceCtx<'_>,
+    control: &mut Vec<ControlSlot>,
 ) -> anyhow::Result<vmm_machine::CreatedPciDevice> {
     let (bdf, driver, config) = split_spec(spec)?;
     let actx = attach::VirtioAttachCtx {
@@ -76,7 +87,7 @@ pub(crate) fn create_pci_device(
         "virtio-blk" | "virtio-blk-pci" => {
             let lintr = ctx.chipset.route_lintr(&bdf);
             let dev = attach::virtio_blk(config, num_vcpus, lintr, &actx)?;
-            ctx.chipset.attach_device(bdf, dev.clone());
+            ctx.chipset.try_attach_device(bdf, dev.clone())?;
             info!(ctx.log, "virtio-blk attached";
                 "bdf" => %bdf, "path" => config);
             Ok((
@@ -90,7 +101,7 @@ pub(crate) fn create_pci_device(
             // interrupt poll thread starts immediately.
             let dev =
                 attach::virtio_viona(config, lintr, false, &actx, ctx.log)?;
-            ctx.chipset.attach_device(bdf, dev.clone());
+            ctx.chipset.try_attach_device(bdf, dev.clone())?;
             info!(ctx.log, "virtio-net-viona attached";
                 "bdf" => %bdf, "vnic" => config);
             Ok((
@@ -105,7 +116,7 @@ pub(crate) fn create_pci_device(
             let lintr = ctx.chipset.route_lintr(&bdf);
             let dev =
                 attach::virtio_fs(&opts, queue_size, lintr, &actx, ctx.log)?;
-            ctx.chipset.attach_device(bdf, dev.clone());
+            ctx.chipset.try_attach_device(bdf, dev.clone())?;
             info!(ctx.log, "virtio-fs attached";
                 "bdf" => %bdf,
                 "tag" => &opts.tag,
@@ -115,10 +126,28 @@ pub(crate) fn create_pci_device(
                 Some(dev as Arc<dyn vmm_devices::Lifecycle>),
             ))
         }
+        "virtio-vsock" => {
+            use vmm_virtio::vsock::device::parse_vsock_config;
+            let (path, cid) = parse_vsock_config(config)?;
+            let lintr = ctx.chipset.route_lintr(&bdf);
+            let (dev, slot) = vmm_virtio::vsock::control::attach_with_control(
+                &path, cid, lintr, &actx, ctx.log,
+            )?;
+            control.push(slot);
+            ctx.chipset.try_attach_device(bdf, dev.clone())?;
+            info!(ctx.log, "virtio-vsock attached";
+                "bdf" => %bdf,
+                "cid" => cid,
+                "socket" => %path.display());
+            Ok((
+                Some(dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
+                Some(dev as Arc<dyn vmm_devices::Lifecycle>),
+            ))
+        }
         "virtio-rnd" => {
             let lintr = ctx.chipset.route_lintr(&bdf);
             let dev = attach::virtio_rng(lintr, &actx);
-            ctx.chipset.attach_device(bdf, dev.clone());
+            ctx.chipset.try_attach_device(bdf, dev.clone())?;
             info!(ctx.log, "virtio-rnd attached"; "bdf" => %bdf);
             Ok((
                 Some(dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
@@ -134,7 +163,7 @@ pub(crate) fn create_pci_device(
                 &actx,
                 ctx.log,
             )?;
-            ctx.chipset.attach_device(bdf, dev.clone());
+            ctx.chipset.try_attach_device(bdf, dev.clone())?;
             info!(ctx.log, "virtio-console attached";
                 "bdf" => %bdf, "socket" => path);
             Ok((
@@ -148,6 +177,31 @@ pub(crate) fn create_pci_device(
         // Reachable only if SUPPORTED grows a name before its arm does.
         other => Err(unsupported_driver(other)),
     }
+}
+
+/// The catalog closure, bound to this VM and handed to the hotplug
+/// engine.
+///
+/// SECURITY: the same closure the boot-time `-s` pass drives, so a
+/// control request can name no driver and no path that a command line
+/// could not. See the trust note in `crate::control`.
+pub(crate) fn hotplug_factory(num_cpus: u32) -> vmm_machine::HotplugFactory {
+    Box::new(move |spec, ctx| {
+        // A vsock device carries the control slot this interface is
+        // served on, and a slot is armed once, at startup. Adding one
+        // later would hand the guest a socket that answers nothing, so
+        // it is refused before anything is built.
+        let (_, driver, _) = split_spec(spec)?;
+        anyhow::ensure!(
+            driver != "virtio-vsock",
+            "virtio-vsock cannot be added at run time: its CONTROL slot \
+             is armed at startup"
+        );
+        let mut slots = Vec::new();
+        let created = create_pci_device(spec, num_cpus, ctx, &mut slots)?;
+        debug_assert!(slots.is_empty(), "only vsock yields a control slot");
+        Ok(created)
+    })
 }
 
 #[cfg(test)]

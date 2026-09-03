@@ -642,7 +642,16 @@ fn write_reply<W: Write>(writer: &mut W, unique: u64, reply: Reply) -> u32 {
         Reply::None => 0,
         Reply::Empty => write_header(writer, unique, 0, &[]),
         Reply::Body(body) => write_header(writer, unique, 0, &body),
-        Reply::Error(err) => write_header(writer, unique, err, &[]),
+        // The only point where an errno reaches the guest, so it is the
+        // only place the host-to-Linux translation has to happen.
+        Reply::Error(err) => {
+            let linux = if err < 0 {
+                -fuse::to_linux_errno(-err)
+            } else {
+                err
+            };
+            write_header(writer, unique, linux, &[])
+        }
     }
 }
 

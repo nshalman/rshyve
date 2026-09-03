@@ -162,6 +162,8 @@ pub struct NvmeController {
     registered_bar4: Mutex<Option<u64>>,
     /// Weak self-reference for MMIO handler closures.
     self_ref: Mutex<Option<std::sync::Weak<Self>>>,
+    /// Structured logger for bus registration diagnostics.
+    log: slog::Logger,
     /// Zvol write-cache control. Declared BEFORE `_file` so Drop runs
     /// `DKIOCSETWCE` restore while the fd is still open.
     _cache: DiskCache,
@@ -182,6 +184,9 @@ impl NvmeController {
     /// - `read_only`: If true, writes return an error status.
     /// - `physmap`: Guest physical memory map (shared with workers).
     /// - `hdl`: VMM handle for MSI-X interrupt delivery.
+    ///
+    /// Bus registration failures go to a discarding logger. Use
+    /// [`new_with_logger`](Self::new_with_logger) to see them.
     pub fn new(
         file: File,
         read_only: bool,
@@ -189,6 +194,28 @@ impl NvmeController {
         physmap: Arc<PhysMap>,
         hdl: Arc<VmmHdl>,
         bus_mmio: Arc<MmioBus>,
+    ) -> Arc<Self> {
+        Self::new_with_logger(
+            file,
+            read_only,
+            instance_id,
+            physmap,
+            hdl,
+            bus_mmio,
+            slog::Logger::root(slog::Discard, slog::o!()),
+        )
+    }
+
+    /// Create a new NVMe controller with a logger for bus registration
+    /// diagnostics.
+    pub fn new_with_logger(
+        file: File,
+        read_only: bool,
+        instance_id: u8,
+        physmap: Arc<PhysMap>,
+        hdl: Arc<VmmHdl>,
+        bus_mmio: Arc<MmioBus>,
+        log: slog::Logger,
     ) -> Arc<Self> {
         let raw_fd = file.as_raw_fd();
 
@@ -298,6 +325,7 @@ impl NvmeController {
             registered_bar0: Mutex::new(None),
             registered_bar4: Mutex::new(None),
             self_ref: Mutex::new(None),
+            log,
             _cache: cache,
             _file: file,
             indicator: Indicator::new(),
@@ -409,6 +437,16 @@ impl PciDevice for NvmeController {
             }
         }
     }
+
+    fn detach_regions(&self) {
+        for (bar, reg_mutex) in [
+            (BarN::BAR0, &self.registered_bar0),
+            (BarN::BAR4, &self.registered_bar4),
+        ] {
+            let mut reg = reg_mutex.lock().expect("bar reg lock");
+            self.release_mmio(bar, &mut reg);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +454,18 @@ impl PciDevice for NvmeController {
 // ---------------------------------------------------------------------------
 
 impl NvmeController {
+    /// Unregister a recorded MMIO base and clear the record.
+    fn release_mmio(&self, bar: BarN, reg: &mut Option<u64>) {
+        if let Some(addr) = reg.take() {
+            if let Err(e) = self.bus_mmio.unregister(addr) {
+                slog::warn!(self.log, "nvme: MMIO unregister failed";
+                    "bar" => ?bar,
+                    "addr" => format!("{addr:#x}"),
+                    "error" => %e);
+            }
+        }
+    }
+
     /// Update MMIO bus registration for BAR0 and BAR4.
     fn update_mmio_registration(self: &Arc<Self>) {
         let pci = self.pci_state.lock().expect("nvme: pci lock");
@@ -424,28 +474,37 @@ impl NvmeController {
             .contains(vmm_devices::pci::bits::RegCmd::MMIO_EN);
 
         // Register both BAR0 and BAR4 on the MMIO bus
-        for (bar_n, reg_mutex) in [
+        for (bar, reg_mutex) in [
             (BarN::BAR0, &self.registered_bar0),
             (BarN::BAR4, &self.registered_bar4),
         ] {
             let mut reg = reg_mutex.lock().expect("bar reg lock");
-            if let Some(old_addr) = reg.take() {
-                let _ = self.bus_mmio.unregister(old_addr);
+            self.release_mmio(bar, &mut reg);
+            if !mmio_enabled {
+                continue;
             }
-            if mmio_enabled {
-                if let Some((def, addr)) = pci.bars().get(bar_n) {
-                    if addr != 0 && def.is_mmio() {
-                        let size = def.size();
-                        let dev = Arc::clone(self);
-                        let bar = bar_n;
-                        let handler: Arc<MmioFn> =
-                            Arc::new(move |offset: usize, rwo: RWOp<'_>| {
-                                dev.bar_rw(bar, offset, rwo);
-                            });
-                        if self.bus_mmio.register(addr, size, handler).is_ok() {
-                            *reg = Some(addr);
-                        }
-                    }
+            let Some((def, addr)) = pci.bars().get(bar) else {
+                continue;
+            };
+            if addr == 0 || !def.is_mmio() {
+                continue;
+            }
+            let size = def.size();
+            let dev = Arc::clone(self);
+            let handler: Arc<MmioFn> =
+                Arc::new(move |offset: usize, rwo: RWOp<'_>| {
+                    dev.bar_rw(bar, offset, rwo);
+                });
+            match self.bus_mmio.register(addr, size, handler) {
+                Ok(()) => *reg = Some(addr),
+                // The controller now decodes nothing on this BAR.
+                Err(e) => {
+                    slog::error!(self.log,
+                        "nvme: MMIO register failed, BAR dark";
+                        "bar" => ?bar,
+                        "addr" => format!("{addr:#x}"),
+                        "size" => size,
+                        "error" => %e);
                 }
             }
         }

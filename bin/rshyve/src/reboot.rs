@@ -58,16 +58,37 @@ fn reset_budget(
     (count <= RESET_MAX_PER_WINDOW).then_some((window_start_ms, count))
 }
 
-/// Build argv for the replacement process without one-shot migration flags.
+/// Build argv for the replacement process.
 ///
-/// A migration destination must reboot as a normal VM instead of waiting for
-/// an inbound migration that will never arrive.
-fn reboot_argv(argv: &[OsString]) -> Vec<OsString> {
-    let mut result = Vec::with_capacity(argv.len());
+/// Two edits. The one-shot migration flags go, because a migration
+/// destination must reboot as a normal VM and not wait for an inbound
+/// migration that will never arrive. Every device an operator hot-added
+/// gains a `-s` entry, or the disk they plugged in would vanish on the
+/// guest's next reboot.
+///
+/// The `-s` entries already in argv are kept verbatim, in their argv
+/// order. They carry the `bootindex` token, which the registry does not
+/// record, so rebuilding the whole list from the registry would
+/// silently change the boot order.
+///
+/// Devices only. A hot-added vCPU and hot-added memory are NOT carried
+/// across a reset: `-c` and `-m` are copied verbatim, so the guest
+/// comes back on its boot CPU count and boot memory size. Nothing here
+/// can change that, because the caller passes device specs alone and
+/// the added CPU and memory totals never leave the run loop.
+fn reboot_argv(argv: &[OsString], hotplug: &[String]) -> Vec<OsString> {
+    let mut result = Vec::with_capacity(argv.len() + 2 * hotplug.len());
     let Some((argv0, args)) = argv.split_first() else {
         return result;
     };
     result.push(argv0.clone());
+
+    // Ahead of the positional VM name, where an option cannot be read
+    // as the name itself.
+    for spec in hotplug {
+        result.push(OsString::from("-s"));
+        result.push(OsString::from(spec));
+    }
 
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -86,6 +107,7 @@ fn reboot_argv(argv: &[OsString]) -> Vec<OsString> {
 pub fn reexec_for_reboot(
     exe: &Path,
     argv: &[OsString],
+    hotplug: &[String],
     sigterm_received: &AtomicBool,
     log: &Logger,
 ) -> ExitCode {
@@ -117,14 +139,14 @@ pub fn reexec_for_reboot(
         return ExitCode::from(4);
     };
 
-    let args = reboot_argv(argv);
+    let args = reboot_argv(argv, hotplug);
     let mut command = Command::new(exe);
     command
         .args(args.iter().skip(1))
         .env(ENV_RESET_COUNT, count.to_string())
         .env(ENV_RESET_WINDOW_START_MS, start.to_string());
     info!(log, "guest requested reset, restarting VMM";
-        "reset_count" => count);
+        "reset_count" => count, "hotplugged" => hotplug.len());
     // WHY: an explicit operator stop outranks a guest reset. Re-check at the
     // last userspace decision point so SIGTERM received during teardown or
     // reboot preparation cannot be discarded by the replacement process.
@@ -204,15 +226,17 @@ mod tests {
         assert_eq!(reset_budget(9_000, Some(10_000), 3), Some((10_000, 4)));
     }
 
+    fn specs(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
     #[test]
     fn strips_separate_migrate_listen() {
         assert_eq!(
-            reboot_argv(&argv(&[
-                "rshyve",
-                "--migrate-listen",
-                "0.0.0.0:4567",
-                "vm",
-            ])),
+            reboot_argv(
+                &argv(&["rshyve", "--migrate-listen", "0.0.0.0:4567", "vm"]),
+                &[],
+            ),
             argv(&["rshyve", "vm"]),
         );
     }
@@ -220,11 +244,10 @@ mod tests {
     #[test]
     fn strips_equals_migrate_listen() {
         assert_eq!(
-            reboot_argv(&argv(&[
-                "rshyve",
-                "--migrate-listen=0.0.0.0:4567",
-                "vm",
-            ])),
+            reboot_argv(
+                &argv(&["rshyve", "--migrate-listen=0.0.0.0:4567", "vm"]),
+                &[],
+            ),
             argv(&["rshyve", "vm"]),
         );
     }
@@ -240,14 +263,171 @@ mod tests {
             "--vtpm",
             "vm",
         ]);
-        assert_eq!(reboot_argv(&original), original);
+        assert_eq!(reboot_argv(&original, &[]), original);
     }
 
     #[test]
     fn preserves_argv0() {
         assert_eq!(
-            reboot_argv(&argv(&["--migrate-listen", "vm"])),
+            reboot_argv(&argv(&["--migrate-listen", "vm"]), &[]),
             argv(&["--migrate-listen", "vm"]),
         );
+    }
+
+    #[test]
+    fn a_hotplugged_disk_survives_the_reboot() {
+        // Without this the device an operator plugged in is gone the
+        // first time the guest restarts.
+        let original = argv(&["rshyve", "-s", "4,nvme,/boot.img", "vm"]);
+
+        let rebooted =
+            reboot_argv(&original, &specs(&["5,virtio-blk,/added.img"]));
+
+        assert_eq!(
+            rebooted,
+            argv(&[
+                "rshyve",
+                "-s",
+                "5,virtio-blk,/added.img",
+                "-s",
+                "4,nvme,/boot.img",
+                "vm",
+            ]),
+        );
+    }
+
+    #[test]
+    fn the_bootindex_of_an_argv_device_is_kept() {
+        // The registry records the stripped spec, so a rebuild from the
+        // registry would drop the token and change the boot order.
+        let original =
+            argv(&["rshyve", "-s", "4,nvme,/boot.img,bootindex=1", "vm"]);
+
+        let rebooted = reboot_argv(&original, &specs(&["5,virtio-rnd"]));
+
+        assert!(
+            rebooted.contains(&OsString::from("4,nvme,/boot.img,bootindex=1")),
+            "got {rebooted:?}",
+        );
+    }
+
+    #[test]
+    fn every_hotplugged_device_is_replayed() {
+        let rebooted = reboot_argv(
+            &argv(&["rshyve", "vm"]),
+            &specs(&["5,virtio-blk,/a.img", "6,virtio-blk,/b.img"]),
+        );
+
+        assert_eq!(
+            rebooted,
+            argv(&[
+                "rshyve",
+                "-s",
+                "5,virtio-blk,/a.img",
+                "-s",
+                "6,virtio-blk,/b.img",
+                "vm",
+            ]),
+        );
+    }
+
+    #[test]
+    fn an_ejected_device_does_not_come_back() {
+        // The registry drops a slot the guest ejected, so its spec is
+        // not in the list, and the rebuilt argv is the boot argv.
+        let original = argv(&["rshyve", "-s", "4,nvme,/boot.img", "vm"]);
+
+        assert_eq!(reboot_argv(&original, &specs(&[])), original);
+    }
+
+    #[test]
+    fn a_slot_pending_removal_comes_back() {
+        // A guest that never runs _EJ0 still owns the device, so the
+        // registry still lists it and the reboot must recreate it.
+        let rebooted = reboot_argv(
+            &argv(&["rshyve", "vm"]),
+            &specs(&["5,virtio-blk,/pending.img"]),
+        );
+
+        assert_eq!(
+            rebooted,
+            argv(&["rshyve", "-s", "5,virtio-blk,/pending.img", "vm"]),
+        );
+    }
+
+    #[test]
+    fn the_full_config_string_of_an_added_device_is_replayed() {
+        // Every option after the device name is part of the backend, so
+        // a spec that loses one boots a different disk.
+        let spec = "5,virtio-blk,/added.img,nocache,ro,sectorsize=4096";
+        let rebooted = reboot_argv(&argv(&["rshyve", "vm"]), &specs(&[spec]));
+
+        assert_eq!(rebooted, argv(&["rshyve", "-s", spec, "vm"]));
+    }
+
+    #[test]
+    fn argv_slot_order_is_kept() {
+        // Firmware walks the slots in order, so a reshuffle can change
+        // which disk the guest boots.
+        let rebooted = reboot_argv(
+            &argv(&[
+                "rshyve",
+                "-s",
+                "4,nvme,/boot.img,bootindex=1",
+                "-s",
+                "6,virtio-net,vnic0",
+                "-s",
+                "8,nvme,/data.img,bootindex=2",
+                "vm",
+            ]),
+            &specs(&["5,virtio-blk,/added.img"]),
+        );
+
+        assert_eq!(
+            rebooted,
+            argv(&[
+                "rshyve",
+                "-s",
+                "5,virtio-blk,/added.img",
+                "-s",
+                "4,nvme,/boot.img,bootindex=1",
+                "-s",
+                "6,virtio-net,vnic0",
+                "-s",
+                "8,nvme,/data.img,bootindex=2",
+                "vm",
+            ]),
+        );
+    }
+
+    #[test]
+    fn hot_added_cpus_and_memory_do_not_survive_a_reset() {
+        // Known gap, pinned here so it cannot change unnoticed. The
+        // rebuilt argv carries the boot `-c` and `-m`, so a guest that
+        // grew comes back at its boot size.
+        let original = argv(&[
+            "rshyve",
+            "-c",
+            "cpus=2,maxcpus=8",
+            "-m",
+            "2G",
+            "-s",
+            "4,nvme,/boot.img",
+            "vm",
+        ]);
+
+        let rebooted =
+            reboot_argv(&original, &specs(&["5,virtio-blk,/added.img"]));
+
+        assert!(rebooted.contains(&OsString::from("cpus=2,maxcpus=8")));
+        assert!(rebooted.contains(&OsString::from("2G")));
+    }
+
+    #[test]
+    fn a_machine_with_no_hotplug_reboots_on_its_own_argv() {
+        // The path every VM that runs today takes.
+        let original =
+            argv(&["rshyve", "-c", "2", "-s", "4,nvme,/d.img", "vm"]);
+        assert_eq!(reboot_argv(&original, &[]), original);
     }
 }

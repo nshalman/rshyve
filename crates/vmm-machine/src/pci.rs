@@ -20,6 +20,9 @@ use vmm_core::pio::PioBus;
 use vmm_devices::chipset::i440fx::I440FxChipset;
 use vmm_devices::InputBroker;
 
+use crate::parse::parse_bdf;
+use crate::registry::{DeviceRegistry, RegisteredDevice, RegistryError};
+
 pub type PciDeviceHandle = Arc<dyn vmm_devices::pci::PciDevice>;
 pub type LifecycleHandle = Arc<dyn vmm_devices::Lifecycle>;
 
@@ -70,6 +73,56 @@ impl<'a> PciDeviceCtx<'a> {
             log,
         }
     }
+
+    /// Borrow an [`OwnedPciCtx`], so a catalog closure keeps its shape.
+    pub fn borrow_from(owned: &'a OwnedPciCtx) -> Self {
+        Self {
+            chipset: &owned.chipset,
+            bus_pio: &owned.bus_pio,
+            bus_mmio: &owned.bus_mmio,
+            physmap: &owned.physmap,
+            vmm_hdl: &owned.vmm_hdl,
+            segids: &owned.segids,
+            input: &owned.input,
+            log: &owned.log,
+        }
+    }
+}
+
+/// The same plumbing, owned.
+///
+/// [`PciDeviceCtx`] borrows a `Machine` that lives on the startup stack,
+/// so no device can be built after startup returns. This form outlives
+/// that stack frame and hands out a borrowed context on demand.
+pub struct OwnedPciCtx {
+    chipset: Arc<I440FxChipset>,
+    bus_pio: Arc<PioBus>,
+    bus_mmio: Arc<MmioBus>,
+    physmap: Arc<PhysMap>,
+    vmm_hdl: Arc<VmmHdl>,
+    segids: Arc<SegidAlloc>,
+    input: Arc<InputBroker>,
+    log: Logger,
+}
+
+impl OwnedPciCtx {
+    pub fn new(
+        machine: &Machine,
+        chipset: &Arc<I440FxChipset>,
+        input: &Arc<InputBroker>,
+        log: &Logger,
+    ) -> Self {
+        Self {
+            chipset: chipset.clone(),
+            bus_pio: machine.bus_pio().clone(),
+            bus_mmio: machine.bus_mmio().clone(),
+            physmap: machine.physmap().clone(),
+            vmm_hdl: machine.hdl().clone(),
+            segids: machine.segids().clone(),
+            input: input.clone(),
+            log: log.clone(),
+        }
+    }
 }
 
 /// Handles collected from one pass over the device specs.
@@ -79,21 +132,48 @@ impl<'a> PciDeviceCtx<'a> {
 /// cannot do.
 #[derive(Default)]
 pub struct PciAttachment {
-    pub pci_devices: Vec<PciDeviceHandle>,
-    pub lifecycle_devices: Vec<LifecycleHandle>,
+    /// Every device the pass created, addressable by id and BDF at run
+    /// time. The one record the binaries read: a boot-time snapshot
+    /// cannot show a device that hotplug added or removed.
+    pub registry: Arc<DeviceRegistry>,
 }
 
-fn push_created(created: CreatedPciDevice, out: &mut PciAttachment) {
-    let (pci, lifecycle) = created;
-    // A device with no PCI handle contributes nothing, even when it
-    // offers a Lifecycle. Preserved from init_pci_devices.
-    let Some(pci) = pci else {
-        return;
-    };
-    out.pci_devices.push(pci);
-    if let Some(lifecycle) = lifecycle {
-        out.lifecycle_devices.push(lifecycle);
+/// The leading `slot` field of a `slot,driver[,config]` spec.
+fn spec_slot(spec: &str) -> &str {
+    spec.split(',').next().unwrap_or("").trim()
+}
+
+/// Stable, operator-facing id for a `slot,driver[,config]` spec.
+///
+/// The slot field makes it unique: the PCI bus refuses a second device
+/// at one BDF, so no two specs share a slot.
+fn spec_device_id(spec: &str) -> String {
+    let slot = spec_slot(spec);
+    match spec.split(',').nth(1).map(str::trim) {
+        Some(driver) if !driver.is_empty() => format!("{driver}@{slot}"),
+        _ => slot.to_string(),
     }
+}
+
+fn push_created(
+    spec: &str,
+    created: CreatedPciDevice,
+    out: &mut PciAttachment,
+) -> Result<(), RegistryError> {
+    let (pci, lifecycle) = created;
+    // hostbridge and lpc: the chipset already created them, so there is
+    // nothing to hold.
+    if pci.is_none() && lifecycle.is_none() {
+        return Ok(());
+    }
+
+    out.registry.insert(RegisteredDevice::new(
+        spec_device_id(spec),
+        parse_bdf(spec_slot(spec)),
+        pci,
+        lifecycle,
+        Some(spec.to_string()),
+    ))
 }
 
 /// The attach loop, with the context already bound into `create`.
@@ -108,7 +188,17 @@ fn attach_each(
     let mut out = PciAttachment::default();
     for spec in specs {
         match create(spec) {
-            Ok(created) => push_created(created, &mut out),
+            Ok(created) => {
+                // A device the registry refuses is a mis-specified
+                // machine, so stop the pass like a creation failure.
+                if let Err(e) = push_created(spec, created, &mut out) {
+                    error!(log, "failed to register PCI device";
+                        "spec" => spec,
+                        "error" => %e,
+                    );
+                    return Err(anyhow::Error::new(e));
+                }
+            }
             Err(e) => {
                 error!(log, "failed to create PCI device";
                     "spec" => spec,
@@ -138,13 +228,15 @@ mod tests {
     use slog::Logger;
 
     use vmm_core::common::RWOp;
+    use vmm_core::mem::SegidAlloc;
     use vmm_devices::pci::{BarN, PciDevice};
     use vmm_devices::Lifecycle;
 
     use super::{
-        attach_each, push_created, CreatedPciDevice, LifecycleHandle,
-        PciAttachment, PciDeviceHandle,
+        attach_each, push_created, spec_device_id, CreatedPciDevice,
+        LifecycleHandle, PciAttachment, PciDeviceHandle,
     };
+    use crate::registry::{RegistryError, SlotState};
 
     struct StubPci;
 
@@ -176,35 +268,102 @@ mod tests {
         Logger::root(slog::Discard, slog::o!())
     }
 
-    fn collect(created: CreatedPciDevice) -> (usize, usize) {
+    /// PCI handles, lifecycle handles, registered slots.
+    fn collect(created: CreatedPciDevice) -> (usize, usize, usize) {
         let mut out = PciAttachment::default();
-        push_created(created, &mut out);
-        (out.pci_devices.len(), out.lifecycle_devices.len())
+        push_created("4,stub,/disk", created, &mut out)
+            .expect("one device never collides");
+        (
+            out.registry.pci_devices().len(),
+            out.registry.lifecycle_devices().len(),
+            out.registry.len(),
+        )
     }
 
     #[test]
-    fn normal_device_lands_in_both_vectors() {
-        assert_eq!(collect((Some(pci()), Some(lifecycle()))), (1, 1));
+    fn normal_device_carries_both_handles() {
+        assert_eq!(collect((Some(pci()), Some(lifecycle()))), (1, 1, 1));
     }
 
     #[test]
-    fn passthru_shape_lands_only_in_pci_devices() {
+    fn passthru_shape_registers_a_pci_handle_only() {
         // passthru carries no Lifecycle and is never quiesced, paused or
         // migrated. The factory contract must keep permitting this.
-        assert_eq!(collect((Some(pci()), None)), (1, 0));
+        assert_eq!(collect((Some(pci()), None)), (1, 0, 1));
     }
 
     #[test]
     fn chipset_owned_driver_contributes_nothing() {
         // hostbridge and lpc: the chipset already created them.
-        assert_eq!(collect((None, None)), (0, 0));
+        assert_eq!(collect((None, None)), (0, 0, 0));
     }
 
     #[test]
-    fn lifecycle_without_a_pci_handle_is_skipped() {
-        // Behavior preserved from init_pci_devices, which matched
-        // Ok((None, _)) and dropped the tuple.
-        assert_eq!(collect((None, Some(lifecycle()))), (0, 0));
+    fn lifecycle_without_a_pci_handle_is_kept() {
+        // The old loop matched Ok((None, _)) and dropped the tuple, so
+        // a backend with no PCI face could never be quiesced or paused.
+        assert_eq!(collect((None, Some(lifecycle()))), (0, 1, 1));
+    }
+
+    #[test]
+    fn the_registry_records_the_id_bdf_and_spec() {
+        let mut out = PciAttachment::default();
+        push_created(
+            "4:1,virtio-blk,/disk",
+            (Some(pci()), Some(lifecycle())),
+            &mut out,
+        )
+        .expect("first device");
+
+        let dev = out
+            .registry
+            .get_by_id("virtio-blk@4:1")
+            .expect("id follows driver@slot");
+        let bdf = dev.bdf.expect("the slot field parses");
+        assert_eq!((bdf.bus(), bdf.dev(), bdf.func()), (0, 4, 1));
+        assert_eq!(dev.spec.as_deref(), Some("4:1,virtio-blk,/disk"));
+        assert_eq!(dev.state, SlotState::Present);
+        assert!(!dev.hotpluggable);
+    }
+
+    #[test]
+    fn spec_device_id_falls_back_to_the_slot() {
+        assert_eq!(spec_device_id("4,virtio-blk,/disk"), "virtio-blk@4");
+        assert_eq!(spec_device_id("0"), "0");
+        assert_eq!(spec_device_id("0,"), "0");
+    }
+
+    #[test]
+    fn the_id_and_the_bdf_read_the_same_slot_field() {
+        // Both must read one trimmed slot. A spec that names a slot the
+        // id shows but the BDF drops would be unreachable by address.
+        let mut out = PciAttachment::default();
+        push_created(" 4 ,virtio-blk", (Some(pci()), None), &mut out)
+            .expect("insert");
+
+        let dev = out.registry.get_by_id("virtio-blk@4").expect("id");
+        assert_eq!(dev.bdf, vmm_devices::pci::Bdf::new(0, 4, 0));
+    }
+
+    #[test]
+    fn two_specs_at_one_slot_are_refused() {
+        // The bus rejects the second attach; the registry is the second
+        // guard, and it must not silently keep two slot 4 devices.
+        let specs =
+            vec!["4,virtio-blk,/a".to_string(), "4,virtio-net,/b".to_string()];
+
+        let Err(err) = attach_each(&specs, &null_log(), |_spec| {
+            Ok((Some(pci()), Some(lifecycle())))
+        }) else {
+            panic!("the second slot 4 spec must fail");
+        };
+
+        assert_eq!(
+            err.downcast_ref::<RegistryError>(),
+            Some(&RegistryError::DuplicateBdf(
+                vmm_devices::pci::Bdf::new(0, 4, 0).expect("slot 4")
+            ))
+        );
     }
 
     #[test]
@@ -223,8 +382,11 @@ mod tests {
         })
         .expect("factory never fails here");
         assert_eq!(seen, specs);
-        assert_eq!(attached.pci_devices.len(), 3);
-        assert_eq!(attached.lifecycle_devices.len(), 3);
+        assert_eq!(attached.registry.pci_devices().len(), 3);
+        assert_eq!(attached.registry.lifecycle_devices().len(), 3);
+        let ids: Vec<String> =
+            attached.registry.list().into_iter().map(|d| d.id).collect();
+        assert_eq!(ids, ["hostbridge@0", "virtio-blk@4", "virtio-rnd@5"]);
     }
 
     #[test]
@@ -246,5 +408,18 @@ mod tests {
         };
         assert_eq!(err.to_string(), "failed to open disk");
         assert_eq!(seen, ["4,virtio-blk,/disk", "5,nvme,/missing"]);
+    }
+
+    #[test]
+    fn an_arc_segid_alloc_keeps_one_counter() {
+        // OwnedPciCtx shares the machine's allocator by Arc. A copy would
+        // restart the counter and hand two devices the same segment ID,
+        // so the kernel would reject the second VM_ALLOC_MEMSEG.
+        let owned = Arc::new(SegidAlloc::new(0));
+        let shared = owned.clone();
+        assert!(Arc::ptr_eq(&owned, &shared));
+        let first = owned.alloc().expect("segment 0 is free");
+        let second = shared.alloc().expect("segment 1 is free");
+        assert_ne!(first, second);
     }
 }

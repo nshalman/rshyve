@@ -309,6 +309,83 @@ pub fn build_cpuid_entries(baseline: CpuBaseline) -> Vec<vcpu_cpuid_entry> {
     entries
 }
 
+/// The CPUID table one VM programs, built once and replayed per vCPU.
+///
+/// A vCPU brought online after boot has to get the table its siblings
+/// got. Two feature sets on one machine is a guest fault that is very
+/// hard to read back, so the table is a value the caller keeps, not a
+/// loop only the boot path can run.
+#[derive(Clone)]
+pub struct CpuidTable {
+    entries: Vec<vcpu_cpuid_entry>,
+    flags: u32,
+}
+
+impl CpuidTable {
+    /// Build the table for `baseline` plus any vendor-defined `extra`
+    /// entries, or `None` when there is nothing to program.
+    ///
+    /// `None` means a pure native passthrough: the kernel answers
+    /// CPUID from the host, so no vCPU needs an override.
+    ///
+    /// When `baseline == Host` and `extra` is non-empty, this builds a
+    /// full host-passthrough table first so the kernel does not lose
+    /// the standard leaves: `set_cpuid` replaces the kernel table
+    /// wholesale, so a partial override cannot be shipped.
+    pub fn build(
+        baseline: CpuBaseline,
+        extra: &[vcpu_cpuid_entry],
+    ) -> Option<Self> {
+        let mut entries = if baseline == CpuBaseline::Host {
+            if extra.is_empty() {
+                return None;
+            }
+            build_passthrough_entries()
+        } else {
+            build_cpuid_entries(baseline)
+        };
+
+        if !extra.is_empty() {
+            entries.extend_from_slice(extra);
+            entries.sort_by(vcpu_cpuid_entry::eval_sort);
+        }
+        if entries.is_empty() {
+            return None;
+        }
+
+        let (_, ebx, ecx, edx) = host_cpuid(0, 0);
+        let is_intel =
+            ebx == 0x756e_6547 && edx == 0x4965_6e69 && ecx == 0x6c65_746e;
+        let flags = if is_intel { VCC_FLAG_INTEL_FALLBACK } else { 0 };
+
+        Some(Self { entries, flags })
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The `VCC_*` flags this table is programmed with.
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    /// Program the table into one vCPU.
+    ///
+    /// The kernel copies the entries in, so each call needs its own
+    /// mutable copy. `vm_set_cpuid` does not need the vCPU to be
+    /// active (`vmm_cpuid.c:457`), which is what lets a hot-add
+    /// program the table before the activation it cannot undo.
+    pub fn apply_to(&self, hdl: &VmmHdl, vcpuid: i32) -> std::io::Result<()> {
+        let mut entries = self.entries.clone();
+        hdl.set_cpuid(vcpuid, &mut entries, self.flags)
+    }
+}
+
 /// Apply a CPUID baseline to all vCPUs of a VM.
 ///
 /// If baseline is `Host`, this is a no-op (kernel uses native CPUID).
@@ -324,10 +401,9 @@ pub fn apply_cpuid_baseline(
 /// Apply a CPUID baseline plus a list of additional vendor-defined
 /// entries (e.g. Hyper-V leaves 0x4000_0000+) to every vCPU.
 ///
-/// `extra` may be empty. When `baseline == Host` and `extra` is
-/// non-empty, this builds a full host-passthrough table first so the
-/// kernel does not lose the standard leaves: `set_cpuid` replaces the
-/// kernel's table wholesale, so we cannot ship a partial override.
+/// `extra` may be empty. Returns the table that was programmed, so the
+/// caller can replay it on a vCPU added later. `None` means nothing
+/// was programmed.
 pub fn apply_cpuid(
     hdl: &VmmHdl,
     num_cpus: u32,
@@ -335,42 +411,39 @@ pub fn apply_cpuid(
     extra: &[vcpu_cpuid_entry],
     log: &slog::Logger,
 ) -> std::io::Result<()> {
-    let mut entries = if baseline == CpuBaseline::Host {
-        if extra.is_empty() {
-            // Pure native passthrough: nothing to program.
-            return Ok(());
-        }
-        build_passthrough_entries()
-    } else {
-        build_cpuid_entries(baseline)
+    apply_cpuid_table(hdl, num_cpus, baseline, extra, log).map(|_| ())
+}
+
+/// The same pass, handing back the table it programmed.
+pub fn apply_cpuid_table(
+    hdl: &VmmHdl,
+    num_cpus: u32,
+    baseline: CpuBaseline,
+    extra: &[vcpu_cpuid_entry],
+    log: &slog::Logger,
+) -> std::io::Result<Option<CpuidTable>> {
+    let Some(table) = CpuidTable::build(baseline, extra) else {
+        return Ok(None);
     };
-
-    if !extra.is_empty() {
-        entries.extend_from_slice(extra);
-        entries.sort_by(vcpu_cpuid_entry::eval_sort);
-    }
-    if entries.is_empty() {
-        return Ok(());
-    }
-
-    let (_, ebx, ecx, edx) = host_cpuid(0, 0);
-    let is_intel =
-        ebx == 0x756e_6547 && edx == 0x4965_6e69 && ecx == 0x6c65_746e;
-    let flags = if is_intel { VCC_FLAG_INTEL_FALLBACK } else { 0 };
 
     slog::info!(log, "applying CPUID";
         "baseline" => ?baseline,
-        "entries" => entries.len(),
+        "entries" => table.len(),
         "extra" => extra.len(),
         "vcpus" => num_cpus,
     );
 
-    for vcpuid in 0..num_cpus as i32 {
-        let mut cpu_entries = entries.clone();
-        hdl.set_cpuid(vcpuid, &mut cpu_entries, flags)?;
+    let last = i32::try_from(num_cpus).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{num_cpus} vCPUs does not fit the bhyve vCPU id"),
+        )
+    })?;
+    for vcpuid in 0..last {
+        table.apply_to(hdl, vcpuid)?;
     }
 
-    Ok(())
+    Ok(Some(table))
 }
 
 /// Build a full CPUID table from native host values, without applying
@@ -532,4 +605,72 @@ pub fn query_host_features() -> (u32, u32, u32, u32, u32, u32) {
     };
 
     (ecx1, edx1, ebx7, ecx7, edx7, xcr0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{entry, CpuBaseline, CpuidTable};
+
+    #[test]
+    fn a_host_baseline_with_no_extra_entries_programs_nothing() {
+        // The kernel answers CPUID from the host, so no vCPU needs an
+        // override and a late vCPU needs no replay either.
+        assert!(CpuidTable::build(CpuBaseline::Host, &[]).is_none());
+    }
+
+    #[test]
+    fn a_host_baseline_with_extra_entries_keeps_the_standard_leaves() {
+        // VM_SET_CPUID replaces the kernel table wholesale, so an
+        // extra leaf on its own would hide every standard leaf.
+        let extra = entry(0x4000_0000, 0, 0, 0x4000_0001, 0, 0, 0);
+        let table = CpuidTable::build(CpuBaseline::Host, &[extra])
+            .expect("extra entries need a table");
+
+        assert!(table.len() > 1, "the standard leaves are still there");
+        assert!(table.entries.iter().any(|e| e.vce_function == 0x4000_0000));
+        assert!(table.entries.iter().any(|e| e.vce_function == 0));
+    }
+
+    #[test]
+    fn a_masked_baseline_builds_a_table() {
+        let table = CpuidTable::build(CpuBaseline::Avx2, &[])
+            .expect("a masked baseline always programs a table");
+
+        assert!(!table.is_empty());
+    }
+
+    #[test]
+    fn every_vcpu_gets_the_same_table() {
+        // A vCPU added after boot must see what its siblings see. The
+        // table is one value, so a replay cannot drift from the boot
+        // pass.
+        let table = CpuidTable::build(CpuBaseline::Sse42, &[])
+            .expect("a masked baseline always programs a table");
+        let first = table.clone();
+
+        assert_eq!(first.len(), table.len());
+        assert_eq!(first.flags(), table.flags());
+        assert!(first.entries.iter().zip(table.entries.iter()).all(
+            |(a, b)| a.vce_function == b.vce_function
+                && a.vce_index == b.vce_index
+                && a.vce_eax == b.vce_eax
+        ));
+    }
+
+    #[test]
+    fn entries_stay_sorted_after_extra_entries_are_folded_in() {
+        // The kernel needs the table in eval order.
+        let extra = entry(0x4000_0000, 0, 0, 1, 0, 0, 0);
+        let table = CpuidTable::build(CpuBaseline::Avx2, &[extra])
+            .expect("a masked baseline always programs a table");
+
+        let mut sorted = table.entries.clone();
+        sorted.sort_by(bhyve_api::vcpu_cpuid_entry::eval_sort);
+        let keys = |v: &[bhyve_api::vcpu_cpuid_entry]| {
+            v.iter()
+                .map(|e| (e.vce_function, e.vce_index))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&table.entries), keys(&sorted));
+    }
 }

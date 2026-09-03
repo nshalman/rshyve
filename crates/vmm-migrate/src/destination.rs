@@ -102,7 +102,9 @@ async fn run_destination_inner<S: AsyncRead + AsyncWrite + Unpin>(
     let pre_data = expect_serialized(pre_msg)?;
     let preamble: MigrationPreamble = Message::deserialize(&pre_data)?;
 
-    // Validate compatibility
+    // Validate compatibility. Both sides report their boot topology,
+    // so a CPU or memory the source hot-added is invisible here. The
+    // source refuses to start in that case.
     if preamble.num_cpus != num_cpus {
         let err = MigrateError::PreambleMismatch(format!(
             "CPU count mismatch: source has {}, we have {}",
@@ -113,7 +115,7 @@ async fn run_destination_inner<S: AsyncRead + AsyncWrite + Unpin>(
     }
     if preamble.mem_size != mem_size {
         let err = MigrateError::PreambleMismatch(format!(
-            "memory size mismatch: source has {}, we have {}",
+            "memory size mismatch: source has {} bytes, we have {}",
             preamble.mem_size, mem_size,
         ));
         ws.send(Message::Error(err.clone()).encode()).await?;

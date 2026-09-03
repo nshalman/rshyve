@@ -89,9 +89,12 @@ fn run_inner<S: Read + Write>(
 
     let pre_data = expect_serialized(recv(ws)?)?;
     let preamble: MigrationPreamble = Message::deserialize(&pre_data)?;
+    // Both sides report their boot topology, so a CPU or memory the
+    // source hot-added is invisible here. The source refuses to start
+    // in that case, which is the only place the growth can be seen.
     if preamble.num_cpus != num_cpus {
         let err = MigrateError::PreambleMismatch(format!(
-            "cpus: src={} dst={}",
+            "CPU count mismatch: source has {}, we have {}",
             preamble.num_cpus, num_cpus
         ));
         send(ws, &Message::Error(err.clone()))?;
@@ -99,7 +102,7 @@ fn run_inner<S: Read + Write>(
     }
     if preamble.mem_size != mem_size {
         let err = MigrateError::PreambleMismatch(format!(
-            "mem: src={} dst={}",
+            "memory size mismatch: source has {} bytes, we have {}",
             preamble.mem_size, mem_size
         ));
         send(ws, &Message::Error(err.clone()))?;

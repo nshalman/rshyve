@@ -18,11 +18,11 @@ use std::sync::{Arc, Mutex};
 use slog;
 use vmm_core::common::RWOp;
 use vmm_core::hdl::VmmHdl;
-use vmm_core::intr_pins::PciIntrPin;
+use vmm_core::intr_pins::PciIntrRoutes;
 use vmm_core::pio::{PioBus, PioFn};
 
 use crate::pci::bits;
-use crate::pci::bus::PciBus;
+use crate::pci::bus::{AttachError, PciBus};
 use crate::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use crate::pci::{BarN, Bdf, PioCfgDecoder};
 
@@ -59,12 +59,9 @@ pub struct I440FxChipset {
     /// LPC bridge retained for future chipset migration-state export.
     #[allow(dead_code)]
     lpc: Arc<LpcBridge>,
-    /// Shared PIR register state for PciIntrPin instances.
-    pir_regs: Arc<Mutex<[u8; PIR_COUNT]>>,
-    /// VM handle for PCI interrupt delivery.
-    hdl: Option<Arc<VmmHdl>>,
-    /// Logger for chipset and child interrupt pins.
-    log: slog::Logger,
+    /// Shared PCI INTx routing state. `None` without a VM handle, which
+    /// leaves [`route_lintr`](Self::route_lintr) with nothing to route to.
+    intr_routes: Option<Arc<PciIntrRoutes>>,
 }
 
 impl I440FxChipset {
@@ -89,7 +86,7 @@ impl I440FxChipset {
         pci_bus.attach(bdf_hb, hostbridge);
 
         // Shared PIR registers: firmware writes these via LPC bridge config
-        // space (0x60-0x63), PciIntrPin reads them at assertion time.
+        // space (0x60-0x63), PciIntrRoutes reads them at delivery time.
         let pir_regs = Arc::new(Mutex::new([0x80u8; PIR_COUNT]));
 
         // ISA/LPC bridge at BDF 0.1.0 with PIR routing
@@ -98,14 +95,20 @@ impl I440FxChipset {
         let bdf_lpc = Bdf::new_unchecked(0, 1, 0);
         pci_bus.attach(bdf_lpc, lpc_pci);
 
+        let intr_routes = hdl.map(|hdl| {
+            PciIntrRoutes::new(
+                pir_regs.clone(),
+                hdl,
+                log.new(slog::o!("component" => "pci-intr")),
+            )
+        });
+
         let chipset = Arc::new(Self {
             pci_bus,
             cfg_decoder: PioCfgDecoder::new(),
             post_code: AtomicU8::new(0),
             lpc,
-            pir_regs,
-            hdl,
-            log,
+            intr_routes,
         });
 
         // Only port 0xCF8 is claimed; dword accesses still reach this handler.
@@ -157,8 +160,28 @@ impl I440FxChipset {
     }
 
     /// Convenience: attach a device to the PCI bus at the given BDF.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the BDF is occupied. Use
+    /// [`try_attach_device`](Self::try_attach_device) when the BDF comes
+    /// from a request at run time.
     pub fn attach_device(&self, bdf: Bdf, dev: Arc<dyn PciDevice>) {
         self.pci_bus.attach(bdf, dev);
+    }
+
+    /// Attach a device, returning an error if the BDF is occupied.
+    pub fn try_attach_device(
+        &self,
+        bdf: Bdf,
+        dev: Arc<dyn PciDevice>,
+    ) -> Result<(), AttachError> {
+        self.pci_bus.try_attach(bdf, dev)
+    }
+
+    /// Remove the device at `bdf` from the PCI bus and return it.
+    pub fn detach_device(&self, bdf: &Bdf) -> Option<Arc<dyn PciDevice>> {
+        self.pci_bus.detach(bdf)
     }
 
     /// Get a PCI interrupt pin for the device at `bdf`.
@@ -173,15 +196,8 @@ impl I440FxChipset {
         bdf: &Bdf,
     ) -> Option<(crate::pci::INTxPinID, Arc<dyn vmm_core::intr_pins::IntrPin>)>
     {
-        let hdl = self.hdl.as_ref()?;
-        let pin = PciIntrPin::new(
-            bdf.dev(),
-            0, // INT#A
-            self.pir_regs.clone(),
-            hdl.clone(),
-            self.log
-                .new(slog::o!("component" => "pci-intr", "slot" => bdf.dev())),
-        );
+        let routes = self.intr_routes.as_ref()?;
+        let pin = routes.pin_handle(bdf.dev(), 0); // INT#A
         Some((crate::pci::INTxPinID::IntA, pin))
     }
 
@@ -305,13 +321,13 @@ const PIR_MASK_IRQ: u8 = 0x0F;
 ///
 /// Handles PIR (PCI Interrupt Routing) registers at config space
 /// offsets 0x60-0x63. The firmware writes these to map PIRQ links
-/// A-D to ISA IRQs. PCI device pins (`PciIntrPin`) read these
-/// registers dynamically at interrupt assertion time, so no callback
-/// wiring is needed when the firmware updates PIR values.
+/// A-D to ISA IRQs. `PciIntrRoutes` reads these registers dynamically
+/// at interrupt delivery time, so no callback wiring is needed when the
+/// firmware updates PIR values.
 struct LpcBridge {
     state: Mutex<DeviceState>,
-    /// Shared PIR register values. PciIntrPin instances hold an
-    /// `Arc` clone and read the register at assertion time.
+    /// Shared PIR register values. `PciIntrRoutes` holds an `Arc` clone
+    /// and reads the register at delivery time.
     pir_regs: Arc<Mutex<[u8; PIR_COUNT]>>,
 }
 
@@ -420,6 +436,35 @@ mod tests {
         pio.handle_out(0xCFC, 4, val);
     }
 
+    /// A device that answers config reads from a plain [`DeviceState`].
+    struct DummyDev(Mutex<DeviceState>);
+
+    impl PciDevice for DummyDev {
+        fn cfg_read(&self, offset: u8, len: u8) -> u32 {
+            self.0
+                .lock()
+                .expect("dummy lock poisoned")
+                .cfg_read(offset, len)
+        }
+        fn cfg_write(&self, offset: u8, len: u8, val: u32) {
+            self.0
+                .lock()
+                .expect("dummy lock poisoned")
+                .cfg_write(offset, len, val);
+        }
+        fn bar_rw(&self, _: BarN, _: usize, _: RWOp<'_>) {}
+    }
+
+    fn dummy_dev(vendor_id: u16, device_id: u16) -> Arc<dyn PciDevice> {
+        Arc::new(DummyDev(Mutex::new(DeviceState::new(DeviceIdent {
+            vendor_id,
+            device_id,
+            class: bits::CLASS_NETWORK,
+            subclass: 0,
+            ..Default::default()
+        }))))
+    }
+
     #[test]
     fn hostbridge_vendor_device_id() {
         let (pio, _cs) = setup();
@@ -504,31 +549,41 @@ mod tests {
     fn attach_additional_device() {
         let (pio, cs) = setup();
 
-        struct DummyDev(Mutex<DeviceState>);
-        impl PciDevice for DummyDev {
-            fn cfg_read(&self, offset: u8, len: u8) -> u32 {
-                self.0.lock().unwrap().cfg_read(offset, len)
-            }
-            fn cfg_write(&self, offset: u8, len: u8, val: u32) {
-                self.0.lock().unwrap().cfg_write(offset, len, val);
-            }
-            fn bar_rw(&self, _: BarN, _: usize, _: RWOp<'_>) {}
-        }
-
-        let dev: Arc<dyn PciDevice> =
-            Arc::new(DummyDev(Mutex::new(DeviceState::new(DeviceIdent {
-                vendor_id: 0x1AF4,
-                device_id: 0x1000,
-                class: bits::CLASS_NETWORK,
-                subclass: 0,
-                ..Default::default()
-            }))));
         let bdf = Bdf::new_unchecked(0, 3, 0);
-        cs.attach_device(bdf, dev);
+        cs.attach_device(bdf, dummy_dev(0x1AF4, 0x1000));
 
         let val = cfg_read_dword(&pio, 0, 3, 0, 0x00);
         assert_eq!(val & 0xFFFF, 0x1AF4);
         assert_eq!((val >> 16) & 0xFFFF, 0x1000);
+    }
+
+    #[test]
+    fn try_attach_rejects_an_occupied_slot() {
+        let (pio, cs) = setup();
+        let bdf = Bdf::new_unchecked(0, 5, 0);
+        cs.attach_device(bdf, dummy_dev(0x1AF4, 0x1041));
+
+        let err = cs
+            .try_attach_device(bdf, dummy_dev(0x1AF4, 0x1042))
+            .expect_err("slot is occupied");
+        assert!(matches!(err, AttachError::SlotOccupied(b) if b == bdf));
+        assert_eq!(cfg_read_dword(&pio, 0, 5, 0, 0x00) >> 16, 0x1041);
+    }
+
+    #[test]
+    fn detach_frees_the_slot() {
+        let (pio, cs) = setup();
+        let bdf = Bdf::new_unchecked(0, 6, 0);
+        cs.attach_device(bdf, dummy_dev(0x1AF4, 0x1041));
+
+        assert!(cs.detach_device(&bdf).is_some());
+        assert_eq!(cfg_read_dword(&pio, 0, 6, 0, 0x00), 0xFFFF_FFFF);
+        assert!(cs.detach_device(&bdf).is_none());
+
+        // The freed slot takes a new device.
+        cs.try_attach_device(bdf, dummy_dev(0x1AF4, 0x1000))
+            .expect("slot is free");
+        assert_eq!(cfg_read_dword(&pio, 0, 6, 0, 0x00) >> 16, 0x1000);
     }
 
     #[test]

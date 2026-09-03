@@ -56,15 +56,9 @@ honor at startup. See [docs/cli.md](docs/cli.md#firehyve).
 ## Building and testing
 
 The `rshyve` binary builds only on illumos: `vmm-tpm-sys` runs an autotools
-build of libtpms, `bhyve-api` binds SunOS ioctls, and `viona-api` needs
-libdladm. Everything else in the workspace builds and tests on any host.
-
-libtpms is a submodule, so clone with it:
-
-```bash
-git clone --recurse-submodules https://github.com/TritonDataCenter/rust-bhyve
-# already cloned:  git submodule update --init third_party/libtpms
-```
+build of vendored libtpms, `bhyve-api` binds SunOS ioctls, and
+`viona-api` needs libdladm. Everything else in the workspace builds and
+tests on any host.
 
 ```bash
 cargo build --workspace --locked --release   # on an illumos host

@@ -1,6 +1,6 @@
 When working with virtio use 1.3 specification:  https://docs.oasis-open.org/virtio/virtio/v1.3/csd01/virtio-v1.3-csd01.html
 
-Propolis is the upstream reference: https://github.com/oxidecomputer/propolis
+Propolis is available as a reference in ~/workspace/oxide/propolis
 
 ## Coding Standards
 

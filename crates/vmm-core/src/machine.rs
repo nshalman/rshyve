@@ -53,7 +53,7 @@ pub struct Machine {
     mem_size: usize,
     bus_pio: Arc<PioBus>,
     bus_mmio: Arc<MmioBus>,
-    segids: SegidAlloc,
+    segids: Arc<SegidAlloc>,
 }
 
 impl Machine {
@@ -93,7 +93,7 @@ impl Machine {
         &self.bus_mmio
     }
 
-    pub fn segids(&self) -> &SegidAlloc {
+    pub fn segids(&self) -> &Arc<SegidAlloc> {
         &self.segids
     }
 }
@@ -129,7 +129,9 @@ impl MachineSetup {
     /// After this, the PhysMap is wrapped in Arc and no further
     /// memory regions can be added.
     pub fn finalize(self) -> Machine {
-        let segids = SegidAlloc::new(self.map.next_segid());
+        // Shared, not copied: a second allocator would hand out
+        // duplicate segment IDs.
+        let segids = Arc::new(SegidAlloc::new(self.map.next_segid()));
         let map = Arc::new(self.map);
         let memctx = MemCtx::new(map.clone());
 

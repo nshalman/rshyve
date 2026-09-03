@@ -8,484 +8,26 @@
 //!
 //! Guest memory is concurrently accessible by vCPUs and potentially by
 //! DMA-capable devices. Therefore, we must never form Rust references
-//! (`&` or `&mut`) to guest memory — doing so would violate Rust's
+//! (`&` or `&mut`) to guest memory. That would violate Rust's
 //! aliasing rules since vCPUs may read or write at any time.
 //!
 //! Instead, we use [`Mapping`] (an owned mmap region) and [`SubMapping`]
 //! (a borrowed view) which operate exclusively through raw pointer
 //! operations (`read_volatile`, `write_volatile`, `copy_nonoverlapping`).
 //!
-//! The lifetime of a [`SubMapping`] is bounded by the [`Mapping`] it
+//! The lifetime of a [`SubMapping`] is bounded by the `Mapping` it
 //! borrows from, preventing use-after-unmap.
 
 use std::io::{Error, ErrorKind, Result};
-use std::mem::{align_of, size_of};
-use std::os::fd::AsRawFd;
-use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use bitflags::bitflags;
-
+use crate::common::PAGE_SIZE;
 use crate::hdl::VmmHdl;
 
-bitflags! {
-    /// Memory protection flags.
-    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-    pub struct Prot: i32 {
-        const READ  = libc::PROT_READ;
-        const WRITE = libc::PROT_WRITE;
-        const EXEC  = libc::PROT_EXEC;
-        const RW    = libc::PROT_READ | libc::PROT_WRITE;
-        const RWX   = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
-    }
-}
+mod mapping;
 
-/// An owned region of mapped memory.
-///
-/// Wraps an mmap'd region with protection metadata. The mapping is
-/// unmapped on drop. No Rust references to the underlying memory are
-/// ever created — all access goes through raw pointer operations.
-///
-/// # Safety
-///
-/// The `Send` and `Sync` impls are safe because:
-/// - The pointer is obtained from `mmap()` and remains valid until `drop()`.
-/// - The API never exposes raw pointers or references to callers.
-/// - All reads/writes go through `SubMapping` which enforces bounds
-///   and protection checks.
-struct Mapping {
-    ptr: NonNull<u8>,
-    len: usize,
-    prot: Prot,
-}
-
-// Safety: See doc comment on Mapping. The pointer is stable (from mmap),
-// and we never create references to the underlying data.
-unsafe impl Send for Mapping {}
-unsafe impl Sync for Mapping {}
-
-impl Mapping {
-    /// Create anonymous read/write backing without a VMM file descriptor.
-    fn anon(size: usize) -> Result<Self> {
-        // Safety: NULL addr lets the OS choose a non-conflicting location.
-        let raw = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                Prot::RW.bits(),
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-
-        if raw == libc::MAP_FAILED {
-            return Err(Error::last_os_error());
-        }
-
-        let ptr = NonNull::new(raw as *mut u8).expect("mmap returned non-NULL");
-        Ok(Self {
-            ptr,
-            len: size,
-            prot: Prot::RW,
-        })
-    }
-
-    /// Create a new memory mapping from a VMM file descriptor.
-    ///
-    /// # Arguments
-    /// - `size`: Region size in bytes (must be page-aligned).
-    /// - `prot`: Requested protection flags.
-    /// - `hdl`: VMM handle providing the file descriptor.
-    /// - `offset`: Offset within the VMM fd to map.
-    fn new(size: usize, prot: Prot, hdl: &VmmHdl, offset: i64) -> Result<Self> {
-        assert!(size > 0, "mapping size must be non-zero");
-
-        // Never map with EXEC into our process — only the guest sees EXEC.
-        let mmap_prot = prot.intersection(Prot::RW);
-
-        // Safety: NULL addr lets the OS choose a non-conflicting location.
-        // The caller must ensure the VMM fd and offset are valid and that
-        // the underlying segment outlives this Mapping.
-        let raw = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                mmap_prot.bits(),
-                libc::MAP_SHARED,
-                hdl.as_raw_fd(),
-                offset,
-            )
-        };
-
-        if raw == libc::MAP_FAILED {
-            return Err(Error::last_os_error());
-        }
-
-        let ptr = NonNull::new(raw as *mut u8).expect("mmap returned non-NULL");
-
-        Ok(Self {
-            ptr,
-            len: size,
-            prot,
-        })
-    }
-}
-
-impl Drop for Mapping {
-    fn drop(&mut self) {
-        // Safety: ptr and len were set by a successful mmap() call.
-        unsafe {
-            libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.len);
-        }
-    }
-}
-
-/// A borrowed, bounds-checked view into a [`Mapping`].
-///
-/// Provides safe read/write operations on guest memory without ever
-/// creating Rust references to that memory.
-///
-/// The `SubMapping` holds an `Arc<Mapping>`, which keeps the mmap
-/// alive for as long as any SubMapping exists. This is safe because
-/// the Mapping's Drop (munmap) only runs when all Arc references
-/// are dropped.
-///
-/// All reads use `read_volatile` and all writes use `write_volatile`
-/// because guest vCPUs may concurrently access the same memory.
-pub struct SubMapping {
-    /// Shared ownership of the backing Mapping, preventing munmap
-    /// while this SubMapping exists.
-    _backing: Arc<Mapping>,
-    ptr: NonNull<u8>,
-    len: usize,
-    prot: Prot,
-}
-
-impl SubMapping {
-    fn new(mapping: &Arc<Mapping>) -> Self {
-        Self {
-            _backing: Arc::clone(mapping),
-            ptr: mapping.ptr,
-            len: mapping.len,
-            prot: mapping.prot,
-        }
-    }
-
-    /// Get the raw host pointer to the start of this mapping.
-    ///
-    /// # Safety
-    ///
-    /// The returned pointer aliases guest memory that vCPUs access
-    /// concurrently. It must only be used as a target for raw I/O
-    /// operations (`pread`, `pwrite`, `preadv`, `pwritev`) — never
-    /// dereferenced as a Rust reference. The caller must keep this
-    /// `SubMapping` alive for the duration of the I/O.
-    #[inline]
-    pub unsafe fn as_ptr(&self) -> *mut u8 {
-        self.ptr.as_ptr()
-    }
-
-    /// Create a sub-region within this mapping.
-    ///
-    /// Returns `None` if `offset + len` exceeds the mapping bounds.
-    pub fn subregion(&self, offset: usize, len: usize) -> Option<SubMapping> {
-        let end = offset.checked_add(len)?;
-        if end > self.len {
-            return None;
-        }
-
-        // Safety: offset is within bounds (checked above), and the
-        // Arc<Mapping> keeps the mmap alive.
-        let ptr = unsafe { self.ptr.as_ptr().add(offset) };
-        Some(SubMapping {
-            _backing: Arc::clone(&self._backing),
-            ptr: NonNull::new(ptr).expect("offset from NonNull is non-null"),
-            len,
-            prot: self.prot,
-        })
-    }
-
-    /// Read a value of type T from the start of this mapping.
-    ///
-    /// Uses `read_volatile` because guest memory is concurrently mutable.
-    pub fn read<T: Copy>(&self) -> Result<T> {
-        if !self.prot.contains(Prot::READ) {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                "mapping is not readable",
-            ));
-        }
-        if self.len < size_of::<T>() {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "mapping too small for requested type",
-            ));
-        }
-        if !(self.ptr.as_ptr() as usize).is_multiple_of(align_of::<T>()) {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "mapping not aligned for requested type",
-            ));
-        }
-
-        // Safety: bounds and alignment checked above. We use
-        // read_volatile because guest vCPUs may write concurrently.
-        let val =
-            unsafe { std::ptr::read_volatile(self.ptr.as_ptr() as *const T) };
-        Ok(val)
-    }
-
-    /// Write a value of type T to the start of this mapping.
-    ///
-    /// Uses `write_volatile` because guest memory is concurrently readable.
-    pub fn write<T: Copy>(&self, val: &T) -> Result<()> {
-        if !self.prot.contains(Prot::WRITE) {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                "mapping is not writable",
-            ));
-        }
-        if self.len < size_of::<T>() {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "mapping too small for requested type",
-            ));
-        }
-        if !(self.ptr.as_ptr() as usize).is_multiple_of(align_of::<T>()) {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "mapping not aligned for requested type",
-            ));
-        }
-
-        // Safety: bounds and alignment checked above. write_volatile
-        // for concurrency.
-        unsafe {
-            std::ptr::write_volatile(self.ptr.as_ptr() as *mut T, *val);
-        }
-        Ok(())
-    }
-
-    /// Read bytes from this mapping into a buffer.
-    pub fn read_bytes(&self, buf: &mut [u8]) -> Result<()> {
-        if !self.prot.contains(Prot::READ) {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                "mapping is not readable",
-            ));
-        }
-        if buf.len() > self.len {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "read exceeds mapping bounds",
-            ));
-        }
-
-        // Safety: bounds checked above. We use volatile reads because
-        // guest memory is concurrently mutable by vCPUs; non-volatile
-        // copies may be optimized in ways that miss concurrent writes.
-        let src = self.ptr.as_ptr();
-        for (i, byte) in buf.iter_mut().enumerate() {
-            unsafe {
-                *byte = std::ptr::read_volatile(src.add(i));
-            }
-        }
-        Ok(())
-    }
-
-    /// Bulk copy out of guest-visible memory into a host buffer.
-    ///
-    /// Unlike the byte-at-a-time volatile loop in [`Self::read_bytes`], this
-    /// is for display capture, where a vCPU may paint the framebuffer during
-    /// the copy. A torn frame is acceptable there, and volatile byte reads are
-    /// too costly for multi-megabyte captures. Do not use this where a torn
-    /// read is a correctness bug.
-    pub fn copy_out(&self, dst: &mut [u8]) -> Result<()> {
-        if !self.prot.contains(Prot::READ) {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                "mapping is not readable",
-            ));
-        }
-        if dst.len() > self.len {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "copy exceeds mapping bounds",
-            ));
-        }
-
-        // Safety: bounds are checked above, and callers cannot obtain an
-        // overlapping destination through the safe SubMapping API.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.ptr.as_ptr(),
-                dst.as_mut_ptr(),
-                dst.len(),
-            );
-        }
-        Ok(())
-    }
-
-    /// Write bytes from a buffer into this mapping.
-    pub fn write_bytes(&self, data: &[u8]) -> Result<()> {
-        if !self.prot.contains(Prot::WRITE) {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                "mapping is not writable",
-            ));
-        }
-        if data.len() > self.len {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "write exceeds mapping bounds",
-            ));
-        }
-
-        // Safety: bounds checked above. We use volatile writes because
-        // guest memory is concurrently readable by vCPUs; non-volatile
-        // copies may be reordered or elided by the optimizer.
-        let dst = self.ptr.as_ptr();
-        for (i, byte) in data.iter().enumerate() {
-            unsafe {
-                std::ptr::write_volatile(dst.add(i), *byte);
-            }
-        }
-        Ok(())
-    }
-
-    /// Bulk copy a host buffer into guest-visible memory.
-    ///
-    /// The write-side counterpart to [`Self::copy_out`]. The
-    /// byte-at-a-time volatile loop in [`Self::write_bytes`] cannot be
-    /// coalesced by the optimizer, which is the point of volatile, so it
-    /// costs about one store instruction per byte. That is far too slow
-    /// for the multi-megabyte writes on the boot path: loading a 9.3 MiB
-    /// PVH kernel that way measured about 14 ms slower than a memcpy.
-    ///
-    /// Only for writes that no vCPU can observe partially, which in
-    /// practice means before the vCPU threads start. Do not use this
-    /// where a torn write is a correctness bug.
-    pub fn copy_in(&self, src: &[u8]) -> Result<()> {
-        if !self.prot.contains(Prot::WRITE) {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                "mapping is not writable",
-            ));
-        }
-        if src.len() > self.len {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "copy exceeds mapping bounds",
-            ));
-        }
-
-        // Safety: bounds are checked above. `copy` rather than
-        // `copy_nonoverlapping` because a caller may legitimately stage
-        // bytes that alias guest memory, and memmove costs nothing extra
-        // when the ranges do not overlap.
-        unsafe {
-            std::ptr::copy(src.as_ptr(), self.ptr.as_ptr(), src.len());
-        }
-        // Keep the copy from sinking past the stores that publish it,
-        // such as the vCPU start that follows on the boot path.
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::Release);
-        Ok(())
-    }
-
-    /// Fill the first `len` bytes of this mapping from `file`, starting
-    /// at `file_offset`.
-    ///
-    /// Reads straight from the file descriptor into guest memory, so a
-    /// multi-megabyte boot image is never staged in the VMM's address
-    /// space. Uses `pread` on the raw pointer rather than a slice: the
-    /// safety model at the top of this module forbids forming a Rust
-    /// reference to guest memory, and that holds here too.
-    ///
-    /// Carries the same constraint as [`Self::copy_in`]: only for
-    /// writes no vCPU can observe partially, which on the boot path
-    /// means before the vCPU threads start.
-    ///
-    /// Short reads are resumed and `EINTR` is retried. End of file
-    /// before `len` bytes is an error rather than a short fill: a
-    /// segment claiming more bytes than its file holds must not leave
-    /// the tail holding whatever the guest page had before.
-    pub fn read_exact_from(
-        &self,
-        file: &std::fs::File,
-        file_offset: u64,
-        len: usize,
-    ) -> Result<()> {
-        if !self.prot.contains(Prot::WRITE) {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                "mapping is not writable",
-            ));
-        }
-        if len > self.len {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "read exceeds mapping bounds",
-            ));
-        }
-
-        let fd = file.as_raw_fd();
-        let mut done: usize = 0;
-        while done < len {
-            let offset = file_offset
-                .checked_add(done as u64)
-                .and_then(|o| i64::try_from(o).ok())
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        "file offset is out of range",
-                    )
-                })?;
-            // Safety: `done < len <= self.len`, so the destination stays
-            // inside the mapping, and the remaining count cannot run
-            // past its end. No Rust reference to guest memory is formed.
-            let got = unsafe {
-                libc::pread(
-                    fd,
-                    self.ptr.as_ptr().add(done) as *mut libc::c_void,
-                    len - done,
-                    offset,
-                )
-            };
-            if got < 0 {
-                let e = Error::last_os_error();
-                if e.kind() == ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(e);
-            }
-            if got == 0 {
-                return Err(Error::new(
-                    ErrorKind::UnexpectedEof,
-                    format!(
-                        "image ended {} bytes before the segment did",
-                        len - done
-                    ),
-                ));
-            }
-            done += got as usize;
-        }
-        // Keep the fill from sinking past the stores that publish it,
-        // such as the vCPU start that follows on the boot path.
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::Release);
-        Ok(())
-    }
-
-    /// Length of this mapping in bytes.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Whether this mapping is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
+use mapping::Mapping;
+pub use mapping::{Prot, SubMapping};
 
 /// Type of a guest physical memory region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,12 +53,67 @@ struct Region {
     mapping: Arc<Mapping>,
 }
 
+/// Start of the 32-bit MMIO hole.
+///
+/// This is the default lowmem limit in `machine.rs`. Everything from
+/// here to 4 GiB belongs to PCI BARs, the APICs and the firmware flash
+/// window, so no RAM may be placed in it at run time.
+pub const MMIO_HOLE_BASE: u64 = 0xC000_0000;
+
+/// End of the 32-bit MMIO hole, which is the 4 GiB line.
+pub const MMIO_HOLE_END: u64 = 0x1_0000_0000;
+
+/// Where a claim is allowed to sit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// Boot time. The 32-bit hole is legal, because the boot ROM, its
+    /// variable store and the firmware scratch RAM all live there.
+    Firmware,
+    /// Run time. RAM only, so the hole stays clear for the PCI BARs,
+    /// the APICs and the flash window.
+    Ram,
+}
+
+/// What is published in the guest physical address space, and what is
+/// spoken for by an add that has not finished.
+#[derive(Default)]
+struct AddressSpace {
+    /// Published regions, sorted by GPA.
+    regions: Vec<Region>,
+    /// `[gpa, end)` ranges held by an add still in progress.
+    ///
+    /// A claim keeps its place while the kernel work runs outside the
+    /// lock, so two adds can never map the same guest addresses.
+    claims: Vec<(u64, u64)>,
+}
+
+impl AddressSpace {
+    /// Reject a `[gpa, end)` range that touches anything already here.
+    ///
+    /// Both the boot path and the run-time path go through this, so
+    /// there is one overlap rule and not two.
+    fn check_free(&self, gpa: u64, end: u64) -> Result<()> {
+        for r in &self.regions {
+            let r_end = r.gpa + r.len as u64;
+            if gpa < r_end && end > r.gpa {
+                return Err(overlaps(gpa, end, r.gpa, r_end, "existing"));
+            }
+        }
+        for &(c_gpa, c_end) in &self.claims {
+            if gpa < c_end && end > c_gpa {
+                return Err(overlaps(gpa, end, c_gpa, c_end, "claimed"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Manages the guest physical address space.
 ///
 /// Tracks all memory regions (RAM, ROM, MMIO) and provides GPA-to-mapping
 /// translation. Regions are non-overlapping and sorted by GPA.
 pub struct PhysMap {
-    regions: Vec<Region>,
+    space: RwLock<AddressSpace>,
     next_segid: i32,
 }
 
@@ -529,7 +126,7 @@ impl Default for PhysMap {
 impl PhysMap {
     pub fn new() -> Self {
         Self {
-            regions: Vec::new(),
+            space: RwLock::new(AddressSpace::default()),
             next_segid: 0,
         }
     }
@@ -538,30 +135,19 @@ impl PhysMap {
     /// kernel VM, which is unavailable on non-illumos test hosts.
     #[doc(hidden)]
     pub fn new_anon(gpa: u64, len: usize) -> Result<Self> {
-        if len == 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "region length must be non-zero",
-            ));
-        }
-        let len64 = u64::try_from(len).map_err(|_| {
-            Error::new(ErrorKind::InvalidInput, "region length exceeds u64")
-        })?;
-        gpa.checked_add(len64).ok_or_else(|| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                "region overflows address space",
-            )
-        })?;
+        let _ = region_end(gpa, len)?;
 
         Ok(Self {
-            regions: vec![Region {
-                gpa,
-                len,
-                kind: RegionKind::Ram,
-                segid: -1,
-                mapping: Arc::new(Mapping::anon(len)?),
-            }],
+            space: RwLock::new(AddressSpace {
+                regions: vec![Region {
+                    gpa,
+                    len,
+                    kind: RegionKind::Ram,
+                    segid: -1,
+                    mapping: Arc::new(Mapping::anon(len)?),
+                }],
+                claims: Vec::new(),
+            }),
             next_segid: 0,
         })
     }
@@ -591,6 +177,67 @@ impl PhysMap {
         self.add_region(hdl, gpa, len, RegionKind::Rom, Prot::READ | Prot::EXEC)
     }
 
+    /// Add a ROM region and a writable RAM region that share one kernel
+    /// segment.
+    ///
+    /// The RAM comes from the tail of the segment, past the ROM image,
+    /// and gets its own guest mapping at `ram_gpa`. The two mappings
+    /// cover disjoint parts of the segment, so no byte is visible at
+    /// two guest addresses.
+    ///
+    /// This exists to save a segment ID. The kernel gives one VM only
+    /// `VM_MAX_MEMSEGS` of them, and `vm_mmap_memseg` puts no limit on
+    /// how many mappings one segment may have.
+    pub fn add_rom_with_ram_tail(
+        &mut self,
+        hdl: &VmmHdl,
+        rom_gpa: u64,
+        rom_len: usize,
+        ram_gpa: u64,
+        ram_len: usize,
+    ) -> Result<()> {
+        let seg_len = rom_len.checked_add(ram_len).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "ROM and RAM tail lengths overflow",
+            )
+        })?;
+        let ram_off = i64::try_from(rom_len).map_err(|_| {
+            Error::new(ErrorKind::InvalidInput, "ROM length exceeds i64")
+        })?;
+
+        let segid = self.next_segid;
+        let mut created = false;
+        let result = (|| -> Result<()> {
+            // Both ranges are claimed before the segment exists, so a
+            // bad layout cannot spend a segment the kernel never gives
+            // back.
+            let rom = self.claim(
+                rom_gpa,
+                rom_len,
+                RegionKind::Rom,
+                Prot::READ | Prot::EXEC,
+                Placement::Firmware,
+            )?;
+            let ram = self.claim(
+                ram_gpa,
+                ram_len,
+                RegionKind::Ram,
+                Prot::RWX,
+                Placement::Firmware,
+            )?;
+            hdl.create_memseg(segid, seg_len, &seg_name(segid))?;
+            created = true;
+            rom.commit(hdl, segid, 0)?;
+            ram.commit(hdl, segid, ram_off)
+        })();
+
+        if created {
+            self.next_segid += 1;
+        }
+        result
+    }
+
     fn add_region(
         &mut self,
         hdl: &VmmHdl,
@@ -599,67 +246,172 @@ impl PhysMap {
         kind: RegionKind,
         guest_prot: Prot,
     ) -> Result<()> {
-        if len == 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "region length must be non-zero",
-            ));
-        }
+        let segid = self.next_segid;
+        let mut created = false;
+        let result = (|| -> Result<()> {
+            let claim =
+                self.claim(gpa, len, kind, guest_prot, Placement::Firmware)?;
+            hdl.create_memseg(segid, len, &seg_name(segid))?;
+            created = true;
+            claim.commit(hdl, segid, 0)
+        })();
 
-        // Check for overlap with existing regions
-        let end = gpa.checked_add(len as u64).ok_or_else(|| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                "region overflows address space",
-            )
-        })?;
-        for r in &self.regions {
-            let r_end = r.gpa + r.len as u64;
-            if gpa < r_end && end > r.gpa {
+        // There is no ioctl that frees a segment, so one that was
+        // created is spent whether or not its mapping worked.
+        if created {
+            self.next_segid += 1;
+        }
+        result
+    }
+
+    /// Map an already allocated segment as RAM while the guest runs.
+    ///
+    /// `VM_MMAP_MEMSEG` takes the VM write lock, which drives every
+    /// vCPU out with a `VM_EXITCODE_BOGUS` exit and freezes it. The run
+    /// loop treats that exit as a plain re-entry, so nothing else has
+    /// to stop.
+    ///
+    /// The caller allocates the segment. `segoff` names the slice of it
+    /// to map, so one segment can back several regions.
+    pub fn add_ram_runtime(
+        &self,
+        hdl: &VmmHdl,
+        segid: i32,
+        gpa: u64,
+        segoff: i64,
+        len: usize,
+    ) -> Result<()> {
+        self.claim_ram(gpa, len)?.commit(hdl, segid, segoff)
+    }
+
+    /// Hold a range of the guest address space for a run-time RAM add.
+    ///
+    /// The claim is taken under the write lock and runs the same
+    /// overlap rule the boot path uses, so two concurrent adds cannot
+    /// both pass. Nothing is allocated yet: drop the claim to give the
+    /// range back, or commit it once the segment exists.
+    pub fn claim_ram(&self, gpa: u64, len: usize) -> Result<RamClaim<'_>> {
+        self.claim(gpa, len, RegionKind::Ram, Prot::RWX, Placement::Ram)
+    }
+
+    /// Take a range, or report why it cannot be had.
+    fn claim(
+        &self,
+        gpa: u64,
+        len: usize,
+        kind: RegionKind,
+        guest_prot: Prot,
+        placement: Placement,
+    ) -> Result<RamClaim<'_>> {
+        let end = region_end(gpa, len)?;
+
+        if placement == Placement::Ram {
+            // The kernel would answer EINVAL. Say why instead.
+            if !gpa.is_multiple_of(PAGE_SIZE as u64)
+                || !len.is_multiple_of(PAGE_SIZE)
+            {
                 return Err(Error::new(
-                    ErrorKind::AlreadyExists,
+                    ErrorKind::InvalidInput,
+                    format!("RAM [{gpa:#x}, {end:#x}) is not page aligned"),
+                ));
+            }
+            // The hole holds the PCI BARs, the APICs, the boot ROM and
+            // its variable store. RAM placed there would be shadowed by
+            // a BAR or would sit under the firmware flash window.
+            if gpa < MMIO_HOLE_END && end > MMIO_HOLE_BASE {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
                     format!(
-                        "region [{:#x}, {:#x}) overlaps with existing \
-                         [{:#x}, {:#x})",
-                        gpa, end, r.gpa, r_end,
+                        "RAM [{gpa:#x}, {end:#x}) runs into the 32-bit \
+                         MMIO hole [{MMIO_HOLE_BASE:#x}, \
+                         {MMIO_HOLE_END:#x})",
                     ),
                 ));
             }
         }
 
-        let segid = self.next_segid;
-        let seg_name = format!("seg{}", segid);
+        let mut space = self.write_space();
+        space.check_free(gpa, end)?;
+        space.claims.push((gpa, end));
 
-        // Allocate segment in kernel
-        hdl.create_memseg(segid, len, &seg_name)?;
+        Ok(RamClaim {
+            map: self,
+            gpa,
+            len,
+            kind,
+            guest_prot,
+            live: true,
+        })
+    }
 
-        // Map into guest physical address space
-        hdl.map_memseg(segid, gpa, len, 0, guest_prot)?;
+    /// Give a claimed range back.
+    fn release_claim(&self, gpa: u64) {
+        let mut space = self.write_space();
+        if let Some(idx) = space.claims.iter().position(|&(c, _)| c == gpa) {
+            space.claims.swap_remove(idx);
+        }
+    }
 
-        self.next_segid += 1;
+    /// Publish a region backed by anonymous memory.
+    ///
+    /// Tests on a host with no kernel VM need real `lookup` boundaries.
+    /// This is the multi-region form of [`Self::new_anon`].
+    #[doc(hidden)]
+    pub fn add_region_anon(
+        &self,
+        gpa: u64,
+        len: usize,
+        kind: RegionKind,
+    ) -> Result<()> {
+        let claim =
+            self.claim(gpa, len, kind, Prot::RWX, Placement::Firmware)?;
+        let mapping = Arc::new(Mapping::anon(len)?);
+        self.publish_claim(claim, -1, mapping);
+        Ok(())
+    }
 
-        // Map into our process for device emulation access (always R/W)
-        let offset = hdl.devmem_offset(segid)?;
-        let mapping = Mapping::new(len, Prot::RW, hdl, offset)?;
+    /// Turn one claim into a published region, in one write-lock section.
+    ///
+    /// The range was checked when the claim was taken and the claim has
+    /// held it since, so there is nothing left to refuse here. The list
+    /// stays sorted by GPA for the binary search in `lookup`.
+    fn publish_claim(
+        &self,
+        mut claim: RamClaim<'_>,
+        segid: i32,
+        mapping: Arc<Mapping>,
+    ) {
+        let mut space = self.write_space();
+        if let Some(idx) =
+            space.claims.iter().position(|&(c, _)| c == claim.gpa)
+        {
+            space.claims.swap_remove(idx);
+        }
+        claim.live = false;
 
-        // Insert sorted by GPA
-        let insert_idx = self
+        let insert_idx = space
             .regions
-            .binary_search_by_key(&gpa, |r| r.gpa)
+            .binary_search_by_key(&claim.gpa, |r| r.gpa)
             .unwrap_or_else(|idx| idx);
 
-        self.regions.insert(
+        space.regions.insert(
             insert_idx,
             Region {
-                gpa,
-                len,
-                kind,
+                gpa: claim.gpa,
+                len: claim.len,
+                kind: claim.kind,
                 segid,
-                mapping: Arc::new(mapping),
+                mapping,
             },
         );
+    }
 
-        Ok(())
+    fn read_space(&self) -> std::sync::RwLockReadGuard<'_, AddressSpace> {
+        self.space.read().expect("physmap regions lock poisoned")
+    }
+
+    fn write_space(&self) -> std::sync::RwLockWriteGuard<'_, AddressSpace> {
+        self.space.write().expect("physmap regions lock poisoned")
     }
 
     /// Look up the region containing a guest physical address and return
@@ -670,8 +422,12 @@ impl PhysMap {
     pub fn lookup(&self, gpa: u64, len: usize) -> Option<SubMapping> {
         let end = gpa.checked_add(len as u64)?;
 
+        // The guard is released when this call returns: `SubMapping` owns
+        // an `Arc<Mapping>` and borrows nothing from the region list.
+        let space = self.read_space();
+
         // Binary search for the region containing this GPA
-        let idx = self
+        let idx = space
             .regions
             .binary_search_by(|r| {
                 if gpa < r.gpa {
@@ -684,7 +440,7 @@ impl PhysMap {
             })
             .ok()?;
 
-        let region = &self.regions[idx];
+        let region = &space.regions[idx];
         let r_end = region.gpa + region.len as u64;
 
         // Verify the entire requested range falls within this region
@@ -698,7 +454,8 @@ impl PhysMap {
 
     /// Get a summary of all memory regions (for migration/diagnostics).
     pub fn regions(&self) -> Vec<(u64, usize, RegionKind)> {
-        self.regions
+        self.read_space()
+            .regions
             .iter()
             .map(|r| (r.gpa, r.len, r.kind))
             .collect()
@@ -706,7 +463,8 @@ impl PhysMap {
 
     /// Total mapped memory in bytes (excluding MMIO reservations).
     pub fn total_memory(&self) -> usize {
-        self.regions
+        self.read_space()
+            .regions
             .iter()
             .filter(|r| r.kind != RegionKind::Mmio)
             .map(|r| r.len)
@@ -715,8 +473,132 @@ impl PhysMap {
 
     /// Number of memory regions.
     pub fn num_regions(&self) -> usize {
-        self.regions.len()
+        self.read_space().regions.len()
     }
+}
+
+/// A held range of the guest physical address space.
+///
+/// Nothing is allocated for it yet. Drop it to give the range back, or
+/// [`commit`](Self::commit) it once the kernel segment exists.
+#[must_use = "a dropped claim gives the range back"]
+pub struct RamClaim<'a> {
+    map: &'a PhysMap,
+    gpa: u64,
+    len: usize,
+    kind: RegionKind,
+    guest_prot: Prot,
+    live: bool,
+}
+
+impl std::fmt::Debug for RamClaim<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RamClaim")
+            .field("gpa", &format_args!("{:#x}", self.gpa))
+            .field("len", &self.len)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl RamClaim<'_> {
+    /// The guest address this claim holds.
+    pub fn gpa(&self) -> u64 {
+        self.gpa
+    }
+
+    /// Map `segid` at the claimed address and publish the region.
+    ///
+    /// `segoff` is the offset into the segment, which lets one segment
+    /// back several regions.
+    pub fn commit(self, hdl: &VmmHdl, segid: i32, segoff: i64) -> Result<()> {
+        if segoff < 0 || !(segoff as u64).is_multiple_of(PAGE_SIZE as u64) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("segment offset {segoff} is not a page offset"),
+            ));
+        }
+        let (map, gpa, len) = (self.map, self.gpa, self.len);
+
+        hdl.map_memseg(segid, gpa, len, segoff, self.guest_prot)?;
+
+        // The guest can reach the memory from here on, so a failure has
+        // to take the mapping back out. A guest mapping the physical map
+        // does not know about would be handed out a second time.
+        match host_view(hdl, segid, segoff, len) {
+            Ok(mapping) => {
+                map.publish_claim(self, segid, mapping);
+                Ok(())
+            }
+            Err(e) => match hdl.munmap_memseg(gpa, len) {
+                Ok(()) => Err(e),
+                Err(unmap) => {
+                    // The guest still reaches memory with no region
+                    // behind it. Keeping the claim for the life of the
+                    // VM stops the range being handed out again.
+                    std::mem::forget(self);
+                    Err(Error::other(format!(
+                        "{e}; the guest mapping at {gpa:#x} could not be \
+                         taken back ({unmap}), so the range is spent",
+                    )))
+                }
+            },
+        }
+    }
+}
+
+/// Map a region into this process, for device emulation.
+fn host_view(
+    hdl: &VmmHdl,
+    segid: i32,
+    segoff: i64,
+    len: usize,
+) -> Result<Arc<Mapping>> {
+    let base = hdl.devmem_offset(segid)?;
+    let offset = base.checked_add(segoff).ok_or_else(|| {
+        Error::new(ErrorKind::InvalidInput, "device memory offset overflows")
+    })?;
+    Ok(Arc::new(Mapping::new(len, Prot::RW, hdl, offset)?))
+}
+
+impl Drop for RamClaim<'_> {
+    fn drop(&mut self) {
+        if self.live {
+            self.map.release_claim(self.gpa);
+        }
+    }
+}
+
+/// The kernel name of a memory segment.
+fn seg_name(segid: i32) -> String {
+    format!("seg{segid}")
+}
+
+/// Validate a region request and return its exclusive end GPA.
+fn region_end(gpa: u64, len: usize) -> Result<u64> {
+    if len == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "region length must be non-zero",
+        ));
+    }
+    let len = u64::try_from(len).map_err(|_| {
+        Error::new(ErrorKind::InvalidInput, "region length exceeds u64")
+    })?;
+    gpa.checked_add(len).ok_or_else(|| {
+        Error::new(ErrorKind::InvalidInput, "region overflows address space")
+    })
+}
+
+/// The error a range that is already spoken for gets.
+fn overlaps(gpa: u64, end: u64, o_gpa: u64, o_end: u64, what: &str) -> Error {
+    Error::new(
+        ErrorKind::AlreadyExists,
+        format!(
+            "region [{gpa:#x}, {end:#x}) overlaps with {what} \
+             [{o_gpa:#x}, {o_end:#x})",
+        ),
+    )
 }
 
 /// `VM_MAX_MEMSEGS` from illumos `uts/intel/io/vmm/vmm.c`.
@@ -738,10 +620,34 @@ impl SegidAlloc {
         }
     }
 
+    /// Give back an ID whose segment was never created.
+    ///
+    /// Only the ID handed out last can come back, which is all a failed
+    /// allocation needs. Reports whether it was taken: another caller
+    /// may have allocated in between, and then the ID stays spent.
+    ///
+    /// Never call this for a segment `VM_ALLOC_MEMSEG` created. The
+    /// kernel has no ioctl that frees one, so reusing the ID would
+    /// answer `EEXIST` or, worse, hand out memory that is already in
+    /// use.
+    pub fn release(&self, segid: i32) -> bool {
+        let Some(next) = segid.checked_add(1) else {
+            return false;
+        };
+        self.next
+            .compare_exchange(
+                next,
+                segid,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
     /// Allocate a segment ID, or return `None` at the kernel limit.
     ///
-    /// Reporting exhaustion here gives startup a useful error instead of an
-    /// unexplained `EINVAL` from `VM_ALLOC_MEMSEG`.
+    /// Reporting exhaustion here gives startup a useful error instead
+    /// of an unexplained `EINVAL` from `VM_ALLOC_MEMSEG`.
     pub fn alloc(&self) -> Option<i32> {
         self.next
             .fetch_update(

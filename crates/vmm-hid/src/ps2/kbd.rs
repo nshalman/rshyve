@@ -2,10 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Portions derived from Propolis, Copyright Oxide Computer Company,
-// used under MPL-2.0. Upstream keeps `PS2Kbd` in
-// lib/propolis/src/hw/ps2/ctrl.rs.
-
 use std::collections::VecDeque;
 
 use super::ctrl::{

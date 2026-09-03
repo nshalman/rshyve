@@ -37,6 +37,7 @@ pub mod pci;
 pub mod queue;
 pub mod rng;
 pub mod viona;
+pub mod vsock;
 
 pub use block::VirtioBlock;
 pub use console::VirtioConsole;

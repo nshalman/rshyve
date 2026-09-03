@@ -493,9 +493,131 @@ pub fn push_val<T: Copy>(buf: &mut Vec<u8>, val: &T) {
 // Unit tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Errno translation
+// ---------------------------------------------------------------------------
+
+/// Linux errno values, named so the table below reads as a mapping.
+///
+/// FUSE is a Linux protocol, so the number in a reply header is read with
+/// Linux numbering whatever host this server runs on. errno 1..=34 is the
+/// classic UNIX set and agrees on every host, so only the range above it
+/// needs naming here.
+mod linux_errno {
+    pub const EDEADLK: i32 = 35;
+    pub const ENAMETOOLONG: i32 = 36;
+    pub const ENOLCK: i32 = 37;
+    pub const ENOSYS: i32 = 38;
+    pub const ENOTEMPTY: i32 = 39;
+    pub const ELOOP: i32 = 40;
+    pub const ENOMSG: i32 = 42;
+    pub const EIDRM: i32 = 43;
+    pub const ENODATA: i32 = 61;
+    pub const ENOLINK: i32 = 67;
+    pub const EPROTO: i32 = 71;
+    pub const EMULTIHOP: i32 = 72;
+    pub const EBADMSG: i32 = 74;
+    pub const EOVERFLOW: i32 = 75;
+    pub const EILSEQ: i32 = 84;
+    pub const EOPNOTSUPP: i32 = 95;
+    pub const ESTALE: i32 = 116;
+    pub const EDQUOT: i32 = 122;
+    pub const ECANCELED: i32 = 125;
+    /// Fallback for a host errno with no Linux counterpart named here.
+    /// Reporting the wrong number is worse than reporting a generic I/O
+    /// error, because the guest acts on it.
+    pub const EIO: i32 = 5;
+}
+
+/// Highest errno that every supported host numbers identically.
+const SHARED_ERRNO_MAX: i32 = 34;
+
+/// Translate a host errno into the Linux errno a FUSE reply must carry.
+///
+/// illumos and Linux agree up to 34 and diverge above it: illumos
+/// `ENOTSUP` is 48, which Linux reads as `ELNRNG`. A guest acts on the
+/// number, so an untranslated reply makes it take an unrelated error
+/// path -- an `execve` reading `security.capability`, for one, aborts
+/// instead of treating the attribute as absent.
+///
+/// Takes and returns a positive errno.
+pub fn to_linux_errno(host: i32) -> i32 {
+    if (1..=SHARED_ERRNO_MAX).contains(&host) {
+        return host;
+    }
+    // Matched by name, so each host maps from its own numbering. A `match`
+    // cannot be used: on Linux several of these names share one value.
+    let table: [(i32, i32); 20] = [
+        (libc::EDEADLK, linux_errno::EDEADLK),
+        (libc::ENAMETOOLONG, linux_errno::ENAMETOOLONG),
+        (libc::ENOLCK, linux_errno::ENOLCK),
+        (libc::ENOSYS, linux_errno::ENOSYS),
+        (libc::ENOTEMPTY, linux_errno::ENOTEMPTY),
+        (libc::ELOOP, linux_errno::ELOOP),
+        (libc::ENOMSG, linux_errno::ENOMSG),
+        (libc::EIDRM, linux_errno::EIDRM),
+        (libc::ENODATA, linux_errno::ENODATA),
+        (libc::ENOLINK, linux_errno::ENOLINK),
+        (libc::EPROTO, linux_errno::EPROTO),
+        (libc::EMULTIHOP, linux_errno::EMULTIHOP),
+        (libc::EBADMSG, linux_errno::EBADMSG),
+        (libc::EOVERFLOW, linux_errno::EOVERFLOW),
+        (libc::EILSEQ, linux_errno::EILSEQ),
+        (libc::ENOTSUP, linux_errno::EOPNOTSUPP),
+        (libc::EOPNOTSUPP, linux_errno::EOPNOTSUPP),
+        (libc::ESTALE, linux_errno::ESTALE),
+        (libc::EDQUOT, linux_errno::EDQUOT),
+        (libc::ECANCELED, linux_errno::ECANCELED),
+    ];
+    for (host_val, linux_val) in table {
+        if host_val == host {
+            return linux_val;
+        }
+    }
+    linux_errno::EIO
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this guards: illumos ENOTSUP is 48, which a Linux guest
+    /// reads as ELNRNG. An execve reading `security.capability` then
+    /// aborts instead of treating the attribute as absent.
+    #[test]
+    fn errno_translation_uses_linux_numbering() {
+        assert_eq!(to_linux_errno(libc::ENOTSUP), 95);
+        assert_eq!(to_linux_errno(libc::EOPNOTSUPP), 95);
+        assert_eq!(to_linux_errno(libc::ESTALE), 116);
+        assert_eq!(to_linux_errno(libc::ENOTEMPTY), 39);
+        assert_eq!(to_linux_errno(libc::ENAMETOOLONG), 36);
+        assert_eq!(to_linux_errno(libc::ENOSYS), 38);
+        assert_eq!(to_linux_errno(libc::ELOOP), 40);
+    }
+
+    #[test]
+    fn classic_errno_range_passes_through() {
+        // 1..=34 is the same on every host this builds for.
+        for (host, name) in [
+            (libc::ENOENT, "ENOENT"),
+            (libc::EACCES, "EACCES"),
+            (libc::EINVAL, "EINVAL"),
+            (libc::EROFS, "EROFS"),
+            (libc::EBADF, "EBADF"),
+            (libc::EEXIST, "EEXIST"),
+            (libc::ENOTDIR, "ENOTDIR"),
+        ] {
+            assert!(host <= 34, "{name} is not in the shared range");
+            assert_eq!(to_linux_errno(host), host, "{name} was rewritten");
+        }
+    }
+
+    /// An unrecognized host errno must not reach the guest unchanged:
+    /// the guest would act on a number that means something else there.
+    #[test]
+    fn unknown_host_errno_becomes_eio() {
+        assert_eq!(to_linux_errno(9999), 5);
+    }
 
     #[test]
     fn header_layout_matches_linux() {

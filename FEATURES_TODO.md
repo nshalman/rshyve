@@ -32,6 +32,7 @@ Conventions:
 | ✅ Kernel-owned MMIO instruction decoding | The illumos vmm kernel decodes MMIO instructions and delivers `VM_EXITCODE_MMIO` with the GPA and operands. `VM_EXITCODE_INST_EMUL` is a diagnostic-only fallback containing 15 raw instruction bytes and a valid-byte count, with no GPA or operands. Userspace does not decode it. |
 | ✅ Writable UEFI variable store | Commits `854efb7`, `d1ed5e5`, and `e82d6c1` add `-l bootrom,<rom>,<varfile>`, size-derived flash layout, and locked CFI-backed persistence. A pristine template and a size-valid, page-aligned erased image filled with `0xFF` are both accepted. Secure Boot enrollment still requires host validation. |
 | ✅ Per-device fw_cfg boot order | An optional `bootindex=N` token on a `-s` specification generates ordered PCI device paths and is stripped before driver parsing. Configurations without a boot index retain the legacy slot-4 payload byte for byte. Live firmware validation remains in the validation backlog. |
+| ✅ PCI, CPU and memory hot-plug | `--hotplug` publishes the GPE0 block at `0xAFE0`, the PCI register file at `0xAE00`, the CPU one at `0xAF00` (only when `maxcpus` is above the boot count), the memory one at `0x0A00`, and the matching AML. Off by default, so an existing VM keeps byte-identical ACPI. rshyve serves `device-add`, `device-remove`, `device-list`, `cpu-add`, `cpu-list`, `mem-add` and `mem-list` on the control socket; firehyve serves the same set on the vsock `CONTROL` verb. `-c cpus=N,maxcpus=M` sizes the CPU slots and `-o hotplug.maxmem=` / `-o hotplug.memslot=` size the memory window, which also needs `-S`. Validation below. |
 
 ### Validated Windows Server 2025 baseline
 
@@ -47,6 +48,30 @@ media at commit `5a5bea6`:
 - EFI Shell `reset` and control socket `{"command":"reset"}` both reboot a live
   WinPE guest. The process keeps the same PID because reset uses `execvp`; the
   kernel VM is recreated, a second boot is observed, and the guest returns.
+
+### Validated hot-plug baseline
+
+Validated on the firehyve test node against a Linux 6.12.13 guest built with
+`kernel/hotplug.config`:
+
+- The guest boots reporting `Allowing 2 present CPUs plus 6 hotplug CPUs` and
+  `ACPI: Enabled 3 GPEs in block 00 to 0F`, registers `acpiphp` slots 2 to 31,
+  and logs no ACPI error.
+- `cpu-add`, `mem-add` and `device-add` each succeed over the vsock `CONTROL`
+  verb. `mem-add` moves the host reservoir's free and allocated counters by
+  exactly the size added.
+
+What that does NOT cover, and is still open:
+
+- The AML is not validated by `iasl`, in CI or anywhere else.
+- The guest-side result is one kernel configuration on one lab node. No CI job
+  boots a guest. Windows, illumos and BSD guests have not been tried.
+- Disk hot-remove is advisory by design. A guest that never runs `_EJ0` leaves
+  the slot in `remove-pending` for the life of the VM. Only the refusal paths
+  have been exercised; a guest completing an `_EJ0` on a busy disk is not
+  recorded.
+- CPU and memory hot-REMOVE stay blocked at the kernel. See the blocked
+  section below.
 
 ### UEFI variable-store recovery
 
@@ -110,8 +135,7 @@ graphical path unusable.
 
 | Item | Why / tree evidence |
 |---|---|
-| ⏳ PCI hot-plug | PCI devices are created only from startup `-s` arguments. There is no ACPI hot-plug or control-socket attach/detach path. This is required for disk attachment without a reboot. |
-| ⏳ virtio-scsi | No virtio-scsi device exists. It remains the useful Windows path for named LUNs, UNMAP/TRIM, hot-plug, and many targets, while NVMe remains the performance path. |
+| ⏳ virtio-scsi | No virtio-scsi device exists. It remains the useful Windows path for named LUNs, UNMAP/TRIM, and many targets, while NVMe remains the performance path. PCI hot-plug no longer depends on it. |
 | ⏳ virtio-balloon | No balloon device exists. It is needed before guest-cooperative memory reclaim or overcommit is possible. |
 | ⏳ Block I/O throttling | NVMe and virtio-blk have no per-disk IOPS or bandwidth limiter. Multitenant rate isolation remains absent. |
 | ⏳ Hugepage memory backing | Guest RAM setup has no hugepage backing option. Any illumos implementation needs measurement and an explicit fallback policy. |
@@ -122,6 +146,8 @@ graphical path unusable.
 | Item | Boundary |
 |---|---|
 | ⏳ Hyper-V Tier 2 | SynIC, synthetic timers, virtual APIC support, TLB-flush hypercalls, and IPI hypercalls require cooperation from `vmm.ko`. They are out of scope for the userspace backlog until the kernel interfaces exist. |
+| ⏳ CPU hot-remove | illumos has no `vm_deactivate_cpu`. `active_cpus` is only ever set, and the one place that clears it is `vm_init` on `VM_REINIT`. `cpu-remove` is recognised and refused with that reason. |
+| ⏳ Memory hot-remove | illumos has no `VM_FREE_MEMSEG`, and `vm_free_memseg` has only destroy-path callers, so a segment lives until the VM does. `mem-remove` is recognised and refused with that reason. |
 
 ## Tier 2 - strategic, multi-week work
 
@@ -137,8 +163,6 @@ graphical path unusable.
 | ❓ virtio-fs | Modern 9p replacement. Useful for development workflows; less important for production tenants. |
 | ❓ virtio-vsock | Host-to-guest socket channel without IP. Cloud agents can use it; vmmnew has mdata over COM2 today. |
 | ❓ qcow2 backing format | Useful for portable layered images and internal snapshots. ZFS already supplies copy-on-write storage for the primary Triton deployment. |
-| ❓ CPU hot-plug | Possible, but the value-to-complexity ratio is poor for the current platform. |
-| ❓ Memory hot-plug, separate from balloon | Ballooning is the simpler elasticity mechanism. Revisit physical memory hot-plug only with a concrete workload. |
 
 ## Skip - out of scope for vmmnew
 
@@ -162,6 +186,8 @@ These are validation gates, not new features:
   listed graphical-console blockers are fixed.
 - ⏳ Add migration coverage for Hyper-V state, framebuffer/xHCI state, and
   vTPM NV state as each migration path lands.
+- ⏳ Validate the hot-plug AML with `iasl`, and boot a `--hotplug` VM with a
+  guest other than the one Linux configuration in the hot-plug baseline.
 
 ---
 
@@ -182,5 +208,4 @@ When picking up new work:
 When working with virtio, use the
 [Virtio 1.3 specification](https://docs.oasis-open.org/virtio/virtio/v1.3/csd01/virtio-v1.3-csd01.html).
 
-Propolis is the upstream reference:
-<https://github.com/oxidecomputer/propolis>.
+Propolis is available as a reference in `~/workspace/oxide/propolis`.
