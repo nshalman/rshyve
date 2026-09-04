@@ -27,7 +27,7 @@
 | virtio-rnd | Complete | /dev/random entropy |
 | Framebuffer/VNC | Complete | Unix socket, password, resolution |
 | xHCI USB tablet | Complete | HID pointer device |
-| PCI passthrough | Complete | Intel VT-d + AMD IOMMU |
+| PCI passthrough | Partial | Intel VT-d only; MSI-X devices refused. See [devices.md](devices.md#pci-passthrough) |
 | AHCI CD-ROM (`ahci-cd`) | Complete | ATAPI SCSI/MMC, zero-copy reads |
 | AHCI disk (`ahci-hd`) | Not implemented | Rejected at startup; use virtio-blk or nvme |
 | LAPIC/IOAPIC/PIC/PIT | Complete | Kernel-emulated |

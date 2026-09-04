@@ -40,6 +40,17 @@ pub trait PciDevice: Send + Sync + 'static {
     /// `bar` identifies which BAR region, `offset` is the byte offset
     /// within the BAR, and `rwo` is the operation.
     fn bar_rw(&self, bar: BarN, offset: usize, rwo: RWOp<'_>);
+
+    /// Unregister every bus region this device has registered.
+    ///
+    /// A BAR handler holds a strong reference to its device, and the
+    /// device holds the bus. The device cannot drop while a handler
+    /// stays registered. Call this before you release the last handle
+    /// to the device, such as on hot-unplug or VM teardown.
+    ///
+    /// Each implementation must clear the recorded bases, so a second
+    /// call does nothing.
+    fn detach_regions(&self) {}
 }
 
 // ---------------------------------------------------------------------------

@@ -23,7 +23,7 @@ Markers: **yes** works, **caveat** works with a condition named in the matching 
 | `nvme` | caveat | reject | `crates/vmm-storage/src/nvme/mod.rs:185`; `bin/rshyve/src/main.rs:1064` |
 | `ahci-cd` (ATAPI CD-ROM, read only) | yes | reject | `crates/vmm-storage/src/ahci/`; `bin/rshyve/src/main.rs:1231` |
 | `ahci-hd` | no (hard error) | reject | `bin/rshyve/src/main.rs:974` `reject_ahci_hd` |
-| Disk hotplug, qcow2, I/O throttling | no | no | attach runs once, `crates/vmm-machine/src/pci.rs:126` |
+| qcow2 or any non-raw image, block I/O throttling | no | no | raw offset arithmetic in every backend; no limiter anywhere |
 | **Network** | | | |
 | `virtio-net-viona` | yes | yes | `crates/vmm-virtio/src/viona.rs`, `attach.rs:170` |
 | Any other NIC model (e1000, tap, slirp) | no | reject | no match arm exists |
@@ -49,14 +49,25 @@ Markers: **yes** works, **caveat** works with a condition named in the matching 
 | Live migration, TCP path | exp, incomplete | reject | `crates/vmm-migrate/src/source.rs` (ships no device state) |
 | Control socket (`--control-socket`) | yes | reject | `bin/rshyve/src/control.rs`; `bin/firehyve/src/main.rs:46` |
 | Dirty page tracking | on by default | never | `bin/rshyve/src/main.rs:175`; `bin/firehyve/src/main.rs:116` |
+| **Hotplug (`--hotplug`, off by default)** | | | |
+| ACPI hotplug interface (GPE0 plus three register files) | yes | yes | `crates/vmm-machine/src/pm.rs:139,166`; `crates/vmm-devices/src/acpi/hotplug/mod.rs:20` |
+| PCI hot-add, any driver the binary's own `-s` catalog builds | caveat | caveat | `crates/vmm-machine/src/hotplug.rs:536` |
+| PCI hot-remove, guest runs `_EJ0` | caveat | caveat | advisory, `crates/vmm-machine/src/hotplug.rs:546,292` |
+| CPU hot-add | caveat | caveat | needs `-c cpus=N,maxcpus=M`, `crates/vmm-machine/src/hotplug/cpu.rs:287` |
+| CPU hot-remove | no (kernel) | no (kernel) | no `vm_deactivate_cpu`, refused at `hotplug/cpu.rs:227` |
+| Memory hot-add | caveat | caveat | needs `-S` and `-o hotplug.maxmem`, `crates/vmm-machine/src/hotplug/mem.rs:389` |
+| Memory hot-remove | no (kernel) | no (kernel) | no `VM_FREE_MEMSEG`, refused at `hotplug/mem.rs:464` |
+| Hotplug commands | control socket | vsock `CONTROL` verb, needs a `virtio-vsock` device | `bin/rshyve/src/control/dispatch.rs:202-252`; `bin/firehyve/src/control.rs:287-297` |
+| Migration after any hot-add, PCI included | reject | n/a | `bin/rshyve/src/control/migrate.rs:84,64` |
 | **Platform** | | | |
 | vTPM 2.0 (`--vtpm`) | caveat | reject | `crates/vmm-tpm/src/crb.rs`; `bin/firehyve/src/main.rs:53` |
 | Hyper-V enlightenments (`--hyperv`) | exp | reject | `crates/vmm-hyperv/src/lib.rs`; `main.rs:57` |
 | `--cpu-baseline` CPUID masking | yes | yes | `crates/vmm-core/src/cpuid.rs:32` |
-| PCI passthrough (`passthru,/dev/pptN`) | caveat | reject | `crates/vmm-passthru/`; `bin/rshyve/src/main.rs:1212` |
+| PCI passthrough (`passthru,/dev/pptN`) | caveat | reject | Intel only, no MSI-X device; `crates/vmm-passthru/`; `bin/rshyve/src/main.rs:1412` |
 | `virtio-rnd` | yes | yes | `crates/vmm-virtio/src/attach.rs:341` |
 | SmartOS metadata agent on COM2 | yes | no (rejects only `--mdata-*`) | `bin/rshyve/src/mdata.rs` |
-| `--json-config`, `-k`, `-o` | accepted, no reader | reject (`--json-config`) | `crates/vmm-config/src/lib.rs:65,78,99` |
+| `--json-config`, `-k` | accepted, no reader | reject (`--json-config`) | `crates/vmm-config/src/lib.rs` |
+| `-o hotplug.maxmem=`, `-o hotplug.memslot=` | yes | yes | `crates/vmm-config/src/lib.rs:374,398`; every other `-o` key is passed over |
 
 ### What firehyve rejects at startup
 
@@ -336,11 +347,79 @@ The hypercall page is a deliberate stub: `mov rax, 2; ret`, which is `HV_STATUS_
 
 If the host TSC frequency probe fails and `--tsc-freq-hz` is not given, rshyve warns and disables reference-TSC entirely, at which point both timing MSRs inject #GP.
 
+## PCI passthrough (rshyve only)
+
+`-s <slot>,passthru,/dev/pptN` binds a real PCI function to the VM
+(`crates/vmm-passthru/src/lib.rs`, attached at `bin/rshyve/src/main.rs:1412`).
+The device needs the illumos PPT driver. Pass `-S` yourself: nothing
+inspects the `-s` specs and adds it for you.
+
+**Intel VT-d only. There is no AMD IOMMU backend.** `iommu_init()` opens
+`misc/vmm_vtd` on an Intel host and `misc/vmm_amdvi` on an AMD one, and
+only the first exists: the illumos tree ships a `vmm_vtd` module
+directory and `VMM_VTD_OBJS = vtd.o` in `Makefile.files`, with no AMD
+counterpart in either place. `amdvi_hw.c` sits in the source tree
+unbuilt, next to the comment "Use the expected name for if/when this is
+ported". On an AMD host `ddi_modopen` fails, `iommu_init` returns that
+error, and passthrough does not work. Both `docs/devices.md` and
+`docs/status.md` claimed AMD support until this was checked.
+
+**A device that advertises MSI-X is refused at attach**, with
+`ErrorKind::Unsupported` and the text "device advertises MSI-X, which
+this VMM cannot isolate" (`check_passthrough_supported`). The reason is
+not tidiness. `update_bar_mappings` maps a whole BAR into the guest with
+`VM_MAP_PPTDEV_MMIO`, and on an MSI-X device that BAR holds the physical
+MSI-X table; the illumos kernel checks only that the range is inside a
+BAR (`ppt_map_mmio`), and carves nothing out. illumos VT-d remaps DMA
+and not interrupts: there is no IRTA or IRTE code anywhere in `vtd.c`.
+So a guest that writes that table makes the device post a message to a
+host physical address of its choice, which is an interrupt at a vector
+of its choice on the host APIC. Linux gates exactly this behind
+`allow_unsafe_interrupts`; cloud-hypervisor carves the table and PBA out
+of the mapped region. This VMM refuses the device. Most modern PCIe
+devices advertise MSI-X, so this rules most of them out. MSI and INTx
+devices still attach.
+
+The userspace MSI-X table emulation that used to sit in
+`crates/vmm-passthru/` has been deleted, not left in place. It could
+never run: nothing
+registered the device on the MMIO bus, so `bar_rw` was never called,
+`VM_PPTDEV_MSIX` was never issued, and the kernel never installed a host
+interrupt handler. Finishing it needs the carve-out, an MMIO-bus
+registration, and a host with an assigned device to test on.
+
+**Config-space writes are deny by default.** `classify_cfg_write` admits
+the command register, the six BARs, the interrupt line byte and the MSI
+capability, and drops everything else with a `warn` line. The default
+matters because the illumos PPT driver adds no filter: `PPT_CFG_WRITE`
+is a bare `pci_config_put32(cfg, cio.pci_off, cio.pci_data)`. Before
+this, the catch-all arm forwarded any offset verbatim, so a guest could
+set PCIe DEVCTL Initiate FLR and reset a device the host still owned,
+write PMCSR and move it to D3, or point the Expansion ROM BAR at host
+physical memory. The MSI capability window is now sized from its own
+Message Control rather than a fixed 24 bytes, so it can no longer be
+used to write the capability that follows it. Guest MSI Enable is
+stripped from the write-through, because `ppt_setup_msi` has the DDI
+framework put a host address and a host vector in those registers; the
+guest's address and data are used for guest-side injection only.
+Multiple Message Enable is clamped to the kernel's `msi_limit`.
+
+**An I/O BAR decodes nothing.** `bar_rw` handles PIO, but nothing
+registers this device on the PIO bus, unlike `crates/vmm-virtio/src/pci.rs`
+which registers its own BAR handlers. MMIO BARs do not need it, because
+EPT maps them straight to hardware. An I/O BAR does, so its ports reach
+neither hardware nor emulation.
+
+`PciPassthru::new` takes no logger and `bin/rshyve/src/main.rs:1420`
+calls it, so dropped config writes and failed unmaps are currently
+recorded nowhere. `PciPassthru::new_with_logger` exists for the caller to
+switch to.
+
 ## Migration and the control socket (rshyve only)
 
 ### Control socket
 
-`--control-socket <PATH>`, newline-delimited JSON, one response line per request. Twelve commands (`bin/rshyve/src/control.rs:328`): `status`, `pause`, `resume`, `shutdown`, `reset`, `stop`, `migrate-source`, `migrate-dest`, `migrate-status`, `migrate-config`, `metrics`, `metrics-prometheus`. Anything else returns `{"success":false,"error":"invalid command"}`.
+`--control-socket <PATH>`, newline-delimited JSON, one response line per request. Twenty-one commands (`bin/rshyve/src/control/protocol.rs:12`): `status`, `pause`, `resume`, `shutdown`, `reset`, `stop`, `migrate-source`, `migrate-dest`, `migrate-status`, `migrate-config`, `metrics`, `metrics-prometheus`, and the nine hotplug commands `device-list`, `device-add`, `device-remove`, `cpu-list`, `cpu-add`, `cpu-remove`, `mem-list`, `mem-add`, `mem-remove`. Anything else returns `{"success":false,"error":"invalid command"}`.
 
 Authorization is uid plus zone, not a capability: the peer's uid must equal the VMM's euid, and on illumos its zone must match ours or be the global zone (zone 0 is allowed deliberately so a global-zone migration agent can drive an in-zone VMM). There is no token and no per-command authorization, so any peer that passes that check can issue `migrate-source`, `stop` or `reset`. The socket itself is 0600 in a 0700 directory, re-stat'd after bind and unlinked if the mode or owner is wrong.
 
@@ -361,6 +440,77 @@ Kernel state transferred: the ioapic, atpit, atpic, hpet, pm_timer and rtc syste
 Guarded refusals that work correctly: a vTPM, a bootrom variable store, or an `ahci-cd` device each block `migrate-source`; `--migrate-listen` combined with `--vtpm`, a varstore, or an `fbuf`/`ahci-cd` spec is a startup error. Note the asymmetry: `fbuf` blocks a destination but not a source, and `xhci` is on neither list, so a destination will accept an `xhci` spec and start with a fresh unrestored controller.
 
 `vmm-migrate-agent` is a separate binary that runs in the global zone and orchestrates the ZFS send/recv plus a Unix-to-TCP bridge. Its flags: `source --uuid --dest-host [--dest-port 4567] [--disk-dataset] [--dest-dataset] [--max-syncs 3] --ssh-key [--control-socket] [--skip-zfs]`, and `dest --uuid [--port 4567]`.
+
+## Hotplug (both binaries)
+
+Off unless `--hotplug` is given (`crates/vmm-config/src/lib.rs:215`, read once at `crates/vmm-machine/src/firmware.rs:52`). Without that flag no hotplug I/O port is claimed and no hotplug AML is emitted, so a VM that does not ask for hotplug keeps the ACPI tables and the free ports it had before this feature existed.
+
+With `--hotplug`, four PIO blocks are claimed (`crates/vmm-machine/src/pm.rs:139,166`):
+
+| Block | Port | Length | Condition |
+|---|---|---|---|
+| GPE0, status and enable | `0xAFE0` | 4 | always |
+| PCI slots: `PCIU`, `PCID`, `B0EJ` | `0xAE00` | 12 | always |
+| CPU slots | `0xAF00` | 12 | only when `maxcpus` is above the boot CPU count |
+| Memory slots | `0x0A00` | 0x18 | always |
+
+Sources: `crates/vmm-devices/src/acpi_gpe.rs:37`, `crates/vmm-devices/src/hotplug/pci.rs:37`, `cpu.rs:29`, `mem.rs:32`. GPE bit 1 runs `_E01` (PCI scan), bit 2 runs `_E02` (CPU scan) and bit 3 runs `_E03` (memory scan), emitted at `crates/vmm-devices/src/acpi/hotplug/mod.rs:28`.
+
+Both binaries drive the same engines (`crates/vmm-machine/src/hotplug.rs` and its `cpu`/`mem` submodules). They differ only in how a request arrives: rshyve takes JSON on `--control-socket`, firehyve takes the vsock `CONTROL` verb, because firehyve rejects `--control-socket` at startup. A firehyve VM started with `--hotplug` but no `virtio-vsock` device therefore has the engines and no way to reach them; the startup log says `vsock CONTROL enabled` only when a device carries the slot (`bin/firehyve/src/main.rs:343`).
+
+### PCI and disk hot-add
+
+`device-add <slot,driver[,config]>` takes the same spec grammar `-s` takes and runs it through the same catalog closure the boot-time pass uses (`bin/rshyve/src/main.rs:513`, `bin/firehyve/src/devices.rs:188`). A control peer can therefore name no driver and no path that a command line could not. firehyve additionally refuses `virtio-vsock` at run time, because the CONTROL slot a vsock device carries is armed once at startup (`devices.rs:196`).
+
+Bus 0, function 0, slots 2 through 31 only (`crates/vmm-devices/src/hotplug/pci.rs:68`). Slot 0 is the host bridge and slot 1 is the LPC bridge; neither gets an `_EJ0` method, so neither can be plugged. The slot is checked free against both the registry and the live bus before anything is built, so a refused request opens no file and takes no MSI-X vector. The id handed back is `driver@slot`, and it is what `device-remove` takes. `hostbridge` and `lpc` build no PCI device and are refused; in rshyve an unrecognised driver name also builds nothing and is refused here, rather than being logged and skipped the way the boot-time pass does it.
+
+The drivers a binary can hot-add are the ones its own `-s` catalog builds, minus the names that build no PCI device. Whether a given driver behaves well when it arrives after boot rather than at boot has been checked on the lab node for `virtio-blk` only; the rest are reachable by construction, not by test.
+
+### PCI hot-remove
+
+`device-remove <id>` is a REQUEST, not an order (`crates/vmm-machine/src/hotplug.rs:546`). It marks the slot `remove-pending`, raises the eject event, and returns. Nothing is torn down and no backing file is closed. The device leaves only when the guest runs `_EJ0`, which a drain thread picks up every 100 ms (`hotplug.rs:292`).
+
+A guest that never runs `_EJ0`, because it has no `acpiphp` driver or because the device is busy, leaves the slot in `remove-pending` for the life of the VM with no host state changed. That is the intended outcome, and `device-list` reports the state so an operator can see it. Three further refusals keep a device rather than forcing it out:
+
+- an eject the guest ran without an operator request is refused, and the slot is offered back to the guest.
+- a device that does not quiesce inside 5 seconds keeps its slot and is resumed.
+- `passthru` returns no `Lifecycle` (`bin/rshyve/src/main.rs:1429`), so nothing can report that its DMA has stopped. It can be hot-added and can never be removed.
+
+A hot-added device stops the VM being a migration source. `migrate-config` does append the device's `-s` spec to the destination command line (`bin/rshyve/src/control/migrate.rs:535`), but that is a report only: `migrate-source` refuses the VM first, because device state on the wire is matched by position. See [What cannot be done](#what-cannot-be-done-and-why).
+
+### CPU hot-add
+
+Needs `--hotplug` and `-c cpus=N,maxcpus=M` with `M` above `N`. When the two are equal the DSDT describes no CPU slot and the register file claims no port, on the reasoning that a controller for an event the VMM cannot raise is dead weight in every DSDT (`crates/vmm-machine/src/pm.rs:94`, `crates/vmm-devices/src/acpi/hotplug/cpu.rs:57`). `maxcpus` below the boot count, or above the kernel's 64, is a startup error (`crates/vmm-config/src/lib.rs:289`).
+
+`cpu-add <id>` activates the vCPU in the kernel, starts its thread, and raises the CPU GPE. It reports that the CPU is present and the guest has been told; onlining it is the guest's own step. Activation is deliberately lazy: a vCPU the kernel has activated but the guest never onlines never joins `halted_cpus`, so pre-activating spare CPUs would stop `VM_SUSPEND_HALT` firing for the life of the VM.
+
+An add that reaches `VM_ACTIVATE_CPU` and then fails consumes that id for the life of the VM. There is no `vm_deactivate_cpu` to undo the activation, so the id is recorded and refused rather than retried into a second active CPU with no thread. `cpu-list` reports such an id as `consumed`.
+
+### Memory hot-add
+
+Needs `--hotplug`, `-S`, and `-o hotplug.maxmem=SIZE`. All three are checked before the VM is created, so a window an operator cannot use costs no boot (`crates/vmm-config/src/lib.rs:374`). `-S` is required because a hot-add runs `VM_ALLOC_MEMSEG` on a live VM under the kernel write lock, which freezes every vCPU until it returns: with reservoir memory that is microseconds at any size, and without it the same call creates and zeroes every page inside the lock, measured at about 400 ms per GiB.
+
+`-o hotplug.memslot=SIZE` sets the slot size, default 128 MiB, which is the Linux x86-64 memory block size. There are 8 slots (`crates/vmm-devices/src/hotplug/mem.rs:44`), the slot size must divide `maxmem`, and a window needing more than 8 slots is refused rather than clamped. The window sits above every RAM region the VM booted with and so always above 4 GiB, which keeps it out of the 32-bit MMIO hole.
+
+`mem-add <bytes>` rounds up to a whole slot and returns the slot it filled. A second, lower ceiling comes from the kernel: one VM gets five memory segments and boot spends some of them, so the number of adds can be below the slot count. A UEFI VM with a framebuffer and more than 3 GiB spends four and leaves one add; direct boot leaves three. The engine reports that as `NoSegment` rather than letting the kernel answer `EINVAL`.
+
+### What cannot be done, and why
+
+`cpu-remove` and `mem-remove` are recognised on both transports and always refused with the reason. illumos has no `vm_deactivate_cpu`: `active_cpus` is only ever set, and the one place that clears it is `vm_init` on `VM_REINIT`. It has no `VM_FREE_MEMSEG` either, and `vm_free_memseg` has only destroy-path callers, so a memory segment lives until the VM does. Both refusals are answers, not silent failures, because an operator will try the command and "unknown command" does not say why (`bin/rshyve/src/control/dispatch.rs:251`, `bin/firehyve/src/control.rs:296`).
+
+A VM that hot-added anything cannot be a migration source. Two separate refusals, both in `migrate_source` under the topology lock:
+
+- **A CPU or memory add** (`bin/rshyve/src/control/migrate.rs:84`). The destination is started from the same command line, so it would get the boot CPU count and the boot memory size; a running vCPU would have no thread there, and memory the guest is using would have nowhere to land.
+- **A PCI add, or a slot still pending removal** (`migrate.rs:64`). Device state on the wire is matched by position: the source tags every queue group `pci_slot: 0`, the preamble carries no device list, and the destination claims the first group whose queue count matches its own. While the live set equals the boot `-s` list both sides build the same devices in the same order, so the match is accidental but correct; a hot-add breaks it and the guest would come up on the far side holding another device's ring state.
+
+The second refusal is the newer of the two and is what makes the `migrate-config` device report above a report only.
+
+### Evidence, and its limits
+
+Everything above is traced to code. The guest-side half has narrower evidence:
+
+- **Lab observed, one guest.** On the firehyve test node, a Linux 6.12.13 guest built with `kernel/hotplug.config` boots reporting `Allowing 2 present CPUs plus 6 hotplug CPUs` and `ACPI: Enabled 3 GPEs in block 00 to 0F`, registers `acpiphp` slots 2 to 31, and logs no ACPI error. `cpu-add`, `mem-add` and `device-add` each succeed on it, and `mem-add` moves the host reservoir's free and allocated counters by exactly the size added.
+- **Not covered.** The AML is not validated by `iasl`, in CI or anywhere else. No CI job boots a guest at all, so the guest-side result is a single lab run on one kernel configuration. Windows, illumos and BSD guests have not been tried. Hot-remove has been exercised only as far as the refusals above; no measurement of a guest completing an `_EJ0` on a busy disk is recorded.
 
 ## Metadata agent (rshyve only)
 
@@ -410,6 +560,9 @@ The kernel command line is fhrun-owned and cannot be edited, only appended to: `
 | xHCI | MaxSlots 64 advertised, 1 implemented; BAR0 8 KiB; INTx only |
 | vTPM | locality 0 only, 3968-byte command buffer, one VM per process |
 | Control socket | 8 concurrent connections, 64 KiB per request line, 30 s read, 10 s write |
+| PCI hotplug | slots 2..=31 on bus 0 function 0; 5 s quiesce budget per eject; the eject drain runs every 100 ms |
+| CPU hotplug | `maxcpus` at most 64, the kernel's `VM_MAXCPU`; ids are add-only and a failed add spends one |
+| Memory hotplug | 8 slots, default 128 MiB each, window above 4 GiB; 5 kernel memory segments per VM, some spent by boot |
 | Migration | 64 pages per batch (cap 256), 8 MiB max serialized payload, 5 convergence iterations at 500 ms with a 1024-page threshold, 5 s pause quiesce, 30 s queue-export budget, 120 s ZFS barrier |
 | mdata | 4096-byte input lines, printable ASCII only, 256-byte UART FIFOs |
 | fhrun | 4 NICs (PCI slots 7..=10), 2 consoles (slots 15..=16) |
@@ -421,8 +574,10 @@ Absent, with no partial path:
 
 - **`ahci-hd`.** rshyve fails at startup with "AHCI device type 'ahci-hd' is not implemented; use virtio-blk or nvme" (`bin/rshyve/src/main.rs:974`). There is no AHCI hard-disk code in `crates/vmm-storage`; the module is ATAPI only.
 - **Any emulated NIC other than viona-backed virtio-net.** No e1000, rtl8139, vmxnet, tap, netgraph or slirp.
-- **virtio-scsi, virtio-9p, virtio-balloon, virtio-vsock, virtio-input, virtio-gpu.**
-- **PCI hotplug and disk hotplug.** Devices are attached once over the `-s` list at startup and `PciBus` exposes no detach.
+- **virtio-scsi, virtio-9p, virtio-balloon, virtio-input, virtio-gpu.**
+- **PCI passthrough on an AMD host**, and passthrough of any device that advertises MSI-X. Neither is a gap in this VMM alone: illumos builds no `vmm_amdvi` module, and its VT-d driver does no interrupt remapping. See [PCI passthrough](#pci-passthrough-rshyve-only).
+- **Interrupt remapping for a passed-through device**, and therefore any equivalent of the Linux `allow_unsafe_interrupts` override. There is no knob to turn the MSI-X refusal off.
+- **Hot-remove of a CPU or of memory.** Both are impossible at the illumos kernel boundary, not merely unimplemented: there is no `vm_deactivate_cpu` and no `VM_FREE_MEMSEG`. Both commands exist and are refused with that reason. See [Hotplug](#hotplug-both-binaries). Hot-ADD of a PCI device, a CPU or memory is supported behind `--hotplug`, and PCI hot-remove works when the guest runs `_EJ0`.
 - **qcow2 or any non-raw image format.** Every backend does raw offset arithmetic on a plain file.
 - **Block I/O throttling.**
 - **VGA emulation, a VGA BIOS, and text mode.** No handlers exist for 0x3C0 or 0x3D4.
@@ -450,7 +605,8 @@ These parse without complaint and do nothing. Each one is a way to believe you c
 | Input | Reality |
 |---|---|
 | `--json-config <PATH>` | No reader exists anywhere in the tree (rshyve). firehyve at least rejects it. |
-| `-k` / `--config-file`, `-o` / `--config-option` | Declared in `crates/vmm-config/src/lib.rs:63,75`; no consumer. Only `-s` configures devices. |
+| `-k` / `--config-file` | Declared in `crates/vmm-config/src/lib.rs`; no consumer. |
+| `-o` / `--config-option`, any key outside `hotplug.` | Passed over. `-o` is a free key space this VMM shares with vmadm. The two keys it does read are `hotplug.maxmem` and `hotplug.memslot`; a misspelled `hotplug.` key is a startup error rather than a silent drop (`crates/vmm-config/src/lib.rs:338`). |
 | `-D` / `--destroy-on-poweroff` | Declared at `crates/vmm-config/src/lib.rs:79` and read nowhere. A whole-tree grep finds only that line. vmadm and boot.c pass `-D`, so this is the one an operator is most likely to trust. The instance is in fact reclaimed when the process exits, because the VMM arms the kernel autodestruct flag, but that happens whether or not `-D` was given. |
 | `-A` / `--acpi` | Declared at `crates/vmm-config/src/lib.rs:91` and read nowhere. ACPI tables are built unconditionally, so the flag is redundant rather than harmful. |
 | `nvme,...,sectorsize=N` | Parsed by the shared block parser, then discarded. NVMe LBA is hardcoded 512. |
@@ -523,7 +679,7 @@ Treat `STATUS.md` as historical. It still titles the project "vmmnew", predates 
 | Migration RAM flow is MemOffer/MemFetch/MemXfer | `docs/migration.md` | None of MemOffer, MemXfer or Page is ever sent. The real flow is PageBatch plus MemFetch, ended by MemEnd/MemDone. Five of the thirteen wire message types are decodable and never constructed. |
 | Migration examples invoke a binary called `vmm` | `docs/migration.md` | The binary is `rshyve`. |
 | `--migrate-listen 0.0.0.0:4567` as the destination | `docs/migration.md`, `docs/cli.md` | Works only because the CLI flag applies no validation; the `migrate-dest` control command runs the same address through a validator that rejects `0.0.0.0`. Two entry points to one feature disagree. |
-| Control socket has 4-5 commands | `docs/cli.md` | Twelve exist. `shutdown`, `reset`, `stop`, `migrate-dest`, `migrate-config`, `metrics` and `metrics-prometheus` are undocumented, as is `migrate-source`'s `zfs_barrier` field. |
+| Control socket has 4-5 commands | `docs/cli.md` | Twenty-one exist (`bin/rshyve/src/control/protocol.rs`), nine of them the hotplug commands. `shutdown`, `reset`, `stop`, `migrate-dest`, `migrate-config`, `metrics` and `metrics-prometheus` are undocumented, as is `migrate-source`'s `zfs_barrier` field. |
 | `password=<b64>` for fbuf | `docs/platform.md:30` | The value is used verbatim; there is no base64 decode. `docs/devices.md:128` gets it right. |
 | `-s 30:1,xhci,tablet` selects the device | `docs/platform.md:31`, `docs/devices.md:130` | The config field is never read. |
 | Framebuffer/VNC and xHCI are "Complete" and at parity with C bhyve | `docs/status.md:28`, `docs/platform.md:151` | No VGA, no TCP listener, no `wait`, Raw encoding only, one client, one xHCI slot, no scroll wheel, no migration state. |

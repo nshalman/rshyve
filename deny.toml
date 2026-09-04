@@ -5,9 +5,8 @@ unused-ignored-advisory = "warn"
 ignore = [
     # Owner: VMM maintainers. Review by 2026-11-17. memmap 0.7 is reached only
     # through usdt 0.5; upgrading first requires an illumos diff of the DTrace
-    # probe names defined in the per-crate `mod probes` blocks and used
-    # by operator scripts.
-    { id = "RUSTSEC-2020-0077", reason = "VMM maintainers; review by 2026-11-17; preserve the emitted DTrace probe names until an illumos probe-name diff is complete" },
+    # probe names documented in DTRACE.md and used by operator scripts.
+    { id = "RUSTSEC-2020-0077", reason = "VMM maintainers; review by 2026-11-17; preserve documented DTrace probe names until an illumos probe-name diff is complete" },
     # Owner: migration maintainers. Review by 2026-11-17. rand 0.8.5 is reached
     # only through tungstenite 0.21, whose `log` feature is disabled, so the
     # custom-logger rand::rng() path is unreachable. Remediation requires moving
@@ -55,6 +54,9 @@ skip-tree = [
     # UEFI backend of the getrandom split above; getrandom 0.3 pulls 5.3
     # through jobserver, getrandom 0.4 pulls 6.0 through tempfile.
     { crate = "r-efi", depth = 1, reason = "follows the getrandom split; not built on any supported target" },
+    # The derive half of the zerocopy split above. acpi_tables turns on
+    # zerocopy's derive feature at 0.8; dof already uses it at 0.7.
+    { crate = "zerocopy-derive", depth = 1, reason = "follows the zerocopy 0.7/0.8 split" },
 ]
 
 [sources]

@@ -8,6 +8,7 @@
 //! control socket, no PCI passthrough.
 
 mod console;
+mod control;
 mod devices;
 
 use std::ffi::{OsStr, OsString};
@@ -17,6 +18,11 @@ use std::sync::Arc;
 use slog::{error, info, Drain};
 
 use vmm_config::Cli;
+use vmm_machine::{
+    CpuHotplugEngine, CpuSlots, DeviceRegistry, HotplugEngine, HotplugEngines,
+    MemHotplugEngine, VcpuRegistry, VcpuSetup,
+};
+use vmm_virtio::vsock::control::{ControlSink, ControlSlot};
 
 /// Kernel command line used when `--cmdline` is absent. It names
 /// `ttyS0`, which is why COM1 is always attached.
@@ -68,6 +74,9 @@ fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
     if let Some(entry) = cli.lpc.iter().find(|a| a.starts_with("bootrom,")) {
         anyhow::bail!("firehyve has no UEFI path; '-l {entry}' is rshyve only");
     }
+    // A misspelled hotplug key would otherwise leave the operator with
+    // a VM that quietly has no window.
+    cli.check_hotplug_options()?;
     console::require_stdio_backend(&cli.lpc)?;
     // attach_pci_devices takes bootindex-stripped specs, and a
     // direct-booted kernel has no firmware boot order for an index to
@@ -89,6 +98,34 @@ fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Arm every vsock control slot with the machine inventory.
+///
+/// Returns the sink so the caller can report that the interface is up,
+/// and `None` when the machine has no vsock device to serve it on.
+fn install_control_sink(
+    slots: &[ControlSlot],
+    registry: &Arc<DeviceRegistry>,
+    hotplug: HotplugEngines,
+    num_cpus: u32,
+    max_cpus: u32,
+    mem_size: usize,
+) -> Option<Arc<dyn ControlSink>> {
+    if slots.is_empty() {
+        return None;
+    }
+    let sink: Arc<dyn ControlSink> = Arc::new(control::Inventory::new(
+        Arc::clone(registry),
+        hotplug,
+        num_cpus,
+        max_cpus,
+        mem_size,
+    ));
+    for slot in slots {
+        slot.install(Arc::clone(&sink));
+    }
+    Some(sink)
+}
+
 /// The phase sequence. Ordering is load-bearing: ACPI tables are written
 /// before the kernel is loaded because the loader is handed the RSDP
 /// address, and the SIGTERM handler is installed after the vCPU threads
@@ -97,12 +134,19 @@ fn run(
     cli: Cli,
     log: &slog::Logger,
 ) -> anyhow::Result<vmm_machine::RunOutcome> {
-    // Phase 1: reject what this binary cannot honor.
+    // Phase 1: reject what this binary cannot honor. The hot-add
+    // window is built here, before the VM exists, so a window an
+    // operator cannot use costs no boot.
     validate_cli(&cli)?;
+    let mem_window = vmm_machine::mem_hotplug_window(&cli)?;
 
     // Phase 2: create the VM. No bootrom, so nothing goes into guest
     // memory before finalize.
     let num_cpus = cli.num_cpus()?;
+    // One ceiling. The MADT slot count, the CPU register file and the
+    // hot-add engine all read this, so the guest cannot be told about a
+    // slot no engine can fill.
+    let max_cpus = cli.max_cpus()?;
     let mem_size = cli.mem_size()?;
     let version = version_string();
     let opts = vmm_machine::MachineOpts {
@@ -132,10 +176,13 @@ fn run(
                 cli.cpu_baseline,
             )
         })?;
-    vmm_core::cpuid::apply_cpuid_baseline(
+    // The table, not just the side effect: a CPU brought online later
+    // has to be given the one its siblings got.
+    let cpuid = vmm_core::cpuid::apply_cpuid_table(
         machine.hdl(),
         num_cpus,
         baseline,
+        &[],
         log,
     )
     .map_err(|e| anyhow::anyhow!("failed to apply CPU baseline: {e}"))?;
@@ -144,7 +191,11 @@ fn run(
     let chipset_devs = vmm_machine::init_chipset(&machine, log)?;
 
     // Phase 4: timers, PM, pvpanic.
-    let _timer_pm = vmm_machine::setup_timers_and_pm(&machine, log)?;
+    let timer_pm = vmm_machine::setup_timers_and_pm(
+        &machine,
+        vmm_machine::HotplugOpts::from_cli(&cli)?,
+        log,
+    )?;
 
     // Phase 5: serial console, then the COM2 marker channel.
     let _com1 = console::setup_console(&machine, &chipset_devs.pic, &cli, log)?;
@@ -164,17 +215,43 @@ fn run(
     // Phase 7: PCI devices. An unknown driver name is an error, not a
     // silent omission.
     let input = Arc::new(vmm_devices::InputBroker::default());
-    let ctx = vmm_machine::PciDeviceCtx::new(
+    let owned_ctx = Arc::new(vmm_machine::pci::OwnedPciCtx::new(
         &machine,
         &chipset_devs.chipset,
         &input,
         log,
-    );
-    let mut factory = |spec: &str, ctx: &vmm_machine::PciDeviceCtx<'_>| {
-        devices::create_pci_device(spec, num_cpus, ctx)
+    ));
+    let ctx = vmm_machine::PciDeviceCtx::borrow_from(&owned_ctx);
+    // The factory borrows the slot list, so it ends with this block.
+    let mut control_slots: Vec<ControlSlot> = Vec::new();
+    let attachment = {
+        let mut factory = |spec: &str, ctx: &vmm_machine::PciDeviceCtx<'_>| {
+            devices::create_pci_device(spec, num_cpus, ctx, &mut control_slots)
+        };
+        vmm_machine::attach_pci_devices(&ctx, &cli.pci_slot, &mut factory)?
     };
-    let attachment =
-        vmm_machine::attach_pci_devices(&ctx, &cli.pci_slot, &mut factory)?;
+
+    // The PM phase runs before the registry exists, so its handles are
+    // pushed here. Without this the GPE0 block takes no part in reset.
+    vmm_machine::register_pm_devices(&attachment.registry, &timer_pm)?;
+
+    // The hotplug engine owns the thread that finishes an eject, so no
+    // teardown ever runs on a vCPU thread.
+    let pci_hotplug = timer_pm.hotplug.as_ref().map(|regs| {
+        HotplugEngine::start(
+            Arc::clone(&attachment.registry),
+            owned_ctx,
+            Arc::clone(&regs.pci),
+            devices::hotplug_factory(num_cpus),
+            log.new(slog::o!("component" => "hotplug")),
+        )
+    });
+    let mem_hotplug = start_mem_hotplug(
+        mem_window,
+        &machine,
+        timer_pm.hotplug.as_ref(),
+        log,
+    )?;
 
     // Phase 8: load the kernel, then enter the BSP at its entry point.
     let kernel_path = cli
@@ -221,23 +298,130 @@ fn run(
         log,
     )?;
 
-    // Phase 9: run.
-    let (event_rx, handles, _metrics) = vmm_machine::spawn_vcpus(
+    // Phase 9: run. The fleet, not the fixed set, because a CPU added
+    // later has to join the same event channel and the same roster.
+    let fleet = vmm_machine::spawn_vcpu_fleet(
         &machine,
         num_cpus,
         build.api_version,
         None,
         log,
     );
-    vmm_machine::install_sigterm_handler(&machine, log);
-    vmm_machine::run_event_loop(
-        &machine,
-        event_rx,
-        handles,
-        None,
-        &attachment.lifecycle_devices,
-        log,
+    let cpu_hotplug = timer_pm
+        .hotplug
+        .as_ref()
+        .and_then(|regs| regs.cpu.clone())
+        .map(|regs| {
+            let vcpus = Arc::new(VcpuRegistry::from_fleet(
+                VcpuSetup {
+                    max_cpus,
+                    boot_cpus: num_cpus,
+                    vmexit_on_hlt: cli.vmexit_on_hlt,
+                    cpuid: cpuid.clone(),
+                },
+                &fleet,
+                log.new(slog::o!("component" => "vcpus")),
+            ));
+            let engine = CpuHotplugEngine::start(
+                Arc::clone(&vcpus),
+                regs,
+                log.new(slog::o!("component" => "hotplug-cpu")),
+            );
+            CpuSlots::from_registry(engine, vcpus)
+        });
+    let hotplug = HotplugEngines {
+        pci: pci_hotplug,
+        cpu: cpu_hotplug,
+        mem: mem_hotplug,
+    };
+
+    // firehyve has no control socket, so the inventory is served on the
+    // vsock host socket. It lands here because the registry is complete
+    // only after the attach pass and the CPU engine only after the
+    // fleet. An empty slot answers nothing, so a guest that somehow got
+    // to vsock first is refused, not misinformed.
+    if install_control_sink(
+        &control_slots,
+        &attachment.registry,
+        hotplug.clone(),
+        num_cpus,
+        max_cpus,
+        mem_size,
     )
+    .is_some()
+    {
+        info!(log, "vsock CONTROL enabled";
+            "sockets" => control_slots.len());
+    }
+
+    let vmm_machine::VcpuFleet {
+        events,
+        sender,
+        threads,
+        ..
+    } = fleet;
+    // The registry keeps its own sender, so the growable loop below
+    // reads "every thread has gone" off the roster. Without a registry
+    // this drop is what lets the channel close.
+    drop(sender);
+
+    vmm_machine::install_sigterm_handler(&machine, log);
+    let outcome = if hotplug.cpu.is_some() {
+        vmm_machine::run_event_loop_growable(
+            &machine,
+            events,
+            &threads,
+            None,
+            &attachment.registry,
+            log,
+        )
+    } else {
+        vmm_machine::run_event_loop_registered(
+            &machine,
+            events,
+            threads.close(),
+            None,
+            &attachment.registry,
+            log,
+        )
+    };
+
+    // The vsock control sink holds a handle, so the drain threads would
+    // otherwise outlive the event loop.
+    hotplug.shutdown();
+    outcome
+}
+
+/// Start the memory hot-add engine, or nothing when the VM asked for no
+/// window.
+///
+/// `-o hotplug.maxmem` already requires `--hotplug`, so a window with no
+/// register file is a contradiction and not a silent omission.
+fn start_mem_hotplug(
+    window: Option<vmm_machine::MemWindow>,
+    machine: &vmm_core::machine::Machine,
+    regs: Option<&vmm_machine::HotplugRegisters>,
+    log: &slog::Logger,
+) -> anyhow::Result<Option<Arc<MemHotplugEngine>>> {
+    let Some(window) = window else {
+        return Ok(None);
+    };
+    let regs = regs.ok_or_else(|| {
+        anyhow::anyhow!("a memory window needs the hotplug register files")
+    })?;
+    info!(log, "memory hot-add window";
+        "base" => format!("{:#x}", window.base()),
+        "bytes" => window.size(),
+        "slots" => window.slots(),
+    );
+    Ok(Some(MemHotplugEngine::start(
+        Arc::clone(machine.physmap()),
+        Arc::clone(machine.hdl()),
+        Arc::clone(machine.segids()),
+        Arc::clone(&regs.mem),
+        window,
+        log.new(slog::o!("component" => "hotplug-mem")),
+    )))
 }
 
 fn main() -> ExitCode {
@@ -291,6 +475,79 @@ mod tests {
             .try_get_matches_from(args)
             .expect("argv parses");
         Cli::from_arg_matches(&matches).expect("from_arg_matches")
+    }
+
+    #[test]
+    fn one_cpu_ceiling_feeds_the_tables_the_registers_and_the_engine() {
+        // The MADT slot count, the CPU register file and the hot-add
+        // engine have to describe one machine. All three read
+        // Cli::max_cpus: the tables through setup_fwcfg_and_acpi, the
+        // register file through HotplugOpts::from_cli, and the engine
+        // through the VcpuSetup below. A hand-built HotplugOpts here
+        // would let the register file describe a different machine, so
+        // the phase sequence must not contain one.
+        let src = include_str!("main.rs");
+        let end = src.find("#[cfg(test)]").expect("test module attribute");
+        let code = &src[..end];
+
+        assert!(!code.contains("HotplugOpts {"), "a hand-built HotplugOpts");
+        // One call, so every other use of the ceiling in this file
+        // flows from the one local it is read into.
+        assert_eq!(code.matches("cli.max_cpus()").count(), 1);
+    }
+
+    #[test]
+    fn a_machine_with_no_vsock_device_arms_no_control_sink() {
+        let registry = Arc::new(DeviceRegistry::new());
+        assert!(install_control_sink(
+            &[],
+            &registry,
+            HotplugEngines::default(),
+            2,
+            2,
+            1 << 30,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn every_vsock_slot_is_armed_with_the_machine_inventory() {
+        // Two slots, because a second `-s ...,virtio-vsock` must not
+        // leave one socket answering nothing.
+        let registry = Arc::new(DeviceRegistry::new());
+        registry
+            .insert(vmm_machine::RegisteredDevice::new(
+                "virtio-vsock@5",
+                vmm_machine::parse_bdf("5"),
+                None,
+                None,
+                None,
+            ))
+            .expect("insert");
+        let slots = vec![ControlSlot::default(), ControlSlot::default()];
+
+        let sink = install_control_sink(
+            &slots,
+            &registry,
+            HotplugEngines::default(),
+            2,
+            2,
+            1 << 30,
+        )
+        .expect("armed");
+
+        for slot in &slots {
+            assert!(slot.sink().is_some(), "a slot was left empty");
+        }
+        // The sink reads the registry the attach pass filled, not a copy.
+        assert_eq!(
+            sink.handle_line("device-list"),
+            "OK 1 virtio-vsock@5,0.5.0,present"
+        );
+        assert_eq!(
+            sink.handle_line("cpu-list"),
+            "OK 2 0,present,boot 1,present,boot"
+        );
     }
 
     #[test]

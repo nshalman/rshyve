@@ -12,7 +12,7 @@ These flags match the existing C bhyve interface used by `boot.c`:
 
 | Flag | Description |
 |------|-------------|
-| `-c <N>` | CPU count (or `cpus=N,sockets=M,cores=C,threads=T`) |
+| `-c <N>` | CPU count (or `cpus=N,sockets=M,cores=C,threads=T`). Add `maxcpus=M` for hotplug CPU slots, see [Hotplug](#hotplug) |
 | `-m <SIZE>` | Memory size. Bare number = MiB. Suffixes: K, M, G, T |
 | `-s <slot,driver[,config]>` | PCI device (repeatable). See [Devices](devices.md) |
 | `-l <device,config>` | LPC device (repeatable): `bootrom`, `com1`, `com2` |
@@ -22,6 +22,7 @@ These flags match the existing C bhyve interface used by `boot.c`:
 | `-D` | Destroy VM on power-off |
 | `-S` | Wire guest memory (no swap) |
 | `-A` | Generate ACPI tables |
+| `-o <key=value>` | Config option (repeatable). Only `hotplug.maxmem` and `hotplug.memslot` are read; see [Hotplug](#hotplug). Any other key is passed over, but a misspelled `hotplug.` key is a startup error |
 
 ## New Flags
 
@@ -33,6 +34,59 @@ These flags match the existing C bhyve interface used by `boot.c`:
 | `--migrate-listen <ADDR:PORT>` | Destination mode: wait for incoming migration |
 | `--control-socket <PATH>` | Unix socket for management commands |
 | `--cpu-baseline <PROFILE>` | CPU feature mask: `host`, `avx2`, `sse42` |
+
+### Hotplug
+
+| Flag | Description |
+|------|-------------|
+| `--hotplug` | Publish the ACPI hotplug interface: the GPE0 block, the PCI, CPU and memory register files, and the matching AML. Off by default |
+| `-c cpus=N,maxcpus=M` | `M` CPU slots, of which `N` boot. CPU hot-add needs `M` above `N`. `M` is at most 64 |
+| `-o hotplug.maxmem=SIZE` | The guest address window hot-added memory goes in. Needs `--hotplug` and `-S` |
+| `-o hotplug.memslot=SIZE` | Size of one hot-add memory slot. Default `128M`. It must divide `hotplug.maxmem`, and the window may need at most 8 slots |
+
+Both binaries accept all four. Sizes use the `-m` grammar: a bare number
+is MiB, and K, M, G and T suffixes work.
+
+`-S` is required with `hotplug.maxmem` because a hot-add runs
+`VM_ALLOC_MEMSEG` on a live VM, and that ioctl freezes every vCPU until
+it returns. With reservoir memory the allocation costs microseconds at
+any size. Without it the same call zeroes every page inside the lock,
+about 400 ms per GiB, which the guest sees as a stall. Size the host
+reservoir first, for example
+`/usr/lib/rsrvrctl -c 512 -a <MiB>`.
+
+Hot-REMOVE of a CPU or of memory is impossible on illumos. There is no
+`vm_deactivate_cpu` and no `VM_FREE_MEMSEG`. `cpu-remove` and
+`mem-remove` are accepted and always answered with that reason. Device
+removal is advisory: the guest has to run `_EJ0`, and a guest that never
+does leaves the slot in `remove-pending` with no host state changed.
+
+A VM that has hot-added anything cannot be a migration source. For a
+CPU or memory add, the destination is built from the same command line
+and would not have the addition. For a PCI add, device state on the
+migration wire is matched by position, so the destination would restore
+another device's state. Both are refused by `migrate-source`, naming the
+reason.
+
+Example, a VM that can grow from 2 to 8 CPUs and add up to 4 GiB:
+
+```bash
+rshyve -H -S --hotplug \
+  -c cpus=2,maxcpus=8 -m 2G \
+  -o hotplug.maxmem=4G -o hotplug.memslot=512M \
+  -s 0,hostbridge \
+  -s 4,virtio-blk,/dev/zvol/rdsk/zones/$UUID/disk0 \
+  -s 29:0,virtio-net-viona,net0 \
+  -s 31,lpc \
+  -l bootrom,/usr/share/bhyve/uefi-rom.bin \
+  -l com1,stdio \
+  --control-socket /var/run/rshyve/growable.sock \
+  growable
+```
+
+That VM claims PIO `0xAFE0` (GPE0), `0xAE00` (PCI slots), `0xAF00` (CPU
+slots) and `0x0A00` (memory slots). Without `--hotplug` none of those
+ports are claimed and the ACPI tables are unchanged.
 
 ### Metadata Agent
 
@@ -98,6 +152,32 @@ echo '{"command":"migrate-source","target_addr":"10.0.0.2:4567"}' | socat - ...
 echo '{"command":"migrate-status"}' | socat - ...
 ```
 
+### Hotplug commands
+
+`device-add` takes the same `slot,driver[,config]` spec `-s` takes and
+answers with the id `device-remove` needs. `device-remove` only asks the
+guest; the device leaves when the guest runs `_EJ0`, and `device-list`
+reports `remove-pending` until it does.
+
+```bash
+echo '{"command":"device-list"}' | socat - ...
+echo '{"command":"device-add","spec":"5,virtio-blk,/dev/zvol/rdsk/zones/d1"}' | socat - ...
+echo '{"command":"device-remove","id":"virtio-blk@5"}' | socat - ...
+
+echo '{"command":"cpu-list"}' | socat - ...
+echo '{"command":"cpu-add","id":2}' | socat - ...
+
+# bytes, rounded up to a whole hotplug.memslot
+echo '{"command":"mem-list"}' | socat - ...
+echo '{"command":"mem-add","bytes":536870912}' | socat - ...
+```
+
+`cpu-remove` and `mem-remove` are recognised and always refused, so the
+answer says why the platform cannot do it. A request for an engine the
+VM was not started with is refused too, naming the flag that is missing.
+Every hot-add needs the VM to be running: a paused or migrating VM
+answers with its state instead.
+
 ## firehyve
 
 `firehyve` is the second binary in this workspace: a microVM over the
@@ -114,9 +194,10 @@ firehyve [OPTIONS] --kernel <PATH> <VM_NAME>
 | `--kernel` | Required. There is no UEFI path, so `-l bootrom,...` is rejected |
 | `-l com1` | `stdio` only. `/dev/zconsole` and `socket,<path>` are rejected |
 | `-l com2` | Not attached. There is no metadata agent, so `--mdata-*` is rejected |
-| `-s <slot>,<driver>` | `virtio-blk` (alias `virtio-blk-pci`), `virtio-net-viona`, `virtio-rnd`, `virtio-console`, `virtio-fs`, `hostbridge` and `lpc` only. `nvme`, `ahci-*`, `fbuf`, `xhci` and `passthru` are rejected, not skipped |
+| `-s <slot>,<driver>` | `virtio-blk` (alias `virtio-blk-pci`), `virtio-net-viona`, `virtio-rnd`, `virtio-console`, `virtio-fs`, `virtio-vsock`, `hostbridge` and `lpc` only. `nvme`, `ahci-*`, `fbuf`, `xhci` and `passthru` are rejected, not skipped |
 | `-s ...,bootindex=N` | Rejected. A directly booted kernel has no firmware boot order |
 | Migration | Not supported: `--migrate-listen` and `--control-socket` are rejected |
+| `--hotplug` | Accepted, with the same `-c maxcpus=` and `-o hotplug.*` options as rshyve. The commands arrive on the vsock `CONTROL` verb, so the VM also needs a `-s <slot>,virtio-vsock,<path>,cid=<n>` device or nothing can reach them |
 | Other | `--vtpm`, `--hyperv` and `--json-config` are rejected |
 
 Example:
@@ -128,6 +209,42 @@ firehyve -c 2 -m 512M \
   --kernel /var/tmp/vmlinux --cmdline "console=ttyS0 root=/dev/vda" \
   guest
 ```
+
+### firehyve CONTROL verb
+
+firehyve has no control socket, so the same commands are served on the
+host socket of a `virtio-vsock` device. A peer that sends `CONNECT
+<port>` is joined to a guest port; a peer that sends `CONTROL` is
+answered by the VMM itself and reaches no guest. One request per line,
+one response line back, `OK ...` or `ERR <reason>`.
+
+```
+CONTROL
+device-list                     -> OK 2 virtio-blk@4,0.4.0,present ...
+device-add 5,virtio-blk,/path   -> OK virtio-blk@5
+device-remove virtio-blk@5      -> OK virtio-blk@5,remove-pending
+cpu-list                        -> OK 4 0,present,boot 2,absent,hotplug ...
+cpu-add 2                       -> OK 2,present
+mem-list                        -> OK 1 boot,1073741824,present
+mem-add 134217728               -> OK slot0,present
+```
+
+Every answer is one line. A list answer is `OK <count>` followed by one
+field per record, and a record is its values joined by commas, so a
+client splits on whitespace and then on commas. No value carries a space
+or a comma. `mem-add` takes BYTES on both transports, not the `-m` size
+grammar.
+
+The socket is the path in the device spec, for example
+`-s 9,virtio-vsock,/var/run/firehyve/guest.sock,cid=3`. It is 0600 in a
+0700 directory, so the peer is already the VMM's own user:
+
+```bash
+printf 'CONTROL\ncpu-add 2\n' | socat - UNIX-CONNECT:/var/run/firehyve/guest.sock
+```
+
+`virtio-vsock` itself cannot be hot-added: its CONTROL slot is armed
+once, at startup.
 
 ## Example: boot.c Equivalent
 

@@ -2,6 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use std::ptr::NonNull;
+
 use super::*;
 
 /// Create a test SubMapping backed by anonymous mmap (no VmmHdl needed).
@@ -458,4 +460,478 @@ fn phys_map_empty() {
     // Lookup in empty map returns None
     assert!(map.lookup(0, 1).is_none());
     assert!(map.lookup(0x1000, 4096).is_none());
+}
+
+/// Add a region without a kernel VM, which no test host outside illumos has.
+fn insert_ram(map: &PhysMap, gpa: u64, len: usize) -> Result<()> {
+    map.add_region_anon(gpa, len, RegionKind::Ram)
+}
+
+#[test]
+fn region_accounting_skips_mmio() {
+    let map = PhysMap::new();
+    insert_ram(&map, 0, 0x2000).unwrap();
+    map.add_region_anon(0x4000, 0x1000, RegionKind::Mmio)
+        .unwrap();
+    map.add_region_anon(0x8000, 0x1000, RegionKind::Rom)
+        .unwrap();
+
+    assert_eq!(map.num_regions(), 3);
+    assert_eq!(map.total_memory(), 0x3000);
+    assert_eq!(
+        map.regions(),
+        vec![
+            (0, 0x2000, RegionKind::Ram),
+            (0x4000, 0x1000, RegionKind::Mmio),
+            (0x8000, 0x1000, RegionKind::Rom),
+        ]
+    );
+    assert!(map.lookup(0x8000, 0x1000).is_some());
+    assert!(map.lookup(0x2000, 1).is_none());
+}
+
+#[test]
+fn overlapping_region_is_rejected() {
+    let map = PhysMap::new();
+    insert_ram(&map, 0x1000, 0x1000).unwrap();
+
+    let err = insert_ram(&map, 0x1800, 0x1000).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    assert_eq!(map.num_regions(), 1);
+
+    // Abutting ranges do not overlap.
+    insert_ram(&map, 0x2000, 0x1000).unwrap();
+    assert_eq!(map.num_regions(), 2);
+}
+
+#[test]
+fn concurrent_overlapping_adds_admit_exactly_one() {
+    // The overlap check and the insert must be one write-lock section.
+    // Two adds that both pass the check would leave the region list with
+    // aliasing entries, so `lookup` could hand out the wrong mapping.
+    let map = Arc::new(PhysMap::new());
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+
+    let handles: Vec<_> = [0x1000u64, 0x1800]
+        .into_iter()
+        .map(|gpa| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                insert_ram(&map, gpa, 0x1000)
+            })
+        })
+        .collect();
+
+    let results: Vec<Result<()>> =
+        handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    let err = results.into_iter().find_map(|r| r.err()).unwrap();
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    assert_eq!(map.num_regions(), 1);
+}
+
+#[test]
+fn lookup_runs_while_a_region_is_added() {
+    // `lookup` is on the guest memory path. It must not hold the region
+    // lock across the returned SubMapping, or a concurrent add deadlocks
+    // every vCPU.
+    const LOOKUPS: usize = 2000;
+    const READERS: usize = 2;
+
+    let map = Arc::new(PhysMap::new());
+    insert_ram(&map, 0, 0x1000).unwrap();
+
+    let barrier = Arc::new(std::sync::Barrier::new(READERS + 1));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+    for _ in 0..READERS {
+        let map = Arc::clone(&map);
+        let barrier = Arc::clone(&barrier);
+        let done = done_tx.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..LOOKUPS {
+                let sub = map.lookup(0, 16).expect("region 0 is mapped");
+                assert_eq!(sub.len(), 16);
+            }
+            let _ = done.send(());
+        });
+    }
+    drop(done_tx);
+
+    barrier.wait();
+    for i in 1..=8u64 {
+        insert_ram(&map, i * 0x1000, 0x1000).unwrap();
+    }
+
+    // Join by channel so a deadlocked reader fails the test instead of
+    // hanging the run forever.
+    for _ in 0..READERS {
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("lookup deadlocked against a concurrent add");
+    }
+    assert_eq!(map.num_regions(), 9);
+    assert_eq!(map.total_memory(), 9 * 0x1000);
+}
+
+#[test]
+fn a_claim_holds_its_range_until_it_is_dropped() {
+    let map = PhysMap::new();
+    let claim = map.claim_ram(0x1_0000_0000, 0x10_0000).unwrap();
+    assert_eq!(claim.gpa(), 0x1_0000_0000);
+    // No region yet: the memory is not there until the claim commits.
+    assert_eq!(map.num_regions(), 0);
+    assert!(map.lookup(0x1_0000_0000, 16).is_none());
+
+    let err = map.claim_ram(0x1_0008_0000, 0x10_0000).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    // A published region is refused against a claim too.
+    let err = insert_ram(&map, 0x1_0000_0000, 0x1000).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+
+    drop(claim);
+    let retaken = map.claim_ram(0x1_0008_0000, 0x10_0000).unwrap();
+    assert_eq!(retaken.gpa(), 0x1_0008_0000);
+}
+
+#[test]
+fn concurrent_runtime_claims_admit_exactly_one() {
+    // Two hot-adds that both passed the overlap check would map two
+    // segments at one guest address.
+    let map = Arc::new(PhysMap::new());
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+
+    let handles: Vec<_> = [0x1_0000_0000u64, 0x1_0000_8000]
+        .into_iter()
+        .map(|gpa| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                // Keep the claim alive: a claim that is dropped at once
+                // would let the loser through and pass by luck.
+                map.claim_ram(gpa, 0x1_0000).map(std::mem::forget)
+            })
+        })
+        .collect();
+
+    let results: Vec<Result<()>> =
+        handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    let err = results.into_iter().find_map(|r| r.err()).unwrap();
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+}
+
+#[test]
+fn a_runtime_claim_refuses_the_mmio_hole() {
+    let map = PhysMap::new();
+
+    for (gpa, len) in [
+        // Wholly inside the hole.
+        (MMIO_HOLE_BASE, 0x10_0000usize),
+        // The boot ROM window, at the top of the hole.
+        (0xFFE2_0000, 0x1E_0000),
+        // The firmware scratch RAM below the ROM.
+        (0xFCC0_0000, 0x40_0000),
+        // Crossing into the hole from below.
+        (MMIO_HOLE_BASE - 0x1000, 0x2000),
+        // Crossing out of the hole at 4 GiB.
+        (MMIO_HOLE_END - 0x1000, 0x2000),
+    ] {
+        let err = map.claim_ram(gpa, len).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "{gpa:#x}");
+    }
+
+    // Abutting the hole on either side is fine.
+    let below = map.claim_ram(MMIO_HOLE_BASE - 0x1000, 0x1000).unwrap();
+    let above = map.claim_ram(MMIO_HOLE_END, 0x1000).unwrap();
+    assert_eq!(below.gpa(), MMIO_HOLE_BASE - 0x1000);
+    assert_eq!(above.gpa(), MMIO_HOLE_END);
+}
+
+#[test]
+fn a_runtime_claim_refuses_a_range_the_kernel_would_refuse() {
+    let map = PhysMap::new();
+
+    assert_eq!(
+        map.claim_ram(0x1_0000_0000, 0).unwrap_err().kind(),
+        ErrorKind::InvalidInput,
+    );
+    assert_eq!(
+        map.claim_ram(u64::MAX - 0x1000, 0x2000).unwrap_err().kind(),
+        ErrorKind::InvalidInput,
+    );
+    // Page alignment, which `vm_mmap_memseg` answers with EINVAL.
+    assert_eq!(
+        map.claim_ram(0x1_0000_0800, 0x1000).unwrap_err().kind(),
+        ErrorKind::InvalidInput,
+    );
+    assert_eq!(
+        map.claim_ram(0x1_0000_0000, 0x800).unwrap_err().kind(),
+        ErrorKind::InvalidInput,
+    );
+}
+
+#[test]
+fn the_boot_and_run_time_paths_share_one_overlap_rule() {
+    // Two copies of the rule would drift, and the run-time copy is the
+    // one a control socket can reach. AddressSpace::check_free is the
+    // rule, PhysMap::claim is its only caller, and add_region,
+    // add_rom_with_ram_tail, add_region_anon and claim_ram all go
+    // through claim.
+    let src = include_str!("../mem.rs");
+    assert_eq!(src.matches("check_free(").count(), 2, "one rule, one call");
+    assert_eq!(
+        src.matches("space.check_free(").count(),
+        1,
+        "check_free is called from one place",
+    );
+    // add_rom_with_ram_tail takes two, and add_region, claim_ram,
+    // add_region_anon and add_region_split_anon one each.
+    assert_eq!(
+        src.matches("fn claim(").count(),
+        1,
+        "one way to take a range"
+    );
+    assert_eq!(
+        src.matches("self.claim(").count(),
+        6,
+        "every path that takes a range goes through claim",
+    );
+}
+
+#[test]
+fn a_claim_over_published_ram_is_refused() {
+    let map = PhysMap::new();
+    insert_ram(&map, 0x1_0000_0000, 0x1_0000).unwrap();
+
+    let err = map.claim_ram(0x1_0000_0000, 0x1000).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    let past = map.claim_ram(0x1_0001_0000, 0x1000).unwrap();
+    assert_eq!(past.gpa(), 0x1_0001_0000);
+}
+
+#[test]
+fn a_segid_that_was_never_used_goes_back() {
+    let alloc = SegidAlloc::new(0);
+    let first = alloc.alloc().unwrap();
+    assert!(alloc.release(first));
+    assert_eq!(alloc.alloc(), Some(first));
+
+    // Only the last one handed out comes back.
+    let second = alloc.alloc().unwrap();
+    assert!(!alloc.release(first));
+    assert!(alloc.release(second));
+
+    // A release cannot push the counter past the kernel limit.
+    let full = SegidAlloc::new(VM_MAX_MEMSEGS);
+    assert_eq!(full.alloc(), None);
+    assert!(full.release(VM_MAX_MEMSEGS - 1));
+    assert_eq!(full.alloc(), Some(VM_MAX_MEMSEGS - 1));
+    assert!(!full.release(i32::MAX));
+}
+
+#[test]
+fn lookup_hands_out_the_tracked_view() {
+    // Every device write to guest RAM goes through `lookup`. The kernel
+    // marks a page dirty only when the write goes through the guest
+    // physical mapping, so a `lookup` that hands out the devmem mapping
+    // loses that page from a live migration.
+    let map = PhysMap::new();
+    map.add_region_split_anon(0, 0x2000).unwrap();
+
+    map.lookup(0, 4)
+        .unwrap()
+        .write_bytes(&[1, 2, 3, 4])
+        .unwrap();
+
+    let mut tracked = [0u8; 4];
+    map.lookup(0, 4).unwrap().read_bytes(&mut tracked).unwrap();
+    assert_eq!(tracked, [1, 2, 3, 4]);
+
+    // The two views of a split anonymous region do not alias, which is
+    // what lets a test tell them apart. A real VM maps the same pages
+    // twice, so both views read the same bytes there.
+    let mut direct = [0u8; 4];
+    map.lookup_untracked(0, 4)
+        .unwrap()
+        .read_bytes(&mut direct)
+        .unwrap();
+    assert_eq!(direct, [0, 0, 0, 0]);
+}
+
+#[test]
+fn the_boot_loaders_write_through_the_untracked_view() {
+    // `write_bulk` and `load_from_file` run before any vCPU starts, so
+    // they have nothing to report to migration and take the cheaper
+    // devmem mapping.
+    let map = Arc::new(PhysMap::new());
+    map.add_region_split_anon(0, 0x2000).unwrap();
+    let mem = MemCtx::new(Arc::clone(&map));
+
+    mem.write_bulk(0, &[7; 8]).unwrap();
+
+    let mut direct = [0u8; 8];
+    map.lookup_untracked(0, 8)
+        .unwrap()
+        .read_bytes(&mut direct)
+        .unwrap();
+    assert_eq!(direct, [7; 8]);
+
+    let mut tracked = [0u8; 8];
+    map.lookup(0, 8).unwrap().read_bytes(&mut tracked).unwrap();
+    assert_eq!(tracked, [0; 8]);
+}
+
+#[test]
+fn a_bulk_read_of_guest_memory_leaves_the_tracked_view_alone() {
+    // A read fault on the tracked mapping marks the page dirty, because
+    // `segvmm_fault_space` holds every page writable. The migration
+    // source reads all of RAM each pass, so a tracked read would report
+    // all of RAM dirty again and the migration would never converge.
+    let map = Arc::new(PhysMap::new());
+    map.add_region_split_anon(0, 0x2000).unwrap();
+    let mem = MemCtx::new(Arc::clone(&map));
+
+    map.lookup(0, 4)
+        .unwrap()
+        .write_bytes(&[9, 9, 9, 9])
+        .unwrap();
+    map.lookup_untracked(0, 4)
+        .unwrap()
+        .write_bytes(&[1, 2, 3, 4])
+        .unwrap();
+
+    let mut got = [0u8; 4];
+    mem.read(0, &mut got).unwrap();
+    assert_eq!(got, [1, 2, 3, 4]);
+}
+
+#[test]
+fn a_rom_region_stays_writable_through_lookup() {
+    // The guest cannot write a ROM, so there is nothing to track there,
+    // and the bootrom loader needs the writable view that `lookup` has
+    // always returned.
+    let map = PhysMap::new();
+    map.add_region_anon(0x1000, 0x1000, RegionKind::Rom)
+        .unwrap();
+
+    map.lookup(0x1000, 4)
+        .unwrap()
+        .write_bytes(&[1, 2, 3, 4])
+        .unwrap();
+
+    let mut got = [0u8; 4];
+    map.lookup_untracked(0x1000, 4)
+        .unwrap()
+        .read_bytes(&mut got)
+        .unwrap();
+    assert_eq!(got, [1, 2, 3, 4]);
+}
+
+#[test]
+fn lookup_answers_a_range_across_two_abutting_ram_regions() {
+    // Hot-added RAM abuts the region below it, and one slot abuts the
+    // next. A guest buffer over the seam is ordinary: `blk_rq_map_sg`
+    // merges physically adjacent pages into one scatter-gather entry.
+    // A `lookup` that refused it would make virtio-blk report a disk
+    // fault for legal memory.
+    let map = PhysMap::new();
+    insert_ram(&map, 0x1_0000_0000, 0x2000).unwrap();
+    insert_ram(&map, 0x1_0000_2000, 0x2000).unwrap();
+
+    let across = map
+        .lookup(0x1_0000_1000, 0x2000)
+        .expect("a buffer over the seam is legal memory");
+    across.write_bytes(&[0xAB; 0x2000]).unwrap();
+
+    // The bytes past the seam belong to the second region.
+    let mut got = [0u8; 4];
+    map.lookup(0x1_0000_2000, 4)
+        .unwrap()
+        .read_bytes(&mut got)
+        .unwrap();
+    assert_eq!(got, [0xAB; 4]);
+}
+
+#[test]
+fn a_region_added_later_joins_the_run_below_it() {
+    // Each hot-add slot abuts the one before it, so the run has to grow
+    // with every add and not only on the first.
+    let map = PhysMap::new();
+    insert_ram(&map, 0x1_0000_0000, 0x1000).unwrap();
+    insert_ram(&map, 0x1_0000_1000, 0x1000).unwrap();
+    insert_ram(&map, 0x1_0000_2000, 0x1000).unwrap();
+
+    assert!(map.lookup(0x1_0000_0000, 0x3000).is_some());
+    assert!(map.lookup(0x1_0000_0800, 0x2000).is_some());
+    // Nothing is mapped past the last region.
+    assert!(map.lookup(0x1_0000_2800, 0x1000).is_none());
+}
+
+#[test]
+fn a_region_added_below_a_run_takes_the_run_with_it() {
+    // Boot maps low memory first, but nothing promises that order.
+    let map = PhysMap::new();
+    insert_ram(&map, 0x1_0000_1000, 0x1000).unwrap();
+    insert_ram(&map, 0x1_0000_2000, 0x1000).unwrap();
+    insert_ram(&map, 0x1_0000_0000, 0x1000).unwrap();
+
+    assert!(map.lookup(0x1_0000_0000, 0x3000).is_some());
+}
+
+#[test]
+fn a_run_stops_at_a_region_of_another_kind() {
+    // Only RAM regions share one mapping. A ROM carries the guest's
+    // read-only protection and a reservation has no backing at all.
+    let map = PhysMap::new();
+    insert_ram(&map, 0x1_0000_0000, 0x1000).unwrap();
+    map.add_region_anon(0x1_0000_1000, 0x1000, RegionKind::Rom)
+        .unwrap();
+    insert_ram(&map, 0x1_0000_2000, 0x1000).unwrap();
+
+    assert!(map.lookup(0x1_0000_0800, 0x1000).is_none());
+    assert!(map.lookup(0x1_0000_1800, 0x1000).is_none());
+}
+
+#[test]
+fn the_untracked_view_stops_at_the_region_boundary() {
+    // The devmem mapping is one kernel memory segment. It cannot span
+    // two of them, so this view keeps the old bounds.
+    let map = PhysMap::new();
+    insert_ram(&map, 0x1_0000_0000, 0x1000).unwrap();
+    insert_ram(&map, 0x1_0000_1000, 0x1000).unwrap();
+
+    assert!(map.lookup(0x1_0000_0800, 0x1000).is_some());
+    assert!(map.lookup_untracked(0x1_0000_0800, 0x1000).is_none());
+}
+
+#[test]
+fn two_adds_of_abutting_ram_still_end_in_one_run() {
+    // The run is read and adopted under one gate. Two adds that both
+    // read the region list before either published would each build a
+    // run of one, and the seam between them would refuse a lookup.
+    let map = Arc::new(PhysMap::new());
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+
+    let handles: Vec<_> = [0x1_0000_1000u64, 0x1_0000_2000]
+        .into_iter()
+        .map(|gpa| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                insert_ram(&map, gpa, 0x1000)
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+
+    assert!(map.lookup(0x1_0000_1800, 0x1000).is_some());
 }

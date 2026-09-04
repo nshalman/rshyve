@@ -150,8 +150,7 @@ no VGA emulation to enable, so every value behaves the same.
 
 ## PCI Passthrough
 
-Requires PPT (PCI PassThrough) kernel driver. Works on both Intel
-(VT-d) and AMD (IOMMU) platforms.
+Needs the PPT (PCI PassThrough) kernel driver, and **Intel VT-d only**.
 
 ```
 -s 5,passthru,/dev/ppt0
@@ -159,6 +158,37 @@ Requires PPT (PCI PassThrough) kernel driver. Works on both Intel
 
 `-S` (wire memory) must be passed explicitly when using passthrough.
 Nothing adds it automatically, and `-A` is accepted but never read.
+
+### Limits
+
+**AMD hosts have no IOMMU backend.** `iommu_init()` asks for
+`misc/vmm_vtd` on an Intel host and `misc/vmm_amdvi` on an AMD one, but
+no `vmm_amdvi` module is built: the illumos tree has a `vmm_vtd` module
+directory and `VMM_VTD_OBJS` in `Makefile.files`, and neither has an AMD
+counterpart. The source carries the comment "Use the expected name for
+if/when this is ported". On an AMD host `ddi_modopen` fails and
+passthrough is unavailable.
+
+**A device that advertises MSI-X is refused at attach.** `PciPassthru`
+maps a whole BAR into the guest with EPT, and on an MSI-X device that
+BAR holds the physical MSI-X table. illumos VT-d remaps DMA but not
+interrupts, so a guest that writes that table makes the device raise a
+vector of its choice on the host APIC. Linux gates the same hole behind
+`allow_unsafe_interrupts`. This VMM refuses the device instead, with
+`device advertises MSI-X, which this VMM cannot isolate`. Most modern
+PCIe devices advertise MSI-X, so in practice passthrough is limited to
+devices with MSI or INTx.
+
+**Config-space writes are deny by default.** Only the command register,
+the six BARs, the interrupt line byte and the MSI capability have a
+handler. Every other write is logged and dropped, because the illumos
+PPT driver forwards `PPT_CFG_WRITE` to `pci_config_put32` with no filter
+of its own. A guest cannot drive PCIe DEVCTL Initiate FLR, move the
+device to D3 through PMCSR, or point the Expansion ROM BAR at host
+memory.
+
+**An I/O BAR decodes nothing.** The device registers no PIO handler, so
+guest port accesses to an I/O BAR reach neither hardware nor emulation.
 
 ## Filesystem
 

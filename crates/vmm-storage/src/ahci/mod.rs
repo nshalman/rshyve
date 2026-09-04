@@ -214,6 +214,18 @@ impl AhciCtrl {
         ctrl
     }
 
+    /// Unregister the recorded ABAR base and clear the record.
+    fn release_abar(&self, reg: &mut Option<u64>) {
+        if let Some(addr) = reg.take() {
+            if let Err(e) = self.bus_mmio.unregister(addr) {
+                slog::warn!(self.log, "ahci: MMIO unregister failed";
+                    "bar" => ?BarN::BAR5,
+                    "addr" => format!("{addr:#x}"),
+                    "error" => %e);
+            }
+        }
+    }
+
     fn update_mmio_registration(self: &Arc<Self>) {
         let pci = self.pci_state.lock().expect("ahci: pci lock");
         let mmio_enabled = pci
@@ -221,9 +233,7 @@ impl AhciCtrl {
             .contains(vmm_devices::pci::bits::RegCmd::MMIO_EN);
 
         let mut reg = self.registered_abar.lock().expect("ahci: abar reg lock");
-        if let Some(old_addr) = reg.take() {
-            let _ = self.bus_mmio.unregister(old_addr);
-        }
+        self.release_abar(&mut reg);
 
         if mmio_enabled {
             if let Some((def, addr)) = pci.bars().get(BarN::BAR5) {
@@ -234,8 +244,17 @@ impl AhciCtrl {
                         Arc::new(move |offset: usize, rwo: RWOp<'_>| {
                             dev.bar_rw(BarN::BAR5, offset, rwo);
                         });
-                    if self.bus_mmio.register(addr, size, handler).is_ok() {
-                        *reg = Some(addr);
+                    match self.bus_mmio.register(addr, size, handler) {
+                        Ok(()) => *reg = Some(addr),
+                        // The controller now decodes nothing on ABAR.
+                        Err(e) => {
+                            slog::error!(self.log,
+                                "ahci: MMIO register failed, ABAR dark";
+                                "bar" => ?BarN::BAR5,
+                                "addr" => format!("{addr:#x}"),
+                                "size" => size,
+                                "error" => %e);
+                        }
                     }
                 }
             }
@@ -484,6 +503,11 @@ impl PciDevice for AhciCtrl {
                 }
             }
         }
+    }
+
+    fn detach_regions(&self) {
+        let mut reg = self.registered_abar.lock().expect("ahci: abar reg lock");
+        self.release_abar(&mut reg);
     }
 }
 

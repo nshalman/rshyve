@@ -128,6 +128,147 @@ fn should_discard_once(rip: u64, last: &mut Option<u64>) -> bool {
     }
 }
 
+/// Everything a vCPU thread needs that is the same for every vCPU.
+///
+/// One value, cloned per thread, so a vCPU started after boot is given
+/// the same buses, handle and MSR handler as its siblings.
+#[derive(Clone)]
+pub struct VcpuThreadCtx {
+    pub bus_pio: Arc<PioBus>,
+    pub bus_mmio: Arc<MmioBus>,
+    pub hdl: Arc<VmmHdl>,
+    pub api_version: u32,
+    pub msr_handler: Option<Arc<dyn MsrHandler>>,
+}
+
+impl VcpuThreadCtx {
+    pub fn from_machine(
+        machine: &vmm_core::machine::Machine,
+        api_version: u32,
+        msr_handler: Option<Arc<dyn MsrHandler>>,
+    ) -> Self {
+        Self {
+            bus_pio: Arc::clone(machine.bus_pio()),
+            bus_mmio: Arc::clone(machine.bus_mmio()),
+            hdl: Arc::clone(machine.hdl()),
+            api_version,
+            msr_handler,
+        }
+    }
+}
+
+/// Holds a fresh vCPU thread outside the guest until the kernel has
+/// the CPU.
+///
+/// illumos has no `vm_deactivate_cpu`, so `VM_ACTIVATE_CPU` cannot be
+/// undone. The thread is therefore made and parked first, and
+/// activation is the last step of an add that can fail. Dropping the
+/// [`StartSignal`] instead of releasing it tells the parked thread to
+/// exit without ever entering the guest, which is the whole rollback.
+pub struct StartGate {
+    rx: mpsc::Receiver<()>,
+}
+
+impl StartGate {
+    /// Block until the caller releases the gate. False means the
+    /// signal was dropped and the thread must exit.
+    pub fn wait(self) -> bool {
+        self.rx.recv().is_ok()
+    }
+}
+
+/// The release side of a [`StartGate`].
+pub struct StartSignal {
+    tx: Sender<()>,
+}
+
+impl StartSignal {
+    /// Let the parked thread enter the guest. False means the thread
+    /// is already gone.
+    pub fn release(self) -> bool {
+        self.tx.send(()).is_ok()
+    }
+}
+
+/// Make a parked-thread gate and its release signal.
+pub fn start_gate() -> (StartSignal, StartGate) {
+    let (tx, rx) = mpsc::channel();
+    (StartSignal { tx }, StartGate { rx })
+}
+
+/// Spawn one vCPU thread and run the exit-dispatch loop in it.
+///
+/// With a `gate`, the thread parks until the caller releases it. That
+/// is what a hot-add uses: the spawn, which can fail, happens before
+/// the activation, which cannot be undone.
+pub fn spawn_one(
+    ctx: &VcpuThreadCtx,
+    vcpu_id: i32,
+    metrics: Arc<VcpuMetrics>,
+    events: Sender<VcpuEvent>,
+    gate: Option<StartGate>,
+    log: &Logger,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    let vcpu_log = log.new(slog::o!("vcpu" => vcpu_id));
+
+    let bus_pio = Arc::clone(&ctx.bus_pio);
+    let bus_mmio = Arc::clone(&ctx.bus_mmio);
+    let vmm_hdl = Arc::clone(&ctx.hdl);
+    let api_version = ctx.api_version;
+    let msr_handler = ctx.msr_handler.clone();
+    let thread_vcpu = Vcpu::new_for_thread(vcpu_id, Arc::clone(&ctx.hdl));
+
+    thread::Builder::new()
+        .name(format!("vcpu-{}", vcpu_id))
+        .spawn(move || {
+            if let Some(gate) = gate {
+                if !gate.wait() {
+                    debug!(vcpu_log, "vCPU thread released before entry");
+                    return;
+                }
+            }
+            vcpu_run_loop(
+                &thread_vcpu,
+                &bus_pio,
+                &bus_mmio,
+                &vmm_hdl,
+                api_version,
+                &metrics,
+                msr_handler.as_deref(),
+                &events,
+                &vcpu_log,
+            );
+        })
+}
+
+/// Spawn a thread for the whole boot set of vCPUs.
+///
+/// No thread parks: the boot set is activated before this call. The
+/// metrics are zipped, not indexed, so a short list cannot panic.
+pub fn spawn_boot_threads(
+    ctx: &VcpuThreadCtx,
+    vcpus: &[Vcpu],
+    vcpu_metrics: &[Arc<VcpuMetrics>],
+    events: &Sender<VcpuEvent>,
+    log: &Logger,
+) -> Vec<thread::JoinHandle<()>> {
+    vcpus
+        .iter()
+        .zip(vcpu_metrics.iter())
+        .map(|(vcpu, metrics)| {
+            spawn_one(
+                ctx,
+                vcpu.id(),
+                Arc::clone(metrics),
+                events.clone(),
+                None,
+                log,
+            )
+            .expect("failed to spawn vCPU thread")
+        })
+        .collect()
+}
+
 /// Spawn a thread for each vCPU and run the exit-dispatch loop.
 ///
 /// Returns a channel receiver for vCPU events and the join handles.
@@ -141,44 +282,15 @@ pub fn spawn_vcpu_threads(
     msr_handler: Option<Arc<dyn MsrHandler>>,
     log: &Logger,
 ) -> (mpsc::Receiver<VcpuEvent>, Vec<thread::JoinHandle<()>>) {
+    let ctx = VcpuThreadCtx {
+        bus_pio: Arc::clone(bus_pio),
+        bus_mmio: Arc::clone(bus_mmio),
+        hdl,
+        api_version,
+        msr_handler,
+    };
     let (tx, rx) = mpsc::channel();
-    let mut handles = Vec::with_capacity(vcpus.len());
-
-    for (idx, vcpu) in vcpus.iter().enumerate() {
-        let vcpu_id = vcpu.id();
-        let vcpu_log = log.new(slog::o!("vcpu" => vcpu_id));
-
-        // Clone Arcs for the thread
-        let bus_pio = Arc::clone(bus_pio);
-        let bus_mmio = Arc::clone(bus_mmio);
-        let metrics = Arc::clone(&vcpu_metrics[idx]);
-        let tx = tx.clone();
-        let vcpu_hdl = Arc::clone(vcpu.hdl());
-        let vmm_hdl = Arc::clone(&hdl);
-        let msr_handler = msr_handler.clone();
-
-        let thread_vcpu = Vcpu::new_for_thread(vcpu_id, vcpu_hdl);
-
-        let handle = thread::Builder::new()
-            .name(format!("vcpu-{}", vcpu_id))
-            .spawn(move || {
-                vcpu_run_loop(
-                    &thread_vcpu,
-                    &bus_pio,
-                    &bus_mmio,
-                    &vmm_hdl,
-                    api_version,
-                    &metrics,
-                    msr_handler.as_deref(),
-                    &tx,
-                    &vcpu_log,
-                );
-            })
-            .expect("failed to spawn vCPU thread");
-
-        handles.push(handle);
-    }
-
+    let handles = spawn_boot_threads(&ctx, vcpus, vcpu_metrics, &tx, log);
     (rx, handles)
 }
 
@@ -460,7 +572,11 @@ fn handle_wrmsr(
 
 #[cfg(test)]
 mod tests {
-    use super::should_discard_once;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::{should_discard_once, start_gate};
 
     #[test]
     fn instruction_is_discarded_once_per_repeating_rip() {
@@ -468,5 +584,44 @@ mod tests {
 
         assert!(should_discard_once(0x1234, &mut last));
         assert!(!should_discard_once(0x1234, &mut last));
+    }
+
+    #[test]
+    fn a_released_gate_lets_the_thread_enter() {
+        let (signal, gate) = start_gate();
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            tx.send(gate.wait()).expect("the test holds the receiver");
+        });
+
+        assert!(signal.release());
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+        worker.join().expect("gate thread should not panic");
+    }
+
+    #[test]
+    fn a_dropped_signal_makes_the_thread_exit() {
+        // This is the whole rollback for a failed add: there is no
+        // vm_deactivate_cpu, so the thread must never enter a guest
+        // whose CPU the kernel refused.
+        let (signal, gate) = start_gate();
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            tx.send(gate.wait()).expect("the test holds the receiver");
+        });
+
+        drop(signal);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(false));
+        worker.join().expect("gate thread should not panic");
+    }
+
+    #[test]
+    fn releasing_a_gate_whose_thread_is_gone_reports_false() {
+        // An activated CPU with no thread breaks the kernel halt
+        // count, so the caller has to hear about it.
+        let (signal, gate) = start_gate();
+        drop(gate);
+
+        assert!(!signal.release());
     }
 }

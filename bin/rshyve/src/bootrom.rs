@@ -24,6 +24,15 @@
 //!   0xFFFF_FFFF             └──────────────────┘
 //! ```
 //!
+//! # Segment budget
+//!
+//! The kernel gives one VM five memory segments. Low RAM, high RAM and
+//! a framebuffer already take four, so the firmware scratch RAM shares
+//! the ROM segment instead of taking a fifth. The two guest mappings
+//! cover disjoint parts of that segment, so no byte is reachable at two
+//! guest addresses. The segment this frees is what memory hot-add runs
+//! on.
+//!
 //! # Security
 //!
 //! The bootrom file is read from the host filesystem with the
@@ -48,13 +57,16 @@ pub const GUEST_4GIB: u64 = 0x1_0000_0000;
 pub const BOOTROM_WINDOW_MAX: usize = 16 * 1024 * 1024;
 
 /// Size of the SEC firmware temporary RAM region.
+///
 /// OVMF for bhyve uses memory below the ROM region for its PEI phase
-/// stack and heap during early boot (before main RAM discovery).
-/// We map 48 MiB of writable RAM from 0xFC000000 to 0xFEFFFFFF
-/// (immediately below the 16 MiB ROM at 0xFF000000).
-const SEC_TEMP_RAM_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+/// stack and heap during early boot, before it has found main RAM.
+const SEC_TEMP_RAM_SIZE: usize = 4 * 1024 * 1024;
 
 /// GPA base of the SEC temp RAM.
+///
+/// This is below the lowest address [`BOOTROM_WINDOW_MAX`] lets a flash
+/// layout reach, so the scratch RAM can never land on the ROM or on the
+/// variable store.
 const SEC_TEMP_RAM_GPA: u64 = 0xFCC0_0000;
 
 /// Maximum firmware file size (16 MiB, well beyond any UEFI image).
@@ -273,14 +285,17 @@ pub fn load_bootrom(
         layout.rom_size,
     );
 
-    // Add SEC temp RAM below the ROM for firmware PEI-phase stack/heap.
-    // This must be writable RAM — the firmware uses it for its temp
-    // stack before discovering and initializing main memory.
-    map.add_ram(hdl, SEC_TEMP_RAM_GPA, SEC_TEMP_RAM_SIZE)
-        .context("failed to map SEC temp RAM region")?;
-
-    map.add_rom(hdl, layout.rom_gpa, layout.rom_size)
-        .context("failed to map ROM region into guest address space")?;
+    // The scratch RAM rides in the tail of the ROM segment. It must be
+    // writable: the firmware puts its PEI phase stack there before it
+    // has found main memory. See the segment budget above.
+    map.add_rom_with_ram_tail(
+        hdl,
+        layout.rom_gpa,
+        layout.rom_size,
+        SEC_TEMP_RAM_GPA,
+        SEC_TEMP_RAM_SIZE,
+    )
+    .context("failed to map the ROM and its scratch RAM")?;
 
     let sub = map.lookup(layout.rom_gpa, layout.rom_size).ok_or_else(|| {
         anyhow::anyhow!(
@@ -470,6 +485,70 @@ mod tests {
         ] {
             let layout = compute_layout(rom_size, var_size).unwrap();
             assert_eq!(layout.rom_gpa + layout.rom_size as u64, GUEST_4GIB,);
+        }
+    }
+
+    /// Every layout `compute_layout` accepts, plus the extremes.
+    fn every_flash_layout() -> Vec<BootromLayout> {
+        let mut layouts: Vec<_> = [
+            (0x1E0000, 0),
+            (0x1E0000, 0x20000),
+            (0x37C000, 0x84000),
+            (0x100000, 0),
+            (0x1E0000, 0x40000),
+            (MIN_ROM_FILE_SIZE, 0),
+            (BOOTROM_WINDOW_MAX, 0),
+        ]
+        .into_iter()
+        .map(|(rom, var)| compute_layout(rom, var).unwrap())
+        .collect();
+        // The widest window the checks allow: the whole 16 MiB split
+        // between the ROM and its variable store.
+        layouts.push(
+            compute_layout(BOOTROM_WINDOW_MAX / 2, BOOTROM_WINDOW_MAX / 2)
+                .unwrap(),
+        );
+        layouts
+    }
+
+    #[test]
+    fn scratch_ram_never_reaches_the_flash_window() {
+        // The scratch RAM shares the ROM segment, so it must not sit on
+        // any address a flash layout can use.
+        let scratch_end = SEC_TEMP_RAM_GPA + SEC_TEMP_RAM_SIZE as u64;
+        for layout in every_flash_layout() {
+            let lowest = layout.var_gpa.unwrap_or(layout.rom_gpa);
+            assert!(
+                scratch_end <= lowest,
+                "scratch RAM ends at {scratch_end:#x}, flash starts at \
+                 {lowest:#x}",
+            );
+        }
+        // Which holds for any future layout too: the window can never
+        // start below this line.
+        assert!(scratch_end <= GUEST_4GIB - BOOTROM_WINDOW_MAX as u64);
+    }
+
+    #[test]
+    fn scratch_ram_is_a_whole_number_of_pages() {
+        // `vm_mmap_memseg` answers EINVAL for anything else, and the
+        // segment offset it is mapped at is the ROM length.
+        assert!(SEC_TEMP_RAM_GPA.is_multiple_of(4096));
+        assert!(SEC_TEMP_RAM_SIZE.is_multiple_of(4096));
+        assert!(SEC_TEMP_RAM_GPA
+            .checked_add(SEC_TEMP_RAM_SIZE as u64)
+            .is_some());
+    }
+
+    #[test]
+    fn the_rom_segment_holds_both_mappings() {
+        // One segment, two disjoint slices: the ROM at offset 0 and the
+        // scratch RAM past it. Neither byte is reachable twice.
+        for layout in every_flash_layout() {
+            let seg_len = layout.rom_size + SEC_TEMP_RAM_SIZE;
+            assert!(seg_len <= BOOTROM_WINDOW_MAX + SEC_TEMP_RAM_SIZE);
+            assert!(layout.rom_size <= seg_len - SEC_TEMP_RAM_SIZE);
+            assert!(i64::try_from(layout.rom_size).is_ok());
         }
     }
 

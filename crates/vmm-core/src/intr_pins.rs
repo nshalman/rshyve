@@ -286,69 +286,73 @@ impl IntrPin for IoApicPin {
     }
 }
 
-/// PCI interrupt pin routed through the i440fx/PIIX3 PIRQ mechanism.
-///
-/// Matches C bhyve's `pci_irq_assert()` behavior: calls
-/// `vm_isa_assert_irq(atpic_irq, ioapic_irq)` where:
-/// - `atpic_irq` is read dynamically from the PIR register (programmed
-///   by firmware at config offsets 0x60-0x63 of the LPC bridge)
-/// - `ioapic_irq` is fixed per device slot: `16 + (4 + slot + pin) % 8`
-///
-/// The PIR register is read at assertion time so that firmware can
-/// reprogram routing without invalidating existing pin handles.
-pub struct PciIntrPin {
-    /// Index into PIR registers (0-3), from `(slot + pin) % 4`.
-    pirq_idx: usize,
-    /// Fixed IOAPIC pin number: `16 + (4 + slot + pin) % 8`.
-    ioapic_irq: i32,
-    /// Shared PIR register state (from LPC bridge config space).
-    pir_regs: Arc<Mutex<[u8; 4]>>,
-    /// VM handle for kernel IRQ ioctls.
-    hdl: Arc<VmmHdl>,
-    /// Per-pin asserted state.
-    asserted: Mutex<bool>,
-    /// Logger for interrupt delivery errors.
-    log: slog::Logger,
-}
-
 /// PIR register bit 7: disable routing.
 const PIR_DISABLE: u8 = 0x80;
 /// PIR register bits 3:0: ISA IRQ number.
 const PIR_IRQ_MASK: u8 = 0x0F;
+/// Number of PIR routing registers (PIRQ A-D).
+const PIR_COUNT: usize = 4;
 
-impl PciIntrPin {
-    /// Create a new PCI interrupt pin for a device at the given slot.
-    ///
-    /// # Arguments
-    /// - `slot` - PCI device number (0-31)
-    /// - `pin` - INTx pin (0=INTA, 1=INTB, 2=INTC, 3=INTD)
-    /// - `pir_regs` - Shared reference to the LPC bridge PIR registers
-    /// - `hdl` - VM handle for kernel IRQ delivery
+/// Number of GSIs that PCI INTx routing can reach.
+const PCI_GSI_COUNT: usize = 8;
+/// First GSI in the PCI INTx range.
+const PCI_GSI_BASE: i32 = 16;
+
+/// Shared PCI INTx routing state for one chipset.
+///
+/// INTx routing aliases 8 ways (`16 + (4 + slot + pin) % 8`), so devices
+/// in different slots share a GSI. Like [`LegacyPIC`], each GSI keeps a
+/// shared level count, so a deassert from one device does not lower a
+/// line that another device still holds.
+pub struct PciIntrRoutes {
+    inner: Mutex<[Entry; PCI_GSI_COUNT]>,
+    /// Shared PIR register state (from LPC bridge config space).
+    pir_regs: Arc<Mutex<[u8; PIR_COUNT]>>,
+    /// VM handle for kernel IRQ ioctls. `None` in unit tests, which have
+    /// no kernel to deliver to.
+    hdl: Option<Arc<VmmHdl>>,
+    /// Logger for interrupt delivery errors.
+    log: slog::Logger,
+}
+
+impl PciIntrRoutes {
+    /// Create the routing state for a chipset.
     pub fn new(
-        slot: u8,
-        pin: u8,
-        pir_regs: Arc<Mutex<[u8; 4]>>,
+        pir_regs: Arc<Mutex<[u8; PIR_COUNT]>>,
         hdl: Arc<VmmHdl>,
         log: slog::Logger,
     ) -> Arc<Self> {
-        let pirq_idx = ((slot as usize) + (pin as usize)) % 4;
-        let ioapic_irq = 16 + ((4 + slot as i32 + pin as i32) % 8);
+        Self::build(pir_regs, Some(hdl), log)
+    }
+
+    fn build(
+        pir_regs: Arc<Mutex<[u8; PIR_COUNT]>>,
+        hdl: Option<Arc<VmmHdl>>,
+        log: slog::Logger,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            pirq_idx,
-            ioapic_irq,
+            inner: Mutex::new([Entry::default(); PCI_GSI_COUNT]),
             pir_regs,
             hdl,
-            asserted: Mutex::new(false),
             log,
         })
     }
 
-    /// Read the current ATPIC IRQ from the PIR register.
+    /// Create a pin handle for a device INTx pin.
+    ///
+    /// # Arguments
+    /// - `slot` - PCI device number (0-31)
+    /// - `pin` - INTx pin (0=INTA, 1=INTB, 2=INTC, 3=INTD)
+    pub fn pin_handle(self: &Arc<Self>, slot: u8, pin: u8) -> Arc<PciIntrPin> {
+        Arc::new(PciIntrPin::new(slot, pin, Arc::downgrade(self)))
+    }
+
+    /// Read the current ATPIC IRQ from a PIR register.
     ///
     /// Returns `Some(irq)` if the route is enabled, `None` if disabled.
-    fn atpic_irq(&self) -> Option<i32> {
+    fn atpic_irq(&self, pirq_idx: usize) -> Option<i32> {
         let pir = self.pir_regs.lock().expect("pir lock");
-        let val = pir[self.pirq_idx];
+        let val = pir[pirq_idx];
         if val & PIR_DISABLE != 0 {
             return None;
         }
@@ -359,6 +363,89 @@ impl PciIntrPin {
             None
         }
     }
+
+    /// Perform a PCI INTx operation, calling the kernel ioctl only on
+    /// level transitions of the shared GSI.
+    fn do_irq(&self, op: PinOp, pirq_idx: usize, line: usize) {
+        let mut lines = self.inner.lock().expect("PciIntrRoutes lock poisoned");
+        if !lines[line].process_op(&op) {
+            return;
+        }
+        let Some(hdl) = self.hdl.as_ref() else {
+            return;
+        };
+
+        let ioapic_irq = PCI_GSI_BASE + line as i32;
+        // The PIR register is read at delivery time so that firmware can
+        // reprogram routing without invalidating existing pin handles.
+        // A disabled route leaves the IOAPIC pin, which the guest kernel
+        // programs from the ACPI _PRT regardless of PIR.
+        let atpic_irq = self.atpic_irq(pirq_idx);
+        let result = match (&op, atpic_irq) {
+            (PinOp::Assert, Some(atpic)) => {
+                hdl.isa_assert_irq(atpic, ioapic_irq)
+            }
+            (PinOp::Deassert, Some(atpic)) => {
+                hdl.isa_deassert_irq(atpic, ioapic_irq)
+            }
+            (PinOp::Pulse, Some(atpic)) => hdl.isa_pulse_irq(atpic, ioapic_irq),
+            (PinOp::Assert, None) => hdl.ioapic_assert_irq(ioapic_irq),
+            (PinOp::Deassert, None) => hdl.ioapic_deassert_irq(ioapic_irq),
+            // The IOAPIC has no pulse ioctl, so raise and lower the pin.
+            (PinOp::Pulse, None) => hdl
+                .ioapic_assert_irq(ioapic_irq)
+                .and_then(|()| hdl.ioapic_deassert_irq(ioapic_irq)),
+        };
+        if let Err(e) = result {
+            slog::warn!(self.log, "failed to deliver PCI INTx";
+                "pirq_idx" => pirq_idx,
+                "atpic_irq" => atpic_irq,
+                "ioapic_irq" => ioapic_irq,
+                "error" => %e,
+            );
+        }
+    }
+
+    /// Shared level count of one GSI, for unit tests.
+    #[cfg(test)]
+    fn line_level(&self, line: usize) -> usize {
+        self.inner.lock().expect("PciIntrRoutes lock poisoned")[line].level
+    }
+}
+
+/// PCI interrupt pin routed through the i440fx/PIIX3 PIRQ mechanism.
+///
+/// Matches C bhyve's `pci_irq_assert()` behavior: calls
+/// `vm_isa_assert_irq(atpic_irq, ioapic_irq)` where:
+/// - `atpic_irq` is read dynamically from the PIR register (programmed
+///   by firmware at config offsets 0x60-0x63 of the LPC bridge)
+/// - `ioapic_irq` is fixed per device slot: `16 + (4 + slot + pin) % 8`
+///
+/// Tracks per-pin asserted state. The shared level count of the GSI
+/// lives in the parent [`PciIntrRoutes`], because slots 8 apart alias
+/// onto the same GSI. Holds a [`Weak`] reference to the parent so the
+/// chipset can be dropped independently.
+pub struct PciIntrPin {
+    /// Index into PIR registers (0-3), from `(slot + pin) % 4`.
+    pirq_idx: usize,
+    /// Index into the shared GSI table, from `(4 + slot + pin) % 8`.
+    line: usize,
+    /// Per-pin asserted state.
+    asserted: Mutex<bool>,
+    routes: Weak<PciIntrRoutes>,
+}
+
+impl PciIntrPin {
+    fn new(slot: u8, pin: u8, routes: Weak<PciIntrRoutes>) -> Self {
+        let pirq_idx = ((slot as usize) + (pin as usize)) % PIR_COUNT;
+        let line = (4 + slot as usize + pin as usize) % PCI_GSI_COUNT;
+        Self {
+            pirq_idx,
+            line,
+            asserted: Mutex::new(false),
+            routes,
+        }
+    }
 }
 
 impl IntrPin for PciIntrPin {
@@ -366,47 +453,105 @@ impl IntrPin for PciIntrPin {
         let mut asserted = self.asserted.lock().expect("pci pin lock");
         if !*asserted {
             *asserted = true;
-            match self.atpic_irq() {
-                Some(atpic_irq) => {
-                    // PIR enabled: route through both ATPIC and IOAPIC
-                    if let Err(e) =
-                        self.hdl.isa_assert_irq(atpic_irq, self.ioapic_irq)
-                    {
-                        slog::warn!(self.log, "assert PIRQ failed";
-                            "pirq_idx" => self.pirq_idx,
-                            "atpic_irq" => atpic_irq,
-                            "ioapic_irq" => self.ioapic_irq,
-                            "error" => %e,
-                        );
-                    }
-                }
-                None => {
-                    // PIR disabled (no firmware, or direct boot mode):
-                    // assert IOAPIC pin directly. The guest kernel
-                    // programs IOAPIC via ACPI _PRT regardless of PIR.
-                    // best-effort IRQ delivery via kernel ioctl
-                    let _ = self.hdl.ioapic_assert_irq(self.ioapic_irq);
-                }
+            if let Some(routes) = self.routes.upgrade() {
+                routes.do_irq(PinOp::Assert, self.pirq_idx, self.line);
             }
         }
     }
 
     fn deassert(&self) {
         let mut asserted = self.asserted.lock().expect("pci pin lock");
-        *asserted = false;
-        match self.atpic_irq() {
-            Some(atpic_irq) => {
-                // best-effort IRQ delivery via kernel ioctl
-                let _ = self.hdl.isa_deassert_irq(atpic_irq, self.ioapic_irq);
+        if *asserted {
+            *asserted = false;
+            if let Some(routes) = self.routes.upgrade() {
+                routes.do_irq(PinOp::Deassert, self.pirq_idx, self.line);
             }
-            None => {
-                // best-effort IRQ delivery via kernel ioctl
-                let _ = self.hdl.ioapic_deassert_irq(self.ioapic_irq);
+        }
+    }
+
+    fn pulse(&self) {
+        let asserted = self.asserted.lock().expect("pci pin lock");
+        if !*asserted {
+            if let Some(routes) = self.routes.upgrade() {
+                routes.do_irq(PinOp::Pulse, self.pirq_idx, self.line);
             }
         }
     }
 
     fn is_asserted(&self) -> bool {
         *self.asserted.lock().expect("pci pin lock")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Routes with no VM handle: only the shared level count runs.
+    fn test_routes() -> Arc<PciIntrRoutes> {
+        PciIntrRoutes::build(
+            Arc::new(Mutex::new([PIR_DISABLE; PIR_COUNT])),
+            None,
+            slog::Logger::root(slog::Discard, slog::o!()),
+        )
+    }
+
+    #[test]
+    fn a_single_pin_tracks_one_level() {
+        let routes = test_routes();
+        let pin = routes.pin_handle(3, 0);
+        assert!(!pin.is_asserted());
+
+        pin.assert();
+        pin.assert();
+        assert!(pin.is_asserted());
+        assert_eq!(routes.line_level(pin.line), 1);
+
+        pin.deassert();
+        pin.deassert();
+        assert!(!pin.is_asserted());
+        assert_eq!(routes.line_level(pin.line), 0);
+    }
+
+    #[test]
+    fn deassert_without_assert_leaves_the_line_low() {
+        let routes = test_routes();
+        let pin = routes.pin_handle(5, 0);
+        pin.deassert();
+        assert_eq!(routes.line_level(pin.line), 0);
+    }
+
+    #[test]
+    fn pins_on_the_same_gsi_share_the_line() {
+        let routes = test_routes();
+        // Slots 8 apart alias onto one GSI.
+        let a = routes.pin_handle(2, 0);
+        let b = routes.pin_handle(10, 0);
+        assert_eq!(a.line, b.line);
+
+        a.assert();
+        b.assert();
+        assert_eq!(routes.line_level(a.line), 2);
+
+        // One device deasserts, the other still holds the line.
+        a.deassert();
+        assert!(!a.is_asserted());
+        assert!(b.is_asserted());
+        assert_eq!(routes.line_level(a.line), 1);
+
+        b.deassert();
+        assert_eq!(routes.line_level(a.line), 0);
+    }
+
+    #[test]
+    fn pins_on_different_gsis_are_independent() {
+        let routes = test_routes();
+        let a = routes.pin_handle(2, 0);
+        let b = routes.pin_handle(3, 0);
+        assert_ne!(a.line, b.line);
+
+        a.assert();
+        assert_eq!(routes.line_level(a.line), 1);
+        assert_eq!(routes.line_level(b.line), 0);
     }
 }

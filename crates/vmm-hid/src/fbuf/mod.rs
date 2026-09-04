@@ -302,6 +302,17 @@ impl PciDevice for Framebuffer {
             }
         }
     }
+
+    fn detach_regions(&self) {
+        {
+            let mut reg =
+                self.registered_bar0.lock().expect("fbuf: bar reg lock");
+            self.release_mmio(&mut reg);
+        }
+        // BAR1 is a devmem segment, not a bus region, but it decodes
+        // guest addresses the same way.
+        self.remap_framebuffer(None);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +320,36 @@ impl PciDevice for Framebuffer {
 // ---------------------------------------------------------------------------
 
 impl Framebuffer {
+    /// Unregister the recorded BAR0 base and clear the record.
+    fn release_mmio(&self, reg: &mut Option<u64>) {
+        if let Some(addr) = reg.take() {
+            if let Err(e) = self.bus_mmio.unregister(addr) {
+                slog::warn!(self.log, "fbuf: MMIO unregister failed";
+                    "bar" => ?BarN::BAR0,
+                    "addr" => format!("{addr:#x}"),
+                    "error" => %e);
+            }
+        }
+    }
+
+    /// Move the framebuffer devmem mapping to `want`, or unmap it.
+    fn remap_framebuffer(&self, want: Option<u64>) {
+        if self.fb.mapped_gpa() == want {
+            return;
+        }
+        if let Err(e) = self.fb.unmap() {
+            slog::warn!(self.log, "fbuf: framebuffer unmap failed"; "error" => %e);
+        }
+        if let Some(gpa) = want {
+            if let Err(e) = self.fb.map_at(gpa) {
+                // The guest may transiently select a GPA that overlaps ROM
+                // while sizing the BAR, so a rejected mapping is not fatal.
+                slog::warn!(self.log, "fbuf: framebuffer map failed, BAR1 undecoded";
+                    "gpa" => format!("{gpa:#x}"), "error" => %e);
+            }
+        }
+    }
+
     /// Update BAR0 MMIO registration and the BAR1 devmem mapping.
     ///
     /// Called when the PCI command register or BAR addresses change.
@@ -320,9 +361,7 @@ impl Framebuffer {
             .contains(vmm_devices::pci::bits::RegCmd::MMIO_EN);
 
         let mut reg = self.registered_bar0.lock().expect("fbuf: bar reg lock");
-        if let Some(old_addr) = reg.take() {
-            let _ = self.bus_mmio.unregister(old_addr);
-        }
+        self.release_mmio(&mut reg);
         if mmio_enabled {
             if let Some((def, addr)) = pci.bars().get(BarN::BAR0) {
                 if addr != 0 && def.is_mmio() {
@@ -332,8 +371,17 @@ impl Framebuffer {
                         Arc::new(move |offset: usize, rwo: RWOp<'_>| {
                             dev.bar_rw(BarN::BAR0, offset, rwo);
                         });
-                    if self.bus_mmio.register(addr, size, handler).is_ok() {
-                        *reg = Some(addr);
+                    match self.bus_mmio.register(addr, size, handler) {
+                        Ok(()) => *reg = Some(addr),
+                        // The device now decodes nothing on BAR0.
+                        Err(e) => {
+                            slog::error!(self.log,
+                                "fbuf: MMIO register failed, BAR0 dark";
+                                "bar" => ?BarN::BAR0,
+                                "addr" => format!("{addr:#x}"),
+                                "size" => size,
+                                "error" => %e);
+                        }
                     }
                 }
             }
@@ -345,20 +393,7 @@ impl Framebuffer {
             .get(BarN::BAR1)
             .map(|(_, addr)| addr)
             .unwrap_or(0);
-        let want = bar1_target(mmio_enabled, bar1_addr);
-        if self.fb.mapped_gpa() != want {
-            if let Err(e) = self.fb.unmap() {
-                slog::warn!(self.log, "fbuf: framebuffer unmap failed"; "error" => %e);
-            }
-            if let Some(gpa) = want {
-                if let Err(e) = self.fb.map_at(gpa) {
-                    // The guest may transiently select a GPA that overlaps ROM
-                    // while sizing the BAR, so a rejected mapping is not fatal.
-                    slog::warn!(self.log, "fbuf: framebuffer map failed, BAR1 undecoded";
-                        "gpa" => format!("{gpa:#x}"), "error" => %e);
-                }
-            }
-        }
+        self.remap_framebuffer(bar1_target(mmio_enabled, bar1_addr));
     }
 }
 

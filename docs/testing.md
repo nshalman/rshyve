@@ -16,6 +16,8 @@ export VMM_PLATFORM_HOST=root@nuc0.example  # platform image test host
 export VMM_GUEST_IP=192.0.2.50              # test guest address
 export VMM_GUEST_GW=192.0.2.1               # test guest gateway
 export VMM_LAB_KEY=~/.ssh/id_lab            # SSH key for the lab hosts
+export VMM_FIREHYVE_HOST=root@tn0.example   # firehyve / virtio-fs test node
+export VMM_FIREHYVE_KEY=~/.ssh/id_lab       # SSH key for that node
 ```
 
 Host names in `ssh`/`rsync` commands below already include the user, so
@@ -29,6 +31,7 @@ they read `ssh $VMM_HEADNODE ...` rather than `ssh root@$VMM_HEADNODE`.
 | `$VMM_MIGRATE_HOST` | Cross-host migration peer | Older CPU: AVX2, no AVX-512 |
 | `$VMM_PLATFORM_HOST` | Platform image test | Runs a production platform image |
 | `$VMM_BUILD_HOST` | Platform image builds | Full autotools + OpenSSL toolchain |
+| `$VMM_FIREHYVE_HOST` | firehyve + virtio-fs tests | No compiler and no outbound network |
 
 ### Build on Headnode
 
@@ -213,6 +216,233 @@ Both headnode and nuc1 have `vmm_test0` VNICs with MAC `02:08:20:aa:bb:cc`.
 5. **SIGTERM test**: `kill -TERM <pid>` triggers ACPI poweroff
 6. **Metrics test**: `echo '{"command":"metrics"}' | socat - UNIX-CONNECT:/tmp/vmm-testvm.sock`
 7. **Windows boot test**: `tools/win-boot-test.sh start` then `wait 'Press any key to boot' 120` - see below
+8. **virtio-fs test**: `tools/virtiofs-stage.sh` then `virtiofs-run.sh` - see below
+9. **Hotplug test**: boot with `--hotplug`, then `cpu-add`, `mem-add` and `device-add` over the control socket or the vsock `CONTROL` verb - see below
+
+### virtio-fs Test
+
+Boots a microVM whose init mounts a virtio-fs share, checks it, and
+powers off. It needs a kernel with FUSE, which the fastboot kernel does
+not have: `kernel/virtiofs.config` layers the three options on
+`kernel/fastboot.config` and builds a variant, so the boot benchmarks
+keep measuring the same kernel.
+
+```bash
+cd kernel && KERNEL_EXTRA_CONFIG=virtiofs.config KERNEL_OUT_SUFFIX=-virtiofs ./build.sh
+```
+
+`$VMM_FIREHYVE_HOST` has no compiler, so build `firehyve` on the build
+host and let the staging script carry the binary over:
+
+```bash
+tools/remote-build.sh build -p firehyve
+scp -i $VMM_BUILD_KEY $VMM_BUILD_HOST:/opt/rust-bhyve/target/release/firehyve /tmp/firehyve
+
+VMM_FIREHYVE_BIN=/tmp/firehyve tools/virtiofs-stage.sh
+ssh -i $VMM_FIREHYVE_KEY $VMM_FIREHYVE_HOST /var/tmp/virtiofs-test/virtiofs-run.sh
+```
+
+The run script boots the VM twice: once on a read-write share, where
+every mutation must succeed, and once with `ro`, where every mutation
+must be refused with EROFS. Each check prints one `VFSTEST:` line and
+the run ends with `VIRTIOFS-TEST: PASS` or `FAIL`.
+
+`tools/virtiofs-test/src/checks.rs` and the fixture built by
+`tools/virtiofs-stage.sh` have to agree on file names, sizes and
+content. Change them together.
+
+To boot a container image as the guest root filesystem instead, stage
+one and run the `container` mode. The image is exported read-only and
+the guest supplies a tmpfs upper layer through overlayfs, so the run
+also checks afterwards that nothing reached the host export:
+
+```bash
+tools/virtiofs-container-stage.sh alpine:3.21
+ssh -i $VMM_FIREHYVE_KEY $VMM_FIREHYVE_HOST /var/tmp/virtiofs-test/virtiofs-run.sh container
+```
+
+The share holds `rootfs/` and `container.json`, the latter derived from
+the image's own OCI config at stage time, so the container cannot see or
+alter what it was told to run. `container` runs the harness checks
+inside the image; `entrypoint` runs the image's own command instead:
+
+```bash
+tools/virtiofs-container-stage.sh hello-world
+ssh -i $VMM_FIREHYVE_KEY $VMM_FIREHYVE_HOST /var/tmp/virtiofs-test/virtiofs-run.sh entrypoint
+```
+
+`entrypoint` is not part of `all`, because whether an image's command
+terminates is a property of the image: a server image runs until the
+timeout, which is correct rather than a failure.
+
+The harness also attaches virtio-rnd and virtio-vsock beside the share,
+so one boot covers all three devices. The vsock check dials host port
+5555 and requires its bytes back from a `socat` echo server the run
+script starts on `<socket>_5555`, which exercises both directions and
+the guest-initiated connect path. The bulk case pushes 512 KiB through,
+which is larger than one RX chain and larger than a connection's credit
+window, so it only passes if splitting, credit and backpressure all
+work. Run it repeatedly: the ordering defect it caught failed roughly
+one run in four.
+
+### Guest kernel comparison
+
+`tools/virtiofs-bench.sh <runs> <kernel>...` boots each kernel through
+the read-write check set and reports boot time and I/O time. The guest
+also prints `boot_to_init_us` from CLOCK_MONOTONIC, which needs no
+console on the command line, and its `/proc/interrupts` lines for the
+device, which name the interrupt path in use.
+
+Boot time is dominated by printk to the serial console: the same kernel
+reaches init in about 172 ms with `console=ttyS0` and about 42 ms with
+`quiet loglevel=0`. Compare like with like, and note the zone's own
+command line carries no `console=`.
+
+### Hotplug Test
+
+`tools/virtiofs-stage.sh` stages `tools/hotplug-run.sh` next to the
+guest kernel and initramfs, and that script runs the whole test:
+
+```bash
+ssh -i $VMM_FIREHYVE_KEY $VMM_FIREHYVE_HOST \
+  'cd /var/tmp/virtiofs-test && VMM_HOTPLUG_DISK=<zvol or file> ./hotplug-run.sh all'
+```
+
+It boots the VM, waits for the guest to record the hardware it already
+has, hot-adds a disk, a CPU and memory, and exits non-zero unless the
+guest reports that it read the new disk, ran a thread on the new CPU and
+counted the new memory. `hotplug-run.sh disk|cpu|mem` runs one resource.
+`VMM_HOTPLUG_DISK` has no default: the disk is on the operator's own
+node, it is read and never written, and it must not be in use by another
+VM.
+
+The manual steps below are the fallback, for a resource or a transport
+the script does not drive, and for rshyve, which the script does not
+cover. They run on `$VMM_FIREHYVE_HOST` for firehyve or `$VMM_HEADNODE`
+for rshyve.
+
+#### Guest kernel
+
+The guest needs the ACPI hotplug drivers, which `fastboot.config` turns
+off. `kernel/hotplug.config` layers them back on and sets SMP itself, so
+the boot benchmarks keep measuring the same kernel:
+
+```bash
+cd kernel && KERNEL_EXTRA_CONFIG="vsock.config hotplug.config" \
+  KERNEL_OUT_SUFFIX=-hotplug ./build.sh
+```
+
+`vsock.config` is layered as well so one kernel also carries the guest
+side of a vsock check. The `CONTROL` verb itself is answered by the VMM
+and needs no guest driver, so a guest with no `AF_VSOCK` still takes
+hotplug commands.
+
+Do not add `smp.config` on top. `hotplug.config` already sets `CONFIG_SMP`
+and `CONFIG_NR_CPUS`, and layering both makes `NR_CPUS` depend on
+fragment order.
+
+#### Host reservoir
+
+Memory hot-add needs the VMM reservoir populated, and the VMM refuses
+`-o hotplug.maxmem` without `-S` for the same reason:
+
+```bash
+ssh -i $VMM_FIREHYVE_KEY $VMM_FIREHYVE_HOST '/usr/lib/rsrvrctl -c 512 -a 2048'
+```
+
+A hot-add runs `VM_ALLOC_MEMSEG` on a live VM, and that ioctl takes the
+kernel write lock, which freezes every vCPU until it returns. Out of the
+reservoir the call only splits spans of an already-populated pool and
+costs 3 to 4 microseconds at any size. Without the reservoir the same
+call creates and zeroes every page inside the lock, about 400 ms per
+GiB, which the guest sees as a stall.
+
+Read the counters back with `rsrvrctl` (its own usage output names the
+query flag) before and after a `mem-add`. That is the check that the add
+really took host memory: free and allocated must move by exactly the
+size added.
+
+A node whose reservoir has no free space fails VM create with ENOMEM as
+soon as `-S` is given, which is why `tools/virtiofs-run.sh` leaves `-S`
+off. Size the reservoir first, or that VM never boots.
+
+#### Boot a hotplug VM
+
+```bash
+ssh -i $VMM_FIREHYVE_KEY $VMM_FIREHYVE_HOST 'nohup /var/tmp/firehyve \
+  -S --hotplug \
+  -c cpus=2,maxcpus=8 -m 1G \
+  -o hotplug.maxmem=2G -o hotplug.memslot=512M \
+  -s 4,virtio-blk,<disk image> \
+  -s 9,virtio-vsock,/var/tmp/hp/guest.sock,cid=3 \
+  --kernel /var/tmp/hp/vmlinux-fastboot-hotplug \
+  --initrd <initramfs> --cmdline "console=ttyS0" \
+  hptest > /var/tmp/hp/vm.log 2>&1 < /dev/null &'
+```
+
+The boot log should carry `Allowing 2 present CPUs plus 6 hotplug CPUs`,
+`ACPI: Enabled 3 GPEs in block 00 to 0F`, and one `acpiphp` line per
+slot from 2 to 31, with no ACPI error. `-c cpus=N,maxcpus=M` with `M`
+equal to `N` publishes no CPU slots at all, which is the usual reason
+`cpu-add` answers that the VM has none.
+
+#### Drive it from the host
+
+firehyve takes the commands on the vsock host socket. Send `CONTROL`
+first, then one command per line:
+
+```bash
+ssh -i $VMM_FIREHYVE_KEY $VMM_FIREHYVE_HOST \
+  "printf 'CONTROL\ncpu-list\n' | socat - UNIX-CONNECT:/var/tmp/hp/guest.sock"
+ssh -i $VMM_FIREHYVE_KEY $VMM_FIREHYVE_HOST \
+  "printf 'CONTROL\ncpu-add 2\nmem-add 536870912\n' | socat - UNIX-CONNECT:/var/tmp/hp/guest.sock"
+ssh -i $VMM_FIREHYVE_KEY $VMM_FIREHYVE_HOST \
+  "printf 'CONTROL\ndevice-add 5,virtio-blk,<disk image>\n' | socat - UNIX-CONNECT:/var/tmp/hp/guest.sock"
+```
+
+rshyve takes the same commands as JSON on its control socket:
+
+```bash
+ssh $VMM_HEADNODE 'echo "{\"command\":\"cpu-list\"}" | socat - UNIX-CONNECT:/tmp/vmm-testvm.sock'
+ssh $VMM_HEADNODE 'echo "{\"command\":\"cpu-add\",\"id\":2}" | socat - UNIX-CONNECT:/tmp/vmm-testvm.sock'
+ssh $VMM_HEADNODE 'echo "{\"command\":\"mem-add\",\"bytes\":536870912}" | socat - UNIX-CONNECT:/tmp/vmm-testvm.sock'
+ssh $VMM_HEADNODE 'echo "{\"command\":\"device-add\",\"spec\":\"5,virtio-blk,/dev/zvol/rdsk/zones/d1\"}" | socat - UNIX-CONNECT:/tmp/vmm-testvm.sock'
+```
+
+`mem-add` takes BYTES on both transports, not the `-m` size grammar, and
+rounds up to a whole `hotplug.memslot`.
+
+#### Check the guest took it
+
+```bash
+nproc; cat /sys/devices/system/cpu/cpu2/online
+grep MemTotal /proc/meminfo
+ls /sys/bus/pci/slots; lspci
+dmesg | grep -i 'acpi\|hotplug' | tail -20
+```
+
+A `device-remove` is only a request. The guest has to run `_EJ0`, and a
+guest that never does leaves the slot in `remove-pending` for the life
+of the VM with no host state changed, which `device-list` reports.
+`cpu-remove` and `mem-remove` are always refused: illumos has no
+`vm_deactivate_cpu` and no `VM_FREE_MEMSEG`.
+
+#### Two gotchas that cost real time
+
+- **illumos has no `timeout(1)`.** A remote `timeout 30 ...` fails with
+  "not found", and the failure reads like a hotplug failure rather than
+  a missing command. Poll with a `for i in $(seq 1 30); do ...; sleep 1;
+  done` loop, the way the boot poll above does.
+- **firehyve rejects `-l com1,null`.** It serves COM1 on `stdio` only,
+  and any other backend is a startup error rather than a warning. COM1 is
+  attached either way and its output goes to the process stdout, so leave
+  the flag off (or pass `-l com1,stdio`) and redirect the process, as the
+  boot command above does with `> vm.log 2>&1 < /dev/null`.
+
+Tear the VM down by name, `bhyvectl --destroy --vm=hptest`, and kill
+only the process you started. The test nodes are shared, so a pattern
+kill such as `pkill -f 'firehyv[e]'` reaches every VM on the box and not
+just yours. `tools/hotplug-run.sh` destroys by name for that reason.
 
 ### Windows Boot Test
 

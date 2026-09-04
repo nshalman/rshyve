@@ -15,7 +15,8 @@ use vmm_core::msr::MsrHandler;
 use vmm_core::vcpu::Vcpu;
 use vmm_devices::metrics::VcpuMetrics;
 
-use crate::vcpu_tasks::{self, VcpuEvent};
+use crate::teardown::VcpuThreads;
+use crate::vcpu_tasks::{self, VcpuEvent, VcpuThreadCtx};
 
 /// The boot-strap processor. Every other vCPU is an application
 /// processor and waits for a SIPI from this one.
@@ -60,24 +61,40 @@ pub fn activate_all_vcpus(
     vmexit_on_hlt: bool,
 ) -> anyhow::Result<()> {
     for vcpu in machine.vcpus() {
-        vcpu.activate().with_context(|| {
-            format!("failed to activate vCPU {}", vcpu.id())
-        })?;
-
-        if vmexit_on_hlt {
-            machine
-                .hdl()
-                .set_capability(
-                    vcpu.id(),
-                    bhyve_api::vm_cap_type::VM_CAP_HALT_EXIT as i32,
-                    1,
-                )
-                .with_context(|| {
-                    format!("failed to set HALT_EXIT on vCPU {}", vcpu.id())
-                })?;
-        }
+        activate_one(vcpu, vmexit_on_hlt)?;
     }
     Ok(())
+}
+
+/// Bring one vCPU online: activate it, then set its capabilities.
+///
+/// The bulk boot path is this, in a loop. A vCPU added while the guest
+/// runs sets the capability FIRST and activates last, because
+/// `VM_ACTIVATE_CPU` has no inverse. See [`crate::vcpus::VcpuRegistry`].
+pub fn activate_one(vcpu: &Vcpu, vmexit_on_hlt: bool) -> anyhow::Result<()> {
+    vcpu.activate()
+        .with_context(|| format!("failed to activate vCPU {}", vcpu.id()))?;
+    set_halt_exit(vcpu, vmexit_on_hlt)
+}
+
+/// Set `VM_CAP_HALT_EXIT` on one vCPU, or leave it alone.
+///
+/// `vm_set_capability` does not ask whether the vCPU is active
+/// (`vmm.c:3225`), so a hot-add can run this before the activation it
+/// cannot undo.
+pub fn set_halt_exit(vcpu: &Vcpu, vmexit_on_hlt: bool) -> anyhow::Result<()> {
+    if !vmexit_on_hlt {
+        return Ok(());
+    }
+    vcpu.hdl()
+        .set_capability(
+            vcpu.id(),
+            bhyve_api::vm_cap_type::VM_CAP_HALT_EXIT as i32,
+            1,
+        )
+        .with_context(|| {
+            format!("failed to set HALT_EXIT on vCPU {}", vcpu.id())
+        })
 }
 
 /// Which vCPUs the UEFI boot path resets.
@@ -145,6 +162,28 @@ pub fn check_aps_awaiting_sipi(machine: &Machine, log: &Logger) {
     }
 }
 
+/// The running vCPU set, plus everything needed to grow it.
+///
+/// [`spawn_vcpus`] keeps returning the three boot-path pieces. A
+/// binary that wants CPU hot-add asks for the fleet instead, and hands
+/// `sender`, `threads` and `ctx` to a [`crate::vcpus::VcpuRegistry`].
+pub struct VcpuFleet {
+    /// The event channel the run loop reads.
+    pub events: mpsc::Receiver<VcpuEvent>,
+    /// A sender for a thread started later.
+    ///
+    /// Holding this keeps the channel open, so an event loop over a
+    /// fleet cannot use the channel closing to mean "every thread has
+    /// gone". `VcpuSet::Roster` asks the roster instead.
+    pub sender: mpsc::Sender<VcpuEvent>,
+    /// The join handles, which the registry adds to.
+    pub threads: Arc<VcpuThreads>,
+    /// Per-vCPU metrics for the boot set, in id order.
+    pub metrics: Vec<Arc<VcpuMetrics>>,
+    /// What a thread started later needs.
+    pub ctx: VcpuThreadCtx,
+}
+
 /// Spawn per-vCPU threads and return the event channel, the join
 /// handles, and the per-vCPU metrics.
 ///
@@ -161,24 +200,55 @@ pub fn spawn_vcpus(
     Vec<JoinHandle<()>>,
     Vec<Arc<VcpuMetrics>>,
 ) {
+    let fleet =
+        spawn_vcpu_fleet(machine, num_cpus, api_version, msr_handler, log);
+
+    // A fixed set cannot grow, so the spare sender goes. The event
+    // loop then reads "every thread has gone" off the channel closing,
+    // as it did before the roster existed.
+    drop(fleet.sender);
+    (fleet.events, fleet.threads.close(), fleet.metrics)
+}
+
+/// The same spawn, keeping the parts a later vCPU needs.
+pub fn spawn_vcpu_fleet(
+    machine: &Machine,
+    num_cpus: u32,
+    api_version: u32,
+    msr_handler: Option<Arc<dyn MsrHandler>>,
+    log: &Logger,
+) -> VcpuFleet {
     info!(log, "starting vCPU threads");
 
-    let vcpu_metrics: Vec<Arc<VcpuMetrics>> = (0..num_cpus)
+    let metrics: Vec<Arc<VcpuMetrics>> = (0..num_cpus)
         .map(|_| Arc::new(VcpuMetrics::new()))
         .collect();
 
-    let (event_rx, handles) = vcpu_tasks::spawn_vcpu_threads(
-        machine.vcpus(),
-        machine.bus_pio(),
-        machine.bus_mmio(),
-        machine.hdl().clone(),
-        api_version,
-        &vcpu_metrics,
-        msr_handler,
-        log,
-    );
+    let ctx = VcpuThreadCtx::from_machine(machine, api_version, msr_handler);
+    let (sender, events) = mpsc::channel();
+    let threads = VcpuThreads::new();
 
-    (event_rx, handles, vcpu_metrics)
+    for handle in vcpu_tasks::spawn_boot_threads(
+        &ctx,
+        machine.vcpus(),
+        &metrics,
+        &sender,
+        log,
+    ) {
+        // A roster is only closed by teardown, and teardown cannot run
+        // before the threads it joins were made.
+        threads
+            .push(handle)
+            .expect("a fresh roster accepts every boot thread");
+    }
+
+    VcpuFleet {
+        events,
+        sender,
+        threads,
+        metrics,
+        ctx,
+    }
 }
 
 #[cfg(test)]

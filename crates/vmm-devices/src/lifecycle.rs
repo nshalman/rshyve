@@ -22,6 +22,9 @@
 //! import state before starting.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::migrate::Migrator;
 
@@ -220,12 +223,27 @@ pub trait Lifecycle: Send + Sync + 'static {
     fn restore_nvme_state(&self, _state: &NvmeMigrateState) {}
 }
 
+/// A transition the [`IndicatedState`] machine does not allow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidTransition {
+    pub from: IndicatedState,
+    pub to: IndicatedState,
+}
+
 /// Indicator for tracking [`Lifecycle`] states.
 ///
 /// Provides atomic state tracking with transition validation.
-/// Invalid transitions cause a panic in debug builds and are logged
-/// (but not fatal) in release builds, since a state machine violation
-/// in a VMM is a serious bug that should be caught during development.
+///
+/// Two families of mutators share one validated core:
+///
+/// * [`Indicator::start`], [`Indicator::pause`], [`Indicator::resume`] and
+///   [`Indicator::halt`] panic on an illegal edge. Use them where the
+///   caller owns the device and the current state, such as construction,
+///   migration import and the ordered teardown path. There a bad edge is a
+///   programming error and must not stay silent.
+/// * [`Indicator::try_transition`] returns [`InvalidTransition`] instead.
+///   Use it where the state is decided by the guest or the operator, such
+///   as a runtime unplug. There a bad edge must not kill the VMM.
 #[derive(Default)]
 pub struct Indicator(AtomicUsize);
 
@@ -234,18 +252,22 @@ impl Indicator {
         Self(AtomicUsize::new(IndicatedState::Init as usize))
     }
 
+    /// Panics unless the device is in `Init` or `Pause`.
     pub fn start(&self) {
         self.transition(IndicatedState::Run);
     }
 
+    /// Panics unless the device is in `Init` or `Run`.
     pub fn pause(&self) {
         self.transition(IndicatedState::Pause);
     }
 
+    /// Panics unless the device is in `Pause`.
     pub fn resume(&self) {
         self.transition(IndicatedState::Run);
     }
 
+    /// Panics unless the device is in `Pause`.
     pub fn halt(&self) {
         self.transition(IndicatedState::Halt);
     }
@@ -259,15 +281,17 @@ impl Indicator {
     /// Uses compare_exchange to ensure atomicity: the old state is
     /// validated before the new state is stored, preventing the
     /// swap-then-validate race in the original implementation.
-    fn transition(&self, new: IndicatedState) {
+    pub fn try_transition(
+        &self,
+        new: IndicatedState,
+    ) -> Result<(), InvalidTransition> {
         loop {
             let old_raw = self.0.load(Ordering::Acquire);
             let old = IndicatedState::from_usize(old_raw);
 
-            assert!(
-                IndicatedState::valid_transition(old, new),
-                "invalid lifecycle transition: {old:?} -> {new:?}",
-            );
+            if !IndicatedState::valid_transition(old, new) {
+                return Err(InvalidTransition { from: old, to: new });
+            }
 
             match self.0.compare_exchange_weak(
                 old_raw,
@@ -275,11 +299,17 @@ impl Indicator {
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => return Ok(()),
                 // Another thread changed the state between our load and
                 // CAS — retry with the new value.
                 Err(_) => continue,
             }
+        }
+    }
+
+    fn transition(&self, new: IndicatedState) {
+        if let Err(InvalidTransition { from, to }) = self.try_transition(new) {
+            panic!("invalid lifecycle transition: {from:?} -> {to:?}");
         }
     }
 }
@@ -330,9 +360,86 @@ impl IndicatedState {
     }
 }
 
+/// Poll interval while an unplug waits for a device to go quiet.
+const UNPLUG_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Failure to make a device safe to remove.
+///
+/// Both variants leave the device paused and NOT halted, so the caller can
+/// retry [`prepare_unplug`] or leave the device attached.
+#[derive(Debug)]
+pub enum UnplugError {
+    /// The device still had work in flight when the budget expired.
+    NotQuiesced { device: &'static str },
+    /// The device could not flush its backing store.
+    Flush {
+        device: &'static str,
+        source: FlushError,
+    },
+}
+
+/// Make a device safe to detach at runtime, then halt it.
+///
+/// Pauses the device, waits up to `budget` for its background work to
+/// drain, flushes the backing store best effort, and halts. The halt only
+/// happens after the device reports quiescence, so an unplug never tears
+/// in-flight DMA out from under the guest. There is no force path.
+///
+/// The pause is conditional because `Pause -> Pause` is an illegal edge and
+/// panics an [`Indicator`] backed device. A device in `Init` is expected:
+/// nothing in the tree calls [`Lifecycle::start`], so an Indicator backed
+/// device stays in `Init` for the life of the VM. `Init -> Pause` is legal.
+pub fn prepare_unplug(
+    dev: &Arc<dyn Lifecycle>,
+    budget: Duration,
+) -> Result<(), UnplugError> {
+    let device = dev.type_name();
+    let state = dev.lifecycle_state();
+
+    // A halted device gave up its resources already. Repeating the pause or
+    // the halt hits an illegal edge, so report success instead.
+    if state == Some(IndicatedState::Halt) {
+        return Ok(());
+    }
+
+    if state != Some(IndicatedState::Pause) {
+        dev.pause();
+    }
+
+    if !wait_device_quiesced(dev.as_ref(), budget) {
+        return Err(UnplugError::NotQuiesced { device });
+    }
+
+    dev.flush_backing(FlushIntent::BestEffort)
+        .map_err(|source| UnplugError::Flush { device, source })?;
+
+    dev.halt();
+    Ok(())
+}
+
+/// Poll `is_quiesced` against a deadline.
+///
+/// The poll must not block: [`Lifecycle::is_quiesced`] is an atomic load, and
+/// this loop sleeps between loads so the budget stays enforceable.
+fn wait_device_quiesced(dev: &dyn Lifecycle, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if dev.is_quiesced() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        thread::sleep(UNPLUG_POLL_INTERVAL.min(deadline - now));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn valid_transitions() {
@@ -373,5 +480,214 @@ mod tests {
         let ind = Indicator::new();
         ind.start();
         ind.halt(); // Run -> Halt is not valid (must pause first)
+    }
+
+    const ALL_STATES: [IndicatedState; 4] = [
+        IndicatedState::Init,
+        IndicatedState::Run,
+        IndicatedState::Pause,
+        IndicatedState::Halt,
+    ];
+
+    fn indicator_in(state: IndicatedState) -> Indicator {
+        let ind = Indicator::new();
+        match state {
+            IndicatedState::Init => {}
+            IndicatedState::Run => ind.start(),
+            IndicatedState::Pause => ind.pause(),
+            IndicatedState::Halt => {
+                ind.pause();
+                ind.halt();
+            }
+        }
+        assert_eq!(ind.state(), state);
+        ind
+    }
+
+    #[test]
+    fn try_transition_rejects_every_illegal_edge() {
+        for from in ALL_STATES {
+            for to in ALL_STATES {
+                let ind = indicator_in(from);
+                let result = ind.try_transition(to);
+
+                if IndicatedState::valid_transition(from, to) {
+                    assert!(result.is_ok(), "{from:?} -> {to:?}");
+                    assert_eq!(ind.state(), to);
+                } else {
+                    assert_eq!(
+                        result.expect_err("illegal edge must not be taken"),
+                        InvalidTransition { from, to },
+                    );
+                    assert_eq!(ind.state(), from, "{from:?} -> {to:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn try_transition_reports_run_to_halt_without_panicking() {
+        let ind = indicator_in(IndicatedState::Run);
+
+        let error = ind
+            .try_transition(IndicatedState::Halt)
+            .expect_err("Run -> Halt is not a legal edge");
+
+        assert_eq!(error.from, IndicatedState::Run);
+        assert_eq!(error.to, IndicatedState::Halt);
+        assert_eq!(ind.state(), IndicatedState::Run);
+    }
+
+    struct UnplugTestDevice {
+        indicator: Indicator,
+        quiesced: AtomicBool,
+        pauses: AtomicUsize,
+        halts: AtomicUsize,
+        flushes: AtomicUsize,
+        flush_fails: bool,
+    }
+
+    impl UnplugTestDevice {
+        fn new(quiesced: bool) -> Self {
+            Self {
+                indicator: Indicator::new(),
+                quiesced: AtomicBool::new(quiesced),
+                pauses: AtomicUsize::new(0),
+                halts: AtomicUsize::new(0),
+                flushes: AtomicUsize::new(0),
+                flush_fails: false,
+            }
+        }
+
+        fn count(counter: &AtomicUsize) -> usize {
+            counter.load(Ordering::Acquire)
+        }
+    }
+
+    impl Lifecycle for UnplugTestDevice {
+        fn type_name(&self) -> &'static str {
+            "unplug-test"
+        }
+
+        fn lifecycle_state(&self) -> Option<IndicatedState> {
+            Some(self.indicator.state())
+        }
+
+        fn is_quiesced(&self) -> bool {
+            self.quiesced.load(Ordering::Acquire)
+        }
+
+        fn start(&self) -> anyhow::Result<()> {
+            self.indicator.start();
+            Ok(())
+        }
+
+        fn pause(&self) {
+            self.pauses.fetch_add(1, Ordering::AcqRel);
+            self.indicator.pause();
+        }
+
+        fn halt(&self) {
+            self.halts.fetch_add(1, Ordering::AcqRel);
+            self.indicator.halt();
+        }
+
+        fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
+            assert_eq!(intent, FlushIntent::BestEffort);
+            self.flushes.fetch_add(1, Ordering::AcqRel);
+            if self.flush_fails {
+                return Err(FlushError::NotQuiesced(self.type_name()));
+            }
+            Ok(())
+        }
+    }
+
+    const UNPLUG_BUDGET: Duration = Duration::from_millis(50);
+
+    #[test]
+    fn unplug_halts_a_running_device_that_quiesces() {
+        let device = Arc::new(UnplugTestDevice::new(true));
+        device.start().expect("start unplug test device");
+        let dev: Arc<dyn Lifecycle> = device.clone();
+
+        prepare_unplug(&dev, UNPLUG_BUDGET).expect("unplug quiesced device");
+
+        assert_eq!(UnplugTestDevice::count(&device.pauses), 1);
+        assert_eq!(UnplugTestDevice::count(&device.flushes), 1);
+        assert_eq!(UnplugTestDevice::count(&device.halts), 1);
+        assert_eq!(device.indicator.state(), IndicatedState::Halt);
+    }
+
+    #[test]
+    fn unplug_handles_a_device_that_never_started() {
+        let device = Arc::new(UnplugTestDevice::new(true));
+        assert_eq!(device.indicator.state(), IndicatedState::Init);
+        let dev: Arc<dyn Lifecycle> = device.clone();
+
+        prepare_unplug(&dev, UNPLUG_BUDGET).expect("unplug device in Init");
+
+        assert_eq!(UnplugTestDevice::count(&device.pauses), 1);
+        assert_eq!(device.indicator.state(), IndicatedState::Halt);
+    }
+
+    #[test]
+    fn unplug_does_not_pause_an_already_paused_device() {
+        let device = Arc::new(UnplugTestDevice::new(true));
+        device.pause();
+        let dev: Arc<dyn Lifecycle> = device.clone();
+
+        prepare_unplug(&dev, UNPLUG_BUDGET).expect("unplug paused device");
+
+        assert_eq!(UnplugTestDevice::count(&device.pauses), 1);
+        assert_eq!(device.indicator.state(), IndicatedState::Halt);
+    }
+
+    #[test]
+    fn unplug_leaves_a_stuck_device_running() {
+        let device = Arc::new(UnplugTestDevice::new(false));
+        device.start().expect("start unplug test device");
+        let dev: Arc<dyn Lifecycle> = device.clone();
+        let started = Instant::now();
+
+        let error = prepare_unplug(&dev, UNPLUG_BUDGET)
+            .expect_err("a device with in-flight work must not be halted");
+
+        assert!(matches!(
+            error,
+            UnplugError::NotQuiesced {
+                device: "unplug-test"
+            }
+        ));
+        assert!(started.elapsed() < UNPLUG_BUDGET * 4);
+        assert_eq!(UnplugTestDevice::count(&device.flushes), 0);
+        assert_eq!(UnplugTestDevice::count(&device.halts), 0);
+        assert_eq!(device.indicator.state(), IndicatedState::Pause);
+    }
+
+    #[test]
+    fn unplug_does_not_halt_a_device_whose_flush_failed() {
+        let mut device = UnplugTestDevice::new(true);
+        device.flush_fails = true;
+        let device = Arc::new(device);
+        let dev: Arc<dyn Lifecycle> = device.clone();
+
+        let error = prepare_unplug(&dev, UNPLUG_BUDGET)
+            .expect_err("a failed flush must not halt the device");
+
+        assert!(matches!(error, UnplugError::Flush { .. }));
+        assert_eq!(UnplugTestDevice::count(&device.halts), 0);
+        assert_eq!(device.indicator.state(), IndicatedState::Pause);
+    }
+
+    #[test]
+    fn unplug_of_a_halted_device_is_idempotent() {
+        let device = Arc::new(UnplugTestDevice::new(true));
+        let dev: Arc<dyn Lifecycle> = device.clone();
+        prepare_unplug(&dev, UNPLUG_BUDGET).expect("first unplug");
+
+        prepare_unplug(&dev, UNPLUG_BUDGET).expect("second unplug");
+
+        assert_eq!(UnplugTestDevice::count(&device.halts), 1);
+        assert_eq!(UnplugTestDevice::count(&device.flushes), 1);
     }
 }

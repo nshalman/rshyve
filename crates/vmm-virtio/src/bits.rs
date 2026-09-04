@@ -236,6 +236,8 @@ pub const VIRTIO_DEV_TYPE_RNG: u16 = 4;
 pub const VIRTIO_DEV_TYPE_BALLOON: u16 = 5;
 /// Filesystem device (virtio-fs). VirtIO 1.3 section 5.11.
 pub const VIRTIO_DEV_TYPE_FS: u16 = 26;
+/// virtio-vsock (VIRTIO 1.3 5.10). Modern id only, like virtio-fs.
+pub const VIRTIO_DEV_TYPE_VSOCK: u16 = 19;
 
 // ---------------------------------------------------------------------------
 // Transitional PCI device IDs (virtio 1.3 section 4.1.2.1)
@@ -275,14 +277,33 @@ pub const fn transitional_device_id(dev_type: u16) -> u16 {
 
 /// Give the PCI (class, subclass) pair to advertise for `dev_type`.
 ///
-/// A console is a communication device. Windows picks the driver from
-/// the device id, but the class decides how the guest groups the device
-/// in its device tree.
+/// A console is a communication device, and virtio-fs is storage/other,
+/// which is what QEMU's vhost-user-fs-pci reports. Windows picks the
+/// driver from the device id, but the class decides how the guest groups
+/// the device in its device tree.
+///
+/// A device must not be left unclassified. Linux refuses to assign BARs
+/// to a device whose class is 0 (`__dev_sort_resources` skips
+/// `PCI_CLASS_NOT_DEFINED`), so on a direct kernel boot, where no
+/// firmware has already placed the BARs, the driver cannot enable the
+/// device at all.
 pub const fn pci_class_for(dev_type: u16) -> (u8, u8) {
     match dev_type {
         VIRTIO_DEV_TYPE_NET => (vmm_devices::pci::bits::CLASS_NETWORK, 0),
         VIRTIO_DEV_TYPE_BLOCK => (vmm_devices::pci::bits::CLASS_STORAGE, 0),
         VIRTIO_DEV_TYPE_CONSOLE => (
+            vmm_devices::pci::bits::CLASS_COMMUNICATION,
+            vmm_devices::pci::bits::SUBCLASS_COMMUNICATION_OTHER,
+        ),
+        VIRTIO_DEV_TYPE_FS => (
+            vmm_devices::pci::bits::CLASS_STORAGE,
+            vmm_devices::pci::bits::SUBCLASS_STORAGE_OTHER,
+        ),
+        // 0xFF, matching QEMU's virtio-rng-pci and the class the legacy
+        // virtio table gives virtio-entropy.
+        VIRTIO_DEV_TYPE_RNG => (vmm_devices::pci::bits::CLASS_OTHERS, 0),
+        // Communication/other, matching QEMU's vhost-vsock-pci.
+        VIRTIO_DEV_TYPE_VSOCK => (
             vmm_devices::pci::bits::CLASS_COMMUNICATION,
             vmm_devices::pci::bits::SUBCLASS_COMMUNICATION_OTHER,
         ),
@@ -385,10 +406,52 @@ mod tests {
             pci_class_for(VIRTIO_DEV_TYPE_NET),
             (vmm_devices::pci::bits::CLASS_NETWORK, 0)
         );
-        // virtio-fs has no class of its own.
         assert_eq!(
-            pci_class_for(26),
-            (vmm_devices::pci::bits::CLASS_UNCLASSIFIED, 0)
+            pci_class_for(VIRTIO_DEV_TYPE_FS),
+            (
+                vmm_devices::pci::bits::CLASS_STORAGE,
+                vmm_devices::pci::bits::SUBCLASS_STORAGE_OTHER
+            )
         );
+        assert_eq!(
+            pci_class_for(VIRTIO_DEV_TYPE_RNG),
+            (vmm_devices::pci::bits::CLASS_OTHERS, 0)
+        );
+        assert_eq!(
+            pci_class_for(VIRTIO_DEV_TYPE_VSOCK),
+            (
+                vmm_devices::pci::bits::CLASS_COMMUNICATION,
+                vmm_devices::pci::bits::SUBCLASS_COMMUNICATION_OTHER
+            )
+        );
+    }
+
+    #[test]
+    fn vsock_uses_the_modern_device_id() {
+        // 0x1040 + 19. vsock has no transitional id of its own.
+        assert_eq!(transitional_device_id(VIRTIO_DEV_TYPE_VSOCK), 0x1053);
+    }
+
+    /// Linux skips a device whose class is 0 when it assigns BARs, so an
+    /// unclassified device cannot be enabled on a direct kernel boot,
+    /// where no firmware has placed the BARs already. Every device type
+    /// either catalog can attach must therefore carry a class.
+    #[test]
+    fn no_attachable_device_type_is_unclassified() {
+        for dev_type in [
+            VIRTIO_DEV_TYPE_NET,
+            VIRTIO_DEV_TYPE_BLOCK,
+            VIRTIO_DEV_TYPE_CONSOLE,
+            VIRTIO_DEV_TYPE_FS,
+            VIRTIO_DEV_TYPE_RNG,
+            VIRTIO_DEV_TYPE_VSOCK,
+        ] {
+            let (class, _) = pci_class_for(dev_type);
+            assert_ne!(
+                class,
+                vmm_devices::pci::bits::CLASS_UNCLASSIFIED,
+                "device type {dev_type} has no PCI class"
+            );
+        }
     }
 }

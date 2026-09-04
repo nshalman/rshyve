@@ -35,6 +35,10 @@ use super::pci::VirtioPciDevice;
 use super::rng::VirtioRng;
 use super::viona;
 use super::viona::VirtioViona;
+use super::vsock::device::{
+    VirtioVsock, VSOCK_MSIX_VECTORS, VSOCK_NUM_QUEUES, VSOCK_QUEUE_SIZE,
+    VSOCK_RX_QUEUE,
+};
 
 /// Machine-owned handles every virtio device needs. Field types match
 /// `PciDeviceCtx`'s so a catalog builds one by plain reference borrow.
@@ -331,6 +335,56 @@ pub fn virtio_fs(
         Some(Arc::new(move |queue_idx: u16| {
             if let Some(dev) = pci_weak.upgrade() {
                 dev.raise_queue_interrupt_for(queue_idx);
+            }
+        }));
+
+    Ok(pci_dev)
+}
+
+/// Build a virtio-vsock device and its PCI transport.
+///
+/// Ordering is load-bearing: the interrupt slot is cloned before the
+/// device moves into the transport, and the `Weak` back-reference is
+/// filled in after `VirtioPciDevice::new` returns.
+pub fn virtio_vsock(
+    socket_path: &Path,
+    guest_cid: u64,
+    lintr: Option<LintrCfg>,
+    ctx: &VirtioAttachCtx<'_>,
+    log: &slog::Logger,
+) -> anyhow::Result<Arc<VirtioPciDevice<VirtioVsock>>> {
+    let vsock = VirtioVsock::new(
+        socket_path,
+        guest_cid,
+        Arc::clone(ctx.physmap),
+        log.clone(),
+    )?;
+    let cfg_size = vsock.config_size();
+    let vsock_intr = vsock.interrupt();
+
+    let msix =
+        Arc::new(MsixTable::new(VSOCK_MSIX_VECTORS, Arc::clone(ctx.hdl)));
+
+    let pci_dev = VirtioPciDevice::new(
+        vsock,
+        bits::VIRTIO_DEV_TYPE_VSOCK,
+        VSOCK_NUM_QUEUES,
+        VSOCK_QUEUE_SIZE,
+        cfg_size,
+        lintr,
+        Arc::clone(ctx.physmap),
+        Arc::clone(ctx.bus_pio),
+        Arc::clone(ctx.bus_mmio),
+        Some(msix),
+    );
+
+    // Only the receive queue completes out of band; the transport
+    // raises for the transmit queue on its own.
+    let pci_weak = Arc::downgrade(&pci_dev);
+    *vsock_intr.lock().expect("virtio-vsock interrupt lock") =
+        Some(Arc::new(move || {
+            if let Some(dev) = pci_weak.upgrade() {
+                dev.raise_queue_interrupt_for(VSOCK_RX_QUEUE);
             }
         }));
 

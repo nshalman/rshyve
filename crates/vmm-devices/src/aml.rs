@@ -660,9 +660,103 @@ impl Aml {
     }
 }
 
+// ── acpi_tables bridge ──────────────────────────────────────────────
+
+/// Sink for `acpi_tables` objects, so one can be emitted inside an
+/// existing builder closure.
+///
+/// This is additive only. `acpi_tables` narrows every integer to the
+/// smallest legal width while the emitters above hold a fixed width,
+/// so replacing an emitter with a crate equivalent would move the
+/// shipping DSDT bytes.
+impl acpi_tables::AmlSink for Aml {
+    fn byte(&mut self, byte: u8) {
+        self.buf.push(byte);
+    }
+
+    fn vec(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+}
+
+// ── Structural validator (tests only) ───────────────────────────────
+
+// Opcodes the validator understands but the builder above does not
+// emit yet. ACPI 6.5, section 20.3.
+#[cfg(test)]
+mod opcode {
+    pub const ONES: u8 = 0xFF;
+    pub const LOCAL0: u8 = 0x60;
+    pub const ARG6: u8 = 0x6E;
+    pub const REF_OF: u8 = 0x71;
+    pub const ADD: u8 = 0x72;
+    pub const CONCAT: u8 = 0x73;
+    pub const SUBTRACT: u8 = 0x74;
+    pub const INCREMENT: u8 = 0x75;
+    pub const DECREMENT: u8 = 0x76;
+    pub const MULTIPLY: u8 = 0x77;
+    pub const DIVIDE: u8 = 0x78;
+    pub const SHIFT_LEFT: u8 = 0x79;
+    pub const SHIFT_RIGHT: u8 = 0x7A;
+    pub const AND: u8 = 0x7B;
+    pub const NAND: u8 = 0x7C;
+    pub const OR: u8 = 0x7D;
+    pub const NOR: u8 = 0x7E;
+    pub const XOR: u8 = 0x7F;
+    pub const NOT: u8 = 0x80;
+    pub const DEREF_OF: u8 = 0x83;
+    pub const NOTIFY: u8 = 0x86;
+    pub const SIZE_OF: u8 = 0x87;
+    pub const INDEX: u8 = 0x88;
+    pub const CREATE_DWORD_FIELD: u8 = 0x8A;
+    pub const CREATE_WORD_FIELD: u8 = 0x8B;
+    pub const CREATE_BYTE_FIELD: u8 = 0x8C;
+    pub const CREATE_BIT_FIELD: u8 = 0x8D;
+    pub const CREATE_QWORD_FIELD: u8 = 0x8F;
+    pub const LAND: u8 = 0x90;
+    pub const LOR: u8 = 0x91;
+    pub const LNOT: u8 = 0x92;
+    pub const LGREATER: u8 = 0x94;
+    pub const LLESS: u8 = 0x95;
+    pub const TO_BUFFER: u8 = 0x96;
+    pub const TO_HEX_STRING: u8 = 0x98;
+    pub const TO_INTEGER: u8 = 0x99;
+    pub const CONTINUE: u8 = 0x9F;
+    pub const ELSE: u8 = 0xA1;
+    pub const WHILE: u8 = 0xA2;
+    pub const NOOP: u8 = 0xA3;
+    pub const BREAK: u8 = 0xA5;
+    pub const BREAK_POINT: u8 = 0xCC;
+
+    // Second byte of an extended (0x5B) opcode.
+    pub const EXT_MUTEX: u8 = 0x01;
+    pub const EXT_CREATE_FIELD: u8 = 0x13;
+    pub const EXT_ACQUIRE: u8 = 0x23;
+    pub const EXT_RELEASE: u8 = 0x27;
+    pub const EXT_DEBUG: u8 = 0x31;
+    pub const EXT_OP_REGION: u8 = 0x80;
+    pub const EXT_FIELD: u8 = 0x81;
+    pub const EXT_INDEX_FIELD: u8 = 0x87;
+
+    // FieldElement leads that are not a NameSeg.
+    pub const FIELD_RESERVED: u8 = 0x00;
+    pub const FIELD_ACCESS: u8 = 0x01;
+    pub const FIELD_CONNECT: u8 = 0x02;
+    pub const FIELD_EXT_ACCESS: u8 = 0x03;
+}
+
+/// Re-parse emitted AML and check that every PkgLength closes exactly.
+///
+/// A malformed PkgLength hangs the guest inside ACPICA, so an opcode
+/// the walker does not know is an error, never a skip.
 #[cfg(test)]
 pub(crate) fn walk_aml(buf: &[u8]) -> Result<(), String> {
-    let mut walker = AmlWalker { buf, pos: 0 };
+    let mut walker = AmlWalker {
+        buf,
+        pos: 0,
+        methods: collect_methods(buf),
+        collect: false,
+    };
     walker.walk_terms(buf.len())?;
     if walker.pos != buf.len() {
         return Err(format!(
@@ -674,10 +768,62 @@ pub(crate) fn walk_aml(buf: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Record every method declaration before the validating pass, because
+/// a call can come earlier in the byte stream than its declaration.
+#[cfg(test)]
+fn collect_methods(buf: &[u8]) -> MethodTable {
+    let mut collector = AmlWalker {
+        buf,
+        pos: 0,
+        methods: MethodTable::default(),
+        collect: true,
+    };
+    // A failure here is not reported: the validating pass walks the
+    // same bytes and gives the real diagnostic. Declarations found
+    // before the failure still help that pass.
+    if collector.walk_terms(buf.len()).is_err() {
+        return collector.methods;
+    }
+    collector.methods
+}
+
+/// Declared argument count for each method, keyed by its last NameSeg.
+///
+/// The walker does not build a namespace, so a NameSeg declared twice
+/// with different arities holds `None` and is refused at its call site
+/// instead of guessing.
+#[cfg(test)]
+#[derive(Default)]
+struct MethodTable {
+    by_seg: std::collections::BTreeMap<[u8; 4], Option<u8>>,
+}
+
+#[cfg(test)]
+impl MethodTable {
+    fn declare(&mut self, name: [u8; 4], args: u8) {
+        self.by_seg
+            .entry(name)
+            .and_modify(|slot| {
+                if *slot != Some(args) {
+                    *slot = None;
+                }
+            })
+            .or_insert(Some(args));
+    }
+
+    fn arity(&self, name: &[u8; 4]) -> Option<Option<u8>> {
+        self.by_seg.get(name).copied()
+    }
+}
+
 #[cfg(test)]
 struct AmlWalker<'a> {
     buf: &'a [u8],
     pos: usize,
+    methods: MethodTable,
+    /// Record method declarations and step over their bodies. A body
+    /// cannot be parsed until every arity is known.
+    collect: bool,
 }
 
 #[cfg(test)]
@@ -695,6 +841,13 @@ impl AmlWalker<'_> {
         Ok(byte)
     }
 
+    fn peek(&self, end: usize) -> Result<u8, String> {
+        if self.pos >= end || self.pos >= self.buf.len() {
+            return Err(self.fail("unexpected end of input"));
+        }
+        Ok(self.buf[self.pos])
+    }
+
     fn skip(&mut self, count: usize, end: usize) -> Result<(), String> {
         let next = self
             .pos
@@ -707,9 +860,12 @@ impl AmlWalker<'_> {
         Ok(())
     }
 
-    fn package_end(&mut self, enclosing_end: usize) -> Result<usize, String> {
-        let start = self.pos;
-        let lead = self.read_byte(enclosing_end)?;
+    /// Decode a PkgLength field and return the value it holds.
+    ///
+    /// Used on its own by FieldElement, where the value is a bit count
+    /// and encloses nothing.
+    fn pkg_length(&mut self, end: usize) -> Result<usize, String> {
+        let lead = self.read_byte(end)?;
         let follow = usize::from(lead >> 6);
         if follow > 0 && lead & 0x30 != 0 {
             return Err(self.fail("reserved PkgLength bits are set"));
@@ -721,11 +877,16 @@ impl AmlWalker<'_> {
             usize::from(lead & 0x0f)
         };
         for index in 0..follow {
-            let byte = usize::from(self.read_byte(enclosing_end)?);
+            let byte = usize::from(self.read_byte(end)?);
             length |= byte << (4 + index * 8);
         }
+        Ok(length)
+    }
 
-        let encoded_size = follow + 1;
+    fn package_end(&mut self, enclosing_end: usize) -> Result<usize, String> {
+        let start = self.pos;
+        let length = self.pkg_length(enclosing_end)?;
+        let encoded_size = self.pos - start;
         if length < encoded_size {
             return Err(self.fail("PkgLength ends inside its own encoding"));
         }
@@ -738,24 +899,60 @@ impl AmlWalker<'_> {
         Ok(package_end)
     }
 
-    fn name_string(&mut self, end: usize) -> Result<(), String> {
+    fn is_name_char(byte: u8, lead: bool) -> bool {
+        byte == b'_'
+            || byte.is_ascii_uppercase()
+            || (!lead && byte.is_ascii_digit())
+    }
+
+    /// Read one 4-character NameSeg.
+    ///
+    /// The character check is what makes an unknown opcode an error:
+    /// without it the walker would consume four arbitrary bytes and
+    /// call the result a name.
+    fn name_seg(&mut self, end: usize) -> Result<[u8; 4], String> {
+        let start = self.pos;
+        self.skip(4, end)?;
+        let mut seg = [0u8; 4];
+        seg.copy_from_slice(&self.buf[start..self.pos]);
+        let valid = Self::is_name_char(seg[0], true)
+            && seg[1..].iter().all(|byte| Self::is_name_char(*byte, false));
+        if !valid {
+            self.pos = start;
+            return Err(self.fail("malformed NameSeg"));
+        }
+        Ok(seg)
+    }
+
+    /// Read a NameString and return its last NameSeg, which is what
+    /// identifies a method call. A NullName returns `None`.
+    fn name_string(&mut self, end: usize) -> Result<Option<[u8; 4]>, String> {
         while self.pos < end && matches!(self.buf[self.pos], 0x5c | 0x5e) {
             self.pos += 1;
         }
-        let lead = self.read_byte(end)?;
-        match lead {
-            0x00 => Ok(()),
-            0x2e => self.skip(8, end),
-            0x2f => {
-                let segments = usize::from(self.read_byte(end)?);
-                self.skip(
-                    segments
-                        .checked_mul(4)
-                        .ok_or_else(|| self.fail("NameString overflow"))?,
-                    end,
-                )
+        match self.peek(end)? {
+            0x00 => {
+                self.pos += 1;
+                Ok(None)
             }
-            _ => self.skip(3, end),
+            AML_DUAL_NAME_PREFIX => {
+                self.pos += 1;
+                self.name_seg(end)?;
+                Ok(Some(self.name_seg(end)?))
+            }
+            AML_MULTI_NAME_PREFIX => {
+                self.pos += 1;
+                let segments = usize::from(self.read_byte(end)?);
+                if segments == 0 {
+                    return Err(self.fail("MultiName holds no segments"));
+                }
+                let mut last = [0u8; 4];
+                for _ in 0..segments {
+                    last = self.name_seg(end)?;
+                }
+                Ok(Some(last))
+            }
+            _ => Ok(Some(self.name_seg(end)?)),
         }
     }
 
@@ -764,6 +961,7 @@ impl AmlWalker<'_> {
         let width = match opcode {
             AML_ZERO_OP => return Ok(0),
             AML_ONE_OP => return Ok(1),
+            opcode::ONES => return Ok(u64::MAX),
             AML_BYTE_PREFIX => 1,
             AML_WORD_PREFIX => 2,
             AML_DWORD_PREFIX => 4,
@@ -779,13 +977,31 @@ impl AmlWalker<'_> {
         Ok(value)
     }
 
+    fn is_data_lead(opcode: u8) -> bool {
+        matches!(
+            opcode,
+            AML_ZERO_OP
+                | AML_ONE_OP
+                | opcode::ONES
+                | AML_BYTE_PREFIX
+                | AML_WORD_PREFIX
+                | AML_DWORD_PREFIX
+                | AML_QWORD_PREFIX
+                | AML_STRING_PREFIX
+                | AML_PACKAGE_OP
+                | AML_BUFFER_OP
+        )
+    }
+
     fn data_object(&mut self, end: usize) -> Result<(), String> {
-        if self.pos >= end {
-            return Err(self.fail("missing data object"));
-        }
-        match self.buf[self.pos] {
-            AML_ZERO_OP | AML_ONE_OP | AML_BYTE_PREFIX | AML_WORD_PREFIX
-            | AML_DWORD_PREFIX | AML_QWORD_PREFIX => {
+        match self.peek(end)? {
+            AML_ZERO_OP
+            | AML_ONE_OP
+            | opcode::ONES
+            | AML_BYTE_PREFIX
+            | AML_WORD_PREFIX
+            | AML_DWORD_PREFIX
+            | AML_QWORD_PREFIX => {
                 self.integer(end)?;
                 Ok(())
             }
@@ -802,7 +1018,7 @@ impl AmlWalker<'_> {
                 let package_end = self.package_end(end)?;
                 let elements = usize::from(self.read_byte(package_end)?);
                 for _ in 0..elements {
-                    self.data_object(package_end)?;
+                    self.package_element(package_end)?;
                 }
                 if self.pos != package_end {
                     return Err(
@@ -828,25 +1044,248 @@ impl AmlWalker<'_> {
         }
     }
 
-    fn term_arg(&mut self, end: usize) -> Result<(), String> {
-        if self.pos >= end {
-            return Err(self.fail("missing term argument"));
+    /// A package element is a data object or a plain name reference.
+    fn package_element(&mut self, end: usize) -> Result<(), String> {
+        if Self::is_data_lead(self.peek(end)?) {
+            return self.data_object(end);
         }
-        match self.buf[self.pos] {
-            AML_ZERO_OP | AML_ONE_OP | AML_BYTE_PREFIX | AML_WORD_PREFIX
-            | AML_DWORD_PREFIX | AML_QWORD_PREFIX | AML_STRING_PREFIX
-            | AML_PACKAGE_OP | AML_BUFFER_OP => self.data_object(end),
-            AML_LEQUAL_OP => {
+        self.name_string(end)?;
+        Ok(())
+    }
+
+    fn term_arg(&mut self, end: usize) -> Result<(), String> {
+        let opcode = self.peek(end)?;
+        if Self::is_data_lead(opcode) {
+            return self.data_object(end);
+        }
+        if (opcode::LOCAL0..=opcode::ARG6).contains(&opcode) {
+            self.pos += 1;
+            return Ok(());
+        }
+        self.expression(end)
+    }
+
+    /// A SuperName: a local, an argument, the debug object, a
+    /// reference expression, or a plain name.
+    fn super_name(&mut self, end: usize) -> Result<(), String> {
+        let opcode = self.peek(end)?;
+        if (opcode::LOCAL0..=opcode::ARG6).contains(&opcode) {
+            self.pos += 1;
+            return Ok(());
+        }
+        match opcode {
+            AML_EXT_PREFIX => {
                 self.pos += 1;
+                if self.read_byte(end)? != opcode::EXT_DEBUG {
+                    return Err(self.fail("expected the debug object"));
+                }
+                Ok(())
+            }
+            opcode::REF_OF | opcode::DEREF_OF | opcode::INDEX => {
+                self.expression(end)
+            }
+            _ => {
+                self.name_string(end)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// A Target: a SuperName, or NullName for "discard the result".
+    fn target(&mut self, end: usize) -> Result<(), String> {
+        if self.peek(end)? == 0x00 {
+            self.pos += 1;
+            return Ok(());
+        }
+        self.super_name(end)
+    }
+
+    fn expression(&mut self, end: usize) -> Result<(), String> {
+        let start = self.pos;
+        let opcode = self.read_byte(end)?;
+        match opcode {
+            AML_STORE_OP => {
+                self.term_arg(end)?;
+                self.super_name(end)
+            }
+            opcode::REF_OF
+            | opcode::SIZE_OF
+            | opcode::INCREMENT
+            | opcode::DECREMENT => self.super_name(end),
+            opcode::DEREF_OF | opcode::LNOT => self.term_arg(end),
+            opcode::NOT
+            | opcode::TO_BUFFER
+            | opcode::TO_HEX_STRING
+            | opcode::TO_INTEGER => {
+                self.term_arg(end)?;
+                self.target(end)
+            }
+            opcode::ADD
+            | opcode::CONCAT
+            | opcode::SUBTRACT
+            | opcode::MULTIPLY
+            | opcode::SHIFT_LEFT
+            | opcode::SHIFT_RIGHT
+            | opcode::AND
+            | opcode::NAND
+            | opcode::OR
+            | opcode::NOR
+            | opcode::XOR
+            | opcode::INDEX => {
+                self.term_arg(end)?;
+                self.term_arg(end)?;
+                self.target(end)
+            }
+            opcode::DIVIDE => {
+                self.term_arg(end)?;
+                self.term_arg(end)?;
+                self.target(end)?;
+                self.target(end)
+            }
+            AML_LEQUAL_OP
+            | opcode::LAND
+            | opcode::LOR
+            | opcode::LGREATER
+            | opcode::LLESS => {
                 self.term_arg(end)?;
                 self.term_arg(end)
             }
-            AML_ARG0 => {
-                self.pos += 1;
+            opcode::CREATE_BIT_FIELD
+            | opcode::CREATE_BYTE_FIELD
+            | opcode::CREATE_WORD_FIELD
+            | opcode::CREATE_DWORD_FIELD
+            | opcode::CREATE_QWORD_FIELD => {
+                self.term_arg(end)?;
+                self.term_arg(end)?;
+                self.name_string(end)?;
                 Ok(())
             }
-            _ => self.name_string(end),
+            AML_EXT_PREFIX => self.extended(end),
+            _ => {
+                self.pos = start;
+                self.method_call(end)
+            }
         }
+    }
+
+    /// An extended (0x5B) opcode. `self.pos` is past the prefix.
+    fn extended(&mut self, end: usize) -> Result<(), String> {
+        match self.read_byte(end)? {
+            AML_DEVICE_OP => self.package_terms(end, true, false),
+            opcode::EXT_MUTEX => {
+                self.name_string(end)?;
+                self.read_byte(end)?; // SyncFlags
+                Ok(())
+            }
+            opcode::EXT_ACQUIRE => {
+                self.super_name(end)?;
+                // The timeout is raw WordData, not a TermArg.
+                self.skip(2, end)
+            }
+            opcode::EXT_RELEASE => self.super_name(end),
+            opcode::EXT_CREATE_FIELD => {
+                self.term_arg(end)?;
+                self.term_arg(end)?;
+                self.term_arg(end)?;
+                self.name_string(end)?;
+                Ok(())
+            }
+            opcode::EXT_OP_REGION => {
+                self.name_string(end)?;
+                self.read_byte(end)?; // RegionSpace
+                self.term_arg(end)?;
+                self.term_arg(end)
+            }
+            opcode::EXT_FIELD => {
+                let package_end = self.package_end(end)?;
+                self.name_string(package_end)?;
+                self.read_byte(package_end)?; // FieldFlags
+                self.field_list(package_end)
+            }
+            opcode::EXT_INDEX_FIELD => {
+                let package_end = self.package_end(end)?;
+                self.name_string(package_end)?;
+                self.name_string(package_end)?;
+                self.read_byte(package_end)?; // FieldFlags
+                self.field_list(package_end)
+            }
+            _ => Err(self.fail("unsupported extended opcode")),
+        }
+    }
+
+    fn field_list(&mut self, end: usize) -> Result<(), String> {
+        while self.pos < end {
+            match self.peek(end)? {
+                opcode::FIELD_RESERVED => {
+                    self.pos += 1;
+                    self.pkg_length(end)?; // bit count of the gap
+                }
+                opcode::FIELD_ACCESS => {
+                    self.pos += 1;
+                    self.skip(2, end)?; // AccessType, AccessAttrib
+                }
+                opcode::FIELD_CONNECT => {
+                    self.pos += 1;
+                    if self.peek(end)? == AML_BUFFER_OP {
+                        self.data_object(end)?;
+                    } else {
+                        self.name_string(end)?;
+                    }
+                }
+                opcode::FIELD_EXT_ACCESS => {
+                    self.pos += 1;
+                    self.skip(3, end)?; // type, attribute, length
+                }
+                _ => {
+                    self.name_seg(end)?;
+                    self.pkg_length(end)?; // bit width of the field
+                }
+            }
+        }
+        if self.pos != end {
+            return Err(self.fail("field list crossed PkgLength boundary"));
+        }
+        Ok(())
+    }
+
+    /// A NameString in term position: a call if it names a declared
+    /// method, otherwise a plain reference.
+    fn method_call(&mut self, end: usize) -> Result<(), String> {
+        let start = self.pos;
+        let Some(name) = self.name_string(end)? else {
+            return Err(self.fail("NullName cannot start a term"));
+        };
+        let Some(declared) = self.methods.arity(&name) else {
+            return Ok(());
+        };
+        let Some(args) = declared else {
+            self.pos = start;
+            return Err(self.fail(
+                "method NameSeg is declared with two different arities",
+            ));
+        };
+        for _ in 0..args {
+            self.term_arg(end)?;
+        }
+        Ok(())
+    }
+
+    fn method_decl(&mut self, enclosing_end: usize) -> Result<(), String> {
+        let package_end = self.package_end(enclosing_end)?;
+        let name = self.name_string(package_end)?;
+        let flags = self.read_byte(package_end)?;
+        if self.collect {
+            if let Some(seg) = name {
+                self.methods.declare(seg, flags & 0x07);
+            }
+            self.pos = package_end;
+            return Ok(());
+        }
+        self.walk_terms(package_end)?;
+        if self.pos != package_end {
+            return Err(self.fail("Method body did not end at PkgLength"));
+        }
+        Ok(())
     }
 
     fn package_terms(
@@ -870,38 +1309,56 @@ impl AmlWalker<'_> {
     }
 
     fn walk_terms(&mut self, end: usize) -> Result<(), String> {
+        let mut previous_was_if = false;
         while self.pos < end {
-            let opcode = self.read_byte(end)?;
+            let opcode = self.peek(end)?;
+            let is_if = opcode == AML_IF_OP;
             match opcode {
-                AML_SCOPE_OP => self.package_terms(end, true, false)?,
-                AML_EXT_PREFIX => {
-                    if self.read_byte(end)? != AML_DEVICE_OP {
-                        return Err(self.fail("unsupported extended opcode"));
-                    }
+                AML_SCOPE_OP => {
+                    self.pos += 1;
                     self.package_terms(end, true, false)?;
                 }
-                AML_METHOD_OP => self.package_terms(end, true, true)?,
-                AML_IF_OP => {
+                AML_METHOD_OP => {
+                    self.pos += 1;
+                    self.method_decl(end)?;
+                }
+                AML_NAME_OP => {
+                    self.pos += 1;
+                    self.name_string(end)?;
+                    self.data_object(end)?;
+                }
+                AML_IF_OP | opcode::WHILE => {
+                    self.pos += 1;
                     let package_end = self.package_end(end)?;
                     self.term_arg(package_end)?;
                     self.walk_terms(package_end)?;
                     if self.pos != package_end {
-                        return Err(
-                            self.fail("If child did not end at PkgLength")
-                        );
+                        return Err(self.fail("child did not end at PkgLength"));
                     }
                 }
-                AML_NAME_OP => {
-                    self.name_string(end)?;
-                    self.data_object(end)?;
+                opcode::ELSE => {
+                    if !previous_was_if {
+                        return Err(self.fail("Else does not follow an If"));
+                    }
+                    self.pos += 1;
+                    self.package_terms(end, false, false)?;
                 }
-                AML_RETURN_OP => self.term_arg(end)?,
-                AML_STORE_OP => {
-                    self.term_arg(end)?;
+                AML_RETURN_OP => {
+                    self.pos += 1;
                     self.term_arg(end)?;
                 }
-                _ => return Err(self.fail("unsupported term opcode")),
+                opcode::NOTIFY => {
+                    self.pos += 1;
+                    self.super_name(end)?;
+                    self.term_arg(end)?;
+                }
+                opcode::BREAK
+                | opcode::CONTINUE
+                | opcode::NOOP
+                | opcode::BREAK_POINT => self.pos += 1,
+                _ => self.term_arg(end)?,
             }
+            previous_was_if = is_if;
         }
         if self.pos != end {
             return Err(self.fail("term list crossed PkgLength boundary"));
@@ -915,6 +1372,215 @@ impl AmlWalker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use acpi_tables::{Aml as _, AmlSink as _};
+
+    // ── Structural validator ────────────────────────────────────
+
+    /// OpRegion(PCST, SystemIO, 0xAE00, 0x10).
+    const HOTPLUG_OP_REGION: [u8; 12] = [
+        0x5B, 0x80, b'P', b'C', b'S', b'T', 0x01, 0x0B, 0x00, 0xAE, 0x0A, 0x10,
+    ];
+    /// Field(PCST, DWordAcc, NoLock, Preserve) { PCIU, 32, PCID, 32 }.
+    const HOTPLUG_FIELD: [u8; 18] = [
+        0x5B, 0x81, 0x10, b'P', b'C', b'S', b'T', 0x02, b'P', b'C', b'I', b'U',
+        0x20, b'P', b'C', b'I', b'D', 0x20,
+    ];
+    /// Mutex(MUTX, 0).
+    const HOTPLUG_MUTEX: [u8; 7] = [0x5B, 0x01, b'M', b'U', b'T', b'X', 0x00];
+    /// Acquire(MUTX, 0xFFFF) then Release(MUTX).
+    const HOTPLUG_LOCK: [u8; 14] = [
+        0x5B, 0x23, b'M', b'U', b'T', b'X', 0xFF, 0xFF, 0x5B, 0x27, b'M', b'U',
+        b'T', b'X',
+    ];
+    /// If (LEqual(Local0, One)) { Return(Zero) }.
+    const IF_TERM: [u8; 7] = [0xA0, 0x06, 0x93, 0x60, 0x01, 0xA4, 0x00];
+    /// Store(Arg0, Local0), then
+    /// If (LEqual(Local0, One)) { Notify(\_SB_, One) } Else { Return(Zero) }.
+    const IF_ELSE_NOTIFY: [u8; 19] = [
+        0x70, 0x68, 0x60, 0xA0, 0x0B, 0x93, 0x60, 0x01, 0x86, 0x5C, b'_', b'S',
+        b'B', b'_', 0x01, 0xA1, 0x03, 0xA4, 0x00,
+    ];
+    /// While (LLess(Local0, 10)) { Increment(Local0); Break }.
+    const WHILE_BREAK: [u8; 9] =
+        [0xA2, 0x08, 0x95, 0x60, 0x0A, 0x0A, 0x75, 0x60, 0xA5];
+    /// Add, Subtract, Multiply, ShiftLeft, ShiftRight, And, Or, Not,
+    /// Decrement, ToInteger, Store(DerefOf(Index)), CreateDWordField,
+    /// CreateQWordField, LNot(LAnd), LOr(LGreater, LLess), Return(Ones).
+    const OPERATOR_SET: [u8; 68] = [
+        0x72, 0x60, 0x01, 0x61, 0x74, 0x61, 0x01, 0x62, 0x77, 0x60, 0x0A, 0x02,
+        0x63, 0x79, 0x01, 0x0A, 0x04, 0x64, 0x7A, 0x64, 0x01, 0x65, 0x7B, 0x65,
+        0x0A, 0x0F, 0x66, 0x7D, 0x66, 0x00, 0x67, 0x80, 0x67, 0x60, 0x76, 0x60,
+        0x99, 0x68, 0x61, 0x70, 0x83, 0x88, 0x60, 0x00, 0x00, 0x62, 0x8A, 0x60,
+        0x00, b'T', b'M', b'P', b'1', 0x8F, 0x60, 0x01, b'T', b'M', b'P', b'2',
+        0x92, 0x90, 0x60, 0x61, 0x91, 0x94, 0x60, 0x01,
+    ];
+    /// Name(PRT0, Package(2) { Zero, \_SB_ }).
+    const PACKAGE_WITH_NAME: [u8; 14] = [
+        0x08, b'P', b'R', b'T', b'0', 0x12, 0x08, 0x02, 0x00, 0x5C, b'_', b'S',
+        b'B', b'_',
+    ];
+
+    /// Wrap raw opcodes in Method("TEST") so the enclosing PkgLength
+    /// comes from the builder and only the body is under test.
+    fn in_method(args: u8, body: &[u8]) -> Vec<u8> {
+        let mut aml = Aml::new();
+        aml.method("TEST", args, false, |m| m.vec(body));
+        aml.into_bytes()
+    }
+
+    #[test]
+    fn walk_accepts_if_else_and_notify() {
+        walk_aml(&in_method(1, &IF_ELSE_NOTIFY)).unwrap();
+    }
+
+    #[test]
+    fn walk_accepts_while_and_break() {
+        walk_aml(&in_method(0, &WHILE_BREAK)).unwrap();
+    }
+
+    #[test]
+    fn walk_accepts_the_operator_set() {
+        let mut body = OPERATOR_SET.to_vec();
+        body.extend_from_slice(&[0x95, 0x61, 0x01]); // LLess(Local1, One)
+        body.extend_from_slice(&[0xA4, 0xFF]); // Return(Ones)
+        walk_aml(&in_method(1, &body)).unwrap();
+    }
+
+    #[test]
+    fn walk_accepts_op_region_field_and_mutex() {
+        let mut aml = Aml::new();
+        aml.vec(&HOTPLUG_OP_REGION);
+        aml.vec(&HOTPLUG_FIELD);
+        aml.vec(&HOTPLUG_MUTEX);
+        aml.method("EJ0", 1, true, |m| m.vec(&HOTPLUG_LOCK));
+        walk_aml(&aml.into_bytes()).unwrap();
+    }
+
+    #[test]
+    fn walk_rejects_a_long_field_pkg_length() {
+        let mut field = HOTPLUG_FIELD;
+        field[2] = 0x11;
+        let error = walk_aml(&field).unwrap_err();
+        assert!(error.contains("PkgLength exceeds"), "{error}");
+    }
+
+    #[test]
+    fn walk_rejects_a_short_field_pkg_length() {
+        let mut field = HOTPLUG_FIELD;
+        field[2] = 0x0E;
+        assert!(walk_aml(&field).is_err());
+    }
+
+    #[test]
+    fn walk_rejects_an_acquire_without_a_timeout() {
+        let body = &HOTPLUG_LOCK[..7];
+        assert!(walk_aml(&in_method(0, body)).is_err());
+    }
+
+    #[test]
+    fn walk_accepts_a_correct_if_pkg_length() {
+        walk_aml(&in_method(0, &IF_TERM)).unwrap();
+    }
+
+    #[test]
+    fn walk_rejects_a_short_if_pkg_length() {
+        let mut body = IF_TERM;
+        body[1] = 0x05;
+        assert!(walk_aml(&in_method(0, &body)).is_err());
+    }
+
+    #[test]
+    fn walk_rejects_a_long_if_pkg_length() {
+        let mut body = IF_TERM;
+        body[1] = 0x07;
+        let error = walk_aml(&in_method(0, &body)).unwrap_err();
+        assert!(error.contains("PkgLength exceeds"), "{error}");
+    }
+
+    #[test]
+    fn walk_rejects_an_else_without_an_if() {
+        let body = &IF_ELSE_NOTIFY[15..];
+        let error = walk_aml(&in_method(0, body)).unwrap_err();
+        assert!(error.contains("Else does not follow an If"), "{error}");
+    }
+
+    #[test]
+    fn walk_rejects_a_truncated_notify() {
+        let body = &IF_ELSE_NOTIFY[8..14];
+        assert!(walk_aml(&in_method(0, body)).is_err());
+    }
+
+    #[test]
+    fn walk_rejects_an_unknown_opcode() {
+        let error = walk_aml(&in_method(0, &[0xB0, 0x00, 0x00, 0x00, 0x00]))
+            .unwrap_err();
+        assert!(error.contains("malformed NameSeg"), "{error}");
+    }
+
+    #[test]
+    fn walk_accepts_a_forward_method_call() {
+        let mut aml = Aml::new();
+        aml.method("BAR", 0, false, |m| {
+            m.vec(&[b'F', b'O', b'O', b'_', 0x00, 0x01]);
+        });
+        aml.method("FOO", 2, false, |m| m.return_val(AmlValue::Zero));
+        walk_aml(&aml.into_bytes()).unwrap();
+    }
+
+    #[test]
+    fn walk_rejects_a_call_missing_an_argument() {
+        let mut aml = Aml::new();
+        aml.method("BAR", 0, false, |m| {
+            m.vec(&[b'F', b'O', b'O', b'_', 0x00]);
+        });
+        aml.method("FOO", 2, false, |m| m.return_val(AmlValue::Zero));
+        assert!(walk_aml(&aml.into_bytes()).is_err());
+    }
+
+    #[test]
+    fn walk_rejects_an_ambiguous_method_arity() {
+        let mut aml = Aml::new();
+        for args in [1, 2] {
+            aml.device("DEV0", |d| {
+                d.method("FOO", args, false, |m| m.return_val(AmlValue::Zero));
+            });
+        }
+        aml.method("BAR", 0, false, |m| {
+            m.vec(&[b'F', b'O', b'O', b'_', 0x00]);
+        });
+        let error = walk_aml(&aml.into_bytes()).unwrap_err();
+        assert!(error.contains("two different arities"), "{error}");
+    }
+
+    #[test]
+    fn walk_accepts_a_name_reference_in_a_package() {
+        walk_aml(&PACKAGE_WITH_NAME).unwrap();
+    }
+
+    /// Name("_STA", 0x0F) as emitted by acpi_tables through the sink.
+    const CRATE_NAME_STA_AML: [u8; 7] =
+        [AML_NAME_OP, b'_', b'S', b'T', b'A', AML_BYTE_PREFIX, 0x0F];
+
+    #[test]
+    fn crate_sink_bytes_are_pinned() {
+        let mut aml = Aml::new();
+        acpi_tables::aml::Name::new("_STA".into(), &0x0Fu8)
+            .to_aml_bytes(&mut aml);
+        assert_eq!(aml.into_bytes().as_slice(), CRATE_NAME_STA_AML.as_slice());
+    }
+
+    #[test]
+    fn crate_narrows_integers() {
+        // The crate picks the smallest legal width, so it cannot replace
+        // the fixed-width emitters without moving the shipping DSDT.
+        let mut aml = Aml::new();
+        acpi_tables::aml::Name::new("_UID".into(), &1u32)
+            .to_aml_bytes(&mut aml);
+        assert_eq!(
+            aml.into_bytes(),
+            vec![AML_NAME_OP, b'_', b'U', b'I', b'D', AML_ONE_OP],
+        );
+    }
 
     #[test]
     fn eisa_id_pnp0a03() {

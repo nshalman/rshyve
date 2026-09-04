@@ -30,7 +30,7 @@ members = [
 # fhrun-init cross-compiles to x86_64-unknown-linux-musl and carries
 # its own workspace and lockfile. Excluding it keeps a host
 # `cargo build --workspace` off the Linux toolchain.
-exclude = ["tools/fhrun-init"]
+exclude = ["tools/fhrun-init", "tools/virtiofs-test"]
 
 [workspace.package]
 # The oldest toolchain this is built with is the illumos build host's
@@ -91,6 +91,7 @@ vmm_tpm = { path = "crates/vmm-tpm" }
 vmm_machine = { path = "crates/vmm-machine" }
 
 # External dependencies
+acpi_tables = "0.2.1"
 anyhow = "1.0"
 ascii = { version = "1.1", default-features = false }
 usdt = { version = "0.5", default-features = false }

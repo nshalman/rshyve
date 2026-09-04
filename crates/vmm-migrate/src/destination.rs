@@ -102,7 +102,9 @@ async fn run_destination_inner<S: AsyncRead + AsyncWrite + Unpin>(
     let pre_data = expect_serialized(pre_msg)?;
     let preamble: MigrationPreamble = Message::deserialize(&pre_data)?;
 
-    // Validate compatibility
+    // Validate compatibility. Both sides report their boot topology,
+    // so a CPU or memory the source hot-added is invisible here. The
+    // source refuses to start in that case.
     if preamble.num_cpus != num_cpus {
         let err = MigrateError::PreambleMismatch(format!(
             "CPU count mismatch: source has {}, we have {}",
@@ -113,7 +115,7 @@ async fn run_destination_inner<S: AsyncRead + AsyncWrite + Unpin>(
     }
     if preamble.mem_size != mem_size {
         let err = MigrateError::PreambleMismatch(format!(
-            "memory size mismatch: source has {}, we have {}",
+            "memory size mismatch: source has {} bytes, we have {}",
             preamble.mem_size, mem_size,
         ));
         ws.send(Message::Error(err.clone()).encode()).await?;
@@ -213,14 +215,37 @@ async fn run_destination_inner<S: AsyncRead + AsyncWrite + Unpin>(
     let time_msg = recv(&mut ws).await?;
     let time_data_bytes = expect_serialized(time_msg)?;
     let time_data: TimeData = Message::deserialize(&time_data_bytes)?;
-    state::import_time_data(hdl, &time_data, log)?;
+    if let Err(e) = state::import_time_data(hdl, &time_data, log) {
+        report_failure(&mut ws, &e, log).await;
+        return Err(e);
+    }
 
     // ── Phase: DeviceState ────────────────────────────────────────
     set_phase(status, MigrationPhase::DeviceState);
     let dev_msg = recv(&mut ws).await?;
     let dev_data_bytes = expect_serialized(dev_msg)?;
     let device_state: DeviceState = Message::deserialize(&dev_data_bytes)?;
-    state::import_device_state(hdl, &device_state, log)?;
+
+    // This path has no device restore callback, so it cannot program
+    // virtio rings or NVMe queues. A guest that resumes without them
+    // has devices it cannot use, so refuse the payload instead.
+    if !device_state.virtio_queues.is_empty()
+        || !device_state.nvme_controllers.is_empty()
+    {
+        let e = MigrateError::State(format!(
+            "payload has {} virtio queues and {} NVMe controllers, this \
+             destination path cannot restore them",
+            device_state.virtio_queues.len(),
+            device_state.nvme_controllers.len(),
+        ));
+        report_failure(&mut ws, &e, log).await;
+        return Err(e);
+    }
+
+    if let Err(e) = state::import_device_state(hdl, &device_state, log) {
+        report_failure(&mut ws, &e, log).await;
+        return Err(e);
+    }
 
     // Resume the VM. This triggers vlapic_resume() in the kernel,
     // which calls vlapic_callout_reset() to re-arm the LAPIC timer.
@@ -265,6 +290,24 @@ async fn run_destination_inner<S: AsyncRead + AsyncWrite + Unpin>(
     ws.close(None).await.ok();
 
     Ok(())
+}
+
+/// Tell the source why the import stopped.
+///
+/// The source resumes the guest when the migration aborts. It needs the
+/// reason: a dropped connection alone does not say whether the state
+/// was rejected or the network failed.
+async fn report_failure<S: AsyncRead + AsyncWrite + Unpin>(
+    ws: &mut WebSocketStream<S>,
+    err: &MigrateError,
+    log: &slog::Logger,
+) {
+    slog::error!(log, "migration import failed"; "error" => %err);
+    if let Err(send_err) = ws.send(Message::Error(err.clone()).encode()).await {
+        slog::warn!(log, "could not report the failure to the source";
+            "error" => %send_err,
+        );
+    }
 }
 
 /// Result of receiving one RAM pass from the source.

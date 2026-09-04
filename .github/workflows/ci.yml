@@ -121,6 +121,24 @@ jobs:
           cargo clippy --locked --all-targets --target x86_64-unknown-linux-musl -- -D warnings
           cargo test --locked --target x86_64-unknown-linux-musl
 
+  guest-vsock-test:
+    name: guest test harness (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: rustup component add clippy rustfmt
+      # Same hazard as tools/fhrun-init above: excluded from the root
+      # workspace, so no other job reaches it. Its spec parsing decides
+      # what a container image actually runs, and that logic is host
+      # independent, so it tests on the runner.
+      - name: format, lint and test the guest harness
+        working-directory: tools/virtiofs-test
+        run: |
+          cargo fmt -- --check
+          cargo clippy --locked --all-targets --target x86_64-unknown-linux-musl -- -D warnings
+          cargo test --locked --target x86_64-unknown-linux-musl
+
   msrv:
     name: builds on the declared MSRV
     runs-on: ubuntu-latest

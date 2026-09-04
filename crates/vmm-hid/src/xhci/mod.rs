@@ -191,14 +191,35 @@ pub struct XhciController {
     intr_pin: Option<Arc<dyn IntrPin>>,
     /// Weak self-reference for MMIO handler closures.
     self_ref: Mutex<Option<Weak<Self>>>,
+    /// Structured logger for bus registration diagnostics.
+    log: slog::Logger,
 }
 
 impl XhciController {
     /// Create a new xHCI controller with a built-in tablet device.
+    ///
+    /// Bus registration failures go to a discarding logger. Use
+    /// [`new_with_logger`](Self::new_with_logger) to see them.
     pub fn new(
         physmap: Arc<PhysMap>,
         bus_mmio: Arc<MmioBus>,
         intr_pin: Option<Arc<dyn IntrPin>>,
+    ) -> Arc<Self> {
+        Self::new_with_logger(
+            physmap,
+            bus_mmio,
+            intr_pin,
+            slog::Logger::root(slog::Discard, slog::o!()),
+        )
+    }
+
+    /// Create a new xHCI controller with a logger for bus registration
+    /// diagnostics.
+    pub fn new_with_logger(
+        physmap: Arc<PhysMap>,
+        bus_mmio: Arc<MmioBus>,
+        intr_pin: Option<Arc<dyn IntrPin>>,
+        log: slog::Logger,
     ) -> Arc<Self> {
         let ident = DeviceIdent {
             vendor_id: PCI_VENDOR_INTEL,
@@ -224,6 +245,7 @@ impl XhciController {
             registered_bar0: Mutex::new(None),
             intr_pin,
             self_ref: Mutex::new(None),
+            log,
         });
 
         // Store weak self-reference for MMIO closures
@@ -242,6 +264,18 @@ impl XhciController {
 
     // ---- MMIO BAR registration (follows NVMe pattern) --------------------
 
+    /// Unregister the recorded BAR0 base and clear the record.
+    fn release_mmio(&self, reg: &mut Option<u64>) {
+        if let Some(addr) = reg.take() {
+            if let Err(e) = self.bus_mmio.unregister(addr) {
+                slog::warn!(self.log, "xhci: MMIO unregister failed";
+                    "bar" => ?BarN::BAR0,
+                    "addr" => format!("{addr:#x}"),
+                    "error" => %e);
+            }
+        }
+    }
+
     /// Update MMIO bus registration after BAR or command register changes.
     fn update_mmio_registration(self: &Arc<Self>) {
         let pci = self.pci_state.lock().expect("xhci: pci lock");
@@ -250,9 +284,7 @@ impl XhciController {
             .contains(vmm_devices::pci::bits::RegCmd::MMIO_EN);
 
         let mut reg = self.registered_bar0.lock().expect("xhci: bar0 reg lock");
-        if let Some(old_addr) = reg.take() {
-            let _ = self.bus_mmio.unregister(old_addr);
-        }
+        self.release_mmio(&mut reg);
 
         if mmio_enabled {
             if let Some((def, addr)) = pci.bars().get(BarN::BAR0) {
@@ -263,8 +295,17 @@ impl XhciController {
                         Arc::new(move |offset: usize, rwo: RWOp<'_>| {
                             dev.bar_rw(BarN::BAR0, offset, rwo);
                         });
-                    if self.bus_mmio.register(addr, size, handler).is_ok() {
-                        *reg = Some(addr);
+                    match self.bus_mmio.register(addr, size, handler) {
+                        Ok(()) => *reg = Some(addr),
+                        // The controller now decodes nothing on BAR0.
+                        Err(e) => {
+                            slog::error!(self.log,
+                                "xhci: MMIO register failed, BAR0 dark";
+                                "bar" => ?BarN::BAR0,
+                                "addr" => format!("{addr:#x}"),
+                                "size" => size,
+                                "error" => %e);
+                        }
                     }
                 }
             }
@@ -1354,6 +1395,11 @@ impl PciDevice for XhciController {
                 }
             }
         }
+    }
+
+    fn detach_regions(&self) {
+        let mut reg = self.registered_bar0.lock().expect("xhci: bar0 reg lock");
+        self.release_mmio(&mut reg);
     }
 }
 

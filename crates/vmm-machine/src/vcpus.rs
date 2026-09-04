@@ -1,0 +1,709 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Run-time vCPU registry.
+//!
+//! Boot brings up a fixed set of vCPUs. This registry brings one more
+//! online while the guest runs, replaying every per-vCPU step the boot
+//! path took so a late CPU is not subtly different from its siblings.
+//!
+//! # Add only
+//!
+//! There is no `remove_vcpu`, and that is not an oversight. illumos has
+//! no `vm_deactivate_cpu`: `active_cpus` is only ever set
+//! (`vmm.c:3369`), and the one place that clears it is `vm_init`, which
+//! zeroes the whole set on `VM_REINIT` (`vmm.c:567`). CPU hot-REMOVE is
+//! therefore not possible at the kernel boundary. The guest-facing
+//! eject path in `vmm_devices::hotplug::cpu` records a request, and the
+//! host can stop scheduling work on the CPU, but the kernel keeps it
+//! active until the VM is reinitialised.
+//!
+//! # Why activation is lazy
+//!
+//! A CPU is activated at the moment of the request, never in advance.
+//! `vmm.c:1634` declares the VM halted only when `halted_cpus` equals
+//! `active_cpus`. A vCPU that is active but that the guest has never
+//! onlined sits in `VRS_HALT`, never reaches the HLT accounting, and so
+//! never joins `halted_cpus`. Pre-activating a spare CPU would stop
+//! `VM_SUSPEND_HALT` firing for the life of the VM.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+
+use slog::{debug, info, warn, Logger};
+use vmm_core::cpuid::CpuidTable;
+use vmm_core::vcpu::Vcpu;
+use vmm_devices::metrics::VcpuMetrics;
+
+use crate::teardown::VcpuThreads;
+use crate::vcpu_tasks::{self, VcpuEvent, VcpuThreadCtx};
+
+/// The kernel's own vCPU ceiling.
+///
+/// `vm_activate_cpu` refuses `vcpuid >= vm->maxcpus` (`vmm.c:3359`),
+/// and `vm_set_topology` re-pins `maxcpus` to `VM_MAXCPU` whatever the
+/// caller asks for (`vmm.c:686`). The guest-visible possible-CPU count
+/// therefore lives entirely in the MADT and fw_cfg, which this tree
+/// owns, and this constant is only the hard kernel limit.
+const KERNEL_MAX_CPUS: u32 = bhyve_api::VM_MAXCPU as u32;
+const _: () = assert!(KERNEL_MAX_CPUS as usize == bhyve_api::VM_MAXCPU);
+
+const BOOK_POISONED: &str = "vCPU registry lock poisoned";
+
+/// Reason a vCPU could not be brought online.
+///
+/// Hand-written rather than derived: this crate carries no `thiserror`
+/// dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VcpuError {
+    /// The id names no CPU this machine describes.
+    OutOfRange { id: u32, max_cpus: u32 },
+    /// This registry already brought the CPU online.
+    AlreadyOnline(u32),
+    /// The kernel answered EBUSY.
+    ///
+    /// `vm_activate_cpu` uses EBUSY for three cases: the id is active
+    /// already (`vmm.c:3362`), the VM was suspended before the set
+    /// (`vmm.c:3365`), and the VM was suspended after it
+    /// (`vmm.c:3375`). Only the middle one leaves the CPU inactive, and
+    /// nothing here can tell them apart, so the id is treated as spent.
+    Suspended(u32),
+    /// The kernel refused the activation for some other reason.
+    Activate { id: u32, error: String },
+    /// A per-vCPU boot step could not be replayed.
+    Setup {
+        id: u32,
+        step: &'static str,
+        error: String,
+    },
+    /// The vCPU thread could not be made.
+    Spawn { id: u32, error: String },
+    /// Teardown has taken the thread roster, so nothing can start.
+    ShuttingDown(u32),
+    /// The CPU is active but its thread has gone.
+    ThreadGone(u32),
+}
+
+impl VcpuError {
+    /// True when the kernel was left with no extra active CPU, so the
+    /// registry can give the id back.
+    ///
+    /// An allowlist of the errors that happen BEFORE `VM_ACTIVATE_CPU`,
+    /// not a list of the ones that happen after. There is no
+    /// `vm_deactivate_cpu`, so an id that reached the kernel can never
+    /// be taken back, and a new variant must default to "spent".
+    ///
+    /// [`VcpuError::Suspended`] is deliberately outside the list.
+    /// `vm_activate_cpu` sets `active_cpus` (`vmm.c:3369`) and THEN
+    /// answers EBUSY if the VM was suspended in the meantime
+    /// (`vmm.c:3375`), leaving the bit set. EBUSY also means the id was
+    /// active already (`vmm.c:3362`). Only the earlier suspend test
+    /// (`vmm.c:3365`) returns before the set, and the caller cannot
+    /// tell the three apart, so EBUSY is read as "the CPU may be
+    /// active".
+    pub fn left_cpu_inactive(&self) -> bool {
+        matches!(
+            self,
+            VcpuError::OutOfRange { .. }
+                | VcpuError::AlreadyOnline(_)
+                | VcpuError::Setup { .. }
+                | VcpuError::Spawn { .. }
+                | VcpuError::ShuttingDown(_)
+        )
+    }
+}
+
+impl fmt::Display for VcpuError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VcpuError::OutOfRange { id, max_cpus } => {
+                write!(f, "vCPU {id} is not one of the {max_cpus} CPU slots")
+            }
+            VcpuError::AlreadyOnline(id) => {
+                write!(f, "vCPU {id} is already online")
+            }
+            VcpuError::Suspended(id) => write!(
+                f,
+                "vCPU {id} was refused: the VM is suspended, or the CPU \
+                 is already active. The kernel may have activated it, \
+                 so the id cannot be reused",
+            ),
+            VcpuError::Activate { id, error } => {
+                write!(f, "failed to activate vCPU {id}: {error}")
+            }
+            VcpuError::Setup { id, step, error } => {
+                write!(f, "failed to set {step} on vCPU {id}: {error}")
+            }
+            VcpuError::Spawn { id, error } => {
+                write!(f, "failed to start the vCPU {id} thread: {error}")
+            }
+            VcpuError::ShuttingDown(id) => {
+                write!(f, "vCPU {id} was refused: the VM is shutting down")
+            }
+            VcpuError::ThreadGone(id) => write!(
+                f,
+                "vCPU {id} is active but its thread has gone; \
+                 the kernel cannot deactivate it",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VcpuError {}
+
+/// What a late vCPU needs to match its siblings.
+pub struct VcpuSetup {
+    /// Every CPU slot the MADT and fw_cfg describe. An id at or above
+    /// this is refused before the kernel sees it.
+    pub max_cpus: u32,
+    /// The CPUs the boot path already brought online, ids 0 upward.
+    pub boot_cpus: u32,
+    /// Whether the boot path set `VM_CAP_HALT_EXIT`.
+    pub vmexit_on_hlt: bool,
+    /// The table `apply_cpuid_table` programmed at boot, or `None` for
+    /// a pure host-passthrough VM that programmed nothing.
+    pub cpuid: Option<CpuidTable>,
+}
+
+/// Which ids are online, and the metrics of the CPUs added since boot.
+///
+/// Separate from the registry so the bookkeeping can be tested with no
+/// live VM: every other step of an add is an ioctl.
+struct VcpuBook {
+    max_cpus: u32,
+    online: BTreeSet<u32>,
+    metrics: BTreeMap<u32, Arc<VcpuMetrics>>,
+}
+
+impl VcpuBook {
+    fn new(max_cpus: u32, boot_cpus: u32) -> Self {
+        Self {
+            max_cpus,
+            online: (0..boot_cpus.min(max_cpus)).collect(),
+            metrics: BTreeMap::new(),
+        }
+    }
+
+    /// Check `id` and reserve it, returning the bhyve vCPU id.
+    ///
+    /// The reservation happens before any ioctl, so two concurrent
+    /// adds of one id cannot both reach `VM_ACTIVATE_CPU`.
+    fn claim(&mut self, id: u32) -> Result<i32, VcpuError> {
+        let vcpu_id = check_id(id, self.max_cpus)?;
+        if !self.online.insert(id) {
+            return Err(VcpuError::AlreadyOnline(id));
+        }
+        Ok(vcpu_id)
+    }
+
+    fn release(&mut self, id: u32) {
+        self.online.remove(&id);
+        self.metrics.remove(&id);
+    }
+
+    fn record(&mut self, id: u32, metrics: Arc<VcpuMetrics>) {
+        self.metrics.insert(id, metrics);
+    }
+}
+
+/// Check a vCPU id against this machine and against the kernel.
+fn check_id(id: u32, max_cpus: u32) -> Result<i32, VcpuError> {
+    let ceiling = max_cpus.min(KERNEL_MAX_CPUS);
+    if id >= ceiling {
+        return Err(VcpuError::OutOfRange {
+            id,
+            max_cpus: ceiling,
+        });
+    }
+    // A vCPU id is an i32 in every bhyve ioctl. The ceiling is well
+    // inside i32, so this cannot fail, but no `as` cast reaches the
+    // kernel from here.
+    i32::try_from(id).map_err(|_| VcpuError::OutOfRange {
+        id,
+        max_cpus: ceiling,
+    })
+}
+
+/// Brings a CPU online on a running VM.
+///
+/// `Machine.vcpus` is built once in `finalize` and handed out only as
+/// `&[Vcpu]`, so the registry mints its own handles with
+/// `Vcpu::new_for_thread`. A `Vcpu` is an id and a shared `VmmHdl`, so
+/// a minted handle is the same thing the boot path holds. The registry
+/// never mutates the `Machine`.
+pub struct VcpuRegistry {
+    setup: VcpuSetup,
+    ctx: VcpuThreadCtx,
+    threads: Arc<VcpuThreads>,
+    events: Sender<VcpuEvent>,
+    log: Logger,
+    book: Mutex<VcpuBook>,
+}
+
+impl VcpuRegistry {
+    pub fn new(
+        setup: VcpuSetup,
+        ctx: VcpuThreadCtx,
+        threads: Arc<VcpuThreads>,
+        events: Sender<VcpuEvent>,
+        log: Logger,
+    ) -> Self {
+        let book = VcpuBook::new(setup.max_cpus, setup.boot_cpus);
+        Self {
+            setup,
+            ctx,
+            threads,
+            events,
+            log,
+            book: Mutex::new(book),
+        }
+    }
+
+    /// Build from the fleet [`crate::vcpu::spawn_vcpu_fleet`] returned.
+    pub fn from_fleet(
+        setup: VcpuSetup,
+        fleet: &crate::vcpu::VcpuFleet,
+        log: Logger,
+    ) -> Self {
+        Self::new(
+            setup,
+            fleet.ctx.clone(),
+            Arc::clone(&fleet.threads),
+            fleet.sender.clone(),
+            log,
+        )
+    }
+
+    /// CPU slots this machine describes, boot CPUs included.
+    pub fn possible_cpus(&self) -> u32 {
+        self.setup.max_cpus.min(KERNEL_MAX_CPUS)
+    }
+
+    /// How many CPUs the boot path brought online, ids 0 upward.
+    ///
+    /// A caller refuses a hot-add of one of these before it reaches the
+    /// registry: the AML gives no boot CPU an insert event, so the
+    /// guest would never hear about it.
+    pub fn boot_cpus(&self) -> u32 {
+        self.setup.boot_cpus
+    }
+
+    /// The ids that are online, in ascending order.
+    pub fn online(&self) -> Vec<u32> {
+        self.book
+            .lock()
+            .expect(BOOK_POISONED)
+            .online
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    pub fn is_online(&self, id: u32) -> bool {
+        self.book.lock().expect(BOOK_POISONED).online.contains(&id)
+    }
+
+    /// Metrics for the CPUs added since boot, in ascending id order.
+    ///
+    /// The boot set has its own metrics, which the fleet returns.
+    pub fn added_metrics(&self) -> Vec<(u32, Arc<VcpuMetrics>)> {
+        self.book
+            .lock()
+            .expect(BOOK_POISONED)
+            .metrics
+            .iter()
+            .map(|(id, metrics)| (*id, Arc::clone(metrics)))
+            .collect()
+    }
+
+    /// Bring one CPU online on the running VM.
+    ///
+    /// The guest still has to accept it: a hot-added CPU is an
+    /// application processor, so it waits in `VRS_HALT` until the guest
+    /// sends INIT/SIPI, exactly as a boot AP does. Nothing here resets
+    /// it. `Vcpu::setup_bsp` calls `reboot_state()`, and that on an AP
+    /// clears the state the guest's bring-up depends on. See
+    /// `crate::vcpu::uefi_reset_targets`.
+    pub fn add_vcpu(&self, id: u32) -> Result<(), VcpuError> {
+        let vcpu_id = self.book.lock().expect(BOOK_POISONED).claim(id)?;
+
+        match self.bring_online(id, vcpu_id) {
+            Ok(()) => {
+                info!(self.log, "vCPU brought online"; "vcpu" => id);
+                Ok(())
+            }
+            Err(error) => {
+                if error.left_cpu_inactive() {
+                    self.book.lock().expect(BOOK_POISONED).release(id);
+                } else {
+                    // The kernel has no way to undo an activation, and
+                    // this error cannot prove the activation did not
+                    // happen, so the id stays claimed and a second add
+                    // is refused.
+                    warn!(self.log, "vCPU id spent: the kernel may have \
+                        activated it";
+                        "vcpu" => id, "error" => %error);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The steps of an add, in the one order that can be rolled back.
+    ///
+    /// The thread is made and parked first, then the per-vCPU boot
+    /// steps are replayed, and activation is last. Every step before
+    /// activation is undone by dropping `signal`, which lets the parked
+    /// thread exit. Activation has no inverse, so nothing fallible
+    /// follows it except the release of the gate.
+    fn bring_online(&self, id: u32, vcpu_id: i32) -> Result<(), VcpuError> {
+        if self.threads.is_closed() {
+            return Err(VcpuError::ShuttingDown(id));
+        }
+
+        let metrics = Arc::new(VcpuMetrics::new());
+        let (signal, gate) = vcpu_tasks::start_gate();
+        let handle = vcpu_tasks::spawn_one(
+            &self.ctx,
+            vcpu_id,
+            Arc::clone(&metrics),
+            self.events.clone(),
+            Some(gate),
+            &self.log,
+        )
+        .map_err(|error| VcpuError::Spawn {
+            id,
+            error: error.to_string(),
+        })?;
+        if let Err(handle) = self.threads.push(handle) {
+            // Teardown started between the check and the push. Drop
+            // the signal so the parked thread exits, and join it: the
+            // roster will not, because it is closed.
+            drop(signal);
+            if handle.join().is_err() {
+                debug!(self.log, "the refused vCPU thread panicked";
+                    "vcpu" => id);
+            }
+            return Err(VcpuError::ShuttingDown(id));
+        }
+
+        let vcpu = Vcpu::new_for_thread(vcpu_id, Arc::clone(&self.ctx.hdl));
+        self.replay_boot_setup(id, vcpu_id, &vcpu)?;
+
+        vcpu.activate()
+            .map_err(|error| match error.raw_os_error() {
+                Some(libc::EBUSY) => VcpuError::Suspended(id),
+                Some(libc::EINVAL) => VcpuError::OutOfRange {
+                    id,
+                    max_cpus: self.possible_cpus(),
+                },
+                _ => VcpuError::Activate {
+                    id,
+                    error: error.to_string(),
+                },
+            })?;
+
+        if !signal.release() {
+            return Err(VcpuError::ThreadGone(id));
+        }
+
+        self.book.lock().expect(BOOK_POISONED).record(id, metrics);
+        Ok(())
+    }
+
+    /// Replay every per-vCPU step the boot path took.
+    ///
+    /// A missed step gives a CPU that behaves differently from its
+    /// siblings, which is far worse than one that fails to start. Both
+    /// steps run before activation: neither ioctl asks whether the vCPU
+    /// is active (`vmm_cpuid.c:457`, `vmm.c:3225`).
+    fn replay_boot_setup(
+        &self,
+        id: u32,
+        vcpu_id: i32,
+        vcpu: &Vcpu,
+    ) -> Result<(), VcpuError> {
+        if let Some(table) = &self.setup.cpuid {
+            table.apply_to(&self.ctx.hdl, vcpu_id).map_err(|error| {
+                VcpuError::Setup {
+                    id,
+                    step: "CPUID",
+                    error: error.to_string(),
+                }
+            })?;
+        }
+
+        crate::vcpu::set_halt_exit(vcpu, self.setup.vmexit_on_hlt).map_err(
+            |error| VcpuError::Setup {
+                id,
+                step: "HALT_EXIT",
+                error: format!("{error:#}"),
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_id, VcpuBook, VcpuError, KERNEL_MAX_CPUS};
+
+    /// The ioctl steps of an add need a live bhyve VM, and a unit test
+    /// has none. Read the invariants that matter out of the source
+    /// instead. The slice stops at the test module so a test literal
+    /// cannot satisfy a check the implementation no longer does.
+    fn implementation() -> &'static str {
+        let src = include_str!("vcpus.rs");
+        let end = src.find("#[cfg(test)]").expect("test module attribute");
+        &src[..end]
+    }
+
+    /// The implementation with every comment line removed.
+    ///
+    /// The doc comments here name the calls a hot-added CPU must NOT
+    /// make, so a scan for those names has to read code only.
+    fn code_only() -> String {
+        implementation()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_of(name: &str) -> &'static str {
+        let src = implementation();
+        let start = src.find(name).unwrap_or_else(|| panic!("{name}"));
+        let body = &src[start..];
+        let end = body.find("\n    }\n").unwrap_or_else(|| panic!("{name}"));
+        &body[..end]
+    }
+
+    #[test]
+    fn an_id_past_the_slot_count_is_refused() {
+        assert_eq!(
+            check_id(4, 4),
+            Err(VcpuError::OutOfRange { id: 4, max_cpus: 4 }),
+        );
+        assert_eq!(check_id(3, 4), Ok(3));
+    }
+
+    #[test]
+    fn an_id_past_the_kernel_ceiling_is_refused() {
+        // vm_activate_cpu refuses vcpuid >= vm->maxcpus, and
+        // vm_set_topology re-pins maxcpus to VM_MAXCPU whatever the
+        // caller asks for, so a bigger MADT cannot widen this.
+        let id = KERNEL_MAX_CPUS;
+        assert_eq!(
+            check_id(id, KERNEL_MAX_CPUS * 4),
+            Err(VcpuError::OutOfRange {
+                id,
+                max_cpus: KERNEL_MAX_CPUS,
+            }),
+        );
+        assert_eq!(check_id(KERNEL_MAX_CPUS - 1, u32::MAX), Ok(63));
+    }
+
+    #[test]
+    fn no_slot_means_no_id_is_valid() {
+        assert!(check_id(0, 0).is_err());
+    }
+
+    #[test]
+    fn the_boot_set_starts_online() {
+        let book = VcpuBook::new(8, 2);
+
+        assert_eq!(book.online.iter().copied().collect::<Vec<_>>(), [0, 1]);
+    }
+
+    #[test]
+    fn more_boot_cpus_than_slots_cannot_claim_a_slot_that_is_not_there() {
+        let book = VcpuBook::new(2, 8);
+
+        assert_eq!(book.online.iter().copied().collect::<Vec<_>>(), [0, 1]);
+    }
+
+    #[test]
+    fn a_boot_cpu_cannot_be_added_again() {
+        let mut book = VcpuBook::new(8, 2);
+
+        assert_eq!(book.claim(1), Err(VcpuError::AlreadyOnline(1)));
+    }
+
+    #[test]
+    fn a_claim_is_refused_the_second_time() {
+        // The claim lands before any ioctl, so two concurrent adds of
+        // one id cannot both reach VM_ACTIVATE_CPU.
+        let mut book = VcpuBook::new(8, 1);
+
+        assert_eq!(book.claim(4), Ok(4));
+        assert_eq!(book.claim(4), Err(VcpuError::AlreadyOnline(4)));
+    }
+
+    #[test]
+    fn a_released_claim_can_be_taken_again() {
+        // A failed add that left the kernel with no active CPU must
+        // give the id back, or a retry is refused forever.
+        let mut book = VcpuBook::new(8, 1);
+        assert_eq!(book.claim(4), Ok(4));
+
+        book.release(4);
+
+        assert_eq!(book.claim(4), Ok(4));
+    }
+
+    #[test]
+    fn releasing_an_id_drops_its_metrics() {
+        let mut book = VcpuBook::new(8, 1);
+        book.claim(4).expect("slot 4 is free");
+        book.record(
+            4,
+            std::sync::Arc::new(vmm_devices::metrics::VcpuMetrics::new()),
+        );
+
+        book.release(4);
+
+        assert!(book.metrics.is_empty());
+    }
+
+    #[test]
+    fn an_out_of_range_claim_takes_no_slot() {
+        let mut book = VcpuBook::new(2, 1);
+
+        assert!(book.claim(9).is_err());
+        assert_eq!(book.online.len(), 1, "only the boot CPU is online");
+    }
+
+    #[test]
+    fn only_an_error_before_the_kernel_call_gives_the_id_back() {
+        // There is no vm_deactivate_cpu, so an id the kernel MAY have
+        // activated must stay claimed even though the add failed.
+        for error in [
+            VcpuError::OutOfRange { id: 4, max_cpus: 8 },
+            VcpuError::AlreadyOnline(4),
+            VcpuError::Setup {
+                id: 4,
+                step: "CPUID",
+                error: "EIO".into(),
+            },
+            VcpuError::Spawn {
+                id: 4,
+                error: "no threads".into(),
+            },
+            VcpuError::ShuttingDown(4),
+        ] {
+            assert!(error.left_cpu_inactive(), "{error:?} is before the ioctl");
+        }
+
+        // ThreadGone means the activation went through. EBUSY cannot
+        // prove it did not: vm_activate_cpu sets active_cpus at
+        // vmm.c:3369 and only then answers EBUSY for a VM that was
+        // suspended in the meantime (vmm.c:3375). An unknown errno from
+        // the ioctl layer says nothing either way.
+        for error in [
+            VcpuError::ThreadGone(4),
+            VcpuError::Suspended(4),
+            VcpuError::Activate {
+                id: 4,
+                error: "EIO".into(),
+            },
+        ] {
+            assert!(!error.left_cpu_inactive(), "{error:?} may have activated");
+        }
+    }
+
+    #[test]
+    fn every_error_says_which_cpu_it_is_about() {
+        let errors = [
+            VcpuError::OutOfRange { id: 7, max_cpus: 4 },
+            VcpuError::AlreadyOnline(7),
+            VcpuError::Suspended(7),
+            VcpuError::Activate {
+                id: 7,
+                error: "EIO".into(),
+            },
+            VcpuError::Setup {
+                id: 7,
+                step: "CPUID",
+                error: "EIO".into(),
+            },
+            VcpuError::Spawn {
+                id: 7,
+                error: "EAGAIN".into(),
+            },
+            VcpuError::ShuttingDown(7),
+            VcpuError::ThreadGone(7),
+        ];
+
+        for error in errors {
+            assert!(
+                error.to_string().contains('7'),
+                "{error:?} does not name the vCPU",
+            );
+        }
+    }
+
+    #[test]
+    fn a_hot_added_cpu_is_never_reset() {
+        // Vcpu::setup_bsp calls reboot_state(), and that on an AP
+        // clears the state the guest's INIT/SIPI bring-up depends on,
+        // which costs hundreds of seconds of SMP boot time.
+        let code = code_only();
+
+        assert!(!code.contains("setup_bsp"), "a hot-added CPU is an AP");
+        assert!(!code.contains("reboot_state"));
+        assert!(!code.contains("set_run_state"));
+    }
+
+    #[test]
+    fn nothing_here_can_remove_a_cpu() {
+        // illumos has no vm_deactivate_cpu: active_cpus is only ever
+        // set, and only VM_REINIT clears it, wholesale.
+        let code = code_only();
+
+        assert!(!code.contains("fn remove_vcpu"));
+        assert!(!code.contains("fn deactivate"));
+        assert!(!code.contains("fn offline"));
+        assert!(
+            implementation().contains("no `vm_deactivate_cpu`"),
+            "the absence has to stay documented",
+        );
+    }
+
+    #[test]
+    fn activation_is_the_last_fallible_step_of_an_add() {
+        // Everything before it is undone by dropping the start signal.
+        // Activation has no inverse.
+        let body = body_of("fn bring_online");
+        let spawn = body.find("spawn_one").expect("the thread is made");
+        let replay = body
+            .find("replay_boot_setup")
+            .expect("boot setup is replayed");
+        let activate = body.find(".activate()").expect("the CPU is activated");
+        let release =
+            body.find("signal.release").expect("the gate is released");
+
+        assert!(spawn < replay, "the thread is made before any setup");
+        assert!(
+            replay < activate,
+            "boot setup is replayed before activation"
+        );
+        assert!(activate < release, "the thread waits for the kernel");
+    }
+
+    #[test]
+    fn an_add_never_pre_activates_a_spare_cpu() {
+        // vmm.c:1634 declares the VM halted only when halted_cpus
+        // equals active_cpus, so an active CPU the guest never onlines
+        // stops VM_SUSPEND_HALT firing for the life of the VM.
+        let body = body_of("pub fn add_vcpu");
+
+        assert!(body.contains("bring_online"), "one add, one CPU");
+        assert_eq!(
+            code_only().matches(".activate()").count(),
+            1,
+            "activation happens in exactly one place",
+        );
+    }
+}

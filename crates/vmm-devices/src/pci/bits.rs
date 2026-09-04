@@ -162,10 +162,15 @@ pub const CLASS_MULTIMEDIA: u8 = 4;
 pub const CLASS_MEMORY: u8 = 5;
 pub const CLASS_BRIDGE: u8 = 6;
 pub const CLASS_COMMUNICATION: u8 = 7;
+/// "Unassigned class", for a device that fits no other. Distinct from
+/// CLASS_UNCLASSIFIED: 0xFF says "none of the above", 0x00 says nothing
+/// at all, and Linux refuses to assign BARs to the latter.
+pub const CLASS_OTHERS: u8 = 0xFF;
 
 // Sub-classes under CLASS_STORAGE
 pub const SUBCLASS_STORAGE_SATA: u8 = 6;
 pub const SUBCLASS_STORAGE_NVM: u8 = 8;
+pub const SUBCLASS_STORAGE_OTHER: u8 = 0x80;
 
 // Sub-classes under CLASS_BRIDGE
 pub const SUBCLASS_BRIDGE_HOST: u8 = 0;
