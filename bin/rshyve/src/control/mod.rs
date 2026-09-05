@@ -199,9 +199,8 @@ impl VmController {
         // guest would wait forever for their completions.
         let devices = self.named_devices();
         for named in &devices {
-            // An Indicator refuses a Pause to Pause transition, so a
-            // device an operator already paused must not be paused
-            // again.
+            // A device an operator already paused has stopped its
+            // workers, so pausing it again only repeats that work.
             if named.device.lifecycle_state()
                 != Some(vmm_devices::IndicatedState::Pause)
             {
