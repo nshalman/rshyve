@@ -67,6 +67,34 @@ impl VionaFd {
         unsafe { ioctl(self.as_raw_fd(), cmd, data as *mut libc::c_void) }
     }
 
+    /// Destroy the in-kernel link, which gives back its `vmm_drv` hold.
+    ///
+    /// WHY teardown must issue this: viona holds the VM for the life of
+    /// the link (`viona_main.c`, `vmm_drv_hold`). `VM_DESTROY_SELF`
+    /// purges the holds and then waits for every lease to break in an
+    /// untimed `cv_wait` (`vmm_sol_dev.c`, `vmm_drv_purge`). Releasing
+    /// the last hold first clears `VMM_HELD`, and the purge skips that
+    /// wait.
+    ///
+    /// The call itself waits for each ring worker to stop, in a
+    /// `cv_wait` that does not heed signals (`viona_ring.c`,
+    /// `viona_ring_reset`). Run it only where a lost thread is
+    /// acceptable.
+    pub fn delete(&self) -> Result<()> {
+        self.ioctl_usize(VNA_IOC_DELETE, 0)?;
+        Ok(())
+    }
+
+    /// Return one ring to its reset state.
+    ///
+    /// [`Self::delete`] resets every ring anyway. Doing it first lets a
+    /// signal interrupt the wait, so the uninterruptible reset inside
+    /// the delete has less left to do.
+    pub fn ring_reset(&self, ring: usize) -> Result<()> {
+        self.ioctl_usize(VNA_IOC_RING_RESET, ring)?;
+        Ok(())
+    }
+
     /// Query the API version exposed by the kernel VMM.
     pub fn api_version(&self) -> Result<u32> {
         let vers = self.ioctl_usize(VNA_IOC_VERSION, 0)?;
