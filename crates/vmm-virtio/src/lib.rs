@@ -215,18 +215,18 @@ pub trait VirtioDevice: Send + Sync + 'static {
 
     /// Reset the device to its initial state.
     ///
-    /// The transport publishes `DEVICE_STATUS` 0 as soon as this
-    /// returns, which tells the guest it can use the ring memory
-    /// again. A device with worker threads must therefore not return
-    /// until no worker can write the ring or the guest chains. The
-    /// transport cannot check this.
+    /// The transport calls this from the vCPU that wrote
+    /// `DEVICE_STATUS`, and publishes 0 as soon as it returns. A
+    /// legacy driver does not poll for that 0: illumos reclaims the
+    /// ring DMA on the next line. So this must not return while any
+    /// worker can still read or write the guest ring or a guest
+    /// chain. The transport cannot check that.
     ///
-    /// It may take as long as that needs. The transport calls this on
-    /// its own drain thread, never on the vCPU that wrote the status
-    /// register, so a wait here holds up the one device and nothing
-    /// else. Giving up on an unfinished drain is the wrong trade: the
-    /// guest frees the vring on reading that 0, and no check made
-    /// afterwards takes back a write that has already landed in it.
+    /// It must NOT wait for backend I/O. A backing-store operation
+    /// owns only host memory. Wait for the guest-memory accesses,
+    /// which are memcpys and ring publication, and let the I/O behind
+    /// them finish into host buffers a later epoch discards. That is
+    /// what makes this bounded enough to run on a vCPU.
     fn reset(&self);
 }
 

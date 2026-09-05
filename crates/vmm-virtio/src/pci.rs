@@ -42,16 +42,6 @@ use super::VirtioDevice;
 /// Maximum number of virtqueues per device.
 const MAX_QUEUES: usize = 4;
 
-/// Budget for a reset drain to finish once the device is halting.
-///
-/// The backend halt runs first and stops the workers the drain waits
-/// on, so this covers the hand back and not the I/O.
-const DRAIN_HALT_BUDGET: std::time::Duration =
-    std::time::Duration::from_secs(2);
-/// Poll interval while a halt waits for the drain thread.
-const DRAIN_HALT_POLL: std::time::Duration =
-    std::time::Duration::from_millis(5);
-
 /// State shared between the PCI device and the VirtIO transport.
 struct VirtioPciState {
     /// Selected queue index for configuration.
@@ -83,14 +73,15 @@ struct VirtioPciState {
     /// Configuration generation counter.
     config_generation: u8,
 
-    /// Set while a backend reset drains its workers.
+    /// Set while a backend reset drains its guest-memory accesses.
     ///
     /// The transport lock is released across that drain so a register
-    /// read is still served, which leaves the device reachable while
-    /// it is half reset. The latch sits inside the locked state so a
-    /// write cannot test it and then wait for the lock: every write
-    /// path tests the latch and changes the registers in one critical
-    /// section, and is dropped when the latch is closed.
+    /// read is still served, which leaves the device reachable to
+    /// another vCPU while it is half reset. The latch sits inside the
+    /// locked state so a write cannot test it and then wait for the
+    /// lock: every write path tests the latch and changes the
+    /// registers in one critical section, and is dropped when the
+    /// latch is closed.
     resetting: bool,
 }
 
@@ -151,11 +142,13 @@ impl VirtioPciState {
 
     /// The device status the driver may read.
     ///
-    /// The driver frees the vring as soon as it reads 0 (VirtIO 1.3
-    /// sec 4.1.4.3.1) and writes ACKNOWLEDGE next, and neither is safe
-    /// while the backend drains. A reset that starts from 0, which is
-    /// what a driver does when it probes a device it never used, would
-    /// otherwise report 0 for the whole drain.
+    /// The vCPU that asked for the reset is inside it, so this read
+    /// comes from another one. A driver frees the vring as soon as it
+    /// reads 0 (VirtIO 1.3 sec 4.1.4.3.1) and writes ACKNOWLEDGE next,
+    /// and neither is safe while the backend drains. A reset that
+    /// starts from 0, which is what a driver does when it probes a
+    /// device it never used, would otherwise report 0 for the whole
+    /// drain.
     fn readable_status(&self) -> u8 {
         if self.resetting {
             self.status | bits::STATUS_ACKNOWLEDGE
@@ -213,20 +206,6 @@ impl CapOffsets {
     }
 }
 
-/// The thread that finishes a device reset, and the channel that wakes
-/// it.
-///
-/// Started on the first reset, so a device the guest never resets pays
-/// nothing for it.
-#[derive(Default)]
-struct ResetDrain {
-    /// Wakes the thread. Dropped by `halt`, which is what ends it.
-    wake: Option<std::sync::mpsc::Sender<()>>,
-    handle: Option<std::thread::JoinHandle<()>>,
-    /// Set by `halt`. A halted device starts no new drain.
-    closed: bool,
-}
-
 /// One-shot park points a test installs to hold a thread at a named
 /// step of the reset protocol. The first thread to reach a point takes
 /// the hook and runs it, so a test can pin an interleaving that would
@@ -237,12 +216,6 @@ struct TestParks {
     /// Reached in a register write path once its reset-latch check has
     /// passed, and before the write changes any transport state.
     write_checked: ParkSlot,
-    /// Reached in the reset path once status 0 and the open latch are
-    /// both staged, and before either can be read.
-    reset_published: ParkSlot,
-    /// Reached in the refusal path once DEVICE_NEEDS_RESET is applied,
-    /// and before the config interrupt goes out.
-    needs_reset_applied: ParkSlot,
     /// Reached once the transport lock is dropped and before the
     /// config interrupt is delivered, which is the window a reset can
     /// run in.
@@ -308,8 +281,6 @@ pub struct VirtioPciDevice<D: VirtioDevice> {
     /// that refuses is guest driven and repeatable, so the rest go to
     /// `debug`.
     queue_refusal_reported: std::sync::atomic::AtomicBool,
-    /// The half of the reset protocol that must not run on a vCPU.
-    drain: Mutex<ResetDrain>,
     /// Counts driver sessions, one more each time a reset takes the
     /// device down. An event that sampled this under the transport
     /// lock can tell whether the driver it was raised for is still
@@ -479,7 +450,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             self_ref: Mutex::new(None),
             log,
             queue_refusal_reported: std::sync::atomic::AtomicBool::new(false),
-            drain: Mutex::new(ResetDrain::default()),
             session: std::sync::atomic::AtomicU64::new(0),
             config_intr: Mutex::new(()),
             #[cfg(test)]
@@ -1326,8 +1296,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         // Sampled under the guard that wrote the bit, so a reset that
         // wipes it is always the later of the two.
         let session = self.session.load(std::sync::atomic::Ordering::Acquire);
-        #[cfg(test)]
-        run_park(&self.parks.needs_reset_applied);
         drop(vs);
         if let Some(error) = error {
             let first = !self
@@ -1352,28 +1320,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             Some(hook);
     }
 
-    /// Install the one-shot park the reset reaches once status 0 and
-    /// the open latch are both staged.
-    #[cfg(test)]
-    fn park_reset_after_publish(&self, hook: Arc<dyn Fn() + Send + Sync>) {
-        *self
-            .parks
-            .reset_published
-            .lock()
-            .expect("park lock poisoned") = Some(hook);
-    }
-
-    /// Install the one-shot park a queue refusal reaches once it has
-    /// applied DEVICE_NEEDS_RESET.
-    #[cfg(test)]
-    fn park_refusal_after_status(&self, hook: Arc<dyn Fn() + Send + Sync>) {
-        *self
-            .parks
-            .needs_reset_applied
-            .lock()
-            .expect("park lock poisoned") = Some(hook);
-    }
-
     /// Install the one-shot park a config interrupt reaches once its
     /// caller has dropped the transport lock.
     #[cfg(test)]
@@ -1385,30 +1331,24 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             .expect("park lock poisoned") = Some(hook);
     }
 
-    /// Start a device reset, and return.
+    /// Reset the device, on the vCPU that wrote DEVICE_STATUS.
     ///
-    /// The driver frees the vring as soon as it reads DEVICE_STATUS
-    /// back as 0 (VirtIO 1.3 sec 4.1.4.3.1), so that 0 is published
-    /// only after the backend has drained. The same paragraph has the
-    /// driver poll for that 0 instead of waiting on its own write, and
-    /// that is what keeps the drain off this thread. A backend stuck
-    /// on host storage would otherwise hold the vCPU that wrote the
-    /// register for as long as it took, and a one-vCPU guest would
-    /// never reach the poll that ends it.
+    /// A legacy driver writes the register once and does not poll.
+    /// illumos `virtio_legacy_device_reset_locked()` is that one
+    /// write, and `virtio_shutdown()` reclaims the ring DMA straight
+    /// after it, so the write must not return while the backend can
+    /// still reach guest memory. A modern driver polls for 0 (VirtIO
+    /// 1.3 sec 4.1.4.3.1) and the same order satisfies it.
     ///
-    /// So the guest write does three things and returns. It clears
-    /// DRIVER_OK, which stops any vCPU queueing more work. It takes
-    /// the queues down. And it closes the latch, which is what makes
-    /// the rest safe: while the latch is closed every register write
-    /// is dropped and `readable_status` reports non-zero, so no driver
-    /// can act on a device the backend is still writing into.
-    /// [`finish_reset`](Self::finish_reset) publishes status 0 and
-    /// opens the latch, together, on the drain thread.
+    /// The wait is short by construction. A backing-store operation
+    /// owns only host memory, so the backend reset ends the request
+    /// epoch and waits out the guest-memory accesses that hold it,
+    /// never the I/O behind them.
     ///
-    /// A drain that never ends leaves the latch closed for good. The
-    /// guest then polls a device that never comes back, which costs it
-    /// that one device. No vCPU waits on it, and nothing is written
-    /// into a ring the guest believes it has freed.
+    /// The latch closes first because the transport lock is dropped
+    /// across the backend reset. While it is closed every register
+    /// write is dropped and `readable_status` reports non-zero, so a
+    /// second vCPU cannot act on a device that is half reset.
     ///
     /// The caller holds the transport lock, so the latch closes in the
     /// same critical section that tested it.
@@ -1425,86 +1365,15 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         drop(vs);
 
-        self.dispatch_drain();
-    }
-
-    /// Wake the drain thread, starting it if this is the first reset.
-    ///
-    /// A failure here is terminal for the device, by design. The latch
-    /// stays closed, the guest is never told the reset finished, and
-    /// no ring is written behind its back. Reporting success the
-    /// device cannot back is the outcome worth avoiding.
-    fn dispatch_drain(&self) {
-        let mut drain = self.drain.lock().expect("drain lock poisoned");
-        // A halted device does not come back.
-        if drain.closed {
-            return;
-        }
-        if drain.wake.is_none() {
-            let Some(weak) =
-                self.self_ref.lock().expect("self_ref lock").clone()
-            else {
-                slog::error!(
-                    self.log,
-                    "virtio-pci cannot drain a reset: no device handle"
-                );
-                return;
-            };
-            let (wake_tx, wake_rx) = std::sync::mpsc::channel();
-            match std::thread::Builder::new()
-                .name("virtio-reset-drain".into())
-                .spawn(move || Self::drain_loop(weak, wake_rx))
-            {
-                Ok(handle) => {
-                    drain.wake = Some(wake_tx);
-                    drain.handle = Some(handle);
-                }
-                Err(error) => {
-                    slog::error!(self.log,
-                        "virtio-pci cannot drain a reset: no thread";
-                        "error" => %error);
-                    return;
-                }
-            }
-        }
-        let gone = drain
-            .wake
-            .as_ref()
-            .is_some_and(|wake| wake.send(()).is_err());
-        if gone {
-            drain.wake = None;
-            slog::error!(
-                self.log,
-                "virtio-pci cannot drain a reset: the drain thread is gone"
-            );
-        }
-    }
-
-    /// The drain thread: one reset per wake.
-    ///
-    /// Holds only a weak reference between resets, so a device that is
-    /// dropped takes this thread with it rather than the other way
-    /// round. The strong reference it takes for the drain is what
-    /// keeps a device that is unplugged mid-drain alive until the
-    /// backend has let the ring go.
-    fn drain_loop(
-        dev: std::sync::Weak<Self>,
-        wake: std::sync::mpsc::Receiver<()>,
-    ) {
-        while wake.recv().is_ok() {
-            let Some(dev) = dev.upgrade() else {
-                return;
-            };
-            dev.finish_reset();
-        }
+        self.finish_reset();
     }
 
     /// Finish the reset the guest asked for, and publish the result.
     ///
-    /// The backend wait has no deadline, and this thread is why it can
-    /// have none: a worker inside a read is already writing into the
-    /// chain, and a device that gave up and reported the reset done
-    /// could not take that write back.
+    /// The backend wait has no deadline. It covers guest-memory
+    /// accesses only, so it is bounded by construction, and a device
+    /// that gave up on one could not take back the write a worker had
+    /// already started into the guest chain.
     fn finish_reset(&self) {
         self.device.reset();
 
@@ -1533,44 +1402,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             );
         }
         // Status 0 and the open latch reach the guest together. The
-        // driver polls for that 0 and writes ACKNOWLEDGE next, and
-        // that write must not meet a latch that is still closed.
+        // driver writes ACKNOWLEDGE next, and that write must not meet
+        // a latch that is still closed.
         vs.resetting = false;
-        #[cfg(test)]
-        run_park(&self.parks.reset_published);
         drop(vs);
-    }
-
-    /// Stop the drain thread, with a bound.
-    ///
-    /// A drain still waiting on a stuck backend must not hold the
-    /// teardown. It keeps its own strong reference to the device, so
-    /// leaving it to run is safe; waiting on it forever is not.
-    fn halt_drain(&self) {
-        let handle = {
-            let mut drain = self.drain.lock().expect("drain lock poisoned");
-            drain.closed = true;
-            // The thread's recv ends when the last sender drops.
-            drain.wake = None;
-            drain.handle.take()
-        };
-        let Some(handle) = handle else {
-            return;
-        };
-        let deadline = std::time::Instant::now() + DRAIN_HALT_BUDGET;
-        while !handle.is_finished() && std::time::Instant::now() < deadline {
-            std::thread::sleep(DRAIN_HALT_POLL);
-        }
-        if !handle.is_finished() {
-            slog::warn!(
-                self.log,
-                "virtio-pci left a reset drain running past its budget"
-            );
-            return;
-        }
-        if handle.join().is_err() {
-            slog::warn!(self.log, "virtio-pci reset drain thread panicked");
-        }
     }
 
     /// Signal the guest that the device needs a reset.
@@ -2007,10 +1842,7 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
     }
 
     fn halt(&self) {
-        // The backend halt stops the workers a drain waits on, so it
-        // runs first or the join below has nothing to wait for.
         Lifecycle::halt(&self.device);
-        self.halt_drain();
     }
 
     fn pause_for_migration(&self) {

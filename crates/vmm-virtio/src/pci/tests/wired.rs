@@ -59,10 +59,12 @@ fn bar_registration_holds_a_strong_self_reference() {
 }
 
 /// A backend whose reset blocks until the test releases it, standing
-/// in for one that must drain its I/O workers before it returns.
+/// in for one that must drain its guest-memory accesses.
 struct BlockingResetDevice {
     entered: std::sync::mpsc::Sender<()>,
     release: Mutex<std::sync::mpsc::Receiver<()>>,
+    /// The thread the transport called the reset on.
+    reset_thread: Mutex<Option<std::thread::ThreadId>>,
 }
 
 impl VirtioDevice for BlockingResetDevice {
@@ -89,6 +91,8 @@ impl VirtioDevice for BlockingResetDevice {
     }
 
     fn reset(&self) {
+        *self.reset_thread.lock().expect("reset thread lock") =
+            Some(std::thread::current().id());
         // A closed channel means the test already finished.
         let _ = self.entered.send(());
         let _ = self
@@ -121,6 +125,7 @@ fn a_slow_backend_reset_does_not_hold_the_transport_lock() {
         BlockingResetDevice {
             entered: entered_tx,
             release: Mutex::new(release_rx),
+            reset_thread: Mutex::new(None),
         },
         bits::VIRTIO_DEV_TYPE_BLOCK,
         1,
@@ -163,15 +168,15 @@ fn a_slow_backend_reset_does_not_hold_the_transport_lock() {
     assert!(served, "a register read blocked behind the backend reset");
 }
 
-// The driver frees the vring as soon as it reads DEVICE_STATUS back
-// as 0 (VirtIO 1.3 sec 4.1.4.3.1). The transport lock is released
-// across the backend drain so other registers stay readable, so the
-// reset must not publish that 0, and must not let a second vCPU
-// re-program the device, until the backend has finished draining.
+// A legacy driver reclaims the ring DMA on the line after its one
+// write to DEVICE_STATUS. The transport lock is released across the
+// backend drain so other registers stay readable, so a second vCPU
+// must neither read 0 nor re-program the device until that drain
+// ends, and the writing vCPU must find the reset already finished.
 #[test]
 fn a_draining_reset_is_not_visible_to_another_vcpu() {
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use vmm_core::common::{ReadOp, WriteOp};
 
     const READY: u8 = bits::STATUS_ACKNOWLEDGE
@@ -184,6 +189,7 @@ fn a_draining_reset_is_not_visible_to_another_vcpu() {
         BlockingResetDevice {
             entered: entered_tx,
             release: Mutex::new(release_rx),
+            reset_thread: Mutex::new(None),
         },
         bits::VIRTIO_DEV_TYPE_BLOCK,
         1,
@@ -213,6 +219,7 @@ fn a_draining_reset_is_not_visible_to_another_vcpu() {
         std::thread::spawn(move || {
             let wo = WriteOp::from_buf(&[0]);
             dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
+            std::thread::current().id()
         })
     };
     entered_rx
@@ -234,17 +241,15 @@ fn a_draining_reset_is_not_visible_to_another_vcpu() {
     );
 
     release_tx.send(()).expect("release the reset");
-    writer.join().expect("status write");
-    // The write returned before the drain did, so the 0 arrives on the
-    // drain thread and the driver polls for it.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while status(&dev) != 0 {
-        assert!(
-            Instant::now() < deadline,
-            "the reset never published its result"
-        );
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    let vcpu = writer.join().expect("status write");
+    // The write ran the reset to the end, so there is nothing to poll
+    // for: an illumos driver reads no status here at all.
+    assert_eq!(
+        *dev.device.reset_thread.lock().expect("reset thread lock"),
+        Some(vcpu),
+        "the backend reset ran off the vCPU that wrote DEVICE_STATUS"
+    );
+    assert_eq!(status(&dev), 0, "the write returned before the reset ended");
 }
 
 #[test]
