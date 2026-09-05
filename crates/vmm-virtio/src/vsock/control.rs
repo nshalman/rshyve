@@ -506,7 +506,8 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
-            let got = read_line_bounded(&mut server, &shutdown, CONTROL_LINE_MAX);
+            let got =
+                read_line_bounded(&mut server, &shutdown, CONTROL_LINE_MAX);
             let _ = tx.send(matches!(got, LineRead::Closed));
         });
 
