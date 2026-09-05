@@ -9,6 +9,8 @@
 //! never across a call to the backing store, so a device reset waits
 //! for a bounded amount of work and can run on the vCPU.
 
+use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
@@ -119,13 +121,20 @@ pub(super) fn needs_backend(rtype: u32) -> bool {
     )
 }
 
+/// Serve one queue's requests until the device drops its sender.
+///
+/// The worker owns a reference to the backing store for its whole
+/// life, so a syscall that is still running when the device goes away
+/// cannot land on a descriptor the host has reopened.
 pub(super) fn blk_io_worker(
     rx: mpsc::Receiver<BlkIoRequest>,
-    fd: i32,
+    file: Arc<File>,
     limits: DiskLimits,
     ctx: WorkerCtx,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
+
+    let fd = file.as_raw_fd();
 
     let mut bounce = Bounce::new();
     let mut done: Vec<(u16, u32)> = Vec::with_capacity(BATCH_MAX);

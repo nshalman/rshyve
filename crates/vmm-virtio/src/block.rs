@@ -139,10 +139,14 @@ pub struct VirtioBlock {
     pub interrupt: Arc<Mutex<Option<InterruptCallback>>>,
     /// Per-queue completion handlers, created on first notification.
     completions: Mutex<Vec<Option<Arc<VirtioCompletion>>>>,
-    /// Zvol write-cache control. Declared BEFORE `_file` so Drop runs
+    /// Zvol write-cache control. Declared BEFORE `file` so Drop runs
     /// `DKIOCSETWCE` restore while the fd is still open.
     _cache: DiskCache,
-    _file: File,
+    /// The backing store. Shared with every worker, so the descriptor
+    /// outlives a device that is dropped while a syscall is running.
+    /// A worker holding a bare fd number would resume against whatever
+    /// the host reopened on it.
+    file: Arc<File>,
     /// Lifecycle state indicator.
     indicator: Indicator,
     gate: Arc<QuiesceGate>,
@@ -161,6 +165,7 @@ impl VirtioBlock {
         let capacity = metadata.len() / u64::from(opts.sector_size);
         let read_only = opts.read_only;
         let raw_fd = file.as_raw_fd();
+        let file = Arc::new(file);
 
         // Enable zvol writeback cache (DKIOCSETWCE=1). Must happen before
         // any I/O so the first guest writes already hit the fast path.
@@ -190,11 +195,12 @@ impl VirtioBlock {
             for i in 0..workers_per_queue {
                 let (tx, rx) = mpsc::channel::<BlkIoRequest>();
                 let ctx = ctx.clone();
+                let file = Arc::clone(&file);
 
                 thread::Builder::new()
                     .name(format!("virtio-blk-q{q}-io-{i}"))
                     .spawn(move || {
-                        blk_io_worker(rx, raw_fd, limits, ctx);
+                        blk_io_worker(rx, file, limits, ctx);
                     })
                     .expect("failed to spawn virtio-blk I/O worker");
 
@@ -219,7 +225,7 @@ impl VirtioBlock {
             interrupt: Arc::new(Mutex::new(None)),
             completions: Mutex::new(completions),
             _cache: cache,
-            _file: file,
+            file,
             indicator: Indicator::new(),
             gate,
             ctx,
@@ -676,7 +682,7 @@ impl Lifecycle for VirtioBlock {
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
         vmm_devices::quiesce::flush_file(
             &self.gate,
-            &self._file,
+            &self.file,
             intent,
             "virtio-blk",
         )

@@ -46,7 +46,7 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         interrupt: Arc::new(Mutex::new(None)),
         completions: Mutex::new(Vec::new()),
         _cache: DiskCache::new(fd, true),
-        _file: file,
+        file: Arc::new(file),
         indicator: Indicator::new(),
         gate: Arc::new(QuiesceGate::new(1)),
         ctx: worker_ctx(&Arc::new(PhysMap::new())),
@@ -421,7 +421,9 @@ const DWZ_AVAIL_GPA: u64 = 0x1100;
 const DWZ_USED_GPA: u64 = 0x1200;
 const DWZ_HEADER_GPA: u64 = 0x2000;
 const DWZ_PAYLOAD_GPA: u64 = 0x2100;
-const DWZ_STATUS_GPA: u64 = 0x2200;
+/// Far enough past the payload that a full sector of data fits between
+/// them.
+const DWZ_STATUS_GPA: u64 = 0x3000;
 const DWZ_QUEUE_SIZE: u16 = 4;
 
 /// One `struct virtio_blk_discard_write_zeroes` (VirtIO 1.3, 5.2.6.2).

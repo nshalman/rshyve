@@ -125,6 +125,42 @@ fn a_reset_does_not_wait_for_the_backing_store() {
         waited < RESET_BUDGET,
         "the reset waited {waited:?} on the backing store"
     );
+
+    // The write the reset could not cancel still lands, from its host
+    // snapshot. Wait for it, so the harness outlives the syscall.
+    wait_for("the parked write never reached the disk", || {
+        read_backing(&h, 512).iter().all(|&b| b == 0xAA)
+    });
+}
+
+// A device can be dropped while a worker is still inside a syscall,
+// on an unplug or a teardown. The worker must not resume against a
+// bare descriptor number: the host reopens those, and the write would
+// land in whatever took it over.
+#[test]
+fn a_syscall_outlives_the_device_that_started_it() {
+    use std::os::unix::fs::FileExt;
+
+    let mut h = write_harness(&[0xAA; 512]);
+    let (reached, release) = park_at_backend(&h.block.ctx);
+
+    h.block.notify_queue(0, &mut h.queues, &h.physmap);
+    wait_for("the worker never reached the backing store", || {
+        reached.load(Ordering::Acquire)
+    });
+
+    let backing = h.backing.try_clone().expect("clone the backing file");
+    drop(h.block);
+    release.store(true, Ordering::Release);
+
+    wait_for(
+        "the write did not survive the device that started it",
+        || {
+            let mut head = [0u8; 512];
+            backing.read_exact_at(&mut head, 0).is_ok()
+                && head.iter().all(|&b| b == 0xAA)
+        },
+    );
 }
 
 // A guest that writes 0 to DEVICE_STATUS reclaims the vring straight
@@ -179,13 +215,13 @@ fn a_worker_drops_requests_from_a_closed_session() {
     let mut file = tempfile::tempfile().expect("create tempfile");
     std::io::Write::write_all(&mut file, &[0xAB; SECTOR])
         .expect("fill the backing file");
-    let fd = file.as_raw_fd();
+    let file = Arc::new(file);
     let limits = DiskLimits {
         capacity: 1,
         read_only: true,
         nodelete: true,
     };
-    thread::spawn(move || blk_io_worker(rx, fd, limits, ctx))
+    thread::spawn(move || blk_io_worker(rx, file, limits, ctx))
         .join()
         .expect("the worker exits when the channel disconnects");
 
@@ -274,14 +310,13 @@ fn a_worker_batch_does_not_span_a_reset() {
     tx.send(request(2, &live, live_epoch)).expect("send live");
     drop(tx);
 
-    let file = tempfile::tempfile().expect("create tempfile");
-    let fd = file.as_raw_fd();
+    let file = Arc::new(tempfile::tempfile().expect("create tempfile"));
     let limits = DiskLimits {
         capacity: 1,
         read_only: true,
         nodelete: true,
     };
-    thread::spawn(move || blk_io_worker(rx, fd, limits, ctx))
+    thread::spawn(move || blk_io_worker(rx, file, limits, ctx))
         .join()
         .expect("the worker exits when the channel disconnects");
 
