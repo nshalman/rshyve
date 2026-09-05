@@ -303,11 +303,6 @@ fn hot_add(ctrl: &VmController, add: impl FnOnce() -> Response) -> Response {
     }
 }
 
-/// Why a hot-add cannot run in this state.
-///
-/// Only a running VM may grow. A paused VM cannot enter the new vCPU
-/// thread, and a migrating VM would leave the addition behind, because
-/// the destination is built from the boot command line.
 /// Why `stop` cannot run now, or `None` when it can.
 ///
 /// A source whose guest moved to another host is left paused and
@@ -326,6 +321,11 @@ fn stop_refusal(
     }
 }
 
+/// Why a hot-add cannot run in this state.
+///
+/// Only a running VM may grow. A paused VM cannot enter the new vCPU
+/// thread, and a migrating VM would leave the addition behind, because
+/// the destination is built from the boot command line.
 fn hot_add_blocked(state: VmRunState) -> Option<Response> {
     if state == VmRunState::Running {
         return None;

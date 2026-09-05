@@ -835,7 +835,6 @@ fn start_mem_hotplug(
     )))
 }
 
-/// Optionally spawn the control socket listener thread.
 /// What the control socket leaves behind for the rest of `run`.
 #[derive(Default)]
 struct ControlSocket {
@@ -846,6 +845,7 @@ struct ControlSocket {
     stop: Option<Arc<dyn vmm_machine::signal::GuestStop>>,
 }
 
+/// Optionally spawn the control socket listener thread.
 fn spawn_control_socket(
     machine: &Machine,
     cli: &Cli,
