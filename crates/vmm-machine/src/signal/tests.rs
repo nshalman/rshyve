@@ -186,6 +186,11 @@ fn drive_with(
 /// The hook runs on every wait slice and is what raises the signal or
 /// arms the deadline, because a watchdog that is given neither waits
 /// for as long as the VMM lives.
+/// Most waits one watchdog run may take before the test gives up on
+/// it. The longest legitimate run is the teardown ceiling, which is
+/// far below this.
+const WAIT_CAP: usize = 10_000;
+
 fn drive_watchdog(
     stop: &RecordingStop,
     on_wait: impl Fn(&FakeClock, &Mutex<Option<Instant>>, &Mutex<bool>),
@@ -194,10 +199,22 @@ fn drive_watchdog(
     let deadline: Mutex<Option<Instant>> = Mutex::new(None);
     let signalled = Mutex::new(false);
     let gave_up = Mutex::new(false);
+    let waits = std::cell::Cell::new(0usize);
 
     watchdog(
         stop,
         |slice| {
+            // A watchdog that never reaches an exit would park the
+            // whole test run here, because the clock only moves when
+            // it waits. The cap makes that one failing test instead.
+            waits.set(waits.get() + 1);
+            assert!(
+                waits.get() <= WAIT_CAP,
+                "the watchdog never reached its terminal step: \
+                 {} waits, {:?} of fake time",
+                waits.get(),
+                clock.elapsed()
+            );
             clock.advance(slice);
             on_wait(&clock, &deadline, &signalled);
         },
