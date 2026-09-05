@@ -171,7 +171,7 @@ fn a_slow_backend_reset_does_not_hold_the_transport_lock() {
 #[test]
 fn a_draining_reset_is_not_visible_to_another_vcpu() {
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use vmm_core::common::{ReadOp, WriteOp};
 
     const READY: u8 = bits::STATUS_ACKNOWLEDGE
@@ -235,7 +235,16 @@ fn a_draining_reset_is_not_visible_to_another_vcpu() {
 
     release_tx.send(()).expect("release the reset");
     writer.join().expect("status write");
-    assert_eq!(status(&dev), 0, "the reset never published its result");
+    // The write returned before the drain did, so the 0 arrives on the
+    // drain thread and the driver polls for it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while status(&dev) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the reset never published its result"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 #[test]

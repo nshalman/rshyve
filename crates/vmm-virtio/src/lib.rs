@@ -220,6 +220,13 @@ pub trait VirtioDevice: Send + Sync + 'static {
     /// again. A device with worker threads must therefore not return
     /// until no worker can write the ring or the guest chains. The
     /// transport cannot check this.
+    ///
+    /// It may take as long as that needs. The transport calls this on
+    /// its own drain thread, never on the vCPU that wrote the status
+    /// register, so a wait here holds up the one device and nothing
+    /// else. Giving up on an unfinished drain is the wrong trade: the
+    /// guest frees the vring on reading that 0, and no check made
+    /// afterwards takes back a write that has already landed in it.
     fn reset(&self);
 }
 

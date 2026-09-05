@@ -399,14 +399,26 @@ fn device_status_zero_resets() {
         WriteOp::from_buf(&[bits::STATUS_ACKNOWLEDGE | bits::STATUS_DRIVER]);
     dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
 
-    // Reset by writing 0
+    // Reset by writing 0. The write returns before the backend has
+    // drained, and the driver polls for the 0 (VirtIO 1.3 sec
+    // 4.1.4.3.1), so poll for it here too.
     let wo = WriteOp::from_buf(&[0]);
     dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
 
-    // Status should be 0
-    let mut ro = ReadOp::new(1);
-    dev.bar_rw(BarN::BAR0, 0x12, RWOp::Read(&mut ro));
-    assert_eq!(ro.buf()[0], 0);
+    let status = || {
+        let mut ro = ReadOp::new(1);
+        dev.bar_rw(BarN::BAR0, 0x12, RWOp::Read(&mut ro));
+        ro.buf()[0]
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while status() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reset never published status 0"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 
 #[test]
