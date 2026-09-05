@@ -41,7 +41,7 @@
 //! unknown or malformed verb closes the connection with one error line
 //! and changes no state.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 
 use slog::warn;
 
+use vmm_core::unixsock::write_all_bounded;
 use vmm_devices::pci::msix::MsixTable;
 use vmm_devices::pci::LintrCfg;
 
@@ -70,6 +71,14 @@ const CONTROL_LINE_MAX: usize = 512;
 /// How long a blocked read waits before it looks at the shutdown flag.
 /// Without this, halt would wait for the peer instead of the guest.
 pub(super) const LINE_POLL: Duration = Duration::from_millis(250);
+
+/// How long a response line has to reach the peer.
+///
+/// This thread is one of the capped reader slots. `SO_SNDTIMEO` bounds
+/// nothing on illumos, so before this the answer to a peer that never
+/// read one held that slot for the life of the VM. Enough such peers
+/// and no further connection can be made, this session included.
+const RESPONSE_BUDGET: Duration = Duration::from_millis(500);
 
 /// How long a peer has to send its opening verb.
 ///
@@ -251,10 +260,24 @@ fn framed(answer: &str) -> &str {
     answer.split(['\r', '\n']).next().unwrap_or("")
 }
 
+/// Send one response line, and give up on a peer that will not take it.
+///
+/// The newline goes in the same write as the line. One response then
+/// costs one budget rather than two, and a peer that stalls cannot
+/// leave a line on the socket with no end to it.
+///
+/// [`write_all_bounded`] polls for space and then sends, so a second
+/// writer on the same socket would break the bound. There is no second
+/// writer here. [`run_control_session`] takes the socket by value, this
+/// module never clones it, and the CONTROL verb keeps it out of the
+/// device socket table, which is the only place another thread looks
+/// one up to write it. The `&mut` is what a later change has to break
+/// first.
 fn write_line(stream: &mut UnixStream, line: &str) -> io::Result<()> {
-    stream.write_all(line.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()
+    let mut out = Vec::with_capacity(line.len() + 1);
+    out.extend_from_slice(line.as_bytes());
+    out.push(b'\n');
+    write_all_bounded(stream, &out, RESPONSE_BUDGET)
 }
 
 /// Serve control requests until the peer closes or the device halts.
@@ -308,7 +331,7 @@ pub(super) fn run_control_session(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     use std::thread;
 
     use super::*;
@@ -346,6 +369,16 @@ mod tests {
     impl ControlSink for TwoLineSink {
         fn handle_line(&self, _line: &str) -> String {
             "OK first\nERR smuggled".to_string()
+        }
+    }
+
+    /// Answers with more than a socket buffer holds, so the write
+    /// cannot finish until the peer reads.
+    struct BulkSink;
+
+    impl ControlSink for BulkSink {
+        fn handle_line(&self, _line: &str) -> String {
+            format!("OK {}", "x".repeat(1024 * 1024))
         }
     }
 
@@ -488,6 +521,38 @@ mod tests {
         drop(client);
         drop(reader);
         handle.join().expect("session thread");
+    }
+
+    /// A peer that asks and never listens must not keep the session.
+    ///
+    /// The session thread is one of the capped reader slots, so a write
+    /// with no end here closes the socket to every other client for the
+    /// life of the VM.
+    #[test]
+    fn a_peer_that_never_reads_its_answer_loses_the_session() {
+        let slot = installed(Arc::new(BulkSink));
+        let (mut client, handle) =
+            session(&slot, Arc::new(AtomicBool::new(false)));
+
+        // Nothing here reads the socket: the banner and the answer
+        // together have to fill it.
+        client.write_all(b"device-list\n").expect("request");
+
+        // The session is the thing under test, so it cannot be joined
+        // here. One that never ended would park the test run.
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(handle.join().is_ok());
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "the session must end on its write budget, not on the peer"
+        );
+
+        // The peer stays open until here. One that closed would end
+        // the write on a broken pipe, which is not the case under test.
+        drop(client);
     }
 
     #[test]
