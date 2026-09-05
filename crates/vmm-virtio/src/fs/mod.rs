@@ -11,7 +11,7 @@ pub mod fuse;
 pub mod passthrough;
 pub mod server;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -47,6 +47,13 @@ pub const FS_MSIX_VECTORS: u16 = FS_NUM_QUEUES as u16 + 1;
 const FS_FORCE_INTERRUPTS: u32 = 32;
 /// Budget for the worker to finish its request during halt.
 const FS_HALT_BUDGET: Duration = Duration::from_secs(5);
+/// How long [`VirtioDevice::reset`] waits for the worker to drain.
+///
+/// The guest drives the reset, so the wait must be bounded: an unbounded
+/// one is a guest-triggerable vCPU hang. Requests that have not started
+/// are dropped by the epoch check, so this budget only ever covers a
+/// passthrough syscall already in flight.
+const FS_RESET_QUIESCE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Interrupt callback, wired by the binary after `VirtioPciDevice::new`.
 ///
@@ -154,6 +161,10 @@ struct FsRequest {
     head: u16,
     bufs: Vec<ChainBuf>,
     completion: Arc<VirtioCompletion>,
+    /// Device epoch this request was queued under. The worker drops the
+    /// request when it no longer matches: the chain and the completion
+    /// both point at a ring the driver has since torn down.
+    epoch: u64,
 }
 
 pub struct VirtioFs {
@@ -167,6 +178,9 @@ pub struct VirtioFs {
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     shutdown: Arc<AtomicBool>,
     gate: Arc<QuiesceGate>,
+    /// Bumped by every device reset. Tags each queued request so the
+    /// worker can tell one that predates the reset from a live one.
+    epoch: Arc<AtomicU64>,
     indicator: Indicator,
     log: slog::Logger,
     /// Queue-indexed interrupt callback. Clone this Arc BEFORE moving the
@@ -206,6 +220,7 @@ impl VirtioFs {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let gate = Arc::new(QuiesceGate::new(1));
+        let epoch = Arc::new(AtomicU64::new(0));
         let (tx, rx) = mpsc::channel::<FsRequest>();
 
         let worker = std::thread::Builder::new()
@@ -215,7 +230,8 @@ impl VirtioFs {
                 let physmap = Arc::clone(&physmap);
                 let gate = Arc::clone(&gate);
                 let shutdown = Arc::clone(&shutdown);
-                move || fs_worker(rx, server, physmap, gate, shutdown)
+                let epoch = Arc::clone(&epoch);
+                move || fs_worker(rx, server, physmap, gate, shutdown, epoch)
             })?;
 
         Ok(Self {
@@ -228,6 +244,7 @@ impl VirtioFs {
             worker: Mutex::new(Some(worker)),
             shutdown,
             gate,
+            epoch,
             indicator: Indicator::new(),
             log,
             interrupt: Arc::new(Mutex::new(None)),
@@ -270,6 +287,7 @@ fn fs_worker(
     physmap: Arc<PhysMap>,
     gate: Arc<QuiesceGate>,
     shutdown: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
 
@@ -289,7 +307,17 @@ fn fs_worker(
         if shutdown.load(Ordering::Acquire) {
             return;
         }
+        // A reset already invalidated this chain and its completion.
+        // Drop the request without touching guest memory.
+        if req.epoch != epoch.load(Ordering::Acquire) {
+            continue;
+        }
         let len = server.handle(&req.bufs, &physmap);
+        // A reset can land while the passthrough syscall runs; the used
+        // ring it would publish to is gone.
+        if req.epoch != epoch.load(Ordering::Acquire) {
+            continue;
+        }
         req.completion.complete(req.head, len);
     }
 }
@@ -362,6 +390,7 @@ impl VirtioDevice for VirtioFs {
         // queue size, so the counter lives outside the re-check loop.
         let max_requests = usize::from(queue.size());
         let mut popped = 0usize;
+        let epoch = self.epoch.load(Ordering::Acquire);
 
         loop {
             let before = queue.last_avail_idx();
@@ -381,6 +410,7 @@ impl VirtioDevice for VirtioFs {
                     head,
                     bufs,
                     completion: Arc::clone(&completion),
+                    epoch,
                 };
                 if tx.send(req).is_err() {
                     completion.complete(head, 0);
@@ -407,15 +437,43 @@ impl VirtioDevice for VirtioFs {
         false
     }
 
+    /// Reset the device, and do not return until the worker can no longer
+    /// write into the guest memory this ring used.
+    ///
+    /// The driver frees the vring as soon as it reads DEVICE_STATUS back
+    /// as 0, so a reply that outlives the reset lands in pages the guest
+    /// has recycled. VirtIO 1.3 sec 4.1.4.3.1 makes the driver poll for
+    /// that 0, which is what buys the device the time to drain.
+    ///
+    /// Bumping the epoch first drops every request that has not started,
+    /// so the wait only ever covers a syscall already in flight. Missing
+    /// the budget still completes the reset: the epoch keeps the straggler
+    /// off the used ring, and leaving the device half-reset would strand
+    /// the driver in that poll loop instead.
     fn reset(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+
+        // A device already paused for migration must stay paused; only the
+        // guest-driven reset owns the resume. Same rule as `flush_file`.
+        let was_paused = self.gate.is_paused();
+        self.gate.pause();
+        let quiesced = self.gate.wait_quiesced(FS_RESET_QUIESCE_BUDGET);
+
         *self.negotiated_features.lock().expect("features lock") = 0;
         for slot in self.completions.lock().expect("completion lock").iter_mut()
         {
             *slot = None;
         }
         // A guest reboot must not leak the inode and handle fd tables.
+        // The drain above is what makes this safe: the worker holds fds
+        // from this table across a FUSE call.
         self.server.passthrough().clear();
-        slog::info!(self.log, "virtio-fs reset");
+
+        if !was_paused {
+            self.gate.resume();
+        }
+        // Guest reachable: a driver can rebind virtio-fs in a loop.
+        slog::debug!(self.log, "virtio-fs reset"; "quiesced" => quiesced);
     }
 }
 
@@ -764,6 +822,71 @@ mod tests {
             .expect("completions")
             .iter()
             .all(Option::is_none));
+    }
+
+    // A guest that writes 0 to DEVICE_STATUS frees the vring right after.
+    // A reply the worker already dequeued must not land in the used ring
+    // the guest has recycled.
+    #[test]
+    fn reset_drops_a_request_queued_before_it() {
+        let (physmap, mut queues, fs) = ring(8, 1);
+        let req = usize::from(FS_REQUEST_QUEUE);
+
+        // Park the worker so the dispatch below is observable: the
+        // request sits in the channel instead of racing to completion.
+        fs.pause();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs.is_quiesced() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(fs.is_quiesced(), "worker did not park within the budget");
+
+        fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
+        assert_eq!(
+            queues[req].read_used_ring_idx(&physmap),
+            0,
+            "the parked worker must not have run yet"
+        );
+
+        VirtioDevice::reset(&fs);
+        fs.resume();
+
+        // A woken worker publishes within microseconds, so this window is
+        // orders of magnitude of margin.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            assert_eq!(
+                queues[req].read_used_ring_idx(&physmap),
+                0,
+                "the worker published into the pre-reset used ring"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // Reset pauses the worker to drain it. It must hand the gate back, or
+    // the next driver's first request never completes.
+    #[test]
+    fn reset_leaves_the_worker_runnable() {
+        let (physmap, mut queues, fs) = ring(8, 1);
+        let req = usize::from(FS_REQUEST_QUEUE);
+
+        VirtioDevice::reset(&fs);
+        assert!(!fs.gate.is_paused(), "reset left the worker parked");
+
+        fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queues[req].read_used_ring_idx(&physmap) == 0
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            queues[req].read_used_ring_idx(&physmap),
+            1,
+            "a post-reset request never completed"
+        );
     }
 
     // halt runs only from the paused state, and it must join the worker

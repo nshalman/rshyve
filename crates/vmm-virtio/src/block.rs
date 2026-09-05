@@ -19,9 +19,10 @@
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use vmm_devices::blkdev::{datasync, DiskCache};
 use vmm_devices::lifecycle::Indicator;
@@ -35,6 +36,7 @@ mod probes {
     fn vioblk_inline(head: u16, rtype: u32, sector: u64) {}
     fn vioblk_dispatch(head: u16, rtype: u32, sector: u64) {}
     fn vioblk_complete(head: u16, status: u8) {}
+    fn vioblk_reset_stuck(epoch: u64) {}
 }
 
 use super::bits;
@@ -52,6 +54,17 @@ mod tests;
 /// per-disk. 8 is enough parallel syscalls for deep queues without hotspotting
 /// the `VirtioCompletion` Mutex<u16>.
 const NUM_WORKERS: usize = 8;
+/// Completions a worker gathers before it takes the `VirtioCompletion`
+/// lock once for the whole set.
+const BATCH_MAX: usize = 16;
+/// How long [`VirtioDevice::reset`] waits for the workers to drain.
+///
+/// The guest drives the reset, so the wait must be bounded: an unbounded
+/// one is a guest-triggerable vCPU hang. Two seconds covers a syscall
+/// already issued against a loaded zvol. Requests that have not started
+/// are dropped by the epoch check, so this budget only ever covers the
+/// syscalls in flight when the reset arrived.
+const RESET_QUIESCE_BUDGET: Duration = Duration::from_secs(2);
 pub const BLK_CONFIG_SIZE: u16 = 8;
 /// Extended config size covering all VirtIO 1.3 block config fields
 /// (capacity through write_zeroes_may_unmap at offset 0x38+1=0x3C).
@@ -113,6 +126,10 @@ struct BlkIoRequest {
     chain: Vec<ChainBuf>,
     head: u16,
     completion: Arc<VirtioCompletion>,
+    /// Device epoch this request was dispatched under. A worker drops the
+    /// request when it no longer matches: the chain and the completion
+    /// both point at a ring the driver has since torn down.
+    epoch: u64,
 }
 
 type InterruptCallback = Arc<dyn Fn() + Send + Sync>;
@@ -147,6 +164,9 @@ pub struct VirtioBlock {
     /// Lifecycle state indicator.
     indicator: Indicator,
     gate: Arc<QuiesceGate>,
+    /// Bumped by every device reset. Tags each dispatched request so a
+    /// worker can tell one that predates the reset from a live one.
+    epoch: Arc<AtomicU64>,
 }
 
 impl VirtioBlock {
@@ -174,6 +194,7 @@ impl VirtioBlock {
         let workers_per_queue = if num_queues <= 1 { NUM_WORKERS } else { 2 };
         let total_workers = num_queues as usize * workers_per_queue;
         let gate = Arc::new(QuiesceGate::new(total_workers));
+        let epoch = Arc::new(AtomicU64::new(0));
         let mut io_txs = Vec::with_capacity(total_workers);
         let mut next_worker = Vec::with_capacity(num_queues as usize);
 
@@ -182,11 +203,12 @@ impl VirtioBlock {
                 let (tx, rx) = mpsc::channel::<BlkIoRequest>();
                 let physmap = Arc::clone(&physmap);
                 let gate = Arc::clone(&gate);
+                let epoch = Arc::clone(&epoch);
 
                 thread::Builder::new()
                     .name(format!("virtio-blk-q{q}-io-{i}"))
                     .spawn(move || {
-                        blk_io_worker(rx, raw_fd, limits, physmap, gate);
+                        blk_io_worker(rx, raw_fd, limits, physmap, gate, epoch);
                     })
                     .expect("failed to spawn virtio-blk I/O worker");
 
@@ -215,6 +237,7 @@ impl VirtioBlock {
             _file: file,
             indicator: Indicator::new(),
             gate,
+            epoch,
         })
     }
 
@@ -557,6 +580,7 @@ impl VirtioDevice for VirtioBlock {
 
         // Multiple requests: round-robin dispatch to per-worker channels.
         let base = queue_idx as usize * self.workers_per_queue;
+        let epoch = self.epoch.load(Ordering::Acquire);
         for (head, header, chain) in requests {
             probes::vioblk_dispatch!(|| (head, header.rtype, header.sector));
             let idx = self.next_worker[queue_idx as usize]
@@ -569,6 +593,7 @@ impl VirtioDevice for VirtioBlock {
                 chain,
                 head,
                 completion: Arc::clone(&completion),
+                epoch,
             });
         }
 
@@ -585,11 +610,41 @@ impl VirtioDevice for VirtioBlock {
         0 // not called — notify_queue is overridden
     }
 
+    /// Reset the device, and do not return until no worker can still
+    /// write into the guest memory this ring used.
+    ///
+    /// The driver frees the vring as soon as it reads DEVICE_STATUS back
+    /// as 0, so a worker that outlives the reset writes disk data, a
+    /// status byte and a used entry into pages the guest has recycled.
+    /// VirtIO 1.3 sec 4.1.4.3.1 makes the driver poll for that 0, which is
+    /// what buys the device the time to drain.
+    ///
+    /// Bumping the epoch first drops every request that has not started,
+    /// so the wait only ever covers syscalls already in flight. Missing
+    /// the budget still completes the reset: the epoch keeps the stragglers
+    /// off the used ring, and leaving the device half-reset would strand
+    /// the driver in that poll loop instead.
     fn reset(&self) {
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // A device already paused for migration must stay paused; only the
+        // guest-driven reset owns the resume. Same rule as `flush_file`.
+        let was_paused = self.gate.is_paused();
+        self.gate.pause();
+        let quiesced = self.gate.wait_quiesced(RESET_QUIESCE_BUDGET);
+
         *self.negotiated_features.lock().expect("lock") = 0;
         let mut slots = self.completions.lock().expect("lock");
         for slot in slots.iter_mut() {
             *slot = None;
+        }
+        drop(slots);
+
+        if !was_paused {
+            self.gate.resume();
+        }
+        if !quiesced {
+            probes::vioblk_reset_stuck!(|| epoch);
         }
     }
 }
@@ -648,54 +703,77 @@ fn blk_io_worker(
     limits: DiskLimits,
     physmap: Arc<PhysMap>,
     gate: Arc<QuiesceGate>,
+    epoch: Arc<AtomicU64>,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
 
+    // Carries the one request a batch drain had to hand back because it
+    // crossed a reset boundary.
+    let mut carried: Option<BlkIoRequest> = None;
+
     loop {
-        let req = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(r) => r,
-            Err(RecvTimeoutError::Timeout) => {
-                gate.park_if_paused();
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => return,
+        let req = match carried.take() {
+            Some(req) => req,
+            None => match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(r) => r,
+                Err(RecvTimeoutError::Timeout) => {
+                    gate.park_if_paused();
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
+            },
         };
 
-        // Process first request
+        // A reset already invalidated this request's chain and completion.
+        // Drop it without touching guest memory.
+        let current = epoch.load(Ordering::Acquire);
+        if req.epoch != current {
+            continue;
+        }
+
         let completion = Arc::clone(&req.completion);
-        let first = process_one_request(fd, &limits, &physmap, req);
+        let mut batch = Vec::with_capacity(BATCH_MAX);
+        batch.extend(process_one_request(fd, &limits, &physmap, &epoch, req));
 
         // Try to drain more pending requests for batching.
         // This reduces Mutex acquisitions in VirtioCompletion:
         // one complete_batch() instead of N complete() calls.
-        let mut batch = Vec::new();
-        batch.push(first);
-        while batch.len() < 16 {
-            match rx.try_recv() {
-                Ok(req) => {
-                    batch.push(process_one_request(fd, &limits, &physmap, req));
-                }
-                Err(_) => break,
+        while batch.len() < BATCH_MAX {
+            let Ok(next) = rx.try_recv() else { break };
+            if next.epoch != current {
+                // A reset landed mid drain. Publish what this batch holds
+                // before touching a request from the other side of it.
+                carried = Some(next);
+                break;
             }
+            batch.extend(process_one_request(
+                fd, &limits, &physmap, &epoch, next,
+            ));
         }
 
-        if batch.len() == 1 {
-            let (head, written) = batch[0];
-            completion.complete(head, written);
-        } else {
-            completion.complete_batch(&batch);
+        match batch.len() {
+            0 => {}
+            1 => {
+                let (head, written) = batch[0];
+                completion.complete(head, written);
+            }
+            _ => completion.complete_batch(&batch),
         }
     }
 }
 
 /// Process a single I/O request: execute the operation, write status.
 /// Returns (head, written) for completion batching.
+///
+/// Returns `None` when a reset landed while the syscall ran: the status
+/// byte and the used entry would both go to memory the driver has freed.
 fn process_one_request(
     fd: i32,
     limits: &DiskLimits,
     physmap: &PhysMap,
+    epoch: &AtomicU64,
     req: BlkIoRequest,
-) -> (u16, u32) {
+) -> Option<(u16, u32)> {
     let (status, written) = match req.rtype {
         bits::VIRTIO_BLK_T_IN => do_pread(fd, req.sector, &req.chain, physmap),
         bits::VIRTIO_BLK_T_OUT if !limits.read_only => {
@@ -715,9 +793,12 @@ fn process_one_request(
         _ => (bits::VIRTIO_BLK_S_UNSUPP, 1),
     };
 
+    if req.epoch != epoch.load(Ordering::Acquire) {
+        return None;
+    }
     write_status(physmap, &req.chain, status);
     probes::vioblk_complete!(|| (req.head, status));
-    (req.head, written)
+    Some((req.head, written))
 }
 
 // ---------------------------------------------------------------------------

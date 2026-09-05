@@ -910,7 +910,13 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             bits::COMMON_CFG_DEVICE_STATUS => {
                 let new_status = val as u8;
                 if new_status == 0 {
+                    // Clear the transport first: that drops DRIVER_OK, so
+                    // no vCPU can queue new work while the backend drains.
+                    // Then release the lock, because the backend reset
+                    // waits for its I/O workers and every other vCPU that
+                    // touches this device would queue behind it.
                     vs.reset();
+                    drop(vs);
                     self.device.reset();
                     self.isr_status
                         .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -925,7 +931,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                             std::sync::atomic::Ordering::Relaxed,
                         );
                     }
-                    drop(vs);
                     self.lower_interrupt();
                 } else {
                     if new_status & bits::STATUS_FEATURES_OK != 0
@@ -1258,7 +1263,13 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             bits::LEGACY_REG_DEVICE_STATUS => {
                 let new_status = val as u8;
                 if new_status == 0 {
+                    // Clear the transport first: that drops DRIVER_OK, so
+                    // no vCPU can queue new work while the backend drains.
+                    // Then release the lock, because the backend reset
+                    // waits for its I/O workers and every other vCPU that
+                    // touches this device would queue behind it.
                     vs.reset();
+                    drop(vs);
                     self.device.reset();
                     self.isr_status
                         .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1272,7 +1283,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                             std::sync::atomic::Ordering::Relaxed,
                         );
                     }
-                    drop(vs);
                     // Ensure interrupt line is low on reset so the
                     // next driver doesn't see a spurious assertion
                     // when it enables the IOAPIC pin.
@@ -2943,6 +2953,111 @@ mod tests {
         enable_bars(&dev);
         // One handler for BAR0 (PIO) and one for BAR2 (MMIO).
         assert_eq!(Arc::strong_count(&dev), 3);
+    }
+
+    /// A backend whose reset blocks until the test releases it, standing
+    /// in for one that must drain its I/O workers before it returns.
+    struct BlockingResetDevice {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl VirtioDevice for BlockingResetDevice {
+        fn device_features(&self) -> u64 {
+            0
+        }
+
+        fn set_features(&self, _features: u64) {}
+
+        fn cfg_read(&self, _offset: u16, _len: u8) -> u32 {
+            0
+        }
+
+        fn cfg_write(&self, _offset: u16, _val: u32, _len: u8) {}
+
+        fn process_queue(
+            &self,
+            _queue_idx: u16,
+            _queue: &mut VirtQueue,
+            _head: u16,
+            _physmap: &PhysMap,
+        ) -> u32 {
+            0
+        }
+
+        fn reset(&self) {
+            // A closed channel means the test already finished.
+            let _ = self.entered.send(());
+            let _ = self
+                .release
+                .lock()
+                .expect("release lock")
+                .recv_timeout(std::time::Duration::from_secs(10));
+        }
+    }
+
+    impl Lifecycle for BlockingResetDevice {
+        fn type_name(&self) -> &'static str {
+            "blocking-reset"
+        }
+    }
+
+    // A backend reset must drain its I/O workers before it returns, and
+    // the driver polls DEVICE_STATUS until it reads 0 (VirtIO 1.3 sec
+    // 4.1.4.3.1). Holding the transport lock across that wait stalls
+    // every other vCPU that touches this device.
+    #[test]
+    fn a_slow_backend_reset_does_not_hold_the_transport_lock() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        use vmm_core::common::{ReadOp, WriteOp};
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let dev = VirtioPciDevice::new(
+            BlockingResetDevice {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            },
+            bits::VIRTIO_DEV_TYPE_BLOCK,
+            1,
+            256,
+            8,
+            None,
+            Arc::new(PhysMap::new()),
+            Arc::new(PioBus::new()),
+            Arc::new(MmioBus::new()),
+            None,
+        );
+
+        let writer = {
+            let dev = Arc::clone(&dev);
+            std::thread::spawn(move || {
+                let wo = WriteOp::from_buf(&[0]);
+                dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the backend reset ran");
+
+        let reader = {
+            let dev = Arc::clone(&dev);
+            std::thread::spawn(move || {
+                let mut ro = ReadOp::new(1);
+                dev.bar_rw(BarN::BAR0, 0x12, RWOp::Read(&mut ro));
+            })
+        };
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !reader.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let served = reader.is_finished();
+
+        release_tx.send(()).expect("release the reset");
+        writer.join().expect("status write");
+        reader.join().expect("status read");
+        assert!(served, "a register read blocked behind the backend reset");
     }
 
     #[test]
