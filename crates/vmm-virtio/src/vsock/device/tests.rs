@@ -301,8 +301,7 @@ fn a_good_rx_chain_is_held_for_a_packet() {
 fn a_silent_peer_does_not_park_the_connect_thread() {
     let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
     let shared = Arc::clone(&vsock.shared);
-    let (_peer, device_end) =
-        std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let (_peer, device_end) = UnixStream::pair().expect("socketpair");
 
     let reader =
         std::thread::spawn(move || handle_host_connect(shared, device_end));
@@ -365,12 +364,11 @@ fn a_host_connect_over_the_cap_is_closed() {
         }));
     }
 
-    let (peer, device_end) =
-        std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let (peer, device_end) = UnixStream::pair().expect("socketpair");
     start_host_connection(Arc::clone(&vsock.shared), device_end, 9999);
 
     let mut answer = String::new();
-    std::io::BufReader::new(peer)
+    io::BufReader::new(peer)
         .read_line(&mut answer)
         .expect("read the refusal");
     assert!(answer.starts_with("ERROR"), "answered {answer:?}");

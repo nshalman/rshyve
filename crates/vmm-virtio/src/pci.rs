@@ -989,7 +989,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                                 q.reset();
                             }
                             self.refuse_queue(vs, idx, Some(error));
-                            return;
                         }
                         Some(Ok(())) => {
                             vs.queue_enabled[idx] = true;
@@ -1315,7 +1314,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                             q.reset();
                         }
                         self.refuse_queue(vs, idx, Some(error));
-                        return;
                     }
                     Some(Ok(())) => {
                         // Notify the device of the new queue address
