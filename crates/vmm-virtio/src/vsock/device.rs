@@ -27,7 +27,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use slog::{debug, warn};
+use slog::debug;
 use vmm_core::mem::PhysMap;
 use vmm_core::unixsock::{bind_restricted, SocketPolicy};
 
@@ -214,6 +214,12 @@ impl VsockShared {
     fn write_host(&self, key: ConnKey, data: &[u8]) {
         let mut sockets = self.sockets.lock().expect("sockets lock");
         let Some(stream) = sockets.get_mut(&key) else {
+            // The mux still holds the connection, so the guest thinks
+            // it is live and would read a stream with a hole in it.
+            // Dropping the payload in silence is what leaves it there.
+            drop(sockets);
+            self.mux.queue_host_close(key);
+            self.deliver_rx();
             return;
         };
         if stream.write_all(data).is_err() {
@@ -443,25 +449,26 @@ fn start_host_connection(
         host_port: shared.mux.alloc_host_port(),
     };
     let mut s = stream;
-    // Register before answering. The table is capped, and a peer told
-    // OK for a connection the mux refused would wait on a guest that is
-    // never going to hear about it.
+    let Ok(peer) = s.try_clone() else {
+        return;
+    };
+    // The socket goes in the table before the guest hears about the
+    // connection: start_host_connect queues the REQUEST, and any
+    // thread may hand that to the guest before this one runs again.
+    // Payload for a key with no socket has nowhere to go.
+    if !shared.register_socket(key, peer) {
+        return;
+    }
+    // The table is capped, and a peer told OK for a connection the mux
+    // refused would wait on a guest that is never going to hear about
+    // it. The ERROR goes out before the socket is shut down.
     if !shared.mux.start_host_connect(key) {
         let _ = writeln!(s, "ERROR: too many connections");
+        shared.drop_socket(key);
         return;
     }
     if writeln!(s, "OK {}", key.host_port).is_err() {
-        shared.mux.forget(key);
-        return;
-    }
-    let peer = match s.try_clone() {
-        Ok(peer) => peer,
-        Err(_) => {
-            shared.mux.forget(key);
-            return;
-        }
-    };
-    if !shared.register_socket(key, peer) {
+        shared.drop_socket(key);
         shared.mux.forget(key);
         return;
     }
@@ -751,7 +758,9 @@ impl VirtioVsock {
         let stream = match UnixStream::connect(&path) {
             Ok(s) => s,
             Err(error) => {
-                warn!(self.shared.log, "virtio-vsock guest connect refused";
+                // Guest reachable and unbounded: a guest dialling a
+                // closed port in a loop reaches this once per packet.
+                debug!(self.shared.log, "virtio-vsock guest connect refused";
                     "path" => &path, "error" => %error);
                 self.shared.mux.refuse_guest_connect(key);
                 return;

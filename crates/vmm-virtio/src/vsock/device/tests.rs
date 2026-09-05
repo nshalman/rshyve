@@ -309,8 +309,8 @@ fn a_silent_peer_does_not_park_the_connect_thread() {
     assert!(!reader.is_finished(), "the reader must still be waiting");
 
     vsock.shared.shutdown.store(true, Ordering::Release);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !reader.is_finished() && std::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !reader.is_finished() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(
@@ -334,11 +334,11 @@ fn a_finished_reader_is_reaped_when_the_next_one_starts() {
         let handle = std::thread::spawn(|| {});
         vsock.shared.track_reader(handle);
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         vsock.shared.track_reader(std::thread::spawn(|| {}));
         let live = vsock.shared.readers.lock().expect("reader lock").len();
-        if live <= 2 || std::time::Instant::now() >= deadline {
+        if live <= 2 || Instant::now() >= deadline {
             assert!(live <= 2, "{live} handles were kept");
             break;
         }
@@ -447,8 +447,8 @@ fn a_host_peer_that_never_reads_does_not_hold_the_writer() {
             shared.write_host(key, &vec![0u8; 8 * 1024 * 1024]);
         })
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !writer.is_finished() && std::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !writer.is_finished() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(
@@ -481,8 +481,8 @@ fn a_silent_peer_gives_its_connect_thread_back() {
 
     let reader =
         std::thread::spawn(move || handle_host_connect(shared, device_end));
-    let deadline = std::time::Instant::now() + HANDSHAKE_BUDGET * 4;
-    while !reader.is_finished() && std::time::Instant::now() < deadline {
+    let deadline = Instant::now() + HANDSHAKE_BUDGET * 4;
+    while !reader.is_finished() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
@@ -490,6 +490,37 @@ fn a_silent_peer_gives_its_connect_thread_back() {
         "a peer that sent nothing held its thread past the handshake budget"
     );
     reader.join().expect("join the reader");
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Payload for a connection the mux knows but the table has no socket
+/// for must not vanish. The guest still believes the connection is
+/// live, so it would read a byte stream with a hole in it and nothing
+/// would say so.
+#[test]
+fn payload_with_no_host_socket_tells_the_guest() {
+    use super::super::packet::OP_SHUTDOWN;
+
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    let key = ConnKey {
+        guest_port: 1024,
+        host_port: 1,
+    };
+    assert!(vsock.shared.mux.start_host_connect(key));
+    // Drop the REQUEST the mux queued, so only what the write below
+    // queues is left to read.
+    while vsock.shared.mux.pop_rx().is_some() {}
+
+    vsock.shared.write_host(key, b"lost");
+
+    let packet = vsock
+        .shared
+        .mux
+        .pop_rx()
+        .expect("the guest was told nothing about the lost payload");
+    assert_eq!(packet.hdr.op, OP_SHUTDOWN);
 
     vsock.halt();
     let _ = std::fs::remove_dir_all(&dir);
