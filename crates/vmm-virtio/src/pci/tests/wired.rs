@@ -439,6 +439,39 @@ fn a_queue_that_refuses_its_rings_on_first_use_raises_needs_reset() {
     );
 }
 
+/// The same first use, over the legacy BAR the bhyve guests in the
+/// field drive. The two notify paths are separate code, and only this
+/// one ships to an illumos guest.
+#[test]
+fn a_legacy_first_use_of_a_refused_queue_raises_needs_reset() {
+    use vmm_core::common::WriteOp;
+    let dev = device_with_ram();
+    {
+        let mut vs = dev.virtio_state.lock().expect("virtio lock");
+        // Past the mapped 16 KiB, so every ring access fails.
+        vs.queues[0].set_addr_modern(
+            RING_GPA + 0x3000,
+            RING_GPA + 0x3800,
+            RING_GPA + 0x3C00,
+        );
+        vs.queue_enabled[0] = true;
+        vs.status = bits::STATUS_DRIVER_OK;
+    }
+
+    let wo = WriteOp::from_buf(&0u16.to_le_bytes());
+    dev.bar_rw(
+        BarN::BAR0,
+        bits::LEGACY_REG_QUEUE_NOTIFY.into(),
+        RWOp::Write(&wo),
+    );
+
+    assert_ne!(
+        device_status(&dev) & bits::STATUS_DEVICE_NEEDS_RESET,
+        0,
+        "a legacy guest was never told the queue had stopped",
+    );
+}
+
 /// Records every MSI-X message the transport delivers.
 struct RecordingSink(Mutex<Vec<(u64, u64)>>);
 
