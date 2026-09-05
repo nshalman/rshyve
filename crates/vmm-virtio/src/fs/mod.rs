@@ -362,6 +362,9 @@ fn fs_worker(rx: mpsc::Receiver<FsRequest>, ctx: FsWorkerCtx) {
 /// the syscall and writes the reply into the guest's chain before it
 /// returns, so no check made after it takes that write back; only this
 /// guard stops a reset from reporting itself done in the middle of it.
+///
+/// Nothing here may park on the quiesce gate. A worker that parked
+/// holding the guard would wedge the reset of a paused device.
 fn serve_request(ctx: &FsWorkerCtx, req: &FsRequest) {
     let _access = ctx
         .ring_access

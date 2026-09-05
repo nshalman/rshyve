@@ -782,6 +782,9 @@ fn blk_io_worker(
 /// status byte, and every used entry. A reset takes the exclusive side,
 /// so a worker descheduled inside `preadv` holds the reset open instead
 /// of racing it.
+///
+/// Nothing here may park on the quiesce gate. A worker that parked
+/// holding the guard would wedge the reset of a paused device.
 fn run_batch(
     rx: &mpsc::Receiver<BlkIoRequest>,
     fd: i32,

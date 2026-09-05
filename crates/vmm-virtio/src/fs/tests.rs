@@ -155,8 +155,8 @@ fn tag_defaults_to_the_last_path_component() {
 
 #[test]
 fn options_are_parsed() {
-    let opts = parse_fs_config("/export/x,tag=data,ro,queue-size=256")
-        .expect("parse");
+    let opts =
+        parse_fs_config("/export/x,tag=data,ro,queue-size=256").expect("parse");
     assert_eq!(opts.tag, "data");
     assert!(opts.read_only);
     assert_eq!(opts.queue_size, 256);
@@ -165,8 +165,8 @@ fn options_are_parsed() {
 #[test]
 fn oversized_tag_is_rejected() {
     let tag = "t".repeat(FS_TAG_LEN + 1);
-    let err = parse_fs_config(&format!("/export/x,tag={tag}"))
-        .expect_err("long tag");
+    let err =
+        parse_fs_config(&format!("/export/x,tag={tag}")).expect_err("long tag");
     assert_eq!(
         err.to_string(),
         format!("virtio-fs tag '{tag}' exceeds {FS_TAG_LEN} bytes")
@@ -175,8 +175,7 @@ fn oversized_tag_is_rejected() {
 
 #[test]
 fn out_of_range_queue_size_is_rejected() {
-    let err =
-        parse_fs_config("/export/x,queue-size=4").expect_err("too small");
+    let err = parse_fs_config("/export/x,queue-size=4").expect_err("too small");
     assert_eq!(
         err.to_string(),
         "virtio-fs queue-size must be 8..=1024, got 4"
@@ -288,8 +287,7 @@ fn notify_queue_caps_collection_at_queue_size() {
     // two-entry queue has processed one queue's worth of work.
     let (physmap, mut queues, fs) = ring(2, 4);
     let req = usize::from(FS_REQUEST_QUEUE);
-    let gpa =
-        queues[req].used_addr() + 4 + u64::from(queues[req].size()) * 8;
+    let gpa = queues[req].used_addr() + 4 + u64::from(queues[req].size()) * 8;
     physmap
         .lookup(gpa, 2)
         .expect("mapped avail event")
@@ -406,8 +404,7 @@ fn reset_never_parks_the_worker() {
 
     fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while fs.inflight.load(Ordering::Acquire) != 0
-        && Instant::now() < deadline
+    while fs.inflight.load(Ordering::Acquire) != 0 && Instant::now() < deadline
     {
         std::thread::sleep(Duration::from_millis(1));
     }
