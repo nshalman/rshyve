@@ -9,8 +9,9 @@
 //! backend drain runs on the device's own thread, so the device stays
 //! reachable while it is half reset. These tests pin the edges of that
 //! window: a write must decide whether to run while it holds the
-//! transport lock, the vCPU must not wait on the backend, and status 0
-//! and the open device must reach the guest in one step.
+//! transport lock, the vCPU must not wait on the backend, status 0 and
+//! the open device must reach the guest in one step, and no event from
+//! the old session may reach the driver that follows.
 
 use super::*;
 
@@ -175,6 +176,17 @@ fn status(dev: &Dev) -> u8 {
     dev.bar_rw(
         BarN::BAR0,
         usize::from(bits::LEGACY_REG_DEVICE_STATUS),
+        RWOp::Read(&mut ro),
+    );
+    ro.buf()[0]
+}
+
+/// Read and clear the ISR, the way a legacy driver's handler does.
+fn isr(dev: &Dev) -> u8 {
+    let mut ro = ReadOp::new(1);
+    dev.bar_rw(
+        BarN::BAR0,
+        usize::from(bits::LEGACY_REG_ISR_STATUS),
         RWOp::Read(&mut ro),
     );
     ro.buf()[0]
@@ -518,6 +530,53 @@ fn a_queue_refusal_writes_its_status_under_the_refusing_guard() {
         status(&dev) & bits::STATUS_DEVICE_NEEDS_RESET,
         0,
         "the driver was never told the queue had stopped"
+    );
+    assert_ne!(
+        isr(&dev) & bits::ISR_CFG_CHANGE,
+        0,
+        "the driver was never interrupted to read that status"
+    );
+}
+
+// The refusal cannot hold the transport lock across its interrupt: an
+// MSI-X write under that lock stalls every other register access. So a
+// reset can run the whole way in the gap, and the interrupt would then
+// stand in a session that never saw the change, on a line the reset
+// had just lowered.
+#[test]
+fn a_refusal_overtaken_by_a_reset_raises_no_interrupt() {
+    let (dev, entered, release) = make_device();
+    let (hook, arrived, go) = park();
+    dev.park_before_config_interrupt(hook);
+
+    let refuser = {
+        let dev = Arc::clone(&dev);
+        // No guest memory is mapped, so the ring is refused.
+        std::thread::spawn(move || {
+            write_legacy(&dev, bits::LEGACY_REG_QUEUE_PFN, 1)
+        })
+    };
+    arrived
+        .recv_timeout(WEDGED)
+        .expect("the refusal reached its interrupt");
+
+    write_status(&dev, 0);
+    entered.recv_timeout(WEDGED).expect("the backend drained");
+    release.send(()).expect("release the drain");
+    wait_for_reset(&dev);
+    write_status(&dev, READY);
+
+    go.send(()).expect("release the refusal");
+    refuser.join().expect("the refusal finished");
+    assert_eq!(
+        isr(&dev),
+        0,
+        "a refusal from the old session interrupted the new one"
+    );
+    assert_eq!(
+        status(&dev),
+        READY,
+        "the old session's refusal marked the new session's status"
     );
 }
 

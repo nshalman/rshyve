@@ -243,6 +243,10 @@ struct TestParks {
     /// Reached in the refusal path once DEVICE_NEEDS_RESET is applied,
     /// and before the config interrupt goes out.
     needs_reset_applied: ParkSlot,
+    /// Reached once the transport lock is dropped and before the
+    /// config interrupt is delivered, which is the window a reset can
+    /// run in.
+    config_interrupt_pending: ParkSlot,
 }
 
 #[cfg(test)]
@@ -306,6 +310,15 @@ pub struct VirtioPciDevice<D: VirtioDevice> {
     queue_refusal_reported: std::sync::atomic::AtomicBool,
     /// The half of the reset protocol that must not run on a vCPU.
     drain: Mutex<ResetDrain>,
+    /// Counts driver sessions, one more each time a reset takes the
+    /// device down. An event that sampled this under the transport
+    /// lock can tell whether the driver it was raised for is still
+    /// there.
+    session: std::sync::atomic::AtomicU64,
+    /// Orders a config interrupt against the reset that lowers the
+    /// line, so a raise either lands in the session that asked for it
+    /// or not at all.
+    config_intr: Mutex<()>,
     /// Park points a test uses to pin a reset interleaving.
     #[cfg(test)]
     parks: TestParks,
@@ -467,6 +480,8 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             log,
             queue_refusal_reported: std::sync::atomic::AtomicBool::new(false),
             drain: Mutex::new(ResetDrain::default()),
+            session: std::sync::atomic::AtomicU64::new(0),
+            config_intr: Mutex::new(()),
             #[cfg(test)]
             parks: TestParks::default(),
             cap_offsets,
@@ -1249,6 +1264,29 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         self.raise_interrupt();
     }
 
+    /// Deliver a config interrupt, unless the session that asked for
+    /// it has since been reset away.
+    ///
+    /// The caller reports a change in the device status, and cannot
+    /// hold the transport lock across the delivery: an MSI-X write
+    /// under that lock stalls every other register access behind it.
+    /// So a reset can start in the gap, and the reset both wipes the
+    /// status this interrupt reports and lowers the line. Raising
+    /// after that leaves an assertion standing in the next driver's
+    /// session, for a change that session never saw. The gate makes
+    /// the session check and the delivery one step against the reset
+    /// that lowers the line, so this either goes out to the driver it
+    /// was raised for or not at all.
+    fn raise_config_interrupt_in(&self, session: u64) {
+        #[cfg(test)]
+        run_park(&self.parks.config_interrupt_pending);
+        let _gate = self.config_intr.lock().expect("config intr lock");
+        if self.session.load(std::sync::atomic::Ordering::Acquire) != session {
+            return;
+        }
+        self.raise_config_interrupt();
+    }
+
     /// Whether a queue refused the ring addresses on its first use.
     ///
     /// A queue programmed outside the enable path, such as by a
@@ -1285,6 +1323,9 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         // can land in the middle of a reset drain, or on the session
         // that follows the reset.
         vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
+        // Sampled under the guard that wrote the bit, so a reset that
+        // wipes it is always the later of the two.
+        let session = self.session.load(std::sync::atomic::Ordering::Acquire);
         #[cfg(test)]
         run_park(&self.parks.needs_reset_applied);
         drop(vs);
@@ -1300,7 +1341,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     "queue" => idx, "reason" => %error);
             }
         }
-        self.raise_config_interrupt();
+        self.raise_config_interrupt_in(session);
     }
 
     /// Install the one-shot park a register write reaches once its
@@ -1329,6 +1370,17 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         *self
             .parks
             .needs_reset_applied
+            .lock()
+            .expect("park lock poisoned") = Some(hook);
+    }
+
+    /// Install the one-shot park a config interrupt reaches once its
+    /// caller has dropped the transport lock.
+    #[cfg(test)]
+    fn park_before_config_interrupt(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .parks
+            .config_interrupt_pending
             .lock()
             .expect("park lock poisoned") = Some(hook);
     }
@@ -1367,6 +1419,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         vs.resetting = true;
         vs.status &= !bits::STATUS_DRIVER_OK;
         vs.queue_enabled.fill(false);
+        // The driver session ends here. An interrupt an earlier event
+        // asked for must not reach the driver that comes next.
+        self.session
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         drop(vs);
 
         self.dispatch_drain();
@@ -1453,12 +1509,15 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         self.device.reset();
 
         // The next driver must find the line low, or it sees a
-        // spurious assertion when it enables the IOAPIC pin. This runs
-        // before the latch opens, or the deassert could eat the first
-        // interrupt that driver is owed.
-        self.isr_status
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        self.lower_interrupt();
+        // spurious assertion when it enables the IOAPIC pin. The gate
+        // holds off a config interrupt that would put the line back
+        // up behind this.
+        {
+            let _gate = self.config_intr.lock().expect("config intr lock");
+            self.isr_status
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.lower_interrupt();
+        }
 
         let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
         vs.reset();
@@ -1523,8 +1582,9 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             return;
         };
         vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
+        let session = self.session.load(std::sync::atomic::Ordering::Acquire);
         drop(vs);
-        self.raise_config_interrupt();
+        self.raise_config_interrupt_in(session);
     }
 
     /// Handle a read from the legacy virtio config BAR.
