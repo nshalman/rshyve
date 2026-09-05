@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! SIGTERM handling.
+//! The shutdown watchdog: the SIGTERM escalation, and the clock every
+//! teardown is held to.
 //!
 //! The static, the `extern "C"` handler that writes it, and the poller
 //! that reads it live together: a `static` cannot be split across a
@@ -149,6 +150,62 @@ pub fn sigterm_received() -> bool {
     SIGTERM_RECEIVED.load(Ordering::Relaxed)
 }
 
+/// Which shutdown the VMM reached first.
+enum Shutdown {
+    /// SIGTERM arrived and nothing has been asked of the guest yet.
+    Signal,
+    /// Teardown is running and armed the clock it must finish inside.
+    Teardown(Instant),
+}
+
+/// Wait until the VMM starts to shut down, either way.
+///
+/// The deadline is read before the flag. A SIGTERM that lands on a
+/// teardown that is already running must watch that teardown, because
+/// the guest it would ask to stop has stopped.
+fn wait_for_shutdown(
+    wait: &impl Fn(Duration),
+    signalled: &impl Fn() -> bool,
+    deadline_of: &impl Fn() -> Option<Instant>,
+) -> Shutdown {
+    loop {
+        if let Some(deadline) = deadline_of() {
+            return Shutdown::Teardown(deadline);
+        }
+        if signalled() {
+            return Shutdown::Signal;
+        }
+        wait(POLL_INTERVAL);
+    }
+}
+
+/// Watch every shutdown, and end a VMM that outlives its own.
+///
+/// WHY not the signal alone: a guest that powers itself off runs the
+/// same teardown, over the same devices and the same
+/// `VM_DESTROY_SELF`, and it is the common path on a node. Watching
+/// only the signal-driven teardown left the common one unwatched.
+fn watchdog(
+    vm: &dyn GuestStop,
+    wait: impl Fn(Duration),
+    now: impl Fn() -> Instant,
+    signalled: impl Fn() -> bool,
+    deadline_of: impl Fn() -> Option<Instant>,
+    give_up: impl FnOnce(),
+    log: &Logger,
+) {
+    match wait_for_shutdown(&wait, &signalled, &deadline_of) {
+        // The guest has stopped already, so it is asked for nothing.
+        Shutdown::Teardown(deadline) => {
+            watch_teardown(&wait, &now, &deadline_of, deadline, give_up, log)
+        }
+        Shutdown::Signal => {
+            info!(log, "SIGTERM received, stopping the guest");
+            shutdown_sequence(vm, wait, now, deadline_of, give_up, log)
+        }
+    }
+}
+
 /// Run one SIGTERM shutdown to its end.
 ///
 /// Each wait is only reached while the VMM is still alive: a VM that
@@ -215,9 +272,10 @@ fn wait_for_teardown(
 
 /// Hold a running teardown to the deadline it armed.
 ///
-/// WHY this thread: the poller is not the thread that drives teardown,
-/// so it still reaches the terminal exit while that thread is parked in
-/// an ioctl. A watchdog on the teardown thread would be parked with it.
+/// WHY a thread of its own: the watchdog is not the thread that drives
+/// teardown, so it still reaches the terminal exit while that thread is
+/// parked in an ioctl. A watchdog on the teardown thread would be
+/// parked with it.
 ///
 /// The loop ends because both `wait` and `now` move the same clock: a
 /// sleep of a non-zero slice always advances a monotonic clock.
@@ -250,11 +308,14 @@ fn watch_teardown(
 /// device writes are power-loss equivalent and inside the
 /// volatile-write-cache contract the block devices advertise.
 ///
-/// This ends every wedge that userspace can break. It does not end one
-/// the kernel holds: a thread parked in an untimed `cv_wait` is not
-/// `T_WAKEABLE`, so `pokelwps` does not wake it and process exit waits
-/// for it (`lwp.c`, `exitlwps`). No signal, close or exit reaches it.
-/// The log line is what names that case to the operator.
+/// This ends every wedge that userspace can break. It cannot end one
+/// the kernel holds. `VM_DESTROY_SELF` waits for the vmm_drv leases in
+/// an untimed `cv_wait` (`vmm_sol_dev.c`, `vmm_lease_block`), and a
+/// thread parked there is not `T_WAKEABLE`, so `pokelwps` does not wake
+/// it and `exitlwps` waits for it (`lwp.c`). No signal, close or exit
+/// reaches such a thread, `_exit` included. Only a kernel that bounds
+/// that wait can free the process. The log line below is the record of
+/// that case.
 fn end_process(reason: &'static str, give_up: impl FnOnce(), log: &Logger) {
     error!(log, "the VMM outlived its own shutdown; ending the process";
         "reason" => reason,
@@ -266,7 +327,8 @@ fn end_process(reason: &'static str, give_up: impl FnOnce(), log: &Logger) {
 ///
 /// `exit` runs the atexit handlers and flushes stdio, either of which
 /// can wait on a lock a stuck thread holds. `_exit` is the syscall
-/// alone.
+/// alone. It is not a guarantee: see [`end_process`] for the wedge that
+/// no exit escapes.
 fn terminal_exit() {
     // The async log drain hands the last line to another thread, and
     // `_exit` does not wait for it.
@@ -276,8 +338,10 @@ fn terminal_exit() {
     unsafe { libc::_exit(WEDGED_EXIT) }
 }
 
-/// Install the SIGTERM signal handler and spawn a poller thread that
-/// triggers ACPI poweroff when the signal is received.
+/// Install the SIGTERM handler and start the shutdown watchdog.
+///
+/// The watchdog covers both ways a VMM shuts down: the signal, and a
+/// guest that stops itself.
 pub fn install_sigterm_handler(machine: &Machine, log: &Logger) {
     install_sigterm_handler_with(
         Arc::new(HdlStop::new(machine.hdl().clone())),
@@ -296,22 +360,19 @@ pub fn install_sigterm_handler_with(stop: Arc<dyn GuestStop>, log: &Logger) {
         )
     };
     thread::Builder::new()
-        .name("sigterm-handler".into())
+        .name("shutdown-watchdog".into())
         .spawn(move || {
-            while !sigterm_received() {
-                thread::sleep(POLL_INTERVAL);
-            }
-            info!(log_sig, "SIGTERM received, stopping the guest");
-            shutdown_sequence(
+            watchdog(
                 stop.as_ref(),
                 thread::sleep,
                 Instant::now,
+                sigterm_received,
                 teardown_deadline,
                 terminal_exit,
                 &log_sig,
             );
         })
-        .expect("failed to spawn sigterm handler thread");
+        .expect("failed to spawn the shutdown watchdog thread");
 }
 
 #[cfg(test)]

@@ -2,6 +2,21 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! What these tests establish, and what they do not.
+//!
+//! They drive the watchdog on a fake clock, so they show which step
+//! runs, in which order, and that the terminal step is reached inside
+//! the armed deadline. `give_up` is a recording closure here, not
+//! `_exit`, so no test in this file shows that the process exits or
+//! that the VM is reclaimed.
+//!
+//! Only a lab test on illumos can show that. It has to hold a vmm_drv
+//! lease open (a viona link that does not release), let the guest power
+//! off, and then watch for the process to leave the process table and
+//! for the instance to leave `/dev/vmm`. That test is also how the
+//! kernel-held wedge in [`super::end_process`] is seen: there the
+//! process stays, and only the log line reports it.
+
 use std::sync::Mutex;
 
 use super::*;
@@ -166,6 +181,41 @@ fn drive_with(
     }
 }
 
+/// Drive the whole watchdog, signal included, on a fake clock.
+///
+/// The hook runs on every wait slice and is what raises the signal or
+/// arms the deadline, because a watchdog that is given neither waits
+/// for as long as the VMM lives.
+fn drive_watchdog(
+    stop: &RecordingStop,
+    on_wait: impl Fn(&FakeClock, &Mutex<Option<Instant>>, &Mutex<bool>),
+) -> Run {
+    let clock = FakeClock::new();
+    let deadline: Mutex<Option<Instant>> = Mutex::new(None);
+    let signalled = Mutex::new(false);
+    let gave_up = Mutex::new(false);
+
+    watchdog(
+        stop,
+        |slice| {
+            clock.advance(slice);
+            on_wait(&clock, &deadline, &signalled);
+        },
+        || clock.now(),
+        || *signalled.lock().expect("signal lock"),
+        || *deadline.lock().expect("deadline lock"),
+        || *gave_up.lock().expect("gave up lock") = true,
+        &null_log(),
+    );
+
+    let ended = *gave_up.lock().expect("gave up lock");
+    Run {
+        steps: stop.steps(),
+        waited: clock.elapsed(),
+        ended,
+    }
+}
+
 /// Arm the deadline once, `budget` out from the current fake time.
 fn arm_once(
     clock: &FakeClock,
@@ -269,6 +319,59 @@ fn a_deadline_armed_late_in_a_budget_is_still_watched() {
     });
 
     assert_eq!(run.steps, ["poweroff".to_string()]);
+    assert!(run.ended);
+}
+
+#[test]
+fn a_guest_that_stops_itself_is_watched_without_a_signal() {
+    // A guest powering itself off is the common shutdown on a node. It
+    // reaches the same teardown and the same VM_DESTROY_SELF, so it
+    // needs the same clock.
+    let stop = RecordingStop::new();
+    let budget = Duration::from_secs(40);
+
+    let run = drive_watchdog(&stop, |clock, deadline, _signalled| {
+        arm_once(clock, deadline, budget);
+    });
+
+    assert!(run.steps.is_empty(), "a stopped guest is asked for nothing");
+    assert!(run.ended, "a guest-initiated teardown must be watched");
+    assert!(
+        run.waited <= budget + POLL_INTERVAL * 2,
+        "the terminal path was reached late, after {:?}",
+        run.waited
+    );
+}
+
+#[test]
+fn a_signal_on_a_running_teardown_does_not_restart_it() {
+    // The halt skips the device flush. A SIGTERM that lands after the
+    // guest stopped must not take a running teardown back to the
+    // request-and-halt escalation.
+    let stop = RecordingStop::new();
+    let budget = Duration::from_secs(40);
+
+    let run = drive_watchdog(&stop, |clock, deadline, signalled| {
+        arm_once(clock, deadline, budget);
+        *signalled.lock().expect("signal lock") = true;
+    });
+
+    assert!(run.steps.is_empty());
+    assert!(run.ended);
+}
+
+#[test]
+fn a_signal_with_no_teardown_runs_the_full_escalation() {
+    // Nothing has stopped the guest, so the watchdog has to ask and
+    // then force, exactly as the signal path did before it also
+    // watched guest-initiated teardown.
+    let stop = RecordingStop::new();
+
+    let run = drive_watchdog(&stop, |_clock, _deadline, signalled| {
+        *signalled.lock().expect("signal lock") = true;
+    });
+
+    assert_eq!(run.steps, ["poweroff".to_string(), "halt".to_string()]);
     assert!(run.ended);
 }
 
