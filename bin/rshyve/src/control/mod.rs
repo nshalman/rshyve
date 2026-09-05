@@ -364,23 +364,38 @@ impl VmController {
     }
 
     /// End a VM whose guest now runs on another host.
+    ///
+    /// A caller that does not win [`VmController::begin_stop`] leaves
+    /// the release to the one that did.
     pub(super) fn release_migrated_source(&self) -> io::Result<()> {
+        if !self.begin_stop() {
+            return Ok(());
+        }
         let halt = bhyve_api::vm_suspend_how::VM_SUSPEND_HALT as u32;
         release_paused_vm(|| self.hdl.suspend(halt, 0), || self.hdl.resume())
     }
 
-    /// Latch `how`, then let a parked VM see it.
+    /// Move to `Stopping`, and say whether this caller is the one that
+    /// must resume a parked VM before its vCPUs can see the stop.
     ///
-    /// The CAS is what makes the resume happen once, however many
-    /// threads ask to stop.
-    fn stop_for_signal(&self, how: u32) -> io::Result<()> {
+    /// The compare-and-swap is what makes the resume happen once,
+    /// however many stops arrive at once. A second resume would meet
+    /// an instance that is not paused, which is a kernel level
+    /// mistake and not a userspace one.
+    pub(super) fn begin_stop(&self) -> bool {
         let from = self.state();
         let parked = stop_needs_resume(from, self.migrated_away())
             && self.transition(from, VmRunState::Stopping);
-
         if !parked {
             self.state
                 .store(VmRunState::Stopping as u8, Ordering::Release);
+        }
+        parked
+    }
+
+    /// Latch `how`, then let a parked VM see it.
+    fn stop_for_signal(&self, how: u32) -> io::Result<()> {
+        if !self.begin_stop() {
             return self.hdl.suspend(how, 0);
         }
         release_paused_vm(|| self.hdl.suspend(how, 0), || self.hdl.resume())

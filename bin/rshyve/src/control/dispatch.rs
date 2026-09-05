@@ -93,11 +93,8 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             if cur != VmRunState::Running && cur != VmRunState::Paused {
                 return Response::err("VM is not running or paused");
             }
-            ctrl.state
-                .store(VmRunState::Stopping as u8, Ordering::Release);
-
             // If paused, resume first so vCPUs can receive the suspend
-            if cur == VmRunState::Paused {
+            if ctrl.begin_stop() {
                 // best-effort: if resume fails, suspend below will also fail
                 let _ = ctrl.hdl.resume();
             }
@@ -125,11 +122,8 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             if cur != VmRunState::Running && cur != VmRunState::Paused {
                 return Response::err("VM is not running or paused");
             }
-            ctrl.state
-                .store(VmRunState::Stopping as u8, Ordering::Release);
-
             // If paused, resume first so vCPUs can receive the suspend
-            if cur == VmRunState::Paused {
+            if ctrl.begin_stop() {
                 // best-effort: if resume fails, suspend below will also fail
                 let _ = ctrl.hdl.resume();
             }
@@ -158,9 +152,6 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             if let Some(refusal) = stop_refusal(cur, migrated_away) {
                 return Response::err(refusal);
             }
-            ctrl.state
-                .store(VmRunState::Stopping as u8, Ordering::Release);
-
             if migrated_away {
                 // The guest runs on another host now, so it must not be
                 // resumed first the way a live VM is.
@@ -184,7 +175,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                 };
             }
 
-            if cur == VmRunState::Paused {
+            if ctrl.begin_stop() {
                 // best-effort: if resume fails, suspend below will also fail
                 let _ = ctrl.hdl.resume();
             }
