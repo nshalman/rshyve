@@ -13,6 +13,7 @@
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
@@ -307,6 +308,18 @@ impl NetMetrics {
     }
 
     #[inline]
+    pub fn record_tx(&self, bytes: u64) {
+        self.tx_packets.fetch_add(1, ORD);
+        self.tx_bytes.fetch_add(bytes, ORD);
+    }
+
+    #[inline]
+    pub fn record_rx(&self, bytes: u64) {
+        self.rx_packets.fetch_add(1, ORD);
+        self.rx_bytes.fetch_add(bytes, ORD);
+    }
+
+    #[inline]
     pub fn record_kick(&self) {
         self.kicks.fetch_add(1, ORD);
     }
@@ -361,8 +374,11 @@ impl NetMetrics {
 /// optional Prometheus endpoint, and all device/vCPU threads.
 pub struct VmmMetrics {
     pub vcpus: Vec<VcpuMetrics>,
-    pub block_devices: Vec<(String, BlockMetrics)>,
-    pub net_devices: Vec<(String, NetMetrics)>,
+    /// Held by `Arc` so a device keeps its own handle. A borrow of the
+    /// registry cannot outlive the registration call, which is why
+    /// these counters had no producers.
+    pub block_devices: Vec<(String, Arc<BlockMetrics>)>,
+    pub net_devices: Vec<(String, Arc<NetMetrics>)>,
     pub start_time: Instant,
 }
 
@@ -377,14 +393,18 @@ impl VmmMetrics {
         }
     }
 
-    pub fn add_block_device(&mut self, name: String) -> &BlockMetrics {
-        self.block_devices.push((name, BlockMetrics::new()));
-        &self.block_devices.last().unwrap().1
+    /// Register a block device and hand back the counters it records to.
+    pub fn add_block_device(&mut self, name: String) -> Arc<BlockMetrics> {
+        let metrics = Arc::new(BlockMetrics::new());
+        self.block_devices.push((name, Arc::clone(&metrics)));
+        metrics
     }
 
-    pub fn add_net_device(&mut self, name: String) -> &NetMetrics {
-        self.net_devices.push((name, NetMetrics::new()));
-        &self.net_devices.last().unwrap().1
+    /// Register a network device and hand back its counters.
+    pub fn add_net_device(&mut self, name: String) -> Arc<NetMetrics> {
+        let metrics = Arc::new(NetMetrics::new());
+        self.net_devices.push((name, Arc::clone(&metrics)));
+        metrics
     }
 
     /// Dump all metrics as JSON.
@@ -540,5 +560,54 @@ mod tests {
                 "kicks",
             ])
         );
+    }
+
+    #[test]
+    fn a_registered_block_device_hands_back_a_keepable_handle() {
+        // A device records from its own worker thread, so registering
+        // has to yield a handle it can hold. A borrow of the registry
+        // is why nothing ever recorded.
+        let mut all = VmmMetrics::new(1);
+        let disk = all.add_block_device("disk0".to_string());
+
+        let worker = std::thread::spawn(move || {
+            disk.record_read(4096, 20, true);
+            disk.record_write(512, 30, false);
+        });
+        worker.join().expect("worker");
+
+        let json = all.to_json();
+        assert!(json.contains(r#""read_bytes":4096"#), "{json}");
+        assert!(json.contains(r#""write_errors":1"#), "{json}");
+    }
+
+    #[test]
+    fn a_registered_net_device_hands_back_a_keepable_handle() {
+        let mut all = VmmMetrics::new(1);
+        let nic = all.add_net_device("net0".to_string());
+
+        let worker = std::thread::spawn(move || {
+            nic.record_tx(1500);
+            nic.record_rx(64);
+            nic.record_rx(64);
+        });
+        worker.join().expect("worker");
+
+        let json = all.to_json();
+        assert!(json.contains(r#""tx_packets":1"#), "{json}");
+        assert!(json.contains(r#""rx_bytes":128"#), "{json}");
+    }
+
+    #[test]
+    fn tx_and_rx_counters_have_recorders() {
+        let net = NetMetrics::new();
+
+        net.record_tx(1500);
+        net.record_rx(64);
+
+        assert_eq!(net.tx_packets.load(ORD), 1);
+        assert_eq!(net.tx_bytes.load(ORD), 1500);
+        assert_eq!(net.rx_packets.load(ORD), 1);
+        assert_eq!(net.rx_bytes.load(ORD), 64);
     }
 }
