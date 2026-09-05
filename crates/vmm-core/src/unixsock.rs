@@ -89,9 +89,15 @@ pub fn bind_restricted(
 ///   reader threads do blocking reads on a clone of the same socket,
 ///   so setting it here would break every read.
 ///
-/// `poll` is what does work, together with the per-call flag in
-/// [`SEND_NOWAIT`]. `POLLOUT` stays clear while the socket is full, and
-/// the send that follows gives up rather than wait for the peer.
+/// `poll` supplies the wait, and [`WRITE_CHUNK`] plus the per-call
+/// flag in [`SEND_NOWAIT`] keep the send that follows it short enough
+/// not to wait again.
+///
+/// This narrows the window rather than closing it. Between the `poll`
+/// and the send, another writer on the same socket can take the space
+/// the `poll` reported, and illumos then waits for the peer inside the
+/// send. Every caller here has one writer per socket, so nothing takes
+/// that space, but the socket type does not enforce it.
 ///
 /// A budget that runs out returns `ErrorKind::TimedOut`. Part of `data`
 /// may be on the socket by then, so the caller has to drop the
@@ -116,7 +122,8 @@ pub fn write_all_bounded(
         if !poll_writable(fd, left)? {
             continue;
         }
-        match send_nowait(fd, &data[sent..]) {
+        let end = data.len().min(sent + WRITE_CHUNK);
+        match send_nowait(fd, &data[sent..end]) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -140,20 +147,29 @@ pub fn write_all_bounded(
     Ok(())
 }
 
+/// Largest block handed to one send after `poll` reports space.
+///
+/// illumos has no flag that makes an AF_UNIX send give up.
+/// `MSG_DONTWAIT` reaches `FNONBLOCK` on the read path only
+/// (`sotpi_sendmsg`, socktpi.c), and `SO_SNDTIMEO` bounds nothing. The
+/// size of the send is the only control left.
+///
+/// An AF_UNIX send reaches `strwrite_common`, which cuts the write
+/// into messages of `sd_qn_maxpsz` and can wait for the peer between
+/// two of them, untimed. `tl` asks for `INFPSZ`, but the stream head
+/// caps that at `strmsgsz`, 64 KiB by default (`conf/param.c`). One
+/// message is placed whole once `canputnext` holds, which is what
+/// `POLLOUT` reports, so a send below that cap does not reach the
+/// wait. This stays far enough below to survive a lowered `strmsgsz`.
+const WRITE_CHUNK: usize = 8 * 1024;
+
 /// Flags that stop one send from waiting for the peer.
 ///
-/// illumos needs none. An AF_UNIX send reaches `strwrite`, whose flow
-/// control is one message at a time: `POLLOUT` means `canputnext`, and
-/// the `strput` that follows takes the whole write. Neither of the two
-/// usual flags helps there in any case. `MSG_DONTWAIT` is mapped to
-/// `FNONBLOCK` for reads only (`sotpi_sendmsg`, socktpi.c), and
-/// `SO_SNDTIMEO` bounds nothing.
-///
-/// Darwin counts free bytes instead, and reports `POLLOUT` on as
-/// little as `SO_SNDLOWAT` of them, so a send of more than that waits
-/// for the peer even after `POLLOUT`. `sosend` reads `MSG_NBIO` for
-/// this, not `MSG_DONTWAIT`. The tests run on Darwin, so the bound has
-/// to hold there as well.
+/// Darwin counts free bytes rather than messages, and reports
+/// `POLLOUT` on as little as `SO_SNDLOWAT` of them, so even a
+/// [`WRITE_CHUNK`] send waits for the peer after `POLLOUT`. `sosend`
+/// reads `MSG_NBIO` for this, not `MSG_DONTWAIT`. The tests run on
+/// Darwin, so the bound has to hold there as well.
 #[cfg(target_vendor = "apple")]
 const SEND_NOWAIT: libc::c_int = 0x0002_0000; // MSG_NBIO
 #[cfg(not(target_vendor = "apple"))]
