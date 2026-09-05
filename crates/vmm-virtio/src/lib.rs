@@ -80,6 +80,15 @@ pub trait VirtioDevice: Send + Sync + 'static {
     fn cfg_read(&self, offset: u16, len: u8) -> u32;
 
     /// Write to device-specific configuration space.
+    ///
+    /// The transport calls this with the transport lock held, so that
+    /// a reset in flight cannot let the write land. An implementation
+    /// must not take that lock again, and must not call
+    /// [`VirtioPciDevice::signal_device_needs_reset`], or it stops
+    /// itself.
+    ///
+    /// [`VirtioPciDevice::signal_device_needs_reset`]:
+    ///     crate::pci::VirtioPciDevice::signal_device_needs_reset
     fn cfg_write(&self, offset: u16, val: u32, len: u8);
 
     /// Process a single request from a virtqueue.
@@ -205,6 +214,12 @@ pub trait VirtioDevice: Send + Sync + 'static {
     fn start_poll_deferred(&self) {}
 
     /// Reset the device to its initial state.
+    ///
+    /// The transport publishes `DEVICE_STATUS` 0 as soon as this
+    /// returns, which tells the guest it can use the ring memory
+    /// again. A device with worker threads must therefore not return
+    /// until no worker can write the ring or the guest chains. The
+    /// transport cannot check this.
     fn reset(&self);
 }
 
