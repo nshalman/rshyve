@@ -13,7 +13,7 @@ pub mod server;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use vmm_core::mem::PhysMap;
@@ -47,13 +47,6 @@ pub const FS_MSIX_VECTORS: u16 = FS_NUM_QUEUES as u16 + 1;
 const FS_FORCE_INTERRUPTS: u32 = 32;
 /// Budget for the worker to finish its request during halt.
 const FS_HALT_BUDGET: Duration = Duration::from_secs(5);
-/// How long [`VirtioDevice::reset`] waits for the worker to drain.
-///
-/// The guest drives the reset, so the wait must be bounded: an unbounded
-/// one is a guest-triggerable vCPU hang. Requests that have not started
-/// are dropped by the epoch check, so this budget only ever covers a
-/// passthrough syscall already in flight.
-const FS_RESET_QUIESCE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Interrupt callback, wired by the binary after `VirtioPciDevice::new`.
 ///
@@ -181,10 +174,10 @@ pub struct VirtioFs {
     /// Bumped by every device reset. Tags each queued request so the
     /// worker can tell one that predates the reset from a live one.
     epoch: Arc<AtomicU64>,
-    /// Requests queued and not yet finished. Reset only has to wait for
-    /// the worker while this is non-zero, which keeps a reset on an idle
-    /// export off the worker's 50ms park path.
+    /// Requests queued and not yet finished. See [`FsWorkerCtx::inflight`].
     inflight: Arc<AtomicUsize>,
+    /// See [`FsWorkerCtx::ring_access`].
+    ring_access: Arc<RwLock<()>>,
     indicator: Indicator,
     log: slog::Logger,
     /// Queue-indexed interrupt callback. Clone this Arc BEFORE moving the
@@ -222,26 +215,22 @@ impl VirtioFs {
         let mut tag = [0u8; FS_TAG_LEN];
         tag[..bytes.len()].copy_from_slice(bytes);
 
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let gate = Arc::new(QuiesceGate::new(1));
-        let epoch = Arc::new(AtomicU64::new(0));
-        let inflight = Arc::new(AtomicUsize::new(0));
+        let ctx = FsWorkerCtx {
+            server: Arc::clone(&server),
+            physmap: Arc::clone(&physmap),
+            gate: Arc::new(QuiesceGate::new(1)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            epoch: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            ring_access: Arc::new(RwLock::new(())),
+        };
         let (tx, rx) = mpsc::channel::<FsRequest>();
 
         let worker = std::thread::Builder::new()
             .name("virtio-fs".to_string())
             .spawn({
-                let server = Arc::clone(&server);
-                let physmap = Arc::clone(&physmap);
-                let gate = Arc::clone(&gate);
-                let shutdown = Arc::clone(&shutdown);
-                let epoch = Arc::clone(&epoch);
-                let inflight = Arc::clone(&inflight);
-                move || {
-                    fs_worker(
-                        rx, server, physmap, gate, shutdown, epoch, inflight,
-                    )
-                }
+                let ctx = ctx.clone();
+                move || fs_worker(rx, ctx)
             })?;
 
         Ok(Self {
@@ -252,10 +241,11 @@ impl VirtioFs {
             completions: Mutex::new(vec![None; FS_NUM_QUEUES]),
             work_tx: Mutex::new(Some(tx)),
             worker: Mutex::new(Some(worker)),
-            shutdown,
-            gate,
-            epoch,
-            inflight,
+            shutdown: ctx.shutdown,
+            gate: ctx.gate,
+            epoch: ctx.epoch,
+            inflight: ctx.inflight,
+            ring_access: ctx.ring_access,
             indicator: Indicator::new(),
             log,
             interrupt: Arc::new(Mutex::new(None)),
@@ -292,11 +282,36 @@ impl VirtioFs {
     }
 }
 
+/// State the FUSE worker shares with the device.
+#[derive(Clone)]
+struct FsWorkerCtx {
+    server: Arc<FuseServer>,
+    physmap: Arc<PhysMap>,
+    gate: Arc<QuiesceGate>,
+    shutdown: Arc<AtomicBool>,
+    /// Bumped by every device reset; see [`FsRequest::epoch`].
+    epoch: Arc<AtomicU64>,
+    /// Requests queued and not yet finished.
+    ///
+    /// The worker drops its count only after it has released
+    /// `ring_access`, so a zero here means a reset has nothing to wait
+    /// for.
+    inflight: Arc<AtomicUsize>,
+    /// Permission to write into the guest's ring and chains.
+    ///
+    /// The worker holds the shared side for a whole request.
+    /// [`VirtioDevice::reset`] takes the exclusive side, which is how it
+    /// takes that permission back. An epoch check cannot:
+    /// `FuseServer::handle` writes the reply into the chain before it
+    /// returns, whatever a later check decides.
+    ring_access: Arc<RwLock<()>>,
+}
+
 /// Drop every request still queued and take them off the count.
 ///
 /// A halt abandons the request the worker holds and everything behind
-/// it. Leaving those counted makes the next reset wait its whole drain
-/// budget for a worker that has already gone.
+/// it. Leaving those counted makes the next reset take its wait path
+/// for a worker that has already gone.
 fn abandon_queued(
     rx: &mpsc::Receiver<FsRequest>,
     inflight: &AtomicUsize,
@@ -311,49 +326,55 @@ fn abandon_queued(
     }
 }
 
-fn fs_worker(
-    rx: mpsc::Receiver<FsRequest>,
-    server: Arc<FuseServer>,
-    physmap: Arc<PhysMap>,
-    gate: Arc<QuiesceGate>,
-    shutdown: Arc<AtomicBool>,
-    epoch: Arc<AtomicU64>,
-    inflight: Arc<AtomicUsize>,
-) {
+fn fs_worker(rx: mpsc::Receiver<FsRequest>, ctx: FsWorkerCtx) {
     use std::sync::mpsc::RecvTimeoutError;
 
     loop {
         let req = match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
-                gate.park_if_paused();
-                if shutdown.load(Ordering::Acquire) {
-                    abandon_queued(&rx, &inflight, 0);
+                ctx.gate.park_if_paused();
+                if ctx.shutdown.load(Ordering::Acquire) {
+                    abandon_queued(&rx, &ctx.inflight, 0);
                     return;
                 }
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        gate.park_if_paused();
-        if shutdown.load(Ordering::Acquire) {
+        ctx.gate.park_if_paused();
+        if ctx.shutdown.load(Ordering::Acquire) {
             drop(req);
-            abandon_queued(&rx, &inflight, 1);
+            abandon_queued(&rx, &ctx.inflight, 1);
             return;
         }
-        // A reset already invalidated this chain and its completion.
-        // Drop the request without touching guest memory.
-        if req.epoch == epoch.load(Ordering::Acquire) {
-            let len = server.handle(&req.bufs, &physmap);
-            // A reset can land while the passthrough syscall runs; the
-            // used ring it would publish to is gone.
-            if req.epoch == epoch.load(Ordering::Acquire) {
-                req.completion.complete(req.head, len);
-            }
-        }
+        serve_request(&ctx, &req);
         drop(req);
-        inflight.fetch_sub(1, Ordering::AcqRel);
+        // Only now can a reset read zero and skip the wait: the request
+        // has released `ring_access` and its used entry is in the ring.
+        ctx.inflight.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// Run one FUSE request and publish its reply.
+///
+/// The shared `ring_access` guard covers both. `FuseServer::handle` does
+/// the syscall and writes the reply into the guest's chain before it
+/// returns, so no check made after it takes that write back; only this
+/// guard stops a reset from reporting itself done in the middle of it.
+fn serve_request(ctx: &FsWorkerCtx, req: &FsRequest) {
+    let _access = ctx
+        .ring_access
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+
+    // A reset already invalidated this chain and its completion. Drop
+    // the request without touching guest memory.
+    if req.epoch != ctx.epoch.load(Ordering::Acquire) {
+        return;
+    }
+    let len = ctx.server.handle(&req.bufs, &ctx.physmap);
+    req.completion.complete(req.head, len);
 }
 
 impl VirtioDevice for VirtioFs {
@@ -483,24 +504,39 @@ impl VirtioDevice for VirtioFs {
     /// has recycled. VirtIO 1.3 sec 4.1.4.3.1 makes the driver poll for
     /// that 0, which is what buys the device the time to drain.
     ///
-    /// Bumping the epoch first drops every request that has not started,
-    /// so the wait only ever covers a syscall already in flight. Missing
-    /// the budget still completes the reset: the epoch keeps the straggler
-    /// off the used ring, and leaving the device half-reset would strand
-    /// the driver in that poll loop instead.
+    /// The wait has no deadline, and that is the point. `FuseServer`
+    /// writes the reply into the chain before it returns, so a device
+    /// that gives up and reports the reset done has lost: no check made
+    /// afterwards takes that write back. Taking `ring_access` exclusively
+    /// is the only thing that ends the window, so this returns after the
+    /// worker leaves it, or not at all. Bumping the epoch first drops
+    /// every request that has not started, so the wait covers the
+    /// syscall already in flight and nothing else, and that is the one
+    /// the guest was blocked on before it asked for the reset.
     fn reset(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
 
-        // The transport clears DRIVER_OK before it calls this, so nothing
-        // can add to the count once it reads zero. Skipping the drain then
-        // keeps a reset on an idle export off the worker's 50ms park path.
-        let mut quiesced = true;
+        // Nothing outstanding means the worker holds no shared side: it
+        // drops its count only after it releases the guard. The transport
+        // clears DRIVER_OK before it calls this, so nothing can put the
+        // count back up.
         if self.inflight.load(Ordering::Acquire) != 0 {
-            // A scope, not a pause: this drain is guest driven, and a
-            // migration pause that lands inside it belongs to the
-            // control plane and must outlive it.
-            let _drain = self.gate.drain_scope();
-            quiesced = self.gate.wait_quiesced(FS_RESET_QUIESCE_BUDGET);
+            match self.ring_access.try_write() {
+                Ok(_) => {}
+                Err(TryLockError::Poisoned(err)) => drop(err.into_inner()),
+                Err(TryLockError::WouldBlock) => {
+                    // Guest reachable: a driver can rebind in a loop.
+                    slog::debug!(
+                        self.log,
+                        "virtio-fs reset is waiting on the worker"
+                    );
+                    drop(
+                        self.ring_access
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner),
+                    );
+                }
+            }
         }
 
         *self.negotiated_features.lock().expect("features lock") = 0;
@@ -509,17 +545,11 @@ impl VirtioDevice for VirtioFs {
             *slot = None;
         }
         // A guest reboot must not leak the inode and handle fd tables,
-        // but only the drain makes closing them safe: the worker holds
-        // raw fds from these tables across a FUSE syscall, and a number
-        // closed under it is handed to the next thread in this process
-        // that opens anything. A drain that missed its budget leaves
-        // the tables for `halt` to reclaim.
-        if quiesced {
-            self.server.passthrough().clear();
-        }
-
-        // Guest reachable: a driver can rebind virtio-fs in a loop.
-        slog::debug!(self.log, "virtio-fs reset"; "quiesced" => quiesced);
+        // and only the wait above makes closing them safe: the worker
+        // holds raw fds from these tables across a FUSE syscall, and a
+        // number closed under it is handed to the next thread in this
+        // process that opens anything.
+        self.server.passthrough().clear();
     }
 }
 

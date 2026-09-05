@@ -65,6 +65,10 @@ impl FuseServer {
     ///
     /// Returns the number of bytes written into the chain's writable
     /// window, which the caller puts in the used-ring `len` field.
+    ///
+    /// The reply reaches guest memory before this returns, so the caller
+    /// must already hold the device's `ring_access` guard. Deciding
+    /// afterwards that the chain was stale is too late.
     pub fn handle(&self, bufs: &[ChainBuf], physmap: &PhysMap) -> u32 {
         // The two views cover disjoint segments of the same chain: the
         // reader skips writable segments and the writer skips readable

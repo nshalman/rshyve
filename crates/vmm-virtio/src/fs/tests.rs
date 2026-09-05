@@ -3,6 +3,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Unit tests for the virtio-fs device.
+//!
+//! The transport publishes DEVICE_STATUS 0 as soon as `reset` returns,
+//! and the driver frees the vring on reading that 0, so "`reset` has
+//! not returned" and "the guest has not been told the reset succeeded"
+//! are the same statement.
 
 use super::*;
 
@@ -10,6 +15,46 @@ use std::time::Instant;
 
 use crate::queue::VirtqDesc;
 use vmm_devices::Lifecycle;
+
+/// Longer than the two second budget the drain used to give up after.
+/// A reset that returns inside this window has a deadline again.
+const PAST_THE_OLD_DRAIN_BUDGET: Duration = Duration::from_millis(2500);
+
+/// Take the shared side of `ring_access` the way the worker holds it
+/// across a passthrough syscall, and put a request on the count so the
+/// reset cannot take its idle short cut.
+fn hold_ring_access(fs: &VirtioFs) -> std::sync::RwLockReadGuard<'_, ()> {
+    fs.inflight.fetch_add(1, Ordering::AcqRel);
+    fs.ring_access.read().expect("ring access")
+}
+
+/// Block until the reset thread is inside the `ring_access` wait.
+///
+/// The epoch moves before the reset reaches the barrier and the caller
+/// holds the shared side, so past this point the reset is in the wait
+/// and can be nowhere else. Sleeping a fixed time instead would let the
+/// assertions run after the reset had already finished.
+fn wait_until_reset_blocks(
+    fs: &VirtioFs,
+    epoch_before: u64,
+    finished: &AtomicBool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fs.epoch.load(Ordering::Acquire) == epoch_before
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_ne!(
+        fs.epoch.load(Ordering::Acquire),
+        epoch_before,
+        "the reset never started"
+    );
+    assert!(
+        !finished.load(Ordering::Acquire),
+        "the reset finished while the worker still held ring access"
+    );
+}
 
 const DESC_GPA: u64 = 0x1000;
 const AVAIL_GPA: u64 = 0x1100;
@@ -306,17 +351,24 @@ fn reset_drops_a_request_queued_before_it() {
     VirtioDevice::reset(&fs);
     fs.resume();
 
-    // A woken worker publishes within microseconds, so this window is
-    // orders of magnitude of margin.
-    let deadline = Instant::now() + Duration::from_millis(250);
-    while Instant::now() < deadline {
-        assert_eq!(
-            queues[req].read_used_ring_idx(&physmap),
-            0,
-            "the worker published into the pre-reset used ring"
-        );
+    // The woken worker drops the stale request and decrements as it
+    // goes, so a count back at zero means it has dealt with it. Timing
+    // a window instead would pass on a runner that never scheduled it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fs.inflight.load(Ordering::Acquire) != 0 && Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(5));
     }
+    assert_eq!(
+        fs.inflight.load(Ordering::Acquire),
+        0,
+        "the worker never finished with the pre-reset request"
+    );
+    assert_eq!(
+        queues[req].read_used_ring_idx(&physmap),
+        0,
+        "the worker published into the pre-reset used ring"
+    );
 }
 
 // Reset pauses the worker to drain it. It must hand the gate back, or
@@ -344,11 +396,12 @@ fn reset_leaves_the_worker_runnable() {
     );
 }
 
-// A guest resets its virtio devices several times while it boots. The
-// worker parks 50ms after it goes idle, so a reset with nothing
-// outstanding must skip the drain rather than pay that each time.
+// A guest resets its virtio devices several times while it boots, and
+// the worker takes 50ms to reach its park point. The reset waits on
+// `ring_access`, which the worker holds only while it is using the
+// ring, so it must never park the worker to find that out.
 #[test]
-fn reset_with_an_idle_export_skips_the_drain() {
+fn reset_never_parks_the_worker() {
     let (physmap, mut queues, fs) = ring(8, 1);
 
     fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
@@ -369,17 +422,18 @@ fn reset_with_an_idle_export_skips_the_drain() {
     assert_eq!(
         fs.gate.drain_count(),
         0,
-        "reset drained an export with nothing outstanding"
+        "reset parked the worker to drain it"
     );
+    assert!(!fs.gate.is_paused(), "reset left the worker parked");
 }
 
-// Clearing the fd tables is safe only because the drain says the
-// worker has let go of them. A drain that missed its budget says
-// nothing of the sort: the worker still holds a raw fd across a
-// FUSE syscall, and closing it hands that number to the next
-// thread in this process that opens anything.
+// Clearing the fd tables is safe only because the reset waited: the
+// worker holds a raw fd from them across a FUSE syscall, and closing
+// it hands that number to the next thread in this process that opens
+// anything. The reset must not get past `ring_access` to reach the
+// clear, and must reach it once the worker lets go.
 #[test]
-fn a_reset_that_missed_its_drain_keeps_the_fd_tables() {
+fn a_reset_keeps_the_fd_tables_while_the_worker_holds_them() {
     let dir = tempfile::tempdir().expect("export directory");
     // `bind_restricted` moves the process umask while it binds, and
     // the vsock tests bind in parallel with this one, so the mode
@@ -406,69 +460,111 @@ fn a_reset_that_missed_its_drain_keeps_the_fd_tables() {
         .lookup(fuse::FUSE_ROOT_ID, &name)
         .expect("look the file up");
 
-    // End the worker without a halt: it never parks, so the gate
-    // cannot quiesce and the drain has to miss its budget.
-    fs.shutdown.store(true, Ordering::Release);
-    *fs.work_tx.lock().expect("work lock") = None;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let done = fs
-            .worker
-            .lock()
-            .expect("worker lock")
-            .as_ref()
-            .is_none_or(std::thread::JoinHandle::is_finished);
-        if done || Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    fs.inflight.fetch_add(1, Ordering::AcqRel);
+    let access = hold_ring_access(&fs);
+    let epoch_before = fs.epoch.load(Ordering::Acquire);
+    let finished = AtomicBool::new(false);
+    let fs_ref = &fs;
+    let finished_ref = &finished;
 
-    VirtioDevice::reset(&fs);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            VirtioDevice::reset(fs_ref);
+            finished_ref.store(true, Ordering::Release);
+        });
 
-    fs.server
-        .passthrough()
-        .getattr(entry.nodeid)
-        .expect("the reset closed an fd the worker still held");
+        wait_until_reset_blocks(&fs, epoch_before, &finished);
+        fs.server
+            .passthrough()
+            .getattr(entry.nodeid)
+            .expect("the reset closed an fd the worker still held");
+
+        drop(access);
+    });
+
+    assert!(
+        fs.server.passthrough().getattr(entry.nodeid).is_err(),
+        "the reset left the guest's fd tables behind"
+    );
 }
 
-// The reset drain is guest driven: any write of 0 to DEVICE_STATUS
-// reaches it, in a loop if the guest likes. A migration or an
-// operator pause that lands while it runs belongs to the control
-// plane, and the reset must not hand the workers back when it ends.
+// The window codex found in the budgeted drain: the worker passes the
+// epoch check, the passthrough syscall runs long, the wait gives up,
+// and the reset returns. The guest reads DEVICE_STATUS as 0, frees the
+// vring, and `FuseServer::handle` writes the reply into the recycled
+// pages. Checking the epoch afterwards cannot take that write back, so
+// the reset must not finish at all while the worker holds the shared
+// side of `ring_access`.
 #[test]
-fn a_reset_drain_does_not_release_a_pause_that_lands_in_it() {
+fn a_reset_waits_out_a_worker_that_never_finishes_in_time() {
     let fs = test_fs(Arc::new(PhysMap::new()));
     fs.start().expect("start");
 
-    // End the worker without a halt: it never parks, so the drain
-    // runs for its whole budget and the pause below lands inside it.
-    fs.shutdown.store(true, Ordering::Release);
-    *fs.work_tx.lock().expect("work lock") = None;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let done = fs
-            .worker
-            .lock()
-            .expect("worker lock")
-            .as_ref()
-            .is_none_or(std::thread::JoinHandle::is_finished);
-        if done || Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    fs.inflight.fetch_add(1, Ordering::AcqRel);
+    let access = hold_ring_access(&fs);
+    let epoch_before = fs.epoch.load(Ordering::Acquire);
+    let finished = AtomicBool::new(false);
+    let fs_ref = &fs;
+    let finished_ref = &finished;
 
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            std::thread::sleep(Duration::from_millis(100));
-            fs.pause();
+        scope.spawn(move || {
+            VirtioDevice::reset(fs_ref);
+            finished_ref.store(true, Ordering::Release);
         });
-        VirtioDevice::reset(&fs);
+
+        wait_until_reset_blocks(&fs, epoch_before, &finished);
+
+        let until = Instant::now() + PAST_THE_OLD_DRAIN_BUDGET;
+        while Instant::now() < until {
+            assert!(
+                !finished.load(Ordering::Acquire),
+                "the reset told the guest it was done while the worker \
+                 could still write into the ring"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(access);
     });
 
+    assert!(
+        finished.load(Ordering::Acquire),
+        "the reset never finished after the worker let the ring go"
+    );
+}
+
+// The reset wait is guest driven: any write of 0 to DEVICE_STATUS
+// reaches it, in a loop if the guest likes. A migration or an operator
+// pause that lands while it waits belongs to the control plane, and the
+// reset must not hand the worker back when it ends.
+#[test]
+fn a_pause_that_lands_inside_a_reset_survives_it() {
+    let fs = test_fs(Arc::new(PhysMap::new()));
+    fs.start().expect("start");
+
+    let access = hold_ring_access(&fs);
+    let epoch_before = fs.epoch.load(Ordering::Acquire);
+    let finished = AtomicBool::new(false);
+    let fs_ref = &fs;
+    let finished_ref = &finished;
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            VirtioDevice::reset(fs_ref);
+            finished_ref.store(true, Ordering::Release);
+        });
+
+        // The handshake is what makes this a test: the pause is taken
+        // only once the reset is known to be inside the wait.
+        wait_until_reset_blocks(&fs, epoch_before, &finished);
+        fs.pause();
+
+        drop(access);
+    });
+
+    assert!(
+        finished.load(Ordering::Acquire),
+        "the reset never finished after the worker let the ring go"
+    );
     assert!(
         fs.gate.is_paused(),
         "the reset released a pause the control plane owns"
