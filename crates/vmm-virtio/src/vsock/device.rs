@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use slog::debug;
 use vmm_core::mem::PhysMap;
-use vmm_core::unixsock::{bind_restricted, SocketPolicy};
+use vmm_core::unixsock::{bind_restricted, write_all_bounded, SocketPolicy};
 
 use super::control::{
     read_line_bounded, run_control_session, ControlSlot, LineRead,
@@ -70,14 +70,13 @@ const HALT_BUDGET: Duration = Duration::from_secs(2);
 /// end on its own, and halt then pays the whole budget for it.
 const HOST_READ_POLL: Duration = Duration::from_millis(250);
 
-/// How long a write to a host peer may block before the device gives
+/// How long a write to a host peer may take before the device gives
 /// up on it.
 ///
-/// `write_host` runs on a vCPU thread with the sockets table locked
-/// and the transport lock held above it, so an unbounded write there
-/// stalls every other vCPU that touches this device, and the halt
-/// sweep that needs the same table. A peer that has not drained a
-/// single byte in this long is treated as gone.
+/// `write_host` runs on a vCPU thread with the transport lock held, so
+/// an unbounded write there stalls every other vCPU that touches this
+/// device. `write_all_bounded` supplies the end: `SO_SNDTIMEO` reports
+/// success on illumos and bounds nothing.
 const HOST_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Pause after a failed `accept`, so a persistent error such as EMFILE
 /// cannot spin the accept thread at full speed.
@@ -94,8 +93,9 @@ struct VsockShared {
     interrupt: Arc<Mutex<Option<InterruptFn>>>,
     /// Serialises RX delivery. Held for a whole pairing pass.
     delivery: Mutex<()>,
-    /// Host socket per live connection.
-    sockets: Mutex<HashMap<ConnKey, UnixStream>>,
+    /// Host socket per live connection. Held behind an `Arc` so a
+    /// write does not need the table locked while it runs.
+    sockets: Mutex<HashMap<ConnKey, Arc<UnixStream>>>,
     /// Answers CONTROL requests. Empty until the binary installs a sink.
     control: ControlSlot,
     socket_path: PathBuf,
@@ -212,44 +212,64 @@ impl VsockShared {
 
     /// Write payload to a connection's host socket.
     fn write_host(&self, key: ConnKey, data: &[u8]) {
-        let mut sockets = self.sockets.lock().expect("sockets lock");
-        let Some(stream) = sockets.get_mut(&key) else {
+        let socket = self
+            .sockets
+            .lock()
+            .expect("sockets lock")
+            .get(&key)
+            .cloned();
+        let Some(stream) = socket else {
             // The mux still holds the connection, so the guest thinks
             // it is live and would read a stream with a hole in it.
             // Dropping the payload in silence is what leaves it there.
-            drop(sockets);
             self.mux.queue_host_close(key);
             self.deliver_rx();
             return;
         };
-        if stream.write_all(data).is_err() {
+        // The table stays unlocked for the write. A slow peer must not
+        // hold the other vCPUs, or the halt sweep, behind it.
+        if let Err(error) = write_all_bounded(&stream, data, HOST_WRITE_TIMEOUT)
+        {
+            debug!(self.log, "virtio-vsock host write gave up";
+                "error" => %error);
             // A dead peer and one that stopped reading for
-            // HOST_WRITE_TIMEOUT are the same to the guest. Shutting
-            // the socket down wakes this connection's reader, which
-            // tells the guest the connection has gone.
-            if let Some(stream) = sockets.remove(&key) {
-                let _ = stream.shutdown(Shutdown::Both);
-            }
+            // HOST_WRITE_TIMEOUT are the same to the guest.
+            self.drop_socket_if_current(key, &stream);
         }
     }
 
-    /// Put a host socket in the table, ready to be written to.
+    /// Take `key` out of the table and shut its socket down, so that
+    /// this connection's reader wakes and tells the guest it has gone.
     ///
-    /// Returns false when the socket could not be armed, which the
-    /// caller has to treat as a refused connection: an unarmed socket
-    /// is the unbounded block this exists to stop.
-    fn register_socket(&self, key: ConnKey, stream: UnixStream) -> bool {
+    /// The entry goes only while `stream` still holds it. The guest
+    /// picks the key for a connection it opens, so it can close one
+    /// and reopen the same key while an unlocked write is running.
+    fn drop_socket_if_current(&self, key: ConnKey, stream: &Arc<UnixStream>) {
+        let mut sockets = self.sockets.lock().expect("sockets lock");
+        if sockets
+            .get(&key)
+            .is_some_and(|held| Arc::ptr_eq(held, stream))
+        {
+            sockets.remove(&key);
+        }
+        drop(sockets);
+        // The peer may already be gone; there is nothing to do.
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+
+    /// Put a host socket in the table, ready to be written to.
+    fn register_socket(&self, key: ConnKey, stream: UnixStream) {
+        // Belt and braces only. This bounds a write on the platforms
+        // where it works, and reports success and does nothing on
+        // illumos, which is why `write_all_bounded` polls instead.
         if let Err(error) = stream.set_write_timeout(Some(HOST_WRITE_TIMEOUT)) {
             debug!(self.log, "virtio-vsock write timeout not set";
                 "error" => %error);
-            let _ = stream.shutdown(Shutdown::Both);
-            return false;
         }
         self.sockets
             .lock()
             .expect("sockets lock")
-            .insert(key, stream);
-        true
+            .insert(key, Arc::new(stream));
     }
 
     fn drop_socket(&self, key: ConnKey) {
@@ -456,9 +476,7 @@ fn start_host_connection(
     // connection: start_host_connect queues the REQUEST, and any
     // thread may hand that to the guest before this one runs again.
     // Payload for a key with no socket has nowhere to go.
-    if !shared.register_socket(key, peer) {
-        return;
-    }
+    shared.register_socket(key, peer);
     // The table is capped, and a peer told OK for a connection the mux
     // refused would wait on a guest that is never going to hear about
     // it. The ERROR goes out before the socket is shut down.
@@ -770,10 +788,7 @@ impl VirtioVsock {
             self.shared.mux.refuse_guest_connect(key);
             return;
         };
-        if !self.shared.register_socket(key, stream) {
-            self.shared.mux.refuse_guest_connect(key);
-            return;
-        }
+        self.shared.register_socket(key, stream);
         self.shared.mux.accept_guest_connect(key);
 
         let shared = Arc::clone(&self.shared);

@@ -5,6 +5,7 @@
 //! Unit tests for the virtio-vsock device.
 
 use super::*;
+use std::sync::atomic::AtomicUsize;
 
 #[test]
 fn connect_line_is_parsed() {
@@ -425,10 +426,9 @@ fn a_wedged_reader_does_not_hold_halt_open() {
 }
 
 /// A host peer that stops reading must not hold the vCPU that is
-/// writing to it. `write_host` runs with the sockets table locked and
-/// with the transport lock held above it, so an unbounded write there
-/// wedges every other vCPU that touches this device, and halt behind
-/// them.
+/// writing to it. `write_host` runs with the transport lock held, so
+/// an unbounded write there wedges every other vCPU that touches this
+/// device, and halt behind them.
 #[test]
 fn a_host_peer_that_never_reads_does_not_hold_the_writer() {
     let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
@@ -439,7 +439,7 @@ fn a_host_peer_that_never_reads_does_not_hold_the_writer() {
     // The peer end is never read from, so the socket buffer fills and
     // stays full for as long as this test holds it.
     let (_peer, device_end) = UnixStream::pair().expect("socketpair");
-    assert!(vsock.shared.register_socket(key, device_end));
+    vsock.shared.register_socket(key, device_end);
 
     let writer = {
         let shared = Arc::clone(&vsock.shared);
@@ -465,6 +465,70 @@ fn a_host_peer_that_never_reads_does_not_hold_the_writer() {
             .contains_key(&key),
         "the wedged connection stayed in the table"
     );
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A peer that reads, but too slowly to take the payload inside the
+/// budget, must lose its connection like one that reads nothing. The
+/// write makes progress here, so a bound that only watched the first
+/// blocked write would never fire.
+#[test]
+fn a_host_peer_that_reads_too_slowly_loses_its_connection() {
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    let key = ConnKey {
+        guest_port: 1024,
+        host_port: 2,
+    };
+    let (peer, device_end) = UnixStream::pair().expect("socketpair");
+    vsock.shared.register_socket(key, device_end);
+
+    // Small reads, spaced out, so the socket buffer frees a little at
+    // a time and the write can never catch up with the payload.
+    let taken = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&taken);
+    let slow = std::thread::spawn(move || {
+        let mut peer = peer;
+        let mut buf = [0u8; 512];
+        loop {
+            std::thread::sleep(HOST_WRITE_TIMEOUT / 4);
+            match peer.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => counted.fetch_add(n, Ordering::Release),
+            };
+        }
+    });
+
+    let writer = {
+        let shared = Arc::clone(&vsock.shared);
+        std::thread::spawn(move || {
+            shared.write_host(key, &vec![0u8; 8 * 1024 * 1024]);
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !writer.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        writer.is_finished(),
+        "the write never gave up on a peer that could not keep up"
+    );
+    writer.join().expect("join the writer");
+    assert!(
+        taken.load(Ordering::Acquire) > 0,
+        "the peer took nothing, so this did not test a partial write"
+    );
+    assert!(
+        !vsock
+            .shared
+            .sockets
+            .lock()
+            .expect("sockets lock")
+            .contains_key(&key),
+        "the connection the write gave up on stayed in the table"
+    );
+    slow.join().expect("join the slow reader");
 
     vsock.halt();
     let _ = std::fs::remove_dir_all(&dir);
