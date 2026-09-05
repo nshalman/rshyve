@@ -1113,6 +1113,17 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// Signal a device configuration change to the guest.
     #[allow(dead_code)]
     pub fn signal_config_change(&self) {
+        self.raise_config_interrupt();
+    }
+
+    /// Deliver a configuration interrupt the way the driver armed it.
+    ///
+    /// WHY one helper for both callers: a modern guest with MSI-X never
+    /// reads the ISR, because it registers no INTx handler. Falling
+    /// through to the pin there tells that driver nothing and leaves
+    /// the level-triggered line asserted for the life of the VM, which
+    /// takes down every other device sharing it.
+    fn raise_config_interrupt(&self) {
         if let Some(ref msix) = self.msix {
             let vector = self
                 .msix_config_vector
@@ -1229,11 +1240,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
         vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
         drop(vs);
-        self.isr_status.fetch_or(
-            bits::ISR_CFG_CHANGE,
-            std::sync::atomic::Ordering::Release,
-        );
-        self.raise_interrupt();
+        self.raise_config_interrupt();
     }
 
     /// Handle a read from the legacy virtio config BAR.

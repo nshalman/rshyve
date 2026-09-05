@@ -438,3 +438,79 @@ fn a_queue_that_refuses_its_rings_on_first_use_raises_needs_reset() {
         "the driver was never told the queue had stopped",
     );
 }
+
+/// Records every MSI-X message the transport delivers.
+struct RecordingSink(Mutex<Vec<(u64, u64)>>);
+
+impl vmm_devices::pci::msix::MsiSink for RecordingSink {
+    fn send(&self, addr: u64, data: u64) {
+        self.0.lock().expect("recording lock").push((addr, data));
+    }
+}
+
+/// A device with one MSI-X vector, armed and pointed at the config
+/// vector the way a modern driver leaves it.
+fn device_with_msix() -> (
+    Arc<VirtioPciDevice<TestVirtioDevice>>,
+    Arc<RecordingSink>,
+    Arc<MsixTable>,
+) {
+    use vmm_core::common::WriteOp;
+
+    let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+    let msix = Arc::new(MsixTable::new(1, Arc::clone(&sink) as _));
+    msix.set_enabled(true);
+    msix.write_entry(0, 0xFEE0_0000, 0x4021);
+    // Clear the vector mask the entry starts with.
+    msix.table_write(0x0C, 0);
+
+    let physmap = Arc::new(
+        PhysMap::new_anon(RING_GPA, RING_BYTES).expect("create guest memory"),
+    );
+    let dev = VirtioPciDevice::new(
+        TestVirtioDevice { features: 0 },
+        bits::VIRTIO_DEV_TYPE_BLOCK,
+        1,
+        256,
+        8,
+        None,
+        physmap,
+        Arc::new(PioBus::new()),
+        Arc::new(MmioBus::new()),
+        Some(Arc::clone(&msix)),
+    );
+    let wo = WriteOp::from_buf(&0u32.to_le_bytes());
+    dev.bar_rw(
+        BarN::BAR2,
+        bits::COMMON_CFG_MSIX_CONFIG.into(),
+        RWOp::Write(&wo),
+    );
+    (dev, sink, msix)
+}
+
+/// DEVICE_NEEDS_RESET has to reach the driver the same way a config
+/// change does. A modern guest with MSI-X never reads the ISR, so an
+/// INTx-only signal tells it nothing and leaves the shared pin high
+/// for the life of the VM. It also has to be raised once: the write
+/// that refuses is guest driven and repeatable.
+#[test]
+fn a_refused_queue_raises_one_msix_message_however_often_it_repeats() {
+    let (dev, sink, _msix) = device_with_msix();
+
+    for _ in 0..16 {
+        // Past the mapped 16 KiB, so the rings cannot be reached.
+        enable_queue_0(
+            &dev,
+            RING_GPA + 0x3000,
+            RING_GPA + 0x3800,
+            RING_GPA + 0x3C00,
+        );
+    }
+
+    assert_ne!(device_status(&dev) & bits::STATUS_DEVICE_NEEDS_RESET, 0);
+    assert_eq!(
+        sink.0.lock().expect("recording lock").len(),
+        1,
+        "the needs-reset signal must reach an MSI-X driver exactly once",
+    );
+}
