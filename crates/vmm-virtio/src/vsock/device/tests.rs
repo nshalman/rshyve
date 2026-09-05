@@ -423,3 +423,49 @@ fn a_wedged_reader_does_not_hold_halt_open() {
     assert!(ended, "halt did not return within its budget");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A host peer that stops reading must not hold the vCPU that is
+/// writing to it. `write_host` runs with the sockets table locked and
+/// with the transport lock held above it, so an unbounded write there
+/// wedges every other vCPU that touches this device, and halt behind
+/// them.
+#[test]
+fn a_host_peer_that_never_reads_does_not_hold_the_writer() {
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    let key = ConnKey {
+        guest_port: 1024,
+        host_port: 1,
+    };
+    // The peer end is never read from, so the socket buffer fills and
+    // stays full for as long as this test holds it.
+    let (_peer, device_end) = UnixStream::pair().expect("socketpair");
+    assert!(vsock.shared.register_socket(key, device_end));
+
+    let writer = {
+        let shared = Arc::clone(&vsock.shared);
+        std::thread::spawn(move || {
+            shared.write_host(key, &vec![0u8; 8 * 1024 * 1024]);
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !writer.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        writer.is_finished(),
+        "the write never gave up on a peer that stopped reading"
+    );
+    writer.join().expect("join the writer");
+    assert!(
+        !vsock
+            .shared
+            .sockets
+            .lock()
+            .expect("sockets lock")
+            .contains_key(&key),
+        "the wedged connection stayed in the table"
+    );
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -68,6 +68,16 @@ const HALT_BUDGET: Duration = Duration::from_secs(2);
 /// flag. A reader that only wakes on the socket being shut down cannot
 /// end on its own, and halt then pays the whole budget for it.
 const HOST_READ_POLL: Duration = Duration::from_millis(250);
+
+/// How long a write to a host peer may block before the device gives
+/// up on it.
+///
+/// `write_host` runs on a vCPU thread with the sockets table locked
+/// and the transport lock held above it, so an unbounded write there
+/// stalls every other vCPU that touches this device, and the halt
+/// sweep that needs the same table. A peer that has not drained a
+/// single byte in this long is treated as gone.
+const HOST_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Pause after a failed `accept`, so a persistent error such as EMFILE
 /// cannot spin the accept thread at full speed.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
@@ -206,12 +216,33 @@ impl VsockShared {
             return;
         };
         if stream.write_all(data).is_err() {
-            // Shutting the socket down wakes this connection's reader,
-            // which tells the guest.
+            // A dead peer and one that stopped reading for
+            // HOST_WRITE_TIMEOUT are the same to the guest. Shutting
+            // the socket down wakes this connection's reader, which
+            // tells the guest the connection has gone.
             if let Some(stream) = sockets.remove(&key) {
                 let _ = stream.shutdown(Shutdown::Both);
             }
         }
+    }
+
+    /// Put a host socket in the table, ready to be written to.
+    ///
+    /// Returns false when the socket could not be armed, which the
+    /// caller has to treat as a refused connection: an unarmed socket
+    /// is the unbounded block this exists to stop.
+    fn register_socket(&self, key: ConnKey, stream: UnixStream) -> bool {
+        if let Err(error) = stream.set_write_timeout(Some(HOST_WRITE_TIMEOUT)) {
+            debug!(self.log, "virtio-vsock write timeout not set";
+                "error" => %error);
+            let _ = stream.shutdown(Shutdown::Both);
+            return false;
+        }
+        self.sockets
+            .lock()
+            .expect("sockets lock")
+            .insert(key, stream);
+        true
     }
 
     fn drop_socket(&self, key: ConnKey) {
@@ -426,11 +457,10 @@ fn start_host_connection(
             return;
         }
     };
-    shared
-        .sockets
-        .lock()
-        .expect("sockets lock")
-        .insert(key, peer);
+    if !shared.register_socket(key, peer) {
+        shared.mux.forget(key);
+        return;
+    }
     shared.deliver_rx();
     reader_loop(shared, key, s);
 }
@@ -727,11 +757,10 @@ impl VirtioVsock {
             self.shared.mux.refuse_guest_connect(key);
             return;
         };
-        self.shared
-            .sockets
-            .lock()
-            .expect("sockets lock")
-            .insert(key, stream);
+        if !self.shared.register_socket(key, stream) {
+            self.shared.mux.refuse_guest_connect(key);
+            return;
+        }
         self.shared.mux.accept_guest_connect(key);
 
         let shared = Arc::clone(&self.shared);
