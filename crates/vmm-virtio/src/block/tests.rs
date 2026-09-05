@@ -7,11 +7,12 @@
 use std::time::{Duration, Instant};
 
 use super::super::queue::VirtqDesc;
-use super::access::{BackendBarrier, GuestAccess};
+use super::access::BackendBarrier;
 use super::worker::{
     blk_io_worker, run_request, BlkIoRequest, Bounce, WorkerCtx, WorkerParks,
 };
 use super::*;
+use crate::access::GuestAccess;
 
 mod barrier;
 mod bounce;

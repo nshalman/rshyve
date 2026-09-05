@@ -2,130 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Permission to touch guest memory, and the order backend work keeps
-//! across a device reset.
+//! The order backend work keeps across a device reset.
 //!
-//! A backing-store call owns only host memory. Every guest-memory
-//! access runs inside a [`Session`], so the wait in
-//! [`GuestAccess::drain`] covers memory copies and ring writes only.
-//! That is what makes a synchronous reset safe on the vCPU.
+//! Permission to touch guest memory is `crate::access::GuestAccess`,
+//! shared with virtio-fs. Only virtio-blk needs what is here: it runs
+//! several workers per queue, so a write admitted under one driver can
+//! still overtake the next driver's write to the same sector.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, PoisonError, RwLock, RwLockReadGuard};
-
-/// Permission to read and write the guest's rings and chains.
-pub(super) struct GuestAccess {
-    /// Admission. Cleared before the drain, because a section refused
-    /// here never takes the lock. `std::sync::RwLock` promises the
-    /// writer no priority, and a guest chooses how much stale work
-    /// waits behind a reset, so readers must be turned away by a
-    /// check they cannot queue on.
-    open: AtomicBool,
-    /// One driver session. A request built against an older session
-    /// names a ring the driver has since freed.
-    epoch: AtomicU64,
-    lock: RwLock<()>,
-}
-
-/// Permission held across one guest-memory access.
-///
-/// No code inside a session calls the backing store, parks on the
-/// quiesce gate, or raises an interrupt. That is what bounds the wait
-/// in [`GuestAccess::drain`].
-pub(super) struct Session<'a> {
-    _guard: RwLockReadGuard<'a, ()>,
-    epoch: u64,
-}
-
-impl Session<'_> {
-    /// The driver session this permission is good for.
-    pub(super) fn epoch(&self) -> u64 {
-        self.epoch
-    }
-}
-
-impl GuestAccess {
-    pub(super) fn new() -> Self {
-        Self {
-            open: AtomicBool::new(true),
-            epoch: AtomicU64::new(0),
-            lock: RwLock::new(()),
-        }
-    }
-
-    /// Take permission for `epoch`, or refuse when the device has
-    /// moved past it.
-    pub(super) fn enter(&self, epoch: u64) -> Option<Session<'_>> {
-        if !self.open.load(Ordering::Acquire) {
-            return None;
-        }
-        let guard = self.lock.read().unwrap_or_else(PoisonError::into_inner);
-        if !self.open.load(Ordering::Acquire)
-            || self.epoch.load(Ordering::Acquire) != epoch
-        {
-            return None;
-        }
-        Some(Session {
-            _guard: guard,
-            epoch,
-        })
-    }
-
-    /// Take permission for whichever session is current.
-    pub(super) fn enter_current(&self) -> Option<Session<'_>> {
-        if !self.open.load(Ordering::Acquire) {
-            return None;
-        }
-        let guard = self.lock.read().unwrap_or_else(PoisonError::into_inner);
-        if !self.open.load(Ordering::Acquire) {
-            return None;
-        }
-        Some(Session {
-            _guard: guard,
-            epoch: self.epoch.load(Ordering::Acquire),
-        })
-    }
-
-    /// Close admission and end the session. Returns the new epoch.
-    pub(super) fn close(&self) -> u64 {
-        self.open.store(false, Ordering::Release);
-        self.epoch.fetch_add(1, Ordering::AcqRel) + 1
-    }
-
-    /// Wait for the sections that were already inside.
-    pub(super) fn drain(&self) {
-        drop(self.lock.write().unwrap_or_else(PoisonError::into_inner));
-    }
-
-    /// Admit the next driver.
-    pub(super) fn reopen(&self) {
-        self.open.store(true, Ordering::Release);
-    }
-
-    /// Raise an interrupt, unless the session that asked for it is
-    /// gone.
-    ///
-    /// The check is one load, and the raise holds nothing a reset
-    /// takes. Delivery is a call into the kernel, whose latency is
-    /// not ours to bound, and [`Self::close`] runs on the vCPU that
-    /// wrote DEVICE_STATUS. So a reset ends the session and abandons
-    /// the raises already past this point rather than waiting for
-    /// them.
-    ///
-    /// Abandoning them is safe here because a queue interrupt carries
-    /// no state. Every byte it reports was written inside a session
-    /// that [`Self::drain`] does wait for, so a late raise only tells
-    /// a driver that is tearing the ring down to look at a ring it
-    /// has stopped reading. The one mark it can leave is the ISR bit
-    /// and the INTx level, which belong to the transport and are the
-    /// transport's to gate against its own reset.
-    pub(super) fn deliver(&self, epoch: u64, raise: impl FnOnce()) {
-        if self.epoch.load(Ordering::Acquire) != epoch {
-            return;
-        }
-        raise();
-    }
-}
+use std::sync::{Condvar, Mutex, PoisonError};
 
 /// Keeps backend work in generation order across a reset.
 ///

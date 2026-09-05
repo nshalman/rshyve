@@ -50,7 +50,8 @@ mod io;
 mod tests;
 mod worker;
 
-use access::{BackendBarrier, GuestAccess};
+use crate::access::GuestAccess;
+use access::BackendBarrier;
 use io::{parse_header, write_status};
 use worker::{blk_io_worker, needs_backend, BlkIoRequest, WorkerCtx};
 

@@ -11,8 +11,6 @@ pub mod fuse;
 pub mod passthrough;
 pub mod server;
 
-mod access;
-
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -20,11 +18,11 @@ use std::time::{Duration, Instant};
 
 use vmm_core::mem::PhysMap;
 
-use self::access::GuestAccess;
 use self::passthrough::Passthrough;
 use self::server::FuseServer;
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::VirtioDevice;
+use crate::access::GuestAccess;
 use vmm_devices::lifecycle::{IndicatedState, Indicator};
 use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
 

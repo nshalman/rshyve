@@ -18,9 +18,10 @@ use vmm_core::mem::PhysMap;
 use vmm_devices::blkdev::datasync;
 use vmm_devices::QuiesceGate;
 
-use super::access::{BackendBarrier, GuestAccess};
+use super::access::BackendBarrier;
 use super::io::{self, BOUNCE_BYTES};
 use super::{bits, discard, probes, ChainBuf, DiskLimits};
+use crate::access::GuestAccess;
 use crate::queue::VirtioCompletion;
 
 /// Completions a worker gathers before it takes the `VirtioCompletion`

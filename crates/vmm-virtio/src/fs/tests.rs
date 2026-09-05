@@ -38,7 +38,7 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(1);
 
 /// Hold guest access the way the worker holds it across a copy into
 /// or out of a chain.
-fn hold_guest_access(fs: &VirtioFs) -> access::Session<'_> {
+fn hold_guest_access(fs: &VirtioFs) -> crate::access::Session<'_> {
     fs.access.enter_current().expect("a session is open")
 }
 

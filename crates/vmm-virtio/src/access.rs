@@ -5,23 +5,22 @@
 //! Permission to touch guest memory, and what a device reset takes
 //! back.
 //!
-//! A FUSE call owns only host memory. Every guest-memory access runs
-//! inside a [`Session`], so the wait in [`GuestAccess::drain`] covers
-//! the two bounded copies a request makes and the used entry that
-//! follows them. That is what makes a synchronous reset safe on the
-//! vCPU.
+//! A backing-store call, whether a disk operation or a FUSE call, owns
+//! only host memory. Every guest-memory access runs inside a
+//! [`Session`], so the wait in [`GuestAccess::drain`] covers the
+//! bounded copies a request makes and the used entry that follows
+//! them. That is what makes a synchronous reset safe on the vCPU.
 //!
-//! This duplicates `block::access::GuestAccess`, which is private to
-//! `block`. Both devices need one shared module. virtio-fs needs no
-//! `BackendBarrier`: it serves requests on one worker, so a call
-//! admitted before a reset always ends before the next session's
-//! first call starts.
+//! virtio-blk and virtio-fs share this. Ordering backend work across a
+//! reset is a separate problem that only virtio-blk has, because it
+//! runs several workers per queue; that lives in
+//! `block::access::BackendBarrier`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
 /// Permission to read and write the guest's rings and chains.
-pub(super) struct GuestAccess {
+pub(crate) struct GuestAccess {
     /// Admission. Cleared before the drain, because a section refused
     /// here never takes the lock. `std::sync::RwLock` promises the
     /// writer no priority, and a guest chooses how much stale work
@@ -39,20 +38,20 @@ pub(super) struct GuestAccess {
 /// No code inside a session calls the backing store, parks on the
 /// quiesce gate, or raises an interrupt. That is what bounds the wait
 /// in [`GuestAccess::drain`].
-pub(super) struct Session<'a> {
+pub(crate) struct Session<'a> {
     _guard: RwLockReadGuard<'a, ()>,
     epoch: u64,
 }
 
 impl Session<'_> {
     /// The driver session this permission is good for.
-    pub(super) fn epoch(&self) -> u64 {
+    pub(crate) fn epoch(&self) -> u64 {
         self.epoch
     }
 }
 
 impl GuestAccess {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             open: AtomicBool::new(true),
             epoch: AtomicU64::new(0),
@@ -62,7 +61,7 @@ impl GuestAccess {
 
     /// Take permission for `epoch`, or refuse when the device has
     /// moved past it.
-    pub(super) fn enter(&self, epoch: u64) -> Option<Session<'_>> {
+    pub(crate) fn enter(&self, epoch: u64) -> Option<Session<'_>> {
         if !self.open.load(Ordering::Acquire) {
             return None;
         }
@@ -79,7 +78,7 @@ impl GuestAccess {
     }
 
     /// Take permission for whichever session is current.
-    pub(super) fn enter_current(&self) -> Option<Session<'_>> {
+    pub(crate) fn enter_current(&self) -> Option<Session<'_>> {
         if !self.open.load(Ordering::Acquire) {
             return None;
         }
@@ -94,18 +93,18 @@ impl GuestAccess {
     }
 
     /// Close admission and end the session. Returns the new epoch.
-    pub(super) fn close(&self) -> u64 {
+    pub(crate) fn close(&self) -> u64 {
         self.open.store(false, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// Wait for the sections that were already inside.
-    pub(super) fn drain(&self) {
+    pub(crate) fn drain(&self) {
         drop(self.lock.write().unwrap_or_else(PoisonError::into_inner));
     }
 
     /// Admit the next driver.
-    pub(super) fn reopen(&self) {
+    pub(crate) fn reopen(&self) {
         self.open.store(true, Ordering::Release);
     }
 
@@ -118,12 +117,14 @@ impl GuestAccess {
     /// DEVICE_STATUS. So a reset ends the session and abandons the
     /// raises already past this point rather than waiting for them.
     ///
-    /// Abandoning them is safe because a queue interrupt carries no
-    /// state. Every byte it reports was written inside a session that
-    /// [`Self::drain`] does wait for, so a late raise only tells a
-    /// driver that is tearing the ring down to look at a ring it has
-    /// stopped reading.
-    pub(super) fn deliver(&self, epoch: u64, raise: impl FnOnce()) {
+    /// Abandoning them is safe here because a queue interrupt carries
+    /// no state. Every byte it reports was written inside a session
+    /// that [`Self::drain`] does wait for, so a late raise only tells
+    /// a driver that is tearing the ring down to look at a ring it has
+    /// stopped reading. The one mark it can leave is the ISR bit and
+    /// the INTx level, which belong to the transport and which the
+    /// transport gates against its own reset.
+    pub(crate) fn deliver(&self, epoch: u64, raise: impl FnOnce()) {
         if self.epoch.load(Ordering::Acquire) != epoch {
             return;
         }
@@ -137,7 +138,7 @@ impl GuestAccess {
     /// a caller that already holds one must not take a second while a
     /// writer waits.
     #[cfg(test)]
-    pub(super) fn is_open(&self) -> bool {
+    pub(crate) fn is_open(&self) -> bool {
         self.open.load(Ordering::Acquire)
     }
 
@@ -147,7 +148,7 @@ impl GuestAccess {
     /// A test uses this to prove that a refused section never queues
     /// on the lock the resetting vCPU waits for.
     #[cfg(test)]
-    pub(super) fn hold_drain(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+    pub(crate) fn hold_drain(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
         self.lock.write().unwrap_or_else(PoisonError::into_inner)
     }
 }

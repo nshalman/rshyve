@@ -26,6 +26,7 @@
 //! +-----------------------+
 //! ```
 
+mod access;
 pub mod attach;
 pub mod bits;
 pub mod block;
