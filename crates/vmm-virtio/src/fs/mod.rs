@@ -492,10 +492,15 @@ impl VirtioDevice for VirtioFs {
         {
             *slot = None;
         }
-        // A guest reboot must not leak the inode and handle fd tables.
-        // The drain above is what makes this safe: the worker holds fds
-        // from this table across a FUSE call.
-        self.server.passthrough().clear();
+        // A guest reboot must not leak the inode and handle fd tables,
+        // but only the drain makes closing them safe: the worker holds
+        // raw fds from these tables across a FUSE syscall, and a number
+        // closed under it is handed to the next thread in this process
+        // that opens anything. A drain that missed its budget leaves
+        // the tables for `halt` to reclaim.
+        if quiesced {
+            self.server.passthrough().clear();
+        }
 
         // Guest reachable: a driver can rebind virtio-fs in a loop.
         slog::debug!(self.log, "virtio-fs reset"; "quiesced" => quiesced);
@@ -538,6 +543,7 @@ impl Lifecycle for VirtioFs {
         *self.work_tx.lock().expect("work lock") = None;
         self.gate.resume();
 
+        let mut worker_gone = true;
         if let Some(handle) = self.worker.lock().expect("worker lock").take() {
             let deadline = Instant::now() + FS_HALT_BUDGET;
             while !handle.is_finished() && Instant::now() < deadline {
@@ -546,6 +552,7 @@ impl Lifecycle for VirtioFs {
             if handle.is_finished() {
                 let _ = handle.join();
             } else {
+                worker_gone = false;
                 slog::warn!(
                     self.log,
                     "virtio-fs worker did not exit within its budget"
@@ -554,8 +561,13 @@ impl Lifecycle for VirtioFs {
         }
 
         // Drop is unreachable while the device Arc lives in the binary's
-        // device vectors, so release guest-held fds here.
-        self.server.passthrough().clear();
+        // device vectors, so release guest-held fds here. A worker that
+        // outlived its budget still holds fds from these tables, and
+        // closing one under it lets an unrelated thread be handed that
+        // number, so the leak is the lesser fault.
+        if worker_gone {
+            self.server.passthrough().clear();
+        }
     }
 
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
@@ -941,6 +953,58 @@ mod tests {
             elapsed < Duration::from_millis(40),
             "reset drained an idle export: {elapsed:?}"
         );
+    }
+
+    // Clearing the fd tables is safe only because the drain says the
+    // worker has let go of them. A drain that missed its budget says
+    // nothing of the sort: the worker still holds a raw fd across a
+    // FUSE syscall, and closing it hands that number to the next
+    // thread in this process that opens anything.
+    #[test]
+    fn a_reset_that_missed_its_drain_keeps_the_fd_tables() {
+        let dir = tempfile::tempdir().expect("export directory");
+        std::fs::write(dir.path().join("f"), b"hello").expect("seed file");
+        let opts = VirtioFsOpts {
+            tag: "shared".to_string(),
+            path: dir.path().to_path_buf(),
+            read_only: true,
+            queue_size: FS_QUEUE_SIZE_DEFAULT,
+        };
+        let fs = VirtioFs::new(&opts, Arc::new(PhysMap::new()), test_logger())
+            .expect("open export");
+
+        let name = std::ffi::CString::new("f").expect("file name");
+        let entry = fs
+            .server
+            .passthrough()
+            .lookup(crate::fs::fuse::FUSE_ROOT_ID, &name)
+            .expect("look the file up");
+
+        // End the worker without a halt: it never parks, so the gate
+        // cannot quiesce and the drain has to miss its budget.
+        fs.shutdown.store(true, Ordering::Release);
+        *fs.work_tx.lock().expect("work lock") = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let done = fs
+                .worker
+                .lock()
+                .expect("worker lock")
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished);
+            if done || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fs.inflight.fetch_add(1, Ordering::AcqRel);
+
+        VirtioDevice::reset(&fs);
+
+        fs.server
+            .passthrough()
+            .getattr(entry.nodeid)
+            .expect("the reset closed an fd the worker still held");
     }
 
     // halt runs only from the paused state, and it must join the worker
