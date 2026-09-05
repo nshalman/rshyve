@@ -41,7 +41,7 @@ use vmm_devices::blkdev::{datasync, DiskCache};
 use vmm_devices::lifecycle::Indicator;
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
-use vmm_devices::pci::msix::MsixTable;
+use vmm_devices::pci::msix::{HdlMsiSink, MsixTable};
 use vmm_devices::pci::BarN;
 use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
 
@@ -280,7 +280,8 @@ impl NvmeController {
         // BAR0 consumes BAR0+BAR1 (64-bit), so BAR4 for MSI-X table
 
         // Create MSI-X table
-        let msix = Arc::new(MsixTable::new(NVME_MSIX_COUNT, Arc::clone(&hdl)));
+        let msix =
+            Arc::new(MsixTable::new(NVME_MSIX_COUNT, HdlMsiSink::new(hdl)));
         let msix_bar_size = msix.bar_size() as u32;
 
         // BAR4: MMIO for MSI-X table + PBA

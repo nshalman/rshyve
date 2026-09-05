@@ -19,7 +19,7 @@ use vmm_core::mem::PhysMap;
 use vmm_core::mmio::MmioBus;
 use vmm_core::pio::PioBus;
 
-use vmm_devices::pci::msix::MsixTable;
+use vmm_devices::pci::msix::{HdlMsiSink, MsiSink, MsixTable};
 use vmm_devices::pci::LintrCfg;
 
 use super::bits;
@@ -47,6 +47,16 @@ pub struct VirtioAttachCtx<'a> {
     pub bus_pio: &'a Arc<PioBus>,
     pub bus_mmio: &'a Arc<MmioBus>,
     pub hdl: &'a Arc<VmmHdl>,
+}
+
+impl VirtioAttachCtx<'_> {
+    /// The MSI-X delivery path for a device built from this context.
+    ///
+    /// The raw handle stays in the context because viona needs the VM
+    /// file descriptor. Every other use of it is this sink.
+    pub fn msi_sink(&self) -> Arc<dyn MsiSink> {
+        HdlMsiSink::new(Arc::clone(self.hdl))
+    }
 }
 
 /// Parse a virtio-blk config string:
@@ -122,7 +132,7 @@ pub fn virtio_blk(
     let cfg_size = blk.config_size();
     let blk_intr = Arc::clone(&blk.interrupt);
     // One MSI-X vector per queue, plus one for config change.
-    let msix = Arc::new(MsixTable::new(num_queues + 1, Arc::clone(ctx.hdl)));
+    let msix = Arc::new(MsixTable::new(num_queues + 1, ctx.msi_sink()));
 
     let pci_dev = VirtioPciDevice::new(
         blk,
@@ -199,7 +209,7 @@ pub fn virtio_viona(
     // One MSI-X vector per queue (rx, tx), plus one for config change.
     let msix = Arc::new(MsixTable::new(
         viona::NET_NUM_QUEUES as u16 + 1,
-        Arc::clone(ctx.hdl),
+        ctx.msi_sink(),
     ));
 
     // The poll thread needs the raise callback before the transport
@@ -265,8 +275,7 @@ pub fn virtio_console(
     let con_intr = console.interrupt();
 
     // One vector per queue, plus one for config change.
-    let msix =
-        Arc::new(MsixTable::new(CONSOLE_MSIX_VECTORS, Arc::clone(ctx.hdl)));
+    let msix = Arc::new(MsixTable::new(CONSOLE_MSIX_VECTORS, ctx.msi_sink()));
 
     let pci_dev = VirtioPciDevice::new(
         console,
@@ -313,7 +322,7 @@ pub fn virtio_fs(
     let fs = VirtioFs::new(opts, Arc::clone(ctx.physmap), log.clone())?;
     let fs_intr = Arc::clone(&fs.interrupt);
 
-    let msix = Arc::new(MsixTable::new(FS_MSIX_VECTORS, Arc::clone(ctx.hdl)));
+    let msix = Arc::new(MsixTable::new(FS_MSIX_VECTORS, ctx.msi_sink()));
 
     let pci_dev = VirtioPciDevice::new(
         fs,
@@ -362,8 +371,7 @@ pub fn virtio_vsock(
     let cfg_size = vsock.config_size();
     let vsock_intr = vsock.interrupt();
 
-    let msix =
-        Arc::new(MsixTable::new(VSOCK_MSIX_VECTORS, Arc::clone(ctx.hdl)));
+    let msix = Arc::new(MsixTable::new(VSOCK_MSIX_VECTORS, ctx.msi_sink()));
 
     let pci_dev = VirtioPciDevice::new(
         vsock,
@@ -397,7 +405,7 @@ pub fn virtio_rng(
     ctx: &VirtioAttachCtx<'_>,
 ) -> Arc<VirtioPciDevice<VirtioRng>> {
     // One queue, plus a config change vector.
-    let msix = Arc::new(MsixTable::new(2, Arc::clone(ctx.hdl)));
+    let msix = Arc::new(MsixTable::new(2, ctx.msi_sink()));
     VirtioPciDevice::new(
         VirtioRng::new(),
         bits::VIRTIO_DEV_TYPE_RNG,

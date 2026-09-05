@@ -134,8 +134,7 @@ pub fn attach_with_control(
     let vsock_intr = vsock.interrupt();
     let control = vsock.control_slot();
 
-    let msix =
-        Arc::new(MsixTable::new(VSOCK_MSIX_VECTORS, Arc::clone(ctx.hdl)));
+    let msix = Arc::new(MsixTable::new(VSOCK_MSIX_VECTORS, ctx.msi_sink()));
 
     let pci_dev = VirtioPciDevice::new(
         vsock,
