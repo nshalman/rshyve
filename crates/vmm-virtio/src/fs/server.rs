@@ -10,7 +10,13 @@
 //! a `fuse_out_header` + body through a `ChainWriter` over the writable
 //! segments.
 //!
-//! `handle` runs on the FUSE worker thread, never on a vCPU thread: the
+//! The three steps are separate calls on purpose. `read_request` and
+//! `write_reply` touch guest memory and are bounded copies; `run` sits
+//! between them and can take as long as the host filesystem does. The
+//! device holds its guest-access guard over the copies alone, so a
+//! device reset never waits on the backing store.
+//!
+//! All three run on the FUSE worker thread, never on a vCPU thread: the
 //! readers and writers build `SubMapping`s, which are `!Send`, so they
 //! must be constructed where they are used.
 
@@ -51,6 +57,49 @@ enum Reply {
     None,
 }
 
+/// One FUSE request, copied out of the guest's chain.
+///
+/// This is host memory, which is what lets [`FuseServer::run`] hold no
+/// guest access while the host filesystem takes its time.
+pub struct FuseCall {
+    unique: u64,
+    kind: CallKind,
+}
+
+enum CallKind {
+    /// A request for the backing store.
+    Dispatch {
+        header: fuse::FuseInHeader,
+        body: Vec<u8>,
+    },
+    /// A header the device refused. The backing store never sees it.
+    Reject(i32),
+    /// The chain held no request to answer.
+    Silent,
+}
+
+impl FuseCall {
+    fn silent() -> Self {
+        Self {
+            unique: 0,
+            kind: CallKind::Silent,
+        }
+    }
+
+    fn reject(unique: u64, errno: i32) -> Self {
+        Self {
+            unique,
+            kind: CallKind::Reject(errno),
+        }
+    }
+}
+
+/// A reply held in host memory, waiting for the guest's chain.
+pub struct FuseReply {
+    unique: u64,
+    reply: Reply,
+}
+
 impl FuseServer {
     pub fn new(passthrough: Arc<Passthrough>) -> Self {
         Self { passthrough }
@@ -61,55 +110,83 @@ impl FuseServer {
         &self.passthrough
     }
 
-    /// Process a single descriptor chain.
+    /// Copy one request out of the guest's chain.
     ///
-    /// Returns the number of bytes written into the chain's writable
-    /// window, which the caller puts in the used-ring `len` field.
+    /// The reader keeps to the readable segments, so a guest that
+    /// interleaves the two halves cannot make this read a segment it
+    /// asked the device to write.
     ///
-    /// The reply reaches guest memory before this returns, so the caller
-    /// must already hold the device's `ring_access` guard. Deciding
-    /// afterwards that the chain was stale is too late.
-    pub fn handle(&self, bufs: &[ChainBuf], physmap: &PhysMap) -> u32 {
-        // The two views cover disjoint segments of the same chain: the
-        // reader skips writable segments and the writer skips readable
-        // ones, so a guest that interleaves them cannot cross the halves.
+    /// The caller holds guest access across this call. The length is
+    /// capped at [`MAX_MSG_SIZE`], so the copy is bounded and the
+    /// caller can hold that access on a vCPU-facing lock.
+    pub fn read_request(
+        &self,
+        bufs: &[ChainBuf],
+        physmap: &PhysMap,
+    ) -> FuseCall {
         let mut reader = ChainReader::new(bufs, physmap);
-        let mut writer = ChainWriter::new(bufs, physmap);
 
-        // Header.
         let mut hdr_buf = [0u8; fuse::FUSE_IN_HEADER_SIZE];
         if reader.read_exact(&mut hdr_buf).is_err() {
-            return 0;
+            return FuseCall::silent();
         }
         let header: fuse::FuseInHeader = match read_at(&hdr_buf) {
             Some(h) => h,
-            None => return 0,
+            None => return FuseCall::silent(),
         };
 
-        // Validate header len.
         let total_len = header.len as usize;
         let limits = fuse::FUSE_IN_HEADER_SIZE..=MAX_MSG_SIZE;
         if !limits.contains(&total_len) {
-            return write_reply(
-                &mut writer,
-                header.unique,
-                Reply::Error(-libc::EINVAL),
-            );
+            return FuseCall::reject(header.unique, -libc::EINVAL);
         }
 
-        // Body.
         let body_len = total_len - fuse::FUSE_IN_HEADER_SIZE;
         let mut body = vec![0u8; body_len];
         if body_len > 0 && reader.read_exact(&mut body).is_err() {
-            return write_reply(
-                &mut writer,
-                header.unique,
-                Reply::Error(-libc::EINVAL),
-            );
+            return FuseCall::reject(header.unique, -libc::EINVAL);
         }
 
-        let reply = self.dispatch(&header, &body);
-        write_reply(&mut writer, header.unique, reply)
+        FuseCall {
+            unique: header.unique,
+            kind: CallKind::Dispatch { header, body },
+        }
+    }
+
+    /// Run a request against the backing store.
+    ///
+    /// Host memory in, host memory out. The caller must NOT hold guest
+    /// access here: a host filesystem can block for as long as it
+    /// likes, and a device reset must not wait behind it.
+    pub fn run(&self, call: &FuseCall) -> FuseReply {
+        let reply = match &call.kind {
+            CallKind::Dispatch { header, body } => self.dispatch(header, body),
+            CallKind::Reject(errno) => Reply::Error(*errno),
+            CallKind::Silent => Reply::None,
+        };
+        FuseReply {
+            unique: call.unique,
+            reply,
+        }
+    }
+
+    /// Write a reply into the chain's writable window.
+    ///
+    /// Returns the byte count for the used-ring `len` field. The writer
+    /// keeps to the writable segments, so it cannot touch a segment the
+    /// guest kept for itself.
+    ///
+    /// The caller holds guest access across this call and the used entry
+    /// it publishes. The reply is already in host memory, so the copy is
+    /// bounded by the writable window.
+    pub fn write_reply(
+        &self,
+        bufs: &[ChainBuf],
+        physmap: &PhysMap,
+        reply: FuseReply,
+    ) -> u32 {
+        let mut writer = ChainWriter::new(bufs, physmap);
+        emit_reply(&mut writer, reply.unique, reply.reply)
     }
 
     fn dispatch(&self, header: &fuse::FuseInHeader, body: &[u8]) -> Reply {
@@ -641,7 +718,7 @@ impl FuseServer {
 // Wire helpers
 // ---------------------------------------------------------------------------
 
-fn write_reply<W: Write>(writer: &mut W, unique: u64, reply: Reply) -> u32 {
+fn emit_reply<W: Write>(writer: &mut W, unique: u64, reply: Reply) -> u32 {
     match reply {
         Reply::None => 0,
         Reply::Empty => write_header(writer, unique, 0, &[]),

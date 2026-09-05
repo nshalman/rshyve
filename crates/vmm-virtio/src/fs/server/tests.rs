@@ -20,6 +20,16 @@ fn server() -> FuseServer {
     FuseServer::new(Arc::new(pt))
 }
 
+/// Run one request end to end.
+///
+/// The device splits these three steps around its guest-access guard.
+/// These tests are about the wire format, so they compose them here.
+fn handle(srv: &FuseServer, bufs: &[ChainBuf], physmap: &PhysMap) -> u32 {
+    let call = srv.read_request(bufs, physmap);
+    let reply = srv.run(&call);
+    srv.write_reply(bufs, physmap, reply)
+}
+
 fn seed(physmap: &PhysMap, gpa: u64, data: &[u8]) {
     physmap
         .lookup(gpa, data.len())
@@ -78,7 +88,7 @@ fn init_over_a_chain_returns_a_success_header() {
         },
     ];
 
-    let written = server().handle(&bufs, &physmap);
+    let written = handle(&server(), &bufs, &physmap);
     assert_eq!(
         written as usize,
         fuse::FUSE_OUT_HEADER_SIZE + size_of::<fuse::FuseInitOut>()
@@ -118,7 +128,7 @@ fn oversized_declared_len_is_rejected_with_einval() {
         },
     ];
 
-    let written = server().handle(&bufs, &physmap);
+    let written = handle(&server(), &bufs, &physmap);
     assert_eq!(written as usize, fuse::FUSE_OUT_HEADER_SIZE);
 
     let out = fetch(&physmap, RESP, written as usize);
@@ -133,7 +143,7 @@ fn a_chain_with_no_readable_segment_writes_nothing() {
         addr: RESP,
         len: 256,
     }];
-    assert_eq!(server().handle(&bufs, &physmap), 0);
+    assert_eq!(handle(&server(), &bufs, &physmap), 0);
 }
 
 // A writable window too small for the body still acks the header, so
@@ -155,7 +165,7 @@ fn a_short_writable_window_still_acks_the_header() {
         },
     ];
 
-    let written = server().handle(&bufs, &physmap);
+    let written = handle(&server(), &bufs, &physmap);
     assert_eq!(written as usize, fuse::FUSE_OUT_HEADER_SIZE);
 }
 
@@ -237,7 +247,7 @@ fn reply_error(srv: &FuseServer, req: &[u8]) -> i32 {
             len: 512,
         },
     ];
-    let written = srv.handle(&bufs, &physmap);
+    let written = handle(srv, &bufs, &physmap);
     assert!(written as usize >= fuse::FUSE_OUT_HEADER_SIZE);
     let out = fetch(&physmap, RESP, written as usize);
     let hdr: fuse::FuseOutHeader = read_at(&out).expect("out header");

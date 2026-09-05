@@ -11,21 +11,126 @@
 
 use super::*;
 
+use std::sync::Condvar;
 use std::time::Instant;
 
 use crate::queue::VirtqDesc;
 use vmm_devices::Lifecycle;
 
-/// Longer than the two second budget the drain used to give up after.
-/// A reset that returns inside this window has a deadline again.
+/// Deadline on every wait a parked backend can be caught in. A device
+/// that wrongly waits on the backing store fails the test after this
+/// instead of hanging the run.
+const PARK_BUDGET: Duration = Duration::from_secs(2);
+
+/// Longer than the two second budget the old drain gave up after. A
+/// reset that returns inside this window has a deadline again.
 const PAST_THE_OLD_DRAIN_BUDGET: Duration = Duration::from_millis(2500);
 
 /// Take the shared side of `ring_access` the way the worker holds it
-/// across a passthrough syscall, and put a request on the count so the
-/// reset cannot take its idle short cut.
+/// across a copy into or out of a chain.
 fn hold_ring_access(fs: &VirtioFs) -> std::sync::RwLockReadGuard<'_, ()> {
-    fs.inflight.fetch_add(1, Ordering::AcqRel);
     fs.ring_access.read().expect("ring access")
+}
+
+#[derive(Default)]
+struct ParkState {
+    /// The worker is inside the stand-in call.
+    inside: bool,
+    /// The test has let it out.
+    released: bool,
+    /// The stand-in call has returned.
+    left: bool,
+}
+
+/// Stands in for a backing-store call that has not returned.
+///
+/// The device runs this where `FuseServer::run` goes, so it holds no
+/// guest access while it waits. Every wait here has a deadline, so a
+/// reset that blocks on the backing store fails a test rather than
+/// wedging the run.
+#[derive(Default)]
+struct ParkedBackend {
+    state: Mutex<ParkState>,
+    signal: Condvar,
+}
+
+impl ParkedBackend {
+    /// Arm the stand-in on `fs`. It answers the next request only.
+    fn install(fs: &VirtioFs) -> Arc<Self> {
+        let this = Arc::new(Self::default());
+        let hook = Arc::clone(&this);
+        *fs.parks.in_backend.lock().expect("park lock") =
+            Some(Arc::new(move || hook.park()));
+        this
+    }
+
+    fn park(&self) {
+        let mut state = self.state.lock().expect("park state");
+        state.inside = true;
+        self.signal.notify_all();
+        while !state.released {
+            let (next, timed_out) = self
+                .signal
+                .wait_timeout(state, PARK_BUDGET)
+                .expect("park state");
+            state = next;
+            if timed_out.timed_out() {
+                break;
+            }
+        }
+        state.left = true;
+        self.signal.notify_all();
+    }
+
+    /// Block until the worker is inside the stand-in call.
+    fn wait_until_inside(&self) {
+        let mut state = self.state.lock().expect("park state");
+        while !state.inside {
+            let (next, timed_out) = self
+                .signal
+                .wait_timeout(state, PARK_BUDGET)
+                .expect("park state");
+            state = next;
+            assert!(
+                !timed_out.timed_out(),
+                "the worker never reached the backing store"
+            );
+        }
+    }
+
+    /// Whether the stand-in call is still running.
+    fn still_running(&self) -> bool {
+        !self.state.lock().expect("park state").left
+    }
+
+    /// Let the stand-in call return, and wait until it has.
+    fn release(&self) {
+        let mut state = self.state.lock().expect("park state");
+        state.released = true;
+        self.signal.notify_all();
+        while !state.left {
+            let (next, timed_out) = self
+                .signal
+                .wait_timeout(state, PARK_BUDGET)
+                .expect("park state");
+            state = next;
+            assert!(!timed_out.timed_out(), "the backing store never returned");
+        }
+    }
+}
+
+/// Block until the worker owes the guest nothing.
+fn wait_until_idle(fs: &VirtioFs) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fs.inflight.load(Ordering::Acquire) != 0 && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        fs.inflight.load(Ordering::Acquire),
+        0,
+        "the worker never finished with the request"
+    );
 }
 
 /// Block until the reset thread is inside the `ring_access` wait.
@@ -61,6 +166,9 @@ const AVAIL_GPA: u64 = 0x1100;
 const USED_GPA: u64 = 0x1200;
 const REQ_GPA: u64 = 0x2000;
 const RESP_GPA: u64 = 0x2800;
+const RESP_LEN: usize = 256;
+/// Byte the reply window carries before a reply can reach it.
+const REPLY_SENTINEL: u8 = 0xA5;
 
 fn test_logger() -> slog::Logger {
     slog::Logger::root(slog::Discard, slog::o!())
@@ -104,7 +212,7 @@ fn ring(
         .expect("mapped reply descriptor")
         .write(&VirtqDesc {
             addr: RESP_GPA,
-            len: 256,
+            len: RESP_LEN as u32,
             flags: crate::bits::VRING_DESC_F_WRITE,
             next: 0,
         })
@@ -127,6 +235,56 @@ fn ring(
     // Queue 0 is hiprio and stays unconfigured; the tests drive the
     // request queue at the index the transport uses.
     (physmap, [VirtQueue::new(queue_size), queue], fs)
+}
+
+/// Write a FUSE_INIT into the chain's readable segment, so the reply
+/// the worker would publish has a body worth catching.
+fn seed_fuse_init(physmap: &PhysMap) {
+    let hdr = fuse::FuseInHeader {
+        len: (fuse::FUSE_IN_HEADER_SIZE + size_of::<fuse::FuseInitIn>()) as u32,
+        opcode: fuse::FUSE_INIT,
+        unique: 1,
+        nodeid: 0,
+        uid: 0,
+        gid: 0,
+        pid: 0,
+        padding: 0,
+    };
+    let mut buf = fuse::bytes_of(&hdr);
+    fuse::push_val(
+        &mut buf,
+        &fuse::FuseInitIn {
+            major: 7,
+            minor: 33,
+            max_readahead: 0x2_0000,
+            flags: 0,
+        },
+    );
+    physmap
+        .lookup(REQ_GPA, buf.len())
+        .expect("mapped request")
+        .write_bytes(&buf)
+        .expect("seed the request");
+}
+
+/// Fill the chain's writable segment with a sentinel, so a reply that
+/// lands there after a reset is visible.
+fn seed_reply_window(physmap: &PhysMap) {
+    physmap
+        .lookup(RESP_GPA, RESP_LEN)
+        .expect("mapped reply window")
+        .write_bytes(&[REPLY_SENTINEL; RESP_LEN])
+        .expect("seed the reply window");
+}
+
+fn reply_window(physmap: &PhysMap) -> Vec<u8> {
+    let mut out = vec![0u8; RESP_LEN];
+    physmap
+        .lookup(RESP_GPA, RESP_LEN)
+        .expect("mapped reply window")
+        .read_bytes(&mut out)
+        .expect("read the reply window");
+    out
 }
 
 fn avail_event(physmap: &PhysMap, queue: &VirtQueue) -> u16 {
@@ -352,16 +510,7 @@ fn reset_drops_a_request_queued_before_it() {
     // The woken worker drops the stale request and decrements as it
     // goes, so a count back at zero means it has dealt with it. Timing
     // a window instead would pass on a runner that never scheduled it.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while fs.inflight.load(Ordering::Acquire) != 0 && Instant::now() < deadline
-    {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert_eq!(
-        fs.inflight.load(Ordering::Acquire),
-        0,
-        "the worker never finished with the pre-reset request"
-    );
+    wait_until_idle(&fs);
     assert_eq!(
         queues[req].read_used_ring_idx(&physmap),
         0,
@@ -403,16 +552,7 @@ fn reset_never_parks_the_worker() {
     let (physmap, mut queues, fs) = ring(8, 1);
 
     fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while fs.inflight.load(Ordering::Acquire) != 0 && Instant::now() < deadline
-    {
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert_eq!(
-        fs.inflight.load(Ordering::Acquire),
-        0,
-        "the queued request never finished"
-    );
+    wait_until_idle(&fs);
 
     VirtioDevice::reset(&fs);
 
@@ -424,13 +564,13 @@ fn reset_never_parks_the_worker() {
     assert!(!fs.gate.is_paused(), "reset left the worker parked");
 }
 
-// Clearing the fd tables is safe only because the reset waited: the
-// worker holds a raw fd from them across a FUSE syscall, and closing
-// it hands that number to the next thread in this process that opens
-// anything. The reset must not get past `ring_access` to reach the
-// clear, and must reach it once the worker lets go.
+// The fd tables are backing-store state. A reset must not close them,
+// because the worker holds raw fds from them across a FUSE syscall and
+// a number closed under it goes to the next thread in this process
+// that opens anything. The worker reaps them instead, once it sees the
+// epoch move.
 #[test]
-fn a_reset_keeps_the_fd_tables_while_the_worker_holds_them() {
+fn the_worker_reaps_the_fd_tables_a_reset_retired() {
     let dir = tempfile::tempdir().expect("export directory");
     // `bind_restricted` moves the process umask while it binds, and
     // the vsock tests bind in parallel with this one, so the mode
@@ -449,6 +589,7 @@ fn a_reset_keeps_the_fd_tables_while_the_worker_holds_them() {
     };
     let fs = VirtioFs::new(&opts, Arc::new(PhysMap::new()), test_logger())
         .expect("open export");
+    fs.start().expect("start");
 
     let name = std::ffi::CString::new("f").expect("file name");
     let entry = fs
@@ -457,42 +598,32 @@ fn a_reset_keeps_the_fd_tables_while_the_worker_holds_them() {
         .lookup(fuse::FUSE_ROOT_ID, &name)
         .expect("look the file up");
 
-    let access = hold_ring_access(&fs);
-    let epoch_before = fs.epoch.load(Ordering::Acquire);
-    let finished = AtomicBool::new(false);
-    let fs_ref = &fs;
-    let finished_ref = &finished;
+    VirtioDevice::reset(&fs);
+    // The reset returns with the tables intact: it does not know what
+    // the worker is holding.
+    fs.server
+        .passthrough()
+        .getattr(entry.nodeid)
+        .expect("the reset closed an fd the worker could still hold");
 
-    std::thread::scope(|scope| {
-        scope.spawn(move || {
-            VirtioDevice::reset(fs_ref);
-            finished_ref.store(true, Ordering::Release);
-        });
-
-        wait_until_reset_blocks(&fs, epoch_before, &finished);
-        fs.server
-            .passthrough()
-            .getattr(entry.nodeid)
-            .expect("the reset closed an fd the worker still held");
-
-        drop(access);
-    });
-
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fs.server.passthrough().getattr(entry.nodeid).is_ok()
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(
         fs.server.passthrough().getattr(entry.nodeid).is_err(),
-        "the reset left the guest's fd tables behind"
+        "the worker never reaped the retired session's fd tables"
     );
 }
 
-// The window codex found in the budgeted drain: the worker passes the
-// epoch check, the passthrough syscall runs long, the wait gives up,
-// and the reset returns. The guest reads DEVICE_STATUS as 0, frees the
-// vring, and `FuseServer::handle` writes the reply into the recycled
-// pages. Checking the epoch afterwards cannot take that write back, so
-// the reset must not finish at all while the worker holds the shared
-// side of `ring_access`.
+// A worker inside a copy has already passed its epoch check, so no
+// later check takes that copy back. The reset must not finish while
+// the worker holds the shared side, and it needs no deadline to say
+// so: the sections under that guard are bounded copies.
 #[test]
-fn a_reset_waits_out_a_worker_that_never_finishes_in_time() {
+fn a_reset_waits_out_a_copy_into_the_chain() {
     let fs = test_fs(Arc::new(PhysMap::new()));
     fs.start().expect("start");
 
@@ -566,6 +697,61 @@ fn a_pause_that_lands_inside_a_reset_survives_it() {
         fs.gate.is_paused(),
         "the reset released a pause the control plane owns"
     );
+}
+
+// The invariant, stated as a test: a backing-store call owns only host
+// memory, so a reset can end the driver session while one is running
+// and nothing it produces reaches the guest. The worker has already
+// copied the request out and passed its first epoch check, which is
+// the interleaving that matters.
+#[test]
+fn a_backend_parked_across_a_reset_writes_nothing_into_the_ring() {
+    let (physmap, mut queues, fs) = ring(8, 1);
+    let req = usize::from(FS_REQUEST_QUEUE);
+    seed_fuse_init(&physmap);
+    seed_reply_window(&physmap);
+    fs.start().expect("start");
+
+    let backend = ParkedBackend::install(&fs);
+    fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
+    backend.wait_until_inside();
+
+    VirtioDevice::reset(&fs);
+    backend.release();
+    wait_until_idle(&fs);
+
+    assert_eq!(
+        queues[req].read_used_ring_idx(&physmap),
+        0,
+        "the reply was published into the ring the guest had freed"
+    );
+    assert!(
+        reply_window(&physmap).iter().all(|b| *b == REPLY_SENTINEL),
+        "the reply landed in guest pages the reset had released"
+    );
+}
+
+// The illumos legacy driver writes the reset register once and does not
+// poll, so this runs on the vCPU. A host filesystem that never answers
+// must therefore not be in the wait: it would hold that vCPU for as
+// long as it took.
+#[test]
+fn a_reset_does_not_wait_for_the_backend() {
+    let (physmap, mut queues, fs) = ring(8, 1);
+    seed_fuse_init(&physmap);
+    fs.start().expect("start");
+
+    let backend = ParkedBackend::install(&fs);
+    fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
+    backend.wait_until_inside();
+
+    VirtioDevice::reset(&fs);
+
+    assert!(
+        backend.still_running(),
+        "the reset waited for the backing store"
+    );
+    backend.release();
 }
 
 // A halt abandons the request the worker holds and every one still
