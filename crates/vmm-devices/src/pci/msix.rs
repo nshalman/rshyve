@@ -263,19 +263,17 @@ impl MsixTable {
             _ => {}
         }
 
-        // Check if vector was just unmasked — deliver pending interrupt
+        // An unmask sends the message the PBA is holding for this one
+        // vector. The function mask still gates it: both masks must be
+        // clear before a message leaves.
         let now_masked = (inner.entries[idx].control & VECTOR_CTRL_MASK) != 0;
-        if was_masked && !now_masked && inner.enabled {
-            let qword = idx / 64;
-            let bit = idx % 64;
-            if inner.pba[qword] & (1 << bit) != 0 {
-                inner.pba[qword] &= !(1 << bit);
-                let e = &inner.entries[idx];
-                let addr = u64::from(e.addr_lo) | (u64::from(e.addr_hi) << 32);
-                let data = u64::from(e.data);
-                drop(inner);
-                self.msi.send(addr, data);
-            }
+        let pending = (was_masked && !now_masked)
+            .then(|| take_pending(&mut inner, idx))
+            .flatten();
+        drop(inner);
+
+        if let Some((addr, data)) = pending {
+            self.msi.send(addr, data);
         }
     }
 
@@ -346,19 +344,82 @@ impl MsixTable {
         }
         let cap_rel = offset - cap_offset;
         let dword_off = cap_rel & 0xFC;
-        if dword_off == 0 {
-            let msg_ctrl = (val >> 16) as u16;
-            let mut inner = self.inner.lock().expect("msix lock");
-            inner.enabled = (msg_ctrl & MSG_CTRL_ENABLE) != 0;
-            inner.func_masked = (msg_ctrl & MSG_CTRL_FUNC_MASK) != 0;
+        if dword_off != 0 {
+            // Table BIR and PBA BIR are read-only.
+            return;
         }
-        // Table BIR and PBA BIR are read-only
+
+        let msg_ctrl = (val >> 16) as u16;
+        let mut inner = self.inner.lock().expect("msix lock");
+        inner.enabled = (msg_ctrl & MSG_CTRL_ENABLE) != 0;
+        inner.func_masked = (msg_ctrl & MSG_CTRL_FUNC_MASK) != 0;
+        // PCI 3.0 6.8.2.3: clearing the Function Mask sends every message
+        // the PBA recorded while it was set. Without this the guest waits
+        // on an I/O that already completed.
+        let pending = drain_pending(&mut inner);
+        drop(inner);
+
+        for (addr, data) in pending {
+            self.msi.send(addr, data);
+        }
     }
 
     /// Total BAR size needed for MSI-X table + PBA.
     pub fn bar_size(&self) -> usize {
         bar_size_for(self.count)
     }
+}
+
+/// Take the message one vector has pending, if it can be sent now.
+///
+/// Clears the PBA bit, so one recorded interrupt sends one message
+/// however many times the guest masks and unmasks the vector.
+fn take_pending(inner: &mut MsixInner, idx: usize) -> Option<(u64, u64)> {
+    if !inner.enabled || inner.func_masked {
+        return None;
+    }
+    // Copied out so the entry borrow ends before the PBA is written.
+    let entry = *inner.entries.get(idx)?;
+    if (entry.control & VECTOR_CTRL_MASK) != 0 {
+        return None;
+    }
+
+    let bit = 1u64 << (idx % 64);
+    let word = inner.pba.get_mut(idx / 64)?;
+    if *word & bit == 0 {
+        return None;
+    }
+    *word &= !bit;
+
+    Some((
+        u64::from(entry.addr_lo) | (u64::from(entry.addr_hi) << 32),
+        u64::from(entry.data),
+    ))
+}
+
+/// Take every message the PBA is holding that can be sent now.
+///
+/// Walks the set bits, not the whole table, so a guest that toggles the
+/// function mask pays for what it left pending and nothing more.
+fn drain_pending(inner: &mut MsixInner) -> Vec<(u64, u64)> {
+    if !inner.enabled || inner.func_masked {
+        return Vec::new();
+    }
+
+    let mut messages = Vec::new();
+    for word in 0..inner.pba.len() {
+        let mut bits = inner.pba[word];
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            // `take_pending` bounds-checks: a bit past the table is
+            // never set by `fire`, and this index is guest driven.
+            if let Some(message) = take_pending(inner, word * 64 + bit) {
+                messages.push(message);
+            }
+        }
+    }
+    messages
 }
 
 #[cfg(test)]
@@ -526,5 +587,97 @@ mod tests {
     fn cap_read_returns_cap_id() {
         // Verify capability ID encoding
         assert_eq!(MSIX_CAP_ID, 0x11);
+    }
+
+    // ── Function mask (PCI 3.0 6.8.2.3) ─────────────────────────
+
+    /// Message Control with MSI-X enabled and the function mask as given.
+    fn write_msg_ctrl(table: &MsixTable, func_masked: bool) {
+        let mut ctrl = MSG_CTRL_ENABLE;
+        if func_masked {
+            ctrl |= MSG_CTRL_FUNC_MASK;
+        }
+        table.cap_write(0, 0, u32::from(ctrl) << 16);
+    }
+
+    #[test]
+    fn clearing_the_function_mask_delivers_every_pending_vector() {
+        // Without this the guest waits forever on an I/O that finished:
+        // the completion is recorded in the PBA and never sent.
+        let (table, sink) = enabled_table(2);
+        table.write_entry(0, 0xFEE0_5000, 0x61);
+        table.write_entry(1, 0xFEE0_5000, 0x62);
+        write_msg_ctrl(&table, true);
+
+        table.fire(0);
+        table.fire(1);
+        assert!(sink.recorded().is_empty());
+        assert_eq!(table.pba_read(0) & 0b11, 0b11);
+
+        write_msg_ctrl(&table, false);
+
+        assert_eq!(
+            sink.recorded(),
+            vec![(0xFEE0_5000, 0x61), (0xFEE0_5000, 0x62)]
+        );
+        assert_eq!(table.pba_read(0) & 0b11, 0);
+    }
+
+    #[test]
+    fn a_function_mask_toggle_delivers_a_message_once() {
+        let (table, sink) = enabled_table(1);
+        table.write_entry(0, 0xFEE0_6000, 0x71);
+        write_msg_ctrl(&table, true);
+        table.fire(0);
+
+        write_msg_ctrl(&table, false);
+        write_msg_ctrl(&table, true);
+        write_msg_ctrl(&table, false);
+
+        assert_eq!(sink.recorded(), vec![(0xFEE0_6000, 0x71)]);
+    }
+
+    #[test]
+    fn clearing_the_function_mask_leaves_a_per_vector_mask_pending() {
+        // Both masks gate delivery, so the vector mask still holds.
+        let (table, sink) = enabled_table(2);
+        table.write_entry(0, 0xFEE0_7000, 0x81);
+        write_msg_ctrl(&table, true);
+        table.fire(0);
+        table.table_write(0xC, VECTOR_CTRL_MASK);
+
+        write_msg_ctrl(&table, false);
+
+        assert!(sink.recorded().is_empty());
+        assert_eq!(table.pba_read(0) & 1, 1);
+
+        table.table_write(0xC, 0);
+        assert_eq!(sink.recorded(), vec![(0xFEE0_7000, 0x81)]);
+    }
+
+    #[test]
+    fn an_unmask_under_the_function_mask_delivers_nothing() {
+        let (table, sink) = enabled_table(1);
+        table.table_write(0x0, 0xFEE0_8000);
+        table.table_write(0x8, 0x91);
+        write_msg_ctrl(&table, true);
+        table.fire(0);
+
+        table.table_write(0xC, 0);
+
+        assert!(sink.recorded().is_empty());
+        assert_eq!(table.pba_read(0) & 1, 1);
+    }
+
+    #[test]
+    fn a_pending_vector_past_the_table_is_never_delivered() {
+        let (table, sink) = enabled_table(2);
+        write_msg_ctrl(&table, true);
+        // Only fire() writes the PBA and it bounds-checks, so reach in.
+        table.inner.lock().expect("msix lock").pba[0] = u64::MAX;
+
+        write_msg_ctrl(&table, false);
+
+        assert_eq!(sink.recorded().len(), 0);
     }
 }
