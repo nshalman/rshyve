@@ -103,6 +103,23 @@ depend on anything else, because a platform image has no pkgsrc: a
 binary that records `NEEDED libcrypto.so.3` links on the build host
 and then fails to exec on a node.
 
+### Host tunables
+
+`strmsgsz` must be 8192 or above, or 0. The default, 65536, is correct,
+and nothing in a stock platform image changes it. Read the live value
+with `echo 'strmsgsz/E' | mdb -k`, and look for a `set strmsgsz=` line
+in `/etc/system` on a node that was tuned.
+
+The VMM writes to its Unix sockets under a lock or on a vCPU thread, so
+each write needs an end. illumos has no send timeout that works on an
+AF_UNIX stream, so the bound is the size of the send: 8 KiB after
+`POLLOUT`, which the stream head passes as one message. The stream head
+caps a message at `strmsgsz`. Below 8192 the send splits, and the wait
+between two messages has no timeout. The sockets this covers are the
+virtio-console client, the vsock host socket, and the firehyve
+`CONTROL` reply. [docs/features.md](features.md#known-caveats) has the
+full chain.
+
 ### OpenSSL and the vTPM
 
 The vTPM backend is the vendored libtpms, which needs OpenSSL. A

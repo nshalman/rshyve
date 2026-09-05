@@ -567,6 +567,7 @@ The kernel command line is fhrun-owned and cannot be edited, only appended to: `
 | mdata | 4096-byte input lines, printable ASCII only, 256-byte UART FIFOs |
 | fhrun | 4 NICs (PCI slots 7..=10), 2 consoles (slots 15..=16) |
 | Host | one bhyve VM instance per non-global zone; a second `VM_CREATE` returns EINVAL |
+| Host tunable | STREAMS `strmsgsz` at 8192 or above, or 0 for unlimited; the default is 65536. See [Known caveats](#known-caveats) |
 
 ## Not supported
 
@@ -645,6 +646,8 @@ These parse without complaint and do nothing. Each one is a way to believe you c
 **Both binaries destroy a same-named VM instance on startup.** `force: true` is hardcoded, not a flag, and `VmmHdl::create` retries 20 times at 100 ms after a best-effort destroy. Do not reuse the name of a live VM.
 
 **No minimum bhyve API version is enforced.** The version is queried and logged, then execution continues. Real gates exist at v12 (sub-second RTC), v16 (triple-fault source) and v17 (`set_dirty_pages`, which returns Unsupported below that). On an older kernel the binaries start and degrade silently. v18 is the only version with test evidence behind it. The viona interface version is never checked at all, so a mismatched module surfaces as a raw ioctl errno.
+
+**The bounded socket writes need `strmsgsz` at 8192 or above.** virtio-console writes to its client with a 250 ms budget; the vsock host socket and its `CONTROL` reply use 500 ms. Each of those writes runs under a lock or on a vCPU thread, so each must end, and illumos offers no flag that ends one. `setsockopt(SO_SNDTIMEO)` on an AF_UNIX stream reports success and is then never read: the send reaches `strwrite`, which waits in `strwaitq` with a timeout of -1 (`fs/sockfs/socktpi.c`, `os/streamio.c`). `MSG_DONTWAIT` becomes `FNONBLOCK` on the receive path only. The size of the send is the only control left, so `write_all_bounded` waits for `POLLOUT` and then sends at most 8 KiB (`crates/vmm-core/src/unixsock.rs`). That works because the stream head cuts a write into messages of `sd_qn_maxpsz`: `tl` advertises `INFPSZ` and the stream head caps it at `strmsgsz`, 65536 by default (`conf/param.c`). A send at or below that cap is one message and does not wait. A host tuned below 8192 splits the send, and the wait between two messages has no timeout and, after the first message, no signal escape either. Keep `strmsgsz` at its default, or at any value of 8192 or more; 0 means unlimited and is safe as well. This is part of the supported host configuration, recorded in [Platform Integration](platform.md#host-tunables).
 
 **Dirty page tracking is on by default in rshyve** (`--track-dirty` defaults true; the real control is the `--no-track-dirty` opt-out), and it asks the kernel for `VCF_TRACK_DIRTY` at VM create. Nothing probes for hardware support first or degrades if the flag is refused.
 
