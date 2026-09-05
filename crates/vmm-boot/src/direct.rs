@@ -33,15 +33,42 @@ use vmm_devices::acpi;
 // ── Guest physical addresses ────────────────────────────────────────
 
 const GPA_GDT: u64 = 0x500;
-const GPA_BOOT_PARAMS: u64 = 0x7000;
+/// `load_kernel` writes the zero page here and `setup_direct_boot_bsp`
+/// puts the address in `RSI`. A BSP setup outside this crate has to
+/// name the same address, so it is public.
+pub const GPA_BOOT_PARAMS: u64 = 0x7000;
 const GPA_PML4: u64 = 0x9000;
 const GPA_PDPT: u64 = 0xA000;
 const GPA_PD_BASE: u64 = 0xB000;
-pub(crate) const GPA_CMDLINE: u64 = 0x2_0000;
+/// Where `load_kernel` writes the kernel command line. Public so a
+/// caller can read back, or rewrite, the string it passed.
+pub const GPA_CMDLINE: u64 = 0x2_0000;
 // Reserved for the pending fixed-address kernel placement path.
 #[allow(dead_code)]
 const GPA_KERNEL: u64 = 0x10_0000;
-pub(crate) const CMDLINE_MAX: usize = 4096;
+/// Longest command line `load_kernel` accepts, NUL included. Public so
+/// a caller can reject an over-long string before it loads anything.
+pub const CMDLINE_MAX: usize = 4096;
+
+/// The zero page is one 4 KiB page.
+const BOOT_PARAMS_BYTES: u64 = 4096;
+
+/// PML4, PDPT and one PD per GB of the identity map.
+const PAGE_TABLE_BYTES: u64 = 6 * 4096;
+
+/// The low guest memory `load_kernel` claims, as `(base, len)` pairs in
+/// ascending order.
+///
+/// A boot path outside this crate puts its own tables in low memory and
+/// must avoid these ranges. Only the footprint is a promise: the GDT
+/// and page table addresses inside it stay private, so the layout can
+/// still change.
+pub const DIRECT_BOOT_RESERVED: [(u64, u64); 4] = [
+    (GPA_GDT, GDT_SIZE as u64),
+    (GPA_BOOT_PARAMS, BOOT_PARAMS_BYTES),
+    (GPA_PML4, PAGE_TABLE_BYTES),
+    (GPA_CMDLINE, CMDLINE_MAX as u64),
+];
 
 // ── bzImage setup_header offsets ────────────────────────────────────
 
@@ -421,7 +448,7 @@ fn write_boot_params(
     mem_size: usize,
     acpi_rsdp_addr: u64,
 ) -> Result<()> {
-    let mut bp = [0u8; 4096];
+    let mut bp = [0u8; BOOT_PARAMS_BYTES as usize];
 
     // Copy setup_header from bzImage (preserves kernel's own fields)
     let hdr = kernel.setup_header();
@@ -737,6 +764,37 @@ mod tests {
                 Write::RunState(2), // VRS_RUN
             ],
         );
+    }
+
+    /// `DIRECT_BOOT_RESERVED` is the promise an outside boot path reads
+    /// instead of the private addresses, so it has to cover every one
+    /// of them.
+    #[test]
+    fn reserved_ranges_cover_every_address_the_loader_writes() {
+        let last_pd = GPA_PD_BASE + 3 * 4096;
+        for addr in [
+            GPA_GDT,
+            GPA_BOOT_PARAMS,
+            GPA_PML4,
+            GPA_PDPT,
+            last_pd,
+            GPA_CMDLINE,
+        ] {
+            assert!(
+                DIRECT_BOOT_RESERVED
+                    .iter()
+                    .any(|&(base, len)| addr >= base && addr < base + len),
+                "{addr:#x} is written but not reserved"
+            );
+        }
+
+        let mut end = 0;
+        for (base, len) in DIRECT_BOOT_RESERVED {
+            assert!(base >= end, "{base:#x} overlaps or is out of order");
+            end = base + len;
+        }
+        // The last range must stop below the kernel load address.
+        assert!(end <= GPA_KERNEL);
     }
 
     #[test]
