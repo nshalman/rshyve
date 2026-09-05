@@ -366,6 +366,30 @@ mod tests {
         out
     }
 
+    /// A host peer that gives up before the guest answers leaves
+    /// nothing half open: the guest was only ever offered the
+    /// connection. Keeping the entry would let a peer that connects
+    /// and hangs up in a loop fill the table, and the cap then refuses
+    /// every later connection for the life of the VM.
+    #[test]
+    fn a_host_close_before_the_guest_answers_frees_the_slot() {
+        let m = mux();
+        let key = ConnKey {
+            guest_port: 1024,
+            host_port: 1,
+        };
+        assert!(m.start_host_connect(key));
+        assert_eq!(m.conn_count(), 1);
+
+        m.queue_host_close(key);
+
+        assert_eq!(
+            m.conn_count(),
+            0,
+            "a connection the guest never answered was never reclaimed"
+        );
+    }
+
     #[test]
     fn a_host_connect_queues_a_request_to_the_guest() {
         let m = mux();
