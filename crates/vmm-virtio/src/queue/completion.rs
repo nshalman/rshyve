@@ -87,47 +87,26 @@ impl VirtioCompletion {
     /// Safe from any thread (vCPU inline path or I/O worker).
     #[inline]
     pub fn complete(&self, desc_idx: u16, len: u32) {
-        if self.publish(desc_idx, len) {
+        if self.publish_batch(&[(desc_idx, len)]) {
             self.signal();
         }
     }
 
-    /// Complete a batch: write all entries, one interrupt if needed.
-    pub fn complete_batch(&self, entries: &[(u16, u32)]) {
-        if self.publish_batch(entries) {
-            self.signal();
-        }
-    }
-
-    /// Publish one used entry and report whether the guest wants an
+    /// Publish used entries and report whether the guest wants an
     /// interrupt.
     ///
-    /// Every step here touches guest memory: the used entry, the used
-    /// index, and the driver's interrupt-suppression fields. A device
-    /// that guards guest access must hold that permission across the
-    /// whole call, and must leave [`Self::signal`] outside it.
+    /// Every step here touches guest memory: the used entries, the
+    /// used index, and the driver's interrupt-suppression fields. A
+    /// device that guards guest access must hold that permission
+    /// across the whole call, and must leave [`Self::signal`] outside
+    /// it.
+    ///
+    /// The Mutex is held across all writes so no thread can interleave.
     ///
     /// When `event_idx` is negotiated, reads `used_event` from the
     /// guest to determine if an interrupt is needed. This suppresses
     /// redundant interrupts: the guest only wants an interrupt when
     /// the device has completed past the index the guest last saw.
-    #[inline]
-    pub fn publish(&self, desc_idx: u16, len: u32) -> bool {
-        let old_idx;
-        let new_idx;
-        {
-            let mut idx = self.write_idx.lock().expect("completion lock");
-            old_idx = *idx;
-            self.write_used_entry(&mut idx, desc_idx, len);
-            new_idx = *idx;
-        }
-        self.should_interrupt(old_idx, new_idx)
-    }
-
-    /// Publish a batch of used entries and report whether the guest
-    /// wants an interrupt.
-    ///
-    /// The Mutex is held across all writes so no thread can interleave.
     pub fn publish_batch(&self, entries: &[(u16, u32)]) -> bool {
         if entries.is_empty() {
             return false;
