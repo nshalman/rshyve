@@ -222,6 +222,14 @@ pub struct VirtioPciDevice<D: VirtioDevice> {
     /// that refuses is guest driven and repeatable, so the rest go to
     /// `debug`.
     queue_refusal_reported: std::sync::atomic::AtomicBool,
+    /// Set while a backend reset drains its workers.
+    ///
+    /// The transport lock is released across that drain so a register
+    /// read is still served, which leaves the device reachable while it
+    /// is half reset. Every BAR write is refused until the drain ends,
+    /// so no other vCPU can re-program the queues, set DRIVER_OK again
+    /// or start a second reset in the window.
+    resetting: std::sync::atomic::AtomicBool,
     /// Capability chain offsets in PCI config space.
     cap_offsets: CapOffsets,
     /// Size of device-specific config region (for cap advertisement).
@@ -379,6 +387,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             self_ref: Mutex::new(None),
             log,
             queue_refusal_reported: std::sync::atomic::AtomicBool::new(false),
+            resetting: std::sync::atomic::AtomicBool::new(false),
             cap_offsets,
             dev_config_size,
             num_queues: num_queues as u16,
@@ -753,6 +762,9 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
 
     /// Handle a write to the modern config BAR (BAR2).
     fn modern_bar_write(&self, offset: u16, val: u32, len: usize) {
+        if self.resetting.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let page = offset & 0xF000;
         let reg = offset & 0x0FFF;
 
@@ -920,28 +932,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             bits::COMMON_CFG_DEVICE_STATUS => {
                 let new_status = val as u8;
                 if new_status == 0 {
-                    // Clear the transport first: that drops DRIVER_OK, so
-                    // no vCPU can queue new work while the backend drains.
-                    // Then release the lock, because the backend reset
-                    // waits for its I/O workers and every other vCPU that
-                    // touches this device would queue behind it.
-                    vs.reset();
-                    drop(vs);
-                    self.device.reset();
-                    self.isr_status
-                        .store(0, std::sync::atomic::Ordering::Relaxed);
-                    // Clear atomic MSI-X vector cache
-                    self.msix_config_vector.store(
-                        bits::VIRTIO_MSI_NO_VECTOR,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    for a in &self.msix_queue_vectors {
-                        a.store(
-                            bits::VIRTIO_MSI_NO_VECTOR,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                    }
-                    self.lower_interrupt();
+                    self.reset_device(vs);
                 } else {
                     if new_status & bits::STATUS_FEATURES_OK != 0
                         && vs.status & bits::STATUS_FEATURES_OK == 0
@@ -1184,6 +1175,55 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         self.signal_device_needs_reset();
     }
 
+    /// Reset the transport and the backend behind it.
+    ///
+    /// The driver frees the vring as soon as it reads DEVICE_STATUS
+    /// back as 0 (VirtIO 1.3 sec 4.1.4.3.1), so that 0 is published
+    /// only once the backend has drained. DRIVER_OK goes first, which
+    /// is what stops any vCPU queueing more work, and the transport
+    /// lock is released across the drain so a register read is still
+    /// served. `resetting` covers the window the lock no longer does:
+    /// a BAR write that lands in it is dropped, so no second vCPU can
+    /// re-program the queues or start a second reset while the old one
+    /// is still writing into the ring.
+    fn reset_device(&self, mut vs: std::sync::MutexGuard<'_, VirtioPciState>) {
+        if self
+            .resetting
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        vs.status &= !bits::STATUS_DRIVER_OK;
+        vs.queue_enabled.fill(false);
+        drop(vs);
+
+        self.device.reset();
+
+        let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
+        vs.reset();
+        self.isr_status
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Clear atomic MSI-X vector cache
+        self.msix_config_vector.store(
+            bits::VIRTIO_MSI_NO_VECTOR,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        for a in &self.msix_queue_vectors {
+            a.store(
+                bits::VIRTIO_MSI_NO_VECTOR,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        drop(vs);
+        // Only now may another write land: everything this reset owns
+        // is published, so it cannot overwrite the next session.
+        self.resetting
+            .store(false, std::sync::atomic::Ordering::Release);
+        // Leave the interrupt line low, or the next driver sees a
+        // spurious assertion when it enables the IOAPIC pin.
+        self.lower_interrupt();
+    }
+
     /// Signal the guest that the device needs a reset.
     pub fn signal_device_needs_reset(&self) {
         let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
@@ -1271,6 +1311,9 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
 
     /// Handle a write to the legacy virtio config BAR.
     fn bar_write(&self, offset: u16, val: u32, len: usize) {
+        if self.resetting.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
 
         let dev_cfg_off = self.device_config_offset();
@@ -1366,30 +1409,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             bits::LEGACY_REG_DEVICE_STATUS => {
                 let new_status = val as u8;
                 if new_status == 0 {
-                    // Clear the transport first: that drops DRIVER_OK, so
-                    // no vCPU can queue new work while the backend drains.
-                    // Then release the lock, because the backend reset
-                    // waits for its I/O workers and every other vCPU that
-                    // touches this device would queue behind it.
-                    vs.reset();
-                    drop(vs);
-                    self.device.reset();
-                    self.isr_status
-                        .store(0, std::sync::atomic::Ordering::Relaxed);
-                    self.msix_config_vector.store(
-                        bits::VIRTIO_MSI_NO_VECTOR,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    for a in &self.msix_queue_vectors {
-                        a.store(
-                            bits::VIRTIO_MSI_NO_VECTOR,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                    }
-                    // Ensure interrupt line is low on reset so the
-                    // next driver doesn't see a spurious assertion
-                    // when it enables the IOAPIC pin.
-                    self.lower_interrupt();
+                    self.reset_device(vs);
                 } else {
                     // FEATURES_OK validation (VirtIO 1.3 sec 2.2):
                     // If the driver sets FEATURES_OK, verify the

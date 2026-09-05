@@ -163,6 +163,81 @@ fn a_slow_backend_reset_does_not_hold_the_transport_lock() {
     assert!(served, "a register read blocked behind the backend reset");
 }
 
+// The driver frees the vring as soon as it reads DEVICE_STATUS back
+// as 0 (VirtIO 1.3 sec 4.1.4.3.1). The transport lock is released
+// across the backend drain so other registers stay readable, so the
+// reset must not publish that 0, and must not let a second vCPU
+// re-program the device, until the backend has finished draining.
+#[test]
+fn a_draining_reset_is_not_visible_to_another_vcpu() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use vmm_core::common::{ReadOp, WriteOp};
+
+    const READY: u8 = bits::STATUS_ACKNOWLEDGE
+        | bits::STATUS_DRIVER
+        | bits::STATUS_FEATURES_OK;
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let dev = VirtioPciDevice::new(
+        BlockingResetDevice {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        },
+        bits::VIRTIO_DEV_TYPE_BLOCK,
+        1,
+        256,
+        8,
+        None,
+        Arc::new(PhysMap::new()),
+        Arc::new(PioBus::new()),
+        Arc::new(MmioBus::new()),
+        None,
+    );
+
+    let status = |dev: &Arc<VirtioPciDevice<BlockingResetDevice>>| {
+        let mut ro = ReadOp::new(1);
+        dev.bar_rw(BarN::BAR0, 0x12, RWOp::Read(&mut ro));
+        ro.buf()[0]
+    };
+    let write_status = |dev: &Arc<VirtioPciDevice<BlockingResetDevice>>,
+                        val: u8| {
+        let wo = WriteOp::from_buf(&[val]);
+        dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
+    };
+
+    write_status(&dev, READY);
+    let writer = {
+        let dev = Arc::clone(&dev);
+        std::thread::spawn(move || {
+            let wo = WriteOp::from_buf(&[0]);
+            dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
+        })
+    };
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the backend reset ran");
+
+    assert_ne!(
+        status(&dev),
+        0,
+        "the guest saw the reset finish while the backend was draining"
+    );
+    // A second vCPU re-initialising the device here would be handed
+    // the completion built on the ring the drain is still writing to.
+    write_status(&dev, READY | bits::STATUS_DRIVER_OK);
+    assert_eq!(
+        status(&dev) & bits::STATUS_DRIVER_OK,
+        0,
+        "a re-init landed while the backend was still draining"
+    );
+
+    release_tx.send(()).expect("release the reset");
+    writer.join().expect("status write");
+    assert_eq!(status(&dev), 0, "the reset never published its result");
+}
+
 #[test]
 fn detach_regions_lets_the_device_drop() {
     let (dev, bus_pio, bus_mmio) = make_device_with_buses();
