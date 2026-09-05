@@ -378,8 +378,11 @@ fn destroy_bounded_with(
             warn!(log, "failed to destroy VM"; "error" => %e);
             true
         }
+        // The ioctl freezes every vCPU and then drains the vmm_drv
+        // leases. Name both, because either can hold it.
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            error!(log, "the VM destroy did not return; a vmm_drv lease is still held";
+            error!(log, "the VM destroy did not return inside its budget";
+                "likely_cause" => "a vCPU that will not freeze, or an unbroken vmm_drv lease",
                 "budget_secs" => budget.as_secs());
             false
         }
