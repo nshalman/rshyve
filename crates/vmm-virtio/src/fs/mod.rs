@@ -943,12 +943,12 @@ mod tests {
             "the queued request never finished"
         );
 
-        let start = Instant::now();
         VirtioDevice::reset(&fs);
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(40),
-            "reset drained an idle export: {elapsed:?}"
+
+        assert_eq!(
+            fs.gate.drain_count(),
+            0,
+            "reset drained an export with nothing outstanding"
         );
     }
 

@@ -39,17 +39,26 @@ fn reset_drops_requests_queued_before_it() {
     VirtioDevice::reset(&blk);
     blk.resume();
 
-    // A woken worker publishes within microseconds, so this window is
-    // five orders of magnitude of margin.
-    let deadline = Instant::now() + Duration::from_millis(250);
-    while Instant::now() < deadline {
-        assert_eq!(
-            queues[0].read_used_ring_idx(&physmap),
-            0,
-            "a worker published into the pre-reset used ring"
-        );
+    // The woken workers drop every stale request and decrement as they
+    // go, so a count back at zero means all five have been dealt with.
+    // Timing a window instead would pass on a runner that never
+    // scheduled them.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while blk.ctx.inflight.load(Ordering::Acquire) != 0
+        && Instant::now() < deadline
+    {
         thread::sleep(Duration::from_millis(5));
     }
+    assert_eq!(
+        blk.ctx.inflight.load(Ordering::Acquire),
+        0,
+        "the workers never finished with the pre-reset requests"
+    );
+    assert_eq!(
+        queues[0].read_used_ring_idx(&physmap),
+        0,
+        "a worker published into the pre-reset used ring"
+    );
 }
 
 // Reset pauses the workers to drain them. It must hand the gate back,
@@ -273,12 +282,12 @@ fn reset_with_an_idle_disk_skips_the_drain() {
         "the dispatched requests never finished"
     );
 
-    let start = Instant::now();
     VirtioDevice::reset(&blk);
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < Duration::from_millis(40),
-        "reset drained an idle disk: {elapsed:?}"
+
+    assert_eq!(
+        blk.gate.drain_count(),
+        0,
+        "reset drained a disk with nothing outstanding"
     );
 }
 

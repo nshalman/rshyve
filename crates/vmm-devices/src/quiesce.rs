@@ -35,6 +35,12 @@ pub struct QuiesceGate {
     /// apart is what stops a guest that loops DEVICE_STATUS writes from
     /// releasing a migration pause it never took.
     drains: AtomicUsize,
+    /// Drains ever started.
+    ///
+    /// Whether a reset took the drain or the idle short cut is
+    /// otherwise only visible as elapsed time, and a test that times a
+    /// few atomics fails a correct tree on a loaded machine.
+    drains_started: AtomicUsize,
     active: AtomicUsize,
     lock: Mutex<()>,
     cv: Condvar,
@@ -61,6 +67,7 @@ impl QuiesceGate {
         Self {
             paused: AtomicBool::new(false),
             drains: AtomicUsize::new(0),
+            drains_started: AtomicUsize::new(0),
             active: AtomicUsize::new(workers),
             lock: Mutex::new(()),
             cv: Condvar::new(),
@@ -83,8 +90,14 @@ impl QuiesceGate {
     /// pause taken by another thread while the scope is held survives
     /// the drop.
     pub fn drain_scope(&self) -> DrainScope<'_> {
+        self.drains_started.fetch_add(1, Ordering::Relaxed);
         self.drains.fetch_add(1, Ordering::AcqRel);
         DrainScope { gate: self }
+    }
+
+    /// How many drains have been started on this gate.
+    pub fn drain_count(&self) -> usize {
+        self.drains_started.load(Ordering::Relaxed)
     }
 
     /// Whether anything is holding the workers, a pause or a drain.
