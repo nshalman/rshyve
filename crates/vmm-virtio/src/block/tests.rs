@@ -38,6 +38,7 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
             gate: Arc::new(QuiesceGate::new(1)),
             epoch: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(AtomicUsize::new(0)),
+            ring_access: Arc::new(RwLock::new(())),
         },
     });
 

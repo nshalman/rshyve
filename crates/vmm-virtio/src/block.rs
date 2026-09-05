@@ -17,7 +17,7 @@
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, PoisonError, RwLock, TryLockError};
 use std::thread;
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ mod probes {
     fn vioblk_inline(head: u16, rtype: u32, sector: u64) {}
     fn vioblk_dispatch(head: u16, rtype: u32, sector: u64) {}
     fn vioblk_complete(head: u16, status: u8) {}
-    fn vioblk_reset_stuck(epoch: u64) {}
+    fn vioblk_reset_drain(epoch: u64) {}
 }
 
 use super::bits;
@@ -57,14 +57,6 @@ const NUM_WORKERS: usize = 8;
 /// Completions a worker gathers before it takes the `VirtioCompletion`
 /// lock once for the whole set.
 const BATCH_MAX: usize = 16;
-/// How long [`VirtioDevice::reset`] waits for the workers to drain.
-///
-/// The guest drives the reset, so the wait must be bounded: an unbounded
-/// one is a guest-triggerable vCPU hang. Two seconds covers a syscall
-/// already issued against a loaded zvol. Requests that have not started
-/// are dropped by the epoch check, so this budget only ever covers the
-/// syscalls in flight when the reset arrived.
-const RESET_QUIESCE_BUDGET: Duration = Duration::from_secs(2);
 pub const BLK_CONFIG_SIZE: u16 = 8;
 /// Extended config size covering all VirtIO 1.3 block config fields
 /// (capacity through write_zeroes_may_unmap at offset 0x38+1=0x3C).
@@ -139,10 +131,20 @@ struct WorkerCtx {
     gate: Arc<QuiesceGate>,
     /// Bumped by every device reset; see [`BlkIoRequest::epoch`].
     epoch: Arc<AtomicU64>,
-    /// Requests dispatched and not yet finished. Reset only has to wait
-    /// for the workers while this is non-zero, which keeps the resets a
-    /// guest does with an idle disk off the 50ms park path.
+    /// Requests dispatched and not yet finished.
+    ///
+    /// A worker drops its count only after it has released `ring_access`,
+    /// so a zero here means no worker holds the shared side and a reset
+    /// has nothing to wait for.
     inflight: Arc<AtomicUsize>,
+    /// Permission to write into the guest's ring and chains.
+    ///
+    /// A worker holds the shared side across its syscalls and the used
+    /// entries they produce. [`VirtioDevice::reset`] takes the exclusive
+    /// side, which is how it takes that permission back. An epoch check
+    /// cannot: a read that already reached `preadv` writes into the chain
+    /// whatever a later check decides.
+    ring_access: Arc<RwLock<()>>,
 }
 
 type InterruptCallback = Arc<dyn Fn() + Send + Sync>;
@@ -211,6 +213,7 @@ impl VirtioBlock {
             gate: Arc::clone(&gate),
             epoch: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(AtomicUsize::new(0)),
+            ring_access: Arc::new(RwLock::new(())),
         };
         let mut io_txs = Vec::with_capacity(total_workers);
         let mut next_worker = Vec::with_capacity(num_queues as usize);
@@ -650,35 +653,43 @@ impl VirtioDevice for VirtioBlock {
     /// VirtIO 1.3 sec 4.1.4.3.1 makes the driver poll for that 0, which is
     /// what buys the device the time to drain.
     ///
-    /// Bumping the epoch first drops every request that has not started,
-    /// so the wait only ever covers syscalls already in flight. Missing
-    /// the budget still completes the reset: the epoch keeps the stragglers
-    /// off the used ring, and leaving the device half-reset would strand
-    /// the driver in that poll loop instead.
+    /// The wait has no deadline, and that is the point. A read that
+    /// reached `preadv` is already writing into the chain, so a device
+    /// that gives up and reports the reset done has lost: no check made
+    /// afterwards takes that write back. Taking `ring_access` exclusively
+    /// is the only thing that ends the window, so this returns after the
+    /// last worker leaves it, or not at all. Bumping the epoch first
+    /// drops every request that has not started, so the wait covers the
+    /// syscalls already in flight and nothing else, and those are the
+    /// ones the guest was blocked on before it asked for the reset.
     fn reset(&self) {
         let epoch = self.ctx.epoch.fetch_add(1, Ordering::AcqRel) + 1;
 
-        // The transport clears DRIVER_OK before it calls this, so nothing
-        // can add to the count once it reads zero. Skipping the drain then
-        // keeps a reset on an idle disk off the workers' 50ms park path.
-        let mut quiesced = true;
+        // Nothing outstanding means no worker holds the shared side: a
+        // worker drops its count only after it releases the guard. The
+        // transport clears DRIVER_OK before it calls this, so nothing can
+        // put the count back up.
         if self.ctx.inflight.load(Ordering::Acquire) != 0 {
-            // A scope, not a pause: this drain is guest driven, and a
-            // migration pause that lands inside it belongs to the
-            // control plane and must outlive it.
-            let _drain = self.gate.drain_scope();
-            quiesced = self.gate.wait_quiesced(RESET_QUIESCE_BUDGET);
+            match self.ctx.ring_access.try_write() {
+                Ok(_) => {}
+                Err(TryLockError::Poisoned(err)) => drop(err.into_inner()),
+                Err(TryLockError::WouldBlock) => {
+                    // A reset that blocks here is waiting on the backing
+                    // store. That is worth seeing from the outside.
+                    probes::vioblk_reset_drain!(|| epoch);
+                    drop(
+                        self.ctx
+                            .ring_access
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner),
+                    );
+                }
+            }
         }
 
         *self.negotiated_features.lock().expect("lock") = 0;
-        let mut slots = self.completions.lock().expect("lock");
-        for slot in slots.iter_mut() {
+        for slot in self.completions.lock().expect("lock").iter_mut() {
             *slot = None;
-        }
-        drop(slots);
-
-        if !quiesced {
-            probes::vioblk_reset_stuck!(|| epoch);
         }
     }
 }
@@ -756,63 +767,87 @@ fn blk_io_worker(
             },
         };
 
-        // A reset already invalidated this request's chain and completion.
-        // Drop it without touching guest memory.
-        let current = ctx.epoch.load(Ordering::Acquire);
-        if req.epoch != current {
-            drop(req);
-            ctx.inflight.fetch_sub(1, Ordering::AcqRel);
-            continue;
-        }
-
-        let completion = Arc::clone(&req.completion);
-        let mut batch = Vec::with_capacity(BATCH_MAX);
-        // Requests this pass took off the channel. The count covers
-        // them until their used entries are published, because `reset`
-        // skips the drain the moment it reads zero.
-        let mut owned = 1usize;
-        batch.extend(process_one_request(fd, &limits, &ctx, req));
-
-        // Try to drain more pending requests for batching.
-        // This reduces Mutex acquisitions in VirtioCompletion:
-        // one complete_batch() instead of N complete() calls.
-        while owned < BATCH_MAX {
-            let Ok(next) = rx.try_recv() else { break };
-            // A fresh read, not `current`: a reset that landed while
-            // the last request ran must stop this one too.
-            if next.epoch != ctx.epoch.load(Ordering::Acquire) {
-                // A reset landed mid drain. Publish what this batch holds
-                // before touching a request from the other side of it.
-                // Its own count stays outstanding: the next pass owns it.
-                carried = Some(next);
-                break;
-            }
-            owned += 1;
-            batch.extend(process_one_request(fd, &limits, &ctx, next));
-        }
-
-        match batch.len() {
-            0 => {}
-            1 => {
-                let (head, written) = batch[0];
-                completion.complete(head, written);
-            }
-            _ => completion.complete_batch(&batch),
-        }
-        // Only now can a reset read zero and skip the drain: every used
-        // entry this pass owed the guest is already in the ring.
+        let owned = run_batch(&rx, fd, &limits, &ctx, req, &mut carried);
+        // Only now can a reset read zero and skip the wait: the pass has
+        // released `ring_access` and every used entry it owed the guest
+        // is already in the ring.
         ctx.inflight.fetch_sub(owned, Ordering::AcqRel);
     }
+}
+
+/// Run one pass of requests, and return how many of them it owns.
+///
+/// The shared `ring_access` guard spans the whole pass: the epoch check
+/// that authorises it, every syscall that writes into a chain, every
+/// status byte, and every used entry. A reset takes the exclusive side,
+/// so a worker descheduled inside `preadv` holds the reset open instead
+/// of racing it.
+fn run_batch(
+    rx: &mpsc::Receiver<BlkIoRequest>,
+    fd: i32,
+    limits: &DiskLimits,
+    ctx: &WorkerCtx,
+    req: BlkIoRequest,
+    carried: &mut Option<BlkIoRequest>,
+) -> usize {
+    let _access = ctx
+        .ring_access
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+
+    // A reset already invalidated this request's chain and completion.
+    // Drop it without touching guest memory.
+    if req.epoch != ctx.epoch.load(Ordering::Acquire) {
+        return 1;
+    }
+
+    let completion = Arc::clone(&req.completion);
+    let mut batch = Vec::with_capacity(BATCH_MAX);
+    // Requests this pass took off the channel.
+    let mut owned = 1usize;
+    batch.extend(process_one_request(fd, limits, ctx, req));
+
+    // Try to drain more pending requests for batching.
+    // This reduces Mutex acquisitions in VirtioCompletion:
+    // one complete_batch() instead of N complete() calls.
+    while owned < BATCH_MAX {
+        let Ok(next) = rx.try_recv() else { break };
+        // A fresh read: a reset that landed while the last request ran
+        // must stop this one too.
+        if next.epoch != ctx.epoch.load(Ordering::Acquire) {
+            // A reset landed mid drain. Publish what this batch holds
+            // before touching a request from the other side of it.
+            // Its own count stays outstanding: the next pass owns it.
+            *carried = Some(next);
+            break;
+        }
+        owned += 1;
+        batch.extend(process_one_request(fd, limits, ctx, next));
+    }
+
+    match batch.len() {
+        0 => {}
+        1 => {
+            let (head, written) = batch[0];
+            completion.complete(head, written);
+        }
+        _ => completion.complete_batch(&batch),
+    }
+    owned
 }
 
 /// Process a single I/O request: execute the operation, write status.
 /// Returns (head, written) for completion batching.
 ///
-/// Returns `None` when the request no longer matches the device epoch:
-/// its chain, its status byte and its used entry all point at a ring
-/// the driver has freed. The epoch is read on both sides of the
-/// syscall, because a read runs straight into the chain and no later
-/// check can take that write back.
+/// The caller must hold the shared side of `ring_access`. This writes
+/// into the guest's chain, and only that guard stops a reset from
+/// telling the driver the pages are free while the write is pending.
+///
+/// Returns `None` for a request the device epoch has moved past. The
+/// check before the syscall is the load-bearing one: a stale request
+/// found in the channel points at a ring the driver already freed, and
+/// a read runs straight into it. The check after it only saves the
+/// guest a completion for a session it is tearing down.
 fn process_one_request(
     fd: i32,
     limits: &DiskLimits,
