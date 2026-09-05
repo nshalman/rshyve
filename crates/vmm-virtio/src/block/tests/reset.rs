@@ -116,10 +116,33 @@ fn a_reset_does_not_wait_for_the_backing_store() {
         reached.load(Ordering::Acquire)
     });
 
-    let start = Instant::now();
-    VirtioDevice::reset(&h.block);
-    let waited = start.elapsed();
-    release.store(true, Ordering::Release);
+    // The reset runs on another thread under a deadline. A reset that
+    // waits on the disk is waiting for a park that only this thread
+    // releases, so waiting for it here would hang the run instead of
+    // reporting the failure.
+    let done = Arc::new(AtomicBool::new(false));
+    let waited = {
+        let block = &h.block;
+        let finished = Arc::clone(&done);
+        let release = Arc::clone(&release);
+        thread::scope(move |s| {
+            s.spawn(move || {
+                VirtioDevice::reset(block);
+                finished.store(true, Ordering::Release);
+            });
+            let start = Instant::now();
+            while !done.load(Ordering::Acquire)
+                && start.elapsed() < RESET_BUDGET
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let waited = start.elapsed();
+            // Let a reset that should not have waited finish, so the
+            // scope joins it rather than parking on it.
+            release.store(true, Ordering::Release);
+            waited
+        })
+    };
 
     assert!(
         waited < RESET_BUDGET,
@@ -360,6 +383,96 @@ fn a_reset_between_the_copy_and_the_publication_publishes_nothing() {
         h.queues[0].read_used_ring_idx(&h.physmap),
         0,
         "a used entry landed in the ring the reset took away"
+    );
+}
+
+// Publishing and raising are separate steps because the raise must
+// happen outside the permission that wrote the ring. Delivery can
+// block, and the drain a synchronous reset waits for covers every live
+// permission, so an interrupt raised inside one puts the reset behind
+// it. That is the bound the whole design rests on.
+#[test]
+fn an_interrupt_is_raised_outside_the_guest_access_section() {
+    let physmap =
+        Arc::new(PhysMap::new_anon(0x1000, 0x2000).expect("queue memory"));
+    let mut queue = VirtQueue::new(8);
+    queue.set_addr_modern(0x1000, 0x1100, 0x1200);
+
+    let raising = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let completion = {
+        let raising = Arc::clone(&raising);
+        let release = Arc::clone(&release);
+        VirtioCompletion::new(&queue, Arc::clone(&physmap), move || {
+            raising.store(true, Ordering::Release);
+            while !release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+
+    let ctx = worker_ctx(&physmap);
+    let access = Arc::clone(&ctx.access);
+    let epoch = ctx
+        .access
+        .enter_current()
+        .expect("a session is open")
+        .epoch();
+    let (tx, rx) = mpsc::channel();
+    tx.send(BlkIoRequest {
+        rtype: bits::VIRTIO_BLK_T_FLUSH,
+        sector: 0,
+        chain: vec![
+            ChainBuf::Readable {
+                addr: 0x2000,
+                len: BLK_REQ_HEADER_SIZE as u32,
+            },
+            ChainBuf::Writable {
+                addr: 0x2100,
+                len: 1,
+            },
+        ],
+        head: 0,
+        completion,
+        epoch,
+    })
+    .expect("queue the request");
+    drop(tx);
+
+    let file = Arc::new(tempfile::tempfile().expect("create tempfile"));
+    let limits = DiskLimits {
+        capacity: 1,
+        read_only: false,
+        nodelete: true,
+    };
+    let worker = thread::spawn(move || blk_io_worker(rx, file, limits, ctx));
+    wait_for("the worker never raised the interrupt", || {
+        raising.load(Ordering::Acquire)
+    });
+
+    // The interrupt is held. A drain that has to wait for it is the
+    // failure, so it runs on its own thread under a deadline.
+    let waited = {
+        let release = Arc::clone(&release);
+        thread::scope(move |sc| {
+            let drainer = sc.spawn(move || access.drain());
+            let start = Instant::now();
+            while !drainer.is_finished() && start.elapsed() < RESET_BUDGET {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let waited = start.elapsed();
+            // Let a wrongly held interrupt go, so the scope joins the
+            // drain rather than parking on it.
+            release.store(true, Ordering::Release);
+            waited
+        })
+    };
+    worker.join().expect("the worker finished");
+
+    assert!(
+        waited < RESET_BUDGET,
+        "the drain waited {waited:?} behind an interrupt raised inside a \
+         guest-access section"
     );
 }
 
