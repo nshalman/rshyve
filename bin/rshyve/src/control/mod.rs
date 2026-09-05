@@ -43,12 +43,13 @@ mod migrate;
 mod protocol;
 
 use std::io;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use slog::Logger;
+use slog::{error, warn, Logger};
 
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::PhysMap;
@@ -114,6 +115,9 @@ pub struct VmController {
     /// copied at startup, so a hotplug add or remove is visible to
     /// pause, resume and migration.
     registry: Arc<DeviceRegistry>,
+    /// Set once the guest has been handed to another host. The source
+    /// must never run the guest again: the destination owns the disk.
+    migrated_away: AtomicBool,
     /// AHCI state has no migration payload, so attached media blocks migration.
     has_ahci_cd: bool,
     /// Each engine is `None` unless the VM was started with the option
@@ -167,6 +171,7 @@ impl VmController {
             migrate_status: Mutex::new(None),
             vcpu_metrics,
             registry,
+            migrated_away: AtomicBool::new(false),
             has_ahci_cd,
             hotplug,
             topology: Mutex::new(()),
@@ -318,6 +323,59 @@ impl VmController {
         VmRunState::from_u8(self.state.load(Ordering::Acquire))
     }
 
+    /// Whether this VM's guest now runs on another host.
+    pub(super) fn migrated_away(&self) -> bool {
+        self.migrated_away.load(Ordering::Acquire)
+    }
+
+    /// Record that the guest left, and arm the release that follows.
+    ///
+    /// A finished source is left paused, so nothing the guest does can
+    /// end it and no other command reaches it. Without the timer an
+    /// orchestrator that dies mid-switchover leaves the node holding
+    /// the whole guest memory of a VM that runs nowhere.
+    pub(super) fn finish_migrated_away(self: &Arc<Self>, grace: Duration) {
+        self.migrated_away.store(true, Ordering::Release);
+        self.state
+            .store(VmRunState::Stopped as u8, Ordering::Release);
+
+        let ctrl = Arc::clone(self);
+        let spawned = thread::Builder::new()
+            .name("migrated-source-release".into())
+            .spawn(move || {
+                thread::sleep(grace);
+                if !grace_must_release(ctrl.state()) {
+                    return;
+                }
+                warn!(ctrl.log, "releasing a migrated source nobody reaped";
+                    "grace_secs" => grace.as_secs());
+                ctrl.log_failed_release();
+            });
+
+        if let Err(e) = spawned {
+            // No timer means no reaper, so release now. Leaking the
+            // guest's memory is worse than an early release of a VM
+            // whose guest has already gone.
+            error!(self.log, "no release timer for a migrated source";
+                "error" => %e);
+            self.log_failed_release();
+        }
+    }
+
+    /// End a VM whose guest now runs on another host.
+    pub(super) fn release_migrated_source(&self) -> io::Result<()> {
+        let halt = bhyve_api::vm_suspend_how::VM_SUSPEND_HALT as u32;
+        release_paused_vm(|| self.hdl.suspend(halt, 0), || self.hdl.resume())
+    }
+
+    /// The same release from a path with nobody to hand an error to.
+    fn log_failed_release(&self) {
+        if let Err(e) = self.release_migrated_source() {
+            error!(self.log, "failed to release a migrated source";
+                "error" => %e);
+        }
+    }
+
     /// Hold the topology still.
     ///
     /// A hot-add takes this and so does the start of a migration, which
@@ -361,6 +419,30 @@ impl VmController {
             named.device.halt();
         }
     }
+}
+
+/// Whether the grace timer must still release the VM itself.
+///
+/// False once something else moved it on, which is the operator `stop`
+/// that beat the timer to it.
+fn grace_must_release(state: VmRunState) -> bool {
+    state == VmRunState::Stopped
+}
+
+/// Stop a paused VM without letting its guest run one more instruction.
+///
+/// The suspend is latched FIRST. A paused vCPU thread is retrying
+/// VM_RUN against EBUSY; the resume lets it back into the kernel, which
+/// sees the latched suspend and turns it straight around. Resuming
+/// first would run guest code against a disk the migration destination
+/// already owns. A suspend that fails is not followed by a resume, for
+/// the same reason.
+fn release_paused_vm<E>(
+    suspend: impl FnOnce() -> Result<(), E>,
+    resume: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    suspend()?;
+    resume()
 }
 
 fn pause_device_set(
@@ -478,6 +560,55 @@ mod tests {
         resume_device_set(&devices);
 
         assert_eq!(device.resume_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_release_latches_the_suspend_before_the_resume() {
+        // Reversed, the guest runs against a disk the destination owns.
+        let order = Mutex::new(Vec::new());
+
+        release_paused_vm::<()>(
+            || {
+                order.lock().expect("order lock").push("suspend");
+                Ok(())
+            },
+            || {
+                order.lock().expect("order lock").push("resume");
+                Ok(())
+            },
+        )
+        .expect("both steps succeed");
+
+        assert_eq!(*order.lock().expect("order lock"), ["suspend", "resume"]);
+    }
+
+    #[test]
+    fn a_failed_suspend_never_resumes_the_guest() {
+        let resumed = AtomicBool::new(false);
+
+        let result = release_paused_vm(
+            || Err("suspend ioctl failed"),
+            || {
+                resumed.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err("suspend ioctl failed"));
+        assert!(!resumed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn the_grace_timer_stands_down_once_something_else_acted() {
+        assert!(grace_must_release(VmRunState::Stopped));
+        for state in [
+            VmRunState::Running,
+            VmRunState::Paused,
+            VmRunState::Stopping,
+            VmRunState::Migrating,
+        ] {
+            assert!(!grace_must_release(state), "{state:?}");
+        }
     }
 
     #[test]
