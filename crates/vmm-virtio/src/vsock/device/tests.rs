@@ -76,7 +76,12 @@ fn the_connect_line_reader_stops_at_the_newline() {
     a.write_all(b"CONNECT 1234\nPIPELINED-REQUEST")
         .expect("write");
 
-    let line = read_connect_line(&mut b).expect("line");
+    let shutdown = AtomicBool::new(false);
+    let LineRead::Line(line) =
+        read_line_bounded(&mut b, &shutdown, CONNECT_LINE_MAX)
+    else {
+        panic!("the CONNECT line was not read");
+    };
     assert_eq!(line, "CONNECT 1234");
 
     // What follows must still be readable by the next stage.
@@ -92,7 +97,11 @@ fn a_connect_line_without_a_newline_is_bounded() {
 
     let (mut a, mut b) = Uds::pair().expect("socketpair");
     a.write_all(&[b'X'; CONNECT_LINE_MAX * 2]).expect("write");
-    assert_eq!(read_connect_line(&mut b), None);
+    let shutdown = AtomicBool::new(false);
+    assert!(matches!(
+        read_line_bounded(&mut b, &shutdown, CONNECT_LINE_MAX),
+        LineRead::TooLong,
+    ));
 }
 
 #[test]
@@ -279,5 +288,124 @@ fn a_good_rx_chain_is_held_for_a_packet() {
     assert_eq!(vsock.shared.pending_rx.lock().expect("pending").len(), 1);
 
     vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -- Host peer bounds --
+
+/// A peer that connects and sends nothing must not park a thread for
+/// the life of the VM. The reader arms its own poll and reads the
+/// shutdown flag on every pass; this connection is not in `sockets`
+/// yet, so halt's socket sweep cannot wake it.
+#[test]
+fn a_silent_peer_does_not_park_the_connect_thread() {
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    let shared = Arc::clone(&vsock.shared);
+    let (_peer, device_end) =
+        std::os::unix::net::UnixStream::pair().expect("socketpair");
+
+    let reader =
+        std::thread::spawn(move || handle_host_connect(shared, device_end));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!reader.is_finished(), "the reader must still be waiting");
+
+    vsock.shared.shutdown.store(true, Ordering::Release);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !reader.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        reader.is_finished(),
+        "the reader never saw the shutdown flag"
+    );
+    reader.join().expect("join the reader");
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The reader table is only drained by halt, so without reaping a peer
+/// that connects and disconnects in a loop grows it, and every handle
+/// in it, for the life of the VM.
+#[test]
+fn a_finished_reader_is_reaped_when_the_next_one_starts() {
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+
+    for _ in 0..64 {
+        let handle = std::thread::spawn(|| {});
+        vsock.shared.track_reader(handle);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        vsock.shared.track_reader(std::thread::spawn(|| {}));
+        let live = vsock.shared.readers.lock().expect("reader lock").len();
+        if live <= 2 || std::time::Instant::now() >= deadline {
+            assert!(live <= 2, "{live} handles were kept");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The mux refuses a connection over the cap and registers nothing, so
+/// the device has to close the peer rather than leave it holding a
+/// socket and a thread for an answer that is never coming.
+#[test]
+fn a_host_connect_over_the_cap_is_closed() {
+    use std::io::BufRead as _;
+
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    for port in 0..MAX_CONNS as u32 {
+        assert!(vsock.shared.mux.start_host_connect(ConnKey {
+            guest_port: port,
+            host_port: 40_000 + port,
+        }));
+    }
+
+    let (peer, device_end) =
+        std::os::unix::net::UnixStream::pair().expect("socketpair");
+    start_host_connection(Arc::clone(&vsock.shared), device_end, 9999);
+
+    let mut answer = String::new();
+    std::io::BufReader::new(peer)
+        .read_line(&mut answer)
+        .expect("read the refusal");
+    assert!(answer.starts_with("ERROR"), "answered {answer:?}");
+    assert_eq!(vsock.shared.mux.conn_count(), MAX_CONNS);
+    assert!(vsock
+        .shared
+        .sockets
+        .lock()
+        .expect("sockets lock")
+        .is_empty());
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The halt budget has to bound the join itself. A deadline tested
+/// before each `join()` only decides whether the next one starts, so
+/// one wedged reader holds teardown open for as long as it stays
+/// wedged.
+#[test]
+fn a_wedged_reader_does_not_hold_halt_open() {
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    let release = Arc::new(AtomicBool::new(false));
+    let wedged = Arc::clone(&release);
+    vsock.shared.track_reader(std::thread::spawn(move || {
+        while !wedged.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }));
+
+    let start = std::time::Instant::now();
+    vsock.halt();
+    let waited = start.elapsed();
+
+    release.store(true, Ordering::Release);
+    assert!(waited < HALT_BUDGET * 3, "halt waited {waited:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

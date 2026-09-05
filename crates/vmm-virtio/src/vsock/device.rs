@@ -31,8 +31,10 @@ use slog::{debug, warn};
 use vmm_core::mem::PhysMap;
 use vmm_core::unixsock::{bind_restricted, SocketPolicy};
 
-use super::control::{run_control_session, ControlSlot};
-use super::mux::{GuestAction, RxPacket, VsockMux};
+use super::control::{
+    read_line_bounded, run_control_session, ControlSlot, LineRead,
+};
+use super::mux::{GuestAction, RxPacket, VsockMux, MAX_CONNS};
 use super::packet::{ConnKey, VsockHdr, CID_GUEST_MIN, HDR_SIZE};
 use crate::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use crate::{queue_drain_should_stop, VirtioDevice};
@@ -60,8 +62,15 @@ const HOST_READ_CHUNK: usize = 64 * 1024;
 const MAX_TX_PAYLOAD: usize = 64 * 1024;
 /// Pause before retrying a host read when the guest is not draining.
 const BACKPRESSURE_PAUSE: Duration = Duration::from_millis(2);
-/// Budget for a reader thread to notice shutdown during halt.
+/// Budget for the reader threads to end during halt.
 const HALT_BUDGET: Duration = Duration::from_secs(2);
+/// How long a blocked host read waits before it looks at the shutdown
+/// flag. A reader that only wakes on the socket being shut down cannot
+/// end on its own, and halt then pays the whole budget for it.
+const HOST_READ_POLL: Duration = Duration::from_millis(250);
+/// Pause after a failed `accept`, so a persistent error such as EMFILE
+/// cannot spin the accept thread at full speed.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
 type InterruptFn = Arc<dyn Fn() + Send + Sync>;
 
@@ -212,10 +221,38 @@ impl VsockShared {
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
+
+    /// Register a reader thread, dropping the handles whose threads
+    /// have ended.
+    ///
+    /// The vector is otherwise only drained by halt, so a peer that
+    /// connects and disconnects in a loop grows it, and every handle in
+    /// it, for the life of the VM.
+    fn track_reader(&self, handle: JoinHandle<()>) {
+        let mut readers = self.readers.lock().expect("reader lock");
+        readers.retain(|h| !h.is_finished());
+        readers.push(handle);
+    }
+
+    /// Whether another reader thread may start.
+    ///
+    /// This is what bounds the thread count. The mux connection cap
+    /// cannot: a peer that connects and sends no CONNECT line holds a
+    /// thread the mux has never heard of.
+    fn reader_slot_free(&self) -> bool {
+        let mut readers = self.readers.lock().expect("reader lock");
+        readers.retain(|h| !h.is_finished());
+        readers.len() < MAX_CONNS
+    }
 }
 
 /// Read from a connection's host socket until it closes.
 fn reader_loop(shared: Arc<VsockShared>, key: ConnKey, mut stream: UnixStream) {
+    // Arm the poll here rather than inherit whatever the CONNECT
+    // handshake left on the socket: a timeout the loop did not ask for
+    // would read as a dead peer, and no timeout at all leaves the
+    // shutdown check below unreachable.
+    let polled = stream.set_read_timeout(Some(HOST_READ_POLL)).is_ok();
     let mut buf = vec![0u8; HOST_READ_CHUNK];
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
@@ -225,6 +262,17 @@ fn reader_loop(shared: Arc<VsockShared>, key: ConnKey, mut stream: UnixStream) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // An idle poll, not a dead peer. Round the loop so the
+            // shutdown flag above is read again.
+            Err(e)
+                if polled
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+            {
+                continue
+            }
             Err(_) => break,
         };
 
@@ -252,11 +300,38 @@ fn reader_loop(shared: Arc<VsockShared>, key: ConnKey, mut stream: UnixStream) {
 
 /// Accept host-initiated connections and parse their CONNECT line.
 fn accept_loop(shared: Arc<VsockShared>, listener: UnixListener) {
+    // One report per run of failures. `incoming()` never ends, so a
+    // persistent error is seen again on every pass, and a peer that can
+    // make one happen must not be able to drive the log with it.
+    let mut reported = false;
     for stream in listener.incoming() {
         if shared.shutdown.load(Ordering::Acquire) {
             break;
         }
-        let Ok(stream) = stream else { continue };
+        let stream = match stream {
+            Ok(stream) => {
+                reported = false;
+                stream
+            }
+            Err(error) => {
+                // A transient error is skipped and a persistent one,
+                // such as EMFILE once the fd table fills, would spin
+                // this thread at full speed without the pause.
+                if !reported {
+                    debug!(shared.log, "virtio-vsock accept failed";
+                        "error" => %error);
+                    reported = true;
+                }
+                std::thread::sleep(ACCEPT_BACKOFF);
+                continue;
+            }
+        };
+        // Every accepted connection costs a thread until its peer sends
+        // a CONNECT line, which it need never do.
+        if !shared.reader_slot_free() {
+            let _ = stream.shutdown(Shutdown::Both);
+            continue;
+        }
         let conn_shared = Arc::clone(&shared);
         // One thread per pending connection: the CONNECT line is read
         // with a blocking read, and a client that never sends one must
@@ -265,7 +340,7 @@ fn accept_loop(shared: Arc<VsockShared>, listener: UnixListener) {
             .name("vsock-connect".into())
             .spawn(move || handle_host_connect(conn_shared, stream))
         {
-            shared.readers.lock().expect("reader lock").push(handle);
+            shared.track_reader(handle);
         }
     }
 }
@@ -273,32 +348,6 @@ fn accept_loop(shared: Arc<VsockShared>, listener: UnixListener) {
 /// Longest CONNECT line accepted, so a client that never sends a newline
 /// cannot make the device read without bound.
 const CONNECT_LINE_MAX: usize = 64;
-
-/// Read the CONNECT line one byte at a time.
-///
-/// Deliberately not a BufReader: that reads a whole block, and anything
-/// the client pipelined behind the newline would sit in a buffer this
-/// function is about to drop. A client is entitled to send its first
-/// request in the same write as the CONNECT line, and losing it would
-/// look like the guest never answered.
-fn read_connect_line(stream: &mut UnixStream) -> Option<String> {
-    let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-    while line.len() < CONNECT_LINE_MAX {
-        match stream.read(&mut byte) {
-            Ok(0) => return None,
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    return String::from_utf8(line).ok();
-                }
-                line.push(byte[0]);
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        }
-    }
-    None
-}
 
 /// The verb a host peer sent on its first line.
 enum HostVerb {
@@ -322,7 +371,13 @@ fn classify_host_line(line: &str) -> HostVerb {
 
 /// Read the opening line and act on the verb it names.
 fn handle_host_connect(shared: Arc<VsockShared>, mut stream: UnixStream) {
-    let Some(line) = read_connect_line(&mut stream) else {
+    // The reader arms its own poll and checks the shutdown flag on
+    // every pass. A peer that opens a connection and sends nothing
+    // would otherwise park this thread for the life of the VM, and it
+    // is not in `sockets` yet, so halt's sweep cannot wake it either.
+    let LineRead::Line(line) =
+        read_line_bounded(&mut stream, &shared.shutdown, CONNECT_LINE_MAX)
+    else {
         return;
     };
     match classify_host_line(&line) {
@@ -353,17 +408,29 @@ fn start_host_connection(
         host_port: shared.mux.alloc_host_port(),
     };
     let mut s = stream;
-    if writeln!(s, "OK {}", key.host_port).is_err() {
+    // Register before answering. The table is capped, and a peer told
+    // OK for a connection the mux refused would wait on a guest that is
+    // never going to hear about it.
+    if !shared.mux.start_host_connect(key) {
+        let _ = writeln!(s, "ERROR: too many connections");
         return;
     }
-    shared.sockets.lock().expect("sockets lock").insert(
-        key,
-        match s.try_clone() {
-            Ok(c) => c,
-            Err(_) => return,
-        },
-    );
-    shared.mux.start_host_connect(key);
+    if writeln!(s, "OK {}", key.host_port).is_err() {
+        shared.mux.forget(key);
+        return;
+    }
+    let peer = match s.try_clone() {
+        Ok(peer) => peer,
+        Err(_) => {
+            shared.mux.forget(key);
+            return;
+        }
+    };
+    shared
+        .sockets
+        .lock()
+        .expect("sockets lock")
+        .insert(key, peer);
     shared.deliver_rx();
     reader_loop(shared, key, s);
 }
@@ -672,11 +739,7 @@ impl VirtioVsock {
             .name("vsock-reader".into())
             .spawn(move || reader_loop(shared, key, reader_stream))
         {
-            self.shared
-                .readers
-                .lock()
-                .expect("reader lock")
-                .push(handle);
+            self.shared.track_reader(handle);
         }
     }
 }
@@ -823,12 +886,12 @@ impl Lifecycle for VirtioVsock {
             .expect("reader lock")
             .drain(..)
             .collect();
-        let deadline = std::time::Instant::now() + HALT_BUDGET;
-        for handle in readers {
-            // A panicked or wedged reader must not abort teardown.
-            if std::time::Instant::now() < deadline {
-                let _ = handle.join();
-            }
+        // The budget has to bound the join itself. Testing a deadline
+        // before each `join()` only decides whether the next one
+        // starts, so one wedged reader holds teardown open for as long
+        // as it stays wedged.
+        if !vmm_core::thread::join_bounded(readers, HALT_BUDGET) {
+            debug!(self.shared.log, "virtio-vsock halt left a reader running");
         }
 
         // The socket may already be gone if the path was reused.

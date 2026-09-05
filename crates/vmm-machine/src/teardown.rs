@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use slog::{error, info, warn, Logger};
@@ -250,21 +250,7 @@ pub fn join_vcpus_bounded(
     handles: Vec<JoinHandle<()>>,
     budget: Duration,
 ) -> bool {
-    let (tx, rx) = mpsc::channel();
-    let worker =
-        thread::Builder::new()
-            .name("vcpu-join".into())
-            .spawn(move || {
-                for handle in handles {
-                    drop(handle.join());
-                }
-                let _ = tx.send(());
-            });
-    if worker.is_err() {
-        return false;
-    }
-
-    matches!(rx.recv_timeout(budget), Ok(()))
+    vmm_core::thread::join_bounded(handles, budget)
 }
 
 /// Where the teardown path finds the devices to quiesce.
@@ -477,8 +463,9 @@ mod tests {
 
     #[test]
     fn quiesce_skips_device_that_is_already_paused() {
-        // Indicator panics on a Pause to Pause transition, so teardown
-        // after an operator pause must not pause again.
+        // Teardown after an operator pause must not pause again: the
+        // device is already quiesced and pausing it twice would hide a
+        // real double pause behind a satisfied request.
         let device = Arc::new(TrackedDevice {
             indicator: vmm_devices::Indicator::new(),
         });

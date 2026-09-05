@@ -842,3 +842,46 @@ fn read_only_disk_publishes_no_discard_limits() {
         assert_eq!(blk.cfg_read(off, 4), 0, "offset {off:#x} not zero");
     }
 }
+
+/// A chain the walker refuses must still go back on the used ring.
+/// `pop_avail` already took its head out of the available ring, so
+/// dropping it burns one descriptor for the life of the device: the
+/// block layer has no abort path to recover it, and a guest that can
+/// drive enough refusals stalls its own disk.
+#[test]
+fn a_refused_chain_returns_its_descriptor() {
+    const DESC_GPA: u64 = 0x1000;
+    const USED_GPA: u64 = 0x1200;
+
+    let (physmap, queue, block) = make_get_id_queue(4, 1);
+    // NEXT past the end of the descriptor table: the walker refuses it.
+    physmap
+        .lookup(DESC_GPA, 16)
+        .expect("mapped header descriptor")
+        .write(&VirtqDesc {
+            addr: 0x2000,
+            len: BLK_REQ_HEADER_SIZE as u32,
+            flags: bits::VRING_DESC_F_NEXT,
+            next: 9,
+        })
+        .expect("write header descriptor");
+    let mut queues = [queue];
+
+    block.notify_queue(0, &mut queues, &physmap);
+
+    assert_eq!(
+        queues[0].read_used_ring_idx(&physmap),
+        1,
+        "the refused head never went back to the guest",
+    );
+    let entry = physmap.lookup(USED_GPA + 4, 8).expect("mapped used entry");
+    assert_eq!(entry.read::<u32>().expect("used id"), 0);
+    assert_eq!(
+        entry
+            .subregion(4, 4)
+            .expect("used length")
+            .read::<u32>()
+            .expect("used length"),
+        0,
+    );
+}

@@ -26,7 +26,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Context;
-use slog::warn;
+use slog::{debug, warn};
 use vmm_core::mem::PhysMap;
 use vmm_core::unixsock::{bind_restricted, SocketPolicy};
 
@@ -423,14 +423,14 @@ impl VirtioConsole {
         &self.shared.socket_path
     }
 
-    fn ensure_rx_completion(&self, queue: &VirtQueue) {
+    fn ensure_rx_completion(&self, queue: &VirtQueue) -> Arc<VirtioCompletion> {
         let mut slot = self
             .shared
             .rx_completion
             .lock()
             .expect("rx completion lock");
-        if slot.is_some() {
-            return;
+        if let Some(completion) = slot.as_ref() {
+            return Arc::clone(completion);
         }
         let intr = Arc::clone(&self.shared.interrupt);
         let completion = VirtioCompletion::new(
@@ -447,12 +447,13 @@ impl VirtioConsole {
         // Force the first completions through EVENT_IDX suppression so
         // an idle guest console always wakes on its first input.
         completion.set_force_interrupt(32);
-        *slot = Some(completion);
+        *slot = Some(Arc::clone(&completion));
+        completion
     }
 
     /// Pop RX chains and hold them until host bytes arrive.
     fn stash_rx(&self, queue: &mut VirtQueue, physmap: &PhysMap) {
-        self.ensure_rx_completion(queue);
+        let completion = self.ensure_rx_completion(queue);
 
         // A stashed chain is only completed once host bytes land in
         // it, so the stash needs a bound of its own: a guest can
@@ -463,6 +464,7 @@ impl VirtioConsole {
         let mut popped = 0usize;
         loop {
             let before = queue.last_avail_idx();
+            let mut refused: Vec<u16> = Vec::new();
             {
                 let mut pending =
                     self.shared.pending_rx.lock().expect("pending rx lock");
@@ -472,9 +474,21 @@ impl VirtioConsole {
                     };
                     popped += 1;
                     let Some(chain) = queue.collect_chain(physmap, head) else {
+                        refused.push(head);
                         continue;
                     };
                     pending.push_back((head, chain));
+                }
+            }
+            // `pop_avail` already took these heads out of the available
+            // ring, so each one has to go back on the used ring. Losing
+            // one costs the guest a descriptor for the life of the
+            // device, and there is no abort path to recover it.
+            if !refused.is_empty() {
+                debug!(self.shared.log, "virtio-console refused rx chains";
+                    "count" => refused.len());
+                for head in refused {
+                    completion.complete(head, 0);
                 }
             }
             let hit_request_cap = popped >= max_requests;

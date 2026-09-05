@@ -766,6 +766,11 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     &mut vs.queues,
                     &self.physmap,
                 );
+                if Self::queue_needs_reset(&vs, queue_idx) {
+                    // The queue logged its own reason when it refused.
+                    self.refuse_queue(vs, queue_idx as usize, None);
+                    return;
+                }
                 if did_work {
                     self.isr_status.fetch_or(
                         bits::ISR_QUEUE_INTR,
@@ -965,13 +970,33 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 let idx = vs.queue_select as usize;
                 if idx < vs.queue_enabled.len() && val == 1 {
                     // Enable the queue: apply the stored addresses
-                    vs.queue_enabled[idx] = true;
                     let desc = vs.queue_desc[idx];
                     let avail = vs.queue_avail[idx];
                     let used = vs.queue_used[idx];
-                    if let Some(q) = vs.queues.get_mut(idx) {
+                    let log = self.log.clone();
+                    // Rings the device cannot reach are refused here
+                    // rather than accepted and then failing every
+                    // access in silence.
+                    let verdict = vs.queues.get_mut(idx).map(|q| {
+                        q.set_log(log);
                         q.set_addr_modern(desc, avail, used);
-                        self.device.queue_addr_set(idx as u16, q);
+                        q.validate_addrs(&self.physmap)
+                    });
+                    match verdict {
+                        None => {}
+                        Some(Err(error)) => {
+                            if let Some(q) = vs.queues.get_mut(idx) {
+                                q.reset();
+                            }
+                            self.refuse_queue(vs, idx, Some(error));
+                            return;
+                        }
+                        Some(Ok(())) => {
+                            vs.queue_enabled[idx] = true;
+                            if let Some(q) = vs.queues.get(idx) {
+                                self.device.queue_addr_set(idx as u16, q);
+                            }
+                        }
                     }
                 }
             }
@@ -1109,8 +1134,43 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         self.raise_interrupt();
     }
 
+    /// Whether a queue refused the ring addresses on its first use.
+    ///
+    /// A queue programmed outside the enable path, such as by a
+    /// migration restore, is only checked when the device first reads
+    /// the ring. It can do no work from then on, so the driver has to
+    /// be told rather than left waiting on it.
+    fn queue_needs_reset(vs: &VirtioPciState, queue_idx: u16) -> bool {
+        vs.queues
+            .get(queue_idx as usize)
+            .is_some_and(|q| q.needs_reset())
+    }
+
+    /// Refuse a queue the guest just programmed and tell it why.
+    ///
+    /// Consumes the transport lock so the caller cannot hold it across
+    /// the interrupt, and does nothing once the device already carries
+    /// DEVICE_NEEDS_RESET: the write that reaches here is guest driven
+    /// and can be repeated without limit, so neither the log nor the
+    /// interrupt may be raised per write.
+    fn refuse_queue(
+        &self,
+        vs: std::sync::MutexGuard<'_, VirtioPciState>,
+        idx: usize,
+        error: Option<crate::queue::QueueAddrError>,
+    ) {
+        if vs.status & bits::STATUS_DEVICE_NEEDS_RESET != 0 {
+            return;
+        }
+        drop(vs);
+        if let Some(error) = error {
+            slog::warn!(self.log, "virtio-pci refused a queue";
+                "queue" => idx, "reason" => %error);
+        }
+        self.signal_device_needs_reset();
+    }
+
     /// Signal the guest that the device needs a reset.
-    #[allow(dead_code)]
     pub fn signal_device_needs_reset(&self) {
         let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
         vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
@@ -1234,12 +1294,37 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             }
             bits::LEGACY_REG_QUEUE_PFN => {
                 let queue_sel = vs.queue_select;
-                if let Some(q) = vs.selected_queue_mut() {
+                let idx = queue_sel as usize;
+                let log = self.log.clone();
+                // A zero PFN is how a legacy driver takes the ring
+                // down, so only a ring the guest is programming is
+                // checked.
+                let verdict = vs.selected_queue_mut().map(|q| {
+                    q.set_log(log);
                     q.set_addr_legacy(val);
-                    // Notify the device of the new queue address
-                    // (kernel-accelerated devices need to program
-                    // their ring addresses at this point)
-                    self.device.queue_addr_set(queue_sel, q);
+                    if val == 0 {
+                        Ok(())
+                    } else {
+                        q.validate_addrs(&self.physmap)
+                    }
+                });
+                match verdict {
+                    None => {}
+                    Some(Err(error)) => {
+                        if let Some(q) = vs.selected_queue_mut() {
+                            q.reset();
+                        }
+                        self.refuse_queue(vs, idx, Some(error));
+                        return;
+                    }
+                    Some(Ok(())) => {
+                        // Notify the device of the new queue address
+                        // (kernel-accelerated devices need to program
+                        // their ring addresses at this point)
+                        if let Some(q) = vs.queues.get(idx) {
+                            self.device.queue_addr_set(queue_sel, q);
+                        }
+                    }
                 }
             }
             bits::LEGACY_REG_QUEUE_SELECT => {
@@ -1255,6 +1340,11 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     &mut vs.queues,
                     &self.physmap,
                 );
+                if Self::queue_needs_reset(&vs, queue_idx) {
+                    // The queue logged its own reason when it refused.
+                    self.refuse_queue(vs, queue_idx as usize, None);
+                    return;
+                }
                 if did_work {
                     drop(vs);
                     self.raise_queue_interrupt_for(queue_idx);

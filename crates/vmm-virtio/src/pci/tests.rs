@@ -1174,3 +1174,155 @@ fn detach_regions_lets_the_device_drop() {
     assert_eq!(bus_pio.handle_in(TEST_BAR0_PORT, 1), 0xFF);
     assert_eq!(bus_mmio.handle_read(TEST_BAR2_ADDR, 4), u64::from(u32::MAX));
 }
+
+// -- Ring address validation --
+
+/// Guest memory for one 256-entry split ring: 4 KiB of descriptors,
+/// then the available and used rings.
+const RING_GPA: u64 = 0x4000;
+const RING_BYTES: usize = 0x4000;
+
+/// A transport whose guest memory really is mapped, so a ring can be
+/// programmed at an address the device can reach.
+fn device_with_ram() -> Arc<VirtioPciDevice<TestVirtioDevice>> {
+    let physmap = Arc::new(
+        PhysMap::new_anon(RING_GPA, RING_BYTES).expect("create guest memory"),
+    );
+    VirtioPciDevice::new(
+        TestVirtioDevice { features: 0 },
+        bits::VIRTIO_DEV_TYPE_BLOCK,
+        1,
+        256,
+        8,
+        None,
+        physmap,
+        Arc::new(PioBus::new()),
+        Arc::new(MmioBus::new()),
+        None,
+    )
+}
+
+/// Program queue 0's three ring addresses through the modern common
+/// config, then write QUEUE_ENABLE.
+fn enable_queue_0(
+    dev: &Arc<VirtioPciDevice<TestVirtioDevice>>,
+    desc: u64,
+    avail: u64,
+    used: u64,
+) {
+    use vmm_core::common::WriteOp;
+    let write = |offset: u16, val: u32| {
+        let wo = WriteOp::from_buf(&val.to_le_bytes());
+        dev.bar_rw(BarN::BAR2, offset.into(), RWOp::Write(&wo));
+    };
+    write(bits::COMMON_CFG_QUEUE_SELECT, 0);
+    write(bits::COMMON_CFG_QUEUE_DESC_LO, desc as u32);
+    write(bits::COMMON_CFG_QUEUE_DESC_HI, (desc >> 32) as u32);
+    write(bits::COMMON_CFG_QUEUE_AVAIL_LO, avail as u32);
+    write(bits::COMMON_CFG_QUEUE_AVAIL_HI, (avail >> 32) as u32);
+    write(bits::COMMON_CFG_QUEUE_USED_LO, used as u32);
+    write(bits::COMMON_CFG_QUEUE_USED_HI, (used >> 32) as u32);
+    write(bits::COMMON_CFG_QUEUE_ENABLE, 1);
+}
+
+fn device_status(dev: &Arc<VirtioPciDevice<TestVirtioDevice>>) -> u8 {
+    dev.virtio_state.lock().expect("virtio lock").status
+}
+
+fn queue_0_enabled(dev: &Arc<VirtioPciDevice<TestVirtioDevice>>) -> bool {
+    dev.virtio_state.lock().expect("virtio lock").queue_enabled[0]
+}
+
+/// The control: a ring the device can reach is accepted, and nothing
+/// tells the driver the device stopped.
+#[test]
+fn a_queue_whose_rings_are_mapped_is_enabled() {
+    let dev = device_with_ram();
+
+    enable_queue_0(&dev, RING_GPA, RING_GPA + 0x1000, RING_GPA + 0x2000);
+
+    assert!(queue_0_enabled(&dev));
+    assert_eq!(device_status(&dev) & bits::STATUS_DEVICE_NEEDS_RESET, 0);
+}
+
+/// A ring that leaves mapped memory fails every access the device makes
+/// on it, forever, while the driver still reads DRIVER_OK. Refuse it at
+/// enable time and raise DEVICE_NEEDS_RESET instead.
+#[test]
+fn a_queue_enable_over_unmapped_memory_is_refused() {
+    let dev = device_with_ram();
+
+    // The used ring needs 4 + 8 * 256 bytes and there is no RAM there.
+    enable_queue_0(&dev, RING_GPA, RING_GPA + 0x1000, RING_GPA + 0x3F00);
+
+    assert!(!queue_0_enabled(&dev), "the queue must not go live");
+    assert_ne!(
+        device_status(&dev) & bits::STATUS_DEVICE_NEEDS_RESET,
+        0,
+        "the driver was never told the device stopped",
+    );
+}
+
+/// The same refusal for an address that breaks the alignment the spec
+/// fixes for the ring.
+#[test]
+fn a_queue_enable_with_a_misaligned_ring_is_refused() {
+    let dev = device_with_ram();
+
+    enable_queue_0(&dev, RING_GPA + 1, RING_GPA + 0x1000, RING_GPA + 0x2000);
+
+    assert!(!queue_0_enabled(&dev));
+    assert_ne!(device_status(&dev) & bits::STATUS_DEVICE_NEEDS_RESET, 0);
+}
+
+/// The legacy transport programs one PFN, and the same refusal applies:
+/// a PFN whose computed rings leave guest memory is not accepted.
+#[test]
+fn a_legacy_pfn_outside_guest_memory_is_refused() {
+    use vmm_core::common::WriteOp;
+    let dev = device_with_ram();
+
+    let wo = WriteOp::from_buf(&0u32.to_le_bytes());
+    dev.bar_rw(
+        BarN::BAR0,
+        bits::LEGACY_REG_QUEUE_SELECT.into(),
+        RWOp::Write(&wo),
+    );
+    // Page 8 is far past the 16 KiB this device has mapped.
+    let wo = WriteOp::from_buf(&8u32.to_le_bytes());
+    dev.bar_rw(
+        BarN::BAR0,
+        bits::LEGACY_REG_QUEUE_PFN.into(),
+        RWOp::Write(&wo),
+    );
+
+    assert_ne!(device_status(&dev) & bits::STATUS_DEVICE_NEEDS_RESET, 0);
+    assert!(!dev.virtio_state.lock().expect("virtio lock").queues[0]
+        .is_configured());
+}
+
+/// A legacy PFN the device can reach still programs the ring.
+#[test]
+fn a_legacy_pfn_inside_guest_memory_is_accepted() {
+    use vmm_core::common::WriteOp;
+    let dev = device_with_ram();
+
+    let wo = WriteOp::from_buf(&0u32.to_le_bytes());
+    dev.bar_rw(
+        BarN::BAR0,
+        bits::LEGACY_REG_QUEUE_SELECT.into(),
+        RWOp::Write(&wo),
+    );
+    let pfn = (RING_GPA / vmm_core::common::PAGE_SIZE as u64) as u32;
+    let wo = WriteOp::from_buf(&pfn.to_le_bytes());
+    dev.bar_rw(
+        BarN::BAR0,
+        bits::LEGACY_REG_QUEUE_PFN.into(),
+        RWOp::Write(&wo),
+    );
+
+    assert_eq!(device_status(&dev) & bits::STATUS_DEVICE_NEEDS_RESET, 0);
+    assert!(
+        dev.virtio_state.lock().expect("virtio lock").queues[0].is_configured()
+    );
+}

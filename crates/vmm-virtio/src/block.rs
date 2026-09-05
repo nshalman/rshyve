@@ -498,7 +498,15 @@ impl VirtioDevice for VirtioBlock {
 
                 let chain = match queue.collect_chain(physmap, head) {
                     Some(c) => c,
-                    None => continue,
+                    None => {
+                        // `pop_avail` already took this head out of the
+                        // available ring, so it has to go back on the
+                        // used ring. Dropping it burns the descriptor
+                        // for the life of the device: the block layer
+                        // has no abort path for virtio-blk.
+                        completion.complete(head, 0);
+                        continue;
+                    }
                 };
 
                 if chain.len() < 2 {

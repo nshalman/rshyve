@@ -341,3 +341,42 @@ fn features_are_ring_only() {
     console.pause();
     console.halt();
 }
+
+/// A chain the walker refuses must still go back on the used ring.
+/// `pop_avail` already took its head out of the available ring, so
+/// dropping it burns one descriptor for the life of the device. Enough
+/// of them and the receive ring runs dry and the console goes deaf.
+#[test]
+fn a_refused_rx_chain_returns_its_descriptor() {
+    let (physmap, rx_queue) = make_queue(4, 1, bits::VRING_DESC_F_WRITE, 8);
+    // NEXT past the end of the descriptor table: the walker refuses it.
+    physmap
+        .lookup(DESC_GPA, 16)
+        .expect("mapped descriptor")
+        .write(&VirtqDesc {
+            addr: DATA_GPA,
+            len: 8,
+            flags: bits::VRING_DESC_F_WRITE | bits::VRING_DESC_F_NEXT,
+            next: 7,
+        })
+        .expect("write descriptor");
+    let (_dir, console) = console_in_tempdir(Arc::clone(&physmap));
+
+    let mut queues = [rx_queue, VirtQueue::new(4)];
+    console.notify_queue(CONSOLE_RX_QUEUE, &mut queues, &physmap);
+
+    assert_eq!(
+        queues[0].read_used_ring_idx(&physmap),
+        1,
+        "the refused head never went back to the guest",
+    );
+    assert_eq!(read_used_entry(&physmap, 0), (0, 0));
+    assert!(console
+        .shared
+        .pending_rx
+        .lock()
+        .expect("pending rx")
+        .is_empty());
+    console.pause();
+    console.halt();
+}
