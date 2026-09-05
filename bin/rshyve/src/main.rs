@@ -836,6 +836,16 @@ fn start_mem_hotplug(
 }
 
 /// Optionally spawn the control socket listener thread.
+/// What the control socket leaves behind for the rest of `run`.
+#[derive(Default)]
+struct ControlSocket {
+    /// The socket file to remove at teardown.
+    cleanup: Option<PathBuf>,
+    /// How SIGTERM stops the VM. `None` without a control socket,
+    /// which is the only kind of VM that cannot be paused.
+    stop: Option<Arc<dyn vmm_machine::signal::GuestStop>>,
+}
+
 fn spawn_control_socket(
     machine: &Machine,
     cli: &Cli,
@@ -848,9 +858,9 @@ fn spawn_control_socket(
     hotplug: HotplugEngines,
     host_local_state: host_state::HostLocalState,
     log: &Logger,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> anyhow::Result<ControlSocket> {
     let Some(sock_path) = cli.control_socket.as_ref() else {
-        return Ok(None);
+        return Ok(ControlSocket::default());
     };
     let ctrl = control::VmController::new(
         machine.hdl().clone(),
@@ -869,10 +879,14 @@ fn spawn_control_socket(
         host_local_state,
         log.clone(),
     );
+    let stop = control::sigterm_stop(Arc::clone(&ctrl));
     let (_handle, path) =
         control::spawn_control_thread(sock_path, ctrl, log.clone())?;
     info!(log, "control socket listening"; "path" => path.display().to_string());
-    Ok(Some(path))
+    Ok(ControlSocket {
+        cleanup: Some(path),
+        stop: Some(stop),
+    })
 }
 
 /// What `run` hands `main`.
@@ -1103,7 +1117,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     drop(sender);
 
     // Phase 12: Control socket
-    let control_cleanup = spawn_control_socket(
+    let control_socket = spawn_control_socket(
         &machine,
         &cli,
         num_cpus,
@@ -1117,8 +1131,13 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         log,
     )?;
 
-    // Phase 13: Signal handling
-    vmm_machine::install_sigterm_handler(&machine, log);
+    // Phase 13: Signal handling. The control-plane stop is preferred
+    // because only it knows whether the VM is parked on the kernel's
+    // pause, where a suspend alone is never seen.
+    let stop = control_socket.stop.clone().unwrap_or_else(|| {
+        Arc::new(vmm_machine::signal::HdlStop::new(machine.hdl().clone()))
+    });
+    vmm_machine::signal::install_sigterm_handler_with(stop, log);
 
     // Phase 14: Main event loop and cleanup
     let outcome = if hotplug.cpu.is_some() {
@@ -1126,7 +1145,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
             &machine,
             events,
             &threads,
-            control_cleanup,
+            control_socket.cleanup.clone(),
             &registry,
             log,
         )
@@ -1135,7 +1154,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
             &machine,
             events,
             threads.close(),
-            control_cleanup,
+            control_socket.cleanup.clone(),
             &registry,
             log,
         )

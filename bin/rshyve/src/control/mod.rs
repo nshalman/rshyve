@@ -54,6 +54,7 @@ use slog::{error, warn, Logger};
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::PhysMap;
 use vmm_devices::quiesce::NamedDevice;
+use vmm_machine::signal::GuestStop;
 use vmm_machine::{DeviceRegistry, HotplugEngines};
 
 use crate::host_state::HostLocalState;
@@ -368,6 +369,23 @@ impl VmController {
         release_paused_vm(|| self.hdl.suspend(halt, 0), || self.hdl.resume())
     }
 
+    /// Latch `how`, then let a parked VM see it.
+    ///
+    /// The CAS is what makes the resume happen once, however many
+    /// threads ask to stop.
+    fn stop_for_signal(&self, how: u32) -> io::Result<()> {
+        let from = self.state();
+        let parked = stop_needs_resume(from, self.migrated_away())
+            && self.transition(from, VmRunState::Stopping);
+
+        if !parked {
+            self.state
+                .store(VmRunState::Stopping as u8, Ordering::Release);
+            return self.hdl.suspend(how, 0);
+        }
+        release_paused_vm(|| self.hdl.suspend(how, 0), || self.hdl.resume())
+    }
+
     /// The same release from a path with nobody to hand an error to.
     fn log_failed_release(&self) {
         if let Err(e) = self.release_migrated_source() {
@@ -418,6 +436,46 @@ impl VmController {
         for named in self.named_devices() {
             named.device.halt();
         }
+    }
+}
+
+/// SIGTERM shutdown driven through the control plane.
+///
+/// Only the control plane knows whether the VM is parked on the
+/// kernel's pause. A stop that is latched but never followed by a
+/// resume leaves a paused VM running for ever, which is why SIGTERM
+/// does nothing to one today.
+struct ControlStop(Arc<VmController>);
+
+/// The stop a VM with a control socket uses for SIGTERM.
+pub(crate) fn sigterm_stop(ctrl: Arc<VmController>) -> Arc<dyn GuestStop> {
+    Arc::new(ControlStop(ctrl))
+}
+
+impl GuestStop for ControlStop {
+    fn request_poweroff(&self) -> io::Result<()> {
+        self.0.stop_for_signal(
+            bhyve_api::vm_suspend_how::VM_SUSPEND_POWEROFF as u32,
+        )
+    }
+
+    fn halt(&self) -> io::Result<()> {
+        self.0
+            .stop_for_signal(bhyve_api::vm_suspend_how::VM_SUSPEND_HALT as u32)
+    }
+}
+
+/// Whether a stop must resume the VM before its vCPUs can see it.
+///
+/// Two states leave the vCPU threads parked on the kernel's pause: an
+/// operator pause, and a source whose guest migrated away. A parked
+/// thread retries VM_RUN against EBUSY and never reaches the suspend
+/// check, so nothing it is told lands until the instance runs again.
+fn stop_needs_resume(state: VmRunState, migrated_away: bool) -> bool {
+    match state {
+        VmRunState::Paused => true,
+        VmRunState::Stopped => migrated_away,
+        _ => false,
     }
 }
 
@@ -608,6 +666,24 @@ mod tests {
             VmRunState::Migrating,
         ] {
             assert!(!grace_must_release(state), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn a_stop_resumes_only_a_vm_that_is_parked() {
+        // A resume of an instance that is not paused is a kernel level
+        // mistake, so this must be exact.
+        assert!(stop_needs_resume(VmRunState::Paused, false));
+        assert!(stop_needs_resume(VmRunState::Stopped, true));
+
+        assert!(!stop_needs_resume(VmRunState::Stopped, false));
+        for state in [
+            VmRunState::Running,
+            VmRunState::Stopping,
+            VmRunState::Migrating,
+        ] {
+            assert!(!stop_needs_resume(state, false), "{state:?}");
+            assert!(!stop_needs_resume(state, true), "{state:?}");
         }
     }
 
