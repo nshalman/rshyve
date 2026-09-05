@@ -409,7 +409,7 @@ impl VirtQueue {
             if addr == 0 {
                 return Err(QueueAddrError::Unset(ring));
             }
-            if !(addr).is_multiple_of(ring.align()) {
+            if !addr.is_multiple_of(ring.align()) {
                 return Err(QueueAddrError::Misaligned { ring, addr });
             }
             // `lookup` refuses a range that wraps or that leaves the
