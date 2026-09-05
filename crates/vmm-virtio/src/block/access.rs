@@ -26,8 +26,9 @@ pub(super) struct GuestAccess {
     epoch: AtomicU64,
     lock: RwLock<()>,
     /// Orders interrupt delivery against the reset that ends the
-    /// session the interrupt belongs to.
-    intr: Mutex<()>,
+    /// session the interrupt belongs to. Shared, so queues still
+    /// deliver in parallel.
+    intr: RwLock<()>,
 }
 
 /// Permission held across one guest-memory access.
@@ -53,7 +54,7 @@ impl GuestAccess {
             open: AtomicBool::new(true),
             epoch: AtomicU64::new(0),
             lock: RwLock::new(()),
-            intr: Mutex::new(()),
+            intr: RwLock::new(()),
         }
     }
 
@@ -105,7 +106,7 @@ impl GuestAccess {
     /// to raise. VirtIO 1.3 sec 2.4.1 forbids queue interaction once a
     /// reset is complete.
     pub(super) fn settle_interrupts(&self) {
-        drop(self.intr.lock().unwrap_or_else(PoisonError::into_inner));
+        drop(self.intr.write().unwrap_or_else(PoisonError::into_inner));
     }
 
     /// Admit the next driver.
@@ -120,7 +121,7 @@ impl GuestAccess {
     /// against [`Self::settle_interrupts`], so the raise reaches the
     /// driver it was meant for or does not happen.
     pub(super) fn deliver(&self, epoch: u64, raise: impl FnOnce()) {
-        let _gate = self.intr.lock().unwrap_or_else(PoisonError::into_inner);
+        let _gate = self.intr.read().unwrap_or_else(PoisonError::into_inner);
         if self.epoch.load(Ordering::Acquire) != epoch {
             return;
         }
