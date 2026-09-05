@@ -93,11 +93,19 @@ pub fn bind_restricted(
 /// flag in [`SEND_NOWAIT`] keep the send that follows it short enough
 /// not to wait again.
 ///
-/// This narrows the window rather than closing it. Between the `poll`
-/// and the send, another writer on the same socket can take the space
-/// the `poll` reported, and illumos then waits for the peer inside the
-/// send. Every caller here has one writer per socket, so nothing takes
-/// that space, but the socket type does not enforce it.
+/// # One writer per socket
+///
+/// The `poll` and the send are two steps. A second writer that takes
+/// the reported space between them leaves this send with nowhere to
+/// put its bytes, and illumos then waits for the peer inside the send,
+/// with no timeout (`strwaitq`, see [`WRITE_CHUNK`]). The budget does
+/// not cover that wait, so a socket with two writers is not bounded by
+/// this function.
+///
+/// This function cannot enforce the rule. A caller holds it by giving
+/// each socket one writer: a thread that owns the socket, or a lock
+/// that every write path takes. A reader thread on a `try_clone` of
+/// the same socket is not a second writer.
 ///
 /// A budget that runs out returns `ErrorKind::TimedOut`. Part of `data`
 /// may be on the socket by then, so the caller has to drop the
@@ -154,13 +162,25 @@ pub fn write_all_bounded(
 /// (`sotpi_sendmsg`, socktpi.c), and `SO_SNDTIMEO` bounds nothing. The
 /// size of the send is the only control left.
 ///
-/// An AF_UNIX send reaches `strwrite_common`, which cuts the write
-/// into messages of `sd_qn_maxpsz` and can wait for the peer between
-/// two of them, untimed. `tl` asks for `INFPSZ`, but the stream head
-/// caps that at `strmsgsz`, 64 KiB by default (`conf/param.c`). One
-/// message is placed whole once `canputnext` holds, which is what
-/// `POLLOUT` reports, so a send below that cap does not reach the
-/// wait. This stays far enough below to survive a lowered `strmsgsz`.
+/// An AF_UNIX send reaches `strwrite_common` (os/streamio.c). That
+/// cuts the write into messages of `sd_qn_maxpsz` and, between two of
+/// them, can sleep in `strwaitq` with no timeout, and with signals
+/// masked after the first message. `tl` asks for `INFPSZ`, but the
+/// stream head caps it at `strmsgsz`, 64 KiB by default
+/// (`conf/param.c`). So a write above that cap can wait for the peer.
+/// A write below it is one message.
+///
+/// One message does not wait. `strput` calls `putnext` once
+/// `canputnext` holds, and `putnext` places the whole message whatever
+/// its size: STREAMS flow control is advisory, so the queue may pass
+/// its high-water mark. `POLLOUT` reads the same `QFULL` bit
+/// `canputnext` does (`strpoll`, os/streamio.c). The send after a
+/// `POLLOUT` therefore places its message and returns. Measured on
+/// illumos: an 8 KiB send after `POLLOUT` returns at once, and
+/// `POLLOUT` stays clear while the queue is full.
+///
+/// 8 KiB is one message for any `strmsgsz` of 8 KiB or more. A host
+/// tuned below that loses the bound.
 const WRITE_CHUNK: usize = 8 * 1024;
 
 /// Flags that stop one send from waiting for the peer.
@@ -269,6 +289,39 @@ mod tests {
     const OVERSIZED: usize = 8 * 1024 * 1024;
     const BUDGET: Duration = Duration::from_millis(200);
 
+    /// How long the harness waits for a bounded write to return.
+    ///
+    /// A write that is not bounded never returns at all, so this only
+    /// has to be clear of the budget. It turns that hang into one
+    /// failed test rather than a test run that never ends.
+    const LIMIT: Duration = Duration::from_secs(2);
+
+    /// Put the socket in the state a bounded write has to survive:
+    /// space free, but less than [`WRITE_CHUNK`] of it.
+    ///
+    /// This is what makes the test below exercise the send. A payload
+    /// that starts on an empty socket fills it in whole blocks, so a
+    /// send that waits for the peer is never reached, and the test
+    /// passes whether the send is bounded or not.
+    fn part_fill(device: &UnixStream) {
+        // An odd length, so the space left is not a round number.
+        write_all_bounded(device, &[0u8; 24], BUDGET).expect("prefix");
+    }
+
+    /// Run one bounded write on a worker, and give up on it after
+    /// [`LIMIT`].
+    ///
+    /// The write is the thing under test, so it cannot be joined here:
+    /// an unbounded one would park the test run instead of failing.
+    fn write_within_limit(device: UnixStream, data: Vec<u8>) -> io::Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(write_all_bounded(&device, &data, BUDGET));
+        });
+        rx.recv_timeout(LIMIT)
+            .expect("the write must end on its budget, not on the peer")
+    }
+
     #[test]
     fn a_write_that_fits_is_not_delayed() {
         let (mut peer, device) = UnixStream::pair().expect("socketpair");
@@ -290,82 +343,45 @@ mod tests {
     #[test]
     fn a_peer_that_never_reads_does_not_hold_the_writer() {
         let (_peer, device) = UnixStream::pair().expect("socketpair");
-        let started = Instant::now();
-        let error = write_all_bounded(&device, &vec![0u8; OVERSIZED], BUDGET)
-            .expect_err("a peer that reads nothing must not be waited on");
+        part_fill(&device);
 
+        let error = write_within_limit(device, vec![0u8; OVERSIZED])
+            .expect_err("a peer that reads nothing must not be waited on");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the write took {:?}",
-            started.elapsed()
-        );
     }
 
-    /// The socket part full when the write starts.
+    /// A peer that reads once and then stops.
     ///
-    /// `POLLOUT` reports space that is smaller than the rest of the
-    /// payload, so a send that could wait for the peer waits here and
-    /// nowhere else. A payload that starts on an empty socket can fill
-    /// it in whole blocks and miss this.
+    /// The write makes progress, so a bound that only watched a write
+    /// which never moved would never fire. The single read also leaves
+    /// the socket with room for less than one [`WRITE_CHUNK`], which is
+    /// the state a send that waits for the peer cannot get out of.
     #[test]
-    fn a_write_onto_a_part_full_socket_is_still_bounded() {
-        let (_peer, device) = UnixStream::pair().expect("socketpair");
-        // A short odd prefix, so the space left is not a round number.
-        write_all_bounded(&device, &[0u8; 24], BUDGET).expect("prefix");
-
-        let started = Instant::now();
-        let error = write_all_bounded(&device, &vec![0u8; OVERSIZED], BUDGET)
-            .expect_err("a peer that reads nothing must not be waited on");
-
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the write took {:?}",
-            started.elapsed()
-        );
-    }
-
-    /// A peer that reads, but too slowly. The write makes progress, so
-    /// a bound that only watched the first blocked write would never
-    /// fire.
-    #[test]
-    fn a_peer_that_reads_too_slowly_still_loses_the_write() {
+    fn a_peer_that_stops_reading_still_loses_the_write() {
         let (peer, device) = UnixStream::pair().expect("socketpair");
         let taken = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&taken);
-        let slow = std::thread::spawn(move || {
+        // Dropped at the end of the test. Until then the peer stays
+        // open: one that closed would end the write on a broken pipe,
+        // which is not the case under test.
+        let (hold, parked) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
             let mut peer = peer;
-            let mut buf = [0u8; 512];
-            loop {
-                std::thread::sleep(BUDGET / 4);
-                match peer.read(&mut buf) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => counted.fetch_add(n, Ordering::Release),
-                };
-            }
+            let mut buf = [0u8; 4096];
+            // Long enough for the write to fill the socket first, and
+            // short enough to leave the write some budget after it.
+            std::thread::sleep(BUDGET / 4);
+            counted.store(peer.read(&mut buf).unwrap_or(0), Ordering::Release);
+            let _ = parked.recv();
         });
 
-        let started = Instant::now();
-        let error = write_all_bounded(&device, &vec![0u8; OVERSIZED], BUDGET)
-            .expect_err("a peer this slow must not be waited on");
+        let error = write_within_limit(device, vec![0u8; OVERSIZED])
+            .expect_err("a peer that stopped reading must not be waited on");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the write took {:?}",
-            started.elapsed()
-        );
+        assert!(taken.load(Ordering::Acquire) > 0, "the peer read nothing");
 
-        // The socket buffer alone accepts far less than the payload,
-        // so the peer had to take bytes for the write to get past it.
-        assert!(
-            taken.load(Ordering::Acquire) > 0,
-            "the write made no progress"
-        );
-        // Wake the reader so this test leaks no thread. The peer may
-        // already be gone, and there is nothing to do about that.
-        let _ = device.shutdown(std::net::Shutdown::Both);
-        slow.join().expect("join the slow reader");
+        drop(hold);
+        reader.join().expect("join the reader");
     }
 
     #[test]
