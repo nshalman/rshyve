@@ -348,3 +348,179 @@ fn has_new_avail_disabled_when_not_configured() {
     // Not configured (no PFN set) → false
     assert!(!q.is_configured());
 }
+
+// -- Ring address validation --
+
+const RING_GPA: u64 = 0x4000;
+const RING_BYTES: usize = 0x1000;
+const RING_DESCS: u16 = 16;
+
+/// A queue whose descriptor 0 is one readable buffer, with that
+/// descriptor posted once in the available ring.
+fn posted_queue(desc: u64, avail: u64, used: u64) -> (PhysMap, VirtQueue) {
+    let physmap =
+        PhysMap::new_anon(RING_GPA, RING_BYTES).expect("create guest memory");
+    let mut queue = VirtQueue::new(RING_DESCS);
+    queue.set_addr_modern(desc, avail, used);
+
+    physmap
+        .lookup(RING_GPA, 16)
+        .expect("mapped descriptor")
+        .write(&VirtqDesc {
+            addr: RING_GPA + 0x800,
+            len: 64,
+            flags: 0,
+            next: 0,
+        })
+        .expect("write descriptor");
+    physmap
+        .lookup(avail + 2, 2)
+        .expect("mapped avail index")
+        .write::<u16>(&1)
+        .expect("write avail index");
+    physmap
+        .lookup(avail + 4, 2)
+        .expect("mapped avail entry")
+        .write::<u16>(&0)
+        .expect("write avail entry");
+    (physmap, queue)
+}
+
+/// The used ring runs off the end of RAM, so no completion can ever
+/// reach the guest. The queue must refuse it rather than pop work it
+/// can never finish.
+#[test]
+fn a_used_ring_past_guest_memory_is_refused() {
+    let (physmap, mut queue) =
+        posted_queue(RING_GPA, RING_GPA + 0x100, RING_GPA + 0xF80);
+
+    assert_eq!(queue.pop_avail(&physmap), None);
+    assert_eq!(queue.last_avail_idx(), 0);
+}
+
+/// VirtIO 1.3 sec 2.7 puts the descriptor table on a 16 byte boundary.
+/// Off it, every descriptor read fails its alignment check, so the
+/// device would pop heads it can never walk.
+#[test]
+fn a_misaligned_descriptor_table_is_refused() {
+    let (physmap, mut queue) =
+        posted_queue(RING_GPA + 8, RING_GPA + 0x100, RING_GPA + 0x200);
+
+    assert_eq!(queue.pop_avail(&physmap), None);
+}
+
+/// The rings a working guest programs must still be accepted.
+#[test]
+fn a_ring_inside_guest_memory_still_pops() {
+    let (physmap, mut queue) =
+        posted_queue(RING_GPA, RING_GPA + 0x100, RING_GPA + 0x200);
+
+    assert_eq!(queue.pop_avail(&physmap), Some(0));
+    assert_eq!(queue.last_avail_idx(), 1);
+}
+
+/// Counts records, so a test can show a guest cannot drive the log.
+struct CountingDrain(Arc<std::sync::atomic::AtomicUsize>);
+
+impl slog::Drain for CountingDrain {
+    type Ok = ();
+    type Err = slog::Never;
+
+    fn log(
+        &self,
+        _record: &slog::Record<'_>,
+        _values: &slog::OwnedKVList,
+    ) -> Result<(), slog::Never> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// The refusal is reported, and reported once: a guest that keeps
+/// kicking a broken ring must not be able to fill the log with it.
+#[test]
+fn a_refused_ring_is_logged_once_however_often_the_guest_kicks() {
+    let (physmap, mut queue) =
+        posted_queue(RING_GPA, RING_GPA + 0x100, RING_GPA + 0xF80);
+    let records = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    queue.set_log(slog::Logger::root(
+        CountingDrain(Arc::clone(&records)),
+        slog::o!(),
+    ));
+
+    for _ in 0..64 {
+        assert_eq!(queue.pop_avail(&physmap), None);
+    }
+
+    assert_eq!(records.load(Ordering::Relaxed), 1);
+    assert!(queue.needs_reset());
+}
+
+/// The refusal lifts when the guest programs the rings again, so a
+/// driver that resets and retries is not locked out.
+#[test]
+fn reprogramming_the_rings_clears_the_refusal() {
+    let (physmap, mut queue) =
+        posted_queue(RING_GPA, RING_GPA + 0x100, RING_GPA + 0xF80);
+    assert_eq!(queue.pop_avail(&physmap), None);
+    assert!(queue.needs_reset());
+
+    queue.set_addr_modern(RING_GPA, RING_GPA + 0x100, RING_GPA + 0x200);
+
+    assert!(!queue.needs_reset());
+    assert_eq!(queue.pop_avail(&physmap), Some(0));
+}
+
+#[test]
+fn validation_names_the_ring_that_is_wrong() {
+    let physmap =
+        PhysMap::new_anon(RING_GPA, RING_BYTES).expect("create guest memory");
+    let mut queue = VirtQueue::new(RING_DESCS);
+
+    queue.set_addr_modern(0, RING_GPA + 0x100, RING_GPA + 0x200);
+    assert_eq!(
+        queue.validate_addrs(&physmap),
+        Err(QueueAddrError::Unset(Ring::Desc)),
+    );
+
+    queue.set_addr_modern(RING_GPA, RING_GPA + 0x101, RING_GPA + 0x200);
+    assert_eq!(
+        queue.validate_addrs(&physmap),
+        Err(QueueAddrError::Misaligned {
+            ring: Ring::Avail,
+            addr: RING_GPA + 0x101,
+        }),
+    );
+
+    queue.set_addr_modern(RING_GPA, RING_GPA + 0x100, RING_GPA + 0x202);
+    assert_eq!(
+        queue.validate_addrs(&physmap),
+        Err(QueueAddrError::Misaligned {
+            ring: Ring::Used,
+            addr: RING_GPA + 0x202,
+        }),
+    );
+
+    queue.set_addr_modern(RING_GPA, RING_GPA + 0x100, RING_GPA + 0x200);
+    assert_eq!(queue.validate_addrs(&physmap), Ok(()));
+}
+
+/// `used_event` sits past the end of the available ring and only
+/// EVENT_IDX makes the device read it. A ring that stops just short of
+/// it works without the feature, so only the feature may refuse it.
+#[test]
+fn the_suppression_field_must_be_mapped_under_event_idx() {
+    let avail = RING_GPA + RING_BYTES as u64 - 4 - u64::from(RING_DESCS) * 2;
+    let (physmap, mut queue) = posted_queue(RING_GPA, avail, RING_GPA + 0x200);
+
+    assert_eq!(queue.validate_addrs(&physmap), Ok(()));
+
+    queue.set_event_idx(true);
+    assert!(matches!(
+        queue.validate_addrs(&physmap),
+        Err(QueueAddrError::Unmapped {
+            ring: Ring::Avail,
+            ..
+        }),
+    ));
+}

@@ -19,6 +19,8 @@
 use std::sync::atomic::{fence, Ordering};
 use std::sync::Arc;
 
+use slog::debug;
+
 use vmm_core::common::PAGE_SIZE;
 use vmm_core::mem::PhysMap;
 
@@ -69,6 +71,65 @@ pub enum ChainBuf {
     Writable { addr: u64, len: u32 },
 }
 
+/// One of the three rings a split virtqueue is made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ring {
+    Desc,
+    Avail,
+    Used,
+}
+
+impl Ring {
+    /// The alignment VirtIO 1.3 sec 2.7 fixes for the ring.
+    const fn align(self) -> u64 {
+        match self {
+            Ring::Desc => 16,
+            Ring::Avail => 2,
+            Ring::Used => 4,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Ring::Desc => "desc",
+            Ring::Avail => "avail",
+            Ring::Used => "used",
+        }
+    }
+}
+
+/// Why the device refuses the ring addresses a guest programmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueAddrError {
+    /// The address is zero, so the guest never programmed the ring.
+    Unset(Ring),
+    /// The address breaks the alignment the spec fixes for the ring.
+    Misaligned { ring: Ring, addr: u64 },
+    /// The ring is not mapped guest memory for its whole size.
+    Unmapped { ring: Ring, addr: u64, len: usize },
+}
+
+impl std::fmt::Display for QueueAddrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unset(ring) => {
+                write!(f, "{} ring address is zero", ring.name())
+            }
+            Self::Misaligned { ring, addr } => write!(
+                f,
+                "{} ring at {addr:#x} is not aligned to {}",
+                ring.name(),
+                ring.align(),
+            ),
+            Self::Unmapped { ring, addr, len } => write!(
+                f,
+                "{} ring at {addr:#x} is not {len} bytes of guest memory",
+                ring.name(),
+            ),
+        }
+    }
+}
+
 /// A split virtqueue.
 ///
 /// Manages the descriptor table, available ring, and used ring for one
@@ -95,6 +156,10 @@ pub struct VirtQueue {
     event_idx: bool,
     /// Whether VIRTIO_F_RING_INDIRECT_DESC is negotiated.
     indirect_supported: bool,
+    /// The address check, kept from the first use of the rings.
+    addrs_ok: Option<bool>,
+    /// Where a refusal is reported. Silent until a transport sets one.
+    log: Option<slog::Logger>,
 }
 
 impl VirtQueue {
@@ -120,7 +185,14 @@ impl VirtQueue {
             shadow_used_idx: 0,
             event_idx: false,
             indirect_supported: false,
+            addrs_ok: None,
+            log: None,
         }
+    }
+
+    /// Report refusals through `log`.
+    pub fn set_log(&mut self, log: slog::Logger) {
+        self.log = Some(log);
     }
 
     /// Get the queue size (number of descriptors).
@@ -189,6 +261,7 @@ impl VirtQueue {
     /// - Available ring at PFN * PAGE_SIZE + size * 16
     /// - Used ring aligned to next page boundary after available ring
     pub fn set_addr_legacy(&mut self, pfn: u32) {
+        self.addrs_ok = None;
         if pfn == 0 {
             self.desc_addr = 0;
             self.avail_addr = 0;
@@ -218,6 +291,7 @@ impl VirtQueue {
     /// the descriptor table, available ring, and used ring instead of
     /// computing them from a single PFN.
     pub fn set_addr_modern(&mut self, desc: u64, avail: u64, used: u64) {
+        self.addrs_ok = None;
         self.desc_addr = desc;
         self.avail_addr = avail;
         self.used_addr = used;
@@ -282,11 +356,103 @@ impl VirtQueue {
 
     /// Reset the queue state (called on device reset).
     pub fn reset(&mut self) {
+        self.addrs_ok = None;
         self.desc_addr = 0;
         self.avail_addr = 0;
         self.used_addr = 0;
         self.last_avail_idx = 0;
         self.shadow_used_idx = 0;
+    }
+
+    /// Bytes the descriptor table occupies: 16 per entry (sec 2.7.5).
+    fn desc_table_bytes(&self) -> usize {
+        usize::from(self.size) * 16
+    }
+
+    /// Bytes of the available ring the device can reach: flags, idx and
+    /// one 2 byte entry per descriptor (sec 2.7.6).
+    fn avail_ring_bytes(&self) -> usize {
+        4 + usize::from(self.size) * 2 + self.event_field_bytes()
+    }
+
+    /// Bytes of the used ring the device can reach: flags, idx and one
+    /// 8 byte entry per descriptor (sec 2.7.8).
+    fn used_ring_bytes(&self) -> usize {
+        4 + usize::from(self.size) * 8 + self.event_field_bytes()
+    }
+
+    /// The suppression field each ring carries only under EVENT_IDX.
+    /// Demanding it otherwise would refuse a ring that works, because
+    /// the device never reads that far without the feature.
+    fn event_field_bytes(&self) -> usize {
+        if self.event_idx {
+            2
+        } else {
+            0
+        }
+    }
+
+    /// Check the three ring addresses against the guest memory map.
+    ///
+    /// A ring that is misaligned, or that leaves mapped memory, fails
+    /// every access the device makes on it. Nothing else notices: the
+    /// device keeps taking heads off the available ring and completing
+    /// none of them, while the guest still reads DRIVER_OK.
+    pub fn validate_addrs(
+        &self,
+        physmap: &PhysMap,
+    ) -> Result<(), QueueAddrError> {
+        for (ring, addr, len) in [
+            (Ring::Desc, self.desc_addr, self.desc_table_bytes()),
+            (Ring::Avail, self.avail_addr, self.avail_ring_bytes()),
+            (Ring::Used, self.used_addr, self.used_ring_bytes()),
+        ] {
+            if addr == 0 {
+                return Err(QueueAddrError::Unset(ring));
+            }
+            if !(addr).is_multiple_of(ring.align()) {
+                return Err(QueueAddrError::Misaligned { ring, addr });
+            }
+            // `lookup` refuses a range that wraps or that leaves the
+            // mapped run, which is the reach of every later access.
+            if physmap.lookup(addr, len).is_none() {
+                return Err(QueueAddrError::Unmapped { ring, addr, len });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the rings passed [`Self::validate_addrs`], checked once
+    /// and remembered.
+    ///
+    /// The verdict holds until the guest programs the rings again. A
+    /// queue that failed cannot start working, and rechecking it on
+    /// every kick would let a guest drive the log.
+    fn addrs_usable(&mut self, physmap: &PhysMap) -> bool {
+        if let Some(ok) = self.addrs_ok {
+            return ok;
+        }
+        match self.validate_addrs(physmap) {
+            Ok(()) => {
+                self.addrs_ok = Some(true);
+                true
+            }
+            Err(error) => {
+                self.addrs_ok = Some(false);
+                if let Some(log) = &self.log {
+                    debug!(log, "virtqueue refused"; "reason" => %error);
+                }
+                false
+            }
+        }
+    }
+
+    /// Whether the queue refused the addresses the guest programmed.
+    ///
+    /// The transport turns this into DEVICE_NEEDS_RESET. A driver has
+    /// no other way to learn that the device stopped.
+    pub fn needs_reset(&self) -> bool {
+        self.addrs_ok == Some(false)
     }
 
     /// Read a descriptor from the descriptor table.
@@ -307,6 +473,11 @@ impl VirtQueue {
     /// Returns `None` if no new descriptors are available.
     pub fn pop_avail(&mut self, physmap: &PhysMap) -> Option<u16> {
         if !self.is_configured() {
+            return None;
+        }
+        // The rings are checked here, not in the address setters: only
+        // a caller with the memory map can say where they land.
+        if !self.addrs_usable(physmap) {
             return None;
         }
 
