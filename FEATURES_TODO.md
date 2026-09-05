@@ -148,6 +148,60 @@ graphical path unusable.
 | ⏳ Hyper-V Tier 2 | SynIC, synthetic timers, virtual APIC support, TLB-flush hypercalls, and IPI hypercalls require cooperation from `vmm.ko`. They are out of scope for the userspace backlog until the kernel interfaces exist. |
 | ⏳ CPU hot-remove | illumos has no `vm_deactivate_cpu`. `active_cpus` is only ever set, and the one place that clears it is `vm_init` on `VM_REINIT`. `cpu-remove` is recognised and refused with that reason. |
 | ⏳ Memory hot-remove | illumos has no `VM_FREE_MEMSEG`, and `vm_free_memseg` has only destroy-path callers, so a segment lives until the VM does. `mem-remove` is recognised and refused with that reason. |
+| ⏳ A `VM_DESTROY_SELF` that can fail | `vmm_lease_block` waits for every vmm_drv lease in an untimed, unwakeable `cv_wait`. A lease that does not break parks the calling LWP, and process exit then waits for that LWP. Detail below. |
+
+### Upstream: bound the vmm_drv lease wait
+
+`VM_DESTROY_SELF` cannot fail and cannot be interrupted, so a VMM whose
+lease will not break can never exit. This is the one shutdown wedge the
+userspace watchdog cannot end.
+
+**The path.** `vmm_destroy_locked` -> `vmm_destroy_begin` ->
+`vmm_drv_purge` -> `vmm_lease_block`
+(`usr/src/uts/intel/io/vmm/vmm_sol_dev.c`). `vmm_drv_purge` marks every
+hold for release, drops `vmm_mtx`, and calls `vmm_lease_block`. That
+function runs each lease's expire callback and then waits for the lease
+list to empty. Both waits there are `cv_wait`, not `cv_wait_sig`, and
+neither carries a timeout.
+
+**Why a lease stays.** viona breaks its lease asynchronously.
+`viona_ring_lease_expire_cb` returns `B_FALSE` and only signals the ring
+worker (`usr/src/uts/intel/io/viona/viona_ring.c`), so the break happens
+the next time that worker reaches its `vmm_drv_lease_expired()` check. A
+worker that does not reach the check holds the lease, the lease holds
+`vmm_lease_block`, and that holds the LWP.
+
+`viona_tx_wait_outstanding` (`viona_tx.c`) is one such point: a second
+untimed `cv_wait`, on TX frames the MAC layer still holds. It is
+reachable only on a link with guest-memory loaning on. illumos defaults
+`viona_default_tx_copy` to `B_TRUE` and this VMM never calls
+`VNA_IOC_SET_PARAMS`, so loaning is off in the shipped configuration.
+The unbounded wait in `vmm_lease_block` is the part that does not depend
+on any of that.
+
+**Why nothing frees the process.** A thread in `cv_wait` does not carry
+`T_WAKEABLE`, so `ISWAKEABLE()` is false, `pokelwps` cannot make it run,
+and `exitlwps` waits for it (`usr/src/uts/common/os/lwp.c`,
+`usr/src/uts/common/sys/thread.h`). `proc_exit` calls `exitlwps`, so the
+process cannot exit. `SIGKILL` and `_exit` do not change that.
+
+**Why userspace cannot close it.** This VMM already runs the destroy on
+its own thread with a 15 s budget, reports the timeout, and ends the
+process with `_exit(4)` when the teardown budget expires
+(`crates/vmm-machine/src/teardown.rs`, `signal.rs`). The process still
+stays, because that exit is what waits for the parked LWP.
+
+**What the kernel needs.** Bound or interrupt the waits in
+`vmm_lease_block` so `VM_DESTROY_SELF` can return `EINTR` or `EBUSY`.
+Two points go with it. The `VM_DESTROY_SELF` case asserts
+`VERIFY0(vmm_destroy_locked(...))`, so it panics on any non-zero return
+today. And `vmm_destroy_locked` does have an interruptible branch
+(`cv_wait_sig` under `VDO_ATTEMPT_WAIT`), but it runs after
+`vmm_destroy_begin`, so it never covers the lease wait. A failed destroy
+is safe for this VMM: `VM_SET_AUTODESTRUCT` is armed at create, so a
+later close still reclaims the instance.
+
+Lab procedure: [docs/testing.md](docs/testing.md#wedged-lease-teardown).
 
 ## Tier 2 - strategic, multi-week work
 

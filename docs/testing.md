@@ -218,6 +218,7 @@ Both headnode and nuc1 have `vmm_test0` VNICs with MAC `02:08:20:aa:bb:cc`.
 7. **Windows boot test**: `tools/win-boot-test.sh start` then `wait 'Press any key to boot' 120` - see below
 8. **virtio-fs test**: `tools/virtiofs-stage.sh` then `virtiofs-run.sh` - see below
 9. **Hotplug test**: boot with `--hotplug`, then `cpu-add`, `mem-add` and `device-add` over the control socket or the vsock `CONTROL` verb - see below
+10. **Wedged lease teardown**: delay viona's TX frame release, power the guest off, and watch the shutdown budget expire - see below
 
 ### virtio-fs Test
 
@@ -443,6 +444,89 @@ Tear the VM down by name, `bhyvectl --destroy --vm=hptest`, and kill
 only the process you started. The test nodes are shared, so a pattern
 kill such as `pkill -f 'firehyv[e]'` reaches every VM on the box and not
 just yours. `tools/hotplug-run.sh` destroys by name for that reason.
+
+### Wedged lease teardown
+
+Covers the one shutdown wedge no watchdog can end: a vmm_drv lease that
+does not break. `VM_DESTROY_SELF` waits for the lease list to empty in
+an untimed `cv_wait`, and process exit then waits for that LWP.
+`FEATURES_TODO.md` holds the kernel detail; this section is what to run
+and what to look for.
+
+**What this does and does not show.** The shipped configuration cannot
+park a lease: illumos defaults viona TX to copying, so viona loans no
+guest memory and its ring worker always reaches the lease check. The
+steps below turn loaning on and then delay the frame release, which
+reproduces the VMM half: the destroy budget expiring, the log lines, and
+the parked thread. They do not park it forever. DTrace `chill()` is
+capped at 500 ms per CPU per second (`dtrace_chill_max`,
+`dtrace_chill_interval`), so the release is delayed, not stopped. A
+permanent wedge needs a consumer that never returns the frame.
+
+Both steps 1 and 3 change kernel state on the host. Test nodes only.
+
+1. Turn viona TX guest-memory loaning on, then boot the test VM. The
+   per-link default is taken when the link is created, so the order
+   matters:
+
+```bash
+ssh $VMM_HEADNODE 'mdb -kw -e "viona_default_tx_copy/W 0"'
+```
+
+   Boot the VM as in "Boot a Test VM" above.
+
+2. Give the guest TX traffic to send:
+
+```bash
+ssh root@$VMM_GUEST_IP "ping -f -s 1400 $VMM_GUEST_GW" &
+```
+
+3. Delay viona's frame release:
+
+```bash
+ssh $VMM_HEADNODE 'dtrace -w -n "fbt::viona_desb_release:entry { chill(500000000); }"'
+```
+
+4. Power the guest off from inside it. That runs the same teardown a
+   SIGTERM runs, and it is the common path on a node:
+
+```bash
+ssh root@$VMM_GUEST_IP 'poweroff'
+```
+
+5. Watch the VMM log. Fifteen seconds after the destroy starts,
+   teardown gives up on it and logs `the VM destroy did not return
+   inside its budget`. The record carries `likely_cause`, which names
+   both a vCPU that will not freeze and an unbroken vmm_drv lease,
+   because either can hold the ioctl. If the destroy is still parked
+   when the teardown budget runs out, the watchdog follows with `the VMM
+   outlived its own shutdown; ending the process` and an exit code of 4.
+
+6. Find the parked thread while the destroy is stuck:
+
+```bash
+ssh $VMM_HEADNODE 'pstack $(pgrep -f "rshyve.*testvm")'
+```
+
+   The `vm-destroy` thread sits in `ioctl`. Confirm the kernel side:
+
+```bash
+ssh $VMM_HEADNODE 'echo "::pgrep rshyve | ::walk thread | ::findstack -v" | mdb -k'
+```
+
+   Look for `cv_wait` called from `vmm_lease_block`.
+
+7. Clean up. Stop the DTrace script and the ping. The frames come back,
+   the lease breaks, the destroy returns, and the process exits. Put the
+   tunable back:
+
+```bash
+ssh $VMM_HEADNODE 'mdb -kw -e "viona_default_tx_copy/W 1"'
+```
+
+   On a node where a real holder cannot be released, there is no
+   userspace recovery. The guest memory stays held until the node
+   reboots.
 
 ### Windows Boot Test
 
