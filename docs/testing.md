@@ -254,8 +254,10 @@ content. Change them together.
 
 To boot a container image as the guest root filesystem instead, stage
 one and run the `container` mode. The image is exported read-only and
-the guest supplies a tmpfs upper layer through overlayfs, so the run
-also checks afterwards that nothing reached the host export:
+the guest supplies a tmpfs upper layer through overlayfs. After the run
+the script probes the host export for two guest writes, a new file and a
+copy-up of `/etc/hostname`. That is two probes, not a comparison of the
+whole export against its staged state:
 
 ```bash
 tools/virtiofs-container-stage.sh alpine:3.21
@@ -263,9 +265,10 @@ ssh -i $VMM_FIREHYVE_KEY $VMM_FIREHYVE_HOST /var/tmp/virtiofs-test/virtiofs-run.
 ```
 
 The share holds `rootfs/` and `container.json`, the latter derived from
-the image's own OCI config at stage time, so the container cannot see or
-alter what it was told to run. `container` runs the harness checks
-inside the image; `entrypoint` runs the image's own command instead:
+the image's own OCI config at stage time. `container.json` sits outside
+`rootfs/`, so it is not inside the container's root, and the share is
+exported read-only. `container` runs the harness checks inside the
+image; `entrypoint` runs the image's own command instead:
 
 ```bash
 tools/virtiofs-container-stage.sh hello-world
@@ -282,9 +285,9 @@ so one boot covers all three devices. The vsock check dials host port
 script starts on `<socket>_5555`, which exercises both directions and
 the guest-initiated connect path. The bulk case pushes 512 KiB through,
 which is larger than one RX chain and larger than a connection's credit
-window, so it only passes if splitting, credit and backpressure all
-work. Run it repeatedly: the ordering defect it caught failed roughly
-one run in four.
+window, so it exercises splitting, credit and backpressure. A pass is
+not proof that all three are correct: the ordering defect this case
+caught failed only about one run in four. Run it repeatedly.
 
 ### Guest kernel comparison
 
@@ -453,10 +456,23 @@ an untimed `cv_wait`, and process exit then waits for that LWP.
 `FEATURES_TODO.md` holds the kernel detail; this section is what to run
 and what to look for.
 
-**What this does and does not show.** The shipped configuration cannot
-park a lease: illumos defaults viona TX to copying, so viona loans no
-guest memory and its ring worker always reaches the lease check. The
-steps below turn loaning on and then delay the frame release, which
+**What this does and does not show.** The shipped configuration excludes
+one wait, not every wait. illumos defaults `viona_default_tx_copy` to
+`B_TRUE`, and this VMM never calls `VNA_IOC_SET_PARAMS`, so a TX ring
+allocates no desb handles, `vr_xfer_outstanding` stays zero, and
+`viona_tx_wait_outstanding` (`viona_tx.c`) returns immediately. That
+wait is the one the steps below use, and it is the only way a lease has
+been shown to park.
+
+Three things stay unshown. Any other path that keeps a ring worker away
+from its `vmm_drv_lease_expired()` check holds the lease the same way,
+and copying TX data says nothing about those paths. viona is not the
+only `vmm_drv` consumer, and `vmm_lease_block` waits for every lease in
+the list whoever signed it. `viona_default_tx_copy` is a writable
+global, so a link created while it is clear loans guest memory. Read the
+claim as "the known wait is excluded", not as "no lease can park".
+
+The steps below turn loaning on and then delay the frame release, which
 reproduces the VMM half: the destroy budget expiring, the log lines, and
 the parked thread. They do not park it forever. DTrace `chill()` is
 capped at 500 ms per CPU per second (`dtrace_chill_max`,
