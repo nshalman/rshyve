@@ -84,14 +84,35 @@ impl VirtioCompletion {
 
     /// Complete one request: write used entry, raise interrupt if needed.
     ///
-    /// When `event_idx` is negotiated, reads `avail_event` from the
-    /// guest to determine if an interrupt is needed. This suppresses
-    /// redundant interrupts: the guest only wants an interrupt when
-    /// the device has completed past the index the guest last saw.
-    ///
     /// Safe from any thread (vCPU inline path or I/O worker).
     #[inline]
     pub fn complete(&self, desc_idx: u16, len: u32) {
+        if self.publish(desc_idx, len) {
+            self.signal();
+        }
+    }
+
+    /// Complete a batch: write all entries, one interrupt if needed.
+    pub fn complete_batch(&self, entries: &[(u16, u32)]) {
+        if self.publish_batch(entries) {
+            self.signal();
+        }
+    }
+
+    /// Publish one used entry and report whether the guest wants an
+    /// interrupt.
+    ///
+    /// Every step here touches guest memory: the used entry, the used
+    /// index, and the driver's interrupt-suppression fields. A device
+    /// that guards guest access must hold that permission across the
+    /// whole call, and must leave [`Self::signal`] outside it.
+    ///
+    /// When `event_idx` is negotiated, reads `used_event` from the
+    /// guest to determine if an interrupt is needed. This suppresses
+    /// redundant interrupts: the guest only wants an interrupt when
+    /// the device has completed past the index the guest last saw.
+    #[inline]
+    pub fn publish(&self, desc_idx: u16, len: u32) -> bool {
         let old_idx;
         let new_idx;
         {
@@ -100,20 +121,16 @@ impl VirtioCompletion {
             self.write_used_entry(&mut idx, desc_idx, len);
             new_idx = *idx;
         }
-
-        if self.should_interrupt(old_idx, new_idx) {
-            (self.interrupt)();
-        }
+        self.should_interrupt(old_idx, new_idx)
     }
 
-    /// Complete a batch: write all entries, one interrupt if needed.
+    /// Publish a batch of used entries and report whether the guest
+    /// wants an interrupt.
     ///
     /// The Mutex is held across all writes so no thread can interleave.
-    /// With event_idx, the interrupt is only raised if the guest
-    /// needs notification based on the avail_event threshold.
-    pub fn complete_batch(&self, entries: &[(u16, u32)]) {
+    pub fn publish_batch(&self, entries: &[(u16, u32)]) -> bool {
         if entries.is_empty() {
-            return;
+            return false;
         }
         let old_idx;
         let new_idx;
@@ -125,9 +142,19 @@ impl VirtioCompletion {
             }
             new_idx = *idx;
         }
-        if self.should_interrupt(old_idx, new_idx) {
-            (self.interrupt)();
-        }
+        self.should_interrupt(old_idx, new_idx)
+    }
+
+    /// Raise the interrupt a publish asked for.
+    ///
+    /// Kept apart from publishing so a device can deliver outside the
+    /// permission that wrote the ring. Delivery can block, and VirtIO
+    /// 1.3 sec 2.4.1 forbids queue interaction once a reset is
+    /// complete, so such a device must also check its own session
+    /// here.
+    #[inline]
+    pub fn signal(&self) {
+        (self.interrupt)();
     }
 
     /// Force the next N completions to always fire an interrupt,
