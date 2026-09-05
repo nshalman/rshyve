@@ -39,6 +39,35 @@ fn park_at_backend(ctx: &WorkerCtx) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
     (reached, release)
 }
 
+/// Hold the raising thread inside the interrupt callback.
+///
+/// Returns the flag that reports the raise and the flag that lets it
+/// go. This stands in for an injection the kernel has not finished.
+fn park_in_the_interrupt(
+    blk: &VirtioBlock,
+) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+    let raised = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let hook_raised = Arc::clone(&raised);
+    let hook_release = Arc::clone(&release);
+    *blk.interrupt.lock().expect("interrupt lock") =
+        Some(Arc::new(move || {
+            hook_raised.store(true, Ordering::Release);
+            while !hook_release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }));
+    (raised, release)
+}
+
+/// A one-request WRITE_ZEROES ring the worker completes on its own.
+fn worker_harness() -> DwzHarness {
+    dwz_harness(&DwzCase {
+        segs: &[encode_seg(0, 8, 0)],
+        ..Default::default()
+    })
+}
+
 /// A one-request WRITE ring on an eight-sector disk.
 fn write_harness(payload: &[u8]) -> DwzHarness {
     dwz_harness(&DwzCase {
@@ -183,6 +212,138 @@ fn a_syscall_outlives_the_device_that_started_it() {
             backing.read_exact_at(&mut head, 0).is_ok()
                 && head.iter().all(|&b| b == 0xAA)
         },
+    );
+}
+
+// Injection is a call into the kernel, so its latency is not ours to
+// bound, and the reset runs on the vCPU that wrote DEVICE_STATUS. The
+// illumos driver reclaims the ring the moment that write returns, so
+// the reset must not be able to queue behind an injection. Measured at
+// the whole reset, not at the drain alone: the wait used to sit after
+// the drain and a test pointed at the drain could not see it.
+#[test]
+fn a_reset_does_not_wait_for_interrupt_injection() {
+    let mut h = worker_harness();
+    let (raised, release) = park_in_the_interrupt(&h.block);
+
+    h.block.notify_queue(0, &mut h.queues, &h.physmap);
+    wait_for("the worker never raised the interrupt", || {
+        raised.load(Ordering::Acquire)
+    });
+
+    // The reset runs on another thread under a deadline. One that waits
+    // on the injection is waiting for a park only this thread releases,
+    // so waiting for it here would hang the run instead of failing it.
+    let done = Arc::new(AtomicBool::new(false));
+    let waited = {
+        let block = &h.block;
+        let finished = Arc::clone(&done);
+        let release = Arc::clone(&release);
+        thread::scope(move |s| {
+            s.spawn(move || {
+                VirtioDevice::reset(block);
+                finished.store(true, Ordering::Release);
+            });
+            let start = Instant::now();
+            while !done.load(Ordering::Acquire)
+                && start.elapsed() < RESET_BUDGET
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let waited = start.elapsed();
+            // Let a reset that should not have waited finish, so the
+            // scope joins it rather than parking on it.
+            release.store(true, Ordering::Release);
+            waited
+        })
+    };
+
+    assert!(
+        waited < RESET_BUDGET,
+        "the reset waited {waited:?} behind an interrupt injection"
+    );
+}
+
+// The notify path runs under the transport's register lock, and a
+// reset on another vCPU has to take that lock before it can start. So
+// an interrupt injected here would put a call into the kernel on the
+// reset's path. The device asks the transport to raise it instead: the
+// transport drops the lock first.
+#[test]
+fn the_notify_path_hands_the_interrupt_to_the_transport() {
+    let (physmap, queue, blk) = make_get_id_queue(8, 5);
+    let mut queues = [queue];
+    let raised = Arc::new(AtomicBool::new(false));
+    {
+        let raised = Arc::clone(&raised);
+        *blk.interrupt.lock().expect("interrupt lock") =
+            Some(Arc::new(move || raised.store(true, Ordering::Release)));
+    }
+
+    let asked = blk.notify_queue(0, &mut queues, &physmap);
+
+    assert_eq!(
+        queues[0].read_used_ring_idx(&physmap),
+        5,
+        "the inline requests did not complete"
+    );
+    assert!(asked, "the transport was not asked to raise the interrupt");
+    assert!(
+        !raised.load(Ordering::Acquire),
+        "the notify path injected an interrupt under the transport lock"
+    );
+}
+
+// The other half of abandoning an injection. A reset cannot take back
+// a call already inside the kernel, so it must stop the raises that
+// have not started: VirtIO 1.3 sec 2.4.1 forbids queue interaction once
+// a reset is complete, and the next driver would see an assertion for
+// a ring it never used.
+#[test]
+fn an_old_session_interrupt_is_dropped_after_the_reset_returns() {
+    let mut h = worker_harness();
+
+    let raised = Arc::new(AtomicBool::new(false));
+    {
+        let raised = Arc::clone(&raised);
+        *h.block.interrupt.lock().expect("interrupt lock") =
+            Some(Arc::new(move || raised.store(true, Ordering::Release)));
+    }
+
+    // Hold the worker between the publication and the raise. That is
+    // the gap a reset overtakes.
+    let at_raise = Arc::new(AtomicBool::new(false));
+    let past_raise = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    {
+        let reached = Arc::clone(&at_raise);
+        let passed = Arc::clone(&past_raise);
+        let release = Arc::clone(&release);
+        *h.block.ctx.parks.before_raise.lock().expect("park lock") =
+            Some(Arc::new(move || {
+                reached.store(true, Ordering::Release);
+                while !release.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                passed.store(true, Ordering::Release);
+            }));
+    }
+
+    h.block.notify_queue(0, &mut h.queues, &h.physmap);
+    wait_for("the worker never reached the raise", || {
+        at_raise.load(Ordering::Acquire)
+    });
+
+    VirtioDevice::reset(&h.block);
+    release.store(true, Ordering::Release);
+    wait_for("the worker never left the park", || {
+        past_raise.load(Ordering::Acquire)
+    });
+    thread::sleep(LONG_ENOUGH);
+
+    assert!(
+        !raised.load(Ordering::Acquire),
+        "an interrupt for the session the reset ended reached the driver"
     );
 }
 
@@ -485,7 +646,6 @@ fn an_interrupt_from_a_closed_session_is_dropped() {
     let stale = access.enter_current().expect("a session is open").epoch();
     let fresh = access.close();
     access.drain();
-    access.settle_interrupts();
     access.reopen();
 
     let fired = AtomicBool::new(false);

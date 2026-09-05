@@ -589,7 +589,6 @@ fn end_session(ctx: &WorkerCtx) -> u64 {
     let epoch = ctx.access.close();
     ctx.backend.retire(epoch);
     ctx.access.drain();
-    ctx.access.settle_interrupts();
     ctx.access.reopen();
     epoch
 }

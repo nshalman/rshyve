@@ -25,10 +25,6 @@ pub(super) struct GuestAccess {
     /// names a ring the driver has since freed.
     epoch: AtomicU64,
     lock: RwLock<()>,
-    /// Orders interrupt delivery against the reset that ends the
-    /// session the interrupt belongs to. Shared, so queues still
-    /// deliver in parallel.
-    intr: RwLock<()>,
 }
 
 /// Permission held across one guest-memory access.
@@ -54,7 +50,6 @@ impl GuestAccess {
             open: AtomicBool::new(true),
             epoch: AtomicU64::new(0),
             lock: RwLock::new(()),
-            intr: RwLock::new(()),
         }
     }
 
@@ -102,13 +97,6 @@ impl GuestAccess {
         drop(self.lock.write().unwrap_or_else(PoisonError::into_inner));
     }
 
-    /// Wait for the interrupts the closed session had already decided
-    /// to raise. VirtIO 1.3 sec 2.4.1 forbids queue interaction once a
-    /// reset is complete.
-    pub(super) fn settle_interrupts(&self) {
-        drop(self.intr.write().unwrap_or_else(PoisonError::into_inner));
-    }
-
     /// Admit the next driver.
     pub(super) fn reopen(&self) {
         self.open.store(true, Ordering::Release);
@@ -117,11 +105,21 @@ impl GuestAccess {
     /// Raise an interrupt, unless the session that asked for it is
     /// gone.
     ///
-    /// The gate makes the session check and the delivery one step
-    /// against [`Self::settle_interrupts`], so the raise reaches the
-    /// driver it was meant for or does not happen.
+    /// The check is one load, and the raise holds nothing a reset
+    /// takes. Delivery is a call into the kernel, whose latency is
+    /// not ours to bound, and [`Self::close`] runs on the vCPU that
+    /// wrote DEVICE_STATUS. So a reset ends the session and abandons
+    /// the raises already past this point rather than waiting for
+    /// them.
+    ///
+    /// Abandoning them is safe here because a queue interrupt carries
+    /// no state. Every byte it reports was written inside a session
+    /// that [`Self::drain`] does wait for, so a late raise only tells
+    /// a driver that is tearing the ring down to look at a ring it
+    /// has stopped reading. The one mark it can leave is the ISR bit
+    /// and the INTx level, which belong to the transport and are the
+    /// transport's to gate against its own reset.
     pub(super) fn deliver(&self, epoch: u64, raise: impl FnOnce()) {
-        let _gate = self.intr.read().unwrap_or_else(PoisonError::into_inner);
         if self.epoch.load(Ordering::Acquire) != epoch {
             return;
         }

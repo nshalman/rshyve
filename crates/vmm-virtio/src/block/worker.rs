@@ -56,6 +56,9 @@ pub(super) struct WorkerParks {
     /// Reached with the guest side of a pass finished and its used
     /// entries not yet published.
     pub(super) before_publish: ParkSlot,
+    /// Reached with the used entries published and the interrupt for
+    /// them not yet raised.
+    pub(super) before_raise: ParkSlot,
 }
 
 /// Run a park point, if a test installed one, and clear it.
@@ -240,6 +243,8 @@ fn publish(
         };
         completion.publish_batch(done)
     };
+    #[cfg(test)]
+    run_park(&ctx.parks.before_raise);
     if raise {
         ctx.access.deliver(epoch, || completion.signal());
     }

@@ -490,6 +490,14 @@ impl VirtioDevice for VirtioBlock {
     /// backing-store call, so a reset waiting for it waits for ring
     /// walks and short memory copies, bounded by the queue size.
     ///
+    /// The return value asks the transport to raise the interrupt,
+    /// rather than raising it here. This runs under the transport's
+    /// register lock, and a reset on another vCPU has to take that
+    /// lock before it can start, so an interrupt injected here would
+    /// put a call into the kernel on the reset's path. The transport
+    /// drops the lock first. Workers raise their own completions:
+    /// they hold no transport lock.
+    ///
     /// EVENT_IDX re-check loop (VirtIO 1.3 sec 2.7.10):
     /// After draining the ring and writing `used_event`, re-read
     /// `avail_idx`. If the guest added entries during the race
@@ -585,18 +593,13 @@ impl VirtioDevice for VirtioBlock {
         ));
 
         let raise = completion.publish_batch(&finished);
-        // The interrupt leaves the session behind: delivery can block,
-        // and a reset must never wait for it.
         drop(session);
-        if raise {
-            self.ctx.access.deliver(epoch, || completion.signal());
-        }
 
         for (head, header, chain) in requests {
             self.dispatch(queue_idx, epoch, &completion, head, &header, chain);
         }
 
-        false // completions are published here and by the workers
+        raise
     }
 
     fn process_queue(
@@ -620,9 +623,14 @@ impl VirtioDevice for VirtioBlock {
     /// buffers. So this is synchronous.
     ///
     /// It is safe to run synchronously because it does not wait for the
-    /// disk. Admission closes, the epoch ends, and the wait covers the
+    /// disk, and it does not wait for interrupt delivery either.
+    /// Admission closes, the epoch ends, and the wait covers the
     /// guest-memory sections alone. Each of those is a bounded copy or
     /// ring walk, so the wait needs no deadline and has none.
+    ///
+    /// Ending the epoch stops any further raise for the old session.
+    /// A raise already past that check is abandoned, not waited for:
+    /// injection is a call into the kernel, and this runs on a vCPU.
     fn reset(&self) {
         // Close admission before the drain. A section refused before it
         // takes the lock never queues on it, and `std::sync::RwLock`
@@ -635,7 +643,6 @@ impl VirtioDevice for VirtioBlock {
         // end, and the next session's I/O waits behind them.
         self.ctx.backend.retire(epoch);
         self.ctx.access.drain();
-        self.ctx.access.settle_interrupts();
 
         *self.negotiated_features.lock().expect("lock") = 0;
         for slot in self.completions.lock().expect("lock").iter_mut() {
