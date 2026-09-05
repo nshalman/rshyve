@@ -172,10 +172,17 @@ impl VirtioCompletion {
     ///
     /// Without event_idx: always interrupt (no suppression).
     fn should_interrupt(&self, old_idx: u16, new_idx: u16) -> bool {
-        // Force-interrupt mode: always fire for the first N completions
-        let force = self.force_intr_count.load(Ordering::Acquire);
-        if force > 0 {
-            self.force_intr_count.fetch_sub(1, Ordering::AcqRel);
+        // Force-interrupt mode: always fire for the first N completions.
+        // Claimed with one read-modify-write, because two threads that
+        // both read the last count and both subtract it wrap the
+        // counter to u32::MAX and force every completion after that.
+        let forced = self
+            .force_intr_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                n.checked_sub(1)
+            })
+            .is_ok();
+        if forced {
             return true;
         }
         if !self.event_idx {
@@ -236,6 +243,74 @@ impl VirtioCompletion {
         if let Some(sub) = self.physmap.lookup(idx_gpa, 2) {
             // write to guest memory; no recovery if unmapped
             let _ = sub.write::<u16>(idx);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    use super::*;
+
+    const AVAIL_GPA: u64 = 0x1100;
+    const QUEUE_SIZE: u16 = 8;
+    const RACERS: usize = 8;
+    const FORCED: u32 = 4;
+
+    /// A completion for a ring whose driver has pushed `used_event`
+    /// out of reach, so only the force counter can ask for an
+    /// interrupt.
+    fn suppressed(physmap: &Arc<PhysMap>) -> Arc<VirtioCompletion> {
+        let mut queue = VirtQueue::new(QUEUE_SIZE);
+        queue.set_addr_modern(0x1000, AVAIL_GPA, 0x1200);
+        queue.set_event_idx(true);
+        physmap
+            .lookup(AVAIL_GPA + 4 + u64::from(QUEUE_SIZE) * 2, 2)
+            .expect("mapped used_event")
+            .write::<u16>(&60_000)
+            .expect("write used_event");
+        VirtioCompletion::new(&queue, Arc::clone(physmap), || {})
+    }
+
+    // Threads can read the same forced count and each subtract it. A
+    // plain subtract then wraps the counter to u32::MAX and the device
+    // forces an interrupt for every completion after that, so the
+    // guest loses EVENT_IDX suppression on a ring it asked to keep
+    // quiet. N counts must force N interrupts and no more.
+    #[test]
+    fn a_race_cannot_force_more_interrupts_than_were_asked_for() {
+        let physmap =
+            Arc::new(PhysMap::new_anon(0x1000, 0x1000).expect("queue memory"));
+        let completion = suppressed(&physmap);
+
+        for round in 0..512 {
+            completion.set_force_interrupt(FORCED);
+            let forced = AtomicUsize::new(0);
+            let ready = AtomicUsize::new(0);
+            let go = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                for _ in 0..RACERS {
+                    s.spawn(|| {
+                        ready.fetch_add(1, Ordering::Release);
+                        while !go.load(Ordering::Acquire) {
+                            std::hint::spin_loop();
+                        }
+                        if completion.should_interrupt(0, 1) {
+                            forced.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+                while ready.load(Ordering::Acquire) < RACERS {
+                    std::hint::spin_loop();
+                }
+                go.store(true, Ordering::Release);
+            });
+            let n = forced.load(Ordering::Relaxed);
+            assert_eq!(
+                n, FORCED as usize,
+                "round {round} forced {n} interrupts, not {FORCED}"
+            );
         }
     }
 }
