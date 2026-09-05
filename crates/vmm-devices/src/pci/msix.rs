@@ -405,12 +405,10 @@ fn take_pending(inner: &mut MsixInner, idx: usize) -> Option<(u64, u64)> {
 /// Take every message the PBA is holding that can be sent now.
 ///
 /// Walks the set bits, not the whole table, so a guest that toggles the
-/// function mask pays for what it left pending and nothing more.
+/// function mask pays for what it left pending and nothing more. The
+/// enable and mask tests live in `take_pending` alone: both run under
+/// the one borrow, so a second copy here can never disagree with it.
 fn drain_pending(inner: &mut MsixInner) -> Vec<(u64, u64)> {
-    if !inner.enabled || inner.func_masked {
-        return Vec::new();
-    }
-
     let mut messages = Vec::new();
     for word in 0..inner.pba.len() {
         let mut bits = inner.pba[word];
