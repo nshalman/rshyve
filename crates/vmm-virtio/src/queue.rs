@@ -211,6 +211,11 @@ impl VirtQueue {
     /// when to raise an interrupt. This dramatically reduces VM exits
     /// for high-throughput workloads.
     pub fn set_event_idx(&mut self, enabled: bool) {
+        // The feature adds the suppression word to what the device
+        // reads, so a cached verdict was taken against a shorter ring.
+        if self.event_idx != enabled {
+            self.addrs_ok = None;
+        }
         self.event_idx = enabled;
     }
 

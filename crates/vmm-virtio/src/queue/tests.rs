@@ -527,6 +527,29 @@ fn the_suppression_field_must_be_mapped_under_event_idx() {
     ));
 }
 
+/// The verdict is cached, and negotiating EVENT_IDX moves what the
+/// device reads, so the cache has to be dropped with it. A guest that
+/// writes DRIVER_FEATURE after QUEUE_ENABLE would otherwise keep a
+/// verdict taken without the suppression field, and the transport
+/// would never be told to refuse the queue.
+#[test]
+fn negotiating_event_idx_rechecks_a_ring_already_accepted() {
+    let avail = RING_GPA + RING_BYTES as u64 - 4 - u64::from(RING_DESCS) * 2;
+    let (physmap, mut queue) = posted_queue(RING_GPA, avail, RING_GPA + 0x200);
+
+    // The first pop caches the verdict the transport later reads.
+    assert_eq!(queue.pop_avail(&physmap), Some(0));
+    assert!(!queue.needs_reset());
+
+    queue.set_event_idx(true);
+
+    assert_eq!(queue.pop_avail(&physmap), None);
+    assert!(
+        queue.needs_reset(),
+        "the queue kept a verdict taken before the feature moved its reach"
+    );
+}
+
 /// The legacy PFN layout must pass the same check: it is what the
 /// bhyve guests in the field program, and EVENT_IDX is stripped from
 /// that transport, so the rings carry no suppression field.
