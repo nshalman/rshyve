@@ -365,7 +365,15 @@ fn a_host_connect_over_the_cap_is_closed() {
     }
 
     let (peer, device_end) = UnixStream::pair().expect("socketpair");
-    start_host_connection(Arc::clone(&vsock.shared), device_end, 9999);
+    // Armed before the call: macOS refuses the option once the far end
+    // has closed. The call runs on its own thread, because a device
+    // that ignored the refusal goes on to stream and never returns.
+    peer.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("arm the read timeout");
+    let shared = Arc::clone(&vsock.shared);
+    let serving = std::thread::spawn(move || {
+        start_host_connection(shared, device_end, 9999)
+    });
 
     let mut answer = String::new();
     io::BufReader::new(peer)
@@ -381,6 +389,7 @@ fn a_host_connect_over_the_cap_is_closed() {
         .is_empty());
 
     vsock.halt();
+    serving.join().expect("join the connect thread");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -399,11 +408,18 @@ fn a_wedged_reader_does_not_hold_halt_open() {
         }
     }));
 
-    let start = std::time::Instant::now();
-    vsock.halt();
-    let waited = start.elapsed();
+    // halt runs on its own thread: a budget that does not bound the
+    // join blocks for ever, and this must report that rather than hang.
+    let (done, ended) = std::sync::mpsc::channel();
+    let halting = std::thread::spawn(move || {
+        vsock.halt();
+        let _ = done.send(());
+        vsock
+    });
+    let ended = ended.recv_timeout(HALT_BUDGET * 3).is_ok();
 
     release.store(true, Ordering::Release);
-    assert!(waited < HALT_BUDGET * 3, "halt waited {waited:?}");
+    halting.join().expect("join the halt thread");
+    assert!(ended, "halt did not return within its budget");
     let _ = std::fs::remove_dir_all(&dir);
 }

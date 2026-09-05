@@ -94,6 +94,11 @@ fn reset_keeps_a_migration_pause() {
 // A reset installs a fresh VirtioCompletion, so a batch that spans one
 // would publish live completions through the ring the guest just freed.
 // The worker must hand the request back and start a new batch instead.
+//
+// The batch drain is the half the top of the worker loop does not cover:
+// a stale request reached there would issue its syscall before anything
+// looked at the epoch, and a read writes disk data straight into the
+// pages the driver has recycled.
 #[test]
 fn a_worker_batch_does_not_span_a_reset() {
     const DESC_A: u64 = 0x1000;
@@ -104,6 +109,9 @@ fn a_worker_batch_does_not_span_a_reset() {
     const USED_B: u64 = 0x1500;
     const HDR_GPA: u64 = 0x2000;
     const STATUS_GPA: u64 = 0x2100;
+    /// Stands in for a page the driver freed and the guest reused.
+    const RECYCLED_GPA: u64 = 0x2200;
+    const SECTOR: usize = 512;
 
     let physmap =
         Arc::new(PhysMap::new_anon(0x1000, 0x2000).expect("queue memory"));
@@ -148,6 +156,30 @@ fn a_worker_batch_does_not_span_a_reset() {
             completion: Arc::clone(completion),
             epoch,
         };
+    // The stale one is a read, so running it is visible in guest memory
+    // rather than only on the used ring.
+    let stale_read =
+        |head, completion: &Arc<VirtioCompletion>, epoch| BlkIoRequest {
+            rtype: bits::VIRTIO_BLK_T_IN,
+            sector: 0,
+            chain: vec![
+                ChainBuf::Readable {
+                    addr: HDR_GPA,
+                    len: BLK_REQ_HEADER_SIZE as u32,
+                },
+                ChainBuf::Writable {
+                    addr: RECYCLED_GPA,
+                    len: SECTOR as u32,
+                },
+                ChainBuf::Writable {
+                    addr: STATUS_GPA,
+                    len: 1,
+                },
+            ],
+            head,
+            completion: Arc::clone(completion),
+            epoch,
+        };
 
     // Epoch 1 is current; the middle request predates the reset.
     let ctx = WorkerCtx {
@@ -158,11 +190,14 @@ fn a_worker_batch_does_not_span_a_reset() {
     };
     let (tx, rx) = mpsc::channel();
     tx.send(request(0, &live, 1)).expect("send live");
-    tx.send(request(1, &stale, 0)).expect("send stale");
+    tx.send(stale_read(1, &stale, 0)).expect("send stale");
     tx.send(request(2, &live, 1)).expect("send live");
     drop(tx);
 
-    let file = tempfile::tempfile().expect("create tempfile");
+    // Disk content the stale read would land in the recycled page.
+    let mut file = tempfile::tempfile().expect("create tempfile");
+    std::io::Write::write_all(&mut file, &[0xAB; SECTOR])
+        .expect("fill the backing file");
     let fd = file.as_raw_fd();
     let limits = DiskLimits {
         capacity: 1,
@@ -192,6 +227,17 @@ fn a_worker_batch_does_not_span_a_reset() {
         live_queue.read_used_ring_idx(&physmap),
         2,
         "the requests either side of the stale one must both complete"
+    );
+
+    let mut recycled = [0u8; SECTOR];
+    physmap
+        .lookup(RECYCLED_GPA, SECTOR)
+        .expect("mapped recycled page")
+        .read_bytes(&mut recycled)
+        .expect("read the recycled page");
+    assert_eq!(
+        recycled, [0u8; SECTOR],
+        "the stale read ran and wrote disk data into a recycled page"
     );
 }
 

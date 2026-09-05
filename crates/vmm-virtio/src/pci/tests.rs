@@ -1326,3 +1326,33 @@ fn a_legacy_pfn_inside_guest_memory_is_accepted() {
         dev.virtio_state.lock().expect("virtio lock").queues[0].is_configured()
     );
 }
+
+/// A queue programmed outside the enable path, which is what a
+/// migration restore does, is only checked when the device first reads
+/// the ring. It can do no work after that, so the driver has to be told
+/// rather than left waiting on a queue that answers nothing.
+#[test]
+fn a_queue_that_refuses_its_rings_on_first_use_raises_needs_reset() {
+    use vmm_core::common::WriteOp;
+    let dev = device_with_ram();
+    {
+        let mut vs = dev.virtio_state.lock().expect("virtio lock");
+        // Past the mapped 16 KiB, so every ring access fails.
+        vs.queues[0].set_addr_modern(
+            RING_GPA + 0x3000,
+            RING_GPA + 0x3800,
+            RING_GPA + 0x3C00,
+        );
+        vs.queue_enabled[0] = true;
+        vs.status = bits::STATUS_DRIVER_OK;
+    }
+
+    let wo = WriteOp::from_buf(&0u32.to_le_bytes());
+    dev.bar_rw(BarN::BAR2, 0x2000, RWOp::Write(&wo));
+
+    assert_ne!(
+        device_status(&dev) & bits::STATUS_DEVICE_NEEDS_RESET,
+        0,
+        "the driver was never told the queue had stopped",
+    );
+}

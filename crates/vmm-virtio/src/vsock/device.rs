@@ -861,8 +861,16 @@ impl Lifecycle for VirtioVsock {
         // wakes it so it sees the flag; without this the join below
         // waits for a client that may never come.
         let _ = UnixStream::connect(&self.shared.socket_path);
+        // Bounded for the same reason the readers are: if that connect
+        // did not land, the accept thread is still blocked in accept()
+        // and joining it has no end.
         if let Some(handle) = self.accept.lock().expect("accept lock").take() {
-            let _ = handle.join();
+            if !vmm_core::thread::join_bounded(vec![handle], HALT_BUDGET) {
+                debug!(
+                    self.shared.log,
+                    "virtio-vsock halt left the accept thread running"
+                );
+            }
         }
 
         // Shutting every socket down wakes the readers blocked on

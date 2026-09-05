@@ -218,6 +218,10 @@ pub struct VirtioPciDevice<D: VirtioDevice> {
     self_ref: Mutex<Option<std::sync::Weak<Self>>>,
     /// Structured logger for bus registration diagnostics.
     log: slog::Logger,
+    /// Set once a refused queue has been reported at `warn`. The write
+    /// that refuses is guest driven and repeatable, so the rest go to
+    /// `debug`.
+    queue_refusal_reported: std::sync::atomic::AtomicBool,
     /// Capability chain offsets in PCI config space.
     cap_offsets: CapOffsets,
     /// Size of device-specific config region (for cap advertisement).
@@ -374,6 +378,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             registered_bar4: Mutex::new(None),
             self_ref: Mutex::new(None),
             log,
+            queue_refusal_reported: std::sync::atomic::AtomicBool::new(false),
             cap_offsets,
             dev_config_size,
             num_queues: num_queues as u16,
@@ -1150,8 +1155,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// Consumes the transport lock so the caller cannot hold it across
     /// the interrupt, and does nothing once the device already carries
     /// DEVICE_NEEDS_RESET: the write that reaches here is guest driven
-    /// and can be repeated without limit, so neither the log nor the
-    /// interrupt may be raised per write.
+    /// and can be repeated without limit, so the interrupt must not be
+    /// raised per write. The reason is reported once per device for the
+    /// same reason: a guest can reset and reprogram in a loop, and the
+    /// second report says nothing the first did not.
     fn refuse_queue(
         &self,
         vs: std::sync::MutexGuard<'_, VirtioPciState>,
@@ -1163,8 +1170,16 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         }
         drop(vs);
         if let Some(error) = error {
-            slog::warn!(self.log, "virtio-pci refused a queue";
-                "queue" => idx, "reason" => %error);
+            let first = !self
+                .queue_refusal_reported
+                .swap(true, std::sync::atomic::Ordering::Relaxed);
+            if first {
+                slog::warn!(self.log, "virtio-pci refused a queue";
+                    "queue" => idx, "reason" => %error);
+            } else {
+                slog::debug!(self.log, "virtio-pci refused a queue";
+                    "queue" => idx, "reason" => %error);
+            }
         }
         self.signal_device_needs_reset();
     }
