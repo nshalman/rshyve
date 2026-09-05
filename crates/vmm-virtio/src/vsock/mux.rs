@@ -169,17 +169,42 @@ impl VsockMux {
     /// Returns false when the table is at [`MAX_CONNS`]. Nothing is
     /// registered and the guest is not told, so the caller has to close
     /// the peer's socket: no answer will ever come for it.
+    ///
+    /// A caller that must write to the host socket first takes the two
+    /// steps apart: [`Self::reserve_host_connect`], then its own write,
+    /// then [`Self::announce_host_connect`].
     pub fn start_host_connect(&self, key: ConnKey) -> bool {
-        {
-            let mut conns = self.conns.lock().expect("conns lock");
-            // Replacing a key the table already holds does not grow it.
-            if conns.len() >= MAX_CONNS && !conns.contains_key(&key) {
-                return false;
-            }
-            conns.insert(key, VsockConn::new(State::Connecting));
+        if !self.reserve_host_connect(key) {
+            return false;
         }
-        self.push_rx(RxPacket::control(self.hdr_for(key, OP_REQUEST)));
+        self.announce_host_connect(key);
         true
+    }
+
+    /// Take a slot for a host-initiated connection, without telling the
+    /// guest about it.
+    ///
+    /// The guest cannot reach the connection until
+    /// [`Self::announce_host_connect`] queues its REQUEST, so the caller
+    /// owns the host socket alone until then. Returns false when the
+    /// table is at [`MAX_CONNS`].
+    pub fn reserve_host_connect(&self, key: ConnKey) -> bool {
+        let mut conns = self.conns.lock().expect("conns lock");
+        // Replacing a key the table already holds does not grow it.
+        if conns.len() >= MAX_CONNS && !conns.contains_key(&key) {
+            return false;
+        }
+        conns.insert(key, VsockConn::new(State::Connecting));
+        true
+    }
+
+    /// Tell the guest about a slot taken by
+    /// [`Self::reserve_host_connect`].
+    ///
+    /// From this point any thread's `deliver_rx` may hand the REQUEST to
+    /// the guest, so the caller must have finished with the host socket.
+    pub fn announce_host_connect(&self, key: ConnKey) {
+        self.push_rx(RxPacket::control(self.hdr_for(key, OP_REQUEST)));
     }
 
     /// Header addressed from the host side of `key` to the guest.

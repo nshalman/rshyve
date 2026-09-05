@@ -350,6 +350,71 @@ fn a_finished_reader_is_reaped_when_the_next_one_starts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Fill the `stream` -> peer direction, so the next write has nowhere
+/// to put its bytes and `POLLOUT` stays clear.
+///
+/// The fill is itself bounded, so it ends on its own budget once the
+/// socket stops taking bytes.
+fn fill_send_buffer(stream: &UnixStream) {
+    // Larger than any default socket buffer, so the write cannot
+    // finish and leave room behind it.
+    let oversized = vec![0u8; 8 * 1024 * 1024];
+    write_all_bounded(stream, &oversized, HOST_WRITE_TIMEOUT)
+        .expect_err("the peer reads nothing, so the socket must fill");
+}
+
+/// The OK line and the REQUEST cannot be reordered.
+///
+/// Once the REQUEST is queued, any thread's `deliver_rx` can hand it to
+/// the guest, the guest can answer and send payload, and a vCPU can
+/// then be inside `write_host` on this same socket. The handshake write
+/// has to be finished by then, or the two writers interleave and break
+/// the framing.
+///
+/// A peer that cannot take the OK line is how that order is read from
+/// outside: if the write comes first, the guest is never told at all.
+#[test]
+fn a_host_peer_hears_ok_before_the_guest_hears_the_request() {
+    use std::sync::mpsc;
+
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    // Held open to the end: a closed peer would end the write on a
+    // broken pipe, which is not the case under test.
+    let (peer, device_end) = UnixStream::pair().expect("socketpair");
+    fill_send_buffer(&device_end);
+
+    let shared = Arc::clone(&vsock.shared);
+    let (done_tx, done_rx) = mpsc::channel();
+    let serving = std::thread::spawn(move || {
+        start_host_connection(shared, device_end, 9999);
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the handshake write must end on its budget");
+
+    assert!(
+        vsock.shared.mux.rx_is_empty(),
+        "the guest was told about a connection whose peer never got its OK"
+    );
+    assert_eq!(
+        vsock.shared.mux.conn_count(),
+        0,
+        "the slot was not released"
+    );
+    assert!(vsock
+        .shared
+        .sockets
+        .lock()
+        .expect("sockets lock")
+        .is_empty());
+
+    drop(peer);
+    vsock.halt();
+    serving.join().expect("join the connect thread");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The mux refuses a connection over the cap and registers nothing, so
 /// the device has to close the peer rather than leave it holding a
 /// socket and a thread for an answer that is never coming.

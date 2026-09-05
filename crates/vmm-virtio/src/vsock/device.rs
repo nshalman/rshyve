@@ -17,7 +17,7 @@
 //! already solves the same shape this way.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -451,9 +451,14 @@ fn handle_host_connect(shared: Arc<VsockShared>, mut stream: UnixStream) {
         ),
         HostVerb::Unknown => {
             // Best effort: the peer may already be gone, and the
-            // connection ends either way.
-            let mut s = stream;
-            let _ = s.write_all(b"ERROR: expected CONNECT <port>\n");
+            // connection ends either way. Bounded, because a peer that
+            // never reads would otherwise hold this thread, and one of
+            // the reader slots, for the life of the VM.
+            let _ = write_all_bounded(
+                &stream,
+                b"ERROR: expected CONNECT <port>\n",
+                HOST_WRITE_TIMEOUT,
+            );
         }
     }
 }
@@ -468,28 +473,44 @@ fn start_host_connection(
         guest_port: port,
         host_port: shared.mux.alloc_host_port(),
     };
-    let mut s = stream;
+    let s = stream;
     let Ok(peer) = s.try_clone() else {
         return;
     };
-    // The socket goes in the table before the guest hears about the
-    // connection: start_host_connect queues the REQUEST, and any
-    // thread may hand that to the guest before this one runs again.
-    // Payload for a key with no socket has nowhere to go.
-    shared.register_socket(key, peer);
     // The table is capped, and a peer told OK for a connection the mux
     // refused would wait on a guest that is never going to hear about
-    // it. The ERROR goes out before the socket is shut down.
-    if !shared.mux.start_host_connect(key) {
-        let _ = writeln!(s, "ERROR: too many connections");
-        shared.drop_socket(key);
+    // it. Reserving the slot answers that without letting the guest
+    // reach the connection yet.
+    if !shared.mux.reserve_host_connect(key) {
+        // Best effort: the peer may already be gone.
+        let _ = write_all_bounded(
+            &s,
+            b"ERROR: too many connections\n",
+            HOST_WRITE_TIMEOUT,
+        );
         return;
     }
-    if writeln!(s, "OK {}", key.host_port).is_err() {
-        shared.drop_socket(key);
+    // This thread owns the socket until the REQUEST is queued. Once it
+    // is, any thread's deliver_rx may hand it to the guest, the guest
+    // may answer and send payload, and a vCPU may then be inside
+    // write_host on this same socket. Two writers would interleave the
+    // OK line with guest payload and break the handshake framing, and
+    // each would take the space the other's poll reported. So the OK
+    // line goes out first, and the socket goes in the table before the
+    // REQUEST, because payload for a key with no socket has nowhere to
+    // go.
+    if write_all_bounded(
+        &s,
+        format!("OK {}\n", key.host_port).as_bytes(),
+        HOST_WRITE_TIMEOUT,
+    )
+    .is_err()
+    {
         shared.mux.forget(key);
         return;
     }
+    shared.register_socket(key, peer);
+    shared.mux.announce_host_connect(key);
     shared.deliver_rx();
     reader_loop(shared, key, s);
 }
