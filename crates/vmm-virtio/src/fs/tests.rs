@@ -27,10 +27,19 @@ const PARK_BUDGET: Duration = Duration::from_secs(10);
 /// reset that returns inside this window has a deadline again.
 const PAST_THE_OLD_DRAIN_BUDGET: Duration = Duration::from_millis(2500);
 
-/// Take the shared side of `ring_access` the way the worker holds it
-/// across a copy into or out of a chain.
-fn hold_ring_access(fs: &VirtioFs) -> std::sync::RwLockReadGuard<'_, ()> {
-    fs.ring_access.read().expect("ring access")
+/// Budget for a stale backlog to retire. Work that is refused before
+/// it takes a lock needs no more than a scheduling delay, so a backlog
+/// still on the count after this is one that queued on the reset.
+const BACKLOG_BUDGET: Duration = Duration::from_secs(2);
+
+/// A drain that takes longer than this is waiting on something other
+/// than a memory copy.
+const DRAIN_BUDGET: Duration = Duration::from_secs(1);
+
+/// Hold guest access the way the worker holds it across a copy into
+/// or out of a chain.
+fn hold_guest_access(fs: &VirtioFs) -> access::Session<'_> {
+    fs.access.enter_current().expect("a session is open")
 }
 
 #[derive(Default)]
@@ -151,31 +160,26 @@ fn wait_until_idle(fs: &VirtioFs) {
     );
 }
 
-/// Block until the reset thread is inside the `ring_access` wait.
+/// Block until the reset thread is inside the drain.
 ///
-/// The epoch moves before the reset reaches the barrier and the caller
-/// holds the shared side, so past this point the reset is in the wait
-/// and can be nowhere else. Sleeping a fixed time instead would let the
-/// assertions run after the reset had already finished.
-fn wait_until_reset_blocks(
-    fs: &VirtioFs,
-    epoch_before: u64,
-    finished: &AtomicBool,
-) {
+/// Admission closes before the reset reaches the drain and reopens
+/// only once it is through, and the caller holds a session, so past
+/// this point the reset is in the wait and can be nowhere else. The
+/// poll cannot block on the drain itself: a closed device refuses a
+/// session without taking the lock. Sleeping a fixed time instead
+/// would let the assertions run after the reset had already finished.
+fn wait_until_reset_blocks(fs: &VirtioFs, finished: &AtomicBool) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while fs.epoch.load(Ordering::Acquire) == epoch_before
-        && Instant::now() < deadline
-    {
+    while fs.access.enter_current().is_some() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_ne!(
-        fs.epoch.load(Ordering::Acquire),
-        epoch_before,
+    assert!(
+        fs.access.enter_current().is_none(),
         "the reset never started"
     );
     assert!(
         !finished.load(Ordering::Acquire),
-        "the reset finished while the worker still held ring access"
+        "the reset finished while the worker still held guest access"
     );
 }
 
@@ -558,7 +562,7 @@ fn reset_leaves_the_worker_runnable() {
 
 // A guest resets its virtio devices several times while it boots, and
 // the worker takes 50ms to reach its park point. The reset waits on
-// `ring_access`, which the worker holds only while it is using the
+// guest access, which the worker holds only while it is using the
 // ring, so it must never park the worker to find that out.
 #[test]
 fn reset_never_parks_the_worker() {
@@ -642,8 +646,7 @@ fn a_reset_waits_out_a_copy_into_the_chain() {
     let fs = test_fs(Arc::new(PhysMap::new()));
     fs.start().expect("start");
 
-    let access = hold_ring_access(&fs);
-    let epoch_before = fs.epoch.load(Ordering::Acquire);
+    let access = hold_guest_access(&fs);
     let finished = AtomicBool::new(false);
     let fs_ref = &fs;
     let finished_ref = &finished;
@@ -654,7 +657,7 @@ fn a_reset_waits_out_a_copy_into_the_chain() {
             finished_ref.store(true, Ordering::Release);
         });
 
-        wait_until_reset_blocks(&fs, epoch_before, &finished);
+        wait_until_reset_blocks(&fs, &finished);
 
         let until = Instant::now() + PAST_THE_OLD_DRAIN_BUDGET;
         while Instant::now() < until {
@@ -684,8 +687,7 @@ fn a_pause_that_lands_inside_a_reset_survives_it() {
     let fs = test_fs(Arc::new(PhysMap::new()));
     fs.start().expect("start");
 
-    let access = hold_ring_access(&fs);
-    let epoch_before = fs.epoch.load(Ordering::Acquire);
+    let access = hold_guest_access(&fs);
     let finished = AtomicBool::new(false);
     let fs_ref = &fs;
     let finished_ref = &finished;
@@ -698,7 +700,7 @@ fn a_pause_that_lands_inside_a_reset_survives_it() {
 
         // The handshake is what makes this a test: the pause is taken
         // only once the reset is known to be inside the wait.
-        wait_until_reset_blocks(&fs, epoch_before, &finished);
+        wait_until_reset_blocks(&fs, &finished);
         fs.pause();
 
         drop(access);
@@ -727,6 +729,8 @@ fn a_backend_parked_across_a_reset_writes_nothing_into_the_ring() {
     seed_reply_window(&physmap);
     fs.start().expect("start");
 
+    let hold = Arc::new(AtomicBool::new(false));
+    let (raised, _inside) = counting_interrupt(&fs, &hold);
     let backend = ParkedBackend::install(&fs);
     fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
     backend.wait_until_inside();
@@ -743,6 +747,11 @@ fn a_backend_parked_across_a_reset_writes_nothing_into_the_ring() {
     assert!(
         reply_window(&physmap).iter().all(|b| *b == REPLY_SENTINEL),
         "the reply landed in guest pages the reset had released"
+    );
+    assert_eq!(
+        raised.load(Ordering::Acquire),
+        0,
+        "the closed session's interrupt reached the next driver"
     );
 }
 
@@ -806,6 +815,135 @@ fn halt_joins_the_worker_after_a_pause() {
     assert_eq!(fs.lifecycle_state(), Some(IndicatedState::Halt));
 }
 
+/// Install a queue interrupt that counts and, while `hold` is set,
+/// blocks inside the callback.
+fn counting_interrupt(
+    fs: &VirtioFs,
+    hold: &Arc<AtomicBool>,
+) -> (Arc<AtomicUsize>, Arc<AtomicBool>) {
+    let raised = Arc::new(AtomicUsize::new(0));
+    let inside = Arc::new(AtomicBool::new(false));
+    let hook = {
+        let raised = Arc::clone(&raised);
+        let inside = Arc::clone(&inside);
+        let hold = Arc::clone(hold);
+        Arc::new(move |_queue: u16| {
+            raised.fetch_add(1, Ordering::AcqRel);
+            inside.store(true, Ordering::Release);
+            while hold.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    *fs.interrupt.lock().expect("interrupt lock") = Some(hook);
+    (raised, inside)
+}
+
+// A guest picks how much stale work is queued when it writes 0 to
+// DEVICE_STATUS. None of it may queue on the lock the resetting vCPU
+// waits for: `std::sync::RwLock` gives the writer no priority, so
+// readers that could take that lock could hand it between themselves
+// and hold the vCPU for as long as the guest liked.
+//
+// The drain is the only part of the reset a stale request can reach.
+// A request refused at admission never publishes, so it never reaches
+// the interrupt gate either.
+#[test]
+fn a_stale_backlog_never_queues_on_the_reset_drain() {
+    const BACKLOG: u16 = FS_QUEUE_SIZE_DEFAULT;
+    let (physmap, mut queues, fs) = ring(BACKLOG, BACKLOG);
+    let req = usize::from(FS_REQUEST_QUEUE);
+    fs.start().expect("start");
+
+    // Park the worker so a whole queue piles up behind it instead of
+    // completing one by one.
+    park_the_worker(&fs);
+    fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
+    assert_eq!(
+        fs.inflight.load(Ordering::Acquire),
+        usize::from(BACKLOG),
+        "the backlog never reached the worker"
+    );
+
+    // A reset, stopped inside its drain: admission closed, the epoch
+    // ended, and the exclusive side held.
+    fs.access.close();
+    let drain = fs.access.hold_drain();
+    fs.resume();
+
+    let deadline = Instant::now() + BACKLOG_BUDGET;
+    while fs.inflight.load(Ordering::Acquire) != 0 && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let left = fs.inflight.load(Ordering::Acquire);
+    // Release the drain before asserting, so a backlog that wrongly
+    // queued on it runs to the end instead of wedging the teardown.
+    drop(drain);
+    fs.access.reopen();
+
+    assert_eq!(
+        left, 0,
+        "{left} stale requests queued on the lock the reset waits for"
+    );
+    assert_eq!(
+        queues[req].read_used_ring_idx(&physmap),
+        0,
+        "a stale request published into the ring the guest had freed"
+    );
+}
+
+// Publishing and raising are separate steps because the raise must
+// happen outside the session that wrote the ring. Delivery is an
+// ioctl and can block, and the drain a synchronous reset waits for
+// covers every live session, so an interrupt raised inside one puts
+// the resetting vCPU behind it. That is the bound the design rests
+// on.
+#[test]
+fn an_interrupt_is_raised_outside_the_guest_access_section() {
+    let (physmap, mut queues, fs) = ring(8, 1);
+    seed_fuse_init(&physmap);
+    fs.start().expect("start");
+
+    let hold = Arc::new(AtomicBool::new(true));
+    let (_raised, inside) = counting_interrupt(&fs, &hold);
+
+    fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
+    let deadline = Instant::now() + PARK_BUDGET;
+    while !inside.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        inside.load(Ordering::Acquire),
+        "the worker never raised the interrupt"
+    );
+
+    // The interrupt is held. A drain that has to wait for it is the
+    // failure, so it runs on its own thread under a deadline.
+    let waited = {
+        let access = &fs.access;
+        let hold = &hold;
+        std::thread::scope(move |scope| {
+            let drainer = scope.spawn(move || access.drain());
+            let start = Instant::now();
+            while !drainer.is_finished() && start.elapsed() < DRAIN_BUDGET {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let waited = start.elapsed();
+            // Let a wrongly held interrupt go, so the scope joins the
+            // drain rather than parking on it.
+            hold.store(false, Ordering::Release);
+            waited
+        })
+    };
+
+    assert!(
+        waited < DRAIN_BUDGET,
+        "the drain waited {waited:?} behind an interrupt raised inside a \
+         guest-access section"
+    );
+}
+
 // A DAX window would be guest-accessible memory that no session
 // covers: the guest keeps the mapping across a device reset, so the
 // reset could not take it back the way it takes back the ring. The
@@ -820,4 +958,37 @@ fn the_device_publishes_no_dax_window() {
     // which this transport never builds.
     assert_eq!(fs.cfg_read(40, 4), 0);
     assert_eq!(FS_CONFIG_SIZE as usize, FS_TAG_LEN + 4 + 4);
+}
+
+// The vCPU half of the same gate. A notification that lands while a
+// reset owns the ring must not walk it and must not queue work
+// against it. The transport serialises the two writes today, so this
+// is the device keeping its own promise instead of borrowing the
+// transport's.
+#[test]
+fn a_notification_refused_by_a_reset_touches_nothing() {
+    let (physmap, mut queues, fs) = ring(8, 1);
+    let req = usize::from(FS_REQUEST_QUEUE);
+    fs.start().expect("start");
+
+    // A reset, stopped inside its drain.
+    fs.access.close();
+    let drain = fs.access.hold_drain();
+
+    let did_work = fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
+
+    drop(drain);
+    fs.access.reopen();
+
+    assert!(!did_work);
+    assert_eq!(
+        queues[req].last_avail_idx(),
+        0,
+        "a notification walked a ring the reset had taken"
+    );
+    assert_eq!(
+        fs.inflight.load(Ordering::Acquire),
+        0,
+        "a notification queued work against a ring the reset had taken"
+    );
 }
