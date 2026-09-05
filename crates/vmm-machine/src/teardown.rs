@@ -5,7 +5,7 @@
 //! Guest exit handling, device quiesce, and VM teardown.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use slog::{error, info, warn, Logger};
 use vmm_core::exits::Suspend;
-use vmm_core::hdl::VmmHdl;
 use vmm_core::machine::Machine;
 use vmm_devices::quiesce::{wait_all_quiesced_named, NamedDevice};
 
@@ -30,6 +29,15 @@ const VCPU_JOIN_BUDGET: Duration = Duration::from_secs(5);
 /// the terminal watchdog is given, so a VM with many disks is not ended
 /// while it is still writing.
 const FLUSH_BUDGET_PER_DEVICE: Duration = Duration::from_secs(2);
+
+/// How long one device gets to give up its in-kernel and thread state.
+///
+/// `halt` is synchronous like the flush, and viona's is the one that
+/// matters: `VNA_IOC_DELETE` waits for each ring worker to stop, in a
+/// `cv_wait` that does not heed signals. Nothing here can interrupt
+/// that. What the count buys is a terminal watchdog clock wide enough
+/// that a VM with many devices is not ended part way through the sweep.
+const HALT_BUDGET_PER_DEVICE: Duration = Duration::from_secs(2);
 
 /// How long `VM_DESTROY_SELF` gets before teardown stops waiting on it.
 ///
@@ -152,6 +160,39 @@ fn quiesce_named(
     }
 
     report
+}
+
+/// Halt every device, giving back the in-kernel state it holds.
+///
+/// WHY this must precede the destroy: viona takes a `vmm_drv` hold for
+/// the life of its link, and `VM_DESTROY_SELF` waits for every hold to
+/// be released in an untimed `cv_wait` (`vmm_sol_dev.c`,
+/// `vmm_drv_purge` and `vmm_lease_block`). viona gives that hold back
+/// in `VNA_IOC_DELETE`, which its `Lifecycle::halt` issues. A halt that
+/// runs after the destroy, or not at all, leaves the hold in place and
+/// the destroy waits on a thread no signal can reach.
+///
+/// A device already in `Halt` is skipped, because a hot-unplug halted
+/// it before teardown started and a second halt has nothing to give
+/// back. A device that refuses the transition is reported: an operator
+/// `resume` between the quiesce and here puts its workers back to work.
+fn halt_devices(devices: &[NamedDevice], log: &Logger) {
+    for named in devices {
+        if named.device.lifecycle_state()
+            == Some(vmm_devices::IndicatedState::Halt)
+        {
+            continue;
+        }
+        named.device.halt();
+        if let Some(state) = named.device.lifecycle_state() {
+            if state != vmm_devices::IndicatedState::Halt {
+                warn!(log, "device refused to halt before the VM destroy";
+                    "device" => named.device.type_name(),
+                    "id" => named.id.as_deref(),
+                    "state" => ?state);
+            }
+        }
+    }
 }
 
 /// The vCPU threads that are running, which can grow at run time.
@@ -295,20 +336,23 @@ enum DeviceSource<'a> {
 }
 
 impl DeviceSource<'_> {
-    fn quiesce(&self, log: &Logger) -> vmm_devices::QuiesceReport {
+    /// The devices teardown will walk, named where they have an id.
+    ///
+    /// Taken once, so the quiesce, the halt and the budget all see the
+    /// same set. A registry read after the guest stops cannot then
+    /// disagree with itself part way through the sweep.
+    fn named(&self) -> Vec<NamedDevice> {
         match self {
-            DeviceSource::Snapshot(devices) => quiesce_devices(devices, log),
+            DeviceSource::Snapshot(devices) => devices
+                .iter()
+                .map(|device| NamedDevice {
+                    id: None,
+                    device: device.clone(),
+                })
+                .collect(),
             DeviceSource::Registry(registry) => {
-                quiesce_registered_devices(registry, log)
+                registry_named_devices(registry)
             }
-        }
-    }
-
-    /// The most devices the flush can have to walk.
-    fn len(&self) -> usize {
-        match self {
-            DeviceSource::Snapshot(devices) => devices.len(),
-            DeviceSource::Registry(registry) => registry.len(),
         }
     }
 }
@@ -320,12 +364,14 @@ impl DeviceSource<'_> {
 /// device, so a VM with many disks needs more time than a VM with one,
 /// and no constant can know which it is.
 fn teardown_budget(devices: usize) -> Duration {
-    let flush = u32::try_from(devices)
+    let per_device =
+        FLUSH_BUDGET_PER_DEVICE.saturating_add(HALT_BUDGET_PER_DEVICE);
+    let device_work = u32::try_from(devices)
         .ok()
-        .and_then(|count| FLUSH_BUDGET_PER_DEVICE.checked_mul(count))
+        .and_then(|count| per_device.checked_mul(count))
         .unwrap_or(TEARDOWN_BUDGET_MAX);
     QUIESCE_BUDGET
-        .saturating_add(flush)
+        .saturating_add(device_work)
         .saturating_add(VCPU_JOIN_BUDGET)
         .saturating_add(DESTROY_BUDGET)
         .clamp(TEARDOWN_BUDGET_MIN, TEARDOWN_BUDGET_MAX)
@@ -343,17 +389,12 @@ fn teardown_budget(devices: usize) -> Duration {
 /// `VM_SET_AUTODESTRUCT` the machine builder armed reclaims the
 /// instance when the fd closes at process exit. A destroy parked in the
 /// lease purge does not end: process exit waits for that thread, so the
-/// fd never closes and the instance stays. Only a kernel that bounds
-/// the purge frees it. See [`crate::signal`].
-fn destroy_bounded(hdl: &Arc<VmmHdl>, budget: Duration, log: &Logger) -> bool {
-    let hdl = hdl.clone();
-    destroy_bounded_with(move || hdl.destroy(), budget, log)
-}
-
-/// The same bound over a caller-supplied destroy.
+/// fd never closes and the instance stays. [`halt_devices`] is what
+/// keeps the purge from reaching that wait; this bound is the belt
+/// behind it. See [`crate::signal`].
 ///
-/// Split out so a destroy that never returns is testable without a live
-/// /dev/vmm handle.
+/// The destroy is a closure so that a call which never returns is
+/// testable without a live /dev/vmm handle.
 fn destroy_bounded_with(
     destroy: impl FnOnce() -> io::Result<()> + Send + 'static,
     budget: Duration,
@@ -468,33 +509,73 @@ fn run_event_loop_with(
     log: &Logger,
 ) -> anyhow::Result<RunOutcome> {
     let outcome = outcome_of(vcpus.next_event(&event_rx), log);
-    // The device flush below is one synchronous backend call per
-    // device, and the destroy after it is unbounded in the kernel.
-    // Neither can be interrupted from here, so the terminal watchdog
-    // keeps a clock across the whole teardown and is given a budget
-    // that scales with the work.
-    crate::signal::arm_teardown_deadline(teardown_budget(devices.len()));
+    let hdl = machine.hdl().clone();
+    shutdown_after_exit(
+        vcpus,
+        &devices.named(),
+        control_cleanup.as_deref(),
+        move || hdl.destroy(),
+        crate::signal::arm_teardown_deadline,
+        log,
+    );
+    outcome
+}
+
+/// Everything teardown does once the guest has stopped.
+///
+/// The order is the fix for the destroy wedge, not a preference:
+///
+/// 1. arm the clock, before any step that cannot be interrupted;
+/// 2. quiesce, so no device is still writing;
+/// 3. join the vCPU threads, so no guest access races the halt;
+/// 4. halt the devices, which gives back the in-kernel state;
+/// 5. destroy the VM.
+///
+/// Step 4 before step 5 is what keeps the destroy out of
+/// `vmm_lease_block`. See [`halt_devices`].
+///
+/// The halt runs on this thread, which is the one the terminal watchdog
+/// keeps a clock on. It must not move to a thread anything else waits
+/// for: `VNA_IOC_DELETE` blocks untimed, and does not heed signals.
+///
+/// Split from [`run_event_loop_with`] so the order is testable with no
+/// live /dev/vmm handle.
+fn shutdown_after_exit(
+    vcpus: VcpuSet<'_>,
+    devices: &[NamedDevice],
+    control_cleanup: Option<&Path>,
+    destroy: impl FnOnce() -> io::Result<()> + Send + 'static,
+    arm_deadline: impl FnOnce(Duration),
+    log: &Logger,
+) {
+    // The flush and the halt below are synchronous backend calls, one
+    // per device, and the destroy after them is unbounded in the
+    // kernel. None can be interrupted from here, so the terminal
+    // watchdog keeps a clock across the whole teardown and is given a
+    // budget that scales with the work.
+    arm_deadline(teardown_budget(devices.len()));
 
     // A wedged backend must not prevent release of the bhyve instance.
-    let _report = devices.quiesce(log);
+    let _report = quiesce_named(devices, log);
 
     if !vcpus.join(VCPU_JOIN_BUDGET) {
         warn!(log, "vCPU threads did not exit; destroying VM anyway");
     }
 
+    halt_devices(devices, log);
+
     // The socket path may already be gone.
-    if let Some(ref path) = control_cleanup {
+    if let Some(path) = control_cleanup {
         let _ = std::fs::remove_file(path);
     }
 
     // WHY no destroy in the crash paths: the machine builder arms
     // VM_SET_AUTODESTRUCT, so the kernel reclaims the instance when the fd
     // closes. This explicit destroy stays the deterministic commit point,
-    // ordered after quiesce and vCPU join.
-    if destroy_bounded(machine.hdl(), DESTROY_BUDGET, log) {
+    // ordered after quiesce, vCPU join and device halt.
+    if destroy_bounded_with(destroy, DESTROY_BUDGET, log) {
         info!(log, "VM shutdown complete");
     }
-    outcome
 }
 
 fn outcome_of(
@@ -533,18 +614,31 @@ fn outcome_of(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    //! What these tests establish, and what they do not.
+    //!
+    //! They drive the real teardown sequence over recording devices
+    //! and a destroy closure, so they show which step runs and in
+    //! which order. No test here opens /dev/vmm, so none of them shows
+    //! that the kernel releases the instance, that the process leaves
+    //! the process table, or that `VNA_IOC_DELETE` returns on a live
+    //! link. Only a lab test on illumos shows that: boot a VM with a
+    //! viona NIC, power it off from inside the guest, and watch for
+    //! the instance to leave `/dev/vmm` and the VMM process to exit
+    //! with no watchdog line behind it.
+
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use slog::Logger;
+    use vmm_devices::quiesce::NamedDevice;
     use vmm_devices::Lifecycle as _;
 
     use super::{
         destroy_bounded_with, join_vcpus_bounded, quiesce_devices,
-        teardown_budget, RunOutcome, VcpuSet, VcpuThreads,
-        FLUSH_BUDGET_PER_DEVICE, QUIESCE_BUDGET, ROSTER_POLL,
-        TEARDOWN_BUDGET_MAX, TEARDOWN_BUDGET_MIN,
+        shutdown_after_exit, teardown_budget, RunOutcome, VcpuSet, VcpuThreads,
+        FLUSH_BUDGET_PER_DEVICE, HALT_BUDGET_PER_DEVICE, QUIESCE_BUDGET,
+        ROSTER_POLL, TEARDOWN_BUDGET_MAX, TEARDOWN_BUDGET_MIN,
     };
     use crate::vcpu_tasks::VcpuEvent;
     use std::sync::mpsc;
@@ -593,6 +687,180 @@ mod tests {
 
     fn null_log() -> Logger {
         Logger::root(slog::Discard, slog::o!())
+    }
+
+    /// The teardown steps one run took, in order.
+    type Steps = Arc<Mutex<Vec<&'static str>>>;
+
+    fn push(steps: &Steps, step: &'static str) {
+        steps.lock().expect("steps lock").push(step);
+    }
+
+    fn steps_of(steps: &Steps) -> Vec<&'static str> {
+        steps.lock().expect("steps lock").clone()
+    }
+
+    /// A device that records which lifecycle calls teardown made.
+    struct RecordingDevice {
+        indicator: vmm_devices::Indicator,
+        steps: Steps,
+        flush_fails: bool,
+    }
+
+    impl RecordingDevice {
+        fn new(steps: &Steps) -> Self {
+            Self {
+                indicator: vmm_devices::Indicator::new(),
+                steps: Arc::clone(steps),
+                flush_fails: false,
+            }
+        }
+
+        fn failing_flush(steps: &Steps) -> Self {
+            Self {
+                flush_fails: true,
+                ..Self::new(steps)
+            }
+        }
+    }
+
+    impl vmm_devices::Lifecycle for RecordingDevice {
+        fn type_name(&self) -> &'static str {
+            "recording-test-device"
+        }
+
+        fn lifecycle_state(&self) -> Option<vmm_devices::IndicatedState> {
+            Some(self.indicator.state())
+        }
+
+        fn pause(&self) {
+            push(&self.steps, "pause");
+            self.indicator.pause();
+        }
+
+        fn halt(&self) {
+            push(&self.steps, "halt");
+            self.indicator.halt();
+        }
+
+        fn is_quiesced(&self) -> bool {
+            !self.flush_fails
+        }
+
+        fn flush_backing(
+            &self,
+            _intent: vmm_devices::FlushIntent,
+        ) -> Result<(), vmm_devices::FlushError> {
+            push(&self.steps, "flush");
+            if self.flush_fails {
+                return Err(vmm_devices::FlushError::NotQuiesced("recording"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Run one teardown over `devices` and report the steps it took.
+    ///
+    /// The arm and the destroy are recorded in the same list as the
+    /// device calls, so the assertions are about one order and not
+    /// about three.
+    fn run_teardown(
+        devices: &[NamedDevice],
+        steps: &Steps,
+    ) -> Option<Duration> {
+        let armed = Mutex::new(None);
+        let arm_steps = Arc::clone(steps);
+        let destroy_steps = Arc::clone(steps);
+
+        shutdown_after_exit(
+            VcpuSet::Fixed(Vec::new()),
+            devices,
+            None,
+            move || {
+                push(&destroy_steps, "destroy");
+                Ok(())
+            },
+            |budget| {
+                push(&arm_steps, "arm");
+                *armed.lock().expect("armed lock") = Some(budget);
+            },
+            &null_log(),
+        );
+
+        let budget = *armed.lock().expect("armed lock");
+        budget
+    }
+
+    fn named(device: Arc<dyn vmm_devices::Lifecycle>) -> Vec<NamedDevice> {
+        vec![NamedDevice {
+            id: Some("net0".to_string()),
+            device,
+        }]
+    }
+
+    #[test]
+    fn teardown_halts_the_devices_before_it_destroys_the_vm() {
+        // VM_DESTROY_SELF waits for every vmm_drv hold to be released,
+        // in an untimed cv_wait. viona gives its hold back in halt, so
+        // a halt after the destroy is a halt that never runs.
+        let steps = Steps::default();
+        let devices = named(Arc::new(RecordingDevice::new(&steps)));
+
+        run_teardown(&devices, &steps);
+
+        assert_eq!(
+            steps_of(&steps),
+            ["arm", "pause", "flush", "halt", "destroy"]
+        );
+    }
+
+    #[test]
+    fn the_deadline_is_armed_before_the_first_step_that_cannot_be_stopped() {
+        // The quiesce, the flush and the halt all run on this thread
+        // and none can be interrupted. A guest that powers itself off
+        // takes this same path with no signal behind it, so the arm is
+        // the only thing that puts a clock on it.
+        let steps = Steps::default();
+        let devices = named(Arc::new(RecordingDevice::new(&steps)));
+
+        let armed = run_teardown(&devices, &steps);
+
+        assert_eq!(steps_of(&steps).first(), Some(&"arm"));
+        assert_eq!(armed, Some(TEARDOWN_BUDGET_MIN));
+    }
+
+    #[test]
+    fn a_device_that_will_not_flush_is_still_halted_and_destroyed() {
+        // Failing to give back kernel state must not itself keep the
+        // instance alive, so nothing in the sweep is allowed to stop
+        // teardown short of the destroy.
+        let steps = Steps::default();
+        let devices = named(Arc::new(RecordingDevice::failing_flush(&steps)));
+
+        run_teardown(&devices, &steps);
+
+        assert_eq!(
+            steps_of(&steps),
+            ["arm", "pause", "flush", "halt", "destroy"]
+        );
+    }
+
+    #[test]
+    fn a_device_halted_before_teardown_is_not_halted_again() {
+        // A hot-unplug halts the device it ejects. Halting it a second
+        // time would repeat a wait that has nothing left to give back.
+        let steps = Steps::default();
+        let device = Arc::new(RecordingDevice::new(&steps));
+        device.pause();
+        device.halt();
+        steps.lock().expect("steps lock").clear();
+        let devices = named(device);
+
+        run_teardown(&devices, &steps);
+
+        let steps = steps_of(&steps);
+        assert!(!steps.contains(&"halt"), "the halt ran twice: {steps:?}");
+        assert_eq!(steps, ["arm", "pause", "flush", "destroy"]);
     }
 
     #[test]
@@ -803,13 +1071,17 @@ mod tests {
 
     #[test]
     fn the_teardown_budget_grows_with_the_device_count() {
-        // The flush is one synchronous call per device, so the clock a
-        // 40-disk VM needs is not the clock a 20-disk VM needs.
+        // The flush and the halt are one synchronous call per device
+        // each, so the clock a 40-disk VM needs is not the clock a
+        // 20-disk VM needs.
         let few = teardown_budget(20);
         let many = teardown_budget(40);
 
         assert!(few < many);
-        assert_eq!(many - few, FLUSH_BUDGET_PER_DEVICE * 20);
+        assert_eq!(
+            many - few,
+            (FLUSH_BUDGET_PER_DEVICE + HALT_BUDGET_PER_DEVICE) * 20,
+        );
     }
 
     #[test]
