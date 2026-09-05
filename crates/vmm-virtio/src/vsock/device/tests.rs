@@ -78,7 +78,7 @@ fn the_connect_line_reader_stops_at_the_newline() {
 
     let shutdown = AtomicBool::new(false);
     let LineRead::Line(line) =
-        read_line_bounded(&mut b, &shutdown, CONNECT_LINE_MAX)
+        read_line_bounded(&mut b, &shutdown, CONNECT_LINE_MAX, None)
     else {
         panic!("the CONNECT line was not read");
     };
@@ -99,7 +99,7 @@ fn a_connect_line_without_a_newline_is_bounded() {
     a.write_all(&[b'X'; CONNECT_LINE_MAX * 2]).expect("write");
     let shutdown = AtomicBool::new(false);
     assert!(matches!(
-        read_line_bounded(&mut b, &shutdown, CONNECT_LINE_MAX),
+        read_line_bounded(&mut b, &shutdown, CONNECT_LINE_MAX, None),
         LineRead::TooLong,
     ));
 }
@@ -465,6 +465,31 @@ fn a_host_peer_that_never_reads_does_not_hold_the_writer() {
             .contains_key(&key),
         "the wedged connection stayed in the table"
     );
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The reader slots are capped, so a peer that connects and never
+/// sends its verb must give the slot back on its own. Waiting on the
+/// shutdown flag only frees them when the VM is already going away.
+#[test]
+fn a_silent_peer_gives_its_connect_thread_back() {
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    let shared = Arc::clone(&vsock.shared);
+    let (_peer, device_end) = UnixStream::pair().expect("socketpair");
+
+    let reader =
+        std::thread::spawn(move || handle_host_connect(shared, device_end));
+    let deadline = std::time::Instant::now() + HANDSHAKE_BUDGET * 4;
+    while !reader.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        reader.is_finished(),
+        "a peer that sent nothing held its thread past the handshake budget"
+    );
+    reader.join().expect("join the reader");
 
     vsock.halt();
     let _ = std::fs::remove_dir_all(&dir);

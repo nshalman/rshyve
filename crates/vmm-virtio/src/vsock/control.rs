@@ -46,7 +46,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slog::warn;
 
@@ -70,6 +70,15 @@ const CONTROL_LINE_MAX: usize = 512;
 /// How long a blocked read waits before it looks at the shutdown flag.
 /// Without this, halt would wait for the peer instead of the guest.
 pub(super) const LINE_POLL: Duration = Duration::from_millis(250);
+
+/// How long a peer has to send its opening verb.
+///
+/// Reader threads are capped, so a peer that connects and says nothing
+/// holds a slot the shutdown flag is the only thing that frees. Enough
+/// of them and no further connection can be made, the CONTROL session
+/// included, for the life of the VM. A peer with nothing to say in
+/// this long has nothing to say.
+pub(super) const HANDSHAKE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Answers one control request.
 ///
@@ -178,6 +187,11 @@ pub(super) enum LineRead {
 /// VM, and a connection the device has not registered yet is out of
 /// reach of the halt sweep, so nothing would ever wake it.
 ///
+/// `deadline` bounds the read itself, which the poll does not: without
+/// one, a silent peer holds the thread until the VM shuts down. Pass
+/// it for a handshake, and `None` for an established session that may
+/// idle between requests.
+///
 /// Read one byte at a time, and deliberately not through a `BufReader`:
 /// that reads a whole block, and anything the peer pipelined behind the
 /// newline would sit in a buffer this function is about to drop.
@@ -185,6 +199,7 @@ pub(super) fn read_line_bounded(
     stream: &mut UnixStream,
     shutdown: &AtomicBool,
     max: usize,
+    deadline: Option<Instant>,
 ) -> LineRead {
     if stream.set_read_timeout(Some(LINE_POLL)).is_err() {
         return LineRead::Closed;
@@ -193,6 +208,9 @@ pub(super) fn read_line_bounded(
     let mut byte = [0u8; 1];
     loop {
         if shutdown.load(Ordering::Acquire) {
+            return LineRead::Closed;
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
             return LineRead::Closed;
         }
         match stream.read(&mut byte) {
@@ -259,7 +277,9 @@ pub(super) fn run_control_session(
     }
 
     loop {
-        match read_line_bounded(&mut stream, shutdown, CONTROL_LINE_MAX) {
+        // No deadline: an established session may idle between
+        // requests, and shutdown is what ends it.
+        match read_line_bounded(&mut stream, shutdown, CONTROL_LINE_MAX, None) {
             LineRead::Line(request) => {
                 let request = request.trim();
                 let answer = if request.is_empty() {
@@ -506,8 +526,12 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
-            let got =
-                read_line_bounded(&mut server, &shutdown, CONTROL_LINE_MAX);
+            let got = read_line_bounded(
+                &mut server,
+                &shutdown,
+                CONTROL_LINE_MAX,
+                None,
+            );
             let _ = tx.send(matches!(got, LineRead::Closed));
         });
 
@@ -527,7 +551,7 @@ mod tests {
         client.write_all(b"12345678\n").expect("write");
 
         assert!(matches!(
-            read_line_bounded(&mut server, &shutdown, 4),
+            read_line_bounded(&mut server, &shutdown, 4, None),
             LineRead::TooLong
         ));
     }

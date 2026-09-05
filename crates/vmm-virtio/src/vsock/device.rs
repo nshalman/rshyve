@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use slog::{debug, warn};
@@ -33,6 +33,7 @@ use vmm_core::unixsock::{bind_restricted, SocketPolicy};
 
 use super::control::{
     read_line_bounded, run_control_session, ControlSlot, LineRead,
+    HANDSHAKE_BUDGET,
 };
 use super::mux::{GuestAction, RxPacket, VsockMux, MAX_CONNS};
 use super::packet::{ConnKey, VsockHdr, CID_GUEST_MIN, HDR_SIZE};
@@ -406,9 +407,12 @@ fn handle_host_connect(shared: Arc<VsockShared>, mut stream: UnixStream) {
     // every pass. A peer that opens a connection and sends nothing
     // would otherwise park this thread for the life of the VM, and it
     // is not in `sockets` yet, so halt's sweep cannot wake it either.
-    let LineRead::Line(line) =
-        read_line_bounded(&mut stream, &shared.shutdown, CONNECT_LINE_MAX)
-    else {
+    let LineRead::Line(line) = read_line_bounded(
+        &mut stream,
+        &shared.shutdown,
+        CONNECT_LINE_MAX,
+        Some(Instant::now() + HANDSHAKE_BUDGET),
+    ) else {
         return;
     };
     match classify_host_line(&line) {

@@ -982,7 +982,7 @@ mod tests {
         let entry = fs
             .server
             .passthrough()
-            .lookup(crate::fs::fuse::FUSE_ROOT_ID, &name)
+            .lookup(fuse::FUSE_ROOT_ID, &name)
             .expect("look the file up");
 
         // End the worker without a halt: it never parks, so the gate
