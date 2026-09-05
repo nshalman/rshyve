@@ -197,6 +197,8 @@ pub struct VirtioFs {
     inflight: Arc<AtomicUsize>,
     /// See [`FsWorkerCtx::ring_access`].
     ring_access: Arc<RwLock<()>>,
+    /// See [`FsWorkerCtx::session_retired`].
+    session_retired: Arc<AtomicBool>,
     #[cfg(test)]
     parks: Arc<FsParks>,
     indicator: Indicator,
@@ -244,6 +246,7 @@ impl VirtioFs {
             epoch: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(AtomicUsize::new(0)),
             ring_access: Arc::new(RwLock::new(())),
+            session_retired: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             parks: Arc::new(FsParks::default()),
         };
@@ -269,6 +272,7 @@ impl VirtioFs {
             epoch: ctx.epoch,
             inflight: ctx.inflight,
             ring_access: ctx.ring_access,
+            session_retired: ctx.session_retired,
             #[cfg(test)]
             parks: ctx.parks,
             indicator: Indicator::new(),
@@ -333,6 +337,14 @@ struct FsWorkerCtx {
     /// A vCPU waits on the exclusive side, so each section must end on
     /// its own.
     ring_access: Arc<RwLock<()>>,
+    /// Set by a reset, cleared by the worker once it has closed the
+    /// retired session's fd tables.
+    ///
+    /// A flag, not a comparison against `epoch`: the worker would have
+    /// to sample the epoch to have something to compare, and a reset
+    /// that lands before that sample would then look like the session
+    /// the worker started in.
+    session_retired: Arc<AtomicBool>,
     #[cfg(test)]
     parks: Arc<FsParks>,
 }
@@ -359,7 +371,6 @@ fn abandon_queued(
 fn fs_worker(rx: mpsc::Receiver<FsRequest>, ctx: FsWorkerCtx) {
     use std::sync::mpsc::RecvTimeoutError;
 
-    let mut session = ctx.epoch.load(Ordering::Acquire);
     loop {
         let req = match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(r) => Some(r),
@@ -375,7 +386,7 @@ fn fs_worker(rx: mpsc::Receiver<FsRequest>, ctx: FsWorkerCtx) {
         }
         // Before the request is served, so a request from the new
         // session never sees the old session's nodeids and handles.
-        reap_retired_session(&ctx, &mut session);
+        reap_retired_session(&ctx);
         let Some(req) = req else { continue };
 
         serve_request(&ctx, &req);
@@ -386,19 +397,16 @@ fn fs_worker(rx: mpsc::Receiver<FsRequest>, ctx: FsWorkerCtx) {
 
 /// Close the fd tables of a driver session that a reset ended.
 ///
-/// The tables are backing-store state, so the reset leaves them alone
-/// and the worker reaps them here. Until `halt` joins this thread, it
+/// The tables are backing-store state, so the reset only marks them
+/// and the worker closes them here. Until `halt` joins this thread, it
 /// is the only one that closes a guest-held fd, so no syscall can be
 /// running on a descriptor this closes. A number closed under such a
 /// syscall would go to the next thread in this process that opens
 /// anything.
-fn reap_retired_session(ctx: &FsWorkerCtx, session: &mut u64) {
-    let now = ctx.epoch.load(Ordering::Acquire);
-    if now == *session {
-        return;
+fn reap_retired_session(ctx: &FsWorkerCtx) {
+    if ctx.session_retired.swap(false, Ordering::AcqRel) {
+        ctx.server.passthrough().clear();
     }
-    *session = now;
-    ctx.server.passthrough().clear();
 }
 
 /// Run one FUSE request and publish its reply.
@@ -595,10 +603,11 @@ impl VirtioDevice for VirtioFs {
         {
             *slot = None;
         }
-        // The guest's fd tables are backing-store state, and the worker
-        // reaps them when it sees the epoch move. Closing them here
-        // would pull a descriptor out from under a syscall the worker is
-        // inside.
+        // The guest's fd tables are backing-store state, so this only
+        // marks them and the worker closes them. Closing them here
+        // would pull a descriptor out from under a syscall the worker
+        // is inside.
+        self.session_retired.store(true, Ordering::Release);
     }
 }
 

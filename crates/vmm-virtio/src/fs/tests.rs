@@ -120,6 +120,23 @@ impl ParkedBackend {
     }
 }
 
+/// Park the worker and block until it is there.
+///
+/// Past this point the worker cannot observe anything the test does
+/// until it is resumed, so an assertion between the two is about the
+/// caller alone.
+fn park_the_worker(fs: &VirtioFs) {
+    fs.pause();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !fs.is_quiesced() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        fs.is_quiesced(),
+        "the worker did not park within its budget"
+    );
+}
+
 /// Block until the worker owes the guest nothing.
 fn wait_until_idle(fs: &VirtioFs) {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -491,12 +508,7 @@ fn reset_drops_a_request_queued_before_it() {
 
     // Park the worker so the dispatch below is observable: the
     // request sits in the channel instead of racing to completion.
-    fs.pause();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !fs.is_quiesced() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(fs.is_quiesced(), "worker did not park within the budget");
+    park_the_worker(&fs);
 
     fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
     assert_eq!(
@@ -599,14 +611,16 @@ fn the_worker_reaps_the_fd_tables_a_reset_retired() {
         .lookup(fuse::FUSE_ROOT_ID, &name)
         .expect("look the file up");
 
+    // Parked, so the reset provably runs with the worker elsewhere and
+    // the mark it leaves has to outlive it.
+    park_the_worker(&fs);
     VirtioDevice::reset(&fs);
-    // The reset returns with the tables intact: it does not know what
-    // the worker is holding.
     fs.server
         .passthrough()
         .getattr(entry.nodeid)
         .expect("the reset closed an fd the worker could still hold");
 
+    fs.resume();
     let deadline = Instant::now() + Duration::from_secs(5);
     while fs.server.passthrough().getattr(entry.nodeid).is_ok()
         && Instant::now() < deadline
@@ -765,12 +779,7 @@ fn halt_clears_the_count_of_every_request_it_abandons() {
 
     // Park the worker so the requests queue up behind it instead
     // of completing one by one.
-    fs.pause();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !fs.is_quiesced() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(fs.is_quiesced(), "worker did not park within its budget");
+    park_the_worker(&fs);
 
     fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
     assert_eq!(fs.inflight.load(Ordering::Acquire), 3);
@@ -790,13 +799,7 @@ fn halt_clears_the_count_of_every_request_it_abandons() {
 fn halt_joins_the_worker_after_a_pause() {
     let fs = test_fs(Arc::new(PhysMap::new()));
     fs.start().expect("start");
-    fs.pause();
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !fs.is_quiesced() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(fs.is_quiesced(), "worker did not park within its budget");
+    park_the_worker(&fs);
 
     fs.halt();
     assert!(fs.worker.lock().expect("worker lock").is_none());
