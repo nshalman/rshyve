@@ -31,7 +31,12 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         _file: file,
         indicator: Indicator::new(),
         gate: Arc::new(QuiesceGate::new(1)),
-        epoch: Arc::new(AtomicU64::new(0)),
+        ctx: WorkerCtx {
+            physmap: Arc::new(PhysMap::new()),
+            gate: Arc::new(QuiesceGate::new(1)),
+            epoch: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(AtomicUsize::new(0)),
+        },
     });
 
     let probe = Arc::clone(&device);
@@ -983,7 +988,12 @@ fn a_worker_batch_does_not_span_a_reset() {
         };
 
     // Epoch 1 is current; the middle request predates the reset.
-    let epoch = Arc::new(AtomicU64::new(1));
+    let ctx = WorkerCtx {
+        physmap: Arc::clone(&physmap),
+        gate: Arc::new(QuiesceGate::new(1)),
+        epoch: Arc::new(AtomicU64::new(1)),
+        inflight: Arc::new(AtomicUsize::new(3)),
+    };
     let (tx, rx) = mpsc::channel();
     tx.send(request(0, &live, 1)).expect("send live");
     tx.send(request(1, &stale, 0)).expect("send stale");
@@ -998,22 +1008,18 @@ fn a_worker_batch_does_not_span_a_reset() {
         nodelete: true,
     };
     let worker = {
-        let physmap = Arc::clone(&physmap);
-        let epoch = Arc::clone(&epoch);
-        thread::spawn(move || {
-            blk_io_worker(
-                rx,
-                fd,
-                limits,
-                physmap,
-                Arc::new(QuiesceGate::new(1)),
-                epoch,
-            );
-        })
+        let ctx = ctx.clone();
+        thread::spawn(move || blk_io_worker(rx, fd, limits, ctx))
     };
     worker
         .join()
         .expect("worker exits when the channel disconnects");
+
+    assert_eq!(
+        ctx.inflight.load(Ordering::Acquire),
+        0,
+        "every request must clear the in-flight count, dropped ones too"
+    );
 
     assert_eq!(
         stale_queue.read_used_ring_idx(&physmap),
@@ -1024,5 +1030,35 @@ fn a_worker_batch_does_not_span_a_reset() {
         live_queue.read_used_ring_idx(&physmap),
         2,
         "the requests either side of the stale one must both complete"
+    );
+}
+
+// A guest resets its virtio devices several times while it boots. The
+// workers park 50ms after they go idle, so a reset with nothing
+// outstanding must skip the drain rather than pay that each time.
+#[test]
+fn reset_with_an_idle_disk_skips_the_drain() {
+    let (physmap, queue, blk) = make_get_id_queue(8, 5);
+    let mut queues = [queue];
+
+    blk.notify_queue(0, &mut queues, &physmap);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while blk.ctx.inflight.load(Ordering::Acquire) != 0
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        blk.ctx.inflight.load(Ordering::Acquire),
+        0,
+        "the dispatched requests never finished"
+    );
+
+    let start = Instant::now();
+    VirtioDevice::reset(&blk);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(40),
+        "reset drained an idle disk: {elapsed:?}"
     );
 }

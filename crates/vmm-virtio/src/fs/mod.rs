@@ -11,7 +11,7 @@ pub mod fuse;
 pub mod passthrough;
 pub mod server;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -181,6 +181,10 @@ pub struct VirtioFs {
     /// Bumped by every device reset. Tags each queued request so the
     /// worker can tell one that predates the reset from a live one.
     epoch: Arc<AtomicU64>,
+    /// Requests queued and not yet finished. Reset only has to wait for
+    /// the worker while this is non-zero, which keeps a reset on an idle
+    /// export off the worker's 50ms park path.
+    inflight: Arc<AtomicUsize>,
     indicator: Indicator,
     log: slog::Logger,
     /// Queue-indexed interrupt callback. Clone this Arc BEFORE moving the
@@ -221,6 +225,7 @@ impl VirtioFs {
         let shutdown = Arc::new(AtomicBool::new(false));
         let gate = Arc::new(QuiesceGate::new(1));
         let epoch = Arc::new(AtomicU64::new(0));
+        let inflight = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = mpsc::channel::<FsRequest>();
 
         let worker = std::thread::Builder::new()
@@ -231,7 +236,12 @@ impl VirtioFs {
                 let gate = Arc::clone(&gate);
                 let shutdown = Arc::clone(&shutdown);
                 let epoch = Arc::clone(&epoch);
-                move || fs_worker(rx, server, physmap, gate, shutdown, epoch)
+                let inflight = Arc::clone(&inflight);
+                move || {
+                    fs_worker(
+                        rx, server, physmap, gate, shutdown, epoch, inflight,
+                    )
+                }
             })?;
 
         Ok(Self {
@@ -245,6 +255,7 @@ impl VirtioFs {
             shutdown,
             gate,
             epoch,
+            inflight,
             indicator: Indicator::new(),
             log,
             interrupt: Arc::new(Mutex::new(None)),
@@ -288,6 +299,7 @@ fn fs_worker(
     gate: Arc<QuiesceGate>,
     shutdown: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
+    inflight: Arc<AtomicUsize>,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
 
@@ -309,16 +321,16 @@ fn fs_worker(
         }
         // A reset already invalidated this chain and its completion.
         // Drop the request without touching guest memory.
-        if req.epoch != epoch.load(Ordering::Acquire) {
-            continue;
+        if req.epoch == epoch.load(Ordering::Acquire) {
+            let len = server.handle(&req.bufs, &physmap);
+            // A reset can land while the passthrough syscall runs; the
+            // used ring it would publish to is gone.
+            if req.epoch == epoch.load(Ordering::Acquire) {
+                req.completion.complete(req.head, len);
+            }
         }
-        let len = server.handle(&req.bufs, &physmap);
-        // A reset can land while the passthrough syscall runs; the used
-        // ring it would publish to is gone.
-        if req.epoch != epoch.load(Ordering::Acquire) {
-            continue;
-        }
-        req.completion.complete(req.head, len);
+        drop(req);
+        inflight.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -412,7 +424,11 @@ impl VirtioDevice for VirtioFs {
                     completion: Arc::clone(&completion),
                     epoch,
                 };
+                // Count the request before it can be received, so a reset
+                // never reads zero while one is already on its way.
+                self.inflight.fetch_add(1, Ordering::AcqRel);
                 if tx.send(req).is_err() {
+                    self.inflight.fetch_sub(1, Ordering::AcqRel);
                     completion.complete(head, 0);
                 }
             }
@@ -453,11 +469,20 @@ impl VirtioDevice for VirtioFs {
     fn reset(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
 
-        // A device already paused for migration must stay paused; only the
-        // guest-driven reset owns the resume. Same rule as `flush_file`.
-        let was_paused = self.gate.is_paused();
-        self.gate.pause();
-        let quiesced = self.gate.wait_quiesced(FS_RESET_QUIESCE_BUDGET);
+        // The transport clears DRIVER_OK before it calls this, so nothing
+        // can add to the count once it reads zero. Skipping the drain then
+        // keeps a reset on an idle export off the worker's 50ms park path.
+        let mut quiesced = true;
+        if self.inflight.load(Ordering::Acquire) != 0 {
+            // A device already paused for migration must stay paused; only
+            // the guest-driven reset owns the resume, as in `flush_file`.
+            let was_paused = self.gate.is_paused();
+            self.gate.pause();
+            quiesced = self.gate.wait_quiesced(FS_RESET_QUIESCE_BUDGET);
+            if !was_paused {
+                self.gate.resume();
+            }
+        }
 
         *self.negotiated_features.lock().expect("features lock") = 0;
         for slot in self.completions.lock().expect("completion lock").iter_mut()
@@ -469,9 +494,6 @@ impl VirtioDevice for VirtioFs {
         // from this table across a FUSE call.
         self.server.passthrough().clear();
 
-        if !was_paused {
-            self.gate.resume();
-        }
         // Guest reachable: a driver can rebind virtio-fs in a loop.
         slog::debug!(self.log, "virtio-fs reset"; "quiesced" => quiesced);
     }
@@ -886,6 +908,35 @@ mod tests {
             queues[req].read_used_ring_idx(&physmap),
             1,
             "a post-reset request never completed"
+        );
+    }
+
+    // A guest resets its virtio devices several times while it boots. The
+    // worker parks 50ms after it goes idle, so a reset with nothing
+    // outstanding must skip the drain rather than pay that each time.
+    #[test]
+    fn reset_with_an_idle_export_skips_the_drain() {
+        let (physmap, mut queues, fs) = ring(8, 1);
+
+        fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs.inflight.load(Ordering::Acquire) != 0
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fs.inflight.load(Ordering::Acquire),
+            0,
+            "the queued request never finished"
+        );
+
+        let start = Instant::now();
+        VirtioDevice::reset(&fs);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(40),
+            "reset drained an idle export: {elapsed:?}"
         );
     }
 

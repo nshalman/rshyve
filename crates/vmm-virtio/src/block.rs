@@ -132,6 +132,19 @@ struct BlkIoRequest {
     epoch: u64,
 }
 
+/// State every I/O worker shares with the device.
+#[derive(Clone)]
+struct WorkerCtx {
+    physmap: Arc<PhysMap>,
+    gate: Arc<QuiesceGate>,
+    /// Bumped by every device reset; see [`BlkIoRequest::epoch`].
+    epoch: Arc<AtomicU64>,
+    /// Requests dispatched and not yet finished. Reset only has to wait
+    /// for the workers while this is non-zero, which keeps the resets a
+    /// guest does with an idle disk off the 50ms park path.
+    inflight: Arc<AtomicUsize>,
+}
+
 type InterruptCallback = Arc<dyn Fn() + Send + Sync>;
 
 /// VirtIO block device with hybrid sync/async I/O.
@@ -164,9 +177,8 @@ pub struct VirtioBlock {
     /// Lifecycle state indicator.
     indicator: Indicator,
     gate: Arc<QuiesceGate>,
-    /// Bumped by every device reset. Tags each dispatched request so a
-    /// worker can tell one that predates the reset from a live one.
-    epoch: Arc<AtomicU64>,
+    /// Shared with every I/O worker.
+    ctx: WorkerCtx,
 }
 
 impl VirtioBlock {
@@ -194,21 +206,24 @@ impl VirtioBlock {
         let workers_per_queue = if num_queues <= 1 { NUM_WORKERS } else { 2 };
         let total_workers = num_queues as usize * workers_per_queue;
         let gate = Arc::new(QuiesceGate::new(total_workers));
-        let epoch = Arc::new(AtomicU64::new(0));
+        let ctx = WorkerCtx {
+            physmap: Arc::clone(&physmap),
+            gate: Arc::clone(&gate),
+            epoch: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(AtomicUsize::new(0)),
+        };
         let mut io_txs = Vec::with_capacity(total_workers);
         let mut next_worker = Vec::with_capacity(num_queues as usize);
 
         for q in 0..num_queues {
             for i in 0..workers_per_queue {
                 let (tx, rx) = mpsc::channel::<BlkIoRequest>();
-                let physmap = Arc::clone(&physmap);
-                let gate = Arc::clone(&gate);
-                let epoch = Arc::clone(&epoch);
+                let ctx = ctx.clone();
 
                 thread::Builder::new()
                     .name(format!("virtio-blk-q{q}-io-{i}"))
                     .spawn(move || {
-                        blk_io_worker(rx, raw_fd, limits, physmap, gate, epoch);
+                        blk_io_worker(rx, raw_fd, limits, ctx);
                     })
                     .expect("failed to spawn virtio-blk I/O worker");
 
@@ -237,7 +252,7 @@ impl VirtioBlock {
             _file: file,
             indicator: Indicator::new(),
             gate,
-            epoch,
+            ctx,
         })
     }
 
@@ -580,21 +595,29 @@ impl VirtioDevice for VirtioBlock {
 
         // Multiple requests: round-robin dispatch to per-worker channels.
         let base = queue_idx as usize * self.workers_per_queue;
-        let epoch = self.epoch.load(Ordering::Acquire);
+        let epoch = self.ctx.epoch.load(Ordering::Acquire);
         for (head, header, chain) in requests {
             probes::vioblk_dispatch!(|| (head, header.rtype, header.sector));
             let idx = self.next_worker[queue_idx as usize]
                 .fetch_add(1, Ordering::Relaxed)
                 % self.workers_per_queue;
-            // receiver dropped during shutdown; safe to ignore
-            let _ = self.io_txs[base + idx].send(BlkIoRequest {
-                rtype: header.rtype,
-                sector: header.sector,
-                chain,
-                head,
-                completion: Arc::clone(&completion),
-                epoch,
-            });
+            // Count the request before it can be received, so a reset
+            // never reads zero while one is already on its way.
+            self.ctx.inflight.fetch_add(1, Ordering::AcqRel);
+            if self.io_txs[base + idx]
+                .send(BlkIoRequest {
+                    rtype: header.rtype,
+                    sector: header.sector,
+                    chain,
+                    head,
+                    completion: Arc::clone(&completion),
+                    epoch,
+                })
+                .is_err()
+            {
+                // Receiver dropped during shutdown.
+                self.ctx.inflight.fetch_sub(1, Ordering::AcqRel);
+            }
         }
 
         false // workers call completion.complete()
@@ -625,13 +648,22 @@ impl VirtioDevice for VirtioBlock {
     /// off the used ring, and leaving the device half-reset would strand
     /// the driver in that poll loop instead.
     fn reset(&self) {
-        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let epoch = self.ctx.epoch.fetch_add(1, Ordering::AcqRel) + 1;
 
-        // A device already paused for migration must stay paused; only the
-        // guest-driven reset owns the resume. Same rule as `flush_file`.
-        let was_paused = self.gate.is_paused();
-        self.gate.pause();
-        let quiesced = self.gate.wait_quiesced(RESET_QUIESCE_BUDGET);
+        // The transport clears DRIVER_OK before it calls this, so nothing
+        // can add to the count once it reads zero. Skipping the drain then
+        // keeps a reset on an idle disk off the workers' 50ms park path.
+        let mut quiesced = true;
+        if self.ctx.inflight.load(Ordering::Acquire) != 0 {
+            // A device already paused for migration must stay paused; only
+            // the guest-driven reset owns the resume, as in `flush_file`.
+            let was_paused = self.gate.is_paused();
+            self.gate.pause();
+            quiesced = self.gate.wait_quiesced(RESET_QUIESCE_BUDGET);
+            if !was_paused {
+                self.gate.resume();
+            }
+        }
 
         *self.negotiated_features.lock().expect("lock") = 0;
         let mut slots = self.completions.lock().expect("lock");
@@ -640,9 +672,6 @@ impl VirtioDevice for VirtioBlock {
         }
         drop(slots);
 
-        if !was_paused {
-            self.gate.resume();
-        }
         if !quiesced {
             probes::vioblk_reset_stuck!(|| epoch);
         }
@@ -701,9 +730,7 @@ fn blk_io_worker(
     rx: mpsc::Receiver<BlkIoRequest>,
     fd: i32,
     limits: DiskLimits,
-    physmap: Arc<PhysMap>,
-    gate: Arc<QuiesceGate>,
-    epoch: Arc<AtomicU64>,
+    ctx: WorkerCtx,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
 
@@ -717,7 +744,7 @@ fn blk_io_worker(
             None => match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(r) => r,
                 Err(RecvTimeoutError::Timeout) => {
-                    gate.park_if_paused();
+                    ctx.gate.park_if_paused();
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -726,14 +753,17 @@ fn blk_io_worker(
 
         // A reset already invalidated this request's chain and completion.
         // Drop it without touching guest memory.
-        let current = epoch.load(Ordering::Acquire);
+        let current = ctx.epoch.load(Ordering::Acquire);
         if req.epoch != current {
+            drop(req);
+            ctx.inflight.fetch_sub(1, Ordering::AcqRel);
             continue;
         }
 
         let completion = Arc::clone(&req.completion);
         let mut batch = Vec::with_capacity(BATCH_MAX);
-        batch.extend(process_one_request(fd, &limits, &physmap, &epoch, req));
+        batch.extend(process_one_request(fd, &limits, &ctx, req));
+        ctx.inflight.fetch_sub(1, Ordering::AcqRel);
 
         // Try to drain more pending requests for batching.
         // This reduces Mutex acquisitions in VirtioCompletion:
@@ -746,9 +776,8 @@ fn blk_io_worker(
                 carried = Some(next);
                 break;
             }
-            batch.extend(process_one_request(
-                fd, &limits, &physmap, &epoch, next,
-            ));
+            batch.extend(process_one_request(fd, &limits, &ctx, next));
+            ctx.inflight.fetch_sub(1, Ordering::AcqRel);
         }
 
         match batch.len() {
@@ -770,10 +799,10 @@ fn blk_io_worker(
 fn process_one_request(
     fd: i32,
     limits: &DiskLimits,
-    physmap: &PhysMap,
-    epoch: &AtomicU64,
+    ctx: &WorkerCtx,
     req: BlkIoRequest,
 ) -> Option<(u16, u32)> {
+    let physmap = &ctx.physmap;
     let (status, written) = match req.rtype {
         bits::VIRTIO_BLK_T_IN => do_pread(fd, req.sector, &req.chain, physmap),
         bits::VIRTIO_BLK_T_OUT if !limits.read_only => {
@@ -793,7 +822,7 @@ fn process_one_request(
         _ => (bits::VIRTIO_BLK_S_UNSUPP, 1),
     };
 
-    if req.epoch != epoch.load(Ordering::Acquire) {
+    if req.epoch != ctx.epoch.load(Ordering::Acquire) {
         return None;
     }
     write_status(physmap, &req.chain, status);
