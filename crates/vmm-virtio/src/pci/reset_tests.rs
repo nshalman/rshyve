@@ -15,12 +15,14 @@
 //! reset finish early, and no event from the old session may reach the
 //! driver that follows.
 
+mod intr;
+
 use super::*;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread::ThreadId;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vmm_core::common::{ReadOp, WriteOp};
 
 /// A wait this long means a thread is wedged, not slow.
@@ -28,6 +30,10 @@ const WEDGED: Duration = Duration::from_secs(10);
 
 /// Time given to a wrong build to run ahead of a parked thread.
 const SETTLE: Duration = Duration::from_millis(200);
+
+/// A reset that takes longer than this waited for something a guest
+/// chose the size of, not for the work the transport admitted.
+const RESET_BUDGET: Duration = Duration::from_secs(1);
 
 /// Status a driver holds just before it sets DRIVER_OK.
 const READY: u8 =

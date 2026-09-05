@@ -183,6 +183,17 @@ impl MsixTable {
         self.msi.send(addr, data);
     }
 
+    /// Drop every message the PBA is holding.
+    ///
+    /// A device reset ends the driver session that asked for these.
+    /// Left in place they leave on the next unmask, which is a guest
+    /// write to the table BAR that no reset gates, and they carry the
+    /// address and data of a driver that is gone.
+    pub fn clear_pending(&self) {
+        let mut inner = self.inner.lock().expect("msix lock");
+        inner.pba.fill(0);
+    }
+
     /// Returns true if MSI-X is enabled (Message Control bit 15).
     pub fn is_enabled(&self) -> bool {
         self.inner.lock().expect("msix lock").enabled

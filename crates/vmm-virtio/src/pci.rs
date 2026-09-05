@@ -23,7 +23,7 @@
 //! Legacy guests use BAR0 as before. `EVENT_IDX` and `INDIRECT_DESC`
 //! are only advertised through the modern path.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use vmm_core::common::RWOp;
 use vmm_core::mem::PhysMap;
@@ -234,6 +234,158 @@ fn run_park(slot: &ParkSlot) {
     }
 }
 
+/// Orders every interrupt this device delivers against its own reset.
+///
+/// A device reset runs on the vCPU that wrote DEVICE_STATUS and must
+/// return with the ISR clear and this device off the interrupt line.
+/// It cannot recall an injection another thread has already handed to
+/// the kernel, so it does the one thing it can: it shuts the door,
+/// waits out the injections already through it, and only then clears
+/// what it owns.
+///
+/// Two mechanisms, because the two halves need different shapes.
+///
+/// `admission` decides which deliveries start. A raise names the
+/// driver session it was raised for, and a reset ends that session and
+/// shuts admission before anything else. No holder of this lock calls
+/// the kernel, so a resetting vCPU never queues behind an injection to
+/// take it. [`Self::settle`] then waits for the deliveries already
+/// admitted. That set is closed and small: one injection per thread
+/// that was already inside, doing nothing else, and a guest cannot add
+/// threads. It is the "one write, no poll" contract that makes the
+/// wait right rather than merely tolerable, and VirtIO 1.3 sec 2.4.1
+/// asks for the same order.
+///
+/// `line` keeps the ISR byte and the INTx level from disagreeing. They
+/// are one piece of state: a driver that reads a zero ISR claims
+/// nothing and lowers nothing, so a level left asserted behind a zero
+/// ISR wedges the line for every device sharing it. This one IS held
+/// across the pin ioctl, and it has to be, but every holder does
+/// exactly one injection and no more.
+struct IntrGate {
+    admission: Mutex<Admission>,
+    settled: Condvar,
+    /// A cheap read of `Admission::session` for a caller that only
+    /// samples it. Staleness is safe: [`Self::begin`] rechecks under
+    /// the lock, and a stale sample can only be refused.
+    session: std::sync::atomic::AtomicU64,
+    line: Mutex<()>,
+}
+
+struct Admission {
+    /// Whether deliveries are being admitted. Shut for the whole
+    /// reset, not just for the session bump: one admitted after the
+    /// settle would still be racing the cleanup behind it.
+    open: bool,
+    /// Counts driver sessions, one more each time a reset takes the
+    /// device down.
+    session: u64,
+    /// Deliveries admitted and not yet finished.
+    in_flight: usize,
+}
+
+/// One admitted delivery, counted until it is dropped.
+struct Admitted<'a> {
+    gate: &'a IntrGate,
+}
+
+impl Drop for Admitted<'_> {
+    fn drop(&mut self) {
+        let mut a = self
+            .gate
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        a.in_flight -= 1;
+        if a.in_flight == 0 {
+            self.gate.settled.notify_all();
+        }
+    }
+}
+
+impl IntrGate {
+    fn new() -> Self {
+        Self {
+            admission: Mutex::new(Admission {
+                open: true,
+                session: 0,
+                in_flight: 0,
+            }),
+            settled: Condvar::new(),
+            session: std::sync::atomic::AtomicU64::new(0),
+            line: Mutex::new(()),
+        }
+    }
+
+    /// The session a caller must name to be admitted.
+    fn session(&self) -> u64 {
+        self.session.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Admit one delivery for `session`.
+    fn begin(&self, session: u64) -> Option<Admitted<'_>> {
+        let mut a = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !a.open || a.session != session {
+            return None;
+        }
+        a.in_flight += 1;
+        Some(Admitted { gate: self })
+    }
+
+    /// Admit one delivery for whichever session is current.
+    fn begin_current(&self) -> Option<Admitted<'_>> {
+        let mut a = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !a.open {
+            return None;
+        }
+        a.in_flight += 1;
+        Some(Admitted { gate: self })
+    }
+
+    /// End the driver session and shut admission.
+    fn end_session(&self) {
+        let mut a = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        a.open = false;
+        a.session += 1;
+        self.session
+            .store(a.session, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Wait for the deliveries admission let through before it shut.
+    fn settle(&self) {
+        let mut a = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while a.in_flight != 0 {
+            a = self.settled.wait(a).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Admit the next driver.
+    fn reopen(&self) {
+        let mut a = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        a.open = true;
+    }
+
+    /// Hold the ISR byte and the INTx level together.
+    fn line(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.line.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// PCI device wrapping a VirtIO backend.
 ///
 /// Implements the [`PciDevice`] trait so it can be attached to the PCI
@@ -281,15 +433,9 @@ pub struct VirtioPciDevice<D: VirtioDevice> {
     /// that refuses is guest driven and repeatable, so the rest go to
     /// `debug`.
     queue_refusal_reported: std::sync::atomic::AtomicBool,
-    /// Counts driver sessions, one more each time a reset takes the
-    /// device down. An event that sampled this under the transport
-    /// lock can tell whether the driver it was raised for is still
-    /// there.
-    session: std::sync::atomic::AtomicU64,
-    /// Orders a config interrupt against the reset that lowers the
-    /// line, so a raise either lands in the session that asked for it
-    /// or not at all.
-    config_intr: Mutex<()>,
+    /// Orders every interrupt this device delivers against its own
+    /// reset.
+    intr: IntrGate,
     /// Park points a test uses to pin a reset interleaving.
     #[cfg(test)]
     parks: TestParks,
@@ -450,8 +596,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             self_ref: Mutex::new(None),
             log,
             queue_refusal_reported: std::sync::atomic::AtomicBool::new(false),
-            session: std::sync::atomic::AtomicU64::new(0),
-            config_intr: Mutex::new(()),
+            intr: IntrGate::new(),
             #[cfg(test)]
             parks: TestParks::default(),
             cap_offsets,
@@ -805,23 +950,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             0x0000 => self.modern_common_read(reg, len),
             0x1000 => self.device.cfg_read(reg, len as u8),
             0x2000 => 0, // notify is write-only
-            0x3000 => {
-                // ISR status (same semantics as legacy: read clears)
-                let val = self
-                    .isr_status
-                    .swap(0, std::sync::atomic::Ordering::AcqRel);
-                if val != 0 {
-                    self.lower_interrupt();
-                    if self
-                        .isr_status
-                        .load(std::sync::atomic::Ordering::Acquire)
-                        != 0
-                    {
-                        self.raise_interrupt();
-                    }
-                }
-                u32::from(val)
-            }
+            0x3000 => u32::from(self.read_isr()),
             _ => 0,
         }
     }
@@ -881,12 +1010,11 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     return;
                 }
                 if did_work {
-                    self.isr_status.fetch_or(
-                        bits::ISR_QUEUE_INTR,
-                        std::sync::atomic::Ordering::Release,
-                    );
+                    // Sampled under the guard, so a reset that ends
+                    // this session is always the later of the two.
+                    let session = self.intr.session();
                     drop(vs);
-                    self.raise_queue_interrupt_for(queue_idx);
+                    self.raise_queue_interrupt_in(session, queue_idx);
                 }
             }
             0x3000 => {} // ISR is read-only
@@ -1154,11 +1282,28 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// hot path. Workers and vCPU can set ISR concurrently without
     /// Mutex contention.
     pub fn raise_queue_interrupt(&self) {
+        let _line = self.intr.line();
         self.isr_status.fetch_or(
             bits::ISR_QUEUE_INTR,
             std::sync::atomic::Ordering::Release,
         );
         self.raise_interrupt();
+    }
+
+    /// Read and clear the ISR the way a legacy driver's handler does.
+    ///
+    /// The read, the clear and the pin are one step under the line
+    /// guard. Split apart they disagree: a raise landing between the
+    /// swap and the deassert leaves the ISR at zero with the pin held
+    /// up, and a level-triggered driver that reads zero claims
+    /// nothing and never lowers it again.
+    fn read_isr(&self) -> u8 {
+        let _line = self.intr.line();
+        let val = self.isr_status.swap(0, std::sync::atomic::Ordering::AcqRel);
+        if val != 0 {
+            self.lower_interrupt();
+        }
+        val
     }
 
     /// Deassert the interrupt after ISR is read or on device reset.
@@ -1181,9 +1326,40 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         }
     }
 
-    /// Raise an interrupt for a specific queue, routing via MSI-X
-    /// when available or falling back to legacy INTx.
+    /// Raise an interrupt for a specific queue, on behalf of a device
+    /// backend that has no transport session to name.
+    ///
+    /// The gate admits it under whichever session is current. A
+    /// backend suspended between its own epoch check and this call
+    /// can therefore still be admitted once the reset has finished
+    /// and reopened admission. What it delivers then is one spurious
+    /// queue interrupt, which the ISR and the pin agree on and which
+    /// VirtIO 1.3 sec 2.7.6 lets a driver ignore; it is not the
+    /// asymmetry that wedges a shared line. Naming the session here
+    /// instead needs the completion to carry the transport
+    /// incarnation it was armed for.
     pub fn raise_queue_interrupt_for(&self, queue_idx: u16) {
+        let Some(_admitted) = self.intr.begin_current() else {
+            return;
+        };
+        self.deliver_queue_interrupt(queue_idx);
+    }
+
+    /// Raise an interrupt for a specific queue, for the driver
+    /// session that asked for it.
+    ///
+    /// A reset ends the session and shuts admission before it clears
+    /// the ISR and lowers the line, so a raise is either whole and
+    /// before that cleanup or refused outright.
+    fn raise_queue_interrupt_in(&self, session: u64, queue_idx: u16) {
+        let Some(_admitted) = self.intr.begin(session) else {
+            return;
+        };
+        self.deliver_queue_interrupt(queue_idx);
+    }
+
+    /// Route a queue interrupt the way the driver armed it.
+    fn deliver_queue_interrupt(&self, queue_idx: u16) {
         if let Some(ref msix) = self.msix {
             // Read vector from lock-free atomic cache (no virtio_state lock
             // needed — safe to call from inside notify_queue callbacks).
@@ -1192,15 +1368,21 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 .get(queue_idx as usize)
                 .map(|a| a.load(std::sync::atomic::Ordering::Acquire))
                 .unwrap_or(bits::VIRTIO_MSI_NO_VECTOR);
-            if vector != bits::VIRTIO_MSI_NO_VECTOR {
-                msix.fire(vector);
+            if msix.is_enabled() {
+                // VirtIO 1.3 sec 4.1.5.1.2: with MSI-X enabled, a
+                // queue mapped to NO_VECTOR gets no interrupt at all.
+                // Falling back to the pin would assert a line an
+                // MSI-X driver registered no handler for, and the
+                // level stays up for the life of the VM.
+                if vector != bits::VIRTIO_MSI_NO_VECTOR {
+                    msix.fire(vector);
+                }
                 return;
             }
         }
-        // No MSI-X vector for this queue, so fall back to legacy INTx.
-        // This is normal operation, not an error: a guest built without
-        // CONFIG_PCI_MSI never assigns a vector, and this runs once per
-        // interrupt, so it must stay silent and lock-free.
+        // MSI-X absent or not enabled, so the driver is on INTx. This
+        // is normal operation, not an error: a guest built without
+        // CONFIG_PCI_MSI never assigns a vector.
         self.raise_queue_interrupt();
     }
 
@@ -1227,6 +1409,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 return;
             }
         }
+        let _line = self.intr.line();
         self.isr_status.fetch_or(
             bits::ISR_CFG_CHANGE,
             std::sync::atomic::Ordering::Release,
@@ -1243,17 +1426,17 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// So a reset can start in the gap, and the reset both wipes the
     /// status this interrupt reports and lowers the line. Raising
     /// after that leaves an assertion standing in the next driver's
-    /// session, for a change that session never saw. The gate makes
-    /// the session check and the delivery one step against the reset
-    /// that lowers the line, so this either goes out to the driver it
-    /// was raised for or not at all.
+    /// session, for a change that session never saw. Admission and
+    /// the session check are one step under a lock that holds no
+    /// kernel call, and the reset waits out the deliveries it
+    /// admitted, so this either goes out to the driver it was raised
+    /// for or not at all.
     fn raise_config_interrupt_in(&self, session: u64) {
         #[cfg(test)]
         run_park(&self.parks.config_interrupt_pending);
-        let _gate = self.config_intr.lock().expect("config intr lock");
-        if self.session.load(std::sync::atomic::Ordering::Acquire) != session {
+        let Some(_admitted) = self.intr.begin(session) else {
             return;
-        }
+        };
         self.raise_config_interrupt();
     }
 
@@ -1295,7 +1478,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
         // Sampled under the guard that wrote the bit, so a reset that
         // wipes it is always the later of the two.
-        let session = self.session.load(std::sync::atomic::Ordering::Acquire);
+        let session = self.intr.session();
         drop(vs);
         if let Some(error) = error {
             let first = !self
@@ -1359,10 +1542,12 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         vs.resetting = true;
         vs.status &= !bits::STATUS_DRIVER_OK;
         vs.queue_enabled.fill(false);
-        // The driver session ends here. An interrupt an earlier event
-        // asked for must not reach the driver that comes next.
-        self.session
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        // The driver session ends here, and interrupt admission shuts
+        // with it. An interrupt an earlier event asked for must not
+        // reach the driver that comes next. Admission stays shut for
+        // the whole of `finish_reset`, so nothing joins the set that
+        // reset has to wait out.
+        self.intr.end_session();
         drop(vs);
 
         self.finish_reset();
@@ -1377,15 +1562,27 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     fn finish_reset(&self) {
         self.device.reset();
 
-        // The next driver must find the line low, or it sees a
-        // spurious assertion when it enables the IOAPIC pin. The gate
-        // holds off a config interrupt that would put the line back
-        // up behind this.
+        // Every delivery this session admitted has finished. Nothing
+        // joins them: admission shut before the backend reset. The
+        // wait is over transport work only, one interrupt injection
+        // per thread already inside, and a guest cannot add threads.
+        self.intr.settle();
+
+        // The next driver must find this device off the line, or it
+        // sees a spurious assertion when it enables the IOAPIC pin.
+        // The ISR and the pin move together, so a driver on another
+        // vCPU cannot read the ISR between them.
         {
-            let _gate = self.config_intr.lock().expect("config intr lock");
+            let _line = self.intr.line();
             self.isr_status
                 .store(0, std::sync::atomic::Ordering::Relaxed);
             self.lower_interrupt();
+        }
+        // Messages the old session left pending would otherwise leave
+        // on the next unmask, which is a guest write this reset does
+        // not gate.
+        if let Some(ref msix) = self.msix {
+            msix.clear_pending();
         }
 
         let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
@@ -1403,8 +1600,11 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         }
         // Status 0 and the open latch reach the guest together. The
         // driver writes ACKNOWLEDGE next, and that write must not meet
-        // a latch that is still closed.
+        // a latch that is still closed. Interrupt admission reopens in
+        // the same critical section, so no register write can get
+        // through before deliveries are being admitted again.
         vs.resetting = false;
+        self.intr.reopen();
         drop(vs);
     }
 
@@ -1417,7 +1617,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             return;
         };
         vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
-        let session = self.session.load(std::sync::atomic::Ordering::Acquire);
+        let session = self.intr.session();
         drop(vs);
         self.raise_config_interrupt_in(session);
     }
@@ -1458,26 +1658,12 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             }
             bits::LEGACY_REG_DEVICE_STATUS => u32::from(vs.readable_status()),
             bits::LEGACY_REG_ISR_STATUS => {
-                // Atomic swap: read and clear ISR in one operation.
-                let val = self
-                    .isr_status
-                    .swap(0, std::sync::atomic::Ordering::AcqRel);
-                if val != 0 {
-                    drop(vs);
-                    self.lower_interrupt();
-                    // Re-check: a worker may have set ISR between our
-                    // swap and deassert. If so, re-assert the pin so
-                    // the guest gets another interrupt for the new work.
-                    if self
-                        .isr_status
-                        .load(std::sync::atomic::Ordering::Acquire)
-                        != 0
-                    {
-                        self.raise_interrupt();
-                    }
-                    return u32::from(val);
-                }
-                0
+                // The line guard is taken with the transport lock
+                // already given up: a raise holds the line guard and
+                // an ISR read must not be able to hold the transport
+                // lock behind it.
+                drop(vs);
+                u32::from(self.read_isr())
             }
             bits::LEGACY_REG_MSIX_CONFIG_VECTOR if self.msix.is_some() => {
                 u32::from(vs.config_msix_vector)
@@ -1587,8 +1773,11 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     return;
                 }
                 if did_work {
+                    // Sampled under the guard, so a reset that ends
+                    // this session is always the later of the two.
+                    let session = self.intr.session();
                     drop(vs);
-                    self.raise_queue_interrupt_for(queue_idx);
+                    self.raise_queue_interrupt_in(session, queue_idx);
                 }
             }
             bits::LEGACY_REG_DEVICE_STATUS => {
