@@ -155,6 +155,11 @@ impl MsixTable {
     /// If the vector is masked or MSI-X is globally disabled, the
     /// interrupt is recorded in the PBA for later delivery when
     /// unmasked.
+    ///
+    /// The lock is dropped before the sink. Delivery is a call into
+    /// the kernel, and a device reset lowers this same route from the
+    /// vCPU that wrote the reset register, so nothing here may hold a
+    /// message in flight against that reset.
     #[inline]
     pub fn fire(&self, vector: u16) {
         let mut inner = self.inner.lock().expect("msix lock");
@@ -424,7 +429,13 @@ fn drain_pending(inner: &mut MsixInner) -> Vec<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
     use super::*;
+
+    /// A teardown that takes longer than this is waiting on the sink.
+    const TEARDOWN_BUDGET: Duration = Duration::from_secs(1);
 
     /// Records every message the table delivers, so a test can assert
     /// the exact bytes that reach the hypervisor.
@@ -679,5 +690,62 @@ mod tests {
         write_msg_ctrl(&table, false);
 
         assert_eq!(sink.recorded().len(), 0);
+    }
+
+    /// A sink that holds the sending thread until it is released.
+    /// This stands in for a kernel call that has not returned.
+    #[derive(Default)]
+    struct ParkingSink {
+        sending: AtomicBool,
+        release: AtomicBool,
+    }
+
+    impl MsiSink for ParkingSink {
+        fn send(&self, _addr: u64, _data: u64) {
+            self.sending.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
+    fn a_message_in_flight_does_not_hold_the_table() {
+        let sink = Arc::new(ParkingSink::default());
+        let table = MsixTable::new(2, sink.clone());
+        table.cap_write(0, 0, u32::from(MSG_CTRL_ENABLE) << 16);
+        table.write_entry(0, 0xFEE0_9000, 0xA1);
+
+        // The teardown runs on its own thread under a deadline. One
+        // that waits on the sink is waiting for a park only this
+        // thread releases, so waiting for it here would hang the run
+        // instead of failing it.
+        let torn_down = AtomicBool::new(false);
+        let waited = std::thread::scope(|s| {
+            s.spawn(|| table.fire(0));
+            while !sink.sending.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            // A driver tearing the device down clears Message Control.
+            s.spawn(|| {
+                table.cap_write(0, 0, 0);
+                torn_down.store(true, Ordering::Release);
+            });
+            let start = Instant::now();
+            while !torn_down.load(Ordering::Acquire)
+                && start.elapsed() < TEARDOWN_BUDGET
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let waited = start.elapsed();
+            sink.release.store(true, Ordering::Release);
+            waited
+        });
+
+        assert!(
+            waited < TEARDOWN_BUDGET,
+            "the teardown waited {waited:?} behind a message in flight"
+        );
     }
 }
