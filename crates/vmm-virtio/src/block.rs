@@ -658,10 +658,12 @@ impl VirtioDevice for VirtioBlock {
     /// that gives up and reports the reset done has lost: no check made
     /// afterwards takes that write back. Taking `ring_access` exclusively
     /// is the only thing that ends the window, so this returns after the
-    /// last worker leaves it, or not at all. Bumping the epoch first
-    /// drops every request that has not started, so the wait covers the
-    /// syscalls already in flight and nothing else, and those are the
-    /// ones the guest was blocked on before it asked for the reset.
+    /// last worker leaves it, or not at all. The transport runs this on
+    /// its drain thread, so no vCPU waits behind it. Bumping the epoch
+    /// first drops every request that has not started, so the wait
+    /// covers the syscalls already in flight and nothing else, and
+    /// those are the ones the guest was blocked on before it asked for
+    /// the reset.
     fn reset(&self) {
         let epoch = self.ctx.epoch.fetch_add(1, Ordering::AcqRel) + 1;
 
