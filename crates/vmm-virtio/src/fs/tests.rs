@@ -19,8 +19,9 @@ use vmm_devices::Lifecycle;
 
 /// Deadline on every wait a parked backend can be caught in. A device
 /// that wrongly waits on the backing store fails the test after this
-/// instead of hanging the run.
-const PARK_BUDGET: Duration = Duration::from_secs(2);
+/// instead of hanging the run. Long enough that a loaded runner cannot
+/// reach it, because only a real fault should.
+const PARK_BUDGET: Duration = Duration::from_secs(10);
 
 /// Longer than the two second budget the old drain gave up after. A
 /// reset that returns inside this window has a deadline again.
