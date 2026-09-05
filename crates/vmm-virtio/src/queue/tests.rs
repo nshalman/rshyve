@@ -526,3 +526,17 @@ fn the_suppression_field_must_be_mapped_under_event_idx() {
         }),
     ));
 }
+
+/// The legacy PFN layout must pass the same check: it is what the
+/// bhyve guests in the field program, and EVENT_IDX is stripped from
+/// that transport, so the rings carry no suppression field.
+#[test]
+fn the_legacy_pfn_layout_is_accepted() {
+    const BASE: u64 = 0x8000;
+    // What a driver allocates for 128 descriptors: two pages.
+    let physmap = PhysMap::new_anon(BASE, 0x2000).expect("create guest memory");
+    let mut queue = VirtQueue::new(128);
+    queue.set_addr_legacy((BASE / PAGE_SIZE as u64) as u32);
+
+    assert_eq!(queue.validate_addrs(&physmap), Ok(()));
+}
