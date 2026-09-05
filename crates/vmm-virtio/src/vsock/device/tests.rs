@@ -270,14 +270,7 @@ fn a_refused_rx_chain_returns_its_descriptor() {
 #[test]
 fn a_good_rx_chain_is_held_for_a_packet() {
     let (physmap, mut queues) = rx_ring();
-    write_desc(
-        &physmap,
-        0,
-        BUF_GPA,
-        64,
-        crate::bits::VRING_DESC_F_WRITE,
-        0,
-    );
+    write_desc(&physmap, 0, BUF_GPA, 64, crate::bits::VRING_DESC_F_WRITE, 0);
     let (dir, vsock) = test_vsock(Arc::clone(&physmap));
 
     vsock.notify_queue(VSOCK_RX_QUEUE, &mut queues, &physmap);
