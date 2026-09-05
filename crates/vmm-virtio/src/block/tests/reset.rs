@@ -270,3 +270,55 @@ fn reset_with_an_idle_disk_skips_the_drain() {
         "reset drained an idle disk: {elapsed:?}"
     );
 }
+
+// `reset` skips the drain when the in-flight count reads zero, so the
+// count has to cover the used-ring write as well as the syscall. A
+// worker that drops its count first leaves a window where a reset
+// returns, the driver frees the vring, and the worker then publishes
+// into the pages the guest has recycled.
+#[test]
+fn a_worker_holds_its_count_until_the_used_entry_lands() {
+    let (physmap, queue, blk) = make_get_id_queue(8, 1);
+
+    // Read by the completion's interrupt, which runs after the used
+    // entry and the used index are both written.
+    let at_publish = Arc::new(AtomicUsize::new(usize::MAX));
+    let completion = {
+        let seen = Arc::clone(&at_publish);
+        let inflight = Arc::clone(&blk.ctx.inflight);
+        VirtioCompletion::new(&queue, Arc::clone(&physmap), move || {
+            seen.store(inflight.load(Ordering::Acquire), Ordering::Release);
+        })
+    };
+    completion.set_force_interrupt(1);
+
+    let (tx, rx) = mpsc::channel();
+    blk.ctx.inflight.fetch_add(1, Ordering::AcqRel);
+    tx.send(BlkIoRequest {
+        rtype: bits::VIRTIO_BLK_T_FLUSH,
+        sector: 0,
+        chain: Vec::new(),
+        head: 0,
+        completion,
+        epoch: blk.ctx.epoch.load(Ordering::Acquire),
+    })
+    .expect("queue the request");
+    drop(tx);
+
+    let ctx = blk.ctx.clone();
+    let fd = blk.fd;
+    let limits = DiskLimits {
+        capacity: blk.capacity,
+        read_only: blk.read_only,
+        nodelete: blk.nodelete,
+    };
+    thread::spawn(move || blk_io_worker(rx, fd, limits, ctx))
+        .join()
+        .expect("worker");
+
+    assert_ne!(
+        at_publish.load(Ordering::Acquire),
+        0,
+        "the count reached zero before the used entry was published",
+    );
+}

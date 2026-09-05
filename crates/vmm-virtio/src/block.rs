@@ -770,22 +770,26 @@ fn blk_io_worker(
 
         let completion = Arc::clone(&req.completion);
         let mut batch = Vec::with_capacity(BATCH_MAX);
+        // Requests this pass took off the channel. The count covers
+        // them until their used entries are published, because `reset`
+        // skips the drain the moment it reads zero.
+        let mut owned = 1usize;
         batch.extend(process_one_request(fd, &limits, &ctx, req));
-        ctx.inflight.fetch_sub(1, Ordering::AcqRel);
 
         // Try to drain more pending requests for batching.
         // This reduces Mutex acquisitions in VirtioCompletion:
         // one complete_batch() instead of N complete() calls.
-        while batch.len() < BATCH_MAX {
+        while owned < BATCH_MAX {
             let Ok(next) = rx.try_recv() else { break };
             if next.epoch != current {
                 // A reset landed mid drain. Publish what this batch holds
                 // before touching a request from the other side of it.
+                // Its own count stays outstanding: the next pass owns it.
                 carried = Some(next);
                 break;
             }
+            owned += 1;
             batch.extend(process_one_request(fd, &limits, &ctx, next));
-            ctx.inflight.fetch_sub(1, Ordering::AcqRel);
         }
 
         match batch.len() {
@@ -796,6 +800,9 @@ fn blk_io_worker(
             }
             _ => completion.complete_batch(&batch),
         }
+        // Only now can a reset read zero and skip the drain: every used
+        // entry this pass owed the guest is already in the ring.
+        ctx.inflight.fetch_sub(owned, Ordering::AcqRel);
     }
 }
 
