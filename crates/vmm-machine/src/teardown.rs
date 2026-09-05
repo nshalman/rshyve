@@ -340,6 +340,10 @@ fn run_event_loop_with(
     log: &Logger,
 ) -> anyhow::Result<RunOutcome> {
     let outcome = outcome_of(vcpus.next_event(&event_rx), log);
+    // Every wait below is bounded, so a SIGTERM escalation running
+    // beside this has nothing left to add and must not end the process
+    // in the middle of a device flush.
+    crate::signal::mark_teardown_started();
 
     // A wedged backend must not prevent release of the bhyve instance.
     let _report = devices.quiesce(log);

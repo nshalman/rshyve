@@ -28,11 +28,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How long the guest gets to act on the stop request.
 const GRACEFUL_BUDGET: Duration = Duration::from_secs(30);
 
-/// How long the hard stop and the teardown behind it get.
+/// How long the hard stop gets before the process is ended.
 ///
-/// Teardown allows 5 s to quiesce the devices and 5 s to join the vCPU
-/// threads (`teardown.rs`). This must outlast both, or a teardown that
-/// is working would be cut short.
+/// This covers a VMM that never reached its teardown at all. A
+/// teardown that is running clears [`teardown_flag`] of this clock,
+/// because its own budgets scale with the device count and this
+/// constant cannot.
 const HARD_BUDGET: Duration = Duration::from_secs(20);
 
 /// Exit code for a VMM that outlived its own shutdown.
@@ -87,6 +88,22 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
     SIGTERM_RECEIVED.store(true, Ordering::Relaxed);
 }
 
+/// Set once the event loop has ended and teardown has begun.
+static TEARDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Borrow the flag [`mark_teardown_started`] writes.
+pub fn teardown_flag() -> &'static AtomicBool {
+    &TEARDOWN_STARTED
+}
+
+/// Say that the guest has stopped and teardown is running.
+///
+/// Teardown bounds every wait it makes, so the escalation has nothing
+/// left to add once this is set.
+pub fn mark_teardown_started() {
+    TEARDOWN_STARTED.store(true, Ordering::Release);
+}
+
 /// Borrow the flag the handler writes.
 ///
 /// A caller that must re-read the flag at a later decision point takes
@@ -111,14 +128,21 @@ fn shutdown_sequence(
     vm: &dyn GuestStop,
     wait: impl Fn(Duration),
     give_up: impl FnOnce(),
+    teardown: &AtomicBool,
     log: &Logger,
 ) {
-    // Ask first. A guest that acts on this flushes its filesystems
-    // before it goes, which a suspend of a running guest does not.
+    // The first step is a suspend, not an ACPI power button: the
+    // kernel turns VM_SUSPEND_POWEROFF straight into a suspend exit on
+    // every vCPU, so the guest is not asked and gets no flush window.
+    // The wait that follows is for the run loop to see the exit and
+    // for teardown to take over, not for the guest to answer.
     if let Err(e) = vm.request_poweroff() {
         warn!(log, "the stop request did not reach the VM"; "error" => %e);
     }
     wait(GRACEFUL_BUDGET);
+    if teardown.load(Ordering::Acquire) {
+        return stand_down(log);
+    }
 
     warn!(log, "the guest did not stop in time; halting it";
         "waited_secs" => GRACEFUL_BUDGET.as_secs());
@@ -126,6 +150,9 @@ fn shutdown_sequence(
         warn!(log, "the halt did not reach the VM"; "error" => %e);
     }
     wait(HARD_BUDGET);
+    if teardown.load(Ordering::Acquire) {
+        return stand_down(log);
+    }
 
     // Nothing is left to try. A node must not keep the memory of a VM
     // that will not stop, so the process goes without its teardown.
@@ -134,6 +161,20 @@ fn shutdown_sequence(
     error!(log, "the VMM outlived its own shutdown; ending the process";
         "exit_code" => WEDGED_EXIT);
     give_up();
+}
+
+/// Leave a running teardown to finish on its own.
+///
+/// Teardown bounds every wait it makes, but the total is a per-device
+/// flush budget times the device count, which no constant here can
+/// know. Ending the process against this clock would cut a working
+/// shutdown off mid flush and return an exit code `main` never
+/// produces, which reads as a VMM failure on a normal stop.
+fn stand_down(log: &Logger) {
+    info!(
+        log,
+        "teardown is running; the shutdown escalation stands down"
+    );
 }
 
 /// Install the SIGTERM signal handler and spawn a poller thread that
@@ -166,6 +207,7 @@ pub fn install_sigterm_handler_with(stop: Arc<dyn GuestStop>, log: &Logger) {
                 stop.as_ref(),
                 thread::sleep,
                 || std::process::exit(WEDGED_EXIT),
+                teardown_flag(),
                 &log_sig,
             );
         })

@@ -80,21 +80,59 @@ fn null_log() -> Logger {
 /// Drive one sequence with no real waiting, and say whether it ended
 /// the process.
 fn drive(stop: &RecordingStop) -> bool {
+    drive_with(stop, &AtomicBool::new(false), |_| {})
+}
+
+/// The same, with a teardown flag and a hook that runs on every wait.
+fn drive_with(
+    stop: &RecordingStop,
+    teardown: &AtomicBool,
+    on_wait: impl Fn(Duration),
+) -> bool {
     let gave_up = Mutex::new(false);
     shutdown_sequence(
         stop,
-        |budget| stop.push(&format!("wait {}s", budget.as_secs())),
+        |budget| {
+            stop.push(&format!("wait {}s", budget.as_secs()));
+            on_wait(budget);
+        },
         || *gave_up.lock().expect("gave up lock") = true,
+        teardown,
         &null_log(),
     );
     let ended = *gave_up.lock().expect("gave up lock");
     ended
 }
 
+/// The escalation exists for a VMM that never reaches its teardown.
+/// Once teardown is running it has budgets of its own, so ending the
+/// process here would cut a working shutdown off mid flush and return
+/// an exit code `main` never produces.
+#[test]
+fn the_escalation_stands_down_once_teardown_is_running() {
+    let stop = RecordingStop::new();
+    let teardown = AtomicBool::new(false);
+
+    let ended = drive_with(&stop, &teardown, |_| {
+        teardown.store(true, Ordering::Relaxed);
+    });
+
+    assert_eq!(
+        stop.steps(),
+        [
+            "poweroff".to_string(),
+            format!("wait {}s", GRACEFUL_BUDGET.as_secs()),
+        ],
+        "the escalation kept going after teardown started"
+    );
+    assert!(!ended, "a teardown that is running must not be cut short");
+}
+
 #[test]
 fn a_stop_asks_before_it_forces() {
-    // A guest that acts on the request flushes its filesystems, so the
-    // hard stop must come second and only after a wait.
+    // The poweroff suspend is the softer of the two: the run loop ends
+    // on it and teardown quiesces and flushes the devices. The halt
+    // skips that, so it must come second and only after a wait.
     let stop = RecordingStop::new();
 
     let ended = drive(&stop);
@@ -137,6 +175,8 @@ fn a_refused_halt_still_ends_the_process() {
 #[test]
 fn the_hard_budget_outlasts_the_teardown_it_waits_on() {
     // Teardown gets 5 s to quiesce the devices and 5 s to join the
-    // vCPU threads. A shorter wait would kill a teardown that works.
+    // vCPU threads, plus a per-device flush this constant cannot
+    // size. The flag is what covers the rest; this only has to outlast
+    // the two fixed halves.
     assert!(HARD_BUDGET > Duration::from_secs(10));
 }
