@@ -15,7 +15,7 @@
 //! advertised length before it reads.
 
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -28,7 +28,7 @@ use std::time::Duration;
 use anyhow::Context;
 use slog::{debug, warn};
 use vmm_core::mem::PhysMap;
-use vmm_core::unixsock::{bind_restricted, SocketPolicy};
+use vmm_core::unixsock::{bind_restricted, write_all_bounded, SocketPolicy};
 
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::{queue_drain_should_stop, VirtioDevice};
@@ -62,7 +62,9 @@ const TX_CHUNK: usize = 4096;
 /// How long a client may stall before it loses its console.
 ///
 /// The transmit queue drains on the vCPU thread, so an unbounded write
-/// would let an idle terminal hold a guest CPU.
+/// would let an idle terminal hold a guest CPU. `write_all_bounded`
+/// supplies the end: `SO_SNDTIMEO` reports success on illumos and
+/// bounds nothing.
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 /// How long the accept thread waits before it re-reads the shutdown
 /// flag. Bounds how long `halt` waits for that thread to return.
@@ -78,8 +80,9 @@ pub type ConsoleInterrupt = Arc<dyn Fn() + Send + Sync>;
 struct ConsoleShared {
     socket_path: PathBuf,
     physmap: Arc<PhysMap>,
-    /// The attached client, if any. TX writes go here.
-    client: Mutex<Option<UnixStream>>,
+    /// The attached client, if any. TX writes go here. Held behind an
+    /// `Arc` so a write does not need the slot locked while it runs.
+    client: Mutex<Option<Arc<UnixStream>>>,
     /// Host bytes with no guest RX chain to land in yet.
     backlog: Mutex<VecDeque<u8>>,
     /// Guest RX chains with no host bytes to fill them yet.
@@ -156,19 +159,36 @@ impl ConsoleShared {
         if data.is_empty() {
             return;
         }
-        let mut guard = self.client.lock().expect("client lock");
-        let Some(stream) = guard.as_mut() else {
+        let client = self.client.lock().expect("client lock").clone();
+        let Some(stream) = client else {
             // No client attached. Console output is best-effort.
             return;
         };
-        if let Err(error) = stream.write_all(data) {
+        // The slot stays unlocked for the write. A terminal that
+        // stopped reading must not hold the vCPU draining the
+        // transmit queue, or every thread that needs the slot.
+        if let Err(error) =
+            write_all_bounded(&stream, data, CLIENT_WRITE_TIMEOUT)
+        {
             warn!(self.log, "virtio-console client write failed";
                 "error" => %error);
-            // Shutting the socket down also wakes this client's reader.
-            if let Some(stream) = guard.take() {
-                let _ = stream.shutdown(Shutdown::Both);
-            }
+            self.detach_client(&stream);
         }
+    }
+
+    /// Drop `stream` as the client and shut it down, so that its
+    /// reader thread wakes and returns.
+    ///
+    /// The slot is cleared only while `stream` still holds it: a newer
+    /// client may have taken it over during the write that failed.
+    fn detach_client(&self, stream: &Arc<UnixStream>) {
+        let mut guard = self.client.lock().expect("client lock");
+        if guard.as_ref().is_some_and(|held| Arc::ptr_eq(held, stream)) {
+            guard.take();
+        }
+        drop(guard);
+        // The peer may already be gone; there is nothing to do.
+        let _ = stream.shutdown(Shutdown::Both);
     }
 
     /// Install `stream` as the client and shut down the one it
@@ -176,7 +196,7 @@ impl ConsoleShared {
     fn replace_client(&self, stream: Option<UnixStream>) {
         let previous = std::mem::replace(
             &mut *self.client.lock().expect("client lock"),
-            stream,
+            stream.map(Arc::new),
         );
         if let Some(old) = previous {
             // The peer may already be gone; there is nothing to do.
@@ -209,11 +229,13 @@ impl ConsoleShared {
                 "error" => %error);
             return;
         }
+        // Belt and braces only. This bounds a write on the platforms
+        // where it works, and reports success and does nothing on
+        // illumos, which is why `write_all_bounded` polls instead.
         if let Err(error) = stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))
         {
             warn!(self.log, "virtio-console write timeout not set";
                 "error" => %error);
-            return;
         }
         let reader = match stream.try_clone() {
             Ok(r) => r,

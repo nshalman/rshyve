@@ -285,6 +285,89 @@ fn reset_drops_posted_rx_chains() {
     console.halt();
 }
 
+/// A client that stops reading must not hold the vCPU that is writing
+/// to it. `write_host` runs on the transmit queue drain, so an
+/// unbounded write there wedges the guest CPU, and a write done with
+/// the client slot locked wedges every thread that needs the slot.
+#[test]
+fn a_console_client_that_never_reads_does_not_hold_the_writer() {
+    let (_dir, console) = console_in_tempdir(Arc::new(PhysMap::new()));
+    // The peer end is never read from, so the socket buffer fills and
+    // stays full for as long as this test holds it.
+    let (_peer, device_end) = UnixStream::pair().expect("socketpair");
+    console.shared.replace_client(Some(device_end));
+
+    let writer = {
+        let shared = Arc::clone(&console.shared);
+        std::thread::spawn(move || {
+            shared.write_host(&vec![0u8; 8 * 1024 * 1024]);
+        })
+    };
+    assert!(
+        wait_for(|| writer.is_finished()),
+        "the write never gave up on a client that stopped reading"
+    );
+    writer.join().expect("join the writer");
+    assert!(
+        console.shared.client.lock().expect("client lock").is_none(),
+        "the wedged client kept the console slot"
+    );
+
+    console.pause();
+    console.halt();
+}
+
+/// A client that reads, but too slowly to take the payload inside the
+/// budget, must lose the console like one that reads nothing. The
+/// write makes progress here, so a bound that only watched the first
+/// blocked write would never fire.
+#[test]
+fn a_console_client_that_reads_too_slowly_loses_the_slot() {
+    let (_dir, console) = console_in_tempdir(Arc::new(PhysMap::new()));
+    let (peer, device_end) = UnixStream::pair().expect("socketpair");
+    console.shared.replace_client(Some(device_end));
+
+    // Small reads, spaced out, so the socket buffer frees a little at
+    // a time and the write can never catch up with the payload.
+    let taken = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&taken);
+    let slow = std::thread::spawn(move || {
+        let mut peer = peer;
+        let mut buf = [0u8; 512];
+        loop {
+            std::thread::sleep(CLIENT_WRITE_TIMEOUT / 4);
+            match peer.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => counted.fetch_add(n, Ordering::Release),
+            };
+        }
+    });
+
+    let writer = {
+        let shared = Arc::clone(&console.shared);
+        std::thread::spawn(move || {
+            shared.write_host(&vec![0u8; 8 * 1024 * 1024]);
+        })
+    };
+    assert!(
+        wait_for(|| writer.is_finished()),
+        "the write never gave up on a client that could not keep up"
+    );
+    writer.join().expect("join the writer");
+    assert!(
+        taken.load(Ordering::Acquire) > 0,
+        "the client took nothing, so this did not test a partial write"
+    );
+    assert!(
+        console.shared.client.lock().expect("client lock").is_none(),
+        "the client the write gave up on kept the console slot"
+    );
+    slow.join().expect("join the slow client");
+
+    console.pause();
+    console.halt();
+}
+
 #[test]
 fn quiesce_query_is_non_blocking() {
     let (_dir, console) = console_in_tempdir(Arc::new(PhysMap::new()));
