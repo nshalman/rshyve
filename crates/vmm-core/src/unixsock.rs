@@ -5,7 +5,7 @@
 //! Restricted Unix domain socket creation and bounded writes.
 
 use std::fs::{self, DirBuilder, Permissions};
-use std::io::{self, Write};
+use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -77,15 +77,6 @@ pub fn bind_restricted(
     Ok(listener)
 }
 
-/// Largest block handed to one `write` after `poll` reports the socket
-/// writable.
-///
-/// `POLLOUT` promises that some space is free, not that all of `data`
-/// fits. A measurement on illumos AF_UNIX puts the point where one
-/// write starts to wait on the peer again between 128 KiB and 256 KiB,
-/// so this stays far below it.
-const WRITE_CHUNK: usize = 8 * 1024;
-
 /// Write all of `data` to `stream`, or give up after `budget`.
 ///
 /// Callers do this write with a lock held, or on a vCPU thread, so it
@@ -98,9 +89,9 @@ const WRITE_CHUNK: usize = 8 * 1024;
 ///   reader threads do blocking reads on a clone of the same socket,
 ///   so setting it here would break every read.
 ///
-/// `poll` is what does work. `POLLOUT` stays clear while the socket is
-/// full, and a write of at most `WRITE_CHUNK` after `POLLOUT` moves its
-/// bytes and returns.
+/// `poll` is what does work, together with the per-call flag in
+/// [`SEND_NOWAIT`]. `POLLOUT` stays clear while the socket is full, and
+/// the send that follows gives up rather than wait for the peer.
 ///
 /// A budget that runs out returns `ErrorKind::TimedOut`. Part of `data`
 /// may be on the socket by then, so the caller has to drop the
@@ -112,7 +103,6 @@ pub fn write_all_bounded(
 ) -> io::Result<()> {
     let deadline = Instant::now() + budget;
     let fd = stream.as_raw_fd();
-    let mut sink: &UnixStream = stream;
     let mut sent = 0;
 
     while sent < data.len() {
@@ -126,8 +116,7 @@ pub fn write_all_bounded(
         if !poll_writable(fd, left)? {
             continue;
         }
-        let end = data.len().min(sent + WRITE_CHUNK);
-        match sink.write(&data[sent..end]) {
+        match send_nowait(fd, &data[sent..]) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -136,8 +125,10 @@ pub fn write_all_bounded(
             }
             Ok(written) => sent += written,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            // A write timeout on a platform where `SO_SNDTIMEO` does
-            // work. The budget above decides whether to try again.
+            // The socket filled between the poll and the send, or it
+            // had less space than `POLLOUT` implied. The budget above
+            // decides whether to try again. `TimedOut` covers a
+            // platform where `SO_SNDTIMEO` does work.
             Err(error)
                 if matches!(
                     error.kind(),
@@ -147,6 +138,41 @@ pub fn write_all_bounded(
         }
     }
     Ok(())
+}
+
+/// Flags that stop one send from waiting for the peer.
+///
+/// illumos needs none. An AF_UNIX send reaches `strwrite`, whose flow
+/// control is one message at a time: `POLLOUT` means `canputnext`, and
+/// the `strput` that follows takes the whole write. Neither of the two
+/// usual flags helps there in any case. `MSG_DONTWAIT` is mapped to
+/// `FNONBLOCK` for reads only (`sotpi_sendmsg`, socktpi.c), and
+/// `SO_SNDTIMEO` bounds nothing.
+///
+/// Darwin counts free bytes instead, and reports `POLLOUT` on as
+/// little as `SO_SNDLOWAT` of them, so a send of more than that waits
+/// for the peer even after `POLLOUT`. `sosend` reads `MSG_NBIO` for
+/// this, not `MSG_DONTWAIT`. The tests run on Darwin, so the bound has
+/// to hold there as well.
+#[cfg(target_vendor = "apple")]
+const SEND_NOWAIT: libc::c_int = 0x0002_0000; // MSG_NBIO
+#[cfg(not(target_vendor = "apple"))]
+const SEND_NOWAIT: libc::c_int = 0;
+
+/// Send what the socket will take now.
+fn send_nowait(fd: RawFd, data: &[u8]) -> io::Result<usize> {
+    let sent = unsafe {
+        libc::send(
+            fd,
+            data.as_ptr().cast::<libc::c_void>(),
+            data.len(),
+            SEND_NOWAIT,
+        )
+    };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(sent as usize)
 }
 
 /// Wait for `fd` to take a write, or for `budget` to pass.
@@ -248,6 +274,30 @@ mod tests {
     #[test]
     fn a_peer_that_never_reads_does_not_hold_the_writer() {
         let (_peer, device) = UnixStream::pair().expect("socketpair");
+        let started = Instant::now();
+        let error = write_all_bounded(&device, &vec![0u8; OVERSIZED], BUDGET)
+            .expect_err("a peer that reads nothing must not be waited on");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the write took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The socket part full when the write starts.
+    ///
+    /// `POLLOUT` reports space that is smaller than the rest of the
+    /// payload, so a send that could wait for the peer waits here and
+    /// nowhere else. A payload that starts on an empty socket can fill
+    /// it in whole blocks and miss this.
+    #[test]
+    fn a_write_onto_a_part_full_socket_is_still_bounded() {
+        let (_peer, device) = UnixStream::pair().expect("socketpair");
+        // A short odd prefix, so the space left is not a round number.
+        write_all_bounded(&device, &[0u8; 24], BUDGET).expect("prefix");
+
         let started = Instant::now();
         let error = write_all_bounded(&device, &vec![0u8; OVERSIZED], BUDGET)
             .expect_err("a peer that reads nothing must not be waited on");
