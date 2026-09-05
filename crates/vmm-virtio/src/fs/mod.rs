@@ -317,6 +317,9 @@ fn fs_worker(
         };
         gate.park_if_paused();
         if shutdown.load(Ordering::Acquire) {
+            // A halt abandons this request, so the count must not keep it.
+            drop(req);
+            inflight.fetch_sub(1, Ordering::AcqRel);
             return;
         }
         // A reset already invalidated this chain and its completion.
