@@ -4,7 +4,7 @@
 
 //! Unix socket listener: connection limits, framing and peer authorisation.
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use slog::{error, info, warn, Logger};
+use vmm_core::unixsock::write_all_bounded;
 
 use super::dispatch::dispatch;
 use super::protocol::{Command, Response};
@@ -22,6 +23,12 @@ use crate::peercred::PeerCred;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 8;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long one response may wait for the client to take it.
+///
+/// A connection holds one of `MAX_CONNECTIONS` slots for its whole
+/// life. A peer that stops reading would keep its slot for ever, and
+/// eight such peers would take the control socket away from every
+/// later client, including the one that stops or migrates the VM.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Spawn the control socket listener thread.
@@ -77,9 +84,18 @@ fn acquire_connection(active: &Arc<AtomicUsize>) -> Option<ConnectionGuard> {
     })
 }
 
-fn set_connection_deadlines(stream: &UnixStream) -> io::Result<()> {
+fn set_connection_deadlines(
+    stream: &UnixStream,
+    log: &Logger,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    // Belt and braces only. This bounds a send on the platforms where
+    // it works, and reports success and does nothing on illumos, which
+    // is why the responses go through `write_all_bounded`. A client is
+    // never refused over it.
+    if let Err(e) = stream.set_write_timeout(Some(WRITE_TIMEOUT)) {
+        warn!(log, "control write timeout not set"; "error" => %e);
+    }
     Ok(())
 }
 
@@ -99,15 +115,17 @@ where
             }
         };
 
-        if let Err(e) = set_connection_deadlines(&stream) {
+        if let Err(e) = set_connection_deadlines(&stream, &log) {
             warn!(log, "failed to set control connection deadlines"; "error" => %e);
             continue;
         }
 
         let Some(connection_guard) = acquire_connection(&active) else {
-            if let Err(e) =
-                write_error_response(&stream, "too many connections")
-            {
+            if let Err(e) = write_error_response(
+                &stream,
+                "too many connections",
+                WRITE_TIMEOUT,
+            ) {
                 warn!(log, "failed to reject excess control connection"; "error" => %e);
             }
             continue;
@@ -193,16 +211,30 @@ fn read_request<R: BufRead>(
     }
 }
 
+/// Send one framed response, or give up after `budget`.
+///
+/// The two usual ways to bound this send do not work on illumos.
+/// `SO_SNDTIMEO` reports success and bounds nothing, and `O_NONBLOCK`
+/// is a file-status flag that the `BufReader` clone of this socket
+/// shares, so it would break the request reads. `write_all_bounded`
+/// polls for space instead.
+fn write_response(
+    stream: &UnixStream,
+    payload: &[u8],
+    budget: Duration,
+) -> io::Result<()> {
+    write_all_bounded(stream, payload, budget)
+}
+
 fn write_error_response(
     stream: &UnixStream,
     message: &str,
+    budget: Duration,
 ) -> Result<(), ControlError> {
     let response = Response::err(message);
     let mut out = serde_json::to_vec(&response)?;
     out.push(b'\n');
-    let mut writer = stream;
-    writer.write_all(&out)?;
-    writer.flush()?;
+    write_response(stream, &out, budget)?;
     Ok(())
 }
 
@@ -221,7 +253,6 @@ fn handle_connection(
     }
 
     let mut reader = BufReader::new(stream);
-    let mut writer = stream;
     let mut request = Vec::with_capacity(256);
 
     loop {
@@ -229,7 +260,11 @@ fn handle_connection(
             Ok(true) => {}
             Ok(false) => break,
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                write_error_response(stream, "request too large")?;
+                write_error_response(
+                    stream,
+                    "request too large",
+                    WRITE_TIMEOUT,
+                )?;
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
@@ -280,19 +315,14 @@ fn handle_connection(
                     serde_json::to_vec(&response)?
                 };
                 out.push(b'\n');
-                writer.write_all(&out)?;
-                writer.flush()?;
+                write_response(stream, &out, WRITE_TIMEOUT)?;
             }
             Err(e) => {
                 warn!(log, "invalid control command";
                     "error" => %e,
                     "bytes" => request.len(),
                 );
-                let response = Response::err("invalid command");
-                let mut out = serde_json::to_vec(&response)?;
-                out.push(b'\n');
-                writer.write_all(&out)?;
-                writer.flush()?;
+                write_error_response(stream, "invalid command", WRITE_TIMEOUT)?;
             }
         }
     }
@@ -305,7 +335,7 @@ fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
 
@@ -409,6 +439,44 @@ mod tests {
             zoneid: None,
         };
         assert!(!peer_is_authorized(&unzoned, 0, Some(0)));
+    }
+
+    /// A client that stops reading must not hold its connection, and
+    /// its slot, for ever.
+    ///
+    /// `SO_SNDTIMEO` reports success on illumos and bounds nothing, so
+    /// without the poll in `write_all_bounded` eight such clients would
+    /// take the control socket away from everyone else.
+    #[test]
+    fn a_client_that_never_reads_does_not_hold_its_slot() {
+        use std::time::Instant;
+
+        let (_peer, server) =
+            UnixStream::pair().expect("create a control socket pair");
+        let budget = Duration::from_millis(200);
+
+        // Fill the socket, the way pipelined commands whose answers
+        // nobody reads would.
+        let error = write_response(&server, &vec![b'x'; 8 << 20], budget)
+            .expect_err("a peer that reads nothing must not be waited on");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+        // The next response is small and still has no room, which is
+        // where a plain write would stop for good.
+        let started = Instant::now();
+        let error =
+            write_error_response(&server, "too many connections", budget)
+                .expect_err("a full socket must not be waited on");
+        assert!(
+            matches!(&error, ControlError::Io(e)
+                if e.kind() == io::ErrorKind::TimedOut),
+            "unexpected error: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the response took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
