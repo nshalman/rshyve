@@ -26,15 +26,41 @@ const BEST_EFFORT_SYNC_BUDGET: Duration = Duration::from_secs(5);
 /// defect unrepresentable.
 pub struct QuiesceGate {
     paused: AtomicBool,
+    /// Drains in progress, one per live [`DrainScope`].
+    ///
+    /// WHY separate from `paused`: a drain parks the workers the same
+    /// way a pause does, but the two have different owners. `paused`
+    /// belongs to the control plane; a drain belongs to whoever holds
+    /// the scope, which for a device reset is the guest. Keeping them
+    /// apart is what stops a guest that loops DEVICE_STATUS writes from
+    /// releasing a migration pause it never took.
+    drains: AtomicUsize,
     active: AtomicUsize,
     lock: Mutex<()>,
     cv: Condvar,
+}
+
+/// One caller's claim on the workers, released when it is dropped.
+///
+/// Held across a drain that must not outlive its own scope: ending it
+/// clears only this claim, never a pause or another drain.
+pub struct DrainScope<'a> {
+    gate: &'a QuiesceGate,
+}
+
+impl Drop for DrainScope<'_> {
+    fn drop(&mut self) {
+        let _guard = self.gate.lock.lock().expect("quiesce gate lock");
+        self.gate.drains.fetch_sub(1, Ordering::AcqRel);
+        self.gate.cv.notify_all();
+    }
 }
 
 impl QuiesceGate {
     pub fn new(workers: usize) -> Self {
         Self {
             paused: AtomicBool::new(false),
+            drains: AtomicUsize::new(0),
             active: AtomicUsize::new(workers),
             lock: Mutex::new(()),
             cv: Condvar::new(),
@@ -51,8 +77,20 @@ impl QuiesceGate {
         self.cv.notify_all();
     }
 
+    /// Park the workers for as long as the returned scope lives.
+    ///
+    /// Use this, not `pause`, for a drain the caller ends itself: a
+    /// pause taken by another thread while the scope is held survives
+    /// the drop.
+    pub fn drain_scope(&self) -> DrainScope<'_> {
+        self.drains.fetch_add(1, Ordering::AcqRel);
+        DrainScope { gate: self }
+    }
+
+    /// Whether anything is holding the workers, a pause or a drain.
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
+            || self.drains.load(Ordering::Acquire) != 0
     }
 
     pub fn is_quiesced(&self) -> bool {
@@ -60,13 +98,13 @@ impl QuiesceGate {
     }
 
     pub fn park_if_paused(&self) {
-        if !self.paused.load(Ordering::Acquire) {
+        if !self.is_paused() {
             return;
         }
         let mut guard = self.lock.lock().expect("quiesce gate lock");
         self.active.fetch_sub(1, Ordering::AcqRel);
         self.cv.notify_all();
-        while self.paused.load(Ordering::Acquire) {
+        while self.is_paused() {
             guard = self.cv.wait(guard).expect("quiesce gate lock");
         }
         self.active.fetch_add(1, Ordering::AcqRel);
@@ -127,17 +165,15 @@ fn flush_file_with<F>(
 where
     F: FnOnce(&File) -> io::Result<()> + Send + 'static,
 {
-    let was_paused = gate.is_paused();
-    gate.pause();
+    // The flush owns this claim and nothing else: a pause another
+    // thread takes while the sync runs must outlive it.
+    let _drain = gate.drain_scope();
 
     let quiesce_budget = match intent {
         FlushIntent::Durable => budgets.durable_quiesce,
         FlushIntent::BestEffort => budgets.best_effort_quiesce,
     };
     if !gate.wait_quiesced(quiesce_budget) {
-        if !was_paused {
-            gate.resume();
-        }
         return Err(FlushError::NotQuiesced(device));
     }
 
@@ -146,12 +182,7 @@ where
         FlushIntent::BestEffort => {
             let worker_file = match file.try_clone() {
                 Ok(file) => file,
-                Err(error) => {
-                    if !was_paused {
-                        gate.resume();
-                    }
-                    return Err(FlushError::Sync(error));
-                }
+                Err(error) => return Err(FlushError::Sync(error)),
             };
             let (tx, rx) = mpsc::channel();
             let worker = thread::Builder::new()
@@ -180,9 +211,6 @@ where
         }
     };
 
-    if !was_paused {
-        gate.resume();
-    }
     result
 }
 
@@ -311,6 +339,38 @@ mod tests {
     use std::io::Write;
 
     struct NeverQuiesces;
+
+    /// A drain is owned by whoever holds the scope. For a device reset
+    /// that is the guest, which can repeat it at will, so ending one
+    /// must not release the pause the control plane took to migrate.
+    #[test]
+    fn a_drain_scope_keeps_a_pause_taken_inside_it() {
+        let gate = QuiesceGate::new(0);
+        let drain = gate.drain_scope();
+        assert!(gate.is_paused(), "a drain must hold the workers");
+
+        gate.pause();
+        drop(drain);
+
+        assert!(gate.is_paused(), "the drain released the operator's pause");
+        gate.resume();
+        assert!(!gate.is_paused());
+    }
+
+    /// Two drains can overlap, a guest reset inside a device flush for
+    /// instance, and the first to end must not free the second.
+    #[test]
+    fn one_drain_scope_does_not_end_another() {
+        let gate = QuiesceGate::new(0);
+        let first = gate.drain_scope();
+        let second = gate.drain_scope();
+
+        drop(first);
+        assert!(gate.is_paused(), "one drain ended another");
+
+        drop(second);
+        assert!(!gate.is_paused(), "the last drain left the workers parked");
+    }
 
     struct FlushTestDevice {
         gate: QuiesceGate,

@@ -477,14 +477,11 @@ impl VirtioDevice for VirtioFs {
         // keeps a reset on an idle export off the worker's 50ms park path.
         let mut quiesced = true;
         if self.inflight.load(Ordering::Acquire) != 0 {
-            // A device already paused for migration must stay paused; only
-            // the guest-driven reset owns the resume, as in `flush_file`.
-            let was_paused = self.gate.is_paused();
-            self.gate.pause();
+            // A scope, not a pause: this drain is guest driven, and a
+            // migration pause that lands inside it belongs to the
+            // control plane and must outlive it.
+            let _drain = self.gate.drain_scope();
             quiesced = self.gate.wait_quiesced(FS_RESET_QUIESCE_BUDGET);
-            if !was_paused {
-                self.gate.resume();
-            }
         }
 
         *self.negotiated_features.lock().expect("features lock") = 0;
@@ -963,6 +960,14 @@ mod tests {
     #[test]
     fn a_reset_that_missed_its_drain_keeps_the_fd_tables() {
         let dir = tempfile::tempdir().expect("export directory");
+        // `bind_restricted` moves the process umask while it binds, and
+        // the vsock tests bind in parallel with this one, so the mode
+        // this directory is created with cannot be trusted.
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("export directory mode");
         std::fs::write(dir.path().join("f"), b"hello").expect("seed file");
         let opts = VirtioFsOpts {
             tag: "shared".to_string(),
@@ -1005,6 +1010,48 @@ mod tests {
             .passthrough()
             .getattr(entry.nodeid)
             .expect("the reset closed an fd the worker still held");
+    }
+
+    // The reset drain is guest driven: any write of 0 to DEVICE_STATUS
+    // reaches it, in a loop if the guest likes. A migration or an
+    // operator pause that lands while it runs belongs to the control
+    // plane, and the reset must not hand the workers back when it ends.
+    #[test]
+    fn a_reset_drain_does_not_release_a_pause_that_lands_in_it() {
+        let fs = test_fs(Arc::new(PhysMap::new()));
+        fs.start().expect("start");
+
+        // End the worker without a halt: it never parks, so the drain
+        // runs for its whole budget and the pause below lands inside it.
+        fs.shutdown.store(true, Ordering::Release);
+        *fs.work_tx.lock().expect("work lock") = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let done = fs
+                .worker
+                .lock()
+                .expect("worker lock")
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished);
+            if done || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fs.inflight.fetch_add(1, Ordering::AcqRel);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                fs.pause();
+            });
+            VirtioDevice::reset(&fs);
+        });
+
+        assert!(
+            fs.gate.is_paused(),
+            "the reset released a pause the control plane owns"
+        );
     }
 
     // halt runs only from the paused state, and it must join the worker

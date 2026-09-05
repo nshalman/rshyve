@@ -82,9 +82,20 @@ fn reset_leaves_the_workers_runnable() {
 // migration's back.
 #[test]
 fn reset_keeps_a_migration_pause() {
-    let (_physmap, _queue, blk) = make_get_id_queue(8, 1);
+    let (physmap, queue, blk) = make_get_id_queue(8, 5);
+    let mut queues = [queue];
 
     park_workers(&blk);
+    // Five requests is past the inline batch limit, so they dispatch
+    // and leave the count non-zero. Without that the reset takes the
+    // idle short cut and never reaches the drain this covers.
+    blk.notify_queue(0, &mut queues, &physmap);
+    assert_ne!(
+        blk.ctx.inflight.load(Ordering::Acquire),
+        0,
+        "the requests must still be outstanding when the reset runs"
+    );
+
     VirtioDevice::reset(&blk);
 
     assert!(blk.gate.is_paused(), "reset cleared a migration pause");

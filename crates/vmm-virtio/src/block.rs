@@ -663,14 +663,11 @@ impl VirtioDevice for VirtioBlock {
         // keeps a reset on an idle disk off the workers' 50ms park path.
         let mut quiesced = true;
         if self.ctx.inflight.load(Ordering::Acquire) != 0 {
-            // A device already paused for migration must stay paused; only
-            // the guest-driven reset owns the resume, as in `flush_file`.
-            let was_paused = self.gate.is_paused();
-            self.gate.pause();
+            // A scope, not a pause: this drain is guest driven, and a
+            // migration pause that lands inside it belongs to the
+            // control plane and must outlive it.
+            let _drain = self.gate.drain_scope();
             quiesced = self.gate.wait_quiesced(RESET_QUIESCE_BUDGET);
-            if !was_paused {
-                self.gate.resume();
-            }
         }
 
         *self.negotiated_features.lock().expect("lock") = 0;
