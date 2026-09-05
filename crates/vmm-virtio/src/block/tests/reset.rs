@@ -1,0 +1,226 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Tests for the device reset path: a reset must not return while a
+//! worker can still write into the ring the driver is about to free.
+
+use super::*;
+
+/// Park every I/O worker, so a later dispatch is observable: the
+/// requests sit in the worker channels instead of racing to completion.
+fn park_workers(blk: &VirtioBlock) {
+    blk.pause();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !blk.is_quiesced() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(blk.is_quiesced(), "workers did not park within the budget");
+}
+
+// A guest that writes 0 to DEVICE_STATUS frees the vring right after.
+// A worker still holding a pre-reset chain must not run its I/O and must
+// not publish into the used ring the guest has already recycled.
+#[test]
+fn reset_drops_requests_queued_before_it() {
+    let (physmap, queue, blk) = make_get_id_queue(8, 5);
+    let mut queues = [queue];
+
+    park_workers(&blk);
+
+    // Five requests is past the inline batch limit, so they dispatch.
+    blk.notify_queue(0, &mut queues, &physmap);
+    assert_eq!(
+        queues[0].read_used_ring_idx(&physmap),
+        0,
+        "the parked workers must not have run yet"
+    );
+
+    VirtioDevice::reset(&blk);
+    blk.resume();
+
+    // A woken worker publishes within microseconds, so this window is
+    // five orders of magnitude of margin.
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < deadline {
+        assert_eq!(
+            queues[0].read_used_ring_idx(&physmap),
+            0,
+            "a worker published into the pre-reset used ring"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// Reset pauses the workers to drain them. It must hand the gate back,
+// or the next driver's first request never completes.
+#[test]
+fn reset_leaves_the_workers_runnable() {
+    let (physmap, queue, blk) = make_get_id_queue(8, 5);
+    let mut queues = [queue];
+
+    VirtioDevice::reset(&blk);
+    assert!(!blk.gate.is_paused(), "reset left the workers parked");
+
+    blk.notify_queue(0, &mut queues, &physmap);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while queues[0].read_used_ring_idx(&physmap) != 5
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        queues[0].read_used_ring_idx(&physmap),
+        5,
+        "post-reset requests never completed"
+    );
+}
+
+// A reset raised while the device is already paused for migration must
+// leave it paused: resuming here would let workers run behind the
+// migration's back.
+#[test]
+fn reset_keeps_a_migration_pause() {
+    let (_physmap, _queue, blk) = make_get_id_queue(8, 1);
+
+    park_workers(&blk);
+    VirtioDevice::reset(&blk);
+
+    assert!(blk.gate.is_paused(), "reset cleared a migration pause");
+    assert!(blk.is_quiesced());
+}
+
+// A reset installs a fresh VirtioCompletion, so a batch that spans one
+// would publish live completions through the ring the guest just freed.
+// The worker must hand the request back and start a new batch instead.
+#[test]
+fn a_worker_batch_does_not_span_a_reset() {
+    const DESC_A: u64 = 0x1000;
+    const AVAIL_A: u64 = 0x1100;
+    const USED_A: u64 = 0x1200;
+    const DESC_B: u64 = 0x1300;
+    const AVAIL_B: u64 = 0x1400;
+    const USED_B: u64 = 0x1500;
+    const HDR_GPA: u64 = 0x2000;
+    const STATUS_GPA: u64 = 0x2100;
+
+    let physmap =
+        Arc::new(PhysMap::new_anon(0x1000, 0x2000).expect("queue memory"));
+    physmap
+        .lookup(HDR_GPA, BLK_REQ_HEADER_SIZE)
+        .expect("mapped request header")
+        .write(&VirtioBlkReqHdr {
+            rtype: bits::VIRTIO_BLK_T_FLUSH,
+            _reserved: 0,
+            sector: 0,
+        })
+        .expect("write request header");
+
+    let ring = |desc, avail, used| {
+        let mut queue = VirtQueue::new(8);
+        queue.set_addr_modern(desc, avail, used);
+        let completion =
+            VirtioCompletion::new(&queue, Arc::clone(&physmap), || {});
+        (queue, completion)
+    };
+    let (live_queue, live) = ring(DESC_A, AVAIL_A, USED_A);
+    let (stale_queue, stale) = ring(DESC_B, AVAIL_B, USED_B);
+
+    let chain = || {
+        vec![
+            ChainBuf::Readable {
+                addr: HDR_GPA,
+                len: BLK_REQ_HEADER_SIZE as u32,
+            },
+            ChainBuf::Writable {
+                addr: STATUS_GPA,
+                len: 1,
+            },
+        ]
+    };
+    let request =
+        |head, completion: &Arc<VirtioCompletion>, epoch| BlkIoRequest {
+            rtype: bits::VIRTIO_BLK_T_FLUSH,
+            sector: 0,
+            chain: chain(),
+            head,
+            completion: Arc::clone(completion),
+            epoch,
+        };
+
+    // Epoch 1 is current; the middle request predates the reset.
+    let ctx = WorkerCtx {
+        physmap: Arc::clone(&physmap),
+        gate: Arc::new(QuiesceGate::new(1)),
+        epoch: Arc::new(AtomicU64::new(1)),
+        inflight: Arc::new(AtomicUsize::new(3)),
+    };
+    let (tx, rx) = mpsc::channel();
+    tx.send(request(0, &live, 1)).expect("send live");
+    tx.send(request(1, &stale, 0)).expect("send stale");
+    tx.send(request(2, &live, 1)).expect("send live");
+    drop(tx);
+
+    let file = tempfile::tempfile().expect("create tempfile");
+    let fd = file.as_raw_fd();
+    let limits = DiskLimits {
+        capacity: 1,
+        read_only: true,
+        nodelete: true,
+    };
+    let worker = {
+        let ctx = ctx.clone();
+        thread::spawn(move || blk_io_worker(rx, fd, limits, ctx))
+    };
+    worker
+        .join()
+        .expect("worker exits when the channel disconnects");
+
+    assert_eq!(
+        ctx.inflight.load(Ordering::Acquire),
+        0,
+        "every request must clear the in-flight count, dropped ones too"
+    );
+
+    assert_eq!(
+        stale_queue.read_used_ring_idx(&physmap),
+        0,
+        "a stale request reached the pre-reset used ring"
+    );
+    assert_eq!(
+        live_queue.read_used_ring_idx(&physmap),
+        2,
+        "the requests either side of the stale one must both complete"
+    );
+}
+
+// A guest resets its virtio devices several times while it boots. The
+// workers park 50ms after they go idle, so a reset with nothing
+// outstanding must skip the drain rather than pay that each time.
+#[test]
+fn reset_with_an_idle_disk_skips_the_drain() {
+    let (physmap, queue, blk) = make_get_id_queue(8, 5);
+    let mut queues = [queue];
+
+    blk.notify_queue(0, &mut queues, &physmap);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while blk.ctx.inflight.load(Ordering::Acquire) != 0
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        blk.ctx.inflight.load(Ordering::Acquire),
+        0,
+        "the dispatched requests never finished"
+    );
+
+    let start = Instant::now();
+    VirtioDevice::reset(&blk);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(40),
+        "reset drained an idle disk: {elapsed:?}"
+    );
+}
