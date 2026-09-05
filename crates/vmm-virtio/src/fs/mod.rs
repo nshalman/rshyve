@@ -443,7 +443,7 @@ fn serve_request(ctx: &FsWorkerCtx, req: &FsRequest) {
             return;
         };
         let len = ctx.server.write_reply(&req.bufs, &ctx.physmap, reply);
-        req.completion.publish(req.head, len)
+        req.completion.publish_batch(&[(req.head, len)])
     };
     // Delivery is an ioctl and can block, so it leaves the session
     // behind. A reset drains the sections above, and an interrupt
