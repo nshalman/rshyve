@@ -338,8 +338,13 @@ fn teardown_budget(devices: usize) -> Duration {
 /// budget. A thread that misses the budget keeps its handle, because
 /// the kernel is still using the file descriptor behind it.
 ///
-/// Returns false when the destroy did not return. The instance is then
-/// left to `VM_SET_AUTODESTRUCT`, which the machine builder armed.
+/// Returns false when the destroy did not return, which covers two
+/// cases. A destroy that is only slow still ends, and the
+/// `VM_SET_AUTODESTRUCT` the machine builder armed reclaims the
+/// instance when the fd closes at process exit. A destroy parked in the
+/// lease purge does not end: process exit waits for that thread, so the
+/// fd never closes and the instance stays. Only a kernel that bounds
+/// the purge frees it. See [`crate::signal`].
 fn destroy_bounded(hdl: &Arc<VmmHdl>, budget: Duration, log: &Logger) -> bool {
     let hdl = hdl.clone();
     destroy_bounded_with(move || hdl.destroy(), budget, log)
