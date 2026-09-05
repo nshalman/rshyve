@@ -290,11 +290,16 @@ impl SubMapping {
 
     /// Bulk copy out of guest-visible memory into a host buffer.
     ///
-    /// Unlike the byte-at-a-time volatile loop in [`Self::read_bytes`], this
-    /// is for display capture, where a vCPU may paint the framebuffer during
-    /// the copy. A torn frame is acceptable there, and volatile byte reads are
-    /// too costly for multi-megabyte captures. Do not use this where a torn
-    /// read is a correctness bug.
+    /// Unlike the byte-at-a-time volatile loop in [`Self::read_bytes`],
+    /// this is a plain memcpy, so the optimizer can split, merge or
+    /// move the loads. Use it only when no vCPU can write the source
+    /// while the copy runs, or when a torn result is acceptable. Two
+    /// callers qualify. Display capture accepts a torn frame, and
+    /// volatile byte reads cost too much for a multi-megabyte capture.
+    /// A virtio device reads a data buffer that the driver gave to the
+    /// device, and the driver must not write that buffer again until
+    /// the used entry publishes it. Do not use this where a torn read
+    /// is a correctness bug.
     pub fn copy_out(&self, dst: &mut [u8]) -> Result<()> {
         if !self.prot.contains(Prot::READ) {
             return Err(Error::new(
@@ -357,9 +362,14 @@ impl SubMapping {
     /// for the multi-megabyte writes on the boot path: loading a 9.3 MiB
     /// PVH kernel that way measured about 14 ms slower than a memcpy.
     ///
-    /// Only for writes that no vCPU can observe partially, which in
-    /// practice means before the vCPU threads start. Do not use this
-    /// where a torn write is a correctness bug.
+    /// Use it only for writes that no vCPU can observe part way
+    /// through. Two things can make that true. The boot path writes
+    /// before the vCPU threads start. A virtio device writes a data
+    /// buffer that the driver gave to the device, and the driver must
+    /// not read that buffer until the used index publishes it;
+    /// `VirtQueue::push_used` writes that index after a release fence,
+    /// which puts this copy before it on all architectures. Do not use
+    /// this where a torn write is a correctness bug.
     pub fn copy_in(&self, src: &[u8]) -> Result<()> {
         if !self.prot.contains(Prot::WRITE) {
             return Err(Error::new(
@@ -397,8 +407,8 @@ impl SubMapping {
     /// reference to guest memory, and that holds here too.
     ///
     /// Carries the same constraint as [`Self::copy_in`]: only for
-    /// writes no vCPU can observe partially, which on the boot path
-    /// means before the vCPU threads start.
+    /// writes no vCPU can observe part way through. On the boot path,
+    /// the vCPU threads have not started.
     ///
     /// Short reads are resumed and `EINTR` is retried. End of file
     /// before `len` bytes is an error rather than a short fill: a
