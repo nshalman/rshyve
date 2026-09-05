@@ -632,5 +632,15 @@ fn a_halt_gives_up_on_a_drain_that_will_not_finish() {
         "the teardown waited on a drain that never finished: {waited:?}"
     );
 
+    // An unplug drops the last handle the VM holds. The drain keeps
+    // one of its own, so the backend it is still inside cannot be
+    // dropped under it.
+    let weak = Arc::downgrade(&dev);
+    drop(dev);
+    assert!(
+        weak.upgrade().is_some(),
+        "the device went away while its backend still held the ring"
+    );
+
     release.send(()).expect("release the drain");
 }
