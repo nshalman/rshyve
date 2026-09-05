@@ -4,6 +4,8 @@
 
 //! Unit tests for the split virtqueue.
 
+use std::sync::Arc;
+
 use super::*;
 
 const INDIRECT_TABLE_GPA: u64 = 0x1000;
