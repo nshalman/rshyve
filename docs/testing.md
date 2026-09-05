@@ -149,6 +149,10 @@ fio --name=t --filename=/tmp/test.dat --rw=read --bs=1M --direct=1 \
 rm /tmp/test.dat
 ```
 
+No fio run covers the virtio-blk bounce buffer yet. Its isolated
+per-operation cost is recorded in
+[block-bounce-cost.md](block-bounce-cost.md).
+
 ### Host Baseline (compare VMM overhead)
 
 ```bash

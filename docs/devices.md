@@ -72,6 +72,10 @@ for lifecycle management and state export/import during migration.
 - `nodelete` parses and is then never read. DISCARD and WRITE_ZEROES
   advertise their feature bits and return success without touching the
   file, so an in-guest `fstrim` reports success and frees nothing
+- Every request bounces through a per-worker host buffer instead of
+  reading or writing guest memory directly, which is what lets a device
+  reset be synchronous. Measured cost:
+  [block-bounce-cost.md](block-bounce-cost.md)
 
 ### Disk Options
 
