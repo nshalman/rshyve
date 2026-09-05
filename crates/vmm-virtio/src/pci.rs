@@ -72,6 +72,16 @@ struct VirtioPciState {
     queue_used: Vec<u64>,
     /// Configuration generation counter.
     config_generation: u8,
+
+    /// Set while a backend reset drains its workers.
+    ///
+    /// The transport lock is released across that drain so a register
+    /// read is still served, which leaves the device reachable while
+    /// it is half reset. The latch sits inside the locked state so a
+    /// write cannot test it and then wait for the lock: every write
+    /// path tests the latch and changes the registers in one critical
+    /// section, and is dropped when the latch is closed.
+    resetting: bool,
 }
 
 impl VirtioPciState {
@@ -93,6 +103,7 @@ impl VirtioPciState {
             queue_avail: vec![0; num_queues],
             queue_used: vec![0; num_queues],
             config_generation: 0,
+            resetting: false,
         }
     }
 
@@ -124,6 +135,23 @@ impl VirtioPciState {
         self.queue_desc.fill(0);
         self.queue_avail.fill(0);
         self.queue_used.fill(0);
+        // `resetting` stays as it is. The reset path owns the latch
+        // and opens it only once every field above is published.
+    }
+
+    /// The device status the driver may read.
+    ///
+    /// The driver frees the vring as soon as it reads 0 (VirtIO 1.3
+    /// sec 4.1.4.3.1) and writes ACKNOWLEDGE next, and neither is safe
+    /// while the backend drains. A reset that starts from 0, which is
+    /// what a driver does when it probes a device it never used, would
+    /// otherwise report 0 for the whole drain.
+    fn readable_status(&self) -> u8 {
+        if self.resetting {
+            self.status | bits::STATUS_ACKNOWLEDGE
+        } else {
+            self.status
+        }
     }
 
     /// Returns true if the guest negotiated VERSION_1 (modern transport).
@@ -175,6 +203,36 @@ impl CapOffsets {
     }
 }
 
+/// One-shot park points a test installs to hold a thread at a named
+/// step of the reset protocol. The first thread to reach a point takes
+/// the hook and runs it, so a test can pin an interleaving that would
+/// otherwise depend on the scheduler.
+#[cfg(test)]
+#[derive(Default)]
+struct TestParks {
+    /// Reached in a register write path once its reset-latch check has
+    /// passed, and before the write changes any transport state.
+    write_checked: ParkSlot,
+    /// Reached in the reset path once status 0 and the open latch are
+    /// both staged, and before either can be read.
+    reset_published: ParkSlot,
+    /// Reached in the refusal path once DEVICE_NEEDS_RESET is applied,
+    /// and before the config interrupt goes out.
+    needs_reset_applied: ParkSlot,
+}
+
+#[cfg(test)]
+type ParkSlot = Mutex<Option<Arc<dyn Fn() + Send + Sync>>>;
+
+/// Run a park point, if a test installed one, and clear it.
+#[cfg(test)]
+fn run_park(slot: &ParkSlot) {
+    let hook = slot.lock().expect("park lock poisoned").take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// PCI device wrapping a VirtIO backend.
 ///
 /// Implements the [`PciDevice`] trait so it can be attached to the PCI
@@ -222,14 +280,9 @@ pub struct VirtioPciDevice<D: VirtioDevice> {
     /// that refuses is guest driven and repeatable, so the rest go to
     /// `debug`.
     queue_refusal_reported: std::sync::atomic::AtomicBool,
-    /// Set while a backend reset drains its workers.
-    ///
-    /// The transport lock is released across that drain so a register
-    /// read is still served, which leaves the device reachable while it
-    /// is half reset. Every BAR write is refused until the drain ends,
-    /// so no other vCPU can re-program the queues, set DRIVER_OK again
-    /// or start a second reset in the window.
-    resetting: std::sync::atomic::AtomicBool,
+    /// Park points a test uses to pin a reset interleaving.
+    #[cfg(test)]
+    parks: TestParks,
     /// Capability chain offsets in PCI config space.
     cap_offsets: CapOffsets,
     /// Size of device-specific config region (for cap advertisement).
@@ -387,7 +440,8 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             self_ref: Mutex::new(None),
             log,
             queue_refusal_reported: std::sync::atomic::AtomicBool::new(false),
-            resetting: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            parks: TestParks::default(),
             cap_offsets,
             dev_config_size,
             num_queues: num_queues as u16,
@@ -760,21 +814,47 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         }
     }
 
+    /// Take the transport lock, unless a reset is draining behind it.
+    ///
+    /// Every guest write goes through here. The latch is part of the
+    /// locked state, so the caller cannot read it and then wait for
+    /// the lock: a write either runs before the reset closes the
+    /// latch or is dropped, never in between.
+    fn lock_for_write(
+        &self,
+    ) -> Option<std::sync::MutexGuard<'_, VirtioPciState>> {
+        let vs = self.virtio_state.lock().expect("virtio lock poisoned");
+        if vs.resetting {
+            return None;
+        }
+        #[cfg(test)]
+        run_park(&self.parks.write_checked);
+        Some(vs)
+    }
+
     /// Handle a write to the modern config BAR (BAR2).
     fn modern_bar_write(&self, offset: u16, val: u32, len: usize) {
-        if self.resetting.load(std::sync::atomic::Ordering::Acquire) {
-            return;
-        }
         let page = offset & 0xF000;
         let reg = offset & 0x0FFF;
 
         match page {
             0x0000 => self.modern_common_write(reg, val, len),
-            0x1000 => self.device.cfg_write(reg, val, len as u8),
+            0x1000 => {
+                // Device config runs under the transport lock for
+                // the reason the common config does: a reset in
+                // flight must not see this write land. The guard is
+                // named, so it holds the lock across the call.
+                let Some(_vs) = self.lock_for_write() else {
+                    return;
+                };
+                self.device.cfg_write(reg, val, len as u8);
+            }
             0x2000 => {
                 // Notification register: guest writes queue index
                 let queue_idx = val as u16;
-                let mut vs = self.virtio_state.lock().expect("virtio lock");
+                let Some(mut vs) = self.lock_for_write() else {
+                    return;
+                };
                 if vs.status & bits::STATUS_DRIVER_OK == 0 {
                     return;
                 }
@@ -824,7 +904,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             },
             bits::COMMON_CFG_MSIX_CONFIG => u32::from(vs.config_msix_vector),
             bits::COMMON_CFG_NUM_QUEUES => u32::from(self.num_queues),
-            bits::COMMON_CFG_DEVICE_STATUS => u32::from(vs.status),
+            bits::COMMON_CFG_DEVICE_STATUS => u32::from(vs.readable_status()),
             bits::COMMON_CFG_CONFIG_GENERATION => {
                 u32::from(vs.config_generation)
             }
@@ -886,7 +966,9 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     // matrix covering accepted and rejected feature sets.
     #[allow(clippy::if_same_then_else)]
     fn modern_common_write(&self, offset: u16, val: u32, _len: usize) {
-        let mut vs = self.virtio_state.lock().expect("virtio lock");
+        let Some(mut vs) = self.lock_for_write() else {
+            return;
+        };
 
         match offset {
             bits::COMMON_CFG_DEVICE_FEATURE_SELECT => {
@@ -1154,22 +1236,30 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
 
     /// Refuse a queue the guest just programmed and tell it why.
     ///
-    /// Consumes the transport lock so the caller cannot hold it across
-    /// the interrupt, and does nothing once the device already carries
-    /// DEVICE_NEEDS_RESET: the write that reaches here is guest driven
-    /// and can be repeated without limit, so the interrupt must not be
-    /// raised per write. The reason is reported once per device for the
-    /// same reason: a guest can reset and reprogram in a loop, and the
-    /// second report says nothing the first did not.
+    /// The status bit goes in under the guard that refused the queue,
+    /// and the guard is then consumed so the caller cannot hold it
+    /// across the interrupt. Nothing happens once the device already
+    /// carries DEVICE_NEEDS_RESET: the write that reaches here is
+    /// guest driven and can be repeated without limit, so the
+    /// interrupt must not be raised per write. The reason is reported
+    /// once per device for the same reason: a guest can reset and
+    /// reprogram in a loop, and the second report says nothing the
+    /// first did not.
     fn refuse_queue(
         &self,
-        vs: std::sync::MutexGuard<'_, VirtioPciState>,
+        mut vs: std::sync::MutexGuard<'_, VirtioPciState>,
         idx: usize,
         error: Option<crate::queue::QueueAddrError>,
     ) {
         if vs.status & bits::STATUS_DEVICE_NEEDS_RESET != 0 {
             return;
         }
+        // The bit must go in here. Applied after the guard drops, it
+        // can land in the middle of a reset drain, or on the session
+        // that follows the reset.
+        vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
+        #[cfg(test)]
+        run_park(&self.parks.needs_reset_applied);
         drop(vs);
         if let Some(error) = error {
             let first = !self
@@ -1183,7 +1273,37 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     "queue" => idx, "reason" => %error);
             }
         }
-        self.signal_device_needs_reset();
+        self.raise_config_interrupt();
+    }
+
+    /// Install the one-shot park a register write reaches once its
+    /// reset-latch check has passed.
+    #[cfg(test)]
+    fn park_write_after_latch_check(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.parks.write_checked.lock().expect("park lock poisoned") =
+            Some(hook);
+    }
+
+    /// Install the one-shot park the reset reaches once status 0 and
+    /// the open latch are both staged.
+    #[cfg(test)]
+    fn park_reset_after_publish(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .parks
+            .reset_published
+            .lock()
+            .expect("park lock poisoned") = Some(hook);
+    }
+
+    /// Install the one-shot park a queue refusal reaches once it has
+    /// applied DEVICE_NEEDS_RESET.
+    #[cfg(test)]
+    fn park_refusal_after_status(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .parks
+            .needs_reset_applied
+            .lock()
+            .expect("park lock poisoned") = Some(hook);
     }
 
     /// Reset the transport and the backend behind it.
@@ -1193,27 +1313,34 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// only once the backend has drained. DRIVER_OK goes first, which
     /// is what stops any vCPU queueing more work, and the transport
     /// lock is released across the drain so a register read is still
-    /// served. `resetting` covers the window the lock no longer does:
-    /// a BAR write that lands in it is dropped, so no second vCPU can
+    /// served. The latch covers the window the lock no longer does: a
+    /// BAR write that lands in it is dropped, so no second vCPU can
     /// re-program the queues or start a second reset while the old one
     /// is still writing into the ring.
+    ///
+    /// The caller holds the transport lock, so the latch closes in the
+    /// same critical section that tested it.
     fn reset_device(&self, mut vs: std::sync::MutexGuard<'_, VirtioPciState>) {
-        if self
-            .resetting
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+        if vs.resetting {
             return;
         }
+        vs.resetting = true;
         vs.status &= !bits::STATUS_DRIVER_OK;
         vs.queue_enabled.fill(false);
         drop(vs);
 
         self.device.reset();
 
-        let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
-        vs.reset();
+        // The next driver must find the line low, or it sees a
+        // spurious assertion when it enables the IOAPIC pin. This
+        // runs before the latch opens, or the deassert could eat the
+        // first interrupt that driver is owed.
         self.isr_status
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.lower_interrupt();
+
+        let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
+        vs.reset();
         // Clear atomic MSI-X vector cache
         self.msix_config_vector.store(
             bits::VIRTIO_MSI_NO_VECTOR,
@@ -1225,19 +1352,23 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+        // Status 0 and the open latch reach the guest together. The
+        // driver polls for that 0 and writes ACKNOWLEDGE next, and
+        // that write must not meet a latch that is still closed.
+        vs.resetting = false;
+        #[cfg(test)]
+        run_park(&self.parks.reset_published);
         drop(vs);
-        // Only now may another write land: everything this reset owns
-        // is published, so it cannot overwrite the next session.
-        self.resetting
-            .store(false, std::sync::atomic::Ordering::Release);
-        // Leave the interrupt line low, or the next driver sees a
-        // spurious assertion when it enables the IOAPIC pin.
-        self.lower_interrupt();
     }
 
     /// Signal the guest that the device needs a reset.
+    ///
+    /// A reset in flight takes the device down anyway, so the bit is
+    /// dropped rather than written onto the session that follows.
     pub fn signal_device_needs_reset(&self) {
-        let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
+        let Some(mut vs) = self.lock_for_write() else {
+            return;
+        };
         vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
         drop(vs);
         self.raise_config_interrupt();
@@ -1277,7 +1408,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 // Write-only register, read returns 0
                 0
             }
-            bits::LEGACY_REG_DEVICE_STATUS => u32::from(vs.status),
+            bits::LEGACY_REG_DEVICE_STATUS => u32::from(vs.readable_status()),
             bits::LEGACY_REG_ISR_STATUS => {
                 // Atomic swap: read and clear ISR in one operation.
                 let val = self
@@ -1318,10 +1449,9 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
 
     /// Handle a write to the legacy virtio config BAR.
     fn bar_write(&self, offset: u16, val: u32, len: usize) {
-        if self.resetting.load(std::sync::atomic::Ordering::Acquire) {
+        let Some(mut vs) = self.lock_for_write() else {
             return;
-        }
-        let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
+        };
 
         let dev_cfg_off = self.device_config_offset();
         if offset >= dev_cfg_off {
@@ -2026,3 +2156,6 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod reset_tests;
