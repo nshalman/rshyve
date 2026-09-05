@@ -23,6 +23,23 @@ fn handler_write_is_visible_through_both_accessors() {
     SIGTERM_RECEIVED.store(false, Ordering::Relaxed);
 }
 
+/// One test owns the whole deadline, for the same reason.
+#[test]
+fn an_armed_deadline_only_moves_outward() {
+    assert!(teardown_deadline().is_none());
+
+    arm_teardown_deadline(Duration::from_secs(60));
+    let far = teardown_deadline().expect("the first arm sets the deadline");
+
+    // A second, smaller budget must not cut a running flush short.
+    arm_teardown_deadline(Duration::from_secs(1));
+
+    assert_eq!(teardown_deadline(), Some(far));
+    *TEARDOWN_DEADLINE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = None;
+}
+
 /// Records every step a shutdown takes, in order.
 struct RecordingStop {
     steps: Mutex<Vec<String>>,
@@ -77,55 +94,88 @@ fn null_log() -> Logger {
     Logger::root(slog::Discard, slog::o!())
 }
 
-/// Drive one sequence with no real waiting, and say whether it ended
-/// the process.
-fn drive(stop: &RecordingStop) -> bool {
-    drive_with(stop, &AtomicBool::new(false), |_| {})
+/// A clock the test moves, so a deadline is reached without waiting.
+///
+/// The escalation slices its waits, so a real clock would make every
+/// one of these tests as slow as the budget it asserts.
+struct FakeClock {
+    base: Instant,
+    elapsed: Mutex<Duration>,
 }
 
-/// The same, with a teardown flag and a hook that runs on every wait.
+impl FakeClock {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            elapsed: Mutex::new(Duration::ZERO),
+        }
+    }
+
+    fn now(&self) -> Instant {
+        self.base + self.elapsed()
+    }
+
+    fn elapsed(&self) -> Duration {
+        *self.elapsed.lock().expect("clock lock")
+    }
+
+    fn advance(&self, by: Duration) {
+        *self.elapsed.lock().expect("clock lock") += by;
+    }
+}
+
+/// What one driven shutdown did.
+struct Run {
+    steps: Vec<String>,
+    waited: Duration,
+    ended: bool,
+}
+
+/// Drive one sequence on a fake clock, with no teardown running.
+fn drive(stop: &RecordingStop) -> Run {
+    drive_with(stop, |_, _| {})
+}
+
+/// The same, with a hook that runs on every wait slice and may arm a
+/// teardown deadline.
 fn drive_with(
     stop: &RecordingStop,
-    teardown: &AtomicBool,
-    on_wait: impl Fn(Duration),
-) -> bool {
+    on_wait: impl Fn(&FakeClock, &Mutex<Option<Instant>>),
+) -> Run {
+    let clock = FakeClock::new();
+    let deadline: Mutex<Option<Instant>> = Mutex::new(None);
     let gave_up = Mutex::new(false);
+
     shutdown_sequence(
         stop,
-        |budget| {
-            stop.push(&format!("wait {}s", budget.as_secs()));
-            on_wait(budget);
+        |slice| {
+            clock.advance(slice);
+            on_wait(&clock, &deadline);
         },
+        || clock.now(),
+        || *deadline.lock().expect("deadline lock"),
         || *gave_up.lock().expect("gave up lock") = true,
-        teardown,
         &null_log(),
     );
+
     let ended = *gave_up.lock().expect("gave up lock");
-    ended
+    Run {
+        steps: stop.steps(),
+        waited: clock.elapsed(),
+        ended,
+    }
 }
 
-/// The escalation exists for a VMM that never reaches its teardown.
-/// Once teardown is running it has budgets of its own, so ending the
-/// process here would cut a working shutdown off mid flush and return
-/// an exit code `main` never produces.
-#[test]
-fn the_escalation_stands_down_once_teardown_is_running() {
-    let stop = RecordingStop::new();
-    let teardown = AtomicBool::new(false);
-
-    let ended = drive_with(&stop, &teardown, |_| {
-        teardown.store(true, Ordering::Relaxed);
-    });
-
-    assert_eq!(
-        stop.steps(),
-        [
-            "poweroff".to_string(),
-            format!("wait {}s", GRACEFUL_BUDGET.as_secs()),
-        ],
-        "the escalation kept going after teardown started"
-    );
-    assert!(!ended, "a teardown that is running must not be cut short");
+/// Arm the deadline once, `budget` out from the current fake time.
+fn arm_once(
+    clock: &FakeClock,
+    deadline: &Mutex<Option<Instant>>,
+    budget: Duration,
+) {
+    let mut armed = deadline.lock().expect("deadline lock");
+    if armed.is_none() {
+        *armed = Some(clock.now() + budget);
+    }
 }
 
 #[test]
@@ -135,18 +185,11 @@ fn a_stop_asks_before_it_forces() {
     // skips that, so it must come second and only after a wait.
     let stop = RecordingStop::new();
 
-    let ended = drive(&stop);
+    let run = drive(&stop);
 
-    assert_eq!(
-        stop.steps(),
-        [
-            "poweroff".to_string(),
-            format!("wait {}s", GRACEFUL_BUDGET.as_secs()),
-            "halt".to_string(),
-            format!("wait {}s", HARD_BUDGET.as_secs()),
-        ]
-    );
-    assert!(ended, "a VMM that outlived its own shutdown must end");
+    assert_eq!(run.steps, ["poweroff".to_string(), "halt".to_string()]);
+    assert_eq!(run.waited, GRACEFUL_BUDGET + HARD_BUDGET);
+    assert!(run.ended, "a VMM that outlived its own shutdown must end");
 }
 
 #[test]
@@ -154,10 +197,10 @@ fn a_refused_request_still_reaches_the_halt() {
     let mut stop = RecordingStop::new();
     stop.poweroff_refused = true;
 
-    let ended = drive(&stop);
+    let run = drive(&stop);
 
-    assert!(stop.steps().contains(&"halt".to_string()));
-    assert!(ended);
+    assert!(run.steps.contains(&"halt".to_string()));
+    assert!(run.ended);
 }
 
 #[test]
@@ -167,16 +210,73 @@ fn a_refused_halt_still_ends_the_process() {
     let mut stop = RecordingStop::new();
     stop.halt_refused = true;
 
-    let ended = drive(&stop);
+    let run = drive(&stop);
 
-    assert!(ended);
+    assert!(run.ended);
+}
+
+#[test]
+fn a_running_teardown_is_watched_and_not_halted() {
+    // The halt skips the device flush, so a teardown that is already
+    // running must not be interrupted by one.
+    let stop = RecordingStop::new();
+    let budget = Duration::from_secs(40);
+
+    let run = drive_with(&stop, |clock, deadline| {
+        arm_once(clock, deadline, budget);
+    });
+
+    assert_eq!(run.steps, ["poweroff".to_string()]);
+    assert!(
+        run.waited >= budget,
+        "the escalation cut the teardown short after {:?}",
+        run.waited
+    );
+}
+
+#[test]
+fn a_teardown_that_never_finishes_still_ends_the_process() {
+    // Teardown ends in VM_DESTROY_SELF, which on illumos waits for
+    // every vmm_drv lease to break through an untimed cv_wait. A
+    // teardown that never returns must not keep the process, so the
+    // escalation holds it to the deadline it armed.
+    let stop = RecordingStop::new();
+    let budget = Duration::from_secs(40);
+
+    let run = drive_with(&stop, |clock, deadline| {
+        arm_once(clock, deadline, budget);
+    });
+
+    assert!(run.ended, "a teardown that never finishes must be ended");
+    assert!(
+        run.waited <= budget + POLL_INTERVAL * 2,
+        "the terminal path was reached late, after {:?}",
+        run.waited
+    );
+}
+
+#[test]
+fn a_deadline_armed_late_in_a_budget_is_still_watched() {
+    // A teardown that starts in the last slice of the graceful budget
+    // would be halted by the next step if the wait were one call.
+    let stop = RecordingStop::new();
+    let budget = Duration::from_secs(40);
+
+    let run = drive_with(&stop, |clock, deadline| {
+        if clock.elapsed() + POLL_INTERVAL >= GRACEFUL_BUDGET {
+            arm_once(clock, deadline, budget);
+        }
+    });
+
+    assert_eq!(run.steps, ["poweroff".to_string()]);
+    assert!(run.ended);
 }
 
 #[test]
 fn the_hard_budget_outlasts_the_teardown_it_waits_on() {
     // Teardown gets 5 s to quiesce the devices and 5 s to join the
     // vCPU threads, plus a per-device flush this constant cannot
-    // size. The flag is what covers the rest; this only has to outlast
-    // the two fixed halves.
+    // size. The armed deadline is what covers the rest; this only has
+    // to outlast the two fixed halves.
     assert!(HARD_BUDGET > Duration::from_secs(10));
 }

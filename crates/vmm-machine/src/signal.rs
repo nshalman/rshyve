@@ -10,9 +10,9 @@
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slog::{error, info, warn, Logger};
 
@@ -30,17 +30,35 @@ const GRACEFUL_BUDGET: Duration = Duration::from_secs(30);
 
 /// How long the hard stop gets before the process is ended.
 ///
-/// This covers a VMM that never reached its teardown at all. A
-/// teardown that is running clears [`teardown_flag`] of this clock,
-/// because its own budgets scale with the device count and this
-/// constant cannot.
+/// This covers a VMM that never reached its teardown at all. A teardown
+/// that is running is held to [`TEARDOWN_DEADLINE`] instead, because
+/// its own work scales with the device count and this constant cannot.
 const HARD_BUDGET: Duration = Duration::from_secs(20);
+
+/// How long the last log line gets to leave the async drain.
+///
+/// The terminal exit is the raw syscall, which does not flush anything,
+/// and the line it writes first is the only record of why the VMM was
+/// ended.
+const LOG_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 /// Exit code for a VMM that outlived its own shutdown.
 ///
 /// Distinct from the guest-caused codes `main` returns, because this
 /// one says the VMM itself would not stop.
 const WEDGED_EXIT: i32 = 4;
+
+/// When a running teardown must be finished by.
+///
+/// WHY a clock and not a flag: teardown ends in `VM_DESTROY_SELF`. On
+/// illumos that ioctl purges the vmm_drv holds and then waits for every
+/// lease to break in an untimed `cv_wait` (`vmm_sol_dev.c`,
+/// `vmm_drv_purge`). A lease that never breaks holds the ioctl for as
+/// long as it is held. Teardown therefore cannot be trusted to end on
+/// its own, and the escalation must keep a clock on it. A flag that
+/// stood the escalation down would hand a stuck lease the whole
+/// process.
+static TEARDOWN_DEADLINE: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// How a shutdown reaches the VM.
 ///
@@ -88,20 +106,33 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
     SIGTERM_RECEIVED.store(true, Ordering::Relaxed);
 }
 
-/// Set once the event loop has ended and teardown has begun.
-static TEARDOWN_STARTED: AtomicBool = AtomicBool::new(false);
-
-/// Borrow the flag [`mark_teardown_started`] writes.
-pub fn teardown_flag() -> &'static AtomicBool {
-    &TEARDOWN_STARTED
+/// Give the running teardown a deadline the escalation holds it to.
+///
+/// Teardown calls this before its first wait, with a budget sized from
+/// the work it is about to do. A later call can only push the deadline
+/// out: shortening one would cut a running flush short.
+pub fn arm_teardown_deadline(budget: Duration) {
+    // A budget too large to add to the clock leaves the deadline
+    // unarmed, which keeps the fixed escalation rather than granting an
+    // unbounded one.
+    let Some(deadline) = Instant::now().checked_add(budget) else {
+        return;
+    };
+    let mut armed = TEARDOWN_DEADLINE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if armed.is_none_or(|current| deadline > current) {
+        *armed = Some(deadline);
+    }
 }
 
-/// Say that the guest has stopped and teardown is running.
-///
-/// Teardown bounds every wait it makes, so the escalation has nothing
-/// left to add once this is set.
-pub fn mark_teardown_started() {
-    TEARDOWN_STARTED.store(true, Ordering::Release);
+/// The deadline a running teardown armed, if any.
+fn teardown_deadline() -> Option<Instant> {
+    // A panic in a caller must not take the escalation with it, so the
+    // poison is stepped over rather than raised.
+    *TEARDOWN_DEADLINE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Borrow the flag the handler writes.
@@ -127,8 +158,9 @@ pub fn sigterm_received() -> bool {
 fn shutdown_sequence(
     vm: &dyn GuestStop,
     wait: impl Fn(Duration),
+    now: impl Fn() -> Instant,
+    deadline_of: impl Fn() -> Option<Instant>,
     give_up: impl FnOnce(),
-    teardown: &AtomicBool,
     log: &Logger,
 ) {
     // The first step is a suspend, not an ACPI power button: the
@@ -139,42 +171,109 @@ fn shutdown_sequence(
     if let Err(e) = vm.request_poweroff() {
         warn!(log, "the stop request did not reach the VM"; "error" => %e);
     }
-    wait(GRACEFUL_BUDGET);
-    if teardown.load(Ordering::Acquire) {
-        return stand_down(log);
+    let mut armed = wait_for_teardown(&wait, &deadline_of, GRACEFUL_BUDGET);
+
+    if armed.is_none() {
+        warn!(log, "the guest did not stop in time; halting it";
+            "waited_secs" => GRACEFUL_BUDGET.as_secs());
+        if let Err(e) = vm.halt() {
+            warn!(log, "the halt did not reach the VM"; "error" => %e);
+        }
+        armed = wait_for_teardown(&wait, &deadline_of, HARD_BUDGET);
     }
 
-    warn!(log, "the guest did not stop in time; halting it";
-        "waited_secs" => GRACEFUL_BUDGET.as_secs());
-    if let Err(e) = vm.halt() {
-        warn!(log, "the halt did not reach the VM"; "error" => %e);
+    match armed {
+        Some(deadline) => {
+            watch_teardown(&wait, &now, &deadline_of, deadline, give_up, log)
+        }
+        None => end_process("the VMM never reached its teardown", give_up, log),
     }
-    wait(HARD_BUDGET);
-    if teardown.load(Ordering::Acquire) {
-        return stand_down(log);
+}
+
+/// Wait for `budget`, stopping early once teardown arms its clock.
+///
+/// The wait is sliced so that a teardown starting near the end of a
+/// budget is watched, and not cut off by the step that follows it.
+fn wait_for_teardown(
+    wait: &impl Fn(Duration),
+    deadline_of: &impl Fn() -> Option<Instant>,
+    budget: Duration,
+) -> Option<Instant> {
+    let mut left = budget;
+    loop {
+        if let Some(deadline) = deadline_of() {
+            return Some(deadline);
+        }
+        if left.is_zero() {
+            return None;
+        }
+        let slice = left.min(POLL_INTERVAL);
+        wait(slice);
+        left -= slice;
+    }
+}
+
+/// Hold a running teardown to the deadline it armed.
+///
+/// WHY this thread: the poller is not the thread that drives teardown,
+/// so it still reaches the terminal exit while that thread is parked in
+/// an ioctl. A watchdog on the teardown thread would be parked with it.
+///
+/// The loop ends because both `wait` and `now` move the same clock: a
+/// sleep of a non-zero slice always advances a monotonic clock.
+fn watch_teardown(
+    wait: &impl Fn(Duration),
+    now: &impl Fn() -> Instant,
+    deadline_of: &impl Fn() -> Option<Instant>,
+    armed: Instant,
+    give_up: impl FnOnce(),
+    log: &Logger,
+) {
+    info!(log, "teardown is running; the escalation keeps a clock on it";
+        "budget_secs" => armed.saturating_duration_since(now()).as_secs());
+    loop {
+        let deadline = deadline_of().unwrap_or(armed);
+        let left = deadline.saturating_duration_since(now());
+        if left.is_zero() {
+            break;
+        }
+        wait(left.min(POLL_INTERVAL));
     }
 
-    // Nothing is left to try. A node must not keep the memory of a VM
-    // that will not stop, so the process goes without its teardown.
-    // Unflushed device writes are power-loss equivalent and inside the
-    // volatile-write-cache contract the block devices advertise.
+    end_process("teardown did not finish inside its deadline", give_up, log);
+}
+
+/// End a VMM that will not stop on its own.
+///
+/// Nothing is left to try. A node must not keep the memory of a VM that
+/// will not stop, so the process goes without its teardown. Unflushed
+/// device writes are power-loss equivalent and inside the
+/// volatile-write-cache contract the block devices advertise.
+///
+/// This ends every wedge that userspace can break. It does not end one
+/// the kernel holds: a thread parked in an untimed `cv_wait` is not
+/// `T_WAKEABLE`, so `pokelwps` does not wake it and process exit waits
+/// for it (`lwp.c`, `exitlwps`). No signal, close or exit reaches it.
+/// The log line is what names that case to the operator.
+fn end_process(reason: &'static str, give_up: impl FnOnce(), log: &Logger) {
     error!(log, "the VMM outlived its own shutdown; ending the process";
+        "reason" => reason,
         "exit_code" => WEDGED_EXIT);
     give_up();
 }
 
-/// Leave a running teardown to finish on its own.
+/// End the process without the exit path a wedged VMM can block in.
 ///
-/// Teardown bounds every wait it makes, but the total is a per-device
-/// flush budget times the device count, which no constant here can
-/// know. Ending the process against this clock would cut a working
-/// shutdown off mid flush and return an exit code `main` never
-/// produces, which reads as a VMM failure on a normal stop.
-fn stand_down(log: &Logger) {
-    info!(
-        log,
-        "teardown is running; the shutdown escalation stands down"
-    );
+/// `exit` runs the atexit handlers and flushes stdio, either of which
+/// can wait on a lock a stuck thread holds. `_exit` is the syscall
+/// alone.
+fn terminal_exit() {
+    // The async log drain hands the last line to another thread, and
+    // `_exit` does not wait for it.
+    thread::sleep(LOG_DRAIN_GRACE);
+    // SAFETY: `_exit` takes an int, does not return, and reads no Rust
+    // state. It is the async-signal-safe half of `exit`.
+    unsafe { libc::_exit(WEDGED_EXIT) }
 }
 
 /// Install the SIGTERM signal handler and spawn a poller thread that
@@ -206,8 +305,9 @@ pub fn install_sigterm_handler_with(stop: Arc<dyn GuestStop>, log: &Logger) {
             shutdown_sequence(
                 stop.as_ref(),
                 thread::sleep,
-                || std::process::exit(WEDGED_EXIT),
-                teardown_flag(),
+                Instant::now,
+                teardown_deadline,
+                terminal_exit,
                 &log_sig,
             );
         })
