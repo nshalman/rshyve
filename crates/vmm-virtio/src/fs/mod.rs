@@ -292,6 +292,25 @@ impl VirtioFs {
     }
 }
 
+/// Drop every request still queued and take them off the count.
+///
+/// A halt abandons the request the worker holds and everything behind
+/// it. Leaving those counted makes the next reset wait its whole drain
+/// budget for a worker that has already gone.
+fn abandon_queued(
+    rx: &mpsc::Receiver<FsRequest>,
+    inflight: &AtomicUsize,
+    held: usize,
+) {
+    let mut count = held;
+    while rx.try_recv().is_ok() {
+        count += 1;
+    }
+    if count != 0 {
+        inflight.fetch_sub(count, Ordering::AcqRel);
+    }
+}
+
 fn fs_worker(
     rx: mpsc::Receiver<FsRequest>,
     server: Arc<FuseServer>,
@@ -309,6 +328,7 @@ fn fs_worker(
             Err(RecvTimeoutError::Timeout) => {
                 gate.park_if_paused();
                 if shutdown.load(Ordering::Acquire) {
+                    abandon_queued(&rx, &inflight, 0);
                     return;
                 }
                 continue;
@@ -317,9 +337,8 @@ fn fs_worker(
         };
         gate.park_if_paused();
         if shutdown.load(Ordering::Acquire) {
-            // A halt abandons this request, so the count must not keep it.
             drop(req);
-            inflight.fetch_sub(1, Ordering::AcqRel);
+            abandon_queued(&rx, &inflight, 1);
             return;
         }
         // A reset already invalidated this chain and its completion.
@@ -1051,6 +1070,35 @@ mod tests {
         assert!(
             fs.gate.is_paused(),
             "the reset released a pause the control plane owns"
+        );
+    }
+
+    // A halt abandons the request the worker holds and every one still
+    // queued behind it. The count has to lose them all, or the next
+    // reset waits its whole budget for a worker that is already gone.
+    #[test]
+    fn halt_clears_the_count_of_every_request_it_abandons() {
+        let (physmap, mut queues, fs) = ring(8, 3);
+        fs.start().expect("start");
+
+        // Park the worker so the requests queue up behind it instead
+        // of completing one by one.
+        fs.pause();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs.is_quiesced() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(fs.is_quiesced(), "worker did not park within its budget");
+
+        fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
+        assert_eq!(fs.inflight.load(Ordering::Acquire), 3);
+
+        fs.halt();
+
+        assert_eq!(
+            fs.inflight.load(Ordering::Acquire),
+            0,
+            "halt left abandoned requests on the count"
         );
     }
 
