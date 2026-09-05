@@ -130,6 +130,17 @@ impl GuestAccess {
         raise();
     }
 
+    /// Whether sections are being admitted.
+    ///
+    /// A test polls this to see a reset reach its drain. Polling
+    /// [`Self::enter_current`] instead would take the reader lock, and
+    /// a caller that already holds one must not take a second while a
+    /// writer waits.
+    #[cfg(test)]
+    pub(super) fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
     /// Hold the exclusive side the way a reset holds it inside
     /// [`Self::drain`].
     ///

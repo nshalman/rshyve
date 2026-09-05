@@ -164,19 +164,15 @@ fn wait_until_idle(fs: &VirtioFs) {
 ///
 /// Admission closes before the reset reaches the drain and reopens
 /// only once it is through, and the caller holds a session, so past
-/// this point the reset is in the wait and can be nowhere else. The
-/// poll cannot block on the drain itself: a closed device refuses a
-/// session without taking the lock. Sleeping a fixed time instead
-/// would let the assertions run after the reset had already finished.
+/// this point the reset is in the wait and can be nowhere else.
+/// Sleeping a fixed time instead would let the assertions run after
+/// the reset had already finished.
 fn wait_until_reset_blocks(fs: &VirtioFs, finished: &AtomicBool) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while fs.access.enter_current().is_some() && Instant::now() < deadline {
+    while fs.access.is_open() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(
-        fs.access.enter_current().is_none(),
-        "the reset never started"
-    );
+    assert!(!fs.access.is_open(), "the reset never started");
     assert!(
         !finished.load(Ordering::Acquire),
         "the reset finished while the worker still held guest access"
@@ -971,13 +967,13 @@ fn a_notification_refused_by_a_reset_touches_nothing() {
     let req = usize::from(FS_REQUEST_QUEUE);
     fs.start().expect("start");
 
-    // A reset, stopped inside its drain.
+    // A reset has taken the ring. The drain is not held here: this
+    // thread is the one calling in, and a gate that wrongly took the
+    // reader lock would then wait on itself instead of failing.
     fs.access.close();
-    let drain = fs.access.hold_drain();
 
     let did_work = fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
 
-    drop(drain);
     fs.access.reopen();
 
     assert!(!did_work);
