@@ -27,7 +27,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Context;
-use slog::warn;
+use slog::{debug, warn};
 use vmm_core::mem::PhysMap;
 use vmm_core::unixsock::{bind_restricted, SocketPolicy};
 
@@ -488,14 +488,14 @@ impl VirtioVsock {
         &self.shared.socket_path
     }
 
-    fn ensure_rx_completion(&self, queue: &VirtQueue) {
+    fn ensure_rx_completion(&self, queue: &VirtQueue) -> Arc<VirtioCompletion> {
         let mut slot = self
             .shared
             .rx_completion
             .lock()
             .expect("rx completion lock");
-        if slot.is_some() {
-            return;
+        if let Some(completion) = slot.as_ref() {
+            return Arc::clone(completion);
         }
         let intr = Arc::clone(&self.shared.interrupt);
         let completion = VirtioCompletion::new(
@@ -512,12 +512,13 @@ impl VirtioVsock {
         // Force the first completions through EVENT_IDX suppression so
         // an idle guest always wakes on the first packet.
         completion.set_force_interrupt(32);
-        *slot = Some(completion);
+        *slot = Some(Arc::clone(&completion));
+        completion
     }
 
     /// Pop RX chains and hold them until a packet needs one.
     fn stash_rx(&self, queue: &mut VirtQueue, physmap: &PhysMap) {
-        self.ensure_rx_completion(queue);
+        let completion = self.ensure_rx_completion(queue);
 
         // A stashed chain is only completed once a packet lands in it,
         // so the stash needs a bound of its own: a guest can otherwise
@@ -526,6 +527,7 @@ impl VirtioVsock {
         let mut popped = 0usize;
         loop {
             let before = queue.last_avail_idx();
+            let mut refused: Vec<u16> = Vec::new();
             {
                 let mut pending =
                     self.shared.pending_rx.lock().expect("pending rx lock");
@@ -535,9 +537,21 @@ impl VirtioVsock {
                     };
                     popped += 1;
                     let Some(chain) = queue.collect_chain(physmap, head) else {
+                        refused.push(head);
                         continue;
                     };
                     pending.push_back((head, chain));
+                }
+            }
+            // `pop_avail` already took these heads out of the available
+            // ring, so each one has to go back on the used ring. Losing
+            // one costs the guest a descriptor for the life of the
+            // device, and there is no abort path to recover it.
+            if !refused.is_empty() {
+                debug!(self.shared.log, "virtio-vsock refused rx chains";
+                    "count" => refused.len());
+                for head in refused {
+                    completion.complete(head, 0);
                 }
             }
             let hit_request_cap = popped >= max_requests;
@@ -963,5 +977,149 @@ mod tests {
     #[test]
     fn the_config_space_is_one_le64_cid() {
         assert_eq!(VSOCK_CONFIG_SIZE, 8);
+    }
+
+    // -- Receive ring fixtures --
+
+    const DESC_GPA: u64 = 0x1000;
+    const AVAIL_GPA: u64 = 0x1100;
+    const USED_GPA: u64 = 0x1200;
+    const BUF_GPA: u64 = 0x1800;
+    const RING_SIZE: u16 = 4;
+
+    fn test_logger() -> slog::Logger {
+        slog::Logger::root(slog::Discard, slog::o!())
+    }
+
+    /// A device whose socket sits in a directory `bind_restricted`
+    /// makes itself. Making it here instead would race the umask that
+    /// `bind_restricted` sets around its own bind.
+    fn test_vsock(physmap: Arc<PhysMap>) -> (PathBuf, VirtioVsock) {
+        static SEQ: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rust-bhyve-vsock-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let vsock =
+            VirtioVsock::new(&dir.join("v.sock"), 3, physmap, test_logger())
+                .expect("create vsock device");
+        (dir, vsock)
+    }
+
+    fn write_desc(
+        physmap: &PhysMap,
+        idx: u64,
+        addr: u64,
+        len: u32,
+        flags: u16,
+        next: u16,
+    ) {
+        physmap
+            .lookup(DESC_GPA + idx * 16, 16)
+            .expect("mapped descriptor")
+            .write(&crate::queue::VirtqDesc {
+                addr,
+                len,
+                flags,
+                next,
+            })
+            .expect("write descriptor");
+    }
+
+    /// A receive queue with one chain posted in the available ring.
+    fn rx_ring() -> (Arc<PhysMap>, Vec<VirtQueue>) {
+        let physmap = Arc::new(
+            PhysMap::new_anon(DESC_GPA, 0x2000).expect("create queue memory"),
+        );
+        let mut queue = VirtQueue::new(RING_SIZE);
+        queue.set_addr_modern(DESC_GPA, AVAIL_GPA, USED_GPA);
+        physmap
+            .lookup(AVAIL_GPA + 2, 2)
+            .expect("mapped avail index")
+            .write::<u16>(&1)
+            .expect("write avail index");
+        physmap
+            .lookup(AVAIL_GPA + 4, 2)
+            .expect("mapped avail entry")
+            .write::<u16>(&0)
+            .expect("write avail entry");
+        (physmap, vec![queue])
+    }
+
+    fn used_idx(physmap: &PhysMap) -> u16 {
+        physmap
+            .lookup(USED_GPA + 2, 2)
+            .expect("mapped used index")
+            .read::<u16>()
+            .expect("read used index")
+    }
+
+    fn used_entry(physmap: &PhysMap) -> (u32, u32) {
+        let sub = physmap.lookup(USED_GPA + 4, 8).expect("mapped used entry");
+        let id = sub.read::<u32>().expect("read used id");
+        let len = sub
+            .subregion(4, 4)
+            .expect("used length")
+            .read::<u32>()
+            .expect("read used length");
+        (id, len)
+    }
+
+    /// A chain the walker refuses must still go back on the used ring.
+    /// `pop_avail` already took its head out of the available ring, so
+    /// dropping it burns one descriptor for the life of the device.
+    /// Enough of them and the ring runs dry and the guest stalls.
+    #[test]
+    fn a_refused_rx_chain_returns_its_descriptor() {
+        let (physmap, mut queues) = rx_ring();
+        // NEXT past the end of the table: the walker refuses this.
+        write_desc(
+            &physmap,
+            0,
+            BUF_GPA,
+            64,
+            crate::bits::VRING_DESC_F_NEXT | crate::bits::VRING_DESC_F_WRITE,
+            RING_SIZE + 3,
+        );
+        let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+
+        vsock.notify_queue(VSOCK_RX_QUEUE, &mut queues, &physmap);
+
+        assert_eq!(
+            used_idx(&physmap),
+            1,
+            "the refused head never went back to the guest",
+        );
+        assert_eq!(used_entry(&physmap), (0, 0));
+        assert!(vsock.shared.pending_rx.lock().expect("pending").is_empty());
+
+        vsock.halt();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The opposite case: a chain that walks is held for a packet, not
+    /// completed. The guest gets it back once there is data in it.
+    #[test]
+    fn a_good_rx_chain_is_held_for_a_packet() {
+        let (physmap, mut queues) = rx_ring();
+        write_desc(
+            &physmap,
+            0,
+            BUF_GPA,
+            64,
+            crate::bits::VRING_DESC_F_WRITE,
+            0,
+        );
+        let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+
+        vsock.notify_queue(VSOCK_RX_QUEUE, &mut queues, &physmap);
+
+        assert_eq!(used_idx(&physmap), 0, "an empty chain was completed");
+        assert_eq!(vsock.shared.pending_rx.lock().expect("pending").len(), 1);
+
+        vsock.halt();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
