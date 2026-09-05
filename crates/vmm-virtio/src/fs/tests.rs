@@ -805,3 +805,19 @@ fn halt_joins_the_worker_after_a_pause() {
     assert!(fs.worker.lock().expect("worker lock").is_none());
     assert_eq!(fs.lifecycle_state(), Some(IndicatedState::Halt));
 }
+
+// A DAX window would be guest-accessible memory that no session
+// covers: the guest keeps the mapping across a device reset, so the
+// reset could not take it back the way it takes back the ring. The
+// device offers no window, and the config it publishes must keep
+// saying so.
+#[test]
+fn the_device_publishes_no_dax_window() {
+    let fs = test_fs(Arc::new(PhysMap::new()));
+
+    // notify_buf_size, the last field of virtio_fs_config. A DAX
+    // device would also carry a shared-memory region capability,
+    // which this transport never builds.
+    assert_eq!(fs.cfg_read(40, 4), 0);
+    assert_eq!(FS_CONFIG_SIZE as usize, FS_TAG_LEN + 4 + 4);
+}

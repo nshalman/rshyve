@@ -379,3 +379,72 @@ fn o_trunc_still_works_on_a_writable_share() {
         .expect("read back")
         .is_empty());
 }
+
+// A DAX window would hand the guest a mapping of host files that
+// outlives the driver session: a device reset can take back the ring,
+// but not a mapping the guest already holds. The export offers none,
+// so the two mapping opcodes must stay undispatched and the INIT
+// reply must keep advertising no map alignment.
+//
+// FUSE_SETUPMAPPING is 48 and FUSE_REMOVEMAPPING is 49 (FUSE 7.31).
+#[test]
+fn the_dax_mapping_opcodes_are_refused() {
+    const FUSE_SETUPMAPPING: u32 = 48;
+    const FUSE_REMOVEMAPPING: u32 = 49;
+
+    for opcode in [FUSE_SETUPMAPPING, FUSE_REMOVEMAPPING] {
+        let physmap = anon();
+        let hdr = fuse::FuseInHeader {
+            len: fuse::FUSE_IN_HEADER_SIZE as u32,
+            opcode,
+            unique: 0x51,
+            nodeid: fuse::FUSE_ROOT_ID,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            padding: 0,
+        };
+        let req = bytes_of(&hdr);
+        seed(&physmap, REQ, &req);
+
+        let bufs = vec![
+            ChainBuf::Readable {
+                addr: REQ,
+                len: req.len() as u32,
+            },
+            ChainBuf::Writable {
+                addr: RESP,
+                len: 256,
+            },
+        ];
+
+        let written = handle(&server(), &bufs, &physmap);
+        let out = fetch(&physmap, RESP, written as usize);
+        let reply: fuse::FuseOutHeader = read_at(&out).expect("out header");
+        // The guest is Linux, so the reply carries a Linux errno.
+        assert_eq!(
+            reply.error,
+            -fuse::to_linux_errno(libc::ENOSYS),
+            "opcode {opcode} reached a handler"
+        );
+    }
+
+    let physmap = anon();
+    let req = init_request();
+    seed(&physmap, REQ, &req);
+    let bufs = vec![
+        ChainBuf::Readable {
+            addr: REQ,
+            len: req.len() as u32,
+        },
+        ChainBuf::Writable {
+            addr: RESP,
+            len: 256,
+        },
+    ];
+    let written = handle(&server(), &bufs, &physmap);
+    let out = fetch(&physmap, RESP, written as usize);
+    let init: fuse::FuseInitOut =
+        read_at(&out[fuse::FUSE_OUT_HEADER_SIZE..]).expect("init out");
+    assert_eq!(init.map_alignment, 0, "the export advertised a DAX window");
+}
