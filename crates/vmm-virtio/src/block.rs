@@ -781,7 +781,9 @@ fn blk_io_worker(
         // one complete_batch() instead of N complete() calls.
         while owned < BATCH_MAX {
             let Ok(next) = rx.try_recv() else { break };
-            if next.epoch != current {
+            // A fresh read, not `current`: a reset that landed while
+            // the last request ran must stop this one too.
+            if next.epoch != ctx.epoch.load(Ordering::Acquire) {
                 // A reset landed mid drain. Publish what this batch holds
                 // before touching a request from the other side of it.
                 // Its own count stays outstanding: the next pass owns it.
@@ -809,14 +811,20 @@ fn blk_io_worker(
 /// Process a single I/O request: execute the operation, write status.
 /// Returns (head, written) for completion batching.
 ///
-/// Returns `None` when a reset landed while the syscall ran: the status
-/// byte and the used entry would both go to memory the driver has freed.
+/// Returns `None` when the request no longer matches the device epoch:
+/// its chain, its status byte and its used entry all point at a ring
+/// the driver has freed. The epoch is read on both sides of the
+/// syscall, because a read runs straight into the chain and no later
+/// check can take that write back.
 fn process_one_request(
     fd: i32,
     limits: &DiskLimits,
     ctx: &WorkerCtx,
     req: BlkIoRequest,
 ) -> Option<(u16, u32)> {
+    if req.epoch != ctx.epoch.load(Ordering::Acquire) {
+        return None;
+    }
     let physmap = &ctx.physmap;
     let (status, written) = match req.rtype {
         bits::VIRTIO_BLK_T_IN => do_pread(fd, req.sector, &req.chain, physmap),

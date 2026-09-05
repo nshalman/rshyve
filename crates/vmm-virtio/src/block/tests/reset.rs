@@ -322,3 +322,77 @@ fn a_worker_holds_its_count_until_the_used_entry_lands() {
         "the count reached zero before the used entry was published",
     );
 }
+
+// The epoch has to be read before the syscall, not after it. A read
+// that runs against a stale chain writes disk contents straight into
+// the pages the driver has already recycled; suppressing the used
+// entry afterwards does not take that back.
+#[test]
+fn a_stale_request_does_not_run_its_syscall() {
+    const HDR_GPA: u64 = 0x2000;
+    const STATUS_GPA: u64 = 0x2100;
+    /// Stands in for a page the driver freed and the guest reused.
+    const RECYCLED_GPA: u64 = 0x2200;
+    const SECTOR: usize = 512;
+
+    let physmap =
+        Arc::new(PhysMap::new_anon(0x1000, 0x2000).expect("queue memory"));
+    let mut queue = VirtQueue::new(8);
+    queue.set_addr_modern(0x1000, 0x1100, 0x1200);
+    let completion = VirtioCompletion::new(&queue, Arc::clone(&physmap), || {});
+
+    let mut file = tempfile::tempfile().expect("create tempfile");
+    std::io::Write::write_all(&mut file, &[0xAB; SECTOR])
+        .expect("fill the backing file");
+    let limits = DiskLimits {
+        capacity: 1,
+        read_only: true,
+        nodelete: true,
+    };
+    // Epoch 1 is current, so the request dispatched under 0 is stale.
+    let ctx = WorkerCtx {
+        physmap: Arc::clone(&physmap),
+        gate: Arc::new(QuiesceGate::new(1)),
+        epoch: Arc::new(AtomicU64::new(1)),
+        inflight: Arc::new(AtomicUsize::new(1)),
+    };
+
+    let done = process_one_request(
+        file.as_raw_fd(),
+        &limits,
+        &ctx,
+        BlkIoRequest {
+            rtype: bits::VIRTIO_BLK_T_IN,
+            sector: 0,
+            chain: vec![
+                ChainBuf::Readable {
+                    addr: HDR_GPA,
+                    len: BLK_REQ_HEADER_SIZE as u32,
+                },
+                ChainBuf::Writable {
+                    addr: RECYCLED_GPA,
+                    len: SECTOR as u32,
+                },
+                ChainBuf::Writable {
+                    addr: STATUS_GPA,
+                    len: 1,
+                },
+            ],
+            head: 0,
+            completion,
+            epoch: 0,
+        },
+    );
+
+    assert!(done.is_none(), "a stale request must publish nothing");
+    let mut recycled = [0u8; SECTOR];
+    physmap
+        .lookup(RECYCLED_GPA, SECTOR)
+        .expect("mapped recycled page")
+        .read_bytes(&mut recycled)
+        .expect("read the recycled page");
+    assert_eq!(
+        recycled, [0u8; SECTOR],
+        "the stale read ran and wrote disk data into a recycled page"
+    );
+}
