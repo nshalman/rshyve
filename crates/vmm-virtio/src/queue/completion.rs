@@ -14,7 +14,7 @@ use super::{bits, vring_need_event, VirtQueue};
 /// Thread-safe completion handler for async virtio I/O.
 ///
 /// Exclusively owns the used ring write index for one virtqueue.
-/// ALL completions — inline fast-path and async workers — MUST go
+/// ALL completions, inline fast-path and async workers alike, MUST go
 /// through this struct. Never mix with `VirtQueue::push_used()`.
 ///
 /// # Design (Propolis `Mutex<VqUsed>` pattern)
@@ -86,7 +86,7 @@ impl VirtioCompletion {
     ///
     /// When `event_idx` is negotiated, reads `avail_event` from the
     /// guest to determine if an interrupt is needed. This suppresses
-    /// redundant interrupts — the guest only wants an interrupt when
+    /// redundant interrupts: the guest only wants an interrupt when
     /// the device has completed past the index the guest last saw.
     ///
     /// Safe from any thread (vCPU inline path or I/O worker).
