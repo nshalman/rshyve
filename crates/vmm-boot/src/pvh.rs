@@ -23,11 +23,10 @@
 use anyhow::{ensure, Context, Result};
 
 use vmm_core::mem::MemCtx;
-use vmm_core::vcpu::Vcpu;
 use vmm_devices::acpi;
 
 use crate::direct::{CMDLINE_MAX, GPA_CMDLINE};
-use crate::{InitrdImage, PvhKernel};
+use crate::{BootVcpu, InitrdImage, PvhKernel};
 
 // ── Guest physical addresses ────────────────────────────────────────
 
@@ -292,7 +291,10 @@ pub fn load_pvh_kernel(
 /// PVH passes `hvm_start_info` in `EBX`. `ESI` carrying a boot pointer is
 /// the bzImage convention and is wrong here. This is separate from
 /// `setup_direct_boot_bsp` because the register state genuinely differs.
-pub fn setup_pvh_bsp(vcpu: &Vcpu, entry32: u32) -> Result<()> {
+pub fn setup_pvh_bsp<V: BootVcpu + ?Sized>(
+    vcpu: &V,
+    entry32: u32,
+) -> Result<()> {
     use bhyve_api::{
         seg_desc, vm_reg_name::*, SEG_ACCESS_DB, SEG_ACCESS_G, SEG_ACCESS_P,
         SEG_ACCESS_S, SEG_ACCESS_UNUSABLE,
@@ -500,6 +502,78 @@ mod tests {
         assert_ne!(GDT_CODE32 & (1 << 54), 0, "D/B must be set");
         assert_eq!(GDT_CODE32 & (1 << 53), 0, "L must be clear");
         assert_ne!(GDT_DATA32 & (1 << 54), 0, "D/B must be set");
+    }
+
+    /// Every register write `setup_pvh_bsp` makes, in order.
+    ///
+    /// The values are literals on purpose: an expression shared with
+    /// the code under test would move with it and prove nothing. PVH
+    /// enters in 32-bit protected mode with paging off and the boot
+    /// pointer in `EBX`, so any drift here is a silent triple fault.
+    #[test]
+    fn pvh_bsp_writes_a_fixed_register_sequence() {
+        use bhyve_api::vm_reg_name::*;
+
+        use crate::recording::{
+            assert_sequence, desc, reg, RecordingVcpu, Write,
+        };
+
+        // P|S|DB|G|0x0B, P|S|DB|G|0x03, P|0x0B, and UNUSABLE.
+        const CODE32_ACCESS: u32 = 0xC09B;
+        const DATA32_ACCESS: u32 = 0xC093;
+        const TSS_BUSY_ACCESS: u32 = 0x8B;
+        const LDTR_ACCESS: u32 = 0x1_0000;
+
+        let cpu = RecordingVcpu::default();
+        setup_pvh_bsp(&cpu, ENTRY32).expect("the recorder never fails");
+
+        assert_sequence(
+            &cpu.writes(),
+            &[
+                Write::Reboot,
+                reg(VM_REG_GUEST_CR0, 0x11), // ET|PE, paging off
+                reg(VM_REG_GUEST_CR3, 0),
+                reg(VM_REG_GUEST_CR4, 0),
+                reg(VM_REG_GUEST_EFER, 0),
+                desc(VM_REG_GUEST_CS, 0, u32::MAX, CODE32_ACCESS),
+                reg(VM_REG_GUEST_CS, 0x08),
+                desc(VM_REG_GUEST_DS, 0, u32::MAX, DATA32_ACCESS),
+                reg(VM_REG_GUEST_DS, 0x10),
+                desc(VM_REG_GUEST_ES, 0, u32::MAX, DATA32_ACCESS),
+                reg(VM_REG_GUEST_ES, 0x10),
+                desc(VM_REG_GUEST_FS, 0, u32::MAX, DATA32_ACCESS),
+                reg(VM_REG_GUEST_FS, 0x10),
+                desc(VM_REG_GUEST_GS, 0, u32::MAX, DATA32_ACCESS),
+                reg(VM_REG_GUEST_GS, 0x10),
+                desc(VM_REG_GUEST_SS, 0, u32::MAX, DATA32_ACCESS),
+                reg(VM_REG_GUEST_SS, 0x10),
+                desc(VM_REG_GUEST_GDTR, 0x6000, 23, 0),
+                desc(VM_REG_GUEST_TR, 0, 0xFFFF, TSS_BUSY_ACCESS),
+                reg(VM_REG_GUEST_TR, 0),
+                desc(VM_REG_GUEST_LDTR, 0, 0, LDTR_ACCESS),
+                reg(VM_REG_GUEST_LDTR, 0),
+                desc(VM_REG_GUEST_IDTR, 0, 0xFFFF, 0),
+                reg(VM_REG_GUEST_RIP, ENTRY32 as u64),
+                reg(VM_REG_GUEST_RBX, 0x1000), // hvm_start_info, not RSI
+                reg(VM_REG_GUEST_RFLAGS, 0x02),
+                reg(VM_REG_GUEST_RAX, 0),
+                reg(VM_REG_GUEST_RCX, 0),
+                reg(VM_REG_GUEST_RDX, 0),
+                reg(VM_REG_GUEST_RSI, 0),
+                reg(VM_REG_GUEST_RDI, 0),
+                reg(VM_REG_GUEST_RBP, 0),
+                reg(VM_REG_GUEST_RSP, 0),
+                reg(VM_REG_GUEST_R8, 0),
+                reg(VM_REG_GUEST_R9, 0),
+                reg(VM_REG_GUEST_R10, 0),
+                reg(VM_REG_GUEST_R11, 0),
+                reg(VM_REG_GUEST_R12, 0),
+                reg(VM_REG_GUEST_R13, 0),
+                reg(VM_REG_GUEST_R14, 0),
+                reg(VM_REG_GUEST_R15, 0),
+                Write::RunState(2), // VRS_RUN
+            ],
+        );
     }
 
     #[test]

@@ -13,9 +13,8 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use vmm_core::mem::MemCtx;
-use vmm_core::vcpu::Vcpu;
 
-use crate::{ImageBytes, InitrdImage, KernelImage, PvhKernel};
+use crate::{BootVcpu, ImageBytes, InitrdImage, KernelImage, PvhKernel};
 
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
 const BZIMAGE_MAGIC_OFFSET: usize = 0x202;
@@ -135,7 +134,7 @@ impl BootImage {
     ///
     /// The entry point travels inside the image, so a caller cannot
     /// pair one protocol's entry with the other's register state.
-    pub fn setup_bsp(&self, vcpu: &Vcpu) -> Result<()> {
+    pub fn setup_bsp<V: BootVcpu + ?Sized>(&self, vcpu: &V) -> Result<()> {
         match self {
             Self::Bzimage(k) => {
                 crate::setup_direct_boot_bsp(vcpu, k.entry_point_64())
@@ -225,6 +224,41 @@ mod tests {
     fn never_falls_back_to_bzimage_for_a_short_file() {
         // A 16-byte file has no 0x202 offset to read.
         assert!(detect_boot_protocol(&[0u8; 16]).is_err());
+    }
+
+    /// The two protocols leave the guest in states that share no
+    /// registers, so a crossed dispatch is a triple fault, not a
+    /// warning. `setup_bsp` is the only place the pairing is decided.
+    #[test]
+    fn setup_bsp_programs_the_registers_of_the_detected_protocol() {
+        use bhyve_api::vm_reg_name::*;
+
+        use crate::recording::{reg, RecordingVcpu};
+
+        let bz = BootImage::Bzimage(
+            KernelImage::from_bytes(bzimage_bytes()).expect("bzImage"),
+        );
+        let cpu = RecordingVcpu::default();
+        bz.setup_bsp(&cpu).expect("the recorder never fails");
+        let writes = cpu.writes();
+        // Long mode: CR0.PG set, and RIP at the 64-bit entry.
+        assert_eq!(writes[1], reg(VM_REG_GUEST_CR0, 0x8000_0031));
+        assert!(writes.contains(&reg(VM_REG_GUEST_RIP, 0x0100_0200)));
+        // bzImage passes boot_params in RSI.
+        assert!(writes.contains(&reg(VM_REG_GUEST_RSI, 0x7000)));
+
+        let pvh = BootImage::Pvh(
+            PvhKernel::from_bytes(pvh_elf_bytes()).expect("PVH ELF"),
+        );
+        let cpu = RecordingVcpu::default();
+        pvh.setup_bsp(&cpu).expect("the recorder never fails");
+        let writes = cpu.writes();
+        // Protected mode: paging off, and RIP at the 32-bit entry.
+        assert_eq!(writes[1], reg(VM_REG_GUEST_CR0, 0x11));
+        assert!(writes.contains(&reg(VM_REG_GUEST_RIP, 0x0010_0100)));
+        // PVH passes hvm_start_info in EBX, and leaves RSI zero.
+        assert!(writes.contains(&reg(VM_REG_GUEST_RBX, 0x1000)));
+        assert!(writes.contains(&reg(VM_REG_GUEST_RSI, 0)));
     }
 
     #[test]

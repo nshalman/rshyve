@@ -26,9 +26,8 @@ use std::path::Path;
 
 use anyhow::{ensure, Context, Result};
 
-use crate::ImageBytes;
+use crate::{BootVcpu, ImageBytes};
 use vmm_core::mem::MemCtx;
-use vmm_core::vcpu::Vcpu;
 use vmm_devices::acpi;
 
 // ── Guest physical addresses ────────────────────────────────────────
@@ -468,7 +467,10 @@ fn write_boot_params(
 // ── BSP setup ───────────────────────────────────────────────────────
 
 /// Configure vCPU 0 for 64-bit long mode entry into the kernel.
-pub fn setup_direct_boot_bsp(vcpu: &Vcpu, entry_point: u64) -> Result<()> {
+pub fn setup_direct_boot_bsp<V: BootVcpu + ?Sized>(
+    vcpu: &V,
+    entry_point: u64,
+) -> Result<()> {
     use bhyve_api::{
         seg_desc, vm_reg_name::*, SEG_ACCESS_DB, SEG_ACCESS_G, SEG_ACCESS_L,
         SEG_ACCESS_P, SEG_ACCESS_S, SEG_ACCESS_UNUSABLE,
@@ -594,6 +596,8 @@ pub fn setup_direct_boot_bsp(vcpu: &Vcpu, entry_point: u64) -> Result<()> {
 mod tests {
     use super::*;
 
+    use crate::recording::Write;
+
     #[test]
     fn page_table_structure() {
         // Verify page table byte layout
@@ -662,6 +666,77 @@ mod tests {
         let err = KernelImage::from_bytes(img)
             .expect_err("a truncated bzImage must error, not panic");
         assert!(err.to_string().contains("bzImage truncated"), "got: {err}");
+    }
+
+    /// Every register write `setup_direct_boot_bsp` makes, in order.
+    ///
+    /// The values are literals on purpose. Sharing an expression with
+    /// the code under test would let one edit change both sides and
+    /// prove nothing. The guest sees this sequence, so a reorder or a
+    /// changed bit is a boot regression whatever else still compiles.
+    #[test]
+    fn direct_boot_bsp_writes_a_fixed_register_sequence() {
+        use bhyve_api::vm_reg_name::*;
+
+        use crate::recording::{assert_sequence, desc, reg, RecordingVcpu};
+
+        // P|S|L|G|0x0B, P|S|DB|G|0x03, P|0x0B, and UNUSABLE.
+        const CODE64_ACCESS: u32 = 0xA09B;
+        const DATA64_ACCESS: u32 = 0xC093;
+        const TSS_BUSY64_ACCESS: u32 = 0x8B;
+        const LDTR_ACCESS: u32 = 0x1_0000;
+        const ENTRY: u64 = 0x0100_0200;
+
+        let cpu = RecordingVcpu::default();
+        setup_direct_boot_bsp(&cpu, ENTRY).expect("the recorder never fails");
+
+        assert_sequence(
+            &cpu.writes(),
+            &[
+                Write::Reboot,
+                reg(VM_REG_GUEST_CR0, 0x8000_0031), // PG|NE|ET|PE
+                reg(VM_REG_GUEST_CR3, 0x9000),
+                reg(VM_REG_GUEST_CR4, 0x20),   // PAE
+                reg(VM_REG_GUEST_EFER, 0x500), // LMA|LME
+                desc(VM_REG_GUEST_CS, 0, u32::MAX, CODE64_ACCESS),
+                reg(VM_REG_GUEST_CS, 0x08),
+                desc(VM_REG_GUEST_DS, 0, u32::MAX, DATA64_ACCESS),
+                reg(VM_REG_GUEST_DS, 0x10),
+                desc(VM_REG_GUEST_ES, 0, u32::MAX, DATA64_ACCESS),
+                reg(VM_REG_GUEST_ES, 0x10),
+                desc(VM_REG_GUEST_FS, 0, u32::MAX, DATA64_ACCESS),
+                reg(VM_REG_GUEST_FS, 0x10),
+                desc(VM_REG_GUEST_GS, 0, u32::MAX, DATA64_ACCESS),
+                reg(VM_REG_GUEST_GS, 0x10),
+                desc(VM_REG_GUEST_SS, 0, u32::MAX, DATA64_ACCESS),
+                reg(VM_REG_GUEST_SS, 0x10),
+                desc(VM_REG_GUEST_GDTR, 0x500, 23, 0),
+                desc(VM_REG_GUEST_TR, 0, 0xFFFF, TSS_BUSY64_ACCESS),
+                reg(VM_REG_GUEST_TR, 0),
+                desc(VM_REG_GUEST_LDTR, 0, 0, LDTR_ACCESS),
+                reg(VM_REG_GUEST_LDTR, 0),
+                desc(VM_REG_GUEST_IDTR, 0, 0xFFFF, 0),
+                reg(VM_REG_GUEST_RIP, ENTRY),
+                reg(VM_REG_GUEST_RSI, 0x7000), // boot_params
+                reg(VM_REG_GUEST_RFLAGS, 0x02),
+                reg(VM_REG_GUEST_RSP, 0),
+                reg(VM_REG_GUEST_RBP, 0),
+                reg(VM_REG_GUEST_RDI, 0),
+                reg(VM_REG_GUEST_RBX, 0),
+                reg(VM_REG_GUEST_RCX, 0),
+                reg(VM_REG_GUEST_RDX, 0),
+                reg(VM_REG_GUEST_RAX, 0),
+                reg(VM_REG_GUEST_R8, 0),
+                reg(VM_REG_GUEST_R9, 0),
+                reg(VM_REG_GUEST_R10, 0),
+                reg(VM_REG_GUEST_R11, 0),
+                reg(VM_REG_GUEST_R12, 0),
+                reg(VM_REG_GUEST_R13, 0),
+                reg(VM_REG_GUEST_R14, 0),
+                reg(VM_REG_GUEST_R15, 0),
+                Write::RunState(2), // VRS_RUN
+            ],
+        );
     }
 
     #[test]
