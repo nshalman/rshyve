@@ -7,16 +7,32 @@
 use std::time::{Duration, Instant};
 
 use super::super::queue::VirtqDesc;
+use super::access::{BackendBarrier, GuestAccess};
+use super::worker::{
+    blk_io_worker, run_request, BlkIoRequest, Bounce, WorkerCtx, WorkerParks,
+};
 use super::*;
 
+mod barrier;
+mod bounce;
 mod reset;
+
+/// A worker context wired to `physmap`, with a fresh session.
+fn worker_ctx(physmap: &Arc<PhysMap>) -> WorkerCtx {
+    WorkerCtx {
+        physmap: Arc::clone(physmap),
+        gate: Arc::new(QuiesceGate::new(1)),
+        access: Arc::new(GuestAccess::new()),
+        backend: Arc::new(BackendBarrier::new()),
+        parks: Arc::new(WorkerParks::default()),
+    }
+}
 
 #[test]
 fn quiesce_query_is_non_blocking_with_active_worker() {
     let file = tempfile::tempfile().expect("create tempfile");
     let fd = file.as_raw_fd();
     let device: Arc<dyn Lifecycle> = Arc::new(VirtioBlock {
-        fd,
         capacity: 0,
         sector_size: 512,
         read_only: true,
@@ -33,13 +49,7 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         _file: file,
         indicator: Indicator::new(),
         gate: Arc::new(QuiesceGate::new(1)),
-        ctx: WorkerCtx {
-            physmap: Arc::new(PhysMap::new()),
-            gate: Arc::new(QuiesceGate::new(1)),
-            epoch: Arc::new(AtomicU64::new(0)),
-            inflight: Arc::new(AtomicUsize::new(0)),
-            ring_access: Arc::new(RwLock::new(())),
-        },
+        ctx: worker_ctx(&Arc::new(PhysMap::new())),
     });
 
     let probe = Arc::clone(&device);
@@ -431,10 +441,13 @@ fn poke(physmap: &PhysMap, gpa: u64, bytes: &[u8]) {
         .expect("write guest range");
 }
 
-/// One DISCARD or WRITE_ZEROES request to drive through the device.
+/// One request to drive through the device: a DISCARD or WRITE_ZEROES
+/// payload, or any other opcode with `payload` set.
 struct DwzCase<'a> {
     rtype: u32,
     segs: &'a [[u8; 16]],
+    /// Data buffer, in place of the segments `segs` would encode.
+    payload: Option<&'a [u8]>,
     /// Backing file size in bytes.
     file_bytes: u64,
     /// Byte to pre-fill the backing file with. `None` leaves it sparse.
@@ -450,6 +463,7 @@ impl Default for DwzCase<'_> {
         Self {
             rtype: bits::VIRTIO_BLK_T_WRITE_ZEROES,
             segs: &[],
+            payload: None,
             file_bytes: 8 * 512,
             fill: Some(0xAB),
             read_only: false,
@@ -487,7 +501,10 @@ fn dwz_harness(case: &DwzCase<'_>) -> DwzHarness {
         .write(&header)
         .expect("write request header");
 
-    let payload: Vec<u8> = case.segs.concat();
+    let payload: Vec<u8> = match case.payload {
+        Some(bytes) => bytes.to_vec(),
+        None => case.segs.concat(),
+    };
     if !payload.is_empty() {
         poke(&physmap, DWZ_PAYLOAD_GPA, &payload);
     }
@@ -554,6 +571,25 @@ fn dwz_harness(case: &DwzCase<'_>) -> DwzHarness {
         block,
         backing,
     }
+}
+
+/// Poll `ready` until it holds, or fail after five seconds.
+fn wait_for(what: &str, ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready() {
+        assert!(Instant::now() < deadline, "{what}");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// End the current driver session, the way `VirtioDevice::reset` does.
+fn end_session(ctx: &WorkerCtx) -> u64 {
+    let epoch = ctx.access.close();
+    ctx.backend.retire(epoch);
+    ctx.access.drain();
+    ctx.access.settle_interrupts();
+    ctx.access.reopen();
+    epoch
 }
 
 /// Drive one request through and return its status byte. Worker

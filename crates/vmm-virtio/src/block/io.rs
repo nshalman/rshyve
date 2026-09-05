@@ -2,14 +2,90 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Zero-copy scatter-gather I/O between a virtio-blk chain and the disk.
+//! Host-buffered I/O between a virtio-blk chain and the disk.
 //!
-//! preadv/pwritev run straight against guest memory, so one syscall
-//! serves a request whatever its segment count.
+//! A backing-store call owns only host memory: a request is bounced
+//! through the worker's buffer. A read fills that buffer with no
+//! guest-access permission held and copies it out under permission; a
+//! write takes its snapshot under permission and then reaches the disk
+//! from the snapshot. Nothing here holds permission across a syscall,
+//! which is what keeps a device reset bounded.
 
-use vmm_core::mem::{PhysMap, SubMapping};
+use vmm_core::mem::PhysMap;
 
 use super::{bits, ChainBuf, VirtioBlkReqHdr, BLK_REQ_HEADER_SIZE};
+use super::{SEG_MAX, SIZE_MAX};
+
+/// Bytes a worker moves between the disk and its buffer per call.
+///
+/// One guest-memory copy of this size is the longest step a reset
+/// waits for, so this constant is the drain bound. A larger request is
+/// split into this many bytes at a time.
+pub(super) const BOUNCE_BYTES: usize = 256 * 1024;
+
+/// Data segments one request may carry. Matches the advertised
+/// `seg_max`.
+pub(super) const MAX_SEGMENTS: usize = SEG_MAX as usize;
+
+/// Bytes one request may move. Matches the advertised `seg_max` and
+/// `size_max`, which is the most a driver that reads them can build.
+pub(super) const MAX_REQ_BYTES: usize = MAX_SEGMENTS * SIZE_MAX as usize;
+
+/// Fold the data segments of a chain, refusing one that runs past the
+/// advertised limits.
+///
+/// Publishing `size_max` and `seg_max` bounds nothing on its own. The
+/// guest builds the chain and picks both numbers, so they hold only
+/// where they are checked.
+fn fold(chain: &[ChainBuf], pick: impl Fn(&ChainBuf) -> bool) -> Option<usize> {
+    let end = chain.len().checked_sub(1)?;
+    let data = chain.get(1..end)?;
+    if data.len() > MAX_SEGMENTS {
+        return None;
+    }
+    let mut total = 0usize;
+    let mut wanted = 0usize;
+    for buf in data {
+        let len = match buf {
+            ChainBuf::Writable { len, .. } | ChainBuf::Readable { len, .. } => {
+                *len
+            }
+        };
+        if len > SIZE_MAX {
+            return None;
+        }
+        total = total.checked_add(len as usize)?;
+        if total > MAX_REQ_BYTES {
+            return None;
+        }
+        if pick(buf) {
+            wanted = wanted.checked_add(len as usize)?;
+        }
+    }
+    Some(wanted)
+}
+
+/// Bytes a chain names in either direction, which is what the
+/// sector-range check must cover.
+pub(super) fn span(chain: &[ChainBuf]) -> Option<usize> {
+    fold(chain, |_| true)
+}
+
+/// Bytes a chain moves in the request's own direction.
+pub(super) fn transfer(chain: &[ChainBuf], writable: bool) -> Option<usize> {
+    fold(chain, |buf| {
+        matches!(buf, ChainBuf::Writable { .. }) == writable
+    })
+}
+
+/// Byte offset of `sector` in the backing store.
+pub(super) fn sector_offset(sector: u64) -> Option<u64> {
+    let offset = sector.checked_mul(bits::SECTOR_SIZE)?;
+    // A negative `off_t` would seek from somewhere the caller did not
+    // name.
+    libc::off_t::try_from(offset).ok()?;
+    Some(offset)
+}
 
 pub(super) fn parse_header(
     chain: &[ChainBuf],
@@ -27,201 +103,172 @@ pub(super) fn parse_header(
     }
 }
 
-/// Maximum segments handled on the stack to avoid heap allocation.
-/// Typical virtio-blk chains have 1-4 data segments; 16 covers all
-/// common cases. Chains longer than this spill to a Vec.
-const STACK_IOV_MAX: usize = 16;
-
-/// Resolve chain data segments into (SubMapping, iovec) pairs.
+/// Run `visit` over the part of each matching data segment that falls
+/// in the window `[offset, offset + len)` of the request.
 ///
-/// `extractor` selects which ChainBuf variant to handle (Writable for
-/// reads, Readable for writes) and returns `(addr, len)` on match.
-///
-/// Returns `(total_bytes, iov_count)` on success, or `None` on lookup failure.
-/// The caller must keep `subs` alive for the duration of the syscall.
-fn build_iovecs<F>(
-    data_bufs: &[ChainBuf],
-    physmap: &PhysMap,
-    subs: &mut [Option<SubMapping>],
-    iovs: &mut [libc::iovec],
-    extractor: F,
-) -> Option<(usize, usize)>
-where
-    F: Fn(&ChainBuf) -> Option<(u64, u32)>,
-{
-    let mut total_bytes = 0usize;
-    let mut iov_count = 0usize;
-    for (i, buf) in data_bufs.iter().enumerate() {
-        if let Some((addr, len)) = extractor(buf) {
-            let n = len as usize;
-            let sub = physmap.lookup(addr, n)?;
-            let ptr = unsafe { sub.as_ptr() };
-            iovs[iov_count] = libc::iovec {
-                iov_base: ptr as *mut libc::c_void,
-                iov_len: n,
-            };
-            subs[i] = Some(sub);
-            total_bytes += n;
-            iov_count += 1;
+/// Returns false when a segment cannot be mapped or a copy fails. The
+/// caller must then abandon the transfer: a partly filled buffer holds
+/// the previous request's bytes.
+fn walk_window(
+    chain: &[ChainBuf],
+    writable: bool,
+    offset: usize,
+    len: usize,
+    mut visit: impl FnMut(u64, usize, usize) -> bool,
+) -> bool {
+    let Some(end) = offset.checked_add(len) else {
+        return false;
+    };
+    let Some(data) = chain.len().checked_sub(1).and_then(|e| chain.get(1..e))
+    else {
+        return false;
+    };
+    let mut pos = 0usize;
+    let mut covered = 0usize;
+    for buf in data {
+        let (addr, seg) = match buf {
+            ChainBuf::Writable { addr, len } if writable => {
+                (*addr, *len as usize)
+            }
+            ChainBuf::Readable { addr, len } if !writable => {
+                (*addr, *len as usize)
+            }
+            _ => continue,
+        };
+        let start = pos;
+        let Some(stop) = start.checked_add(seg) else {
+            return false;
+        };
+        pos = stop;
+        if stop <= offset || start >= end {
+            continue;
         }
+        let from = offset.max(start);
+        let to = end.min(stop);
+        if to == from {
+            continue;
+        }
+        let Some(gpa) = addr.checked_add((from - start) as u64) else {
+            return false;
+        };
+        if !visit(gpa, from - offset, to - from) {
+            return false;
+        }
+        covered += to - from;
     }
-    Some((total_bytes, iov_count))
+    // A short walk would leave the tail of the window untouched, which
+    // for a read means the guest keeps whatever the page held before.
+    covered == len
 }
 
-/// Zero-copy preadv (scatter-gather) directly into guest memory.
-/// One syscall regardless of segment count.
-/// Returns (status, bytes_written) where bytes_written includes the status byte.
-pub(super) fn do_pread(
-    fd: i32,
-    sector: u64,
-    chain: &[ChainBuf],
+/// Copy `buf` into the chain's writable data segments, `offset` bytes
+/// into the request.
+pub(super) fn scatter(
     physmap: &PhysMap,
-) -> (u8, u32) {
-    let offset = match sector.checked_mul(bits::SECTOR_SIZE) {
-        Some(o) => o as i64,
-        None => return (bits::VIRTIO_BLK_S_IOERR, 1),
-    };
-    if offset < 0 {
-        return (bits::VIRTIO_BLK_S_IOERR, 1);
-    }
-    if chain.len() < 3 {
-        return (bits::VIRTIO_BLK_S_IOERR, 1);
-    }
-
-    let data_bufs = &chain[1..chain.len() - 1];
-    let nseg = data_bufs.len();
-
-    // Stack path for typical small chains; heap fallback for large ones.
-    let mut stack_subs: [Option<SubMapping>; STACK_IOV_MAX] =
-        std::array::from_fn(|_| None);
-    let mut stack_iovs: [libc::iovec; STACK_IOV_MAX] = [libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len: 0,
-    }; STACK_IOV_MAX];
-
-    let mut heap_subs: Vec<Option<SubMapping>> = Vec::new();
-    let mut heap_iovs: Vec<libc::iovec> = Vec::new();
-
-    let (subs, iovs): (&mut [Option<SubMapping>], &mut [libc::iovec]) =
-        if nseg <= STACK_IOV_MAX {
-            (&mut stack_subs[..nseg], &mut stack_iovs[..nseg])
-        } else {
-            heap_subs.resize_with(nseg, || None);
-            heap_iovs.resize(
-                nseg,
-                libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                },
-            );
-            (&mut heap_subs, &mut heap_iovs)
+    chain: &[ChainBuf],
+    offset: usize,
+    buf: &[u8],
+) -> bool {
+    walk_window(chain, true, offset, buf.len(), |gpa, at, len| {
+        let Some(sub) = physmap.lookup(gpa, len) else {
+            return false;
         };
-
-    let (total_bytes, iov_count) =
-        match build_iovecs(data_bufs, physmap, subs, iovs, |buf| match buf {
-            ChainBuf::Writable { addr, len } => Some((*addr, *len)),
-            _ => None,
-        }) {
-            Some(v) => v,
-            None => return (bits::VIRTIO_BLK_S_IOERR, 1),
-        };
-
-    if total_bytes == 0 {
-        return (bits::VIRTIO_BLK_S_OK, 1);
-    }
-
-    let nread = unsafe {
-        libc::preadv(
-            fd,
-            iovs.as_ptr(),
-            iov_count as libc::c_int,
-            offset as libc::off_t,
-        )
-    };
-    // SubMappings in `subs` keep guest pages pinned until after preadv returns.
-    if nread < 0 || nread as usize != total_bytes {
-        return (bits::VIRTIO_BLK_S_IOERR, 1);
-    }
-    let len = u32::try_from(total_bytes)
-        .unwrap_or(u32::MAX)
-        .saturating_add(1);
-    (bits::VIRTIO_BLK_S_OK, len) // +1 for status byte
+        // A bulk copy, not the volatile byte loop: the driver may not
+        // read a data buffer before the used index that publishes it,
+        // and that index is written after this with a release fence.
+        // So no vCPU can observe this copy part way through.
+        sub.copy_in(&buf[at..at + len]).is_ok()
+    })
 }
 
-/// Zero-copy pwritev (scatter-gather) directly from guest memory.
-/// One syscall regardless of segment count.
-/// Returns (status, bytes_written) where bytes_written is 1 (status byte only).
-pub(super) fn do_pwrite(
-    fd: i32,
-    sector: u64,
-    chain: &[ChainBuf],
+/// Copy the chain's readable data segments into `buf`, `offset` bytes
+/// into the request.
+pub(super) fn gather(
     physmap: &PhysMap,
-) -> (u8, u32) {
-    let offset = match sector.checked_mul(bits::SECTOR_SIZE) {
-        Some(o) => o as i64,
-        None => return (bits::VIRTIO_BLK_S_IOERR, 1),
-    };
-    if offset < 0 {
-        return (bits::VIRTIO_BLK_S_IOERR, 1);
-    }
-    if chain.len() < 3 {
-        return (bits::VIRTIO_BLK_S_IOERR, 1);
-    }
-
-    let data_bufs = &chain[1..chain.len() - 1];
-    let nseg = data_bufs.len();
-
-    let mut stack_subs: [Option<SubMapping>; STACK_IOV_MAX] =
-        std::array::from_fn(|_| None);
-    let mut stack_iovs: [libc::iovec; STACK_IOV_MAX] = [libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len: 0,
-    }; STACK_IOV_MAX];
-
-    let mut heap_subs: Vec<Option<SubMapping>> = Vec::new();
-    let mut heap_iovs: Vec<libc::iovec> = Vec::new();
-
-    let (subs, iovs): (&mut [Option<SubMapping>], &mut [libc::iovec]) =
-        if nseg <= STACK_IOV_MAX {
-            (&mut stack_subs[..nseg], &mut stack_iovs[..nseg])
-        } else {
-            heap_subs.resize_with(nseg, || None);
-            heap_iovs.resize(
-                nseg,
-                libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                },
-            );
-            (&mut heap_subs, &mut heap_iovs)
+    chain: &[ChainBuf],
+    offset: usize,
+    buf: &mut [u8],
+) -> bool {
+    let want = buf.len();
+    walk_window(chain, false, offset, want, |gpa, at, len| {
+        let Some(sub) = physmap.lookup(gpa, len) else {
+            return false;
         };
+        // The driver owns the buffer until the used entry lands, so it
+        // may not rewrite it here. A bulk copy matches what the kernel
+        // did when this was a `pwritev` straight out of guest memory.
+        sub.copy_out(&mut buf[at..at + len]).is_ok()
+    })
+}
 
-    let (total_bytes, iov_count) =
-        match build_iovecs(data_bufs, physmap, subs, iovs, |buf| match buf {
-            ChainBuf::Readable { addr, len } => Some((*addr, *len)),
-            _ => None,
-        }) {
-            Some(v) => v,
-            None => return (bits::VIRTIO_BLK_S_IOERR, 1),
+/// Fill the whole of `buf` from the disk. Host memory only, so no
+/// guest-access permission is needed or held.
+pub(super) fn read_backend(fd: i32, offset: u64, buf: &mut [u8]) -> bool {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let Some(at) = offset.checked_add(done as u64) else {
+            return false;
         };
-
-    if total_bytes == 0 {
-        return (bits::VIRTIO_BLK_S_OK, 1);
+        let Ok(at) = libc::off_t::try_from(at) else {
+            return false;
+        };
+        // SAFETY: the slice gives at least `buf.len() - done` writable
+        // bytes and the caller keeps `fd` open across the call.
+        let n = unsafe {
+            libc::pread(
+                fd,
+                buf[done..].as_mut_ptr().cast(),
+                buf.len() - done,
+                at,
+            )
+        };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind()
+                == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            return false;
+        }
+        // End of file short of the range. The caller must not copy the
+        // buffer out: past `done` it still holds the last request.
+        if n == 0 {
+            return false;
+        }
+        done += n as usize;
     }
+    true
+}
 
-    let nwritten = unsafe {
-        libc::pwritev(
-            fd,
-            iovs.as_ptr(),
-            iov_count as libc::c_int,
-            offset as libc::off_t,
-        )
-    };
-    // SubMappings in `subs` keep guest pages pinned until after pwritev returns.
-    if nwritten < 0 || nwritten as usize != total_bytes {
-        return (bits::VIRTIO_BLK_S_IOERR, 1);
+/// Write the whole of `buf` to the disk from the host snapshot.
+pub(super) fn write_backend(fd: i32, offset: u64, buf: &[u8]) -> bool {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let Some(at) = offset.checked_add(done as u64) else {
+            return false;
+        };
+        let Ok(at) = libc::off_t::try_from(at) else {
+            return false;
+        };
+        // SAFETY: the slice gives at least `buf.len() - done` readable
+        // bytes and the caller keeps `fd` open across the call.
+        let n = unsafe {
+            libc::pwrite(fd, buf[done..].as_ptr().cast(), buf.len() - done, at)
+        };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind()
+                == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            return false;
+        }
+        if n == 0 {
+            return false;
+        }
+        done += n as usize;
     }
-    (bits::VIRTIO_BLK_S_OK, 1) // writes only produce the status byte for guest
+    true
 }
 
 pub(super) fn write_status(
