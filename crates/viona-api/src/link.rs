@@ -37,6 +37,13 @@ use crate::{
 #[cfg(test)]
 mod test;
 
+/// The band viona signals a pending interrupt in.
+///
+/// The wait asks the kernel for this band and reads the answer back
+/// through the same name, so the two cannot drift apart. Ordinary
+/// readability is a different thing and means nothing here.
+const INTR_BAND: libc::c_short = libc::POLLRDBAND;
+
 /// What one `VNA_IOC_INTR_POLL` copies out: the pending state of
 /// every ring, in ring order.
 pub type IntrStatus = [u32; VIONA_VQ_MAX as usize];
@@ -267,7 +274,7 @@ impl LinkOps for VionaFd {
             let mut pfds = [
                 libc::pollfd {
                     fd: self.as_raw_fd(),
-                    events: libc::POLLRDBAND,
+                    events: INTR_BAND,
                     revents: 0,
                 },
                 libc::pollfd {
@@ -287,8 +294,17 @@ impl LinkOps for VionaFd {
                 // The device is closed, or the error is fatal.
                 return Err(err);
             }
-            if let Some(end) = poll_verdict(pfds[0].revents, pfds[1].revents) {
-                return Ok(end);
+            match poll_verdict(pfds[0].revents, pfds[1].revents) {
+                Some(end) => return Ok(end),
+                // The wait has no deadline, so poll(2) answers only
+                // when something it was asked for is ready, and every
+                // one of those has a verdict. A wakeup that lands here
+                // is one the loop would meet again at once.
+                None => {
+                    return Err(std::io::Error::other(
+                        "the viona wait woke with no event it asked for",
+                    ))
+                }
             }
         }
     }
@@ -331,11 +347,15 @@ impl LinkOps for VionaFd {
 /// descriptor is read first and on its own: the halt closes the write
 /// end, so it is ready and stays ready, and the poll thread must leave
 /// before it touches a link that is about to be destroyed.
+///
+/// `None` is not "wait again with the same descriptors ready": the
+/// caller treats it as an error, because every event the wait asks for
+/// is answered above.
 fn poll_verdict(link: libc::c_short, stop: libc::c_short) -> Option<IntrWait> {
     if stop != 0 {
         return Some(IntrWait::Stopped);
     }
-    if link & libc::POLLRDBAND != 0 {
+    if link & INTR_BAND != 0 {
         return Some(IntrWait::Pending);
     }
     // None of these clears on its own, so waiting again would spin.

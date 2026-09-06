@@ -474,6 +474,11 @@ fn one_wakeup_is_read_the_way_the_poll_thread_needs_it() {
     // not it. An end that is not a signal (the link hung up, the
     // descriptor is gone) stops the thread instead of spinning it:
     // none of those states clears on its own.
+    //
+    // The two rows that answer None are events the wait never asks
+    // for, so it can only meet them through a mistake. The caller
+    // reports them rather than waiting again on a descriptor that is
+    // ready and stays ready.
     let stopped = Some(IntrWait::Stopped);
     let pending = Some(IntrWait::Pending);
     let table = [
