@@ -45,6 +45,7 @@ mod migrate;
 mod modern;
 
 use intr::IntrGate;
+use modern::CapOffsets;
 
 /// Maximum number of virtqueues per device.
 const MAX_QUEUES: usize = 4;
@@ -169,47 +170,6 @@ impl VirtioPciState {
     #[allow(dead_code)]
     fn is_modern(&self) -> bool {
         self.guest_features & bits::VIRTIO_F_VERSION_1 != 0
-    }
-}
-
-/// Offsets of virtio PCI capabilities in config space.
-struct CapOffsets {
-    /// First capability offset (either MSI-X or first virtio cap).
-    first: u8,
-    /// MSI-X capability offset (0 if no MSI-X).
-    msix: u8,
-    /// Common config capability offset.
-    common: u8,
-    /// Notify capability offset.
-    notify: u8,
-    /// ISR capability offset.
-    isr: u8,
-    /// Device config capability offset.
-    device: u8,
-}
-
-impl CapOffsets {
-    fn new(has_msix: bool) -> Self {
-        if has_msix {
-            // MSI-X cap (12 bytes) at 0x40, then virtio caps after
-            Self {
-                first: 0x40,
-                msix: 0x40,
-                common: 0x4C,
-                notify: 0x5C, // 0x4C + 16
-                isr: 0x70,    // 0x5C + 20
-                device: 0x80, // 0x70 + 16
-            }
-        } else {
-            Self {
-                first: 0x40,
-                msix: 0,
-                common: 0x40,
-                notify: 0x50, // 0x40 + 16
-                isr: 0x64,    // 0x50 + 20
-                device: 0x74, // 0x64 + 16
-            }
-        }
     }
 }
 
