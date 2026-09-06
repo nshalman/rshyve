@@ -287,6 +287,47 @@ fn a_kick_from_a_hostile_guest_leaves_the_device_usable() {
     );
 }
 
+/// The guest reaches this by accepting features and then kicking,
+/// before it has written a single ring address. viona starts a ring
+/// worker in `ring_init`, so a ring the guest never programmed has
+/// none, and the kick walks into the mac layer with a NULL there.
+///
+/// The features guard above does not cover it: the guest sets
+/// FEATURES_OK first, which is the order the specification gives it.
+#[test]
+fn a_kick_before_the_guest_programmed_a_ring_is_refused() {
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps)));
+
+    VirtioDevice::set_features(&device, u64::from(VIRTIO_NET_F_MAC));
+    for ring in 0..NET_NUM_QUEUES as u16 {
+        notify(&device, ring);
+    }
+
+    assert_eq!(
+        steps_of(&steps),
+        [Step::SetFeatures(u64::from(VIRTIO_NET_F_MAC))],
+        "a kick reached a ring the kernel has no worker for",
+    );
+}
+
+/// The guard is per ring, not per device. A guest that programs one
+/// ring and kicks the other reaches the same NULL as the one that
+/// programs nothing.
+#[test]
+fn a_kick_reaches_only_the_ring_the_guest_programmed() {
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps)));
+    VirtioDevice::set_features(&device, u64::from(VIRTIO_NET_F_MAC));
+    VirtioDevice::queue_addr_set(&device, 0, &addressed_queue());
+    steps.lock().expect("steps lock").clear();
+
+    notify(&device, 0);
+    notify(&device, 1);
+
+    assert_eq!(steps_of(&steps), [Step::RingKick(0)]);
+}
+
 #[test]
 fn a_halt_leaves_no_ring_a_kick_can_reach() {
     // The halt drops the device lock before it destroys the link,
