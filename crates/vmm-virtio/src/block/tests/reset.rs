@@ -274,21 +274,30 @@ fn a_reset_does_not_wait_for_interrupt_injection() {
 fn a_guest_refilling_the_ring_does_not_hold_the_resetting_vcpu() {
     const RING: u16 = 64;
     const AVAIL_IDX_GPA: u64 = 0x1102;
+    const USED_IDX_GPA: u64 = 0x1202;
     let (physmap, queue, blk) = make_get_id_queue(RING, RING);
     let mut queues = [queue];
     let stop = AtomicBool::new(false);
     let done = AtomicBool::new(false);
 
+    let used_idx = || -> u16 {
+        physmap
+            .lookup(USED_IDX_GPA, 2)
+            .expect("mapped used index")
+            .read::<u16>()
+            .expect("read used index")
+    };
+
     let waited = thread::scope(|s| {
         // A second vCPU pushing more work in behind the walk. Every
         // avail entry names the same head, so this needs only the
-        // index.
+        // index, and it moves far enough each time that the walk
+        // never catches up: what ends the walk is the cap and nothing
+        // else.
         s.spawn(|| {
             let slot = physmap
                 .lookup(AVAIL_IDX_GPA, 2)
                 .expect("mapped avail index");
-            // Far enough ahead each time that the walk never catches
-            // up, so what ends it is the cap and nothing else.
             let mut idx = RING;
             while !stop.load(Ordering::Acquire) {
                 idx = idx.wrapping_add(251);
@@ -298,6 +307,11 @@ fn a_guest_refilling_the_ring_does_not_hold_the_resetting_vcpu() {
         s.spawn(|| {
             blk.notify_queue(0, &mut queues, &physmap);
         });
+        // The reset must start while the walk is in flight. Without
+        // this it can run first, take the session, and leave the walk
+        // with nothing to do.
+        wait_for("the walk never started", || used_idx() > 0);
+
         // The reset runs on its own thread under a deadline. One that
         // waits for a walk the guest can extend would park the run
         // instead of failing it.
