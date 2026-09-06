@@ -10,6 +10,11 @@
 # The crate list is derived from the workspace members, not kept by
 # hand. A new library crate therefore fails this check until either CI
 # names it or it is declared not portable below.
+#
+# Four jobs are checked, not three. The illumos cross-check is the only
+# job that compiles a `#[cfg(test)]` body behind
+# `cfg(target_os = "illumos")`, so a crate missing from ITS list is
+# unchecked against the target with every other job green.
 set -eu
 
 CI=".github/workflows/ci.yml"
@@ -65,19 +70,31 @@ for dir in $members; do
 done
 
 status=0
-for job in clippy test msrv; do
+for job in clippy test msrv cross; do
     # $MSRV is literal text in the workflow, not a shell expansion.
     # shellcheck disable=SC2016
     case "$job" in
         clippy) marker="cargo clippy --locked --all-targets" ;;
         test) marker="cargo test --locked" ;;
         msrv) marker='cargo "+$MSRV" check --locked' ;;
+        cross) marker="cargo check --locked --all-targets" ;;
+    esac
+    # Crates this one job may leave out, with the reason recorded at
+    # the job itself. Everything else must be named.
+    case "$job" in
+        # vmm_migrate pulls zstd-sys, which needs an illumos cross-cc
+        # the runner does not have. The host clippy and test jobs cover
+        # it, and its illumos paths are covered on the build host.
+        cross) allowed="vmm_migrate" ;;
+        *) allowed="" ;;
     esac
     # The command is a folded YAML scalar: the marker line, then the
-    # continuation lines that carry the -p arguments.
+    # continuation lines that carry the arguments. A --target line is
+    # one of those; stopping at it would read an empty crate list and
+    # report every crate missing.
     block=$(awk -v m="$marker" '
         index($0, m) { seen = 1; grab = 1; print; next }
-        grab && $0 ~ /^[ \t]*-p / { print; next }
+        grab && $0 ~ /^[ \t]*(-p |--target )/ { print; next }
         grab { exit }
         END { if (!seen) exit 1 }
     ' "$CI") || {
@@ -86,7 +103,22 @@ for job in clippy test msrv; do
         continue
     }
     args=" $(echo "$block" | tr '\n' ' ') "
+    case "$args" in
+        *" -p "*) ;;
+        *)
+            echo "$CI: the $job job block carries no -p arguments" >&2
+            status=1
+            continue
+            ;;
+    esac
     for crate in $crates; do
+        skip=no
+        for ok in $allowed; do
+            if [ "$crate" = "$ok" ]; then
+                skip=yes
+            fi
+        done
+        [ "$skip" = yes ] && continue
         case "$args" in
             *" -p $crate "*) ;;
             *)
