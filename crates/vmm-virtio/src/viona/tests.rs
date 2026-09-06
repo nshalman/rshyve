@@ -49,6 +49,7 @@ enum Op {
     SetNotifyIop,
     SetNotifyMmio,
     SetPromisc,
+    WaitIntr,
     Delete,
 }
 
@@ -305,6 +306,7 @@ impl LinkOps for TestLink {
     }
 
     fn wait_intr(&self, stop: &PipeReader) -> std::io::Result<IntrWait> {
+        self.result(Op::WaitIntr)?;
         // The halt closes the write end, so this read ends with 0
         // bytes. No test link signals its own work.
         let mut byte = [0u8; 1];

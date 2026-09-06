@@ -200,7 +200,7 @@ pub(super) fn deliver_pending(
 ///
 /// `stop` is the read end of the halt's pipe. The wait has no timeout,
 /// so that descriptor is the only thing that ends this loop on demand.
-fn viona_intr_poll_loop(
+pub(super) fn viona_intr_poll_loop(
     link: &dyn LinkOps,
     stop: std::io::PipeReader,
     slot: &Mutex<Option<VionaInterrupt>>,

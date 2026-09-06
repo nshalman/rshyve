@@ -11,7 +11,8 @@
 //! no worker for it, and a sweep that stops at the first failure is
 //! one that never reaches the delete.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use vmm_devices::Lifecycle;
 
@@ -19,11 +20,14 @@ use super::device::{addressed_queue, device_with, running_device};
 use super::{cleared, null_log, steps_of, Op, Step, Steps, TestLink};
 use crate::pci::intr::BackendIntr;
 use crate::viona::halt::halt_link;
-use crate::viona::poll::deliver_pending;
+use crate::viona::poll::{deliver_pending, viona_intr_poll_loop};
 use crate::viona::{
     RingState, VionaInterrupt, NET_NUM_QUEUES, NET_QUEUE_SIZE, VIRTIO_NET_F_MAC,
 };
 use crate::VirtioDevice;
+
+/// A wait this long means a thread is wedged, not slow.
+const WEDGED: Duration = Duration::from_secs(15);
 
 /// The ring the restore tests program.
 const RESTORED_RING: u16 = 1;
@@ -278,5 +282,35 @@ fn an_interrupt_the_kernel_would_not_clear_is_still_raised() {
         *raised.lock().expect("raised lock"),
         [0],
         "a refused clear dropped the guest's interrupt",
+    );
+}
+
+#[test]
+fn a_wait_the_kernel_refused_ends_the_poll_thread() {
+    // The wait is the only thing that parks this thread. An error it
+    // waited through would be an error it meets again at once: a tight
+    // loop on one core, and a halt that joins a thread which never
+    // leaves.
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).failing(&[Op::WaitIntr]);
+    let (slot, raised) = wired_interrupt();
+    let (stop, _wake) = std::io::pipe().expect("the test can open a pipe");
+
+    // On its own thread, so a loop that spins is a failure here and
+    // not a run that never ends.
+    let (done, left) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("poll-loop".into())
+        .spawn(move || {
+            viona_intr_poll_loop(&link, stop, &slot, null_log());
+            done.send(()).expect("the test waits for this");
+        })
+        .expect("the test can spawn a thread");
+
+    left.recv_timeout(WEDGED)
+        .expect("the poll thread left after the wait failed");
+    assert!(
+        raised.lock().expect("raised lock").is_empty(),
+        "a failed wait delivered an interrupt",
     );
 }
