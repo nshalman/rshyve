@@ -81,9 +81,9 @@ enum RingState {
 
 /// VirtIO network device backed by the illumos viona kernel driver.
 ///
-/// On non-illumos platforms, the viona ioctls are stubbed out
-/// (they return errors), so this device cannot actually function.
-/// The code compiles on all platforms to keep CI working.
+/// Only illumos can open a link, so [`VirtioViona::new`] fails
+/// elsewhere. Everything above the link is the same code on every
+/// platform.
 pub struct VirtioViona {
     inner: Mutex<VionaInner>,
 
@@ -105,19 +105,14 @@ pub struct VirtioViona {
 pub type VionaInterrupt = Arc<BackendIntr>;
 
 struct VionaInner {
-    /// Open handle to the viona kernel device.
+    /// The in-kernel link, on every platform.
+    ///
+    /// On illumos this holds the open `/dev/viona` handle. It is a
+    /// trait object there too, so a test can put its own link in the
+    /// same slot and run where the product runs.
     ///
     /// Shared, so the halt can keep the link after it drops the device
     /// lock. The calls the halt makes are untimed kernel waits.
-    #[cfg(target_os = "illumos")]
-    viona_fd: Arc<viona_api::VionaFd>,
-
-    /// The link a halt calls, on a build with no viona driver.
-    ///
-    /// On illumos the open handle above is that link. Elsewhere the
-    /// device cannot be created at all, so this exists only so the
-    /// halt has one code path on every platform.
-    #[cfg(not(target_os = "illumos"))]
     link: Arc<dyn LinkOps>,
 
     /// MAC address of the VNIC.
@@ -151,27 +146,13 @@ struct VionaInner {
 }
 
 impl VionaInner {
-    /// The link this build talks to.
-    ///
-    /// Handed out by value so a caller can drop the device lock and
-    /// still hold the link.
-    #[cfg(target_os = "illumos")]
-    fn link(&self) -> Arc<dyn LinkOps> {
-        Arc::clone(&self.viona_fd) as Arc<dyn LinkOps>
-    }
-
-    #[cfg(not(target_os = "illumos"))]
+    /// The link, by value, so a caller can drop the device lock and
+    /// still hold it.
     fn link(&self) -> Arc<dyn LinkOps> {
         Arc::clone(&self.link)
     }
 
     /// The link, borrowed for one call under the device lock.
-    #[cfg(target_os = "illumos")]
-    fn link_ref(&self) -> &dyn LinkOps {
-        self.viona_fd.as_ref()
-    }
-
-    #[cfg(not(target_os = "illumos"))]
     fn link_ref(&self) -> &dyn LinkOps {
         self.link.as_ref()
     }

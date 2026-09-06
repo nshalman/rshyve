@@ -4,10 +4,12 @@
 
 //! Opening the link and pointing the kernel at it.
 
-use super::VirtioViona;
+use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "illumos")]
-use super::{RingState, ETHERADDRL, NET_NUM_QUEUES};
+use viona_api::PromiscMode;
+
+use super::link::LinkOps;
+use super::{RingState, VionaInner, VirtioViona, ETHERADDRL, NET_NUM_QUEUES};
 
 impl VirtioViona {
     /// Create a new viona-backed virtio-net device.
@@ -19,50 +21,26 @@ impl VirtioViona {
     ///
     /// # Errors
     ///
-    /// Returns an error if the VNIC link ID cannot be resolved, or if
-    /// the viona device cannot be opened/associated.
-    #[cfg(target_os = "illumos")]
+    /// Returns an error if the platform has no viona driver, if the
+    /// VNIC link ID cannot be resolved, or if the viona device cannot
+    /// be opened and associated with the VM.
     pub fn new(
         vnic_name: &str,
         vm_fd: std::os::fd::RawFd,
     ) -> std::io::Result<Self> {
-        use std::sync::{Arc, Mutex};
+        let (link, mac_addr, dev_features) = open_link(vnic_name, vm_fd)?;
+        Ok(Self::with_link(link, mac_addr, dev_features))
+    }
 
-        let (link_id, mac_addr) = lookup_vnic(vnic_name)?;
-
-        let viona_fd =
-            viona_api::VionaFd::new(link_id, vm_fd).map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "failed to create viona instance for '{}' \
-                         (link_id={}): {}",
-                        vnic_name, link_id, e
-                    ),
-                )
-            })?;
-
-        // Query features supported by the kernel driver.
-        let dev_features = {
-            let mut feat: u64 = 0;
-            // Safety: the command copies out one u64, and that is what
-            // `feat` is.
-            unsafe {
-                viona_fd.ioctl(viona_api::VNA_IOC_GET_FEATURES, &mut feat)
-            }
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!("VNA_IOC_GET_FEATURES failed: {}", e),
-                )
-            })?;
-            // For legacy transport we only use the low 32 bits.
-            feat as u32
-        };
-
-        Ok(Self {
-            inner: Mutex::new(super::VionaInner {
-                viona_fd: Arc::new(viona_fd),
+    /// A device around one link, before the guest has programmed it.
+    pub(super) fn with_link(
+        link: Arc<dyn LinkOps>,
+        mac_addr: [u8; ETHERADDRL],
+        dev_features: u32,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(VionaInner {
+                link,
                 mac_addr,
                 dev_features,
                 negotiated_features: 0,
@@ -73,46 +51,23 @@ impl VirtioViona {
                 halted: false,
             }),
             interrupt: Arc::new(Mutex::new(None)),
-        })
-    }
-
-    /// Stub constructor for non-illumos platforms.
-    #[cfg(not(target_os = "illumos"))]
-    pub fn new(
-        _vnic_name: &str,
-        _vm_fd: std::os::fd::RawFd,
-    ) -> std::io::Result<Self> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "viona is only available on illumos",
-        ))
+        }
     }
 
     /// Program the notification I/O port and MMIO address in the kernel.
     ///
     /// The kernel then takes the guest's ring kick itself, and the vCPU
     /// does not leave to userspace for it.
-    #[cfg(target_os = "illumos")]
     pub fn set_notify_addrs(&self, pio_port: u16, mmio_addr: u64) {
         let inner = self.inner.lock().expect("viona lock");
         if pio_port != 0 {
-            if let Err(e) = inner.viona_fd.set_notify_iop(pio_port) {
+            if let Err(e) = inner.link_ref().set_notify_iop(pio_port) {
                 slog::warn!(inner.log(), "viona set notify port failed";
                     "port" => pio_port, "error" => %e);
             }
         }
         if mmio_addr != 0 {
-            let mut vim = viona_api::vioc_notify_mmio {
-                vim_address: mmio_addr,
-                vim_size: 0x1000,
-            };
-            // Safety: the command copies in one vioc_notify_mmio, and
-            // that is what `vim` is.
-            let rc = unsafe {
-                inner
-                    .viona_fd
-                    .ioctl(viona_api::VNA_IOC_SET_NOTIFY_MMIO, &mut vim)
-            };
+            let rc = inner.link_ref().set_notify_mmio(mmio_addr, 0x1000);
             if let Err(e) = rc {
                 slog::warn!(inner.log(), "viona set notify mmio failed";
                     "addr" => mmio_addr, "error" => %e);
@@ -120,36 +75,66 @@ impl VirtioViona {
         }
     }
 
-    #[cfg(not(target_os = "illumos"))]
-    pub fn set_notify_addrs(&self, _: u16, _: u64) {}
-
     /// Enable promiscuous mode on the viona device.
     ///
     /// When `promiscphys` is true, the VNIC receives all physical
     /// traffic (MAC spoofing). This is required for VMs with
     /// `allow_mac_spoofing=true` in the zone config.
-    #[cfg(target_os = "illumos")]
     pub fn set_promisc(&self, enable: bool) -> std::io::Result<()> {
-        let inner = self.inner.lock().expect("viona lock");
-        let mut mode: i32 = if enable {
-            viona_api::VIONA_PROMISC_ALL
+        let mode = if enable {
+            PromiscMode::All
         } else {
-            viona_api::VIONA_PROMISC_NONE
+            PromiscMode::None
         };
-        // Safety: the command copies in one int, and that is what
-        // `mode` is.
-        unsafe {
-            inner
-                .viona_fd
-                .ioctl(viona_api::VNA_IOC_SET_PROMISC, &mut mode)
-        }?;
-        Ok(())
+        self.inner
+            .lock()
+            .expect("viona lock")
+            .link_ref()
+            .set_promisc(mode)
     }
+}
 
-    #[cfg(not(target_os = "illumos"))]
-    pub fn set_promisc(&self, _enable: bool) -> std::io::Result<()> {
-        Ok(())
-    }
+/// Open the kernel link for `vnic_name` and read what it offers.
+///
+/// The features come back with the link because this is the one call
+/// the device makes on a handle it does not hold yet.
+#[cfg(target_os = "illumos")]
+fn open_link(
+    vnic_name: &str,
+    vm_fd: std::os::fd::RawFd,
+) -> std::io::Result<(Arc<dyn LinkOps>, [u8; ETHERADDRL], u32)> {
+    let (link_id, mac_addr) = lookup_vnic(vnic_name)?;
+
+    let viona_fd = viona_api::VionaFd::new(link_id, vm_fd).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "failed to create viona instance for '{}' (link_id={}): {}",
+                vnic_name, link_id, e
+            ),
+        )
+    })?;
+
+    let dev_features = viona_fd.get_features().map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("VNA_IOC_GET_FEATURES failed: {}", e),
+        )
+    })?;
+
+    // The legacy transport carries only the low 32 bits.
+    Ok((Arc::new(viona_fd), mac_addr, dev_features as u32))
+}
+
+#[cfg(not(target_os = "illumos"))]
+fn open_link(
+    _vnic_name: &str,
+    _vm_fd: std::os::fd::RawFd,
+) -> std::io::Result<(Arc<dyn LinkOps>, [u8; ETHERADDRL], u32)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "viona is only available on illumos",
+    ))
 }
 
 /// Look up a VNIC by name using libdladm, returning its link ID and

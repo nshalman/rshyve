@@ -33,10 +33,10 @@ use vmm_devices::pci::msix::{MsiSink, MsixTable};
 use vmm_devices::pci::{BarN, INTxPinID, IntrPin};
 
 use super::device::device_with;
-use super::null_log;
+use super::{cleared, null_log, Park, ParkAt, Steps, TestLink};
 use crate::bits;
 use crate::pci::VirtioPciDevice;
-use crate::viona::link::{IntrStatus, LinkOps};
+use crate::viona::link::LinkOps;
 use crate::viona::poll::deliver_pending;
 use crate::viona::{
     VionaInterrupt, VirtioViona, NET_CONFIG_SIZE, NET_NUM_QUEUES,
@@ -59,103 +59,6 @@ const PENDING_RING: usize = 0;
 /// Where the message that vector carries goes.
 const MSG_ADDR: u64 = 0xFEE0_0000;
 const MSG_DATA: u64 = 0x21;
-
-/// Where the poll thread is held while the guest resets the device.
-///
-/// Two points, because they pin different mistakes. `Poll` catches a
-/// session read after the kernel is asked what is pending; `Clear`
-/// catches a session read at the raise. Only a sample taken before
-/// both survives.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ParkAt {
-    /// Inside `VNA_IOC_INTR_POLL`, before the pending rings are known.
-    Poll,
-    /// After the ring's pending interrupt is cleared, which is the
-    /// step that makes the notification this thread's to deliver.
-    Clear,
-}
-
-/// A one-shot park the test drives from the other side.
-struct Park {
-    at: ParkAt,
-    arrived: mpsc::Sender<()>,
-    go: mpsc::Receiver<()>,
-}
-
-/// A link that reports one pending ring and holds the poll thread at
-/// a named step.
-struct PollLink {
-    status: IntrStatus,
-    park: Mutex<Option<Park>>,
-    cleared: Mutex<Vec<u16>>,
-}
-
-impl PollLink {
-    /// Hold the caller here, if this is the step the test named.
-    ///
-    /// One shot: the park is taken, so the same link delivers
-    /// normally afterwards.
-    fn maybe_park(&self, at: ParkAt) {
-        let park = {
-            let mut slot = self.park.lock().expect("park lock");
-            match slot.as_ref() {
-                Some(park) if park.at == at => slot.take(),
-                _ => None,
-            }
-        };
-        let Some(park) = park else {
-            return;
-        };
-        park.arrived.send(()).expect("the test watches this park");
-        park.go
-            .recv_timeout(WEDGED)
-            .expect("the test never released this park");
-    }
-
-    fn cleared(&self) -> Vec<u16> {
-        self.cleared.lock().expect("cleared lock").clone()
-    }
-}
-
-impl LinkOps for PollLink {
-    fn ring_init(
-        &self,
-        _ring: u16,
-        _size: u16,
-        _desc: u64,
-        _avail: u64,
-        _used: u64,
-    ) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn ring_kick(&self, _ring: u16) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn ring_reset(&self, _ring: u16) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn set_features(&self, _features: u64) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn intr_status(&self) -> std::io::Result<IntrStatus> {
-        self.maybe_park(ParkAt::Poll);
-        Ok(self.status)
-    }
-
-    fn ring_intr_clr(&self, ring: u16) -> std::io::Result<()> {
-        self.cleared.lock().expect("cleared lock").push(ring);
-        self.maybe_park(ParkAt::Clear);
-        Ok(())
-    }
-
-    fn delete(&self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 
 /// An interrupt pin that counts what the transport put on the line.
 struct TestPin {
@@ -226,7 +129,9 @@ type Dev = Arc<VirtioPciDevice<VirtioViona>>;
 /// guest's interrupts reach.
 struct Fixture {
     dev: Dev,
-    link: Arc<PollLink>,
+    link: Arc<TestLink>,
+    /// What the device asked of the kernel, the clears included.
+    steps: Steps,
     intr: Arc<Mutex<Option<VionaInterrupt>>>,
     pin: Arc<TestPin>,
     /// Set when the driver in this fixture uses MSI-X.
@@ -243,17 +148,14 @@ impl Fixture {
     fn new(park_at: ParkAt, msix: bool) -> Self {
         let (arrived_tx, arrived_rx) = mpsc::channel();
         let (go_tx, go_rx) = mpsc::channel();
-        let mut status = IntrStatus::default();
-        status[PENDING_RING] = 1;
-        let link = Arc::new(PollLink {
-            status,
-            park: Mutex::new(Some(Park {
+        let steps = Steps::default();
+        let link = Arc::new(
+            TestLink::new(&steps).pending(PENDING_RING).parking(Park {
                 at: park_at,
                 arrived: arrived_tx,
                 go: go_rx,
-            })),
-            cleared: Mutex::new(Vec::new()),
-        });
+            }),
+        );
 
         let sink = msix.then(TestSink::new);
         let table = sink.as_ref().map(|sink| {
@@ -288,6 +190,7 @@ impl Fixture {
         Self {
             dev,
             link,
+            steps,
             intr,
             pin,
             sink,
@@ -409,7 +312,7 @@ fn a_reset_refuses_the_notification_it_overtook(park_at: ParkAt, msix: bool) {
         "the running session's own notification was dropped",
     );
     assert_eq!(
-        fix.link.cleared(),
+        cleared(&fix.steps),
         [PENDING_RING as u16, PENDING_RING as u16],
         "the kernel's pending interrupt was not cleared each wakeup",
     );
@@ -557,7 +460,7 @@ fn a_reset_completes_while_the_poll_thread_is_held(
     // A refused notification still has to leave the kernel's pending
     // bit clear, or viona re-signals it and this thread spins.
     assert_eq!(
-        fix.link.cleared(),
+        cleared(&fix.steps),
         [PENDING_RING as u16, PENDING_RING as u16],
         "the kernel's pending interrupt was not cleared each wakeup",
     );

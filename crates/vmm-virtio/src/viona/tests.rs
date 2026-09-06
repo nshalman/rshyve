@@ -4,36 +4,28 @@
 
 //! What these tests reach, and what they do not.
 //!
-//! The halt, the guards and the ring bookkeeping are the same code on
-//! every platform, and they all reach the kernel through
-//! [`LinkOps`](super::link::LinkOps). A recording link stands in for
-//! the driver, so a test reads the command and the ring the device
-//! asked for. What the illumos build then puts on the wire is pinned
-//! one layer down, in `viona_api`.
+//! Every call the device makes into the kernel goes through
+//! [`LinkOps`](super::link::LinkOps), on every platform. A recording
+//! link stands in for the driver, so a test reads the command and the
+//! ring the device asked for, and the same test runs on illumos, where
+//! the product runs. What the illumos build then puts on the wire is
+//! pinned one layer down, in `viona_api`.
 //!
-//! The calls a migration or a boot makes ([`super::migrate`],
-//! [`super::setup`]) go straight to the kernel handle and have nothing
-//! to stand in for them off illumos. No test here covers those. Do not
-//! add one that calls their empty stub: it reads as coverage and pins
-//! nothing.
+//! Nothing here reaches the ioctl itself. That needs an open
+//! `/dev/viona`, which is a lab test.
 
+use std::io::{PipeReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
+use viona_api::{vioc_ring_state, PromiscMode};
+
 use super::halt::{halt_link, stop_poller, Poller};
-use super::link::{IntrStatus, LinkOps};
+use super::link::{IntrStatus, IntrWait, LinkOps};
 use super::VirtioViona;
 
-/// The device tests need a `VionaInner` with no kernel handle, and the
-/// illumos build has no such shape. What they pin is the shared halt
-/// and guard logic, which is the same code on both platforms.
-#[cfg(not(target_os = "illumos"))]
 mod device;
-
-/// The poll thread's delivery against the reset that ends the driver
-/// session. Needs the same handle-free shape as [`device`].
-#[cfg(not(target_os = "illumos"))]
 mod intr;
 
 /// One call the device made into the kernel.
@@ -48,50 +40,120 @@ enum Step {
     },
     RingKick(u16),
     RingReset(u16),
+    RingPause(u16),
+    RingSetState(vioc_ring_state),
+    RingSetMsi {
+        ring: u16,
+        addr: u64,
+        msg: u64,
+    },
+    RingIntrClr(u16),
     SetFeatures(u64),
+    SetNotifyIop(u16),
+    SetNotifyMmio {
+        addr: u64,
+        size: u32,
+    },
+    SetPromisc(PromiscMode),
     Delete,
     /// The poll thread left.
-    ///
-    /// Only a device test starts a poller, and that needs the shape
-    /// the illumos build does not have.
-    #[cfg(not(target_os = "illumos"))]
     PollerStopped,
 }
 
-/// What one halt asked of the kernel, in order.
+/// What the device asked of the kernel, in order.
 type Steps = Arc<Mutex<Vec<Step>>>;
+
+/// Where the poll thread is held while a test acts.
+///
+/// Two points, because they pin different mistakes. `Poll` catches a
+/// session read after the kernel is asked what is pending; `Clear`
+/// catches a session read at the raise. Only a sample taken before
+/// both survives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParkAt {
+    /// Inside `VNA_IOC_INTR_POLL`, before the pending rings are known.
+    Poll,
+    /// After the ring's pending interrupt is cleared, which is the
+    /// step that makes the notification this thread's to deliver.
+    Clear,
+}
+
+/// A one-shot park the test drives from the other side.
+struct Park {
+    at: ParkAt,
+    arrived: mpsc::Sender<()>,
+    go: mpsc::Receiver<()>,
+}
+
+/// A delete that waits until the test lets it go.
+///
+/// On illumos the delete is an untimed kernel wait. This stands in for
+/// it, so a test can act while the halt is inside one.
+struct Hold {
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+/// A wait this long means a thread is wedged, not slow.
+const WEDGED: Duration = Duration::from_secs(15);
 
 /// A link that records the calls the device makes.
 ///
-/// This is the whole in-kernel side of the shared logic, so the order
-/// and the error handling are testable on every platform, illumos
-/// included.
-struct RecordingLink {
+/// This is the whole in-kernel side of the device, so the order and
+/// the error handling are testable on every platform, illumos
+/// included. Each test switches on only what it reads.
+struct TestLink {
     steps: Steps,
+    /// What `delete` answers.
     delete_result: fn() -> std::io::Result<()>,
+    /// Holds `delete` until the test releases it.
+    delete_hold: Mutex<Option<Hold>>,
     /// The device to check for a held lock, once it exists.
     device: OnceLock<Weak<VirtioViona>>,
     /// The calls that ran with the device lock held.
     locked: Mutex<Vec<Step>>,
+    /// What `intr_status` reports pending, one entry per ring.
+    status: IntrStatus,
+    /// Where the poll thread is held, once.
+    park: Mutex<Option<Park>>,
 }
 
-impl RecordingLink {
+impl TestLink {
     fn new(steps: &Steps) -> Self {
         Self {
             steps: Arc::clone(steps),
             delete_result: || Ok(()),
+            delete_hold: Mutex::new(None),
             device: OnceLock::new(),
             locked: Mutex::new(Vec::new()),
+            status: IntrStatus::default(),
+            park: Mutex::new(None),
         }
     }
 
-    fn failing(steps: &Steps) -> Self {
-        Self {
-            delete_result: || {
-                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
-            },
-            ..Self::new(steps)
-        }
+    /// A link whose delete reports a failure.
+    fn failing(mut self) -> Self {
+        self.delete_result =
+            || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        self
+    }
+
+    /// A link whose delete waits for `hold`.
+    fn holding(self, hold: Hold) -> Self {
+        *self.delete_hold.lock().expect("hold lock") = Some(hold);
+        self
+    }
+
+    /// A link that reports `ring` pending on every poll.
+    fn pending(mut self, ring: usize) -> Self {
+        self.status[ring] = 1;
+        self
+    }
+
+    /// A link that holds the poll thread once, at `park.at`.
+    fn parking(self, park: Park) -> Self {
+        *self.park.lock().expect("park lock") = Some(park);
+        self
     }
 
     fn push(&self, step: Step) {
@@ -104,9 +166,30 @@ impl RecordingLink {
         }
         self.steps.lock().expect("steps lock").push(step);
     }
+
+    /// Hold the caller here, if this is the step the test named.
+    ///
+    /// One shot: the park is taken, so the same link delivers
+    /// normally afterwards.
+    fn maybe_park(&self, at: ParkAt) {
+        let park = {
+            let mut slot = self.park.lock().expect("park lock");
+            match slot.as_ref() {
+                Some(park) if park.at == at => slot.take(),
+                _ => None,
+            }
+        };
+        let Some(park) = park else {
+            return;
+        };
+        park.arrived.send(()).expect("the test watches this park");
+        park.go
+            .recv_timeout(WEDGED)
+            .expect("the test never released this park");
+    }
 }
 
-impl LinkOps for RecordingLink {
+impl LinkOps for TestLink {
     fn ring_init(
         &self,
         ring: u16,
@@ -135,27 +218,107 @@ impl LinkOps for RecordingLink {
         Ok(())
     }
 
+    fn ring_pause(&self, ring: u16) -> std::io::Result<()> {
+        self.push(Step::RingPause(ring));
+        Ok(())
+    }
+
+    fn ring_set_state(&self, state: &vioc_ring_state) -> std::io::Result<()> {
+        self.push(Step::RingSetState(*state));
+        Ok(())
+    }
+
+    fn ring_get_state(&self, ring: u16) -> std::io::Result<vioc_ring_state> {
+        // The indices a migration source reads out. Distinct, and
+        // neither is the ring, so a caller that returns the wrong
+        // field or swaps the pair is visible.
+        Ok(vioc_ring_state {
+            vrs_index: ring,
+            vrs_avail_idx: 0x1111 + ring,
+            vrs_used_idx: 0x2222 + ring,
+            ..Default::default()
+        })
+    }
+
+    fn ring_set_msi(
+        &self,
+        ring: u16,
+        addr: u64,
+        msg: u64,
+    ) -> std::io::Result<()> {
+        self.push(Step::RingSetMsi { ring, addr, msg });
+        Ok(())
+    }
+
     fn set_features(&self, features: u64) -> std::io::Result<()> {
         self.push(Step::SetFeatures(features));
         Ok(())
     }
 
     fn intr_status(&self) -> std::io::Result<IntrStatus> {
-        Ok(IntrStatus::default())
+        self.maybe_park(ParkAt::Poll);
+        Ok(self.status)
     }
 
-    fn ring_intr_clr(&self, _ring: u16) -> std::io::Result<()> {
+    fn ring_intr_clr(&self, ring: u16) -> std::io::Result<()> {
+        self.push(Step::RingIntrClr(ring));
+        self.maybe_park(ParkAt::Clear);
+        Ok(())
+    }
+
+    fn wait_intr(&self, stop: &PipeReader, _log: &slog::Logger) -> IntrWait {
+        // The halt closes the write end, so this read ends with 0
+        // bytes. No test link signals its own work.
+        let mut byte = [0u8; 1];
+        let mut stop = stop;
+        match stop.read(&mut byte) {
+            Ok(0) => IntrWait::Stopped,
+            other => panic!("the stop pipe answered {other:?}"),
+        }
+    }
+
+    fn set_notify_iop(&self, port: u16) -> std::io::Result<()> {
+        self.push(Step::SetNotifyIop(port));
+        Ok(())
+    }
+
+    fn set_notify_mmio(&self, addr: u64, size: u32) -> std::io::Result<()> {
+        self.push(Step::SetNotifyMmio { addr, size });
+        Ok(())
+    }
+
+    fn set_promisc(&self, mode: PromiscMode) -> std::io::Result<()> {
+        self.push(Step::SetPromisc(mode));
         Ok(())
     }
 
     fn delete(&self) -> std::io::Result<()> {
         self.push(Step::Delete);
+        if let Some(hold) = self.delete_hold.lock().expect("hold lock").take() {
+            hold.entered
+                .send(())
+                .expect("the test waits for the delete");
+            hold.release
+                .recv_timeout(WEDGED)
+                .expect("the test released the delete");
+        }
         (self.delete_result)()
     }
 }
 
 fn steps_of(steps: &Steps) -> Vec<Step> {
     steps.lock().expect("steps lock").clone()
+}
+
+/// The rings whose pending interrupt the device cleared, in order.
+fn cleared(steps: &Steps) -> Vec<u16> {
+    steps_of(steps)
+        .iter()
+        .filter_map(|step| match step {
+            Step::RingIntrClr(ring) => Some(*ring),
+            _ => None,
+        })
+        .collect()
 }
 
 fn null_log() -> slog::Logger {
@@ -167,7 +330,7 @@ fn a_halt_resets_every_ring_before_it_deletes_the_link() {
     // A ring that is reset already leaves the delete's own wait at
     // once, and that wait ignores signals.
     let steps = Steps::default();
-    let link = RecordingLink::new(&steps);
+    let link = TestLink::new(&steps);
 
     halt_link(&link, &null_log());
 
@@ -182,7 +345,7 @@ fn a_failed_delete_does_not_stop_the_halt() {
     // Teardown has to reach VM_DESTROY_SELF whatever the link
     // does, so the failure is reported and nothing is unwound.
     let steps = Steps::default();
-    let link = RecordingLink::failing(&steps);
+    let link = TestLink::new(&steps).failing();
 
     halt_link(&link, &null_log());
 

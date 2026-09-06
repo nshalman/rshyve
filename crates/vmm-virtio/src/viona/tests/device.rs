@@ -2,25 +2,25 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The device around the link: the halt, and the guards that keep a
-//! destroyed link out of the kernel.
+//! The device around the link: the halt, the guards that keep a
+//! destroyed link out of the kernel, and what a migration asks of it.
 //!
-//! A device here holds a recording link in place of the kernel handle,
-//! which the illumos build does not have room for. Every guard below
-//! is the same code on both platforms.
+//! A device here holds a recording link in place of the kernel handle.
+//! That is the same slot the illumos build fills, so every test below
+//! runs on the target too.
 
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use vmm_core::mem::PhysMap;
 use vmm_devices::Lifecycle;
 
-use super::{null_log, steps_of, RecordingLink, Step, Steps};
+use super::{null_log, steps_of, Hold, Step, Steps, TestLink};
 use crate::queue::VirtQueue;
 use crate::viona::halt::Poller;
-use crate::viona::link::{IntrStatus, LinkOps};
+use crate::viona::link::LinkOps;
 use crate::viona::{
-    RingState, VionaInner, VirtioViona, NET_NUM_QUEUES, NET_QUEUE_SIZE,
+    RingState, VirtioViona, ETHERADDRL, NET_NUM_QUEUES, NET_QUEUE_SIZE,
     VIRTIO_NET_F_MAC,
 };
 use crate::VirtioDevice;
@@ -31,13 +31,10 @@ use crate::VirtioDevice;
 /// enough that a loaded machine does not reach it.
 const STUCK: Duration = Duration::from_secs(15);
 
-/// How long a blocked delete waits to be released.
-///
-/// Longer than [`STUCK`], so a test that fails reports the thread
-/// that is really stuck.
-const DELETE_STUCK: Duration = Duration::from_secs(60);
+/// The MAC the test VNIC answers for.
+const TEST_MAC: [u8; ETHERADDRL] = [0x02, 0x08, 0x20, 0xaa, 0xbb, 0xcc];
 
-impl RecordingLink {
+impl TestLink {
     /// Watch `device` for a lock held across the calls it makes.
     fn watch(&self, device: &Arc<VirtioViona>) {
         self.device
@@ -50,84 +47,12 @@ impl RecordingLink {
     }
 }
 
-/// A link whose delete waits until the test releases it.
-///
-/// On illumos the delete is an untimed kernel wait. This stands in
-/// for it, so a test can act while the halt is inside one.
-struct BlockingLink {
-    entered: Mutex<mpsc::Sender<()>>,
-    release: Mutex<mpsc::Receiver<()>>,
-}
-
-impl LinkOps for BlockingLink {
-    fn ring_init(
-        &self,
-        _ring: u16,
-        _size: u16,
-        _desc: u64,
-        _avail: u64,
-        _used: u64,
-    ) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn ring_kick(&self, _ring: u16) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn ring_reset(&self, _ring: u16) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn set_features(&self, _features: u64) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn intr_status(&self) -> std::io::Result<IntrStatus> {
-        Ok(IntrStatus::default())
-    }
-
-    fn ring_intr_clr(&self, _ring: u16) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn delete(&self) -> std::io::Result<()> {
-        self.entered
-            .lock()
-            .expect("entered lock")
-            .send(())
-            .expect("the test waits for the delete");
-        self.release
-            .lock()
-            .expect("release lock")
-            .recv_timeout(DELETE_STUCK)
-            .expect("the test released the delete");
-        Ok(())
-    }
-}
-
-/// Build a `VionaInner` with a test link in place of the kernel
-/// handle.
-fn test_inner_with(link: Arc<dyn LinkOps>) -> VionaInner {
-    VionaInner {
-        link,
-        mac_addr: [0x02, 0x08, 0x20, 0xaa, 0xbb, 0xcc],
-        dev_features: VIRTIO_NET_F_MAC,
-        negotiated_features: 0,
-        ring_state: [RingState::Init; NET_NUM_QUEUES],
-        deferred_poll: None,
-        poller: None,
-        log: None,
-        halted: false,
-    }
-}
-
 /// A device whose calls into the kernel are watched through its link.
+///
+/// The same constructor the illumos build uses once it has opened a
+/// link, so nothing here builds a device shape the product does not.
 pub(super) fn device_with(link: Arc<dyn LinkOps>) -> VirtioViona {
-    VirtioViona {
-        inner: Mutex::new(test_inner_with(link)),
-        interrupt: Arc::new(Mutex::new(None)),
-    }
+    VirtioViona::with_link(link, TEST_MAC, VIRTIO_NET_F_MAC)
 }
 
 /// A device the guest has finished programming.
@@ -192,7 +117,7 @@ fn a_halt_issues_the_delete_that_frees_the_vmm_hold() {
     // VM_DESTROY_SELF waits for every vmm_drv hold in an untimed
     // cv_wait. VNA_IOC_DELETE is what gives viona's hold back.
     let steps = Steps::default();
-    let device = device_with(Arc::new(RecordingLink::new(&steps)));
+    let device = device_with(Arc::new(TestLink::new(&steps)));
 
     device.halt();
 
@@ -209,7 +134,7 @@ fn a_halt_stops_the_poll_thread_before_it_deletes_the_link() {
     // it a link that is gone. This is Propolis's order, and it
     // needs the whole halt to hold it, not `stop_poller` alone.
     let steps = Steps::default();
-    let device = device_with(Arc::new(RecordingLink::new(&steps)));
+    let device = device_with(Arc::new(TestLink::new(&steps)));
     device.inner.lock().expect("viona lock").poller =
         Some(recording_poller(&steps));
 
@@ -235,7 +160,7 @@ fn a_halt_holds_no_device_lock_while_it_stops_the_link() {
     // vCPU must not wait behind the teardown. This fails the moment
     // somebody holds the guard across halt_link again.
     let steps = Steps::default();
-    let link = Arc::new(RecordingLink::new(&steps));
+    let link = Arc::new(TestLink::new(&steps));
     let device = Arc::new(device_with(link.clone()));
     link.watch(&device);
 
@@ -256,12 +181,14 @@ fn a_halt_holds_no_device_lock_while_it_stops_the_link() {
 fn a_config_read_does_not_wait_behind_the_link_delete() {
     // The same property from the guest's side: a vCPU reads the
     // device config while the halt sits in the delete.
+    let steps = Steps::default();
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    let device = Arc::new(device_with(Arc::new(BlockingLink {
-        entered: Mutex::new(entered_tx),
-        release: Mutex::new(release_rx),
-    })));
+    let device =
+        Arc::new(device_with(Arc::new(TestLink::new(&steps).holding(Hold {
+            entered: entered_tx,
+            release: release_rx,
+        }))));
 
     let halting = {
         let device = Arc::clone(&device);
@@ -305,7 +232,7 @@ fn a_running_device_kicks_the_ring_the_guest_named() {
     // The kick carries the ring. One that always sends ring 0 leaves
     // the guest's transmits in the ring and stalls the link.
     let steps = Steps::default();
-    let device = running_device(Arc::new(RecordingLink::new(&steps)));
+    let device = running_device(Arc::new(TestLink::new(&steps)));
 
     notify(&device, 1);
 
@@ -318,7 +245,7 @@ fn a_halt_leaves_no_ring_a_kick_can_reach() {
     // so a vCPU can reach notify_queue while the delete runs. It
     // must find no ring ready to kick.
     let steps = Steps::default();
-    let device = running_device(Arc::new(RecordingLink::new(&steps)));
+    let device = running_device(Arc::new(TestLink::new(&steps)));
 
     device.halt();
     steps.lock().expect("steps lock").clear();
@@ -341,7 +268,7 @@ fn a_queue_address_write_programs_that_ring() {
     // reads. A ring or an address that drifts here points the
     // in-kernel worker at guest memory the driver never offered.
     let steps = Steps::default();
-    let device = device_with(Arc::new(RecordingLink::new(&steps)));
+    let device = device_with(Arc::new(TestLink::new(&steps)));
 
     VirtioDevice::queue_addr_set(&device, 1, &addressed_queue());
 
@@ -368,7 +295,7 @@ fn a_halted_device_programs_no_ring() {
     // through would start a kernel worker on a link that is gone,
     // and mark the ring ready for the next kick.
     let steps = Steps::default();
-    let device = device_with(Arc::new(RecordingLink::new(&steps)));
+    let device = device_with(Arc::new(TestLink::new(&steps)));
     device.halt();
     steps.lock().expect("steps lock").clear();
 
@@ -390,7 +317,7 @@ fn a_running_device_takes_a_feature_write() {
     // The kernel needs the features the guest accepted: VERSION_1
     // is what puts viona's rings in the modern layout.
     let steps = Steps::default();
-    let device = device_with(Arc::new(RecordingLink::new(&steps)));
+    let device = device_with(Arc::new(TestLink::new(&steps)));
 
     VirtioDevice::set_features(&device, u64::from(VIRTIO_NET_F_MAC));
 
@@ -408,7 +335,7 @@ fn a_halted_device_takes_no_feature_write() {
     // still holding the guard, and the next vCPU would block on the
     // guard: the hot-unplug stall by another route.
     let steps = Steps::default();
-    let device = device_with(Arc::new(RecordingLink::new(&steps)));
+    let device = device_with(Arc::new(TestLink::new(&steps)));
     device.halt();
     steps.lock().expect("steps lock").clear();
 
@@ -431,7 +358,7 @@ fn a_second_halt_does_not_delete_again() {
     // The delete waits for each ring worker to stop. Repeating it
     // would repeat that wait for nothing.
     let steps = Steps::default();
-    let device = device_with(Arc::new(RecordingLink::new(&steps)));
+    let device = device_with(Arc::new(TestLink::new(&steps)));
 
     device.halt();
     device.halt();
@@ -450,7 +377,7 @@ fn a_failed_delete_still_leaves_the_device_halted() {
     // Teardown carries on to the destroy, so a failure must not
     // leave the device asking to be halted again.
     let steps = Steps::default();
-    let device = device_with(Arc::new(RecordingLink::failing(&steps)));
+    let device = device_with(Arc::new(TestLink::new(&steps).failing()));
 
     device.halt();
     device.halt();
@@ -469,7 +396,7 @@ fn a_halt_drops_a_deferred_poll() {
     // A migration restore can land after the halt. Starting the
     // deferred poll thread then would read a destroyed link.
     let steps = Steps::default();
-    let device = device_with(Arc::new(RecordingLink::new(&steps)));
+    let device = device_with(Arc::new(TestLink::new(&steps)));
     device.defer_intr_poll(null_log());
 
     device.halt();
@@ -487,7 +414,7 @@ fn a_halted_device_refuses_a_deferred_poll() {
     // A restore that stores its callback after the halt must leave
     // nothing for start_poll_deferred to find.
     let steps = Steps::default();
-    let device = device_with(Arc::new(RecordingLink::new(&steps)));
+    let device = device_with(Arc::new(TestLink::new(&steps)));
     device.halt();
 
     device.defer_intr_poll(null_log());
@@ -509,7 +436,7 @@ fn a_reset_returns_every_ring_to_the_kernel() {
     // ring until the driver programs it again, and the kernel worker
     // has to stop before the guest reuses that memory.
     let steps = Steps::default();
-    let device = running_device(Arc::new(RecordingLink::new(&steps)));
+    let device = running_device(Arc::new(TestLink::new(&steps)));
 
     VirtioDevice::reset(&device);
 
@@ -525,7 +452,7 @@ fn a_halted_device_resets_no_ring() {
     // lock while it sits in an untimed kernel call, so a vCPU can
     // reach this. The halt reset the rings already.
     let steps = Steps::default();
-    let device = running_device(Arc::new(RecordingLink::new(&steps)));
+    let device = running_device(Arc::new(TestLink::new(&steps)));
     device.halt();
     steps.lock().expect("steps lock").clear();
 
@@ -538,7 +465,233 @@ fn a_halted_device_resets_no_ring() {
     );
 }
 
-// No test calls `start_poll_deferred` here. Off illumos its body only
-// clears the field the halt cleared already, so a test of it would
-// exercise a stub and pin nothing. The guard it holds on illumos is
-// the same one `defer_intr_poll` holds, which the two tests above pin.
+#[test]
+fn a_deferred_start_kicks_the_rings_a_restore_programmed() {
+    // Programming the ring state sets the indices but does not always
+    // wake the kernel worker. Without this second kick a migrated
+    // guest gets no traffic until it kicks a ring itself, which on an
+    // idle rx ring never happens.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+    device.defer_intr_poll(null_log());
+
+    device.start_poll_deferred();
+    // The halt joins the poll thread this started, so the test never
+    // leaves one behind.
+    device.halt();
+
+    assert_eq!(
+        steps_of(&steps)
+            .iter()
+            .take_while(|step| **step != Step::RingReset(0))
+            .copied()
+            .collect::<Vec<_>>(),
+        [Step::RingKick(0), Step::RingKick(1)],
+        "a deferred start left the restored rings unkicked",
+    );
+}
+
+#[test]
+fn a_deferred_start_kicks_no_ring_the_guest_has_not_programmed() {
+    // A kick to a ring the kernel has no worker for is refused, and on
+    // an older viona it dereferences a NULL in the mac layer.
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps)));
+    device.defer_intr_poll(null_log());
+
+    device.start_poll_deferred();
+    device.halt();
+
+    assert_eq!(
+        steps_of(&steps),
+        [Step::RingReset(0), Step::RingReset(1), Step::Delete],
+        "a deferred start kicked a ring that was never programmed",
+    );
+}
+
+#[test]
+fn a_halted_device_starts_no_deferred_poll() {
+    // Two guards stand between a migration restore and a destroyed
+    // link: the halt drops the deferred start, and this refuses one
+    // that is left behind. The one below is planted by hand, because
+    // the first guard closed every other route to it.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+    device.halt();
+    steps.lock().expect("steps lock").clear();
+    device.inner.lock().expect("viona lock").deferred_poll = Some(null_log());
+
+    device.start_poll_deferred();
+
+    let inner = device.inner.lock().expect("viona lock");
+    assert!(inner.poller.is_none(), "a halted device started a poller");
+    assert!(
+        inner.deferred_poll.is_none(),
+        "the refusal left the deferred start in place",
+    );
+    assert_eq!(
+        steps_of(&steps),
+        [],
+        "a halted device kicked a ring after the delete",
+    );
+}
+
+#[test]
+fn a_migration_source_reads_the_indices_the_kernel_reports() {
+    // These two go into the payload the destination resumes from. A
+    // pair that swaps replays descriptors the guest already reclaimed,
+    // and the guest driver reports "id N is not a head!".
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps)));
+
+    assert_eq!(
+        VirtioDevice::get_kernel_ring_indices(&device, 1),
+        (0x1112, 0x2223),
+    );
+}
+
+#[test]
+fn a_restore_programs_the_ring_and_its_interrupt() {
+    // The addresses and the indices go in together, because ring_init
+    // would put the indices back to 0. The features come first, since
+    // VERSION_1 is what puts the kernel rings in the modern layout the
+    // addresses are read in. The kick that follows is what makes the
+    // kernel worker look at what the source left available.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+
+    VirtioDevice::restore_ring_state(
+        &device,
+        1,
+        NET_QUEUE_SIZE,
+        0x1_0000,
+        0x2_0000,
+        0x3_0000,
+        7,
+        5,
+        0xFEE0_0000,
+        0x21,
+    );
+
+    assert_eq!(
+        steps_of(&steps),
+        [
+            Step::SetFeatures(u64::from(VIRTIO_NET_F_MAC)),
+            Step::RingSetState(viona_api::vioc_ring_state {
+                vrs_index: 1,
+                vrs_avail_idx: 7,
+                vrs_used_idx: 5,
+                vrs_qsize: NET_QUEUE_SIZE,
+                vrs_qaddr_desc: 0x1_0000,
+                vrs_qaddr_avail: 0x2_0000,
+                vrs_qaddr_used: 0x3_0000,
+            }),
+            Step::RingSetMsi {
+                ring: 1,
+                addr: 0xFEE0_0000,
+                msg: 0x21,
+            },
+            Step::RingKick(1),
+        ],
+    );
+    assert_eq!(
+        device.inner.lock().expect("viona lock").ring_state[1],
+        RingState::Ready,
+    );
+}
+
+#[test]
+fn a_halted_device_restores_no_ring() {
+    // A restore that races the halt would program a link that is
+    // already destroyed, and mark the ring ready for the next kick.
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps)));
+    device.halt();
+    steps.lock().expect("steps lock").clear();
+
+    VirtioDevice::restore_ring_state(
+        &device,
+        1,
+        NET_QUEUE_SIZE,
+        0x1_0000,
+        0x2_0000,
+        0x3_0000,
+        7,
+        5,
+        0,
+        0,
+    );
+
+    assert_eq!(
+        steps_of(&steps),
+        [],
+        "a halted device programmed a ring in the kernel",
+    );
+}
+
+#[test]
+fn an_export_pauses_every_ring_before_it_reads_them() {
+    // A ring the kernel still works on moves its indices while the
+    // source reads them, and the destination resumes from a cursor
+    // that was never true.
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps)));
+
+    VirtioDevice::pause_rings_for_export(&device);
+
+    assert_eq!(steps_of(&steps), [Step::RingPause(0), Step::RingPause(1)]);
+}
+
+#[test]
+fn a_notification_address_reaches_the_kernel() {
+    // With these the kernel takes the guest's kick itself and the vCPU
+    // does not leave to userspace. A port or an address that drifts
+    // sends the kick nowhere and stalls the ring.
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps)));
+
+    VirtioDevice::set_notify_addrs(&device, 0x2000, 0xC000_0000);
+
+    assert_eq!(
+        steps_of(&steps),
+        [
+            Step::SetNotifyIop(0x2000),
+            Step::SetNotifyMmio {
+                addr: 0xC000_0000,
+                size: 0x1000,
+            },
+        ],
+    );
+}
+
+#[test]
+fn an_unprogrammed_notification_address_is_not_sent() {
+    // A transport with no legacy BAR passes port 0, and one with no
+    // modern BAR passes address 0. Neither is an address the guest
+    // writes, and the kernel would take them as one.
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps)));
+
+    VirtioDevice::set_notify_addrs(&device, 0, 0);
+
+    assert_eq!(steps_of(&steps), []);
+}
+
+#[test]
+fn promiscuous_mode_follows_the_zone_config() {
+    // A VM with allow_mac_spoofing needs every frame the physical link
+    // carries. One without must not see its neighbours' traffic.
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps)));
+
+    device.set_promisc(true).expect("the test link answers");
+    device.set_promisc(false).expect("the test link answers");
+
+    assert_eq!(
+        steps_of(&steps),
+        [
+            Step::SetPromisc(viona_api::PromiscMode::All),
+            Step::SetPromisc(viona_api::PromiscMode::None),
+        ],
+    );
+}
