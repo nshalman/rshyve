@@ -364,16 +364,17 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// Raise an interrupt for a specific queue, under whichever
     /// session is current.
     ///
-    /// Only for a caller with no session to name: the in-kernel poll
-    /// thread, which holds no driver state of its own and is stopped
-    /// by its device's own halt, and the migration restore, which
-    /// raises on the session it has just built. A backend that
-    /// authorises work under one session and completes it on another
-    /// thread must use [`Self::raise_queue_interrupt_in`] instead. It
-    /// can be parked between its own check and this call for a whole
-    /// reset, and "is a session open now" says yes again on the other
-    /// side of one.
-    pub fn raise_queue_interrupt_current(&self, queue_idx: u16) {
+    /// One caller: the migration restore, which raises on the session
+    /// it has just built, on the restore thread, before any vCPU
+    /// exists to write DEVICE_STATUS. Every other caller can be parked
+    /// between naming its work and arriving here, and "is a session
+    /// open now" says yes again on the far side of a whole reset, so
+    /// it must use [`Self::raise_queue_interrupt_in`] instead.
+    ///
+    /// Private to the transport for that reason. A backend reaches the
+    /// interrupt path through [`BackendIntr::raise`], which carries
+    /// the session its work was authorised under.
+    pub(super) fn raise_queue_interrupt_current(&self, queue_idx: u16) {
         let Some(_admitted) = self.intr.begin_current() else {
             return;
         };

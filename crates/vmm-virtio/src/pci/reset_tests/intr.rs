@@ -712,3 +712,77 @@ fn a_session_raise_admitted_before_the_reset_is_delivered_and_waited_out() {
         "the driver that asked for this interrupt never got it"
     );
 }
+
+// The post-restore kick is not on a vCPU. It runs on its own thread
+// for about a second after the vCPUs start (bin/rshyve's
+// post-migrate-virtio-kick), so a migrated guest that re-probes the
+// device in that window resets it underneath the kick. What the kick
+// then raises belongs to the queue set the previous driver had
+// enabled, and the next driver never armed it: on INTx a level nobody
+// lowers, on MSI-X a message to whatever vector it had just
+// programmed.
+fn a_reset_refuses_the_post_restore_kick_it_overtook(msix: bool) {
+    let (wired, _table, sink) = if msix {
+        let (w, t, s) = wired_msix(Some(1));
+        (w, Some(t), Some(s))
+    } else {
+        (wired_intx(), None, None)
+    };
+    let (dev, entered, release, pin) = wired;
+    write_status(&dev, READY | bits::STATUS_DRIVER_OK);
+    // The queue set a restore leaves behind. How it was enabled is not
+    // what this test is about.
+    dev.virtio_state.lock().expect("virtio lock").queue_enabled[0] = true;
+
+    let (hook, arrived, go) = park();
+    dev.park_before_restore_kick(hook);
+    let kicker = {
+        let dev = Arc::clone(&dev);
+        std::thread::spawn(move || dev.post_restore_kick())
+    };
+    arrived
+        .recv_timeout(WEDGED)
+        .expect("the kick dropped the transport lock");
+
+    // A whole reset, and then the next driver, while the kick is held.
+    // A reset that waited for this thread would never return, which is
+    // why the kick is not admitted before it parks.
+    release_on_drain(entered, release);
+    write_status(&dev, 0);
+    write_status(&dev, READY | bits::STATUS_DRIVER_OK);
+    if msix {
+        // A reset leaves every vector at NO_VECTOR, so without this the
+        // MSI-X silence below would prove nothing.
+        dev.msix_queue_vectors[0].store(1, Ordering::Release);
+    }
+
+    go.send(()).expect("release the kick");
+    kicker.join().expect("the kick finished");
+
+    let delivered =
+        pin.asserts() + sink.as_ref().map_or(0, |sink| sink.sent().len());
+    assert_eq!(
+        delivered, 0,
+        "a kick for the old driver's queues reached the next driver",
+    );
+    assert_eq!(isr(&dev), 0, "the old session set the ISR");
+    assert!(!pin.is_asserted(), "the old session left the line asserted",);
+
+    // The converse, on the same device and the same queue. A migrated
+    // guest that never gets this kick leaves its rx ring unreplenished.
+    dev.virtio_state.lock().expect("virtio lock").queue_enabled[0] = true;
+    dev.post_restore_kick();
+    let delivered =
+        pin.asserts() + sink.as_ref().map_or(0, |sink| sink.sent().len());
+    assert_eq!(delivered, 1, "the running session's own kick was dropped");
+}
+
+#[test]
+fn a_reset_refuses_the_post_restore_kick_it_overtook_on_intx() {
+    a_reset_refuses_the_post_restore_kick_it_overtook(false);
+}
+
+#[test]
+fn a_reset_refuses_the_post_restore_kick_it_overtook_on_msix() {
+    a_reset_refuses_the_post_restore_kick_it_overtook(true);
+}

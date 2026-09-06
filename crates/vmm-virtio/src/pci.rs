@@ -208,6 +208,9 @@ struct TestParks {
     /// delivering what the unmask released, which is the window a
     /// whole reset can run in.
     released_delivery_pending: ParkSlot,
+    /// Reached by the post-restore kick once it has dropped the
+    /// transport lock, which is the window a whole reset can run in.
+    post_restore_kick_pending: ParkSlot,
 }
 
 #[cfg(test)]
@@ -538,6 +541,17 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             .expect("park lock poisoned") = Some(hook);
     }
 
+    /// Install the one-shot park the post-restore kick reaches once it
+    /// has dropped the transport lock.
+    #[cfg(test)]
+    fn park_before_restore_kick(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .parks
+            .post_restore_kick_pending
+            .lock()
+            .expect("park lock poisoned") = Some(hook);
+    }
+
     /// Install the one-shot park a config interrupt reaches once its
     /// caller has dropped the transport lock.
     #[cfg(test)]
@@ -714,15 +728,26 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
         // Re-inject interrupts on all enabled queues after vCPUs are
         // running. This ensures the guest's NAPI handler runs and
         // replenishes rx buffers.
+        //
+        // WHY the session comes from under the lock: this runs on its
+        // own thread for about a second after the vCPUs start, so the
+        // guest can reset the device between the queue set being read
+        // and the raise. A reset takes this same lock to end the
+        // session, so a session sampled here names the driver whose
+        // queues were just read, and one that no longer exists is
+        // refused rather than written onto the driver that followed.
         let vs = self.virtio_state.lock().expect("virtio lock");
+        let session = self.intr.session();
         let enabled: Vec<u16> = (0..self.num_queues)
             .filter(|&idx| {
                 vs.queue_enabled.get(idx as usize).copied().unwrap_or(false)
             })
             .collect();
         drop(vs);
+        #[cfg(test)]
+        run_park(&self.parks.post_restore_kick_pending);
         for idx in enabled {
-            self.raise_queue_interrupt_current(idx);
+            self.raise_queue_interrupt_in(session, idx);
         }
     }
 
