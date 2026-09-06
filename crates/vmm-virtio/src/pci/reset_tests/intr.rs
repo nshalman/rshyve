@@ -33,6 +33,10 @@ struct TestPin {
     level: AtomicBool,
     asserts: AtomicUsize,
     park: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Every assert takes this long while set, so a flood keeps
+    /// injections in flight instead of leaving gaps a reset can slip
+    /// through by luck.
+    slow: AtomicBool,
 }
 
 impl TestPin {
@@ -41,6 +45,7 @@ impl TestPin {
             level: AtomicBool::new(false),
             asserts: AtomicUsize::new(0),
             park: Mutex::new(None),
+            slow: AtomicBool::new(false),
         })
     }
 
@@ -52,6 +57,12 @@ impl TestPin {
     fn asserts(&self) -> usize {
         self.asserts.load(Ordering::Acquire)
     }
+
+    /// Make every assert take about as long as a contended kernel
+    /// call.
+    fn make_slow(&self) {
+        self.slow.store(true, Ordering::Release);
+    }
 }
 
 impl IntrPin for TestPin {
@@ -59,6 +70,9 @@ impl IntrPin for TestPin {
         let hook = self.park.lock().expect("pin park poisoned").take();
         if let Some(hook) = hook {
             hook();
+        }
+        if self.slow.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
         }
         self.asserts.fetch_add(1, Ordering::AcqRel);
         self.level.store(true, Ordering::Release);
@@ -384,16 +398,20 @@ fn a_reset_drops_the_messages_the_old_session_left_pending() {
 }
 
 // The hostile case the gate exists for: a guest that keeps every vCPU
-// it has raising interrupts and reading the ISR while one of them
-// resets the device. The reset waits only for the raises already
-// admitted, so the backlog behind it cannot hold the resetting vCPU.
+// it has raising interrupts while one of them resets the device. Each
+// injection is made slow, so the flood keeps one in flight at all
+// times and the reset cannot get through on a lucky gap. What stops
+// the flood holding the resetting vCPU is that admission shuts before
+// the wait: the set the reset waits out is closed the moment it starts
+// waiting.
 #[test]
 fn a_flood_of_raises_does_not_hold_the_resetting_vcpu() {
     let (dev, entered, release, pin) = wired_intx();
     write_status(&dev, READY | bits::STATUS_DRIVER_OK);
+    pin.make_slow();
 
     let stop = Arc::new(AtomicBool::new(false));
-    let floods: Vec<_> = (0..4)
+    let floods: Vec<_> = (0..8)
         .map(|_| {
             let dev = Arc::clone(&dev);
             let stop = Arc::clone(&stop);
@@ -405,14 +423,29 @@ fn a_flood_of_raises_does_not_hold_the_resetting_vcpu() {
             })
         })
         .collect();
-    assert!(wait_for(|| pin.asserts() > 64), "the flood never got going");
+    assert!(wait_for(|| pin.asserts() > 8), "the flood never got going");
 
     release_on_drain(entered, release);
+    // The reset runs on its own thread under a deadline. One the flood
+    // can hold would park the run instead of failing it: only this
+    // thread stops the flood.
+    let done = Arc::new(AtomicBool::new(false));
+    let resetter = {
+        let dev = Arc::clone(&dev);
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            write_status(&dev, 0);
+            done.store(true, Ordering::Release);
+        })
+    };
     let start = Instant::now();
-    write_status(&dev, 0);
+    while !done.load(Ordering::Acquire) && start.elapsed() < RESET_BUDGET {
+        std::thread::sleep(Duration::from_micros(20));
+    }
     let waited = start.elapsed();
 
     stop.store(true, Ordering::Release);
+    resetter.join().expect("the reset finished");
     for t in floods {
         t.join().expect("a flooding thread finished");
     }

@@ -284,15 +284,13 @@ fn a_guest_refilling_the_ring_does_not_hold_the_resetting_vcpu() {
         // avail entry names the same head, so this needs only the
         // index.
         s.spawn(|| {
+            let slot = physmap
+                .lookup(AVAIL_IDX_GPA, 2)
+                .expect("mapped avail index");
             let mut idx = RING;
             while !stop.load(Ordering::Acquire) {
-                idx = idx.wrapping_add(RING);
-                physmap
-                    .lookup(AVAIL_IDX_GPA, 2)
-                    .expect("mapped avail index")
-                    .write::<u16>(&idx)
-                    .expect("write avail index");
-                thread::yield_now();
+                idx = idx.wrapping_add(1);
+                slot.write::<u16>(&idx).expect("write avail index");
             }
         });
         s.spawn(|| {
