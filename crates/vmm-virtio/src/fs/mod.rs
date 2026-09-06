@@ -685,6 +685,14 @@ impl Lifecycle for VirtioFs {
         self.indicator.resume();
     }
 
+    /// The worker join below polls this deadline, so teardown has to
+    /// wait at least as long or it abandons a halt one poll short of
+    /// returning. Reported from the same constant the halt reads, so
+    /// raising one raises the other.
+    fn halt_budget(&self) -> Duration {
+        FS_HALT_BUDGET
+    }
+
     fn halt(&self) {
         self.indicator.halt();
         self.shutdown.store(true, Ordering::Release);

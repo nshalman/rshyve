@@ -7,6 +7,7 @@
 use super::*;
 use crate::pci::intr::IntrGate;
 use std::sync::atomic::AtomicUsize;
+use vmm_devices::Lifecycle;
 
 #[test]
 fn connect_line_is_parsed() {
@@ -693,6 +694,25 @@ fn an_rx_completion_from_the_closed_session_raises_nothing() {
         "the driver that is running got no interrupt for its packet"
     );
 
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// The halt joins the accept thread and then the readers, one after
+// the other, so the deadline it holds is the product and not the
+// constant. Teardown derives its own bound from what this reports; a
+// device that under-reports is cut off inside its own wait.
+#[test]
+fn the_declared_halt_budget_covers_both_joins_the_halt_runs() {
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    assert_eq!(
+        Lifecycle::halt_budget(&vsock),
+        HALT_BUDGET * HALT_JOIN_ROUNDS,
+    );
+    assert!(
+        Lifecycle::halt_budget(&vsock) > HALT_BUDGET,
+        "one join's budget does not cover two joins run in sequence",
+    );
     vsock.halt();
     let _ = std::fs::remove_dir_all(&dir);
 }
