@@ -239,6 +239,54 @@ fn a_running_device_kicks_the_ring_the_guest_named() {
     assert_eq!(steps_of(&steps), [Step::RingKick(1)]);
 }
 
+/// The guest picks this index. `pci/legacy.rs` and `pci/modern.rs` both
+/// take it from the notify register with `val as u16` and pass it on
+/// unchecked, so the bound in `ring_kick` is the only one there is.
+/// Indexing `ring_state` past its end panics the vCPU thread while it
+/// holds the device mutex, and the seven other `expect` sites on that
+/// mutex then panic in turn.
+#[test]
+fn a_kick_naming_a_queue_that_does_not_exist_is_refused() {
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+
+    for idx in [NET_NUM_QUEUES as u16, 2, 3, 255, u16::MAX] {
+        notify(&device, idx);
+    }
+
+    assert_eq!(
+        steps_of(&steps),
+        [],
+        "a queue index the device does not have reached the link",
+    );
+}
+
+/// The harm a missing bound does is not one panic. It is the poisoned
+/// mutex every later caller finds.
+#[test]
+fn a_kick_from_a_hostile_guest_leaves_the_device_usable() {
+    let steps = Steps::default();
+    let device = Arc::new(running_device(Arc::new(TestLink::new(&steps))));
+
+    // A vCPU thread, the way the transport calls in.
+    let vcpu = Arc::clone(&device);
+    std::thread::spawn(move || notify(&vcpu, u16::MAX))
+        .join()
+        .expect("a guest queue index must not panic the vCPU thread");
+
+    // What every other thread does next.
+    assert!(
+        device.inner.lock().is_ok(),
+        "the device mutex was poisoned, so every other caller panics",
+    );
+    notify(&device, 1);
+    assert_eq!(
+        steps_of(&steps),
+        [Step::RingKick(1)],
+        "a real kick stopped working after the hostile one",
+    );
+}
+
 #[test]
 fn a_halt_leaves_no_ring_a_kick_can_reach() {
     // The halt drops the device lock before it destroys the link,
