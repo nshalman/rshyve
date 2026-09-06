@@ -174,6 +174,29 @@ fn no_two_commands_share_a_number() {
     }
 }
 
+/// The one call that binds a handle to its link and its VM.
+///
+/// `c_linkid` and `c_vmfd` are both 32 bits and adjacent, so swapping
+/// them still compiles and still sends a well formed struct. The kernel
+/// then looks up a link by a file descriptor number and a VM by a link
+/// id. `VionaFd::new` opens the real device before it sends this, so
+/// only the split-out `create` can be reached by a recorder.
+#[test]
+fn the_create_call_sends_the_link_and_the_vm_where_the_kernel_reads_them() {
+    let fd = recorder();
+    // Distinct, and neither a plausible value for the other field.
+    let link_id: u32 = 0xAABB_CCDD;
+    let vm_fd: RawFd = 0x0102_0304;
+
+    fd.create(link_id, vm_fd).expect("a recorder answers");
+
+    let call = &calls(&fd)[0];
+    assert_eq!(call.cmd(), VNA_IOC_CREATE);
+    let sent = call.payload::<vioc_create>();
+    assert_eq!(sent.c_linkid, link_id, "the link id moved");
+    assert_eq!(sent.c_vmfd, vm_fd, "the vm descriptor moved");
+}
+
 #[test]
 fn the_version_query_sends_the_command_its_name_says() {
     // The one call that is not a link operation: the binary asks

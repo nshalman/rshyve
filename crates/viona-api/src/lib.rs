@@ -130,13 +130,23 @@ impl VionaFd {
     /// provided in `link_id` and `vm_fd`, respectively.
     pub fn new(link_id: u32, vm_fd: RawFd) -> Result<Self> {
         let this = Self::open()?;
+        this.create(link_id, vm_fd)?;
+        Ok(this)
+    }
 
+    /// Bind an open handle to a link and a VM.
+    ///
+    /// Split out of [`Self::new`] because `new` opens the real device
+    /// first, so no recorder could reach the call and a test could not
+    /// see which field went where.
+    fn create(&self, link_id: u32, vm_fd: RawFd) -> Result<()> {
         let mut vna_create = vioc_create {
             c_linkid: link_id,
             c_vmfd: vm_fd,
         };
-        let _ = unsafe { this.ioctl(VNA_IOC_CREATE, &mut vna_create) }?;
-        Ok(this)
+        // Safety: the kernel reads one vioc_create for this command.
+        let _ = unsafe { self.ioctl(VNA_IOC_CREATE, &mut vna_create) }?;
+        Ok(())
     }
 
     /// Open viona device instance without performing any other initialization

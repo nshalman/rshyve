@@ -71,6 +71,7 @@ const fn howmany(x: usize, y: usize) -> usize {
 pub const VIONA_INTR_WORDS: usize = howmany(VIONA_MAX_QPAIR * 2, 32);
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct vioc_create {
     pub c_linkid: u32,
     pub c_vmfd: i32,
