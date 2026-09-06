@@ -264,33 +264,61 @@ fn a_reset_does_not_wait_for_interrupt_injection() {
     );
 }
 
-// The hostile case. A guest fills the ring before it writes 0 to
-// DEVICE_STATUS, so the walk it starts on another vCPU is the longest
-// guest-access section it can build. The reset waits for that section
-// and for nothing behind it: work refused at admission never touches
-// the lock the drain takes, and `std::sync::RwLock` gives the writer
-// no priority, so anything that could queue there could hold the vCPU
-// for as long as the guest liked.
+// The hostile case, through the ring. One vCPU walks the ring while
+// another keeps refilling it and a third writes 0 to DEVICE_STATUS.
+// The walk holds one guest-access session for its whole length, so
+// the reset waits for it; what stops the guest from making that wait
+// as long as it likes is the cap at queue size, which ends the walk
+// no matter how fast the refill runs.
 #[test]
-fn a_full_ring_walk_does_not_hold_the_resetting_vcpu() {
-    const RING: u16 = 256;
+fn a_guest_refilling_the_ring_does_not_hold_the_resetting_vcpu() {
+    const RING: u16 = 64;
+    const AVAIL_IDX_GPA: u64 = 0x1102;
     let (physmap, queue, blk) = make_get_id_queue(RING, RING);
     let mut queues = [queue];
+    let stop = AtomicBool::new(false);
+    let done = AtomicBool::new(false);
 
     let waited = thread::scope(|s| {
-        let physmap = &physmap;
-        let blk = &blk;
-        s.spawn(move || {
-            blk.notify_queue(0, &mut queues, physmap);
+        // A second vCPU pushing more work in behind the walk. Every
+        // avail entry names the same head, so this needs only the
+        // index.
+        s.spawn(|| {
+            let mut idx = RING;
+            while !stop.load(Ordering::Acquire) {
+                idx = idx.wrapping_add(RING);
+                physmap
+                    .lookup(AVAIL_IDX_GPA, 2)
+                    .expect("mapped avail index")
+                    .write::<u16>(&idx)
+                    .expect("write avail index");
+                thread::yield_now();
+            }
+        });
+        s.spawn(|| {
+            blk.notify_queue(0, &mut queues, &physmap);
+        });
+        // The reset runs on its own thread under a deadline. One that
+        // waits for a walk the guest can extend would park the run
+        // instead of failing it.
+        s.spawn(|| {
+            VirtioDevice::reset(&blk);
+            done.store(true, Ordering::Release);
         });
         let start = Instant::now();
-        VirtioDevice::reset(blk);
-        start.elapsed()
+        while !done.load(Ordering::Acquire) && start.elapsed() < RESET_BUDGET {
+            thread::sleep(Duration::from_micros(20));
+        }
+        let waited = start.elapsed();
+        // Let a walk that should have stopped on its own finish, so
+        // the scope joins it.
+        stop.store(true, Ordering::Release);
+        waited
     });
 
     assert!(
         waited < RESET_BUDGET,
-        "a full ring walk held the resetting vCPU for {waited:?}"
+        "a guest refilling the ring held the resetting vCPU for {waited:?}"
     );
 }
 
