@@ -22,6 +22,23 @@
 //! guest negotiates `VIRTIO_F_VERSION_1` (bit 32) and uses BAR2.
 //! Legacy guests use BAR0 as before. `EVENT_IDX` and `INDIRECT_DESC`
 //! are only advertised through the modern path.
+//!
+//! # Where the parts are
+//!
+//! This module keeps what every path shares: the register state in
+//! `VirtioPciState`, the reset latch inside it, and the reset
+//! protocol that closes the latch and reopens it. Each submodule owns
+//! one thing, and its own doc says which:
+//!
+//! - `bus`: the addresses this device decodes, and the accesses that
+//!   arrive at them.
+//! - `legacy`: the pre-1.0 register file on BAR0.
+//! - `modern`: the capability chain and the BAR2 register file it
+//!   points at.
+//! - `intr`: every interrupt this transport delivers, ordered against
+//!   its own reset.
+//! - `migrate`: what goes on the migration wire, and the order a
+//!   restore puts it back in.
 
 use std::sync::{Arc, Mutex};
 
