@@ -288,15 +288,20 @@ fn a_guest_that_overclaims_the_ring_does_not_hold_the_resetting_vcpu() {
             .expect("read used index")
     };
 
-    let waited = thread::scope(|s| {
+    // Nothing is asserted inside the scope: an assertion there would
+    // unwind with the guest thread still claiming, and the scope would
+    // park on it instead of failing.
+    let (did, waited) = thread::scope(|s| {
         // The second vCPU. Every avail entry names the same head, so
         // this needs only the index, and it keeps that index half a
-        // ring ahead of wherever the device has got to.
+        // ring ahead of wherever the device has got to. Its own
+        // deadline is the backstop for a panic that skips `stop`.
         s.spawn(|| {
             let slot = physmap
                 .lookup(AVAIL_IDX_GPA, 2)
                 .expect("mapped avail index");
-            while !stop.load(Ordering::Acquire) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
                 let ahead = used_idx().wrapping_add(1 << 14);
                 slot.write::<u16>(&ahead).expect("write avail index");
             }
@@ -304,11 +309,7 @@ fn a_guest_that_overclaims_the_ring_does_not_hold_the_resetting_vcpu() {
 
         // One notification, against a claim that never runs out.
         blk.notify_queue(0, &mut queues, &physmap);
-        assert!(
-            used_idx() <= RING,
-            "one notification did {} requests on a ring of {RING}",
-            used_idx()
-        );
+        let did = used_idx();
 
         // Now the same walk racing a reset. The reset runs on its own
         // thread under a deadline: one a guest can hold would park the
@@ -326,9 +327,13 @@ fn a_guest_that_overclaims_the_ring_does_not_hold_the_resetting_vcpu() {
         }
         let waited = start.elapsed();
         stop.store(true, Ordering::Release);
-        waited
+        (did, waited)
     });
 
+    assert!(
+        did <= RING,
+        "one notification did {did} requests on a ring of {RING}"
+    );
     assert!(
         waited < RESET_BUDGET,
         "a guest overclaiming the ring held the resetting vCPU for {waited:?}"
