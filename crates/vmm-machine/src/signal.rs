@@ -311,11 +311,22 @@ fn watch_teardown(
 /// This ends every wedge that userspace can break. It cannot end one
 /// the kernel holds. `VM_DESTROY_SELF` waits for the vmm_drv leases in
 /// an untimed `cv_wait` (`vmm_sol_dev.c`, `vmm_lease_block`), and a
-/// thread parked there is not `T_WAKEABLE`, so `pokelwps` does not wake
-/// it and `exitlwps` waits for it (`lwp.c`). No signal, close or exit
-/// reaches such a thread, `_exit` included. Only a kernel that bounds
-/// that wait can free the process. The log line below is the record of
-/// that case.
+/// thread parked there is not `T_WAKEABLE`, so `pokelwps` steps over it
+/// (`lwp.c:1640`) and `exitlwps` waits for it. `_exit` does not reach
+/// that thread either.
+///
+/// The exit usually frees the process all the same, for a different
+/// reason. `proc_exit` sets `SEXITING` before it calls `exitlwps`
+/// (`exit.c:517`), viona ring workers are LWPs of this same process,
+/// and `vring_need_bail_ext` tests that flag (`viona_ring.c:736`). A
+/// worker that reaches the test drops its lease, and the destroy that
+/// waited for the lease returns.
+///
+/// It does not free the process when a worker cannot reach that test:
+/// one inside the mac perimeter, or in the untimed `cv_wait` of
+/// `viona_tx_wait_outstanding` (`viona_tx.c:92`), which neither heeds
+/// signals nor rechecks the bail. Only a kernel that bounds those waits
+/// closes that case. The log line below is the record of it.
 fn end_process(reason: &'static str, give_up: impl FnOnce(), log: &Logger) {
     error!(log, "the VMM outlived its own shutdown; ending the process";
         "reason" => reason,
@@ -327,8 +338,8 @@ fn end_process(reason: &'static str, give_up: impl FnOnce(), log: &Logger) {
 ///
 /// `exit` runs the atexit handlers and flushes stdio, either of which
 /// can wait on a lock a stuck thread holds. `_exit` is the syscall
-/// alone. It is not a guarantee: see [`end_process`] for the wedge that
-/// no exit escapes.
+/// alone. It is not a guarantee: see [`end_process`] for the one wedge
+/// that no exit escapes.
 fn terminal_exit() {
     // The async log drain hands the last line to another thread, and
     // `_exit` does not wait for it.

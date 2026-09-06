@@ -384,14 +384,29 @@ fn teardown_budget(devices: usize) -> Duration {
 /// budget. A thread that misses the budget keeps its handle, because
 /// the kernel is still using the file descriptor behind it.
 ///
-/// Returns false when the destroy did not return, which covers two
-/// cases. A destroy that is only slow still ends, and the
-/// `VM_SET_AUTODESTRUCT` the machine builder armed reclaims the
-/// instance when the fd closes at process exit. A destroy parked in the
-/// lease purge does not end: process exit waits for that thread, so the
-/// fd never closes and the instance stays. [`halt_devices`] is what
-/// keeps the purge from reaching that wait; this bound is the belt
-/// behind it. See [`crate::signal`].
+/// Returns false when the destroy did not return. A destroy that is
+/// only slow still ends, and the `VM_SET_AUTODESTRUCT` the machine
+/// builder armed reclaims the instance when the fd closes at process
+/// exit.
+///
+/// A destroy parked in the lease purge usually ends as well, and the
+/// route is not obvious. `proc_exit` sets `SEXITING` before it calls
+/// `exitlwps` (`exit.c:517`). viona ring workers are LWPs of this same
+/// process (`viona_ring.c:920`, `viona_create_worker` passes
+/// `curproc`), and `vring_need_bail_ext` tests that flag
+/// (`viona_ring.c:736`). A worker that reaches the test bails and drops
+/// its lease, and the purge that waited for the lease returns. Process
+/// exit does not reach the parked destroy thread itself: `cv_wait`
+/// leaves it neither wakeable nor waiting, so `pokelwps` steps over it
+/// (`lwp.c:1640`) and `exitlwps` waits for it.
+///
+/// It does not end when a ring worker cannot reach that test. viona
+/// halt and ring reset are the remaining boundary: a worker inside the
+/// mac perimeter, or in `viona_tx_wait_outstanding`, which is an
+/// untimed `cv_wait` that neither heeds signals nor rechecks the bail
+/// (`viona_tx.c:92`). [`halt_devices`] runs that halt before the
+/// destroy so the purge has no lease left to wait for. This bound is
+/// the belt behind it. See [`crate::signal`].
 ///
 /// The destroy is a closure so that a call which never returns is
 /// testable without a live /dev/vmm handle.
