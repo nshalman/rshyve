@@ -17,6 +17,7 @@ use crate::pci::intr::{IntrGate, IntrSession};
 
 mod barrier;
 mod bounce;
+mod multiqueue;
 mod reset;
 
 /// A completion handler with no transport behind it.

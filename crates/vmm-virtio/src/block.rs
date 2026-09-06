@@ -117,12 +117,6 @@ struct DiskLimits {
     nodelete: bool,
 }
 
-/// The queue every worker completion raises on.
-///
-/// This is unchanged behaviour. With MSI-X and more than one queue it
-/// is the wrong vector, which is a defect of its own.
-const BLK_INTR_QUEUE: u16 = 0;
-
 /// VirtIO block device.
 pub struct VirtioBlock {
     capacity: u64,
@@ -278,6 +272,10 @@ impl VirtioBlock {
         }
 
         let intr = Arc::clone(&self.interrupt);
+        // The handler carries the ring it belongs to. MSI-X gives each
+        // virtqueue its own vector, and the guest driver only looks at
+        // the ring that vector names, so a completion raised on any
+        // other index is never collected.
         let interrupt_fn = move |session| {
             // The slot is unlocked for the raise. Delivery is a call
             // into the kernel, and the reset reads this slot, so a
@@ -285,7 +283,7 @@ impl VirtioBlock {
             // of a vCPU.
             let path = intr.lock().ok().and_then(|slot| slot.clone());
             if let Some(path) = path {
-                path.raise(session, BLK_INTR_QUEUE);
+                path.raise(session, queue_idx);
             }
         };
 
