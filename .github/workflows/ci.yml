@@ -5,17 +5,17 @@ name: CI
 # The target platform is illumos, and GitHub offers no illumos runner.
 # Neither binary LINKS anywhere but illumos: bhyve-api binds SunOS
 # ioctls and viona-api needs libdladm. Both do type-check here, though.
-# firehyve cross-checks against the illumos target, and rshyve checks on
-# the host target where its C dependencies (zstd-sys, the vendored
-# libtpms that vmm-tpm-sys builds) compile natively. See the `binaries`
-# job.
+# firehyve cross-checks against the illumos target, and both binaries
+# build and run their tests on the host target, where rshyve's C
+# dependencies (zstd-sys, the vendored libtpms that vmm-tpm-sys builds)
+# compile natively. See the `binaries` job.
 #
 # So a green run here means: the tree is formatted, the portable crates
-# are clippy-clean and their tests pass, the illumos FFI binding crates
-# type-check against the illumos target, the lockfile is current, and
-# the dependency and public-surface policies hold. tools/fhrun-init is
-# excluded from the workspace, so the guest-init job covers it on its
-# own.
+# are clippy-clean and their tests pass, every portable crate and its
+# test targets type-check against the illumos target, the lockfile is
+# current, and the dependency and public-surface policies hold.
+# tools/fhrun-init is excluded from the workspace, so the guest-init job
+# covers it on its own.
 #
 # It does NOT mean the VMM builds, boots a guest, or passes a platform
 # test. Those still run on the illumos build host; see docs/testing.md.
@@ -80,14 +80,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup target add x86_64-unknown-illumos
-      # The FFI crates: ioctl definitions, struct layouts, and the viona
-      # bindings. This is the code most likely to break against the
-      # target and it has no C or asm dependencies. No linker is needed
-      # because check does not link.
+      # Every portable crate against the real target, tests included.
+      # `--all-targets` is the point of this job: it is the only place
+      # in the workflow that COMPILES a `#[cfg(test)]` body behind
+      # `cfg(target_os = "illumos")`. The clippy and test jobs build for
+      # the host, and the firehyve check in `binaries` reaches these
+      # crates as libraries only, so an illumos-only test could stop
+      # compiling and no job here would say so.
+      #
+      # vmm_passthru, vmm_storage and vmm_hid are in the list for a
+      # second reason: firehyve does not depend on them, so before this
+      # their illumos ioctl code was not compiled against the target at
+      # all. Only rshyve reaches them, and rshyve cannot cross-compile.
+      #
+      # vmm_migrate is left out. zstd-sys needs a C compiler for the
+      # target and this runner has no illumos cross-cc. That crate is
+      # portable, so the host clippy and test jobs cover it, and its
+      # illumos paths are covered on the build host.
+      #
+      # No linker is needed because check does not link.
       - run: >
           cargo check --locked --all-targets
           --target x86_64-unknown-illumos
-          -p bhyve_api_sys -p bhyve_api -p viona_api -p vmm_api_common -p vmm_config
+          -p bhyve_api_sys -p bhyve_api -p viona_api -p vmm_api_common
+          -p vmm_config -p vmm_core -p vmm_devices -p vmm_devices_testsupport
+          -p vmm_boot -p vmm_metrics -p vmm_machine -p vmm_hyperv
+          -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
+          -p fhrun
 
   test:
     name: portable tests
@@ -198,9 +217,15 @@ jobs:
       # build, which need a C toolchain for the target, and
       # there is no illumos cross-cc here. The host target compiles those
       # natively instead, which still type-checks every line of rshyve.
-      - run: >
-          cargo check --locked --all-targets
-          -p rshyve -p vmm-migrate-agent
+      #
+      # `test`, not `check`: rshyve and firehyve hold 236 tests that no
+      # job in this workflow ran. The control socket authorization
+      # policy is among them, and its peer-credential test is gated to
+      # Linux and macOS, so the illumos build host skips it. This runner
+      # is the only machine that runs that test at all. None of these
+      # three packages has a bench or example target, so nothing that
+      # `--all-targets` compiled is lost.
+      - run: cargo test --locked -p rshyve -p firehyve -p vmm-migrate-agent
 
   supply-chain:
     name: advisories, licenses, sources
@@ -287,3 +312,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: tools/public-surface.sh
+
+  ci-coverage:
+    name: every portable crate is named by a job
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A crate that no `-p` list names is unlinted and untested code
+      # this workflow reports green, which is how the vmm-devices split
+      # nearly lost five crates. The script derives its list from the
+      # workspace members, so a new crate fails here until a job names
+      # it. It failed closed but ran on no machine before this.
+      - run: tools/check-ci-crates.sh
