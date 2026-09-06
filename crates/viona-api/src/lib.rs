@@ -40,7 +40,23 @@ enum Chan {
     /// A recorder. It holds a file only to answer [`AsRawFd`], and to
     /// give `wait_intr` a descriptor to poll.
     #[cfg(test)]
-    Record(File, std::sync::Mutex<Vec<Call>>),
+    Record(File, std::sync::Mutex<Recording>),
+}
+
+/// What a recorder keeps, and what it answers with.
+#[cfg(test)]
+#[derive(Default)]
+struct Recording {
+    /// The ioctls a caller sent, in order.
+    calls: Vec<Call>,
+
+    /// The bytes each command copies back out, by command.
+    ///
+    /// WHY a recorder needs these: without them a caller reads back
+    /// the struct it passed in, so a method whose value comes from
+    /// the copy-out answers exactly like one that returns a constant.
+    /// `intr_status` and `get_features` are both such methods.
+    replies: std::collections::HashMap<i32, Vec<u8>>,
 }
 
 /// One ioctl that a caller sent.
@@ -154,25 +170,39 @@ impl VionaFd {
             Chan::Dev(fp) => {
                 ioctl(fp.as_raw_fd(), cmd, data as *mut libc::c_void)
             }
-            // A recorder copies nothing back, so a caller reads the
-            // struct it passed in. It keeps the bytes going the other
-            // way, which is what says a call filled the payload in
-            // the order the kernel reads it.
+            // A recorder keeps the bytes going in, which is what says
+            // a call filled the payload in the order the kernel reads
+            // it. It then writes back what the test armed for this
+            // command, so a caller that reads a copy-out reads a
+            // value it did not send.
             //
             // Safety: the caller's contract above says `data` points
-            // at one initialized T. Every ioctl payload names its
-            // padding, so no byte read here is uninitialized.
+            // at one initialized T, writable for the same length.
+            // Every ioctl payload names its padding, so no byte read
+            // here is uninitialized, and the bytes written back came
+            // from a value of that size.
             #[cfg(test)]
-            Chan::Record(_, calls) => {
-                let data = std::slice::from_raw_parts(
+            Chan::Record(_, rec) => {
+                let sent = std::slice::from_raw_parts(
                     data.cast::<u8>(),
                     size_of::<T>(),
                 )
                 .to_vec();
-                calls
-                    .lock()
-                    .expect("the recorded calls")
-                    .push(Call::Typed { cmd, data });
+                let mut rec = rec.lock().expect("the recorded calls");
+                rec.calls.push(Call::Typed { cmd, data: sent });
+                if let Some(reply) = rec.replies.get(&cmd) {
+                    assert_eq!(
+                        reply.len(),
+                        size_of::<T>(),
+                        "cmd {cmd:#x} copies out {} bytes",
+                        size_of::<T>(),
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        reply.as_ptr(),
+                        data.cast::<u8>(),
+                        reply.len(),
+                    );
+                }
                 Ok(0)
             }
         }
@@ -197,10 +227,10 @@ impl VionaFd {
             // A recorder answers 1, which is a valid version, so
             // `api_version` does not trip its own demand.
             #[cfg(test)]
-            Chan::Record(_, calls) => {
-                calls
-                    .lock()
+            Chan::Record(_, rec) => {
+                rec.lock()
                     .expect("the recorded calls")
+                    .calls
                     .push(Call::Usize { cmd, arg: data });
                 Ok(1)
             }

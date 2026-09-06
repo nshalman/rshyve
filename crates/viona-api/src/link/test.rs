@@ -21,7 +21,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::*;
-use crate::test::{calls, cmds, not_a_link, recorder, recorder_on};
+use crate::test::{
+    answers_with, calls, cmds, not_a_link, recorder, recorder_on,
+};
 use crate::{Call, VIONA_PROMISC_ALL};
 
 /// A wait this long means a thread is wedged, not slow.
@@ -254,6 +256,16 @@ fn a_ring_state_read_asks_for_the_ring_it_was_given() {
     // reads ring 0 whatever the caller asks for, and a migration
     // source then writes ring 0's indices into every ring's payload.
     let fd = recorder();
+    let filled = vioc_ring_state {
+        vrs_index: 1,
+        vrs_avail_idx: 7,
+        vrs_used_idx: 5,
+        vrs_qsize: 256,
+        vrs_qaddr_desc: 0x1_0000,
+        vrs_qaddr_avail: 0x2_0000,
+        vrs_qaddr_used: 0x3_0000,
+    };
+    answers_with(&fd, VNA_IOC_RING_GET_STATE, filled);
 
     let state = fd.ring_get_state(1).expect("a recorder answers");
 
@@ -264,9 +276,11 @@ fn a_ring_state_read_asks_for_the_ring_it_was_given() {
             ..Default::default()
         },
     );
-    // A recorder copies nothing back, so this is the struct that went
-    // in. It says the read answers with the struct the kernel filled.
-    assert_eq!(state.vrs_index, 1);
+    // The indices are the kernel's to fill, and they are what the
+    // migration payload carries. A read that answered with the struct
+    // it sent would report every ring at 0, and the destination would
+    // replay descriptors the guest has already reclaimed.
+    assert_eq!(state, filled);
 }
 
 #[test]
@@ -325,10 +339,22 @@ fn a_notify_window_sends_its_address_and_its_size() {
 
 #[test]
 fn an_interrupt_poll_reads_the_pending_rings() {
-    // The payload is what the kernel copies out, so it goes in empty.
-    // A poll that sent a stale status would report rings pending that
-    // the kernel never signalled.
+    // The payload is what the kernel copies out, so it goes in empty
+    // and the answer comes back in it. A poll that sent a stale
+    // status would report rings pending that the kernel never
+    // signalled.
+    //
+    // The answer is the whole point of the call. A read that gave
+    // back an empty status would leave the poll thread finding no
+    // ring pending on every wakeup: nothing clears the kernel's
+    // signal, the band stays asserted, the wait returns at once for
+    // ever, and one core spins while the guest waits for an interrupt
+    // that never comes.
     let fd = recorder();
+    // The tx ring alone, so a status that answers by position is
+    // told apart from one that answers at all.
+    let pending = vioc_intr_poll { vip_status: [0, 1] };
+    answers_with(&fd, VNA_IOC_INTR_POLL, pending);
 
     let status = fd.intr_status().expect("a recorder answers");
 
@@ -336,7 +362,7 @@ fn an_interrupt_poll_reads_the_pending_rings() {
         calls(&fd)[0].payload::<vioc_intr_poll>(),
         vioc_intr_poll::default(),
     );
-    assert_eq!(status, IntrStatus::default());
+    assert_eq!(status, pending.vip_status);
 }
 
 #[test]

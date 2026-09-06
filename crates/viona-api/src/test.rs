@@ -30,13 +30,34 @@ pub(crate) fn recorder() -> VionaFd {
 /// The file is what `wait_intr` polls, so a test that drives the wait
 /// chooses a descriptor it can make ready.
 pub(crate) fn recorder_on(fp: File) -> VionaFd {
-    VionaFd(Chan::Record(fp, Mutex::new(Vec::new())))
+    VionaFd(Chan::Record(fp, Mutex::new(Recording::default())))
 }
 
 /// What a recorder was asked for, in order.
 pub(crate) fn calls(fd: &VionaFd) -> Vec<Call> {
+    recording(fd).calls.clone()
+}
+
+/// Arm what the kernel copies back out for `cmd`.
+///
+/// The bytes come from one `T`, so the caller reads back a value the
+/// kernel could have written. Without this a caller reads the struct
+/// it sent, and a method that answers with a constant looks right.
+pub(crate) fn answers_with<T: Copy>(fd: &VionaFd, cmd: i32, value: T) {
+    // Safety: `value` is one initialized T, and every ioctl payload
+    // names its padding, so no byte read here is uninitialized.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::from_ref(&value).cast::<u8>(),
+            size_of::<T>(),
+        )
+    };
+    recording(fd).replies.insert(cmd, bytes.to_vec());
+}
+
+fn recording(fd: &VionaFd) -> std::sync::MutexGuard<'_, Recording> {
     match &fd.0 {
-        Chan::Record(_, calls) => calls.lock().expect("the calls").clone(),
+        Chan::Record(_, rec) => rec.lock().expect("the recording"),
         Chan::Dev(_) => panic!("only a recorder keeps its calls"),
     }
 }
@@ -155,14 +176,21 @@ fn a_command_that_copies_in_is_refused_at_the_kernel_call() {
 
 #[test]
 fn the_features_the_kernel_offers_are_read_from_the_kernel() {
-    // The one call the device makes before it holds the link. A
-    // recorder copies nothing back, so this says which command the
-    // read reached, not what it answered.
+    // The one call the device makes before it holds the link, and
+    // everything the guest is offered starts here. A read that
+    // answered a constant would leave the device offering MAC and
+    // STATUS alone, and drop every feature the kernel has: the guest
+    // would then run a legacy ring layout on a modern viona.
     let fd = recorder();
+    // VERSION_1, plus two bits the kernel offers with it.
+    let offered = (1u64 << 32) | 0x30;
+    answers_with(&fd, VNA_IOC_GET_FEATURES, offered);
 
-    fd.get_features().expect("a recorder answers");
+    assert_eq!(fd.get_features().expect("a recorder answers"), offered);
 
     assert_eq!(cmds(&fd), [VNA_IOC_GET_FEATURES]);
+    // The payload is what the kernel fills, so it goes in empty.
+    assert_eq!(calls(&fd)[0].payload::<u64>(), 0);
 }
 
 #[test]
