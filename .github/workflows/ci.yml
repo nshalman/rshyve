@@ -318,6 +318,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: tools/public-surface.sh
+      # The guard stops private data reaching a public repository, so a
+      # silent pass is its worst failure, and it had one: a `git grep`
+      # that failed was read as "no hits". Outside a checkout it printed
+      # a git error and then reported clean, which is what the illumos
+      # build host does with an extracted tarball. A guard nobody has
+      # watched fail is not known to work, so both failures run here.
+      - name: the guard fails on a planted address, and refuses a tree it cannot list
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          elsewhere="$(mktemp -d)"
+          trap 'rm -rf "$tmp" "$elsewhere"' EXIT
+          # An extracted archive is what the build host has: no checkout.
+          git archive HEAD | tar -x -C "$tmp"
+          # Assembled at run time. The literal would trip the guard on
+          # this file, which is the guard doing its job.
+          octet=199
+          printf 'root@10.%s.%s.40\n' "$octet" "$octet" > "$tmp/docs/ci-self-test.md"
+          if "$tmp/tools/public-surface.sh"; then
+            echo "the guard reported clean with a lab address in the tree" >&2
+            exit 1
+          fi
+          rm "$tmp/docs/ci-self-test.md"
+          "$tmp/tools/public-surface.sh"
+          # A listing that misses this tree must refuse. An empty answer
+          # read as a clean one is the failure this step exists for.
+          mkdir -p "$elsewhere/tools"
+          cp "$tmp/tools/public-surface.sh" "$elsewhere/tools/"
+          rc=0
+          "$elsewhere/tools/public-surface.sh" || rc=$?
+          if [ "$rc" -ne 2 ]; then
+            echo "the guard answered $rc outside its own tree, wanted 2" >&2
+            exit 1
+          fi
 
   ci-coverage:
     name: every portable crate is named by a job
