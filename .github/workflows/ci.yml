@@ -375,6 +375,37 @@ jobs:
       # workspace members, so a new crate fails here until a job names
       # it. It failed closed but ran on no machine before this.
       - run: tools/check-ci-crates.sh
+      # The gate itself failed closed but had a blind spot: a crate it
+      # exempted was asserted nowhere, so the workflow could stop naming
+      # it and this job stayed green. Watch it fail before trusting it.
+      - name: the gate notices a crate dropped from the jobs that cover it
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          git archive HEAD | tar -x -C "$tmp"
+          ci="$tmp/.github/workflows/ci.yml"
+          # Named through a variable so this file does not carry the
+          # literal the step strips, which would count itself.
+          crate=viona_api
+          before="$(grep -c -- "-p $crate" "$ci")"
+          sed "s/ -p $crate//g" "$ci" > "$ci.cut"
+          mv "$ci.cut" "$ci"
+          # grep prints 0 and exits 1 when it matches nothing, and prints
+          # nothing when it cannot read the file. Only the first is
+          # expected here.
+          after="$(grep -c -- "-p $crate" "$ci" || true)"
+          [ -n "$after" ] || { echo "cannot read the workflow copy" >&2; exit 1; }
+          # A defect that did not land would make the check below pass
+          # for the wrong reason, which is the failure this job is about.
+          if [ "$before" -lt 2 ] || [ "$after" -ne 0 ]; then
+            echo "the defect did not land: $before job lists named $crate, $after still do" >&2
+            exit 1
+          fi
+          if (cd "$tmp" && tools/check-ci-crates.sh); then
+            echo "the gate reported full coverage with $crate dropped from every job" >&2
+            exit 1
+          fi
 
   test-parity:
     name: illumos and CI compile the same tests
