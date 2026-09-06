@@ -25,8 +25,7 @@ use vmm_devices::pci::LintrCfg;
 use super::bits;
 use super::block::{VirtioBlock, VirtioBlockOpts};
 use super::console::{
-    VirtioConsole, CONSOLE_MSIX_VECTORS, CONSOLE_NUM_QUEUES,
-    CONSOLE_QUEUE_SIZE, CONSOLE_RX_QUEUE,
+    VirtioConsole, CONSOLE_MSIX_VECTORS, CONSOLE_NUM_QUEUES, CONSOLE_QUEUE_SIZE,
 };
 use super::fs::{
     VirtioFs, VirtioFsOpts, FS_CONFIG_SIZE, FS_MSIX_VECTORS, FS_NUM_QUEUES,
@@ -37,7 +36,6 @@ use super::viona;
 use super::viona::VirtioViona;
 use super::vsock::device::{
     VirtioVsock, VSOCK_MSIX_VECTORS, VSOCK_NUM_QUEUES, VSOCK_QUEUE_SIZE,
-    VSOCK_RX_QUEUE,
 };
 
 /// Machine-owned handles every virtio device needs. Field types match
@@ -149,13 +147,8 @@ pub fn virtio_blk(
 
     // Workers raise through the transport so the interrupt takes the
     // MSI-X vector when the guest enabled it, and INTx otherwise.
-    let pci_weak = Arc::downgrade(&pci_dev);
     *blk_intr.lock().expect("virtio-blk interrupt lock") =
-        Some(Arc::new(move || {
-            if let Some(dev) = pci_weak.upgrade() {
-                dev.raise_queue_interrupt_for(0);
-            }
-        }));
+        Some(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }
@@ -226,7 +219,7 @@ pub fn virtio_viona(
                 .and_then(|g| g.clone())
                 .and_then(|w| w.upgrade())
             {
-                d.raise_queue_interrupt_for(queue_idx);
+                d.raise_queue_interrupt_current(queue_idx);
             }
         });
 
@@ -292,13 +285,8 @@ pub fn virtio_console(
 
     // Only the receive queue completes out of band; the transport
     // raises for the transmit queue on its own.
-    let pci_weak = Arc::downgrade(&pci_dev);
     *con_intr.lock().expect("virtio-console interrupt lock") =
-        Some(Arc::new(move || {
-            if let Some(dev) = pci_weak.upgrade() {
-                dev.raise_queue_interrupt_for(CONSOLE_RX_QUEUE);
-            }
-        }));
+        Some(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }
@@ -337,15 +325,10 @@ pub fn virtio_fs(
         Some(msix),
     );
 
-    // Both queues complete out of band, so the callback carries the
-    // queue index and each queue raises its own MSI-X vector.
-    let pci_weak = Arc::downgrade(&pci_dev);
+    // Both queues complete out of band, so the raise carries the queue
+    // index and each queue raises its own MSI-X vector.
     *fs_intr.lock().expect("virtio-fs interrupt lock") =
-        Some(Arc::new(move |queue_idx: u16| {
-            if let Some(dev) = pci_weak.upgrade() {
-                dev.raise_queue_interrupt_for(queue_idx);
-            }
-        }));
+        Some(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }
@@ -388,13 +371,8 @@ pub fn virtio_vsock(
 
     // Only the receive queue completes out of band; the transport
     // raises for the transmit queue on its own.
-    let pci_weak = Arc::downgrade(&pci_dev);
     *vsock_intr.lock().expect("virtio-vsock interrupt lock") =
-        Some(Arc::new(move || {
-            if let Some(dev) = pci_weak.upgrade() {
-                dev.raise_queue_interrupt_for(VSOCK_RX_QUEUE);
-            }
-        }));
+        Some(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }

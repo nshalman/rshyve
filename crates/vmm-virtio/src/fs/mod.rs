@@ -22,7 +22,8 @@ use self::passthrough::Passthrough;
 use self::server::FuseServer;
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::VirtioDevice;
-use crate::access::GuestAccess;
+use crate::access::{GuestAccess, Session};
+use crate::pci::intr::{next_intr_session, BackendIntr};
 use vmm_devices::lifecycle::{IndicatedState, Indicator};
 use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
 
@@ -68,11 +69,14 @@ fn run_park(slot: &ParkSlot) {
     }
 }
 
-/// Interrupt callback, wired by the binary after `VirtioPciDevice::new`.
+/// The transport interrupt path, wired by the binary after
+/// `VirtioPciDevice::new`.
 ///
-/// Takes the queue index: virtio-fs has two queues and each raises its own
-/// MSI-X vector.
-pub type QueueInterruptFn = Arc<dyn Fn(u16) + Send + Sync>;
+/// A raise names a queue index, because virtio-fs has two queues and
+/// each has its own MSI-X vector, and the session it was authorised
+/// under, because a reply is published on a worker thread that a reset
+/// can overtake.
+pub type QueueIntr = Arc<BackendIntr>;
 
 /// Parsed `-s <slot>,virtio-fs,<config>` options.
 #[derive(Debug, Clone)]
@@ -201,9 +205,9 @@ pub struct VirtioFs {
     parks: Arc<FsParks>,
     indicator: Indicator,
     log: slog::Logger,
-    /// Queue-indexed interrupt callback. Clone this Arc BEFORE moving the
+    /// The transport interrupt path. Clone this Arc BEFORE moving the
     /// device into `VirtioPciDevice::new`.
-    pub interrupt: Arc<Mutex<Option<QueueInterruptFn>>>,
+    pub interrupt: Arc<Mutex<Option<QueueIntr>>>,
 }
 
 impl VirtioFs {
@@ -278,8 +282,14 @@ impl VirtioFs {
     }
 
     /// Get or create the completion handler for one queue.
+    ///
+    /// The caller's permission stamps the handler with the right
+    /// session. Permission is refused for the whole of a reset, so a
+    /// handler built here cannot reach the slot the next driver finds
+    /// carrying the session that just ended.
     fn get_completion(
         &self,
+        access: &Session<'_>,
         queue_idx: u16,
         queue: &VirtQueue,
     ) -> Arc<VirtioCompletion> {
@@ -290,15 +300,21 @@ impl VirtioFs {
         }
 
         let intr = Arc::clone(&self.interrupt);
-        let c = VirtioCompletion::new(queue, Arc::clone(&self.physmap), {
-            move || {
-                if let Ok(guard) = intr.lock() {
-                    if let Some(ref f) = *guard {
-                        f(queue_idx);
-                    }
+        let c = VirtioCompletion::new(
+            queue,
+            Arc::clone(&self.physmap),
+            access.intr(),
+            move |session| {
+                // The slot is unlocked for the raise. Delivery is a
+                // call into the kernel, and the reset reads this
+                // slot, so a raise that held the lock would put that
+                // call in front of a vCPU.
+                let path = intr.lock().ok().and_then(|slot| slot.clone());
+                if let Some(path) = path {
+                    path.raise(session, queue_idx);
                 }
-            }
-        });
+            },
+        );
         c.set_force_interrupt(FS_FORCE_INTERRUPTS);
         if let Some(slot) = slots.get_mut(idx) {
             *slot = Some(Arc::clone(&c));
@@ -522,12 +538,11 @@ impl VirtioDevice for VirtioFs {
         let Some(tx) = self.work_tx.lock().expect("work lock").clone() else {
             return false;
         };
-        let completion = self.get_completion(queue_idx, queue);
-
         let Some(session) = self.access.enter_current() else {
             // A reset owns the ring. Its queue state goes with it.
             return false;
         };
+        let completion = self.get_completion(&session, queue_idx, queue);
         let epoch = session.epoch();
 
         // A guest can keep advancing avail_idx during the EVENT_IDX
@@ -634,7 +649,10 @@ impl VirtioDevice for VirtioFs {
         // is inside. The mark goes up before admission reopens, so no
         // request of the next session is served against them.
         self.session_retired.store(true, Ordering::Release);
-        self.access.reopen();
+        self.access.reopen(next_intr_session(
+            &self.interrupt,
+            self.access.intr_session(),
+        ));
     }
 }
 

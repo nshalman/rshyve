@@ -165,7 +165,7 @@ fn the_notify_path_hands_the_interrupt_to_the_transport() {
     {
         let raised = Arc::clone(&raised);
         *fs.interrupt.lock().expect("interrupt lock") =
-            Some(Arc::new(move |_queue: u16| {
+            Some(BackendIntr::detached(move |_session, _queue| {
                 raised.store(true, Ordering::Release)
             }));
     }
@@ -181,5 +181,49 @@ fn the_notify_path_hands_the_interrupt_to_the_transport() {
     assert!(
         !raised.load(Ordering::Acquire),
         "the notify path injected an interrupt under the transport lock"
+    );
+}
+
+// virtio-fs keeps the same two counters as virtio-blk, and the gap
+// between them is the same. The worker's epoch check is one load, and
+// a whole reset can run after it passes. What keeps a reply off the
+// next driver is the session the completion handler was built in,
+// which the transport tests in the same step that admits the delivery.
+#[test]
+fn a_completion_from_the_closed_session_raises_nothing() {
+    let (_physmap, queues, fs) = ring(8, 0);
+    let req = usize::from(FS_REQUEST_QUEUE);
+    let gate = Arc::new(IntrGate::new());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    *fs.interrupt.lock().expect("interrupt lock") =
+        Some(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
+
+    // Built the way a queue notification builds it: under permission.
+    let handler = || {
+        let session = fs.access.enter_current().expect("a session is open");
+        fs.get_completion(&session, FS_REQUEST_QUEUE, &queues[req])
+    };
+    let stale = handler();
+
+    // The whole reset, in the order the transport runs it: the session
+    // ends first, then the backend resets, then admission reopens.
+    gate.end_session();
+    VirtioDevice::reset(&fs);
+    gate.reopen();
+
+    stale.signal();
+    assert!(
+        seen.lock().expect("record lock").is_empty(),
+        "a reply of the closed session interrupted the driver that followed"
+    );
+
+    // The other half, and it is the worse failure of the two: a reply
+    // of the session running now has to get through, or the device has
+    // traded a spurious interrupt for a guest that waits for ever.
+    handler().signal();
+    assert_eq!(
+        seen.lock().expect("record lock").len(),
+        1,
+        "the driver that is running got no interrupt for its reply"
     );
 }

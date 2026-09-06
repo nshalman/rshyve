@@ -13,10 +13,27 @@ use super::worker::{
 };
 use super::*;
 use crate::access::GuestAccess;
+use crate::pci::intr::{IntrGate, IntrSession};
 
 mod barrier;
 mod bounce;
 mod reset;
+
+/// A completion handler with no transport behind it.
+///
+/// Every raise it makes goes nowhere, which is what a test that only
+/// watches the used ring wants.
+fn detached_completion(
+    queue: &VirtQueue,
+    physmap: &Arc<PhysMap>,
+) -> Arc<VirtioCompletion> {
+    VirtioCompletion::new(
+        queue,
+        Arc::clone(physmap),
+        IntrSession::INITIAL,
+        |_| {},
+    )
+}
 
 /// A worker context wired to `physmap`, with a fresh session.
 fn worker_ctx(physmap: &Arc<PhysMap>) -> WorkerCtx {
@@ -590,7 +607,7 @@ fn end_session(ctx: &WorkerCtx) -> u64 {
     let epoch = ctx.access.close();
     ctx.backend.retire(epoch);
     ctx.access.drain();
-    ctx.access.reopen();
+    ctx.access.reopen(IntrSession::INITIAL);
     epoch
 }
 

@@ -224,7 +224,7 @@ fn an_isr_read_and_a_raise_do_not_split_the_line() {
 
     let worker = {
         let dev = Arc::clone(&dev);
-        std::thread::spawn(move || dev.raise_queue_interrupt_for(0))
+        std::thread::spawn(move || dev.raise_queue_interrupt_current(0))
     };
     arrived
         .recv_timeout(WEDGED)
@@ -269,7 +269,7 @@ fn a_reset_waits_out_the_injection_it_admitted() {
 
     let worker = {
         let dev = Arc::clone(&dev);
-        std::thread::spawn(move || dev.raise_queue_interrupt_for(0))
+        std::thread::spawn(move || dev.raise_queue_interrupt_current(0))
     };
     arrived
         .recv_timeout(WEDGED)
@@ -345,7 +345,7 @@ fn a_raise_during_the_reset_is_refused() {
     entered.recv_timeout(WEDGED).expect("the backend drained");
 
     // The worker's own epoch check passed before the reset started.
-    dev.raise_queue_interrupt_for(0);
+    dev.raise_queue_interrupt_current(0);
     let reached = pin.asserts();
 
     release.send(()).expect("release the drain");
@@ -366,7 +366,7 @@ fn an_msix_driver_with_no_vector_is_not_put_on_the_pin() {
     let ((dev, _entered, _release, pin), _table, sink) = wired_msix(None);
     write_status(&dev, READY | bits::STATUS_DRIVER_OK);
 
-    dev.raise_queue_interrupt_for(0);
+    dev.raise_queue_interrupt_current(0);
     // The config route has the same rule, and a reset leaves its
     // vector at NO_VECTOR too.
     dev.signal_device_needs_reset();
@@ -391,7 +391,7 @@ fn a_reset_drops_the_messages_the_old_session_left_pending() {
 
     // The driver masks its vector, then the device raises on it.
     write_table(&dev, ENTRY_SIZE + 12, 1);
-    dev.raise_queue_interrupt_for(0);
+    dev.raise_queue_interrupt_current(0);
     assert_eq!(sink.sent(), Vec::new(), "a masked vector sent a message");
 
     release_on_drain(entered, release);
@@ -416,7 +416,7 @@ fn an_unmask_during_a_reset_delivers_nothing() {
     let ((dev, entered, release, _pin), _table, sink) = wired_msix(Some(1));
     write_status(&dev, READY | bits::STATUS_DRIVER_OK);
     write_table(&dev, ENTRY_SIZE + 12, 1);
-    dev.raise_queue_interrupt_for(0);
+    dev.raise_queue_interrupt_current(0);
 
     let resetter = {
         let dev = Arc::clone(&dev);
@@ -458,7 +458,7 @@ fn a_flood_of_raises_does_not_hold_the_resetting_vcpu() {
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
-                    dev.raise_queue_interrupt_for(0);
+                    dev.raise_queue_interrupt_current(0);
                     isr(&dev);
                 }
             })
@@ -496,7 +496,7 @@ fn a_flood_of_raises_does_not_hold_the_resetting_vcpu() {
         "a raise flood held the resetting vCPU for {waited:?}"
     );
     assert_eq!(
-        dev.intr.session(),
+        dev.intr.session().raw(),
         1,
         "the reset never ended the driver session"
     );
@@ -513,7 +513,7 @@ fn an_unmask_overtaken_by_a_whole_reset_delivers_nothing() {
     let ((dev, entered, release, _pin), _table, sink) = wired_msix(Some(1));
     write_status(&dev, READY | bits::STATUS_DRIVER_OK);
     write_table(&dev, ENTRY_SIZE + 12, 1);
-    dev.raise_queue_interrupt_for(0);
+    dev.raise_queue_interrupt_current(0);
     assert_eq!(sink.sent(), Vec::new(), "a masked vector sent a message");
 
     let (hook, arrived, go) = park();
@@ -539,4 +539,42 @@ fn an_unmask_overtaken_by_a_whole_reset_delivers_nothing() {
         Vec::new(),
         "an unmask from the old session reached the driver that followed"
     );
+}
+
+// The interleaving a device backend cannot avoid. It authorises work
+// under one driver session and raises for it on another thread. A
+// whole reset can run in between: admission shuts and reopens, so "is
+// admission open now" says yes again on the far side of one. Only the
+// session the backend held when the work was authorised tells the two
+// drivers apart.
+#[test]
+fn a_backend_raise_overtaken_by_a_whole_reset_delivers_nothing() {
+    let (dev, entered, release, pin) = wired_intx();
+    write_status(&dev, READY | bits::STATUS_DRIVER_OK);
+    let intr = dev.backend_intr();
+    // The session a completion authorised now would carry.
+    let armed = intr.session();
+
+    // The whole reset, start to finish, and the next driver up.
+    release_on_drain(entered, release);
+    write_status(&dev, 0);
+    write_status(&dev, READY | bits::STATUS_DRIVER_OK);
+
+    intr.raise(armed, 0);
+    assert_eq!(
+        pin.asserts(),
+        0,
+        "a completion from the closed session reached the driver that \
+         followed"
+    );
+    assert!(!pin.is_asserted(), "the old session put the line back up");
+    assert_eq!(isr(&dev), 0, "the old session set the ISR");
+
+    // The other half, and it is the worse failure of the two: a
+    // completion of the session running now has to get through, or the
+    // device has traded a spurious interrupt for a guest that waits
+    // for ever.
+    intr.raise(intr.session(), 0);
+    assert_eq!(pin.asserts(), 1, "the driver that is running got nothing");
+    assert_ne!(isr(&dev), 0, "the running driver's ISR was left clear");
 }

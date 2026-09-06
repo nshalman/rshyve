@@ -50,7 +50,8 @@ mod io;
 mod tests;
 mod worker;
 
-use crate::access::GuestAccess;
+use crate::access::{GuestAccess, Session};
+use crate::pci::intr::{next_intr_session, BackendIntr};
 use access::BackendBarrier;
 use io::{parse_header, write_status};
 use worker::{blk_io_worker, needs_backend, BlkIoRequest, WorkerCtx};
@@ -116,7 +117,11 @@ struct DiskLimits {
     nodelete: bool,
 }
 
-type InterruptCallback = Arc<dyn Fn() + Send + Sync>;
+/// The queue every worker completion raises on.
+///
+/// This is unchanged behaviour. With MSI-X and more than one queue it
+/// is the wrong vector, which is a defect of its own.
+const BLK_INTR_QUEUE: u16 = 0;
 
 /// VirtIO block device.
 pub struct VirtioBlock {
@@ -136,8 +141,8 @@ pub struct VirtioBlock {
     next_worker: Vec<AtomicUsize>,
     /// Guest physical memory for completion handler creation.
     physmap: Arc<PhysMap>,
-    /// Interrupt callback, set after PCI device creation.
-    pub interrupt: Arc<Mutex<Option<InterruptCallback>>>,
+    /// The transport interrupt path, set after PCI device creation.
+    pub interrupt: Arc<Mutex<Option<Arc<BackendIntr>>>>,
     /// Per-queue completion handlers, created on first notification.
     completions: Mutex<Vec<Option<Arc<VirtioCompletion>>>>,
     /// Zvol write-cache control. Declared BEFORE `file` so Drop runs
@@ -253,11 +258,14 @@ impl VirtioBlock {
 
     /// Get or create the VirtioCompletion for the given queue index.
     ///
-    /// The only guest memory this reads is the used index, and a reset
-    /// drops the slot, so a sample taken from a session that is ending
-    /// never reaches the next one.
+    /// The caller's permission covers two things. The only guest
+    /// memory read here is the used index, and the session stamped on
+    /// the handler has to be the one the ring belongs to. Permission
+    /// is refused for the whole of a reset, so neither can reach the
+    /// slot the next driver finds.
     fn get_completion(
         &self,
+        access: &Session<'_>,
         queue_idx: u16,
         queue: &VirtQueue,
     ) -> Arc<VirtioCompletion> {
@@ -270,17 +278,21 @@ impl VirtioBlock {
         }
 
         let intr = Arc::clone(&self.interrupt);
-        let interrupt_fn = move || {
-            if let Ok(guard) = intr.lock() {
-                if let Some(ref f) = *guard {
-                    f();
-                }
+        let interrupt_fn = move |session| {
+            // The slot is unlocked for the raise. Delivery is a call
+            // into the kernel, and the reset reads this slot, so a
+            // raise that held the lock would put that call in front
+            // of a vCPU.
+            let path = intr.lock().ok().and_then(|slot| slot.clone());
+            if let Some(path) = path {
+                path.raise(session, BLK_INTR_QUEUE);
             }
         };
 
         let c = VirtioCompletion::new(
             queue,
             Arc::clone(&self.physmap),
+            access.intr(),
             interrupt_fn,
         );
         // Force-interrupt the first 32 completions so the guest's
@@ -516,12 +528,11 @@ impl VirtioDevice for VirtioBlock {
             None => return false,
         };
 
-        let completion = self.get_completion(queue_idx, queue);
-
         let Some(session) = self.ctx.access.enter_current() else {
             // A reset owns the ring. Its queue state goes with it.
             return false;
         };
+        let completion = self.get_completion(&session, queue_idx, queue);
         let epoch = session.epoch();
 
         // A guest can keep advancing avail_idx during the EVENT_IDX re-check.
@@ -649,7 +660,10 @@ impl VirtioDevice for VirtioBlock {
         for slot in self.completions.lock().expect("lock").iter_mut() {
             *slot = None;
         }
-        self.ctx.access.reopen();
+        self.ctx.access.reopen(next_intr_session(
+            &self.interrupt,
+            self.ctx.access.intr_session(),
+        ));
     }
 }
 

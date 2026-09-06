@@ -56,7 +56,6 @@ use vmm_devices::pci::LintrCfg;
 
 use super::device::{
     VirtioVsock, VSOCK_MSIX_VECTORS, VSOCK_NUM_QUEUES, VSOCK_QUEUE_SIZE,
-    VSOCK_RX_QUEUE,
 };
 use crate::attach::VirtioAttachCtx;
 use crate::bits;
@@ -169,13 +168,8 @@ pub fn attach_with_control(
 
     // Only the receive queue completes out of band; the transport
     // raises for the transmit queue on its own.
-    let pci_weak = Arc::downgrade(&pci_dev);
     *vsock_intr.lock().expect("virtio-vsock interrupt lock") =
-        Some(Arc::new(move || {
-            if let Some(dev) = pci_weak.upgrade() {
-                dev.raise_queue_interrupt_for(VSOCK_RX_QUEUE);
-            }
-        }));
+        Some(pci_dev.backend_intr());
 
     Ok((pci_dev, control))
 }

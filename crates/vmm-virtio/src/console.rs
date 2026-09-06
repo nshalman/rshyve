@@ -32,6 +32,7 @@ use vmm_core::unixsock::{bind_restricted, write_all_bounded, SocketPolicy};
 
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::{queue_drain_should_stop, VirtioDevice};
+use crate::pci::intr::{next_intr_session, BackendIntr, IntrSession};
 use vmm_devices::lifecycle::{IndicatedState, Indicator};
 use vmm_devices::{Lifecycle, QuiesceGate};
 
@@ -79,9 +80,10 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// the vsock device uses, for the same reason.
 const HALT_BUDGET: Duration = Duration::from_secs(2);
 
-/// Interrupt callback, installed by the binary after the transport
-/// exists. Clone the slot before the device is moved into the transport.
-pub type ConsoleInterrupt = Arc<dyn Fn() + Send + Sync>;
+/// The transport interrupt path, installed by the binary after the
+/// transport exists. Clone the slot before the device is moved into
+/// the transport.
+pub type ConsoleInterrupt = Arc<BackendIntr>;
 
 /// State shared with the accept and reader threads.
 struct ConsoleShared {
@@ -452,6 +454,13 @@ impl VirtioConsole {
         &self.shared.socket_path
     }
 
+    /// Get or create the completion handler for the RX ring.
+    ///
+    /// The session is read and the handler is stored under one lock,
+    /// and [`VirtioDevice::reset`] drops the handler under the same
+    /// lock after the transport has ended its session. So a handler
+    /// this leaves behind names either the session that is ending, and
+    /// is then dropped, or the one that follows.
     fn ensure_rx_completion(&self, queue: &VirtQueue) -> Arc<VirtioCompletion> {
         let mut slot = self
             .shared
@@ -462,14 +471,20 @@ impl VirtioConsole {
             return Arc::clone(completion);
         }
         let intr = Arc::clone(&self.shared.interrupt);
+        let session =
+            next_intr_session(&self.shared.interrupt, IntrSession::INITIAL);
         let completion = VirtioCompletion::new(
             queue,
             Arc::clone(&self.shared.physmap),
-            move || {
-                if let Ok(guard) = intr.lock() {
-                    if let Some(ref raise) = *guard {
-                        raise();
-                    }
+            session,
+            move |session| {
+                // The slot is unlocked for the raise. Delivery is a
+                // call into the kernel, and the reset reads this
+                // slot, so a raise that held the lock would put that
+                // call in front of a vCPU.
+                let path = intr.lock().ok().and_then(|slot| slot.clone());
+                if let Some(path) = path {
+                    path.raise(session, CONSOLE_RX_QUEUE);
                 }
             },
         );

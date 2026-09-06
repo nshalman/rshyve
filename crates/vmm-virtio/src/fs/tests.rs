@@ -16,6 +16,7 @@ mod reset;
 use std::sync::Condvar;
 use std::time::Instant;
 
+use crate::pci::intr::{IntrGate, IntrSession};
 use crate::queue::VirtqDesc;
 use vmm_devices::Lifecycle;
 
@@ -40,7 +41,7 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(1);
 
 /// Hold guest access the way the worker holds it across a copy into
 /// or out of a chain.
-fn hold_guest_access(fs: &VirtioFs) -> crate::access::Session<'_> {
+fn hold_guest_access(fs: &VirtioFs) -> Session<'_> {
     fs.access.enter_current().expect("a session is open")
 }
 
@@ -825,7 +826,7 @@ fn counting_interrupt(
         let raised = Arc::clone(&raised);
         let inside = Arc::clone(&inside);
         let hold = Arc::clone(hold);
-        Arc::new(move |_queue: u16| {
+        BackendIntr::detached(move |_session, _queue| {
             raised.fetch_add(1, Ordering::AcqRel);
             inside.store(true, Ordering::Release);
             while hold.load(Ordering::Acquire) {
@@ -878,7 +879,7 @@ fn a_stale_backlog_never_queues_on_the_reset_drain() {
     // Release the drain before asserting, so a backlog that wrongly
     // queued on it runs to the end instead of wedging the teardown.
     drop(drain);
-    fs.access.reopen();
+    fs.access.reopen(IntrSession::INITIAL);
 
     assert_eq!(
         left, 0,
@@ -976,7 +977,7 @@ fn a_notification_refused_by_a_reset_touches_nothing() {
 
     let did_work = fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
 
-    fs.access.reopen();
+    fs.access.reopen(IntrSession::INITIAL);
 
     assert!(!did_work);
     assert_eq!(

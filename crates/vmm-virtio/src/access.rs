@@ -19,6 +19,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
+use crate::pci::intr::IntrSession;
+
 /// Permission to read and write the guest's rings and chains.
 pub(crate) struct GuestAccess {
     /// Admission. Cleared before the drain, because a section refused
@@ -30,6 +32,19 @@ pub(crate) struct GuestAccess {
     /// One driver session. A request built against an older session
     /// names a ring the driver has since freed.
     epoch: AtomicU64,
+    /// The transport session the current epoch runs under, as a raw
+    /// [`IntrSession`].
+    ///
+    /// The device epoch and the transport session are separate
+    /// counters, and a completion has to name the transport one to be
+    /// admitted. Pairing them here is what makes the name it carries
+    /// the session its work was authorised under, rather than
+    /// whichever session is running when it arrives.
+    ///
+    /// Only [`GuestAccess::reopen`] writes it, and only after
+    /// [`GuestAccess::drain`], so no reader can be inside while the
+    /// pair changes.
+    intr: AtomicU64,
     lock: RwLock<()>,
 }
 
@@ -41,12 +56,22 @@ pub(crate) struct GuestAccess {
 pub(crate) struct Session<'a> {
     _guard: RwLockReadGuard<'a, ()>,
     epoch: u64,
+    intr: IntrSession,
 }
 
 impl Session<'_> {
     /// The driver session this permission is good for.
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// The transport session this permission is good for.
+    ///
+    /// Work authorised here carries this value and hands it back at
+    /// completion, so a reset in between refuses the interrupt instead
+    /// of writing it onto the driver that followed.
+    pub(crate) fn intr(&self) -> IntrSession {
+        self.intr
     }
 }
 
@@ -55,6 +80,7 @@ impl GuestAccess {
         Self {
             open: AtomicBool::new(true),
             epoch: AtomicU64::new(0),
+            intr: AtomicU64::new(IntrSession::INITIAL.raw()),
             lock: RwLock::new(()),
         }
     }
@@ -74,6 +100,7 @@ impl GuestAccess {
         Some(Session {
             _guard: guard,
             epoch,
+            intr: self.intr_session(),
         })
     }
 
@@ -89,6 +116,7 @@ impl GuestAccess {
         Some(Session {
             _guard: guard,
             epoch: self.epoch.load(Ordering::Acquire),
+            intr: self.intr_session(),
         })
     }
 
@@ -103,8 +131,20 @@ impl GuestAccess {
         drop(self.lock.write().unwrap_or_else(PoisonError::into_inner));
     }
 
-    /// Admit the next driver.
-    pub(crate) fn reopen(&self) {
+    /// The transport session the current epoch runs under.
+    pub(crate) fn intr_session(&self) -> IntrSession {
+        IntrSession::from_raw(self.intr.load(Ordering::Acquire))
+    }
+
+    /// Admit the next driver, running under `session`.
+    ///
+    /// Call this after [`Self::drain`]. Admission is shut and no
+    /// reader is inside from there until this returns, which is what
+    /// makes the epoch and the session one pair to every reader: a
+    /// reader holds the read lock across both reads, and this store
+    /// cannot happen while it does.
+    pub(crate) fn reopen(&self, session: IntrSession) {
+        self.intr.store(session.raw(), Ordering::Release);
         self.open.store(true, Ordering::Release);
     }
 
@@ -114,16 +154,17 @@ impl GuestAccess {
     /// The check is one load, and the raise holds nothing a reset
     /// takes. Delivery is a call into the kernel, whose latency is not
     /// ours to bound, and [`Self::close`] runs on the vCPU that wrote
-    /// DEVICE_STATUS. So a reset ends the session and abandons the
+    /// DEVICE_STATUS. So a reset ends the epoch and abandons the
     /// raises already past this point rather than waiting for them.
     ///
-    /// Abandoning them is safe here because a queue interrupt carries
-    /// no state. Every byte it reports was written inside a session
-    /// that [`Self::drain`] does wait for, so a late raise only tells
-    /// a driver that is tearing the ring down to look at a ring it has
-    /// stopped reading. The one mark it can leave is the ISR bit and
-    /// the INTx level, which belong to the transport and which the
-    /// transport gates against its own reset.
+    /// This check alone does not keep a raise off the next driver. A
+    /// thread parked here while a whole reset runs finds the epoch
+    /// already tested and goes on to the transport. What stops it
+    /// there is the transport session the raise names, taken from
+    /// [`Session::intr`] before the work left its permission: the
+    /// transport tests that name in the same step that admits the
+    /// delivery, so a raise from a session a reset ended is refused.
+    /// This load only saves the call.
     pub(crate) fn deliver(&self, epoch: u64, raise: impl FnOnce()) {
         if self.epoch.load(Ordering::Acquire) != epoch {
             return;
@@ -152,7 +193,6 @@ impl GuestAccess {
         self.lock.write().unwrap_or_else(PoisonError::into_inner)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,7 +261,7 @@ mod tests {
         let stale = access.enter_current().expect("a session is open").epoch();
         let fresh = access.close();
         access.drain();
-        access.reopen();
+        access.reopen(IntrSession::INITIAL);
 
         let fired = AtomicBool::new(false);
         access.deliver(stale, || fired.store(true, Ordering::Release));

@@ -69,7 +69,7 @@ fn request(
         sector,
         chain,
         head: 0,
-        completion: VirtioCompletion::new(&queue, Arc::clone(physmap), || {}),
+        completion: detached_completion(&queue, physmap),
         epoch: ctx
             .access
             .enter_current()
@@ -290,7 +290,7 @@ fn a_request_past_the_buffer_moves_every_byte() {
         sector: 0,
         chain: read_chain,
         head: 7,
-        completion: VirtioCompletion::new(&queue, Arc::clone(&physmap), || {}),
+        completion: detached_completion(&queue, &physmap),
         epoch: 0,
     };
     let mut bounce = Bounce::new();
@@ -320,7 +320,7 @@ fn a_request_past_the_buffer_moves_every_byte() {
         sector: 0,
         chain: write_chain,
         head: 8,
-        completion: VirtioCompletion::new(&queue, Arc::clone(&physmap), || {}),
+        completion: detached_completion(&queue, &physmap),
         epoch: 0,
     };
     assert_eq!(

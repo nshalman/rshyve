@@ -5,6 +5,7 @@
 //! Unit tests for the virtio-vsock device.
 
 use super::*;
+use crate::pci::intr::IntrGate;
 use std::sync::atomic::AtomicUsize;
 
 #[test]
@@ -650,6 +651,47 @@ fn payload_with_no_host_socket_tells_the_guest() {
         .pop_rx()
         .expect("the guest was told nothing about the lost payload");
     assert_eq!(packet.hdr.op, OP_SHUTDOWN);
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// The RX handler and the transport session are two pieces of state a
+// reset changes one after the other, and a socket thread can be
+// between them. A packet delivered on the handler the reset dropped
+// must not interrupt the driver that followed.
+#[test]
+fn an_rx_completion_from_the_closed_session_raises_nothing() {
+    let (physmap, queues) = rx_ring();
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+    let gate = Arc::new(IntrGate::new());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    *vsock.shared.interrupt.lock().expect("interrupt lock") =
+        Some(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
+
+    let stale = vsock.ensure_rx_completion(&queues[0]);
+
+    // The whole reset, in the order the transport runs it: the session
+    // ends first, then the backend resets, then admission reopens.
+    gate.end_session();
+    VirtioDevice::reset(&vsock);
+    gate.reopen();
+
+    stale.signal();
+    assert!(
+        seen.lock().expect("record lock").is_empty(),
+        "a packet of the closed session interrupted the driver that followed"
+    );
+
+    // The other half, and it is the worse failure of the two: a packet
+    // of the session running now has to get through, or the device has
+    // traded a spurious interrupt for a guest that waits for ever.
+    vsock.ensure_rx_completion(&queues[0]).signal();
+    assert_eq!(
+        seen.lock().expect("record lock").len(),
+        1,
+        "the driver that is running got no interrupt for its packet"
+    );
 
     vsock.halt();
     let _ = std::fs::remove_dir_all(&dir);

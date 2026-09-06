@@ -37,6 +37,7 @@ use super::control::{
 };
 use super::mux::{GuestAction, RxPacket, VsockMux, MAX_CONNS};
 use super::packet::{ConnKey, VsockHdr, CID_GUEST_MIN, HDR_SIZE};
+use crate::pci::intr::{next_intr_session, BackendIntr, IntrSession};
 use crate::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use crate::{queue_drain_should_stop, VirtioDevice};
 use vmm_devices::lifecycle::{IndicatedState, Indicator};
@@ -82,7 +83,7 @@ const HOST_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 /// cannot spin the accept thread at full speed.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
-type InterruptFn = Arc<dyn Fn() + Send + Sync>;
+type InterruptFn = Arc<BackendIntr>;
 
 struct VsockShared {
     mux: VsockMux,
@@ -635,6 +636,13 @@ impl VirtioVsock {
         &self.shared.socket_path
     }
 
+    /// Get or create the completion handler for the RX ring.
+    ///
+    /// The session is read and the handler is stored under one lock,
+    /// and [`VirtioDevice::reset`] drops the handler under the same
+    /// lock after the transport has ended its session. So a handler
+    /// this leaves behind names either the session that is ending, and
+    /// is then dropped, or the one that follows.
     fn ensure_rx_completion(&self, queue: &VirtQueue) -> Arc<VirtioCompletion> {
         let mut slot = self
             .shared
@@ -645,14 +653,20 @@ impl VirtioVsock {
             return Arc::clone(completion);
         }
         let intr = Arc::clone(&self.shared.interrupt);
+        let session =
+            next_intr_session(&self.shared.interrupt, IntrSession::INITIAL);
         let completion = VirtioCompletion::new(
             queue,
             Arc::clone(&self.shared.physmap),
-            move || {
-                if let Ok(guard) = intr.lock() {
-                    if let Some(ref raise) = *guard {
-                        raise();
-                    }
+            session,
+            move |session| {
+                // The slot is unlocked for the raise. Delivery is a
+                // call into the kernel, and the reset reads this
+                // slot, so a raise that held the lock would put that
+                // call in front of a vCPU.
+                let path = intr.lock().ok().and_then(|slot| slot.clone());
+                if let Some(path) = path {
+                    path.raise(session, VSOCK_RX_QUEUE);
                 }
             },
         );

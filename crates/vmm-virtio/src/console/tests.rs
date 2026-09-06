@@ -228,7 +228,7 @@ fn host_bytes_reach_guest_memory() {
     let raised = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&raised);
     *console.interrupt().lock().expect("interrupt lock") =
-        Some(Arc::new(move || {
+        Some(BackendIntr::detached(move |_session, _queue| {
             counter.fetch_add(1, Ordering::Release);
         }));
 

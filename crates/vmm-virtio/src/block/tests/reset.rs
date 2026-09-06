@@ -51,7 +51,7 @@ fn park_in_the_interrupt(
     let hook_raised = Arc::clone(&raised);
     let hook_release = Arc::clone(&release);
     *blk.interrupt.lock().expect("interrupt lock") =
-        Some(Arc::new(move || {
+        Some(BackendIntr::detached(move |_, _| {
             hook_raised.store(true, Ordering::Release);
             while !hook_release.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(1));
@@ -100,7 +100,7 @@ fn admission_closes_before_the_drain() {
 
     drop(live);
     access.drain();
-    access.reopen();
+    access.reopen(IntrSession::INITIAL);
     assert!(
         access.enter_current().is_some(),
         "the next driver is shut out"
@@ -353,7 +353,9 @@ fn the_notify_path_hands_the_interrupt_to_the_transport() {
     {
         let raised = Arc::clone(&raised);
         *blk.interrupt.lock().expect("interrupt lock") =
-            Some(Arc::new(move || raised.store(true, Ordering::Release)));
+            Some(BackendIntr::detached(move |_, _| {
+                raised.store(true, Ordering::Release)
+            }));
     }
 
     let asked = blk.notify_queue(0, &mut queues, &physmap);
@@ -383,7 +385,9 @@ fn an_old_session_interrupt_is_dropped_after_the_reset_returns() {
     {
         let raised = Arc::clone(&raised);
         *h.block.interrupt.lock().expect("interrupt lock") =
-            Some(Arc::new(move || raised.store(true, Ordering::Release)));
+            Some(BackendIntr::detached(move |_, _| {
+                raised.store(true, Ordering::Release)
+            }));
     }
 
     // Hold the worker between the publication and the raise. That is
@@ -435,7 +439,7 @@ fn a_worker_drops_requests_from_a_closed_session() {
         Arc::new(PhysMap::new_anon(0x1000, 0x2000).expect("queue memory"));
     let mut queue = VirtQueue::new(8);
     queue.set_addr_modern(0x1000, 0x1100, 0x1200);
-    let completion = VirtioCompletion::new(&queue, Arc::clone(&physmap), || {});
+    let completion = detached_completion(&queue, &physmap);
     let ctx = worker_ctx(&physmap);
 
     // The requests are built for the session the reset then ends.
@@ -528,8 +532,7 @@ fn a_worker_batch_does_not_span_a_reset() {
     let ring = |desc, avail, used| {
         let mut queue = VirtQueue::new(8);
         queue.set_addr_modern(desc, avail, used);
-        let completion =
-            VirtioCompletion::new(&queue, Arc::clone(&physmap), || {});
+        let completion = detached_completion(&queue, &physmap);
         (queue, completion)
     };
     let (stale_queue, stale) = ring(0x1000, 0x1100, 0x1200);
@@ -640,12 +643,17 @@ fn an_interrupt_is_raised_outside_the_guest_access_section() {
     let completion = {
         let raising = Arc::clone(&raising);
         let release = Arc::clone(&release);
-        VirtioCompletion::new(&queue, Arc::clone(&physmap), move || {
-            raising.store(true, Ordering::Release);
-            while !release.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_millis(1));
-            }
-        })
+        VirtioCompletion::new(
+            &queue,
+            Arc::clone(&physmap),
+            IntrSession::INITIAL,
+            move |_| {
+                raising.store(true, Ordering::Release);
+                while !release.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            },
+        )
     };
 
     let ctx = worker_ctx(&physmap);
@@ -722,7 +730,7 @@ fn an_interrupt_from_a_closed_session_is_dropped() {
     let stale = access.enter_current().expect("a session is open").epoch();
     let fresh = access.close();
     access.drain();
-    access.reopen();
+    access.reopen(IntrSession::INITIAL);
 
     let fired = AtomicBool::new(false);
     access.deliver(stale, || fired.store(true, Ordering::Release));
@@ -821,4 +829,56 @@ fn park_workers(blk: &VirtioBlock) {
     wait_for("workers did not park within the budget", || {
         blk.is_quiesced()
     });
+}
+
+/// Build a completion handler the way a queue notification does, under
+/// permission taken from `blk`.
+fn completion_for(
+    blk: &VirtioBlock,
+    queue: &VirtQueue,
+) -> Arc<VirtioCompletion> {
+    let session = blk.ctx.access.enter_current().expect("a session is open");
+    blk.get_completion(&session, 0, queue)
+}
+
+// The device epoch and the transport session are separate counters,
+// and the gap between them is the whole bug. A worker's epoch check is
+// one load; a whole reset can run after it passes, and "is admission
+// open now" then says yes again. What tells the two drivers apart is
+// the session the completion handler was built in, which the transport
+// tests in the same step that admits the delivery.
+#[test]
+fn a_completion_from_the_closed_session_raises_nothing() {
+    let (_physmap, queue, blk) = make_get_id_queue(8, 0);
+    let gate = Arc::new(IntrGate::new());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    *blk.interrupt.lock().expect("interrupt lock") =
+        Some(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
+
+    let stale = completion_for(&blk, &queue);
+
+    // The whole reset, in the order the transport runs it: the session
+    // ends first, then the backend resets, then admission reopens.
+    gate.end_session();
+    VirtioDevice::reset(&blk);
+    gate.reopen();
+
+    stale.signal();
+    assert!(
+        seen.lock().expect("record lock").is_empty(),
+        "a completion of the closed session interrupted the driver that \
+         followed"
+    );
+
+    // The other half, and it is the worse failure of the two: a
+    // completion of the session running now has to get through, or the
+    // device has traded a spurious interrupt for a guest that waits
+    // for ever.
+    let fresh = completion_for(&blk, &queue);
+    fresh.signal();
+    assert_eq!(
+        seen.lock().expect("record lock").len(),
+        1,
+        "the driver that is running got no interrupt for its completion"
+    );
 }

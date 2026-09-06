@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use vmm_core::mem::PhysMap;
 
 use super::{bits, vring_need_event, VirtQueue};
+use crate::pci::intr::IntrSession;
 
 /// Thread-safe completion handler for async virtio I/O.
 ///
@@ -41,7 +42,15 @@ pub struct VirtioCompletion {
     queue_size: u16,
     write_idx: Mutex<u16>,
     physmap: Arc<PhysMap>,
-    interrupt: Box<dyn Fn() + Send + Sync>,
+    /// The transport session this handler was built in.
+    ///
+    /// A device drops its handlers in its reset and builds the next
+    /// one inside the session that follows, so the value here is the
+    /// session every used entry this handler publishes belongs to.
+    /// [`Self::signal`] hands it to the transport, which refuses a
+    /// raise for a session it has ended.
+    session: IntrSession,
+    interrupt: Box<dyn Fn(IntrSession) + Send + Sync>,
     /// Whether VIRTIO_F_RING_EVENT_IDX is negotiated.
     event_idx: bool,
     /// Force-interrupt counter: always fire interrupt for the first
@@ -59,7 +68,8 @@ impl VirtioCompletion {
     pub fn new(
         queue: &VirtQueue,
         physmap: Arc<PhysMap>,
-        interrupt: impl Fn() + Send + Sync + 'static,
+        session: IntrSession,
+        interrupt: impl Fn(IntrSession) + Send + Sync + 'static,
     ) -> Arc<Self> {
         let (used_addr, queue_size) = queue.used_ring_info();
         let avail_addr = queue.avail_addr();
@@ -76,6 +86,7 @@ impl VirtioCompletion {
             queue_size,
             write_idx: Mutex::new(initial_idx),
             physmap,
+            session,
             interrupt: Box::new(interrupt),
             event_idx,
             force_intr_count: AtomicU32::new(0),
@@ -129,11 +140,13 @@ impl VirtioCompletion {
     /// Kept apart from publishing so a device can deliver outside the
     /// permission that wrote the ring. Delivery can block, and VirtIO
     /// 1.3 sec 2.4.1 forbids queue interaction once a reset is
-    /// complete, so such a device must also check its own session
-    /// here.
+    /// complete. The raise therefore names the session this handler
+    /// belongs to rather than the one running now: a thread parked
+    /// here across a whole reset is refused by the transport instead
+    /// of interrupting the driver that followed.
     #[inline]
     pub fn signal(&self) {
-        (self.interrupt)();
+        (self.interrupt)(self.session);
     }
 
     /// Force the next N completions to always fire an interrupt,
@@ -249,7 +262,12 @@ mod tests {
             .expect("mapped used_event")
             .write::<u16>(&60_000)
             .expect("write used_event");
-        VirtioCompletion::new(&queue, Arc::clone(physmap), || {})
+        VirtioCompletion::new(
+            &queue,
+            Arc::clone(physmap),
+            IntrSession::INITIAL,
+            |_| {},
+        )
     }
 
     // Threads can read the same forced count and each subtract it. A
