@@ -57,6 +57,15 @@ fn main() {
          git submodule update --init third_party/libtpms",
         src.display()
     );
+    // Said here because the failure otherwise arrives from automake as
+    // "'pkgconfig_DATA' is used but 'pkgconfigdir' is undefined", which
+    // names neither pkg-config nor OpenSSL.
+    assert!(
+        !pkg_config(&["--version"]).is_empty(),
+        "pkg-config is missing. libtpms needs it twice: autoreconf \
+         reads its pkg.m4 for the PKG_INSTALLDIR macro, and this build \
+         script asks it where OpenSSL is. See docs/testing.md."
+    );
     let patches = workspace_root
         .join("third_party")
         .join("libtpms-illumos")
