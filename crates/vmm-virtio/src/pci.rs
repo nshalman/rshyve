@@ -1360,25 +1360,15 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
 
     /// Route a queue interrupt the way the driver armed it.
     fn deliver_queue_interrupt(&self, queue_idx: u16) {
-        if let Some(ref msix) = self.msix {
-            // Read vector from lock-free atomic cache (no virtio_state lock
-            // needed — safe to call from inside notify_queue callbacks).
-            let vector = self
-                .msix_queue_vectors
-                .get(queue_idx as usize)
-                .map(|a| a.load(std::sync::atomic::Ordering::Acquire))
-                .unwrap_or(bits::VIRTIO_MSI_NO_VECTOR);
-            if msix.is_enabled() {
-                // VirtIO 1.3 sec 4.1.5.1.2: with MSI-X enabled, a
-                // queue mapped to NO_VECTOR gets no interrupt at all.
-                // Falling back to the pin would assert a line an
-                // MSI-X driver registered no handler for, and the
-                // level stays up for the life of the VM.
-                if vector != bits::VIRTIO_MSI_NO_VECTOR {
-                    msix.fire(vector);
-                }
-                return;
-            }
+        // Read vector from lock-free atomic cache (no virtio_state lock
+        // needed — safe to call from inside notify_queue callbacks).
+        let vector = self
+            .msix_queue_vectors
+            .get(queue_idx as usize)
+            .map(|a| a.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(bits::VIRTIO_MSI_NO_VECTOR);
+        if self.route_msix(vector) {
+            return;
         }
         // MSI-X absent or not enabled, so the driver is on INTx. This
         // is normal operation, not an error: a guest built without
@@ -1400,14 +1390,11 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// the level-triggered line asserted for the life of the VM, which
     /// takes down every other device sharing it.
     fn raise_config_interrupt(&self) {
-        if let Some(ref msix) = self.msix {
-            let vector = self
-                .msix_config_vector
-                .load(std::sync::atomic::Ordering::Acquire);
-            if vector != bits::VIRTIO_MSI_NO_VECTOR {
-                msix.fire(vector);
-                return;
-            }
+        let vector = self
+            .msix_config_vector
+            .load(std::sync::atomic::Ordering::Acquire);
+        if self.route_msix(vector) {
+            return;
         }
         let _line = self.intr.line();
         self.isr_status.fetch_or(
@@ -1415,6 +1402,28 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             std::sync::atomic::Ordering::Release,
         );
         self.raise_interrupt();
+    }
+
+    /// Send `vector` as a message, if the driver is on MSI-X.
+    ///
+    /// Returns whether MSI-X answered for this interrupt. It answers
+    /// even for `VIRTIO_MSI_NO_VECTOR`, where the answer is silence:
+    /// VirtIO 1.3 sec 4.1.5.1.2 says a vector set to NO_VECTOR gets no
+    /// interrupt, and an MSI-X driver registers no INTx handler, so
+    /// falling through to the pin raises a line nobody will ever lower
+    /// and wedges it for every device sharing it. A reset leaves every
+    /// vector at NO_VECTOR, which is when this matters most.
+    fn route_msix(&self, vector: u16) -> bool {
+        let Some(ref msix) = self.msix else {
+            return false;
+        };
+        if !msix.is_enabled() {
+            return false;
+        }
+        if vector != bits::VIRTIO_MSI_NO_VECTOR {
+            msix.fire(vector);
+        }
+        true
     }
 
     /// Deliver a config interrupt, unless the session that asked for

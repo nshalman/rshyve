@@ -361,6 +361,9 @@ fn an_msix_driver_with_no_vector_is_not_put_on_the_pin() {
     write_status(&dev, READY | bits::STATUS_DRIVER_OK);
 
     dev.raise_queue_interrupt_for(0);
+    // The config route has the same rule, and a reset leaves its
+    // vector at NO_VECTOR too.
+    dev.signal_device_needs_reset();
 
     assert_eq!(pin.asserts(), 0, "an MSI-X driver was put on the INTx pin");
     assert!(!pin.is_asserted(), "the line went up with no handler on it");
