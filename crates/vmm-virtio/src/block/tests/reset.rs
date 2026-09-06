@@ -287,9 +287,11 @@ fn a_guest_refilling_the_ring_does_not_hold_the_resetting_vcpu() {
             let slot = physmap
                 .lookup(AVAIL_IDX_GPA, 2)
                 .expect("mapped avail index");
+            // Far enough ahead each time that the walk never catches
+            // up, so what ends it is the cap and nothing else.
             let mut idx = RING;
             while !stop.load(Ordering::Acquire) {
-                idx = idx.wrapping_add(1);
+                idx = idx.wrapping_add(251);
                 slot.write::<u16>(&idx).expect("write avail index");
             }
         });
