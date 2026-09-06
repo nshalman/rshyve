@@ -211,6 +211,25 @@ fn send_nowait(fd: RawFd, data: &[u8]) -> io::Result<usize> {
     Ok(sent as usize)
 }
 
+/// The events `fd` reports within `timeout_ms`, for a reader.
+///
+/// A timeout or a signal reports nothing, so a loop that owns a
+/// shutdown flag re-reads that flag on every tick instead of waiting
+/// for a peer that may never come. The caller decides what an error
+/// condition means: a listener that reports one keeps reporting it,
+/// so the loop must leave rather than spin.
+pub fn poll_events(fd: RawFd, timeout_ms: i32) -> libc::c_short {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut pfd, 1, timeout_ms) } <= 0 {
+        return 0;
+    }
+    pfd.revents
+}
+
 /// Wait for `fd` to take a write, or for `budget` to pass.
 ///
 /// An error condition reports true as well, so that the write which

@@ -17,7 +17,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,7 +28,9 @@ use std::time::Duration;
 use anyhow::Context;
 use slog::{debug, warn};
 use vmm_core::mem::PhysMap;
-use vmm_core::unixsock::{bind_restricted, write_all_bounded, SocketPolicy};
+use vmm_core::unixsock::{
+    bind_restricted, poll_events, write_all_bounded, SocketPolicy,
+};
 
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::{queue_drain_should_stop, VirtioDevice};
@@ -285,20 +287,6 @@ impl ConsoleShared {
 /// A blocking `accept` can only be broken by racing a connect against
 /// the listener, and a connect that fails leaves the thread blocked
 /// forever, which would hang VM teardown.
-fn poll_events(fd: RawFd, timeout_ms: i32) -> libc::c_short {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // A timeout or EINTR reports nothing, and the caller then re-reads
-    // the shutdown flag.
-    if unsafe { libc::poll(&mut pfd, 1, timeout_ms) } <= 0 {
-        return 0;
-    }
-    pfd.revents
-}
-
 fn accept_loop(shared: Arc<ConsoleShared>, listener: UnixListener) {
     if let Err(error) = listener.set_nonblocking(true) {
         warn!(shared.log, "virtio-console listener setup failed";

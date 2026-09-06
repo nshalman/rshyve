@@ -15,14 +15,14 @@
 
 use std::io::{self, Read};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use slog::{debug, warn};
-use vmm_core::unixsock::write_all_bounded;
+use vmm_core::unixsock::{poll_events, write_all_bounded};
 
 use super::shared::{VsockShared, HOST_WRITE_TIMEOUT};
 use crate::vsock::control::{
@@ -58,20 +58,6 @@ pub(super) const CONNECT_LINE_MAX: usize = 64;
 ///
 /// The console has the same function. Both copies belong in
 /// `vmm_core::unixsock`.
-fn poll_events(fd: RawFd, timeout_ms: i32) -> libc::c_short {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // A timeout or EINTR reports nothing, and the caller then re-reads
-    // the shutdown flag.
-    if unsafe { libc::poll(&mut pfd, 1, timeout_ms) } <= 0 {
-        return 0;
-    }
-    pfd.revents
-}
-
 /// Hand back an accepted socket the readers can use, or nothing.
 ///
 /// The listener is non-blocking so the accept loop can poll. On BSD and
