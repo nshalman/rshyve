@@ -904,3 +904,48 @@ fn a_roster_returns_the_event_a_late_thread_sends() {
     drop(park);
     assert!(join_vcpus_bounded(threads.close(), Duration::from_secs(5)));
 }
+
+#[test]
+fn a_halt_the_budget_ran_out_on_is_reported_as_not_returned() {
+    // The sweep decides two things on this answer: whether to log the
+    // overrun, and whether to read the device state afterwards. That
+    // read is refused for a halt still running, because the halt still
+    // holds whatever locks it took. A timeout reported as a return
+    // sends the sweep down the path meant for a halt that finished.
+    //
+    // The refused-spawn case had this assertion and the timeout case
+    // did not, so `Timeout => true` passed the whole suite.
+    let steps = Steps::default();
+    let (release, blocked) = mpsc::channel::<()>();
+    let device: Arc<dyn vmm_devices::Lifecycle> = Arc::new(BlockingHalt {
+        steps: Arc::clone(&steps),
+        release: Mutex::new(blocked),
+        budget: Duration::ZERO,
+    });
+
+    // On its own thread, so a bound that stopped working fails this
+    // test instead of parking the run.
+    let (done_tx, done_rx) = mpsc::channel();
+    let caller = thread::spawn(move || {
+        let returned = halt_bounded_with(
+            &spawn_halt,
+            &device,
+            Duration::from_millis(100),
+            Duration::ZERO,
+            &null_log(),
+        );
+        // A closed channel means the test already gave up.
+        let _test_gave_up = done_tx.send(returned);
+    });
+
+    let returned = done_rx.recv_timeout(Duration::from_secs(3));
+    drop(release);
+    caller.join().expect("the caller thread should not panic");
+
+    assert_eq!(
+        returned,
+        Ok(false),
+        "a halt the budget ran out on was reported as returned",
+    );
+    assert_eq!(steps_of(&steps), vec!["blocked-halt"]);
+}
