@@ -25,7 +25,32 @@ use super::halt::{halt_link, stop_poller, Poller};
 use super::VirtioViona;
 
 mod device;
+mod errors;
 mod intr;
+
+/// One kind of call the device makes into the kernel.
+///
+/// A test names the calls whose kernel refuses them. Per call, because
+/// one refused call says nothing about the branch that follows
+/// another: of the thirteen error branches in this module, only the
+/// delete had a test before this existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    RingInit,
+    RingKick,
+    RingReset,
+    RingPause,
+    RingSetState,
+    RingGetState,
+    RingSetMsi,
+    SetFeatures,
+    IntrStatus,
+    RingIntrClr,
+    SetNotifyIop,
+    SetNotifyMmio,
+    SetPromisc,
+    Delete,
+}
 
 /// One call the device made into the kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,8 +128,8 @@ const WEDGED: Duration = Duration::from_secs(15);
 /// included. Each test switches on only what it reads.
 struct TestLink {
     steps: Steps,
-    /// What `delete` answers.
-    delete_result: fn() -> std::io::Result<()>,
+    /// The calls whose kernel refuses them.
+    failing: Vec<Op>,
     /// Holds `delete` until the test releases it.
     delete_hold: Mutex<Option<Hold>>,
     /// The device to check for a held lock, once it exists.
@@ -121,7 +146,7 @@ impl TestLink {
     fn new(steps: &Steps) -> Self {
         Self {
             steps: Arc::clone(steps),
-            delete_result: || Ok(()),
+            failing: Vec::new(),
             delete_hold: Mutex::new(None),
             device: OnceLock::new(),
             locked: Mutex::new(Vec::new()),
@@ -130,11 +155,27 @@ impl TestLink {
         }
     }
 
-    /// A link whose delete reports a failure.
-    fn failing(mut self) -> Self {
-        self.delete_result =
-            || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    /// A link whose kernel refuses `ops` and answers the rest.
+    fn failing(mut self, ops: &[Op]) -> Self {
+        self.failing = ops.to_vec();
         self
+    }
+
+    /// Record one call, then answer it the way the test asked.
+    ///
+    /// The step is recorded either way: a refused call is one the
+    /// device still made, and the test reads both.
+    fn answer(&self, op: Op, step: Step) -> std::io::Result<()> {
+        self.push(step);
+        self.result(op)
+    }
+
+    /// What one call answers.
+    fn result(&self, op: Op) -> std::io::Result<()> {
+        if self.failing.contains(&op) {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        }
+        Ok(())
     }
 
     /// A link whose delete waits for `hold`.
@@ -197,37 +238,36 @@ impl LinkOps for TestLink {
         avail: u64,
         used: u64,
     ) -> std::io::Result<()> {
-        self.push(Step::RingInit {
-            ring,
-            size,
-            desc,
-            avail,
-            used,
-        });
-        Ok(())
+        self.answer(
+            Op::RingInit,
+            Step::RingInit {
+                ring,
+                size,
+                desc,
+                avail,
+                used,
+            },
+        )
     }
 
     fn ring_kick(&self, ring: u16) -> std::io::Result<()> {
-        self.push(Step::RingKick(ring));
-        Ok(())
+        self.answer(Op::RingKick, Step::RingKick(ring))
     }
 
     fn ring_reset(&self, ring: u16) -> std::io::Result<()> {
-        self.push(Step::RingReset(ring));
-        Ok(())
+        self.answer(Op::RingReset, Step::RingReset(ring))
     }
 
     fn ring_pause(&self, ring: u16) -> std::io::Result<()> {
-        self.push(Step::RingPause(ring));
-        Ok(())
+        self.answer(Op::RingPause, Step::RingPause(ring))
     }
 
     fn ring_set_state(&self, state: &vioc_ring_state) -> std::io::Result<()> {
-        self.push(Step::RingSetState(*state));
-        Ok(())
+        self.answer(Op::RingSetState, Step::RingSetState(*state))
     }
 
     fn ring_get_state(&self, ring: u16) -> std::io::Result<vioc_ring_state> {
+        self.result(Op::RingGetState)?;
         // The indices a migration source reads out. Distinct, and
         // neither is the ring, so a caller that returns the wrong
         // field or swaps the pair is visible.
@@ -245,24 +285,23 @@ impl LinkOps for TestLink {
         addr: u64,
         msg: u64,
     ) -> std::io::Result<()> {
-        self.push(Step::RingSetMsi { ring, addr, msg });
-        Ok(())
+        self.answer(Op::RingSetMsi, Step::RingSetMsi { ring, addr, msg })
     }
 
     fn set_features(&self, features: u64) -> std::io::Result<()> {
-        self.push(Step::SetFeatures(features));
-        Ok(())
+        self.answer(Op::SetFeatures, Step::SetFeatures(features))
     }
 
     fn intr_status(&self) -> std::io::Result<IntrStatus> {
         self.maybe_park(ParkAt::Poll);
+        self.result(Op::IntrStatus)?;
         Ok(self.status)
     }
 
     fn ring_intr_clr(&self, ring: u16) -> std::io::Result<()> {
-        self.push(Step::RingIntrClr(ring));
+        let refused = self.answer(Op::RingIntrClr, Step::RingIntrClr(ring));
         self.maybe_park(ParkAt::Clear);
-        Ok(())
+        refused
     }
 
     fn wait_intr(&self, stop: &PipeReader) -> std::io::Result<IntrWait> {
@@ -277,18 +316,15 @@ impl LinkOps for TestLink {
     }
 
     fn set_notify_iop(&self, port: u16) -> std::io::Result<()> {
-        self.push(Step::SetNotifyIop(port));
-        Ok(())
+        self.answer(Op::SetNotifyIop, Step::SetNotifyIop(port))
     }
 
     fn set_notify_mmio(&self, addr: u64, size: u32) -> std::io::Result<()> {
-        self.push(Step::SetNotifyMmio { addr, size });
-        Ok(())
+        self.answer(Op::SetNotifyMmio, Step::SetNotifyMmio { addr, size })
     }
 
     fn set_promisc(&self, mode: PromiscMode) -> std::io::Result<()> {
-        self.push(Step::SetPromisc(mode));
-        Ok(())
+        self.answer(Op::SetPromisc, Step::SetPromisc(mode))
     }
 
     fn delete(&self) -> std::io::Result<()> {
@@ -301,7 +337,7 @@ impl LinkOps for TestLink {
                 .recv_timeout(WEDGED)
                 .expect("the test released the delete");
         }
-        (self.delete_result)()
+        self.result(Op::Delete)
     }
 }
 
@@ -344,7 +380,7 @@ fn a_failed_delete_does_not_stop_the_halt() {
     // Teardown has to reach VM_DESTROY_SELF whatever the link
     // does, so the failure is reported and nothing is unwound.
     let steps = Steps::default();
-    let link = TestLink::new(&steps).failing();
+    let link = TestLink::new(&steps).failing(&[Op::Delete]);
 
     halt_link(&link, &null_log());
 

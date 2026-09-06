@@ -59,6 +59,13 @@ impl VirtioViona {
     /// does not leave to userspace for it.
     pub fn set_notify_addrs(&self, pio_port: u16, mmio_addr: u64) {
         let inner = self.inner.lock().expect("viona lock");
+        // A migration restore can land after the halt. The link is
+        // gone, and the halt holds no device lock while it destroys
+        // it, so an ioctl issued here could wait out an untimed
+        // kernel call with the lock held.
+        if inner.halted {
+            return;
+        }
         if pio_port != 0 {
             if let Err(e) = inner.link_ref().set_notify_iop(pio_port) {
                 slog::warn!(inner.log(), "viona set notify port failed";
@@ -85,11 +92,18 @@ impl VirtioViona {
         } else {
             PromiscMode::None
         };
-        self.inner
-            .lock()
-            .expect("viona lock")
-            .link_ref()
-            .set_promisc(mode)
+        let inner = self.inner.lock().expect("viona lock");
+        // The same guard the other link calls carry. This one reports
+        // to its caller, so the refusal is an error and not silence:
+        // a guest that was promised every frame must not be told it
+        // has them.
+        if inner.halted {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "the viona link is destroyed",
+            ));
+        }
+        inner.link_ref().set_promisc(mode)
     }
 }
 

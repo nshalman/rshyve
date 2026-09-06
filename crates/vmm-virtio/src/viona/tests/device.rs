@@ -15,7 +15,7 @@ use std::time::Duration;
 use vmm_core::mem::PhysMap;
 use vmm_devices::Lifecycle;
 
-use super::{null_log, steps_of, Hold, Step, Steps, TestLink};
+use super::{null_log, steps_of, Hold, Op, Step, Steps, TestLink};
 use crate::queue::VirtQueue;
 use crate::viona::halt::Poller;
 use crate::viona::{
@@ -56,7 +56,7 @@ pub(super) fn device_with(link: Arc<dyn LinkOps>) -> VirtioViona {
 }
 
 /// A device the guest has finished programming.
-fn running_device(link: Arc<dyn LinkOps>) -> VirtioViona {
+pub(super) fn running_device(link: Arc<dyn LinkOps>) -> VirtioViona {
     let device = device_with(link);
     {
         let mut inner = device.inner.lock().expect("viona lock");
@@ -67,7 +67,7 @@ fn running_device(link: Arc<dyn LinkOps>) -> VirtioViona {
 }
 
 /// A queue the guest has given addresses to.
-fn addressed_queue() -> VirtQueue {
+pub(super) fn addressed_queue() -> VirtQueue {
     let mut queue = VirtQueue::new(NET_QUEUE_SIZE);
     queue.set_addr_modern(0x1_0000, 0x2_0000, 0x3_0000);
     queue
@@ -377,7 +377,8 @@ fn a_failed_delete_still_leaves_the_device_halted() {
     // Teardown carries on to the destroy, so a failure must not
     // leave the device asking to be halted again.
     let steps = Steps::default();
-    let device = device_with(Arc::new(TestLink::new(&steps).failing()));
+    let link = TestLink::new(&steps).failing(&[Op::Delete]);
+    let device = device_with(Arc::new(link));
 
     device.halt();
     device.halt();
@@ -640,6 +641,105 @@ fn an_export_pauses_every_ring_before_it_reads_them() {
     VirtioDevice::pause_rings_for_export(&device);
 
     assert_eq!(steps_of(&steps), [Step::RingPause(0), Step::RingPause(1)]);
+}
+
+#[test]
+fn a_restore_stops_every_ring_before_it_programs_them() {
+    // The destination pauses and resets each ring before it programs
+    // the state the source left. A worker still running would read the
+    // ring while its addresses change under it.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+
+    VirtioDevice::reset_all_rings(&device);
+
+    assert_eq!(
+        steps_of(&steps),
+        [
+            Step::RingPause(0),
+            Step::RingReset(0),
+            Step::RingPause(1),
+            Step::RingReset(1),
+        ],
+    );
+}
+
+#[test]
+fn a_halted_device_pauses_no_ring() {
+    // An export can run while the halt is inside the delete: the halt
+    // holds no device lock there. A pause that got in could wait out
+    // that untimed kernel call holding the lock every vCPU needs.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+    device.halt();
+    steps.lock().expect("steps lock").clear();
+
+    VirtioDevice::pause_rings_for_export(&device);
+
+    assert_eq!(
+        steps_of(&steps),
+        [],
+        "a halted device paused a ring in the kernel",
+    );
+}
+
+#[test]
+fn a_halted_device_resets_no_ring_for_a_restore() {
+    // Same window, from the destination side. The halt reset every
+    // ring already and destroyed the link.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+    device.halt();
+    steps.lock().expect("steps lock").clear();
+
+    VirtioDevice::reset_all_rings(&device);
+
+    assert_eq!(
+        steps_of(&steps),
+        [],
+        "a halted device reset a ring in the kernel",
+    );
+}
+
+#[test]
+fn a_halted_device_sends_no_notification_address() {
+    // The restore programs these one step before it starts the poll
+    // thread, and that start is guarded already. This is the same
+    // window: the link is gone and the ioctl would go under the
+    // device lock.
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps)));
+    device.halt();
+    steps.lock().expect("steps lock").clear();
+
+    VirtioDevice::set_notify_addrs(&device, 0x2000, 0xC000_0000);
+
+    assert_eq!(
+        steps_of(&steps),
+        [],
+        "a halted device gave the kernel a notification address",
+    );
+}
+
+#[test]
+fn a_halted_device_refuses_a_promiscuous_mode_change() {
+    // The one link call that reports to its caller. Silence here would
+    // tell a zone with allow_mac_spoofing that its guest can see every
+    // frame, on a link that no longer exists.
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps)));
+    device.halt();
+    steps.lock().expect("steps lock").clear();
+
+    device
+        .set_promisc(true)
+        .expect_err("a halted device has no link to set");
+
+    assert_eq!(
+        steps_of(&steps),
+        [],
+        "a halted device sent a promiscuous mode to the link",
+    );
 }
 
 #[test]

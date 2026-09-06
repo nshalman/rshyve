@@ -16,6 +16,13 @@ impl VirtioViona {
     /// still.
     pub(super) fn pause_rings(&self) {
         let inner = self.inner.lock().expect("viona lock");
+        // Same guard as the restore below. The halt drops the device
+        // lock and sits in an untimed kernel call, so a pause that got
+        // in could wait for that call inside the kernel while holding
+        // the lock every vCPU needs.
+        if inner.halted {
+            return;
+        }
         for ring in 0..NET_NUM_QUEUES as u16 {
             if let Err(e) = inner.link_ref().ring_pause(ring) {
                 slog::warn!(inner.log(), "viona ring pause failed";
@@ -27,6 +34,11 @@ impl VirtioViona {
     /// Reset all viona rings (pause + reset). Call before ring_set_state.
     pub fn reset_all_rings(&self) {
         let inner = self.inner.lock().expect("viona lock");
+        // The halt reset every ring already, and it holds no device
+        // lock while it destroys the link.
+        if inner.halted {
+            return;
+        }
         for ring in 0..NET_NUM_QUEUES as u16 {
             if let Err(e) = inner.link_ref().ring_pause(ring) {
                 slog::warn!(inner.log(), "viona ring pause failed";
