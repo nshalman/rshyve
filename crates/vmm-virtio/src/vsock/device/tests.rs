@@ -6,8 +6,8 @@
 
 use super::halt::{HALT_BUDGET, HALT_JOIN_ROUNDS};
 use super::listener::{
-    classify_host_line, handle_host_connect, start_host_connection, HostVerb,
-    CONNECT_LINE_MAX,
+    accepted_blocking, classify_host_line, handle_host_connect,
+    start_host_connection, HostVerb, CONNECT_LINE_MAX,
 };
 use super::shared::HOST_WRITE_TIMEOUT;
 use super::*;
@@ -16,6 +16,7 @@ use crate::vsock::control::{read_line_bounded, LineRead, HANDSHAKE_BUDGET};
 use crate::vsock::mux::MAX_CONNS;
 use crate::vsock::packet::ConnKey;
 use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -726,6 +727,87 @@ fn the_declared_halt_budget_covers_both_joins_the_halt_runs() {
         Lifecycle::halt_budget(&vsock) > HALT_BUDGET,
         "one join's budget does not cover two joins run in sequence",
     );
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -- The accept loop and the teardown it allows --
+
+/// The accept thread must end on the shutdown flag alone.
+///
+/// It used to be woken by halt connecting to the device's own socket.
+/// That connect has no bound of its own: a same-uid peer can fill the
+/// listen backlog and make it wait for as long as it likes, and the
+/// teardown sweep budget was the only cap on it. Taking the socket
+/// away first is how that is read from outside. Nothing can connect to
+/// this path any more, so a halt that still needed a connection to
+/// wake the thread pays its whole join budget and leaves it running.
+#[test]
+fn halt_ends_the_accept_thread_with_no_connection_to_the_socket() {
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    std::fs::remove_file(vsock.socket_path()).expect("remove the socket");
+
+    let started = Instant::now();
+    vsock.halt();
+    let took = started.elapsed();
+
+    // `join_bounded` returns early only when the thread has ended, so
+    // the time it took is what says whether it did.
+    assert!(
+        took < HALT_BUDGET,
+        "halt spent {took:?} of its {HALT_BUDGET:?} join budget waiting \
+         for an accept thread nothing could wake",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An accepted socket must not keep the listener's non-blocking flag.
+///
+/// The listener carries the flag so the accept loop can poll, and on
+/// BSD and illumos an accepted socket inherits it. Every reader here
+/// arms a read timeout and reads `WouldBlock` as an idle poll, so a
+/// socket that kept the flag would spin a thread at full speed instead
+/// of waiting for its peer.
+#[test]
+fn an_accepted_socket_does_not_keep_the_non_blocking_flag() {
+    let (_peer, inherited) = UnixStream::pair().expect("socketpair");
+    inherited.set_nonblocking(true).expect("arm the flag");
+
+    let served = accepted_blocking(inherited).expect("the socket is usable");
+
+    let flags = unsafe { libc::fcntl(served.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0, "F_GETFL failed");
+    assert_eq!(
+        flags & libc::O_NONBLOCK,
+        0,
+        "a reader on this socket would spin instead of waiting",
+    );
+}
+
+/// The polling accept loop still serves a client.
+///
+/// A poll that never reaches `accept`, or an accepted socket the
+/// handshake cannot read, leaves every host client unanswered with
+/// nothing else in the device failing.
+#[test]
+fn the_accept_loop_answers_a_host_connect() {
+    use std::io::{BufRead as _, Write as _};
+
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    let mut client = UnixStream::connect(vsock.socket_path()).expect("connect");
+    // Armed so a loop that never accepts fails here rather than hangs.
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("arm the read timeout");
+    client.write_all(b"CONNECT 1024\n").expect("send the verb");
+
+    let mut answer = String::new();
+    io::BufReader::new(client)
+        .read_line(&mut answer)
+        .expect("read the answer");
+    assert!(answer.starts_with("OK "), "answered {answer:?}");
+
     vsock.halt();
     let _ = std::fs::remove_dir_all(&dir);
 }

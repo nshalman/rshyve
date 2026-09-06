@@ -6,11 +6,14 @@
 //!
 //! # Invariant
 //!
-//! Halt returns inside the budget it declares. Each join is bounded by
-//! the budget, not tested before it starts, so one wedged thread cannot
-//! hold teardown open.
+//! Halt returns inside the budget it declares, and nothing in it waits
+//! on a host peer. Each join is bounded by the budget, not tested
+//! before it starts, so one wedged thread cannot hold teardown open.
+//! Every thread ends on the shutdown flag, so halt does not connect to
+//! its own socket to wake the accept thread. That connect was the last
+//! unbounded wait here: a same-uid peer that fills the listen backlog
+//! makes a connect wait for as long as it likes.
 
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -69,13 +72,10 @@ impl Lifecycle for VirtioVsock {
         self.indicator.halt();
         self.shared.shutdown.store(true, Ordering::Release);
 
-        // The accept thread is blocked in accept(). Connecting once
-        // wakes it so it sees the flag; without this the join below
-        // waits for a client that may never come.
-        let _ = UnixStream::connect(&self.shared.socket_path);
-        // Bounded for the same reason the readers are: if that connect
-        // did not land, the accept thread is still blocked in accept()
-        // and joining it has no end.
+        // The accept thread polls the flag, so it returns on its own.
+        // The bound is for the case where it cannot: this halt runs on
+        // the teardown sweep, and no device may hold that thread short
+        // of the VM destroy.
         if let Some(handle) = self.accept.lock().expect("accept lock").take() {
             if !vmm_core::thread::join_bounded(vec![handle], HALT_BUDGET) {
                 debug!(
