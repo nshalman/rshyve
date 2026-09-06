@@ -11,6 +11,7 @@
 
 use super::*;
 
+mod intr;
 mod reset;
 
 use std::sync::Condvar;
