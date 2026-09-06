@@ -300,8 +300,7 @@ fn remove_after_error(path: &Path, error: io::Error) -> io::Error {
 mod tests {
     use super::*;
     use std::io::Read;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::mpsc;
 
     /// Payload larger than any socket buffer, so the write cannot
     /// finish until the peer reads.
@@ -378,26 +377,33 @@ mod tests {
     #[test]
     fn a_peer_that_stops_reading_still_loses_the_write() {
         let (peer, device) = UnixStream::pair().expect("socketpair");
-        let taken = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&taken);
+        // The reader reports what it took over a channel, not through
+        // shared memory. A plain load races the reader thread: the
+        // write can give up on its budget before the store lands, and
+        // the check below then reads a count the peer has already
+        // taken. `recv` waits for the reader instead.
+        let (took, taken) = mpsc::channel::<usize>();
         // Dropped at the end of the test. Until then the peer stays
         // open: one that closed would end the write on a broken pipe,
         // which is not the case under test.
-        let (hold, parked) = std::sync::mpsc::channel::<()>();
+        let (hold, parked) = mpsc::channel::<()>();
         let reader = std::thread::spawn(move || {
             let mut peer = peer;
             let mut buf = [0u8; 4096];
             // Long enough for the write to fill the socket first, and
             // short enough to leave the write some budget after it.
             std::thread::sleep(BUDGET / 4);
-            counted.store(peer.read(&mut buf).unwrap_or(0), Ordering::Release);
+            let _ = took.send(peer.read(&mut buf).unwrap_or(0));
             let _ = parked.recv();
         });
 
         let error = write_within_limit(device, vec![0u8; OVERSIZED])
             .expect_err("a peer that stopped reading must not be waited on");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(taken.load(Ordering::Acquire) > 0, "the peer read nothing");
+        let read = taken
+            .recv_timeout(LIMIT)
+            .expect("the peer must report what it read");
+        assert!(read > 0, "the peer read nothing");
 
         drop(hold);
         reader.join().expect("join the reader");
