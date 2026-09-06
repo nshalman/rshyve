@@ -18,10 +18,13 @@
 | 5 warm reboots with a dirty guest page cache | Working |
 | virtio-fs and viona reset with traffic in flight | Working |
 | 30 guest ACPI S5 poweroffs, no leaked process or VM instance | Working |
+| 140 device resets on a Debian 13 guest, 4 vCPUs (100 modern, 40 legacy) | Working |
+| Multiqueue virtio-blk, 128 MiB written and verified per queue with vCPU pinning | Working |
 
-The reset, reboot and poweroff rows come from one lab session on a
-busybox initramfs guest, not a distro image. What they do and do not
-show is in [hardware-run.md](hardware-run.md).
+The reset, reboot and poweroff rows come from two lab sessions. The
+second ran a Debian 13 guest with 4 vCPUs, a real block driver stack
+and a real init. What they do and do not show is in
+[hardware-run.md](hardware-run.md).
 
 ## Devices
 
@@ -109,6 +112,7 @@ show is in [hardware-run.md](hardware-run.md).
   write lock delays it, and memory hot-add holds that lock for 233 to
   270 ms per GiB. See
   [hardware-run.md](hardware-run.md#why-a-device-reset-has-no-upper-bound)
-- Most viona device tests do not compile on illumos, so they cover the
-  macOS and Linux build only. See
+- The control socket's peer check runs on macOS and Linux only, the
+  autodestruct test runs on illumos only, and nothing compares
+  per-crate test counts across platforms. See
   [hardware-run.md](hardware-run.md#coverage-that-does-not-reach-illumos)

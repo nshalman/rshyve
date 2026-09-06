@@ -32,6 +32,8 @@ Conventions:
 | ✅ Kernel-owned MMIO instruction decoding | The illumos vmm kernel decodes MMIO instructions and delivers `VM_EXITCODE_MMIO` with the GPA and operands. `VM_EXITCODE_INST_EMUL` is a diagnostic-only fallback containing 15 raw instruction bytes and a valid-byte count, with no GPA or operands. Userspace does not decode it. |
 | ✅ Writable UEFI variable store | Commits `854efb7`, `d1ed5e5`, and `e82d6c1` add `-l bootrom,<rom>,<varfile>`, size-derived flash layout, and locked CFI-backed persistence. A pristine template and a size-valid, page-aligned erased image filled with `0xFF` are both accepted. Secure Boot enrollment still requires host validation. |
 | ✅ Per-device fw_cfg boot order | An optional `bootindex=N` token on a `-s` specification generates ordered PCI device paths and is stripped before driver parsing. Configurations without a boot index retain the legacy slot-4 payload byte for byte. Live firmware validation remains in the validation backlog. |
+| ✅ Multiqueue virtio-blk completions on the queue they came from | Every worker completion raised its interrupt on virtqueue 0, so under MSI-X the guest handler for any other queue never saw its completion and any guest with 2 or more vCPUs stalled. INTx hid it. Commit `704fb1e`. Proved on a Debian 13 guest with 4 vCPUs: all four MSI-X vectors firing, 128 MiB written and verified per queue with vCPU pinning, 140 resets with 0 mismatches. Evidence in [docs/hardware-run.md](docs/hardware-run.md#the-rerun-on-a-distro-guest). |
+| ✅ The viona test seam on illumos | `VionaInner` held two mutually exclusive fields, so 26 of 29 viona tests compiled out on the one platform that runs the code. `f896980` collapses them into one `Arc<dyn LinkOps>` on every platform and `dfd478a` moves the `LinkOps` trait into `viona-api`, beside the `VionaFd` that implements it, which removes a delegation layer. Viona tests executing on illumos went from 3 to 39, with no platform gate left. |
 | ✅ PCI, CPU and memory hot-plug | `--hotplug` publishes the GPE0 block at `0xAFE0`, the PCI register file at `0xAE00`, the CPU one at `0xAF00` (only when `maxcpus` is above the boot count), the memory one at `0x0A00`, and the matching AML. Off by default, so an existing VM keeps byte-identical ACPI. rshyve serves `device-add`, `device-remove`, `device-list`, `cpu-add`, `cpu-list`, `mem-add` and `mem-list` on the control socket; firehyve serves the same set on the vsock `CONTROL` verb. `-c cpus=N,maxcpus=M` sizes the CPU slots and `-o hotplug.maxmem=` / `-o hotplug.memslot=` size the memory window, which also needs `-S`. Validation below. |
 
 ### Validated Windows Server 2025 baseline
@@ -140,8 +142,7 @@ graphical path unusable.
 | ⏳ Block I/O throttling | NVMe and virtio-blk have no per-disk IOPS or bandwidth limiter. Multitenant rate isolation remains absent. |
 | ⏳ Hugepage memory backing | Guest RAM setup has no hugepage backing option. Any illumos implementation needs measurement and an explicit fallback policy. |
 | ⏳ Watchdog device | No guest watchdog such as `i6300esb` exists. Guest stall detection and watchdog-triggered reset remain absent. |
-| ⏳ Make the viona test seam exist on illumos | `VionaInner` holds `viona_fd: Arc<viona_api::VionaFd>` on illumos and `link: Arc<dyn LinkOps>` everywhere else (`crates/vmm-virtio/src/viona.rs:113,121`), so `viona/tests.rs` gates both test modules out on the target platform: 26 of 29 viona tests at `d1ec631`, up from 22 of 25 one commit earlier. Hold the link as `Arc<dyn LinkOps>` on every platform and put the kernel handle behind it, which `VionaInner::link` already returns. Every viona test added before this widens the gap. |
-| ⏳ Guard the per-platform test-count delta | macOS ran about 12 more tests than illumos across the four crates carrying platform gates, and the delta grew from 5 to 12 across two commits with nobody noticing. Compare per-crate test counts on both platforms and fail on an unexplained change. Reasoning about the gates does not work: the delta does not reduce to the gates now in the tree. |
+| ⏳ Guard the per-platform test-count delta | macOS ran about 12 more tests than illumos across the four crates carrying platform gates, and the delta grew from 5 to 12 across two commits with nobody noticing. viona was most of that and is now fixed, but the gates in `peercred.rs` and `tests/autodestruct.rs` remain and a new one would be just as invisible. Compare per-crate test counts on both platforms and fail on an unexplained change. Reasoning about the gates does not work: the delta does not reduce to the gates now in the tree. |
 
 ## Blocked on illumos kernel work
 
@@ -302,10 +303,6 @@ These are validation gates, not new features:
   it back (`uts/common/io/virtio/virtio_legacy.c:208`,
   `virtio_modern.c:242`), which is the weakest contract any driver
   offers this VMM, and it has only been read from the source.
-- ⏳ Rerun the reset matrix on a distro guest. The 293-reset run used a
-  busybox initramfs because a multiqueue defect blocked the distro
-  image. Characterise that defect, then repeat with a real block driver
-  stack and a real init.
 - ⏳ Produce a real vmm_drv lease park. The teardown budget, its log
   records and the shutdown watchdog have never run against a lease that
   will not break. The DTrace procedure in
