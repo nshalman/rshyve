@@ -303,31 +303,33 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         })
     }
 
-    /// Assert the legacy interrupt to notify the guest.
+    /// Assert the PCI interrupt pin.
     ///
-    /// Uses edge-triggered delivery: deassert then reassert to generate
-    /// a new edge. The PciIntrPin calls `vm_isa_assert_irq(atpic, ioapic)`
-    /// which delivers through both the legacy PIC and IOAPIC paths.
+    /// PCI INTx is level-triggered: assert while work is pending, and
+    /// deassert when the guest reads the ISR. There is no deassert
+    /// here. A deassert plus an assert makes a second edge, and the
+    /// guest sees that edge with ISR=0, reports "nobody cared" and
+    /// disables the IRQ.
     ///
-    /// Assert the PCI interrupt pin (level-triggered).
-    ///
-    /// PCI INTx is level-triggered: assert when work is pending,
-    /// deassert when the guest reads ISR (clears the pending flag).
-    /// No deassert here, which prevents the spurious IRQ race where
-    /// deassert plus assert creates a second edge that the guest sees
-    /// with ISR=0, causing "nobody cared" and an IRQ disable.
-    pub fn raise_interrupt(&self) {
+    /// Private to this module. It raises the line with no session
+    /// test, so a backend that reached it would deliver into the
+    /// driver that followed a reset. Backends go through
+    /// [`BackendIntr::raise`], which names the session it was
+    /// authorised under.
+    fn raise_interrupt(&self) {
         if let Some(pin) = &self.intr_pin {
             pin.assert();
         }
     }
 
-    /// Raise a queue interrupt: set ISR status and assert the pin.
+    /// Set the queue bit in the ISR and assert the pin.
     ///
-    /// Uses AtomicU8 for ISR to avoid locking virtio_state on the
-    /// hot path. Workers and vCPU can set ISR concurrently without
-    /// Mutex contention.
-    pub fn raise_queue_interrupt(&self) {
+    /// The ISR is an AtomicU8, so a worker and a vCPU can set it at
+    /// the same time without taking the transport lock on the hot
+    /// path.
+    ///
+    /// Private for the reason [`Self::raise_interrupt`] is.
+    fn raise_queue_interrupt(&self) {
         let _line = self.intr.line();
         self.isr_status.fetch_or(
             bits::ISR_QUEUE_INTR,
