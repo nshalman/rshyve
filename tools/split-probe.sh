@@ -62,8 +62,18 @@ fi
 # A binary that still reaches a moved module through vmm_devices does
 # not fail the check above, because the probe cannot compile either
 # binary on this host.
-if grep -rnE 'vmm_devices::(virtio|nvme|ahci|fbuf|xhci|ps2|passthru)::' \
-    "$WT/bin" >"$TMP/stale" 2>/dev/null; then
+#
+# grep answers 0 for a hit, 1 for none, and more than 1 for a directory
+# it could not read. Reading that third answer as "none" would report a
+# clean split for a tree the probe never scanned.
+rc=0
+grep -rnE 'vmm_devices::(virtio|nvme|ahci|fbuf|xhci|ps2|passthru)::' \
+    "$WT/bin" >"$TMP/stale" || rc=$?
+if [ "$rc" -gt 1 ]; then
+    echo "split-probe: cannot scan $WT/bin, grep answered $rc" >&2
+    exit 2
+fi
+if [ -s "$TMP/stale" ]; then
     echo "split-probe: FAILED, a binary still reaches a moved module" >&2
     cat "$TMP/stale" >&2
     exit 1
