@@ -72,6 +72,7 @@ impl VirtioViona {
                 log: None,
                 halted: false,
             }),
+            interrupt: Arc::new(Mutex::new(None)),
         })
     }
 

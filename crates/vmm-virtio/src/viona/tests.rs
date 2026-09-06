@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use super::halt::{halt_link, stop_poller, Poller};
-use super::link::LinkOps;
+use super::link::{IntrStatus, LinkOps};
 use super::VirtioViona;
 
 /// The device tests need a `VionaInner` with no kernel handle, and the
@@ -30,6 +30,11 @@ use super::VirtioViona;
 /// and guard logic, which is the same code on both platforms.
 #[cfg(not(target_os = "illumos"))]
 mod device;
+
+/// The poll thread's delivery against the reset that ends the driver
+/// session. Needs the same handle-free shape as [`device`].
+#[cfg(not(target_os = "illumos"))]
+mod intr;
 
 /// One call the device made into the kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +137,14 @@ impl LinkOps for RecordingLink {
 
     fn set_features(&self, features: u64) -> std::io::Result<()> {
         self.push(Step::SetFeatures(features));
+        Ok(())
+    }
+
+    fn intr_status(&self) -> std::io::Result<IntrStatus> {
+        Ok(IntrStatus::default())
+    }
+
+    fn ring_intr_clr(&self, _ring: u16) -> std::io::Result<()> {
         Ok(())
     }
 

@@ -18,10 +18,10 @@ use vmm_devices::Lifecycle;
 use super::{null_log, steps_of, RecordingLink, Step, Steps};
 use crate::queue::VirtQueue;
 use crate::viona::halt::Poller;
-use crate::viona::link::LinkOps;
+use crate::viona::link::{IntrStatus, LinkOps};
 use crate::viona::{
-    QueueInterrupt, RingState, VionaInner, VirtioViona, NET_NUM_QUEUES,
-    NET_QUEUE_SIZE, VIRTIO_NET_F_MAC,
+    RingState, VionaInner, VirtioViona, NET_NUM_QUEUES, NET_QUEUE_SIZE,
+    VIRTIO_NET_F_MAC,
 };
 use crate::VirtioDevice;
 
@@ -83,6 +83,14 @@ impl LinkOps for BlockingLink {
         Ok(())
     }
 
+    fn intr_status(&self) -> std::io::Result<IntrStatus> {
+        Ok(IntrStatus::default())
+    }
+
+    fn ring_intr_clr(&self, _ring: u16) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn delete(&self) -> std::io::Result<()> {
         self.entered
             .lock()
@@ -115,9 +123,10 @@ fn test_inner_with(link: Arc<dyn LinkOps>) -> VionaInner {
 }
 
 /// A device whose calls into the kernel are watched through its link.
-fn device_with(link: Arc<dyn LinkOps>) -> VirtioViona {
+pub(super) fn device_with(link: Arc<dyn LinkOps>) -> VirtioViona {
     VirtioViona {
         inner: Mutex::new(test_inner_with(link)),
+        interrupt: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -461,8 +470,7 @@ fn a_halt_drops_a_deferred_poll() {
     // deferred poll thread then would read a destroyed link.
     let steps = Steps::default();
     let device = device_with(Arc::new(RecordingLink::new(&steps)));
-    let raise: QueueInterrupt = Arc::new(|_| {});
-    device.store_poll_fn(raise, null_log());
+    device.defer_intr_poll(null_log());
 
     device.halt();
 
@@ -482,8 +490,7 @@ fn a_halted_device_refuses_a_deferred_poll() {
     let device = device_with(Arc::new(RecordingLink::new(&steps)));
     device.halt();
 
-    let raise: QueueInterrupt = Arc::new(|_| {});
-    device.store_poll_fn(raise, null_log());
+    device.defer_intr_poll(null_log());
 
     assert!(
         device
@@ -534,4 +541,4 @@ fn a_halted_device_resets_no_ring() {
 // No test calls `start_poll_deferred` here. Off illumos its body only
 // clears the field the halt cleared already, so a test of it would
 // exercise a stub and pin nothing. The guard it holds on illumos is
-// the same one `store_poll_fn` holds, which the two tests above pin.
+// the same one `defer_intr_poll` holds, which the two tests above pin.

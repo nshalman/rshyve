@@ -8,8 +8,25 @@
 //! descriptor. One thread per device waits for that signal and raises
 //! the guest interrupt. The halt stops the thread before it destroys
 //! the link, because the thread reads the link.
+//!
+//! The wait is the only part of this that needs illumos. What one
+//! wakeup then does lives in [`deliver_pending`], which every platform
+//! builds, so the order it holds is testable off illumos.
 
-use super::{QueueInterrupt, VirtioViona};
+use std::sync::{Mutex, PoisonError};
+
+use super::link::LinkOps;
+use super::{VionaInterrupt, VirtioViona, NET_NUM_QUEUES};
+
+/// The interrupt slot the poll thread reads its path from.
+#[cfg(target_os = "illumos")]
+type IntrSlot = std::sync::Arc<Mutex<Option<VionaInterrupt>>>;
+
+// The poll thread raises one interrupt per ring, and the transport
+// holds one MSI-X vector per queue. A kernel that grew more rings than
+// this device has queues would raise on a queue with no vector, which
+// on an MSI-X guest is silence and on INTx is a line nobody lowers.
+const _: () = assert!(viona_api::VIONA_VQ_MAX as usize == NET_NUM_QUEUES);
 
 impl VirtioViona {
     /// Start the interrupt polling thread.
@@ -20,29 +37,22 @@ impl VirtioViona {
     /// have pending interrupts, clears them, and raises the per-queue
     /// interrupt so the guest processes the used ring.
     ///
-    /// The callback receives the queue index (0=rx, 1=tx) so the
-    /// PCI transport can route via the correct MSI-X vector.
+    /// The raise carries the queue index (0=rx, 1=tx) so the PCI
+    /// transport can route via the correct MSI-X vector.
     #[cfg(target_os = "illumos")]
-    pub fn start_intr_poll(
-        &self,
-        raise_intr: QueueInterrupt,
-        log: slog::Logger,
-    ) {
+    pub fn start_intr_poll(&self, log: slog::Logger) {
         let mut inner = self.inner.lock().expect("viona lock");
         inner.log = Some(log.clone());
         // A halted device has no link left to poll.
         if inner.halted {
             return;
         }
-        Self::poller_start(&mut inner, raise_intr, log);
+        let intr = std::sync::Arc::clone(&self.interrupt);
+        Self::poller_start(&mut inner, intr, log);
     }
 
     #[cfg(not(target_os = "illumos"))]
-    pub fn start_intr_poll(
-        &self,
-        _raise_intr: QueueInterrupt,
-        log: slog::Logger,
-    ) {
+    pub fn start_intr_poll(&self, log: slog::Logger) {
         self.inner.lock().expect("viona lock").log = Some(log);
     }
 
@@ -54,7 +64,7 @@ impl VirtioViona {
     #[cfg(target_os = "illumos")]
     fn poller_start(
         inner: &mut super::VionaInner,
-        raise_intr: QueueInterrupt,
+        intr: IntrSlot,
         log: slog::Logger,
     ) {
         // A second thread on the same descriptor would be left running
@@ -77,27 +87,27 @@ impl VirtioViona {
         let thread = std::thread::Builder::new()
             .name("viona-intr-poll".into())
             .spawn(move || {
-                viona_intr_poll_loop(&dev, stop, raise_intr, log);
+                viona_intr_poll_loop(&dev, stop, &intr, log);
             })
             .expect("failed to spawn viona-intr-poll thread");
         inner.poller = Some(super::halt::Poller { wake, thread });
     }
 
-    /// Store the interrupt poll parameters for deferred start.
+    /// Hold the logger for a deferred start of the poll thread.
     ///
     /// On migration destinations, the poll thread cannot start at device
     /// creation time because the rings haven't been programmed yet
     /// (and starting it would make them EBUSY). Instead, store the
-    /// raise_fn and logger here, then call `start_poll_deferred()` after
-    /// ring state is fully restored.
-    pub fn store_poll_fn(&self, raise_intr: QueueInterrupt, log: slog::Logger) {
+    /// logger here, then call `start_poll_deferred()` after ring state
+    /// is fully restored.
+    pub fn defer_intr_poll(&self, log: slog::Logger) {
         let mut inner = self.inner.lock().expect("viona lock");
         inner.log = Some(log.clone());
         // A halted device has no link left to poll.
         if inner.halted {
             return;
         }
-        inner.deferred_poll = Some((raise_intr, log));
+        inner.deferred_poll = Some(log);
     }
 
     /// Start the interrupt poll thread using previously stored parameters.
@@ -108,7 +118,7 @@ impl VirtioViona {
     /// the guest.
     #[cfg(target_os = "illumos")]
     pub fn start_poll_deferred(&self) {
-        use super::{RingState, NET_NUM_QUEUES};
+        use super::RingState;
 
         let mut inner = self.inner.lock().expect("viona lock");
         // A migration restore that lands after the halt must not start
@@ -117,9 +127,10 @@ impl VirtioViona {
             inner.deferred_poll = None;
             return;
         }
-        if let Some((raise_intr, log)) = inner.deferred_poll.take() {
+        if let Some(log) = inner.deferred_poll.take() {
             slog::info!(log, "starting deferred viona interrupt poll thread");
-            Self::poller_start(&mut inner, raise_intr, log);
+            let intr = std::sync::Arc::clone(&self.interrupt);
+            Self::poller_start(&mut inner, intr, log);
 
             // Re-kick all rings after starting the poll thread.
             // VNA_IOC_RING_SET_STATE programs indices but may not
@@ -145,13 +156,67 @@ impl VirtioViona {
     }
 }
 
+/// Deliver the interrupts one poll wakeup found pending.
+///
+/// WHY the session is read first: the clear below is what makes a
+/// notification this thread's to deliver, and a whole device reset can
+/// run between that clear and the raise. Viona's reset returns the
+/// kernel rings, it does not stop this thread, so the thread comes back
+/// into a session the next driver owns. A session sampled after the
+/// clear names that driver, and the transport would then write an
+/// interrupt for a ring it never armed: on INTx a level nobody lowers,
+/// on MSI-X a message to whichever vector it had just programmed.
+/// Sampled before, the same notification is refused, which is right.
+/// It belongs to a driver that no longer exists.
+///
+/// Only the illumos poll loop calls this. The tests build and drive it
+/// on every platform, which is where that order is pinned.
+#[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
+pub(super) fn deliver_pending(
+    link: &dyn LinkOps,
+    slot: &Mutex<Option<VionaInterrupt>>,
+    log: &slog::Logger,
+) {
+    // Cloned out, because the raise takes transport locks and the
+    // binary fills this slot once.
+    let path = slot.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let Some(intr) = path else {
+        // The transport is not wired up yet, so no driver can have
+        // armed a ring.
+        return;
+    };
+    let session = intr.session();
+
+    let status = match link.intr_status() {
+        Ok(status) => status,
+        Err(err) => {
+            slog::warn!(log, "VNA_IOC_INTR_POLL failed"; "error" => %err);
+            return;
+        }
+    };
+
+    // Fire per ring so the PCI transport routes via the correct MSI-X
+    // vector, or falls back to shared INTx.
+    for (ring, pending) in status.iter().enumerate() {
+        if *pending == 0 {
+            continue;
+        }
+        let ring = ring as u16;
+        // Until this clears, the kernel signals the same interrupt
+        // again and this loop spins.
+        if let Err(err) = link.ring_intr_clr(ring) {
+            slog::warn!(log, "viona interrupt clear failed";
+                "ring" => ring, "error" => %err);
+        }
+        intr.raise(session, ring);
+    }
+}
+
 /// Interrupt polling loop for the viona kernel driver.
 ///
 /// Uses `poll(2)` with `POLLRDBAND` to wait for the kernel to signal
-/// that completed I/O is ready. When signaled, reads the interrupt
-/// bitmap via `VNA_IOC_INTR_POLL`, clears each pending queue's
-/// interrupt state, and calls the provided callback to raise the
-/// PCI interrupt.
+/// that completed I/O is ready. Each wakeup is handed to
+/// [`deliver_pending`].
 ///
 /// `stop` is the read end of the halt's pipe. The wait has no timeout,
 /// so that descriptor is the only thing that ends this loop on demand.
@@ -159,7 +224,7 @@ impl VirtioViona {
 fn viona_intr_poll_loop(
     dev: &viona_api::VionaFd,
     stop: std::io::PipeReader,
-    raise_intr: QueueInterrupt,
+    slot: &Mutex<Option<VionaInterrupt>>,
     log: slog::Logger,
 ) {
     use std::os::fd::AsRawFd;
@@ -208,32 +273,6 @@ fn viona_intr_poll_loop(
             continue;
         }
 
-        // Read which queues have pending interrupts.
-        //
-        // Safety: the command copies out one vioc_intr_poll, and that
-        // is what `poll_data` is.
-        let mut poll_data = viona_api::vioc_intr_poll::default();
-        let rc =
-            unsafe { dev.ioctl(viona_api::VNA_IOC_INTR_POLL, &mut poll_data) };
-        if let Err(err) = rc {
-            slog::warn!(log, "VNA_IOC_INTR_POLL failed"; "error" => %err);
-            continue;
-        }
-
-        // Process each queue with a pending interrupt.
-        // Fire per-queue so PCI transport routes via the correct
-        // MSI-X vector (or falls back to shared INTx).
-        for i in 0..viona_api::VIONA_VQ_MAX as usize {
-            if poll_data.vip_status[i] == 0 {
-                continue;
-            }
-            // Until this clears, the kernel signals the same interrupt
-            // again and this loop spins.
-            if let Err(err) = dev.ring_intr_clr(i) {
-                slog::warn!(log, "viona interrupt clear failed";
-                    "ring" => i, "error" => %err);
-            }
-            raise_intr(i as u16);
-        }
+        deliver_pending(dev, slot, &log);
     }
 }

@@ -14,6 +14,15 @@
 
 use std::io::Result;
 
+/// What one `VNA_IOC_INTR_POLL` copies out: the pending state of
+/// every ring, in ring order.
+///
+/// Only the poll thread reads this, and only illumos runs one. The
+/// tests build it everywhere, which is where the order it is read in
+/// is pinned.
+#[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
+pub(super) type IntrStatus = [u32; viona_api::VIONA_VQ_MAX as usize];
+
 /// The kernel side of the calls that run on every platform.
 pub(super) trait LinkOps: Send + Sync {
     /// Program one ring's addresses, in the modern layout.
@@ -37,6 +46,22 @@ pub(super) trait LinkOps: Send + Sync {
 
     /// Give the kernel the features the guest accepted.
     fn set_features(&self, features: u64) -> Result<()>;
+
+    /// Read which rings have an interrupt pending.
+    ///
+    /// One entry per ring, non-zero for a ring the kernel has work
+    /// waiting on. Only the poll thread calls this, and only illumos
+    /// runs one.
+    #[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
+    fn intr_status(&self) -> Result<IntrStatus>;
+
+    /// Clear one ring's pending interrupt.
+    ///
+    /// Until this runs the kernel signals the same interrupt again
+    /// and the poll thread spins. The clear is also what makes the
+    /// notification the poll thread's to deliver.
+    #[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
+    fn ring_intr_clr(&self, ring: u16) -> Result<()>;
 
     /// Destroy the link, which gives back its `vmm_drv` hold.
     fn delete(&self) -> Result<()>;
@@ -80,6 +105,18 @@ impl LinkOps for viona_api::VionaFd {
         // `feat` is.
         unsafe { self.ioctl(viona_api::VNA_IOC_SET_FEATURES, &mut feat) }?;
         Ok(())
+    }
+
+    fn intr_status(&self) -> Result<IntrStatus> {
+        let mut poll_data = viona_api::vioc_intr_poll::default();
+        // Safety: the command copies out one vioc_intr_poll, and that
+        // is what `poll_data` is.
+        unsafe { self.ioctl(viona_api::VNA_IOC_INTR_POLL, &mut poll_data) }?;
+        Ok(poll_data.vip_status)
+    }
+
+    fn ring_intr_clr(&self, ring: u16) -> Result<()> {
+        viona_api::VionaFd::ring_intr_clr(self, ring as usize)
     }
 
     fn delete(&self) -> Result<()> {

@@ -10,7 +10,7 @@
 //! exists, has exactly one implementation.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
 
 use anyhow::Context;
 
@@ -205,29 +205,17 @@ pub fn virtio_viona(
         ctx.msi_sink(),
     ));
 
-    // The poll thread needs the raise callback before the transport
-    // exists, so the callback reads through a Weak that is filled in
-    // once VirtioPciDevice::new returns.
-    let hook: Arc<Mutex<Option<Weak<VirtioPciDevice<VirtioViona>>>>> =
-        Arc::new(Mutex::new(None));
-    let hook_clone = Arc::clone(&hook);
-    let raise_fn: Arc<dyn Fn(u16) + Send + Sync> =
-        Arc::new(move |queue_idx: u16| {
-            if let Some(d) = hook_clone
-                .lock()
-                .ok()
-                .and_then(|g| g.clone())
-                .and_then(|w| w.upgrade())
-            {
-                d.raise_queue_interrupt_current(queue_idx);
-            }
-        });
+    // The poll thread reads this slot on every wakeup, so it can
+    // start before the transport exists. It names the driver session
+    // each notification was collected under, which a raise made
+    // through a bare callback could not.
+    let viona_intr = dev.interrupt();
 
     let intr_log = log.new(slog::o!("component" => "viona-intr"));
     if defer_poll {
-        dev.store_poll_fn(raise_fn, intr_log);
+        dev.defer_intr_poll(intr_log);
     } else {
-        dev.start_intr_poll(raise_fn, intr_log);
+        dev.start_intr_poll(intr_log);
     }
 
     let pci_dev = VirtioPciDevice::new(
@@ -243,9 +231,8 @@ pub fn virtio_viona(
         Some(msix),
     );
 
-    if let Ok(mut h) = hook.lock() {
-        *h = Some(Arc::downgrade(&pci_dev));
-    }
+    *viona_intr.lock().expect("viona interrupt lock") =
+        Some(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }

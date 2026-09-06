@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use vmm_core::mem::PhysMap;
 
+use super::pci::intr::BackendIntr;
 use super::queue::VirtQueue;
 use super::VirtioDevice;
 use link::LinkOps;
@@ -85,9 +86,23 @@ enum RingState {
 /// The code compiles on all platforms to keep CI working.
 pub struct VirtioViona {
     inner: Mutex<VionaInner>,
+
+    /// The transport interrupt path, filled by the binary once the
+    /// transport exists.
+    ///
+    /// Outside `inner` because the poll thread reads it on every
+    /// wakeup and must never wait on the device lock: the halt drops
+    /// that lock across an untimed kernel call.
+    interrupt: Arc<Mutex<Option<VionaInterrupt>>>,
 }
 
-type QueueInterrupt = Arc<dyn Fn(u16) + Send + Sync>;
+/// The transport interrupt path, installed by the binary after the
+/// transport is built.
+///
+/// The poll thread names the driver session each notification was
+/// collected under, so a reset in between refuses it. A bare
+/// `Fn(u16)` cannot: it has no session to name.
+pub type VionaInterrupt = Arc<BackendIntr>;
 
 struct VionaInner {
     /// Open handle to the viona kernel device.
@@ -118,9 +133,9 @@ struct VionaInner {
     ring_state: [RingState; NET_NUM_QUEUES],
 
     /// Deferred interrupt poll state for migration destinations.
-    /// Stores the raise_fn and logger so the poll thread can be
-    /// started after ring state is restored.
-    deferred_poll: Option<(QueueInterrupt, slog::Logger)>,
+    /// Holds the logger so the poll thread can be started after ring
+    /// state is restored.
+    deferred_poll: Option<slog::Logger>,
 
     /// The running interrupt poll thread, if one was started.
     poller: Option<halt::Poller>,
@@ -170,6 +185,12 @@ impl VionaInner {
 }
 
 impl VirtioViona {
+    /// The interrupt slot, for the binary to fill after the transport
+    /// is built.
+    pub fn interrupt(&self) -> Arc<Mutex<Option<VionaInterrupt>>> {
+        Arc::clone(&self.interrupt)
+    }
+
     /// Kick an in-kernel virtqueue ring.
     ///
     /// Only kicks if the queue index is valid (0=RX, 1=TX), features

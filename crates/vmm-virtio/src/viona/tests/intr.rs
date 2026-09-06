@@ -1,0 +1,474 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! The poll thread's delivery against the reset that ends the driver
+//! session.
+//!
+//! Viona's reset returns the kernel rings. It does not stop this
+//! thread and it does not drain it, so the thread can be holding a
+//! notification it collected under one driver while the guest resets
+//! the device and the next driver arms its interrupts. Delivering
+//! there writes an interrupt for a ring the new driver never armed: on
+//! INTx a level nobody lowers, on MSI-X a message to the vector that
+//! driver had just programmed.
+//!
+//! Both routes are covered because they fail differently, and because
+//! a reset leaves every MSI-X vector at `NO_VECTOR`: a device that is
+//! quiet only for that reason has proved nothing. Each test below ends
+//! by delivering on the same ring in the running session, which is
+//! also the shape this fix could break. A session check that refuses
+//! too much drops live interrupts and hangs the guest.
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+
+use vmm_core::common::{RWOp, ReadOp, WriteOp};
+use vmm_core::mem::PhysMap;
+use vmm_core::mmio::MmioBus;
+use vmm_core::pio::PioBus;
+use vmm_devices::pci::device::PciDevice;
+use vmm_devices::pci::msix::{MsiSink, MsixTable};
+use vmm_devices::pci::{BarN, INTxPinID, IntrPin};
+
+use super::device::device_with;
+use super::null_log;
+use crate::bits;
+use crate::pci::VirtioPciDevice;
+use crate::viona::link::{IntrStatus, LinkOps};
+use crate::viona::poll::deliver_pending;
+use crate::viona::{
+    VionaInterrupt, VirtioViona, NET_CONFIG_SIZE, NET_NUM_QUEUES,
+    NET_QUEUE_SIZE,
+};
+
+/// A wait this long means a thread is wedged, not slow.
+const WEDGED: Duration = Duration::from_secs(15);
+
+/// Status a driver holds just before it sets DRIVER_OK.
+const READY: u8 =
+    bits::STATUS_ACKNOWLEDGE | bits::STATUS_DRIVER | bits::STATUS_FEATURES_OK;
+
+/// The vector a driver maps the rx ring to.
+const QUEUE_VECTOR: u16 = 1;
+
+/// The rx ring, which is the one the kernel reports pending.
+const PENDING_RING: usize = 0;
+
+/// Where the message that vector carries goes.
+const MSG_ADDR: u64 = 0xFEE0_0000;
+const MSG_DATA: u64 = 0x21;
+
+/// Where the poll thread is held while the guest resets the device.
+///
+/// Two points, because they pin different mistakes. `Poll` catches a
+/// session read after the kernel is asked what is pending; `Clear`
+/// catches a session read at the raise. Only a sample taken before
+/// both survives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParkAt {
+    /// Inside `VNA_IOC_INTR_POLL`, before the pending rings are known.
+    Poll,
+    /// After the ring's pending interrupt is cleared, which is the
+    /// step that makes the notification this thread's to deliver.
+    Clear,
+}
+
+/// A one-shot park the test drives from the other side.
+struct Park {
+    at: ParkAt,
+    arrived: mpsc::Sender<()>,
+    go: mpsc::Receiver<()>,
+}
+
+/// A link that reports one pending ring and holds the poll thread at
+/// a named step.
+struct PollLink {
+    status: IntrStatus,
+    park: Mutex<Option<Park>>,
+    cleared: Mutex<Vec<u16>>,
+}
+
+impl PollLink {
+    /// Hold the caller here, if this is the step the test named.
+    ///
+    /// One shot: the park is taken, so the same link delivers
+    /// normally afterwards.
+    fn maybe_park(&self, at: ParkAt) {
+        let park = {
+            let mut slot = self.park.lock().expect("park lock");
+            match slot.as_ref() {
+                Some(park) if park.at == at => slot.take(),
+                _ => None,
+            }
+        };
+        let Some(park) = park else {
+            return;
+        };
+        park.arrived.send(()).expect("the test watches this park");
+        park.go
+            .recv_timeout(WEDGED)
+            .expect("the test never released this park");
+    }
+
+    fn cleared(&self) -> Vec<u16> {
+        self.cleared.lock().expect("cleared lock").clone()
+    }
+}
+
+impl LinkOps for PollLink {
+    fn ring_init(
+        &self,
+        _ring: u16,
+        _size: u16,
+        _desc: u64,
+        _avail: u64,
+        _used: u64,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn ring_kick(&self, _ring: u16) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn ring_reset(&self, _ring: u16) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn set_features(&self, _features: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn intr_status(&self) -> std::io::Result<IntrStatus> {
+        self.maybe_park(ParkAt::Poll);
+        Ok(self.status)
+    }
+
+    fn ring_intr_clr(&self, ring: u16) -> std::io::Result<()> {
+        self.cleared.lock().expect("cleared lock").push(ring);
+        self.maybe_park(ParkAt::Clear);
+        Ok(())
+    }
+
+    fn delete(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// An interrupt pin that counts what the transport put on the line.
+struct TestPin {
+    level: AtomicBool,
+    asserts: AtomicUsize,
+}
+
+impl TestPin {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            level: AtomicBool::new(false),
+            asserts: AtomicUsize::new(0),
+        })
+    }
+
+    fn asserts(&self) -> usize {
+        self.asserts.load(Ordering::Acquire)
+    }
+}
+
+impl IntrPin for TestPin {
+    fn assert(&self) {
+        self.asserts.fetch_add(1, Ordering::AcqRel);
+        self.level.store(true, Ordering::Release);
+    }
+
+    fn deassert(&self) {
+        self.level.store(false, Ordering::Release);
+    }
+
+    fn is_asserted(&self) -> bool {
+        self.level.load(Ordering::Acquire)
+    }
+}
+
+/// A sink that records the messages that reached the kernel.
+struct TestSink {
+    sent: Mutex<Vec<(u64, u64)>>,
+}
+
+impl TestSink {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            sent: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn sent(&self) -> Vec<(u64, u64)> {
+        self.sent.lock().expect("sink lock").clone()
+    }
+}
+
+impl MsiSink for TestSink {
+    fn send(&self, addr: u64, data: u64) {
+        self.sent.lock().expect("sink lock").push((addr, data));
+    }
+}
+
+type Dev = Arc<VirtioPciDevice<VirtioViona>>;
+
+/// A viona device on a real pin, its poll link, and whatever the
+/// guest's interrupts reach.
+struct Fixture {
+    dev: Dev,
+    link: Arc<PollLink>,
+    intr: Arc<Mutex<Option<VionaInterrupt>>>,
+    pin: Arc<TestPin>,
+    /// Set when the driver in this fixture uses MSI-X.
+    sink: Option<Arc<TestSink>>,
+    arrived: mpsc::Receiver<()>,
+    go: mpsc::Sender<()>,
+}
+
+impl Fixture {
+    /// Build a device whose poll thread parks at `park_at`.
+    ///
+    /// `msix` decides the route the driver takes, which is the whole
+    /// reason for two of every test below.
+    fn new(park_at: ParkAt, msix: bool) -> Self {
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let mut status = IntrStatus::default();
+        status[PENDING_RING] = 1;
+        let link = Arc::new(PollLink {
+            status,
+            park: Mutex::new(Some(Park {
+                at: park_at,
+                arrived: arrived_tx,
+                go: go_rx,
+            })),
+            cleared: Mutex::new(Vec::new()),
+        });
+
+        let sink = msix.then(TestSink::new);
+        let table = sink.as_ref().map(|sink| {
+            let table = Arc::new(MsixTable::new(
+                NET_NUM_QUEUES as u16 + 1,
+                Arc::clone(sink) as Arc<dyn MsiSink>,
+            ));
+            table.set_enabled(true);
+            // A vector the driver programmed, so `fire` has somewhere
+            // to send.
+            table.write_entry(QUEUE_VECTOR, MSG_ADDR, MSG_DATA);
+            table
+        });
+
+        let device = device_with(Arc::clone(&link) as Arc<dyn LinkOps>);
+        let intr = device.interrupt();
+        let pin = TestPin::new();
+        let dev = VirtioPciDevice::new(
+            device,
+            bits::VIRTIO_DEV_TYPE_NET,
+            NET_NUM_QUEUES,
+            NET_QUEUE_SIZE,
+            NET_CONFIG_SIZE,
+            Some((INTxPinID::IntA, Arc::clone(&pin) as Arc<dyn IntrPin>)),
+            Arc::new(PhysMap::new()),
+            Arc::new(PioBus::new()),
+            Arc::new(MmioBus::new()),
+            table,
+        );
+        *intr.lock().expect("viona interrupt lock") = Some(dev.backend_intr());
+
+        Self {
+            dev,
+            link,
+            intr,
+            pin,
+            sink,
+            arrived: arrived_rx,
+            go: go_tx,
+        }
+    }
+
+    fn write_legacy(&self, reg: u16, val: &[u8]) {
+        let wo = WriteOp::from_buf(val);
+        self.dev
+            .bar_rw(BarN::BAR0, usize::from(reg), RWOp::Write(&wo));
+    }
+
+    fn write_status(&self, val: u8) {
+        self.write_legacy(bits::LEGACY_REG_DEVICE_STATUS, &[val]);
+    }
+
+    /// Read and clear the ISR, the way a legacy driver's handler does.
+    fn isr(&self) -> u8 {
+        let mut ro = ReadOp::new(1);
+        self.dev.bar_rw(
+            BarN::BAR0,
+            usize::from(bits::LEGACY_REG_ISR_STATUS),
+            RWOp::Read(&mut ro),
+        );
+        ro.buf()[0]
+    }
+
+    /// Bring a driver up, the way the guest does.
+    ///
+    /// The MSI-X vector is part of that: a reset leaves every vector
+    /// at `NO_VECTOR`, and a device that says nothing for that reason
+    /// would pass every assertion here without a session check.
+    fn arm(&self) {
+        self.write_status(READY | bits::STATUS_DRIVER_OK);
+        if self.sink.is_some() {
+            self.write_legacy(
+                bits::LEGACY_REG_QUEUE_SELECT,
+                &(PENDING_RING as u16).to_le_bytes(),
+            );
+            self.write_legacy(
+                bits::LEGACY_REG_MSIX_QUEUE_VECTOR,
+                &QUEUE_VECTOR.to_le_bytes(),
+            );
+        }
+    }
+
+    /// Run one poll wakeup on its own thread, the way the poll thread
+    /// does.
+    fn spawn_poller(&self) -> std::thread::JoinHandle<()> {
+        let link = Arc::clone(&self.link);
+        let intr = Arc::clone(&self.intr);
+        std::thread::Builder::new()
+            .name("viona-intr-poll-stub".into())
+            .spawn(move || {
+                deliver_pending(link.as_ref(), &intr, &null_log());
+            })
+            .expect("the test can spawn a thread")
+    }
+
+    /// Deliver one wakeup on this thread, with no park left to hit.
+    fn deliver_here(&self) {
+        deliver_pending(self.link.as_ref(), &self.intr, &null_log());
+    }
+
+    fn wait_parked(&self) {
+        self.arrived
+            .recv_timeout(WEDGED)
+            .expect("the poll thread reached its park");
+    }
+
+    fn release(&self) {
+        self.go.send(()).expect("release the poll thread");
+    }
+
+    /// What reached the guest, by either route.
+    fn delivered(&self) -> usize {
+        let messages = self.sink.as_ref().map_or(0, |sink| sink.sent().len());
+        self.pin.asserts() + messages
+    }
+}
+
+/// A whole device reset lands between the poll thread's session and
+/// its raise. Nothing may reach the driver that follows, and the same
+/// ring must still reach the driver that is running.
+fn a_reset_refuses_the_notification_it_overtook(park_at: ParkAt, msix: bool) {
+    let fix = Fixture::new(park_at, msix);
+    fix.arm();
+
+    let poller = fix.spawn_poller();
+    fix.wait_parked();
+
+    // The guest resets the device and the next driver arms its
+    // interrupts, all while the poll thread is held. A reset that
+    // waited for this thread would never return.
+    fix.write_status(0);
+    fix.arm();
+
+    fix.release();
+    poller.join().expect("the poll thread finished");
+
+    assert_eq!(
+        fix.delivered(),
+        0,
+        "a notification collected before the reset reached the next driver",
+    );
+    assert_eq!(fix.isr(), 0, "the old session set the ISR");
+    assert!(
+        !fix.pin.is_asserted(),
+        "the old session left the line asserted",
+    );
+
+    // The converse, on the same device, the same ring and the same
+    // vector. Only the session differs, so this is what tells a
+    // refusal apart from a device that can no longer interrupt.
+    fix.deliver_here();
+    assert_eq!(
+        fix.delivered(),
+        1,
+        "the running session's own notification was dropped",
+    );
+    assert_eq!(
+        fix.link.cleared(),
+        [PENDING_RING as u16, PENDING_RING as u16],
+        "the kernel's pending interrupt was not cleared each wakeup",
+    );
+}
+
+#[test]
+fn a_reset_refuses_a_notification_parked_at_the_poll_on_intx() {
+    a_reset_refuses_the_notification_it_overtook(ParkAt::Poll, false);
+}
+
+#[test]
+fn a_reset_refuses_a_notification_parked_at_the_poll_on_msix() {
+    a_reset_refuses_the_notification_it_overtook(ParkAt::Poll, true);
+}
+
+#[test]
+fn a_reset_refuses_a_notification_parked_at_the_clear_on_intx() {
+    a_reset_refuses_the_notification_it_overtook(ParkAt::Clear, false);
+}
+
+#[test]
+fn a_reset_refuses_a_notification_parked_at_the_clear_on_msix() {
+    a_reset_refuses_the_notification_it_overtook(ParkAt::Clear, true);
+}
+
+#[test]
+fn a_notification_in_the_running_session_reaches_an_intx_driver() {
+    // The interrupt the guest is waiting for. A device that lost this
+    // stalls the ring instead of wedging the line, which is the other
+    // way a session check goes wrong.
+    let fix = Fixture::new(ParkAt::Poll, false);
+    fix.arm();
+    fix.release();
+
+    fix.deliver_here();
+
+    assert_eq!(fix.pin.asserts(), 1, "the interrupt never reached the pin");
+    assert!(fix.pin.is_asserted(), "the line was not left asserted");
+    assert_eq!(
+        fix.isr(),
+        bits::ISR_QUEUE_INTR,
+        "the driver's handler would read a zero ISR",
+    );
+}
+
+#[test]
+fn a_notification_in_the_running_session_reaches_an_msix_driver() {
+    // The same, on the route a modern guest uses. This one has no
+    // level to leave behind, so the message itself is the evidence.
+    let fix = Fixture::new(ParkAt::Poll, true);
+    fix.arm();
+    fix.release();
+
+    fix.deliver_here();
+
+    assert_eq!(
+        fix.sink.as_ref().expect("this fixture is on MSI-X").sent(),
+        [(MSG_ADDR, MSG_DATA)],
+        "the interrupt never reached the vector the driver programmed",
+    );
+    assert_eq!(
+        fix.pin.asserts(),
+        0,
+        "an MSI-X driver was sent an INTx assertion it will never lower",
+    );
+}
