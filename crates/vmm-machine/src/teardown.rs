@@ -30,18 +30,6 @@ const VCPU_JOIN_BUDGET: Duration = Duration::from_secs(5);
 /// while it is still writing.
 const FLUSH_BUDGET_PER_DEVICE: Duration = Duration::from_secs(2);
 
-/// The largest budget any device halt holds itself to.
-///
-/// virtio-fs waits up to 5 s for its worker thread
-/// (`vmm-virtio/src/fs/mod.rs`, `FS_HALT_BUDGET`). virtio-vsock waits
-/// 2 s for its accept thread and 2 s more for its readers
-/// (`vmm-virtio/src/vsock/device.rs`, `HALT_BUDGET`). No other halt in
-/// the tree waits on purpose for longer.
-///
-/// These are separate crates, so the compiler cannot check the
-/// relation. The test below is what holds it.
-const DEVICE_HALT_SELF_BUDGET_MAX: Duration = Duration::from_secs(5);
-
 /// Slack over a device's own halt deadline.
 ///
 /// A device that polls its own deadline returns just after it, not on
@@ -50,20 +38,48 @@ const DEVICE_HALT_SELF_BUDGET_MAX: Duration = Duration::from_secs(5);
 /// by a wide margin, and more only delays the destroy.
 const HALT_OVERRUN_SLACK: Duration = Duration::from_secs(1);
 
+/// How many times the sweep asks the system for a halt thread.
+///
+/// A refused spawn is usually transient at teardown, and the guest can
+/// help cause one: every console client it opens takes a reader thread,
+/// and the console halt that ran a moment ago is what gives those
+/// threads back. Asking again is cheap and often works.
+const HALT_SPAWN_ATTEMPTS: u32 = 3;
+
+/// How long the sweep waits between those attempts.
+const HALT_SPAWN_RETRY_PAUSE: Duration = Duration::from_millis(50);
+
 /// How long one device gets to give up its in-kernel and thread state.
 ///
 /// [`halt_devices`] runs each `halt` on a thread of its own and stops
-/// waiting after this, so the value bounds the halt phase and does not
-/// only size a clock. It must outlast
-/// [`DEVICE_HALT_SELF_BUDGET_MAX`], or the sweep would abandon a halt
-/// that was about to return.
+/// waiting after the value returned here, so it bounds the halt phase
+/// and does not only size a clock.
+///
+/// The device declares the deadline it holds itself to, and the sweep
+/// adds `slack` on top of it. WHY it is not a constant here: it was
+/// one, hand copied from `FS_HALT_BUDGET` in another crate, and the
+/// compiler cannot check a copy. Raising the real deadline left this
+/// crate abandoning a virtio-fs halt one poll early with every test
+/// still green.
+///
+/// The result is capped at [`TEARDOWN_BUDGET_MAX`]. The device supplies
+/// the value, so one device must not be able to hold the sweep for
+/// longer than the whole teardown may claim. Past the cap the terminal
+/// watchdog would end the process anyway, so the wait buys nothing.
 ///
 /// Nothing here can interrupt a halt that overruns. viona's is the one
 /// that matters: `VNA_IOC_DELETE` waits for each ring worker to stop,
 /// in a `cv_wait` that does not heed signals. The budget only decides
 /// when the sweep stops waiting for it and goes on to the destroy.
-const HALT_BUDGET_PER_DEVICE: Duration =
-    DEVICE_HALT_SELF_BUDGET_MAX.saturating_add(HALT_OVERRUN_SLACK);
+fn halt_budget_for(
+    device: &dyn vmm_devices::Lifecycle,
+    slack: Duration,
+) -> Duration {
+    device
+        .halt_budget()
+        .saturating_add(slack)
+        .min(TEARDOWN_BUDGET_MAX)
+}
 
 /// How long `VM_DESTROY_SELF` gets before teardown stops waiting on it.
 ///
@@ -86,6 +102,17 @@ const TEARDOWN_BUDGET_MIN: Duration = Duration::from_secs(60);
 ///
 /// A device count large enough to overflow the sum must not disarm the
 /// watchdog by asking for a deadline it can never reach.
+///
+/// Past 34 lifecycle devices that take the default halt budget, this
+/// ceiling is shorter than the worst-case bounded sweep, so the
+/// watchdog can end a teardown that is still working. A 40-disk VM is
+/// not impossible. The trade is accepted, and the test below pins the
+/// count rather than hiding it. The worst case needs every device to
+/// spend its whole flush budget and its whole halt budget, which no
+/// real block flush and no returning halt does, and a node must not
+/// hold the memory of a VM that will not stop for longer than five
+/// minutes. A device that reports a shorter
+/// [`vmm_devices::Lifecycle::halt_budget`] raises the count.
 const TEARDOWN_BUDGET_MAX: Duration = Duration::from_secs(300);
 
 /// How often the event loop rechecks a roster that can grow.
@@ -208,19 +235,21 @@ fn quiesce_named(
 /// production teardown. Several join threads. One that does not return
 /// would hold the sweep short of the destroy, which is the wedge the
 /// sweep exists to prevent. No single device may cost the VM its
-/// destroy, so each halt gets `budget` and no more.
-fn halt_devices(devices: &[NamedDevice], budget: Duration, log: &Logger) {
+/// destroy, so each halt gets the deadline it declared plus `slack`,
+/// and no more. See [`halt_budget_for`].
+fn halt_devices(devices: &[NamedDevice], slack: Duration, log: &Logger) {
     for named in devices {
         if named.device.lifecycle_state()
             == Some(vmm_devices::IndicatedState::Halt)
         {
             continue;
         }
+        let budget = halt_budget_for(named.device.as_ref(), slack);
         if !halt_bounded(&named.device, budget, log) {
             error!(log, "device halt did not return; going on to the VM destroy";
                 "device" => named.device.type_name(),
                 "id" => named.id.as_deref(),
-                "budget_secs" => budget.as_secs());
+                "budget_ms" => budget.as_millis() as u64);
             // The state is not read here: the halt still holds whatever
             // locks it took, and this thread must not wait on one.
             continue;
@@ -234,6 +263,27 @@ fn halt_devices(devices: &[NamedDevice], budget: Duration, log: &Logger) {
             }
         }
     }
+}
+
+/// Work handed to a thread the sweep may then abandon.
+type HaltWork = Box<dyn FnOnce() + Send + 'static>;
+
+/// How the sweep gets a thread for one halt.
+///
+/// A function and not a direct spawn so the refused case is testable.
+/// That case is the one that must not put an untimed ioctl on the
+/// teardown thread, and no test can exhaust the real thread limit.
+type HaltSpawn<'a> = &'a dyn Fn(HaltWork) -> io::Result<()>;
+
+/// Start one halt on a thread nothing joins.
+///
+/// The handle is dropped on purpose: a halt that outlives its budget is
+/// left running, so there is never anything to join.
+fn spawn_halt(work: HaltWork) -> io::Result<()> {
+    thread::Builder::new()
+        .name("device-halt".into())
+        .spawn(work)
+        .map(drop)
 }
 
 /// Halt one device, and stop waiting on it after `budget`.
@@ -253,26 +303,66 @@ fn halt_bounded(
     budget: Duration,
     log: &Logger,
 ) -> bool {
+    halt_bounded_with(&spawn_halt, device, budget, HALT_SPAWN_RETRY_PAUSE, log)
+}
+
+/// The same halt over a caller-supplied spawn.
+fn halt_bounded_with(
+    spawn: HaltSpawn<'_>,
+    device: &Arc<dyn vmm_devices::Lifecycle>,
+    budget: Duration,
+    retry_pause: Duration,
+    log: &Logger,
+) -> bool {
     let (tx, rx) = mpsc::channel();
-    let halting = Arc::clone(device);
-    let spawned =
-        thread::Builder::new()
-            .name("device-halt".into())
-            .spawn(move || {
-                halting.halt();
-                // A closed channel means the sweep stopped waiting, which
-                // is the case this bound exists for.
-                let _sweep_gave_up = tx.send(());
-            });
-    if let Err(e) = spawned {
-        // Skipping the halt would leave viona's vmm_drv hold in place
-        // and guarantee the destroy wedge. Running it here only risks
-        // one, and the shutdown watchdog still holds the clock.
-        error!(log, "could not start the device halt; running it unbounded";
+    let mut started = false;
+    for attempt in 1..=HALT_SPAWN_ATTEMPTS {
+        let halting = Arc::clone(device);
+        let done = tx.clone();
+        match spawn(Box::new(move || {
+            halting.halt();
+            // A closed channel means the sweep stopped waiting, which
+            // is the case this bound exists for.
+            let _sweep_gave_up = done.send(());
+        })) {
+            Ok(()) => {
+                started = true;
+                break;
+            }
+            Err(e) => {
+                warn!(log, "could not start a device halt thread";
+                    "device" => device.type_name(),
+                    "attempt" => attempt,
+                    "error" => %e);
+                if attempt < HALT_SPAWN_ATTEMPTS {
+                    thread::sleep(retry_pause);
+                }
+            }
+        }
+    }
+    // The sweep keeps no sender, so the wait below ends when the halt
+    // thread goes, whether it sent or panicked.
+    drop(tx);
+
+    if !started {
+        // WHY the halt is skipped and not run on this thread:
+        // `VNA_IOC_DELETE` is untimed and heeds no signal, so a halt
+        // here has no bound at all and would hold the sweep one step
+        // short of the VM destroy. The guest can help cause the refusal
+        // it would follow, one thread per console client it opens, so a
+        // guest that cannot wedge the destroy could still wedge this.
+        //
+        // Skipping the halt does not make the destroy wedge certain.
+        // The hold it leaves makes `vmm_drv_purge` wait, and the purge
+        // asks each lessee to break its lease; a viona ring worker that
+        // reaches `vring_need_bail_ext` breaks it (`viona_ring.c:736`).
+        // The wedge needs a worker that cannot reach that test. So this
+        // raises the risk of the wedge rather than guaranteeing one,
+        // and the destroy keeps its own budget behind it.
+        error!(log, "no thread for the device halt; leaving its state to the VM destroy";
             "device" => device.type_name(),
-            "error" => %e);
-        device.halt();
-        return true;
+            "attempts" => HALT_SPAWN_ATTEMPTS);
+        return false;
     }
 
     match rx.recv_timeout(budget) {
@@ -450,19 +540,35 @@ impl DeviceSource<'_> {
     }
 }
 
+/// The per-device half of the teardown clock.
+///
+/// Summed and not multiplied, because each device declares the halt
+/// deadline it holds itself to. A VM of block devices that return at
+/// once therefore asks for a shorter clock than a VM with a virtio-fs
+/// share on it.
+fn device_work(devices: &[NamedDevice]) -> Duration {
+    devices.iter().fold(Duration::ZERO, |total, named| {
+        total
+            .saturating_add(FLUSH_BUDGET_PER_DEVICE)
+            .saturating_add(halt_budget_for(
+                named.device.as_ref(),
+                HALT_OVERRUN_SLACK,
+            ))
+    })
+}
+
 /// The clock the terminal watchdog holds this teardown to.
 ///
 /// Quiesce, the vCPU join and the destroy cannot run past their own
 /// budgets. The flush can: it is one synchronous backend call per
 /// device, so a VM with many disks needs more time than a VM with one,
 /// and no constant can know which it is.
-fn teardown_budget(devices: usize) -> Duration {
-    let per_device =
-        FLUSH_BUDGET_PER_DEVICE.saturating_add(HALT_BUDGET_PER_DEVICE);
-    let device_work = u32::try_from(devices)
-        .ok()
-        .and_then(|count| per_device.checked_mul(count))
-        .unwrap_or(TEARDOWN_BUDGET_MAX);
+fn teardown_budget(devices: &[NamedDevice]) -> Duration {
+    teardown_budget_for(device_work(devices))
+}
+
+/// The same clock over a device total the caller already has.
+fn teardown_budget_for(device_work: Duration) -> Duration {
     QUIESCE_BUDGET
         .saturating_add(device_work)
         .saturating_add(VCPU_JOIN_BUDGET)
@@ -661,7 +767,7 @@ fn shutdown_after_exit(
     // kernel. None can be interrupted from here, so the terminal
     // watchdog keeps a clock across the whole teardown and is given a
     // budget that scales with the work.
-    arm_deadline(teardown_budget(devices.len()));
+    arm_deadline(teardown_budget(devices));
 
     // A wedged backend must not prevent release of the bhyve instance.
     let _report = quiesce_named(devices, log);
@@ -670,7 +776,7 @@ fn shutdown_after_exit(
         warn!(log, "vCPU threads did not exit; destroying VM anyway");
     }
 
-    halt_devices(devices, HALT_BUDGET_PER_DEVICE, log);
+    halt_devices(devices, HALT_OVERRUN_SLACK, log);
 
     // The socket path may already be gone.
     if let Some(path) = control_cleanup {
@@ -721,652 +827,4 @@ fn outcome_of(
 }
 
 #[cfg(test)]
-mod tests {
-    //! What these tests establish, and what they do not.
-    //!
-    //! They drive the real teardown sequence over recording devices
-    //! and a destroy closure, so they show which step runs and in
-    //! which order. No test here opens /dev/vmm, so none of them shows
-    //! that the kernel releases the instance, that the process leaves
-    //! the process table, or that `VNA_IOC_DELETE` returns on a live
-    //! link. Only a lab test on illumos shows that: boot a VM with a
-    //! viona NIC, power it off from inside the guest, and watch for
-    //! the instance to leave `/dev/vmm` and the VMM process to exit
-    //! with no watchdog line behind it.
-
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    use slog::Logger;
-    use vmm_devices::quiesce::NamedDevice;
-    use vmm_devices::Lifecycle as _;
-
-    use super::{
-        destroy_bounded_with, halt_devices, join_vcpus_bounded,
-        quiesce_devices, shutdown_after_exit, teardown_budget, RunOutcome,
-        VcpuSet, VcpuThreads, DESTROY_BUDGET, DEVICE_HALT_SELF_BUDGET_MAX,
-        FLUSH_BUDGET_PER_DEVICE, HALT_BUDGET_PER_DEVICE, QUIESCE_BUDGET,
-        ROSTER_POLL, TEARDOWN_BUDGET_MAX, TEARDOWN_BUDGET_MIN,
-        VCPU_JOIN_BUDGET,
-    };
-    use crate::vcpu_tasks::VcpuEvent;
-    use std::sync::mpsc;
-
-    struct TrackedDevice {
-        indicator: vmm_devices::Indicator,
-    }
-
-    impl vmm_devices::Lifecycle for TrackedDevice {
-        fn type_name(&self) -> &'static str {
-            "tracked-test-device"
-        }
-
-        fn lifecycle_state(&self) -> Option<vmm_devices::IndicatedState> {
-            Some(self.indicator.state())
-        }
-
-        fn start(&self) -> anyhow::Result<()> {
-            self.indicator.start();
-            Ok(())
-        }
-
-        fn pause(&self) {
-            self.indicator.pause();
-        }
-    }
-
-    struct NeverQuiesces;
-
-    impl vmm_devices::Lifecycle for NeverQuiesces {
-        fn type_name(&self) -> &'static str {
-            "never"
-        }
-
-        fn is_quiesced(&self) -> bool {
-            false
-        }
-
-        fn flush_backing(
-            &self,
-            _intent: vmm_devices::FlushIntent,
-        ) -> Result<(), vmm_devices::FlushError> {
-            Err(vmm_devices::FlushError::NotQuiesced("never"))
-        }
-    }
-
-    fn null_log() -> Logger {
-        Logger::root(slog::Discard, slog::o!())
-    }
-
-    /// The teardown steps one run took, in order.
-    type Steps = Arc<Mutex<Vec<&'static str>>>;
-
-    fn push(steps: &Steps, step: &'static str) {
-        steps.lock().expect("steps lock").push(step);
-    }
-
-    fn steps_of(steps: &Steps) -> Vec<&'static str> {
-        steps.lock().expect("steps lock").clone()
-    }
-
-    /// A device that records which lifecycle calls teardown made.
-    struct RecordingDevice {
-        indicator: vmm_devices::Indicator,
-        steps: Steps,
-        flush_fails: bool,
-    }
-
-    impl RecordingDevice {
-        fn new(steps: &Steps) -> Self {
-            Self {
-                indicator: vmm_devices::Indicator::new(),
-                steps: Arc::clone(steps),
-                flush_fails: false,
-            }
-        }
-
-        fn failing_flush(steps: &Steps) -> Self {
-            Self {
-                flush_fails: true,
-                ..Self::new(steps)
-            }
-        }
-    }
-
-    impl vmm_devices::Lifecycle for RecordingDevice {
-        fn type_name(&self) -> &'static str {
-            "recording-test-device"
-        }
-
-        fn lifecycle_state(&self) -> Option<vmm_devices::IndicatedState> {
-            Some(self.indicator.state())
-        }
-
-        fn pause(&self) {
-            push(&self.steps, "pause");
-            self.indicator.pause();
-        }
-
-        fn halt(&self) {
-            push(&self.steps, "halt");
-            self.indicator.halt();
-        }
-
-        fn is_quiesced(&self) -> bool {
-            !self.flush_fails
-        }
-
-        fn flush_backing(
-            &self,
-            _intent: vmm_devices::FlushIntent,
-        ) -> Result<(), vmm_devices::FlushError> {
-            push(&self.steps, "flush");
-            if self.flush_fails {
-                return Err(vmm_devices::FlushError::NotQuiesced("recording"));
-            }
-            Ok(())
-        }
-    }
-
-    /// Run one teardown over `devices` and report the steps it took.
-    ///
-    /// The arm and the destroy are recorded in the same list as the
-    /// device calls, so the assertions are about one order and not
-    /// about three.
-    fn run_teardown(
-        devices: &[NamedDevice],
-        steps: &Steps,
-    ) -> Option<Duration> {
-        let armed = Mutex::new(None);
-        let arm_steps = Arc::clone(steps);
-        let destroy_steps = Arc::clone(steps);
-
-        shutdown_after_exit(
-            VcpuSet::Fixed(Vec::new()),
-            devices,
-            None,
-            move || {
-                push(&destroy_steps, "destroy");
-                Ok(())
-            },
-            |budget| {
-                push(&arm_steps, "arm");
-                *armed.lock().expect("armed lock") = Some(budget);
-            },
-            &null_log(),
-        );
-
-        let budget = *armed.lock().expect("armed lock");
-        budget
-    }
-
-    /// A device whose halt does not return until the test releases it,
-    /// standing in for one joining a thread that will not stop.
-    struct BlockingHalt {
-        steps: Steps,
-        release: Mutex<mpsc::Receiver<()>>,
-    }
-
-    impl vmm_devices::Lifecycle for BlockingHalt {
-        fn type_name(&self) -> &'static str {
-            "blocking-halt-test-device"
-        }
-
-        fn halt(&self) {
-            push(&self.steps, "blocked-halt");
-            // The recv ends only when the test drops the sender, which
-            // is how the stand-in halt is released.
-            let _released =
-                self.release.lock().expect("release lock").recv().is_ok();
-        }
-    }
-
-    /// A device whose halt panics.
-    struct PanickingHalt {
-        steps: Steps,
-    }
-
-    impl vmm_devices::Lifecycle for PanickingHalt {
-        fn type_name(&self) -> &'static str {
-            "panicking-halt-test-device"
-        }
-
-        fn halt(&self) {
-            push(&self.steps, "panic-halt");
-            panic!("a device halt that panics must not unwind the sweep");
-        }
-    }
-
-    fn named(device: Arc<dyn vmm_devices::Lifecycle>) -> Vec<NamedDevice> {
-        vec![NamedDevice {
-            id: Some("net0".to_string()),
-            device,
-        }]
-    }
-
-    /// Name a device for a sweep that walks more than one.
-    fn one(id: &str, device: Arc<dyn vmm_devices::Lifecycle>) -> NamedDevice {
-        NamedDevice {
-            id: Some(id.to_string()),
-            device,
-        }
-    }
-
-    #[test]
-    fn teardown_halts_the_devices_before_it_destroys_the_vm() {
-        // VM_DESTROY_SELF waits for every vmm_drv hold to be released,
-        // in an untimed cv_wait. viona gives its hold back in halt, so
-        // a halt after the destroy is a halt that never runs.
-        let steps = Steps::default();
-        let devices = named(Arc::new(RecordingDevice::new(&steps)));
-
-        run_teardown(&devices, &steps);
-
-        assert_eq!(
-            steps_of(&steps),
-            ["arm", "pause", "flush", "halt", "destroy"]
-        );
-    }
-
-    #[test]
-    fn the_deadline_is_armed_before_the_first_step_that_cannot_be_stopped() {
-        // The quiesce, the flush and the halt all run on this thread
-        // and none can be interrupted. A guest that powers itself off
-        // takes this same path with no signal behind it, so the arm is
-        // the only thing that puts a clock on it.
-        let steps = Steps::default();
-        let devices = named(Arc::new(RecordingDevice::new(&steps)));
-
-        let armed = run_teardown(&devices, &steps);
-
-        assert_eq!(steps_of(&steps).first(), Some(&"arm"));
-        assert_eq!(armed, Some(TEARDOWN_BUDGET_MIN));
-    }
-
-    #[test]
-    fn a_device_that_will_not_flush_is_still_halted_and_destroyed() {
-        // Failing to give back kernel state must not itself keep the
-        // instance alive, so nothing in the sweep is allowed to stop
-        // teardown short of the destroy.
-        let steps = Steps::default();
-        let devices = named(Arc::new(RecordingDevice::failing_flush(&steps)));
-
-        run_teardown(&devices, &steps);
-
-        assert_eq!(
-            steps_of(&steps),
-            ["arm", "pause", "flush", "halt", "destroy"]
-        );
-    }
-
-    #[test]
-    fn a_device_halted_before_teardown_is_not_halted_again() {
-        // A hot-unplug halts the device it ejects. Halting it a second
-        // time would repeat a wait that has nothing left to give back.
-        let steps = Steps::default();
-        let device = Arc::new(RecordingDevice::new(&steps));
-        device.pause();
-        device.halt();
-        steps.lock().expect("steps lock").clear();
-        let devices = named(device);
-
-        run_teardown(&devices, &steps);
-
-        let steps = steps_of(&steps);
-        assert!(!steps.contains(&"halt"), "the halt ran twice: {steps:?}");
-        assert_eq!(steps, ["arm", "pause", "flush", "destroy"]);
-    }
-
-    #[test]
-    fn a_halt_that_never_returns_does_not_stop_the_sweep() {
-        // Until the sweep landed, prepare_unplug was the only caller
-        // of halt, so console, vsock, virtio-fs, virtio-blk and nvme
-        // had never run one at teardown. Several join threads. One
-        // that does not return must not cost the VM its destroy.
-        let steps = Steps::default();
-        let (release, blocked) = mpsc::channel::<()>();
-        let devices = vec![
-            one(
-                "stuck",
-                Arc::new(BlockingHalt {
-                    steps: Arc::clone(&steps),
-                    release: Mutex::new(blocked),
-                }),
-            ),
-            one("net0", Arc::new(RecordingDevice::new(&steps))),
-        ];
-        let budget = Duration::from_millis(50);
-
-        // The sweep runs on a thread of its own so that dropping the
-        // per-device bound fails this test rather than wedging the
-        // whole run. A test that can hang proves nothing.
-        let (done_tx, done_rx) = mpsc::channel();
-        let sweep = thread::spawn(move || {
-            halt_devices(&devices, budget, &null_log());
-            // A closed channel means the test already gave up.
-            let _test_gave_up = done_tx.send(());
-        });
-
-        let finished = done_rx.recv_timeout(budget * 20).is_ok();
-        drop(release);
-        sweep.join().expect("the sweep thread should not panic");
-
-        assert!(finished, "a stuck device halt held the sweep");
-        assert_eq!(steps_of(&steps), ["blocked-halt", "halt"]);
-    }
-
-    #[test]
-    fn a_halt_that_panics_does_not_stop_the_sweep() {
-        // This pins the unwinding build only. The release profile sets
-        // panic = "abort", so there the panic ends the process and
-        // VM_SET_AUTODESTRUCT reclaims the instance. The panic message
-        // this test prints is expected.
-        let steps = Steps::default();
-        let devices = vec![
-            one(
-                "bad",
-                Arc::new(PanickingHalt {
-                    steps: Arc::clone(&steps),
-                }),
-            ),
-            one("net0", Arc::new(RecordingDevice::new(&steps))),
-        ];
-
-        run_teardown(&devices, &steps);
-
-        assert_eq!(
-            steps_of(&steps),
-            ["arm", "pause", "flush", "panic-halt", "halt", "destroy"]
-        );
-    }
-
-    #[test]
-    fn quiesce_skips_device_that_is_already_paused() {
-        // Teardown after an operator pause must not pause again: the
-        // device is already quiesced and pausing it twice would hide a
-        // real double pause behind a satisfied request.
-        let device = Arc::new(TrackedDevice {
-            indicator: vmm_devices::Indicator::new(),
-        });
-        device.start().expect("test device should start");
-        device.pause();
-        let devices: Vec<Arc<dyn vmm_devices::Lifecycle>> =
-            vec![device.clone()];
-
-        let report = quiesce_devices(&devices, &null_log());
-
-        assert!(report.is_empty());
-        assert_eq!(
-            device.lifecycle_state(),
-            Some(vmm_devices::IndicatedState::Pause),
-        );
-    }
-
-    #[test]
-    fn quiesce_reports_device_that_misses_deadline() {
-        let devices: Vec<Arc<dyn vmm_devices::Lifecycle>> =
-            vec![Arc::new(NeverQuiesces)];
-        let started = Instant::now();
-
-        let report = quiesce_devices(&devices, &null_log());
-
-        assert_eq!(report.stuck, vec!["never"]);
-        assert!(started.elapsed() <= QUIESCE_BUDGET * 2);
-    }
-
-    #[test]
-    fn join_vcpus_bounded_returns_true_with_no_threads() {
-        assert!(join_vcpus_bounded(Vec::new(), Duration::from_secs(1)));
-    }
-
-    #[test]
-    fn vcpu_join_timeout_is_bounded() {
-        // A wedged vCPU thread must not hold the bhyve instance open.
-        let budget = Duration::from_millis(20);
-        let handle = thread::spawn(move || thread::sleep(budget * 5));
-        let started = Instant::now();
-
-        let joined = join_vcpus_bounded(vec![handle], budget);
-
-        assert!(!joined);
-        assert!(started.elapsed() <= budget * 2);
-    }
-
-    #[test]
-    fn run_outcome_distinguishes_triple_fault_sources() {
-        assert_ne!(RunOutcome::TripleFault(0), RunOutcome::TripleFault(1));
-        assert_eq!(RunOutcome::Halt, RunOutcome::Halt);
-    }
-
-    /// A thread that runs until its channel is dropped, standing in
-    /// for a vCPU thread inside the guest.
-    fn parked_thread() -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
-        let (tx, rx) = mpsc::channel::<()>();
-        // The recv fails when the sender is dropped, which is how
-        // the test stops the stand-in thread.
-        let handle = thread::spawn(move || if rx.recv().is_ok() {});
-        (tx, handle)
-    }
-
-    /// Wait for a roster to report `want` live threads, or give up.
-    fn wait_for_live(threads: &VcpuThreads, want: usize) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if threads.live() == want {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        false
-    }
-
-    #[test]
-    fn a_roster_grows_while_the_guest_runs() {
-        // The boot set is fixed, but a CPU added later has a thread
-        // that teardown still has to join.
-        let threads = VcpuThreads::new();
-        let (boot, boot_handle) = parked_thread();
-        threads
-            .push(boot_handle)
-            .expect("a fresh roster accepts a thread");
-        assert_eq!(threads.len(), 1);
-
-        let (late, late_handle) = parked_thread();
-        threads
-            .push(late_handle)
-            .expect("an open roster accepts a thread");
-        assert_eq!(threads.len(), 2);
-
-        drop(boot);
-        drop(late);
-        assert!(join_vcpus_bounded(threads.close(), Duration::from_secs(5)));
-    }
-
-    #[test]
-    fn a_closed_roster_hands_the_handle_back() {
-        // A thread pushed after teardown took the handles would never
-        // be joined, so the add has to be refused and undone.
-        let threads = VcpuThreads::new();
-        assert!(threads.close().is_empty());
-        assert!(threads.is_closed());
-
-        let (park, handle) = parked_thread();
-        let refused =
-            threads.push(handle).expect_err("a closed roster refuses");
-        drop(park);
-        refused.join().expect("the refused thread should not panic");
-        assert!(threads.is_empty());
-    }
-
-    #[test]
-    fn a_roster_drops_the_threads_a_failed_add_left_behind() {
-        // A rolled-back add leaves a finished handle. Without the
-        // prune, a long-running VM collects one per refused add.
-        let threads = VcpuThreads::new();
-        let (park, handle) = parked_thread();
-        drop(park);
-        threads
-            .push(handle)
-            .expect("a fresh roster accepts a thread");
-        assert!(wait_for_live(&threads, 0));
-
-        let (still_parked, live_handle) = parked_thread();
-        threads
-            .push(live_handle)
-            .expect("an open roster accepts a thread");
-
-        assert_eq!(threads.len(), 1, "the finished handle was dropped");
-        drop(still_parked);
-        assert!(join_vcpus_bounded(threads.close(), Duration::from_secs(5)));
-    }
-
-    #[test]
-    fn a_fixed_set_stops_when_the_event_channel_closes() {
-        let (tx, rx) = mpsc::channel::<VcpuEvent>();
-        drop(tx);
-
-        assert!(VcpuSet::Fixed(Vec::new()).next_event(&rx).is_none());
-    }
-
-    #[test]
-    fn a_roster_stops_when_no_thread_is_left() {
-        // The registry holds a sender for the CPU that is not added
-        // yet, so the channel never closes. The roster is what says
-        // that every vCPU thread has gone.
-        let threads = VcpuThreads::new();
-        let (park, handle) = parked_thread();
-        threads
-            .push(handle)
-            .expect("a fresh roster accepts a thread");
-        let (_registry_sender, rx) = mpsc::channel::<VcpuEvent>();
-
-        drop(park);
-        assert!(wait_for_live(&threads, 0));
-        let started = Instant::now();
-        let event = VcpuSet::Roster(&threads).next_event(&rx);
-
-        assert!(event.is_none());
-        assert!(started.elapsed() <= ROSTER_POLL * 8);
-    }
-
-    #[test]
-    fn a_destroy_that_never_returns_does_not_hold_teardown_open() {
-        // VM_DESTROY_SELF waits for every vmm_drv lease to break, in an
-        // untimed cv_wait. Teardown must stop waiting on it, and must
-        // not report the shutdown as complete.
-        let (park, blocked) = mpsc::channel::<()>();
-        let budget = Duration::from_millis(50);
-        let started = Instant::now();
-
-        let destroyed = destroy_bounded_with(
-            move || {
-                // The recv ends only when the test drops the sender,
-                // which is how the stand-in call is released.
-                blocked.recv().ok();
-                Ok(())
-            },
-            budget,
-            &null_log(),
-        );
-
-        assert!(!destroyed, "a destroy that never returned is not a success");
-        assert!(started.elapsed() <= budget * 20);
-        drop(park);
-    }
-
-    #[test]
-    fn a_destroy_that_returns_is_reported_either_way() {
-        // The call came back, so teardown is over. An error from the
-        // kernel is logged, not waited on again.
-        assert!(destroy_bounded_with(|| Ok(()), QUIESCE_BUDGET, &null_log()));
-        assert!(destroy_bounded_with(
-            || Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
-            QUIESCE_BUDGET,
-            &null_log(),
-        ));
-    }
-
-    #[test]
-    fn the_teardown_budget_grows_with_the_device_count() {
-        // The flush and the halt are one call per device each, so the
-        // clock a 20-disk VM needs is not the clock a 10-disk VM
-        // needs. Both counts sit between the floor and the ceiling,
-        // where the sum is what decides the budget.
-        let few = teardown_budget(10);
-        let many = teardown_budget(20);
-
-        assert!(few < many);
-        assert_eq!(
-            many - few,
-            (FLUSH_BUDGET_PER_DEVICE + HALT_BUDGET_PER_DEVICE) * 10,
-        );
-    }
-
-    #[test]
-    fn the_halt_budget_outlasts_the_slowest_device_halt() {
-        // virtio-fs polls its own 5 s deadline and then closes the
-        // files the guest held. A sweep bound at the same value would
-        // abandon a halt that was one poll from returning, and the
-        // files would stay open.
-        assert!(HALT_BUDGET_PER_DEVICE > DEVICE_HALT_SELF_BUDGET_MAX);
-    }
-
-    #[test]
-    fn the_armed_clock_covers_the_sweep_it_bounds() {
-        // Every step but the flush is bounded, so the clock the
-        // watchdog holds must be at least the sum of those bounds.
-        // A shorter one would end a teardown that was still working.
-        let bounded_work = |devices: u32| {
-            QUIESCE_BUDGET
-                + FLUSH_BUDGET_PER_DEVICE * devices
-                + HALT_BUDGET_PER_DEVICE * devices
-                + VCPU_JOIN_BUDGET
-                + DESTROY_BUDGET
-        };
-        for devices in [0u32, 1, 8, 34] {
-            assert!(
-                teardown_budget(devices as usize) >= bounded_work(devices),
-                "the clock is short of the work for {devices} devices",
-            );
-        }
-
-        // Past that count the ceiling decides, so the watchdog can end
-        // a sweep that is still working. The ceiling stays, because a
-        // deadline that can never be reached arms nothing.
-        assert_eq!(teardown_budget(35), TEARDOWN_BUDGET_MAX);
-        assert!(bounded_work(35) > TEARDOWN_BUDGET_MAX);
-    }
-
-    #[test]
-    fn a_teardown_budget_stays_inside_its_bounds() {
-        // Under the floor the terminal exit would be more eager than
-        // the fixed escalation it replaces. Over the ceiling the
-        // deadline could never be reached, which disarms the watchdog
-        // the budget exists to arm.
-        assert_eq!(teardown_budget(0), TEARDOWN_BUDGET_MIN);
-        assert_eq!(teardown_budget(usize::MAX), TEARDOWN_BUDGET_MAX);
-    }
-
-    #[test]
-    fn a_roster_returns_the_event_a_late_thread_sends() {
-        let threads = VcpuThreads::new();
-        let (park, handle) = parked_thread();
-        threads
-            .push(handle)
-            .expect("a fresh roster accepts a thread");
-        let (sender, rx) = mpsc::channel::<VcpuEvent>();
-
-        sender
-            .send(VcpuEvent::Error {
-                vcpu_id: 3,
-                error: "late vCPU".into(),
-            })
-            .expect("the test holds the receiver");
-        let event = VcpuSet::Roster(&threads).next_event(&rx);
-
-        assert!(matches!(event, Some(VcpuEvent::Error { vcpu_id: 3, .. })));
-        drop(park);
-        assert!(join_vcpus_bounded(threads.close(), Duration::from_secs(5)));
-    }
-}
+mod tests;

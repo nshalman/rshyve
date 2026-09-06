@@ -52,6 +52,22 @@ pub enum FlushError {
     TimedOut,
 }
 
+/// The deadline a device halt holds itself to when it does not say.
+///
+/// This value covers every halt in the tree that waits on purpose.
+/// virtio-fs polls its worker for 5 s (`vmm-virtio/src/fs/mod.rs`,
+/// `FS_HALT_BUDGET`). virtio-vsock and virtio-console each join an
+/// accept thread for 2 s and their readers for 2 s more
+/// (`vmm-virtio/src/vsock/device.rs` and `vmm-virtio/src/console.rs`,
+/// `HALT_BUDGET`).
+///
+/// WHY the default is the largest of those and not the smallest: the
+/// teardown sweep bounds each halt from the outside. A bound shorter
+/// than the deadline the device polls abandons a halt one poll before
+/// it returns, and the in-kernel state that halt gives back stays held.
+/// A device that returns sooner costs only a budget nothing spends.
+pub const DEFAULT_HALT_BUDGET: Duration = Duration::from_secs(5);
+
 /// Virtio PCI transport state for migration export/import.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VirtioMigratePciState {
@@ -172,6 +188,25 @@ pub trait Lifecycle: Send + Sync + 'static {
     /// Indicates that the device's instance is stopping.
     /// Only called on paused devices.
     fn halt(&self) {}
+
+    /// The deadline this device's [`halt`](Lifecycle::halt) holds
+    /// itself to.
+    ///
+    /// Teardown runs every halt under a bound of its own and derives
+    /// that bound from this value plus its own slack, so a device that
+    /// polls a deadline inside `halt` must report the same deadline
+    /// here. A device that reports less than it waits is abandoned one
+    /// poll short of returning, and whatever the halt gives back stays
+    /// held.
+    ///
+    /// [`DEFAULT_HALT_BUDGET`] covers every halt in the tree, so a
+    /// device whose halt returns at once may leave this alone. A device
+    /// that reports its own shorter deadline shortens the clock the
+    /// teardown watchdog is given. A device that waits for longer MUST
+    /// report it here: nothing else tells teardown to wait.
+    fn halt_budget(&self) -> Duration {
+        DEFAULT_HALT_BUDGET
+    }
 
     /// Return the Migrator for exporting/importing this device's state.
     fn migrate(&'_ self) -> Migrator<'_> {
@@ -439,6 +474,39 @@ pub enum UnplugError {
 /// workers back to work; [`Indicator`] then refuses `Run -> Halt` and
 /// leaves the device running. Detaching its BARs there would strip a
 /// live device, so the unplug reports [`UnplugError::Refused`] instead.
+///
+/// # The halt is not bounded, and cannot be from here
+///
+/// `budget` bounds the quiesce wait only. The halt below can hold the
+/// calling thread for as long as the device's own release takes, and
+/// viona's is untimed: `VNA_IOC_DELETE` waits for each ring worker in a
+/// `cv_wait` that heeds no signal. Teardown solves the same problem by
+/// running each halt on a thread it can abandon
+/// (`vmm-machine/src/teardown.rs`, `halt_bounded`). That answer does
+/// not port here, for two reasons that are properties of the caller and
+/// not of this function:
+///
+/// * Abandoning the halt would return from the unplug with the release
+///   in flight. The eject caller then detaches the BARs and drops the
+///   registry record, while a viona poll thread may still be inside a
+///   transport callback on the device that is leaving. Teardown may
+///   abandon a halt because nothing runs after it but the VM destroy.
+/// * The state read below would then run under a halt that still holds
+///   whatever locks it took. `halt_devices` refuses that read after a
+///   timeout for exactly this reason.
+///
+/// Bounding it therefore needs the eject path to grow a third outcome,
+/// "halting, do not touch the slot yet", a place to observe the release
+/// finishing, and a retry that does not read `Halt` as done. Every
+/// device that reports a state takes the [`Indicator`] edge at the top
+/// of its halt, so the state says `Halt` from the first instant of a
+/// release that has not happened yet, and viona reports no state at
+/// all.
+///
+/// Until that lands, every caller must run this off the vCPU threads
+/// and off any thread that has to stay answerable. The eject path
+/// already does (`vmm-machine/src/hotplug.rs`, the drain thread); the
+/// hot-add rollback still runs on the control-socket thread.
 pub fn prepare_unplug(
     dev: &Arc<dyn Lifecycle>,
     budget: Duration,
