@@ -4,9 +4,22 @@
 
 //! Unit tests for the virtio-vsock device.
 
+use super::halt::{HALT_BUDGET, HALT_JOIN_ROUNDS};
+use super::listener::{
+    classify_host_line, handle_host_connect, start_host_connection, HostVerb,
+    CONNECT_LINE_MAX,
+};
+use super::shared::HOST_WRITE_TIMEOUT;
 use super::*;
-use crate::pci::intr::IntrGate;
-use std::sync::atomic::AtomicUsize;
+use crate::pci::intr::{BackendIntr, IntrGate};
+use crate::vsock::control::{read_line_bounded, LineRead, HANDSHAKE_BUDGET};
+use crate::vsock::mux::MAX_CONNS;
+use crate::vsock::packet::ConnKey;
+use std::io::{self, Read};
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+use vmm_core::unixsock::write_all_bounded;
 use vmm_devices::Lifecycle;
 
 #[test]
