@@ -355,9 +355,10 @@ fn o_trunc_cannot_destroy_a_file_on_a_read_only_share() {
 // truncation rather than every open.
 //
 // This and the next test reach `reopen_fd`, which reopens through
-// /proc/self/fd. That path does not exist on a macOS dev host, so both
-// run only on the deployment target.
-#[cfg(target_os = "illumos")]
+// /proc/self/fd. illumos and Linux both have that path; a macOS dev
+// host does not. Keep Linux in the gate: it is the only platform CI
+// runs on, so an illumos-only gate would run these nowhere.
+#[cfg(any(target_os = "illumos", target_os = "linux"))]
 #[test]
 fn a_plain_read_open_still_works_on_a_read_only_share() {
     let dir = private_dir();
@@ -367,7 +368,7 @@ fn a_plain_read_open_still_works_on_a_read_only_share() {
     assert_eq!(reply_error(&srv, &open_request(nodeid, flags)), 0);
 }
 
-#[cfg(target_os = "illumos")]
+#[cfg(any(target_os = "illumos", target_os = "linux"))]
 #[test]
 fn o_trunc_still_works_on_a_writable_share() {
     let dir = private_dir();
