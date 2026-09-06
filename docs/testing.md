@@ -33,6 +33,42 @@ they read `ssh $VMM_HEADNODE ...` rather than `ssh root@$VMM_HEADNODE`.
 | `$VMM_BUILD_HOST` | Platform image builds | Full autotools + OpenSSL toolchain |
 | `$VMM_FIREHYVE_HOST` | firehyve + virtio-fs tests | No compiler and no outbound network |
 
+### The vTPM crates on a developer host
+
+`vmm_tpm_sys` builds the vendored libtpms from the submodule, so its
+tests and the `vmm_tpm` CRB tests need a C toolchain, autotools and
+OpenSSL. Every other crate needs none of that. Get them once:
+
+```sh
+git submodule update --init third_party/libtpms
+brew install autoconf automake libtool pkgconf openssl@3   # macOS
+```
+
+Then the two crates build and their tests run on the laptop:
+
+```sh
+cargo test -p vmm_tpm_sys -p vmm_tpm
+```
+
+`pkgconf` is not optional. It carries `pkg.m4`, which `autoreconf` needs
+for the libtpms `PKG_INSTALLDIR` macro, and the build script asks
+`pkg-config` where OpenSSL is. Without it `autoreconf` stops at
+`'pkgconfig_DATA' is used but 'pkgconfigdir' is undefined`.
+
+Two limits are real, and neither is worked around:
+
+* Only these two crates. rshyve and the rest of the workspace call
+  illumos interfaces that no other operating system has.
+* A developer host links the libtpms it builds against the OpenSSL that
+  `pkg-config` reports. The SmartOS path, which binds the `sunw_`
+  prefixed platform libcrypto through a generated header and a link
+  farm, is taken only on a SmartOS host, so it is proved on
+  `$VMM_BUILD_HOST` and not on a laptop.
+
+If `autoreconf` reports `libtoolize: command not found`, the autoconf in
+use is not the Homebrew build, which calls `glibtoolize`. Point it at
+the GNU one: `export LIBTOOLIZE=glibtoolize`.
+
 ### Build on Headnode
 
 Do this one time if the host still holds the checkout with its old name.
