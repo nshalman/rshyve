@@ -67,6 +67,7 @@ enum Step {
     RingReset(u16),
     RingPause(u16),
     RingSetState(vioc_ring_state),
+    RingGetState(u16),
     RingSetMsi {
         ring: u16,
         addr: u64,
@@ -268,6 +269,7 @@ impl LinkOps for TestLink {
     }
 
     fn ring_get_state(&self, ring: u16) -> std::io::Result<vioc_ring_state> {
+        self.push(Step::RingGetState(ring));
         self.result(Op::RingGetState)?;
         // The indices a migration source reads out. Distinct, and
         // neither is the ring, so a caller that returns the wrong

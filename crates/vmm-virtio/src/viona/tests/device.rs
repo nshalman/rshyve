@@ -641,6 +641,99 @@ fn a_migration_source_reads_the_indices_the_kernel_reports() {
 }
 
 #[test]
+fn a_halted_device_reads_no_ring_state() {
+    // An export can run while the halt is inside the delete, which
+    // holds no device lock. An ioctl that got in would wait out that
+    // untimed kernel call holding the lock every vCPU needs, on a
+    // link that is destroyed.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+    device.halt();
+    steps.lock().expect("steps lock").clear();
+
+    assert_eq!(device.get_kernel_ring_state(1), None);
+
+    assert_eq!(
+        steps_of(&steps),
+        [],
+        "a ring state read reached the link after the delete",
+    );
+}
+
+#[test]
+fn a_migration_source_reads_the_state_of_the_ring_it_names() {
+    // The read carries the ring, and the answer goes into that ring's
+    // payload. One that always read ring 0 would give every ring ring
+    // 0's indices.
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps)));
+
+    assert_eq!(device.get_kernel_ring_state(1), Some((0x1112, 0x2223)));
+
+    assert_eq!(steps_of(&steps), [Step::RingGetState(1)]);
+}
+
+#[test]
+fn a_restore_refuses_indices_no_running_ring_can_have_left() {
+    // The export answers with a pair of numbers and cannot say that
+    // the kernel refused the read, so a ring it could not read for
+    // arrives with a consumption cursor of 0 against a used index the
+    // export took from guest memory. Programmed as is, viona treats
+    // the whole available ring as unconsumed and hands the driver
+    // descriptors it has already reclaimed.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+
+    VirtioDevice::restore_ring_state(
+        &device,
+        1,
+        NET_QUEUE_SIZE,
+        0x1_0000,
+        0x2_0000,
+        0x3_0000,
+        0,
+        900,
+        0,
+        0,
+    );
+
+    assert_eq!(
+        steps_of(&steps),
+        [],
+        "a ring with more chains in flight than descriptors was programmed",
+    );
+}
+
+#[test]
+fn a_restore_takes_indices_that_wrapped() {
+    // Both cursors count in a u16 and wrap with it. A check that read
+    // the pair as plain numbers would refuse every ring the source
+    // paused across a wrap, and a migrated guest would lose the queue.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+
+    VirtioDevice::restore_ring_state(
+        &device,
+        1,
+        NET_QUEUE_SIZE,
+        0x1_0000,
+        0x2_0000,
+        0x3_0000,
+        3,
+        u16::MAX - 5,
+        0,
+        0,
+    );
+
+    assert!(
+        steps_of(&steps)
+            .iter()
+            .any(|step| matches!(step, Step::RingSetState(_))),
+        "a ring whose indices wrapped was refused",
+    );
+}
+
+#[test]
 fn a_restore_programs_the_ring_and_its_interrupt() {
     // The addresses and the indices go in together, because ring_init
     // would put the indices back to 0. The features come first, since

@@ -338,7 +338,12 @@ impl VirtioDevice for VirtioViona {
     }
 
     fn get_kernel_ring_indices(&self, queue_idx: u16) -> (u16, u16) {
-        self.get_kernel_ring_state(queue_idx)
+        // The trait carries a pair of numbers and no way to say "no
+        // answer", and a device that has none reads here as a ring
+        // that moved nothing. The export then falls back to indices
+        // userspace keeps, which viona never moves. `ring_set_state`
+        // on the destination refuses the payload that makes.
+        self.get_kernel_ring_state(queue_idx).unwrap_or((0, 0))
     }
 
     fn reset_all_rings(&self) {

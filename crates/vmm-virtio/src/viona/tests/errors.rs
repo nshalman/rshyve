@@ -167,14 +167,19 @@ fn a_halt_deletes_the_link_though_every_ring_reset_fails() {
 }
 
 #[test]
-fn a_ring_state_read_the_kernel_refused_reports_no_progress() {
-    // These two indices go into the migration payload, and the read
-    // cannot report to its caller. A refusal has to look like a ring
-    // that moved nothing, not like whatever the last ring answered.
+fn a_ring_state_read_the_kernel_refused_has_no_answer() {
+    // The indices are the kernel's alone: viona never moves the pair
+    // userspace keeps, so nothing stands in for them. The device says
+    // it has no answer rather than reporting a ring that moved
+    // nothing.
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::RingGetState]);
     let device = device_with(Arc::new(link));
 
+    assert_eq!(device.get_kernel_ring_state(1), None);
+    // What the trait can carry. The pair reads as a ring that moved
+    // nothing, and `ring_set_state` on the destination refuses the
+    // payload that makes.
     assert_eq!(VirtioDevice::get_kernel_ring_indices(&device, 1), (0, 0));
 }
 
