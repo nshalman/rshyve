@@ -89,6 +89,11 @@ Note: rsync may not update timestamps. Use `--checksum` or `touch` changed files
 
 ### Boot a Test VM
 
+This recipe takes the whole node: `pkill -9 rshyve` ends every VMM
+process on it, and the name `testvm` is shared. Give the VM your own
+prefix and kill by that prefix when anybody else may be on the same
+host. See [Cleanup Test VMs](#cleanup-test-vms).
+
 ```bash
 ssh $VMM_HEADNODE 'pkill -9 rshyve; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null; sleep 1; \
 zfs rollback zones/vmm-test-disk@final 2>/dev/null; \
@@ -199,10 +204,36 @@ ssh $VMM_HEADNODE 'export PATH=/opt/tools/bin:$PATH; \
 
 ### Cleanup Test VMs
 
+Name every VM you boot with a prefix of your own, and sweep by that
+prefix at the end of the run. A session that skipped this left 14 VM
+instances and 15 dataset clones alive for 12 hours.
+
+Read the list before you destroy anything:
+
 ```bash
-ssh $VMM_HEADNODE 'pkill -9 rshyve; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null'
-ssh -i $VMM_LAB_KEY $VMM_MIGRATE_HOST 'pkill -9 rshyve; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null'
+export PFX=<your-prefix>-
+: "${PFX:?set PFX before you run any sweep below}"
+ssh $VMM_HEADNODE "pgrep -fl 'rshyve.*$PFX'; ls /dev/vmm | grep \"^$PFX\""
 ```
+
+Then sweep what that listed. An empty `PFX` here matches every VM on
+the node, so keep the guard:
+
+```bash
+: "${PFX:?set PFX before you run any sweep below}"
+SWEEP="pkill -f 'rshyve.*$PFX'; \
+  for v in \$(ls /dev/vmm | grep \"^$PFX\"); do \
+    /usr/sbin/bhyvectl --vm=\$v --destroy; done"
+ssh $VMM_HEADNODE "$SWEEP"
+ssh -i $VMM_LAB_KEY $VMM_MIGRATE_HOST "$SWEEP"
+```
+
+Dataset clones do not go with the process. List them and destroy the
+ones you made, by name.
+
+**Never touch a `SYSbhyve-*` instance.** Those belong to the platform
+and each one is somebody's running guest. A sweep that matches on
+`rshyve` alone, or on no prefix at all, reaches them.
 
 ### Boot-Time Profiling
 
@@ -607,6 +638,12 @@ The shape that found bugs, and that
 4. After every reset, read back a file of known content in the guest and
    compare its SHA-256. A reset that loses or reorders a completion
    corrupts data quietly; a pass/fail on the reset alone does not see it.
+5. Give the guest 4 or more vCPUs, drive one writer per queue with
+   `taskset` pinned to the vCPU that owns it, and read
+   `/proc/interrupts` per vector afterwards. Every vector must have
+   moved. A completion routed to the wrong queue leaves one vector
+   carrying the whole run while throughput and every aggregate counter
+   stay healthy ([hardware-run.md](hardware-run.md#the-rerun-on-a-distro-guest)).
 
 Two guest resets that also need cover, and that the run above included:
 a warm reboot with a dirty page cache, and an ACPI S5 poweroff. After a

@@ -56,9 +56,16 @@ honor at startup. See [docs/cli.md](docs/cli.md#firehyve).
 
 ## Building and testing
 
-The `rshyve` binary builds only on illumos: `vmm-tpm-sys` runs an autotools
-build of libtpms, `bhyve-api` binds SunOS ioctls, and `viona-api` needs
-libdladm. Everything else in the workspace builds and tests on any host.
+The `rshyve` binary targets illumos: `bhyve-api` binds SunOS ioctls and
+`viona-api` needs libdladm. Everything else in the workspace builds and
+tests on any host.
+
+`vmm-tpm-sys` is one of those. It drives a real autotools build of the
+vendored libtpms on macOS and Linux as well as on illumos, and the 12
+vTPM tests run on each. Do not replace it with a stub build script. A
+stub hides the OpenSSL link path, and that path is what once produced a
+binary no platform image could load
+([docs/platform.md](docs/platform.md#openssl-and-the-vtpm)).
 
 libtpms is a submodule, so clone with it:
 
@@ -77,7 +84,8 @@ fails, and the partial output still reads like a completed pass.
 
 Build prerequisites on the illumos host: a Rust toolchain, autoconf,
 automake, libtool, pkg-config, gmake, gcc, and OpenSSL development
-files. DTrace is not required to build; USDT probes are compiled in
+files. A macOS or Linux host needs the same set, with `make` in place
+of `gmake`. DTrace is not required to build; USDT probes are compiled in
 either way and simply do not register without it.
 
 [docs/testing.md](docs/testing.md) covers the lab procedures: booting a
