@@ -111,8 +111,11 @@ type QueueInterrupt = Arc<dyn Fn(u16) + Send + Sync>;
 
 struct VionaInner {
     /// Open handle to the viona kernel device.
+    ///
+    /// Shared, so the halt can keep the link after it drops the device
+    /// lock. The calls the halt makes are untimed kernel waits.
     #[cfg(target_os = "illumos")]
-    viona_fd: viona_api::VionaFd,
+    viona_fd: Arc<viona_api::VionaFd>,
 
     /// The link a halt calls, on a build with no viona driver.
     ///
@@ -120,7 +123,7 @@ struct VionaInner {
     /// device cannot be created at all, so this exists only so the
     /// halt has one code path on every platform.
     #[cfg(not(target_os = "illumos"))]
-    link: Box<dyn LinkOps>,
+    link: Arc<dyn LinkOps>,
 
     /// MAC address of the VNIC.
     mac_addr: [u8; ETHERADDRL],
@@ -154,14 +157,17 @@ struct VionaInner {
 
 impl VionaInner {
     /// The link this build talks to.
+    ///
+    /// Handed out by value so a caller can drop the device lock and
+    /// still hold the link.
     #[cfg(target_os = "illumos")]
-    fn link(&self) -> &dyn LinkOps {
-        &self.viona_fd
+    fn link(&self) -> Arc<dyn LinkOps> {
+        Arc::clone(&self.viona_fd) as Arc<dyn LinkOps>
     }
 
     #[cfg(not(target_os = "illumos"))]
-    fn link(&self) -> &dyn LinkOps {
-        self.link.as_ref()
+    fn link(&self) -> Arc<dyn LinkOps> {
+        Arc::clone(&self.link)
     }
 
     /// Where a halt reports, discarding when the device got no logger.
@@ -188,9 +194,12 @@ fn stop_poller(poller: Option<Poller>, log: &slog::Logger) {
 
 /// Reset every ring, then destroy the link.
 ///
-/// The delete resets the rings itself, but its reset does not heed
-/// signals (`viona_ring.c`, `viona_ring_reset`). Resetting first, where
-/// a signal can cut the wait short, leaves that one less to do.
+/// The delete resets the rings itself, in a wait that ignores signals
+/// (`viona_main.c`, `viona_ioc_delete`). A ring that is in its reset
+/// state already leaves that wait at once (`viona_ring.c`,
+/// `viona_ring_reset`), so each reset that succeeds here is one wait
+/// the delete does not make. Nothing in this process signals the
+/// teardown thread, so the order does not make the halt interruptible.
 ///
 /// A failure is reported and the sweep carries on. Teardown must reach
 /// the destroy whatever the link does.
@@ -260,7 +269,7 @@ impl VirtioViona {
 
         Ok(Self {
             inner: Mutex::new(VionaInner {
-                viona_fd,
+                viona_fd: Arc::new(viona_fd),
                 mac_addr,
                 dev_features,
                 negotiated_features: 0,
@@ -271,20 +280,6 @@ impl VirtioViona {
                 halted: false,
             }),
         })
-    }
-
-    /// Stop the interrupt poll thread and wait for it to leave.
-    ///
-    /// The thread reads the viona descriptor and calls back into the
-    /// PCI transport, so it must be gone before the link is destroyed.
-    /// The join runs with the device lock dropped: the thread may be
-    /// inside that callback now, and it takes transport locks.
-    fn poller_stop(&self) {
-        let (poller, log) = {
-            let mut inner = self.inner.lock().expect("viona lock poisoned");
-            (inner.poller.take(), inner.log())
-        };
-        stop_poller(poller, &log);
     }
 
     /// Restore ring state after migration using VNA_IOC_RING_SET_STATE.
@@ -858,6 +853,12 @@ impl VirtioDevice for VirtioViona {
         // When the guest programs a queue address, tell the kernel
         // where the ring structures live.
         let mut inner = self.inner.lock().expect("viona lock poisoned");
+        // The halt destroys the link with this lock dropped, so a guest
+        // write can land in the middle of it. A ring marked ready then
+        // would let the next kick reach a link that is gone.
+        if inner.halted {
+            return;
+        }
         Self::ring_init(&mut inner, queue_idx, queue);
     }
 
@@ -1122,35 +1123,73 @@ impl Lifecycle for VirtioViona {
     /// This call is not bounded. The delete waits for each ring worker
     /// to stop, and does not heed signals, so it must run on the
     /// teardown thread the shutdown watchdog keeps a clock on.
+    ///
+    /// A hot unplug halts too, with the guest running
+    /// (`vmm_devices::lifecycle::prepare_unplug`). So the device lock is
+    /// dropped before any of that: `cfg_read`, `notify_queue`,
+    /// `queue_addr_set` and `reset` take the same lock, and a vCPU in
+    /// one of them must not wait out an untimed kernel call.
     fn halt(&self) {
-        self.poller_stop();
+        let (link, log, poller) = {
+            let mut inner = self.inner.lock().expect("viona lock poisoned");
+            // A second halt has no link left to destroy. viona would
+            // treat it as a no-op, but a repeated delete would also
+            // repeat the wait inside it.
+            if inner.halted {
+                return;
+            }
+            inner.halted = true;
+            // A deferred start held past the halt would revive a dead
+            // link.
+            inner.deferred_poll = None;
+            // Nothing may kick the rings again: they are gone. This is
+            // set before the lock is dropped, so a kick that races the
+            // delete finds no ring to send.
+            inner.ring_state = [RingState::Init; NET_NUM_QUEUES];
+            inner.negotiated_features = 0;
+            (inner.link(), inner.log(), inner.poller.take())
+        };
 
-        let mut inner = self.inner.lock().expect("viona lock poisoned");
-        // A second halt has no link left to destroy. viona would treat
-        // it as a no-op, but a repeated delete would also repeat the
-        // wait inside it.
-        if inner.halted {
-            return;
-        }
-        inner.halted = true;
-        // A deferred start held past the halt would revive a dead link.
-        inner.deferred_poll = None;
-
-        let log = inner.log();
-        halt_link(inner.link(), &log);
-
-        // Nothing may kick the rings again: they are gone.
-        inner.ring_state = [RingState::Init; NET_NUM_QUEUES];
-        inner.negotiated_features = 0;
+        // The poll thread reads the viona descriptor and calls back
+        // into the PCI transport, so it must be gone before the link
+        // is destroyed. The join needs the device lock dropped as well:
+        // the thread may be inside that callback now, and it takes
+        // transport locks.
+        stop_poller(poller, &log);
+        halt_link(link.as_ref(), &log);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // What these tests reach, and what they do not.
+    //
+    // The halt, the reset and the deferred poll bookkeeping are the
+    // same code on every platform, so a test link exercises the real
+    // thing. The ioctl paths (`ring_kick`, `ring_init`,
+    // `ring_set_state`) exist only on illumos and have nothing to stand
+    // in for them off it. No test here covers those. Do not add one
+    // that calls their empty stub: it reads as coverage and pins
+    // nothing.
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, OnceLock, Weak};
+    use std::time::Duration;
 
     /// What one halt asked of the kernel, in order.
     type Steps = Arc<Mutex<Vec<String>>>;
+
+    /// How long a test waits before it calls a thread stuck.
+    ///
+    /// A wait that runs out is a failure, never a pass. It is long
+    /// enough that a loaded machine does not reach it.
+    const STUCK: Duration = Duration::from_secs(15);
+
+    /// How long a blocked delete waits to be released.
+    ///
+    /// Longer than [`STUCK`], so a test that fails reports the thread
+    /// that is really stuck.
+    const DELETE_STUCK: Duration = Duration::from_secs(60);
 
     /// A link that records the calls a halt makes.
     ///
@@ -1160,6 +1199,10 @@ mod tests {
     struct RecordingLink {
         steps: Steps,
         delete_result: fn() -> std::io::Result<()>,
+        /// The device to check for a held lock, once it exists.
+        device: OnceLock<Weak<VirtioViona>>,
+        /// The calls that ran with the device lock held.
+        locked: Mutex<Vec<String>>,
     }
 
     impl RecordingLink {
@@ -1167,20 +1210,40 @@ mod tests {
             Self {
                 steps: Arc::clone(steps),
                 delete_result: || Ok(()),
+                device: OnceLock::new(),
+                locked: Mutex::new(Vec::new()),
             }
         }
 
         fn failing(steps: &Steps) -> Self {
             Self {
-                steps: Arc::clone(steps),
                 delete_result: || {
                     Err(std::io::Error::from(std::io::ErrorKind::NotFound))
                 },
+                ..Self::new(steps)
             }
         }
 
+        /// Watch `device` for a lock held across the calls below.
+        fn watch(&self, device: &Arc<VirtioViona>) {
+            self.device
+                .set(Arc::downgrade(device))
+                .expect("the link watches one device");
+        }
+
         fn push(&self, step: String) {
+            if let Some(device) = self.device.get().and_then(Weak::upgrade) {
+                // A guard the halt still holds refuses this, which is
+                // the regression the watch exists to catch.
+                if device.inner.try_lock().is_err() {
+                    self.locked.lock().expect("locked lock").push(step.clone());
+                }
+            }
             self.steps.lock().expect("steps lock").push(step);
+        }
+
+        fn locked_calls(&self) -> Vec<String> {
+            self.locked.lock().expect("locked lock").clone()
         }
     }
 
@@ -1196,6 +1259,35 @@ mod tests {
         }
     }
 
+    /// A link whose delete waits until the test releases it.
+    ///
+    /// On illumos the delete is an untimed kernel wait. This stands in
+    /// for it, so a test can act while the halt is inside one.
+    struct BlockingLink {
+        entered: Mutex<mpsc::Sender<()>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl LinkOps for BlockingLink {
+        fn ring_reset(&self, _ring: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn delete(&self) -> std::io::Result<()> {
+            self.entered
+                .lock()
+                .expect("entered lock")
+                .send(())
+                .expect("the test waits for the delete");
+            self.release
+                .lock()
+                .expect("release lock")
+                .recv_timeout(DELETE_STUCK)
+                .expect("the test released the delete");
+            Ok(())
+        }
+    }
+
     fn steps_of(steps: &Steps) -> Vec<String> {
         steps.lock().expect("steps lock").clone()
     }
@@ -1208,7 +1300,7 @@ mod tests {
     /// On illumos this would need a real VionaFd; for CI we test
     /// the state-tracking logic via the fields directly.
     #[cfg(not(target_os = "illumos"))]
-    fn test_inner_with(link: Box<dyn LinkOps>) -> VionaInner {
+    fn test_inner_with(link: Arc<dyn LinkOps>) -> VionaInner {
         VionaInner {
             link,
             mac_addr: [0x02, 0x08, 0x20, 0xaa, 0xbb, 0xcc],
@@ -1222,14 +1314,9 @@ mod tests {
         }
     }
 
+    /// A device whose halt is watched through its link.
     #[cfg(not(target_os = "illumos"))]
-    fn test_inner() -> VionaInner {
-        test_inner_with(Box::new(RecordingLink::new(&Steps::default())))
-    }
-
-    /// A device whose halt is watched through `steps`.
-    #[cfg(not(target_os = "illumos"))]
-    fn device_with(link: Box<dyn LinkOps>) -> VirtioViona {
+    fn device_with(link: Arc<dyn LinkOps>) -> VirtioViona {
         VirtioViona {
             inner: Mutex::new(test_inner_with(link)),
         }
@@ -1237,8 +1324,8 @@ mod tests {
 
     #[test]
     fn a_halt_resets_every_ring_before_it_deletes_the_link() {
-        // The delete resets the rings itself, in a wait that does not
-        // heed signals. Resetting first leaves that one less to do.
+        // A ring that is reset already leaves the delete's own wait at
+        // once, and that wait ignores signals.
         let steps = Steps::default();
         let link = RecordingLink::new(&steps);
 
@@ -1263,39 +1350,52 @@ mod tests {
     }
 
     #[test]
-    fn stopping_a_poller_wakes_the_thread_and_joins_it() {
-        // The poll thread parks with no timeout, so closing the write
-        // end is the only thing that can end it. A stop that does not
-        // wake the thread hangs this test, which is the failure it
-        // exists to catch; the poll below bounds that hang.
+    fn stopping_a_poller_wakes_the_thread_and_waits_for_it() {
+        // Two properties the halt needs. The poll thread parks with no
+        // timeout, so closing the write end is the only thing that can
+        // end it. And the stop must not return before the thread is
+        // gone: the link is deleted next, and the thread reads it.
         use std::os::fd::AsRawFd;
 
         let (stop, wake) = std::io::pipe().expect("the test can open a pipe");
-        let woken = Arc::new(Mutex::new(false));
-        let reported = Arc::clone(&woken);
-        let thread = std::thread::Builder::new()
-            .name("poller-stub".into())
-            .spawn(move || {
-                let mut pfd = libc::pollfd {
-                    fd: stop.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // A closed write end leaves the descriptor ready, so
-                // this returns once and does not spin.
-                while unsafe { libc::poll(&mut pfd, 1, 10_000) } < 0 {
-                    let err = std::io::Error::last_os_error();
-                    assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
-                }
-                *reported.lock().expect("woken lock") = pfd.revents != 0;
-            })
-            .expect("the test can spawn a thread");
+        let woken = Arc::new(AtomicBool::new(false));
+        let gone = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let woken = Arc::clone(&woken);
+            let gone = Arc::clone(&gone);
+            std::thread::Builder::new()
+                .name("poller-stub".into())
+                .spawn(move || {
+                    let mut pfd = libc::pollfd {
+                        fd: stop.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // A closed write end leaves the descriptor ready,
+                    // so this returns once and does not spin. The
+                    // timeout only stops a broken wake from hanging.
+                    while unsafe { libc::poll(&mut pfd, 1, 10_000) } < 0 {
+                        let err = std::io::Error::last_os_error();
+                        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+                    }
+                    woken.store(pfd.revents != 0, Ordering::SeqCst);
+                    // A stop that drops the handle instead of joining
+                    // it returns inside this window.
+                    std::thread::sleep(Duration::from_millis(200));
+                    gone.store(true, Ordering::SeqCst);
+                })
+                .expect("the test can spawn a thread")
+        };
 
         stop_poller(Some(Poller { wake, thread }), &null_log());
 
         assert!(
-            *woken.lock().expect("woken lock"),
+            woken.load(Ordering::SeqCst),
             "the stop pipe never became ready",
+        );
+        assert!(
+            gone.load(Ordering::SeqCst),
+            "the stop returned before the thread left",
         );
     }
 
@@ -1305,7 +1405,7 @@ mod tests {
         // VM_DESTROY_SELF waits for every vmm_drv hold in an untimed
         // cv_wait. VNA_IOC_DELETE is what gives viona's hold back.
         let steps = Steps::default();
-        let device = device_with(Box::new(RecordingLink::new(&steps)));
+        let device = device_with(Arc::new(RecordingLink::new(&steps)));
 
         device.halt();
 
@@ -1317,11 +1417,108 @@ mod tests {
 
     #[cfg(not(target_os = "illumos"))]
     #[test]
+    fn a_halt_holds_no_device_lock_while_it_stops_the_link() {
+        // A hot unplug halts a device the guest is still using
+        // (`vmm_devices::lifecycle::prepare_unplug`). Every call the
+        // halt makes is an untimed kernel wait, and cfg_read,
+        // notify_queue, queue_addr_set and reset all take this lock. A
+        // vCPU must not wait behind the teardown. This fails the moment
+        // somebody holds the guard across halt_link again.
+        let steps = Steps::default();
+        let link = Arc::new(RecordingLink::new(&steps));
+        let device = Arc::new(device_with(link.clone()));
+        link.watch(&device);
+
+        device.halt();
+
+        assert_eq!(
+            steps_of(&steps),
+            ["ring_reset(0)", "ring_reset(1)", "delete"],
+        );
+        assert!(
+            link.locked_calls().is_empty(),
+            "the halt held the device lock through {:?}",
+            link.locked_calls(),
+        );
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    #[test]
+    fn a_config_read_does_not_wait_behind_the_link_delete() {
+        // The same property from the guest's side: a vCPU reads the
+        // device config while the halt sits in the delete.
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let device = Arc::new(device_with(Arc::new(BlockingLink {
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        })));
+
+        let halting = {
+            let device = Arc::clone(&device);
+            std::thread::Builder::new()
+                .name("halt".into())
+                .spawn(move || device.halt())
+                .expect("the test can spawn a thread")
+        };
+        entered_rx
+            .recv_timeout(STUCK)
+            .expect("the halt reached the delete");
+
+        // The read runs on its own thread. A lock the halt held would
+        // park it for as long as the delete runs, and this test has to
+        // report that rather than hang with it.
+        let (read_tx, read_rx) = mpsc::channel();
+        let reader = {
+            let device = Arc::clone(&device);
+            std::thread::Builder::new()
+                .name("cfg-read".into())
+                .spawn(move || {
+                    let mac = device.cfg_read(0, 4);
+                    read_tx.send(mac).expect("the test waits for the read");
+                })
+                .expect("the test can spawn a thread")
+        };
+        let observed = read_rx.recv_timeout(STUCK);
+
+        release_tx.send(()).expect("the delete waits for this");
+        halting.join().expect("the halting thread left");
+        reader.join().expect("the reading thread left");
+
+        assert_eq!(
+            observed.expect("a config read waited out the link delete"),
+            u32::from_le_bytes([0x02, 0x08, 0x20, 0xaa]),
+        );
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    #[test]
+    fn a_halt_leaves_no_ring_a_kick_can_reach() {
+        // The halt drops the device lock before it destroys the link,
+        // so a vCPU can reach notify_queue while the delete runs. It
+        // must find no ring ready to kick.
+        let steps = Steps::default();
+        let device = device_with(Arc::new(RecordingLink::new(&steps)));
+        {
+            let mut inner = device.inner.lock().expect("viona lock");
+            inner.negotiated_features = u64::from(VIRTIO_NET_F_MAC);
+            inner.ring_state = [RingState::Ready; NET_NUM_QUEUES];
+        }
+
+        device.halt();
+
+        let inner = device.inner.lock().expect("viona lock");
+        assert_eq!(inner.ring_state, [RingState::Init; NET_NUM_QUEUES]);
+        assert_eq!(inner.negotiated_features, 0);
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    #[test]
     fn a_second_halt_does_not_delete_again() {
         // The delete waits for each ring worker to stop. Repeating it
         // would repeat that wait for nothing.
         let steps = Steps::default();
-        let device = device_with(Box::new(RecordingLink::new(&steps)));
+        let device = device_with(Arc::new(RecordingLink::new(&steps)));
 
         device.halt();
         device.halt();
@@ -1338,7 +1535,7 @@ mod tests {
         // Teardown carries on to the destroy, so a failure must not
         // leave the device asking to be halted again.
         let steps = Steps::default();
-        let device = device_with(Box::new(RecordingLink::failing(&steps)));
+        let device = device_with(Arc::new(RecordingLink::failing(&steps)));
 
         device.halt();
         device.halt();
@@ -1351,15 +1548,36 @@ mod tests {
 
     #[cfg(not(target_os = "illumos"))]
     #[test]
-    fn a_halt_drops_a_deferred_poll_so_a_late_restore_cannot_revive_it() {
+    fn a_halt_drops_a_deferred_poll() {
         // A migration restore can land after the halt. Starting the
         // deferred poll thread then would read a destroyed link.
         let steps = Steps::default();
-        let device = device_with(Box::new(RecordingLink::new(&steps)));
+        let device = device_with(Arc::new(RecordingLink::new(&steps)));
         let raise: QueueInterrupt = Arc::new(|_| {});
-        device.store_poll_fn(Arc::clone(&raise), null_log());
+        device.store_poll_fn(raise, null_log());
 
         device.halt();
+
+        let inner = device.inner.lock().expect("viona lock");
+        assert!(inner.halted);
+        assert!(
+            inner.deferred_poll.is_none(),
+            "the halt left a deferred poll behind",
+        );
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    #[test]
+    fn a_halted_device_refuses_a_deferred_poll() {
+        // A restore that stores its callback after the halt must leave
+        // nothing for start_poll_deferred to find.
+        let steps = Steps::default();
+        let device = device_with(Arc::new(RecordingLink::new(&steps)));
+        device.halt();
+
+        let raise: QueueInterrupt = Arc::new(|_| {});
+        device.store_poll_fn(raise, null_log());
+
         assert!(
             device
                 .inner
@@ -1367,123 +1585,27 @@ mod tests {
                 .expect("viona lock")
                 .deferred_poll
                 .is_none(),
-            "the halt left a deferred poll behind",
+            "a halted device took a deferred poll",
         );
-
-        // A restore that stores its callback after the halt is
-        // refused, so nothing can start on the destroyed link.
-        device.store_poll_fn(raise, null_log());
-        device.start_poll_deferred();
-
-        let inner = device.inner.lock().expect("viona lock");
-        assert!(inner.halted);
-        assert!(inner.deferred_poll.is_none());
-        assert!(inner.poller.is_none());
     }
 
     #[cfg(not(target_os = "illumos"))]
     #[test]
-    fn a_halted_device_refuses_a_ring_restore() {
-        // ring_set_state programs kernel state and kicks the ring. On
-        // a destroyed link there is nothing to program.
+    fn a_reset_clears_the_features_and_every_ring() {
+        // The guest writes 0 to the device status. Nothing may kick a
+        // ring until the driver programs it again.
         let steps = Steps::default();
-        let device = device_with(Box::new(RecordingLink::new(&steps)));
+        let device = device_with(Arc::new(RecordingLink::new(&steps)));
+        {
+            let mut inner = device.inner.lock().expect("viona lock");
+            inner.negotiated_features = u64::from(VIRTIO_NET_F_MAC);
+            inner.ring_state = [RingState::Ready; NET_NUM_QUEUES];
+        }
 
-        device.halt();
-        device.ring_set_state(0, 256, 0x1000, 0x2000, 0x3000, 0, 0, 0, 0);
+        VirtioDevice::reset(&device);
 
         let inner = device.inner.lock().expect("viona lock");
-        assert_eq!(inner.ring_state[0], RingState::Init);
-    }
-
-    #[test]
-    fn ring_state_default_is_init() {
-        let states = [RingState::Init; NET_NUM_QUEUES];
-        assert_eq!(states[0], RingState::Init);
-        assert_eq!(states[1], RingState::Init);
-    }
-
-    #[test]
-    fn ring_state_transitions_to_ready() {
-        let mut states = [RingState::Init; NET_NUM_QUEUES];
-        states[0] = RingState::Ready;
-        assert_eq!(states[0], RingState::Ready);
-        assert_eq!(states[1], RingState::Init);
-    }
-
-    #[test]
-    // The first assignments model pre-reset migration state. Keep the explicit
-    // transition until the migration engine restructuring is resolved.
-    #[allow(unused_assignments)]
-    fn ring_state_reset_clears_ready() {
-        let mut states = [RingState::Init; NET_NUM_QUEUES];
-        states[0] = RingState::Ready;
-        states[1] = RingState::Ready;
-        // Simulate reset
-        states = [RingState::Init; NET_NUM_QUEUES];
-        assert_eq!(states[0], RingState::Init);
-        assert_eq!(states[1], RingState::Init);
-    }
-
-    #[cfg(not(target_os = "illumos"))]
-    #[test]
-    fn kick_suppressed_when_ring_not_ready() {
-        let inner = test_inner();
-        // ring_kick is a no-op on non-illumos, but we verify
-        // the guard conditions would prevent a kick:
-        assert_eq!(inner.ring_state[0], RingState::Init);
-        assert_eq!(inner.ring_state[1], RingState::Init);
         assert_eq!(inner.negotiated_features, 0);
-        // Calling ring_kick should be safe (no-op stub)
-        VirtioViona::ring_kick(&inner, 0);
-        VirtioViona::ring_kick(&inner, 1);
-        VirtioViona::ring_kick(&inner, 2); // out of range
-    }
-
-    #[cfg(not(target_os = "illumos"))]
-    #[test]
-    fn kick_allowed_after_features_and_ring_init() {
-        let mut inner = test_inner();
-        inner.negotiated_features = VIRTIO_NET_F_MAC as u64;
-        inner.ring_state[0] = RingState::Ready;
-        // On illumos this would actually issue the ioctl; on
-        // non-illumos the stub is a no-op. Verify state is correct.
-        assert_eq!(inner.ring_state[0], RingState::Ready);
-        assert_ne!(inner.negotiated_features, 0);
-        VirtioViona::ring_kick(&inner, 0);
-    }
-
-    #[cfg(not(target_os = "illumos"))]
-    #[test]
-    fn reset_clears_features_and_ring_state() {
-        let mut inner = test_inner();
-        inner.negotiated_features = VIRTIO_NET_F_MAC as u64;
-        inner.ring_state[0] = RingState::Ready;
-        inner.ring_state[1] = RingState::Ready;
-
-        // Simulate the reset path
-        inner.negotiated_features = 0;
-        inner.ring_state = [RingState::Init; NET_NUM_QUEUES];
-
-        assert_eq!(inner.negotiated_features, 0);
-        assert_eq!(inner.ring_state[0], RingState::Init);
-        assert_eq!(inner.ring_state[1], RingState::Init);
-    }
-
-    #[test]
-    fn ring_state_copy_semantics() {
-        let a = RingState::Ready;
-        let b = a;
-        assert_eq!(a, b);
-        assert_eq!(a, RingState::Ready);
-    }
-
-    #[test]
-    fn ring_state_debug_fmt() {
-        // Ensure Debug derive works (useful for error messages)
-        let s = format!("{:?}", RingState::Init);
-        assert_eq!(s, "Init");
-        let s = format!("{:?}", RingState::Ready);
-        assert_eq!(s, "Ready");
+        assert_eq!(inner.ring_state, [RingState::Init; NET_NUM_QUEUES]);
     }
 }
