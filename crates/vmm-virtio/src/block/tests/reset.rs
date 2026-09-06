@@ -264,14 +264,14 @@ fn a_reset_does_not_wait_for_interrupt_injection() {
     );
 }
 
-// The hostile case, through the ring. One vCPU walks the ring while
-// another keeps refilling it and a third writes 0 to DEVICE_STATUS.
-// The walk holds one guest-access session for its whole length, so
-// the reset waits for it; what stops the guest from making that wait
-// as long as it likes is the cap at queue size, which ends the walk
-// no matter how fast the refill runs.
+// The hostile case, through the ring. A guest is free to claim it
+// posted more than it did, and to keep claiming from a second vCPU
+// while the first walks the ring. Two things have to hold. One
+// notification must do at most a ring's worth of work, whatever the
+// guest claims, and a reset racing that walk must get through in the
+// time one walk takes.
 #[test]
-fn a_guest_refilling_the_ring_does_not_hold_the_resetting_vcpu() {
+fn a_guest_that_overclaims_the_ring_does_not_hold_the_resetting_vcpu() {
     const RING: u16 = 64;
     const AVAIL_IDX_GPA: u64 = 0x1102;
     const USED_IDX_GPA: u64 = 0x1202;
@@ -289,13 +289,9 @@ fn a_guest_refilling_the_ring_does_not_hold_the_resetting_vcpu() {
     };
 
     let waited = thread::scope(|s| {
-        // A second vCPU pushing more work in behind the walk. Every
-        // avail entry names the same head, so this needs only the
-        // index. It reads the used index to keep the claim half a ring
-        // ahead of wherever the walk has got to: a guest is free to
-        // lie about how much it has posted, and an index that walks
-        // away on its own is what makes the cap the only thing that
-        // can end the walk.
+        // The second vCPU. Every avail entry names the same head, so
+        // this needs only the index, and it keeps that index half a
+        // ring ahead of wherever the device has got to.
         s.spawn(|| {
             let slot = physmap
                 .lookup(AVAIL_IDX_GPA, 2)
@@ -305,17 +301,21 @@ fn a_guest_refilling_the_ring_does_not_hold_the_resetting_vcpu() {
                 slot.write::<u16>(&ahead).expect("write avail index");
             }
         });
+
+        // One notification, against a claim that never runs out.
+        blk.notify_queue(0, &mut queues, &physmap);
+        assert!(
+            used_idx() <= RING,
+            "one notification did {} requests on a ring of {RING}",
+            used_idx()
+        );
+
+        // Now the same walk racing a reset. The reset runs on its own
+        // thread under a deadline: one a guest can hold would park the
+        // run instead of failing it.
         s.spawn(|| {
             blk.notify_queue(0, &mut queues, &physmap);
         });
-        // The reset must start while the walk is in flight. Without
-        // this it can run first, take the session, and leave the walk
-        // with nothing to do.
-        wait_for("the walk never started", || used_idx() > 0);
-
-        // The reset runs on its own thread under a deadline. One that
-        // waits for a walk the guest can extend would park the run
-        // instead of failing it.
         s.spawn(|| {
             VirtioDevice::reset(&blk);
             done.store(true, Ordering::Release);
@@ -325,15 +325,13 @@ fn a_guest_refilling_the_ring_does_not_hold_the_resetting_vcpu() {
             thread::sleep(Duration::from_micros(20));
         }
         let waited = start.elapsed();
-        // Let a walk that should have stopped on its own finish, so
-        // the scope joins it.
         stop.store(true, Ordering::Release);
         waited
     });
 
     assert!(
         waited < RESET_BUDGET,
-        "a guest refilling the ring held the resetting vCPU for {waited:?}"
+        "a guest overclaiming the ring held the resetting vCPU for {waited:?}"
     );
 }
 
