@@ -183,8 +183,11 @@ run_mode() {
 }
 
 # Boot a container image as the guest root filesystem. The share is
-# exported read-only and the guest supplies its own writable layer, so a
-# clean run must leave the host export untouched.
+# exported read-only and the guest supplies its own writable layer. Two
+# probes below check that the guest's writes stayed in that layer. They
+# are two named files, not a comparison of the export against its
+# staged state, so they show those two writes did not get through, not
+# that nothing did.
 # $1 is "checks" to run the harness script inside the image, or
 # "entrypoint" to run whatever the image itself declares.
 run_container() {
@@ -267,7 +270,7 @@ run_container() {
         echo "=== mode=container:$what: FAILED (copy-up wrote through) ==="
         return 1
     fi
-    echo "=== mode=container:$what: OK (host export untouched) ==="
+    echo "=== mode=container:$what: OK (both write probes stayed off the host) ==="
     return 0
 }
 
