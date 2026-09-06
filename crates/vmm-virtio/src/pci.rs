@@ -220,6 +220,10 @@ struct TestParks {
     /// config interrupt is delivered, which is the window a reset can
     /// run in.
     config_interrupt_pending: ParkSlot,
+    /// Reached between sampling the session for an MSI-X unmask and
+    /// delivering what the unmask released, which is the window a
+    /// whole reset can run in.
+    released_delivery_pending: ParkSlot,
 }
 
 #[cfg(test)]
@@ -933,8 +937,12 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         // Only MSI-X has writable fields
         if co.msix != 0 && offset >= co.msix && offset < co.msix + 12 {
             if let Some(ref msix) = self.msix {
+                // Sampled before the write takes the messages out of
+                // the pending array, so a reset that runs from here on
+                // is always the later of the two.
+                let session = self.intr.session();
                 let released = msix.cap_write_deferred(offset, co.msix, val);
-                self.deliver_released(msix, released);
+                self.deliver_released(session, msix, released);
             }
         }
         // All virtio cap fields are read-only
@@ -1410,11 +1418,14 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     ///
     /// These leave on a guest write to the MSI-X table or capability,
     /// which no reset latch covers, and they carry the address and
-    /// data of whichever driver recorded them. Taking admission before
-    /// the send is what puts them inside the set a reset waits out,
-    /// and what drops them once it has shut.
+    /// data of whichever driver recorded them. `session` is sampled
+    /// before the write takes them out of the pending array, so a
+    /// reset that lands anywhere from that point on refuses them; and
+    /// one admitted before the reset started is inside the set the
+    /// reset waits out.
     fn deliver_released(
         &self,
+        session: u64,
         msix: &MsixTable,
         released: impl IntoIterator<Item = (u64, u64)>,
     ) {
@@ -1422,7 +1433,9 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         if released.peek().is_none() {
             return;
         }
-        let Some(_admitted) = self.intr.begin_current() else {
+        #[cfg(test)]
+        run_park(&self.parks.released_delivery_pending);
+        let Some(_admitted) = self.intr.begin(session) else {
             return;
         };
         for (addr, data) in released {
@@ -1536,6 +1549,17 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     fn park_write_after_latch_check(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.parks.write_checked.lock().expect("park lock poisoned") =
             Some(hook);
+    }
+
+    /// Install the one-shot park an MSI-X unmask reaches once it has
+    /// taken the message out of the pending array.
+    #[cfg(test)]
+    fn park_before_released_delivery(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .parks
+            .released_delivery_pending
+            .lock()
+            .expect("park lock poisoned") = Some(hook);
     }
 
     /// Install the one-shot park a config interrupt reaches once its
@@ -1951,9 +1975,12 @@ impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
                             _ => wo.read_u32(),
                         };
                         if offset < pba_offset {
+                            // Sampled before the write takes the
+                            // message out of the pending array.
+                            let session = self.intr.session();
                             let released =
                                 msix.table_write_deferred(offset, val);
-                            self.deliver_released(msix, released);
+                            self.deliver_released(session, msix, released);
                         }
                     }
                 }

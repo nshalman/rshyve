@@ -501,3 +501,42 @@ fn a_flood_of_raises_does_not_hold_the_resetting_vcpu() {
         "the reset never ended the driver session"
     );
 }
+
+// The narrower half of the same problem. The unmask can be caught
+// between taking the message out of the pending array and sending it,
+// and a whole reset can run in that window: admission shuts and
+// reopens, so "is admission open now" says yes again. Only the session
+// the unmask sampled before it took the message tells the two drivers
+// apart.
+#[test]
+fn an_unmask_overtaken_by_a_whole_reset_delivers_nothing() {
+    let ((dev, entered, release, _pin), _table, sink) = wired_msix(Some(1));
+    write_status(&dev, READY | bits::STATUS_DRIVER_OK);
+    write_table(&dev, ENTRY_SIZE + 12, 1);
+    dev.raise_queue_interrupt_for(0);
+    assert_eq!(sink.sent(), Vec::new(), "a masked vector sent a message");
+
+    let (hook, arrived, go) = park();
+    dev.park_before_released_delivery(hook);
+    let unmasker = {
+        let dev = Arc::clone(&dev);
+        std::thread::spawn(move || write_table(&dev, ENTRY_SIZE + 12, 0))
+    };
+    arrived
+        .recv_timeout(WEDGED)
+        .expect("the unmask took the message");
+
+    // The whole reset, start to finish, while the message waits.
+    release_on_drain(entered, release);
+    write_status(&dev, 0);
+    write_status(&dev, READY | bits::STATUS_DRIVER_OK);
+
+    go.send(()).expect("release the unmask");
+    unmasker.join().expect("the unmask finished");
+
+    assert_eq!(
+        sink.sent(),
+        Vec::new(),
+        "an unmask from the old session reached the driver that followed"
+    );
+}
