@@ -17,6 +17,12 @@ name: CI
 # tools/fhrun-init is excluded from the workspace, so the guest-init job
 # covers it on its own.
 #
+# A green run also means the two platforms compile the same set of
+# tests, apart from the gated ones recorded in tools/test-parity.expected
+# with a reason. Every job here runs on ubuntu, so without that check a
+# test gated to illumos runs nowhere and a test gated away from illumos
+# never runs on the product platform. See the `test-parity` job.
+#
 # It does NOT mean the VMM builds, boots a guest, or passes a platform
 # test. Those still run on the illumos build host; see docs/testing.md.
 # Do not read this badge as platform coverage.
@@ -324,3 +330,43 @@ jobs:
       # workspace members, so a new crate fails here until a job names
       # it. It failed closed but ran on no machine before this.
       - run: tools/check-ci-crates.sh
+
+  test-parity:
+    name: illumos and CI compile the same tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-unknown-illumos
+      # Every job above runs on ubuntu, so a test behind
+      # `cfg(target_os = "illumos")` runs on no machine here, and a test
+      # behind `cfg(not(target_os = "illumos"))` never runs on the
+      # product platform. Both have shipped on this tree, and both were
+      # found by hand: nine tests were exercising empty stubs, two
+      # security tests ran nowhere, and 26 of 29 viona tests were
+      # compiled out on the target. Nothing reported any of it.
+      #
+      # The script counts both sides instead of reading the gates. It
+      # asks rustc for the test list of each target, compares the two,
+      # and fails when the set of platform-gated tests moves away from
+      # tools/test-parity.expected. Recording a change is a deliberate
+      # edit, so drift becomes a reviewed decision.
+      #
+      # A list for a target nobody can execute comes from the MIR: the
+      # test harness rustc builds names every test it kept. The reader
+      # is not trusted, it is checked. The same run builds and lists
+      # this runner's tests and asserts the reader returns exactly those
+      # names. On this runner the checked side is the CI side of the
+      # comparison. Run the script on the illumos build host with
+      # --check-reader to check the other side against a real harness.
+      #
+      # The job also compiles every reachable package for illumos with
+      # its test targets, so illumos-only code that stopped compiling
+      # fails here. It reads the workspace members rather than a
+      # hand-kept `-p` list, so it reaches vmm-migrate-agent, which no
+      # other job cross-checks, and it reaches a new package on the day
+      # it is added.
+      #
+      # It stays quiet about rshyve, vmm_migrate and the two TPM crates.
+      # Their dependencies compile C for the target and this runner has
+      # no illumos cross-cc. The build host covers them.
+      - run: tools/check-test-parity.py
