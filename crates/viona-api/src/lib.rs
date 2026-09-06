@@ -87,9 +87,10 @@ impl VionaFd {
 
     /// Return one ring to its reset state.
     ///
-    /// [`Self::delete`] resets every ring anyway. Doing it first lets a
-    /// signal interrupt the wait, so the uninterruptible reset inside
-    /// the delete has less left to do.
+    /// [`Self::delete`] resets every ring anyway, in a wait that
+    /// ignores signals. A ring that is reset already leaves that wait
+    /// at once, so each reset here is one wait the delete does not
+    /// make. This wait heeds signals and can return `EINTR`.
     pub fn ring_reset(&self, ring: usize) -> Result<()> {
         self.ioctl_usize(VNA_IOC_RING_RESET, ring)?;
         Ok(())
@@ -233,6 +234,21 @@ pub fn api_version() -> Result<u32> {
 mod test {
     use super::*;
 
+    /// An open fd that is not a viona link.
+    ///
+    /// The ioctls below reach the kernel and are refused there, so the
+    /// wrappers are testable off illumos. /dev/null answers every
+    /// ioctl with ENXIO (`uts/common/io/mem.c`, `mmioctl`).
+    fn not_a_link() -> VionaFd {
+        VionaFd(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .expect("every unix has /dev/null"),
+        )
+    }
+
     #[test]
     fn latest_api_version() {
         let cur = ApiVersion::current();
@@ -244,5 +260,89 @@ mod test {
         assert!(1u32 < ApiVersion::V2);
         assert!(2u32 == ApiVersion::V2);
         assert!(3u32 > ApiVersion::V2);
+    }
+
+    #[test]
+    fn the_halt_commands_match_the_kernel() {
+        // uts/intel/sys/viona_io.h. A number that drifts sends the
+        // halt to some other viona entry point, and the vmm_drv hold
+        // it must give back stays held.
+        assert_eq!(VNA_IOC_DELETE, 0x0056_4302);
+        assert_eq!(VNA_IOC_RING_RESET, 0x0056_4311);
+    }
+
+    #[test]
+    fn the_halt_commands_may_take_a_usize() {
+        // delete() and ring_reset() go through ioctl_usize. A cmd the
+        // allowlist misses is refused before the kernel sees it, and
+        // the halt would then leave viona's hold on the VM.
+        assert!(VionaFd::ioctl_usize_safe(VNA_IOC_DELETE));
+        assert!(VionaFd::ioctl_usize_safe(VNA_IOC_RING_RESET));
+    }
+
+    #[test]
+    fn no_command_that_copies_in_may_take_a_usize() {
+        // ioctl_usize hands its argument to the kernel as the data
+        // pointer. A cmd that copies in would read the usize as a
+        // user address of the caller's choice.
+        for cmd in [
+            VNA_IOC_CREATE,
+            VNA_IOC_DEFAULT_PARAMS,
+            VNA_IOC_RING_INIT,
+            VNA_IOC_RING_INIT_MODERN,
+            VNA_IOC_RING_SET_MSI,
+            VNA_IOC_RING_SET_STATE,
+            VNA_IOC_RING_GET_STATE,
+            VNA_IOC_INTR_POLL,
+            VNA_IOC_INTR_POLL_MQ,
+            VNA_IOC_SET_FEATURES,
+            VNA_IOC_GET_FEATURES,
+            VNA_IOC_SET_NOTIFY_MMIO,
+            VNA_IOC_GET_PARAMS,
+            VNA_IOC_SET_PARAMS,
+        ] {
+            assert!(
+                !VionaFd::ioctl_usize_safe(cmd),
+                "cmd {cmd:#x} copies in through its data argument",
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_that_copies_in_is_refused_at_the_call() {
+        // The allowlist has to hold at the call, not only in the
+        // const fn that lists it.
+        let err = not_a_link()
+            .ioctl_usize(VNA_IOC_RING_SET_STATE, 0x4141_4141)
+            .expect_err("a copyin cmd may not take a usize");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn a_failed_delete_reports_it() {
+        // The halt calls this and carries on to VM_DESTROY_SELF. A
+        // failure it swallowed would hide the destroy wedge that
+        // follows.
+        let err = not_a_link().delete().expect_err("/dev/null holds no link");
+        assert_ne!(
+            err.kind(),
+            ErrorKind::InvalidInput,
+            "the delete never reached the ioctl",
+        );
+    }
+
+    #[test]
+    fn a_failed_ring_reset_reports_it() {
+        // The halt resets every ring before the delete and reports
+        // what fails. An out of range ring is the kernel's to refuse.
+        let fd = not_a_link();
+        for ring in [0, 1, usize::MAX] {
+            let err = fd.ring_reset(ring).expect_err("/dev/null holds no link");
+            assert_ne!(
+                err.kind(),
+                ErrorKind::InvalidInput,
+                "ring {ring} never reached the ioctl",
+            );
+        }
     }
 }
