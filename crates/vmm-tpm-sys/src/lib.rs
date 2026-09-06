@@ -18,6 +18,11 @@
 
 use std::os::raw::{c_char, c_uint, c_void};
 
+// `build.rs` includes this file rather than importing it, so its tests
+// only run from here.
+#[cfg(test)]
+mod platform_flags;
+
 /// `TPM_RESULT` from libtpms: 32-bit response code. 0 == success.
 pub type TPM_RESULT = u32;
 
@@ -108,11 +113,12 @@ mod tests {
 
     /// Smoke test: choose TPM 2.0, init, run TPM2_GetRandom for 4 bytes,
     /// terminate. Verifies the entire FFI / build chain is intact.
-    ///
-    /// Skipped automatically if the host can't allocate the libtpms NV
-    /// blob (no permissions, no /tmp, etc.).
     #[test]
     fn smoke_get_random() {
+        let home = nv_directory();
+        let start = std::env::current_dir().expect("read the directory");
+        std::env::set_current_dir(&home).expect("enter the NV directory");
+
         unsafe {
             assert_eq!(
                 TPMLIB_ChooseTPMVersion(
@@ -121,9 +127,9 @@ mod tests {
                 TPM_SUCCESS,
                 "ChooseTPMVersion"
             );
-            // TPMLIB_MainInit needs the platform callbacks set up to
-            // open NV storage; without them it falls back to in-memory
-            // mode, which is fine for this smoke test.
+            // With no callbacks registered, TPMLIB_MainInit uses the
+            // libtpms platform layer, which keeps NV in the `NVChip`
+            // file this test runs beside.
             assert_eq!(TPMLIB_MainInit(), TPM_SUCCESS, "MainInit");
 
             // TPM2_Startup(TPM_SU_CLEAR) — every TPM needs this before
@@ -174,5 +180,33 @@ mod tests {
 
             TPMLIB_Terminate();
         }
+
+        std::env::set_current_dir(&start).expect("leave the NV directory");
+        std::fs::remove_dir_all(&home).expect("remove the NV directory");
+    }
+
+    /// A private directory to run libtpms in.
+    ///
+    /// The TPM 2 platform layer opens its NV file, `NVChip`, by a
+    /// relative path. Left alone it writes 176 KiB into the source
+    /// tree, and the next run reads that file back and so never
+    /// exercises first boot.
+    ///
+    /// The current directory belongs to the process, not to one test,
+    /// but every other test in this binary is a pure function over
+    /// strings.
+    fn nv_directory() -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after 1970")
+            .as_nanos();
+        let pid = std::process::id();
+        let dir = std::env::temp_dir()
+            .join(format!("vmm-tpm-sys-smoke-{pid}-{unique}"));
+        // create_dir, not create_dir_all: it fails when anything
+        // already holds the name, so a symlink planted in a shared
+        // /tmp cannot redirect the NV file.
+        std::fs::create_dir(&dir).expect("make a private NV directory");
+        dir
     }
 }
