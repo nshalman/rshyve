@@ -19,6 +19,9 @@ mod intr;
 
 use super::*;
 
+use vmm_core::common::RWOp;
+use vmm_devices::pci::device::PciDevice;
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread::ThreadId;

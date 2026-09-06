@@ -6,6 +6,11 @@
 
 use super::*;
 
+// The parent no longer imports these; the tests drive the
+// transport through the same trait and ops a PCI bus would.
+use vmm_core::common::RWOp;
+use vmm_devices::pci::device::PciDevice;
+
 /// Minimal test VirtIO device for transport tests.
 struct TestVirtioDevice {
     features: u64,
