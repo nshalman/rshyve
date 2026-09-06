@@ -9,7 +9,8 @@ use std::thread::JoinHandle;
 
 use vmm_devices::Lifecycle;
 
-use super::link::LinkOps;
+use viona_api::LinkOps;
+
 use super::{RingState, VirtioViona, NET_NUM_QUEUES};
 
 /// The interrupt poll thread, while one is running.

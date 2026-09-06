@@ -77,7 +77,7 @@ pub struct vioc_create {
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct vioc_ring_init_modern {
     pub rim_index: u16,
     pub rim_qsize: u16,
@@ -88,7 +88,7 @@ pub struct vioc_ring_init_modern {
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct vioc_ring_msi {
     pub rm_index: u16,
     pub _pad: [u16; 3],
@@ -101,7 +101,7 @@ pub const VIONA_VQ_MAX: u16 = 2;
 
 /// Interrupt poll result for legacy single-pair viona.
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct vioc_intr_poll {
     pub vip_status: [u32; VIONA_VQ_MAX as usize],
 }
@@ -114,11 +114,17 @@ pub struct vioc_intr_poll_mq {
     pub vipm_status: [u32; VIONA_INTR_WORDS],
 }
 
+/// The address window the guest kicks a ring through.
+///
+/// The trailing padding is named. The kernel copies in `sizeof`, so
+/// those four bytes reach it either way, and an unnamed hole would
+/// send it whatever the host stack held.
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct vioc_notify_mmio {
     pub vim_address: u64,
     pub vim_size: u32,
+    pub _pad: u32,
 }
 
 #[repr(C)]

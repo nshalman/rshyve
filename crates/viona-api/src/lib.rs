@@ -12,8 +12,10 @@ use std::os::fd::*;
 use std::os::unix::fs::MetadataExt;
 
 mod ffi;
+mod link;
 
 pub use ffi::*;
+pub use link::{IntrStatus, IntrWait, LinkOps};
 
 pub const VIONA_DEV_PATH: &str = "/dev/viona";
 
@@ -21,33 +23,71 @@ pub const VIONA_DEV_PATH: &str = "/dev/viona";
 ///
 /// [`Chan::Dev`] is the link a VM runs on. A test builds the other
 /// arm, which keeps the command and the argument and reaches no
-/// kernel. Both arms sit under one set of wrappers: there is a single
-/// [`VionaFd::delete`], and that is the one a test watches.
+/// kernel. Both arms sit under one set of calls: there is a single
+/// `delete`, and that is the one a test watches.
 ///
-/// WHY the seam is here and not in the wrappers: upstream Propolis
-/// sends every ioctl straight to `libc::ioctl`
+/// WHY the seam is here and not one layer up: upstream Propolis sends
+/// every ioctl straight to `libc::ioctl`
 /// (propolis/crates/viona-api/src/lib.rs:164), so a test can read only
-/// the errno. A wrapper that names the wrong command, or that drops
-/// its ring argument, answers with the same errno as the right one.
+/// the errno. A call that names the wrong command, or that swaps two
+/// of its arguments, answers with the same errno as the right one.
+///
+/// A recorder is `#[cfg(test)]`, so no production build can make one.
 enum Chan {
     /// An open viona device.
     Dev(File),
 
-    /// A recorder. It holds a file only to answer [`AsRawFd`].
+    /// A recorder. It holds a file only to answer [`AsRawFd`], and to
+    /// give `wait_intr` a descriptor to poll.
     #[cfg(test)]
     Record(File, std::sync::Mutex<Vec<Call>>),
 }
 
-/// One ioctl that a wrapper sent.
+/// One ioctl that a caller sent.
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Call {
     /// The data argument is a value the kernel reads directly.
     Usize { cmd: i32, arg: usize },
 
-    /// The data argument is a pointer to a struct. A recorder copies
-    /// nothing, so only the command is kept.
-    Typed { cmd: i32 },
+    /// The data argument is a pointer to a struct, kept as the bytes
+    /// the kernel would copy in. Without them a call that swaps two
+    /// fields of its payload records the same thing as the right one.
+    Typed { cmd: i32, data: Vec<u8> },
+}
+
+#[cfg(test)]
+impl Call {
+    /// The command this call sent.
+    fn cmd(&self) -> i32 {
+        match self {
+            Call::Usize { cmd, .. } | Call::Typed { cmd, .. } => *cmd,
+        }
+    }
+
+    /// The value this call sent the kernel.
+    fn value(&self) -> usize {
+        match self {
+            Call::Usize { arg, .. } => *arg,
+            Call::Typed { cmd, .. } => panic!("cmd {cmd:#x} sent no value"),
+        }
+    }
+
+    /// The payload this call sent the kernel, read back.
+    fn payload<T: Copy>(&self) -> T {
+        let Call::Typed { cmd, data } = self else {
+            panic!("cmd {:#x} sent no payload", self.cmd())
+        };
+        assert_eq!(
+            data.len(),
+            size_of::<T>(),
+            "cmd {cmd:#x} sent {} bytes",
+            data.len(),
+        );
+        // Safety: the bytes came from one T, and a Vec's buffer has
+        // no alignment to promise, so the read is unaligned.
+        unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<T>()) }
+    }
 }
 
 pub struct VionaFd(Chan);
@@ -96,15 +136,25 @@ impl VionaFd {
             Chan::Dev(fp) => {
                 ioctl(fp.as_raw_fd(), cmd, data as *mut libc::c_void)
             }
-            // A recorder keeps the command and copies nothing, so a
-            // caller reads back the struct it passed in. That is
-            // enough to say which entry point a wrapper reached.
+            // A recorder copies nothing back, so a caller reads the
+            // struct it passed in. It keeps the bytes going the other
+            // way, which is what says a call filled the payload in
+            // the order the kernel reads it.
+            //
+            // Safety: the caller's contract above says `data` points
+            // at one initialized T. Every ioctl payload names its
+            // padding, so no byte read here is uninitialized.
             #[cfg(test)]
             Chan::Record(_, calls) => {
+                let data = std::slice::from_raw_parts(
+                    data.cast::<u8>(),
+                    size_of::<T>(),
+                )
+                .to_vec();
                 calls
                     .lock()
                     .expect("the recorded calls")
-                    .push(Call::Typed { cmd });
+                    .push(Call::Typed { cmd, data });
                 Ok(0)
             }
         }
@@ -139,178 +189,6 @@ impl VionaFd {
         }
     }
 
-    /// Destroy the in-kernel link, which gives back its `vmm_drv` hold.
-    ///
-    /// WHY teardown must issue this: viona holds the VM for the life of
-    /// the link (`viona_main.c`, `vmm_drv_hold`). `VM_DESTROY_SELF`
-    /// purges the holds and then waits for every lease to break in an
-    /// untimed `cv_wait` (`vmm_sol_dev.c`, `vmm_drv_purge`). Releasing
-    /// the last hold first clears `VMM_HELD`, and the purge skips that
-    /// wait.
-    ///
-    /// The call itself waits for each ring worker to stop, in a
-    /// `cv_wait` that does not heed signals (`viona_ring.c`,
-    /// `viona_ring_reset`). Run it only where a lost thread is
-    /// acceptable.
-    pub fn delete(&self) -> Result<()> {
-        self.ioctl_usize(VNA_IOC_DELETE, 0)?;
-        Ok(())
-    }
-
-    /// Return one ring to its reset state.
-    ///
-    /// [`Self::delete`] resets every ring anyway, in a wait that
-    /// ignores signals. A ring that is reset already leaves that wait
-    /// at once, so each reset here is one wait the delete does not
-    /// make. This wait heeds signals and can return `EINTR`.
-    pub fn ring_reset(&self, ring: usize) -> Result<()> {
-        self.ioctl_usize(VNA_IOC_RING_RESET, ring)?;
-        Ok(())
-    }
-
-    /// Tell the kernel worker to look at one ring again.
-    ///
-    /// This is the guest kick. A ring that was never programmed has no
-    /// worker, and the kernel refuses the call.
-    pub fn ring_kick(&self, ring: usize) -> Result<()> {
-        self.ioctl_usize(VNA_IOC_RING_KICK, ring)?;
-        Ok(())
-    }
-
-    /// Stop one ring's worker and keep its state.
-    ///
-    /// A migration source pauses each ring before it reads the ring
-    /// indices out, so the kernel does not move them again.
-    pub fn ring_pause(&self, ring: usize) -> Result<()> {
-        self.ioctl_usize(VNA_IOC_RING_PAUSE, ring)?;
-        Ok(())
-    }
-
-    /// Clear one ring's pending interrupt.
-    ///
-    /// The poll thread does this before it raises the interrupt to the
-    /// guest. Until it runs, the kernel signals the same interrupt
-    /// again and the poll thread spins.
-    pub fn ring_intr_clr(&self, ring: usize) -> Result<()> {
-        self.ioctl_usize(VNA_IOC_RING_INTR_CLR, ring)?;
-        Ok(())
-    }
-
-    /// Name the I/O port the guest writes to kick a ring.
-    ///
-    /// The kernel then takes the kick itself, and the vCPU does not
-    /// leave to userspace for it.
-    pub fn set_notify_iop(&self, port: u16) -> Result<()> {
-        self.ioctl_usize(VNA_IOC_SET_NOTIFY_IOP, port as usize)?;
-        Ok(())
-    }
-
-    /// Set what traffic the link passes to the guest.
-    ///
-    /// The mode goes by value: this command copies nothing in, and the
-    /// kernel casts the data argument straight to its enum
-    /// (`viona_main.c`, `viona_ioc_set_promisc`). A pointer here sets
-    /// the mode to an address.
-    pub fn set_promisc(&self, mode: PromiscMode) -> Result<()> {
-        self.ioctl_usize(VNA_IOC_SET_PROMISC, mode as usize)?;
-        Ok(())
-    }
-
-    /// Program one ring's addresses, in the modern (VirtIO 1.0) layout.
-    ///
-    /// The kernel starts a worker for the ring, and resets the ring
-    /// indices to 0. A migration destination needs
-    /// [`Self::ring_set_state`] instead.
-    pub fn ring_init_modern(
-        &self,
-        ring: u16,
-        size: u16,
-        desc: u64,
-        avail: u64,
-        used: u64,
-    ) -> Result<()> {
-        let mut rim = vioc_ring_init_modern {
-            rim_index: ring,
-            rim_qsize: size,
-            rim_qaddr_desc: desc,
-            rim_qaddr_avail: avail,
-            rim_qaddr_used: used,
-            ..Default::default()
-        };
-        // Safety: the command copies in one vioc_ring_init_modern, and
-        // that is what `rim` is.
-        unsafe { self.ioctl(VNA_IOC_RING_INIT_MODERN, &mut rim) }?;
-        Ok(())
-    }
-
-    /// Program one ring's addresses and its indices together.
-    ///
-    /// A migration destination resumes the kernel where the source
-    /// stopped, which [`Self::ring_init_modern`] cannot do.
-    pub fn ring_set_state(&self, state: &vioc_ring_state) -> Result<()> {
-        let mut state = *state;
-        // Safety: the command copies in one vioc_ring_state, and that
-        // is what `state` is.
-        unsafe { self.ioctl(VNA_IOC_RING_SET_STATE, &mut state) }?;
-        Ok(())
-    }
-
-    /// Read one ring's addresses and indices.
-    ///
-    /// A migration source reads the indices out after it pauses the
-    /// ring, so the kernel does not move them again.
-    pub fn ring_get_state(&self, ring: u16) -> Result<vioc_ring_state> {
-        let mut state = vioc_ring_state {
-            vrs_index: ring,
-            ..Default::default()
-        };
-        // Safety: the command copies out one vioc_ring_state, and that
-        // is what `state` is.
-        unsafe { self.ioctl(VNA_IOC_RING_GET_STATE, &mut state) }?;
-        Ok(state)
-    }
-
-    /// Route one ring's interrupt to an MSI-X message.
-    ///
-    /// The kernel then writes the message itself, and the userspace
-    /// poll thread has nothing to raise for that ring.
-    pub fn ring_set_msi(&self, ring: u16, addr: u64, msg: u64) -> Result<()> {
-        let mut msi = vioc_ring_msi {
-            rm_index: ring,
-            rm_addr: addr,
-            rm_msg: msg,
-            ..Default::default()
-        };
-        // Safety: the command copies in one vioc_ring_msi, and that is
-        // what `msi` is.
-        unsafe { self.ioctl(VNA_IOC_RING_SET_MSI, &mut msi) }?;
-        Ok(())
-    }
-
-    /// Read which rings have an interrupt pending.
-    ///
-    /// One entry per ring, non-zero for a ring the kernel has work
-    /// waiting on.
-    pub fn intr_status(&self) -> Result<[u32; VIONA_VQ_MAX as usize]> {
-        let mut poll_data = vioc_intr_poll::default();
-        // Safety: the command copies out one vioc_intr_poll, and that
-        // is what `poll_data` is.
-        unsafe { self.ioctl(VNA_IOC_INTR_POLL, &mut poll_data) }?;
-        Ok(poll_data.vip_status)
-    }
-
-    /// Give the kernel the features the guest accepted.
-    ///
-    /// `VIRTIO_F_VERSION_1` is the one that puts the kernel rings in
-    /// the modern layout.
-    pub fn set_features(&self, features: u64) -> Result<()> {
-        let mut feat = features;
-        // Safety: the command copies in one u64, and that is what
-        // `feat` is.
-        unsafe { self.ioctl(VNA_IOC_SET_FEATURES, &mut feat) }?;
-        Ok(())
-    }
-
     /// Read the features the kernel driver offers.
     pub fn get_features(&self) -> Result<u64> {
         let mut feat: u64 = 0;
@@ -318,20 +196,6 @@ impl VionaFd {
         // `feat` is.
         unsafe { self.ioctl(VNA_IOC_GET_FEATURES, &mut feat) }?;
         Ok(feat)
-    }
-
-    /// Name the memory address the guest writes to kick a ring.
-    ///
-    /// The modern transport counterpart of [`Self::set_notify_iop`].
-    pub fn set_notify_mmio(&self, addr: u64, size: u32) -> Result<()> {
-        let mut vim = vioc_notify_mmio {
-            vim_address: addr,
-            vim_size: size,
-        };
-        // Safety: the command copies in one vioc_notify_mmio, and that
-        // is what `vim` is.
-        unsafe { self.ioctl(VNA_IOC_SET_NOTIFY_MMIO, &mut vim) }?;
-        Ok(())
     }
 
     /// Query the API version exposed by the kernel VMM.

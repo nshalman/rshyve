@@ -2,13 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! What the wrappers ask of the kernel.
+//! The version constants and the guard on `ioctl_usize`.
 //!
-//! Two kinds of test live here, and neither replaces the other. The
-//! recorder reads the command and the argument a wrapper sends, but
-//! reaches no kernel. The `/dev/null` handle reaches the kernel and
-//! shows only the errno. Together they pin that a wrapper makes a real
-//! call, and that it is the call the wrapper's name says.
+//! What the link calls themselves send is in [`crate::link`]. The
+//! handles both files use are built here.
 
 use std::sync::Mutex;
 
@@ -17,34 +14,39 @@ use super::*;
 /// An open fd that is not a viona link.
 ///
 /// The ioctls below reach the kernel and are refused there, so the
-/// wrappers are testable off illumos. /dev/null answers every
+/// calls are testable off illumos. /dev/null answers every
 /// ioctl with ENXIO (`uts/common/io/mem.c`, `mmioctl`).
-fn not_a_link() -> VionaFd {
+pub(crate) fn not_a_link() -> VionaFd {
     VionaFd(Chan::Dev(dev_null()))
 }
 
-/// A handle that keeps what a wrapper asked of the kernel.
-fn recorder() -> VionaFd {
-    VionaFd(Chan::Record(dev_null(), Mutex::new(Vec::new())))
+/// A handle that keeps what a caller asked of the kernel.
+pub(crate) fn recorder() -> VionaFd {
+    recorder_on(dev_null())
+}
+
+/// A recorder over one open file.
+///
+/// The file is what `wait_intr` polls, so a test that drives the wait
+/// chooses a descriptor it can make ready.
+pub(crate) fn recorder_on(fp: File) -> VionaFd {
+    VionaFd(Chan::Record(fp, Mutex::new(Vec::new())))
 }
 
 /// What a recorder was asked for, in order.
-fn calls(fd: &VionaFd) -> Vec<Call> {
+pub(crate) fn calls(fd: &VionaFd) -> Vec<Call> {
     match &fd.0 {
         Chan::Record(_, calls) => calls.lock().expect("the calls").clone(),
         Chan::Dev(_) => panic!("only a recorder keeps its calls"),
     }
 }
 
-/// The value one recorded call sent the kernel.
-fn value_of(call: &Call) -> usize {
-    match call {
-        Call::Usize { arg, .. } => *arg,
-        Call::Typed { cmd } => panic!("cmd {cmd:#x} sent no value"),
-    }
+/// The commands a recorder was sent, in order.
+pub(crate) fn cmds(fd: &VionaFd) -> Vec<i32> {
+    calls(fd).iter().map(Call::cmd).collect()
 }
 
-fn dev_null() -> File {
+pub(crate) fn dev_null() -> File {
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -75,165 +77,20 @@ fn the_halt_commands_match_the_kernel() {
 }
 
 #[test]
-fn every_wrapper_sends_the_command_its_name_says() {
-    // A wrapper that names another command reaches another viona
-    // entry point and reports success. `delete` is the one that
-    // matters most: any other command there leaves viona's vmm_drv
-    // hold in place, and VM_DESTROY_SELF then waits for it in an
-    // untimed cv_wait.
+fn the_version_query_sends_the_command_its_name_says() {
+    // The one call that is not a link operation: the binary asks
+    // before it opens a link, and refuses a kernel that is too old.
     let fd = recorder();
 
-    fd.delete().expect("a recorder answers");
-    fd.ring_reset(1).expect("a recorder answers");
-    fd.ring_kick(1).expect("a recorder answers");
-    fd.ring_pause(1).expect("a recorder answers");
-    fd.ring_intr_clr(1).expect("a recorder answers");
-    fd.set_notify_iop(0x2000).expect("a recorder answers");
-    fd.set_promisc(PromiscMode::All)
-        .expect("a recorder answers");
-    fd.api_version().expect("a recorder answers");
+    assert_eq!(fd.api_version().expect("a recorder answers"), 1);
 
     assert_eq!(
         calls(&fd),
-        [
-            Call::Usize {
-                cmd: VNA_IOC_DELETE,
-                arg: 0
-            },
-            Call::Usize {
-                cmd: VNA_IOC_RING_RESET,
-                arg: 1
-            },
-            Call::Usize {
-                cmd: VNA_IOC_RING_KICK,
-                arg: 1
-            },
-            Call::Usize {
-                cmd: VNA_IOC_RING_PAUSE,
-                arg: 1
-            },
-            Call::Usize {
-                cmd: VNA_IOC_RING_INTR_CLR,
-                arg: 1
-            },
-            Call::Usize {
-                cmd: VNA_IOC_SET_NOTIFY_IOP,
-                arg: 0x2000
-            },
-            Call::Usize {
-                cmd: VNA_IOC_SET_PROMISC,
-                arg: VIONA_PROMISC_ALL as usize
-            },
-            Call::Usize {
-                cmd: VNA_IOC_VERSION,
-                arg: 0
-            },
-        ],
+        [Call::Usize {
+            cmd: VNA_IOC_VERSION,
+            arg: 0
+        }],
     );
-}
-
-#[test]
-fn every_struct_wrapper_sends_the_command_its_name_says() {
-    // The other half of the boundary. A recorder copies nothing back,
-    // so these say which viona entry point each wrapper reached and
-    // nothing about the struct it filled in. A wrapper that names
-    // another command still reports success to its caller.
-    let fd = recorder();
-
-    fd.ring_init_modern(1, 256, 0x1000, 0x2000, 0x3000)
-        .expect("a recorder answers");
-    fd.ring_set_state(&vioc_ring_state::default())
-        .expect("a recorder answers");
-    fd.ring_get_state(1).expect("a recorder answers");
-    fd.ring_set_msi(1, 0xFEE0_0000, 0x21)
-        .expect("a recorder answers");
-    fd.intr_status().expect("a recorder answers");
-    fd.set_features(1).expect("a recorder answers");
-    fd.get_features().expect("a recorder answers");
-    fd.set_notify_mmio(0xC000_0000, 0x1000)
-        .expect("a recorder answers");
-
-    assert_eq!(
-        calls(&fd),
-        [
-            Call::Typed {
-                cmd: VNA_IOC_RING_INIT_MODERN
-            },
-            Call::Typed {
-                cmd: VNA_IOC_RING_SET_STATE
-            },
-            Call::Typed {
-                cmd: VNA_IOC_RING_GET_STATE
-            },
-            Call::Typed {
-                cmd: VNA_IOC_RING_SET_MSI
-            },
-            Call::Typed {
-                cmd: VNA_IOC_INTR_POLL
-            },
-            Call::Typed {
-                cmd: VNA_IOC_SET_FEATURES
-            },
-            Call::Typed {
-                cmd: VNA_IOC_GET_FEATURES
-            },
-            Call::Typed {
-                cmd: VNA_IOC_SET_NOTIFY_MMIO
-            },
-        ],
-    );
-}
-
-#[test]
-fn the_promiscuous_mode_goes_by_value() {
-    // viona_ioc_set_promisc casts the data argument straight to its
-    // enum. A wrapper that passed a pointer would set the mode to a
-    // userspace address, and the kernel would refuse the whole call.
-    // A guest allowed to spoof its MAC then gets no traffic.
-    let fd = recorder();
-
-    fd.set_promisc(PromiscMode::None)
-        .expect("a recorder answers");
-    fd.set_promisc(PromiscMode::Multi)
-        .expect("a recorder answers");
-    fd.set_promisc(PromiscMode::All)
-        .expect("a recorder answers");
-
-    assert_eq!(
-        calls(&fd),
-        [
-            Call::Usize {
-                cmd: VNA_IOC_SET_PROMISC,
-                arg: 0
-            },
-            Call::Usize {
-                cmd: VNA_IOC_SET_PROMISC,
-                arg: 1
-            },
-            Call::Usize {
-                cmd: VNA_IOC_SET_PROMISC,
-                arg: 2
-            },
-        ],
-    );
-}
-
-#[test]
-fn every_ring_wrapper_sends_the_ring_it_was_given() {
-    // A wrapper that drops its argument works on ring 0 whatever the
-    // caller asks for. The halt would then leave every other ring
-    // running, and the delete would wait for each of them.
-    for ring in [0usize, 1, 7, usize::MAX] {
-        let fd = recorder();
-
-        fd.ring_reset(ring).expect("a recorder answers");
-        fd.ring_kick(ring).expect("a recorder answers");
-        fd.ring_pause(ring).expect("a recorder answers");
-        fd.ring_intr_clr(ring).expect("a recorder answers");
-
-        let args: Vec<usize> = calls(&fd).iter().map(value_of).collect();
-        assert_eq!(args, [ring; 4], "a ring wrapper dropped ring {ring}");
-    }
 }
 
 #[test]
@@ -297,29 +154,27 @@ fn a_command_that_copies_in_is_refused_at_the_kernel_call() {
 }
 
 #[test]
-fn a_failed_delete_reports_it() {
-    // The halt calls this and carries on to VM_DESTROY_SELF. A
-    // failure it swallowed would hide the destroy wedge that
-    // follows.
-    let err = not_a_link().delete().expect_err("/dev/null holds no link");
-    assert_ne!(
-        err.kind(),
-        ErrorKind::InvalidInput,
-        "the delete never reached the ioctl",
-    );
+fn the_features_the_kernel_offers_are_read_from_the_kernel() {
+    // The one call the device makes before it holds the link. A
+    // recorder copies nothing back, so this says which command the
+    // read reached, not what it answered.
+    let fd = recorder();
+
+    fd.get_features().expect("a recorder answers");
+
+    assert_eq!(cmds(&fd), [VNA_IOC_GET_FEATURES]);
 }
 
 #[test]
-fn a_failed_ring_reset_reports_it() {
-    // The halt resets every ring before the delete and reports
-    // what fails. An out of range ring is the kernel's to refuse.
-    let fd = not_a_link();
-    for ring in [0, 1, usize::MAX] {
-        let err = fd.ring_reset(ring).expect_err("/dev/null holds no link");
-        assert_ne!(
-            err.kind(),
-            ErrorKind::InvalidInput,
-            "ring {ring} never reached the ioctl",
-        );
-    }
+fn a_failed_feature_read_reports_it() {
+    // The device gives up on the link rather than offering the guest
+    // features the kernel never claimed.
+    let err = not_a_link()
+        .get_features()
+        .expect_err("/dev/null holds no link");
+    assert_ne!(
+        err.kind(),
+        ErrorKind::InvalidInput,
+        "the read never reached the ioctl",
+    );
 }

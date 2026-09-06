@@ -5,7 +5,7 @@
 //! What these tests reach, and what they do not.
 //!
 //! Every call the device makes into the kernel goes through
-//! [`LinkOps`](super::link::LinkOps), on every platform. A recording
+//! [`LinkOps`](viona_api::LinkOps), on every platform. A recording
 //! link stands in for the driver, so a test reads the command and the
 //! ring the device asked for, and the same test runs on illumos, where
 //! the product runs. What the illumos build then puts on the wire is
@@ -19,10 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use viona_api::{vioc_ring_state, PromiscMode};
+use viona_api::{vioc_ring_state, IntrStatus, IntrWait, LinkOps, PromiscMode};
 
 use super::halt::{halt_link, stop_poller, Poller};
-use super::link::{IntrStatus, IntrWait, LinkOps};
 use super::VirtioViona;
 
 mod device;
@@ -266,13 +265,13 @@ impl LinkOps for TestLink {
         Ok(())
     }
 
-    fn wait_intr(&self, stop: &PipeReader, _log: &slog::Logger) -> IntrWait {
+    fn wait_intr(&self, stop: &PipeReader) -> std::io::Result<IntrWait> {
         // The halt closes the write end, so this read ends with 0
         // bytes. No test link signals its own work.
         let mut byte = [0u8; 1];
         let mut stop = stop;
         match stop.read(&mut byte) {
-            Ok(0) => IntrWait::Stopped,
+            Ok(0) => Ok(IntrWait::Stopped),
             other => panic!("the stop pipe answered {other:?}"),
         }
     }

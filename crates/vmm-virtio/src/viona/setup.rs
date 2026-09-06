@@ -6,9 +6,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use viona_api::PromiscMode;
+use viona_api::{LinkOps, PromiscMode};
 
-use super::link::LinkOps;
 use super::{RingState, VionaInner, VirtioViona, ETHERADDRL, NET_NUM_QUEUES};
 
 impl VirtioViona {

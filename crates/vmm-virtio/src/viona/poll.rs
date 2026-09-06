@@ -15,7 +15,8 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use super::link::{IntrWait, LinkOps};
+use viona_api::{IntrWait, LinkOps};
+
 use super::{VionaInterrupt, VirtioViona, NET_NUM_QUEUES};
 
 /// The interrupt slot the poll thread reads its path from.
@@ -205,7 +206,18 @@ fn viona_intr_poll_loop(
     slot: &Mutex<Option<VionaInterrupt>>,
     log: slog::Logger,
 ) {
-    while link.wait_intr(&stop, &log) == IntrWait::Pending {
-        deliver_pending(link, slot, &log);
+    loop {
+        match link.wait_intr(&stop) {
+            Ok(IntrWait::Pending) => deliver_pending(link, slot, &log),
+            // The halt closed the stop pipe, or the link is gone.
+            Ok(IntrWait::Stopped) => return,
+            // The descriptor is closed, or the error is fatal. Waiting
+            // again would spin on the same error.
+            Err(err) => {
+                slog::warn!(log, "the viona interrupt wait failed";
+                    "error" => %err);
+                return;
+            }
+        }
     }
 }

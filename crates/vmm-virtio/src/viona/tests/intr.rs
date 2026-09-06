@@ -36,12 +36,12 @@ use super::device::device_with;
 use super::{cleared, null_log, Park, ParkAt, Steps, TestLink};
 use crate::bits;
 use crate::pci::VirtioPciDevice;
-use crate::viona::link::LinkOps;
 use crate::viona::poll::deliver_pending;
 use crate::viona::{
     VionaInterrupt, VirtioViona, NET_CONFIG_SIZE, NET_NUM_QUEUES,
     NET_QUEUE_SIZE,
 };
+use viona_api::LinkOps;
 
 /// A wait this long means a thread is wedged, not slow.
 const WEDGED: Duration = Duration::from_secs(15);

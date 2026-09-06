@@ -19,11 +19,15 @@
 //!
 //! # Where the rest lives
 //!
-//! - [`link`]: the in-kernel calls, behind one trait
 //! - [`halt`]: the teardown order, which gives the VM its hold back
 //! - [`poll`]: the interrupt poll thread
 //! - [`migrate`]: the ring state a migration moves
 //! - [`setup`]: opening the link and pointing the kernel at it
+//!
+//! Every call into the kernel goes through [`viona_api::LinkOps`], on
+//! every platform. The illumos build puts its open `VionaFd` behind
+//! it, so the device holds the same `Arc<dyn LinkOps>` the tests hand
+//! it. That is what lets the tests run where the product runs.
 
 use std::sync::{Arc, Mutex};
 
@@ -32,10 +36,9 @@ use vmm_core::mem::PhysMap;
 use super::pci::intr::BackendIntr;
 use super::queue::VirtQueue;
 use super::VirtioDevice;
-use link::LinkOps;
+use viona_api::LinkOps;
 
 mod halt;
-mod link;
 mod migrate;
 mod poll;
 mod setup;

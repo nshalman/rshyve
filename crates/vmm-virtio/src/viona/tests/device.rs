@@ -18,12 +18,12 @@ use vmm_devices::Lifecycle;
 use super::{null_log, steps_of, Hold, Step, Steps, TestLink};
 use crate::queue::VirtQueue;
 use crate::viona::halt::Poller;
-use crate::viona::link::LinkOps;
 use crate::viona::{
     RingState, VirtioViona, ETHERADDRL, NET_NUM_QUEUES, NET_QUEUE_SIZE,
     VIRTIO_NET_F_MAC,
 };
 use crate::VirtioDevice;
+use viona_api::LinkOps;
 
 /// How long a test waits before it calls a thread stuck.
 ///
