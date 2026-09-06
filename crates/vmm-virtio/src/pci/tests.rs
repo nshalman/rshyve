@@ -77,6 +77,33 @@ fn make_device_of_type(
     )
 }
 
+/// Build a device that has an MSI-X table, the way every real device
+/// does. `MsiSink` exists so the table needs no live vmm handle.
+fn make_device_with_msix(
+) -> (Arc<VirtioPciDevice<TestVirtioDevice>>, Arc<MsixTable>) {
+    struct NullSink;
+    impl vmm_devices::pci::msix::MsiSink for NullSink {
+        fn send(&self, _addr: u64, _data: u64) {}
+    }
+    let msix = Arc::new(MsixTable::new(2, Arc::new(NullSink)));
+    let physmap = Arc::new(PhysMap::new());
+    let bus_pio = Arc::new(PioBus::new());
+    let bus_mmio = Arc::new(MmioBus::new());
+    let dev = VirtioPciDevice::new(
+        TestVirtioDevice { features: 0x42 },
+        bits::VIRTIO_DEV_TYPE_BLOCK,
+        1,
+        256,
+        8,
+        None,
+        physmap,
+        bus_pio,
+        bus_mmio,
+        Some(Arc::clone(&msix)),
+    );
+    (dev, msix)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RestoreRingCall {
     queue_idx: u16,
@@ -559,14 +586,60 @@ fn device_config_offset_without_msix() {
 
 #[test]
 fn device_config_offset_msix_constant() {
-    // Without a VmmHdl we cannot construct MsixTable, but we can
-    // verify the constants that determine the offset.
     assert_eq!(bits::LEGACY_REG_DEVICE_CONFIG, 0x14);
     assert_eq!(bits::LEGACY_REG_DEVICE_CONFIG_MSIX, 0x18);
     // The difference is 4 bytes (two 16-bit vector registers)
     assert_eq!(
         bits::LEGACY_REG_DEVICE_CONFIG_MSIX - bits::LEGACY_REG_DEVICE_CONFIG,
         4,
+    );
+}
+
+/// The legacy layout follows the MSI-X enable bit, not the presence of
+/// the table. Every device is built with a table, so a driver that
+/// leaves MSI-X off reads device config at 0x14 and must find it
+/// there. A guest that read 4 bytes early got two 0xFFFF vector
+/// registers where its data belonged.
+#[test]
+fn a_driver_that_leaves_msix_off_reads_device_config_at_0x14() {
+    let (dev, msix) = make_device_with_msix();
+    assert!(!msix.is_enabled(), "MSI-X starts disabled");
+    assert_eq!(dev.device_config_offset(), bits::LEGACY_REG_DEVICE_CONFIG);
+    assert_eq!(dev.device_config_offset(), 0x14);
+}
+
+#[test]
+fn a_driver_that_enables_msix_reads_device_config_at_0x18() {
+    let (dev, msix) = make_device_with_msix();
+    msix.set_enabled(true);
+    assert_eq!(
+        dev.device_config_offset(),
+        bits::LEGACY_REG_DEVICE_CONFIG_MSIX
+    );
+    assert_eq!(dev.device_config_offset(), 0x18);
+}
+
+/// The vector registers themselves follow the same rule: they exist
+/// only once the driver enabled MSI-X. While it is off, 0x14 is the
+/// first byte of device config.
+#[test]
+fn the_vector_registers_appear_only_once_msix_is_enabled() {
+    let (dev, msix) = make_device_with_msix();
+
+    // TestVirtioDevice::cfg_read answers with the offset it was given,
+    // so device config byte 0 reads back as 0. A vector register at
+    // NO_VECTOR reads 0xFFFF, so the two are told apart.
+    assert_eq!(
+        dev.bar_read(0x14, 2),
+        0,
+        "0x14 gave the driver a vector register while MSI-X was off"
+    );
+
+    msix.set_enabled(true);
+    assert_eq!(
+        dev.bar_read(0x14, 2),
+        0xFFFF,
+        "with MSI-X on, 0x14 is the config vector register at NO_VECTOR"
     );
 }
 

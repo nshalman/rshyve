@@ -26,13 +26,23 @@ use super::bits;
 use super::{VirtioDevice, VirtioPciDevice};
 
 impl<D: VirtioDevice> VirtioPciDevice<D> {
+    /// Whether the driver turned MSI-X on.
+    ///
+    /// The legacy layout follows the enable bit in Message Control, not
+    /// the presence of the capability. Every device here is built with
+    /// an MSI-X table, so a presence test moves device config for a
+    /// driver that never enabled MSI-X and reads it at 0x14.
+    fn msix_enabled(&self) -> bool {
+        self.msix.as_ref().is_some_and(|msix| msix.is_enabled())
+    }
+
     /// Return the BAR0 offset where device-specific config begins.
     ///
-    /// With MSI-X, two extra 16-bit vector registers are inserted
-    /// between ISR and device config (at 0x14 and 0x16), pushing
-    /// device config to 0x18.
+    /// With MSI-X enabled, two extra 16-bit vector registers are
+    /// inserted between ISR and device config (at 0x14 and 0x16),
+    /// pushing device config to 0x18.
     pub(super) fn device_config_offset(&self) -> u16 {
-        if self.msix.is_some() {
+        if self.msix_enabled() {
             bits::LEGACY_REG_DEVICE_CONFIG_MSIX
         } else {
             bits::LEGACY_REG_DEVICE_CONFIG
@@ -82,10 +92,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 drop(vs);
                 u32::from(self.read_isr())
             }
-            bits::LEGACY_REG_MSIX_CONFIG_VECTOR if self.msix.is_some() => {
+            bits::LEGACY_REG_MSIX_CONFIG_VECTOR if self.msix_enabled() => {
                 u32::from(vs.config_msix_vector)
             }
-            bits::LEGACY_REG_MSIX_QUEUE_VECTOR if self.msix.is_some() => {
+            bits::LEGACY_REG_MSIX_QUEUE_VECTOR if self.msix_enabled() => {
                 let idx = vs.queue_select as usize;
                 u32::from(
                     vs.queue_msix_vectors
@@ -221,12 +231,12 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             bits::LEGACY_REG_ISR_STATUS => {
                 // Read-only register, ignore writes
             }
-            bits::LEGACY_REG_MSIX_CONFIG_VECTOR if self.msix.is_some() => {
+            bits::LEGACY_REG_MSIX_CONFIG_VECTOR if self.msix_enabled() => {
                 vs.config_msix_vector = val as u16;
                 self.msix_config_vector
                     .store(val as u16, std::sync::atomic::Ordering::Release);
             }
-            bits::LEGACY_REG_MSIX_QUEUE_VECTOR if self.msix.is_some() => {
+            bits::LEGACY_REG_MSIX_QUEUE_VECTOR if self.msix_enabled() => {
                 let idx = vs.queue_select as usize;
                 if idx < vs.queue_msix_vectors.len() {
                     vs.queue_msix_vectors[idx] = val as u16;
