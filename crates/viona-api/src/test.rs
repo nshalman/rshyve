@@ -88,13 +88,90 @@ fn u32_comparisons() {
     assert!(3u32 > ApiVersion::V2);
 }
 
+/// Every command, against the literal the kernel header computes.
+///
+/// uts/intel/sys/viona_io.h builds these from `('V' << 16) | ('C' << 8)`
+/// plus a selector. Both sides here used that same helper, so every
+/// assertion compared a constant with itself and a drifted selector
+/// reached some other viona entry point in silence. These are the
+/// header's arithmetic done once, by hand.
+///
+/// The halt's two matter most: a drifted DELETE leaves the vmm_drv hold
+/// held, and VM_DESTROY_SELF then waits on it.
 #[test]
-fn the_halt_commands_match_the_kernel() {
-    // uts/intel/sys/viona_io.h. A number that drifts sends the
-    // halt to some other viona entry point, and the vmm_drv hold
-    // it must give back stays held.
+fn the_commands_match_the_kernel() {
+    assert_eq!(VNA_IOC_CREATE, 0x0056_4301);
     assert_eq!(VNA_IOC_DELETE, 0x0056_4302);
+    assert_eq!(VNA_IOC_VERSION, 0x0056_4303);
+    assert_eq!(VNA_IOC_DEFAULT_PARAMS, 0x0056_4304);
+    assert_eq!(VNA_IOC_RING_INIT, 0x0056_4310);
     assert_eq!(VNA_IOC_RING_RESET, 0x0056_4311);
+    assert_eq!(VNA_IOC_RING_KICK, 0x0056_4312);
+    assert_eq!(VNA_IOC_RING_SET_MSI, 0x0056_4313);
+    assert_eq!(VNA_IOC_RING_INTR_CLR, 0x0056_4314);
+    assert_eq!(VNA_IOC_RING_SET_STATE, 0x0056_4315);
+    assert_eq!(VNA_IOC_RING_GET_STATE, 0x0056_4316);
+    assert_eq!(VNA_IOC_RING_PAUSE, 0x0056_4317);
+    assert_eq!(VNA_IOC_RING_INIT_MODERN, 0x0056_4318);
+    assert_eq!(VNA_IOC_INTR_POLL, 0x0056_4320);
+    assert_eq!(VNA_IOC_SET_FEATURES, 0x0056_4321);
+    assert_eq!(VNA_IOC_GET_FEATURES, 0x0056_4322);
+    assert_eq!(VNA_IOC_SET_NOTIFY_IOP, 0x0056_4323);
+    assert_eq!(VNA_IOC_SET_PROMISC, 0x0056_4324);
+    assert_eq!(VNA_IOC_GET_PARAMS, 0x0056_4325);
+    assert_eq!(VNA_IOC_SET_PARAMS, 0x0056_4326);
+    assert_eq!(VNA_IOC_GET_MTU, 0x0056_4327);
+    assert_eq!(VNA_IOC_SET_MTU, 0x0056_4328);
+    assert_eq!(VNA_IOC_SET_NOTIFY_MMIO, 0x0056_4329);
+    assert_eq!(VNA_IOC_INTR_POLL_MQ, 0x0056_432A);
+    assert_eq!(VNA_IOC_GET_PAIRS, 0x0056_4330);
+    assert_eq!(VNA_IOC_SET_PAIRS, 0x0056_4331);
+    assert_eq!(VNA_IOC_GET_USEPAIRS, 0x0056_4332);
+    assert_eq!(VNA_IOC_SET_USEPAIRS, 0x0056_4333);
+}
+
+/// A selector may not be reused. The kernel dispatches on the whole
+/// number, so two names sharing one value are one entry point.
+#[test]
+fn no_two_commands_share_a_number() {
+    let all = [
+        ("VNA_IOC_CREATE", VNA_IOC_CREATE),
+        ("VNA_IOC_DELETE", VNA_IOC_DELETE),
+        ("VNA_IOC_VERSION", VNA_IOC_VERSION),
+        ("VNA_IOC_DEFAULT_PARAMS", VNA_IOC_DEFAULT_PARAMS),
+        ("VNA_IOC_RING_INIT", VNA_IOC_RING_INIT),
+        ("VNA_IOC_RING_RESET", VNA_IOC_RING_RESET),
+        ("VNA_IOC_RING_KICK", VNA_IOC_RING_KICK),
+        ("VNA_IOC_RING_SET_MSI", VNA_IOC_RING_SET_MSI),
+        ("VNA_IOC_RING_INTR_CLR", VNA_IOC_RING_INTR_CLR),
+        ("VNA_IOC_RING_SET_STATE", VNA_IOC_RING_SET_STATE),
+        ("VNA_IOC_RING_GET_STATE", VNA_IOC_RING_GET_STATE),
+        ("VNA_IOC_RING_PAUSE", VNA_IOC_RING_PAUSE),
+        ("VNA_IOC_RING_INIT_MODERN", VNA_IOC_RING_INIT_MODERN),
+        ("VNA_IOC_INTR_POLL", VNA_IOC_INTR_POLL),
+        ("VNA_IOC_SET_FEATURES", VNA_IOC_SET_FEATURES),
+        ("VNA_IOC_GET_FEATURES", VNA_IOC_GET_FEATURES),
+        ("VNA_IOC_SET_NOTIFY_IOP", VNA_IOC_SET_NOTIFY_IOP),
+        ("VNA_IOC_SET_PROMISC", VNA_IOC_SET_PROMISC),
+        ("VNA_IOC_GET_PARAMS", VNA_IOC_GET_PARAMS),
+        ("VNA_IOC_SET_PARAMS", VNA_IOC_SET_PARAMS),
+        ("VNA_IOC_GET_MTU", VNA_IOC_GET_MTU),
+        ("VNA_IOC_SET_MTU", VNA_IOC_SET_MTU),
+        ("VNA_IOC_SET_NOTIFY_MMIO", VNA_IOC_SET_NOTIFY_MMIO),
+        ("VNA_IOC_INTR_POLL_MQ", VNA_IOC_INTR_POLL_MQ),
+        ("VNA_IOC_GET_PAIRS", VNA_IOC_GET_PAIRS),
+        ("VNA_IOC_SET_PAIRS", VNA_IOC_SET_PAIRS),
+        ("VNA_IOC_GET_USEPAIRS", VNA_IOC_GET_USEPAIRS),
+        ("VNA_IOC_SET_USEPAIRS", VNA_IOC_SET_USEPAIRS),
+    ];
+    for (i, (name, val)) in all.iter().enumerate() {
+        for (other, other_val) in &all[i + 1..] {
+            assert_ne!(
+                val, other_val,
+                "{name} and {other} name one viona entry point",
+            );
+        }
+    }
 }
 
 #[test]
