@@ -335,20 +335,51 @@ fn vring_need_event_single_step() {
     }
 }
 
+// VirtIO 1.3 sec 2.7.10: after the device writes `used_event` it
+// re-reads `avail_idx`, because the guest may have decided not to kick
+// on the stale threshold it saw. Each of the three answers is read out
+// of real guest memory: an early return that reported the wrong one
+// would either re-walk a ring nobody posted to or drop the entries the
+// guest posted in the race window, and the guest would wait for ever.
+//
+// These two used to assert only `!event_idx_enabled()` and
+// `!is_configured()` on a fresh queue, which are constructor defaults.
+// Neither called `has_new_avail`, so both passed with it returning
+// `true` unconditionally.
 #[test]
-fn has_new_avail_disabled_when_no_event_idx() {
-    let q = VirtQueue::new(128);
-    assert!(!q.event_idx_enabled());
-    // has_new_avail should always return false when event_idx is off
-    // (can't test with real PhysMap, but the early return is the key)
+fn has_new_avail_says_no_when_event_idx_is_off() {
+    let (physmap, mut queue) =
+        posted_queue(RING_GPA, RING_GPA + 0x100, RING_GPA + 0x200);
+    queue.set_event_idx(false);
+
+    // The guest has posted an entry the device has not seen, so the
+    // only thing that can hold the answer down is the feature bit.
+    assert_eq!(queue.last_avail_idx(), 0);
+    assert!(!queue.has_new_avail(&physmap));
 }
 
 #[test]
-fn has_new_avail_disabled_when_not_configured() {
-    let mut q = VirtQueue::new(128);
-    q.set_event_idx(true);
-    // Not configured (no PFN set) → false
-    assert!(!q.is_configured());
+fn has_new_avail_says_no_on_a_queue_the_driver_never_programmed() {
+    let physmap =
+        PhysMap::new_anon(RING_GPA, RING_BYTES).expect("create guest memory");
+    let mut queue = VirtQueue::new(RING_DESCS);
+    queue.set_event_idx(true);
+
+    assert!(!queue.is_configured());
+    assert!(!queue.has_new_avail(&physmap));
+}
+
+// The answer the other two are the exceptions to. Without this one a
+// `has_new_avail` that always says no passes both of them.
+#[test]
+fn has_new_avail_sees_an_entry_the_device_has_not_walked() {
+    let (physmap, mut queue) =
+        posted_queue(RING_GPA, RING_GPA + 0x100, RING_GPA + 0x200);
+    queue.set_event_idx(true);
+
+    assert!(queue.has_new_avail(&physmap));
+    assert_eq!(queue.pop_avail(&physmap), Some(0));
+    assert!(!queue.has_new_avail(&physmap));
 }
 
 // -- Ring address validation --
