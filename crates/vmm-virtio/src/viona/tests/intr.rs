@@ -214,6 +214,12 @@ impl MsiSink for TestSink {
     }
 }
 
+/// Write a legacy BAR0 register the way a guest does.
+fn write_legacy_on(dev: &Dev, reg: u16, val: &[u8]) {
+    let wo = WriteOp::from_buf(val);
+    dev.bar_rw(BarN::BAR0, usize::from(reg), RWOp::Write(&wo));
+}
+
 type Dev = Arc<VirtioPciDevice<VirtioViona>>;
 
 /// A viona device on a real pin, its poll link, and whatever the
@@ -291,9 +297,7 @@ impl Fixture {
     }
 
     fn write_legacy(&self, reg: u16, val: &[u8]) {
-        let wo = WriteOp::from_buf(val);
-        self.dev
-            .bar_rw(BarN::BAR0, usize::from(reg), RWOp::Write(&wo));
+        write_legacy_on(&self.dev, reg, val);
     }
 
     fn write_status(&self, val: u8) {
@@ -471,4 +475,110 @@ fn a_notification_in_the_running_session_reaches_an_msix_driver() {
         0,
         "an MSI-X driver was sent an INTx assertion it will never lower",
     );
+}
+
+/// How long a reset may take while a poll thread sits at its park.
+///
+/// Generous: this is not a latency claim, it separates "returned" from
+/// "waiting on the parked thread".
+const RESET_BOUND: Duration = Duration::from_secs(5);
+
+/// The reset runs on its own thread, and must finish while the poll
+/// thread is still parked.
+///
+/// This is what says the park sits BEFORE admission rather than after.
+/// A delivery the gate had already admitted is one `finish_reset` waits
+/// out, so a poller parked on the far side of admission would hold the
+/// reset here and this fails instead of hanging. It is also the
+/// property the whole remedy rests on: the poll thread is never
+/// stopped or drained by a reset, so a reset that could wait for it
+/// would wait for a kernel poll with no deadline.
+fn a_reset_completes_while_the_poll_thread_is_held(
+    park_at: ParkAt,
+    msix: bool,
+) {
+    let fix = Fixture::new(park_at, msix);
+    fix.arm();
+
+    let poller = fix.spawn_poller();
+    fix.wait_parked();
+
+    // Another thread entirely, the way the guest's vCPU is another
+    // thread. Nothing releases the park until it has returned.
+    let resetter = {
+        let dev = Arc::clone(&fix.dev);
+        std::thread::Builder::new()
+            .name("guest-vcpu-stub".into())
+            .spawn(move || {
+                write_legacy_on(&dev, bits::LEGACY_REG_DEVICE_STATUS, &[0]);
+            })
+            .expect("the test can spawn a thread")
+    };
+    let deadline = std::time::Instant::now() + RESET_BOUND;
+    while !resetter.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let reset_returned = resetter.is_finished();
+
+    // The next driver arms BEFORE the poll thread is let go, vector
+    // and all. Arming afterwards makes this test lie on MSI-X: a reset
+    // leaves every vector at NO_VECTOR, so a delivery into the new
+    // session would be swallowed by the routing and the test would
+    // pass with the session check removed. Verified by mutation, not
+    // by reading.
+    fix.arm();
+
+    // Released either way, so a wrong build fails rather than parking
+    // the run.
+    fix.release();
+    poller.join().expect("the poll thread finished");
+    resetter.join().expect("the reset finished");
+    assert!(
+        reset_returned,
+        "the reset waited on a poll thread parked before admission",
+    );
+
+    assert_eq!(
+        fix.delivered(),
+        0,
+        "a notification collected before the reset reached the next driver",
+    );
+    assert_eq!(fix.isr(), 0, "the old session set the ISR");
+    assert!(!fix.pin.is_asserted(), "the old session left the line up");
+
+    // Same device, same ring, same vector: only the session differs.
+    // Without this, silence is not evidence of a session check.
+    fix.deliver_here();
+    assert_eq!(
+        fix.delivered(),
+        1,
+        "the running session's own notification was dropped",
+    );
+    // A refused notification still has to leave the kernel's pending
+    // bit clear, or viona re-signals it and this thread spins.
+    assert_eq!(
+        fix.link.cleared(),
+        [PENDING_RING as u16, PENDING_RING as u16],
+        "the kernel's pending interrupt was not cleared each wakeup",
+    );
+}
+
+#[test]
+fn a_reset_on_another_thread_finishes_over_a_parked_poller_on_intx() {
+    a_reset_completes_while_the_poll_thread_is_held(ParkAt::Poll, false);
+}
+
+#[test]
+fn a_reset_on_another_thread_finishes_over_a_parked_poller_on_msix() {
+    a_reset_completes_while_the_poll_thread_is_held(ParkAt::Poll, true);
+}
+
+#[test]
+fn a_reset_on_another_thread_finishes_over_a_poller_at_the_clear_on_intx() {
+    a_reset_completes_while_the_poll_thread_is_held(ParkAt::Clear, false);
+}
+
+#[test]
+fn a_reset_on_another_thread_finishes_over_a_poller_at_the_clear_on_msix() {
+    a_reset_completes_while_the_poll_thread_is_held(ParkAt::Clear, true);
 }
