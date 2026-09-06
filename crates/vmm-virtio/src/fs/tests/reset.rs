@@ -70,16 +70,19 @@ fn a_reset_does_not_wait_for_interrupt_injection() {
 
 // A guest picks how much stale work is waiting when it writes 0 to
 // DEVICE_STATUS. A full queue of it must not lengthen the reset by so
-// much as one request: admission shuts first, and work refused there
-// never touches the lock the resetting vCPU waits for.
+// much as one request, and none of it may reach the ring afterwards:
+// the driver is free to reclaim that memory the moment the write
+// returns.
 #[test]
 fn a_full_queue_of_stale_work_does_not_lengthen_the_reset() {
     const BACKLOG: u16 = FS_QUEUE_SIZE_DEFAULT;
     let (physmap, mut queues, fs) = ring(BACKLOG, BACKLOG);
+    let req = usize::from(FS_REQUEST_QUEUE);
     fs.start().expect("start");
 
     // Park the worker so a whole queue piles up behind it instead of
-    // completing one by one.
+    // completing one by one, which is what a guest arranges before it
+    // writes the reset register.
     park_the_worker(&fs);
     fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
     assert_eq!(
@@ -87,28 +90,31 @@ fn a_full_queue_of_stale_work_does_not_lengthen_the_reset() {
         usize::from(BACKLOG),
         "the backlog never reached the worker"
     );
-    fs.resume();
 
     let waited = time_reset(&fs, &|| ());
-    let req = usize::from(FS_REQUEST_QUEUE);
-    let published = queues[req].read_used_ring_idx(&physmap);
+
+    // Let the worker loose on the backlog the reset ended. Every
+    // request in it names the session that is gone.
+    fs.resume();
+    let deadline = Instant::now() + BACKLOG_BUDGET;
+    while fs.inflight.load(Ordering::Acquire) != 0 && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
 
     assert!(
         waited < WHOLE_RESET_BUDGET,
         "a backlog of {BACKLOG} held the resetting vCPU for {waited:?}"
     );
-    // The rest of the backlog is still running. None of it may reach
-    // the ring the guest is free to reclaim now the write has
-    // returned, so the index has to stand still from here.
-    assert!(
-        published < BACKLOG,
-        "the whole backlog finished before the reset"
+    assert_eq!(
+        fs.inflight.load(Ordering::Acquire),
+        0,
+        "the backlog never retired"
     );
-    std::thread::sleep(BACKLOG_BUDGET);
     assert_eq!(
         queues[req].read_used_ring_idx(&physmap),
-        published,
-        "a stale request published into the ring after the reset returned"
+        0,
+        "a stale request published into the ring the reset gave back"
     );
 }
 
