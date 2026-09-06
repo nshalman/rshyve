@@ -52,6 +52,7 @@ honor at startup. See [docs/cli.md](docs/cli.md#firehyve).
 - [Live Migration](docs/migration.md) - Cross-host VM migration
 - [Metadata Agent](docs/mdata.md) - Guest configuration via COM2
 - [Platform Integration](docs/platform.md) - vmadm/boot.c integration
+- [Hardware run](docs/hardware-run.md) - what a live guest established, and what it did not
 
 ## Building and testing
 
@@ -68,8 +69,11 @@ git clone --recurse-submodules https://github.com/TritonDataCenter/rust-bhyve
 
 ```bash
 cargo build --workspace --locked --release   # on an illumos host
-cargo test --workspace --locked
+cargo test --workspace --locked --no-fail-fast
 ```
+
+Pass `--no-fail-fast`. Without it the run stops at the first crate that
+fails, and the partial output still reads like a completed pass.
 
 Build prerequisites on the illumos host: a Rust toolchain, autoconf,
 automake, libtool, pkg-config, gmake, gcc, and OpenSSL development
@@ -90,7 +94,10 @@ could be offered, since it replaces `/usr/sbin/bhyve` wholesale.
 ## Status
 
 Tested on SmartOS with bhyve API v18. See [docs/status.md](docs/status.md)
-for feature matrix.
+for the feature matrix and
+[docs/hardware-run.md](docs/hardware-run.md) for what a live guest
+showed, including the one platform limit it found: a device reset has
+no bounded duration on illumos.
 
 ## Security
 

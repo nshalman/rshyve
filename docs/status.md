@@ -14,6 +14,14 @@
 | Same-host migration with busy workload | Working |
 | SIGTERM graceful shutdown | Working |
 | dd sequential read (NVMe, O_DIRECT) | 2.8 GB/s (matches C bhyve) |
+| 293 guest device resets under load, data verified after each | Working |
+| 5 warm reboots with a dirty guest page cache | Working |
+| virtio-fs and viona reset with traffic in flight | Working |
+| 30 guest ACPI S5 poweroffs, no leaked process or VM instance | Working |
+
+The reset, reboot and poweroff rows come from one lab session on a
+busybox initramfs guest, not a distro image. What they do and do not
+show is in [hardware-run.md](hardware-run.md).
 
 ## Devices
 
@@ -97,3 +105,10 @@
 - NVList/zhyve.cmd reader not implemented (boot.c integration uses CLI flags directly)
 - Large VMs (>32 GB) not tested with migration
 - virtio-net TX may show initial delay on first packet (viona interrupt poll startup)
+- A device reset has no bounded duration. Anything holding the bhyve VM
+  write lock delays it, and memory hot-add holds that lock for 233 to
+  270 ms per GiB. See
+  [hardware-run.md](hardware-run.md#why-a-device-reset-has-no-upper-bound)
+- Most viona device tests do not compile on illumos, so they cover the
+  macOS and Linux build only. See
+  [hardware-run.md](hardware-run.md#coverage-that-does-not-reach-illumos)

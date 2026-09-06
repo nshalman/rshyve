@@ -223,6 +223,10 @@ Both headnode and nuc1 have `vmm_test0` VNICs with MAC `02:08:20:aa:bb:cc`.
 8. **virtio-fs test**: `tools/virtiofs-stage.sh` then `virtiofs-run.sh` - see below
 9. **Hotplug test**: boot with `--hotplug`, then `cpu-add`, `mem-add` and `device-add` over the control socket or the vsock `CONTROL` verb - see below
 10. **Wedged lease teardown**: delay viona's TX frame release, power the guest off, and watch the shutdown budget expire - see below
+11. **Device reset matrix**: reset the device from inside a running guest, repeatedly, with I/O in flight, and verify guest data after each - see below
+
+What one live guest already established, and what it did not, is in
+[hardware-run.md](hardware-run.md). Read it before repeating any of it.
 
 ### virtio-fs Test
 
@@ -547,6 +551,54 @@ ssh $VMM_HEADNODE 'mdb -kw -e "viona_default_tx_copy/W 1"'
    On a node where a real holder cannot be released, there is no
    userspace recovery. The guest memory stays held until the node
    reboots.
+
+### Device reset matrix
+
+A device reset is the one guest operation this VMM has to complete
+synchronously, and no test in the suite drives a real driver through
+one. Drive it from inside the guest.
+
+The shape that found bugs, and that
+[hardware-run.md](hardware-run.md#the-device-reset-matrix) records:
+
+1. Start a long `dd` against the disk inside the guest and leave it
+   running. A reset with no work in flight tests almost nothing.
+2. Unbind and rebind the device through sysfs, in a loop. Each rebind
+   is a real driver reset, not a control-socket command.
+3. Force the legacy transport for part of the run. That path writes the
+   status register and reads it back once, with no polling loop, so a
+   reset that has not finished when the write returns is visible.
+4. After every reset, read back a file of known content in the guest and
+   compare its SHA-256. A reset that loses or reorders a completion
+   corrupts data quietly; a pass/fail on the reset alone does not see it.
+
+Two guest resets that also need cover, and that the run above included:
+a warm reboot with a dirty page cache, and an ACPI S5 poweroff. After a
+poweroff, check the host for a leaked process and for a leaked kernel VM
+instance with `bhyvectl --vm=<name> --get-stats`.
+
+Do not read a pass as a result for an illumos guest. The illumos virtio
+driver writes the status register once and never reads it back, on
+either transport, so it is the strictest case and it has never been run.
+
+### Interrupt injection latency
+
+The residual cost of a device reset is the interrupt injections already
+in flight, and each is one ioctl. Measure the ioctl, under three
+conditions, because the idle number is not the one that matters:
+
+- idle,
+- with the guest running one spinning thread per vCPU,
+- during a memory hot-add on the same VM.
+
+The third is the interesting one. Both injection ioctls take the bhyve
+VM read lock, and illumos grants that lock to a waiting writer first, so
+a hot-add stalls injection for as long as it holds the write lock. Time
+`VM_ALLOC_MEMSEG` on the host at the same time, and vary the size added:
+the hold scales per GiB.
+
+Numbers from the run, and what they mean for a node, are in
+[hardware-run.md](hardware-run.md#why-a-device-reset-has-no-upper-bound).
 
 ### Windows Boot Test
 
