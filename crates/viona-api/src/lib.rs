@@ -45,7 +45,7 @@ enum Chan {
 
 /// One ioctl that a caller sent.
 #[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Call {
     /// The data argument is a value the kernel reads directly.
     Usize { cmd: i32, arg: usize },
@@ -54,6 +54,24 @@ enum Call {
     /// the kernel would copy in. Without them a call that swaps two
     /// fields of its payload records the same thing as the right one.
     Typed { cmd: i32, data: Vec<u8> },
+}
+
+/// The command in hex, the way `uts/intel/sys/viona_io.h` writes it.
+///
+/// A failed assertion here is read against that header, and a decimal
+/// command number is not.
+#[cfg(test)]
+impl std::fmt::Debug for Call {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Call::Usize { cmd, arg } => {
+                write!(f, "Usize {{ cmd: {cmd:#x}, arg: {arg:#x} }}")
+            }
+            Call::Typed { cmd, data } => {
+                write!(f, "Typed {{ cmd: {cmd:#x}, data: {data:02x?} }}")
+            }
+        }
+    }
 }
 
 #[cfg(test)]

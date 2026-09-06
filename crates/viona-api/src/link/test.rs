@@ -509,11 +509,16 @@ fn the_wait_ends_when_the_halt_closes_the_stop_pipe() {
     // that read that as pending would go back to the link, and the
     // halt would wait for a thread that never leaves.
     //
-    // The link has ordinary data in it, so a wait that ends here has
-    // to end for the stop descriptor and not for the link.
+    // Where the platform allows it the link carries ordinary data, so
+    // a wait that ends here has to end for the stop descriptor and not
+    // for the link. macOS reports that byte in the interrupt band, and
+    // would end the wait for it before the stop pipe ever closed, so
+    // there the link is left idle and this reads only the wake.
     let (link_rx, mut link_tx) = std::io::pipe().expect("a pipe");
     let (stop_rx, stop_tx) = std::io::pipe().expect("a pipe");
-    link_tx.write_all(b"x").expect("the pipe takes a byte");
+    if tells_a_band_from_a_byte() {
+        link_tx.write_all(b"x").expect("the pipe takes a byte");
+    }
 
     let waiting = spawn_wait(link_on(link_rx), stop_rx);
     drop(stop_tx);
