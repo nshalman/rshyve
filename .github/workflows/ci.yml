@@ -11,8 +11,9 @@ name: CI
 # compile natively. See the `binaries` job.
 #
 # So a green run here means: the tree is formatted, the portable crates
-# are clippy-clean and their tests pass, every portable crate and its
-# test targets type-check against the illumos target, the lockfile is
+# are clippy-clean and their tests pass, the recorded-ioctl tests of the
+# three illumos binding crates pass, every portable crate and its test
+# targets type-check against the illumos target, the lockfile is
 # current, and the dependency and public-surface policies hold.
 # tools/fhrun-init is excluded from the workspace, so the guest-init job
 # covers it on its own.
@@ -120,13 +121,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Codecs, bounds checks, device register models, and the migration
-      # protocol. Nothing here touches bhyve or viona.
+      # protocol.
+      #
+      # The three binding crates are here for their tests only. They
+      # reach no kernel on this runner: each one drives a recorded ioctl
+      # seam over /dev/null and a pipe, and those recordings are the only
+      # pins on the command number and the arguments the kernel is given.
+      # The bindings are still left out of the clippy and MSRV jobs,
+      # because the compile that means something for them is the illumos
+      # one in `cross-check`. Before this, the build host was the one
+      # machine that ran these tests. tools/check-ci-crates.sh asserts
+      # that they stay named here.
       - run: >
           cargo test --locked
           -p vmm_api_common -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
           -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
-          -p fhrun
+          -p fhrun -p bhyve_api_sys -p bhyve_api -p viona_api
 
   guest-init:
     name: guest init (musl)
