@@ -140,6 +140,8 @@ graphical path unusable.
 | ⏳ Block I/O throttling | NVMe and virtio-blk have no per-disk IOPS or bandwidth limiter. Multitenant rate isolation remains absent. |
 | ⏳ Hugepage memory backing | Guest RAM setup has no hugepage backing option. Any illumos implementation needs measurement and an explicit fallback policy. |
 | ⏳ Watchdog device | No guest watchdog such as `i6300esb` exists. Guest stall detection and watchdog-triggered reset remain absent. |
+| ⏳ Make the viona test seam exist on illumos | `VionaInner` holds `viona_fd: Arc<viona_api::VionaFd>` on illumos and `link: Arc<dyn LinkOps>` everywhere else (`crates/vmm-virtio/src/viona.rs:113,121`), so `viona/tests.rs` gates both test modules out on the target platform: 26 of 29 viona tests at `d1ec631`, up from 22 of 25 one commit earlier. Hold the link as `Arc<dyn LinkOps>` on every platform and put the kernel handle behind it, which `VionaInner::link` already returns. Every viona test added before this widens the gap. |
+| ⏳ Guard the per-platform test-count delta | macOS ran about 12 more tests than illumos across the four crates carrying platform gates, and the delta grew from 5 to 12 across two commits with nobody noticing. Compare per-crate test counts on both platforms and fail on an unexplained change. Reasoning about the gates does not work: the delta does not reduce to the gates now in the tree. |
 
 ## Blocked on illumos kernel work
 
@@ -149,6 +151,7 @@ graphical path unusable.
 | ⏳ CPU hot-remove | illumos has no `vm_deactivate_cpu`. `active_cpus` is only ever set, and the one place that clears it is `vm_init` on `VM_REINIT`. `cpu-remove` is recognised and refused with that reason. |
 | ⏳ Memory hot-remove | illumos has no `VM_FREE_MEMSEG`, and `vm_free_memseg` has only destroy-path callers, so a segment lives until the VM does. `mem-remove` is recognised and refused with that reason. |
 | ⏳ A `VM_DESTROY_SELF` that can fail | `vmm_lease_block` waits for every vmm_drv lease in an untimed, unwakeable `cv_wait`. A lease that does not break parks the calling LWP, and process exit then waits for that LWP. Detail below. |
+| ⏳ A bounded device reset | Both interrupt injection ioctls take the bhyve VM read lock, and illumos grants that lock to a waiting writer first. Any VM write-lock holder therefore delays every device reset on that VM, without limit. Detail below. |
 
 ### Upstream: bound the vmm_drv lease wait
 
@@ -203,6 +206,58 @@ later close still reclaims the instance.
 
 Lab procedure: [docs/testing.md](docs/testing.md#wedged-lease-teardown).
 
+### Upstream: let an interrupt injection through a waiting writer
+
+A device reset ends with an untimed wait over the interrupt injections
+already in flight (`IntrGate::settle`,
+`crates/vmm-virtio/src/pci/intr.rs`). Each of those ends in one
+`VM_LAPIC_MSI` or `VM_IOAPIC_ASSERT_IRQ`. Neither
+`vlapic_set_intr_ready` nor `vioapic_assert_irq` can block, so the
+delay is not in the work. It is in the lock the ioctl takes first.
+
+**The path.** `vmm_ioctl` classifies both injection ioctls as
+`LOCK_READ_HOLD` and calls `vmm_read_lock`, which is
+`rw_enter(&sc->vmm_rwlock, RW_READER)`
+(`usr/src/uts/intel/io/vmm/vmm_sol_dev.c:503,506,517,362`). illumos runs
+a writer priority policy: a reader fails when the lock is owned OR
+wanted by a writer (`usr/src/uts/common/os/rwlock.c:64-70`). So one
+waiting writer stops every later injection.
+
+**Who holds the write lock.** `VM_ALLOC_MEMSEG`, `VM_MMAP_MEMSEG`,
+`VM_PAUSE`, `VM_RESUME` and `VM_DATA_READ`/`VM_DATA_WRITE` with
+`vcpu == -1`, which is VM-wide device-state export
+(`vmm_sol_dev.c:488,528`). All are reachable on a live VM.
+`vmm_write_lock` also freezes every vCPU and calls `vmm_lease_block`
+before it takes the lock, so its hold covers more than the work it
+protects.
+
+**The measurement.** `VM_ALLOC_MEMSEG` alone held the write lock 69 ms
+for a 256 MiB hot-add and scaled at 233 to 270 ms per GiB. A 16 GiB
+hot-add stalls a device reset for seconds. Interrupt injection itself
+measures p50 1.28 us and p99 4.48 us on an idle VM.
+
+**Why userspace cannot close it.** `settle` cannot take a deadline.
+Admission tests the driver session before the ioctl, so an injection
+already dispatched cannot be recalled; a reset that stopped waiting
+would return, the guest would enable its line for the next driver, and
+the stale injection would land on it. This is also worse on illumos
+than elsewhere: `virtio_legacy_device_reset_locked` and
+`virtio_modern_device_reset_locked`
+(`usr/src/uts/common/io/virtio/`) are each a single status write with
+no read-back, so the guest is stopped inside one register write for
+the whole reset.
+
+**What the kernel needs.** Take the injection ioctls with
+`RW_READER_STARVEWRITER` rather than `RW_READER`. That mode acquires
+while a writer waits, as long as no writer owns the lock, and it is
+documented as safe alongside `RW_READER` on the same lock
+(`rwlock.c:173-178`). It buys a bounded injection at the cost of writer
+starvation, so it is a kernel design decision. The alternative is
+operational, not a fix: keep memory hot-add off a VM whose guest may
+reset a device.
+
+Measurements and limits: [docs/hardware-run.md](docs/hardware-run.md#why-a-device-reset-has-no-upper-bound).
+
 ## Tier 2 - strategic, multi-week work
 
 | Item | Why / tree evidence |
@@ -242,6 +297,20 @@ These are validation gates, not new features:
   vTPM NV state as each migration path lands.
 - ⏳ Validate the hot-plug AML with `iasl`, and boot a `--hotplug` VM with a
   guest other than the one Linux configuration in the hot-plug baseline.
+- ⏳ Boot an illumos guest. Every device reset result to date is against
+  Linux drivers. illumos writes the status register once and never reads
+  it back (`uts/common/io/virtio/virtio_legacy.c:208`,
+  `virtio_modern.c:242`), which is the weakest contract any driver
+  offers this VMM, and it has only been read from the source.
+- ⏳ Rerun the reset matrix on a distro guest. The 293-reset run used a
+  busybox initramfs because a multiqueue defect blocked the distro
+  image. Characterise that defect, then repeat with a real block driver
+  stack and a real init.
+- ⏳ Produce a real vmm_drv lease park. The teardown budget, its log
+  records and the shutdown watchdog have never run against a lease that
+  will not break. The DTrace procedure in
+  [docs/testing.md](docs/testing.md#wedged-lease-teardown) delays the
+  release; it does not stop it.
 
 ---
 

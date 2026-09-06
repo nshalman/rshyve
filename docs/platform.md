@@ -105,10 +105,13 @@ and then fails to exec on a node.
 
 ### Host tunables
 
-`strmsgsz` must be 8192 or above, or 0. The default, 65536, is correct,
-and nothing in a stock platform image changes it. Read the live value
-with `echo 'strmsgsz/E' | mdb -k`, and look for a `set strmsgsz=` line
-in `/etc/system` on a node that was tuned.
+`strmsgsz` must be 8192 or above, or 0. Read the live value with
+`echo 'strmsgsz/E' | mdb -k`, and look for a `set strmsgsz=` line in
+`/etc/system` on a node that was tuned.
+
+This is measured, not assumed. A lab node reads 65536 against the
+VMM's 8 KiB write chunk, an 8x margin, and nothing in a stock platform
+image changes it ([hardware-run.md](hardware-run.md#the-socket-bound-is-measured-not-assumed)).
 
 The VMM writes to its Unix sockets under a lock or on a vCPU thread, so
 each write needs an end. illumos has no send timeout that works on an
@@ -119,6 +122,25 @@ between two messages has no timeout. The sockets this covers are the
 virtio-console client, the vsock host socket, and the firehyve
 `CONTROL` reply. [docs/features.md](features.md#known-caveats) has the
 full chain.
+
+Check this on a new host rather than trusting a test pass from a
+development machine. macOS bounds an AF_UNIX send with `SO_SNDTIMEO`
+and illumos accepts the option and ignores it, so the portable test
+suite never reaches the code that needs `strmsgsz`.
+
+### Interrupt injection and the VM lock
+
+A device reset ends by waiting out the interrupt injections already in
+flight, and both injection ioctls take the bhyve VM read lock. illumos
+grants that lock to a waiting writer first, so any operation holding
+the VM write lock delays every reset on that VM. Memory hot-add, pause,
+resume and VM-wide device-state export all hold it.
+
+The delay is unbounded and it scales with the size of a hot-add: 233 to
+270 ms per GiB measured. Plan a node's memory hot-add policy around
+that, and read
+[hardware-run.md](hardware-run.md#why-a-device-reset-has-no-upper-bound)
+before assuming a reset completes in a fixed time.
 
 ### OpenSSL and the vTPM
 
