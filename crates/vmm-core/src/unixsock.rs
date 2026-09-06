@@ -332,7 +332,7 @@ mod tests {
     /// The write is the thing under test, so it cannot be joined here:
     /// an unbounded one would park the test run instead of failing.
     fn write_within_limit(device: UnixStream, data: Vec<u8>) -> io::Result<()> {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(write_all_bounded(&device, &data, BUDGET));
         });
