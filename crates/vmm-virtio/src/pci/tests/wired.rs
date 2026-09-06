@@ -3,8 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Transport tests that build a device on real buses or real guest
-//! memory: BAR teardown, a blocking backend reset, and ring address
-//! validation.
+//! memory: BAR moves and teardown, a blocking backend reset, and ring
+//! address validation.
 
 use super::*;
 
@@ -250,6 +250,63 @@ fn a_draining_reset_is_not_visible_to_another_vcpu() {
         "the backend reset ran off the vCPU that wrote DEVICE_STATUS"
     );
     assert_eq!(status(&dev), 0, "the write returned before the reset ended");
+}
+
+/// A BAR the guest moves must stop decoding at the address it gave up.
+///
+/// A guest reassigns BARs whenever it likes, and it can hand the old
+/// window to another function. A registration left behind answers
+/// there for as long as the device lives, so this device would serve
+/// reads and writes aimed at another one. The registration record and
+/// the bus must agree at every step, so an update releases before it
+/// registers.
+#[test]
+fn moving_a_bar_takes_the_old_window_off_the_bus() {
+    const MOVED_BAR0_PORT: u16 = 0x3000;
+    const MOVED_BAR2_ADDR: u64 = 0xE100_0000;
+
+    let (dev, bus_pio, bus_mmio) = make_device_with_buses();
+    enable_bars(&dev);
+
+    // A live window answers 0 here: legacy DEVICE_FEATURES is 0 for
+    // this backend, and modern DEVICE_FEATURE_SELECT starts at 0. A
+    // dark one answers all ones.
+    assert_eq!(bus_pio.handle_in(TEST_BAR0_PORT, 1), 0, "BAR0 is not live");
+    assert_eq!(
+        bus_mmio.handle_read(TEST_BAR2_ADDR, 4),
+        0,
+        "BAR2 is not live"
+    );
+
+    dev.cfg_write(0x10, 4, u32::from(MOVED_BAR0_PORT));
+    dev.cfg_write(0x18, 4, MOVED_BAR2_ADDR as u32);
+
+    assert_eq!(
+        bus_pio.handle_in(TEST_BAR0_PORT, 1),
+        0xFF,
+        "BAR0 still decodes the port the guest gave up"
+    );
+    assert_eq!(
+        bus_mmio.handle_read(TEST_BAR2_ADDR, 4),
+        u64::from(u32::MAX),
+        "BAR2 still decodes the address the guest gave up"
+    );
+
+    // The device answers at the new windows, and only there.
+    assert_eq!(
+        bus_pio.handle_in(MOVED_BAR0_PORT, 1),
+        0,
+        "BAR0 does not decode where the guest put it"
+    );
+    assert_eq!(
+        bus_mmio.handle_read(MOVED_BAR2_ADDR, 4),
+        0,
+        "BAR2 does not decode where the guest put it"
+    );
+
+    // One handler each, as before the move. A leaked registration
+    // holds a strong reference of its own.
+    assert_eq!(Arc::strong_count(&dev), 3);
 }
 
 #[test]
