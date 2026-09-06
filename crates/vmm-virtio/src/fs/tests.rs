@@ -11,6 +11,8 @@
 
 use super::*;
 
+mod reset;
+
 use std::sync::Condvar;
 use std::time::Instant;
 

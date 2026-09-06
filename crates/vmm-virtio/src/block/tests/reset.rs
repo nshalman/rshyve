@@ -163,7 +163,7 @@ fn a_reset_does_not_wait_for_the_backing_store() {
             while !done.load(Ordering::Acquire)
                 && start.elapsed() < RESET_BUDGET
             {
-                thread::sleep(Duration::from_millis(1));
+                thread::sleep(Duration::from_micros(20));
             }
             let waited = start.elapsed();
             // Let a reset that should not have waited finish, so the
@@ -248,7 +248,7 @@ fn a_reset_does_not_wait_for_interrupt_injection() {
             while !done.load(Ordering::Acquire)
                 && start.elapsed() < RESET_BUDGET
             {
-                thread::sleep(Duration::from_millis(1));
+                thread::sleep(Duration::from_micros(20));
             }
             let waited = start.elapsed();
             // Let a reset that should not have waited finish, so the
@@ -261,6 +261,36 @@ fn a_reset_does_not_wait_for_interrupt_injection() {
     assert!(
         waited < RESET_BUDGET,
         "the reset waited {waited:?} behind an interrupt injection"
+    );
+}
+
+// The hostile case. A guest fills the ring before it writes 0 to
+// DEVICE_STATUS, so the walk it starts on another vCPU is the longest
+// guest-access section it can build. The reset waits for that section
+// and for nothing behind it: work refused at admission never touches
+// the lock the drain takes, and `std::sync::RwLock` gives the writer
+// no priority, so anything that could queue there could hold the vCPU
+// for as long as the guest liked.
+#[test]
+fn a_full_ring_walk_does_not_hold_the_resetting_vcpu() {
+    const RING: u16 = 256;
+    let (physmap, queue, blk) = make_get_id_queue(RING, RING);
+    let mut queues = [queue];
+
+    let waited = thread::scope(|s| {
+        let physmap = &physmap;
+        let blk = &blk;
+        s.spawn(move || {
+            blk.notify_queue(0, &mut queues, physmap);
+        });
+        let start = Instant::now();
+        VirtioDevice::reset(blk);
+        start.elapsed()
+    });
+
+    assert!(
+        waited < RESET_BUDGET,
+        "a full ring walk held the resetting vCPU for {waited:?}"
     );
 }
 
