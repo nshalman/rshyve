@@ -122,7 +122,7 @@ pub struct vioc_notify_mmio {
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct vioc_ring_state {
     pub vrs_index: u16,
     pub vrs_avail_idx: u16,
@@ -137,6 +137,22 @@ pub const VIONA_PROMISC_NONE: i32 = 0;
 pub const VIONA_PROMISC_MULTI: i32 = 1;
 pub const VIONA_PROMISC_ALL: i32 = 2;
 // VIONA_PROMISC_ALL_VLAN = 3 (Oxide falcon-specific, omitted)
+
+/// What traffic the link passes to the guest.
+///
+/// The kernel takes this as a value, not through a pointer, so the
+/// wrapper sends it as one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum PromiscMode {
+    /// The link's own address and broadcast only.
+    None = VIONA_PROMISC_NONE,
+    /// Add multicast.
+    Multi = VIONA_PROMISC_MULTI,
+    /// Everything the physical link carries, which is what a guest
+    /// allowed to spoof its MAC needs.
+    All = VIONA_PROMISC_ALL,
+}
 
 #[repr(C)]
 #[derive(Default)]

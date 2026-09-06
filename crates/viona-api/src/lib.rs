@@ -35,15 +35,19 @@ enum Chan {
 
     /// A recorder. It holds a file only to answer [`AsRawFd`].
     #[cfg(test)]
-    Record(File, std::sync::Mutex<Vec<UsizeCall>>),
+    Record(File, std::sync::Mutex<Vec<Call>>),
 }
 
-/// One ioctl that a wrapper sent by value.
+/// One ioctl that a wrapper sent.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct UsizeCall {
-    cmd: i32,
-    arg: usize,
+enum Call {
+    /// The data argument is a value the kernel reads directly.
+    Usize { cmd: i32, arg: usize },
+
+    /// The data argument is a pointer to a struct. A recorder copies
+    /// nothing, so only the command is kept.
+    Typed { cmd: i32 },
 }
 
 pub struct VionaFd(Chan);
@@ -92,13 +96,17 @@ impl VionaFd {
             Chan::Dev(fp) => {
                 ioctl(fp.as_raw_fd(), cmd, data as *mut libc::c_void)
             }
-            // Every caller of this reads its struct after the call, and
-            // a recorder copies nothing back.
+            // A recorder keeps the command and copies nothing, so a
+            // caller reads back the struct it passed in. That is
+            // enough to say which entry point a wrapper reached.
             #[cfg(test)]
-            Chan::Record(..) => Err(Error::new(
-                ErrorKind::Unsupported,
-                "a recording handle takes no copyin ioctl",
-            )),
+            Chan::Record(_, calls) => {
+                calls
+                    .lock()
+                    .expect("the recorded calls")
+                    .push(Call::Typed { cmd });
+                Ok(0)
+            }
         }
     }
 
@@ -125,7 +133,7 @@ impl VionaFd {
                 calls
                     .lock()
                     .expect("the recorded calls")
-                    .push(UsizeCall { cmd, arg: data });
+                    .push(Call::Usize { cmd, arg: data });
                 Ok(1)
             }
         }
@@ -194,6 +202,135 @@ impl VionaFd {
     /// leave to userspace for it.
     pub fn set_notify_iop(&self, port: u16) -> Result<()> {
         self.ioctl_usize(VNA_IOC_SET_NOTIFY_IOP, port as usize)?;
+        Ok(())
+    }
+
+    /// Set what traffic the link passes to the guest.
+    ///
+    /// The mode goes by value: this command copies nothing in, and the
+    /// kernel casts the data argument straight to its enum
+    /// (`viona_main.c`, `viona_ioc_set_promisc`). A pointer here sets
+    /// the mode to an address.
+    pub fn set_promisc(&self, mode: PromiscMode) -> Result<()> {
+        self.ioctl_usize(VNA_IOC_SET_PROMISC, mode as usize)?;
+        Ok(())
+    }
+
+    /// Program one ring's addresses, in the modern (VirtIO 1.0) layout.
+    ///
+    /// The kernel starts a worker for the ring, and resets the ring
+    /// indices to 0. A migration destination needs
+    /// [`Self::ring_set_state`] instead.
+    pub fn ring_init_modern(
+        &self,
+        ring: u16,
+        size: u16,
+        desc: u64,
+        avail: u64,
+        used: u64,
+    ) -> Result<()> {
+        let mut rim = vioc_ring_init_modern {
+            rim_index: ring,
+            rim_qsize: size,
+            rim_qaddr_desc: desc,
+            rim_qaddr_avail: avail,
+            rim_qaddr_used: used,
+            ..Default::default()
+        };
+        // Safety: the command copies in one vioc_ring_init_modern, and
+        // that is what `rim` is.
+        unsafe { self.ioctl(VNA_IOC_RING_INIT_MODERN, &mut rim) }?;
+        Ok(())
+    }
+
+    /// Program one ring's addresses and its indices together.
+    ///
+    /// A migration destination resumes the kernel where the source
+    /// stopped, which [`Self::ring_init_modern`] cannot do.
+    pub fn ring_set_state(&self, state: &vioc_ring_state) -> Result<()> {
+        let mut state = *state;
+        // Safety: the command copies in one vioc_ring_state, and that
+        // is what `state` is.
+        unsafe { self.ioctl(VNA_IOC_RING_SET_STATE, &mut state) }?;
+        Ok(())
+    }
+
+    /// Read one ring's addresses and indices.
+    ///
+    /// A migration source reads the indices out after it pauses the
+    /// ring, so the kernel does not move them again.
+    pub fn ring_get_state(&self, ring: u16) -> Result<vioc_ring_state> {
+        let mut state = vioc_ring_state {
+            vrs_index: ring,
+            ..Default::default()
+        };
+        // Safety: the command copies out one vioc_ring_state, and that
+        // is what `state` is.
+        unsafe { self.ioctl(VNA_IOC_RING_GET_STATE, &mut state) }?;
+        Ok(state)
+    }
+
+    /// Route one ring's interrupt to an MSI-X message.
+    ///
+    /// The kernel then writes the message itself, and the userspace
+    /// poll thread has nothing to raise for that ring.
+    pub fn ring_set_msi(&self, ring: u16, addr: u64, msg: u64) -> Result<()> {
+        let mut msi = vioc_ring_msi {
+            rm_index: ring,
+            rm_addr: addr,
+            rm_msg: msg,
+            ..Default::default()
+        };
+        // Safety: the command copies in one vioc_ring_msi, and that is
+        // what `msi` is.
+        unsafe { self.ioctl(VNA_IOC_RING_SET_MSI, &mut msi) }?;
+        Ok(())
+    }
+
+    /// Read which rings have an interrupt pending.
+    ///
+    /// One entry per ring, non-zero for a ring the kernel has work
+    /// waiting on.
+    pub fn intr_status(&self) -> Result<[u32; VIONA_VQ_MAX as usize]> {
+        let mut poll_data = vioc_intr_poll::default();
+        // Safety: the command copies out one vioc_intr_poll, and that
+        // is what `poll_data` is.
+        unsafe { self.ioctl(VNA_IOC_INTR_POLL, &mut poll_data) }?;
+        Ok(poll_data.vip_status)
+    }
+
+    /// Give the kernel the features the guest accepted.
+    ///
+    /// `VIRTIO_F_VERSION_1` is the one that puts the kernel rings in
+    /// the modern layout.
+    pub fn set_features(&self, features: u64) -> Result<()> {
+        let mut feat = features;
+        // Safety: the command copies in one u64, and that is what
+        // `feat` is.
+        unsafe { self.ioctl(VNA_IOC_SET_FEATURES, &mut feat) }?;
+        Ok(())
+    }
+
+    /// Read the features the kernel driver offers.
+    pub fn get_features(&self) -> Result<u64> {
+        let mut feat: u64 = 0;
+        // Safety: the command copies out one u64, and that is what
+        // `feat` is.
+        unsafe { self.ioctl(VNA_IOC_GET_FEATURES, &mut feat) }?;
+        Ok(feat)
+    }
+
+    /// Name the memory address the guest writes to kick a ring.
+    ///
+    /// The modern transport counterpart of [`Self::set_notify_iop`].
+    pub fn set_notify_mmio(&self, addr: u64, size: u32) -> Result<()> {
+        let mut vim = vioc_notify_mmio {
+            vim_address: addr,
+            vim_size: size,
+        };
+        // Safety: the command copies in one vioc_notify_mmio, and that
+        // is what `vim` is.
+        unsafe { self.ioctl(VNA_IOC_SET_NOTIFY_MMIO, &mut vim) }?;
         Ok(())
     }
 

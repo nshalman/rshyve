@@ -29,10 +29,18 @@ fn recorder() -> VionaFd {
 }
 
 /// What a recorder was asked for, in order.
-fn calls(fd: &VionaFd) -> Vec<UsizeCall> {
+fn calls(fd: &VionaFd) -> Vec<Call> {
     match &fd.0 {
         Chan::Record(_, calls) => calls.lock().expect("the calls").clone(),
         Chan::Dev(_) => panic!("only a recorder keeps its calls"),
+    }
+}
+
+/// The value one recorded call sent the kernel.
+fn value_of(call: &Call) -> usize {
+    match call {
+        Call::Usize { arg, .. } => *arg,
+        Call::Typed { cmd } => panic!("cmd {cmd:#x} sent no value"),
     }
 }
 
@@ -81,38 +89,130 @@ fn every_wrapper_sends_the_command_its_name_says() {
     fd.ring_pause(1).expect("a recorder answers");
     fd.ring_intr_clr(1).expect("a recorder answers");
     fd.set_notify_iop(0x2000).expect("a recorder answers");
+    fd.set_promisc(PromiscMode::All)
+        .expect("a recorder answers");
     fd.api_version().expect("a recorder answers");
 
     assert_eq!(
         calls(&fd),
         [
-            UsizeCall {
+            Call::Usize {
                 cmd: VNA_IOC_DELETE,
                 arg: 0
             },
-            UsizeCall {
+            Call::Usize {
                 cmd: VNA_IOC_RING_RESET,
                 arg: 1
             },
-            UsizeCall {
+            Call::Usize {
                 cmd: VNA_IOC_RING_KICK,
                 arg: 1
             },
-            UsizeCall {
+            Call::Usize {
                 cmd: VNA_IOC_RING_PAUSE,
                 arg: 1
             },
-            UsizeCall {
+            Call::Usize {
                 cmd: VNA_IOC_RING_INTR_CLR,
                 arg: 1
             },
-            UsizeCall {
+            Call::Usize {
                 cmd: VNA_IOC_SET_NOTIFY_IOP,
                 arg: 0x2000
             },
-            UsizeCall {
+            Call::Usize {
+                cmd: VNA_IOC_SET_PROMISC,
+                arg: VIONA_PROMISC_ALL as usize
+            },
+            Call::Usize {
                 cmd: VNA_IOC_VERSION,
                 arg: 0
+            },
+        ],
+    );
+}
+
+#[test]
+fn every_struct_wrapper_sends_the_command_its_name_says() {
+    // The other half of the boundary. A recorder copies nothing back,
+    // so these say which viona entry point each wrapper reached and
+    // nothing about the struct it filled in. A wrapper that names
+    // another command still reports success to its caller.
+    let fd = recorder();
+
+    fd.ring_init_modern(1, 256, 0x1000, 0x2000, 0x3000)
+        .expect("a recorder answers");
+    fd.ring_set_state(&vioc_ring_state::default())
+        .expect("a recorder answers");
+    fd.ring_get_state(1).expect("a recorder answers");
+    fd.ring_set_msi(1, 0xFEE0_0000, 0x21)
+        .expect("a recorder answers");
+    fd.intr_status().expect("a recorder answers");
+    fd.set_features(1).expect("a recorder answers");
+    fd.get_features().expect("a recorder answers");
+    fd.set_notify_mmio(0xC000_0000, 0x1000)
+        .expect("a recorder answers");
+
+    assert_eq!(
+        calls(&fd),
+        [
+            Call::Typed {
+                cmd: VNA_IOC_RING_INIT_MODERN
+            },
+            Call::Typed {
+                cmd: VNA_IOC_RING_SET_STATE
+            },
+            Call::Typed {
+                cmd: VNA_IOC_RING_GET_STATE
+            },
+            Call::Typed {
+                cmd: VNA_IOC_RING_SET_MSI
+            },
+            Call::Typed {
+                cmd: VNA_IOC_INTR_POLL
+            },
+            Call::Typed {
+                cmd: VNA_IOC_SET_FEATURES
+            },
+            Call::Typed {
+                cmd: VNA_IOC_GET_FEATURES
+            },
+            Call::Typed {
+                cmd: VNA_IOC_SET_NOTIFY_MMIO
+            },
+        ],
+    );
+}
+
+#[test]
+fn the_promiscuous_mode_goes_by_value() {
+    // viona_ioc_set_promisc casts the data argument straight to its
+    // enum. A wrapper that passed a pointer would set the mode to a
+    // userspace address, and the kernel would refuse the whole call.
+    // A guest allowed to spoof its MAC then gets no traffic.
+    let fd = recorder();
+
+    fd.set_promisc(PromiscMode::None)
+        .expect("a recorder answers");
+    fd.set_promisc(PromiscMode::Multi)
+        .expect("a recorder answers");
+    fd.set_promisc(PromiscMode::All)
+        .expect("a recorder answers");
+
+    assert_eq!(
+        calls(&fd),
+        [
+            Call::Usize {
+                cmd: VNA_IOC_SET_PROMISC,
+                arg: 0
+            },
+            Call::Usize {
+                cmd: VNA_IOC_SET_PROMISC,
+                arg: 1
+            },
+            Call::Usize {
+                cmd: VNA_IOC_SET_PROMISC,
+                arg: 2
             },
         ],
     );
@@ -131,7 +231,7 @@ fn every_ring_wrapper_sends_the_ring_it_was_given() {
         fd.ring_pause(ring).expect("a recorder answers");
         fd.ring_intr_clr(ring).expect("a recorder answers");
 
-        let args: Vec<usize> = calls(&fd).iter().map(|c| c.arg).collect();
+        let args: Vec<usize> = calls(&fd).iter().map(value_of).collect();
         assert_eq!(args, [ring; 4], "a ring wrapper dropped ring {ring}");
     }
 }
