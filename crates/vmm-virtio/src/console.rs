@@ -80,6 +80,11 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// the vsock device uses, for the same reason.
 const HALT_BUDGET: Duration = Duration::from_secs(2);
 
+/// How many of those joins the halt runs one after the other: the
+/// accept thread, then the readers. The deadline teardown must allow
+/// is the product, not the constant.
+const HALT_JOIN_ROUNDS: u32 = 2;
+
 /// The transport interrupt path, installed by the binary after the
 /// transport exists. Clone the slot before the device is moved into
 /// the transport.
@@ -716,6 +721,13 @@ impl Lifecycle for VirtioConsole {
         self.indicator.resume();
         // Bytes buffered during the pause are owed to the guest.
         self.shared.deliver_rx();
+    }
+
+    /// The halt joins the accept thread for one budget and then the
+    /// reader threads for another, one after the other, so the deadline
+    /// it really holds is twice the constant.
+    fn halt_budget(&self) -> Duration {
+        HALT_BUDGET.saturating_mul(HALT_JOIN_ROUNDS)
     }
 
     fn halt(&self) {

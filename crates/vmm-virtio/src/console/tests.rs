@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::bits;
+use crate::pci::intr::IntrGate;
 use crate::queue::VirtqDesc;
 use std::io::Write;
 use std::sync::atomic::AtomicUsize;
@@ -524,4 +525,65 @@ fn a_thread_the_halt_cannot_wake_does_not_hold_it() {
         returned.is_ok(),
         "a thread the halt could not wake held it: {returned:?}",
     );
+}
+
+// The RX handler and the transport session are two pieces of state a
+// reset changes one after the other, and the client reader thread can
+// be between them. Bytes delivered on the handler the reset dropped
+// must not interrupt the driver that followed. This is the same shape
+// as the vsock device's RX path; both are covered because both are
+// call sites of the same rule, and an untested one lets the whole
+// mechanism be reverted here with the suite green.
+#[test]
+fn an_rx_completion_from_the_closed_session_raises_nothing() {
+    let (physmap, rx_queue) = make_queue(4, 1, bits::VRING_DESC_F_WRITE, 8);
+    let (_dir, console) = console_in_tempdir(Arc::clone(&physmap));
+    let gate = Arc::new(IntrGate::new());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    *console.interrupt().lock().expect("interrupt lock") =
+        Some(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
+
+    let stale = console.ensure_rx_completion(&rx_queue);
+
+    // The whole reset, in the order the transport runs it: the session
+    // ends first, then the backend resets, then admission reopens.
+    gate.end_session();
+    VirtioDevice::reset(&console);
+    gate.reopen();
+
+    stale.signal();
+    assert!(
+        seen.lock().expect("record lock").is_empty(),
+        "input from the closed session interrupted the driver that followed"
+    );
+
+    // The other half, and it is the worse failure of the two: input
+    // for the session running now has to get through, or the device
+    // has traded a spurious interrupt for a guest that waits for ever.
+    console.ensure_rx_completion(&rx_queue).signal();
+    assert_eq!(
+        seen.lock().expect("record lock").len(),
+        1,
+        "the driver that is running got no interrupt for its input"
+    );
+
+    console.halt();
+}
+
+// The halt joins the accept thread and then the readers, one after
+// the other, so the deadline it holds is the product and not the
+// constant. Teardown derives its own bound from what this reports; a
+// device that under-reports is cut off inside its own wait.
+#[test]
+fn the_declared_halt_budget_covers_both_joins_the_halt_runs() {
+    let (_dir, console) = console_in_tempdir(Arc::new(PhysMap::new()));
+    assert_eq!(
+        Lifecycle::halt_budget(&console),
+        HALT_BUDGET * HALT_JOIN_ROUNDS,
+    );
+    assert!(
+        Lifecycle::halt_budget(&console) > HALT_BUDGET,
+        "one join's budget does not cover two joins run in sequence",
+    );
+    console.halt();
 }
