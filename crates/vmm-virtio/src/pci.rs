@@ -612,9 +612,20 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         self.device.reset();
 
         // Every delivery this session admitted has finished. Nothing
-        // joins them: admission shut before the backend reset. The
-        // wait is over transport work only, one interrupt injection
-        // per thread already inside, and a guest cannot add threads.
+        // joins them: admission shut before the backend reset, so the
+        // set is one injection per thread already inside and a guest
+        // cannot add threads.
+        //
+        // WHY THE COUNT IS THE ONLY BOUND: the set is finite, its
+        // members are not. Both injection ioctls take the VM lock as
+        // readers, and an illumos reader yields to a waiting writer.
+        // Memory hot-add holds that writer for hundreds of ms per GiB,
+        // so a reset that lands beside one waits for it. Measured at
+        // 1.3 us idle and 17.9 ms beside a 256 MiB hot-add. A deadline
+        // here would not help: admission is tested before the ioctl,
+        // so an injection already dispatched cannot be recalled, and
+        // returning early would put it in the next driver session.
+        // docs/hardware-run.md carries the measurement.
         self.intr.settle();
 
         // The next driver must find this device off the line, or it
