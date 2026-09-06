@@ -991,3 +991,14 @@ fn a_notification_refused_by_a_reset_touches_nothing() {
         "a notification queued work against a ring the reset had taken"
     );
 }
+
+// Teardown runs each halt under a bound it derives from this value, so
+// a device that waits longer than it declares is abandoned one poll
+// short of returning and whatever the halt gives back stays held. The
+// number used to be hand copied into vmm-machine, where raising the
+// real deadline moved neither copy.
+#[test]
+fn the_declared_halt_budget_is_the_deadline_the_halt_polls() {
+    let fs = test_fs(Arc::new(PhysMap::new()));
+    assert_eq!(Lifecycle::halt_budget(&fs), FS_HALT_BUDGET);
+}
