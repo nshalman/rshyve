@@ -71,6 +71,13 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const ACCEPT_POLL_MS: i32 = 50;
 /// Pause after an accept that failed for a reason retrying cannot fix.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+/// How long `halt` waits for one set of threads.
+///
+/// The teardown sweep halts every device before `VM_DESTROY_SELF`, and
+/// gives each halt a budget of its own. Staying inside that budget
+/// keeps the sweep from abandoning this halt part-way. Same value as
+/// the vsock device uses, for the same reason.
+const HALT_BUDGET: Duration = Duration::from_secs(2);
 
 /// Interrupt callback, installed by the binary after the transport
 /// exists. Clone the slot before the device is moved into the transport.
@@ -701,10 +708,16 @@ impl Lifecycle for VirtioConsole {
         self.shared.shutdown.store(true, Ordering::Release);
 
         // The accept thread polls the flag, so it returns on its own.
-        // Nothing here races a connect that could fail and leave that
-        // thread blocked in accept() for the rest of teardown.
+        // The bound is for the case where it cannot: this halt runs on
+        // the teardown sweep now, and no device may hold that thread
+        // short of the VM destroy.
         if let Some(handle) = self.accept.lock().expect("accept lock").take() {
-            let _ = handle.join();
+            if !vmm_core::thread::join_bounded(vec![handle], HALT_BUDGET) {
+                debug!(
+                    self.shared.log,
+                    "virtio-console halt left the accept thread running"
+                );
+            }
         }
 
         // Shutting the socket down wakes the reader blocked on read().
@@ -718,9 +731,15 @@ impl Lifecycle for VirtioConsole {
             .expect("reader lock")
             .drain(..)
             .collect();
-        for handle in readers {
-            // A panicked reader must not abort teardown.
-            let _ = handle.join();
+        // The budget has to bound the join itself, not decide whether
+        // the next one starts. A reader the shutdown did not reach sits
+        // in a `read(2)` nothing here can revoke, so it is left running
+        // and teardown goes on.
+        if !vmm_core::thread::join_bounded(readers, HALT_BUDGET) {
+            debug!(
+                self.shared.log,
+                "virtio-console halt left a reader running"
+            );
         }
 
         // The socket may already be gone if the path was reused.

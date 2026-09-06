@@ -9,7 +9,7 @@ use crate::bits;
 use crate::queue::VirtqDesc;
 use std::io::Write;
 use std::sync::atomic::AtomicUsize;
-use std::sync::MutexGuard;
+use std::sync::{mpsc, MutexGuard};
 use std::time::{Duration, Instant};
 use vmm_core::mem::PhysMap;
 use vmm_devices::Lifecycle;
@@ -462,4 +462,66 @@ fn a_refused_rx_chain_returns_its_descriptor() {
         .is_empty());
     console.pause();
     console.halt();
+}
+
+/// A thread the halt cannot wake must not hold the teardown sweep.
+///
+/// Both joins used to be unbounded. `halt` only ever ran on a hot
+/// unplug then; it now runs on every teardown, one device at a time,
+/// ahead of `VM_DESTROY_SELF`. The readers sit in a blocking `read(2)`
+/// that only `shutdown(2)` on their client ends, and nothing in
+/// userspace can revoke a syscall a thread is already in. So the join
+/// itself carries the bound.
+#[test]
+fn a_thread_the_halt_cannot_wake_does_not_hold_it() {
+    let (_dir, console) = console_in_tempdir(Arc::new(PhysMap::new()));
+    let wedged = Arc::new(AtomicBool::new(false));
+
+    // Neither thread holds a socket, so nothing `halt` does reaches
+    // them. Only the bound can end the wait.
+    let accept = {
+        let stop = Arc::clone(&wedged);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    let reader = {
+        let stop = Arc::clone(&wedged);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    *console.accept.lock().expect("accept lock") = Some(accept);
+    console
+        .shared
+        .readers
+        .lock()
+        .expect("reader lock")
+        .push(reader);
+
+    // The halt runs on its own thread so an unbounded join reports a
+    // failure here instead of parking the whole test run.
+    let console = Arc::new(console);
+    let (tx, rx) = mpsc::channel();
+    let halting = {
+        let console = Arc::clone(&console);
+        std::thread::spawn(move || {
+            console.pause();
+            console.halt();
+            let _ = tx.send(());
+        })
+    };
+    // Both sets are joined in turn, so the halt may take two budgets.
+    let returned = rx.recv_timeout(HALT_BUDGET * 4);
+
+    wedged.store(true, Ordering::Release);
+    halting.join().expect("join the halting thread");
+    assert!(
+        returned.is_ok(),
+        "a thread the halt could not wake held it: {returned:?}",
+    );
 }
