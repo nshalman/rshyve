@@ -243,6 +243,12 @@ jobs:
       # three packages has a bench or example target, so nothing that
       # `--all-targets` compiled is lost.
       - run: cargo test --locked -p rshyve -p firehyve -p vmm-migrate-agent
+      # The vTPM crates ran in no job. They need the submodule and the
+      # autotools deps this job already has, and their tests drive real
+      # libtpms rather than a stub, so they belong here and nowhere
+      # else. vmm_tpm_sys asserts the library answers TPM2_GetRandom,
+      # which a build that silently produced no library cannot do.
+      - run: cargo test --locked -p vmm_tpm -p vmm_tpm_sys
 
   supply-chain:
     name: advisories, licenses, sources
