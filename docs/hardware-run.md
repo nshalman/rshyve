@@ -6,10 +6,11 @@ what a live guest showed on the target platform, what it did not show,
 and the one platform limit the run found, so nobody has to measure it
 again.
 
-Recorded 2026-09-05 against `hyp-seam` at commit `d1ec631`. Every
-number comes from one lab host: SunOS 5.11, x86_64, 40 CPUs, bhyve API
-v18. Numbers are comparable only against a later run on the same
-host.
+Two sessions, both on one lab host: SunOS 5.11, x86_64, 40 CPUs,
+bhyve API v18. The first ran 2026-09-05 at commit `d1ec631` on a
+busybox initramfs. The second reran the matrix on a Debian 13 guest
+after the multiqueue fix in `704fb1e`. Numbers are comparable only
+against a later run on the same host.
 
 ## The suite on the target platform
 
@@ -65,6 +66,38 @@ Also passed, same host, same session:
 - 30 guest-initiated ACPI S5 poweroffs, with 0 leaked processes and 0
   leaked kernel VM instances.
 
+That session ran a busybox initramfs, because a multiqueue defect
+stalled every distro image. The rerun below removes that limit.
+
+## The rerun on a distro guest
+
+The defect was found, fixed and proved on hardware. Every worker
+completion raised its interrupt on virtqueue 0. Under MSI-X each
+virtqueue has its own vector, and a guest handler reads only its own
+ring, so a completion on any other queue was never collected. Linux
+blk-mq puts vCPU k's I/O on queue k, so any guest with 2 or more vCPUs
+stalled. INTx hid it, because the shared handler walks every ring.
+Fixed in `704fb1e`.
+
+The matrix then reran on Debian 13 with 4 vCPUs: a real block driver
+stack, a real init and a real page cache.
+
+| Case | Count | Result |
+|---|---|---|
+| modern transport resets | 100 | 0 mismatches |
+| forced legacy resets | 40 | 0 mismatches |
+| warm reboot, 64 MiB dirty page cache | 1 | clean |
+| ACPI S5 poweroffs | 10 | 0 leaked processes, 0 leaked kernel VM instances |
+
+Per queue, the guest wrote 128 MiB and read it back, with `taskset`
+pinning the writer to the vCPU that owns that queue. All four MSI-X
+vectors fired: 639, 423, 407 and 460 interrupts.
+
+Read the per-vector counts before you call a multiqueue run a pass.
+Traffic on one vector only, or on three of four, is the signature of
+the defect above, and every aggregate number stays healthy while it
+happens.
+
 ## What the matrix does not show
 
 State these as plainly as the results.
@@ -73,14 +106,43 @@ State these as plainly as the results.
   from the illumos source, not observed. Nothing here proves how that
   driver behaves against this device.
 - **No wedge was produced.** The teardown budget and the shutdown
-  watchdog stayed unexercised against a real vmm_drv lease that will
-  not break. See
+  watchdog have never run against a real vmm_drv lease that will not
+  break, so the teardown fix is unexercised against a real park. See
   [testing.md](testing.md#wedged-lease-teardown) for what that
   procedure does and does not reach.
-- **The guest was a busybox initramfs, not a distro image.** A
-  multiqueue defect blocked the distro guest. The defect is not
-  characterised here, and until it is, no result above carries over to
-  a guest with a real block driver stack and a real init.
+
+## What only a guest could find
+
+Booting a guest found three defects that no test suite on either
+platform could see. Each one passed a full green run on macOS and on
+illumos first. The pattern repeats, so it is worth naming: each defect
+sits where a test's stand-in is not the thing the guest touches.
+
+**Completions raised on the wrong queue** (`704fb1e`), described
+above. A test asserts that a completion lands in the used ring, and
+that was always correct. The defect was in which vector was raised
+next, and no test delivers an interrupt to a driver that reads one
+ring.
+
+**Legacy device config read four bytes early** (`651ace5`). The legacy
+layout puts two vector registers at 0x14 and 0x16, but only after the
+driver enables MSI-X. The code picked the offset on whether the device
+*has* an MSI-X table, and every device is built with one, so device
+config sat at 0x18 for every driver. A guest that left MSI-X off read
+0x14 and got the vector registers instead. It read disk capacity back
+as 0x0140000000FF00FF against a real 0x01400000: the four bytes it
+wanted, four bytes late. Tests read config through the same rule the
+code wrote it with, so the two sides agreed and the suite passed.
+
+**Promiscuous mode passed by pointer** (`0c2aaca`).
+`viona_ioc_set_promisc` casts the ioctl data argument straight to its
+enum, so a pointer set the mode to a userspace address and the kernel
+answered EINVAL. Every VM with `allow_mac_spoofing` failed to attach
+its NIC. A recorder that records the call cannot catch this, because
+only the kernel reads that argument the way that matters.
+
+A suite cannot check the meaning a kernel or a driver gives to a value.
+Boot a guest before you call a device path proved.
 
 ## Why a device reset has no upper bound
 
@@ -164,41 +226,34 @@ bound is exactly the code macOS never exercises.
 
 ## Coverage that does not reach illumos
 
-Most viona device tests **do not compile** on the target platform.
-`VionaInner` holds either `viona_fd: Arc<viona_api::VionaFd>` on
-illumos or `link: Arc<dyn LinkOps>` everywhere else
-(`crates/vmm-virtio/src/viona.rs:113,121`). The two are mutually
-exclusive fields, so the substitutable seam a test needs exists only
-off the target, and `viona/tests.rs` gates both test modules on
-`cfg(not(target_os = "illumos"))`.
+This was the largest gap in the tree, and for viona it is closed.
 
-The gap widens with every viona test added, and it did so during this
-work:
+`VionaInner` used to hold two mutually exclusive fields: `viona_fd:
+Arc<viona_api::VionaFd>` on illumos, `link: Arc<dyn LinkOps>`
+everywhere else. The seam a test substitutes into existed only off the
+target platform, so `viona/tests.rs` gated both test modules on
+`cfg(not(target_os = "illumos"))`, and 26 of 29 viona tests compiled
+out on the one platform that runs the code.
 
-| Commit | viona tests | Compiled out on illumos |
-|---|---|---|
-| `e597ea0` | 25 | 22 |
-| `d1ec631` | 29 | 26 |
+`f896980` collapsed the two fields into one `Arc<dyn LinkOps>` on every
+platform, with the kernel handle behind it there. Viona tests executing
+on illumos went from 3 to 39, and no platform gate is left in them.
+`dfd478a` then moved the `LinkOps` trait into `viona-api`, beside the
+`VionaFd` that implements it, so the illumos adapter sends its ioctls
+directly and one delegation layer is gone.
 
-**The fix is to make the seam exist on illumos too**: hold the link as
-`Arc<dyn LinkOps>` on every platform and let the illumos build put the
-kernel handle behind it, which `VionaInner::link` already returns
-(`viona.rs:159`). Until then, every viona test is a test of the macOS
-and Linux build.
+Do not read 39 as current. The count grows with every viona test, and
+that is the point: a number a reader reconstructs is out of date by the
+time it is written down.
 
-Two smaller gates go the same way. `bin/rshyve/src/peercred.rs:130`
-gates its test to Linux and macOS, so the control socket's peer check
-is untested on the only platform that runs it. In the other direction
+Two smaller gates remain. `bin/rshyve/src/peercred.rs:130` gates its
+test to Linux and macOS, so the control socket's peer check is untested
+on the only platform that runs it. In the other direction
 `crates/vmm-core/tests/autodestruct.rs` is illumos only, so CI never
 runs it.
 
-The whole-workspace effect was measured at about 12 more tests on macOS
-than on illumos across the four crates carrying platform gates, and
-that delta grew from 5 to 12 across two commits. Treat 12 as a
-snapshot, not a constant: it was taken before the viona tests above
-landed, and the gates now in the tree already account for more.
-
-**This needs a guard that compares per-crate test counts on both
-platforms.** Reading the gates does not work, because the number a
-reader reconstructs is already out of date by the time it is written
-down. Count both sides and fail on a change nobody explained.
+**A guard that compares per-crate test counts on both platforms is
+still missing.** The whole-workspace delta was about 12 tests before
+this work and viona was most of it, but what is left does not reduce to
+the gates now in the tree. Count both sides and fail on a change nobody
+explained.
