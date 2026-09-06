@@ -192,6 +192,12 @@ fn release_on_drain(entered: mpsc::Receiver<()>, release: mpsc::Sender<()>) {
     });
 }
 
+/// Write the MSI-X table the way a guest does, through the BAR.
+fn write_table(dev: &Dev, offset: usize, val: u32) {
+    let wo = WriteOp::from_buf(&val.to_le_bytes());
+    dev.bar_rw(BarN::BAR4, offset, RWOp::Write(&wo));
+}
+
 /// Poll until `done`, or give up once the deadline passes. Never parks
 /// the run: the caller releases whatever it parked either way.
 fn wait_for(done: impl Fn() -> bool) -> bool {
@@ -380,11 +386,11 @@ fn an_msix_driver_with_no_vector_is_not_put_on_the_pin() {
 // gates. It carries the address and data of a driver that is gone.
 #[test]
 fn a_reset_drops_the_messages_the_old_session_left_pending() {
-    let ((dev, entered, release, _pin), table, sink) = wired_msix(Some(1));
+    let ((dev, entered, release, _pin), _table, sink) = wired_msix(Some(1));
     write_status(&dev, READY | bits::STATUS_DRIVER_OK);
 
     // The driver masks its vector, then the device raises on it.
-    table.table_write(ENTRY_SIZE + 12, 1);
+    write_table(&dev, ENTRY_SIZE + 12, 1);
     dev.raise_queue_interrupt_for(0);
     assert_eq!(sink.sent(), Vec::new(), "a masked vector sent a message");
 
@@ -392,11 +398,43 @@ fn a_reset_drops_the_messages_the_old_session_left_pending() {
     write_status(&dev, 0);
 
     // The next driver unmasks the same vector.
-    table.table_write(ENTRY_SIZE + 12, 0);
+    write_table(&dev, ENTRY_SIZE + 12, 0);
     assert_eq!(
         sink.sent(),
         Vec::new(),
         "an unmask delivered a message the old session raised"
+    );
+}
+
+// The same message, taken out one step earlier. An unmask is a guest
+// write to the table BAR, which no reset latch covers, so the reset
+// can be under way when the message leaves. Admission is what stops
+// it: taken before the send, it either puts the send inside the set
+// the reset waits out or refuses it outright.
+#[test]
+fn an_unmask_during_a_reset_delivers_nothing() {
+    let ((dev, entered, release, _pin), _table, sink) = wired_msix(Some(1));
+    write_status(&dev, READY | bits::STATUS_DRIVER_OK);
+    write_table(&dev, ENTRY_SIZE + 12, 1);
+    dev.raise_queue_interrupt_for(0);
+
+    let resetter = {
+        let dev = Arc::clone(&dev);
+        std::thread::spawn(move || write_status(&dev, 0))
+    };
+    entered.recv_timeout(WEDGED).expect("the backend drained");
+
+    // The guest unmasks while the reset holds the device.
+    write_table(&dev, ENTRY_SIZE + 12, 0);
+    let sent = sink.sent();
+
+    release.send(()).expect("release the drain");
+    resetter.join().expect("the reset finished");
+
+    assert_eq!(
+        sent,
+        Vec::new(),
+        "an unmask during the reset delivered the old session's message"
     );
 }
 

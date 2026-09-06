@@ -933,7 +933,8 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         // Only MSI-X has writable fields
         if co.msix != 0 && offset >= co.msix && offset < co.msix + 12 {
             if let Some(ref msix) = self.msix {
-                msix.cap_write(offset, co.msix, val);
+                let released = msix.cap_write_deferred(offset, co.msix, val);
+                self.deliver_released(msix, released);
             }
         }
         // All virtio cap fields are read-only
@@ -1402,6 +1403,31 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             std::sync::atomic::Ordering::Release,
         );
         self.raise_interrupt();
+    }
+
+    /// Deliver the messages an unmask released, under the same
+    /// admission the device's own raises take.
+    ///
+    /// These leave on a guest write to the MSI-X table or capability,
+    /// which no reset latch covers, and they carry the address and
+    /// data of whichever driver recorded them. Taking admission before
+    /// the send is what puts them inside the set a reset waits out,
+    /// and what drops them once it has shut.
+    fn deliver_released(
+        &self,
+        msix: &MsixTable,
+        released: impl IntoIterator<Item = (u64, u64)>,
+    ) {
+        let mut released = released.into_iter().peekable();
+        if released.peek().is_none() {
+            return;
+        }
+        let Some(_admitted) = self.intr.begin_current() else {
+            return;
+        };
+        for (addr, data) in released {
+            msix.send_message(addr, data);
+        }
     }
 
     /// Send `vector` as a message, if the driver is on MSI-X.
@@ -1925,7 +1951,9 @@ impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
                             _ => wo.read_u32(),
                         };
                         if offset < pba_offset {
-                            msix.table_write(offset, val);
+                            let released =
+                                msix.table_write_deferred(offset, val);
+                            self.deliver_released(msix, released);
                         }
                     }
                 }

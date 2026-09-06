@@ -260,13 +260,31 @@ impl MsixTable {
         }
     }
 
-    /// Write to the MSI-X table BAR.
+    /// Write to the MSI-X table BAR, delivering what an unmask
+    /// released.
     pub fn table_write(&self, offset: usize, val: u32) {
+        if let Some((addr, data)) = self.table_write_deferred(offset, val) {
+            self.msi.send(addr, data);
+        }
+    }
+
+    /// Write to the MSI-X table BAR and hand back what an unmask
+    /// released, instead of sending it.
+    ///
+    /// A caller that gates interrupt delivery against a device reset
+    /// needs the message before it leaves: the send is a call into the
+    /// kernel and the reset cannot recall it, so the decision has to
+    /// be made on this side of it.
+    pub fn table_write_deferred(
+        &self,
+        offset: usize,
+        val: u32,
+    ) -> Option<(u64, u64)> {
         let mut inner = self.inner.lock().expect("msix lock");
         let idx = offset / ENTRY_SIZE;
         let field = offset % ENTRY_SIZE;
         if idx >= inner.entries.len() {
-            return;
+            return None;
         }
 
         let was_masked = (inner.entries[idx].control & VECTOR_CTRL_MASK) != 0;
@@ -283,14 +301,9 @@ impl MsixTable {
         // vector. The function mask still gates it: both masks must be
         // clear before a message leaves.
         let now_masked = (inner.entries[idx].control & VECTOR_CTRL_MASK) != 0;
-        let pending = (was_masked && !now_masked)
+        (was_masked && !now_masked)
             .then(|| take_pending(&mut inner, idx))
-            .flatten();
-        drop(inner);
-
-        if let Some((addr, data)) = pending {
-            self.msi.send(addr, data);
-        }
+            .flatten()
     }
 
     /// Read from the PBA BAR region.
@@ -355,14 +368,28 @@ impl MsixTable {
 
     /// Write to the MSI-X capability structure.
     pub fn cap_write(&self, offset: u8, cap_offset: u8, val: u32) {
+        for (addr, data) in self.cap_write_deferred(offset, cap_offset, val) {
+            self.msi.send(addr, data);
+        }
+    }
+
+    /// Write the capability and hand back what clearing the function
+    /// mask released, instead of sending it. See
+    /// [`Self::table_write_deferred`].
+    pub fn cap_write_deferred(
+        &self,
+        offset: u8,
+        cap_offset: u8,
+        val: u32,
+    ) -> Vec<(u64, u64)> {
         if offset < cap_offset || offset >= cap_offset + 12 {
-            return;
+            return Vec::new();
         }
         let cap_rel = offset - cap_offset;
         let dword_off = cap_rel & 0xFC;
         if dword_off != 0 {
             // Table BIR and PBA BIR are read-only.
-            return;
+            return Vec::new();
         }
 
         let msg_ctrl = (val >> 16) as u16;
@@ -372,12 +399,12 @@ impl MsixTable {
         // PCI 3.0 6.8.2.3: clearing the Function Mask sends every message
         // the PBA recorded while it was set. Without this the guest waits
         // on an I/O that already completed.
-        let pending = drain_pending(&mut inner);
-        drop(inner);
+        drain_pending(&mut inner)
+    }
 
-        for (addr, data) in pending {
-            self.msi.send(addr, data);
-        }
+    /// Deliver a message a `_deferred` write handed back.
+    pub fn send_message(&self, addr: u64, data: u64) {
+        self.msi.send(addr, data);
     }
 
     /// Total BAR size needed for MSI-X table + PBA.

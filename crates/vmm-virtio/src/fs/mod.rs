@@ -507,6 +507,9 @@ impl VirtioDevice for VirtioFs {
     /// from the worker. The session also names the epoch every request
     /// is tagged with, so a request cannot carry a session that ended
     /// while it was being built.
+    ///
+    /// Returns whether the heads answered inline need an interrupt.
+    /// The transport raises it after it drops its register lock.
     fn notify_queue(
         &self,
         queue_idx: u16,
@@ -585,15 +588,16 @@ impl VirtioDevice for VirtioFs {
         }
 
         let raise = completion.publish_batch(&finished);
-        // The interrupt leaves the session behind: delivery can block,
-        // and a reset must never wait for it.
         drop(session);
-        if raise {
-            self.access.deliver(epoch, || completion.signal());
-        }
 
-        // The completion handler raises the interrupt when the reply lands.
-        false
+        // The heads this answered itself go back to the transport for
+        // the interrupt, the way virtio-blk does it. Raising here runs
+        // under the transport's register lock, and a reset on another
+        // vCPU has to take that lock before it can even close
+        // admission, so an injection here is one a guest can put in
+        // front of a reset. The replies the worker publishes raise
+        // their own interrupt, off the vCPU.
+        raise
     }
 
     /// Reset the device, and return once nothing can write into the

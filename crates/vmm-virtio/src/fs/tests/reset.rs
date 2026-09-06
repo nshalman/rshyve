@@ -132,3 +132,48 @@ fn a_parked_backing_store_does_not_lengthen_the_reset() {
         "the reset waited {waited:?} behind the backing store"
     );
 }
+
+// The notify path runs on the vCPU under the transport's register
+// lock, and a reset on another vCPU has to take that lock before it
+// can close admission. So an injection here is one a guest can put in
+// front of a reset. The heads this path answers itself go back to the
+// transport, which drops the lock first.
+#[test]
+fn the_notify_path_hands_the_interrupt_to_the_transport() {
+    let (physmap, mut queues, fs) = ring(8, 1);
+    // A chain that runs off the end of the descriptor table, so the
+    // walk answers the head itself instead of sending it to a worker.
+    physmap
+        .lookup(DESC_GPA, 16)
+        .expect("mapped request descriptor")
+        .write(&VirtqDesc {
+            addr: REQ_GPA,
+            len: 64,
+            flags: crate::bits::VRING_DESC_F_NEXT,
+            next: 8,
+        })
+        .expect("write request descriptor");
+    fs.start().expect("start");
+
+    let raised = Arc::new(AtomicBool::new(false));
+    {
+        let raised = Arc::clone(&raised);
+        *fs.interrupt.lock().expect("interrupt lock") =
+            Some(Arc::new(move |_queue: u16| {
+                raised.store(true, Ordering::Release)
+            }));
+    }
+
+    let asked = fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
+
+    assert_eq!(
+        queues[usize::from(FS_REQUEST_QUEUE)].read_used_ring_idx(&physmap),
+        1,
+        "the head the walk answered never reached the used ring"
+    );
+    assert!(asked, "the transport was not asked to raise the interrupt");
+    assert!(
+        !raised.load(Ordering::Acquire),
+        "the notify path injected an interrupt under the transport lock"
+    );
+}
