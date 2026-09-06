@@ -291,17 +291,18 @@ fn a_guest_refilling_the_ring_does_not_hold_the_resetting_vcpu() {
     let waited = thread::scope(|s| {
         // A second vCPU pushing more work in behind the walk. Every
         // avail entry names the same head, so this needs only the
-        // index, and it moves far enough each time that the walk
-        // never catches up: what ends the walk is the cap and nothing
-        // else.
+        // index. It reads the used index to keep the claim half a ring
+        // ahead of wherever the walk has got to: a guest is free to
+        // lie about how much it has posted, and an index that walks
+        // away on its own is what makes the cap the only thing that
+        // can end the walk.
         s.spawn(|| {
             let slot = physmap
                 .lookup(AVAIL_IDX_GPA, 2)
                 .expect("mapped avail index");
-            let mut idx = RING;
             while !stop.load(Ordering::Acquire) {
-                idx = idx.wrapping_add(251);
-                slot.write::<u16>(&idx).expect("write avail index");
+                let ahead = used_idx().wrapping_add(1 << 14);
+                slot.write::<u16>(&ahead).expect("write avail index");
             }
         });
         s.spawn(|| {
