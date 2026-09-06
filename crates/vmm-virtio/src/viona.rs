@@ -1415,6 +1415,60 @@ mod tests {
         );
     }
 
+    /// A poll thread that records the moment it was stopped.
+    ///
+    /// The wake is the pipe closing, the same as the real one. The
+    /// pause before the step is written is what makes the order
+    /// readable: a halt that drops the poller instead of joining it
+    /// reaches the assertion before this line runs.
+    #[cfg(not(target_os = "illumos"))]
+    fn recording_poller(steps: &Steps) -> Poller {
+        use std::os::fd::AsRawFd;
+
+        let (stop, wake) = std::io::pipe().expect("the test can open a pipe");
+        let steps = Arc::clone(steps);
+        let thread = std::thread::Builder::new()
+            .name("poller-stub".into())
+            .spawn(move || {
+                let mut pfd = libc::pollfd {
+                    fd: stop.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                while unsafe { libc::poll(&mut pfd, 1, 10_000) } < 0 {
+                    let err = std::io::Error::last_os_error();
+                    assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                steps
+                    .lock()
+                    .expect("steps lock")
+                    .push("poller stopped".to_string());
+            })
+            .expect("the test can spawn a thread");
+        Poller { wake, thread }
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    #[test]
+    fn a_halt_stops_the_poll_thread_before_it_deletes_the_link() {
+        // The poll thread reads the viona descriptor and calls back
+        // into the PCI transport, so a delete that runs beside it hands
+        // it a link that is gone. This is Propolis's order, and it
+        // needs the whole halt to hold it, not `stop_poller` alone.
+        let steps = Steps::default();
+        let device = device_with(Arc::new(RecordingLink::new(&steps)));
+        device.inner.lock().expect("viona lock").poller =
+            Some(recording_poller(&steps));
+
+        device.halt();
+
+        assert_eq!(
+            steps_of(&steps),
+            ["poller stopped", "ring_reset(0)", "ring_reset(1)", "delete"],
+        );
+    }
+
     #[cfg(not(target_os = "illumos"))]
     #[test]
     fn a_halt_holds_no_device_lock_while_it_stops_the_link() {
