@@ -578,3 +578,137 @@ fn a_backend_raise_overtaken_by_a_whole_reset_delivers_nothing() {
     assert_eq!(pin.asserts(), 1, "the driver that is running got nothing");
     assert_ne!(isr(&dev), 0, "the running driver's ISR was left clear");
 }
+
+// The reviewer's interleaving, run concurrently rather than in
+// sequence. A backend authorises work under one session and the thread
+// that will raise for it is parked on the far side of that handoff,
+// before the transport admits anything. A whole reset then runs to
+// completion on the vCPU thread and the next driver comes up.
+//
+// Two properties, and a wrong fix breaks the second one. Nothing from
+// the parked thread may reach the driver that followed; and the reset
+// must not wait for that thread, because a raise the gate never
+// admitted is not in the set `settle` closes over. A reset that waited
+// for it would be bounded by a backend, which is the other half of the
+// same finding.
+#[test]
+fn a_raise_parked_across_a_whole_reset_is_refused_and_never_holds_it() {
+    let (dev, entered, release, pin) = wired_intx();
+    write_status(&dev, READY | bits::STATUS_DRIVER_OK);
+    let intr = dev.backend_intr();
+    // The session a completion built now would carry to its raise.
+    let armed = intr.session();
+
+    let (hook, arrived, go) = park();
+    let raiser = {
+        let intr = Arc::clone(&intr);
+        std::thread::spawn(move || {
+            hook();
+            intr.raise(armed, 0);
+        })
+    };
+    arrived
+        .recv_timeout(WEDGED)
+        .expect("the raise parked before admission");
+
+    release_on_drain(entered, release);
+    let started = Instant::now();
+    write_status(&dev, 0);
+    let reset_took = started.elapsed();
+    write_status(&dev, READY | bits::STATUS_DRIVER_OK);
+    assert!(
+        reset_took < RESET_BUDGET,
+        "the reset waited {reset_took:?} on a raise it never admitted",
+    );
+
+    go.send(()).expect("release the raise");
+    raiser.join().expect("the raise finished");
+
+    assert_eq!(
+        pin.asserts(),
+        0,
+        "a raise held over from the closed session reached the driver that \
+         followed"
+    );
+    assert!(!pin.is_asserted(), "the old session left the line up");
+    assert_eq!(isr(&dev), 0, "the old session set the new driver's ISR");
+
+    // The converse, and it is the worse failure of the two: the driver
+    // running now must still be interrupted for its own work, or the
+    // device has traded a spurious interrupt for a guest that waits
+    // for ever.
+    let live = intr.session();
+    let (hook, arrived, go) = park();
+    let raiser = {
+        let intr = Arc::clone(&intr);
+        std::thread::spawn(move || {
+            hook();
+            intr.raise(live, 0);
+        })
+    };
+    arrived.recv_timeout(WEDGED).expect("the live raise parked");
+    go.send(()).expect("release the live raise");
+    raiser.join().expect("the live raise finished");
+
+    assert_eq!(
+        pin.asserts(),
+        1,
+        "the driver that is running got no interrupt for its own work"
+    );
+    assert_ne!(isr(&dev), 0, "the running driver's ISR was left clear");
+}
+
+// The boundary the session check must not cross. A raise the gate
+// admitted BEFORE the reset started is already the reset's to wait
+// out, and it belongs to the driver that asked for it. Refusing it
+// would lose an interrupt the guest is entitled to; letting the reset
+// return while it is still on its way leaves a message from the old
+// session arriving in the new one.
+//
+// This goes out as an MSI-X message on purpose. The INTx path holds
+// the line guard across the pin, so a reset there is held by that lock
+// whether or not the gate counted the delivery, and the test would
+// pass for the wrong reason. A message has no line and no level, so
+// the only thing that can hold the reset is the admission the raise
+// took, and the only evidence is whether the send had finished.
+#[test]
+fn a_session_raise_admitted_before_the_reset_is_delivered_and_waited_out() {
+    let ((dev, entered, release, _pin), _table, sink) = wired_msix(Some(1));
+    write_status(&dev, READY | bits::STATUS_DRIVER_OK);
+    let intr = dev.backend_intr();
+    let armed = intr.session();
+
+    let (hook, arrived, go) = park();
+    sink.park_in_send(hook);
+    let raiser = {
+        let intr = Arc::clone(&intr);
+        std::thread::spawn(move || intr.raise(armed, 0))
+    };
+    arrived
+        .recv_timeout(WEDGED)
+        .expect("the admitted raise reached the kernel");
+
+    let resetter = {
+        let dev = Arc::clone(&dev);
+        std::thread::spawn(move || write_status(&dev, 0))
+    };
+    release_on_drain(entered, release);
+    // Every chance for a build that does not hold the admission across
+    // the delivery to finish the reset while the message is in flight.
+    std::thread::sleep(SETTLE);
+    let finished_early = resetter.is_finished();
+
+    go.send(()).expect("release the admitted raise");
+    raiser.join().expect("the admitted raise finished");
+    resetter.join().expect("the reset finished");
+
+    assert!(
+        !finished_early,
+        "the reset returned with a message it admitted still in flight"
+    );
+    assert_eq!(
+        sink.delivered(),
+        1,
+        "the driver that asked for this interrupt never got it"
+    );
+}
