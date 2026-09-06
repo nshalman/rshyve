@@ -44,23 +44,43 @@ fn link_on(reader: PipeReader) -> VionaFd {
     recorder_on(File::from(OwnedFd::from(reader)))
 }
 
+/// One wait, running on its own thread.
+struct Waiting {
+    /// What the wait ended with, once it ends.
+    end: mpsc::Receiver<Result<IntrWait>>,
+    /// The thread it runs on, for a test that signals it.
+    thread: Tid,
+}
+
+/// A thread id a test can carry across a channel.
+///
+/// `pthread_t` is a pointer on macOS, so it is not `Send` on its own.
+#[derive(Clone, Copy)]
+struct Tid(libc::pthread_t);
+
+// Safety: the value only names a thread, and every test that holds
+// one waits for that thread to end before it drops the id.
+unsafe impl Send for Tid {}
+
 /// Run one wait on its own thread.
 ///
 /// A wait that never ends is a failure, not a hung run, so no test
 /// below calls it on the test thread.
-fn spawn_wait(
-    fd: VionaFd,
-    stop: PipeReader,
-) -> mpsc::Receiver<Result<IntrWait>> {
-    let (tx, rx) = mpsc::channel();
+fn spawn_wait(fd: VionaFd, stop: PipeReader) -> Waiting {
+    let (tx, end) = mpsc::channel();
+    let (named, id) = mpsc::channel();
     std::thread::Builder::new()
         .name("wait-intr".into())
         .spawn(move || {
+            // Safety: pthread_self names the calling thread.
+            let me = Tid(unsafe { libc::pthread_self() });
+            named.send(me).expect("the test reads this");
             tx.send(fd.wait_intr(&stop))
                 .expect("the test waits for this");
         })
         .expect("the test can spawn a thread");
-    rx
+    let thread = id.recv_timeout(WEDGED).expect("the thread named itself");
+    Waiting { end, thread }
 }
 
 /// Whether this platform tells viona's interrupt band apart from
@@ -95,10 +115,36 @@ fn tells_a_band_from_a_byte() -> bool {
 }
 
 /// What one spawned wait ended with.
-fn waited(rx: &mpsc::Receiver<Result<IntrWait>>) -> IntrWait {
-    rx.recv_timeout(WEDGED)
+fn waited(waiting: &Waiting) -> IntrWait {
+    waiting
+        .end
+        .recv_timeout(WEDGED)
         .expect("the wait ended")
         .expect("the poll answered")
+}
+
+/// Make `SIGUSR1` interrupt a system call on this process.
+///
+/// `SA_RESTART` is left out on purpose: with it the C library
+/// restarts the call, and the retry under test never runs. The
+/// handler does nothing, so the only effect is the `EINTR`.
+fn sigusr1_interrupts_a_call() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    extern "C" fn note(_sig: libc::c_int) {}
+
+    INSTALLED.call_once(|| {
+        // Safety: the struct is initialized before the call, and the
+        // handler is a plain function that touches nothing.
+        let rc = unsafe {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction =
+                note as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            act.sa_flags = 0;
+            libc::sigemptyset(&mut act.sa_mask);
+            libc::sigaction(libc::SIGUSR1, &act, std::ptr::null_mut())
+        };
+        assert_eq!(rc, 0, "sigaction: {}", std::io::Error::last_os_error());
+    });
 }
 
 #[test]
@@ -553,6 +599,71 @@ fn the_wait_ends_when_the_halt_closes_the_stop_pipe() {
 }
 
 #[test]
+fn the_wait_ends_when_the_stop_pipe_carries_a_byte() {
+    // The halt ends this wait by closing the write end, and a closed
+    // end reports POLLHUP whatever the wait asked for. So the wait
+    // must ask for readability on the stop descriptor as well: the
+    // day anything signals the stop by writing it, a wait that asked
+    // for nothing sleeps through the write, the poll thread stays
+    // parked, and the halt joins it for ever.
+    //
+    // The link write end is held open, so nothing but the byte can
+    // end this wait.
+    let (link_rx, link_tx) = std::io::pipe().expect("a pipe");
+    let (stop_rx, mut stop_tx) = std::io::pipe().expect("a pipe");
+
+    let waiting = spawn_wait(link_on(link_rx), stop_rx);
+    stop_tx.write_all(b"x").expect("the pipe takes a byte");
+
+    assert_eq!(waited(&waiting), IntrWait::Stopped);
+    drop(link_tx);
+}
+
+#[test]
+fn a_signal_does_not_end_the_wait() {
+    // poll(2) gives up with EINTR when a signal lands on this thread,
+    // and the kernel's interrupt is still pending after it. A wait
+    // that reported that would end the poll thread on the first
+    // signal the process takes: the link stays up, the halt still
+    // joins a thread that already left, and the guest loses every
+    // interrupt from then on.
+    //
+    // Both write ends stay open, so only the signal can reach the
+    // wait until the test closes the stop pipe.
+    let (link_rx, link_tx) = std::io::pipe().expect("a pipe");
+    let (stop_rx, stop_tx) = std::io::pipe().expect("a pipe");
+    sigusr1_interrupts_a_call();
+
+    let waiting = spawn_wait(link_on(link_rx), stop_rx);
+    // The thread parks in poll(2) for the whole run below, so the
+    // signals land there. One is enough to end a wait that gives up.
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(10));
+        // Safety: the thread named itself above, and the assertion
+        // below reads the answer that says whether it is still there.
+        let rc = unsafe { libc::pthread_kill(waiting.thread.0, libc::SIGUSR1) };
+        // The thread sends its result before it leaves, so a thread
+        // that is gone has already said why.
+        assert_eq!(
+            rc,
+            0,
+            "the wait thread left the run of signals, ending with {:?}",
+            waiting.end.try_recv(),
+        );
+    }
+
+    match waiting.end.recv_timeout(PARKED) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        other => panic!("a signal ended the wait with {other:?}"),
+    }
+
+    // Released either way, so the thread is never left parked.
+    drop(stop_tx);
+    assert_eq!(waited(&waiting), IntrWait::Stopped);
+    drop(link_tx);
+}
+
+#[test]
 fn the_wait_ends_when_the_link_hangs_up() {
     // A link whose write end is gone signals POLLHUP and nothing
     // else, for ever. Reading that as anything but an end spins one
@@ -584,7 +695,7 @@ fn a_readable_link_with_no_interrupt_does_not_end_the_wait() {
 
     let waiting = spawn_wait(link_on(link_rx), stop_rx);
 
-    match waiting.recv_timeout(PARKED) {
+    match waiting.end.recv_timeout(PARKED) {
         Err(mpsc::RecvTimeoutError::Timeout) => {}
         other => panic!("a readable link ended the wait with {other:?}"),
     }
