@@ -38,6 +38,7 @@ mod control;
 mod host_state;
 mod input;
 mod mdata;
+mod msix;
 mod peercred;
 mod reboot;
 mod varstore;
@@ -1248,7 +1249,7 @@ fn parse_and_create_pci_device(
             info!(log, "virtio-blk attached";
                 "bdf" => %bdf,
                 "path" => config,
-                "msix" => "2 vectors",
+                "msix_vectors" => msix::vector_count(pci_dev.as_ref()),
             );
             Ok((
                 Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
@@ -1273,7 +1274,7 @@ fn parse_and_create_pci_device(
                 "bdf" => %bdf,
                 "vnic" => vnic_name,
                 "promiscphys" => promiscphys,
-                "msix" => "3 vectors",
+                "msix_vectors" => msix::vector_count(pci_dev.as_ref()),
             );
             Ok((
                 Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
@@ -1324,7 +1325,7 @@ fn parse_and_create_pci_device(
             info!(log, "virtio-console attached";
                 "bdf" => %bdf,
                 "socket" => path,
-                "msix" => "3 vectors",
+                "msix_vectors" => msix::vector_count(pci_dev.as_ref()),
             );
             Ok((
                 Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
@@ -1343,7 +1344,7 @@ fn parse_and_create_pci_device(
                 "bdf" => %bdf,
                 "tag" => &opts.tag,
                 "path" => %opts.path.display(),
-                "msix" => "3 vectors",
+                "msix_vectors" => msix::vector_count(pci_dev.as_ref()),
             );
             Ok((
                 Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
@@ -1354,7 +1355,10 @@ fn parse_and_create_pci_device(
             let lintr = chipset.route_lintr(&bdf);
             let pci_dev = attach::virtio_rng(lintr, &virtio_ctx);
             chipset.try_attach_device(bdf, pci_dev.clone())?;
-            info!(log, "virtio-rnd attached"; "bdf" => %bdf, "msix" => "2 vectors");
+            info!(log, "virtio-rnd attached";
+                "bdf" => %bdf,
+                "msix_vectors" => msix::vector_count(pci_dev.as_ref()),
+            );
             Ok((
                 Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
                 Some(pci_dev as Arc<dyn vmm_devices::Lifecycle>),
