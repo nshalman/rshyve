@@ -527,12 +527,27 @@ pub fn prepare_unplug(
         return Err(UnplugError::NotQuiesced { device });
     }
 
+    // The refusal is decided before the halt, not after it. Every
+    // device's halt drops the Indicator's answer and tears its worker
+    // down regardless, so a state read taken afterwards reports a
+    // refusal for a device this call has already destroyed, and the
+    // caller's abort path then resumes a device with no worker left.
+    // The window is narrowed, not closed: a resume landing between
+    // this read and the halt below still gets that outcome. Closing it
+    // needs each device's halt to act on what its Indicator answers.
+    //
+    // A device with no Indicator reports nothing and its halt stands.
+    if let Some(state) = dev.lifecycle_state() {
+        if state != IndicatedState::Pause {
+            return Err(UnplugError::Refused { device, state });
+        }
+    }
+
     dev.flush_backing(FlushIntent::BestEffort)
         .map_err(|source| UnplugError::Flush { device, source })?;
 
     dev.halt();
     match dev.lifecycle_state() {
-        // A device with no Indicator cannot report, so its halt stands.
         None | Some(IndicatedState::Halt) => Ok(()),
         Some(state) => Err(UnplugError::Refused { device, state }),
     }

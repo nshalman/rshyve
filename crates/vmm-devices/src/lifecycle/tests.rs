@@ -417,4 +417,12 @@ fn unplug_refuses_to_halt_a_device_resumed_under_it() {
         "{error:?}",
     );
     assert_eq!(device.indicator.state(), IndicatedState::Run);
+    // The name of this test is the assertion. Without it the device is
+    // torn down and then reported as refused, and the caller's abort
+    // path resumes a device whose worker is already gone.
+    assert_eq!(
+        device.halts.load(Ordering::Acquire),
+        0,
+        "the unplug halted a device it went on to report as refused",
+    );
 }
