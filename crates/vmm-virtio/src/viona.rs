@@ -732,6 +732,14 @@ impl VirtioDevice for VirtioViona {
 
     fn set_features(&self, features: u64) {
         let mut inner = self.inner.lock().expect("viona lock poisoned");
+        // A halt in flight has dropped this lock and is inside an
+        // untimed kernel call. A vCPU that issued an ioctl here would
+        // wait for that call inside the kernel while still holding
+        // this guard, and every other vCPU would then wait for the
+        // guard. That is the hot-unplug stall by another route.
+        if inner.halted {
+            return;
+        }
         inner.negotiated_features = features;
         Self::set_kernel_features(&inner, features);
     }
@@ -864,6 +872,12 @@ impl VirtioDevice for VirtioViona {
 
     fn reset(&self) {
         let mut inner = self.inner.lock().expect("viona lock poisoned");
+        // Same reason as `set_features`: no ioctl may be issued under
+        // this guard once the halt has let it go. The halt cleared
+        // both fields below already, and nothing can set them again.
+        if inner.halted {
+            return;
+        }
         inner.negotiated_features = 0;
         inner.ring_state = [RingState::Init; NET_NUM_QUEUES];
 
@@ -1564,6 +1578,29 @@ mod tests {
         let inner = device.inner.lock().expect("viona lock");
         assert_eq!(inner.ring_state, [RingState::Init; NET_NUM_QUEUES]);
         assert_eq!(inner.negotiated_features, 0);
+    }
+
+    #[cfg(not(target_os = "illumos"))]
+    #[test]
+    fn a_halted_device_takes_no_feature_write() {
+        // On illumos `set_features` issues an ioctl under the device
+        // guard. A halt has dropped that guard and is inside an untimed
+        // kernel call, so a vCPU that got in would block in the kernel
+        // still holding the guard, and the next vCPU would block on the
+        // guard: the hot-unplug stall by another route. Only the
+        // bookkeeping is visible off illumos; the refusal is the same
+        // code on both.
+        let steps = Steps::default();
+        let device = device_with(Arc::new(RecordingLink::new(&steps)));
+        device.halt();
+
+        VirtioDevice::set_features(&device, u64::from(VIRTIO_NET_F_MAC));
+
+        assert_eq!(
+            device.inner.lock().expect("viona lock").negotiated_features,
+            0,
+            "a halted device took a feature write",
+        );
     }
 
     #[cfg(not(target_os = "illumos"))]
