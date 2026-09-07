@@ -360,10 +360,12 @@ jobs:
           trap 'rm -rf "$tmp" "$elsewhere"' EXIT
           # An extracted archive is what the build host has: no checkout.
           git archive HEAD | tar -x -C "$tmp"
-          # Assembled at run time. The literal would trip the guard on
-          # this file, which is the guard doing its job.
-          octet=199
-          printf 'root@10.%s.%s.40\n' "$octet" "$octet" > "$tmp/docs/ci-self-test.md"
+          # Assembled at run time, because the literal would trip the
+          # guard on this file, which is the guard doing its job. The
+          # address is a generic RFC 1918 one the guard also matches:
+          # this file is public, so it must not carry a real host.
+          third=168
+          printf 'root@192.%s.0.1\n' "$third" > "$tmp/docs/ci-self-test.md"
           if "$tmp/tools/public-surface.sh"; then
             echo "the guard reported clean with a lab address in the tree" >&2
             exit 1

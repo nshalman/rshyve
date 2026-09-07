@@ -102,9 +102,12 @@ happens.
 
 State these as plainly as the results.
 
-- **No illumos guest was booted.** The driver contract above is read
-  from the illumos source, not observed. Nothing here proves how that
-  driver behaves against this device.
+- **The illumos guest run is not in the matrix above.** One was booted
+  later, and it found the PCI bus defect below. It reached multi-user
+  on the fix, and the same ISO on the same host under the platform's
+  own bhyve was the control. The reset and poweroff counts above are
+  still from a Linux guest, so no illumos driver has been measured
+  through a reset.
 - **No wedge was produced.** The teardown budget and the shutdown
   watchdog have never run against a real vmm_drv lease that will not
   break, so the teardown fix is unexercised against a real park. See
@@ -113,10 +116,23 @@ State these as plainly as the results.
 
 ## What only a guest could find
 
-Booting a guest found three defects that no test suite on either
+Booting a guest found four defects that no test suite on either
 platform could see. Each one passed a full green run on macOS and on
 illumos first. The pattern repeats, so it is worth naming: each defect
 sits where a test's stand-in is not the thing the guest touches.
+
+**PCI config space answered for every bus** (`198e7cd`). `config_read`
+indexed the slot table by device and function and never read the bus,
+so bus 0 answered all 256 bus numbers. illumos probes every bus, found
+a copy of the hostbridge behind each, and gave each a root bus node
+whose `reg` is `<bus, 0, 0>`. rootnex reads an I/O port base out of
+that bustype field, so a config read on the Nth root bus becomes
+`inw(N + 6)`, and bus 0x1a is port 0x20, the in-kernel 8259, which
+refuses a 2-byte access. rshyve could not boot an illumos guest at
+all. Linux never walks past the bridges it finds, so it never saw it.
+The test at the 0xCF8 path swept the device number and pinned the bus
+to 0, on a helper that already took a bus argument: this one was
+catchable in process and the suite simply never varied the field.
 
 **Completions raised on the wrong queue** (`704fb1e`), described
 above. A test asserts that a completion lands in the used ring, and
