@@ -519,6 +519,29 @@ mod tests {
         }
     }
 
+    /// The guest, not the host, picks the bus in a config address, and
+    /// an illumos guest walks all 256 of them. Only bus 0 exists here,
+    /// so every other one must float. When they did not, the guest
+    /// found a copy of bus 0 behind each, built a root bus node per
+    /// bus, and the 27th of those decoded to an inw of port 0x20.
+    ///
+    /// This drives 0xCF8/0xCFC rather than PciBus, so it still holds if
+    /// the check moves.
+    #[test]
+    fn no_bus_but_zero_answers_a_config_read() {
+        let (pio, _cs) = setup();
+        // Device 0 is the hostbridge, so bus 0 answers here.
+        assert_ne!(cfg_read_dword(&pio, 0, 0, 0, 0x00), 0xFFFF_FFFF);
+
+        for bus in 1..=u8::MAX {
+            assert_eq!(
+                cfg_read_dword(&pio, bus, 0, 0, 0x00),
+                0xFFFF_FFFF,
+                "bus {bus} answered with the devices of bus 0",
+            );
+        }
+    }
+
     #[test]
     fn config_addr_disabled_returns_ff() {
         let (pio, _cs) = setup();

@@ -19,6 +19,20 @@ use super::Bdf;
 const SLOTS_PER_BUS: usize = 32;
 const FUNCS_PER_SLOT: usize = 8;
 
+/// The only bus number this machine implements.
+///
+/// There is no PCI-to-PCI bridge, so bus 0 is the whole topology.
+const ROOT_BUS: u8 = 0;
+
+/// The value an unclaimed config address returns: the bus floats high.
+const fn bus_float(len: u8) -> u32 {
+    match len {
+        1 => 0xFF,
+        2 => 0xFFFF,
+        _ => 0xFFFF_FFFF,
+    }
+}
+
 type PciSlot = [Option<Arc<dyn PciDevice>>; FUNCS_PER_SLOT];
 type PciSlots = [PciSlot; SLOTS_PER_BUS];
 
@@ -28,6 +42,9 @@ pub enum AttachError {
     /// Another device holds this BDF.
     #[error("device already attached at BDF {0}")]
     SlotOccupied(Bdf),
+    /// The BDF names a bus this machine does not have.
+    #[error("no such PCI bus for BDF {0}")]
+    NoSuchBus(Bdf),
 }
 
 /// PCI bus holding up to 32 device slots, each with up to 8 functions.
@@ -86,6 +103,9 @@ impl PciBus {
         bdf: Bdf,
         dev: Arc<dyn PciDevice>,
     ) -> Result<(), AttachError> {
+        if bdf.bus() != ROOT_BUS {
+            return Err(AttachError::NoSuchBus(bdf));
+        }
         let func0 = {
             let mut inner = self.inner.lock().expect("PciBus lock poisoned");
             let slot =
@@ -114,6 +134,9 @@ impl PciBus {
     ///
     /// Returns `None` if the slot is empty.
     pub fn detach(&self, bdf: &Bdf) -> Option<Arc<dyn PciDevice>> {
+        if bdf.bus() != ROOT_BUS {
+            return None;
+        }
         let mut inner = self.inner.lock().expect("PciBus lock poisoned");
         let dev =
             inner.slots[bdf.dev() as usize][bdf.func() as usize].take()?;
@@ -141,7 +164,14 @@ impl PciBus {
     ///
     /// Returns all-ones (0xFFFF_FFFF) for empty slots, which is the
     /// correct bus-float response that UEFI expects when scanning.
+    ///
+    /// A bus other than [`ROOT_BUS`] has nothing behind it and floats
+    /// as well. Without that test every one of the 256 bus numbers
+    /// answers with a copy of bus 0.
     pub fn config_read(&self, bdf: &Bdf, offset: u8, len: u8) -> u32 {
+        if bdf.bus() != ROOT_BUS {
+            return bus_float(len);
+        }
         let inner = self.inner.lock().expect("PciBus lock poisoned");
         match &inner.slots[bdf.dev() as usize][bdf.func() as usize] {
             Some(dev) => {
@@ -149,14 +179,7 @@ impl PciBus {
                 drop(inner);
                 dev.cfg_read(offset, len)
             }
-            None => {
-                // Bus float: all ones
-                match len {
-                    1 => 0xFF,
-                    2 => 0xFFFF,
-                    _ => 0xFFFF_FFFF,
-                }
-            }
+            None => bus_float(len),
         }
     }
 
@@ -164,6 +187,9 @@ impl PciBus {
     ///
     /// Writes to empty slots are silently dropped.
     pub fn config_write(&self, bdf: &Bdf, offset: u8, len: u8, val: u32) {
+        if bdf.bus() != ROOT_BUS {
+            return;
+        }
         let inner = self.inner.lock().expect("PciBus lock poisoned");
         if let Some(dev) = &inner.slots[bdf.dev() as usize][bdf.func() as usize]
         {
@@ -176,6 +202,9 @@ impl PciBus {
 
     /// Look up the device at the given BDF, if any.
     pub fn device_at(&self, bdf: &Bdf) -> Option<Arc<dyn PciDevice>> {
+        if bdf.bus() != ROOT_BUS {
+            return None;
+        }
         let inner = self.inner.lock().expect("PciBus lock poisoned");
         inner.slots[bdf.dev() as usize][bdf.func() as usize].clone()
     }
@@ -450,5 +479,59 @@ mod tests {
         // Unoccupied slot still returns all-ones
         let bdf_empty = Bdf::new_unchecked(0, 2, 0);
         assert_eq!(bus.config_read(&bdf_empty, 0x00, 4), 0xFFFF_FFFF);
+    }
+
+    /// A guest walks all 256 bus numbers. Only bus 0 may answer, or the
+    /// guest finds a copy of bus 0 behind every one of them.
+    #[test]
+    fn config_space_does_not_alias_onto_another_bus() {
+        let bus = PciBus::new();
+        let dev: Arc<dyn PciDevice> = Arc::new(TestDevice {
+            vendor_id: 0x8086,
+            device_id: 0x2821,
+        });
+        bus.attach(Bdf::new_unchecked(0, 3, 0), dev);
+        assert_eq!(
+            bus.config_read(&Bdf::new_unchecked(0, 3, 0), 0x00, 2),
+            0x8086
+        );
+
+        for b in 1..=u8::MAX {
+            let bdf = Bdf::new_unchecked(b, 3, 0);
+            assert_eq!(bus.config_read(&bdf, 0x00, 4), 0xFFFF_FFFF);
+            assert_eq!(bus.config_read(&bdf, 0x00, 2), 0xFFFF);
+            assert_eq!(bus.config_read(&bdf, 0x00, 1), 0xFF);
+            assert!(bus.device_at(&bdf).is_none());
+        }
+    }
+
+    #[test]
+    fn a_config_write_to_another_bus_is_dropped() {
+        let bus = PciBus::new();
+        let dev = Arc::new(HeaderDevice::new());
+        bus.attach(Bdf::new_unchecked(0, 4, 0), dev.clone());
+        let before = dev.header_type();
+
+        bus.config_write(
+            &Bdf::new_unchecked(7, 4, 0),
+            bits::REG_HEADER_TYPE,
+            1,
+            0x5A,
+        );
+
+        assert_eq!(dev.header_type(), before);
+    }
+
+    #[test]
+    fn attach_to_another_bus_is_refused() {
+        let bus = PciBus::new();
+        let dev: Arc<dyn PciDevice> = Arc::new(TestDevice {
+            vendor_id: 0x1234,
+            device_id: 0x5678,
+        });
+        let bdf = Bdf::new_unchecked(1, 4, 0);
+        let err = bus.try_attach(bdf, dev).expect_err("bus 1 does not exist");
+        assert!(matches!(err, AttachError::NoSuchBus(b) if b == bdf));
+        assert!(bus.device_at(&Bdf::new_unchecked(0, 4, 0)).is_none());
     }
 }
