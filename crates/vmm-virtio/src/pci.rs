@@ -22,22 +22,47 @@
 //! guest negotiates `VIRTIO_F_VERSION_1` (bit 32) and uses BAR2.
 //! Legacy guests use BAR0 as before. `EVENT_IDX` and `INDIRECT_DESC`
 //! are only advertised through the modern path.
+//!
+//! # Where the parts are
+//!
+//! This module keeps what every path shares: the register state in
+//! `VirtioPciState`, the reset latch inside it, and the reset
+//! protocol that closes the latch and reopens it. Each submodule owns
+//! one thing, and its own doc says which:
+//!
+//! - `bus`: the addresses this device decodes, and the accesses that
+//!   arrive at them.
+//! - `legacy`: the pre-1.0 register file on BAR0.
+//! - `modern`: the capability chain and the BAR2 register file it
+//!   points at.
+//! - `intr`: every interrupt this transport delivers, ordered against
+//!   its own reset.
+//! - `migrate`: what goes on the migration wire, and the order a
+//!   restore puts it back in.
 
 use std::sync::{Arc, Mutex};
 
-use vmm_core::common::RWOp;
 use vmm_core::mem::PhysMap;
-use vmm_core::mmio::{MmioBus, MmioFn};
-use vmm_core::pio::{PioBus, PioFn};
+use vmm_core::mmio::MmioBus;
+use vmm_core::pio::PioBus;
 
 use vmm_devices::pci::bar::BarDefine;
-use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
+use vmm_devices::pci::device::{DeviceIdent, DeviceState};
 use vmm_devices::pci::msix::MsixTable;
 use vmm_devices::pci::{BarN, IntrPin, LintrCfg};
 
 use super::bits;
 use super::queue::VirtQueue;
 use super::VirtioDevice;
+
+mod bus;
+pub mod intr;
+mod legacy;
+mod migrate;
+mod modern;
+
+use intr::IntrGate;
+use modern::CapOffsets;
 
 /// Maximum number of virtqueues per device.
 const MAX_QUEUES: usize = 4;
@@ -72,6 +97,17 @@ struct VirtioPciState {
     queue_used: Vec<u64>,
     /// Configuration generation counter.
     config_generation: u8,
+
+    /// Set while a backend reset drains its guest-memory accesses.
+    ///
+    /// The transport lock is released across that drain so a register
+    /// read is still served, which leaves the device reachable to
+    /// another vCPU while it is half reset. The latch sits inside the
+    /// locked state so a write cannot test it and then wait for the
+    /// lock: every write path tests the latch and changes the
+    /// registers in one critical section, and is dropped when the
+    /// latch is closed.
+    resetting: bool,
 }
 
 impl VirtioPciState {
@@ -93,6 +129,7 @@ impl VirtioPciState {
             queue_avail: vec![0; num_queues],
             queue_used: vec![0; num_queues],
             config_generation: 0,
+            resetting: false,
         }
     }
 
@@ -124,6 +161,25 @@ impl VirtioPciState {
         self.queue_desc.fill(0);
         self.queue_avail.fill(0);
         self.queue_used.fill(0);
+        // `resetting` stays as it is. The reset path owns the latch
+        // and opens it only once every field above is published.
+    }
+
+    /// The device status the driver may read.
+    ///
+    /// The vCPU that asked for the reset is inside it, so this read
+    /// comes from another one. A driver frees the vring as soon as it
+    /// reads 0 (VirtIO 1.3 sec 4.1.4.3.1) and writes ACKNOWLEDGE next,
+    /// and neither is safe while the backend drains. A reset that
+    /// starts from 0, which is what a driver does when it probes a
+    /// device it never used, would otherwise report 0 for the whole
+    /// drain.
+    fn readable_status(&self) -> u8 {
+        if self.resetting {
+            self.status | bits::STATUS_ACKNOWLEDGE
+        } else {
+            self.status
+        }
     }
 
     /// Returns true if the guest negotiated VERSION_1 (modern transport).
@@ -134,50 +190,45 @@ impl VirtioPciState {
     }
 }
 
-/// Offsets of virtio PCI capabilities in config space.
-struct CapOffsets {
-    /// First capability offset (either MSI-X or first virtio cap).
-    first: u8,
-    /// MSI-X capability offset (0 if no MSI-X).
-    msix: u8,
-    /// Common config capability offset.
-    common: u8,
-    /// Notify capability offset.
-    notify: u8,
-    /// ISR capability offset.
-    isr: u8,
-    /// Device config capability offset.
-    device: u8,
+/// One-shot park points a test installs to hold a thread at a named
+/// step of the reset protocol. The first thread to reach a point takes
+/// the hook and runs it, so a test can pin an interleaving that would
+/// otherwise depend on the scheduler.
+#[cfg(test)]
+#[derive(Default)]
+struct TestParks {
+    /// Reached in a register write path once its reset-latch check has
+    /// passed, and before the write changes any transport state.
+    write_checked: ParkSlot,
+    /// Reached once the transport lock is dropped and before the
+    /// config interrupt is delivered, which is the window a reset can
+    /// run in.
+    config_interrupt_pending: ParkSlot,
+    /// Reached between sampling the session for an MSI-X unmask and
+    /// delivering what the unmask released, which is the window a
+    /// whole reset can run in.
+    released_delivery_pending: ParkSlot,
+    /// Reached by the post-restore kick once it has dropped the
+    /// transport lock, which is the window a whole reset can run in.
+    post_restore_kick_pending: ParkSlot,
 }
 
-impl CapOffsets {
-    fn new(has_msix: bool) -> Self {
-        if has_msix {
-            // MSI-X cap (12 bytes) at 0x40, then virtio caps after
-            Self {
-                first: 0x40,
-                msix: 0x40,
-                common: 0x4C,
-                notify: 0x5C, // 0x4C + 16
-                isr: 0x70,    // 0x5C + 20
-                device: 0x80, // 0x70 + 16
-            }
-        } else {
-            Self {
-                first: 0x40,
-                msix: 0,
-                common: 0x40,
-                notify: 0x50, // 0x40 + 16
-                isr: 0x64,    // 0x50 + 20
-                device: 0x74, // 0x64 + 16
-            }
-        }
+#[cfg(test)]
+type ParkSlot = Mutex<Option<Arc<dyn Fn() + Send + Sync>>>;
+
+/// Run a park point, if a test installed one, and clear it.
+#[cfg(test)]
+fn run_park(slot: &ParkSlot) {
+    let hook = slot.lock().expect("park lock poisoned").take();
+    if let Some(hook) = hook {
+        hook();
     }
 }
 
 /// PCI device wrapping a VirtIO backend.
 ///
-/// Implements the [`PciDevice`] trait so it can be attached to the PCI
+/// Implements the [`PciDevice`](vmm_devices::pci::device::PciDevice)
+/// trait so it can be attached to the PCI
 /// bus. Transitional device: BAR0 (PIO) for legacy, BAR2 (MMIO) for
 /// modern transport.
 pub struct VirtioPciDevice<D: VirtioDevice> {
@@ -218,6 +269,16 @@ pub struct VirtioPciDevice<D: VirtioDevice> {
     self_ref: Mutex<Option<std::sync::Weak<Self>>>,
     /// Structured logger for bus registration diagnostics.
     log: slog::Logger,
+    /// Set once a refused queue has been reported at `warn`. The write
+    /// that refuses is guest driven and repeatable, so the rest go to
+    /// `debug`.
+    queue_refusal_reported: std::sync::atomic::AtomicBool,
+    /// Orders every interrupt this device delivers against its own
+    /// reset.
+    intr: Arc<IntrGate>,
+    /// Park points a test uses to pin a reset interleaving.
+    #[cfg(test)]
+    parks: TestParks,
     /// Capability chain offsets in PCI config space.
     cap_offsets: CapOffsets,
     /// Size of device-specific config region (for cap advertisement).
@@ -374,6 +435,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             registered_bar4: Mutex::new(None),
             self_ref: Mutex::new(None),
             log,
+            queue_refusal_reported: std::sync::atomic::AtomicBool::new(false),
+            intr: Arc::new(IntrGate::new()),
+            #[cfg(test)]
+            parks: TestParks::default(),
             cap_offsets,
             dev_config_size,
             num_queues: num_queues as u16,
@@ -384,1105 +449,237 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         dev
     }
 
-    /// Unregister the recorded BAR0 PIO base and clear the record.
-    fn release_pio(&self, reg: &mut Option<u16>) {
-        if let Some(port) = reg.take() {
-            if let Err(e) = self.bus_pio.unregister(port) {
-                slog::warn!(self.log, "virtio-pci: PIO unregister failed";
-                    "bar" => ?BarN::BAR0,
-                    "port" => format!("{port:#x}"),
-                    "error" => %e);
-            }
-        }
-    }
-
-    /// Unregister a recorded MMIO base and clear the record.
-    fn release_mmio(&self, bar: BarN, reg: &mut Option<u64>) {
-        if let Some(addr) = reg.take() {
-            if let Err(e) = self.bus_mmio.unregister(addr) {
-                slog::warn!(self.log, "virtio-pci: MMIO unregister failed";
-                    "bar" => ?bar,
-                    "addr" => format!("{addr:#x}"),
-                    "error" => %e);
-            }
-        }
-    }
-
-    /// Update PIO bus registration for BAR0 based on current state.
+    /// Take the transport lock, unless a reset is draining behind it.
     ///
-    /// Must be called with an Arc<Self> available. Registers or
-    /// unregisters the PIO handler as needed.
-    fn update_bar_registration(self: &Arc<Self>, pci: &DeviceState) {
-        let io_enabled = pci
-            .command()
-            .contains(vmm_devices::pci::bits::RegCmd::IO_EN);
-        let bar_info = pci.bars().get(BarN::BAR0);
-
-        let mut reg = self.registered_bar.lock().expect("bar lock poisoned");
-        self.release_pio(&mut reg);
-
-        // Register new handler if IO is enabled and BAR has an address
-        if io_enabled {
-            if let Some((BarDefine::Pio(size), addr)) = bar_info {
-                let port = addr as u16;
-                if port != 0 {
-                    let dev = Arc::clone(self);
-                    let handler: Arc<PioFn> =
-                        Arc::new(move |offset: u16, rwo: RWOp<'_>| {
-                            dev.bar_rw(BarN::BAR0, offset as usize, rwo);
-                        });
-                    match self.bus_pio.register(port, size, handler) {
-                        Ok(()) => *reg = Some(port),
-                        // The device now decodes nothing on BAR0.
-                        Err(e) => {
-                            slog::error!(self.log,
-                                "virtio-pci: PIO register failed, BAR0 dark";
-                                "bar" => ?BarN::BAR0,
-                                "port" => format!("{port:#x}"),
-                                "size" => size,
-                                "error" => %e);
-                        }
-                    }
-                }
-            }
+    /// Every guest write goes through here. The latch is part of the
+    /// locked state, so the caller cannot read it and then wait for
+    /// the lock: a write either runs before the reset closes the
+    /// latch or is dropped, never in between.
+    fn lock_for_write(
+        &self,
+    ) -> Option<std::sync::MutexGuard<'_, VirtioPciState>> {
+        let vs = self.virtio_state.lock().expect("virtio lock poisoned");
+        if vs.resetting {
+            return None;
         }
+        #[cfg(test)]
+        run_park(&self.parks.write_checked);
+        Some(vs)
     }
 
-    /// Update MMIO bus registration for BAR2 and BAR4.
-    fn update_mmio_registration(self: &Arc<Self>, pci: &DeviceState) {
-        let mmio_enabled = pci
-            .command()
-            .contains(vmm_devices::pci::bits::RegCmd::MMIO_EN);
-
-        // BAR2: modern transport config
-        {
-            let mut reg = self.registered_bar2.lock().expect("bar2 lock");
-            self.release_mmio(BarN::BAR2, &mut reg);
-            if mmio_enabled {
-                self.register_mmio(BarN::BAR2, pci, &mut reg);
-            }
-        }
-
-        // BAR4: MSI-X table + PBA
-        if self.msix.is_some() {
-            let mut reg = self.registered_bar4.lock().expect("bar4 lock");
-            self.release_mmio(BarN::BAR4, &mut reg);
-            if mmio_enabled {
-                self.register_mmio(BarN::BAR4, pci, &mut reg);
-            }
-        }
+    /// Whether a queue refused the ring addresses on its first use.
+    ///
+    /// A queue programmed outside the enable path, such as by a
+    /// migration restore, is only checked when the device first reads
+    /// the ring. It can do no work from then on, so the driver has to
+    /// be told rather than left waiting on it.
+    fn queue_needs_reset(vs: &VirtioPciState, queue_idx: u16) -> bool {
+        vs.queues
+            .get(queue_idx as usize)
+            .is_some_and(|q| q.needs_reset())
     }
 
-    /// Register one MMIO BAR and record its base on success.
-    fn register_mmio(
-        self: &Arc<Self>,
-        bar: BarN,
-        pci: &DeviceState,
-        reg: &mut Option<u64>,
+    /// Refuse a queue the guest just programmed and tell it why.
+    ///
+    /// The status bit goes in under the guard that refused the queue,
+    /// and the guard is then consumed so the caller cannot hold it
+    /// across the interrupt. Nothing happens once the device already
+    /// carries DEVICE_NEEDS_RESET: the write that reaches here is
+    /// guest driven and can be repeated without limit, so the
+    /// interrupt must not be raised per write. The reason is reported
+    /// once per device for the same reason: a guest can reset and
+    /// reprogram in a loop, and the second report says nothing the
+    /// first did not.
+    fn refuse_queue(
+        &self,
+        mut vs: std::sync::MutexGuard<'_, VirtioPciState>,
+        idx: usize,
+        error: Option<crate::queue::QueueAddrError>,
     ) {
-        let Some((def, addr)) = pci.bars().get(bar) else {
-            return;
-        };
-        if addr == 0 || !def.is_mmio() {
+        if vs.status & bits::STATUS_DEVICE_NEEDS_RESET != 0 {
             return;
         }
-        let size = def.size();
-        let dev = Arc::clone(self);
-        let handler: Arc<MmioFn> =
-            Arc::new(move |offset: usize, rwo: RWOp<'_>| {
-                dev.bar_rw(bar, offset, rwo);
-            });
-        match self.bus_mmio.register(addr, size, handler) {
-            Ok(()) => *reg = Some(addr),
-            // The device now decodes nothing on this BAR.
-            Err(e) => {
-                slog::error!(self.log,
-                    "virtio-pci: MMIO register failed, BAR dark";
-                    "bar" => ?bar,
-                    "addr" => format!("{addr:#x}"),
-                    "size" => size,
-                    "error" => %e);
+        // The bit must go in here. Applied after the guard drops, it
+        // can land in the middle of a reset drain, or on the session
+        // that follows the reset.
+        vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
+        // Sampled under the guard that wrote the bit, so a reset that
+        // wipes it is always the later of the two.
+        let session = self.intr.session();
+        drop(vs);
+        if let Some(error) = error {
+            let first = !self
+                .queue_refusal_reported
+                .swap(true, std::sync::atomic::Ordering::Relaxed);
+            if first {
+                slog::warn!(self.log, "virtio-pci refused a queue";
+                    "queue" => idx, "reason" => %error);
+            } else {
+                slog::debug!(self.log, "virtio-pci refused a queue";
+                    "queue" => idx, "reason" => %error);
             }
         }
+        self.raise_config_interrupt_in(session);
     }
 
-    /// Snapshot PCI BAR addresses and command bits for migration.
-    fn export_migrate_pci_state(
-        &self,
-    ) -> vmm_devices::lifecycle::VirtioMigratePciState {
-        let pci = self.pci_state.lock().expect("pci lock");
-        let mut bar_addrs = [0u64; 6];
-        for (idx, addr) in bar_addrs.iter_mut().enumerate() {
-            let bar = BarN::try_from(idx as u8).expect("valid BAR index");
-            *addr = pci.bars().get(bar).map(|(_, value)| value).unwrap_or(0);
-        }
-
-        vmm_devices::lifecycle::VirtioMigratePciState {
-            command: pci.command().bits(),
-            bar_addrs,
-        }
+    /// Install the one-shot park a register write reaches once its
+    /// reset-latch check has passed.
+    #[cfg(test)]
+    fn park_write_after_latch_check(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.parks.write_checked.lock().expect("park lock poisoned") =
+            Some(hook);
     }
 
-    /// Replay BAR and command-register writes so bus registrations are restored.
-    fn restore_migrate_pci_state(
-        &self,
-        state: &vmm_devices::lifecycle::VirtioMigratePciState,
-    ) {
-        let mut bar_writes = Vec::with_capacity(7);
+    /// Install the one-shot park an MSI-X unmask reaches once it has
+    /// taken the message out of the pending array.
+    #[cfg(test)]
+    fn park_before_released_delivery(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .parks
+            .released_delivery_pending
+            .lock()
+            .expect("park lock poisoned") = Some(hook);
+    }
+
+    /// Install the one-shot park the post-restore kick reaches once it
+    /// has dropped the transport lock.
+    #[cfg(test)]
+    fn park_before_restore_kick(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .parks
+            .post_restore_kick_pending
+            .lock()
+            .expect("park lock poisoned") = Some(hook);
+    }
+
+    /// Install the one-shot park a config interrupt reaches once its
+    /// caller has dropped the transport lock.
+    #[cfg(test)]
+    fn park_before_config_interrupt(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .parks
+            .config_interrupt_pending
+            .lock()
+            .expect("park lock poisoned") = Some(hook);
+    }
+
+    /// Reset the device, on the vCPU that wrote DEVICE_STATUS.
+    ///
+    /// A legacy driver writes the register once and does not poll.
+    /// illumos `virtio_legacy_device_reset_locked()` is that one
+    /// write, and `virtio_shutdown()` reclaims the ring DMA straight
+    /// after it, so the write must not return while the backend can
+    /// still reach guest memory. A modern driver polls for 0 (VirtIO
+    /// 1.3 sec 4.1.4.3.1) and the same order satisfies it.
+    ///
+    /// The wait is short by construction. A backing-store operation
+    /// owns only host memory, so the backend reset ends the request
+    /// epoch and waits out the guest-memory accesses that hold it,
+    /// never the I/O behind them.
+    ///
+    /// The latch closes first because the transport lock is dropped
+    /// across the backend reset. While it is closed every register
+    /// write is dropped and `readable_status` reports non-zero, so a
+    /// second vCPU cannot act on a device that is half reset.
+    ///
+    /// The caller holds the transport lock, so the latch closes in the
+    /// same critical section that tested it.
+    fn reset_device(&self, mut vs: std::sync::MutexGuard<'_, VirtioPciState>) {
+        if vs.resetting {
+            return;
+        }
+        vs.resetting = true;
+        vs.status &= !bits::STATUS_DRIVER_OK;
+        vs.queue_enabled.fill(false);
+        // The driver session ends here, and interrupt admission shuts
+        // with it. An interrupt an earlier event asked for must not
+        // reach the driver that comes next. Admission stays shut for
+        // the whole of `finish_reset`, so nothing joins the set that
+        // reset has to wait out.
+        self.intr.end_session();
+        drop(vs);
+
+        self.finish_reset();
+    }
+
+    /// Finish the reset the guest asked for, and publish the result.
+    ///
+    /// The backend wait has no deadline. It covers guest-memory
+    /// accesses only, so it is bounded by construction, and a device
+    /// that gave up on one could not take back the write a worker had
+    /// already started into the guest chain.
+    fn finish_reset(&self) {
+        self.device.reset();
+
+        // Every delivery this session admitted has finished. Nothing
+        // joins them: admission shut before the backend reset, so the
+        // set is one injection per thread already inside and a guest
+        // cannot add threads.
+        //
+        // WHY THE COUNT IS THE ONLY BOUND: the set is finite, its
+        // members are not. Both injection ioctls take the VM lock as
+        // readers, and an illumos reader yields to a waiting writer.
+        // Memory hot-add holds that writer for hundreds of ms per GiB,
+        // so a reset that lands beside one waits for it. Measured at
+        // 1.3 us idle and 17.9 ms beside a 256 MiB hot-add. A deadline
+        // here would not help: admission is tested before the ioctl,
+        // so an injection already dispatched cannot be recalled, and
+        // returning early would put it in the next driver session.
+        // docs/hardware-run.md carries the measurement.
+        self.intr.settle();
+
+        // The next driver must find this device off the line, or it
+        // sees a spurious assertion when it enables the IOAPIC pin.
+        // The ISR and the pin move together, so a driver on another
+        // vCPU cannot read the ISR between them.
         {
-            let pci = self.pci_state.lock().expect("pci lock");
-            for (idx, addr) in state.bar_addrs.iter().copied().enumerate() {
-                let bar = BarN::try_from(idx as u8).expect("valid BAR index");
-                let Some((def, _)) = pci.bars().get(bar) else {
-                    continue;
-                };
-
-                let offset = vmm_devices::pci::bits::REG_BAR0 + (idx as u8 * 4);
-                match def {
-                    BarDefine::Pio(_) | BarDefine::Mmio(_) => {
-                        bar_writes.push((offset, addr as u32));
-                    }
-                    BarDefine::Mmio64(_) => {
-                        bar_writes.push((offset, addr as u32));
-                        bar_writes.push((offset + 4, (addr >> 32) as u32));
-                    }
-                }
-            }
+            let _line = self.intr.line();
+            self.isr_status
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.lower_interrupt();
         }
-
-        for (offset, value) in bar_writes {
-            self.cfg_write(offset, 4, value);
-        }
-        self.cfg_write(
-            vmm_devices::pci::bits::REG_COMMAND,
-            2,
-            u32::from(state.command),
-        );
-    }
-
-    // -- Modern transport: features --
-
-    /// Features advertised through the modern transport path.
-    ///
-    /// Device features already include EVENT_IDX and INDIRECT_DESC
-    /// for devices that support them (block, rng). Viona strips
-    /// EVENT_IDX since it handles rings in-kernel.
-    fn modern_features(&self) -> u64 {
-        self.device.device_features() | bits::VIRTIO_F_VERSION_1
-    }
-
-    // -- PCI capability chain read/write --
-
-    /// Whether this device presents a VIRTIO_PCI_CAP_DEVICE_CFG.
-    ///
-    /// VIRTIO 1.3 4.1.4.6 makes the capability conditional on the device
-    /// having device-specific configuration. virtio-rnd has none, and a
-    /// capability advertising length 0 is not merely ignored: Linux's
-    /// `map_capability()` rejects `length <= start` and fails the whole
-    /// probe with -EINVAL, so the device never binds.
-    fn has_device_cfg_cap(&self) -> bool {
-        self.dev_config_size != 0
-    }
-
-    /// Read a dword from a virtio PCI capability structure.
-    ///
-    /// Returns `Some(val)` if `offset` falls within a virtio or MSI-X
-    /// capability, `None` otherwise.
-    fn cap_chain_read(&self, offset: u8) -> Option<u32> {
-        let co = &self.cap_offsets;
-
-        // MSI-X capability (12 bytes)
-        if co.msix != 0 && offset >= co.msix && offset < co.msix + 12 {
-            if let Some(ref msix) = self.msix {
-                let mut val = msix.cap_read(offset, co.msix)?;
-                // Patch next-pointer: MSI-X byte 1 → first virtio cap
-                if offset == co.msix {
-                    val = (val & !0x0000_FF00) | (u32::from(co.common) << 8);
-                }
-                return Some(val);
-            }
-        }
-
-        // Virtio common config cap (16 bytes)
-        if offset >= co.common && offset < co.common + 16 {
-            return Some(self.read_virtio_cap(
-                offset - co.common,
-                bits::VIRTIO_PCI_CAP_COMMON_CFG,
-                co.notify,
-                bits::MODERN_BAR_IDX,
-                bits::MODERN_BAR_COMMON_OFFSET,
-                bits::COMMON_CFG_SIZE as u32,
-            ));
-        }
-
-        // Virtio notify cap (20 bytes)
-        if offset >= co.notify && offset < co.notify + 20 {
-            let rel = offset - co.notify;
-            if rel >= 16 {
-                // Extra dword: notify_off_multiplier = 0
-                return Some(0);
-            }
-            return Some(self.read_virtio_cap(
-                rel,
-                bits::VIRTIO_PCI_CAP_NOTIFY_CFG,
-                co.isr,
-                bits::MODERN_BAR_IDX,
-                bits::MODERN_BAR_NOTIFY_OFFSET,
-                4,
-            ));
-        }
-
-        // Virtio ISR cap (16 bytes)
-        if offset >= co.isr && offset < co.isr + 16 {
-            return Some(self.read_virtio_cap(
-                offset - co.isr,
-                bits::VIRTIO_PCI_CAP_ISR_CFG,
-                // With no device-specific config there is no device-config
-                // capability, so ISR ends the chain.
-                if self.has_device_cfg_cap() {
-                    co.device
-                } else {
-                    0
-                },
-                bits::MODERN_BAR_IDX,
-                bits::MODERN_BAR_ISR_OFFSET,
-                4,
-            ));
-        }
-
-        // Virtio device config cap (16 bytes)
-        if self.has_device_cfg_cap()
-            && offset >= co.device
-            && offset < co.device + 16
-        {
-            return Some(self.read_virtio_cap(
-                offset - co.device,
-                bits::VIRTIO_PCI_CAP_DEVICE_CFG,
-                0, // last in chain
-                bits::MODERN_BAR_IDX,
-                bits::MODERN_BAR_DEVICE_OFFSET,
-                u32::from(self.dev_config_size),
-            ));
-        }
-
-        None
-    }
-
-    /// Build a dword from a virtio_pci_cap structure at relative offset.
-    fn read_virtio_cap(
-        &self,
-        rel: u8,
-        cfg_type: u8,
-        next: u8,
-        bar: u8,
-        offset: u32,
-        length: u32,
-    ) -> u32 {
-        let dword_off = rel & 0xFC;
-        match dword_off {
-            // Byte 0: cap_vndr=0x09, Byte 1: cap_next, Byte 2: cap_len, Byte 3: cfg_type
-            0 => {
-                let cap_len = if cfg_type == bits::VIRTIO_PCI_CAP_NOTIFY_CFG {
-                    bits::VIRTIO_PCI_NOTIFY_CAP_SIZE
-                } else {
-                    bits::VIRTIO_PCI_CAP_SIZE
-                };
-                u32::from(bits::PCI_CAP_ID_VNDR)
-                    | (u32::from(next) << 8)
-                    | (u32::from(cap_len) << 16)
-                    | (u32::from(cfg_type) << 24)
-            }
-            // Byte 4: bar, Byte 5: id(0), Bytes 6-7: padding
-            4 => u32::from(bar),
-            // Bytes 8-11: offset within BAR
-            8 => offset,
-            // Bytes 12-15: length
-            12 => length,
-            _ => 0,
-        }
-    }
-
-    /// Handle writes to virtio PCI capabilities (mostly read-only).
-    fn cap_chain_write(&self, offset: u8, val: u32) {
-        let co = &self.cap_offsets;
-        // Only MSI-X has writable fields
-        if co.msix != 0 && offset >= co.msix && offset < co.msix + 12 {
-            if let Some(ref msix) = self.msix {
-                msix.cap_write(offset, co.msix, val);
-            }
-        }
-        // All virtio cap fields are read-only
-    }
-
-    // -- Modern transport: BAR2 MMIO handlers --
-
-    /// Handle a read from the modern config BAR (BAR2).
-    fn modern_bar_read(&self, offset: u16, len: usize) -> u32 {
-        let page = offset & 0xF000;
-        let reg = offset & 0x0FFF;
-
-        match page {
-            0x0000 => self.modern_common_read(reg, len),
-            0x1000 => self.device.cfg_read(reg, len as u8),
-            0x2000 => 0, // notify is write-only
-            0x3000 => {
-                // ISR status (same semantics as legacy: read clears)
-                let val = self
-                    .isr_status
-                    .swap(0, std::sync::atomic::Ordering::AcqRel);
-                if val != 0 {
-                    self.lower_interrupt();
-                    if self
-                        .isr_status
-                        .load(std::sync::atomic::Ordering::Acquire)
-                        != 0
-                    {
-                        self.raise_interrupt();
-                    }
-                }
-                u32::from(val)
-            }
-            _ => 0,
-        }
-    }
-
-    /// Handle a write to the modern config BAR (BAR2).
-    fn modern_bar_write(&self, offset: u16, val: u32, len: usize) {
-        let page = offset & 0xF000;
-        let reg = offset & 0x0FFF;
-
-        match page {
-            0x0000 => self.modern_common_write(reg, val, len),
-            0x1000 => self.device.cfg_write(reg, val, len as u8),
-            0x2000 => {
-                // Notification register: guest writes queue index
-                let queue_idx = val as u16;
-                let mut vs = self.virtio_state.lock().expect("virtio lock");
-                if vs.status & bits::STATUS_DRIVER_OK == 0 {
-                    return;
-                }
-                let did_work = self.device.notify_queue(
-                    queue_idx,
-                    &mut vs.queues,
-                    &self.physmap,
-                );
-                if did_work {
-                    self.isr_status.fetch_or(
-                        bits::ISR_QUEUE_INTR,
-                        std::sync::atomic::Ordering::Release,
-                    );
-                    drop(vs);
-                    self.raise_queue_interrupt_for(queue_idx);
-                }
-            }
-            0x3000 => {} // ISR is read-only
-            _ => {}
-        }
-    }
-
-    /// Read from the modern common configuration structure.
-    fn modern_common_read(&self, offset: u16, _len: usize) -> u32 {
-        let vs = self.virtio_state.lock().expect("virtio lock");
-
-        match offset {
-            bits::COMMON_CFG_DEVICE_FEATURE_SELECT => vs.device_feature_select,
-            bits::COMMON_CFG_DEVICE_FEATURE => {
-                let feats = self.modern_features();
-                match vs.device_feature_select {
-                    0 => feats as u32,
-                    1 => (feats >> 32) as u32,
-                    _ => 0,
-                }
-            }
-            bits::COMMON_CFG_DRIVER_FEATURE_SELECT => vs.driver_feature_select,
-            bits::COMMON_CFG_DRIVER_FEATURE => match vs.driver_feature_select {
-                0 => vs.guest_features as u32,
-                1 => (vs.guest_features >> 32) as u32,
-                _ => 0,
-            },
-            bits::COMMON_CFG_MSIX_CONFIG => u32::from(vs.config_msix_vector),
-            bits::COMMON_CFG_NUM_QUEUES => u32::from(self.num_queues),
-            bits::COMMON_CFG_DEVICE_STATUS => u32::from(vs.status),
-            bits::COMMON_CFG_CONFIG_GENERATION => {
-                u32::from(vs.config_generation)
-            }
-            bits::COMMON_CFG_QUEUE_SELECT => u32::from(vs.queue_select),
-            bits::COMMON_CFG_QUEUE_SIZE => vs
-                .selected_queue()
-                .map(|q| u32::from(q.size()))
-                .unwrap_or(0),
-            bits::COMMON_CFG_QUEUE_MSIX_VECTOR => {
-                let idx = vs.queue_select as usize;
-                u32::from(
-                    vs.queue_msix_vectors
-                        .get(idx)
-                        .copied()
-                        .unwrap_or(bits::VIRTIO_MSI_NO_VECTOR),
-                )
-            }
-            bits::COMMON_CFG_QUEUE_ENABLE => {
-                let idx = vs.queue_select as usize;
-                u32::from(
-                    vs.queue_enabled.get(idx).copied().unwrap_or(false) as u16
-                )
-            }
-            bits::COMMON_CFG_QUEUE_NOTIFY_OFF => {
-                // With multiplier=0, all queues notify at the same offset
-                u32::from(vs.queue_select)
-            }
-            bits::COMMON_CFG_QUEUE_DESC_LO => {
-                let idx = vs.queue_select as usize;
-                vs.queue_desc.get(idx).copied().unwrap_or(0) as u32
-            }
-            bits::COMMON_CFG_QUEUE_DESC_HI => {
-                let idx = vs.queue_select as usize;
-                (vs.queue_desc.get(idx).copied().unwrap_or(0) >> 32) as u32
-            }
-            bits::COMMON_CFG_QUEUE_AVAIL_LO => {
-                let idx = vs.queue_select as usize;
-                vs.queue_avail.get(idx).copied().unwrap_or(0) as u32
-            }
-            bits::COMMON_CFG_QUEUE_AVAIL_HI => {
-                let idx = vs.queue_select as usize;
-                (vs.queue_avail.get(idx).copied().unwrap_or(0) >> 32) as u32
-            }
-            bits::COMMON_CFG_QUEUE_USED_LO => {
-                let idx = vs.queue_select as usize;
-                vs.queue_used.get(idx).copied().unwrap_or(0) as u32
-            }
-            bits::COMMON_CFG_QUEUE_USED_HI => {
-                let idx = vs.queue_select as usize;
-                (vs.queue_used.get(idx).copied().unwrap_or(0) >> 32) as u32
-            }
-            _ => 0,
-        }
-    }
-
-    /// Write to the modern common configuration structure.
-    // Virtio 1.3 section 3.1.1 requires FEATURES_OK validation here. The two
-    // paths must remain distinct until the correct behavior has a guest test
-    // matrix covering accepted and rejected feature sets.
-    #[allow(clippy::if_same_then_else)]
-    fn modern_common_write(&self, offset: u16, val: u32, _len: usize) {
-        let mut vs = self.virtio_state.lock().expect("virtio lock");
-
-        match offset {
-            bits::COMMON_CFG_DEVICE_FEATURE_SELECT => {
-                vs.device_feature_select = val;
-            }
-            bits::COMMON_CFG_DRIVER_FEATURE_SELECT => {
-                vs.driver_feature_select = val;
-            }
-            bits::COMMON_CFG_DRIVER_FEATURE => {
-                // Write the selected 32-bit half of driver features.
-                let offered = self.modern_features();
-                match vs.driver_feature_select {
-                    0 => {
-                        let accepted = val & (offered as u32);
-                        vs.guest_features = (vs.guest_features
-                            & 0xFFFF_FFFF_0000_0000)
-                            | u64::from(accepted);
-                    }
-                    1 => {
-                        let accepted = val & ((offered >> 32) as u32);
-                        vs.guest_features = (vs.guest_features
-                            & 0x0000_0000_FFFF_FFFF)
-                            | (u64::from(accepted) << 32);
-                    }
-                    _ => {}
-                }
-                // Propagate to device and queues
-                let features = vs.guest_features;
-                self.device.set_features(features);
-                let event_idx = features & bits::VIRTIO_F_RING_EVENT_IDX != 0;
-                let indirect =
-                    features & bits::VIRTIO_F_RING_INDIRECT_DESC != 0;
-                for q in &mut vs.queues {
-                    q.set_event_idx(event_idx);
-                    q.set_indirect_supported(indirect);
-                }
-            }
-            bits::COMMON_CFG_MSIX_CONFIG => {
-                vs.config_msix_vector = val as u16;
-                self.msix_config_vector
-                    .store(val as u16, std::sync::atomic::Ordering::Release);
-            }
-            bits::COMMON_CFG_DEVICE_STATUS => {
-                let new_status = val as u8;
-                if new_status == 0 {
-                    vs.reset();
-                    self.device.reset();
-                    self.isr_status
-                        .store(0, std::sync::atomic::Ordering::Relaxed);
-                    // Clear atomic MSI-X vector cache
-                    self.msix_config_vector.store(
-                        bits::VIRTIO_MSI_NO_VECTOR,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    for a in &self.msix_queue_vectors {
-                        a.store(
-                            bits::VIRTIO_MSI_NO_VECTOR,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                    }
-                    drop(vs);
-                    self.lower_interrupt();
-                } else {
-                    if new_status & bits::STATUS_FEATURES_OK != 0
-                        && vs.status & bits::STATUS_FEATURES_OK == 0
-                    {
-                        vs.status = new_status;
-                    } else {
-                        vs.status = new_status;
-                    }
-                }
-            }
-            bits::COMMON_CFG_QUEUE_SELECT => {
-                vs.queue_select = val as u16;
-            }
-            bits::COMMON_CFG_QUEUE_SIZE => {
-                // Modern transport allows writing queue size (power of 2).
-                // We accept only if it equals our fixed size (simplification).
-            }
-            bits::COMMON_CFG_QUEUE_MSIX_VECTOR => {
-                let idx = vs.queue_select as usize;
-                if idx < vs.queue_msix_vectors.len() {
-                    vs.queue_msix_vectors[idx] = val as u16;
-                    if let Some(a) = self.msix_queue_vectors.get(idx) {
-                        a.store(
-                            val as u16,
-                            std::sync::atomic::Ordering::Release,
-                        );
-                    }
-                }
-            }
-            bits::COMMON_CFG_QUEUE_ENABLE => {
-                let idx = vs.queue_select as usize;
-                if idx < vs.queue_enabled.len() && val == 1 {
-                    // Enable the queue: apply the stored addresses
-                    vs.queue_enabled[idx] = true;
-                    let desc = vs.queue_desc[idx];
-                    let avail = vs.queue_avail[idx];
-                    let used = vs.queue_used[idx];
-                    if let Some(q) = vs.queues.get_mut(idx) {
-                        q.set_addr_modern(desc, avail, used);
-                        self.device.queue_addr_set(idx as u16, q);
-                    }
-                }
-            }
-            bits::COMMON_CFG_QUEUE_DESC_LO => {
-                let idx = vs.queue_select as usize;
-                if let Some(a) = vs.queue_desc.get_mut(idx) {
-                    *a = (*a & 0xFFFF_FFFF_0000_0000) | u64::from(val);
-                }
-            }
-            bits::COMMON_CFG_QUEUE_DESC_HI => {
-                let idx = vs.queue_select as usize;
-                if let Some(a) = vs.queue_desc.get_mut(idx) {
-                    *a = (*a & 0x0000_0000_FFFF_FFFF) | (u64::from(val) << 32);
-                }
-            }
-            bits::COMMON_CFG_QUEUE_AVAIL_LO => {
-                let idx = vs.queue_select as usize;
-                if let Some(a) = vs.queue_avail.get_mut(idx) {
-                    *a = (*a & 0xFFFF_FFFF_0000_0000) | u64::from(val);
-                }
-            }
-            bits::COMMON_CFG_QUEUE_AVAIL_HI => {
-                let idx = vs.queue_select as usize;
-                if let Some(a) = vs.queue_avail.get_mut(idx) {
-                    *a = (*a & 0x0000_0000_FFFF_FFFF) | (u64::from(val) << 32);
-                }
-            }
-            bits::COMMON_CFG_QUEUE_USED_LO => {
-                let idx = vs.queue_select as usize;
-                if let Some(a) = vs.queue_used.get_mut(idx) {
-                    *a = (*a & 0xFFFF_FFFF_0000_0000) | u64::from(val);
-                }
-            }
-            bits::COMMON_CFG_QUEUE_USED_HI => {
-                let idx = vs.queue_select as usize;
-                if let Some(a) = vs.queue_used.get_mut(idx) {
-                    *a = (*a & 0x0000_0000_FFFF_FFFF) | (u64::from(val) << 32);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Assert the legacy interrupt to notify the guest.
-    ///
-    /// Uses edge-triggered delivery: deassert then reassert to generate
-    /// a new edge. The PciIntrPin calls `vm_isa_assert_irq(atpic, ioapic)`
-    /// which delivers through both the legacy PIC and IOAPIC paths.
-    ///
-    /// Assert the PCI interrupt pin (level-triggered).
-    ///
-    /// PCI INTx is level-triggered: assert when work is pending,
-    /// deassert when the guest reads ISR (clears the pending flag).
-    /// No deassert here — that prevents the spurious IRQ race where
-    /// deassert+assert creates a second edge that the guest sees
-    /// with ISR=0, causing "nobody cared" → IRQ disable.
-    pub fn raise_interrupt(&self) {
-        if let Some(pin) = &self.intr_pin {
-            pin.assert();
-        }
-    }
-
-    /// Raise a queue interrupt: set ISR status and assert the pin.
-    ///
-    /// Uses AtomicU8 for ISR to avoid locking virtio_state on the
-    /// hot path. Workers and vCPU can set ISR concurrently without
-    /// Mutex contention.
-    pub fn raise_queue_interrupt(&self) {
-        self.isr_status.fetch_or(
-            bits::ISR_QUEUE_INTR,
-            std::sync::atomic::Ordering::Release,
-        );
-        self.raise_interrupt();
-    }
-
-    /// Deassert the interrupt after ISR is read or on device reset.
-    fn lower_interrupt(&self) {
-        if let Some(pin) = &self.intr_pin {
-            pin.deassert();
-        }
-    }
-
-    /// Return the BAR0 offset where device-specific config begins.
-    ///
-    /// With MSI-X, two extra 16-bit vector registers are inserted
-    /// between ISR and device config (at 0x14 and 0x16), pushing
-    /// device config to 0x18.
-    fn device_config_offset(&self) -> u16 {
-        if self.msix.is_some() {
-            bits::LEGACY_REG_DEVICE_CONFIG_MSIX
-        } else {
-            bits::LEGACY_REG_DEVICE_CONFIG
-        }
-    }
-
-    /// Raise an interrupt for a specific queue, routing via MSI-X
-    /// when available or falling back to legacy INTx.
-    pub fn raise_queue_interrupt_for(&self, queue_idx: u16) {
+        // Messages the old session left pending would otherwise leave
+        // on the next unmask, which is a guest write this reset does
+        // not gate.
         if let Some(ref msix) = self.msix {
-            // Read vector from lock-free atomic cache (no virtio_state lock
-            // needed — safe to call from inside notify_queue callbacks).
-            let vector = self
-                .msix_queue_vectors
-                .get(queue_idx as usize)
-                .map(|a| a.load(std::sync::atomic::Ordering::Acquire))
-                .unwrap_or(bits::VIRTIO_MSI_NO_VECTOR);
-            if vector != bits::VIRTIO_MSI_NO_VECTOR {
-                msix.fire(vector);
-                return;
-            }
+            msix.clear_pending();
         }
-        // No MSI-X vector for this queue, so fall back to legacy INTx.
-        // This is normal operation, not an error: a guest built without
-        // CONFIG_PCI_MSI never assigns a vector, and this runs once per
-        // interrupt, so it must stay silent and lock-free.
-        self.raise_queue_interrupt();
-    }
 
-    /// Signal a device configuration change to the guest.
-    #[allow(dead_code)]
-    pub fn signal_config_change(&self) {
-        if let Some(ref msix) = self.msix {
-            let vector = self
-                .msix_config_vector
-                .load(std::sync::atomic::Ordering::Acquire);
-            if vector != bits::VIRTIO_MSI_NO_VECTOR {
-                msix.fire(vector);
-                return;
-            }
-        }
-        self.isr_status.fetch_or(
-            bits::ISR_CFG_CHANGE,
-            std::sync::atomic::Ordering::Release,
+        let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
+        vs.reset();
+        // Clear atomic MSI-X vector cache
+        self.msix_config_vector.store(
+            bits::VIRTIO_MSI_NO_VECTOR,
+            std::sync::atomic::Ordering::Relaxed,
         );
-        self.raise_interrupt();
+        for a in &self.msix_queue_vectors {
+            a.store(
+                bits::VIRTIO_MSI_NO_VECTOR,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        // Status 0 and the open latch reach the guest together. The
+        // driver writes ACKNOWLEDGE next, and that write must not meet
+        // a latch that is still closed. Interrupt admission reopens in
+        // the same critical section, so no register write can get
+        // through before deliveries are being admitted again.
+        vs.resetting = false;
+        self.intr.reopen();
+        drop(vs);
     }
 
     /// Signal the guest that the device needs a reset.
-    #[allow(dead_code)]
+    ///
+    /// A reset in flight takes the device down anyway, so the bit is
+    /// dropped rather than written onto the session that follows.
     pub fn signal_device_needs_reset(&self) {
-        let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
+        let Some(mut vs) = self.lock_for_write() else {
+            return;
+        };
         vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
+        let session = self.intr.session();
         drop(vs);
-        self.isr_status.fetch_or(
-            bits::ISR_CFG_CHANGE,
-            std::sync::atomic::Ordering::Release,
-        );
-        self.raise_interrupt();
-    }
-
-    /// Handle a read from the legacy virtio config BAR.
-    fn bar_read(&self, offset: u16, len: usize) -> u32 {
-        let vs = self.virtio_state.lock().expect("virtio lock poisoned");
-
-        let dev_cfg_off = self.device_config_offset();
-        if offset >= dev_cfg_off {
-            // Device-specific config read
-            let dev_offset = offset - dev_cfg_off;
-            return self.device.cfg_read(dev_offset, len as u8);
-        }
-
-        match offset {
-            bits::LEGACY_REG_DEVICE_FEATURES => {
-                // Truncate to 32-bit for legacy transport.
-                // Strip EVENT_IDX and INDIRECT_DESC: these cause
-                // deadlock with legacy transport on Linux 6.14.
-                // They are available via the modern BAR2 path.
-                (self.device.device_features() as u32)
-                    & !bits::VIRTIO_F_RING_EVENT_IDX_U32
-                    & !bits::VIRTIO_F_RING_INDIRECT_DESC_U32
-            }
-            bits::LEGACY_REG_GUEST_FEATURES => vs.guest_features_u32(),
-            bits::LEGACY_REG_QUEUE_PFN => {
-                vs.selected_queue().map(|q| q.pfn()).unwrap_or(0)
-            }
-            bits::LEGACY_REG_QUEUE_SIZE => vs
-                .selected_queue()
-                .map(|q| u32::from(q.size()))
-                .unwrap_or(0),
-            bits::LEGACY_REG_QUEUE_SELECT => u32::from(vs.queue_select),
-            bits::LEGACY_REG_QUEUE_NOTIFY => {
-                // Write-only register, read returns 0
-                0
-            }
-            bits::LEGACY_REG_DEVICE_STATUS => u32::from(vs.status),
-            bits::LEGACY_REG_ISR_STATUS => {
-                // Atomic swap: read and clear ISR in one operation.
-                let val = self
-                    .isr_status
-                    .swap(0, std::sync::atomic::Ordering::AcqRel);
-                if val != 0 {
-                    drop(vs);
-                    self.lower_interrupt();
-                    // Re-check: a worker may have set ISR between our
-                    // swap and deassert. If so, re-assert the pin so
-                    // the guest gets another interrupt for the new work.
-                    if self
-                        .isr_status
-                        .load(std::sync::atomic::Ordering::Acquire)
-                        != 0
-                    {
-                        self.raise_interrupt();
-                    }
-                    return u32::from(val);
-                }
-                0
-            }
-            bits::LEGACY_REG_MSIX_CONFIG_VECTOR if self.msix.is_some() => {
-                u32::from(vs.config_msix_vector)
-            }
-            bits::LEGACY_REG_MSIX_QUEUE_VECTOR if self.msix.is_some() => {
-                let idx = vs.queue_select as usize;
-                u32::from(
-                    vs.queue_msix_vectors
-                        .get(idx)
-                        .copied()
-                        .unwrap_or(bits::VIRTIO_MSI_NO_VECTOR),
-                )
-            }
-            _ => 0,
-        }
-    }
-
-    /// Handle a write to the legacy virtio config BAR.
-    fn bar_write(&self, offset: u16, val: u32, len: usize) {
-        let mut vs = self.virtio_state.lock().expect("virtio lock poisoned");
-
-        let dev_cfg_off = self.device_config_offset();
-        if offset >= dev_cfg_off {
-            // Device-specific config write
-            let dev_offset = offset - dev_cfg_off;
-            self.device.cfg_write(dev_offset, val, len as u8);
-            return;
-        }
-
-        match offset {
-            bits::LEGACY_REG_DEVICE_FEATURES => {
-                // Read-only register, ignore writes
-            }
-            bits::LEGACY_REG_GUEST_FEATURES => {
-                // Mask: only accept features the device offered via legacy.
-                // Strip EVENT_IDX/INDIRECT_DESC from legacy offered set.
-                let offered = (self.device.device_features() as u32)
-                    & !bits::VIRTIO_F_RING_EVENT_IDX_U32
-                    & !bits::VIRTIO_F_RING_INDIRECT_DESC_U32;
-                let accepted = val & offered;
-                vs.guest_features = u64::from(accepted);
-                self.device.set_features(u64::from(accepted));
-
-                // Propagate event_idx and indirect_supported to all
-                // queues so they know the negotiated capabilities.
-                let accepted64 = vs.guest_features;
-                let event_idx = accepted64 & bits::VIRTIO_F_RING_EVENT_IDX != 0;
-                let indirect =
-                    accepted64 & bits::VIRTIO_F_RING_INDIRECT_DESC != 0;
-                for q in &mut vs.queues {
-                    q.set_event_idx(event_idx);
-                    q.set_indirect_supported(indirect);
-                }
-            }
-            bits::LEGACY_REG_QUEUE_PFN => {
-                let queue_sel = vs.queue_select;
-                if let Some(q) = vs.selected_queue_mut() {
-                    q.set_addr_legacy(val);
-                    // Notify the device of the new queue address
-                    // (kernel-accelerated devices need to program
-                    // their ring addresses at this point)
-                    self.device.queue_addr_set(queue_sel, q);
-                }
-            }
-            bits::LEGACY_REG_QUEUE_SELECT => {
-                vs.queue_select = val as u16;
-            }
-            bits::LEGACY_REG_QUEUE_NOTIFY => {
-                let queue_idx = val as u16;
-                if vs.status & bits::STATUS_DRIVER_OK == 0 {
-                    return;
-                }
-                let did_work = self.device.notify_queue(
-                    queue_idx,
-                    &mut vs.queues,
-                    &self.physmap,
-                );
-                if did_work {
-                    drop(vs);
-                    self.raise_queue_interrupt_for(queue_idx);
-                }
-            }
-            bits::LEGACY_REG_DEVICE_STATUS => {
-                let new_status = val as u8;
-                if new_status == 0 {
-                    vs.reset();
-                    self.device.reset();
-                    self.isr_status
-                        .store(0, std::sync::atomic::Ordering::Relaxed);
-                    self.msix_config_vector.store(
-                        bits::VIRTIO_MSI_NO_VECTOR,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    for a in &self.msix_queue_vectors {
-                        a.store(
-                            bits::VIRTIO_MSI_NO_VECTOR,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                    }
-                    drop(vs);
-                    // Ensure interrupt line is low on reset so the
-                    // next driver doesn't see a spurious assertion
-                    // when it enables the IOAPIC pin.
-                    self.lower_interrupt();
-                } else {
-                    // FEATURES_OK validation (VirtIO 1.3 sec 2.2):
-                    // If the driver sets FEATURES_OK, verify the
-                    // negotiated feature subset is acceptable. If
-                    // not, clear FEATURES_OK so the driver sees the
-                    // rejection on re-read.
-                    if new_status & bits::STATUS_FEATURES_OK != 0
-                        && vs.status & bits::STATUS_FEATURES_OK == 0
-                    {
-                        // Accept all subsets for now — reject only if
-                        // a future device requires mandatory features.
-                        vs.status = new_status;
-                    } else {
-                        vs.status = new_status;
-                    }
-                }
-            }
-            bits::LEGACY_REG_ISR_STATUS => {
-                // Read-only register, ignore writes
-            }
-            bits::LEGACY_REG_MSIX_CONFIG_VECTOR if self.msix.is_some() => {
-                vs.config_msix_vector = val as u16;
-                self.msix_config_vector
-                    .store(val as u16, std::sync::atomic::Ordering::Release);
-            }
-            bits::LEGACY_REG_MSIX_QUEUE_VECTOR if self.msix.is_some() => {
-                let idx = vs.queue_select as usize;
-                if idx < vs.queue_msix_vectors.len() {
-                    vs.queue_msix_vectors[idx] = val as u16;
-                    if let Some(a) = self.msix_queue_vectors.get(idx) {
-                        a.store(
-                            val as u16,
-                            std::sync::atomic::Ordering::Release,
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
-    fn cfg_read(&self, offset: u8, len: u8) -> u32 {
-        // Check capability chain (virtio caps + MSI-X) first.
-        // cap_chain_read works on dword-aligned offsets, so align
-        // and extract the requested bytes afterwards.
-        if offset >= 0x40 {
-            let dword_off = offset & 0xFC;
-            let byte_off = (offset & 0x03) as u32;
-            if let Some(dword_val) = self.cap_chain_read(dword_off) {
-                let mask = match len {
-                    1 => 0xFF,
-                    2 => 0xFFFF,
-                    _ => 0xFFFF_FFFF,
-                };
-                return (dword_val >> (byte_off * 8)) & mask;
-            }
-        }
-        self.pci_state
-            .lock()
-            .expect("pci lock poisoned")
-            .cfg_read(offset, len)
-    }
-
-    fn cfg_write(&self, offset: u8, len: u8, val: u32) {
-        // Handle capability chain writes (MSI-X has writable fields).
-        // Sub-dword writes need read-modify-write: read the current
-        // capability dword, merge the written bytes, then pass the
-        // full dword so cap_write sees fields at their correct bit
-        // positions (e.g., Message Control at bits 31:16).
-        if offset >= 0x40 {
-            let dword_off = offset & 0xFC;
-            let byte_in_dword = (offset & 0x03) as u32;
-            let dword_val = if len < 4 {
-                let cur = self.cap_chain_read(dword_off).unwrap_or(0);
-                let shift = byte_in_dword * 8;
-                let mask = match len {
-                    1 => 0xFFu32 << shift,
-                    2 => 0xFFFFu32 << shift,
-                    _ => 0xFFFF_FFFFu32,
-                };
-                (cur & !mask) | ((val << shift) & mask)
-            } else {
-                val
-            };
-            self.cap_chain_write(dword_off, dword_val);
-        }
-        let mut pci = self.pci_state.lock().expect("pci lock poisoned");
-        pci.cfg_write(offset, len, val);
-
-        // After any config write that could affect BARs or command
-        // register, update PIO and MMIO bus registrations.
-        let dword_off = offset & 0xFC;
-        if dword_off == 0x04 || (0x10..=0x24).contains(&dword_off) {
-            let weak = self.self_ref.lock().expect("self_ref lock");
-            if let Some(arc_self) = weak.as_ref().and_then(|w| w.upgrade()) {
-                drop(pci);
-                let pci_ref = arc_self.pci_state.lock().expect("pci lock");
-                arc_self.update_bar_registration(&pci_ref);
-                arc_self.update_mmio_registration(&pci_ref);
-            }
-        }
-    }
-
-    fn bar_rw(&self, bar: BarN, offset: usize, rwo: RWOp<'_>) {
-        // BAR4: MSI-X table + PBA access
-        if bar == BarN::BAR4 {
-            if let Some(ref msix) = self.msix {
-                let pba_offset = msix.pba_offset();
-                match rwo {
-                    RWOp::Read(ro) => {
-                        let val = if offset >= pba_offset {
-                            msix.pba_read(offset - pba_offset)
-                        } else {
-                            msix.table_read(offset)
-                        };
-                        match ro.len() {
-                            1 => ro.write_u8(val as u8),
-                            2 => ro.write_u16(val as u16),
-                            4 => ro.write_u32(val),
-                            _ => ro.write_u32(val),
-                        }
-                    }
-                    RWOp::Write(wo) => {
-                        let val = match wo.len() {
-                            1 => u32::from(wo.read_u8()),
-                            2 => u32::from(wo.read_u16()),
-                            4 => wo.read_u32(),
-                            _ => wo.read_u32(),
-                        };
-                        if offset < pba_offset {
-                            msix.table_write(offset, val);
-                        }
-                    }
-                }
-            }
-            return;
-        }
-
-        // BAR2: Modern transport config (MMIO)
-        if bar == BarN::BAR2 {
-            match rwo {
-                RWOp::Read(ro) => {
-                    let val = self.modern_bar_read(offset as u16, ro.len());
-                    match ro.len() {
-                        1 => ro.write_u8(val as u8),
-                        2 => ro.write_u16(val as u16),
-                        4 => ro.write_u32(val),
-                        _ => ro.write_u32(val),
-                    }
-                }
-                RWOp::Write(wo) => {
-                    let val = match wo.len() {
-                        1 => u32::from(wo.read_u8()),
-                        2 => u32::from(wo.read_u16()),
-                        4 => wo.read_u32(),
-                        _ => wo.read_u32(),
-                    };
-                    self.modern_bar_write(offset as u16, val, wo.len());
-                }
-            }
-            return;
-        }
-
-        // BAR0: Legacy transport config (PIO)
-        if bar != BarN::BAR0 {
-            return;
-        }
-
-        match rwo {
-            RWOp::Read(ro) => {
-                let val = self.bar_read(offset as u16, ro.len());
-                match ro.len() {
-                    1 => ro.write_u8(val as u8),
-                    2 => ro.write_u16(val as u16),
-                    4 => ro.write_u32(val),
-                    _ => ro.write_u32(val),
-                }
-            }
-            RWOp::Write(wo) => {
-                let val = match wo.len() {
-                    1 => u32::from(wo.read_u8()),
-                    2 => u32::from(wo.read_u16()),
-                    4 => wo.read_u32(),
-                    _ => wo.read_u32(),
-                };
-                self.bar_write(offset as u16, val, wo.len());
-            }
-        }
-    }
-
-    fn detach_regions(&self) {
-        {
-            let mut reg =
-                self.registered_bar.lock().expect("bar lock poisoned");
-            self.release_pio(&mut reg);
-        }
-        {
-            let mut reg = self.registered_bar2.lock().expect("bar2 lock");
-            self.release_mmio(BarN::BAR2, &mut reg);
-        }
-        {
-            let mut reg = self.registered_bar4.lock().expect("bar4 lock");
-            self.release_mmio(BarN::BAR4, &mut reg);
-        }
+        self.raise_config_interrupt_in(session);
     }
 }
 
@@ -1524,7 +721,7 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
     }
 
     fn halt(&self) {
-        Lifecycle::halt(&self.device)
+        Lifecycle::halt(&self.device);
     }
 
     fn pause_for_migration(&self) {
@@ -1542,15 +739,26 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
         // Re-inject interrupts on all enabled queues after vCPUs are
         // running. This ensures the guest's NAPI handler runs and
         // replenishes rx buffers.
+        //
+        // WHY the session comes from under the lock: this runs on its
+        // own thread for about a second after the vCPUs start, so the
+        // guest can reset the device between the queue set being read
+        // and the raise. A reset takes this same lock to end the
+        // session, so a session sampled here names the driver whose
+        // queues were just read, and one that no longer exists is
+        // refused rather than written onto the driver that followed.
         let vs = self.virtio_state.lock().expect("virtio lock");
+        let session = self.intr.session();
         let enabled: Vec<u16> = (0..self.num_queues)
             .filter(|&idx| {
                 vs.queue_enabled.get(idx as usize).copied().unwrap_or(false)
             })
             .collect();
         drop(vs);
+        #[cfg(test)]
+        run_park(&self.parks.post_restore_kick_pending);
         for idx in enabled {
-            self.raise_queue_interrupt_for(idx);
+            self.raise_queue_interrupt_in(session, idx);
         }
     }
 
@@ -1561,1409 +769,19 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
     fn export_virtio_state(
         &self,
     ) -> Vec<vmm_devices::lifecycle::VirtioMigrateQueue> {
-        use vmm_devices::lifecycle::VirtioMigrateQueue;
-        // Ring threads are already paused by pause_for_migration()
-        // which runs BEFORE vCPU pause. This ensures the guest's
-        // descriptor state is consistent with the kernel's indices.
-        let vs = self.virtio_state.lock().expect("virtio lock");
-        let pci_state = self.export_migrate_pci_state();
-        let mut result = Vec::new();
-        for idx in 0..self.num_queues as usize {
-            let q = &vs.queues[idx];
-            if q.is_configured() {
-                let (k_avail, k_used) =
-                    self.device.get_kernel_ring_indices(idx as u16);
-                // For software devices (blk), read used_idx from guest
-                // memory because VirtioCompletion manages the used ring
-                // separately from VirtQueue's shadow_used_idx.
-                let used_idx = if k_used != 0 {
-                    k_used
-                } else {
-                    let guest_used = q.read_used_ring_idx(&self.physmap);
-                    if guest_used != 0 {
-                        guest_used
-                    } else {
-                        q.shadow_used_idx()
-                    }
-                };
-                // For kernel-managed queues (viona), use the kernel's
-                // actual consumed position (k_avail). The delta between
-                // k_avail and guest memory's avail_ring->idx represents
-                // entries the guest posted but the kernel hasn't consumed.
-                // On the dest, these entries are immediately available —
-                // their descriptors are valid (guest set them up, kernel
-                // hasn't touched them). Using guest memory's avail_ring->idx
-                // instead would make the dest kernel see 0 available
-                // entries, requiring complex workarounds.
-                let avail_idx = if k_used != 0 {
-                    k_avail
-                } else {
-                    q.last_avail_idx()
-                };
-
-                // Get MSI-X entry for this queue's vector
-                let vector = self
-                    .msix_queue_vectors
-                    .get(idx)
-                    .map(|a| a.load(std::sync::atomic::Ordering::Acquire))
-                    .unwrap_or(bits::VIRTIO_MSI_NO_VECTOR);
-                let (msix_addr, msix_data) = if let Some(ref msix) = self.msix {
-                    if vector != bits::VIRTIO_MSI_NO_VECTOR {
-                        msix.read_entry(vector)
-                    } else {
-                        (0, 0)
-                    }
-                } else {
-                    (0, 0)
-                };
-
-                result.push(VirtioMigrateQueue {
-                    queue_idx: idx as u16,
-                    queue_size: q.size(),
-                    desc_addr: q.desc_addr(),
-                    avail_addr: q.avail_addr(),
-                    used_addr: q.used_addr(),
-                    enabled: vs
-                        .queue_enabled
-                        .get(idx)
-                        .copied()
-                        .unwrap_or(false),
-                    features: vs.guest_features,
-                    avail_idx,
-                    used_idx,
-                    msix_addr,
-                    msix_data: msix_data as u32,
-                    msix_vector: vector,
-                    pci_state: Some(pci_state.clone()),
-                });
-                // Detailed ring state dump for migration debugging
-                let guest_avail = q.read_avail_idx(&self.physmap);
-                let guest_used = q.read_used_ring_idx(&self.physmap);
-                eprintln!("[virtio-export] q={} k_avail={} k_used={} guest_avail={} guest_used={} export_avail={} export_used={}",
-                    idx, k_avail, k_used, guest_avail, guest_used, avail_idx, used_idx);
-                if k_used != 0 && k_avail == guest_avail {
-                    // Fully drained — dump avail ring entries to see descriptor IDs
-                    let qsize = q.size();
-                    let mut ids = Vec::new();
-                    for slot in 0..qsize.min(16) {
-                        let gpa = q.avail_addr() + 4 + u64::from(slot) * 2;
-                        if let Some(id) = self
-                            .physmap
-                            .lookup(gpa, 2)
-                            .and_then(|s| s.read::<u16>().ok())
-                        {
-                            ids.push(id);
-                        }
-                    }
-                    eprintln!(
-                        "[virtio-export] q={} DRAINED avail_ring[0..15]={:?}",
-                        idx, ids
-                    );
-                }
-            }
-        }
-        result
+        self.export_migrate_queues()
     }
 
     fn restore_virtio_state(
         &self,
         states: &[vmm_devices::lifecycle::VirtioMigrateQueue],
     ) {
-        // Group by queue_idx=0 starts, find group matching our queue count
-        let my_nq = self.num_queues as usize;
-        let matching: Vec<_> = {
-            let mut groups: Vec<Vec<_>> = Vec::new();
-            let mut cur: Vec<_> = Vec::new();
-            for s in states {
-                if s.queue_idx == 0 && !cur.is_empty() {
-                    groups.push(std::mem::take(&mut cur));
-                }
-                cur.push(s.clone());
-            }
-            if !cur.is_empty() {
-                groups.push(cur);
-            }
-            groups
-                .into_iter()
-                .find(|g| g.len() == my_nq)
-                .unwrap_or_default()
-        };
-
-        if let Some(pci_state) =
-            matching.iter().find_map(|qs| qs.pci_state.as_ref())
-        {
-            eprintln!(
-                "[virtio-restore] restoring PCI: cmd={:#x} bars={:?}",
-                pci_state.command, pci_state.bar_addrs
-            );
-            self.restore_migrate_pci_state(pci_state);
-        } else {
-            eprintln!(
-                "[virtio-restore] NO pci_state in matching queues (nq={})",
-                my_nq
-            );
-        }
-
-        let mut vs = self.virtio_state.lock().expect("virtio lock");
-        self.device.reset_all_rings();
-
-        for qs in &matching {
-            let idx = qs.queue_idx as usize;
-            if idx >= vs.queues.len() {
-                continue;
-            }
-
-            if vs.guest_features == 0 && qs.features != 0 {
-                vs.guest_features = qs.features;
-                self.device.set_features(qs.features);
-                // Propagate ring feature flags to all queues — the
-                // normal guest write path does this in the feature
-                // register handler, but restore bypasses it. Without
-                // this, indirect_supported stays false and
-                // collect_chain() silently drops every indirect
-                // descriptor request (all Linux virtio-blk I/O).
-                let event_idx =
-                    qs.features & bits::VIRTIO_F_RING_EVENT_IDX != 0;
-                let indirect =
-                    qs.features & bits::VIRTIO_F_RING_INDIRECT_DESC != 0;
-                for q in &mut vs.queues {
-                    q.set_event_idx(event_idx);
-                    q.set_indirect_supported(indirect);
-                }
-            }
-
-            vs.queues[idx].set_addr_modern(
-                qs.desc_addr,
-                qs.avail_addr,
-                qs.used_addr,
-            );
-            // Restore ring indices for software-emulated devices.
-            // set_addr_modern resets indices to 0, but after migration
-            // we need to continue from the source's position.
-            vs.queues[idx].set_last_avail_idx(qs.avail_idx);
-            vs.queues[idx].set_shadow_used_idx(qs.used_idx);
-            eprintln!("[virtio-restore] q={} avail_idx={} used_idx={} addrs={:#x}/{:#x}/{:#x}",
-                qs.queue_idx, qs.avail_idx, qs.used_idx,
-                qs.desc_addr, qs.avail_addr, qs.used_addr);
-            if idx < vs.queue_desc.len() {
-                vs.queue_desc[idx] = qs.desc_addr;
-                vs.queue_avail[idx] = qs.avail_addr;
-                vs.queue_used[idx] = qs.used_addr;
-            }
-            if idx < vs.queue_enabled.len() {
-                vs.queue_enabled[idx] = qs.enabled;
-            }
-
-            // Restore MSI-X vector mapping for this queue
-            if qs.msix_vector != bits::VIRTIO_MSI_NO_VECTOR {
-                if idx < vs.queue_msix_vectors.len() {
-                    vs.queue_msix_vectors[idx] = qs.msix_vector;
-                }
-                if let Some(a) = self.msix_queue_vectors.get(idx) {
-                    a.store(
-                        qs.msix_vector,
-                        std::sync::atomic::Ordering::Release,
-                    );
-                }
-                // Write the MSI-X table entry so fire() can inject the interrupt
-                if let Some(ref msix) = self.msix {
-                    msix.write_entry(
-                        qs.msix_vector,
-                        qs.msix_addr,
-                        qs.msix_data as u64,
-                    );
-                }
-            }
-
-            if qs.enabled {
-                // Log ring state for debugging
-                let guest_avail_gpa = qs.avail_addr + 2;
-                let guest_used_gpa = qs.used_addr + 2;
-                let ga = self
-                    .physmap
-                    .lookup(guest_avail_gpa, 2)
-                    .and_then(|s| s.read::<u16>().ok())
-                    .unwrap_or(0);
-                let gu = self
-                    .physmap
-                    .lookup(guest_used_gpa, 2)
-                    .and_then(|s| s.read::<u16>().ok())
-                    .unwrap_or(0);
-                let avail_delta = ga.wrapping_sub(qs.avail_idx);
-                eprintln!(
-                    "[virtio-restore] q={} kernel(avail={} used={}) guest_mem(avail={} used={}) available={}",
-                    qs.queue_idx, qs.avail_idx, qs.used_idx, ga, gu, avail_delta,
-                );
-
-                self.device.restore_ring_state(
-                    qs.queue_idx,
-                    qs.queue_size,
-                    qs.desc_addr,
-                    qs.avail_addr,
-                    qs.used_addr,
-                    qs.avail_idx,
-                    qs.used_idx,
-                    qs.msix_addr,
-                    qs.msix_data,
-                );
-            }
-        }
-
-        if !matching.is_empty() {
-            vs.status = bits::STATUS_DRIVER_OK
-                | bits::STATUS_FEATURES_OK
-                | bits::STATUS_DRIVER
-                | bits::STATUS_ACKNOWLEDGE;
-
-            // Enable MSI-X so fire() can deliver interrupts
-            if let Some(ref msix) = self.msix {
-                msix.set_enabled(true);
-            }
-        }
-
-        // Program notification addresses from current BAR state
-        let pci = self.pci_state.lock().expect("pci lock");
-        let bar0_port = pci
-            .bars()
-            .get(BarN::BAR0)
-            .and_then(|(def, addr)| {
-                if def.is_pio() {
-                    Some(addr as u16)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0);
-        let bar2_addr = pci
-            .bars()
-            .get(BarN::BAR2)
-            .and_then(
-                |(def, addr)| if def.is_mmio() { Some(addr) } else { None },
-            )
-            .unwrap_or(0);
-        drop(pci);
-        eprintln!(
-            "[virtio-restore] BAR0={:#x} BAR2={:#x}",
-            bar0_port, bar2_addr
-        );
-
-        if bar0_port != 0 || bar2_addr != 0 {
-            let notify_pio = if bar0_port != 0 {
-                bar0_port + bits::LEGACY_REG_QUEUE_NOTIFY
-            } else {
-                0
-            };
-            let notify_mmio = if bar2_addr != 0 {
-                bar2_addr + bits::MODERN_BAR_NOTIFY_OFFSET as u64
-            } else {
-                0
-            };
-            self.device.set_notify_addrs(notify_pio, notify_mmio);
-        }
-
-        // Start the deferred interrupt poll thread now that rings,
-        // MSI-X vectors, and notification addresses are all programmed.
-        self.device.start_poll_deferred();
-
-        // Inject a post-restore interrupt on each queue to wake the
-        // guest driver. After migration, the rx ring may have no
-        // available buffers (avail_idx == used_idx). The guest driver
-        // needs an interrupt to process the "caught up" used ring and
-        // post new rx buffers. Without this, incoming packets are
-        // dropped with "no_space" in the kernel viona driver.
-        drop(vs);
-        for qs in &matching {
-            if qs.enabled {
-                eprintln!(
-                    "[virtio-restore] injecting post-restore interrupt q={}",
-                    qs.queue_idx
-                );
-                self.raise_queue_interrupt_for(qs.queue_idx);
-            }
-        }
+        self.restore_migrate_queues(states);
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    /// Minimal test VirtIO device for transport tests.
-    struct TestVirtioDevice {
-        features: u64,
-    }
-
-    impl VirtioDevice for TestVirtioDevice {
-        fn device_features(&self) -> u64 {
-            self.features
-        }
-
-        fn set_features(&self, _features: u64) {}
-
-        fn cfg_read(&self, offset: u16, _len: u8) -> u32 {
-            // Return offset as value for testability
-            u32::from(offset)
-        }
-
-        fn cfg_write(&self, _offset: u16, _val: u32, _len: u8) {}
-
-        fn process_queue(
-            &self,
-            _queue_idx: u16,
-            _queue: &mut VirtQueue,
-            _head: u16,
-            _physmap: &PhysMap,
-        ) -> u32 {
-            0
-        }
-
-        fn reset(&self) {}
-    }
-
-    impl Lifecycle for TestVirtioDevice {
-        fn type_name(&self) -> &'static str {
-            "test-virtio"
-        }
-    }
-
-    fn make_test_device() -> Arc<VirtioPciDevice<TestVirtioDevice>> {
-        make_device_of_type(bits::VIRTIO_DEV_TYPE_BLOCK)
-    }
-
-    fn make_device_of_type(
-        dev_type: u16,
-    ) -> Arc<VirtioPciDevice<TestVirtioDevice>> {
-        let physmap = Arc::new(PhysMap::new());
-        let bus_pio = Arc::new(PioBus::new());
-        let bus_mmio = Arc::new(MmioBus::new());
-        VirtioPciDevice::new(
-            TestVirtioDevice {
-                features: 0x42
-                    | bits::VIRTIO_F_RING_EVENT_IDX
-                    | bits::VIRTIO_F_RING_INDIRECT_DESC,
-            },
-            dev_type,
-            1,
-            256,
-            8, // 8 bytes of device config
-            None,
-            physmap,
-            bus_pio,
-            bus_mmio,
-            None, // no MSI-X
-        )
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct RestoreRingCall {
-        queue_idx: u16,
-        size: u16,
-        desc: u64,
-        avail: u64,
-        used: u64,
-        avail_idx: u16,
-        used_idx: u16,
-        msix_addr: u64,
-        msix_data: u32,
-    }
-
-    #[derive(Debug, Default)]
-    struct TrackingVirtioDeviceState {
-        set_features: Vec<u64>,
-        notify_addrs: Vec<(u16, u64)>,
-        restored_rings: Vec<RestoreRingCall>,
-        reset_all_rings: usize,
-    }
-
-    struct TrackingVirtioDevice {
-        features: u64,
-        state: Mutex<TrackingVirtioDeviceState>,
-    }
-
-    impl VirtioDevice for TrackingVirtioDevice {
-        fn device_features(&self) -> u64 {
-            self.features
-        }
-
-        fn set_features(&self, features: u64) {
-            self.state
-                .lock()
-                .expect("tracking state lock")
-                .set_features
-                .push(features);
-        }
-
-        fn cfg_read(&self, offset: u16, _len: u8) -> u32 {
-            u32::from(offset)
-        }
-
-        fn cfg_write(&self, _offset: u16, _val: u32, _len: u8) {}
-
-        fn process_queue(
-            &self,
-            _queue_idx: u16,
-            _queue: &mut VirtQueue,
-            _head: u16,
-            _physmap: &PhysMap,
-        ) -> u32 {
-            0
-        }
-
-        fn reset_all_rings(&self) {
-            self.state
-                .lock()
-                .expect("tracking state lock")
-                .reset_all_rings += 1;
-        }
-
-        fn restore_ring_state(
-            &self,
-            queue_idx: u16,
-            size: u16,
-            desc: u64,
-            avail: u64,
-            used: u64,
-            avail_idx: u16,
-            used_idx: u16,
-            msix_addr: u64,
-            msix_data: u32,
-        ) {
-            self.state
-                .lock()
-                .expect("tracking state lock")
-                .restored_rings
-                .push(RestoreRingCall {
-                    queue_idx,
-                    size,
-                    desc,
-                    avail,
-                    used,
-                    avail_idx,
-                    used_idx,
-                    msix_addr,
-                    msix_data,
-                });
-        }
-
-        fn set_notify_addrs(&self, pio_port: u16, mmio_addr: u64) {
-            self.state
-                .lock()
-                .expect("tracking state lock")
-                .notify_addrs
-                .push((pio_port, mmio_addr));
-        }
-
-        fn reset(&self) {}
-    }
-
-    impl Lifecycle for TrackingVirtioDevice {
-        fn type_name(&self) -> &'static str {
-            "tracking-virtio"
-        }
-    }
-
-    fn make_tracking_device() -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
-        let physmap = Arc::new(PhysMap::new());
-        let bus_pio = Arc::new(PioBus::new());
-        let bus_mmio = Arc::new(MmioBus::new());
-        VirtioPciDevice::new(
-            TrackingVirtioDevice {
-                features: bits::VIRTIO_F_VERSION_1,
-                state: Mutex::new(TrackingVirtioDeviceState::default()),
-            },
-            bits::VIRTIO_DEV_TYPE_BLOCK,
-            1,
-            256,
-            8,
-            None,
-            physmap,
-            bus_pio,
-            bus_mmio,
-            None,
-        )
-    }
-
-    #[test]
-    fn pci_identity() {
-        let dev = make_test_device();
-        // Vendor ID
-        let id = dev.cfg_read(0x00, 4);
-        assert_eq!(id & 0xFFFF, bits::VIRTIO_PCI_VENDOR_ID as u32);
-        // Transitional device id assigned to virtio-blk.
-        assert_eq!((id >> 16) & 0xFFFF, 0x1001);
-    }
-
-    #[test]
-    fn pci_identity_net() {
-        let dev = make_device_of_type(bits::VIRTIO_DEV_TYPE_NET);
-        let id = dev.cfg_read(0x00, 4);
-        assert_eq!((id >> 16) & 0xFFFF, 0x1000);
-    }
-
-    #[test]
-    fn pci_identity_rng() {
-        let dev = make_device_of_type(bits::VIRTIO_DEV_TYPE_RNG);
-        let id = dev.cfg_read(0x00, 4);
-        // Regression: the old formula advertised 0x1003, which belongs to
-        // virtio-console.
-        assert_eq!((id >> 16) & 0xFFFF, 0x1005);
-    }
-
-    #[test]
-    fn pci_identity_console() {
-        let dev = make_device_of_type(bits::VIRTIO_DEV_TYPE_CONSOLE);
-        let id = dev.cfg_read(0x00, 4);
-        assert_eq!((id >> 16) & 0xFFFF, 0x1003);
-        let class_reg = dev.cfg_read(0x08, 4);
-        assert_eq!(
-            (class_reg >> 24) & 0xFF,
-            vmm_devices::pci::bits::CLASS_COMMUNICATION as u32
-        );
-        assert_eq!(
-            (class_reg >> 16) & 0xFF,
-            vmm_devices::pci::bits::SUBCLASS_COMMUNICATION_OTHER as u32
-        );
-    }
-
-    #[test]
-    fn pci_class() {
-        let dev = make_test_device();
-        let class_reg = dev.cfg_read(0x08, 4);
-        let class = (class_reg >> 24) & 0xFF;
-        assert_eq!(class, vmm_devices::pci::bits::CLASS_STORAGE as u32);
-    }
-
-    /// Build a device with no device-specific config, as virtio-rnd has.
-    fn make_device_without_config() -> Arc<VirtioPciDevice<TestVirtioDevice>> {
-        let physmap = Arc::new(PhysMap::new());
-        VirtioPciDevice::new(
-            TestVirtioDevice { features: 0 },
-            bits::VIRTIO_DEV_TYPE_RNG,
-            1,
-            64,
-            0, // no device config, like virtio-rnd
-            None,
-            physmap,
-            Arc::new(PioBus::new()),
-            Arc::new(MmioBus::new()),
-            None,
-        )
-    }
-
-    /// Walk the capability chain, returning (cfg_type, length) per virtio
-    /// capability in link order.
-    fn walk_virtio_caps<D: VirtioDevice>(
-        dev: &VirtioPciDevice<D>,
-    ) -> Vec<(u8, u32)> {
-        let mut out = Vec::new();
-        // Capabilities pointer at 0x34, low byte.
-        let mut pos = (dev.cfg_read(0x34, 4) & 0xFF) as u8;
-        // Bounded: a malformed chain must not spin the test forever.
-        for _ in 0..16 {
-            if pos == 0 {
-                break;
-            }
-            let hdr = dev.cfg_read(pos, 4);
-            let cap_id = (hdr & 0xFF) as u8;
-            let next = ((hdr >> 8) & 0xFF) as u8;
-            if cap_id == bits::PCI_CAP_ID_VNDR {
-                let cfg_type = ((hdr >> 24) & 0xFF) as u8;
-                let length = dev.cfg_read(pos + 12, 4);
-                out.push((cfg_type, length));
-            }
-            pos = next;
-        }
-        out
-    }
-
-    /// A capability advertising length 0 is not ignored by Linux: its
-    /// `map_capability()` rejects `length <= start` and fails the whole
-    /// probe, so the device never binds. VIRTIO 1.3 4.1.4.6 makes the
-    /// device-config capability conditional on having such config.
-    #[test]
-    fn device_without_config_omits_the_device_cfg_cap() {
-        let dev = make_device_without_config();
-        let caps = walk_virtio_caps(&dev);
-
-        assert!(
-            !caps
-                .iter()
-                .any(|(t, _)| *t == bits::VIRTIO_PCI_CAP_DEVICE_CFG),
-            "device with no config still advertises a device-cfg cap: {caps:?}"
-        );
-        // Whatever is advertised must be usable.
-        for (cfg_type, length) in &caps {
-            assert_ne!(*length, 0, "cap type {cfg_type} has length 0");
-        }
-        // The chain must still reach the caps a driver needs.
-        for want in [
-            bits::VIRTIO_PCI_CAP_COMMON_CFG,
-            bits::VIRTIO_PCI_CAP_NOTIFY_CFG,
-            bits::VIRTIO_PCI_CAP_ISR_CFG,
-        ] {
-            assert!(
-                caps.iter().any(|(t, _)| *t == want),
-                "cap type {want} missing from {caps:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn device_with_config_keeps_the_device_cfg_cap() {
-        let dev = make_test_device();
-        let caps = walk_virtio_caps(&dev);
-        let found = caps
-            .iter()
-            .find(|(t, _)| *t == bits::VIRTIO_PCI_CAP_DEVICE_CFG)
-            .expect("device-cfg cap present");
-        assert_eq!(
-            found.1, 8,
-            "device-cfg cap length should be the config size"
-        );
-    }
-
-    #[test]
-    fn pci_subsystem() {
-        let dev = make_test_device();
-        let sub = dev.cfg_read(0x2C, 4);
-        assert_eq!(sub & 0xFFFF, bits::VIRTIO_PCI_VENDOR_ID as u32);
-        assert_eq!((sub >> 16) & 0xFFFF, bits::VIRTIO_DEV_TYPE_BLOCK as u32);
-    }
-
-    #[test]
-    fn bar0_is_pio() {
-        let dev = make_test_device();
-        // Write all-ones to BAR0 to probe
-        dev.cfg_write(0x10, 4, 0xFFFF_FFFF);
-        let bar = dev.cfg_read(0x10, 4);
-        // Low bit should be 1 (PIO)
-        assert_eq!(bar & 1, 1);
-    }
-
-    #[test]
-    fn device_features_read() {
-        use vmm_core::common::ReadOp;
-        let dev = make_test_device();
-        let mut ro = ReadOp::new(4);
-        dev.bar_rw(BarN::BAR0, 0x00, RWOp::Read(&mut ro));
-        let val = u32::from_le_bytes([
-            ro.buf()[0],
-            ro.buf()[1],
-            ro.buf()[2],
-            ro.buf()[3],
-        ]);
-        // Device features = 0x42 from test device (EVENT_IDX disabled pending investigation)
-        assert_eq!(val, 0x42);
-    }
-
-    #[test]
-    fn device_status_readwrite() {
-        use vmm_core::common::{ReadOp, WriteOp};
-        let dev = make_test_device();
-
-        // Write status
-        let wo = WriteOp::from_buf(&[bits::STATUS_ACKNOWLEDGE]);
-        dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
-
-        // Read status back
-        let mut ro = ReadOp::new(1);
-        dev.bar_rw(BarN::BAR0, 0x12, RWOp::Read(&mut ro));
-        assert_eq!(ro.buf()[0], bits::STATUS_ACKNOWLEDGE);
-    }
-
-    #[test]
-    fn device_status_zero_resets() {
-        use vmm_core::common::{ReadOp, WriteOp};
-        let dev = make_test_device();
-
-        // Set some status
-        let wo =
-            WriteOp::from_buf(
-                &[bits::STATUS_ACKNOWLEDGE | bits::STATUS_DRIVER],
-            );
-        dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
-
-        // Reset by writing 0
-        let wo = WriteOp::from_buf(&[0]);
-        dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
-
-        // Status should be 0
-        let mut ro = ReadOp::new(1);
-        dev.bar_rw(BarN::BAR0, 0x12, RWOp::Read(&mut ro));
-        assert_eq!(ro.buf()[0], 0);
-    }
-
-    #[test]
-    fn isr_read_clears() {
-        use vmm_core::common::ReadOp;
-        let dev = make_test_device();
-
-        // Manually set ISR
-        dev.isr_status
-            .store(bits::ISR_QUEUE_INTR, std::sync::atomic::Ordering::Relaxed);
-
-        // First read should return the value
-        let mut ro = ReadOp::new(1);
-        dev.bar_rw(BarN::BAR0, 0x13, RWOp::Read(&mut ro));
-        assert_eq!(ro.buf()[0], bits::ISR_QUEUE_INTR);
-
-        // Second read should return 0 (cleared)
-        let mut ro = ReadOp::new(1);
-        dev.bar_rw(BarN::BAR0, 0x13, RWOp::Read(&mut ro));
-        assert_eq!(ro.buf()[0], 0);
-    }
-
-    #[test]
-    fn queue_select_and_size() {
-        use vmm_core::common::{ReadOp, WriteOp};
-        let dev = make_test_device();
-
-        // Select queue 0
-        let wo = WriteOp::from_buf(&[0, 0]);
-        dev.bar_rw(BarN::BAR0, 0x0E, RWOp::Write(&wo));
-
-        // Read queue size
-        let mut ro = ReadOp::new(2);
-        dev.bar_rw(BarN::BAR0, 0x0C, RWOp::Read(&mut ro));
-        let size = u16::from_le_bytes([ro.buf()[0], ro.buf()[1]]);
-        assert_eq!(size, 256);
-
-        // Select invalid queue
-        let wo = WriteOp::from_buf(&[1, 0]);
-        dev.bar_rw(BarN::BAR0, 0x0E, RWOp::Write(&wo));
-
-        let mut ro = ReadOp::new(2);
-        dev.bar_rw(BarN::BAR0, 0x0C, RWOp::Read(&mut ro));
-        let size = u16::from_le_bytes([ro.buf()[0], ro.buf()[1]]);
-        assert_eq!(size, 0);
-    }
-
-    #[test]
-    fn device_config_read() {
-        use vmm_core::common::ReadOp;
-        let dev = make_test_device();
-
-        // Read device-specific config at offset 0x14 (dev offset 0)
-        let mut ro = ReadOp::new(4);
-        dev.bar_rw(BarN::BAR0, 0x14, RWOp::Read(&mut ro));
-        let val = u32::from_le_bytes([
-            ro.buf()[0],
-            ro.buf()[1],
-            ro.buf()[2],
-            ro.buf()[3],
-        ]);
-        // TestVirtioDevice returns offset as value
-        assert_eq!(val, 0);
-
-        // At offset 0x18 (dev offset 4)
-        let mut ro = ReadOp::new(4);
-        dev.bar_rw(BarN::BAR0, 0x18, RWOp::Read(&mut ro));
-        let val = u32::from_le_bytes([
-            ro.buf()[0],
-            ro.buf()[1],
-            ro.buf()[2],
-            ro.buf()[3],
-        ]);
-        assert_eq!(val, 4);
-    }
-
-    #[test]
-    fn guest_features_write_read() {
-        use vmm_core::common::{ReadOp, WriteOp};
-        let dev = make_test_device();
-
-        // Device offers 0x42; write 0x42 so masking yields 0x42.
-        let wo = WriteOp::from_buf(&[0x42, 0x00, 0x00, 0x00]);
-        dev.bar_rw(BarN::BAR0, 0x04, RWOp::Write(&wo));
-
-        let mut ro = ReadOp::new(4);
-        dev.bar_rw(BarN::BAR0, 0x04, RWOp::Read(&mut ro));
-        let val = u32::from_le_bytes([
-            ro.buf()[0],
-            ro.buf()[1],
-            ro.buf()[2],
-            ro.buf()[3],
-        ]);
-        assert_eq!(val, 0x42);
-    }
-
-    #[test]
-    fn guest_features_masked_to_offered() {
-        use vmm_core::common::{ReadOp, WriteOp};
-        let dev = make_test_device();
-
-        // Write 0xFFFFFFFF — should be masked to offered features (0x42)
-        let wo = WriteOp::from_buf(&[0xFF, 0xFF, 0xFF, 0xFF]);
-        dev.bar_rw(BarN::BAR0, 0x04, RWOp::Write(&wo));
-
-        let mut ro = ReadOp::new(4);
-        dev.bar_rw(BarN::BAR0, 0x04, RWOp::Read(&mut ro));
-        let val = u32::from_le_bytes([
-            ro.buf()[0],
-            ro.buf()[1],
-            ro.buf()[2],
-            ro.buf()[3],
-        ]);
-        assert_eq!(
-            val, 0x42,
-            "guest features should be masked to offered 0x42"
-        );
-    }
-
-    #[test]
-    fn guest_features_write_unsupported_is_rejected() {
-        use vmm_core::common::{ReadOp, WriteOp};
-        let dev = make_test_device();
-
-        // Write a feature not offered (0x100)
-        let wo = WriteOp::from_buf(&[0x00, 0x01, 0x00, 0x00]);
-        dev.bar_rw(BarN::BAR0, 0x04, RWOp::Write(&wo));
-
-        let mut ro = ReadOp::new(4);
-        dev.bar_rw(BarN::BAR0, 0x04, RWOp::Read(&mut ro));
-        let val = u32::from_le_bytes([
-            ro.buf()[0],
-            ro.buf()[1],
-            ro.buf()[2],
-            ro.buf()[3],
-        ]);
-        // Only offered features survive masking
-        assert_eq!(val, 0x00);
-    }
-
-    #[test]
-    fn device_config_offset_without_msix() {
-        let dev = make_test_device();
-        // Without MSI-X, device config starts at 0x14
-        assert_eq!(dev.device_config_offset(), bits::LEGACY_REG_DEVICE_CONFIG);
-        assert_eq!(dev.device_config_offset(), 0x14);
-    }
-
-    #[test]
-    fn device_config_offset_msix_constant() {
-        // Without a VmmHdl we cannot construct MsixTable, but we can
-        // verify the constants that determine the offset.
-        assert_eq!(bits::LEGACY_REG_DEVICE_CONFIG, 0x14);
-        assert_eq!(bits::LEGACY_REG_DEVICE_CONFIG_MSIX, 0x18);
-        // The difference is 4 bytes (two 16-bit vector registers)
-        assert_eq!(
-            bits::LEGACY_REG_DEVICE_CONFIG_MSIX
-                - bits::LEGACY_REG_DEVICE_CONFIG,
-            4,
-        );
-    }
-
-    #[test]
-    fn queue_select_invalid_returns_zero_size() {
-        use vmm_core::common::{ReadOp, WriteOp};
-        let dev = make_test_device();
-
-        // Device has 1 queue (index 0). Select queue 3 (invalid).
-        let wo = WriteOp::from_buf(&[3, 0]);
-        dev.bar_rw(BarN::BAR0, 0x0E, RWOp::Write(&wo));
-
-        // Queue size for invalid index should be 0
-        let mut ro = ReadOp::new(2);
-        dev.bar_rw(BarN::BAR0, 0x0C, RWOp::Read(&mut ro));
-        let size = u16::from_le_bytes([ro.buf()[0], ro.buf()[1]]);
-        assert_eq!(size, 0, "invalid queue index should report size 0");
-
-        // Queue PFN for invalid index should also be 0
-        let mut ro = ReadOp::new(4);
-        dev.bar_rw(BarN::BAR0, 0x08, RWOp::Read(&mut ro));
-        let pfn = u32::from_le_bytes([
-            ro.buf()[0],
-            ro.buf()[1],
-            ro.buf()[2],
-            ro.buf()[3],
-        ]);
-        assert_eq!(pfn, 0, "invalid queue index should report PFN 0");
-    }
-
-    #[test]
-    fn features_ok_set_and_readable() {
-        use vmm_core::common::{ReadOp, WriteOp};
-        let dev = make_test_device();
-
-        // Walk through the status progression: ACK -> DRIVER -> FEATURES_OK
-        let wo = WriteOp::from_buf(&[bits::STATUS_ACKNOWLEDGE]);
-        dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
-
-        let wo =
-            WriteOp::from_buf(
-                &[bits::STATUS_ACKNOWLEDGE | bits::STATUS_DRIVER],
-            );
-        dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
-
-        let wo = WriteOp::from_buf(&[bits::STATUS_ACKNOWLEDGE
-            | bits::STATUS_DRIVER
-            | bits::STATUS_FEATURES_OK]);
-        dev.bar_rw(BarN::BAR0, 0x12, RWOp::Write(&wo));
-
-        // Read back — FEATURES_OK should be set
-        let mut ro = ReadOp::new(1);
-        dev.bar_rw(BarN::BAR0, 0x12, RWOp::Read(&mut ro));
-        assert_ne!(
-            ro.buf()[0] & bits::STATUS_FEATURES_OK,
-            0,
-            "FEATURES_OK should be set after valid feature negotiation"
-        );
-    }
-
-    #[test]
-    fn queue_notify_ignored_before_driver_ok() {
-        use vmm_core::common::WriteOp;
-        let dev = make_test_device();
-
-        // Don't set DRIVER_OK status. Notify queue 0 — should be a no-op.
-        // (Verifying no panic or crash)
-        let wo = WriteOp::from_buf(&[0, 0]);
-        dev.bar_rw(BarN::BAR0, 0x10, RWOp::Write(&wo));
-    }
-
-    #[test]
-    fn isr_cfg_change_bit() {
-        use vmm_core::common::ReadOp;
-        let dev = make_test_device();
-
-        // Set config change ISR bit
-        dev.isr_status
-            .store(bits::ISR_CFG_CHANGE, std::sync::atomic::Ordering::Relaxed);
-
-        let mut ro = ReadOp::new(1);
-        dev.bar_rw(BarN::BAR0, 0x13, RWOp::Read(&mut ro));
-        assert_eq!(ro.buf()[0], bits::ISR_CFG_CHANGE);
-
-        // Should be cleared after read
-        let mut ro = ReadOp::new(1);
-        dev.bar_rw(BarN::BAR0, 0x13, RWOp::Read(&mut ro));
-        assert_eq!(ro.buf()[0], 0);
-    }
-
-    #[test]
-    fn isr_combined_bits() {
-        use vmm_core::common::ReadOp;
-        let dev = make_test_device();
-
-        // Set both ISR bits
-        dev.isr_status.store(
-            bits::ISR_QUEUE_INTR | bits::ISR_CFG_CHANGE,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-
-        let mut ro = ReadOp::new(1);
-        dev.bar_rw(BarN::BAR0, 0x13, RWOp::Read(&mut ro));
-        assert_eq!(ro.buf()[0], bits::ISR_QUEUE_INTR | bits::ISR_CFG_CHANGE,);
-    }
-
-    #[test]
-    fn device_features_write_ignored() {
-        use vmm_core::common::{ReadOp, WriteOp};
-        let dev = make_test_device();
-
-        // Device features register (0x00) is read-only
-        let wo = WriteOp::from_buf(&[0xFF, 0xFF, 0xFF, 0xFF]);
-        dev.bar_rw(BarN::BAR0, 0x00, RWOp::Write(&wo));
-
-        // Should still read as original device features
-        let mut ro = ReadOp::new(4);
-        dev.bar_rw(BarN::BAR0, 0x00, RWOp::Read(&mut ro));
-        let val = u32::from_le_bytes([
-            ro.buf()[0],
-            ro.buf()[1],
-            ro.buf()[2],
-            ro.buf()[3],
-        ]);
-        assert_eq!(val, 0x42, "device features should be read-only");
-    }
-
-    // -- Modern transport tests --
-
-    #[test]
-    fn bar2_is_mmio() {
-        let dev = make_test_device();
-        // Write all-ones to BAR2 to probe
-        dev.cfg_write(0x18, 4, 0xFFFF_FFFF);
-        let bar = dev.cfg_read(0x18, 4);
-        // Low bit 0 = MMIO (not PIO)
-        assert_eq!(bar & 1, 0, "BAR2 should be MMIO");
-        // Size mask for 16KB: ~(0x4000 - 1) = 0xFFFF_C000
-        assert_eq!(bar & 0xFFFF_C000, 0xFFFF_C000, "BAR2 size should be 16KB");
-    }
-
-    #[test]
-    fn export_virtio_state_includes_pci_transport_state() {
-        let dev = make_test_device();
-        {
-            let mut vs = dev.virtio_state.lock().expect("virtio lock");
-            vs.queues[0].set_addr_modern(0x1000, 0x2000, 0x3000);
-            vs.queue_enabled[0] = true;
-        }
-
-        let command = vmm_devices::pci::bits::RegCmd::IO_EN
-            | vmm_devices::pci::bits::RegCmd::MMIO_EN
-            | vmm_devices::pci::bits::RegCmd::BUSMSTR_EN
-            | vmm_devices::pci::bits::RegCmd::INTX_DIS;
-        dev.cfg_write(vmm_devices::pci::bits::REG_BAR0, 4, 0xC120);
-        dev.cfg_write(vmm_devices::pci::bits::REG_BAR2, 4, 0xFEC0_0000);
-        dev.cfg_write(
-            vmm_devices::pci::bits::REG_COMMAND,
-            2,
-            u32::from(command.bits()),
-        );
-
-        let exported = dev.export_virtio_state();
-        assert_eq!(exported.len(), 1);
-
-        let pci_state = exported[0]
-            .pci_state
-            .as_ref()
-            .expect("pci transport state should be exported");
-        assert_eq!(pci_state.command, command.bits());
-        assert_eq!(pci_state.bar_addrs[BarN::BAR0 as usize], 0xC120);
-        assert_eq!(pci_state.bar_addrs[BarN::BAR2 as usize], 0xFEC0_0000);
-        assert_eq!(pci_state.bar_addrs[BarN::BAR4 as usize], 0);
-    }
-
-    #[test]
-    fn restore_virtio_state_replays_pci_transport_state() {
-        let dev = make_tracking_device();
-        let command = vmm_devices::pci::bits::RegCmd::IO_EN
-            | vmm_devices::pci::bits::RegCmd::MMIO_EN
-            | vmm_devices::pci::bits::RegCmd::BUSMSTR_EN
-            | vmm_devices::pci::bits::RegCmd::INTX_DIS;
-        let queue_state = vmm_devices::lifecycle::VirtioMigrateQueue {
-            queue_idx: 0,
-            queue_size: 256,
-            desc_addr: 0x1000,
-            avail_addr: 0x2000,
-            used_addr: 0x3000,
-            enabled: true,
-            features: bits::VIRTIO_F_VERSION_1,
-            avail_idx: 7,
-            used_idx: 5,
-            msix_addr: 0,
-            msix_data: 0,
-            msix_vector: bits::VIRTIO_MSI_NO_VECTOR,
-            pci_state: Some(vmm_devices::lifecycle::VirtioMigratePciState {
-                command: command.bits(),
-                bar_addrs: [0xC120, 0, 0xFEC0_0000, 0, 0, 0],
-            }),
-        };
-
-        dev.restore_virtio_state(&[queue_state]);
-
-        assert_eq!(dev.cfg_read(vmm_devices::pci::bits::REG_BAR0, 4), 0xC121);
-        assert_eq!(
-            dev.cfg_read(vmm_devices::pci::bits::REG_BAR2, 4),
-            0xFEC0_0000
-        );
-        assert_eq!(
-            dev.cfg_read(vmm_devices::pci::bits::REG_COMMAND, 2),
-            u32::from(command.bits()),
-        );
-
-        let tracked = dev.device.state.lock().expect("tracking state lock");
-        assert_eq!(tracked.reset_all_rings, 1);
-        assert_eq!(tracked.set_features, vec![bits::VIRTIO_F_VERSION_1]);
-        assert_eq!(
-            tracked.restored_rings,
-            vec![RestoreRingCall {
-                queue_idx: 0,
-                size: 256,
-                desc: 0x1000,
-                avail: 0x2000,
-                used: 0x3000,
-                avail_idx: 7,
-                used_idx: 5,
-                msix_addr: 0,
-                msix_data: 0,
-            }],
-        );
-        assert_eq!(
-            tracked.notify_addrs,
-            vec![(
-                0xC120 + bits::LEGACY_REG_QUEUE_NOTIFY,
-                0xFEC0_0000 + bits::MODERN_BAR_NOTIFY_OFFSET as u64,
-            )],
-        );
-    }
-
-    #[test]
-    fn restore_virtio_state_propagates_ring_feature_flags() {
-        let dev = make_tracking_device();
-        let features = bits::VIRTIO_F_VERSION_1
-            | bits::VIRTIO_F_RING_EVENT_IDX
-            | bits::VIRTIO_F_RING_INDIRECT_DESC;
-        let queue_state = vmm_devices::lifecycle::VirtioMigrateQueue {
-            queue_idx: 0,
-            queue_size: 256,
-            desc_addr: 0x1000,
-            avail_addr: 0x2000,
-            used_addr: 0x3000,
-            enabled: true,
-            features,
-            avail_idx: 0,
-            used_idx: 0,
-            msix_addr: 0,
-            msix_data: 0,
-            msix_vector: bits::VIRTIO_MSI_NO_VECTOR,
-            pci_state: None,
-        };
-
-        dev.restore_virtio_state(&[queue_state]);
-
-        let vs = dev.virtio_state.lock().expect("lock");
-        assert!(
-            vs.queues[0].event_idx_enabled(),
-            "event_idx must be propagated to queues during restore",
-        );
-        assert!(
-            vs.queues[0].indirect_supported(),
-            "indirect_supported must be propagated to queues during restore",
-        );
-    }
-
-    #[test]
-    fn cap_chain_starts_at_0x40() {
-        let dev = make_test_device();
-        // Capabilities pointer at 0x34
-        let cap_ptr = dev.cfg_read(0x34, 1);
-        assert_eq!(cap_ptr, 0x40, "cap chain should start at 0x40");
-    }
-
-    #[test]
-    fn cap_chain_byte_reads() {
-        let dev = make_test_device();
-        // Byte read at 0x40 → cap_vndr = 0x09
-        assert_eq!(dev.cfg_read(0x40, 1), 0x09, "byte read: cap_vndr");
-        // Byte read at 0x41 → cap_next = 0x50 (notify cap)
-        assert_eq!(dev.cfg_read(0x41, 1), 0x50, "byte read: cap_next");
-        // Byte read at 0x42 → cap_len = 16
-        assert_eq!(dev.cfg_read(0x42, 1), 16, "byte read: cap_len");
-        // Byte read at 0x43 → cfg_type = 1 (common)
-        assert_eq!(dev.cfg_read(0x43, 1), 1, "byte read: cfg_type");
-    }
-
-    #[test]
-    fn cap_chain_common_cfg() {
-        let dev = make_test_device();
-        // No MSI-X → common cap at 0x40
-        let dword0 = dev.cfg_read(0x40, 4);
-        // Byte 0: cap_vndr = 0x09
-        assert_eq!(dword0 & 0xFF, 0x09, "cap_vndr should be 0x09");
-        // Byte 3: cfg_type = 1 (common)
-        assert_eq!((dword0 >> 24) & 0xFF, 1, "cfg_type should be COMMON_CFG");
-        // Bar field at offset+4
-        let dword1 = dev.cfg_read(0x44, 4);
-        assert_eq!(
-            dword1 & 0xFF,
-            bits::MODERN_BAR_IDX as u32,
-            "common cap should point to BAR2"
-        );
-        // Offset within BAR at offset+8
-        let dword2 = dev.cfg_read(0x48, 4);
-        assert_eq!(
-            dword2,
-            bits::MODERN_BAR_COMMON_OFFSET,
-            "common cap offset should be 0"
-        );
-    }
-
-    #[test]
-    fn cap_chain_notify_cfg() {
-        let dev = make_test_device();
-        // No MSI-X → notify cap at 0x50
-        let dword0 = dev.cfg_read(0x50, 4);
-        assert_eq!(dword0 & 0xFF, 0x09);
-        assert_eq!((dword0 >> 24) & 0xFF, 2, "cfg_type should be NOTIFY_CFG");
-        // Offset within BAR
-        let offset = dev.cfg_read(0x58, 4);
-        assert_eq!(offset, bits::MODERN_BAR_NOTIFY_OFFSET);
-        // Multiplier (extra dword at cap+16)
-        let mult = dev.cfg_read(0x60, 4);
-        assert_eq!(mult, 0, "notify_off_multiplier should be 0");
-    }
-
-    #[test]
-    fn cap_chain_last_is_device_cfg() {
-        let dev = make_test_device();
-        // No MSI-X → device cap at 0x74
-        let dword0 = dev.cfg_read(0x74, 4);
-        assert_eq!(dword0 & 0xFF, 0x09);
-        assert_eq!((dword0 >> 24) & 0xFF, 4, "cfg_type should be DEVICE_CFG");
-        // Next pointer should be 0 (last in chain)
-        assert_eq!((dword0 >> 8) & 0xFF, 0, "last cap next should be 0");
-    }
-
-    #[test]
-    fn modern_features_include_version_1() {
-        use vmm_core::common::{ReadOp, WriteOp};
-        let dev = make_test_device();
-
-        // Read modern features via BAR2: select high 32 bits
-        let wo = WriteOp::from_buf(&[1, 0, 0, 0]);
-        dev.bar_rw(BarN::BAR2, 0x00, RWOp::Write(&wo));
-
-        // Read device_feature
-        let mut ro = ReadOp::new(4);
-        dev.bar_rw(BarN::BAR2, 0x04, RWOp::Read(&mut ro));
-        let high = u32::from_le_bytes([
-            ro.buf()[0],
-            ro.buf()[1],
-            ro.buf()[2],
-            ro.buf()[3],
-        ]);
-        // VERSION_1 = bit 32 → bit 0 of high word
-        assert_ne!(high & 1, 0, "VERSION_1 should be in modern features");
-    }
-
-    #[test]
-    fn modern_features_include_event_idx() {
-        use vmm_core::common::ReadOp;
-        let dev = make_test_device();
-
-        // Read modern features: select low 32 bits (default)
-        let mut ro = ReadOp::new(4);
-        dev.bar_rw(BarN::BAR2, 0x04, RWOp::Read(&mut ro));
-        let low = u32::from_le_bytes([
-            ro.buf()[0],
-            ro.buf()[1],
-            ro.buf()[2],
-            ro.buf()[3],
-        ]);
-        // EVENT_IDX = bit 29
-        assert_ne!(
-            low & (1 << 29),
-            0,
-            "EVENT_IDX should be in modern features"
-        );
-        // INDIRECT_DESC = bit 28
-        assert_ne!(
-            low & (1 << 28),
-            0,
-            "INDIRECT_DESC should be in modern features"
-        );
-    }
-
-    #[test]
-    fn legacy_features_no_event_idx() {
-        use vmm_core::common::ReadOp;
-        let dev = make_test_device();
-
-        // Legacy BAR0 device_features at offset 0x00
-        let mut ro = ReadOp::new(4);
-        dev.bar_rw(BarN::BAR0, 0x00, RWOp::Read(&mut ro));
-        let val = u32::from_le_bytes([
-            ro.buf()[0],
-            ro.buf()[1],
-            ro.buf()[2],
-            ro.buf()[3],
-        ]);
-        // Legacy should NOT include EVENT_IDX (bit 29)
-        assert_eq!(
-            val & (1 << 29),
-            0,
-            "EVENT_IDX must NOT appear in legacy features"
-        );
-    }
-
-    #[test]
-    fn modern_num_queues() {
-        use vmm_core::common::ReadOp;
-        let dev = make_test_device();
-
-        // num_queues at common config offset 0x12
-        let mut ro = ReadOp::new(2);
-        dev.bar_rw(BarN::BAR2, 0x12, RWOp::Read(&mut ro));
-        let nq = u16::from_le_bytes([ro.buf()[0], ro.buf()[1]]);
-        assert_eq!(nq, 1, "should report 1 queue");
-    }
-
-    #[test]
-    fn modern_device_status() {
-        use vmm_core::common::{ReadOp, WriteOp};
-        let dev = make_test_device();
-
-        // Write status via BAR2
-        let wo = WriteOp::from_buf(&[bits::STATUS_ACKNOWLEDGE]);
-        dev.bar_rw(BarN::BAR2, 0x14, RWOp::Write(&wo));
-
-        // Read back
-        let mut ro = ReadOp::new(1);
-        dev.bar_rw(BarN::BAR2, 0x14, RWOp::Read(&mut ro));
-        assert_eq!(ro.buf()[0], bits::STATUS_ACKNOWLEDGE);
-    }
-
-    // -- BAR teardown tests --
-
-    const TEST_BAR0_PORT: u16 = 0x2000;
-    const TEST_BAR2_ADDR: u64 = 0xE000_0000;
-
-    /// Build a device and keep handles to the buses it registers on.
-    fn make_device_with_buses() -> (
-        Arc<VirtioPciDevice<TestVirtioDevice>>,
-        Arc<PioBus>,
-        Arc<MmioBus>,
-    ) {
-        let bus_pio = Arc::new(PioBus::new());
-        let bus_mmio = Arc::new(MmioBus::new());
-        let dev = VirtioPciDevice::new(
-            TestVirtioDevice { features: 0 },
-            bits::VIRTIO_DEV_TYPE_BLOCK,
-            1,
-            256,
-            8,
-            None,
-            Arc::new(PhysMap::new()),
-            Arc::clone(&bus_pio),
-            Arc::clone(&bus_mmio),
-            None,
-        );
-        (dev, bus_pio, bus_mmio)
-    }
-
-    /// Program BAR0 and BAR2, then enable IO and MMIO decoding.
-    fn enable_bars(dev: &Arc<VirtioPciDevice<TestVirtioDevice>>) {
-        dev.cfg_write(0x10, 4, u32::from(TEST_BAR0_PORT));
-        dev.cfg_write(0x18, 4, TEST_BAR2_ADDR as u32);
-        let cmd = vmm_devices::pci::bits::RegCmd::IO_EN
-            | vmm_devices::pci::bits::RegCmd::MMIO_EN;
-        dev.cfg_write(0x04, 2, u32::from(cmd.bits()));
-        assert!(dev.registered_bar.lock().expect("bar lock").is_some());
-        assert!(dev.registered_bar2.lock().expect("bar2 lock").is_some());
-    }
-
-    /// Every live BAR handler holds a strong self reference, so the
-    /// device cannot drop while one stays registered.
-    #[test]
-    fn bar_registration_holds_a_strong_self_reference() {
-        let (dev, _bus_pio, _bus_mmio) = make_device_with_buses();
-        assert_eq!(Arc::strong_count(&dev), 1);
-        enable_bars(&dev);
-        // One handler for BAR0 (PIO) and one for BAR2 (MMIO).
-        assert_eq!(Arc::strong_count(&dev), 3);
-    }
-
-    #[test]
-    fn detach_regions_lets_the_device_drop() {
-        let (dev, bus_pio, bus_mmio) = make_device_with_buses();
-        enable_bars(&dev);
-
-        let weak = Arc::downgrade(&dev);
-        dev.detach_regions();
-        // A second call must not unregister a base twice.
-        dev.detach_regions();
-        assert_eq!(Arc::strong_count(&dev), 1);
-
-        drop(dev);
-        assert!(weak.upgrade().is_none(), "device outlived its last handle");
-
-        // The buses must no longer decode the old BAR ranges.
-        assert_eq!(bus_pio.handle_in(TEST_BAR0_PORT, 1), 0xFF);
-        assert_eq!(
-            bus_mmio.handle_read(TEST_BAR2_ADDR, 4),
-            u64::from(u32::MAX)
-        );
-    }
-}
+#[cfg(test)]
+mod reset_tests;

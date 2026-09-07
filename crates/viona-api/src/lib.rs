@@ -12,24 +12,141 @@ use std::os::fd::*;
 use std::os::unix::fs::MetadataExt;
 
 mod ffi;
+mod link;
 
 pub use ffi::*;
+pub use link::{IntrStatus, IntrWait, LinkOps};
 
 pub const VIONA_DEV_PATH: &str = "/dev/viona";
 
-pub struct VionaFd(File);
+/// Where a [`VionaFd`] sends the ioctls it makes.
+///
+/// [`Chan::Dev`] is the link a VM runs on. A test builds the other
+/// arm, which keeps the command and the argument and reaches no
+/// kernel. Both arms sit under one set of calls: there is a single
+/// `delete`, and that is the one a test watches.
+///
+/// WHY the seam is here and not one layer up: upstream Propolis sends
+/// every ioctl straight to `libc::ioctl`
+/// (propolis/crates/viona-api/src/lib.rs:164), so a test can read only
+/// the errno. A call that names the wrong command, or that swaps two
+/// of its arguments, answers with the same errno as the right one.
+///
+/// A recorder is `#[cfg(test)]`, so no production build can make one.
+enum Chan {
+    /// An open viona device.
+    Dev(File),
+
+    /// A recorder. It holds a file only to answer [`AsRawFd`], and to
+    /// give `wait_intr` a descriptor to poll.
+    #[cfg(test)]
+    Record(File, std::sync::Mutex<Recording>),
+}
+
+/// What a recorder keeps, and what it answers with.
+#[cfg(test)]
+#[derive(Default)]
+struct Recording {
+    /// The ioctls a caller sent, in order.
+    calls: Vec<Call>,
+
+    /// The bytes each command copies back out, by command.
+    ///
+    /// WHY a recorder needs these: without them a caller reads back
+    /// the struct it passed in, so a method whose value comes from
+    /// the copy-out answers exactly like one that returns a constant.
+    /// `intr_status` and `get_features` are both such methods.
+    replies: std::collections::HashMap<i32, Vec<u8>>,
+}
+
+/// One ioctl that a caller sent.
+#[cfg(test)]
+#[derive(Clone, PartialEq, Eq)]
+enum Call {
+    /// The data argument is a value the kernel reads directly.
+    Usize { cmd: i32, arg: usize },
+
+    /// The data argument is a pointer to a struct, kept as the bytes
+    /// the kernel would copy in. Without them a call that swaps two
+    /// fields of its payload records the same thing as the right one.
+    Typed { cmd: i32, data: Vec<u8> },
+}
+
+/// The command in hex, the way `uts/intel/sys/viona_io.h` writes it.
+///
+/// A failed assertion here is read against that header, and a decimal
+/// command number is not.
+#[cfg(test)]
+impl std::fmt::Debug for Call {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Call::Usize { cmd, arg } => {
+                write!(f, "Usize {{ cmd: {cmd:#x}, arg: {arg:#x} }}")
+            }
+            Call::Typed { cmd, data } => {
+                write!(f, "Typed {{ cmd: {cmd:#x}, data: {data:02x?} }}")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Call {
+    /// The command this call sent.
+    fn cmd(&self) -> i32 {
+        match self {
+            Call::Usize { cmd, .. } | Call::Typed { cmd, .. } => *cmd,
+        }
+    }
+
+    /// The value this call sent the kernel.
+    fn value(&self) -> usize {
+        match self {
+            Call::Usize { arg, .. } => *arg,
+            Call::Typed { cmd, .. } => panic!("cmd {cmd:#x} sent no value"),
+        }
+    }
+
+    /// The payload this call sent the kernel, read back.
+    fn payload<T: Copy>(&self) -> T {
+        let Call::Typed { cmd, data } = self else {
+            panic!("cmd {:#x} sent no payload", self.cmd())
+        };
+        assert_eq!(
+            data.len(),
+            size_of::<T>(),
+            "cmd {cmd:#x} sent {} bytes",
+            data.len(),
+        );
+        // Safety: the bytes came from one T, and a Vec's buffer has
+        // no alignment to promise, so the read is unaligned.
+        unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<T>()) }
+    }
+}
+
+pub struct VionaFd(Chan);
 impl VionaFd {
     /// Open viona device and associate it with a given link and vmm instance,
     /// provided in `link_id` and `vm_fd`, respectively.
     pub fn new(link_id: u32, vm_fd: RawFd) -> Result<Self> {
         let this = Self::open()?;
+        this.create(link_id, vm_fd)?;
+        Ok(this)
+    }
 
+    /// Bind an open handle to a link and a VM.
+    ///
+    /// Split out of [`Self::new`] because `new` opens the real device
+    /// first, so no recorder could reach the call and a test could not
+    /// see which field went where.
+    fn create(&self, link_id: u32, vm_fd: RawFd) -> Result<()> {
         let mut vna_create = vioc_create {
             c_linkid: link_id,
             c_vmfd: vm_fd,
         };
-        let _ = unsafe { this.ioctl(VNA_IOC_CREATE, &mut vna_create) }?;
-        Ok(this)
+        // Safety: the kernel reads one vioc_create for this command.
+        let _ = unsafe { self.ioctl(VNA_IOC_CREATE, &mut vna_create) }?;
+        Ok(())
     }
 
     /// Open viona device instance without performing any other initialization
@@ -39,7 +156,16 @@ impl VionaFd {
             .write(true)
             .open(VIONA_DEV_PATH)?;
 
-        Ok(Self(fp))
+        Ok(Self(Chan::Dev(fp)))
+    }
+
+    /// The open file this handle answers for.
+    fn file(&self) -> &File {
+        match &self.0 {
+            Chan::Dev(fp) => fp,
+            #[cfg(test)]
+            Chan::Record(fp, _) => fp,
+        }
     }
 
     /// Issue ioctl against open viona instance
@@ -50,7 +176,46 @@ impl VionaFd {
     /// any copyin/copyout actions which may occur as part of the ioctl
     /// processing.
     pub unsafe fn ioctl<T>(&self, cmd: i32, data: *mut T) -> Result<i32> {
-        ioctl(self.as_raw_fd(), cmd, data as *mut libc::c_void)
+        match &self.0 {
+            Chan::Dev(fp) => {
+                ioctl(fp.as_raw_fd(), cmd, data as *mut libc::c_void)
+            }
+            // A recorder keeps the bytes going in, which is what says
+            // a call filled the payload in the order the kernel reads
+            // it. It then writes back what the test armed for this
+            // command, so a caller that reads a copy-out reads a
+            // value it did not send.
+            //
+            // Safety: the caller's contract above says `data` points
+            // at one initialized T, writable for the same length.
+            // Every ioctl payload names its padding, so no byte read
+            // here is uninitialized, and the bytes written back came
+            // from a value of that size.
+            #[cfg(test)]
+            Chan::Record(_, rec) => {
+                let sent = std::slice::from_raw_parts(
+                    data.cast::<u8>(),
+                    size_of::<T>(),
+                )
+                .to_vec();
+                let mut rec = rec.lock().expect("the recorded calls");
+                rec.calls.push(Call::Typed { cmd, data: sent });
+                if let Some(reply) = rec.replies.get(&cmd) {
+                    assert_eq!(
+                        reply.len(),
+                        size_of::<T>(),
+                        "cmd {cmd:#x} copies out {} bytes",
+                        size_of::<T>(),
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        reply.as_ptr(),
+                        data.cast::<u8>(),
+                        reply.len(),
+                    );
+                }
+                Ok(0)
+            }
+        }
     }
 
     pub fn ioctl_usize(&self, cmd: i32, data: usize) -> Result<i32> {
@@ -60,11 +225,35 @@ impl VionaFd {
                 "unsafe cmd provided",
             ));
         }
-        // Safety: Since we are explicitly filtering for vmm ioctls which will
-        // not assume the data argument is a pointer for copyin/copyout, we can
-        // dismiss those dangers.  The caller is assumed to be cognizant of
-        // other potential side effects.
-        unsafe { ioctl(self.as_raw_fd(), cmd, data as *mut libc::c_void) }
+        match &self.0 {
+            // Safety: Since we are explicitly filtering for vmm ioctls
+            // which will not assume the data argument is a pointer for
+            // copyin/copyout, we can dismiss those dangers.  The caller
+            // is assumed to be cognizant of other potential side
+            // effects.
+            Chan::Dev(fp) => unsafe {
+                ioctl(fp.as_raw_fd(), cmd, data as *mut libc::c_void)
+            },
+            // A recorder answers 1, which is a valid version, so
+            // `api_version` does not trip its own demand.
+            #[cfg(test)]
+            Chan::Record(_, rec) => {
+                rec.lock()
+                    .expect("the recorded calls")
+                    .calls
+                    .push(Call::Usize { cmd, arg: data });
+                Ok(1)
+            }
+        }
+    }
+
+    /// Read the features the kernel driver offers.
+    pub fn get_features(&self) -> Result<u64> {
+        let mut feat: u64 = 0;
+        // Safety: the command copies out one u64, and that is what
+        // `feat` is.
+        unsafe { self.ioctl(VNA_IOC_GET_FEATURES, &mut feat) }?;
+        Ok(feat)
     }
 
     /// Query the API version exposed by the kernel VMM.
@@ -80,7 +269,7 @@ impl VionaFd {
     /// Retrieve the minor number of the viona device instance.
     /// This is used for matching kernel statistic entries to the viona device.
     pub fn instance_id(&self) -> Result<u32> {
-        let meta = self.0.metadata()?;
+        let meta = self.file().metadata()?;
         Ok(minor(&meta))
     }
 
@@ -108,7 +297,7 @@ impl VionaFd {
 }
 impl AsRawFd for VionaFd {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.file().as_raw_fd()
     }
 }
 
@@ -202,19 +391,4 @@ pub fn api_version() -> Result<u32> {
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn latest_api_version() {
-        let cur = ApiVersion::current();
-        assert_eq!(VIONA_CURRENT_INTERFACE_VERSION, cur as u32);
-    }
-
-    #[test]
-    fn u32_comparisons() {
-        assert!(1u32 < ApiVersion::V2);
-        assert!(2u32 == ApiVersion::V2);
-        assert!(3u32 > ApiVersion::V2);
-    }
-}
+mod test;

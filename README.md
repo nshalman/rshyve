@@ -52,12 +52,20 @@ honor at startup. See [docs/cli.md](docs/cli.md#firehyve).
 - [Live Migration](docs/migration.md) - Cross-host VM migration
 - [Metadata Agent](docs/mdata.md) - Guest configuration via COM2
 - [Platform Integration](docs/platform.md) - vmadm/boot.c integration
+- [Hardware run](docs/hardware-run.md) - what a live guest established, and what it did not
 
 ## Building and testing
 
-The `rshyve` binary builds only on illumos: `vmm-tpm-sys` runs an autotools
-build of libtpms, `bhyve-api` binds SunOS ioctls, and `viona-api` needs
-libdladm. Everything else in the workspace builds and tests on any host.
+The `rshyve` binary targets illumos: `bhyve-api` binds SunOS ioctls and
+`viona-api` needs libdladm. Everything else in the workspace builds and
+tests on any host.
+
+`vmm-tpm-sys` is one of those. It drives a real autotools build of the
+vendored libtpms on macOS and Linux as well as on illumos, and the 12
+vTPM tests run on each. Do not replace it with a stub build script. A
+stub hides the OpenSSL link path, and that path is what once produced a
+binary no platform image could load
+([docs/platform.md](docs/platform.md#openssl-and-the-vtpm)).
 
 libtpms is a submodule, so clone with it:
 
@@ -68,12 +76,16 @@ git clone --recurse-submodules https://github.com/TritonDataCenter/rust-bhyve
 
 ```bash
 cargo build --workspace --locked --release   # on an illumos host
-cargo test --workspace --locked
+cargo test --workspace --locked --no-fail-fast
 ```
+
+Pass `--no-fail-fast`. Without it the run stops at the first crate that
+fails, and the partial output still reads like a completed pass.
 
 Build prerequisites on the illumos host: a Rust toolchain, autoconf,
 automake, libtool, pkg-config, gmake, gcc, and OpenSSL development
-files. DTrace is not required to build; USDT probes are compiled in
+files. A macOS or Linux host needs the same set, with `make` in place
+of `gmake`. DTrace is not required to build; USDT probes are compiled in
 either way and simply do not register without it.
 
 [docs/testing.md](docs/testing.md) covers the lab procedures: booting a
@@ -90,7 +102,10 @@ could be offered, since it replaces `/usr/sbin/bhyve` wholesale.
 ## Status
 
 Tested on SmartOS with bhyve API v18. See [docs/status.md](docs/status.md)
-for feature matrix.
+for the feature matrix and
+[docs/hardware-run.md](docs/hardware-run.md) for what a live guest
+showed, including the one platform limit it found: a device reset has
+no bounded duration on illumos.
 
 ## Security
 

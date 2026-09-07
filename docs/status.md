@@ -14,6 +14,17 @@
 | Same-host migration with busy workload | Working |
 | SIGTERM graceful shutdown | Working |
 | dd sequential read (NVMe, O_DIRECT) | 2.8 GB/s (matches C bhyve) |
+| 293 guest device resets under load, data verified after each | Working |
+| 5 warm reboots with a dirty guest page cache | Working |
+| virtio-fs and viona reset with traffic in flight | Working |
+| 30 guest ACPI S5 poweroffs, no leaked process or VM instance | Working |
+| 140 device resets on a Debian 13 guest, 4 vCPUs (100 modern, 40 legacy) | Working |
+| Multiqueue virtio-blk, 128 MiB written and verified per queue with vCPU pinning | Working |
+
+The reset, reboot and poweroff rows come from two lab sessions. The
+second ran a Debian 13 guest with 4 vCPUs, a real block driver stack
+and a real init. What they do and do not show is in
+[hardware-run.md](hardware-run.md).
 
 ## Devices
 
@@ -97,3 +108,11 @@
 - NVList/zhyve.cmd reader not implemented (boot.c integration uses CLI flags directly)
 - Large VMs (>32 GB) not tested with migration
 - virtio-net TX may show initial delay on first packet (viona interrupt poll startup)
+- A device reset has no bounded duration. Anything holding the bhyve VM
+  write lock delays it, and memory hot-add holds that lock for 233 to
+  270 ms per GiB. See
+  [hardware-run.md](hardware-run.md#why-a-device-reset-has-no-upper-bound)
+- The control socket's peer check runs on macOS and Linux only, the
+  autodestruct test runs on illumos only, and nothing compares
+  per-crate test counts across platforms. See
+  [hardware-run.md](hardware-run.md#coverage-that-does-not-reach-illumos)

@@ -17,7 +17,8 @@
 //! prevent infinite loops from malicious guests.
 
 use std::sync::atomic::{fence, Ordering};
-use std::sync::Arc;
+
+use slog::debug;
 
 use vmm_core::common::PAGE_SIZE;
 use vmm_core::mem::PhysMap;
@@ -69,6 +70,65 @@ pub enum ChainBuf {
     Writable { addr: u64, len: u32 },
 }
 
+/// One of the three rings a split virtqueue is made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ring {
+    Desc,
+    Avail,
+    Used,
+}
+
+impl Ring {
+    /// The alignment VirtIO 1.3 sec 2.7 fixes for the ring.
+    const fn align(self) -> u64 {
+        match self {
+            Ring::Desc => 16,
+            Ring::Avail => 2,
+            Ring::Used => 4,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Ring::Desc => "desc",
+            Ring::Avail => "avail",
+            Ring::Used => "used",
+        }
+    }
+}
+
+/// Why the device refuses the ring addresses a guest programmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueAddrError {
+    /// The address is zero, so the guest never programmed the ring.
+    Unset(Ring),
+    /// The address breaks the alignment the spec fixes for the ring.
+    Misaligned { ring: Ring, addr: u64 },
+    /// The ring is not mapped guest memory for its whole size.
+    Unmapped { ring: Ring, addr: u64, len: usize },
+}
+
+impl std::fmt::Display for QueueAddrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unset(ring) => {
+                write!(f, "{} ring address is zero", ring.name())
+            }
+            Self::Misaligned { ring, addr } => write!(
+                f,
+                "{} ring at {addr:#x} is not aligned to {}",
+                ring.name(),
+                ring.align(),
+            ),
+            Self::Unmapped { ring, addr, len } => write!(
+                f,
+                "{} ring at {addr:#x} is not {len} bytes of guest memory",
+                ring.name(),
+            ),
+        }
+    }
+}
+
 /// A split virtqueue.
 ///
 /// Manages the descriptor table, available ring, and used ring for one
@@ -95,6 +155,10 @@ pub struct VirtQueue {
     event_idx: bool,
     /// Whether VIRTIO_F_RING_INDIRECT_DESC is negotiated.
     indirect_supported: bool,
+    /// The address check, kept from the first use of the rings.
+    addrs_ok: Option<bool>,
+    /// Where a refusal is reported. Silent until a transport sets one.
+    log: Option<slog::Logger>,
 }
 
 impl VirtQueue {
@@ -120,7 +184,14 @@ impl VirtQueue {
             shadow_used_idx: 0,
             event_idx: false,
             indirect_supported: false,
+            addrs_ok: None,
+            log: None,
         }
+    }
+
+    /// Report refusals through `log`.
+    pub fn set_log(&mut self, log: slog::Logger) {
+        self.log = Some(log);
     }
 
     /// Get the queue size (number of descriptors).
@@ -140,6 +211,11 @@ impl VirtQueue {
     /// when to raise an interrupt. This dramatically reduces VM exits
     /// for high-throughput workloads.
     pub fn set_event_idx(&mut self, enabled: bool) {
+        // The feature adds the suppression word to what the device
+        // reads, so a cached verdict was taken against a shorter ring.
+        if self.event_idx != enabled {
+            self.addrs_ok = None;
+        }
         self.event_idx = enabled;
     }
 
@@ -189,6 +265,7 @@ impl VirtQueue {
     /// - Available ring at PFN * PAGE_SIZE + size * 16
     /// - Used ring aligned to next page boundary after available ring
     pub fn set_addr_legacy(&mut self, pfn: u32) {
+        self.addrs_ok = None;
         if pfn == 0 {
             self.desc_addr = 0;
             self.avail_addr = 0;
@@ -218,6 +295,7 @@ impl VirtQueue {
     /// the descriptor table, available ring, and used ring instead of
     /// computing them from a single PFN.
     pub fn set_addr_modern(&mut self, desc: u64, avail: u64, used: u64) {
+        self.addrs_ok = None;
         self.desc_addr = desc;
         self.avail_addr = avail;
         self.used_addr = used;
@@ -282,11 +360,103 @@ impl VirtQueue {
 
     /// Reset the queue state (called on device reset).
     pub fn reset(&mut self) {
+        self.addrs_ok = None;
         self.desc_addr = 0;
         self.avail_addr = 0;
         self.used_addr = 0;
         self.last_avail_idx = 0;
         self.shadow_used_idx = 0;
+    }
+
+    /// Bytes the descriptor table occupies: 16 per entry (sec 2.7.5).
+    fn desc_table_bytes(&self) -> usize {
+        usize::from(self.size) * 16
+    }
+
+    /// Bytes of the available ring the device can reach: flags, idx and
+    /// one 2 byte entry per descriptor (sec 2.7.6).
+    fn avail_ring_bytes(&self) -> usize {
+        4 + usize::from(self.size) * 2 + self.event_field_bytes()
+    }
+
+    /// Bytes of the used ring the device can reach: flags, idx and one
+    /// 8 byte entry per descriptor (sec 2.7.8).
+    fn used_ring_bytes(&self) -> usize {
+        4 + usize::from(self.size) * 8 + self.event_field_bytes()
+    }
+
+    /// The suppression field each ring carries only under EVENT_IDX.
+    /// Demanding it otherwise would refuse a ring that works, because
+    /// the device never reads that far without the feature.
+    fn event_field_bytes(&self) -> usize {
+        if self.event_idx {
+            2
+        } else {
+            0
+        }
+    }
+
+    /// Check the three ring addresses against the guest memory map.
+    ///
+    /// A ring that is misaligned, or that leaves mapped memory, fails
+    /// every access the device makes on it. Nothing else notices: the
+    /// device keeps taking heads off the available ring and completing
+    /// none of them, while the guest still reads DRIVER_OK.
+    pub fn validate_addrs(
+        &self,
+        physmap: &PhysMap,
+    ) -> Result<(), QueueAddrError> {
+        for (ring, addr, len) in [
+            (Ring::Desc, self.desc_addr, self.desc_table_bytes()),
+            (Ring::Avail, self.avail_addr, self.avail_ring_bytes()),
+            (Ring::Used, self.used_addr, self.used_ring_bytes()),
+        ] {
+            if addr == 0 {
+                return Err(QueueAddrError::Unset(ring));
+            }
+            if !addr.is_multiple_of(ring.align()) {
+                return Err(QueueAddrError::Misaligned { ring, addr });
+            }
+            // `lookup` refuses a range that wraps or that leaves the
+            // mapped run, which is the reach of every later access.
+            if physmap.lookup(addr, len).is_none() {
+                return Err(QueueAddrError::Unmapped { ring, addr, len });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the rings passed [`Self::validate_addrs`], checked once
+    /// and remembered.
+    ///
+    /// The verdict holds until the guest programs the rings again. A
+    /// queue that failed cannot start working, and rechecking it on
+    /// every kick would let a guest drive the log.
+    fn addrs_usable(&mut self, physmap: &PhysMap) -> bool {
+        if let Some(ok) = self.addrs_ok {
+            return ok;
+        }
+        match self.validate_addrs(physmap) {
+            Ok(()) => {
+                self.addrs_ok = Some(true);
+                true
+            }
+            Err(error) => {
+                self.addrs_ok = Some(false);
+                if let Some(log) = &self.log {
+                    debug!(log, "virtqueue refused"; "reason" => %error);
+                }
+                false
+            }
+        }
+    }
+
+    /// Whether the queue refused the addresses the guest programmed.
+    ///
+    /// The transport turns this into DEVICE_NEEDS_RESET. A driver has
+    /// no other way to learn that the device stopped.
+    pub fn needs_reset(&self) -> bool {
+        self.addrs_ok == Some(false)
     }
 
     /// Read a descriptor from the descriptor table.
@@ -307,6 +477,11 @@ impl VirtQueue {
     /// Returns `None` if no new descriptors are available.
     pub fn pop_avail(&mut self, physmap: &PhysMap) -> Option<u16> {
         if !self.is_configured() {
+            return None;
+        }
+        // The rings are checked here, not in the address setters: only
+        // a caller with the memory map can say where they land.
+        if !self.addrs_usable(physmap) {
             return None;
         }
 
@@ -661,552 +836,8 @@ fn align_up(val: u64, align: u64) -> u64 {
     (val + align - 1) & !(align - 1)
 }
 
-/// Thread-safe completion handler for async virtio I/O.
-///
-/// Exclusively owns the used ring write index for one virtqueue.
-/// ALL completions — inline fast-path and async workers — MUST go
-/// through this struct. Never mix with `VirtQueue::push_used()`.
-///
-/// # Design (Propolis `Mutex<VqUsed>` pattern)
-///
-/// - `Mutex<u16>` serializes used ring writes so entry data is
-///   always committed before the index advances
-/// - Release fence before index write ensures the guest sees the
-///   entry data before the updated index
-/// - Interrupt callback fires after the Mutex is released
-///
-/// # Performance
-///
-/// - Uncontended Mutex: ~10ns (single atomic CAS)
-/// - Zero heap allocation per I/O
-/// - Batch mode: one interrupt for N completions
-///
-/// # Reuse
-///
-/// Generic for any async virtio device (block, scsi, net, 9p).
-/// Create one per virtqueue via `VirtioCompletion::new()`.
-pub struct VirtioCompletion {
-    used_addr: u64,
-    avail_addr: u64,
-    queue_size: u16,
-    write_idx: std::sync::Mutex<u16>,
-    physmap: Arc<PhysMap>,
-    interrupt: Box<dyn Fn() + Send + Sync>,
-    /// Whether VIRTIO_F_RING_EVENT_IDX is negotiated.
-    event_idx: bool,
-    /// Force-interrupt counter: always fire interrupt for the first
-    /// N completions. Used after migration to ensure the guest
-    /// processes completions even when EVENT_IDX would suppress them.
-    force_intr_count: std::sync::atomic::AtomicU32,
-}
-
-impl VirtioCompletion {
-    /// Create a completion handler for a configured virtqueue.
-    ///
-    /// Reads the current used index from guest memory to establish
-    /// the starting write position. From this point forward, this
-    /// struct exclusively owns the used ring write index.
-    pub fn new(
-        queue: &VirtQueue,
-        physmap: Arc<PhysMap>,
-        interrupt: impl Fn() + Send + Sync + 'static,
-    ) -> Arc<Self> {
-        let (used_addr, queue_size) = queue.used_ring_info();
-        let avail_addr = queue.avail_addr();
-        let idx_gpa = used_addr + 2;
-        let initial_idx = physmap
-            .lookup(idx_gpa, 2)
-            .and_then(|sub| sub.read::<u16>().ok())
-            .unwrap_or(0);
-
-        let event_idx = queue.event_idx_enabled();
-        Arc::new(Self {
-            used_addr,
-            avail_addr,
-            queue_size,
-            write_idx: std::sync::Mutex::new(initial_idx),
-            physmap,
-            interrupt: Box::new(interrupt),
-            event_idx,
-            force_intr_count: std::sync::atomic::AtomicU32::new(0),
-        })
-    }
-
-    /// Complete one request: write used entry, raise interrupt if needed.
-    ///
-    /// When `event_idx` is negotiated, reads `avail_event` from the
-    /// guest to determine if an interrupt is needed. This suppresses
-    /// redundant interrupts — the guest only wants an interrupt when
-    /// the device has completed past the index the guest last saw.
-    ///
-    /// Safe from any thread (vCPU inline path or I/O worker).
-    #[inline]
-    pub fn complete(&self, desc_idx: u16, len: u32) {
-        let old_idx;
-        let new_idx;
-        {
-            let mut idx = self.write_idx.lock().expect("completion lock");
-            old_idx = *idx;
-            self.write_used_entry(&mut idx, desc_idx, len);
-            new_idx = *idx;
-        }
-
-        if self.should_interrupt(old_idx, new_idx) {
-            (self.interrupt)();
-        }
-    }
-
-    /// Complete a batch: write all entries, one interrupt if needed.
-    ///
-    /// The Mutex is held across all writes so no thread can interleave.
-    /// With event_idx, the interrupt is only raised if the guest
-    /// needs notification based on the avail_event threshold.
-    pub fn complete_batch(&self, entries: &[(u16, u32)]) {
-        if entries.is_empty() {
-            return;
-        }
-        let old_idx;
-        let new_idx;
-        {
-            let mut idx = self.write_idx.lock().expect("completion lock");
-            old_idx = *idx;
-            for &(desc_idx, len) in entries {
-                self.write_used_entry(&mut idx, desc_idx, len);
-            }
-            new_idx = *idx;
-        }
-        if self.should_interrupt(old_idx, new_idx) {
-            (self.interrupt)();
-        }
-    }
-
-    /// Force the next N completions to always fire an interrupt,
-    /// bypassing EVENT_IDX suppression. Used after migration to
-    /// ensure the guest processes stale used entries.
-    pub fn set_force_interrupt(&self, count: u32) {
-        self.force_intr_count.store(count, Ordering::Release);
-    }
-
-    /// Check if the guest needs an interrupt.
-    ///
-    /// With event_idx: only interrupt when `new_idx` crosses the
-    /// `avail_event` threshold set by the guest. Uses the VirtIO 1.3
-    /// wrapping comparison from spec sec 2.7.7.1.
-    ///
-    /// Without event_idx: always interrupt (no suppression).
-    fn should_interrupt(&self, old_idx: u16, new_idx: u16) -> bool {
-        // Force-interrupt mode: always fire for the first N completions
-        let force = self.force_intr_count.load(Ordering::Acquire);
-        if force > 0 {
-            self.force_intr_count.fetch_sub(1, Ordering::AcqRel);
-            return true;
-        }
-        if !self.event_idx {
-            // Without EVENT_IDX, check the avail ring flags field.
-            if self.avail_addr != 0 {
-                if let Some(sub) = self.physmap.lookup(self.avail_addr, 2) {
-                    if let Ok(flags) = sub.read::<u16>() {
-                        return flags & bits::VIRTQ_AVAIL_F_NO_INTERRUPT == 0;
-                    }
-                }
-            }
-            return true;
-        }
-
-        // Full barrier: ensure our used_idx write (in write_used_entry)
-        // is visible to the guest before we read used_event. Without
-        // this, a Store-Load reorder could cause us to read a stale
-        // used_event and skip an interrupt the guest expects.
-        // QEMU: smp_mb() in virtio_split_should_notify().
-        fence(Ordering::SeqCst);
-
-        // Read used_event from the avail ring (driver's threshold).
-        // Layout: flags(2) + idx(2) + ring(2*N) + used_event(2)
-        let used_event_gpa =
-            self.avail_addr + 4 + u64::from(self.queue_size) * 2;
-        let used_event = match self
-            .physmap
-            .lookup(used_event_gpa, 2)
-            .and_then(|sub| sub.read::<u16>().ok())
-        {
-            Some(v) => v,
-            None => return true, // Can't read → always interrupt (safe)
-        };
-
-        // VirtIO 1.3 sec 2.7.7.1 (vring_need_event):
-        // Interrupt when the used index crosses the guest's threshold.
-        vring_need_event(used_event, new_idx, old_idx)
-    }
-
-    /// Write one entry and advance the index. Caller holds Mutex.
-    fn write_used_entry(&self, idx: &mut u16, desc_idx: u16, len: u32) {
-        let slot = u64::from(*idx % self.queue_size);
-        let entry_gpa = self.used_addr + 4 + slot * 8;
-
-        if let Some(sub) = self.physmap.lookup(entry_gpa, 8) {
-            // write to guest memory; no recovery if unmapped
-            let _ = sub.write::<u32>(&u32::from(desc_idx));
-            if let Some(len_sub) = sub.subregion(4, 4) {
-                let _ = len_sub.write::<u32>(&len);
-            }
-        }
-
-        // Release fence: guest reads index first, then entry data.
-        fence(Ordering::Release);
-
-        *idx = idx.wrapping_add(1);
-        let idx_gpa = self.used_addr + 2;
-        if let Some(sub) = self.physmap.lookup(idx_gpa, 2) {
-            // write to guest memory; no recovery if unmapped
-            let _ = sub.write::<u16>(idx);
-        }
-    }
-}
+mod completion;
+pub use completion::VirtioCompletion;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const INDIRECT_TABLE_GPA: u64 = 0x1000;
-
-    fn indirect_physmap(num_descs: usize) -> PhysMap {
-        PhysMap::new_anon(INDIRECT_TABLE_GPA, num_descs * 16)
-            .expect("create anonymous indirect table memory")
-    }
-
-    fn write_indirect_desc(physmap: &PhysMap, idx: usize, desc: VirtqDesc) {
-        physmap
-            .lookup(INDIRECT_TABLE_GPA + (idx as u64 * 16), 16)
-            .expect("mapped indirect descriptor")
-            .write(&desc)
-            .expect("write indirect descriptor");
-    }
-
-    #[test]
-    fn pop_avail_failing_lookup_does_not_advance_last_avail_idx() {
-        const REGION_GPA: u64 = 0x4000;
-        const REGION_SIZE: usize = 0x1000;
-        const REGION_END: u64 = REGION_GPA + REGION_SIZE as u64;
-
-        let physmap = PhysMap::new_anon(REGION_GPA, REGION_SIZE)
-            .expect("create guest memory");
-        let mut queue = VirtQueue::new(2);
-        queue.set_addr_modern(REGION_GPA, REGION_END - 4, REGION_GPA + 0x100);
-        physmap
-            .lookup(REGION_END - 2, 2)
-            .expect("mapped avail index")
-            .write::<u16>(&1)
-            .expect("write avail index");
-
-        let before = queue.last_avail_idx();
-        assert_eq!(queue.pop_avail(&physmap), None);
-        assert_eq!(queue.last_avail_idx(), before);
-    }
-
-    #[test]
-    fn new_queue_defaults() {
-        let q = VirtQueue::new(256);
-        assert_eq!(q.size(), 256);
-        assert!(!q.is_configured());
-        assert_eq!(q.pfn(), 0);
-    }
-
-    #[test]
-    fn set_addr_legacy_computes_regions() {
-        let mut q = VirtQueue::new(256);
-        // PFN 1 => base = 4096
-        q.set_addr_legacy(1);
-        assert!(q.is_configured());
-        assert_eq!(q.pfn(), 1);
-
-        // Desc at base
-        assert_eq!(q.desc_addr, 4096);
-        // Avail at base + 256 * 16 = base + 4096 = 8192
-        assert_eq!(q.avail_addr, 4096 + 256 * 16);
-        // Used at next page boundary after avail ring
-        let avail_end = q.avail_addr + 6 + 256 * 2;
-        let expected_used = align_up(avail_end, PAGE_SIZE as u64);
-        assert_eq!(q.used_addr, expected_used);
-    }
-
-    #[test]
-    fn set_addr_legacy_zero_resets() {
-        let mut q = VirtQueue::new(128);
-        q.set_addr_legacy(1);
-        assert!(q.is_configured());
-
-        q.set_addr_legacy(0);
-        assert!(!q.is_configured());
-        assert_eq!(q.desc_addr, 0);
-        assert_eq!(q.avail_addr, 0);
-        assert_eq!(q.used_addr, 0);
-    }
-
-    #[test]
-    fn reset_clears_state() {
-        let mut q = VirtQueue::new(64);
-        q.set_addr_legacy(10);
-        q.reset();
-        assert!(!q.is_configured());
-        assert_eq!(q.pfn(), 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "power of 2")]
-    fn non_power_of_two_panics() {
-        let _ = VirtQueue::new(100);
-    }
-
-    #[test]
-    #[should_panic(expected = "power of 2")]
-    fn zero_size_panics() {
-        let _ = VirtQueue::new(0);
-    }
-
-    #[test]
-    fn align_up_works() {
-        assert_eq!(align_up(0, 4096), 0);
-        assert_eq!(align_up(1, 4096), 4096);
-        assert_eq!(align_up(4096, 4096), 4096);
-        assert_eq!(align_up(4097, 4096), 8192);
-    }
-
-    #[test]
-    fn virtq_desc_flags() {
-        let desc = VirtqDesc {
-            addr: 0x1000,
-            len: 512,
-            flags: bits::VRING_DESC_F_NEXT | bits::VRING_DESC_F_WRITE,
-            next: 1,
-        };
-        assert!(desc.has_next());
-        assert!(desc.is_write());
-        assert!(!desc.is_indirect());
-
-        let desc2 = VirtqDesc {
-            addr: 0x2000,
-            len: 1,
-            flags: 0,
-            next: 0,
-        };
-        assert!(!desc2.has_next());
-        assert!(!desc2.is_write());
-        assert!(!desc2.is_indirect());
-    }
-
-    #[test]
-    fn virtq_desc_indirect_flag() {
-        let desc = VirtqDesc {
-            addr: 0x3000,
-            len: 256,
-            flags: bits::VRING_DESC_F_INDIRECT,
-            next: 0,
-        };
-        assert!(desc.is_indirect());
-        assert!(!desc.has_next());
-        assert!(!desc.is_write());
-
-        // Indirect + other flags
-        let desc2 = VirtqDesc {
-            addr: 0x4000,
-            len: 128,
-            flags: bits::VRING_DESC_F_INDIRECT | bits::VRING_DESC_F_WRITE,
-            next: 0,
-        };
-        assert!(desc2.is_indirect());
-        assert!(desc2.is_write());
-    }
-
-    #[test]
-    fn indirect_table_longer_than_queue_size_is_rejected() {
-        // Every descriptor is backed and walkable, so the size bound is
-        // the only thing that can reject this table.
-        let q = VirtQueue::new(4);
-        let physmap = indirect_physmap(5);
-        for idx in 0..5 {
-            write_indirect_desc(
-                &physmap,
-                idx,
-                VirtqDesc {
-                    addr: 0x2000 + (idx as u64 * 0x1000),
-                    len: 64,
-                    flags: if idx == 4 { 0 } else { bits::VRING_DESC_F_NEXT },
-                    next: idx as u16 + 1,
-                },
-            );
-        }
-
-        assert!(q
-            .walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 5 * 16)
-            .is_none());
-
-        // Same table, queue large enough to admit it: now it walks.
-        let q = VirtQueue::new(8);
-        assert_eq!(
-            q.walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 5 * 16)
-                .expect("table within queue size")
-                .len(),
-            5
-        );
-    }
-
-    #[test]
-    fn indirect_table_within_queue_size_still_walks() {
-        let q = VirtQueue::new(4);
-        let physmap = indirect_physmap(3);
-        write_indirect_desc(
-            &physmap,
-            0,
-            VirtqDesc {
-                addr: 0x2000,
-                len: 64,
-                flags: bits::VRING_DESC_F_NEXT,
-                next: 1,
-            },
-        );
-        write_indirect_desc(
-            &physmap,
-            1,
-            VirtqDesc {
-                addr: 0x3000,
-                len: 128,
-                flags: bits::VRING_DESC_F_NEXT | bits::VRING_DESC_F_WRITE,
-                next: 2,
-            },
-        );
-        write_indirect_desc(
-            &physmap,
-            2,
-            VirtqDesc {
-                addr: 0x4000,
-                len: 32,
-                flags: 0,
-                next: 0,
-            },
-        );
-
-        let bufs = q
-            .walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 3 * 16)
-            .expect("valid indirect table");
-
-        assert_eq!(bufs.len(), 3);
-        assert!(matches!(
-            bufs[0],
-            ChainBuf::Readable {
-                addr: 0x2000,
-                len: 64
-            }
-        ));
-        assert!(matches!(
-            bufs[1],
-            ChainBuf::Writable {
-                addr: 0x3000,
-                len: 128
-            }
-        ));
-        assert!(matches!(
-            bufs[2],
-            ChainBuf::Readable {
-                addr: 0x4000,
-                len: 32
-            }
-        ));
-    }
-
-    #[test]
-    fn indirect_len_not_multiple_of_16_rejected() {
-        let q = VirtQueue::new(4);
-        let physmap = indirect_physmap(2);
-
-        assert!(q
-            .walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 17)
-            .is_none());
-    }
-
-    #[test]
-    fn indirect_cycle_terminates_and_returns_none() {
-        let q = VirtQueue::new(4);
-        let physmap = indirect_physmap(3);
-        for idx in 0..3 {
-            write_indirect_desc(
-                &physmap,
-                idx,
-                VirtqDesc {
-                    addr: 0x2000 + (idx as u64 * 0x1000),
-                    len: 64,
-                    flags: bits::VRING_DESC_F_NEXT,
-                    next: if idx == 2 { 0 } else { idx as u16 + 1 },
-                },
-            );
-        }
-
-        assert!(q
-            .walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 3 * 16)
-            .is_none());
-    }
-
-    // -- EVENT_IDX tests --
-
-    #[test]
-    fn vring_need_event_crossing_threshold() {
-        // new_idx crosses event_idx: should interrupt
-        // old=0, new=1, event=0: (1-0-1=0) < (1-0=1) → true
-        assert!(vring_need_event(0, 1, 0));
-        // old=5, new=10, event=7: (10-7-1=2) < (10-5=5) → true
-        assert!(vring_need_event(7, 10, 5));
-    }
-
-    #[test]
-    fn vring_need_event_threshold_already_passed() {
-        // event_idx already behind old_idx: no interrupt
-        // old=5, new=10, event=4: (10-4-1=5) < (10-5=5) → false
-        assert!(!vring_need_event(4, 10, 5));
-        // old=0, new=1, event=1: (1-1-1=65535) < (1-0=1) → false
-        assert!(!vring_need_event(1, 1, 0));
-    }
-
-    #[test]
-    fn vring_need_event_no_new_work() {
-        // old == new (no work done): never interrupt
-        assert!(!vring_need_event(3, 5, 5));
-        assert!(!vring_need_event(0, 0, 0));
-    }
-
-    #[test]
-    fn vring_need_event_wrapping() {
-        // Wrapping around u16::MAX
-        // old=65535, new=0, event=65535: (0-65535-1=0) < (0-65535=1) → true
-        assert!(vring_need_event(65535, 0, 65535));
-        // old=65535, new=0, event=0: (0-0-1=65535) < (0-65535=1) → false
-        assert!(!vring_need_event(0, 0, 65535));
-        // old=65534, new=1, event=65535: (1-65535-1=1) < (1-65534=3) → true
-        assert!(vring_need_event(65535, 1, 65534));
-    }
-
-    #[test]
-    fn vring_need_event_single_step() {
-        // Exact threshold crossing: old=N, new=N+1, event=N → interrupt
-        for n in [0u16, 1, 100, 255, 65534, 65535] {
-            assert!(
-                vring_need_event(n, n.wrapping_add(1), n),
-                "should interrupt at threshold {n}",
-            );
-        }
-    }
-
-    #[test]
-    fn has_new_avail_disabled_when_no_event_idx() {
-        let q = VirtQueue::new(128);
-        assert!(!q.event_idx_enabled());
-        // has_new_avail should always return false when event_idx is off
-        // (can't test with real PhysMap, but the early return is the key)
-    }
-
-    #[test]
-    fn has_new_avail_disabled_when_not_configured() {
-        let mut q = VirtQueue::new(128);
-        q.set_event_idx(true);
-        // Not configured (no PFN set) → false
-        assert!(!q.is_configured());
-    }
-}
+mod tests;

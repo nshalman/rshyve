@@ -24,6 +24,22 @@ use super::packet::{
 /// memory without limit while the guest is not reading.
 pub const RX_BACKLOG_MAX: usize = 1024 * 1024;
 
+/// Live connections one device holds. Both ends open them: a host peer
+/// that connects, and a guest that sends REQUEST. Each one costs a
+/// table entry, a host socket and a reader thread, so without a cap
+/// either end can exhaust the VMM. cloud-hypervisor caps its muxer at
+/// 1023 for the same reason.
+pub const MAX_CONNS: usize = 1024;
+
+/// Packets queued for the guest, of any kind.
+///
+/// [`RX_BACKLOG_MAX`] bounds payload bytes, but a control packet
+/// carries none and is admitted anyway, so it needs a separate bound: a
+/// guest that never posts an RX chain can make the device reply to
+/// packets far faster than the queue drains. Deep enough for several
+/// control packets per live connection.
+pub const RX_PACKETS_MAX: usize = MAX_CONNS * 4;
+
 /// Host ports handed to guest-initiated connections start here, above
 /// anything a caller is likely to have named.
 const EPHEMERAL_PORT_BASE: u32 = 49152;
@@ -63,11 +79,21 @@ pub enum GuestAction {
     Connect(ConnKey, u32),
 }
 
+/// Packets waiting for an RX chain, and the payload bytes they hold.
+///
+/// One lock, not two: the queue, its length cap and its byte count are
+/// one invariant, and both caps have to be tested and applied without
+/// letting go in between.
+#[derive(Default)]
+struct RxQueue {
+    q: VecDeque<RxPacket>,
+    bytes: usize,
+}
+
 pub struct VsockMux {
     guest_cid: u64,
     conns: Mutex<HashMap<ConnKey, VsockConn>>,
-    rx: Mutex<VecDeque<RxPacket>>,
-    rx_bytes: Mutex<usize>,
+    rx: Mutex<RxQueue>,
     next_host_port: AtomicU32,
 }
 
@@ -76,8 +102,7 @@ impl VsockMux {
         Self {
             guest_cid,
             conns: Mutex::new(HashMap::new()),
-            rx: Mutex::new(VecDeque::new()),
-            rx_bytes: Mutex::new(0),
+            rx: Mutex::new(RxQueue::default()),
             next_host_port: AtomicU32::new(EPHEMERAL_PORT_BASE),
         }
     }
@@ -94,46 +119,91 @@ impl VsockMux {
     /// Queue a packet for the guest. Returns false when the backlog is
     /// full, which tells the caller to stop reading its host socket.
     pub fn push_rx(&self, pkt: RxPacket) -> bool {
-        let mut bytes = self.rx_bytes.lock().expect("rx bytes lock");
-        // Control packets are always admitted: dropping a RST or a
-        // RESPONSE wedges the connection it belongs to, and they are
-        // small enough that the cap stays meaningful.
+        let mut rx = self.rx.lock().expect("rx lock");
+        // The packet cap holds for every kind of packet. A queue this
+        // deep means the guest has stopped draining, so its connections
+        // are wedged already, and dropping one more packet is what
+        // keeps the VMM standing. cloud-hypervisor drops an RST on a
+        // full queue for the same reason.
+        if rx.q.len() >= RX_PACKETS_MAX {
+            return false;
+        }
+        // Below that, a control packet is always admitted: dropping a
+        // RST or a RESPONSE wedges the connection it belongs to, and
+        // they are small enough that the byte cap stays meaningful.
         if !pkt.payload.is_empty()
-            && *bytes + pkt.payload.len() > RX_BACKLOG_MAX
+            && rx.bytes.saturating_add(pkt.payload.len()) > RX_BACKLOG_MAX
         {
             return false;
         }
-        *bytes += pkt.payload.len();
-        self.rx.lock().expect("rx lock").push_back(pkt);
+        rx.bytes = rx.bytes.saturating_add(pkt.payload.len());
+        rx.q.push_back(pkt);
         true
     }
 
     /// Next packet for the guest, if any.
     pub fn pop_rx(&self) -> Option<RxPacket> {
-        let pkt = self.rx.lock().expect("rx lock").pop_front()?;
-        let mut bytes = self.rx_bytes.lock().expect("rx bytes lock");
-        *bytes = bytes.saturating_sub(pkt.payload.len());
+        let mut rx = self.rx.lock().expect("rx lock");
+        let pkt = rx.q.pop_front()?;
+        rx.bytes = rx.bytes.saturating_sub(pkt.payload.len());
         Some(pkt)
     }
 
     /// Put a packet back at the head of the queue, keeping stream
     /// order. Used when a chain was too small to take all of it.
+    ///
+    /// Not subject to either cap: this packet was just popped, so it
+    /// returns the queue to a size it already held.
     pub fn requeue_rx_front(&self, pkt: RxPacket) {
-        let mut bytes = self.rx_bytes.lock().expect("rx bytes lock");
-        *bytes += pkt.payload.len();
-        self.rx.lock().expect("rx lock").push_front(pkt);
+        let mut rx = self.rx.lock().expect("rx lock");
+        rx.bytes = rx.bytes.saturating_add(pkt.payload.len());
+        rx.q.push_front(pkt);
     }
 
     pub fn rx_is_empty(&self) -> bool {
-        self.rx.lock().expect("rx lock").is_empty()
+        self.rx.lock().expect("rx lock").q.is_empty()
     }
 
     /// Register a host-initiated connection and queue its REQUEST.
-    pub fn start_host_connect(&self, key: ConnKey) {
-        self.conns
-            .lock()
-            .expect("conns lock")
-            .insert(key, VsockConn::new(State::Connecting));
+    ///
+    /// Returns false when the table is at [`MAX_CONNS`]. Nothing is
+    /// registered and the guest is not told, so the caller has to close
+    /// the peer's socket: no answer will ever come for it.
+    ///
+    /// A caller that must write to the host socket first takes the two
+    /// steps apart: [`Self::reserve_host_connect`], then its own write,
+    /// then [`Self::announce_host_connect`].
+    pub fn start_host_connect(&self, key: ConnKey) -> bool {
+        if !self.reserve_host_connect(key) {
+            return false;
+        }
+        self.announce_host_connect(key);
+        true
+    }
+
+    /// Take a slot for a host-initiated connection, without telling the
+    /// guest about it.
+    ///
+    /// The guest cannot reach the connection until
+    /// [`Self::announce_host_connect`] queues its REQUEST, so the caller
+    /// owns the host socket alone until then. Returns false when the
+    /// table is at [`MAX_CONNS`].
+    pub fn reserve_host_connect(&self, key: ConnKey) -> bool {
+        let mut conns = self.conns.lock().expect("conns lock");
+        // Replacing a key the table already holds does not grow it.
+        if conns.len() >= MAX_CONNS && !conns.contains_key(&key) {
+            return false;
+        }
+        conns.insert(key, VsockConn::new(State::Connecting));
+        true
+    }
+
+    /// Tell the guest about a slot taken by
+    /// [`Self::reserve_host_connect`].
+    ///
+    /// From this point any thread's `deliver_rx` may hand the REQUEST to
+    /// the guest, so the caller must have finished with the host socket.
+    pub fn announce_host_connect(&self, key: ConnKey) {
         self.push_rx(RxPacket::control(self.hdr_for(key, OP_REQUEST)));
     }
 
@@ -220,7 +290,10 @@ impl VsockMux {
 
         // A REQUEST opens a connection the table does not have yet.
         if hdr.op == OP_REQUEST {
-            if conns.contains_key(&key) {
+            // Refused for one of two reasons: the guest already has this
+            // connection, or it has as many as it may hold. Each one
+            // costs the device a host socket and a reader thread.
+            if conns.contains_key(&key) || conns.len() >= MAX_CONNS {
                 drop(conns);
                 self.push_rx(RxPacket::control(hdr.reply(OP_RST)));
                 return GuestAction::None;
@@ -316,6 +389,30 @@ mod tests {
             out.push(p);
         }
         out
+    }
+
+    /// A host peer that gives up before the guest answers leaves
+    /// nothing half open: the guest was only ever offered the
+    /// connection. Keeping the entry would let a peer that connects
+    /// and hangs up in a loop fill the table, and the cap then refuses
+    /// every later connection for the life of the VM.
+    #[test]
+    fn a_host_close_before_the_guest_answers_frees_the_slot() {
+        let m = mux();
+        let key = ConnKey {
+            guest_port: 1024,
+            host_port: 1,
+        };
+        assert!(m.start_host_connect(key));
+        assert_eq!(m.conn_count(), 1);
+
+        m.queue_host_close(key);
+
+        assert_eq!(
+            m.conn_count(),
+            0,
+            "a connection the guest never answered was never reclaimed"
+        );
     }
 
     #[test]
@@ -538,6 +635,62 @@ mod tests {
             m.queue_host_data(key, vec![0u8; 64 * 1024]),
             "room must come back once the guest has taken the packets"
         );
+    }
+
+    /// Each connection costs a host socket and a reader thread, so a
+    /// guest that opens them faster than it closes them must be stopped
+    /// at a cap rather than left to exhaust the VMM.
+    #[test]
+    fn the_guest_cannot_grow_the_connection_table_without_bound() {
+        let m = mux();
+        for port in 0..(MAX_CONNS as u32 + 64) {
+            m.on_guest_packet(&guest_hdr(OP_REQUEST, port, 5000), vec![]);
+            drain(&m);
+        }
+        assert_eq!(m.conn_count(), MAX_CONNS);
+
+        // The one over the cap is refused, and told so.
+        let act =
+            m.on_guest_packet(&guest_hdr(OP_REQUEST, 900_000, 5000), vec![]);
+        assert_eq!(act, GuestAction::None);
+        assert_eq!(drain(&m)[0].hdr.op, OP_RST);
+    }
+
+    /// The same cap from the host side, where a peer that connects over
+    /// and over is the one driving it.
+    #[test]
+    fn host_connects_stop_at_the_connection_cap() {
+        let m = mux();
+        for port in 0..MAX_CONNS as u32 {
+            assert!(m.start_host_connect(ConnKey {
+                guest_port: 1024,
+                host_port: 50_000 + port,
+            }));
+            drain(&m);
+        }
+
+        assert!(!m.start_host_connect(ConnKey {
+            guest_port: 1024,
+            host_port: 40_000,
+        }));
+        assert_eq!(m.conn_count(), MAX_CONNS);
+        assert!(
+            drain(&m).is_empty(),
+            "a refused connect must not ask the guest to open one"
+        );
+    }
+
+    /// A control packet carries no payload, so the byte cap never sees
+    /// it. A guest that stops draining must still not be able to grow
+    /// the queue by sending packets the device has to answer.
+    #[test]
+    fn control_packets_cannot_grow_the_rx_queue_without_bound() {
+        let m = mux();
+        for port in 0..(RX_PACKETS_MAX as u32 * 2) {
+            m.on_guest_packet(&guest_hdr(OP_RW, port, 9), vec![]);
+        }
+        assert_eq!(m.conn_count(), 0, "none of these open a connection");
+        assert_eq!(drain(&m).len(), RX_PACKETS_MAX);
     }
 
     #[test]

@@ -71,13 +71,14 @@ const fn howmany(x: usize, y: usize) -> usize {
 pub const VIONA_INTR_WORDS: usize = howmany(VIONA_MAX_QPAIR * 2, 32);
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct vioc_create {
     pub c_linkid: u32,
     pub c_vmfd: i32,
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct vioc_ring_init_modern {
     pub rim_index: u16,
     pub rim_qsize: u16,
@@ -88,7 +89,7 @@ pub struct vioc_ring_init_modern {
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct vioc_ring_msi {
     pub rm_index: u16,
     pub _pad: [u16; 3],
@@ -101,7 +102,7 @@ pub const VIONA_VQ_MAX: u16 = 2;
 
 /// Interrupt poll result for legacy single-pair viona.
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct vioc_intr_poll {
     pub vip_status: [u32; VIONA_VQ_MAX as usize],
 }
@@ -114,15 +115,21 @@ pub struct vioc_intr_poll_mq {
     pub vipm_status: [u32; VIONA_INTR_WORDS],
 }
 
+/// The address window the guest kicks a ring through.
+///
+/// The trailing padding is named. The kernel copies in `sizeof`, so
+/// those four bytes reach it either way, and an unnamed hole would
+/// send it whatever the host stack held.
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct vioc_notify_mmio {
     pub vim_address: u64,
     pub vim_size: u32,
+    pub _pad: u32,
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct vioc_ring_state {
     pub vrs_index: u16,
     pub vrs_avail_idx: u16,
@@ -137,6 +144,22 @@ pub const VIONA_PROMISC_NONE: i32 = 0;
 pub const VIONA_PROMISC_MULTI: i32 = 1;
 pub const VIONA_PROMISC_ALL: i32 = 2;
 // VIONA_PROMISC_ALL_VLAN = 3 (Oxide falcon-specific, omitted)
+
+/// What traffic the link passes to the guest.
+///
+/// The kernel takes this as a value, not through a pointer, so the
+/// wrapper sends it as one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum PromiscMode {
+    /// The link's own address and broadcast only.
+    None = VIONA_PROMISC_NONE,
+    /// Add multicast.
+    Multi = VIONA_PROMISC_MULTI,
+    /// Everything the physical link carries, which is what a guest
+    /// allowed to spoof its MAC needs.
+    All = VIONA_PROMISC_ALL,
+}
 
 #[repr(C)]
 #[derive(Default)]

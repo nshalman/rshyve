@@ -330,7 +330,16 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Serial number of the next test directory in this process.
+    ///
+    /// The clock cannot separate these. Two test threads that start
+    /// together read the same `SystemTime`, because macOS reports it in
+    /// steps coarser than the gap between the threads, and the second
+    /// `create_dir` then fails with EEXIST. A counter always differs.
+    /// The pid keeps two concurrent test processes apart.
+    static DIR_SERIAL: AtomicUsize = AtomicUsize::new(0);
 
     struct TestFiles {
         dir: PathBuf,
@@ -341,12 +350,9 @@ mod tests {
 
     impl TestFiles {
         fn new() -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock before unix epoch")
-                .as_nanos();
+            let serial = DIR_SERIAL.fetch_add(1, Ordering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
-                "fhrun-manifest-test-{}-{unique}",
+                "fhrun-manifest-test-{}-{serial}",
                 std::process::id()
             ));
             std::fs::create_dir(&dir).expect("create test dir");

@@ -26,23 +26,49 @@ use std::path::Path;
 
 use anyhow::{ensure, Context, Result};
 
-use crate::ImageBytes;
+use crate::{BootVcpu, ImageBytes};
 use vmm_core::mem::MemCtx;
-use vmm_core::vcpu::Vcpu;
 use vmm_devices::acpi;
 
 // ── Guest physical addresses ────────────────────────────────────────
 
 const GPA_GDT: u64 = 0x500;
-const GPA_BOOT_PARAMS: u64 = 0x7000;
+/// `load_kernel` writes the zero page here and `setup_direct_boot_bsp`
+/// puts the address in `RSI`. A BSP setup outside this crate has to
+/// name the same address, so it is public.
+pub const GPA_BOOT_PARAMS: u64 = 0x7000;
 const GPA_PML4: u64 = 0x9000;
 const GPA_PDPT: u64 = 0xA000;
 const GPA_PD_BASE: u64 = 0xB000;
-pub(crate) const GPA_CMDLINE: u64 = 0x2_0000;
+/// Where `load_kernel` writes the kernel command line. Public so a
+/// caller can read back, or rewrite, the string it passed.
+pub const GPA_CMDLINE: u64 = 0x2_0000;
 // Reserved for the pending fixed-address kernel placement path.
 #[allow(dead_code)]
 const GPA_KERNEL: u64 = 0x10_0000;
-pub(crate) const CMDLINE_MAX: usize = 4096;
+/// Longest command line `load_kernel` accepts, NUL included. Public so
+/// a caller can reject an over-long string before it loads anything.
+pub const CMDLINE_MAX: usize = 4096;
+
+/// The zero page is one 4 KiB page.
+const BOOT_PARAMS_BYTES: u64 = 4096;
+
+/// PML4, PDPT and one PD per GB of the identity map.
+const PAGE_TABLE_BYTES: u64 = 6 * 4096;
+
+/// The low guest memory `load_kernel` claims, as `(base, len)` pairs in
+/// ascending order.
+///
+/// A boot path outside this crate puts its own tables in low memory and
+/// must avoid these ranges. Only the footprint is a promise: the GDT
+/// and page table addresses inside it stay private, so the layout can
+/// still change.
+pub const DIRECT_BOOT_RESERVED: [(u64, u64); 4] = [
+    (GPA_GDT, GDT_SIZE as u64),
+    (GPA_BOOT_PARAMS, BOOT_PARAMS_BYTES),
+    (GPA_PML4, PAGE_TABLE_BYTES),
+    (GPA_CMDLINE, CMDLINE_MAX as u64),
+];
 
 // ── bzImage setup_header offsets ────────────────────────────────────
 
@@ -422,7 +448,7 @@ fn write_boot_params(
     mem_size: usize,
     acpi_rsdp_addr: u64,
 ) -> Result<()> {
-    let mut bp = [0u8; 4096];
+    let mut bp = [0u8; BOOT_PARAMS_BYTES as usize];
 
     // Copy setup_header from bzImage (preserves kernel's own fields)
     let hdr = kernel.setup_header();
@@ -468,7 +494,10 @@ fn write_boot_params(
 // ── BSP setup ───────────────────────────────────────────────────────
 
 /// Configure vCPU 0 for 64-bit long mode entry into the kernel.
-pub fn setup_direct_boot_bsp(vcpu: &Vcpu, entry_point: u64) -> Result<()> {
+pub fn setup_direct_boot_bsp<V: BootVcpu + ?Sized>(
+    vcpu: &V,
+    entry_point: u64,
+) -> Result<()> {
     use bhyve_api::{
         seg_desc, vm_reg_name::*, SEG_ACCESS_DB, SEG_ACCESS_G, SEG_ACCESS_L,
         SEG_ACCESS_P, SEG_ACCESS_S, SEG_ACCESS_UNUSABLE,
@@ -594,6 +623,8 @@ pub fn setup_direct_boot_bsp(vcpu: &Vcpu, entry_point: u64) -> Result<()> {
 mod tests {
     use super::*;
 
+    use crate::recording::Write;
+
     #[test]
     fn page_table_structure() {
         // Verify page table byte layout
@@ -662,6 +693,108 @@ mod tests {
         let err = KernelImage::from_bytes(img)
             .expect_err("a truncated bzImage must error, not panic");
         assert!(err.to_string().contains("bzImage truncated"), "got: {err}");
+    }
+
+    /// Every register write `setup_direct_boot_bsp` makes, in order.
+    ///
+    /// The values are literals on purpose. Sharing an expression with
+    /// the code under test would let one edit change both sides and
+    /// prove nothing. The guest sees this sequence, so a reorder or a
+    /// changed bit is a boot regression whatever else still compiles.
+    #[test]
+    fn direct_boot_bsp_writes_a_fixed_register_sequence() {
+        use bhyve_api::vm_reg_name::*;
+
+        use crate::recording::{assert_sequence, desc, reg, RecordingVcpu};
+
+        // P|S|L|G|0x0B, P|S|DB|G|0x03, P|0x0B, and UNUSABLE.
+        const CODE64_ACCESS: u32 = 0xA09B;
+        const DATA64_ACCESS: u32 = 0xC093;
+        const TSS_BUSY64_ACCESS: u32 = 0x8B;
+        const LDTR_ACCESS: u32 = 0x1_0000;
+        const ENTRY: u64 = 0x0100_0200;
+
+        let cpu = RecordingVcpu::default();
+        setup_direct_boot_bsp(&cpu, ENTRY).expect("the recorder never fails");
+
+        assert_sequence(
+            &cpu.writes(),
+            &[
+                Write::Reboot,
+                reg(VM_REG_GUEST_CR0, 0x8000_0031), // PG|NE|ET|PE
+                reg(VM_REG_GUEST_CR3, 0x9000),
+                reg(VM_REG_GUEST_CR4, 0x20),   // PAE
+                reg(VM_REG_GUEST_EFER, 0x500), // LMA|LME
+                desc(VM_REG_GUEST_CS, 0, u32::MAX, CODE64_ACCESS),
+                reg(VM_REG_GUEST_CS, 0x08),
+                desc(VM_REG_GUEST_DS, 0, u32::MAX, DATA64_ACCESS),
+                reg(VM_REG_GUEST_DS, 0x10),
+                desc(VM_REG_GUEST_ES, 0, u32::MAX, DATA64_ACCESS),
+                reg(VM_REG_GUEST_ES, 0x10),
+                desc(VM_REG_GUEST_FS, 0, u32::MAX, DATA64_ACCESS),
+                reg(VM_REG_GUEST_FS, 0x10),
+                desc(VM_REG_GUEST_GS, 0, u32::MAX, DATA64_ACCESS),
+                reg(VM_REG_GUEST_GS, 0x10),
+                desc(VM_REG_GUEST_SS, 0, u32::MAX, DATA64_ACCESS),
+                reg(VM_REG_GUEST_SS, 0x10),
+                desc(VM_REG_GUEST_GDTR, 0x500, 23, 0),
+                desc(VM_REG_GUEST_TR, 0, 0xFFFF, TSS_BUSY64_ACCESS),
+                reg(VM_REG_GUEST_TR, 0),
+                desc(VM_REG_GUEST_LDTR, 0, 0, LDTR_ACCESS),
+                reg(VM_REG_GUEST_LDTR, 0),
+                desc(VM_REG_GUEST_IDTR, 0, 0xFFFF, 0),
+                reg(VM_REG_GUEST_RIP, ENTRY),
+                reg(VM_REG_GUEST_RSI, 0x7000), // boot_params
+                reg(VM_REG_GUEST_RFLAGS, 0x02),
+                reg(VM_REG_GUEST_RSP, 0),
+                reg(VM_REG_GUEST_RBP, 0),
+                reg(VM_REG_GUEST_RDI, 0),
+                reg(VM_REG_GUEST_RBX, 0),
+                reg(VM_REG_GUEST_RCX, 0),
+                reg(VM_REG_GUEST_RDX, 0),
+                reg(VM_REG_GUEST_RAX, 0),
+                reg(VM_REG_GUEST_R8, 0),
+                reg(VM_REG_GUEST_R9, 0),
+                reg(VM_REG_GUEST_R10, 0),
+                reg(VM_REG_GUEST_R11, 0),
+                reg(VM_REG_GUEST_R12, 0),
+                reg(VM_REG_GUEST_R13, 0),
+                reg(VM_REG_GUEST_R14, 0),
+                reg(VM_REG_GUEST_R15, 0),
+                Write::RunState(2), // VRS_RUN
+            ],
+        );
+    }
+
+    /// `DIRECT_BOOT_RESERVED` is the promise an outside boot path reads
+    /// instead of the private addresses, so it has to cover every one
+    /// of them.
+    #[test]
+    fn reserved_ranges_cover_every_address_the_loader_writes() {
+        let last_pd = GPA_PD_BASE + 3 * 4096;
+        for addr in [
+            GPA_GDT,
+            GPA_BOOT_PARAMS,
+            GPA_PML4,
+            GPA_PDPT,
+            last_pd,
+            GPA_CMDLINE,
+        ] {
+            assert!(
+                DIRECT_BOOT_RESERVED
+                    .iter()
+                    .any(|&(base, len)| addr >= base && addr < base + len),
+                "{addr:#x} is written but not reserved"
+            );
+        }
+
+        let mut end = 0;
+        for (base, len) in DIRECT_BOOT_RESERVED {
+            assert!(base >= end, "{base:#x} overlaps or is out of order");
+            end = base + len;
+        }
+        // The last range must stop below the kernel load address.
+        assert!(end <= GPA_KERNEL);
     }
 
     #[test]

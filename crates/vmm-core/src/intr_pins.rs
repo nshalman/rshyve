@@ -106,6 +106,22 @@ impl Entry {
             }
         }
     }
+
+    /// Put the level back where [`Self::process_op`] found it.
+    ///
+    /// A committed level the kernel never took is worse than no
+    /// bookkeeping at all: a deassert whose ioctl failed leaves the
+    /// kernel line high and this count at zero, so the next deassert
+    /// sees no transition and never retries, and the line stays up for
+    /// the life of the VM.
+    fn undo_op(&mut self, op: &PinOp) {
+        match op {
+            PinOp::Assert => self.level -= 1,
+            PinOp::Deassert => self.level += 1,
+            // Pulse leaves the level alone.
+            PinOp::Pulse => {}
+        }
+    }
 }
 
 /// Virtual legacy PIC/IOAPIC that delivers ISA IRQs to the kernel.
@@ -143,22 +159,30 @@ impl LegacyPIC {
 
     /// Perform an IRQ operation, calling the kernel ioctl only on
     /// level transitions.
-    fn do_irq(&self, op: PinOp, irq: u8) {
+    /// Returns whether the caller's pin state change stands. A false
+    /// return means the kernel refused the operation, so the caller
+    /// must leave its own state where it was and let a later call try
+    /// again.
+    fn do_irq(&self, op: PinOp, irq: u8) -> bool {
         let mut pins = self.inner.lock().expect("LegacyPIC lock poisoned");
 
-        if pins[irq as usize].process_op(&op) {
-            let irq_i32 = i32::from(irq);
-            let result = match op {
-                PinOp::Assert => self.hdl.isa_assert_irq(irq_i32, irq_i32),
-                PinOp::Deassert => self.hdl.isa_deassert_irq(irq_i32, irq_i32),
-                PinOp::Pulse => self.hdl.isa_pulse_irq(irq_i32, irq_i32),
-            };
-            if let Err(e) = result {
-                // Log but don't panic -- IRQ delivery failure in the
-                // kernel is not recoverable but should not crash the VMM.
-                slog::warn!(self.log, "failed to deliver IRQ"; "irq" => irq, "error" => %e);
-            }
+        if !pins[irq as usize].process_op(&op) {
+            return true;
         }
+        let irq_i32 = i32::from(irq);
+        let result = match op {
+            PinOp::Assert => self.hdl.isa_assert_irq(irq_i32, irq_i32),
+            PinOp::Deassert => self.hdl.isa_deassert_irq(irq_i32, irq_i32),
+            PinOp::Pulse => self.hdl.isa_pulse_irq(irq_i32, irq_i32),
+        };
+        if let Err(e) = result {
+            // Log but don't panic -- IRQ delivery failure in the
+            // kernel is not recoverable but should not crash the VMM.
+            slog::error!(self.log, "failed to deliver IRQ"; "irq" => irq, "error" => %e);
+            pins[irq as usize].undo_op(&op);
+            return false;
+        }
+        true
     }
 }
 
@@ -191,7 +215,7 @@ impl IntrPin for LegacyPin {
         if !*asserted {
             *asserted = true;
             if let Some(pic) = self.pic.upgrade() {
-                pic.do_irq(PinOp::Assert, self.irq);
+                *asserted = pic.do_irq(PinOp::Assert, self.irq);
             }
         }
     }
@@ -202,7 +226,7 @@ impl IntrPin for LegacyPin {
         if *asserted {
             *asserted = false;
             if let Some(pic) = self.pic.upgrade() {
-                pic.do_irq(PinOp::Deassert, self.irq);
+                *asserted = !pic.do_irq(PinOp::Deassert, self.irq);
             }
         }
     }
@@ -366,13 +390,17 @@ impl PciIntrRoutes {
 
     /// Perform a PCI INTx operation, calling the kernel ioctl only on
     /// level transitions of the shared GSI.
-    fn do_irq(&self, op: PinOp, pirq_idx: usize, line: usize) {
+    /// Returns whether the caller's pin state change stands. A false
+    /// return means the kernel refused the operation, so the caller
+    /// must leave its own state where it was and let a later call try
+    /// again.
+    fn do_irq(&self, op: PinOp, pirq_idx: usize, line: usize) -> bool {
         let mut lines = self.inner.lock().expect("PciIntrRoutes lock poisoned");
         if !lines[line].process_op(&op) {
-            return;
+            return true;
         }
         let Some(hdl) = self.hdl.as_ref() else {
-            return;
+            return true;
         };
 
         let ioapic_irq = PCI_GSI_BASE + line as i32;
@@ -397,13 +425,16 @@ impl PciIntrRoutes {
                 .and_then(|()| hdl.ioapic_deassert_irq(ioapic_irq)),
         };
         if let Err(e) = result {
-            slog::warn!(self.log, "failed to deliver PCI INTx";
+            slog::error!(self.log, "failed to deliver PCI INTx";
                 "pirq_idx" => pirq_idx,
                 "atpic_irq" => atpic_irq,
                 "ioapic_irq" => ioapic_irq,
                 "error" => %e,
             );
+            lines[line].undo_op(&op);
+            return false;
         }
+        true
     }
 
     /// Shared level count of one GSI, for unit tests.
@@ -454,7 +485,8 @@ impl IntrPin for PciIntrPin {
         if !*asserted {
             *asserted = true;
             if let Some(routes) = self.routes.upgrade() {
-                routes.do_irq(PinOp::Assert, self.pirq_idx, self.line);
+                *asserted =
+                    routes.do_irq(PinOp::Assert, self.pirq_idx, self.line);
             }
         }
     }
@@ -464,7 +496,8 @@ impl IntrPin for PciIntrPin {
         if *asserted {
             *asserted = false;
             if let Some(routes) = self.routes.upgrade() {
-                routes.do_irq(PinOp::Deassert, self.pirq_idx, self.line);
+                *asserted =
+                    !routes.do_irq(PinOp::Deassert, self.pirq_idx, self.line);
             }
         }
     }
@@ -494,6 +527,30 @@ mod tests {
             None,
             slog::Logger::root(slog::Discard, slog::o!()),
         )
+    }
+
+    // A level the kernel refused must not stay committed. Committed,
+    // a failed deassert leaves the line high in the kernel and the
+    // count at zero, so no later deassert sees a transition and the
+    // line never comes down again.
+    #[test]
+    fn a_refused_operation_leaves_the_level_where_it_was() {
+        let mut entry = Entry::default();
+
+        assert!(entry.process_op(&PinOp::Assert));
+        entry.undo_op(&PinOp::Assert);
+        assert_eq!(entry.level, 0, "a refused assert stayed on the count");
+        // The retry has a transition to report, so the kernel is asked
+        // again.
+        assert!(entry.process_op(&PinOp::Assert));
+
+        assert!(entry.process_op(&PinOp::Deassert));
+        entry.undo_op(&PinOp::Deassert);
+        assert_eq!(entry.level, 1, "a refused deassert left the line low");
+        assert!(
+            entry.process_op(&PinOp::Deassert),
+            "a refused deassert is never retried"
+        );
     }
 
     #[test]

@@ -34,6 +34,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+include!("src/platform_flags.rs");
+
 /// The platform OpenSSL shipped in a SmartOS platform image.
 const SMARTOS_CRYPTO: &str = "/lib/amd64/libcrypto-smartos.so.3";
 
@@ -55,6 +57,15 @@ fn main() {
          git submodule update --init third_party/libtpms",
         src.display()
     );
+    // Said here because the failure otherwise arrives from automake as
+    // "'pkgconfig_DATA' is used but 'pkgconfigdir' is undefined", which
+    // names neither pkg-config nor OpenSSL.
+    assert!(
+        !pkg_config(&["--version"]).is_empty(),
+        "pkg-config is missing. libtpms needs it twice: autoreconf \
+         reads its pkg.m4 for the PKG_INSTALLDIR macro, and this build \
+         script asks it where OpenSSL is. See docs/testing.md."
+    );
     let patches = workspace_root
         .join("third_party")
         .join("libtpms-illumos")
@@ -71,15 +82,21 @@ fn main() {
     println!("cargo:rerun-if-changed={}", src.display());
     println!("cargo:rerun-if-changed={}", patches.display());
     println!("cargo:rerun-if-changed={SMARTOS_CRYPTO}");
+    // Named because this file `include!`s it. A rerun-if-changed line
+    // anywhere turns off cargo's own "any file in the package" rule.
+    println!("cargo:rerun-if-changed=src/platform_flags.rs");
 
     let crypto = select_crypto(&out_dir);
+    let target_os = env::var("CARGO_CFG_TARGET_OS")
+        .expect("CARGO_CFG_TARGET_OS set by cargo");
+    let cflags = base_cflags(&target_os);
 
-    // The stamp records which OpenSSL the archive in OUT_DIR was built
-    // against. OUT_DIR survives a change to this file, so a bare
-    // "already built" marker would keep handing back an archive linked
-    // against the wrong library.
+    // The stamp records how the archive in OUT_DIR was built. OUT_DIR
+    // survives a change to this file, so a bare "already built" marker
+    // would keep handing back an archive linked against the wrong
+    // library, or compiled with flags this file no longer passes.
     let marker = build_dir.join(".vmm-tpm-built.stamp");
-    let fingerprint = crypto.fingerprint();
+    let fingerprint = format!("{}\ncflags {cflags}", crypto.fingerprint());
     if std::fs::read_to_string(&marker).ok().as_deref() != Some(&fingerprint) {
         copy_tree(&src, &work_src);
         apply_patches(&patches, &work_src);
@@ -89,7 +106,7 @@ fn main() {
         let _ = std::fs::remove_dir_all(&build_dir);
         std::fs::create_dir_all(&build_dir).expect("mkdir libtpms-build");
         run_autogen(&work_src);
-        run_configure(&work_src, &build_dir, &crypto);
+        run_configure(&work_src, &build_dir, &crypto, &target_os, &cflags);
         run_make(&build_dir);
         std::fs::write(&marker, &fingerprint).expect("write marker");
     }
@@ -349,7 +366,13 @@ fn run_autogen(src: &Path) {
     assert!(status.success(), "libtpms autogen.sh failed");
 }
 
-fn run_configure(src: &Path, build: &Path, crypto: &Crypto) {
+fn run_configure(
+    src: &Path,
+    build: &Path,
+    crypto: &Crypto,
+    target_os: &str,
+    base: &str,
+) {
     let configure = src.join("configure");
     assert!(
         configure.is_file(),
@@ -357,9 +380,7 @@ fn run_configure(src: &Path, build: &Path, crypto: &Crypto) {
         configure.display()
     );
 
-    let mut cflags = String::from(
-        "-D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D__EXTENSIONS__ -O2 -fPIC",
-    );
+    let mut cflags = String::from(base);
     let mut ldflags = String::new();
     let mut libs = String::new();
 
@@ -384,7 +405,7 @@ fn run_configure(src: &Path, build: &Path, crypto: &Crypto) {
         Crypto::PkgConfig => {
             let dirs = pkg_config(&["--libs-only-L", "openssl"]);
             ldflags.push_str(&dirs);
-            // Mirror -L flags as -R runpath entries so the autoconf
+            // Mirror every -L as a runpath entry so the autoconf
             // "can run compiled program" check (which builds and
             // executes a tiny test binary) finds libcrypto at run time
             // without LD_LIBRARY_PATH set in the environment.
@@ -394,7 +415,7 @@ fn run_configure(src: &Path, build: &Path, crypto: &Crypto) {
                 if !ldflags.is_empty() {
                     ldflags.push(' ');
                 }
-                ldflags.push_str(&format!("-Wl,-R,{dir}"));
+                ldflags.push_str(&runpath_flag(target_os, dir));
             }
             libs.push_str(&pkg_config(&["--libs-only-l", "openssl"]));
 

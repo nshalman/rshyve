@@ -2,20 +2,21 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! VirtIO block device with hybrid sync/async I/O.
+//! VirtIO block device.
 //!
-//! Adaptive strategy based on queue depth:
-//! - **iodepth=1**: pread/pwrite inline in the vCPU thread (~3us)
-//! - **iodepth>1**: dispatch to 4 worker threads for parallel I/O
+//! One invariant holds the design together: a backing-store operation
+//! owns only host memory, and every guest-memory access needs
+//! permission for the request epoch, held until that access finishes.
+//! So a reset closes admission, ends the epoch, waits for the short
+//! guest-access sections, and returns. It never waits for the disk.
 //!
-//! All completions go through `VirtioCompletion` — a single Mutex-
-//! protected used ring writer that prevents the index corruption
-//! bugs that occur when inline and async paths use separate indexes.
+//! Requests that reach the disk run on worker threads. Only the ones
+//! that touch guest memory alone, such as GET_ID, run inline on the
+//! vCPU.
 //!
-//! Zero-copy: preadv/pwritev scatter-gather I/O directly to/from
-//! guest memory via `SubMapping::as_ptr()`. One syscall per request
-//! regardless of segment count. Stack-allocated iovecs for <= 16
-//! segments to avoid heap allocation on the hot path.
+//! All completions go through `VirtioCompletion`, one Mutex-protected
+//! used ring writer. Separate write indexes on the inline and async
+//! paths corrupt the used index.
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -23,11 +24,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
-use vmm_devices::blkdev::{datasync, DiskCache};
+use vmm_devices::blkdev::DiskCache;
 use vmm_devices::lifecycle::Indicator;
 use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
 
-use vmm_core::mem::{PhysMap, SubMapping};
+use vmm_core::mem::PhysMap;
 
 #[usdt::provider(provider = "vmm")]
 mod probes {
@@ -35,15 +36,25 @@ mod probes {
     fn vioblk_inline(head: u16, rtype: u32, sector: u64) {}
     fn vioblk_dispatch(head: u16, rtype: u32, sector: u64) {}
     fn vioblk_complete(head: u16, status: u8) {}
+    fn vioblk_reset_drain(epoch: u64) {}
 }
 
 use super::bits;
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::{queue_drain_should_stop, VirtioDevice};
 
+mod access;
 mod discard;
+mod io;
 #[cfg(test)]
 mod tests;
+mod worker;
+
+use crate::access::{GuestAccess, Session};
+use crate::pci::intr::{next_intr_session, BackendIntr};
+use access::BackendBarrier;
+use io::{parse_header, write_status};
+use worker::{blk_io_worker, needs_backend, BlkIoRequest, WorkerCtx};
 
 /// Default I/O workers for a single-queue virtio-blk device.
 ///
@@ -81,8 +92,8 @@ pub struct VirtioBlockOpts {
     pub nodelete: bool,
     pub sector_size: u32,
     /// Number of virtqueues. `None` means "caller decides" (typically
-    /// `min(num_vcpus, 4)`). Capped at 8 — a zvol has one SPA sync pipeline
-    /// so more queues don't add throughput but do add worker threads.
+    /// `min(num_vcpus, 4)`). Capped at 8: a zvol has one SPA sync
+    /// pipeline, so more queues add worker threads and no throughput.
     pub num_queues: Option<u16>,
 }
 
@@ -106,20 +117,8 @@ struct DiskLimits {
     nodelete: bool,
 }
 
-/// I/O request sent to worker threads.
-struct BlkIoRequest {
-    rtype: u32,
-    sector: u64,
-    chain: Vec<ChainBuf>,
-    head: u16,
-    completion: Arc<VirtioCompletion>,
-}
-
-type InterruptCallback = Arc<dyn Fn() + Send + Sync>;
-
-/// VirtIO block device with hybrid sync/async I/O.
+/// VirtIO block device.
 pub struct VirtioBlock {
-    fd: i32,
     capacity: u64,
     sector_size: u32,
     read_only: bool,
@@ -136,17 +135,23 @@ pub struct VirtioBlock {
     next_worker: Vec<AtomicUsize>,
     /// Guest physical memory for completion handler creation.
     physmap: Arc<PhysMap>,
-    /// Interrupt callback, set after PCI device creation.
-    pub interrupt: Arc<Mutex<Option<InterruptCallback>>>,
+    /// The transport interrupt path, set after PCI device creation.
+    pub interrupt: Arc<Mutex<Option<Arc<BackendIntr>>>>,
     /// Per-queue completion handlers, created on first notification.
     completions: Mutex<Vec<Option<Arc<VirtioCompletion>>>>,
-    /// Zvol write-cache control. Declared BEFORE `_file` so Drop runs
+    /// Zvol write-cache control. Declared BEFORE `file` so Drop runs
     /// `DKIOCSETWCE` restore while the fd is still open.
     _cache: DiskCache,
-    _file: File,
+    /// The backing store. Shared with every worker, so the descriptor
+    /// outlives a device that is dropped while a syscall is running.
+    /// A worker holding a bare fd number would resume against whatever
+    /// the host reopened on it.
+    file: Arc<File>,
     /// Lifecycle state indicator.
     indicator: Indicator,
     gate: Arc<QuiesceGate>,
+    /// Shared with every I/O worker.
+    ctx: WorkerCtx,
 }
 
 impl VirtioBlock {
@@ -160,6 +165,7 @@ impl VirtioBlock {
         let capacity = metadata.len() / u64::from(opts.sector_size);
         let read_only = opts.read_only;
         let raw_fd = file.as_raw_fd();
+        let file = Arc::new(file);
 
         // Enable zvol writeback cache (DKIOCSETWCE=1). Must happen before
         // any I/O so the first guest writes already hit the fast path.
@@ -174,19 +180,27 @@ impl VirtioBlock {
         let workers_per_queue = if num_queues <= 1 { NUM_WORKERS } else { 2 };
         let total_workers = num_queues as usize * workers_per_queue;
         let gate = Arc::new(QuiesceGate::new(total_workers));
+        let ctx = WorkerCtx {
+            physmap: Arc::clone(&physmap),
+            gate: Arc::clone(&gate),
+            access: Arc::new(GuestAccess::new()),
+            backend: Arc::new(BackendBarrier::new()),
+            #[cfg(test)]
+            parks: Arc::new(worker::WorkerParks::default()),
+        };
         let mut io_txs = Vec::with_capacity(total_workers);
         let mut next_worker = Vec::with_capacity(num_queues as usize);
 
         for q in 0..num_queues {
             for i in 0..workers_per_queue {
                 let (tx, rx) = mpsc::channel::<BlkIoRequest>();
-                let physmap = Arc::clone(&physmap);
-                let gate = Arc::clone(&gate);
+                let ctx = ctx.clone();
+                let file = Arc::clone(&file);
 
                 thread::Builder::new()
                     .name(format!("virtio-blk-q{q}-io-{i}"))
                     .spawn(move || {
-                        blk_io_worker(rx, raw_fd, limits, physmap, gate);
+                        blk_io_worker(rx, file, limits, ctx);
                     })
                     .expect("failed to spawn virtio-blk I/O worker");
 
@@ -198,7 +212,6 @@ impl VirtioBlock {
         let completions = (0..num_queues as usize).map(|_| None).collect();
 
         Ok(Self {
-            fd: raw_fd,
             capacity,
             sector_size: opts.sector_size,
             read_only: opts.read_only,
@@ -212,18 +225,11 @@ impl VirtioBlock {
             interrupt: Arc::new(Mutex::new(None)),
             completions: Mutex::new(completions),
             _cache: cache,
-            _file: file,
+            file,
             indicator: Indicator::new(),
             gate,
+            ctx,
         })
-    }
-
-    fn limits(&self) -> DiskLimits {
-        DiskLimits {
-            capacity: self.capacity,
-            read_only: self.read_only,
-            nodelete: self.nodelete,
-        }
     }
 
     /// Number of request queues.
@@ -245,8 +251,15 @@ impl VirtioBlock {
     }
 
     /// Get or create the VirtioCompletion for the given queue index.
+    ///
+    /// The caller's permission covers two things. The only guest
+    /// memory read here is the used index, and the session stamped on
+    /// the handler has to be the one the ring belongs to. Permission
+    /// is refused for the whole of a reset, so neither can reach the
+    /// slot the next driver finds.
     fn get_completion(
         &self,
+        access: &Session<'_>,
         queue_idx: u16,
         queue: &VirtQueue,
     ) -> Arc<VirtioCompletion> {
@@ -259,17 +272,25 @@ impl VirtioBlock {
         }
 
         let intr = Arc::clone(&self.interrupt);
-        let interrupt_fn = move || {
-            if let Ok(guard) = intr.lock() {
-                if let Some(ref f) = *guard {
-                    f();
-                }
+        // The handler carries the ring it belongs to. MSI-X gives each
+        // virtqueue its own vector, and the guest driver only looks at
+        // the ring that vector names, so a completion raised on any
+        // other index is never collected.
+        let interrupt_fn = move |session| {
+            // The slot is unlocked for the raise. Delivery is a call
+            // into the kernel, and the reset reads this slot, so a
+            // raise that held the lock would put that call in front
+            // of a vCPU.
+            let path = intr.lock().ok().and_then(|slot| slot.clone());
+            if let Some(path) = path {
+                path.raise(session, queue_idx);
             }
         };
 
         let c = VirtioCompletion::new(
             queue,
             Arc::clone(&self.physmap),
+            access.intr(),
             interrupt_fn,
         );
         // Force-interrupt the first 32 completions so the guest's
@@ -283,29 +304,64 @@ impl VirtioBlock {
         c
     }
 
-    /// Inline fast path: pread/pwrite in the vCPU thread.
+    /// Check one chain and return its request header.
+    ///
+    /// On refusal the status byte is written and the used length the
+    /// guest is owed is returned. A refused head still goes back on the
+    /// used ring: `pop_avail` has already taken it out of the available
+    /// ring, and virtio-blk has no abort path to recover it.
+    fn check_request(
+        &self,
+        chain: &[ChainBuf],
+        physmap: &PhysMap,
+    ) -> Result<VirtioBlkReqHdr, u32> {
+        let refuse = |chain: &[ChainBuf]| {
+            write_status(physmap, chain, bits::VIRTIO_BLK_S_IOERR)
+        };
+        if chain.len() < 2 {
+            return Err(refuse(chain));
+        }
+        let Some(header) = parse_header(chain, physmap) else {
+            return Err(refuse(chain));
+        };
+        // Segment count and segment size are the guest's to pick, so
+        // the advertised limits hold only where they are checked.
+        let Some(data_bytes) = io::span(chain) else {
+            return Err(refuse(chain));
+        };
+
+        if header.rtype == bits::VIRTIO_BLK_T_IN
+            || header.rtype == bits::VIRTIO_BLK_T_OUT
+        {
+            // A request with no data buffer would pass the sector range
+            // check whatever sector it named, because 0 + 0 is never
+            // past the capacity.
+            if data_bytes == 0 {
+                return Err(refuse(chain));
+            }
+            let sectors_needed =
+                (data_bytes as u64).div_ceil(bits::SECTOR_SIZE);
+            if header
+                .sector
+                .checked_add(sectors_needed)
+                .is_none_or(|end| end > self.capacity)
+            {
+                return Err(refuse(chain));
+            }
+        }
+        Ok(header)
+    }
+
+    /// Run a request that touches guest memory and nothing else.
+    ///
     /// Returns (status, used_ring_len).
-    fn process_inline(
+    fn local_request(
         &self,
         header: &VirtioBlkReqHdr,
         chain: &[ChainBuf],
         physmap: &PhysMap,
     ) -> (u8, u32) {
         match header.rtype {
-            bits::VIRTIO_BLK_T_IN => {
-                do_pread(self.fd, header.sector, chain, physmap)
-            }
-            bits::VIRTIO_BLK_T_OUT if !self.read_only => {
-                do_pwrite(self.fd, header.sector, chain, physmap)
-            }
-            bits::VIRTIO_BLK_T_OUT => (bits::VIRTIO_BLK_S_IOERR, 1),
-            bits::VIRTIO_BLK_T_FLUSH => {
-                if datasync(self.fd) == 0 {
-                    (bits::VIRTIO_BLK_S_OK, 1)
-                } else {
-                    (bits::VIRTIO_BLK_S_IOERR, 1)
-                }
-            }
             bits::VIRTIO_BLK_T_GET_ID => {
                 let id = self.device_id();
                 // Write ID to the first writable buffer in the chain
@@ -321,17 +377,35 @@ impl VirtioBlock {
                 }
                 (bits::VIRTIO_BLK_S_IOERR, 1)
             }
-            bits::VIRTIO_BLK_T_DISCARD | bits::VIRTIO_BLK_T_WRITE_ZEROES => {
-                discard::execute(
-                    self.fd,
-                    &self.limits(),
-                    header.rtype,
-                    chain,
-                    physmap,
-                )
-            }
             _ => (bits::VIRTIO_BLK_S_UNSUPP, 1),
         }
+    }
+
+    /// Hand a request to one of the queue's workers.
+    fn dispatch(
+        &self,
+        queue_idx: u16,
+        epoch: u64,
+        completion: &Arc<VirtioCompletion>,
+        head: u16,
+        header: &VirtioBlkReqHdr,
+        chain: Vec<ChainBuf>,
+    ) {
+        probes::vioblk_dispatch!(|| (head, header.rtype, header.sector));
+        let base = queue_idx as usize * self.workers_per_queue;
+        let idx = self.next_worker[queue_idx as usize]
+            .fetch_add(1, Ordering::Relaxed)
+            % self.workers_per_queue;
+        // A closed channel means the worker is gone during shutdown.
+        // The request carries an epoch, so nothing else has to undo.
+        let _ = self.io_txs[base + idx].send(BlkIoRequest {
+            rtype: header.rtype,
+            sector: header.sector,
+            chain,
+            head,
+            completion: Arc::clone(completion),
+            epoch,
+        });
     }
 }
 
@@ -377,7 +451,7 @@ impl VirtioDevice for VirtioBlock {
         config[0x0C..0x10].copy_from_slice(&SEG_MAX.to_le_bytes());
         // blk_size at offset 0x14 (4 bytes)
         config[0x14..0x18].copy_from_slice(&self.sector_size.to_le_bytes());
-        // num_queues at offset 0x22 (2 bytes) — VirtIO block MQ config
+        // num_queues at offset 0x22 (2 bytes), VirtIO block MQ config
         config[0x22..0x24].copy_from_slice(&self.num_queues.to_le_bytes());
         // DISCARD and WRITE_ZEROES limits (VirtIO 1.3 sec 5.2.4). Linux
         // reads a zero here as "no limit" (drivers/block/virtio_blk.c),
@@ -417,19 +491,30 @@ impl VirtioDevice for VirtioBlock {
 
     fn cfg_write(&self, _: u16, _: u32, _: u8) {}
 
-    /// Override notify_queue: pop avail, process or dispatch, complete.
+    /// Override notify_queue: pop avail, run or dispatch, complete.
     ///
-    /// ALL used ring writes go through VirtioCompletion — never
-    /// through VirtQueue::push_used(). This prevents the index
-    /// divergence bug where inline and async paths tracked the
-    /// used ring index independently.
+    /// ALL used ring writes go through VirtioCompletion, never through
+    /// VirtQueue::push_used(). Two paths tracking the used index
+    /// independently make it diverge.
+    ///
+    /// The whole body runs under one guest-access session and makes no
+    /// backing-store call, so a reset waiting for it waits for ring
+    /// walks and short memory copies, bounded by the queue size.
+    ///
+    /// The return value asks the transport to raise the interrupt,
+    /// rather than raising it here. This runs under the transport's
+    /// register lock, and a reset on another vCPU has to take that
+    /// lock before it can start, so an interrupt injected here would
+    /// put a call into the kernel on the reset's path. The transport
+    /// drops the lock first. Workers raise their own completions:
+    /// they hold no transport lock.
     ///
     /// EVENT_IDX re-check loop (VirtIO 1.3 sec 2.7.10):
     /// After draining the ring and writing `used_event`, re-read
     /// `avail_idx`. If the guest added entries during the race
     /// window between our drain and the `used_event` write, the
-    /// guest may have decided not to kick — we must catch those
-    /// entries ourselves.
+    /// guest may have decided not to kick, so the device must catch
+    /// those entries itself.
     fn notify_queue(
         &self,
         queue_idx: u16,
@@ -441,13 +526,20 @@ impl VirtioDevice for VirtioBlock {
             None => return false,
         };
 
-        let completion = self.get_completion(queue_idx, queue);
+        let Some(session) = self.ctx.access.enter_current() else {
+            // A reset owns the ring. Its queue state goes with it.
+            return false;
+        };
+        let completion = self.get_completion(&session, queue_idx, queue);
+        let epoch = session.epoch();
 
         // A guest can keep advancing avail_idx during the EVENT_IDX re-check.
         // Bound the work retained by one notification to the queue size.
         let max_requests = usize::from(queue.size());
         let mut requests: Vec<(u16, VirtioBlkReqHdr, Vec<ChainBuf>)> =
             Vec::with_capacity(max_requests);
+        // Results already finished, published together at the end.
+        let mut finished: Vec<(u16, u32)> = Vec::new();
         let mut popped = 0usize;
 
         loop {
@@ -460,56 +552,36 @@ impl VirtioDevice for VirtioBlock {
 
                 let chain = match queue.collect_chain(physmap, head) {
                     Some(c) => c,
-                    None => continue,
+                    None => {
+                        // `pop_avail` already took this head out of the
+                        // available ring, so it has to go back on the
+                        // used ring. Dropping it burns the descriptor
+                        // for the life of the device: the block layer
+                        // has no abort path for virtio-blk.
+                        finished.push((head, 0));
+                        continue;
+                    }
                 };
 
-                if chain.len() < 2 {
-                    write_status(physmap, &chain, bits::VIRTIO_BLK_S_IOERR);
-                    completion.complete(head, 1);
+                let header = match self.check_request(&chain, physmap) {
+                    Ok(header) => header,
+                    Err(len) => {
+                        finished.push((head, len));
+                        continue;
+                    }
+                };
+
+                if needs_backend(header.rtype) {
+                    requests.push((head, header, chain));
                     continue;
                 }
 
-                let header = match parse_header(&chain, physmap) {
-                    Some(h) => h,
-                    None => {
-                        write_status(physmap, &chain, bits::VIRTIO_BLK_S_IOERR);
-                        completion.complete(head, 1);
-                        continue;
-                    }
-                };
-
-                // Bounds check: verify start sector AND full range fit.
-                // Also reject zero-length data transfers — a guest can
-                // craft a request with no data buffers to bypass the
-                // sector range check (0 + 0 <= capacity is always true).
-                if header.rtype == bits::VIRTIO_BLK_T_IN
-                    || header.rtype == bits::VIRTIO_BLK_T_OUT
-                {
-                    let data_bytes: u64 = chain[1..chain.len() - 1]
-                        .iter()
-                        .map(|b| match b {
-                            ChainBuf::Readable { len, .. }
-                            | ChainBuf::Writable { len, .. } => u64::from(*len),
-                        })
-                        .sum();
-                    if data_bytes == 0 {
-                        write_status(physmap, &chain, bits::VIRTIO_BLK_S_IOERR);
-                        completion.complete(head, 1);
-                        continue;
-                    }
-                    let sectors_needed = data_bytes.div_ceil(bits::SECTOR_SIZE);
-                    if header
-                        .sector
-                        .checked_add(sectors_needed)
-                        .is_none_or(|end| end > self.capacity)
-                    {
-                        write_status(physmap, &chain, bits::VIRTIO_BLK_S_IOERR);
-                        completion.complete(head, 1);
-                        continue;
-                    }
-                }
-
-                requests.push((head, header, chain));
+                probes::vioblk_inline!(|| (head, header.rtype, header.sector));
+                let (status, written) =
+                    self.local_request(&header, &chain, physmap);
+                write_status(physmap, &chain, status);
+                probes::vioblk_complete!(|| (head, status));
+                finished.push((head, written));
             }
 
             // A cap exit leaves entries pending, so publishing avail_event
@@ -525,54 +597,19 @@ impl VirtioDevice for VirtioBlock {
             // Guest added entries during race window; drain again.
         }
 
-        if requests.is_empty() {
-            return false;
-        }
+        probes::vioblk_notify!(|| (
+            queue_idx,
+            (finished.len() + requests.len()) as u32
+        ));
 
-        probes::vioblk_notify!(|| (queue_idx, requests.len() as u32));
+        let raise = completion.publish_batch(&finished);
+        drop(session);
 
-        // Small batch inline fast path: reads and metadata ops only.
-        //
-        // Writes and flushes always dispatch to workers — they may block
-        // the thread for milliseconds on ZIL commit, and running inline
-        // would stall the guest vCPU. WRITE_ZEROES joins them because it
-        // writes up to 8 MiB per segment. Reads are near-zero-cost from
-        // the ARC so keeping them inline preserves iodepth=1 read latency.
-        let all_inline_safe = requests.iter().all(|(_, h, _)| {
-            h.rtype != bits::VIRTIO_BLK_T_OUT
-                && h.rtype != bits::VIRTIO_BLK_T_FLUSH
-                && h.rtype != bits::VIRTIO_BLK_T_WRITE_ZEROES
-        });
-        if requests.len() <= 4 && all_inline_safe {
-            for &(head, ref header, ref chain) in &requests {
-                probes::vioblk_inline!(|| (head, header.rtype, header.sector));
-                let (status, written) =
-                    self.process_inline(header, chain, physmap);
-                write_status(physmap, chain, status);
-                probes::vioblk_complete!(|| (head, status));
-                completion.complete(head, written);
-            }
-            return false;
-        }
-
-        // Multiple requests: round-robin dispatch to per-worker channels.
-        let base = queue_idx as usize * self.workers_per_queue;
         for (head, header, chain) in requests {
-            probes::vioblk_dispatch!(|| (head, header.rtype, header.sector));
-            let idx = self.next_worker[queue_idx as usize]
-                .fetch_add(1, Ordering::Relaxed)
-                % self.workers_per_queue;
-            // receiver dropped during shutdown; safe to ignore
-            let _ = self.io_txs[base + idx].send(BlkIoRequest {
-                rtype: header.rtype,
-                sector: header.sector,
-                chain,
-                head,
-                completion: Arc::clone(&completion),
-            });
+            self.dispatch(queue_idx, epoch, &completion, head, &header, chain);
         }
 
-        false // workers call completion.complete()
+        raise
     }
 
     fn process_queue(
@@ -582,15 +619,49 @@ impl VirtioDevice for VirtioBlock {
         _: u16,
         _: &PhysMap,
     ) -> u32 {
-        0 // not called — notify_queue is overridden
+        0 // not called: notify_queue is overridden
     }
 
+    /// Reset the device, and do not return until no worker can still
+    /// write into the guest memory this ring used.
+    ///
+    /// The illumos driver treats one register write as the whole reset:
+    /// `virtio_legacy_device_reset_locked` does not poll, and
+    /// `virtio_main.c` states the contract as "when we reset the device,
+    /// it should immediately stop using any DMA memory we have
+    /// previously passed to it". `virtio_shutdown` then reclaims those
+    /// buffers. So this is synchronous.
+    ///
+    /// It is safe to run synchronously because it does not wait for the
+    /// disk, and it does not wait for interrupt delivery either.
+    /// Admission closes, the epoch ends, and the wait covers the
+    /// guest-memory sections alone. Each of those is a bounded copy or
+    /// ring walk, so the wait needs no deadline and has none.
+    ///
+    /// Ending the epoch stops any further raise for the old session.
+    /// A raise already past that check is abandoned, not waited for:
+    /// injection is a call into the kernel, and this runs on a vCPU.
     fn reset(&self) {
+        // Close admission before the drain. A section refused before it
+        // takes the lock never queues on it, and `std::sync::RwLock`
+        // gives the writer no priority: a guest picks how much stale
+        // work is waiting, and it must not be able to starve this.
+        let epoch = self.ctx.access.close();
+        probes::vioblk_reset_drain!(|| epoch);
+        // No backend work is admitted for the old session from here.
+        // Operations already inside a syscall are counted until they
+        // end, and the next session's I/O waits behind them.
+        self.ctx.backend.retire(epoch);
+        self.ctx.access.drain();
+
         *self.negotiated_features.lock().expect("lock") = 0;
-        let mut slots = self.completions.lock().expect("lock");
-        for slot in slots.iter_mut() {
+        for slot in self.completions.lock().expect("lock").iter_mut() {
             *slot = None;
         }
+        self.ctx.access.reopen(next_intr_session(
+            &self.interrupt,
+            self.ctx.access.intr_session(),
+        ));
     }
 }
 
@@ -631,320 +702,9 @@ impl Lifecycle for VirtioBlock {
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
         vmm_devices::quiesce::flush_file(
             &self.gate,
-            &self._file,
+            &self.file,
             intent,
             "virtio-blk",
         )
     }
-}
-
-// ---------------------------------------------------------------------------
-// I/O worker
-// ---------------------------------------------------------------------------
-
-fn blk_io_worker(
-    rx: mpsc::Receiver<BlkIoRequest>,
-    fd: i32,
-    limits: DiskLimits,
-    physmap: Arc<PhysMap>,
-    gate: Arc<QuiesceGate>,
-) {
-    use std::sync::mpsc::RecvTimeoutError;
-
-    loop {
-        let req = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(r) => r,
-            Err(RecvTimeoutError::Timeout) => {
-                gate.park_if_paused();
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => return,
-        };
-
-        // Process first request
-        let completion = Arc::clone(&req.completion);
-        let first = process_one_request(fd, &limits, &physmap, req);
-
-        // Try to drain more pending requests for batching.
-        // This reduces Mutex acquisitions in VirtioCompletion:
-        // one complete_batch() instead of N complete() calls.
-        let mut batch = Vec::new();
-        batch.push(first);
-        while batch.len() < 16 {
-            match rx.try_recv() {
-                Ok(req) => {
-                    batch.push(process_one_request(fd, &limits, &physmap, req));
-                }
-                Err(_) => break,
-            }
-        }
-
-        if batch.len() == 1 {
-            let (head, written) = batch[0];
-            completion.complete(head, written);
-        } else {
-            completion.complete_batch(&batch);
-        }
-    }
-}
-
-/// Process a single I/O request: execute the operation, write status.
-/// Returns (head, written) for completion batching.
-fn process_one_request(
-    fd: i32,
-    limits: &DiskLimits,
-    physmap: &PhysMap,
-    req: BlkIoRequest,
-) -> (u16, u32) {
-    let (status, written) = match req.rtype {
-        bits::VIRTIO_BLK_T_IN => do_pread(fd, req.sector, &req.chain, physmap),
-        bits::VIRTIO_BLK_T_OUT if !limits.read_only => {
-            do_pwrite(fd, req.sector, &req.chain, physmap)
-        }
-        bits::VIRTIO_BLK_T_OUT => (bits::VIRTIO_BLK_S_IOERR, 1),
-        bits::VIRTIO_BLK_T_FLUSH => {
-            if datasync(fd) == 0 {
-                (bits::VIRTIO_BLK_S_OK, 1)
-            } else {
-                (bits::VIRTIO_BLK_S_IOERR, 1)
-            }
-        }
-        bits::VIRTIO_BLK_T_DISCARD | bits::VIRTIO_BLK_T_WRITE_ZEROES => {
-            discard::execute(fd, limits, req.rtype, &req.chain, physmap)
-        }
-        _ => (bits::VIRTIO_BLK_S_UNSUPP, 1),
-    };
-
-    write_status(physmap, &req.chain, status);
-    probes::vioblk_complete!(|| (req.head, status));
-    (req.head, written)
-}
-
-// ---------------------------------------------------------------------------
-// I/O helpers
-// ---------------------------------------------------------------------------
-
-fn parse_header(
-    chain: &[ChainBuf],
-    physmap: &PhysMap,
-) -> Option<VirtioBlkReqHdr> {
-    match &chain[0] {
-        ChainBuf::Readable { addr, len }
-            if (*len as usize) >= BLK_REQ_HEADER_SIZE =>
-        {
-            physmap
-                .lookup(*addr, BLK_REQ_HEADER_SIZE)
-                .and_then(|sub| sub.read::<VirtioBlkReqHdr>().ok())
-        }
-        _ => None,
-    }
-}
-
-/// Maximum segments handled on the stack to avoid heap allocation.
-/// Typical virtio-blk chains have 1-4 data segments; 16 covers all
-/// common cases. Chains longer than this spill to a Vec.
-const STACK_IOV_MAX: usize = 16;
-
-/// Resolve chain data segments into (SubMapping, iovec) pairs.
-///
-/// `extractor` selects which ChainBuf variant to handle (Writable for
-/// reads, Readable for writes) and returns `(addr, len)` on match.
-///
-/// Returns `(total_bytes, iov_count)` on success, or `None` on lookup failure.
-/// The caller must keep `subs` alive for the duration of the syscall.
-fn build_iovecs<F>(
-    data_bufs: &[ChainBuf],
-    physmap: &PhysMap,
-    subs: &mut [Option<SubMapping>],
-    iovs: &mut [libc::iovec],
-    extractor: F,
-) -> Option<(usize, usize)>
-where
-    F: Fn(&ChainBuf) -> Option<(u64, u32)>,
-{
-    let mut total_bytes = 0usize;
-    let mut iov_count = 0usize;
-    for (i, buf) in data_bufs.iter().enumerate() {
-        if let Some((addr, len)) = extractor(buf) {
-            let n = len as usize;
-            let sub = physmap.lookup(addr, n)?;
-            let ptr = unsafe { sub.as_ptr() };
-            iovs[iov_count] = libc::iovec {
-                iov_base: ptr as *mut libc::c_void,
-                iov_len: n,
-            };
-            subs[i] = Some(sub);
-            total_bytes += n;
-            iov_count += 1;
-        }
-    }
-    Some((total_bytes, iov_count))
-}
-
-/// Zero-copy preadv (scatter-gather) directly into guest memory.
-/// One syscall regardless of segment count.
-/// Returns (status, bytes_written) where bytes_written includes the status byte.
-fn do_pread(
-    fd: i32,
-    sector: u64,
-    chain: &[ChainBuf],
-    physmap: &PhysMap,
-) -> (u8, u32) {
-    let offset = match sector.checked_mul(bits::SECTOR_SIZE) {
-        Some(o) => o as i64,
-        None => return (bits::VIRTIO_BLK_S_IOERR, 1),
-    };
-    if offset < 0 {
-        return (bits::VIRTIO_BLK_S_IOERR, 1);
-    }
-    if chain.len() < 3 {
-        return (bits::VIRTIO_BLK_S_IOERR, 1);
-    }
-
-    let data_bufs = &chain[1..chain.len() - 1];
-    let nseg = data_bufs.len();
-
-    // Stack path for typical small chains; heap fallback for large ones.
-    let mut stack_subs: [Option<SubMapping>; STACK_IOV_MAX] =
-        std::array::from_fn(|_| None);
-    let mut stack_iovs: [libc::iovec; STACK_IOV_MAX] = [libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len: 0,
-    }; STACK_IOV_MAX];
-
-    let mut heap_subs: Vec<Option<SubMapping>> = Vec::new();
-    let mut heap_iovs: Vec<libc::iovec> = Vec::new();
-
-    let (subs, iovs): (&mut [Option<SubMapping>], &mut [libc::iovec]) =
-        if nseg <= STACK_IOV_MAX {
-            (&mut stack_subs[..nseg], &mut stack_iovs[..nseg])
-        } else {
-            heap_subs.resize_with(nseg, || None);
-            heap_iovs.resize(
-                nseg,
-                libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                },
-            );
-            (&mut heap_subs, &mut heap_iovs)
-        };
-
-    let (total_bytes, iov_count) =
-        match build_iovecs(data_bufs, physmap, subs, iovs, |buf| match buf {
-            ChainBuf::Writable { addr, len } => Some((*addr, *len)),
-            _ => None,
-        }) {
-            Some(v) => v,
-            None => return (bits::VIRTIO_BLK_S_IOERR, 1),
-        };
-
-    if total_bytes == 0 {
-        return (bits::VIRTIO_BLK_S_OK, 1);
-    }
-
-    let nread = unsafe {
-        libc::preadv(
-            fd,
-            iovs.as_ptr(),
-            iov_count as libc::c_int,
-            offset as libc::off_t,
-        )
-    };
-    // SubMappings in `subs` keep guest pages pinned until after preadv returns.
-    if nread < 0 || nread as usize != total_bytes {
-        return (bits::VIRTIO_BLK_S_IOERR, 1);
-    }
-    let len = u32::try_from(total_bytes)
-        .unwrap_or(u32::MAX)
-        .saturating_add(1);
-    (bits::VIRTIO_BLK_S_OK, len) // +1 for status byte
-}
-
-/// Zero-copy pwritev (scatter-gather) directly from guest memory.
-/// One syscall regardless of segment count.
-/// Returns (status, bytes_written) where bytes_written is 1 (status byte only).
-fn do_pwrite(
-    fd: i32,
-    sector: u64,
-    chain: &[ChainBuf],
-    physmap: &PhysMap,
-) -> (u8, u32) {
-    let offset = match sector.checked_mul(bits::SECTOR_SIZE) {
-        Some(o) => o as i64,
-        None => return (bits::VIRTIO_BLK_S_IOERR, 1),
-    };
-    if offset < 0 {
-        return (bits::VIRTIO_BLK_S_IOERR, 1);
-    }
-    if chain.len() < 3 {
-        return (bits::VIRTIO_BLK_S_IOERR, 1);
-    }
-
-    let data_bufs = &chain[1..chain.len() - 1];
-    let nseg = data_bufs.len();
-
-    let mut stack_subs: [Option<SubMapping>; STACK_IOV_MAX] =
-        std::array::from_fn(|_| None);
-    let mut stack_iovs: [libc::iovec; STACK_IOV_MAX] = [libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len: 0,
-    }; STACK_IOV_MAX];
-
-    let mut heap_subs: Vec<Option<SubMapping>> = Vec::new();
-    let mut heap_iovs: Vec<libc::iovec> = Vec::new();
-
-    let (subs, iovs): (&mut [Option<SubMapping>], &mut [libc::iovec]) =
-        if nseg <= STACK_IOV_MAX {
-            (&mut stack_subs[..nseg], &mut stack_iovs[..nseg])
-        } else {
-            heap_subs.resize_with(nseg, || None);
-            heap_iovs.resize(
-                nseg,
-                libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                },
-            );
-            (&mut heap_subs, &mut heap_iovs)
-        };
-
-    let (total_bytes, iov_count) =
-        match build_iovecs(data_bufs, physmap, subs, iovs, |buf| match buf {
-            ChainBuf::Readable { addr, len } => Some((*addr, *len)),
-            _ => None,
-        }) {
-            Some(v) => v,
-            None => return (bits::VIRTIO_BLK_S_IOERR, 1),
-        };
-
-    if total_bytes == 0 {
-        return (bits::VIRTIO_BLK_S_OK, 1);
-    }
-
-    let nwritten = unsafe {
-        libc::pwritev(
-            fd,
-            iovs.as_ptr(),
-            iov_count as libc::c_int,
-            offset as libc::off_t,
-        )
-    };
-    // SubMappings in `subs` keep guest pages pinned until after pwritev returns.
-    if nwritten < 0 || nwritten as usize != total_bytes {
-        return (bits::VIRTIO_BLK_S_IOERR, 1);
-    }
-    (bits::VIRTIO_BLK_S_OK, 1) // writes only produce the status byte for guest
-}
-
-fn write_status(physmap: &PhysMap, chain: &[ChainBuf], status: u8) -> u32 {
-    if let Some(ChainBuf::Writable { addr, len }) = chain.last() {
-        if *len >= 1 {
-            if let Some(sub) = physmap.lookup(*addr, 1) {
-                // write to guest memory; no recovery if unmapped
-                let _ = sub.write_bytes(&[status]);
-            }
-        }
-    }
-    1
 }

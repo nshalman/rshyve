@@ -5,17 +5,24 @@ name: CI
 # The target platform is illumos, and GitHub offers no illumos runner.
 # Neither binary LINKS anywhere but illumos: bhyve-api binds SunOS
 # ioctls and viona-api needs libdladm. Both do type-check here, though.
-# firehyve cross-checks against the illumos target, and rshyve checks on
-# the host target where its C dependencies (zstd-sys, the vendored
-# libtpms that vmm-tpm-sys builds) compile natively. See the `binaries`
-# job.
+# firehyve cross-checks against the illumos target, and both binaries
+# build and run their tests on the host target, where rshyve's C
+# dependencies (zstd-sys, the vendored libtpms that vmm-tpm-sys builds)
+# compile natively. See the `binaries` job.
 #
 # So a green run here means: the tree is formatted, the portable crates
-# are clippy-clean and their tests pass, the illumos FFI binding crates
-# type-check against the illumos target, the lockfile is current, and
-# the dependency and public-surface policies hold. tools/fhrun-init is
-# excluded from the workspace, so the guest-init job covers it on its
-# own.
+# are clippy-clean and their tests pass, the recorded-ioctl tests of the
+# three illumos binding crates pass, every portable crate and its test
+# targets type-check against the illumos target, the lockfile is
+# current, and the dependency and public-surface policies hold.
+# tools/fhrun-init is excluded from the workspace, so the guest-init job
+# covers it on its own.
+#
+# A green run also means the two platforms compile the same set of
+# tests, apart from the gated ones recorded in tools/test-parity.expected
+# with a reason. Every job here runs on ubuntu, so without that check a
+# test gated to illumos runs nowhere and a test gated away from illumos
+# never runs on the product platform. See the `test-parity` job.
 #
 # It does NOT mean the VMM builds, boots a guest, or passes a platform
 # test. Those still run on the illumos build host; see docs/testing.md.
@@ -80,14 +87,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup target add x86_64-unknown-illumos
-      # The FFI crates: ioctl definitions, struct layouts, and the viona
-      # bindings. This is the code most likely to break against the
-      # target and it has no C or asm dependencies. No linker is needed
-      # because check does not link.
+      # Every portable crate against the real target, tests included.
+      # `--all-targets` is the point of this job: it is the only place
+      # in the workflow that COMPILES a `#[cfg(test)]` body behind
+      # `cfg(target_os = "illumos")`. The clippy and test jobs build for
+      # the host, and the firehyve check in `binaries` reaches these
+      # crates as libraries only, so an illumos-only test could stop
+      # compiling and no job here would say so.
+      #
+      # vmm_passthru, vmm_storage and vmm_hid are in the list for a
+      # second reason: firehyve does not depend on them, so before this
+      # their illumos ioctl code was not compiled against the target at
+      # all. Only rshyve reaches them, and rshyve cannot cross-compile.
+      #
+      # vmm_migrate is left out. zstd-sys needs a C compiler for the
+      # target and this runner has no illumos cross-cc. That crate is
+      # portable, so the host clippy and test jobs cover it, and its
+      # illumos paths are covered on the build host.
+      #
+      # No linker is needed because check does not link.
       - run: >
           cargo check --locked --all-targets
           --target x86_64-unknown-illumos
-          -p bhyve_api_sys -p bhyve_api -p viona_api -p vmm_api_common -p vmm_config
+          -p bhyve_api_sys -p bhyve_api -p viona_api -p vmm_api_common
+          -p vmm_config -p vmm_core -p vmm_devices -p vmm_devices_testsupport
+          -p vmm_boot -p vmm_metrics -p vmm_machine -p vmm_hyperv
+          -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
+          -p fhrun
 
   test:
     name: portable tests
@@ -95,13 +121,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Codecs, bounds checks, device register models, and the migration
-      # protocol. Nothing here touches bhyve or viona.
+      # protocol.
+      #
+      # The three binding crates are here for their tests only. They
+      # reach no kernel on this runner: each one drives a recorded ioctl
+      # seam over /dev/null and a pipe, and those recordings are the only
+      # pins on the command number and the arguments the kernel is given.
+      # The bindings are still left out of the clippy and MSRV jobs,
+      # because the compile that means something for them is the illumos
+      # one in `cross-check`. Before this, the build host was the one
+      # machine that ran these tests. tools/check-ci-crates.sh asserts
+      # that they stay named here.
       - run: >
           cargo test --locked
           -p vmm_api_common -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
           -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
-          -p fhrun
+          -p fhrun -p bhyve_api_sys -p bhyve_api -p viona_api
+      # Release is the profile that ships, and no job ran it. slog drops
+      # `debug!` at compile time there and the optimiser changes what a
+      # test can observe, so a green debug run says nothing about it. A
+      # test asserting a debug record the shipping binary never emits
+      # passed here for the life of the branch.
+      - run: >
+          cargo test --locked --release
+          -p vmm_api_common -p vmm_core -p vmm_devices -p vmm_devices_testsupport
+          -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
+          -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
+          -p fhrun -p bhyve_api_sys -p bhyve_api -p viona_api
 
   guest-init:
     name: guest init (musl)
@@ -198,9 +245,21 @@ jobs:
       # build, which need a C toolchain for the target, and
       # there is no illumos cross-cc here. The host target compiles those
       # natively instead, which still type-checks every line of rshyve.
-      - run: >
-          cargo check --locked --all-targets
-          -p rshyve -p vmm-migrate-agent
+      #
+      # `test`, not `check`: rshyve and firehyve hold 236 tests that no
+      # job in this workflow ran. The control socket authorization
+      # policy is among them, and its peer-credential test is gated to
+      # Linux and macOS, so the illumos build host skips it. This runner
+      # is the only machine that runs that test at all. None of these
+      # three packages has a bench or example target, so nothing that
+      # `--all-targets` compiled is lost.
+      - run: cargo test --locked -p rshyve -p firehyve -p vmm-migrate-agent
+      # The vTPM crates ran in no job. They need the submodule and the
+      # autotools deps this job already has, and their tests drive real
+      # libtpms rather than a stub, so they belong here and nowhere
+      # else. vmm_tpm_sys asserts the library answers TPM2_GetRandom,
+      # which a build that silently produced no library cannot do.
+      - run: cargo test --locked -p vmm_tpm -p vmm_tpm_sys
 
   supply-chain:
     name: advisories, licenses, sources
@@ -287,3 +346,122 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: tools/public-surface.sh
+      # The guard stops private data reaching a public repository, so a
+      # silent pass is its worst failure, and it had one: a `git grep`
+      # that failed was read as "no hits". Outside a checkout it printed
+      # a git error and then reported clean, which is what the illumos
+      # build host does with an extracted tarball. A guard nobody has
+      # watched fail is not known to work, so both failures run here.
+      - name: the guard fails on a planted address, and refuses a tree it cannot list
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          elsewhere="$(mktemp -d)"
+          trap 'rm -rf "$tmp" "$elsewhere"' EXIT
+          # An extracted archive is what the build host has: no checkout.
+          git archive HEAD | tar -x -C "$tmp"
+          # Assembled at run time, because the literal would trip the
+          # guard on this file, which is the guard doing its job. The
+          # address is a generic RFC 1918 one the guard also matches:
+          # this file is public, so it must not carry a real host.
+          third=168
+          printf 'root@192.%s.0.1\n' "$third" > "$tmp/docs/ci-self-test.md"
+          if "$tmp/tools/public-surface.sh"; then
+            echo "the guard reported clean with a lab address in the tree" >&2
+            exit 1
+          fi
+          rm "$tmp/docs/ci-self-test.md"
+          "$tmp/tools/public-surface.sh"
+          # A listing that misses this tree must refuse. An empty answer
+          # read as a clean one is the failure this step exists for.
+          mkdir -p "$elsewhere/tools"
+          cp "$tmp/tools/public-surface.sh" "$elsewhere/tools/"
+          rc=0
+          "$elsewhere/tools/public-surface.sh" || rc=$?
+          if [ "$rc" -ne 2 ]; then
+            echo "the guard answered $rc outside its own tree, wanted 2" >&2
+            exit 1
+          fi
+
+  ci-coverage:
+    name: every portable crate is named by a job
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A crate that no `-p` list names is unlinted and untested code
+      # this workflow reports green, which is how the vmm-devices split
+      # nearly lost five crates. The script derives its list from the
+      # workspace members, so a new crate fails here until a job names
+      # it. It failed closed but ran on no machine before this.
+      - run: tools/check-ci-crates.sh
+      # The gate itself failed closed but had a blind spot: a crate it
+      # exempted was asserted nowhere, so the workflow could stop naming
+      # it and this job stayed green. Watch it fail before trusting it.
+      - name: the gate notices a crate dropped from the jobs that cover it
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          git archive HEAD | tar -x -C "$tmp"
+          ci="$tmp/.github/workflows/ci.yml"
+          # Named through a variable so this file does not carry the
+          # literal the step strips, which would count itself.
+          crate=viona_api
+          before="$(grep -c -- "-p $crate" "$ci")"
+          sed "s/ -p $crate//g" "$ci" > "$ci.cut"
+          mv "$ci.cut" "$ci"
+          # grep prints 0 and exits 1 when it matches nothing, and prints
+          # nothing when it cannot read the file. Only the first is
+          # expected here.
+          after="$(grep -c -- "-p $crate" "$ci" || true)"
+          [ -n "$after" ] || { echo "cannot read the workflow copy" >&2; exit 1; }
+          # A defect that did not land would make the check below pass
+          # for the wrong reason, which is the failure this job is about.
+          if [ "$before" -lt 2 ] || [ "$after" -ne 0 ]; then
+            echo "the defect did not land: $before job lists named $crate, $after still do" >&2
+            exit 1
+          fi
+          if (cd "$tmp" && tools/check-ci-crates.sh); then
+            echo "the gate reported full coverage with $crate dropped from every job" >&2
+            exit 1
+          fi
+
+  test-parity:
+    name: illumos and CI compile the same tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-unknown-illumos
+      # Every job above runs on ubuntu, so a test behind
+      # `cfg(target_os = "illumos")` runs on no machine here, and a test
+      # behind `cfg(not(target_os = "illumos"))` never runs on the
+      # product platform. Both have shipped on this tree, and both were
+      # found by hand: nine tests were exercising empty stubs, two
+      # security tests ran nowhere, and 26 of 29 viona tests were
+      # compiled out on the target. Nothing reported any of it.
+      #
+      # The script counts both sides instead of reading the gates. It
+      # asks rustc for the test list of each target, compares the two,
+      # and fails when the set of platform-gated tests moves away from
+      # tools/test-parity.expected. Recording a change is a deliberate
+      # edit, so drift becomes a reviewed decision.
+      #
+      # A list for a target nobody can execute comes from the MIR: the
+      # test harness rustc builds names every test it kept. The reader
+      # is not trusted, it is checked. The same run builds and lists
+      # this runner's tests and asserts the reader returns exactly those
+      # names. On this runner the checked side is the CI side of the
+      # comparison. Run the script on the illumos build host with
+      # --check-reader to check the other side against a real harness.
+      #
+      # The job also compiles every reachable package for illumos with
+      # its test targets, so illumos-only code that stopped compiling
+      # fails here. It reads the workspace members rather than a
+      # hand-kept `-p` list, so it reaches vmm-migrate-agent, which no
+      # other job cross-checks, and it reaches a new package on the day
+      # it is added.
+      #
+      # It stays quiet about rshyve, vmm_migrate and the two TPM crates.
+      # Their dependencies compile C for the target and this runner has
+      # no illumos cross-cc. The build host covers them.
+      - run: tools/check-test-parity.py

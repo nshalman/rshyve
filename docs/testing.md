@@ -33,6 +33,42 @@ they read `ssh $VMM_HEADNODE ...` rather than `ssh root@$VMM_HEADNODE`.
 | `$VMM_BUILD_HOST` | Platform image builds | Full autotools + OpenSSL toolchain |
 | `$VMM_FIREHYVE_HOST` | firehyve + virtio-fs tests | No compiler and no outbound network |
 
+### The vTPM crates on a developer host
+
+`vmm_tpm_sys` builds the vendored libtpms from the submodule, so its
+tests and the `vmm_tpm` CRB tests need a C toolchain, autotools and
+OpenSSL. Every other crate needs none of that. Get them once:
+
+```sh
+git submodule update --init third_party/libtpms
+brew install autoconf automake libtool pkgconf openssl@3   # macOS
+```
+
+Then the two crates build and their tests run on the laptop:
+
+```sh
+cargo test -p vmm_tpm_sys -p vmm_tpm
+```
+
+`pkgconf` is not optional. It carries `pkg.m4`, which `autoreconf` needs
+for the libtpms `PKG_INSTALLDIR` macro, and the build script asks
+`pkg-config` where OpenSSL is. Without it `autoreconf` stops at
+`'pkgconfig_DATA' is used but 'pkgconfigdir' is undefined`.
+
+Two limits are real, and neither is worked around:
+
+* Only these two crates. rshyve and the rest of the workspace call
+  illumos interfaces that no other operating system has.
+* A developer host links the libtpms it builds against the OpenSSL that
+  `pkg-config` reports. The SmartOS path, which binds the `sunw_`
+  prefixed platform libcrypto through a generated header and a link
+  farm, is taken only on a SmartOS host, so it is proved on
+  `$VMM_BUILD_HOST` and not on a laptop.
+
+If `autoreconf` reports `libtoolize: command not found`, the autoconf in
+use is not the Homebrew build, which calls `glibtoolize`. Point it at
+the GNU one: `export LIBTOOLIZE=glibtoolize`.
+
 ### Build on Headnode
 
 Do this one time if the host still holds the checkout with its old name.
@@ -52,6 +88,11 @@ ssh $VMM_HEADNODE 'cd /opt/rust-bhyve && export PATH=/opt/tools/bin:$PATH && car
 Note: rsync may not update timestamps. Use `--checksum` or `touch` changed files before `cargo build` to force recompilation.
 
 ### Boot a Test VM
+
+This recipe takes the whole node: `pkill -9 rshyve` ends every VMM
+process on it, and the name `testvm` is shared. Give the VM your own
+prefix and kill by that prefix when anybody else may be on the same
+host. See [Cleanup Test VMs](#cleanup-test-vms).
 
 ```bash
 ssh $VMM_HEADNODE 'pkill -9 rshyve; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null; sleep 1; \
@@ -149,6 +190,10 @@ fio --name=t --filename=/tmp/test.dat --rw=read --bs=1M --direct=1 \
 rm /tmp/test.dat
 ```
 
+No fio run covers the virtio-blk bounce buffer yet. Its isolated
+per-operation cost is recorded in
+[block-bounce-cost.md](block-bounce-cost.md).
+
 ### Host Baseline (compare VMM overhead)
 
 ```bash
@@ -159,10 +204,36 @@ ssh $VMM_HEADNODE 'export PATH=/opt/tools/bin:$PATH; \
 
 ### Cleanup Test VMs
 
+Name every VM you boot with a prefix of your own, and sweep by that
+prefix at the end of the run. A session that skipped this left 14 VM
+instances and 15 dataset clones alive for 12 hours.
+
+Read the list before you destroy anything:
+
 ```bash
-ssh $VMM_HEADNODE 'pkill -9 rshyve; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null'
-ssh -i $VMM_LAB_KEY $VMM_MIGRATE_HOST 'pkill -9 rshyve; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/dev/null'
+export PFX=<your-prefix>-
+: "${PFX:?set PFX before you run any sweep below}"
+ssh $VMM_HEADNODE "pgrep -fl 'rshyve.*$PFX'; ls /dev/vmm | grep \"^$PFX\""
 ```
+
+Then sweep what that listed. An empty `PFX` here matches every VM on
+the node, so keep the guard:
+
+```bash
+: "${PFX:?set PFX before you run any sweep below}"
+SWEEP="pkill -f 'rshyve.*$PFX'; \
+  for v in \$(ls /dev/vmm | grep \"^$PFX\"); do \
+    /usr/sbin/bhyvectl --vm=\$v --destroy; done"
+ssh $VMM_HEADNODE "$SWEEP"
+ssh -i $VMM_LAB_KEY $VMM_MIGRATE_HOST "$SWEEP"
+```
+
+Dataset clones do not go with the process. List them and destroy the
+ones you made, by name.
+
+**Never touch a `SYSbhyve-*` instance.** Those belong to the platform
+and each one is somebody's running guest. A sweep that matches on
+`rshyve` alone, or on no prefix at all, reaches them.
 
 ### Boot-Time Profiling
 
@@ -218,6 +289,11 @@ Both headnode and nuc1 have `vmm_test0` VNICs with MAC `02:08:20:aa:bb:cc`.
 7. **Windows boot test**: `tools/win-boot-test.sh start` then `wait 'Press any key to boot' 120` - see below
 8. **virtio-fs test**: `tools/virtiofs-stage.sh` then `virtiofs-run.sh` - see below
 9. **Hotplug test**: boot with `--hotplug`, then `cpu-add`, `mem-add` and `device-add` over the control socket or the vsock `CONTROL` verb - see below
+10. **Wedged lease teardown**: delay viona's TX frame release, power the guest off, and watch the shutdown budget expire - see below
+11. **Device reset matrix**: reset the device from inside a running guest, repeatedly, with I/O in flight, and verify guest data after each - see below
+
+What one live guest already established, and what it did not, is in
+[hardware-run.md](hardware-run.md). Read it before repeating any of it.
 
 ### virtio-fs Test
 
@@ -253,8 +329,10 @@ content. Change them together.
 
 To boot a container image as the guest root filesystem instead, stage
 one and run the `container` mode. The image is exported read-only and
-the guest supplies a tmpfs upper layer through overlayfs, so the run
-also checks afterwards that nothing reached the host export:
+the guest supplies a tmpfs upper layer through overlayfs. After the run
+the script probes the host export for two guest writes, a new file and a
+copy-up of `/etc/hostname`. That is two probes, not a comparison of the
+whole export against its staged state:
 
 ```bash
 tools/virtiofs-container-stage.sh alpine:3.21
@@ -262,9 +340,10 @@ ssh -i $VMM_FIREHYVE_KEY $VMM_FIREHYVE_HOST /var/tmp/virtiofs-test/virtiofs-run.
 ```
 
 The share holds `rootfs/` and `container.json`, the latter derived from
-the image's own OCI config at stage time, so the container cannot see or
-alter what it was told to run. `container` runs the harness checks
-inside the image; `entrypoint` runs the image's own command instead:
+the image's own OCI config at stage time. `container.json` sits outside
+`rootfs/`, so it is not inside the container's root, and the share is
+exported read-only. `container` runs the harness checks inside the
+image; `entrypoint` runs the image's own command instead:
 
 ```bash
 tools/virtiofs-container-stage.sh hello-world
@@ -281,9 +360,9 @@ so one boot covers all three devices. The vsock check dials host port
 script starts on `<socket>_5555`, which exercises both directions and
 the guest-initiated connect path. The bulk case pushes 512 KiB through,
 which is larger than one RX chain and larger than a connection's credit
-window, so it only passes if splitting, credit and backpressure all
-work. Run it repeatedly: the ordering defect it caught failed roughly
-one run in four.
+window, so it exercises splitting, credit and backpressure. A pass is
+not proof that all three are correct: the ordering defect this case
+caught failed only about one run in four. Run it repeatedly.
 
 ### Guest kernel comparison
 
@@ -443,6 +522,156 @@ Tear the VM down by name, `bhyvectl --destroy --vm=hptest`, and kill
 only the process you started. The test nodes are shared, so a pattern
 kill such as `pkill -f 'firehyv[e]'` reaches every VM on the box and not
 just yours. `tools/hotplug-run.sh` destroys by name for that reason.
+
+### Wedged lease teardown
+
+Covers the one shutdown wedge no watchdog can end: a vmm_drv lease that
+does not break. `VM_DESTROY_SELF` waits for the lease list to empty in
+an untimed `cv_wait`, and process exit then waits for that LWP.
+`FEATURES_TODO.md` holds the kernel detail; this section is what to run
+and what to look for.
+
+**What this does and does not show.** The shipped configuration excludes
+one wait, not every wait. illumos defaults `viona_default_tx_copy` to
+`B_TRUE`, and this VMM never calls `VNA_IOC_SET_PARAMS`, so a TX ring
+allocates no desb handles, `vr_xfer_outstanding` stays zero, and
+`viona_tx_wait_outstanding` (`viona_tx.c`) returns immediately. That
+wait is the one the steps below use, and it is the only way a lease has
+been shown to park.
+
+Three things stay unshown. Any other path that keeps a ring worker away
+from its `vmm_drv_lease_expired()` check holds the lease the same way,
+and copying TX data says nothing about those paths. viona is not the
+only `vmm_drv` consumer, and `vmm_lease_block` waits for every lease in
+the list whoever signed it. `viona_default_tx_copy` is a writable
+global, so a link created while it is clear loans guest memory. Read the
+claim as "the known wait is excluded", not as "no lease can park".
+
+The steps below turn loaning on and then delay the frame release, which
+reproduces the VMM half: the destroy budget expiring, the log lines, and
+the parked thread. They do not park it forever. DTrace `chill()` is
+capped at 500 ms per CPU per second (`dtrace_chill_max`,
+`dtrace_chill_interval`), so the release is delayed, not stopped. A
+permanent wedge needs a consumer that never returns the frame.
+
+Both steps 1 and 3 change kernel state on the host. Test nodes only.
+
+1. Turn viona TX guest-memory loaning on, then boot the test VM. The
+   per-link default is taken when the link is created, so the order
+   matters:
+
+```bash
+ssh $VMM_HEADNODE 'mdb -kw -e "viona_default_tx_copy/W 0"'
+```
+
+   Boot the VM as in "Boot a Test VM" above.
+
+2. Give the guest TX traffic to send:
+
+```bash
+ssh root@$VMM_GUEST_IP "ping -f -s 1400 $VMM_GUEST_GW" &
+```
+
+3. Delay viona's frame release:
+
+```bash
+ssh $VMM_HEADNODE 'dtrace -w -n "fbt::viona_desb_release:entry { chill(500000000); }"'
+```
+
+4. Power the guest off from inside it. That runs the same teardown a
+   SIGTERM runs, and it is the common path on a node:
+
+```bash
+ssh root@$VMM_GUEST_IP 'poweroff'
+```
+
+5. Watch the VMM log. Fifteen seconds after the destroy starts,
+   teardown gives up on it and logs `the VM destroy did not return
+   inside its budget`. The record carries `likely_cause`, which names
+   both a vCPU that will not freeze and an unbroken vmm_drv lease,
+   because either can hold the ioctl. If the destroy is still parked
+   when the teardown budget runs out, the watchdog follows with `the VMM
+   outlived its own shutdown; ending the process` and an exit code of 4.
+
+6. Find the parked thread while the destroy is stuck:
+
+```bash
+ssh $VMM_HEADNODE 'pstack $(pgrep -f "rshyve.*testvm")'
+```
+
+   The `vm-destroy` thread sits in `ioctl`. Confirm the kernel side:
+
+```bash
+ssh $VMM_HEADNODE 'echo "::pgrep rshyve | ::walk thread | ::findstack -v" | mdb -k'
+```
+
+   Look for `cv_wait` called from `vmm_lease_block`.
+
+7. Clean up. Stop the DTrace script and the ping. The frames come back,
+   the lease breaks, the destroy returns, and the process exits. Put the
+   tunable back:
+
+```bash
+ssh $VMM_HEADNODE 'mdb -kw -e "viona_default_tx_copy/W 1"'
+```
+
+   On a node where a real holder cannot be released, there is no
+   userspace recovery. The guest memory stays held until the node
+   reboots.
+
+### Device reset matrix
+
+A device reset is the one guest operation this VMM has to complete
+synchronously, and no test in the suite drives a real driver through
+one. Drive it from inside the guest.
+
+The shape that found bugs, and that
+[hardware-run.md](hardware-run.md#the-device-reset-matrix) records:
+
+1. Start a long `dd` against the disk inside the guest and leave it
+   running. A reset with no work in flight tests almost nothing.
+2. Unbind and rebind the device through sysfs, in a loop. Each rebind
+   is a real driver reset, not a control-socket command.
+3. Force the legacy transport for part of the run. That path writes the
+   status register and reads it back once, with no polling loop, so a
+   reset that has not finished when the write returns is visible.
+4. After every reset, read back a file of known content in the guest and
+   compare its SHA-256. A reset that loses or reorders a completion
+   corrupts data quietly; a pass/fail on the reset alone does not see it.
+5. Give the guest 4 or more vCPUs, drive one writer per queue with
+   `taskset` pinned to the vCPU that owns it, and read
+   `/proc/interrupts` per vector afterwards. Every vector must have
+   moved. A completion routed to the wrong queue leaves one vector
+   carrying the whole run while throughput and every aggregate counter
+   stay healthy ([hardware-run.md](hardware-run.md#the-rerun-on-a-distro-guest)).
+
+Two guest resets that also need cover, and that the run above included:
+a warm reboot with a dirty page cache, and an ACPI S5 poweroff. After a
+poweroff, check the host for a leaked process and for a leaked kernel VM
+instance with `bhyvectl --vm=<name> --get-stats`.
+
+Do not read a pass as a result for an illumos guest. The illumos virtio
+driver writes the status register once and never reads it back, on
+either transport, so it is the strictest case and it has never been run.
+
+### Interrupt injection latency
+
+The residual cost of a device reset is the interrupt injections already
+in flight, and each is one ioctl. Measure the ioctl, under three
+conditions, because the idle number is not the one that matters:
+
+- idle,
+- with the guest running one spinning thread per vCPU,
+- during a memory hot-add on the same VM.
+
+The third is the interesting one. Both injection ioctls take the bhyve
+VM read lock, and illumos grants that lock to a waiting writer first, so
+a hot-add stalls injection for as long as it holds the write lock. Time
+`VM_ALLOC_MEMSEG` on the host at the same time, and vary the size added:
+the hold scales per GiB.
+
+Numbers from the run, and what they mean for a node, are in
+[hardware-run.md](hardware-run.md#why-a-device-reset-has-no-upper-bound).
 
 ### Windows Boot Test
 

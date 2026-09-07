@@ -5,9 +5,9 @@
 //! MSI-X interrupt support for PCI devices.
 //!
 //! Provides [`MsixTable`] which manages MSI-X vector entries and
-//! delivers interrupts via `VmmHdl::lapic_msi()`. Devices use this
-//! by placing the MSI-X table in a BAR and calling [`fire`] to
-//! trigger a specific vector.
+//! delivers interrupts through an [`MsiSink`]. Devices use this by
+//! placing the MSI-X table in a BAR and calling [`fire`] to trigger a
+//! specific vector.
 //!
 //! # PCI Config Space
 //!
@@ -17,7 +17,35 @@
 
 use std::sync::{Arc, Mutex};
 
-use vmm_core::hdl::VmmHdl;
+/// Deliver a message-signalled interrupt.
+///
+/// Indirected through a trait so the table is unit-testable without a
+/// live /dev/vmm handle, and so the table stays free of any one
+/// hypervisor. bhyve does this with VM_LAPIC_MSI; KVM would use
+/// KVM_SIGNAL_MSI.
+pub trait MsiSink: Send + Sync + 'static {
+    fn send(&self, addr: u64, data: u64);
+}
+
+/// MSI sink backed by a live vmm handle.
+pub struct HdlMsiSink {
+    hdl: Arc<vmm_core::hdl::VmmHdl>,
+}
+
+impl HdlMsiSink {
+    /// Create an MSI sink for the VM handle.
+    pub fn new(hdl: Arc<vmm_core::hdl::VmmHdl>) -> Arc<Self> {
+        Arc::new(Self { hdl })
+    }
+}
+
+impl MsiSink for HdlMsiSink {
+    fn send(&self, addr: u64, data: u64) {
+        // Delivery is best effort. A device has no caller to hand a
+        // kernel error back to, and the guest re-arms the vector.
+        let _ = self.hdl.lapic_msi(addr, data);
+    }
+}
 
 /// MSI-X capability ID in PCI config space.
 pub const MSIX_CAP_ID: u8 = 0x11;
@@ -84,7 +112,7 @@ impl Default for MsixEntry {
 /// entry, then drops it before the ioctl.
 pub struct MsixTable {
     inner: Mutex<MsixInner>,
-    hdl: Arc<VmmHdl>,
+    msi: Arc<dyn MsiSink>,
     /// Fixed at construction; cached outside the lock so the BAR decode
     /// path can compute the PBA offset without contending on the mutex.
     count: u16,
@@ -102,7 +130,7 @@ struct MsixInner {
 
 impl MsixTable {
     /// Create a new MSI-X table with `count` vectors.
-    pub fn new(count: u16, hdl: Arc<VmmHdl>) -> Self {
+    pub fn new(count: u16, msi: Arc<dyn MsiSink>) -> Self {
         let entries = vec![MsixEntry::default(); count as usize];
         let pba_qwords = (count as usize).div_ceil(64);
         Self {
@@ -112,7 +140,7 @@ impl MsixTable {
                 func_masked: false,
                 pba: vec![0; pba_qwords],
             }),
-            hdl,
+            msi,
             count,
         }
     }
@@ -127,6 +155,11 @@ impl MsixTable {
     /// If the vector is masked or MSI-X is globally disabled, the
     /// interrupt is recorded in the PBA for later delivery when
     /// unmasked.
+    ///
+    /// The lock is dropped before the sink. Delivery is a call into
+    /// the kernel, and a device reset lowers this same route from the
+    /// vCPU that wrote the reset register, so nothing here may hold a
+    /// message in flight against that reset.
     #[inline]
     pub fn fire(&self, vector: u16) {
         let mut inner = self.inner.lock().expect("msix lock");
@@ -147,7 +180,18 @@ impl MsixTable {
         let data = u64::from(entry.data);
         drop(inner);
 
-        let _ = self.hdl.lapic_msi(addr, data);
+        self.msi.send(addr, data);
+    }
+
+    /// Drop every message the PBA is holding.
+    ///
+    /// A device reset ends the driver session that asked for these.
+    /// Left in place they leave on the next unmask, which is a guest
+    /// write to the table BAR that no reset gates, and they carry the
+    /// address and data of a driver that is gone.
+    pub fn clear_pending(&self) {
+        let mut inner = self.inner.lock().expect("msix lock");
+        inner.pba.fill(0);
     }
 
     /// Returns true if MSI-X is enabled (Message Control bit 15).
@@ -216,13 +260,31 @@ impl MsixTable {
         }
     }
 
-    /// Write to the MSI-X table BAR.
+    /// Write to the MSI-X table BAR, delivering what an unmask
+    /// released.
     pub fn table_write(&self, offset: usize, val: u32) {
+        if let Some((addr, data)) = self.table_write_deferred(offset, val) {
+            self.msi.send(addr, data);
+        }
+    }
+
+    /// Write to the MSI-X table BAR and hand back what an unmask
+    /// released, instead of sending it.
+    ///
+    /// A caller that gates interrupt delivery against a device reset
+    /// needs the message before it leaves: the send is a call into the
+    /// kernel and the reset cannot recall it, so the decision has to
+    /// be made on this side of it.
+    pub fn table_write_deferred(
+        &self,
+        offset: usize,
+        val: u32,
+    ) -> Option<(u64, u64)> {
         let mut inner = self.inner.lock().expect("msix lock");
         let idx = offset / ENTRY_SIZE;
         let field = offset % ENTRY_SIZE;
         if idx >= inner.entries.len() {
-            return;
+            return None;
         }
 
         let was_masked = (inner.entries[idx].control & VECTOR_CTRL_MASK) != 0;
@@ -235,21 +297,13 @@ impl MsixTable {
             _ => {}
         }
 
-        // Check if vector was just unmasked — deliver pending interrupt
+        // An unmask sends the message the PBA is holding for this one
+        // vector. The function mask still gates it: both masks must be
+        // clear before a message leaves.
         let now_masked = (inner.entries[idx].control & VECTOR_CTRL_MASK) != 0;
-        if was_masked && !now_masked && inner.enabled {
-            let qword = idx / 64;
-            let bit = idx % 64;
-            if inner.pba[qword] & (1 << bit) != 0 {
-                inner.pba[qword] &= !(1 << bit);
-                let e = &inner.entries[idx];
-                let addr = u64::from(e.addr_lo) | (u64::from(e.addr_hi) << 32);
-                let data = u64::from(e.data);
-                drop(inner);
-                // best-effort MSI delivery; kernel error if this fails
-                let _ = self.hdl.lapic_msi(addr, data);
-            }
-        }
+        (was_masked && !now_masked)
+            .then(|| take_pending(&mut inner, idx))
+            .flatten()
     }
 
     /// Read from the PBA BAR region.
@@ -314,18 +368,43 @@ impl MsixTable {
 
     /// Write to the MSI-X capability structure.
     pub fn cap_write(&self, offset: u8, cap_offset: u8, val: u32) {
+        for (addr, data) in self.cap_write_deferred(offset, cap_offset, val) {
+            self.msi.send(addr, data);
+        }
+    }
+
+    /// Write the capability and hand back what clearing the function
+    /// mask released, instead of sending it. See
+    /// [`Self::table_write_deferred`].
+    pub fn cap_write_deferred(
+        &self,
+        offset: u8,
+        cap_offset: u8,
+        val: u32,
+    ) -> Vec<(u64, u64)> {
         if offset < cap_offset || offset >= cap_offset + 12 {
-            return;
+            return Vec::new();
         }
         let cap_rel = offset - cap_offset;
         let dword_off = cap_rel & 0xFC;
-        if dword_off == 0 {
-            let msg_ctrl = (val >> 16) as u16;
-            let mut inner = self.inner.lock().expect("msix lock");
-            inner.enabled = (msg_ctrl & MSG_CTRL_ENABLE) != 0;
-            inner.func_masked = (msg_ctrl & MSG_CTRL_FUNC_MASK) != 0;
+        if dword_off != 0 {
+            // Table BIR and PBA BIR are read-only.
+            return Vec::new();
         }
-        // Table BIR and PBA BIR are read-only
+
+        let msg_ctrl = (val >> 16) as u16;
+        let mut inner = self.inner.lock().expect("msix lock");
+        inner.enabled = (msg_ctrl & MSG_CTRL_ENABLE) != 0;
+        inner.func_masked = (msg_ctrl & MSG_CTRL_FUNC_MASK) != 0;
+        // PCI 3.0 6.8.2.3: clearing the Function Mask sends every message
+        // the PBA recorded while it was set. Without this the guest waits
+        // on an I/O that already completed.
+        drain_pending(&mut inner)
+    }
+
+    /// Deliver a message a `_deferred` write handed back.
+    pub fn send_message(&self, addr: u64, data: u64) {
+        self.msi.send(addr, data);
     }
 
     /// Total BAR size needed for MSI-X table + PBA.
@@ -334,11 +413,193 @@ impl MsixTable {
     }
 }
 
+/// Take the message one vector has pending, if it can be sent now.
+///
+/// Clears the PBA bit, so one recorded interrupt sends one message
+/// however many times the guest masks and unmasks the vector.
+fn take_pending(inner: &mut MsixInner, idx: usize) -> Option<(u64, u64)> {
+    if !inner.enabled || inner.func_masked {
+        return None;
+    }
+    // Copied out so the entry borrow ends before the PBA is written.
+    let entry = *inner.entries.get(idx)?;
+    if (entry.control & VECTOR_CTRL_MASK) != 0 {
+        return None;
+    }
+
+    let bit = 1u64 << (idx % 64);
+    let word = inner.pba.get_mut(idx / 64)?;
+    if *word & bit == 0 {
+        return None;
+    }
+    *word &= !bit;
+
+    Some((
+        u64::from(entry.addr_lo) | (u64::from(entry.addr_hi) << 32),
+        u64::from(entry.data),
+    ))
+}
+
+/// Take every message the PBA is holding that can be sent now.
+///
+/// Walks the set bits, not the whole table, so a guest that toggles the
+/// function mask pays for what it left pending and nothing more. The
+/// enable and mask tests live in `take_pending` alone: both run under
+/// the one borrow, so a second copy here can never disagree with it.
+fn drain_pending(inner: &mut MsixInner) -> Vec<(u64, u64)> {
+    let mut messages = Vec::new();
+    for word in 0..inner.pba.len() {
+        let mut bits = inner.pba[word];
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            // `take_pending` bounds-checks: a bit past the table is
+            // never set by `fire`, and this index is guest driven.
+            if let Some(message) = take_pending(inner, word * 64 + bit) {
+                messages.push(message);
+            }
+        }
+    }
+    messages
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
     use super::*;
 
-    // Can't test fire() without a VmmHdl, but we can test table mechanics
+    /// A teardown that takes longer than this is waiting on the sink.
+    const TEARDOWN_BUDGET: Duration = Duration::from_secs(1);
+
+    /// Records every message the table delivers, so a test can assert
+    /// the exact bytes that reach the hypervisor.
+    struct RecordingSink(Mutex<Vec<(u64, u64)>>);
+
+    impl RecordingSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self(Mutex::new(Vec::new())))
+        }
+
+        fn recorded(&self) -> Vec<(u64, u64)> {
+            self.0.lock().expect("recording lock poisoned").clone()
+        }
+    }
+
+    impl MsiSink for RecordingSink {
+        fn send(&self, addr: u64, data: u64) {
+            self.0
+                .lock()
+                .expect("recording lock poisoned")
+                .push((addr, data));
+        }
+    }
+
+    /// A table with `count` vectors and MSI-X enabled, as a guest leaves
+    /// it after it writes Message Control.
+    fn enabled_table(count: u16) -> (MsixTable, Arc<RecordingSink>) {
+        let sink = RecordingSink::new();
+        let table = MsixTable::new(count, sink.clone());
+        table.cap_write(0, 0, u32::from(MSG_CTRL_ENABLE) << 16);
+        assert!(table.is_enabled());
+        (table, sink)
+    }
+
+    #[test]
+    fn fire_delivers_the_programmed_address_and_data() {
+        let (table, sink) = enabled_table(4);
+
+        // Vector 1 starts at table offset 0x10.
+        table.table_write(0x10, 0xFEE0_1000); // address low
+        table.table_write(0x14, 0x0000_0001); // address high
+        table.table_write(0x18, 0x0000_4021); // message data
+        table.table_write(0x1C, 0); // unmask
+
+        table.fire(1);
+
+        // The address is the two halves joined; the data is the low
+        // 32 bits with the top half zero.
+        assert_eq!(sink.recorded(), vec![(0x0000_0001_FEE0_1000, 0x4021)]);
+    }
+
+    #[test]
+    fn message_data_is_zero_extended() {
+        let (table, sink) = enabled_table(1);
+
+        table.table_write(0x0, 0xFFFF_FFFF);
+        table.table_write(0x4, 0xFFFF_FFFF);
+        table.table_write(0x8, 0xFFFF_FFFF);
+        table.table_write(0xC, 0);
+
+        table.fire(0);
+
+        assert_eq!(
+            sink.recorded(),
+            vec![(0xFFFF_FFFF_FFFF_FFFF, 0x0000_0000_FFFF_FFFF)]
+        );
+    }
+
+    #[test]
+    fn a_masked_vector_goes_to_the_pba_and_unmask_delivers_it_once() {
+        let (table, sink) = enabled_table(2);
+
+        // Entries start masked, so the message is only programmed here.
+        table.table_write(0x0, 0xFEE0_2000);
+        table.table_write(0x4, 0);
+        table.table_write(0x8, 0x0000_0031);
+
+        table.fire(0);
+        assert!(sink.recorded().is_empty());
+        assert_eq!(table.pba_read(0) & 1, 1);
+
+        table.table_write(0xC, 0);
+        assert_eq!(sink.recorded(), vec![(0xFEE0_2000, 0x31)]);
+        assert_eq!(table.pba_read(0) & 1, 0);
+
+        // A later mask and unmask must not replay the message.
+        table.table_write(0xC, VECTOR_CTRL_MASK);
+        table.table_write(0xC, 0);
+        assert_eq!(sink.recorded().len(), 1);
+    }
+
+    #[test]
+    fn the_function_mask_defers_every_vector() {
+        let (table, sink) = enabled_table(2);
+        table.write_entry(0, 0xFEE0_4000, 0x51);
+
+        table.cap_write(
+            0,
+            0,
+            u32::from(MSG_CTRL_ENABLE | MSG_CTRL_FUNC_MASK) << 16,
+        );
+        table.fire(0);
+
+        assert!(sink.recorded().is_empty());
+        assert_eq!(table.pba_read(0) & 1, 1);
+    }
+
+    #[test]
+    fn a_disabled_table_delivers_nothing_and_keeps_the_pba_clear() {
+        let sink = RecordingSink::new();
+        let table = MsixTable::new(2, sink.clone());
+        table.write_entry(0, 0xFEE0_3000, 0x41);
+
+        table.fire(0);
+
+        assert!(sink.recorded().is_empty());
+        assert_eq!(table.pba_read(0), 0);
+    }
+
+    #[test]
+    fn a_vector_past_the_table_is_ignored() {
+        let (table, sink) = enabled_table(2);
+
+        table.fire(2);
+        table.fire(u16::MAX);
+
+        assert!(sink.recorded().is_empty());
+    }
 
     #[test]
     fn entry_default_is_masked() {
@@ -373,5 +634,154 @@ mod tests {
     fn cap_read_returns_cap_id() {
         // Verify capability ID encoding
         assert_eq!(MSIX_CAP_ID, 0x11);
+    }
+
+    // ── Function mask (PCI 3.0 6.8.2.3) ─────────────────────────
+
+    /// Message Control with MSI-X enabled and the function mask as given.
+    fn write_msg_ctrl(table: &MsixTable, func_masked: bool) {
+        let mut ctrl = MSG_CTRL_ENABLE;
+        if func_masked {
+            ctrl |= MSG_CTRL_FUNC_MASK;
+        }
+        table.cap_write(0, 0, u32::from(ctrl) << 16);
+    }
+
+    #[test]
+    fn clearing_the_function_mask_delivers_every_pending_vector() {
+        // Without this the guest waits forever on an I/O that finished:
+        // the completion is recorded in the PBA and never sent.
+        let (table, sink) = enabled_table(2);
+        table.write_entry(0, 0xFEE0_5000, 0x61);
+        table.write_entry(1, 0xFEE0_5000, 0x62);
+        write_msg_ctrl(&table, true);
+
+        table.fire(0);
+        table.fire(1);
+        assert!(sink.recorded().is_empty());
+        assert_eq!(table.pba_read(0) & 0b11, 0b11);
+
+        write_msg_ctrl(&table, false);
+
+        assert_eq!(
+            sink.recorded(),
+            vec![(0xFEE0_5000, 0x61), (0xFEE0_5000, 0x62)]
+        );
+        assert_eq!(table.pba_read(0) & 0b11, 0);
+    }
+
+    #[test]
+    fn a_function_mask_toggle_delivers_a_message_once() {
+        let (table, sink) = enabled_table(1);
+        table.write_entry(0, 0xFEE0_6000, 0x71);
+        write_msg_ctrl(&table, true);
+        table.fire(0);
+
+        write_msg_ctrl(&table, false);
+        write_msg_ctrl(&table, true);
+        write_msg_ctrl(&table, false);
+
+        assert_eq!(sink.recorded(), vec![(0xFEE0_6000, 0x71)]);
+    }
+
+    #[test]
+    fn clearing_the_function_mask_leaves_a_per_vector_mask_pending() {
+        // Both masks gate delivery, so the vector mask still holds.
+        let (table, sink) = enabled_table(2);
+        table.write_entry(0, 0xFEE0_7000, 0x81);
+        write_msg_ctrl(&table, true);
+        table.fire(0);
+        table.table_write(0xC, VECTOR_CTRL_MASK);
+
+        write_msg_ctrl(&table, false);
+
+        assert!(sink.recorded().is_empty());
+        assert_eq!(table.pba_read(0) & 1, 1);
+
+        table.table_write(0xC, 0);
+        assert_eq!(sink.recorded(), vec![(0xFEE0_7000, 0x81)]);
+    }
+
+    #[test]
+    fn an_unmask_under_the_function_mask_delivers_nothing() {
+        let (table, sink) = enabled_table(1);
+        table.table_write(0x0, 0xFEE0_8000);
+        table.table_write(0x8, 0x91);
+        write_msg_ctrl(&table, true);
+        table.fire(0);
+
+        table.table_write(0xC, 0);
+
+        assert!(sink.recorded().is_empty());
+        assert_eq!(table.pba_read(0) & 1, 1);
+    }
+
+    #[test]
+    fn a_pending_vector_past_the_table_is_never_delivered() {
+        let (table, sink) = enabled_table(2);
+        write_msg_ctrl(&table, true);
+        // Only fire() writes the PBA and it bounds-checks, so reach in.
+        table.inner.lock().expect("msix lock").pba[0] = u64::MAX;
+
+        write_msg_ctrl(&table, false);
+
+        assert_eq!(sink.recorded().len(), 0);
+    }
+
+    /// A sink that holds the sending thread until it is released.
+    /// This stands in for a kernel call that has not returned.
+    #[derive(Default)]
+    struct ParkingSink {
+        sending: AtomicBool,
+        release: AtomicBool,
+    }
+
+    impl MsiSink for ParkingSink {
+        fn send(&self, _addr: u64, _data: u64) {
+            self.sending.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
+    fn a_message_in_flight_does_not_hold_the_table() {
+        let sink = Arc::new(ParkingSink::default());
+        let table = MsixTable::new(2, sink.clone());
+        table.cap_write(0, 0, u32::from(MSG_CTRL_ENABLE) << 16);
+        table.write_entry(0, 0xFEE0_9000, 0xA1);
+
+        // The teardown runs on its own thread under a deadline. One
+        // that waits on the sink is waiting for a park only this
+        // thread releases, so waiting for it here would hang the run
+        // instead of failing it.
+        let torn_down = AtomicBool::new(false);
+        let waited = std::thread::scope(|s| {
+            s.spawn(|| table.fire(0));
+            while !sink.sending.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            // A driver tearing the device down clears Message Control.
+            s.spawn(|| {
+                table.cap_write(0, 0, 0);
+                torn_down.store(true, Ordering::Release);
+            });
+            let start = Instant::now();
+            while !torn_down.load(Ordering::Acquire)
+                && start.elapsed() < TEARDOWN_BUDGET
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let waited = start.elapsed();
+            sink.release.store(true, Ordering::Release);
+            waited
+        });
+
+        assert!(
+            waited < TEARDOWN_BUDGET,
+            "the teardown waited {waited:?} behind a message in flight"
+        );
     }
 }

@@ -93,11 +93,8 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             if cur != VmRunState::Running && cur != VmRunState::Paused {
                 return Response::err("VM is not running or paused");
             }
-            ctrl.state
-                .store(VmRunState::Stopping as u8, Ordering::Release);
-
             // If paused, resume first so vCPUs can receive the suspend
-            if cur == VmRunState::Paused {
+            if ctrl.begin_stop() {
                 // best-effort: if resume fails, suspend below will also fail
                 let _ = ctrl.hdl.resume();
             }
@@ -125,11 +122,8 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             if cur != VmRunState::Running && cur != VmRunState::Paused {
                 return Response::err("VM is not running or paused");
             }
-            ctrl.state
-                .store(VmRunState::Stopping as u8, Ordering::Release);
-
             // If paused, resume first so vCPUs can receive the suspend
-            if cur == VmRunState::Paused {
+            if ctrl.begin_stop() {
                 // best-effort: if resume fails, suspend below will also fail
                 let _ = ctrl.hdl.resume();
             }
@@ -154,13 +148,34 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
 
         Command::Stop => {
             let cur = ctrl.state();
-            if cur == VmRunState::Stopped || cur == VmRunState::Stopping {
-                return Response::err("VM is already stopped/stopping");
+            let migrated_away = ctrl.migrated_away();
+            if let Some(refusal) = stop_refusal(cur, migrated_away) {
+                return Response::err(refusal);
             }
-            ctrl.state
-                .store(VmRunState::Stopping as u8, Ordering::Release);
+            if migrated_away {
+                // The guest runs on another host now, so it must not be
+                // resumed first the way a live VM is.
+                return match ctrl.release_migrated_source() {
+                    Ok(()) => {
+                        let mut r = Response::ok();
+                        r.state = Some(VmRunState::Stopping);
+                        r
+                    }
+                    Err(e) => {
+                        // Back to Stopped so the release timer still
+                        // fires. Leaving it Stopping stands the timer
+                        // down and the zombie would outlive the node.
+                        ctrl.state.store(
+                            VmRunState::Stopped as u8,
+                            Ordering::Release,
+                        );
+                        error!(ctrl.log, "stop failed"; "error" => %e);
+                        Response::err("suspend ioctl failed")
+                    }
+                };
+            }
 
-            if cur == VmRunState::Paused {
+            if ctrl.begin_stop() {
                 // best-effort: if resume fails, suspend below will also fail
                 let _ = ctrl.hdl.resume();
             }
@@ -285,6 +300,24 @@ fn hot_add(ctrl: &VmController, add: impl FnOnce() -> Response) -> Response {
     match hot_add_blocked(ctrl.state()) {
         Some(refusal) => refusal,
         None => add(),
+    }
+}
+
+/// Why `stop` cannot run now, or `None` when it can.
+///
+/// A source whose guest moved to another host is left paused and
+/// holding the whole guest memory, and no other command reaches that
+/// state. `stop` is what releases it.
+fn stop_refusal(
+    state: VmRunState,
+    migrated_away: bool,
+) -> Option<&'static str> {
+    match state {
+        VmRunState::Stopped if migrated_away => None,
+        VmRunState::Stopped | VmRunState::Stopping => {
+            Some("VM is already stopped/stopping")
+        }
+        _ => None,
     }
 }
 
@@ -486,8 +519,9 @@ mod tests {
     use super::VmRunState;
     use super::{
         added, cpu_added, cpu_list, device_list, hot_add_blocked,
-        hotplug_disabled, mem_added, mem_list, removing, window_json,
-        CPU_HOTPLUG_OFF, MEM_HOTPLUG_OFF, NO_CPU_REMOVE, NO_MEM_REMOVE,
+        hotplug_disabled, mem_added, mem_list, removing, stop_refusal,
+        window_json, CPU_HOTPLUG_OFF, MEM_HOTPLUG_OFF, NO_CPU_REMOVE,
+        NO_MEM_REMOVE,
     };
 
     /// A stand-in CPU set. Every step of a real add is an ioctl, so a
@@ -899,5 +933,32 @@ mod tests {
             line(cpu_added(3, Err(CpuHotplugError::Consumed(3)))),
             r#"{"success":false,"error":"vCPU 3 was consumed by a failed add: the kernel cannot deactivate a vCPU, so the id cannot be reused"}"#,
         );
+    }
+
+    #[test]
+    fn stop_releases_a_source_the_guest_has_left() {
+        // A migrated-away source is left paused and holding its memory.
+        // `stop` is the only command that can reach it, so refusing it
+        // leaves a zombie no operator can clear.
+        assert_eq!(stop_refusal(VmRunState::Stopped, true), None);
+    }
+
+    #[test]
+    fn stop_refuses_a_vm_that_is_already_done() {
+        for state in [VmRunState::Stopped, VmRunState::Stopping] {
+            assert!(stop_refusal(state, false).is_some(), "{state:?}");
+        }
+        assert!(stop_refusal(VmRunState::Stopping, true).is_some());
+    }
+
+    #[test]
+    fn stop_reaches_a_live_vm_in_every_other_state() {
+        for state in [
+            VmRunState::Running,
+            VmRunState::Paused,
+            VmRunState::Migrating,
+        ] {
+            assert_eq!(stop_refusal(state, false), None, "{state:?}");
+        }
     }
 }

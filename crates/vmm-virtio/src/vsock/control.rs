@@ -41,21 +41,21 @@
 //! unknown or malformed verb closes the connection with one error line
 //! and changes no state.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slog::warn;
 
+use vmm_core::unixsock::write_all_bounded;
 use vmm_devices::pci::msix::MsixTable;
 use vmm_devices::pci::LintrCfg;
 
 use super::device::{
     VirtioVsock, VSOCK_MSIX_VECTORS, VSOCK_NUM_QUEUES, VSOCK_QUEUE_SIZE,
-    VSOCK_RX_QUEUE,
 };
 use crate::attach::VirtioAttachCtx;
 use crate::bits;
@@ -69,7 +69,24 @@ const CONTROL_LINE_MAX: usize = 512;
 
 /// How long a blocked read waits before it looks at the shutdown flag.
 /// Without this, halt would wait for the peer instead of the guest.
-const CONTROL_POLL: Duration = Duration::from_millis(250);
+pub(super) const LINE_POLL: Duration = Duration::from_millis(250);
+
+/// How long a response line has to reach the peer.
+///
+/// This thread is one of the capped reader slots. `SO_SNDTIMEO` bounds
+/// nothing on illumos, so before this the answer to a peer that never
+/// read one held that slot for the life of the VM. Enough such peers
+/// and no further connection can be made, this session included.
+const RESPONSE_BUDGET: Duration = Duration::from_millis(500);
+
+/// How long a peer has to send its opening verb.
+///
+/// Reader threads are capped, so a peer that connects and says nothing
+/// holds a slot the shutdown flag is the only thing that frees. Enough
+/// of them and no further connection can be made, the CONTROL session
+/// included, for the life of the VM. A peer with nothing to say in
+/// this long has nothing to say.
+pub(super) const HANDSHAKE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Answers one control request.
 ///
@@ -134,8 +151,7 @@ pub fn attach_with_control(
     let vsock_intr = vsock.interrupt();
     let control = vsock.control_slot();
 
-    let msix =
-        Arc::new(MsixTable::new(VSOCK_MSIX_VECTORS, Arc::clone(ctx.hdl)));
+    let msix = Arc::new(MsixTable::new(VSOCK_MSIX_VECTORS, ctx.msi_sink()));
 
     let pci_dev = VirtioPciDevice::new(
         vsock,
@@ -152,50 +168,65 @@ pub fn attach_with_control(
 
     // Only the receive queue completes out of band; the transport
     // raises for the transmit queue on its own.
-    let pci_weak = Arc::downgrade(&pci_dev);
     *vsock_intr.lock().expect("virtio-vsock interrupt lock") =
-        Some(Arc::new(move || {
-            if let Some(dev) = pci_weak.upgrade() {
-                dev.raise_queue_interrupt_for(VSOCK_RX_QUEUE);
-            }
-        }));
+        Some(pci_dev.backend_intr());
 
     Ok((pci_dev, control))
 }
 
-/// What one read of the request line produced.
-enum ControlRead {
+/// What one read of a peer's line produced.
+pub(super) enum LineRead {
     Line(String),
     TooLong,
     NotUtf8,
     Closed,
 }
 
-/// Read one request line, one byte at a time and bounded.
+/// Read one line from a host peer, bounded in length and in time.
 ///
-/// Wakes every [`CONTROL_POLL`] to look at `shutdown`, so a session that
-/// an operator left open does not hold up teardown.
-fn read_control_line(
+/// The reader arms [`LINE_POLL`] on the stream itself rather than
+/// trusting the caller to do it. A peer that opens a connection and
+/// sends nothing would otherwise park the thread for the life of the
+/// VM, and a connection the device has not registered yet is out of
+/// reach of the halt sweep, so nothing would ever wake it.
+///
+/// `deadline` bounds the read itself, which the poll does not: without
+/// one, a silent peer holds the thread until the VM shuts down. Pass
+/// it for a handshake, and `None` for an established session that may
+/// idle between requests.
+///
+/// Read one byte at a time, and deliberately not through a `BufReader`:
+/// that reads a whole block, and anything the peer pipelined behind the
+/// newline would sit in a buffer this function is about to drop.
+pub(super) fn read_line_bounded(
     stream: &mut UnixStream,
     shutdown: &AtomicBool,
-) -> ControlRead {
+    max: usize,
+    deadline: Option<Instant>,
+) -> LineRead {
+    if stream.set_read_timeout(Some(LINE_POLL)).is_err() {
+        return LineRead::Closed;
+    }
     let mut line: Vec<u8> = Vec::new();
     let mut byte = [0u8; 1];
     loop {
         if shutdown.load(Ordering::Acquire) {
-            return ControlRead::Closed;
+            return LineRead::Closed;
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return LineRead::Closed;
         }
         match stream.read(&mut byte) {
-            Ok(0) => return ControlRead::Closed,
+            Ok(0) => return LineRead::Closed,
             Ok(_) => {
                 if byte[0] == b'\n' {
                     return match String::from_utf8(line) {
-                        Ok(text) => ControlRead::Line(text),
-                        Err(_) => ControlRead::NotUtf8,
+                        Ok(text) => LineRead::Line(text),
+                        Err(_) => LineRead::NotUtf8,
                     };
                 }
-                if line.len() >= CONTROL_LINE_MAX {
-                    return ControlRead::TooLong;
+                if line.len() >= max {
+                    return LineRead::TooLong;
                 }
                 line.push(byte[0]);
             }
@@ -209,7 +240,7 @@ fn read_control_line(
             {
                 continue
             }
-            Err(_) => return ControlRead::Closed,
+            Err(_) => return LineRead::Closed,
         }
     }
 }
@@ -223,10 +254,24 @@ fn framed(answer: &str) -> &str {
     answer.split(['\r', '\n']).next().unwrap_or("")
 }
 
+/// Send one response line, and give up on a peer that will not take it.
+///
+/// The newline goes in the same write as the line. One response then
+/// costs one budget rather than two, and a peer that stalls cannot
+/// leave a line on the socket with no end to it.
+///
+/// [`write_all_bounded`] polls for space and then sends, so a second
+/// writer on the same socket would break the bound. There is no second
+/// writer here. [`run_control_session`] takes the socket by value, this
+/// module never clones it, and the CONTROL verb keeps it out of the
+/// device socket table, which is the only place another thread looks
+/// one up to write it. The `&mut` is what a later change has to break
+/// first.
 fn write_line(stream: &mut UnixStream, line: &str) -> io::Result<()> {
-    stream.write_all(line.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()
+    let mut out = Vec::with_capacity(line.len() + 1);
+    out.extend_from_slice(line.as_bytes());
+    out.push(b'\n');
+    write_all_bounded(stream, &out, RESPONSE_BUDGET)
 }
 
 /// Serve control requests until the peer closes or the device halts.
@@ -244,19 +289,15 @@ pub(super) fn run_control_session(
         let _ = write_line(&mut stream, "ERR control interface not available");
         return;
     };
-    if let Err(error) = stream.set_read_timeout(Some(CONTROL_POLL)) {
-        warn!(log, "vsock CONTROL refused; no read timeout";
-            "error" => %error);
-        let _ = write_line(&mut stream, "ERR control interface not available");
-        return;
-    }
     if write_line(&mut stream, "OK control").is_err() {
         return;
     }
 
     loop {
-        match read_control_line(&mut stream, shutdown) {
-            ControlRead::Line(request) => {
+        // No deadline: an established session may idle between
+        // requests, and shutdown is what ends it.
+        match read_line_bounded(&mut stream, shutdown, CONTROL_LINE_MAX, None) {
+            LineRead::Line(request) => {
                 let request = request.trim();
                 let answer = if request.is_empty() {
                     "ERR empty request".to_string()
@@ -269,22 +310,22 @@ pub(super) fn run_control_session(
             }
             // A truncated request cannot be resynchronised, so the
             // connection ends rather than acting on half a line.
-            ControlRead::TooLong => {
+            LineRead::TooLong => {
                 let _ = write_line(&mut stream, "ERR request line too long");
                 return;
             }
-            ControlRead::NotUtf8 => {
+            LineRead::NotUtf8 => {
                 let _ = write_line(&mut stream, "ERR request is not text");
                 return;
             }
-            ControlRead::Closed => return,
+            LineRead::Closed => return,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     use std::thread;
 
     use super::*;
@@ -322,6 +363,16 @@ mod tests {
     impl ControlSink for TwoLineSink {
         fn handle_line(&self, _line: &str) -> String {
             "OK first\nERR smuggled".to_string()
+        }
+    }
+
+    /// Answers with more than a socket buffer holds, so the write
+    /// cannot finish until the peer reads.
+    struct BulkSink;
+
+    impl ControlSink for BulkSink {
+        fn handle_line(&self, _line: &str) -> String {
+            format!("OK {}", "x".repeat(1024 * 1024))
         }
     }
 
@@ -466,6 +517,38 @@ mod tests {
         handle.join().expect("session thread");
     }
 
+    /// A peer that asks and never listens must not keep the session.
+    ///
+    /// The session thread is one of the capped reader slots, so a write
+    /// with no end here closes the socket to every other client for the
+    /// life of the VM.
+    #[test]
+    fn a_peer_that_never_reads_its_answer_loses_the_session() {
+        let slot = installed(Arc::new(BulkSink));
+        let (mut client, handle) =
+            session(&slot, Arc::new(AtomicBool::new(false)));
+
+        // Nothing here reads the socket: the banner and the answer
+        // together have to fill it.
+        client.write_all(b"device-list\n").expect("request");
+
+        // The session is the thing under test, so it cannot be joined
+        // here. One that never ended would park the test run.
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(handle.join().is_ok());
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "the session must end on its write budget, not on the peer"
+        );
+
+        // The peer stays open until here. One that closed would end
+        // the write on a broken pipe, which is not the case under test.
+        drop(client);
+    }
+
     #[test]
     fn halt_ends_an_idle_session() {
         // The reader wakes on its own to look at the flag, so a session
@@ -480,6 +563,56 @@ mod tests {
         shutdown.store(true, Ordering::Release);
 
         handle.join().expect("session thread ends on the flag");
+    }
+
+    /// A peer that sends nothing must not park the thread.
+    ///
+    /// The reader owns its own poll timeout, so a caller that forgets to
+    /// arm one still gets a bounded read. The CONNECT path in
+    /// `device.rs` reads its opening line with no timeout at all, and a
+    /// connection that is not in the socket table yet is out of reach of
+    /// the halt sweep.
+    #[test]
+    fn a_silent_peer_does_not_park_the_reader() {
+        let (_client, mut server) = UnixStream::pair().expect("socketpair");
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let flag = Arc::clone(&shutdown);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            flag.store(true, Ordering::Release);
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let got = read_line_bounded(
+                &mut server,
+                &shutdown,
+                CONTROL_LINE_MAX,
+                None,
+            );
+            let _ = tx.send(matches!(got, LineRead::Closed));
+        });
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "the read must end on the flag, not on the peer"
+        );
+    }
+
+    /// The CONNECT path caps its opening line far shorter than a
+    /// control request, so the bound has to be the caller's to pick.
+    #[test]
+    fn the_line_cap_is_the_callers_to_pick() {
+        let (mut client, mut server) = UnixStream::pair().expect("socketpair");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        client.write_all(b"12345678\n").expect("write");
+
+        assert!(matches!(
+            read_line_bounded(&mut server, &shutdown, 4, None),
+            LineRead::TooLong
+        ));
     }
 
     #[test]

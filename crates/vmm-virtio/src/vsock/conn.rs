@@ -157,8 +157,14 @@ impl VsockConn {
     }
 
     /// The host end went away: tell the guest to stop sending.
+    ///
+    /// A connection the guest has not answered yet closes outright.
+    /// There is no half open state to keep: the guest was offered the
+    /// connection and never took it, and holding the entry until it
+    /// replies lets a peer that connects and hangs up fill the table.
     pub fn close_local_send(&mut self) {
         self.state = match self.state {
+            State::Connecting => State::Closed,
             State::PeerSendClosed => State::Closed,
             State::Closed => State::Closed,
             _ => State::LocalSendClosed,

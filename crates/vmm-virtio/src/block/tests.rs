@@ -4,15 +4,54 @@
 
 //! Unit tests for the virtio-blk device.
 
+use std::time::{Duration, Instant};
+
 use super::super::queue::VirtqDesc;
+use super::access::BackendBarrier;
+use super::worker::{
+    blk_io_worker, run_request, BlkIoRequest, Bounce, WorkerCtx, WorkerParks,
+};
 use super::*;
+use crate::access::GuestAccess;
+use crate::pci::intr::{IntrGate, IntrSession};
+
+mod barrier;
+mod bounce;
+mod multiqueue;
+mod reset;
+
+/// A completion handler with no transport behind it.
+///
+/// Every raise it makes goes nowhere, which is what a test that only
+/// watches the used ring wants.
+fn detached_completion(
+    queue: &VirtQueue,
+    physmap: &Arc<PhysMap>,
+) -> Arc<VirtioCompletion> {
+    VirtioCompletion::new(
+        queue,
+        Arc::clone(physmap),
+        IntrSession::INITIAL,
+        |_| {},
+    )
+}
+
+/// A worker context wired to `physmap`, with a fresh session.
+fn worker_ctx(physmap: &Arc<PhysMap>) -> WorkerCtx {
+    WorkerCtx {
+        physmap: Arc::clone(physmap),
+        gate: Arc::new(QuiesceGate::new(1)),
+        access: Arc::new(GuestAccess::new()),
+        backend: Arc::new(BackendBarrier::new()),
+        parks: Arc::new(WorkerParks::default()),
+    }
+}
 
 #[test]
 fn quiesce_query_is_non_blocking_with_active_worker() {
     let file = tempfile::tempfile().expect("create tempfile");
     let fd = file.as_raw_fd();
     let device: Arc<dyn Lifecycle> = Arc::new(VirtioBlock {
-        fd,
         capacity: 0,
         sector_size: 512,
         read_only: true,
@@ -26,9 +65,10 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         interrupt: Arc::new(Mutex::new(None)),
         completions: Mutex::new(Vec::new()),
         _cache: DiskCache::new(fd, true),
-        _file: file,
+        file: Arc::new(file),
         indicator: Indicator::new(),
         gate: Arc::new(QuiesceGate::new(1)),
+        ctx: worker_ctx(&Arc::new(PhysMap::new())),
     });
 
     let probe = Arc::clone(&device);
@@ -400,7 +440,9 @@ const DWZ_AVAIL_GPA: u64 = 0x1100;
 const DWZ_USED_GPA: u64 = 0x1200;
 const DWZ_HEADER_GPA: u64 = 0x2000;
 const DWZ_PAYLOAD_GPA: u64 = 0x2100;
-const DWZ_STATUS_GPA: u64 = 0x2200;
+/// Far enough past the payload that a full sector of data fits between
+/// them.
+const DWZ_STATUS_GPA: u64 = 0x3000;
 const DWZ_QUEUE_SIZE: u16 = 4;
 
 /// One `struct virtio_blk_discard_write_zeroes` (VirtIO 1.3, 5.2.6.2).
@@ -420,10 +462,13 @@ fn poke(physmap: &PhysMap, gpa: u64, bytes: &[u8]) {
         .expect("write guest range");
 }
 
-/// One DISCARD or WRITE_ZEROES request to drive through the device.
+/// One request to drive through the device: a DISCARD or WRITE_ZEROES
+/// payload, or any other opcode with `payload` set.
 struct DwzCase<'a> {
     rtype: u32,
     segs: &'a [[u8; 16]],
+    /// Data buffer, in place of the segments `segs` would encode.
+    payload: Option<&'a [u8]>,
     /// Backing file size in bytes.
     file_bytes: u64,
     /// Byte to pre-fill the backing file with. `None` leaves it sparse.
@@ -439,6 +484,7 @@ impl Default for DwzCase<'_> {
         Self {
             rtype: bits::VIRTIO_BLK_T_WRITE_ZEROES,
             segs: &[],
+            payload: None,
             file_bytes: 8 * 512,
             fill: Some(0xAB),
             read_only: false,
@@ -476,7 +522,10 @@ fn dwz_harness(case: &DwzCase<'_>) -> DwzHarness {
         .write(&header)
         .expect("write request header");
 
-    let payload: Vec<u8> = case.segs.concat();
+    let payload: Vec<u8> = match case.payload {
+        Some(bytes) => bytes.to_vec(),
+        None => case.segs.concat(),
+    };
     if !payload.is_empty() {
         poke(&physmap, DWZ_PAYLOAD_GPA, &payload);
     }
@@ -545,17 +594,31 @@ fn dwz_harness(case: &DwzCase<'_>) -> DwzHarness {
     }
 }
 
+/// Poll `ready` until it holds, or fail after five seconds.
+fn wait_for(what: &str, ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready() {
+        assert!(Instant::now() < deadline, "{what}");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// End the current driver session, the way `VirtioDevice::reset` does.
+fn end_session(ctx: &WorkerCtx) -> u64 {
+    let epoch = ctx.access.close();
+    ctx.backend.retire(epoch);
+    ctx.access.drain();
+    ctx.access.reopen(IntrSession::INITIAL);
+    epoch
+}
+
 /// Drive one request through and return its status byte. Worker
 /// completions are asynchronous, so poll the used ring.
 fn dwz_run(h: &mut DwzHarness) -> u8 {
     h.block.notify_queue(0, &mut h.queues, &h.physmap);
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(5);
     while h.queues[0].read_used_ring_idx(&h.physmap) == 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "request never completed"
-        );
+        assert!(Instant::now() < deadline, "request never completed");
         thread::yield_now();
     }
     let mut status = [0u8; 1];
@@ -835,4 +898,47 @@ fn read_only_disk_publishes_no_discard_limits() {
     for off in [0x24u16, 0x28, 0x2C, 0x30, 0x34, 0x38] {
         assert_eq!(blk.cfg_read(off, 4), 0, "offset {off:#x} not zero");
     }
+}
+
+/// A chain the walker refuses must still go back on the used ring.
+/// `pop_avail` already took its head out of the available ring, so
+/// dropping it burns one descriptor for the life of the device: the
+/// block layer has no abort path to recover it, and a guest that can
+/// drive enough refusals stalls its own disk.
+#[test]
+fn a_refused_chain_returns_its_descriptor() {
+    const DESC_GPA: u64 = 0x1000;
+    const USED_GPA: u64 = 0x1200;
+
+    let (physmap, queue, block) = make_get_id_queue(4, 1);
+    // NEXT past the end of the descriptor table: the walker refuses it.
+    physmap
+        .lookup(DESC_GPA, 16)
+        .expect("mapped header descriptor")
+        .write(&VirtqDesc {
+            addr: 0x2000,
+            len: BLK_REQ_HEADER_SIZE as u32,
+            flags: bits::VRING_DESC_F_NEXT,
+            next: 9,
+        })
+        .expect("write header descriptor");
+    let mut queues = [queue];
+
+    block.notify_queue(0, &mut queues, &physmap);
+
+    assert_eq!(
+        queues[0].read_used_ring_idx(&physmap),
+        1,
+        "the refused head never went back to the guest",
+    );
+    let entry = physmap.lookup(USED_GPA + 4, 8).expect("mapped used entry");
+    assert_eq!(entry.read::<u32>().expect("used id"), 0);
+    assert_eq!(
+        entry
+            .subregion(4, 4)
+            .expect("used length")
+            .read::<u32>()
+            .expect("used length"),
+        0,
+    );
 }

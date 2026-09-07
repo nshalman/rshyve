@@ -2,14 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Restricted Unix domain socket creation.
+//! Restricted Unix domain socket creation and bounded writes.
 
 use std::fs::{self, DirBuilder, Permissions};
 use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
@@ -75,6 +77,185 @@ pub fn bind_restricted(
     Ok(listener)
 }
 
+/// Write all of `data` to `stream`, or give up after `budget`.
+///
+/// Callers do this write with a lock held, or on a vCPU thread, so it
+/// must have an end. Two usual ways to give it one do not work here:
+///
+/// - `SO_SNDTIMEO` does nothing on illumos. `setsockopt` reports
+///   success and a `write` to a full AF_UNIX socket still blocks with
+///   no end.
+/// - `O_NONBLOCK` is a file-status flag, which `try_clone` shares. The
+///   reader threads do blocking reads on a clone of the same socket,
+///   so setting it here would break every read.
+///
+/// `poll` supplies the wait, and [`WRITE_CHUNK`] plus the per-call
+/// flag in [`SEND_NOWAIT`] keep the send that follows it short enough
+/// not to wait again.
+///
+/// # One writer per socket
+///
+/// The `poll` and the send are two steps. A second writer that takes
+/// the reported space between them leaves this send with nowhere to
+/// put its bytes, and illumos then waits for the peer inside the send,
+/// with no timeout (`strwaitq`, see [`WRITE_CHUNK`]). The budget does
+/// not cover that wait, so a socket with two writers is not bounded by
+/// this function.
+///
+/// This function cannot enforce the rule. A caller holds it by giving
+/// each socket one writer: a thread that owns the socket, or a lock
+/// that every write path takes. A reader thread on a `try_clone` of
+/// the same socket is not a second writer.
+///
+/// A budget that runs out returns `ErrorKind::TimedOut`. Part of `data`
+/// may be on the socket by then, so the caller has to drop the
+/// connection rather than write to it again.
+pub fn write_all_bounded(
+    stream: &UnixStream,
+    data: &[u8],
+    budget: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + budget;
+    let fd = stream.as_raw_fd();
+    let mut sent = 0;
+
+    while sent < data.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the peer did not take the write within its budget",
+            ));
+        }
+        if !poll_writable(fd, left)? {
+            continue;
+        }
+        let end = data.len().min(sent + WRITE_CHUNK);
+        match send_nowait(fd, &data[sent..end]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "the peer took none of the write",
+                ))
+            }
+            Ok(written) => sent += written,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            // The socket filled between the poll and the send, or it
+            // had less space than `POLLOUT` implied. The budget above
+            // decides whether to try again. `TimedOut` covers a
+            // platform where `SO_SNDTIMEO` does work.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Largest block handed to one send after `poll` reports space.
+///
+/// illumos has no flag that makes an AF_UNIX send give up.
+/// `MSG_DONTWAIT` reaches `FNONBLOCK` on the read path only
+/// (`sotpi_sendmsg`, socktpi.c), and `SO_SNDTIMEO` bounds nothing. The
+/// size of the send is the only control left.
+///
+/// An AF_UNIX send reaches `strwrite_common` (os/streamio.c). That
+/// cuts the write into messages of `sd_qn_maxpsz` and, between two of
+/// them, can sleep in `strwaitq` with no timeout, and with signals
+/// masked after the first message. `tl` asks for `INFPSZ`, but the
+/// stream head caps it at `strmsgsz`, 64 KiB by default
+/// (`conf/param.c`). So a write above that cap can wait for the peer.
+/// A write below it is one message.
+///
+/// One message does not wait. `strput` calls `putnext` once
+/// `canputnext` holds, and `putnext` places the whole message whatever
+/// its size: STREAMS flow control is advisory, so the queue may pass
+/// its high-water mark. `POLLOUT` reads the same `QFULL` bit
+/// `canputnext` does (`strpoll`, os/streamio.c). The send after a
+/// `POLLOUT` therefore places its message and returns. Measured on
+/// illumos: an 8 KiB send after `POLLOUT` returns at once, and
+/// `POLLOUT` stays clear while the queue is full.
+///
+/// 8 KiB is one message for any `strmsgsz` of 8 KiB or more. A host
+/// tuned below that loses the bound.
+const WRITE_CHUNK: usize = 8 * 1024;
+
+/// Flags that stop one send from waiting for the peer.
+///
+/// Darwin counts free bytes rather than messages, and reports
+/// `POLLOUT` on as little as `SO_SNDLOWAT` of them, so even a
+/// [`WRITE_CHUNK`] send waits for the peer after `POLLOUT`. `sosend`
+/// reads `MSG_NBIO` for this, not `MSG_DONTWAIT`. The tests run on
+/// Darwin, so the bound has to hold there as well.
+#[cfg(target_vendor = "apple")]
+const SEND_NOWAIT: libc::c_int = 0x0002_0000; // MSG_NBIO
+#[cfg(not(target_vendor = "apple"))]
+const SEND_NOWAIT: libc::c_int = 0;
+
+/// Send what the socket will take now.
+fn send_nowait(fd: RawFd, data: &[u8]) -> io::Result<usize> {
+    let sent = unsafe {
+        libc::send(
+            fd,
+            data.as_ptr().cast::<libc::c_void>(),
+            data.len(),
+            SEND_NOWAIT,
+        )
+    };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(sent as usize)
+}
+
+/// The events `fd` reports within `timeout_ms`, for a reader.
+///
+/// A timeout or a signal reports nothing, so a loop that owns a
+/// shutdown flag re-reads that flag on every tick instead of waiting
+/// for a peer that may never come. The caller decides what an error
+/// condition means: a listener that reports one keeps reporting it,
+/// so the loop must leave rather than spin.
+pub fn poll_events(fd: RawFd, timeout_ms: i32) -> libc::c_short {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut pfd, 1, timeout_ms) } <= 0 {
+        return 0;
+    }
+    pfd.revents
+}
+
+/// Wait for `fd` to take a write, or for `budget` to pass.
+///
+/// An error condition reports true as well, so that the write which
+/// follows names the error rather than this guessing at it.
+fn poll_writable(fd: RawFd, budget: Duration) -> io::Result<bool> {
+    // At least one millisecond: a shorter budget would round to a poll
+    // that returns at once, and the caller would spin on it.
+    let timeout_ms = budget.as_millis().clamp(1, i32::MAX as u128) as i32;
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut pfd, 1, timeout_ms) } < 0 {
+        let error = io::Error::last_os_error();
+        // A signal is not a failure. The caller re-reads its deadline.
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    Ok(pfd.revents
+        & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
+        != 0)
+}
+
 fn verify_bound_path(
     path: &Path,
     expected_mode: u32,
@@ -118,7 +299,115 @@ fn remove_after_error(path: &Path, error: io::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixStream;
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    /// Payload larger than any socket buffer, so the write cannot
+    /// finish until the peer reads.
+    const OVERSIZED: usize = 8 * 1024 * 1024;
+    const BUDGET: Duration = Duration::from_millis(200);
+
+    /// How long the harness waits for a bounded write to return.
+    ///
+    /// A write that is not bounded never returns at all, so this only
+    /// has to be clear of the budget. It turns that hang into one
+    /// failed test rather than a test run that never ends.
+    const LIMIT: Duration = Duration::from_secs(2);
+
+    /// Put the socket in the state a bounded write has to survive:
+    /// space free, but less than [`WRITE_CHUNK`] of it.
+    ///
+    /// This is what makes the test below exercise the send. A payload
+    /// that starts on an empty socket fills it in whole blocks, so a
+    /// send that waits for the peer is never reached, and the test
+    /// passes whether the send is bounded or not.
+    fn part_fill(device: &UnixStream) {
+        // An odd length, so the space left is not a round number.
+        write_all_bounded(device, &[0u8; 24], BUDGET).expect("prefix");
+    }
+
+    /// Run one bounded write on a worker, and give up on it after
+    /// [`LIMIT`].
+    ///
+    /// The write is the thing under test, so it cannot be joined here:
+    /// an unbounded one would park the test run instead of failing.
+    fn write_within_limit(device: UnixStream, data: Vec<u8>) -> io::Result<()> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(write_all_bounded(&device, &data, BUDGET));
+        });
+        rx.recv_timeout(LIMIT)
+            .expect("the write must end on its budget, not on the peer")
+    }
+
+    #[test]
+    fn a_write_that_fits_is_not_delayed() {
+        let (mut peer, device) = UnixStream::pair().expect("socketpair");
+        write_all_bounded(&device, b"hello", BUDGET).expect("write");
+
+        let mut got = [0u8; 5];
+        peer.read_exact(&mut got).expect("read");
+        assert_eq!(&got, b"hello");
+    }
+
+    #[test]
+    fn an_empty_write_needs_no_budget() {
+        let (_peer, device) = UnixStream::pair().expect("socketpair");
+        write_all_bounded(&device, b"", Duration::ZERO).expect("write");
+    }
+
+    /// `SO_SNDTIMEO` reports success on illumos and bounds nothing, so
+    /// this is the case that proves the poll is what supplies the end.
+    #[test]
+    fn a_peer_that_never_reads_does_not_hold_the_writer() {
+        let (_peer, device) = UnixStream::pair().expect("socketpair");
+        part_fill(&device);
+
+        let error = write_within_limit(device, vec![0u8; OVERSIZED])
+            .expect_err("a peer that reads nothing must not be waited on");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// A peer that reads once and then stops.
+    ///
+    /// The write makes progress, so a bound that only watched a write
+    /// which never moved would never fire. The single read also leaves
+    /// the socket with room for less than one [`WRITE_CHUNK`], which is
+    /// the state a send that waits for the peer cannot get out of.
+    #[test]
+    fn a_peer_that_stops_reading_still_loses_the_write() {
+        let (peer, device) = UnixStream::pair().expect("socketpair");
+        // The reader reports what it took over a channel, not through
+        // shared memory. A plain load races the reader thread: the
+        // write can give up on its budget before the store lands, and
+        // the check below then reads a count the peer has already
+        // taken. `recv` waits for the reader instead.
+        let (took, taken) = mpsc::channel::<usize>();
+        // Dropped at the end of the test. Until then the peer stays
+        // open: one that closed would end the write on a broken pipe,
+        // which is not the case under test.
+        let (hold, parked) = mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            let mut peer = peer;
+            let mut buf = [0u8; 4096];
+            // Long enough for the write to fill the socket first, and
+            // short enough to leave the write some budget after it.
+            std::thread::sleep(BUDGET / 4);
+            let _ = took.send(peer.read(&mut buf).unwrap_or(0));
+            let _ = parked.recv();
+        });
+
+        let error = write_within_limit(device, vec![0u8; OVERSIZED])
+            .expect_err("a peer that stopped reading must not be waited on");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let read = taken
+            .recv_timeout(LIMIT)
+            .expect("the peer must report what it read");
+        assert!(read > 0, "the peer read nothing");
+
+        drop(hold);
+        reader.join().expect("join the reader");
+    }
 
     #[test]
     fn socket_is_mode_0600_after_bind() {

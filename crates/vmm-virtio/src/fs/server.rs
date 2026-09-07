@@ -10,7 +10,13 @@
 //! a `fuse_out_header` + body through a `ChainWriter` over the writable
 //! segments.
 //!
-//! `handle` runs on the FUSE worker thread, never on a vCPU thread: the
+//! The three steps are separate calls on purpose. `read_request` and
+//! `write_reply` touch guest memory and are bounded copies; `run` sits
+//! between them and can take as long as the host filesystem does. The
+//! device holds its guest-access guard over the copies alone, so a
+//! device reset never waits on the backing store.
+//!
+//! All three run on the FUSE worker thread, never on a vCPU thread: the
 //! readers and writers build `SubMapping`s, which are `!Send`, so they
 //! must be constructed where they are used.
 
@@ -51,6 +57,49 @@ enum Reply {
     None,
 }
 
+/// One FUSE request, copied out of the guest's chain.
+///
+/// This is host memory, which is what lets [`FuseServer::run`] hold no
+/// guest access while the host filesystem takes its time.
+pub struct FuseCall {
+    unique: u64,
+    kind: CallKind,
+}
+
+enum CallKind {
+    /// A request for the backing store.
+    Dispatch {
+        header: fuse::FuseInHeader,
+        body: Vec<u8>,
+    },
+    /// A header the device refused. The backing store never sees it.
+    Reject(i32),
+    /// The chain held no request to answer.
+    Silent,
+}
+
+impl FuseCall {
+    fn silent() -> Self {
+        Self {
+            unique: 0,
+            kind: CallKind::Silent,
+        }
+    }
+
+    fn reject(unique: u64, errno: i32) -> Self {
+        Self {
+            unique,
+            kind: CallKind::Reject(errno),
+        }
+    }
+}
+
+/// A reply held in host memory, waiting for the guest's chain.
+pub struct FuseReply {
+    unique: u64,
+    reply: Reply,
+}
+
 impl FuseServer {
     pub fn new(passthrough: Arc<Passthrough>) -> Self {
         Self { passthrough }
@@ -61,51 +110,83 @@ impl FuseServer {
         &self.passthrough
     }
 
-    /// Process a single descriptor chain.
+    /// Copy one request out of the guest's chain.
     ///
-    /// Returns the number of bytes written into the chain's writable
-    /// window, which the caller puts in the used-ring `len` field.
-    pub fn handle(&self, bufs: &[ChainBuf], physmap: &PhysMap) -> u32 {
-        // The two views cover disjoint segments of the same chain: the
-        // reader skips writable segments and the writer skips readable
-        // ones, so a guest that interleaves them cannot cross the halves.
+    /// The reader keeps to the readable segments, so a guest that
+    /// interleaves the two halves cannot make this read a segment it
+    /// asked the device to write.
+    ///
+    /// The caller holds guest access across this call. The length is
+    /// capped at [`MAX_MSG_SIZE`], so the copy is bounded and the
+    /// caller can hold that access on a vCPU-facing lock.
+    pub fn read_request(
+        &self,
+        bufs: &[ChainBuf],
+        physmap: &PhysMap,
+    ) -> FuseCall {
         let mut reader = ChainReader::new(bufs, physmap);
-        let mut writer = ChainWriter::new(bufs, physmap);
 
-        // Header.
         let mut hdr_buf = [0u8; fuse::FUSE_IN_HEADER_SIZE];
         if reader.read_exact(&mut hdr_buf).is_err() {
-            return 0;
+            return FuseCall::silent();
         }
         let header: fuse::FuseInHeader = match read_at(&hdr_buf) {
             Some(h) => h,
-            None => return 0,
+            None => return FuseCall::silent(),
         };
 
-        // Validate header len.
         let total_len = header.len as usize;
         let limits = fuse::FUSE_IN_HEADER_SIZE..=MAX_MSG_SIZE;
         if !limits.contains(&total_len) {
-            return write_reply(
-                &mut writer,
-                header.unique,
-                Reply::Error(-libc::EINVAL),
-            );
+            return FuseCall::reject(header.unique, -libc::EINVAL);
         }
 
-        // Body.
         let body_len = total_len - fuse::FUSE_IN_HEADER_SIZE;
         let mut body = vec![0u8; body_len];
         if body_len > 0 && reader.read_exact(&mut body).is_err() {
-            return write_reply(
-                &mut writer,
-                header.unique,
-                Reply::Error(-libc::EINVAL),
-            );
+            return FuseCall::reject(header.unique, -libc::EINVAL);
         }
 
-        let reply = self.dispatch(&header, &body);
-        write_reply(&mut writer, header.unique, reply)
+        FuseCall {
+            unique: header.unique,
+            kind: CallKind::Dispatch { header, body },
+        }
+    }
+
+    /// Run a request against the backing store.
+    ///
+    /// Host memory in, host memory out. The caller must NOT hold guest
+    /// access here: a host filesystem can block for as long as it
+    /// likes, and a device reset must not wait behind it.
+    pub fn run(&self, call: &FuseCall) -> FuseReply {
+        let reply = match &call.kind {
+            CallKind::Dispatch { header, body } => self.dispatch(header, body),
+            CallKind::Reject(errno) => Reply::Error(*errno),
+            CallKind::Silent => Reply::None,
+        };
+        FuseReply {
+            unique: call.unique,
+            reply,
+        }
+    }
+
+    /// Write a reply into the chain's writable window.
+    ///
+    /// Returns the byte count for the used-ring `len` field. The writer
+    /// keeps to the writable segments, so it cannot touch a segment the
+    /// guest kept for itself.
+    ///
+    /// The caller holds guest access across this call and the used entry
+    /// it publishes. The reply is already in host memory, so the copy is
+    /// bounded by the writable window.
+    pub fn write_reply(
+        &self,
+        bufs: &[ChainBuf],
+        physmap: &PhysMap,
+        reply: FuseReply,
+    ) -> u32 {
+        let mut writer = ChainWriter::new(bufs, physmap);
+        emit_reply(&mut writer, reply.unique, reply.reply)
     }
 
     fn dispatch(&self, header: &fuse::FuseInHeader, body: &[u8]) -> Reply {
@@ -637,7 +718,7 @@ impl FuseServer {
 // Wire helpers
 // ---------------------------------------------------------------------------
 
-fn write_reply<W: Write>(writer: &mut W, unique: u64, reply: Reply) -> u32 {
+fn emit_reply<W: Write>(writer: &mut W, unique: u64, reply: Reply) -> u32 {
     match reply {
         Reply::None => 0,
         Reply::Empty => write_header(writer, unique, 0, &[]),
@@ -690,380 +771,5 @@ fn extract_name(buf: &[u8]) -> Option<std::ffi::CString> {
     std::ffi::CString::new(&buf[..end]).ok()
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const GPA: u64 = 0x20_0000;
-    const LEN: usize = 0x4000;
-    const REQ: u64 = GPA;
-    const RESP: u64 = GPA + 0x1000;
-
-    fn anon() -> PhysMap {
-        PhysMap::new_anon(GPA, LEN).expect("anon region")
-    }
-
-    fn server() -> FuseServer {
-        let pt =
-            Passthrough::new(&std::env::temp_dir(), true).expect("open temp");
-        FuseServer::new(Arc::new(pt))
-    }
-
-    fn seed(physmap: &PhysMap, gpa: u64, data: &[u8]) {
-        physmap
-            .lookup(gpa, data.len())
-            .expect("mapped")
-            .write_bytes(data)
-            .expect("seed guest memory");
-    }
-
-    fn fetch(physmap: &PhysMap, gpa: u64, len: usize) -> Vec<u8> {
-        let mut out = vec![0u8; len];
-        physmap
-            .lookup(gpa, len)
-            .expect("mapped")
-            .read_bytes(&mut out)
-            .expect("read reply");
-        out
-    }
-
-    /// Build a FUSE_INIT request: 40-byte header + 16-byte fuse_init_in.
-    fn init_request() -> Vec<u8> {
-        let body = fuse::FuseInitIn {
-            major: 7,
-            minor: 33,
-            max_readahead: 0x2_0000,
-            flags: 0,
-        };
-        let hdr = fuse::FuseInHeader {
-            len: (fuse::FUSE_IN_HEADER_SIZE + 16) as u32,
-            opcode: fuse::FUSE_INIT,
-            unique: 0x4242,
-            nodeid: 0,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            padding: 0,
-        };
-        let mut buf = bytes_of(&hdr);
-        push_val(&mut buf, &body);
-        buf
-    }
-
-    #[test]
-    fn init_over_a_chain_returns_a_success_header() {
-        let physmap = anon();
-        let req = init_request();
-        seed(&physmap, REQ, &req);
-
-        let bufs = vec![
-            ChainBuf::Readable {
-                addr: REQ,
-                len: req.len() as u32,
-            },
-            ChainBuf::Writable {
-                addr: RESP,
-                len: 256,
-            },
-        ];
-
-        let written = server().handle(&bufs, &physmap);
-        assert_eq!(
-            written as usize,
-            fuse::FUSE_OUT_HEADER_SIZE + size_of::<fuse::FuseInitOut>()
-        );
-
-        let out = fetch(&physmap, RESP, written as usize);
-        let hdr: fuse::FuseOutHeader = read_at(&out).expect("out header");
-        assert_eq!(hdr.error, 0);
-        assert_eq!(hdr.unique, 0x4242);
-        assert_eq!(hdr.len, written);
-
-        let init: fuse::FuseInitOut =
-            read_at(&out[fuse::FUSE_OUT_HEADER_SIZE..]).expect("init out");
-        assert_eq!(init.major, 7);
-        assert_eq!(init.minor, 33);
-        assert_eq!(init.max_write, INIT_MAX_WRITE);
-    }
-
-    // A guest can declare any length in the header. Anything past the
-    // message cap must be refused before a body of that size is allocated.
-    #[test]
-    fn oversized_declared_len_is_rejected_with_einval() {
-        let physmap = anon();
-        let mut req = init_request();
-        let bogus = (MAX_MSG_SIZE as u32) + 1;
-        req[..4].copy_from_slice(&bogus.to_le_bytes());
-        seed(&physmap, REQ, &req);
-
-        let bufs = vec![
-            ChainBuf::Readable {
-                addr: REQ,
-                len: req.len() as u32,
-            },
-            ChainBuf::Writable {
-                addr: RESP,
-                len: 256,
-            },
-        ];
-
-        let written = server().handle(&bufs, &physmap);
-        assert_eq!(written as usize, fuse::FUSE_OUT_HEADER_SIZE);
-
-        let out = fetch(&physmap, RESP, written as usize);
-        let hdr: fuse::FuseOutHeader = read_at(&out).expect("out header");
-        assert_eq!(hdr.error, -libc::EINVAL);
-    }
-
-    #[test]
-    fn a_chain_with_no_readable_segment_writes_nothing() {
-        let physmap = anon();
-        let bufs = vec![ChainBuf::Writable {
-            addr: RESP,
-            len: 256,
-        }];
-        assert_eq!(server().handle(&bufs, &physmap), 0);
-    }
-
-    // A writable window too small for the body still acks the header, so
-    // the guest sees a reply instead of a stalled request.
-    #[test]
-    fn a_short_writable_window_still_acks_the_header() {
-        let physmap = anon();
-        let req = init_request();
-        seed(&physmap, REQ, &req);
-
-        let bufs = vec![
-            ChainBuf::Readable {
-                addr: REQ,
-                len: req.len() as u32,
-            },
-            ChainBuf::Writable {
-                addr: RESP,
-                len: fuse::FUSE_OUT_HEADER_SIZE as u32,
-            },
-        ];
-
-        let written = server().handle(&bufs, &physmap);
-        assert_eq!(written as usize, fuse::FUSE_OUT_HEADER_SIZE);
-    }
-
-    #[test]
-    fn extract_trims_nul() {
-        let buf = b"foo\0bar\0";
-        let c = extract_name(buf).unwrap();
-        assert_eq!(c.as_bytes(), b"foo");
-    }
-
-    #[test]
-    fn extract_rejects_empty() {
-        assert!(extract_name(&[]).is_none());
-        assert!(extract_name(b"\0").is_none());
-    }
-
-    // -------------------------------------------------------------------
-    // Wire-level security properties
-    //
-    // `extract_name` does not validate: it stops at the first NUL and
-    // returns whatever bytes precede it. The guard against a guest walking
-    // out of the shared directory lives one layer down, in the passthrough
-    // backend. These tests drive whole requests through `handle` so the
-    // property is proved at the boundary the guest actually reaches, not
-    // at the backend call the dispatcher happens to make today.
-    // -------------------------------------------------------------------
-
-    fn private_dir() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::set_permissions(
-            dir.path(),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .expect("restore tempdir mode");
-        dir
-    }
-
-    fn server_on(dir: &tempfile::TempDir, read_only: bool) -> FuseServer {
-        let pt = Passthrough::new(dir.path(), read_only).expect("open dir");
-        FuseServer::new(Arc::new(pt))
-    }
-
-    /// FUSE_MKDIR against the root node, carrying `name` verbatim.
-    fn mkdir_request(name: &[u8]) -> Vec<u8> {
-        let body = fuse::FuseMkdirIn {
-            mode: 0o755,
-            umask: 0,
-        };
-        let body_len = size_of::<fuse::FuseMkdirIn>() + name.len() + 1;
-        let hdr = fuse::FuseInHeader {
-            len: (fuse::FUSE_IN_HEADER_SIZE + body_len) as u32,
-            opcode: fuse::FUSE_MKDIR,
-            unique: 0x5150,
-            nodeid: fuse::FUSE_ROOT_ID,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            padding: 0,
-        };
-        let mut buf = bytes_of(&hdr);
-        push_val(&mut buf, &body);
-        buf.extend_from_slice(name);
-        buf.push(0);
-        buf
-    }
-
-    /// Run one request through `handle` and return the reply's errno field.
-    fn reply_error(srv: &FuseServer, req: &[u8]) -> i32 {
-        let physmap = anon();
-        seed(&physmap, REQ, req);
-        let bufs = vec![
-            ChainBuf::Readable {
-                addr: REQ,
-                len: req.len() as u32,
-            },
-            ChainBuf::Writable {
-                addr: RESP,
-                len: 512,
-            },
-        ];
-        let written = srv.handle(&bufs, &physmap);
-        assert!(written as usize >= fuse::FUSE_OUT_HEADER_SIZE);
-        let out = fetch(&physmap, RESP, written as usize);
-        let hdr: fuse::FuseOutHeader = read_at(&out).expect("out header");
-        hdr.error
-    }
-
-    // A writable share must still refuse to leave its root. This is the
-    // case that matters: read-only would mask the traversal behind EROFS.
-    #[test]
-    fn a_dotdot_component_is_refused_on_a_writable_share() {
-        let dir = private_dir();
-        let srv = server_on(&dir, false);
-        assert_eq!(reply_error(&srv, &mkdir_request(b"..")), -libc::EINVAL);
-        assert!(!dir.path().parent().unwrap().join("escaped").exists());
-    }
-
-    #[test]
-    fn an_embedded_slash_is_refused_on_a_writable_share() {
-        let dir = private_dir();
-        let srv = server_on(&dir, false);
-        assert_eq!(
-            reply_error(&srv, &mkdir_request(b"sub/escaped")),
-            -libc::EINVAL
-        );
-        assert_eq!(reply_error(&srv, &mkdir_request(b"/abs")), -libc::EINVAL);
-    }
-
-    // The name check runs before the read-only check, so a traversal name
-    // reports EINVAL rather than EROFS even on a read-only share. Pinning
-    // that order keeps a future edit from hiding one guard behind the other.
-    #[test]
-    fn the_name_check_precedes_the_read_only_check() {
-        let dir = private_dir();
-        let srv = server_on(&dir, true);
-        assert_eq!(reply_error(&srv, &mkdir_request(b"..")), -libc::EINVAL);
-    }
-
-    #[test]
-    fn a_mutating_op_is_refused_on_a_read_only_share() {
-        let dir = private_dir();
-        let srv = server_on(&dir, true);
-        assert_eq!(
-            reply_error(&srv, &mkdir_request(b"ordinary")),
-            -libc::EROFS
-        );
-        assert!(!dir.path().join("ordinary").exists());
-    }
-
-    // The same request succeeds when the share is writable, so the two
-    // tests above prove enforcement rather than a broken request shape.
-    #[test]
-    fn the_same_mkdir_succeeds_on_a_writable_share() {
-        let dir = private_dir();
-        let srv = server_on(&dir, false);
-        assert_eq!(reply_error(&srv, &mkdir_request(b"ordinary")), 0);
-        assert!(dir.path().join("ordinary").is_dir());
-    }
-
-    /// FUSE_OPEN of `nodeid`, carrying the guest's open flags verbatim.
-    fn open_request(nodeid: u64, flags: u32) -> Vec<u8> {
-        let body = fuse::FuseOpenIn { flags, unused: 0 };
-        let hdr = fuse::FuseInHeader {
-            len: (fuse::FUSE_IN_HEADER_SIZE + size_of::<fuse::FuseOpenIn>())
-                as u32,
-            opcode: fuse::FUSE_OPEN,
-            unique: 0x6060,
-            nodeid,
-            uid: 0,
-            gid: 0,
-            pid: 0,
-            padding: 0,
-        };
-        let mut buf = bytes_of(&hdr);
-        push_val(&mut buf, &body);
-        buf
-    }
-
-    /// Seed a file with content and return its nodeid, via a real LOOKUP.
-    fn seeded_file(dir: &tempfile::TempDir, srv: &FuseServer) -> u64 {
-        std::fs::write(dir.path().join("payload"), b"KEEP THIS DATA")
-            .expect("seed file");
-        let pt = srv.passthrough();
-        let name = std::ffi::CString::new("payload").expect("name");
-        pt.lookup(fuse::FUSE_ROOT_ID, &name).expect("lookup").nodeid
-    }
-
-    // O_TRUNC destroys a file whatever the access mode claims: illumos
-    // honors O_RDONLY | O_TRUNC and truncates. A guest that sends it at a
-    // read-only share must be refused, or the share is not read-only.
-    #[test]
-    fn o_trunc_cannot_destroy_a_file_on_a_read_only_share() {
-        let dir = private_dir();
-        let srv = server_on(&dir, true);
-        let nodeid = seeded_file(&dir, &srv);
-        let flags = (libc::O_RDONLY | libc::O_TRUNC) as u32;
-
-        assert_eq!(
-            reply_error(&srv, &open_request(nodeid, flags)),
-            -libc::EROFS
-        );
-        assert_eq!(
-            std::fs::read(dir.path().join("payload")).expect("read back"),
-            b"KEEP THIS DATA",
-            "a read-only share truncated the host file"
-        );
-    }
-
-    // A plain read open is still allowed, so the guard above rejects the
-    // truncation rather than every open.
-    //
-    // This and the next test reach `reopen_fd`, which reopens through
-    // /proc/self/fd. That path does not exist on a macOS dev host, so both
-    // run only on the deployment target.
-    #[cfg(target_os = "illumos")]
-    #[test]
-    fn a_plain_read_open_still_works_on_a_read_only_share() {
-        let dir = private_dir();
-        let srv = server_on(&dir, true);
-        let nodeid = seeded_file(&dir, &srv);
-        let flags = libc::O_RDONLY as u32;
-        assert_eq!(reply_error(&srv, &open_request(nodeid, flags)), 0);
-    }
-
-    #[cfg(target_os = "illumos")]
-    #[test]
-    fn o_trunc_still_works_on_a_writable_share() {
-        let dir = private_dir();
-        let srv = server_on(&dir, false);
-        let nodeid = seeded_file(&dir, &srv);
-        let flags = (libc::O_WRONLY | libc::O_TRUNC) as u32;
-        assert_eq!(reply_error(&srv, &open_request(nodeid, flags)), 0);
-        assert!(std::fs::read(dir.path().join("payload"))
-            .expect("read back")
-            .is_empty());
-    }
-}
+mod tests;

@@ -10,7 +10,7 @@
 //! exists, has exactly one implementation.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
 
 use anyhow::Context;
 
@@ -19,14 +19,13 @@ use vmm_core::mem::PhysMap;
 use vmm_core::mmio::MmioBus;
 use vmm_core::pio::PioBus;
 
-use vmm_devices::pci::msix::MsixTable;
+use vmm_devices::pci::msix::{HdlMsiSink, MsiSink, MsixTable};
 use vmm_devices::pci::LintrCfg;
 
 use super::bits;
 use super::block::{VirtioBlock, VirtioBlockOpts};
 use super::console::{
-    VirtioConsole, CONSOLE_MSIX_VECTORS, CONSOLE_NUM_QUEUES,
-    CONSOLE_QUEUE_SIZE, CONSOLE_RX_QUEUE,
+    VirtioConsole, CONSOLE_MSIX_VECTORS, CONSOLE_NUM_QUEUES, CONSOLE_QUEUE_SIZE,
 };
 use super::fs::{
     VirtioFs, VirtioFsOpts, FS_CONFIG_SIZE, FS_MSIX_VECTORS, FS_NUM_QUEUES,
@@ -37,7 +36,6 @@ use super::viona;
 use super::viona::VirtioViona;
 use super::vsock::device::{
     VirtioVsock, VSOCK_MSIX_VECTORS, VSOCK_NUM_QUEUES, VSOCK_QUEUE_SIZE,
-    VSOCK_RX_QUEUE,
 };
 
 /// Machine-owned handles every virtio device needs. Field types match
@@ -47,6 +45,16 @@ pub struct VirtioAttachCtx<'a> {
     pub bus_pio: &'a Arc<PioBus>,
     pub bus_mmio: &'a Arc<MmioBus>,
     pub hdl: &'a Arc<VmmHdl>,
+}
+
+impl VirtioAttachCtx<'_> {
+    /// The MSI-X delivery path for a device built from this context.
+    ///
+    /// The raw handle stays in the context because viona needs the VM
+    /// file descriptor. Every other use of it is this sink.
+    pub fn msi_sink(&self) -> Arc<dyn MsiSink> {
+        HdlMsiSink::new(Arc::clone(self.hdl))
+    }
 }
 
 /// Parse a virtio-blk config string:
@@ -122,7 +130,7 @@ pub fn virtio_blk(
     let cfg_size = blk.config_size();
     let blk_intr = Arc::clone(&blk.interrupt);
     // One MSI-X vector per queue, plus one for config change.
-    let msix = Arc::new(MsixTable::new(num_queues + 1, Arc::clone(ctx.hdl)));
+    let msix = Arc::new(MsixTable::new(num_queues + 1, ctx.msi_sink()));
 
     let pci_dev = VirtioPciDevice::new(
         blk,
@@ -139,13 +147,8 @@ pub fn virtio_blk(
 
     // Workers raise through the transport so the interrupt takes the
     // MSI-X vector when the guest enabled it, and INTx otherwise.
-    let pci_weak = Arc::downgrade(&pci_dev);
     *blk_intr.lock().expect("virtio-blk interrupt lock") =
-        Some(Arc::new(move || {
-            if let Some(dev) = pci_weak.upgrade() {
-                dev.raise_queue_interrupt_for(0);
-            }
-        }));
+        Some(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }
@@ -199,32 +202,20 @@ pub fn virtio_viona(
     // One MSI-X vector per queue (rx, tx), plus one for config change.
     let msix = Arc::new(MsixTable::new(
         viona::NET_NUM_QUEUES as u16 + 1,
-        Arc::clone(ctx.hdl),
+        ctx.msi_sink(),
     ));
 
-    // The poll thread needs the raise callback before the transport
-    // exists, so the callback reads through a Weak that is filled in
-    // once VirtioPciDevice::new returns.
-    let hook: Arc<Mutex<Option<Weak<VirtioPciDevice<VirtioViona>>>>> =
-        Arc::new(Mutex::new(None));
-    let hook_clone = Arc::clone(&hook);
-    let raise_fn: Arc<dyn Fn(u16) + Send + Sync> =
-        Arc::new(move |queue_idx: u16| {
-            if let Some(d) = hook_clone
-                .lock()
-                .ok()
-                .and_then(|g| g.clone())
-                .and_then(|w| w.upgrade())
-            {
-                d.raise_queue_interrupt_for(queue_idx);
-            }
-        });
+    // The poll thread reads this slot on every wakeup, so it can
+    // start before the transport exists. It names the driver session
+    // each notification was collected under, which a raise made
+    // through a bare callback could not.
+    let viona_intr = dev.interrupt();
 
     let intr_log = log.new(slog::o!("component" => "viona-intr"));
     if defer_poll {
-        dev.store_poll_fn(raise_fn, intr_log);
+        dev.defer_intr_poll(intr_log);
     } else {
-        dev.start_intr_poll(raise_fn, intr_log);
+        dev.start_intr_poll(intr_log);
     }
 
     let pci_dev = VirtioPciDevice::new(
@@ -240,9 +231,8 @@ pub fn virtio_viona(
         Some(msix),
     );
 
-    if let Ok(mut h) = hook.lock() {
-        *h = Some(Arc::downgrade(&pci_dev));
-    }
+    *viona_intr.lock().expect("viona interrupt lock") =
+        Some(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }
@@ -265,8 +255,7 @@ pub fn virtio_console(
     let con_intr = console.interrupt();
 
     // One vector per queue, plus one for config change.
-    let msix =
-        Arc::new(MsixTable::new(CONSOLE_MSIX_VECTORS, Arc::clone(ctx.hdl)));
+    let msix = Arc::new(MsixTable::new(CONSOLE_MSIX_VECTORS, ctx.msi_sink()));
 
     let pci_dev = VirtioPciDevice::new(
         console,
@@ -283,13 +272,8 @@ pub fn virtio_console(
 
     // Only the receive queue completes out of band; the transport
     // raises for the transmit queue on its own.
-    let pci_weak = Arc::downgrade(&pci_dev);
     *con_intr.lock().expect("virtio-console interrupt lock") =
-        Some(Arc::new(move || {
-            if let Some(dev) = pci_weak.upgrade() {
-                dev.raise_queue_interrupt_for(CONSOLE_RX_QUEUE);
-            }
-        }));
+        Some(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }
@@ -313,7 +297,7 @@ pub fn virtio_fs(
     let fs = VirtioFs::new(opts, Arc::clone(ctx.physmap), log.clone())?;
     let fs_intr = Arc::clone(&fs.interrupt);
 
-    let msix = Arc::new(MsixTable::new(FS_MSIX_VECTORS, Arc::clone(ctx.hdl)));
+    let msix = Arc::new(MsixTable::new(FS_MSIX_VECTORS, ctx.msi_sink()));
 
     let pci_dev = VirtioPciDevice::new(
         fs,
@@ -328,15 +312,10 @@ pub fn virtio_fs(
         Some(msix),
     );
 
-    // Both queues complete out of band, so the callback carries the
-    // queue index and each queue raises its own MSI-X vector.
-    let pci_weak = Arc::downgrade(&pci_dev);
+    // Both queues complete out of band, so the raise carries the queue
+    // index and each queue raises its own MSI-X vector.
     *fs_intr.lock().expect("virtio-fs interrupt lock") =
-        Some(Arc::new(move |queue_idx: u16| {
-            if let Some(dev) = pci_weak.upgrade() {
-                dev.raise_queue_interrupt_for(queue_idx);
-            }
-        }));
+        Some(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }
@@ -362,8 +341,7 @@ pub fn virtio_vsock(
     let cfg_size = vsock.config_size();
     let vsock_intr = vsock.interrupt();
 
-    let msix =
-        Arc::new(MsixTable::new(VSOCK_MSIX_VECTORS, Arc::clone(ctx.hdl)));
+    let msix = Arc::new(MsixTable::new(VSOCK_MSIX_VECTORS, ctx.msi_sink()));
 
     let pci_dev = VirtioPciDevice::new(
         vsock,
@@ -380,13 +358,8 @@ pub fn virtio_vsock(
 
     // Only the receive queue completes out of band; the transport
     // raises for the transmit queue on its own.
-    let pci_weak = Arc::downgrade(&pci_dev);
     *vsock_intr.lock().expect("virtio-vsock interrupt lock") =
-        Some(Arc::new(move || {
-            if let Some(dev) = pci_weak.upgrade() {
-                dev.raise_queue_interrupt_for(VSOCK_RX_QUEUE);
-            }
-        }));
+        Some(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }
@@ -397,7 +370,7 @@ pub fn virtio_rng(
     ctx: &VirtioAttachCtx<'_>,
 ) -> Arc<VirtioPciDevice<VirtioRng>> {
     // One queue, plus a config change vector.
-    let msix = Arc::new(MsixTable::new(2, Arc::clone(ctx.hdl)));
+    let msix = Arc::new(MsixTable::new(2, ctx.msi_sink()));
     VirtioPciDevice::new(
         VirtioRng::new(),
         bits::VIRTIO_DEV_TYPE_RNG,

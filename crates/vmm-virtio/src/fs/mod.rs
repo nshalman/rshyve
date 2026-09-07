@@ -11,7 +11,7 @@ pub mod fuse;
 pub mod passthrough;
 pub mod server;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,6 +22,8 @@ use self::passthrough::Passthrough;
 use self::server::FuseServer;
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::VirtioDevice;
+use crate::access::{GuestAccess, Session};
+use crate::pci::intr::{next_intr_session, BackendIntr};
 use vmm_devices::lifecycle::{IndicatedState, Indicator};
 use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
 
@@ -48,11 +50,33 @@ const FS_FORCE_INTERRUPTS: u32 = 32;
 /// Budget for the worker to finish its request during halt.
 const FS_HALT_BUDGET: Duration = Duration::from_secs(5);
 
-/// Interrupt callback, wired by the binary after `VirtioPciDevice::new`.
+#[cfg(test)]
+type ParkSlot = Mutex<Option<Arc<dyn Fn() + Send + Sync>>>;
+
+/// Park points a test uses to pin a reset against the worker.
+#[cfg(test)]
+#[derive(Default)]
+struct FsParks {
+    /// Entered where the backing store runs, with no guest access held.
+    in_backend: ParkSlot,
+}
+
+#[cfg(test)]
+fn run_park(slot: &ParkSlot) {
+    let hook = slot.lock().expect("park lock poisoned").take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// The transport interrupt path, wired by the binary after
+/// `VirtioPciDevice::new`.
 ///
-/// Takes the queue index: virtio-fs has two queues and each raises its own
-/// MSI-X vector.
-pub type QueueInterruptFn = Arc<dyn Fn(u16) + Send + Sync>;
+/// A raise names a queue index, because virtio-fs has two queues and
+/// each has its own MSI-X vector, and the session it was authorised
+/// under, because a reply is published on a worker thread that a reset
+/// can overtake.
+pub type QueueIntr = Arc<BackendIntr>;
 
 /// Parsed `-s <slot>,virtio-fs,<config>` options.
 #[derive(Debug, Clone)]
@@ -154,6 +178,10 @@ struct FsRequest {
     head: u16,
     bufs: Vec<ChainBuf>,
     completion: Arc<VirtioCompletion>,
+    /// Device epoch this request was queued under. The worker drops the
+    /// request when it no longer matches: the chain and the completion
+    /// both point at a ring the driver has since torn down.
+    epoch: u64,
 }
 
 pub struct VirtioFs {
@@ -167,11 +195,19 @@ pub struct VirtioFs {
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     shutdown: Arc<AtomicBool>,
     gate: Arc<QuiesceGate>,
+    /// See [`FsWorkerCtx::access`].
+    access: Arc<GuestAccess>,
+    /// Requests the guest is still owed. See [`FsWorkerCtx::inflight`].
+    inflight: Arc<AtomicUsize>,
+    /// See [`FsWorkerCtx::session_retired`].
+    session_retired: Arc<AtomicBool>,
+    #[cfg(test)]
+    parks: Arc<FsParks>,
     indicator: Indicator,
     log: slog::Logger,
-    /// Queue-indexed interrupt callback. Clone this Arc BEFORE moving the
+    /// The transport interrupt path. Clone this Arc BEFORE moving the
     /// device into `VirtioPciDevice::new`.
-    pub interrupt: Arc<Mutex<Option<QueueInterruptFn>>>,
+    pub interrupt: Arc<Mutex<Option<QueueIntr>>>,
 }
 
 impl VirtioFs {
@@ -204,18 +240,24 @@ impl VirtioFs {
         let mut tag = [0u8; FS_TAG_LEN];
         tag[..bytes.len()].copy_from_slice(bytes);
 
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let gate = Arc::new(QuiesceGate::new(1));
+        let ctx = FsWorkerCtx {
+            server: Arc::clone(&server),
+            physmap: Arc::clone(&physmap),
+            gate: Arc::new(QuiesceGate::new(1)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            access: Arc::new(GuestAccess::new()),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            session_retired: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            parks: Arc::new(FsParks::default()),
+        };
         let (tx, rx) = mpsc::channel::<FsRequest>();
 
         let worker = std::thread::Builder::new()
             .name("virtio-fs".to_string())
             .spawn({
-                let server = Arc::clone(&server);
-                let physmap = Arc::clone(&physmap);
-                let gate = Arc::clone(&gate);
-                let shutdown = Arc::clone(&shutdown);
-                move || fs_worker(rx, server, physmap, gate, shutdown)
+                let ctx = ctx.clone();
+                move || fs_worker(rx, ctx)
             })?;
 
         Ok(Self {
@@ -226,8 +268,13 @@ impl VirtioFs {
             completions: Mutex::new(vec![None; FS_NUM_QUEUES]),
             work_tx: Mutex::new(Some(tx)),
             worker: Mutex::new(Some(worker)),
-            shutdown,
-            gate,
+            shutdown: ctx.shutdown,
+            gate: ctx.gate,
+            access: ctx.access,
+            inflight: ctx.inflight,
+            session_retired: ctx.session_retired,
+            #[cfg(test)]
+            parks: ctx.parks,
             indicator: Indicator::new(),
             log,
             interrupt: Arc::new(Mutex::new(None)),
@@ -235,8 +282,14 @@ impl VirtioFs {
     }
 
     /// Get or create the completion handler for one queue.
+    ///
+    /// The caller's permission stamps the handler with the right
+    /// session. Permission is refused for the whole of a reset, so a
+    /// handler built here cannot reach the slot the next driver finds
+    /// carrying the session that just ended.
     fn get_completion(
         &self,
+        access: &Session<'_>,
         queue_idx: u16,
         queue: &VirtQueue,
     ) -> Arc<VirtioCompletion> {
@@ -247,15 +300,21 @@ impl VirtioFs {
         }
 
         let intr = Arc::clone(&self.interrupt);
-        let c = VirtioCompletion::new(queue, Arc::clone(&self.physmap), {
-            move || {
-                if let Ok(guard) = intr.lock() {
-                    if let Some(ref f) = *guard {
-                        f(queue_idx);
-                    }
+        let c = VirtioCompletion::new(
+            queue,
+            Arc::clone(&self.physmap),
+            access.intr(),
+            move |session| {
+                // The slot is unlocked for the raise. Delivery is a
+                // call into the kernel, and the reset reads this
+                // slot, so a raise that held the lock would put that
+                // call in front of a vCPU.
+                let path = intr.lock().ok().and_then(|slot| slot.clone());
+                if let Some(path) = path {
+                    path.raise(session, queue_idx);
                 }
-            }
-        });
+            },
+        );
         c.set_force_interrupt(FS_FORCE_INTERRUPTS);
         if let Some(slot) = slots.get_mut(idx) {
             *slot = Some(Arc::clone(&c));
@@ -264,33 +323,147 @@ impl VirtioFs {
     }
 }
 
-fn fs_worker(
-    rx: mpsc::Receiver<FsRequest>,
+/// State the FUSE worker shares with the device.
+#[derive(Clone)]
+struct FsWorkerCtx {
     server: Arc<FuseServer>,
     physmap: Arc<PhysMap>,
     gate: Arc<QuiesceGate>,
     shutdown: Arc<AtomicBool>,
+    /// Permission to touch the guest's ring and chains, and the epoch
+    /// every request is tagged with; see [`FsRequest::epoch`].
+    ///
+    /// The worker takes a session around each copy between host memory
+    /// and a chain, and around the used entry that follows it.
+    /// [`VirtioDevice::reset`] closes admission and drains those
+    /// sections, which is how it takes that permission back.
+    ///
+    /// No section may wait on the backing store, park on the quiesce
+    /// gate, or raise an interrupt. A vCPU waits for the drain, so
+    /// each section must end on its own.
+    access: Arc<GuestAccess>,
+    /// Requests the guest is still owed.
+    ///
+    /// The worker drops its count after it publishes the used entry.
+    /// `reset` does not read this: the guard it takes is short whatever
+    /// this says.
+    inflight: Arc<AtomicUsize>,
+    /// Set by a reset, cleared by the worker once it has closed the
+    /// retired session's fd tables.
+    ///
+    /// A flag, not a comparison against `epoch`: the worker would have
+    /// to sample the epoch to have something to compare, and a reset
+    /// that lands before that sample would then look like the session
+    /// the worker started in.
+    session_retired: Arc<AtomicBool>,
+    #[cfg(test)]
+    parks: Arc<FsParks>,
+}
+
+/// Drop every request still queued and take them off the count.
+///
+/// A halt abandons the request the worker holds and everything behind
+/// it. `inflight` counts what the guest is still owed, so a request
+/// nobody will answer must come off it.
+fn abandon_queued(
+    rx: &mpsc::Receiver<FsRequest>,
+    inflight: &AtomicUsize,
+    held: usize,
 ) {
+    let mut count = held;
+    while rx.try_recv().is_ok() {
+        count += 1;
+    }
+    if count != 0 {
+        inflight.fetch_sub(count, Ordering::AcqRel);
+    }
+}
+
+fn fs_worker(rx: mpsc::Receiver<FsRequest>, ctx: FsWorkerCtx) {
     use std::sync::mpsc::RecvTimeoutError;
 
     loop {
         let req = match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(r) => r,
-            Err(RecvTimeoutError::Timeout) => {
-                gate.park_if_paused();
-                if shutdown.load(Ordering::Acquire) {
-                    return;
-                }
-                continue;
-            }
+            Ok(r) => Some(r),
+            Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        gate.park_if_paused();
-        if shutdown.load(Ordering::Acquire) {
+        ctx.gate.park_if_paused();
+        if ctx.shutdown.load(Ordering::Acquire) {
+            let held = usize::from(req.is_some());
+            drop(req);
+            abandon_queued(&rx, &ctx.inflight, held);
             return;
         }
-        let len = server.handle(&req.bufs, &physmap);
-        req.completion.complete(req.head, len);
+        // Before the request is served, so a request from the new
+        // session never sees the old session's nodeids and handles.
+        reap_retired_session(&ctx);
+        let Some(req) = req else { continue };
+
+        serve_request(&ctx, &req);
+        drop(req);
+        ctx.inflight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Close the fd tables of a driver session that a reset ended.
+///
+/// The tables are backing-store state, so the reset only marks them
+/// and the worker closes them here. Until `halt` joins this thread, it
+/// is the only one that closes a guest-held fd, so no syscall can be
+/// running on a descriptor this closes. A number closed under such a
+/// syscall would go to the next thread in this process that opens
+/// anything.
+fn reap_retired_session(ctx: &FsWorkerCtx) {
+    if ctx.session_retired.swap(false, Ordering::AcqRel) {
+        ctx.server.passthrough().clear();
+    }
+}
+
+/// Run one FUSE request and publish its reply.
+///
+/// Guest memory is touched twice, each time inside a session for the
+/// request's epoch: the request copied out, then the reply copied in
+/// together with its used entry. Both copies are bounded, by
+/// `MAX_MSG_SIZE` and by the chain's writable window, so a reset waits
+/// on neither for long.
+///
+/// `FuseServer::run` sits between them with no session at all. It
+/// reads and writes host memory only, so a host filesystem that never
+/// answers stops this device's I/O and holds nothing else.
+///
+/// Nothing here may park on the quiesce gate. A worker that parked
+/// inside a session would wedge the reset of a paused device.
+fn serve_request(ctx: &FsWorkerCtx, req: &FsRequest) {
+    let call = {
+        // A reset already invalidated this chain and its completion.
+        // The check comes before the lock: a refused request must not
+        // be able to queue on the lock a resetting vCPU waits for.
+        let Some(_session) = ctx.access.enter(req.epoch) else {
+            return;
+        };
+        ctx.server.read_request(&req.bufs, &ctx.physmap)
+    };
+
+    #[cfg(test)]
+    run_park(&ctx.parks.in_backend);
+    let reply = ctx.server.run(&call);
+
+    let raise = {
+        // A reset landed while the backing store ran. The reply is
+        // host memory, so dropping it here writes nothing into the
+        // guest.
+        let Some(_session) = ctx.access.enter(req.epoch) else {
+            return;
+        };
+        let len = ctx.server.write_reply(&req.bufs, &ctx.physmap, reply);
+        req.completion.publish_batch(&[(req.head, len)])
+    };
+    // Delivery is an ioctl and can block, so it leaves the session
+    // behind. A reset drains the sections above, and an interrupt
+    // raised inside one puts the resetting vCPU behind it.
+    if raise {
+        ctx.access.deliver(req.epoch, || req.completion.signal());
     }
 }
 
@@ -343,6 +516,16 @@ impl VirtioDevice for VirtioFs {
         0
     }
 
+    /// Collect the guest's chains and hand them to the worker.
+    ///
+    /// The ring walk runs under one guest-access session, so a reset
+    /// takes the ring back from this the same way it takes it back
+    /// from the worker. The session also names the epoch every request
+    /// is tagged with, so a request cannot carry a session that ended
+    /// while it was being built.
+    ///
+    /// Returns whether the heads answered inline need an interrupt.
+    /// The transport raises it after it drops its register lock.
     fn notify_queue(
         &self,
         queue_idx: u16,
@@ -355,12 +538,20 @@ impl VirtioDevice for VirtioFs {
         let Some(tx) = self.work_tx.lock().expect("work lock").clone() else {
             return false;
         };
-        let completion = self.get_completion(queue_idx, queue);
+        let Some(session) = self.access.enter_current() else {
+            // A reset owns the ring. Its queue state goes with it.
+            return false;
+        };
+        let completion = self.get_completion(&session, queue_idx, queue);
+        let epoch = session.epoch();
 
         // A guest can keep advancing avail_idx during the EVENT_IDX
         // re-check. Bound the work retained by one notification to the
         // queue size, so the counter lives outside the re-check loop.
         let max_requests = usize::from(queue.size());
+        // Heads the worker will never answer, published together at
+        // the end so the used ring is written once.
+        let mut finished: Vec<(u16, u32)> = Vec::new();
         let mut popped = 0usize;
 
         loop {
@@ -374,16 +565,24 @@ impl VirtioDevice for VirtioFs {
                 let Some(bufs) = queue.collect_chain(physmap, head) else {
                     // A malformed chain completes with zero bytes so the
                     // ring index does not stall behind it.
-                    completion.complete(head, 0);
+                    finished.push((head, 0));
                     continue;
                 };
                 let req = FsRequest {
                     head,
                     bufs,
                     completion: Arc::clone(&completion),
+                    epoch,
                 };
+                // Count the request before it can be received, so a reset
+                // never reads zero while one is already on its way.
+                self.inflight.fetch_add(1, Ordering::AcqRel);
+                // The send stays in the session, unlike virtio-blk's
+                // dispatch: a head this refuses has to reach the used
+                // ring, and the queue caps how many sends there are.
                 if tx.send(req).is_err() {
-                    completion.complete(head, 0);
+                    self.inflight.fetch_sub(1, Ordering::AcqRel);
+                    finished.push((head, 0));
                 }
             }
 
@@ -403,19 +602,57 @@ impl VirtioDevice for VirtioFs {
             }
         }
 
-        // The completion handler raises the interrupt when the reply lands.
-        false
+        let raise = completion.publish_batch(&finished);
+        drop(session);
+
+        // The heads this answered itself go back to the transport for
+        // the interrupt, the way virtio-blk does it. Raising here runs
+        // under the transport's register lock, and a reset on another
+        // vCPU has to take that lock before it can even close
+        // admission, so an injection here is one a guest can put in
+        // front of a reset. The replies the worker publishes raise
+        // their own interrupt, off the vCPU.
+        raise
     }
 
+    /// Reset the device, and return once nothing can write into the
+    /// ring the driver is about to free.
+    ///
+    /// This runs on the vCPU that wrote DEVICE_STATUS, so it has to be
+    /// finished when it returns and it has to be short. The illumos
+    /// legacy driver gives no grace: `virtio_legacy_device_reset_locked`
+    /// is one register write with no poll, and `virtio_shutdown`
+    /// reclaims the DMA buffers straight after it.
+    ///
+    /// It is both. Admission closes and the epoch ends, which drops
+    /// every request the worker has not started. The drain then covers
+    /// only the two bounded copies a request makes into and out of its
+    /// chain, so the wait ends on its own and needs no deadline. The
+    /// backing store is not waited for: a request inside it finishes
+    /// into host memory, fails the epoch check, and writes nothing.
     fn reset(&self) {
+        // Admission closes before the drain. A section refused before
+        // it takes the lock never queues on it, and `std::sync::RwLock`
+        // gives the writer no priority: a guest picks how much stale
+        // work is waiting, and it must not be able to starve this.
+        self.access.close();
+        self.access.drain();
+
         *self.negotiated_features.lock().expect("features lock") = 0;
         for slot in self.completions.lock().expect("completion lock").iter_mut()
         {
             *slot = None;
         }
-        // A guest reboot must not leak the inode and handle fd tables.
-        self.server.passthrough().clear();
-        slog::info!(self.log, "virtio-fs reset");
+        // The guest's fd tables are backing-store state, so this only
+        // marks them and the worker closes them. Closing them here
+        // would pull a descriptor out from under a syscall the worker
+        // is inside. The mark goes up before admission reopens, so no
+        // request of the next session is served against them.
+        self.session_retired.store(true, Ordering::Release);
+        self.access.reopen(next_intr_session(
+            &self.interrupt,
+            self.access.intr_session(),
+        ));
     }
 }
 
@@ -448,6 +685,14 @@ impl Lifecycle for VirtioFs {
         self.indicator.resume();
     }
 
+    /// The worker join below polls this deadline, so teardown has to
+    /// wait at least as long or it abandons a halt one poll short of
+    /// returning. Reported from the same constant the halt reads, so
+    /// raising one raises the other.
+    fn halt_budget(&self) -> Duration {
+        FS_HALT_BUDGET
+    }
+
     fn halt(&self) {
         self.indicator.halt();
         self.shutdown.store(true, Ordering::Release);
@@ -455,6 +700,7 @@ impl Lifecycle for VirtioFs {
         *self.work_tx.lock().expect("work lock") = None;
         self.gate.resume();
 
+        let mut worker_gone = true;
         if let Some(handle) = self.worker.lock().expect("worker lock").take() {
             let deadline = Instant::now() + FS_HALT_BUDGET;
             while !handle.is_finished() && Instant::now() < deadline {
@@ -463,6 +709,7 @@ impl Lifecycle for VirtioFs {
             if handle.is_finished() {
                 let _ = handle.join();
             } else {
+                worker_gone = false;
                 slog::warn!(
                     self.log,
                     "virtio-fs worker did not exit within its budget"
@@ -471,8 +718,13 @@ impl Lifecycle for VirtioFs {
         }
 
         // Drop is unreachable while the device Arc lives in the binary's
-        // device vectors, so release guest-held fds here.
-        self.server.passthrough().clear();
+        // device vectors, so release guest-held fds here. A worker that
+        // outlived its budget still holds fds from these tables, and
+        // closing one under it lets an unrelated thread be handed that
+        // number, so the leak is the lesser fault.
+        if worker_gone {
+            self.server.passthrough().clear();
+        }
     }
 
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
@@ -490,298 +742,4 @@ impl Lifecycle for VirtioFs {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use std::time::Instant;
-
-    use crate::queue::VirtqDesc;
-    use vmm_devices::Lifecycle;
-
-    const DESC_GPA: u64 = 0x1000;
-    const AVAIL_GPA: u64 = 0x1100;
-    const USED_GPA: u64 = 0x1200;
-    const REQ_GPA: u64 = 0x2000;
-    const RESP_GPA: u64 = 0x2800;
-
-    fn test_logger() -> slog::Logger {
-        slog::Logger::root(slog::Discard, slog::o!())
-    }
-
-    fn test_fs(physmap: Arc<PhysMap>) -> VirtioFs {
-        let opts = VirtioFsOpts {
-            tag: "shared".to_string(),
-            path: std::env::temp_dir(),
-            read_only: true,
-            queue_size: FS_QUEUE_SIZE_DEFAULT,
-        };
-        VirtioFs::new(&opts, physmap, test_logger()).expect("open export")
-    }
-
-    /// Build a two-descriptor chain and an avail ring that publishes it
-    /// `avail_idx` times, mirroring `block.rs`'s ring fixture.
-    fn ring(
-        queue_size: u16,
-        avail_idx: u16,
-    ) -> (Arc<PhysMap>, [VirtQueue; FS_NUM_QUEUES], VirtioFs) {
-        let physmap = Arc::new(
-            PhysMap::new_anon(DESC_GPA, 0x3000).expect("create queue memory"),
-        );
-        let mut queue = VirtQueue::new(queue_size);
-        queue.set_addr_modern(DESC_GPA, AVAIL_GPA, USED_GPA);
-        queue.set_event_idx(true);
-
-        physmap
-            .lookup(DESC_GPA, 16)
-            .expect("mapped request descriptor")
-            .write(&VirtqDesc {
-                addr: REQ_GPA,
-                len: 64,
-                flags: crate::bits::VRING_DESC_F_NEXT,
-                next: 1,
-            })
-            .expect("write request descriptor");
-        physmap
-            .lookup(DESC_GPA + 16, 16)
-            .expect("mapped reply descriptor")
-            .write(&VirtqDesc {
-                addr: RESP_GPA,
-                len: 256,
-                flags: crate::bits::VRING_DESC_F_WRITE,
-                next: 0,
-            })
-            .expect("write reply descriptor");
-
-        physmap
-            .lookup(AVAIL_GPA + 2, 2)
-            .expect("mapped avail index")
-            .write::<u16>(&avail_idx)
-            .expect("write avail index");
-        for idx in 0..queue_size {
-            physmap
-                .lookup(AVAIL_GPA + 4 + u64::from(idx) * 2, 2)
-                .expect("mapped avail entry")
-                .write::<u16>(&0)
-                .expect("write avail entry");
-        }
-
-        let fs = test_fs(Arc::clone(&physmap));
-        // Queue 0 is hiprio and stays unconfigured; the tests drive the
-        // request queue at the index the transport uses.
-        (physmap, [VirtQueue::new(queue_size), queue], fs)
-    }
-
-    fn avail_event(physmap: &PhysMap, queue: &VirtQueue) -> u16 {
-        let gpa = queue.used_addr() + 4 + u64::from(queue.size()) * 8;
-        physmap
-            .lookup(gpa, 2)
-            .expect("mapped avail event")
-            .read::<u16>()
-            .expect("read avail event")
-    }
-
-    #[test]
-    fn config_requires_a_path() {
-        let err = parse_fs_config("").expect_err("empty config");
-        assert_eq!(err.to_string(), "virtio-fs requires a host directory path");
-    }
-
-    #[test]
-    fn tag_defaults_to_the_last_path_component() {
-        let opts = parse_fs_config("/export/shared").expect("parse");
-        assert_eq!(opts.tag, "shared");
-        assert_eq!(opts.path, std::path::PathBuf::from("/export/shared"));
-        assert!(!opts.read_only);
-        assert_eq!(opts.queue_size, FS_QUEUE_SIZE_DEFAULT);
-    }
-
-    #[test]
-    fn options_are_parsed() {
-        let opts = parse_fs_config("/export/x,tag=data,ro,queue-size=256")
-            .expect("parse");
-        assert_eq!(opts.tag, "data");
-        assert!(opts.read_only);
-        assert_eq!(opts.queue_size, 256);
-    }
-
-    #[test]
-    fn oversized_tag_is_rejected() {
-        let tag = "t".repeat(FS_TAG_LEN + 1);
-        let err = parse_fs_config(&format!("/export/x,tag={tag}"))
-            .expect_err("long tag");
-        assert_eq!(
-            err.to_string(),
-            format!("virtio-fs tag '{tag}' exceeds {FS_TAG_LEN} bytes")
-        );
-    }
-
-    #[test]
-    fn out_of_range_queue_size_is_rejected() {
-        let err =
-            parse_fs_config("/export/x,queue-size=4").expect_err("too small");
-        assert_eq!(
-            err.to_string(),
-            "virtio-fs queue-size must be 8..=1024, got 4"
-        );
-    }
-
-    // virtio-fs is new, so there is no forward compatibility to preserve
-    // and an unknown option is a hard error, unlike parse_blk_config.
-    #[test]
-    fn unknown_option_is_rejected() {
-        let err = parse_fs_config("/export/x,dax").expect_err("unknown");
-        assert_eq!(err.to_string(), "virtio-fs: unknown option 'dax'");
-    }
-
-    // VirtQueue::new panics on a non-power-of-two size, so the catalog must
-    // pass clamp_queue_size's result to VirtioPciDevice::new.
-    #[test]
-    fn queue_size_is_clamped_and_rounded_up() {
-        assert_eq!(clamp_queue_size(0), FS_QUEUE_SIZE_MIN);
-        assert_eq!(clamp_queue_size(8), 8);
-        assert_eq!(clamp_queue_size(100), 128);
-        assert_eq!(clamp_queue_size(u16::MAX), FS_QUEUE_SIZE_MAX);
-        for n in [0u16, 1, 7, 8, 9, 100, 512, 1023, 1024, 4096, u16::MAX] {
-            let q = clamp_queue_size(n);
-            assert!(q.is_power_of_two(), "{q} is not a power of two");
-            assert!((FS_QUEUE_SIZE_MIN..=FS_QUEUE_SIZE_MAX).contains(&q));
-        }
-    }
-
-    // Linux's virtio_cread bounds-checks offset+len against the advertised
-    // device-config length, so FS_CONFIG_SIZE covers the whole spec struct.
-    #[test]
-    fn config_size_covers_tag_and_both_trailing_fields() {
-        assert_eq!(FS_CONFIG_SIZE as usize, FS_TAG_LEN + 4 + 4);
-        assert_eq!(FS_CONFIG_SIZE, 44);
-    }
-
-    #[test]
-    fn a_tag_the_config_field_cannot_hold_is_refused_by_new() {
-        let opts = VirtioFsOpts {
-            tag: "t".repeat(FS_TAG_LEN + 1),
-            path: std::env::temp_dir(),
-            read_only: true,
-            queue_size: FS_QUEUE_SIZE_DEFAULT,
-        };
-        let Err(err) =
-            VirtioFs::new(&opts, Arc::new(PhysMap::new()), test_logger())
-        else {
-            panic!("an oversized tag must not build a device");
-        };
-        assert!(
-            err.to_string()
-                .ends_with(&format!("exceeds {FS_TAG_LEN} bytes")),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn queue_count_fits_the_transport_limit() {
-        // VirtioPciDevice::new asserts num_queues <= MAX_QUEUES (4).
-        assert!(FS_NUM_QUEUES <= 4);
-        assert_eq!(FS_HIPRIO_QUEUE, 0);
-        assert_eq!(FS_REQUEST_QUEUE, 1);
-    }
-
-    #[test]
-    fn device_config_serves_the_tag_then_num_request_queues() {
-        let fs = test_fs(Arc::new(PhysMap::new()));
-
-        let mut tag = Vec::new();
-        for off in 0..FS_TAG_LEN as u16 {
-            tag.push(fs.cfg_read(off, 1) as u8);
-        }
-        assert_eq!(&tag[..6], b"shared");
-        assert!(tag[6..].iter().all(|b| *b == 0));
-
-        assert_eq!(fs.cfg_read(36, 4), FS_NUM_REQUEST_QUEUES);
-        assert_eq!(fs.cfg_read(40, 4), 0, "notify_buf_size");
-        assert_eq!(fs.cfg_read(FS_CONFIG_SIZE, 4), 0, "past the config");
-
-        let feat = fs.device_features();
-        assert_ne!(feat & crate::bits::VIRTIO_F_RING_EVENT_IDX, 0);
-        assert_ne!(feat & crate::bits::VIRTIO_F_RING_INDIRECT_DESC, 0);
-    }
-
-    // The used ring belongs to VirtioCompletion, so notify_queue must
-    // drain the avail ring and update avail_event without ever calling
-    // push_used. shadow_used_idx only moves on push_used, so it is the
-    // assertion that stays deterministic against the worker thread.
-    #[test]
-    fn notify_queue_drains_the_ring_and_never_pushes_used() {
-        let (physmap, mut queues, fs) = ring(8, 2);
-        let req = usize::from(FS_REQUEST_QUEUE);
-
-        assert!(!fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap));
-
-        assert_eq!(queues[req].last_avail_idx(), 2);
-        assert_eq!(avail_event(&physmap, &queues[req]), 2);
-        assert_eq!(queues[req].read_used_idx(&physmap), 0);
-    }
-
-    // A guest can keep advancing avail_idx during the EVENT_IDX re-check.
-    // One notification must retain at most one queue's worth of work.
-    #[test]
-    fn notify_queue_caps_collection_at_queue_size() {
-        const AVAIL_EVENT_SENTINEL: u16 = 0x55aa;
-
-        // Four published entries keep has_new_avail() true after this
-        // two-entry queue has processed one queue's worth of work.
-        let (physmap, mut queues, fs) = ring(2, 4);
-        let req = usize::from(FS_REQUEST_QUEUE);
-        let gpa =
-            queues[req].used_addr() + 4 + u64::from(queues[req].size()) * 8;
-        physmap
-            .lookup(gpa, 2)
-            .expect("mapped avail event")
-            .write::<u16>(&AVAIL_EVENT_SENTINEL)
-            .expect("write avail event sentinel");
-
-        fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
-
-        assert_eq!(queues[req].last_avail_idx(), queues[req].size());
-        assert!(queues[req].has_new_avail(&physmap));
-        assert_eq!(avail_event(&physmap, &queues[req]), AVAIL_EVENT_SENTINEL);
-        assert_eq!(queues[req].read_used_idx(&physmap), 0);
-    }
-
-    #[test]
-    fn reset_clears_the_negotiated_features_and_completions() {
-        let (physmap, mut queues, fs) = ring(8, 1);
-        fs.set_features(crate::bits::VIRTIO_F_RING_EVENT_IDX);
-        fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
-        assert!(fs.completions.lock().expect("completions")
-            [usize::from(FS_REQUEST_QUEUE)]
-        .is_some());
-
-        VirtioDevice::reset(&fs);
-
-        assert_eq!(*fs.negotiated_features.lock().expect("features"), 0);
-        assert!(fs
-            .completions
-            .lock()
-            .expect("completions")
-            .iter()
-            .all(Option::is_none));
-    }
-
-    // halt runs only from the paused state, and it must join the worker
-    // it unparks rather than leaving the thread behind.
-    #[test]
-    fn halt_joins_the_worker_after_a_pause() {
-        let fs = test_fs(Arc::new(PhysMap::new()));
-        fs.start().expect("start");
-        fs.pause();
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !fs.is_quiesced() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(fs.is_quiesced(), "worker did not park within its budget");
-
-        fs.halt();
-        assert!(fs.worker.lock().expect("worker lock").is_none());
-        assert_eq!(fs.lifecycle_state(), Some(IndicatedState::Halt));
-    }
-}
+mod tests;

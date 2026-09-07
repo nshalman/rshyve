@@ -323,7 +323,7 @@ impl Core {
         // the device itself unless it is paused already, so this is the
         // only point that can tell whose pause it is. Resuming one the
         // operator paused would start it behind them, and `Indicator`
-        // panics on a resume from any state but `Pause`.
+        // refuses a resume from any state but `Pause`.
         let paused_here =
             lifecycle.lifecycle_state() != Some(IndicatedState::Pause);
 

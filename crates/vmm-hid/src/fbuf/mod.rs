@@ -22,9 +22,9 @@
 
 pub mod rfb;
 
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,7 @@ use vmm_core::common::RWOp;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::DevMemSeg;
 use vmm_core::mmio::{MmioBus, MmioFn};
+use vmm_core::unixsock::write_all_bounded;
 
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
@@ -84,6 +85,12 @@ const VNC_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Desktop name sent to VNC clients.
 const VNC_DESKTOP_NAME: &str = "bhyve framebuffer";
+
+/// How long one send may wait for the VNC client to take bytes.
+///
+/// The VNC thread also runs the accept loop, so a client that stops
+/// reading costs every later viewer as well.
+const VNC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Mode registers (BAR0 layout)
@@ -604,14 +611,20 @@ fn dispatch_client_message(dev: &Framebuffer, msg: ClientMessage) -> bool {
 /// Handle a single VNC client connection.
 fn handle_vnc_client(
     dev: &Arc<Framebuffer>,
-    stream: std::os::unix::net::UnixStream,
+    stream: UnixStream,
 ) -> io::Result<()> {
-    // Set read/write timeouts to detect dead clients
+    // Set a read timeout to detect dead clients.
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    // Belt and braces only. This bounds a send on the platforms where
+    // it works, and reports success and does nothing on illumos, which
+    // is why `VncWriter` polls instead. A client is never refused over
+    // it.
+    if let Err(e) = stream.set_write_timeout(Some(VNC_WRITE_TIMEOUT)) {
+        slog::warn!(dev.log, "VNC write timeout not set"; "error" => %e);
+    }
 
     let read_stream = stream.try_clone()?;
-    let mut writer = BufWriter::new(&stream);
+    let mut writer = VncWriter::new(&stream, VNC_WRITE_TIMEOUT);
     let mut reader = BufReader::new(read_stream);
     let mut framebuffer_scratch = Vec::new();
 
@@ -714,9 +727,9 @@ fn handle_vnc_client(
 }
 
 /// Send a full framebuffer update to the VNC client.
-fn send_framebuffer_update<W: Write>(
+fn send_framebuffer_update(
     dev: &Arc<Framebuffer>,
-    writer: &mut BufWriter<W>,
+    writer: &mut VncWriter<'_>,
     scratch: &mut Vec<u8>,
 ) -> io::Result<()> {
     let res = dev.resolution.load(Ordering::Acquire);
@@ -765,23 +778,77 @@ fn send_framebuffer_update<W: Write>(
         encoding: ENCODING_RAW,
     };
     writer.write_all(&rect.to_bytes())?;
-    writer.write_all(scratch)?;
-
-    writer.flush()?;
+    writer.write_all_direct(scratch)?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Client socket writer
+// ---------------------------------------------------------------------------
+
+/// Buffered writer for a VNC client socket, with a bound on how long
+/// one send waits.
+///
+/// `BufWriter` was here before. Its write to a full AF_UNIX socket has
+/// no end on illumos: `SO_SNDTIMEO` reports success and bounds
+/// nothing, and `O_NONBLOCK` is a file-status flag that the reader
+/// clone of this socket shares. `write_all_bounded` polls for space,
+/// which does work.
+///
+/// Only protocol headers go through the buffer. Pixel data is far too
+/// large to copy again, so it goes to the socket from the caller's own
+/// storage through [`VncWriter::write_all_direct`].
+struct VncWriter<'a> {
+    stream: &'a UnixStream,
+    buf: Vec<u8>,
+    budget: Duration,
+}
+
+impl<'a> VncWriter<'a> {
+    fn new(stream: &'a UnixStream, budget: Duration) -> Self {
+        Self {
+            stream,
+            buf: Vec::new(),
+            budget,
+        }
+    }
+
+    /// Send the buffer, then `data`, without copying `data` first.
+    fn write_all_direct(&mut self, data: &[u8]) -> io::Result<()> {
+        self.flush()?;
+        write_all_bounded(self.stream, data, self.budget)
+    }
+}
+
+impl Write for VncWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let result = write_all_bounded(self.stream, &self.buf, self.budget);
+        // A send that gave up left part of the buffer on the socket, so
+        // the bytes must not be sent again. The caller drops the client.
+        self.buf.clear();
+        result
+    }
 }
 
 // ---------------------------------------------------------------------------
 // CombinedStream helper for handshake
 // ---------------------------------------------------------------------------
 
-/// Wrapper that implements `Read + Write` by combining a BufReader and
-/// BufWriter, needed for the handshake functions which want a single
+/// Wrapper that implements `Read + Write` by combining a reader and a
+/// writer, needed for the handshake functions which want a single
 /// stream that can both read and write.
 struct CombinedStream<'a, R: Read, W: Write> {
     reader: &'a mut BufReader<R>,
-    writer: &'a mut BufWriter<W>,
+    writer: &'a mut W,
 }
 
 impl<R: Read, W: Write> Read for CombinedStream<'_, R, W> {
@@ -1065,6 +1132,32 @@ mod tests {
         assert_eq!(bar1_target(true, 0), None);
         assert_eq!(bar1_target(true, addr), Some(addr));
         assert_eq!(bar1_target(false, addr), None);
+    }
+
+    /// A VNC client that stops reading must not hold the VNC thread.
+    ///
+    /// The thread also runs the accept loop, so a stuck write costs
+    /// every later viewer as well.
+    #[test]
+    fn a_client_that_never_reads_does_not_hold_the_vnc_thread() {
+        use std::os::unix::net::UnixStream;
+        use std::time::Instant;
+
+        let dev = make_test_dev();
+        let (_peer, server) =
+            UnixStream::pair().expect("create a VNC socket pair");
+        let mut writer = VncWriter::new(&server, Duration::from_millis(200));
+        let mut scratch = Vec::new();
+
+        let started = Instant::now();
+        let error = send_framebuffer_update(&dev, &mut writer, &mut scratch)
+            .expect_err("a client that reads nothing must not be waited on");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the update took {:?}",
+            started.elapsed()
+        );
     }
 
     /// Create a test device without starting the VNC server.

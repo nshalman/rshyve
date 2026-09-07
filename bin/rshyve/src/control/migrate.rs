@@ -8,6 +8,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use slog::{error, info};
 
@@ -17,6 +18,13 @@ use vmm_machine::HotplugEngines;
 use super::protocol::{Command, Response};
 use super::{VmController, VmRunState};
 use crate::host_state::HostLocalState;
+
+/// How long a finished source waits to be reaped before it ends itself.
+///
+/// Long enough for an orchestrator to stumble over its switchover, and
+/// short enough that a wedged one does not leave the node holding a
+/// guest's whole memory for a VM that runs nowhere.
+const SOURCE_RELEASE_GRACE: Duration = Duration::from_secs(300);
 
 pub(super) fn migration_source_guard(
     state: HostLocalState,
@@ -273,10 +281,7 @@ pub(super) fn migrate_source(
                 ) {
                     Ok(()) => {
                         info!(mlog, "source migration complete");
-                        ctrl_arc.state.store(
-                            VmRunState::Stopped as u8,
-                            Ordering::Release,
-                        );
+                        ctrl_arc.finish_migrated_away(SOURCE_RELEASE_GRACE);
                     }
                     Err(e) => {
                         error!(mlog, "source migration failed";
@@ -334,10 +339,7 @@ pub(super) fn migrate_source(
                     {
                         Ok(()) => {
                             info!(mlog, "source migration complete");
-                            ctrl_arc.state.store(
-                                VmRunState::Stopped as u8,
-                                Ordering::Release,
-                            );
+                            ctrl_arc.finish_migrated_away(SOURCE_RELEASE_GRACE);
                         }
                         Err(e) => {
                             error!(mlog, "source migration failed";

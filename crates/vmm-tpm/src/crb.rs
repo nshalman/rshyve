@@ -556,15 +556,16 @@ mod tests {
         let dir = std::env::temp_dir()
             .join(format!("vmm-tpm-crbtest-{}", std::process::id(),));
         let _ = std::fs::remove_dir_all(&dir);
+        // A failure here used to return quietly, so this test reported
+        // green whether or not libtpms worked. It is the only caller of
+        // `Tpm::new` in this binary, so the process-global callbacks
+        // table it sets cannot already be taken, and there is nothing
+        // left for a failure to mean but a broken build.
         let tpm = match crate::Tpm::new(dir.clone(), null_logger()) {
             Ok(t) => t,
-            // Tpm::new sets a process-global libtpms callbacks
-            // table; if a previous test already initialized it
-            // we can still run our register-level tests with a
-            // fresh Crb that rides on the existing backend.
-            Err(_) => {
+            Err(e) => {
                 let _ = std::fs::remove_dir_all(&dir);
-                return;
+                panic!("libtpms would not start, so nothing below ran: {e}");
             }
         };
 

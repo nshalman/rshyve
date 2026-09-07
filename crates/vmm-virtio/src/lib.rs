@@ -26,6 +26,7 @@
 //! +-----------------------+
 //! ```
 
+mod access;
 pub mod attach;
 pub mod bits;
 pub mod block;
@@ -80,6 +81,15 @@ pub trait VirtioDevice: Send + Sync + 'static {
     fn cfg_read(&self, offset: u16, len: u8) -> u32;
 
     /// Write to device-specific configuration space.
+    ///
+    /// The transport calls this with the transport lock held, so that
+    /// a reset in flight cannot let the write land. An implementation
+    /// must not take that lock again, and must not call
+    /// [`VirtioPciDevice::signal_device_needs_reset`], or it stops
+    /// itself.
+    ///
+    /// [`VirtioPciDevice::signal_device_needs_reset`]:
+    ///     crate::pci::VirtioPciDevice::signal_device_needs_reset
     fn cfg_write(&self, offset: u16, val: u32, len: u8);
 
     /// Process a single request from a virtqueue.
@@ -205,6 +215,19 @@ pub trait VirtioDevice: Send + Sync + 'static {
     fn start_poll_deferred(&self) {}
 
     /// Reset the device to its initial state.
+    ///
+    /// The transport calls this from the vCPU that wrote
+    /// `DEVICE_STATUS`, and publishes 0 as soon as it returns. A
+    /// legacy driver does not poll for that 0: illumos reclaims the
+    /// ring DMA on the next line. So this must not return while any
+    /// worker can still read or write the guest ring or a guest
+    /// chain. The transport cannot check that.
+    ///
+    /// It must NOT wait for backend I/O. A backing-store operation
+    /// owns only host memory. Wait for the guest-memory accesses,
+    /// which are memcpys and ring publication, and let the I/O behind
+    /// them finish into host buffers a later epoch discards. That is
+    /// what makes this bounded enough to run on a vCPU.
     fn reset(&self);
 }
 

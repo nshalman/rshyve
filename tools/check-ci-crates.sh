@@ -1,5 +1,6 @@
 #!/bin/sh
-# Assert that CI still lints, tests and MSRV-checks every portable crate.
+# Assert that CI still lints, tests and MSRV-checks every portable crate,
+# and still runs the tests of the illumos bindings.
 #
 # The vmm-devices split moved roughly 19k lines into vmm-virtio,
 # vmm-storage, vmm-hid, vmm-passthru and vmm-metrics. A crate that no
@@ -9,18 +10,40 @@
 #
 # The crate list is derived from the workspace members, not kept by
 # hand. A new library crate therefore fails this check until either CI
-# names it or it is declared not portable below.
+# names it or it is declared below, and a declaration that names a crate
+# the workspace no longer has fails too, so neither list can rot in
+# silence.
+#
+# Four jobs are checked, not three. The illumos cross-check is the only
+# job that compiles a `#[cfg(test)]` body behind
+# `cfg(target_os = "illumos")`, so a crate missing from ITS list is
+# unchecked against the target with every other job green.
 set -eu
 
 CI=".github/workflows/ci.yml"
 ROOT="Cargo.toml"
 
-# Crates the portable jobs cannot cover. The bhyve, bhyve-sys and viona
-# bindings are ioctl and struct-layout code whose only meaningful check
-# is against the illumos target, which the cross-check job does. The two
-# TPM crates run an autotools build of vendored libtpms and need an
-# illumos host.
-NOT_PORTABLE="bhyve_api bhyve_api_sys viona_api vmm_tpm vmm_tpm_sys"
+# Crates the host jobs cannot usefully lint or MSRV-check. The bhyve,
+# bhyve-sys and viona bindings are ioctl and struct-layout code, and the
+# compile that means anything for them is the one against the illumos
+# target, which the cross-check job does.
+#
+# Their TESTS are a separate question, and the answer is the opposite
+# one. Each test drives a recorded ioctl seam over /dev/null and a pipe,
+# names no illumos symbol, and runs anywhere. Those recordings hold the
+# only pins on the command number and on the arguments the kernel is
+# given, and a wrong argument answers with the same errno as a right
+# one, so nothing else catches it. Leaving them to the build host left
+# those pins on one developer machine, so the test job must name these
+# crates as well.
+TARGET_ONLY="bhyve_api_sys bhyve_api viona_api"
+
+# Crates no job here builds on its own. vmm-tpm-sys drives an autotools
+# build of the vendored libtpms, and only the `binaries` job installs
+# what that build needs; it reaches both crates as dependencies of
+# rshyve. Their own tests run on the build host, with
+# `cargo test --workspace`, and on no runner.
+NO_JOB="vmm_tpm vmm_tpm_sys"
 
 [ -f "$CI" ] || { echo "run from the repository root: no $CI" >&2; exit 1; }
 
@@ -37,7 +60,10 @@ members=$(awk '
 
 [ -n "$members" ] || { echo "no [workspace] members found in $ROOT" >&2; exit 1; }
 
+status=0
+
 crates=""
+known=""
 for dir in $members; do
     # Binaries are illumos-only and are built on the build host.
     case "$dir" in
@@ -53,31 +79,57 @@ for dir in $members; do
         echo "$manifest has no package name" >&2
         exit 1
     fi
-    portable=yes
-    for skip in $NOT_PORTABLE; do
-        if [ "$name" = "$skip" ]; then
-            portable=no
-        fi
-    done
-    if [ "$portable" = yes ]; then
-        crates="$crates $name"
-    fi
+    known="$known $name"
+    case " $TARGET_ONLY $NO_JOB " in
+        *" $name "*) ;;
+        *) crates="$crates $name" ;;
+    esac
 done
 
-status=0
-for job in clippy test msrv; do
+# An exemption that outlives its crate covers nothing and hides the next
+# crate that inherits the name.
+for name in $TARGET_ONLY $NO_JOB; do
+    case " $known " in
+        *" $name "*) ;;
+        *)
+            echo "no workspace crate is named $name, so this script exempts a crate that is gone" >&2
+            status=1
+            ;;
+    esac
+done
+
+for job in clippy test msrv cross; do
     # $MSRV is literal text in the workflow, not a shell expansion.
     # shellcheck disable=SC2016
     case "$job" in
         clippy) marker="cargo clippy --locked --all-targets" ;;
         test) marker="cargo test --locked" ;;
         msrv) marker='cargo "+$MSRV" check --locked' ;;
+        cross) marker="cargo check --locked --all-targets" ;;
+    esac
+    # The two jobs that can say something about the bindings must name
+    # them: the cross-check compiles them for the target, and the test
+    # job runs the recordings that pin their ioctl arguments.
+    case "$job" in
+        test|cross) required="$crates $TARGET_ONLY" ;;
+        *) required="$crates" ;;
+    esac
+    # Crates this one job may leave out, with the reason recorded at
+    # the job itself. Everything else must be named.
+    case "$job" in
+        # vmm_migrate pulls zstd-sys, which needs an illumos cross-cc
+        # the runner does not have. The host clippy and test jobs cover
+        # it, and its illumos paths are covered on the build host.
+        cross) allowed="vmm_migrate" ;;
+        *) allowed="" ;;
     esac
     # The command is a folded YAML scalar: the marker line, then the
-    # continuation lines that carry the -p arguments.
+    # continuation lines that carry the arguments. A --target line is
+    # one of those; stopping at it would read an empty crate list and
+    # report every crate missing.
     block=$(awk -v m="$marker" '
         index($0, m) { seen = 1; grab = 1; print; next }
-        grab && $0 ~ /^[ \t]*-p / { print; next }
+        grab && $0 ~ /^[ \t]*(-p |--target )/ { print; next }
         grab { exit }
         END { if (!seen) exit 1 }
     ' "$CI") || {
@@ -86,7 +138,22 @@ for job in clippy test msrv; do
         continue
     }
     args=" $(echo "$block" | tr '\n' ' ') "
-    for crate in $crates; do
+    case "$args" in
+        *" -p "*) ;;
+        *)
+            echo "$CI: the $job job block carries no -p arguments" >&2
+            status=1
+            continue
+            ;;
+    esac
+    for crate in $required; do
+        skip=no
+        for ok in $allowed; do
+            if [ "$crate" = "$ok" ]; then
+                skip=yes
+            fi
+        done
+        [ "$skip" = yes ] && continue
         case "$args" in
             *" -p $crate "*) ;;
             *)
@@ -98,6 +165,6 @@ for job in clippy test msrv; do
 done
 
 if [ "$status" -eq 0 ]; then
-    echo "check-ci-crates: all portable crates covered"
+    echo "check-ci-crates: all portable crates covered, bindings tested"
 fi
 exit "$status"
