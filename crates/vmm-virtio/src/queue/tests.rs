@@ -476,16 +476,28 @@ fn a_refused_ring_is_logged_once_however_often_the_guest_kicks() {
     let (physmap, mut queue) =
         posted_queue(RING_GPA, RING_GPA + 0x100, RING_GPA + 0xF80);
     let records = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    queue.set_log(slog::Logger::root(
-        CountingDrain(Arc::clone(&records)),
-        slog::o!(),
-    ));
+    let log =
+        slog::Logger::root(CountingDrain(Arc::clone(&records)), slog::o!());
+    queue.set_log(log.clone());
+
+    // slog drops `debug!` at compile time in a release build, so ask
+    // this logger whether the level survives rather than assuming the
+    // profile. The refusal is logged at debug on purpose: it is
+    // guest-reachable, and a guest must not be able to fill the log.
+    slog::debug!(log, "probe");
+    let debug_reaches_the_drain = records.load(Ordering::Relaxed) > 0;
+    records.store(0, Ordering::Relaxed);
 
     for _ in 0..64 {
         assert_eq!(queue.pop_avail(&physmap), None);
     }
 
-    assert_eq!(records.load(Ordering::Relaxed), 1);
+    let seen = records.load(Ordering::Relaxed);
+    // The property that holds in either profile: 64 kicks, not 64 records.
+    assert!(seen <= 1, "64 kicks produced {seen} records");
+    if debug_reaches_the_drain {
+        assert_eq!(seen, 1, "the refusal was never reported");
+    }
     assert!(queue.needs_reset());
 }
 
