@@ -31,6 +31,14 @@ pub const OPT_MAXMEM: &str = "hotplug.maxmem";
 /// `-o hotplug.memslot=SIZE`: the size of one hot-add memory slot.
 pub const OPT_MEMSLOT: &str = "hotplug.memslot";
 
+/// The key C bhyve reads to draw guest memory from the VMM reservoir.
+///
+/// `bhyverun.c:553` turns it into `VCF_RESERVOIR_MEM`. It is the channel
+/// the control plane uses, because the bhyve brand splices
+/// `bhyve_extra_opts` onto the argv and no zonecfg attribute reaches
+/// this.
+pub const OPT_USE_RESERVOIR: &str = "memory.use_reservoir";
+
 /// Parse a memory size string into bytes.
 ///
 /// Accepts suffixes: K/k (KiB), M/m (MiB), G/g (GiB), T/t (TiB).
@@ -331,6 +339,25 @@ impl Cli {
             .map(|(_, value)| value.trim())
     }
 
+    /// Whether guest memory comes from the VMM reservoir.
+    ///
+    /// Two spellings, because two callers use different ones. Our own
+    /// tools and docs pass `-S`. The control plane passes
+    /// `-o memory.use_reservoir=true`, which is what C bhyve reads
+    /// (`bhyverun.c:553`), and it passes no `-S`. Reading only `-S`
+    /// meant a control-plane VM silently got transient memory after the
+    /// agent had already grown and charged the reservoir for it.
+    ///
+    /// Note this VMM does not implement C bhyve's `-S`, which is
+    /// `memory.wired` there (`bhyverun_machdep.c:220`) and a different
+    /// thing. `-S` here has always meant the reservoir.
+    pub fn use_reservoir(&self) -> bool {
+        self.wire_memory
+            || self
+                .config_opt(OPT_USE_RESERVOIR)
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    }
+
     /// Refuse a `hotplug.` key this tree does not read.
     ///
     /// Every other `-o` key is left alone, because bhyve's `-o` is a
@@ -383,10 +410,11 @@ impl Cli {
              has no memory hotplug AML to answer on",
         );
         anyhow::ensure!(
-            self.wire_memory,
-            "'-o {OPT_MAXMEM}' needs -S: without reservoir memory a \
-             hot-add zeroes every page inside the ioctl that freezes \
-             the vCPUs, about 400 ms per GiB",
+            self.use_reservoir(),
+            "'-o {OPT_MAXMEM}' needs reservoir memory, from -S or \
+             '-o {OPT_USE_RESERVOIR}=true': without it a hot-add zeroes \
+             every page inside the ioctl that freezes the vCPUs, about \
+             400 ms per GiB",
         );
         Ok(Some(bytes))
     }
@@ -576,6 +604,51 @@ mod tests {
 
         let error = cli.max_mem().expect_err("no --hotplug");
         assert!(error.to_string().contains("--hotplug"), "{error}");
+    }
+
+    /// The control plane never passes -S. It passes the key C bhyve
+    /// reads (`bhyverun.c:553`), spliced onto the argv through the
+    /// brand's `bhyve_extra_opts`. Reading only -S meant the guest got
+    /// transient memory, about 400 ms per GiB, after the agent had
+    /// already grown and charged the reservoir for it. Silently.
+    #[test]
+    fn the_reservoir_option_the_control_plane_sends_is_read() {
+        let cli = cli_from(&[
+            "rshyve",
+            "-c",
+            "1",
+            "-m",
+            "128M",
+            "-o",
+            "memory.use_reservoir=true",
+            "vm",
+        ]);
+        assert!(!cli.wire_memory, "the control plane sends no -S");
+        assert!(cli.use_reservoir(), "the reservoir request was dropped");
+    }
+
+    #[test]
+    fn dash_s_still_asks_for_the_reservoir() {
+        let cli = cli_from(&["rshyve", "-S", "-c", "1", "-m", "128M", "vm"]);
+        assert!(cli.use_reservoir());
+    }
+
+    #[test]
+    fn no_request_means_no_reservoir() {
+        let cli = cli_from(&["rshyve", "-c", "1", "-m", "128M", "vm"]);
+        assert!(!cli.use_reservoir());
+        // A value that is not true must not be read as one.
+        let off = cli_from(&[
+            "rshyve",
+            "-c",
+            "1",
+            "-m",
+            "128M",
+            "-o",
+            "memory.use_reservoir=false",
+            "vm",
+        ]);
+        assert!(!off.use_reservoir());
     }
 
     #[test]

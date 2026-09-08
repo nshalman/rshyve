@@ -155,7 +155,7 @@ fn run(
         mem_size,
         create_opts: vmm_core::hdl::CreateOpts {
             force: true,
-            use_reservoir: cli.wire_memory,
+            use_reservoir: cli.use_reservoir(),
             // Dirty tracking exists to serve migration, which this
             // binary does not have.
             track_dirty: false,
