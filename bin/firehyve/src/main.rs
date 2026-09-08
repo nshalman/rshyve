@@ -445,19 +445,21 @@ fn main() -> ExitCode {
     let log = setup_logger();
 
     match run(cli, &log) {
-        // A reboot exits cleanly: firehyve has no re-exec path, matching
-        // C bhyve's VM_SUSPEND_RESET handling.
-        Ok(
-            vmm_machine::RunOutcome::Reboot
-            | vmm_machine::RunOutcome::PowerOff
-            | vmm_machine::RunOutcome::Halt,
-        ) => ExitCode::SUCCESS,
+        // The zone brand reads these. `boot.c` sets ZONE_ATTR_INITRESTART0
+        // on every bhyve zone and the brand declares no <initreboot>, so
+        // the kernel restarts init only on exit 0 and halts the zone on
+        // anything else. A guest that powers itself off must therefore
+        // NOT exit 0, or the zone restarts it for ever. The values are C
+        // bhyve's, from usr/src/cmd/bhyve/amd64/vmexit.c.
+        Ok(vmm_machine::RunOutcome::Reboot) => ExitCode::SUCCESS,
+        Ok(vmm_machine::RunOutcome::PowerOff) => ExitCode::from(1),
+        Ok(vmm_machine::RunOutcome::Halt) => ExitCode::from(2),
         Ok(vmm_machine::RunOutcome::TripleFault(src)) => {
             error!(log, "VM triple fault"; "source_vcpu" => src);
             ExitCode::from(3)
         }
-        // Keep a guest-caused fatal exit distinct from an internal error.
-        Ok(vmm_machine::RunOutcome::GuestFault) => ExitCode::from(2),
+        // Distinct from HALT, which C bhyve gives 2.
+        Ok(vmm_machine::RunOutcome::GuestFault) => ExitCode::from(4),
         Err(e) => {
             error!(log, "fatal error"; "error" => format!("{e:#}"));
             ExitCode::FAILURE
@@ -469,6 +471,34 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use clap::FromArgMatches;
+
+    /// The zone brand reads the exit code, and the kernel rule is not
+    /// symmetric: `boot.c` sets ZONE_ATTR_INITRESTART0 on every bhyve
+    /// zone, the brand declares no <initreboot>, and
+    /// uts/common/os/exit.c restarts init only on `CLD_EXITED && what
+    /// == 0`. So exit 0 means "start the guest again" and anything else
+    /// means "halt the zone". A guest that powers itself off must not
+    /// take the first branch.
+    ///
+    /// The values are C bhyve's, from usr/src/cmd/bhyve/amd64/vmexit.c:
+    /// RESET 0, POWEROFF 1, HALT 2, TRIPLEFAULT 3.
+    #[test]
+    fn the_exit_codes_match_the_ones_the_zone_brand_reads() {
+        use vmm_machine::RunOutcome;
+        let code = |o: RunOutcome| match o {
+            RunOutcome::Reboot => 0u8,
+            RunOutcome::PowerOff => 1,
+            RunOutcome::Halt => 2,
+            RunOutcome::TripleFault(_) => 3,
+            RunOutcome::GuestFault => 4,
+        };
+        assert_eq!(code(RunOutcome::Reboot), 0, "only a reboot may exit 0");
+        assert_eq!(code(RunOutcome::PowerOff), 1);
+        assert_eq!(code(RunOutcome::Halt), 2);
+        assert_eq!(code(RunOutcome::TripleFault(0)), 3);
+        // Sharing 2 with HALT would report a guest fault as a clean halt.
+        assert_ne!(code(RunOutcome::GuestFault), code(RunOutcome::Halt));
+    }
 
     fn cli_from(args: &[&str]) -> Cli {
         let matches = Cli::command_named("firehyve")

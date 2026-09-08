@@ -1807,12 +1807,23 @@ fn main() -> ExitCode {
             vmm_machine::sigterm_flag(),
             &log,
         ),
-        // Preserve vmadm/SIGTERM success semantics instead of adopting
-        // bhyve's distinct clean-shutdown exit codes.
+        // C bhyve's codes, from usr/src/cmd/bhyve/amd64/vmexit.c. They
+        // are not cosmetic: `boot.c` sets ZONE_ATTR_INITRESTART0 on
+        // every bhyve zone and the brand declares no <initreboot>, so
+        // the kernel restarts init only on exit 0. Exiting 0 here
+        // restarts a guest that asked to power off, for ever.
+        //
+        // vmadm is unaffected. Its stop sends SIGTERM, which C bhyve
+        // turns into an ACPI power button (amd64/pm.c:432), so an
+        // orderly guest shutdown already exits 1 today.
         Ok(RunResult {
-            outcome: RunOutcome::PowerOff | RunOutcome::Halt,
+            outcome: RunOutcome::PowerOff,
             ..
-        }) => ExitCode::SUCCESS,
+        }) => ExitCode::from(1),
+        Ok(RunResult {
+            outcome: RunOutcome::Halt,
+            ..
+        }) => ExitCode::from(2),
         Ok(RunResult {
             outcome: RunOutcome::TripleFault(src),
             ..
@@ -1820,11 +1831,11 @@ fn main() -> ExitCode {
             error!(log, "VM triple fault"; "source_vcpu" => src);
             ExitCode::from(3)
         }
-        // Keep a guest-caused fatal exit distinct from an internal VMM error.
+        // Distinct from HALT, which C bhyve gives 2.
         Ok(RunResult {
             outcome: RunOutcome::GuestFault,
             ..
-        }) => ExitCode::from(2),
+        }) => ExitCode::from(4),
         Err(e) => {
             slog::error!(log, "fatal error"; "error" => format!("{:#}", e));
             ExitCode::FAILURE
