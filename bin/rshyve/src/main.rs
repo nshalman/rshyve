@@ -1027,6 +1027,13 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         )?;
     }
 
+    // The guest can run now, so tell the brand. `vmadm create` waits on
+    // this rename, not on the process, and gives up after 300 s. C
+    // bhyve does it at the same point, bhyverun.c:915. It must also
+    // stay ahead of any privilege drop, since the rename needs file
+    // access.
+    vmm_machine::provision::mark_provisioned(log);
+
     // Phase 9: Spawn vCPU threads. The fleet, not the fixed set,
     // because a CPU added later joins the same event channel and the
     // same roster.
