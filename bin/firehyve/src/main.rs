@@ -15,7 +15,7 @@ use std::ffi::{OsStr, OsString};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use slog::{error, info, Drain};
+use slog::{error, info, warn, Drain};
 
 use vmm_config::Cli;
 use vmm_machine::{
@@ -43,7 +43,12 @@ fn version_string() -> String {
 
 /// Reject every shared-grammar flag firehyve cannot honor, so an
 /// operator learns at startup instead of from a guest that misbehaves.
-fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
+///
+/// Two classes of option are not refused. An option the bhyve zone
+/// brand puts on every zone is accepted and logged, because refusing it
+/// means an unmodified brand can never start this binary. An option
+/// that would change guest behaviour is still refused.
+fn validate_cli(cli: &Cli, log: &slog::Logger) -> anyhow::Result<()> {
     anyhow::ensure!(
         cli.migrate_listen.is_none(),
         "firehyve does not support --migrate-listen; live migration is rshyve only"
@@ -71,13 +76,23 @@ fn validate_cli(cli: &Cli) -> anyhow::Result<()> {
             && cli.mdata_root_pw.is_none(),
         "firehyve does not support the --mdata-* flags; there is no COM2 agent"
     );
-    if let Some(entry) = cli.lpc.iter().find(|a| a.starts_with("bootrom,")) {
-        anyhow::bail!("firehyve has no UEFI path; '-l {entry}' is rshyve only");
+    // `boot.c` appends `-l bootrom,<rom>` to every bhyve zone, and
+    // falls back to a default ROM when the zonecfg attr is unset. There
+    // is no way to ask the brand not to. firehyve boots the kernel
+    // directly, so the ROM is merely unused: nothing is loaded from it
+    // and no guest behaviour changes. Refusing it would block the
+    // unmodified brand, so it is accepted and logged.
+    for entry in cli.lpc.iter().filter(|a| a.starts_with("bootrom,")) {
+        warn!(log, "bootrom ignored";
+            "requested" => entry.trim_start_matches("bootrom,"),
+            "reason" => "firehyve boots the kernel directly and has no \
+                         UEFI path",
+        );
     }
     // A misspelled hotplug key would otherwise leave the operator with
     // a VM that quietly has no window.
     cli.check_hotplug_options()?;
-    console::require_stdio_backend(&cli.lpc)?;
+    console::report_serial_backends(&cli.lpc, log);
     // attach_pci_devices takes bootindex-stripped specs, and a
     // direct-booted kernel has no firmware boot order for an index to
     // steer. Accepting the token would silently drop it.
@@ -137,7 +152,14 @@ fn run(
     // Phase 1: reject what this binary cannot honor. The hot-add
     // window is built here, before the VM exists, so a window an
     // operator cannot use costs no boot.
-    validate_cli(&cli)?;
+    validate_cli(&cli, log)?;
+    // Resolved here, not at load time: a command line that is malformed
+    // or supplied twice must cost no VM. `--cmdline-base64` is the form
+    // the bhyve zone brand can carry, because it splits its only
+    // pass-through attr on whitespace.
+    let cmdline = cli
+        .kernel_cmdline()?
+        .unwrap_or_else(|| DEFAULT_CMDLINE.to_string());
     let mem_window = vmm_machine::mem_hotplug_window(&cli)?;
 
     // Phase 2: create the VM. No bootrom, so nothing goes into guest
@@ -198,7 +220,7 @@ fn run(
     )?;
 
     // Phase 5: serial console, then the COM2 marker channel.
-    let _com1 = console::setup_console(&machine, &chipset_devs.pic, &cli, log)?;
+    let _com1 = console::setup_console(&machine, &chipset_devs.pic, log)?;
     let _com2 = console::setup_com2(&machine, &chipset_devs.pic, log)?;
 
     // Phase 6: fw_cfg, ACPI, SMBIOS. No boot order, no TPM2 table.
@@ -272,11 +294,10 @@ fn run(
         .transpose()?;
     let read_us = t_read.elapsed().as_micros() as u64;
 
-    let cmdline = cli.cmdline.as_deref().unwrap_or(DEFAULT_CMDLINE);
     let t_load = std::time::Instant::now();
     let entry = kernel.load(
         machine.memctx(),
-        cmdline,
+        &cmdline,
         initrd.as_ref(),
         mem_size,
         acpi.rsdp_addr(),
@@ -286,7 +307,7 @@ fn run(
         "entry" => format!("{entry:#x}"),
         "read_us" => read_us,
         "load_us" => t_load.elapsed().as_micros() as u64,
-        "cmdline" => cmdline,
+        "cmdline" => &cmdline,
     );
 
     // `BspEntry::Custom` only borrows the closure, so it needs a name.
@@ -514,6 +535,12 @@ mod tests {
         Cli::from_arg_matches(&matches).expect("from_arg_matches")
     }
 
+    /// A logger that keeps nothing. The tests that care what was
+    /// logged live in `console`, which has a recording drain.
+    fn quiet() -> slog::Logger {
+        slog::Logger::root(slog::Discard, slog::o!())
+    }
+
     #[test]
     fn one_cpu_ceiling_feeds_the_tables_the_registers_and_the_engine() {
         // The MADT slot count, the CPU register file and the hot-add
@@ -590,7 +617,7 @@ mod tests {
     #[test]
     fn kernel_is_required() {
         let cli = cli_from(&["firehyve", "guest"]);
-        let err = validate_cli(&cli).expect_err("no --kernel");
+        let err = validate_cli(&cli, &quiet()).expect_err("no --kernel");
         assert!(err.to_string().contains("--kernel"), "got: {err}");
     }
 
@@ -604,7 +631,8 @@ mod tests {
             "0.0.0.0:4567",
             "guest",
         ]);
-        let err = validate_cli(&cli).expect_err("migration is rshyve only");
+        let err =
+            validate_cli(&cli, &quiet()).expect_err("migration is rshyve only");
         assert!(err.to_string().contains("--migrate-listen"), "got: {err}");
     }
 
@@ -618,12 +646,18 @@ mod tests {
             "/tmp/ctl.sock",
             "guest",
         ]);
-        let err = validate_cli(&cli).expect_err("no control socket");
+        let err = validate_cli(&cli, &quiet()).expect_err("no control socket");
         assert!(err.to_string().contains("--control-socket"), "got: {err}");
     }
 
+    /// `boot.c` appends `-l bootrom,<rom>` to every bhyve zone and
+    /// offers no way to suppress it, so refusing it means an
+    /// unmodified brand can never start firehyve. The ROM is unused
+    /// rather than misused: the kernel is booted directly.
+    ///
+    /// Mutation this kills: restoring the bail on a bootrom entry.
     #[test]
-    fn bootrom_lpc_entry_is_rejected() {
+    fn the_bootrom_the_brand_always_appends_is_accepted() {
         let cli = cli_from(&[
             "firehyve",
             "--kernel",
@@ -632,8 +666,7 @@ mod tests {
             "bootrom,/usr/share/bhyve/BHYVE_UEFI.fd",
             "guest",
         ]);
-        let err = validate_cli(&cli).expect_err("no UEFI path");
-        assert!(err.to_string().contains("bootrom"), "got: {err}");
+        validate_cli(&cli, &quiet()).expect("the brand always sends this");
     }
 
     #[test]
@@ -648,12 +681,16 @@ mod tests {
             "4,virtio-blk,/tmp/d.img,bootindex=1",
             "guest",
         ]);
-        let err = validate_cli(&cli).expect_err("no boot order");
+        let err = validate_cli(&cli, &quiet()).expect_err("no boot order");
         assert!(err.to_string().contains("bootindex"), "got: {err}");
     }
 
+    /// The `com1` zonecfg attr is `/dev/zconsole` on every bhyve zone
+    /// tritond-vmadm builds, so this cannot be a refusal either.
+    ///
+    /// Mutation this kills: restoring `require_stdio_backend`.
     #[test]
-    fn a_console_backend_other_than_stdio_is_rejected() {
+    fn the_console_backend_the_brand_emits_is_accepted() {
         let cli = cli_from(&[
             "firehyve",
             "--kernel",
@@ -662,8 +699,87 @@ mod tests {
             "com1,/dev/zconsole",
             "guest",
         ]);
-        let err = validate_cli(&cli).expect_err("stdio only");
-        assert!(err.to_string().contains("/dev/zconsole"), "got: {err}");
+        validate_cli(&cli, &quiet()).expect("the brand always sends this");
+    }
+
+    /// The whole point, in one test: the argv `boot.c` builds for a
+    /// bhyve zone has to start firehyve.
+    ///
+    /// Every element here comes from a real zone. `-l bootrom,...` is
+    /// appended unconditionally (`boot.c`), `com1` and `com2` come from
+    /// the zonecfg attrs tritond-vmadm always sets, and the kernel,
+    /// initrd and command line arrive through `bhyve_extra_opts`, which
+    /// the brand splits on space and tab. That split is why the command
+    /// line is base64 here.
+    ///
+    /// Mutation this kills: any one of the three refusals coming back.
+    #[test]
+    fn the_argv_the_bhyve_brand_builds_is_accepted() {
+        let cmdline = "root=/dev/ram0 init=/init console=ttyS0 panic=-1";
+        // The literal is the value tritond-vmadm would put in the
+        // attr. Spelling it out keeps base64 out of this binary's
+        // dependency graph, which deny-firehyve.toml curates.
+        let encoded =
+            "cm9vdD0vZGV2L3JhbTAgaW5pdD0vaW5pdCBjb25zb2xlPXR0eVMwIHBhbmljPS0x";
+        // The brand's own split would destroy the plain form.
+        assert!(cmdline.split([' ', '\t']).count() > 1);
+        assert_eq!(encoded.split([' ', '\t']).count(), 1);
+
+        let cli = cli_from(&[
+            "firehyve",
+            "-c",
+            "1",
+            "-m",
+            "2048",
+            "-s",
+            "0,hostbridge",
+            "-s",
+            "31,lpc",
+            "-l",
+            "bootrom,/usr/share/bhyve/BHYVE_UEFI.fd",
+            "-l",
+            "com1,/dev/zconsole",
+            "-l",
+            "com2,socket,/tmp/vm.ttyb",
+            "-H",
+            "-B",
+            "1,manufacturer=Joyent",
+            "--kernel",
+            "/vmlinux",
+            "--cmdline-base64",
+            encoded,
+            "3fe75ae1-8624-4764-80a3-2f4a332f3604",
+        ]);
+
+        validate_cli(&cli, &quiet()).expect("the brand's argv must boot");
+        assert_eq!(cli.kernel_cmdline().unwrap().as_deref(), Some(cmdline));
+    }
+
+    /// The relaxations are scoped to what the brand forces. An option
+    /// that would change guest behaviour is still refused.
+    ///
+    /// Mutation this kills: relaxing a refusal beyond the two the brand
+    /// forces on every zone.
+    #[test]
+    fn the_refusals_that_protect_guest_behaviour_are_kept() {
+        let base = ["firehyve", "--kernel", "/tmp/vmlinux"];
+        let cases: [(&str, &[&str]); 5] = [
+            ("--vtpm", &["--vtpm"]),
+            ("--hyperv", &["--hyperv"]),
+            ("--mdata-", &["--mdata-ssh-keys", "ssh-rsa AAAA"]),
+            ("--control-socket", &["--control-socket", "/tmp/c.sock"]),
+            ("--json-config", &["--json-config", "/tmp/c.json"]),
+        ];
+        for (want, extra) in cases {
+            let mut argv = base.to_vec();
+            argv.extend_from_slice(extra);
+            argv.push("guest");
+            let cli = cli_from(&argv);
+            let err = validate_cli(&cli, &quiet())
+                .expect_err("must stay refused")
+                .to_string();
+            assert!(err.contains(want), "for {want} got: {err}");
+        }
     }
 
     #[test]
@@ -682,6 +798,6 @@ mod tests {
             "/tmp/vmlinux",
             "guest",
         ]);
-        validate_cli(&cli).expect("accepted");
+        validate_cli(&cli, &quiet()).expect("accepted");
     }
 }

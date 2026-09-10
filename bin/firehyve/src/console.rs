@@ -8,14 +8,14 @@
 //! guest produces no output at all. COM2 carries out-of-band markers
 //! from the guest. PS/2 and the metadata agent stay rshyve-only.
 //!
-//! stdio is the only backend for both. rshyve's zconsole and
-//! Unix-socket paths belong to a supervised zone, which is not the
-//! shape firehyve runs in.
+//! Both ports are served on the stdio this process inherits. The
+//! zone brand names a backend for each one, and firehyve accepts that
+//! name and ignores it. See `report_serial_backends`.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use slog::info;
+use slog::{info, warn};
 
 use vmm_core::intr_pins::{IntrPin, LegacyPIC, NoOpPin};
 use vmm_core::machine::Machine;
@@ -37,34 +37,48 @@ fn stdout_sink(port: &'static str) -> TxSink {
     })
 }
 
-/// Reject a `-l com1,<backend>` or `-l com2,<backend>` this binary
-/// cannot serve.
+/// Report each `-l com1,<backend>` / `-l com2,<backend>` this binary
+/// accepts but does not use.
 ///
-/// Kept apart from the attach functions so the one behavioral decision
-/// here is testable without a live VM, and so `validate_cli` can reach
-/// it before the VM exists.
-pub(crate) fn require_stdio_backend(lpc_args: &[String]) -> anyhow::Result<()> {
+/// The bhyve zone brand puts a backend on every zone: `com1` comes
+/// from the zonecfg attr, which tritond-vmadm always sets to
+/// `/dev/zconsole`, and `com2` to `socket,/tmp/vm.ttyb`. firehyve
+/// serves both ports on the stdio it inherits from zhyve, so it cannot
+/// honour either name. Refusing them would mean an unmodified brand
+/// can never start this binary, so they are accepted and logged.
+///
+/// The log line is the point. zhyve points stdout at `/dev/zfd/1`,
+/// which zoneadmd copies into the zone log, NOT at the `/dev/zconsole`
+/// the brand asked for. So `zlogin -C` stays dark and the operator has
+/// to be told where the bytes went.
+///
+/// Kept apart from the attach functions so the decision is testable
+/// without a live VM, and so `validate_cli` can reach it before the VM
+/// exists.
+pub(crate) fn report_serial_backends(lpc_args: &[String], log: &slog::Logger) {
     for port in SERVED_PORTS {
-        match vmm_machine::find_lpc_device(lpc_args, port).as_deref() {
-            None | Some("stdio") => {}
-            Some(other) => anyhow::bail!(
-                "firehyve serves {port} on stdio only; \
-                 '-l {port},{other}' is rshyve only"
-            ),
+        let Some(backend) = vmm_machine::find_lpc_device(lpc_args, port) else {
+            continue;
+        };
+        if backend == "stdio" {
+            continue;
         }
+        warn!(log, "serial backend ignored";
+            "port" => port,
+            "requested" => &backend,
+            "served_on" => "inherited stdio",
+            "note" => "zoneadmd copies stdout to the zone log, \
+                       not to the zone console",
+        );
     }
-    Ok(())
 }
 
 /// Attach COM1 and connect it to this process's stdio.
 pub(crate) fn setup_console(
     machine: &Machine,
     pic: &Arc<LegacyPIC>,
-    cli: &vmm_config::Cli,
     log: &slog::Logger,
 ) -> anyhow::Result<Arc<LpcUart>> {
-    require_stdio_backend(&cli.lpc)?;
-
     let pin: Arc<dyn IntrPin> = match pic.pin_handle(lpc::COM1_IRQ) {
         Some(p) => p,
         None => Arc::new(NoOpPin),
@@ -129,48 +143,137 @@ pub(crate) fn setup_com2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn lpc(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| (*a).to_string()).collect()
     }
 
-    #[test]
-    fn an_absent_com1_entry_defaults_to_stdio() {
-        require_stdio_backend(&lpc(&[])).expect("default is stdio");
+    /// Keeps every record so a test can prove firehyve logged an
+    /// ignored option instead of dropping it quietly.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl Recorder {
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().expect("recorder lock").clone()
+        }
+
+        fn logger(&self) -> slog::Logger {
+            slog::Logger::root(self.clone(), slog::o!())
+        }
+    }
+
+    /// Flattens a record and its key/value pairs into one string.
+    struct Flatten(String);
+
+    impl slog::Serializer for Flatten {
+        fn emit_arguments(
+            &mut self,
+            key: slog::Key,
+            val: &std::fmt::Arguments<'_>,
+        ) -> slog::Result {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, " {key}={val}");
+            Ok(())
+        }
+    }
+
+    impl slog::Drain for Recorder {
+        type Ok = ();
+        type Err = slog::Never;
+
+        fn log(
+            &self,
+            record: &slog::Record<'_>,
+            values: &slog::OwnedKVList,
+        ) -> Result<Self::Ok, Self::Err> {
+            use slog::KV as _;
+            let mut out =
+                Flatten(format!("{} {}", record.level(), record.msg()));
+            let _ = record.kv().serialize(record, &mut out);
+            let _ = values.serialize(record, &mut out);
+            self.0.lock().expect("recorder lock").push(out.0);
+            Ok(())
+        }
     }
 
     #[test]
-    fn an_explicit_stdio_backend_is_accepted() {
-        require_stdio_backend(&lpc(&["com1,stdio"])).expect("stdio");
+    fn a_stdio_backend_or_no_entry_at_all_reports_nothing() {
+        // Nothing is ignored in either case, so a log line here would
+        // be noise on the one path that needs none.
+        for args in [lpc(&[]), lpc(&["com1,stdio"]), lpc(&["com2,stdio"])] {
+            let rec = Recorder::default();
+            report_serial_backends(&args, &rec.logger());
+            assert!(rec.lines().is_empty(), "reported: {:?}", rec.lines());
+        }
     }
 
+    /// tritond-vmadm sets the `com1` zonecfg attr to `/dev/zconsole` on
+    /// every bhyve zone, so refusing it means an unmodified brand can
+    /// never start firehyve. It is accepted, but it must not be
+    /// accepted quietly: the bytes go to the zone log, not to the
+    /// zone console, and only this line tells the operator that.
+    ///
+    /// Mutation this kills: deleting the warn! and keeping the loop, or
+    /// dropping the "requested" pair so the line does not say what was
+    /// ignored.
     #[test]
-    fn any_other_backend_is_rejected_at_startup() {
-        // rshyve serves zconsole and a Unix socket on COM1. firehyve
-        // has neither, so an operator learns now instead of finding a
-        // console that produces no output.
-        let err = require_stdio_backend(&lpc(&["com1,/dev/zconsole"]))
-            .expect_err("zconsole is rshyve only");
-        assert!(err.to_string().contains("/dev/zconsole"), "got: {err}");
+    fn the_com1_backend_the_brand_emits_is_accepted_and_logged() {
+        let rec = Recorder::default();
+        report_serial_backends(&lpc(&["com1,/dev/zconsole"]), &rec.logger());
 
-        assert!(require_stdio_backend(&lpc(&["com1,socket,/tmp/c"])).is_err());
+        let lines = rec.lines();
+        assert_eq!(lines.len(), 1, "expected one line, got {lines:?}");
+        let line = &lines[0];
+        assert!(line.starts_with("WARN"), "must be a warning: {line}");
+        assert!(line.contains("/dev/zconsole"), "names no backend: {line}");
+        assert!(line.contains("com1"), "names no port: {line}");
     }
 
+    /// `-l com2,socket,/tmp/vm.ttyb` is on every bhyve zone too, and
+    /// firehyve has no COM2 agent to serve it.
+    ///
+    /// Mutation this kills: reporting com1 only.
     #[test]
-    fn com2_also_serves_stdio_only() {
-        // COM2 carries fhrun's boot markers to the host on stdout. A
-        // zconsole backend would send them where firehyve cannot read
-        // them, so the operator learns at startup.
-        require_stdio_backend(&lpc(&["com2,stdio"])).expect("stdio");
+    fn the_com2_backend_the_brand_emits_is_accepted_and_logged() {
+        let rec = Recorder::default();
+        report_serial_backends(
+            &lpc(&["com2,socket,/tmp/vm.ttyb"]),
+            &rec.logger(),
+        );
 
-        let err = require_stdio_backend(&lpc(&["com2,/dev/zconsole"]))
-            .expect_err("zconsole is rshyve only");
-        assert!(err.to_string().contains("com2"), "got: {err}");
+        let lines = rec.lines();
+        assert_eq!(lines.len(), 1, "expected one line, got {lines:?}");
+        assert!(lines[0].contains("com2"), "names no port: {}", lines[0]);
+        assert!(
+            lines[0].contains("/tmp/vm.ttyb"),
+            "names no backend: {}",
+            lines[0]
+        );
     }
 
+    /// Both ports at once, which is what the brand actually builds.
     #[test]
-    fn an_lpc_entry_for_another_device_is_ignored() {
-        require_stdio_backend(&lpc(&["bootrom,/usr/share/bhyve/uefi-rom.bin"]))
-            .expect("not a serial port");
+    fn both_brand_serial_backends_are_reported_one_line_each() {
+        let rec = Recorder::default();
+        report_serial_backends(
+            &lpc(&["com1,/dev/zconsole", "com2,socket,/tmp/vm.ttyb"]),
+            &rec.logger(),
+        );
+        assert_eq!(rec.lines().len(), 2, "got {:?}", rec.lines());
+    }
+
+    /// Mutation this kills: matching on any `-l` entry instead of the
+    /// two serial ports, which would report the bootrom here as well
+    /// as in validate_cli.
+    #[test]
+    fn an_lpc_entry_for_another_device_is_not_reported() {
+        let rec = Recorder::default();
+        report_serial_backends(
+            &lpc(&["bootrom,/usr/share/bhyve/uefi-rom.bin"]),
+            &rec.logger(),
+        );
+        assert!(rec.lines().is_empty(), "reported: {:?}", rec.lines());
     }
 }
