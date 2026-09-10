@@ -43,7 +43,7 @@ pub fn mark_provisioned(log: &slog::Logger) {
 
 fn mark_provisioned_at(from: &Path, to: &Path, log: &slog::Logger) {
     // Absent means this is not a brand-managed zone. Not an error.
-    if !from.symlink_metadata().is_ok() {
+    if from.symlink_metadata().is_err() {
         return;
     }
     match std::fs::rename(from, to) {
