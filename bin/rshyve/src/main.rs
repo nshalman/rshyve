@@ -554,6 +554,23 @@ fn reject_unmigratable_destination(
     Ok(())
 }
 
+/// Kernel command line used when neither `--cmdline` nor
+/// `--cmdline-base64` is given. It names `ttyS0`, which is why COM1 is
+/// always attached.
+const DEFAULT_CMDLINE: &str = "console=ttyS0 earlyprintk=serial";
+
+/// The guest kernel command line, from whichever spelling was given.
+///
+/// Both spellings resolve through `Cli::kernel_cmdline`, which is also
+/// where the length bound and the NUL and control-byte checks live.
+/// Reading `cli.cmdline` here instead would accept
+/// `--cmdline-base64` and then boot the guest without it.
+fn resolved_cmdline(cli: &Cli) -> anyhow::Result<String> {
+    Ok(cli
+        .kernel_cmdline()?
+        .unwrap_or_else(|| DEFAULT_CMDLINE.to_string()))
+}
+
 /// If direct-booting a kernel, load it into guest RAM and return the
 /// entry point address.
 fn load_direct_boot_kernel(
@@ -566,14 +583,11 @@ fn load_direct_boot_kernel(
     log: &Logger,
 ) -> anyhow::Result<()> {
     if let Some(ref kernel) = kernel_image {
-        let cmdline = cli
-            .cmdline
-            .as_deref()
-            .unwrap_or("console=ttyS0 earlyprintk=serial");
+        let cmdline = resolved_cmdline(cli)?;
         let acpi_rsdp_addr = acpi_tables.rsdp_addr();
         let entry = kernel.load(
             machine.memctx(),
-            cmdline,
+            &cmdline,
             initrd_image.as_ref(),
             mem_size,
             acpi_rsdp_addr,
@@ -1710,6 +1724,53 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::FromArgMatches;
+
+    fn cli_from(args: &[&str]) -> Cli {
+        let matches = Cli::command_named("rshyve")
+            .try_get_matches_from(args)
+            .expect("argv parses");
+        Cli::from_arg_matches(&matches).expect("from_arg_matches")
+    }
+
+    /// The bhyve zone brand splits its only pass-through attr on
+    /// whitespace, so a command line with spaces can only reach this
+    /// binary base64-encoded. Reading `cli.cmdline` directly accepts
+    /// the flag and boots the guest without it.
+    ///
+    /// Mutation this kills: `cli.cmdline.as_deref().unwrap_or(DEFAULT)`
+    /// in place of the resolver, which returns the default here.
+    #[test]
+    fn the_base64_command_line_reaches_the_guest() {
+        let cli = cli_from(&[
+            "rshyve",
+            "--cmdline-base64",
+            "cm9vdD0vZGV2L3ZkYTEgcnc=",
+            "vm",
+        ]);
+        assert_eq!(
+            resolved_cmdline(&cli).expect("resolves"),
+            "root=/dev/vda1 rw",
+        );
+    }
+
+    /// Mutation this kills: dropping the resolver's `?` so a command
+    /// line that fails validation is passed to the loader anyway.
+    #[test]
+    fn a_control_byte_in_the_command_line_stops_the_boot() {
+        let cli =
+            cli_from(&["rshyve", "--cmdline", "root=/dev/vda1\x07", "vm"]);
+        resolved_cmdline(&cli).expect_err("a control byte must be refused");
+    }
+
+    /// Without a command line the guest still has to be told where its
+    /// console is, or a direct boot produces no output at all.
+    #[test]
+    fn no_command_line_at_all_names_the_serial_console() {
+        let cli = cli_from(&["rshyve", "vm"]);
+        assert_eq!(resolved_cmdline(&cli).expect("resolves"), DEFAULT_CMDLINE);
+        assert!(DEFAULT_CMDLINE.contains("ttyS0"), "console is not ttyS0");
+    }
 
     /// The binary must not carry its own copy of the boot images.
     /// This coerces only if the parameter types are the ones `vmm_boot`
