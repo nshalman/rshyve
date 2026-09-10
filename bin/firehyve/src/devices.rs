@@ -6,11 +6,13 @@
 //! string to a concrete device.
 //!
 //! An unrecognized driver name is an error. Skipping it would produce a
-//! VM that boots without the device the operator asked for.
+//! VM that boots without the device the operator asked for. The one
+//! exception is `IGNORED`: names the bhyve zone brand puts on every
+//! zone that firehyve has no device for.
 
 use std::sync::Arc;
 
-use slog::info;
+use slog::{info, warn};
 
 use vmm_devices::pci::Bdf;
 use vmm_virtio::attach;
@@ -30,6 +32,21 @@ const SUPPORTED: &[&str] = &[
     "hostbridge",
     "lpc",
 ];
+
+/// Driver names the bhyve zone brand emits that firehyve has no device
+/// for, and therefore accepts and leaves unattached.
+///
+/// `add_fbuf` in `boot.c` puts a frame buffer and an xhci tablet on
+/// every zone unless VNC is turned off, and VNC is on by default. Both
+/// serve a graphical console. firehyve boots a kernel directly onto a
+/// serial console and has no frame buffer, so the slots stay empty.
+/// Refusing them would mean an unmodified brand can never start this
+/// binary.
+///
+/// This list is for the startup argv only. `hotplug_factory` refuses
+/// these names, because a hot-add that reports success and attaches
+/// nothing would be a lie.
+const IGNORED: &[&str] = &["fbuf", "xhci"];
 
 fn unsupported_driver(driver: &str) -> anyhow::Error {
     anyhow::anyhow!(
@@ -53,7 +70,7 @@ pub(crate) fn split_spec(spec: &str) -> anyhow::Result<(Bdf, &str, &str)> {
         anyhow::anyhow!("invalid BDF '{}' in spec '{}'", parts[0], spec)
     })?;
     let driver = parts[1];
-    if !SUPPORTED.contains(&driver) {
+    if !SUPPORTED.contains(&driver) && !IGNORED.contains(&driver) {
         return Err(unsupported_driver(driver));
     }
 
@@ -76,6 +93,15 @@ pub(crate) fn create_pci_device(
     control: &mut Vec<ControlSlot>,
 ) -> anyhow::Result<vmm_machine::CreatedPciDevice> {
     let (bdf, driver, config) = split_spec(spec)?;
+    if IGNORED.contains(&driver) {
+        warn!(ctx.log, "PCI device ignored";
+            "bdf" => %bdf,
+            "driver" => driver,
+            "reason" => "firehyve has no frame buffer; the guest console \
+                         is serial",
+        );
+        return Ok((None, None));
+    }
     let actx = attach::VirtioAttachCtx {
         physmap: ctx.physmap,
         bus_pio: ctx.bus_pio,
@@ -192,6 +218,14 @@ pub(crate) fn hotplug_factory(num_cpus: u32) -> vmm_machine::HotplugFactory {
         // later would hand the guest a socket that answers nothing, so
         // it is refused before anything is built.
         let (_, driver, _) = split_spec(spec)?;
+        // Accepted in the startup argv because the brand forces it
+        // there. Hot-add is firehyve's own interface, so a name that
+        // attaches nothing is refused instead of reported as added.
+        anyhow::ensure!(
+            !IGNORED.contains(&driver),
+            "firehyve cannot add '{driver}' at run time: it has no \
+             frame buffer"
+        );
         anyhow::ensure!(
             driver != "virtio-vsock",
             "virtio-vsock cannot be added at run time: its CONTROL slot \
@@ -236,9 +270,51 @@ mod tests {
         // The tolerant catch-all in rshyve yields a VM with a missing
         // disk; firehyve refuses to start instead.
         assert!(split_spec("4,virtio-blkk,/tmp/d.img").is_err());
-        assert!(split_spec("6,fbuf").is_err());
-        assert!(split_spec("7,xhci").is_err());
         assert!(split_spec("8,passthru,/dev/ppt0").is_err());
+        // A name that merely resembles one the brand forces is still a
+        // typo, not an ignored device.
+        assert!(split_spec("6,fbufx").is_err());
+        assert!(split_spec("7,xhc").is_err());
+    }
+
+    /// `boot.c` puts a frame buffer and an xhci tablet on every zone
+    /// that has VNC on, which is the default. firehyve has no frame
+    /// buffer, so refusing them means an unmodified brand can never
+    /// start it.
+    ///
+    /// Mutation this kills: dropping `fbuf` or `xhci` from IGNORED, or
+    /// folding them into SUPPORTED, which would claim a device that
+    /// does not exist.
+    #[test]
+    fn the_display_devices_the_brand_emits_are_accepted_and_skipped() {
+        for spec in ["30:0,fbuf,vga=off,unix=/tmp/vm.vnc", "30:1,xhci,tablet"] {
+            let (_, driver, _) =
+                split_spec(spec).unwrap_or_else(|e| panic!("{spec}: {e}"));
+            assert!(IGNORED.contains(&driver), "{driver} is not ignored");
+            assert!(
+                !SUPPORTED.contains(&driver),
+                "{driver} has no device, so it must not be advertised"
+            );
+        }
+    }
+
+    /// The startup relaxation must not reach hot-add. A hot-add that
+    /// reports success and attaches nothing would be a lie.
+    ///
+    /// Mutation this kills: removing the IGNORED guard from
+    /// hotplug_factory.
+    #[test]
+    fn a_display_device_is_still_refused_at_run_time() {
+        let src = include_str!("devices.rs");
+        let start = src
+            .find("pub(crate) fn hotplug_factory")
+            .expect("hotplug_factory");
+        let body = &src[start..];
+        let end = body.find("\n}").expect("end of function");
+        assert!(
+            body[..end].contains("IGNORED.contains"),
+            "hot-add does not refuse the ignored names"
+        );
     }
 
     #[test]
