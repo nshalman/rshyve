@@ -220,7 +220,8 @@ fn run(
     )?;
 
     // Phase 5: serial console, then the COM2 marker channel.
-    let _com1 = console::setup_console(&machine, &chipset_devs.pic, log)?;
+    let _com1 =
+        console::setup_console(&machine, &chipset_devs.pic, &cli.lpc, log)?;
     let _com2 = console::setup_com2(&machine, &chipset_devs.pic, log)?;
 
     // Phase 6: fw_cfg, ACPI, SMBIOS. No boot order, no TPM2 table.

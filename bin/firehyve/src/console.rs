@@ -8,59 +8,83 @@
 //! guest produces no output at all. COM2 carries out-of-band markers
 //! from the guest. PS/2 and the metadata agent stay rshyve-only.
 //!
-//! Both ports are served on the stdio this process inherits. The
-//! zone brand names a backend for each one, and firehyve accepts that
-//! name and ignores it. See `report_serial_backends`.
+//! COM1 goes to the backend the zone brand names when that backend is a
+//! device path, which is what makes `zlogin -C` a working console. COM2
+//! stays on this process's stdout, where the boot harness reads its
+//! markers. See [`com1_backend`] and [`report_serial_backends`].
 
-use std::io::{Read, Write};
 use std::sync::Arc;
 
-use slog::{info, warn};
+use slog::warn;
 
 use vmm_core::intr_pins::{IntrPin, LegacyPIC, NoOpPin};
 use vmm_core::machine::Machine;
-use vmm_devices::uart::lpc::{self, LpcUart, TxSink};
+use vmm_devices::uart::backend::{attach, SerialBackend};
+use vmm_devices::uart::lpc::{self, LpcUart};
 
-/// The LPC ports this binary serves, both on stdout.
+/// The LPC ports this binary serves.
 const SERVED_PORTS: [&str; 2] = ["com1", "com2"];
 
-/// Mirror one UART's transmit path to this process's stdout. Both
-/// ports share the destination, so a host reads console output and
-/// markers from one stream.
-fn stdout_sink(port: &'static str) -> TxSink {
-    Box::new(move |b: u8| {
-        let mut out = std::io::stdout();
-        if let Err(e) = out.write_all(&[b]) {
-            eprintln!("[firehyve] {port} stdout write error: {e}");
+/// Where COM1's bytes go.
+///
+/// Decided from the argv alone, so the choice is testable without a
+/// live VM and reportable before the VM exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Com1Backend {
+    /// The stdio this process inherited. zhyve points that at
+    /// `/dev/zfd/1`, which zoneadmd copies into the zone log.
+    Stdio,
+    /// A character device named by `-l com1,<path>`. In a bhyve zone
+    /// that is `/dev/zconsole`, the one channel `zlogin -C` reads.
+    Device(String),
+}
+
+/// Choose the COM1 backend from `-l com1,<backend>`.
+///
+/// An absolute path is served. Anything else falls back to the
+/// inherited stdio, because refusing an unknown backend would stop an
+/// unmodified zone brand from ever starting this binary. A relative
+/// path is not served: what it would resolve against is not the
+/// operator's working directory, so opening it would be a guess.
+pub(crate) fn com1_backend(lpc_args: &[String]) -> Com1Backend {
+    match vmm_machine::find_lpc_device(lpc_args, "com1") {
+        Some(backend)
+            if backend.starts_with('/') && !backend.contains('\0') =>
+        {
+            Com1Backend::Device(backend)
         }
-        let _ = out.flush();
-    })
+        _ => Com1Backend::Stdio,
+    }
 }
 
 /// Report each `-l com1,<backend>` / `-l com2,<backend>` this binary
 /// accepts but does not use.
 ///
-/// The bhyve zone brand puts a backend on every zone: `com1` comes
-/// from the zonecfg attr, which tritond-vmadm always sets to
-/// `/dev/zconsole`, and `com2` to `socket,/tmp/vm.ttyb`. firehyve
-/// serves both ports on the stdio it inherits from zhyve, so it cannot
-/// honour either name. Refusing them would mean an unmodified brand
-/// can never start this binary, so they are accepted and logged.
+/// The bhyve zone brand puts a backend on every zone: `com1` comes from
+/// the zonecfg attr, which tritond-vmadm always sets to
+/// `/dev/zconsole`, and `com2` to `socket,/tmp/vm.ttyb`. COM1 honours a
+/// device path, so only a backend firehyve cannot serve is reported
+/// here. Refusing one would mean an unmodified brand can never start
+/// this binary.
 ///
-/// The log line is the point. zhyve points stdout at `/dev/zfd/1`,
-/// which zoneadmd copies into the zone log, NOT at the `/dev/zconsole`
-/// the brand asked for. So `zlogin -C` stays dark and the operator has
-/// to be told where the bytes went.
+/// The log line is the point. A port that falls back to stdio writes to
+/// `/dev/zfd/1`, which zoneadmd copies into the zone log, NOT to the
+/// `/dev/zconsole` the brand asked for. So `zlogin -C` stays dark for
+/// that port and the operator has to be told where the bytes went.
 ///
 /// Kept apart from the attach functions so the decision is testable
 /// without a live VM, and so `validate_cli` can reach it before the VM
 /// exists.
 pub(crate) fn report_serial_backends(lpc_args: &[String], log: &slog::Logger) {
+    let com1 = com1_backend(lpc_args);
     for port in SERVED_PORTS {
         let Some(backend) = vmm_machine::find_lpc_device(lpc_args, port) else {
             continue;
         };
         if backend == "stdio" {
+            continue;
+        }
+        if port == "com1" && com1 == Com1Backend::Device(backend.clone()) {
             continue;
         }
         warn!(log, "serial backend ignored";
@@ -73,42 +97,46 @@ pub(crate) fn report_serial_backends(lpc_args: &[String], log: &slog::Logger) {
     }
 }
 
-/// Attach COM1 and connect it to this process's stdio.
-pub(crate) fn setup_console(
+/// Attach one LPC UART at `base` with `irq`, with no backend yet.
+fn new_port(
     machine: &Machine,
     pic: &Arc<LegacyPIC>,
-    log: &slog::Logger,
-) -> anyhow::Result<Arc<LpcUart>> {
-    let pin: Arc<dyn IntrPin> = match pic.pin_handle(lpc::COM1_IRQ) {
+    base: u16,
+    irq: u8,
+) -> Arc<LpcUart> {
+    let pin: Arc<dyn IntrPin> = match pic.pin_handle(irq) {
         Some(p) => p,
         None => Arc::new(NoOpPin),
     };
     let uart = LpcUart::new(pin);
-    uart.attach(machine.bus_pio(), lpc::COM1_BASE);
+    uart.attach(machine.bus_pio(), base);
+    uart
+}
 
-    uart.set_tx_sink(stdout_sink("com1"));
-
-    let rx = Arc::clone(&uart);
-    std::thread::Builder::new()
-        .name("com1-input".into())
-        .spawn(move || {
-            let stdin = std::io::stdin();
-            let mut buf = [0u8; 1];
-            loop {
-                match stdin.lock().read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        rx.input_byte(buf[0]);
-                    }
-                }
-            }
-        })
-        .map_err(|e| {
-            anyhow::anyhow!("failed to spawn com1 input thread: {e}")
-        })?;
-
-    info!(log, "COM1 attached to stdio";
-        "port" => format!("{:#x}", lpc::COM1_BASE));
+/// Attach COM1 and connect it to the backend the argv named.
+///
+/// A device that cannot be opened falls back to stdio rather than
+/// failing the boot: a guest that runs with its output in the zone log
+/// is worth more than no guest at all, and the warning says which one
+/// happened.
+pub(crate) fn setup_console(
+    machine: &Machine,
+    pic: &Arc<LegacyPIC>,
+    lpc_args: &[String],
+    log: &slog::Logger,
+) -> anyhow::Result<Arc<LpcUart>> {
+    let uart = new_port(machine, pic, lpc::COM1_BASE, lpc::COM1_IRQ);
+    if let Com1Backend::Device(path) = com1_backend(lpc_args) {
+        match attach(&uart, SerialBackend::Device(&path), "com1", log) {
+            Ok(()) => return Ok(uart),
+            Err(e) => warn!(log, "serial device unusable, falling back";
+                "port" => "com1",
+                "requested" => &path,
+                "error" => %e,
+            ),
+        }
+    }
+    attach(&uart, SerialBackend::Stdio, "com1", log)?;
     Ok(uart)
 }
 
@@ -127,16 +155,8 @@ pub(crate) fn setup_com2(
     pic: &Arc<LegacyPIC>,
     log: &slog::Logger,
 ) -> anyhow::Result<Arc<LpcUart>> {
-    let pin: Arc<dyn IntrPin> = match pic.pin_handle(lpc::COM2_IRQ) {
-        Some(p) => p,
-        None => Arc::new(NoOpPin),
-    };
-    let uart = LpcUart::new(pin);
-    uart.attach(machine.bus_pio(), lpc::COM2_BASE);
-    uart.set_tx_sink(stdout_sink("com2"));
-
-    info!(log, "COM2 attached to stdio";
-        "port" => format!("{:#x}", lpc::COM2_BASE));
+    let uart = new_port(machine, pic, lpc::COM2_BASE, lpc::COM2_IRQ);
+    attach(&uart, SerialBackend::StdoutOnly, "com2", log)?;
     Ok(uart)
 }
 
@@ -210,28 +230,74 @@ mod tests {
     }
 
     /// tritond-vmadm sets the `com1` zonecfg attr to `/dev/zconsole` on
-    /// every bhyve zone, so refusing it means an unmodified brand can
-    /// never start firehyve. It is accepted, but it must not be
-    /// accepted quietly: the bytes go to the zone log, not to the
-    /// zone console, and only this line tells the operator that.
+    /// every bhyve zone, and that path is the only channel `zlogin -C`
+    /// reads. It is served, so it must not be reported as ignored.
     ///
-    /// Mutation this kills: deleting the warn! and keeping the loop, or
-    /// dropping the "requested" pair so the line does not say what was
-    /// ignored.
+    /// Mutation this kills: keeping the old behaviour, where every
+    /// non-stdio com1 backend was accepted and dropped.
     #[test]
-    fn the_com1_backend_the_brand_emits_is_accepted_and_logged() {
+    fn the_com1_device_the_brand_emits_is_served_not_ignored() {
+        assert_eq!(
+            com1_backend(&lpc(&["com1,/dev/zconsole"])),
+            Com1Backend::Device("/dev/zconsole".to_string()),
+        );
+
         let rec = Recorder::default();
         report_serial_backends(&lpc(&["com1,/dev/zconsole"]), &rec.logger());
-
-        let lines = rec.lines();
-        assert_eq!(lines.len(), 1, "expected one line, got {lines:?}");
-        let line = &lines[0];
-        assert!(line.starts_with("WARN"), "must be a warning: {line}");
-        assert!(line.contains("/dev/zconsole"), "names no backend: {line}");
-        assert!(line.contains("com1"), "names no port: {line}");
+        assert!(rec.lines().is_empty(), "reported: {:?}", rec.lines());
     }
 
-    /// `-l com2,socket,/tmp/vm.ttyb` is on every bhyve zone too, and
+    /// firehyve has no Unix-socket serial backend, so a com1 socket
+    /// falls back to stdio and has to say so.
+    ///
+    /// Mutation this kills: treating any backend string as a device
+    /// path, which would make firehyve open a file called
+    /// `socket,/tmp/vm.ttya`.
+    #[test]
+    fn a_com1_socket_backend_falls_back_to_stdio_and_is_logged() {
+        assert_eq!(
+            com1_backend(&lpc(&["com1,socket,/tmp/vm.ttya"])),
+            Com1Backend::Stdio,
+        );
+
+        let rec = Recorder::default();
+        report_serial_backends(
+            &lpc(&["com1,socket,/tmp/vm.ttya"]),
+            &rec.logger(),
+        );
+        let lines = rec.lines();
+        assert_eq!(lines.len(), 1, "expected one line, got {lines:?}");
+        assert!(lines[0].starts_with("WARN"), "must warn: {}", lines[0]);
+        assert!(
+            lines[0].contains("/tmp/vm.ttya"),
+            "names no backend: {}",
+            lines[0]
+        );
+    }
+
+    /// What a relative path resolves against is not the operator's
+    /// working directory, so serving one would open a guessed file.
+    ///
+    /// Mutation this kills: dropping the leading-slash test.
+    #[test]
+    fn a_relative_com1_backend_is_not_opened() {
+        assert_eq!(com1_backend(&lpc(&["com1,zconsole"])), Com1Backend::Stdio);
+    }
+
+    /// A NUL truncates at the C boundary, so the file opened would not
+    /// be the file named.
+    ///
+    /// Mutation this kills: dropping the NUL test and leaving the
+    /// refusal to the open call.
+    #[test]
+    fn a_com1_backend_with_an_embedded_nul_is_not_opened() {
+        assert_eq!(
+            com1_backend(&lpc(&["com1,/dev/zconsole\0/x"])),
+            Com1Backend::Stdio,
+        );
+    }
+
+    /// `-l com2,socket,/tmp/vm.ttyb` is on every bhyve zone, and
     /// firehyve has no COM2 agent to serve it.
     ///
     /// Mutation this kills: reporting com1 only.
@@ -254,14 +320,17 @@ mod tests {
     }
 
     /// Both ports at once, which is what the brand actually builds.
+    /// COM1 is served on the device, so only COM2 is reported.
     #[test]
-    fn both_brand_serial_backends_are_reported_one_line_each() {
+    fn only_the_unserved_brand_backend_is_reported() {
         let rec = Recorder::default();
         report_serial_backends(
             &lpc(&["com1,/dev/zconsole", "com2,socket,/tmp/vm.ttyb"]),
             &rec.logger(),
         );
-        assert_eq!(rec.lines().len(), 2, "got {:?}", rec.lines());
+        let lines = rec.lines();
+        assert_eq!(lines.len(), 1, "got {lines:?}");
+        assert!(lines[0].contains("com2"), "wrong port: {}", lines[0]);
     }
 
     /// Mutation this kills: matching on any `-l` entry instead of the
