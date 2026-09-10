@@ -22,6 +22,7 @@ use vmm_core::machine::{Machine, MachineSetup};
 use vmm_core::msr::MsrHandler;
 use vmm_devices::acpi;
 use vmm_devices::chipset::i440fx::I440FxChipset;
+use vmm_devices::uart::backend::SerialBackend;
 use vmm_devices::uart::lpc::{self, LpcUart};
 use vmm_devices::InputBroker;
 use vmm_machine::{
@@ -1506,14 +1507,15 @@ fn parse_and_create_pci_device(
 /// - `stdio` or absent → stdout/stdin
 /// - `socket,/path` → Unix domain socket (host metadata agent connects)
 /// - `/dev/zconsole` or any path → open as read/write device
+///
+/// The last two forms of backend live in `vmm_devices::uart::backend`,
+/// so this binary and firehyve serve a zone console the same way.
 fn setup_serial_io(
     uart: &Arc<LpcUart>,
     config: Option<&str>,
     name: &str,
     log: &Logger,
 ) -> anyhow::Result<()> {
-    use std::io::{Read, Write};
-
     // Handle "socket,/path" — create a Unix domain socket listener
     // that the host-side metadata agent connects to.
     if let Some(path) = config.and_then(|c| c.strip_prefix("socket,")) {
@@ -1521,162 +1523,17 @@ fn setup_serial_io(
         return Ok(());
     }
 
-    match config {
-        None | Some("stdio") => {
-            // stdout for TX, stdin for RX
-            uart.set_tx_sink(Box::new(|b: u8| {
-                if let Err(e) = std::io::stdout().write_all(&[b]) {
-                    eprintln!("[serial] stdout write error: {}", e);
-                }
-                let _ = std::io::stdout().flush();
-            }));
-
-            let uart_input = uart.clone();
-            thread::Builder::new()
-                .name(format!("{name}-input"))
-                .spawn(move || {
-                    let stdin = std::io::stdin();
-                    let mut buf = [0u8; 1];
-                    loop {
-                        match stdin.lock().read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                uart_input.input_byte(buf[0]);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                })
-                .expect("failed to spawn serial input thread");
-            info!(log, "{name} connected to stdio");
-        }
-        Some(path) => {
-            // Open using libc::open() like C-bhyve to ensure proper
-            // pty initialization on illumos. Rust's File::open may
-            // not trigger the same STREAMS module setup.
-            let c_path = std::ffi::CString::new(path).unwrap();
-            let fd = unsafe {
-                libc::open(
-                    c_path.as_ptr(),
-                    libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                )
-            };
-            if fd >= 0 {
-                {
-                    // Match C-bhyve: cfmakeraw + CLOCAL, blocking mode.
-                    // C-bhyve opens with O_NONBLOCK but then leaves it
-                    // in blocking mode (the O_NONBLOCK is only for the
-                    // open() call to avoid carrier wait). Blocking writes
-                    // to zconsole work because zoneadmd holds the master
-                    // side open, preventing buffer-full stalls.
-                    #[cfg(target_os = "illumos")]
-                    unsafe {
-                        let mut termios: libc::termios = std::mem::zeroed();
-                        if libc::tcgetattr(fd, &mut termios) == 0 {
-                            libc::cfmakeraw(&mut termios);
-                            termios.c_cflag |= libc::CLOCAL;
-                            libc::tcsetattr(fd, libc::TCSANOW, &termios);
-                        }
-                        // Keep O_NONBLOCK set. On illumos, open() with
-                        // O_NONBLOCK is transient, but we explicitly set
-                        // it for writes: zconsole writes must not block
-                        // the vCPU when no console client is connected
-                        // (pty buffer full). The read path uses poll()
-                        // so EAGAIN is handled correctly.
-                        libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-                    }
-
-                    let is_tty = unsafe { libc::isatty(fd) } != 0;
-                    eprintln!(
-                        "[serial] fd={} isatty={} path={}",
-                        fd, is_tty, path
-                    );
-
-                    // TX: dup the fd for writes
-                    // Guest-reset re-exec must not inherit backend fds.
-                    let write_fd =
-                        unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-                    // TX: write directly from vCPU using non-blocking write.
-                    let tx_err_count = std::sync::atomic::AtomicU32::new(0);
-                    uart.set_tx_sink(Box::new(move |b: u8| {
-                        let ret = unsafe {
-                            libc::write(
-                                write_fd,
-                                &b as *const u8 as *const _,
-                                1,
-                            )
-                        };
-                        if ret < 0 {
-                            let n = tx_err_count.fetch_add(
-                                1,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            if n < 3 {
-                                let err = std::io::Error::last_os_error();
-                                eprintln!(
-                                    "[serial-tx] write error: {} (fd={})",
-                                    err, write_fd
-                                );
-                            }
-                        }
-                    }));
-
-                    // RX: dup the fd for reading. We use poll() with a
-                    // blocking fd — do NOT set O_NONBLOCK because dup'd
-                    // fds share the file status flags and nonblock would
-                    // affect the write path too (causing dropped console data).
-                    let uart_input = uart.clone();
-                    // Guest-reset re-exec must not inherit backend fds.
-                    let read_fd_dup =
-                        unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-                    thread::Builder::new()
-                        .name(format!("{name}-input"))
-                        .spawn(move || {
-                            let mut buf = [0u8; 64];
-                            loop {
-                                // Poll for readable data
-                                let mut pfd = libc::pollfd {
-                                    fd: read_fd_dup,
-                                    events: libc::POLLIN,
-                                    revents: 0,
-                                };
-                                let ret = unsafe { libc::poll(&mut pfd, 1, 1000) };
-                                if ret < 0 {
-                                    let err = std::io::Error::last_os_error();
-                                    if err.kind() == std::io::ErrorKind::Interrupted { continue; }
-                                    break;
-                                }
-                                if ret == 0 { continue; } // timeout
-                                if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 { break; }
-                                if pfd.revents & libc::POLLIN != 0 {
-                                    let n = unsafe {
-                                        libc::read(read_fd_dup, buf.as_mut_ptr() as *mut _, buf.len())
-                                    };
-                                    if n <= 0 {
-                                        if n < 0 {
-                                            let err = std::io::Error::last_os_error();
-                                            if err.kind() == std::io::ErrorKind::WouldBlock { continue; }
-                                        }
-                                        break;
-                                    }
-                                    for byte in buf.iter().take(n as usize) {
-                                        uart_input.input_byte(*byte);
-                                    }
-                                }
-                            }
-                        })
-                        .expect("failed to spawn serial input thread");
-                    info!(log, "{name} connected to {path}");
-                }
-            } else {
-                warn!(log, "failed to open {name} device";
-                    "path" => path,
-                    "error" => std::io::Error::last_os_error(),
-                );
-            }
-        }
+    let backend = match config {
+        None | Some("stdio") => SerialBackend::Stdio,
+        Some(path) => SerialBackend::Device(path),
+    };
+    // A console that cannot be opened is not worth failing a boot for:
+    // the guest still runs, and the warning names the path.
+    if let Err(e) = vmm_devices::uart::backend::attach(uart, backend, name, log)
+    {
+        warn!(log, "serial backend unusable"; "port" => name,
+            "error" => %e);
     }
-
     Ok(())
 }
 
