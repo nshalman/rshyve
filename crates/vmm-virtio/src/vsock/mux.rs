@@ -59,11 +59,6 @@ impl RxPacket {
             payload: Vec::new(),
         }
     }
-
-    /// Total wire size: header plus payload.
-    pub fn wire_len(&self) -> usize {
-        super::packet::HDR_SIZE + self.payload.len()
-    }
 }
 
 /// What the device should do with a packet the guest sent.

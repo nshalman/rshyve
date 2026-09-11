@@ -181,13 +181,6 @@ impl VirtioPciState {
             self.status
         }
     }
-
-    /// Returns true if the guest negotiated VERSION_1 (modern transport).
-    // Retained for the pending transport-mode validation path.
-    #[allow(dead_code)]
-    fn is_modern(&self) -> bool {
-        self.guest_features & bits::VIRTIO_F_VERSION_1 != 0
-    }
 }
 
 /// One-shot park points a test installs to hold a thread at a named

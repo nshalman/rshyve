@@ -22,56 +22,44 @@ use vmm_core::hdl::VmmHdl;
 ///
 /// The kernel handles PIO at ports 0x20-0x21 (master) and 0xA0-0xA1
 /// (slave) directly. No userspace configuration needed.
-pub struct BhyveAtPic {
-    #[allow(dead_code)]
-    hdl: Arc<VmmHdl>,
-}
+pub struct BhyveAtPic;
 
 impl BhyveAtPic {
-    pub fn create(hdl: Arc<VmmHdl>) -> Arc<Self> {
-        Arc::new(Self { hdl })
+    pub fn create() -> Arc<Self> {
+        Arc::new(Self)
     }
 }
 
 /// Bhyve kernel-emulated AT PIT (Intel 8254).
 ///
 /// The kernel handles PIO at ports 0x40-0x43 directly.
-pub struct BhyveAtPit {
-    #[allow(dead_code)]
-    hdl: Arc<VmmHdl>,
-}
+pub struct BhyveAtPit;
 
 impl BhyveAtPit {
-    pub fn create(hdl: Arc<VmmHdl>) -> Arc<Self> {
-        Arc::new(Self { hdl })
+    pub fn create() -> Arc<Self> {
+        Arc::new(Self)
     }
 }
 
 /// Bhyve kernel-emulated HPET (High Precision Event Timer).
 ///
 /// The kernel handles MMIO at 0xFED00000 directly.
-pub struct BhyveHpet {
-    #[allow(dead_code)]
-    hdl: Arc<VmmHdl>,
-}
+pub struct BhyveHpet;
 
 impl BhyveHpet {
-    pub fn create(hdl: Arc<VmmHdl>) -> Arc<Self> {
-        Arc::new(Self { hdl })
+    pub fn create() -> Arc<Self> {
+        Arc::new(Self)
     }
 }
 
 /// Bhyve kernel-emulated I/O APIC.
 ///
 /// The kernel handles MMIO at 0xFEC00000 directly.
-pub struct BhyveIoApic {
-    #[allow(dead_code)]
-    hdl: Arc<VmmHdl>,
-}
+pub struct BhyveIoApic;
 
 impl BhyveIoApic {
-    pub fn create(hdl: Arc<VmmHdl>) -> Arc<Self> {
-        Arc::new(Self { hdl })
+    pub fn create() -> Arc<Self> {
+        Arc::new(Self)
     }
 }
 

@@ -47,10 +47,10 @@ pub fn init_chipset(
     info!(log, "chipset initialized"; "type" => "i440fx");
 
     // These are emulated in-kernel; we just hold references for lifecycle.
-    let atpic = BhyveAtPic::create(machine.hdl().clone());
-    let atpit = BhyveAtPit::create(machine.hdl().clone());
-    let hpet = BhyveHpet::create(machine.hdl().clone());
-    let ioapic = BhyveIoApic::create(machine.hdl().clone());
+    let atpic = BhyveAtPic::create();
+    let atpit = BhyveAtPit::create();
+    let hpet = BhyveHpet::create();
+    let ioapic = BhyveIoApic::create();
     let rtc = BhyveRtc::create(machine.hdl().clone());
 
     // UEFI reads the memory size back out of RTC NVRAM.

@@ -364,22 +364,6 @@ pub struct AcpiLayout {
 ///
 /// Checksums are set to 0 in fields that will be recomputed by the
 /// firmware via ADD_CHECKSUM commands.
-/// Generate ACPI layout with optional DSDT override.
-///
-/// If `dsdt_override` is Some, uses the provided pre-compiled AML
-/// bytecode instead of generating a DSDT from the AML builder.
-/// This is useful for testing with iasl-compiled DSDT files.
-pub fn generate_acpi_layout_with_dsdt(
-    num_cpus: u32,
-    dsdt_override: Option<Vec<u8>>,
-) -> AcpiLayout {
-    generate_acpi_layout_inner(
-        &AcpiConfig::boot_only(num_cpus),
-        dsdt_override,
-        None,
-    )
-}
-
 pub fn generate_acpi_layout(num_cpus: u32) -> AcpiLayout {
     generate_acpi_layout_inner(&AcpiConfig::boot_only(num_cpus), None, None)
 }

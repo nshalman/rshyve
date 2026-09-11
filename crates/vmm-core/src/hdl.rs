@@ -11,7 +11,6 @@
 
 use std::io::{Error, ErrorKind, Result};
 use std::os::fd::AsRawFd;
-use std::sync::Arc;
 use std::time::Duration;
 
 use bhyve_api::{
@@ -208,14 +207,6 @@ impl VmmHdl {
         self.inner.rtc_settime(time)
     }
 
-    /// Read a byte from the virtual RTC at the given offset.
-    pub fn rtc_read(&self, offset: i32) -> Result<u8> {
-        let mut data = vm_rtc_data { offset, value: 0 };
-        // Safety: vm_rtc_data is the correct struct for VM_RTC_READ.
-        unsafe { self.inner.ioctl(ioctls::VM_RTC_READ, &mut data) }?;
-        Ok(data.value)
-    }
-
     /// Write a byte to the virtual RTC at the given offset.
     pub fn rtc_write(&self, offset: i32, value: u8) -> Result<()> {
         let mut data = vm_rtc_data { offset, value };
@@ -314,17 +305,6 @@ impl VmmHdl {
     pub fn lapic_irq(&self, cpuid: i32, vector: i32) -> Result<()> {
         let mut irq = bhyve_api::vm_lapic_irq { cpuid, vector };
         unsafe { self.inner.ioctl(ioctls::VM_LAPIC_IRQ, &mut irq) }?;
-        Ok(())
-    }
-
-    /// Inject a Non-Maskable Interrupt into a vCPU.
-    ///
-    /// NMIs unconditionally wake a HLTed vCPU. Used after migration
-    /// to kick the guest out of HLT when the LAPIC timer isn't
-    /// automatically re-armed.
-    pub fn inject_nmi(&self, cpuid: i32) -> Result<()> {
-        let mut nmi = bhyve_api::vm_nmi { cpuid };
-        unsafe { self.inner.ioctl(ioctls::VM_INJECT_NMI, &mut nmi) }?;
         Ok(())
     }
 
@@ -532,9 +512,6 @@ impl AsRawFd for VmmHdl {
         self.inner.as_raw_fd()
     }
 }
-
-/// Shared reference to a VmmHdl.
-pub type VmmHdlRef = Arc<VmmHdl>;
 
 // VmmHdl intentionally does NOT expose a generic ioctl method.
 // All operations must go through typed methods above.

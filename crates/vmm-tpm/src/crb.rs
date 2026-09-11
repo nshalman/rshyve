@@ -26,7 +26,7 @@
 use std::ptr;
 use std::sync::Mutex;
 
-use slog::{debug, info, warn, Logger};
+use slog::{debug, warn, Logger};
 use vmm_core::common::{RWOp, ReadOp, WriteOp};
 use vmm_tpm_sys::{tpmlib_free, TPMLIB_Process, TPM_RESULT, TPM_SUCCESS};
 
@@ -393,14 +393,6 @@ impl Crb {
         // Clear START — guest polls this to detect completion.
         state.ctrl_start &= !CTRL_START_INVOKE;
     }
-}
-
-#[allow(dead_code)]
-fn _info(log: &Logger) {
-    info!(
-        log,
-        "CRB region @ {:#x}, len {:#x}", CRB_BASE, CRB_REGION_LEN
-    );
 }
 
 #[cfg(test)]

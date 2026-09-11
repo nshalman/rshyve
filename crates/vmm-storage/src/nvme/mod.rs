@@ -1425,24 +1425,6 @@ fn write_to_prp(
     Ok(())
 }
 
-/// Read data from guest memory using PRP entries.
-// Retained for the pending non-worker admin data-in path.
-#[allow(dead_code)]
-fn read_from_prp(
-    mem: &MemCtx,
-    prp1: u64,
-    prp2: u64,
-    buf: &mut [u8],
-) -> io::Result<()> {
-    let segments = prp_collect(mem, prp1, prp2, buf.len())?;
-    let mut offset = 0;
-    for (gpa, len) in segments {
-        mem.read(gpa, &mut buf[offset..offset + len])?;
-        offset += len;
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // I/O worker thread
 // ---------------------------------------------------------------------------

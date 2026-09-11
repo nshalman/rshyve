@@ -33,7 +33,6 @@ pub mod block;
 pub mod chain_io;
 pub mod console;
 pub mod fs;
-pub mod packed_queue;
 pub mod pci;
 pub mod queue;
 pub mod rng;

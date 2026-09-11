@@ -31,8 +31,6 @@ const AML_DEVICE_OP: u8 = 0x82; // follows EXT_PREFIX
 const AML_PACKAGE_OP: u8 = 0x12;
 const AML_RETURN_OP: u8 = 0xA4;
 const AML_STORE_OP: u8 = 0x70;
-const AML_IF_OP: u8 = 0xA0;
-const AML_LEQUAL_OP: u8 = 0x93;
 const AML_ARG0: u8 = 0x68;
 const AML_ZERO_OP: u8 = 0x00;
 const AML_ONE_OP: u8 = 0x01;
@@ -575,49 +573,6 @@ impl Aml {
         self.buf.extend_from_slice(&Self::encode_name_string(name));
     }
 
-    /// Emit If(LEqual(name, val)) { body }.
-    pub fn if_equal(
-        &mut self,
-        name: &str,
-        val: u64,
-        body: impl FnOnce(&mut Aml),
-    ) {
-        let mut inner = Aml::new();
-        body(&mut inner);
-        let inner_bytes = inner.into_bytes();
-
-        // Predicate: LEqual(name, val)
-        let name_bytes = Self::encode_name_string(name);
-        let val_aml = if val == 0 {
-            AmlValue::Zero
-        } else if val == 1 {
-            AmlValue::One
-        } else if val <= 0xFF {
-            AmlValue::Byte(val as u8)
-        } else if val <= 0xFFFF {
-            AmlValue::Word(val as u16)
-        } else if val <= 0xFFFF_FFFF {
-            AmlValue::DWord(val as u32)
-        } else {
-            AmlValue::QWord(val)
-        };
-        let val_bytes = Self::encode_value(&val_aml);
-
-        // predicate = LEqual op + name + val
-        let pred_len = 1 + name_bytes.len() + val_bytes.len();
-        let content_len = pred_len + inner_bytes.len();
-        let pkg_len_size = Self::pkg_length_size(content_len);
-        let total_pkg_len = pkg_len_size + content_len;
-
-        self.buf.push(AML_IF_OP);
-        self.buf
-            .extend_from_slice(&Self::encode_pkg_length(total_pkg_len));
-        self.buf.push(AML_LEQUAL_OP);
-        self.buf.extend_from_slice(&name_bytes);
-        self.buf.extend_from_slice(&val_bytes);
-        self.buf.extend_from_slice(&inner_bytes);
-    }
-
     // ── EISA ID helper ──────────────────────────────────────────
 
     /// Convert an EISA ID string (e.g., "PNP0A03") to a packed u32.
@@ -685,6 +640,8 @@ impl acpi_tables::AmlSink for Aml {
 // emit yet. ACPI 6.5, section 20.3.
 #[cfg(test)]
 mod opcode {
+    pub const IF: u8 = 0xA0;
+    pub const LEQUAL: u8 = 0x93;
     pub const ONES: u8 = 0xFF;
     pub const LOCAL0: u8 = 0x60;
     pub const ARG6: u8 = 0x6E;
@@ -1142,7 +1099,7 @@ impl AmlWalker<'_> {
                 self.target(end)?;
                 self.target(end)
             }
-            AML_LEQUAL_OP
+            opcode::LEQUAL
             | opcode::LAND
             | opcode::LOR
             | opcode::LGREATER
@@ -1312,7 +1269,7 @@ impl AmlWalker<'_> {
         let mut previous_was_if = false;
         while self.pos < end {
             let opcode = self.peek(end)?;
-            let is_if = opcode == AML_IF_OP;
+            let is_if = opcode == opcode::IF;
             match opcode {
                 AML_SCOPE_OP => {
                     self.pos += 1;
@@ -1327,7 +1284,7 @@ impl AmlWalker<'_> {
                     self.name_string(end)?;
                     self.data_object(end)?;
                 }
-                AML_IF_OP | opcode::WHILE => {
+                opcode::IF | opcode::WHILE => {
                     self.pos += 1;
                     let package_end = self.package_end(end)?;
                     self.term_arg(package_end)?;
@@ -1792,18 +1749,6 @@ mod tests {
         assert_eq!(bytes[0], AML_STORE_OP);
         assert_eq!(bytes[1], AML_ARG0);
         assert_eq!(&bytes[2..6], b"PICM");
-    }
-
-    #[test]
-    fn if_equal_construct() {
-        let mut aml = Aml::new();
-        aml.if_equal("PICM", 0, |body| {
-            body.return_name("APRT");
-        });
-        let bytes = aml.into_bytes();
-        assert_eq!(bytes[0], AML_IF_OP);
-        // Should contain LEqual op somewhere inside
-        assert!(bytes.contains(&AML_LEQUAL_OP));
     }
 
     #[test]

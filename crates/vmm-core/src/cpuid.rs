@@ -80,7 +80,6 @@ fn entry(
 ///
 /// Reads host CPUID values and masks out features above the baseline.
 /// Returns a sorted Vec of entries suitable for `VmmHdl::set_cpuid`.
-#[allow(unused_mut, unused_assignments)]
 pub fn build_cpuid_entries(baseline: CpuBaseline) -> Vec<vcpu_cpuid_entry> {
     if baseline == CpuBaseline::Host {
         return Vec::new();
@@ -206,7 +205,7 @@ pub fn build_cpuid_entries(baseline: CpuBaseline) -> Vec<vcpu_cpuid_entry> {
 
     // Leaf 0xD: XSAVE state — must match masked features
     if max_leaf >= 0xD {
-        let (mut eax_d0, mut ebx_d0, mut ecx_d0, edx_d0) = host_cpuid(0xD, 0);
+        let (mut eax_d0, _, _, edx_d0) = host_cpuid(0xD, 0);
 
         match baseline {
             CpuBaseline::Avx2 => {
@@ -226,8 +225,8 @@ pub fn build_cpuid_entries(baseline: CpuBaseline) -> Vec<vcpu_cpuid_entry> {
         if eax_d0 & (1 << 2) != 0 {
             xsave_size = 832; // + AVX YMM hi128
         }
-        ebx_d0 = xsave_size;
-        ecx_d0 = xsave_size;
+        let ebx_d0 = xsave_size;
+        let ecx_d0 = xsave_size;
 
         entries.push(entry(
             0xD,
@@ -384,34 +383,6 @@ impl CpuidTable {
         let mut entries = self.entries.clone();
         hdl.set_cpuid(vcpuid, &mut entries, self.flags)
     }
-}
-
-/// Apply a CPUID baseline to all vCPUs of a VM.
-///
-/// If baseline is `Host`, this is a no-op (kernel uses native CPUID).
-pub fn apply_cpuid_baseline(
-    hdl: &VmmHdl,
-    num_cpus: u32,
-    baseline: CpuBaseline,
-    log: &slog::Logger,
-) -> std::io::Result<()> {
-    apply_cpuid(hdl, num_cpus, baseline, &[], log)
-}
-
-/// Apply a CPUID baseline plus a list of additional vendor-defined
-/// entries (e.g. Hyper-V leaves 0x4000_0000+) to every vCPU.
-///
-/// `extra` may be empty. Returns the table that was programmed, so the
-/// caller can replay it on a vCPU added later. `None` means nothing
-/// was programmed.
-pub fn apply_cpuid(
-    hdl: &VmmHdl,
-    num_cpus: u32,
-    baseline: CpuBaseline,
-    extra: &[vcpu_cpuid_entry],
-    log: &slog::Logger,
-) -> std::io::Result<()> {
-    apply_cpuid_table(hdl, num_cpus, baseline, extra, log).map(|_| ())
 }
 
 /// The same pass, handing back the table it programmed.

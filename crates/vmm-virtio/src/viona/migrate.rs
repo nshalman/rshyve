@@ -165,16 +165,6 @@ impl VirtioViona {
             }
         }
     }
-
-    /// Kick all ready queues after migration to wake kernel processing.
-    pub fn kick_all_queues(&self) {
-        let inner = self.inner.lock().expect("viona lock");
-        for idx in 0..NET_NUM_QUEUES as u16 {
-            if inner.ring_state[idx as usize] == RingState::Ready {
-                Self::ring_kick(&inner, idx);
-            }
-        }
-    }
 }
 
 /// Whether a migration payload's indices can have come from a running

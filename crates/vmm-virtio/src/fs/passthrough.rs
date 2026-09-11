@@ -37,8 +37,6 @@
 //! * Directory contents are snapshotted at `OPENDIR` time — one consistent
 //!   view for the life of the handle.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::fd::RawFd;
@@ -178,14 +176,8 @@ impl InodeTable {
 
 #[derive(Debug)]
 enum Handle {
-    File {
-        fd: RawFd,
-        nodeid: u64,
-    },
-    Dir {
-        nodeid: u64,
-        entries: Vec<DirSnapshot>,
-    },
+    File { fd: RawFd },
+    Dir { entries: Vec<DirSnapshot> },
 }
 
 #[derive(Debug, Clone)]
@@ -223,7 +215,6 @@ impl HandleTable {
 // ---------------------------------------------------------------------------
 
 pub struct Passthrough {
-    root_fd: RawFd,
     read_only: bool,
     inodes: Mutex<InodeTable>,
     handles: Mutex<HandleTable>,
@@ -262,7 +253,6 @@ impl Passthrough {
         inodes.by_id.insert(fuse::FUSE_ROOT_ID, root);
 
         Ok(Self {
-            root_fd: fd,
             read_only,
             inodes: Mutex::new(inodes),
             handles: Mutex::new(HandleTable::new()),
@@ -504,9 +494,7 @@ impl Passthrough {
 
         let mut handles = self.handles.lock().unwrap();
         let id = handles.alloc_id();
-        handles
-            .by_id
-            .insert(id, Handle::File { fd: new_fd, nodeid });
+        handles.by_id.insert(id, Handle::File { fd: new_fd });
         Ok(id)
     }
 
@@ -612,7 +600,7 @@ impl Passthrough {
         let fh = {
             let mut handles = self.handles.lock().unwrap();
             let id = handles.alloc_id();
-            handles.by_id.insert(id, Handle::File { fd: fh_fd, nodeid });
+            handles.by_id.insert(id, Handle::File { fd: fh_fd });
             id
         };
 
@@ -1093,7 +1081,7 @@ impl Passthrough {
 
         let mut handles = self.handles.lock().unwrap();
         let id = handles.alloc_id();
-        handles.by_id.insert(id, Handle::Dir { nodeid, entries });
+        handles.by_id.insert(id, Handle::Dir { entries });
         Ok(id)
     }
 

@@ -171,10 +171,6 @@ impl VsockConn {
         };
     }
 
-    pub fn force_close(&mut self) {
-        self.state = State::Closed;
-    }
-
     /// Whether the guest may still send payload to the host.
     pub fn accepts_guest_data(&self) -> bool {
         matches!(self.state, State::Established | State::LocalSendClosed)

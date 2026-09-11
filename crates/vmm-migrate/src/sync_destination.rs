@@ -240,10 +240,6 @@ fn report_failure<S: Read + Write>(
 
 #[derive(PartialEq)]
 enum PassResult {
-    // Retained for the pending migration-engine restructuring; removing a
-    // protocol state here would prejudge that work.
-    #[allow(dead_code)]
-    MorePasses,
     PauseSignal,
 }
 

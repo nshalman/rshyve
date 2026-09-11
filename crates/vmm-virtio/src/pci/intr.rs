@@ -420,12 +420,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         self.raise_queue_interrupt();
     }
 
-    /// Signal a device configuration change to the guest.
-    #[allow(dead_code)]
-    pub fn signal_config_change(&self) {
-        self.raise_config_interrupt();
-    }
-
     /// Deliver a configuration interrupt the way the driver armed it.
     ///
     /// WHY one helper for both callers: a modern guest with MSI-X never

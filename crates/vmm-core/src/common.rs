@@ -4,9 +4,6 @@
 
 //! Common types for I/O operations on PIO and MMIO buses.
 
-/// Guest physical address.
-pub type GuestAddr = u64;
-
 /// Standard page size in bytes (4 KiB).
 pub const PAGE_SIZE: usize = 4096;
 

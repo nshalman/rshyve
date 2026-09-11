@@ -443,15 +443,6 @@ impl VmController {
     fn resume_devices(&self) {
         resume_device_set(&self.named_devices());
     }
-
-    /// Halt all devices: permanent shutdown.
-    // Kept for the pending graceful device-stop sequence.
-    #[allow(dead_code)]
-    fn halt_devices(&self) {
-        for named in self.named_devices() {
-            named.device.halt();
-        }
-    }
 }
 
 /// SIGTERM shutdown driven through the control plane.

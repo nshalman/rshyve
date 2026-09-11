@@ -73,9 +73,6 @@ struct Region {
     gpa: u64,
     len: usize,
     kind: RegionKind,
-    /// Kernel segment ID, used for migration state export.
-    #[allow(dead_code)]
-    segid: i32,
     /// Mapping of the guest physical address space. A write through
     /// this one is what the kernel marks dirty. See the module comment.
     tracked: TrackedRun,
@@ -236,16 +233,6 @@ impl PhysMap {
         self.add_region(hdl, gpa, len, RegionKind::Ram, Prot::RWX)
     }
 
-    /// Add a ROM region backed by a new bhyve memory segment.
-    pub fn add_rom(
-        &mut self,
-        hdl: &VmmHdl,
-        gpa: u64,
-        len: usize,
-    ) -> Result<()> {
-        self.add_region(hdl, gpa, len, RegionKind::Rom, Prot::READ | Prot::EXEC)
-    }
-
     /// Add a ROM region and a writable RAM region that share one kernel
     /// segment.
     ///
@@ -331,26 +318,6 @@ impl PhysMap {
             self.next_segid += 1;
         }
         result
-    }
-
-    /// Map an already allocated segment as RAM while the guest runs.
-    ///
-    /// `VM_MMAP_MEMSEG` takes the VM write lock, which drives every
-    /// vCPU out with a `VM_EXITCODE_BOGUS` exit and freezes it. The run
-    /// loop treats that exit as a plain re-entry, so nothing else has
-    /// to stop.
-    ///
-    /// The caller allocates the segment. `segoff` names the slice of it
-    /// to map, so one segment can back several regions.
-    pub fn add_ram_runtime(
-        &self,
-        hdl: &VmmHdl,
-        segid: i32,
-        gpa: u64,
-        segoff: i64,
-        len: usize,
-    ) -> Result<()> {
-        self.claim_ram(gpa, len)?.commit(hdl, segid, segoff)
     }
 
     /// Hold a range of the guest address space for a run-time RAM add.
@@ -453,7 +420,7 @@ impl PhysMap {
                 mapping: Arc::new(Mapping::anon(run_len)?),
             }
         };
-        self.publish_claim(publish, claim, -1, RegionViews { tracked, direct });
+        self.publish_claim(publish, claim, RegionViews { tracked, direct });
         Ok(())
     }
 
@@ -475,7 +442,6 @@ impl PhysMap {
         self.publish_claim(
             publish,
             claim,
-            -1,
             RegionViews {
                 tracked: TrackedRun {
                     gpa,
@@ -499,7 +465,6 @@ impl PhysMap {
         &self,
         _publish: std::sync::MutexGuard<'_, ()>,
         mut claim: RamClaim<'_>,
-        segid: i32,
         views: RegionViews,
     ) {
         let mut space = self.write_space();
@@ -521,7 +486,6 @@ impl PhysMap {
                 gpa: claim.gpa,
                 len: claim.len,
                 kind: claim.kind,
-                segid,
                 tracked: views.tracked.clone(),
                 direct: views.direct,
             },
@@ -760,7 +724,6 @@ impl RamClaim<'_> {
                 map.publish_claim(
                     publish,
                     self,
-                    segid,
                     RegionViews { tracked, direct },
                 );
                 Ok(())

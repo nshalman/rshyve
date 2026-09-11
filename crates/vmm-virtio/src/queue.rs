@@ -781,41 +781,6 @@ impl VirtQueue {
 
         Some(bufs)
     }
-
-    /// Process a descriptor chain, calling `handler` for each buffer.
-    ///
-    /// Returns `false` if the chain could not be walked (bad descriptor).
-    pub fn process_chain(
-        &self,
-        physmap: &PhysMap,
-        head: u16,
-        mut handler: impl FnMut(&VirtqDesc),
-    ) -> bool {
-        let mut idx = head;
-        let mut count = 0u16;
-
-        loop {
-            if count >= self.size {
-                return false;
-            }
-
-            let desc = match self.read_desc(physmap, idx) {
-                Some(d) => d,
-                None => return false,
-            };
-            count += 1;
-
-            handler(&desc);
-
-            if desc.has_next() {
-                idx = desc.next;
-            } else {
-                break;
-            }
-        }
-
-        true
-    }
 }
 
 /// VirtIO 1.3 sec 2.7.7.1 wrapping comparison for notification suppression.
