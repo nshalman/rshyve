@@ -269,31 +269,6 @@ pub fn spawn_boot_threads(
         .collect()
 }
 
-/// Spawn a thread for each vCPU and run the exit-dispatch loop.
-///
-/// Returns a channel receiver for vCPU events and the join handles.
-pub fn spawn_vcpu_threads(
-    vcpus: &[Vcpu],
-    bus_pio: &Arc<PioBus>,
-    bus_mmio: &Arc<MmioBus>,
-    hdl: Arc<VmmHdl>,
-    api_version: u32,
-    vcpu_metrics: &[Arc<VcpuMetrics>],
-    msr_handler: Option<Arc<dyn MsrHandler>>,
-    log: &Logger,
-) -> (mpsc::Receiver<VcpuEvent>, Vec<thread::JoinHandle<()>>) {
-    let ctx = VcpuThreadCtx {
-        bus_pio: Arc::clone(bus_pio),
-        bus_mmio: Arc::clone(bus_mmio),
-        hdl,
-        api_version,
-        msr_handler,
-    };
-    let (tx, rx) = mpsc::channel();
-    let handles = spawn_boot_threads(&ctx, vcpus, vcpu_metrics, &tx, log);
-    (rx, handles)
-}
-
 /// The main vCPU execution loop.
 ///
 /// Runs until a suspend event occurs or a fatal error is encountered.
@@ -391,6 +366,10 @@ fn vcpu_run_loop(
                 if should_discard_once(exit.rip, &mut discarded_at) {
                     // A userspace-fallback exit leaves kernel decode state
                     // pending until it is explicitly discarded.
+                    warn!(log, "discarding an instruction the kernel could not emulate";
+                        "probe" => "inst_emul_discard",
+                        "rip" => format!("{:#x}", exit.rip),
+                        "inst" => &inst_hex);
                     VmEntry::DiscardInstr
                 } else {
                     fatal_exit(

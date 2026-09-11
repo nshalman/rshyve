@@ -5,11 +5,10 @@
 //! vmm - New Rust-based bhyve VMM with live migration support.
 
 use std::ffi::OsString;
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 
 use anyhow::Context;
 use slog::{error, info, o, warn, Drain, Logger};
@@ -61,55 +60,6 @@ fn setup_logger() -> Logger {
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
     let drain = slog_async::Async::new(drain).build().fuse();
     Logger::root(drain, o!("component" => "rshyve"))
-}
-
-/// Spawn a thread that drains the UART TX buffer and writes to stderr.
-/// This is the simplest possible serial console — just print what the
-/// guest writes to COM1.
-// Retained as a simple diagnostic console path for backend bring-up.
-#[allow(dead_code)]
-fn spawn_serial_drain(
-    uart: Arc<LpcUart>,
-    log: Logger,
-    output_path: Option<&std::path::Path>,
-) -> JoinHandle<()> {
-    // Open serial output file if specified, otherwise use stderr
-    // (stderr avoids interleaving with interactive console input on stdout)
-    let output: Box<dyn Write + Send> = if let Some(path) = output_path {
-        match std::fs::File::create(path) {
-            Ok(f) => Box::new(f),
-            Err(e) => {
-                warn!(log, "failed to open serial output file, using stderr";
-                    "path" => path.display().to_string(), "error" => %e);
-                Box::new(std::io::stderr())
-            }
-        }
-    } else {
-        Box::new(std::io::stderr())
-    };
-    let output = std::sync::Mutex::new(output);
-
-    thread::Builder::new()
-        .name("serial-drain".into())
-        .spawn(move || {
-            loop {
-                match uart.output_byte() {
-                    Some(b) => {
-                        if let Ok(mut out) = output.lock() {
-                            if let Err(e) = out.write_all(&[b]) {
-                                eprintln!("[serial-drain] write error: {}", e);
-                            }
-                            let _ = out.flush();
-                        }
-                    }
-                    None => {
-                        // Poll more aggressively to keep up with high-speed serial
-                        thread::sleep(std::time::Duration::from_micros(100));
-                    }
-                }
-            }
-        })
-        .expect("failed to spawn serial drain thread")
 }
 
 /// Result of `create_machine`: the finalized Machine plus metadata needed

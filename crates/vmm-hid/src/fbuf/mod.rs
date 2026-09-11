@@ -126,10 +126,6 @@ pub struct Framebuffer {
     /// Device memory segment backing BAR1.
     fb: DevMemSeg,
 
-    /// VM handle retained for the device memory segment lifetime.
-    #[allow(dead_code)]
-    hdl: Option<Arc<VmmHdl>>,
-
     /// MMIO bus for BAR registration/unregistration.
     bus_mmio: Arc<MmioBus>,
 
@@ -194,18 +190,12 @@ impl Framebuffer {
         pci_state.define_bar(BarN::BAR1, BarDefine::Mmio(BAR1_SIZE));
 
         let resolution = pack_resolution(width, height);
-        let fb = DevMemSeg::new(
-            Arc::clone(&hdl),
-            segid,
-            "framebuffer",
-            BAR1_SIZE as usize,
-        )?;
+        let fb = DevMemSeg::new(hdl, segid, "framebuffer", BAR1_SIZE as usize)?;
 
         let dev = Arc::new(Self {
             pci_state: Mutex::new(pci_state),
             resolution: AtomicU32::new(resolution),
             fb,
-            hdl: Some(hdl),
             bus_mmio,
             registered_bar0: Mutex::new(None),
             self_ref: Mutex::new(None),
@@ -1185,7 +1175,6 @@ mod tests {
             pci_state: Mutex::new(pci_state),
             resolution: AtomicU32::new(pack_resolution(1024, 768)),
             fb: DevMemSeg::new_anon(BAR1_SIZE as usize).unwrap(),
-            hdl: None,
             bus_mmio: Arc::new(MmioBus::new()),
             registered_bar0: Mutex::new(None),
             self_ref: Mutex::new(None),

@@ -135,9 +135,6 @@ pub struct BlockMetrics {
     pub read_latency_us: AtomicU64,
     /// Cumulative write latency in microseconds.
     pub write_latency_us: AtomicU64,
-    /// Start time retained for the pending block-uptime metric.
-    #[allow(dead_code)]
-    start: Instant,
 }
 
 #[derive(Serialize)]
@@ -172,7 +169,6 @@ impl BlockMetrics {
             write_errors: AtomicU64::new(0),
             read_latency_us: AtomicU64::new(0),
             write_latency_us: AtomicU64::new(0),
-            start: Instant::now(),
         }
     }
 

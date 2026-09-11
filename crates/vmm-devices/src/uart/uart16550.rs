@@ -236,20 +236,6 @@ impl Uart {
         self.intr_pin
     }
 
-    /// Returns `true` when there is data in the TX FIFO available for
-    /// an external consumer to read via [`data_read`](Self::data_read).
-    #[inline]
-    pub fn is_readable(&self) -> bool {
-        !self.tx_fifo.is_empty()
-    }
-
-    /// Returns `true` when the RX FIFO can accept more data via
-    /// [`data_write`](Self::data_write).
-    #[inline]
-    pub fn is_writable(&self) -> bool {
-        self.is_loopback() || !self.rx_fifo.is_full()
-    }
-
     /// Reset all registers and FIFOs to power-on defaults.
     pub fn reset(&mut self) {
         self.reg_intr_enable = IntrEnaReg::empty();
@@ -369,11 +355,6 @@ impl Fifo {
     #[inline]
     fn is_empty(&self) -> bool {
         self.buf.is_empty()
-    }
-
-    #[inline]
-    fn is_full(&self) -> bool {
-        self.buf.len() >= self.capacity
     }
 }
 

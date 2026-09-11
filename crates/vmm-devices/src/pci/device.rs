@@ -118,14 +118,9 @@ impl DeviceState {
         self.intr_pin = pin;
     }
 
-    /// Set the header type (e.g., multi-function flag).
     /// Set the PCI Interrupt Line register (0x3C).
     pub fn set_intr_line(&mut self, irq: u8) {
         self.intr_line = irq;
-    }
-
-    pub fn set_header_type(&mut self, htype: u8) {
-        self.header_type = htype;
     }
 
     /// Set the capabilities pointer. This also sets the CAP_LIST

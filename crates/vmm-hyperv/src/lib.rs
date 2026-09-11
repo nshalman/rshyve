@@ -342,35 +342,6 @@ impl HyperV {
         }
     }
 
-    /// Re-install overlay pages from the current MSR values, e.g.
-    /// after migration import.
-    pub fn resume_overlays(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.msr_guest_os_id != 0 && inner.msr_hypercall.enabled() {
-            let payload = hypercall::build_page();
-            match overlay::install(
-                &self.physmap,
-                inner.msr_hypercall.gpa(),
-                &payload,
-            ) {
-                Ok(ov) => inner.hypercall_overlay = Some(ov),
-                Err(e) => {
-                    warn!(self.log, "resume hypercall overlay failed"; "error" => %e)
-                }
-            }
-        }
-        if self.features.reference_tsc && inner.msr_reference_tsc.enabled() {
-            let msr = inner.msr_reference_tsc;
-            if let Err(e) = self.publish_tsc_page(
-                &mut inner,
-                msr,
-                tsc::compute_scale(self.features.tsc_freq_hz).unwrap_or(0),
-            ) {
-                warn!(self.log, "resume tsc overlay failed"; "error" => %e);
-            }
-        }
-    }
-
     /// Reset all guest-visible state (called on guest reboot).
     pub fn reset(&self) {
         self.pause_overlays();

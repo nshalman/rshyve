@@ -56,9 +56,6 @@ pub struct I440FxChipset {
     pci_bus: Arc<PciBus>,
     cfg_decoder: PioCfgDecoder,
     post_code: AtomicU8,
-    /// LPC bridge retained for future chipset migration-state export.
-    #[allow(dead_code)]
-    lpc: Arc<LpcBridge>,
     /// Shared PCI INTx routing state. `None` without a VM handle, which
     /// leaves [`route_lintr`](Self::route_lintr) with nothing to route to.
     intr_routes: Option<Arc<PciIntrRoutes>>,
@@ -90,8 +87,8 @@ impl I440FxChipset {
         let pir_regs = Arc::new(Mutex::new([0x80u8; PIR_COUNT]));
 
         // ISA/LPC bridge at BDF 0.1.0 with PIR routing
-        let lpc = Arc::new(LpcBridge::new(pir_regs.clone()));
-        let lpc_pci: Arc<dyn PciDevice> = lpc.clone();
+        let lpc_pci: Arc<dyn PciDevice> =
+            Arc::new(LpcBridge::new(pir_regs.clone()));
         let bdf_lpc = Bdf::new_unchecked(0, 1, 0);
         pci_bus.attach(bdf_lpc, lpc_pci);
 
@@ -107,7 +104,6 @@ impl I440FxChipset {
             pci_bus,
             cfg_decoder: PioCfgDecoder::new(),
             post_code: AtomicU8::new(0),
-            lpc,
             intr_routes,
         });
 
@@ -307,15 +303,9 @@ impl PciDevice for Hostbridge {
 // ---------------------------------------------------------------------------
 
 /// PIR (PCI Interrupt Routing) register offsets in the LPC config space.
+/// In each register, bit 7 disables the link and bits 3:0 hold the ISA IRQ.
 const PIR_OFFSET: u8 = 0x60;
 const PIR_COUNT: usize = 4;
-/// PIR bit 7 = disable, bits 3:0 = ISA IRQ number.
-// Keep the masks next to the register definition for the pending firmware PIR
-// validation path.
-#[allow(dead_code)]
-const PIR_MASK_DISABLE: u8 = 0x80;
-#[allow(dead_code)]
-const PIR_MASK_IRQ: u8 = 0x0F;
 
 /// ISA/LPC bridge PCI device at slot 1 (Intel PIIX3).
 ///

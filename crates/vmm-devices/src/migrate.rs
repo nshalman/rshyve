@@ -132,10 +132,6 @@ impl<'a> PayloadOffers<'a> {
             .parse()
     }
 
-    pub fn is_consumed(&self) -> bool {
-        self.0.is_empty()
-    }
-
     fn take_schema(
         &mut self,
         id: SchemaId,

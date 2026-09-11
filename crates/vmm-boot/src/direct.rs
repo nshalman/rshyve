@@ -43,9 +43,6 @@ const GPA_PD_BASE: u64 = 0xB000;
 /// Where `load_kernel` writes the kernel command line. Public so a
 /// caller can read back, or rewrite, the string it passed.
 pub const GPA_CMDLINE: u64 = 0x2_0000;
-// Reserved for the pending fixed-address kernel placement path.
-#[allow(dead_code)]
-const GPA_KERNEL: u64 = 0x10_0000;
 /// Longest command line `load_kernel` accepts, NUL included. Public so
 /// a caller can reject an over-long string before it loads anything.
 pub const CMDLINE_MAX: usize = 4096;
@@ -624,6 +621,10 @@ mod tests {
     use super::*;
 
     use crate::recording::Write;
+
+    /// Where a bzImage is loaded by default. The boot scratch ranges
+    /// below must all stop before it.
+    const GPA_KERNEL: u64 = 0x10_0000;
 
     #[test]
     fn page_table_structure() {
