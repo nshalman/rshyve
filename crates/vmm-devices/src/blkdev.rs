@@ -122,10 +122,6 @@ fn dkioc_wce(
 ) -> io::Result<()> {
     // SAFETY: caller holds `fd` open for the duration of the call; `v`
     // lives through the call and is the correct size for DKIOC{GET,SET}WCE.
-    let r = unsafe { libc::ioctl(fd, cmd, v as *mut libc::c_int) };
-    if r < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    unsafe { vmm_api_common::ioctl(fd, cmd, std::ptr::from_mut(v).cast()) }?;
+    Ok(())
 }

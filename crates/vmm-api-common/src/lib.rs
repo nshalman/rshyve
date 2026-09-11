@@ -5,7 +5,40 @@
 //! Shared utilities for VMM API crates (bhyve-api, viona-api).
 
 use std::io::{Error, Result};
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI64, Ordering};
+
+/// Issue an ioctl and turn -1 into the errno it left behind.
+///
+/// # Safety
+///
+/// `data` must point at the struct `cmd` expects, or be the plain
+/// value `cmd` takes in place of a pointer.
+#[cfg(target_os = "illumos")]
+pub unsafe fn ioctl(
+    fd: RawFd,
+    cmd: i32,
+    data: *mut libc::c_void,
+) -> Result<i32> {
+    match libc::ioctl(fd, cmd, data) {
+        -1 => Err(Error::last_os_error()),
+        other => Ok(other),
+    }
+}
+
+/// The kernel interfaces this tree drives exist only on illumos.
+///
+/// # Safety
+///
+/// Never dereferences `data`; the signature matches the illumos build.
+#[cfg(not(target_os = "illumos"))]
+pub unsafe fn ioctl(
+    _fd: RawFd,
+    _cmd: i32,
+    _data: *mut libc::c_void,
+) -> Result<i32> {
+    Err(Error::other("illumos required"))
+}
 
 /// Thread-safe, one-shot cache for a kernel API version query.
 ///
