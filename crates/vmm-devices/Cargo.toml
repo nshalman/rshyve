@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 acpi_tables.workspace = true
 vmm_core.workspace = true
+vmm_api_common.workspace = true
 vmm_metrics.workspace = true
 bitflags.workspace = true
 anyhow.workspace = true

@@ -793,19 +793,7 @@ impl Drop for PciPassthru {
 /// The caller must provide a `data` pointer to a struct that is correct
 /// for the given `cmd` ioctl number.
 unsafe fn ioctl_on_fd<T>(fd: RawFd, cmd: i32, data: &mut T) -> Result<i32> {
-    #[cfg(target_os = "illumos")]
-    let ret = libc::ioctl(fd, cmd, data as *mut T as *mut libc::c_void);
-    #[cfg(not(target_os = "illumos"))]
-    let ret = libc::ioctl(
-        fd,
-        cmd as libc::c_ulong,
-        data as *mut T as *mut libc::c_void,
-    );
-    if ret < 0 {
-        Err(Error::last_os_error())
-    } else {
-        Ok(ret)
-    }
+    vmm_api_common::ioctl(fd, cmd, std::ptr::from_mut(data).cast())
 }
 
 /// Extract bytes from a dword value based on the access offset and length.

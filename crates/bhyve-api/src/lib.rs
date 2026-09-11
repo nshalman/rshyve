@@ -8,11 +8,13 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Result};
+
 use std::mem::{size_of, size_of_val};
 use std::os::fd::*;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
+use vmm_api_common::ioctl;
 use vmm_api_common::CachedVersion;
 
 pub use bhyve_api_sys::*;
@@ -497,23 +499,6 @@ pub fn api_version() -> Result<u32> {
         let vers = ctl.query_api_version()?;
         Ok(vers)
     })
-}
-
-#[cfg(target_os = "illumos")]
-unsafe fn ioctl(fd: RawFd, cmd: i32, data: *mut libc::c_void) -> Result<i32> {
-    match libc::ioctl(fd, cmd, data) {
-        -1 => Err(Error::last_os_error()),
-        other => Ok(other),
-    }
-}
-
-#[cfg(not(target_os = "illumos"))]
-unsafe fn ioctl(
-    _fd: RawFd,
-    _cmd: i32,
-    _data: *mut libc::c_void,
-) -> Result<i32> {
-    Err(Error::other("illumos required"))
 }
 
 /// Convenience constants to provide some documentation on what changes have

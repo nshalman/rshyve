@@ -8,8 +8,10 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Result};
+
 use std::os::fd::*;
 use std::os::unix::fs::MetadataExt;
+use vmm_api_common::ioctl;
 
 mod ffi;
 mod link;
@@ -299,23 +301,6 @@ impl AsRawFd for VionaFd {
     fn as_raw_fd(&self) -> RawFd {
         self.file().as_raw_fd()
     }
-}
-
-#[cfg(target_os = "illumos")]
-unsafe fn ioctl(fd: RawFd, cmd: i32, data: *mut libc::c_void) -> Result<i32> {
-    match libc::ioctl(fd, cmd, data) {
-        -1 => Err(Error::last_os_error()),
-        other => Ok(other),
-    }
-}
-
-#[cfg(not(target_os = "illumos"))]
-unsafe fn ioctl(
-    _fd: RawFd,
-    _cmd: i32,
-    _data: *mut libc::c_void,
-) -> Result<i32> {
-    Err(Error::other("illumos required"))
 }
 
 #[cfg(target_os = "illumos")]
