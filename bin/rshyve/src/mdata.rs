@@ -18,6 +18,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use slog::{info, warn, Logger};
 use vmm_devices::uart::lpc::LpcUart;
 
@@ -249,175 +251,17 @@ fn process_v1_command(line: &str, store: &MdataStore, log: &Logger) -> String {
     }
 }
 
-// -- Base64 and CRC32 helpers --
-
 fn b64_encode(s: &str) -> String {
-    use std::io::Write;
-    let mut buf = Vec::with_capacity(s.len() * 4 / 3 + 4);
-    {
-        let mut enc = Base64Encoder::new(&mut buf);
-        enc.write_all(s.as_bytes()).unwrap();
-        enc.finish().unwrap();
-    }
-    String::from_utf8(buf).unwrap()
+    BASE64.encode(s)
 }
 
 fn b64_decode(s: &str) -> Option<String> {
-    let bytes = base64_decode_bytes(s)?;
-    String::from_utf8(bytes).ok()
+    String::from_utf8(BASE64.decode(s).ok()?).ok()
 }
 
-fn base64_decode_bytes(input: &str) -> Option<Vec<u8>> {
-    const TABLE: [u8; 128] = {
-        let mut t = [0xFFu8; 128];
-        let mut i = 0u8;
-        while i < 26 {
-            t[(b'A' + i) as usize] = i;
-            i += 1;
-        }
-        i = 0;
-        while i < 26 {
-            t[(b'a' + i) as usize] = 26 + i;
-            i += 1;
-        }
-        i = 0;
-        while i < 10 {
-            t[(b'0' + i) as usize] = 52 + i;
-            i += 1;
-        }
-        t[b'+' as usize] = 62;
-        t[b'/' as usize] = 63;
-        t
-    };
-
-    let input = input.trim_end_matches('=');
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i + 3 < bytes.len() {
-        let (a, b, c, d) = (
-            *TABLE.get(*bytes.get(i)? as usize)?,
-            *TABLE.get(*bytes.get(i + 1)? as usize)?,
-            *TABLE.get(*bytes.get(i + 2)? as usize)?,
-            *TABLE.get(*bytes.get(i + 3)? as usize)?,
-        );
-        if a == 0xFF || b == 0xFF || c == 0xFF || d == 0xFF {
-            return None;
-        }
-        out.push((a << 2) | (b >> 4));
-        out.push((b << 4) | (c >> 2));
-        out.push((c << 6) | d);
-        i += 4;
-    }
-    let rem = bytes.len() - i;
-    if rem >= 2 {
-        let a = *TABLE.get(*bytes.get(i)? as usize)?;
-        let b = *TABLE.get(*bytes.get(i + 1)? as usize)?;
-        if a == 0xFF || b == 0xFF {
-            return None;
-        }
-        out.push((a << 2) | (b >> 4));
-        if rem >= 3 {
-            let c = *TABLE.get(*bytes.get(i + 2)? as usize)?;
-            if c == 0xFF {
-                return None;
-            }
-            out.push((b << 4) | (c >> 2));
-        }
-    }
-    Some(out)
-}
-
-struct Base64Encoder<'a> {
-    buf: &'a mut Vec<u8>,
-    pending: [u8; 3],
-    pending_len: usize,
-}
-
-impl<'a> Base64Encoder<'a> {
-    fn new(buf: &'a mut Vec<u8>) -> Self {
-        Self {
-            buf,
-            pending: [0; 3],
-            pending_len: 0,
-        }
-    }
-    fn finish(mut self) -> Result<(), std::io::Error> {
-        const CHARS: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        if self.pending_len == 1 {
-            let a = self.pending[0];
-            self.buf.push(CHARS[(a >> 2) as usize]);
-            self.buf.push(CHARS[((a & 0x03) << 4) as usize]);
-            self.buf.push(b'=');
-            self.buf.push(b'=');
-        } else if self.pending_len == 2 {
-            let (a, b) = (self.pending[0], self.pending[1]);
-            self.buf.push(CHARS[(a >> 2) as usize]);
-            self.buf.push(CHARS[((a & 0x03) << 4 | b >> 4) as usize]);
-            self.buf.push(CHARS[((b & 0x0F) << 2) as usize]);
-            self.buf.push(b'=');
-        }
-        self.pending_len = 0;
-        Ok(())
-    }
-}
-
-impl<'a> std::io::Write for Base64Encoder<'a> {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        const CHARS: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut i = 0;
-        // First, fill pending buffer
-        while self.pending_len < 3 && i < data.len() {
-            self.pending[self.pending_len] = data[i];
-            self.pending_len += 1;
-            i += 1;
-        }
-        if self.pending_len == 3 {
-            let (a, b, c) = (self.pending[0], self.pending[1], self.pending[2]);
-            self.buf.push(CHARS[(a >> 2) as usize]);
-            self.buf.push(CHARS[((a & 0x03) << 4 | b >> 4) as usize]);
-            self.buf.push(CHARS[((b & 0x0F) << 2 | c >> 6) as usize]);
-            self.buf.push(CHARS[(c & 0x3F) as usize]);
-            self.pending_len = 0;
-        }
-        // Process remaining full triplets
-        while i + 2 < data.len() {
-            let (a, b, c) = (data[i], data[i + 1], data[i + 2]);
-            self.buf.push(CHARS[(a >> 2) as usize]);
-            self.buf.push(CHARS[((a & 0x03) << 4 | b >> 4) as usize]);
-            self.buf.push(CHARS[((b & 0x0F) << 2 | c >> 6) as usize]);
-            self.buf.push(CHARS[(c & 0x3F) as usize]);
-            i += 3;
-        }
-        // Buffer remaining
-        while i < data.len() {
-            self.pending[self.pending_len] = data[i];
-            self.pending_len += 1;
-            i += 1;
-        }
-        Ok(data.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// CRC32 (ISO 3309 / ITU-T V.42, same as zlib).
+/// The V2 frame checksum: CRC32 as zlib computes it.
 fn crc32(data: &str) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data.as_bytes() {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    !crc
+    crc32fast::hash(data.as_bytes())
 }
 
 /// Build the metadata store from zone config / CLI flags.

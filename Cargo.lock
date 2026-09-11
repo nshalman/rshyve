@@ -251,6 +251,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1142,7 +1151,9 @@ name = "rshyve"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
+ "crc32fast",
  "libc",
  "memmap2",
  "serde",
@@ -1884,6 +1895,7 @@ dependencies = [
  "slog",
  "tempfile",
  "thiserror 1.0.69",
+ "vmm_api_common",
  "vmm_core",
  "vmm_metrics",
 ]
@@ -1968,6 +1980,7 @@ dependencies = [
  "bhyve_api",
  "libc",
  "slog",
+ "vmm_api_common",
  "vmm_core",
  "vmm_devices",
 ]
