@@ -366,6 +366,10 @@ fn vcpu_run_loop(
                 if should_discard_once(exit.rip, &mut discarded_at) {
                     // A userspace-fallback exit leaves kernel decode state
                     // pending until it is explicitly discarded.
+                    warn!(log, "discarding an instruction the kernel could not emulate";
+                        "probe" => "inst_emul_discard",
+                        "rip" => format!("{:#x}", exit.rip),
+                        "inst" => &inst_hex);
                     VmEntry::DiscardInstr
                 } else {
                     fatal_exit(

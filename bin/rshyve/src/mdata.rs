@@ -210,6 +210,7 @@ fn process_v1_command(line: &str, store: &MdataStore, log: &Logger) -> String {
     let parts: Vec<&str> = line.splitn(2, ' ').collect();
     let cmd = parts[0];
     let arg = parts.get(1).copied().unwrap_or("");
+    info!(log, "mdata: V1 command"; "probe" => "mdata_v1", "command" => cmd);
 
     match cmd {
         "GET" => {
