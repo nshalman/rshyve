@@ -36,17 +36,7 @@ impl BhyvePmTimer {
     /// PIO reads to this port by returning the timer value directly,
     /// without exiting to userspace.
     pub fn attach(&self) -> std::io::Result<()> {
-        // VM_PMTMR_LOCATE tells the kernel to intercept reads
-        // to this port and return the ACPI PM timer value.
-        let fd = std::os::fd::AsRawFd::as_raw_fd(&*self.hdl);
-        let port = self.port as usize;
-        let res = unsafe {
-            libc::ioctl(fd, bhyve_api::ioctls::VM_PMTMR_LOCATE as _, port)
-        };
-        if res == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+        self.hdl.pmtmr_locate(self.port)
     }
 
     /// Get the PIO port this timer is configured for.

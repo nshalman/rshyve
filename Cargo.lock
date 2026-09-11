@@ -1142,7 +1142,6 @@ name = "rshyve"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bhyve_api",
  "clap",
  "libc",
  "memmap2",
@@ -1877,7 +1876,6 @@ version = "0.1.0"
 dependencies = [
  "acpi_tables",
  "anyhow",
- "bhyve_api",
  "bitflags",
  "erased-serde 0.4.10",
  "libc",
@@ -1900,7 +1898,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ascii",
- "bhyve_api",
  "bitflags",
  "des",
  "libc",

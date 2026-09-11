@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use clap::Parser;
 
 /// Most vCPUs a bhyve VM can have, matching the kernel's VM_MAXCPU.
-/// Repeated here because this crate does not link bhyve_api.
+/// Repeated here because this crate does not link bhyve_api;
+/// vmm_machine checks the two agree at compile time.
 pub const MAX_VCPUS: u32 = 64;
 
 /// Longest kernel command line this VMM accepts.

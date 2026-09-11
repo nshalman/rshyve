@@ -12,7 +12,6 @@ workspace = true
 acpi_tables.workspace = true
 vmm_core.workspace = true
 vmm_metrics.workspace = true
-bhyve_api.workspace = true
 bitflags.workspace = true
 anyhow.workspace = true
 erased-serde.workspace = true

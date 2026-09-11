@@ -13,15 +13,56 @@ use std::io::{Error, ErrorKind, Result};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
+use std::os::fd::RawFd;
+
 use bhyve_api::{
-    ioctls, vcpu_cpuid_entry, vm_capability, vm_create_req, vm_isa_irq,
-    vm_lapic_msi, vm_memmap, vm_memseg, vm_npt_operation, vm_rtc_data,
-    vm_suspend, vm_vcpu_cpuid_config, vmm_dirty_tracker, ApiVersion, VmmCtlFd,
-    VmmFd, VCF_RESERVOIR_MEM, VCF_TRACK_DIRTY, VM_MAX_SEG_NAMELEN,
-    VM_MEMMAP_F_WIRED, VNO_FLAG_BITMAP_IN, VNO_OP_SET_DIRTY,
+    ioctls, vcpu_cpuid_entry, vm_cap_type, vm_capability, vm_create_req,
+    vm_isa_irq, vm_lapic_msi, vm_memmap, vm_memseg, vm_npt_operation,
+    vm_pptdev, vm_pptdev_limits, vm_pptdev_mmio, vm_pptdev_msi, vm_rtc_data,
+    vm_suspend, vm_suspend_how, vm_vcpu_cpuid_config, vmm_dirty_tracker,
+    ApiVersion, VmmCtlFd, VmmFd, VCF_RESERVOIR_MEM, VCF_TRACK_DIRTY,
+    VM_MAX_SEG_NAMELEN, VM_MEMMAP_F_WIRED, VNO_FLAG_BITMAP_IN,
+    VNO_OP_SET_DIRTY,
 };
 
 use crate::mem::Prot;
+
+/// How a VM is asked to stop. The kernel latches the first request and
+/// answers `EALREADY` to the rest.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SuspendHow {
+    Reset,
+    PowerOff,
+    Halt,
+}
+
+impl SuspendHow {
+    fn raw(self) -> u32 {
+        let how = match self {
+            SuspendHow::Reset => vm_suspend_how::VM_SUSPEND_RESET,
+            SuspendHow::PowerOff => vm_suspend_how::VM_SUSPEND_POWEROFF,
+            SuspendHow::Halt => vm_suspend_how::VM_SUSPEND_HALT,
+        };
+        how as u32
+    }
+}
+
+impl std::fmt::Display for SuspendHow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SuspendHow::Reset => "reset",
+            SuspendHow::PowerOff => "poweroff",
+            SuspendHow::Halt => "halt",
+        })
+    }
+}
+
+/// MSI and MSI-X vector counts a passthrough device may use.
+#[derive(Copy, Clone, Debug)]
+pub struct PptdevLimits {
+    pub msi: i32,
+    pub msix: i32,
+}
 
 /// Options for creating a new VM instance.
 #[derive(Debug, Clone, Default)]
@@ -329,17 +370,12 @@ impl VmmHdl {
         Ok(())
     }
 
-    /// Set a VM capability (e.g., halt-on-exit, pause-on-exit).
-    pub fn set_capability(
-        &self,
-        cpuid: i32,
-        captype: i32,
-        capval: i32,
-    ) -> Result<()> {
+    /// Make one vCPU exit to userspace on HLT.
+    pub fn set_halt_exit(&self, cpuid: i32, enable: bool) -> Result<()> {
         let mut cap = vm_capability {
             cpuid,
-            captype,
-            capval,
+            captype: vm_cap_type::VM_CAP_HALT_EXIT as i32,
+            capval: i32::from(enable),
             allcpus: 0,
         };
         // Safety: vm_capability is the correct struct.
@@ -378,11 +414,116 @@ impl VmmHdl {
         Ok(())
     }
 
-    /// Suspend the VM (power-off, reset, halt, or triple-fault).
-    pub fn suspend(&self, how: u32, source: i32) -> Result<()> {
-        let mut req = vm_suspend { how, source };
+    /// Suspend the VM. `source` is the requesting vCPU, or -1 for a
+    /// device or operator request.
+    pub fn suspend(&self, how: SuspendHow, source: i32) -> Result<()> {
+        let mut req = vm_suspend {
+            how: how.raw(),
+            source,
+        };
         // Safety: vm_suspend is the correct struct for VM_SUSPEND.
         unsafe { self.inner.ioctl(ioctls::VM_SUSPEND, &mut req) }?;
+        Ok(())
+    }
+
+    /// Tell the kernel which PIO port serves the ACPI PM timer.
+    pub fn pmtmr_locate(&self, port: u16) -> Result<()> {
+        self.inner
+            .ioctl_usize(ioctls::VM_PMTMR_LOCATE, usize::from(port))?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // PCI passthrough
+    // ---------------------------------------------------------------
+
+    /// Bind an open `/dev/pptN` descriptor to this VM.
+    pub fn bind_pptdev(&self, pptfd: RawFd) -> Result<()> {
+        let mut req = vm_pptdev { pptfd };
+        // Safety: vm_pptdev is the correct struct for VM_BIND_PPTDEV.
+        unsafe { self.inner.ioctl(ioctls::VM_BIND_PPTDEV, &mut req) }?;
+        Ok(())
+    }
+
+    /// Give a bound passthrough device back to the host.
+    pub fn unbind_pptdev(&self, pptfd: RawFd) -> Result<()> {
+        let mut req = vm_pptdev { pptfd };
+        // Safety: vm_pptdev is the correct struct for VM_UNBIND_PPTDEV.
+        unsafe { self.inner.ioctl(ioctls::VM_UNBIND_PPTDEV, &mut req) }?;
+        Ok(())
+    }
+
+    /// Ask how many MSI and MSI-X vectors a bound device may use.
+    pub fn pptdev_limits(&self, pptfd: RawFd) -> Result<PptdevLimits> {
+        let mut req = vm_pptdev_limits {
+            pptfd,
+            msi_limit: 0,
+            msix_limit: 0,
+        };
+        // Safety: vm_pptdev_limits is correct for VM_GET_PPTDEV_LIMITS.
+        unsafe { self.inner.ioctl(ioctls::VM_GET_PPTDEV_LIMITS, &mut req) }?;
+        Ok(PptdevLimits {
+            msi: req.msi_limit,
+            msix: req.msix_limit,
+        })
+    }
+
+    /// Map `len` bytes of a device BAR at host physical `hpa` into the
+    /// guest at `gpa`.
+    pub fn map_pptdev_mmio(
+        &self,
+        pptfd: RawFd,
+        gpa: u64,
+        hpa: u64,
+        len: usize,
+    ) -> Result<()> {
+        let mut req = vm_pptdev_mmio {
+            pptfd,
+            gpa,
+            hpa,
+            len,
+        };
+        // Safety: vm_pptdev_mmio is correct for VM_MAP_PPTDEV_MMIO.
+        unsafe { self.inner.ioctl(ioctls::VM_MAP_PPTDEV_MMIO, &mut req) }?;
+        Ok(())
+    }
+
+    /// Undo [`map_pptdev_mmio`](Self::map_pptdev_mmio) for `gpa`.
+    pub fn unmap_pptdev_mmio(
+        &self,
+        pptfd: RawFd,
+        gpa: u64,
+        len: usize,
+    ) -> Result<()> {
+        let mut req = vm_pptdev_mmio {
+            pptfd,
+            gpa,
+            hpa: 0,
+            len,
+        };
+        // Safety: vm_pptdev_mmio is correct for VM_UNMAP_PPTDEV_MMIO.
+        unsafe { self.inner.ioctl(ioctls::VM_UNMAP_PPTDEV_MMIO, &mut req) }?;
+        Ok(())
+    }
+
+    /// Point a bound device's MSI at `addr`/`msg`. `numvec` of 0 turns
+    /// MSI off.
+    pub fn pptdev_msi(
+        &self,
+        pptfd: RawFd,
+        addr: u64,
+        msg: u64,
+        numvec: i32,
+    ) -> Result<()> {
+        let mut req = vm_pptdev_msi {
+            vcpu: 0,
+            pptfd,
+            numvec,
+            msg,
+            addr,
+        };
+        // Safety: vm_pptdev_msi is correct for VM_PPTDEV_MSI.
+        unsafe { self.inner.ioctl(ioctls::VM_PPTDEV_MSI, &mut req) }?;
         Ok(())
     }
 
@@ -508,7 +649,7 @@ impl VmmHdl {
 }
 
 impl AsRawFd for VmmHdl {
-    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+    fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
     }
 }

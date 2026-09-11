@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use slog::{error, info, warn, Logger};
 
-use vmm_core::hdl::VmmHdl;
+use vmm_core::hdl::{SuspendHow, VmmHdl};
 use vmm_core::machine::Machine;
 
 /// Atomic flag set by the SIGTERM signal handler.
@@ -90,13 +90,11 @@ impl HdlStop {
 
 impl GuestStop for HdlStop {
     fn request_poweroff(&self) -> io::Result<()> {
-        self.0
-            .suspend(bhyve_api::vm_suspend_how::VM_SUSPEND_POWEROFF as u32, 0)
+        self.0.suspend(SuspendHow::PowerOff, 0)
     }
 
     fn halt(&self) -> io::Result<()> {
-        self.0
-            .suspend(bhyve_api::vm_suspend_how::VM_SUSPEND_HALT as u32, 0)
+        self.0.suspend(SuspendHow::Halt, 0)
     }
 }
 

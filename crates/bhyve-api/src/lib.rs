@@ -252,7 +252,8 @@ impl VmmFd {
                 | VM_DESTROY_SELF
                 | VM_SET_AUTODESTRUCT
                 | VMM_INTERFACE_VERSION
-                | VM_VCPU_BARRIER,
+                | VM_VCPU_BARRIER
+                | VM_PMTMR_LOCATE,
         )
     }
 }

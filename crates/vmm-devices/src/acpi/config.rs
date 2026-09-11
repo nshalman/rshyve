@@ -65,7 +65,7 @@ impl AcpiConfig {
         if max_cpus < num_cpus {
             return Err(AcpiConfigError::MaxBelowBoot { num_cpus, max_cpus });
         }
-        let limit = bhyve_api::VM_MAXCPU as u32;
+        let limit = vmm_core::VM_MAXCPU;
         if max_cpus > limit {
             return Err(AcpiConfigError::AboveKernelLimit { max_cpus, limit });
         }

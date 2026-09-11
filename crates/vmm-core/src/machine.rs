@@ -29,6 +29,9 @@ use crate::pio::PioBus;
 use crate::vcpu::Vcpu;
 
 /// The 4 GiB boundary where high memory begins (above the MMIO hole).
+/// Most vCPUs one VM can have. The kernel's `VM_MAXCPU`.
+pub const VM_MAXCPU: u32 = bhyve_api::VM_MAXCPU as u32;
+
 const FOUR_GIB: u64 = 0x1_0000_0000;
 
 /// Default lowmem limit (below the MMIO hole).
@@ -204,9 +207,9 @@ impl Builder {
     /// adding ROM and other regions before finalization.
     pub fn build(self) -> anyhow::Result<MachineSetup> {
         anyhow::ensure!(
-            self.num_cpus > 0 && self.num_cpus <= bhyve_api::VM_MAXCPU as u32,
+            self.num_cpus > 0 && self.num_cpus <= VM_MAXCPU,
             "num_cpus must be 1..={}, got {}",
-            bhyve_api::VM_MAXCPU,
+            VM_MAXCPU,
             self.num_cpus,
         );
         anyhow::ensure!(

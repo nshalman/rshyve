@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
 use vmm_core::common::RWOp;
+use vmm_core::hdl::SuspendHow;
 use vmm_core::intr_pins::IntrPin;
 use vmm_core::pio::{PioBus, PioFn};
 
@@ -589,9 +590,7 @@ impl PS2Ctrl {
                     let reset_sink = state.reset_sink.clone();
                     drop(state);
                     if let Some(sink) = reset_sink {
-                        sink.suspend(
-                            bhyve_api::vm_suspend_how::VM_SUSPEND_RESET as u32,
-                        );
+                        sink.suspend(SuspendHow::Reset);
                     }
                 }
             }
@@ -730,16 +729,16 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingSink(Mutex<Vec<u32>>);
+    struct RecordingSink(Mutex<Vec<SuspendHow>>);
 
     impl RecordingSink {
-        fn recorded(&self) -> Vec<u32> {
+        fn recorded(&self) -> Vec<SuspendHow> {
             self.0.lock().expect("recording lock poisoned").clone()
         }
     }
 
     impl SuspendSink for RecordingSink {
-        fn suspend(&self, how: u32) {
+        fn suspend(&self, how: SuspendHow) {
             self.0.lock().expect("recording lock poisoned").push(how);
         }
     }
@@ -974,9 +973,6 @@ mod tests {
 
         bus.handle_out(PORT_PS2_CMD_STATUS, 1, 0xfe);
 
-        assert_eq!(
-            sink.recorded(),
-            vec![bhyve_api::vm_suspend_how::VM_SUSPEND_RESET as u32]
-        );
+        assert_eq!(sink.recorded(), vec![SuspendHow::Reset]);
     }
 }

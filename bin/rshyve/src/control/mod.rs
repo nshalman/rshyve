@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use slog::{error, warn, Logger};
 
-use vmm_core::hdl::VmmHdl;
+use vmm_core::hdl::{SuspendHow, VmmHdl};
 use vmm_core::mem::PhysMap;
 use vmm_devices::quiesce::NamedDevice;
 use vmm_machine::signal::GuestStop;
@@ -371,8 +371,10 @@ impl VmController {
         if !self.begin_stop() {
             return Ok(());
         }
-        let halt = bhyve_api::vm_suspend_how::VM_SUSPEND_HALT as u32;
-        release_paused_vm(|| self.hdl.suspend(halt, 0), || self.hdl.resume())
+        release_paused_vm(
+            || self.hdl.suspend(SuspendHow::Halt, 0),
+            || self.hdl.resume(),
+        )
     }
 
     /// Move to `Stopping`, and say whether this caller is the one that
@@ -394,7 +396,7 @@ impl VmController {
     }
 
     /// Latch `how`, then let a parked VM see it.
-    fn stop_for_signal(&self, how: u32) -> io::Result<()> {
+    fn stop_for_signal(&self, how: SuspendHow) -> io::Result<()> {
         if !self.begin_stop() {
             return self.hdl.suspend(how, 0);
         }
@@ -460,14 +462,11 @@ pub(crate) fn sigterm_stop(ctrl: Arc<VmController>) -> Arc<dyn GuestStop> {
 
 impl GuestStop for ControlStop {
     fn request_poweroff(&self) -> io::Result<()> {
-        self.0.stop_for_signal(
-            bhyve_api::vm_suspend_how::VM_SUSPEND_POWEROFF as u32,
-        )
+        self.0.stop_for_signal(SuspendHow::PowerOff)
     }
 
     fn halt(&self) -> io::Result<()> {
-        self.0
-            .stop_for_signal(bhyve_api::vm_suspend_how::VM_SUSPEND_HALT as u32)
+        self.0.stop_for_signal(SuspendHow::Halt)
     }
 }
 
