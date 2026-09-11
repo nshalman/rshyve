@@ -223,23 +223,57 @@ impl VsockMux {
         }
     }
 
-    /// Queue payload read from a host socket, stamped with this
-    /// connection's current credit. Returns false when the backlog is
-    /// full.
-    pub fn queue_host_data(&self, key: ConnKey, data: Vec<u8>) -> bool {
+    /// Queue payload read from a host socket, as much of it as the
+    /// guest's credit and the backlog allow, and take what went out of
+    /// `data`.
+    ///
+    /// The guest publishes a receive window per connection and drops
+    /// whatever arrives past it, so bytes sent over the window are not
+    /// slow, they are lost, and the guest reads a stream with a hole in
+    /// it. The window is [`VsockConn::peer_credit`], which fails closed.
+    ///
+    /// `data` is the caller's retry buffer: what goes is removed from
+    /// it, so a caller that offers the same buffer until it is empty
+    /// sends every byte exactly once. Returning a count to subtract, or
+    /// a bool meaning all or nothing, puts that on every caller, and a
+    /// caller that gets it wrong resends bytes the guest already has.
+    ///
+    /// Takes the connection lock and then the queue lock. Nothing here
+    /// takes them the other way round.
+    pub fn queue_host_data(&self, key: ConnKey, data: &mut Vec<u8>) {
         let mut conns = self.conns.lock().expect("conns lock");
         let Some(conn) = conns.get_mut(&key) else {
-            return true;
+            // Nothing knows this connection, so no window will ever open
+            // for it. Keeping the bytes would park the caller for the
+            // life of the VM.
+            data.clear();
+            return;
         };
+        let take = (conn.peer_credit() as usize).min(data.len());
+        if take == 0 {
+            // The guest's window is shut. It opens again on the next
+            // packet from the guest: every one carries fresh credit.
+            return;
+        }
         let (buf_alloc, fwd_cnt) = conn.our_credit();
-        conn.record_sent(data.len() as u32);
-        drop(conns);
-
         let mut hdr = self.hdr_for(key, OP_RW);
-        hdr.len = data.len() as u32;
+        hdr.len = take as u32;
         hdr.buf_alloc = buf_alloc;
         hdr.fwd_cnt = fwd_cnt;
-        self.push_rx(RxPacket { hdr, payload: data })
+        if !self.push_rx(RxPacket {
+            hdr,
+            payload: data[..take].to_vec(),
+        }) {
+            // The backlog is full, so nothing was queued: spend no
+            // credit and take nothing.
+            return;
+        }
+        // Only bytes really on their way count against the window. A
+        // packet the backlog refused would otherwise shut the window on
+        // bytes the guest never saw.
+        conn.record_sent(take as u32);
+        drop(conns);
+        data.drain(..take);
     }
 
     /// Tell the guest the host end has gone.
@@ -359,346 +393,4 @@ impl VsockMux {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const GUEST_CID: u64 = 3;
-
-    fn mux() -> VsockMux {
-        VsockMux::new(GUEST_CID)
-    }
-
-    fn guest_hdr(op: u16, guest_port: u32, host_port: u32) -> VsockHdr {
-        VsockHdr {
-            src_cid: GUEST_CID,
-            dst_cid: CID_HOST,
-            src_port: guest_port,
-            dst_port: host_port,
-            len: 0,
-            type_: TYPE_STREAM,
-            op,
-            flags: 0,
-            buf_alloc: 64 * 1024,
-            fwd_cnt: 0,
-        }
-    }
-
-    fn drain(m: &VsockMux) -> Vec<RxPacket> {
-        let mut out = Vec::new();
-        while let Some(p) = m.pop_rx() {
-            out.push(p);
-        }
-        out
-    }
-
-    /// A host peer that gives up before the guest answers leaves
-    /// nothing half open: the guest was only ever offered the
-    /// connection. Keeping the entry would let a peer that connects
-    /// and hangs up in a loop fill the table, and the cap then refuses
-    /// every later connection for the life of the VM.
-    #[test]
-    fn a_host_close_before_the_guest_answers_frees_the_slot() {
-        let m = mux();
-        let key = ConnKey {
-            guest_port: 1024,
-            host_port: 1,
-        };
-        assert!(m.start_host_connect(key));
-        assert_eq!(m.conn_count(), 1);
-
-        m.queue_host_close(key);
-
-        assert_eq!(
-            m.conn_count(),
-            0,
-            "a connection the guest never answered was never reclaimed"
-        );
-    }
-
-    #[test]
-    fn a_host_connect_queues_a_request_to_the_guest() {
-        let m = mux();
-        let key = ConnKey {
-            guest_port: 1024,
-            host_port: 50000,
-        };
-        m.start_host_connect(key);
-
-        let pkts = drain(&m);
-        assert_eq!(pkts.len(), 1);
-        assert_eq!(pkts[0].hdr.op, OP_REQUEST);
-        assert_eq!(pkts[0].hdr.src_cid, CID_HOST);
-        assert_eq!(pkts[0].hdr.dst_cid, GUEST_CID);
-        assert_eq!(pkts[0].hdr.dst_port, 1024);
-        assert_eq!(m.conn_count(), 1);
-    }
-
-    #[test]
-    fn the_guest_response_establishes_it() {
-        let m = mux();
-        let key = ConnKey {
-            guest_port: 1024,
-            host_port: 50000,
-        };
-        m.start_host_connect(key);
-        drain(&m);
-
-        let act =
-            m.on_guest_packet(&guest_hdr(OP_RESPONSE, 1024, 50000), vec![]);
-        assert_eq!(act, GuestAction::None);
-        assert!(drain(&m).is_empty(), "an accepted response needs no reply");
-    }
-
-    #[test]
-    fn guest_payload_is_delivered_to_the_host_socket() {
-        let m = mux();
-        let key = ConnKey {
-            guest_port: 1024,
-            host_port: 50000,
-        };
-        m.start_host_connect(key);
-        m.on_guest_packet(&guest_hdr(OP_RESPONSE, 1024, 50000), vec![]);
-        drain(&m);
-
-        let mut h = guest_hdr(OP_RW, 1024, 50000);
-        h.len = 5;
-        let act = m.on_guest_packet(&h, b"hello".to_vec());
-        assert_eq!(act, GuestAction::Deliver(key, b"hello".to_vec()));
-    }
-
-    #[test]
-    fn a_guest_request_opens_a_connection_outward() {
-        let m = mux();
-        let act = m.on_guest_packet(&guest_hdr(OP_REQUEST, 1024, 5000), vec![]);
-        assert_eq!(
-            act,
-            GuestAction::Connect(
-                ConnKey {
-                    guest_port: 1024,
-                    host_port: 5000
-                },
-                5000
-            )
-        );
-        assert_eq!(m.conn_count(), 1);
-    }
-
-    #[test]
-    fn accepting_a_guest_connect_answers_with_response() {
-        let m = mux();
-        m.on_guest_packet(&guest_hdr(OP_REQUEST, 1024, 5000), vec![]);
-        let key = ConnKey {
-            guest_port: 1024,
-            host_port: 5000,
-        };
-        m.accept_guest_connect(key);
-
-        let pkts = drain(&m);
-        assert_eq!(pkts.len(), 1);
-        assert_eq!(pkts[0].hdr.op, OP_RESPONSE);
-        assert_ne!(pkts[0].hdr.buf_alloc, 0, "must advertise a window");
-    }
-
-    #[test]
-    fn refusing_a_guest_connect_answers_with_rst() {
-        let m = mux();
-        m.on_guest_packet(&guest_hdr(OP_REQUEST, 1024, 5000), vec![]);
-        let key = ConnKey {
-            guest_port: 1024,
-            host_port: 5000,
-        };
-        m.refuse_guest_connect(key);
-
-        let pkts = drain(&m);
-        assert_eq!(pkts.len(), 1);
-        assert_eq!(pkts[0].hdr.op, OP_RST);
-        assert_eq!(m.conn_count(), 0);
-    }
-
-    /// A packet for a connection nobody knows must be answered, or the
-    /// guest retries forever.
-    #[test]
-    fn an_unknown_connection_gets_rst() {
-        let m = mux();
-        let act = m.on_guest_packet(&guest_hdr(OP_RW, 7, 9), b"x".to_vec());
-        assert_eq!(act, GuestAction::None);
-        let pkts = drain(&m);
-        assert_eq!(pkts.len(), 1);
-        assert_eq!(pkts[0].hdr.op, OP_RST);
-    }
-
-    /// An RST for an unknown connection must not be answered with
-    /// another RST, or two peers ping-pong forever.
-    #[test]
-    fn an_rst_for_an_unknown_connection_is_dropped() {
-        let m = mux();
-        m.on_guest_packet(&guest_hdr(OP_RST, 7, 9), vec![]);
-        assert!(drain(&m).is_empty());
-    }
-
-    /// A guest may address any CID it likes. Only the host's own is
-    /// routable here.
-    #[test]
-    fn a_packet_for_another_cid_is_refused() {
-        let m = mux();
-        let mut h = guest_hdr(OP_REQUEST, 1024, 5000);
-        h.dst_cid = 99;
-        let act = m.on_guest_packet(&h, vec![]);
-        assert_eq!(act, GuestAction::None);
-        assert_eq!(drain(&m)[0].hdr.op, OP_RST);
-        assert_eq!(m.conn_count(), 0, "no connection for a foreign CID");
-    }
-
-    #[test]
-    fn a_duplicate_request_is_refused_without_disturbing_the_original() {
-        let m = mux();
-        m.on_guest_packet(&guest_hdr(OP_REQUEST, 1024, 5000), vec![]);
-        drain(&m);
-        let act = m.on_guest_packet(&guest_hdr(OP_REQUEST, 1024, 5000), vec![]);
-        assert_eq!(act, GuestAction::None);
-        assert_eq!(drain(&m)[0].hdr.op, OP_RST);
-        assert_eq!(m.conn_count(), 1);
-    }
-
-    #[test]
-    fn shutdown_from_the_guest_closes_and_reports() {
-        let m = mux();
-        m.on_guest_packet(&guest_hdr(OP_REQUEST, 1024, 5000), vec![]);
-        drain(&m);
-        let key = ConnKey {
-            guest_port: 1024,
-            host_port: 5000,
-        };
-
-        let mut h = guest_hdr(OP_SHUTDOWN, 1024, 5000);
-        h.flags = SHUTDOWN_RCV | SHUTDOWN_SEND;
-        assert_eq!(m.on_guest_packet(&h, vec![]), GuestAction::Close(key));
-        assert_eq!(m.conn_count(), 0);
-    }
-
-    /// The cap exists so a host writer cannot grow VMM memory without
-    /// bound while the guest is not reading.
-    #[test]
-    fn the_rx_backlog_is_bounded() {
-        let m = mux();
-        let key = ConnKey {
-            guest_port: 1024,
-            host_port: 50000,
-        };
-        m.start_host_connect(key);
-        m.on_guest_packet(&guest_hdr(OP_RESPONSE, 1024, 50000), vec![]);
-
-        let chunk = vec![0u8; 64 * 1024];
-        let mut accepted = 0;
-        for _ in 0..64 {
-            if m.queue_host_data(key, chunk.clone()) {
-                accepted += 1;
-            }
-        }
-        assert!(accepted > 0, "some data should be accepted");
-        assert!(accepted < 64, "the backlog must refuse eventually");
-        assert!(accepted * chunk.len() <= RX_BACKLOG_MAX + chunk.len());
-    }
-
-    /// Dropping a control packet would wedge the connection it belongs
-    /// to, so the cap must not apply to them.
-    #[test]
-    fn control_packets_bypass_the_backlog_cap() {
-        let m = mux();
-        let key = ConnKey {
-            guest_port: 1024,
-            host_port: 50000,
-        };
-        m.start_host_connect(key);
-        m.on_guest_packet(&guest_hdr(OP_RESPONSE, 1024, 50000), vec![]);
-        while m.queue_host_data(key, vec![0u8; 64 * 1024]) {}
-
-        assert!(
-            m.push_rx(RxPacket::control(m.hdr_for(key, OP_RST))),
-            "a control packet must still be admitted when full"
-        );
-    }
-
-    #[test]
-    fn popping_frees_backlog_room() {
-        let m = mux();
-        let key = ConnKey {
-            guest_port: 1024,
-            host_port: 50000,
-        };
-        m.start_host_connect(key);
-        m.on_guest_packet(&guest_hdr(OP_RESPONSE, 1024, 50000), vec![]);
-        while m.queue_host_data(key, vec![0u8; 64 * 1024]) {}
-
-        drain(&m);
-        assert!(
-            m.queue_host_data(key, vec![0u8; 64 * 1024]),
-            "room must come back once the guest has taken the packets"
-        );
-    }
-
-    /// Each connection costs a host socket and a reader thread, so a
-    /// guest that opens them faster than it closes them must be stopped
-    /// at a cap rather than left to exhaust the VMM.
-    #[test]
-    fn the_guest_cannot_grow_the_connection_table_without_bound() {
-        let m = mux();
-        for port in 0..(MAX_CONNS as u32 + 64) {
-            m.on_guest_packet(&guest_hdr(OP_REQUEST, port, 5000), vec![]);
-            drain(&m);
-        }
-        assert_eq!(m.conn_count(), MAX_CONNS);
-
-        // The one over the cap is refused, and told so.
-        let act =
-            m.on_guest_packet(&guest_hdr(OP_REQUEST, 900_000, 5000), vec![]);
-        assert_eq!(act, GuestAction::None);
-        assert_eq!(drain(&m)[0].hdr.op, OP_RST);
-    }
-
-    /// The same cap from the host side, where a peer that connects over
-    /// and over is the one driving it.
-    #[test]
-    fn host_connects_stop_at_the_connection_cap() {
-        let m = mux();
-        for port in 0..MAX_CONNS as u32 {
-            assert!(m.start_host_connect(ConnKey {
-                guest_port: 1024,
-                host_port: 50_000 + port,
-            }));
-            drain(&m);
-        }
-
-        assert!(!m.start_host_connect(ConnKey {
-            guest_port: 1024,
-            host_port: 40_000,
-        }));
-        assert_eq!(m.conn_count(), MAX_CONNS);
-        assert!(
-            drain(&m).is_empty(),
-            "a refused connect must not ask the guest to open one"
-        );
-    }
-
-    /// A control packet carries no payload, so the byte cap never sees
-    /// it. A guest that stops draining must still not be able to grow
-    /// the queue by sending packets the device has to answer.
-    #[test]
-    fn control_packets_cannot_grow_the_rx_queue_without_bound() {
-        let m = mux();
-        for port in 0..(RX_PACKETS_MAX as u32 * 2) {
-            m.on_guest_packet(&guest_hdr(OP_RW, port, 9), vec![]);
-        }
-        assert_eq!(m.conn_count(), 0, "none of these open a connection");
-        assert_eq!(drain(&m).len(), RX_PACKETS_MAX);
-    }
-
-    #[test]
-    fn host_ports_are_unique() {
-        let m = mux();
-        let a = m.alloc_host_port();
-        let b = m.alloc_host_port();
-        assert_ne!(a, b);
-        assert!(a >= EPHEMERAL_PORT_BASE);
-    }
-}
+mod tests;
