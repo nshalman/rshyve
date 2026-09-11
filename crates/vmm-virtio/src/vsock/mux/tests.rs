@@ -642,3 +642,67 @@ fn a_lying_guest_gets_no_more_than_it_advertised() {
         );
     }
 }
+
+/// The guest's own send window reopens only when it hears our
+/// `fwd_cnt`, and the only carrier of that count is a packet we send.
+/// A payload packet that leaves it at zero stalls the guest for good
+/// once it has sent one window's worth. Kills two mutations: not
+/// counting what we take from the guest, and not stamping the count
+/// on the payload we send back.
+#[test]
+fn payload_tells_the_guest_how_much_of_its_stream_we_took() {
+    let m = mux();
+    let key = ConnKey {
+        guest_port: 1024,
+        host_port: 50000,
+    };
+    const WINDOW: u32 = 4096;
+    const FROM_GUEST: usize = 3000;
+    established(&m, key, WINDOW);
+
+    let mut h = guest_hdr(OP_RW, key.guest_port, key.host_port);
+    h.buf_alloc = WINDOW;
+    m.on_guest_packet(&h, vec![0u8; FROM_GUEST]);
+    drain(&m);
+
+    let mut data = vec![1u8; 512];
+    assert_eq!(offer(&m, key, &mut data), 512);
+
+    let pkts = drain(&m);
+    assert_eq!(pkts.len(), 1);
+    assert_eq!(pkts[0].hdr.op, OP_RW);
+    assert_eq!(
+        pkts[0].hdr.fwd_cnt, FROM_GUEST as u32,
+        "the guest's send window never reopens"
+    );
+    assert_eq!(pkts[0].hdr.buf_alloc, DEFAULT_BUF_ALLOC, "our own window");
+}
+
+/// A guest that opens the connection publishes its window on the
+/// REQUEST, and it may send nothing more before it reads: a host
+/// service that speaks first is the usual shape. Dropping the credit
+/// off that REQUEST leaves the window shut until the guest happens to
+/// send, which for such a service is never. The mirror of the zero
+/// window we used to put on a REQUEST of our own. Kills the mutation
+/// of building the connection without absorbing the REQUEST's credit.
+#[test]
+fn a_guest_request_opens_the_window_it_names() {
+    let m = mux();
+    let key = ConnKey {
+        guest_port: 1024,
+        host_port: 5000,
+    };
+    const WINDOW: u32 = 8192;
+    let mut h = guest_hdr(OP_REQUEST, key.guest_port, key.host_port);
+    h.buf_alloc = WINDOW;
+    m.on_guest_packet(&h, vec![]);
+    m.accept_guest_connect(key);
+    drain(&m);
+
+    let mut data = vec![4u8; CHUNK];
+    assert_eq!(
+        offer(&m, key, &mut data),
+        WINDOW as usize,
+        "the window the guest named on its REQUEST was dropped"
+    );
+}
