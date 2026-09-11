@@ -124,6 +124,27 @@ fn a_host_close_before_the_guest_answers_frees_the_slot() {
     );
 }
 
+/// A REQUEST is the first header the guest sees on a host-initiated
+/// connection, and the guest takes its send window from it. A zero
+/// there leaves a guest that speaks first with nothing to speak into,
+/// waiting on a window that only our own payload would open.
+#[test]
+fn a_request_carries_the_window_the_guest_may_send_into() {
+    let m = mux();
+    let key = ConnKey {
+        guest_port: 1024,
+        host_port: 50000,
+    };
+    assert!(m.start_host_connect(key));
+
+    let pkts = drain(&m);
+    assert_eq!(pkts[0].hdr.op, OP_REQUEST);
+    assert_eq!(
+        pkts[0].hdr.buf_alloc, DEFAULT_BUF_ALLOC,
+        "a REQUEST that advertises no window"
+    );
+}
+
 #[test]
 fn a_host_connect_queues_a_request_to_the_guest() {
     let m = mux();

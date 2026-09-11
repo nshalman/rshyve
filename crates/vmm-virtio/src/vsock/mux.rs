@@ -204,7 +204,25 @@ impl VsockMux {
     /// From this point any thread's `deliver_rx` may hand the REQUEST to
     /// the guest, so the caller must have finished with the host socket.
     pub fn announce_host_connect(&self, key: ConnKey) {
-        self.push_rx(RxPacket::control(self.hdr_for(key, OP_REQUEST)));
+        let mut hdr = self.hdr_for(key, OP_REQUEST);
+        self.stamp_credit(key, &mut hdr);
+        self.push_rx(RxPacket::control(hdr));
+    }
+
+    /// Put this connection's receive window on a packet.
+    ///
+    /// Every header carries the credit fields (VIRTIO 1.3 5.10.6.3),
+    /// and the guest takes them from whichever packet opens the
+    /// connection. A zero window there tells the guest it may send
+    /// nothing, and a guest that speaks first then waits for a window
+    /// that only our own payload would ever open.
+    fn stamp_credit(&self, key: ConnKey, hdr: &mut VsockHdr) {
+        let conns = self.conns.lock().expect("conns lock");
+        if let Some(conn) = conns.get(&key) {
+            let (buf_alloc, fwd_cnt) = conn.our_credit();
+            hdr.buf_alloc = buf_alloc;
+            hdr.fwd_cnt = fwd_cnt;
+        }
     }
 
     /// Header addressed from the host side of `key` to the guest.
@@ -372,16 +390,11 @@ impl VsockMux {
 
     /// Accept a guest-initiated connection the host side agreed to.
     pub fn accept_guest_connect(&self, key: ConnKey) {
-        let (buf_alloc, fwd_cnt) = {
-            let conns = self.conns.lock().expect("conns lock");
-            match conns.get(&key) {
-                Some(c) => c.our_credit(),
-                None => return,
-            }
-        };
+        if !self.conns.lock().expect("conns lock").contains_key(&key) {
+            return;
+        }
         let mut hdr = self.hdr_for(key, OP_RESPONSE);
-        hdr.buf_alloc = buf_alloc;
-        hdr.fwd_cnt = fwd_cnt;
+        self.stamp_credit(key, &mut hdr);
         self.push_rx(RxPacket::control(hdr));
     }
 
