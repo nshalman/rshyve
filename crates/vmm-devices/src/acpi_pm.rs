@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use slog;
 use vmm_core::common::RWOp;
+use vmm_core::hdl::SuspendHow;
 use vmm_core::pio::{PioBus, PioFn};
 
 /// ACPI PM base I/O port.
@@ -67,8 +68,7 @@ const PM1_ALWAYS_ZERO: u16 = 0xC003;
 /// Indirected through a trait so the register emulation is unit-testable
 /// without a live /dev/vmm handle.
 pub trait SuspendSink: Send + Sync + 'static {
-    /// `how` is a `bhyve_api::vm_suspend_how` discriminant.
-    fn suspend(&self, how: u32);
+    fn suspend(&self, how: SuspendHow);
 }
 
 /// Suspend sink backed by a live vmm handle.
@@ -88,17 +88,17 @@ impl HdlSuspendSink {
 }
 
 impl SuspendSink for HdlSuspendSink {
-    fn suspend(&self, how: u32) {
+    fn suspend(&self, how: SuspendHow) {
         // A device request is not attributable to a specific vCPU.
         match self.hdl.suspend(how, -1) {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::EALREADY) => {
                 // Another vCPU may have already latched the transition.
-                slog::debug!(self.log, "VM suspend already latched"; "how" => how);
+                slog::debug!(self.log, "VM suspend already latched"; "how" => %how);
             }
             Err(e) => {
                 slog::error!(self.log, "failed to suspend VM";
-                    "how" => how, "error" => %e);
+                    "how" => %how, "error" => %e);
             }
         }
     }
@@ -241,9 +241,7 @@ impl AcpiPm {
                     slog::info!(self.log, "guest requested ACPI S5 poweroff");
                     // Avoid blocking another vCPU on device state during the suspend ioctl.
                     drop(inner);
-                    self.sink.suspend(
-                        bhyve_api::vm_suspend_how::VM_SUSPEND_POWEROFF as u32,
-                    );
+                    self.sink.suspend(SuspendHow::PowerOff);
                 }
             }
         }
@@ -283,9 +281,7 @@ impl AcpiPm {
                     slog::info!(self.log, "guest requested reset via 0xCF9");
                     // Avoid blocking another vCPU on device state during the suspend ioctl.
                     drop(inner);
-                    self.sink.suspend(
-                        bhyve_api::vm_suspend_how::VM_SUSPEND_RESET as u32,
-                    );
+                    self.sink.suspend(SuspendHow::Reset);
                 }
             }
         }
@@ -296,20 +292,20 @@ impl AcpiPm {
 mod tests {
     use super::*;
 
-    struct RecordingSink(Mutex<Vec<u32>>);
+    struct RecordingSink(Mutex<Vec<SuspendHow>>);
 
     impl RecordingSink {
         fn new() -> Arc<Self> {
             Arc::new(Self(Mutex::new(Vec::new())))
         }
 
-        fn recorded(&self) -> Vec<u32> {
+        fn recorded(&self) -> Vec<SuspendHow> {
             self.0.lock().expect("recording lock poisoned").clone()
         }
     }
 
     impl SuspendSink for RecordingSink {
-        fn suspend(&self, how: u32) {
+        fn suspend(&self, how: SuspendHow) {
             self.0.lock().expect("recording lock poisoned").push(how);
         }
     }
@@ -333,10 +329,7 @@ mod tests {
 
         bus.handle_out(PMBASE + 4, 2, (PM1_SLP_EN | (5 << 10)) as u32);
 
-        assert_eq!(
-            sink.recorded(),
-            vec![bhyve_api::vm_suspend_how::VM_SUSPEND_POWEROFF as u32]
-        );
+        assert_eq!(sink.recorded(), vec![SuspendHow::PowerOff]);
     }
 
     #[test]
@@ -363,10 +356,7 @@ mod tests {
 
         bus.handle_out(0xCF9, 1, 0x06);
 
-        assert_eq!(
-            sink.recorded(),
-            vec![bhyve_api::vm_suspend_how::VM_SUSPEND_RESET as u32]
-        );
+        assert_eq!(sink.recorded(), vec![SuspendHow::Reset]);
     }
 
     #[test]

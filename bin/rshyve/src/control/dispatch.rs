@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use slog::error;
+use vmm_core::hdl::SuspendHow;
 
 use vmm_machine::{
     CpuHotplugError, CpuSlots, DeviceRegistry, HotplugError, MemHotplugEngine,
@@ -99,11 +100,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                 let _ = ctrl.hdl.resume();
             }
 
-            use bhyve_api::vm_suspend_how;
-            match ctrl
-                .hdl
-                .suspend(vm_suspend_how::VM_SUSPEND_POWEROFF as u32, 0)
-            {
+            match ctrl.hdl.suspend(SuspendHow::PowerOff, 0) {
                 Ok(()) => {
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Stopping);
@@ -128,11 +125,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                 let _ = ctrl.hdl.resume();
             }
 
-            use bhyve_api::vm_suspend_how;
-            match ctrl
-                .hdl
-                .suspend(vm_suspend_how::VM_SUSPEND_RESET as u32, -1)
-            {
+            match ctrl.hdl.suspend(SuspendHow::Reset, -1) {
                 Ok(()) => {
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Stopping);
@@ -180,8 +173,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                 let _ = ctrl.hdl.resume();
             }
 
-            use bhyve_api::vm_suspend_how;
-            match ctrl.hdl.suspend(vm_suspend_how::VM_SUSPEND_HALT as u32, 0) {
+            match ctrl.hdl.suspend(SuspendHow::Halt, 0) {
                 Ok(()) => {
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Stopping);

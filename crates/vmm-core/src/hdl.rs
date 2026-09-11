@@ -16,12 +16,43 @@ use std::time::Duration;
 use bhyve_api::{
     ioctls, vcpu_cpuid_entry, vm_capability, vm_create_req, vm_isa_irq,
     vm_lapic_msi, vm_memmap, vm_memseg, vm_npt_operation, vm_rtc_data,
-    vm_suspend, vm_vcpu_cpuid_config, vmm_dirty_tracker, ApiVersion, VmmCtlFd,
-    VmmFd, VCF_RESERVOIR_MEM, VCF_TRACK_DIRTY, VM_MAX_SEG_NAMELEN,
-    VM_MEMMAP_F_WIRED, VNO_FLAG_BITMAP_IN, VNO_OP_SET_DIRTY,
+    vm_suspend, vm_suspend_how, vm_vcpu_cpuid_config, vmm_dirty_tracker,
+    ApiVersion, VmmCtlFd, VmmFd, VCF_RESERVOIR_MEM, VCF_TRACK_DIRTY,
+    VM_MAX_SEG_NAMELEN, VM_MEMMAP_F_WIRED, VNO_FLAG_BITMAP_IN,
+    VNO_OP_SET_DIRTY,
 };
 
 use crate::mem::Prot;
+
+/// How a VM is asked to stop. The kernel latches the first request and
+/// answers `EALREADY` to the rest.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SuspendHow {
+    Reset,
+    PowerOff,
+    Halt,
+}
+
+impl SuspendHow {
+    fn raw(self) -> u32 {
+        let how = match self {
+            SuspendHow::Reset => vm_suspend_how::VM_SUSPEND_RESET,
+            SuspendHow::PowerOff => vm_suspend_how::VM_SUSPEND_POWEROFF,
+            SuspendHow::Halt => vm_suspend_how::VM_SUSPEND_HALT,
+        };
+        how as u32
+    }
+}
+
+impl std::fmt::Display for SuspendHow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SuspendHow::Reset => "reset",
+            SuspendHow::PowerOff => "poweroff",
+            SuspendHow::Halt => "halt",
+        })
+    }
+}
 
 /// Options for creating a new VM instance.
 #[derive(Debug, Clone, Default)]
@@ -378,9 +409,13 @@ impl VmmHdl {
         Ok(())
     }
 
-    /// Suspend the VM (power-off, reset, halt, or triple-fault).
-    pub fn suspend(&self, how: u32, source: i32) -> Result<()> {
-        let mut req = vm_suspend { how, source };
+    /// Suspend the VM. `source` is the requesting vCPU, or -1 for a
+    /// device or operator request.
+    pub fn suspend(&self, how: SuspendHow, source: i32) -> Result<()> {
+        let mut req = vm_suspend {
+            how: how.raw(),
+            source,
+        };
         // Safety: vm_suspend is the correct struct for VM_SUSPEND.
         unsafe { self.inner.ioctl(ioctls::VM_SUSPEND, &mut req) }?;
         Ok(())

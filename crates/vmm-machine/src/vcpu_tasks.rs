@@ -18,7 +18,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
 
-use bhyve_api::{vm_reg_name, vm_suspend_how};
+use bhyve_api::vm_reg_name;
 use slog::{debug, error, info, warn, Logger};
 
 #[usdt::provider(provider = "vmm")]
@@ -31,7 +31,7 @@ mod probes {
 use vmm_core::exits::{
     InoutReq, InoutRes, MmioReq, MmioRes, Suspend, VmEntry, VmExitKind,
 };
-use vmm_core::hdl::VmmHdl;
+use vmm_core::hdl::{SuspendHow, VmmHdl};
 use vmm_core::mmio::MmioBus;
 use vmm_core::msr::{MsrHandler, RdmsrOutcome, WrmsrOutcome};
 use vmm_core::pio::PioBus;
@@ -100,11 +100,11 @@ fn fatal_exit(
         "cs" => diagnostic_cs(vcpu),
     );
 
-    match hdl.suspend(vm_suspend_how::VM_SUSPEND_HALT as u32, vcpu_id) {
+    match hdl.suspend(SuspendHow::Halt, vcpu_id) {
         Ok(()) => {}
         Err(error) if error.raw_os_error() == Some(libc::EALREADY) => {
             debug!(log, "VM suspend already latched";
-                "how" => vm_suspend_how::VM_SUSPEND_HALT as u32);
+                "how" => %SuspendHow::Halt);
         }
         Err(error) => {
             error!(log, "failed to halt VM after fatal vCPU exit";
@@ -535,10 +535,7 @@ fn handle_wrmsr(
                 return;
             }
             WrmsrOutcome::Reset => {
-                use bhyve_api::vm_suspend_how;
-                if let Err(e) = hdl
-                    .suspend(vm_suspend_how::VM_SUSPEND_RESET as u32, vcpu_id)
-                {
+                if let Err(e) = hdl.suspend(SuspendHow::Reset, vcpu_id) {
                     warn!(log, "reset suspend failed"; "error" => %e);
                 }
                 return;
