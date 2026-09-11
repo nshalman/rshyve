@@ -207,10 +207,21 @@ impl VirtioVsock {
                     completion.complete(head, 0);
                 }
             }
+            // Arm the kick before leaving, on every path out.
+            //
+            // Skipping this when the request cap is hit is only sound
+            // for a drain that comes straight back, and this one does
+            // not: the stash is the device's whole supply of chains,
+            // and the only thing that refills it is the guest kicking.
+            // Linux fills the ring the moment it probes, so the very
+            // first pass hits the cap, and a device that left
+            // `avail_event` unarmed there was never kicked again: it
+            // spent the chains it had, then held every packet for a
+            // guest that could not be told. New connections hang with
+            // it, because a RESPONSE needs a chain like any other
+            // packet.
             let hit_request_cap = popped >= max_requests;
-            if !hit_request_cap {
-                queue.update_used_event(physmap);
-            }
+            queue.update_used_event(physmap);
             if queue_drain_should_stop(queue, before, hit_request_cap, physmap)
             {
                 break;

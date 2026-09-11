@@ -240,6 +240,48 @@ fn rx_ring() -> (Arc<PhysMap>, Vec<VirtQueue>) {
     (physmap, vec![queue])
 }
 
+/// A receive queue with EVENT_IDX on and every slot filled, which is
+/// what Linux's virtio_vsock posts as soon as it probes.
+fn rx_ring_full() -> (Arc<PhysMap>, Vec<VirtQueue>) {
+    let physmap = Arc::new(
+        PhysMap::new_anon(DESC_GPA, 0x2000).expect("create queue memory"),
+    );
+    let mut queue = VirtQueue::new(RING_SIZE);
+    queue.set_addr_modern(DESC_GPA, AVAIL_GPA, USED_GPA);
+    queue.set_event_idx(true);
+    for i in 0..RING_SIZE {
+        write_desc(
+            &physmap,
+            u64::from(i),
+            BUF_GPA + u64::from(i) * 64,
+            64,
+            crate::bits::VRING_DESC_F_WRITE,
+            0,
+        );
+        physmap
+            .lookup(AVAIL_GPA + 4 + u64::from(i) * 2, 2)
+            .expect("mapped avail entry")
+            .write::<u16>(&i)
+            .expect("write avail entry");
+    }
+    physmap
+        .lookup(AVAIL_GPA + 2, 2)
+        .expect("mapped avail index")
+        .write::<u16>(&RING_SIZE)
+        .expect("write avail index");
+    (physmap, vec![queue])
+}
+
+/// The device's own "kick me past here" threshold, which lives at the
+/// end of the used ring (VIRTIO 1.3 sec 2.7.7).
+fn avail_event(physmap: &PhysMap) -> u16 {
+    physmap
+        .lookup(USED_GPA + 4 + u64::from(RING_SIZE) * 8, 2)
+        .expect("mapped avail event")
+        .read::<u16>()
+        .expect("read avail event")
+}
+
 fn used_idx(physmap: &PhysMap) -> u16 {
     physmap
         .lookup(USED_GPA + 2, 2)
@@ -917,6 +959,41 @@ fn the_reader_offers_every_byte_once_through_a_small_window() {
 
     let _peer = writer.join().expect("join the host peer");
     reader.join().expect("join the reader");
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Taking the guest's whole ring in one pass must still arm the kick.
+///
+/// `avail_event` is how the device asks to be told about new chains.
+/// A guest with EVENT_IDX reads it and stays quiet while it is behind
+/// the index the guest is adding at, so a device that leaves it
+/// unarmed is never kicked again. It then spends the chains it already
+/// holds and goes deaf: packets queue for a guest that cannot be
+/// given them, and every later connection hangs, because a RESPONSE
+/// needs a chain like any other packet.
+///
+/// Linux fills the whole ring the moment it probes, so this is the
+/// first pass, not a corner. Kills the mutation of arming only when
+/// the pass stopped short of the request cap.
+#[test]
+fn a_ring_taken_whole_still_arms_the_next_kick() {
+    let (physmap, mut queues) = rx_ring_full();
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+
+    vsock.notify_queue(VSOCK_RX_QUEUE, &mut queues, &physmap);
+
+    assert_eq!(
+        vsock.shared.pending_rx.lock().expect("pending").len(),
+        usize::from(RING_SIZE),
+        "the whole ring should be stashed",
+    );
+    assert_eq!(
+        avail_event(&physmap),
+        RING_SIZE,
+        "avail_event left behind the ring: the guest will never kick again",
+    );
+
     vsock.halt();
     let _ = std::fs::remove_dir_all(&dir);
 }
