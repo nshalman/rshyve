@@ -17,8 +17,10 @@
 //! | COM1 | 0x3F8  |  4  |
 //! | COM2 | 0x2F8  |  3  |
 
+pub mod backend;
 pub mod lpc;
 pub mod uart16550;
 
+pub use backend::{attach, SerialBackend};
 pub use lpc::LpcUart;
 pub use uart16550::Uart;

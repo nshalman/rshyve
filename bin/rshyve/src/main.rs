@@ -22,6 +22,7 @@ use vmm_core::machine::{Machine, MachineSetup};
 use vmm_core::msr::MsrHandler;
 use vmm_devices::acpi;
 use vmm_devices::chipset::i440fx::I440FxChipset;
+use vmm_devices::uart::backend::SerialBackend;
 use vmm_devices::uart::lpc::{self, LpcUart};
 use vmm_devices::InputBroker;
 use vmm_machine::{
@@ -188,7 +189,7 @@ fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
         mem_size,
         create_opts: CreateOpts {
             force: true,
-            use_reservoir: cli.wire_memory,
+            use_reservoir: cli.use_reservoir(),
             track_dirty: cli.track_dirty && !cli.no_track_dirty,
         },
         banner: "rshyve starting",
@@ -553,6 +554,23 @@ fn reject_unmigratable_destination(
     Ok(())
 }
 
+/// Kernel command line used when neither `--cmdline` nor
+/// `--cmdline-base64` is given. It names `ttyS0`, which is why COM1 is
+/// always attached.
+const DEFAULT_CMDLINE: &str = "console=ttyS0 earlyprintk=serial";
+
+/// The guest kernel command line, from whichever spelling was given.
+///
+/// Both spellings resolve through `Cli::kernel_cmdline`, which is also
+/// where the length bound and the NUL and control-byte checks live.
+/// Reading `cli.cmdline` here instead would accept
+/// `--cmdline-base64` and then boot the guest without it.
+fn resolved_cmdline(cli: &Cli) -> anyhow::Result<String> {
+    Ok(cli
+        .kernel_cmdline()?
+        .unwrap_or_else(|| DEFAULT_CMDLINE.to_string()))
+}
+
 /// If direct-booting a kernel, load it into guest RAM and return the
 /// entry point address.
 fn load_direct_boot_kernel(
@@ -565,14 +583,11 @@ fn load_direct_boot_kernel(
     log: &Logger,
 ) -> anyhow::Result<()> {
     if let Some(ref kernel) = kernel_image {
-        let cmdline = cli
-            .cmdline
-            .as_deref()
-            .unwrap_or("console=ttyS0 earlyprintk=serial");
+        let cmdline = resolved_cmdline(cli)?;
         let acpi_rsdp_addr = acpi_tables.rsdp_addr();
         let entry = kernel.load(
             machine.memctx(),
-            cmdline,
+            &cmdline,
             initrd_image.as_ref(),
             mem_size,
             acpi_rsdp_addr,
@@ -1026,6 +1041,13 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
             log,
         )?;
     }
+
+    // The guest can run now, so tell the brand. `vmadm create` waits on
+    // this rename, not on the process, and gives up after 300 s. C
+    // bhyve does it at the same point, bhyverun.c:915. It must also
+    // stay ahead of any privilege drop, since the rename needs file
+    // access.
+    vmm_machine::provision::mark_provisioned(log);
 
     // Phase 9: Spawn vCPU threads. The fleet, not the fixed set,
     // because a CPU added later joins the same event channel and the
@@ -1499,14 +1521,15 @@ fn parse_and_create_pci_device(
 /// - `stdio` or absent → stdout/stdin
 /// - `socket,/path` → Unix domain socket (host metadata agent connects)
 /// - `/dev/zconsole` or any path → open as read/write device
+///
+/// The last two forms of backend live in `vmm_devices::uart::backend`,
+/// so this binary and firehyve serve a zone console the same way.
 fn setup_serial_io(
     uart: &Arc<LpcUart>,
     config: Option<&str>,
     name: &str,
     log: &Logger,
 ) -> anyhow::Result<()> {
-    use std::io::{Read, Write};
-
     // Handle "socket,/path" — create a Unix domain socket listener
     // that the host-side metadata agent connects to.
     if let Some(path) = config.and_then(|c| c.strip_prefix("socket,")) {
@@ -1514,162 +1537,17 @@ fn setup_serial_io(
         return Ok(());
     }
 
-    match config {
-        None | Some("stdio") => {
-            // stdout for TX, stdin for RX
-            uart.set_tx_sink(Box::new(|b: u8| {
-                if let Err(e) = std::io::stdout().write_all(&[b]) {
-                    eprintln!("[serial] stdout write error: {}", e);
-                }
-                let _ = std::io::stdout().flush();
-            }));
-
-            let uart_input = uart.clone();
-            thread::Builder::new()
-                .name(format!("{name}-input"))
-                .spawn(move || {
-                    let stdin = std::io::stdin();
-                    let mut buf = [0u8; 1];
-                    loop {
-                        match stdin.lock().read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                uart_input.input_byte(buf[0]);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                })
-                .expect("failed to spawn serial input thread");
-            info!(log, "{name} connected to stdio");
-        }
-        Some(path) => {
-            // Open using libc::open() like C-bhyve to ensure proper
-            // pty initialization on illumos. Rust's File::open may
-            // not trigger the same STREAMS module setup.
-            let c_path = std::ffi::CString::new(path).unwrap();
-            let fd = unsafe {
-                libc::open(
-                    c_path.as_ptr(),
-                    libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                )
-            };
-            if fd >= 0 {
-                {
-                    // Match C-bhyve: cfmakeraw + CLOCAL, blocking mode.
-                    // C-bhyve opens with O_NONBLOCK but then leaves it
-                    // in blocking mode (the O_NONBLOCK is only for the
-                    // open() call to avoid carrier wait). Blocking writes
-                    // to zconsole work because zoneadmd holds the master
-                    // side open, preventing buffer-full stalls.
-                    #[cfg(target_os = "illumos")]
-                    unsafe {
-                        let mut termios: libc::termios = std::mem::zeroed();
-                        if libc::tcgetattr(fd, &mut termios) == 0 {
-                            libc::cfmakeraw(&mut termios);
-                            termios.c_cflag |= libc::CLOCAL;
-                            libc::tcsetattr(fd, libc::TCSANOW, &termios);
-                        }
-                        // Keep O_NONBLOCK set. On illumos, open() with
-                        // O_NONBLOCK is transient, but we explicitly set
-                        // it for writes: zconsole writes must not block
-                        // the vCPU when no console client is connected
-                        // (pty buffer full). The read path uses poll()
-                        // so EAGAIN is handled correctly.
-                        libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-                    }
-
-                    let is_tty = unsafe { libc::isatty(fd) } != 0;
-                    eprintln!(
-                        "[serial] fd={} isatty={} path={}",
-                        fd, is_tty, path
-                    );
-
-                    // TX: dup the fd for writes
-                    // Guest-reset re-exec must not inherit backend fds.
-                    let write_fd =
-                        unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-                    // TX: write directly from vCPU using non-blocking write.
-                    let tx_err_count = std::sync::atomic::AtomicU32::new(0);
-                    uart.set_tx_sink(Box::new(move |b: u8| {
-                        let ret = unsafe {
-                            libc::write(
-                                write_fd,
-                                &b as *const u8 as *const _,
-                                1,
-                            )
-                        };
-                        if ret < 0 {
-                            let n = tx_err_count.fetch_add(
-                                1,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            if n < 3 {
-                                let err = std::io::Error::last_os_error();
-                                eprintln!(
-                                    "[serial-tx] write error: {} (fd={})",
-                                    err, write_fd
-                                );
-                            }
-                        }
-                    }));
-
-                    // RX: dup the fd for reading. We use poll() with a
-                    // blocking fd — do NOT set O_NONBLOCK because dup'd
-                    // fds share the file status flags and nonblock would
-                    // affect the write path too (causing dropped console data).
-                    let uart_input = uart.clone();
-                    // Guest-reset re-exec must not inherit backend fds.
-                    let read_fd_dup =
-                        unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-                    thread::Builder::new()
-                        .name(format!("{name}-input"))
-                        .spawn(move || {
-                            let mut buf = [0u8; 64];
-                            loop {
-                                // Poll for readable data
-                                let mut pfd = libc::pollfd {
-                                    fd: read_fd_dup,
-                                    events: libc::POLLIN,
-                                    revents: 0,
-                                };
-                                let ret = unsafe { libc::poll(&mut pfd, 1, 1000) };
-                                if ret < 0 {
-                                    let err = std::io::Error::last_os_error();
-                                    if err.kind() == std::io::ErrorKind::Interrupted { continue; }
-                                    break;
-                                }
-                                if ret == 0 { continue; } // timeout
-                                if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 { break; }
-                                if pfd.revents & libc::POLLIN != 0 {
-                                    let n = unsafe {
-                                        libc::read(read_fd_dup, buf.as_mut_ptr() as *mut _, buf.len())
-                                    };
-                                    if n <= 0 {
-                                        if n < 0 {
-                                            let err = std::io::Error::last_os_error();
-                                            if err.kind() == std::io::ErrorKind::WouldBlock { continue; }
-                                        }
-                                        break;
-                                    }
-                                    for byte in buf.iter().take(n as usize) {
-                                        uart_input.input_byte(*byte);
-                                    }
-                                }
-                            }
-                        })
-                        .expect("failed to spawn serial input thread");
-                    info!(log, "{name} connected to {path}");
-                }
-            } else {
-                warn!(log, "failed to open {name} device";
-                    "path" => path,
-                    "error" => std::io::Error::last_os_error(),
-                );
-            }
-        }
+    let backend = match config {
+        None | Some("stdio") => SerialBackend::Stdio,
+        Some(path) => SerialBackend::Device(path),
+    };
+    // A console that cannot be opened is not worth failing a boot for:
+    // the guest still runs, and the warning names the path.
+    if let Err(e) = vmm_devices::uart::backend::attach(uart, backend, name, log)
+    {
+        warn!(log, "serial backend unusable"; "port" => name,
+            "error" => %e);
     }
-
     Ok(())
 }
 
@@ -1807,12 +1685,23 @@ fn main() -> ExitCode {
             vmm_machine::sigterm_flag(),
             &log,
         ),
-        // Preserve vmadm/SIGTERM success semantics instead of adopting
-        // bhyve's distinct clean-shutdown exit codes.
+        // C bhyve's codes, from usr/src/cmd/bhyve/amd64/vmexit.c. They
+        // are not cosmetic: `boot.c` sets ZONE_ATTR_INITRESTART0 on
+        // every bhyve zone and the brand declares no <initreboot>, so
+        // the kernel restarts init only on exit 0. Exiting 0 here
+        // restarts a guest that asked to power off, for ever.
+        //
+        // vmadm is unaffected. Its stop sends SIGTERM, which C bhyve
+        // turns into an ACPI power button (amd64/pm.c:432), so an
+        // orderly guest shutdown already exits 1 today.
         Ok(RunResult {
-            outcome: RunOutcome::PowerOff | RunOutcome::Halt,
+            outcome: RunOutcome::PowerOff,
             ..
-        }) => ExitCode::SUCCESS,
+        }) => ExitCode::from(1),
+        Ok(RunResult {
+            outcome: RunOutcome::Halt,
+            ..
+        }) => ExitCode::from(2),
         Ok(RunResult {
             outcome: RunOutcome::TripleFault(src),
             ..
@@ -1820,11 +1709,11 @@ fn main() -> ExitCode {
             error!(log, "VM triple fault"; "source_vcpu" => src);
             ExitCode::from(3)
         }
-        // Keep a guest-caused fatal exit distinct from an internal VMM error.
+        // Distinct from HALT, which C bhyve gives 2.
         Ok(RunResult {
             outcome: RunOutcome::GuestFault,
             ..
-        }) => ExitCode::from(2),
+        }) => ExitCode::from(4),
         Err(e) => {
             slog::error!(log, "fatal error"; "error" => format!("{:#}", e));
             ExitCode::FAILURE
@@ -1835,6 +1724,53 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::FromArgMatches;
+
+    fn cli_from(args: &[&str]) -> Cli {
+        let matches = Cli::command_named("rshyve")
+            .try_get_matches_from(args)
+            .expect("argv parses");
+        Cli::from_arg_matches(&matches).expect("from_arg_matches")
+    }
+
+    /// The bhyve zone brand splits its only pass-through attr on
+    /// whitespace, so a command line with spaces can only reach this
+    /// binary base64-encoded. Reading `cli.cmdline` directly accepts
+    /// the flag and boots the guest without it.
+    ///
+    /// Mutation this kills: `cli.cmdline.as_deref().unwrap_or(DEFAULT)`
+    /// in place of the resolver, which returns the default here.
+    #[test]
+    fn the_base64_command_line_reaches_the_guest() {
+        let cli = cli_from(&[
+            "rshyve",
+            "--cmdline-base64",
+            "cm9vdD0vZGV2L3ZkYTEgcnc=",
+            "vm",
+        ]);
+        assert_eq!(
+            resolved_cmdline(&cli).expect("resolves"),
+            "root=/dev/vda1 rw",
+        );
+    }
+
+    /// Mutation this kills: dropping the resolver's `?` so a command
+    /// line that fails validation is passed to the loader anyway.
+    #[test]
+    fn a_control_byte_in_the_command_line_stops_the_boot() {
+        let cli =
+            cli_from(&["rshyve", "--cmdline", "root=/dev/vda1\x07", "vm"]);
+        resolved_cmdline(&cli).expect_err("a control byte must be refused");
+    }
+
+    /// Without a command line the guest still has to be told where its
+    /// console is, or a direct boot produces no output at all.
+    #[test]
+    fn no_command_line_at_all_names_the_serial_console() {
+        let cli = cli_from(&["rshyve", "vm"]);
+        assert_eq!(resolved_cmdline(&cli).expect("resolves"), DEFAULT_CMDLINE);
+        assert!(DEFAULT_CMDLINE.contains("ttyS0"), "console is not ttyS0");
+    }
 
     /// The binary must not carry its own copy of the boot images.
     /// This coerces only if the parameter types are the ones `vmm_boot`

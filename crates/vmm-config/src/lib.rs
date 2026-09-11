@@ -15,6 +15,14 @@ use clap::Parser;
 /// Repeated here because this crate does not link bhyve_api.
 pub const MAX_VCPUS: u32 = 64;
 
+/// Longest kernel command line this VMM accepts.
+///
+/// It mirrors `vmm_boot::direct::CMDLINE_MAX`, which is the bound the
+/// loader applies when it writes the string into guest memory. It is
+/// repeated here so a bad value fails when the arguments are parsed,
+/// before the VM exists.
+pub const CMDLINE_MAX: usize = 4096;
+
 /// Prefix of the `-o` keys this tree owns.
 ///
 /// bhyve's `-o` is a free key space and vmadm passes keys nothing here
@@ -30,6 +38,64 @@ pub const OPT_MAXMEM: &str = "hotplug.maxmem";
 
 /// `-o hotplug.memslot=SIZE`: the size of one hot-add memory slot.
 pub const OPT_MEMSLOT: &str = "hotplug.memslot";
+
+/// The key C bhyve reads to draw guest memory from the VMM reservoir.
+///
+/// `bhyverun.c:553` turns it into `VCF_RESERVOIR_MEM`. It is the channel
+/// the control plane uses, because the bhyve brand splices
+/// `bhyve_extra_opts` onto the argv and no zonecfg attribute reaches
+/// this.
+pub const OPT_USE_RESERVOIR: &str = "memory.use_reservoir";
+
+/// Decode the base64 form of the kernel command line.
+///
+/// The alphabet is the standard one with padding, which is what
+/// `attr_base64` in tritond-vmadm produces. A different alphabet is
+/// refused rather than guessed at.
+fn decode_cmdline_base64(encoded: &str) -> anyhow::Result<String> {
+    use base64::Engine as _;
+
+    // The decoded length is bounded below, but bound the input first so
+    // an oversized argument is refused before it is allocated.
+    anyhow::ensure!(
+        encoded.len() <= CMDLINE_MAX * 2,
+        "--cmdline-base64 is too long ({} bytes)",
+        encoded.len(),
+    );
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .map_err(|e| anyhow::anyhow!("--cmdline-base64 is not base64: {e}"))?;
+    String::from_utf8(raw).map_err(|e| {
+        anyhow::anyhow!("--cmdline-base64 does not decode to UTF-8: {e}")
+    })
+}
+
+/// Refuse a kernel command line this VMM must not give to a guest.
+///
+/// The string is copied into guest memory and terminated with a NUL, so
+/// an embedded NUL would silently truncate it. Control bytes are
+/// refused for the same reason: the guest kernel splits its command
+/// line on whitespace and gives no meaning to the other control codes,
+/// so a control byte in this string is always an error at the source.
+fn check_cmdline(cmdline: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        cmdline.len() < CMDLINE_MAX,
+        "kernel command line is too long ({} bytes, max {})",
+        cmdline.len(),
+        CMDLINE_MAX - 1,
+    );
+    if let Some((idx, bad)) = cmdline
+        .char_indices()
+        .find(|(_, c)| *c == '\u{7f}' || c.is_control())
+    {
+        anyhow::bail!(
+            "kernel command line has a control byte {:#04x} at offset {}",
+            bad as u32,
+            idx,
+        );
+    }
+    Ok(())
+}
 
 /// Parse a memory size string into bytes.
 ///
@@ -139,6 +205,20 @@ pub struct Cli {
     /// Direct boot: kernel command line
     #[arg(long)]
     pub cmdline: Option<String>,
+
+    /// Direct boot: kernel command line, base64 (standard alphabet,
+    /// padded).
+    ///
+    /// The bhyve zone brand is the reason this form exists. It carries
+    /// extra arguments in the `bhyve_extra_opts` zonecfg attr and
+    /// splits that attr on space and tab (`boot.c`), so a command line
+    /// with spaces cannot go through `--cmdline`. Base64 is how this
+    /// codebase already carries such a value: see `attr_base64` in
+    /// tritond-vmadm.
+    ///
+    /// Use this flag or `--cmdline`, not both.
+    #[arg(long = "cmdline-base64")]
+    pub cmdline_base64: Option<String>,
 
     /// Direct boot: initrd/initramfs path
     #[arg(long)]
@@ -311,6 +391,31 @@ impl Cli {
         Ok(num_cpus)
     }
 
+    /// Resolve the kernel command line from its plain and base64 forms.
+    ///
+    /// The two forms are alternatives. A value that is supplied in both
+    /// forms is refused, because there is no correct way to choose
+    /// between them.
+    ///
+    /// The result goes to the guest kernel command line, so it is
+    /// checked here: the length is bounded, and NUL and control bytes
+    /// are refused. A NUL would truncate the string the loader writes,
+    /// and control bytes have no meaning to a kernel command line
+    /// parser.
+    pub fn kernel_cmdline(&self) -> anyhow::Result<Option<String>> {
+        let resolved = match (&self.cmdline, &self.cmdline_base64) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "--cmdline and --cmdline-base64 are alternatives; \
+                 supply one, not both"
+            ),
+            (Some(plain), None) => plain.clone(),
+            (None, Some(encoded)) => decode_cmdline_base64(encoded)?,
+            (None, None) => return Ok(None),
+        };
+        check_cmdline(&resolved)?;
+        Ok(Some(resolved))
+    }
+
     /// Parse the memory size from the -m argument.
     ///
     /// Returns an error if the argument is present but unparseable.
@@ -329,6 +434,25 @@ impl Cli {
             .filter_map(|opt| opt.split_once('='))
             .find(|(k, _)| k.trim() == key)
             .map(|(_, value)| value.trim())
+    }
+
+    /// Whether guest memory comes from the VMM reservoir.
+    ///
+    /// Two spellings, because two callers use different ones. Our own
+    /// tools and docs pass `-S`. The control plane passes
+    /// `-o memory.use_reservoir=true`, which is what C bhyve reads
+    /// (`bhyverun.c:553`), and it passes no `-S`. Reading only `-S`
+    /// meant a control-plane VM silently got transient memory after the
+    /// agent had already grown and charged the reservoir for it.
+    ///
+    /// Note this VMM does not implement C bhyve's `-S`, which is
+    /// `memory.wired` there (`bhyverun_machdep.c:220`) and a different
+    /// thing. `-S` here has always meant the reservoir.
+    pub fn use_reservoir(&self) -> bool {
+        self.wire_memory
+            || self
+                .config_opt(OPT_USE_RESERVOIR)
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     }
 
     /// Refuse a `hotplug.` key this tree does not read.
@@ -383,10 +507,11 @@ impl Cli {
              has no memory hotplug AML to answer on",
         );
         anyhow::ensure!(
-            self.wire_memory,
-            "'-o {OPT_MAXMEM}' needs -S: without reservoir memory a \
-             hot-add zeroes every page inside the ioctl that freezes \
-             the vCPUs, about 400 ms per GiB",
+            self.use_reservoir(),
+            "'-o {OPT_MAXMEM}' needs reservoir memory, from -S or \
+             '-o {OPT_USE_RESERVOIR}=true': without it a hot-add zeroes \
+             every page inside the ioctl that freezes the vCPUs, about \
+             400 ms per GiB",
         );
         Ok(Some(bytes))
     }
@@ -578,6 +703,51 @@ mod tests {
         assert!(error.to_string().contains("--hotplug"), "{error}");
     }
 
+    /// The control plane never passes -S. It passes the key C bhyve
+    /// reads (`bhyverun.c:553`), spliced onto the argv through the
+    /// brand's `bhyve_extra_opts`. Reading only -S meant the guest got
+    /// transient memory, about 400 ms per GiB, after the agent had
+    /// already grown and charged the reservoir for it. Silently.
+    #[test]
+    fn the_reservoir_option_the_control_plane_sends_is_read() {
+        let cli = cli_from(&[
+            "rshyve",
+            "-c",
+            "1",
+            "-m",
+            "128M",
+            "-o",
+            "memory.use_reservoir=true",
+            "vm",
+        ]);
+        assert!(!cli.wire_memory, "the control plane sends no -S");
+        assert!(cli.use_reservoir(), "the reservoir request was dropped");
+    }
+
+    #[test]
+    fn dash_s_still_asks_for_the_reservoir() {
+        let cli = cli_from(&["rshyve", "-S", "-c", "1", "-m", "128M", "vm"]);
+        assert!(cli.use_reservoir());
+    }
+
+    #[test]
+    fn no_request_means_no_reservoir() {
+        let cli = cli_from(&["rshyve", "-c", "1", "-m", "128M", "vm"]);
+        assert!(!cli.use_reservoir());
+        // A value that is not true must not be read as one.
+        let off = cli_from(&[
+            "rshyve",
+            "-c",
+            "1",
+            "-m",
+            "128M",
+            "-o",
+            "memory.use_reservoir=false",
+            "vm",
+        ]);
+        assert!(!off.use_reservoir());
+    }
+
     #[test]
     fn maxmem_needs_reservoir_memory() {
         // VM_ALLOC_MEMSEG runs under the kernel write lock, which
@@ -656,6 +826,138 @@ mod tests {
         assert!(
             err.to_string().contains("firehyve"),
             "error should name the binary, got: {err}"
+        );
+    }
+
+    /// The guest command line has spaces, and the only channel the
+    /// bhyve zone brand offers splits on space and tab. So the base64
+    /// form has to survive a full round trip.
+    ///
+    /// Mutation this kills: returning the encoded string unchanged, or
+    /// dropping the decode. The alphabet is pinned separately, because
+    /// a realistic ASCII command line never encodes to `+` or `/`.
+    #[test]
+    fn the_base64_command_line_round_trips() {
+        use base64::Engine as _;
+
+        let want = "root=/dev/ram0 init=/init console=ttyS0 panic=-1";
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(want.as_bytes());
+        // The value has spaces, which is the whole reason for the flag.
+        assert!(want.contains(' '));
+        // And the encoding has none, so the brand's split cannot break it.
+        assert!(!encoded.contains(' ') && !encoded.contains('\t'));
+
+        let cli = cli_from(&["rshyve", "--cmdline-base64", &encoded, "guest"]);
+        assert_eq!(cli.kernel_cmdline().unwrap().as_deref(), Some(want));
+    }
+
+    /// `attr_base64` in tritond-vmadm produces the standard alphabet.
+    /// `+` and `/` are exactly the two characters the URL-safe
+    /// alphabet renames, so a value that uses both pins the decoder.
+    ///
+    /// Mutation this kills: decoding with the URL-safe alphabet.
+    #[test]
+    fn the_standard_base64_alphabet_is_the_one_decoded() {
+        // base64("|>~qi?") == "fD5+cWk/", which uses both + and /.
+        let cli =
+            cli_from(&["rshyve", "--cmdline-base64", "fD5+cWk/", "guest"]);
+        assert_eq!(cli.kernel_cmdline().unwrap().as_deref(), Some("|>~qi?"));
+
+        // The URL-safe spelling of the same bytes must not decode, or
+        // the two alphabets would both be accepted and disagree.
+        let cli =
+            cli_from(&["rshyve", "--cmdline-base64", "fD5-cWk_", "guest"]);
+        assert!(cli.kernel_cmdline().is_err(), "URL-safe must not decode");
+    }
+
+    /// Mutation this kills: preferring one form when both are present
+    /// instead of refusing.
+    #[test]
+    fn a_command_line_that_is_both_plain_and_encoded_is_refused() {
+        let cli = cli_from(&[
+            "rshyve",
+            "--cmdline",
+            "console=ttyS0",
+            "--cmdline-base64",
+            "Y29uc29sZT10dHlTMA==",
+            "guest",
+        ]);
+        let err = cli.kernel_cmdline().expect_err("two forms");
+        assert!(err.to_string().contains("--cmdline-base64"), "got: {err}");
+    }
+
+    /// This string reaches the guest kernel command line. The loader
+    /// NUL-terminates it, so an embedded NUL would silently truncate
+    /// the rest.
+    ///
+    /// Mutation this kills: dropping the control-byte scan in
+    /// check_cmdline.
+    #[test]
+    fn a_control_byte_in_the_command_line_is_refused() {
+        use base64::Engine as _;
+
+        for raw in ["console=ttyS0\u{0}rest", "a\nb", "a\u{7f}b"] {
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(raw.as_bytes());
+            let cli =
+                cli_from(&["rshyve", "--cmdline-base64", &encoded, "guest"]);
+            let err = cli
+                .kernel_cmdline()
+                .expect_err("a control byte must be refused");
+            assert!(
+                err.to_string().contains("control byte"),
+                "for {raw:?} got: {err}"
+            );
+        }
+
+        // The plain form takes the same scan, so neither channel is a
+        // way around it.
+        let cli = cli_from(&["rshyve", "--cmdline", "a\u{7f}b", "guest"]);
+        assert!(cli.kernel_cmdline().is_err(), "plain form is not scanned");
+    }
+
+    /// Mutation this kills: bounding only the encoded input, or not
+    /// bounding at all.
+    #[test]
+    fn an_oversized_command_line_is_refused_in_both_forms() {
+        use base64::Engine as _;
+
+        let long = "a".repeat(CMDLINE_MAX);
+        let cli = cli_from(&["rshyve", "--cmdline", &long, "guest"]);
+        assert!(cli.kernel_cmdline().is_err(), "plain form is not bounded");
+
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(long.as_bytes());
+        let cli = cli_from(&["rshyve", "--cmdline-base64", &encoded, "guest"]);
+        assert!(cli.kernel_cmdline().is_err(), "base64 form is not bounded");
+
+        // One byte below the bound still passes, so the check is a
+        // bound and not a blanket refusal.
+        let ok = "a".repeat(CMDLINE_MAX - 1);
+        let cli = cli_from(&["rshyve", "--cmdline", &ok, "guest"]);
+        assert!(cli.kernel_cmdline().is_ok());
+    }
+
+    /// Mutation this kills: accepting any string as base64 and passing
+    /// the undecoded bytes through.
+    #[test]
+    fn a_value_that_is_not_base64_is_refused() {
+        let cli =
+            cli_from(&["rshyve", "--cmdline-base64", "not base64!", "guest"]);
+        assert!(cli.kernel_cmdline().is_err());
+    }
+
+    #[test]
+    fn a_plain_command_line_is_unchanged_and_absence_is_none() {
+        let cli = cli_from(&["rshyve", "--cmdline", "console=ttyS0", "guest"]);
+        assert_eq!(
+            cli.kernel_cmdline().unwrap().as_deref(),
+            Some("console=ttyS0")
+        );
+        assert_eq!(
+            cli_from(&["rshyve", "guest"]).kernel_cmdline().unwrap(),
+            None
         );
     }
 }

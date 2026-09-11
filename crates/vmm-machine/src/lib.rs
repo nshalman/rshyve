@@ -17,6 +17,7 @@ pub mod hotplug;
 pub mod parse;
 pub mod pci;
 pub mod pm;
+pub mod provision;
 pub mod registry;
 pub mod signal;
 pub mod teardown;

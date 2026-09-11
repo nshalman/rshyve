@@ -298,21 +298,29 @@ pub(super) fn reader_loop(
             Err(_) => break,
         };
 
-        // The backlog is bounded, so a guest that stops reading must
-        // stop this thread rather than grow VMM memory.
+        // The guest's receive window and the backlog each bound what
+        // may go at once, so one read can take several passes. The mux
+        // removes what it took, so `data` always holds exactly what the
+        // guest has not been given yet: no byte is offered twice, and
+        // none is dropped.
         let mut data = buf[..n].to_vec();
         loop {
-            if shared.mux.queue_host_data(key, std::mem::take(&mut data)) {
+            shared.mux.queue_host_data(key, &mut data);
+            shared.deliver_rx();
+            if data.is_empty() {
                 break;
             }
-            data = buf[..n].to_vec();
             if shared.shutdown.load(Ordering::Acquire) {
                 return;
             }
-            shared.deliver_rx();
+            // The window opens again on a packet from the guest, and
+            // backlog room comes back as the guest posts RX chains.
+            // Both land on other threads, so this waits for them rather
+            // than spinning. A guest that never reads stalls this
+            // connection alone: one reader thread and one host socket,
+            // both already capped.
             std::thread::sleep(BACKPRESSURE_PAUSE);
         }
-        shared.deliver_rx();
     }
 
     shared.mux.queue_host_close(key);

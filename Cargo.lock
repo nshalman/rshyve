@@ -1848,6 +1848,7 @@ name = "vmm_config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "serde",
  "serde_json",
@@ -1929,6 +1930,7 @@ dependencies = [
  "bhyve_api",
  "libc",
  "slog",
+ "tempfile",
  "usdt",
  "vmm_config",
  "vmm_core",

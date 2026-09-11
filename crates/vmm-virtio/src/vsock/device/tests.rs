@@ -6,7 +6,7 @@
 
 use super::halt::{HALT_BUDGET, HALT_JOIN_ROUNDS};
 use super::listener::{
-    accepted_blocking, classify_host_line, handle_host_connect,
+    accepted_blocking, classify_host_line, handle_host_connect, reader_loop,
     start_host_connection, HostVerb, CONNECT_LINE_MAX,
 };
 use super::shared::HOST_WRITE_TIMEOUT;
@@ -238,6 +238,48 @@ fn rx_ring() -> (Arc<PhysMap>, Vec<VirtQueue>) {
         .write::<u16>(&0)
         .expect("write avail entry");
     (physmap, vec![queue])
+}
+
+/// A receive queue with EVENT_IDX on and every slot filled, which is
+/// what Linux's virtio_vsock posts as soon as it probes.
+fn rx_ring_full() -> (Arc<PhysMap>, Vec<VirtQueue>) {
+    let physmap = Arc::new(
+        PhysMap::new_anon(DESC_GPA, 0x2000).expect("create queue memory"),
+    );
+    let mut queue = VirtQueue::new(RING_SIZE);
+    queue.set_addr_modern(DESC_GPA, AVAIL_GPA, USED_GPA);
+    queue.set_event_idx(true);
+    for i in 0..RING_SIZE {
+        write_desc(
+            &physmap,
+            u64::from(i),
+            BUF_GPA + u64::from(i) * 64,
+            64,
+            crate::bits::VRING_DESC_F_WRITE,
+            0,
+        );
+        physmap
+            .lookup(AVAIL_GPA + 4 + u64::from(i) * 2, 2)
+            .expect("mapped avail entry")
+            .write::<u16>(&i)
+            .expect("write avail entry");
+    }
+    physmap
+        .lookup(AVAIL_GPA + 2, 2)
+        .expect("mapped avail index")
+        .write::<u16>(&RING_SIZE)
+        .expect("write avail index");
+    (physmap, vec![queue])
+}
+
+/// The device's own "kick me past here" threshold, which lives at the
+/// end of the used ring (VIRTIO 1.3 sec 2.7.7).
+fn avail_event(physmap: &PhysMap) -> u16 {
+    physmap
+        .lookup(USED_GPA + 4 + u64::from(RING_SIZE) * 8, 2)
+        .expect("mapped avail event")
+        .read::<u16>()
+        .expect("read avail event")
 }
 
 fn used_idx(physmap: &PhysMap) -> u16 {
@@ -807,6 +849,150 @@ fn the_accept_loop_answers_a_host_connect() {
         .read_line(&mut answer)
         .expect("read the answer");
     assert!(answer.starts_with("OK "), "answered {answer:?}");
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The reader thread is the only production caller of
+/// `queue_host_data`, and the contract it has to keep is to offer one
+/// buffer until the mux has emptied it. This drives the real thread
+/// with a window far smaller than the data, so the offer takes many
+/// passes, and compares the guest's stream with the source byte for
+/// byte.
+///
+/// The mux tests state the same property against a loop written in the
+/// test. This states it against the loop that ships. Kills the
+/// mutation of leaving the loop after one pass, which truncates, and
+/// would kill a caller that rebuilt its buffer between passes, which
+/// duplicates.
+#[test]
+fn the_reader_offers_every_byte_once_through_a_small_window() {
+    use crate::vsock::packet::{
+        VsockHdr, CID_HOST, OP_CREDIT_UPDATE, OP_RESPONSE, OP_RW, TYPE_STREAM,
+    };
+    use std::io::Write as _;
+    use std::net::Shutdown;
+
+    const GUEST_CID: u64 = 3;
+    const WINDOW: u32 = 8 * 1024;
+
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    let key = ConnKey {
+        guest_port: 1024,
+        host_port: 50000,
+    };
+    let guest_hdr = |op: u16, fwd_cnt: u32| VsockHdr {
+        src_cid: GUEST_CID,
+        dst_cid: CID_HOST,
+        src_port: key.guest_port,
+        dst_port: key.host_port,
+        len: 0,
+        type_: TYPE_STREAM,
+        op,
+        flags: 0,
+        buf_alloc: WINDOW,
+        fwd_cnt,
+    };
+
+    // A connection the guest has answered, naming a window smaller
+    // than one read from the host socket.
+    assert!(vsock.shared.mux.start_host_connect(key));
+    vsock
+        .shared
+        .mux
+        .on_guest_packet(&guest_hdr(OP_RESPONSE, 0), vec![]);
+    while vsock.shared.mux.pop_rx().is_some() {}
+
+    let source: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    let (peer, device_end) = UnixStream::pair().expect("socketpair");
+
+    let reader = {
+        let shared = Arc::clone(&vsock.shared);
+        std::thread::spawn(move || reader_loop(shared, key, device_end))
+    };
+    // The host peer writes on its own thread: the socket buffer fills
+    // long before the guest's window has taken the whole stream.
+    let writer = {
+        let source = source.clone();
+        std::thread::spawn(move || {
+            let mut peer = peer;
+            peer.write_all(&source).expect("write the source");
+            peer.shutdown(Shutdown::Write).expect("half close");
+            peer
+        })
+    };
+
+    // The guest: take the packets and say what has been read, which is
+    // the only thing that reopens the window.
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while got.len() < source.len() && Instant::now() < deadline {
+        let mut moved = false;
+        while let Some(pkt) = vsock.shared.mux.pop_rx() {
+            if pkt.hdr.op == OP_RW {
+                assert_eq!(
+                    pkt.hdr.len as usize,
+                    pkt.payload.len(),
+                    "len is a lie"
+                );
+                assert!(
+                    pkt.payload.len() <= WINDOW as usize,
+                    "sent past the guest's window"
+                );
+                got.extend_from_slice(&pkt.payload);
+                moved = true;
+            }
+        }
+        if moved {
+            vsock.shared.mux.on_guest_packet(
+                &guest_hdr(OP_CREDIT_UPDATE, got.len() as u32),
+                vec![],
+            );
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    assert_eq!(got.len(), source.len(), "the guest saw a different count");
+    assert_eq!(got, source, "the guest read a different stream");
+
+    let _peer = writer.join().expect("join the host peer");
+    reader.join().expect("join the reader");
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Taking the guest's whole ring in one pass must still arm the kick.
+///
+/// `avail_event` is how the device asks to be told about new chains.
+/// A guest with EVENT_IDX reads it and stays quiet while it is behind
+/// the index the guest is adding at, so a device that leaves it
+/// unarmed is never kicked again. It then spends the chains it already
+/// holds and goes deaf: packets queue for a guest that cannot be
+/// given them, and every later connection hangs, because a RESPONSE
+/// needs a chain like any other packet.
+///
+/// Linux fills the whole ring the moment it probes, so this is the
+/// first pass, not a corner. Kills the mutation of arming only when
+/// the pass stopped short of the request cap.
+#[test]
+fn a_ring_taken_whole_still_arms_the_next_kick() {
+    let (physmap, mut queues) = rx_ring_full();
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+
+    vsock.notify_queue(VSOCK_RX_QUEUE, &mut queues, &physmap);
+
+    assert_eq!(
+        vsock.shared.pending_rx.lock().expect("pending").len(),
+        usize::from(RING_SIZE),
+        "the whole ring should be stashed",
+    );
+    assert_eq!(
+        avail_event(&physmap),
+        RING_SIZE,
+        "avail_event left behind the ring: the guest will never kick again",
+    );
 
     vsock.halt();
     let _ = std::fs::remove_dir_all(&dir);
