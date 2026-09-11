@@ -36,13 +36,12 @@
 //! do, so a passthrough device with an I/O BAR decodes nothing.
 
 use std::io::{Error, ErrorKind, Result};
-use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 
 use bhyve_api::{
-    ioctls, ppt_bar_io, ppt_bar_query, ppt_cfg_io, vm_pptdev, vm_pptdev_limits,
-    vm_pptdev_mmio, vm_pptdev_msi, PCI_ADDR_IO, PCI_ADDR_MEM32, PCI_ADDR_MEM64,
+    ioctls, ppt_bar_io, ppt_bar_query, ppt_cfg_io, PCI_ADDR_IO, PCI_ADDR_MEM32,
+    PCI_ADDR_MEM64,
 };
 use slog::{o, warn, Logger};
 
@@ -176,14 +175,7 @@ impl PciPassthru {
             fd
         };
 
-        // Bind the PPT device to the VM.
-        let mut bind_req = vm_pptdev { pptfd: ppt_fd };
-        // Safety: vm_pptdev is the correct struct for VM_BIND_PPTDEV.
-        // The VM fd and PPT fd are both valid at this point.
-        unsafe {
-            ioctl_on_hdl(hdl.as_raw_fd(), ioctls::VM_BIND_PPTDEV, &mut bind_req)
-        }
-        .inspect_err(|_| {
+        hdl.bind_pptdev(ppt_fd).inspect_err(|_| {
             // Clean up the fd on bind failure.
             unsafe { libc::close(ppt_fd) };
         })?;
@@ -197,20 +189,7 @@ impl PciPassthru {
             log: log.clone(),
         };
 
-        // Query MSI/MSI-X limits.
-        let mut limits = vm_pptdev_limits {
-            pptfd: ppt_fd,
-            msi_limit: 0,
-            msix_limit: 0,
-        };
-        // Safety: vm_pptdev_limits is correct for VM_GET_PPTDEV_LIMITS.
-        unsafe {
-            ioctl_on_hdl(
-                hdl.as_raw_fd(),
-                ioctls::VM_GET_PPTDEV_LIMITS,
-                &mut limits,
-            )
-        }?;
+        let limits = hdl.pptdev_limits(ppt_fd)?;
 
         // Read the full PCI config space (256 bytes) via PPT_CFG_READ.
         let mut phys_cfg = [0u8; 256];
@@ -312,7 +291,7 @@ impl PciPassthru {
             bars,
             phys_cfg,
             caps,
-            msi_limit: limits.msi_limit,
+            msi_limit: limits.msi,
             state: Mutex::new(dev_state),
             mapped_bars: Mutex::new([None; BAR_COUNT]),
             command: Mutex::new(0),
@@ -356,40 +335,13 @@ impl PciPassthru {
     /// Map a PPT device BAR into guest physical address space via EPT.
     fn map_bar_mmio(&self, bar_idx: usize, gpa: u64, len: u64) -> Result<()> {
         let hpa = self.bars[bar_idx].hpa;
-        let mut mmio = vm_pptdev_mmio {
-            pptfd: self.ppt_fd,
-            gpa,
-            hpa,
-            len: len as usize,
-        };
-        // Safety: vm_pptdev_mmio is correct for VM_MAP_PPTDEV_MMIO.
-        unsafe {
-            ioctl_on_hdl(
-                self.hdl.as_raw_fd(),
-                ioctls::VM_MAP_PPTDEV_MMIO,
-                &mut mmio,
-            )
-        }?;
-        Ok(())
+        self.hdl
+            .map_pptdev_mmio(self.ppt_fd, gpa, hpa, len as usize)
     }
 
     /// Unmap a PPT device BAR from guest physical address space.
     fn unmap_bar_mmio(&self, gpa: u64, len: u64) -> Result<()> {
-        let mut mmio = vm_pptdev_mmio {
-            pptfd: self.ppt_fd,
-            gpa,
-            hpa: 0,
-            len: len as usize,
-        };
-        // Safety: vm_pptdev_mmio is correct for VM_UNMAP_PPTDEV_MMIO.
-        unsafe {
-            ioctl_on_hdl(
-                self.hdl.as_raw_fd(),
-                ioctls::VM_UNMAP_PPTDEV_MMIO,
-                &mut mmio,
-            )
-        }?;
-        Ok(())
+        self.hdl.unmap_pptdev_mmio(self.ppt_fd, gpa, len as usize)
     }
 
     /// Handle a BAR address change: unmap old mapping, create new one.
@@ -767,22 +719,7 @@ impl PciPassthru {
         let enabled = *self.msi_enabled.lock().expect("msi_enabled lock");
         let numvec = msi_numvec(msg_ctrl, enabled, self.msi_limit);
 
-        let mut msi_req = vm_pptdev_msi {
-            vcpu: 0,
-            pptfd: self.ppt_fd,
-            numvec,
-            msg: data,
-            addr,
-        };
-        // Safety: vm_pptdev_msi is correct for VM_PPTDEV_MSI.
-        let res = unsafe {
-            ioctl_on_hdl(
-                self.hdl.as_raw_fd(),
-                ioctls::VM_PPTDEV_MSI,
-                &mut msi_req,
-            )
-        };
-        if let Err(e) = res {
+        if let Err(e) = self.hdl.pptdev_msi(self.ppt_fd, addr, data, numvec) {
             warn!(self.log, "passthru: MSI setup failed, device has no \
                 interrupt";
                 "numvec" => numvec, "error" => %e);
@@ -823,12 +760,7 @@ impl Drop for BoundPpt {
 
 /// Unbind a PPT device from the VM and close its descriptor.
 fn unbind_ppt(fd: RawFd, hdl: &VmmHdl, log: &Logger) {
-    let mut unbind = vm_pptdev { pptfd: fd };
-    // Safety: vm_pptdev is correct for VM_UNBIND_PPTDEV.
-    let res = unsafe {
-        ioctl_on_hdl(hdl.as_raw_fd(), ioctls::VM_UNBIND_PPTDEV, &mut unbind)
-    };
-    if let Err(e) = res {
+    if let Err(e) = hdl.unbind_pptdev(fd) {
         // Nothing else can run here, so the record is the only remedy:
         // the device stays owned by the VM until the instance goes.
         warn!(log, "passthru: unbind failed, device still held";
@@ -853,28 +785,6 @@ impl Drop for PciPassthru {
 }
 
 // ── Ioctl helpers ──────────────────────────────────────────────────
-
-/// Issue an ioctl on the VM fd.
-///
-/// # Safety
-///
-/// The caller must provide a `data` pointer to a struct that is correct
-/// for the given `cmd` ioctl number.
-unsafe fn ioctl_on_hdl<T>(fd: RawFd, cmd: i32, data: &mut T) -> Result<i32> {
-    #[cfg(target_os = "illumos")]
-    let ret = libc::ioctl(fd, cmd, data as *mut T as *mut libc::c_void);
-    #[cfg(not(target_os = "illumos"))]
-    let ret = libc::ioctl(
-        fd,
-        cmd as libc::c_ulong,
-        data as *mut T as *mut libc::c_void,
-    );
-    if ret < 0 {
-        Err(Error::last_os_error())
-    } else {
-        Ok(ret)
-    }
-}
 
 /// Issue an ioctl on the PPT device fd.
 ///

@@ -622,7 +622,7 @@ mod tests {
                 max_cpus: 2,
             },
         );
-        let limit = bhyve_api::VM_MAXCPU as u32;
+        let limit = vmm_core::VM_MAXCPU;
         assert_eq!(
             AcpiConfig::new(2, limit + 1).unwrap_err(),
             AcpiConfigError::AboveKernelLimit {

@@ -86,15 +86,9 @@ pub fn set_halt_exit(vcpu: &Vcpu, vmexit_on_hlt: bool) -> anyhow::Result<()> {
     if !vmexit_on_hlt {
         return Ok(());
     }
-    vcpu.hdl()
-        .set_capability(
-            vcpu.id(),
-            bhyve_api::vm_cap_type::VM_CAP_HALT_EXIT as i32,
-            1,
-        )
-        .with_context(|| {
-            format!("failed to set HALT_EXIT on vCPU {}", vcpu.id())
-        })
+    vcpu.hdl().set_halt_exit(vcpu.id(), true).with_context(|| {
+        format!("failed to set HALT_EXIT on vCPU {}", vcpu.id())
+    })
 }
 
 /// Which vCPUs the UEFI boot path resets.

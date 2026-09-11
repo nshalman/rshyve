@@ -48,8 +48,9 @@ use crate::vcpu_tasks::{self, VcpuEvent, VcpuThreadCtx};
 /// caller asks for (`vmm.c:686`). The guest-visible possible-CPU count
 /// therefore lives entirely in the MADT and fw_cfg, which this tree
 /// owns, and this constant is only the hard kernel limit.
-const KERNEL_MAX_CPUS: u32 = bhyve_api::VM_MAXCPU as u32;
-const _: () = assert!(KERNEL_MAX_CPUS as usize == bhyve_api::VM_MAXCPU);
+const KERNEL_MAX_CPUS: u32 = vmm_core::VM_MAXCPU;
+// vmm_config cannot link the kernel ABI, so it carries its own copy.
+const _: () = assert!(KERNEL_MAX_CPUS == vmm_config::MAX_VCPUS);
 
 const BOOK_POISONED: &str = "vCPU registry lock poisoned";
 

@@ -11,7 +11,6 @@ workspace = true
 [dependencies]
 vmm_devices.workspace = true
 vmm_core.workspace = true
-bhyve_api.workspace = true
 anyhow.workspace = true
 ascii.workspace = true
 bitflags.workspace = true

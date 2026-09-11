@@ -26,7 +26,6 @@ vmm_machine.workspace = true
 vmm_migrate.workspace = true
 vmm_hyperv.workspace = true
 vmm_tpm.workspace = true
-bhyve_api.workspace = true
 viona_api.workspace = true
 anyhow.workspace = true
 clap.workspace = true
