@@ -8,6 +8,7 @@ use super::*;
 use crate::bits;
 use crate::pci::intr::IntrGate;
 use crate::queue::VirtqDesc;
+use crate::socket_halt::{HALT_BUDGET, HALT_JOIN_ROUNDS};
 use std::io::Write;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{mpsc, MutexGuard};

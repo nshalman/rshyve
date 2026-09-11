@@ -36,6 +36,7 @@ pub mod fs;
 pub mod pci;
 pub mod queue;
 pub mod rng;
+pub(crate) mod socket_halt;
 pub mod viona;
 pub mod vsock;
 
