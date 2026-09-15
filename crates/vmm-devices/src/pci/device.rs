@@ -12,6 +12,7 @@ use vmm_core::common::RWOp;
 use super::bar::{BarDefine, BarWriteResult, Bars};
 use super::bits;
 use super::BarN;
+use crate::lifecycle::VirtioMigratePciState;
 
 // ---------------------------------------------------------------------------
 // PciDevice trait
@@ -51,6 +52,20 @@ pub trait PciDevice: Send + Sync + 'static {
     /// Each implementation must clear the recorded bases, so a second
     /// call does nothing.
     fn detach_regions(&self) {}
+}
+
+/// Replay a migrated PCI header: the BAR writes from
+/// [`DeviceState::bar_replay_writes`], then the command register, so
+/// the bus registrations come back in the order the guest made them.
+pub fn replay_migrate_pci_state(
+    dev: &dyn PciDevice,
+    bar_writes: &[(u8, u32)],
+    command: u16,
+) {
+    for &(offset, value) in bar_writes {
+        dev.cfg_write(offset, 4, value);
+    }
+    dev.cfg_write(bits::REG_COMMAND, 2, u32::from(command));
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +147,43 @@ impl DeviceState {
     /// Get a reference to the BAR state.
     pub fn bars(&self) -> &Bars {
         &self.bars
+    }
+
+    /// The command bits and BAR bases a migration carries.
+    pub fn migrate_state(&self) -> VirtioMigratePciState {
+        let mut bar_addrs = [0u64; 6];
+        for (idx, addr) in bar_addrs.iter_mut().enumerate() {
+            let bar = BarN::try_from(idx as u8).expect("valid BAR index");
+            *addr = self.bars.get(bar).map(|(_, value)| value).unwrap_or(0);
+        }
+        VirtioMigratePciState {
+            command: self.command.bits(),
+            bar_addrs,
+        }
+    }
+
+    /// The config writes that put `bar_addrs` back, as (offset, value)
+    /// pairs. A 64-bit BAR takes two. The caller replays them through
+    /// its own `cfg_write`, so bus registrations follow.
+    pub fn bar_replay_writes(&self, bar_addrs: &[u64; 6]) -> Vec<(u8, u32)> {
+        let mut writes = Vec::with_capacity(7);
+        for (idx, addr) in bar_addrs.iter().copied().enumerate() {
+            let bar = BarN::try_from(idx as u8).expect("valid BAR index");
+            let Some((def, _)) = self.bars.get(bar) else {
+                continue;
+            };
+            let offset = bits::REG_BAR0 + (idx as u8 * 4);
+            match def {
+                BarDefine::Pio(_) | BarDefine::Mmio(_) => {
+                    writes.push((offset, addr as u32));
+                }
+                BarDefine::Mmio64(_) => {
+                    writes.push((offset, addr as u32));
+                    writes.push((offset + 4, (addr >> 32) as u32));
+                }
+            }
+        }
+        writes
     }
 
     /// Apply a guest write to one BAR register.
