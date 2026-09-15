@@ -264,13 +264,10 @@ impl Bars {
         Some((def, ent.value))
     }
 
-    /// Directly set the address value for a defined BAR.
-    ///
-    /// # Panics
-    ///
-    /// - If the BAR is not defined (empty or Mmio64High).
-    /// - If the value exceeds the BAR type's address range.
-    pub fn set(&mut self, bar: BarN, value: u64) {
+    /// Set a BAR base without the register masking, so a test can
+    /// place one exactly. Guest writes go through [`Self::reg_write`].
+    #[cfg(test)]
+    pub(crate) fn set(&mut self, bar: BarN, value: u64) {
         let ent = &mut self.entries[bar as usize];
         match ent.kind {
             EntryKind::Empty => {

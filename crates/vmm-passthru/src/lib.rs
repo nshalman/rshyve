@@ -629,7 +629,7 @@ impl PciPassthru {
         };
 
         let mut state = self.state.lock().expect("state lock");
-        let Some(result) = state.bars_mut().reg_write(bar_n, val) else {
+        let Some(result) = state.bar_write(bar_n, val) else {
             return;
         };
         let idx = result.bar as usize;
