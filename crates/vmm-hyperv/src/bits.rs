@@ -47,18 +47,6 @@ bitflags! {
 }
 
 bitflags! {
-    /// CPUID leaf 0x4000_0003 EDX: misc feature bits.
-    ///
-    /// `GUEST_DEBUGGING` and `XMM_HYPERCALL_INPUT` are not implemented;
-    /// only `HYPERCALL_PARAMS_IN_XMM` is omitted. We surface the bits
-    /// we depend on (none are set) as documentation.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct HvLeaf3Edx: u32 {
-        const HYPERCALL_RETURN_GUEST_OS_ID_REQ = 1 << 8;
-    }
-}
-
-bitflags! {
     /// CPUID leaf 0x4000_0004 EAX: recommended guest behaviors.
     ///
     /// `RELAXED_TIMING` disables Windows' CLOCK_WATCHDOG bugcheck on

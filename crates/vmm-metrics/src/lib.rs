@@ -192,11 +192,6 @@ impl BlockMetrics {
         }
     }
 
-    #[inline]
-    pub fn record_flush(&self) {
-        self.flushes.fetch_add(1, ORD);
-    }
-
     pub fn avg_read_latency_us(&self) -> u64 {
         let reads = self.reads.load(ORD);
         self.read_latency_us
@@ -318,11 +313,6 @@ impl NetMetrics {
     #[inline]
     pub fn record_kick(&self) {
         self.kicks.fetch_add(1, ORD);
-    }
-
-    #[inline]
-    pub fn record_interrupt(&self) {
-        self.interrupts.fetch_add(1, ORD);
     }
 
     pub fn to_json(&self, device: &str) -> String {

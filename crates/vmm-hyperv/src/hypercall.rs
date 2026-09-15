@@ -25,7 +25,6 @@ pub struct MsrHypercallValue(pub u64);
 impl MsrHypercallValue {
     pub const ENABLED: u64 = 1 << 0;
     pub const LOCKED: u64 = 1 << 1;
-    pub const PFN_SHIFT: u64 = 12;
     pub const PFN_MASK: u64 = !0xFFF;
 
     pub fn enabled(self) -> bool {

@@ -62,7 +62,6 @@ use worker::{blk_io_worker, needs_backend, BlkIoRequest, WorkerCtx};
 /// per-disk. 8 is enough parallel syscalls for deep queues without hotspotting
 /// the `VirtioCompletion` Mutex<u16>.
 const NUM_WORKERS: usize = 8;
-pub const BLK_CONFIG_SIZE: u16 = 8;
 /// Extended config size covering all VirtIO 1.3 block config fields
 /// (capacity through write_zeroes_may_unmap at offset 0x38+1=0x3C).
 /// Must match the cfg_read buffer size so the modern driver's BUG_ON

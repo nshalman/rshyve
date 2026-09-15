@@ -67,7 +67,6 @@ impl BhyveIoApic {
 ///
 /// The kernel handles PIO at ports 0x70-0x71 directly.
 pub struct BhyveRtc {
-    #[allow(dead_code)]
     hdl: Arc<VmmHdl>,
 }
 

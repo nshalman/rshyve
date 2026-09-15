@@ -307,19 +307,6 @@ impl VcpuRegistry {
         self.book.lock().expect(BOOK_POISONED).online.contains(&id)
     }
 
-    /// Metrics for the CPUs added since boot, in ascending id order.
-    ///
-    /// The boot set has its own metrics, which the fleet returns.
-    pub fn added_metrics(&self) -> Vec<(u32, Arc<VcpuMetrics>)> {
-        self.book
-            .lock()
-            .expect(BOOK_POISONED)
-            .metrics
-            .iter()
-            .map(|(id, metrics)| (*id, Arc::clone(metrics)))
-            .collect()
-    }
-
     /// Bring one CPU online on the running VM.
     ///
     /// The guest still has to accept it: a hot-added CPU is an
