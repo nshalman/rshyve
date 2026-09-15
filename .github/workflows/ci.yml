@@ -75,7 +75,7 @@ jobs:
       - run: rustup component add clippy
       - run: >
           cargo clippy --locked --all-targets
-          -p vmm_api_common -p vmm_core -p vmm_devices -p vmm_devices_testsupport
+          -p vmm_api_common -p dladm -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
           -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
           -p fhrun
@@ -109,7 +109,7 @@ jobs:
       - run: >
           cargo check --locked --all-targets
           --target x86_64-unknown-illumos
-          -p bhyve_api_sys -p bhyve_api -p viona_api -p vmm_api_common
+          -p bhyve_api_sys -p bhyve_api -p viona_api -p dladm -p vmm_api_common
           -p vmm_config -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_boot -p vmm_metrics -p vmm_machine -p vmm_hyperv
           -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
@@ -134,10 +134,10 @@ jobs:
       # that they stay named here.
       - run: >
           cargo test --locked
-          -p vmm_api_common -p vmm_core -p vmm_devices -p vmm_devices_testsupport
+          -p vmm_api_common -p dladm -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
           -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
-          -p fhrun -p bhyve_api_sys -p bhyve_api -p viona_api
+          -p fhrun -p bhyve_api_sys -p bhyve_api -p viona_api -p dladm
       # Release is the profile that ships, and no job ran it. slog drops
       # `debug!` at compile time there and the optimiser changes what a
       # test can observe, so a green debug run says nothing about it. A
@@ -145,10 +145,10 @@ jobs:
       # passed here for the life of the branch.
       - run: >
           cargo test --locked --release
-          -p vmm_api_common -p vmm_core -p vmm_devices -p vmm_devices_testsupport
+          -p vmm_api_common -p dladm -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
           -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
-          -p fhrun -p bhyve_api_sys -p bhyve_api -p viona_api
+          -p fhrun -p bhyve_api_sys -p bhyve_api -p viona_api -p dladm
 
   guest-init:
     name: guest init (musl)
@@ -211,7 +211,7 @@ jobs:
           MSRV: ${{ steps.msrv.outputs.version }}
         run: >
           cargo "+$MSRV" check --locked
-          -p vmm_api_common -p vmm_core -p vmm_devices -p vmm_devices_testsupport
+          -p vmm_api_common -p dladm -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
           -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
           -p fhrun
