@@ -54,63 +54,23 @@ impl VirtioAttachCtx<'_> {
     }
 }
 
-/// Parse a virtio-blk config string:
-/// `path[,nodelete][,ro][,sectorsize=N][,num-queues=N]`.
-///
-/// Unknown options are ignored so an older binary still boots a config
-/// written for a newer one. A path cannot contain a comma, so the split
-/// is unambiguous.
-pub fn parse_blk_config(config: &str) -> (&str, VirtioBlockOpts) {
-    let mut opts = VirtioBlockOpts::default();
-    let mut path = config;
-
-    if let Some(comma) = config.find(',') {
-        path = &config[..comma];
-        for opt in config[comma + 1..].split(',') {
-            match opt {
-                "nodelete" => opts.nodelete = true,
-                "ro" => opts.read_only = true,
-                s if s.starts_with("sectorsize=") => {
-                    if let Ok(sz) = s["sectorsize=".len()..].parse::<u32>() {
-                        if sz.is_power_of_two() && (512..=65536).contains(&sz) {
-                            opts.sector_size = sz;
-                        }
-                    }
-                }
-                s if s.starts_with("num-queues=") => {
-                    if let Ok(n) = s["num-queues=".len()..].parse::<u16>() {
-                        if (1..=8).contains(&n) {
-                            opts.num_queues = Some(n);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    (path, opts)
-}
-
 /// Build a virtio-blk device and its PCI transport.
 ///
 /// The caller routes the INTx pin before this call and attaches the
 /// returned device to the chipset after it, so this function names no
 /// chipset type.
 pub fn virtio_blk(
-    config: &str,
+    path: &Path,
+    opts: &VirtioBlockOpts,
     num_vcpus: u32,
     lintr: Option<LintrCfg>,
     ctx: &VirtioAttachCtx<'_>,
 ) -> anyhow::Result<Arc<VirtioPciDevice<VirtioBlock>>> {
-    anyhow::ensure!(!config.is_empty(), "virtio-blk requires a disk path");
-    let (path, opts) = parse_blk_config(config);
-
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(!opts.read_only)
         .open(path)
-        .with_context(|| format!("failed to open disk: {path}"))?;
+        .with_context(|| format!("failed to open disk: {}", path.display()))?;
 
     // A zvol has one SPA sync pipeline, so beyond ~4 queues there is no
     // throughput gain.
@@ -118,11 +78,10 @@ pub fn virtio_blk(
         .num_queues
         .unwrap_or_else(|| std::cmp::min(num_vcpus as u16, 4).max(1));
 
-    let blk =
-        VirtioBlock::new(file, &opts, Arc::clone(ctx.physmap), num_queues)
-            .with_context(|| {
-                format!("failed to create virtio-blk for: {path}")
-            })?;
+    let blk = VirtioBlock::new(file, opts, Arc::clone(ctx.physmap), num_queues)
+        .with_context(|| {
+            format!("failed to create virtio-blk for: {}", path.display())
+        })?;
 
     let cfg_size = blk.config_size();
     // One MSI-X vector per queue, plus one for config change.
@@ -148,40 +107,22 @@ pub fn virtio_blk(
     Ok(pci_dev)
 }
 
-/// Split a viona config string into the VNIC name and the promiscphys
-/// flag.
-///
-/// promiscphys puts the VNIC in physical promiscuous mode, which a zone
-/// with MAC spoofing allowed needs.
-pub fn parse_viona_config(config: &str) -> (&str, bool) {
-    match config.find(',') {
-        Some(comma) => {
-            let promisc = config[comma + 1..]
-                .split(',')
-                .any(|o| o == "promiscphys" || o == "promiscphys=true");
-            (&config[..comma], promisc)
-        }
-        None => (config, false),
-    }
-}
-
-/// Build a viona device and its PCI transport from `vnic[,promiscphys]`.
+/// Build a viona device and its PCI transport on `vnic_name`.
 ///
 /// `defer_poll` holds the in-kernel interrupt poll thread back until ring
 /// state is restored; a binary with no migration path passes `false`.
 pub fn virtio_viona(
-    config: &str,
+    vnic_name: &str,
+    promiscphys: bool,
     lintr: Option<LintrCfg>,
     defer_poll: bool,
     ctx: &VirtioAttachCtx<'_>,
     log: &slog::Logger,
 ) -> anyhow::Result<Arc<VirtioPciDevice<VirtioViona>>> {
     anyhow::ensure!(
-        !config.is_empty(),
+        !vnic_name.is_empty(),
         "virtio-net-viona requires a VNIC name"
     );
-
-    let (vnic_name, promiscphys) = parse_viona_config(config);
 
     use std::os::fd::AsFd;
     let dev =
@@ -326,52 +267,4 @@ pub fn virtio_rng(
         Arc::clone(ctx.bus_mmio),
         Some(msix),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn blk_config_path_only() {
-        let (path, opts) = parse_blk_config("/dev/zvol/rdsk/tank/disk0");
-        assert_eq!(path, "/dev/zvol/rdsk/tank/disk0");
-        assert!(!opts.read_only);
-        assert_eq!(opts.sector_size, 512);
-        assert_eq!(opts.num_queues, None);
-    }
-
-    #[test]
-    fn blk_config_options() {
-        let (path, opts) = parse_blk_config(
-            "/tmp/d.img,ro,nodelete,sectorsize=4096,num-queues=2",
-        );
-        assert_eq!(path, "/tmp/d.img");
-        assert!(opts.read_only);
-        assert!(opts.nodelete);
-        assert_eq!(opts.sector_size, 4096);
-        assert_eq!(opts.num_queues, Some(2));
-    }
-
-    #[test]
-    fn viona_config_splits_name_and_promisc() {
-        assert_eq!(parse_viona_config("vnic0"), ("vnic0", false));
-        assert_eq!(parse_viona_config("vnic0,promiscphys"), ("vnic0", true));
-        assert_eq!(
-            parse_viona_config("vnic0,promiscphys=true"),
-            ("vnic0", true)
-        );
-        // An unknown option must not turn promiscuous mode on.
-        assert_eq!(parse_viona_config("vnic0,mtu=9000"), ("vnic0", false));
-    }
-
-    #[test]
-    fn blk_config_rejects_out_of_range_values() {
-        // Values outside the accepted range leave the defaults in place
-        // rather than handing a bad geometry to the guest.
-        let (_, opts) =
-            parse_blk_config("/tmp/d.img,sectorsize=777,num-queues=99");
-        assert_eq!(opts.sector_size, 512);
-        assert_eq!(opts.num_queues, None);
-    }
 }

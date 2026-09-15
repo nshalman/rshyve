@@ -50,6 +50,7 @@ use vmm_devices::lifecycle::prepare_unplug;
 use vmm_devices::pci::{Bdf, PciBus};
 use vmm_devices::IndicatedState;
 
+use crate::devspec;
 use crate::parse::parse_bdf;
 use crate::pci::{
     CreatedPciDevice, OwnedPciCtx, PciDeviceCtx, PciDeviceHandle,
@@ -201,7 +202,7 @@ impl Core {
         build: &mut BuildDevice<'_>,
     ) -> Result<String, HotplugError> {
         let bdf = hotplug_bdf(spec)?;
-        let id = device_id(spec);
+        let id = devspec::device_id(spec);
         self.check_free(&id, bdf)?;
 
         let (pci, lifecycle) =
@@ -220,7 +221,7 @@ impl Core {
                 }
             }
             return Err(HotplugError::NothingBuilt(
-                driver_of(spec).to_string(),
+                devspec::parts(spec).driver.to_string(),
             ));
         }
 
@@ -641,8 +642,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// its registers hold one bit per slot on bus 0, and the AML gives an
 /// `_EJ0` method to function 0 alone.
 fn hotplug_bdf(spec: &str) -> Result<Bdf, HotplugError> {
-    let slot = spec_slot(spec);
-    if driver_of(spec).is_empty() {
+    let devspec::SpecParts { slot, driver, .. } = devspec::parts(spec);
+    if driver.is_empty() {
         return Err(HotplugError::BadSpec(format!(
             "'{spec}' needs slot,driver[,config]"
         )));
@@ -659,28 +660,6 @@ fn hotplug_bdf(spec: &str) -> Result<Bdf, HotplugError> {
         return Err(HotplugError::FixedSlot(bdf.dev()));
     }
     Ok(bdf)
-}
-
-/// The leading `slot` field of a `slot,driver[,config]` spec.
-fn spec_slot(spec: &str) -> &str {
-    spec.split(',').next().unwrap_or("").trim()
-}
-
-/// The `driver` field, or an empty string.
-fn driver_of(spec: &str) -> &str {
-    spec.split(',').nth(1).map(str::trim).unwrap_or("")
-}
-
-/// Stable, operator-facing id for a spec.
-///
-/// The same `driver@slot` rule the boot-time attach pass uses, so one
-/// device has one id however it arrived.
-fn device_id(spec: &str) -> String {
-    let slot = spec_slot(spec);
-    match driver_of(spec) {
-        "" => slot.to_string(),
-        driver => format!("{driver}@{slot}"),
-    }
 }
 
 /// The `-s` specs a restart has to replay.

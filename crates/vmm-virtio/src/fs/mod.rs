@@ -95,68 +95,6 @@ impl Default for VirtioFsOpts {
     }
 }
 
-/// Parse the config half of `-s <slot>,virtio-fs,<config>`.
-///
-/// Grammar: `<host-path>[,tag=<name>][,ro][,queue-size=<n>]`. The tag
-/// defaults to the last path component. Unknown options are a hard error:
-/// virtio-fs is new here, so there is no forward compatibility to keep.
-pub fn parse_fs_config(config: &str) -> anyhow::Result<VirtioFsOpts> {
-    let mut parts = config.split(',');
-    let path = parts.next().unwrap_or("");
-    if path.is_empty() {
-        anyhow::bail!("virtio-fs requires a host directory path");
-    }
-
-    let mut opts = VirtioFsOpts {
-        path: std::path::PathBuf::from(path),
-        ..VirtioFsOpts::default()
-    };
-    let mut tag: Option<String> = None;
-
-    for opt in parts.filter(|o| !o.is_empty()) {
-        if let Some(v) = opt.strip_prefix("tag=") {
-            tag = Some(v.to_string());
-        } else if opt == "ro" {
-            opts.read_only = true;
-        } else if let Some(v) = opt.strip_prefix("queue-size=") {
-            let n: u32 = v.parse().unwrap_or(0);
-            if !(u32::from(FS_QUEUE_SIZE_MIN)..=u32::from(FS_QUEUE_SIZE_MAX))
-                .contains(&n)
-            {
-                anyhow::bail!(
-                    "virtio-fs queue-size must be {}..={}, got {}",
-                    FS_QUEUE_SIZE_MIN,
-                    FS_QUEUE_SIZE_MAX,
-                    v
-                );
-            }
-            opts.queue_size = n as u16;
-        } else {
-            anyhow::bail!("virtio-fs: unknown option '{}'", opt);
-        }
-    }
-
-    opts.tag = match tag {
-        Some(t) => t,
-        None => opts
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-    };
-    if opts.tag.len() > FS_TAG_LEN {
-        anyhow::bail!(
-            "virtio-fs tag '{}' exceeds {} bytes",
-            opts.tag,
-            FS_TAG_LEN
-        );
-    }
-    if opts.tag.as_bytes().contains(&0) {
-        anyhow::bail!("virtio-fs tag must not contain NUL");
-    }
-    Ok(opts)
-}
-
 /// Normalize a requested queue size to something `VirtQueue::new` accepts:
 /// clamped to 8..=1024, then rounded up to a power of two.
 ///

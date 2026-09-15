@@ -12,6 +12,7 @@
 
 pub mod build;
 pub mod chipset;
+pub mod devspec;
 pub mod firmware;
 pub mod hotplug;
 pub mod opts;

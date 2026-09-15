@@ -337,21 +337,6 @@ fn reader_loop(shared: Arc<ConsoleShared>, mut stream: UnixStream) {
     // own it, and the write path drops a dead one on its own.
 }
 
-/// Parse the config half of `-s <slot>,virtio-console,<socket-path>`.
-pub fn parse_console_config(config: &str) -> anyhow::Result<&str> {
-    if config.is_empty() {
-        anyhow::bail!("virtio-console requires a socket path");
-    }
-    let mut parts = config.split(',');
-    let path = parts.next().unwrap_or(config);
-    if let Some(opt) = parts.next() {
-        // Rejecting unknown options stops a misspelled flag from
-        // looking as though it were honored.
-        anyhow::bail!("virtio-console takes no options, got '{}'", opt);
-    }
-    Ok(path)
-}
-
 /// Single-port VirtIO console backed by a Unix domain socket.
 pub struct VirtioConsole {
     shared: Arc<ConsoleShared>,

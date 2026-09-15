@@ -1953,6 +1953,7 @@ dependencies = [
  "vmm_config",
  "vmm_core",
  "vmm_devices",
+ "vmm_virtio",
 ]
 
 [[package]]

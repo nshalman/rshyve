@@ -25,7 +25,7 @@ use vmm_devices::uart::backend::SerialBackend;
 use vmm_devices::uart::lpc::{self, LpcUart};
 use vmm_devices::InputBroker;
 use vmm_machine::{
-    build_machine, find_lpc_device, host_tsc_frequency_hz, parse_bdf,
+    build_machine, devspec, find_lpc_device, host_tsc_frequency_hz,
     CpuHotplugEngine, CpuSlots, CreatedPciDevice, DeviceRegistry,
     HotplugEngine, HotplugEngines, MachineOpts, MemHotplugEngine,
     RegisteredDevice, RunOutcome, VcpuRegistry, VcpuSetup,
@@ -476,7 +476,7 @@ fn hotplug_factory(cli: &Cli, num_vcpus: u32) -> vmm_machine::HotplugFactory {
 }
 
 fn pci_spec_driver(spec: &str) -> Option<&str> {
-    spec.split(',').nth(1)
+    Some(devspec::parts(spec).driver).filter(|driver| !driver.is_empty())
 }
 
 /// True when any bootindex-stripped spec names the ahci-cd driver.
@@ -1154,19 +1154,6 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     })
 }
 
-fn parse_ahci_cd_path(config: &str) -> anyhow::Result<&str> {
-    if config.is_empty() {
-        anyhow::bail!("ahci-cd requires an ISO path");
-    }
-    let path = config.split(',').next().unwrap_or(config);
-    if let Some(opt) = config.split(',').skip(1).find(|o| !o.is_empty()) {
-        // Rejecting unknown options prevents a read-only device from
-        // appearing to honor a writable configuration.
-        anyhow::bail!("ahci-cd takes no options, got '{}'", opt);
-    }
-    Ok(path)
-}
-
 fn reject_ahci_hd<T>() -> anyhow::Result<T> {
     anyhow::bail!(
         "AHCI device type 'ahci-hd' is not implemented; use virtio-blk or nvme"
@@ -1206,25 +1193,23 @@ fn parse_and_create_pci_device(
         hdl: vmm_hdl,
     };
 
-    let parts: Vec<&str> = spec.splitn(3, ',').collect();
-    if parts.len() < 2 {
-        anyhow::bail!(
-            "invalid PCI slot spec '{}': need slot,driver[,config]",
-            spec
-        );
-    }
-
-    let bdf = parse_bdf(parts[0]).ok_or_else(|| {
-        anyhow::anyhow!("invalid BDF '{}' in spec '{}'", parts[0], spec)
-    })?;
-    let driver = parts[1];
-    let config = parts.get(2).copied().unwrap_or("");
+    let (bdf, driver, config) = devspec::split(spec)?;
 
     match driver {
         "virtio-blk" | "virtio-blk-pci" => {
+            anyhow::ensure!(
+                !config.is_empty(),
+                "virtio-blk requires a disk path"
+            );
+            let (path, blk_opts) = devspec::parse_blk_config(config);
             let lintr = chipset.route_lintr(&bdf);
-            let pci_dev =
-                attach::virtio_blk(config, num_vcpus, lintr, &virtio_ctx)?;
+            let pci_dev = attach::virtio_blk(
+                std::path::Path::new(path),
+                &blk_opts,
+                num_vcpus,
+                lintr,
+                &virtio_ctx,
+            )?;
             chipset.try_attach_device(bdf, pci_dev.clone())?;
             info!(log, "virtio-blk attached";
                 "bdf" => %bdf,
@@ -1237,13 +1222,14 @@ fn parse_and_create_pci_device(
             ))
         }
         "virtio-net-viona" => {
-            let (vnic_name, promiscphys) = attach::parse_viona_config(config);
+            let (vnic_name, promiscphys) = devspec::parse_viona_config(config);
 
             // On a migrate destination the rings are not programmed yet, so
             // the poll thread waits for start_poll_deferred() after restore.
             let lintr = chipset.route_lintr(&bdf);
             let pci_dev = attach::virtio_viona(
-                config,
+                vnic_name,
+                promiscphys,
                 lintr,
                 is_migrate_dest,
                 &virtio_ctx,
@@ -1265,7 +1251,7 @@ fn parse_and_create_pci_device(
             if config.is_empty() {
                 anyhow::bail!("nvme requires a disk path");
             }
-            let (path, blk_opts) = attach::parse_blk_config(config);
+            let (path, blk_opts) = devspec::parse_blk_config(config);
             use std::fs::OpenOptions;
             let file = OpenOptions::new()
                 .read(true)
@@ -1293,7 +1279,7 @@ fn parse_and_create_pci_device(
             ))
         }
         "virtio-console" => {
-            let path = vmm_virtio::console::parse_console_config(config)?;
+            let path = devspec::parse_console_config(config)?;
             let lintr = chipset.route_lintr(&bdf);
             let pci_dev = attach::virtio_console(
                 std::path::Path::new(path),
@@ -1313,8 +1299,8 @@ fn parse_and_create_pci_device(
             ))
         }
         "virtio-fs" => {
-            use vmm_virtio::fs::{clamp_queue_size, parse_fs_config};
-            let opts = parse_fs_config(config)?;
+            use vmm_virtio::fs::clamp_queue_size;
+            let opts = devspec::parse_fs_config(config)?;
             let queue_size = clamp_queue_size(opts.queue_size);
             let lintr = chipset.route_lintr(&bdf);
             let pci_dev =
@@ -1432,7 +1418,7 @@ fn parse_and_create_pci_device(
             Ok((Some(dev as Arc<dyn vmm_devices::pci::PciDevice>), None))
         }
         "ahci-cd" => {
-            let path = parse_ahci_cd_path(config)?;
+            let path = devspec::parse_ahci_cd_path(config)?;
             let media = vmm_storage::ahci::media::IsoMedia::open(
                 std::path::Path::new(path),
             )
@@ -1787,20 +1773,6 @@ mod tests {
 
         assert!(message.contains("not implemented"));
         assert!(!message.contains("use virtio-blk instead"));
-    }
-
-    #[test]
-    fn ahci_cd_requires_path() {
-        let error = parse_ahci_cd_path("").unwrap_err();
-
-        assert_eq!(error.to_string(), "ahci-cd requires an ISO path");
-    }
-
-    #[test]
-    fn ahci_cd_rejects_options() {
-        let error = parse_ahci_cd_path("/x.iso,rw").unwrap_err();
-
-        assert_eq!(error.to_string(), "ahci-cd takes no options, got 'rw'");
     }
 
     #[test]

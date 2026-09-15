@@ -209,7 +209,8 @@ impl Fixture {
         let bus = Arc::clone(&self.bus);
         move |spec: &str| {
             calls.fetch_add(1, Ordering::AcqRel);
-            let bdf = parse_bdf(spec_slot(spec)).expect("a parsed slot");
+            let bdf =
+                parse_bdf(devspec::parts(spec).slot).expect("a parsed slot");
             // The boot-time catalogs attach through the chipset, which
             // is this call.
             bus.try_attach(bdf, device.clone() as Arc<dyn PciDevice>)?;
@@ -276,9 +277,9 @@ impl Fixture {
 fn the_hot_add_id_matches_the_boot_path() {
     // One device gets one id however it arrived, or an operator could
     // not name a hot-added device the way device-list reports it.
-    assert_eq!(device_id("4,virtio-blk,/disk"), "virtio-blk@4");
-    assert_eq!(device_id(" 4 ,virtio-blk"), "virtio-blk@4");
-    assert_eq!(device_id("4"), "4");
+    assert_eq!(devspec::device_id("4,virtio-blk,/disk"), "virtio-blk@4");
+    assert_eq!(devspec::device_id(" 4 ,virtio-blk"), "virtio-blk@4");
+    assert_eq!(devspec::device_id("4"), "4");
 }
 
 #[test]

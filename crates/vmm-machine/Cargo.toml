@@ -12,6 +12,7 @@ workspace = true
 vmm_config.workspace = true
 vmm_core.workspace = true
 vmm_devices.workspace = true
+vmm_virtio.workspace = true
 bhyve_api.workspace = true
 anyhow.workspace = true
 libc.workspace = true
