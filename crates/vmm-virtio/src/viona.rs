@@ -289,19 +289,7 @@ impl VirtioDevice for VirtioViona {
             (status >> 8) as u8,
         ];
 
-        let off = offset as usize;
-        let nbytes = (len as usize).min(4);
-        if off >= cfg.len() {
-            return 0;
-        }
-
-        let mut val = 0u32;
-        for i in 0..nbytes {
-            if off + i < cfg.len() {
-                val |= u32::from(cfg[off + i]) << (i * 8);
-            }
-        }
-        val
+        crate::cfg_read_bytes(&cfg, offset, len)
     }
 
     fn cfg_write(&self, _offset: u16, _val: u32, _len: u8) {

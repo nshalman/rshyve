@@ -471,17 +471,7 @@ impl VirtioDevice for VirtioBlock {
             // We write zeros instead of deallocating, so never unmap.
             config[0x38] = 0;
         }
-        let off = offset as usize;
-        if off >= config.len() {
-            return 0;
-        }
-        let mut result = 0u32;
-        for i in 0..len.min(4) as usize {
-            if off + i < config.len() {
-                result |= (config[off + i] as u32) << (i * 8);
-            }
-        }
-        result
+        crate::cfg_read_bytes(&config, offset, len)
     }
 
     fn cfg_write(&self, _: u16, _: u32, _: u8) {}
