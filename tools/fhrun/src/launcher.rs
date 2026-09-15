@@ -214,62 +214,19 @@ extern "C" fn forward_signal(sig: libc::c_int) {
 // -- temp dir ---------------------------------------------------------
 
 /// A temp directory removed on drop.
-///
-/// Hand-rolled rather than taking a `tempfile` dependency: the only
-/// thing needed is mkdtemp plus recursive removal.
-pub struct TempDir {
-    path: PathBuf,
-}
+pub struct TempDir(tempfile::TempDir);
 
 impl TempDir {
     fn new(prefix: &str) -> Result<Self> {
-        let template =
-            format!("{}/{}-XXXXXX", std::env::temp_dir().display(), prefix);
-        let mut bytes: Vec<u8> = template.into_bytes();
-        bytes.push(0);
-        let p =
-            unsafe { libc::mkdtemp(bytes.as_mut_ptr() as *mut libc::c_char) };
-        if p.is_null() {
-            let e = std::io::Error::last_os_error();
-            anyhow::bail!("mkdtemp failed: {e}");
-        }
-        bytes.pop();
-        let s = String::from_utf8(bytes).context("temp path not utf8")?;
-        Ok(TempDir {
-            path: PathBuf::from(s),
-        })
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("{prefix}-"))
+            .tempdir()
+            .context("create temp dir")?;
+        Ok(Self(dir))
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        // Best effort: the program is exiting, and a stale temp dir is
-        // better than a panic in a destructor.
-        let _ = remove_dir_all(&self.path);
-    }
-}
-
-fn remove_dir_all(path: &Path) -> std::io::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    if path.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let p = entry.path();
-            if p.is_dir() && !p.is_symlink() {
-                remove_dir_all(&p)?;
-            } else {
-                std::fs::remove_file(&p)?;
-            }
-        }
-        std::fs::remove_dir(path)
-    } else {
-        std::fs::remove_file(path)
+        self.0.path()
     }
 }
 
