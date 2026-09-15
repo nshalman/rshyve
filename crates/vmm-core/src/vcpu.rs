@@ -15,13 +15,9 @@
 //! a given vCPU at a time. This type does not enforce that invariant
 //! in Rust — the caller must ensure single-threaded access per vCPU.
 
-use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
-use bhyve_api::{
-    ioctls, seg_desc, vm_exception, vm_exit, vm_reg_name, vm_register,
-    vm_run_state, vm_seg_desc, VRS_RUN,
-};
+use bhyve_api::{seg_desc, vm_exit, vm_reg_name, VRS_RUN};
 
 use crate::exits::{VmEntry, VmExit};
 use crate::hdl::VmmHdl;
@@ -64,15 +60,7 @@ impl Vcpu {
     /// Must be called before [`enter`]. The kernel allocates per-vCPU
     /// state on activation.
     pub fn activate(&self) -> std::io::Result<()> {
-        let fd = self.hdl.as_raw_fd();
-        let mut cpu = self.id;
-        // Safety: VM_ACTIVATE_CPU takes a pointer to the vCPU id.
-        let res =
-            unsafe { libc::ioctl(fd, ioctls::VM_ACTIVATE_CPU as _, &mut cpu) };
-        if res == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+        self.hdl.vcpu_activate(self.id)
     }
 
     // ---------------------------------------------------------------
@@ -81,79 +69,28 @@ impl Vcpu {
 
     /// Set a guest register value.
     pub fn set_reg(&self, reg: vm_reg_name, val: u64) -> std::io::Result<()> {
-        let mut vr = vm_register {
-            cpuid: self.id,
-            regnum: reg as i32,
-            regval: val,
-        };
-        let fd = self.hdl.as_raw_fd();
-        // Safety: vm_register is the correct struct for VM_SET_REGISTER.
-        let res =
-            unsafe { libc::ioctl(fd, ioctls::VM_SET_REGISTER as _, &mut vr) };
-        if res == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+        self.hdl.vcpu_set_reg(self.id, reg, val)
     }
 
     /// Inject a `#GP(0)` (general protection) exception on the next
     /// re-entry. Used for spec-mandated MSR access faults — for
     /// example writing a Hyper-V MSR with reserved bits set.
     ///
-    /// `restart_instruction = 0` so the kernel does not rewind RIP:
-    /// the WRMSR/RDMSR has already been decoded by the time we get
-    /// here, and the guest expects to see the fault at the next
-    /// instruction (TLFS 14.6).
+    /// The kernel does not rewind RIP: the WRMSR/RDMSR has already
+    /// been decoded by the time we get here, and the guest expects to
+    /// see the fault at the next instruction (TLFS 14.6).
     pub fn inject_gp(&self) -> std::io::Result<()> {
-        let mut exc = vm_exception {
-            cpuid: self.id,
-            vector: 13,
-            error_code: 0,
-            error_code_valid: 1,
-            restart_instruction: 0,
-        };
-        let fd = self.hdl.as_raw_fd();
-        let res = unsafe {
-            libc::ioctl(fd, ioctls::VM_INJECT_EXCEPTION as _, &mut exc)
-        };
-        if res == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+        self.hdl.vcpu_inject_exception(self.id, 13, Some(0), false)
     }
 
     /// Get a guest register value.
     pub fn get_reg(&self, reg: vm_reg_name) -> std::io::Result<u64> {
-        let mut vr = vm_register {
-            cpuid: self.id,
-            regnum: reg as i32,
-            regval: 0,
-        };
-        let fd = self.hdl.as_raw_fd();
-        // Safety: vm_register is the correct struct for VM_GET_REGISTER.
-        let res =
-            unsafe { libc::ioctl(fd, ioctls::VM_GET_REGISTER as _, &mut vr) };
-        if res == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(vr.regval)
+        self.hdl.vcpu_get_reg(self.id, reg)
     }
 
     /// Get the vCPU run state and SIPI vector.
     pub fn get_run_state(&self) -> std::io::Result<(u32, u8)> {
-        let mut rs = vm_run_state {
-            vcpuid: self.id,
-            state: 0,
-            sipi_vector: 0,
-            _pad: [0; 3],
-        };
-        let fd = self.hdl.as_raw_fd();
-        let res =
-            unsafe { libc::ioctl(fd, ioctls::VM_GET_RUN_STATE as _, &mut rs) };
-        if res == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok((rs.state, rs.sipi_vector))
+        self.hdl.vcpu_run_state(self.id)
     }
 
     /// Set the vCPU run state (e.g., VRS_RUN to mark it runnable).
@@ -167,20 +104,7 @@ impl Vcpu {
         state: u32,
         sipi_vector: u8,
     ) -> std::io::Result<()> {
-        let mut rs = vm_run_state {
-            vcpuid: self.id,
-            state,
-            sipi_vector,
-            _pad: [0; 3],
-        };
-        let fd = self.hdl.as_raw_fd();
-        // Safety: vm_run_state is the correct struct for VM_SET_RUN_STATE.
-        let res =
-            unsafe { libc::ioctl(fd, ioctls::VM_SET_RUN_STATE as _, &mut rs) };
-        if res == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+        self.hdl.vcpu_set_run_state(self.id, state, sipi_vector)
     }
 
     /// Reset all vCPU state to x86 power-on defaults.
@@ -189,18 +113,7 @@ impl Vcpu {
     /// segment descriptors, and pending interrupts to their reset
     /// values as defined by the x86 architecture.
     pub fn reboot_state(&self) -> std::io::Result<()> {
-        let mut vvr = bhyve_api::vm_vcpu_reset {
-            vcpuid: self.id,
-            kind: bhyve_api::vcpu_reset_kind::VRK_RESET as u32,
-        };
-        let fd = self.hdl.as_raw_fd();
-        // Safety: vm_vcpu_reset is the correct struct for VM_RESET_CPU.
-        let res =
-            unsafe { libc::ioctl(fd, ioctls::VM_RESET_CPU as _, &mut vvr) };
-        if res == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+        self.hdl.vcpu_reset(self.id)
     }
 
     /// Set a guest segment descriptor (CS, DS, SS, ES, FS, GS, TR, LDTR, GDTR, IDTR).
@@ -209,20 +122,7 @@ impl Vcpu {
         reg: vm_reg_name,
         desc: &seg_desc,
     ) -> std::io::Result<()> {
-        let mut vsd = vm_seg_desc {
-            cpuid: self.id,
-            regnum: reg as i32,
-            desc: *desc,
-        };
-        let fd = self.hdl.as_raw_fd();
-        // Safety: vm_seg_desc is the correct struct for VM_SET_SEGMENT_DESCRIPTOR.
-        let res = unsafe {
-            libc::ioctl(fd, ioctls::VM_SET_SEGMENT_DESCRIPTOR as _, &mut vsd)
-        };
-        if res == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+        self.hdl.vcpu_set_segment_desc(self.id, reg, desc)
     }
 
     /// Get a guest segment descriptor (CS, DS, SS, ES, FS, GS, TR, LDTR, GDTR, IDTR).
@@ -230,19 +130,7 @@ impl Vcpu {
         &self,
         reg: vm_reg_name,
     ) -> std::io::Result<seg_desc> {
-        let mut vsd = vm_seg_desc {
-            cpuid: self.id,
-            regnum: reg as i32,
-            desc: seg_desc::default(),
-        };
-        let fd = self.hdl.as_raw_fd();
-        let res = unsafe {
-            libc::ioctl(fd, ioctls::VM_GET_SEGMENT_DESCRIPTOR as _, &mut vsd)
-        };
-        if res == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(vsd.desc)
+        self.hdl.vcpu_get_segment_desc(self.id, reg)
     }
 
     /// Set up the BSP (bootstrap processor, vCPU 0) for initial boot.
@@ -282,15 +170,9 @@ impl Vcpu {
         let mut raw_entry =
             entry.to_raw(self.id, &mut raw_exit as *mut vm_exit);
 
-        let fd = self.hdl.as_raw_fd();
-        // Safety: VM_RUN takes a vm_entry pointer. raw_exit is
-        // stack-local and outlives the ioctl. raw_entry.exit_data
-        // points to raw_exit.
-        let res =
-            unsafe { libc::ioctl(fd, ioctls::VM_RUN as _, &mut raw_entry) };
-        if res == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
+        // Safety: raw_entry.exit_data points at raw_exit, which is
+        // stack-local and outlives the call.
+        unsafe { self.hdl.vcpu_run(&mut raw_entry) }?;
 
         Ok(VmExit::parse(&raw_exit, api_version))
     }

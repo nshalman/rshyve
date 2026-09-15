@@ -27,6 +27,8 @@ use bhyve_api::{
 
 use crate::mem::Prot;
 
+mod vcpu;
+
 /// How a VM is asked to stop. The kernel latches the first request and
 /// answers `EALREADY` to the rest.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
