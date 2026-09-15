@@ -4,9 +4,8 @@
 
 //! CFI-compatible persistent UEFI variable storage.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -165,31 +164,24 @@ impl VarFile {
                 "mode" => format!("{mode:#o}"));
         }
 
-        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
-        // POSIX types both fields as short, but libc exposes the F_* and
-        // SEEK_* constants as c_int, and the widths differ by platform.
-        lock.l_type = libc::F_WRLCK as libc::c_short;
-        lock.l_whence = libc::SEEK_SET as libc::c_short;
-        lock.l_start = 0;
-        lock.l_len = 0;
-        let lock_result = unsafe {
-            libc::fcntl(
-                file.as_raw_fd(),
-                libc::F_SETLK,
-                &lock as *const libc::flock,
-            )
-        };
-        if lock_result < 0 {
-            let error = std::io::Error::last_os_error();
-            anyhow::bail!(
-                "variable store {} is locked by another vmm process: {error}",
+        // The lock lives on the open file description, so it lasts as
+        // long as `file` does and no longer.
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => anyhow::bail!(
+                "variable store {} is locked by another vmm process",
                 path.display(),
-            );
+            ),
+            Err(TryLockError::Error(error)) => {
+                return Err(error).with_context(|| {
+                    format!("cannot lock variable store: {}", path.display())
+                });
+            }
         }
 
         validate_header(&mut file, path, len, log)?;
 
-        // MAP_SHARED aliasing is sound because the record lock excludes other
+        // MAP_SHARED aliasing is sound because the lock excludes other
         // VMM instances and this process never changes the validated length. A
         // host actor that can truncate the file can still induce SIGBUS, so file
         // permissions remain the trust boundary.
