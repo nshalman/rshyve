@@ -16,6 +16,7 @@ pub mod devspec;
 pub mod entry;
 pub mod firmware;
 pub mod hotplug;
+pub mod inventory;
 pub mod opts;
 pub mod parse;
 pub mod pci;
