@@ -9,8 +9,7 @@
 //! from the host's entropy source and return them.
 //!
 //! This is a security-critical device: guest entropy quality depends
-//! entirely on the host source. We use `getrandom(2)` which draws
-//! from the kernel CSPRNG.
+//! entirely on the host source, which is the kernel CSPRNG.
 
 use vmm_core::mem::PhysMap;
 
@@ -76,9 +75,10 @@ impl VirtioDevice for VirtioRng {
                     let n = remaining.min(CHUNK);
                     let mut rand_buf = vec![0u8; n];
 
-                    // getrandom(2) — blocks until entropy is available,
-                    // never fails for reasonable buffer sizes.
-                    getrandom(&mut rand_buf);
+                    // Blocks until entropy is available; never fails
+                    // for a buffer this size.
+                    getrandom::fill(&mut rand_buf)
+                        .expect("the host entropy source failed");
 
                     if let Some(sub) = physmap.lookup(*addr + offset, n) {
                         // write to guest memory; no recovery if unmapped
@@ -104,40 +104,6 @@ impl Lifecycle for VirtioRng {
     }
 }
 
-/// Fill a buffer with cryptographically secure random bytes.
-///
-/// Uses `getrandom(2)` on illumos, `getentropy(2)` on macOS.
-/// Retries on partial reads and EINTR.
-#[cfg(target_os = "illumos")]
-fn getrandom(buf: &mut [u8]) {
-    let mut filled = 0;
-    while filled < buf.len() {
-        let ret = unsafe {
-            libc::getrandom(
-                buf[filled..].as_mut_ptr().cast(),
-                buf.len() - filled,
-                0,
-            )
-        };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            panic!("getrandom failed: {err}");
-        }
-        filled += ret as usize;
-    }
-}
-
-#[cfg(not(target_os = "illumos"))]
-fn getrandom(buf: &mut [u8]) {
-    use std::io::Read;
-    let mut f = std::fs::File::open("/dev/urandom")
-        .expect("failed to open /dev/urandom");
-    f.read_exact(buf).expect("failed to read from /dev/urandom");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,13 +122,5 @@ mod tests {
         let rng = VirtioRng::new();
         assert_eq!(rng.cfg_read(0, 4), 0);
         assert_eq!(rng.cfg_read(4, 1), 0);
-    }
-
-    #[test]
-    fn getrandom_fills_buffer() {
-        let mut buf = [0u8; 64];
-        getrandom(&mut buf);
-        // Extremely unlikely that 64 random bytes are all zero
-        assert_ne!(buf, [0u8; 64]);
     }
 }

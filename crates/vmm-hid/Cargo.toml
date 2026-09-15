@@ -15,6 +15,6 @@ anyhow.workspace = true
 ascii.workspace = true
 bitflags.workspace = true
 des.workspace = true
-libc.workspace = true
+getrandom.workspace = true
 slog.workspace = true
 usdt = { workspace = true, features = ["asm"] }

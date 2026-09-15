@@ -234,7 +234,7 @@ fn vnc_auth_challenge<S: Read + Write>(
 ) -> io::Result<()> {
     // Generate a random 16-byte challenge from the OS CSPRNG.
     let mut challenge = [0u8; 16];
-    fill_random(&mut challenge)?;
+    getrandom::fill(&mut challenge).map_err(io::Error::other)?;
 
     stream.write_all(&challenge)?;
     stream.flush()?;
@@ -295,39 +295,6 @@ fn reverse_bits(mut b: u8) -> u8 {
         b >>= 1;
     }
     result
-}
-
-/// Fill a buffer with cryptographically secure random bytes.
-///
-/// Uses `getrandom(2)` on illumos, `/dev/urandom` elsewhere.
-#[cfg(target_os = "illumos")]
-fn fill_random(buf: &mut [u8]) -> io::Result<()> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        let ret = unsafe {
-            libc::getrandom(
-                buf[filled..].as_mut_ptr().cast(),
-                buf.len() - filled,
-                0,
-            )
-        };
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-        filled += ret as usize;
-    }
-    Ok(())
-}
-
-/// Fill a buffer with cryptographically secure random bytes.
-#[cfg(not(target_os = "illumos"))]
-fn fill_random(buf: &mut [u8]) -> io::Result<()> {
-    let mut f = std::fs::File::open("/dev/urandom")?;
-    f.read_exact(buf)
 }
 
 /// Send the ServerInit message.
@@ -763,13 +730,5 @@ mod tests {
         assert_eq!(result.len(), 16);
         // Even with an all-zero key, DES transforms the input
         assert_ne!(result, challenge);
-    }
-
-    #[test]
-    fn fill_random_produces_bytes() {
-        let mut buf = [0u8; 16];
-        fill_random(&mut buf).expect("fill_random should succeed");
-        // Extremely unlikely that 16 random bytes are all zero
-        assert_ne!(buf, [0u8; 16]);
     }
 }
