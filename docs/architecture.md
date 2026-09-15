@@ -9,6 +9,7 @@ vmmnew/
     bhyve-api/          Kernel ioctl FFI (forked from propolis)
     bhyve-api/sys/      Raw ioctl structs and constants
     viona-api/          viona network driver FFI
+    dladm/              libdladm VNIC lookup
     viona-api/sys/      Raw viona structs
     vmm-core/           VmmHdl, PhysMap, MemCtx, Machine, Vcpu, CPUID
     vmm-devices/        All device implementations

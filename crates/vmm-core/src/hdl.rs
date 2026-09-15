@@ -10,7 +10,7 @@
 //! exposed via a generic ioctl escape hatch.
 
 use std::io::{Error, ErrorKind, Result};
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::time::Duration;
 
 use bhyve_api::{
@@ -658,6 +658,12 @@ impl VmmHdl {
 impl AsRawFd for VmmHdl {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
+    }
+}
+
+impl AsFd for VmmHdl {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
     }
 }
 

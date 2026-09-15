@@ -266,6 +266,12 @@ impl AsRawFd for VmmFd {
     }
 }
 
+impl AsFd for VmmFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
 pub type VmmDataResult<T> = std::result::Result<T, VmmDataError>;
 
 /// Encompasses the configuration and context to perform a vmm-data operation

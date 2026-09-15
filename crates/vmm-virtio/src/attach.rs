@@ -185,8 +185,8 @@ pub fn virtio_viona(
 
     let (vnic_name, promiscphys) = parse_viona_config(config);
 
-    use std::os::fd::AsRawFd;
-    let dev = VirtioViona::new(vnic_name, ctx.hdl.as_raw_fd()).with_context(
+    use std::os::fd::AsFd;
+    let dev = VirtioViona::new(vnic_name, ctx.hdl.as_fd()).with_context(
         || format!("failed to create viona device for VNIC: {vnic_name}"),
     )?;
 

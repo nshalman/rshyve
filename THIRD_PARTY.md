@@ -34,6 +34,7 @@ Copied essentially verbatim:
 | `crates/bhyve-api/src/lib.rs` | `crates/bhyve-api/src/lib.rs` |
 | `crates/viona-api/src/lib.rs` | `crates/viona-api/src/lib.rs` |
 | `crates/viona-api/src/ffi.rs` | `crates/viona-api/src/ffi.rs` |
+| `crates/dladm/src/sys.rs` | `crates/dladm/src/sys.rs` |
 | `crates/vmm-core/src/aspace.rs` | `lib/propolis/src/util/aspace.rs` |
 | `crates/vmm-hid/src/ps2/keysym.rs` | `crates/rfb/src/keysym.rs` |
 | `crates/vmm-hid/src/ps2/keyboard/mod.rs` | `lib/propolis/src/hw/ps2/keyboard/mod.rs` |

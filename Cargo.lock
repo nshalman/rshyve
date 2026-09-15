@@ -330,6 +330,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dladm"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "dof"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1912,7 +1919,7 @@ dependencies = [
  "ascii",
  "bitflags",
  "des",
- "libc",
+ "getrandom 0.4.2",
  "slog",
  "usdt",
  "vmm_core",
@@ -1978,7 +1985,6 @@ name = "vmm_passthru"
 version = "0.1.0"
 dependencies = [
  "bhyve_api",
- "libc",
  "slog",
  "vmm_api_common",
  "vmm_core",
@@ -1990,7 +1996,6 @@ name = "vmm_storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "libc",
  "slog",
  "tempfile",
  "vmm_core",
@@ -2021,6 +2026,8 @@ name = "vmm_virtio"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dladm",
+ "getrandom 0.4.2",
  "libc",
  "slog",
  "tempfile",
