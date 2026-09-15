@@ -16,7 +16,7 @@ use slog::{error, info, o, warn, Drain, Logger};
 use vmm_boot::direct;
 use vmm_config::Cli;
 use vmm_core::hdl::CreateOpts;
-use vmm_core::intr_pins::{LegacyPIC, NoOpPin};
+use vmm_core::intr_pins::LegacyPIC;
 use vmm_core::machine::{Machine, MachineSetup};
 use vmm_core::msr::MsrHandler;
 use vmm_devices::acpi;
@@ -27,8 +27,8 @@ use vmm_devices::InputBroker;
 use vmm_machine::{
     build_machine, devspec, find_lpc_device, host_tsc_frequency_hz,
     CpuHotplugEngine, CpuSlots, CreatedPciDevice, DeviceRegistry,
-    HotplugEngine, HotplugEngines, MachineOpts, MemHotplugEngine,
-    RegisteredDevice, RunOutcome, VcpuRegistry, VcpuSetup,
+    HotplugEngine, HotplugEngines, MachineOpts, RegisteredDevice, RunOutcome,
+    VcpuRegistry, VcpuSetup,
 };
 use vmm_virtio::attach::{self, VirtioAttachCtx};
 
@@ -356,24 +356,11 @@ fn setup_serial(
     cli: &Cli,
     log: &Logger,
 ) -> anyhow::Result<(Arc<LpcUart>, Arc<LpcUart>)> {
-    // Create COM1 UART (IRQ 4, base port 0x3F8)
-    let com1_irq: Arc<dyn vmm_core::intr_pins::IntrPin> =
-        match pic.pin_handle(lpc::COM1_IRQ) {
-            Some(pin) => pin,
-            None => Arc::new(NoOpPin),
-        };
-    let com1 = LpcUart::new(com1_irq);
-    com1.attach(machine.bus_pio(), lpc::COM1_BASE);
+    let com1 =
+        vmm_machine::attach_uart(machine, pic, lpc::COM1_BASE, lpc::COM1_IRQ);
     info!(log, "COM1 attached"; "port" => format!("{:#x}", lpc::COM1_BASE));
-
-    // Create COM2 UART (IRQ 3, base port 0x2F8)
-    let com2_irq: Arc<dyn vmm_core::intr_pins::IntrPin> =
-        match pic.pin_handle(lpc::COM2_IRQ) {
-            Some(pin) => pin,
-            None => Arc::new(NoOpPin),
-        };
-    let com2 = LpcUart::new(com2_irq);
-    com2.attach(machine.bus_pio(), lpc::COM2_BASE);
+    let com2 =
+        vmm_machine::attach_uart(machine, pic, lpc::COM2_BASE, lpc::COM2_IRQ);
     info!(log, "COM2 attached"; "port" => format!("{:#x}", lpc::COM2_BASE));
 
     // Parse COM port paths from -l flags
@@ -383,19 +370,10 @@ fn setup_serial(
     // Set up COM1 serial I/O based on -l com1,<config>
     setup_serial_io(&com1, com1_path.as_deref(), "com1", log)?;
 
-    // Set up COM2:
-    // - "socket,/path" → Unix socket for host-side metadata agent
-    // - absent/no --mdata-nics → built-in mdata agent
-    // - other path → raw file I/O
+    // COM2 serves the backend the argv named, or the built-in mdata
+    // agent when it named none.
     if let Some(ref path) = com2_path {
-        if path.starts_with("socket,") {
-            // Production zone: create Unix socket so the host-side
-            // metadata agent (vmadmd) can connect and serve sdc:nics,
-            // SSH keys, etc. to the guest via COM2.
-            setup_serial_io(&com2, Some(path.as_str()), "com2", log)?;
-        } else {
-            setup_serial_io(&com2, Some(path.as_str()), "com2", log)?;
-        }
+        setup_serial_io(&com2, Some(path.as_str()), "com2", log)?;
     } else {
         // Standalone mode: start built-in mdata agent using CLI flags.
         let mdata_store = Arc::new(mdata::build_store_from_zone_config(
@@ -688,38 +666,6 @@ fn post_migration_timer_kick(machine: &Machine, log: &Logger) {
     }
 }
 
-/// Start the memory hot-add engine, or nothing when the VM asked for no
-/// window.
-///
-/// `-o hotplug.maxmem` already requires `--hotplug`, so a window with no
-/// register file is a contradiction and not a silent omission.
-fn start_mem_hotplug(
-    window: Option<vmm_machine::MemWindow>,
-    machine: &Machine,
-    regs: Option<&vmm_machine::HotplugRegisters>,
-    log: &Logger,
-) -> anyhow::Result<Option<Arc<MemHotplugEngine>>> {
-    let Some(window) = window else {
-        return Ok(None);
-    };
-    let regs = regs.ok_or_else(|| {
-        anyhow::anyhow!("a memory window needs the hotplug register files")
-    })?;
-    info!(log, "memory hot-add window";
-        "base" => format!("{:#x}", window.base()),
-        "bytes" => window.size(),
-        "slots" => window.slots(),
-    );
-    Ok(Some(MemHotplugEngine::start(
-        Arc::clone(machine.physmap()),
-        Arc::clone(machine.hdl()),
-        Arc::clone(machine.segids()),
-        Arc::clone(&regs.mem),
-        window,
-        log.new(o!("component" => "hotplug-mem")),
-    )))
-}
-
 /// What the control socket leaves behind for the rest of `run`.
 #[derive(Default)]
 struct ControlSocket {
@@ -992,7 +938,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     let hotplug = HotplugEngines {
         pci: pci_hotplug,
         cpu: cpu_hotplug,
-        mem: start_mem_hotplug(
+        mem: vmm_machine::start_mem_hotplug(
             mem_window,
             &machine,
             timer_pm_devs.hotplug.as_ref(),

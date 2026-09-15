@@ -20,7 +20,7 @@ use slog::{error, info, warn, Drain};
 use vmm_config::Cli;
 use vmm_machine::{
     CpuHotplugEngine, CpuSlots, DeviceRegistry, HotplugEngine, HotplugEngines,
-    MemHotplugEngine, VcpuRegistry, VcpuSetup,
+    VcpuRegistry, VcpuSetup,
 };
 use vmm_virtio::vsock::control::{ControlSink, ControlSlot};
 
@@ -264,7 +264,7 @@ fn run(
             log.new(slog::o!("component" => "hotplug")),
         )
     });
-    let mem_hotplug = start_mem_hotplug(
+    let mem_hotplug = vmm_machine::start_mem_hotplug(
         mem_window,
         &machine,
         timer_pm.hotplug.as_ref(),
@@ -414,38 +414,6 @@ fn run(
     // otherwise outlive the event loop.
     hotplug.shutdown();
     outcome
-}
-
-/// Start the memory hot-add engine, or nothing when the VM asked for no
-/// window.
-///
-/// `-o hotplug.maxmem` already requires `--hotplug`, so a window with no
-/// register file is a contradiction and not a silent omission.
-fn start_mem_hotplug(
-    window: Option<vmm_machine::MemWindow>,
-    machine: &vmm_core::machine::Machine,
-    regs: Option<&vmm_machine::HotplugRegisters>,
-    log: &slog::Logger,
-) -> anyhow::Result<Option<Arc<MemHotplugEngine>>> {
-    let Some(window) = window else {
-        return Ok(None);
-    };
-    let regs = regs.ok_or_else(|| {
-        anyhow::anyhow!("a memory window needs the hotplug register files")
-    })?;
-    info!(log, "memory hot-add window";
-        "base" => format!("{:#x}", window.base()),
-        "bytes" => window.size(),
-        "slots" => window.slots(),
-    );
-    Ok(Some(MemHotplugEngine::start(
-        Arc::clone(machine.physmap()),
-        Arc::clone(machine.hdl()),
-        Arc::clone(machine.segids()),
-        Arc::clone(&regs.mem),
-        window,
-        log.new(slog::o!("component" => "hotplug-mem")),
-    )))
 }
 
 fn main() -> ExitCode {

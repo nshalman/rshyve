@@ -31,7 +31,7 @@ pub use build::{
     build_machine, host_tsc_frequency_hz, no_pre_finalize, MachineBuild,
     MachineOpts,
 };
-pub use chipset::{init_chipset, ChipsetDevices};
+pub use chipset::{attach_uart, init_chipset, ChipsetDevices};
 pub use firmware::{
     setup_fwcfg_and_acpi, write_legacy_acpi_tables, write_smbios_tables,
     AcpiTables,
@@ -51,8 +51,8 @@ pub use pci::{
     PciDeviceCtx, PciDeviceFactory, PciDeviceHandle,
 };
 pub use pm::{
-    mem_hotplug_window, register_pm_devices, setup_timers_and_pm, Gpe0,
-    HotplugOpts, HotplugRegisters, TimerAndPmDevices,
+    mem_hotplug_window, register_pm_devices, setup_timers_and_pm,
+    start_mem_hotplug, Gpe0, HotplugOpts, HotplugRegisters, TimerAndPmDevices,
 };
 pub use registry::{
     DeviceRegistry, RegisteredDevice, RegistryError, SlotState,

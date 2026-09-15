@@ -157,6 +157,15 @@ impl LegacyPIC {
         Some(Arc::new(LegacyPin::new(irq, Arc::downgrade(self))))
     }
 
+    /// The pin for `irq`, or a [`NoOpPin`] for an IRQ the PIC cannot
+    /// route, so a device with an optional line always has one.
+    pub fn pin_or_noop(self: &Arc<Self>, irq: u8) -> Arc<dyn IntrPin> {
+        match self.pin_handle(irq) {
+            Some(pin) => pin,
+            None => Arc::new(NoOpPin),
+        }
+    }
+
     /// Perform an IRQ operation, calling the kernel ioctl only on
     /// level transitions.
     /// Returns whether the caller's pin state change stands. A false
