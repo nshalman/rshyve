@@ -17,6 +17,8 @@ bhyve_api.workspace = true
 anyhow.workspace = true
 libc.workspace = true
 slog.workspace = true
+slog-async.workspace = true
+slog-term.workspace = true
 usdt = { workspace = true, features = ["asm"] }
 
 [dev-dependencies]

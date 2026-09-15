@@ -10,8 +10,6 @@
 //! exception is `IGNORED`: names the bhyve zone brand puts on every
 //! zone that firehyve has no device for.
 
-use std::sync::Arc;
-
 use slog::{info, warn};
 
 use vmm_devices::pci::Bdf;
@@ -118,10 +116,7 @@ pub(crate) fn create_pci_device(
             ctx.chipset.try_attach_device(bdf, dev.clone())?;
             info!(ctx.log, "virtio-blk attached";
                 "bdf" => %bdf, "path" => config);
-            Ok((
-                Some(dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(dev as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(dev))
         }
         "virtio-net-viona" => {
             let lintr = ctx.chipset.route_lintr(&bdf);
@@ -139,10 +134,7 @@ pub(crate) fn create_pci_device(
             ctx.chipset.try_attach_device(bdf, dev.clone())?;
             info!(ctx.log, "virtio-net-viona attached";
                 "bdf" => %bdf, "vnic" => config);
-            Ok((
-                Some(dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(dev as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(dev))
         }
         "virtio-fs" => {
             use vmm_virtio::fs::clamp_queue_size;
@@ -156,10 +148,7 @@ pub(crate) fn create_pci_device(
                 "bdf" => %bdf,
                 "tag" => &opts.tag,
                 "path" => %opts.path.display());
-            Ok((
-                Some(dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(dev as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(dev))
         }
         "virtio-vsock" => {
             let (path, cid) = devspec::parse_vsock_config(config)?;
@@ -173,20 +162,14 @@ pub(crate) fn create_pci_device(
                 "bdf" => %bdf,
                 "cid" => cid,
                 "socket" => %path.display());
-            Ok((
-                Some(dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(dev as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(dev))
         }
         "virtio-rnd" => {
             let lintr = ctx.chipset.route_lintr(&bdf);
             let dev = attach::virtio_rng(lintr, &actx);
             ctx.chipset.try_attach_device(bdf, dev.clone())?;
             info!(ctx.log, "virtio-rnd attached"; "bdf" => %bdf);
-            Ok((
-                Some(dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(dev as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(dev))
         }
         "virtio-console" => {
             let path = devspec::parse_console_config(config)?;
@@ -200,10 +183,7 @@ pub(crate) fn create_pci_device(
             ctx.chipset.try_attach_device(bdf, dev.clone())?;
             info!(ctx.log, "virtio-console attached";
                 "bdf" => %bdf, "socket" => path);
-            Ok((
-                Some(dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(dev as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(dev))
         }
         // The chipset creates both of these; accepting the names keeps a
         // bhyve-shaped command line working.

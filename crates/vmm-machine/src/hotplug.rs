@@ -58,7 +58,8 @@ use crate::pci::{
 use crate::registry::{
     DeviceRegistry, RegisteredDevice, RegistryError, SlotState,
 };
-use crate::vcpus::VcpuRegistry;
+use crate::vcpu::VcpuFleet;
+use crate::vcpus::{VcpuRegistry, VcpuSetup};
 
 use self::cpu::{CpuHotplugEngine, CpuHotplugError, CpuOnline};
 use self::mem::{MemHotplugEngine, MemHotplugError, MemWindow};
@@ -739,6 +740,28 @@ impl CpuSlots {
     fn shutdown(&self) {
         self.engine.shutdown();
     }
+}
+
+/// Start the CPU hot-add engine when the VM has the register file for
+/// one. The registry it needs is built from the boot fleet.
+pub fn start_cpu_hotplug(
+    regs: Option<&crate::pm::HotplugRegisters>,
+    setup: VcpuSetup,
+    fleet: &VcpuFleet,
+    log: &Logger,
+) -> Option<CpuSlots> {
+    let regs = regs.and_then(|regs| regs.cpu.clone())?;
+    let vcpus = Arc::new(VcpuRegistry::from_fleet(
+        setup,
+        fleet,
+        log.new(slog::o!("component" => "vcpus")),
+    ));
+    let engine = CpuHotplugEngine::start(
+        Arc::clone(&vcpus),
+        regs,
+        log.new(slog::o!("component" => "hotplug-cpu")),
+    );
+    Some(CpuSlots::from_registry(engine, vcpus))
 }
 
 /// Every hot-add engine one VM has.

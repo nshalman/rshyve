@@ -16,7 +16,9 @@ use vmm_core::exits::Suspend;
 use vmm_core::machine::Machine;
 use vmm_devices::quiesce::{wait_all_quiesced_named, NamedDevice};
 
+use crate::hotplug::HotplugEngines;
 use crate::registry::DeviceRegistry;
+use crate::vcpu::VcpuFleet;
 use crate::vcpu_tasks::VcpuEvent;
 
 const QUIESCE_BUDGET: Duration = Duration::from_secs(5);
@@ -696,6 +698,48 @@ pub fn run_event_loop_registered(
 
 /// The same loop again, over a vCPU set that can grow while the guest
 /// runs.
+/// Run the event loop over a whole fleet, growable when the VM has a
+/// CPU hot-add engine and fixed otherwise.
+///
+/// The registry keeps its own sender, so the growable loop reads
+/// "every thread has gone" off the roster. Without a registry the drop
+/// of the fleet's sender here is what lets the channel close.
+pub fn run_fleet_event_loop(
+    machine: &Machine,
+    fleet: VcpuFleet,
+    hotplug: &HotplugEngines,
+    control_cleanup: Option<PathBuf>,
+    registry: &DeviceRegistry,
+    log: &Logger,
+) -> anyhow::Result<RunOutcome> {
+    let VcpuFleet {
+        events,
+        sender,
+        threads,
+        ..
+    } = fleet;
+    drop(sender);
+    if hotplug.cpu.is_some() {
+        run_event_loop_growable(
+            machine,
+            events,
+            &threads,
+            control_cleanup,
+            registry,
+            log,
+        )
+    } else {
+        run_event_loop_registered(
+            machine,
+            events,
+            threads.close(),
+            control_cleanup,
+            registry,
+            log,
+        )
+    }
+}
+
 pub fn run_event_loop_growable(
     machine: &Machine,
     event_rx: mpsc::Receiver<VcpuEvent>,

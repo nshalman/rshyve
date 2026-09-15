@@ -34,6 +34,18 @@ pub type LifecycleHandle = Arc<dyn vmm_devices::Lifecycle>;
 /// such as hostbridge or lpc.
 pub type CreatedPciDevice = (Option<PciDeviceHandle>, Option<LifecycleHandle>);
 
+/// The pair for a device that is both on the bus and in the lifecycle
+/// sweep, which is every emulated device.
+pub fn created<D>(dev: Arc<D>) -> CreatedPciDevice
+where
+    D: vmm_devices::pci::PciDevice + vmm_devices::Lifecycle,
+{
+    (
+        Some(Arc::clone(&dev) as PciDeviceHandle),
+        Some(dev as LifecycleHandle),
+    )
+}
+
 /// A binary's device catalog. `FnMut` so the closure can hold state;
 /// `dyn` so this module stays object-safe and is not monomorphized once
 /// per binary.
