@@ -150,115 +150,14 @@ pub struct DeviceState {
     pub nvme_controllers: Vec<NvmeControllerState>,
 }
 
-/// Virtio PCI transport state needed to restore BAR decoding after migration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct VirtioMigratePciState {
-    /// PCI command register bits that gate BAR decoding and bus mastering.
-    pub command: u16,
-    /// BAR base addresses indexed by BAR number (BAR0..BAR5).
-    pub bar_addrs: [u64; 6],
-}
-
-/// Virtio queue ring addresses for post-migration restoration.
-///
-/// After migration, the destination's viona kernel driver needs
-/// the ring GPAs to be reprogrammed. These addresses were configured
-/// by the guest on the source and must be transferred explicitly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VirtioQueueState {
-    /// PCI BDF slot of the virtio device (to match on destination).
-    pub pci_slot: u8,
-    /// Queue index (0=RX, 1=TX for viona).
-    pub queue_idx: u16,
-    /// Queue size (number of descriptors).
-    pub queue_size: u16,
-    /// Guest physical address of descriptor table.
-    pub desc_addr: u64,
-    /// Guest physical address of available ring.
-    pub avail_addr: u64,
-    /// Guest physical address of used ring.
-    pub used_addr: u64,
-    /// Whether this queue is enabled.
-    pub enabled: bool,
-    /// Negotiated features for the device.
-    pub features: u64,
-    /// Current available ring index (device-side).
-    #[serde(default)]
-    pub avail_idx: u16,
-    /// Current used ring index (device-side shadow).
-    #[serde(default)]
-    pub used_idx: u16,
-    /// MSI-X table entry address for this queue's interrupt vector.
-    #[serde(default)]
-    pub msix_addr: u64,
-    /// MSI-X table entry data for this queue's interrupt vector.
-    #[serde(default)]
-    pub msix_data: u32,
-    /// MSI-X vector number for this queue (0xFFFF = no vector).
-    #[serde(default = "default_msix_no_vector")]
-    pub msix_vector: u16,
-    /// PCI BAR addresses and command register bits for the device.
-    #[serde(default)]
-    pub pci_state: Option<VirtioMigratePciState>,
-}
-
-fn default_msix_no_vector() -> u16 {
-    0xFFFF
-}
-
-/// NVMe controller state for migration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct NvmeControllerState {
-    /// Controller Configuration register.
-    pub cc: u32,
-    /// Controller Status register.
-    pub csts: u32,
-    /// Admin Queue Attributes register.
-    pub aqa: u32,
-    /// Admin Submission Queue base address.
-    pub asq_base: u64,
-    /// Admin Completion Queue base address.
-    pub acq_base: u64,
-    /// Admin submission queue state.
-    pub admin_sq: Option<NvmeSqState>,
-    /// Admin completion queue state.
-    pub admin_cq: Option<NvmeCqState>,
-    /// I/O submission queue states (index 0 = qid 1).
-    pub io_sqs: Vec<Option<NvmeSqState>>,
-    /// I/O completion queue states (index 0 = qid 1).
-    pub io_cqs: Vec<Option<NvmeCqState>>,
-    /// Number of I/O queue pairs negotiated with guest.
-    pub num_io_queues: u16,
-    /// PCI command register.
-    pub pci_command: u16,
-    /// PCI BAR base addresses (BAR0..BAR5).
-    pub pci_bar_addrs: [u64; 6],
-    /// MSI-X table entries: (addr, data) per vector.
-    pub msix_entries: Vec<(u64, u64)>,
-    /// Whether MSI-X is globally enabled.
-    pub msix_enabled: bool,
-}
-
-/// NVMe submission queue state for migration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NvmeSqState {
-    pub base: u64,
-    pub size: u16,
-    pub head: u16,
-    pub tail: u16,
-    pub cq_id: u16,
-}
-
-/// NVMe completion queue state for migration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NvmeCqState {
-    pub base: u64,
-    pub size: u16,
-    pub head: u16,
-    pub tail: u16,
-    pub phase: bool,
-    pub iv: u16,
-}
+/// The device state types are the device crate's own, so a device
+/// exports what the wire carries with nothing copied in between. The
+/// names here are the wire's.
+pub use vmm_devices::lifecycle::{
+    NvmeMigrateCq as NvmeCqState, NvmeMigrateSq as NvmeSqState,
+    NvmeMigrateState as NvmeControllerState, VirtioMigratePciState,
+    VirtioMigrateQueue as VirtioQueueState,
+};
 
 /// State data for a single vCPU.
 #[derive(Debug, Clone, Serialize, Deserialize)]

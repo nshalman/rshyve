@@ -32,7 +32,8 @@ pub use vmm_metrics as metrics;
 
 pub use input::{InputBroker, KeyboardSink, PointerSink};
 pub use lifecycle::{
-    FlushError, FlushIntent, IndicatedState, Indicator, Lifecycle,
+    DeviceMigrateState, FlushError, FlushIntent, IndicatedState, Indicator,
+    Lifecycle,
 };
 pub use migrate::{
     MigrateCtx, MigrateMulti, MigrateSingle, MigrateStateError, Migrator,

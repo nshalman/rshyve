@@ -64,7 +64,7 @@ fn growth(hotplug: &HotplugEngines) -> (usize, u64) {
 /// tags every queue group with `pci_slot: 0` (`control/mod.rs`), the
 /// preamble device list is empty (`vmm-migrate/src/sync_source.rs`),
 /// and the destination claims the first queue group whose count equals
-/// its own (`vmm-virtio/src/pci.rs::restore_virtio_state`). While the
+/// its own (`vmm-virtio/src/pci/migrate.rs`). While the
 /// live set equals the boot `-s` list, both sides build the same
 /// devices in the same order, so the match is accidental but correct.
 /// A hot-add or an eject breaks that, and a guest would come up on the

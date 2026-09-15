@@ -50,6 +50,7 @@ use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState};
 use vmm_devices::pci::msix::MsixTable;
 use vmm_devices::pci::{BarN, IntrPin, LintrCfg};
+use vmm_devices::DeviceMigrateState;
 
 use super::bits;
 use super::queue::VirtQueue;
@@ -764,17 +765,16 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
         Lifecycle::migrate(&self.device)
     }
 
-    fn export_virtio_state(
-        &self,
-    ) -> Vec<vmm_devices::lifecycle::VirtioMigrateQueue> {
-        self.export_migrate_queues()
+    fn export_migrate_state(&self) -> Option<DeviceMigrateState> {
+        Some(DeviceMigrateState::VirtioQueues(
+            self.export_migrate_queues(),
+        ))
     }
 
-    fn restore_virtio_state(
-        &self,
-        states: &[vmm_devices::lifecycle::VirtioMigrateQueue],
-    ) {
-        self.restore_migrate_queues(states);
+    fn restore_migrate_state(&self, state: &DeviceMigrateState) {
+        if let DeviceMigrateState::VirtioQueues(states) = state {
+            self.restore_migrate_queues(states);
+        }
     }
 }
 

@@ -611,98 +611,18 @@ fn run_migration_destination(
         let devs: Vec<Arc<dyn vmm_devices::Lifecycle>> = devices.to_vec();
         let restore_fn: vmm_migrate::sync_destination::DeviceRestoreFn =
             Box::new(move |queue_states, nvme_states| {
-                // Restore virtio queue state
-                let migq: Vec<_> = queue_states
-                    .iter()
-                    .map(|qs| vmm_devices::lifecycle::VirtioMigrateQueue {
-                        queue_idx: qs.queue_idx,
-                        queue_size: qs.queue_size,
-                        desc_addr: qs.desc_addr,
-                        avail_addr: qs.avail_addr,
-                        used_addr: qs.used_addr,
-                        enabled: qs.enabled,
-                        features: qs.features,
-                        avail_idx: qs.avail_idx,
-                        used_idx: qs.used_idx,
-                        msix_addr: qs.msix_addr,
-                        msix_data: qs.msix_data,
-                        msix_vector: qs.msix_vector,
-                        pci_state: qs.pci_state.clone().map(|pci| {
-                            vmm_devices::lifecycle::VirtioMigratePciState {
-                                command: pci.command,
-                                bar_addrs: pci.bar_addrs,
-                            }
-                        }),
-                    })
-                    .collect();
+                // Every device sees every entry and takes its own.
+                let queues = vmm_devices::DeviceMigrateState::VirtioQueues(
+                    queue_states.to_vec(),
+                );
                 for dev in &devs {
-                    dev.restore_virtio_state(&migq);
+                    dev.restore_migrate_state(&queues);
                 }
-                // Restore NVMe controller state
                 for nvme in nvme_states {
-                    use vmm_devices::lifecycle::{
-                        NvmeMigrateCq, NvmeMigrateSq, NvmeMigrateState,
-                    };
-                    let mig = NvmeMigrateState {
-                        cc: nvme.cc,
-                        csts: nvme.csts,
-                        aqa: nvme.aqa,
-                        asq_base: nvme.asq_base,
-                        acq_base: nvme.acq_base,
-                        admin_sq: nvme.admin_sq.as_ref().map(|sq| {
-                            NvmeMigrateSq {
-                                base: sq.base,
-                                size: sq.size,
-                                head: sq.head,
-                                tail: sq.tail,
-                                cq_id: sq.cq_id,
-                            }
-                        }),
-                        admin_cq: nvme.admin_cq.as_ref().map(|cq| {
-                            NvmeMigrateCq {
-                                base: cq.base,
-                                size: cq.size,
-                                head: cq.head,
-                                tail: cq.tail,
-                                phase: cq.phase,
-                                iv: cq.iv,
-                            }
-                        }),
-                        io_sqs: nvme
-                            .io_sqs
-                            .iter()
-                            .map(|sq| {
-                                sq.as_ref().map(|sq| NvmeMigrateSq {
-                                    base: sq.base,
-                                    size: sq.size,
-                                    head: sq.head,
-                                    tail: sq.tail,
-                                    cq_id: sq.cq_id,
-                                })
-                            })
-                            .collect(),
-                        io_cqs: nvme
-                            .io_cqs
-                            .iter()
-                            .map(|cq| {
-                                cq.as_ref().map(|cq| NvmeMigrateCq {
-                                    base: cq.base,
-                                    size: cq.size,
-                                    head: cq.head,
-                                    tail: cq.tail,
-                                    phase: cq.phase,
-                                    iv: cq.iv,
-                                })
-                            })
-                            .collect(),
-                        num_io_queues: nvme.num_io_queues,
-                        pci_command: nvme.pci_command,
-                        pci_bar_addrs: nvme.pci_bar_addrs,
-                        msix_entries: nvme.msix_entries.clone(),
-                        msix_enabled: nvme.msix_enabled,
-                    };
+                    let state =
+                        vmm_devices::DeviceMigrateState::Nvme(nvme.clone());
                     for dev in &devs {
-                        dev.restore_nvme_state(&mig);
+                        dev.restore_migrate_state(&state);
                     }
                 }
             });

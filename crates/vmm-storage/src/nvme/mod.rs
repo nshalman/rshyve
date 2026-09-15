@@ -42,7 +42,9 @@ use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use vmm_devices::pci::msix::{HdlMsiSink, MsixTable};
 use vmm_devices::pci::BarN;
-use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
+use vmm_devices::{
+    DeviceMigrateState, FlushError, FlushIntent, Lifecycle, QuiesceGate,
+};
 
 use bits::*;
 
@@ -1634,9 +1636,7 @@ impl Lifecycle for NvmeController {
         )
     }
 
-    fn export_nvme_state(
-        &self,
-    ) -> Option<vmm_devices::lifecycle::NvmeMigrateState> {
+    fn export_migrate_state(&self) -> Option<DeviceMigrateState> {
         use vmm_devices::lifecycle::{
             NvmeMigrateCq, NvmeMigrateSq, NvmeMigrateState,
         };
@@ -1712,7 +1712,7 @@ impl Lifecycle for NvmeController {
             st.cc, st.csts, st.aqa, st.num_io_queues, msix_enabled,
         );
 
-        Some(NvmeMigrateState {
+        Some(DeviceMigrateState::Nvme(NvmeMigrateState {
             cc: st.cc,
             csts: st.csts,
             aqa: st.aqa,
@@ -1727,13 +1727,13 @@ impl Lifecycle for NvmeController {
             pci_bar_addrs,
             msix_entries,
             msix_enabled,
-        })
+        }))
     }
 
-    fn restore_nvme_state(
-        &self,
-        mig: &vmm_devices::lifecycle::NvmeMigrateState,
-    ) {
+    fn restore_migrate_state(&self, state: &DeviceMigrateState) {
+        let DeviceMigrateState::Nvme(mig) = state else {
+            return;
+        };
         eprintln!(
             "[nvme-restore] cc={:#x} csts={:#x} aqa={:#x} io_queues={} msix_enabled={}",
             mig.cc, mig.csts, mig.aqa, mig.num_io_queues, mig.msix_enabled,

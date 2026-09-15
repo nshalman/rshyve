@@ -6,6 +6,7 @@
 //! capability chain, the common config registers and the feature bits.
 
 use super::*;
+use vmm_devices::DeviceMigrateState;
 
 // -- Modern transport tests --
 
@@ -42,7 +43,11 @@ fn export_virtio_state_includes_pci_transport_state() {
         u32::from(command.bits()),
     );
 
-    let exported = dev.export_virtio_state();
+    let Some(DeviceMigrateState::VirtioQueues(exported)) =
+        dev.export_migrate_state()
+    else {
+        panic!("a virtio transport exports its queues");
+    };
     assert_eq!(exported.len(), 1);
 
     let pci_state = exported[0]
@@ -63,6 +68,7 @@ fn restore_virtio_state_replays_pci_transport_state() {
         | vmm_devices::pci::bits::RegCmd::BUSMSTR_EN
         | vmm_devices::pci::bits::RegCmd::INTX_DIS;
     let queue_state = vmm_devices::lifecycle::VirtioMigrateQueue {
+        pci_slot: 0,
         queue_idx: 0,
         queue_size: 256,
         desc_addr: 0x1000,
@@ -81,7 +87,9 @@ fn restore_virtio_state_replays_pci_transport_state() {
         }),
     };
 
-    dev.restore_virtio_state(&[queue_state]);
+    dev.restore_migrate_state(&DeviceMigrateState::VirtioQueues(vec![
+        queue_state,
+    ]));
 
     assert_eq!(dev.cfg_read(vmm_devices::pci::bits::REG_BAR0, 4), 0xC121);
     assert_eq!(
@@ -126,6 +134,7 @@ fn restore_virtio_state_propagates_ring_feature_flags() {
         | bits::VIRTIO_F_RING_EVENT_IDX
         | bits::VIRTIO_F_RING_INDIRECT_DESC;
     let queue_state = vmm_devices::lifecycle::VirtioMigrateQueue {
+        pci_slot: 0,
         queue_idx: 0,
         queue_size: 256,
         desc_addr: 0x1000,
@@ -141,7 +150,9 @@ fn restore_virtio_state_propagates_ring_feature_flags() {
         pci_state: None,
     };
 
-    dev.restore_virtio_state(&[queue_state]);
+    dev.restore_migrate_state(&DeviceMigrateState::VirtioQueues(vec![
+        queue_state,
+    ]));
 
     let vs = dev.virtio_state.lock().expect("lock");
     assert!(
