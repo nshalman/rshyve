@@ -9,7 +9,7 @@
 
 use vmm_core::common::RWOp;
 
-use super::bar::{BarDefine, Bars};
+use super::bar::{BarDefine, BarWriteResult, Bars};
 use super::bits;
 use super::BarN;
 
@@ -134,9 +134,12 @@ impl DeviceState {
         &self.bars
     }
 
-    /// Get a mutable reference to the BAR state.
-    pub fn bars_mut(&mut self) -> &mut Bars {
-        &mut self.bars
+    /// Apply a guest write to one BAR register.
+    ///
+    /// The one way a BAR base changes after definition, so every
+    /// caller gets the same masking and the same remap result.
+    pub fn bar_write(&mut self, bar: BarN, val: u32) -> Option<BarWriteResult> {
+        self.bars.reg_write(bar, val)
     }
 
     /// Current command register value.
@@ -260,7 +263,7 @@ impl DeviceState {
                 // BAR writes must be dword-aligned and full-width.
                 let bar_idx = (bar_off - 0x10) / 4;
                 if let Ok(bar_n) = BarN::try_from(bar_idx) {
-                    self.bars.reg_write(bar_n, val);
+                    self.bar_write(bar_n, val);
                 }
             }
             // 0x3C: Interrupt Line (byte at offset 0x3C is writable)

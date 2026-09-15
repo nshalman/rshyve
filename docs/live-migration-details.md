@@ -533,7 +533,7 @@ dropped.
 
 During normal operation, when the guest writes to the virtio feature
 register, the PCI transport propagates `event_idx` and `indirect_supported`
-flags to all VirtQueues. However, `restore_virtio_state()` bypasses the
+flags to all VirtQueues. However, `restore_migrate_queues()` bypasses the
 feature register write path -- it directly sets `guest_features` in the
 `VirtioPciState`.
 
@@ -544,7 +544,7 @@ an indirect descriptor with `indirect_supported == false`, it silently
 returns `None`. Every request is dropped. Disk I/O stalls completely with
 no error message.
 
-**The fix** (in `restore_virtio_state` in `pci.rs`): After setting
+**The fix** (in `restore_migrate_queues` in `pci/migrate.rs`): After setting
 `guest_features`, explicitly call `set_event_idx()` and
 `set_indirect_supported()` on all queues:
 

@@ -151,6 +151,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 };
 
                 result.push(VirtioMigrateQueue {
+                    pci_slot: 0,
                     queue_idx: idx as u16,
                     queue_size: q.size(),
                     desc_addr: q.desc_addr(),

@@ -17,7 +17,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::net::Shutdown;
-use std::os::fd::AsRawFd;
+use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,13 +28,12 @@ use std::time::Duration;
 use anyhow::Context;
 use slog::{debug, warn};
 use vmm_core::mem::PhysMap;
-use vmm_core::unixsock::{
-    bind_restricted, poll_events, write_all_bounded, SocketPolicy,
-};
+use vmm_core::poll::{wait_readable, Readiness};
+use vmm_core::unixsock::{bind_restricted, write_all_bounded, SocketPolicy};
 
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::{queue_drain_should_stop, VirtioDevice};
-use crate::pci::intr::{next_intr_session, BackendIntr, IntrSession};
+use crate::pci::intr::{BackendIntr, IntrSession, IntrSlot};
 use vmm_devices::lifecycle::{IndicatedState, Indicator};
 use vmm_devices::{Lifecycle, QuiesceGate};
 
@@ -71,14 +70,9 @@ const TX_CHUNK: usize = 4096;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 /// How long the accept thread waits before it re-reads the shutdown
 /// flag. Bounds how long `halt` waits for that thread to return.
-const ACCEPT_POLL_MS: i32 = 50;
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
 /// Pause after an accept that failed for a reason retrying cannot fix.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
-/// The transport interrupt path, installed by the binary after the
-/// transport exists. Clone the slot before the device is moved into
-/// the transport.
-pub type ConsoleInterrupt = Arc<BackendIntr>;
-
 /// State shared with the accept and reader threads.
 struct ConsoleShared {
     socket_path: PathBuf,
@@ -91,7 +85,7 @@ struct ConsoleShared {
     /// Guest RX chains with no host bytes to fill them yet.
     pending_rx: Mutex<VecDeque<(u16, Vec<ChainBuf>)>>,
     rx_completion: Mutex<Option<Arc<VirtioCompletion>>>,
-    interrupt: Arc<Mutex<Option<ConsoleInterrupt>>>,
+    interrupt: Arc<IntrSlot>,
     /// Reader threads, one per client that has been attached.
     readers: Mutex<Vec<JoinHandle<()>>>,
     shutdown: AtomicBool,
@@ -269,7 +263,7 @@ impl ConsoleShared {
     }
 }
 
-/// Wait for events on `fd`, or for `timeout_ms` to pass.
+/// Accept clients until shutdown, waking on a timer to notice it.
 ///
 /// A blocking `accept` can only be broken by racing a connect against
 /// the listener, and a connect that fails leaves the thread blocked
@@ -280,19 +274,15 @@ fn accept_loop(shared: Arc<ConsoleShared>, listener: UnixListener) {
             "error" => %error);
         return;
     }
-    let fd = listener.as_raw_fd();
 
     while !shared.shutdown.load(Ordering::Acquire) {
-        let revents = poll_events(fd, ACCEPT_POLL_MS);
-        // A dead listener reports its condition on every call, so the
-        // loop must leave rather than spin on it.
-        if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-            warn!(shared.log, "virtio-console listener is unusable";
-                "revents" => i32::from(revents));
-            return;
-        }
-        if revents & libc::POLLIN == 0 {
-            continue;
+        match wait_readable(listener.as_fd(), ACCEPT_POLL) {
+            Readiness::Readable => {}
+            Readiness::Idle => continue,
+            Readiness::Gone => {
+                warn!(shared.log, "virtio-console listener is unusable");
+                return;
+            }
         }
         match listener.accept() {
             Ok((stream, _)) => shared.attach_client(stream),
@@ -347,21 +337,6 @@ fn reader_loop(shared: Arc<ConsoleShared>, mut stream: UnixStream) {
     // own it, and the write path drops a dead one on its own.
 }
 
-/// Parse the config half of `-s <slot>,virtio-console,<socket-path>`.
-pub fn parse_console_config(config: &str) -> anyhow::Result<&str> {
-    if config.is_empty() {
-        anyhow::bail!("virtio-console requires a socket path");
-    }
-    let mut parts = config.split(',');
-    let path = parts.next().unwrap_or(config);
-    if let Some(opt) = parts.next() {
-        // Rejecting unknown options stops a misspelled flag from
-        // looking as though it were honored.
-        anyhow::bail!("virtio-console takes no options, got '{}'", opt);
-    }
-    Ok(path)
-}
-
 /// Single-port VirtIO console backed by a Unix domain socket.
 pub struct VirtioConsole {
     shared: Arc<ConsoleShared>,
@@ -398,7 +373,7 @@ impl VirtioConsole {
             backlog: Mutex::new(VecDeque::new()),
             pending_rx: Mutex::new(VecDeque::new()),
             rx_completion: Mutex::new(None),
-            interrupt: Arc::new(Mutex::new(None)),
+            interrupt: Arc::new(IntrSlot::new()),
             readers: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
             gate: Arc::new(QuiesceGate::new(0)),
@@ -420,10 +395,9 @@ impl VirtioConsole {
         })
     }
 
-    /// The interrupt slot, for the binary to fill after the transport
-    /// exists. Clone this before moving the device into the transport.
-    pub fn interrupt(&self) -> Arc<Mutex<Option<ConsoleInterrupt>>> {
-        Arc::clone(&self.shared.interrupt)
+    /// Install the transport interrupt path once the transport exists.
+    pub fn install_interrupt(&self, intr: Arc<BackendIntr>) {
+        self.shared.interrupt.install(intr);
     }
 
     pub const fn config_size(&self) -> u16 {
@@ -451,21 +425,13 @@ impl VirtioConsole {
             return Arc::clone(completion);
         }
         let intr = Arc::clone(&self.shared.interrupt);
-        let session =
-            next_intr_session(&self.shared.interrupt, IntrSession::INITIAL);
+        let session = self.shared.interrupt.next_session(IntrSession::INITIAL);
         let completion = VirtioCompletion::new(
             queue,
             Arc::clone(&self.shared.physmap),
             session,
             move |session| {
-                // The slot is unlocked for the raise. Delivery is a
-                // call into the kernel, and the reset reads this
-                // slot, so a raise that held the lock would put that
-                // call in front of a vCPU.
-                let path = intr.lock().ok().and_then(|slot| slot.clone());
-                if let Some(path) = path {
-                    path.raise(session, CONSOLE_RX_QUEUE);
-                }
+                intr.raise(session, CONSOLE_RX_QUEUE);
             },
         );
         // Force the first completions through EVENT_IDX suppression so

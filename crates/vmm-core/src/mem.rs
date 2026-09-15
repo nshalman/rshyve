@@ -48,11 +48,13 @@ use crate::hdl::VmmHdl;
 
 mod ctx;
 mod devmem;
+mod io;
 mod mapping;
 mod segid;
 
 pub use ctx::MemCtx;
 pub use devmem::DevMemSeg;
+pub use io::GuestIoVec;
 use mapping::Mapping;
 pub use mapping::{Prot, SubMapping};
 pub use segid::{SegidAlloc, VM_MAX_MEMSEGS};

@@ -19,12 +19,16 @@
 //!
 //! Both live here so the zone console has one implementation.
 
+use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use slog::{info, warn};
+use vmm_core::poll::{wait_readable, Readiness};
 
 use super::lpc::LpcUart;
 
@@ -35,7 +39,7 @@ const TX_ERROR_LOG_LIMIT: u32 = 3;
 
 /// Receive poll timeout. Bounded so the thread notices a closed
 /// backend instead of parking for ever.
-const POLL_TIMEOUT_MS: libc::c_int = 1000;
+const POLL_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Where one emulated serial port's bytes come from and go to.
 pub enum SerialBackend<'a> {
@@ -118,37 +122,61 @@ fn spawn_stdin_reader(uart: &Arc<LpcUart>, name: &str) -> anyhow::Result<()> {
 }
 
 /// Open `path` read/write and serve both directions of this port on it.
-///
-/// The open uses `libc` rather than `std::fs` to match what C bhyve
-/// does, because a pty on illumos needs the STREAMS modules that path
-/// sets up.
 fn attach_device(
     uart: &Arc<LpcUart>,
     path: &str,
     name: &str,
     log: &slog::Logger,
 ) -> anyhow::Result<()> {
-    let c_path = std::ffi::CString::new(path)
-        .map_err(|_| anyhow::anyhow!("{name} device path contains a NUL"))?;
     // O_NONBLOCK on the open itself, so a device with no carrier does
-    // not park the whole process here.
-    let fd = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(anyhow::anyhow!(
-            "cannot open {name} device {path}: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let guard = FdGuard(fd);
+    // not park the whole process here. It stays on the description, so
+    // a transmit never stalls a vCPU because nobody drains the console.
+    let device = File::options()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| {
+            anyhow::anyhow!("cannot open {name} device {path}: {e}")
+        })?;
 
-    // A console must not translate: the guest owns the line discipline.
-    // A backend that is not a terminal has no attributes to set, so a
-    // failed tcgetattr is not an error.
+    make_raw(&device);
+
+    // Separate descriptors for the two directions. `try_clone` makes
+    // them close-on-exec, so a guest-reset re-exec does not inherit
+    // them.
+    let write_half = device
+        .try_clone()
+        .map_err(|e| anyhow::anyhow!("cannot dup {name} device: {e}"))?;
+    let read_half = device
+        .try_clone()
+        .map_err(|e| anyhow::anyhow!("cannot dup {name} device: {e}"))?;
+    drop(device);
+
+    let tx_errors = AtomicU32::new(0);
+    let tx_log = log.clone();
+    let tx_name = name.to_string();
+    uart.set_tx_sink(Box::new(move |b: u8| {
+        if let Err(e) = (&write_half).write(&[b]) {
+            if tx_errors.fetch_add(1, Ordering::Relaxed) < TX_ERROR_LOG_LIMIT {
+                warn!(tx_log, "serial transmit failed"; "port" => &tx_name,
+                    "error" => %e);
+            }
+        }
+    }));
+
+    spawn_device_reader(uart, read_half, name)?;
+    info!(log, "serial port connected"; "port" => name, "backend" => path);
+    Ok(())
+}
+
+/// Stop the line discipline translating anything: the guest owns it.
+///
+/// A backend that is not a terminal has no attributes to set, so a
+/// failed `tcgetattr` is not an error.
+fn make_raw(device: &File) {
+    let fd = device.as_raw_fd();
+    // Safety: `tio` is a whole termios and `fd` is open for the calls.
     unsafe {
         let mut tio: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut tio) == 0 {
@@ -157,123 +185,47 @@ fn attach_device(
             tio.c_cflag |= libc::CLOCAL;
             libc::tcsetattr(fd, libc::TCSANOW, &tio);
         }
-        // Keep the description non-blocking. A transmit must never
-        // stall a vCPU because nobody is draining the console.
-        libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
     }
-
-    // Separate descriptors for the two directions, both close-on-exec
-    // so a guest-reset re-exec does not inherit them.
-    let write_fd = dup_cloexec(fd)
-        .map_err(|e| anyhow::anyhow!("cannot dup {name} device: {e}"))?;
-    let read_fd = dup_cloexec(fd).map_err(|e| {
-        unsafe { libc::close(write_fd) };
-        anyhow::anyhow!("cannot dup {name} device: {e}")
-    })?;
-    // The dups keep the open file description alive.
-    drop(guard);
-
-    let tx_errors = AtomicU32::new(0);
-    let tx_log = log.clone();
-    let tx_name = name.to_string();
-    uart.set_tx_sink(Box::new(move |b: u8| {
-        let ret =
-            unsafe { libc::write(write_fd, std::ptr::from_ref(&b).cast(), 1) };
-        if ret < 0
-            && tx_errors.fetch_add(1, Ordering::Relaxed) < TX_ERROR_LOG_LIMIT
-        {
-            warn!(tx_log, "serial transmit failed"; "port" => &tx_name,
-                "error" => %std::io::Error::last_os_error());
-        }
-    }));
-
-    spawn_device_reader(uart, read_fd, name)?;
-    info!(log, "serial port connected"; "port" => name, "backend" => path);
-    Ok(())
 }
 
-/// Read from `read_fd` into the port's receive FIFO until it closes.
+/// Read from `device` into the port's receive FIFO until it closes.
 fn spawn_device_reader(
     uart: &Arc<LpcUart>,
-    read_fd: RawFd,
+    device: File,
     name: &str,
 ) -> anyhow::Result<()> {
     let rx = Arc::clone(uart);
-    let spawned = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name(format!("{name}-input"))
         .spawn(move || {
-            let _owned = FdGuard(read_fd);
             let mut buf = [0u8; 64];
             loop {
-                let mut pfd = libc::pollfd {
-                    fd: read_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let ready = unsafe { libc::poll(&mut pfd, 1, POLL_TIMEOUT_MS) };
-                if ready < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
+                match wait_readable(device.as_fd(), POLL_TIMEOUT) {
+                    Readiness::Readable => {}
+                    Readiness::Idle => continue,
+                    Readiness::Gone => break,
+                }
+                match (&device).read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        for byte in &buf[..n] {
+                            rx.input_byte(*byte);
+                        }
                     }
-                    break;
-                }
-                if ready == 0 {
-                    continue;
-                }
-                if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                    break;
-                }
-                if pfd.revents & libc::POLLIN == 0 {
-                    continue;
-                }
-                let n = unsafe {
-                    libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len())
-                };
-                if n < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::Interrupted
-                    ) {
-                        continue;
-                    }
-                    break;
-                }
-                if n == 0 {
-                    break;
-                }
-                for byte in buf.iter().take(n as usize) {
-                    rx.input_byte(*byte);
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => break,
                 }
             }
-        });
-    match spawned {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            unsafe { libc::close(read_fd) };
-            Err(anyhow::anyhow!("cannot spawn {name} input thread: {e}"))
-        }
-    }
-}
-
-fn dup_cloexec(fd: RawFd) -> std::io::Result<RawFd> {
-    let out = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if out < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(out)
-}
-
-/// Closes a descriptor when it goes out of scope, so an error path
-/// between `open` and the two dups cannot leak one.
-struct FdGuard(RawFd);
-
-impl Drop for FdGuard {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.0) };
-    }
+        })
+        .map_err(|e| {
+            anyhow::anyhow!("cannot spawn {name} input thread: {e}")
+        })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -311,33 +263,37 @@ mod tests {
     /// A pty pair, which is the shape `/dev/zconsole` has: zoneadmd
     /// holds the master, and the backend opens the slave by path.
     struct Pty {
-        master: RawFd,
+        master: File,
         slave_path: String,
     }
 
     impl Pty {
         fn open() -> Self {
-            let ptmx = std::ffi::CString::new("/dev/ptmx").expect("ptmx path");
-            let master = unsafe {
-                libc::open(ptmx.as_ptr(), libc::O_RDWR | libc::O_NOCTTY)
+            let master = File::options()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open("/dev/ptmx")
+                .expect("open /dev/ptmx");
+            let fd = master.as_raw_fd();
+            // Safety: `fd` is the open master for the whole block.
+            let slave_path = unsafe {
+                assert_eq!(libc::grantpt(fd), 0, "grantpt");
+                assert_eq!(libc::unlockpt(fd), 0, "unlockpt");
+                let name = libc::ptsname(fd);
+                assert!(!name.is_null(), "ptsname");
+                std::ffi::CStr::from_ptr(name)
+                    .to_str()
+                    .expect("slave path is utf8")
+                    .to_string()
             };
-            assert!(master >= 0, "open /dev/ptmx: {}", last_error());
-            assert_eq!(unsafe { libc::grantpt(master) }, 0, "grantpt");
-            assert_eq!(unsafe { libc::unlockpt(master) }, 0, "unlockpt");
-            let name = unsafe { libc::ptsname(master) };
-            assert!(!name.is_null(), "ptsname");
-            let slave_path = unsafe { std::ffi::CStr::from_ptr(name) }
-                .to_str()
-                .expect("slave path is utf8")
-                .to_string();
             Self { master, slave_path }
         }
 
         fn write(&self, bytes: &[u8]) {
-            let n = unsafe {
-                libc::write(self.master, bytes.as_ptr().cast(), bytes.len())
-            };
-            assert_eq!(n, bytes.len() as isize, "write: {}", last_error());
+            (&self.master)
+                .write_all(bytes)
+                .expect("write to the master");
         }
 
         /// Read until `want` bytes arrive or the deadline passes.
@@ -346,34 +302,20 @@ mod tests {
             let mut out = Vec::new();
             let mut buf = [0u8; 64];
             while out.len() < want && Instant::now() < deadline {
-                let mut pfd = libc::pollfd {
-                    fd: self.master,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                if unsafe { libc::poll(&mut pfd, 1, 200) } <= 0 {
+                if wait_readable(
+                    self.master.as_fd(),
+                    Duration::from_millis(200),
+                ) != Readiness::Readable
+                {
                     continue;
                 }
-                let n = unsafe {
-                    libc::read(self.master, buf.as_mut_ptr().cast(), buf.len())
-                };
-                if n <= 0 {
+                let Ok(n) = (&self.master).read(&mut buf) else {
                     continue;
-                }
-                out.extend_from_slice(&buf[..n as usize]);
+                };
+                out.extend_from_slice(&buf[..n]);
             }
             out
         }
-    }
-
-    impl Drop for Pty {
-        fn drop(&mut self) {
-            unsafe { libc::close(self.master) };
-        }
-    }
-
-    fn last_error() -> std::io::Error {
-        std::io::Error::last_os_error()
     }
 
     fn uart_on_bus() -> (Arc<LpcUart>, PioBus) {

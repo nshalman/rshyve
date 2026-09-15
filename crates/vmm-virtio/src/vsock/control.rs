@@ -88,15 +88,201 @@ const RESPONSE_BUDGET: Duration = Duration::from_millis(500);
 /// this long has nothing to say.
 pub(super) const HANDSHAKE_BUDGET: Duration = Duration::from_secs(2);
 
+/// Longest value written back for one field. An id comes from the `-s`
+/// arguments, so an operator can make it long; the response line stays
+/// readable either way.
+pub const FIELD_MAX: usize = 64;
+
+/// Longest refusal written back. A refusal can quote a value the peer
+/// sent, so the line stays bounded.
+pub const REASON_MAX: usize = 200;
+
+/// What an empty value renders as, so every record keeps its shape.
+const NO_VALUE: &str = "-";
+
+/// One request, as the grammar names it.
+///
+/// The arguments a verb takes are parsed here, so a sink never sees
+/// text it has to split, and a typo is answered as a typo whatever the
+/// machine behind the sink can do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlRequest {
+    DeviceList,
+    CpuList,
+    MemList,
+    /// Add the device one `-s` spec names.
+    DeviceAdd(String),
+    /// Ask the guest to give up the device with this id.
+    DeviceRemove(String),
+    CpuAdd(u32),
+    /// Give the guest this many more bytes.
+    MemAdd(u64),
+    /// Named so the answer can say why the platform cannot, rather
+    /// than reading as a typo the operator can fix.
+    CpuRemove,
+    MemRemove,
+}
+
+impl ControlRequest {
+    /// Parse one request line. The error is the reason the line is
+    /// refused, ready for the wire.
+    pub fn parse(line: &str) -> Result<Self, String> {
+        let mut fields = line.split_whitespace();
+        // Read all three up front: a match guard cannot advance the
+        // iterator. A `-s` spec carries no space, so one field is a
+        // whole spec and a second means the request is malformed.
+        let verb = fields.next().unwrap_or("");
+        let argument = fields.next();
+        let extra = fields.next();
+
+        match (verb, argument, extra) {
+            ("device-list", None, _) => Ok(Self::DeviceList),
+            ("cpu-list", None, _) => Ok(Self::CpuList),
+            ("mem-list", None, _) => Ok(Self::MemList),
+            ("device-add", Some(spec), None) => {
+                Ok(Self::DeviceAdd(spec.to_string()))
+            }
+            ("device-remove", Some(id), None) => {
+                Ok(Self::DeviceRemove(id.to_string()))
+            }
+            // The id is never used as an index: the engine range-checks
+            // it as well.
+            ("cpu-add", Some(id), None) => id
+                .parse()
+                .map(Self::CpuAdd)
+                .map_err(|_| format!("{} is not a CPU id", value(id))),
+            ("mem-add", Some(bytes), None) => {
+                bytes.parse().map(Self::MemAdd).map_err(|_| {
+                    format!("{} is not a size in bytes", value(bytes))
+                })
+            }
+            ("cpu-remove", _, _) => Ok(Self::CpuRemove),
+            ("mem-remove", _, _) => Ok(Self::MemRemove),
+            ("", _, _) => Err("empty request".to_string()),
+            ("device-list" | "cpu-list" | "mem-list", Some(_), _) => {
+                Err(format!("{} takes no argument", value(verb)))
+            }
+            (
+                "device-add" | "device-remove" | "cpu-add" | "mem-add",
+                None,
+                _,
+            ) => Err(format!("{} needs one argument", value(verb))),
+            (
+                "device-add" | "device-remove" | "cpu-add" | "mem-add",
+                Some(_),
+                Some(_),
+            ) => Err(format!("{} takes one argument", value(verb))),
+            _ => Err(format!("unknown command {}", value(verb))),
+        }
+    }
+}
+
+/// One answer. A record is its values joined by commas, and the reply
+/// is `OK` and the records joined by spaces, or `ERR` and a reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlReply {
+    Ok(Vec<Vec<String>>),
+    Refused(String),
+}
+
+impl ControlReply {
+    /// `OK` and one record.
+    pub fn record(values: impl IntoIterator<Item = String>) -> Self {
+        Self::Ok(vec![values.into_iter().collect()])
+    }
+
+    /// `OK <count>` and then one record each.
+    pub fn list(records: Vec<Vec<String>>) -> Self {
+        let mut out = Vec::with_capacity(records.len() + 1);
+        out.push(vec![records.len().to_string()]);
+        out.extend(records);
+        Self::Ok(out)
+    }
+
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Self::Refused(reason.into())
+    }
+
+    /// The response line, with every value and the reason bounded and
+    /// stripped down to what a terminal can show.
+    pub fn render(&self) -> String {
+        match self {
+            Self::Ok(records) => {
+                let mut out = String::from("OK");
+                for record in records {
+                    out.push(' ');
+                    let record: Vec<String> =
+                        record.iter().map(|v| value(v)).collect();
+                    out.push_str(&record.join(","));
+                }
+                out
+            }
+            Self::Refused(reason) => format!("ERR {}", clean_reason(reason)),
+        }
+    }
+}
+
+/// One value, safe to put on the wire.
+///
+/// The grammar separates records by spaces and values by commas, and an
+/// operator reads the answer on a terminal. So a value that came from
+/// the command line keeps only plain characters, and the length is
+/// capped.
+fn value(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .take(FIELD_MAX)
+        .map(|c| {
+            if c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | '@' | ':')
+            {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        NO_VALUE.to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// One refusal, safe to put on the wire.
+///
+/// A refusal can quote a value the peer sent, so the text is capped and
+/// stripped down to printable ASCII. Spaces stay: the grammar makes a
+/// refusal one reason, not a record.
+fn clean_reason(reason: &str) -> String {
+    reason
+        .chars()
+        .take(REASON_MAX)
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Answers one control request.
 ///
 /// Implemented by the VMM binary, which owns the device registry and the
 /// CPU and memory configuration. The device knows the framing and
 /// nothing else.
 pub trait ControlSink: Send + Sync {
-    /// Answer one request line. The return value is one response line,
-    /// with no trailing newline.
-    fn handle_line(&self, line: &str) -> String;
+    fn handle(&self, request: ControlRequest) -> ControlReply;
+}
+
+/// One request line in, one response line out, with no newline.
+pub fn answer_line(sink: &dyn ControlSink, line: &str) -> String {
+    match ControlRequest::parse(line.trim()) {
+        Ok(request) => sink.handle(request).render(),
+        Err(reason) => ControlReply::refused(reason).render(),
+    }
 }
 
 /// The device's sink, filled in after the device exists.
@@ -148,7 +334,6 @@ pub fn attach_with_control(
         log.clone(),
     )?;
     let cfg_size = vsock.config_size();
-    let vsock_intr = vsock.interrupt();
     let control = vsock.control_slot();
 
     let msix = Arc::new(MsixTable::new(VSOCK_MSIX_VECTORS, ctx.msi_sink()));
@@ -168,8 +353,7 @@ pub fn attach_with_control(
 
     // Only the receive queue completes out of band; the transport
     // raises for the transmit queue on its own.
-    *vsock_intr.lock().expect("virtio-vsock interrupt lock") =
-        Some(pci_dev.backend_intr());
+    pci_dev.device().install_interrupt(pci_dev.backend_intr());
 
     Ok((pci_dev, control))
 }
@@ -298,12 +482,7 @@ pub(super) fn run_control_session(
         // requests, and shutdown is what ends it.
         match read_line_bounded(&mut stream, shutdown, CONTROL_LINE_MAX, None) {
             LineRead::Line(request) => {
-                let request = request.trim();
-                let answer = if request.is_empty() {
-                    "ERR empty request".to_string()
-                } else {
-                    sink.handle_line(request)
-                };
+                let answer = answer_line(sink.as_ref(), &request);
                 if write_line(&mut stream, framed(&answer)).is_err() {
                     return;
                 }
@@ -347,22 +526,28 @@ mod tests {
         }
     }
 
-    /// Echoes what it was given, so a test sees the exact request the
-    /// device passed on.
+    /// Names the request it was given, so a test sees the exact
+    /// request the device passed on.
     struct EchoSink;
 
     impl ControlSink for EchoSink {
-        fn handle_line(&self, line: &str) -> String {
-            format!("OK {line}")
+        fn handle(&self, request: ControlRequest) -> ControlReply {
+            match request {
+                ControlRequest::DeviceList => {
+                    ControlReply::record(["device-list".to_string()])
+                }
+                other => ControlReply::refused(format!("{other:?}")),
+            }
         }
     }
 
-    /// Answers with two lines, which the framing must not let out.
+    /// Answers with a value holding a newline, which the rendering
+    /// must not let out as a second line.
     struct TwoLineSink;
 
     impl ControlSink for TwoLineSink {
-        fn handle_line(&self, _line: &str) -> String {
-            "OK first\nERR smuggled".to_string()
+        fn handle(&self, _request: ControlRequest) -> ControlReply {
+            ControlReply::record(["first\nsmuggled".to_string()])
         }
     }
 
@@ -371,8 +556,8 @@ mod tests {
     struct BulkSink;
 
     impl ControlSink for BulkSink {
-        fn handle_line(&self, _line: &str) -> String {
-            format!("OK {}", "x".repeat(1024 * 1024))
+        fn handle(&self, _request: ControlRequest) -> ControlReply {
+            ControlReply::list(vec![vec!["x".repeat(FIELD_MAX)]; 20_000])
         }
     }
 
@@ -511,7 +696,7 @@ mod tests {
         line.clear();
         reader.read_line(&mut line).expect("answer");
 
-        assert_eq!(line, "OK first\n");
+        assert_eq!(line, "OK first_smuggled\n");
         drop(client);
         drop(reader);
         handle.join().expect("session thread");

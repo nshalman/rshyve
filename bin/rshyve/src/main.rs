@@ -25,7 +25,7 @@ use vmm_devices::uart::backend::SerialBackend;
 use vmm_devices::uart::lpc::{self, LpcUart};
 use vmm_devices::InputBroker;
 use vmm_machine::{
-    build_machine, find_lpc_device, host_tsc_frequency_hz, parse_bdf,
+    build_machine, devspec, find_lpc_device, host_tsc_frequency_hz,
     CpuHotplugEngine, CpuSlots, CreatedPciDevice, DeviceRegistry,
     HotplugEngine, HotplugEngines, MachineOpts, MemHotplugEngine,
     RegisteredDevice, RunOutcome, VcpuRegistry, VcpuSetup,
@@ -80,6 +80,9 @@ struct MachineCreation {
     /// same one: two feature sets on one machine is a guest fault that
     /// is very hard to read back.
     cpuid: Option<vmm_core::cpuid::CpuidTable>,
+    /// The baseline the CPUID table was built for. A migration
+    /// describes the guest's features with it.
+    cpu_baseline: vmm_core::cpuid::CpuBaseline,
     host_local_state: host_state::HostLocalState,
 }
 
@@ -317,6 +320,7 @@ fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
         varstore,
         tpm_acpi,
         cpuid,
+        cpu_baseline,
         host_local_state,
     })
 }
@@ -472,7 +476,7 @@ fn hotplug_factory(cli: &Cli, num_vcpus: u32) -> vmm_machine::HotplugFactory {
 }
 
 fn pci_spec_driver(spec: &str) -> Option<&str> {
-    spec.split(',').nth(1)
+    Some(devspec::parts(spec).driver).filter(|driver| !driver.is_empty())
 }
 
 /// True when any bootindex-stripped spec names the ahci-cd driver.
@@ -507,7 +511,7 @@ fn reject_unmigratable_destination(
 /// Kernel command line used when neither `--cmdline` nor
 /// `--cmdline-base64` is given. It names `ttyS0`, which is why COM1 is
 /// always attached.
-const DEFAULT_CMDLINE: &str = "console=ttyS0 earlyprintk=serial";
+use vmm_config::DEFAULT_CMDLINE;
 
 /// The guest kernel command line, from whichever spelling was given.
 ///
@@ -607,98 +611,18 @@ fn run_migration_destination(
         let devs: Vec<Arc<dyn vmm_devices::Lifecycle>> = devices.to_vec();
         let restore_fn: vmm_migrate::sync_destination::DeviceRestoreFn =
             Box::new(move |queue_states, nvme_states| {
-                // Restore virtio queue state
-                let migq: Vec<_> = queue_states
-                    .iter()
-                    .map(|qs| vmm_devices::lifecycle::VirtioMigrateQueue {
-                        queue_idx: qs.queue_idx,
-                        queue_size: qs.queue_size,
-                        desc_addr: qs.desc_addr,
-                        avail_addr: qs.avail_addr,
-                        used_addr: qs.used_addr,
-                        enabled: qs.enabled,
-                        features: qs.features,
-                        avail_idx: qs.avail_idx,
-                        used_idx: qs.used_idx,
-                        msix_addr: qs.msix_addr,
-                        msix_data: qs.msix_data,
-                        msix_vector: qs.msix_vector,
-                        pci_state: qs.pci_state.clone().map(|pci| {
-                            vmm_devices::lifecycle::VirtioMigratePciState {
-                                command: pci.command,
-                                bar_addrs: pci.bar_addrs,
-                            }
-                        }),
-                    })
-                    .collect();
+                // Every device sees every entry and takes its own.
+                let queues = vmm_devices::DeviceMigrateState::VirtioQueues(
+                    queue_states.to_vec(),
+                );
                 for dev in &devs {
-                    dev.restore_virtio_state(&migq);
+                    dev.restore_migrate_state(&queues);
                 }
-                // Restore NVMe controller state
                 for nvme in nvme_states {
-                    use vmm_devices::lifecycle::{
-                        NvmeMigrateCq, NvmeMigrateSq, NvmeMigrateState,
-                    };
-                    let mig = NvmeMigrateState {
-                        cc: nvme.cc,
-                        csts: nvme.csts,
-                        aqa: nvme.aqa,
-                        asq_base: nvme.asq_base,
-                        acq_base: nvme.acq_base,
-                        admin_sq: nvme.admin_sq.as_ref().map(|sq| {
-                            NvmeMigrateSq {
-                                base: sq.base,
-                                size: sq.size,
-                                head: sq.head,
-                                tail: sq.tail,
-                                cq_id: sq.cq_id,
-                            }
-                        }),
-                        admin_cq: nvme.admin_cq.as_ref().map(|cq| {
-                            NvmeMigrateCq {
-                                base: cq.base,
-                                size: cq.size,
-                                head: cq.head,
-                                tail: cq.tail,
-                                phase: cq.phase,
-                                iv: cq.iv,
-                            }
-                        }),
-                        io_sqs: nvme
-                            .io_sqs
-                            .iter()
-                            .map(|sq| {
-                                sq.as_ref().map(|sq| NvmeMigrateSq {
-                                    base: sq.base,
-                                    size: sq.size,
-                                    head: sq.head,
-                                    tail: sq.tail,
-                                    cq_id: sq.cq_id,
-                                })
-                            })
-                            .collect(),
-                        io_cqs: nvme
-                            .io_cqs
-                            .iter()
-                            .map(|cq| {
-                                cq.as_ref().map(|cq| NvmeMigrateCq {
-                                    base: cq.base,
-                                    size: cq.size,
-                                    head: cq.head,
-                                    tail: cq.tail,
-                                    phase: cq.phase,
-                                    iv: cq.iv,
-                                })
-                            })
-                            .collect(),
-                        num_io_queues: nvme.num_io_queues,
-                        pci_command: nvme.pci_command,
-                        pci_bar_addrs: nvme.pci_bar_addrs,
-                        msix_entries: nvme.msix_entries.clone(),
-                        msix_enabled: nvme.msix_enabled,
-                    };
+                    let state =
+                        vmm_devices::DeviceMigrateState::Nvme(nvme.clone());
                     for dev in &devs {
-                        dev.restore_nvme_state(&mig);
+                        dev.restore_migrate_state(&state);
                     }
                 }
             });
@@ -818,6 +742,7 @@ fn spawn_control_socket(
     num_cpus: u32,
     max_cpus: u32,
     mem_size: usize,
+    cpu_baseline: vmm_core::cpuid::CpuBaseline,
     vcpu_metrics: &[Arc<vmm_devices::metrics::VcpuMetrics>],
     registry: Arc<DeviceRegistry>,
     has_ahci_cd: bool,
@@ -841,7 +766,7 @@ fn spawn_control_socket(
         hotplug,
         cli.pci_slot.clone(),
         cli.lpc.clone(),
-        cli.cpu_baseline.clone(),
+        cpu_baseline,
         host_local_state,
         log.clone(),
     );
@@ -866,9 +791,13 @@ struct RunResult {
 }
 
 fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
+    // Read once. The MADT slot count, the CPU register file and the
+    // hot-add engine all read this, so the guest cannot be told about
+    // a slot no engine can fill.
+    let vm_opts = vmm_machine::VmOpts::from_cli(&cli)?;
     // The hot-add window is built before the VM exists, so a window an
     // operator cannot use costs no boot.
-    let mem_window = vmm_machine::mem_hotplug_window(&cli)?;
+    let mem_window = vmm_machine::mem_hotplug_window(&vm_opts)?;
 
     // Phase 1: Create VM, load bootrom/kernel, finalize memory
     let creation = create_machine(&cli, log)?;
@@ -883,12 +812,10 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         varstore,
         tpm_acpi,
         cpuid,
+        cpu_baseline,
         host_local_state,
     } = creation;
-    // One ceiling. The MADT slot count, the CPU register file and the
-    // hot-add engine all read this, so the guest cannot be told about a
-    // slot no engine can fill.
-    let max_cpus = cli.max_cpus()?;
+    let max_cpus = vm_opts.max_cpus;
 
     // Phase 2: Initialize chipset and kernel-emulated devices
     let chipset_devs = vmm_machine::init_chipset(&machine, log)?;
@@ -896,7 +823,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     // Phase 3: Timers, PM, pvpanic
     let timer_pm_devs = vmm_machine::setup_timers_and_pm(
         &machine,
-        vmm_machine::HotplugOpts::from_cli(&cli)?,
+        vmm_machine::HotplugOpts::from_vm(&vm_opts),
         log,
     )?;
 
@@ -915,7 +842,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     // Phase 5: fw_cfg, ACPI tables, SMBIOS, E820, boot order
     let (_fwcfg, acpi_tables) = vmm_machine::setup_fwcfg_and_acpi(
         &machine,
-        &cli,
+        &vm_opts,
         num_cpus,
         mem_size,
         bootorder::build_bootorder(&cli.pci_slot)?,
@@ -1096,6 +1023,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         num_cpus,
         max_cpus,
         mem_size,
+        cpu_baseline,
         &vcpu_metrics,
         Arc::clone(&registry),
         has_ahci_cd,
@@ -1146,19 +1074,6 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     })
 }
 
-fn parse_ahci_cd_path(config: &str) -> anyhow::Result<&str> {
-    if config.is_empty() {
-        anyhow::bail!("ahci-cd requires an ISO path");
-    }
-    let path = config.split(',').next().unwrap_or(config);
-    if let Some(opt) = config.split(',').skip(1).find(|o| !o.is_empty()) {
-        // Rejecting unknown options prevents a read-only device from
-        // appearing to honor a writable configuration.
-        anyhow::bail!("ahci-cd takes no options, got '{}'", opt);
-    }
-    Ok(path)
-}
-
 fn reject_ahci_hd<T>() -> anyhow::Result<T> {
     anyhow::bail!(
         "AHCI device type 'ahci-hd' is not implemented; use virtio-blk or nvme"
@@ -1198,25 +1113,23 @@ fn parse_and_create_pci_device(
         hdl: vmm_hdl,
     };
 
-    let parts: Vec<&str> = spec.splitn(3, ',').collect();
-    if parts.len() < 2 {
-        anyhow::bail!(
-            "invalid PCI slot spec '{}': need slot,driver[,config]",
-            spec
-        );
-    }
-
-    let bdf = parse_bdf(parts[0]).ok_or_else(|| {
-        anyhow::anyhow!("invalid BDF '{}' in spec '{}'", parts[0], spec)
-    })?;
-    let driver = parts[1];
-    let config = parts.get(2).copied().unwrap_or("");
+    let (bdf, driver, config) = devspec::split(spec)?;
 
     match driver {
         "virtio-blk" | "virtio-blk-pci" => {
+            anyhow::ensure!(
+                !config.is_empty(),
+                "virtio-blk requires a disk path"
+            );
+            let (path, blk_opts) = devspec::parse_blk_config(config);
             let lintr = chipset.route_lintr(&bdf);
-            let pci_dev =
-                attach::virtio_blk(config, num_vcpus, lintr, &virtio_ctx)?;
+            let pci_dev = attach::virtio_blk(
+                std::path::Path::new(path),
+                &blk_opts,
+                num_vcpus,
+                lintr,
+                &virtio_ctx,
+            )?;
             chipset.try_attach_device(bdf, pci_dev.clone())?;
             info!(log, "virtio-blk attached";
                 "bdf" => %bdf,
@@ -1229,13 +1142,14 @@ fn parse_and_create_pci_device(
             ))
         }
         "virtio-net-viona" => {
-            let (vnic_name, promiscphys) = attach::parse_viona_config(config);
+            let (vnic_name, promiscphys) = devspec::parse_viona_config(config);
 
             // On a migrate destination the rings are not programmed yet, so
             // the poll thread waits for start_poll_deferred() after restore.
             let lintr = chipset.route_lintr(&bdf);
             let pci_dev = attach::virtio_viona(
-                config,
+                vnic_name,
+                promiscphys,
                 lintr,
                 is_migrate_dest,
                 &virtio_ctx,
@@ -1257,7 +1171,7 @@ fn parse_and_create_pci_device(
             if config.is_empty() {
                 anyhow::bail!("nvme requires a disk path");
             }
-            let (path, blk_opts) = attach::parse_blk_config(config);
+            let (path, blk_opts) = devspec::parse_blk_config(config);
             use std::fs::OpenOptions;
             let file = OpenOptions::new()
                 .read(true)
@@ -1285,7 +1199,7 @@ fn parse_and_create_pci_device(
             ))
         }
         "virtio-console" => {
-            let path = vmm_virtio::console::parse_console_config(config)?;
+            let path = devspec::parse_console_config(config)?;
             let lintr = chipset.route_lintr(&bdf);
             let pci_dev = attach::virtio_console(
                 std::path::Path::new(path),
@@ -1305,8 +1219,8 @@ fn parse_and_create_pci_device(
             ))
         }
         "virtio-fs" => {
-            use vmm_virtio::fs::{clamp_queue_size, parse_fs_config};
-            let opts = parse_fs_config(config)?;
+            use vmm_virtio::fs::clamp_queue_size;
+            let opts = devspec::parse_fs_config(config)?;
             let queue_size = clamp_queue_size(opts.queue_size);
             let lintr = chipset.route_lintr(&bdf);
             let pci_dev =
@@ -1424,7 +1338,7 @@ fn parse_and_create_pci_device(
             Ok((Some(dev as Arc<dyn vmm_devices::pci::PciDevice>), None))
         }
         "ahci-cd" => {
-            let path = parse_ahci_cd_path(config)?;
+            let path = devspec::parse_ahci_cd_path(config)?;
             let media = vmm_storage::ahci::media::IsoMedia::open(
                 std::path::Path::new(path),
             )
@@ -1756,8 +1670,8 @@ mod tests {
     fn one_cpu_ceiling_feeds_the_tables_the_registers_and_the_engine() {
         // The MADT slot count, the CPU register file and the hot-add
         // engine have to describe one machine. All three read
-        // Cli::max_cpus: the tables through setup_fwcfg_and_acpi, the
-        // register file through HotplugOpts::from_cli, and the engine
+        // VmOpts::max_cpus: the tables through setup_fwcfg_and_acpi, the
+        // register file through HotplugOpts::from_vm, and the engine
         // through the VcpuSetup in run(). A hand-built HotplugOpts here
         // would let the register file describe a different machine, so
         // the phase sequence must not contain one.
@@ -1766,9 +1680,10 @@ mod tests {
         let code = &src[..end];
 
         assert!(!code.contains("HotplugOpts {"), "a hand-built HotplugOpts");
-        // One call, so every other use of the ceiling in this file
+        // One read, so every other use of the ceiling in this file
         // flows from the one local it is read into.
-        assert_eq!(code.matches("cli.max_cpus()").count(), 1);
+        assert_eq!(code.matches("VmOpts::from_cli(").count(), 1);
+        assert_eq!(code.matches("cli.max_cpus()").count(), 0);
     }
 
     #[test]
@@ -1778,20 +1693,6 @@ mod tests {
 
         assert!(message.contains("not implemented"));
         assert!(!message.contains("use virtio-blk instead"));
-    }
-
-    #[test]
-    fn ahci_cd_requires_path() {
-        let error = parse_ahci_cd_path("").unwrap_err();
-
-        assert_eq!(error.to_string(), "ahci-cd requires an ISO path");
-    }
-
-    #[test]
-    fn ahci_cd_rejects_options() {
-        let error = parse_ahci_cd_path("/x.iso,rw").unwrap_err();
-
-        assert_eq!(error.to_string(), "ahci-cd takes no options, got 'rw'");
     }
 
     #[test]

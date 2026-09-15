@@ -24,12 +24,13 @@ pub mod mem;
 pub mod mmio;
 pub mod msr;
 pub mod pio;
+pub mod poll;
 pub mod thread;
 pub mod unixsock;
 pub mod vcpu;
 
 pub use common::{RWOp, ReadOp, WriteOp};
-pub use hdl::{CreateOpts, VmmHdl};
+pub use hdl::{CreateOpts, SuspendOutcome, VmmHdl};
 pub use machine::{Machine, MachineSetup, VM_MAXCPU};
 pub use mem::{DevMemSeg, MemCtx, PhysMap, SegidAlloc, VM_MAX_MEMSEGS};
 pub use mmio::MmioBus;

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use vmm_core::mem::PhysMap;
 
-pub const PAGE_SIZE: usize = 4096;
+pub use vmm_core::common::PAGE_SIZE;
 
 /// One installed overlay: GPA, the bytes we wrote, and the original
 /// 4 KiB the guest had there. `original` lets us restore on remove

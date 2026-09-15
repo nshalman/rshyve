@@ -22,6 +22,7 @@ use slog;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 
+use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::{MemCtx, RegionKind};
 
@@ -60,7 +61,7 @@ pub async fn run_source<S>(
     mem_size: u64,
     status: Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
-    cpu_baseline: &str,
+    cpu_baseline: CpuBaseline,
 ) -> Result<(), MigrateError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -113,7 +114,7 @@ async fn run_source_inner<S: AsyncRead + AsyncWrite + Unpin>(
     mem_size: u64,
     status: &Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
-    cpu_baseline: &str,
+    cpu_baseline: CpuBaseline,
 ) -> Result<(), MigrateError> {
     // ── Phase: Sync ────────────────────────────────────────────────
     set_phase(status, MigrationPhase::Sync);
@@ -138,10 +139,8 @@ async fn run_source_inner<S: AsyncRead + AsyncWrite + Unpin>(
 
     // Send preamble with CPU features masked by the baseline.
     // This reflects what the guest sees, not the raw host features.
-    let baseline = vmm_core::cpuid::CpuBaseline::parse(cpu_baseline)
-        .unwrap_or(vmm_core::cpuid::CpuBaseline::Host);
     let (l1_ecx, l1_edx, l7_ebx, l7_ecx, l7_edx, xcr0) =
-        vmm_core::cpuid::query_masked_features(baseline);
+        vmm_core::cpuid::query_masked_features(cpu_baseline);
     let preamble = MigrationPreamble {
         num_cpus,
         mem_size,

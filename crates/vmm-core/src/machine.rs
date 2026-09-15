@@ -23,19 +23,19 @@ use std::sync::Arc;
 use anyhow::Context as _;
 
 use crate::hdl::{CreateOpts, VmmHdl};
-use crate::mem::{MemCtx, PhysMap, SegidAlloc};
+use crate::mem::{MemCtx, PhysMap, SegidAlloc, MMIO_HOLE_BASE, MMIO_HOLE_END};
 use crate::mmio::MmioBus;
 use crate::pio::PioBus;
 use crate::vcpu::Vcpu;
 
-/// The 4 GiB boundary where high memory begins (above the MMIO hole).
 /// Most vCPUs one VM can have. The kernel's `VM_MAXCPU`.
 pub const VM_MAXCPU: u32 = bhyve_api::VM_MAXCPU as u32;
 
-const FOUR_GIB: u64 = 0x1_0000_0000;
+/// High memory begins at the end of the MMIO hole.
+const FOUR_GIB: u64 = MMIO_HOLE_END;
 
 /// Default lowmem limit (below the MMIO hole).
-const DEFAULT_LOWMEM_LIMIT: u64 = 0xC000_0000;
+const DEFAULT_LOWMEM_LIMIT: u64 = MMIO_HOLE_BASE;
 
 /// Minimum supported memory size (1 MiB).
 const MIN_MEM_SIZE: usize = 1024 * 1024;

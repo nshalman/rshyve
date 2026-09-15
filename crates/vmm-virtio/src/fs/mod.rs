@@ -23,7 +23,7 @@ use self::server::FuseServer;
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::VirtioDevice;
 use crate::access::{GuestAccess, Session};
-use crate::pci::intr::{next_intr_session, BackendIntr};
+use crate::pci::intr::{BackendIntr, IntrSlot};
 use vmm_devices::lifecycle::{IndicatedState, Indicator};
 use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
 
@@ -72,12 +72,6 @@ fn run_park(slot: &ParkSlot) {
 /// The transport interrupt path, wired by the binary after
 /// `VirtioPciDevice::new`.
 ///
-/// A raise names a queue index, because virtio-fs has two queues and
-/// each has its own MSI-X vector, and the session it was authorised
-/// under, because a reply is published on a worker thread that a reset
-/// can overtake.
-pub type QueueIntr = Arc<BackendIntr>;
-
 /// Parsed `-s <slot>,virtio-fs,<config>` options.
 #[derive(Debug, Clone)]
 pub struct VirtioFsOpts {
@@ -99,68 +93,6 @@ impl Default for VirtioFsOpts {
             queue_size: FS_QUEUE_SIZE_DEFAULT,
         }
     }
-}
-
-/// Parse the config half of `-s <slot>,virtio-fs,<config>`.
-///
-/// Grammar: `<host-path>[,tag=<name>][,ro][,queue-size=<n>]`. The tag
-/// defaults to the last path component. Unknown options are a hard error:
-/// virtio-fs is new here, so there is no forward compatibility to keep.
-pub fn parse_fs_config(config: &str) -> anyhow::Result<VirtioFsOpts> {
-    let mut parts = config.split(',');
-    let path = parts.next().unwrap_or("");
-    if path.is_empty() {
-        anyhow::bail!("virtio-fs requires a host directory path");
-    }
-
-    let mut opts = VirtioFsOpts {
-        path: std::path::PathBuf::from(path),
-        ..VirtioFsOpts::default()
-    };
-    let mut tag: Option<String> = None;
-
-    for opt in parts.filter(|o| !o.is_empty()) {
-        if let Some(v) = opt.strip_prefix("tag=") {
-            tag = Some(v.to_string());
-        } else if opt == "ro" {
-            opts.read_only = true;
-        } else if let Some(v) = opt.strip_prefix("queue-size=") {
-            let n: u32 = v.parse().unwrap_or(0);
-            if !(u32::from(FS_QUEUE_SIZE_MIN)..=u32::from(FS_QUEUE_SIZE_MAX))
-                .contains(&n)
-            {
-                anyhow::bail!(
-                    "virtio-fs queue-size must be {}..={}, got {}",
-                    FS_QUEUE_SIZE_MIN,
-                    FS_QUEUE_SIZE_MAX,
-                    v
-                );
-            }
-            opts.queue_size = n as u16;
-        } else {
-            anyhow::bail!("virtio-fs: unknown option '{}'", opt);
-        }
-    }
-
-    opts.tag = match tag {
-        Some(t) => t,
-        None => opts
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-    };
-    if opts.tag.len() > FS_TAG_LEN {
-        anyhow::bail!(
-            "virtio-fs tag '{}' exceeds {} bytes",
-            opts.tag,
-            FS_TAG_LEN
-        );
-    }
-    if opts.tag.as_bytes().contains(&0) {
-        anyhow::bail!("virtio-fs tag must not contain NUL");
-    }
-    Ok(opts)
 }
 
 /// Normalize a requested queue size to something `VirtQueue::new` accepts:
@@ -207,10 +139,15 @@ pub struct VirtioFs {
     log: slog::Logger,
     /// The transport interrupt path. Clone this Arc BEFORE moving the
     /// device into `VirtioPciDevice::new`.
-    pub interrupt: Arc<Mutex<Option<QueueIntr>>>,
+    interrupt: Arc<IntrSlot>,
 }
 
 impl VirtioFs {
+    /// Install the transport interrupt path once the transport exists.
+    pub fn install_interrupt(&self, intr: Arc<BackendIntr>) {
+        self.interrupt.install(intr);
+    }
+
     /// Open the passthrough root, build the FUSE server, and spawn the
     /// worker thread.
     pub fn new(
@@ -277,7 +214,7 @@ impl VirtioFs {
             parks: ctx.parks,
             indicator: Indicator::new(),
             log,
-            interrupt: Arc::new(Mutex::new(None)),
+            interrupt: Arc::new(IntrSlot::new()),
         })
     }
 
@@ -305,14 +242,7 @@ impl VirtioFs {
             Arc::clone(&self.physmap),
             access.intr(),
             move |session| {
-                // The slot is unlocked for the raise. Delivery is a
-                // call into the kernel, and the reset reads this
-                // slot, so a raise that held the lock would put that
-                // call in front of a vCPU.
-                let path = intr.lock().ok().and_then(|slot| slot.clone());
-                if let Some(path) = path {
-                    path.raise(session, queue_idx);
-                }
+                intr.raise(session, queue_idx);
             },
         );
         c.set_force_interrupt(FS_FORCE_INTERRUPTS);
@@ -649,10 +579,8 @@ impl VirtioDevice for VirtioFs {
         // is inside. The mark goes up before admission reopens, so no
         // request of the next session is served against them.
         self.session_retired.store(true, Ordering::Release);
-        self.access.reopen(next_intr_session(
-            &self.interrupt,
-            self.access.intr_session(),
-        ));
+        self.access
+            .reopen(self.interrupt.next_session(self.access.intr_session()));
     }
 }
 

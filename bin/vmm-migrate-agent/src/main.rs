@@ -18,10 +18,12 @@
 //! 6. Agents bridge VMM↔Unix↔TCP↔Unix↔VMM throughout step 5
 //! 7. Dest VMM resumes, guest continues running
 
-use std::path::PathBuf;
-use std::process::Command;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::{bail, ensure, Context};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -95,6 +97,12 @@ fn main() -> anyhow::Result<()> {
             let src_disk =
                 disk_dataset.unwrap_or_else(|| format!("zones/{uuid}/disk0"));
             let dst_disk = dest_dataset.unwrap_or_else(|| src_disk.clone());
+            // These names reach a remote shell through ssh, so they are
+            // held to the characters ZFS and DNS allow.
+            check_name("uuid", &uuid)?;
+            check_name("dest-host", &dest_host)?;
+            check_name("disk-dataset", &src_disk)?;
+            check_name("dest-dataset", &dst_disk)?;
             let ctl = control_socket.unwrap_or_else(|| {
                 PathBuf::from(format!(
                     "/zones/{uuid}/root/tmp/vmm-migrate.sock"
@@ -102,10 +110,10 @@ fn main() -> anyhow::Result<()> {
             });
             let mig_sock =
                 format!("/zones/{uuid}/root/tmp/vmm-migrate-data.sock");
-            let ssh = format!(
-                "ssh -i {} -o StrictHostKeyChecking=no -o IdentitiesOnly=yes",
-                ssh_key.display()
-            );
+            let ssh = Ssh {
+                key: ssh_key,
+                host: dest_host.clone(),
+            };
 
             run_source(
                 &uuid, &dest_host, dest_port, &src_disk, &dst_disk, max_syncs,
@@ -125,14 +133,120 @@ fn log(msg: &str) {
 }
 
 fn now() -> String {
-    Command::new("date")
-        .arg("+%T")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+    chrono::Local::now().format("%T").to_string()
+}
+
+/// Accept only the characters a dataset, a UUID, or a host name is
+/// made of. Anything else could reach the remote shell as syntax.
+fn check_name(what: &str, value: &str) -> anyhow::Result<()> {
+    ensure!(
+        !value.is_empty()
+            && value.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '_' | '-' | '.' | '/' | ':')
+            }),
+        "{what} {value:?} holds a character that is not allowed"
+    );
+    Ok(())
+}
+
+/// The remote side of every ssh call.
+struct Ssh {
+    key: PathBuf,
+    host: String,
+}
+
+impl Ssh {
+    /// A command that runs `argv` on the remote host.
+    fn remote(&self, argv: &[&str]) -> Command {
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-i")
+            .arg(&self.key)
+            .args([
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "IdentitiesOnly=yes",
+            ])
+            .arg(format!("root@{}", self.host))
+            .args(argv);
+        cmd
+    }
+}
+
+/// Run one local `zfs` command and report a non-zero exit.
+fn zfs(argv: &[&str]) -> anyhow::Result<()> {
+    let st = Command::new("zfs")
+        .args(argv)
+        .status()
+        .with_context(|| format!("run zfs {argv:?}"))?;
+    if !st.success() {
+        bail!("exit {}: zfs {argv:?}", st.code().unwrap_or(-1));
+    }
+    Ok(())
+}
+
+/// Destroy a snapshot that may not exist. Nothing to report either way.
+fn zfs_destroy_quiet(snapshot: &str) {
+    let _ = Command::new("zfs")
+        .args(["destroy", snapshot])
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// The same on the remote host.
+fn remote_zfs_destroy_quiet(ssh: &Ssh, snapshot: &str) {
+    let _ = ssh
+        .remote(&["zfs", "destroy", snapshot])
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Pipe `zfs send <send_args>` into `zfs recv -F <dst>` on the remote
+/// host. Both ends must exit clean.
+fn zfs_send_recv(
+    send_args: &[&str],
+    ssh: &Ssh,
+    dst: &str,
+) -> anyhow::Result<()> {
+    let mut send = Command::new("zfs")
+        .arg("send")
+        .args(send_args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run zfs send {send_args:?}"))?;
+    let stream = send.stdout.take().expect("stdout is piped");
+    let recv = ssh
+        .remote(&["zfs", "recv", "-F", dst])
+        .stdin(stream)
+        .status()
+        .context("run remote zfs recv")?;
+    let sent = send.wait().context("wait for zfs send")?;
+    if !sent.success() {
+        bail!("exit {}: zfs send {send_args:?}", sent.code().unwrap_or(-1));
+    }
+    if !recv.success() {
+        bail!("exit {}: zfs recv -F {dst}", recv.code().unwrap_or(-1));
+    }
+    Ok(())
+}
+
+/// Send one control command to the VMM and log its answer.
+fn control_command(
+    ctl: &Path,
+    command: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let mut stream = std::os::unix::net::UnixStream::connect(ctl)
+        .with_context(|| format!("connect to {}", ctl.display()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    writeln!(stream, "{command}")?;
+    let mut reply = String::new();
+    // The command has been delivered once the write returns; a slow
+    // or missing answer is worth a log line, not a failure.
+    if BufReader::new(&stream).read_line(&mut reply).is_ok() {
+        log(&format!("  VMM answered: {}", reply.trim_end()));
+    }
+    Ok(())
 }
 
 fn run_source(
@@ -142,8 +256,8 @@ fn run_source(
     src_disk: &str,
     dst_disk: &str,
     max_syncs: u32,
-    ssh: &str,
-    ctl: &std::path::Path,
+    ssh: &Ssh,
+    ctl: &Path,
     mig_sock: &str,
     skip_zfs: bool,
 ) -> anyhow::Result<()> {
@@ -156,8 +270,8 @@ fn run_source(
             .rsplit_once('/')
             .map(|(p, _)| p)
             .unwrap_or(src_disk);
-        let _ = sh(&format!("zfs set quota=none {zone_ds}"));
-        let _ = sh(&format!("zfs set refreservation=none {src_disk}"));
+        let _ = zfs(&["set", "quota=none", zone_ds]);
+        let _ = zfs(&["set", "refreservation=none", src_disk]);
 
         // Clean ALL old migration snapshots on both sides
         for snap in &[
@@ -169,29 +283,34 @@ fn run_source(
             "vmm-mig-live",
             "vmm-mig-fresh",
         ] {
-            let _ = sh(&format!("zfs destroy {src_disk}@{snap} 2>/dev/null"));
-            let _ = sh(&format!("{ssh} root@{dest_host} 'zfs destroy {dst_disk}@{snap} 2>/dev/null'"));
+            zfs_destroy_quiet(&format!("{src_disk}@{snap}"));
+            remote_zfs_destroy_quiet(ssh, &format!("{dst_disk}@{snap}"));
         }
 
-        sh(&format!("zfs snapshot {src_disk}@vmm-mig-base"))?;
-        sh(&format!("zfs send {src_disk}@vmm-mig-base | {ssh} root@{dest_host} 'zfs recv -F {dst_disk}'"))?;
+        let base = format!("{src_disk}@vmm-mig-base");
+        zfs(&["snapshot", &base])?;
+        zfs_send_recv(&[&base], ssh, dst_disk)?;
         log("  full send done");
 
         let mut last = "vmm-mig-base".to_string();
         for i in 1..=max_syncs {
             log(&format!("Phase 2: incremental sync {i}/{max_syncs}"));
             let snap = format!("vmm-mig-iter-{i}");
-            sh(&format!("zfs snapshot {src_disk}@{snap}"))?;
-            sh(&format!("zfs send -i {src_disk}@{last} {src_disk}@{snap} | {ssh} root@{dest_host} 'zfs recv -F {dst_disk}'"))?;
-            let _ = sh(&format!("zfs destroy {src_disk}@{last}"));
+            let from = format!("{src_disk}@{last}");
+            let to = format!("{src_disk}@{snap}");
+            zfs(&["snapshot", &to])?;
+            zfs_send_recv(&["-i", &from, &to], ssh, dst_disk)?;
+            zfs_destroy_quiet(&from);
             last = snap;
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(Duration::from_secs(1));
         }
 
         log("Phase 3: final ZFS incremental");
-        sh(&format!("zfs snapshot {src_disk}@vmm-mig-final"))?;
-        sh(&format!("zfs send -i {src_disk}@{last} {src_disk}@vmm-mig-final | {ssh} root@{dest_host} 'zfs recv -F {dst_disk}'"))?;
-        let _ = sh(&format!("zfs destroy {src_disk}@{last}"));
+        let from = format!("{src_disk}@{last}");
+        let fin = format!("{src_disk}@vmm-mig-final");
+        zfs(&["snapshot", &fin])?;
+        zfs_send_recv(&["-i", &from, &fin], ssh, dst_disk)?;
+        zfs_destroy_quiet(&from);
         log("  ZFS sync complete");
     } else {
         log("ZFS sync skipped (--skip-zfs)");
@@ -201,17 +320,16 @@ fn run_source(
     // Now that ZFS is synced, boot the dest VM. The VMM will see
     // --migrate-listen and connect to the dest agent's Unix socket.
     log("Phase 3.5: starting dest VM");
-    let start_result = sh(&format!(
-        "{ssh} root@{dest_host} 'vmadm start {uuid} 2>&1 || echo VM_ALREADY_RUNNING'"
-    ));
-    match start_result {
-        Ok(()) => log("  dest VM started"),
-        Err(e) => {
-            log(&format!("  dest VM start (may be already running): {e}"))
-        }
+    match ssh.remote(&["vmadm", "start", uuid]).status() {
+        Ok(st) if st.success() => log("  dest VM started"),
+        Ok(st) => log(&format!(
+            "  dest VM start exited {} (may be already running)",
+            st.code().unwrap_or(-1)
+        )),
+        Err(e) => log(&format!("  dest VM start failed to run: {e}")),
     }
     // Give the VMM a moment to boot and connect to the Unix socket
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    std::thread::sleep(Duration::from_secs(3));
 
     // ── Phase 4: Bridge + trigger migration ─────────────────────
     log("Phase 4: setting up bridge and triggering migration");
@@ -223,7 +341,8 @@ fn run_source(
     rt.block_on(async {
         let dest_addr = format!("{dest_host}:{dest_port}");
         log(&format!("  connecting to dest agent at {dest_addr}..."));
-        let tcp = tokio::net::TcpStream::connect(&dest_addr).await
+        let tcp = tokio::net::TcpStream::connect(&dest_addr)
+            .await
             .context("connect to dest agent")?;
         log("  connected to dest agent");
 
@@ -237,25 +356,30 @@ fn run_source(
             .unwrap_or("/tmp/vmm-migrate-data.sock");
 
         // Create ZFS barrier socket for post-pause sync
-        let barrier_gz_path = format!("/zones/{uuid}/root/tmp/vmm-migrate-zfs-barrier.sock");
+        let barrier_gz_path =
+            format!("/zones/{uuid}/root/tmp/vmm-migrate-zfs-barrier.sock");
         let barrier_zone_path = "/tmp/vmm-migrate-zfs-barrier.sock";
         let _ = std::fs::remove_file(&barrier_gz_path);
-        let barrier_listener = std::os::unix::net::UnixListener::bind(&barrier_gz_path)
-            .context("bind ZFS barrier socket")?;
+        let barrier_listener =
+            std::os::unix::net::UnixListener::bind(&barrier_gz_path)
+                .context("bind ZFS barrier socket")?;
         barrier_listener.set_nonblocking(true).ok();
         log(&format!("  ZFS barrier at {barrier_gz_path}"));
 
-        let trigger = format!(
-            r#"echo '{{"command":"migrate-source","target_addr":"{zone_mig_path}","zfs_barrier":"{barrier_zone_path}"}}' | socat - UNIX-CONNECT:{}"#,
-            ctl.display()
-        );
+        let trigger = serde_json::json!({
+            "command": "migrate-source",
+            "target_addr": zone_mig_path,
+            "zfs_barrier": barrier_zone_path,
+        });
         // Spawn background thread for post-pause ZFS barrier sync.
         // Blocks on accept() until VMM connects (vCPUs paused), then
         // does final ZFS incremental, then signals VMM to continue.
         let zfs_src = src_disk.to_string();
         let zfs_dst = dst_disk.to_string();
-        let zfs_ssh = ssh.to_string();
-        let zfs_dest = dest_host.to_string();
+        let zfs_ssh = Ssh {
+            key: ssh.key.clone(),
+            host: ssh.host.clone(),
+        };
         let zfs_skip = skip_zfs;
         let barrier_cleanup = barrier_gz_path.clone();
         let zfs_handle = std::thread::Builder::new()
@@ -269,13 +393,20 @@ fn run_source(
                         log("  ZFS barrier: VMM paused, starting final sync");
                         if !zfs_skip {
                             let snap = format!("{zfs_src}@vmm-mig-postpause");
-                            let _ = sh(&format!("zfs destroy {snap} 2>/dev/null"));
-                            if let Err(e) = sh(&format!("zfs snapshot {snap}")) {
-                                log(&format!("  ZFS barrier: snapshot failed: {e}"));
-                            } else if let Err(e) = sh(&format!(
-                                "zfs send -i {zfs_src}@vmm-mig-final {snap} | {zfs_ssh} root@{zfs_dest} 'zfs recv -F {zfs_dst}'"
-                            )) {
-                                log(&format!("  ZFS barrier: send failed: {e}"));
+                            let fin = format!("{zfs_src}@vmm-mig-final");
+                            zfs_destroy_quiet(&snap);
+                            if let Err(e) = zfs(&["snapshot", &snap]) {
+                                log(&format!(
+                                    "  ZFS barrier: snapshot failed: {e}"
+                                ));
+                            } else if let Err(e) = zfs_send_recv(
+                                &["-i", &fin, &snap],
+                                &zfs_ssh,
+                                &zfs_dst,
+                            ) {
+                                log(&format!(
+                                    "  ZFS barrier: send failed: {e}"
+                                ));
                             } else {
                                 log("  ZFS barrier: final incremental sent");
                             }
@@ -283,20 +414,21 @@ fn run_source(
                             log("  ZFS barrier: skipped (--skip-zfs)");
                         }
                         // Signal VMM to continue
-                        let _ = std::io::Write::write_all(&mut conn, &[1u8]);
+                        let _ = conn.write_all(&[1u8]);
                     }
-                    Err(e) => log(&format!("  ZFS barrier: accept failed: {e}")),
+                    Err(e) => {
+                        log(&format!("  ZFS barrier: accept failed: {e}"))
+                    }
                 }
                 let _ = std::fs::remove_file(&barrier_cleanup);
             })
             .ok();
 
         log(&format!("  triggering: {trigger}"));
-        sh(&trigger)?;
+        control_command(ctl, &trigger)?;
         log("  migration triggered, waiting for VMM...");
 
-        let (unix, _) = unix_listener.accept().await
-            .context("accept VMM")?;
+        let (unix, _) = unix_listener.accept().await.context("accept VMM")?;
         log("  VMM connected, bridging...");
 
         let (mut ur, mut uw) = tokio::io::split(unix);
@@ -311,13 +443,15 @@ fn run_source(
         }
 
         let _ = std::fs::remove_file(mig_sock);
-        if let Some(h) = zfs_handle { let _ = h.join(); }
+        if let Some(h) = zfs_handle {
+            let _ = h.join();
+        }
         Ok::<(), anyhow::Error>(())
     })?;
 
     if !skip_zfs {
-        let _ = sh(&format!("zfs destroy {src_disk}@vmm-mig-final"));
-        let _ = sh(&format!("zfs destroy {src_disk}@vmm-mig-postpause"));
+        zfs_destroy_quiet(&format!("{src_disk}@vmm-mig-final"));
+        zfs_destroy_quiet(&format!("{src_disk}@vmm-mig-postpause"));
     }
 
     log("=== MIGRATION COMPLETE ===");
@@ -371,15 +505,4 @@ fn run_dest(_uuid: &str, port: u16, mig_sock: &str) -> anyhow::Result<()> {
         log("=== DEST MIGRATION COMPLETE ===");
         Ok::<(), anyhow::Error>(())
     })
-}
-
-fn sh(cmd: &str) -> anyhow::Result<()> {
-    let st = Command::new("bash")
-        .args(["-c", cmd])
-        .status()
-        .with_context(|| format!("run: {cmd}"))?;
-    if !st.success() {
-        bail!("exit {}: {}", st.code().unwrap_or(-1), cmd);
-    }
-    Ok(())
 }

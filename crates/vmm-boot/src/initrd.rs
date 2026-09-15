@@ -7,7 +7,7 @@
 use anyhow::{ensure, Context, Result};
 
 /// Ceiling of the low guest-RAM window, below the 32-bit MMIO hole.
-pub const LOWMEM_LIMIT: u64 = 0xC000_0000;
+pub use vmm_core::mem::MMIO_HOLE_BASE as LOWMEM_LIMIT;
 
 /// Highest page-aligned address that holds `rd_size` bytes below the
 /// low-memory ceiling, without touching the kernel image.

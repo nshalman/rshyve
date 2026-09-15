@@ -18,11 +18,11 @@ use vmm_devices::Lifecycle;
 
 use super::device::{addressed_queue, device_with, running_device};
 use super::{cleared, null_log, steps_of, Op, Step, Steps, TestLink};
-use crate::pci::intr::BackendIntr;
+use crate::pci::intr::{BackendIntr, IntrSlot};
 use crate::viona::halt::halt_link;
 use crate::viona::poll::{deliver_pending, viona_intr_poll_loop};
 use crate::viona::{
-    RingState, VionaInterrupt, NET_NUM_QUEUES, NET_QUEUE_SIZE, VIRTIO_NET_F_MAC,
+    RingState, NET_NUM_QUEUES, NET_QUEUE_SIZE, VIRTIO_NET_F_MAC,
 };
 use crate::VirtioDevice;
 
@@ -71,13 +71,14 @@ fn restore(device: &crate::viona::VirtioViona) {
 }
 
 /// An interrupt path that records the rings it was raised for.
-fn wired_interrupt() -> (Mutex<Option<VionaInterrupt>>, Arc<Mutex<Vec<u16>>>) {
+fn wired_interrupt() -> (IntrSlot, Arc<Mutex<Vec<u16>>>) {
     let raised = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&raised);
-    let intr = BackendIntr::detached(move |_session, ring| {
+    let slot = IntrSlot::new();
+    slot.install(BackendIntr::detached(move |_session, ring| {
         sink.lock().expect("raised lock").push(ring);
-    });
-    (Mutex::new(Some(intr)), raised)
+    }));
+    (slot, raised)
 }
 
 #[test]

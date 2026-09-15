@@ -35,11 +35,11 @@ use vmm_devices::pci::{BarN, INTxPinID, IntrPin};
 use super::device::device_with;
 use super::{cleared, null_log, Park, ParkAt, Steps, TestLink};
 use crate::bits;
+use crate::pci::intr::IntrSlot;
 use crate::pci::VirtioPciDevice;
 use crate::viona::poll::deliver_pending;
 use crate::viona::{
-    VionaInterrupt, VirtioViona, NET_CONFIG_SIZE, NET_NUM_QUEUES,
-    NET_QUEUE_SIZE,
+    VirtioViona, NET_CONFIG_SIZE, NET_NUM_QUEUES, NET_QUEUE_SIZE,
 };
 use viona_api::LinkOps;
 
@@ -132,7 +132,7 @@ struct Fixture {
     link: Arc<TestLink>,
     /// What the device asked of the kernel, the clears included.
     steps: Steps,
-    intr: Arc<Mutex<Option<VionaInterrupt>>>,
+    intr: Arc<IntrSlot>,
     pin: Arc<TestPin>,
     /// Set when the driver in this fixture uses MSI-X.
     sink: Option<Arc<TestSink>>,
@@ -171,7 +171,7 @@ impl Fixture {
         });
 
         let device = device_with(Arc::clone(&link) as Arc<dyn LinkOps>);
-        let intr = device.interrupt();
+        let intr = device.interrupt_slot();
         let pin = TestPin::new();
         let dev = VirtioPciDevice::new(
             device,
@@ -185,7 +185,7 @@ impl Fixture {
             Arc::new(MmioBus::new()),
             table,
         );
-        *intr.lock().expect("viona interrupt lock") = Some(dev.backend_intr());
+        dev.device().install_interrupt(dev.backend_intr());
 
         Self {
             dev,

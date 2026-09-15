@@ -15,6 +15,7 @@ use std::sync::Arc;
 use slog::{info, warn};
 
 use vmm_devices::pci::Bdf;
+use vmm_machine::devspec;
 use vmm_virtio::attach;
 use vmm_virtio::vsock::control::ControlSlot;
 
@@ -60,21 +61,11 @@ fn unsupported_driver(driver: &str) -> anyhow::Error {
 /// Kept separate from device construction so the driver-name contract is
 /// testable without a live VM.
 pub(crate) fn split_spec(spec: &str) -> anyhow::Result<(Bdf, &str, &str)> {
-    let parts: Vec<&str> = spec.splitn(3, ',').collect();
-    anyhow::ensure!(
-        parts.len() >= 2,
-        "invalid PCI slot spec '{spec}': need slot,driver[,config]"
-    );
-
-    let bdf = vmm_machine::parse_bdf(parts[0]).ok_or_else(|| {
-        anyhow::anyhow!("invalid BDF '{}' in spec '{}'", parts[0], spec)
-    })?;
-    let driver = parts[1];
+    let (bdf, driver, config) = devspec::split(spec)?;
     if !SUPPORTED.contains(&driver) && !IGNORED.contains(&driver) {
         return Err(unsupported_driver(driver));
     }
-
-    Ok((bdf, driver, parts.get(2).copied().unwrap_or("")))
+    Ok((bdf, driver, config))
 }
 
 /// Build one PCI device from its spec string.
@@ -111,8 +102,19 @@ pub(crate) fn create_pci_device(
 
     match driver {
         "virtio-blk" | "virtio-blk-pci" => {
+            anyhow::ensure!(
+                !config.is_empty(),
+                "virtio-blk requires a disk path"
+            );
+            let (path, opts) = devspec::parse_blk_config(config);
             let lintr = ctx.chipset.route_lintr(&bdf);
-            let dev = attach::virtio_blk(config, num_vcpus, lintr, &actx)?;
+            let dev = attach::virtio_blk(
+                std::path::Path::new(path),
+                &opts,
+                num_vcpus,
+                lintr,
+                &actx,
+            )?;
             ctx.chipset.try_attach_device(bdf, dev.clone())?;
             info!(ctx.log, "virtio-blk attached";
                 "bdf" => %bdf, "path" => config);
@@ -125,8 +127,15 @@ pub(crate) fn create_pci_device(
             let lintr = ctx.chipset.route_lintr(&bdf);
             // firehyve is never a migration destination, so the in-kernel
             // interrupt poll thread starts immediately.
-            let dev =
-                attach::virtio_viona(config, lintr, false, &actx, ctx.log)?;
+            let (vnic, promiscphys) = devspec::parse_viona_config(config);
+            let dev = attach::virtio_viona(
+                vnic,
+                promiscphys,
+                lintr,
+                false,
+                &actx,
+                ctx.log,
+            )?;
             ctx.chipset.try_attach_device(bdf, dev.clone())?;
             info!(ctx.log, "virtio-net-viona attached";
                 "bdf" => %bdf, "vnic" => config);
@@ -136,8 +145,8 @@ pub(crate) fn create_pci_device(
             ))
         }
         "virtio-fs" => {
-            use vmm_virtio::fs::{clamp_queue_size, parse_fs_config};
-            let opts = parse_fs_config(config)?;
+            use vmm_virtio::fs::clamp_queue_size;
+            let opts = devspec::parse_fs_config(config)?;
             let queue_size = clamp_queue_size(opts.queue_size);
             let lintr = ctx.chipset.route_lintr(&bdf);
             let dev =
@@ -153,8 +162,7 @@ pub(crate) fn create_pci_device(
             ))
         }
         "virtio-vsock" => {
-            use vmm_virtio::vsock::device::parse_vsock_config;
-            let (path, cid) = parse_vsock_config(config)?;
+            let (path, cid) = devspec::parse_vsock_config(config)?;
             let lintr = ctx.chipset.route_lintr(&bdf);
             let (dev, slot) = vmm_virtio::vsock::control::attach_with_control(
                 &path, cid, lintr, &actx, ctx.log,
@@ -181,7 +189,7 @@ pub(crate) fn create_pci_device(
             ))
         }
         "virtio-console" => {
-            let path = vmm_virtio::console::parse_console_config(config)?;
+            let path = devspec::parse_console_config(config)?;
             let lintr = ctx.chipset.route_lintr(&bdf);
             let dev = attach::virtio_console(
                 std::path::Path::new(path),

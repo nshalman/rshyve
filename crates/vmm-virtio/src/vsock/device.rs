@@ -35,7 +35,7 @@ mod sockets;
 mod tx;
 
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -46,10 +46,11 @@ use vmm_core::unixsock::{bind_restricted, SocketPolicy};
 use vmm_devices::lifecycle::Indicator;
 use vmm_devices::QuiesceGate;
 
-use self::shared::{InterruptFn, VsockShared};
+use self::shared::VsockShared;
 use super::control::ControlSlot;
 use super::mux::VsockMux;
 use super::packet::CID_GUEST_MIN;
+use crate::pci::intr::{BackendIntr, IntrSlot};
 use crate::queue::VirtQueue;
 use crate::VirtioDevice;
 
@@ -69,36 +70,6 @@ pub const VSOCK_QUEUE_SIZE: u16 = 256;
 pub const VSOCK_CONFIG_SIZE: u16 = 8;
 /// One vector per queue plus one for config change.
 pub const VSOCK_MSIX_VECTORS: u16 = VSOCK_NUM_QUEUES as u16 + 1;
-
-/// Parse the config half of `-s <slot>,virtio-vsock,<config>`.
-///
-/// Grammar: `<uds-path>,cid=<n>`. The CID is required: there is no
-/// sensible default, and two guests sharing one would be a routing bug
-/// that only shows up under load.
-pub fn parse_vsock_config(config: &str) -> anyhow::Result<(PathBuf, u64)> {
-    let mut parts = config.split(',');
-    let path = parts.next().unwrap_or("");
-    anyhow::ensure!(!path.is_empty(), "virtio-vsock requires a socket path");
-
-    let mut cid: Option<u64> = None;
-    for opt in parts.filter(|o| !o.is_empty()) {
-        if let Some(v) = opt.strip_prefix("cid=") {
-            cid =
-                Some(v.parse().map_err(|_| {
-                    anyhow::anyhow!("virtio-vsock: bad cid '{v}'")
-                })?);
-        } else {
-            anyhow::bail!("virtio-vsock: unknown option '{opt}'");
-        }
-    }
-    let cid =
-        cid.ok_or_else(|| anyhow::anyhow!("virtio-vsock requires cid=<n>"))?;
-    anyhow::ensure!(
-        cid >= CID_GUEST_MIN,
-        "virtio-vsock cid must be {CID_GUEST_MIN} or above, got {cid}"
-    );
-    Ok((PathBuf::from(path), cid))
-}
 
 pub struct VirtioVsock {
     shared: Arc<VsockShared>,
@@ -138,7 +109,7 @@ impl VirtioVsock {
             pending_rx: Mutex::new(VecDeque::new()),
             rx_completion: Mutex::new(None),
             delivery: Mutex::new(()),
-            interrupt: Arc::new(Mutex::new(None)),
+            interrupt: Arc::new(IntrSlot::new()),
             sockets: Mutex::new(HashMap::new()),
             control: ControlSlot::default(),
             socket_path: socket_path.to_path_buf(),
@@ -162,10 +133,9 @@ impl VirtioVsock {
         })
     }
 
-    /// The interrupt slot, for the binary to fill after the transport
-    /// exists. Clone this before moving the device into the transport.
-    pub fn interrupt(&self) -> Arc<Mutex<Option<InterruptFn>>> {
-        Arc::clone(&self.shared.interrupt)
+    /// Install the transport interrupt path once the transport exists.
+    pub fn install_interrupt(&self, intr: Arc<BackendIntr>) {
+        self.shared.interrupt.install(intr);
     }
 
     /// The control slot, for the binary to fill once the device registry

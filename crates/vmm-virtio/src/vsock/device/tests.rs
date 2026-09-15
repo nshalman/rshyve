@@ -18,6 +18,7 @@ use crate::vsock::packet::ConnKey;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use vmm_core::unixsock::write_all_bounded;
@@ -44,41 +45,6 @@ fn a_malformed_connect_line_is_refused() {
     ] {
         assert_eq!(parse_connect_line(line), None, "accepted {line:?}");
     }
-}
-
-#[test]
-fn config_needs_a_path_and_a_cid() {
-    let (path, cid) = parse_vsock_config("/tmp/v.sock,cid=3").expect("ok");
-    assert_eq!(path, PathBuf::from("/tmp/v.sock"));
-    assert_eq!(cid, 3);
-}
-
-#[test]
-fn config_without_a_cid_is_an_error() {
-    // No default: two guests sharing a CID is a routing bug that
-    // only shows up under load.
-    assert!(parse_vsock_config("/tmp/v.sock").is_err());
-}
-
-/// 0, 1 and 2 are the hypervisor, loopback and host. A guest given
-/// one of them would collide with the host's own address.
-#[test]
-fn config_rejects_a_reserved_cid() {
-    for cid in [0, 1, 2] {
-        assert!(
-            parse_vsock_config(&format!("/tmp/v.sock,cid={cid}")).is_err(),
-            "accepted reserved cid {cid}"
-        );
-    }
-    assert!(parse_vsock_config("/tmp/v.sock,cid=3").is_ok());
-}
-
-#[test]
-fn config_rejects_junk() {
-    assert!(parse_vsock_config("").is_err());
-    assert!(parse_vsock_config("/tmp/v.sock,cid=x").is_err());
-    assert!(parse_vsock_config("/tmp/v.sock,cid=3,bogus").is_err());
-    assert!(parse_vsock_config("/tmp/v.sock,tag=nope,cid=3").is_err());
 }
 
 /// The line reader must stop at the newline and leave whatever
@@ -723,8 +689,10 @@ fn an_rx_completion_from_the_closed_session_raises_nothing() {
     let (dir, vsock) = test_vsock(Arc::clone(&physmap));
     let gate = Arc::new(IntrGate::new());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    *vsock.shared.interrupt.lock().expect("interrupt lock") =
-        Some(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
+    vsock
+        .shared
+        .interrupt
+        .install(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
 
     let stale = vsock.ensure_rx_completion(&queues[0]);
 

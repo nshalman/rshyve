@@ -154,35 +154,6 @@ fn wait_for(mut ready: impl FnMut() -> bool) -> bool {
 }
 
 #[test]
-fn parse_console_config_requires_a_path() {
-    let err = parse_console_config("").expect_err("empty must fail");
-    assert_eq!(err.to_string(), "virtio-console requires a socket path");
-}
-
-#[test]
-fn parse_console_config_rejects_options() {
-    let err =
-        parse_console_config("/tmp/c.sock,rw").expect_err("option must fail");
-    assert_eq!(err.to_string(), "virtio-console takes no options, got 'rw'");
-}
-
-#[test]
-fn parse_console_config_rejects_a_trailing_comma() {
-    // A trailing comma is a typo, not an empty option list.
-    let err = parse_console_config("/tmp/c.sock,")
-        .expect_err("trailing comma must fail");
-    assert_eq!(err.to_string(), "virtio-console takes no options, got ''");
-}
-
-#[test]
-fn parse_console_config_returns_the_path() {
-    assert_eq!(
-        parse_console_config("/tmp/c.sock").expect("path"),
-        "/tmp/c.sock"
-    );
-}
-
-#[test]
 fn tx_notify_drains_ring_and_updates_avail_event() {
     let (physmap, tx_queue) = make_tx_queue(4, 2);
     let avail_event_gpa =
@@ -229,10 +200,11 @@ fn host_bytes_reach_guest_memory() {
     let (dir, console) = console_in_tempdir(Arc::clone(&physmap));
     let raised = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&raised);
-    *console.interrupt().lock().expect("interrupt lock") =
-        Some(BackendIntr::detached(move |_session, _queue| {
+    console.install_interrupt(BackendIntr::detached(
+        move |_session, _queue| {
             counter.fetch_add(1, Ordering::Release);
-        }));
+        },
+    ));
 
     let mut queues = [rx_queue, VirtQueue::new(4)];
     assert!(!console.notify_queue(CONSOLE_RX_QUEUE, &mut queues, &physmap));
@@ -541,8 +513,10 @@ fn an_rx_completion_from_the_closed_session_raises_nothing() {
     let (_dir, console) = console_in_tempdir(Arc::clone(&physmap));
     let gate = Arc::new(IntrGate::new());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    *console.interrupt().lock().expect("interrupt lock") =
-        Some(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
+    console.install_interrupt(BackendIntr::recording(
+        Arc::clone(&gate),
+        Arc::clone(&seen),
+    ));
 
     let stale = console.ensure_rx_completion(&rx_queue);
 

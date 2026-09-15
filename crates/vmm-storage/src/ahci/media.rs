@@ -7,7 +7,6 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -46,8 +45,8 @@ impl IsoMedia {
         &self.serial
     }
 
-    pub fn as_raw_fd(&self) -> RawFd {
-        self.file.as_raw_fd()
+    pub fn file(&self) -> &File {
+        &self.file
     }
 
     pub fn read_range(&self, lba: u64, count: u32) -> Option<(u64, usize)> {

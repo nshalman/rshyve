@@ -4,10 +4,9 @@
 
 //! Read back the MSI-X table size a guest driver will find.
 
+use vmm_devices::pci::bits::CAP_ID_MSIX;
 use vmm_devices::pci::PciDevice;
 
-/// Capability ID of MSI-X (PCI 3.0, 6.8.2).
-const CAP_ID_MSIX: u8 = 0x11;
 /// Configuration space offset of the Status register.
 const STATUS_REG: u8 = 0x06;
 /// Status bit 4: the device presents a capability list.
@@ -77,7 +76,7 @@ mod tests {
     const PCI_STATUS: usize = 0x06;
     const PCI_CAP_PTR: usize = 0x34;
     const PCI_STATUS_CAP_LIST: u16 = 0x0010;
-    const PCI_CAP_ID_MSIX: u8 = 0x11;
+    const PCI_CAP_ID_MSIX: u8 = CAP_ID_MSIX;
     /// Lowest offset a capability may sit at.
     const PCI_FIRST_CAP: u8 = 0x40;
 

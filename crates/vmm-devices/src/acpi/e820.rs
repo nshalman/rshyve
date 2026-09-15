@@ -30,9 +30,9 @@ const E820_VGA_BASE: u64 = 0xA_0000;
 /// ROM area end (1 MiB boundary).
 const E820_ROM_END: u64 = 0x10_0000;
 /// 4 GiB boundary where high memory starts.
-const FOUR_GIB: u64 = 0x1_0000_0000;
+const FOUR_GIB: u64 = vmm_core::mem::MMIO_HOLE_END;
 /// Default lowmem limit (below MMIO hole).
-const LOWMEM_LIMIT: u64 = 0xC000_0000;
+const LOWMEM_LIMIT: u64 = vmm_core::mem::MMIO_HOLE_BASE;
 
 /// Build structured E820 entries from total VM memory size.
 ///

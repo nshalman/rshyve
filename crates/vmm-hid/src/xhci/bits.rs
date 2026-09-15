@@ -10,7 +10,7 @@
 
 // ---- PCI identity --------------------------------------------------------
 
-pub const PCI_VENDOR_INTEL: u16 = 0x8086;
+pub use vmm_devices::pci::bits::PCI_VENDOR_INTEL;
 pub const PCI_DEVICE_XHCI_PPT: u16 = 0x1E31; // Panther Point xHCI
 pub const PCI_CLASS_SERIAL: u8 = 0x0C;
 pub const PCI_SUBCLASS_USB: u8 = 0x03;

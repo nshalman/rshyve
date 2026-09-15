@@ -33,6 +33,7 @@ rust-bhyve/
 
   crates/bhyve-api/         Kernel VMM ioctl FFI (forked from propolis)
   crates/viona-api/         viona NIC driver FFI (forked from propolis)
+  crates/dladm/             libdladm VNIC lookup (FFI shape from propolis)
   crates/vmm-core/          VmmHdl, PhysMap, MemCtx, Vcpu, CPUID masking, MsrHandler
   crates/vmm-machine/       Device-agnostic machine construction. Names no driver
   crates/vmm-boot/          Direct bzImage and PVH kernel loading

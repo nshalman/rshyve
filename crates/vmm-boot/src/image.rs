@@ -14,9 +14,9 @@ use anyhow::{bail, Context, Result};
 
 use vmm_core::mem::MemCtx;
 
+use crate::elf::ELF_MAGIC;
 use crate::{BootVcpu, ImageBytes, InitrdImage, KernelImage, PvhKernel};
 
-const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
 const BZIMAGE_MAGIC_OFFSET: usize = 0x202;
 /// "HdrS".
 const BZIMAGE_MAGIC: u32 = 0x5372_6448;

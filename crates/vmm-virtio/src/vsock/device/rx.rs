@@ -19,7 +19,7 @@ use vmm_core::mem::PhysMap;
 
 use super::shared::VsockShared;
 use super::{VirtioVsock, VSOCK_RX_QUEUE};
-use crate::pci::intr::{next_intr_session, IntrSession};
+use crate::pci::intr::IntrSession;
 use crate::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use crate::queue_drain_should_stop;
 use crate::vsock::mux::RxPacket;
@@ -145,21 +145,13 @@ impl VirtioVsock {
             return Arc::clone(completion);
         }
         let intr = Arc::clone(&self.shared.interrupt);
-        let session =
-            next_intr_session(&self.shared.interrupt, IntrSession::INITIAL);
+        let session = self.shared.interrupt.next_session(IntrSession::INITIAL);
         let completion = VirtioCompletion::new(
             queue,
             Arc::clone(&self.shared.physmap),
             session,
             move |session| {
-                // The slot is unlocked for the raise. Delivery is a
-                // call into the kernel, and the reset reads this
-                // slot, so a raise that held the lock would put that
-                // call in front of a vCPU.
-                let path = intr.lock().ok().and_then(|slot| slot.clone());
-                if let Some(path) = path {
-                    path.raise(session, VSOCK_RX_QUEUE);
-                }
+                intr.raise(session, VSOCK_RX_QUEUE);
             },
         );
         // Force the first completions through EVENT_IDX suppression so

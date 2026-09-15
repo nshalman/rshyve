@@ -19,7 +19,6 @@
 //! paths corrupt the used index.
 
 use std::fs::File;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -51,7 +50,7 @@ mod tests;
 mod worker;
 
 use crate::access::{GuestAccess, Session};
-use crate::pci::intr::{next_intr_session, BackendIntr};
+use crate::pci::intr::{BackendIntr, IntrSlot};
 use access::BackendBarrier;
 use io::{parse_header, write_status};
 use worker::{blk_io_worker, needs_backend, BlkIoRequest, WorkerCtx};
@@ -63,7 +62,6 @@ use worker::{blk_io_worker, needs_backend, BlkIoRequest, WorkerCtx};
 /// per-disk. 8 is enough parallel syscalls for deep queues without hotspotting
 /// the `VirtioCompletion` Mutex<u16>.
 const NUM_WORKERS: usize = 8;
-pub const BLK_CONFIG_SIZE: u16 = 8;
 /// Extended config size covering all VirtIO 1.3 block config fields
 /// (capacity through write_zeroes_may_unmap at offset 0x38+1=0x3C).
 /// Must match the cfg_read buffer size so the modern driver's BUG_ON
@@ -135,12 +133,12 @@ pub struct VirtioBlock {
     next_worker: Vec<AtomicUsize>,
     /// Guest physical memory for completion handler creation.
     physmap: Arc<PhysMap>,
-    /// The transport interrupt path, set after PCI device creation.
-    pub interrupt: Arc<Mutex<Option<Arc<BackendIntr>>>>,
+    /// The transport interrupt path, installed after the transport
+    /// exists.
+    interrupt: Arc<IntrSlot>,
     /// Per-queue completion handlers, created on first notification.
     completions: Mutex<Vec<Option<Arc<VirtioCompletion>>>>,
-    /// Zvol write-cache control. Declared BEFORE `file` so Drop runs
-    /// `DKIOCSETWCE` restore while the fd is still open.
+    /// Zvol write-cache control.
     _cache: DiskCache,
     /// The backing store. Shared with every worker, so the descriptor
     /// outlives a device that is dropped while a syscall is running.
@@ -155,6 +153,11 @@ pub struct VirtioBlock {
 }
 
 impl VirtioBlock {
+    /// Install the transport interrupt path once the transport exists.
+    pub fn install_interrupt(&self, intr: Arc<BackendIntr>) {
+        self.interrupt.install(intr);
+    }
+
     pub fn new(
         file: File,
         opts: &VirtioBlockOpts,
@@ -164,12 +167,11 @@ impl VirtioBlock {
         let metadata = file.metadata()?;
         let capacity = metadata.len() / u64::from(opts.sector_size);
         let read_only = opts.read_only;
-        let raw_fd = file.as_raw_fd();
         let file = Arc::new(file);
 
         // Enable zvol writeback cache (DKIOCSETWCE=1). Must happen before
         // any I/O so the first guest writes already hit the fast path.
-        let cache = DiskCache::new(raw_fd, read_only);
+        let cache = DiskCache::new(Arc::clone(&file), read_only);
 
         // Workers per queue: NUM_WORKERS for single queue, 2 per queue for MQ.
         let limits = DiskLimits {
@@ -222,7 +224,7 @@ impl VirtioBlock {
             io_txs,
             next_worker,
             physmap,
-            interrupt: Arc::new(Mutex::new(None)),
+            interrupt: Arc::new(IntrSlot::new()),
             completions: Mutex::new(completions),
             _cache: cache,
             file,
@@ -277,14 +279,7 @@ impl VirtioBlock {
         // the ring that vector names, so a completion raised on any
         // other index is never collected.
         let interrupt_fn = move |session| {
-            // The slot is unlocked for the raise. Delivery is a call
-            // into the kernel, and the reset reads this slot, so a
-            // raise that held the lock would put that call in front
-            // of a vCPU.
-            let path = intr.lock().ok().and_then(|slot| slot.clone());
-            if let Some(path) = path {
-                path.raise(session, queue_idx);
-            }
+            intr.raise(session, queue_idx);
         };
 
         let c = VirtioCompletion::new(
@@ -658,10 +653,9 @@ impl VirtioDevice for VirtioBlock {
         for slot in self.completions.lock().expect("lock").iter_mut() {
             *slot = None;
         }
-        self.ctx.access.reopen(next_intr_session(
-            &self.interrupt,
-            self.ctx.access.intr_session(),
-        ));
+        self.ctx.access.reopen(
+            self.interrupt.next_session(self.ctx.access.intr_session()),
+        );
     }
 }
 

@@ -15,14 +15,15 @@
 
 use std::io::{self, Read};
 use std::net::Shutdown;
-use std::os::fd::AsRawFd;
+use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use slog::{debug, warn};
-use vmm_core::unixsock::{poll_events, write_all_bounded};
+use vmm_core::poll::{wait_readable, Readiness};
+use vmm_core::unixsock::write_all_bounded;
 
 use super::shared::{VsockShared, HOST_WRITE_TIMEOUT};
 use crate::vsock::control::{
@@ -40,7 +41,7 @@ const BACKPRESSURE_PAUSE: Duration = Duration::from_millis(2);
 const HOST_READ_POLL: Duration = Duration::from_millis(250);
 /// How long the accept thread waits before it re-reads the shutdown
 /// flag. This bounds how long halt waits for that thread to return.
-const ACCEPT_POLL_MS: i32 = 50;
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
 /// Pause after a failed `accept`, so a persistent error such as EMFILE
 /// cannot spin the accept thread at full speed.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
@@ -48,16 +49,11 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// cannot make the device read without bound.
 pub(super) const CONNECT_LINE_MAX: usize = 64;
 
-/// Wait for events on `fd`, or for `timeout_ms` to pass.
-///
 /// The accept loop needs a wait it can leave. A blocking `accept` ends
 /// only when a client arrives, so halt would have to connect to the
 /// socket itself to wake it, and that connect has no bound: a same-uid
 /// peer that fills the listen backlog makes it wait for as long as it
 /// likes.
-///
-/// The console has the same function. Both copies belong in
-/// `vmm_core::unixsock`.
 /// Hand back an accepted socket the readers can use, or nothing.
 ///
 /// The listener is non-blocking so the accept loop can poll. On BSD and
@@ -87,23 +83,19 @@ pub(super) fn accept_loop(shared: Arc<VsockShared>, listener: UnixListener) {
             "error" => %error);
         return;
     }
-    let fd = listener.as_raw_fd();
 
     // One report per run of failures. A persistent error is seen again
     // on every pass, and a peer that can make one happen must not be
     // able to drive the log with it.
     let mut reported = false;
     while !shared.shutdown.load(Ordering::Acquire) {
-        let revents = poll_events(fd, ACCEPT_POLL_MS);
-        // A dead listener reports its condition on every call, so the
-        // loop must leave rather than spin on it.
-        if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-            warn!(shared.log, "virtio-vsock listener is unusable";
-                "revents" => i32::from(revents));
-            return;
-        }
-        if revents & libc::POLLIN == 0 {
-            continue;
+        match wait_readable(listener.as_fd(), ACCEPT_POLL) {
+            Readiness::Readable => {}
+            Readiness::Idle => continue,
+            Readiness::Gone => {
+                warn!(shared.log, "virtio-vsock listener is unusable");
+                return;
+            }
         }
         let stream = match listener.accept() {
             Ok((stream, _)) => {

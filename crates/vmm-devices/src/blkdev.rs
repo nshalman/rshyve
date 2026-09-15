@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Block-device helpers: write-cache control (DKIOCSETWCE).
+//! Zvol write-cache control (DKIOCSETWCE).
 //!
 //! Zvols default to write-through on illumos; every sync 4K write commits
 //! the ZIL. Flipping the zvol to writeback (with guest-driven flushes for
@@ -14,28 +14,15 @@
 //! we always advertise `VIRTIO_BLK_F_FLUSH` and every real guest negotiates
 //! it, and NVMe has implicit FLUSH semantics.
 //!
-//! Drop order: declare `DiskCache` fields *before* the owning `File` in
-//! the parent struct so the restore ioctl runs while the fd is still open.
+//! `DiskCache` shares the `File`, so the restore ioctl always runs on
+//! an open descriptor whatever the field order of the owner.
 
+use std::fs::File;
 #[cfg(target_os = "illumos")]
 use std::io;
-use std::os::fd::RawFd;
-
-/// Platform-appropriate data sync for block-device flush operations.
-///
-/// This lives with `DiskCache` because both own the raw backing fd, and
-/// because virtio-blk and NVMe each call it directly.
 #[cfg(target_os = "illumos")]
-pub fn datasync(fd: RawFd) -> i32 {
-    // SAFETY: the caller holds `fd` open for the duration of the call.
-    unsafe { libc::fdatasync(fd) }
-}
-
-#[cfg(not(target_os = "illumos"))]
-pub fn datasync(fd: RawFd) -> i32 {
-    // SAFETY: the caller holds `fd` open for the duration of the call.
-    unsafe { libc::fsync(fd) }
-}
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::sync::Arc;
 
 #[cfg(target_os = "illumos")]
 const DKIOC: libc::c_int = 0x04 << 8; // 0x0400
@@ -52,49 +39,64 @@ const DKIOCSETWCE: libc::c_int = DKIOC | 37; // 0x0425
 /// that didn't support DKIOCSETWCE).
 pub struct DiskCache {
     #[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
-    fd: RawFd,
+    file: Arc<File>,
     #[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
     initial: Option<bool>,
 }
 
 impl DiskCache {
-    /// Probe and (where supported) enable writeback on the backing fd.
+    /// Probe and (where supported) enable writeback on the backing file.
     ///
     /// Best-effort: any ioctl failure leaves the device state unchanged.
-    pub fn new(fd: RawFd, read_only: bool) -> Self {
+    pub fn new(file: Arc<File>, read_only: bool) -> Self {
         if read_only {
-            return Self { fd, initial: None };
+            return Self {
+                file,
+                initial: None,
+            };
         }
-        Self::new_inner(fd)
+        Self::new_inner(file)
     }
 
     #[cfg(target_os = "illumos")]
-    fn new_inner(fd: RawFd) -> Self {
+    fn new_inner(file: Arc<File>) -> Self {
         let mut v: libc::c_int = 0;
-        if dkioc_wce(fd, DKIOCGETWCE, &mut v).is_err() {
+        if dkioc_wce(file.as_fd(), DKIOCGETWCE, &mut v).is_err() {
             // Not a disk device, or the backing store doesn't expose WCE
             // (regular files on illumos, iSCSI/COMSTAR targets, etc.).
-            return Self { fd, initial: None };
+            return Self {
+                file,
+                initial: None,
+            };
         }
         let initial = v != 0;
         if initial {
             // Already in writeback; nothing to do, nothing to restore.
-            return Self { fd, initial: None };
+            return Self {
+                file,
+                initial: None,
+            };
         }
         let mut enable: libc::c_int = 1;
-        if dkioc_wce(fd, DKIOCSETWCE, &mut enable).is_err() {
+        if dkioc_wce(file.as_fd(), DKIOCSETWCE, &mut enable).is_err() {
             // GET worked but SET refused — leave state alone.
-            return Self { fd, initial: None };
+            return Self {
+                file,
+                initial: None,
+            };
         }
         Self {
-            fd,
+            file,
             initial: Some(false),
         }
     }
 
     #[cfg(not(target_os = "illumos"))]
-    fn new_inner(fd: RawFd) -> Self {
-        Self { fd, initial: None }
+    fn new_inner(file: Arc<File>) -> Self {
+        Self {
+            file,
+            initial: None,
+        }
     }
 }
 
@@ -104,7 +106,7 @@ impl Drop for DiskCache {
         {
             if self.initial == Some(false) {
                 let mut v: libc::c_int = 0;
-                let _ = dkioc_wce(self.fd, DKIOCSETWCE, &mut v);
+                let _ = dkioc_wce(self.file.as_fd(), DKIOCSETWCE, &mut v);
             }
         }
     }
@@ -116,12 +118,14 @@ impl Drop for DiskCache {
 /// type promotion and the kernel reads/writes the expected 4 bytes.
 #[cfg(target_os = "illumos")]
 fn dkioc_wce(
-    fd: RawFd,
+    fd: BorrowedFd<'_>,
     cmd: libc::c_int,
     v: &mut libc::c_int,
 ) -> io::Result<()> {
-    // SAFETY: caller holds `fd` open for the duration of the call; `v`
-    // lives through the call and is the correct size for DKIOC{GET,SET}WCE.
-    unsafe { vmm_api_common::ioctl(fd, cmd, std::ptr::from_mut(v).cast()) }?;
+    // SAFETY: `v` lives through the call and is the size
+    // DKIOC{GET,SET}WCE reads and writes.
+    unsafe {
+        vmm_api_common::ioctl(fd.as_raw_fd(), cmd, std::ptr::from_mut(v).cast())
+    }?;
     Ok(())
 }

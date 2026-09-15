@@ -55,16 +55,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use vmm_machine::{CpuSlots, DeviceRegistry, HotplugEngines, HotplugError};
-use vmm_virtio::vsock::control::ControlSink;
-
-/// Longest value written back for one field. An id comes from the `-s`
-/// arguments, so an operator can make it long; the response line stays
-/// readable either way.
-const FIELD_MAX: usize = 64;
-
-/// Longest refusal written back. An error can quote a path the peer
-/// sent, so the line stays bounded.
-const REASON_MAX: usize = 200;
+use vmm_virtio::vsock::control::{ControlReply, ControlRequest, ControlSink};
 
 /// Placeholder for a device that is not on the PCI bus.
 const NO_BDF: &str = "-";
@@ -121,13 +112,13 @@ impl Inventory {
     }
 
     /// Build one device and report the id `device-remove` takes.
-    fn device_add(&self, spec: &str) -> String {
+    fn device_add(&self, spec: &str) -> ControlReply {
         let Some(engine) = self.hotplug.pci.as_ref() else {
-            return refused(&HotplugError::Disabled.to_string());
+            return ControlReply::refused(HotplugError::Disabled.to_string());
         };
         match engine.add_device(spec) {
-            Ok(id) => format!("OK {}", field(&id)),
-            Err(e) => refused(&e.to_string()),
+            Ok(id) => ControlReply::record([id]),
+            Err(e) => ControlReply::refused(e.to_string()),
         }
     }
 
@@ -136,70 +127,60 @@ impl Inventory {
     /// The answer says the request was recorded, not that the device is
     /// gone: only the guest can finish an eject, and a guest that never
     /// runs `_EJ0` leaves the slot pending for the life of the VM.
-    fn device_remove(&self, id: &str) -> String {
+    fn device_remove(&self, id: &str) -> ControlReply {
         let Some(engine) = self.hotplug.pci.as_ref() else {
-            return refused(&HotplugError::Disabled.to_string());
+            return ControlReply::refused(HotplugError::Disabled.to_string());
         };
         match engine.request_remove(id) {
-            Ok(()) => format!(
-                "OK {},{}",
-                field(id),
-                field(&vmm_machine::SlotState::RemovePending.to_string()),
-            ),
-            Err(e) => refused(&e.to_string()),
+            Ok(()) => ControlReply::record([
+                id.to_string(),
+                vmm_machine::SlotState::RemovePending.to_string(),
+            ]),
+            Err(e) => ControlReply::refused(e.to_string()),
         }
     }
 
-    fn device_list(&self) -> String {
-        let devices = self.registry.list();
-        let records = devices.iter().map(|device| {
-            let bdf = device
-                .bdf
-                .map_or_else(|| NO_BDF.to_string(), |bdf| bdf.to_string());
-            format!(
-                "{},{},{}",
-                field(&device.id),
-                field(&bdf),
-                field(&device.state.to_string()),
-            )
-        });
-        ok_list(devices.len(), records)
+    fn device_list(&self) -> ControlReply {
+        let records = self
+            .registry
+            .list()
+            .into_iter()
+            .map(|device| {
+                let bdf = device
+                    .bdf
+                    .map_or_else(|| NO_BDF.to_string(), |bdf| bdf.to_string());
+                vec![device.id, bdf, device.state.to_string()]
+            })
+            .collect();
+        ControlReply::list(records)
     }
 
     /// Bring one CPU online, and report the id that is now running.
-    ///
-    /// The argument is read before the engine is looked up, so a typo
-    /// is answered as a typo whatever the VM was started with. It is
-    /// never used as an index: the engine range-checks it as well.
-    fn cpu_add(&self, id: &str) -> String {
-        let Ok(id) = id.parse::<u32>() else {
-            return refused(&format!("{} is not a CPU id", field(id)));
-        };
+    fn cpu_add(&self, id: u32) -> ControlReply {
         let Some(cpus) = self.hotplug.cpu.as_ref() else {
-            return refused(CPU_HOTPLUG_OFF);
+            return ControlReply::refused(CPU_HOTPLUG_OFF);
         };
         match cpus.add(id) {
-            Ok(()) => format!("OK {id},present"),
-            Err(e) => refused(&e.to_string()),
+            Ok(()) => {
+                ControlReply::record([id.to_string(), "present".to_string()])
+            }
+            Err(e) => ControlReply::refused(e.to_string()),
         }
     }
 
     /// Give the guest more memory, and report the slot it went in.
     ///
     /// The size is BYTES. The engine rounds it up to a whole slot.
-    fn mem_add(&self, bytes: &str) -> String {
-        let Ok(bytes) = bytes.parse::<u64>() else {
-            return refused(&format!(
-                "{} is not a size in bytes",
-                field(bytes),
-            ));
-        };
+    fn mem_add(&self, bytes: u64) -> ControlReply {
         let Some(engine) = self.hotplug.mem.as_ref() else {
-            return refused(MEM_HOTPLUG_OFF);
+            return ControlReply::refused(MEM_HOTPLUG_OFF);
         };
         match engine.add_memory(bytes) {
-            Ok(slot) => format!("OK slot{slot},present"),
-            Err(e) => refused(&e.to_string()),
+            Ok(slot) => ControlReply::record([
+                format!("slot{slot}"),
+                "present".to_string(),
+            ]),
+            Err(e) => ControlReply::refused(e.to_string()),
         }
     }
 
@@ -208,11 +189,11 @@ impl Inventory {
     /// Every slot the MADT describes is listed, whether or not this VM
     /// can fill it: hiding the spare slots would contradict what the
     /// guest reads. `cpu-add` is what says whether one can be filled.
-    fn cpu_list(&self) -> String {
+    fn cpu_list(&self) -> ControlReply {
         let cpus = self.hotplug.cpu.as_ref();
         // With an engine, its ceiling is the one an add is checked
-        // against. The two agree: both come from `Cli::max_cpus`, which
-        // is already capped at the kernel's 64.
+        // against. The two agree: both come from `VmOpts::max_cpus`,
+        // which is already capped at the kernel's 64.
         let max_cpus = cpus.map_or(self.max_cpus, CpuSlots::max_cpus);
         let boot_cpus = cpus.map_or(self.num_cpus, CpuSlots::boot_cpus);
         // A set, never a slice indexed by an id. The ids come from the
@@ -224,25 +205,32 @@ impl Inventory {
             .into_iter()
             .collect();
 
-        let records = (0..max_cpus).map(|id| {
-            let state = if consumed.contains(&id) {
-                "consumed"
-            } else if cpus.map_or(id < boot_cpus, |cpus| cpus.is_online(id)) {
-                "present"
-            } else {
-                "absent"
-            };
-            let kind = if id < boot_cpus { "boot" } else { "hotplug" };
-            format!("{id},{state},{kind}")
-        });
-        ok_list(max_cpus as usize, records)
+        let records = (0..max_cpus)
+            .map(|id| {
+                let state = if consumed.contains(&id) {
+                    "consumed"
+                } else if cpus.map_or(id < boot_cpus, |cpus| cpus.is_online(id))
+                {
+                    "present"
+                } else {
+                    "absent"
+                };
+                let kind = if id < boot_cpus { "boot" } else { "hotplug" };
+                vec![id.to_string(), state.to_string(), kind.to_string()]
+            })
+            .collect();
+        ControlReply::list(records)
     }
 
     /// The boot memory, and the hot-add window when the VM has one.
-    fn mem_list(&self) -> String {
-        let boot = format!("boot,{},present", self.mem_size);
+    fn mem_list(&self) -> ControlReply {
+        let boot = vec![
+            "boot".to_string(),
+            self.mem_size.to_string(),
+            "present".to_string(),
+        ];
         let Some(engine) = self.hotplug.mem.as_ref() else {
-            return ok_list(1, [boot].into_iter());
+            return ControlReply::list(vec![boot]);
         };
 
         let mut records = vec![boot];
@@ -251,7 +239,7 @@ impl Inventory {
             engine.slots_used(),
             engine.bytes_added(),
         ));
-        ok_list(records.len(), records.into_iter())
+        ControlReply::list(records)
     }
 }
 
@@ -263,111 +251,32 @@ fn window_records(
     window: &vmm_machine::MemWindow,
     slots_used: usize,
     added: u64,
-) -> [String; 5] {
-    [
-        format!("window,{},present", window.size()),
-        format!("slot-size,{},present", window.slot_size()),
-        format!("slot-count,{},present", window.slots()),
-        format!("slots-used,{slots_used},present"),
-        format!("added,{added},present"),
+) -> Vec<Vec<String>> {
+    let record = |name: &str, value: String| {
+        vec![name.to_string(), value, "present".to_string()]
+    };
+    vec![
+        record("window", window.size().to_string()),
+        record("slot-size", window.slot_size().to_string()),
+        record("slot-count", window.slots().to_string()),
+        record("slots-used", slots_used.to_string()),
+        record("added", added.to_string()),
     ]
 }
 
 impl ControlSink for Inventory {
-    fn handle_line(&self, line: &str) -> String {
-        let mut fields = line.split_whitespace();
-        // Read all three up front: a match guard cannot advance the
-        // iterator. A `-s` spec carries no space, so one field is a
-        // whole spec and a second means the request is malformed.
-        let verb = fields.next().unwrap_or("");
-        let argument = fields.next();
-        let extra = fields.next();
-
-        match (verb, argument, extra) {
-            ("device-list", None, _) => self.device_list(),
-            ("cpu-list", None, _) => self.cpu_list(),
-            ("mem-list", None, _) => self.mem_list(),
-            ("device-add", Some(spec), None) => self.device_add(spec),
-            ("device-remove", Some(id), None) => self.device_remove(id),
-            ("cpu-add", Some(id), None) => self.cpu_add(id),
-            ("mem-add", Some(bytes), None) => self.mem_add(bytes),
-            // Recognised so the answer says why, rather than reading as
-            // a typo the operator can fix.
-            ("cpu-remove", _, _) => refused(NO_CPU_REMOVE),
-            ("mem-remove", _, _) => refused(NO_MEM_REMOVE),
-            ("", _, _) => "ERR empty request".to_string(),
-            ("device-list" | "cpu-list" | "mem-list", Some(_), _) => {
-                format!("ERR {} takes no argument", field(verb))
-            }
-            (
-                "device-add" | "device-remove" | "cpu-add" | "mem-add",
-                None,
-                _,
-            ) => format!("ERR {} needs one argument", field(verb)),
-            (
-                "device-add" | "device-remove" | "cpu-add" | "mem-add",
-                Some(_),
-                Some(_),
-            ) => format!("ERR {} takes one argument", field(verb)),
-            _ => format!("ERR unknown command {}", field(verb)),
+    fn handle(&self, request: ControlRequest) -> ControlReply {
+        match request {
+            ControlRequest::DeviceList => self.device_list(),
+            ControlRequest::CpuList => self.cpu_list(),
+            ControlRequest::MemList => self.mem_list(),
+            ControlRequest::DeviceAdd(spec) => self.device_add(&spec),
+            ControlRequest::DeviceRemove(id) => self.device_remove(&id),
+            ControlRequest::CpuAdd(id) => self.cpu_add(id),
+            ControlRequest::MemAdd(bytes) => self.mem_add(bytes),
+            ControlRequest::CpuRemove => ControlReply::refused(NO_CPU_REMOVE),
+            ControlRequest::MemRemove => ControlReply::refused(NO_MEM_REMOVE),
         }
-    }
-}
-
-/// `OK <count>` and then one field per record.
-fn ok_list(count: usize, records: impl Iterator<Item = String>) -> String {
-    let mut out = format!("OK {count}");
-    for record in records {
-        out.push(' ');
-        out.push_str(&record);
-    }
-    out
-}
-
-/// One refusal line, safe to put on the wire.
-///
-/// Takes text, not one error type: the three engines have three error
-/// types and every one of them can quote a value the peer sent. So the
-/// text is capped and stripped down to printable ASCII. Spaces stay:
-/// the grammar makes a refusal one reason, not a field list.
-fn refused(reason: &str) -> String {
-    let cleaned: String = reason
-        .chars()
-        .take(REASON_MAX)
-        .map(|c| {
-            if c.is_ascii_graphic() || c == ' ' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("ERR {cleaned}")
-}
-
-/// One field value, safe to put on the wire.
-///
-/// The grammar separates fields by spaces and values by commas, and an
-/// operator reads the answer on a terminal. So an id that came from the
-/// command line keeps only plain characters, and the length is capped.
-fn field(value: &str) -> String {
-    let cleaned: String = value
-        .chars()
-        .take(FIELD_MAX)
-        .map(|c| {
-            if c.is_ascii_alphanumeric()
-                || matches!(c, '-' | '_' | '.' | '@' | ':')
-            {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() {
-        NO_BDF.to_string()
-    } else {
-        cleaned
     }
 }
 
@@ -381,6 +290,11 @@ mod tests {
     };
 
     use super::*;
+    use vmm_virtio::vsock::control::{answer_line, FIELD_MAX, REASON_MAX};
+
+    fn line(inv: &Inventory, request: &str) -> String {
+        answer_line(inv, request)
+    }
 
     /// A machine with no hot-add engine at all. The default: without
     /// `--hotplug` the guest has no interface to answer on.
@@ -511,7 +425,7 @@ mod tests {
         ]));
 
         assert_eq!(
-            inv.handle_line("device-list"),
+            line(&inv, "device-list"),
             "OK 2 virtio-blk@4,0.4.0,present virtio-vsock@5,0.5.0,present"
         );
     }
@@ -522,20 +436,20 @@ mod tests {
         // counting fields per device.
         let inv = inventory(with_devices(&[("varstore", None)]));
 
-        assert_eq!(inv.handle_line("device-list"), "OK 1 varstore,-,present");
+        assert_eq!(line(&inv, "device-list"), "OK 1 varstore,-,present");
     }
 
     #[test]
     fn an_empty_registry_answers_with_a_zero_count() {
         let inv = inventory(DeviceRegistry::new());
-        assert_eq!(inv.handle_line("device-list"), "OK 0");
+        assert_eq!(line(&inv, "device-list"), "OK 0");
     }
 
     #[test]
     fn cpu_list_reports_one_record_per_boot_cpu() {
         let inv = inventory(DeviceRegistry::new());
         assert_eq!(
-            inv.handle_line("cpu-list"),
+            line(&inv, "cpu-list"),
             "OK 2 0,present,boot 1,present,boot"
         );
     }
@@ -555,12 +469,12 @@ mod tests {
         );
 
         assert_eq!(
-            inv.handle_line("cpu-list"),
+            line(&inv, "cpu-list"),
             "OK 4 0,present,boot 1,present,boot 2,absent,hotplug \
              3,absent,hotplug"
         );
         assert_eq!(
-            inv.handle_line("cpu-add 2"),
+            line(&inv, "cpu-add 2"),
             "ERR CPU hot-add needs --hotplug and -c cpus=N,maxcpus=M",
         );
     }
@@ -570,7 +484,7 @@ mod tests {
         let inv = inventory_with_cpus(FakeCpus::new(4, 2));
 
         assert_eq!(
-            inv.handle_line("cpu-list"),
+            line(&inv, "cpu-list"),
             "OK 4 0,present,boot 1,present,boot 2,absent,hotplug \
              3,absent,hotplug"
         );
@@ -580,9 +494,9 @@ mod tests {
     fn cpu_list_shows_a_cpu_that_was_hot_added() {
         let inv = inventory_with_cpus(FakeCpus::new(4, 2));
 
-        assert_eq!(inv.handle_line("cpu-add 3"), "OK 3,present");
+        assert_eq!(line(&inv, "cpu-add 3"), "OK 3,present");
 
-        let listed = inv.handle_line("cpu-list");
+        let listed = line(&inv, "cpu-list");
         assert!(listed.contains("3,present,hotplug"), "{listed}");
         assert!(listed.contains("2,absent,hotplug"), "{listed}");
     }
@@ -598,12 +512,12 @@ mod tests {
             VcpuError::ThreadGone(3),
         ));
 
-        assert!(inv.handle_line("cpu-add 3").starts_with("ERR "));
+        assert!(line(&inv, "cpu-add 3").starts_with("ERR "));
 
-        let listed = inv.handle_line("cpu-list");
+        let listed = line(&inv, "cpu-list");
         assert!(listed.contains("3,consumed,hotplug"), "{listed}");
         assert_eq!(
-            inv.handle_line("cpu-add 3"),
+            line(&inv, "cpu-add 3"),
             "ERR vCPU 3 was consumed by a failed add: the kernel cannot \
              deactivate a vCPU, so the id cannot be reused"
         );
@@ -614,11 +528,11 @@ mod tests {
         let inv = inventory_with_cpus(FakeCpus::new(4, 2));
 
         assert_eq!(
-            inv.handle_line("cpu-add 4"),
+            line(&inv, "cpu-add 4"),
             "ERR vCPU 4 is not one of the 4 CPU slots"
         );
         assert_eq!(
-            inv.handle_line("cpu-add 0"),
+            line(&inv, "cpu-add 0"),
             "ERR vCPU 0 is a boot CPU and is online already"
         );
     }
@@ -629,10 +543,10 @@ mod tests {
         // a typo whatever the VM was started with.
         let inv = inventory_with_cpus(FakeCpus::new(4, 2));
 
-        assert_eq!(inv.handle_line("cpu-add two"), "ERR two is not a CPU id");
-        assert_eq!(inv.handle_line("cpu-add -1"), "ERR -1 is not a CPU id");
+        assert_eq!(line(&inv, "cpu-add two"), "ERR two is not a CPU id");
+        assert_eq!(line(&inv, "cpu-add -1"), "ERR -1 is not a CPU id");
         assert_eq!(
-            inv.handle_line("cpu-add 99999999999999999999"),
+            line(&inv, "cpu-add 99999999999999999999"),
             "ERR 99999999999999999999 is not a CPU id",
         );
     }
@@ -641,7 +555,7 @@ mod tests {
     fn a_hostile_cpu_id_cannot_reach_the_operator_terminal() {
         let inv = inventory(DeviceRegistry::new());
 
-        let line = inv.handle_line("cpu-add \u{1b}[2Jwiped");
+        let line = line(&inv, "cpu-add \u{1b}[2Jwiped");
 
         assert_eq!(line, "ERR __2Jwiped is not a CPU id");
         assert!(!line.contains('\n'));
@@ -650,7 +564,7 @@ mod tests {
     #[test]
     fn mem_list_reports_the_boot_memory() {
         let inv = inventory(DeviceRegistry::new());
-        assert_eq!(inv.handle_line("mem-list"), "OK 1 boot,1073741824,present");
+        assert_eq!(line(&inv, "mem-list"), "OK 1 boot,1073741824,present");
     }
 
     #[test]
@@ -667,14 +581,10 @@ mod tests {
         let records = window_records(&window, 1, 1024 * 1024 * 1024);
 
         assert_eq!(
-            records,
-            [
-                "window,4294967296,present".to_string(),
-                "slot-size,1073741824,present".to_string(),
-                "slot-count,4,present".to_string(),
-                "slots-used,1,present".to_string(),
-                "added,1073741824,present".to_string(),
-            ],
+            ControlReply::list(records).render(),
+            "OK 5 window,4294967296,present slot-size,1073741824,present \
+             slot-count,4,present slots-used,1,present \
+             added,1073741824,present",
         );
     }
 
@@ -683,13 +593,10 @@ mod tests {
         let inv = inventory(DeviceRegistry::new());
 
         assert_eq!(
-            inv.handle_line("mem-add 512M"),
+            line(&inv, "mem-add 512M"),
             "ERR 512M is not a size in bytes",
         );
-        assert_eq!(
-            inv.handle_line("mem-add -1"),
-            "ERR -1 is not a size in bytes"
-        );
+        assert_eq!(line(&inv, "mem-add -1"), "ERR -1 is not a size in bytes");
     }
 
     #[test]
@@ -713,12 +620,12 @@ mod tests {
         let inv = inventory(DeviceRegistry::new());
 
         assert_eq!(
-            inv.handle_line("cpu-remove 3"),
+            line(&inv, "cpu-remove 3"),
             "ERR cpu-remove is not supported: illumos has no \
              vm_deactivate_cpu, so an active vCPU cannot be taken back"
         );
         assert_eq!(
-            inv.handle_line("mem-remove slot0"),
+            line(&inv, "mem-remove slot0"),
             "ERR mem-remove is not supported: illumos has no \
              VM_FREE_MEMSEG, so a memory segment lives until the VM does"
         );
@@ -728,11 +635,11 @@ mod tests {
     fn an_unknown_verb_is_refused() {
         let inv = inventory(DeviceRegistry::new());
         assert_eq!(
-            inv.handle_line("device-plug 4,virtio-blk,/d.img"),
+            line(&inv, "device-plug 4,virtio-blk,/d.img"),
             "ERR unknown command device-plug"
         );
         assert_eq!(
-            inv.handle_line("DEVICE-LIST"),
+            line(&inv, "DEVICE-LIST"),
             "ERR unknown command DEVICE-LIST"
         );
     }
@@ -744,8 +651,8 @@ mod tests {
         let inv = inventory(DeviceRegistry::new());
         let refused = "ERR this VM was not started with --hotplug";
 
-        assert_eq!(inv.handle_line("device-add 5,virtio-blk,/d.img"), refused);
-        assert_eq!(inv.handle_line("device-remove virtio-blk@5"), refused);
+        assert_eq!(line(&inv, "device-add 5,virtio-blk,/d.img"), refused);
+        assert_eq!(line(&inv, "device-remove virtio-blk@5"), refused);
     }
 
     #[test]
@@ -755,11 +662,11 @@ mod tests {
         let inv = inventory(DeviceRegistry::new());
 
         assert_eq!(
-            inv.handle_line("cpu-add 3"),
+            line(&inv, "cpu-add 3"),
             "ERR CPU hot-add needs --hotplug and -c cpus=N,maxcpus=M",
         );
         assert_eq!(
-            inv.handle_line("mem-add 134217728"),
+            line(&inv, "mem-add 134217728"),
             "ERR memory hot-add needs --hotplug and -o hotplug.maxmem=SIZE",
         );
     }
@@ -771,7 +678,7 @@ mod tests {
         let inv = inventory_with_cpus(FakeCpus::new(4, 2));
 
         assert_eq!(
-            inv.handle_line("mem-add 134217728"),
+            line(&inv, "mem-add 134217728"),
             "ERR memory hot-add needs --hotplug and -o hotplug.maxmem=SIZE",
         );
     }
@@ -783,27 +690,21 @@ mod tests {
         let inv = inventory(DeviceRegistry::new());
 
         assert_eq!(
-            inv.handle_line("device-add"),
+            line(&inv, "device-add"),
             "ERR device-add needs one argument"
         );
         assert_eq!(
-            inv.handle_line("device-remove"),
+            line(&inv, "device-remove"),
             "ERR device-remove needs one argument"
         );
         assert_eq!(
-            inv.handle_line("device-add 5,virtio-blk, /d.img"),
+            line(&inv, "device-add 5,virtio-blk, /d.img"),
             "ERR device-add takes one argument"
         );
+        assert_eq!(line(&inv, "cpu-add"), "ERR cpu-add needs one argument");
+        assert_eq!(line(&inv, "mem-add"), "ERR mem-add needs one argument");
         assert_eq!(
-            inv.handle_line("cpu-add"),
-            "ERR cpu-add needs one argument"
-        );
-        assert_eq!(
-            inv.handle_line("mem-add"),
-            "ERR mem-add needs one argument"
-        );
-        assert_eq!(
-            inv.handle_line("mem-add 128 MiB"),
+            line(&inv, "mem-add 128 MiB"),
             "ERR mem-add takes one argument"
         );
     }
@@ -813,10 +714,11 @@ mod tests {
         // An error quotes the spec the peer sent, so a control sequence
         // in it would otherwise be read by whatever terminal shows the
         // answer.
-        let line = refused(
-            &HotplugError::BadSpec("\u{1b}[2Jwiped\nOK 0".to_string())
+        let line = ControlReply::refused(
+            HotplugError::BadSpec("\u{1b}[2Jwiped\nOK 0".to_string())
                 .to_string(),
-        );
+        )
+        .render();
 
         // The escape introducer is gone, so the rest is inert text.
         assert_eq!(line, "ERR bad spec: _[2Jwiped_OK 0");
@@ -826,7 +728,9 @@ mod tests {
     #[test]
     fn a_long_refusal_is_capped() {
         let long = "a".repeat(REASON_MAX * 2);
-        let line = refused(&HotplugError::BadSpec(long).to_string());
+        let line =
+            ControlReply::refused(HotplugError::BadSpec(long).to_string())
+                .render();
 
         assert_eq!(line.len(), REASON_MAX + "ERR ".len());
     }
@@ -837,7 +741,7 @@ mod tests {
         // `device-list <id>` look like it filtered.
         let inv = inventory(DeviceRegistry::new());
         assert_eq!(
-            inv.handle_line("device-list all"),
+            line(&inv, "device-list all"),
             "ERR device-list takes no argument"
         );
     }
@@ -845,7 +749,7 @@ mod tests {
     #[test]
     fn a_blank_request_is_refused() {
         let inv = inventory(DeviceRegistry::new());
-        assert_eq!(inv.handle_line(""), "ERR empty request");
+        assert_eq!(line(&inv, ""), "ERR empty request");
     }
 
     #[test]
@@ -856,7 +760,7 @@ mod tests {
         let inv = inventory(with_devices(&[("evil id,0.0.0,absent", None)]));
 
         assert_eq!(
-            inv.handle_line("device-list"),
+            line(&inv, "device-list"),
             "OK 1 evil_id_0.0.0_absent,-,present"
         );
     }
@@ -867,7 +771,7 @@ mod tests {
         // whatever terminal reads the answer.
         let inv = inventory(with_devices(&[("\u{1b}[2Jwiped", None)]));
 
-        assert_eq!(inv.handle_line("device-list"), "OK 1 __2Jwiped,-,present");
+        assert_eq!(line(&inv, "device-list"), "OK 1 __2Jwiped,-,present");
     }
 
     #[test]
@@ -875,13 +779,13 @@ mod tests {
         let long = "a".repeat(FIELD_MAX * 2);
         let inv = inventory(with_devices(&[(long.as_str(), None)]));
 
-        let answer = inv.handle_line("device-list");
+        let answer = line(&inv, "device-list");
         assert_eq!(answer, format!("OK 1 {},-,present", "a".repeat(FIELD_MAX)));
     }
 
     #[test]
     fn an_unknown_verb_is_echoed_safely() {
         let inv = inventory(DeviceRegistry::new());
-        assert_eq!(inv.handle_line("\u{1b}[2J"), "ERR unknown command __2J");
+        assert_eq!(line(&inv, "\u{1b}[2J"), "ERR unknown command __2J");
     }
 }

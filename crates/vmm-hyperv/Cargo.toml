@@ -13,5 +13,4 @@ vmm_core.workspace = true
 bhyve_api.workspace = true
 slog.workspace = true
 bitflags.workspace = true
-serde.workspace = true
 thiserror.workspace = true

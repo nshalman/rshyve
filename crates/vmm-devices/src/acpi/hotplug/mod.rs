@@ -16,6 +16,14 @@ pub(super) mod cpu;
 pub(super) mod mem;
 pub(super) mod pci;
 
+/// ACPI 6.5, table 6.16: rescan the device and bind a driver.
+const NOTIFY_DEVICE_CHECK: u8 = 1;
+/// ACPI 6.5, table 6.16: unbind the driver, then run `_EJ0`.
+const NOTIFY_EJECT_REQUEST: u8 = 3;
+/// `_STA` for a device that is present, enabled, shown, and
+/// functioning. ACPI 6.5, section 6.3.7.
+const STA_PRESENT: u8 = 0x0F;
+
 /// Emit every hotplug controller and slot device under `\_SB`.
 pub(super) fn emit_devices(sb: &mut Aml, cfg: &AcpiConfig) {
     pci::emit_devices(sb, cfg);

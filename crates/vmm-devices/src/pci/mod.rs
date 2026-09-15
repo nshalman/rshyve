@@ -236,11 +236,6 @@ impl PioCfgDecoder {
     pub fn addr(&self) -> u32 {
         *self.addr.lock().unwrap()
     }
-
-    /// Set the config address register directly (for migration).
-    pub fn set_addr(&self, addr: u32) {
-        *self.addr.lock().unwrap() = addr;
-    }
 }
 
 impl Default for PioCfgDecoder {

@@ -23,7 +23,6 @@ pub mod bits;
 
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -32,18 +31,20 @@ use std::time::Duration;
 use vmm_core::common::RWOp;
 
 /// Page size for NVMe PRP entries (4 KiB).
-const PAGE_SIZE: usize = 4096;
+use vmm_core::common::PAGE_SIZE;
 use vmm_core::hdl::VmmHdl;
-use vmm_core::mem::{MemCtx, PhysMap, SubMapping};
+use vmm_core::mem::{GuestIoVec, MemCtx, PhysMap};
 use vmm_core::mmio::{MmioBus, MmioFn};
 
-use vmm_devices::blkdev::{datasync, DiskCache};
+use vmm_devices::blkdev::DiskCache;
 use vmm_devices::lifecycle::Indicator;
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use vmm_devices::pci::msix::{HdlMsiSink, MsixTable};
 use vmm_devices::pci::BarN;
-use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
+use vmm_devices::{
+    DeviceMigrateState, FlushError, FlushIntent, Lifecycle, QuiesceGate,
+};
 
 use bits::*;
 
@@ -164,12 +165,10 @@ pub struct NvmeController {
     self_ref: Mutex<Option<std::sync::Weak<Self>>>,
     /// Structured logger for bus registration diagnostics.
     log: slog::Logger,
-    /// Zvol write-cache control. Declared BEFORE `_file` so Drop runs
-    /// `DKIOCSETWCE` restore while the fd is still open.
+    /// Zvol write-cache control.
     _cache: DiskCache,
-    /// Backing file kept alive for the raw fd used by I/O workers.
-    /// Dropped (and fd closed) when the controller is dropped.
-    _file: File,
+    /// The backing store, shared with every I/O worker.
+    _file: Arc<File>,
     /// Lifecycle state indicator.
     indicator: Indicator,
     gate: Arc<QuiesceGate>,
@@ -217,12 +216,12 @@ impl NvmeController {
         bus_mmio: Arc<MmioBus>,
         log: slog::Logger,
     ) -> Arc<Self> {
-        let raw_fd = file.as_raw_fd();
+        let file = Arc::new(file);
 
         // Enable zvol writeback cache (DKIOCSETWCE=1). NVMe's protocol has
         // explicit FLUSH semantics, matching the writeback contract. Must
         // happen before any I/O so first writes hit the fast path.
-        let cache = DiskCache::new(raw_fd, read_only);
+        let cache = DiskCache::new(Arc::clone(&file), read_only);
 
         // Determine disk geometry
         let file_len = file
@@ -328,7 +327,7 @@ impl NvmeController {
             self_ref: Mutex::new(None),
             log,
             _cache: cache,
-            _file: file,
+            _file: Arc::clone(&file),
             indicator: Indicator::new(),
             gate: Arc::clone(&gate),
         });
@@ -344,12 +343,13 @@ impl NvmeController {
             let msix = Arc::clone(&msix);
             let state_ref = Arc::clone(&ctrl);
             let gate = Arc::clone(&gate);
+            let file = Arc::clone(&file);
 
             thread::Builder::new()
                 .name(format!("nvme-io-{}", i))
                 .spawn(move || {
                     io_worker(
-                        rx, raw_fd, read_only, physmap, msix, state_ref, gate,
+                        rx, file, read_only, physmap, msix, state_ref, gate,
                     );
                 })
                 .expect("nvme: failed to spawn I/O worker thread");
@@ -1322,20 +1322,17 @@ fn prp_collect(
     Ok(segments)
 }
 
-/// Resolve PRP entries into iovecs pointing directly into guest mmap'd memory.
+/// Resolve PRP entries into a scatter list over guest memory.
 ///
-/// Returns a Vec of (iovec, SubMapping) pairs. The SubMappings must be
-/// kept alive for the duration of the preadv/pwritev call — they pin
-/// the guest memory pages in our process address space.
-///
-/// This is the zero-copy I/O path: no intermediate buffer, no copies.
-fn prp_to_iovecs(
+/// The list pins the guest pages, so the transfer goes straight to
+/// them: no intermediate buffer, no copies.
+fn prp_to_iovec(
     physmap: &PhysMap,
     prp1: u64,
     prp2: u64,
     total_len: usize,
-) -> io::Result<Vec<(libc::iovec, SubMapping)>> {
-    let mut result = Vec::with_capacity(16);
+) -> io::Result<GuestIoVec> {
+    let mut result = GuestIoVec::with_capacity(16);
     let mut remaining = total_len;
 
     if remaining == 0 {
@@ -1348,11 +1345,7 @@ fn prp_to_iovecs(
     let sub = physmap.lookup(prp1, first_len).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "PRP1 unmapped")
     })?;
-    let iov = libc::iovec {
-        iov_base: unsafe { sub.as_ptr() } as *mut libc::c_void,
-        iov_len: first_len,
-    };
-    result.push((iov, sub));
+    result.push(sub);
     remaining -= first_len;
 
     if remaining == 0 {
@@ -1364,11 +1357,7 @@ fn prp_to_iovecs(
         let sub = physmap.lookup(prp2, remaining).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "PRP2 unmapped")
         })?;
-        let iov = libc::iovec {
-            iov_base: unsafe { sub.as_ptr() } as *mut libc::c_void,
-            iov_len: remaining,
-        };
-        result.push((iov, sub));
+        result.push(sub);
         return Ok(result);
     }
 
@@ -1390,11 +1379,7 @@ fn prp_to_iovecs(
         let sub = physmap.lookup(page_addr, seg_len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "PRP page unmapped")
         })?;
-        let iov = libc::iovec {
-            iov_base: unsafe { sub.as_ptr() } as *mut libc::c_void,
-            iov_len: seg_len,
-        };
-        result.push((iov, sub));
+        result.push(sub);
         remaining -= seg_len;
         entry_idx += 1;
     }
@@ -1435,7 +1420,7 @@ fn write_to_prp(
 /// Each completed request posts a CQE to guest memory and fires MSI-X.
 fn io_worker(
     rx: Arc<Mutex<mpsc::Receiver<IoRequest>>>,
-    raw_fd: i32,
+    file: Arc<File>,
     read_only: bool,
     physmap: Arc<PhysMap>,
     msix: Arc<MsixTable>,
@@ -1460,7 +1445,7 @@ fn io_worker(
         };
 
         let status =
-            process_io_request(&req, raw_fd, read_only, &physmap, &ctrl);
+            process_io_request(&req, &file, read_only, &physmap, &ctrl);
         // Post completion: need to lock state briefly to access the CQ
         let mem = MemCtx::new(Arc::clone(&physmap));
         let sq_head = {
@@ -1493,7 +1478,7 @@ fn io_worker(
 /// Returns the NVMe status code for the completion entry.
 fn process_io_request(
     req: &IoRequest,
-    raw_fd: i32,
+    file: &File,
     read_only: bool,
     physmap: &Arc<PhysMap>,
     ctrl: &NvmeController,
@@ -1534,63 +1519,39 @@ fn process_io_request(
     match req.opcode {
         NVM_OPC_READ => {
             // Zero-copy: preadv directly into guest mmap'd pages
-            let iovecs_subs =
-                match prp_to_iovecs(physmap, req.prp1, req.prp2, byte_count) {
-                    Ok(v) => v,
-                    Err(_) => return SC_DATA_XFER_ERROR,
-                };
-            let iovecs: Vec<libc::iovec> =
-                iovecs_subs.iter().map(|(iov, _)| *iov).collect();
-            let nread = unsafe {
-                libc::preadv(
-                    raw_fd,
-                    iovecs.as_ptr(),
-                    iovecs.len() as libc::c_int,
-                    byte_offset as libc::off_t,
-                )
-            };
-            // SubMappings in iovecs_subs keep guest pages pinned until here
-            drop(iovecs_subs);
-            if nread < 0 || nread as usize != byte_count {
+            let Ok(iov) = prp_to_iovec(physmap, req.prp1, req.prp2, byte_count)
+            else {
                 return SC_DATA_XFER_ERROR;
+            };
+            match iov.read_from(file, byte_offset) {
+                Ok(n) if n == byte_count => SC_SUCCESS,
+                _ => SC_DATA_XFER_ERROR,
             }
-            SC_SUCCESS
         }
         NVM_OPC_WRITE => {
             if read_only {
                 return SC_DATA_XFER_ERROR;
             }
             // Zero-copy: pwritev directly from guest mmap'd pages
-            let iovecs_subs =
-                match prp_to_iovecs(physmap, req.prp1, req.prp2, byte_count) {
-                    Ok(v) => v,
-                    Err(_) => return SC_DATA_XFER_ERROR,
-                };
-            let iovecs: Vec<libc::iovec> =
-                iovecs_subs.iter().map(|(iov, _)| *iov).collect();
-            let nwritten = unsafe {
-                libc::pwritev(
-                    raw_fd,
-                    iovecs.as_ptr(),
-                    iovecs.len() as libc::c_int,
-                    byte_offset as libc::off_t,
-                )
-            };
-            drop(iovecs_subs);
-            if nwritten < 0 || nwritten as usize != byte_count {
+            let Ok(iov) = prp_to_iovec(physmap, req.prp1, req.prp2, byte_count)
+            else {
                 return SC_DATA_XFER_ERROR;
+            };
+            match iov.write_to(file, byte_offset) {
+                Ok(n) if n == byte_count => {}
+                _ => return SC_DATA_XFER_ERROR,
             }
             // FUA: Identify Controller advertises VWC=1, so FUA writes
             // must be durable before completion. Without this, a guest
             // filesystem journal commit can report success while the data
             // still lives in zvol writeback cache.
-            if req.fua && datasync(raw_fd) != 0 {
+            if req.fua && file.sync_data().is_err() {
                 return SC_INTERNAL_ERROR;
             }
             SC_SUCCESS
         }
         NVM_OPC_FLUSH => {
-            if datasync(raw_fd) != 0 {
+            if file.sync_data().is_err() {
                 return SC_INTERNAL_ERROR;
             }
             SC_SUCCESS
@@ -1675,9 +1636,7 @@ impl Lifecycle for NvmeController {
         )
     }
 
-    fn export_nvme_state(
-        &self,
-    ) -> Option<vmm_devices::lifecycle::NvmeMigrateState> {
+    fn export_migrate_state(&self) -> Option<DeviceMigrateState> {
         use vmm_devices::lifecycle::{
             NvmeMigrateCq, NvmeMigrateSq, NvmeMigrateState,
         };
@@ -1753,7 +1712,7 @@ impl Lifecycle for NvmeController {
             st.cc, st.csts, st.aqa, st.num_io_queues, msix_enabled,
         );
 
-        Some(NvmeMigrateState {
+        Some(DeviceMigrateState::Nvme(NvmeMigrateState {
             cc: st.cc,
             csts: st.csts,
             aqa: st.aqa,
@@ -1768,13 +1727,13 @@ impl Lifecycle for NvmeController {
             pci_bar_addrs,
             msix_entries,
             msix_enabled,
-        })
+        }))
     }
 
-    fn restore_nvme_state(
-        &self,
-        mig: &vmm_devices::lifecycle::NvmeMigrateState,
-    ) {
+    fn restore_migrate_state(&self, state: &DeviceMigrateState) {
+        let DeviceMigrateState::Nvme(mig) = state else {
+            return;
+        };
         eprintln!(
             "[nvme-restore] cc={:#x} csts={:#x} aqa={:#x} io_queues={} msix_enabled={}",
             mig.cc, mig.csts, mig.aqa, mig.num_io_queues, mig.msix_enabled,

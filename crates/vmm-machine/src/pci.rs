@@ -20,6 +20,7 @@ use vmm_core::pio::PioBus;
 use vmm_devices::chipset::i440fx::I440FxChipset;
 use vmm_devices::InputBroker;
 
+use crate::devspec;
 use crate::parse::parse_bdf;
 use crate::registry::{DeviceRegistry, RegisteredDevice, RegistryError};
 
@@ -138,23 +139,6 @@ pub struct PciAttachment {
     pub registry: Arc<DeviceRegistry>,
 }
 
-/// The leading `slot` field of a `slot,driver[,config]` spec.
-fn spec_slot(spec: &str) -> &str {
-    spec.split(',').next().unwrap_or("").trim()
-}
-
-/// Stable, operator-facing id for a `slot,driver[,config]` spec.
-///
-/// The slot field makes it unique: the PCI bus refuses a second device
-/// at one BDF, so no two specs share a slot.
-fn spec_device_id(spec: &str) -> String {
-    let slot = spec_slot(spec);
-    match spec.split(',').nth(1).map(str::trim) {
-        Some(driver) if !driver.is_empty() => format!("{driver}@{slot}"),
-        _ => slot.to_string(),
-    }
-}
-
 fn push_created(
     spec: &str,
     created: CreatedPciDevice,
@@ -168,8 +152,8 @@ fn push_created(
     }
 
     out.registry.insert(RegisteredDevice::new(
-        spec_device_id(spec),
-        parse_bdf(spec_slot(spec)),
+        devspec::device_id(spec),
+        parse_bdf(devspec::parts(spec).slot),
         pci,
         lifecycle,
         Some(spec.to_string()),
@@ -233,8 +217,8 @@ mod tests {
     use vmm_devices::Lifecycle;
 
     use super::{
-        attach_each, push_created, spec_device_id, CreatedPciDevice,
-        LifecycleHandle, PciAttachment, PciDeviceHandle,
+        attach_each, push_created, CreatedPciDevice, LifecycleHandle,
+        PciAttachment, PciDeviceHandle,
     };
     use crate::registry::{RegistryError, SlotState};
 
@@ -324,13 +308,6 @@ mod tests {
         assert_eq!(dev.spec.as_deref(), Some("4:1,virtio-blk,/disk"));
         assert_eq!(dev.state, SlotState::Present);
         assert!(!dev.hotpluggable);
-    }
-
-    #[test]
-    fn spec_device_id_falls_back_to_the_slot() {
-        assert_eq!(spec_device_id("4,virtio-blk,/disk"), "virtio-blk@4");
-        assert_eq!(spec_device_id("0"), "0");
-        assert_eq!(spec_device_id("0,"), "0");
     }
 
     #[test]

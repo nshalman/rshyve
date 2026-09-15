@@ -318,58 +318,6 @@ fn avail_event(physmap: &PhysMap, queue: &VirtQueue) -> u16 {
         .expect("read avail event")
 }
 
-#[test]
-fn config_requires_a_path() {
-    let err = parse_fs_config("").expect_err("empty config");
-    assert_eq!(err.to_string(), "virtio-fs requires a host directory path");
-}
-
-#[test]
-fn tag_defaults_to_the_last_path_component() {
-    let opts = parse_fs_config("/export/shared").expect("parse");
-    assert_eq!(opts.tag, "shared");
-    assert_eq!(opts.path, std::path::PathBuf::from("/export/shared"));
-    assert!(!opts.read_only);
-    assert_eq!(opts.queue_size, FS_QUEUE_SIZE_DEFAULT);
-}
-
-#[test]
-fn options_are_parsed() {
-    let opts =
-        parse_fs_config("/export/x,tag=data,ro,queue-size=256").expect("parse");
-    assert_eq!(opts.tag, "data");
-    assert!(opts.read_only);
-    assert_eq!(opts.queue_size, 256);
-}
-
-#[test]
-fn oversized_tag_is_rejected() {
-    let tag = "t".repeat(FS_TAG_LEN + 1);
-    let err =
-        parse_fs_config(&format!("/export/x,tag={tag}")).expect_err("long tag");
-    assert_eq!(
-        err.to_string(),
-        format!("virtio-fs tag '{tag}' exceeds {FS_TAG_LEN} bytes")
-    );
-}
-
-#[test]
-fn out_of_range_queue_size_is_rejected() {
-    let err = parse_fs_config("/export/x,queue-size=4").expect_err("too small");
-    assert_eq!(
-        err.to_string(),
-        "virtio-fs queue-size must be 8..=1024, got 4"
-    );
-}
-
-// virtio-fs is new, so there is no forward compatibility to preserve
-// and an unknown option is a hard error, unlike parse_blk_config.
-#[test]
-fn unknown_option_is_rejected() {
-    let err = parse_fs_config("/export/x,dax").expect_err("unknown");
-    assert_eq!(err.to_string(), "virtio-fs: unknown option 'dax'");
-}
-
 // VirtQueue::new panics on a non-power-of-two size, so the catalog must
 // pass clamp_queue_size's result to VirtioPciDevice::new.
 #[test]
@@ -835,7 +783,7 @@ fn counting_interrupt(
             }
         })
     };
-    *fs.interrupt.lock().expect("interrupt lock") = Some(hook);
+    fs.interrupt.install(hook);
     (raised, inside)
 }
 

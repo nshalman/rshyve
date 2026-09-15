@@ -51,9 +51,11 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use slog::{error, warn, Logger};
 
+use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::{SuspendHow, VmmHdl};
 use vmm_core::mem::PhysMap;
 use vmm_devices::quiesce::NamedDevice;
+use vmm_devices::DeviceMigrateState;
 use vmm_machine::signal::GuestStop;
 use vmm_machine::{DeviceRegistry, HotplugEngines};
 
@@ -134,7 +136,7 @@ pub struct VmController {
     cli_pci_slots: Vec<String>,
     cli_lpc: Vec<String>,
     /// CPU baseline for migration feature masking.
-    cpu_baseline: String,
+    cpu_baseline: CpuBaseline,
     host_local_state: HostLocalState,
     log: Logger,
 }
@@ -155,7 +157,7 @@ impl VmController {
         hotplug: HotplugEngines,
         cli_pci_slots: Vec<String>,
         cli_lpc: Vec<String>,
-        cpu_baseline: String,
+        cpu_baseline: CpuBaseline,
         host_local_state: HostLocalState,
         log: Logger,
     ) -> Arc<Self> {
@@ -228,90 +230,14 @@ impl VmController {
         let mut nvme_controllers = Vec::new();
 
         for dev in devices.iter().map(|named| &named.device) {
-            for q in dev.export_virtio_state() {
-                virtio_queues.push(vmm_migrate::codec::VirtioQueueState {
-                    pci_slot: 0,
-                    queue_idx: q.queue_idx,
-                    queue_size: q.queue_size,
-                    desc_addr: q.desc_addr,
-                    avail_addr: q.avail_addr,
-                    used_addr: q.used_addr,
-                    enabled: q.enabled,
-                    features: q.features,
-                    avail_idx: q.avail_idx,
-                    used_idx: q.used_idx,
-                    msix_addr: q.msix_addr,
-                    msix_data: q.msix_data,
-                    msix_vector: q.msix_vector,
-                    pci_state: q.pci_state.clone().map(|pci| {
-                        vmm_migrate::codec::VirtioMigratePciState {
-                            command: pci.command,
-                            bar_addrs: pci.bar_addrs,
-                        }
-                    }),
-                });
-            }
-            if let Some(nvme) = dev.export_nvme_state() {
-                nvme_controllers.push(
-                    vmm_migrate::codec::NvmeControllerState {
-                        cc: nvme.cc,
-                        csts: nvme.csts,
-                        aqa: nvme.aqa,
-                        asq_base: nvme.asq_base,
-                        acq_base: nvme.acq_base,
-                        admin_sq: nvme.admin_sq.map(|sq| {
-                            vmm_migrate::codec::NvmeSqState {
-                                base: sq.base,
-                                size: sq.size,
-                                head: sq.head,
-                                tail: sq.tail,
-                                cq_id: sq.cq_id,
-                            }
-                        }),
-                        admin_cq: nvme.admin_cq.map(|cq| {
-                            vmm_migrate::codec::NvmeCqState {
-                                base: cq.base,
-                                size: cq.size,
-                                head: cq.head,
-                                tail: cq.tail,
-                                phase: cq.phase,
-                                iv: cq.iv,
-                            }
-                        }),
-                        io_sqs: nvme
-                            .io_sqs
-                            .into_iter()
-                            .map(|sq| {
-                                sq.map(|sq| vmm_migrate::codec::NvmeSqState {
-                                    base: sq.base,
-                                    size: sq.size,
-                                    head: sq.head,
-                                    tail: sq.tail,
-                                    cq_id: sq.cq_id,
-                                })
-                            })
-                            .collect(),
-                        io_cqs: nvme
-                            .io_cqs
-                            .into_iter()
-                            .map(|cq| {
-                                cq.map(|cq| vmm_migrate::codec::NvmeCqState {
-                                    base: cq.base,
-                                    size: cq.size,
-                                    head: cq.head,
-                                    tail: cq.tail,
-                                    phase: cq.phase,
-                                    iv: cq.iv,
-                                })
-                            })
-                            .collect(),
-                        num_io_queues: nvme.num_io_queues,
-                        pci_command: nvme.pci_command,
-                        pci_bar_addrs: nvme.pci_bar_addrs,
-                        msix_entries: nvme.msix_entries,
-                        msix_enabled: nvme.msix_enabled,
-                    },
-                );
+            match dev.export_migrate_state() {
+                Some(DeviceMigrateState::VirtioQueues(queues)) => {
+                    virtio_queues.extend(queues);
+                }
+                Some(DeviceMigrateState::Nvme(state)) => {
+                    nvme_controllers.push(state);
+                }
+                None => {}
             }
         }
         Ok(vmm_migrate::sync_source::DeviceQueueExport {
@@ -372,7 +298,7 @@ impl VmController {
             return Ok(());
         }
         release_paused_vm(
-            || self.hdl.suspend(SuspendHow::Halt, 0),
+            || self.hdl.suspend(SuspendHow::Halt, 0).map(|_| ()),
             || self.hdl.resume(),
         )
     }
@@ -398,9 +324,12 @@ impl VmController {
     /// Latch `how`, then let a parked VM see it.
     fn stop_for_signal(&self, how: SuspendHow) -> io::Result<()> {
         if !self.begin_stop() {
-            return self.hdl.suspend(how, 0);
+            return self.hdl.suspend(how, 0).map(|_| ());
         }
-        release_paused_vm(|| self.hdl.suspend(how, 0), || self.hdl.resume())
+        release_paused_vm(
+            || self.hdl.suspend(how, 0).map(|_| ()),
+            || self.hdl.resume(),
+        )
     }
 
     /// The same release from a path with nobody to hand an error to.

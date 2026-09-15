@@ -15,7 +15,7 @@ use anyhow::{ensure, Context, Result};
 
 use crate::ImageBytes;
 
-const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+pub(crate) const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
 const EHDR_SIZE: usize = 64;
 const PHDR_SIZE: usize = 56;
 const NHDR_SIZE: usize = 12;

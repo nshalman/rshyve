@@ -129,10 +129,10 @@ impl Call {
 pub struct VionaFd(Chan);
 impl VionaFd {
     /// Open viona device and associate it with a given link and vmm instance,
-    /// provided in `link_id` and `vm_fd`, respectively.
-    pub fn new(link_id: u32, vm_fd: RawFd) -> Result<Self> {
+    /// provided in `link_id` and `vm`, respectively.
+    pub fn new(link_id: u32, vm: BorrowedFd<'_>) -> Result<Self> {
         let this = Self::open()?;
-        this.create(link_id, vm_fd)?;
+        this.create(link_id, vm)?;
         Ok(this)
     }
 
@@ -141,10 +141,10 @@ impl VionaFd {
     /// Split out of [`Self::new`] because `new` opens the real device
     /// first, so no recorder could reach the call and a test could not
     /// see which field went where.
-    fn create(&self, link_id: u32, vm_fd: RawFd) -> Result<()> {
+    fn create(&self, link_id: u32, vm: BorrowedFd<'_>) -> Result<()> {
         let mut vna_create = vioc_create {
             c_linkid: link_id,
-            c_vmfd: vm_fd,
+            c_vmfd: vm.as_raw_fd(),
         };
         // Safety: the kernel reads one vioc_create for this command.
         let _ = unsafe { self.ioctl(VNA_IOC_CREATE, &mut vna_create) }?;

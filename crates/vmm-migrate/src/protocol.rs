@@ -10,7 +10,7 @@
 pub const PROTOCOL_RON_V0: &str = "vmm-migrate-ron/0";
 
 /// Page size used for dirty tracking (4 KiB).
-pub const PAGE_SIZE: usize = 4096;
+pub use vmm_core::common::PAGE_SIZE;
 
 /// Number of pages per byte in the dirty bitmap.
 pub const PAGES_PER_BYTE: usize = 8;

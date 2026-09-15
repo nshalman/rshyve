@@ -132,6 +132,49 @@ pub(crate) fn next_intr_session(
         .map_or(fallback, |intr| intr.session())
 }
 
+/// Where a backend keeps its transport interrupt path.
+///
+/// Empty until the binary installs the path, which it can only do
+/// once the transport exists and the backend has moved into it. The
+/// raise clones the path out first: delivery is a call into the
+/// kernel, and a reset reads this slot, so a raise made under the
+/// lock would put that call in front of a vCPU.
+#[derive(Default)]
+pub struct IntrSlot(Mutex<Option<Arc<BackendIntr>>>);
+
+impl IntrSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install the path. The binary does this once per device.
+    pub fn install(&self, intr: Arc<BackendIntr>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(intr);
+    }
+
+    /// The path, or `None` while the transport is not wired up.
+    pub fn get(&self) -> Option<Arc<BackendIntr>> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Raise for `queue_idx` under `session`. Nothing happens before
+    /// the path is installed: no driver can have armed a ring yet.
+    pub fn raise(&self, session: IntrSession, queue_idx: u16) {
+        if let Some(path) = self.get() {
+            path.raise(session, queue_idx);
+        }
+    }
+
+    /// The session the next driver runs under, or `fallback` while the
+    /// transport is not wired up. See [`next_intr_session`].
+    pub(crate) fn next_session(&self, fallback: IntrSession) -> IntrSession {
+        next_intr_session(&self.0, fallback)
+    }
+}
+
 /// Orders every interrupt this device delivers against its own reset.
 ///
 /// A device reset runs on the vCPU that wrote DEVICE_STATUS and must

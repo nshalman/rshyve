@@ -17,6 +17,9 @@
 //! [`plan`] reads guest memory and runs under guest-access permission.
 //! [`zero`] reaches the disk and must run without it.
 
+use std::fs::File;
+use std::os::unix::fs::FileExt;
+
 use vmm_core::mem::PhysMap;
 
 use super::DiskLimits;
@@ -179,9 +182,9 @@ pub(super) fn plan(
 
 /// Zero every range the plan named. Reaches the disk, so the caller
 /// must hold no guest-access permission.
-pub(super) fn zero(fd: i32, ranges: &Ranges) -> u8 {
+pub(super) fn zero(file: &File, ranges: &Ranges) -> u8 {
     for &(sector, num_sectors) in ranges.iter() {
-        if !write_zero_range(fd, sector, num_sectors) {
+        if !write_zero_range(file, sector, num_sectors) {
             return bits::VIRTIO_BLK_S_IOERR;
         }
     }
@@ -194,7 +197,7 @@ pub(super) fn zero(fd: i32, ranges: &Ranges) -> u8 {
 /// only and a zvol needs a hand-built `DKIOCFREE` list, so the answer
 /// that is correct for both backing stores is a bounded loop of
 /// `pwrite`. The caller has already bounded the range.
-fn write_zero_range(fd: i32, sector: u64, num_sectors: u32) -> bool {
+fn write_zero_range(file: &File, sector: u64, num_sectors: u32) -> bool {
     let Some(mut offset) = sector.checked_mul(bits::SECTOR_SIZE) else {
         return false;
     };
@@ -207,30 +210,13 @@ fn write_zero_range(fd: i32, sector: u64, num_sectors: u32) -> bool {
     let zeros = vec![0u8; ZERO_CHUNK];
     while remaining > 0 {
         let chunk = remaining.min(ZERO_CHUNK as u64) as usize;
-        let Ok(off) = libc::off_t::try_from(offset) else {
-            return false;
-        };
-        // SAFETY: `zeros` holds at least `chunk` readable bytes and the
-        // caller keeps `fd` open across the call.
-        let n = unsafe { libc::pwrite(fd, zeros.as_ptr().cast(), chunk, off) };
-        if n < 0 {
-            if std::io::Error::last_os_error().kind()
-                == std::io::ErrorKind::Interrupted
-            {
-                continue;
-            }
+        if i64::try_from(offset).is_err()
+            || file.write_all_at(&zeros[..chunk], offset).is_err()
+        {
             return false;
         }
-        // A zero-length result on a non-empty write would spin forever.
-        let done = n as u64;
-        if done == 0 {
-            return false;
-        }
-        let Some(next) = offset.checked_add(done) else {
-            return false;
-        };
-        offset = next;
-        remaining -= done;
+        offset += chunk as u64;
+        remaining -= chunk as u64;
     }
     true
 }

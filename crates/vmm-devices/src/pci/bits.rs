@@ -189,6 +189,9 @@ pub const PROGIF_ENTERPRISE_NVME: u8 = 2;
 // Capability IDs
 // ---------------------------------------------------------------------------
 
+/// PCI-SIG vendor id of Intel, which the AHCI and xHCI models present.
+pub const PCI_VENDOR_INTEL: u16 = 0x8086;
+
 pub const CAP_ID_MSI: u8 = 0x05;
 pub const CAP_ID_VENDOR: u8 = 0x09;
 pub const CAP_ID_MSIX: u8 = 0x11;

@@ -11,6 +11,9 @@
 //! from the snapshot. Nothing here holds permission across a syscall,
 //! which is what keeps a device reset bounded.
 
+use std::fs::File;
+use std::os::unix::fs::FileExt;
+
 use vmm_core::mem::PhysMap;
 
 use super::{bits, ChainBuf, VirtioBlkReqHdr, BLK_REQ_HEADER_SIZE};
@@ -81,9 +84,9 @@ pub(super) fn transfer(chain: &[ChainBuf], writable: bool) -> Option<usize> {
 /// Byte offset of `sector` in the backing store.
 pub(super) fn sector_offset(sector: u64) -> Option<u64> {
     let offset = sector.checked_mul(bits::SECTOR_SIZE)?;
-    // A negative `off_t` would seek from somewhere the caller did not
-    // name.
-    libc::off_t::try_from(offset).ok()?;
+    // The kernel takes a signed offset. A larger one would wrap to a
+    // place the caller did not name.
+    i64::try_from(offset).ok()?;
     Some(offset)
 }
 
@@ -203,72 +206,17 @@ pub(super) fn gather(
 
 /// Fill the whole of `buf` from the disk. Host memory only, so no
 /// guest-access permission is needed or held.
-pub(super) fn read_backend(fd: i32, offset: u64, buf: &mut [u8]) -> bool {
-    let mut done = 0usize;
-    while done < buf.len() {
-        let Some(at) = offset.checked_add(done as u64) else {
-            return false;
-        };
-        let Ok(at) = libc::off_t::try_from(at) else {
-            return false;
-        };
-        // SAFETY: the slice gives at least `buf.len() - done` writable
-        // bytes and the caller keeps `fd` open across the call.
-        let n = unsafe {
-            libc::pread(
-                fd,
-                buf[done..].as_mut_ptr().cast(),
-                buf.len() - done,
-                at,
-            )
-        };
-        if n < 0 {
-            if std::io::Error::last_os_error().kind()
-                == std::io::ErrorKind::Interrupted
-            {
-                continue;
-            }
-            return false;
-        }
-        // End of file short of the range. The caller must not copy the
-        // buffer out: past `done` it still holds the last request.
-        if n == 0 {
-            return false;
-        }
-        done += n as usize;
-    }
-    true
+///
+/// End of file short of the range is a failure. The caller must not
+/// copy the buffer out then: past the bytes read it still holds the
+/// last request.
+pub(super) fn read_backend(file: &File, offset: u64, buf: &mut [u8]) -> bool {
+    file.read_exact_at(buf, offset).is_ok()
 }
 
 /// Write the whole of `buf` to the disk from the host snapshot.
-pub(super) fn write_backend(fd: i32, offset: u64, buf: &[u8]) -> bool {
-    let mut done = 0usize;
-    while done < buf.len() {
-        let Some(at) = offset.checked_add(done as u64) else {
-            return false;
-        };
-        let Ok(at) = libc::off_t::try_from(at) else {
-            return false;
-        };
-        // SAFETY: the slice gives at least `buf.len() - done` readable
-        // bytes and the caller keeps `fd` open across the call.
-        let n = unsafe {
-            libc::pwrite(fd, buf[done..].as_ptr().cast(), buf.len() - done, at)
-        };
-        if n < 0 {
-            if std::io::Error::last_os_error().kind()
-                == std::io::ErrorKind::Interrupted
-            {
-                continue;
-            }
-            return false;
-        }
-        if n == 0 {
-            return false;
-        }
-        done += n as usize;
-    }
-    true
+pub(super) fn write_backend(file: &File, offset: u64, buf: &[u8]) -> bool {
+    file.write_all_at(buf, offset).is_ok()
 }
 
 pub(super) fn write_status(

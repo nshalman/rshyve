@@ -8,12 +8,15 @@
 //! migration agent bridges the Unix socket to TCP.
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tungstenite::WebSocket;
 
+use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::{MemCtx, RegionKind};
+use vmm_devices::FlushError;
 
 use crate::codec::{
     CpuFeatures, Message, MigrateError, MigrationPreamble, ProtocolOffer,
@@ -52,7 +55,16 @@ pub type DeviceExportFn = Box<dyn FnOnce() -> DeviceQueueExport + Send>;
 /// Callback to flush device writeback caches. Called after `hdl.pause()`
 /// has quiesced vCPUs and before the ZFS barrier / device-state export
 /// so `zfs send` sees every write the guest was told was complete.
-pub type DeviceFlushFn = Box<dyn FnOnce() -> Result<(), String> + Send>;
+pub type DeviceFlushFn =
+    Box<dyn FnOnce() -> Result<(), DeviceFlushError> + Send>;
+
+/// One device's backing store could not be flushed.
+#[derive(Debug, thiserror::Error)]
+#[error("{device}: {source}")]
+pub struct DeviceFlushError {
+    pub device: &'static str,
+    pub source: FlushError,
+}
 
 /// Callback to resume device workers when a paused migration aborts.
 pub type DeviceResumeFn = Box<dyn Fn() + Send>;
@@ -67,12 +79,12 @@ pub fn run_source_sync<S: Read + Write>(
     mem_size: u64,
     status: Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
-    cpu_baseline: &str,
+    cpu_baseline: CpuBaseline,
     device_pre_pause_fn: DevicePrePauseFn,
     device_flush_fn: DeviceFlushFn,
     device_resume_fn: DeviceResumeFn,
     device_export_fn: DeviceExportFn,
-    zfs_barrier: Option<String>,
+    zfs_barrier: Option<PathBuf>,
 ) -> Result<(), MigrateError> {
     let mut ws = WebSocket::from_raw_socket(
         stream,
@@ -133,11 +145,11 @@ fn run_inner<S: Read + Write>(
     mem_size: u64,
     status: &Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
-    cpu_baseline: &str,
+    cpu_baseline: CpuBaseline,
     device_pre_pause_fn: DevicePrePauseFn,
     device_flush_fn: DeviceFlushFn,
     device_export_fn: DeviceExportFn,
-    zfs_barrier: Option<String>,
+    zfs_barrier: Option<PathBuf>,
 ) -> Result<(), MigrateError> {
     // ── Sync ──
     set_phase(status, MigrationPhase::Sync);
@@ -153,10 +165,8 @@ fn run_inner<S: Read + Write>(
         return Err(MigrateError::ProtocolMismatch(sel.protocol));
     }
 
-    let baseline = vmm_core::cpuid::CpuBaseline::parse(cpu_baseline)
-        .unwrap_or(vmm_core::cpuid::CpuBaseline::Host);
     let (l1_ecx, l1_edx, l7_ebx, l7_ecx, l7_edx, xcr0) =
-        vmm_core::cpuid::query_masked_features(baseline);
+        vmm_core::cpuid::query_masked_features(cpu_baseline);
 
     let preamble = MigrationPreamble {
         num_cpus,
@@ -221,7 +231,8 @@ fn run_inner<S: Read + Write>(
     // back (ZFS send complete). This ensures the dest disk has all
     // writes up to the pause point.
     if let Some(ref barrier_path) = zfs_barrier {
-        slog::info!(log, "waiting for post-pause ZFS sync"; "barrier" => barrier_path);
+        slog::info!(log, "waiting for post-pause ZFS sync";
+            "barrier" => %barrier_path.display());
         match std::os::unix::net::UnixStream::connect(barrier_path) {
             Ok(mut stream) => {
                 stream
@@ -493,8 +504,12 @@ mod tests {
 
     #[test]
     fn flush_failure_resumes_devices_and_vcpus() {
-        let flush_fn: DeviceFlushFn =
-            Box::new(|| Err("virtio-blk: not quiesced".to_string()));
+        let flush_fn: DeviceFlushFn = Box::new(|| {
+            Err(DeviceFlushError {
+                device: "virtio-blk",
+                source: FlushError::NotQuiesced("virtio-blk"),
+            })
+        });
         let result = flush_fn().map_err(|error| {
             MigrateError::Io(format!("device flush failed: {error}"))
         });
@@ -523,7 +538,8 @@ mod tests {
         assert!(matches!(
             result,
             Err(MigrateError::Io(ref error))
-                if error == "device flush failed: virtio-blk: not quiesced"
+                if error
+                    == "device flush failed: virtio-blk: workers did not quiesce in time"
         ));
         assert!(devices_resumed.load(Ordering::Acquire));
         assert!(vcpus_resumed.load(Ordering::Acquire));

@@ -24,13 +24,11 @@ use std::time::Duration;
 use vmm_core::mem::PhysMap;
 use vmm_devices::QuiesceGate;
 
-use crate::pci::intr::BackendIntr;
+use crate::pci::intr::IntrSlot;
 use crate::queue::{ChainBuf, VirtioCompletion};
 use crate::vsock::control::ControlSlot;
 use crate::vsock::mux::VsockMux;
 use crate::vsock::packet::ConnKey;
-
-pub(super) type InterruptFn = Arc<BackendIntr>;
 
 /// How long a write to a host peer may take before the device gives
 /// up on it.
@@ -47,7 +45,7 @@ pub(super) struct VsockShared {
     /// RX chains the guest has posted, waiting for a packet.
     pub(super) pending_rx: Mutex<VecDeque<(u16, Vec<ChainBuf>)>>,
     pub(super) rx_completion: Mutex<Option<Arc<VirtioCompletion>>>,
-    pub(super) interrupt: Arc<Mutex<Option<InterruptFn>>>,
+    pub(super) interrupt: Arc<IntrSlot>,
     /// Serialises RX delivery. Held for a whole pairing pass.
     pub(super) delivery: Mutex<()>,
     /// Host socket per live connection. Held behind an `Arc` so a

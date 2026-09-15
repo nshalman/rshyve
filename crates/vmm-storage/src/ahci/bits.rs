@@ -169,7 +169,7 @@ pub const ASC_SAVING_PARAMS_NOT_SUPPORTED: u8 = 0x39;
 pub const MODEPAGE_RW_ERROR_RECOVERY: u8 = 0x01;
 pub const MODEPAGE_CD_CAPABILITIES: u8 = 0x2A;
 
-pub const PCI_VENDOR_INTEL: u16 = 0x8086;
+pub use vmm_devices::pci::bits::PCI_VENDOR_INTEL;
 pub const PCI_DEVICE_ICH8_AHCI: u16 = 0x2821;
 
 #[cfg(test)]

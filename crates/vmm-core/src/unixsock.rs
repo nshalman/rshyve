@@ -6,12 +6,14 @@
 
 use std::fs::{self, DirBuilder, Permissions};
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::poll::wait_writable;
 
 static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
@@ -116,7 +118,7 @@ pub fn write_all_bounded(
     budget: Duration,
 ) -> io::Result<()> {
     let deadline = Instant::now() + budget;
-    let fd = stream.as_raw_fd();
+    let fd = stream.as_fd();
     let mut sent = 0;
 
     while sent < data.len() {
@@ -127,7 +129,7 @@ pub fn write_all_bounded(
                 "the peer did not take the write within its budget",
             ));
         }
-        if !poll_writable(fd, left)? {
+        if !wait_writable(fd, left)? {
             continue;
         }
         let end = data.len().min(sent + WRITE_CHUNK);
@@ -196,10 +198,11 @@ const SEND_NOWAIT: libc::c_int = 0x0002_0000; // MSG_NBIO
 const SEND_NOWAIT: libc::c_int = 0;
 
 /// Send what the socket will take now.
-fn send_nowait(fd: RawFd, data: &[u8]) -> io::Result<usize> {
+fn send_nowait(fd: BorrowedFd<'_>, data: &[u8]) -> io::Result<usize> {
+    // Safety: `data` is a live slice for the length passed.
     let sent = unsafe {
         libc::send(
-            fd,
+            fd.as_raw_fd(),
             data.as_ptr().cast::<libc::c_void>(),
             data.len(),
             SEND_NOWAIT,
@@ -209,51 +212,6 @@ fn send_nowait(fd: RawFd, data: &[u8]) -> io::Result<usize> {
         return Err(io::Error::last_os_error());
     }
     Ok(sent as usize)
-}
-
-/// The events `fd` reports within `timeout_ms`, for a reader.
-///
-/// A timeout or a signal reports nothing, so a loop that owns a
-/// shutdown flag re-reads that flag on every tick instead of waiting
-/// for a peer that may never come. The caller decides what an error
-/// condition means: a listener that reports one keeps reporting it,
-/// so the loop must leave rather than spin.
-pub fn poll_events(fd: RawFd, timeout_ms: i32) -> libc::c_short {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    if unsafe { libc::poll(&mut pfd, 1, timeout_ms) } <= 0 {
-        return 0;
-    }
-    pfd.revents
-}
-
-/// Wait for `fd` to take a write, or for `budget` to pass.
-///
-/// An error condition reports true as well, so that the write which
-/// follows names the error rather than this guessing at it.
-fn poll_writable(fd: RawFd, budget: Duration) -> io::Result<bool> {
-    // At least one millisecond: a shorter budget would round to a poll
-    // that returns at once, and the caller would spin on it.
-    let timeout_ms = budget.as_millis().clamp(1, i32::MAX as u128) as i32;
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLOUT,
-        revents: 0,
-    };
-    if unsafe { libc::poll(&mut pfd, 1, timeout_ms) } < 0 {
-        let error = io::Error::last_os_error();
-        // A signal is not a failure. The caller re-reads its deadline.
-        if error.kind() == io::ErrorKind::Interrupted {
-            return Ok(false);
-        }
-        return Err(error);
-    }
-    Ok(pfd.revents
-        & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
-        != 0)
 }
 
 fn verify_bound_path(

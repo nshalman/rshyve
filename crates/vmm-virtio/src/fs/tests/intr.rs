@@ -25,9 +25,10 @@ fn drain(seen: &Mutex<Vec<(IntrSession, u16)>>) -> Vec<u16> {
 fn a_reply_raises_on_the_queue_it_belongs_to() {
     let (_physmap, queues, fs) = ring(8, 0);
     let seen = Arc::new(Mutex::new(Vec::new()));
-    *fs.interrupt.lock().expect("interrupt lock") = Some(
-        BackendIntr::recording(Arc::new(IntrGate::new()), Arc::clone(&seen)),
-    );
+    fs.interrupt.install(BackendIntr::recording(
+        Arc::new(IntrGate::new()),
+        Arc::clone(&seen),
+    ));
 
     for queue_idx in [FS_HIPRIO_QUEUE, FS_REQUEST_QUEUE] {
         let session = fs.access.enter_current().expect("a session is open");

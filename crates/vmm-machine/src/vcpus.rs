@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 
 use slog::{debug, info, warn, Logger};
 use vmm_core::cpuid::CpuidTable;
-use vmm_core::vcpu::Vcpu;
+use vmm_core::vcpu::{ActivateError, Vcpu};
 use vmm_devices::metrics::VcpuMetrics;
 
 use crate::teardown::VcpuThreads;
@@ -307,19 +307,6 @@ impl VcpuRegistry {
         self.book.lock().expect(BOOK_POISONED).online.contains(&id)
     }
 
-    /// Metrics for the CPUs added since boot, in ascending id order.
-    ///
-    /// The boot set has its own metrics, which the fleet returns.
-    pub fn added_metrics(&self) -> Vec<(u32, Arc<VcpuMetrics>)> {
-        self.book
-            .lock()
-            .expect(BOOK_POISONED)
-            .metrics
-            .iter()
-            .map(|(id, metrics)| (*id, Arc::clone(metrics)))
-            .collect()
-    }
-
     /// Bring one CPU online on the running VM.
     ///
     /// The guest still has to accept it: a hot-added CPU is an
@@ -394,18 +381,17 @@ impl VcpuRegistry {
         let vcpu = Vcpu::new_for_thread(vcpu_id, Arc::clone(&self.ctx.hdl));
         self.replay_boot_setup(id, vcpu_id, &vcpu)?;
 
-        vcpu.activate()
-            .map_err(|error| match error.raw_os_error() {
-                Some(libc::EBUSY) => VcpuError::Suspended(id),
-                Some(libc::EINVAL) => VcpuError::OutOfRange {
-                    id,
-                    max_cpus: self.possible_cpus(),
-                },
-                _ => VcpuError::Activate {
-                    id,
-                    error: error.to_string(),
-                },
-            })?;
+        vcpu.activate().map_err(|error| match error {
+            ActivateError::Busy => VcpuError::Suspended(id),
+            ActivateError::OutOfRange => VcpuError::OutOfRange {
+                id,
+                max_cpus: self.possible_cpus(),
+            },
+            ActivateError::Os(error) => VcpuError::Activate {
+                id,
+                error: error.to_string(),
+            },
+        })?;
 
         if !signal.release() {
             return Err(VcpuError::ThreadGone(id));

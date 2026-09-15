@@ -22,10 +22,6 @@ pub const MODE_EXEC: u32 = 0o100_755;
 pub const MODE_FILE: u32 = 0o100_644;
 /// Mode bits for a directory (040755).
 pub const MODE_DIR: u32 = 0o040_755;
-/// Mode bits for a symlink (0120777). Kept here for future entries
-/// even though no current call site uses it.
-#[allow(dead_code)]
-pub const MODE_SYMLINK: u32 = 0o120_777;
 
 /// One archive entry to be written.
 pub struct Entry<'a> {

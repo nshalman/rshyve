@@ -12,7 +12,7 @@ pub use super::decode::{
 };
 use super::{reset_port_state, AhciCtrl, AhciState};
 use std::mem::size_of;
-use vmm_core::mem::SubMapping;
+use vmm_core::mem::GuestIoVec;
 
 pub fn build_d2h_fis(
     cfis: &[u8; FIS_D2H_LEN],
@@ -274,8 +274,7 @@ impl AhciCtrl {
             );
         };
 
-        let mut subs: Vec<(libc::iovec, SubMapping)> =
-            Vec::with_capacity(prds.len());
+        let mut iov = GuestIoVec::with_capacity(prds.len());
         let mut remaining = bytes;
         for prd in &prds {
             if remaining == 0 {
@@ -291,37 +290,17 @@ impl AhciCtrl {
                     ASC_INVALID_FIELD_IN_CDB,
                 );
             };
-            // Safety: the SubMapping stays in `subs` until after preadv and
-            // the raw pointer is used only as an iovec destination.
-            subs.push((
-                libc::iovec {
-                    iov_base: unsafe { sub.as_ptr() } as *mut libc::c_void,
-                    iov_len: chunk,
-                },
-                sub,
-            ));
+            iov.push(sub);
             remaining -= chunk;
         }
 
         let want = bytes - remaining;
-        let iovecs: Vec<libc::iovec> =
-            subs.iter().map(|(iov, _)| *iov).collect();
         // MMIO dispatch drops its address-space lock before invoking us, so
         // synchronous reads stall only the issuing vCPU and leave no I/O for
         // lifecycle quiescence or reboot paths to drain.
-        // Safety: every iovec is bounds-checked by PhysMap and its SubMapping
-        // remains alive until the syscall returns.
-        let nread = unsafe {
-            libc::preadv(
-                self.media.as_raw_fd(),
-                iovecs.as_ptr(),
-                iovecs.len() as libc::c_int,
-                offset as libc::off_t,
-            )
-        };
-        drop(subs);
+        let nread = iov.read_from(self.media.file(), offset);
 
-        if nread < 0 || nread as usize != want {
+        if !matches!(nread, Ok(n) if n == want) {
             return self.complete_packet_check(
                 st,
                 slot,

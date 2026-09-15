@@ -10,10 +10,8 @@
 //! exposed via a generic ioctl escape hatch.
 
 use std::io::{Error, ErrorKind, Result};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::time::Duration;
-
-use std::os::fd::RawFd;
 
 use bhyve_api::{
     ioctls, vcpu_cpuid_entry, vm_cap_type, vm_capability, vm_create_req,
@@ -26,6 +24,8 @@ use bhyve_api::{
 };
 
 use crate::mem::Prot;
+
+mod vcpu;
 
 /// How a VM is asked to stop. The kernel latches the first request and
 /// answers `EALREADY` to the rest.
@@ -55,6 +55,15 @@ impl std::fmt::Display for SuspendHow {
             SuspendHow::Halt => "halt",
         })
     }
+}
+
+/// What a suspend request did. The kernel latches the first request
+/// for a VM and refuses the rest, and a refusal is not a failure: the
+/// VM is stopping either way.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SuspendOutcome {
+    Requested,
+    AlreadyLatched,
 }
 
 /// MSI and MSI-X vector counts a passthrough device may use.
@@ -416,14 +425,23 @@ impl VmmHdl {
 
     /// Suspend the VM. `source` is the requesting vCPU, or -1 for a
     /// device or operator request.
-    pub fn suspend(&self, how: SuspendHow, source: i32) -> Result<()> {
+    pub fn suspend(
+        &self,
+        how: SuspendHow,
+        source: i32,
+    ) -> Result<SuspendOutcome> {
         let mut req = vm_suspend {
             how: how.raw(),
             source,
         };
         // Safety: vm_suspend is the correct struct for VM_SUSPEND.
-        unsafe { self.inner.ioctl(ioctls::VM_SUSPEND, &mut req) }?;
-        Ok(())
+        match unsafe { self.inner.ioctl(ioctls::VM_SUSPEND, &mut req) } {
+            Ok(_) => Ok(SuspendOutcome::Requested),
+            Err(e) if e.raw_os_error() == Some(libc::EALREADY) => {
+                Ok(SuspendOutcome::AlreadyLatched)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Tell the kernel which PIO port serves the ACPI PM timer.
@@ -438,25 +456,29 @@ impl VmmHdl {
     // ---------------------------------------------------------------
 
     /// Bind an open `/dev/pptN` descriptor to this VM.
-    pub fn bind_pptdev(&self, pptfd: RawFd) -> Result<()> {
-        let mut req = vm_pptdev { pptfd };
+    pub fn bind_pptdev(&self, pptfd: BorrowedFd<'_>) -> Result<()> {
+        let mut req = vm_pptdev {
+            pptfd: pptfd.as_raw_fd(),
+        };
         // Safety: vm_pptdev is the correct struct for VM_BIND_PPTDEV.
         unsafe { self.inner.ioctl(ioctls::VM_BIND_PPTDEV, &mut req) }?;
         Ok(())
     }
 
     /// Give a bound passthrough device back to the host.
-    pub fn unbind_pptdev(&self, pptfd: RawFd) -> Result<()> {
-        let mut req = vm_pptdev { pptfd };
+    pub fn unbind_pptdev(&self, pptfd: BorrowedFd<'_>) -> Result<()> {
+        let mut req = vm_pptdev {
+            pptfd: pptfd.as_raw_fd(),
+        };
         // Safety: vm_pptdev is the correct struct for VM_UNBIND_PPTDEV.
         unsafe { self.inner.ioctl(ioctls::VM_UNBIND_PPTDEV, &mut req) }?;
         Ok(())
     }
 
     /// Ask how many MSI and MSI-X vectors a bound device may use.
-    pub fn pptdev_limits(&self, pptfd: RawFd) -> Result<PptdevLimits> {
+    pub fn pptdev_limits(&self, pptfd: BorrowedFd<'_>) -> Result<PptdevLimits> {
         let mut req = vm_pptdev_limits {
-            pptfd,
+            pptfd: pptfd.as_raw_fd(),
             msi_limit: 0,
             msix_limit: 0,
         };
@@ -472,13 +494,13 @@ impl VmmHdl {
     /// guest at `gpa`.
     pub fn map_pptdev_mmio(
         &self,
-        pptfd: RawFd,
+        pptfd: BorrowedFd<'_>,
         gpa: u64,
         hpa: u64,
         len: usize,
     ) -> Result<()> {
         let mut req = vm_pptdev_mmio {
-            pptfd,
+            pptfd: pptfd.as_raw_fd(),
             gpa,
             hpa,
             len,
@@ -491,12 +513,12 @@ impl VmmHdl {
     /// Undo [`map_pptdev_mmio`](Self::map_pptdev_mmio) for `gpa`.
     pub fn unmap_pptdev_mmio(
         &self,
-        pptfd: RawFd,
+        pptfd: BorrowedFd<'_>,
         gpa: u64,
         len: usize,
     ) -> Result<()> {
         let mut req = vm_pptdev_mmio {
-            pptfd,
+            pptfd: pptfd.as_raw_fd(),
             gpa,
             hpa: 0,
             len,
@@ -510,14 +532,14 @@ impl VmmHdl {
     /// MSI off.
     pub fn pptdev_msi(
         &self,
-        pptfd: RawFd,
+        pptfd: BorrowedFd<'_>,
         addr: u64,
         msg: u64,
         numvec: i32,
     ) -> Result<()> {
         let mut req = vm_pptdev_msi {
             vcpu: 0,
-            pptfd,
+            pptfd: pptfd.as_raw_fd(),
             numvec,
             msg,
             addr,
@@ -651,6 +673,12 @@ impl VmmHdl {
 impl AsRawFd for VmmHdl {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
+    }
+}
+
+impl AsFd for VmmHdl {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
     }
 }
 

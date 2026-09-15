@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use vmm_core::mem::PhysMap;
 
-use super::pci::intr::BackendIntr;
+use super::pci::intr::{BackendIntr, IntrSlot};
 use super::queue::VirtQueue;
 use super::VirtioDevice;
 use viona_api::LinkOps;
@@ -96,17 +96,12 @@ pub struct VirtioViona {
     /// Outside `inner` because the poll thread reads it on every
     /// wakeup and must never wait on the device lock: the halt drops
     /// that lock across an untimed kernel call.
-    interrupt: Arc<Mutex<Option<VionaInterrupt>>>,
+    interrupt: Arc<IntrSlot>,
 }
 
 /// The transport interrupt path, installed by the binary after the
 /// transport is built.
 ///
-/// The poll thread names the driver session each notification was
-/// collected under, so a reset in between refuses it. A bare
-/// `Fn(u16)` cannot: it has no session to name.
-pub type VionaInterrupt = Arc<BackendIntr>;
-
 struct VionaInner {
     /// The in-kernel link, on every platform.
     ///
@@ -169,9 +164,15 @@ impl VionaInner {
 }
 
 impl VirtioViona {
-    /// The interrupt slot, for the binary to fill after the transport
-    /// is built.
-    pub fn interrupt(&self) -> Arc<Mutex<Option<VionaInterrupt>>> {
+    /// Install the transport interrupt path once the transport exists.
+    pub fn install_interrupt(&self, intr: Arc<BackendIntr>) {
+        self.interrupt.install(intr);
+    }
+
+    /// The slot the poll thread reads, for a test that drives that
+    /// thread's body by hand.
+    #[cfg(test)]
+    pub(super) fn interrupt_slot(&self) -> Arc<IntrSlot> {
         Arc::clone(&self.interrupt)
     }
 

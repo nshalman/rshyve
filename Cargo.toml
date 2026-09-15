@@ -5,6 +5,7 @@ members = [
     "crates/bhyve-api",
     "crates/bhyve-api/sys",
     "crates/viona-api",
+    "crates/dladm",
     "crates/vmm-api-common",
     "crates/vmm-core",
     "crates/vmm-devices",
@@ -73,6 +74,7 @@ strip = "debuginfo"
 bhyve_api = { path = "crates/bhyve-api" }
 bhyve_api_sys = { path = "crates/bhyve-api/sys" }
 viona_api = { path = "crates/viona-api" }
+dladm = { path = "crates/dladm" }
 vmm_api_common = { path = "crates/vmm-api-common" }
 vmm_core = { path = "crates/vmm-core" }
 vmm_devices = { path = "crates/vmm-devices" }
@@ -100,6 +102,7 @@ usdt = { version = "0.5", default-features = false }
 bitflags = "2.4"
 clap = { version = "4.2", features = ["derive"] }
 futures = "0.3"
+getrandom = "0.4"
 libc = "0.2"
 memmap2 = "0.9"
 ron = "0.8"

@@ -5,6 +5,7 @@
 //! Migration command handlers and their address guards.
 
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,6 +15,7 @@ use slog::{error, info};
 
 use vmm_core::mem::MemCtx;
 use vmm_machine::HotplugEngines;
+use vmm_migrate::sync_source::DeviceFlushError;
 
 use super::protocol::{Command, Response};
 use super::{VmController, VmRunState};
@@ -62,7 +64,7 @@ fn growth(hotplug: &HotplugEngines) -> (usize, u64) {
 /// tags every queue group with `pci_slot: 0` (`control/mod.rs`), the
 /// preamble device list is empty (`vmm-migrate/src/sync_source.rs`),
 /// and the destination claims the first queue group whose count equals
-/// its own (`vmm-virtio/src/pci.rs::restore_virtio_state`). While the
+/// its own (`vmm-virtio/src/pci/migrate.rs`). While the
 /// live set equals the boot `-s` list, both sides build the same
 /// devices in the same order, so the match is accidental but correct.
 /// A hot-add or an eject breaks that, and a guest would come up on the
@@ -236,8 +238,11 @@ pub(super) fn migrate_source(
                             dev.flush_backing(
                                 vmm_devices::FlushIntent::Durable,
                             )
-                            .map_err(|error| {
-                                format!("{}: {:?}", dev.type_name(), error)
+                            .map_err(|source| {
+                                DeviceFlushError {
+                                    device: dev.type_name(),
+                                    source,
+                                }
                             })?;
                         }
                         Ok(())
@@ -272,12 +277,12 @@ pub(super) fn migrate_source(
                     mem_size,
                     status,
                     &mlog,
-                    &ctrl_arc.cpu_baseline,
+                    ctrl_arc.cpu_baseline,
                     pre_pause_fn,
                     flush_fn,
                     resume_fn,
                     export_fn,
-                    zfs_barrier,
+                    zfs_barrier.map(PathBuf::from),
                 ) {
                     Ok(()) => {
                         info!(mlog, "source migration complete");
@@ -333,7 +338,7 @@ pub(super) fn migrate_source(
                         mem_size,
                         status,
                         &mlog,
-                        &ctrl_arc.cpu_baseline,
+                        ctrl_arc.cpu_baseline,
                     )
                     .await
                     {

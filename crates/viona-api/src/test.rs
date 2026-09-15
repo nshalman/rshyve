@@ -188,7 +188,10 @@ fn the_create_call_sends_the_link_and_the_vm_where_the_kernel_reads_them() {
     let link_id: u32 = 0xAABB_CCDD;
     let vm_fd: RawFd = 0x0102_0304;
 
-    fd.create(link_id, vm_fd).expect("a recorder answers");
+    // Safety: a recorder never passes the descriptor to the kernel, so
+    // the number need not be open.
+    let vm = unsafe { BorrowedFd::borrow_raw(vm_fd) };
+    fd.create(link_id, vm).expect("a recorder answers");
 
     let call = &calls(&fd)[0];
     assert_eq!(call.cmd(), VNA_IOC_CREATE);

@@ -57,12 +57,7 @@ const MRLH_PATH: &str = "\\_SB_.MHPC.MRLH";
 /// Path of the slot scan method, which `_E03` runs.
 const MSCN_PATH: &str = "\\_SB_.MHPC.MSCN";
 
-/// ACPI 6.5, table 6.16: rescan the device and bind a driver.
-const NOTIFY_DEVICE_CHECK: u8 = 1;
-
-/// `_STA` for a slot that holds memory: present, enabled, shown, and
-/// functioning. ACPI 6.5, section 6.3.7.
-const STA_PRESENT: u8 = 0x0F;
+use super::{NOTIFY_DEVICE_CHECK, STA_PRESENT};
 
 /// `_STA` for the controller: present, enabled and functioning, but
 /// not shown to the user.
