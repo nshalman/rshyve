@@ -557,18 +557,10 @@ impl PciDevice for PciPassthru {
                         offset as u32,
                         ro.len() as u32,
                     );
-                    match ro.len() {
-                        1 => ro.write_u8(val as u8),
-                        2 => ro.write_u16(val as u16),
-                        _ => ro.write_u32(val),
-                    }
+                    ro.write_dword(val)
                 }
                 RWOp::Write(wo) => {
-                    let data = match wo.len() {
-                        1 => u32::from(wo.read_u8()),
-                        2 => u32::from(wo.read_u16()),
-                        _ => wo.read_u32(),
-                    };
+                    let data = wo.read_dword();
                     self.bar_io_write(
                         bar_idx as u32,
                         offset as u32,

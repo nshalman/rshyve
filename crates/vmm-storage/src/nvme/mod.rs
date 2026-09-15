@@ -561,12 +561,10 @@ impl NvmeController {
                     0x34 => (st.acq_base >> 32) as u32,
                     _ => 0,
                 };
-                match ro.len() {
-                    1 => ro.write_u8(val as u8),
-                    2 => ro.write_u16(val as u16),
-                    4 => ro.write_u32(val),
-                    8 => ro.write_u64(val as u64),
-                    _ => ro.write_u32(val),
+                if ro.len() == 8 {
+                    ro.write_u64(u64::from(val));
+                } else {
+                    ro.write_dword_at(val, offset);
                 }
             }
             RWOp::Write(wo) => {
@@ -905,10 +903,7 @@ impl NvmeController {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
 
-        // Validate that the queue base GPA is page-aligned and non-zero.
-        // A malicious guest could point CQ base at an MMIO region of
-        // another device, causing cross-device confusion.
-        if prp1 == 0 || (prp1 & 0xFFF) != 0 {
+        if !valid_queue_base(prp1) {
             return (SC_INVALID_FIELD | SC_DNR, 0);
         }
 
@@ -955,8 +950,7 @@ impl NvmeController {
             return (SC_INVALID_FIELD | SC_DNR, 0);
         }
 
-        // Validate that the queue base GPA is page-aligned and non-zero.
-        if prp1 == 0 || (prp1 & 0xFFF) != 0 {
+        if !valid_queue_base(prp1) {
             return (SC_INVALID_FIELD | SC_DNR, 0);
         }
 
@@ -1167,20 +1161,10 @@ impl NvmeController {
                 } else {
                     self.msix.table_read(offset)
                 };
-                match ro.len() {
-                    1 => ro.write_u8(val as u8),
-                    2 => ro.write_u16(val as u16),
-                    4 => ro.write_u32(val),
-                    _ => ro.write_u32(val),
-                }
+                ro.write_dword(val)
             }
             RWOp::Write(wo) => {
-                let val = match wo.len() {
-                    1 => u32::from(wo.read_u8()),
-                    2 => u32::from(wo.read_u16()),
-                    4 => wo.read_u32(),
-                    _ => wo.read_u32(),
-                };
+                let val = wo.read_dword();
                 // The PBA is read-only to the guest.
                 if offset < pba_offset {
                     self.msix.table_write(offset, val);
@@ -1415,6 +1399,13 @@ fn write_to_prp(
 // ---------------------------------------------------------------------------
 // I/O worker thread
 // ---------------------------------------------------------------------------
+
+/// Whether a guest-supplied queue base may be used: page-aligned and
+/// non-zero. A malicious guest could otherwise point a queue at the
+/// MMIO region of another device.
+fn valid_queue_base(prp1: u64) -> bool {
+    prp1 != 0 && (prp1 & 0xFFF) == 0
+}
 
 /// Worker thread loop: reads I/O requests from the channel and executes them.
 ///

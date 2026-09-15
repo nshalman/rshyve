@@ -238,20 +238,10 @@ impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
                         } else {
                             msix.table_read(offset)
                         };
-                        match ro.len() {
-                            1 => ro.write_u8(val as u8),
-                            2 => ro.write_u16(val as u16),
-                            4 => ro.write_u32(val),
-                            _ => ro.write_u32(val),
-                        }
+                        ro.write_dword(val)
                     }
                     RWOp::Write(wo) => {
-                        let val = match wo.len() {
-                            1 => u32::from(wo.read_u8()),
-                            2 => u32::from(wo.read_u16()),
-                            4 => wo.read_u32(),
-                            _ => wo.read_u32(),
-                        };
+                        let val = wo.read_dword();
                         if offset < pba_offset {
                             // Sampled before the write takes the
                             // message out of the pending array.
@@ -271,20 +261,10 @@ impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
             match rwo {
                 RWOp::Read(ro) => {
                     let val = self.modern_bar_read(offset as u16, ro.len());
-                    match ro.len() {
-                        1 => ro.write_u8(val as u8),
-                        2 => ro.write_u16(val as u16),
-                        4 => ro.write_u32(val),
-                        _ => ro.write_u32(val),
-                    }
+                    ro.write_dword(val)
                 }
                 RWOp::Write(wo) => {
-                    let val = match wo.len() {
-                        1 => u32::from(wo.read_u8()),
-                        2 => u32::from(wo.read_u16()),
-                        4 => wo.read_u32(),
-                        _ => wo.read_u32(),
-                    };
+                    let val = wo.read_dword();
                     self.modern_bar_write(offset as u16, val, wo.len());
                 }
             }
@@ -299,20 +279,10 @@ impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
         match rwo {
             RWOp::Read(ro) => {
                 let val = self.bar_read(offset as u16, ro.len());
-                match ro.len() {
-                    1 => ro.write_u8(val as u8),
-                    2 => ro.write_u16(val as u16),
-                    4 => ro.write_u32(val),
-                    _ => ro.write_u32(val),
-                }
+                ro.write_dword(val)
             }
             RWOp::Write(wo) => {
-                let val = match wo.len() {
-                    1 => u32::from(wo.read_u8()),
-                    2 => u32::from(wo.read_u16()),
-                    4 => wo.read_u32(),
-                    _ => wo.read_u32(),
-                };
+                let val = wo.read_dword();
                 self.bar_write(offset as u16, val, wo.len());
             }
         }
