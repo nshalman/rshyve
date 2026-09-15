@@ -5,7 +5,6 @@
 use std::fmt;
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
@@ -158,13 +157,7 @@ pub fn flush_file(
     intent: FlushIntent,
     device: &'static str,
 ) -> Result<(), FlushError> {
-    flush_file_with(gate, file, intent, device, FLUSH_BUDGETS, |file| {
-        if crate::blkdev::datasync(file.as_raw_fd()) == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    })
+    flush_file_with(gate, file, intent, device, FLUSH_BUDGETS, File::sync_data)
 }
 
 fn flush_file_with<F>(

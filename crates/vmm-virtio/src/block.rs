@@ -19,7 +19,6 @@
 //! paths corrupt the used index.
 
 use std::fs::File;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -139,8 +138,7 @@ pub struct VirtioBlock {
     pub interrupt: Arc<Mutex<Option<Arc<BackendIntr>>>>,
     /// Per-queue completion handlers, created on first notification.
     completions: Mutex<Vec<Option<Arc<VirtioCompletion>>>>,
-    /// Zvol write-cache control. Declared BEFORE `file` so Drop runs
-    /// `DKIOCSETWCE` restore while the fd is still open.
+    /// Zvol write-cache control.
     _cache: DiskCache,
     /// The backing store. Shared with every worker, so the descriptor
     /// outlives a device that is dropped while a syscall is running.
@@ -164,12 +162,11 @@ impl VirtioBlock {
         let metadata = file.metadata()?;
         let capacity = metadata.len() / u64::from(opts.sector_size);
         let read_only = opts.read_only;
-        let raw_fd = file.as_raw_fd();
         let file = Arc::new(file);
 
         // Enable zvol writeback cache (DKIOCSETWCE=1). Must happen before
         // any I/O so the first guest writes already hit the fast path.
-        let cache = DiskCache::new(raw_fd, read_only);
+        let cache = DiskCache::new(Arc::clone(&file), read_only);
 
         // Workers per queue: NUM_WORKERS for single queue, 2 per queue for MQ.
         let limits = DiskLimits {

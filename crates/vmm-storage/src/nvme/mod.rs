@@ -23,7 +23,6 @@ pub mod bits;
 
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -37,7 +36,7 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::{GuestIoVec, MemCtx, PhysMap};
 use vmm_core::mmio::{MmioBus, MmioFn};
 
-use vmm_devices::blkdev::{datasync, DiskCache};
+use vmm_devices::blkdev::DiskCache;
 use vmm_devices::lifecycle::Indicator;
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
@@ -164,8 +163,7 @@ pub struct NvmeController {
     self_ref: Mutex<Option<std::sync::Weak<Self>>>,
     /// Structured logger for bus registration diagnostics.
     log: slog::Logger,
-    /// Zvol write-cache control. Declared BEFORE `_file` so Drop runs
-    /// `DKIOCSETWCE` restore while the fd is still open.
+    /// Zvol write-cache control.
     _cache: DiskCache,
     /// The backing store, shared with every I/O worker.
     _file: Arc<File>,
@@ -217,12 +215,11 @@ impl NvmeController {
         log: slog::Logger,
     ) -> Arc<Self> {
         let file = Arc::new(file);
-        let raw_fd = file.as_raw_fd();
 
         // Enable zvol writeback cache (DKIOCSETWCE=1). NVMe's protocol has
         // explicit FLUSH semantics, matching the writeback contract. Must
         // happen before any I/O so first writes hit the fast path.
-        let cache = DiskCache::new(raw_fd, read_only);
+        let cache = DiskCache::new(Arc::clone(&file), read_only);
 
         // Determine disk geometry
         let file_len = file
@@ -1546,13 +1543,13 @@ fn process_io_request(
             // must be durable before completion. Without this, a guest
             // filesystem journal commit can report success while the data
             // still lives in zvol writeback cache.
-            if req.fua && datasync(file.as_raw_fd()) != 0 {
+            if req.fua && file.sync_data().is_err() {
                 return SC_INTERNAL_ERROR;
             }
             SC_SUCCESS
         }
         NVM_OPC_FLUSH => {
-            if datasync(file.as_raw_fd()) != 0 {
+            if file.sync_data().is_err() {
                 return SC_INTERNAL_ERROR;
             }
             SC_SUCCESS

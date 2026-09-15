@@ -133,7 +133,7 @@ fn a_write_reaches_the_disk_from_its_snapshot() {
         chain(RECYCLED_GPA, SECTOR as u32, false),
     );
     let done = run_request(
-        file.as_raw_fd(),
+        &file,
         &writable_disk(1),
         &ctx,
         &mut Bounce::new(),
@@ -178,7 +178,7 @@ fn a_read_parked_across_a_reset_lands_nothing_in_a_recycled_page() {
         chain(RECYCLED_GPA, SECTOR as u32, true),
     );
     let done = run_request(
-        file.as_raw_fd(),
+        &file,
         &writable_disk(1),
         &ctx,
         &mut Bounce::new(),
@@ -218,7 +218,7 @@ fn a_short_read_copies_nothing_into_the_guest() {
         chain(RECYCLED_GPA, SECTOR as u32, true),
     );
     assert_eq!(
-        run_request(file.as_raw_fd(), &limits, &ctx, &mut bounce, &first),
+        run_request(&file, &limits, &ctx, &mut bounce, &first),
         Some((0, SECTOR as u32 + 1))
     );
     assert_eq!(peek(&physmap, RECYCLED_GPA, SECTOR), vec![0xAB; SECTOR]);
@@ -231,7 +231,7 @@ fn a_short_read_copies_nothing_into_the_guest() {
         chain(SPARE_GPA, SECTOR as u32, true),
     );
     assert_eq!(
-        run_request(file.as_raw_fd(), &limits, &ctx, &mut bounce, &second),
+        run_request(&file, &limits, &ctx, &mut bounce, &second),
         Some((0, 1)),
         "a read past the end of the file must report only a status byte"
     );
@@ -295,7 +295,7 @@ fn a_request_past_the_buffer_moves_every_byte() {
     };
     let mut bounce = Bounce::new();
     assert_eq!(
-        run_request(file.as_raw_fd(), &limits, &ctx, &mut bounce, &req),
+        run_request(&file, &limits, &ctx, &mut bounce, &req),
         Some((7, TOTAL as u32 + 1))
     );
     assert_eq!(peek(&physmap, data, TOTAL), disk, "a split read lost bytes");
@@ -324,7 +324,7 @@ fn a_request_past_the_buffer_moves_every_byte() {
         epoch: 0,
     };
     assert_eq!(
-        run_request(out.as_raw_fd(), &limits, &ctx, &mut bounce, &req),
+        run_request(&out, &limits, &ctx, &mut bounce, &req),
         Some((8, 1))
     );
     assert_eq!(read_backing(&out, TOTAL), disk, "a split write lost bytes");

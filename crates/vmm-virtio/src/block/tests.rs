@@ -49,8 +49,7 @@ fn worker_ctx(physmap: &Arc<PhysMap>) -> WorkerCtx {
 
 #[test]
 fn quiesce_query_is_non_blocking_with_active_worker() {
-    let file = tempfile::tempfile().expect("create tempfile");
-    let fd = file.as_raw_fd();
+    let file = Arc::new(tempfile::tempfile().expect("create tempfile"));
     let device: Arc<dyn Lifecycle> = Arc::new(VirtioBlock {
         capacity: 0,
         sector_size: 512,
@@ -64,8 +63,8 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         physmap: Arc::new(PhysMap::new()),
         interrupt: Arc::new(Mutex::new(None)),
         completions: Mutex::new(Vec::new()),
-        _cache: DiskCache::new(fd, true),
-        file: Arc::new(file),
+        _cache: DiskCache::new(Arc::clone(&file), true),
+        file,
         indicator: Indicator::new(),
         gate: Arc::new(QuiesceGate::new(1)),
         ctx: worker_ctx(&Arc::new(PhysMap::new())),
