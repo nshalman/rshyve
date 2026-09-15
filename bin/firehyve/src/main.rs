@@ -608,11 +608,14 @@ mod tests {
         }
         // The sink reads the registry the attach pass filled, not a copy.
         assert_eq!(
-            sink.handle_line("device-list"),
+            vmm_virtio::vsock::control::answer_line(
+                sink.as_ref(),
+                "device-list"
+            ),
             "OK 1 virtio-vsock@5,0.5.0,present"
         );
         assert_eq!(
-            sink.handle_line("cpu-list"),
+            vmm_virtio::vsock::control::answer_line(sink.as_ref(), "cpu-list"),
             "OK 2 0,present,boot 1,present,boot"
         );
     }
