@@ -169,13 +169,8 @@ fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
     let api_version = built.api_version;
 
     // Apply CPU feature masking for migration compatibility
-    let cpu_baseline = vmm_core::cpuid::CpuBaseline::parse(&cli.cpu_baseline)
-        .ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown CPU baseline '{}' (valid: host, avx2, no-avx512, sse42)",
-            cli.cpu_baseline,
-        )
-    })?;
+    let cpu_baseline: vmm_core::cpuid::CpuBaseline =
+        cli.cpu_baseline.parse()?;
     if cpu_baseline != vmm_core::cpuid::CpuBaseline::Host {
         info!(log, "applying CPU baseline"; "baseline" => &cli.cpu_baseline);
     }

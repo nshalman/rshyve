@@ -192,13 +192,7 @@ fn run(
 
     // CPUID stays outside build_machine because rshyve folds Hyper-V
     // leaves in here. firehyve has none, so this is the baseline only.
-    let baseline = vmm_core::cpuid::CpuBaseline::parse(&cli.cpu_baseline)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown CPU baseline '{}' (valid: host, avx2, no-avx512, sse42)",
-                cli.cpu_baseline,
-            )
-        })?;
+    let baseline: vmm_core::cpuid::CpuBaseline = cli.cpu_baseline.parse()?;
     // The table, not just the side effect: a CPU brought online later
     // has to be given the one its siblings got.
     let cpuid = vmm_core::cpuid::apply_cpuid_table(
