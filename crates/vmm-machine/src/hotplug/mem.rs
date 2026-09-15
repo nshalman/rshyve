@@ -41,8 +41,7 @@
 //! it. Nothing here may be built as though removal works.
 
 use std::fmt;
-use std::sync::{Arc, Mutex, Weak};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex};
 
 use slog::{debug, error, info, Logger};
 
@@ -52,7 +51,8 @@ use vmm_devices::hotplug::mem::{
     MemHotplug, MemHotplugError as SlotError, MAX_SLOTS,
 };
 
-use super::{lock, Stopper, DRAIN_INTERVAL};
+use super::drain::DrainThread;
+use super::lock;
 
 /// Guest page size. A mapping the kernel accepts is a whole number of
 /// these.
@@ -311,8 +311,7 @@ pub struct MemHotplugEngine {
     /// The drain thread holds a weak reference to this. Keeping the
     /// strong one here is what stops the thread ending early.
     drain: Arc<Drain>,
-    stop: Arc<Stopper>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    thread: DrainThread,
     log: Logger,
 }
 
@@ -349,8 +348,13 @@ impl MemHotplugEngine {
             regs: Arc::clone(&regs),
             log: log.clone(),
         });
-        let stop = Arc::new(Stopper::default());
-        let thread = spawn_drain(&drain, &stop, &log);
+        let thread = DrainThread::spawn(
+            "hotplug-mem",
+            &drain,
+            Drain::refuse_ejects,
+            &log,
+            "no memory hotplug thread; ejects go unanswered",
+        );
 
         Arc::new(Self {
             mapper,
@@ -360,8 +364,7 @@ impl MemHotplugEngine {
             slots,
             filled: Mutex::new(Filled::default()),
             drain,
-            stop,
-            thread: Mutex::new(thread),
+            thread,
             log,
         })
     }
@@ -465,15 +468,10 @@ impl MemHotplugEngine {
         self.drain.refuse_ejects();
     }
 
-    /// Stop the drain thread and wait for it.
+    /// Stop the drain thread and wait for it, then answer a request
+    /// that arrived last.
     pub fn shutdown(&self) {
-        self.stop.stop();
-        let handle = lock(&self.thread).take();
-        if let Some(handle) = handle {
-            if handle.join().is_err() {
-                error!(self.log, "the memory hotplug thread panicked");
-            }
-        }
+        self.thread.shutdown();
         self.refuse_ejects();
     }
 }
@@ -487,40 +485,6 @@ impl Drop for MemHotplugEngine {
 /// Render a register file error without pulling its type into the API.
 fn slot_error(e: SlotError) -> String {
     e.to_string()
-}
-
-fn spawn_drain(
-    drain: &Arc<Drain>,
-    stop: &Arc<Stopper>,
-    log: &Logger,
-) -> Option<JoinHandle<()>> {
-    // Weak, so an engine that is dropped without a shutdown still ends
-    // its thread.
-    let drain = Arc::downgrade(drain);
-    let stop = Arc::clone(stop);
-    let spawned = thread::Builder::new()
-        .name("hotplug-mem".into())
-        .spawn(move || drain_loop(&drain, &stop));
-    match spawned {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            // The VM keeps running and an add still works. An eject
-            // waits in the register file, which is no worse than the
-            // refusal it would have got.
-            error!(log, "no memory hotplug thread; ejects go unanswered";
-                "error" => %e);
-            None
-        }
-    }
-}
-
-fn drain_loop(drain: &Weak<Drain>, stop: &Stopper) {
-    while !stop.wait(DRAIN_INTERVAL) {
-        let Some(drain) = drain.upgrade() else {
-            return;
-        };
-        drain.refuse_ejects();
-    }
 }
 
 #[cfg(test)]

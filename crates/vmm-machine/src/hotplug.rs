@@ -36,8 +36,7 @@
 //! detached from is always the bus its catalog attached it to.
 
 use std::fmt;
-use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use slog::{debug, error, info, warn, Logger};
@@ -62,6 +61,7 @@ use crate::vcpu::VcpuFleet;
 use crate::vcpus::{VcpuRegistry, VcpuSetup};
 
 use self::cpu::{CpuHotplugEngine, CpuHotplugError, CpuOnline};
+use self::drain::DrainThread;
 use self::mem::{MemHotplugEngine, MemHotplugError, MemWindow};
 
 /// How long a device gets to drain before an eject is abandoned.
@@ -484,9 +484,7 @@ pub struct HotplugEngine {
     /// The binary's catalog. `Mutex` because it is `FnMut` and two
     /// control connections can ask at once.
     factory: Mutex<HotplugFactory>,
-    stop: Arc<Stopper>,
-    thread: Mutex<Option<JoinHandle<()>>>,
-    log: Logger,
+    thread: DrainThread,
 }
 
 impl HotplugEngine {
@@ -521,16 +519,19 @@ impl HotplugEngine {
             budget: UNPLUG_BUDGET,
             log: log.clone(),
         });
-        let stop = Arc::new(Stopper::default());
-        let thread = spawn_drain(&core, &stop, &log);
+        let thread = DrainThread::spawn(
+            "hotplug",
+            &core,
+            Core::drain_ejects,
+            &log,
+            "no hotplug thread; ejects will not be drained",
+        );
 
         Arc::new(Self {
             core,
             ctx,
             factory: Mutex::new(factory),
-            stop,
-            thread: Mutex::new(thread),
-            log,
+            thread,
         })
     }
 
@@ -551,80 +552,13 @@ impl HotplugEngine {
 
     /// Stop the drain thread and wait for it.
     pub fn shutdown(&self) {
-        self.stop.stop();
-        let handle = lock(&self.thread).take();
-        if let Some(handle) = handle {
-            if handle.join().is_err() {
-                error!(self.log, "the hotplug thread panicked");
-            }
-        }
+        self.thread.shutdown();
     }
 }
 
 impl Drop for HotplugEngine {
     fn drop(&mut self) {
         self.shutdown();
-    }
-}
-
-fn spawn_drain(
-    core: &Arc<Core>,
-    stop: &Arc<Stopper>,
-    log: &Logger,
-) -> Option<JoinHandle<()>> {
-    // Weak, so an engine that is dropped without a shutdown still ends
-    // its thread.
-    let core = Arc::downgrade(core);
-    let stop = Arc::clone(stop);
-    let spawned = thread::Builder::new()
-        .name("hotplug".into())
-        .spawn(move || drain_loop(&core, &stop));
-    match spawned {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            // The VM keeps running: an add still works, and a removal
-            // waits in the register file instead of being forced.
-            error!(log, "no hotplug thread; ejects will not be drained";
-                "error" => %e);
-            None
-        }
-    }
-}
-
-fn drain_loop(core: &Weak<Core>, stop: &Stopper) {
-    while !stop.wait(DRAIN_INTERVAL) {
-        let Some(core) = core.upgrade() else {
-            return;
-        };
-        core.drain_ejects();
-    }
-}
-
-/// The drain thread's shutdown flag, with the wait that reads it.
-#[derive(Default)]
-struct Stopper {
-    stopped: Mutex<bool>,
-    changed: Condvar,
-}
-
-impl Stopper {
-    fn stop(&self) {
-        *lock(&self.stopped) = true;
-        self.changed.notify_all();
-    }
-
-    /// Wait up to `timeout`, and report whether the engine must stop.
-    fn wait(&self, timeout: Duration) -> bool {
-        let stopped = lock(&self.stopped);
-        if *stopped {
-            return true;
-        }
-        match self.changed.wait_timeout(stopped, timeout) {
-            Ok((stopped, _)) => *stopped,
-            // A poisoned wait still carries the flag, and the flag is
-            // the whole state.
-            Err(e) => *e.into_inner().0,
-        }
     }
 }
 
@@ -857,6 +791,7 @@ pub fn hot_add_window(
 }
 
 pub mod cpu;
+mod drain;
 pub mod mem;
 
 #[cfg(test)]
