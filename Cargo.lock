@@ -1893,6 +1893,7 @@ dependencies = [
  "slog-term",
  "tempfile",
  "usdt",
+ "vmm_boot",
  "vmm_config",
  "vmm_core",
  "vmm_devices",

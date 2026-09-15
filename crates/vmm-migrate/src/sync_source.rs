@@ -31,9 +31,7 @@ use crate::state;
 use crate::MigrationPhase;
 use crate::MigrationStatus;
 
-const BATCH_SIZE: usize = 64;
-const _: () = assert!(BATCH_SIZE <= limits::MAX_PAGES_PER_BATCH as usize);
-const ZSTD_LEVEL: i32 = 1;
+use crate::limits::{BATCH_SIZE, ZSTD_LEVEL};
 
 /// Run the source side of live migration over a synchronous stream.
 ///
