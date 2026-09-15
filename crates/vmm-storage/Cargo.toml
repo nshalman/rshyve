@@ -12,7 +12,6 @@ workspace = true
 vmm_devices.workspace = true
 vmm_core.workspace = true
 anyhow.workspace = true
-libc.workspace = true
 slog.workspace = true
 
 [dev-dependencies]
