@@ -10,10 +10,8 @@
 //! exposed via a generic ioctl escape hatch.
 
 use std::io::{Error, ErrorKind, Result};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::time::Duration;
-
-use std::os::fd::RawFd;
 
 use bhyve_api::{
     ioctls, vcpu_cpuid_entry, vm_cap_type, vm_capability, vm_create_req,
@@ -440,25 +438,32 @@ impl VmmHdl {
     // ---------------------------------------------------------------
 
     /// Bind an open `/dev/pptN` descriptor to this VM.
-    pub fn bind_pptdev(&self, pptfd: RawFd) -> Result<()> {
-        let mut req = vm_pptdev { pptfd };
+    pub fn bind_pptdev(&self, pptfd: BorrowedFd<'_>) -> Result<()> {
+        let mut req = vm_pptdev {
+            pptfd: pptfd.as_raw_fd(),
+        };
         // Safety: vm_pptdev is the correct struct for VM_BIND_PPTDEV.
         unsafe { self.inner.ioctl(ioctls::VM_BIND_PPTDEV, &mut req) }?;
         Ok(())
     }
 
     /// Give a bound passthrough device back to the host.
-    pub fn unbind_pptdev(&self, pptfd: RawFd) -> Result<()> {
-        let mut req = vm_pptdev { pptfd };
+    pub fn unbind_pptdev(&self, pptfd: BorrowedFd<'_>) -> Result<()> {
+        let mut req = vm_pptdev {
+            pptfd: pptfd.as_raw_fd(),
+        };
         // Safety: vm_pptdev is the correct struct for VM_UNBIND_PPTDEV.
         unsafe { self.inner.ioctl(ioctls::VM_UNBIND_PPTDEV, &mut req) }?;
         Ok(())
     }
 
     /// Ask how many MSI and MSI-X vectors a bound device may use.
-    pub fn pptdev_limits(&self, pptfd: RawFd) -> Result<PptdevLimits> {
+    pub fn pptdev_limits(
+        &self,
+        pptfd: BorrowedFd<'_>,
+    ) -> Result<PptdevLimits> {
         let mut req = vm_pptdev_limits {
-            pptfd,
+            pptfd: pptfd.as_raw_fd(),
             msi_limit: 0,
             msix_limit: 0,
         };
@@ -474,13 +479,13 @@ impl VmmHdl {
     /// guest at `gpa`.
     pub fn map_pptdev_mmio(
         &self,
-        pptfd: RawFd,
+        pptfd: BorrowedFd<'_>,
         gpa: u64,
         hpa: u64,
         len: usize,
     ) -> Result<()> {
         let mut req = vm_pptdev_mmio {
-            pptfd,
+            pptfd: pptfd.as_raw_fd(),
             gpa,
             hpa,
             len,
@@ -493,12 +498,12 @@ impl VmmHdl {
     /// Undo [`map_pptdev_mmio`](Self::map_pptdev_mmio) for `gpa`.
     pub fn unmap_pptdev_mmio(
         &self,
-        pptfd: RawFd,
+        pptfd: BorrowedFd<'_>,
         gpa: u64,
         len: usize,
     ) -> Result<()> {
         let mut req = vm_pptdev_mmio {
-            pptfd,
+            pptfd: pptfd.as_raw_fd(),
             gpa,
             hpa: 0,
             len,
@@ -512,14 +517,14 @@ impl VmmHdl {
     /// MSI off.
     pub fn pptdev_msi(
         &self,
-        pptfd: RawFd,
+        pptfd: BorrowedFd<'_>,
         addr: u64,
         msg: u64,
         numvec: i32,
     ) -> Result<()> {
         let mut req = vm_pptdev_msi {
             vcpu: 0,
-            pptfd,
+            pptfd: pptfd.as_raw_fd(),
             numvec,
             msg,
             addr,

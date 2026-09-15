@@ -35,8 +35,9 @@
 //! handlers. MMIO BARs do not need it, because EPT maps them. PIO BARs
 //! do, so a passthrough device with an I/O BAR decodes nothing.
 
-use std::io::{Error, ErrorKind, Result};
-use std::os::unix::io::RawFd;
+use std::io::Result;
+use std::fs::File;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 
 use bhyve_api::{
@@ -113,8 +114,8 @@ struct BarInfo {
 /// guest. MMIO BARs go into guest physical address space with EPT.
 /// Config space is interposed, deny by default.
 pub struct PciPassthru {
-    /// File descriptor for `/dev/pptN`.
-    ppt_fd: RawFd,
+    /// The open `/dev/pptN`.
+    ppt: File,
     /// VM handle for ioctls.
     hdl: Arc<VmmHdl>,
     /// Cached physical BAR information from the kernel.
@@ -159,35 +160,20 @@ impl PciPassthru {
         hdl: Arc<VmmHdl>,
         log: Logger,
     ) -> Result<Arc<Self>> {
-        // Open the PPT device.
-        let ppt_fd = {
-            let c_path = std::ffi::CString::new(ppt_path).map_err(|_| {
-                Error::new(ErrorKind::InvalidInput, "invalid ppt path")
-            })?;
-            // Safety: opening a device node with valid C string.
-            // Guest-reset re-exec must not inherit passthrough descriptors.
-            let fd = unsafe {
-                libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
-            };
-            if fd < 0 {
-                return Err(Error::last_os_error());
-            }
-            fd
-        };
+        // std opens close-on-exec, so a guest-reset re-exec does not
+        // inherit the device.
+        let ppt = File::options().read(true).write(true).open(ppt_path)?;
 
-        hdl.bind_pptdev(ppt_fd).inspect_err(|_| {
-            // Clean up the fd on bind failure.
-            unsafe { libc::close(ppt_fd) };
-        })?;
+        hdl.bind_pptdev(ppt.as_fd())?;
 
         // From here on every early return must give the device back to
         // the host, so the bind is owned by a guard.
         let bound = BoundPpt {
-            fd: ppt_fd,
+            ppt: Some(ppt),
             hdl: Arc::clone(&hdl),
-            armed: true,
             log: log.clone(),
         };
+        let ppt_fd = bound.fd();
 
         let limits = hdl.pptdev_limits(ppt_fd)?;
 
@@ -286,7 +272,7 @@ impl PciPassthru {
         dev_state.set_cap_ptr(phys_cfg[CFG_CAP_PTR]);
 
         Ok(Arc::new(Self {
-            ppt_fd: bound.release(),
+            ppt: bound.release(),
             hdl,
             bars,
             phys_cfg,
@@ -310,7 +296,7 @@ impl PciPassthru {
             pci_data: 0,
         };
         // Safety: ppt_cfg_io is correct for PPT_CFG_READ on our ppt_fd.
-        unsafe { ioctl_on_fd(self.ppt_fd, ioctls::PPT_CFG_READ, &mut cfg_io) }?;
+        unsafe { ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_CFG_READ, &mut cfg_io) }?;
         Ok(cfg_io.pci_data)
     }
 
@@ -327,7 +313,7 @@ impl PciPassthru {
         };
         // Safety: ppt_cfg_io is correct for PPT_CFG_WRITE on our ppt_fd.
         unsafe {
-            ioctl_on_fd(self.ppt_fd, ioctls::PPT_CFG_WRITE, &mut cfg_io)
+            ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_CFG_WRITE, &mut cfg_io)
         }?;
         Ok(())
     }
@@ -336,12 +322,12 @@ impl PciPassthru {
     fn map_bar_mmio(&self, bar_idx: usize, gpa: u64, len: u64) -> Result<()> {
         let hpa = self.bars[bar_idx].hpa;
         self.hdl
-            .map_pptdev_mmio(self.ppt_fd, gpa, hpa, len as usize)
+            .map_pptdev_mmio(self.ppt.as_fd(), gpa, hpa, len as usize)
     }
 
     /// Unmap a PPT device BAR from guest physical address space.
     fn unmap_bar_mmio(&self, gpa: u64, len: u64) -> Result<()> {
-        self.hdl.unmap_pptdev_mmio(self.ppt_fd, gpa, len as usize)
+        self.hdl.unmap_pptdev_mmio(self.ppt.as_fd(), gpa, len as usize)
     }
 
     /// Handle a BAR address change: unmap old mapping, create new one.
@@ -448,7 +434,7 @@ impl PciPassthru {
             pbi_data: 0,
         };
         // Safety: ppt_bar_io is correct for PPT_BAR_READ.
-        match unsafe { ioctl_on_fd(self.ppt_fd, ioctls::PPT_BAR_READ, &mut io) }
+        match unsafe { ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_BAR_READ, &mut io) }
         {
             Ok(_) => io.pbi_data,
             // An undecoded PCI read returns all ones.
@@ -466,7 +452,7 @@ impl PciPassthru {
         };
         // Safety: ppt_bar_io is correct for PPT_BAR_WRITE.
         if let Err(e) =
-            unsafe { ioctl_on_fd(self.ppt_fd, ioctls::PPT_BAR_WRITE, &mut io) }
+            unsafe { ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_BAR_WRITE, &mut io) }
         {
             warn!(self.log, "passthru: BAR I/O write failed";
                 "bar" => bar, "off" => offset, "error" => %e);
@@ -719,7 +705,7 @@ impl PciPassthru {
         let enabled = *self.msi_enabled.lock().expect("msi_enabled lock");
         let numvec = msi_numvec(msg_ctrl, enabled, self.msi_limit);
 
-        if let Err(e) = self.hdl.pptdev_msi(self.ppt_fd, addr, data, numvec) {
+        if let Err(e) = self.hdl.pptdev_msi(self.ppt.as_fd(), addr, data, numvec) {
             warn!(self.log, "passthru: MSI setup failed, device has no \
                 interrupt";
                 "numvec" => numvec, "error" => %e);
@@ -735,39 +721,40 @@ impl PciPassthru {
 /// Without this, an error after `VM_BIND_PPTDEV` leaks the descriptor
 /// and leaves the device owned by a VM that never starts.
 struct BoundPpt {
-    fd: RawFd,
+    /// `None` once the device took the file.
+    ppt: Option<File>,
     hdl: Arc<VmmHdl>,
-    armed: bool,
     log: Logger,
 }
 
 impl BoundPpt {
+    fn fd(&self) -> BorrowedFd<'_> {
+        self.ppt.as_ref().expect("the guard holds the file").as_fd()
+    }
+
     /// Give up ownership once the device is built.
-    fn release(mut self) -> RawFd {
-        self.armed = false;
-        self.fd
+    fn release(mut self) -> File {
+        self.ppt.take().expect("the guard holds the file")
     }
 }
 
 impl Drop for BoundPpt {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
+        if let Some(ppt) = self.ppt.take() {
+            unbind_ppt(&ppt, &self.hdl, &self.log);
         }
-        unbind_ppt(self.fd, &self.hdl, &self.log);
     }
 }
 
-/// Unbind a PPT device from the VM and close its descriptor.
-fn unbind_ppt(fd: RawFd, hdl: &VmmHdl, log: &Logger) {
-    if let Err(e) = hdl.unbind_pptdev(fd) {
+/// Unbind a PPT device from the VM. The caller's drop of `ppt` then
+/// closes it.
+fn unbind_ppt(ppt: &File, hdl: &VmmHdl, log: &Logger) {
+    if let Err(e) = hdl.unbind_pptdev(ppt.as_fd()) {
         // Nothing else can run here, so the record is the only remedy:
         // the device stays owned by the VM until the instance goes.
         warn!(log, "passthru: unbind failed, device still held";
             "error" => %e);
     }
-    // Safety: fd is the descriptor opened in `new`.
-    unsafe { libc::close(fd) };
 }
 
 impl Drop for PciPassthru {
@@ -780,7 +767,7 @@ impl Drop for PciPassthru {
             self.report_unmap(gpa, len);
         }
 
-        unbind_ppt(self.ppt_fd, &self.hdl, &self.log);
+        unbind_ppt(&self.ppt, &self.hdl, &self.log);
     }
 }
 
@@ -792,8 +779,12 @@ impl Drop for PciPassthru {
 ///
 /// The caller must provide a `data` pointer to a struct that is correct
 /// for the given `cmd` ioctl number.
-unsafe fn ioctl_on_fd<T>(fd: RawFd, cmd: i32, data: &mut T) -> Result<i32> {
-    vmm_api_common::ioctl(fd, cmd, std::ptr::from_mut(data).cast())
+unsafe fn ioctl_on_fd<T>(
+    fd: BorrowedFd<'_>,
+    cmd: i32,
+    data: &mut T,
+) -> Result<i32> {
+    vmm_api_common::ioctl(fd.as_raw_fd(), cmd, std::ptr::from_mut(data).cast())
 }
 
 /// Extract bytes from a dword value based on the access offset and length.

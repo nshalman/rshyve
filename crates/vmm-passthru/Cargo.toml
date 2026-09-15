@@ -13,5 +13,4 @@ vmm_devices.workspace = true
 vmm_core.workspace = true
 bhyve_api.workspace = true
 vmm_api_common.workspace = true
-libc.workspace = true
 slog.workspace = true
