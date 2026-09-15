@@ -125,7 +125,6 @@ pub fn virtio_blk(
             })?;
 
     let cfg_size = blk.config_size();
-    let blk_intr = Arc::clone(&blk.interrupt);
     // One MSI-X vector per queue, plus one for config change.
     let msix = Arc::new(MsixTable::new(num_queues + 1, ctx.msi_sink()));
 
@@ -144,8 +143,7 @@ pub fn virtio_blk(
 
     // Workers raise through the transport so the interrupt takes the
     // MSI-X vector when the guest enabled it, and INTx otherwise.
-    *blk_intr.lock().expect("virtio-blk interrupt lock") =
-        Some(pci_dev.backend_intr());
+    pci_dev.device().install_interrupt(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }
@@ -203,12 +201,8 @@ pub fn virtio_viona(
         ctx.msi_sink(),
     ));
 
-    // The poll thread reads this slot on every wakeup, so it can
-    // start before the transport exists. It names the driver session
-    // each notification was collected under, which a raise made
-    // through a bare callback could not.
-    let viona_intr = dev.interrupt();
-
+    // The poll thread reads the interrupt slot on every wakeup, so it
+    // can start before the transport exists.
     let intr_log = log.new(slog::o!("component" => "viona-intr"));
     if defer_poll {
         dev.defer_intr_poll(intr_log);
@@ -229,8 +223,7 @@ pub fn virtio_viona(
         Some(msix),
     );
 
-    *viona_intr.lock().expect("viona interrupt lock") =
-        Some(pci_dev.backend_intr());
+    pci_dev.device().install_interrupt(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }
@@ -250,7 +243,6 @@ pub fn virtio_console(
     let console =
         VirtioConsole::new(socket_path, Arc::clone(ctx.physmap), log.clone())?;
     let cfg_size = console.config_size();
-    let con_intr = console.interrupt();
 
     // One vector per queue, plus one for config change.
     let msix = Arc::new(MsixTable::new(CONSOLE_MSIX_VECTORS, ctx.msi_sink()));
@@ -270,8 +262,7 @@ pub fn virtio_console(
 
     // Only the receive queue completes out of band; the transport
     // raises for the transmit queue on its own.
-    *con_intr.lock().expect("virtio-console interrupt lock") =
-        Some(pci_dev.backend_intr());
+    pci_dev.device().install_interrupt(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }
@@ -293,7 +284,6 @@ pub fn virtio_fs(
     log: &slog::Logger,
 ) -> anyhow::Result<Arc<VirtioPciDevice<VirtioFs>>> {
     let fs = VirtioFs::new(opts, Arc::clone(ctx.physmap), log.clone())?;
-    let fs_intr = Arc::clone(&fs.interrupt);
 
     let msix = Arc::new(MsixTable::new(FS_MSIX_VECTORS, ctx.msi_sink()));
 
@@ -312,8 +302,7 @@ pub fn virtio_fs(
 
     // Both queues complete out of band, so the raise carries the queue
     // index and each queue raises its own MSI-X vector.
-    *fs_intr.lock().expect("virtio-fs interrupt lock") =
-        Some(pci_dev.backend_intr());
+    pci_dev.device().install_interrupt(pci_dev.backend_intr());
 
     Ok(pci_dev)
 }

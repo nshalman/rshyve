@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use viona_api::{LinkOps, PromiscMode};
 
 use super::{RingState, VionaInner, VirtioViona, ETHERADDRL, NET_NUM_QUEUES};
+use crate::pci::intr::IntrSlot;
 
 impl VirtioViona {
     /// Create a new viona-backed virtio-net device.
@@ -47,7 +48,7 @@ impl VirtioViona {
                 log: None,
                 halted: false,
             }),
-            interrupt: Arc::new(Mutex::new(None)),
+            interrupt: Arc::new(IntrSlot::new()),
         }
     }
 

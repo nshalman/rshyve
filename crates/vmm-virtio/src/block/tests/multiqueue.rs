@@ -81,9 +81,10 @@ fn mq_harness(num_queues: u16) -> MqHarness {
         .expect("create VirtioBlock");
 
     let seen = Arc::new(Mutex::new(Vec::new()));
-    *block.interrupt.lock().expect("interrupt lock") = Some(
-        BackendIntr::recording(Arc::new(IntrGate::new()), Arc::clone(&seen)),
-    );
+    block.interrupt.install(BackendIntr::recording(
+        Arc::new(IntrGate::new()),
+        Arc::clone(&seen),
+    ));
 
     MqHarness {
         physmap,

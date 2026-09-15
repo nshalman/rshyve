@@ -50,7 +50,7 @@ mod tests;
 mod worker;
 
 use crate::access::{GuestAccess, Session};
-use crate::pci::intr::{next_intr_session, BackendIntr};
+use crate::pci::intr::{BackendIntr, IntrSlot};
 use access::BackendBarrier;
 use io::{parse_header, write_status};
 use worker::{blk_io_worker, needs_backend, BlkIoRequest, WorkerCtx};
@@ -134,8 +134,9 @@ pub struct VirtioBlock {
     next_worker: Vec<AtomicUsize>,
     /// Guest physical memory for completion handler creation.
     physmap: Arc<PhysMap>,
-    /// The transport interrupt path, set after PCI device creation.
-    pub interrupt: Arc<Mutex<Option<Arc<BackendIntr>>>>,
+    /// The transport interrupt path, installed after the transport
+    /// exists.
+    interrupt: Arc<IntrSlot>,
     /// Per-queue completion handlers, created on first notification.
     completions: Mutex<Vec<Option<Arc<VirtioCompletion>>>>,
     /// Zvol write-cache control.
@@ -153,6 +154,11 @@ pub struct VirtioBlock {
 }
 
 impl VirtioBlock {
+    /// Install the transport interrupt path once the transport exists.
+    pub fn install_interrupt(&self, intr: Arc<BackendIntr>) {
+        self.interrupt.install(intr);
+    }
+
     pub fn new(
         file: File,
         opts: &VirtioBlockOpts,
@@ -219,7 +225,7 @@ impl VirtioBlock {
             io_txs,
             next_worker,
             physmap,
-            interrupt: Arc::new(Mutex::new(None)),
+            interrupt: Arc::new(IntrSlot::new()),
             completions: Mutex::new(completions),
             _cache: cache,
             file,
@@ -274,14 +280,7 @@ impl VirtioBlock {
         // the ring that vector names, so a completion raised on any
         // other index is never collected.
         let interrupt_fn = move |session| {
-            // The slot is unlocked for the raise. Delivery is a call
-            // into the kernel, and the reset reads this slot, so a
-            // raise that held the lock would put that call in front
-            // of a vCPU.
-            let path = intr.lock().ok().and_then(|slot| slot.clone());
-            if let Some(path) = path {
-                path.raise(session, queue_idx);
-            }
+            intr.raise(session, queue_idx);
         };
 
         let c = VirtioCompletion::new(
@@ -655,10 +654,9 @@ impl VirtioDevice for VirtioBlock {
         for slot in self.completions.lock().expect("lock").iter_mut() {
             *slot = None;
         }
-        self.ctx.access.reopen(next_intr_session(
-            &self.interrupt,
-            self.ctx.access.intr_session(),
-        ));
+        self.ctx.access.reopen(
+            self.interrupt.next_session(self.ctx.access.intr_session()),
+        );
     }
 }
 

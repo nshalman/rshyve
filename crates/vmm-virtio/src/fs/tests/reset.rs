@@ -164,8 +164,8 @@ fn the_notify_path_hands_the_interrupt_to_the_transport() {
     let raised = Arc::new(AtomicBool::new(false));
     {
         let raised = Arc::clone(&raised);
-        *fs.interrupt.lock().expect("interrupt lock") =
-            Some(BackendIntr::detached(move |_session, _queue| {
+        fs.interrupt
+            .install(BackendIntr::detached(move |_session, _queue| {
                 raised.store(true, Ordering::Release)
             }));
     }
@@ -195,8 +195,8 @@ fn a_completion_from_the_closed_session_raises_nothing() {
     let req = usize::from(FS_REQUEST_QUEUE);
     let gate = Arc::new(IntrGate::new());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    *fs.interrupt.lock().expect("interrupt lock") =
-        Some(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
+    fs.interrupt
+        .install(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
 
     // Built the way a queue notification builds it: under permission.
     let handler = || {

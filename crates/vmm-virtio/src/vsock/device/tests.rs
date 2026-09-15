@@ -723,8 +723,10 @@ fn an_rx_completion_from_the_closed_session_raises_nothing() {
     let (dir, vsock) = test_vsock(Arc::clone(&physmap));
     let gate = Arc::new(IntrGate::new());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    *vsock.shared.interrupt.lock().expect("interrupt lock") =
-        Some(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
+    vsock
+        .shared
+        .interrupt
+        .install(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
 
     let stale = vsock.ensure_rx_completion(&queues[0]);
 

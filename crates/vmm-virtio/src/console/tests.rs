@@ -229,10 +229,11 @@ fn host_bytes_reach_guest_memory() {
     let (dir, console) = console_in_tempdir(Arc::clone(&physmap));
     let raised = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&raised);
-    *console.interrupt().lock().expect("interrupt lock") =
-        Some(BackendIntr::detached(move |_session, _queue| {
+    console.install_interrupt(BackendIntr::detached(
+        move |_session, _queue| {
             counter.fetch_add(1, Ordering::Release);
-        }));
+        },
+    ));
 
     let mut queues = [rx_queue, VirtQueue::new(4)];
     assert!(!console.notify_queue(CONSOLE_RX_QUEUE, &mut queues, &physmap));
@@ -541,8 +542,10 @@ fn an_rx_completion_from_the_closed_session_raises_nothing() {
     let (_dir, console) = console_in_tempdir(Arc::clone(&physmap));
     let gate = Arc::new(IntrGate::new());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    *console.interrupt().lock().expect("interrupt lock") =
-        Some(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
+    console.install_interrupt(BackendIntr::recording(
+        Arc::clone(&gate),
+        Arc::clone(&seen),
+    ));
 
     let stale = console.ensure_rx_completion(&rx_queue);
 

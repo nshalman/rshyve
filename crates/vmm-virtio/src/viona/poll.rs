@@ -13,14 +13,12 @@
 //! whole loop is the same code on every platform and a test can drive
 //! it with its own link.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use viona_api::{IntrWait, LinkOps};
 
-use super::{VionaInterrupt, VirtioViona, NET_NUM_QUEUES};
-
-/// The interrupt slot the poll thread reads its path from.
-type IntrSlot = Arc<Mutex<Option<VionaInterrupt>>>;
+use super::{VirtioViona, NET_NUM_QUEUES};
+use crate::pci::intr::IntrSlot;
 
 // The poll thread raises one interrupt per ring, and the transport
 // holds one MSI-X vector per queue. A kernel that grew more rings than
@@ -56,7 +54,7 @@ impl VirtioViona {
     /// guest, and both failures are resource exhaustion at boot.
     fn poller_start(
         inner: &mut super::VionaInner,
-        intr: IntrSlot,
+        intr: Arc<IntrSlot>,
         log: slog::Logger,
     ) {
         // A second thread on the same descriptor would be left running
@@ -155,13 +153,10 @@ impl VirtioViona {
 /// It belongs to a driver that no longer exists.
 pub(super) fn deliver_pending(
     link: &dyn LinkOps,
-    slot: &Mutex<Option<VionaInterrupt>>,
+    slot: &IntrSlot,
     log: &slog::Logger,
 ) {
-    // Cloned out, because the raise takes transport locks and the
-    // binary fills this slot once.
-    let path = slot.lock().unwrap_or_else(PoisonError::into_inner).clone();
-    let Some(intr) = path else {
+    let Some(intr) = slot.get() else {
         // The transport is not wired up yet, so no driver can have
         // armed a ring.
         return;
@@ -203,7 +198,7 @@ pub(super) fn deliver_pending(
 pub(super) fn viona_intr_poll_loop(
     link: &dyn LinkOps,
     stop: std::io::PipeReader,
-    slot: &Mutex<Option<VionaInterrupt>>,
+    slot: &IntrSlot,
     log: slog::Logger,
 ) {
     loop {

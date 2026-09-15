@@ -281,6 +281,11 @@ pub struct VirtioPciDevice<D: VirtioDevice> {
 }
 
 impl<D: VirtioDevice> VirtioPciDevice<D> {
+    /// The backend behind this transport.
+    pub fn device(&self) -> &D {
+        &self.device
+    }
+
     /// Create a new VirtIO PCI device (transitional: legacy + modern).
     ///
     /// # Arguments

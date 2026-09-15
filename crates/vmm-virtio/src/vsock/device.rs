@@ -46,10 +46,11 @@ use vmm_core::unixsock::{bind_restricted, SocketPolicy};
 use vmm_devices::lifecycle::Indicator;
 use vmm_devices::QuiesceGate;
 
-use self::shared::{InterruptFn, VsockShared};
+use self::shared::VsockShared;
 use super::control::ControlSlot;
 use super::mux::VsockMux;
 use super::packet::CID_GUEST_MIN;
+use crate::pci::intr::{BackendIntr, IntrSlot};
 use crate::queue::VirtQueue;
 use crate::VirtioDevice;
 
@@ -138,7 +139,7 @@ impl VirtioVsock {
             pending_rx: Mutex::new(VecDeque::new()),
             rx_completion: Mutex::new(None),
             delivery: Mutex::new(()),
-            interrupt: Arc::new(Mutex::new(None)),
+            interrupt: Arc::new(IntrSlot::new()),
             sockets: Mutex::new(HashMap::new()),
             control: ControlSlot::default(),
             socket_path: socket_path.to_path_buf(),
@@ -162,10 +163,9 @@ impl VirtioVsock {
         })
     }
 
-    /// The interrupt slot, for the binary to fill after the transport
-    /// exists. Clone this before moving the device into the transport.
-    pub fn interrupt(&self) -> Arc<Mutex<Option<InterruptFn>>> {
-        Arc::clone(&self.shared.interrupt)
+    /// Install the transport interrupt path once the transport exists.
+    pub fn install_interrupt(&self, intr: Arc<BackendIntr>) {
+        self.shared.interrupt.install(intr);
     }
 
     /// The control slot, for the binary to fill once the device registry

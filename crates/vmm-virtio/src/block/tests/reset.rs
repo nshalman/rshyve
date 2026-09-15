@@ -50,13 +50,12 @@ fn park_in_the_interrupt(
     let release = Arc::new(AtomicBool::new(false));
     let hook_raised = Arc::clone(&raised);
     let hook_release = Arc::clone(&release);
-    *blk.interrupt.lock().expect("interrupt lock") =
-        Some(BackendIntr::detached(move |_, _| {
-            hook_raised.store(true, Ordering::Release);
-            while !hook_release.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_millis(1));
-            }
-        }));
+    blk.interrupt.install(BackendIntr::detached(move |_, _| {
+        hook_raised.store(true, Ordering::Release);
+        while !hook_release.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }));
     (raised, release)
 }
 
@@ -352,10 +351,9 @@ fn the_notify_path_hands_the_interrupt_to_the_transport() {
     let raised = Arc::new(AtomicBool::new(false));
     {
         let raised = Arc::clone(&raised);
-        *blk.interrupt.lock().expect("interrupt lock") =
-            Some(BackendIntr::detached(move |_, _| {
-                raised.store(true, Ordering::Release)
-            }));
+        blk.interrupt.install(BackendIntr::detached(move |_, _| {
+            raised.store(true, Ordering::Release)
+        }));
     }
 
     let asked = blk.notify_queue(0, &mut queues, &physmap);
@@ -384,8 +382,9 @@ fn an_old_session_interrupt_is_dropped_after_the_reset_returns() {
     let raised = Arc::new(AtomicBool::new(false));
     {
         let raised = Arc::clone(&raised);
-        *h.block.interrupt.lock().expect("interrupt lock") =
-            Some(BackendIntr::detached(move |_, _| {
+        h.block
+            .interrupt
+            .install(BackendIntr::detached(move |_, _| {
                 raised.store(true, Ordering::Release)
             }));
     }
@@ -852,8 +851,8 @@ fn a_completion_from_the_closed_session_raises_nothing() {
     let (_physmap, queue, blk) = make_get_id_queue(8, 0);
     let gate = Arc::new(IntrGate::new());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    *blk.interrupt.lock().expect("interrupt lock") =
-        Some(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
+    blk.interrupt
+        .install(BackendIntr::recording(Arc::clone(&gate), Arc::clone(&seen)));
 
     let stale = completion_for(&blk, &queue);
 

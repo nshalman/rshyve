@@ -33,7 +33,7 @@ use vmm_core::unixsock::{bind_restricted, write_all_bounded, SocketPolicy};
 
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::{queue_drain_should_stop, VirtioDevice};
-use crate::pci::intr::{next_intr_session, BackendIntr, IntrSession};
+use crate::pci::intr::{BackendIntr, IntrSession, IntrSlot};
 use vmm_devices::lifecycle::{IndicatedState, Indicator};
 use vmm_devices::{Lifecycle, QuiesceGate};
 
@@ -73,11 +73,6 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 /// Pause after an accept that failed for a reason retrying cannot fix.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
-/// The transport interrupt path, installed by the binary after the
-/// transport exists. Clone the slot before the device is moved into
-/// the transport.
-pub type ConsoleInterrupt = Arc<BackendIntr>;
-
 /// State shared with the accept and reader threads.
 struct ConsoleShared {
     socket_path: PathBuf,
@@ -90,7 +85,7 @@ struct ConsoleShared {
     /// Guest RX chains with no host bytes to fill them yet.
     pending_rx: Mutex<VecDeque<(u16, Vec<ChainBuf>)>>,
     rx_completion: Mutex<Option<Arc<VirtioCompletion>>>,
-    interrupt: Arc<Mutex<Option<ConsoleInterrupt>>>,
+    interrupt: Arc<IntrSlot>,
     /// Reader threads, one per client that has been attached.
     readers: Mutex<Vec<JoinHandle<()>>>,
     shutdown: AtomicBool,
@@ -393,7 +388,7 @@ impl VirtioConsole {
             backlog: Mutex::new(VecDeque::new()),
             pending_rx: Mutex::new(VecDeque::new()),
             rx_completion: Mutex::new(None),
-            interrupt: Arc::new(Mutex::new(None)),
+            interrupt: Arc::new(IntrSlot::new()),
             readers: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
             gate: Arc::new(QuiesceGate::new(0)),
@@ -415,10 +410,9 @@ impl VirtioConsole {
         })
     }
 
-    /// The interrupt slot, for the binary to fill after the transport
-    /// exists. Clone this before moving the device into the transport.
-    pub fn interrupt(&self) -> Arc<Mutex<Option<ConsoleInterrupt>>> {
-        Arc::clone(&self.shared.interrupt)
+    /// Install the transport interrupt path once the transport exists.
+    pub fn install_interrupt(&self, intr: Arc<BackendIntr>) {
+        self.shared.interrupt.install(intr);
     }
 
     pub const fn config_size(&self) -> u16 {
@@ -446,21 +440,13 @@ impl VirtioConsole {
             return Arc::clone(completion);
         }
         let intr = Arc::clone(&self.shared.interrupt);
-        let session =
-            next_intr_session(&self.shared.interrupt, IntrSession::INITIAL);
+        let session = self.shared.interrupt.next_session(IntrSession::INITIAL);
         let completion = VirtioCompletion::new(
             queue,
             Arc::clone(&self.shared.physmap),
             session,
             move |session| {
-                // The slot is unlocked for the raise. Delivery is a
-                // call into the kernel, and the reset reads this
-                // slot, so a raise that held the lock would put that
-                // call in front of a vCPU.
-                let path = intr.lock().ok().and_then(|slot| slot.clone());
-                if let Some(path) = path {
-                    path.raise(session, CONSOLE_RX_QUEUE);
-                }
+                intr.raise(session, CONSOLE_RX_QUEUE);
             },
         );
         // Force the first completions through EVENT_IDX suppression so

@@ -61,7 +61,7 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         io_txs: Vec::new(),
         next_worker: Vec::new(),
         physmap: Arc::new(PhysMap::new()),
-        interrupt: Arc::new(Mutex::new(None)),
+        interrupt: Arc::new(IntrSlot::new()),
         completions: Mutex::new(Vec::new()),
         _cache: DiskCache::new(Arc::clone(&file), true),
         file,

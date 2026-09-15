@@ -835,7 +835,7 @@ fn counting_interrupt(
             }
         })
     };
-    *fs.interrupt.lock().expect("interrupt lock") = Some(hook);
+    fs.interrupt.install(hook);
     (raised, inside)
 }
 

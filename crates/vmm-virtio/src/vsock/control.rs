@@ -148,7 +148,6 @@ pub fn attach_with_control(
         log.clone(),
     )?;
     let cfg_size = vsock.config_size();
-    let vsock_intr = vsock.interrupt();
     let control = vsock.control_slot();
 
     let msix = Arc::new(MsixTable::new(VSOCK_MSIX_VECTORS, ctx.msi_sink()));
@@ -168,8 +167,7 @@ pub fn attach_with_control(
 
     // Only the receive queue completes out of band; the transport
     // raises for the transmit queue on its own.
-    *vsock_intr.lock().expect("virtio-vsock interrupt lock") =
-        Some(pci_dev.backend_intr());
+    pci_dev.device().install_interrupt(pci_dev.backend_intr());
 
     Ok((pci_dev, control))
 }
