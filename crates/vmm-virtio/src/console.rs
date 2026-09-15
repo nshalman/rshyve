@@ -17,7 +17,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::net::Shutdown;
-use std::os::fd::AsRawFd;
+use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,9 +28,8 @@ use std::time::Duration;
 use anyhow::Context;
 use slog::{debug, warn};
 use vmm_core::mem::PhysMap;
-use vmm_core::unixsock::{
-    bind_restricted, poll_events, write_all_bounded, SocketPolicy,
-};
+use vmm_core::poll::{wait_readable, Readiness};
+use vmm_core::unixsock::{bind_restricted, write_all_bounded, SocketPolicy};
 
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::{queue_drain_should_stop, VirtioDevice};
@@ -71,7 +70,7 @@ const TX_CHUNK: usize = 4096;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 /// How long the accept thread waits before it re-reads the shutdown
 /// flag. Bounds how long `halt` waits for that thread to return.
-const ACCEPT_POLL_MS: i32 = 50;
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
 /// Pause after an accept that failed for a reason retrying cannot fix.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// The transport interrupt path, installed by the binary after the
@@ -269,7 +268,7 @@ impl ConsoleShared {
     }
 }
 
-/// Wait for events on `fd`, or for `timeout_ms` to pass.
+/// Accept clients until shutdown, waking on a timer to notice it.
 ///
 /// A blocking `accept` can only be broken by racing a connect against
 /// the listener, and a connect that fails leaves the thread blocked
@@ -280,19 +279,15 @@ fn accept_loop(shared: Arc<ConsoleShared>, listener: UnixListener) {
             "error" => %error);
         return;
     }
-    let fd = listener.as_raw_fd();
 
     while !shared.shutdown.load(Ordering::Acquire) {
-        let revents = poll_events(fd, ACCEPT_POLL_MS);
-        // A dead listener reports its condition on every call, so the
-        // loop must leave rather than spin on it.
-        if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-            warn!(shared.log, "virtio-console listener is unusable";
-                "revents" => i32::from(revents));
-            return;
-        }
-        if revents & libc::POLLIN == 0 {
-            continue;
+        match wait_readable(listener.as_fd(), ACCEPT_POLL) {
+            Readiness::Readable => {}
+            Readiness::Idle => continue,
+            Readiness::Gone => {
+                warn!(shared.log, "virtio-console listener is unusable");
+                return;
+            }
         }
         match listener.accept() {
             Ok((stream, _)) => shared.attach_client(stream),
