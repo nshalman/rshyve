@@ -142,7 +142,8 @@ fn check_name(what: &str, value: &str) -> anyhow::Result<()> {
     ensure!(
         !value.is_empty()
             && value.chars().all(|c| {
-                c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':')
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '_' | '-' | '.' | '/' | ':')
             }),
         "{what} {value:?} holds a character that is not allowed"
     );
@@ -161,7 +162,12 @@ impl Ssh {
         let mut cmd = Command::new("ssh");
         cmd.arg("-i")
             .arg(&self.key)
-            .args(["-o", "StrictHostKeyChecking=no", "-o", "IdentitiesOnly=yes"])
+            .args([
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "IdentitiesOnly=yes",
+            ])
             .arg(format!("root@{}", self.host))
             .args(argv);
         cmd
@@ -198,7 +204,11 @@ fn remote_zfs_destroy_quiet(ssh: &Ssh, snapshot: &str) {
 
 /// Pipe `zfs send <send_args>` into `zfs recv -F <dst>` on the remote
 /// host. Both ends must exit clean.
-fn zfs_send_recv(send_args: &[&str], ssh: &Ssh, dst: &str) -> anyhow::Result<()> {
+fn zfs_send_recv(
+    send_args: &[&str],
+    ssh: &Ssh,
+    dst: &str,
+) -> anyhow::Result<()> {
     let mut send = Command::new("zfs")
         .arg("send")
         .args(send_args)
@@ -222,7 +232,10 @@ fn zfs_send_recv(send_args: &[&str], ssh: &Ssh, dst: &str) -> anyhow::Result<()>
 }
 
 /// Send one control command to the VMM and log its answer.
-fn control_command(ctl: &Path, command: &serde_json::Value) -> anyhow::Result<()> {
+fn control_command(
+    ctl: &Path,
+    command: &serde_json::Value,
+) -> anyhow::Result<()> {
     let mut stream = std::os::unix::net::UnixStream::connect(ctl)
         .with_context(|| format!("connect to {}", ctl.display()))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -328,7 +341,8 @@ fn run_source(
     rt.block_on(async {
         let dest_addr = format!("{dest_host}:{dest_port}");
         log(&format!("  connecting to dest agent at {dest_addr}..."));
-        let tcp = tokio::net::TcpStream::connect(&dest_addr).await
+        let tcp = tokio::net::TcpStream::connect(&dest_addr)
+            .await
             .context("connect to dest agent")?;
         log("  connected to dest agent");
 
@@ -342,11 +356,13 @@ fn run_source(
             .unwrap_or("/tmp/vmm-migrate-data.sock");
 
         // Create ZFS barrier socket for post-pause sync
-        let barrier_gz_path = format!("/zones/{uuid}/root/tmp/vmm-migrate-zfs-barrier.sock");
+        let barrier_gz_path =
+            format!("/zones/{uuid}/root/tmp/vmm-migrate-zfs-barrier.sock");
         let barrier_zone_path = "/tmp/vmm-migrate-zfs-barrier.sock";
         let _ = std::fs::remove_file(&barrier_gz_path);
-        let barrier_listener = std::os::unix::net::UnixListener::bind(&barrier_gz_path)
-            .context("bind ZFS barrier socket")?;
+        let barrier_listener =
+            std::os::unix::net::UnixListener::bind(&barrier_gz_path)
+                .context("bind ZFS barrier socket")?;
         barrier_listener.set_nonblocking(true).ok();
         log(&format!("  ZFS barrier at {barrier_gz_path}"));
 
@@ -380,13 +396,17 @@ fn run_source(
                             let fin = format!("{zfs_src}@vmm-mig-final");
                             zfs_destroy_quiet(&snap);
                             if let Err(e) = zfs(&["snapshot", &snap]) {
-                                log(&format!("  ZFS barrier: snapshot failed: {e}"));
+                                log(&format!(
+                                    "  ZFS barrier: snapshot failed: {e}"
+                                ));
                             } else if let Err(e) = zfs_send_recv(
                                 &["-i", &fin, &snap],
                                 &zfs_ssh,
                                 &zfs_dst,
                             ) {
-                                log(&format!("  ZFS barrier: send failed: {e}"));
+                                log(&format!(
+                                    "  ZFS barrier: send failed: {e}"
+                                ));
                             } else {
                                 log("  ZFS barrier: final incremental sent");
                             }
@@ -396,7 +416,9 @@ fn run_source(
                         // Signal VMM to continue
                         let _ = conn.write_all(&[1u8]);
                     }
-                    Err(e) => log(&format!("  ZFS barrier: accept failed: {e}")),
+                    Err(e) => {
+                        log(&format!("  ZFS barrier: accept failed: {e}"))
+                    }
                 }
                 let _ = std::fs::remove_file(&barrier_cleanup);
             })
@@ -406,8 +428,7 @@ fn run_source(
         control_command(ctl, &trigger)?;
         log("  migration triggered, waiting for VMM...");
 
-        let (unix, _) = unix_listener.accept().await
-            .context("accept VMM")?;
+        let (unix, _) = unix_listener.accept().await.context("accept VMM")?;
         log("  VMM connected, bridging...");
 
         let (mut ur, mut uw) = tokio::io::split(unix);
@@ -422,7 +443,9 @@ fn run_source(
         }
 
         let _ = std::fs::remove_file(mig_sock);
-        if let Some(h) = zfs_handle { let _ = h.join(); }
+        if let Some(h) = zfs_handle {
+            let _ = h.join();
+        }
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -483,4 +506,3 @@ fn run_dest(_uuid: &str, port: u16, mig_sock: &str) -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     })
 }
-

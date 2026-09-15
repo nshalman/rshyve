@@ -132,13 +132,8 @@ fn a_write_reaches_the_disk_from_its_snapshot() {
         0,
         chain(RECYCLED_GPA, SECTOR as u32, false),
     );
-    let done = run_request(
-        &file,
-        &writable_disk(1),
-        &ctx,
-        &mut Bounce::new(),
-        &req,
-    );
+    let done =
+        run_request(&file, &writable_disk(1), &ctx, &mut Bounce::new(), &req);
 
     assert_eq!(done, Some((0, 1)));
     assert_eq!(
@@ -177,13 +172,8 @@ fn a_read_parked_across_a_reset_lands_nothing_in_a_recycled_page() {
         0,
         chain(RECYCLED_GPA, SECTOR as u32, true),
     );
-    let done = run_request(
-        &file,
-        &writable_disk(1),
-        &ctx,
-        &mut Bounce::new(),
-        &req,
-    );
+    let done =
+        run_request(&file, &writable_disk(1), &ctx, &mut Bounce::new(), &req);
 
     assert!(done.is_none(), "a closed session published a used entry");
     assert_eq!(

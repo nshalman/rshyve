@@ -109,7 +109,10 @@ unsafe impl Send for Handle {}
 
 #[cfg(not(target_os = "illumos"))]
 fn unsupported() -> Error {
-    Error::new(ErrorKind::Unsupported, "libdladm is only available on illumos")
+    Error::new(
+        ErrorKind::Unsupported,
+        "libdladm is only available on illumos",
+    )
 }
 
 /// Turn a `dladm_status_t` into an error naming the call.

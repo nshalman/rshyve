@@ -133,7 +133,8 @@ impl VmmHdl {
         // Safety: vm_seg_desc is the struct VM_SET_SEGMENT_DESCRIPTOR
         // reads.
         unsafe {
-            self.inner.ioctl(ioctls::VM_SET_SEGMENT_DESCRIPTOR, &mut vsd)
+            self.inner
+                .ioctl(ioctls::VM_SET_SEGMENT_DESCRIPTOR, &mut vsd)
         }?;
         Ok(())
     }
@@ -151,7 +152,8 @@ impl VmmHdl {
         // Safety: vm_seg_desc is the struct VM_GET_SEGMENT_DESCRIPTOR
         // fills.
         unsafe {
-            self.inner.ioctl(ioctls::VM_GET_SEGMENT_DESCRIPTOR, &mut vsd)
+            self.inner
+                .ioctl(ioctls::VM_GET_SEGMENT_DESCRIPTOR, &mut vsd)
         }?;
         Ok(vsd.desc)
     }

@@ -125,11 +125,7 @@ fn dkioc_wce(
     // SAFETY: `v` lives through the call and is the size
     // DKIOC{GET,SET}WCE reads and writes.
     unsafe {
-        vmm_api_common::ioctl(
-            fd.as_raw_fd(),
-            cmd,
-            std::ptr::from_mut(v).cast(),
-        )
+        vmm_api_common::ioctl(fd.as_raw_fd(), cmd, std::ptr::from_mut(v).cast())
     }?;
     Ok(())
 }

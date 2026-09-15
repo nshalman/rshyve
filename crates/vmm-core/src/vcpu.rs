@@ -87,11 +87,13 @@ impl Vcpu {
     /// Must be called before [`enter`]. The kernel allocates per-vCPU
     /// state on activation.
     pub fn activate(&self) -> Result<(), ActivateError> {
-        self.hdl.vcpu_activate(self.id).map_err(|e| match e.raw_os_error() {
-            Some(libc::EBUSY) => ActivateError::Busy,
-            Some(libc::EINVAL) => ActivateError::OutOfRange,
-            _ => ActivateError::Os(e),
-        })
+        self.hdl
+            .vcpu_activate(self.id)
+            .map_err(|e| match e.raw_os_error() {
+                Some(libc::EBUSY) => ActivateError::Busy,
+                Some(libc::EINVAL) => ActivateError::OutOfRange,
+                _ => ActivateError::Os(e),
+            })
     }
 
     // ---------------------------------------------------------------

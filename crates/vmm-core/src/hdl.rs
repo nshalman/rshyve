@@ -425,7 +425,11 @@ impl VmmHdl {
 
     /// Suspend the VM. `source` is the requesting vCPU, or -1 for a
     /// device or operator request.
-    pub fn suspend(&self, how: SuspendHow, source: i32) -> Result<SuspendOutcome> {
+    pub fn suspend(
+        &self,
+        how: SuspendHow,
+        source: i32,
+    ) -> Result<SuspendOutcome> {
         let mut req = vm_suspend {
             how: how.raw(),
             source,
@@ -472,10 +476,7 @@ impl VmmHdl {
     }
 
     /// Ask how many MSI and MSI-X vectors a bound device may use.
-    pub fn pptdev_limits(
-        &self,
-        pptfd: BorrowedFd<'_>,
-    ) -> Result<PptdevLimits> {
+    pub fn pptdev_limits(&self, pptfd: BorrowedFd<'_>) -> Result<PptdevLimits> {
         let mut req = vm_pptdev_limits {
             pptfd: pptfd.as_raw_fd(),
             msi_limit: 0,

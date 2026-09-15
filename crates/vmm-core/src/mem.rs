@@ -54,8 +54,8 @@ mod segid;
 
 pub use ctx::MemCtx;
 pub use devmem::DevMemSeg;
-use mapping::Mapping;
 pub use io::GuestIoVec;
+use mapping::Mapping;
 pub use mapping::{Prot, SubMapping};
 pub use segid::{SegidAlloc, VM_MAX_MEMSEGS};
 

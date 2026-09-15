@@ -24,10 +24,7 @@ impl VirtioViona {
     /// Returns an error if the platform has no viona driver, if the
     /// VNIC link ID cannot be resolved, or if the viona device cannot
     /// be opened and associated with the VM.
-    pub fn new(
-        vnic_name: &str,
-        vm: BorrowedFd<'_>,
-    ) -> std::io::Result<Self> {
+    pub fn new(vnic_name: &str, vm: BorrowedFd<'_>) -> std::io::Result<Self> {
         let (link, mac_addr, dev_features) = open_link(vnic_name, vm)?;
         Ok(Self::with_link(link, mac_addr, dev_features))
     }

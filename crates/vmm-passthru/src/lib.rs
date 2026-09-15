@@ -35,8 +35,8 @@
 //! handlers. MMIO BARs do not need it, because EPT maps them. PIO BARs
 //! do, so a passthrough device with an I/O BAR decodes nothing.
 
-use std::io::Result;
 use std::fs::File;
+use std::io::Result;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 
@@ -296,7 +296,9 @@ impl PciPassthru {
             pci_data: 0,
         };
         // Safety: ppt_cfg_io is correct for PPT_CFG_READ on our ppt_fd.
-        unsafe { ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_CFG_READ, &mut cfg_io) }?;
+        unsafe {
+            ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_CFG_READ, &mut cfg_io)
+        }?;
         Ok(cfg_io.pci_data)
     }
 
@@ -327,7 +329,8 @@ impl PciPassthru {
 
     /// Unmap a PPT device BAR from guest physical address space.
     fn unmap_bar_mmio(&self, gpa: u64, len: u64) -> Result<()> {
-        self.hdl.unmap_pptdev_mmio(self.ppt.as_fd(), gpa, len as usize)
+        self.hdl
+            .unmap_pptdev_mmio(self.ppt.as_fd(), gpa, len as usize)
     }
 
     /// Handle a BAR address change: unmap old mapping, create new one.
@@ -434,8 +437,9 @@ impl PciPassthru {
             pbi_data: 0,
         };
         // Safety: ppt_bar_io is correct for PPT_BAR_READ.
-        match unsafe { ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_BAR_READ, &mut io) }
-        {
+        match unsafe {
+            ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_BAR_READ, &mut io)
+        } {
             Ok(_) => io.pbi_data,
             // An undecoded PCI read returns all ones.
             Err(_) => u32::MAX,
@@ -451,9 +455,9 @@ impl PciPassthru {
             pbi_data: data,
         };
         // Safety: ppt_bar_io is correct for PPT_BAR_WRITE.
-        if let Err(e) =
-            unsafe { ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_BAR_WRITE, &mut io) }
-        {
+        if let Err(e) = unsafe {
+            ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_BAR_WRITE, &mut io)
+        } {
             warn!(self.log, "passthru: BAR I/O write failed";
                 "bar" => bar, "off" => offset, "error" => %e);
         }
@@ -705,7 +709,9 @@ impl PciPassthru {
         let enabled = *self.msi_enabled.lock().expect("msi_enabled lock");
         let numvec = msi_numvec(msg_ctrl, enabled, self.msi_limit);
 
-        if let Err(e) = self.hdl.pptdev_msi(self.ppt.as_fd(), addr, data, numvec) {
+        if let Err(e) =
+            self.hdl.pptdev_msi(self.ppt.as_fd(), addr, data, numvec)
+        {
             warn!(self.log, "passthru: MSI setup failed, device has no \
                 interrupt";
                 "numvec" => numvec, "error" => %e);

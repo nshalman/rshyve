@@ -57,7 +57,10 @@ impl GuestIoVec {
     /// Fill the list from `file` at `offset`. Returns the bytes moved,
     /// which is short of [`Self::len`] only at end of file.
     pub fn read_from(&self, file: &File, offset: u64) -> Result<usize> {
-        self.check_prot(Prot::WRITE, "read into a mapping that is not writable")?;
+        self.check_prot(
+            Prot::WRITE,
+            "read into a mapping that is not writable",
+        )?;
         self.transfer(file, offset, |fd, iov, at| {
             // Safety: every iovec names pinned guest memory the caller
             // has permission to write, and `iov` outlives the call.
@@ -67,7 +70,10 @@ impl GuestIoVec {
 
     /// Write the list to `file` at `offset`. Returns the bytes moved.
     pub fn write_to(&self, file: &File, offset: u64) -> Result<usize> {
-        self.check_prot(Prot::READ, "write from a mapping that is not readable")?;
+        self.check_prot(
+            Prot::READ,
+            "write from a mapping that is not readable",
+        )?;
         self.transfer(file, offset, |fd, iov, at| {
             // Safety: every iovec names pinned guest memory the caller
             // has permission to read, and `iov` outlives the call.

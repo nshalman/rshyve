@@ -136,7 +136,9 @@ fn attach_device(
         .write(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
-        .map_err(|e| anyhow::anyhow!("cannot open {name} device {path}: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!("cannot open {name} device {path}: {e}")
+        })?;
 
     make_raw(&device);
 
@@ -220,7 +222,9 @@ fn spawn_device_reader(
                 }
             }
         })
-        .map_err(|e| anyhow::anyhow!("cannot spawn {name} input thread: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!("cannot spawn {name} input thread: {e}")
+        })?;
     Ok(())
 }
 
@@ -287,7 +291,9 @@ mod tests {
         }
 
         fn write(&self, bytes: &[u8]) {
-            (&self.master).write_all(bytes).expect("write to the master");
+            (&self.master)
+                .write_all(bytes)
+                .expect("write to the master");
         }
 
         /// Read until `want` bytes arrive or the deadline passes.
@@ -296,8 +302,10 @@ mod tests {
             let mut out = Vec::new();
             let mut buf = [0u8; 64];
             while out.len() < want && Instant::now() < deadline {
-                if wait_readable(self.master.as_fd(), Duration::from_millis(200))
-                    != Readiness::Readable
+                if wait_readable(
+                    self.master.as_fd(),
+                    Duration::from_millis(200),
+                ) != Readiness::Readable
                 {
                     continue;
                 }

@@ -14,8 +14,8 @@ use std::time::Duration;
 use slog::{error, info};
 
 use vmm_core::mem::MemCtx;
-use vmm_migrate::sync_source::DeviceFlushError;
 use vmm_machine::HotplugEngines;
+use vmm_migrate::sync_source::DeviceFlushError;
 
 use super::protocol::{Command, Response};
 use super::{VmController, VmRunState};
@@ -238,9 +238,11 @@ pub(super) fn migrate_source(
                             dev.flush_backing(
                                 vmm_devices::FlushIntent::Durable,
                             )
-                            .map_err(|source| DeviceFlushError {
-                                device: dev.type_name(),
-                                source,
+                            .map_err(|source| {
+                                DeviceFlushError {
+                                    device: dev.type_name(),
+                                    source,
+                                }
                             })?;
                         }
                         Ok(())
