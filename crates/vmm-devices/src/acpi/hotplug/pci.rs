@@ -48,11 +48,7 @@ const PCIU_PATH: &str = "\\_SB_.PHPR.PCIU";
 /// Path of the slot-down register.
 const PCID_PATH: &str = "\\_SB_.PHPR.PCID";
 
-/// ACPI 6.5, table 6.16: rescan the slot and bind a driver.
-const NOTIFY_DEVICE_CHECK: u8 = 1;
-
-/// ACPI 6.5, table 6.16: unbind the driver, then run `_EJ0`.
-const NOTIFY_EJECT_REQUEST: u8 = 3;
+use super::{NOTIFY_DEVICE_CHECK, NOTIFY_EJECT_REQUEST};
 
 /// Names of the slot devices, `S000` through `S031`.
 ///

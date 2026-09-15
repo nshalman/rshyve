@@ -24,6 +24,10 @@ pub const MAX_VCPUS: u32 = 64;
 /// before the VM exists.
 pub const CMDLINE_MAX: usize = 4096;
 
+/// The kernel command line a direct boot gets when the operator gives
+/// none. Both binaries serve the console on COM1.
+pub const DEFAULT_CMDLINE: &str = "console=ttyS0 earlyprintk=serial";
+
 /// Prefix of the `-o` keys this tree owns.
 ///
 /// bhyve's `-o` is a free key space and vmadm passes keys nothing here

@@ -31,7 +31,7 @@ use std::time::Duration;
 use vmm_core::common::RWOp;
 
 /// Page size for NVMe PRP entries (4 KiB).
-const PAGE_SIZE: usize = 4096;
+use vmm_core::common::PAGE_SIZE;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::{GuestIoVec, MemCtx, PhysMap};
 use vmm_core::mmio::{MmioBus, MmioFn};

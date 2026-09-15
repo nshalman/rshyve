@@ -54,8 +54,8 @@ const HPET_ADDR: u32 = 0xFED0_0000;
 
 // ── ACPI PM I/O ports (must match BhyvePmTimer / kernel config) ───
 
-/// ACPI PM base port (matches PMBASE_DEFAULT in pmtimer.rs).
-const PMBASE: u32 = 0x400;
+/// ACPI PM base port.
+const PMBASE: u32 = crate::bhyve::pmtimer::PMBASE_DEFAULT as u32;
 /// PM1a event block port.
 const PM1A_EVT_ADDR: u32 = PMBASE;
 /// PM1a control block port.

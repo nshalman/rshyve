@@ -26,7 +26,7 @@ use vmm_virtio::vsock::control::{ControlSink, ControlSlot};
 
 /// Kernel command line used when `--cmdline` is absent. It names
 /// `ttyS0`, which is why COM1 is always attached.
-const DEFAULT_CMDLINE: &str = "console=ttyS0 earlyprintk=serial";
+use vmm_config::DEFAULT_CMDLINE;
 
 fn setup_logger() -> slog::Logger {
     let decorator = slog_term::TermDecorator::new().build();

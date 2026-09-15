@@ -56,7 +56,7 @@ use super::{lock, Stopper, DRAIN_INTERVAL};
 
 /// Guest page size. A mapping the kernel accepts is a whole number of
 /// these.
-const PAGE_SIZE: u64 = 4096;
+const PAGE_SIZE: u64 = vmm_core::common::PAGE_SIZE as u64;
 
 /// Default size of one hot-add slot.
 ///

@@ -18,8 +18,7 @@ use vmm_core::common::RWOp;
 use vmm_core::hdl::{SuspendHow, SuspendOutcome};
 use vmm_core::pio::{PioBus, PioFn};
 
-/// ACPI PM base I/O port.
-const PMBASE: u16 = 0x400;
+use crate::bhyve::pmtimer::PMBASE_DEFAULT as PMBASE;
 
 /// SMI Command port for ACPI enable/disable.
 const SMI_CMD_PORT: u16 = 0xB2;

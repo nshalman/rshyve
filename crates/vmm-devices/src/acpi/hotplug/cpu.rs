@@ -44,12 +44,8 @@ const NOTIFY_METHOD: &str = "CTFY";
 const EJECT_METHOD: &str = "CEJ0";
 const SCAN_METHOD: &str = "CSCN";
 
-/// `_STA` for a present, enabled, working CPU shown in the UI.
-const STA_PRESENT: u8 = 0x0F;
-/// ACPI `Notify` value for a device that has appeared.
-const NOTIFY_DEVICE_CHECK: u8 = 1;
-/// ACPI `Notify` value asking the guest to give a device up.
-const NOTIFY_EJECT_REQUEST: u8 = 3;
+use super::{NOTIFY_DEVICE_CHECK, NOTIFY_EJECT_REQUEST, STA_PRESENT};
+
 /// Wait forever for the register block mutex.
 const NO_TIMEOUT: u16 = 0xFFFF;
 

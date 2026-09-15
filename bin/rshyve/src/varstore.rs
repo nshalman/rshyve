@@ -24,7 +24,7 @@ const CFI_BCS_CLEAR_STATUS: u8 = 0x50;
 const CFI_BCS_READ_STATUS: u8 = 0x70;
 const CFI_BCS_READ_ARRAY: u8 = 0xFF;
 
-const PAGE_SIZE: usize = 4096;
+use vmm_core::common::PAGE_SIZE;
 const MAX_VARSTORE_SIZE: u64 = 16 * 1024 * 1024;
 const EFI_SYSTEM_NV_DATA_FV_GUID: [u8; 16] = [
     0x8d, 0x2b, 0xf1, 0xff, 0x96, 0x76, 0x8b, 0x4c, 0xa9, 0x85, 0x27, 0x47,

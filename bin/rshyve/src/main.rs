@@ -511,7 +511,7 @@ fn reject_unmigratable_destination(
 /// Kernel command line used when neither `--cmdline` nor
 /// `--cmdline-base64` is given. It names `ttyS0`, which is why COM1 is
 /// always attached.
-const DEFAULT_CMDLINE: &str = "console=ttyS0 earlyprintk=serial";
+use vmm_config::DEFAULT_CMDLINE;
 
 /// The guest kernel command line, from whichever spelling was given.
 ///
