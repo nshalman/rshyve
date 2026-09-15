@@ -372,7 +372,7 @@ impl VmController {
             return Ok(());
         }
         release_paused_vm(
-            || self.hdl.suspend(SuspendHow::Halt, 0),
+            || self.hdl.suspend(SuspendHow::Halt, 0).map(|_| ()),
             || self.hdl.resume(),
         )
     }
@@ -398,9 +398,12 @@ impl VmController {
     /// Latch `how`, then let a parked VM see it.
     fn stop_for_signal(&self, how: SuspendHow) -> io::Result<()> {
         if !self.begin_stop() {
-            return self.hdl.suspend(how, 0);
+            return self.hdl.suspend(how, 0).map(|_| ());
         }
-        release_paused_vm(|| self.hdl.suspend(how, 0), || self.hdl.resume())
+        release_paused_vm(
+            || self.hdl.suspend(how, 0).map(|_| ()),
+            || self.hdl.resume(),
+        )
     }
 
     /// The same release from a path with nobody to hand an error to.

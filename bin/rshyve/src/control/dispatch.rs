@@ -101,7 +101,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             }
 
             match ctrl.hdl.suspend(SuspendHow::PowerOff, 0) {
-                Ok(()) => {
+                Ok(_) => {
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Stopping);
                     r
@@ -126,7 +126,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             }
 
             match ctrl.hdl.suspend(SuspendHow::Reset, -1) {
-                Ok(()) => {
+                Ok(_) => {
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Stopping);
                     r
@@ -174,7 +174,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             }
 
             match ctrl.hdl.suspend(SuspendHow::Halt, 0) {
-                Ok(()) => {
+                Ok(_) => {
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Stopping);
                     r

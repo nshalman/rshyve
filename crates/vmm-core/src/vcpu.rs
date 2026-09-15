@@ -22,6 +22,33 @@ use bhyve_api::{seg_desc, vm_exit, vm_reg_name, VRS_RUN};
 use crate::exits::{VmEntry, VmExit};
 use crate::hdl::VmmHdl;
 
+/// Why a vCPU could not be activated.
+#[derive(Debug, thiserror::Error)]
+pub enum ActivateError {
+    /// The kernel answered EBUSY: the id is active already, or the VM
+    /// was suspended. Nothing here can tell the two apart.
+    #[error("the vCPU is active or the VM is suspended")]
+    Busy,
+    /// The kernel answered EINVAL: no such vCPU on this VM.
+    #[error("the vCPU id is out of range")]
+    OutOfRange,
+    #[error(transparent)]
+    Os(std::io::Error),
+}
+
+/// Why an entry into the guest returned no exit.
+#[derive(Debug, thiserror::Error)]
+pub enum EnterError {
+    /// A signal landed. Enter again.
+    #[error("the entry was interrupted by a signal")]
+    Interrupted,
+    /// The VM is paused. Wait, then enter again.
+    #[error("the VM is paused")]
+    Paused,
+    #[error(transparent)]
+    Os(std::io::Error),
+}
+
 /// Represents a single virtual CPU.
 ///
 /// Provides methods to activate, configure registers, and run the vCPU.
@@ -59,8 +86,12 @@ impl Vcpu {
     ///
     /// Must be called before [`enter`]. The kernel allocates per-vCPU
     /// state on activation.
-    pub fn activate(&self) -> std::io::Result<()> {
-        self.hdl.vcpu_activate(self.id)
+    pub fn activate(&self) -> Result<(), ActivateError> {
+        self.hdl.vcpu_activate(self.id).map_err(|e| match e.raw_os_error() {
+            Some(libc::EBUSY) => ActivateError::Busy,
+            Some(libc::EINVAL) => ActivateError::OutOfRange,
+            _ => ActivateError::Os(e),
+        })
     }
 
     // ---------------------------------------------------------------
@@ -165,14 +196,20 @@ impl Vcpu {
         &self,
         entry: &VmEntry,
         api_version: u32,
-    ) -> std::io::Result<VmExit> {
+    ) -> Result<VmExit, EnterError> {
         let mut raw_exit = vm_exit::default();
         let mut raw_entry =
             entry.to_raw(self.id, &mut raw_exit as *mut vm_exit);
 
         // Safety: raw_entry.exit_data points at raw_exit, which is
         // stack-local and outlives the call.
-        unsafe { self.hdl.vcpu_run(&mut raw_entry) }?;
+        unsafe { self.hdl.vcpu_run(&mut raw_entry) }.map_err(|e| {
+            match e.raw_os_error() {
+                Some(libc::EINTR) => EnterError::Interrupted,
+                Some(libc::EBUSY) => EnterError::Paused,
+                _ => EnterError::Os(e),
+            }
+        })?;
 
         Ok(VmExit::parse(&raw_exit, api_version))
     }

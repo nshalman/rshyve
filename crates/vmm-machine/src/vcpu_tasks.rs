@@ -31,11 +31,11 @@ mod probes {
 use vmm_core::exits::{
     InoutReq, InoutRes, MmioReq, MmioRes, Suspend, VmEntry, VmExitKind,
 };
-use vmm_core::hdl::{SuspendHow, VmmHdl};
+use vmm_core::hdl::{SuspendHow, SuspendOutcome, VmmHdl};
 use vmm_core::mmio::MmioBus;
 use vmm_core::msr::{MsrHandler, RdmsrOutcome, WrmsrOutcome};
 use vmm_core::pio::PioBus;
-use vmm_core::vcpu::Vcpu;
+use vmm_core::vcpu::{EnterError, Vcpu};
 use vmm_devices::metrics::VcpuMetrics;
 
 /// Events sent from vCPU threads to the main thread.
@@ -101,8 +101,8 @@ fn fatal_exit(
     );
 
     match hdl.suspend(SuspendHow::Halt, vcpu_id) {
-        Ok(()) => {}
-        Err(error) if error.raw_os_error() == Some(libc::EALREADY) => {
+        Ok(SuspendOutcome::Requested) => {}
+        Ok(SuspendOutcome::AlreadyLatched) => {
             debug!(log, "VM suspend already latched";
                 "how" => %SuspendHow::Halt);
         }
@@ -293,19 +293,17 @@ fn vcpu_run_loop(
         probes::vm_entry!(|| vcpu_id as u32);
         let exit = match vcpu.enter(&next_entry, api_version) {
             Ok(exit) => exit,
+            Err(EnterError::Interrupted) => {
+                next_entry = VmEntry::Run;
+                continue;
+            }
+            Err(EnterError::Paused) => {
+                // resume() unblocks the next entry.
+                thread::sleep(std::time::Duration::from_millis(10));
+                next_entry = VmEntry::Run;
+                continue;
+            }
             Err(e) => {
-                // EINTR is normal (e.g., signal delivery) — retry
-                if e.raw_os_error() == Some(libc::EINTR) {
-                    next_entry = VmEntry::Run;
-                    continue;
-                }
-                // EBUSY means the VM is paused (e.g., during migration).
-                // Sleep briefly and retry — resume() will unblock us.
-                if e.raw_os_error() == Some(libc::EBUSY) {
-                    thread::sleep(std::time::Duration::from_millis(10));
-                    next_entry = VmEntry::Run;
-                    continue;
-                }
                 error!(log, "VM_RUN failed"; "error" => %e);
                 // receiver dropped during shutdown; safe to ignore
                 let _ = events.send(VcpuEvent::Error {

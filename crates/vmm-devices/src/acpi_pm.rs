@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use slog;
 use vmm_core::common::RWOp;
-use vmm_core::hdl::SuspendHow;
+use vmm_core::hdl::{SuspendHow, SuspendOutcome};
 use vmm_core::pio::{PioBus, PioFn};
 
 /// ACPI PM base I/O port.
@@ -91,8 +91,8 @@ impl SuspendSink for HdlSuspendSink {
     fn suspend(&self, how: SuspendHow) {
         // A device request is not attributable to a specific vCPU.
         match self.hdl.suspend(how, -1) {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EALREADY) => {
+            Ok(SuspendOutcome::Requested) => {}
+            Ok(SuspendOutcome::AlreadyLatched) => {
                 // Another vCPU may have already latched the transition.
                 slog::debug!(self.log, "VM suspend already latched"; "how" => %how);
             }

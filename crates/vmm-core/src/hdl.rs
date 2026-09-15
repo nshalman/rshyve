@@ -57,6 +57,15 @@ impl std::fmt::Display for SuspendHow {
     }
 }
 
+/// What a suspend request did. The kernel latches the first request
+/// for a VM and refuses the rest, and a refusal is not a failure: the
+/// VM is stopping either way.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SuspendOutcome {
+    Requested,
+    AlreadyLatched,
+}
+
 /// MSI and MSI-X vector counts a passthrough device may use.
 #[derive(Copy, Clone, Debug)]
 pub struct PptdevLimits {
@@ -416,14 +425,19 @@ impl VmmHdl {
 
     /// Suspend the VM. `source` is the requesting vCPU, or -1 for a
     /// device or operator request.
-    pub fn suspend(&self, how: SuspendHow, source: i32) -> Result<()> {
+    pub fn suspend(&self, how: SuspendHow, source: i32) -> Result<SuspendOutcome> {
         let mut req = vm_suspend {
             how: how.raw(),
             source,
         };
         // Safety: vm_suspend is the correct struct for VM_SUSPEND.
-        unsafe { self.inner.ioctl(ioctls::VM_SUSPEND, &mut req) }?;
-        Ok(())
+        match unsafe { self.inner.ioctl(ioctls::VM_SUSPEND, &mut req) } {
+            Ok(_) => Ok(SuspendOutcome::Requested),
+            Err(e) if e.raw_os_error() == Some(libc::EALREADY) => {
+                Ok(SuspendOutcome::AlreadyLatched)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Tell the kernel which PIO port serves the ACPI PM timer.

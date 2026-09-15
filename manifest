@@ -1,0 +1,4 @@
+d usr 0755 root sys
+d usr/sbin 0755 root sys
+f usr/sbin/rshyve 0555 root sys
+f usr/sbin/firehyve 0555 root sys

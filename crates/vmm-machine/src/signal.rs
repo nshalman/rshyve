@@ -90,11 +90,11 @@ impl HdlStop {
 
 impl GuestStop for HdlStop {
     fn request_poweroff(&self) -> io::Result<()> {
-        self.0.suspend(SuspendHow::PowerOff, 0)
+        self.0.suspend(SuspendHow::PowerOff, 0).map(|_| ())
     }
 
     fn halt(&self) -> io::Result<()> {
-        self.0.suspend(SuspendHow::Halt, 0)
+        self.0.suspend(SuspendHow::Halt, 0).map(|_| ())
     }
 }
 
