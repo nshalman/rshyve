@@ -5,6 +5,7 @@
 //! Migration command handlers and their address guards.
 
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -13,6 +14,7 @@ use std::time::Duration;
 use slog::{error, info};
 
 use vmm_core::mem::MemCtx;
+use vmm_migrate::sync_source::DeviceFlushError;
 use vmm_machine::HotplugEngines;
 
 use super::protocol::{Command, Response};
@@ -236,8 +238,9 @@ pub(super) fn migrate_source(
                             dev.flush_backing(
                                 vmm_devices::FlushIntent::Durable,
                             )
-                            .map_err(|error| {
-                                format!("{}: {:?}", dev.type_name(), error)
+                            .map_err(|source| DeviceFlushError {
+                                device: dev.type_name(),
+                                source,
                             })?;
                         }
                         Ok(())
@@ -272,12 +275,12 @@ pub(super) fn migrate_source(
                     mem_size,
                     status,
                     &mlog,
-                    &ctrl_arc.cpu_baseline,
+                    ctrl_arc.cpu_baseline,
                     pre_pause_fn,
                     flush_fn,
                     resume_fn,
                     export_fn,
-                    zfs_barrier,
+                    zfs_barrier.map(PathBuf::from),
                 ) {
                     Ok(()) => {
                         info!(mlog, "source migration complete");
@@ -333,7 +336,7 @@ pub(super) fn migrate_source(
                         mem_size,
                         status,
                         &mlog,
-                        &ctrl_arc.cpu_baseline,
+                        ctrl_arc.cpu_baseline,
                     )
                     .await
                     {

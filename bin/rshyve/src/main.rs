@@ -80,6 +80,9 @@ struct MachineCreation {
     /// same one: two feature sets on one machine is a guest fault that
     /// is very hard to read back.
     cpuid: Option<vmm_core::cpuid::CpuidTable>,
+    /// The baseline the CPUID table was built for. A migration
+    /// describes the guest's features with it.
+    cpu_baseline: vmm_core::cpuid::CpuBaseline,
     host_local_state: host_state::HostLocalState,
 }
 
@@ -317,6 +320,7 @@ fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
         varstore,
         tpm_acpi,
         cpuid,
+        cpu_baseline,
         host_local_state,
     })
 }
@@ -818,6 +822,7 @@ fn spawn_control_socket(
     num_cpus: u32,
     max_cpus: u32,
     mem_size: usize,
+    cpu_baseline: vmm_core::cpuid::CpuBaseline,
     vcpu_metrics: &[Arc<vmm_devices::metrics::VcpuMetrics>],
     registry: Arc<DeviceRegistry>,
     has_ahci_cd: bool,
@@ -841,7 +846,7 @@ fn spawn_control_socket(
         hotplug,
         cli.pci_slot.clone(),
         cli.lpc.clone(),
-        cli.cpu_baseline.clone(),
+        cpu_baseline,
         host_local_state,
         log.clone(),
     );
@@ -883,6 +888,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         varstore,
         tpm_acpi,
         cpuid,
+        cpu_baseline,
         host_local_state,
     } = creation;
     // One ceiling. The MADT slot count, the CPU register file and the
@@ -1096,6 +1102,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         num_cpus,
         max_cpus,
         mem_size,
+        cpu_baseline,
         &vcpu_metrics,
         Arc::clone(&registry),
         has_ahci_cd,

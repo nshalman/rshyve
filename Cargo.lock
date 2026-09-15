@@ -1977,6 +1977,7 @@ dependencies = [
  "tokio-tungstenite",
  "tungstenite",
  "vmm_core",
+ "vmm_devices",
  "zstd",
 ]
 

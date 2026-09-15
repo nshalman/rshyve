@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 vmm_core.workspace = true
+vmm_devices.workspace = true
 bhyve_api.workspace = true
 anyhow.workspace = true
 futures.workspace = true

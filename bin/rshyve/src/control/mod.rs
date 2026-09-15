@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use slog::{error, warn, Logger};
 
+use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::{SuspendHow, VmmHdl};
 use vmm_core::mem::PhysMap;
 use vmm_devices::quiesce::NamedDevice;
@@ -134,7 +135,7 @@ pub struct VmController {
     cli_pci_slots: Vec<String>,
     cli_lpc: Vec<String>,
     /// CPU baseline for migration feature masking.
-    cpu_baseline: String,
+    cpu_baseline: CpuBaseline,
     host_local_state: HostLocalState,
     log: Logger,
 }
@@ -155,7 +156,7 @@ impl VmController {
         hotplug: HotplugEngines,
         cli_pci_slots: Vec<String>,
         cli_lpc: Vec<String>,
-        cpu_baseline: String,
+        cpu_baseline: CpuBaseline,
         host_local_state: HostLocalState,
         log: Logger,
     ) -> Arc<Self> {

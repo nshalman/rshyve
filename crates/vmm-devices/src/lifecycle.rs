@@ -42,13 +42,16 @@ pub enum FlushIntent {
 }
 
 /// Failure to quiesce or sync a device backing file.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum FlushError {
     /// Device workers did not quiesce before the intent-specific deadline.
+    #[error("workers did not quiesce in time")]
     NotQuiesced(&'static str),
     /// The backing file could not be cloned or synced.
+    #[error("sync failed: {0}")]
     Sync(std::io::Error),
     /// A best-effort sync outlived its teardown watchdog.
+    #[error("the sync outlived its watchdog")]
     TimedOut,
 }
 
