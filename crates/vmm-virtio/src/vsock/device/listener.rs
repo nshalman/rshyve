@@ -15,14 +15,11 @@
 
 use std::io::{self, Read};
 use std::net::Shutdown;
-use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use slog::{debug, warn};
-use vmm_core::poll::{wait_readable, Readiness};
 use vmm_core::unixsock::write_all_bounded;
 
 use super::shared::{VsockShared, HOST_WRITE_TIMEOUT};
@@ -39,98 +36,18 @@ const BACKPRESSURE_PAUSE: Duration = Duration::from_millis(2);
 /// flag. A reader that only wakes on the socket being shut down cannot
 /// end on its own, and halt then pays the whole budget for it.
 const HOST_READ_POLL: Duration = Duration::from_millis(250);
-/// How long the accept thread waits before it re-reads the shutdown
-/// flag. This bounds how long halt waits for that thread to return.
-const ACCEPT_POLL: Duration = Duration::from_millis(50);
-/// Pause after a failed `accept`, so a persistent error such as EMFILE
-/// cannot spin the accept thread at full speed.
-const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// Longest CONNECT line accepted, so a client that never sends a newline
 /// cannot make the device read without bound.
 pub(super) const CONNECT_LINE_MAX: usize = 64;
 
-/// The accept loop needs a wait it can leave. A blocking `accept` ends
-/// only when a client arrives, so halt would have to connect to the
-/// socket itself to wake it, and that connect has no bound: a same-uid
-/// peer that fills the listen backlog makes it wait for as long as it
-/// likes.
-/// Hand back an accepted socket the readers can use, or nothing.
-///
-/// The listener is non-blocking so the accept loop can poll. On BSD and
-/// illumos an accepted socket inherits that flag. Every reader on this
-/// socket arms a read timeout and treats `WouldBlock` as an idle poll,
-/// so a socket that kept the flag would spin a thread at full speed
-/// instead of waiting. A socket the flag cannot be cleared on is closed
-/// rather than served.
-pub(super) fn accepted_blocking(stream: UnixStream) -> Option<UnixStream> {
-    match stream.set_nonblocking(false) {
-        Ok(()) => Some(stream),
-        Err(_) => {
-            let _ = stream.shutdown(Shutdown::Both);
-            None
-        }
-    }
-}
-
 /// Accept host-initiated connections and parse their CONNECT line.
 pub(super) fn accept_loop(shared: Arc<VsockShared>, listener: UnixListener) {
-    if let Err(error) = listener.set_nonblocking(true) {
-        // Without the flag this thread would block in `accept` and only
-        // a client could end it. Serving no host connection is the
-        // lesser fault: a device that cannot be torn down holds the
-        // whole teardown sweep.
-        warn!(shared.log, "virtio-vsock listener setup failed";
-            "error" => %error);
-        return;
-    }
-
-    // One report per run of failures. A persistent error is seen again
-    // on every pass, and a peer that can make one happen must not be
-    // able to drive the log with it.
-    let mut reported = false;
-    while !shared.shutdown.load(Ordering::Acquire) {
-        match wait_readable(listener.as_fd(), ACCEPT_POLL) {
-            Readiness::Readable => {}
-            Readiness::Idle => continue,
-            Readiness::Gone => {
-                warn!(shared.log, "virtio-vsock listener is unusable");
-                return;
-            }
-        }
-        let stream = match listener.accept() {
-            Ok((stream, _)) => {
-                reported = false;
-                stream
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) =>
-            {
-                continue
-            }
-            Err(error) => {
-                // A transient error is skipped and a persistent one,
-                // such as EMFILE once the fd table fills, would spin
-                // this thread at full speed without the pause.
-                if !reported {
-                    debug!(shared.log, "virtio-vsock accept failed";
-                        "error" => %error);
-                    reported = true;
-                }
-                std::thread::sleep(ACCEPT_BACKOFF);
-                continue;
-            }
-        };
-        let Some(stream) = accepted_blocking(stream) else {
-            continue;
-        };
+    let on_client = |stream: UnixStream| {
         // Every accepted connection costs a thread until its peer sends
         // a CONNECT line, which it need never do.
         if !shared.reader_slot_free() {
             let _ = stream.shutdown(Shutdown::Both);
-            continue;
+            return;
         }
         let conn_shared = Arc::clone(&shared);
         // One thread per pending connection: the CONNECT line is read
@@ -142,7 +59,14 @@ pub(super) fn accept_loop(shared: Arc<VsockShared>, listener: UnixListener) {
         {
             shared.track_reader(handle);
         }
-    }
+    };
+    crate::socket_accept::accept_loop(
+        listener,
+        &shared.shutdown,
+        &shared.log,
+        "virtio-vsock",
+        on_client,
+    );
 }
 
 /// The verb a host peer sent on its first line.

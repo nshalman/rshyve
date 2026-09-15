@@ -5,12 +5,13 @@
 //! Unit tests for the virtio-vsock device.
 
 use super::listener::{
-    accepted_blocking, classify_host_line, handle_host_connect, reader_loop,
+    classify_host_line, handle_host_connect, reader_loop,
     start_host_connection, HostVerb, CONNECT_LINE_MAX,
 };
 use super::shared::HOST_WRITE_TIMEOUT;
 use super::*;
 use crate::pci::intr::{BackendIntr, IntrGate};
+use crate::socket_accept::accepted_blocking;
 use crate::socket_halt::{HALT_BUDGET, HALT_JOIN_ROUNDS};
 use crate::vsock::control::{read_line_bounded, LineRead, HANDSHAKE_BUDGET};
 use crate::vsock::mux::MAX_CONNS;
