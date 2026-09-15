@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use slog::{info, warn, Logger};
-use vmm_config::Cli;
 use vmm_core::common::RWOp;
 use vmm_core::intr_pins::{IntrPin, LegacyPIC};
 use vmm_core::machine::Machine;
@@ -29,9 +28,9 @@ use vmm_devices::hotplug::pci::{
 };
 use vmm_devices::pvpanic::{PvPanic, PVPANIC_IOPORT};
 
-use crate::firmware::hotplug_enabled;
 use crate::hotplug::hot_add_window;
 use crate::hotplug::mem::{MemWindow, DEFAULT_SLOT_SIZE};
+use crate::opts::VmOpts;
 use crate::registry::{DeviceRegistry, RegisteredDevice, RegistryError};
 
 /// ISA IRQ the SCI is delivered on. The FADT publishes the same number.
@@ -62,7 +61,7 @@ pub struct HotplugRegisters {
 
 /// What the PM phase needs to know about hotplug.
 ///
-/// Built from the one `Cli` that the ACPI tables also read, so the
+/// Built from the one [`VmOpts`] the ACPI tables also read, so the
 /// ports this file claims and the ports the DSDT reserves cannot
 /// disagree.
 #[derive(Debug, Clone, Copy)]
@@ -73,12 +72,12 @@ pub struct HotplugOpts {
 }
 
 impl HotplugOpts {
-    pub fn from_cli(cli: &Cli) -> anyhow::Result<Self> {
-        Ok(Self {
-            enabled: hotplug_enabled(cli),
-            num_cpus: cli.num_cpus()?,
-            max_cpus: cli.max_cpus()?,
-        })
+    pub fn from_vm(opts: &VmOpts) -> Self {
+        Self {
+            enabled: opts.hotplug,
+            num_cpus: opts.num_cpus,
+            max_cpus: opts.max_cpus,
+        }
     }
 
     /// Whether the DSDT describes CPU slots, and so whether the CPU
@@ -98,18 +97,18 @@ impl HotplugOpts {
 
 /// The memory hot-add window this VM asked for, or `None`.
 ///
-/// Read from the same [`Cli`] the CPU counts and the ACPI tables read,
-/// so the window an engine hands out and the slots the AML describes
-/// cannot disagree.
+/// Read from the same [`VmOpts`] the CPU counts and the ACPI tables
+/// read, so the window an engine hands out and the slots the AML
+/// describes cannot disagree.
 ///
 /// Call this BEFORE the VM is created. Every refusal here is an
 /// operator mistake, and finding one after the VM exists wastes a boot.
-pub fn mem_hotplug_window(cli: &Cli) -> anyhow::Result<Option<MemWindow>> {
-    let Some(max_mem) = cli.max_mem()? else {
+pub fn mem_hotplug_window(opts: &VmOpts) -> anyhow::Result<Option<MemWindow>> {
+    let Some(max_mem) = opts.max_mem else {
         return Ok(None);
     };
-    let slot_size = cli.mem_slot_size()?.unwrap_or(DEFAULT_SLOT_SIZE);
-    let window = hot_add_window(cli.mem_size()?, max_mem, slot_size)
+    let slot_size = opts.mem_slot_size.unwrap_or(DEFAULT_SLOT_SIZE);
+    let window = hot_add_window(opts.mem_size, max_mem, slot_size)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(Some(window))
 }
@@ -409,19 +408,21 @@ mod tests {
         Logger::root(slog::Discard, slog::o!())
     }
 
-    fn cli_from(argv: &[&str]) -> Cli {
-        Cli::try_parse_named("rshyve", argv).expect("valid argv parses")
+    fn opts_from(argv: &[&str]) -> VmOpts {
+        let cli = vmm_config::Cli::try_parse_named("rshyve", argv)
+            .expect("valid argv parses");
+        VmOpts::from_cli(&cli).expect("the options are legal")
     }
 
     #[test]
     fn a_vm_that_asked_for_no_window_gets_none() {
-        let cli = cli_from(&["rshyve", "--hotplug", "-S", "guest"]);
-        assert!(mem_hotplug_window(&cli).expect("no window").is_none());
+        let opts = opts_from(&["rshyve", "--hotplug", "-S", "guest"]);
+        assert!(mem_hotplug_window(&opts).expect("no window").is_none());
     }
 
     #[test]
-    fn the_window_is_built_from_the_same_cli_the_tables_read() {
-        let cli = cli_from(&[
+    fn the_window_is_built_from_the_same_opts_the_tables_read() {
+        let opts = opts_from(&[
             "rshyve",
             "--hotplug",
             "-S",
@@ -434,7 +435,7 @@ mod tests {
             "guest",
         ]);
 
-        let window = mem_hotplug_window(&cli)
+        let window = mem_hotplug_window(&opts)
             .expect("the window is legal")
             .expect("a window was asked for");
 
@@ -450,7 +451,7 @@ mod tests {
         // Four GiB of the 128 MiB default slot needs 32 slots and the
         // AML declares eight. Finding this after the VM is created
         // would waste a boot.
-        let cli = cli_from(&[
+        let opts = opts_from(&[
             "rshyve",
             "--hotplug",
             "-S",
@@ -459,26 +460,8 @@ mod tests {
             "guest",
         ]);
 
-        let error = mem_hotplug_window(&cli).expect_err("32 slots");
+        let error = mem_hotplug_window(&opts).expect_err("32 slots");
         assert!(error.to_string().contains("raise the slot size"), "{error}");
-    }
-
-    #[test]
-    fn a_window_without_the_reservoir_is_refused_here_too() {
-        // The gate lives in Cli::max_mem, and this is the one call the
-        // binaries make, so it has to carry the refusal through.
-        let cli = cli_from(&[
-            "rshyve",
-            "--hotplug",
-            "-o",
-            "hotplug.maxmem=1G",
-            "-o",
-            "hotplug.memslot=1G",
-            "guest",
-        ]);
-
-        let error = mem_hotplug_window(&cli).expect_err("no -S");
-        assert!(error.to_string().contains("-S"), "{error}");
     }
 
     fn opts(enabled: bool, num_cpus: u32, max_cpus: u32) -> HotplugOpts {

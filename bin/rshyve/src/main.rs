@@ -871,9 +871,13 @@ struct RunResult {
 }
 
 fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
+    // Read once. The MADT slot count, the CPU register file and the
+    // hot-add engine all read this, so the guest cannot be told about
+    // a slot no engine can fill.
+    let vm_opts = vmm_machine::VmOpts::from_cli(&cli)?;
     // The hot-add window is built before the VM exists, so a window an
     // operator cannot use costs no boot.
-    let mem_window = vmm_machine::mem_hotplug_window(&cli)?;
+    let mem_window = vmm_machine::mem_hotplug_window(&vm_opts)?;
 
     // Phase 1: Create VM, load bootrom/kernel, finalize memory
     let creation = create_machine(&cli, log)?;
@@ -891,10 +895,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         cpu_baseline,
         host_local_state,
     } = creation;
-    // One ceiling. The MADT slot count, the CPU register file and the
-    // hot-add engine all read this, so the guest cannot be told about a
-    // slot no engine can fill.
-    let max_cpus = cli.max_cpus()?;
+    let max_cpus = vm_opts.max_cpus;
 
     // Phase 2: Initialize chipset and kernel-emulated devices
     let chipset_devs = vmm_machine::init_chipset(&machine, log)?;
@@ -902,7 +903,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     // Phase 3: Timers, PM, pvpanic
     let timer_pm_devs = vmm_machine::setup_timers_and_pm(
         &machine,
-        vmm_machine::HotplugOpts::from_cli(&cli)?,
+        vmm_machine::HotplugOpts::from_vm(&vm_opts),
         log,
     )?;
 
@@ -921,7 +922,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     // Phase 5: fw_cfg, ACPI tables, SMBIOS, E820, boot order
     let (_fwcfg, acpi_tables) = vmm_machine::setup_fwcfg_and_acpi(
         &machine,
-        &cli,
+        &vm_opts,
         num_cpus,
         mem_size,
         bootorder::build_bootorder(&cli.pci_slot)?,
@@ -1763,8 +1764,8 @@ mod tests {
     fn one_cpu_ceiling_feeds_the_tables_the_registers_and_the_engine() {
         // The MADT slot count, the CPU register file and the hot-add
         // engine have to describe one machine. All three read
-        // Cli::max_cpus: the tables through setup_fwcfg_and_acpi, the
-        // register file through HotplugOpts::from_cli, and the engine
+        // VmOpts::max_cpus: the tables through setup_fwcfg_and_acpi, the
+        // register file through HotplugOpts::from_vm, and the engine
         // through the VcpuSetup in run(). A hand-built HotplugOpts here
         // would let the register file describe a different machine, so
         // the phase sequence must not contain one.
@@ -1773,9 +1774,10 @@ mod tests {
         let code = &src[..end];
 
         assert!(!code.contains("HotplugOpts {"), "a hand-built HotplugOpts");
-        // One call, so every other use of the ceiling in this file
+        // One read, so every other use of the ceiling in this file
         // flows from the one local it is read into.
-        assert_eq!(code.matches("cli.max_cpus()").count(), 1);
+        assert_eq!(code.matches("VmOpts::from_cli(").count(), 1);
+        assert_eq!(code.matches("cli.max_cpus()").count(), 0);
     }
 
     #[test]

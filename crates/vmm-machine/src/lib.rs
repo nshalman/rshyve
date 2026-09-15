@@ -14,6 +14,7 @@ pub mod build;
 pub mod chipset;
 pub mod firmware;
 pub mod hotplug;
+pub mod opts;
 pub mod parse;
 pub mod pci;
 pub mod pm;
@@ -31,8 +32,8 @@ pub use build::{
 };
 pub use chipset::{init_chipset, ChipsetDevices};
 pub use firmware::{
-    hotplug_enabled, setup_fwcfg_and_acpi, write_legacy_acpi_tables,
-    write_smbios_tables, AcpiTables,
+    setup_fwcfg_and_acpi, write_legacy_acpi_tables, write_smbios_tables,
+    AcpiTables,
 };
 pub use hotplug::cpu::{CpuHotplugEngine, CpuHotplugError, CpuOnline};
 pub use hotplug::mem::{
@@ -42,6 +43,7 @@ pub use hotplug::{
     hot_add_window, hotplug_specs, CpuSlots, HotplugEngine, HotplugEngines,
     HotplugError, HotplugFactory, VmPause,
 };
+pub use opts::VmOpts;
 pub use parse::{find_lpc_device, parse_bdf};
 pub use pci::{
     attach_pci_devices, CreatedPciDevice, LifecycleHandle, PciAttachment,

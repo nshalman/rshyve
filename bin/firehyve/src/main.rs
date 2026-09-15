@@ -160,16 +160,17 @@ fn run(
     let cmdline = cli
         .kernel_cmdline()?
         .unwrap_or_else(|| DEFAULT_CMDLINE.to_string());
-    let mem_window = vmm_machine::mem_hotplug_window(&cli)?;
+    // Read once. The MADT slot count, the CPU register file and the
+    // hot-add engine all read this, so the guest cannot be told about
+    // a slot no engine can fill.
+    let vm_opts = vmm_machine::VmOpts::from_cli(&cli)?;
+    let mem_window = vmm_machine::mem_hotplug_window(&vm_opts)?;
 
     // Phase 2: create the VM. No bootrom, so nothing goes into guest
     // memory before finalize.
-    let num_cpus = cli.num_cpus()?;
-    // One ceiling. The MADT slot count, the CPU register file and the
-    // hot-add engine all read this, so the guest cannot be told about a
-    // slot no engine can fill.
-    let max_cpus = cli.max_cpus()?;
-    let mem_size = cli.mem_size()?;
+    let num_cpus = vm_opts.num_cpus;
+    let max_cpus = vm_opts.max_cpus;
+    let mem_size = vm_opts.mem_size;
     let version = version_string();
     let opts = vmm_machine::MachineOpts {
         vm_name: &cli.vm_name,
@@ -215,7 +216,7 @@ fn run(
     // Phase 4: timers, PM, pvpanic.
     let timer_pm = vmm_machine::setup_timers_and_pm(
         &machine,
-        vmm_machine::HotplugOpts::from_cli(&cli)?,
+        vmm_machine::HotplugOpts::from_vm(&vm_opts),
         log,
     )?;
 
@@ -227,7 +228,7 @@ fn run(
     // Phase 6: fw_cfg, ACPI, SMBIOS. No boot order, no TPM2 table.
     let (_fwcfg, acpi) = vmm_machine::setup_fwcfg_and_acpi(
         &machine,
-        &cli,
+        &vm_opts,
         num_cpus,
         mem_size,
         Vec::new(),
@@ -546,8 +547,8 @@ mod tests {
     fn one_cpu_ceiling_feeds_the_tables_the_registers_and_the_engine() {
         // The MADT slot count, the CPU register file and the hot-add
         // engine have to describe one machine. All three read
-        // Cli::max_cpus: the tables through setup_fwcfg_and_acpi, the
-        // register file through HotplugOpts::from_cli, and the engine
+        // VmOpts::max_cpus: the tables through setup_fwcfg_and_acpi, the
+        // register file through HotplugOpts::from_vm, and the engine
         // through the VcpuSetup below. A hand-built HotplugOpts here
         // would let the register file describe a different machine, so
         // the phase sequence must not contain one.
@@ -556,9 +557,10 @@ mod tests {
         let code = &src[..end];
 
         assert!(!code.contains("HotplugOpts {"), "a hand-built HotplugOpts");
-        // One call, so every other use of the ceiling in this file
+        // One read, so every other use of the ceiling in this file
         // flows from the one local it is read into.
-        assert_eq!(code.matches("cli.max_cpus()").count(), 1);
+        assert_eq!(code.matches("VmOpts::from_cli(").count(), 1);
+        assert_eq!(code.matches("cli.max_cpus()").count(), 0);
     }
 
     #[test]
