@@ -412,23 +412,12 @@ impl VirtioDevice for VirtioFs {
     }
 
     fn cfg_read(&self, offset: u16, len: u8) -> u32 {
-        let mut out = 0u32;
-        for i in 0..usize::from(len).min(4) {
-            // The guest picks the offset, so the sum is checked.
-            let Some(off) = usize::from(offset).checked_add(i) else {
-                break;
-            };
-            let byte = if off < FS_TAG_LEN {
-                self.tag[off]
-            } else if off < FS_TAG_LEN + 4 {
-                FS_NUM_REQUEST_QUEUES.to_le_bytes()[off - FS_TAG_LEN]
-            } else {
-                // notify_buf_size, and everything past the config, read 0.
-                0
-            };
-            out |= u32::from(byte) << (i * 8);
-        }
-        out
+        // The tag, then num_request_queues. notify_buf_size and
+        // everything past the config read 0.
+        let mut cfg = [0u8; FS_TAG_LEN + 4];
+        cfg[..FS_TAG_LEN].copy_from_slice(&self.tag);
+        cfg[FS_TAG_LEN..].copy_from_slice(&FS_NUM_REQUEST_QUEUES.to_le_bytes());
+        crate::cfg_read_bytes(&cfg, offset, len)
     }
 
     fn cfg_write(&self, _offset: u16, _val: u32, _len: u8) {

@@ -23,8 +23,6 @@ vmm_boot.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 slog.workspace = true
-slog-async.workspace = true
-slog-term.workspace = true
 usdt.workspace = true
 
 # Deliberately absent, and enforced by deny-firehyve.toml:

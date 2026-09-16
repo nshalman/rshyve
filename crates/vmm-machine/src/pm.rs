@@ -29,7 +29,7 @@ use vmm_devices::hotplug::pci::{
 use vmm_devices::pvpanic::{PvPanic, PVPANIC_IOPORT};
 
 use crate::hotplug::hot_add_window;
-use crate::hotplug::mem::{MemWindow, DEFAULT_SLOT_SIZE};
+use crate::hotplug::mem::{MemHotplugEngine, MemWindow, DEFAULT_SLOT_SIZE};
 use crate::opts::VmOpts;
 use crate::registry::{DeviceRegistry, RegisteredDevice, RegistryError};
 
@@ -111,6 +111,38 @@ pub fn mem_hotplug_window(opts: &VmOpts) -> anyhow::Result<Option<MemWindow>> {
     let window = hot_add_window(opts.mem_size, max_mem, slot_size)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(Some(window))
+}
+
+/// Start the memory hot-add engine, or nothing when the VM asked for no
+/// window.
+///
+/// `-o hotplug.maxmem` already requires `--hotplug`, so a window with no
+/// register file is a contradiction and not a silent omission.
+pub fn start_mem_hotplug(
+    window: Option<MemWindow>,
+    machine: &Machine,
+    regs: Option<&HotplugRegisters>,
+    log: &Logger,
+) -> anyhow::Result<Option<Arc<MemHotplugEngine>>> {
+    let Some(window) = window else {
+        return Ok(None);
+    };
+    let regs = regs.ok_or_else(|| {
+        anyhow::anyhow!("a memory window needs the hotplug register files")
+    })?;
+    info!(log, "memory hot-add window";
+        "base" => format!("{:#x}", window.base()),
+        "bytes" => window.size(),
+        "slots" => window.slots(),
+    );
+    Ok(Some(MemHotplugEngine::start(
+        Arc::clone(machine.physmap()),
+        Arc::clone(machine.hdl()),
+        Arc::clone(machine.segids()),
+        Arc::clone(&regs.mem),
+        window,
+        log.new(slog::o!("component" => "hotplug-mem")),
+    )))
 }
 
 /// Timer and power-management device handles kept alive for the VM's

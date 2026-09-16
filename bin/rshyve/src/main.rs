@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::thread;
 
 use anyhow::Context;
-use slog::{error, info, o, warn, Drain, Logger};
+use slog::{info, o, warn, Logger};
 
 use vmm_boot::direct;
 use vmm_config::Cli;
 use vmm_core::hdl::CreateOpts;
-use vmm_core::intr_pins::{LegacyPIC, NoOpPin};
+use vmm_core::intr_pins::LegacyPIC;
 use vmm_core::machine::{Machine, MachineSetup};
 use vmm_core::msr::MsrHandler;
 use vmm_devices::acpi;
@@ -26,9 +26,8 @@ use vmm_devices::uart::lpc::{self, LpcUart};
 use vmm_devices::InputBroker;
 use vmm_machine::{
     build_machine, devspec, find_lpc_device, host_tsc_frequency_hz,
-    CpuHotplugEngine, CpuSlots, CreatedPciDevice, DeviceRegistry,
-    HotplugEngine, HotplugEngines, MachineOpts, MemHotplugEngine,
-    RegisteredDevice, RunOutcome, VcpuRegistry, VcpuSetup,
+    CreatedPciDevice, DeviceRegistry, HotplugEngine, HotplugEngines,
+    MachineOpts, RegisteredDevice, RunOutcome, VcpuSetup,
 };
 use vmm_virtio::attach::{self, VirtioAttachCtx};
 
@@ -54,13 +53,6 @@ type PciDeviceInventory = (
     bool,
     Arc<vmm_machine::pci::OwnedPciCtx>,
 );
-
-fn setup_logger() -> Logger {
-    let decorator = slog_term::TermDecorator::new().build();
-    let drain = slog_term::FullFormat::new(decorator).build().fuse();
-    let drain = slog_async::Async::new(drain).build().fuse();
-    Logger::root(drain, o!("component" => "rshyve"))
-}
 
 /// Result of `create_machine`: the finalized Machine plus metadata needed
 /// by later stages.
@@ -169,13 +161,8 @@ fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
     let api_version = built.api_version;
 
     // Apply CPU feature masking for migration compatibility
-    let cpu_baseline = vmm_core::cpuid::CpuBaseline::parse(&cli.cpu_baseline)
-        .ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown CPU baseline '{}' (valid: host, avx2, no-avx512, sse42)",
-            cli.cpu_baseline,
-        )
-    })?;
+    let cpu_baseline: vmm_core::cpuid::CpuBaseline =
+        cli.cpu_baseline.parse()?;
     if cpu_baseline != vmm_core::cpuid::CpuBaseline::Host {
         info!(log, "applying CPU baseline"; "baseline" => &cli.cpu_baseline);
     }
@@ -361,24 +348,11 @@ fn setup_serial(
     cli: &Cli,
     log: &Logger,
 ) -> anyhow::Result<(Arc<LpcUart>, Arc<LpcUart>)> {
-    // Create COM1 UART (IRQ 4, base port 0x3F8)
-    let com1_irq: Arc<dyn vmm_core::intr_pins::IntrPin> =
-        match pic.pin_handle(lpc::COM1_IRQ) {
-            Some(pin) => pin,
-            None => Arc::new(NoOpPin),
-        };
-    let com1 = LpcUart::new(com1_irq);
-    com1.attach(machine.bus_pio(), lpc::COM1_BASE);
+    let com1 =
+        vmm_machine::attach_uart(machine, pic, lpc::COM1_BASE, lpc::COM1_IRQ);
     info!(log, "COM1 attached"; "port" => format!("{:#x}", lpc::COM1_BASE));
-
-    // Create COM2 UART (IRQ 3, base port 0x2F8)
-    let com2_irq: Arc<dyn vmm_core::intr_pins::IntrPin> =
-        match pic.pin_handle(lpc::COM2_IRQ) {
-            Some(pin) => pin,
-            None => Arc::new(NoOpPin),
-        };
-    let com2 = LpcUart::new(com2_irq);
-    com2.attach(machine.bus_pio(), lpc::COM2_BASE);
+    let com2 =
+        vmm_machine::attach_uart(machine, pic, lpc::COM2_BASE, lpc::COM2_IRQ);
     info!(log, "COM2 attached"; "port" => format!("{:#x}", lpc::COM2_BASE));
 
     // Parse COM port paths from -l flags
@@ -388,19 +362,10 @@ fn setup_serial(
     // Set up COM1 serial I/O based on -l com1,<config>
     setup_serial_io(&com1, com1_path.as_deref(), "com1", log)?;
 
-    // Set up COM2:
-    // - "socket,/path" → Unix socket for host-side metadata agent
-    // - absent/no --mdata-nics → built-in mdata agent
-    // - other path → raw file I/O
+    // COM2 serves the backend the argv named, or the built-in mdata
+    // agent when it named none.
     if let Some(ref path) = com2_path {
-        if path.starts_with("socket,") {
-            // Production zone: create Unix socket so the host-side
-            // metadata agent (vmadmd) can connect and serve sdc:nics,
-            // SSH keys, etc. to the guest via COM2.
-            setup_serial_io(&com2, Some(path.as_str()), "com2", log)?;
-        } else {
-            setup_serial_io(&com2, Some(path.as_str()), "com2", log)?;
-        }
+        setup_serial_io(&com2, Some(path.as_str()), "com2", log)?;
     } else {
         // Standalone mode: start built-in mdata agent using CLI flags.
         let mdata_store = Arc::new(mdata::build_store_from_zone_config(
@@ -693,38 +658,6 @@ fn post_migration_timer_kick(machine: &Machine, log: &Logger) {
     }
 }
 
-/// Start the memory hot-add engine, or nothing when the VM asked for no
-/// window.
-///
-/// `-o hotplug.maxmem` already requires `--hotplug`, so a window with no
-/// register file is a contradiction and not a silent omission.
-fn start_mem_hotplug(
-    window: Option<vmm_machine::MemWindow>,
-    machine: &Machine,
-    regs: Option<&vmm_machine::HotplugRegisters>,
-    log: &Logger,
-) -> anyhow::Result<Option<Arc<MemHotplugEngine>>> {
-    let Some(window) = window else {
-        return Ok(None);
-    };
-    let regs = regs.ok_or_else(|| {
-        anyhow::anyhow!("a memory window needs the hotplug register files")
-    })?;
-    info!(log, "memory hot-add window";
-        "base" => format!("{:#x}", window.base()),
-        "bytes" => window.size(),
-        "slots" => window.slots(),
-    );
-    Ok(Some(MemHotplugEngine::start(
-        Arc::clone(machine.physmap()),
-        Arc::clone(machine.hdl()),
-        Arc::clone(machine.segids()),
-        Arc::clone(&regs.mem),
-        window,
-        log.new(o!("component" => "hotplug-mem")),
-    )))
-}
-
 /// What the control socket leaves behind for the rest of `run`.
 #[derive(Default)]
 struct ControlSocket {
@@ -972,49 +905,27 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
             log.new(o!("component" => "hotplug")),
         )
     });
-    let cpu_hotplug = timer_pm_devs
-        .hotplug
-        .as_ref()
-        .and_then(|regs| regs.cpu.clone())
-        .map(|regs| {
-            let vcpus = Arc::new(VcpuRegistry::from_fleet(
-                VcpuSetup {
-                    max_cpus,
-                    boot_cpus: num_cpus,
-                    vmexit_on_hlt: cli.vmexit_on_hlt,
-                    cpuid: cpuid.clone(),
-                },
-                &fleet,
-                log.new(o!("component" => "vcpus")),
-            ));
-            let engine = CpuHotplugEngine::start(
-                Arc::clone(&vcpus),
-                regs,
-                log.new(o!("component" => "hotplug-cpu")),
-            );
-            CpuSlots::from_registry(engine, vcpus)
-        });
+    let cpu_hotplug = vmm_machine::start_cpu_hotplug(
+        timer_pm_devs.hotplug.as_ref(),
+        VcpuSetup {
+            max_cpus,
+            boot_cpus: num_cpus,
+            vmexit_on_hlt: cli.vmexit_on_hlt,
+            cpuid: cpuid.clone(),
+        },
+        &fleet,
+        log,
+    );
     let hotplug = HotplugEngines {
         pci: pci_hotplug,
         cpu: cpu_hotplug,
-        mem: start_mem_hotplug(
+        mem: vmm_machine::start_mem_hotplug(
             mem_window,
             &machine,
             timer_pm_devs.hotplug.as_ref(),
             log,
         )?,
     };
-
-    let vmm_machine::VcpuFleet {
-        events,
-        sender,
-        threads,
-        ..
-    } = fleet;
-    // The registry keeps its own sender, so the growable loop below
-    // reads "every thread has gone" off the roster. Without a registry
-    // this drop is what lets the channel close.
-    drop(sender);
 
     // Phase 12: Control socket
     let control_socket = spawn_control_socket(
@@ -1041,25 +952,14 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     vmm_machine::signal::install_sigterm_handler_with(stop, log);
 
     // Phase 14: Main event loop and cleanup
-    let outcome = if hotplug.cpu.is_some() {
-        vmm_machine::run_event_loop_growable(
-            &machine,
-            events,
-            &threads,
-            control_socket.cleanup.clone(),
-            &registry,
-            log,
-        )
-    } else {
-        vmm_machine::run_event_loop_registered(
-            &machine,
-            events,
-            threads.close(),
-            control_socket.cleanup.clone(),
-            &registry,
-            log,
-        )
-    };
+    let outcome = vmm_machine::run_fleet_event_loop(
+        &machine,
+        fleet,
+        &hotplug,
+        control_socket.cleanup.clone(),
+        &registry,
+        log,
+    );
 
     // The control thread is never joined, so its handles would
     // otherwise keep the drain threads alive past the event loop.
@@ -1136,10 +1036,7 @@ fn parse_and_create_pci_device(
                 "path" => config,
                 "msix_vectors" => msix::vector_count(pci_dev.as_ref()),
             );
-            Ok((
-                Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(pci_dev as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(pci_dev))
         }
         "virtio-net-viona" => {
             let (vnic_name, promiscphys) = devspec::parse_viona_config(config);
@@ -1162,10 +1059,7 @@ fn parse_and_create_pci_device(
                 "promiscphys" => promiscphys,
                 "msix_vectors" => msix::vector_count(pci_dev.as_ref()),
             );
-            Ok((
-                Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(pci_dev as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(pci_dev))
         }
         "nvme" => {
             if config.is_empty() {
@@ -1193,10 +1087,7 @@ fn parse_and_create_pci_device(
                 "bdf" => %bdf,
                 "path" => path,
             );
-            Ok((
-                Some(nvme.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(nvme as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(nvme))
         }
         "virtio-console" => {
             let path = devspec::parse_console_config(config)?;
@@ -1213,10 +1104,7 @@ fn parse_and_create_pci_device(
                 "socket" => path,
                 "msix_vectors" => msix::vector_count(pci_dev.as_ref()),
             );
-            Ok((
-                Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(pci_dev as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(pci_dev))
         }
         "virtio-fs" => {
             use vmm_virtio::fs::clamp_queue_size;
@@ -1232,10 +1120,7 @@ fn parse_and_create_pci_device(
                 "path" => %opts.path.display(),
                 "msix_vectors" => msix::vector_count(pci_dev.as_ref()),
             );
-            Ok((
-                Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(pci_dev as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(pci_dev))
         }
         "virtio-rnd" => {
             let lintr = chipset.route_lintr(&bdf);
@@ -1245,10 +1130,7 @@ fn parse_and_create_pci_device(
                 "bdf" => %bdf,
                 "msix_vectors" => msix::vector_count(pci_dev.as_ref()),
             );
-            Ok((
-                Some(pci_dev.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(pci_dev as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(pci_dev))
         }
         "fbuf" => {
             let segid = segids.alloc().ok_or_else(|| {
@@ -1295,10 +1177,7 @@ fn parse_and_create_pci_device(
                 "vnc" => vnc_path.display().to_string(),
                 "resolution" => format!("{}x{}", width, height),
             );
-            Ok((
-                Some(fbuf.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(fbuf as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(fbuf))
         }
         "xhci" => {
             // xHCI USB controller with tablet device
@@ -1313,10 +1192,7 @@ fn parse_and_create_pci_device(
             chipset.try_attach_device(bdf, xhci.clone())?;
             input.set_pointer(xhci.clone());
             info!(log, "xhci tablet attached"; "bdf" => %bdf);
-            Ok((
-                Some(xhci.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(xhci as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(xhci))
         }
         "passthru" => {
             if config.is_empty() {
@@ -1353,10 +1229,7 @@ fn parse_and_create_pci_device(
             );
             chipset.try_attach_device(bdf, ahci.clone())?;
             info!(log, "ahci-cd attached"; "bdf" => %bdf, "path" => path);
-            Ok((
-                Some(ahci.clone() as Arc<dyn vmm_devices::pci::PciDevice>),
-                Some(ahci as Arc<dyn vmm_devices::Lifecycle>),
-            ))
+            Ok(vmm_machine::created(ahci))
         }
         // A separate arm prevents an unsupported disk from silently becoming
         // a read-only ATAPI device with different guest-visible semantics.
@@ -1519,24 +1392,14 @@ fn main() -> ExitCode {
     let exe =
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from(&args[0]));
 
-    // Check for --version before full CLI parse so it works
-    // even when required args are missing.
-    if args.iter().any(|arg| {
-        arg.as_os_str() == std::ffi::OsStr::new("--version")
-            || arg.as_os_str() == std::ffi::OsStr::new("-V")
-    }) {
+    if vmm_machine::entry::version_requested(&args) {
         println!("rshyve {}", version_string());
         return ExitCode::SUCCESS;
     }
-
-    // Register USDT probes before any device setup.
-    // Non-fatal: /dev/dtrace/helper may not exist inside zones.
-    if let Err(e) = usdt::register_probes() {
-        eprintln!("[rshyve] USDT probe registration skipped: {e}");
-    }
+    vmm_machine::entry::register_probes("rshyve");
 
     let cli = Cli::parse_named("rshyve");
-    let log = setup_logger();
+    let log = vmm_machine::entry::setup_logger("rshyve");
 
     match run(cli, &log) {
         Ok(RunResult {
@@ -1549,35 +1412,9 @@ fn main() -> ExitCode {
             vmm_machine::sigterm_flag(),
             &log,
         ),
-        // C bhyve's codes, from usr/src/cmd/bhyve/amd64/vmexit.c. They
-        // are not cosmetic: `boot.c` sets ZONE_ATTR_INITRESTART0 on
-        // every bhyve zone and the brand declares no <initreboot>, so
-        // the kernel restarts init only on exit 0. Exiting 0 here
-        // restarts a guest that asked to power off, for ever.
-        //
-        // vmadm is unaffected. Its stop sends SIGTERM, which C bhyve
-        // turns into an ACPI power button (amd64/pm.c:432), so an
-        // orderly guest shutdown already exits 1 today.
-        Ok(RunResult {
-            outcome: RunOutcome::PowerOff,
-            ..
-        }) => ExitCode::from(1),
-        Ok(RunResult {
-            outcome: RunOutcome::Halt,
-            ..
-        }) => ExitCode::from(2),
-        Ok(RunResult {
-            outcome: RunOutcome::TripleFault(src),
-            ..
-        }) => {
-            error!(log, "VM triple fault"; "source_vcpu" => src);
-            ExitCode::from(3)
+        Ok(RunResult { outcome, .. }) => {
+            vmm_machine::entry::exit_code(outcome, &log)
         }
-        // Distinct from HALT, which C bhyve gives 2.
-        Ok(RunResult {
-            outcome: RunOutcome::GuestFault,
-            ..
-        }) => ExitCode::from(4),
         Err(e) => {
             slog::error!(log, "fatal error"; "error" => format!("{:#}", e));
             ExitCode::FAILURE

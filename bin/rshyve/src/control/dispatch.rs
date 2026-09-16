@@ -10,9 +10,13 @@ use std::sync::Arc;
 use slog::error;
 use vmm_core::hdl::SuspendHow;
 
+use vmm_machine::inventory::{
+    cpu_inventory, MemWindowReport, CPU_HOTPLUG_OFF, MEM_HOTPLUG_OFF,
+    NO_CPU_REMOVE, NO_MEM_REMOVE,
+};
 use vmm_machine::{
     CpuHotplugError, CpuSlots, DeviceRegistry, HotplugError, MemHotplugEngine,
-    MemWindow, SlotState,
+    SlotState,
 };
 
 use super::migrate::{
@@ -260,26 +264,6 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
     }
 }
 
-/// Why a CPU request was refused on a VM with no CPU slots.
-///
-/// Two starts give a VM no engine: no `--hotplug`, and a `maxcpus` that
-/// is not above the boot count. The answer names both, because the
-/// operator has to fix whichever one applies.
-const CPU_HOTPLUG_OFF: &str =
-    "CPU hot-add needs --hotplug and -c cpus=N,maxcpus=M";
-
-/// The same for memory.
-const MEM_HOTPLUG_OFF: &str =
-    "memory hot-add needs --hotplug and -o hotplug.maxmem=SIZE";
-
-/// Why `cpu-remove` cannot exist on this platform.
-const NO_CPU_REMOVE: &str = "cpu-remove is not supported: illumos has no \
-     vm_deactivate_cpu, so an active vCPU cannot be taken back";
-
-/// Why `mem-remove` cannot exist on this platform.
-const NO_MEM_REMOVE: &str = "mem-remove is not supported: illumos has no \
-     VM_FREE_MEMSEG, so a memory segment lives until the VM does";
-
 /// Run one hot-add, if the VM is in a state that can take it.
 ///
 /// The topology lock is held for the whole add, and `migrate_source`
@@ -402,46 +386,24 @@ fn device_list(registry: &DeviceRegistry) -> serde_json::Value {
 /// Every CPU slot the machine has, with the state of each.
 ///
 /// `num_cpus` keeps its old meaning, the boot CPU count, because a
-/// client that shipped before hot-add reads it. `max_cpus` is the slot
-/// count the MADT describes, whether or not this VM can fill any of
-/// them: hiding the spare slots would contradict what the guest sees.
-/// `hotplug` is the field that says whether `cpu-add` can work.
+/// client that shipped before hot-add reads it.
 fn cpu_list(
     boot_cpus: u32,
     max_cpus: u32,
     cpus: Option<&CpuSlots>,
 ) -> serde_json::Value {
-    // With an engine, its ceiling is the one an add is checked against.
-    // The two agree: both come from `Cli::max_cpus`, which is already
-    // capped at the kernel's 64.
-    let max_cpus = cpus.map_or(max_cpus, CpuSlots::max_cpus);
-    let boot_cpus = cpus.map_or(boot_cpus, CpuSlots::boot_cpus);
-    // A set, never a slice indexed by an id. The ids come from the
-    // engine and are bounded by the kernel's 64 CPUs, but nothing here
-    // has to trust that.
-    let consumed: std::collections::BTreeSet<u32> = cpus
-        .map(CpuSlots::consumed)
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-
-    let listed: Vec<serde_json::Value> = (0..max_cpus)
-        .map(|id| {
-            let state = if consumed.contains(&id) {
-                "consumed"
-            } else if cpus.map_or(id < boot_cpus, |cpus| cpus.is_online(id)) {
-                "present"
-            } else {
-                "absent"
-            };
-            let kind = if id < boot_cpus { "boot" } else { "hotplug" };
-            slot_json(id, state, kind)
+    let inv = cpu_inventory(boot_cpus, max_cpus, cpus);
+    let listed: Vec<serde_json::Value> = inv
+        .slots
+        .iter()
+        .map(|slot| {
+            slot_json(slot.id, &slot.state.to_string(), &slot.kind.to_string())
         })
         .collect();
     serde_json::json!({
-        "num_cpus": boot_cpus,
-        "max_cpus": max_cpus,
-        "hotplug": cpus.is_some(),
+        "num_cpus": inv.boot_cpus,
+        "max_cpus": inv.max_cpus,
+        "hotplug": inv.hotplug,
         "cpus": listed,
     })
 }
@@ -463,11 +425,7 @@ fn mem_list(
         "hotplug": engine.is_some(),
     });
     if let Some(engine) = engine {
-        let window = window_json(
-            &engine.window(),
-            engine.slots_used(),
-            engine.bytes_added(),
-        );
+        let window = window_json(&MemWindowReport::of(engine));
         // The value above is an object literal, so this cannot fail.
         if let Some(map) = value.as_object_mut() {
             map.insert("window".to_string(), window);
@@ -480,18 +438,14 @@ fn mem_list(
 ///
 /// Split from the engine so the wire shape can be tested: every part of
 /// a real engine is an ioctl on a live VM.
-fn window_json(
-    window: &MemWindow,
-    slots_used: usize,
-    added: u64,
-) -> serde_json::Value {
+fn window_json(report: &MemWindowReport) -> serde_json::Value {
     serde_json::json!({
-        "base": window.base(),
-        "bytes": window.size(),
-        "slot_bytes": window.slot_size(),
-        "slots": window.slots(),
-        "slots_used": slots_used,
-        "added_bytes": added,
+        "base": report.base,
+        "bytes": report.bytes,
+        "slot_bytes": report.slot_bytes,
+        "slots": report.slots,
+        "slots_used": report.slots_used,
+        "added_bytes": report.added_bytes,
     })
 }
 
@@ -512,8 +466,8 @@ mod tests {
     use super::{
         added, cpu_added, cpu_list, device_list, hot_add_blocked,
         hotplug_disabled, mem_added, mem_list, removing, stop_refusal,
-        window_json, CPU_HOTPLUG_OFF, MEM_HOTPLUG_OFF, NO_CPU_REMOVE,
-        NO_MEM_REMOVE,
+        window_json, MemWindowReport, CPU_HOTPLUG_OFF, MEM_HOTPLUG_OFF,
+        NO_CPU_REMOVE, NO_MEM_REMOVE,
     };
 
     /// A stand-in CPU set. Every step of a real add is an ioctl, so a
@@ -845,7 +799,8 @@ mod tests {
         )
         .expect("4 slots of 1 GiB");
 
-        let value = window_json(&window, 1, 1024 * 1024 * 1024);
+        let value =
+            window_json(&MemWindowReport::new(&window, 1, 1024 * 1024 * 1024));
 
         assert_eq!(
             serde_json::to_string(&value).expect("serializes"),

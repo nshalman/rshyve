@@ -69,6 +69,25 @@ impl ReadOp {
 
     /// Get the valid portion of the buffer.
     #[inline]
+    /// Answer this read from the dword register value `val`, as seen
+    /// from byte `byte_off` of that register.
+    ///
+    /// A one or two byte access at a sub-dword offset gets the bytes it
+    /// named. An access wider than a dword gets the whole value.
+    pub fn write_dword_at(&mut self, val: u32, byte_off: usize) {
+        let shifted = val >> ((byte_off & 0x3) * 8);
+        match self.len() {
+            1 => self.write_u8(shifted as u8),
+            2 => self.write_u16(shifted as u16),
+            _ => self.write_u32(shifted),
+        }
+    }
+
+    /// Answer this read from a dword register value at its own width.
+    pub fn write_dword(&mut self, val: u32) {
+        self.write_dword_at(val, 0);
+    }
+
     pub fn buf(&self) -> &[u8] {
         &self.buf[..self.len as usize]
     }
@@ -137,6 +156,15 @@ impl WriteOp {
 
     /// Read a `u64` value from the buffer in little-endian byte order.
     #[inline]
+    /// The value written, widened to a dword.
+    pub fn read_dword(&self) -> u32 {
+        match self.len() {
+            1 => u32::from(self.read_u8()),
+            2 => u32::from(self.read_u16()),
+            _ => self.read_u32(),
+        }
+    }
+
     pub fn read_u64(&self) -> u64 {
         u64::from_le_bytes(self.buf)
     }

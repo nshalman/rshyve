@@ -971,14 +971,7 @@ impl XhciController {
                     0x1C => HCCPARAMS2,
                     _ => 0,
                 };
-                let byte_off = (offset & 0x3) as u32;
-                let shifted = val >> (byte_off * 8);
-                match ro.len() {
-                    1 => ro.write_u8(shifted as u8),
-                    2 => ro.write_u16(shifted as u16),
-                    4 => ro.write_u32(val),
-                    _ => ro.write_u32(val),
-                }
+                ro.write_dword_at(val, offset)
             }
             RWOp::Write(_) => {
                 // Capability registers are read-only
@@ -1010,14 +1003,7 @@ impl XhciController {
                     OP_CONFIG => st.config,
                     _ => 0,
                 };
-                let byte_off = (op_off & 0x3) as u32;
-                let shifted = val >> (byte_off * 8);
-                match ro.len() {
-                    1 => ro.write_u8(shifted as u8),
-                    2 => ro.write_u16(shifted as u16),
-                    4 => ro.write_u32(val),
-                    _ => ro.write_u32(val),
-                }
+                ro.write_dword_at(val, op_off)
             }
             RWOp::Write(wo) => {
                 let val = wo.read_u32();
@@ -1134,14 +1120,7 @@ impl XhciController {
                     (1, PORTSC_PORTSC) => st.port2_sc,
                     _ => 0,
                 };
-                let byte_off = (op_off & 0x3) as u32;
-                let shifted = val >> (byte_off * 8);
-                match ro.len() {
-                    1 => ro.write_u8(shifted as u8),
-                    2 => ro.write_u16(shifted as u16),
-                    4 => ro.write_u32(val),
-                    _ => ro.write_u32(val),
-                }
+                ro.write_dword_at(val, op_off)
             }
             RWOp::Write(wo) => {
                 let val = wo.read_u32();
@@ -1192,12 +1171,7 @@ impl XhciController {
         match rwo {
             RWOp::Read(ro) => {
                 // Doorbell registers read as 0
-                match ro.len() {
-                    1 => ro.write_u8(0),
-                    2 => ro.write_u16(0),
-                    4 => ro.write_u32(0),
-                    _ => ro.write_u32(0),
-                }
+                ro.write_dword(0)
             }
             RWOp::Write(wo) => {
                 let db_idx = db_off / DB_REG_SIZE;
@@ -1259,14 +1233,7 @@ impl XhciController {
                         _ => 0,
                     }
                 };
-                let byte_off = (rt_off & 0x3) as u32;
-                let shifted = val >> (byte_off * 8);
-                match ro.len() {
-                    1 => ro.write_u8(shifted as u8),
-                    2 => ro.write_u16(shifted as u16),
-                    4 => ro.write_u32(val),
-                    _ => ro.write_u32(val),
-                }
+                ro.write_dword_at(val, rt_off)
             }
             RWOp::Write(wo) => {
                 if rt_off < IR0_BASE {
@@ -1345,14 +1312,7 @@ impl XhciController {
                 } else {
                     0
                 };
-                let byte_off = (xcap_off & 0x3) as u32;
-                let shifted = val >> (byte_off * 8);
-                match ro.len() {
-                    1 => ro.write_u8(shifted as u8),
-                    2 => ro.write_u16(shifted as u16),
-                    4 => ro.write_u32(val),
-                    _ => ro.write_u32(val),
-                }
+                ro.write_dword_at(val, xcap_off)
             }
             RWOp::Write(_) => {
                 // Extended capabilities are read-only

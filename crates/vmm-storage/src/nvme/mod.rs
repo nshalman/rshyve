@@ -39,7 +39,9 @@ use vmm_core::mmio::{MmioBus, MmioFn};
 use vmm_devices::blkdev::DiskCache;
 use vmm_devices::lifecycle::Indicator;
 use vmm_devices::pci::bar::BarDefine;
-use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
+use vmm_devices::pci::device::{
+    replay_migrate_pci_state, DeviceIdent, DeviceState, PciDevice,
+};
 use vmm_devices::pci::msix::{HdlMsiSink, MsixTable};
 use vmm_devices::pci::BarN;
 use vmm_devices::{
@@ -559,12 +561,10 @@ impl NvmeController {
                     0x34 => (st.acq_base >> 32) as u32,
                     _ => 0,
                 };
-                match ro.len() {
-                    1 => ro.write_u8(val as u8),
-                    2 => ro.write_u16(val as u16),
-                    4 => ro.write_u32(val),
-                    8 => ro.write_u64(val as u64),
-                    _ => ro.write_u32(val),
+                if ro.len() == 8 {
+                    ro.write_u64(u64::from(val));
+                } else {
+                    ro.write_dword_at(val, offset);
                 }
             }
             RWOp::Write(wo) => {
@@ -903,10 +903,7 @@ impl NvmeController {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
 
-        // Validate that the queue base GPA is page-aligned and non-zero.
-        // A malicious guest could point CQ base at an MMIO region of
-        // another device, causing cross-device confusion.
-        if prp1 == 0 || (prp1 & 0xFFF) != 0 {
+        if !valid_queue_base(prp1) {
             return (SC_INVALID_FIELD | SC_DNR, 0);
         }
 
@@ -953,8 +950,7 @@ impl NvmeController {
             return (SC_INVALID_FIELD | SC_DNR, 0);
         }
 
-        // Validate that the queue base GPA is page-aligned and non-zero.
-        if prp1 == 0 || (prp1 & 0xFFF) != 0 {
+        if !valid_queue_base(prp1) {
             return (SC_INVALID_FIELD | SC_DNR, 0);
         }
 
@@ -1165,20 +1161,10 @@ impl NvmeController {
                 } else {
                     self.msix.table_read(offset)
                 };
-                match ro.len() {
-                    1 => ro.write_u8(val as u8),
-                    2 => ro.write_u16(val as u16),
-                    4 => ro.write_u32(val),
-                    _ => ro.write_u32(val),
-                }
+                ro.write_dword(val)
             }
             RWOp::Write(wo) => {
-                let val = match wo.len() {
-                    1 => u32::from(wo.read_u8()),
-                    2 => u32::from(wo.read_u16()),
-                    4 => wo.read_u32(),
-                    _ => wo.read_u32(),
-                };
+                let val = wo.read_dword();
                 // The PBA is read-only to the guest.
                 if offset < pba_offset {
                     self.msix.table_write(offset, val);
@@ -1413,6 +1399,13 @@ fn write_to_prp(
 // ---------------------------------------------------------------------------
 // I/O worker thread
 // ---------------------------------------------------------------------------
+
+/// Whether a guest-supplied queue base may be used: page-aligned and
+/// non-zero. A malicious guest could otherwise point a queue at the
+/// MMIO region of another device.
+fn valid_queue_base(prp1: u64) -> bool {
+    prp1 != 0 && (prp1 & 0xFFF) == 0
+}
 
 /// Worker thread loop: reads I/O requests from the channel and executes them.
 ///
@@ -1691,15 +1684,9 @@ impl Lifecycle for NvmeController {
             })
             .collect();
 
-        // Export PCI state
-        let pci = self.pci_state.lock().expect("pci lock");
-        let mut pci_bar_addrs = [0u64; 6];
-        for (idx, addr) in pci_bar_addrs.iter_mut().enumerate() {
-            let bar = BarN::try_from(idx as u8).expect("valid BAR");
-            *addr = pci.bars().get(bar).map(|(_, v)| v).unwrap_or(0);
-        }
-        let pci_command = pci.command().bits();
-        drop(pci);
+        let pci = self.pci_state.lock().expect("pci lock").migrate_state();
+        let pci_command = pci.command;
+        let pci_bar_addrs = pci.bar_addrs;
 
         // Export MSI-X table entries
         let msix_count = self.msix.count();
@@ -1740,36 +1727,12 @@ impl Lifecycle for NvmeController {
         );
 
         // Restore PCI BAR addresses and command register
-        {
-            use vmm_devices::pci::bar::BarDefine;
-            let pci = self.pci_state.lock().expect("pci lock");
-            let mut bar_writes = Vec::new();
-            for (idx, &addr) in mig.pci_bar_addrs.iter().enumerate() {
-                let bar = BarN::try_from(idx as u8).expect("valid BAR");
-                let Some((def, _)) = pci.bars().get(bar) else {
-                    continue;
-                };
-                let offset = vmm_devices::pci::bits::REG_BAR0 + (idx as u8 * 4);
-                match def {
-                    BarDefine::Pio(_) | BarDefine::Mmio(_) => {
-                        bar_writes.push((offset, addr as u32));
-                    }
-                    BarDefine::Mmio64(_) => {
-                        bar_writes.push((offset, addr as u32));
-                        bar_writes.push((offset + 4, (addr >> 32) as u32));
-                    }
-                }
-            }
-            drop(pci);
-            for (off, val) in &bar_writes {
-                self.cfg_write(*off, 4, *val);
-            }
-            self.cfg_write(
-                vmm_devices::pci::bits::REG_COMMAND,
-                2,
-                u32::from(mig.pci_command),
-            );
-        }
+        let bar_writes = self
+            .pci_state
+            .lock()
+            .expect("pci lock")
+            .bar_replay_writes(&mig.pci_bar_addrs);
+        replay_migrate_pci_state(self, &bar_writes, mig.pci_command);
 
         // Restore controller state
         let mut st = self.state.lock().expect("nvme state lock");

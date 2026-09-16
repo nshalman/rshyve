@@ -17,7 +17,6 @@
 use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::net::Shutdown;
-use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,12 +27,12 @@ use std::time::Duration;
 use anyhow::Context;
 use slog::{debug, warn};
 use vmm_core::mem::PhysMap;
-use vmm_core::poll::{wait_readable, Readiness};
 use vmm_core::unixsock::{bind_restricted, write_all_bounded, SocketPolicy};
 
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::{queue_drain_should_stop, VirtioDevice};
 use crate::pci::intr::{BackendIntr, IntrSession, IntrSlot};
+use crate::socket_accept;
 use vmm_devices::lifecycle::{IndicatedState, Indicator};
 use vmm_devices::{Lifecycle, QuiesceGate};
 
@@ -68,11 +67,6 @@ const TX_CHUNK: usize = 4096;
 /// supplies the end: `SO_SNDTIMEO` reports success on illumos and
 /// bounds nothing.
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
-/// How long the accept thread waits before it re-reads the shutdown
-/// flag. Bounds how long `halt` waits for that thread to return.
-const ACCEPT_POLL: Duration = Duration::from_millis(50);
-/// Pause after an accept that failed for a reason retrying cannot fix.
-const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// State shared with the accept and reader threads.
 struct ConsoleShared {
     socket_path: PathBuf,
@@ -219,13 +213,6 @@ impl ConsoleShared {
 
     /// Take over as the single client and start reading from it.
     fn attach_client(self: &Arc<Self>, stream: UnixStream) {
-        // An accepted socket inherits the listener's non-blocking flag
-        // on some platforms, and the reader needs a blocking read.
-        if let Err(error) = stream.set_nonblocking(false) {
-            warn!(self.log, "virtio-console client setup failed";
-                "error" => %error);
-            return;
-        }
         // Belt and braces only. This bounds a write on the platforms
         // where it works, and reports success and does nothing on
         // illumos, which is why `write_all_bounded` polls instead.
@@ -263,43 +250,15 @@ impl ConsoleShared {
     }
 }
 
-/// Accept clients until shutdown, waking on a timer to notice it.
-///
-/// A blocking `accept` can only be broken by racing a connect against
-/// the listener, and a connect that fails leaves the thread blocked
-/// forever, which would hang VM teardown.
 fn accept_loop(shared: Arc<ConsoleShared>, listener: UnixListener) {
-    if let Err(error) = listener.set_nonblocking(true) {
-        warn!(shared.log, "virtio-console listener setup failed";
-            "error" => %error);
-        return;
-    }
-
-    while !shared.shutdown.load(Ordering::Acquire) {
-        match wait_readable(listener.as_fd(), ACCEPT_POLL) {
-            Readiness::Readable => {}
-            Readiness::Idle => continue,
-            Readiness::Gone => {
-                warn!(shared.log, "virtio-console listener is unusable");
-                return;
-            }
-        }
-        match listener.accept() {
-            Ok((stream, _)) => shared.attach_client(stream),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) => {}
-            Err(error) => {
-                warn!(shared.log, "virtio-console accept failed";
-                    "error" => %error);
-                // Out of file descriptors leaves the connection
-                // pending, so back off instead of spinning on it.
-                std::thread::sleep(ACCEPT_BACKOFF);
-            }
-        }
-    }
+    let on_client = |stream| shared.attach_client(stream);
+    socket_accept::accept_loop(
+        listener,
+        &shared.shutdown,
+        &shared.log,
+        "virtio-console",
+        on_client,
+    );
 }
 
 fn reader_loop(shared: Arc<ConsoleShared>, mut stream: UnixStream) {

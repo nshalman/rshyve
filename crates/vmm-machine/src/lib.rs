@@ -13,8 +13,10 @@
 pub mod build;
 pub mod chipset;
 pub mod devspec;
+pub mod entry;
 pub mod firmware;
 pub mod hotplug;
+pub mod inventory;
 pub mod opts;
 pub mod parse;
 pub mod pci;
@@ -31,7 +33,7 @@ pub use build::{
     build_machine, host_tsc_frequency_hz, no_pre_finalize, MachineBuild,
     MachineOpts,
 };
-pub use chipset::{init_chipset, ChipsetDevices};
+pub use chipset::{attach_uart, init_chipset, ChipsetDevices};
 pub use firmware::{
     setup_fwcfg_and_acpi, write_legacy_acpi_tables, write_smbios_tables,
     AcpiTables,
@@ -41,18 +43,18 @@ pub use hotplug::mem::{
     MemHotplugEngine, MemHotplugError, MemWindow, DEFAULT_SLOT_SIZE,
 };
 pub use hotplug::{
-    hot_add_window, hotplug_specs, CpuSlots, HotplugEngine, HotplugEngines,
-    HotplugError, HotplugFactory, VmPause,
+    hot_add_window, hotplug_specs, start_cpu_hotplug, CpuSlots, HotplugEngine,
+    HotplugEngines, HotplugError, HotplugFactory, VmPause,
 };
 pub use opts::VmOpts;
 pub use parse::{find_lpc_device, parse_bdf};
 pub use pci::{
-    attach_pci_devices, CreatedPciDevice, LifecycleHandle, PciAttachment,
-    PciDeviceCtx, PciDeviceFactory, PciDeviceHandle,
+    attach_pci_devices, created, CreatedPciDevice, LifecycleHandle,
+    PciAttachment, PciDeviceCtx, PciDeviceFactory, PciDeviceHandle,
 };
 pub use pm::{
-    mem_hotplug_window, register_pm_devices, setup_timers_and_pm, Gpe0,
-    HotplugOpts, HotplugRegisters, TimerAndPmDevices,
+    mem_hotplug_window, register_pm_devices, setup_timers_and_pm,
+    start_mem_hotplug, Gpe0, HotplugOpts, HotplugRegisters, TimerAndPmDevices,
 };
 pub use registry::{
     DeviceRegistry, RegisteredDevice, RegistryError, SlotState,
@@ -61,7 +63,8 @@ pub use signal::{install_sigterm_handler, sigterm_flag, sigterm_received};
 pub use teardown::{
     join_vcpus_bounded, quiesce_devices, quiesce_registered_devices,
     registry_named_devices, run_event_loop, run_event_loop_growable,
-    run_event_loop_registered, RunOutcome, VcpuSet, VcpuThreads,
+    run_event_loop_registered, run_fleet_event_loop, RunOutcome, VcpuSet,
+    VcpuThreads,
 };
 pub use vcpu::{
     activate_all_vcpus, activate_one, activate_uefi_bsp_only, activate_vcpus,

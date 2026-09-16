@@ -51,34 +51,17 @@
 //! user. rshyve, which has a control socket, adds a uid and zoneid
 //! peercred check on top.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use vmm_machine::{CpuSlots, DeviceRegistry, HotplugEngines, HotplugError};
+use vmm_machine::inventory::{
+    cpu_inventory, MemWindowReport, CPU_HOTPLUG_OFF, MEM_HOTPLUG_OFF,
+    NO_CPU_REMOVE, NO_MEM_REMOVE,
+};
+use vmm_machine::{DeviceRegistry, HotplugEngines, HotplugError};
 use vmm_virtio::vsock::control::{ControlReply, ControlRequest, ControlSink};
 
 /// Placeholder for a device that is not on the PCI bus.
 const NO_BDF: &str = "-";
-
-/// Why a CPU request was refused on a VM with no CPU slots.
-///
-/// Two starts give a VM no engine: no `--hotplug`, and a `maxcpus` that
-/// is not above the boot count. The answer names both, because the
-/// operator has to fix whichever one applies.
-const CPU_HOTPLUG_OFF: &str =
-    "CPU hot-add needs --hotplug and -c cpus=N,maxcpus=M";
-
-/// The same for memory.
-const MEM_HOTPLUG_OFF: &str =
-    "memory hot-add needs --hotplug and -o hotplug.maxmem=SIZE";
-
-/// Why `cpu-remove` cannot exist on this platform.
-const NO_CPU_REMOVE: &str = "cpu-remove is not supported: illumos has no \
-     vm_deactivate_cpu, so an active vCPU cannot be taken back";
-
-/// Why `mem-remove` cannot exist on this platform.
-const NO_MEM_REMOVE: &str = "mem-remove is not supported: illumos has no \
-     VM_FREE_MEMSEG, so a memory segment lives until the VM does";
 
 /// The machine, as the control commands see it.
 pub struct Inventory {
@@ -185,38 +168,21 @@ impl Inventory {
     }
 
     /// One record per CPU slot: `id,state,kind`.
-    ///
-    /// Every slot the MADT describes is listed, whether or not this VM
-    /// can fill it: hiding the spare slots would contradict what the
-    /// guest reads. `cpu-add` is what says whether one can be filled.
     fn cpu_list(&self) -> ControlReply {
-        let cpus = self.hotplug.cpu.as_ref();
-        // With an engine, its ceiling is the one an add is checked
-        // against. The two agree: both come from `VmOpts::max_cpus`,
-        // which is already capped at the kernel's 64.
-        let max_cpus = cpus.map_or(self.max_cpus, CpuSlots::max_cpus);
-        let boot_cpus = cpus.map_or(self.num_cpus, CpuSlots::boot_cpus);
-        // A set, never a slice indexed by an id. The ids come from the
-        // engine and are bounded by the kernel's 64 CPUs, but nothing
-        // here has to trust that.
-        let consumed: BTreeSet<u32> = cpus
-            .map(CpuSlots::consumed)
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-
-        let records = (0..max_cpus)
-            .map(|id| {
-                let state = if consumed.contains(&id) {
-                    "consumed"
-                } else if cpus.map_or(id < boot_cpus, |cpus| cpus.is_online(id))
-                {
-                    "present"
-                } else {
-                    "absent"
-                };
-                let kind = if id < boot_cpus { "boot" } else { "hotplug" };
-                vec![id.to_string(), state.to_string(), kind.to_string()]
+        let inv = cpu_inventory(
+            self.num_cpus,
+            self.max_cpus,
+            self.hotplug.cpu.as_ref(),
+        );
+        let records = inv
+            .slots
+            .iter()
+            .map(|slot| {
+                vec![
+                    slot.id.to_string(),
+                    slot.state.to_string(),
+                    slot.kind.to_string(),
+                ]
             })
             .collect();
         ControlReply::list(records)
@@ -234,11 +200,7 @@ impl Inventory {
         };
 
         let mut records = vec![boot];
-        records.extend(window_records(
-            &engine.window(),
-            engine.slots_used(),
-            engine.bytes_added(),
-        ));
+        records.extend(window_records(&MemWindowReport::of(engine)));
         ControlReply::list(records)
     }
 }
@@ -247,20 +209,16 @@ impl Inventory {
 ///
 /// Split from the engine so the wire shape can be tested: every part of
 /// a real engine is an ioctl on a live VM.
-fn window_records(
-    window: &vmm_machine::MemWindow,
-    slots_used: usize,
-    added: u64,
-) -> Vec<Vec<String>> {
+fn window_records(report: &MemWindowReport) -> Vec<Vec<String>> {
     let record = |name: &str, value: String| {
         vec![name.to_string(), value, "present".to_string()]
     };
     vec![
-        record("window", window.size().to_string()),
-        record("slot-size", window.slot_size().to_string()),
-        record("slot-count", window.slots().to_string()),
-        record("slots-used", slots_used.to_string()),
-        record("added", added.to_string()),
+        record("window", report.bytes.to_string()),
+        record("slot-size", report.slot_bytes.to_string()),
+        record("slot-count", report.slots.to_string()),
+        record("slots-used", report.slots_used.to_string()),
+        record("added", report.added_bytes.to_string()),
     ]
 }
 
@@ -284,9 +242,11 @@ impl ControlSink for Inventory {
 mod tests {
     use std::sync::Mutex;
 
+    use std::collections::BTreeSet;
+
     use vmm_machine::{
-        CpuHotplugEngine, CpuOnline, DeviceRegistry, RegisteredDevice,
-        VcpuError,
+        CpuHotplugEngine, CpuOnline, CpuSlots, DeviceRegistry,
+        RegisteredDevice, VcpuError,
     };
 
     use super::*;
@@ -578,7 +538,11 @@ mod tests {
         )
         .expect("4 slots of 1 GiB");
 
-        let records = window_records(&window, 1, 1024 * 1024 * 1024);
+        let records = window_records(&MemWindowReport::new(
+            &window,
+            1,
+            1024 * 1024 * 1024,
+        ));
 
         assert_eq!(
             ControlReply::list(records).render(),
@@ -597,21 +561,6 @@ mod tests {
             "ERR 512M is not a size in bytes",
         );
         assert_eq!(line(&inv, "mem-add -1"), "ERR -1 is not a size in bytes");
-    }
-
-    #[test]
-    fn no_refusal_carries_a_run_of_spaces() {
-        // A `\` line continuation in a string literal eats the newline
-        // AND the indent that follows it. A message rebuilt without one
-        // keeps that indent and reaches the operator as a gap.
-        for message in [
-            CPU_HOTPLUG_OFF,
-            MEM_HOTPLUG_OFF,
-            NO_CPU_REMOVE,
-            NO_MEM_REMOVE,
-        ] {
-            assert!(!message.contains("  "), "{message}");
-        }
     }
 
     #[test]

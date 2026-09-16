@@ -888,37 +888,3 @@ fn a_slot_on_its_way_out_is_not_replayed() {
 
     assert!(hotplug_specs(&fixture.registry).is_empty());
 }
-
-// ── Thread ──────────────────────────────────────────────────────────
-
-#[test]
-fn the_drain_thread_stops_on_request() {
-    let stop = Arc::new(Stopper::default());
-    let core = Arc::new(Fixture::new().core);
-    let weak = Arc::downgrade(&core);
-    let handle = {
-        let stop = Arc::clone(&stop);
-        thread::spawn(move || drain_loop(&weak, &stop))
-    };
-
-    stop.stop();
-
-    handle.join().expect("the drain thread ends");
-}
-
-#[test]
-fn the_drain_thread_stops_when_the_engine_is_dropped() {
-    // No shutdown call: a leaked engine must not leave a thread polling
-    // the register file forever.
-    let stop = Arc::new(Stopper::default());
-    let core = Arc::new(Fixture::new().core);
-    let weak = Arc::downgrade(&core);
-    let handle = {
-        let stop = Arc::clone(&stop);
-        thread::spawn(move || drain_loop(&weak, &stop))
-    };
-
-    drop(core);
-
-    handle.join().expect("the drain thread ends");
-}

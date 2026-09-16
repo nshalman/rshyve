@@ -27,8 +27,7 @@
 //!    the wake it posts no new receive buffers, and the kernel viona
 //!    driver drops arriving packets with "no_space".
 
-use vmm_devices::pci::bar::BarDefine;
-use vmm_devices::pci::device::PciDevice;
+use vmm_devices::pci::device::replay_migrate_pci_state;
 use vmm_devices::pci::BarN;
 
 use super::bits;
@@ -39,17 +38,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     fn export_migrate_pci_state(
         &self,
     ) -> vmm_devices::lifecycle::VirtioMigratePciState {
-        let pci = self.pci_state.lock().expect("pci lock");
-        let mut bar_addrs = [0u64; 6];
-        for (idx, addr) in bar_addrs.iter_mut().enumerate() {
-            let bar = BarN::try_from(idx as u8).expect("valid BAR index");
-            *addr = pci.bars().get(bar).map(|(_, value)| value).unwrap_or(0);
-        }
-
-        vmm_devices::lifecycle::VirtioMigratePciState {
-            command: pci.command().bits(),
-            bar_addrs,
-        }
+        self.pci_state.lock().expect("pci lock").migrate_state()
     }
 
     /// Replay BAR and command-register writes so bus registrations are restored.
@@ -57,36 +46,12 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         &self,
         state: &vmm_devices::lifecycle::VirtioMigratePciState,
     ) {
-        let mut bar_writes = Vec::with_capacity(7);
-        {
-            let pci = self.pci_state.lock().expect("pci lock");
-            for (idx, addr) in state.bar_addrs.iter().copied().enumerate() {
-                let bar = BarN::try_from(idx as u8).expect("valid BAR index");
-                let Some((def, _)) = pci.bars().get(bar) else {
-                    continue;
-                };
-
-                let offset = vmm_devices::pci::bits::REG_BAR0 + (idx as u8 * 4);
-                match def {
-                    BarDefine::Pio(_) | BarDefine::Mmio(_) => {
-                        bar_writes.push((offset, addr as u32));
-                    }
-                    BarDefine::Mmio64(_) => {
-                        bar_writes.push((offset, addr as u32));
-                        bar_writes.push((offset + 4, (addr >> 32) as u32));
-                    }
-                }
-            }
-        }
-
-        for (offset, value) in bar_writes {
-            self.cfg_write(offset, 4, value);
-        }
-        self.cfg_write(
-            vmm_devices::pci::bits::REG_COMMAND,
-            2,
-            u32::from(state.command),
-        );
+        let writes = self
+            .pci_state
+            .lock()
+            .expect("pci lock")
+            .bar_replay_writes(&state.bar_addrs);
+        replay_migrate_pci_state(self, &writes, state.command);
     }
 
     /// Snapshot every configured queue, plus the config-space

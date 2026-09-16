@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use slog::warn;
 
-use vmm_core::intr_pins::{IntrPin, LegacyPIC, NoOpPin};
+use vmm_core::intr_pins::LegacyPIC;
 use vmm_core::machine::Machine;
 use vmm_devices::uart::backend::{attach, SerialBackend};
 use vmm_devices::uart::lpc::{self, LpcUart};
@@ -97,22 +97,6 @@ pub(crate) fn report_serial_backends(lpc_args: &[String], log: &slog::Logger) {
     }
 }
 
-/// Attach one LPC UART at `base` with `irq`, with no backend yet.
-fn new_port(
-    machine: &Machine,
-    pic: &Arc<LegacyPIC>,
-    base: u16,
-    irq: u8,
-) -> Arc<LpcUart> {
-    let pin: Arc<dyn IntrPin> = match pic.pin_handle(irq) {
-        Some(p) => p,
-        None => Arc::new(NoOpPin),
-    };
-    let uart = LpcUart::new(pin);
-    uart.attach(machine.bus_pio(), base);
-    uart
-}
-
 /// Attach COM1 and connect it to the backend the argv named.
 ///
 /// A device that cannot be opened falls back to stdio rather than
@@ -125,7 +109,8 @@ pub(crate) fn setup_console(
     lpc_args: &[String],
     log: &slog::Logger,
 ) -> anyhow::Result<Arc<LpcUart>> {
-    let uart = new_port(machine, pic, lpc::COM1_BASE, lpc::COM1_IRQ);
+    let uart =
+        vmm_machine::attach_uart(machine, pic, lpc::COM1_BASE, lpc::COM1_IRQ);
     if let Com1Backend::Device(path) = com1_backend(lpc_args) {
         match attach(&uart, SerialBackend::Device(&path), "com1", log) {
             Ok(()) => return Ok(uart),
@@ -155,7 +140,8 @@ pub(crate) fn setup_com2(
     pic: &Arc<LegacyPIC>,
     log: &slog::Logger,
 ) -> anyhow::Result<Arc<LpcUart>> {
-    let uart = new_port(machine, pic, lpc::COM2_BASE, lpc::COM2_IRQ);
+    let uart =
+        vmm_machine::attach_uart(machine, pic, lpc::COM2_BASE, lpc::COM2_IRQ);
     attach(&uart, SerialBackend::StdoutOnly, "com2", log)?;
     Ok(uart)
 }

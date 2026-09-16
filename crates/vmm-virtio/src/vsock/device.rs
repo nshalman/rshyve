@@ -167,14 +167,10 @@ impl VirtioDevice for VirtioVsock {
         *self.negotiated_features.lock().expect("features lock") = features;
     }
 
-    fn cfg_read(&self, offset: u16, _len: u8) -> u32 {
+    fn cfg_read(&self, offset: u16, len: u8) -> u32 {
         // The whole config is one le64 guest_cid.
-        let cid = self.shared.mux.guest_cid();
-        match offset {
-            0 => cid as u32,
-            4 => (cid >> 32) as u32,
-            _ => 0,
-        }
+        let cid = self.shared.mux.guest_cid().to_le_bytes();
+        crate::cfg_read_bytes(&cid, offset, len)
     }
 
     fn cfg_write(&self, _offset: u16, _val: u32, _len: u8) {}

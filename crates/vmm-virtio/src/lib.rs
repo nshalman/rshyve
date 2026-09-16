@@ -36,7 +36,8 @@ pub mod fs;
 pub mod pci;
 pub mod queue;
 pub mod rng;
-pub(crate) mod socket_halt;
+pub(crate) mod socket_accept;
+mod socket_halt;
 pub mod viona;
 pub mod vsock;
 
@@ -49,6 +50,24 @@ pub use rng::VirtioRng;
 pub use viona::VirtioViona;
 
 use vmm_core::mem::PhysMap;
+
+/// Read up to four little-endian bytes of a device config at `offset`.
+///
+/// The guest picks the offset and the width, so the sum is checked and
+/// every byte past the end of `cfg` reads as zero.
+pub fn cfg_read_bytes(cfg: &[u8], offset: u16, len: u8) -> u32 {
+    let mut out = 0u32;
+    for i in 0..usize::from(len).min(4) {
+        let Some(byte) = usize::from(offset)
+            .checked_add(i)
+            .and_then(|off| cfg.get(off))
+        else {
+            break;
+        };
+        out |= u32::from(*byte) << (i * 8);
+    }
+    out
+}
 
 fn queue_drain_should_stop(
     queue: &VirtQueue,

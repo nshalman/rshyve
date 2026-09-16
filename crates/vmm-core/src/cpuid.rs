@@ -28,13 +28,20 @@ pub enum CpuBaseline {
     Sse42,
 }
 
-impl CpuBaseline {
-    pub fn parse(s: &str) -> Option<Self> {
+/// A `--cpu-baseline` value this build does not know.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown CPU baseline '{0}' (valid: host, avx2, no-avx512, sse42)")]
+pub struct UnknownCpuBaseline(String);
+
+impl std::str::FromStr for CpuBaseline {
+    type Err = UnknownCpuBaseline;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "host" | "native" => Some(Self::Host),
-            "avx2" | "no-avx512" => Some(Self::Avx2),
-            "sse42" | "sse4.2" | "westmere" => Some(Self::Sse42),
-            _ => None,
+            "host" | "native" => Ok(Self::Host),
+            "avx2" | "no-avx512" => Ok(Self::Avx2),
+            "sse42" | "sse4.2" | "westmere" => Ok(Self::Sse42),
+            _ => Err(UnknownCpuBaseline(s.to_string())),
         }
     }
 }

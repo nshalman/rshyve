@@ -14,6 +14,7 @@ use vmm_devices::bhyve::{
     BhyveAtPic, BhyveAtPit, BhyveHpet, BhyveIoApic, BhyveRtc,
 };
 use vmm_devices::chipset::i440fx::I440FxChipset;
+use vmm_devices::uart::lpc::LpcUart;
 
 /// Chipset and kernel-emulated device handles that must be kept alive
 /// for the VM's lifetime.
@@ -84,4 +85,19 @@ pub fn init_chipset(
         ioapic,
         rtc,
     })
+}
+
+/// Attach one LPC UART at `base` on `irq`, with no backend yet.
+///
+/// An IRQ the PIC cannot route gets a no-op pin, so the port still
+/// exists for a guest that polls it.
+pub fn attach_uart(
+    machine: &Machine,
+    pic: &Arc<LegacyPIC>,
+    base: u16,
+    irq: u8,
+) -> Arc<LpcUart> {
+    let uart = LpcUart::new(pic.pin_or_noop(irq));
+    uart.attach(machine.bus_pio(), base);
+    uart
 }

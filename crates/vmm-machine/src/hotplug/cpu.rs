@@ -28,14 +28,14 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::{Arc, Mutex, Weak};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex};
 
 use slog::{debug, error, info, warn, Logger};
 
 use vmm_devices::hotplug::cpu::CpuHotplug;
 
-use super::{lock, Stopper, DRAIN_INTERVAL};
+use super::drain::DrainThread;
+use super::lock;
 use crate::vcpus::{VcpuError, VcpuRegistry};
 
 /// Why a CPU hot-add was refused.
@@ -241,9 +241,7 @@ impl Core {
 /// The CPU hot-add engine, and the thread that answers ejects.
 pub struct CpuHotplugEngine {
     core: Arc<Core>,
-    stop: Arc<Stopper>,
-    thread: Mutex<Option<JoinHandle<()>>>,
-    log: Logger,
+    thread: DrainThread,
 }
 
 impl CpuHotplugEngine {
@@ -272,15 +270,15 @@ impl CpuHotplugEngine {
             consumed: Mutex::new(BTreeSet::new()),
             log: log.clone(),
         });
-        let stop = Arc::new(Stopper::default());
-        let thread = spawn_drain(&core, &stop, &log);
+        let thread = DrainThread::spawn(
+            "hotplug-cpu",
+            &core,
+            Core::drain_ejects,
+            &log,
+            "no CPU hotplug thread; ejects will not be answered",
+        );
 
-        Arc::new(Self {
-            core,
-            stop,
-            thread: Mutex::new(thread),
-            log,
-        })
+        Arc::new(Self { core, thread })
     }
 
     /// Bring one CPU online on the running VM.
@@ -295,53 +293,13 @@ impl CpuHotplugEngine {
 
     /// Stop the drain thread and wait for it.
     pub fn shutdown(&self) {
-        self.stop.stop();
-        let handle = lock(&self.thread).take();
-        if let Some(handle) = handle {
-            if handle.join().is_err() {
-                error!(self.log, "the CPU hotplug thread panicked");
-            }
-        }
+        self.thread.shutdown();
     }
 }
 
 impl Drop for CpuHotplugEngine {
     fn drop(&mut self) {
         self.shutdown();
-    }
-}
-
-fn spawn_drain(
-    core: &Arc<Core>,
-    stop: &Arc<Stopper>,
-    log: &Logger,
-) -> Option<JoinHandle<()>> {
-    // Weak, so an engine that is dropped without a shutdown still ends
-    // its thread.
-    let core = Arc::downgrade(core);
-    let stop = Arc::clone(stop);
-    let spawned = thread::Builder::new()
-        .name("hotplug-cpu".into())
-        .spawn(move || drain_loop(&core, &stop));
-    match spawned {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            // The VM keeps running, and an add still works. An eject
-            // then waits in the register file, which leaves the slot
-            // reading absent until something drains it.
-            error!(log, "no CPU hotplug thread; ejects will not be answered";
-                "error" => %e);
-            None
-        }
-    }
-}
-
-fn drain_loop(core: &Weak<Core>, stop: &Stopper) {
-    while !stop.wait(DRAIN_INTERVAL) {
-        let Some(core) = core.upgrade() else {
-            return;
-        };
-        core.drain_ejects();
     }
 }
 
@@ -716,7 +674,7 @@ mod tests {
 
         h.engine.shutdown();
 
-        assert!(lock(&h.engine.thread).is_none());
+        assert!(h.engine.thread.is_stopped());
         // A second shutdown, and the one in Drop, must both be quiet.
         h.engine.shutdown();
     }

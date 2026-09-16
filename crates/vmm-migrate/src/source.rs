@@ -39,11 +39,7 @@ use crate::state;
 use crate::MigrationPhase;
 use crate::MigrationStatus;
 
-/// Number of pages per batch for PageBatch messages.
-const BATCH_SIZE: usize = 64;
-const _: () = assert!(BATCH_SIZE <= limits::MAX_PAGES_PER_BATCH as usize);
-/// zstd compression level (1 = fastest, good ratio for RAM).
-const ZSTD_LEVEL: i32 = 1;
+use crate::limits::{BATCH_SIZE, ZSTD_LEVEL};
 
 /// Run the source side of live migration.
 ///

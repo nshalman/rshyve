@@ -408,12 +408,7 @@ impl Framebuffer {
         match rwo {
             RWOp::Read(ro) => {
                 let val = self.bar0_read(offset, ro.len());
-                match ro.len() {
-                    1 => ro.write_u8(val as u8),
-                    2 => ro.write_u16(val as u16),
-                    4 => ro.write_u32(val),
-                    _ => ro.write_u32(val),
-                }
+                ro.write_dword(val)
             }
             RWOp::Write(wo) => {
                 self.bar0_write(offset, wo.read_u32(), wo.len());

@@ -11,6 +11,11 @@ pub const MAX_BATCH_RAW_BYTES: usize = MAX_PAGES_PER_BATCH as usize * PAGE_SIZE;
 pub const MAX_BATCH_COMPRESSED_BYTES: usize =
     MAX_BATCH_RAW_BYTES + MAX_BATCH_RAW_BYTES / 8 + 4096;
 pub const MAX_SPARSE_GPAS: usize = MAX_PAGES_PER_BATCH as usize;
+/// Pages per PageBatch message on the source.
+pub const BATCH_SIZE: usize = 64;
+const _: () = assert!(BATCH_SIZE <= MAX_PAGES_PER_BATCH as usize);
+/// zstd compression level (1 = fastest, good ratio for RAM).
+pub const ZSTD_LEVEL: i32 = 1;
 pub const MAX_SERIALIZED_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = MAX_SERIALIZED_BYTES + 4096;
 

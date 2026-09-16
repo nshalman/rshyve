@@ -51,6 +51,9 @@ use crate::vcpu_tasks::{self, VcpuEvent, VcpuThreadCtx};
 const KERNEL_MAX_CPUS: u32 = vmm_core::VM_MAXCPU;
 // vmm_config cannot link the kernel ABI, so it carries its own copy.
 const _: () = assert!(KERNEL_MAX_CPUS == vmm_config::MAX_VCPUS);
+// The same for the command line: vmm_config refuses at parse time
+// what the loader would refuse when it writes guest memory.
+const _: () = assert!(vmm_config::CMDLINE_MAX == vmm_boot::direct::CMDLINE_MAX);
 
 const BOOK_POISONED: &str = "vCPU registry lock poisoned";
 

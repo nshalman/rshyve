@@ -11,29 +11,19 @@ mod console;
 mod control;
 mod devices;
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use slog::{error, info, warn, Drain};
+use slog::{error, info, warn};
 
 use vmm_config::Cli;
-use vmm_machine::{
-    CpuHotplugEngine, CpuSlots, DeviceRegistry, HotplugEngine, HotplugEngines,
-    MemHotplugEngine, VcpuRegistry, VcpuSetup,
-};
+use vmm_machine::{DeviceRegistry, HotplugEngine, HotplugEngines, VcpuSetup};
 use vmm_virtio::vsock::control::{ControlSink, ControlSlot};
 
 /// Kernel command line used when `--cmdline` is absent. It names
 /// `ttyS0`, which is why COM1 is always attached.
 use vmm_config::DEFAULT_CMDLINE;
-
-fn setup_logger() -> slog::Logger {
-    let decorator = slog_term::TermDecorator::new().build();
-    let drain = slog_term::FullFormat::new(decorator).build().fuse();
-    let drain = slog_async::Async::new(drain).build().fuse();
-    slog::Logger::root(drain, slog::o!("component" => "firehyve"))
-}
 
 fn version_string() -> String {
     let version = env!("CARGO_PKG_VERSION");
@@ -192,13 +182,7 @@ fn run(
 
     // CPUID stays outside build_machine because rshyve folds Hyper-V
     // leaves in here. firehyve has none, so this is the baseline only.
-    let baseline = vmm_core::cpuid::CpuBaseline::parse(&cli.cpu_baseline)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown CPU baseline '{}' (valid: host, avx2, no-avx512, sse42)",
-                cli.cpu_baseline,
-            )
-        })?;
+    let baseline: vmm_core::cpuid::CpuBaseline = cli.cpu_baseline.parse()?;
     // The table, not just the side effect: a CPU brought online later
     // has to be given the one its siblings got.
     let cpuid = vmm_core::cpuid::apply_cpuid_table(
@@ -270,7 +254,7 @@ fn run(
             log.new(slog::o!("component" => "hotplug")),
         )
     });
-    let mem_hotplug = start_mem_hotplug(
+    let mem_hotplug = vmm_machine::start_mem_hotplug(
         mem_window,
         &machine,
         timer_pm.hotplug.as_ref(),
@@ -337,28 +321,17 @@ fn run(
         None,
         log,
     );
-    let cpu_hotplug = timer_pm
-        .hotplug
-        .as_ref()
-        .and_then(|regs| regs.cpu.clone())
-        .map(|regs| {
-            let vcpus = Arc::new(VcpuRegistry::from_fleet(
-                VcpuSetup {
-                    max_cpus,
-                    boot_cpus: num_cpus,
-                    vmexit_on_hlt: cli.vmexit_on_hlt,
-                    cpuid: cpuid.clone(),
-                },
-                &fleet,
-                log.new(slog::o!("component" => "vcpus")),
-            ));
-            let engine = CpuHotplugEngine::start(
-                Arc::clone(&vcpus),
-                regs,
-                log.new(slog::o!("component" => "hotplug-cpu")),
-            );
-            CpuSlots::from_registry(engine, vcpus)
-        });
+    let cpu_hotplug = vmm_machine::start_cpu_hotplug(
+        timer_pm.hotplug.as_ref(),
+        VcpuSetup {
+            max_cpus,
+            boot_cpus: num_cpus,
+            vmexit_on_hlt: cli.vmexit_on_hlt,
+            cpuid: cpuid.clone(),
+        },
+        &fleet,
+        log,
+    );
     let hotplug = HotplugEngines {
         pci: pci_hotplug,
         cpu: cpu_hotplug,
@@ -384,37 +357,15 @@ fn run(
             "sockets" => control_slots.len());
     }
 
-    let vmm_machine::VcpuFleet {
-        events,
-        sender,
-        threads,
-        ..
-    } = fleet;
-    // The registry keeps its own sender, so the growable loop below
-    // reads "every thread has gone" off the roster. Without a registry
-    // this drop is what lets the channel close.
-    drop(sender);
-
     vmm_machine::install_sigterm_handler(&machine, log);
-    let outcome = if hotplug.cpu.is_some() {
-        vmm_machine::run_event_loop_growable(
-            &machine,
-            events,
-            &threads,
-            None,
-            &attachment.registry,
-            log,
-        )
-    } else {
-        vmm_machine::run_event_loop_registered(
-            &machine,
-            events,
-            threads.close(),
-            None,
-            &attachment.registry,
-            log,
-        )
-    };
+    let outcome = vmm_machine::run_fleet_event_loop(
+        &machine,
+        fleet,
+        &hotplug,
+        None,
+        &attachment.registry,
+        log,
+    );
 
     // The vsock control sink holds a handle, so the drain threads would
     // otherwise outlive the event loop.
@@ -422,74 +373,20 @@ fn run(
     outcome
 }
 
-/// Start the memory hot-add engine, or nothing when the VM asked for no
-/// window.
-///
-/// `-o hotplug.maxmem` already requires `--hotplug`, so a window with no
-/// register file is a contradiction and not a silent omission.
-fn start_mem_hotplug(
-    window: Option<vmm_machine::MemWindow>,
-    machine: &vmm_core::machine::Machine,
-    regs: Option<&vmm_machine::HotplugRegisters>,
-    log: &slog::Logger,
-) -> anyhow::Result<Option<Arc<MemHotplugEngine>>> {
-    let Some(window) = window else {
-        return Ok(None);
-    };
-    let regs = regs.ok_or_else(|| {
-        anyhow::anyhow!("a memory window needs the hotplug register files")
-    })?;
-    info!(log, "memory hot-add window";
-        "base" => format!("{:#x}", window.base()),
-        "bytes" => window.size(),
-        "slots" => window.slots(),
-    );
-    Ok(Some(MemHotplugEngine::start(
-        Arc::clone(machine.physmap()),
-        Arc::clone(machine.hdl()),
-        Arc::clone(machine.segids()),
-        Arc::clone(&regs.mem),
-        window,
-        log.new(slog::o!("component" => "hotplug-mem")),
-    )))
-}
-
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
 
-    // Answer --version before clap so it works with required args absent.
-    if args.iter().any(|arg| {
-        arg.as_os_str() == OsStr::new("--version")
-            || arg.as_os_str() == OsStr::new("-V")
-    }) {
+    if vmm_machine::entry::version_requested(&args) {
         println!("firehyve {}", version_string());
         return ExitCode::SUCCESS;
     }
-
-    // Non-fatal: /dev/dtrace/helper may not exist inside a zone.
-    if let Err(e) = usdt::register_probes() {
-        eprintln!("[firehyve] USDT probe registration skipped: {e}");
-    }
+    vmm_machine::entry::register_probes("firehyve");
 
     let cli = Cli::parse_named("firehyve");
-    let log = setup_logger();
+    let log = vmm_machine::entry::setup_logger("firehyve");
 
     match run(cli, &log) {
-        // The zone brand reads these. `boot.c` sets ZONE_ATTR_INITRESTART0
-        // on every bhyve zone and the brand declares no <initreboot>, so
-        // the kernel restarts init only on exit 0 and halts the zone on
-        // anything else. A guest that powers itself off must therefore
-        // NOT exit 0, or the zone restarts it for ever. The values are C
-        // bhyve's, from usr/src/cmd/bhyve/amd64/vmexit.c.
-        Ok(vmm_machine::RunOutcome::Reboot) => ExitCode::SUCCESS,
-        Ok(vmm_machine::RunOutcome::PowerOff) => ExitCode::from(1),
-        Ok(vmm_machine::RunOutcome::Halt) => ExitCode::from(2),
-        Ok(vmm_machine::RunOutcome::TripleFault(src)) => {
-            error!(log, "VM triple fault"; "source_vcpu" => src);
-            ExitCode::from(3)
-        }
-        // Distinct from HALT, which C bhyve gives 2.
-        Ok(vmm_machine::RunOutcome::GuestFault) => ExitCode::from(4),
+        Ok(outcome) => vmm_machine::entry::exit_code(outcome, &log),
         Err(e) => {
             error!(log, "fatal error"; "error" => format!("{e:#}"));
             ExitCode::FAILURE

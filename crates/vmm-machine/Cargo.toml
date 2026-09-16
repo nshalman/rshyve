@@ -13,10 +13,13 @@ vmm_config.workspace = true
 vmm_core.workspace = true
 vmm_devices.workspace = true
 vmm_virtio.workspace = true
+vmm_boot.workspace = true
 bhyve_api.workspace = true
 anyhow.workspace = true
 libc.workspace = true
 slog.workspace = true
+slog-async.workspace = true
+slog-term.workspace = true
 usdt = { workspace = true, features = ["asm"] }
 
 [dev-dependencies]

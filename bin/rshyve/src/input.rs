@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use slog::{info, Logger};
 
-use vmm_core::intr_pins::{IntrPin, LegacyPIC, NoOpPin};
+use vmm_core::intr_pins::LegacyPIC;
 use vmm_core::machine::Machine;
 use vmm_devices::acpi_pm::SuspendSink;
 use vmm_devices::InputBroker;
@@ -23,14 +23,8 @@ pub fn setup_ps2(
     input: &Arc<InputBroker>,
     log: &Logger,
 ) -> Arc<PS2Ctrl> {
-    let pri: Arc<dyn IntrPin> = match pic.pin_handle(IRQ_PS2_PRI) {
-        Some(pin) => pin,
-        None => Arc::new(NoOpPin),
-    };
-    let aux: Arc<dyn IntrPin> = match pic.pin_handle(IRQ_PS2_AUX) {
-        Some(pin) => pin,
-        None => Arc::new(NoOpPin),
-    };
+    let pri = pic.pin_or_noop(IRQ_PS2_PRI);
+    let aux = pic.pin_or_noop(IRQ_PS2_AUX);
     let ps2 = PS2Ctrl::create();
     ps2.attach(machine.bus_pio(), pri, aux, Some(suspend_sink));
     input.set_keyboard(ps2.clone());

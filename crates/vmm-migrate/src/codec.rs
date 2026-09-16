@@ -349,10 +349,8 @@ impl Message {
         match tag {
             MessageType::Okay => Ok(Message::Okay),
             MessageType::Error => {
-                let text = std::str::from_utf8(payload).map_err(|e| {
-                    MigrateError::Codec(format!("invalid UTF-8 in error: {e}"))
-                })?;
-                let err: MigrateError = ron::from_str(text)?;
+                let err: MigrateError =
+                    ron::from_str(Self::text(payload, "Error")?)?;
                 Ok(Message::Error(err))
             }
             MessageType::Serialized => {
@@ -361,10 +359,8 @@ impl Message {
             MessageType::Blob => Ok(Message::Blob(payload.to_vec())),
             MessageType::Page => Ok(Message::Page(payload.to_vec())),
             MessageType::MemQuery => {
-                let text = std::str::from_utf8(payload).map_err(|e| {
-                    MigrateError::Codec(format!("invalid UTF-8: {e}"))
-                })?;
-                let regions: Vec<MemRegionDesc> = ron::from_str(text)?;
+                let regions: Vec<MemRegionDesc> =
+                    ron::from_str(Self::text(payload, "MemQuery")?)?;
                 Ok(Message::MemQuery(regions))
             }
             MessageType::MemOffer => {
@@ -385,23 +381,16 @@ impl Message {
                         "MemOffer truncated region data".to_string(),
                     ));
                 }
-                let region_text = std::str::from_utf8(
+                let region: MemRegionDesc = ron::from_str(Self::text(
                     &payload[4..4 + region_len],
-                )
-                .map_err(|e| {
-                    MigrateError::Codec(format!(
-                        "invalid UTF-8 in MemOffer region: {e}"
-                    ))
-                })?;
-                let region: MemRegionDesc = ron::from_str(region_text)?;
+                    "MemOffer region",
+                )?)?;
                 let bitmap = payload[4 + region_len..].to_vec();
                 Ok(Message::MemOffer { region, bitmap })
             }
             MessageType::MemFetch => {
-                let text = std::str::from_utf8(payload).map_err(|e| {
-                    MigrateError::Codec(format!("invalid UTF-8: {e}"))
-                })?;
-                let gpas: Vec<u64> = ron::from_str(text)?;
+                let gpas: Vec<u64> =
+                    ron::from_str(Self::text(payload, "MemFetch")?)?;
                 if gpas.len() > limits::MAX_SPARSE_GPAS {
                     return Err(MigrateError::Codec(format!(
                         "MemFetch has too many GPAs: {}",
@@ -468,13 +457,21 @@ impl Message {
         Ok(Message::Serialized(data.into_bytes()))
     }
 
+    /// The payload as text, for the RON decoders.
+    fn text<'a>(
+        payload: &'a [u8],
+        what: &str,
+    ) -> Result<&'a str, MigrateError> {
+        std::str::from_utf8(payload).map_err(|e| {
+            MigrateError::Codec(format!("invalid UTF-8 in {what}: {e}"))
+        })
+    }
+
     /// Decode the payload of a Serialized message.
     pub fn deserialize<T: for<'de> Deserialize<'de>>(
         data: &[u8],
     ) -> Result<T, MigrateError> {
-        let text = std::str::from_utf8(data)
-            .map_err(|e| MigrateError::Codec(format!("invalid UTF-8: {e}")))?;
-        let val: T = ron::from_str(text)?;
+        let val: T = ron::from_str(Self::text(data, "Serialized")?)?;
         Ok(val)
     }
 }
