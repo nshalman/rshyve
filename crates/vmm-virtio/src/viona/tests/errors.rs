@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use vmm_devices::Lifecycle;
 
-use super::device::{addressed_queue, device_with, running_device};
+use super::device::{addressed_queue, device_with, notify, running_device};
 use super::{cleared, null_log, steps_of, Op, Step, Steps, TestLink};
 use crate::pci::intr::{BackendIntr, IntrSlot};
 use crate::viona::halt::halt_link;
@@ -86,17 +86,121 @@ fn a_ring_the_kernel_refused_to_program_is_not_ready() {
     // The ready flag is what lets the next kick through. A ring the
     // kernel refused has no worker: the kick is refused at best, and
     // on an older viona it dereferences a NULL in the mac layer.
+    // Userspace already validated these addresses, so writing them
+    // again cannot help; the ring is quarantined until a device reset.
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::RingInit]);
     let device = device_with(Arc::new(link));
 
     VirtioDevice::queue_addr_set(&device, 1, &addressed_queue());
+    VirtioDevice::queue_addr_set(&device, 1, &addressed_queue());
 
     assert_eq!(
         device.inner.lock().expect("viona lock").ring_state,
-        [RingState::Init; NET_NUM_QUEUES],
+        [RingState::Init, RingState::Error],
         "a ring the kernel refused was marked ready",
     );
+    assert_eq!(
+        steps_of(&steps).len(),
+        1,
+        "a quarantined ring kept issuing ioctls, one per guest write",
+    );
+}
+
+/// `viona_ioc_ring_reset` waits with signals heeded, so `EINTR` says
+/// nothing about the ring, only that this thread took a signal. A reset
+/// that believed it would quarantine a working NIC and leave the ring
+/// the driver asked for unprogrammed.
+#[test]
+fn a_reset_a_signal_interrupted_is_tried_again() {
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).interrupted_on(Op::RingReset, 2);
+    let device = running_device(Arc::new(link));
+
+    VirtioDevice::queue_addr_set(&device, RESTORED_RING, &addressed_queue());
+
+    assert_eq!(
+        steps_of(&steps),
+        [
+            Step::RingReset(RESTORED_RING),
+            Step::RingReset(RESTORED_RING),
+            Step::RingReset(RESTORED_RING),
+            Step::RingInit {
+                ring: RESTORED_RING,
+                size: NET_QUEUE_SIZE,
+                desc: DESC,
+                avail: AVAIL,
+                used: USED,
+            },
+        ],
+        "the reset gave up on a signal",
+    );
+    assert_eq!(
+        device.inner.lock().expect("viona lock").ring_state
+            [RESTORED_RING as usize],
+        RingState::Ready,
+    );
+}
+
+/// A `DEVICE_STATUS` write of 0 publishes status 0 as soon as the
+/// backend returns, and an illumos driver reclaims the ring pages on
+/// the next line. A kernel ring the reset could not stop keeps reading
+/// and writing them, so it must not read back as unprogrammed:
+/// `RING_INIT` over a running ring only fails with `EBUSY`, which would
+/// leave the stale worker and the new addresses both in place.
+#[test]
+fn a_device_reset_the_kernel_refused_quarantines_the_ring() {
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).failing(&[Op::RingReset]);
+    let device = running_device(Arc::new(link));
+
+    VirtioDevice::reset(&device);
+
+    assert_eq!(
+        device.inner.lock().expect("viona lock").ring_state,
+        [RingState::Error; NET_NUM_QUEUES],
+        "a ring the kernel still runs read back as unprogrammed",
+    );
+
+    VirtioDevice::queue_addr_set(&device, 1, &addressed_queue());
+    assert_eq!(
+        steps_of(&steps),
+        [Step::RingReset(0), Step::RingReset(1)],
+        "a quarantined ring was programmed over",
+    );
+}
+
+/// The kernel refuses a kick for any ring it is not running, and a
+/// guest can spin on `QUEUE_NOTIFY`, so one warning per refusal is a
+/// host log flood at a rate the guest picks. The latch is what holds it
+/// to one line per run of refusals.
+///
+/// The ring stays in service: a migration export pauses the kernel
+/// rings and leaves this state at `Ready`, so a ring retired on a
+/// refused kick would leave a dead NIC behind an aborted export.
+#[test]
+fn refused_kicks_warn_once_and_leave_the_ring_in_service() {
+    const KICKS: usize = 8;
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).failing(&[Op::RingKick]);
+    let device = running_device(Arc::new(link));
+
+    for _ in 0..KICKS {
+        notify(&device, 1);
+    }
+
+    let inner = device.inner.lock().expect("viona lock");
+    assert!(
+        inner.kick_refused[1],
+        "the latch is open, so every later refusal writes its own line",
+    );
+    assert_eq!(
+        inner.ring_state[1],
+        RingState::Ready,
+        "a refused kick took the ring out of service",
+    );
+    drop(inner);
+    assert_eq!(steps_of(&steps).len(), KICKS);
 }
 
 #[test]

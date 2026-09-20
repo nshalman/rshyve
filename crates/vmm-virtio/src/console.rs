@@ -30,8 +30,9 @@ use vmm_core::mem::PhysMap;
 use vmm_core::unixsock::{bind_restricted, write_all_bounded, SocketPolicy};
 
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
-use super::{queue_drain_should_stop, VirtioDevice};
-use crate::pci::intr::{BackendIntr, IntrSession, IntrSlot};
+use super::VirtioDevice;
+use crate::access::{GuestAccess, Session};
+use crate::pci::intr::{BackendIntr, IntrSlot};
 use crate::socket_accept;
 use vmm_devices::lifecycle::{IndicatedState, Indicator};
 use vmm_devices::{Lifecycle, QuiesceGate};
@@ -60,6 +61,18 @@ pub const CONSOLE_RX_BACKLOG_MAX: usize = 64 * 1024;
 /// Guest output is copied through a fixed buffer, so a descriptor
 /// length the guest picked never becomes an allocation size.
 const TX_CHUNK: usize = 4096;
+/// Bytes of guest output one kick may copy.
+///
+/// The drain runs inline on the vCPU under the transport lock, and
+/// the guest picks both the descriptor lengths and the number of
+/// chains. A ring of 128 chains, each naming 128 descriptors of 4 GiB,
+/// is tens of terabytes of copying for one notification: the vCPU
+/// stays in the VMM, every other vCPU that touches this device's
+/// registers waits on the transport lock, and a pause or teardown
+/// that needs that vCPU waits with them. Output past the bound is
+/// dropped, which the console already does whenever no client is
+/// attached.
+const TX_BYTES_PER_KICK: usize = 1024 * 1024;
 /// How long a client may stall before it loses its console.
 ///
 /// The transmit queue drains on the vCPU thread, so an unbounded write
@@ -79,6 +92,11 @@ struct ConsoleShared {
     /// Guest RX chains with no host bytes to fill them yet.
     pending_rx: Mutex<VecDeque<(u16, Vec<ChainBuf>)>>,
     rx_completion: Mutex<Option<Arc<VirtioCompletion>>>,
+    /// Permission to touch the guest's ring and chains.
+    ///
+    /// The reader thread delivers on its own, so a reset has to take
+    /// the ring back from it rather than from a worker it dispatched.
+    access: Arc<GuestAccess>,
     interrupt: Arc<IntrSlot>,
     /// Reader threads, one per client that has been attached.
     readers: Mutex<Vec<JoinHandle<()>>>,
@@ -91,6 +109,13 @@ struct ConsoleShared {
 }
 
 impl ConsoleShared {
+    /// Drop the used-ring writer and the stashed chains. Chains are
+    /// dropped, not completed: the guest abandons its ring and reposts.
+    fn forget_rx_ring(&self) {
+        *self.rx_completion.lock().expect("rx completion lock") = None;
+        self.pending_rx.lock().expect("pending rx lock").clear();
+    }
+
     /// Move host bytes into posted guest RX chains and publish them.
     fn deliver_rx(&self) {
         // A paused device must not touch guest memory. Bytes stay in
@@ -98,6 +123,15 @@ impl ConsoleShared {
         if self.gate.is_paused() {
             return;
         }
+        // Held across every copy and every used entry below. The
+        // transport publishes status 0 as soon as `reset` returns and
+        // the illumos driver reclaims the ring DMA on the next line,
+        // so a delivery that started before the reset has to finish
+        // inside it. The work here is bounded by the stash and the
+        // backlog cap, which is what lets a vCPU wait for it.
+        let Some(_session) = self.access.enter_current() else {
+            return;
+        };
         let completion = {
             let guard = self.rx_completion.lock().expect("rx completion lock");
             match guard.as_ref() {
@@ -300,7 +334,6 @@ fn reader_loop(shared: Arc<ConsoleShared>, mut stream: UnixStream) {
 pub struct VirtioConsole {
     shared: Arc<ConsoleShared>,
     accept: Mutex<Option<JoinHandle<()>>>,
-    negotiated_features: Mutex<u64>,
     indicator: Indicator,
 }
 
@@ -332,6 +365,7 @@ impl VirtioConsole {
             backlog: Mutex::new(VecDeque::new()),
             pending_rx: Mutex::new(VecDeque::new()),
             rx_completion: Mutex::new(None),
+            access: Arc::new(GuestAccess::new()),
             interrupt: Arc::new(IntrSlot::new()),
             readers: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
@@ -349,7 +383,6 @@ impl VirtioConsole {
         Ok(Self {
             shared,
             accept: Mutex::new(Some(accept)),
-            negotiated_features: Mutex::new(0),
             indicator: Indicator::new(),
         })
     }
@@ -369,12 +402,15 @@ impl VirtioConsole {
 
     /// Get or create the completion handler for the RX ring.
     ///
-    /// The session is read and the handler is stored under one lock,
-    /// and [`VirtioDevice::reset`] drops the handler under the same
-    /// lock after the transport has ended its session. So a handler
-    /// this leaves behind names either the session that is ending, and
-    /// is then dropped, or the one that follows.
-    fn ensure_rx_completion(&self, queue: &VirtQueue) -> Arc<VirtioCompletion> {
+    /// The caller's permission stamps the handler with the session its
+    /// ring belongs to. Permission is refused for the whole of a
+    /// reset, so a handler built here cannot reach the slot the next
+    /// driver finds.
+    fn ensure_rx_completion(
+        &self,
+        access: &Session<'_>,
+        queue: &VirtQueue,
+    ) -> Arc<VirtioCompletion> {
         let mut slot = self
             .shared
             .rx_completion
@@ -384,11 +420,10 @@ impl VirtioConsole {
             return Arc::clone(completion);
         }
         let intr = Arc::clone(&self.shared.interrupt);
-        let session = self.shared.interrupt.next_session(IntrSession::INITIAL);
         let completion = VirtioCompletion::new(
             queue,
             Arc::clone(&self.shared.physmap),
-            session,
+            access.intr(),
             move |session| {
                 intr.raise(session, CONSOLE_RX_QUEUE);
             },
@@ -402,107 +437,109 @@ impl VirtioConsole {
 
     /// Pop RX chains and hold them until host bytes arrive.
     fn stash_rx(&self, queue: &mut VirtQueue, physmap: &PhysMap) {
-        let completion = self.ensure_rx_completion(queue);
+        let Some(session) = self.shared.access.enter_current() else {
+            // A reset owns the ring. Its queue state goes with it.
+            return;
+        };
+        let completion = self.ensure_rx_completion(&session, queue);
 
         // A stashed chain is only completed once host bytes land in
         // it, so the stash needs a bound of its own: a guest can
         // otherwise publish one descriptor over and over and grow VMM
         // memory without limit.
         let max_requests = usize::from(queue.size());
-        let max_pending = max_requests;
-        let mut popped = 0usize;
-        loop {
-            let before = queue.last_avail_idx();
-            let mut refused: Vec<u16> = Vec::new();
-            {
-                let mut pending =
-                    self.shared.pending_rx.lock().expect("pending rx lock");
-                while popped < max_requests && pending.len() < max_pending {
-                    let Some(head) = queue.pop_avail(physmap) else {
-                        break;
-                    };
-                    popped += 1;
-                    let Some(chain) = queue.collect_chain(physmap, head) else {
-                        refused.push(head);
-                        continue;
-                    };
-                    pending.push_back((head, chain));
-                }
+        let mut refused: Vec<u16> = Vec::new();
+        let mut pending =
+            self.shared.pending_rx.lock().expect("pending rx lock");
+        queue.drain_avail(physmap, max_requests, |queue, head| {
+            if pending.len() >= max_requests {
+                refused.push(head);
+                return;
             }
-            // `pop_avail` already took these heads out of the available
-            // ring, so each one has to go back on the used ring. Losing
-            // one costs the guest a descriptor for the life of the
-            // device, and there is no abort path to recover it.
-            if !refused.is_empty() {
-                debug!(self.shared.log, "virtio-console refused rx chains";
-                    "count" => refused.len());
-                for head in refused {
-                    completion.complete(head, 0);
-                }
+            match queue.collect_chain(physmap, head) {
+                Some(chain) => pending.push_back((head, chain)),
+                None => refused.push(head),
             }
-            let hit_request_cap = popped >= max_requests;
-            if !hit_request_cap {
-                queue.update_used_event(physmap);
-            }
-            if queue_drain_should_stop(queue, before, hit_request_cap, physmap)
-            {
-                break;
+        });
+        drop(pending);
+        // `pop_avail` already took these heads out of the available
+        // ring, so each one has to go back on the used ring. Losing
+        // one costs the guest a descriptor for the life of the
+        // device, and there is no abort path to recover it.
+        if !refused.is_empty() {
+            debug!(self.shared.log, "virtio-console refused rx chains";
+                "count" => refused.len());
+            for head in refused {
+                completion.complete(head, 0);
             }
         }
 
+        // Dropped first: `deliver_rx` takes its own permission, and a
+        // second read lock behind a waiting writer deadlocks.
+        drop(session);
         self.shared.deliver_rx();
+    }
+
+    /// End the session that owns the RX ring, wait for the deliveries
+    /// already inside it, and drop everything that named that ring.
+    ///
+    /// Admission closes before the wait. A delivery refused there
+    /// never takes the lock, and `std::sync::RwLock` gives the writer
+    /// no priority, so a host peer that writes fast enough could
+    /// otherwise starve a vCPU waiting here.
+    fn retire_rx_ring(&self) {
+        self.shared.access.close();
+        self.shared.access.drain();
+        self.shared.forget_rx_ring();
+        self.shared.access.reopen(
+            self.shared
+                .interrupt
+                .next_session(self.shared.access.intr_session()),
+        );
     }
 
     /// Drain guest output inline on the vCPU thread.
     fn drain_tx(&self, queue: &mut VirtQueue, physmap: &PhysMap) -> bool {
         let old_used_idx = queue.read_used_idx(physmap);
         let max_requests = usize::from(queue.size());
-        let mut popped = 0usize;
-        let mut did_work = false;
         let mut chunk = [0u8; TX_CHUNK];
+        let mut budget = TX_BYTES_PER_KICK;
 
-        loop {
-            let before = queue.last_avail_idx();
-            while popped < max_requests {
-                let Some(head) = queue.pop_avail(physmap) else {
-                    break;
-                };
-                popped += 1;
-                if let Some(chain) = queue.collect_chain(physmap, head) {
-                    for buf in &chain {
-                        let ChainBuf::Readable { addr, len } = buf else {
-                            continue;
-                        };
-                        self.write_chain_buf(physmap, *addr, *len, &mut chunk);
-                    }
+        let popped = queue.drain_avail(physmap, max_requests, |queue, head| {
+            if let Some(chain) = queue.collect_chain(physmap, head) {
+                for buf in &chain {
+                    let ChainBuf::Readable { addr, len } = buf else {
+                        continue;
+                    };
+                    self.write_chain_buf(
+                        physmap,
+                        *addr,
+                        *len,
+                        &mut chunk,
+                        &mut budget,
+                    );
                 }
-                // The chain is entirely device-readable, so the used
-                // length is zero.
-                queue.push_used(physmap, head, 0);
-                did_work = true;
             }
-            let hit_request_cap = popped >= max_requests;
-            if !hit_request_cap {
-                queue.update_used_event(physmap);
-            }
-            if queue_drain_should_stop(queue, before, hit_request_cap, physmap)
-            {
-                break;
-            }
-        }
+            // Heads keep going back on the used ring once the budget
+            // is gone: the ring has to drain either way, and only the
+            // copying is bounded.
+            queue.push_used(physmap, head, 0);
+        });
 
-        did_work && queue.should_notify_guest(physmap, old_used_idx)
+        popped > 0 && queue.should_notify_guest(physmap, old_used_idx)
     }
 
-    /// Copy one device-readable buffer out to the client, in chunks.
+    /// Copy one device-readable buffer out to the client, in chunks,
+    /// spending `budget` as it goes.
     fn write_chain_buf(
         &self,
         physmap: &PhysMap,
         addr: u64,
         len: u32,
         chunk: &mut [u8; TX_CHUNK],
+        budget: &mut usize,
     ) {
-        let mut remaining = len as usize;
+        let mut remaining = (len as usize).min(*budget);
         let mut offset = 0u64;
         while remaining > 0 {
             let n = remaining.min(TX_CHUNK);
@@ -516,6 +553,7 @@ impl VirtioConsole {
                 return;
             }
             self.shared.write_host(&chunk[..n]);
+            *budget -= n;
             offset = offset.saturating_add(n as u64);
             remaining = remaining.saturating_sub(n);
         }
@@ -530,10 +568,9 @@ impl VirtioDevice for VirtioConsole {
             | super::bits::VIRTIO_F_RING_INDIRECT_DESC
     }
 
-    fn set_features(&self, features: u64) {
-        // Store only: the modern transport calls this twice, once per
-        // 32-bit half, with a partial value on the first call.
-        *self.negotiated_features.lock().expect("features lock") = features;
+    fn set_features(&self, _features: u64) {
+        // The console reads no feature bit of its own, and the queues
+        // are told what was negotiated by the transport.
     }
 
     fn cfg_read(&self, _offset: u16, _len: u8) -> u32 {
@@ -573,20 +610,16 @@ impl VirtioDevice for VirtioConsole {
         }
     }
 
+    /// The handler and the stashed chains both name the ring they
+    /// came from, so a ring the driver programs again starts empty.
+    fn queue_addr_set(&self, queue_idx: u16, _queue: &VirtQueue) {
+        if queue_idx == CONSOLE_RX_QUEUE {
+            self.retire_rx_ring();
+        }
+    }
+
     fn reset(&self) {
-        *self.negotiated_features.lock().expect("features lock") = 0;
-        *self
-            .shared
-            .rx_completion
-            .lock()
-            .expect("rx completion lock") = None;
-        // Chains posted before the reset are dropped, not completed:
-        // the guest abandons its rings across a reset and reposts.
-        self.shared
-            .pending_rx
-            .lock()
-            .expect("pending rx lock")
-            .clear();
+        self.retire_rx_ring();
         // The host-side backlog survives a guest reset: those bytes
         // were accepted from the client and are still owed to the guest.
     }

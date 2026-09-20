@@ -17,6 +17,7 @@ use crate::pci::intr::{IntrGate, IntrSession};
 
 mod barrier;
 mod bounce;
+mod get_id;
 mod multiqueue;
 mod reset;
 
@@ -57,7 +58,6 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         nodelete: false,
         num_queues: 0,
         workers_per_queue: 0,
-        negotiated_features: Mutex::new(0),
         io_txs: Vec::new(),
         next_worker: Vec::new(),
         physmap: Arc::new(PhysMap::new()),
@@ -232,13 +232,16 @@ fn notify_queue_caps_collection_at_queue_size() {
     assert_eq!(queues[0].last_avail_idx(), queues[0].size());
     assert!(queues[0].has_new_avail(&physmap));
     assert_eq!(queues[0].read_used_ring_idx(&physmap), queues[0].size());
+    // A cap exit still arms the kick: nothing re-drains this ring
+    // but a guest notification, and the guest only sends one when
+    // avail_event names the index it adds at.
     assert_eq!(
         physmap
             .lookup(avail_event_gpa, 2)
             .expect("mapped avail event")
             .read::<u16>()
             .expect("read avail event"),
-        AVAIL_EVENT_SENTINEL,
+        queues[0].size(),
     );
 }
 
@@ -260,6 +263,77 @@ fn notify_queue_drains_ring_and_updates_avail_event() {
             .read::<u16>()
             .expect("read avail event"),
         2,
+    );
+}
+
+/// A ring the driver programs again gets a new used-ring writer.
+/// The writer snapshots the ring it was built on; kept across a
+/// reprogram it writes the old ring and the new one never advances.
+#[test]
+fn a_reprogrammed_ring_gets_its_own_used_ring_writer() {
+    const DESC_GPA: u64 = 0x1000;
+    const AVAIL_GPA: u64 = 0x1100;
+    const USED_GPA: u64 = 0x1200;
+    const NEW_USED_GPA: u64 = 0x1400;
+
+    let (physmap, queue, block) = make_get_id_queue(4, 1);
+    let mut queues = [queue];
+    block.notify_queue(0, &mut queues, &physmap);
+    assert_eq!(queues[0].read_used_ring_idx(&physmap), 1);
+
+    // The driver moves the used ring and reposts its one request.
+    queues[0].set_addr_modern(DESC_GPA, AVAIL_GPA, NEW_USED_GPA);
+    block.queue_addr_set(0, &queues[0]);
+    block.notify_queue(0, &mut queues, &physmap);
+
+    assert_eq!(
+        queues[0].read_used_ring_idx(&physmap),
+        1,
+        "the completion went to the ring the driver gave up",
+    );
+    let old_used_idx = physmap
+        .lookup(USED_GPA + 2, 2)
+        .expect("mapped old used index")
+        .read::<u16>()
+        .expect("read old used index");
+    assert_eq!(old_used_idx, 1, "the old ring was written after the move");
+}
+
+/// A driver may program a ring again without resetting the device, and
+/// a worker with a request in flight holds its own `Arc` to the writer
+/// that names the old ring. Dropping the cached one leaves that worker
+/// publishing into memory the guest has taken back, so the epoch has to
+/// end with the ring.
+#[test]
+fn a_reprogrammed_ring_ends_the_epoch_that_named_it() {
+    const DESC_GPA: u64 = 0x1000;
+    const AVAIL_GPA: u64 = 0x1100;
+    const NEW_USED_GPA: u64 = 0x1400;
+
+    let (physmap, queue, block) = make_get_id_queue(4, 1);
+    let mut queues = [queue];
+    block.notify_queue(0, &mut queues, &physmap);
+
+    // What a worker holds while its request is in flight. The session
+    // is dropped here: one held across the reprogram would deadlock
+    // against the drain, which is the property `reset` relies on too.
+    let epoch = block
+        .ctx
+        .access
+        .enter_current()
+        .expect("the device admits guest access")
+        .epoch();
+
+    queues[0].set_addr_modern(DESC_GPA, AVAIL_GPA, NEW_USED_GPA);
+    block.queue_addr_set(0, &queues[0]);
+
+    assert!(
+        block.ctx.access.enter(epoch).is_none(),
+        "a worker from the retired epoch can still reach guest memory",
+    );
+    assert!(
+        block.ctx.access.enter_current().is_some(),
+        "the device took no new session, so nothing can run again",
     );
 }
 
@@ -370,6 +444,72 @@ fn cfg_read_capacity() {
     let hi = blk.cfg_read(0x04, 4);
     let capacity = u64::from(lo) | (u64::from(hi) << 32);
     assert_eq!(capacity, 1024);
+}
+
+/// VirtIO 1.3 sec 5.2.4 counts `capacity` in 512-byte sectors whatever
+/// `blk_size` is, and sec 5.2.6 puts the request sector in the same
+/// units. Dividing the image by a 4096-byte logical block published an
+/// eighth of the disk, and the range check refused every request past
+/// it, so a filesystem written with `sectorsize=4096` saw a truncated
+/// device.
+#[test]
+fn capacity_counts_512_byte_sectors_whatever_the_block_size() {
+    const BYTES: u64 = 512 * 1024;
+    const HEADER_GPA: u64 = 0x1000;
+    const DATA_GPA: u64 = 0x1200;
+    const STATUS_GPA: u64 = 0x1400;
+
+    let file = tempfile::tempfile().expect("create tempfile");
+    file.set_len(BYTES).expect("set file length");
+    let opts = VirtioBlockOpts {
+        sector_size: 4096,
+        ..Default::default()
+    };
+    let physmap = Arc::new(
+        PhysMap::new_anon(HEADER_GPA, 0x1000).expect("create guest memory"),
+    );
+    let blk = VirtioBlock::new(file, &opts, Arc::clone(&physmap), 1)
+        .expect("create VirtioBlock");
+
+    let lo = blk.cfg_read(0x00, 4);
+    let hi = blk.cfg_read(0x04, 4);
+    assert_eq!(
+        u64::from(lo) | (u64::from(hi) << 32),
+        BYTES / bits::SECTOR_SIZE,
+        "capacity was counted in logical blocks",
+    );
+    // blk_size still reports the logical block size the guest aligns to.
+    assert_eq!(blk.cfg_read(0x14, 4), 4096);
+
+    // The last 512-byte sector of the image must be readable.
+    physmap
+        .lookup(HEADER_GPA, BLK_REQ_HEADER_SIZE)
+        .expect("mapped request header")
+        .write(&VirtioBlkReqHdr {
+            rtype: bits::VIRTIO_BLK_T_IN,
+            _reserved: 0,
+            sector: BYTES / bits::SECTOR_SIZE - 1,
+        })
+        .expect("write request header");
+    let chain = [
+        ChainBuf::Readable {
+            addr: HEADER_GPA,
+            len: BLK_REQ_HEADER_SIZE as u32,
+        },
+        ChainBuf::Writable {
+            addr: DATA_GPA,
+            len: 512,
+        },
+        ChainBuf::Writable {
+            addr: STATUS_GPA,
+            len: 1,
+        },
+    ];
+
+    assert!(
+        blk.check_request(&chain, &physmap).is_ok(),
+        "the last sector of the image was refused",
+    );
 }
 
 #[test]

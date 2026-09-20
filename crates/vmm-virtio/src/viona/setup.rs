@@ -43,6 +43,7 @@ impl VirtioViona {
                 dev_features,
                 negotiated_features: 0,
                 ring_state: [RingState::Init; NET_NUM_QUEUES],
+                kick_refused: [false; NET_NUM_QUEUES],
                 deferred_poll: None,
                 poller: None,
                 log: None,

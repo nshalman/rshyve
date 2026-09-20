@@ -123,6 +123,8 @@ struct TrackingVirtioDeviceState {
     notify_addrs: Vec<(u16, u64)>,
     restored_rings: Vec<RestoreRingCall>,
     reset_all_rings: usize,
+    /// The queue index of every kick the transport let through.
+    notified: Vec<u16>,
 }
 
 struct TrackingVirtioDevice {
@@ -157,6 +159,20 @@ impl VirtioDevice for TrackingVirtioDevice {
         _physmap: &PhysMap,
     ) -> u32 {
         0
+    }
+
+    fn notify_queue(
+        &self,
+        queue_idx: u16,
+        _queues: &mut [VirtQueue],
+        _physmap: &PhysMap,
+    ) -> bool {
+        self.state
+            .lock()
+            .expect("tracking state lock")
+            .notified
+            .push(queue_idx);
+        false
     }
 
     fn reset_all_rings(&self) {
@@ -213,7 +229,12 @@ impl Lifecycle for TrackingVirtioDevice {
 }
 
 fn make_tracking_device() -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
-    let physmap = Arc::new(PhysMap::new());
+    make_tracking_device_on(Arc::new(PhysMap::new()))
+}
+
+fn make_tracking_device_on(
+    physmap: Arc<PhysMap>,
+) -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
     let bus_pio = Arc::new(PioBus::new());
     let bus_mmio = Arc::new(MmioBus::new());
     VirtioPciDevice::new(
@@ -698,15 +719,66 @@ fn features_ok_set_and_readable() {
     );
 }
 
+fn notified(dev: &VirtioPciDevice<TrackingVirtioDevice>) -> Vec<u16> {
+    dev.device
+        .state
+        .lock()
+        .expect("tracking state lock")
+        .notified
+        .clone()
+}
+
 #[test]
 fn queue_notify_ignored_before_driver_ok() {
     use vmm_core::common::WriteOp;
-    let dev = make_test_device();
+    let dev = make_tracking_device();
 
-    // Don't set DRIVER_OK status. Notify queue 0: it must do nothing.
-    // (Verifying no panic or crash)
     let wo = WriteOp::from_buf(&[0, 0]);
     dev.bar_rw(BarN::BAR0, 0x10, RWOp::Write(&wo));
+    assert!(notified(&dev).is_empty(), "a kick reached the backend");
+}
+
+/// A kick on a queue with no ring must not reach the backend. A
+/// backend builds its used-ring writer on the first kick, from the
+/// ring the queue holds, and keeps it for the session: built on
+/// address zero, it never writes the ring the driver programs next.
+#[test]
+fn a_kick_before_the_ring_is_programmed_never_reaches_the_backend() {
+    use vmm_core::common::WriteOp;
+    const RAM_GPA: u64 = 0x4000;
+    let physmap = Arc::new(
+        PhysMap::new_anon(RAM_GPA, 0x4000).expect("create guest memory"),
+    );
+    let dev = make_tracking_device_on(physmap);
+    let write = |reg: u16, val: &[u8]| {
+        let wo = WriteOp::from_buf(val);
+        dev.bar_rw(BarN::BAR0, usize::from(reg), RWOp::Write(&wo));
+    };
+    write(
+        bits::LEGACY_REG_DEVICE_STATUS,
+        &[bits::STATUS_ACKNOWLEDGE
+            | bits::STATUS_DRIVER
+            | bits::STATUS_DRIVER_OK],
+    );
+
+    write(bits::LEGACY_REG_QUEUE_NOTIFY, &[0, 0]);
+    assert!(
+        notified(&dev).is_empty(),
+        "a kick reached an unprogrammed queue"
+    );
+
+    let pfn = (RAM_GPA / vmm_core::common::PAGE_SIZE as u64) as u32;
+    write(bits::LEGACY_REG_QUEUE_PFN, &pfn.to_le_bytes());
+    write(bits::LEGACY_REG_QUEUE_NOTIFY, &[0, 0]);
+    assert_eq!(
+        notified(&dev),
+        vec![0],
+        "the kick after programming is lost"
+    );
+
+    write(bits::LEGACY_REG_QUEUE_PFN, &[0, 0, 0, 0]);
+    write(bits::LEGACY_REG_QUEUE_NOTIFY, &[0, 0]);
+    assert_eq!(notified(&dev), vec![0], "a kick reached a retired queue");
 }
 
 #[test]

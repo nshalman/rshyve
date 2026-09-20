@@ -131,7 +131,7 @@ impl VirtioViona {
             }
         }
 
-        Self::ring_kick(&inner, queue_idx);
+        Self::ring_kick(&mut inner, queue_idx);
         slog::info!(log, "viona ring state restored";
             "ring" => queue_idx, "avail_idx" => avail_idx,
             "used_idx" => used_idx, "msi_addr" => msix_addr);

@@ -73,7 +73,7 @@ pub(super) fn addressed_queue() -> VirtQueue {
     queue
 }
 
-fn notify(device: &VirtioViona, queue_idx: u16) {
+pub(super) fn notify(device: &VirtioViona, queue_idx: u16) {
     let mut queues = [
         VirtQueue::new(NET_QUEUE_SIZE),
         VirtQueue::new(NET_QUEUE_SIZE),
@@ -370,6 +370,59 @@ fn a_queue_address_write_programs_that_ring() {
             avail: 0x2_0000,
             used: 0x3_0000,
         }],
+    );
+    assert_eq!(
+        device.inner.lock().expect("viona lock").ring_state[1],
+        RingState::Ready,
+    );
+}
+
+/// A legacy driver retires a ring by writing `QUEUE_PFN = 0` and then
+/// frees the pages. A kernel ring left running reads and writes memory
+/// the guest has already put to another use.
+#[test]
+fn retiring_a_ring_resets_it_in_the_kernel() {
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+
+    // What `set_addr_legacy(0)` leaves behind: no addresses.
+    VirtioDevice::queue_addr_set(&device, 1, &VirtQueue::new(NET_QUEUE_SIZE));
+
+    assert_eq!(
+        steps_of(&steps),
+        [Step::RingReset(1)],
+        "the kernel kept the ring the driver retired",
+    );
+    assert_eq!(
+        device.inner.lock().expect("viona lock").ring_state[1],
+        RingState::Init,
+        "a retired ring stayed ready, so the next kick would reach it",
+    );
+}
+
+/// The kernel refuses `RING_INIT` unless the ring is reset, so a ring
+/// reprogrammed without a device reset has to be retired first or the
+/// new addresses never reach the kernel at all.
+#[test]
+fn reprogramming_a_ring_resets_it_before_programming_again() {
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+
+    VirtioDevice::queue_addr_set(&device, 1, &addressed_queue());
+
+    assert_eq!(
+        steps_of(&steps),
+        [
+            Step::RingReset(1),
+            Step::RingInit {
+                ring: 1,
+                size: NET_QUEUE_SIZE,
+                desc: 0x1_0000,
+                avail: 0x2_0000,
+                used: 0x3_0000,
+            },
+        ],
+        "the ring was programmed over while the kernel still ran it",
     );
     assert_eq!(
         device.inner.lock().expect("viona lock").ring_state[1],

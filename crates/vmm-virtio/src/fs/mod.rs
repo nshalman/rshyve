@@ -435,6 +435,19 @@ impl VirtioDevice for VirtioFs {
         0
     }
 
+    /// The handler snapshots the ring it was built on, so a ring the
+    /// driver programs again needs a new one.
+    fn queue_addr_set(&self, queue_idx: u16, _queue: &VirtQueue) {
+        if let Some(slot) = self
+            .completions
+            .lock()
+            .expect("completion lock")
+            .get_mut(usize::from(queue_idx))
+        {
+            *slot = None;
+        }
+    }
+
     /// Collect the guest's chains and hand them to the worker.
     ///
     /// The ring walk runs under one guest-access session, so a reset

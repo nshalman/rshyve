@@ -178,13 +178,13 @@ fn indirect_table_longer_than_queue_size_is_rejected() {
     }
 
     assert!(q
-        .walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 5 * 16)
+        .walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 5 * 16, q.size())
         .is_none());
 
     // Same table, queue large enough to admit it: now it walks.
     let q = VirtQueue::new(8);
     assert_eq!(
-        q.walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 5 * 16)
+        q.walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 5 * 16, q.size())
             .expect("table within queue size")
             .len(),
         5
@@ -227,7 +227,7 @@ fn indirect_table_within_queue_size_still_walks() {
     );
 
     let bufs = q
-        .walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 3 * 16)
+        .walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 3 * 16, q.size())
         .expect("valid indirect table");
 
     assert_eq!(bufs.len(), 3);
@@ -254,13 +254,154 @@ fn indirect_table_within_queue_size_still_walks() {
     ));
 }
 
+/// VirtIO 1.3 sec 2.7.5.3.1: the device must handle zero or more
+/// normal chained descriptors followed by a single indirect one.
+/// Returning the table alone drops the buffers ahead of it, so a
+/// device parses the request header out of whatever the table's first
+/// entry happens to be.
+#[test]
+fn a_direct_descriptor_before_an_indirect_table_keeps_its_buffer() {
+    const DESC_GPA: u64 = 0x2000;
+    let physmap = PhysMap::new_anon(INDIRECT_TABLE_GPA, 0x2000)
+        .expect("create queue memory");
+    let mut q = VirtQueue::new(4);
+    q.set_addr_modern(DESC_GPA, DESC_GPA + 0x100, DESC_GPA + 0x200);
+    q.set_indirect_supported(true);
+
+    let write_desc = |idx: u64, desc: VirtqDesc| {
+        physmap
+            .lookup(DESC_GPA + idx * 16, 16)
+            .expect("mapped descriptor")
+            .write(&desc)
+            .expect("write descriptor");
+    };
+    // A request header, then a table holding the rest of the request.
+    write_desc(
+        0,
+        VirtqDesc {
+            addr: 0x2800,
+            len: 16,
+            flags: bits::VRING_DESC_F_NEXT,
+            next: 1,
+        },
+    );
+    write_desc(
+        1,
+        VirtqDesc {
+            addr: INDIRECT_TABLE_GPA,
+            len: 2 * 16,
+            flags: bits::VRING_DESC_F_INDIRECT,
+            next: 0,
+        },
+    );
+    write_indirect_desc(
+        &physmap,
+        0,
+        VirtqDesc {
+            addr: 0x2900,
+            len: 512,
+            flags: bits::VRING_DESC_F_NEXT | bits::VRING_DESC_F_WRITE,
+            next: 1,
+        },
+    );
+    write_indirect_desc(
+        &physmap,
+        1,
+        VirtqDesc {
+            addr: 0x2b00,
+            len: 1,
+            flags: bits::VRING_DESC_F_WRITE,
+            next: 0,
+        },
+    );
+
+    let bufs = q.collect_chain(&physmap, 0).expect("a mixed chain walks");
+
+    assert_eq!(bufs.len(), 3, "the direct header was dropped");
+    assert!(matches!(
+        bufs[0],
+        ChainBuf::Readable {
+            addr: 0x2800,
+            len: 16
+        }
+    ));
+    assert!(matches!(
+        bufs[1],
+        ChainBuf::Writable {
+            addr: 0x2900,
+            len: 512
+        }
+    ));
+    assert!(matches!(
+        bufs[2],
+        ChainBuf::Writable {
+            addr: 0x2b00,
+            len: 1
+        }
+    ));
+}
+
+/// A chain may name no more descriptors than the ring holds (sec
+/// 2.7.5.3.1), and the direct descriptors ahead of a table count
+/// towards that: three direct buffers plus a two-entry table is five
+/// descriptors, one too many for a four-entry ring.
+#[test]
+fn direct_and_indirect_descriptors_share_one_queue_size_budget() {
+    const DESC_GPA: u64 = 0x2000;
+    let physmap = PhysMap::new_anon(INDIRECT_TABLE_GPA, 0x2000)
+        .expect("create queue memory");
+    let mut q = VirtQueue::new(4);
+    q.set_addr_modern(DESC_GPA, DESC_GPA + 0x100, DESC_GPA + 0x200);
+    q.set_indirect_supported(true);
+
+    for idx in 0..3u64 {
+        physmap
+            .lookup(DESC_GPA + idx * 16, 16)
+            .expect("mapped descriptor")
+            .write(&VirtqDesc {
+                addr: 0x2800 + idx * 0x40,
+                len: 16,
+                flags: bits::VRING_DESC_F_NEXT,
+                next: idx as u16 + 1,
+            })
+            .expect("write descriptor");
+    }
+    physmap
+        .lookup(DESC_GPA + 3 * 16, 16)
+        .expect("mapped descriptor")
+        .write(&VirtqDesc {
+            addr: INDIRECT_TABLE_GPA,
+            len: 2 * 16,
+            flags: bits::VRING_DESC_F_INDIRECT,
+            next: 0,
+        })
+        .expect("write descriptor");
+    for idx in 0..2 {
+        write_indirect_desc(
+            &physmap,
+            idx,
+            VirtqDesc {
+                addr: 0x2900 + (idx as u64 * 0x40),
+                len: 64,
+                flags: if idx == 0 { bits::VRING_DESC_F_NEXT } else { 0 },
+                next: 1,
+            },
+        );
+    }
+
+    assert!(
+        q.collect_chain(&physmap, 0).is_none(),
+        "three direct buffers plus a two-entry table is five descriptors",
+    );
+}
+
 #[test]
 fn indirect_len_not_multiple_of_16_rejected() {
     let q = VirtQueue::new(4);
     let physmap = indirect_physmap(2);
 
     assert!(q
-        .walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 17)
+        .walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 17, q.size())
         .is_none());
 }
 
@@ -282,7 +423,7 @@ fn indirect_cycle_terminates_and_returns_none() {
     }
 
     assert!(q
-        .walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 3 * 16)
+        .walk_indirect_table(&physmap, INDIRECT_TABLE_GPA, 3 * 16, q.size())
         .is_none());
 }
 

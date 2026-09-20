@@ -88,7 +88,12 @@ struct VirtioPciState {
     device_feature_select: u32,
     /// Selects which 32-bit half of driver features to write.
     driver_feature_select: u32,
-    /// Per-queue enable flags (modern transport only).
+    /// Whether the driver has made each queue live.
+    ///
+    /// Modern drivers write QUEUE_ENABLE; legacy drivers have no such
+    /// register, so a non-zero QUEUE_PFN sets this instead. A kick is
+    /// gated on the ring addresses rather than on this, which is what a
+    /// migration export reads to decide which queues to carry.
     queue_enabled: Vec<bool>,
     /// Per-queue descriptor table addresses (modern transport).
     queue_desc: Vec<u64>,
@@ -145,6 +150,24 @@ impl VirtioPciState {
     /// Return the low 32 bits of guest_features for legacy register reads.
     fn guest_features_u32(&self) -> u32 {
         self.guest_features as u32
+    }
+
+    /// Tell the queues what the driver negotiated.
+    ///
+    /// The ring features decide what the device reads and writes, so
+    /// they are applied once, where negotiation ends, and never under
+    /// a live ring: a `VirtioCompletion` takes EVENT_IDX when it is
+    /// built and would then judge kicks by a rule its own queue no
+    /// longer uses.
+    fn apply_features(&mut self) {
+        let event_idx =
+            self.guest_features & bits::VIRTIO_F_RING_EVENT_IDX != 0;
+        let indirect =
+            self.guest_features & bits::VIRTIO_F_RING_INDIRECT_DESC != 0;
+        for q in &mut self.queues {
+            q.set_event_idx(event_idx);
+            q.set_indirect_supported(indirect);
+        }
     }
 
     fn reset(&mut self) {
@@ -466,6 +489,20 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         Some(vs)
     }
 
+    /// Whether a kick may reach the backend.
+    ///
+    /// A queue with no ring has nothing to drain, and a backend that
+    /// builds its used-ring writer on the first kick would build it on
+    /// address zero and keep it for the whole session, so the ring the
+    /// driver programs next is never written.
+    fn can_notify(vs: &VirtioPciState, queue_idx: u16) -> bool {
+        vs.status & bits::STATUS_DRIVER_OK != 0
+            && vs
+                .queues
+                .get(usize::from(queue_idx))
+                .is_some_and(VirtQueue::is_configured)
+    }
+
     /// Whether a queue refused the ring addresses on its first use.
     ///
     /// A queue programmed outside the enable path, such as by a
@@ -491,21 +528,13 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// first did not.
     fn refuse_queue(
         &self,
-        mut vs: std::sync::MutexGuard<'_, VirtioPciState>,
+        vs: std::sync::MutexGuard<'_, VirtioPciState>,
         idx: usize,
         error: Option<crate::queue::QueueAddrError>,
     ) {
-        if vs.status & bits::STATUS_DEVICE_NEEDS_RESET != 0 {
+        if !self.set_needs_reset(vs) {
             return;
         }
-        // The bit must go in here. Applied after the guard drops, it
-        // can land in the middle of a reset drain, or on the session
-        // that follows the reset.
-        vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
-        // Sampled under the guard that wrote the bit, so a reset that
-        // wipes it is always the later of the two.
-        let session = self.intr.session();
-        drop(vs);
         if let Some(error) = error {
             let first = !self
                 .queue_refusal_reported
@@ -518,7 +547,60 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     "queue" => idx, "reason" => %error);
             }
         }
+    }
+
+    /// Apply a non-zero DEVICE_STATUS write, on either transport.
+    ///
+    /// VirtIO 1.3 sec 2.1.2: the driver must not clear a status bit.
+    /// A device that let it would let a driver toggle FEATURES_OK and
+    /// renegotiate under rings it has already programmed, or clear
+    /// DEVICE_NEEDS_RESET and carry on with a device that stopped.
+    /// The one way back is a write of 0, which the caller takes.
+    ///
+    /// The FEATURES_OK transition is where negotiation ends (sec
+    /// 2.2.1), so it is where the backend and the rings are told what
+    /// was agreed. A legacy driver never writes the bit; `legacy`
+    /// applies its features on the feature register instead.
+    fn set_status(
+        &self,
+        mut vs: std::sync::MutexGuard<'_, VirtioPciState>,
+        new_status: u8,
+    ) {
+        if new_status & vs.status != vs.status {
+            self.set_needs_reset(vs);
+            return;
+        }
+        let gained = new_status & !vs.status;
+        vs.status = new_status;
+        if gained & bits::STATUS_FEATURES_OK != 0 {
+            vs.apply_features();
+            let features = vs.guest_features;
+            self.device.set_features(features);
+        }
+    }
+
+    /// Set DEVICE_NEEDS_RESET and tell the driver, once.
+    ///
+    /// Returns false when the device already carries the bit: the
+    /// write that lands here is guest driven and repeatable, so the
+    /// interrupt must not be raised per write. The bit goes in under
+    /// the guard, which is then consumed: applied after the guard
+    /// drops, it could land in the middle of a reset drain, or on the
+    /// session that follows the reset.
+    fn set_needs_reset(
+        &self,
+        mut vs: std::sync::MutexGuard<'_, VirtioPciState>,
+    ) -> bool {
+        if vs.status & bits::STATUS_DEVICE_NEEDS_RESET != 0 {
+            return false;
+        }
+        vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
+        // Sampled under the guard that wrote the bit, so a reset that
+        // wipes it is always the later of the two.
+        let session = self.intr.session();
+        drop(vs);
         self.raise_config_interrupt_in(session);
+        true
     }
 
     /// Install the one-shot park a register write reaches once its
@@ -672,13 +754,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// A reset in flight takes the device down anyway, so the bit is
     /// dropped rather than written onto the session that follows.
     pub fn signal_device_needs_reset(&self) {
-        let Some(mut vs) = self.lock_for_write() else {
+        let Some(vs) = self.lock_for_write() else {
             return;
         };
-        vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
-        let session = self.intr.session();
-        drop(vs);
-        self.raise_config_interrupt_in(session);
+        self.set_needs_reset(vs);
     }
 }
 
