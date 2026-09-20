@@ -1,6 +1,6 @@
 # Feature reference
 
-`rshyve` and `firehyve` are two binaries built from one workspace. `rshyve` is a drop-in replacement for the illumos `bhyve(8)` command: UEFI firmware, NVMe, AHCI CD-ROM, a VNC framebuffer, PCI passthrough, a control socket, and live migration. `firehyve` is a microVM that boots a Linux kernel directly and links a deliberately smaller crate set; it accepts eight PCI drivers and rejects everything else at startup instead of skipping it. Choose `firehyve` when the guest is a Linux kernel you supply and the device list is virtio only; choose `rshyve` for anything that needs firmware, a graphical console, or migration.
+`rshyve` and `firehyve` are two binaries built from one workspace. `rshyve` is a drop-in replacement for the illumos `bhyve(8)` command: UEFI firmware, NVMe, AHCI CD-ROM, a VNC framebuffer, PCI passthrough, a control socket, and live migration. `firehyve` is a microVM that boots a Linux kernel directly and links a deliberately smaller crate set; it attaches six virtio drivers, accepts the two chipset names and the two graphical-console names the bhyve zone brand always emits, and rejects everything else at startup instead of skipping it. Choose `firehyve` when the guest is a Linux kernel you supply and the device list is virtio only; choose `rshyve` for anything that needs firmware, a graphical console, or migration.
 
 Everything below is traced to code. Where a shipped document contradicts the code, the code wins and the contradiction is listed at the end.
 
@@ -60,8 +60,8 @@ Markers: **yes** works, **caveat** works with a condition named in the matching 
 | Hotplug commands | control socket | vsock `CONTROL` verb, needs a `virtio-vsock` device | `bin/rshyve/src/control/dispatch.rs:202-252`; `bin/firehyve/src/control.rs:287-297` |
 | Migration after any hot-add, PCI included | reject | n/a | `bin/rshyve/src/control/migrate.rs:84,64` |
 | **Platform** | | | |
-| vTPM 2.0 (`--vtpm`) | caveat | reject | `crates/vmm-tpm/src/crb.rs`; `bin/firehyve/src/main.rs:53` |
-| Hyper-V enlightenments (`--hyperv`) | exp | reject | `crates/vmm-hyperv/src/lib.rs`; `main.rs:57` |
+| vTPM 2.0 (`--vtpm`) | caveat | reject | `crates/vmm-tpm/src/crb.rs`; `bin/firehyve/src/main.rs` `validate_cli` |
+| Hyper-V enlightenments (`--hyperv`) | exp | reject | `crates/vmm-hyperv/src/lib.rs`; `validate_cli` |
 | `--cpu-baseline` CPUID masking | yes | yes | `crates/vmm-core/src/cpuid.rs:32` |
 | PCI passthrough (`passthru,/dev/pptN`) | caveat | reject | Intel only, no MSI-X device; `crates/vmm-passthru/`; `bin/rshyve/src/main.rs:1412` |
 | `virtio-rnd` | yes | yes | `crates/vmm-virtio/src/attach.rs:341` |
@@ -71,7 +71,9 @@ Markers: **yes** works, **caveat** works with a condition named in the matching 
 
 ### What firehyve rejects at startup
 
-`validate_cli` (`bin/firehyve/src/main.rs:40-89`) errors on: a missing `--kernel`, `--migrate-listen`, `--control-socket`, `--json-config`, every `--mdata-*` flag, `--vtpm`, `--vtpm-state-dir`, `--hyperv`, `--tsc-freq-hz`, any `-l` argument beginning with the literal lowercase `bootrom,`, any `-l com1`/`com2` backend other than `stdio`, and any `-s` spec containing a `bootindex=` token. `bin/firehyve/src/devices.rs:54` then rejects any PCI driver outside its eight-name `SUPPORTED` list.
+`validate_cli` (`bin/firehyve/src/main.rs`) errors on: a missing `--kernel`, `--migrate-listen`, `--control-socket`, `--json-config`, every `--mdata-*` flag, `--vtpm`, `--vtpm-state-dir`, `--hyperv`, `--tsc-freq-hz`, and any `-s` spec containing a `bootindex=` token. `split_spec` (`bin/firehyve/src/devices.rs`) then rejects any PCI driver outside its `SUPPORTED` list.
+
+What the bhyve zone brand forces onto every zone is accepted instead, because refusing it would mean an unmodified brand could never start the binary. Each is logged at `warn` and changes no guest behaviour: `-l bootrom,<rom>` (nothing is loaded from it), a `-l com1`/`com2` backend firehyve cannot serve (the port falls back to inherited stdio, which zoneadmd copies into the zone log rather than the zone console), and the `fbuf` and `xhci` specs `add_fbuf` emits (the slots stay empty). COM1 does serve an absolute device path, so the brand's `/dev/zconsole` is a working console. The startup argv is the only place these are tolerated: a hot-add of `fbuf` or `xhci` over the `CONTROL` verb is refused.
 
 Because both binaries share one clap derive (`crates/vmm-config/src/lib.rs`), `firehyve --help` still lists the rshyve-only flags. The refusal happens at runtime, not in the parser.
 
