@@ -3,7 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use vmm_core::common::{RWOp, ReadOp, WriteOp, PAGE_SIZE};
@@ -59,7 +60,125 @@ fn backing_file() -> std::fs::File {
     file
 }
 
+/// A backend whose transfers the test controls.
+///
+/// A held transfer stands in for a slow disk: the test can stop every
+/// worker inside the backend and then do to the controller whatever a
+/// guest could do while its I/O is outstanding.
+struct TestBackend {
+    file: Arc<std::fs::File>,
+    delay_us: AtomicU64,
+    state: Mutex<BackendState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct BackendState {
+    held: bool,
+    /// Transfers that have entered the backend, ever.
+    started: usize,
+    /// Transfers inside the backend now, held ones included.
+    in_flight: usize,
+}
+
+impl TestBackend {
+    fn new(file: Arc<std::fs::File>) -> Arc<Self> {
+        Arc::new(Self {
+            file,
+            delay_us: AtomicU64::new(0),
+            state: Mutex::new(BackendState::default()),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn set_delay(&self, delay: Duration) {
+        self.delay_us
+            .store(delay.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Block until `n` transfers are inside the backend.
+    fn wait_in_flight(&self, n: usize) {
+        let mut st = self.state.lock().expect("backend lock");
+        let start = Instant::now();
+        while st.in_flight < n {
+            let (next, timeout) = self
+                .cv
+                .wait_timeout(st, Duration::from_millis(50))
+                .expect("backend lock");
+            st = next;
+            assert!(
+                !timeout.timed_out() || start.elapsed() < WAIT,
+                "only {} of {n} transfers started",
+                st.in_flight
+            );
+        }
+    }
+
+    fn enter(&self) {
+        let mut st = self.state.lock().expect("backend lock");
+        st.started += 1;
+        st.in_flight += 1;
+        self.cv.notify_all();
+        while st.held {
+            st = self.cv.wait(st).expect("backend lock");
+        }
+        drop(st);
+        let delay = self.delay_us.load(Ordering::Relaxed);
+        if delay != 0 {
+            std::thread::sleep(Duration::from_micros(delay));
+        }
+    }
+
+    fn leave(&self) {
+        let mut st = self.state.lock().expect("backend lock");
+        st.in_flight -= 1;
+        self.cv.notify_all();
+    }
+}
+
+impl super::io::IoBackend for TestBackend {
+    fn read_at(
+        &self,
+        iov: &vmm_core::mem::GuestIoVec,
+        offset: u64,
+    ) -> std::io::Result<usize> {
+        self.enter();
+        let done = iov.read_from(&self.file, offset);
+        self.leave();
+        done
+    }
+
+    fn write_at(
+        &self,
+        iov: &vmm_core::mem::GuestIoVec,
+        offset: u64,
+    ) -> std::io::Result<usize> {
+        self.enter();
+        let done = iov.write_to(&self.file, offset);
+        self.leave();
+        done
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        self.enter();
+        let done = self.file.sync_data();
+        self.leave();
+        done
+    }
+}
+
 impl Harness {
+    /// A harness whose transfers the returned backend controls.
+    fn held() -> (Self, Arc<TestBackend>) {
+        let file = Arc::new(backing_file());
+        let backend = TestBackend::new(Arc::clone(&file));
+        let h = Self::with_backend(
+            file,
+            Arc::clone(&backend) as Arc<dyn super::io::IoBackend>,
+        );
+        (h, backend)
+    }
+
     fn new() -> Self {
         let file = Arc::new(backing_file());
         Self::with_backend(Arc::clone(&file), file)
@@ -624,6 +743,65 @@ fn command_specific_status_reaches_the_guest_with_sct_one() {
             dnr: true
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// Pause and shutdown
+// ---------------------------------------------------------------------------
+
+/// Keep ringing the I/O SQ 1 doorbell until `stop` is set.
+///
+/// The channel never empties, which is the load an operator pause has
+/// to survive.
+fn steady_submitter(
+    ctrl: Arc<NvmeController>,
+    physmap: Arc<PhysMap>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mem = MemCtx::new(physmap);
+        let mut tail = 0u16;
+        let mut cid = 1u16;
+        while !stop.load(Ordering::Relaxed) {
+            let sqe = Sqe::read(0, 1, 0x70000, 0);
+            mem.write(
+                SQ1 + u64::from(tail) * SQE_SIZE as u64,
+                &sqe.encode(cid),
+            )
+            .expect("write SQE");
+            tail = (tail + 1) % IO_QDEPTH;
+            cid = cid.wrapping_add(1);
+            let wo = WriteOp::from_buf(&u32::from(tail).to_le_bytes());
+            ctrl.bar_rw(BarN::BAR0, REG_DOORBELL_BASE + 8, RWOp::Write(&wo));
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    })
+}
+
+#[test]
+fn pause_quiesces_the_workers_under_steady_guest_io() {
+    let (mut h, backend) = Harness::held();
+    // Slower than the submitter, so the channel keeps growing.
+    backend.set_delay(Duration::from_millis(5));
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let submitter = steady_submitter(
+        Arc::clone(&h.ctrl),
+        Arc::clone(&h.physmap),
+        Arc::clone(&stop),
+    );
+    backend.wait_in_flight(1);
+
+    h.ctrl.pause();
+    let quiesced = h.ctrl.gate.wait_quiesced(Duration::from_secs(2));
+
+    stop.store(true, Ordering::Relaxed);
+    submitter.join().expect("submitter");
+    backend.set_delay(Duration::ZERO);
+    h.ctrl.resume();
+    assert!(quiesced, "pause did not quiesce the workers under load");
 }
 
 // ---------------------------------------------------------------------------

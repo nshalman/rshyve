@@ -15,9 +15,9 @@ use super::io::{process_io_request, IoBackend, IoRequest};
 use super::queues::{io_queue_index, post_completion};
 use super::NvmeController;
 
-// ---------------------------------------------------------------------------
-// I/O worker thread
-// ---------------------------------------------------------------------------
+/// How long a worker waits on an empty channel before looking at the
+/// gate again. Only an idle controller pays it.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Worker thread loop: reads I/O requests from the channel and executes them.
 ///
@@ -35,19 +35,28 @@ pub(super) fn io_worker(
     use std::sync::mpsc::RecvTimeoutError;
 
     loop {
-        // Acquire the receiver lock only to get the next message
+        // Park before taking new work. A guest that keeps the channel
+        // non-empty would otherwise never let a worker reach the gate,
+        // and an operator pause would time out under load.
+        gate.park_if_paused();
+
         let req = {
             let rx_guard = rx.lock().expect("nvme: io_rx lock");
-            match rx_guard.recv_timeout(Duration::from_millis(50)) {
+            // A pause taken while this thread waited for the receiver
+            // must not cost the poll interval for every other worker.
+            if gate.is_paused() {
+                continue;
+            }
+            match rx_guard.recv_timeout(POLL_INTERVAL) {
                 Ok(req) => req,
-                Err(RecvTimeoutError::Timeout) => {
-                    drop(rx_guard);
-                    gate.park_if_paused();
-                    continue;
-                }
+                Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         };
+
+        // A pause between the dequeue and the transfer stops the
+        // transfer, so a drain covers the guest memory this touches.
+        gate.park_if_paused();
 
         let mem = MemCtx::new(Arc::clone(&physmap));
         let status = process_io_request(
@@ -57,6 +66,7 @@ pub(super) fn io_worker(
             &mem,
             ctrl.geometry,
         );
+
         let sq_head = {
             let st = ctrl.state.lock().expect("nvme: state lock");
             if let Some(idx) = io_queue_index(req.sqid) {
