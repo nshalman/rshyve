@@ -1202,10 +1202,15 @@ fn parse_and_create_pci_device(
             }
             // Config is just the path to /dev/pptN
             let path = config.split(',').next().unwrap_or(config);
-            let dev = vmm_passthru::PciPassthru::new(path, Arc::clone(vmm_hdl))
-                .with_context(|| {
-                    format!("failed to init passthru device: {}", path)
-                })?;
+            let dev = vmm_passthru::PciPassthru::new(
+                path,
+                Arc::clone(vmm_hdl),
+                Arc::clone(bus_pio),
+                log.clone(),
+            )
+            .with_context(|| {
+                format!("failed to init passthru device: {}", path)
+            })?;
             chipset.try_attach_device(bdf, dev.clone())?;
             info!(log, "passthru attached";
                 "bdf" => %bdf,
