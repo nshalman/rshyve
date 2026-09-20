@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -43,9 +43,6 @@ const MAX_LINE: usize = 4096;
 /// How long one response may wait for the guest to drain the RX FIFO
 /// before the rest of it is dropped.
 const RESPONSE_BUDGET: Duration = Duration::from_secs(2);
-
-/// Pause between two tries to push a response byte into a full FIFO.
-const RX_RETRY: Duration = Duration::from_millis(1);
 
 /// Bytes the guest may have in flight on COM2 before the sink drops.
 const TX_QUEUE_BYTES: usize = 2 * MAX_LINE;
@@ -227,25 +224,15 @@ fn answer(
 }
 
 /// Send a line and its terminator to the guest through COM2 RX.
-///
-/// The RX FIFO holds 256 bytes, so a longer reply waits for the guest
-/// to drain it. A guest that does not read within `budget` gets the
-/// rest of the reply dropped; the count sent is the error.
 fn send_line(
     uart: &LpcUart,
     line: &str,
     budget: Duration,
 ) -> Result<(), usize> {
-    let deadline = Instant::now() + budget;
-    for (sent, &b) in line.as_bytes().iter().chain(b"\n").enumerate() {
-        while !uart.input_byte(b) {
-            if Instant::now() >= deadline {
-                return Err(sent);
-            }
-            thread::sleep(RX_RETRY);
-        }
-    }
-    Ok(())
+    let mut out = Vec::with_capacity(line.len() + 1);
+    out.extend_from_slice(line.as_bytes());
+    out.push(b'\n');
+    crate::serial::input_bytes(uart, &out, budget)
 }
 
 /// The request id a reply carries when the request had no usable one.
@@ -839,17 +826,17 @@ mod tests {
     }
 
     #[test]
-    fn a_response_stops_waiting_for_a_guest_that_does_not_read() {
+    fn a_response_carries_its_terminator_into_the_rx_fifo() {
         let pin = Arc::new(vmm_core::intr_pins::NoOpPin);
         let uart = LpcUart::new(pin);
-        // Longer than the 256 byte RX FIFO, with nothing draining it.
-        let line = "x".repeat(300);
+        let bus = PioBus::new();
+        uart.attach(&bus, COM2_BASE);
 
-        let started = Instant::now();
-        let sent = send_line(&uart, &line, Duration::from_millis(50))
-            .expect_err("a full FIFO with no reader must not be waited on");
-        assert_eq!(sent, 256);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        send_line(&uart, "V2_OK", RESPONSE_BUDGET).expect("a short reply");
+
+        let read: Vec<u8> =
+            (0..6).map(|_| bus.handle_in(COM2_BASE, 1) as u8).collect();
+        assert_eq!(read, b"V2_OK\n");
     }
 
     #[test]
