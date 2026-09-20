@@ -116,6 +116,12 @@ for the feature matrix and
 showed, including the one platform limit it found: a device reset has
 no bounded duration on illumos.
 
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the build, what CI does and
+does not prove, the repository gates, and commit style.
+[CHANGELOG.md](CHANGELOG.md) records what an operator would notice.
+
 ## Security
 
 Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
