@@ -53,6 +53,7 @@ pub const CC_MPS_SHIFT: u32 = 7;
 pub const CC_MPS_MASK: u32 = 0xF;
 /// Arbitration Mechanism (bits 13:11) — 0 = Round Robin
 pub const CC_AMS_SHIFT: u32 = 11;
+pub const CC_AMS_MASK: u32 = 0x7;
 /// Shutdown Notification (bits 15:14)
 pub const CC_SHN_SHIFT: u32 = 14;
 pub const CC_SHN_MASK: u32 = 0x3;

@@ -208,11 +208,18 @@ impl NvmeController {
 
         let asqs = (st.aqa & AQA_ASQS_MASK) + 1;
         let acqs = ((st.aqa >> AQA_ACQS_SHIFT) & AQA_ACQS_MASK) + 1;
-        let supported = (new_cc >> CC_IOSQES_SHIFT) & CC_IOSQES_MASK
-            == SQE_SIZE_LOG2
-            && (new_cc >> CC_IOCQES_SHIFT) & CC_IOCQES_MASK == CQE_SIZE_LOG2
+        // A zero entry size means the driver has not set one yet, which
+        // it may do before it creates an I/O queue. Anything else must
+        // match the required value the Identify data reports.
+        let iosqes = (new_cc >> CC_IOSQES_SHIFT) & CC_IOSQES_MASK;
+        let iocqes = (new_cc >> CC_IOCQES_SHIFT) & CC_IOCQES_MASK;
+        let supported = (iosqes == 0 || iosqes == SQE_SIZE_LOG2)
+            && (iocqes == 0 || iocqes == CQE_SIZE_LOG2)
+            // MPSMIN and MPSMAX are both zero: 4 KiB pages only.
             && (new_cc >> CC_MPS_SHIFT) & CC_MPS_MASK == 0
-            && (new_cc >> CC_CSS_SHIFT) & CC_CSS_MASK == 0;
+            && (new_cc >> CC_CSS_SHIFT) & CC_CSS_MASK == 0
+            // Round robin is the only arbitration this controller has.
+            && (new_cc >> CC_AMS_SHIFT) & CC_AMS_MASK == 0;
         if !supported
             || asqs < 2
             || acqs < 2

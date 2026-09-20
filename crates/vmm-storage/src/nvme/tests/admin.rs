@@ -48,6 +48,57 @@ fn enable_sets_rdy_and_identify_lands_through_prp1_and_prp2() {
 }
 
 #[test]
+fn enable_refuses_a_configuration_the_controller_cannot_honour() {
+    for cc in [
+        // An I/O SQ entry size the Identify data does not offer.
+        CC_EN | (7 << CC_IOSQES_SHIFT) | (CQE_SIZE_LOG2 << CC_IOCQES_SHIFT),
+        // A memory page size past CAP.MPSMAX.
+        CC_EN
+            | (SQE_SIZE_LOG2 << CC_IOSQES_SHIFT)
+            | (CQE_SIZE_LOG2 << CC_IOCQES_SHIFT)
+            | (1 << CC_MPS_SHIFT),
+        // A command set this controller does not implement.
+        CC_EN
+            | (SQE_SIZE_LOG2 << CC_IOSQES_SHIFT)
+            | (CQE_SIZE_LOG2 << CC_IOCQES_SHIFT)
+            | (1 << CC_CSS_SHIFT),
+    ] {
+        let h = Harness::new();
+        h.reg_write32(
+            REG_AQA,
+            u32::from(ADMIN_QDEPTH - 1) | (u32::from(ADMIN_QDEPTH - 1) << 16),
+        );
+        h.reg_write64(REG_ASQ, ASQ);
+        h.reg_write64(REG_ACQ, ACQ);
+        h.reg_write32(REG_CC, cc);
+
+        assert_eq!(h.csts() & CSTS_RDY, 0, "CC {cc:#x} reported ready");
+        assert_eq!(h.csts() & CSTS_CFS, CSTS_CFS, "CC {cc:#x}");
+    }
+}
+
+#[test]
+fn enable_refuses_an_admin_queue_that_is_not_mapped() {
+    let h = Harness::new();
+    h.reg_write32(
+        REG_AQA,
+        u32::from(ADMIN_QDEPTH - 1) | (u32::from(ADMIN_QDEPTH - 1) << 16),
+    );
+    // Page aligned but past the end of guest RAM.
+    h.reg_write64(REG_ASQ, (GUEST_RAM as u64) + 0x1000);
+    h.reg_write64(REG_ACQ, ACQ);
+    h.reg_write32(
+        REG_CC,
+        CC_EN
+            | (SQE_SIZE_LOG2 << CC_IOSQES_SHIFT)
+            | (CQE_SIZE_LOG2 << CC_IOCQES_SHIFT),
+    );
+
+    assert_eq!(h.csts() & CSTS_RDY, 0);
+    assert_eq!(h.csts() & CSTS_CFS, CSTS_CFS);
+}
+
+#[test]
 fn admin_cq_wraps_and_flips_phase() {
     let mut h = Harness::new();
     h.enable();
