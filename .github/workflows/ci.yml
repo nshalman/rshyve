@@ -46,6 +46,12 @@ on:
 permissions:
   contents: read
 
+# Every third-party action is pinned to a commit SHA with the tag it came
+# from in a trailing comment. A tag is mutable, and cargo-deny-action is
+# the job that vouches for the dependency graph, so a moved tag there
+# would be the graph vouching for itself. The gitleaks download in the
+# `secrets` job is pinned by version and SHA-256 for the same reason.
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -54,7 +60,7 @@ jobs:
     name: lockfile is current
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: cargo metadata --locked --format-version 1 > /dev/null
       - name: Cargo.lock unchanged
         run: git diff --exit-code Cargo.lock
@@ -63,7 +69,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup component add rustfmt
       - run: cargo fmt --all -- --check
 
@@ -71,7 +77,7 @@ jobs:
     name: clippy (portable crates)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup component add clippy
       - run: >
           cargo clippy --locked --all-targets
@@ -85,7 +91,7 @@ jobs:
     name: illumos bindings type-check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-illumos
       # Every portable crate against the real target, tests included.
       # `--all-targets` is the point of this job: it is the only place
@@ -119,7 +125,7 @@ jobs:
     name: portable tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Codecs, bounds checks, device register models, and the migration
       # protocol.
       #
@@ -154,7 +160,7 @@ jobs:
     name: guest init (musl)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-linux-musl
       - run: rustup component add clippy rustfmt
       # tools/fhrun-init is excluded from the root workspace, so no
@@ -172,7 +178,7 @@ jobs:
     name: guest test harness (musl)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-linux-musl
       - run: rustup component add clippy rustfmt
       # Same hazard as tools/fhrun-init above: excluded from the root
@@ -190,7 +196,7 @@ jobs:
     name: builds on the declared MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Cargo.toml is attacker-controlled on a fork pull request, so the
       # value is validated to a bare version number before it is used,
       # and passed through the environment rather than interpolated into
@@ -222,7 +228,7 @@ jobs:
     steps:
       # The only job that builds rshyve, so the only one that needs the
       # libtpms submodule. Everything else names portable packages.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: true
       - run: rustup target add x86_64-unknown-illumos
@@ -265,8 +271,8 @@ jobs:
     name: advisories, licenses, sources
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories bans licenses sources
 
@@ -282,7 +288,7 @@ jobs:
       GITLEAKS_VERSION: 8.30.1
       GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - name: install gitleaks
@@ -299,7 +305,7 @@ jobs:
     name: firehyve dependency boundary
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Scoping the crate graph to one workspace member is what makes
       # this a per-binary gate. `cargo tree -i` cannot serve here: it
       # exits 0 both when a crate is present and when it is filtered out.
@@ -308,7 +314,7 @@ jobs:
       # which is intended. All-features would enable optional
       # dependencies a real firehyve build never links, so this job sees
       # a different dependency view from the supply-chain job above.
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           manifest-path: ./bin/firehyve/Cargo.toml
           arguments: --locked --config deny-firehyve.toml --target x86_64-unknown-illumos --exclude-dev
@@ -321,7 +327,7 @@ jobs:
     name: stock-PI dependency gate self-test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The gate itself runs on the illumos build host, where rshyve is
       # actually linked; see tools/remote-build.sh. What CI can prove is
       # that the script is not silently broken, which is the failure
@@ -344,7 +350,7 @@ jobs:
     name: public surface guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # The commit messages of the pushed range are scanned too, so
           # the range has to be reachable.
@@ -440,7 +446,7 @@ jobs:
     name: every portable crate is named by a job
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # A crate that no `-p` list names is unlinted and untested code
       # this workflow reports green, which is how the vmm-devices split
       # nearly lost five crates. The script derives its list from the
@@ -483,7 +489,7 @@ jobs:
     name: illumos and CI compile the same tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-illumos
       # Every job above runs on ubuntu, so a test behind
       # `cfg(target_os = "illumos")` runs on no machine here, and a test
