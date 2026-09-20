@@ -82,6 +82,9 @@ impl PtError {
 
 type PtResult<T> = Result<T, PtError>;
 
+/// The directory itself, for an `openat` relative to its own fd.
+const DOT_DIR: &CStr = c".";
+
 fn last_os() -> PtError {
     PtError::Io(std::io::Error::last_os_error())
 }
@@ -1025,14 +1028,14 @@ impl Passthrough {
             let fd = ino.fd.ok_or_else(|| {
                 PtError::Io(std::io::Error::from_raw_os_error(libc::EBADF))
             })?;
-            let dup = unsafe { libc::dup(fd) };
-            if dup < 0 {
-                return Err(last_os());
-            }
-            Ok(dup)
+            // A `dup` would share the cached fd's open file description
+            // and with it the directory offset, which readdir leaves at
+            // EOF for every later OPENDIR of the same inode. Opening "."
+            // gets a description of its own.
+            openat_nofollow(fd, DOT_DIR, libc::O_RDONLY | libc::O_DIRECTORY)
         })?;
 
-        // Snapshot via fdopendir. Consumes dir_fd.
+        // Consumes dir_fd.
         let dirp = unsafe { libc::fdopendir(dir_fd) };
         if dirp.is_null() {
             unsafe { libc::close(dir_fd) };
@@ -1041,8 +1044,6 @@ impl Passthrough {
 
         let mut entries = Vec::new();
         loop {
-            // Per POSIX readdir() is not thread-safe in general, but we hold
-            // our own DIR* and serialize access via the device worker.
             set_errno(0);
             let entp = unsafe { libc::readdir(dirp) };
             if entp.is_null() {
@@ -1072,7 +1073,7 @@ impl Passthrough {
             entries.push(DirSnapshot {
                 name,
                 ino: dirent.d_ino as u64,
-                ftype: None, // populated lazily for readdirplus
+                ftype: None,
             });
         }
 
@@ -1533,6 +1534,41 @@ mod tests {
         // Root inode survives, so the device still serves after a reset.
         let attr = pt.getattr(fuse::FUSE_ROOT_ID).expect("root still open");
         assert_eq!(attr.mode & ifmt::MASK, ifmt::DIR);
+    }
+
+    /// Every name a directory handle serves, in snapshot order.
+    #[cfg(unix)]
+    fn listing(pt: &Passthrough, fh: u64) -> Vec<Vec<u8>> {
+        let mut names = Vec::new();
+        pt.readdir_each(fh, 0, |_, name, _, _| {
+            names.push(name.to_bytes().to_vec());
+            true
+        })
+        .expect("readdir");
+        names
+    }
+
+    // The bug this guards: a `dup` of the cached inode fd shares its
+    // directory offset, so the first snapshot read the directory to
+    // EOF and every OPENDIR after it saw nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_opendir_of_the_same_directory_sees_the_same_entries() {
+        let dir = private_dir();
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.path().join(name), b"x").expect("seed");
+        }
+        let pt = Passthrough::new(dir.path(), true).expect("open temp");
+
+        let first = pt.opendir(fuse::FUSE_ROOT_ID).expect("first opendir");
+        let mut seen_first = listing(&pt, first);
+        let second = pt.opendir(fuse::FUSE_ROOT_ID).expect("second opendir");
+        let mut seen_second = listing(&pt, second);
+
+        seen_first.sort();
+        seen_second.sort();
+        assert_eq!(seen_first, [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+        assert_eq!(seen_second, seen_first, "the second snapshot differs");
     }
 
     #[cfg(unix)]
