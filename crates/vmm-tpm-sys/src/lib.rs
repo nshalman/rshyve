@@ -8,11 +8,11 @@
 //! because the libtpms public API is small and stable (the
 //! `TPMLIB_*` family in `libtpms/tpm_library.h`).
 //!
-//! The shared-library version of libtpms uses TLS for some of its
-//! internal command processing state, which means the same library
-//! instance cannot serve more than one VM in the same process. We
-//! always link statically and instantiate per-process; if vmmnew
-//! ever runs multiple VMs in one process, this module needs revisiting.
+//! libtpms keeps the whole TPM in process-global C state and takes no
+//! locks, so one instance serves one VM and one caller at a time. The
+//! link is always static and the instance is per process. Running more
+//! than one VM in a process needs this module revisited; `vmm_tpm::Crb`
+//! is what serialises the callers today.
 
 #![allow(non_camel_case_types, non_snake_case)]
 
