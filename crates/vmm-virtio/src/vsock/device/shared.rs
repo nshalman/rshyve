@@ -18,7 +18,6 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use vmm_core::mem::PhysMap;
@@ -30,6 +29,8 @@ use crate::queue::{ChainBuf, VirtioCompletion};
 use crate::vsock::control::ControlSlot;
 use crate::vsock::mux::VsockMux;
 use crate::vsock::packet::ConnKey;
+
+use super::sockets::ReaderTable;
 
 /// How long a write to a host peer may take before the device gives
 /// up on it.
@@ -64,8 +65,10 @@ pub(super) struct VsockShared {
     /// Answers CONTROL requests. Empty until the binary installs a sink.
     pub(super) control: ControlSlot,
     pub(super) socket_path: PathBuf,
-    /// Threads serving one host connection each.
-    pub(super) readers: Mutex<Vec<JoinHandle<()>>>,
+    /// Threads serving one host connection each, and the slots
+    /// promised to threads not yet started. Bounds the thread count for
+    /// host peers and for the guest's own connections alike.
+    pub(super) readers: Mutex<ReaderTable>,
     pub(super) shutdown: Arc<AtomicBool>,
     pub(super) gate: Arc<QuiesceGate>,
     pub(super) log: slog::Logger,

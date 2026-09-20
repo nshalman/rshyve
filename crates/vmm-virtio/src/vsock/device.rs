@@ -114,7 +114,7 @@ impl VirtioVsock {
             sockets: Mutex::new(HashMap::new()),
             control: ControlSlot::default(),
             socket_path: socket_path.to_path_buf(),
-            readers: Mutex::new(Vec::new()),
+            readers: Mutex::new(Default::default()),
             shutdown: Arc::new(AtomicBool::new(false)),
             gate: Arc::new(QuiesceGate::new(0)),
             log,

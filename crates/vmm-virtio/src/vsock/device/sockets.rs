@@ -21,7 +21,7 @@
 
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use slog::debug;
@@ -135,31 +135,84 @@ impl VsockShared {
             .collect()
     }
 
-    /// Register a reader thread, dropping the handles whose threads
-    /// have ended.
+    /// Take a slot for one more thread, or refuse when the table is
+    /// full.
     ///
-    /// The vector is otherwise only drained by halt, so a peer that
-    /// connects and disconnects in a loop grows it, and every handle in
-    /// it, for the life of the VM.
-    pub(super) fn track_reader(&self, handle: JoinHandle<()>) {
-        let mut readers = self.readers.lock().expect("reader lock");
-        readers.retain(|h| !h.is_finished());
-        readers.push(handle);
+    /// Reserving is one step, so both the accept loop and the guest's
+    /// own connections are held to the same bound: checking, spawning
+    /// and recording separately let two callers past the same free
+    /// slot. Handles whose threads have ended are dropped here, since
+    /// halt is otherwise the only thing that drains them and a peer
+    /// that connects and disconnects in a loop would grow the table
+    /// for the life of the VM.
+    pub(super) fn reserve_reader(&self) -> Option<ReaderSlot<'_>> {
+        let mut table = self.readers.lock().expect("reader lock");
+        table.handles.retain(|h| !h.is_finished());
+        if table.handles.len() + table.reserved >= MAX_CONNS {
+            return None;
+        }
+        table.reserved += 1;
+        Some(ReaderSlot {
+            readers: &self.readers,
+            filled: false,
+        })
     }
 
-    /// Whether another reader thread may start.
-    pub(super) fn reader_slot_free(&self) -> bool {
-        let mut readers = self.readers.lock().expect("reader lock");
-        readers.retain(|h| !h.is_finished());
-        readers.len() < MAX_CONNS
+    /// Record a thread in the reader table.
+    ///
+    /// Tests use this to fill the table without an accept; production
+    /// reserves a slot first and fills it.
+    #[cfg(test)]
+    pub(super) fn track_reader(&self, handle: JoinHandle<()>) {
+        self.reserve_reader().expect("a reader slot").fill(handle);
+    }
+
+    /// Reader threads the table still holds.
+    #[cfg(test)]
+    pub(super) fn reader_count(&self) -> usize {
+        self.readers.lock().expect("reader lock").handles.len()
     }
 
     /// Take every reader handle, for the halt join.
     pub(super) fn take_readers(&self) -> Vec<JoinHandle<()>> {
-        self.readers
-            .lock()
-            .expect("reader lock")
-            .drain(..)
-            .collect()
+        std::mem::take(&mut self.readers.lock().expect("reader lock").handles)
+    }
+}
+
+/// The reader threads and the slots promised to threads not yet
+/// started.
+#[derive(Default)]
+pub(super) struct ReaderTable {
+    handles: Vec<JoinHandle<()>>,
+    reserved: usize,
+}
+
+/// A slot taken by [`VsockShared::reserve_reader`].
+///
+/// Either it is filled by the thread it was taken for, or dropping it
+/// gives the slot back. A spawn that fails therefore costs nothing,
+/// where a caller that recorded the thread after starting it would
+/// leak a slot for every failure.
+pub(super) struct ReaderSlot<'a> {
+    readers: &'a Mutex<ReaderTable>,
+    filled: bool,
+}
+
+impl ReaderSlot<'_> {
+    pub(super) fn fill(mut self, handle: JoinHandle<()>) {
+        let mut table = self.readers.lock().expect("reader lock");
+        table.handles.push(handle);
+        table.reserved -= 1;
+        drop(table);
+        self.filled = true;
+    }
+}
+
+impl Drop for ReaderSlot<'_> {
+    fn drop(&mut self) {
+        if self.filled {
+            return;
+        }
+        self.readers.lock().expect("reader lock").reserved -= 1;
     }
 }

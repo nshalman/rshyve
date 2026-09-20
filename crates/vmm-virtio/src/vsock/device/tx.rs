@@ -15,7 +15,7 @@
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
-use slog::debug;
+use slog::{debug, warn};
 use vmm_core::mem::PhysMap;
 
 use super::listener::reader_loop;
@@ -116,6 +116,16 @@ impl VirtioVsock {
 
     /// A guest-initiated connection: dial `<socket>_<port>` on the host.
     fn connect_out(&self, key: ConnKey, port: u32) {
+        // The reader table bounds the threads this device holds, and it
+        // is one table: a guest that opened connections outside it
+        // doubled the ceiling every other path is held to. Reserved
+        // before the dial, so nothing is opened that cannot be served.
+        let Some(slot) = self.shared.reserve_reader() else {
+            debug!(self.shared.log, "virtio-vsock refused a guest connect";
+                "reason" => "reader table full");
+            self.shared.mux.refuse_guest_connect(key);
+            return;
+        };
         let path = format!("{}_{}", self.shared.socket_path.display(), port);
         let stream = match UnixStream::connect(&path) {
             Ok(s) => s,
@@ -132,11 +142,22 @@ impl VirtioVsock {
         self.shared.mux.accept_guest_connect(key);
 
         let shared = Arc::clone(&self.shared);
-        if let Ok(handle) = std::thread::Builder::new()
+        let reader = Arc::clone(&socket);
+        match std::thread::Builder::new()
             .name("vsock-reader".into())
-            .spawn(move || reader_loop(shared, key, socket))
+            .spawn(move || reader_loop(shared, key, reader))
         {
-            self.shared.track_reader(handle);
+            Ok(handle) => slot.fill(handle),
+            Err(error) => {
+                // Nothing would read this socket, and nothing would
+                // tell the guest the host end had gone, so the
+                // connection is undone rather than left accepted.
+                warn!(self.shared.log,
+                    "virtio-vsock reader thread not started";
+                    "error" => %error);
+                self.shared.release_socket(key, &socket);
+                self.shared.mux.refuse_guest_connect(key);
+            }
         }
     }
 }

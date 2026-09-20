@@ -20,6 +20,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use slog::{debug, warn};
 use vmm_core::unixsock::write_all_bounded;
 
 use super::shared::{VsockShared, HOST_WRITE_TIMEOUT};
@@ -45,19 +46,25 @@ pub(super) fn accept_loop(shared: Arc<VsockShared>, listener: UnixListener) {
     let on_client = |stream: UnixStream| {
         // Every accepted connection costs a thread until its peer sends
         // a CONNECT line, which it need never do.
-        if !shared.reader_slot_free() {
+        let Some(slot) = shared.reserve_reader() else {
+            debug!(shared.log, "virtio-vsock refused a peer";
+                "reason" => "reader table full");
             let _ = stream.shutdown(Shutdown::Both);
             return;
-        }
+        };
         let conn_shared = Arc::clone(&shared);
         // One thread per pending connection: the CONNECT line is read
         // with a blocking read, and a client that never sends one must
         // not block every other client behind it.
-        if let Ok(handle) = std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("vsock-connect".into())
             .spawn(move || handle_host_connect(conn_shared, stream))
         {
-            shared.track_reader(handle);
+            // Dropping the slot gives it back, and the peer's socket
+            // goes with the closure, so it reads end of file.
+            Err(error) => warn!(shared.log,
+                "virtio-vsock connect thread not started"; "error" => %error),
+            Ok(handle) => slot.fill(handle),
         }
     };
     crate::socket_accept::accept_loop(

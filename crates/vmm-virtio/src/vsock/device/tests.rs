@@ -397,7 +397,7 @@ fn a_finished_reader_is_reaped_when_the_next_one_starts() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         vsock.shared.track_reader(std::thread::spawn(|| {}));
-        let live = vsock.shared.readers.lock().expect("reader lock").len();
+        let live = vsock.shared.reader_count();
         if live <= 2 || Instant::now() >= deadline {
             assert!(live <= 2, "{live} handles were kept");
             break;
@@ -823,6 +823,109 @@ fn a_reset_waits_out_a_delivery_already_inside() {
     resetter.join().expect("reset thread");
     assert!(finished.load(Ordering::Acquire));
 
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Host accepts are held to the reader table, and so are the guest's
+/// own connections: they cost the same thread and the same 64 KiB
+/// buffer. A guest allowed past it doubles the ceiling the device
+/// claims, and the refusal has to come before the dial, so nothing is
+/// opened on the host that cannot be served.
+#[test]
+fn a_guest_connect_is_held_to_the_reader_table() {
+    use crate::vsock::packet::{
+        VsockHdr, HDR_SIZE, OP_REQUEST, OP_RST, TYPE_STREAM,
+    };
+    use std::os::unix::net::UnixListener;
+
+    const GUEST_PORT: u32 = 1024;
+    const HOST_PORT: u32 = 5000;
+
+    let hdr = VsockHdr {
+        src_cid: 3,
+        dst_cid: crate::vsock::packet::CID_HOST,
+        src_port: GUEST_PORT,
+        dst_port: HOST_PORT,
+        len: 0,
+        type_: TYPE_STREAM,
+        op: OP_REQUEST,
+        flags: 0,
+        buf_alloc: 64 * 1024,
+        fwd_cnt: 0,
+    };
+
+    let physmap = Arc::new(
+        PhysMap::new_anon(DESC_GPA, 0x2000).expect("create queue memory"),
+    );
+    let mut queue = VirtQueue::new(RING_SIZE);
+    queue.set_addr_modern(DESC_GPA, AVAIL_GPA, USED_GPA);
+    write_desc(&physmap, 0, BUF_GPA, HDR_SIZE as u32, 0, 0);
+    physmap
+        .lookup(BUF_GPA, HDR_SIZE)
+        .expect("mapped packet")
+        .write_bytes(&hdr.to_bytes())
+        .expect("seed the packet");
+    physmap
+        .lookup(AVAIL_GPA + 4, 2)
+        .expect("mapped avail entry")
+        .write::<u16>(&0)
+        .expect("write avail entry");
+    physmap
+        .lookup(AVAIL_GPA + 2, 2)
+        .expect("mapped avail index")
+        .write::<u16>(&1)
+        .expect("write avail index");
+    let mut queues = vec![VirtQueue::new(RING_SIZE), queue];
+
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+    // A host listener the dial would reach, so a refusal can only come
+    // from the cap.
+    let port_path = PathBuf::from(format!(
+        "{}_{}",
+        vsock.socket_path().display(),
+        HOST_PORT
+    ));
+    let host = UnixListener::bind(&port_path).expect("bind the host port");
+    host.set_nonblocking(true).expect("non-blocking listener");
+
+    // Every slot promised to a thread, as a full table is.
+    let slots: Vec<_> = (0..MAX_CONNS)
+        .map(|_| vsock.shared.reserve_reader().expect("a free slot"))
+        .collect();
+
+    vsock.notify_queue(VSOCK_TX_QUEUE, &mut queues, &physmap);
+
+    let key = ConnKey {
+        guest_port: GUEST_PORT,
+        host_port: HOST_PORT,
+    };
+    assert_eq!(
+        vsock.shared.mux.conn_count(),
+        0,
+        "a connection was kept with no reader to serve it",
+    );
+    assert!(
+        !vsock
+            .shared
+            .sockets
+            .lock()
+            .expect("sockets")
+            .contains_key(&key),
+        "a host socket was registered past the reader cap",
+    );
+    let refusal = vsock
+        .shared
+        .mux
+        .pop_rx()
+        .expect("the guest was told nothing");
+    assert_eq!(refusal.hdr.op, OP_RST);
+    assert!(
+        matches!(host.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+        "the host port was dialled before the cap was tested",
+    );
+
+    drop(slots);
     vsock.halt();
     let _ = std::fs::remove_dir_all(&dir);
 }
