@@ -165,7 +165,11 @@ impl VirtioBlock {
         num_queues: u16,
     ) -> std::io::Result<Self> {
         let metadata = file.metadata()?;
-        let capacity = metadata.len() / u64::from(opts.sector_size);
+        // VirtIO 1.3 sec 5.2.4: capacity is in 512-byte sectors
+        // whatever `blk_size` is, and sec 5.2.6 puts the request
+        // sector in the same units. `sector_size` is the logical block
+        // size the guest is told to align to, not the unit of either.
+        let capacity = metadata.len() / bits::SECTOR_SIZE;
         let read_only = opts.read_only;
         let file = Arc::new(file);
 

@@ -408,6 +408,72 @@ fn cfg_read_capacity() {
     assert_eq!(capacity, 1024);
 }
 
+/// VirtIO 1.3 sec 5.2.4 counts `capacity` in 512-byte sectors whatever
+/// `blk_size` is, and sec 5.2.6 puts the request sector in the same
+/// units. Dividing the image by a 4096-byte logical block published an
+/// eighth of the disk, and the range check refused every request past
+/// it, so a filesystem written with `sectorsize=4096` saw a truncated
+/// device.
+#[test]
+fn capacity_counts_512_byte_sectors_whatever_the_block_size() {
+    const BYTES: u64 = 512 * 1024;
+    const HEADER_GPA: u64 = 0x1000;
+    const DATA_GPA: u64 = 0x1200;
+    const STATUS_GPA: u64 = 0x1400;
+
+    let file = tempfile::tempfile().expect("create tempfile");
+    file.set_len(BYTES).expect("set file length");
+    let opts = VirtioBlockOpts {
+        sector_size: 4096,
+        ..Default::default()
+    };
+    let physmap = Arc::new(
+        PhysMap::new_anon(HEADER_GPA, 0x1000).expect("create guest memory"),
+    );
+    let blk = VirtioBlock::new(file, &opts, Arc::clone(&physmap), 1)
+        .expect("create VirtioBlock");
+
+    let lo = blk.cfg_read(0x00, 4);
+    let hi = blk.cfg_read(0x04, 4);
+    assert_eq!(
+        u64::from(lo) | (u64::from(hi) << 32),
+        BYTES / bits::SECTOR_SIZE,
+        "capacity was counted in logical blocks",
+    );
+    // blk_size still reports the logical block size the guest aligns to.
+    assert_eq!(blk.cfg_read(0x14, 4), 4096);
+
+    // The last 512-byte sector of the image must be readable.
+    physmap
+        .lookup(HEADER_GPA, BLK_REQ_HEADER_SIZE)
+        .expect("mapped request header")
+        .write(&VirtioBlkReqHdr {
+            rtype: bits::VIRTIO_BLK_T_IN,
+            _reserved: 0,
+            sector: BYTES / bits::SECTOR_SIZE - 1,
+        })
+        .expect("write request header");
+    let chain = [
+        ChainBuf::Readable {
+            addr: HEADER_GPA,
+            len: BLK_REQ_HEADER_SIZE as u32,
+        },
+        ChainBuf::Writable {
+            addr: DATA_GPA,
+            len: 512,
+        },
+        ChainBuf::Writable {
+            addr: STATUS_GPA,
+            len: 1,
+        },
+    ];
+
+    assert!(
+        blk.check_request(&chain, &physmap).is_ok(),
+        "the last sector of the image was refused",
+    );
+}
+
 #[test]
 fn cfg_read_size_max() {
     let blk = make_test_block(512 * 1024);
