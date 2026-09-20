@@ -55,13 +55,8 @@ pub fn init_chipset(
     let rtc = BhyveRtc::create(machine.hdl().clone());
 
     // UEFI reads the memory size back out of RTC NVRAM.
-    let lowmem = machine.mem_size().min(0xC000_0000) as u32;
-    let highmem = if machine.mem_size() > 0xC000_0000 {
-        (machine.mem_size() - 0xC000_0000) as u64
-    } else {
-        0
-    };
-    rtc.memsize_to_nvram(lowmem, highmem)
+    let (lowmem, highmem) = vmm_core::machine::split_memory(machine.mem_size());
+    rtc.memsize_to_nvram(lowmem as u32, highmem as u64)
         .context("failed to write memory size to RTC NVRAM")?;
 
     let now = std::time::SystemTime::now()

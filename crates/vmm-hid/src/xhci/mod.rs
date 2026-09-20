@@ -36,6 +36,16 @@ use vmm_devices::Lifecycle;
 use bits::*;
 use tablet::TabletDevice;
 
+/// Replace the low dword of a 64-bit register.
+fn merge_low_dword(reg: u64, val: u32) -> u64 {
+    (reg & 0xFFFF_FFFF_0000_0000) | u64::from(val)
+}
+
+/// Replace the high dword of a 64-bit register.
+fn merge_high_dword(reg: u64, val: u32) -> u64 {
+    (reg & 0x0000_0000_FFFF_FFFF) | (u64::from(val) << 32)
+}
+
 // ---------------------------------------------------------------------------
 // Internal state
 // ---------------------------------------------------------------------------
@@ -422,15 +432,30 @@ impl XhciController {
         self.post_event(st, event);
     }
 
+    /// Apply a complete CRCR value.
+    ///
+    /// The command ring never runs between doorbells in this model, so
+    /// CRR is never set and every write lands. A driver that writes the
+    /// two halves separately reaches here twice; the last one wins.
+    fn write_crcr(&self, st: &mut XhciState, crcr: u64) {
+        let ptr = crcr & CRCR_PTR_MASK;
+        st.crcr = crcr & !CRCR_CRR;
+        st.cmd_ring_base = ptr;
+        st.cmd_ring_dequeue = ptr;
+        st.cmd_ring_ccs = (crcr & CRCR_RCS) != 0;
+    }
+
     // ---- Event Ring Segment Table parsing ---------------------------------
 
     /// Read the ERST and configure the event ring.
+    ///
+    /// ERST Max advertises one segment, and ERSTSZ is clamped to match,
+    /// so entry 0 describes the whole ring.
     fn setup_event_ring(&self, st: &mut XhciState) {
         if st.erstba == 0 || st.erstsz == 0 {
             return;
         }
 
-        // Read the first ERST entry (16 bytes)
         let mut buf = [0u8; 16];
         if let Some(sub) = self.physmap.lookup(st.erstba, 16) {
             if sub.read_bytes(&mut buf).is_err() {
@@ -991,6 +1016,15 @@ impl XhciController {
         let mut st = self.state.lock().expect("xhci: state lock");
         match rwo {
             RWOp::Read(ro) => {
+                // AC64 is advertised, so a guest may read a 64-bit
+                // register in one access.
+                if ro.len() == 8 {
+                    match op_off {
+                        OP_CRCR => return ro.write_u64(st.crcr),
+                        OP_DCBAAP => return ro.write_u64(st.dcbaap),
+                        _ => {}
+                    }
+                }
                 let val = match op_off & !0x3 {
                     OP_USBCMD => st.usbcmd,
                     OP_USBSTS => st.usbsts,
@@ -1006,6 +1040,14 @@ impl XhciController {
                 ro.write_dword_at(val, op_off)
             }
             RWOp::Write(wo) => {
+                if wo.len() == 8 {
+                    match op_off {
+                        OP_CRCR => self.write_crcr(&mut st, wo.read_u64()),
+                        OP_DCBAAP => st.dcbaap = wo.read_u64(),
+                        _ => {}
+                    }
+                    return;
+                }
                 let val = wo.read_u32();
                 match op_off & !0x3 {
                     OP_USBCMD => {
@@ -1065,35 +1107,19 @@ impl XhciController {
                     OP_DNCTRL => {
                         st.dnctrl = val;
                     }
-                    OP_CRCR if (val as u64 & CRCR_CRR) == 0 => {
-                        // Only update when ring is not running
-                        let ptr = u64::from(val) & CRCR_PTR_MASK;
-                        let ccs = (val & 1) != 0;
-                        st.crcr =
-                            (st.crcr & 0xFFFF_FFFF_0000_0000) | u64::from(val);
-                        st.cmd_ring_base = ptr;
-                        st.cmd_ring_dequeue = ptr;
-                        st.cmd_ring_ccs = ccs;
+                    OP_CRCR => {
+                        let crcr = merge_low_dword(st.crcr, val);
+                        self.write_crcr(&mut st, crcr);
                     }
                     0x1C => {
-                        // CRCR high dword
-                        st.crcr = (st.crcr & 0x0000_0000_FFFF_FFFF)
-                            | (u64::from(val) << 32);
-                        // Update base pointer with full 64-bit value
-                        let ptr = st.crcr & CRCR_PTR_MASK;
-                        if ptr != 0 {
-                            st.cmd_ring_base = ptr;
-                            st.cmd_ring_dequeue = ptr;
-                        }
+                        let crcr = merge_high_dword(st.crcr, val);
+                        self.write_crcr(&mut st, crcr);
                     }
                     OP_DCBAAP => {
-                        st.dcbaap = (st.dcbaap & 0xFFFF_FFFF_0000_0000)
-                            | u64::from(val);
+                        st.dcbaap = merge_low_dword(st.dcbaap, val);
                     }
                     0x34 => {
-                        // DCBAAP high
-                        st.dcbaap = (st.dcbaap & 0x0000_0000_FFFF_FFFF)
-                            | (u64::from(val) << 32);
+                        st.dcbaap = merge_high_dword(st.dcbaap, val);
                     }
                     OP_CONFIG => {
                         st.config = (val & 0xFF).min(u32::from(MAX_SLOTS));
@@ -1214,12 +1240,18 @@ impl XhciController {
 
         match rwo {
             RWOp::Read(ro) => {
-                let val = if rt_off < IR0_BASE {
-                    // MFINDEX
-                    match rt_off {
-                        RT_MFINDEX => 0, // We don't track microframes
-                        _ => 0,
+                // AC64 is advertised, so a guest may read a 64-bit
+                // register in one access.
+                if ro.len() == 8 && rt_off >= IR0_BASE {
+                    match rt_off - IR0_BASE {
+                        IR_ERSTBA => return ro.write_u64(st.erstba),
+                        IR_ERDP => return ro.write_u64(st.erdp),
+                        _ => {}
                     }
+                }
+                let val = if rt_off < IR0_BASE {
+                    // Microframes are not tracked, so MFINDEX stays 0.
+                    0
                 } else {
                     let ir_off = rt_off - IR0_BASE;
                     match ir_off & !0x3 {
@@ -1240,6 +1272,17 @@ impl XhciController {
                     return; // MFINDEX is read-only
                 }
                 let ir_off = rt_off - IR0_BASE;
+                if wo.len() == 8 {
+                    match ir_off {
+                        IR_ERSTBA => {
+                            st.erstba = wo.read_u64() & ERSTBA_PTR_MASK;
+                            self.setup_event_ring(&mut st);
+                        }
+                        IR_ERDP => st.erdp = wo.read_u64() & ERDP_PTR_MASK,
+                        _ => {}
+                    }
+                    return;
+                }
                 let val = wo.read_u32();
                 match ir_off & !0x3 {
                     IR_IMAN => {
@@ -1257,28 +1300,26 @@ impl XhciController {
                         st.imod = val;
                     }
                     IR_ERSTSZ => {
-                        st.erstsz = val & 0xFFFF;
+                        // ERST Max advertises one segment, so only the
+                        // first entry can ever be valid.
+                        st.erstsz = (val & 0xFFFF).min(1);
                     }
                     IR_ERSTBA => {
-                        st.erstba = (st.erstba & 0xFFFF_FFFF_0000_0000)
-                            | u64::from(val & !0x3F); // 64-byte aligned
+                        st.erstba =
+                            merge_low_dword(st.erstba, val) & ERSTBA_PTR_MASK;
+                        self.setup_event_ring(&mut st);
                     }
                     0x14 => {
-                        // ERSTBA high
-                        st.erstba = (st.erstba & 0x0000_0000_FFFF_FFFF)
-                            | (u64::from(val) << 32);
-                        // Both halves written; set up the event ring
+                        st.erstba =
+                            merge_high_dword(st.erstba, val) & ERSTBA_PTR_MASK;
                         self.setup_event_ring(&mut st);
                     }
                     IR_ERDP => {
-                        st.erdp = (st.erdp & 0xFFFF_FFFF_0000_0000)
-                            | u64::from(val & !0x7); // 8-byte aligned, clear EHB
-                                                     // Clear Event Handler Busy bit (bit 3)
+                        st.erdp = merge_low_dword(st.erdp, val) & ERDP_PTR_MASK;
                     }
                     0x1C => {
-                        // ERDP high
-                        st.erdp = (st.erdp & 0x0000_0000_FFFF_FFFF)
-                            | (u64::from(val) << 32);
+                        st.erdp =
+                            merge_high_dword(st.erdp, val) & ERDP_PTR_MASK;
                     }
                     _ => {}
                 }
@@ -1387,7 +1428,7 @@ impl Lifecycle for XhciController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vmm_core::common::WriteOp;
+    use vmm_core::common::{ReadOp, WriteOp};
 
     /// Helper to create an XhciState for testing register logic.
     fn test_state() -> XhciState {
@@ -1400,6 +1441,127 @@ mod tests {
             Arc::new(MmioBus::new()),
             None,
         )
+    }
+
+    const RAM_LEN: usize = 0x10_000;
+
+    /// A controller over real guest memory, so `PhysMap::lookup`
+    /// answers and the ring walks reach something.
+    fn test_controller_with_ram() -> Arc<XhciController> {
+        let physmap =
+            PhysMap::new_anon(0, RAM_LEN).expect("anonymous guest memory");
+        XhciController::new(Arc::new(physmap), Arc::new(MmioBus::new()), None)
+    }
+
+    fn write_ram(ctrl: &XhciController, gpa: u64, bytes: &[u8]) {
+        let sub = ctrl
+            .physmap
+            .lookup(gpa, bytes.len())
+            .expect("guest memory at gpa");
+        sub.write_bytes(bytes).expect("write guest memory");
+    }
+
+    /// One ERST entry: `base` and `size` TRBs.
+    fn write_erst_entry(ctrl: &XhciController, gpa: u64, base: u64, size: u32) {
+        let mut entry = [0u8; 16];
+        entry[..8].copy_from_slice(&base.to_le_bytes());
+        entry[8..12].copy_from_slice(&size.to_le_bytes());
+        write_ram(ctrl, gpa, &entry);
+    }
+
+    fn write_reg(ctrl: &XhciController, off: usize, bytes: &[u8]) {
+        let wo = WriteOp::from_buf(bytes);
+        ctrl.bar0_rw(off, RWOp::Write(&wo));
+    }
+
+    fn read_reg(ctrl: &XhciController, off: usize, len: usize) -> u64 {
+        let mut ro = ReadOp::new(len);
+        ctrl.bar0_rw(off, RWOp::Read(&mut ro));
+        let mut buf = [0u8; 8];
+        buf[..len].copy_from_slice(ro.buf());
+        u64::from_le_bytes(buf)
+    }
+
+    const ERSTBA_OFF: usize = RTSOFF as usize + IR0_BASE + IR_ERSTBA;
+    const ERSTSZ_OFF: usize = RTSOFF as usize + IR0_BASE + IR_ERSTSZ;
+    const ERDP_OFF: usize = RTSOFF as usize + IR0_BASE + IR_ERDP;
+
+    #[test]
+    fn a_qword_erstba_write_sets_up_the_event_ring() {
+        // The illumos xhci driver writes ERSTBA with one ddi_put64, so
+        // a device that only latches the high dword never gets a ring.
+        let ctrl = test_controller_with_ram();
+        write_erst_entry(&ctrl, 0x2000, 0x3000, 16);
+        write_reg(&ctrl, ERSTSZ_OFF, &1u32.to_le_bytes());
+        write_reg(&ctrl, ERSTBA_OFF, &0x2000u64.to_le_bytes());
+
+        let st = ctrl.state.lock().expect("xhci: state lock");
+        assert_eq!(st.erstba, 0x2000);
+        assert_eq!(st.event_ring_base, 0x3000);
+        assert_eq!(st.event_ring_size, 16);
+    }
+
+    #[test]
+    fn split_dword_erstba_writes_still_set_up_the_event_ring() {
+        // Linux writes the two halves low first; both orders have to
+        // end with a configured ring.
+        for high_first in [false, true] {
+            let ctrl = test_controller_with_ram();
+            write_erst_entry(&ctrl, 0x2000, 0x3000, 16);
+            write_reg(&ctrl, ERSTSZ_OFF, &1u32.to_le_bytes());
+            let halves: [(usize, u32); 2] =
+                [(ERSTBA_OFF, 0x2000), (ERSTBA_OFF + 4, 0)];
+            let order = if high_first { [1, 0] } else { [0, 1] };
+            for i in order {
+                write_reg(&ctrl, halves[i].0, &halves[i].1.to_le_bytes());
+            }
+
+            let st = ctrl.state.lock().expect("xhci: state lock");
+            assert_eq!(st.event_ring_base, 0x3000, "high_first={high_first}");
+            assert_eq!(st.event_ring_size, 16, "high_first={high_first}");
+        }
+    }
+
+    #[test]
+    fn qword_writes_keep_the_upper_dword_of_every_64_bit_register() {
+        let ctrl = test_controller_with_ram();
+        let crcr = 0x0000_0001_2345_6740u64;
+        let dcbaap = 0x0000_0002_3456_7800u64;
+        let erdp = 0x0000_0003_4567_8900u64;
+        write_reg(&ctrl, OP_BASE + OP_CRCR, &(crcr | CRCR_RCS).to_le_bytes());
+        write_reg(&ctrl, OP_BASE + OP_DCBAAP, &dcbaap.to_le_bytes());
+        write_reg(&ctrl, ERDP_OFF, &erdp.to_le_bytes());
+
+        let st = ctrl.state.lock().expect("xhci: state lock");
+        assert_eq!(st.cmd_ring_base, crcr);
+        assert_eq!(st.cmd_ring_dequeue, crcr);
+        assert!(st.cmd_ring_ccs);
+        assert_eq!(st.dcbaap, dcbaap);
+        assert_eq!(st.erdp, erdp);
+    }
+
+    #[test]
+    fn qword_reads_answer_with_all_eight_bytes() {
+        let ctrl = test_controller_with_ram();
+        let dcbaap = 0x0000_0002_3456_7800u64;
+        write_reg(&ctrl, OP_BASE + OP_DCBAAP, &dcbaap.to_le_bytes());
+        assert_eq!(read_reg(&ctrl, OP_BASE + OP_DCBAAP, 8), dcbaap);
+
+        write_erst_entry(&ctrl, 0x2000, 0x3000, 16);
+        write_reg(&ctrl, ERSTSZ_OFF, &1u32.to_le_bytes());
+        write_reg(&ctrl, ERSTBA_OFF, &0x2000u64.to_le_bytes());
+        assert_eq!(read_reg(&ctrl, ERSTBA_OFF, 8), 0x2000);
+    }
+
+    #[test]
+    fn erstsz_is_clamped_to_the_one_segment_we_advertise() {
+        // Only ERST entry 0 is ever read, so a larger table would lose
+        // every event posted into the segments we never walk.
+        assert_eq!((hcsparams2() >> 4) & 0xF, 0, "ERST Max = 2^0 = 1");
+
+        let ctrl = test_controller_with_ram();
+        write_reg(&ctrl, ERSTSZ_OFF, &0xFFFFu32.to_le_bytes());
+        assert_eq!(ctrl.state.lock().expect("xhci: state lock").erstsz, 1);
     }
 
     #[test]

@@ -48,10 +48,6 @@ fn validate_cli(cli: &Cli, log: &slog::Logger) -> anyhow::Result<()> {
         "firehyve does not support --control-socket"
     );
     anyhow::ensure!(
-        cli.json_config.is_none(),
-        "firehyve does not support --json-config"
-    );
-    anyhow::ensure!(
         !cli.vtpm && cli.vtpm_state_dir.is_none(),
         "firehyve does not support --vtpm; vTPM is rshyve only"
     );
@@ -666,12 +662,11 @@ mod tests {
     #[test]
     fn the_refusals_that_protect_guest_behaviour_are_kept() {
         let base = ["firehyve", "--kernel", "/tmp/vmlinux"];
-        let cases: [(&str, &[&str]); 5] = [
+        let cases: [(&str, &[&str]); 4] = [
             ("--vtpm", &["--vtpm"]),
             ("--hyperv", &["--hyperv"]),
             ("--mdata-", &["--mdata-ssh-keys", "ssh-rsa AAAA"]),
             ("--control-socket", &["--control-socket", "/tmp/c.sock"]),
-            ("--json-config", &["--json-config", "/tmp/c.json"]),
         ];
         for (want, extra) in cases {
             let mut argv = base.to_vec();

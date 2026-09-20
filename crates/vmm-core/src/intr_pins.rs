@@ -308,9 +308,14 @@ impl IntrPin for IoApicPin {
         let mut asserted =
             self.asserted.lock().expect("ioapic pin lock poisoned");
         if *asserted {
-            *asserted = false;
-            // best-effort IRQ delivery via kernel ioctl
-            let _ = self.hdl.ioapic_deassert_irq(self.irq);
+            // A refused deassert leaves the kernel line high. Keeping
+            // the pin asserted lets the next deassert retry it.
+            match self.hdl.ioapic_deassert_irq(self.irq) {
+                Ok(()) => *asserted = false,
+                Err(e) => {
+                    slog::warn!(self.log, "deassert GSI failed"; "gsi" => self.irq, "error" => %e);
+                }
+            }
         }
     }
 

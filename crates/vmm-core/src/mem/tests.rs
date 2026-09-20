@@ -812,25 +812,47 @@ fn a_bulk_read_of_guest_memory_leaves_the_tracked_view_alone() {
 }
 
 #[test]
-fn a_rom_region_stays_writable_through_lookup() {
-    // The guest cannot write a ROM, so there is nothing to track there,
-    // and the bootrom loader needs the writable view that `lookup` has
-    // always returned.
+fn a_rom_region_refuses_writes_through_lookup() {
+    // A guest cannot write its ROM, so a device it drives must not be
+    // able to DMA into it either. The bootrom loader takes the
+    // untracked view, which stays writable.
     let map = PhysMap::new();
     map.add_region_anon(0x1000, 0x1000, RegionKind::Rom)
+        .unwrap();
+
+    let err = map
+        .lookup(0x1000, 4)
+        .unwrap()
+        .write_bytes(&[1, 2, 3, 4])
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    let err = map
+        .lookup(0x1000, 4)
+        .unwrap()
+        .copy_in(&[1, 2, 3, 4])
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+
+    map.lookup_untracked(0x1000, 4)
+        .unwrap()
+        .write_bytes(&[1, 2, 3, 4])
+        .unwrap();
+
+    let mut got = [0u8; 4];
+    map.lookup(0x1000, 4).unwrap().read_bytes(&mut got).unwrap();
+    assert_eq!(got, [1, 2, 3, 4]);
+}
+
+#[test]
+fn a_ram_region_stays_writable_through_lookup() {
+    let map = PhysMap::new();
+    map.add_region_anon(0x1000, 0x1000, RegionKind::Ram)
         .unwrap();
 
     map.lookup(0x1000, 4)
         .unwrap()
         .write_bytes(&[1, 2, 3, 4])
         .unwrap();
-
-    let mut got = [0u8; 4];
-    map.lookup_untracked(0x1000, 4)
-        .unwrap()
-        .read_bytes(&mut got)
-        .unwrap();
-    assert_eq!(got, [1, 2, 3, 4]);
 }
 
 #[test]

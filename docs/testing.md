@@ -250,7 +250,7 @@ rsync -az --exclude target $VMM_SRC/ $VMM_BUILD_HOST:/opt/rust-bhyve/
 
 ```bash
 # Source on nuc1 (old CPU)
-ssh -i $VMM_LAB_KEY $VMM_MIGRATE_HOST '... start VM with --track-dirty --control-socket ...'
+ssh -i $VMM_LAB_KEY $VMM_MIGRATE_HOST '... start VM with --control-socket ...'
 
 # Destination on headnode (new CPU)
 ssh $VMM_HEADNODE '... start VM with --migrate-listen 0.0.0.0:4567 ...'

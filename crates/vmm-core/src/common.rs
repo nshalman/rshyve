@@ -67,8 +67,6 @@ impl ReadOp {
         self.buf[..8].copy_from_slice(&bytes);
     }
 
-    /// Get the valid portion of the buffer.
-    #[inline]
     /// Answer this read from the dword register value `val`, as seen
     /// from byte `byte_off` of that register.
     ///
@@ -88,6 +86,7 @@ impl ReadOp {
         self.write_dword_at(val, 0);
     }
 
+    /// The valid portion of the buffer.
     pub fn buf(&self) -> &[u8] {
         &self.buf[..self.len as usize]
     }
@@ -154,9 +153,8 @@ impl WriteOp {
         u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
     }
 
-    /// Read a `u64` value from the buffer in little-endian byte order.
-    #[inline]
     /// The value written, widened to a dword.
+    #[inline]
     pub fn read_dword(&self) -> u32 {
         match self.len() {
             1 => u32::from(self.read_u8()),
@@ -165,6 +163,7 @@ impl WriteOp {
         }
     }
 
+    /// Read a `u64` value from the buffer in little-endian byte order.
     pub fn read_u64(&self) -> u64 {
         u64::from_le_bytes(self.buf)
     }

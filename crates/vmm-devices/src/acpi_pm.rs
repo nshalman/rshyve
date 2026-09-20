@@ -4,12 +4,15 @@
 
 //! ACPI Power Management register emulation.
 //!
-//! Implements the PM1 event, enable, and control registers that the
-//! UEFI firmware and OS poll for power management events. Also handles
-//! the reset register at 0xCF9.
+//! Implements the PM1 event, enable and control registers, plus the
+//! reset register at 0xCF9. PM1_CNT SLP_TYP 5 with SLP_EN is the ACPI
+//! S5 poweroff the guest asks for, and 0xCF9 is its reset.
 //!
-//! Without these handlers, the firmware's boot timeout never fires
-//! because it polls PM1_STS for timer overflow events.
+//! No event source raises a PM1 status bit: there is no fixed power or
+//! sleep button, and the PM timer is the kernel's. The status register
+//! therefore reads zero and the FADT says so. A poweroff from the
+//! control plane goes through `VM_SUSPEND_POWEROFF`, not through an
+//! SCI the guest would have to answer.
 
 use std::sync::{Arc, Mutex};
 
@@ -28,13 +31,7 @@ const ACPI_ENABLE: u8 = 0xA0;
 const ACPI_DISABLE: u8 = 0xA1;
 
 /// PM1 Status register bit definitions.
-// Timer/global status and sleep-button enable are part of the modeled ACPI
-// register layout even though no current event source raises them.
-#[allow(dead_code)]
-const PM1_TMR_STS: u16 = 0x0001;
 const PM1_BM_STS: u16 = 0x0010;
-#[allow(dead_code)]
-const PM1_GBL_STS: u16 = 0x0020;
 const PM1_PWRBTN_STS: u16 = 0x0100;
 const PM1_SLPBTN_STS: u16 = 0x0200;
 const PM1_RTC_STS: u16 = 0x0400;
@@ -48,8 +45,6 @@ const PM1_STS_CLEARABLE: u16 =
 const PM1_TMR_EN: u16 = 0x0001;
 const PM1_GBL_EN: u16 = 0x0020;
 const PM1_PWRBTN_EN: u16 = 0x0100;
-#[allow(dead_code)]
-const PM1_SLPBTN_EN: u16 = 0x0200;
 const PM1_RTC_EN: u16 = 0x0400;
 
 /// Writable enable bits.

@@ -21,10 +21,8 @@
 //! - Class: Display (0x03), Subclass: VGA (0x00)
 
 pub mod rfb;
+mod vnc;
 
-use std::io::{self, BufReader, Read, Write};
-use std::net::Shutdown;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,14 +34,11 @@ use vmm_core::common::RWOp;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::DevMemSeg;
 use vmm_core::mmio::{MmioBus, MmioFn};
-use vmm_core::unixsock::write_all_bounded;
 
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use vmm_devices::pci::BarN;
 use vmm_devices::{InputBroker, Lifecycle};
-
-use rfb::{ClientMessage, PixelFormat, RectHeader, ENCODING_RAW};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -79,12 +74,6 @@ fn resolution_fits(width: u16, height: u16) -> bool {
         .checked_mul(u64::from(height))
         .is_some_and(|n| n <= u64::from(BAR1_SIZE))
 }
-
-/// VNC update interval (~30 fps).
-const VNC_FRAME_INTERVAL: Duration = Duration::from_millis(33);
-
-/// Desktop name sent to VNC clients.
-const VNC_DESKTOP_NAME: &str = "bhyve framebuffer";
 
 /// How long one send may wait for the VNC client to take bytes.
 ///
@@ -149,6 +138,9 @@ pub struct Framebuffer {
 
     /// Flag to signal VNC thread to shut down.
     shutdown: AtomicBool,
+
+    /// The VNC thread, so halt can wait for it to leave.
+    vnc_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl Framebuffer {
@@ -204,6 +196,7 @@ impl Framebuffer {
             log,
             input,
             shutdown: AtomicBool::new(false),
+            vnc_thread: Mutex::new(None),
         });
 
         // Store weak self-reference for MMIO closures
@@ -217,12 +210,13 @@ impl Framebuffer {
 
         // Start VNC server thread
         let vnc_dev = Arc::clone(&dev);
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("fbuf-vnc".into())
             .spawn(move || {
-                vnc_server_loop(vnc_dev, listener);
+                vnc::server_loop(vnc_dev, listener);
             })
             .expect("fbuf: failed to spawn VNC server thread");
+        *dev.vnc_thread.lock().expect("fbuf: vnc thread lock") = Some(handle);
 
         Ok(dev)
     }
@@ -237,9 +231,23 @@ impl Framebuffer {
         unpack_height(self.resolution.load(Ordering::Relaxed))
     }
 
-    /// Signal the VNC server to shut down.
+    /// Stop the VNC server and wait for its thread to leave.
+    ///
+    /// Without this the thread outlives halt, keeps streaming devmem to
+    /// a connected client, and holds this device and its 16 MiB segment
+    /// alive until the process exits.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+        let handle = self
+            .vnc_thread
+            .lock()
+            .expect("fbuf: vnc thread lock")
+            .take();
+        if let Some(handle) = handle {
+            if handle.join().is_err() {
+                slog::warn!(self.log, "VNC server thread panicked");
+            }
+        }
     }
 }
 
@@ -417,9 +425,6 @@ impl Framebuffer {
     }
 
     /// Read a value from the BAR0 register space.
-    // A 32-bit depth read will eventually include refresh in the high half;
-    // preserve the width split until that register behavior is implemented.
-    #[allow(clippy::if_same_then_else)]
     fn bar0_read(&self, offset: usize, len: usize) -> u32 {
         let res = self.resolution.load(Ordering::Relaxed);
         let width = unpack_width(res);
@@ -436,13 +441,9 @@ impl Framebuffer {
                 }
             }
             memreg::HEIGHT => u32::from(height),
-            memreg::DEPTH => {
-                if len >= 4 {
-                    u32::from(DEFAULT_BPP) // depth | (refresh << 16)
-                } else {
-                    u32::from(DEFAULT_BPP)
-                }
-            }
+            // There is no refresh register, so the high half of a
+            // 4-byte read is zero.
+            memreg::DEPTH => u32::from(DEFAULT_BPP),
             memreg::REFRESH => 0,
             _ => 0,
         }
@@ -497,362 +498,6 @@ impl Framebuffer {
 }
 
 // ---------------------------------------------------------------------------
-// VNC server
-// ---------------------------------------------------------------------------
-
-/// Main VNC server loop running in a dedicated thread.
-///
-/// Listens on a Unix domain socket and handles one client at a time.
-/// When a client disconnects, the server waits for a new connection.
-fn vnc_server_loop(dev: Arc<Framebuffer>, listener: UnixListener) {
-    // Set a timeout on accept so we can check the shutdown flag
-    listener
-        .set_nonblocking(false)
-        .expect("fbuf: set_nonblocking");
-
-    slog::info!(dev.log, "VNC server listening"; "path" => ?dev.vnc_path);
-
-    loop {
-        if dev.shutdown.load(Ordering::Acquire) {
-            break;
-        }
-
-        // Accept with a timeout-like approach: set a short SO_RCVTIMEO
-        // on the listener's underlying fd. On illumos, UnixListener
-        // doesn't support set_nonblocking + poll easily, so we use
-        // a blocking accept in a loop and check shutdown between clients.
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                slog::info!(dev.log, "VNC client connected");
-                if let Err(e) = handle_vnc_client(&dev, stream) {
-                    if !is_expected_disconnect(&e) {
-                        slog::warn!(dev.log, "VNC client error"; "error" => %e);
-                    }
-                }
-                slog::info!(dev.log, "VNC client disconnected");
-            }
-            Err(e) => {
-                if dev.shutdown.load(Ordering::Acquire) {
-                    break;
-                }
-                if e.kind() != io::ErrorKind::WouldBlock
-                    && e.kind() != io::ErrorKind::TimedOut
-                {
-                    slog::warn!(dev.log, "VNC accept error"; "error" => %e);
-                    thread::sleep(Duration::from_millis(100));
-                }
-            }
-        }
-    }
-
-    // Clean up socket file
-    let _ = std::fs::remove_file(&dev.vnc_path);
-}
-
-/// Check if an error is an expected client disconnect.
-fn is_expected_disconnect(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::ConnectionReset
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::UnexpectedEof
-    )
-}
-
-/// Dispatch a VNC message and report whether it requested a display update.
-fn dispatch_client_message(dev: &Framebuffer, msg: ClientMessage) -> bool {
-    match msg {
-        ClientMessage::FbUpdateRequest { .. } => true,
-        ClientMessage::SetPixelFormat(pf) => {
-            if pf.bits_per_pixel != 32 {
-                slog::warn!(dev.log, "client requested unsupported pixel format";
-                    "bpp" => pf.bits_per_pixel);
-            }
-            false
-        }
-        ClientMessage::SetEncodings(encs) => {
-            if !encs.contains(&ENCODING_RAW) {
-                slog::warn!(dev.log, "client encodings do not include Raw, updates may not display correctly");
-            }
-            false
-        }
-        ClientMessage::KeyEvent { down, key } => {
-            dev.input.key_event(down, key);
-            false
-        }
-        ClientMessage::PointerEvent { button_mask, x, y } => {
-            // The tablet only clamps values, so scaling must use fbuf's
-            // current resolution before the event reaches the input broker.
-            let res = dev.resolution.load(Ordering::Acquire);
-            let sx = scale_abs(x, unpack_width(res));
-            let sy = scale_abs(y, unpack_height(res));
-            dev.input.pointer_event(button_mask, sx, sy);
-            false
-        }
-        ClientMessage::CutText(_) => false,
-    }
-}
-
-/// Handle a single VNC client connection.
-fn handle_vnc_client(
-    dev: &Arc<Framebuffer>,
-    stream: UnixStream,
-) -> io::Result<()> {
-    // Set a read timeout to detect dead clients.
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    // Belt and braces only. This bounds a send on the platforms where
-    // it works, and reports success and does nothing on illumos, which
-    // is why `VncWriter` polls instead. A client is never refused over
-    // it.
-    if let Err(e) = stream.set_write_timeout(Some(VNC_WRITE_TIMEOUT)) {
-        slog::warn!(dev.log, "VNC write timeout not set"; "error" => %e);
-    }
-
-    let read_stream = stream.try_clone()?;
-    let mut writer = VncWriter::new(&stream, VNC_WRITE_TIMEOUT);
-    let mut reader = BufReader::new(read_stream);
-    let mut framebuffer_scratch = Vec::new();
-
-    // --- RFB handshake ---
-
-    // Version handshake
-    rfb::handshake_version(&mut CombinedStream {
-        reader: &mut reader,
-        writer: &mut writer,
-    })?;
-
-    // Security handshake
-    rfb::handshake_security(
-        &mut CombinedStream {
-            reader: &mut reader,
-            writer: &mut writer,
-        },
-        dev.vnc_password.as_deref(),
-    )?;
-
-    // ClientInit
-    let _shared_flag = rfb::read_client_init(&mut reader)?;
-
-    // ServerInit
-    let res = dev.resolution.load(Ordering::Acquire);
-    let width = unpack_width(res);
-    let height = unpack_height(res);
-    let pf = PixelFormat::xrgb8888();
-    rfb::send_server_init(&mut writer, width, height, &pf, VNC_DESKTOP_NAME)?;
-
-    // --- Main event loop ---
-    //
-    // We alternate between:
-    // 1. Polling for client messages (non-blocking reads)
-    // 2. Sending framebuffer updates when requested
-
-    // Track whether the client has requested an update
-    let update_requested = Arc::new(AtomicBool::new(false));
-    let client_alive = Arc::new(AtomicBool::new(true));
-
-    let shutdown_ref = &dev.shutdown;
-
-    // We'll run the reader in the same thread using non-blocking reads
-    // with a short timeout, interleaved with frame sends.
-    stream.set_read_timeout(Some(Duration::from_millis(5)))?;
-
-    // On first connect, many clients immediately request a full update,
-    // but some viewers (like macOS Screen Sharing) send it after init.
-    // We'll send an initial update after a brief wait.
-
-    while !shutdown_ref.load(Ordering::Relaxed)
-        && client_alive.load(Ordering::Relaxed)
-    {
-        // Poll for client messages (non-blocking due to timeout)
-        match rfb::read_client_message(&mut reader) {
-            Ok(Some(msg)) => {
-                if dispatch_client_message(dev, msg) {
-                    update_requested.store(true, Ordering::Release);
-                }
-            }
-            Ok(None) => {
-                // EOF: client disconnected
-                client_alive.store(false, Ordering::Release);
-                break;
-            }
-            Err(e) => {
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut
-                {
-                    // No data available, that's fine
-                } else {
-                    return Err(e);
-                }
-            }
-        }
-
-        // Send framebuffer update if requested
-        if update_requested.swap(false, Ordering::AcqRel) {
-            if let Err(e) = send_framebuffer_update(
-                dev,
-                &mut writer,
-                &mut framebuffer_scratch,
-            ) {
-                if is_expected_disconnect(&e) {
-                    client_alive.store(false, Ordering::Release);
-                    break;
-                }
-                return Err(e);
-            }
-        }
-
-        // Sleep until next frame
-        thread::sleep(VNC_FRAME_INTERVAL);
-    }
-
-    // Clean shutdown
-    let _ = stream.shutdown(Shutdown::Both);
-
-    Ok(())
-}
-
-/// Send a full framebuffer update to the VNC client.
-fn send_framebuffer_update(
-    dev: &Arc<Framebuffer>,
-    writer: &mut VncWriter<'_>,
-    scratch: &mut Vec<u8>,
-) -> io::Result<()> {
-    let res = dev.resolution.load(Ordering::Acquire);
-    let width = unpack_width(res);
-    let height = unpack_height(res);
-
-    if width == 0 || height == 0 {
-        return Ok(());
-    }
-
-    // Calculate the pixel data size, clamped to the actual framebuffer
-    // to prevent unbounded allocation if resolution is somehow larger.
-    let stride = u32::from(width) as usize * 4; // 4 bytes per pixel (XRGB8888)
-    let frame_bytes = stride.saturating_mul(usize::from(height));
-
-    let clamped = frame_bytes.min(dev.fb.len());
-
-    // Derive the actual dimensions we can send from the clamped size
-    // so the VNC rectangle header matches the data we transmit.
-    let (send_w, send_h) = if clamped < frame_bytes && stride > 0 {
-        let rows = clamped / stride;
-        (width, rows as u16)
-    } else {
-        (width, height)
-    };
-
-    let send_bytes = usize::from(send_w) * 4 * usize::from(send_h);
-    scratch.resize(send_bytes, 0);
-    dev.fb
-        .view()
-        .subregion(0, send_bytes)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "framebuffer update exceeds devmem bounds",
-            )
-        })?
-        .copy_out(scratch)?;
-
-    rfb::write_fb_update_header(writer, 1)?;
-    let rect = RectHeader {
-        x: 0,
-        y: 0,
-        width: send_w,
-        height: send_h,
-        encoding: ENCODING_RAW,
-    };
-    writer.write_all(&rect.to_bytes())?;
-    writer.write_all_direct(scratch)?;
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Client socket writer
-// ---------------------------------------------------------------------------
-
-/// Buffered writer for a VNC client socket, with a bound on how long
-/// one send waits.
-///
-/// `BufWriter` was here before. Its write to a full AF_UNIX socket has
-/// no end on illumos: `SO_SNDTIMEO` reports success and bounds
-/// nothing, and `O_NONBLOCK` is a file-status flag that the reader
-/// clone of this socket shares. `write_all_bounded` polls for space,
-/// which does work.
-///
-/// Only protocol headers go through the buffer. Pixel data is far too
-/// large to copy again, so it goes to the socket from the caller's own
-/// storage through [`VncWriter::write_all_direct`].
-struct VncWriter<'a> {
-    stream: &'a UnixStream,
-    buf: Vec<u8>,
-    budget: Duration,
-}
-
-impl<'a> VncWriter<'a> {
-    fn new(stream: &'a UnixStream, budget: Duration) -> Self {
-        Self {
-            stream,
-            buf: Vec::new(),
-            budget,
-        }
-    }
-
-    /// Send the buffer, then `data`, without copying `data` first.
-    fn write_all_direct(&mut self, data: &[u8]) -> io::Result<()> {
-        self.flush()?;
-        write_all_bounded(self.stream, data, self.budget)
-    }
-}
-
-impl Write for VncWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if self.buf.is_empty() {
-            return Ok(());
-        }
-        let result = write_all_bounded(self.stream, &self.buf, self.budget);
-        // A send that gave up left part of the buffer on the socket, so
-        // the bytes must not be sent again. The caller drops the client.
-        self.buf.clear();
-        result
-    }
-}
-
-// ---------------------------------------------------------------------------
-// CombinedStream helper for handshake
-// ---------------------------------------------------------------------------
-
-/// Wrapper that implements `Read + Write` by combining a reader and a
-/// writer, needed for the handshake functions which want a single
-/// stream that can both read and write.
-struct CombinedStream<'a, R: Read, W: Write> {
-    reader: &'a mut BufReader<R>,
-    writer: &'a mut W,
-}
-
-impl<R: Read, W: Write> Read for CombinedStream<'_, R, W> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.reader.read(buf)
-    }
-}
-
-impl<R: Read, W: Write> Write for CombinedStream<'_, R, W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.writer.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -860,6 +505,10 @@ impl Lifecycle for Framebuffer {
     // The VNC thread holds no guest state that must drain or migrate.
     fn type_name(&self) -> &'static str {
         "framebuffer"
+    }
+
+    fn halt(&self) {
+        self.shutdown();
     }
 }
 
@@ -872,10 +521,10 @@ mod tests {
     use super::*;
 
     #[derive(Default)]
-    struct RecordingKeyboard(Mutex<Vec<(bool, u32)>>);
+    pub(super) struct RecordingKeyboard(Mutex<Vec<(bool, u32)>>);
 
     impl RecordingKeyboard {
-        fn events(&self) -> Vec<(bool, u32)> {
+        pub(super) fn events(&self) -> Vec<(bool, u32)> {
             self.0.lock().expect("recording keyboard lock").clone()
         }
     }
@@ -932,23 +581,6 @@ mod tests {
                 assert!(scale_abs(value, extent) <= 0x7FFF);
             }
         }
-    }
-
-    #[test]
-    fn key_message_reaches_input_broker() {
-        let input = Arc::new(InputBroker::default());
-        let keyboard = Arc::new(RecordingKeyboard::default());
-        input.set_keyboard(keyboard.clone());
-        let dev = make_test_dev_with_input(input);
-
-        assert!(!dispatch_client_message(
-            &dev,
-            ClientMessage::KeyEvent {
-                down: true,
-                key: 0xff0d,
-            },
-        ));
-        assert_eq!(keyboard.events(), vec![(true, 0xff0d)]);
     }
 
     #[test]
@@ -1119,38 +751,21 @@ mod tests {
         assert_eq!(bar1_target(false, addr), None);
     }
 
-    /// A VNC client that stops reading must not hold the VNC thread.
-    ///
-    /// The thread also runs the accept loop, so a stuck write costs
-    /// every later viewer as well.
-    #[test]
-    fn a_client_that_never_reads_does_not_hold_the_vnc_thread() {
-        use std::os::unix::net::UnixStream;
-        use std::time::Instant;
-
-        let dev = make_test_dev();
-        let (_peer, server) =
-            UnixStream::pair().expect("create a VNC socket pair");
-        let mut writer = VncWriter::new(&server, Duration::from_millis(200));
-        let mut scratch = Vec::new();
-
-        let started = Instant::now();
-        let error = send_framebuffer_update(&dev, &mut writer, &mut scratch)
-            .expect_err("a client that reads nothing must not be waited on");
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the update took {:?}",
-            started.elapsed()
-        );
-    }
-
     /// Create a test device without starting the VNC server.
-    fn make_test_dev() -> Arc<Framebuffer> {
+    pub(super) fn make_test_dev() -> Arc<Framebuffer> {
         make_test_dev_with_input(Arc::new(InputBroker::default()))
     }
 
-    fn make_test_dev_with_input(input: Arc<InputBroker>) -> Arc<Framebuffer> {
+    pub(super) fn make_test_dev_with_input(
+        input: Arc<InputBroker>,
+    ) -> Arc<Framebuffer> {
+        make_test_dev_at(input, PathBuf::from("/nonexistent/fbuf.vnc"))
+    }
+
+    pub(super) fn make_test_dev_at(
+        input: Arc<InputBroker>,
+        vnc_path: PathBuf,
+    ) -> Arc<Framebuffer> {
         let ident = DeviceIdent {
             vendor_id: PCI_VENDOR_ID,
             device_id: PCI_DEVICE_ID,
@@ -1174,10 +789,11 @@ mod tests {
             registered_bar0: Mutex::new(None),
             self_ref: Mutex::new(None),
             vnc_password: None,
-            vnc_path: PathBuf::from("/tmp/test-fbuf.vnc"),
+            vnc_path,
             log: slog::Logger::root(slog::Discard, slog::o!()),
             input,
             shutdown: AtomicBool::new(false),
+            vnc_thread: Mutex::new(None),
         });
         *dev.self_ref.lock().expect("fbuf: self_ref lock") =
             Some(Arc::downgrade(&dev));

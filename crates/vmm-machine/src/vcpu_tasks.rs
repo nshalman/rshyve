@@ -314,9 +314,8 @@ fn vcpu_run_loop(
             }
         };
 
-        let exit_code = exit.kind.exit_code();
-        probes::vm_exit!(|| (vcpu_id as u32, exit.rip, exit_code));
-        metrics.record_exit(exit_code);
+        probes::vm_exit!(|| (vcpu_id as u32, exit.rip, exit.kind.exit_code()));
+        metrics.record_exit(&exit.kind);
 
         next_entry = match exit.kind {
             VmExitKind::Bogus | VmExitKind::Debug => VmEntry::Run,

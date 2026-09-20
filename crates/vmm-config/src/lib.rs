@@ -4,8 +4,15 @@
 
 //! CLI argument parsing and configuration for the VMM.
 //!
-//! Maintains compatibility with existing bhyve flags used by vmadm/boot.c
-//! while adding new flags for migration and management.
+//! Accepts the bhyve flags the zone brand's `boot.c` builds (`-H -U -B
+//! -c -m -A -S -s -l -o`) and adds the migration and direct-boot flags.
+//!
+//! Three C bhyve flags are deliberately absent, so clap refuses them
+//! instead of this VMM ignoring them: `-D` (destroy on power-off) would
+//! change the lifecycle the zone brand relies on, and `-k` and
+//! `--json-config` name configuration files nothing here reads, so a
+//! VM would boot with defaults and no word about it. An operator who
+//! puts one in `bhyve_extra_opts` gets an error, not a surprise.
 
 use std::path::PathBuf;
 
@@ -128,6 +135,43 @@ pub fn parse_mem_size(s: &str) -> anyhow::Result<usize> {
         .ok_or_else(|| anyhow::anyhow!("memory size '{s}' overflows"))
 }
 
+/// Refuse a vCPU count the kernel cannot give.
+///
+/// `VM_MAXCPU` is the ceiling. Without this the count reaches the
+/// kernel and comes back as a bare EINVAL from VM_SET_TOPOLOGY.
+fn check_cpu_count(n: u32) -> anyhow::Result<u32> {
+    anyhow::ensure!(n > 0, "CPU count must be > 0");
+    anyhow::ensure!(
+        n <= MAX_VCPUS,
+        "CPU count {n} is above the kernel limit of {MAX_VCPUS}",
+    );
+    Ok(n)
+}
+
+/// Split a `-c key=value,...` specification.
+///
+/// `sockets`, `cores` and `threads` are refused rather than dropped:
+/// this VMM programs one socket with one thread per core, so accepting
+/// them would give the guest a topology the operator did not ask for.
+fn cpu_spec_keys(spec: &str) -> anyhow::Result<Vec<(&str, &str)>> {
+    let mut pairs = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        let Some((key, val)) = part.split_once('=') else {
+            anyhow::bail!("-c '{part}' is not key=value");
+        };
+        match key {
+            "cpus" | "maxcpus" => pairs.push((key, val)),
+            "sockets" | "cores" | "threads" => anyhow::bail!(
+                "-c {key}= is not implemented; this VMM programs one \
+                 socket with one thread per core, so use cpus=N"
+            ),
+            _ => anyhow::bail!("-c has no '{key}' key"),
+        }
+    }
+    Ok(pairs)
+}
+
 /// New Rust-based bhyve VMM with live migration support.
 #[derive(Parser, Debug)]
 #[command(about)]
@@ -149,10 +193,6 @@ pub struct Cli {
     #[arg(short = 'l', action = clap::ArgAction::Append)]
     pub lpc: Vec<String>,
 
-    /// Configuration file (key=value or TOML)
-    #[arg(short = 'k')]
-    pub config_file: Option<PathBuf>,
-
     /// VM UUID
     #[arg(short = 'U')]
     pub uuid: Option<String>,
@@ -169,19 +209,20 @@ pub struct Cli {
     #[arg(short = 'o', action = clap::ArgAction::Append)]
     pub config_option: Vec<String>,
 
-    /// Destroy VM on power-off
-    #[arg(short = 'D')]
-    pub destroy_on_poweroff: bool,
-
     /// VM exit on HLT instruction
     #[arg(short = 'H')]
     pub vmexit_on_hlt: bool,
 
-    /// Wire guest memory (don't swap)
+    /// Draw guest memory from the VMM reservoir.
+    ///
+    /// C bhyve's `-S` means `memory.wired`, which is a different thing
+    /// this VMM does not implement. See [`Cli::use_reservoir`].
     #[arg(short = 'S')]
     pub wire_memory: bool,
 
-    /// Create ACPI tables
+    /// Create ACPI tables. Accepted because the zone brand passes it;
+    /// the tables are always built, so the flag asks for what already
+    /// happens.
     #[arg(short = 'A')]
     pub acpi: bool,
 
@@ -189,16 +230,8 @@ pub struct Cli {
     #[arg(long)]
     pub control_socket: Option<PathBuf>,
 
-    /// JSON configuration file (alternative to CLI flags)
-    #[arg(long)]
-    pub json_config: Option<PathBuf>,
-
-    /// Enable dirty page tracking for live migration (default: on).
-    /// Disable with --no-track-dirty for benchmarking or non-migratable VMs.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::SetTrue)]
-    pub track_dirty: bool,
-
-    /// Disable dirty page tracking (opt-out from default --track-dirty)
+    /// Turn off dirty page tracking, for benchmarking or a VM that will
+    /// never migrate. Tracking is on otherwise.
     #[arg(long = "no-track-dirty", action = clap::ArgAction::SetTrue)]
     pub no_track_dirty: bool,
 
@@ -340,29 +373,28 @@ impl Cli {
 
     /// Parse the CPU count from the -c argument.
     ///
-    /// Returns an error if the argument is present but unparseable.
+    /// Returns an error if the argument is present but unparseable, or
+    /// names a topology this VMM does not program.
     pub fn num_cpus(&self) -> anyhow::Result<u32> {
-        match &self.cpus {
-            None => Ok(1),
-            Some(s) => {
-                // Simple number
-                if let Ok(n) = s.parse::<u32>() {
-                    anyhow::ensure!(n > 0, "CPU count must be > 0");
-                    return Ok(n);
-                }
-                // cpus=N,sockets=M,cores=C,threads=T format
-                for part in s.split(',') {
-                    if let Some(val) = part.strip_prefix("cpus=") {
-                        let n: u32 = val.parse().map_err(|e| {
-                            anyhow::anyhow!("invalid cpus value '{val}': {e}")
-                        })?;
-                        anyhow::ensure!(n > 0, "CPU count must be > 0");
-                        return Ok(n);
-                    }
-                }
-                anyhow::bail!("could not parse CPU specification: '{s}'")
+        let Some(spec) = &self.cpus else {
+            return Ok(1);
+        };
+        // Simple number
+        if let Ok(n) = spec.parse::<u32>() {
+            return check_cpu_count(n);
+        }
+        let mut cpus = None;
+        for (key, val) in cpu_spec_keys(spec)? {
+            if key == "cpus" {
+                let n: u32 = val.parse().map_err(|e| {
+                    anyhow::anyhow!("invalid cpus value '{val}': {e}")
+                })?;
+                cpus = Some(check_cpu_count(n)?);
             }
         }
+        cpus.ok_or_else(|| {
+            anyhow::anyhow!("could not parse CPU specification: '{spec}'")
+        })
     }
 
     /// Parse the CPU ceiling from the -c argument's `maxcpus` key.
@@ -376,10 +408,13 @@ impl Cli {
         let Some(spec) = &self.cpus else {
             return Ok(num_cpus);
         };
-        for part in spec.split(',') {
-            let Some(val) = part.strip_prefix("maxcpus=") else {
+        if spec.parse::<u32>().is_ok() {
+            return Ok(num_cpus);
+        }
+        for (key, val) in cpu_spec_keys(spec)? {
+            if key != "maxcpus" {
                 continue;
-            };
+            }
             let n: u32 = val.parse().map_err(|e| {
                 anyhow::anyhow!("invalid maxcpus value '{val}': {e}")
             })?;
@@ -565,8 +600,70 @@ mod tests {
                 .unwrap(),
             4,
         );
-        let cli = cli_from(&["rshyve", "-c", "cpus=4,sockets=1", "guest"]);
-        assert_eq!(cli.max_cpus().unwrap(), 4);
+    }
+
+    #[test]
+    fn a_topology_this_vmm_does_not_program_is_refused() {
+        // A dropped sockets= or threads= gave the guest a topology the
+        // operator did not ask for, with no word about it.
+        for spec in [
+            "cpus=4,sockets=1",
+            "cpus=4,cores=2,threads=1",
+            "sockets=2,cores=2",
+            "threads=2",
+        ] {
+            let cli = cli_from(&["rshyve", "-c", spec, "guest"]);
+            assert!(cli.num_cpus().is_err(), "{spec}");
+            assert!(cli.max_cpus().is_err(), "{spec}");
+        }
+        // An unknown key is refused too, so a typo is not a silent default.
+        let typo = cli_from(&["rshyve", "-c", "cpu=4", "guest"]);
+        assert!(typo.num_cpus().is_err());
+    }
+
+    #[test]
+    fn a_boot_cpu_count_above_the_kernel_limit_is_refused() {
+        // Without this, VM_SET_TOPOLOGY answers with a bare EINVAL.
+        for spec in ["65", "cpus=65", "0", "cpus=0"] {
+            let cli = cli_from(&["rshyve", "-c", spec, "guest"]);
+            assert!(cli.num_cpus().is_err(), "{spec}");
+        }
+        assert_eq!(
+            cli_from(&["rshyve", "-c", "64", "guest"])
+                .num_cpus()
+                .unwrap(),
+            MAX_VCPUS,
+        );
+    }
+
+    #[test]
+    fn the_flags_this_vmm_does_not_implement_are_refused() {
+        // Accepting and ignoring -D, -k or --json-config would boot a VM
+        // with defaults and a lifecycle the operator did not ask for.
+        for flag in [
+            vec!["rshyve", "-D", "guest"],
+            vec!["rshyve", "-k", "/tmp/vm.conf", "guest"],
+            vec!["rshyve", "--json-config", "/tmp/vm.json", "guest"],
+        ] {
+            assert!(Cli::try_parse_named("rshyve", &flag).is_err(), "{flag:?}");
+        }
+        // The flags the zone brand does pass still parse.
+        let cli = cli_from(&["rshyve", "-H", "-A", "-S", "guest"]);
+        assert!(cli.acpi && cli.wire_memory && cli.vmexit_on_hlt);
+    }
+
+    #[test]
+    fn dirty_tracking_is_on_unless_it_is_turned_off() {
+        assert!(!cli_from(&["rshyve", "guest"]).no_track_dirty);
+        assert!(
+            cli_from(&["rshyve", "--no-track-dirty", "guest"]).no_track_dirty
+        );
+        // The old --track-dirty could never be false, so it is gone.
+        assert!(Cli::try_parse_named(
+            "rshyve",
+            ["rshyve", "--track-dirty", "guest"]
+        )
+        .is_err());
     }
 
     #[test]

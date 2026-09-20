@@ -1862,6 +1862,7 @@ dependencies = [
  "des",
  "getrandom 0.4.2",
  "slog",
+ "tempfile",
  "usdt",
  "vmm_core",
  "vmm_devices",
@@ -1901,8 +1902,8 @@ dependencies = [
 name = "vmm_metrics"
 version = "0.1.0"
 dependencies = [
- "serde",
  "serde_json",
+ "vmm_core",
 ]
 
 [[package]]

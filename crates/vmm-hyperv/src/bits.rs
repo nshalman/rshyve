@@ -47,6 +47,16 @@ bitflags! {
 }
 
 bitflags! {
+    /// CPUID leaf 0x4000_0003 EDX: miscellaneous feature availability.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct HvLeaf3Edx: u32 {
+        /// Linux and Windows both test this before they write the
+        /// crash MSRs, so the BSOD payload depends on it.
+        const GUEST_CRASH_MSRS = 1 << 10;
+    }
+}
+
+bitflags! {
     /// CPUID leaf 0x4000_0004 EAX: recommended guest behaviors.
     ///
     /// `RELAXED_TIMING` disables Windows' CLOCK_WATCHDOG bugcheck on

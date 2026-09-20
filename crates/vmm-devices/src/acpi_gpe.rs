@@ -10,10 +10,8 @@
 //! The SCI is a level-triggered line, so the pin must follow the
 //! register state at all times. A pin that stays high with no status
 //! bit set wedges IRQ 9 for the guest. A pin that stays low with a
-//! status bit set loses the event. This block owns the pin because it
-//! is the only place that sees both halves of the level: the GPE0
-//! registers here, and the PM1 registers in [`crate::acpi_pm`], which
-//! report their half through [`AcpiGpe::set_pm1_level`].
+//! status bit set loses the event. The GPE0 registers are the whole
+//! level: no PM1 event source raises the SCI (see [`crate::acpi_pm`]).
 //!
 //! Layout follows the QEMU guest ABI, which the hotplug AML in the
 //! DSDT is written against: a 4 byte block at 0xAFE0 holding a 2 byte
@@ -109,9 +107,6 @@ pub struct AcpiGpe {
 struct GpeInner {
     status: u16,
     enable: u16,
-    /// Whether the PM1 registers hold the SCI. Reported by
-    /// [`AcpiGpe::set_pm1_level`].
-    pm1_active: bool,
 }
 
 impl AcpiGpe {
@@ -131,7 +126,6 @@ impl AcpiGpe {
             inner: Mutex::new(GpeInner {
                 status: 0,
                 enable: 0,
-                pm1_active: false,
             }),
         });
 
@@ -152,24 +146,13 @@ impl AcpiGpe {
         Ok(gpe)
     }
 
-    /// Report whether `pm1_sts & pm1_en` is non-zero.
-    ///
-    /// The PM1 registers share the SCI with the GPE0 block, so their
-    /// half of the level comes through here. Call it from every PM1
-    /// path that can change that product.
-    pub fn set_pm1_level(&self, active: bool) {
-        let mut inner = self.inner.lock().expect("gpe lock poisoned");
-        inner.pm1_active = active;
-        self.recompute_sci(&inner);
-    }
-
     /// Drive the SCI pin from the full register state.
     ///
     /// The caller holds the lock across the pin update on purpose. Two
     /// vCPUs that compute a level and then apply it unordered can leave
     /// the line high with nothing set, or low with an event pending.
     fn recompute_sci(&self, inner: &GpeInner) {
-        let level = (inner.status & inner.enable) != 0 || inner.pm1_active;
+        let level = (inner.status & inner.enable) != 0;
         self.sci.set_state(level);
     }
 
@@ -257,10 +240,6 @@ impl Lifecycle for AcpiGpe {
     }
 
     /// Cold start: nothing latched and no source enabled.
-    ///
-    /// `pm1_active` is left alone. It mirrors the PM1 registers, which
-    /// [`crate::acpi_pm::AcpiPm`] owns, and lowering a level its owner
-    /// still holds would lose the event this block exists to keep.
     fn reset(&self) {
         let mut inner = self.inner.lock().expect("gpe lock poisoned");
         inner.status = 0;
@@ -565,35 +544,6 @@ mod tests {
     }
 
     #[test]
-    fn the_pm1_half_holds_the_sci_on_its_own() {
-        let (bus, gpe, pin) = attached();
-
-        gpe.set_pm1_level(true);
-        assert!(pin.is_asserted());
-
-        // A GPE write must not lower a line the PM1 half still holds.
-        bus.handle_out(STS_LO, 1, u32::from(GPE0_VALID));
-        bus.handle_out(EN_LO, 1, 0);
-        assert!(pin.is_asserted());
-
-        gpe.set_pm1_level(false);
-        assert_eq!(pin.history(), vec![true, false]);
-    }
-
-    #[test]
-    fn the_pm1_half_does_not_hide_a_pending_gpe() {
-        let (bus, gpe, pin) = attached();
-        bus.handle_out(EN_LO, 1, u32::from(GPE0_VALID));
-        gpe.set_pm1_level(true);
-        gpe.raise(GpeBit::Cpu);
-
-        gpe.set_pm1_level(false);
-
-        assert!(pin.is_asserted());
-        assert_eq!(pin.history(), vec![true]);
-    }
-
-    #[test]
     fn the_sci_line_history_is_exact() {
         let (bus, gpe, pin) = attached();
 
@@ -712,18 +662,6 @@ mod tests {
         assert_eq!(gpe.status(), 0);
         assert_eq!(gpe.enable(), 0);
         assert_eq!(pin.history(), vec![true, false]);
-    }
-
-    #[test]
-    fn reset_keeps_a_level_the_pm1_half_holds() {
-        let (_bus, gpe, pin) = attached();
-        gpe.set_pm1_level(true);
-
-        gpe.reset();
-
-        // AcpiPm owns that half and has not lowered it, so the line
-        // stays up and the PM1 event is not lost.
-        assert!(pin.is_asserted());
     }
 
     #[test]

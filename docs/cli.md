@@ -12,16 +12,15 @@ These flags match the existing C bhyve interface used by `boot.c`:
 
 | Flag | Description |
 |------|-------------|
-| `-c <N>` | CPU count (or `cpus=N,sockets=M,cores=C,threads=T`). Add `maxcpus=M` for hotplug CPU slots, see [Hotplug](#hotplug) |
+| `-c <N>` | CPU count, or `cpus=N`. Add `maxcpus=M` for hotplug CPU slots, see [Hotplug](#hotplug). `sockets=`, `cores=` and `threads=` are refused: this VMM programs one socket with one thread per core |
 | `-m <SIZE>` | Memory size. Bare number = MiB. Suffixes: K, M, G, T |
 | `-s <slot,driver[,config]>` | PCI device (repeatable). See [Devices](devices.md) |
 | `-l <device,config>` | LPC device (repeatable): `bootrom`, `com1`, `com2` |
 | `-U <UUID>` | VM UUID (SMBIOS Type 1 + mdata `sdc:uuid`) |
 | `-B <smbios>` | SMBIOS string: `1,manufacturer=X,product=Y,...` |
 | `-H` | Exit on HLT instruction |
-| `-D` | Destroy VM on power-off |
-| `-S` | Wire guest memory (no swap) |
-| `-A` | Generate ACPI tables |
+| `-S` | Draw guest memory from the VMM reservoir. C bhyve's `-S` means `memory.wired`, which is a different thing this VMM does not implement |
+| `-A` | Accepted because `boot.c` passes it; ACPI tables are always generated |
 | `-o <key=value>` | Config option (repeatable). Only `hotplug.maxmem` and `hotplug.memslot` are read; see [Hotplug](#hotplug). Any other key is passed over, but a misspelled `hotplug.` key is a startup error |
 
 ## New Flags
@@ -30,7 +29,7 @@ These flags match the existing C bhyve interface used by `boot.c`:
 
 | Flag | Description |
 |------|-------------|
-| `--track-dirty` | Enable dirty page tracking (required for migration) |
+| `--no-track-dirty` | Turn off dirty page tracking. It is on otherwise |
 | `--migrate-listen <ADDR:PORT>` | Destination mode: wait for incoming migration |
 | `--control-socket <PATH>` | Unix socket for management commands |
 | `--cpu-baseline <PROFILE>` | CPU feature mask: `host`, `avx2`, `sse42` |
@@ -263,3 +262,11 @@ rshyve -H \
   -l com1,/dev/zconsole \
   SYSbhyve-$ZONENAME
 ```
+
+## Flags this VMM refuses
+
+`-D`, `-k` and `--json-config` are C bhyve flags this VMM does not
+implement, so it refuses them instead of ignoring them. `-D` (destroy on
+power-off) would change the lifecycle the zone brand relies on, and `-k`
+and `--json-config` name configuration files nothing here reads, so a VM
+would boot with defaults and no word about it.

@@ -9,6 +9,7 @@
 //! updates with Raw encoding, and client message parsing.
 
 use std::io::{self, BufRead, Read, Write};
+use std::time::{Duration, Instant};
 
 use des::cipher::{BlockEncrypt, KeyInit};
 use des::Des;
@@ -61,6 +62,17 @@ pub const CLIENT_CUT_TEXT: u8 = 6;
 // ---------------------------------------------------------------------------
 
 pub const ENCODING_RAW: i32 = 0;
+
+/// DesktopSize pseudo-encoding: a client that lists it accepts a new
+/// framebuffer size in a rectangle header.
+pub const ENCODING_DESKTOP_SIZE: i32 = -223;
+
+/// How long a message body may take once its type byte is consumed.
+///
+/// The caller polls for the type byte with a short timeout. After that
+/// the framing is committed, so a timeout mid-body cannot be reported
+/// as "no data": the remainder has to arrive or the client is dead.
+const BODY_DEADLINE: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // PixelFormat
@@ -393,6 +405,46 @@ pub enum ClientMessage {
     CutText(String),
 }
 
+/// Whether an error is the socket's read timeout rather than a fault.
+pub fn is_read_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// Fill `buf` completely, riding out the socket's read timeout.
+///
+/// `read_exact` leaves an unspecified amount consumed when it fails, so
+/// it cannot be retried. This keeps its own count and only gives up
+/// once `deadline` has passed with no progress at all.
+fn read_body<R: Read>(
+    r: &mut R,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "client closed mid-message",
+                ))
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if is_read_timeout(&e) => {
+                if Instant::now() >= deadline {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Read and parse a single client message.
 ///
 /// Returns `None` on EOF (client disconnected).
@@ -405,12 +457,16 @@ pub fn read_client_message<R: BufRead>(
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
+    // The type byte is gone from the stream, so every read below has to
+    // finish: a caller that treated a mid-body timeout as "no data"
+    // would parse the next body byte as a message type.
+    let deadline = Instant::now() + BODY_DEADLINE;
 
     match msg_type[0] {
         CLIENT_SET_PIXEL_FORMAT => {
             // 3 bytes padding + 16 bytes pixel format
             let mut buf = [0u8; 19];
-            r.read_exact(&mut buf)?;
+            read_body(r, &mut buf, deadline)?;
             let pf_bytes: [u8; 16] = buf[3..19].try_into().expect("16 bytes");
             Ok(Some(ClientMessage::SetPixelFormat(
                 PixelFormat::from_bytes(&pf_bytes),
@@ -419,7 +475,7 @@ pub fn read_client_message<R: BufRead>(
         CLIENT_SET_ENCODINGS => {
             // 1 byte padding + 2 bytes count
             let mut hdr = [0u8; 3];
-            r.read_exact(&mut hdr)?;
+            read_body(r, &mut hdr, deadline)?;
             let count = u16::from_be_bytes([hdr[1], hdr[2]]) as usize;
             // Cap at 64 encodings to prevent resource exhaustion from
             // a malicious client sending count=65535.
@@ -427,7 +483,7 @@ pub fn read_client_message<R: BufRead>(
             let mut encodings = Vec::with_capacity(capped);
             for i in 0..count {
                 let mut enc = [0u8; 4];
-                r.read_exact(&mut enc)?;
+                read_body(r, &mut enc, deadline)?;
                 if i < capped {
                     encodings.push(i32::from_be_bytes(enc));
                 }
@@ -438,7 +494,7 @@ pub fn read_client_message<R: BufRead>(
         CLIENT_FB_UPDATE_REQUEST => {
             // 1 byte incremental + 2*4 bytes x,y,w,h
             let mut buf = [0u8; 9];
-            r.read_exact(&mut buf)?;
+            read_body(r, &mut buf, deadline)?;
             Ok(Some(ClientMessage::FbUpdateRequest {
                 incremental: buf[0] != 0,
                 x: u16::from_be_bytes([buf[1], buf[2]]),
@@ -450,7 +506,7 @@ pub fn read_client_message<R: BufRead>(
         CLIENT_KEY_EVENT => {
             // 1 byte down-flag + 2 bytes padding + 4 bytes key
             let mut buf = [0u8; 7];
-            r.read_exact(&mut buf)?;
+            read_body(r, &mut buf, deadline)?;
             Ok(Some(ClientMessage::KeyEvent {
                 down: buf[0] != 0,
                 key: u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]),
@@ -459,7 +515,7 @@ pub fn read_client_message<R: BufRead>(
         CLIENT_POINTER_EVENT => {
             // 1 byte button-mask + 2 bytes x + 2 bytes y
             let mut buf = [0u8; 5];
-            r.read_exact(&mut buf)?;
+            read_body(r, &mut buf, deadline)?;
             Ok(Some(ClientMessage::PointerEvent {
                 button_mask: buf[0],
                 x: u16::from_be_bytes([buf[1], buf[2]]),
@@ -469,20 +525,20 @@ pub fn read_client_message<R: BufRead>(
         CLIENT_CUT_TEXT => {
             // 3 bytes padding + 4 bytes length + text
             let mut hdr = [0u8; 7];
-            r.read_exact(&mut hdr)?;
+            read_body(r, &mut hdr, deadline)?;
             let len =
                 u32::from_be_bytes([hdr[3], hdr[4], hdr[5], hdr[6]]) as usize;
             // Cap at 1 MiB to avoid OOM
             let capped = len.min(1024 * 1024);
             let mut text_buf = vec![0u8; capped];
-            r.read_exact(&mut text_buf)?;
+            read_body(r, &mut text_buf, deadline)?;
             // Drain remaining bytes if we capped
             if len > capped {
                 let mut drain = vec![0u8; 4096];
                 let mut remaining = len - capped;
                 while remaining > 0 {
                     let chunk = remaining.min(drain.len());
-                    r.read_exact(&mut drain[..chunk])?;
+                    read_body(r, &mut drain[..chunk], deadline)?;
                     remaining -= chunk;
                 }
             }
@@ -730,5 +786,95 @@ mod tests {
         assert_eq!(result.len(), 16);
         // Even with an all-zero key, DES transforms the input
         assert_ne!(result, challenge);
+    }
+
+    /// A socket that hands out its bytes in the pieces a script names,
+    /// with a read timeout wherever the script says so.
+    enum Step {
+        Data(Vec<u8>),
+        Timeout,
+    }
+
+    struct Stuttering(std::collections::VecDeque<Step>);
+
+    impl Read for Stuttering {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.pop_front() {
+                None => Ok(0),
+                Some(Step::Timeout) => {
+                    Err(io::Error::from(io::ErrorKind::WouldBlock))
+                }
+                Some(Step::Data(data)) => {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    if n < data.len() {
+                        self.0.push_front(Step::Data(data[n..].to_vec()));
+                    }
+                    Ok(n)
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_timeout_mid_message_does_not_lose_the_framing() {
+        // The type byte is consumed before the body arrives. Reporting
+        // the timeout to the caller there would make the next call read
+        // a body byte as a message type and drop the client.
+        use std::io::BufReader;
+
+        let pointer = |mask: u8, x: u16, y: u16| {
+            let mut m = vec![CLIENT_POINTER_EVENT, mask];
+            m.extend_from_slice(&x.to_be_bytes());
+            m.extend_from_slice(&y.to_be_bytes());
+            m
+        };
+        let first = pointer(1, 0x0102, 0x0304);
+        let second = pointer(0, 0x0506, 0x0708);
+
+        let mut reader = BufReader::new(Stuttering(
+            [
+                Step::Data(first[..1].to_vec()),
+                Step::Timeout,
+                Step::Data(first[1..3].to_vec()),
+                Step::Timeout,
+                Step::Data(first[3..].to_vec()),
+                Step::Data(second.clone()),
+            ]
+            .into(),
+        ));
+
+        assert!(matches!(
+            read_client_message(&mut reader).expect("first message"),
+            Some(ClientMessage::PointerEvent {
+                button_mask: 1,
+                x: 0x0102,
+                y: 0x0304
+            })
+        ));
+        // The stream is still framed, so the next message parses.
+        assert!(matches!(
+            read_client_message(&mut reader).expect("second message"),
+            Some(ClientMessage::PointerEvent {
+                button_mask: 0,
+                x: 0x0506,
+                y: 0x0708
+            })
+        ));
+        assert!(read_client_message(&mut reader)
+            .expect("clean EOF")
+            .is_none());
+    }
+
+    #[test]
+    fn a_client_that_stops_mid_message_is_an_error_not_a_message() {
+        use std::io::BufReader;
+
+        let mut reader = BufReader::new(Stuttering(
+            [Step::Data(vec![CLIENT_POINTER_EVENT, 1])].into(),
+        ));
+        let err = read_client_message(&mut reader)
+            .expect_err("a half message is not a message");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }
