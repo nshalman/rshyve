@@ -29,12 +29,13 @@ pub mod overlay;
 pub mod tsc;
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bhyve_api::vcpu_cpuid_entry;
 use slog::{info, warn, Logger};
 use vmm_core::mem::PhysMap;
 use vmm_core::msr::{MsrHandler, RdmsrOutcome, WrmsrOutcome};
+use vmm_core::ratelimit::TokenBucket;
 
 use crate::bits::*;
 use crate::hypercall::MsrHypercallValue;
@@ -78,8 +79,13 @@ pub struct HyperV {
     physmap: Arc<PhysMap>,
     features: Features,
     boot: Instant,
+    /// Records a guest can earn by writing CRASH_CTL.
+    crash_log_budget: TokenBucket,
     inner: Mutex<Inner>,
 }
+
+const CRASH_LOG_BURST: u32 = 4;
+const CRASH_LOG_PERIOD: Duration = Duration::from_secs(15);
 
 struct Inner {
     msr_guest_os_id: u64,
@@ -116,6 +122,10 @@ impl HyperV {
             physmap,
             features,
             boot: Instant::now(),
+            crash_log_budget: TokenBucket::new(
+                CRASH_LOG_BURST,
+                CRASH_LOG_PERIOD,
+            ),
             inner: Mutex::new(Inner::new()),
         })
     }
@@ -168,7 +178,17 @@ impl HyperV {
             leaf3 |= HvLeaf3Eax::PARTITION_REFERENCE_COUNTER;
             leaf3 |= HvLeaf3Eax::PARTITION_REFERENCE_TSC;
         }
-        entries.push(cpuid_entry(0x4000_0003, 0, leaf3.bits(), 0, 0, 0));
+        // EDX: the crash MSRs are always handled, and both Windows and
+        // Linux test this bit before they write them.
+        let leaf3_edx = HvLeaf3Edx::GUEST_CRASH_MSRS.bits();
+        entries.push(cpuid_entry(
+            0x4000_0003,
+            0,
+            leaf3.bits(),
+            0,
+            0,
+            leaf3_edx,
+        ));
 
         // 0x4000_0004: recommended guest behaviors.
         // EAX = RELAXED_TIMING (the watchdog suppression bit).
@@ -317,6 +337,10 @@ impl HyperV {
     }
 
     fn log_crash(&self, inner: &Inner) {
+        // CRASH_CTL is a guest WRMSR, so the record needs a cap.
+        if !self.crash_log_budget.take() {
+            return;
+        }
         info!(
             self.log,
             "Windows guest BSOD";
@@ -482,5 +506,80 @@ fn cpuid_entry(
         vce_ecx: ecx,
         vce_edx: edx,
         _pad: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts the records a guest earns, so a test can show a WRMSR
+    /// loop does not log in that loop.
+    struct CountingDrain(Arc<AtomicUsize>);
+
+    impl slog::Drain for CountingDrain {
+        type Ok = ();
+        type Err = slog::Never;
+
+        fn log(
+            &self,
+            record: &slog::Record<'_>,
+            _values: &slog::OwnedKVList,
+        ) -> Result<(), Self::Err> {
+            if record.level().is_at_least(slog::Level::Info) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    fn hyperv(log: Logger) -> Arc<HyperV> {
+        HyperV::new(log, Arc::new(PhysMap::new()), Features::default())
+    }
+
+    fn counting() -> (Arc<HyperV>, Arc<AtomicUsize>) {
+        use slog::Drain;
+        let count = Arc::new(AtomicUsize::new(0));
+        let log = Logger::root(CountingDrain(count.clone()).fuse(), slog::o!());
+        (hyperv(log), count)
+    }
+
+    #[test]
+    fn the_crash_msrs_are_advertised_in_leaf_3_edx() {
+        // Windows and Linux both test this bit before they write the
+        // crash MSRs, so without it the BSOD payload never arrives.
+        let hv = hyperv(Logger::root(slog::Discard, slog::o!()));
+        let mut entries = Vec::new();
+        hv.add_cpuid(&mut entries);
+        let leaf3 = entries
+            .iter()
+            .find(|e| e.vce_function == 0x4000_0003)
+            .expect("leaf 0x4000_0003");
+        assert_ne!(leaf3.vce_edx & HvLeaf3Edx::GUEST_CRASH_MSRS.bits(), 0);
+    }
+
+    #[test]
+    fn a_crash_ctl_loop_cannot_flood_the_log() {
+        let (hv, count) = counting();
+        for _ in 0..1000 {
+            assert!(matches!(
+                hv.wrmsr(0, HV_X64_MSR_CRASH_CTL, HV_CRASH_CTL_NOTIFY),
+                WrmsrOutcome::Handled
+            ));
+        }
+        let logged = count.load(Ordering::Relaxed);
+        assert!(logged > 0, "the first crash must be reported");
+        assert!(logged <= CRASH_LOG_BURST as usize, "{logged} records");
+    }
+
+    #[test]
+    fn crash_ctl_without_notify_reports_nothing() {
+        let (hv, count) = counting();
+        assert!(matches!(
+            hv.wrmsr(0, HV_X64_MSR_CRASH_CTL, 0),
+            WrmsrOutcome::Handled
+        ));
+        assert_eq!(count.load(Ordering::Relaxed), 0);
     }
 }
