@@ -193,12 +193,6 @@ pub(crate) fn create_pci_device(
     }
 }
 
-/// The catalog closure, bound to this VM and handed to the hotplug
-/// engine.
-///
-/// SECURITY: the same closure the boot-time `-s` pass drives, so a
-/// control request can name no driver and no path that a command line
-/// could not. See the trust note in `crate::control`.
 /// Refuse a spec that only the startup argv may carry.
 ///
 /// Split out of the factory so the policy is testable without a live
@@ -222,6 +216,12 @@ fn check_hot_add(spec: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The catalog closure, bound to this VM and handed to the hotplug
+/// engine.
+///
+/// SECURITY: the same closure the boot-time `-s` pass drives, so a
+/// control request can name no driver and no path that a command line
+/// could not. See the trust note in `crate::control`.
 pub(crate) fn hotplug_factory(num_cpus: u32) -> vmm_machine::HotplugFactory {
     Box::new(move |spec, ctx| {
         check_hot_add(spec)?;
