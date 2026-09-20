@@ -243,12 +243,11 @@ impl NvmeController {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
 
-        // Verify the associated CQ exists
         let Some(cq_idx) = io_queue_index(cq_id) else {
-            return (SC_INVALID_FIELD | SC_DNR, 0);
+            return (SC_CQ_INVALID | SC_DNR, 0);
         };
         if st.io_cqs[cq_idx].is_none() {
-            return (SC_INVALID_FIELD | SC_DNR, 0);
+            return (SC_CQ_INVALID | SC_DNR, 0);
         }
 
         if !valid_queue_base(prp1) {

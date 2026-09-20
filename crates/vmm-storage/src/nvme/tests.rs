@@ -496,6 +496,60 @@ fn io_read_past_the_namespace_is_refused() {
     assert_eq!(cqe.status(), Status::of(SC_INVALID_FIELD | SC_DNR));
 }
 
+#[test]
+fn command_specific_status_reaches_the_guest_with_sct_one() {
+    let mut h = Harness::new();
+    h.enable();
+    // An SQ whose CQ does not exist.
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_CREATE_IO_SQ,
+        prp1: SQ1,
+        cdw10: 1 | (u32::from(IO_QDEPTH - 1) << 16),
+        cdw11: 3 << 16,
+        ..Sqe::default()
+    });
+    assert_eq!(
+        cqe.status(),
+        Status {
+            sct: 1,
+            sc: 0x00,
+            dnr: true
+        }
+    );
+    // A queue id past the allocation.
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_CREATE_IO_CQ,
+        prp1: CQ1,
+        cdw10: 16 | (u32::from(IO_QDEPTH - 1) << 16),
+        cdw11: 1 << 16,
+        ..Sqe::default()
+    });
+    assert_eq!(
+        cqe.status(),
+        Status {
+            sct: 1,
+            sc: 0x01,
+            dnr: true
+        }
+    );
+    // A queue of one entry.
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_CREATE_IO_CQ,
+        prp1: CQ1,
+        cdw10: 1,
+        cdw11: 1 << 16,
+        ..Sqe::default()
+    });
+    assert_eq!(
+        cqe.status(),
+        Status {
+            sct: 1,
+            sc: 0x02,
+            dnr: true
+        }
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Unit-level checks kept from before the harness
 // ---------------------------------------------------------------------------
@@ -550,7 +604,7 @@ fn create_io_sq_with_cq_id_zero_is_rejected() {
         cq_id,
     );
 
-    assert_eq!(status, (SC_INVALID_FIELD | SC_DNR, 0));
+    assert_eq!(status, (SC_CQ_INVALID | SC_DNR, 0));
 }
 
 #[test]

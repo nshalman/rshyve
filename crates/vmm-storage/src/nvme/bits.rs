@@ -131,14 +131,17 @@ pub const SC_INVALID_FIELD: u16 = 0x0002;
 pub const SC_DATA_XFER_ERROR: u16 = 0x0004;
 pub const SC_INTERNAL_ERROR: u16 = 0x0006;
 pub const SC_INVALID_NS: u16 = 0x000B;
-pub const SC_INVALID_QUEUE_ID: u16 = 0x0100; // in command-specific range
-pub const SC_INVALID_QUEUE_SIZE: u16 = 0x0101;
+
+// Command specific status, NVMe 1.4 figure 128. Bits 10:8 carry the
+// status code type, so these read as SCT=1, SC=n.
+pub const SC_CQ_INVALID: u16 = 0x0100;
+pub const SC_INVALID_QUEUE_ID: u16 = 0x0101;
+pub const SC_INVALID_QUEUE_SIZE: u16 = 0x0102;
+pub const SC_INVALID_INTR_VECTOR: u16 = 0x0108;
+pub const SC_INVALID_LOG_PAGE: u16 = 0x0109;
 
 /// Do Not Retry flag in status
 pub const SC_DNR: u16 = 1 << 14;
-/// Status Code Type shift (bits 27:25 of DW3)
-pub const SCT_GENERIC: u16 = 0;
-pub const SCT_CMD_SPECIFIC: u16 = 1;
 
 // ── Submission Queue Entry (64 bytes) ──────────────────────────
 
