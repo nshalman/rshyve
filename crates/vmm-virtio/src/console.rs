@@ -31,7 +31,8 @@ use vmm_core::unixsock::{bind_restricted, write_all_bounded, SocketPolicy};
 
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::VirtioDevice;
-use crate::pci::intr::{BackendIntr, IntrSession, IntrSlot};
+use crate::access::{GuestAccess, Session};
+use crate::pci::intr::{BackendIntr, IntrSlot};
 use crate::socket_accept;
 use vmm_devices::lifecycle::{IndicatedState, Indicator};
 use vmm_devices::{Lifecycle, QuiesceGate};
@@ -79,6 +80,11 @@ struct ConsoleShared {
     /// Guest RX chains with no host bytes to fill them yet.
     pending_rx: Mutex<VecDeque<(u16, Vec<ChainBuf>)>>,
     rx_completion: Mutex<Option<Arc<VirtioCompletion>>>,
+    /// Permission to touch the guest's ring and chains.
+    ///
+    /// The reader thread delivers on its own, so a reset has to take
+    /// the ring back from it rather than from a worker it dispatched.
+    access: Arc<GuestAccess>,
     interrupt: Arc<IntrSlot>,
     /// Reader threads, one per client that has been attached.
     readers: Mutex<Vec<JoinHandle<()>>>,
@@ -105,6 +111,15 @@ impl ConsoleShared {
         if self.gate.is_paused() {
             return;
         }
+        // Held across every copy and every used entry below. The
+        // transport publishes status 0 as soon as `reset` returns and
+        // the illumos driver reclaims the ring DMA on the next line,
+        // so a delivery that started before the reset has to finish
+        // inside it. The work here is bounded by the stash and the
+        // backlog cap, which is what lets a vCPU wait for it.
+        let Some(_session) = self.access.enter_current() else {
+            return;
+        };
         let completion = {
             let guard = self.rx_completion.lock().expect("rx completion lock");
             match guard.as_ref() {
@@ -339,6 +354,7 @@ impl VirtioConsole {
             backlog: Mutex::new(VecDeque::new()),
             pending_rx: Mutex::new(VecDeque::new()),
             rx_completion: Mutex::new(None),
+            access: Arc::new(GuestAccess::new()),
             interrupt: Arc::new(IntrSlot::new()),
             readers: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
@@ -376,12 +392,15 @@ impl VirtioConsole {
 
     /// Get or create the completion handler for the RX ring.
     ///
-    /// The session is read and the handler is stored under one lock,
-    /// and [`VirtioDevice::reset`] drops the handler under the same
-    /// lock after the transport has ended its session. So a handler
-    /// this leaves behind names either the session that is ending, and
-    /// is then dropped, or the one that follows.
-    fn ensure_rx_completion(&self, queue: &VirtQueue) -> Arc<VirtioCompletion> {
+    /// The caller's permission stamps the handler with the session its
+    /// ring belongs to. Permission is refused for the whole of a
+    /// reset, so a handler built here cannot reach the slot the next
+    /// driver finds.
+    fn ensure_rx_completion(
+        &self,
+        access: &Session<'_>,
+        queue: &VirtQueue,
+    ) -> Arc<VirtioCompletion> {
         let mut slot = self
             .shared
             .rx_completion
@@ -391,11 +410,10 @@ impl VirtioConsole {
             return Arc::clone(completion);
         }
         let intr = Arc::clone(&self.shared.interrupt);
-        let session = self.shared.interrupt.next_session(IntrSession::INITIAL);
         let completion = VirtioCompletion::new(
             queue,
             Arc::clone(&self.shared.physmap),
-            session,
+            access.intr(),
             move |session| {
                 intr.raise(session, CONSOLE_RX_QUEUE);
             },
@@ -409,7 +427,11 @@ impl VirtioConsole {
 
     /// Pop RX chains and hold them until host bytes arrive.
     fn stash_rx(&self, queue: &mut VirtQueue, physmap: &PhysMap) {
-        let completion = self.ensure_rx_completion(queue);
+        let Some(session) = self.shared.access.enter_current() else {
+            // A reset owns the ring. Its queue state goes with it.
+            return;
+        };
+        let completion = self.ensure_rx_completion(&session, queue);
 
         // A stashed chain is only completed once host bytes land in
         // it, so the stash needs a bound of its own: a guest can
@@ -442,7 +464,28 @@ impl VirtioConsole {
             }
         }
 
+        // Dropped first: `deliver_rx` takes its own permission, and a
+        // second read lock behind a waiting writer deadlocks.
+        drop(session);
         self.shared.deliver_rx();
+    }
+
+    /// End the session that owns the RX ring, wait for the deliveries
+    /// already inside it, and drop everything that named that ring.
+    ///
+    /// Admission closes before the wait. A delivery refused there
+    /// never takes the lock, and `std::sync::RwLock` gives the writer
+    /// no priority, so a host peer that writes fast enough could
+    /// otherwise starve a vCPU waiting here.
+    fn retire_rx_ring(&self) {
+        self.shared.access.close();
+        self.shared.access.drain();
+        self.shared.forget_rx_ring();
+        self.shared.access.reopen(
+            self.shared
+                .interrupt
+                .next_session(self.shared.access.intr_session()),
+        );
     }
 
     /// Drain guest output inline on the vCPU thread.
@@ -551,13 +594,13 @@ impl VirtioDevice for VirtioConsole {
     /// came from, so a ring the driver programs again starts empty.
     fn queue_addr_set(&self, queue_idx: u16, _queue: &VirtQueue) {
         if queue_idx == CONSOLE_RX_QUEUE {
-            self.shared.forget_rx_ring();
+            self.retire_rx_ring();
         }
     }
 
     fn reset(&self) {
         *self.negotiated_features.lock().expect("features lock") = 0;
-        self.shared.forget_rx_ring();
+        self.retire_rx_ring();
         // The host-side backlog survives a guest reset: those bytes
         // were accepted from the client and are still owed to the guest.
     }

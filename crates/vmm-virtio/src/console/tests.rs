@@ -227,6 +227,45 @@ fn a_ring_taken_whole_still_arms_the_next_kick() {
     console.halt();
 }
 
+/// The reader thread copies host bytes into a guest chain and
+/// publishes a used entry, all outside the vCPU. The transport
+/// publishes status 0 the moment `reset` returns, and the illumos
+/// driver reclaims the ring DMA on the next line, so a delivery
+/// already inside the ring has to finish before the reset does.
+#[test]
+fn a_reset_waits_for_a_delivery_already_inside_the_ring() {
+    let (physmap, rx_queue) = make_queue(4, 1, bits::VRING_DESC_F_WRITE, 8);
+    let (_dir, console) = console_in_tempdir(Arc::clone(&physmap));
+    let mut queues = [rx_queue, VirtQueue::new(4)];
+    console.notify_queue(CONSOLE_RX_QUEUE, &mut queues, &physmap);
+
+    // Stands in for a reader thread inside `deliver_rx`.
+    let held = console
+        .shared
+        .access
+        .enter_current()
+        .expect("a delivery is admitted");
+    let finished = AtomicBool::new(false);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            VirtioDevice::reset(&console);
+            finished.store(true, Ordering::Release);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !finished.load(Ordering::Acquire),
+            "the reset returned while a delivery still held the ring",
+        );
+        drop(held);
+    });
+
+    assert!(finished.load(Ordering::Acquire));
+    // And the delivery that follows finds no ring to write.
+    assert!(console.shared.rx_completion.lock().expect("slot").is_none());
+    console.halt();
+}
+
 #[test]
 fn host_bytes_reach_guest_memory() {
     let (physmap, rx_queue) = make_queue(4, 1, bits::VRING_DESC_F_WRITE, 8);
@@ -551,7 +590,13 @@ fn an_rx_completion_from_the_closed_session_raises_nothing() {
         Arc::clone(&seen),
     ));
 
-    let stale = console.ensure_rx_completion(&rx_queue);
+    let session = console
+        .shared
+        .access
+        .enter_current()
+        .expect("a delivery is admitted");
+    let stale = console.ensure_rx_completion(&session, &rx_queue);
+    drop(session);
 
     // The whole reset, in the order the transport runs it: the session
     // ends first, then the backend resets, then admission reopens.
@@ -568,7 +613,13 @@ fn an_rx_completion_from_the_closed_session_raises_nothing() {
     // The other half, and it is the worse failure of the two: input
     // for the session running now has to get through, or the device
     // has traded a spurious interrupt for a guest that waits for ever.
-    console.ensure_rx_completion(&rx_queue).signal();
+    let session = console
+        .shared
+        .access
+        .enter_current()
+        .expect("a delivery is admitted");
+    console.ensure_rx_completion(&session, &rx_queue).signal();
+    drop(session);
     assert_eq!(
         seen.lock().expect("record lock").len(),
         1,
