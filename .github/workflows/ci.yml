@@ -10,13 +10,21 @@ name: CI
 # dependencies (zstd-sys, the vendored libtpms that vmm-tpm-sys builds)
 # compile natively. See the `binaries` job.
 #
-# So a green run here means: the tree is formatted, the portable crates
-# are clippy-clean and their tests pass, the recorded-ioctl tests of the
-# three illumos binding crates pass, every portable crate and its test
-# targets type-check against the illumos target, the lockfile is
-# current, and the dependency and public-surface policies hold.
-# tools/fhrun-init is excluded from the workspace, so the guest-init job
-# covers it on its own.
+# So a green run here means: the tree is formatted, EVERY workspace
+# member is clippy-clean under `-D warnings` (the portable ones on the
+# host, the bindings and firehyve against the illumos target, rshyve and
+# the TPM crates on the host because their C dependencies cannot
+# cross-compile), the portable tests pass in both profiles, the
+# recorded-ioctl tests of the three illumos binding crates pass, every
+# portable crate and its test targets type-check against the illumos
+# target, the lockfile is current, and the dependency, public-surface policy holds. tools/fhrun-init and tools/virtiofs-test
+# are excluded from the workspace, so the two guest jobs cover them.
+#
+# What the clippy coverage does NOT prove: rshyve's
+# `cfg(target_os = "illumos")` bodies are linted on the host target only,
+# because zstd-sys and the libtpms autotools build need a C toolchain for
+# the target. CONTRIBUTING.md records the workspace-wide clippy run the
+# illumos build host does.
 #
 # A green run also means the two platforms compile the same set of
 # tests, apart from the gated ones recorded in tools/test-parity.expected
@@ -87,6 +95,27 @@ jobs:
           -p fhrun
           -- -D warnings
 
+  clippy-illumos:
+    name: clippy against the illumos target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: rustup target add x86_64-unknown-illumos
+      - run: rustup component add clippy
+      # The workspace denies `clippy::correctness`, which catches
+      # undefined behaviour, and those lints only fire under clippy. The
+      # ioctl bindings hold most of the `unsafe` in the tree and no
+      # clippy job named them, so the deny was inert for exactly the code
+      # it was written for. The compile that means anything for them is
+      # the one against the real target, so it is this job and not the
+      # host one. firehyve rides along: it has no C dependencies, so it
+      # cross-compiles.
+      - run: >
+          cargo clippy --locked --target x86_64-unknown-illumos --all-targets
+          -p bhyve_api_sys -p bhyve_api -p viona_api
+          -p firehyve
+          -- -D warnings
+
   cross-check:
     name: illumos bindings type-check
     runs-on: ubuntu-latest
@@ -133,17 +162,17 @@ jobs:
       # reach no kernel on this runner: each one drives a recorded ioctl
       # seam over /dev/null and a pipe, and those recordings are the only
       # pins on the command number and the arguments the kernel is given.
-      # The bindings are still left out of the clippy and MSRV jobs,
-      # because the compile that means something for them is the illumos
-      # one in `cross-check`. Before this, the build host was the one
-      # machine that ran these tests. tools/check-ci-crates.sh asserts
-      # that they stay named here.
+      # The bindings are left out of the MSRV job, because the compile
+      # that means something for them is the illumos one, which
+      # `clippy-illumos` and `cross-check` do. Before this, the build host
+      # was the one machine that ran these tests.
+      # tools/check-ci-crates.sh asserts that they stay named here.
       - run: >
           cargo test --locked
           -p vmm_api_common -p dladm -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
           -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
-          -p fhrun -p bhyve_api_sys -p bhyve_api -p viona_api -p dladm
+          -p fhrun -p bhyve_api_sys -p bhyve_api -p viona_api
       # Release is the profile that ships, and no job ran it. slog drops
       # `debug!` at compile time there and the optimiser changes what a
       # test can observe, so a green debug run says nothing about it. A
@@ -154,7 +183,7 @@ jobs:
           -p vmm_api_common -p dladm -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
           -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
-          -p fhrun -p bhyve_api_sys -p bhyve_api -p viona_api -p dladm
+          -p fhrun -p bhyve_api_sys -p bhyve_api -p viona_api
 
   guest-init:
     name: guest init (musl)
@@ -266,6 +295,16 @@ jobs:
       # else. vmm_tpm_sys asserts the library answers TPM2_GetRandom,
       # which a build that silently produced no library cannot do.
       - run: cargo test --locked -p vmm_tpm -p vmm_tpm_sys
+      # rshyve, the migrate agent and the two TPM crates cannot
+      # cross-compile here (zstd-sys and the libtpms autotools build need
+      # a C toolchain for the target), so this is the only place they can
+      # be linted at all. It is the host target, so rshyve's
+      # `cfg(target_os = "illumos")` bodies are NOT covered; CONTRIBUTING
+      # records the workspace clippy run the illumos build host does.
+      - run: >
+          cargo clippy --locked --all-targets
+          -p rshyve -p vmm-migrate-agent -p vmm_tpm -p vmm_tpm_sys
+          -- -D warnings
 
   supply-chain:
     name: advisories, licenses, sources
