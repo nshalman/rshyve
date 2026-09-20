@@ -4,25 +4,49 @@ set -eu
 
 VM=${VM:-wintest}
 VMM=${VMM:-/opt/rust-bhyve/target/release/rshyve}
-DISK=${DISK:-/tmp/wintest.img}
 ISO=${ISO:-/opt/winassets/winsrv2025-eval.iso}
 ROM=${ROM:-/usr/share/bhyve/uefi-rom.bin}
 VARS=${VARS:-}
 VARS_TEMPLATE=${VARS_TEMPLATE:-/opt/fw/BHYVE_UEFI_VARS.pristine.fd}
-LOGFILE=${LOGFILE:-/tmp/${VM}.log}
-FIFO=${FIFO:-/tmp/${VM}.in}
 MEM=${MEM:-4G}
 CPUS=${CPUS:-2}
-HOLDER=/tmp/${VM}.holder
+
+# This runs as root in the global zone and the subcommands have to find
+# the same files across separate invocations, so the run directory is a
+# fixed name under a root-owned, 0700 directory rather than a predictable
+# name in /tmp. illumos has no protected symlinks, so a planted symlink
+# at a /tmp name would redirect `mkfile` and `cp` here.
+RUNDIR=${RUNDIR:-/var/run/win-boot-test}
+mkdir -p "$RUNDIR"
+chmod 700 "$RUNDIR"
+
+DISK=${DISK:-$RUNDIR/${VM}.img}
+LOGFILE=${LOGFILE:-$RUNDIR/${VM}.log}
+FIFO=${FIFO:-$RUNDIR/${VM}.in}
+HOLDER=$RUNDIR/${VM}.holder
+VMMPID=$RUNDIR/${VM}.vmmpid
 
 usage() {
 	printf 'usage: %s {start|send STRING|log [BYTES]|wait PATTERN [SECS]|status|vars|stop}\n' "$0" >&2
 	exit 2
 }
 
+# Only the VM this script started. These nodes are shared, so a
+# `pkill -9 rshyve` would SIGKILL other people's live guests; the VMM pid
+# is recorded at start and the kernel instance is destroyed by name.
 teardown() {
-	# Brackets keep pkill from matching the remote ssh shell that invoked it.
-	pkill -9 -f 'rshyv[e]' >/dev/null 2>&1 || :
+	if [ -f "$VMMPID" ]; then
+		vmm_pid=$(cat "$VMMPID" 2>/dev/null || :)
+		if [ -n "$vmm_pid" ]; then
+			# Confirm the pid is still this VM's VMM. A pid is
+			# reused, and killing whatever inherited it is the
+			# failure this check exists for.
+			if pgrep -f "$VMM" 2>/dev/null | grep -qx "$vmm_pid"; then
+				kill -9 "$vmm_pid" >/dev/null 2>&1 || :
+			fi
+		fi
+		rm -f "$VMMPID" || :
+	fi
 	/usr/sbin/bhyvectl --vm="$VM" --destroy >/dev/null 2>&1 || :
 	if [ -f "$HOLDER" ]; then
 		holder_pid=$(cat "$HOLDER" 2>/dev/null || :)
@@ -52,6 +76,7 @@ start() {
 		-s 0,hostbridge -s 4,nvme,"$DISK" -s 5,nvme,"$ISO",ro \
 		-s 31,lpc -l "$BOOTROM_ARG" -l com1,stdio "$VM" \
 		> "$LOGFILE" 2>&1 < "$FIFO" &
+	echo $! > "$VMMPID"
 	printf '%s\n' "$!"
 }
 
@@ -93,10 +118,14 @@ case $1 in
 		;;
 	status)
 		[ "$#" -eq 1 ] || usage
-		pids=$(pgrep -f 'rshyv[e]' 2>/dev/null || :)
-		printf 'rshyve pid: %s\n' "${pids:-not running}"
-		if [ -n "$pids" ]; then
-			ps -o pid,pcpu,args -p $pids || :
+		# This VM only. Other rshyve processes on the node belong to
+		# other people.
+		pid=$(cat "$VMMPID" 2>/dev/null || :)
+		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+			printf 'rshyve pid: %s\n' "$pid"
+			ps -o pid,pcpu,args -p "$pid" || :
+		else
+			printf 'rshyve pid: %s\n' 'not running'
 		fi
 		ls /dev/vmm/ || :
 		;;

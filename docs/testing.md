@@ -685,16 +685,22 @@ tools/win-boot-test.sh wait 'Press any key to boot' 120
 tools/win-boot-test.sh send '\r'
 tools/win-boot-test.sh log 4000
 tools/win-boot-test.sh status
-VARS=/tmp/wintest-vars.fd tools/win-boot-test.sh vars
+VARS=/var/run/win-boot-test/wintest-vars.fd tools/win-boot-test.sh vars
 tools/win-boot-test.sh stop
 ```
+
+The disk image, the serial log, the console FIFO and the recorded VMM pid
+all live in `$RUNDIR`, which defaults to `/var/run/win-boot-test` at mode
+0700. `stop` kills the pid it recorded and destroys the VM by name; it
+does not `pkill rshyve`, because these nodes carry other people's live
+guests.
 
 To boot Windows Setup with the install ISO exposed as a CD-ROM, replace the
 fixed NVMe ISO namespace in the harness command with this attachment:
 
 ```bash
 /opt/rust-bhyve/target/release/rshyve -H -c 2 -m 4G \
-  -s 0,hostbridge -s 4,nvme,/tmp/wintest.img \
+  -s 0,hostbridge -s 4,nvme,/var/run/win-boot-test/wintest.img \
   -s 5,ahci-cd,/opt/winassets/winsrv2025-eval.iso \
   -s 31,lpc -l bootrom,/usr/share/bhyve/uefi-rom.bin -l com1,stdio wintest
 ```
