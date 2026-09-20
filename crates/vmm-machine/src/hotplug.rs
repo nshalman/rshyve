@@ -128,6 +128,10 @@ pub enum HotplugError {
     /// devices, so a device added now would never be halted and its
     /// `vmm_drv` lease would park the VM destroy.
     Closed,
+    /// No thread is draining ejects, so the guest's `_EJ0` would never
+    /// be acted on and the slot would stay `RemovePending` for the life
+    /// of the VM.
+    NotDrained,
 }
 
 impl fmt::Display for HotplugError {
@@ -137,6 +141,10 @@ impl fmt::Display for HotplugError {
                 f.write_str("this VM was not started with --hotplug")
             }
             HotplugError::Closed => f.write_str("the VM is shutting down"),
+            HotplugError::NotDrained => f.write_str(
+                "this VM has no hotplug drain thread, so a removal could \
+                 not be finished",
+            ),
             HotplugError::BadSpec(reason) => write!(f, "bad spec: {reason}"),
             HotplugError::FixedSlot(slot) => {
                 write!(f, "PCI slot {slot} is fixed and cannot be plugged")
@@ -196,6 +204,10 @@ struct Core {
     /// Every entry point reads it, the way `VcpuThreads::close` refuses
     /// a late CPU add.
     closed: AtomicBool,
+    /// False when the drain thread was refused at start. An add still
+    /// works; a removal does not, because nothing would act on the
+    /// guest's `_EJ0`.
+    drains: AtomicBool,
     log: Logger,
 }
 
@@ -265,6 +277,12 @@ impl Core {
     fn request_remove(&self, id: &str) -> Result<(), HotplugError> {
         if self.is_closed() {
             return Err(HotplugError::Closed);
+        }
+        if !self.drains.load(Ordering::Acquire) {
+            // Marking the slot would ask the guest for a device nothing
+            // could then take: it would report remove-pending for the
+            // life of the VM and be replayed on the next boot.
+            return Err(HotplugError::NotDrained);
         }
         let device = self
             .registry
@@ -586,6 +604,7 @@ impl HotplugEngine {
             budget: UNPLUG_BUDGET,
             halt_slack: UNPLUG_HALT_SLACK,
             closed: AtomicBool::new(false),
+            drains: AtomicBool::new(true),
             log: log.clone(),
         });
         let thread = DrainThread::spawn(
@@ -595,6 +614,9 @@ impl HotplugEngine {
             &log,
             "no hotplug thread; ejects will not be drained",
         );
+        if thread.is_stopped() {
+            core.drains.store(false, Ordering::Release);
+        }
 
         Arc::new(Self {
             core,

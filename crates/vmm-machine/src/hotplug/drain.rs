@@ -60,7 +60,6 @@ impl DrainThread {
     }
 
     /// Whether the thread has been joined, or never started.
-    #[cfg(test)]
     pub(super) fn is_stopped(&self) -> bool {
         lock(&self.thread).is_none()
     }

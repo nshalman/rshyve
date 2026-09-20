@@ -217,6 +217,7 @@ impl Fixture {
                 budget: Duration::from_millis(20),
                 halt_slack: Duration::from_millis(20),
                 closed: AtomicBool::new(false),
+                drains: AtomicBool::new(true),
                 log: null_log(),
             },
             registry,
@@ -989,6 +990,27 @@ fn a_release_that_never_returns_does_not_park_the_drain_thread() {
     assert_eq!(lifecycle.resumes.load(Ordering::Acquire), 0);
 
     lifecycle.halt_wedges.store(false, Ordering::Release);
+}
+
+/// A refused drain thread means nothing acts on the guest's `_EJ0`, so
+/// the slot would report remove-pending for the life of the VM and be
+/// replayed on the next boot.
+#[test]
+fn a_removal_is_refused_when_no_thread_would_drain_it() {
+    let fixture = Fixture::new();
+    let id = fixture.add("5,virtio-blk,/added").expect("added");
+
+    fixture.core.drains.store(false, Ordering::Release);
+
+    assert_eq!(
+        fixture.core.request_remove(&id),
+        Err(HotplugError::NotDrained),
+    );
+    // The slot is untouched, so the device goes on serving the guest.
+    assert_eq!(
+        fixture.registry.get_by_id(&id).map(|d| d.state),
+        Some(SlotState::Present),
+    );
 }
 
 /// Teardown takes its device list once. Anything added after that is

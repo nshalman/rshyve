@@ -372,13 +372,22 @@ pub fn install_sigterm_handler(machine: &Machine, log: &Logger) {
 /// The same install over a caller-supplied stop.
 pub fn install_sigterm_handler_with(stop: Arc<dyn GuestStop>, log: &Logger) {
     let log_sig = log.clone();
-    // libc::signal returns SIG_ERR on failure; safe to ignore
-    let _ = unsafe {
+    // SAFETY: the handler only stores an atomic, which is
+    // async-signal-safe, and the cast is the one `signal` takes.
+    let installed = unsafe {
         libc::signal(
             libc::SIGTERM,
             sigterm_handler as *const () as libc::sighandler_t,
         )
     };
+    if installed == libc::SIG_ERR {
+        // SIGTERM keeps its default action, so `vmadm stop` kills the
+        // VMM outright: no teardown, no device halt, and the instance
+        // is left to autodestruct.
+        error!(log, "SIGTERM handler not installed; a stop will kill the \
+            VMM with no teardown";
+            "error" => %io::Error::last_os_error());
+    }
     thread::Builder::new()
         .name("shutdown-watchdog".into())
         .spawn(move || {
