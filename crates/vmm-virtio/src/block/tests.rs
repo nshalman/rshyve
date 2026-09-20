@@ -302,6 +302,212 @@ fn a_get_id_without_a_data_segment_reports_an_error() {
     );
 }
 
+/// Overwrite one descriptor of the harness chain.
+fn set_desc(physmap: &PhysMap, base: u64, idx: u64, desc: VirtqDesc) {
+    physmap
+        .lookup(base + idx * 16, 16)
+        .expect("mapped descriptor")
+        .write(&desc)
+        .expect("write descriptor");
+}
+
+/// Read one used-ring entry's `(id, len)`.
+fn used_entry(physmap: &PhysMap, used_gpa: u64, slot: u64) -> (u32, u32) {
+    let entry = physmap
+        .lookup(used_gpa + 4 + slot * 8, 8)
+        .expect("mapped used entry");
+    (
+        entry.read::<u32>().expect("used id"),
+        entry
+            .subregion(4, 4)
+            .expect("used length")
+            .read::<u32>()
+            .expect("read used length"),
+    )
+}
+
+fn status_byte(physmap: &PhysMap, gpa: u64) -> u8 {
+    let mut byte = [0u8; 1];
+    physmap
+        .lookup(gpa, 1)
+        .expect("mapped status byte")
+        .read_bytes(&mut byte)
+        .expect("read status byte");
+    byte[0]
+}
+
+/// The shape a driver actually posts: header, one data buffer, the
+/// status byte. Narrowing GET_ID to the data segment is only right if
+/// this case still answers, and no other test covers it.
+#[test]
+fn a_get_id_answers_into_the_data_segment() {
+    const DESC_GPA: u64 = 0x1000;
+    const USED_GPA: u64 = 0x1200;
+    const HEADER_GPA: u64 = 0x2000;
+    const DATA_GPA: u64 = 0x3000;
+    const STATUS_GPA: u64 = 0x3800;
+
+    let (physmap, queue, block) = make_get_id_queue(4, 1);
+    set_desc(
+        &physmap,
+        DESC_GPA,
+        0,
+        VirtqDesc {
+            addr: HEADER_GPA,
+            len: BLK_REQ_HEADER_SIZE as u32,
+            flags: bits::VRING_DESC_F_NEXT,
+            next: 1,
+        },
+    );
+    set_desc(
+        &physmap,
+        DESC_GPA,
+        1,
+        VirtqDesc {
+            addr: DATA_GPA,
+            len: VIRTIO_BLK_ID_BYTES as u32,
+            flags: bits::VRING_DESC_F_WRITE | bits::VRING_DESC_F_NEXT,
+            next: 2,
+        },
+    );
+    set_desc(
+        &physmap,
+        DESC_GPA,
+        2,
+        VirtqDesc {
+            addr: STATUS_GPA,
+            len: 1,
+            flags: bits::VRING_DESC_F_WRITE,
+            next: 0,
+        },
+    );
+    let mut queues = [queue];
+
+    block.notify_queue(0, &mut queues, &physmap);
+
+    assert_eq!(status_byte(&physmap, STATUS_GPA), bits::VIRTIO_BLK_S_OK);
+    assert_eq!(
+        used_entry(&physmap, USED_GPA, 0),
+        (0, VIRTIO_BLK_ID_BYTES as u32 + 1),
+        "the used length must count the id and the status byte",
+    );
+    let mut id = [0u8; VIRTIO_BLK_ID_BYTES];
+    physmap
+        .lookup(DATA_GPA, VIRTIO_BLK_ID_BYTES)
+        .expect("mapped data buffer")
+        .read_bytes(&mut id)
+        .expect("read data buffer");
+    assert_eq!(&id[..14], b"vmm-virtio-blk");
+}
+
+/// A used length the device did not write tells the guest that bytes of
+/// device id are in a buffer that still holds whatever was there
+/// before, which is an information leak rather than a wrong length.
+#[test]
+fn a_get_id_into_unmapped_memory_reports_an_error() {
+    const DESC_GPA: u64 = 0x1000;
+    const USED_GPA: u64 = 0x1200;
+    const STATUS_GPA: u64 = 0x3800;
+    /// Past the one region the harness maps.
+    const UNMAPPED_GPA: u64 = 0x9000;
+
+    let (physmap, queue, block) = make_get_id_queue(4, 1);
+    set_desc(
+        &physmap,
+        DESC_GPA,
+        1,
+        VirtqDesc {
+            addr: UNMAPPED_GPA,
+            len: VIRTIO_BLK_ID_BYTES as u32,
+            flags: bits::VRING_DESC_F_WRITE | bits::VRING_DESC_F_NEXT,
+            next: 2,
+        },
+    );
+    set_desc(
+        &physmap,
+        DESC_GPA,
+        2,
+        VirtqDesc {
+            addr: STATUS_GPA,
+            len: 1,
+            flags: bits::VRING_DESC_F_WRITE,
+            next: 0,
+        },
+    );
+    let mut queues = [queue];
+
+    block.notify_queue(0, &mut queues, &physmap);
+
+    assert_eq!(status_byte(&physmap, STATUS_GPA), bits::VIRTIO_BLK_S_IOERR);
+    assert_eq!(
+        used_entry(&physmap, USED_GPA, 0),
+        (0, 1),
+        "the device reported id bytes it never wrote",
+    );
+}
+
+/// Nothing stops a driver padding its chain, and an empty buffer is not
+/// the one the answer belongs in: taking it reported one status byte of
+/// device id and left the real buffer untouched.
+#[test]
+fn a_get_id_skips_an_empty_data_buffer() {
+    const DESC_GPA: u64 = 0x1000;
+    const USED_GPA: u64 = 0x1200;
+    const DATA_GPA: u64 = 0x3000;
+    const STATUS_GPA: u64 = 0x3800;
+
+    let (physmap, queue, block) = make_get_id_queue(4, 1);
+    set_desc(
+        &physmap,
+        DESC_GPA,
+        1,
+        VirtqDesc {
+            addr: DATA_GPA,
+            len: 0,
+            flags: bits::VRING_DESC_F_WRITE | bits::VRING_DESC_F_NEXT,
+            next: 2,
+        },
+    );
+    set_desc(
+        &physmap,
+        DESC_GPA,
+        2,
+        VirtqDesc {
+            addr: DATA_GPA + 0x100,
+            len: VIRTIO_BLK_ID_BYTES as u32,
+            flags: bits::VRING_DESC_F_WRITE | bits::VRING_DESC_F_NEXT,
+            next: 3,
+        },
+    );
+    set_desc(
+        &physmap,
+        DESC_GPA,
+        3,
+        VirtqDesc {
+            addr: STATUS_GPA,
+            len: 1,
+            flags: bits::VRING_DESC_F_WRITE,
+            next: 0,
+        },
+    );
+    let mut queues = [queue];
+
+    block.notify_queue(0, &mut queues, &physmap);
+
+    assert_eq!(status_byte(&physmap, STATUS_GPA), bits::VIRTIO_BLK_S_OK);
+    assert_eq!(
+        used_entry(&physmap, USED_GPA, 0),
+        (0, VIRTIO_BLK_ID_BYTES as u32 + 1),
+    );
+    let mut id = [0u8; 14];
+    physmap
+        .lookup(DATA_GPA + 0x100, 14)
+        .expect("mapped data buffer")
+        .read_bytes(&mut id)
+        .expect("read data buffer");
+    assert_eq!(&id, b"vmm-virtio-blk");
+}
+
 #[test]
 fn notify_queue_drains_ring_and_updates_avail_event() {
     let (physmap, queue, block) = make_get_id_queue(4, 2);
@@ -354,6 +560,44 @@ fn a_reprogrammed_ring_gets_its_own_used_ring_writer() {
         .read::<u16>()
         .expect("read old used index");
     assert_eq!(old_used_idx, 1, "the old ring was written after the move");
+}
+
+/// A driver may program a ring again without resetting the device, and
+/// a worker with a request in flight holds its own `Arc` to the writer
+/// that names the old ring. Dropping the cached one leaves that worker
+/// publishing into memory the guest has taken back, so the epoch has to
+/// end with the ring.
+#[test]
+fn a_reprogrammed_ring_ends_the_epoch_that_named_it() {
+    const DESC_GPA: u64 = 0x1000;
+    const AVAIL_GPA: u64 = 0x1100;
+    const NEW_USED_GPA: u64 = 0x1400;
+
+    let (physmap, queue, block) = make_get_id_queue(4, 1);
+    let mut queues = [queue];
+    block.notify_queue(0, &mut queues, &physmap);
+
+    // What a worker holds while its request is in flight. The session
+    // is dropped here: one held across the reprogram would deadlock
+    // against the drain, which is the property `reset` relies on too.
+    let epoch = block
+        .ctx
+        .access
+        .enter_current()
+        .expect("the device admits guest access")
+        .epoch();
+
+    queues[0].set_addr_modern(DESC_GPA, AVAIL_GPA, NEW_USED_GPA);
+    block.queue_addr_set(0, &queues[0]);
+
+    assert!(
+        block.ctx.access.enter(epoch).is_none(),
+        "a worker from the retired epoch can still reach guest memory",
+    );
+    assert!(
+        block.ctx.access.enter_current().is_some(),
+        "the device took no new session, so nothing can run again",
+    );
 }
 
 #[test]
