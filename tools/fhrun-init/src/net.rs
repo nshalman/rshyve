@@ -12,7 +12,7 @@
 //! hand-written message building. The ioctl path is six syscalls, no
 //! parsing, and it has worked unchanged since Linux 2.0.
 
-use std::mem::{size_of, zeroed, MaybeUninit};
+use std::mem::{size_of, zeroed};
 
 use crate::spec::NetConfig;
 
@@ -166,8 +166,8 @@ fn add_default_route(sock: libc::c_int, gateway: u32) -> Result<(), String> {
     const RTF_UP: u16 = 0x1;
     const RTF_GATEWAY: u16 = 0x2;
 
-    let mut buf: MaybeUninit<[u8; 256]> = MaybeUninit::zeroed();
-    let buf_ref: &mut [u8; 256] = unsafe { &mut *buf.as_mut_ptr() };
+    let mut buf = [0u8; 256];
+    let buf_ref = &mut buf;
 
     let dst = build_sockaddr_in(0); // 0.0.0.0
     let gw = build_sockaddr_in(gateway);
