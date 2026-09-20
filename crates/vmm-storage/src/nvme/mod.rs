@@ -317,7 +317,14 @@ impl NvmeController {
         self.gate.resume();
         let workers =
             std::mem::take(&mut *self.workers.lock().expect("workers lock"));
+        // A worker that held the last reference runs this from `Drop`,
+        // so its own handle is in the list. Joining the running thread
+        // would deadlock; it is on its way out either way.
+        let me = thread::current().id();
         for worker in workers {
+            if worker.thread().id() == me {
+                continue;
+            }
             if worker.join().is_err() {
                 slog::error!(self.log, "nvme: I/O worker panicked");
             }
