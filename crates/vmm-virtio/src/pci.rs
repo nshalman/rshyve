@@ -88,7 +88,12 @@ struct VirtioPciState {
     device_feature_select: u32,
     /// Selects which 32-bit half of driver features to write.
     driver_feature_select: u32,
-    /// Per-queue enable flags (modern transport only).
+    /// Whether the driver has made each queue live.
+    ///
+    /// Modern drivers write QUEUE_ENABLE; legacy drivers have no such
+    /// register, so a non-zero QUEUE_PFN sets this instead. A kick is
+    /// gated on the ring addresses rather than on this, which is what a
+    /// migration export reads to decide which queues to carry.
     queue_enabled: Vec<bool>,
     /// Per-queue descriptor table addresses (modern transport).
     queue_desc: Vec<u64>,

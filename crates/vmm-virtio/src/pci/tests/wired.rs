@@ -480,6 +480,52 @@ fn a_legacy_pfn_inside_guest_memory_is_accepted() {
     );
 }
 
+/// Legacy has no QUEUE_ENABLE, so a non-zero PFN is what makes a queue
+/// live. Recording it as disabled made a migration export carry every
+/// legacy queue that way, and the destination restored none of them and
+/// woke none of them, so a migrated legacy guest lost its disk.
+#[test]
+fn a_legacy_pfn_makes_its_queue_live_for_a_migration_export() {
+    use vmm_core::common::WriteOp;
+    let dev = device_with_ram();
+
+    let wo = WriteOp::from_buf(&0u32.to_le_bytes());
+    dev.bar_rw(
+        BarN::BAR0,
+        bits::LEGACY_REG_QUEUE_SELECT.into(),
+        RWOp::Write(&wo),
+    );
+    let pfn = (RING_GPA / vmm_core::common::PAGE_SIZE as u64) as u32;
+    let wo = WriteOp::from_buf(&pfn.to_le_bytes());
+    dev.bar_rw(
+        BarN::BAR0,
+        bits::LEGACY_REG_QUEUE_PFN.into(),
+        RWOp::Write(&wo),
+    );
+
+    assert!(queue_0_enabled(&dev));
+    let exported = dev.export_migrate_queues();
+    assert_eq!(exported.len(), 1, "the programmed queue was not exported");
+    assert!(
+        exported[0].enabled,
+        "a programmed legacy queue exported as disabled",
+    );
+
+    // PFN 0 is how the driver takes the ring down again.
+    let wo = WriteOp::from_buf(&0u32.to_le_bytes());
+    dev.bar_rw(
+        BarN::BAR0,
+        bits::LEGACY_REG_QUEUE_PFN.into(),
+        RWOp::Write(&wo),
+    );
+
+    assert!(!queue_0_enabled(&dev));
+    assert!(
+        dev.export_migrate_queues().is_empty(),
+        "a retired ring was still carried",
+    );
+}
+
 /// A queue programmed outside the enable path, which is what a
 /// migration restore does, is only checked when the device first reads
 /// the ring. It can do no work after that, so the driver has to be told

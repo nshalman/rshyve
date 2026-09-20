@@ -166,9 +166,20 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                         if let Some(q) = vs.selected_queue_mut() {
                             q.reset();
                         }
+                        if let Some(live) = vs.queue_enabled.get_mut(idx) {
+                            *live = false;
+                        }
                         self.refuse_queue(vs, idx, Some(error));
                     }
                     Some(Ok(())) => {
+                        // Legacy has no QUEUE_ENABLE: the PFN is what
+                        // makes a queue live. Leaving this false let a
+                        // migration export record every legacy queue as
+                        // disabled, so the destination restored none of
+                        // them and woke none of them.
+                        if let Some(live) = vs.queue_enabled.get_mut(idx) {
+                            *live = val != 0;
+                        }
                         // Notify the device of the new queue address
                         // (kernel-accelerated devices need to program
                         // their ring addresses at this point)
