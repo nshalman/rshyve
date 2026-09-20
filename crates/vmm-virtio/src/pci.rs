@@ -466,6 +466,20 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         Some(vs)
     }
 
+    /// Whether a kick may reach the backend.
+    ///
+    /// A queue with no ring has nothing to drain, and a backend that
+    /// builds its used-ring writer on the first kick would build it on
+    /// address zero and keep it for the whole session, so the ring the
+    /// driver programs next is never written.
+    fn can_notify(vs: &VirtioPciState, queue_idx: u16) -> bool {
+        vs.status & bits::STATUS_DRIVER_OK != 0
+            && vs
+                .queues
+                .get(usize::from(queue_idx))
+                .is_some_and(VirtQueue::is_configured)
+    }
+
     /// Whether a queue refused the ring addresses on its first use.
     ///
     /// A queue programmed outside the enable path, such as by a

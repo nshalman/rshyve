@@ -146,13 +146,13 @@ pub trait VirtioDevice: Send + Sync + 'static {
         popped > 0 && queue.should_notify_guest(physmap, old_used_idx)
     }
 
-    /// Called when the guest sets a queue address (PFN) during setup.
+    /// Called when the guest programs or retires a queue's ring.
     ///
-    /// Kernel-accelerated devices override this to inform the kernel
-    /// of the queue ring addresses. The default does nothing.
-    fn queue_addr_set(&self, _queue_idx: u16, _queue: &VirtQueue) {
-        // Default: nothing to do for software-emulated devices
-    }
+    /// Kernel-accelerated devices tell the kernel where the ring is.
+    /// Devices that keep a used-ring writer per queue drop it here,
+    /// because it names the ring it was built on. The default does
+    /// nothing.
+    fn queue_addr_set(&self, _queue_idx: u16, _queue: &VirtQueue) {}
 
     /// Get kernel ring indices for migration export. Returns (avail_idx, used_idx).
     /// Software devices return the VirtQueue indices; kernel devices query the kernel.

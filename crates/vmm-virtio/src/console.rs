@@ -91,6 +91,13 @@ struct ConsoleShared {
 }
 
 impl ConsoleShared {
+    /// Drop the used-ring writer and the stashed chains. Chains are
+    /// dropped, not completed: the guest abandons its ring and reposts.
+    fn forget_rx_ring(&self) {
+        *self.rx_completion.lock().expect("rx completion lock") = None;
+        self.pending_rx.lock().expect("pending rx lock").clear();
+    }
+
     /// Move host bytes into posted guest RX chains and publish them.
     fn deliver_rx(&self) {
         // A paused device must not touch guest memory. Bytes stay in
@@ -540,20 +547,17 @@ impl VirtioDevice for VirtioConsole {
         }
     }
 
+    /// The handler and the stashed chains both name the ring they
+    /// came from, so a ring the driver programs again starts empty.
+    fn queue_addr_set(&self, queue_idx: u16, _queue: &VirtQueue) {
+        if queue_idx == CONSOLE_RX_QUEUE {
+            self.shared.forget_rx_ring();
+        }
+    }
+
     fn reset(&self) {
         *self.negotiated_features.lock().expect("features lock") = 0;
-        *self
-            .shared
-            .rx_completion
-            .lock()
-            .expect("rx completion lock") = None;
-        // Chains posted before the reset are dropped, not completed:
-        // the guest abandons its rings across a reset and reposts.
-        self.shared
-            .pending_rx
-            .lock()
-            .expect("pending rx lock")
-            .clear();
+        self.shared.forget_rx_ring();
         // The host-side backlog survives a guest reset: those bytes
         // were accepted from the client and are still owed to the guest.
     }

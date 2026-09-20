@@ -266,6 +266,39 @@ fn notify_queue_drains_ring_and_updates_avail_event() {
     );
 }
 
+/// A ring the driver programs again gets a new used-ring writer.
+/// The writer snapshots the ring it was built on; kept across a
+/// reprogram it writes the old ring and the new one never advances.
+#[test]
+fn a_reprogrammed_ring_gets_its_own_used_ring_writer() {
+    const DESC_GPA: u64 = 0x1000;
+    const AVAIL_GPA: u64 = 0x1100;
+    const USED_GPA: u64 = 0x1200;
+    const NEW_USED_GPA: u64 = 0x1400;
+
+    let (physmap, queue, block) = make_get_id_queue(4, 1);
+    let mut queues = [queue];
+    block.notify_queue(0, &mut queues, &physmap);
+    assert_eq!(queues[0].read_used_ring_idx(&physmap), 1);
+
+    // The driver moves the used ring and reposts its one request.
+    queues[0].set_addr_modern(DESC_GPA, AVAIL_GPA, NEW_USED_GPA);
+    block.queue_addr_set(0, &queues[0]);
+    block.notify_queue(0, &mut queues, &physmap);
+
+    assert_eq!(
+        queues[0].read_used_ring_idx(&physmap),
+        1,
+        "the completion went to the ring the driver gave up",
+    );
+    let old_used_idx = physmap
+        .lookup(USED_GPA + 2, 2)
+        .expect("mapped old used index")
+        .read::<u16>()
+        .expect("read old used index");
+    assert_eq!(old_used_idx, 1, "the old ring was written after the move");
+}
+
 #[test]
 fn device_id_returns_valid_20_bytes() {
     let blk = make_test_block(512 * 1024);

@@ -256,7 +256,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 let Some(mut vs) = self.lock_for_write() else {
                     return;
                 };
-                if vs.status & bits::STATUS_DRIVER_OK == 0 {
+                if !Self::can_notify(&vs, queue_idx) {
                     return;
                 }
                 let did_work = self.device.notify_queue(

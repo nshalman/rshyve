@@ -211,6 +211,25 @@ impl VirtioDevice for VirtioVsock {
         }
     }
 
+    /// The handler snapshots the ring it was built on, so a ring the
+    /// driver programs again needs a new one, and the chains stashed
+    /// from the old ring go with it.
+    fn queue_addr_set(&self, queue_idx: u16, _queue: &VirtQueue) {
+        if queue_idx != VSOCK_RX_QUEUE {
+            return;
+        }
+        *self
+            .shared
+            .rx_completion
+            .lock()
+            .expect("rx completion lock") = None;
+        self.shared
+            .pending_rx
+            .lock()
+            .expect("pending rx lock")
+            .clear();
+    }
+
     fn reset(&self) {
         *self.negotiated_features.lock().expect("features lock") = 0;
         *self

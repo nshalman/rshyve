@@ -186,7 +186,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             }
             bits::LEGACY_REG_QUEUE_NOTIFY => {
                 let queue_idx = val as u16;
-                if vs.status & bits::STATUS_DRIVER_OK == 0 {
+                if !Self::can_notify(&vs, queue_idx) {
                     return;
                 }
                 let did_work = self.device.notify_queue(

@@ -578,6 +578,21 @@ impl VirtioDevice for VirtioBlock {
         0 // not called: notify_queue is overridden
     }
 
+    /// The handler snapshots the ring it was built on, so a ring the
+    /// driver programs again needs a new one. A worker still holding
+    /// the old handler finishes into the old ring, which the driver
+    /// gave up when it moved.
+    fn queue_addr_set(&self, queue_idx: u16, _queue: &VirtQueue) {
+        if let Some(slot) = self
+            .completions
+            .lock()
+            .expect("lock")
+            .get_mut(usize::from(queue_idx))
+        {
+            *slot = None;
+        }
+    }
+
     /// Reset the device, and do not return until no worker can still
     /// write into the guest memory this ring used.
     ///
