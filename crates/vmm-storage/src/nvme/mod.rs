@@ -526,10 +526,12 @@ impl Lifecycle for NvmeController {
             (0..msix_count).map(|v| self.msix.read_entry(v)).collect();
         let msix_enabled = self.msix.is_enabled();
 
-        eprintln!(
-            "[nvme-export] cc={:#x} csts={:#x} aqa={:#x} io_queues={} msix_enabled={}",
-            st.cc, st.csts, st.aqa, st.num_io_queues, msix_enabled,
-        );
+        slog::info!(self.log, "nvme: exporting controller state";
+            "cc" => format!("{:#x}", st.cc),
+            "csts" => format!("{:#x}", st.csts),
+            "aqa" => format!("{:#x}", st.aqa),
+            "io_queues" => st.num_io_queues,
+            "msix_enabled" => msix_enabled);
 
         Some(DeviceMigrateState::Nvme(NvmeMigrateState {
             cc: st.cc,
@@ -553,10 +555,12 @@ impl Lifecycle for NvmeController {
         let DeviceMigrateState::Nvme(mig) = state else {
             return;
         };
-        eprintln!(
-            "[nvme-restore] cc={:#x} csts={:#x} aqa={:#x} io_queues={} msix_enabled={}",
-            mig.cc, mig.csts, mig.aqa, mig.num_io_queues, mig.msix_enabled,
-        );
+        slog::info!(self.log, "nvme: restoring controller state";
+            "cc" => format!("{:#x}", mig.cc),
+            "csts" => format!("{:#x}", mig.csts),
+            "aqa" => format!("{:#x}", mig.aqa),
+            "io_queues" => mig.num_io_queues,
+            "msix_enabled" => mig.msix_enabled);
 
         // Restore PCI BAR addresses and command register
         let bar_writes = self
