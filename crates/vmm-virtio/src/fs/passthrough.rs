@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::fd::RawFd;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::fuse::{self, FuseAttr, FuseEntryOut, FuseStatfsOut};
 
@@ -87,6 +87,42 @@ const DOT_DIR: &CStr = c".";
 
 fn last_os() -> PtError {
     PtError::Io(std::io::Error::last_os_error())
+}
+
+fn errno(code: i32) -> PtError {
+    PtError::Io(std::io::Error::from_raw_os_error(code))
+}
+
+/// Bounds on the host state one guest may hold through this device.
+///
+/// Every cached inode of a regular file or directory and every open
+/// file handle pins one host fd until the guest sends FORGET or
+/// RELEASE, and a guest decides when that is. The VMM has no fd to
+/// spare for a guest that never does: past the process limit its
+/// control socket, console and hotplug paths fail too. So the tables
+/// are capped, and the guest sees ENFILE or EMFILE the way it would
+/// on any full system.
+#[derive(Debug, Clone, Copy)]
+pub struct PtLimits {
+    /// Cached inodes, root included.
+    pub max_inodes: usize,
+    /// Open file and directory handles together.
+    pub max_handles: usize,
+    /// Bytes of directory snapshots across every open directory handle.
+    pub max_snapshot_bytes: usize,
+}
+
+impl Default for PtLimits {
+    /// Sized against the 65536 fds an illumos process may hold once
+    /// [`raise_fd_limit`] has run: inodes and file handles together
+    /// take at most 24576 of them, leaving the rest to the VMM.
+    fn default() -> Self {
+        Self {
+            max_inodes: 16384,
+            max_handles: 8192,
+            max_snapshot_bytes: 64 * 1024 * 1024,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -179,8 +215,15 @@ impl InodeTable {
 
 #[derive(Debug)]
 enum Handle {
-    File { fd: RawFd },
-    Dir { entries: Vec<DirSnapshot> },
+    File {
+        fd: RawFd,
+    },
+    /// Shared with every READDIR that reads it, so a listing copies
+    /// the pointer and not the directory.
+    Dir {
+        entries: Arc<[DirSnapshot]>,
+        bytes: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -190,16 +233,28 @@ struct DirSnapshot {
     ftype: Option<FileType>,
 }
 
+impl DirSnapshot {
+    /// What one entry costs against [`PtLimits::max_snapshot_bytes`].
+    fn cost(&self) -> usize {
+        size_of::<Self>() + self.name.as_bytes_with_nul().len()
+    }
+}
+
 struct HandleTable {
     by_id: HashMap<u64, Handle>,
     next_id: u64,
+    /// Sum of `bytes` over every `Handle::Dir`.
+    snapshot_bytes: usize,
+    limits: PtLimits,
 }
 
 impl HandleTable {
-    fn new() -> Self {
+    fn new(limits: PtLimits) -> Self {
         Self {
             by_id: HashMap::new(),
             next_id: 1,
+            snapshot_bytes: 0,
+            limits,
         }
     }
 
@@ -211,6 +266,41 @@ impl HandleTable {
         }
         id
     }
+
+    /// Room left for another directory snapshot.
+    fn snapshot_budget(&self) -> usize {
+        self.limits
+            .max_snapshot_bytes
+            .saturating_sub(self.snapshot_bytes)
+    }
+
+    /// Add a handle, or refuse it and close what it carries.
+    fn insert(&mut self, handle: Handle) -> PtResult<u64> {
+        if self.by_id.len() >= self.limits.max_handles {
+            if let Handle::File { fd } = handle {
+                unsafe { libc::close(fd) };
+            }
+            return Err(errno(libc::EMFILE));
+        }
+        if let Handle::Dir { bytes, .. } = &handle {
+            if *bytes > self.snapshot_budget() {
+                return Err(errno(libc::ENOMEM));
+            }
+            self.snapshot_bytes += *bytes;
+        }
+        let id = self.alloc_id();
+        self.by_id.insert(id, handle);
+        Ok(id)
+    }
+
+    fn remove(&mut self, fh: u64) -> PtResult<Handle> {
+        let handle =
+            self.by_id.remove(&fh).ok_or(PtError::UnknownHandle(fh))?;
+        if let Handle::Dir { bytes, .. } = &handle {
+            self.snapshot_bytes = self.snapshot_bytes.saturating_sub(*bytes);
+        }
+        Ok(handle)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,12 +309,21 @@ impl HandleTable {
 
 pub struct Passthrough {
     read_only: bool,
+    limits: PtLimits,
     inodes: Mutex<InodeTable>,
     handles: Mutex<HandleTable>,
 }
 
 impl Passthrough {
     pub fn new(path: &Path, read_only: bool) -> PtResult<Self> {
+        Self::with_limits(path, read_only, PtLimits::default())
+    }
+
+    pub fn with_limits(
+        path: &Path,
+        read_only: bool,
+        limits: PtLimits,
+    ) -> PtResult<Self> {
         let cpath = path_cstring(path)?;
         let fd = unsafe {
             libc::open(
@@ -257,8 +356,9 @@ impl Passthrough {
 
         Ok(Self {
             read_only,
+            limits,
             inodes: Mutex::new(inodes),
-            handles: Mutex::new(HandleTable::new()),
+            handles: Mutex::new(HandleTable::new(limits)),
         })
     }
 
@@ -276,9 +376,7 @@ impl Passthrough {
 
         let parent_fd = self.with_inode(parent, |ino| match ino.fd {
             Some(fd) if ino.ftype == FileType::Directory => Ok(fd),
-            _ => Err(PtError::Io(std::io::Error::from_raw_os_error(
-                libc::ENOTDIR,
-            ))),
+            _ => Err(errno(libc::ENOTDIR)),
         })?;
 
         // Probe the child with fstatat first — this tells us if it's a
@@ -318,6 +416,12 @@ impl Passthrough {
             }
             existing
         } else {
+            if inodes.by_id.len() >= self.limits.max_inodes {
+                if let Some(fd) = fd_opt {
+                    unsafe { libc::close(fd) };
+                }
+                return Err(errno(libc::ENFILE));
+            }
             let id = inodes.alloc_id();
             let (sym_parent, sym_name) = if ftype == FileType::Symlink {
                 (Some(parent), Some(name.to_owned()))
@@ -388,9 +492,7 @@ impl Passthrough {
 
     pub fn statfs(&self, nodeid: u64) -> PtResult<FuseStatfsOut> {
         let fd = self.with_inode(nodeid, |ino| {
-            ino.fd.ok_or_else(|| {
-                PtError::Io(std::io::Error::from_raw_os_error(libc::EBADF))
-            })
+            ino.fd.ok_or_else(|| errno(libc::EBADF))
         })?;
         let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::fstatvfs(fd, &mut vfs) };
@@ -423,22 +525,14 @@ impl Passthrough {
     pub fn readlink(&self, nodeid: u64) -> PtResult<Vec<u8>> {
         let (parent_fd, name) = self.with_inode(nodeid, |ino| {
             if ino.ftype != FileType::Symlink {
-                return Err(PtError::Io(std::io::Error::from_raw_os_error(
-                    libc::EINVAL,
-                )));
+                return Err(errno(libc::EINVAL));
             }
-            let parent = ino.sym_parent.ok_or_else(|| {
-                PtError::Io(std::io::Error::from_raw_os_error(libc::EIO))
-            })?;
-            let name = ino.sym_name.clone().ok_or_else(|| {
-                PtError::Io(std::io::Error::from_raw_os_error(libc::EIO))
-            })?;
+            let parent = ino.sym_parent.ok_or_else(|| errno(libc::EIO))?;
+            let name = ino.sym_name.clone().ok_or_else(|| errno(libc::EIO))?;
             Ok((parent, name))
         })?;
         let pfd = self.with_inode(parent_fd, |p| {
-            p.fd.ok_or_else(|| {
-                PtError::Io(std::io::Error::from_raw_os_error(libc::EBADF))
-            })
+            p.fd.ok_or_else(|| errno(libc::EBADF))
         })?;
 
         let mut buf = vec![0u8; libc::PATH_MAX as usize];
@@ -469,23 +563,19 @@ impl Passthrough {
 
         let new_fd = self.with_inode(nodeid, |ino| {
             if ino.ftype != FileType::Regular {
-                return Err(PtError::Io(std::io::Error::from_raw_os_error(
-                    libc::EISDIR,
-                )));
+                return Err(errno(libc::EISDIR));
             }
-            let fd = ino.fd.ok_or_else(|| {
-                PtError::Io(std::io::Error::from_raw_os_error(libc::EBADF))
-            })?;
+            let fd = ino.fd.ok_or_else(|| errno(libc::EBADF))?;
             // The data-path flags only. The file already exists and its
             // identity is fixed by `fd`, so O_CREAT, O_EXCL, O_DIRECTORY
             // and O_NOFOLLOW have nothing to say on a reopen.
             reopen_fd(fd, flags.host_io_flags())
         })?;
 
-        let mut handles = self.handles.lock().unwrap();
-        let id = handles.alloc_id();
-        handles.by_id.insert(id, Handle::File { fd: new_fd });
-        Ok(id)
+        self.handles
+            .lock()
+            .unwrap()
+            .insert(Handle::File { fd: new_fd })
     }
 
     /// FUSE_CREATE: atomic create-and-open. `flags` is the guest's Linux
@@ -559,6 +649,12 @@ impl Passthrough {
                 }
                 existing
             } else {
+                if inodes.by_id.len() >= self.limits.max_inodes {
+                    drop(inodes);
+                    unsafe { libc::close(ino_fd) };
+                    unsafe { libc::close(fh_fd) };
+                    return Err(errno(libc::ENFILE));
+                }
                 let id = inodes.alloc_id();
                 inodes.by_id.insert(
                     id,
@@ -587,16 +683,17 @@ impl Passthrough {
             attr: stat_to_attr(&st),
         };
 
-        let fh = {
-            let mut handles = self.handles.lock().unwrap();
-            let id = handles.alloc_id();
-            handles.by_id.insert(id, Handle::File { fd: fh_fd });
-            id
-        };
+        // The inode entry above holds a lookup the guest will FORGET
+        // whatever happens to the handle, so a refused handle leaves
+        // the table consistent.
+        let fh = self
+            .handles
+            .lock()
+            .unwrap()
+            .insert(Handle::File { fd: fh_fd })?;
 
-        // third return: whether we actually created (always true on this
-        // path; FUSE_CREATE does not have a "found existing" case since
-        // O_CREAT without O_EXCL opens the existing file).
+        // FUSE_CREATE has no "found existing" case: O_CREAT without
+        // O_EXCL opens the existing file, so this is always true.
         Ok((entry, fh, true))
     }
 
@@ -768,9 +865,7 @@ impl Passthrough {
             if ino.ftype != FileType::Regular {
                 return Err(PtError::UnsupportedType);
             }
-            ino.fd.ok_or_else(|| {
-                PtError::Io(std::io::Error::from_raw_os_error(libc::EBADF))
-            })
+            ino.fd.ok_or_else(|| errno(libc::EBADF))
         })?;
         let new_parent_fd = self.parent_fd(new_parent)?;
 
@@ -822,9 +917,7 @@ impl Passthrough {
             }
         } else {
             self.with_inode(nodeid, |ino| {
-                ino.fd.ok_or_else(|| {
-                    PtError::Io(std::io::Error::from_raw_os_error(libc::EBADF))
-                })
+                ino.fd.ok_or_else(|| errno(libc::EBADF))
             })?
         };
 
@@ -896,11 +989,7 @@ impl Passthrough {
             let handles = self.handles.lock().unwrap();
             match handles.by_id.get(&fh) {
                 Some(Handle::File { fd, .. }) => *fd,
-                Some(_) => {
-                    return Err(PtError::Io(std::io::Error::from_raw_os_error(
-                        libc::EISDIR,
-                    )))
-                }
+                Some(_) => return Err(errno(libc::EISDIR)),
                 None => return Err(PtError::UnknownHandle(fh)),
             }
         };
@@ -958,19 +1047,13 @@ impl Passthrough {
     }
 
     pub fn release(&self, fh: u64) -> PtResult<()> {
-        let mut handles = self.handles.lock().unwrap();
-        let handle = handles
-            .by_id
-            .remove(&fh)
-            .ok_or(PtError::UnknownHandle(fh))?;
+        let handle = self.handles.lock().unwrap().remove(fh)?;
         match handle {
             Handle::File { fd, .. } => {
                 unsafe { libc::close(fd) };
             }
             Handle::Dir { .. } => {
-                return Err(PtError::Io(std::io::Error::from_raw_os_error(
-                    libc::EBADF,
-                )));
+                return Err(errno(libc::EBADF));
             }
         }
         Ok(())
@@ -981,11 +1064,7 @@ impl Passthrough {
             let handles = self.handles.lock().unwrap();
             match handles.by_id.get(&fh) {
                 Some(Handle::File { fd, .. }) => *fd,
-                Some(_) => {
-                    return Err(PtError::Io(std::io::Error::from_raw_os_error(
-                        libc::EISDIR,
-                    )))
-                }
+                Some(_) => return Err(errno(libc::EISDIR)),
                 None => return Err(PtError::UnknownHandle(fh)),
             }
         };
@@ -1008,13 +1087,9 @@ impl Passthrough {
     pub fn opendir(&self, nodeid: u64) -> PtResult<u64> {
         let dir_fd = self.with_inode(nodeid, |ino| {
             if ino.ftype != FileType::Directory {
-                return Err(PtError::Io(std::io::Error::from_raw_os_error(
-                    libc::ENOTDIR,
-                )));
+                return Err(errno(libc::ENOTDIR));
             }
-            let fd = ino.fd.ok_or_else(|| {
-                PtError::Io(std::io::Error::from_raw_os_error(libc::EBADF))
-            })?;
+            let fd = ino.fd.ok_or_else(|| errno(libc::EBADF))?;
             // A `dup` would share the cached fd's open file description
             // and with it the directory offset, which readdir leaves at
             // EOF for every later OPENDIR of the same inode. Opening "."
@@ -1029,6 +1104,12 @@ impl Passthrough {
             return Err(last_os());
         }
 
+        // Read against the room left now, so a directory too big for
+        // the budget is refused before it is held in memory. The FUSE
+        // worker is the only caller, so the room cannot shrink under
+        // this loop; `insert` checks again regardless.
+        let budget = self.handles.lock().unwrap().snapshot_budget();
+        let mut bytes = 0usize;
         let mut entries = Vec::new();
         loop {
             set_errno(0);
@@ -1054,36 +1135,37 @@ impl Passthrough {
                 // Skip — FUSE layer doesn't want these (client handles them).
                 continue;
             }
-            let name = CString::new(name_bytes)
-                .map_err(|_| PtError::InvalidName(name_bytes.to_vec()))?;
-
-            entries.push(DirSnapshot {
-                name,
+            // `d_name` is NUL-terminated, so the copy cannot hold an
+            // interior NUL.
+            let entry = DirSnapshot {
+                name: name_cstr.to_owned(),
                 ino: dirent.d_ino as u64,
                 ftype: None,
-            });
+            };
+            bytes = bytes.saturating_add(entry.cost());
+            if bytes > budget {
+                unsafe { libc::closedir(dirp) };
+                return Err(errno(libc::ENOMEM));
+            }
+            entries.push(entry);
         }
 
         // closedir also closes the underlying fd.
         unsafe { libc::closedir(dirp) };
 
-        let mut handles = self.handles.lock().unwrap();
-        let id = handles.alloc_id();
-        handles.by_id.insert(id, Handle::Dir { entries });
-        Ok(id)
+        self.handles.lock().unwrap().insert(Handle::Dir {
+            entries: Arc::from(entries),
+            bytes,
+        })
     }
 
     pub fn releasedir(&self, fh: u64) -> PtResult<()> {
-        let mut handles = self.handles.lock().unwrap();
-        let handle = handles
-            .by_id
-            .remove(&fh)
-            .ok_or(PtError::UnknownHandle(fh))?;
+        let handle = self.handles.lock().unwrap().remove(fh)?;
         match handle {
             Handle::Dir { .. } => Ok(()),
             Handle::File { fd, .. } => {
                 unsafe { libc::close(fd) };
-                Err(PtError::Io(std::io::Error::from_raw_os_error(libc::EBADF)))
+                Err(errno(libc::EBADF))
             }
         }
     }
@@ -1100,12 +1182,8 @@ impl Passthrough {
     ) -> PtResult<()> {
         let handles = self.handles.lock().unwrap();
         let snap = match handles.by_id.get(&fh) {
-            Some(Handle::Dir { entries, .. }) => entries.clone(),
-            Some(_) => {
-                return Err(PtError::Io(std::io::Error::from_raw_os_error(
-                    libc::ENOTDIR,
-                )))
-            }
+            Some(Handle::Dir { entries, .. }) => Arc::clone(entries),
+            Some(_) => return Err(errno(libc::ENOTDIR)),
             None => return Err(PtError::UnknownHandle(fh)),
         };
         drop(handles);
@@ -1143,17 +1221,11 @@ impl Passthrough {
             (_, Some(fd), _) => fstat(fd),
             (FileType::Symlink, None, Some((parent, name))) => {
                 let pfd = self.with_inode(parent, |p| {
-                    p.fd.ok_or_else(|| {
-                        PtError::Io(std::io::Error::from_raw_os_error(
-                            libc::EBADF,
-                        ))
-                    })
+                    p.fd.ok_or_else(|| errno(libc::EBADF))
                 })?;
                 fstatat_nofollow(pfd, name.as_c_str())
             }
-            _ => Err(PtError::Io(std::io::Error::from_raw_os_error(
-                libc::ESTALE,
-            ))),
+            _ => Err(errno(libc::ESTALE)),
         }
     }
 
@@ -1172,12 +1244,8 @@ impl Passthrough {
     fn parent_fd(&self, nodeid: u64) -> PtResult<RawFd> {
         self.with_inode(nodeid, |ino| match ino.fd {
             Some(fd) if ino.ftype == FileType::Directory => Ok(fd),
-            Some(_) => Err(PtError::Io(std::io::Error::from_raw_os_error(
-                libc::ENOTDIR,
-            ))),
-            None => {
-                Err(PtError::Io(std::io::Error::from_raw_os_error(libc::EBADF)))
-            }
+            Some(_) => Err(errno(libc::ENOTDIR)),
+            None => Err(errno(libc::EBADF)),
         })
     }
 
@@ -1200,6 +1268,7 @@ impl Passthrough {
         }
         handles.by_id.clear();
         handles.next_id = 1;
+        handles.snapshot_bytes = 0;
         drop(handles);
 
         let mut inodes = self
@@ -1303,12 +1372,48 @@ pub fn validate_name(name: &[u8]) -> PtResult<()> {
     Ok(())
 }
 
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit.
+///
+/// The soft limit is a few thousand by default and every cached inode
+/// costs one fd, so a guest listing a large tree would hit it long
+/// before [`PtLimits`] does, and every fd-consuming path in the VMM
+/// would fail with it. Returns the soft limit now in force.
+pub fn raise_fd_limit() -> std::io::Result<libc::rlim_t> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let target = fd_limit_target(lim.rlim_max);
+    if lim.rlim_cur >= target {
+        return Ok(lim.rlim_cur);
+    }
+    lim.rlim_cur = target;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(target)
+}
+
+/// macOS refuses a soft `RLIMIT_NOFILE` above `OPEN_MAX` even when the
+/// hard limit reads as unlimited. Development hosts only; illumos takes
+/// its hard limit as it stands.
+#[cfg(target_os = "macos")]
+fn fd_limit_target(hard: libc::rlim_t) -> libc::rlim_t {
+    hard.min(10240)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fd_limit_target(hard: libc::rlim_t) -> libc::rlim_t {
+    hard
+}
+
 /// Translate the guest's Linux open flags, refusing bits this server
 /// does not know rather than guessing at a host meaning for them.
 fn parse_open_flags(flags: u32) -> PtResult<fuse::OpenFlags> {
-    fuse::OpenFlags::from_linux(flags).map_err(|_| {
-        PtError::Io(std::io::Error::from_raw_os_error(libc::EINVAL))
-    })
+    fuse::OpenFlags::from_linux(flags).map_err(|_| errno(libc::EINVAL))
 }
 
 fn fstat(fd: RawFd) -> PtResult<libc::stat> {
@@ -1599,6 +1704,142 @@ mod tests {
         seen_second.sort();
         assert_eq!(seen_first, [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
         assert_eq!(seen_second, seen_first, "the second snapshot differs");
+    }
+
+    #[cfg(unix)]
+    fn limited(dir: &tempfile::TempDir, limits: PtLimits) -> Passthrough {
+        Passthrough::with_limits(dir.path(), false, limits).expect("open temp")
+    }
+
+    #[cfg(unix)]
+    fn name(s: &str) -> CString {
+        CString::new(s).expect("name")
+    }
+
+    // Every cached inode pins a host fd until the guest FORGETs it, and
+    // the guest decides when that is.
+    #[cfg(unix)]
+    #[test]
+    fn the_inode_table_is_capped_and_forget_makes_room() {
+        let dir = private_dir();
+        for n in ["a", "b"] {
+            std::fs::write(dir.path().join(n), b"x").expect("seed");
+        }
+        // Root takes one of the two.
+        let pt = limited(
+            &dir,
+            PtLimits {
+                max_inodes: 2,
+                ..PtLimits::default()
+            },
+        );
+
+        let a = pt.lookup(fuse::FUSE_ROOT_ID, &name("a")).expect("a fits");
+        let refused = pt.lookup(fuse::FUSE_ROOT_ID, &name("b")).unwrap_err();
+        assert_eq!(refused.to_errno(), libc::ENFILE);
+        // A hit on a cached inode costs no fd and is still served.
+        pt.lookup(fuse::FUSE_ROOT_ID, &name("a")).expect("a again");
+
+        pt.forget(a.nodeid, 2);
+        pt.lookup(fuse::FUSE_ROOT_ID, &name("b"))
+            .expect("b fits now");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_is_held_to_the_inode_cap() {
+        let dir = private_dir();
+        let pt = limited(
+            &dir,
+            PtLimits {
+                max_inodes: 1,
+                ..PtLimits::default()
+            },
+        );
+        let flags = lx::O_WRONLY | lx::O_CREAT;
+        let refused = pt
+            .create(fuse::FUSE_ROOT_ID, &name("n"), flags, 0o644, 0)
+            .unwrap_err();
+        assert_eq!(refused.to_errno(), libc::ENFILE);
+        assert!(pt.handles.lock().unwrap().by_id.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_handle_table_is_capped_and_release_makes_room() {
+        let dir = private_dir();
+        let pt = limited(
+            &dir,
+            PtLimits {
+                max_handles: 1,
+                ..PtLimits::default()
+            },
+        );
+        let fh = pt.opendir(fuse::FUSE_ROOT_ID).expect("first fits");
+        let refused = pt.opendir(fuse::FUSE_ROOT_ID).unwrap_err();
+        assert_eq!(refused.to_errno(), libc::EMFILE);
+        pt.releasedir(fh).expect("release");
+        pt.opendir(fuse::FUSE_ROOT_ID).expect("fits again");
+    }
+
+    // A directory is snapshotted whole at OPENDIR, and the guest picks
+    // how many snapshots it holds.
+    #[cfg(unix)]
+    #[test]
+    fn directory_snapshots_are_held_to_a_byte_budget() {
+        let dir = private_dir();
+        for i in 0..8 {
+            std::fs::write(dir.path().join(format!("f{i}")), b"x")
+                .expect("seed");
+        }
+        // Room for one snapshot of this directory, not two.
+        let one = 8 * (size_of::<DirSnapshot>() + 3);
+        let pt = limited(
+            &dir,
+            PtLimits {
+                max_snapshot_bytes: one + one / 2,
+                ..PtLimits::default()
+            },
+        );
+        let fh = pt.opendir(fuse::FUSE_ROOT_ID).expect("first fits");
+        let refused = pt.opendir(fuse::FUSE_ROOT_ID).unwrap_err();
+        assert_eq!(refused.to_errno(), libc::ENOMEM);
+        pt.releasedir(fh).expect("release");
+        pt.opendir(fuse::FUSE_ROOT_ID).expect("fits again");
+        pt.clear();
+        assert_eq!(pt.handles.lock().unwrap().snapshot_bytes, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readdir_shares_one_snapshot_across_reads() {
+        let dir = private_dir();
+        std::fs::write(dir.path().join("f"), b"x").expect("seed");
+        let pt = Passthrough::new(dir.path(), true).expect("open temp");
+        let fh = pt.opendir(fuse::FUSE_ROOT_ID).expect("opendir");
+        assert_eq!(listing(&pt, fh), listing(&pt, fh));
+        let handles = pt.handles.lock().unwrap();
+        let Some(Handle::Dir { entries, .. }) = handles.by_id.get(&fh) else {
+            panic!("no dir handle");
+        };
+        assert_eq!(Arc::strong_count(entries), 1, "a listing kept a copy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_fd_limit_is_raised_to_the_hard_limit() {
+        let soft = raise_fd_limit().expect("raise");
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) },
+            0
+        );
+        assert_eq!(lim.rlim_cur, soft);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(lim.rlim_cur, lim.rlim_max);
     }
 
     #[cfg(unix)]

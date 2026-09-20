@@ -155,6 +155,16 @@ impl VirtioFs {
         physmap: Arc<PhysMap>,
         log: slog::Logger,
     ) -> anyhow::Result<Self> {
+        // Process-wide, and idempotent, so every device may do it.
+        match passthrough::raise_fd_limit() {
+            Ok(soft) => {
+                slog::debug!(log, "virtio-fs fd limit"; "soft" => soft)
+            }
+            Err(error) => slog::warn!(
+                log,
+                "virtio-fs could not raise the fd limit"; "error" => %error
+            ),
+        }
         let pt = Passthrough::new(&opts.path, opts.read_only).map_err(|e| {
             anyhow::anyhow!(
                 "open passthrough root '{}': {}",
