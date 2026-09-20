@@ -199,26 +199,32 @@ pub(crate) fn create_pci_device(
 /// SECURITY: the same closure the boot-time `-s` pass drives, so a
 /// control request can name no driver and no path that a command line
 /// could not. See the trust note in `crate::control`.
+/// Refuse a spec that only the startup argv may carry.
+///
+/// Split out of the factory so the policy is testable without a live
+/// VM: everything here is decided from the spec string alone.
+fn check_hot_add(spec: &str) -> anyhow::Result<()> {
+    let (_, driver, _) = split_spec(spec)?;
+    // Accepted in the startup argv because the brand forces it there.
+    // Hot-add is firehyve's own interface, so a name that attaches
+    // nothing is refused instead of reported as added.
+    anyhow::ensure!(
+        !IGNORED.contains(&driver),
+        "firehyve cannot add '{driver}' at run time: it has no frame buffer"
+    );
+    // A vsock control slot is armed once, at startup. One added later
+    // would hand the guest a socket that answers nothing.
+    anyhow::ensure!(
+        driver != "virtio-vsock",
+        "virtio-vsock cannot be added at run time: its CONTROL slot is \
+         armed at startup"
+    );
+    Ok(())
+}
+
 pub(crate) fn hotplug_factory(num_cpus: u32) -> vmm_machine::HotplugFactory {
     Box::new(move |spec, ctx| {
-        // A vsock device carries the control slot this interface is
-        // served on, and a slot is armed once, at startup. Adding one
-        // later would hand the guest a socket that answers nothing, so
-        // it is refused before anything is built.
-        let (_, driver, _) = split_spec(spec)?;
-        // Accepted in the startup argv because the brand forces it
-        // there. Hot-add is firehyve's own interface, so a name that
-        // attaches nothing is refused instead of reported as added.
-        anyhow::ensure!(
-            !IGNORED.contains(&driver),
-            "firehyve cannot add '{driver}' at run time: it has no \
-             frame buffer"
-        );
-        anyhow::ensure!(
-            driver != "virtio-vsock",
-            "virtio-vsock cannot be added at run time: its CONTROL slot \
-             is armed at startup"
-        );
+        check_hot_add(spec)?;
         let mut slots = Vec::new();
         let created = create_pci_device(spec, num_cpus, ctx, &mut slots)?;
         debug_assert!(slots.is_empty(), "only vsock yields a control slot");
@@ -289,20 +295,21 @@ mod tests {
     /// The startup relaxation must not reach hot-add. A hot-add that
     /// reports success and attaches nothing would be a lie.
     ///
-    /// Mutation this kills: removing the IGNORED guard from
-    /// hotplug_factory.
+    /// Mutation this kills: dropping either guard from `check_hot_add`.
     #[test]
     fn a_display_device_is_still_refused_at_run_time() {
-        let src = include_str!("devices.rs");
-        let start = src
-            .find("pub(crate) fn hotplug_factory")
-            .expect("hotplug_factory");
-        let body = &src[start..];
-        let end = body.find("\n}").expect("end of function");
-        assert!(
-            body[..end].contains("IGNORED.contains"),
-            "hot-add does not refuse the ignored names"
-        );
+        for driver in IGNORED {
+            let spec = format!("6,{driver}");
+            let err = check_hot_add(&spec)
+                .expect_err("an ignored startup name must not be hot-added");
+            assert!(err.to_string().contains(driver), "{driver}: {err}");
+        }
+
+        let err = check_hot_add("6,virtio-vsock,/tmp/v.sock")
+            .expect_err("a vsock CONTROL slot is armed at startup only");
+        assert!(err.to_string().contains("CONTROL"), "{err}");
+
+        check_hot_add("6,virtio-rnd").expect("a real device is addable");
     }
 
     #[test]
