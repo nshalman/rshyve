@@ -57,11 +57,11 @@ use vmm_core::mem::PhysMap;
 use vmm_devices::quiesce::NamedDevice;
 use vmm_devices::DeviceMigrateState;
 use vmm_machine::signal::GuestStop;
-use vmm_machine::{DeviceRegistry, HotplugEngines};
+use vmm_machine::{DeviceRegistry, HotplugEngines, SUSPEND_SOURCE_VMM};
 
 use crate::host_state::HostLocalState;
 
-pub use listener::spawn_control_thread;
+pub use listener::{spawn_control_thread, ControlListener};
 
 // ── Error type ──────────────────────────────────────────────────────
 
@@ -103,6 +103,14 @@ impl VmRunState {
 pub struct VmController {
     state: AtomicU8,
     hdl: Arc<VmmHdl>,
+    /// The pause `Command::Pause` takes.
+    ///
+    /// Shared with the PCI hot-add engine, because the kernel keeps one
+    /// pause flag per instance and the engine pauses the whole VM for
+    /// each bus change. The guest picks when that happens, so without
+    /// the shared count an operator `pause` landing inside an eject was
+    /// answered `EALREADY` and reported as failed.
+    pause_gate: Arc<vmm_machine::VmPauseGate>,
     physmap: Arc<PhysMap>,
     vm_name: String,
     num_cpus: u32,
@@ -162,9 +170,11 @@ impl VmController {
         log: Logger,
     ) -> Arc<Self> {
         let name = vm_name.to_string();
+        let pause_gate = hotplug.pause_gate(&hdl);
         Arc::new(Self {
             state: AtomicU8::new(VmRunState::Running as u8),
             hdl,
+            pause_gate,
             physmap,
             vm_name: name,
             num_cpus,
@@ -290,46 +300,70 @@ impl VmController {
     }
 
     /// End a VM whose guest now runs on another host.
-    ///
-    /// A caller that does not win [`VmController::begin_stop`] leaves
-    /// the release to the one that did.
     pub(super) fn release_migrated_source(&self) -> io::Result<()> {
-        if !self.begin_stop() {
-            return Ok(());
-        }
-        release_paused_vm(
-            || self.hdl.suspend(SuspendHow::Halt, 0).map(|_| ()),
-            || self.hdl.resume(),
-        )
+        self.latch_stop(SuspendHow::Halt)
+            .map(drop)
+            .map_err(Into::into)
     }
 
-    /// Move to `Stopping`, and say whether this caller is the one that
-    /// must resume a parked VM before its vCPUs can see the stop.
+    /// Take ownership of the stop, moving the VM to `Stopping`.
     ///
-    /// The compare-and-swap is what makes the resume happen once,
-    /// however many stops arrive at once. A second resume would meet
-    /// an instance that is not paused, which is a kernel level
-    /// mistake and not a userspace one.
-    pub(super) fn begin_stop(&self) -> bool {
-        let from = self.state();
-        let parked = stop_needs_resume(from, self.migrated_away())
-            && self.transition(from, VmRunState::Stopping);
-        if !parked {
-            self.state
-                .store(VmRunState::Stopping as u8, Ordering::Release);
-        }
-        parked
+    /// The compare-and-swap is what makes the suspend and the resume
+    /// happen once, however many stops arrive at once. A second suspend
+    /// is answered `EALREADY` and a second resume would meet an
+    /// instance that is not paused, which is a kernel level mistake and
+    /// not a userspace one.
+    fn begin_stop(&self) -> StopOwner {
+        claim_stop(&self.state, self.migrated_away())
     }
 
-    /// Latch `how`, then let a parked VM see it.
-    fn stop_for_signal(&self, how: SuspendHow) -> io::Result<()> {
-        if !self.begin_stop() {
-            return self.hdl.suspend(how, 0).map(|_| ());
+    /// Latch `how` and report the state the VM is really in.
+    ///
+    /// A parked VM is suspended first and resumed second, which is the
+    /// order [`release_paused_vm`] documents: resuming first would run
+    /// guest instructions the operator asked to stop. A suspend that
+    /// fails therefore leaves the VM as it was, kernel and device
+    /// workers together, instead of half resumed.
+    pub(super) fn latch_stop(
+        &self,
+        how: SuspendHow,
+    ) -> Result<VmRunState, StopFailure<io::Error>> {
+        let from = self.state();
+        match self.begin_stop() {
+            // Another caller latched it. The suspend is on the
+            // instance, so `Stopping` is the truth.
+            StopOwner::Elsewhere => Ok(VmRunState::Stopping),
+            StopOwner::Running => {
+                match self.hdl.suspend(how, SUSPEND_SOURCE_VMM) {
+                    Ok(_) => Ok(VmRunState::Stopping),
+                    Err(e) => {
+                        self.state.store(from as u8, Ordering::Release);
+                        Err(StopFailure::NotLatched(e))
+                    }
+                }
+            }
+            StopOwner::Parked => {
+                match release_paused_vm(
+                    || self.hdl.suspend(how, SUSPEND_SOURCE_VMM).map(drop),
+                    || self.hdl.resume(),
+                ) {
+                    Ok(()) => Ok(VmRunState::Stopping),
+                    Err(StopFailure::NotLatched(e)) => {
+                        self.state.store(from as u8, Ordering::Release);
+                        Err(StopFailure::NotLatched(e))
+                    }
+                    // The stop is latched, so the VM is stopping even
+                    // though its vCPUs are still parked. Rolling the
+                    // state back would claim it is not.
+                    Err(failed) => Err(failed),
+                }
+            }
         }
-        release_paused_vm(
-            || self.hdl.suspend(how, 0).map(|_| ()),
-            || self.hdl.resume(),
-        )
+    }
+
+    /// Latch `how` from a signal handler's stop.
+    fn stop_for_signal(&self, how: SuspendHow) -> io::Result<()> {
+        self.latch_stop(how).map(drop).map_err(Into::into)
     }
 
     /// The same release from a path with nobody to hand an error to.
@@ -362,6 +396,17 @@ impl VmController {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    /// Take the operator's hold on the kernel pause.
+    fn hold_pause(&self) -> anyhow::Result<()> {
+        vmm_machine::VmPause::pause(self.pause_gate.as_ref())
+    }
+
+    /// Give up the operator's hold. The instance runs again once the
+    /// hot-unplug path has given up any hold of its own.
+    fn release_pause(&self) -> anyhow::Result<()> {
+        vmm_machine::VmPause::resume(self.pause_gate.as_ref())
     }
 
     /// Pause all devices: signal each to quiesce, then wait for all
@@ -421,6 +466,73 @@ fn grace_must_release(state: VmRunState) -> bool {
     state == VmRunState::Stopped
 }
 
+/// Take ownership of the stop by moving `state` to `Stopping`.
+///
+/// Free of the controller so the race two stops run has a test.
+fn claim_stop(state: &AtomicU8, migrated_away: bool) -> StopOwner {
+    loop {
+        let from = VmRunState::from_u8(state.load(Ordering::Acquire));
+        if from == VmRunState::Stopping {
+            return StopOwner::Elsewhere;
+        }
+        let parked = stop_needs_resume(from, migrated_away);
+        // A losing swap means the state moved under this read, so read
+        // it again rather than acting on the stale one.
+        if state
+            .compare_exchange(
+                from as u8,
+                VmRunState::Stopping as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            continue;
+        }
+        return if parked {
+            StopOwner::Parked
+        } else {
+            StopOwner::Running
+        };
+    }
+}
+
+/// Who owns a stop that several callers can ask for at once.
+#[derive(Debug, PartialEq, Eq)]
+enum StopOwner {
+    /// This caller latched it on a running VM.
+    Running,
+    /// This caller latched it on a VM whose vCPUs are parked on the
+    /// kernel's pause, so it also owns the resume.
+    Parked,
+    /// Another caller latched it first.
+    Elsewhere,
+}
+
+/// Which step of a stop failed.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StopFailure<E> {
+    /// The suspend did not latch, so the VM is as it was.
+    NotLatched(E),
+    /// The suspend latched, but the parked VM was not let back into the
+    /// kernel, so its vCPUs have not seen the stop yet.
+    NotReleased(E),
+}
+
+impl<E> StopFailure<E> {
+    fn into_inner(self) -> E {
+        match self {
+            StopFailure::NotLatched(e) | StopFailure::NotReleased(e) => e,
+        }
+    }
+}
+
+impl From<StopFailure<io::Error>> for io::Error {
+    fn from(failure: StopFailure<io::Error>) -> Self {
+        failure.into_inner()
+    }
+}
+
 /// Stop a paused VM without letting its guest run one more instruction.
 ///
 /// The suspend is latched FIRST. A paused vCPU thread is retrying
@@ -432,9 +544,9 @@ fn grace_must_release(state: VmRunState) -> bool {
 fn release_paused_vm<E>(
     suspend: impl FnOnce() -> Result<(), E>,
     resume: impl FnOnce() -> Result<(), E>,
-) -> Result<(), E> {
-    suspend()?;
-    resume()
+) -> Result<(), StopFailure<E>> {
+    suspend().map_err(StopFailure::NotLatched)?;
+    resume().map_err(StopFailure::NotReleased)
 }
 
 fn pause_device_set(
@@ -586,8 +698,40 @@ mod tests {
             },
         );
 
-        assert_eq!(result, Err("suspend ioctl failed"));
+        assert_eq!(
+            result,
+            Err(StopFailure::NotLatched("suspend ioctl failed"))
+        );
         assert!(!resumed.load(Ordering::Acquire));
+    }
+
+    /// Only one of two racing stops may issue the suspend and resume.
+    #[test]
+    fn a_second_stop_leaves_the_suspend_to_the_first() {
+        let paused = AtomicU8::new(VmRunState::Paused as u8);
+        assert_eq!(claim_stop(&paused, false), StopOwner::Parked);
+        assert_eq!(claim_stop(&paused, false), StopOwner::Elsewhere);
+        assert_eq!(
+            VmRunState::from_u8(paused.load(Ordering::Acquire)),
+            VmRunState::Stopping,
+        );
+
+        let running = AtomicU8::new(VmRunState::Running as u8);
+        assert_eq!(claim_stop(&running, false), StopOwner::Running);
+        assert_eq!(claim_stop(&running, false), StopOwner::Elsewhere);
+
+        // A source whose guest migrated away is parked too.
+        let migrated = AtomicU8::new(VmRunState::Stopped as u8);
+        assert_eq!(claim_stop(&migrated, true), StopOwner::Parked);
+        assert_eq!(claim_stop(&migrated, true), StopOwner::Elsewhere);
+    }
+
+    /// A latched stop must not be reported as a VM that never got one.
+    #[test]
+    fn a_failed_resume_still_says_the_suspend_latched() {
+        let result = release_paused_vm::<&str>(|| Ok(()), || Err("EBUSY"));
+
+        assert_eq!(result, Err(StopFailure::NotReleased("EBUSY")));
     }
 
     #[test]

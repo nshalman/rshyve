@@ -281,9 +281,20 @@ pub struct Cli {
     #[arg(long)]
     pub mdata_ssh_keys: Option<String>,
 
-    /// Root password for mdata agent (plaintext, set via cloud-init)
+    /// Root password for mdata agent (plaintext, set via cloud-init).
+    ///
+    /// Every process in the zone, and the global zone, reads this out of
+    /// `ps`/`pargs`. Prefer --mdata-root-pw-file.
     #[arg(long)]
     pub mdata_root_pw: Option<String>,
+
+    /// File holding the root password for the mdata agent.
+    ///
+    /// Read once at start, without its trailing newline. Takes
+    /// precedence over --mdata-root-pw, and keeps the password out of
+    /// argv.
+    #[arg(long)]
+    pub mdata_root_pw_file: Option<String>,
 
     /// CPU baseline profile for migration compatibility.
     /// Masks out CPU features above the specified level so VMs can

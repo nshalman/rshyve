@@ -14,6 +14,7 @@
 //! The loop terminates on suspend events (halt, reset, triple-fault)
 //! which are sent to the main thread via a channel.
 
+use std::io;
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -208,7 +209,7 @@ pub fn spawn_one(
     events: Sender<VcpuEvent>,
     gate: Option<StartGate>,
     log: &Logger,
-) -> std::io::Result<thread::JoinHandle<()>> {
+) -> io::Result<thread::JoinHandle<()>> {
     let vcpu_log = log.new(slog::o!("vcpu" => vcpu_id));
 
     let bus_pio = Arc::clone(&ctx.bus_pio);
@@ -241,6 +242,20 @@ pub fn spawn_one(
         })
 }
 
+/// A boot set that could not be started whole.
+///
+/// Carries the threads that did start, because the boot vCPUs are
+/// activated before the spawn: every one of them is already running
+/// guest code, and the caller has to stop them before it unwinds past
+/// the machine they run on.
+pub struct BootSpawnError {
+    /// The threads already running, in id order.
+    pub started: Vec<thread::JoinHandle<()>>,
+    /// The vCPU whose thread was refused.
+    pub vcpu: i32,
+    pub source: io::Error,
+}
+
 /// Spawn a thread for the whole boot set of vCPUs.
 ///
 /// No thread parks: the boot set is activated before this call. The
@@ -251,22 +266,28 @@ pub fn spawn_boot_threads(
     vcpu_metrics: &[Arc<VcpuMetrics>],
     events: &Sender<VcpuEvent>,
     log: &Logger,
-) -> Vec<thread::JoinHandle<()>> {
-    vcpus
-        .iter()
-        .zip(vcpu_metrics.iter())
-        .map(|(vcpu, metrics)| {
-            spawn_one(
-                ctx,
-                vcpu.id(),
-                Arc::clone(metrics),
-                events.clone(),
-                None,
-                log,
-            )
-            .expect("failed to spawn vCPU thread")
-        })
-        .collect()
+) -> Result<Vec<thread::JoinHandle<()>>, BootSpawnError> {
+    let mut started = Vec::with_capacity(vcpus.len());
+    for (vcpu, metrics) in vcpus.iter().zip(vcpu_metrics.iter()) {
+        match spawn_one(
+            ctx,
+            vcpu.id(),
+            Arc::clone(metrics),
+            events.clone(),
+            None,
+            log,
+        ) {
+            Ok(handle) => started.push(handle),
+            Err(source) => {
+                return Err(BootSpawnError {
+                    started,
+                    vcpu: vcpu.id(),
+                    source,
+                })
+            }
+        }
+    }
+    Ok(started)
 }
 
 /// The main vCPU execution loop.

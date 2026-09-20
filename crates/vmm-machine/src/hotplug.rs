@@ -36,14 +36,12 @@
 //! detached from is always the bus its catalog attached it to.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use slog::{debug, error, info, warn, Logger};
 
-use vmm_core::hdl::VmmHdl;
-use vmm_core::mem::{MMIO_HOLE_BASE, MMIO_HOLE_END};
-use vmm_devices::hotplug::mem::MAX_SLOTS as MEM_SLOTS;
 use vmm_devices::hotplug::pci::{is_hotpluggable_slot, PciHotplug};
 use vmm_devices::lifecycle::prepare_unplug;
 use vmm_devices::pci::{Bdf, PciBus};
@@ -51,6 +49,7 @@ use vmm_devices::IndicatedState;
 
 use crate::devspec;
 use crate::parse::parse_bdf;
+use crate::pause::{VmPause, VmPauseGate};
 use crate::pci::{
     CreatedPciDevice, OwnedPciCtx, PciDeviceCtx, PciDeviceHandle,
 };
@@ -62,13 +61,20 @@ use crate::vcpus::{VcpuRegistry, VcpuSetup};
 
 use self::cpu::{CpuHotplugEngine, CpuHotplugError, CpuOnline};
 use self::drain::DrainThread;
-use self::mem::{MemHotplugEngine, MemHotplugError, MemWindow};
+use self::mem::MemHotplugEngine;
+use self::unplug::{unplug_bounded, Unplug, UNPLUG_HALT_SLACK};
 
 /// How long a device gets to drain before an eject is abandoned.
 ///
 /// A device that is still doing DMA must keep its slot, so the budget
 /// expiring aborts the removal instead of forcing it.
 const UNPLUG_BUDGET: Duration = Duration::from_secs(5);
+
+/// How long [`HotplugEngine::close`] waits for the drain thread.
+///
+/// A thread abandoned inside a device release must not hold the
+/// teardown one step short of the VM destroy.
+const DRAIN_JOIN_BUDGET: Duration = Duration::from_secs(5);
 
 /// How often the engine looks for an eject the guest has run.
 const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
@@ -109,6 +115,14 @@ pub enum HotplugError {
     NotHotpluggable(String),
     /// The slot is already on its way out.
     NotRemovable { id: String, state: SlotState },
+    /// The VM has stopped. Teardown has already taken its list of
+    /// devices, so a device added now would never be halted and its
+    /// `vmm_drv` lease would park the VM destroy.
+    Closed,
+    /// No thread is draining ejects, so the guest's `_EJ0` would never
+    /// be acted on and the slot would stay `RemovePending` for the life
+    /// of the VM.
+    NotDrained,
 }
 
 impl fmt::Display for HotplugError {
@@ -117,6 +131,11 @@ impl fmt::Display for HotplugError {
             HotplugError::Disabled => {
                 f.write_str("this VM was not started with --hotplug")
             }
+            HotplugError::Closed => f.write_str("the VM is shutting down"),
+            HotplugError::NotDrained => f.write_str(
+                "this VM has no hotplug drain thread, so a removal could \
+                 not be finished",
+            ),
             HotplugError::BadSpec(reason) => write!(f, "bad spec: {reason}"),
             HotplugError::FixedSlot(slot) => {
                 write!(f, "PCI slot {slot} is fixed and cannot be plugged")
@@ -149,25 +168,6 @@ impl fmt::Display for HotplugError {
 
 impl std::error::Error for HotplugError {}
 
-/// Stops every vCPU while the PCI bus changes shape.
-///
-/// A trait, not the handle itself, so the teardown order can be tested
-/// without a live VM.
-pub trait VmPause: Send + Sync {
-    fn pause(&self) -> anyhow::Result<()>;
-    fn resume(&self) -> anyhow::Result<()>;
-}
-
-impl VmPause for VmmHdl {
-    fn pause(&self) -> anyhow::Result<()> {
-        VmmHdl::pause(self).map_err(anyhow::Error::from)
-    }
-
-    fn resume(&self) -> anyhow::Result<()> {
-        VmmHdl::resume(self).map_err(anyhow::Error::from)
-    }
-}
-
 /// Builds one device from its spec. The engine's seam onto a binary's
 /// catalog.
 type BuildDevice<'a> = dyn FnMut(&str) -> anyhow::Result<CreatedPciDevice> + 'a;
@@ -188,6 +188,17 @@ struct Core {
     regs: Arc<PciHotplug>,
     vm: Arc<dyn VmPause>,
     budget: Duration,
+    /// How much longer than `budget` one unplug may take, to cover the
+    /// unbounded `halt()` at the end of it.
+    halt_slack: Duration,
+    /// Set by [`HotplugEngine::close`] once the guest has stopped.
+    /// Every entry point reads it, the way `VcpuThreads::close` refuses
+    /// a late CPU add.
+    closed: AtomicBool,
+    /// False when the drain thread was refused at start. An add still
+    /// works; a removal does not, because nothing would act on the
+    /// guest's `_EJ0`.
+    drains: AtomicBool,
     log: Logger,
 }
 
@@ -202,6 +213,9 @@ impl Core {
         spec: &str,
         build: &mut BuildDevice<'_>,
     ) -> Result<String, HotplugError> {
+        if self.is_closed() {
+            return Err(HotplugError::Closed);
+        }
         let bdf = hotplug_bdf(spec)?;
         let id = devspec::device_id(spec);
         self.check_free(&id, bdf)?;
@@ -252,6 +266,15 @@ impl Core {
 
     /// Ask the guest to give a device up. Tears nothing down.
     fn request_remove(&self, id: &str) -> Result<(), HotplugError> {
+        if self.is_closed() {
+            return Err(HotplugError::Closed);
+        }
+        if !self.drains.load(Ordering::Acquire) {
+            // Marking the slot would ask the guest for a device nothing
+            // could then take: it would report remove-pending for the
+            // life of the VM and be replayed on the next boot.
+            return Err(HotplugError::NotDrained);
+        }
         let device = self
             .registry
             .get_by_id(id)
@@ -283,8 +306,19 @@ impl Core {
         Ok(())
     }
 
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     /// Act on every eject the guest has run since the last pass.
     fn drain_ejects(&self) {
+        // The guest chooses the moment it runs `_EJ0`, so it can pick
+        // the instant the VM powers off. An eject started then would
+        // pause, quiesce and halt the same device the teardown sweep is
+        // halting, from a second thread.
+        if self.is_closed() {
+            return;
+        }
         for slot in self.regs.take_eject_requests() {
             self.eject(slot);
         }
@@ -329,20 +363,48 @@ impl Core {
         let paused_here =
             lifecycle.lifecycle_state() != Some(IndicatedState::Pause);
 
-        if let Err(e) = prepare_unplug(&lifecycle, self.budget) {
+        match unplug_bounded(
+            &lifecycle,
+            self.budget,
+            self.budget.saturating_add(self.halt_slack),
+            &self.log,
+        ) {
+            Unplug::Done => {}
             // Never forced. The device keeps running, keeps its slot and
             // keeps its backing file. `prepare_unplug` already paused
             // it, so the abort has to undo that: a device left paused
             // never serves the guest again, which is a silent hang
             // rather than a refused removal.
-            warn!(self.log, "eject aborted: the device did not quiesce";
-                "id" => &device.id, "error" => format!("{e:?}"));
-            self.abort_eject(
-                &device.id,
-                slot,
-                paused_here.then_some(&lifecycle),
-            );
-            return;
+            Unplug::Kept { reason, paused } => {
+                warn!(self.log, "eject aborted: the device did not quiesce";
+                    "id" => &device.id, "error" => reason);
+                self.abort_eject(
+                    &device.id,
+                    slot,
+                    (paused_here && paused).then_some(&lifecycle),
+                );
+                return;
+            }
+
+            // The release is still running on a thread this one let go
+            // of. Nothing may touch the slot: a worker can still be
+            // inside a transport callback on the device that is leaving,
+            // and its state reads `Halt` from the first instant of a
+            // release that has not happened.
+            Unplug::InFlight => {
+                error!(self.log, "eject abandoned: the device release did \
+                    not return inside its budget";
+                    "id" => &device.id, "bdf" => %bdf);
+                if let Err(e) = self.registry.set_state(
+                    &device.id,
+                    SlotState::RemovePending,
+                    SlotState::Ejecting,
+                ) {
+                    error!(self.log, "an abandoned eject left the slot as \
+                        it was"; "id" => &device.id, "error" => %e);
+                }
+                return;
+            }
         }
 
         // The compare-and-swap comes after the quiesce, not before it:
@@ -360,7 +422,15 @@ impl Core {
             return;
         }
 
-        self.detach_paused(bdf, device.pci.as_ref());
+        if let Err(e) = self.detach_paused(bdf, device.pci.as_ref()) {
+            // The slot stays `Ejecting`: the device is quiesced and
+            // halted, so it serves the guest no more, but its regions
+            // are still registered and a vCPU may be inside one.
+            error!(self.log, "eject stopped: the VM would not pause for \
+                the bus change"; "id" => &device.id,
+                "error" => format!("{e:#}"));
+            return;
+        }
         if let Err(e) = self.registry.set_state(
             &device.id,
             SlotState::Ejecting,
@@ -440,26 +510,27 @@ impl Core {
                     "bdf" => %bdf, "error" => format!("{e:?}"));
             }
         }
-        self.detach_paused(bdf, pci);
+        if let Err(e) = self.detach_paused(bdf, pci) {
+            error!(self.log, "a rolled-back device is still on the bus";
+                "bdf" => %bdf, "error" => format!("{e:#}"));
+        }
     }
 
     /// Take a device off the bus with no vCPU inside a bus handler.
     ///
     /// The pause is what makes the region unregister safe: a vCPU can
-    /// be part-way through a BAR access on the device that is leaving.
-    /// Only a pause this call took is resumed, so a VM the operator
-    /// stopped is never started again from here.
-    fn detach_paused(&self, bdf: Bdf, pci: Option<&PciDeviceHandle>) {
-        let paused = match self.vm.pause() {
-            Ok(()) => true,
-            Err(e) => {
-                // Carry on: the guest has already let the device go, so
-                // leaving it half attached is worse than a racy detach.
-                error!(self.log, "failed to pause the VM for a bus change";
-                    "bdf" => %bdf, "error" => format!("{e:#}"));
-                false
-            }
-        };
+    /// be part-way through a BAR access on the device that is leaving,
+    /// so a pause that fails aborts the detach rather than stripping a
+    /// live device. The pause is a [`VmPauseGate`] hold, so an operator
+    /// pause already in force is not a failure and is not resumed here.
+    fn detach_paused(
+        &self,
+        bdf: Bdf,
+        pci: Option<&PciDeviceHandle>,
+    ) -> anyhow::Result<()> {
+        self.vm.pause().map_err(|e| {
+            e.context(format!("no pause for the bus change at {bdf}"))
+        })?;
 
         if let Some(device) = pci {
             device.detach_regions();
@@ -468,18 +539,23 @@ impl Core {
         // releases the reference the bus held.
         drop(self.bus.detach(&bdf));
 
-        if paused {
-            if let Err(e) = self.vm.resume() {
-                error!(self.log, "failed to resume the VM after a bus change";
-                    "bdf" => %bdf, "error" => format!("{e:#}"));
-            }
+        if let Err(e) = self.vm.resume() {
+            // The regions are already gone, so the change stands. A VM
+            // that will not resume is a kernel level failure this path
+            // cannot undo.
+            error!(self.log, "failed to resume the VM after a bus change";
+                "bdf" => %bdf, "error" => format!("{e:#}"));
         }
+        Ok(())
     }
 }
 
 /// The add and remove engine, and the thread that owns teardown.
 pub struct HotplugEngine {
     core: Arc<Core>,
+    /// The pause the bus change takes. Held here so the control plane
+    /// can take the same one.
+    gate: Arc<VmPauseGate>,
     ctx: Arc<OwnedPciCtx>,
     /// The binary's catalog. `Mutex` because it is `FnMut` and two
     /// control connections can ask at once.
@@ -503,11 +579,11 @@ impl HotplugEngine {
         // The bus and the VM handle come out of the context the catalog
         // builds against, so a device can never be detached from a bus
         // other than the one it was attached to.
-        let (bus, vm) = {
+        let (bus, gate) = {
             let borrowed = PciDeviceCtx::borrow_from(&ctx);
             (
                 Arc::clone(borrowed.chipset.pci_bus()),
-                Arc::clone(borrowed.vmm_hdl) as Arc<dyn VmPause>,
+                VmPauseGate::over_hdl(Arc::clone(borrowed.vmm_hdl)),
             )
         };
 
@@ -515,8 +591,11 @@ impl HotplugEngine {
             registry,
             bus,
             regs: pci_regs,
-            vm,
+            vm: Arc::clone(&gate) as Arc<dyn VmPause>,
             budget: UNPLUG_BUDGET,
+            halt_slack: UNPLUG_HALT_SLACK,
+            closed: AtomicBool::new(false),
+            drains: AtomicBool::new(true),
             log: log.clone(),
         });
         let thread = DrainThread::spawn(
@@ -526,9 +605,13 @@ impl HotplugEngine {
             &log,
             "no hotplug thread; ejects will not be drained",
         );
+        if thread.is_stopped() {
+            core.drains.store(false, Ordering::Release);
+        }
 
         Arc::new(Self {
             core,
+            gate,
             ctx,
             factory: Mutex::new(factory),
             thread,
@@ -550,9 +633,30 @@ impl HotplugEngine {
         self.core.request_remove(id)
     }
 
+    /// The pause this engine takes when it changes the bus.
+    ///
+    /// The kernel keeps one pause flag per instance, so every userspace
+    /// path that stops the whole VM has to share this count.
+    pub fn pause_gate(&self) -> Arc<VmPauseGate> {
+        Arc::clone(&self.gate)
+    }
+
+    /// Refuse every later add and removal, and stop the drain thread.
+    ///
+    ///
+    /// Teardown calls this before it takes its list of devices. An add
+    /// that landed after that list attaches a device the halt sweep
+    /// never sees, and the `vmm_drv` lease it holds then parks
+    /// `VM_DESTROY_SELF` in `vmm_lease_block` until the watchdog ends
+    /// the process.
+    pub fn close(&self) {
+        self.core.closed.store(true, Ordering::Release);
+        self.thread.shutdown(DRAIN_JOIN_BUDGET);
+    }
+
     /// Stop the drain thread and wait for it.
     pub fn shutdown(&self) {
-        self.thread.shutdown();
+        self.thread.shutdown(DRAIN_JOIN_BUDGET);
     }
 }
 
@@ -600,14 +704,23 @@ fn hotplug_bdf(spec: &str) -> Result<Bdf, HotplugError> {
 /// The `-s` specs a restart has to replay.
 ///
 /// Only hot-added devices: an argv device already has its own `-s`
-/// entry, complete with the bootindex the registry does not keep. A
-/// slot on its way out is dropped, because the device is going away.
+/// entry, complete with the bootindex the registry does not keep.
+///
+/// A slot whose teardown has begun is dropped. `Absent` never reaches
+/// here, because `eject` sets it and removes the record on the same
+/// thread, so `Ejecting` is the state that has to be filtered: the
+/// device is gone or going, and replaying its spec would open its
+/// backing file again in the next run.
 pub fn hotplug_specs(registry: &DeviceRegistry) -> Vec<String> {
     registry
         .list()
         .into_iter()
         .filter(|device| {
-            device.hotpluggable && device.state != SlotState::Absent
+            device.hotpluggable
+                && !matches!(
+                    device.state,
+                    SlotState::Absent | SlotState::Ejecting
+                )
         })
         .filter_map(|device| device.spec)
         .collect()
@@ -715,11 +828,40 @@ pub struct HotplugEngines {
 }
 
 impl HotplugEngines {
-    /// Stop every drain thread and wait for it.
+    /// The pause every path that stops the whole VM must take.
     ///
-    /// Called at teardown. The control plane thread is never joined, so
-    /// a request can still arrive after this: a CPU add then finds the
-    /// vCPU roster closed and is refused.
+    /// The PCI engine's gate when the VM has one, because that engine is
+    /// the only other userspace owner of the kernel's single pause flag.
+    /// Without the engine there is no second owner, so a fresh gate over
+    /// the handle is the whole count.
+    pub fn pause_gate(
+        &self,
+        hdl: &Arc<vmm_core::hdl::VmmHdl>,
+    ) -> Arc<VmPauseGate> {
+        match self.pci.as_ref() {
+            Some(pci) => pci.pause_gate(),
+            None => VmPauseGate::over_hdl(Arc::clone(hdl)),
+        }
+    }
+
+    /// Refuse every later request and stop every drain thread.
+    ///
+    /// Called from inside the event loop, before teardown takes its
+    /// list of devices. A request that arrives after this finds every
+    /// engine closed: PCI on its own flag, CPU on the vCPU roster.
+    pub fn close(&self) {
+        if let Some(pci) = self.pci.as_ref() {
+            pci.close();
+        }
+        if let Some(cpu) = self.cpu.as_ref() {
+            cpu.shutdown();
+        }
+        if let Some(mem) = self.mem.as_ref() {
+            mem.shutdown();
+        }
+    }
+
+    /// Stop every drain thread and wait for it.
     pub fn shutdown(&self) {
         if let Some(pci) = self.pci.as_ref() {
             pci.shutdown();
@@ -733,133 +875,17 @@ impl HotplugEngines {
     }
 }
 
-/// The guest address window that hot-added memory goes in.
-///
-/// It starts above every RAM region the VM booted with. The machine
-/// builder maps `[0, min(mem, MMIO_HOLE_BASE))` and, for a bigger
-/// guest, `[MMIO_HOLE_END, MMIO_HOLE_END + mem - MMIO_HOLE_BASE)`, so
-/// the first free address is the top of that second range. The window
-/// is therefore always above 4 GiB and can never land in the 32-bit
-/// MMIO hole.
-///
-/// `slot_size` has to divide `max_mem`, and the quotient has to fit the
-/// [`MEM_SLOTS`] slots the register file and the AML describe. Both are
-/// refused here rather than silently clamped, because a window that
-/// claims more slots than the guest has would report free memory no add
-/// can reach.
-///
-/// The base is computed from `mem_size` because this runs before the VM
-/// exists. If that layout ever changed, the first add would be REFUSED
-/// and not misplaced: `PhysMap::claim_ram` checks the range against
-/// every published region before any ioctl runs.
-///
-/// The kernel puts a second, lower ceiling on this: one VM gets five
-/// memory segments (`vmm.c:179`) and boot spends some of them, so the
-/// real number of adds can be below the slot count. The engine reports
-/// that as it happens, because what boot spent depends on the devices.
-pub fn hot_add_window(
-    mem_size: usize,
-    max_mem: u64,
-    slot_size: u64,
-) -> Result<MemWindow, MemHotplugError> {
-    let bad = |reason: String| Err(MemHotplugError::BadWindow(reason));
-
-    if slot_size == 0 {
-        return bad("a slot size of 0 describes no memory".to_string());
-    }
-    let Ok(mem_size) = u64::try_from(mem_size) else {
-        return bad(format!("{mem_size} bytes of RAM does not fit a u64"));
-    };
-    let highmem = mem_size.saturating_sub(MMIO_HOLE_BASE);
-    let Some(base) = MMIO_HOLE_END.checked_add(highmem) else {
-        return bad(format!("{mem_size} bytes of RAM leaves no window"));
-    };
-    if !max_mem.is_multiple_of(slot_size) {
-        return bad(format!(
-            "a window of {max_mem:#x} does not divide into {slot_size:#x} slots",
-        ));
-    }
-    let slots = max_mem / slot_size;
-    if slots > MEM_SLOTS as u64 {
-        return bad(format!(
-            "a {max_mem:#x} window of {slot_size:#x} slots needs {slots} \
-             slots, and the guest has {MEM_SLOTS}; raise the slot size",
-        ));
-    }
-
-    MemWindow::new(base, max_mem, slot_size)
-}
-
 pub mod cpu;
 mod drain;
 pub mod mem;
+mod unplug;
 
 #[cfg(test)]
 mod tests;
 
-/// Tests for the pieces above that the disk engine's own module does
-/// not cover. Kept inline so `hotplug/tests.rs` stays under the file
-/// size this tree holds itself to.
 #[cfg(test)]
-mod window_tests {
+mod engine_tests {
     use super::*;
-
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const SLOT: u64 = 128 * 1024 * 1024;
-
-    #[test]
-    fn the_window_starts_above_every_ram_region_the_vm_booted_with() {
-        // A window that overlapped high RAM would map a second segment
-        // over memory the guest is already using.
-        let small = hot_add_window(1024 * 1024 * 1024, GIB, SLOT)
-            .expect("1 GiB of RAM is all low memory");
-        assert_eq!(small.base(), MMIO_HOLE_END);
-
-        // 4 GiB of RAM is 3 GiB low and 1 GiB high, so high RAM ends at
-        // 5 GiB and the window starts there.
-        let big = hot_add_window(4 * 1024 * 1024 * 1024, GIB, SLOT)
-            .expect("4 GiB of RAM has a high half");
-        assert_eq!(big.base(), MMIO_HOLE_END + GIB);
-    }
-
-    #[test]
-    fn the_window_never_reaches_the_mmio_hole() {
-        for gib in [1u64, 3, 4, 8, 64] {
-            let window = hot_add_window((gib * GIB) as usize, GIB, SLOT)
-                .unwrap_or_else(|e| panic!("{gib} GiB: {e}"));
-            assert!(
-                window.base() >= MMIO_HOLE_END,
-                "{gib} GiB put the window at {:#x}",
-                window.base(),
-            );
-        }
-    }
-
-    #[test]
-    fn a_window_the_guest_has_no_slots_for_is_refused() {
-        // 8 GiB of 128 MiB slots wants 64 slots and the AML declares 8.
-        // Clamping instead would report free memory no add can reach.
-        let refused =
-            hot_add_window(GIB as usize, 8 * GIB, SLOT).expect_err("64 slots");
-        assert!(
-            refused.to_string().contains("raise the slot size"),
-            "{refused}",
-        );
-
-        // The same window in slots the guest has.
-        let window = hot_add_window(GIB as usize, 8 * GIB, GIB)
-            .expect("8 slots of 1 GiB");
-        assert_eq!(window.slots(), 8);
-    }
-
-    #[test]
-    fn a_window_the_slot_size_does_not_divide_is_refused() {
-        let refused = hot_add_window(GIB as usize, GIB + 1, SLOT)
-            .expect_err("not a whole number of slots");
-        assert!(refused.to_string().contains("does not divide"), "{refused}");
-
-        assert!(hot_add_window(GIB as usize, GIB, 0).is_err());
-    }
 
     #[test]
     fn engines_a_vm_did_not_ask_for_are_absent() {
