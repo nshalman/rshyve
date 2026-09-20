@@ -111,6 +111,42 @@ fn a_reset_waits_for_the_transfer_it_interrupts() {
 }
 
 #[test]
+fn shutdown_drains_before_it_reports_complete() {
+    let (mut h, backend) = Harness::held();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    backend.hold();
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::write(0, 1, 0x50000, 0), 0x61);
+    backend.wait_in_flight(1);
+
+    let releaser =
+        release_on_drain(Arc::clone(&h.ctrl.gate), Arc::clone(&backend));
+    h.reg_write32(
+        REG_CC,
+        CC_EN
+            | (SQE_SIZE_LOG2 << CC_IOSQES_SHIFT)
+            | (CQE_SIZE_LOG2 << CC_IOCQES_SHIFT)
+            | (1 << CC_SHN_SHIFT),
+    );
+    let quiet = backend.in_flight();
+    let drained = releaser.join().expect("releaser");
+
+    assert!(drained, "the shutdown did not drain the workers");
+    assert_eq!(quiet, 0, "SHST completed with a transfer still in flight");
+    assert_eq!(
+        (h.csts() >> CSTS_SHST_SHIFT) & CSTS_SHST_MASK,
+        SHST_COMPLETE
+    );
+    assert_eq!(h.csts() & CSTS_CFS, 0);
+    // The queues are gone, so a further doorbell does nothing.
+    assert_eq!(backend.started(), 1);
+    h.sq_doorbell(1, 1);
+    assert_eq!(backend.started(), 1);
+}
+
+#[test]
 fn a_reset_drops_queued_io_instead_of_completing_it_into_new_queues() {
     let (mut h, backend) = Harness::held();
     h.enable();
