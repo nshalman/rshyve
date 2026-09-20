@@ -10,11 +10,11 @@
 //!
 //! ```text
 //!   0x0000_0000  ┌─────────────────┐
-//!                │     Low RAM     │  (0 to lowmem_limit, default 3 GiB)
+//!                │     Low RAM     │  (0 to MMIO_HOLE_BASE, 3 GiB)
 //!   0xC000_0000  ├─────────────────┤
 //!                │   MMIO hole     │  (3 GiB to 4 GiB: PCI BARs, etc.)
 //!   0x1_0000_0000├─────────────────┤
-//!                │    High RAM     │  (4 GiB+, if mem_size > lowmem_limit)
+//!                │    High RAM     │  (4 GiB+, if mem_size > MMIO_HOLE_BASE)
 //!                └─────────────────┘
 //! ```
 
@@ -31,11 +31,15 @@ use crate::vcpu::Vcpu;
 /// Most vCPUs one VM can have. The kernel's `VM_MAXCPU`.
 pub const VM_MAXCPU: u32 = bhyve_api::VM_MAXCPU as u32;
 
-/// High memory begins at the end of the MMIO hole.
-const FOUR_GIB: u64 = MMIO_HOLE_END;
-
-/// Default lowmem limit (below the MMIO hole).
-const DEFAULT_LOWMEM_LIMIT: u64 = MMIO_HOLE_BASE;
+/// The low and high RAM a machine of `mem_size` bytes gets.
+///
+/// Low RAM stops where the MMIO hole starts; the rest goes above 4 GiB.
+/// The chipset and the hot-add layout take their split from here, so
+/// there is one source of truth for it.
+pub fn split_memory(mem_size: usize) -> (usize, usize) {
+    let low = mem_size.min(MMIO_HOLE_BASE as usize);
+    (low, mem_size - low)
+}
 
 /// Minimum supported memory size (1 MiB).
 const MIN_MEM_SIZE: usize = 1024 * 1024;
@@ -167,7 +171,6 @@ pub struct Builder {
     opts: CreateOpts,
     num_cpus: u32,
     mem_size: usize,
-    lowmem_limit: u64,
 }
 
 impl Builder {
@@ -177,7 +180,6 @@ impl Builder {
             opts: CreateOpts::default(),
             num_cpus: 1,
             mem_size: 256 * 1024 * 1024,
-            lowmem_limit: DEFAULT_LOWMEM_LIMIT,
         }
     }
 
@@ -193,11 +195,6 @@ impl Builder {
 
     pub fn memory(mut self, size: usize) -> Self {
         self.mem_size = size;
-        self
-    }
-
-    pub fn lowmem_limit(mut self, limit: u64) -> Self {
-        self.lowmem_limit = limit;
         self
     }
 
@@ -225,9 +222,10 @@ impl Builder {
             self.mem_size,
         );
         anyhow::ensure!(
-            self.lowmem_limit > 0 && self.lowmem_limit <= FOUR_GIB,
-            "lowmem_limit must be (0, 4 GiB], got {:#x}",
-            self.lowmem_limit,
+            self.mem_size.is_multiple_of(crate::common::PAGE_SIZE),
+            "mem_size must be a multiple of {} bytes, got {}",
+            crate::common::PAGE_SIZE,
+            self.mem_size,
         );
 
         let hdl = Arc::new(VmmHdl::create(&self.name, &self.opts)?);
@@ -239,14 +237,10 @@ impl Builder {
 
         let mut map = PhysMap::new();
 
-        // Low memory: 0 to min(mem_size, lowmem_limit)
-        let lowmem_size = self.mem_size.min(self.lowmem_limit as usize);
+        let (lowmem_size, highmem_size) = split_memory(self.mem_size);
         map.add_ram(&hdl, 0, lowmem_size)?;
-
-        // High memory: above 4 GiB if mem_size exceeds lowmem_limit
-        if self.mem_size > self.lowmem_limit as usize {
-            let highmem_size = self.mem_size - self.lowmem_limit as usize;
-            map.add_ram(&hdl, FOUR_GIB, highmem_size)?;
+        if highmem_size > 0 {
+            map.add_ram(&hdl, MMIO_HOLE_END, highmem_size)?;
         }
 
         Ok(MachineSetup {
@@ -255,5 +249,19 @@ impl Builder {
             num_cpus: self.num_cpus,
             mem_size: self.mem_size,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_memory;
+    use crate::mem::MMIO_HOLE_BASE;
+
+    #[test]
+    fn ram_past_the_hole_base_goes_above_four_gib() {
+        let base = MMIO_HOLE_BASE as usize;
+        assert_eq!(split_memory(base - 0x1000), (base - 0x1000, 0));
+        assert_eq!(split_memory(base), (base, 0));
+        assert_eq!(split_memory(base + 0x1000), (base, 0x1000));
     }
 }
