@@ -4,72 +4,20 @@
 
 //! Live migration protocol and implementation.
 //!
-//! Provides the migration protocol (WebSocket-based), codec, memory
-//! transfer with dirty page tracking, and device state serialization.
+//! One driver, over any `Read + Write` stream: a Unix socket inside a
+//! bhyve zone, where `/dev/poll` is unavailable, or a TCP socket. Two
+//! drivers for two transports drifted apart once already, and the
+//! async twin shipped no device state at all.
 
 pub mod codec;
+pub mod cpu;
 pub mod destination;
 pub mod limits;
 pub mod pages;
 pub mod protocol;
 pub mod source;
 pub mod state;
-pub mod sync_destination;
-pub mod sync_source;
-
-/// A stream that can be either a TCP connection or a Unix socket.
-/// Implements AsyncRead + AsyncWrite so it can be used with the
-/// generic migration protocol.
-pub enum MigrateStream {
-    Tcp(tokio::net::TcpStream),
-    Unix(tokio::net::UnixStream),
-}
-
-impl tokio::io::AsyncRead for MigrateStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            MigrateStream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-            MigrateStream::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-        }
-    }
-}
-
-impl tokio::io::AsyncWrite for MigrateStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            MigrateStream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            MigrateStream::Unix(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            MigrateStream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
-            MigrateStream::Unix(s) => std::pin::Pin::new(s).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            MigrateStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            MigrateStream::Unix(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-        }
-    }
-}
+pub mod wire;
 
 /// Migration phases, executed in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,8 +36,14 @@ pub enum MigrationPhase {
     DeviceState,
     /// Destination requests any missing pages.
     RamPull,
-    /// Handoff, destination resumes.
+    /// The destination says it holds everything.
     Finish,
+    /// The source has handed the guest over and cannot take it back.
+    ///
+    /// Past this point a rollback would run a second copy of the same
+    /// guest against the same disk, so the source stays paused however
+    /// the rest of the exchange ends.
+    Committed,
     /// Migration failed.
     Error,
 }
@@ -105,6 +59,7 @@ impl std::fmt::Display for MigrationPhase {
             Self::DeviceState => write!(f, "device-state"),
             Self::RamPull => write!(f, "ram-pull"),
             Self::Finish => write!(f, "finish"),
+            Self::Committed => write!(f, "committed"),
             Self::Error => write!(f, "error"),
         }
     }

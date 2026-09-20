@@ -12,11 +12,16 @@ commit that closed them.
 **Boundary:** migration peer to VMM. **Severity:** high in any
 deployment where the migration path is not already a trusted channel.
 
-The source connects to `ws://migration/live` in the clear
-(`crates/vmm-migrate/src/source.rs`), the destination accepts a raw
-WebSocket (`crates/vmm-migrate/src/destination.rs`), and the sync paths
-accept TCP or Unix streams with no protocol-level peer identity.
+`crates/vmm-migrate/src/source.rs` connects and
+`crates/vmm-migrate/src/destination.rs` accepts a raw WebSocket over a
+TCP or Unix stream with no protocol-level peer identity.
 `vmm-migrate-agent` binds `0.0.0.0` and accepts the first connection.
+
+Every field the peer sends is now validated before it is applied, and a
+payload the destination cannot hold fails the migration rather than
+half-programming a device, so a malformed blob is a refused migration
+and not a corrupt guest. That bounds the damage; it is not
+authentication.
 
 Guest RAM, CPU state, and device state therefore have no
 confidentiality and no peer authentication unless an external control
@@ -53,6 +58,12 @@ Separately, `sh()` runs pipelines without `pipefail` and checks a single
 exit status, so a truncated `zfs send` is invisible whenever the remote
 `zfs recv` exits 0. The agent then migrates RAM onto a short disk.
 
+`check_name` now also refuses a value beginning with `-`, which the
+invoked program would read as an option, and one with a `..` path
+element, which climbs out of the zone root the agent's paths are built
+from. `Cli::Dest` checks its `--uuid` as the source side does. The
+remaining gap is the shape of the call, not the character set.
+
 **To close:** replace `sh()` with `std::process::Command` argument
 arrays, introduce validated newtypes for UUID, dataset, host, and key
 path so clap rejects bad input at parse time, quote the remote word
@@ -81,25 +92,6 @@ and validate across a real cross-host migration with a continuous AVX
 workload. A malformed XSAVE blob can set reserved `XCOMP_BV` bits and
 fault the guest at its first `XRSTOR`, so this is worse to get wrong
 than to leave unimplemented.
-
-### OSF-3 — CPU feature mismatch is warned about, not rejected
-
-**Boundary:** correctness, guest-visible. **Severity:** medium.
-
-Both destinations log a CPU feature mismatch and continue. The two
-implementations also compare differently: the sync path, which is the
-one production uses, checks only CPUID leaf 7 and has no ignore masks
-for SGX/MPX, while the async path checks leaf 1, leaf 7, and xcr0.
-
-The comparison itself is also wrong in a way that produces false
-negatives: the source sends baseline-masked guest features while the
-destination compares against raw host features, so a migration from
-`--cpu-baseline host` to a narrower baseline reports a passing check and
-then hands a running guest a feature table with bits cleared.
-
-**To close:** one shared comparison over the full effective guest CPUID
-contract, then a policy decision on reject-by-default with an explicit,
-auditable override.
 
 ### OSF-4 — Vendored libtpms predates two CVE fixes
 
@@ -272,6 +264,8 @@ whatever the source audit says.
 
 | Finding | Closed by |
 |---|---|
+| OSF-3 — CPU feature mismatch was warned about, not rejected, and the two implementations compared different leaves against unmasked host features | `Migrate device state by PCI identity over one driver` |
+| Hyper-V enlightenment state was not migrated; `TIME_REF_COUNT` restarted from a process-local clock and ran backwards for the guest | `Migrate the Hyper-V enlightenment` |
 | PS/2 controller RAM out-of-bounds index reachable from guest port I/O | `fix(ps2): guest-reachable out-of-bounds index in controller RAM` |
 | Virtio indirect descriptor table unbounded against queue size | `fix(virtio): bound indirect descriptor tables to the queue size` |
 | Migration `PageBatch` slice index abort and discarded guest-memory errors | `fix(migrate): validate and bound peer-controlled page transfers` |

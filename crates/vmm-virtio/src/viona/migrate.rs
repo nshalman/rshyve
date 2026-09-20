@@ -9,26 +9,80 @@
 //! [`super::VirtioViona::ring_init`] cannot do because it resets the
 //! indices to 0.
 
+use vmm_devices::lifecycle::DeviceStateError;
+
 use super::{RingState, VirtioViona, NET_NUM_QUEUES};
 
 impl VirtioViona {
     /// Stop every ring worker, so the indices this reads out hold
-    /// still.
-    pub(super) fn pause_rings(&self) {
-        let inner = self.inner.lock().expect("viona lock");
+    /// still, and keep each ring's state for a rollback.
+    ///
+    /// A ring that could not be paused keeps consuming available
+    /// entries while the export reads its indices, so the failure has
+    /// to fail the migration.
+    pub(super) fn pause_rings(&self) -> Result<(), DeviceStateError> {
+        let mut inner = self.inner.lock().expect("viona lock");
         // Same guard as the restore below. The halt drops the device
         // lock and sits in an untimed kernel call, so a pause that got
         // in could wait for that call inside the kernel while holding
         // the lock every vCPU needs.
         if inner.halted {
-            return;
+            return Ok(());
         }
         for ring in 0..NET_NUM_QUEUES as u16 {
+            // Read the state before the pause: the ring is running, so
+            // this is what a rollback has to put back.
+            let saved = inner.link_ref().ring_get_state(ring).ok();
             if let Err(e) = inner.link_ref().ring_pause(ring) {
-                slog::warn!(inner.log(), "viona ring pause failed";
-                    "ring" => ring, "error" => %e);
+                return Err(DeviceStateError::Export(format!(
+                    "viona ring {ring} pause failed: {e}"
+                )));
             }
+            inner.paused_rings[usize::from(ring)] = saved;
         }
+        Ok(())
+    }
+
+    /// Put the rings [`Self::pause_rings`] stopped back to work.
+    ///
+    /// A paused ring is `VRS_STOP` in the kernel, and
+    /// `viona_ioc_ring_kick` answers EBUSY for one, so a guest kick
+    /// cannot restart it. Only a reset followed by a state write can,
+    /// which is what this does from the state the pause saved.
+    pub(super) fn resume_rings(&self) -> Result<(), DeviceStateError> {
+        let mut inner = self.inner.lock().expect("viona lock");
+        if inner.halted {
+            return Ok(());
+        }
+        let mut failed: Vec<String> = Vec::new();
+        for ring in 0..NET_NUM_QUEUES as u16 {
+            let idx = usize::from(ring);
+            let Some(state) = inner.paused_rings[idx].take() else {
+                continue;
+            };
+            // The guest ran between the pause and the abort and may
+            // have reset the device. Its rings are the driver's to
+            // program again, not ours to revive.
+            if inner.ring_state[idx] != RingState::Ready {
+                continue;
+            }
+            if let Err(e) = inner.link_ref().ring_reset(ring) {
+                failed.push(format!("ring {ring} reset: {e}"));
+                continue;
+            }
+            if let Err(e) = inner.link_ref().ring_set_state(&state) {
+                failed.push(format!("ring {ring} set state: {e}"));
+                continue;
+            }
+            Self::ring_kick(&mut inner, ring);
+        }
+        if failed.is_empty() {
+            return Ok(());
+        }
+        Err(DeviceStateError::Invalid(format!(
+            "viona rings stayed paused: {}",
+            failed.join("; ")
+        )))
     }
 
     /// Reset all viona rings (pause + reset). Call before ring_set_state.

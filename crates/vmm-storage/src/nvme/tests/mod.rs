@@ -22,6 +22,7 @@ use super::{NvmeController, NvmeParts};
 mod admin;
 mod io;
 mod lifecycle;
+mod migrate;
 
 /// Guest RAM the harness maps: enough for queues and a 2 MiB transfer.
 const GUEST_RAM: usize = 8 << 20;

@@ -366,12 +366,20 @@ fn rom_bar_and_interrupt_line_are_emulated() {
     assert_eq!(read(&dev, 0x3C, 4) & 0xFFFF, 0x0105);
 }
 
+/// PCI makes the header type read-only, and the multi-function bit
+/// belongs to the slot: `PciBus` ORs it into the read because only the
+/// bus knows which functions a slot holds. A guest write here must not
+/// reach the device or the hardware.
 #[test]
-fn bus_can_set_the_multifunction_bit() {
+fn the_header_type_is_read_only() {
     let (dev, fake, _) = build(FakePpt::new());
     assert_eq!(read(&dev, 0x0E, 1), u32::from(bits::HEADER_TYPE_DEVICE));
     write(&dev, 0x0E, 1, u32::from(bits::HEADER_TYPE_MULTIFUNC));
-    assert_eq!(read(&dev, 0x0E, 1), u32::from(bits::HEADER_TYPE_MULTIFUNC));
+    assert_eq!(
+        read(&dev, 0x0E, 1),
+        u32::from(bits::HEADER_TYPE_DEVICE),
+        "a guest write changed the header type",
+    );
     assert_eq!(read(&dev, 0x0C, 1), 0x10, "cache line from hardware");
     assert!(fake.cfg_writes.lock().unwrap().is_empty());
 }

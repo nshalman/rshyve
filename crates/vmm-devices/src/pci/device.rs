@@ -12,7 +12,7 @@ use vmm_core::common::RWOp;
 use super::bar::{BarDefine, BarWriteResult, Bars};
 use super::bits;
 use super::BarN;
-use crate::lifecycle::VirtioMigratePciState;
+use crate::lifecycle::MigratePciState;
 
 // ---------------------------------------------------------------------------
 // PciDevice trait
@@ -150,13 +150,13 @@ impl DeviceState {
     }
 
     /// The command bits and BAR bases a migration carries.
-    pub fn migrate_state(&self) -> VirtioMigratePciState {
+    pub fn migrate_state(&self) -> MigratePciState {
         let mut bar_addrs = [0u64; 6];
         for (idx, addr) in bar_addrs.iter_mut().enumerate() {
             let bar = BarN::try_from(idx as u8).expect("valid BAR index");
             *addr = self.bars.get(bar).map(|(_, value)| value).unwrap_or(0);
         }
-        VirtioMigratePciState {
+        MigratePciState {
             command: self.command.bits(),
             bar_addrs,
         }

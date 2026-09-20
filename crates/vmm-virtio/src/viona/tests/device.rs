@@ -869,13 +869,62 @@ fn a_halted_device_restores_no_ring() {
 fn an_export_pauses_every_ring_before_it_reads_them() {
     // A ring the kernel still works on moves its indices while the
     // source reads them, and the destination resumes from a cursor
-    // that was never true.
+    // that was never true. The state is read before each pause,
+    // because that is what a rollback has to put back.
     let steps = Steps::default();
     let device = device_with(Arc::new(TestLink::new(&steps)));
 
-    VirtioDevice::pause_rings_for_export(&device);
+    VirtioDevice::pause_rings_for_export(&device).expect("pauses");
 
-    assert_eq!(steps_of(&steps), [Step::RingPause(0), Step::RingPause(1)]);
+    assert_eq!(
+        steps_of(&steps),
+        [
+            Step::RingGetState(0),
+            Step::RingPause(0),
+            Step::RingGetState(1),
+            Step::RingPause(1),
+        ],
+    );
+}
+
+#[test]
+fn a_rollback_puts_every_paused_ring_back_to_work() {
+    // A paused ring is VRS_STOP, and viona answers a guest kick on one
+    // with EBUSY, so only a reset plus a state write revives it. The
+    // source guest would otherwise resume with a dead NIC.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+
+    VirtioDevice::pause_rings_for_export(&device).expect("pauses");
+    steps.lock().expect("steps").clear();
+
+    VirtioDevice::resume_rings_after_migration(&device).expect("resumes");
+
+    let seen = steps_of(&steps);
+    assert!(
+        seen.contains(&Step::RingReset(0))
+            && seen.contains(&Step::RingReset(1)),
+        "{seen:?}",
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|s| matches!(s, Step::RingSetState { .. }))
+            .count(),
+        2,
+        "both rings get their saved state back: {seen:?}",
+    );
+}
+
+#[test]
+fn a_ring_that_will_not_pause_fails_the_migration() {
+    // The export would otherwise read indices that are still moving.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(
+        TestLink::new(&steps).failing(&[Op::RingPause]),
+    ));
+
+    VirtioDevice::pause_rings_for_export(&device)
+        .expect_err("a ring that stays running must fail the migration");
 }
 
 #[test]
@@ -909,7 +958,8 @@ fn a_halted_device_pauses_no_ring() {
     device.halt();
     steps.lock().expect("steps lock").clear();
 
-    VirtioDevice::pause_rings_for_export(&device);
+    VirtioDevice::pause_rings_for_export(&device)
+        .expect("a halted device has nothing to pause");
 
     assert_eq!(
         steps_of(&steps),

@@ -241,17 +241,26 @@ fn check_field_entry_blob(
 pub(super) fn check_device_state(
     state: &DeviceState,
     layouts: &[vdi_version_entry_v1],
+    num_cpus: u32,
 ) -> Result<(), MigrateError> {
-    if state.vcpus.is_empty() {
-        return Err(MigrateError::State("payload has no vCPU state".into()));
+    // One payload per vCPU, no more and no fewer. The kernel accepts
+    // any id below VM_MAXCPU, so a payload for a vCPU this VM never
+    // activated writes MSRs, LAPIC and run state into one that has no
+    // thread; a missing one leaves that AP at reset and the guest
+    // kernel hangs waiting for it.
+    if state.vcpus.len() != num_cpus as usize {
+        return Err(MigrateError::State(format!(
+            "payload has {} vCPU states, this VM has {num_cpus} vCPUs",
+            state.vcpus.len(),
+        )));
     }
 
     let mut seen_vcpu = std::collections::HashSet::new();
     for vcpu in &state.vcpus {
         let id = vcpu.vcpuid;
-        if id < 0 {
+        if id < 0 || id as u32 >= num_cpus {
             return Err(MigrateError::State(format!(
-                "payload has invalid vcpu id {id}"
+                "payload has vcpu id {id}, outside 0..{num_cpus}"
             )));
         }
         if !seen_vcpu.insert(id) {
@@ -426,8 +435,8 @@ pub(crate) mod fixtures {
         DeviceState {
             vcpus: vec![vcpu_payload(0)],
             devices: device_payloads(),
-            virtio_queues: Vec::new(),
-            nvme_controllers: Vec::new(),
+            emulated: Vec::new(),
+            hyperv: None,
         }
     }
 }

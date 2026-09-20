@@ -89,14 +89,41 @@ fn load_direct_boot_kernel(
     Ok(())
 }
 
-/// Handle migration destination mode: activate vCPUs, listen for a
-/// migration connection, and import VM state from the source.
+/// Every device a migration carries state for, with the PCI address
+/// that identifies it on the wire.
+fn migrate_devices(
+    registry: &DeviceRegistry,
+) -> Vec<(
+    vmm_migrate::codec::DeviceIdentity,
+    Arc<dyn vmm_devices::Lifecycle>,
+)> {
+    registry
+        .list()
+        .into_iter()
+        .filter_map(|slot| {
+            let bdf = slot.bdf?;
+            let device = slot.lifecycle?;
+            Some((
+                vmm_migrate::codec::DeviceIdentity {
+                    bdf: bdf.into(),
+                    kind: device.type_name().to_string(),
+                },
+                device,
+            ))
+        })
+        .collect()
+}
+
+/// Handle migration destination mode: activate vCPUs, take a migration
+/// connection, and import VM state from the source.
 fn run_migration_destination(
     machine: &Machine,
     listen_addr: &str,
     num_cpus: u32,
     mem_size: usize,
-    devices: &[Arc<dyn vmm_devices::Lifecycle>],
+    registry: &DeviceRegistry,
+    cpu_baseline: vmm_core::cpuid::CpuBaseline,
+    hyperv: Option<Arc<vmm_hyperv::HyperV>>,
     log: &Logger,
 ) -> anyhow::Result<()> {
     info!(log, "migration destination mode"; "listen" => listen_addr);
@@ -112,119 +139,106 @@ fn run_migration_destination(
             .with_context(|| format!("failed to reset vCPU {}", vcpu.id()))?;
     }
 
-    // Listen for migration connection
-    let hdl = machine.hdl().clone();
-    let physmap = machine.physmap().clone();
-    let migrate_mem_size = mem_size as u64;
+    let devices = migrate_devices(registry);
+    let config = vmm_migrate::destination::DestConfig {
+        num_cpus,
+        mem_size: mem_size as u64,
+        cpu_baseline,
+        devices: devices.iter().map(|(ident, _)| ident.clone()).collect(),
+        deadlines: vmm_migrate::wire::Deadlines::default(),
+        // The control socket's migrate-dest carries the override. A VM
+        // started this way has no operator to ask mid-migration.
+        allow_cpu_feature_mismatch: false,
+    };
+
+    let by_bdf = devices.clone();
+    let for_resume: Vec<Arc<dyn vmm_devices::Lifecycle>> =
+        registry.lifecycle_devices();
+    let hooks = vmm_migrate::destination::DestHooks {
+        restore: Box::new(move |bdf, state| {
+            let device = by_bdf
+                .iter()
+                .find(|(ident, _)| ident.bdf == bdf)
+                .map(|(_, device)| device)
+                .ok_or_else(|| {
+                    vmm_devices::lifecycle::DeviceStateError::Invalid(format!(
+                        "no device at {bdf}"
+                    ))
+                })?;
+            device.restore_migrate_state(state)
+        }),
+        resume: Box::new(move || {
+            for dev in &for_resume {
+                dev.resume();
+            }
+        }),
+        hyperv: Box::new(move |state| match hyperv.as_ref() {
+            Some(hyperv) => {
+                hyperv.import_state(state);
+                true
+            }
+            // The payload carries an enlightenment this VM has no
+            // handler for, so the guest would find its hypercall page
+            // gone. A mismatch, not a silent drop.
+            None => false,
+        }),
+    };
+
     let status = Arc::new(std::sync::Mutex::new(
         vmm_migrate::MigrationStatus::default(),
     ));
+    let memctx = vmm_core::mem::MemCtx::new(machine.physmap().clone());
+    let hdl = machine.hdl().clone();
 
-    let is_unix =
-        listen_addr.starts_with('/') || listen_addr.ends_with(".sock");
-
-    if is_unix {
-        // Synchronous Unix socket -- no tokio needed (works in bhyve zones).
-        info!(log, "connecting to migration socket"; "path" => listen_addr);
-        let stream = {
-            let mut retries = 0;
-            loop {
-                match std::os::unix::net::UnixStream::connect(listen_addr) {
-                    Ok(s) => break s,
-                    Err(_) if retries < 30 => {
-                        retries += 1;
-                        thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                    Err(e) => anyhow::bail!("connect to {listen_addr}: {e}"),
-                }
-            }
-        };
-        info!(log, "connected to migration socket");
-        // Build restore callback that reprograms device queue state
-        // on destination devices (virtio rings + NVMe controller).
-        let devs: Vec<Arc<dyn vmm_devices::Lifecycle>> = devices.to_vec();
-        let restore_fn: vmm_migrate::sync_destination::DeviceRestoreFn =
-            Box::new(move |queue_states, nvme_states| {
-                // Every device sees every entry and takes its own.
-                let queues = vmm_devices::DeviceMigrateState::VirtioQueues(
-                    queue_states.to_vec(),
-                );
-                for dev in &devs {
-                    dev.restore_migrate_state(&queues);
-                }
-                for nvme in nvme_states {
-                    let state =
-                        vmm_devices::DeviceMigrateState::Nvme(nvme.clone());
-                    for dev in &devs {
-                        dev.restore_migrate_state(&state);
-                    }
-                }
-            });
-
-        vmm_migrate::sync_destination::run_destination_sync(
-            stream,
-            hdl,
-            &vmm_core::mem::MemCtx::new(physmap),
-            num_cpus,
-            migrate_mem_size,
-            status,
-            log,
-            Some(restore_fn),
+    // One driver over either stream. A Unix socket is the only kind
+    // that works inside a bhyve zone, where /dev/poll is unavailable;
+    // the GZ agent bridges it to the peer.
+    if listen_addr.starts_with('/') || listen_addr.ends_with(".sock") {
+        let stream = connect_migration_socket(listen_addr, log)?;
+        vmm_migrate::destination::run_destination(
+            stream, hdl, &memctx, config, hooks, status, log,
         )
         .context("migration import failed")?;
     } else {
-        // Async TCP path -- for GZ or manual testing.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to create tokio runtime")?;
-        let addr = listen_addr.to_string();
-        rt.block_on(async {
-            let listener = tokio::net::TcpListener::bind(&addr)
-                .await
-                .context("bind failed")?;
-            info!(log, "waiting for migration"; "addr" => &addr);
-            let (stream, peer) =
-                listener.accept().await.context("accept failed")?;
-            info!(log, "migration connection"; "peer" => %peer);
-            vmm_migrate::destination::run_destination(
-                vmm_migrate::MigrateStream::Tcp(stream),
-                hdl.clone(),
-                &vmm_core::mem::MemCtx::new(physmap.clone()),
-                num_cpus,
-                migrate_mem_size,
-                status,
-                log,
-            )
-            .await
-            .context("migration failed")
-        })?;
+        let listener = std::net::TcpListener::bind(listen_addr)
+            .with_context(|| format!("bind {listen_addr}"))?;
+        info!(log, "waiting for migration"; "addr" => listen_addr);
+        let (stream, peer) = listener.accept().context("accept failed")?;
+        info!(log, "migration connection"; "peer" => %peer);
+        vmm_migrate::destination::run_destination(
+            stream, hdl, &memctx, config, hooks, status, log,
+        )
+        .context("migration import failed")?;
     }
 
+    // The run state was restored per vCPU during the import. A vCPU in
+    // HLT or INIT stays there and the kernel resumes it when needed.
+    // The interrupt kick happens after the vCPU threads are spawned:
+    // one injected before the spawn is lost.
     info!(log, "migration import complete, starting vCPUs");
-
-    // Run state was restored per-vCPU during import_device_state.
-    // No need to force VRS_RUN here — vCPUs in HLT/INIT stay
-    // in that state and will be resumed by the kernel when needed.
-    // Interrupt injection happens AFTER vCPU threads are spawned
-    // (see below). Injecting before spawn loses the kick.
     Ok(())
 }
 
-/// After migration, inject a timer interrupt to restart the scheduler tick
-/// in the guest (nohz/tickless mode workaround).
-fn post_migration_timer_kick(machine: &Machine, log: &Logger) {
-    thread::sleep(std::time::Duration::from_millis(200));
-    for vcpu in machine.vcpus() {
-        match machine.hdl().lapic_irq(vcpu.id(), 0xEC) {
-            Ok(()) => {
-                info!(log, "post-migration timer kick"; "vcpu" => vcpu.id())
+/// Connect to the agent's socket, waiting for it to appear.
+///
+/// The agent and the VMM start together, so the socket may not exist
+/// for the first moments.
+fn connect_migration_socket(
+    path: &str,
+    log: &Logger,
+) -> anyhow::Result<std::os::unix::net::UnixStream> {
+    const RETRIES: u32 = 30;
+    info!(log, "connecting to migration socket"; "path" => path);
+    for _ in 0..RETRIES {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(stream) => {
+                info!(log, "connected to migration socket");
+                return Ok(stream);
             }
-            Err(e) => {
-                warn!(log, "timer kick failed"; "vcpu" => vcpu.id(), "error" => %e)
-            }
+            Err(_) => thread::sleep(std::time::Duration::from_millis(500)),
         }
     }
+    anyhow::bail!("no migration socket at {path} after {RETRIES} tries")
 }
 
 /// What the control socket leaves behind for the rest of `run`.
@@ -247,9 +261,8 @@ fn spawn_control_socket(
     cpu_baseline: vmm_core::cpuid::CpuBaseline,
     vcpu_metrics: &[Arc<vmm_devices::metrics::VcpuMetrics>],
     registry: Arc<DeviceRegistry>,
-    has_ahci_cd: bool,
     hotplug: HotplugEngines,
-    host_local_state: host_state::HostLocalState,
+    migration: control::MigrationInputs,
     log: &Logger,
 ) -> anyhow::Result<ControlSocket> {
     let Some(sock_path) = cli.control_socket.as_ref() else {
@@ -264,12 +277,11 @@ fn spawn_control_socket(
         mem_size,
         vcpu_metrics.to_vec(),
         registry,
-        has_ahci_cd,
         hotplug,
         cli.pci_slot.clone(),
         cli.lpc.clone(),
         cpu_baseline,
-        host_local_state,
+        migration,
         log.clone(),
     );
     let stop = control::sigterm_stop(Arc::clone(&ctrl));
@@ -400,7 +412,9 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
             listen_addr,
             num_cpus,
             mem_size,
-            &registry.lifecycle_devices(),
+            &registry,
+            cpu_baseline,
+            hyperv.clone(),
             log,
         )?;
     } else if let Some(ref kernel) = kernel_image {
@@ -440,27 +454,30 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     .context("failed to start the boot vCPU threads")?;
     let vcpu_metrics = fleet.metrics.clone();
 
-    // Phase 10: Post-migration timer kick + delayed virtio interrupt
+    // Phase 10: wake the guest's virtio drivers once the vCPUs run.
+    //
+    // The restore raises an interrupt per live queue, but that one
+    // fires before the vCPUs start and a driver that is not running
+    // cannot take it. This second one reaches a running driver, which
+    // is what makes it process the caught-up used ring and post new
+    // receive buffers.
     if cli.migrate_listen.is_some() {
-        post_migration_timer_kick(&machine, log);
-
-        // Re-inject virtio interrupts periodically after vCPUs start.
-        // The initial post-restore interrupt fires before resume but
-        // may not be sufficient for virtio-blk (the guest's blk driver
-        // may need multiple interrupt cycles to fully process stale
-        // used ring entries and resume I/O).
         let devs = registry.lifecycle_devices();
-        thread::Builder::new()
+        let kick_log = log.clone();
+        if let Err(e) = thread::Builder::new()
             .name("post-migrate-virtio-kick".into())
             .spawn(move || {
-                for _ in 0..10 {
-                    thread::sleep(std::time::Duration::from_millis(100));
-                    for dev in &devs {
-                        dev.post_restore_kick();
-                    }
+                thread::sleep(std::time::Duration::from_millis(100));
+                for dev in &devs {
+                    dev.post_restore_kick();
                 }
             })
-            .ok();
+        {
+            // The guest keeps its rings; it may just not notice the
+            // entries waiting in them until it kicks a queue itself.
+            warn!(kick_log, "could not start the post-migration kick thread";
+                "error" => %e);
+        }
     }
 
     // Phase 11: Hotplug engines. Each owns the thread that answers the
@@ -506,9 +523,12 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         cpu_baseline,
         &vcpu_metrics,
         Arc::clone(&registry),
-        has_ahci_cd,
         hotplug.clone(),
-        host_local_state,
+        control::MigrationInputs {
+            has_ahci_cd,
+            hyperv: hyperv.clone(),
+            host_local_state,
+        },
         log,
     )?;
 
