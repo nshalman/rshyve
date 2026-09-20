@@ -362,9 +362,22 @@ impl VirtioBlock {
     ) -> (u8, u32) {
         match header.rtype {
             bits::VIRTIO_BLK_T_GET_ID => {
+                // The data segment is the chain without its header and
+                // its status byte, the same span `io::fold` and
+                // `discard::read_payload` take. Writing the ID into the
+                // status descriptor of a `[header, status]` chain
+                // reported a length that counted that byte twice, and
+                // `write_status` then overwrote the first byte of the
+                // answer.
+                let Some(data) = chain
+                    .len()
+                    .checked_sub(1)
+                    .and_then(|end| chain.get(1..end))
+                else {
+                    return (bits::VIRTIO_BLK_S_IOERR, 1);
+                };
                 let id = self.device_id();
-                // Write ID to the first writable buffer in the chain
-                for buf in chain {
+                for buf in data {
                     if let ChainBuf::Writable { addr, len } = buf {
                         let n = (*len as usize).min(VIRTIO_BLK_ID_BYTES);
                         if let Some(sub) = physmap.lookup(*addr, n) {

@@ -245,6 +245,63 @@ fn notify_queue_caps_collection_at_queue_size() {
     );
 }
 
+/// Every other request takes its data from the chain without the header
+/// and the status byte. GET_ID took the first writable buffer instead,
+/// which on a `[header, status]` chain is the status descriptor: the
+/// answer went into the byte that reports it, and the used length
+/// counted that byte twice.
+#[test]
+fn a_get_id_without_a_data_segment_reports_an_error() {
+    const DESC_GPA: u64 = 0x1000;
+    const USED_GPA: u64 = 0x1200;
+    const STATUS_GPA: u64 = 0x3800;
+
+    let (physmap, queue, block) = make_get_id_queue(4, 1);
+    let mut queues = [queue];
+
+    // Point the header's NEXT at a one-byte status descriptor, so the
+    // chain names no data at all.
+    physmap
+        .lookup(DESC_GPA + 16, 16)
+        .expect("mapped status descriptor")
+        .write(&VirtqDesc {
+            addr: STATUS_GPA,
+            len: 1,
+            flags: bits::VRING_DESC_F_WRITE,
+            next: 0,
+        })
+        .expect("write status descriptor");
+    physmap
+        .lookup(STATUS_GPA, 1)
+        .expect("mapped status byte")
+        .write_bytes(&[0xEE])
+        .expect("write status byte");
+
+    block.notify_queue(0, &mut queues, &physmap);
+
+    let entry = physmap.lookup(USED_GPA + 4, 8).expect("mapped used entry");
+    assert_eq!(
+        entry
+            .subregion(4, 4)
+            .expect("used length")
+            .read::<u32>()
+            .expect("read used length"),
+        1,
+        "the used length counted the status byte as data",
+    );
+    let mut status = [0u8; 1];
+    physmap
+        .lookup(STATUS_GPA, 1)
+        .expect("mapped status byte")
+        .read_bytes(&mut status)
+        .expect("read status byte");
+    assert_eq!(
+        status[0],
+        bits::VIRTIO_BLK_S_IOERR,
+        "the device answered a request it could not place",
+    );
+}
+
 #[test]
 fn notify_queue_drains_ring_and_updates_avail_event() {
     let (physmap, queue, block) = make_get_id_queue(4, 2);
