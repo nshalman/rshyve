@@ -40,7 +40,7 @@ mod probes {
 
 use super::bits;
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
-use super::{queue_drain_should_stop, VirtioDevice};
+use super::VirtioDevice;
 
 mod access;
 mod discard;
@@ -493,13 +493,6 @@ impl VirtioDevice for VirtioBlock {
     /// put a call into the kernel on the reset's path. The transport
     /// drops the lock first. Workers raise their own completions:
     /// they hold no transport lock.
-    ///
-    /// EVENT_IDX re-check loop (VirtIO 1.3 sec 2.7.10):
-    /// After draining the ring and writing `used_event`, re-read
-    /// `avail_idx`. If the guest added entries during the race
-    /// window between our drain and the `used_event` write, the
-    /// guest may have decided not to kick, so the device must catch
-    /// those entries itself.
     fn notify_queue(
         &self,
         queue_idx: u16,
@@ -518,69 +511,47 @@ impl VirtioDevice for VirtioBlock {
         let completion = self.get_completion(&session, queue_idx, queue);
         let epoch = session.epoch();
 
-        // A guest can keep advancing avail_idx during the EVENT_IDX re-check.
         // Bound the work retained by one notification to the queue size.
         let max_requests = usize::from(queue.size());
         let mut requests: Vec<(u16, VirtioBlkReqHdr, Vec<ChainBuf>)> =
             Vec::with_capacity(max_requests);
         // Results already finished, published together at the end.
         let mut finished: Vec<(u16, u32)> = Vec::new();
-        let mut popped = 0usize;
 
-        loop {
-            let before = queue.last_avail_idx();
-            while popped < max_requests {
-                let Some(head) = queue.pop_avail(physmap) else {
-                    break;
-                };
-                popped += 1;
-
-                let chain = match queue.collect_chain(physmap, head) {
-                    Some(c) => c,
-                    None => {
-                        // `pop_avail` already took this head out of the
-                        // available ring, so it has to go back on the
-                        // used ring. Dropping it burns the descriptor
-                        // for the life of the device: the block layer
-                        // has no abort path for virtio-blk.
-                        finished.push((head, 0));
-                        continue;
-                    }
-                };
-
-                let header = match self.check_request(&chain, physmap) {
-                    Ok(header) => header,
-                    Err(len) => {
-                        finished.push((head, len));
-                        continue;
-                    }
-                };
-
-                if needs_backend(header.rtype) {
-                    requests.push((head, header, chain));
-                    continue;
+        queue.drain_avail(physmap, max_requests, |queue, head| {
+            let chain = match queue.collect_chain(physmap, head) {
+                Some(c) => c,
+                None => {
+                    // `pop_avail` already took this head out of the
+                    // available ring, so it has to go back on the
+                    // used ring. Dropping it burns the descriptor
+                    // for the life of the device: the block layer
+                    // has no abort path for virtio-blk.
+                    finished.push((head, 0));
+                    return;
                 }
+            };
 
-                probes::vioblk_inline!(|| (head, header.rtype, header.sector));
-                let (status, written) =
-                    self.local_request(&header, &chain, physmap);
-                write_status(physmap, &chain, status);
-                probes::vioblk_complete!(|| (head, status));
-                finished.push((head, written));
+            let header = match self.check_request(&chain, physmap) {
+                Ok(header) => header,
+                Err(len) => {
+                    finished.push((head, len));
+                    return;
+                }
+            };
+
+            if needs_backend(header.rtype) {
+                requests.push((head, header, chain));
+                return;
             }
 
-            // A cap exit leaves entries pending, so publishing avail_event
-            // would suppress a subsequent single-entry kick.
-            let hit_request_cap = popped >= max_requests;
-            if !hit_request_cap {
-                queue.update_used_event(physmap);
-            }
-            if queue_drain_should_stop(queue, before, hit_request_cap, physmap)
-            {
-                break;
-            }
-            // Guest added entries during race window; drain again.
-        }
+            probes::vioblk_inline!(|| (head, header.rtype, header.sector));
+            let (status, written) =
+                self.local_request(&header, &chain, physmap);
+            write_status(physmap, &chain, status);
+            probes::vioblk_complete!(|| (head, status));
+            finished.push((head, written));
+        });
 
         probes::vioblk_notify!(|| (
             queue_idx,

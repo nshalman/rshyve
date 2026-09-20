@@ -232,13 +232,16 @@ fn notify_queue_caps_collection_at_queue_size() {
     assert_eq!(queues[0].last_avail_idx(), queues[0].size());
     assert!(queues[0].has_new_avail(&physmap));
     assert_eq!(queues[0].read_used_ring_idx(&physmap), queues[0].size());
+    // A cap exit still arms the kick: nothing re-drains this ring
+    // but a guest notification, and the guest only sends one when
+    // avail_event names the index it adds at.
     assert_eq!(
         physmap
             .lookup(avail_event_gpa, 2)
             .expect("mapped avail event")
             .read::<u16>()
             .expect("read avail event"),
-        AVAIL_EVENT_SENTINEL,
+        queues[0].size(),
     );
 }
 

@@ -30,7 +30,7 @@ use vmm_core::mem::PhysMap;
 use vmm_core::unixsock::{bind_restricted, write_all_bounded, SocketPolicy};
 
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
-use super::{queue_drain_should_stop, VirtioDevice};
+use super::VirtioDevice;
 use crate::pci::intr::{BackendIntr, IntrSession, IntrSlot};
 use crate::socket_accept;
 use vmm_devices::lifecycle::{IndicatedState, Indicator};
@@ -409,44 +409,29 @@ impl VirtioConsole {
         // otherwise publish one descriptor over and over and grow VMM
         // memory without limit.
         let max_requests = usize::from(queue.size());
-        let max_pending = max_requests;
-        let mut popped = 0usize;
-        loop {
-            let before = queue.last_avail_idx();
-            let mut refused: Vec<u16> = Vec::new();
-            {
-                let mut pending =
-                    self.shared.pending_rx.lock().expect("pending rx lock");
-                while popped < max_requests && pending.len() < max_pending {
-                    let Some(head) = queue.pop_avail(physmap) else {
-                        break;
-                    };
-                    popped += 1;
-                    let Some(chain) = queue.collect_chain(physmap, head) else {
-                        refused.push(head);
-                        continue;
-                    };
-                    pending.push_back((head, chain));
-                }
+        let mut refused: Vec<u16> = Vec::new();
+        let mut pending =
+            self.shared.pending_rx.lock().expect("pending rx lock");
+        queue.drain_avail(physmap, max_requests, |queue, head| {
+            if pending.len() >= max_requests {
+                refused.push(head);
+                return;
             }
-            // `pop_avail` already took these heads out of the available
-            // ring, so each one has to go back on the used ring. Losing
-            // one costs the guest a descriptor for the life of the
-            // device, and there is no abort path to recover it.
-            if !refused.is_empty() {
-                debug!(self.shared.log, "virtio-console refused rx chains";
-                    "count" => refused.len());
-                for head in refused {
-                    completion.complete(head, 0);
-                }
+            match queue.collect_chain(physmap, head) {
+                Some(chain) => pending.push_back((head, chain)),
+                None => refused.push(head),
             }
-            let hit_request_cap = popped >= max_requests;
-            if !hit_request_cap {
-                queue.update_used_event(physmap);
-            }
-            if queue_drain_should_stop(queue, before, hit_request_cap, physmap)
-            {
-                break;
+        });
+        drop(pending);
+        // `pop_avail` already took these heads out of the available
+        // ring, so each one has to go back on the used ring. Losing
+        // one costs the guest a descriptor for the life of the
+        // device, and there is no abort path to recover it.
+        if !refused.is_empty() {
+            debug!(self.shared.log, "virtio-console refused rx chains";
+                "count" => refused.len());
+            for head in refused {
+                completion.complete(head, 0);
             }
         }
 
@@ -457,41 +442,23 @@ impl VirtioConsole {
     fn drain_tx(&self, queue: &mut VirtQueue, physmap: &PhysMap) -> bool {
         let old_used_idx = queue.read_used_idx(physmap);
         let max_requests = usize::from(queue.size());
-        let mut popped = 0usize;
-        let mut did_work = false;
         let mut chunk = [0u8; TX_CHUNK];
 
-        loop {
-            let before = queue.last_avail_idx();
-            while popped < max_requests {
-                let Some(head) = queue.pop_avail(physmap) else {
-                    break;
-                };
-                popped += 1;
-                if let Some(chain) = queue.collect_chain(physmap, head) {
-                    for buf in &chain {
-                        let ChainBuf::Readable { addr, len } = buf else {
-                            continue;
-                        };
-                        self.write_chain_buf(physmap, *addr, *len, &mut chunk);
-                    }
+        let popped = queue.drain_avail(physmap, max_requests, |queue, head| {
+            if let Some(chain) = queue.collect_chain(physmap, head) {
+                for buf in &chain {
+                    let ChainBuf::Readable { addr, len } = buf else {
+                        continue;
+                    };
+                    self.write_chain_buf(physmap, *addr, *len, &mut chunk);
                 }
-                // The chain is entirely device-readable, so the used
-                // length is zero.
-                queue.push_used(physmap, head, 0);
-                did_work = true;
             }
-            let hit_request_cap = popped >= max_requests;
-            if !hit_request_cap {
-                queue.update_used_event(physmap);
-            }
-            if queue_drain_should_stop(queue, before, hit_request_cap, physmap)
-            {
-                break;
-            }
-        }
+            // The chain is entirely device-readable, so the used
+            // length is zero.
+            queue.push_used(physmap, head, 0);
+        });
 
-        did_work && queue.should_notify_guest(physmap, old_used_idx)
+        popped > 0 && queue.should_notify_guest(physmap, old_used_idx)
     }
 
     /// Copy one device-readable buffer out to the client, in chunks.

@@ -69,16 +69,7 @@ pub fn cfg_read_bytes(cfg: &[u8], offset: u16, len: u8) -> u32 {
     out
 }
 
-fn queue_drain_should_stop(
-    queue: &VirtQueue,
-    before: u16,
-    hit_request_cap: bool,
-    physmap: &PhysMap,
-) -> bool {
-    queue.last_avail_idx() == before
-        || hit_request_cap
-        || !queue.has_new_avail(physmap)
-}
+pub(crate) use queue::queue_drain_should_stop;
 
 /// Trait implemented by VirtIO backend devices.
 ///
@@ -146,45 +137,13 @@ pub trait VirtioDevice: Send + Sync + 'static {
             None => return false,
         };
 
-        // Record used_idx before processing for interrupt suppression.
         let old_used_idx = queue.read_used_idx(physmap);
-
-        let mut did_work = false;
         let max_requests = usize::from(queue.size());
-        let mut popped = 0usize;
-
-        // EVENT_IDX re-check loop (VirtIO 1.3 sec 2.7.10):
-        // After draining the ring and setting used_event, re-read
-        // avail_idx. If the guest added entries during the race
-        // window, it may have decided not to kick — so we must
-        // process them here. Bound the total work to one queue's
-        // worth and stop if pop_avail() cannot make forward progress.
-        loop {
-            let before = queue.last_avail_idx();
-            while popped < max_requests {
-                let Some(head) = queue.pop_avail(physmap) else {
-                    break;
-                };
-                popped += 1;
-                let written =
-                    self.process_queue(queue_idx, queue, head, physmap);
-                queue.push_used(physmap, head, written);
-                did_work = true;
-            }
-
-            let hit_request_cap = popped >= max_requests;
-            if !hit_request_cap {
-                queue.update_used_event(physmap);
-            }
-            if queue_drain_should_stop(queue, before, hit_request_cap, physmap)
-            {
-                break;
-            }
-        }
-
-        // With EVENT_IDX, suppress the interrupt unless the used
-        // index crossed the guest's avail_event threshold.
-        did_work && queue.should_notify_guest(physmap, old_used_idx)
+        let popped = queue.drain_avail(physmap, max_requests, |queue, head| {
+            let written = self.process_queue(queue_idx, queue, head, physmap);
+            queue.push_used(physmap, head, written);
+        });
+        popped > 0 && queue.should_notify_guest(physmap, old_used_idx)
     }
 
     /// Called when the guest sets a queue address (PFN) during setup.
@@ -397,6 +356,14 @@ mod tests {
         assert_eq!(device.processed(), 2);
         assert_eq!(queues[0].last_avail_idx(), 2);
         assert!(queues[0].has_new_avail(&physmap));
+        // The cap exit must still arm the kick for the entries left.
+        let avail_event_gpa = USED_GPA + 4 + u64::from(queues[0].size()) * 8;
+        let avail_event = physmap
+            .lookup(avail_event_gpa, 2)
+            .expect("mapped avail event")
+            .read::<u16>()
+            .expect("read avail event");
+        assert_eq!(avail_event, 2);
     }
 
     #[test]

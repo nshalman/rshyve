@@ -194,6 +194,39 @@ fn rx_notify_stashes_chains_without_completing_them() {
     console.halt();
 }
 
+/// Taking the guest's whole receive ring in one pass must still arm
+/// the kick. Linux posts a full ring at probe, so this is the first
+/// pass, and a device that leaves `avail_event` behind the ring is
+/// never kicked again: it spends the chains it holds and then holds
+/// every host byte for a guest it cannot reach.
+#[test]
+fn a_ring_taken_whole_still_arms_the_next_kick() {
+    let (physmap, rx_queue) = make_queue(4, 4, bits::VRING_DESC_F_WRITE, 8);
+    let avail_event_gpa =
+        rx_queue.used_addr() + 4 + u64::from(rx_queue.size()) * 8;
+    let (_dir, console) = console_in_tempdir(Arc::clone(&physmap));
+
+    let mut queues = [rx_queue, VirtQueue::new(4)];
+    console.notify_queue(CONSOLE_RX_QUEUE, &mut queues, &physmap);
+
+    assert_eq!(
+        console.shared.pending_rx.lock().expect("pending").len(),
+        4,
+        "the whole ring should be stashed",
+    );
+    assert_eq!(
+        physmap
+            .lookup(avail_event_gpa, 2)
+            .expect("mapped avail event")
+            .read::<u16>()
+            .expect("read avail event"),
+        4,
+        "avail_event left behind the ring: the guest will never kick again",
+    );
+    console.pause();
+    console.halt();
+}
+
 #[test]
 fn host_bytes_reach_guest_memory() {
     let (physmap, rx_queue) = make_queue(4, 1, bits::VRING_DESC_F_WRITE, 8);

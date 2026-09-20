@@ -515,6 +515,44 @@ impl VirtQueue {
         Some(desc_idx)
     }
 
+    /// Pop heads and hand each to `each`, until the ring is empty or
+    /// `max` heads have been taken. Returns how many were taken.
+    ///
+    /// `avail_event` is armed on every way out, the cap exit
+    /// included. With EVENT_IDX the guest kicks only when the index it
+    /// adds at is the one the device asked for (sec 2.7.7.2), so a
+    /// threshold left over from the previous drain is below every
+    /// index the guest adds at from now on, and the device is never
+    /// kicked again. A drain that fills its cap is the common case,
+    /// not a corner: Linux posts a whole ring of receive buffers when
+    /// it probes.
+    ///
+    /// After arming, `avail_idx` is read again. An entry the guest
+    /// added between the drain and the arm was judged against the old
+    /// threshold and may never be kicked (sec 2.7.10).
+    pub fn drain_avail(
+        &mut self,
+        physmap: &PhysMap,
+        max: usize,
+        mut each: impl FnMut(&mut VirtQueue, u16),
+    ) -> usize {
+        let mut popped = 0usize;
+        loop {
+            let before = self.last_avail_idx;
+            while popped < max {
+                let Some(head) = self.pop_avail(physmap) else {
+                    break;
+                };
+                popped += 1;
+                each(self, head);
+            }
+            self.update_used_event(physmap);
+            if queue_drain_should_stop(self, before, popped >= max, physmap) {
+                return popped;
+            }
+        }
+    }
+
     /// Write `avail_event` in the used ring to suppress guest kicks.
     ///
     /// Call AFTER draining all available entries (not per-pop).
@@ -781,6 +819,22 @@ impl VirtQueue {
 
         Some(bufs)
     }
+}
+
+/// Whether a drain that just armed `avail_event` is finished.
+///
+/// It stops when the last pass made no progress (an entry the device
+/// cannot read would otherwise spin it), when it hit its cap, or when
+/// the guest added nothing during the arm.
+pub(crate) fn queue_drain_should_stop(
+    queue: &VirtQueue,
+    before: u16,
+    hit_request_cap: bool,
+    physmap: &PhysMap,
+) -> bool {
+    queue.last_avail_idx() == before
+        || hit_request_cap
+        || !queue.has_new_avail(physmap)
 }
 
 /// VirtIO 1.3 sec 2.7.7.1 wrapping comparison for notification suppression.
