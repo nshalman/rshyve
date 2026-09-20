@@ -9,13 +9,12 @@
 //! and to ask the active locality for an incoming command. We map
 //! each NV blob to a file in a per-VM state directory.
 //!
-//! The callbacks are C function pointers, registered once at TPM
-//! init via `TPMLIB_RegisterCallbacks`. libtpms invokes them
-//! synchronously from inside `TPMLIB_Process` on whatever thread
-//! issued the command (the vCPU thread, via the CRB MMIO handler).
-//!
-//! libtpms is a single-instance library — one vmm process serves
-//! one VM, so this is fine. Per-VM state lives behind a `OnceLock`.
+//! The callbacks are C function pointers, registered once at TPM init
+//! via `TPMLIB_RegisterCallbacks`. libtpms invokes them synchronously
+//! from inside `TPMLIB_Process`, on the vCPU thread that wrote the CRB
+//! START register. The CRB serialises those calls, so a callback sees
+//! one command at a time; per-VM state lives behind a `OnceLock`
+//! because libtpms serves one VM per process.
 
 use std::ffi::CStr;
 use std::fs::File;
@@ -27,7 +26,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 use slog::{debug, warn, Logger};
-use vmm_tpm_sys::TPM_RESULT;
+use vmm_tpm_sys::{TPMLIB_RegisterCallbacks, TPM_RESULT};
 
 /// libtpms callback table layout. Mirrors `struct libtpms_callbacks`
 /// in `tpm_library.h.in`. Order and field count must match exactly;
@@ -77,10 +76,6 @@ const TPM_FAIL: TPM_RESULT = 9;
 /// non-zero code is treated as a hard failure and aborts startup.
 const TPM_RETRY: TPM_RESULT = 0x800;
 
-extern "C" {
-    fn TPMLIB_RegisterCallbacks(cbs: *mut LibtpmsCallbacks) -> TPM_RESULT;
-}
-
 /// Per-process callback state. Set once during TPM device construction.
 struct CallbackState {
     state_dir: PathBuf,
@@ -129,7 +124,11 @@ pub fn register(state_dir: PathBuf, log: Logger) -> Result<(), io::Error> {
         tpm_io_getphysicalpresence: Some(cb_io_getphysicalpresence),
     };
 
-    let rc = unsafe { TPMLIB_RegisterCallbacks(&mut cbs) };
+    // SAFETY: libtpms copies at most `size_of_struct` bytes out of the
+    // table and keeps no pointer to it.
+    let rc = unsafe {
+        TPMLIB_RegisterCallbacks(std::ptr::from_mut(&mut cbs).cast())
+    };
     if rc != 0 {
         return Err(io::Error::other(format!(
             "TPMLIB_RegisterCallbacks failed: {:#x}",
@@ -322,7 +321,7 @@ unsafe extern "C" fn cb_nvram_deletename(
 // ---------------------------------------------------------------
 
 fn durable_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    let tmp = temp_path(path)?;
     let mut file = File::create(&tmp).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -372,6 +371,25 @@ fn durable_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })
 }
 
+/// The staging path for `path`.
+///
+/// It keeps the whole file name and appends the suffix. Replacing the
+/// extension instead would stage `tpm2-00.permall`,
+/// `tpm2-00.volatilestate` and `tpm2-00.savestate` through one
+/// `tpm2-00.tmp`, and a rename would then publish one blob's bytes
+/// under another blob's name.
+fn temp_path(path: &Path) -> io::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("TPM NV path has no file name: {}", path.display()),
+        )
+    })?;
+    let mut tmp = name.to_os_string();
+    tmp.push(".tmp");
+    Ok(path.with_file_name(tmp))
+}
+
 fn nv_path(s: &CallbackState, name: *const c_char) -> Option<PathBuf> {
     if name.is_null() {
         return None;
@@ -392,10 +410,8 @@ fn display_name(name: *const c_char) -> String {
         .into_owned()
 }
 
-// Compile-time assertion: callback struct size matches the C layout
-// libtpms expects. C struct = 1 int + 7 function pointers, with the
-// int padded to 8 bytes, total 64 bytes on x86-64. Mismatch here
-// silently corrupts callbacks at runtime, so make it a build error.
+// A field count or order that drifts from `struct libtpms_callbacks`
+// makes libtpms call the wrong pointer, with no runtime complaint.
 const _: () = assert!(
     size_of::<LibtpmsCallbacks>() == 64,
     "LibtpmsCallbacks must be exactly 64 bytes on 64-bit targets — \
@@ -450,6 +466,39 @@ mod tests {
             std::fs::read(&path).expect("read replacement state"),
             b"replacement state",
         );
-        assert!(!path.with_extension("tmp").exists());
+        assert!(!temp_path(&path).expect("temp path").exists());
+    }
+
+    /// Two blobs staged through one temp file let a rename publish one
+    /// blob's bytes under the other blob's name, which destroys the
+    /// vTPM state a BitLocker key depends on.
+    #[test]
+    fn each_nv_blob_stages_through_its_own_temp_file() {
+        let dir = Path::new("/vm/tpm");
+        let names = [
+            "tpm2-00.permall",
+            "tpm2-00.volatilestate",
+            "tpm2-00.savestate",
+        ];
+        let temps: Vec<PathBuf> = names
+            .iter()
+            .map(|name| temp_path(&dir.join(name)).expect("temp path"))
+            .collect();
+
+        for (name, tmp) in names.iter().zip(&temps) {
+            assert_eq!(tmp, &dir.join(format!("{name}.tmp")));
+        }
+        for (i, tmp) in temps.iter().enumerate() {
+            assert!(
+                !temps[i + 1..].contains(tmp),
+                "{} is staged by more than one blob",
+                tmp.display(),
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_without_a_file_name_has_no_temp_file() {
+        assert!(temp_path(Path::new("/")).is_err());
     }
 }

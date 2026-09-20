@@ -65,6 +65,21 @@ extern "C" {
         command_size: u32,
     ) -> TPM_RESULT;
 
+    /// Negotiate the largest command and response the TPM will accept.
+    ///
+    /// Call after `TPMLIB_ChooseTPMVersion` and before
+    /// `TPMLIB_MainInit`: the value becomes the reference code's
+    /// `MAX_COMMAND_SIZE` and `MAX_RESPONSE_SIZE`, so the library
+    /// answers an oversize command with `TPM_RC_COMMAND_SIZE` and never
+    /// builds a response the caller's buffer cannot hold. Returns the
+    /// size it settled on, clamped into `*min_size ..= *max_size`.
+    /// `wanted_size` 0 only reports the current value.
+    pub fn TPMLIB_SetBufferSize(
+        wanted_size: u32,
+        min_size: *mut u32,
+        max_size: *mut u32,
+    ) -> u32;
+
     /// Apply runtime profile (locality, established flag, …) before
     /// MainInit. Pass NULL for default behavior.
     pub fn TPMLIB_SetProfile(profile: *const c_char) -> TPM_RESULT;
