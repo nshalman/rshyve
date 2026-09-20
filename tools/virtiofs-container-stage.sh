@@ -31,6 +31,18 @@ HOST="${VMM_FIREHYVE_HOST:?set VMM_FIREHYVE_HOST to user@host of your illumos te
 KEY="${VMM_FIREHYVE_KEY:?set VMM_FIREHYVE_KEY to the SSH key for that node}"
 DIR="${VMM_FIREHYVE_DIR:-/var/tmp/virtiofs-test}"
 
+# The value is spliced into a command that a remote root shell parses, so
+# it is constrained to an absolute path made of path characters. A space,
+# a quote or a `$(...)` would otherwise run as root on the node.
+case "$DIR" in
+    /*) ;;
+    *) echo "STAGE-FAIL: VMM_FIREHYVE_DIR must be an absolute path" >&2; exit 1 ;;
+esac
+if printf '%s' "$DIR" | grep -qv '^[A-Za-z0-9_./-]*$'; then
+    echo "STAGE-FAIL: VMM_FIREHYVE_DIR may hold only letters, digits, _ . / -" >&2
+    exit 1
+fi
+
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SSH=(ssh -o ConnectTimeout=15 -i "$KEY" "$HOST")
 
