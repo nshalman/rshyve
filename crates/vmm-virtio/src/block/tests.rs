@@ -57,7 +57,6 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         nodelete: false,
         num_queues: 0,
         workers_per_queue: 0,
-        negotiated_features: Mutex::new(0),
         io_txs: Vec::new(),
         next_worker: Vec::new(),
         physmap: Arc::new(PhysMap::new()),

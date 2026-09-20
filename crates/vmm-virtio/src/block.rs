@@ -126,7 +126,6 @@ pub struct VirtioBlock {
     num_queues: u16,
     /// Number of I/O worker threads per queue.
     workers_per_queue: usize,
-    negotiated_features: Mutex<u64>,
     /// Per-worker I/O sender channels (flat: queue_idx * workers_per_queue + worker_idx).
     io_txs: Vec<mpsc::Sender<BlkIoRequest>>,
     /// Per-queue round-robin counter for dispatching to workers.
@@ -224,7 +223,6 @@ impl VirtioBlock {
             nodelete: opts.nodelete,
             num_queues,
             workers_per_queue,
-            negotiated_features: Mutex::new(0),
             io_txs,
             next_worker,
             physmap,
@@ -492,8 +490,10 @@ impl VirtioDevice for VirtioBlock {
         f
     }
 
-    fn set_features(&self, features: u64) {
-        *self.negotiated_features.lock().expect("lock") = features;
+    fn set_features(&self, _features: u64) {
+        // Every bit this device offers changes what the guest may ask
+        // for, not how the device answers, and the queues are told what
+        // was negotiated by the transport.
     }
 
     fn cfg_read(&self, offset: u16, len: u8) -> u32 {
@@ -670,7 +670,6 @@ impl VirtioDevice for VirtioBlock {
     /// A raise already past that check is abandoned, not waited for:
     /// injection is a call into the kernel, and this runs on a vCPU.
     fn reset(&self) {
-        *self.negotiated_features.lock().expect("lock") = 0;
         self.retire_rings();
     }
 }

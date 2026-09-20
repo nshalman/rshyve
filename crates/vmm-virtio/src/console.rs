@@ -334,7 +334,6 @@ fn reader_loop(shared: Arc<ConsoleShared>, mut stream: UnixStream) {
 pub struct VirtioConsole {
     shared: Arc<ConsoleShared>,
     accept: Mutex<Option<JoinHandle<()>>>,
-    negotiated_features: Mutex<u64>,
     indicator: Indicator,
 }
 
@@ -384,7 +383,6 @@ impl VirtioConsole {
         Ok(Self {
             shared,
             accept: Mutex::new(Some(accept)),
-            negotiated_features: Mutex::new(0),
             indicator: Indicator::new(),
         })
     }
@@ -570,10 +568,9 @@ impl VirtioDevice for VirtioConsole {
             | super::bits::VIRTIO_F_RING_INDIRECT_DESC
     }
 
-    fn set_features(&self, features: u64) {
-        // Store only: the modern transport calls this twice, once per
-        // 32-bit half, with a partial value on the first call.
-        *self.negotiated_features.lock().expect("features lock") = features;
+    fn set_features(&self, _features: u64) {
+        // The console reads no feature bit of its own, and the queues
+        // are told what was negotiated by the transport.
     }
 
     fn cfg_read(&self, _offset: u16, _len: u8) -> u32 {
@@ -622,7 +619,6 @@ impl VirtioDevice for VirtioConsole {
     }
 
     fn reset(&self) {
-        *self.negotiated_features.lock().expect("features lock") = 0;
         self.retire_rx_ring();
         // The host-side backlog survives a guest reset: those bytes
         // were accepted from the client and are still owed to the guest.
