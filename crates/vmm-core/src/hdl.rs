@@ -23,6 +23,7 @@ use bhyve_api::{
     VNO_OP_SET_DIRTY,
 };
 
+use crate::common::PAGE_SIZE;
 use crate::mem::Prot;
 
 mod vcpu;
@@ -553,55 +554,42 @@ impl VmmHdl {
     // Dirty page tracking (for live migration)
     // ---------------------------------------------------------------
 
-    /// Track dirty pages for a memory region.
+    /// Read and clear the dirty bits of a memory region.
     ///
-    /// Returns a bitmap where each bit represents a 4 KiB page.
-    /// Calling this atomically reads and clears the dirty bits.
-    ///
-    /// The `bitmap` buffer must be large enough to hold one bit per
-    /// page in the region: `ceil(len / 4096 / 8)` bytes.
+    /// Each bit of `bitmap` stands for one 4 KiB page, so it needs
+    /// `ceil(len / 4096 / 8)` bytes. The region is walked in
+    /// [`DIRTY_CHUNK`] pieces because the kernel refuses more per call.
     pub fn track_dirty_pages(
         &self,
         start_gpa: u64,
         len: usize,
         bitmap: &mut [u8],
     ) -> Result<()> {
-        let pages = len.div_ceil(4096);
-        let required_bytes = pages.div_ceil(8);
-        if bitmap.len() < required_bytes {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "bitmap too small: need {} bytes for {} pages, got {}",
-                    required_bytes,
-                    pages,
-                    bitmap.len(),
-                ),
-            ));
+        for chunk in dirty_chunks(start_gpa, len, bitmap.len())? {
+            let mut tracker = vmm_dirty_tracker {
+                vdt_start_gpa: chunk.gpa,
+                vdt_len: chunk.len,
+                // Safety: the slice outlives this ioctl, which blocks
+                // until the kernel has copied the bits out.
+                vdt_pfns: bitmap[chunk.bits.clone()].as_mut_ptr() as *mut _,
+            };
+            // Safety: vmm_dirty_tracker is the correct struct.
+            unsafe {
+                self.inner.ioctl(ioctls::VM_TRACK_DIRTY_PAGES, &mut tracker)
+            }?;
         }
-
-        let mut tracker = vmm_dirty_tracker {
-            vdt_start_gpa: start_gpa,
-            vdt_len: len,
-            // Safety: bitmap is a valid mutable slice that outlives this
-            // ioctl call (we block until it completes).
-            vdt_pfns: bitmap.as_mut_ptr() as *mut _,
-        };
-        // Safety: vmm_dirty_tracker is the correct struct.
-        unsafe {
-            self.inner.ioctl(ioctls::VM_TRACK_DIRTY_PAGES, &mut tracker)
-        }?;
         Ok(())
     }
 
-    /// Set pages as dirty in the NPT (for migration re-dirtying).
+    /// Mark pages dirty in the NPT, for a migration that has to send
+    /// them again.
     ///
-    /// Requires bhyve API version >= 17. Returns an error if the
-    /// kernel does not support this operation.
+    /// `bitmap` has the same shape as for [`Self::track_dirty_pages`].
+    /// Requires bhyve API version 17 or later.
     pub fn set_dirty_pages(
         &self,
         gpa: u64,
-        len: u64,
+        len: usize,
         bitmap: &[u8],
     ) -> Result<()> {
         let api_ver = self.api_version()?;
@@ -612,18 +600,18 @@ impl VmmHdl {
             ));
         }
 
-        let mut op = vm_npt_operation {
-            vno_gpa: gpa,
-            vno_len: len,
-            // Safety: bitmap is a valid slice that outlives this ioctl.
-            // The const-to-mut cast is required by the kernel interface
-            // but the kernel only reads from the bitmap when
-            // VNO_FLAG_BITMAP_IN is set.
-            vno_bitmap: bitmap.as_ptr() as *mut u8,
-            vno_operation: VNO_OP_SET_DIRTY | VNO_FLAG_BITMAP_IN,
-        };
-        // Safety: vm_npt_operation is the correct struct.
-        unsafe { self.inner.ioctl(ioctls::VM_NPT_OPERATION, &mut op) }?;
+        for chunk in dirty_chunks(gpa, len, bitmap.len())? {
+            let mut op = vm_npt_operation {
+                vno_gpa: chunk.gpa,
+                vno_len: chunk.len as u64,
+                // Safety: the slice outlives this ioctl. The kernel only
+                // reads through the pointer with VNO_FLAG_BITMAP_IN.
+                vno_bitmap: bitmap[chunk.bits.clone()].as_ptr() as *mut u8,
+                vno_operation: VNO_OP_SET_DIRTY | VNO_FLAG_BITMAP_IN,
+            };
+            // Safety: vm_npt_operation is the correct struct.
+            unsafe { self.inner.ioctl(ioctls::VM_NPT_OPERATION, &mut op) }?;
+        }
         Ok(())
     }
 
@@ -670,6 +658,75 @@ impl VmmHdl {
     }
 }
 
+/// Most guest memory one dirty-bitmap ioctl may cover.
+///
+/// The kernel caps `VM_TRACK_DIRTY_PAGES` at a bitmap of eight pages,
+/// which is 1 GiB of guest memory, and `VM_NPT_OPERATION` at the same
+/// bitmap size (`vmm_sol_dev.c`, `max_track_region_len` and
+/// `max_bitmap_size`).
+pub const DIRTY_CHUNK: usize = 8 * PAGE_SIZE * 8 * PAGE_SIZE;
+
+/// One ioctl's worth of a dirty-bitmap walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirtyChunk {
+    gpa: u64,
+    len: usize,
+    /// The bytes of the caller's bitmap this piece fills.
+    bits: std::ops::Range<usize>,
+}
+
+/// Split `[start_gpa, start_gpa + len)` into pieces the kernel accepts.
+///
+/// Checks what the kernel would refuse with a bare `EINVAL`, and that
+/// `bitmap_len` bytes hold a bit for every page, so no ioctl ever
+/// copies past the caller's buffer.
+fn dirty_chunks(
+    start_gpa: u64,
+    len: usize,
+    bitmap_len: usize,
+) -> Result<Vec<DirtyChunk>> {
+    let page = PAGE_SIZE as u64;
+    if !start_gpa.is_multiple_of(page) || !len.is_multiple_of(PAGE_SIZE) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "dirty range [{start_gpa:#x}, +{len:#x}) is not page aligned"
+            ),
+        ));
+    }
+    let end = start_gpa.checked_add(len as u64).ok_or_else(|| {
+        Error::new(ErrorKind::InvalidInput, "dirty range overflows")
+    })?;
+    let pages = len / PAGE_SIZE;
+    let required = pages.div_ceil(8);
+    if bitmap_len < required {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "bitmap too small: need {required} bytes for {pages} pages, \
+                 got {bitmap_len}"
+            ),
+        ));
+    }
+
+    let bits_per_chunk = DIRTY_CHUNK / PAGE_SIZE / 8;
+    let mut chunks = Vec::with_capacity(len.div_ceil(DIRTY_CHUNK));
+    let mut gpa = start_gpa;
+    let mut bit_off = 0;
+    while gpa < end {
+        let chunk_len = DIRTY_CHUNK.min((end - gpa) as usize);
+        let bit_len = (chunk_len / PAGE_SIZE).div_ceil(8);
+        chunks.push(DirtyChunk {
+            gpa,
+            len: chunk_len,
+            bits: bit_off..bit_off + bit_len,
+        });
+        gpa += chunk_len as u64;
+        bit_off += bits_per_chunk;
+    }
+    Ok(chunks)
+}
+
 impl AsRawFd for VmmHdl {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
@@ -682,7 +739,54 @@ impl AsFd for VmmHdl {
     }
 }
 
-// VmmHdl intentionally does NOT expose a generic ioctl method.
-// All operations must go through typed methods above.
-// To add new operations, add a new method here rather than
-// using a raw ioctl escape hatch.
+#[cfg(test)]
+mod dirty_chunk_tests {
+    use super::{dirty_chunks, DIRTY_CHUNK};
+    use crate::common::PAGE_SIZE;
+
+    #[test]
+    fn a_region_over_one_gib_is_split_at_the_kernel_cap() {
+        // A 4 GiB guest has a 3 GiB low region. One ioctl for it gets
+        // EINVAL, so the walk has to hand the kernel three pieces whose
+        // bitmap slices abut.
+        let len = 3 * DIRTY_CHUNK;
+        let chunks = dirty_chunks(0, len, len / PAGE_SIZE / 8).unwrap();
+        assert_eq!(chunks.len(), 3);
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(c.gpa, (i * DIRTY_CHUNK) as u64);
+            assert_eq!(c.len, DIRTY_CHUNK);
+            assert_eq!(c.bits, i * 0x8000..(i + 1) * 0x8000);
+        }
+    }
+
+    #[test]
+    fn the_last_piece_keeps_the_remainder() {
+        let len = DIRTY_CHUNK + 3 * PAGE_SIZE;
+        let chunks =
+            dirty_chunks(0x1_0000_0000, len, (len / PAGE_SIZE).div_ceil(8))
+                .unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[1].gpa, 0x1_0000_0000 + DIRTY_CHUNK as u64);
+        assert_eq!(chunks[1].len, 3 * PAGE_SIZE);
+        assert_eq!(chunks[1].bits, 0x8000..0x8001);
+    }
+
+    #[test]
+    fn a_short_bitmap_is_refused_before_any_ioctl() {
+        let len = 16 * PAGE_SIZE;
+        assert!(dirty_chunks(0, len, 1).is_err());
+        assert!(dirty_chunks(0, len, 2).is_ok());
+    }
+
+    #[test]
+    fn an_unaligned_range_is_refused_with_a_reason() {
+        assert!(dirty_chunks(1, PAGE_SIZE, 1).is_err());
+        assert!(dirty_chunks(0, PAGE_SIZE + 1, 1).is_err());
+        assert!(dirty_chunks(u64::MAX - 0xFFF, PAGE_SIZE * 2, 1).is_err());
+    }
+
+    #[test]
+    fn an_empty_range_needs_no_ioctl() {
+        assert!(dirty_chunks(0, 0, 0).unwrap().is_empty());
+    }
+}
