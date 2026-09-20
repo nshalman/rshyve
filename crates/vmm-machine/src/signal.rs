@@ -82,6 +82,13 @@ pub trait GuestStop: Send + Sync + 'static {
 /// over that socket.
 pub struct HdlStop(Arc<VmmHdl>);
 
+/// The `source` a suspend that did not come from a guest CPU carries.
+///
+/// `VM_SUSPEND` records it as the requesting vCPU, and the kernel reads
+/// -1 as "a device or the VMM". Zero names guest CPU 0, so a stop the
+/// operator asked for was reported against a CPU that did not ask.
+pub const SUSPEND_SOURCE_VMM: i32 = -1;
+
 impl HdlStop {
     pub fn new(hdl: Arc<VmmHdl>) -> Self {
         Self(hdl)
@@ -90,11 +97,15 @@ impl HdlStop {
 
 impl GuestStop for HdlStop {
     fn request_poweroff(&self) -> io::Result<()> {
-        self.0.suspend(SuspendHow::PowerOff, 0).map(|_| ())
+        self.0
+            .suspend(SuspendHow::PowerOff, SUSPEND_SOURCE_VMM)
+            .map(drop)
     }
 
     fn halt(&self) -> io::Result<()> {
-        self.0.suspend(SuspendHow::Halt, 0).map(|_| ())
+        self.0
+            .suspend(SuspendHow::Halt, SUSPEND_SOURCE_VMM)
+            .map(drop)
     }
 }
 

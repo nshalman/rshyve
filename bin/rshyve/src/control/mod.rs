@@ -57,7 +57,7 @@ use vmm_core::mem::PhysMap;
 use vmm_devices::quiesce::NamedDevice;
 use vmm_devices::DeviceMigrateState;
 use vmm_machine::signal::GuestStop;
-use vmm_machine::{DeviceRegistry, HotplugEngines};
+use vmm_machine::{DeviceRegistry, HotplugEngines, SUSPEND_SOURCE_VMM};
 
 use crate::host_state::HostLocalState;
 
@@ -333,16 +333,18 @@ impl VmController {
             // Another caller latched it. The suspend is on the
             // instance, so `Stopping` is the truth.
             StopOwner::Elsewhere => Ok(VmRunState::Stopping),
-            StopOwner::Running => match self.hdl.suspend(how, OPERATOR_STOP) {
-                Ok(_) => Ok(VmRunState::Stopping),
-                Err(e) => {
-                    self.state.store(from as u8, Ordering::Release);
-                    Err(StopFailure::NotLatched(e))
+            StopOwner::Running => {
+                match self.hdl.suspend(how, SUSPEND_SOURCE_VMM) {
+                    Ok(_) => Ok(VmRunState::Stopping),
+                    Err(e) => {
+                        self.state.store(from as u8, Ordering::Release);
+                        Err(StopFailure::NotLatched(e))
+                    }
                 }
-            },
+            }
             StopOwner::Parked => {
                 match release_paused_vm(
-                    || self.hdl.suspend(how, OPERATOR_STOP).map(drop),
+                    || self.hdl.suspend(how, SUSPEND_SOURCE_VMM).map(drop),
                     || self.hdl.resume(),
                 ) {
                     Ok(()) => Ok(VmRunState::Stopping),
@@ -530,12 +532,6 @@ impl From<StopFailure<io::Error>> for io::Error {
         failure.into_inner()
     }
 }
-
-/// The `source` a suspend the operator asked for carries.
-///
-/// `VM_SUSPEND` records it as the requesting vCPU, and -1 is what the
-/// kernel reads as "a device or an operator", not guest CPU 0.
-const OPERATOR_STOP: i32 = -1;
 
 /// Stop a paused VM without letting its guest run one more instruction.
 ///

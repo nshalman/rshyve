@@ -320,7 +320,10 @@ fn run(
         build.api_version,
         None,
         log,
-    );
+    )
+    .map_err(|e| {
+        anyhow::anyhow!("failed to start the boot vCPU threads: {e}")
+    })?;
     let cpu_hotplug = vmm_machine::start_cpu_hotplug(
         timer_pm.hotplug.as_ref(),
         VcpuSetup {

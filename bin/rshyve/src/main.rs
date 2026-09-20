@@ -438,7 +438,8 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         api_version,
         hyperv.clone().map(|hv| hv as Arc<dyn MsrHandler>),
         log,
-    );
+    )
+    .context("failed to start the boot vCPU threads")?;
     let vcpu_metrics = fleet.metrics.clone();
 
     // Phase 10: Post-migration timer kick + delayed virtio interrupt

@@ -61,7 +61,9 @@ pub use pm::{
 pub use registry::{
     DeviceRegistry, RegisteredDevice, RegistryError, SlotState,
 };
-pub use signal::{install_sigterm_handler, sigterm_flag, sigterm_received};
+pub use signal::{
+    install_sigterm_handler, sigterm_flag, sigterm_received, SUSPEND_SOURCE_VMM,
+};
 pub use teardown::{
     registry_named_devices, run_fleet_event_loop, RunOutcome, VcpuThreads,
 };

@@ -4,16 +4,20 @@
 
 //! vCPU activation and thread spawn.
 
+use std::io;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use slog::{info, warn, Logger};
+use slog::{error, info, warn, Logger};
+use vmm_core::hdl::SuspendHow;
 use vmm_core::machine::Machine;
 use vmm_core::msr::MsrHandler;
 use vmm_core::vcpu::Vcpu;
 use vmm_devices::metrics::VcpuMetrics;
 
+use crate::signal::SUSPEND_SOURCE_VMM;
 use crate::teardown::VcpuThreads;
 use crate::vcpu_tasks::{self, VcpuEvent, VcpuThreadCtx};
 
@@ -176,17 +180,25 @@ pub struct VcpuFleet {
     pub ctx: VcpuThreadCtx,
 }
 
+/// How long an abandoned boot set gets to leave the kernel.
+const BOOT_ABORT_JOIN: Duration = Duration::from_secs(5);
+
 /// Spawn the boot vCPU threads and keep the parts a later vCPU needs.
 ///
 /// `msr_handler` is a trait object so this crate does not name the crate
 /// that supplies the synthetic MSRs. Only rshyve has one.
+///
+/// A refused thread fails the boot rather than aborting the process. The
+/// boot vCPUs are activated before this call, so the ones already
+/// started are running guest code: the halt below is what gets them out
+/// of the kernel before the caller unwinds past the machine.
 pub fn spawn_vcpu_fleet(
     machine: &Machine,
     num_cpus: u32,
     api_version: u32,
     msr_handler: Option<Arc<dyn MsrHandler>>,
     log: &Logger,
-) -> VcpuFleet {
+) -> io::Result<VcpuFleet> {
     info!(log, "starting vCPU threads");
 
     let metrics: Vec<Arc<VcpuMetrics>> = (0..num_cpus)
@@ -197,13 +209,34 @@ pub fn spawn_vcpu_fleet(
     let (sender, events) = mpsc::channel();
     let threads = VcpuThreads::new();
 
-    for handle in vcpu_tasks::spawn_boot_threads(
+    let started = match vcpu_tasks::spawn_boot_threads(
         &ctx,
         machine.vcpus(),
         &metrics,
         &sender,
         log,
     ) {
+        Ok(started) => started,
+        Err(refused) => {
+            error!(log, "a boot vCPU thread was refused; stopping the                 partly started boot set";
+                "vcpu" => refused.vcpu,
+                "started" => refused.started.len(),
+                "error" => %refused.source);
+            if let Err(e) =
+                machine.hdl().suspend(SuspendHow::Halt, SUSPEND_SOURCE_VMM)
+            {
+                error!(log, "the partly started boot set was not halted";
+                    "error" => %e);
+            }
+            if !vmm_core::thread::join_bounded(refused.started, BOOT_ABORT_JOIN)
+            {
+                error!(log, "a boot vCPU thread did not leave the kernel");
+            }
+            return Err(refused.source);
+        }
+    };
+
+    for handle in started {
         // A roster is only closed by teardown, and teardown cannot run
         // before the threads it joins were made.
         threads
@@ -211,13 +244,13 @@ pub fn spawn_vcpu_fleet(
             .expect("a fresh roster accepts every boot thread");
     }
 
-    VcpuFleet {
+    Ok(VcpuFleet {
         events,
         sender,
         threads,
         metrics,
         ctx,
-    }
+    })
 }
 
 #[cfg(test)]
