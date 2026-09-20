@@ -27,16 +27,21 @@ use std::sync::Arc;
 use vmm_core::mem::PhysMap;
 
 use super::fuse::{self, bytes_of, push_val, read_at};
-use super::passthrough::{Passthrough, PtError};
+use super::passthrough::Passthrough;
 use crate::chain_io::{ChainReader, ChainWriter};
 use crate::queue::ChainBuf;
 
-/// Upper bound on the size of a request body we are willing to read from the
-/// guest before processing. Caps individual FUSE messages at 1 MiB.
-pub const MAX_MSG_SIZE: usize = 1024 * 1024;
+/// Largest write payload the server promises the guest in FUSE_INIT_OUT.
+pub const INIT_MAX_WRITE: u32 = 512 * 1024;
+
+/// Upper bound on one FUSE message body, in either direction.
+///
+/// Twice [`INIT_MAX_WRITE`], so a write of the promised size still fits
+/// beside its header, and a READ or READDIR the guest asks for is capped
+/// here whatever it asks for.
+pub const MAX_MSG_SIZE: usize = 2 * INIT_MAX_WRITE as usize;
 
 /// Per-server limits exposed to the guest in FUSE_INIT_OUT.
-pub const INIT_MAX_WRITE: u32 = 512 * 1024;
 pub const INIT_MAX_BACKGROUND: u16 = 64;
 pub const INIT_CONGESTION: u16 = 48;
 pub const INIT_TIME_GRAN: u32 = 1;
@@ -347,13 +352,6 @@ impl FuseServer {
             Some(v) => v,
             None => return Reply::Error(-libc::EINVAL),
         };
-        // O_TRUNC truncates even alongside O_RDONLY on illumos, so the
-        // access mode alone does not say whether an open mutates.
-        let mutating = oi.flags & libc::O_ACCMODE as u32 != 0
-            || oi.flags & libc::O_TRUNC as u32 != 0;
-        if self.passthrough.is_read_only() && mutating {
-            return Reply::Error(-libc::EROFS);
-        }
         match self.passthrough.open(header.nodeid, oi.flags) {
             Ok(fh) => Reply::Body(bytes_of(&fuse::FuseOpenOut {
                 fh,
@@ -423,7 +421,6 @@ impl FuseServer {
         };
         let max = (rd.size as usize).min(MAX_MSG_SIZE);
         let mut out: Vec<u8> = Vec::with_capacity(max.min(64 * 1024));
-        let mut saw_err: Option<PtError> = None;
         let pt = &self.passthrough;
         let res = pt.readdir_each(rd.fh, rd.offset, |ino, name, dt, next| {
             let name_bytes = name.to_bytes();
@@ -438,13 +435,17 @@ impl FuseServer {
                 return false;
             }
             if with_plus {
-                let entry = match pt.lookup(header.nodeid, name) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        saw_err = Some(e);
-                        return false;
-                    }
-                };
+                // An entry the lookup refuses, a socket or a FIFO, one
+                // unlinked since the snapshot, or one past the inode
+                // cap, still goes out with nodeid 0. Linux takes that
+                // as "not cached" and looks the name up on its own, so
+                // it gets that entry's error rather than losing the
+                // whole listing to it. No lookup reference is left
+                // behind: only the entries the guest is told about
+                // take one.
+                let entry = pt
+                    .lookup(header.nodeid, name)
+                    .unwrap_or_else(|_| fuse::FuseEntryOut::default());
                 push_val(&mut out, &entry);
             }
             let d = fuse::FuseDirent {
@@ -461,9 +462,6 @@ impl FuseServer {
             true
         });
         if let Err(e) = res {
-            return Reply::Error(-e.to_errno());
-        }
-        if let Some(e) = saw_err {
             return Reply::Error(-e.to_errno());
         }
         Reply::Body(out)

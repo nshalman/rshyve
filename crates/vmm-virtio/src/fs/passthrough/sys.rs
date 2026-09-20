@@ -1,0 +1,283 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! The syscalls this server makes, and the conversions around them.
+//!
+//! Every descriptor is opened `O_CLOEXEC`, because the VMM re-execs
+//! itself on a guest reboot, and `O_NOFOLLOW`, because a name in the
+//! export is not the server's to resolve through.
+
+use std::ffi::{CStr, CString};
+use std::os::fd::RawFd;
+use std::path::Path;
+
+use super::fuse::{self, FuseAttr};
+use super::{errno, last_os, FileType, PtError, PtResult};
+
+pub(super) fn path_cstring(p: &Path) -> PtResult<CString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        CString::new(p.as_os_str().as_bytes()).map_err(|_| {
+            PtError::InvalidName(p.to_string_lossy().into_owned().into_bytes())
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        CString::new(p.to_string_lossy().into_owned())
+            .map_err(|_| PtError::InvalidName(Vec::new()))
+    }
+}
+
+/// Validate a single path component.
+///
+/// * Empty → EINVAL.
+/// * Contains `/` → EINVAL (caller shouldn't compose paths).
+/// * Exactly `.` or `..` → EINVAL.
+/// * Contains NUL → impossible via CStr, but we double-check as bytes.
+pub fn validate_name(name: &[u8]) -> PtResult<()> {
+    if name.is_empty()
+        || name == b"."
+        || name == b".."
+        || name.contains(&b'/')
+        || name.contains(&0)
+    {
+        return Err(PtError::InvalidName(name.to_vec()));
+    }
+    Ok(())
+}
+
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit.
+///
+/// The soft limit is a few thousand by default and every cached inode
+/// costs one fd, so a guest listing a large tree would hit it long
+/// before [`PtLimits`] does, and every fd-consuming path in the VMM
+/// would fail with it. Returns the soft limit now in force.
+pub fn raise_fd_limit() -> std::io::Result<libc::rlim_t> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let target = fd_limit_target(lim.rlim_max);
+    if lim.rlim_cur >= target {
+        return Ok(lim.rlim_cur);
+    }
+    lim.rlim_cur = target;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(target)
+}
+
+/// macOS refuses a soft `RLIMIT_NOFILE` above `OPEN_MAX` even when the
+/// hard limit reads as unlimited. Development hosts only; illumos takes
+/// its hard limit as it stands.
+#[cfg(target_os = "macos")]
+fn fd_limit_target(hard: libc::rlim_t) -> libc::rlim_t {
+    hard.min(10240)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fd_limit_target(hard: libc::rlim_t) -> libc::rlim_t {
+    hard
+}
+
+/// Translate the guest's Linux open flags, refusing bits this server
+/// does not know rather than guessing at a host meaning for them.
+pub(super) fn parse_open_flags(flags: u32) -> PtResult<fuse::OpenFlags> {
+    fuse::OpenFlags::from_linux(flags).map_err(|_| errno(libc::EINVAL))
+}
+
+pub(super) fn fstat(fd: RawFd) -> PtResult<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    if rc != 0 {
+        return Err(last_os());
+    }
+    Ok(st)
+}
+
+pub(super) fn fstatat_nofollow(
+    parent: RawFd,
+    name: &CStr,
+) -> PtResult<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::fstatat(parent, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+    };
+    if rc != 0 {
+        return Err(last_os());
+    }
+    Ok(st)
+}
+
+/// Open `name` under `parent`, never following a final symlink and
+/// never waiting.
+///
+/// `O_NONBLOCK` is what keeps the single FUSE worker running: a FIFO
+/// opened without it blocks until a peer appears at the other end, and
+/// the export is allowed to contain one. The flag is inert on the
+/// regular files and directories this server serves, and the caller
+/// checks what it opened.
+/// The `(dev, ino)` pair naming one host file.
+///
+/// `dev_t` and `ino_t` differ in width between illumos and the
+/// development hosts, so the widening happens here once rather than at
+/// every caller.
+#[allow(clippy::unnecessary_cast)]
+pub(super) fn dev_ino(st: &libc::stat) -> (u64, u64) {
+    (st.st_dev as u64, st.st_ino as u64)
+}
+
+/// Open the child the caller probed, and hand back the stat of what was
+/// really opened.
+///
+/// The name is resolved a second time by the open, so what arrives need
+/// not be what was probed: anything with write access to the export can
+/// swap it in between. The descriptor is then the authority for both the
+/// type and the identity, and a disagreement is reported as the stale
+/// name it is. A symlink has no descriptor, so its probe stands.
+pub(super) fn open_child(
+    parent_fd: RawFd,
+    name: &CStr,
+    probe: &libc::stat,
+    ftype: FileType,
+) -> PtResult<(Option<RawFd>, libc::stat)> {
+    if ftype == FileType::Symlink {
+        return Ok((None, *probe));
+    }
+    let flags = if ftype == FileType::Directory {
+        libc::O_RDONLY | libc::O_DIRECTORY
+    } else {
+        libc::O_RDONLY
+    };
+    let fd = openat_nofollow(parent_fd, name, flags)?;
+    let opened = fstat(fd).inspect_err(|_| {
+        unsafe { libc::close(fd) };
+    })?;
+    if FileType::from_mode(opened.st_mode as u32) != Some(ftype)
+        || opened.st_dev != probe.st_dev
+        || opened.st_ino != probe.st_ino
+    {
+        unsafe { libc::close(fd) };
+        return Err(errno(libc::ESTALE));
+    }
+    Ok((Some(fd), opened))
+}
+
+pub(super) fn openat_nofollow(
+    parent: RawFd,
+    name: &CStr,
+    flags: libc::c_int,
+) -> PtResult<RawFd> {
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(last_os());
+    }
+    Ok(fd)
+}
+
+// The width of each `libc::stat` field changes between targets: `st_mode`
+// and `st_nlink` are 16-bit on macOS and 32-bit on illumos, and `st_rdev`
+// is signed on one and unsigned on the other. Keep every cast so the
+// function builds on all of them.
+#[allow(clippy::unnecessary_cast)]
+pub fn stat_to_attr(st: &libc::stat) -> FuseAttr {
+    FuseAttr {
+        ino: st.st_ino as u64,
+        size: st.st_size as u64,
+        blocks: st.st_blocks as u64,
+        atime: st.st_atime as u64,
+        mtime: st.st_mtime as u64,
+        ctime: st.st_ctime as u64,
+        atimensec: nsec(st.st_atime_nsec),
+        mtimensec: nsec(st.st_mtime_nsec),
+        ctimensec: nsec(st.st_ctime_nsec),
+        mode: st.st_mode as u32,
+        nlink: st.st_nlink as u32,
+        uid: st.st_uid as u32,
+        gid: st.st_gid as u32,
+        rdev: st.st_rdev as u32,
+        blksize: st.st_blksize as u32,
+        flags: 0,
+    }
+}
+
+fn nsec(val: i64) -> u32 {
+    (val as u32).min(999_999_999)
+}
+
+/// Re-open a file by its existing descriptor, with new flags.
+///
+/// Through the procfs magic symlink, so no name is resolved a second
+/// time and the new descriptor is certainly the same file: on illumos
+/// `pr_open` for `PR_FD` refuses a mode wider than the source
+/// descriptor's unless the caller is privileged, which is why a rw share
+/// needs the VMM to be root. No `O_NOFOLLOW`, because the magic symlink
+/// itself would then trip ELOOP.
+pub(super) fn reopen_fd(fd: RawFd, flags: libc::c_int) -> PtResult<RawFd> {
+    let path = CString::new(format!("/proc/self/fd/{fd}")).unwrap();
+    let new_fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
+    if new_fd < 0 {
+        return Err(last_os());
+    }
+    Ok(new_fd)
+}
+
+/// Build a timespec for futimens given FUSE setattr inputs.
+pub(super) fn build_timespec(
+    has_explicit: bool,
+    want_now: bool,
+    sec: u64,
+    nsec: u32,
+) -> libc::timespec {
+    if want_now {
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_NOW,
+        }
+    } else if has_explicit {
+        libc::timespec {
+            tv_sec: sec as libc::time_t,
+            tv_nsec: nsec as libc::c_long,
+        }
+    } else {
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        }
+    }
+}
+
+// Portable errno accessors. Rust's `std::io::Error::last_os_error()` reads
+// errno but doesn't let us clear it; we need the raw pointer for readdir.
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+fn errno_ptr() -> *mut libc::c_int {
+    unsafe { libc::___errno() }
+}
+#[cfg(target_os = "linux")]
+fn errno_ptr() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+#[cfg(target_os = "macos")]
+fn errno_ptr() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+pub(super) fn set_errno(v: i32) {
+    unsafe { *errno_ptr() = v };
+}
+
+pub(super) fn get_errno() -> i32 {
+    unsafe { *errno_ptr() }
+}

@@ -7,10 +7,13 @@
 //!
 //! # Invariants
 //!
-//! An entry leaves the socket table only for the socket that is in it
-//! now. The guest picks the key, so it can close a connection and open
-//! the same key again while an unlocked write is still running.
-//! Removing by key alone would drop the new connection's socket.
+//! A connection is named by its socket, not by its key. The guest
+//! picks the key, so it can close a connection and open the same key
+//! again while an unlocked write, or a reader thread that has not
+//! woken yet, still holds the old one. Every caller that acts on a
+//! connection it learned about earlier therefore names the socket it
+//! served, and [`VsockShared::release_socket`] refuses a key another
+//! connection has taken.
 //!
 //! The reader table bounds the thread count. The mux connection cap
 //! cannot: a peer that connects and sends no CONNECT line holds a
@@ -18,13 +21,15 @@
 
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use slog::debug;
 use vmm_core::unixsock::write_all_bounded;
 
 use super::shared::{VsockShared, HOST_WRITE_TIMEOUT};
+use crate::vsock::control::MAX_CONTROL_SESSIONS;
 use crate::vsock::mux::MAX_CONNS;
 use crate::vsock::packet::ConnKey;
 
@@ -52,32 +57,53 @@ impl VsockShared {
             debug!(self.log, "virtio-vsock host write gave up";
                 "error" => %error);
             // A dead peer and one that stopped reading for
-            // HOST_WRITE_TIMEOUT are the same to the guest.
-            self.drop_socket_if_current(key, &stream);
+            // HOST_WRITE_TIMEOUT are the same to the guest, and the
+            // guest hears it here rather than when the reader wakes:
+            // the reader can no longer tell for a socket this took out
+            // of the table.
+            if self.release_socket(key, &stream) {
+                self.mux.queue_host_close(key);
+                self.deliver_rx();
+            }
         }
     }
 
     /// Take `key` out of the table and shut its socket down, so that
-    /// this connection's reader wakes and tells the guest it has gone.
+    /// this connection's reader wakes.
     ///
-    /// The entry goes only while `stream` still holds it. The guest
-    /// picks the key for a connection it opens, so it can close one
-    /// and reopen the same key while an unlocked write is running.
-    fn drop_socket_if_current(&self, key: ConnKey, stream: &Arc<UnixStream>) {
+    /// Returns whether the entry was still this socket's, which is the
+    /// caller's permission to speak for the connection. A key another
+    /// connection has taken, or one already released, answers false:
+    /// the guest picks the key and can reopen it while a write or a
+    /// reader thread still holds the old socket.
+    pub(super) fn release_socket(
+        &self,
+        key: ConnKey,
+        stream: &Arc<UnixStream>,
+    ) -> bool {
         let mut sockets = self.sockets.lock().expect("sockets lock");
-        if sockets
+        let ours = sockets
             .get(&key)
-            .is_some_and(|held| Arc::ptr_eq(held, stream))
-        {
+            .is_some_and(|held| Arc::ptr_eq(held, stream));
+        if ours {
             sockets.remove(&key);
         }
         drop(sockets);
         // The peer may already be gone; there is nothing to do.
         let _ = stream.shutdown(Shutdown::Both);
+        ours
     }
 
     /// Put a host socket in the table, ready to be written to.
-    pub(super) fn register_socket(&self, key: ConnKey, stream: UnixStream) {
+    ///
+    /// The caller hands the returned handle to the connection's reader
+    /// thread, so the reader and the table name one socket and the
+    /// reader can prove at exit that the connection is still its own.
+    pub(super) fn register_socket(
+        &self,
+        key: ConnKey,
+        stream: UnixStream,
+    ) -> Arc<UnixStream> {
         // Belt and braces only. This bounds a write on the platforms
         // where it works, and reports success and does nothing on
         // illumos, which is why `write_all_bounded` polls instead.
@@ -85,10 +111,12 @@ impl VsockShared {
             debug!(self.log, "virtio-vsock write timeout not set";
                 "error" => %error);
         }
+        let stream = Arc::new(stream);
         self.sockets
             .lock()
             .expect("sockets lock")
-            .insert(key, Arc::new(stream));
+            .insert(key, Arc::clone(&stream));
+        stream
     }
 
     pub(super) fn drop_socket(&self, key: ConnKey) {
@@ -109,31 +137,121 @@ impl VsockShared {
             .collect()
     }
 
-    /// Register a reader thread, dropping the handles whose threads
-    /// have ended.
+    /// Take a slot for one more thread, or refuse when the table is
+    /// full.
     ///
-    /// The vector is otherwise only drained by halt, so a peer that
-    /// connects and disconnects in a loop grows it, and every handle in
-    /// it, for the life of the VM.
-    pub(super) fn track_reader(&self, handle: JoinHandle<()>) {
-        let mut readers = self.readers.lock().expect("reader lock");
-        readers.retain(|h| !h.is_finished());
-        readers.push(handle);
+    /// Reserving is one step, so both the accept loop and the guest's
+    /// own connections are held to the same bound: checking, spawning
+    /// and recording separately let two callers past the same free
+    /// slot. Handles whose threads have ended are dropped here, since
+    /// halt is otherwise the only thing that drains them and a peer
+    /// that connects and disconnects in a loop would grow the table
+    /// for the life of the VM.
+    pub(super) fn reserve_reader(&self) -> Option<ReaderSlot<'_>> {
+        let mut table = self.readers.lock().expect("reader lock");
+        table.handles.retain(|h| !h.is_finished());
+        if table.handles.len() + table.reserved >= MAX_CONNS {
+            return None;
+        }
+        table.reserved += 1;
+        Some(ReaderSlot {
+            readers: &self.readers,
+            filled: false,
+        })
     }
 
-    /// Whether another reader thread may start.
-    pub(super) fn reader_slot_free(&self) -> bool {
-        let mut readers = self.readers.lock().expect("reader lock");
-        readers.retain(|h| !h.is_finished());
-        readers.len() < MAX_CONNS
+    /// Take a place among the CONTROL sessions, or refuse.
+    ///
+    /// CONTROL shares the reader table with every CONNECT, and an
+    /// established session may idle, so without a quota of its own a
+    /// handful of idle CONTROL peers can take every slot and leave the
+    /// operator unable to connect at all.
+    pub(super) fn reserve_control_session(
+        &self,
+    ) -> Option<ControlSessionSlot<'_>> {
+        let mut held = self.control_sessions.load(Ordering::Acquire);
+        loop {
+            if held >= MAX_CONTROL_SESSIONS {
+                return None;
+            }
+            match self.control_sessions.compare_exchange_weak(
+                held,
+                held + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ControlSessionSlot(&self.control_sessions))
+                }
+                Err(now) => held = now,
+            }
+        }
+    }
+
+    /// Record a thread in the reader table.
+    ///
+    /// Tests use this to fill the table without an accept; production
+    /// reserves a slot first and fills it.
+    #[cfg(test)]
+    pub(super) fn track_reader(&self, handle: JoinHandle<()>) {
+        self.reserve_reader().expect("a reader slot").fill(handle);
+    }
+
+    /// Reader threads the table still holds.
+    #[cfg(test)]
+    pub(super) fn reader_count(&self) -> usize {
+        self.readers.lock().expect("reader lock").handles.len()
     }
 
     /// Take every reader handle, for the halt join.
     pub(super) fn take_readers(&self) -> Vec<JoinHandle<()>> {
-        self.readers
-            .lock()
-            .expect("reader lock")
-            .drain(..)
-            .collect()
+        std::mem::take(&mut self.readers.lock().expect("reader lock").handles)
+    }
+}
+
+/// One CONTROL session's place in the quota that verb has.
+pub(super) struct ControlSessionSlot<'a>(&'a AtomicUsize);
+
+impl Drop for ControlSessionSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The reader threads and the slots promised to threads not yet
+/// started.
+#[derive(Default)]
+pub(super) struct ReaderTable {
+    handles: Vec<JoinHandle<()>>,
+    reserved: usize,
+}
+
+/// A slot taken by [`VsockShared::reserve_reader`].
+///
+/// Either it is filled by the thread it was taken for, or dropping it
+/// gives the slot back. A spawn that fails therefore costs nothing,
+/// where a caller that recorded the thread after starting it would
+/// leak a slot for every failure.
+pub(super) struct ReaderSlot<'a> {
+    readers: &'a Mutex<ReaderTable>,
+    filled: bool,
+}
+
+impl ReaderSlot<'_> {
+    pub(super) fn fill(mut self, handle: JoinHandle<()>) {
+        let mut table = self.readers.lock().expect("reader lock");
+        table.handles.push(handle);
+        table.reserved -= 1;
+        drop(table);
+        self.filled = true;
+    }
+}
+
+impl Drop for ReaderSlot<'_> {
+    fn drop(&mut self) {
+        if self.filled {
+            return;
+        }
+        self.readers.lock().expect("reader lock").reserved -= 1;
     }
 }

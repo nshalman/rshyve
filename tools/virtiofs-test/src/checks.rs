@@ -360,6 +360,11 @@ pub fn run_write_checks(rep: &mut Report, mnt: &Path, read_only: bool) {
             rep.run(name, || f(mnt));
         }
     }
+    // Needs a mutation to mean anything, so a read-only share skips it
+    // rather than expecting EROFS from the listing that comes first.
+    if !read_only {
+        rep.run("readdir_after_change", || readdir_after_change(mnt));
+    }
 }
 
 /// On a read-only share a mutation must fail, and fail with EROFS
@@ -440,6 +445,54 @@ fn readdir_root(mnt: &Path) -> Check {
         }
     }
     Ok(format!("{} entries", names.len()))
+}
+
+/// List a directory, change it, and list it again.
+///
+/// The second listing is the one that catches a server whose OPENDIR
+/// does not start at the beginning of the directory. Linux serves the
+/// first listing again from its page cache while the directory's mtime
+/// is unchanged, so the mutation is what forces the second OPENDIR and
+/// READDIR onto the wire. A server that answers it with nothing makes
+/// the directory look empty for the life of the inode.
+fn readdir_after_change(mnt: &Path) -> Check {
+    let dir = mnt.join("readdir-twice");
+    std::fs::create_dir(&dir).map_err(errstr)?;
+    for name in ["one", "two"] {
+        std::fs::write(dir.join(name), b"x").map_err(errstr)?;
+    }
+    let first = listing(&dir)?;
+    if first.len() != 2 {
+        return Err(format!("first listing is {first:?}"));
+    }
+
+    std::fs::write(dir.join("three"), b"x").map_err(errstr)?;
+    let second = listing(&dir)?;
+    if second.len() != 3 {
+        return Err(format!("second listing is {second:?}, want 3 entries"));
+    }
+    for want in &first {
+        if !second.contains(want) {
+            return Err(format!("{want} vanished from {second:?}"));
+        }
+    }
+
+    std::fs::remove_dir_all(&dir).map_err(errstr)?;
+    Ok("3 entries after the change".to_string())
+}
+
+fn listing(dir: &Path) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for ent in std::fs::read_dir(dir).map_err(errstr)? {
+        names.push(
+            ent.map_err(errstr)?
+                .file_name()
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    names.sort();
+    Ok(names)
 }
 
 fn readlink(mnt: &Path) -> Check {

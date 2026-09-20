@@ -407,6 +407,11 @@ fn notify_queue_drains_the_ring_and_never_pushes_used() {
 
 // A guest can keep advancing avail_idx during the EVENT_IDX re-check.
 // One notification must retain at most one queue's worth of work.
+//
+// The cap exit still arms the kick. The worker answers off the vCPU, so
+// nothing returns to this ring on its own: leaving `avail_event` behind
+// tells the guest to suppress the notification the device is waiting
+// for, and the queue stalls for the life of the driver.
 #[test]
 fn notify_queue_caps_collection_at_queue_size() {
     const AVAIL_EVENT_SENTINEL: u16 = 0x55aa;
@@ -426,7 +431,11 @@ fn notify_queue_caps_collection_at_queue_size() {
 
     assert_eq!(queues[req].last_avail_idx(), queues[req].size());
     assert!(queues[req].has_new_avail(&physmap));
-    assert_eq!(avail_event(&physmap, &queues[req]), AVAIL_EVENT_SENTINEL);
+    assert_eq!(
+        avail_event(&physmap, &queues[req]),
+        queues[req].last_avail_idx(),
+        "the cap exit left the guest's kick suppressed"
+    );
     assert_eq!(queues[req].read_used_idx(&physmap), 0);
 }
 
