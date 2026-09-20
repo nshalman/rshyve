@@ -31,12 +31,17 @@ use super::passthrough::Passthrough;
 use crate::chain_io::{ChainReader, ChainWriter};
 use crate::queue::ChainBuf;
 
-/// Upper bound on the size of a request body we are willing to read from the
-/// guest before processing. Caps individual FUSE messages at 1 MiB.
-pub const MAX_MSG_SIZE: usize = 1024 * 1024;
+/// Largest write payload the server promises the guest in FUSE_INIT_OUT.
+pub const INIT_MAX_WRITE: u32 = 512 * 1024;
+
+/// Upper bound on one FUSE message body, in either direction.
+///
+/// Twice [`INIT_MAX_WRITE`], so a write of the promised size still fits
+/// beside its header, and a READ or READDIR the guest asks for is capped
+/// here whatever it asks for.
+pub const MAX_MSG_SIZE: usize = 2 * INIT_MAX_WRITE as usize;
 
 /// Per-server limits exposed to the guest in FUSE_INIT_OUT.
-pub const INIT_MAX_WRITE: u32 = 512 * 1024;
 pub const INIT_MAX_BACKGROUND: u16 = 64;
 pub const INIT_CONGESTION: u16 = 48;
 pub const INIT_TIME_GRAN: u32 = 1;

@@ -69,9 +69,6 @@ fn run_park(slot: &ParkSlot) {
     }
 }
 
-/// The transport interrupt path, wired by the binary after
-/// `VirtioPciDevice::new`.
-///
 /// Parsed `-s <slot>,virtio-fs,<config>` options.
 #[derive(Debug, Clone)]
 pub struct VirtioFsOpts {

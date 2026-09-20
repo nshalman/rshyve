@@ -7,8 +7,6 @@
 //! Targets FUSE ABI 7.33. All on-the-wire structures are packed little-endian
 //! (host and guest are both little-endian on x86_64).
 
-#![allow(dead_code)]
-
 // ---------------------------------------------------------------------------
 // Protocol version
 // ---------------------------------------------------------------------------
