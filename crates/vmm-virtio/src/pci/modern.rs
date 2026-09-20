@@ -429,8 +429,15 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 vs.queue_select = val as u16;
             }
             bits::COMMON_CFG_QUEUE_SIZE => {
-                // Modern transport allows writing queue size (power of 2).
-                // We accept only if it equals our fixed size (simplification).
+                let idx = usize::from(vs.queue_select);
+                let verdict =
+                    vs.selected_queue_mut().map(|q| q.set_size(val as u16));
+                if let Some(Err(error)) = verdict {
+                    if self.set_needs_reset(vs) {
+                        slog::debug!(self.log, "virtio-pci refused a queue size";
+                            "queue" => idx, "reason" => %error);
+                    }
+                }
             }
             bits::COMMON_CFG_QUEUE_MSIX_VECTOR => {
                 let idx = vs.queue_select as usize;

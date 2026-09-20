@@ -129,14 +129,38 @@ impl std::fmt::Display for QueueAddrError {
     }
 }
 
+/// Why the device refuses the ring size a driver wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueSizeError {
+    /// Zero, not a power of two, or larger than the device offered.
+    Invalid { size: u16, max: u16 },
+    /// The ring is programmed; its size is fixed until a reset.
+    Live,
+}
+
+impl std::fmt::Display for QueueSizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid { size, max } => write!(
+                f,
+                "queue size {size} is not a power of two in 1..={max}"
+            ),
+            Self::Live => write!(f, "queue size written on a programmed ring"),
+        }
+    }
+}
+
 /// A split virtqueue.
 ///
 /// Manages the descriptor table, available ring, and used ring for one
 /// queue. The queue addresses are set by the guest during device init
 /// via the legacy PCI transport (queue PFN register).
 pub struct VirtQueue {
-    /// Queue size (number of descriptors). Must be a power of 2.
+    /// The ring size in use. A modern driver may shrink it below
+    /// `max_size` before it enables the queue (sec 4.1.4.3.2).
     size: u16,
+    /// The size the device offers, and returns to on reset.
+    max_size: u16,
     /// Guest physical address of the descriptor table.
     desc_addr: u64,
     /// Guest physical address of the available ring.
@@ -177,6 +201,7 @@ impl VirtQueue {
         assert!(size <= MAX_QUEUE_SIZE, "queue size exceeds maximum");
         Self {
             size,
+            max_size: size,
             desc_addr: 0,
             avail_addr: 0,
             used_addr: 0,
@@ -197,6 +222,26 @@ impl VirtQueue {
     /// Get the queue size (number of descriptors).
     pub fn size(&self) -> u16 {
         self.size
+    }
+
+    /// Take the ring size a modern driver wrote.
+    ///
+    /// The driver may only shrink the ring, and only before it
+    /// programs the addresses: the device reads and writes `size`
+    /// entries, so a size that changes under a live ring walks past
+    /// the ring the driver allocated.
+    pub fn set_size(&mut self, size: u16) -> Result<(), QueueSizeError> {
+        if size == 0 || !size.is_power_of_two() || size > self.max_size {
+            return Err(QueueSizeError::Invalid {
+                size,
+                max: self.max_size,
+            });
+        }
+        if self.is_configured() {
+            return Err(QueueSizeError::Live);
+        }
+        self.size = size;
+        Ok(())
     }
 
     /// Returns true if the queue has been configured with valid addresses.
@@ -361,6 +406,7 @@ impl VirtQueue {
     /// Reset the queue state (called on device reset).
     pub fn reset(&mut self) {
         self.addrs_ok = None;
+        self.size = self.max_size;
         self.desc_addr = 0;
         self.avail_addr = 0;
         self.used_addr = 0;

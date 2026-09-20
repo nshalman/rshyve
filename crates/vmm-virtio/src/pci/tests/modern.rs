@@ -331,3 +331,57 @@ fn modern_device_status() {
     dev.bar_rw(BarN::BAR2, 0x14, RWOp::Read(&mut ro));
     assert_eq!(ro.buf()[0], bits::STATUS_ACKNOWLEDGE);
 }
+
+fn read_modern_u16(dev: &VirtioPciDevice<TestVirtioDevice>, off: u16) -> u16 {
+    use vmm_core::common::ReadOp;
+    let mut ro = ReadOp::new(2);
+    dev.bar_rw(BarN::BAR2, usize::from(off), RWOp::Read(&mut ro));
+    u16::from_le_bytes([ro.buf()[0], ro.buf()[1]])
+}
+
+fn write_modern_u16(
+    dev: &VirtioPciDevice<TestVirtioDevice>,
+    off: u16,
+    val: u16,
+) {
+    use vmm_core::common::WriteOp;
+    let wo = WriteOp::from_buf(&val.to_le_bytes());
+    dev.bar_rw(BarN::BAR2, usize::from(off), RWOp::Write(&wo));
+}
+
+fn modern_status(dev: &VirtioPciDevice<TestVirtioDevice>) -> u8 {
+    read_modern_u16(dev, bits::COMMON_CFG_DEVICE_STATUS) as u8
+}
+
+/// A driver may shrink a ring before it enables it (VirtIO 1.3 sec
+/// 4.1.4.3.2), and the device must then walk only that many entries.
+/// A size it did not offer, or that is not a power of two, is refused
+/// with DEVICE_NEEDS_RESET rather than dropped in silence.
+#[test]
+fn a_modern_driver_can_shrink_the_ring_and_a_bad_size_is_refused() {
+    let dev = make_test_device();
+    assert_eq!(read_modern_u16(&dev, bits::COMMON_CFG_QUEUE_SIZE), 256);
+
+    write_modern_u16(&dev, bits::COMMON_CFG_QUEUE_SIZE, 64);
+    assert_eq!(read_modern_u16(&dev, bits::COMMON_CFG_QUEUE_SIZE), 64);
+    assert_eq!(
+        dev.virtio_state.lock().expect("virtio lock").queues[0].size(),
+        64,
+        "the device kept its own size for the ring walk",
+    );
+    assert_eq!(modern_status(&dev) & bits::STATUS_DEVICE_NEEDS_RESET, 0);
+
+    for bad in [0u16, 48, 512] {
+        write_modern_u16(&dev, bits::COMMON_CFG_QUEUE_SIZE, bad);
+        assert_eq!(
+            read_modern_u16(&dev, bits::COMMON_CFG_QUEUE_SIZE),
+            64,
+            "size {bad} was taken",
+        );
+    }
+    assert_ne!(modern_status(&dev) & bits::STATUS_DEVICE_NEEDS_RESET, 0);
+
+    // A reset gives the offered size back.
+    write_modern_u16(&dev, bits::COMMON_CFG_DEVICE_STATUS, 0);
+    assert_eq!(read_modern_u16(&dev, bits::COMMON_CFG_QUEUE_SIZE), 256);
+}

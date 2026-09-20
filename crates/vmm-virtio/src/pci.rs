@@ -505,21 +505,13 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// first did not.
     fn refuse_queue(
         &self,
-        mut vs: std::sync::MutexGuard<'_, VirtioPciState>,
+        vs: std::sync::MutexGuard<'_, VirtioPciState>,
         idx: usize,
         error: Option<crate::queue::QueueAddrError>,
     ) {
-        if vs.status & bits::STATUS_DEVICE_NEEDS_RESET != 0 {
+        if !self.set_needs_reset(vs) {
             return;
         }
-        // The bit must go in here. Applied after the guard drops, it
-        // can land in the middle of a reset drain, or on the session
-        // that follows the reset.
-        vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
-        // Sampled under the guard that wrote the bit, so a reset that
-        // wipes it is always the later of the two.
-        let session = self.intr.session();
-        drop(vs);
         if let Some(error) = error {
             let first = !self
                 .queue_refusal_reported
@@ -532,7 +524,30 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     "queue" => idx, "reason" => %error);
             }
         }
+    }
+
+    /// Set DEVICE_NEEDS_RESET and tell the driver, once.
+    ///
+    /// Returns false when the device already carries the bit: the
+    /// write that lands here is guest driven and repeatable, so the
+    /// interrupt must not be raised per write. The bit goes in under
+    /// the guard, which is then consumed: applied after the guard
+    /// drops, it could land in the middle of a reset drain, or on the
+    /// session that follows the reset.
+    fn set_needs_reset(
+        &self,
+        mut vs: std::sync::MutexGuard<'_, VirtioPciState>,
+    ) -> bool {
+        if vs.status & bits::STATUS_DEVICE_NEEDS_RESET != 0 {
+            return false;
+        }
+        vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
+        // Sampled under the guard that wrote the bit, so a reset that
+        // wipes it is always the later of the two.
+        let session = self.intr.session();
+        drop(vs);
         self.raise_config_interrupt_in(session);
+        true
     }
 
     /// Install the one-shot park a register write reaches once its
@@ -686,13 +701,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// A reset in flight takes the device down anyway, so the bit is
     /// dropped rather than written onto the session that follows.
     pub fn signal_device_needs_reset(&self) {
-        let Some(mut vs) = self.lock_for_write() else {
+        let Some(vs) = self.lock_for_write() else {
             return;
         };
-        vs.status |= bits::STATUS_DEVICE_NEEDS_RESET;
-        let session = self.intr.session();
-        drop(vs);
-        self.raise_config_interrupt_in(session);
+        self.set_needs_reset(vs);
     }
 }
 
