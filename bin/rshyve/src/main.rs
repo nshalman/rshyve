@@ -34,6 +34,7 @@ mod msix;
 mod pcidev;
 mod peercred;
 mod reboot;
+mod secret;
 mod serial;
 mod varstore;
 
@@ -556,8 +557,9 @@ fn version_string() -> String {
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
-    let exe =
-        std::env::current_exe().unwrap_or_else(|_| PathBuf::from(&args[0]));
+    let exe = std::env::current_exe().unwrap_or_else(|_| {
+        args.first().map(PathBuf::from).unwrap_or_default()
+    });
 
     if vmm_machine::entry::version_requested(&args) {
         println!("rshyve {}", version_string());

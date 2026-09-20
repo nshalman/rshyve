@@ -122,13 +122,14 @@ pub fn setup_serial(
     if let Some(ref path) = com2_path {
         setup_serial_io(&com2, Some(path.as_str()), "com2", log)?;
     } else {
+        let root_pw = root_password(cli, log)?;
         let mdata_store = Arc::new(mdata::build_store_from_zone_config(
             &cli.vm_name,
             cli.uuid.as_deref(),
             cli.mdata_nics.as_deref(),
             cli.mdata_resolvers.as_deref(),
             cli.mdata_ssh_keys.as_deref(),
-            cli.mdata_root_pw.as_deref(),
+            root_pw.as_deref(),
         ));
         mdata::start_mdata_agent(com2.clone(), mdata_store, log.clone())
             .context("failed to start the mdata agent")?;
@@ -136,6 +137,23 @@ pub fn setup_serial(
     }
 
     Ok((com1, com2))
+}
+
+/// The root password the mdata agent serves, from a file when argv
+/// named one.
+fn root_password(cli: &Cli, log: &Logger) -> anyhow::Result<Option<String>> {
+    if let Some(path) = cli.mdata_root_pw_file.as_deref() {
+        return crate::secret::read_file(std::path::Path::new(path), log)
+            .map(Some);
+    }
+    if cli.mdata_root_pw.is_some() {
+        crate::secret::warn_argv_exposure(
+            log,
+            "--mdata-root-pw",
+            "--mdata-root-pw-file",
+        );
+    }
+    Ok(cli.mdata_root_pw.clone())
 }
 
 /// Set up serial I/O for a COM port.
