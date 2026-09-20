@@ -10,22 +10,39 @@
 
 use libc::{c_int, c_uint};
 
-/// Opaque handle to libdladm.
-pub enum dladm_handle {}
-pub type dladm_handle_t = *mut dladm_handle;
+// The struct layout is checked on every target so a header change is
+// caught on a developer host; only the calls need illumos.
+#[cfg(target_os = "illumos")]
+pub use illumos_only::*;
+
 pub type datalink_id_t = u32;
 
 pub const MAXMACADDRLEN: usize = 20;
 
-/// The `DLADM_STATUS_NOTFOUND` member of `dladm_status_t`.
-pub const DLADM_STATUS_NOTFOUND: c_int = 5;
+#[cfg(target_os = "illumos")]
+mod illumos_only {
+    use libc::c_int;
 
-/// `DLADM_OPT_ACTIVE`: read the running state, not the persistent one.
-pub const DLADM_OPT_ACTIVE: u32 = 0x1;
+    /// Opaque handle to libdladm.
+    pub enum dladm_handle {}
+    pub type dladm_handle_t = *mut dladm_handle;
 
-/// The head of `dladm_vnic_attr_t`. The real struct ends with a
-/// `mac_resource_props_t` that is 15,428 bytes long, which is why the
-/// tail is padding here: the caller reads only the MAC.
+    /// The `DLADM_STATUS_NOTFOUND` member of `dladm_status_t`.
+    pub const DLADM_STATUS_NOTFOUND: c_int = 5;
+
+    /// `DLADM_OPT_ACTIVE`: read the running state, not the persistent one.
+    pub const DLADM_OPT_ACTIVE: u32 = 0x1;
+}
+
+/// `mac_resource_props_t` in units of its own alignment.
+///
+/// The caller reads only the MAC, so the tail is opaque. It must still
+/// have the C type's size and 8-byte alignment: libdladm may `bcopy` a
+/// whole `mac_resource_props_t` into it, and a smaller or less aligned
+/// tail would put the end of that copy past the Rust local.
+const RESOURCE_PROPS_WORDS: usize = 1929;
+
+/// `dladm_vnic_attr_t` from `libdlvnic.h`.
 #[repr(C)]
 pub struct dladm_vnic_attr_t {
     pub va_vnic_id: datalink_id_t,
@@ -39,9 +56,20 @@ pub struct dladm_vnic_attr_t {
     pub va_force: c_int,
     pub va_vrid: u32,
     pub va_af: c_int,
-    _resource_props: [u8; 15432],
+    _resource_props: [u64; RESOURCE_PROPS_WORDS],
 }
 
+/// Sizes from `mac_flow.h`: `mac_cpus_t` is 5144, `mac_protect_t` is
+/// 9236, and the rest of `mac_resource_props_t` is 4 + 4 padding + 8 +
+/// 4 + 4 + 4 + `MAXPATHLEN`.
+const _: () = assert!(
+    size_of::<dladm_vnic_attr_t>() == 15496,
+    "dladm_vnic_attr_t no longer matches libdlvnic.h; libdladm would \
+     write past it"
+);
+const _: () = assert!(align_of::<dladm_vnic_attr_t>() == 8);
+
+#[cfg(target_os = "illumos")]
 impl dladm_vnic_attr_t {
     pub fn zeroed() -> Self {
         // Safety: every field is plain data for which zero is valid.
@@ -68,4 +96,24 @@ extern "C" {
         attrp: *mut dladm_vnic_attr_t,
         flags: u32,
     ) -> c_int;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::offset_of;
+
+    /// Field offsets from `libdlvnic.h`. `va_resource_props` follows
+    /// `va_af` at 56 after four bytes of alignment padding; a `[u8; _]`
+    /// tail needs no alignment and so started at 60.
+    #[test]
+    fn vnic_attr_fields_sit_where_libdladm_writes_them() {
+        assert_eq!(offset_of!(dladm_vnic_attr_t, va_mac_addr), 16);
+        assert_eq!(offset_of!(dladm_vnic_attr_t, va_mac_slot), 36);
+        assert_eq!(offset_of!(dladm_vnic_attr_t, va_vid), 44);
+        assert_eq!(offset_of!(dladm_vnic_attr_t, va_force), 48);
+        assert_eq!(offset_of!(dladm_vnic_attr_t, va_af), 56);
+        assert_eq!(offset_of!(dladm_vnic_attr_t, _resource_props), 64);
+        assert_eq!(size_of::<dladm_vnic_attr_t>(), 15496);
+    }
 }
