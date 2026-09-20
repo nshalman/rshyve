@@ -28,7 +28,9 @@ use std::time::Duration;
 use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::{MemCtx, RegionKind};
-use vmm_devices::lifecycle::{DeviceStateError, DeviceStatePayload};
+use vmm_devices::lifecycle::{
+    DeviceStateError, DeviceStatePayload, HypervMigrateState,
+};
 use vmm_devices::FlushError;
 
 use crate::codec::{
@@ -82,6 +84,13 @@ pub struct DeviceFlushError {
 /// guest was already paused.
 pub type DeviceResumeFn = Box<dyn Fn() + Send>;
 
+/// Read the Hyper-V enlightenment out, and drop its overlay pages
+/// first so the RAM image carries the guest's own bytes.
+///
+/// `None` for a VM started without `--hyperv`.
+pub type HypervExportFn =
+    Box<dyn FnOnce() -> Option<HypervMigrateState> + Send>;
+
 /// What the source needs from its owner, beyond the stream.
 pub struct SourceConfig {
     pub num_cpus: u32,
@@ -101,6 +110,7 @@ pub struct SourceHooks {
     pub flush: DeviceFlushFn,
     pub export: DeviceExportFn,
     pub resume: DeviceResumeFn,
+    pub hyperv: HypervExportFn,
 }
 
 pub fn run_source<S: Transport>(
@@ -127,6 +137,7 @@ pub fn run_source<S: Transport>(
         hooks.pre_pause,
         hooks.flush,
         hooks.export,
+        hooks.hyperv,
         &status,
         log,
     );
@@ -177,6 +188,7 @@ fn run_inner<S: Transport>(
     device_pre_pause_fn: DevicePrePauseFn,
     device_flush_fn: DeviceFlushFn,
     device_export_fn: DeviceExportFn,
+    hyperv_export_fn: HypervExportFn,
     status: &Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
@@ -245,6 +257,11 @@ fn run_inner<S: Transport>(
         zfs_barrier_wait(barrier, config.deadlines.zfs_barrier, log)?;
     }
 
+    // The overlay pages go before the final pass: the destination
+    // reinstalls them from the MSR values, so shipping ours would give
+    // the guest our bytes where its own belong.
+    let hyperv = hyperv_export_fn();
+
     // ── Post-pause dirty ──
     // Every writer stopped in the pre-pause step, so this pass is the
     // last word on guest memory.
@@ -262,6 +279,7 @@ fn run_inner<S: Transport>(
     let mut dev_state = state::export_device_state(hdl, config.num_cpus, log)?;
     dev_state.emulated = device_export_fn()
         .map_err(|e| MigrateError::State(format!("device export: {e}")))?;
+    dev_state.hyperv = hyperv;
     slog::info!(log, "exporting device state";
         "devices" => dev_state.emulated.len());
     chan.send(&Message::serialized(&dev_state)?)?;

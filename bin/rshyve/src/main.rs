@@ -554,6 +554,7 @@ fn run_migration_destination(
     mem_size: usize,
     registry: &DeviceRegistry,
     cpu_baseline: vmm_core::cpuid::CpuBaseline,
+    hyperv: Option<Arc<vmm_hyperv::HyperV>>,
     log: &Logger,
 ) -> anyhow::Result<()> {
     info!(log, "migration destination mode"; "listen" => listen_addr);
@@ -601,6 +602,16 @@ fn run_migration_destination(
             for dev in &for_resume {
                 dev.resume();
             }
+        }),
+        hyperv: Box::new(move |state| match hyperv.as_ref() {
+            Some(hyperv) => {
+                hyperv.import_state(state);
+                true
+            }
+            // The payload carries an enlightenment this VM has no
+            // handler for, so the guest would find its hypercall page
+            // gone. A mismatch, not a silent drop.
+            None => false,
         }),
     };
 
@@ -697,9 +708,8 @@ fn spawn_control_socket(
     cpu_baseline: vmm_core::cpuid::CpuBaseline,
     vcpu_metrics: &[Arc<vmm_devices::metrics::VcpuMetrics>],
     registry: Arc<DeviceRegistry>,
-    has_ahci_cd: bool,
     hotplug: HotplugEngines,
-    host_local_state: host_state::HostLocalState,
+    migration: control::MigrationInputs,
     log: &Logger,
 ) -> anyhow::Result<ControlSocket> {
     let Some(sock_path) = cli.control_socket.as_ref() else {
@@ -714,12 +724,11 @@ fn spawn_control_socket(
         mem_size,
         vcpu_metrics.to_vec(),
         registry,
-        has_ahci_cd,
         hotplug,
         cli.pci_slot.clone(),
         cli.lpc.clone(),
         cpu_baseline,
-        host_local_state,
+        migration,
         log.clone(),
     );
     let stop = control::sigterm_stop(Arc::clone(&ctrl));
@@ -851,6 +860,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
             mem_size,
             &registry,
             cpu_baseline,
+            hyperv.clone(),
             log,
         )?;
     } else if let Some(ref kernel) = kernel_image {
@@ -957,9 +967,12 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         cpu_baseline,
         &vcpu_metrics,
         Arc::clone(&registry),
-        has_ahci_cd,
         hotplug.clone(),
-        host_local_state,
+        control::MigrationInputs {
+            has_ahci_cd,
+            hyperv: hyperv.clone(),
+            host_local_state,
+        },
         log,
     )?;
 

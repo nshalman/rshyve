@@ -436,6 +436,7 @@ pub(crate) mod fixtures {
             vcpus: vec![vcpu_payload(0)],
             devices: device_payloads(),
             emulated: Vec::new(),
+            hyperv: None,
         }
     }
 }

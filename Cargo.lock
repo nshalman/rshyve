@@ -1773,6 +1773,7 @@ dependencies = [
  "slog",
  "thiserror 1.0.69",
  "vmm_core",
+ "vmm_devices",
 ]
 
 [[package]]

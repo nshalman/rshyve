@@ -108,6 +108,28 @@ pub struct DeviceStatePayload {
     pub state: Option<DeviceMigrateState>,
 }
 
+/// The Hyper-V enlightenment's guest-visible state.
+///
+/// Not a PCI device: the enlightenment belongs to the VM, so it travels
+/// beside the per-address payloads rather than under one of them.
+///
+/// The two overlay pages are not carried. They are derived from the
+/// MSR values, so replaying the MSR writes on the destination
+/// reinstalls them, which is what Propolis does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HypervMigrateState {
+    pub guest_os_id: u64,
+    pub hypercall: u64,
+    pub reference_tsc: u64,
+    pub crash_p: [u64; 5],
+    /// `HV_X64_MSR_TIME_REF_COUNT` at export, in 100 ns units.
+    ///
+    /// The destination continues the counter from here. A fresh
+    /// process-local clock makes a counter the guest is told is
+    /// monotonic run backwards.
+    pub time_ref_count: u64,
+}
+
 /// PCI header state a transport replays before its queues.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigratePciState {

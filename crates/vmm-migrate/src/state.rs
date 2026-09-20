@@ -562,6 +562,7 @@ pub fn export_device_state(
         vcpus,
         devices,
         emulated: Vec::new(),
+        hyperv: None,
     })
 }
 

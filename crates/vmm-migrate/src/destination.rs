@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex};
 use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::MemCtx;
-use vmm_devices::lifecycle::{DeviceMigrateState, DeviceStateError, WireBdf};
+use vmm_devices::lifecycle::{
+    DeviceMigrateState, DeviceStateError, HypervMigrateState, WireBdf,
+};
 
 use crate::codec::{
     DeviceIdentity, DeviceState, Message, MigrateError, MigrationPreamble,
@@ -40,6 +42,14 @@ pub type DeviceRestoreFn = Box<
 /// Start the device workers once the import succeeded.
 pub type DeviceResumeFn = Box<dyn Fn() + Send>;
 
+/// Put the Hyper-V enlightenment back, reinstalling both overlay
+/// pages from the MSR values the source carried.
+///
+/// Answers whether this VM has an enlightenment at all, so a payload
+/// that carries one for a VM started without `--hyperv` is refused
+/// rather than dropped.
+pub type HypervRestoreFn = Box<dyn Fn(&HypervMigrateState) -> bool + Send>;
+
 /// What the destination needs from its owner, beyond the stream.
 pub struct DestConfig {
     pub num_cpus: u32,
@@ -60,6 +70,7 @@ pub struct DestConfig {
 pub struct DestHooks {
     pub restore: DeviceRestoreFn,
     pub resume: DeviceResumeFn,
+    pub hyperv: HypervRestoreFn,
 }
 
 pub fn run_destination<S: Transport>(
@@ -286,6 +297,16 @@ fn restore_devices(
             "payload carries no entry for {} ({})",
             bdf, expected[bdf],
         )));
+    }
+
+    if let Some(hyperv) = &dev_state.hyperv {
+        if !(hooks.hyperv)(hyperv) {
+            return Err(MigrateError::State(
+                "payload carries Hyper-V enlightenment state, and this VM \
+                 was not started with --hyperv"
+                    .into(),
+            ));
+        }
     }
 
     slog::info!(log, "restoring device state";

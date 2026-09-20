@@ -322,6 +322,7 @@ fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
     let for_flush = Arc::clone(ctrl);
     let for_resume = Arc::clone(ctrl);
     let for_export = Arc::clone(ctrl);
+    let for_hyperv = Arc::clone(ctrl);
     vmm_migrate::source::SourceHooks {
         pre_pause: Box::new(move || {
             for_pre_pause.pause_devices_for_migration()
@@ -329,6 +330,7 @@ fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
         flush: Box::new(move || for_flush.flush_devices_for_migration()),
         resume: Box::new(move || for_resume.resume_devices_after_migration()),
         export: Box::new(move || for_export.export_device_state()),
+        hyperv: Box::new(move || for_hyperv.export_hyperv()),
     }
 }
 
@@ -463,11 +465,13 @@ pub(super) fn migrate_dest(
 fn dest_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::destination::DestHooks {
     let for_restore = Arc::clone(ctrl);
     let for_resume = Arc::clone(ctrl);
+    let for_hyperv = Arc::clone(ctrl);
     vmm_migrate::destination::DestHooks {
         restore: Box::new(move |bdf, state| {
             for_restore.restore_device_state(bdf, state)
         }),
         resume: Box::new(move || for_resume.resume_devices()),
+        hyperv: Box::new(move |state| for_hyperv.restore_hyperv(state)),
     }
 }
 

@@ -151,8 +151,25 @@ pub struct VmController {
     cli_lpc: Vec<String>,
     /// CPU baseline for migration feature masking.
     cpu_baseline: CpuBaseline,
+    /// The Hyper-V enlightenment, for a VM started with `--hyperv`.
+    /// Its MSR state is migrated; nothing else touches it here.
+    hyperv: Option<Arc<vmm_hyperv::HyperV>>,
     host_local_state: HostLocalState,
     log: Logger,
+}
+
+/// What this VM holds that only migration cares about.
+///
+/// Each one either blocks a migration or travels on the wire, so they
+/// arrive together rather than as three more constructor arguments.
+pub(crate) struct MigrationInputs {
+    /// AHCI state has no migration payload, so attached media blocks
+    /// migration.
+    pub(crate) has_ahci_cd: bool,
+    /// The Hyper-V enlightenment, for a VM started with `--hyperv`.
+    pub(crate) hyperv: Option<Arc<vmm_hyperv::HyperV>>,
+    /// State that lives on this host and cannot follow the guest.
+    pub(crate) host_local_state: HostLocalState,
 }
 
 impl VmController {
@@ -167,12 +184,11 @@ impl VmController {
         mem_size: usize,
         vcpu_metrics: Vec<Arc<vmm_devices::metrics::VcpuMetrics>>,
         registry: Arc<DeviceRegistry>,
-        has_ahci_cd: bool,
         hotplug: HotplugEngines,
         cli_pci_slots: Vec<String>,
         cli_lpc: Vec<String>,
         cpu_baseline: CpuBaseline,
-        host_local_state: HostLocalState,
+        migration: MigrationInputs,
         log: Logger,
     ) -> Arc<Self> {
         let name = vm_name.to_string();
@@ -189,13 +205,14 @@ impl VmController {
             vcpu_metrics,
             registry,
             migrated_away: AtomicBool::new(false),
-            has_ahci_cd,
+            has_ahci_cd: migration.has_ahci_cd,
             hotplug,
             topology: Mutex::new(()),
             cli_pci_slots,
             cli_lpc,
             cpu_baseline,
-            host_local_state,
+            hyperv: migration.hyperv,
+            host_local_state: migration.host_local_state,
             log,
         })
     }
@@ -317,6 +334,32 @@ impl VmController {
                 })
             })
             .collect()
+    }
+
+    /// The Hyper-V enlightenment a migration carries, with its overlay
+    /// pages dropped first so the RAM image holds the guest's bytes.
+    fn export_hyperv(
+        &self,
+    ) -> Option<vmm_devices::lifecycle::HypervMigrateState> {
+        let hyperv = self.hyperv.as_ref()?;
+        hyperv.pause_overlays();
+        Some(hyperv.export_state())
+    }
+
+    /// Put a source's enlightenment back. `false` when this VM has
+    /// none, which makes the payload a mismatch rather than a silent
+    /// drop.
+    fn restore_hyperv(
+        &self,
+        state: &vmm_devices::lifecycle::HypervMigrateState,
+    ) -> bool {
+        match self.hyperv.as_ref() {
+            Some(hyperv) => {
+                hyperv.import_state(state);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Give one device the state its counterpart on the source exported.

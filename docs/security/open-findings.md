@@ -157,38 +157,12 @@ accept.
 **To close:** a modern authenticated, encrypted console boundary for any
 remote use, and a documented tunnel requirement until then.
 
-### OSF-8 — Hyper-V enlightenment state is not migrated
-
-**Boundary:** correctness, guest-visible. **Severity:** medium, and only
-for a VM started with `--hyperv`.
-
-`crates/vmm-hyperv/src/lib.rs` keeps `msr_guest_os_id`,
-`msr_hypercall`, `msr_reference_tsc`, the two overlay pages and the
-crash MSRs, and nothing exports or imports any of it. The destination
-builds a fresh `HyperV` with every MSR zero and `boot = Instant::now()`,
-so a Windows guest reads `HV_X64_MSR_TIME_REF_COUNT` smaller than its
-last read: a monotonic partition counter goes backwards. An RDMSR of
-`HV_X64_MSR_HYPERCALL` returns 0 although the guest set Enabled|Locked.
-The overlay pages survive only because they were copied as plain RAM,
-and a later `GUEST_OS_ID = 0` on the destination cannot restore the
-original bytes.
-
-`pause_overlays()` and `reset()` say in their doc comments that they run
-"before VM reset and before live migration". Neither has a caller.
-
-**To close:** give `HyperV` a `DeviceMigrateState` variant carrying the
-three MSR values and the crash MSRs, derive `TIME_REF_COUNT` from the
-VMM's `boot_hrtime` rather than a process-local `Instant` as Propolis
-does (`lib/propolis/src/enlightenment/hyperv/mod.rs`), register it in
-the migration device set, and delete or call the two dead methods.
-Until then a `--hyperv` VM migrates with its enlightenment lost;
-`docs/migration.md` lists it under what migration does not carry.
-
 ## Resolved
 
 | Finding | Closed by |
 |---|---|
-| OSF-3 — CPU feature mismatch was warned about, not rejected, and the two implementations compared different leaves against unmasked host features | `Compare the whole guest CPUID contract on both ends` |
+| OSF-3 — CPU feature mismatch was warned about, not rejected, and the two implementations compared different leaves against unmasked host features | `Migrate device state by PCI identity over one driver` |
+| Hyper-V enlightenment state was not migrated; `TIME_REF_COUNT` restarted from a process-local clock and ran backwards for the guest | `Migrate the Hyper-V enlightenment` |
 | PS/2 controller RAM out-of-bounds index reachable from guest port I/O | `fix(ps2): guest-reachable out-of-bounds index in controller RAM` |
 | Virtio indirect descriptor table unbounded against queue size | `fix(virtio): bound indirect descriptor tables to the queue size` |
 | Migration `PageBatch` slice index abort and discarded guest-memory errors | `fix(migrate): validate and bound peer-controlled page transfers` |

@@ -159,6 +159,18 @@ Per NVMe controller: CC, CSTS, AQA, the admin queue bases, every admin
 and I/O queue pair with its size, cursors, phase and vector, the PCI
 command and BAR bases, and the MSI-X table.
 
+For a VM started with `--hyperv`: `HV_X64_MSR_GUEST_OS_ID`,
+`HV_X64_MSR_HYPERCALL`, `HV_X64_MSR_REFERENCE_TSC`, the five crash MSRs,
+and the partition reference counter. The hypercall and reference-TSC
+overlay pages are not shipped: the source removes them before the final
+RAM pass, so the memory image holds the guest's own bytes, and the
+destination reinstalls both by replaying the MSR writes. The reference
+counter continues from the source's last value, because a guest is told
+that counter is monotonic.
+
+A payload carrying enlightenment state for a VM started without
+`--hyperv` is refused.
+
 Every field is checked before any of it is applied: queue sizes against
 the device's own, cursors inside their ring, ring addresses mapped and
 aligned, vectors inside the table, and each NVMe submission queue's
@@ -211,7 +223,6 @@ guest and refusing would block every VM:
 - i8042 / PS-2: controller and keyboard state.
 - `fw_cfg`: the selector, which only firmware reads.
 - ACPI PM1 and GPE: the event and enable registers.
-- Hyper-V enlightenment MSRs and their overlay pages. See OSF-8.
 - FPU and XSAVE state. See OSF-2.
 
 A VM that hot-added a CPU, memory, or a device since boot is also

@@ -137,12 +137,16 @@ pub struct DeviceState {
     /// device had on the source. The destination restores by that
     /// address alone.
     pub emulated: Vec<DeviceStatePayload>,
+    /// The Hyper-V enlightenment, when the VM has one. Not a PCI
+    /// device, so it travels beside the per-address payloads.
+    pub hyperv: Option<HypervMigrateState>,
 }
 
 /// The device state types are the device crate's own, so a device
 /// exports what the wire carries with nothing copied in between.
 pub use vmm_devices::lifecycle::{
-    DeviceMigrateState, DeviceStatePayload, MigratePciState, WireBdf,
+    DeviceMigrateState, DeviceStatePayload, HypervMigrateState,
+    MigratePciState, WireBdf,
 };
 
 /// State data for a single vCPU.
@@ -661,6 +665,7 @@ mod tests {
         let state = DeviceState {
             vcpus: Vec::new(),
             devices: Vec::new(),
+            hyperv: None,
             emulated: vec![
                 DeviceStatePayload {
                     bdf: WireBdf {
