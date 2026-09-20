@@ -17,7 +17,8 @@ name: CI
 # cross-compile), the portable tests pass in both profiles, the
 # recorded-ioctl tests of the three illumos binding crates pass, every
 # portable crate and its test targets type-check against the illumos
-# target, the lockfile is current, and the dependency, public-surface policy holds. tools/fhrun-init and tools/virtiofs-test
+# target, the lockfile is current, and the dependency, unsafe-comment and
+# public-surface policies hold. tools/fhrun-init and tools/virtiofs-test
 # are excluded from the workspace, so the two guest jobs cover them.
 #
 # What the clippy coverage does NOT prove: rshyve's
@@ -478,6 +479,43 @@ jobs:
           "$elsewhere/tools/public-surface.sh" || rc=$?
           if [ "$rc" -ne 2 ]; then
             echo "the guard answered $rc outside its own tree, wanted 2" >&2
+            exit 1
+          fi
+
+  unsafe-safety:
+    name: every unsafe block is justified
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # 280 unsafe blocks and 5 `// SAFETY:` comments is the first thing
+      # an outside reviewer of a hypervisor counts. A flag day is not on
+      # offer, so tools/safety-budget.txt records the per-crate count and
+      # this holds it down. Adding an unsafe block without a comment
+      # fails; documenting one and not lowering the budget fails too, so
+      # the number cannot drift either way.
+      - run: tools/check-safety-comments.py
+      # A gate nobody has watched fail is not known to work. The copy is
+      # an extracted archive, which is also what the illumos build host
+      # has: no checkout, so the gate falls back to a filesystem walk.
+      # A listing it cannot build must refuse, not report clean.
+      - name: the gate notices an undocumented block and a stale budget
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          git archive HEAD | tar -x -C "$tmp"
+          cd "$tmp"
+          tools/check-safety-comments.py | grep -q 'from a filesystem walk'
+          printf 'fn f() { let _ = unsafe { 1 }; }\n' > crates/vmm-core/src/ci_self_test.rs
+          if tools/check-safety-comments.py; then
+            echo "the gate passed with an undocumented unsafe block added" >&2
+            exit 1
+          fi
+          rm crates/vmm-core/src/ci_self_test.rs
+          tools/check-safety-comments.py
+          sed -i 's/^crates\/vmm-core .*/crates\/vmm-core 9999/' tools/safety-budget.txt
+          if tools/check-safety-comments.py; then
+            echo "the gate passed with a budget nobody lowered" >&2
             exit 1
           fi
 

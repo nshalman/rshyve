@@ -1,0 +1,26 @@
+# Undocumented `unsafe` blocks per workspace member.
+#
+# tools/check-safety-comments.py holds these numbers down. A new
+# unsafe block needs a `// SAFETY:` comment above it; documenting
+# an old one lowers a number here. Nothing may raise one.
+#
+# Regenerate with: tools/check-safety-comments.py --write
+
+bin/rshyve 13
+crates/bhyve-api 6
+crates/dladm 5
+crates/viona-api 19
+crates/vmm-boot 1
+crates/vmm-core 66
+crates/vmm-devices 2
+crates/vmm-hid 2
+crates/vmm-hyperv 1
+crates/vmm-machine 1
+crates/vmm-migrate 2
+crates/vmm-passthru 6
+crates/vmm-tpm 17
+crates/vmm-tpm-sys 2
+crates/vmm-virtio 59
+tools/fhrun 2
+tools/fhrun-init 22
+tools/virtiofs-test 51
