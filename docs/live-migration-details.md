@@ -106,21 +106,25 @@ Protocol negotiation and preamble exchange.
 
 ```
 Source                              Destination
-  |--- ProtocolOffer ["vmm-migrate-ron/0"] -->|
-  |<-- ProtocolSelect "vmm-migrate-ron/0" ----|
-  |--- MigrationPreamble (cpus, mem, features) -->|
+  |--- ProtocolOffer ["vmm-migrate-ron/1"] -->|
+  |<-- ProtocolSelect "vmm-migrate-ron/1" ----|
+  |--- MigrationPreamble (cpus, mem, devices, features) -->|
   |<-- Okay ----------------------------------|
 ```
 
 The preamble includes:
 
 - `num_cpus` and `mem_size` -- must match exactly or migration is rejected
+- `devices` -- every device that carries state, as a PCI bus/device/function
+  plus its type name. The destination refuses a set that is not its own,
+  before it accepts a single page
 - `cpu_features` -- CPUID leaf 1 ECX/EDX, leaf 7 EBX/ECX/EDX, and XCR0
   bits masked by the source's `--cpu-baseline` profile
 
-The destination validates CPU and memory compatibility. CPU feature
-mismatches produce a warning but do not abort migration (the mismatch
-may be acceptable depending on the guest workload).
+Both ends report their post-mask tables, because that is what the guest
+saw and what it will see. The destination refuses any bit the source has
+and it lacks; `allow_cpu_feature_mismatch` on the `migrate-dest` command
+overrides that and logs the missing bits.
 
 ### Phase 2: Pre-Pause RAM (RamPushPrePause)
 
@@ -343,14 +347,21 @@ to import state.
 
 ## Pause Ordering
 
-Device rings must be paused **before** vCPUs. This is implemented in
-`sync_source.rs`:
+Device workers and rings must be paused **before** vCPUs. This is
+implemented in `source.rs`:
 
 ```rust
 set_phase(status, MigrationPhase::Pause);
-device_pre_pause_fn();   // Pause viona rings (VNA_IOC_RING_PAUSE)
+device_pre_pause_fn()?;  // Park workers, wait for quiesce, then
+                         // VNA_IOC_RING_PAUSE each kernel ring
 hdl.pause()?;            // Pause vCPUs (VM_PAUSE)
 ```
+
+The final dirty pass then runs after every writer has stopped, by
+construction rather than as a side effect of the flush. Before that
+change it ran while the console and vsock reader threads could still
+fill a receive ring, so the exported `used_idx` could count an entry
+whose ring slot and buffer were never shipped.
 
 ### Why This Order Matters
 
@@ -727,27 +738,39 @@ The check on phase ensures we only resume if we actually paused. If the
 error occurred during pre-pause RAM transfer, the VM is still running
 and no resume is needed.
 
-The destination VM (if started) must be destroyed by the caller. There
-is no automatic rollback on the destination side.
+A rollback also re-initialises every kernel ring the pause stopped. A
+paused viona ring is `VRS_STOP`, and `viona_ioc_ring_kick` answers
+EBUSY for one, so a guest kick cannot revive it: only the reset plus
+state write the rollback does can. Without that the source guest
+resumed with a NIC whose rings never moved again.
+
+The destination VM (if started) must be destroyed by the caller. A
+`migrate-dest` that fails puts the VM back in the state it was in, so a
+live guest is never left `Stopped` and unreachable.
 
 
 ## Synchronous Transport (No Tokio in Zones)
 
 Bhyve zones on illumos lack `/dev/poll`, which tokio requires for its
 event loop. The migration protocol therefore uses **synchronous**
-WebSocket I/O via the `tungstenite` crate (not `tokio-tungstenite`).
+WebSocket I/O via the `tungstenite` crate.
 
-The `sync_source.rs` and `sync_destination.rs` modules implement the
-full protocol using blocking `Read`/`Write` traits on
-`std::os::unix::net::UnixStream`. The GZ agents (which DO have
-`/dev/poll`) use tokio to bridge Unix sockets to TCP with
+`source.rs` and `destination.rs` are the only protocol implementation.
+They are generic over `wire::Transport`, a `Read + Write` stream whose
+read deadline the protocol can move: `std::os::unix::net::UnixStream`
+inside a zone, `std::net::TcpStream` elsewhere. The GZ agents, which do
+have `/dev/poll`, still use tokio to bridge Unix sockets to TCP with
 `tokio::io::copy`.
 
-The codec module (`codec.rs`) uses `tokio_tungstenite::tungstenite::Message`
-as the frame type for encoding/decoding, but the actual WebSocket I/O
-uses the synchronous `tungstenite::WebSocket` wrapper. This dual dependency
-exists because the async migration path (for direct TCP, used in testing)
-shares the same `Message::encode`/`Message::decode` with the sync path.
+There used to be a second, async implementation for direct TCP. The two
+drifted: the async twin pauses no devices, flushes nothing, exports no
+device state and runs no ZFS barrier, and its CPU feature check compared
+different leaves. A `migrate-source` with a `host:port` target selected
+it. It is deleted, and the one driver serves both transports.
+
+Read deadlines come from `wire::Deadlines`: generous before the pause,
+short after it. `SO_SNDTIMEO` reports success on illumos and the write
+still blocks for ever, so only read deadlines are set.
 
 
 ## Comparison with Propolis
@@ -806,10 +829,13 @@ the pre-pause convergence loop may need more iterations.
 | File | Purpose |
 |------|---------|
 | `bin/vmm-migrate-agent/src/main.rs` | GZ migration orchestrator (ZFS send/recv, Unix-TCP bridge) |
-| `crates/vmm-migrate/src/sync_source.rs` | Source migration protocol (pre-pause RAM, barrier, device export) |
-| `crates/vmm-migrate/src/sync_destination.rs` | Destination migration protocol (RAM import, state restore, resume) |
-| `crates/vmm-migrate/src/codec.rs` | Wire format: Message types, VirtioQueueState, NvmeControllerState |
-| `crates/vmm-migrate/src/protocol.rs` | Protocol constants, dirty bitmap iterator |
+| `crates/vmm-migrate/src/source.rs` | Source migration protocol (pre-pause RAM, barrier, device export) |
+| `crates/vmm-migrate/src/destination.rs` | Destination migration protocol (topology check, RAM import, state restore, resume) |
+| `crates/vmm-migrate/src/wire.rs` | Transport trait, read deadlines, framing, message expectations |
+| `crates/vmm-migrate/src/cpu.rs` | The one CPU feature comparison both ends use |
+| `crates/vmm-migrate/src/codec.rs` | Wire format: Message types, preamble, device payloads |
+| `crates/vmm-devices/src/lifecycle/state.rs` | The device state types the wire carries |
+| `crates/vmm-migrate/src/protocol.rs` | Protocol version, dirty bitmap iterator |
 | `crates/vmm-migrate/src/state.rs` | Kernel device state export/import (vmm-data API, register get/set) |
 | `crates/vmm-devices/src/virtio/pci.rs` | Virtio PCI transport: export/restore BAR state, feature flags, queue indices |
 | `crates/vmm-devices/src/virtio/viona.rs` | Viona kernel interface: RING_SET_STATE, RING_PAUSE, interrupt polling |

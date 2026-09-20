@@ -12,11 +12,16 @@ commit that closed them.
 **Boundary:** migration peer to VMM. **Severity:** high in any
 deployment where the migration path is not already a trusted channel.
 
-The source connects to `ws://migration/live` in the clear
-(`crates/vmm-migrate/src/source.rs`), the destination accepts a raw
-WebSocket (`crates/vmm-migrate/src/destination.rs`), and the sync paths
-accept TCP or Unix streams with no protocol-level peer identity.
+`crates/vmm-migrate/src/source.rs` connects and
+`crates/vmm-migrate/src/destination.rs` accepts a raw WebSocket over a
+TCP or Unix stream with no protocol-level peer identity.
 `vmm-migrate-agent` binds `0.0.0.0` and accepts the first connection.
+
+Every field the peer sends is now validated before it is applied, and a
+payload the destination cannot hold fails the migration rather than
+half-programming a device, so a malformed blob is a refused migration
+and not a corrupt guest. That bounds the damage; it is not
+authentication.
 
 Guest RAM, CPU state, and device state therefore have no
 confidentiality and no peer authentication unless an external control
@@ -53,6 +58,12 @@ Separately, `sh()` runs pipelines without `pipefail` and checks a single
 exit status, so a truncated `zfs send` is invisible whenever the remote
 `zfs recv` exits 0. The agent then migrates RAM onto a short disk.
 
+`check_name` now also refuses a value beginning with `-`, which the
+invoked program would read as an option, and one with a `..` path
+element, which climbs out of the zone root the agent's paths are built
+from. `Cli::Dest` checks its `--uuid` as the source side does. The
+remaining gap is the shape of the call, not the character set.
+
 **To close:** replace `sh()` with `std::process::Command` argument
 arrays, introduce validated newtypes for UUID, dataset, host, and key
 path so clap rejects bad input at parse time, quote the remote word
@@ -81,25 +92,6 @@ and validate across a real cross-host migration with a continuous AVX
 workload. A malformed XSAVE blob can set reserved `XCOMP_BV` bits and
 fault the guest at its first `XRSTOR`, so this is worse to get wrong
 than to leave unimplemented.
-
-### OSF-3 — CPU feature mismatch is warned about, not rejected
-
-**Boundary:** correctness, guest-visible. **Severity:** medium.
-
-Both destinations log a CPU feature mismatch and continue. The two
-implementations also compare differently: the sync path, which is the
-one production uses, checks only CPUID leaf 7 and has no ignore masks
-for SGX/MPX, while the async path checks leaf 1, leaf 7, and xcr0.
-
-The comparison itself is also wrong in a way that produces false
-negatives: the source sends baseline-masked guest features while the
-destination compares against raw host features, so a migration from
-`--cpu-baseline host` to a narrower baseline reports a passing check and
-then hands a running guest a feature table with bits cleared.
-
-**To close:** one shared comparison over the full effective guest CPUID
-contract, then a policy decision on reject-by-default with an explicit,
-auditable override.
 
 ### OSF-4 — Vendored libtpms predates two CVE fixes
 
@@ -165,10 +157,38 @@ accept.
 **To close:** a modern authenticated, encrypted console boundary for any
 remote use, and a documented tunnel requirement until then.
 
+### OSF-8 — Hyper-V enlightenment state is not migrated
+
+**Boundary:** correctness, guest-visible. **Severity:** medium, and only
+for a VM started with `--hyperv`.
+
+`crates/vmm-hyperv/src/lib.rs` keeps `msr_guest_os_id`,
+`msr_hypercall`, `msr_reference_tsc`, the two overlay pages and the
+crash MSRs, and nothing exports or imports any of it. The destination
+builds a fresh `HyperV` with every MSR zero and `boot = Instant::now()`,
+so a Windows guest reads `HV_X64_MSR_TIME_REF_COUNT` smaller than its
+last read: a monotonic partition counter goes backwards. An RDMSR of
+`HV_X64_MSR_HYPERCALL` returns 0 although the guest set Enabled|Locked.
+The overlay pages survive only because they were copied as plain RAM,
+and a later `GUEST_OS_ID = 0` on the destination cannot restore the
+original bytes.
+
+`pause_overlays()` and `reset()` say in their doc comments that they run
+"before VM reset and before live migration". Neither has a caller.
+
+**To close:** give `HyperV` a `DeviceMigrateState` variant carrying the
+three MSR values and the crash MSRs, derive `TIME_REF_COUNT` from the
+VMM's `boot_hrtime` rather than a process-local `Instant` as Propolis
+does (`lib/propolis/src/enlightenment/hyperv/mod.rs`), register it in
+the migration device set, and delete or call the two dead methods.
+Until then a `--hyperv` VM migrates with its enlightenment lost;
+`docs/migration.md` lists it under what migration does not carry.
+
 ## Resolved
 
 | Finding | Closed by |
 |---|---|
+| OSF-3 — CPU feature mismatch was warned about, not rejected, and the two implementations compared different leaves against unmasked host features | `Compare the whole guest CPUID contract on both ends` |
 | PS/2 controller RAM out-of-bounds index reachable from guest port I/O | `fix(ps2): guest-reachable out-of-bounds index in controller RAM` |
 | Virtio indirect descriptor table unbounded against queue size | `fix(virtio): bound indirect descriptor tables to the queue size` |
 | Migration `PageBatch` slice index abort and discarded guest-memory errors | `fix(migrate): validate and bound peer-controlled page transfers` |
