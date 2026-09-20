@@ -127,6 +127,13 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 // Read-only register, ignore writes
             }
             bits::LEGACY_REG_GUEST_FEATURES => {
+                // Legacy has no FEATURES_OK, so negotiation ends where
+                // the driver declares itself live. A write after that
+                // would change what the device reads and writes while
+                // the driver is using the rings.
+                if vs.status & bits::STATUS_DRIVER_OK != 0 {
+                    return;
+                }
                 // Mask: only accept features the device offered via legacy.
                 // Strip EVENT_IDX/INDIRECT_DESC from legacy offered set.
                 let offered = (self.device.device_features() as u32)
@@ -134,18 +141,8 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     & !bits::VIRTIO_F_RING_INDIRECT_DESC_U32;
                 let accepted = val & offered;
                 vs.guest_features = u64::from(accepted);
+                vs.apply_features();
                 self.device.set_features(u64::from(accepted));
-
-                // Propagate event_idx and indirect_supported to all
-                // queues so they know the negotiated capabilities.
-                let accepted64 = vs.guest_features;
-                let event_idx = accepted64 & bits::VIRTIO_F_RING_EVENT_IDX != 0;
-                let indirect =
-                    accepted64 & bits::VIRTIO_F_RING_INDIRECT_DESC != 0;
-                for q in &mut vs.queues {
-                    q.set_event_idx(event_idx);
-                    q.set_indirect_supported(indirect);
-                }
             }
             bits::LEGACY_REG_QUEUE_PFN => {
                 let queue_sel = vs.queue_select;
@@ -212,20 +209,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 if new_status == 0 {
                     self.reset_device(vs);
                 } else {
-                    // FEATURES_OK validation (VirtIO 1.3 sec 2.2):
-                    // If the driver sets FEATURES_OK, verify the
-                    // negotiated feature subset is acceptable. If
-                    // not, clear FEATURES_OK so the driver sees the
-                    // rejection on re-read.
-                    if new_status & bits::STATUS_FEATURES_OK != 0
-                        && vs.status & bits::STATUS_FEATURES_OK == 0
-                    {
-                        // Accept all subsets for now — reject only if
-                        // a future device requires mandatory features.
-                        vs.status = new_status;
-                    } else {
-                        vs.status = new_status;
-                    }
+                    self.set_status(vs, new_status);
                 }
             }
             bits::LEGACY_REG_ISR_STATUS => {

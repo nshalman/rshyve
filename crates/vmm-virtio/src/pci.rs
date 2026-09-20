@@ -147,6 +147,24 @@ impl VirtioPciState {
         self.guest_features as u32
     }
 
+    /// Tell the queues what the driver negotiated.
+    ///
+    /// The ring features decide what the device reads and writes, so
+    /// they are applied once, where negotiation ends, and never under
+    /// a live ring: a `VirtioCompletion` takes EVENT_IDX when it is
+    /// built and would then judge kicks by a rule its own queue no
+    /// longer uses.
+    fn apply_features(&mut self) {
+        let event_idx =
+            self.guest_features & bits::VIRTIO_F_RING_EVENT_IDX != 0;
+        let indirect =
+            self.guest_features & bits::VIRTIO_F_RING_INDIRECT_DESC != 0;
+        for q in &mut self.queues {
+            q.set_event_idx(event_idx);
+            q.set_indirect_supported(indirect);
+        }
+    }
+
     fn reset(&mut self) {
         self.queue_select = 0;
         self.status = 0;
@@ -523,6 +541,36 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 slog::debug!(self.log, "virtio-pci refused a queue";
                     "queue" => idx, "reason" => %error);
             }
+        }
+    }
+
+    /// Apply a non-zero DEVICE_STATUS write, on either transport.
+    ///
+    /// VirtIO 1.3 sec 2.1.2: the driver must not clear a status bit.
+    /// A device that let it would let a driver toggle FEATURES_OK and
+    /// renegotiate under rings it has already programmed, or clear
+    /// DEVICE_NEEDS_RESET and carry on with a device that stopped.
+    /// The one way back is a write of 0, which the caller takes.
+    ///
+    /// The FEATURES_OK transition is where negotiation ends (sec
+    /// 2.2.1), so it is where the backend and the rings are told what
+    /// was agreed. A legacy driver never writes the bit; `legacy`
+    /// applies its features on the feature register instead.
+    fn set_status(
+        &self,
+        mut vs: std::sync::MutexGuard<'_, VirtioPciState>,
+        new_status: u8,
+    ) {
+        if new_status & vs.status != vs.status {
+            self.set_needs_reset(vs);
+            return;
+        }
+        let gained = new_status & !vs.status;
+        vs.status = new_status;
+        if gained & bits::STATUS_FEATURES_OK != 0 {
+            vs.apply_features();
+            let features = vs.guest_features;
+            self.device.set_features(features);
         }
     }
 

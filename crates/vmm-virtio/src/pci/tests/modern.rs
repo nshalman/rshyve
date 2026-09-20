@@ -353,6 +353,92 @@ fn modern_status(dev: &VirtioPciDevice<TestVirtioDevice>) -> u8 {
     read_modern_u16(dev, bits::COMMON_CFG_DEVICE_STATUS) as u8
 }
 
+fn write_modern_u32(
+    dev: &VirtioPciDevice<TestVirtioDevice>,
+    off: u16,
+    val: u32,
+) {
+    use vmm_core::common::WriteOp;
+    let wo = WriteOp::from_buf(&val.to_le_bytes());
+    dev.bar_rw(BarN::BAR2, usize::from(off), RWOp::Write(&wo));
+}
+
+fn read_modern_u32(dev: &VirtioPciDevice<TestVirtioDevice>, off: u16) -> u32 {
+    use vmm_core::common::ReadOp;
+    let mut ro = ReadOp::new(4);
+    dev.bar_rw(BarN::BAR2, usize::from(off), RWOp::Read(&mut ro));
+    u32::from_le_bytes([ro.buf()[0], ro.buf()[1], ro.buf()[2], ro.buf()[3]])
+}
+
+fn queue_event_idx(dev: &VirtioPciDevice<TestVirtioDevice>) -> bool {
+    dev.virtio_state.lock().expect("virtio lock").queues[0].event_idx_enabled()
+}
+
+/// Features are final at FEATURES_OK (VirtIO 1.3 sec 2.2.1) and the
+/// only way to renegotiate is a reset. A half taken after it would
+/// change what the device reads and writes under rings the driver is
+/// already using: `VirtioCompletion` takes EVENT_IDX when it is built,
+/// so the used-ring writer and its own queue would judge kicks by
+/// different rules.
+#[test]
+fn a_feature_write_after_features_ok_changes_nothing() {
+    let dev = make_test_device();
+    let event_idx = bits::VIRTIO_F_RING_EVENT_IDX as u32;
+
+    write_modern_u32(&dev, bits::COMMON_CFG_DRIVER_FEATURE, event_idx);
+    write_modern_u16(
+        &dev,
+        bits::COMMON_CFG_DEVICE_STATUS,
+        u16::from(
+            bits::STATUS_ACKNOWLEDGE
+                | bits::STATUS_DRIVER
+                | bits::STATUS_FEATURES_OK,
+        ),
+    );
+    assert!(
+        queue_event_idx(&dev),
+        "FEATURES_OK did not reach the queues"
+    );
+
+    write_modern_u32(&dev, bits::COMMON_CFG_DRIVER_FEATURE, 0);
+
+    assert_eq!(
+        read_modern_u32(&dev, bits::COMMON_CFG_DRIVER_FEATURE),
+        event_idx,
+        "the device renegotiated after FEATURES_OK",
+    );
+    assert!(queue_event_idx(&dev), "a live queue lost EVENT_IDX");
+}
+
+/// VirtIO 1.3 sec 2.1.2: the driver must not clear a status bit. A
+/// device that let it would let a driver clear DEVICE_NEEDS_RESET and
+/// keep using a device that stopped, or toggle FEATURES_OK to
+/// renegotiate. The one way back is a write of 0.
+#[test]
+fn clearing_a_status_bit_is_refused_and_asks_for_a_reset() {
+    let dev = make_test_device();
+    let live = bits::STATUS_ACKNOWLEDGE | bits::STATUS_DRIVER;
+    write_modern_u16(&dev, bits::COMMON_CFG_DEVICE_STATUS, u16::from(live));
+
+    write_modern_u16(
+        &dev,
+        bits::COMMON_CFG_DEVICE_STATUS,
+        u16::from(bits::STATUS_ACKNOWLEDGE),
+    );
+
+    let status = modern_status(&dev);
+    assert_eq!(status & live, live, "a status bit was cleared");
+    assert_ne!(
+        status & bits::STATUS_DEVICE_NEEDS_RESET,
+        0,
+        "the driver was not told the device stopped",
+    );
+
+    // A write of 0 is still a reset, and clears the bit with it.
+    write_modern_u16(&dev, bits::COMMON_CFG_DEVICE_STATUS, 0);
+    assert_eq!(modern_status(&dev), 0);
+}
+
 /// A driver may shrink a ring before it enables it (VirtIO 1.3 sec
 /// 4.1.4.3.2), and the device must then walk only that many entries.
 /// A size it did not offer, or that is not a power of two, is refused

@@ -361,10 +361,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
     }
 
     /// Write to the modern common configuration structure.
-    // Virtio 1.3 section 3.1.1 requires FEATURES_OK validation here. The two
-    // paths must remain distinct until the correct behavior has a guest test
-    // matrix covering accepted and rejected feature sets.
-    #[allow(clippy::if_same_then_else)]
     fn modern_common_write(&self, offset: u16, val: u32, _len: usize) {
         let Some(mut vs) = self.lock_for_write() else {
             return;
@@ -378,7 +374,13 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 vs.driver_feature_select = val;
             }
             bits::COMMON_CFG_DRIVER_FEATURE => {
-                // Write the selected 32-bit half of driver features.
+                // Negotiation ends at FEATURES_OK (VirtIO 1.3 sec
+                // 2.2.1): the only way to renegotiate is a reset. A
+                // half written after it would reach the backend and
+                // the rings while the driver is using them.
+                if vs.status & bits::STATUS_FEATURES_OK != 0 {
+                    return;
+                }
                 let offered = self.modern_features();
                 match vs.driver_feature_select {
                     0 => {
@@ -395,16 +397,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     }
                     _ => {}
                 }
-                // Propagate to device and queues
-                let features = vs.guest_features;
-                self.device.set_features(features);
-                let event_idx = features & bits::VIRTIO_F_RING_EVENT_IDX != 0;
-                let indirect =
-                    features & bits::VIRTIO_F_RING_INDIRECT_DESC != 0;
-                for q in &mut vs.queues {
-                    q.set_event_idx(event_idx);
-                    q.set_indirect_supported(indirect);
-                }
             }
             bits::COMMON_CFG_MSIX_CONFIG => {
                 vs.config_msix_vector = val as u16;
@@ -416,13 +408,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 if new_status == 0 {
                     self.reset_device(vs);
                 } else {
-                    if new_status & bits::STATUS_FEATURES_OK != 0
-                        && vs.status & bits::STATUS_FEATURES_OK == 0
-                    {
-                        vs.status = new_status;
-                    } else {
-                        vs.status = new_status;
-                    }
+                    self.set_status(vs, new_status);
                 }
             }
             bits::COMMON_CFG_QUEUE_SELECT => {
