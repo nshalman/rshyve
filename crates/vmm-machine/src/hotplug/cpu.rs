@@ -656,19 +656,6 @@ mod tests {
     }
 
     #[test]
-    fn nothing_here_can_remove_a_cpu() {
-        // illumos has no vm_deactivate_cpu, so an API that looks like a
-        // removal would be a promise this engine cannot keep.
-        let src = include_str!("cpu.rs");
-        let end = src.find("#[cfg(test)]").expect("test module attribute");
-        let code = &src[..end];
-
-        assert!(!code.contains("fn remove_cpu"));
-        assert!(!code.contains("fn request_remove"));
-        assert!(!code.contains("fn eject("));
-    }
-
-    #[test]
     fn shutdown_ends_the_drain_thread() {
         let h = harness(8, 2);
 

@@ -3,11 +3,7 @@ use std::process::Command;
 fn find_git() -> &'static str {
     for path in ["/opt/tools/bin/git", "/usr/bin/git", "git"] {
         if Command::new(path).arg("--version").output().is_ok() {
-            return match path {
-                "/opt/tools/bin/git" => "/opt/tools/bin/git",
-                "/usr/bin/git" => "/usr/bin/git",
-                _ => "git",
-            };
+            return path;
         }
     }
     "git"

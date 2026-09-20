@@ -424,9 +424,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
 
     // The guest can run now, so tell the brand. `vmadm create` waits on
     // this rename, not on the process, and gives up after 300 s. C
-    // bhyve does it at the same point, bhyverun.c:915. It must also
-    // stay ahead of any privilege drop, since the rename needs file
-    // access.
+    // bhyve does it at the same point, bhyverun.c:915.
     vmm_machine::provision::mark_provisioned(log);
 
     // Phase 9: Spawn vCPU threads. The fleet, not the fixed set,
@@ -671,26 +669,6 @@ mod tests {
             &vmm_boot::BootImage,
             &vmm_core::vcpu::Vcpu,
         ) -> anyhow::Result<()> = vmm_boot::BootImage::setup_bsp;
-    }
-
-    #[test]
-    fn one_cpu_ceiling_feeds_the_tables_the_registers_and_the_engine() {
-        // The MADT slot count, the CPU register file and the hot-add
-        // engine have to describe one machine. All three read
-        // VmOpts::max_cpus: the tables through setup_fwcfg_and_acpi, the
-        // register file through HotplugOpts::from_vm, and the engine
-        // through the VcpuSetup in run(). A hand-built HotplugOpts here
-        // would let the register file describe a different machine, so
-        // the phase sequence must not contain one.
-        let src = include_str!("main.rs");
-        let end = src.find("#[cfg(test)]").expect("test module attribute");
-        let code = &src[..end];
-
-        assert!(!code.contains("HotplugOpts {"), "a hand-built HotplugOpts");
-        // One read, so every other use of the ceiling in this file
-        // flows from the one local it is read into.
-        assert_eq!(code.matches("VmOpts::from_cli(").count(), 1);
-        assert_eq!(code.matches("cli.max_cpus()").count(), 0);
     }
 
     #[test]

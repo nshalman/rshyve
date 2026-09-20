@@ -512,8 +512,10 @@ mod tests {
         let error = reject_ahci_hd::<()>().unwrap_err();
         let message = error.to_string();
 
-        assert!(message.contains("not implemented"));
-        assert!(!message.contains("use virtio-blk instead"));
+        assert!(message.contains("not implemented"), "{message}");
+        // The refusal has to name what to use instead, or an operator
+        // is left with a driver name and no next step.
+        assert!(message.contains("virtio-blk"), "{message}");
     }
 
     #[test]

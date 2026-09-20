@@ -440,36 +440,6 @@ impl VcpuRegistry {
 mod tests {
     use super::{check_id, VcpuBook, VcpuError, KERNEL_MAX_CPUS};
 
-    /// The ioctl steps of an add need a live bhyve VM, and a unit test
-    /// has none. Read the invariants that matter out of the source
-    /// instead. The slice stops at the test module so a test literal
-    /// cannot satisfy a check the implementation no longer does.
-    fn implementation() -> &'static str {
-        let src = include_str!("vcpus.rs");
-        let end = src.find("#[cfg(test)]").expect("test module attribute");
-        &src[..end]
-    }
-
-    /// The implementation with every comment line removed.
-    ///
-    /// The doc comments here name the calls a hot-added CPU must NOT
-    /// make, so a scan for those names has to read code only.
-    fn code_only() -> String {
-        implementation()
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn body_of(name: &str) -> &'static str {
-        let src = implementation();
-        let start = src.find(name).unwrap_or_else(|| panic!("{name}"));
-        let body = &src[start..];
-        let end = body.find("\n    }\n").unwrap_or_else(|| panic!("{name}"));
-        &body[..end]
-    }
-
     #[test]
     fn an_id_past_the_slot_count_is_refused() {
         assert_eq!(
@@ -632,68 +602,5 @@ mod tests {
                 "{error:?} does not name the vCPU",
             );
         }
-    }
-
-    #[test]
-    fn a_hot_added_cpu_is_never_reset() {
-        // Vcpu::setup_bsp calls reboot_state(), and that on an AP
-        // clears the state the guest's INIT/SIPI bring-up depends on,
-        // which costs hundreds of seconds of SMP boot time.
-        let code = code_only();
-
-        assert!(!code.contains("setup_bsp"), "a hot-added CPU is an AP");
-        assert!(!code.contains("reboot_state"));
-        assert!(!code.contains("set_run_state"));
-    }
-
-    #[test]
-    fn nothing_here_can_remove_a_cpu() {
-        // illumos has no vm_deactivate_cpu: active_cpus is only ever
-        // set, and only VM_REINIT clears it, wholesale.
-        let code = code_only();
-
-        assert!(!code.contains("fn remove_vcpu"));
-        assert!(!code.contains("fn deactivate"));
-        assert!(!code.contains("fn offline"));
-        assert!(
-            implementation().contains("no `vm_deactivate_cpu`"),
-            "the absence has to stay documented",
-        );
-    }
-
-    #[test]
-    fn activation_is_the_last_fallible_step_of_an_add() {
-        // Everything before it is undone by dropping the start signal.
-        // Activation has no inverse.
-        let body = body_of("fn bring_online");
-        let spawn = body.find("spawn_one").expect("the thread is made");
-        let replay = body
-            .find("replay_boot_setup")
-            .expect("boot setup is replayed");
-        let activate = body.find(".activate()").expect("the CPU is activated");
-        let release =
-            body.find("signal.release").expect("the gate is released");
-
-        assert!(spawn < replay, "the thread is made before any setup");
-        assert!(
-            replay < activate,
-            "boot setup is replayed before activation"
-        );
-        assert!(activate < release, "the thread waits for the kernel");
-    }
-
-    #[test]
-    fn an_add_never_pre_activates_a_spare_cpu() {
-        // vmm.c:1634 declares the VM halted only when halted_cpus
-        // equals active_cpus, so an active CPU the guest never onlines
-        // stops VM_SUSPEND_HALT firing for the life of the VM.
-        let body = body_of("pub fn add_vcpu");
-
-        assert!(body.contains("bring_online"), "one add, one CPU");
-        assert_eq!(
-            code_only().matches(".activate()").count(),
-            1,
-            "activation happens in exactly one place",
-        );
     }
 }

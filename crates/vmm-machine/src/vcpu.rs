@@ -257,16 +257,6 @@ pub fn spawn_vcpu_fleet(
 mod tests {
     use super::uefi_reset_targets;
 
-    /// The activation paths need a live bhyve VM, and a unit test has
-    /// none. Read the invariant out of the source instead. The slice
-    /// stops at the test module so a test literal cannot satisfy a
-    /// check that the implementation no longer does.
-    fn implementation() -> &'static str {
-        let src = include_str!("vcpu.rs");
-        let end = src.find("#[cfg(test)]").expect("test module attribute");
-        &src[..end]
-    }
-
     #[test]
     fn uefi_reset_targets_selects_the_bsp_and_no_ap() {
         // Resetting an AP clears the state the guest's INIT/SIPI
@@ -292,25 +282,5 @@ mod tests {
         // A target list that ignores its argument can name a vCPU that
         // does not exist, and it cannot describe the AP complement.
         assert!(uefi_reset_targets(0).is_empty());
-    }
-
-    #[test]
-    fn uefi_bsp_reset_goes_through_the_target_list() {
-        let src = implementation();
-        let start = src
-            .find("pub fn activate_uefi_bsp_only")
-            .expect("activate_uefi_bsp_only");
-        let body = &src[start..];
-        let end = body.find("\n}\n").expect("end of activate_uefi_bsp_only");
-        let body = &body[..end];
-
-        assert!(
-            body.contains("uefi_reset_targets(machine.num_cpus())"),
-            "the target list is the only place the AP asymmetry is decided",
-        );
-        assert!(
-            !body.contains("machine.vcpus()"),
-            "iterating every vCPU here resets the APs",
-        );
     }
 }

@@ -126,7 +126,8 @@ pub fn process_zoneid() -> io::Result<Option<i32>> {
 
 // Only the Linux and macOS arms are exercisable from a plain unit test.
 // The illumos path needs a real zone to say anything interesting; the
-// authorization policy built on top of it is tested in control.rs.
+// authorization policy built on top of it is tested in
+// control/listener.rs.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
