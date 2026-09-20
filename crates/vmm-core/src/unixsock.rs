@@ -87,7 +87,11 @@ pub fn bind_restricted(
 /// be a socket, checked without following a symlink, and a connect to
 /// it has to be refused, which is what a socket whose listener has
 /// gone answers with. A connect that succeeds means another process
-/// serves the path, and that process keeps it.
+/// serves the path, and that process keeps it. A listener whose backlog
+/// is full also refuses the connect (illumos `tl_conn_req`), so a busy
+/// socket can still be taken; nothing short of asking the kernel who
+/// holds the bind distinguishes the two, and illumos offers no such
+/// call.
 ///
 /// The check and the unlink are two steps, so a parent directory the
 /// caller does not control can still swap the inode between them.
