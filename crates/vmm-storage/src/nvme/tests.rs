@@ -374,6 +374,24 @@ impl Harness {
         }
     }
 
+    /// Set the mask bit in the MSI-X vector control of `vector`.
+    fn mask_vector(&self, vector: u16) {
+        let offset = usize::from(vector) * 16 + 12;
+        let wo = WriteOp::from_buf(&1u32.to_le_bytes());
+        self.ctrl.bar_rw(BarN::BAR4, offset, RWOp::Write(&wo));
+    }
+
+    /// The MSI-X pending bit array, first dword.
+    fn pba(&self) -> u32 {
+        let mut ro = ReadOp::new(4);
+        self.ctrl.bar_rw(
+            BarN::BAR4,
+            self.ctrl.msix.pba_offset(),
+            RWOp::Read(&mut ro),
+        );
+        u32::from_le_bytes(ro.buf().try_into().expect("four bytes"))
+    }
+
     fn msi_count(&self) -> usize {
         self.sink.0.lock().expect("sink lock").len()
     }
@@ -975,6 +993,25 @@ fn deleting_and_recreating_an_io_queue_drops_the_old_commands() {
     let cqe = h.wait_cqe(CQ1, 0, true);
     assert_eq!(cqe.cid, 0x21, "a command from the deleted queue completed");
     assert_eq!(backend.started(), 1, "the dropped command still ran");
+}
+
+#[test]
+fn a_reset_drops_the_pending_msix_messages() {
+    let mut h = Harness::new();
+    h.mask_vector(0);
+    h.enable();
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_GET_FEATURES,
+        cdw10: u32::from(FEAT_NUM_QUEUES),
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::SUCCESS);
+    assert_eq!(h.pba() & 1, 1, "the masked admin vector should be pending");
+    assert_eq!(h.msi_count(), 0);
+
+    h.reg_write32(REG_CC, 0);
+
+    assert_eq!(h.pba() & 1, 0, "a reset left a message pending");
 }
 
 #[test]

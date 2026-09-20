@@ -258,6 +258,9 @@ impl NvmeController {
     fn disable(&self, new_cc: u32) {
         self.state.lock().expect("nvme: state lock").retire_queues();
         let fenced = self.fence_workers();
+        // The messages the PBA holds name a driver that is gone; left
+        // in place they leave on the next unmask.
+        self.msix.clear_pending();
 
         let mut st = self.state.lock().expect("nvme: state lock");
         st.cc = new_cc;
