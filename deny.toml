@@ -4,9 +4,12 @@
 unused-ignored-advisory = "warn"
 ignore = [
     # Owner: VMM maintainers. Review by 2026-11-17. memmap 0.7 is reached only
-    # through usdt 0.5; upgrading first requires an illumos diff of the DTrace
-    # probe names documented in DTRACE.md and used by operator scripts.
-    { id = "RUSTSEC-2020-0077", reason = "VMM maintainers; review by 2026-11-17; preserve documented DTrace probe names until an illumos probe-name diff is complete" },
+    # through usdt 0.5; upgrading first requires an illumos diff of the `vmm`
+    # provider probe names, which are declared in the `usdt::provider` blocks
+    # (crates/vmm-core/src/pio.rs, vmm-machine/src/vcpu_tasks.rs,
+    # vmm-virtio/src/block.rs, vmm-hid/src/ps2/ctrl.rs) and consumed by
+    # tools/profile/.
+    { id = "RUSTSEC-2020-0077", reason = "VMM maintainers; review by 2026-11-17; preserve the vmm provider probe names until an illumos probe-name diff is complete" },
     # Owner: migration maintainers. Review by 2026-11-17. rand 0.8.5 is reached
     # only through tungstenite 0.21, whose `log` feature is disabled, so the
     # custom-logger rand::rng() path is unreachable. Remediation requires moving

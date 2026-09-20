@@ -1,6 +1,12 @@
-# Feature Status
+# Feature status
 
-## Tested Configurations
+The one status document for this project. The crate structure is in
+[architecture.md](architecture.md), per-device limits and caveats are in
+[features.md](features.md), and what a live guest actually established
+is in [hardware-run.md](hardware-run.md). Open security findings are in
+[security/open-findings.md](security/open-findings.md).
+
+## Tested configurations
 
 | Scenario | Result |
 |----------|--------|
@@ -10,7 +16,7 @@
 | SSH access via mdata-delivered keys | Working |
 | Guest gets IP via mdata sdc:nics | Working |
 | Cross-host migration (old CPU -> new CPU) | Working |
-| Cross-host migration (new CPU -> old CPU) | Rejected (CPU feature check) |
+| Cross-host migration (new CPU -> old CPU) | Needs `--cpu-baseline`; a mismatch is warned about, not rejected (OSF-3) |
 | Same-host migration with busy workload | Working |
 | SIGTERM graceful shutdown | Working |
 | dd sequential read (NVMe, O_DIRECT) | 2.8 GB/s (matches C bhyve) |
@@ -38,7 +44,7 @@ and a real init. What they do and do not show is in
 | virtio-rnd | Complete | /dev/random entropy |
 | Framebuffer/VNC | Complete | Unix socket, password, resolution |
 | xHCI USB tablet | Complete | HID pointer device |
-| PCI passthrough | Partial | Intel VT-d only; MSI-X devices refused. See [devices.md](devices.md#pci-passthrough) |
+| PCI passthrough | Partial | Intel VT-d only, no AMD IOMMU backend; MSI-X devices refused. Not security-audited (OSF-5). See [devices.md](devices.md#pci-passthrough) |
 | AHCI CD-ROM (`ahci-cd`) | Complete | ATAPI SCSI/MMC, zero-copy reads |
 | AHCI disk (`ahci-hd`) | Not implemented | Rejected at startup; use virtio-blk or nvme |
 | LAPIC/IOAPIC/PIC/PIT | Complete | Kernel-emulated |
@@ -70,14 +76,14 @@ and a real init. What they do and do not show is in
 | Serial to device path (-l com1,/dev/zconsole) | Complete |
 | SMBIOS -B parsing | Complete (manufacturer, product, serial, etc.) |
 
-## Live Migration
+## Live migration
 
 | Feature | Status |
 |---------|--------|
 | Same-host migration | Complete |
 | Cross-host (old->new CPU) | Complete |
 | Cross-host (new->old CPU) | Requires --cpu-baseline |
-| CPU feature check at preamble | Warns only | Does not reject a mismatch; sync and async paths compare differently |
+| CPU feature check at preamble | Warns only, does not reject; the sync and async paths compare differently (OSF-3) |
 | CPUID masking (--cpu-baseline) | Complete (host, avx2, sse42) |
 | RAM transfer (pre/post pause) | Complete |
 | Kernel device state | Complete (IOAPIC, ATPIT, ATPIC, HPET, RTC, PM Timer) |
@@ -88,7 +94,7 @@ and a real init. What they do and do not show is in
 | Auto-resume on failure | Complete |
 | FPU/XSAVE state | Not yet implemented |
 
-## Platform Integration Readiness
+## Platform integration readiness
 
 | Requirement | Status |
 |-------------|--------|
@@ -100,19 +106,22 @@ and a real init. What they do and do not show is in
 | Dirty page tracking for migration | Supported |
 | Control socket for migration commands | Supported |
 
-## Known Limitations
+## Known limitations
 
 - `ahci-hd` not implemented (`ahci-cd` is); use virtio-blk or nvme for disks
 - FPU/XSAVE state not transferred during migration
 - Migration transport is unauthenticated and unencrypted; see SECURITY.md
 - NVList/zhyve.cmd reader not implemented (boot.c integration uses CLI flags directly)
 - Large VMs (>32 GB) not tested with migration
+- Hyper-V enlightenment state is not in the migration payload, so a
+  `--hyperv` guest's reference time restarts on the destination
+  (OSF-8)
 - virtio-net TX may show initial delay on first packet (viona interrupt poll startup)
 - A device reset has no bounded duration. Anything holding the bhyve VM
   write lock delays it, and memory hot-add holds that lock for 233 to
   270 ms per GiB. See
   [hardware-run.md](hardware-run.md#why-a-device-reset-has-no-upper-bound)
-- The control socket's peer check runs on macOS and Linux only, the
-  autodestruct test runs on illumos only, and nothing compares
-  per-crate test counts across platforms. See
+- The control socket's peer check runs on macOS and Linux only and the
+  autodestruct test runs on illumos only, so neither runs on both.
+  `tools/check-test-parity.py` now fails CI when that set moves. See
   [hardware-run.md](hardware-run.md#coverage-that-does-not-reach-illumos)
