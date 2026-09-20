@@ -846,10 +846,10 @@ impl VirtQueue {
                 if desc.has_next() {
                     return None;
                 }
-                // Sec 2.7.5.3.2: the device must handle zero or more
-                // normal descriptors followed by one indirect
-                // descriptor. The buffers ahead of the table belong to
-                // the same request, and a device that returned the
+                // Sec 2.7.5.3.1: the device must handle zero or more
+                // normal chained descriptors followed by a single
+                // indirect one. The buffers ahead of the table belong
+                // to the same request, so a device that returned the
                 // table alone would read the request out of the wrong
                 // buffer. The table ends the chain, because INDIRECT
                 // and NEXT cannot be set together.

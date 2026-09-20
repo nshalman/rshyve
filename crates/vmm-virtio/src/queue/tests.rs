@@ -254,8 +254,8 @@ fn indirect_table_within_queue_size_still_walks() {
     ));
 }
 
-/// VirtIO 1.3 sec 2.7.5.3.2: the device must handle zero or more
-/// normal chained descriptors followed by one indirect descriptor.
+/// VirtIO 1.3 sec 2.7.5.3.1: the device must handle zero or more
+/// normal chained descriptors followed by a single indirect one.
 /// Returning the table alone drops the buffers ahead of it, so a
 /// device parses the request header out of whatever the table's first
 /// entry happens to be.
@@ -343,8 +343,8 @@ fn a_direct_descriptor_before_an_indirect_table_keeps_its_buffer() {
 
 /// A chain may name no more descriptors than the ring holds (sec
 /// 2.7.5.3.1), and the direct descriptors ahead of a table count
-/// towards that: three direct buffers plus a four-entry table is one
-/// descriptor too many for a four-entry ring.
+/// towards that: three direct buffers plus a two-entry table is five
+/// descriptors, one too many for a four-entry ring.
 #[test]
 fn direct_and_indirect_descriptors_share_one_queue_size_budget() {
     const DESC_GPA: u64 = 0x2000;
