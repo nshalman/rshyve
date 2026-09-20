@@ -1,0 +1,197 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+use super::*;
+use vmm_core::common::PAGE_SIZE;
+
+struct NvmeQuiesceTestDevice {
+    gate: Arc<QuiesceGate>,
+}
+
+impl Lifecycle for NvmeQuiesceTestDevice {
+    fn type_name(&self) -> &'static str {
+        "nvme"
+    }
+
+    fn is_quiesced(&self) -> bool {
+        self.gate.is_quiesced()
+    }
+}
+
+#[test]
+fn quiesce_query_is_non_blocking_with_active_worker() {
+    let device: Arc<dyn Lifecycle> = Arc::new(NvmeQuiesceTestDevice {
+        gate: Arc::new(QuiesceGate::new(1)),
+    });
+
+    let probe = Arc::clone(&device);
+    assert!(!vmm_devices_testsupport::assert_query_non_blocking(
+        move || probe.is_quiesced()
+    ));
+}
+
+#[test]
+fn cap_register_value() {
+    // Verify CAP register encoding
+    let mqes = MAX_QUEUE_SIZE - 1;
+    let cap: u64 = (u64::from(mqes) << CAP_MQES_SHIFT)
+        | CAP_CQR
+        | (1u64 << CAP_TO_SHIFT)
+        | CAP_CSS_NVM;
+    // MQES should be in bits 15:0
+    assert_eq!((cap & CAP_MQES_MASK) as u16, mqes);
+    // CQR bit 16
+    assert_ne!(cap & CAP_CQR, 0);
+    // CSS NVM bit 37
+    assert_ne!(cap & CAP_CSS_NVM, 0);
+}
+
+#[test]
+fn cqe_phase_bit_encoding() {
+    // Phase bit is bit 0 of the status word in CQE
+    let status: u16 = SC_SUCCESS;
+    let phase = true;
+    let encoded = (status << 1) | if phase { 1 } else { 0 };
+    assert_eq!(encoded & 1, 1); // phase set
+    assert_eq!(encoded >> 1, SC_SUCCESS);
+}
+
+#[test]
+fn doorbell_index_calculation() {
+    // SQ tail doorbell for queue 0 is at offset 0x1000
+    let offset = REG_DOORBELL_BASE;
+    let db_offset = offset - REG_DOORBELL_BASE;
+    let db_index = db_offset / 4;
+    let qid = db_index / 2;
+    let is_sq = db_index.is_multiple_of(2);
+    assert_eq!(qid, 0);
+    assert!(is_sq);
+
+    // CQ head doorbell for queue 0 is at offset 0x1004
+    let offset = REG_DOORBELL_BASE + 4;
+    let db_offset = offset - REG_DOORBELL_BASE;
+    let db_index = db_offset / 4;
+    let qid = db_index / 2;
+    let is_sq = db_index.is_multiple_of(2);
+    assert_eq!(qid, 0);
+    assert!(!is_sq);
+
+    // SQ tail doorbell for queue 1 is at offset 0x1008
+    let offset = REG_DOORBELL_BASE + 8;
+    let db_offset = offset - REG_DOORBELL_BASE;
+    let db_index = db_offset / 4;
+    let qid = db_index / 2;
+    let is_sq = db_index.is_multiple_of(2);
+    assert_eq!(qid, 1);
+    assert!(is_sq);
+}
+
+#[test]
+fn prp_single_page() {
+    // When total_len fits in one page, only PRP1 is used
+    // This is a structural test of the logic (can't test without MemCtx)
+    let offset_in_page = 0x100usize;
+    let _prp1_addr = 0x1000u64 + offset_in_page as u64;
+    let first_len = (PAGE_SIZE - offset_in_page).min(512);
+    assert_eq!(first_len, 512); // 512 < 3840
+}
+
+#[test]
+fn status_code_encoding() {
+    // DNR flag should be bit 14
+    assert_eq!(SC_DNR, 1 << 14);
+    // Invalid opcode with DNR
+    let status = SC_INVALID_OPCODE | SC_DNR;
+    assert_ne!(status & SC_DNR, 0);
+    assert_eq!(status & !SC_DNR, SC_INVALID_OPCODE);
+}
+
+#[test]
+fn create_io_cq_with_cq_id_zero_is_rejected() {
+    let mut state = NvmeState::default();
+    let qid = 1u32;
+    let qsize = 1u32 << 16;
+    let cq_id = 0u32 << 16;
+
+    let status = NvmeController::admin_create_io_sq(
+        &mut state,
+        0x1000,
+        qid | qsize,
+        cq_id,
+    );
+
+    assert_eq!(status, (SC_INVALID_FIELD | SC_DNR, 0));
+}
+
+#[test]
+fn num_queues_max_request_stays_nonzero() {
+    let mut state = NvmeState::default();
+
+    let set_result = NvmeController::admin_set_features(
+        &mut state,
+        u32::from(FEAT_NUM_QUEUES),
+        u32::MAX,
+    );
+
+    let allocated = (MAX_IO_QUEUES as u32) - 1;
+    assert_eq!(set_result, (SC_SUCCESS, allocated | (allocated << 16)));
+    assert_eq!(state.num_io_queues, MAX_IO_QUEUES as u16);
+    assert_ne!(state.num_io_queues, 0);
+    assert_eq!(
+        NvmeController::admin_get_features(&state, u32::from(FEAT_NUM_QUEUES),),
+        set_result
+    );
+}
+
+#[test]
+fn create_io_queues_reject_max_qsize_without_overflow() {
+    let cdw10 = 1 | (u32::from(u16::MAX) << 16);
+
+    let mut cq_state = NvmeState::default();
+    assert_eq!(
+        NvmeController::admin_create_io_cq(&mut cq_state, 0x1000, cdw10, 0,),
+        (SC_INVALID_QUEUE_SIZE | SC_DNR, 0)
+    );
+
+    let mut sq_state = NvmeState::default();
+    assert_eq!(
+        NvmeController::admin_create_io_sq(
+            &mut sq_state,
+            0x1000,
+            cdw10,
+            1 << 16,
+        ),
+        (SC_INVALID_QUEUE_SIZE | SC_DNR, 0)
+    );
+}
+
+#[test]
+fn sector_overflow_checked_mul() {
+    // Verify that checked_mul catches overflow in sector arithmetic.
+    // slba near u64::MAX with block_size=512 would overflow.
+    let slba: u64 = u64::MAX / 512 + 1;
+    let block_size: u32 = 512;
+    assert!(slba.checked_mul(u64::from(block_size)).is_none());
+}
+
+#[test]
+fn sector_bounds_checked_add() {
+    // slba + nlb overflow should be caught
+    let slba: u64 = u64::MAX;
+    let nlb: u16 = 1;
+    assert!(slba.checked_add(u64::from(nlb)).is_none());
+}
+
+#[test]
+fn nlb_overflow_checked_mul() {
+    // nlb * block_size overflow should be caught
+    let nlb: u16 = u16::MAX;
+    let block_size: u32 = u32::MAX;
+    assert!((nlb as u64).checked_mul(u64::from(block_size)).is_some());
+    // This fits in u64, so the overflow is in byte_offset, not byte_count
+    // Verify the realistic case works
+    let nlb: u16 = 128;
+    let block_size: u32 = 512;
+    assert_eq!((nlb as u64).checked_mul(u64::from(block_size)), Some(65536));
+}
