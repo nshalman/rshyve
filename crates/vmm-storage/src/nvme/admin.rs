@@ -82,9 +82,9 @@ impl NvmeController {
                     .expect("4 bytes"),
             );
 
-            // Advance the SQ head
+            let sq_head = (sq_head + 1) % sq_size;
             if let Some(sq) = &mut st.admin_sq {
-                sq.head = (sq_head + 1) % sq_size;
+                sq.head = sq_head;
             }
 
             // Now process the command with full NvmeState access

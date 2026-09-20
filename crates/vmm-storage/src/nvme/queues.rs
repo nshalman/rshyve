@@ -71,8 +71,6 @@ pub(super) struct NvmeState {
 
     // Configuration
     pub(super) num_io_queues: u16,
-    pub(super) block_size: u32,
-    pub(super) total_blocks: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,15 +148,9 @@ pub(super) fn valid_queue_base(prp1: u64) -> bool {
     prp1 != 0 && (prp1 & 0xFFF) == 0
 }
 
-// ---------------------------------------------------------------------------
-// Default impl for Option arrays
-// ---------------------------------------------------------------------------
-
-// SubQueue and CompQueue don't implement Copy/Clone, so we need a manual
-// Default for the fixed-size arrays.
+#[cfg(test)]
 impl Default for NvmeState {
     fn default() -> Self {
-        // This is only used internally; the real init is in NvmeController::new
         Self {
             cap: 0,
             cc: 0,
@@ -173,8 +165,6 @@ impl Default for NvmeState {
             ctrl_ident: [0u8; IDENT_CTRL_SIZE],
             ns_ident: [0u8; IDENT_NS_SIZE],
             num_io_queues: MAX_IO_QUEUES as u16,
-            block_size: 512,
-            total_blocks: 0,
         }
     }
 }

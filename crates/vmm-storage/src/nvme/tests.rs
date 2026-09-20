@@ -2,8 +2,503 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use super::*;
-use vmm_core::common::PAGE_SIZE;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use vmm_core::common::{RWOp, ReadOp, WriteOp, PAGE_SIZE};
+use vmm_core::mem::{MemCtx, PhysMap};
+use vmm_core::mmio::MmioBus;
+use vmm_devices::pci::device::PciDevice;
+use vmm_devices::pci::msix::MsiSink;
+use vmm_devices::pci::BarN;
+use vmm_devices::{Lifecycle, QuiesceGate};
+
+use super::bits::*;
+use super::queues::NvmeState;
+use super::{NvmeController, NvmeParts};
+
+/// Guest RAM the harness maps: enough for queues and a 2 MiB transfer.
+const GUEST_RAM: usize = 8 << 20;
+const BACKING_BLOCKS: u64 = 4096;
+const ASQ: u64 = 0x10000;
+const ACQ: u64 = 0x11000;
+const ADMIN_QDEPTH: u16 = 16;
+const WAIT: Duration = Duration::from_secs(5);
+
+struct RecordingSink(Mutex<Vec<(u64, u64)>>);
+
+impl MsiSink for RecordingSink {
+    fn send(&self, addr: u64, data: u64) {
+        self.0.lock().expect("sink lock").push((addr, data));
+    }
+}
+
+/// One controller over anonymous guest RAM and a patterned temp file.
+///
+/// Byte `i` of the backing file is `(i / 512) as u8 ^ (i as u8)`, so a
+/// read that lands in the wrong page is visible.
+struct Harness {
+    ctrl: Arc<NvmeController>,
+    physmap: Arc<PhysMap>,
+    sink: Arc<RecordingSink>,
+    admin_tail: u16,
+    admin_cq_head: usize,
+    admin_phase: bool,
+    next_cid: u16,
+}
+
+fn backing_byte(i: u64) -> u8 {
+    ((i / 512) as u8) ^ (i as u8)
+}
+
+fn backing_file() -> std::fs::File {
+    let mut file = tempfile::tempfile().expect("temp backing file");
+    let bytes: Vec<u8> = (0..BACKING_BLOCKS * 512).map(backing_byte).collect();
+    file.write_all(&bytes).expect("fill backing file");
+    file
+}
+
+impl Harness {
+    fn new() -> Self {
+        let file = Arc::new(backing_file());
+        Self::with_backend(Arc::clone(&file), file)
+    }
+
+    fn with_backend(
+        file: Arc<std::fs::File>,
+        backend: Arc<dyn super::io::IoBackend>,
+    ) -> Self {
+        let physmap =
+            Arc::new(PhysMap::new_anon(0, GUEST_RAM).expect("anon guest RAM"));
+        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+        let ctrl = NvmeController::build(NvmeParts {
+            file,
+            backend,
+            read_only: false,
+            instance_id: 1,
+            physmap: Arc::clone(&physmap),
+            msi: Arc::clone(&sink) as Arc<dyn MsiSink>,
+            bus_mmio: Arc::new(MmioBus::new()),
+            log: slog::Logger::root(slog::Discard, slog::o!()),
+        });
+        ctrl.msix.set_enabled(true);
+        for v in 0..NVME_MSIX_COUNT {
+            ctrl.msix.write_entry(v, 0xFEE0_0000, u64::from(v));
+        }
+        Self {
+            ctrl,
+            physmap,
+            sink,
+            admin_tail: 0,
+            admin_cq_head: 0,
+            admin_phase: true,
+            next_cid: 1,
+        }
+    }
+
+    fn mem(&self) -> MemCtx {
+        MemCtx::new(Arc::clone(&self.physmap))
+    }
+
+    fn fill(&self, gpa: u64, len: usize, byte: u8) {
+        self.mem()
+            .write(gpa, &vec![byte; len])
+            .expect("fill guest RAM");
+    }
+
+    fn read_guest(&self, gpa: u64, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        self.mem().read(gpa, &mut buf).expect("read guest RAM");
+        buf
+    }
+
+    fn reg_write32(&self, offset: usize, val: u32) {
+        let wo = WriteOp::from_buf(&val.to_le_bytes());
+        self.ctrl.bar_rw(BarN::BAR0, offset, RWOp::Write(&wo));
+    }
+
+    fn reg_write64(&self, offset: usize, val: u64) {
+        let wo = WriteOp::from_buf(&val.to_le_bytes());
+        self.ctrl.bar_rw(BarN::BAR0, offset, RWOp::Write(&wo));
+    }
+
+    fn reg_read32(&self, offset: usize) -> u32 {
+        let mut ro = ReadOp::new(4);
+        self.ctrl.bar_rw(BarN::BAR0, offset, RWOp::Read(&mut ro));
+        u32::from_le_bytes(ro.buf().try_into().expect("four bytes"))
+    }
+
+    fn sq_doorbell(&self, qid: u16, tail: u16) {
+        self.reg_write32(
+            REG_DOORBELL_BASE + usize::from(qid) * 8,
+            u32::from(tail),
+        );
+    }
+
+    fn cq_doorbell(&self, qid: u16, head: u16) {
+        self.reg_write32(
+            REG_DOORBELL_BASE + usize::from(qid) * 8 + 4,
+            u32::from(head),
+        );
+    }
+
+    /// Program the admin queues and set CC.EN with the entry sizes a
+    /// real driver writes.
+    fn enable(&self) {
+        self.reg_write32(
+            REG_AQA,
+            u32::from(ADMIN_QDEPTH - 1) | (u32::from(ADMIN_QDEPTH - 1) << 16),
+        );
+        self.reg_write64(REG_ASQ, ASQ);
+        self.reg_write64(REG_ACQ, ACQ);
+        self.reg_write32(
+            REG_CC,
+            CC_EN
+                | (SQE_SIZE_LOG2 << CC_IOSQES_SHIFT)
+                | (CQE_SIZE_LOG2 << CC_IOCQES_SHIFT),
+        );
+    }
+
+    fn csts(&self) -> u32 {
+        self.reg_read32(REG_CSTS)
+    }
+
+    /// Submit one admin command and return its completion.
+    fn admin(&mut self, sqe: Sqe) -> Cqe {
+        let cid = self.next_cid;
+        self.next_cid += 1;
+        let entry = ASQ + u64::from(self.admin_tail) * SQE_SIZE as u64;
+        self.mem()
+            .write(entry, &sqe.encode(cid))
+            .expect("write SQE");
+        self.admin_tail = (self.admin_tail + 1) % ADMIN_QDEPTH;
+        self.sq_doorbell(ADMIN_QUEUE_ID, self.admin_tail);
+
+        let slot = ACQ + self.admin_cq_head as u64 * CQE_SIZE as u64;
+        let cqe = Cqe::decode(&self.read_guest(slot, CQE_SIZE));
+        assert_eq!(cqe.phase, self.admin_phase, "admin CQE phase");
+        assert_eq!(cqe.cid, cid, "admin CQE cid");
+        self.admin_cq_head += 1;
+        if self.admin_cq_head == usize::from(ADMIN_QDEPTH) {
+            self.admin_cq_head = 0;
+            self.admin_phase = !self.admin_phase;
+        }
+        self.cq_doorbell(ADMIN_QUEUE_ID, self.admin_cq_head as u16);
+        cqe
+    }
+
+    /// Create I/O queue pair `qid` of `depth` entries with the SQ at
+    /// `sq_base` and the CQ at `cq_base`, MSI-X vector `qid`.
+    fn create_io_queues(
+        &mut self,
+        qid: u16,
+        depth: u16,
+        sq_base: u64,
+        cq_base: u64,
+    ) {
+        let cqe = self.admin(Sqe {
+            opcode: ADMIN_OPC_CREATE_IO_CQ,
+            prp1: cq_base,
+            cdw10: u32::from(qid) | (u32::from(depth - 1) << 16),
+            cdw11: (u32::from(qid) << 16) | CQ_IEN | CQ_PC,
+            ..Sqe::default()
+        });
+        assert_eq!(cqe.status(), Status::SUCCESS, "create CQ");
+        let cqe = self.admin(Sqe {
+            opcode: ADMIN_OPC_CREATE_IO_SQ,
+            prp1: sq_base,
+            cdw10: u32::from(qid) | (u32::from(depth - 1) << 16),
+            cdw11: (u32::from(qid) << 16) | CQ_PC,
+            ..Sqe::default()
+        });
+        assert_eq!(cqe.status(), Status::SUCCESS, "create SQ");
+    }
+
+    /// Poll a CQ slot until its phase bit reads `phase`.
+    fn wait_cqe(&self, cq_base: u64, index: u16, phase: bool) -> Cqe {
+        let slot = cq_base + u64::from(index) * CQE_SIZE as u64;
+        let start = Instant::now();
+        loop {
+            let cqe = Cqe::decode(&self.read_guest(slot, CQE_SIZE));
+            if cqe.phase == phase {
+                return cqe;
+            }
+            assert!(start.elapsed() < WAIT, "no completion in {WAIT:?}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn msi_count(&self) -> usize {
+        self.sink.0.lock().expect("sink lock").len()
+    }
+}
+
+const CQ_PC: u32 = 1;
+const CQ_IEN: u32 = 1 << 1;
+
+#[derive(Default, Clone, Copy)]
+struct Sqe {
+    opcode: u8,
+    nsid: u32,
+    prp1: u64,
+    prp2: u64,
+    cdw10: u32,
+    cdw11: u32,
+    cdw12: u32,
+}
+
+impl Sqe {
+    fn encode(&self, cid: u16) -> [u8; SQE_SIZE] {
+        let mut b = [0u8; SQE_SIZE];
+        b[SQE_OPC] = self.opcode;
+        b[SQE_CID..SQE_CID + 2].copy_from_slice(&cid.to_le_bytes());
+        b[SQE_NSID..SQE_NSID + 4].copy_from_slice(&self.nsid.to_le_bytes());
+        b[SQE_PRP1..SQE_PRP1 + 8].copy_from_slice(&self.prp1.to_le_bytes());
+        b[SQE_PRP2..SQE_PRP2 + 8].copy_from_slice(&self.prp2.to_le_bytes());
+        b[SQE_CDW10..SQE_CDW10 + 4].copy_from_slice(&self.cdw10.to_le_bytes());
+        b[SQE_CDW11..SQE_CDW11 + 4].copy_from_slice(&self.cdw11.to_le_bytes());
+        b[SQE_CDW12..SQE_CDW12 + 4].copy_from_slice(&self.cdw12.to_le_bytes());
+        b
+    }
+
+    fn read(slba: u64, nlb: u16, prp1: u64, prp2: u64) -> Self {
+        Self {
+            opcode: NVM_OPC_READ,
+            nsid: 1,
+            prp1,
+            prp2,
+            cdw10: slba as u32,
+            cdw11: (slba >> 32) as u32,
+            cdw12: u32::from(nlb - 1),
+        }
+    }
+
+    fn write(slba: u64, nlb: u16, prp1: u64, prp2: u64) -> Self {
+        Self {
+            opcode: NVM_OPC_WRITE,
+            ..Self::read(slba, nlb, prp1, prp2)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Status {
+    sct: u8,
+    sc: u8,
+    dnr: bool,
+}
+
+impl Status {
+    const SUCCESS: Self = Self {
+        sct: 0,
+        sc: 0,
+        dnr: false,
+    };
+
+    /// The status a `SC_*` constant encodes, as the guest decodes it.
+    fn of(code: u16) -> Self {
+        Self {
+            sct: ((code >> 8) & 0x7) as u8,
+            sc: (code & 0xFF) as u8,
+            dnr: code & SC_DNR != 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Cqe {
+    dw0: u32,
+    sq_head: u16,
+    sqid: u16,
+    cid: u16,
+    raw_status: u16,
+    phase: bool,
+}
+
+impl Cqe {
+    fn decode(b: &[u8]) -> Self {
+        let raw = u16::from_le_bytes([b[CQE_STATUS], b[CQE_STATUS + 1]]);
+        Self {
+            dw0: u32::from_le_bytes(
+                b[CQE_DW0..CQE_DW0 + 4].try_into().expect("dw0"),
+            ),
+            sq_head: u16::from_le_bytes([b[CQE_SQHD], b[CQE_SQHD + 1]]),
+            sqid: u16::from_le_bytes([b[CQE_SQID], b[CQE_SQID + 1]]),
+            cid: u16::from_le_bytes([b[CQE_CID], b[CQE_CID + 1]]),
+            raw_status: raw,
+            phase: raw & 1 != 0,
+        }
+    }
+
+    fn status(&self) -> Status {
+        Status {
+            sct: ((self.raw_status >> 9) & 0x7) as u8,
+            sc: ((self.raw_status >> 1) & 0xFF) as u8,
+            dnr: self.raw_status & (1 << 15) != 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Register and admin path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn enable_sets_rdy_and_identify_lands_through_prp1_and_prp2() {
+    let mut h = Harness::new();
+    h.enable();
+    assert_eq!(h.csts() & CSTS_RDY, CSTS_RDY);
+
+    // PRP1 starts mid-page, so the 4 KiB structure straddles PRP2.
+    let prp1 = 0x20800;
+    let prp2 = 0x22000;
+    h.fill(0x20000, 3 * PAGE_SIZE, 0xAA);
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_IDENTIFY,
+        prp1,
+        prp2,
+        cdw10: u32::from(IDENTIFY_CNS_CONTROLLER),
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::SUCCESS);
+    assert_eq!(cqe.sqid, ADMIN_QUEUE_ID);
+    assert_eq!(cqe.sq_head, 1);
+    assert_eq!(cqe.dw0, 0);
+    assert_eq!(h.msi_count(), 1, "one MSI for the admin CQ");
+
+    let first = h.read_guest(prp1, 0x800);
+    assert_eq!(&first[4..24], b"TRITON-NVME-0001    ");
+    assert_eq!(first[77], MDTS_LOG2_PAGES);
+    assert_eq!(
+        first[512],
+        SQE_SIZE_LOG2 as u8 | ((SQE_SIZE_LOG2 as u8) << 4)
+    );
+    let second = h.read_guest(prp2, 0x800);
+    assert_eq!(first[525], 1, "VWC");
+    assert!(
+        second.iter().all(|&b| b == 0),
+        "upper half of Identify is zero"
+    );
+    // Nothing past the end of the PRP1 page and nothing past the data.
+    assert!(h.read_guest(0x21000, PAGE_SIZE).iter().all(|&b| b == 0xAA));
+    assert!(h.read_guest(prp2 + 0x800, 0x800).iter().all(|&b| b == 0xAA));
+}
+
+#[test]
+fn admin_cq_wraps_and_flips_phase() {
+    let mut h = Harness::new();
+    h.enable();
+    for _ in 0..ADMIN_QDEPTH + 2 {
+        let cqe = h.admin(Sqe {
+            opcode: ADMIN_OPC_GET_FEATURES,
+            cdw10: u32::from(FEAT_NUM_QUEUES),
+            ..Sqe::default()
+        });
+        assert_eq!(cqe.status(), Status::SUCCESS);
+    }
+    // The harness asserted the phase on every entry; past the wrap the
+    // controller must be writing phase 0.
+    assert!(!h.admin_phase);
+    assert_eq!(h.admin_cq_head, 2);
+}
+
+#[test]
+fn admin_doorbell_beyond_queue_size_is_ignored() {
+    let h = Harness::new();
+    h.enable();
+    let entry = ASQ;
+    let sqe = Sqe {
+        opcode: ADMIN_OPC_GET_FEATURES,
+        cdw10: u32::from(FEAT_NUM_QUEUES),
+        ..Sqe::default()
+    };
+    h.mem().write(entry, &sqe.encode(7)).expect("write SQE");
+    h.sq_doorbell(ADMIN_QUEUE_ID, ADMIN_QDEPTH);
+    assert_eq!(h.read_guest(ACQ, CQE_SIZE), vec![0u8; CQE_SIZE]);
+    assert_eq!(h.msi_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// I/O path
+// ---------------------------------------------------------------------------
+
+const SQ1: u64 = 0x30000;
+const CQ1: u64 = 0x40000;
+const IO_QDEPTH: u16 = 64;
+
+/// Submit `sqe` on I/O queue 1 at `tail` and wait for its completion.
+fn io_submit(h: &mut Harness, tail: &mut u16, sqe: Sqe, cid: u16) {
+    let entry = SQ1 + u64::from(*tail) * SQE_SIZE as u64;
+    h.mem().write(entry, &sqe.encode(cid)).expect("write SQE");
+    *tail = (*tail + 1) % IO_QDEPTH;
+    h.sq_doorbell(1, *tail);
+}
+
+#[test]
+fn io_read_through_prp1_and_prp2_returns_the_backing_bytes() {
+    let mut h = Harness::new();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    let prp1 = 0x50800;
+    let prp2 = 0x52000;
+    h.fill(0x50000, 3 * PAGE_SIZE, 0xAA);
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::read(8, 8, prp1, prp2), 0x77);
+    let cqe = h.wait_cqe(CQ1, 0, true);
+    assert_eq!(cqe.status(), Status::SUCCESS);
+    assert_eq!(cqe.cid, 0x77);
+    assert_eq!(cqe.sqid, 1);
+    assert_eq!(cqe.sq_head, 1);
+
+    let expect: Vec<u8> = (8 * 512..16 * 512).map(backing_byte).collect();
+    assert_eq!(h.read_guest(prp1, 0x800), expect[..0x800]);
+    assert_eq!(h.read_guest(prp2, 0x800), expect[0x800..]);
+    assert!(h.read_guest(0x51000, PAGE_SIZE).iter().all(|&b| b == 0xAA));
+    assert_eq!(h.msi_count(), 3, "two admin completions and one I/O");
+}
+
+#[test]
+fn io_write_reaches_the_backing_file() {
+    let file = Arc::new(backing_file());
+    let mut h = Harness::with_backend(
+        Arc::clone(&file),
+        Arc::clone(&file) as Arc<dyn super::io::IoBackend>,
+    );
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    h.fill(0x50000, 512, 0x5A);
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::write(100, 1, 0x50000, 0), 1);
+    assert_eq!(h.wait_cqe(CQ1, 0, true).status(), Status::SUCCESS);
+
+    use std::os::unix::fs::FileExt;
+    let mut buf = [0u8; 512];
+    file.read_exact_at(&mut buf, 100 * 512).expect("read back");
+    assert!(buf.iter().all(|&b| b == 0x5A));
+}
+
+#[test]
+fn io_read_past_the_namespace_is_refused() {
+    let mut h = Harness::new();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut tail = 0;
+    io_submit(
+        &mut h,
+        &mut tail,
+        Sqe::read(BACKING_BLOCKS - 1, 2, 0x50000, 0),
+        1,
+    );
+    let cqe = h.wait_cqe(CQ1, 0, true);
+    assert_eq!(cqe.status(), Status::of(SC_INVALID_FIELD | SC_DNR));
+}
+
+// ---------------------------------------------------------------------------
+// Unit-level checks kept from before the harness
+// ---------------------------------------------------------------------------
 
 struct NvmeQuiesceTestDevice {
     gate: Arc<QuiesceGate>,
@@ -32,72 +527,6 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
 }
 
 #[test]
-fn cap_register_value() {
-    // Verify CAP register encoding
-    let mqes = MAX_QUEUE_SIZE - 1;
-    let cap: u64 = (u64::from(mqes) << CAP_MQES_SHIFT)
-        | CAP_CQR
-        | (1u64 << CAP_TO_SHIFT)
-        | CAP_CSS_NVM;
-    // MQES should be in bits 15:0
-    assert_eq!((cap & CAP_MQES_MASK) as u16, mqes);
-    // CQR bit 16
-    assert_ne!(cap & CAP_CQR, 0);
-    // CSS NVM bit 37
-    assert_ne!(cap & CAP_CSS_NVM, 0);
-}
-
-#[test]
-fn cqe_phase_bit_encoding() {
-    // Phase bit is bit 0 of the status word in CQE
-    let status: u16 = SC_SUCCESS;
-    let phase = true;
-    let encoded = (status << 1) | if phase { 1 } else { 0 };
-    assert_eq!(encoded & 1, 1); // phase set
-    assert_eq!(encoded >> 1, SC_SUCCESS);
-}
-
-#[test]
-fn doorbell_index_calculation() {
-    // SQ tail doorbell for queue 0 is at offset 0x1000
-    let offset = REG_DOORBELL_BASE;
-    let db_offset = offset - REG_DOORBELL_BASE;
-    let db_index = db_offset / 4;
-    let qid = db_index / 2;
-    let is_sq = db_index.is_multiple_of(2);
-    assert_eq!(qid, 0);
-    assert!(is_sq);
-
-    // CQ head doorbell for queue 0 is at offset 0x1004
-    let offset = REG_DOORBELL_BASE + 4;
-    let db_offset = offset - REG_DOORBELL_BASE;
-    let db_index = db_offset / 4;
-    let qid = db_index / 2;
-    let is_sq = db_index.is_multiple_of(2);
-    assert_eq!(qid, 0);
-    assert!(!is_sq);
-
-    // SQ tail doorbell for queue 1 is at offset 0x1008
-    let offset = REG_DOORBELL_BASE + 8;
-    let db_offset = offset - REG_DOORBELL_BASE;
-    let db_index = db_offset / 4;
-    let qid = db_index / 2;
-    let is_sq = db_index.is_multiple_of(2);
-    assert_eq!(qid, 1);
-    assert!(is_sq);
-}
-
-#[test]
-fn prp_single_page() {
-    // When total_len fits in one page, only PRP1 is used
-    // This is a structural test of the logic (can't test without MemCtx)
-    let offset_in_page = 0x100usize;
-    let _prp1_addr = 0x1000u64 + offset_in_page as u64;
-    let first_len = (PAGE_SIZE - offset_in_page).min(512);
-    assert_eq!(first_len, 512); // 512 < 3840
-}
-
-#[test]
 fn status_code_encoding() {
     // DNR flag should be bit 14
     assert_eq!(SC_DNR, 1 << 14);
@@ -108,7 +537,7 @@ fn status_code_encoding() {
 }
 
 #[test]
-fn create_io_cq_with_cq_id_zero_is_rejected() {
+fn create_io_sq_with_cq_id_zero_is_rejected() {
     let mut state = NvmeState::default();
     let qid = 1u32;
     let qsize = 1u32 << 16;
@@ -164,34 +593,4 @@ fn create_io_queues_reject_max_qsize_without_overflow() {
         ),
         (SC_INVALID_QUEUE_SIZE | SC_DNR, 0)
     );
-}
-
-#[test]
-fn sector_overflow_checked_mul() {
-    // Verify that checked_mul catches overflow in sector arithmetic.
-    // slba near u64::MAX with block_size=512 would overflow.
-    let slba: u64 = u64::MAX / 512 + 1;
-    let block_size: u32 = 512;
-    assert!(slba.checked_mul(u64::from(block_size)).is_none());
-}
-
-#[test]
-fn sector_bounds_checked_add() {
-    // slba + nlb overflow should be caught
-    let slba: u64 = u64::MAX;
-    let nlb: u16 = 1;
-    assert!(slba.checked_add(u64::from(nlb)).is_none());
-}
-
-#[test]
-fn nlb_overflow_checked_mul() {
-    // nlb * block_size overflow should be caught
-    let nlb: u16 = u16::MAX;
-    let block_size: u32 = u32::MAX;
-    assert!((nlb as u64).checked_mul(u64::from(block_size)).is_some());
-    // This fits in u64, so the overflow is in byte_offset, not byte_count
-    // Verify the realistic case works
-    let nlb: u16 = 128;
-    let block_size: u32 = 512;
-    assert_eq!((nlb as u64).checked_mul(u64::from(block_size)), Some(65536));
 }

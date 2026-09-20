@@ -2,22 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! NVMe 1.0 controller device emulation.
+//! NVMe 1.0 controller with one namespace.
 //!
-//! Implements a single-namespace NVMe controller with MSI-X interrupt
-//! delivery and async I/O via worker threads. The vCPU thread submits
-//! I/O requests through a channel and returns immediately; worker
-//! threads perform file I/O, write completion queue entries to guest
-//! memory, and fire MSI-X interrupts.
+//! Admin commands run on the vCPU that rang the doorbell. I/O commands
+//! go through a channel to a pool of worker threads that move data
+//! straight between the backing file and the guest pages named by the
+//! PRPs, then post the completion and raise MSI-X.
 //!
-//! # Architecture
-//!
-//! - BAR0: 64-bit MMIO (16 KiB) for controller registers + doorbells
-//! - BAR4: MMIO for MSI-X table/PBA
-//! - MSI-X capability at config offset 0x40
-//! - Admin commands processed synchronously during doorbell write
-//! - I/O commands dispatched to a pool of 4 worker threads
-//! - File I/O uses `pread`/`pwrite` on the raw fd (lock-free)
+//! BAR0 holds the registers and doorbells, BAR4 the MSI-X table.
 
 pub mod bits;
 
@@ -47,65 +39,69 @@ use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{
     replay_migrate_pci_state, DeviceIdent, DeviceState, PciDevice,
 };
-use vmm_devices::pci::msix::{HdlMsiSink, MsixTable};
+use vmm_devices::pci::msix::{HdlMsiSink, MsiSink, MsixTable};
 use vmm_devices::pci::BarN;
 use vmm_devices::{
     DeviceMigrateState, FlushError, FlushIntent, Lifecycle, QuiesceGate,
 };
 
 use bits::*;
-use io::IoRequest;
+use io::{IoBackend, IoRequest};
 use queues::{CompQueue, NvmeState, SubQueue};
 use workers::io_worker;
 
-/// Number of I/O worker threads (matches C bhyve's blockif thread count).
+/// Matches the C bhyve blockif thread count.
 const NUM_WORKERS: usize = 8;
 
 /// MSI-X capability offset in PCI config space.
 const MSIX_CAP_OFFSET: u8 = 0x40;
 
-// ---------------------------------------------------------------------------
-// NVMe controller
-// ---------------------------------------------------------------------------
+/// Namespace geometry, fixed for the life of the controller.
+#[derive(Clone, Copy)]
+pub(super) struct Geometry {
+    pub(super) block_size: u32,
+    pub(super) total_blocks: u64,
+}
+
+/// What a controller is built from.
+///
+/// Tests inject a recording MSI sink and a backend that stalls on
+/// demand; production passes the VM handle and the file itself.
+pub(super) struct NvmeParts {
+    pub(super) file: Arc<File>,
+    pub(super) backend: Arc<dyn IoBackend>,
+    pub(super) read_only: bool,
+    pub(super) instance_id: u8,
+    pub(super) physmap: Arc<PhysMap>,
+    pub(super) msi: Arc<dyn MsiSink>,
+    pub(super) bus_mmio: Arc<MmioBus>,
+    pub(super) log: slog::Logger,
+}
 
 /// NVMe 1.0 controller implementing the PCI device trait.
-///
-/// Provides a single namespace backed by a file, with MSI-X interrupts
-/// and async I/O via worker threads.
 pub struct NvmeController {
     pub(super) pci_state: Mutex<DeviceState>,
     pub(super) msix: Arc<MsixTable>,
     state: Mutex<NvmeState>,
     io_tx: Mutex<Option<mpsc::Sender<IoRequest>>>,
     pub(super) physmap: Arc<PhysMap>,
-    /// MMIO bus for BAR registration/unregistration.
     pub(super) bus_mmio: Arc<MmioBus>,
-    /// Currently registered BAR0 base address (if any).
     pub(super) registered_bar0: Mutex<Option<u64>>,
-    /// Currently registered BAR4 base address (if any).
     pub(super) registered_bar4: Mutex<Option<u64>>,
     /// Weak self-reference for MMIO handler closures.
     pub(super) self_ref: Mutex<Option<std::sync::Weak<Self>>>,
-    /// Structured logger for bus registration diagnostics.
     pub(super) log: slog::Logger,
     /// Zvol write-cache control.
     _cache: DiskCache,
-    /// The backing store, shared with every I/O worker.
-    _file: Arc<File>,
-    /// Lifecycle state indicator.
+    /// The backing store, kept for the durable flush.
+    file: Arc<File>,
+    pub(super) geometry: Geometry,
     indicator: Indicator,
     pub(super) gate: Arc<QuiesceGate>,
 }
 
 impl NvmeController {
     /// Create a new NVMe controller.
-    ///
-    /// # Arguments
-    ///
-    /// - `file`: Backing storage file (owned, moved into workers).
-    /// - `read_only`: If true, writes return an error status.
-    /// - `physmap`: Guest physical memory map (shared with workers).
-    /// - `hdl`: VMM handle for MSI-X interrupt delivery.
     ///
     /// Bus registration failures go to a discarding logger. Use
     /// [`new_with_logger`](Self::new_with_logger) to see them.
@@ -140,49 +136,63 @@ impl NvmeController {
         log: slog::Logger,
     ) -> Arc<Self> {
         let file = Arc::new(file);
+        Self::build(NvmeParts {
+            backend: Arc::clone(&file) as Arc<dyn IoBackend>,
+            file,
+            read_only,
+            instance_id,
+            physmap,
+            msi: HdlMsiSink::new(hdl),
+            bus_mmio,
+            log,
+        })
+    }
 
-        // Enable zvol writeback cache (DKIOCSETWCE=1). NVMe's protocol has
-        // explicit FLUSH semantics, matching the writeback contract. Must
-        // happen before any I/O so first writes hit the fast path.
+    pub(super) fn build(parts: NvmeParts) -> Arc<Self> {
+        let NvmeParts {
+            file,
+            backend,
+            read_only,
+            instance_id,
+            physmap,
+            msi,
+            bus_mmio,
+            log,
+        } = parts;
+
+        // NVMe has explicit FLUSH semantics, so the zvol may run
+        // writeback. Set before any I/O so first writes hit the fast path.
         let cache = DiskCache::new(Arc::clone(&file), read_only);
 
-        // Determine disk geometry
         let file_len = file
             .metadata()
             .expect("nvme: failed to stat backing file")
             .len();
         let block_size: u32 = 512;
-        let total_blocks = file_len / u64::from(block_size);
+        let geometry = Geometry {
+            block_size,
+            total_blocks: file_len / u64::from(block_size),
+        };
 
-        // Build Identify data structures with unique serial per instance
         let serial = format!("TRITON-NVME-{:04}", instance_id);
         let ctrl_ident = build_identify_controller(
             &serial,
             "Triton VMM NVMe Controller",
             "1.0.0",
-            1, // max_namespaces
-            9, // mdts: 2^9 pages = 2 MiB max transfer (matches C bhyve)
+            1,
+            MDTS_LOG2_PAGES,
             MAX_IO_QUEUES as u16,
         );
-        let ns_ident = build_identify_namespace(total_blocks, block_size);
+        let ns_ident =
+            build_identify_namespace(geometry.total_blocks, block_size);
 
-        // Build CAP register value:
-        // MQES = MAX_QUEUE_SIZE - 1 (0-based)
-        // CQR = 1 (contiguous queues required)
-        // TO = 1 (500 ms timeout)
-        // DSTRD = 0 (4-byte doorbell stride)
-        // CSS = NVM command set
-        // MPSMIN = 0 (4 KiB)
-        // MPSMAX = 0 (4 KiB)
+        // CQR: contiguous queues only. TO: 500 ms. DSTRD, MPSMIN and
+        // MPSMAX are zero: 4-byte doorbells, 4 KiB pages.
         let cap: u64 = (u64::from(MAX_QUEUE_SIZE - 1) << CAP_MQES_SHIFT)
             | CAP_CQR
             | (1u64 << CAP_TO_SHIFT)
-            | (0u64 << CAP_DSTRD_SHIFT)
-            | CAP_CSS_NVM
-            | (0u64 << CAP_MPSMIN_SHIFT)
-            | (0u64 << CAP_MPSMAX_SHIFT);
+            | CAP_CSS_NVM;
 
-        // PCI identity for NVMe
         let ident = DeviceIdent {
             vendor_id: PCI_VENDOR_ID,
             device_id: PCI_DEVICE_ID,
@@ -195,24 +205,16 @@ impl NvmeController {
         };
 
         let mut pci_state = DeviceState::new(ident);
-        // BAR0: 32-bit MMIO, 16 KiB for registers + doorbells
-        // Using 32-bit to ensure the firmware places it in the
-        // 3-4 GB MMIO gap where EPT traps reliably.
+        // A 32-bit BAR0 keeps the firmware placing it in the 3-4 GiB
+        // MMIO gap, where EPT traps reliably.
         pci_state.define_bar(BarN::BAR0, BarDefine::Mmio(BAR0_SIZE as u32));
-        // BAR0 consumes BAR0+BAR1 (64-bit), so BAR4 for MSI-X table
 
-        // Create MSI-X table
-        let msix =
-            Arc::new(MsixTable::new(NVME_MSIX_COUNT, HdlMsiSink::new(hdl)));
+        let msix = Arc::new(MsixTable::new(NVME_MSIX_COUNT, msi));
         let msix_bar_size = msix.bar_size() as u32;
-
-        // BAR4: MMIO for MSI-X table + PBA
         pci_state.define_bar(
             BarN::BAR4,
             BarDefine::Mmio(msix_bar_size.next_power_of_two().max(4096)),
         );
-
-        // Set capabilities pointer to our MSI-X cap
         pci_state.set_cap_ptr(MSIX_CAP_OFFSET);
 
         let nvme_state = NvmeState {
@@ -229,13 +231,9 @@ impl NvmeController {
             ctrl_ident,
             ns_ident,
             num_io_queues: MAX_IO_QUEUES as u16,
-            block_size,
-            total_blocks,
         };
 
-        // Create the I/O submission channel
         let (tx, rx) = mpsc::channel::<IoRequest>();
-
         let gate = Arc::new(QuiesceGate::new(NUM_WORKERS));
 
         let ctrl = Arc::new(Self {
@@ -250,15 +248,14 @@ impl NvmeController {
             self_ref: Mutex::new(None),
             log,
             _cache: cache,
-            _file: Arc::clone(&file),
+            file,
+            geometry,
             indicator: Indicator::new(),
             gate: Arc::clone(&gate),
         });
-        // Store weak self-reference for MMIO closures
         *ctrl.self_ref.lock().expect("self_ref lock") =
             Some(Arc::downgrade(&ctrl));
 
-        // Spawn I/O worker threads
         let rx = Arc::new(Mutex::new(rx));
         for i in 0..NUM_WORKERS {
             let rx = Arc::clone(&rx);
@@ -266,13 +263,13 @@ impl NvmeController {
             let msix = Arc::clone(&msix);
             let state_ref = Arc::clone(&ctrl);
             let gate = Arc::clone(&gate);
-            let file = Arc::clone(&file);
+            let backend = Arc::clone(&backend);
 
             thread::Builder::new()
                 .name(format!("nvme-io-{}", i))
                 .spawn(move || {
                     io_worker(
-                        rx, file, read_only, physmap, msix, state_ref, gate,
+                        rx, backend, read_only, physmap, msix, state_ref, gate,
                     );
                 })
                 .expect("nvme: failed to spawn I/O worker thread");
@@ -412,12 +409,7 @@ impl Lifecycle for NvmeController {
     }
 
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
-        vmm_devices::quiesce::flush_file(
-            &self.gate,
-            &self._file,
-            intent,
-            "nvme",
-        )
+        vmm_devices::quiesce::flush_file(&self.gate, &self.file, intent, "nvme")
     }
 
     fn export_migrate_state(&self) -> Option<DeviceMigrateState> {

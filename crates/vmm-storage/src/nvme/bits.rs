@@ -175,6 +175,11 @@ pub const MAX_IO_QUEUES: usize = 15;
 pub const MAX_QUEUE_SIZE: u16 = 4096;
 pub const ADMIN_QUEUE_ID: u16 = 0;
 
+/// MDTS as log2 pages: 2 MiB, the C bhyve value.
+pub const MDTS_LOG2_PAGES: u8 = 9;
+/// The largest transfer one command may name.
+pub const MAX_XFER_BYTES: u64 = (1 << MDTS_LOG2_PAGES) * 4096;
+
 // ── MSI-X ──────────────────────────────────────────────────────
 
 /// Number of MSI-X vectors (1 per queue + 1 admin)

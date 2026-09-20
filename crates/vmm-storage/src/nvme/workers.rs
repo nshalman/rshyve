@@ -4,7 +4,6 @@
 
 //! I/O worker threads.
 
-use std::fs::File;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -12,7 +11,7 @@ use vmm_core::mem::{MemCtx, PhysMap};
 use vmm_devices::pci::msix::MsixTable;
 use vmm_devices::QuiesceGate;
 
-use super::io::{process_io_request, IoRequest};
+use super::io::{process_io_request, IoBackend, IoRequest};
 use super::queues::{io_queue_index, post_completion};
 use super::NvmeController;
 
@@ -26,7 +25,7 @@ use super::NvmeController;
 /// Each completed request posts a CQE to guest memory and fires MSI-X.
 pub(super) fn io_worker(
     rx: Arc<Mutex<mpsc::Receiver<IoRequest>>>,
-    file: Arc<File>,
+    backend: Arc<dyn IoBackend>,
     read_only: bool,
     physmap: Arc<PhysMap>,
     msix: Arc<MsixTable>,
@@ -50,8 +49,13 @@ pub(super) fn io_worker(
             }
         };
 
-        let status =
-            process_io_request(&req, &file, read_only, &physmap, &ctrl);
+        let status = process_io_request(
+            &req,
+            backend.as_ref(),
+            read_only,
+            &physmap,
+            ctrl.geometry,
+        );
         // Post completion: need to lock state briefly to access the CQ
         let mem = MemCtx::new(Arc::clone(&physmap));
         let sq_head = {
