@@ -76,6 +76,12 @@ const VERSION_OFFSET: usize = 0x206;
 const PREF_ADDRESS_OFFSET: usize = 0x258;
 const XLOADFLAGS_OFFSET: usize = 0x236;
 const XLF_KERNEL_64: u16 = 1;
+/// Dword at 0x238: the longest command line this kernel will read.
+/// Valid from protocol 2.06; x86 kernels advertise
+/// `COMMAND_LINE_SIZE - 1`, which is 2047 today.
+const CMDLINE_SIZE_OFFSET: usize = 0x238;
+/// The limit before 2.06 added the field, for an image that leaves it 0.
+const CMDLINE_SIZE_LEGACY: u32 = 255;
 const SETUP_HEADER_END: usize = 0x290;
 
 // ── boot_params (zero page) offsets ────────────────────────────────
@@ -177,6 +183,8 @@ pub struct KernelImage {
     version: u16,
     /// Preferred load address (typically 0x100_0000).
     pref_address: u64,
+    /// Longest command line this kernel reads, from `cmdline_size`.
+    cmdline_size: u32,
 }
 
 // Debug leaves out the image bytes. A derived one prints a whole
@@ -188,6 +196,7 @@ impl fmt::Debug for KernelImage {
             .field("setup_sects", &self.setup_sects)
             .field("version", &format_args!("{:#06x}", self.version))
             .field("pref_address", &format_args!("{:#x}", self.pref_address))
+            .field("cmdline_size", &self.cmdline_size)
             .finish()
     }
 }
@@ -260,12 +269,34 @@ impl KernelImage {
                 .unwrap(),
         );
 
+        let cmdline_size = u32::from_le_bytes(
+            data[CMDLINE_SIZE_OFFSET..CMDLINE_SIZE_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let cmdline_size = if cmdline_size == 0 {
+            CMDLINE_SIZE_LEGACY
+        } else {
+            cmdline_size
+        };
+
         Ok(Self {
             data,
             setup_sects,
             version,
             pref_address,
+            cmdline_size,
         })
+    }
+
+    /// Longest command line this kernel will read, in bytes.
+    ///
+    /// The kernel truncates at its own `COMMAND_LINE_SIZE` without a
+    /// word, so a longer line loses its tail (an `init=` at the end,
+    /// for example). `CMDLINE_MAX` is the guest-memory ceiling and
+    /// applies as well.
+    pub fn cmdline_limit(&self) -> usize {
+        (self.cmdline_size as usize).min(CMDLINE_MAX - 1)
     }
 
     /// 64-bit entry point address.
@@ -346,10 +377,11 @@ pub fn load_kernel(
         .context("failed to write kernel to guest memory")?;
 
     // 2. Write kernel command line
+    let cmdline_limit = kernel.cmdline_limit();
     ensure!(
-        cmdline.len() < CMDLINE_MAX,
-        "cmdline too long (max {})",
-        CMDLINE_MAX
+        cmdline.len() <= cmdline_limit,
+        "cmdline is {} bytes and this kernel reads at most {cmdline_limit}",
+        cmdline.len(),
     );
     let mut cmdline_buf = cmdline.as_bytes().to_vec();
     cmdline_buf.push(0); // NUL terminate
@@ -620,11 +652,69 @@ pub fn setup_direct_boot_bsp<V: BootVcpu + ?Sized>(
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
+    use vmm_core::mem::PhysMap;
+
     use crate::recording::Write;
 
     /// Where a bzImage is loaded by default. The boot scratch ranges
     /// below must all stop before it.
     const GPA_KERNEL: u64 = 0x10_0000;
+
+    const MIB: usize = 1024 * 1024;
+
+    /// Minimal bzImage carrying `cmdline_size`, loaded at 1 MiB so a
+    /// small anonymous guest holds it.
+    fn bzimage(cmdline_size: u32) -> Vec<u8> {
+        let mut img = vec![0u8; 0x2_0000];
+        img[HEADER_MAGIC_OFFSET..HEADER_MAGIC_OFFSET + 4]
+            .copy_from_slice(&HEADER_MAGIC.to_le_bytes());
+        img[VERSION_OFFSET..VERSION_OFFSET + 2]
+            .copy_from_slice(&0x020Fu16.to_le_bytes());
+        img[XLOADFLAGS_OFFSET..XLOADFLAGS_OFFSET + 2]
+            .copy_from_slice(&XLF_KERNEL_64.to_le_bytes());
+        img[SETUP_HEADER_OFFSET] = 4;
+        img[PREF_ADDRESS_OFFSET..PREF_ADDRESS_OFFSET + 8]
+            .copy_from_slice(&(GPA_KERNEL).to_le_bytes());
+        img[CMDLINE_SIZE_OFFSET..CMDLINE_SIZE_OFFSET + 4]
+            .copy_from_slice(&cmdline_size.to_le_bytes());
+        img
+    }
+
+    fn load(kernel: &KernelImage, cmdline: &str) -> Result<u64> {
+        let map = PhysMap::new_anon(0, 32 * MIB).expect("anon guest RAM");
+        let mem = MemCtx::new(Arc::new(map));
+        load_kernel(&mem, kernel, cmdline, None, 32 * MIB, 0xF2400)
+    }
+
+    #[test]
+    fn the_command_line_bound_is_the_kernels_own() {
+        // The kernel truncates at COMMAND_LINE_SIZE without a word, so
+        // a 3000-byte line silently lost its tail.
+        let kernel = KernelImage::from_bytes(bzimage(2047)).expect("parses");
+        assert_eq!(kernel.cmdline_limit(), 2047);
+
+        load(&kernel, &"a".repeat(2047)).expect("at the limit");
+        let err = load(&kernel, &"a".repeat(2048))
+            .expect_err("past the kernel's own limit");
+        assert!(err.to_string().contains("2047"), "{err}");
+    }
+
+    #[test]
+    fn a_kernel_with_no_cmdline_size_gets_the_pre_2_06_limit() {
+        let kernel = KernelImage::from_bytes(bzimage(0)).expect("parses");
+        assert_eq!(kernel.cmdline_limit(), 255);
+        assert!(load(&kernel, &"a".repeat(256)).is_err());
+    }
+
+    #[test]
+    fn the_guest_memory_ceiling_still_caps_a_boastful_kernel() {
+        // A kernel may advertise more than the page the loader reserves.
+        let kernel =
+            KernelImage::from_bytes(bzimage(u32::MAX)).expect("parses");
+        assert_eq!(kernel.cmdline_limit(), CMDLINE_MAX - 1);
+    }
 
     #[test]
     fn page_table_structure() {
