@@ -36,6 +36,7 @@
 //! detached from is always the bus its catalog attached it to.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -109,6 +110,10 @@ pub enum HotplugError {
     NotHotpluggable(String),
     /// The slot is already on its way out.
     NotRemovable { id: String, state: SlotState },
+    /// The VM has stopped. Teardown has already taken its list of
+    /// devices, so a device added now would never be halted and its
+    /// `vmm_drv` lease would park the VM destroy.
+    Closed,
 }
 
 impl fmt::Display for HotplugError {
@@ -117,6 +122,7 @@ impl fmt::Display for HotplugError {
             HotplugError::Disabled => {
                 f.write_str("this VM was not started with --hotplug")
             }
+            HotplugError::Closed => f.write_str("the VM is shutting down"),
             HotplugError::BadSpec(reason) => write!(f, "bad spec: {reason}"),
             HotplugError::FixedSlot(slot) => {
                 write!(f, "PCI slot {slot} is fixed and cannot be plugged")
@@ -188,6 +194,10 @@ struct Core {
     regs: Arc<PciHotplug>,
     vm: Arc<dyn VmPause>,
     budget: Duration,
+    /// Set by [`HotplugEngine::close`] once the guest has stopped.
+    /// Every entry point reads it, the way `VcpuThreads::close` refuses
+    /// a late CPU add.
+    closed: AtomicBool,
     log: Logger,
 }
 
@@ -202,6 +212,9 @@ impl Core {
         spec: &str,
         build: &mut BuildDevice<'_>,
     ) -> Result<String, HotplugError> {
+        if self.is_closed() {
+            return Err(HotplugError::Closed);
+        }
         let bdf = hotplug_bdf(spec)?;
         let id = devspec::device_id(spec);
         self.check_free(&id, bdf)?;
@@ -252,6 +265,9 @@ impl Core {
 
     /// Ask the guest to give a device up. Tears nothing down.
     fn request_remove(&self, id: &str) -> Result<(), HotplugError> {
+        if self.is_closed() {
+            return Err(HotplugError::Closed);
+        }
         let device = self
             .registry
             .get_by_id(id)
@@ -283,8 +299,19 @@ impl Core {
         Ok(())
     }
 
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     /// Act on every eject the guest has run since the last pass.
     fn drain_ejects(&self) {
+        // The guest chooses the moment it runs `_EJ0`, so it can pick
+        // the instant the VM powers off. An eject started then would
+        // pause, quiesce and halt the same device the teardown sweep is
+        // halting, from a second thread.
+        if self.is_closed() {
+            return;
+        }
         for slot in self.regs.take_eject_requests() {
             self.eject(slot);
         }
@@ -517,6 +544,7 @@ impl HotplugEngine {
             regs: pci_regs,
             vm,
             budget: UNPLUG_BUDGET,
+            closed: AtomicBool::new(false),
             log: log.clone(),
         });
         let thread = DrainThread::spawn(
@@ -548,6 +576,18 @@ impl HotplugEngine {
     /// has been asked.
     pub fn request_remove(&self, id: &str) -> Result<(), HotplugError> {
         self.core.request_remove(id)
+    }
+
+    /// Refuse every later add and removal, and stop the drain thread.
+    ///
+    /// Teardown calls this before it takes its list of devices. An add
+    /// that landed after that list attaches a device the halt sweep
+    /// never sees, and the `vmm_drv` lease it holds then parks
+    /// `VM_DESTROY_SELF` in `vmm_lease_block` until the watchdog ends
+    /// the process.
+    pub fn close(&self) {
+        self.core.closed.store(true, Ordering::Release);
+        self.thread.shutdown();
     }
 
     /// Stop the drain thread and wait for it.
@@ -600,14 +640,23 @@ fn hotplug_bdf(spec: &str) -> Result<Bdf, HotplugError> {
 /// The `-s` specs a restart has to replay.
 ///
 /// Only hot-added devices: an argv device already has its own `-s`
-/// entry, complete with the bootindex the registry does not keep. A
-/// slot on its way out is dropped, because the device is going away.
+/// entry, complete with the bootindex the registry does not keep.
+///
+/// A slot whose teardown has begun is dropped. `Absent` never reaches
+/// here, because `eject` sets it and removes the record on the same
+/// thread, so `Ejecting` is the state that has to be filtered: the
+/// device is gone or going, and replaying its spec would open its
+/// backing file again in the next run.
 pub fn hotplug_specs(registry: &DeviceRegistry) -> Vec<String> {
     registry
         .list()
         .into_iter()
         .filter(|device| {
-            device.hotpluggable && device.state != SlotState::Absent
+            device.hotpluggable
+                && !matches!(
+                    device.state,
+                    SlotState::Absent | SlotState::Ejecting
+                )
         })
         .filter_map(|device| device.spec)
         .collect()
@@ -715,11 +764,24 @@ pub struct HotplugEngines {
 }
 
 impl HotplugEngines {
-    /// Stop every drain thread and wait for it.
+    /// Refuse every later request and stop every drain thread.
     ///
-    /// Called at teardown. The control plane thread is never joined, so
-    /// a request can still arrive after this: a CPU add then finds the
-    /// vCPU roster closed and is refused.
+    /// Called from inside the event loop, before teardown takes its
+    /// list of devices. A request that arrives after this finds every
+    /// engine closed: PCI on its own flag, CPU on the vCPU roster.
+    pub fn close(&self) {
+        if let Some(pci) = self.pci.as_ref() {
+            pci.close();
+        }
+        if let Some(cpu) = self.cpu.as_ref() {
+            cpu.shutdown();
+        }
+        if let Some(mem) = self.mem.as_ref() {
+            mem.shutdown();
+        }
+    }
+
+    /// Stop every drain thread and wait for it.
     pub fn shutdown(&self) {
         if let Some(pci) = self.pci.as_ref() {
             pci.shutdown();

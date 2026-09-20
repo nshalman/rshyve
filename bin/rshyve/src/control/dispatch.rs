@@ -159,14 +159,16 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
         // share this process's uid and be in this zone or the global
         // zone.
         Command::DeviceAdd { spec } => match ctrl.hotplug.pci.as_ref() {
-            Some(engine) => added(engine.add_device(&spec)),
+            Some(engine) => hot_add(ctrl, || added(engine.add_device(&spec))),
             None => hotplug_disabled(),
         },
 
         // Advisory: the device leaves when the guest runs _EJ0, and
         // never before.
         Command::DeviceRemove { id } => match ctrl.hotplug.pci.as_ref() {
-            Some(engine) => removing(&id, engine.request_remove(&id)),
+            Some(engine) => {
+                hot_add(ctrl, || removing(&id, engine.request_remove(&id)))
+            }
             None => hotplug_disabled(),
         },
 
@@ -218,11 +220,6 @@ fn hot_add(ctrl: &VmController, add: impl FnOnce() -> Response) -> Response {
     }
 }
 
-/// Why `stop` cannot run now, or `None` when it can.
-///
-/// A source whose guest moved to another host is left paused and
-/// holding the whole guest memory, and no other command reaches that
-/// state. `stop` is what releases it.
 /// Latch a stop on a running or paused VM and report what happened.
 ///
 /// One helper for `shutdown`, `reset` and `stop`: the three differ only
@@ -259,6 +256,11 @@ fn latch_stop(
     }
 }
 
+/// Why `stop` cannot run now, or `None` when it can.
+///
+/// A source whose guest moved to another host is left paused and
+/// holding the whole guest memory, and no other command reaches that
+/// state. `stop` is what releases it.
 fn stop_refusal(
     state: VmRunState,
     migrated_away: bool,

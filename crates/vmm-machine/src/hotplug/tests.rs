@@ -190,6 +190,7 @@ impl Fixture {
                 vm: Arc::clone(&vm) as Arc<dyn VmPause>,
                 // Short, so the abort path does not slow the suite.
                 budget: Duration::from_millis(20),
+                closed: AtomicBool::new(false),
                 log: null_log(),
             },
             registry,
@@ -877,14 +878,56 @@ fn a_slot_on_its_way_out_is_not_replayed() {
     // A guest that never runs _EJ0 keeps the device, so it is replayed.
     assert_eq!(hotplug_specs(&fixture.registry), ["5,virtio-blk,/added"]);
 
+    // A device whose teardown has begun is going, so replaying its spec
+    // in the next run would open its backing file again.
     fixture
         .registry
         .set_state(&id, SlotState::RemovePending, SlotState::Ejecting)
         .expect("ejecting");
+    assert!(hotplug_specs(&fixture.registry).is_empty());
+
     fixture
         .registry
         .set_state(&id, SlotState::Ejecting, SlotState::Absent)
         .expect("absent");
-
     assert!(hotplug_specs(&fixture.registry).is_empty());
+}
+
+/// Teardown takes its device list once. Anything added after that is
+/// never halted, and its `vmm_drv` lease parks the VM destroy.
+#[test]
+fn a_closed_engine_refuses_every_add_and_removal() {
+    let fixture = Fixture::new();
+    let id = fixture.add("5,virtio-blk,/added").expect("added");
+
+    fixture.core.closed.store(true, Ordering::Release);
+
+    assert_eq!(fixture.add("6,virtio-blk,/late"), Err(HotplugError::Closed),);
+    assert_eq!(fixture.core.request_remove(&id), Err(HotplugError::Closed),);
+    // The device that was already there is untouched, so the teardown
+    // sweep still finds it.
+    assert!(fixture.registry.get_by_id(&id).is_some());
+}
+
+/// The guest picks the moment it runs `_EJ0`, so it can pick the instant
+/// the VM powers off. An eject then halts the same device the teardown
+/// sweep is halting, from a second thread.
+#[test]
+fn a_closed_engine_drains_no_eject() {
+    let fixture = Fixture::new();
+    let id = fixture.add("5,virtio-blk,/added").expect("added");
+    fixture
+        .registry
+        .set_state(&id, SlotState::Present, SlotState::RemovePending)
+        .expect("requested");
+    fixture.guest_ejects(5);
+
+    fixture.core.closed.store(true, Ordering::Release);
+    fixture.core.drain_ejects();
+
+    assert!(fixture.registry.get_by_id(&id).is_some());
+    assert_eq!(
+        fixture.registry.get_by_id(&id).map(|d| d.state),
+        Some(SlotState::RemovePending),
+    );
 }

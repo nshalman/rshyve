@@ -61,14 +61,11 @@ pub use registry::{
 };
 pub use signal::{install_sigterm_handler, sigterm_flag, sigterm_received};
 pub use teardown::{
-    join_vcpus_bounded, quiesce_devices, quiesce_registered_devices,
-    registry_named_devices, run_event_loop, run_event_loop_growable,
-    run_event_loop_registered, run_fleet_event_loop, RunOutcome, VcpuSet,
-    VcpuThreads,
+    registry_named_devices, run_fleet_event_loop, RunOutcome, VcpuThreads,
 };
 pub use vcpu::{
-    activate_all_vcpus, activate_one, activate_uefi_bsp_only, activate_vcpus,
-    check_aps_awaiting_sipi, set_halt_exit, spawn_vcpu_fleet, spawn_vcpus,
+    activate_one, activate_uefi_bsp_only, activate_vcpus,
+    check_aps_awaiting_sipi, set_halt_exit, spawn_vcpu_fleet,
     uefi_reset_targets, BspEntry, VcpuFleet,
 };
 pub use vcpu_tasks::{

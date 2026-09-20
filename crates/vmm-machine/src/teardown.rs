@@ -139,7 +139,8 @@ pub enum RunOutcome {
 }
 
 /// Pause every device, wait for the backends to go quiet, then flush.
-pub fn quiesce_devices(
+#[cfg(test)]
+fn quiesce_devices(
     devices: &[Arc<dyn vmm_devices::Lifecycle>],
     log: &Logger,
 ) -> vmm_devices::QuiesceReport {
@@ -151,17 +152,6 @@ pub fn quiesce_devices(
         })
         .collect::<Vec<_>>();
     quiesce_named(&named, log)
-}
-
-/// The same teardown, driven from the run-time registry.
-///
-/// The registry names each device, so a stuck one is reported by id and
-/// not by a type name two devices share.
-pub fn quiesce_registered_devices(
-    registry: &DeviceRegistry,
-    log: &Logger,
-) -> vmm_devices::QuiesceReport {
-    quiesce_named(&registry_named_devices(registry), log)
 }
 
 /// Snapshot the registry as named lifecycle handles.
@@ -457,7 +447,7 @@ impl VcpuThreads {
 }
 
 /// The vCPU threads an event loop waits on.
-pub enum VcpuSet<'a> {
+enum VcpuSet<'a> {
     /// A set made at boot. The event channel closing means every
     /// thread has gone.
     Fixed(Vec<JoinHandle<()>>),
@@ -505,41 +495,8 @@ impl VcpuSet<'_> {
 ///
 /// Returns false when the budget expired. A wedged vCPU thread must not
 /// hold the bhyve instance open, so the caller destroys the VM anyway.
-pub fn join_vcpus_bounded(
-    handles: Vec<JoinHandle<()>>,
-    budget: Duration,
-) -> bool {
+fn join_vcpus_bounded(handles: Vec<JoinHandle<()>>, budget: Duration) -> bool {
     vmm_core::thread::join_bounded(handles, budget)
-}
-
-/// Where the teardown path finds the devices to quiesce.
-enum DeviceSource<'a> {
-    Snapshot(&'a [Arc<dyn vmm_devices::Lifecycle>]),
-    /// Read after the guest stops, so a device that was hot-removed
-    /// during the run is not paused after its eject.
-    Registry(&'a DeviceRegistry),
-}
-
-impl DeviceSource<'_> {
-    /// The devices teardown will walk, named where they have an id.
-    ///
-    /// Taken once, so the quiesce, the halt and the budget all see the
-    /// same set. A registry read after the guest stops cannot then
-    /// disagree with itself part way through the sweep.
-    fn named(&self) -> Vec<NamedDevice> {
-        match self {
-            DeviceSource::Snapshot(devices) => devices
-                .iter()
-                .map(|device| NamedDevice {
-                    id: None,
-                    device: device.clone(),
-                })
-                .collect(),
-            DeviceSource::Registry(registry) => {
-                registry_named_devices(registry)
-            }
-        }
-    }
 }
 
 /// The per-device half of the teardown clock.
@@ -657,47 +614,6 @@ fn destroy_bounded_with(
     }
 }
 
-/// Wait for the first vCPU event, quiesce the devices, join the vCPU
-/// threads, clean up the control socket, and destroy the VM.
-pub fn run_event_loop(
-    machine: &Machine,
-    event_rx: mpsc::Receiver<VcpuEvent>,
-    handles: Vec<JoinHandle<()>>,
-    control_cleanup: Option<PathBuf>,
-    devices: &[Arc<dyn vmm_devices::Lifecycle>],
-    log: &Logger,
-) -> anyhow::Result<RunOutcome> {
-    run_event_loop_with(
-        machine,
-        event_rx,
-        VcpuSet::Fixed(handles),
-        control_cleanup,
-        DeviceSource::Snapshot(devices),
-        log,
-    )
-}
-
-/// The same loop, quiescing whatever the registry holds at exit.
-pub fn run_event_loop_registered(
-    machine: &Machine,
-    event_rx: mpsc::Receiver<VcpuEvent>,
-    handles: Vec<JoinHandle<()>>,
-    control_cleanup: Option<PathBuf>,
-    registry: &DeviceRegistry,
-    log: &Logger,
-) -> anyhow::Result<RunOutcome> {
-    run_event_loop_with(
-        machine,
-        event_rx,
-        VcpuSet::Fixed(handles),
-        control_cleanup,
-        DeviceSource::Registry(registry),
-        log,
-    )
-}
-
-/// The same loop again, over a vCPU set that can grow while the guest
-/// runs.
 /// Run the event loop over a whole fleet, growable when the VM has a
 /// CPU hot-add engine and fixed otherwise.
 ///
@@ -719,41 +635,18 @@ pub fn run_fleet_event_loop(
         ..
     } = fleet;
     drop(sender);
-    if hotplug.cpu.is_some() {
-        run_event_loop_growable(
-            machine,
-            events,
-            &threads,
-            control_cleanup,
-            registry,
-            log,
-        )
+    let vcpus = if hotplug.cpu.is_some() {
+        VcpuSet::Roster(&threads)
     } else {
-        run_event_loop_registered(
-            machine,
-            events,
-            threads.close(),
-            control_cleanup,
-            registry,
-            log,
-        )
-    }
-}
-
-pub fn run_event_loop_growable(
-    machine: &Machine,
-    event_rx: mpsc::Receiver<VcpuEvent>,
-    threads: &Arc<VcpuThreads>,
-    control_cleanup: Option<PathBuf>,
-    registry: &DeviceRegistry,
-    log: &Logger,
-) -> anyhow::Result<RunOutcome> {
+        VcpuSet::Fixed(threads.close())
+    };
     run_event_loop_with(
         machine,
-        event_rx,
-        VcpuSet::Roster(threads),
+        events,
+        vcpus,
         control_cleanup,
-        DeviceSource::Registry(registry),
+        registry,
+        || hotplug.close(),
         log,
     )
 }
@@ -763,14 +656,20 @@ fn run_event_loop_with(
     event_rx: mpsc::Receiver<VcpuEvent>,
     vcpus: VcpuSet<'_>,
     control_cleanup: Option<PathBuf>,
-    devices: DeviceSource<'_>,
+    registry: &DeviceRegistry,
+    close_hotplug: impl FnOnce(),
     log: &Logger,
 ) -> anyhow::Result<RunOutcome> {
     let outcome = outcome_of(vcpus.next_event(&event_rx), log);
+    // Before the snapshot below, not after the sweep: a device added
+    // during the quiesce window would not be in the list, so nothing
+    // would halt it, and the `vmm_drv` lease it holds would park
+    // `VM_DESTROY_SELF` in `vmm_lease_block`.
+    close_hotplug();
     let hdl = machine.hdl().clone();
     shutdown_after_exit(
         vcpus,
-        &devices.named(),
+        &registry_named_devices(registry),
         control_cleanup.as_deref(),
         move || hdl.destroy(),
         crate::signal::arm_teardown_deadline,

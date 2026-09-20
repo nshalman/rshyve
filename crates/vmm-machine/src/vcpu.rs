@@ -6,7 +6,6 @@
 
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use anyhow::{anyhow, Context};
 use slog::{info, warn, Logger};
@@ -56,7 +55,7 @@ pub fn activate_vcpus(
 ///
 /// This touches no reset state and no run state. Keeping activation
 /// apart from reset is what makes the AP asymmetry below auditable.
-pub fn activate_all_vcpus(
+fn activate_all_vcpus(
     machine: &Machine,
     vmexit_on_hlt: bool,
 ) -> anyhow::Result<()> {
@@ -158,9 +157,8 @@ pub fn check_aps_awaiting_sipi(machine: &Machine, log: &Logger) {
 
 /// The running vCPU set, plus everything needed to grow it.
 ///
-/// [`spawn_vcpus`] keeps returning the three boot-path pieces. A
-/// binary that wants CPU hot-add asks for the fleet instead, and hands
-/// `sender`, `threads` and `ctx` to a [`crate::vcpus::VcpuRegistry`].
+/// A binary that wants CPU hot-add hands `sender`, `threads` and `ctx`
+/// to a [`crate::vcpus::VcpuRegistry`].
 pub struct VcpuFleet {
     /// The event channel the run loop reads.
     pub events: mpsc::Receiver<VcpuEvent>,
@@ -178,33 +176,10 @@ pub struct VcpuFleet {
     pub ctx: VcpuThreadCtx,
 }
 
-/// Spawn per-vCPU threads and return the event channel, the join
-/// handles, and the per-vCPU metrics.
+/// Spawn the boot vCPU threads and keep the parts a later vCPU needs.
 ///
-/// `msr_handler` is a trait object so this crate does not name the
-/// crate that supplies the synthetic MSRs. Only rshyve has one.
-pub fn spawn_vcpus(
-    machine: &Machine,
-    num_cpus: u32,
-    api_version: u32,
-    msr_handler: Option<Arc<dyn MsrHandler>>,
-    log: &Logger,
-) -> (
-    mpsc::Receiver<VcpuEvent>,
-    Vec<JoinHandle<()>>,
-    Vec<Arc<VcpuMetrics>>,
-) {
-    let fleet =
-        spawn_vcpu_fleet(machine, num_cpus, api_version, msr_handler, log);
-
-    // A fixed set cannot grow, so the spare sender goes. The event
-    // loop then reads "every thread has gone" off the channel closing,
-    // as it did before the roster existed.
-    drop(fleet.sender);
-    (fleet.events, fleet.threads.close(), fleet.metrics)
-}
-
-/// The same spawn, keeping the parts a later vCPU needs.
+/// `msr_handler` is a trait object so this crate does not name the crate
+/// that supplies the synthetic MSRs. Only rshyve has one.
 pub fn spawn_vcpu_fleet(
     machine: &Machine,
     num_cpus: u32,
