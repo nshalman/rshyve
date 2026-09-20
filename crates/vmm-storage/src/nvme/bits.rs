@@ -255,13 +255,15 @@ pub const PCI_PROGIF_NVME: u8 = 0x02;
 pub const IDENT_CTRL_SIZE: usize = 4096;
 
 /// Build an Identify Controller data structure.
+///
+/// `cntlid` must be unique within the subsystem.
 pub fn build_identify_controller(
     serial: &str,
     model: &str,
     firmware: &str,
     max_namespaces: u32,
     mdts: u8,
-    _max_io_queues: u16,
+    cntlid: u16,
 ) -> [u8; IDENT_CTRL_SIZE] {
     let mut data = [0u8; IDENT_CTRL_SIZE];
 
@@ -282,14 +284,7 @@ pub fn build_identify_controller(
     let fr = format!("{:<8}", firmware);
     data[64..72].copy_from_slice(&fr.as_bytes()[..8]);
 
-    // CNTLID - Controller ID (bytes 78-79), must be unique per subsystem
-    let cntlid = (serial.as_bytes()[serial.len() - 1] as u16).wrapping_add(
-        serial
-            .as_bytes()
-            .get(serial.len() - 2)
-            .copied()
-            .unwrap_or(0) as u16,
-    );
+    // CNTLID - Controller ID (bytes 78-79)
     data[78..80].copy_from_slice(&cntlid.to_le_bytes());
 
     // MDTS - Maximum Data Transfer Size (byte 77)
@@ -364,9 +359,16 @@ mod tests {
     }
 
     #[test]
+    fn identify_controller_cntlid_survives_a_one_character_serial() {
+        let data = build_identify_controller("X", "VMM NVMe", "1.0", 1, 5, 7);
+        let cntlid = u16::from_le_bytes(data[78..80].try_into().unwrap());
+        assert_eq!(cntlid, 7);
+    }
+
+    #[test]
     fn identify_controller_serial() {
         let data =
-            build_identify_controller("SN001", "VMM NVMe", "1.0", 1, 5, 15);
+            build_identify_controller("SN001", "VMM NVMe", "1.0", 1, 5, 2);
         let sn = std::str::from_utf8(&data[4..24]).unwrap();
         assert!(sn.starts_with("SN001"));
     }

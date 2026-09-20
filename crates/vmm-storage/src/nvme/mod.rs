@@ -189,7 +189,8 @@ impl NvmeController {
             "1.0.0",
             1,
             MDTS_LOG2_PAGES,
-            MAX_IO_QUEUES as u16,
+            // One controller per instance, and CNTLID 0 is reserved.
+            u16::from(instance_id) + 1,
         );
         let ns_ident =
             build_identify_namespace(geometry.total_blocks, block_size);
