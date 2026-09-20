@@ -345,7 +345,60 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: tools/public-surface.sh
+        with:
+          # The commit messages of the pushed range are scanned too, so
+          # the range has to be reachable.
+          fetch-depth: 0
+      # Event fields go through the environment, not the command line:
+      # a pull request title or ref is attacker-controlled text.
+      - name: scan the tree and the commit messages of this range
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request) range="$BASE..$HEAD_SHA" ;;
+            *)
+              # A new branch reports an all-zero "before".
+              if printf '%s' "$BEFORE" | grep -qxE '0+'; then
+                range="$HEAD_SHA~1..$HEAD_SHA"
+              else
+                range="$BEFORE..$HEAD_SHA"
+              fi
+              ;;
+          esac
+          tools/public-surface.sh --commits "$range"
+      # A commit message carrying a lab address once reached master past
+      # the tree guard. Watch the message scan fail before trusting it.
+      # The tree of this clone is the tree the step above just passed, so
+      # the only hit can be the planted message, and the output is
+      # checked for it: a failure for any other reason would pass this
+      # step for the wrong reason.
+      - name: the guard fails on a planted address in a commit message
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          git clone -q . "$tmp/clone"
+          cd "$tmp/clone"
+          git config user.email ci@example.com
+          git config user.name ci
+          # Assembled at run time: the literal would trip the guard on
+          # this file, which is the guard doing its job.
+          third=168
+          git commit -q --allow-empty -m "test" -m "host root@192.$third.0.1 here"
+          rc=0
+          out="$(tools/public-surface.sh --commits HEAD~1..HEAD 2>&1)" || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -ne 1 ]; then
+            echo "the guard answered $rc with a lab address in a commit message, wanted 1" >&2
+            exit 1
+          fi
+          printf '%s\n' "$out" | grep -q 'commit message' \
+            || { echo "the guard failed, but not on the commit message" >&2; exit 1; }
       # The guard stops private data reaching a public repository, so a
       # silent pass is its worst failure, and it had one: a `git grep`
       # that failed was read as "no hits". Outside a checkout it printed

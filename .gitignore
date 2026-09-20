@@ -14,3 +14,6 @@ CLAUDE.local.md
 
 # Operator-specific test configuration
 /.env
+
+# Site-specific patterns for tools/public-surface.sh
+/.public-surface.local
