@@ -2,7 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Restricted Unix domain socket creation and bounded writes.
+//! Restricted Unix domain socket creation, bounded writes, and the
+//! accept loop every listener in this workspace runs.
+
+pub mod accept;
 
 use std::fs::{self, DirBuilder, Permissions};
 use std::io;
