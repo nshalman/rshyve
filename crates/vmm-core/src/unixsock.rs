@@ -61,8 +61,8 @@ pub fn bind_restricted(
 
     remove_stale_socket(path)?;
 
-    let old_umask =
-        unsafe { libc::umask((!policy.mode & 0o777) as libc::mode_t) };
+    // SAFETY: `umask` only reads its argument and returns the old mask.
+    let old_umask = unsafe { libc::umask(socket_umask(policy.mode)) };
     let result = UnixListener::bind(path);
     unsafe {
         libc::umask(old_umask);
@@ -77,6 +77,20 @@ pub fn bind_restricted(
 
     verify_bound_path(path, policy.mode, unsafe { libc::geteuid() })?;
     Ok(listener)
+}
+
+/// The umask that keeps the socket within `mode` between its `bind`
+/// and the `chmod` that follows.
+///
+/// Only the read and write bits are masked. A connect to a bound
+/// AF_UNIX socket is checked as read plus write (illumos
+/// `so_ux_addr_xlate`, `VOP_ACCESS(vp, VREAD|VWRITE)`), so an execute
+/// bit left on the socket grants nobody anything. Masking one costs a
+/// lot: the umask is process-wide, so it also takes the search bit off
+/// every directory another thread creates in the window, and every
+/// later open below that directory fails with `EACCES`.
+fn socket_umask(mode: u32) -> libc::mode_t {
+    (!mode & 0o666) as libc::mode_t
 }
 
 /// Unlink `path` only when it is a socket nobody listens on.
@@ -406,6 +420,20 @@ mod tests {
 
         drop(hold);
         reader.join().expect("join the reader");
+    }
+
+    /// A directory another thread creates while the bind holds the
+    /// umask must keep its search bit.
+    #[test]
+    fn the_socket_umask_masks_no_execute_bit() {
+        let mask = socket_umask(0o600);
+        assert_eq!(mask, 0o066, "an execute bit is masked");
+        assert_eq!(0o700 & !mask, 0o700, "a 0700 directory lost a bit");
+        assert_eq!(
+            0o777 & !mask & 0o066,
+            0,
+            "group or other can read or write the socket"
+        );
     }
 
     #[test]
