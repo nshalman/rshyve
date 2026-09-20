@@ -25,6 +25,7 @@ pub mod mmio;
 pub mod msr;
 pub mod pio;
 pub mod poll;
+pub mod ratelimit;
 pub mod thread;
 pub mod unixsock;
 pub mod vcpu;
