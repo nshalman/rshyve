@@ -92,7 +92,7 @@ proportionally and the destination's `guest_freq` is used.
 ### Source Side
 
 ```bash
-vmm ... --track-dirty --control-socket /tmp/vm.sock myvm
+vmm ... --control-socket /tmp/vm.sock myvm
 
 # Trigger migration
 echo '{"command":"migrate-source","target_addr":"10.0.0.2:4567"}' \
@@ -102,7 +102,7 @@ echo '{"command":"migrate-source","target_addr":"10.0.0.2:4567"}' \
 ### Destination Side
 
 ```bash
-vmm ... --track-dirty --migrate-listen 0.0.0.0:4567 myvm
+vmm ... --migrate-listen 0.0.0.0:4567 myvm
 ```
 
 The destination creates the VM with RAM and devices but does not start

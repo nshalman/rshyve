@@ -135,7 +135,7 @@ fn create_machine(cli: &Cli, log: &Logger) -> anyhow::Result<MachineCreation> {
         create_opts: CreateOpts {
             force: true,
             use_reservoir: cli.use_reservoir(),
-            track_dirty: cli.track_dirty && !cli.no_track_dirty,
+            track_dirty: !cli.no_track_dirty,
         },
         banner: "rshyve starting",
         version: &version,
