@@ -42,6 +42,18 @@ mod listener;
 mod migrate;
 mod protocol;
 
+/// How long the migration pause waits for every device worker to park.
+///
+/// The guest is still running while this runs, so a generous budget
+/// costs nothing but a slower switchover.
+const MIGRATION_QUIESCE_BUDGET: Duration = Duration::from_secs(30);
+
+/// One device, with the identity the migration wire names it by.
+pub(super) struct MigrateDevice {
+    pub(super) ident: vmm_migrate::codec::DeviceIdentity,
+    pub(super) named: NamedDevice,
+}
+
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -54,8 +66,10 @@ use slog::{error, warn, Logger};
 use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::{SuspendHow, VmmHdl};
 use vmm_core::mem::PhysMap;
+use vmm_devices::lifecycle::{
+    DeviceMigrateState, DeviceStateError, DeviceStatePayload, WireBdf,
+};
 use vmm_devices::quiesce::NamedDevice;
-use vmm_devices::DeviceMigrateState;
 use vmm_machine::signal::GuestStop;
 use vmm_machine::{DeviceRegistry, HotplugEngines};
 
@@ -198,13 +212,51 @@ impl VmController {
         vmm_machine::registry_named_devices(&self.registry)
     }
 
-    fn export_device_queues(
+    /// Every device a migration carries state for, with the PCI address
+    /// that identifies it on the wire.
+    ///
+    /// A device without an address has nothing the wire can name, and
+    /// one without a lifecycle handle has nothing to export.
+    pub(super) fn migrate_devices(&self) -> Vec<MigrateDevice> {
+        self.registry
+            .list()
+            .into_iter()
+            .filter_map(|slot| {
+                let bdf = slot.bdf?;
+                let device = slot.lifecycle?;
+                Some(MigrateDevice {
+                    ident: vmm_migrate::codec::DeviceIdentity {
+                        bdf: bdf.into(),
+                        kind: device.type_name().to_string(),
+                    },
+                    named: NamedDevice {
+                        id: Some(slot.id),
+                        device,
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// The device identity set the preamble carries.
+    pub(super) fn migrate_identities(
         &self,
-    ) -> Result<vmm_migrate::sync_source::DeviceQueueExport, String> {
-        // Pause all devices so in-flight I/O completes before we
-        // snapshot ring indices. Without this, requests popped from
-        // the avail ring but not yet completed would be lost. The
-        // guest would wait forever for their completions.
+    ) -> Vec<vmm_migrate::codec::DeviceIdentity> {
+        self.migrate_devices()
+            .into_iter()
+            .map(|d| d.ident)
+            .collect()
+    }
+
+    /// Stop every device worker and every kernel ring, then wait for
+    /// them to quiesce.
+    ///
+    /// Runs before the vCPUs pause. In-flight I/O has to complete
+    /// first: a request popped from the avail ring and not completed is
+    /// a completion the guest waits for for ever. Every thread that
+    /// writes guest memory has to be stopped as well, or the final
+    /// dirty pass ships a used ring the destination never sees filled.
+    fn pause_devices_for_migration(&self) -> Result<(), DeviceStateError> {
         let devices = self.named_devices();
         for named in &devices {
             // A device an operator already paused has stopped its
@@ -217,33 +269,89 @@ impl VmController {
         }
         let report = vmm_devices::quiesce::wait_all_quiesced_named(
             &devices,
-            Duration::from_secs(30),
+            MIGRATION_QUIESCE_BUDGET,
         );
         if !report.is_empty() {
-            return Err(format!(
+            return Err(DeviceStateError::Export(format!(
                 "devices did not quiesce: {:?}",
                 report.names()
-            ));
+            )));
         }
+        // The kernel rings last: a ring paused before its device's
+        // workers stop would still be asked for descriptors.
+        for named in &devices {
+            named.device.pause_for_migration()?;
+        }
+        Ok(())
+    }
 
-        let mut virtio_queues = Vec::new();
-        let mut nvme_controllers = Vec::new();
+    /// Make every backing store durable.
+    ///
+    /// zvol write caching means writes the guest was told were complete
+    /// may still sit in cache, and `zfs send` ships only committed pool
+    /// state.
+    fn flush_devices_for_migration(
+        &self,
+    ) -> Result<(), vmm_migrate::source::DeviceFlushError> {
+        for dev in self.lifecycle_devices() {
+            dev.flush_backing(vmm_devices::FlushIntent::Durable)
+                .map_err(|source| vmm_migrate::source::DeviceFlushError {
+                    device: dev.type_name(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
 
-        for dev in devices.iter().map(|named| &named.device) {
-            match dev.export_migrate_state() {
-                Some(DeviceMigrateState::VirtioQueues(queues)) => {
-                    virtio_queues.extend(queues);
-                }
-                Some(DeviceMigrateState::Nvme(state)) => {
-                    nvme_controllers.push(state);
-                }
-                None => {}
+    /// Read every device's state out. A pure read: the pause already
+    /// happened.
+    fn export_device_state(
+        &self,
+    ) -> Result<Vec<DeviceStatePayload>, DeviceStateError> {
+        self.migrate_devices()
+            .into_iter()
+            .map(|d| {
+                Ok(DeviceStatePayload {
+                    bdf: d.ident.bdf,
+                    state: d.named.device.export_migrate_state()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Give one device the state its counterpart on the source exported.
+    fn restore_device_state(
+        &self,
+        bdf: WireBdf,
+        state: &DeviceMigrateState,
+    ) -> Result<(), DeviceStateError> {
+        let device = self
+            .migrate_devices()
+            .into_iter()
+            .find(|d| d.ident.bdf == bdf)
+            .ok_or_else(|| {
+                DeviceStateError::Invalid(format!("no device at {bdf}"))
+            })?;
+        device.named.device.restore_migrate_state(state)
+    }
+
+    /// Put the devices back to work after a migration that failed once
+    /// the guest was already paused.
+    ///
+    /// A resume alone leaves a kernel ring stopped, and viona answers a
+    /// guest kick on a stopped ring with EBUSY, so the guest would come
+    /// back with a dead NIC.
+    fn resume_devices_after_migration(&self) {
+        let devices = self.named_devices();
+        resume_device_set(&devices);
+        for named in &devices {
+            if let Err(error) = named.device.resume_after_migration() {
+                error!(self.log, "a device's rings stayed paused after a \
+                    failed migration; the guest may see it dead";
+                    "device" => named.device.type_name(),
+                    "error" => %error);
             }
         }
-        Ok(vmm_migrate::sync_source::DeviceQueueExport {
-            virtio_queues,
-            nvme_controllers,
-        })
     }
 
     fn state(&self) -> VmRunState {

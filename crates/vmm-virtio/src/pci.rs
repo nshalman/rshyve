@@ -723,8 +723,10 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
         Lifecycle::halt(&self.device);
     }
 
-    fn pause_for_migration(&self) {
-        self.device.pause_rings_for_export();
+    fn pause_for_migration(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        self.device.pause_rings_for_export()
     }
 
     fn flush_backing(
@@ -765,16 +767,36 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
         Lifecycle::migrate(&self.device)
     }
 
-    fn export_migrate_state(&self) -> Option<DeviceMigrateState> {
-        Some(DeviceMigrateState::VirtioQueues(
+    fn export_migrate_state(
+        &self,
+    ) -> Result<
+        Option<DeviceMigrateState>,
+        vmm_devices::lifecycle::DeviceStateError,
+    > {
+        Ok(Some(DeviceMigrateState::Virtio(
             self.export_migrate_queues(),
-        ))
+        )))
     }
 
-    fn restore_migrate_state(&self, state: &DeviceMigrateState) {
-        if let DeviceMigrateState::VirtioQueues(states) = state {
-            self.restore_migrate_queues(states);
+    fn restore_migrate_state(
+        &self,
+        state: &DeviceMigrateState,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        match state {
+            DeviceMigrateState::Virtio(state) => {
+                self.restore_migrate_queues(state)
+            }
+            other => Err(vmm_devices::lifecycle::DeviceStateError::WrongKind {
+                want: "virtio",
+                got: other.kind(),
+            }),
         }
+    }
+
+    fn resume_after_migration(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        self.device.resume_rings_after_migration()
     }
 }
 

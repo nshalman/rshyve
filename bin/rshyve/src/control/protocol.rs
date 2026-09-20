@@ -32,7 +32,14 @@ pub(super) enum Command {
         zfs_barrier: Option<String>,
     },
     #[serde(rename = "migrate-dest")]
-    MigrateDest { listen_addr: String },
+    MigrateDest {
+        listen_addr: String,
+        /// Take a source whose guest saw CPU features this host lacks.
+        /// The guest takes #UD on the next such instruction, so the
+        /// orchestrator has to ask for it per migration.
+        #[serde(default)]
+        allow_cpu_feature_mismatch: bool,
+    },
     #[serde(rename = "migrate-status")]
     MigrateStatus,
     #[serde(rename = "migrate-config")]

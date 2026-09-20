@@ -196,7 +196,10 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             zfs_barrier,
         } => migrate_source(ctrl, target_addr, zfs_barrier),
 
-        Command::MigrateDest { listen_addr } => migrate_dest(ctrl, listen_addr),
+        Command::MigrateDest {
+            listen_addr,
+            allow_cpu_feature_mismatch,
+        } => migrate_dest(ctrl, listen_addr, allow_cpu_feature_mismatch),
 
         Command::Metrics | Command::MetricsPrometheus => {
             // Metrics are returned as raw text, not via the typed

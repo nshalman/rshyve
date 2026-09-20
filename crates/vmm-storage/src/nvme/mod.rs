@@ -37,7 +37,9 @@ use vmm_core::mem::{GuestIoVec, MemCtx, PhysMap};
 use vmm_core::mmio::{MmioBus, MmioFn};
 
 use vmm_devices::blkdev::DiskCache;
-use vmm_devices::lifecycle::Indicator;
+use vmm_devices::lifecycle::{
+    DeviceStateError, Indicator, NvmeMigrateCq, NvmeMigrateSq,
+};
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{
     replay_migrate_pci_state, DeviceIdent, DeviceState, PciDevice,
@@ -1629,169 +1631,231 @@ impl Lifecycle for NvmeController {
         )
     }
 
-    fn export_migrate_state(&self) -> Option<DeviceMigrateState> {
+    fn export_migrate_state(
+        &self,
+    ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {
         use vmm_devices::lifecycle::{
             NvmeMigrateCq, NvmeMigrateSq, NvmeMigrateState,
         };
 
         let st = self.state.lock().expect("nvme state lock");
 
-        // Only export if the controller is enabled (has active queues)
+        // A disabled controller has no queues, so there is nothing for
+        // the destination to put back.
         if (st.cc & CC_EN) == 0 {
-            return None;
+            return Ok(None);
         }
 
-        let admin_sq = st.admin_sq.as_ref().map(|sq| NvmeMigrateSq {
+        let wire_sq = |sq: &SubQueue| NvmeMigrateSq {
             base: sq.base,
             size: sq.size,
             head: sq.head,
             tail: sq.tail,
             cq_id: sq.cq_id,
-        });
-        let admin_cq = st.admin_cq.as_ref().map(|cq| NvmeMigrateCq {
+        };
+        let wire_cq = |cq: &CompQueue| NvmeMigrateCq {
             base: cq.base,
             size: cq.size,
             head: cq.head,
             tail: cq.tail,
             phase: cq.phase,
             iv: cq.iv,
-        });
-        let io_sqs = st
-            .io_sqs
-            .iter()
-            .map(|sq| {
-                sq.as_ref().map(|sq| NvmeMigrateSq {
-                    base: sq.base,
-                    size: sq.size,
-                    head: sq.head,
-                    tail: sq.tail,
-                    cq_id: sq.cq_id,
-                })
-            })
-            .collect();
-        let io_cqs = st
-            .io_cqs
-            .iter()
-            .map(|cq| {
-                cq.as_ref().map(|cq| NvmeMigrateCq {
-                    base: cq.base,
-                    size: cq.size,
-                    head: cq.head,
-                    tail: cq.tail,
-                    phase: cq.phase,
-                    iv: cq.iv,
-                })
-            })
-            .collect();
+        };
 
-        let pci = self.pci_state.lock().expect("pci lock").migrate_state();
-        let pci_command = pci.command;
-        let pci_bar_addrs = pci.bar_addrs;
-
-        // Export MSI-X table entries
-        let msix_count = self.msix.count();
-        let msix_entries: Vec<(u64, u64)> =
-            (0..msix_count).map(|v| self.msix.read_entry(v)).collect();
-        let msix_enabled = self.msix.is_enabled();
-
-        eprintln!(
-            "[nvme-export] cc={:#x} csts={:#x} aqa={:#x} io_queues={} msix_enabled={}",
-            st.cc, st.csts, st.aqa, st.num_io_queues, msix_enabled,
-        );
-
-        Some(DeviceMigrateState::Nvme(NvmeMigrateState {
+        Ok(Some(DeviceMigrateState::Nvme(NvmeMigrateState {
             cc: st.cc,
             csts: st.csts,
             aqa: st.aqa,
             asq_base: st.asq_base,
             acq_base: st.acq_base,
-            admin_sq,
-            admin_cq,
-            io_sqs,
-            io_cqs,
+            admin_sq: st.admin_sq.as_ref().map(wire_sq),
+            admin_cq: st.admin_cq.as_ref().map(wire_cq),
+            io_sqs: st
+                .io_sqs
+                .iter()
+                .map(|sq| sq.as_ref().map(wire_sq))
+                .collect(),
+            io_cqs: st
+                .io_cqs
+                .iter()
+                .map(|cq| cq.as_ref().map(wire_cq))
+                .collect(),
             num_io_queues: st.num_io_queues,
-            pci_command,
-            pci_bar_addrs,
-            msix_entries,
-            msix_enabled,
-        }))
+            pci: self.pci_state.lock().expect("pci lock").migrate_state(),
+            msix: self.msix.export_state(),
+        })))
     }
 
-    fn restore_migrate_state(&self, state: &DeviceMigrateState) {
+    fn restore_migrate_state(
+        &self,
+        state: &DeviceMigrateState,
+    ) -> Result<(), DeviceStateError> {
         let DeviceMigrateState::Nvme(mig) = state else {
-            return;
+            return Err(DeviceStateError::WrongKind {
+                want: "nvme",
+                got: state.kind(),
+            });
         };
-        eprintln!(
-            "[nvme-restore] cc={:#x} csts={:#x} aqa={:#x} io_queues={} msix_enabled={}",
-            mig.cc, mig.csts, mig.aqa, mig.num_io_queues, mig.msix_enabled,
-        );
+        // Every field is checked before any of it is applied. The
+        // doorbell handlers divide by a queue size and index a ring by
+        // head and tail, so a payload the checks let through would
+        // abort the VMM on the guest's first doorbell write.
+        check_nvme_state(mig)?;
 
-        // Restore PCI BAR addresses and command register
         let bar_writes = self
             .pci_state
             .lock()
             .expect("pci lock")
-            .bar_replay_writes(&mig.pci_bar_addrs);
-        replay_migrate_pci_state(self, &bar_writes, mig.pci_command);
+            .bar_replay_writes(&mig.pci.bar_addrs);
+        replay_migrate_pci_state(self, &bar_writes, mig.pci.command);
 
-        // Restore controller state
         let mut st = self.state.lock().expect("nvme state lock");
         st.cc = mig.cc;
         st.csts = mig.csts;
         st.aqa = mig.aqa;
         st.asq_base = mig.asq_base;
         st.acq_base = mig.acq_base;
-        st.num_io_queues = mig.num_io_queues.clamp(1, MAX_IO_QUEUES as u16);
+        st.num_io_queues = mig.num_io_queues;
 
-        // Restore admin queues
-        st.admin_sq = mig.admin_sq.as_ref().map(|sq| SubQueue {
+        let live_sq = |sq: &NvmeMigrateSq| SubQueue {
             base: sq.base,
             size: sq.size,
             head: sq.head,
             tail: sq.tail,
             cq_id: sq.cq_id,
-        });
-        st.admin_cq = mig.admin_cq.as_ref().map(|cq| CompQueue {
+        };
+        let live_cq = |cq: &NvmeMigrateCq| CompQueue {
             base: cq.base,
             size: cq.size,
             head: cq.head,
             tail: cq.tail,
             phase: cq.phase,
             iv: cq.iv,
-        });
+        };
 
-        // Restore I/O queues
-        for (idx, sq_opt) in mig.io_sqs.iter().enumerate() {
-            if idx < MAX_IO_QUEUES {
-                st.io_sqs[idx] = sq_opt.as_ref().map(|sq| SubQueue {
-                    base: sq.base,
-                    size: sq.size,
-                    head: sq.head,
-                    tail: sq.tail,
-                    cq_id: sq.cq_id,
-                });
-            }
+        st.admin_sq = mig.admin_sq.as_ref().map(live_sq);
+        st.admin_cq = mig.admin_cq.as_ref().map(live_cq);
+        for (slot, wire) in st.io_sqs.iter_mut().zip(&mig.io_sqs) {
+            *slot = wire.as_ref().map(live_sq);
         }
-        for (idx, cq_opt) in mig.io_cqs.iter().enumerate() {
-            if idx < MAX_IO_QUEUES {
-                st.io_cqs[idx] = cq_opt.as_ref().map(|cq| CompQueue {
-                    base: cq.base,
-                    size: cq.size,
-                    head: cq.head,
-                    tail: cq.tail,
-                    phase: cq.phase,
-                    iv: cq.iv,
-                });
-            }
+        for (slot, wire) in st.io_cqs.iter_mut().zip(&mig.io_cqs) {
+            *slot = wire.as_ref().map(live_cq);
         }
         drop(st);
 
-        // Restore MSI-X table entries and enable flag
-        for (v, &(addr, data)) in mig.msix_entries.iter().enumerate() {
-            self.msix.write_entry(v as u16, addr, data);
-        }
-        self.msix.set_enabled(mig.msix_enabled);
+        self.msix.import_state(&mig.msix).map_err(|error| {
+            DeviceStateError::invalid(format!("MSI-X table: {error}"))
+        })
     }
+}
+
+/// Everything a controller payload must satisfy before any of it is
+/// applied, matching what the guest-facing create-queue commands
+/// enforce.
+fn check_nvme_state(
+    mig: &vmm_devices::lifecycle::NvmeMigrateState,
+) -> Result<(), DeviceStateError> {
+    use vmm_devices::lifecycle::{NvmeMigrateCq, NvmeMigrateSq};
+
+    fn check_size(what: &str, size: u16) -> Result<(), DeviceStateError> {
+        // The doorbell handlers take `% size`, so 0 divides by zero and
+        // aborts a VMM built with panic = "abort".
+        if !(2..=MAX_QUEUE_SIZE).contains(&size) {
+            return Err(DeviceStateError::invalid(format!(
+                "{what} size {size} is outside 2..={MAX_QUEUE_SIZE}",
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_cursors(
+        what: &str,
+        size: u16,
+        head: u16,
+        tail: u16,
+    ) -> Result<(), DeviceStateError> {
+        if head >= size || tail >= size {
+            return Err(DeviceStateError::invalid(format!(
+                "{what} head {head} / tail {tail} outside a {size}-entry ring",
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_base(what: &str, base: u64) -> Result<(), DeviceStateError> {
+        if !valid_queue_base(base) {
+            return Err(DeviceStateError::invalid(format!(
+                "{what} base {base:#x} is zero or not page-aligned",
+            )));
+        }
+        Ok(())
+    }
+
+    let check_cq =
+        |what: &str, cq: &NvmeMigrateCq| -> Result<(), DeviceStateError> {
+            check_size(what, cq.size)?;
+            check_cursors(what, cq.size, cq.head, cq.tail)?;
+            check_base(what, cq.base)
+        };
+
+    if !(1..=MAX_IO_QUEUES as u16).contains(&mig.num_io_queues) {
+        return Err(DeviceStateError::invalid(format!(
+            "num_io_queues {} is outside 1..={MAX_IO_QUEUES}",
+            mig.num_io_queues,
+        )));
+    }
+    if mig.io_sqs.len() > MAX_IO_QUEUES || mig.io_cqs.len() > MAX_IO_QUEUES {
+        return Err(DeviceStateError::invalid(format!(
+            "payload carries {} SQs and {} CQs, this controller has \
+             {MAX_IO_QUEUES} of each",
+            mig.io_sqs.len(),
+            mig.io_cqs.len(),
+        )));
+    }
+
+    if let Some(cq) = &mig.admin_cq {
+        check_cq("admin CQ", cq)?;
+    }
+    for (idx, cq) in mig.io_cqs.iter().enumerate() {
+        if let Some(cq) = cq {
+            check_cq(&format!("IO CQ {}", idx + 1), cq)?;
+        }
+    }
+
+    // A submission queue names the completion queue its results go to.
+    // An SQ whose CQ does not exist would post completions through a
+    // `None` slot, or into another queue's ring.
+    let cq_exists = |cq_id: u16| -> bool {
+        if cq_id == 0 {
+            return mig.admin_cq.is_some();
+        }
+        io_queue_index(cq_id)
+            .and_then(|idx| mig.io_cqs.get(idx))
+            .is_some_and(|slot| slot.is_some())
+    };
+    let check_sq =
+        |what: &str, sq: &NvmeMigrateSq| -> Result<(), DeviceStateError> {
+            check_size(what, sq.size)?;
+            check_cursors(what, sq.size, sq.head, sq.tail)?;
+            check_base(what, sq.base)?;
+            if !cq_exists(sq.cq_id) {
+                return Err(DeviceStateError::invalid(format!(
+                    "{what} posts to CQ {}, which the payload does not create",
+                    sq.cq_id,
+                )));
+            }
+            Ok(())
+        };
+
+    if let Some(sq) = &mig.admin_sq {
+        check_sq("admin SQ", sq)?;
+    }
+    for (idx, sq) in mig.io_sqs.iter().enumerate() {
+        if let Some(sq) = sq {
+            check_sq(&format!("IO SQ {}", idx + 1), sq)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1810,6 +1874,136 @@ mod tests {
         fn is_quiesced(&self) -> bool {
             self.gate.is_quiesced()
         }
+    }
+
+    /// A controller payload with one admin queue pair and one I/O
+    /// queue pair, all of it valid.
+    fn good_payload() -> vmm_devices::lifecycle::NvmeMigrateState {
+        vmm_devices::lifecycle::NvmeMigrateState {
+            cc: CC_EN,
+            csts: 1,
+            aqa: 0x003F_003F,
+            asq_base: 0x1000,
+            acq_base: 0x2000,
+            admin_sq: Some(NvmeMigrateSq {
+                base: 0x1000,
+                size: 64,
+                head: 3,
+                tail: 5,
+                cq_id: 0,
+            }),
+            admin_cq: Some(NvmeMigrateCq {
+                base: 0x2000,
+                size: 64,
+                head: 3,
+                tail: 5,
+                phase: true,
+                iv: 0,
+            }),
+            io_sqs: vec![Some(NvmeMigrateSq {
+                base: 0x3000,
+                size: 256,
+                head: 0,
+                tail: 0,
+                cq_id: 1,
+            })],
+            io_cqs: vec![Some(NvmeMigrateCq {
+                base: 0x4000,
+                size: 256,
+                head: 0,
+                tail: 0,
+                phase: true,
+                iv: 1,
+            })],
+            num_io_queues: 1,
+            pci: Default::default(),
+            msix: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_sane_controller_payload_is_accepted() {
+        check_nvme_state(&good_payload()).expect("a sane payload");
+    }
+
+    #[test]
+    fn a_queue_size_of_zero_is_refused() {
+        // The doorbell handlers take `% size`; zero divides by zero and
+        // a release build aborts on it.
+        let mut payload = good_payload();
+        payload.admin_sq.as_mut().expect("admin sq").size = 0;
+        let error = check_nvme_state(&payload).expect_err("size 0");
+        assert!(error.to_string().contains("outside 2..="), "{error}");
+
+        let mut payload = good_payload();
+        payload.admin_cq.as_mut().expect("admin cq").size = 1;
+        check_nvme_state(&payload).expect_err("size 1 is below the minimum");
+    }
+
+    #[test]
+    fn a_queue_size_past_the_maximum_is_refused() {
+        let mut payload = good_payload();
+        payload.io_sqs[0].as_mut().expect("io sq").size = MAX_QUEUE_SIZE;
+        check_nvme_state(&payload).expect("the maximum itself is fine");
+        payload.io_sqs[0].as_mut().expect("io sq").size = u16::MAX;
+        check_nvme_state(&payload).expect_err("past the maximum");
+    }
+
+    #[test]
+    fn a_cursor_outside_the_ring_is_refused() {
+        // `while sq.head != sq.tail` would walk guest memory until the
+        // cursor wrapped.
+        let mut payload = good_payload();
+        payload.admin_sq.as_mut().expect("admin sq").head = 64;
+        let error = check_nvme_state(&payload).expect_err("head == size");
+        assert!(error.to_string().contains("outside a 64-entry"), "{error}");
+
+        let mut payload = good_payload();
+        payload.io_cqs[0].as_mut().expect("io cq").tail = 999;
+        check_nvme_state(&payload).expect_err("tail past the ring");
+    }
+
+    #[test]
+    fn an_unaligned_or_zero_queue_base_is_refused() {
+        let mut payload = good_payload();
+        payload.io_sqs[0].as_mut().expect("io sq").base = 0x3001;
+        let error = check_nvme_state(&payload).expect_err("unaligned base");
+        assert!(error.to_string().contains("page-aligned"), "{error}");
+
+        let mut payload = good_payload();
+        payload.admin_cq.as_mut().expect("admin cq").base = 0;
+        check_nvme_state(&payload).expect_err("a zero base");
+    }
+
+    #[test]
+    fn a_submission_queue_whose_completion_queue_is_absent_is_refused() {
+        // Completions would be posted through a `None` slot, or into
+        // another queue's ring.
+        let mut payload = good_payload();
+        payload.io_cqs[0] = None;
+        let error = check_nvme_state(&payload).expect_err("missing CQ 1");
+        assert!(error.to_string().contains("does not create"), "{error}",);
+
+        let mut payload = good_payload();
+        payload.io_sqs[0].as_mut().expect("io sq").cq_id = 9;
+        check_nvme_state(&payload).expect_err("a CQ id past the table");
+    }
+
+    #[test]
+    fn more_queues_than_the_controller_has_is_refused() {
+        let mut payload = good_payload();
+        payload.io_sqs = vec![None; MAX_IO_QUEUES + 1];
+        let error = check_nvme_state(&payload).expect_err("too many SQs");
+        assert!(error.to_string().contains("of each"), "{error}");
+    }
+
+    #[test]
+    fn an_out_of_range_io_queue_count_is_refused() {
+        let mut payload = good_payload();
+        payload.num_io_queues = 0;
+        check_nvme_state(&payload).expect_err("zero queues");
+        payload.num_io_queues = MAX_IO_QUEUES as u16 + 1;
+        check_nvme_state(&payload).expect_err("past the maximum");
     }
 
     #[test]

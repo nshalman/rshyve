@@ -212,8 +212,23 @@ impl Lifecycle for TrackingVirtioDevice {
     }
 }
 
+/// Guest memory the migration tests program their rings into. The
+/// restore refuses a ring that is not mapped, so the addresses have to
+/// be real.
+pub(super) const MIGRATE_RING_GPA: u64 = 0x1000;
+pub(super) const MIGRATE_RING_LEN: usize = 0x8000;
+
 fn make_tracking_device() -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
-    let physmap = Arc::new(PhysMap::new());
+    make_tracking_device_with_msix(None)
+}
+
+fn make_tracking_device_with_msix(
+    msix: Option<Arc<MsixTable>>,
+) -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
+    let physmap = Arc::new(
+        PhysMap::new_anon(MIGRATE_RING_GPA, MIGRATE_RING_LEN)
+            .expect("create guest memory"),
+    );
     let bus_pio = Arc::new(PioBus::new());
     let bus_mmio = Arc::new(MmioBus::new());
     VirtioPciDevice::new(
@@ -229,8 +244,17 @@ fn make_tracking_device() -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
         physmap,
         bus_pio,
         bus_mmio,
-        None,
+        msix,
     )
+}
+
+/// An MSI-X table that needs no live vmm handle.
+pub(super) fn null_msix(count: u16) -> Arc<MsixTable> {
+    struct NullSink;
+    impl vmm_devices::pci::msix::MsiSink for NullSink {
+        fn send(&self, _addr: u64, _data: u64) {}
+    }
+    Arc::new(MsixTable::new(count, Arc::new(NullSink)))
 }
 
 #[test]

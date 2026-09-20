@@ -42,6 +42,7 @@ impl VirtioViona {
                 mac_addr,
                 dev_features,
                 negotiated_features: 0,
+                paused_rings: [None; NET_NUM_QUEUES],
                 ring_state: [RingState::Init; NET_NUM_QUEUES],
                 deferred_poll: None,
                 poller: None,

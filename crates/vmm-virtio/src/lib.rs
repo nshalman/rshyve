@@ -221,9 +221,27 @@ pub trait VirtioDevice: Send + Sync + 'static {
     }
 
     /// Pause kernel ring threads for migration export.
-    /// Must be called after vCPU pause to quiesce kernel I/O before
-    /// reading ring state. Only kernel-accelerated devices need this.
-    fn pause_rings_for_export(&self) {}
+    ///
+    /// Runs before the vCPUs pause so no ring entry is consumed
+    /// between the pause and the export. A failure fails the
+    /// migration: the indices the export would read are moving.
+    fn pause_rings_for_export(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        Ok(())
+    }
+
+    /// Put the rings [`Self::pause_rings_for_export`] stopped back to
+    /// work, after a migration that failed past the pause.
+    ///
+    /// A paused kernel ring is `VRS_STOP`, and viona answers a guest
+    /// kick on one with EBUSY. Without this the source guest resumes
+    /// with a NIC whose rings never move again.
+    fn resume_rings_after_migration(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        Ok(())
+    }
 
     /// Program notification addresses after migration.
     fn set_notify_addrs(&self, _pio_port: u16, _mmio_addr: u64) {}

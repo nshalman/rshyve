@@ -125,6 +125,13 @@ struct VionaInner {
     /// Per-ring initialization state (RX=0, TX=1).
     ring_state: [RingState; NET_NUM_QUEUES],
 
+    /// Each ring's kernel state as it was when a migration paused it.
+    ///
+    /// A migration that fails after the pause has to put the rings
+    /// back, and a kick cannot do it: the kernel answers EBUSY for a
+    /// stopped ring. Only these saved addresses and indices can.
+    paused_rings: [Option<viona_api::vioc_ring_state>; NET_NUM_QUEUES],
+
     /// Deferred interrupt poll state for migration destinations.
     /// Holds the logger so the poll thread can be started after ring
     /// state is restored.
@@ -357,8 +364,16 @@ impl VirtioDevice for VirtioViona {
         );
     }
 
-    fn pause_rings_for_export(&self) {
-        self.pause_rings();
+    fn pause_rings_for_export(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        self.pause_rings()
+    }
+
+    fn resume_rings_after_migration(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        self.resume_rings()
     }
 
     fn set_notify_addrs(&self, pio_port: u16, mmio_addr: u64) {

@@ -28,18 +28,9 @@ pub enum MessageType {
     Error = 1,
     /// RON-serialized structured data.
     Serialized = 2,
-    /// Raw binary blob.
-    Blob = 3,
-    /// Memory page data.
-    Page = 4,
-    /// Memory region query.
-    MemQuery = 5,
-    /// Memory region offer (dirty bitmap).
-    MemOffer = 6,
-    /// Request specific pages.
+    /// The GPAs the next PageBatch stands for, when they are not
+    /// contiguous.
     MemFetch = 7,
-    /// Page data transfer.
-    MemXfer = 8,
     /// End of memory transfer phase.
     MemEnd = 9,
     /// Memory transfer complete acknowledgement.
@@ -48,9 +39,8 @@ pub enum MessageType {
     ///
     /// Wire format: `[base_gpa: u64][page_count: u32][flags: u32][data...]`
     /// flags bit 0: ZSTD_COMPRESSED (data is zstd-compressed)
-    /// data: page_count * 4096 bytes (uncompressed) or zstd stream
     PageBatch = 11,
-    /// Source has paused; next RAM pass is the final one.
+    /// Source has paused the VM; the next RAM pass is the final one.
     PauseSignal = 12,
 }
 
@@ -64,12 +54,7 @@ impl MessageType {
             0 => Some(Self::Okay),
             1 => Some(Self::Error),
             2 => Some(Self::Serialized),
-            3 => Some(Self::Blob),
-            4 => Some(Self::Page),
-            5 => Some(Self::MemQuery),
-            6 => Some(Self::MemOffer),
             7 => Some(Self::MemFetch),
-            8 => Some(Self::MemXfer),
             9 => Some(Self::MemEnd),
             10 => Some(Self::MemDone),
             11 => Some(Self::PageBatch),
@@ -142,21 +127,16 @@ pub struct DeviceState {
     pub vcpus: Vec<VcpuStatePayload>,
     /// System device state payloads (IOAPIC, ATPIT, etc.).
     pub devices: Vec<DevicePayload>,
-    /// Virtio queue state for viona ring reprogramming on destination.
-    #[serde(default)]
-    pub virtio_queues: Vec<VirtioQueueState>,
-    /// NVMe controller state for disk device restoration on destination.
-    #[serde(default)]
-    pub nvme_controllers: Vec<NvmeControllerState>,
+    /// Emulated-device state, each entry under the PCI address its
+    /// device had on the source. The destination restores by that
+    /// address alone.
+    pub emulated: Vec<DeviceStatePayload>,
 }
 
 /// The device state types are the device crate's own, so a device
-/// exports what the wire carries with nothing copied in between. The
-/// names here are the wire's.
+/// exports what the wire carries with nothing copied in between.
 pub use vmm_devices::lifecycle::{
-    NvmeMigrateCq as NvmeCqState, NvmeMigrateSq as NvmeSqState,
-    NvmeMigrateState as NvmeControllerState, VirtioMigratePciState,
-    VirtioMigrateQueue as VirtioQueueState,
+    DeviceMigrateState, DeviceStatePayload, MigratePciState, WireBdf,
 };
 
 /// State data for a single vCPU.
@@ -210,23 +190,11 @@ pub enum Message {
     /// Error with a RON-serialized MigrateError.
     Error(MigrateError),
     /// RON-serialized structured data (protocol offers, preamble,
-    /// time data, device state, etc.).
+    /// time data, device state).
     Serialized(Vec<u8>),
-    /// Raw binary blob.
-    Blob(Vec<u8>),
-    /// A single 4 KiB memory page.
-    Page(Vec<u8>),
-    /// Memory region query.
-    MemQuery(Vec<MemRegionDesc>),
-    /// Memory region offer with dirty bitmap.
-    MemOffer {
-        region: MemRegionDesc,
-        bitmap: Vec<u8>,
-    },
-    /// Request specific pages by GPA list.
+    /// The GPAs the next PageBatch stands for. Sent only when the
+    /// batch's pages are not contiguous.
     MemFetch(Vec<u64>),
-    /// Page data transfer header (GPA + count).
-    MemXfer { gpa: u64, count: u32 },
     /// End of memory transfer phase.
     MemEnd,
     /// Memory transfer complete acknowledgement.
@@ -247,6 +215,22 @@ pub enum Message {
 }
 
 impl Message {
+    /// The variant name, for an error that names what arrived.
+    ///
+    /// Never the payload: a peer must not choose what goes in a log.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Okay => "Okay",
+            Self::Error(_) => "Error",
+            Self::Serialized(_) => "Serialized",
+            Self::MemFetch(_) => "MemFetch",
+            Self::MemEnd => "MemEnd",
+            Self::MemDone => "MemDone",
+            Self::PageBatch { .. } => "PageBatch",
+            Self::PauseSignal => "PauseSignal",
+        }
+    }
+
     /// Encode this message into a WebSocket binary frame.
     ///
     /// Format: `[payload bytes...][tag byte]`
@@ -261,37 +245,10 @@ impl Message {
             Message::Serialized(data) => {
                 (MessageType::Serialized, data.clone())
             }
-            Message::Blob(data) => (MessageType::Blob, data.clone()),
-            Message::Page(data) => (MessageType::Page, data.clone()),
-            Message::MemQuery(regions) => {
-                let data = ron::ser::to_string(regions)
-                    .unwrap_or_else(|_| "[]".to_string());
-                (MessageType::MemQuery, data.into_bytes())
-            }
-            Message::MemOffer { region, bitmap } => {
-                // RON-serialize the region, then append bitmap as raw
-                // bytes after a length separator.
-                let region_data = ron::ser::to_string(region)
-                    .unwrap_or_else(|_| "()".to_string());
-                let region_bytes = region_data.as_bytes();
-                let len_bytes = (region_bytes.len() as u32).to_le_bytes();
-                let mut payload =
-                    Vec::with_capacity(4 + region_bytes.len() + bitmap.len());
-                payload.extend_from_slice(&len_bytes);
-                payload.extend_from_slice(region_bytes);
-                payload.extend_from_slice(bitmap);
-                (MessageType::MemOffer, payload)
-            }
             Message::MemFetch(gpas) => {
                 let data = ron::ser::to_string(gpas)
                     .unwrap_or_else(|_| "[]".to_string());
                 (MessageType::MemFetch, data.into_bytes())
-            }
-            Message::MemXfer { gpa, count } => {
-                let mut payload = Vec::with_capacity(12);
-                payload.extend_from_slice(&gpa.to_le_bytes());
-                payload.extend_from_slice(&count.to_le_bytes());
-                (MessageType::MemXfer, payload)
             }
             Message::MemEnd => (MessageType::MemEnd, Vec::new()),
             Message::MemDone => (MessageType::MemDone, Vec::new()),
@@ -356,38 +313,6 @@ impl Message {
             MessageType::Serialized => {
                 Ok(Message::Serialized(payload.to_vec()))
             }
-            MessageType::Blob => Ok(Message::Blob(payload.to_vec())),
-            MessageType::Page => Ok(Message::Page(payload.to_vec())),
-            MessageType::MemQuery => {
-                let regions: Vec<MemRegionDesc> =
-                    ron::from_str(Self::text(payload, "MemQuery")?)?;
-                Ok(Message::MemQuery(regions))
-            }
-            MessageType::MemOffer => {
-                if payload.len() < 4 {
-                    return Err(MigrateError::Codec(
-                        "MemOffer too short for length prefix".to_string(),
-                    ));
-                }
-                let region_len = u32::from_le_bytes(
-                    payload[..4].try_into().map_err(|_| {
-                        MigrateError::Codec(
-                            "MemOffer length prefix".to_string(),
-                        )
-                    })?,
-                ) as usize;
-                if payload.len() < 4 + region_len {
-                    return Err(MigrateError::Codec(
-                        "MemOffer truncated region data".to_string(),
-                    ));
-                }
-                let region: MemRegionDesc = ron::from_str(Self::text(
-                    &payload[4..4 + region_len],
-                    "MemOffer region",
-                )?)?;
-                let bitmap = payload[4 + region_len..].to_vec();
-                Ok(Message::MemOffer { region, bitmap })
-            }
             MessageType::MemFetch => {
                 let gpas: Vec<u64> =
                     ron::from_str(Self::text(payload, "MemFetch")?)?;
@@ -399,21 +324,6 @@ impl Message {
                 }
                 Ok(Message::MemFetch(gpas))
             }
-            MessageType::MemXfer => {
-                if payload.len() < 12 {
-                    return Err(MigrateError::Codec(
-                        "MemXfer too short".to_string(),
-                    ));
-                }
-                let gpa = u64::from_le_bytes(payload[..8].try_into().map_err(
-                    |_| MigrateError::Codec("MemXfer gpa".to_string()),
-                )?);
-                let count =
-                    u32::from_le_bytes(payload[8..12].try_into().map_err(
-                        |_| MigrateError::Codec("MemXfer count".to_string()),
-                    )?);
-                Ok(Message::MemXfer { gpa, count })
-            }
             MessageType::MemEnd => Ok(Message::MemEnd),
             MessageType::MemDone => Ok(Message::MemDone),
             MessageType::PageBatch => {
@@ -422,12 +332,14 @@ impl Message {
                         "PageBatch too short for header".to_string(),
                     ));
                 }
-                let base_gpa =
-                    u64::from_le_bytes(payload[..8].try_into().unwrap());
-                let page_count =
-                    u32::from_le_bytes(payload[8..12].try_into().unwrap());
-                let flags =
-                    u32::from_le_bytes(payload[12..16].try_into().unwrap());
+                let word = |at: usize| -> [u8; 4] {
+                    payload[at..at + 4].try_into().expect("4 bytes")
+                };
+                let base_gpa = u64::from_le_bytes(
+                    payload[..8].try_into().expect("8 bytes"),
+                );
+                let page_count = u32::from_le_bytes(word(8));
+                let flags = u32::from_le_bytes(word(12));
                 if page_count == 0 || page_count > limits::MAX_PAGES_PER_BATCH {
                     return Err(MigrateError::Codec(format!(
                         "invalid PageBatch page count: {page_count}",
@@ -438,12 +350,11 @@ impl Message {
                         "unknown PageBatch flags: {flags:#x}",
                     )));
                 }
-                let data = payload[16..].to_vec();
                 Ok(Message::PageBatch {
                     base_gpa,
                     page_count,
                     flags,
-                    data,
+                    data: payload[16..].to_vec(),
                 })
             }
             MessageType::PauseSignal => Ok(Message::PauseSignal),
@@ -490,13 +401,26 @@ pub struct ProtocolSelect {
     pub protocol: String,
 }
 
-/// Memory region descriptor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemRegionDesc {
-    /// Guest physical address.
-    pub gpa: u64,
-    /// Length in bytes.
-    pub len: u64,
+/// One device the source carries, as the destination sees it in the
+/// preamble.
+///
+/// The destination compares this set with its own before it takes a
+/// single page, so an operator who started it with one disk fewer gets
+/// a failed migration instead of a guest with a dead disk.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub struct DeviceIdentity {
+    pub bdf: WireBdf,
+    /// The device's `type_name()`, so two devices at one address but of
+    /// different kinds do not pass for each other.
+    pub kind: String,
+}
+
+impl std::fmt::Display for DeviceIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.kind, self.bdf)
+    }
 }
 
 /// Preamble exchanged during the Sync phase.
@@ -505,11 +429,10 @@ pub struct MigrationPreamble {
     /// VM configuration for compatibility check.
     pub num_cpus: u32,
     pub mem_size: u64,
-    /// Device list for compatibility.
-    pub devices: Vec<String>,
+    /// Every device that carries migration state, sorted by address.
+    pub devices: Vec<DeviceIdentity>,
     /// CPU feature bits from the source host for compatibility check.
     /// The destination rejects migration if it lacks any of these features.
-    #[serde(default)]
     pub cpu_features: Option<CpuFeatures>,
 }
 
@@ -578,7 +501,7 @@ mod tests {
     #[test]
     fn roundtrip_serialized() {
         let offer = ProtocolOffer {
-            protocols: vec!["vmm-migrate-ron/0".to_string()],
+            protocols: vec![crate::protocol::PROTOCOL_RON.to_string()],
         };
         let msg = Message::serialized(&offer).unwrap();
         let out = roundtrip(&msg);
@@ -589,41 +512,6 @@ mod tests {
                 assert_eq!(decoded.protocols, offer.protocols);
             }
             other => panic!("expected Serialized, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn roundtrip_page() {
-        let page = vec![0xABu8; 4096];
-        let out = roundtrip(&Message::Page(page.clone()));
-        match out {
-            Message::Page(data) => assert_eq!(data, page),
-            other => panic!("expected Page, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn roundtrip_mem_offer() {
-        let region = MemRegionDesc {
-            gpa: 0x1000,
-            len: 0x8000,
-        };
-        let bitmap = vec![0xFF, 0x01];
-        let msg = Message::MemOffer {
-            region: region.clone(),
-            bitmap: bitmap.clone(),
-        };
-        let out = roundtrip(&msg);
-        match out {
-            Message::MemOffer {
-                region: r,
-                bitmap: b,
-            } => {
-                assert_eq!(r.gpa, 0x1000);
-                assert_eq!(r.len, 0x8000);
-                assert_eq!(b, bitmap);
-            }
-            other => panic!("expected MemOffer, got {other:?}"),
         }
     }
 
@@ -641,22 +529,6 @@ mod tests {
     fn decode_mem_fetch_rejects_too_many_gpas() {
         let msg = Message::MemFetch(vec![0; limits::MAX_SPARSE_GPAS + 1]);
         assert!(Message::decode(msg.encode()).is_err());
-    }
-
-    #[test]
-    fn roundtrip_mem_xfer() {
-        let msg = Message::MemXfer {
-            gpa: 0xDEAD_0000,
-            count: 42,
-        };
-        let out = roundtrip(&msg);
-        match out {
-            Message::MemXfer { gpa, count } => {
-                assert_eq!(gpa, 0xDEAD_0000);
-                assert_eq!(count, 42);
-            }
-            other => panic!("expected MemXfer, got {other:?}"),
-        }
     }
 
     #[test]
@@ -728,45 +600,96 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_preamble() {
+    fn roundtrip_preamble_keeps_device_identity() {
+        let devices = vec![DeviceIdentity {
+            bdf: WireBdf {
+                bus: 0,
+                dev: 5,
+                func: 0,
+            },
+            kind: "virtio-blk".to_string(),
+        }];
         let preamble = MigrationPreamble {
             num_cpus: 4,
             mem_size: 1024 * 1024 * 1024,
-            devices: vec!["virtio-blk".to_string()],
+            devices: devices.clone(),
             cpu_features: None,
         };
         let msg = Message::serialized(&preamble).unwrap();
-        let out = roundtrip(&msg);
-        match out {
+        match roundtrip(&msg) {
             Message::Serialized(data) => {
                 let decoded: MigrationPreamble =
                     Message::deserialize(&data).unwrap();
                 assert_eq!(decoded.num_cpus, 4);
                 assert_eq!(decoded.mem_size, 1024 * 1024 * 1024);
-                assert_eq!(decoded.devices, vec!["virtio-blk"]);
+                assert_eq!(decoded.devices, devices);
             }
             other => panic!("expected Serialized, got {other:?}"),
         }
     }
 
     #[test]
-    fn virtio_queue_state_defaults_missing_pci_state() {
-        let encoded = r#"(
-            pci_slot: 0,
-            queue_idx: 0,
-            queue_size: 256,
-            desc_addr: 4096,
-            avail_addr: 8192,
-            used_addr: 12288,
-            enabled: true,
-            features: 4294967296,
-            avail_idx: 7,
-            used_idx: 5,
-            msix_addr: 0,
-            msix_data: 0,
-        )"#;
+    fn a_retired_message_tag_is_refused() {
+        // v0 carried Blob, Page, MemQuery, MemOffer and MemXfer and
+        // never sent any of them. A peer must not resurrect a decoder
+        // this build no longer has.
+        for tag in [3u8, 4, 5, 6, 8] {
+            let frame = tungstenite::Message::Binary(vec![0, tag]);
+            assert!(
+                Message::decode(frame).is_err(),
+                "tag {tag} must not decode"
+            );
+        }
+    }
 
-        let decoded: VirtioQueueState = ron::from_str(encoded).unwrap();
-        assert!(decoded.pci_state.is_none());
+    #[test]
+    fn an_unexpected_message_is_named_by_variant_not_by_payload() {
+        // A peer must not choose what goes in a log line.
+        let msg = Message::Serialized(b"\n\x1b[2J".to_vec());
+        assert_eq!(msg.name(), "Serialized");
+    }
+
+    #[test]
+    fn device_state_carries_one_payload_per_address() {
+        use vmm_devices::lifecycle::{DeviceStatePayload, VirtioMigrateState};
+        let state = DeviceState {
+            vcpus: Vec::new(),
+            devices: Vec::new(),
+            emulated: vec![
+                DeviceStatePayload {
+                    bdf: WireBdf {
+                        bus: 0,
+                        dev: 4,
+                        func: 0,
+                    },
+                    state: Some(DeviceMigrateState::Virtio(
+                        VirtioMigrateState::default(),
+                    )),
+                },
+                DeviceStatePayload {
+                    bdf: WireBdf {
+                        bus: 0,
+                        dev: 5,
+                        func: 0,
+                    },
+                    state: Some(DeviceMigrateState::Virtio(
+                        VirtioMigrateState::default(),
+                    )),
+                },
+            ],
+        };
+        let msg = Message::serialized(&state).unwrap();
+        match roundtrip(&msg) {
+            Message::Serialized(data) => {
+                let decoded: DeviceState = Message::deserialize(&data).unwrap();
+                let addrs: Vec<String> = decoded
+                    .emulated
+                    .iter()
+                    .map(|d| d.bdf.to_string())
+                    .collect();
+                assert_eq!(addrs, ["0.4.0", "0.5.0"]);
+            }
+            other => panic!("expected Serialized, got {other:?}"),
+        }
     }
 }
