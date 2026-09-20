@@ -216,7 +216,7 @@ generated third-party license bundle alongside it.
 required before broad distribution: a generated SBOM published with each
 artifact.
 
-## Unpinned inputs
+## Fetched at need: the fast-boot guest kernel
 
 `kernel/build.sh` verifies the Linux tarball against a SHA-256 recorded
 per kernel version and pins the Alpine build container by digest. It is
