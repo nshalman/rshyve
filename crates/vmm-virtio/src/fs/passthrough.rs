@@ -339,12 +339,12 @@ impl Passthrough {
         }
 
         let mut inodes = InodeTable::new();
-        let st = fstat(fd)?;
+        let (dev, ino) = dev_ino(&fstat(fd)?);
         let root = Inode {
             fd: Some(fd),
             ftype: FileType::Directory,
-            dev: st.st_dev as u64,
-            ino: st.st_ino as u64,
+            dev,
+            ino,
             lookups: u64::MAX / 2, // pin forever
             sym_parent: None,
             sym_name: None,
@@ -382,27 +382,15 @@ impl Passthrough {
         // Probe the child with fstatat first — this tells us if it's a
         // symlink before we try to open it (open with O_NOFOLLOW would fail
         // on symlinks with ELOOP on illumos).
-        let st = fstatat_nofollow(parent_fd, name)?;
-        let ftype = FileType::from_mode(st.st_mode as u32)
+        let probe = fstatat_nofollow(parent_fd, name)?;
+        let ftype = FileType::from_mode(probe.st_mode as u32)
             .ok_or(PtError::UnsupportedType)?;
 
-        let fd_opt = match ftype {
-            FileType::Regular | FileType::Directory => Some(openat_nofollow(
-                parent_fd,
-                name,
-                if ftype == FileType::Directory {
-                    libc::O_RDONLY | libc::O_DIRECTORY
-                } else {
-                    libc::O_RDONLY
-                },
-            )?),
-            FileType::Symlink => None,
-        };
+        let (fd_opt, st) = open_child(parent_fd, name, &probe, ftype)?;
 
         // Reconcile with existing cache entry if we already know this
         // (dev, ino) — keeps guest-side cache consistent.
-        let dev = st.st_dev as u64;
-        let ino = st.st_ino as u64;
+        let (dev, ino) = dev_ino(&st);
 
         let mut inodes = self.inodes.lock().unwrap();
         let nodeid = if let Some(&existing) = inodes.by_devino.get(&(dev, ino))
@@ -598,9 +586,13 @@ impl Passthrough {
 
         // O_EXCL is the one creation flag with a meaning here: it is how
         // a guest takes a lock file against another writer of the share.
+        // O_NONBLOCK because O_CREAT opens a name that already exists,
+        // and the export may hold a FIFO under it: without the flag the
+        // open waits for a peer and the one FUSE worker never returns.
         let mut open_flags = flags.host_io_flags()
             | libc::O_CREAT
             | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
             | libc::O_CLOEXEC;
         if flags.excl {
             open_flags |= libc::O_EXCL;
@@ -618,26 +610,36 @@ impl Passthrough {
         if fh_fd < 0 {
             return Err(last_os());
         }
-        // Successfully created + opened.
-        let st = match fstat(fh_fd) {
-            Ok(s) => s,
-            Err(e) => {
-                unsafe { libc::close(fh_fd) };
-                return Err(e);
-            }
-        };
+        let st = fstat(fh_fd).inspect_err(|_| {
+            unsafe { libc::close(fh_fd) };
+        })?;
+        // O_CREAT opens whatever the name already holds, so the type
+        // comes from the descriptor rather than from the assumption
+        // that this call made a regular file.
+        if FileType::from_mode(st.st_mode as u32) != Some(FileType::Regular) {
+            unsafe { libc::close(fh_fd) };
+            return Err(PtError::UnsupportedType);
+        }
 
-        // Obtain a stable O_RDONLY fd for the inode cache.
-        let ino_fd = match openat_nofollow(parent_fd, name, libc::O_RDONLY) {
-            Ok(fd) => fd,
-            Err(e) => {
+        // Obtain a stable O_RDONLY fd for the inode cache. The name is
+        // resolved a second time, so the two descriptors are checked to
+        // be one file: the export is shared, and anything with write
+        // access to it can swap the name in between.
+        let ino_fd = openat_nofollow(parent_fd, name, libc::O_RDONLY)
+            .inspect_err(|_| {
                 unsafe { libc::close(fh_fd) };
-                return Err(e);
-            }
-        };
+            })?;
+        let ino_st = fstat(ino_fd).inspect_err(|_| {
+            unsafe { libc::close(ino_fd) };
+            unsafe { libc::close(fh_fd) };
+        })?;
+        if ino_st.st_dev != st.st_dev || ino_st.st_ino != st.st_ino {
+            unsafe { libc::close(ino_fd) };
+            unsafe { libc::close(fh_fd) };
+            return Err(errno(libc::ESTALE));
+        }
 
-        let dev = st.st_dev as u64;
-        let ino = st.st_ino as u64;
+        let (dev, ino) = dev_ino(&st);
         let nodeid = {
             let mut inodes = self.inodes.lock().unwrap();
             if let Some(&existing) = inodes.by_devino.get(&(dev, ino)) {
@@ -1436,6 +1438,60 @@ fn fstatat_nofollow(parent: RawFd, name: &CStr) -> PtResult<libc::stat> {
     Ok(st)
 }
 
+/// Open `name` under `parent`, never following a final symlink and
+/// never waiting.
+///
+/// `O_NONBLOCK` is what keeps the single FUSE worker running: a FIFO
+/// opened without it blocks until a peer appears at the other end, and
+/// the export is allowed to contain one. The flag is inert on the
+/// regular files and directories this server serves, and the caller
+/// checks what it opened.
+/// The `(dev, ino)` pair naming one host file.
+///
+/// `dev_t` and `ino_t` differ in width between illumos and the
+/// development hosts, so the widening happens here once rather than at
+/// every caller.
+#[allow(clippy::unnecessary_cast)]
+fn dev_ino(st: &libc::stat) -> (u64, u64) {
+    (st.st_dev as u64, st.st_ino as u64)
+}
+
+/// Open the child the caller probed, and hand back the stat of what was
+/// really opened.
+///
+/// The name is resolved a second time by the open, so what arrives need
+/// not be what was probed: anything with write access to the export can
+/// swap it in between. The descriptor is then the authority for both the
+/// type and the identity, and a disagreement is reported as the stale
+/// name it is. A symlink has no descriptor, so its probe stands.
+fn open_child(
+    parent_fd: RawFd,
+    name: &CStr,
+    probe: &libc::stat,
+    ftype: FileType,
+) -> PtResult<(Option<RawFd>, libc::stat)> {
+    if ftype == FileType::Symlink {
+        return Ok((None, *probe));
+    }
+    let flags = if ftype == FileType::Directory {
+        libc::O_RDONLY | libc::O_DIRECTORY
+    } else {
+        libc::O_RDONLY
+    };
+    let fd = openat_nofollow(parent_fd, name, flags)?;
+    let opened = fstat(fd).inspect_err(|_| {
+        unsafe { libc::close(fd) };
+    })?;
+    if FileType::from_mode(opened.st_mode as u32) != Some(ftype)
+        || opened.st_dev != probe.st_dev
+        || opened.st_ino != probe.st_ino
+    {
+        unsafe { libc::close(fd) };
+        return Err(errno(libc::ESTALE));
+    }
+    Ok((Some(fd), opened))
+}
+
 fn openat_nofollow(
     parent: RawFd,
     name: &CStr,
@@ -1445,7 +1501,7 @@ fn openat_nofollow(
         libc::openat(
             parent,
             name.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -1704,6 +1760,107 @@ mod tests {
         seen_second.sort();
         assert_eq!(seen_first, [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
         assert_eq!(seen_second, seen_first, "the second snapshot differs");
+    }
+
+    /// Make a FIFO in `dir`, or say the host would not.
+    #[cfg(unix)]
+    fn mkfifo(dir: &Path, name: &str) {
+        let path = path_cstring(&dir.join(name)).expect("fifo path");
+        let rc = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    }
+
+    /// Run `body` on a thread and fail if it has not returned in time.
+    ///
+    /// A blocking `open` would hang the whole test run, so the deadline
+    /// is what turns that into a failure.
+    #[cfg(unix)]
+    fn within<T: Send + 'static>(
+        body: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(body());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the call never returned: it is waiting on a FIFO peer")
+    }
+
+    // A share may hold a FIFO, and the guest reaches it: Linux sends
+    // CREATE for a name it has not cached, and O_CREAT opens whatever is
+    // already there. Without O_NONBLOCK that open waits for a peer at
+    // the other end and the one FUSE worker never comes back.
+    #[cfg(unix)]
+    #[test]
+    fn a_create_over_a_fifo_is_refused_without_waiting() {
+        let dir = private_dir();
+        mkfifo(dir.path(), "p");
+        let pt = Passthrough::new(dir.path(), false).expect("open temp");
+        let refused = within(move || {
+            pt.create(
+                fuse::FUSE_ROOT_ID,
+                &CString::new("p").expect("name"),
+                lx::O_WRONLY | lx::O_CREAT,
+                0o644,
+                0,
+            )
+            .err()
+            .map(|e| e.to_errno())
+        });
+        // ENXIO because a write-only open of a FIFO with no reader
+        // fails at once once O_NONBLOCK is set, ENOTSUP if the host
+        // lets the open through and the type check refuses it. Either
+        // answer reaches the guest; a third one never comes back.
+        assert!(
+            matches!(refused, Some(libc::ENXIO | libc::ENOTSUP)),
+            "unexpected refusal: {refused:?}"
+        );
+    }
+
+    // The same name through LOOKUP. The type check comes off the probe
+    // here, so the guest is refused before anything is opened.
+    #[cfg(unix)]
+    #[test]
+    fn a_lookup_of_a_fifo_is_refused_without_waiting() {
+        let dir = private_dir();
+        mkfifo(dir.path(), "p");
+        let pt = Passthrough::new(dir.path(), false).expect("open temp");
+        let refused = within(move || {
+            pt.lookup(fuse::FUSE_ROOT_ID, &CString::new("p").expect("name"))
+                .err()
+                .map(|e| e.to_errno())
+        });
+        assert_eq!(refused, Some(libc::ENOTSUP));
+    }
+
+    // The probe and the open resolve the name twice, so a type the
+    // descriptor disagrees with is the name having changed underneath.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_changed_type_between_probe_and_open_is_stale() {
+        let dir = private_dir();
+        mkfifo(dir.path(), "p");
+        let parent = Passthrough::new(dir.path(), false).expect("open temp");
+        let parent_fd = parent
+            .inodes
+            .lock()
+            .unwrap()
+            .by_id
+            .get(&fuse::FUSE_ROOT_ID)
+            .and_then(|ino| ino.fd)
+            .expect("root fd");
+        let probe = fstat(parent_fd).expect("stat the root");
+        let refused = within(move || {
+            open_child(
+                parent_fd,
+                &CString::new("p").expect("name"),
+                &probe,
+                FileType::Regular,
+            )
+            .err()
+            .map(|e| e.to_errno())
+        });
+        assert_eq!(refused, Some(libc::ESTALE));
     }
 
     #[cfg(unix)]
