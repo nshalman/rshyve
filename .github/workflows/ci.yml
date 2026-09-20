@@ -287,7 +287,7 @@ jobs:
       # is the only machine that runs that test at all. None of these
       # three packages has a bench or example target, so nothing that
       # `--all-targets` compiled is lost.
-      - run: cargo test --locked -p rshyve -p firehyve -p vmm-migrate-agent
+      - run: cargo test --locked -p rshyve -p firehyve
       # The vTPM crates ran in no job. They need the submodule and the
       # autotools deps this job already has, and their tests drive real
       # libtpms rather than a stub, so they belong here and nowhere
@@ -302,7 +302,7 @@ jobs:
       # records the workspace clippy run the illumos build host does.
       - run: >
           cargo clippy --locked --all-targets
-          -p rshyve -p vmm-migrate-agent -p vmm_tpm -p vmm_tpm_sys
+          -p rshyve -p vmm_tpm -p vmm_tpm_sys
           -- -D warnings
 
   supply-chain:
@@ -591,9 +591,8 @@ jobs:
       # The job also compiles every reachable package for illumos with
       # its test targets, so illumos-only code that stopped compiling
       # fails here. It reads the workspace members rather than a
-      # hand-kept `-p` list, so it reaches vmm-migrate-agent, which no
-      # other job cross-checks, and it reaches a new package on the day
-      # it is added.
+      # hand-kept `-p` list, so it reaches a new package on the day it
+      # is added.
       #
       # It stays quiet about rshyve, vmm_migrate and the two TPM crates.
       # Their dependencies compile C for the target and this runner has

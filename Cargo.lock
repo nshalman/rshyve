@@ -1671,17 +1671,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vmm-migrate-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "vmm_api_common"
 version = "0.1.0"
 dependencies = [

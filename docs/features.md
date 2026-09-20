@@ -441,7 +441,7 @@ Kernel state transferred: the ioapic, atpit, atpic, hpet, pm_timer and rtc syste
 
 Guarded refusals that work correctly: a vTPM, a bootrom variable store, or an `ahci-cd` device each block `migrate-source`; `--migrate-listen` combined with `--vtpm`, a varstore, or an `fbuf`/`ahci-cd` spec is a startup error. Note the asymmetry: `fbuf` blocks a destination but not a source, and `xhci` is on neither list, so a destination will accept an `xhci` spec and start with a fresh unrestored controller.
 
-`vmm-migrate-agent` is a separate binary that runs in the global zone and orchestrates the ZFS send/recv plus a Unix-to-TCP bridge. Its flags: `source --uuid --dest-host [--dest-port 4567] [--disk-dataset] [--dest-dataset] [--max-syncs 3] --ssh-key [--control-socket] [--skip-zfs]`, and `dest --uuid [--port 4567]`.
+Orchestration is not in this repository. Replicating the disk, sequencing the two hosts and bridging the transport belong to whatever drives the migration; this tree provides the VMM side, the control-socket verbs and the barrier contract (see [migration.md](migration.md#the-zfs-barrier)). `tools/vmm-migrate.sh` drives one end to end for lab use and is a test harness, not a supported component.
 
 ## Hotplug (both binaries)
 
@@ -629,7 +629,7 @@ These parse without complaint and do nothing. Each one is a way to believe you c
 
 ## Known caveats
 
-**Live migration is experimental and its transport is unauthenticated and unencrypted.** Guest RAM, all vCPU register and MSR state, and device state cross the wire in cleartext with no peer identity, no session binding, no migration ID and no replay protection. The destination resumes whatever the first connecting peer sends, subject only to a `num_cpus` and `mem_size` equality check. `SECURITY.md` states this and `docs/security/open-findings.md` tracks it as OSF-1 (high). The only mitigation available today is external: migrate over a separately authenticated tunnel, ideally an SSH-forwarded Unix socket so the VMM never binds TCP. `vmm-migrate-agent` compounds this: it disables `StrictHostKeyChecking` and builds every command by string interpolation into `bash -c`, so a shell metacharacter in `--uuid`, `--dest-host` or a dataset name runs as root in the global zone (OSF-1b).
+**Live migration is experimental and its transport is unauthenticated and unencrypted.** Guest RAM, all vCPU register and MSR state, and device state cross the wire in cleartext with no peer identity, no session binding, no migration ID and no replay protection. The destination resumes whatever the first connecting peer sends, subject only to a `num_cpus` and `mem_size` equality check. `SECURITY.md` states this and `docs/security/open-findings.md` tracks it as OSF-1 (high). The only mitigation available today is external: migrate over a separately authenticated tunnel, ideally an SSH-forwarded Unix socket so the VMM never binds TCP.
 
 **A writable virtio-fs share is a root-equivalent grant over that subtree.** File operations run as the VMM's euid with no uid/gid squashing, and the guest chooses the uid, gid and mode on SETATTR, setuid bit included. Treat a read-write export the way you would treat handing the guest a root shell scoped to that directory. `ro` shares carry none of this: every mutating opcode returns EROFS, including an `O_TRUNC` open.
 
@@ -663,7 +663,7 @@ These parse without complaint and do nothing. Each one is a way to believe you c
 
 **CI type-checks; it does not link or boot.** A green run proves formatting, portable-crate clippy and tests, illumos type-checking of the FFI crates, a current lockfile, and the dependency and public-surface policies. It does not prove the VMM builds, boots a guest, or passes a platform test. USDT probe emission is a no-op on the Linux runner and is verified only on the build host. The stock-platform-image shared-library gate (`tools/check-needed.sh`) runs on the build host, not in CI, so CI never sees a real illumos ELF. `tools/check-ci-crates.sh`, the guard that asserts CI covers every portable crate, runs in the `ci-coverage` job. Every runtime claim in `docs/testing.md` is lab-verified against an untracked host list, not reproducible publicly.
 
-**The MSRV (1.94) is unverified for both shipping binaries.** The MSRV job's crate list omits `rshyve`, `firehyve`, `vmm_tpm`, `vmm_tpm_sys` and `vmm-migrate-agent`. There is no `rust-toolchain.toml`, and `tools/fhrun-init` declares no `rust-version` at all.
+**The MSRV (1.94) is unverified for both shipping binaries.** The MSRV job's crate list omits `rshyve`, `firehyve`, `vmm_tpm` and `vmm_tpm_sys`. There is no `rust-toolchain.toml`, and `tools/fhrun-init` declares no `rust-version` at all.
 
 **Build on a platform image no newer than the oldest node you deploy to.** `tools/check-needed.sh` pins `MAX_OPENSSL_SMARTOS=3.0.9`, because `ld.so.1` refuses a binary whose recorded `OPENSSL_SMARTOS_<ver>` the node's library does not define. The platform-OpenSSL link path is taken only when host and target match and `/lib/amd64/libcrypto-smartos.so.3` exists; a cross build silently falls back to pkg-config, which is the configuration that once produced a binary recording `NEEDED libcrypto.so.3` that no platform image ships.
 
@@ -671,7 +671,7 @@ These parse without complaint and do nothing. Each one is a way to believe you c
 
 ## Documentation that contradicts the code
 
-Treat `STATUS.md` as historical. It still titles the project "vmmnew", predates the two-binary split, never mentions `firehyve`, `fhrun` or `vmm-migrate-agent`, and maps fbuf, xHCI, NVMe and passthru to a monolithic `crates/vmm-devices/` that no longer holds them.
+Treat `STATUS.md` as historical. It still titles the project "vmmnew", predates the two-binary split, never mentions `firehyve` or `fhrun`, and maps fbuf, xHCI, NVMe and passthru to a monolithic `crates/vmm-devices/` that no longer holds them.
 
 | Claim | Where | Reality |
 |---|---|---|

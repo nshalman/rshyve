@@ -24,7 +24,6 @@ members = [
     "crates/vmm-machine",
     "bin/rshyve",
     "bin/firehyve",
-    "bin/vmm-migrate-agent",
     "tools/fhrun",
 ]
 

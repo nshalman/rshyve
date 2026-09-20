@@ -60,7 +60,7 @@ Source Host                         Destination Host
 +---------------------------+       +---------------------------+
 | Global Zone               |       | Global Zone               |
 |                           |       |                           |
-| vmm-migrate-agent source  | TCP   | vmm-migrate-agent dest    |
+| orchestrator, source side | TCP   | orchestrator, dest side   |
 |   - ZFS send/recv         |<----->|   - ZFS recv              |
 |   - Unix<->TCP bridge     |       |   - Unix<->TCP bridge     |
 |                           |       |                           |
@@ -828,7 +828,6 @@ the pre-pause convergence loop may need more iterations.
 
 | File | Purpose |
 |------|---------|
-| `bin/vmm-migrate-agent/src/main.rs` | GZ migration orchestrator (ZFS send/recv, Unix-TCP bridge) |
 | `crates/vmm-migrate/src/source.rs` | Source migration protocol (pre-pause RAM, barrier, device export) |
 | `crates/vmm-migrate/src/destination.rs` | Destination migration protocol (topology check, RAM import, state restore, resume) |
 | `crates/vmm-migrate/src/wire.rs` | Transport trait, read deadlines, framing, message expectations |

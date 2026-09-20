@@ -44,11 +44,15 @@ stdio serial console, with no UEFI, migration, control socket or
 passthrough. It shares the flag grammar and rejects what it cannot
 honor at startup. See [docs/cli.md](docs/cli.md#firehyve).
 
-Two smaller binaries go with them. `vmm-migrate-agent` runs in the
-global zone and drives a ZFS-plus-RAM migration end to end; its
-transport is the one OSF-1 describes, so treat its arguments as
-trusted. `fhrun` runs a Linux binary inside a firehyve microVM like a
-child process (see [docs/fhrun.md](docs/fhrun.md)).
+One smaller binary goes with them: `fhrun` runs a Linux binary inside a
+firehyve microVM like a child process (see
+[docs/fhrun.md](docs/fhrun.md)).
+
+Migration orchestration is not in this repository. The VMM implements
+the wire protocol and the control-socket verbs; replicating the disk and
+sequencing the two hosts belong to whatever drives it. The contract an
+orchestrator has to meet is in
+[docs/migration.md](docs/migration.md#the-zfs-barrier).
 
 ## Documentation
 

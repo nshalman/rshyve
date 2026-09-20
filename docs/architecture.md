@@ -11,7 +11,6 @@ scoped to its manifest (`deny-firehyve.toml`).
 ```
 bin/rshyve/                 Parity VMM: mdata agent, control socket, bootrom
 bin/firehyve/               microVM: direct kernel boot, no control socket
-bin/vmm-migrate-agent/      Global-zone helper that drives a migration
 tools/fhrun/                Runs a Linux binary in a microVM like a child process
 tools/fhrun-init/           In-guest PID 1 for fhrun (linux-musl, own workspace)
 tools/virtiofs-test/        In-guest test harness (linux-musl, own workspace)

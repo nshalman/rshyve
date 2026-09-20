@@ -15,7 +15,8 @@ deployment where the migration path is not already a trusted channel.
 `crates/vmm-migrate/src/source.rs` connects and
 `crates/vmm-migrate/src/destination.rs` accepts a raw WebSocket over a
 TCP or Unix stream with no protocol-level peer identity.
-`vmm-migrate-agent` binds `0.0.0.0` and accepts the first connection.
+A destination told to listen binds the address it is given and accepts
+the first connection.
 
 Every field the peer sends is now validated before it is applied, and a
 payload the destination cannot hold fails the migration rather than
@@ -36,40 +37,6 @@ TCP at all.
 
 **Mitigation today:** migrate only across a trusted network, over a
 tunnel established and authenticated by other means.
-
-### OSF-1b — vmm-migrate-agent trusts the destination host key
-
-**Boundary:** operator input to root in the global zone. **Severity:**
-medium. The shell-injection half of this finding is closed; what remains
-is the transport and the absence of typed input.
-
-`bin/vmm-migrate-agent/src/main.rs` no longer builds command strings. It
-runs `zfs`, `ssh` and `vmadm` through `std::process::Command` argument
-arrays, so no value it is given reaches a shell, and `send_recv` now
-waits on both ends of the `zfs send | zfs recv` pipeline and fails on
-either exit status, so a truncated stream can no longer pass for a
-complete one. `check_name` refuses a value that begins with `-`, which
-the invoked program would read as an option, and one carrying a `..`
-path element.
-
-Two gaps remain:
-
-- **The agent passes `-o StrictHostKeyChecking=no`** (`Ssh::remote`), so
-  the `zfs send` stream carrying the guest's disk is open to a
-  machine-in-the-middle on first connection, and a substituted
-  destination is accepted silently.
-- **Operator input is checked by predicate, not by type.** UUID,
-  dataset, host and key path are `String` with a shared character
-  check rather than newtypes clap validates at parse time, so a new call
-  site can forget the check.
-
-**To close:** verify the destination host key against a known_hosts file
-the operator supplies, and introduce validated newtypes so bad input is
-refused at parse time rather than at each use.
-
-**Mitigation today:** run the agent only over a network where the
-destination's identity is already assured, and only from automation that
-constructs its arguments.
 
 ### OSF-2 — Migration does not transfer FPU/XSAVE state
 

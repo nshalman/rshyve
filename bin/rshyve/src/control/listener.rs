@@ -186,8 +186,8 @@ fn serve_connections<F>(
 
 /// illumos global zone id. A global-zone peer already has full authority
 /// over this zone, so refusing it would protect nothing and would break
-/// vmm-migrate-agent, which runs in the GZ and drives the control socket
-/// of a VMM inside a zone.
+/// a global-zone orchestrator, which drives the control socket of a VMM
+/// inside a zone.
 const GLOBAL_ZONEID: i32 = 0;
 
 fn peer_is_authorized(peer: &PeerCred, euid: u32, zoneid: Option<i32>) -> bool {
@@ -436,8 +436,8 @@ mod tests {
 
     #[test]
     fn global_zone_peer_is_authorized_against_a_zoned_vmm() {
-        // vmm-migrate-agent runs in the GZ and drives the control socket
-        // of a VMM inside a zone. Rejecting it would break migration.
+        // A migration orchestrator runs in the GZ and drives the control
+        // socket of a VMM inside a zone. Rejecting it would break migration.
         let gz_peer = PeerCred {
             uid: 0,
             gid: 0,

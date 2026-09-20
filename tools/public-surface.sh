@@ -272,14 +272,10 @@ report "personal identifier" \
 
 # docs/testing.md: the test guest is rebuilt from a ZFS snapshot on every
 #   run, so its host key legitimately changes each boot. Explained inline.
-# vmm-migrate-agent: tracked as OSF-1b. Drop this exception when it closes.
-# open-findings.md: describes the defect above; it does not practise it.
 report "SSH host key verification disabled" \
     'StrictHostKeyChecking=n[o]|UserKnownHostsFile=/dev/nul[l]' \
     '' \
-    'docs/testing.md' \
-    'bin/vmm-migrate-agent/src/main.rs' \
-    'docs/security/open-findings.md'
+    'docs/testing.md'
 
 # Site-specific literals, never spelled here. See the header.
 site=()
