@@ -266,7 +266,10 @@ fn an_rst_for_an_unknown_connection_is_dropped() {
 }
 
 /// A guest may address any CID it likes. Only the host's own is
-/// routable here.
+/// routable here, and the refusal has to come from the host CID: the
+/// Linux driver drops a packet from anywhere else, so an RST sourced
+/// from the CID the guest named is lost and the guest keeps retrying
+/// instead of failing at once.
 #[test]
 fn a_packet_for_another_cid_is_refused() {
     let m = mux();
@@ -274,7 +277,10 @@ fn a_packet_for_another_cid_is_refused() {
     h.dst_cid = 99;
     let act = m.on_guest_packet(&h, vec![]);
     assert_eq!(act, GuestAction::None);
-    assert_eq!(drain(&m)[0].hdr.op, OP_RST);
+    let refusal = &drain(&m)[0].hdr;
+    assert_eq!(refusal.op, OP_RST);
+    assert_eq!(refusal.src_cid, CID_HOST, "the guest will drop this RST");
+    assert_eq!(refusal.dst_cid, GUEST_CID);
     assert_eq!(m.conn_count(), 0, "no connection for a foreign CID");
 }
 
