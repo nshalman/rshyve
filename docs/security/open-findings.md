@@ -165,6 +165,109 @@ accept.
 **To close:** a modern authenticated, encrypted console boundary for any
 remote use, and a documented tunnel requirement until then.
 
+### OSF-8 — Hyper-V enlightenment state does not cross a migration
+
+**Boundary:** correctness, guest-visible. **Severity:** high for a
+`--hyperv` Windows guest. **Status:** pending verification.
+
+`crates/vmm-hyperv/src/lib.rs` keeps every piece of enlightenment state
+in one `Mutex<Inner>` built zeroed, and derives reference time from an
+`Instant` taken when the instance was constructed.
+`crates/vmm-migrate/src/codec.rs` carries no Hyper-V payload, and
+`bin/rshyve/src/main.rs` builds a fresh instance on the destination. So a
+nominally successful migration restarts `TIME_REF_COUNT` at zero,
+violating the monotonicity the guest is promised, and loses
+`HV_X64_MSR_GUEST_OS_ID`, `HV_X64_MSR_HYPERCALL`,
+`HV_X64_MSR_REFERENCE_TSC` and the five guest-readable crash parameters.
+The overlay pages themselves travel inside guest RAM, so the guest keeps
+pages whose describing MSRs the destination has forgotten.
+
+`--hyperv` is not refused for migration, so nothing warns.
+
+**To close:** export and import the three configuration MSRs, the crash
+parameters, and a reference-time offset rather than a raw `Instant`;
+remove the overlays before the final RAM copy and reinstall them after
+import, propagating any failure; then migrate a live Windows guest under
+a continuous time-reading workload and confirm `TIME_REF_COUNT` does not
+go backwards. Until then, refuse migration for a VM started with
+`--hyperv`.
+
+**Mitigation today:** do not migrate a `--hyperv` guest.
+
+### OSF-9 — A guest can flood the host log on several device paths
+
+**Boundary:** guest to host. **Severity:** medium (host disk and log
+pipeline, and evidence destruction). **Status:** pending verification.
+
+Several device paths write one log record per guest action with no rate
+limit and no latch, so a guest that repeats the action writes to the host
+log as fast as it can execute: pvpanic writes, COM2 bytes the guest does
+not drain, and refused viona kicks and ring inits are the ones found.
+Each is being fixed where it was found. This entry records the class,
+because the tree has no shared answer to it: no rate-limiting drain, no
+"log once per state change" helper, and no test convention, so the next
+device to log on a guest-driven path reintroduces it.
+
+The logger's async drain is a 128-entry channel with `DropAndReport`, so
+a flood also evicts the records that would explain an unrelated failure.
+
+**To close:** one rate-limited or latched logging seam for guest-driven
+events, used by every device that logs on such a path, and a
+`CountingDrain` test per device asserting that N guest actions produce a
+bounded number of records. Then re-audit every `warn!` and `info!`
+reachable from a guest action.
+
+### OSF-10 — virtio-fs runs in the VMM process, not a sandbox
+
+**Boundary:** guest to host filesystem. **Severity:** medium.
+**Status:** pending verification.
+
+`crates/vmm-virtio/src/fs/passthrough.rs` serves FUSE requests from the
+VMM process itself. The isolation is the shared root fd, `*at()` calls
+with `O_NOFOLLOW`, name validation at LOOKUP, and refusal of device,
+FIFO and socket nodes. Caps on cached inodes and open handles are being
+added so a guest cannot pin host descriptors without bound.
+
+Those caps are a mitigation, not the boundary. virtiofsd runs the same
+work in a separate process under a namespace or `pivot_root`, so a defect
+in path handling costs an attacker a sandbox rather than the VMM's whole
+address space and every fd in it. illumos has no seccomp and no mount
+namespaces, so the equivalent needs its own design.
+
+**To close:** decide whether virtio-fs ships in the VMM process at all.
+If it does, the argument for it needs writing down, together with a
+negative test set for every path-handling rule the module claims. If it
+does not, a helper process with a reduced privilege set and its own
+`root_fd`, talking to the device over a socket.
+
+**Mitigation today:** export only directories whose contents the guest
+may read, and never a read-write share of anything the host trusts.
+
+### OSF-11 — The PCI passthrough audit has not run on real hardware
+
+**Boundary:** guest to host. **Severity:** unknown.
+**Status:** pending verification.
+
+OSF-5 records that passthrough was unaudited. A source audit of the
+guest-offset arithmetic and the BAR mapping paths closes the reading part
+of that. What no audit can supply is a device: every conclusion about
+passthrough in this tree has been reached by reading code and the PPT
+ioctl contract, never by assigning a physical function to a guest.
+
+Specifically unproven: that the config-space windows the guest sees match
+what the audit concluded, that BAR mapping and unmapping survive a guest
+reset with DMA in flight, that the MSI-X refusal covers every device that
+advertises it, and that illumos VT-d remapping behaves as the module
+header assumes. There is no AMD IOMMU backend at all.
+
+**To close:** run a real assigned device: a NIC and a storage controller,
+each through guest boot, reset, reboot and VM destroy, with DMA active,
+on an Intel VT-d host. Record what was assigned and what was observed in
+`docs/hardware-run.md`. Until then treat `passthru` as experimental
+whatever the source audit says.
+
+**Mitigation today:** do not offer `-s N,passthru` to an untrusted guest.
+
 ## Resolved
 
 | Finding | Closed by |
