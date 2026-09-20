@@ -7,7 +7,9 @@
 use std::fs::{self, DirBuilder, Permissions};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{
+    DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt,
+};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Mutex;
@@ -36,8 +38,10 @@ impl Default for SocketPolicy {
 /// Bind a Unix domain socket and verify its ownership and permissions.
 ///
 /// If the parent directory does not exist, it is created with `dir_mode`.
-/// Any failure after the socket is bound removes the socket path before the
-/// error is returned.
+/// A stale socket left by an earlier process is replaced; see
+/// [`remove_stale_socket`] for what else may be at the path. Any failure
+/// after the socket is bound removes the socket path before the error
+/// is returned.
 pub fn bind_restricted(
     path: &Path,
     policy: SocketPolicy,
@@ -55,11 +59,7 @@ pub fn bind_restricted(
         builder.create(parent)?;
     }
 
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
+    remove_stale_socket(path)?;
 
     let old_umask =
         unsafe { libc::umask((!policy.mode & 0o777) as libc::mode_t) };
@@ -77,6 +77,43 @@ pub fn bind_restricted(
 
     verify_bound_path(path, policy.mode, unsafe { libc::geteuid() })?;
     Ok(listener)
+}
+
+/// Unlink `path` only when it is a socket nobody listens on.
+///
+/// The path comes from the operator: a `-s` spec, or a `device-add`
+/// over the control channel for the life of the VM. An unconditional
+/// unlink would remove whatever file that names. So the inode has to
+/// be a socket, checked without following a symlink, and a connect to
+/// it has to be refused, which is what a socket whose listener has
+/// gone answers with. A connect that succeeds means another process
+/// serves the path, and that process keeps it.
+///
+/// The check and the unlink are two steps, so a parent directory the
+/// caller does not control can still swap the inode between them.
+/// The socket directory is created 0700 above for that reason.
+fn remove_stale_socket(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} exists and is not a socket", path.display()),
+        ));
+    }
+    match UnixStream::connect(path) {
+        Ok(_live) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("{} is served by another process", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            fs::remove_file(path)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Write all of `data` to `stream`, or give up after `budget`.
@@ -413,6 +450,63 @@ mod tests {
             UnixStream::connect(&path).expect("connect to replacement socket");
         let _accepted =
             listener.accept().expect("accept replacement connection");
+        drop(client);
+    }
+
+    /// `-s 5,virtio-console,/etc/passwd` must fail without removing
+    /// the file it names.
+    #[test]
+    fn bind_does_not_remove_a_file_that_is_not_a_socket() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("control.sock");
+        fs::write(&path, b"keep me").expect("write a regular file");
+
+        let error = bind_restricted(&path, SocketPolicy::default())
+            .expect_err("a regular file must not be replaced");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(&path).expect("the file is still there"),
+            b"keep me"
+        );
+    }
+
+    /// A symlink is not followed: the target is not stat'ed and the
+    /// link is not removed.
+    #[test]
+    fn bind_does_not_remove_a_symlink_to_a_socket() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let target = temp.path().join("real.sock");
+        let path = temp.path().join("control.sock");
+        let _stale = UnixListener::bind(&target).expect("bind the target");
+        std::os::unix::fs::symlink(&target, &path).expect("symlink");
+
+        let error = bind_restricted(&path, SocketPolicy::default())
+            .expect_err("a symlink must not be replaced");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(fs::symlink_metadata(&path)
+            .expect("the link is still there")
+            .file_type()
+            .is_symlink());
+    }
+
+    /// A second VM that names a running VM's socket must not take it.
+    #[test]
+    fn bind_does_not_remove_a_socket_another_listener_serves() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("control.sock");
+        let live = UnixListener::bind(&path).expect("bind the live socket");
+
+        let error = bind_restricted(&path, SocketPolicy::default())
+            .expect_err("a served socket must not be replaced");
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        // The probe connect is the one the live listener sees; after
+        // it the path still reaches this listener.
+        let _probe = live.accept().expect("the probe connection");
+        let client = UnixStream::connect(&path).expect("still served");
+        let _accepted = live.accept().expect("accept after the refusal");
         drop(client);
     }
 
