@@ -4,27 +4,21 @@
 
 //! Command Response Buffer (CRB) MMIO interface — TCG PTP 2.0.
 //!
-//! Implements the locality-0 register layout at the standard base
-//! 0xFED40000. Windows 11 / Server 2022 detect TPM 2.0 via the TPM2
-//! ACPI table's "Start Method = 7 (CRB)" and read the Control Area
-//! Address; from there they drive everything through this register
-//! map. We deliberately limit support to locality 0 — sufficient for
-//! every TPM 2.0 boot/attestation/BitLocker flow we care about, and
-//! matches QEMU's CRB.
+//! Serves the locality-0 register layout at the standard base
+//! 0xFED40000. Only locality 0 exists here, which is what every TPM 2.0
+//! boot, attestation and BitLocker flow uses, and what QEMU's CRB
+//! offers.
 //!
-//! Command flow:
-//!   1. Guest writes command bytes into the buffer at offset 0x80.
-//!   2. Guest writes `START_INVOKE` into `CTRL_START` (offset 0x4C).
-//!   3. Our MMIO handler hands the command to libtpms synchronously
-//!      (`TPMLIB_Process`). The response replaces the command bytes
-//!      in the same buffer.
-//!   4. Handler clears the START bit. Guest polls START until it
-//!      returns to zero, then reads the response.
+//! The guest writes a command into the buffer at offset 0x80, then sets
+//! INVOKE in `CTRL_START`. The MMIO handler runs the command through
+//! libtpms on the writing vCPU, replaces the buffer contents with the
+//! response and clears INVOKE, which is what the guest polls.
 //!
-//! libtpms is a single-instance library: one `Crb` per process.
+//! libtpms has no internal locking, so [`Crb`] must be the only caller
+//! and must have one command in flight. See [`crate`].
 
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use slog::{debug, warn, Logger};
 use vmm_core::common::{RWOp, ReadOp, WriteOp};
@@ -38,7 +32,11 @@ pub const CRB_BASE: u64 = 0xFED4_0000;
 pub const CRB_REGION_LEN: u64 = 0x1000;
 
 const BUF_OFFSET: usize = 0x80;
-const BUF_LEN: usize = 0x1000 - BUF_OFFSET; // 3968 bytes
+/// The CRB command/response buffer fills the rest of the page. It is
+/// also the size negotiated with libtpms (see [`crate::Tpm::new`]), so
+/// the library refuses a longer command and never builds a longer
+/// response.
+pub const BUF_LEN: usize = 0x1000 - BUF_OFFSET;
 
 // Register offsets (within the MMIO region).
 const REG_LOC_STATE: usize = 0x00;
@@ -67,26 +65,16 @@ const LOC_STATE_TPM_REG_VALID: u32 = 1 << 7;
 
 const LOC_CTRL_REQ_ACCESS: u32 = 1 << 0;
 const LOC_CTRL_RELINQUISH: u32 = 1 << 1;
-#[allow(dead_code)]
-const LOC_CTRL_SEIZE: u32 = 1 << 2;
 const LOC_CTRL_RESET_EST: u32 = 1 << 3;
 
 const LOC_STS_GRANTED: u32 = 1 << 0;
-#[allow(dead_code)]
-const LOC_STS_BEEN_SEIZED: u32 = 1 << 1;
 
 const CTRL_REQ_CMD_READY: u32 = 1 << 0;
 const CTRL_REQ_GO_IDLE: u32 = 1 << 1;
 
-// Retained for the architected CRB status bit even though only IDLE is emitted.
-#[allow(dead_code)]
-const CTRL_STS_TPM_STS: u32 = 1 << 0;
 const CTRL_STS_TPM_IDLE: u32 = 1 << 1;
 
 const CTRL_START_INVOKE: u32 = 1 << 0;
-
-#[allow(dead_code)]
-const CTRL_CANCEL_INVOKE: u32 = 1 << 0;
 
 /// Static interface ID register value advertised to the guest.
 ///
@@ -124,10 +112,7 @@ fn intf_id_value() -> u32 {
         | (rid << 24)
 }
 
-/// Mutable register + buffer state. Guarded by a single Mutex; the
-/// hot path (command processing) holds the lock for the duration of
-/// `TPMLIB_Process`, which is fine because we run synchronously and
-/// only one vCPU should be talking to the TPM at a time.
+/// Register file and command buffer, as the guest sees them.
 struct State {
     loc_state: u32,
     loc_ctrl: u32,
@@ -156,10 +141,6 @@ impl State {
             buffer: Box::new([0u8; BUF_LEN]),
         }
     }
-
-    fn reset(&mut self) {
-        *self = Self::new();
-    }
 }
 
 /// CRB device. Owns the MMIO state and serves read/write requests
@@ -167,6 +148,14 @@ impl State {
 /// `CRB_BASE` with length `CRB_REGION_LEN`.
 pub struct Crb {
     state: Mutex<State>,
+    /// Held for one whole libtpms command. libtpms keeps its TPM state
+    /// in C globals with no locking of its own, so two vCPUs inside
+    /// `TPMLIB_Process` would race on them and on the NV files.
+    ///
+    /// It is separate from `state` so a register read answers while a
+    /// command runs, and it is always taken before `state`, never with
+    /// `state` already held.
+    command: Mutex<()>,
     log: Logger,
 }
 
@@ -174,13 +163,13 @@ impl Crb {
     pub fn new(log: Logger) -> Self {
         Self {
             state: Mutex::new(State::new()),
+            command: Mutex::new(()),
             log,
         }
     }
 
-    /// Reset the CRB state (called on guest reboot).
-    pub fn reset(&self) {
-        self.state.lock().unwrap().reset();
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().expect("CRB register lock")
     }
 
     /// Top-level MMIO dispatch. `offset` is relative to `CRB_BASE`.
@@ -196,7 +185,7 @@ impl Crb {
     }
 
     fn handle_buffer(&self, buf_off: usize, op: RWOp<'_>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         match op {
             RWOp::Read(ro) => {
                 let mut tmp = [0u8; 8];
@@ -229,7 +218,7 @@ impl Crb {
     }
 
     fn handle_reg_read(&self, offset: usize, ro: &mut ReadOp) {
-        let state = self.state.lock().unwrap();
+        let state = self.state();
         let value: u32 = match offset & !0x3 {
             REG_LOC_STATE => state.loc_state,
             REG_LOC_CTRL => state.loc_ctrl,
@@ -288,7 +277,7 @@ impl Crb {
     }
 
     fn handle_loc_ctrl(&self, val: u32) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         if val & LOC_CTRL_REQ_ACCESS != 0 {
             // Grant access immediately — locality 0 is always available
             // on a single-locality CRB.
@@ -308,7 +297,7 @@ impl Crb {
     }
 
     fn handle_ctrl_req(&self, val: u32) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state();
         if val & CTRL_REQ_CMD_READY != 0 {
             state.ctrl_sts &= !CTRL_STS_TPM_IDLE;
         }
@@ -317,13 +306,11 @@ impl Crb {
         }
     }
 
+    /// Record a cancel request. A command in flight is not preempted;
+    /// libtpms returns in well under the guest's CRB timeout for every
+    /// command except RSA key generation.
     fn handle_ctrl_cancel(&self, val: u32) {
-        // We don't preempt libtpms commands. Record the request for
-        // diagnostic visibility; the guest will see the response come
-        // back as soon as libtpms returns (typically <10ms for any
-        // command except RSA keygen).
-        let mut state = self.state.lock().unwrap();
-        state.ctrl_cancel = val;
+        self.state().ctrl_cancel = val;
     }
 
     fn handle_ctrl_start(&self, val: u32) {
@@ -331,84 +318,108 @@ impl Crb {
             return;
         }
 
-        let cmd_bytes;
-        {
-            let mut state = self.state.lock().unwrap();
-            // Latch the START bit so the guest sees "in progress".
+        let cmd_bytes = {
+            let mut state = self.state();
+            if state.ctrl_start & CTRL_START_INVOKE != 0 {
+                // A command is already running, on this vCPU or
+                // another. libtpms cannot take a second one. Leave
+                // INVOKE set: the guest is already waiting on it.
+                return;
+            }
             state.ctrl_start |= CTRL_START_INVOKE;
 
-            // Parse TPM command size from buffer bytes 2..6 (BE u32).
+            // TPM command header: tag(2) commandSize(4, big endian).
+            // A size past the buffer stays past it, so libtpms sees a
+            // short command and answers TPM_RC_COMMAND_SIZE itself.
             let size = u32::from_be_bytes([
                 state.buffer[2],
                 state.buffer[3],
                 state.buffer[4],
                 state.buffer[5],
             ]) as usize;
+            state.buffer[..size.min(BUF_LEN)].to_vec()
+        };
 
-            let bounded = size.min(BUF_LEN);
-            cmd_bytes = state.buffer[..bounded].to_vec();
+        let response = {
+            let _running = self.command.lock().expect("CRB command lock");
+            self.run_command(&cmd_bytes)
+        };
+
+        let mut state = self.state();
+        match response {
+            Some(bytes) => state.buffer[..bytes.len()].copy_from_slice(&bytes),
+            // A well-formed failure reply, so the guest fails the
+            // command instead of timing out. Tag 8001, size 0x0A,
+            // TPM_RC_FAILURE.
+            None => state.buffer[..10].copy_from_slice(&[
+                0x80, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x01, 0x01,
+            ]),
         }
+        state.ctrl_start &= !CTRL_START_INVOKE;
+    }
 
-        // Drop the lock for the duration of TPMLIB_Process: libtpms
-        // calls back into our nvram_loaddata/storedata, which hold no
-        // CRB state but may take their own filesystem locks. Holding
-        // the CRB mutex across a callback that re-enters Rust risks
-        // deadlock if a future callback ever needs the CRB state.
+    /// Run one command through libtpms and copy out its response.
+    ///
+    /// The caller must hold `self.command` and must not hold `self.state`:
+    /// libtpms calls back into the NV callbacks from this thread.
+    fn run_command(&self, cmd: &[u8]) -> Option<Vec<u8>> {
         let mut resp_ptr: *mut u8 = ptr::null_mut();
         let mut resp_size: u32 = 0;
-        let mut resp_bufsize: u32 = BUF_LEN as u32;
+        // A null buffer makes libtpms allocate one of its own size.
+        let mut resp_bufsize: u32 = 0;
+        // SAFETY: the three out-parameters point at live locals, `cmd`
+        // is a live slice of `cmd.len()` bytes, and the command lock
+        // makes this the only call in flight.
         let rc: TPM_RESULT = unsafe {
             TPMLIB_Process(
                 &mut resp_ptr,
                 &mut resp_size,
                 &mut resp_bufsize,
-                cmd_bytes.as_ptr(),
-                cmd_bytes.len() as u32,
+                cmd.as_ptr(),
+                cmd.len() as u32,
             )
         };
 
-        let mut state = self.state.lock().unwrap();
-        if rc == TPM_SUCCESS && !resp_ptr.is_null() {
-            let n = (resp_size as usize).min(BUF_LEN);
-            let resp_slice = unsafe { std::slice::from_raw_parts(resp_ptr, n) };
-            state.buffer[..n].copy_from_slice(resp_slice);
-            unsafe { tpmlib_free(resp_ptr as *mut _) };
-        } else {
-            warn!(self.log, "TPMLIB_Process error";
-                "rc" => format!("{:#x}", rc),
-                "cmd_size" => cmd_bytes.len()
-            );
-            // Synthesize a minimal failure response so the guest sees
-            // a well-formed TPM2 reply rather than a hang. Tag 8001,
-            // size 0x0A, response code = 0x101 (TPM_RC_FAILURE).
-            state.buffer[..10].copy_from_slice(&[
-                0x80, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x01, 0x01,
-            ]);
-            // Free libtpms's buffer if it was allocated despite the error.
-            if !resp_ptr.is_null() {
-                unsafe { tpmlib_free(resp_ptr as *mut _) };
-            }
+        let response = self.take_response(rc, resp_ptr, resp_size, cmd.len());
+        if !resp_ptr.is_null() {
+            // SAFETY: libtpms allocated this buffer with libc malloc and
+            // hands us ownership; `response` already copied out of it.
+            unsafe { tpmlib_free(resp_ptr.cast()) };
         }
+        response
+    }
 
-        // Clear START — guest polls this to detect completion.
-        state.ctrl_start &= !CTRL_START_INVOKE;
+    fn take_response(
+        &self,
+        rc: TPM_RESULT,
+        resp_ptr: *const u8,
+        resp_size: u32,
+        cmd_len: usize,
+    ) -> Option<Vec<u8>> {
+        if rc != TPM_SUCCESS || resp_ptr.is_null() {
+            warn!(self.log, "TPMLIB_Process error";
+                "rc" => format!("{rc:#x}"), "cmd_size" => cmd_len);
+            return None;
+        }
+        let n = resp_size as usize;
+        if n > BUF_LEN {
+            // Cannot happen while the negotiated buffer size holds, and
+            // a truncated frame would leave the guest reading a length
+            // the buffer does not contain.
+            warn!(self.log, "libtpms response exceeds the CRB buffer";
+                "resp_size" => n, "buffer" => BUF_LEN);
+            return None;
+        }
+        // SAFETY: libtpms reports `resp_size` valid bytes at `resp_ptr`,
+        // and the copy ends before this function returns.
+        Some(unsafe { std::slice::from_raw_parts(resp_ptr, n) }.to_vec())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    //! End-to-end CRB driver simulation.
-    //!
-    //! These tests instantiate the full vTPM (CRB frontend + libtpms
-    //! backend) and drive it with the same register sequence the
-    //! Linux `tpm_crb` driver uses. They verify our device behaves
-    //! correctly under realistic access patterns even when no actual
-    //! guest is running.
-    //!
-    //! Tests link libtpms (via vmm_tpm_sys), so they only run on
-    //! hosts where `cargo build` for that crate succeeds (illumos
-    //! with autotools + OpenSSL pkgsrc). On macOS dev hosts these
-    //! tests will fail to *build*; that is expected.
+    //! CRB driver simulation, driven through the MMIO entry points with
+    //! the register sequence the Linux `tpm_crb` driver uses.
     use super::*;
     use slog::Drain;
 
@@ -532,27 +543,47 @@ mod tests {
         assert_eq!(read_reg(&crb, REG_LOC_STS) & LOC_STS_GRANTED, 0);
     }
 
-    /// Drive a TPM2_GetRandom through the CRB the way `tpm_crb` does
-    /// in Linux: acquire locality, clear idle, copy command into the
-    /// shared buffer, write START, poll START until cleared, read
-    /// response. Validates the entire dispatch loop end-to-end.
+    /// TPM2_Startup(TPM_SU_CLEAR), which a TPM needs once after
+    /// power-on. Header: tag=8001 size=0000000C cc=00000144.
+    const STARTUP: [u8; 12] = [
+        0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x44, 0x00, 0x00,
+    ];
+    /// TPM2_GetRandom(8). Header: tag=8001 size=0000000C cc=0000017B.
+    const GET_RANDOM_8: [u8; 12] = [
+        0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x7B, 0x00, 0x08,
+    ];
+    /// `RC_VER1 + 0x042` from the TPM 2 reference code.
+    const TPM_RC_COMMAND_SIZE: u32 = 0x142;
+
+    /// Response code from a reply sitting in the CRB buffer.
+    fn response_code(crb: &Crb) -> u32 {
+        let resp = read_buffer(crb, 10);
+        u32::from_be_bytes([resp[6], resp[7], resp[8], resp[9]])
+    }
+
+    /// Submit the bytes now in the buffer and wait for the reply.
     ///
-    /// Requires libtpms to be initialized via `crate::Tpm::new`,
-    /// which means it only runs on hosts where the vmm_tpm_sys build
-    /// can produce libtpms.a (illumos build host / headnode).
+    /// The command runs inside the START write, so INVOKE is already
+    /// clear when the write returns.
+    fn submit(crb: &Crb) {
+        write_reg(crb, REG_CTRL_START, CTRL_START_INVOKE);
+        assert_eq!(
+            read_reg(crb, REG_CTRL_START) & CTRL_START_INVOKE,
+            0,
+            "START still latched after the write returned",
+        );
+    }
+
+    /// Every libtpms-backed case shares one test: `Tpm::new` installs a
+    /// process-global callback table and libtpms keeps one TPM per
+    /// process, so it can run only once per test binary.
     #[test]
-    fn crb_kernel_driver_style_get_random_round_trip() {
-        // Use a unique state directory per run so we always hit the
-        // first-boot manufacturing path, irrespective of leftover
-        // state from earlier test runs.
+    fn crb_command_path_under_a_kernel_style_driver() {
+        // A fresh state directory per run, so this always takes the
+        // first-boot manufacturing path.
         let dir = std::env::temp_dir()
-            .join(format!("vmm-tpm-crbtest-{}", std::process::id(),));
+            .join(format!("vmm-tpm-crbtest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // A failure here used to return quietly, so this test reported
-        // green whether or not libtpms worked. It is the only caller of
-        // `Tpm::new` in this binary, so the process-global callbacks
-        // table it sets cannot already be taken, and there is nothing
-        // left for a failure to mean but a broken build.
         let tpm = match crate::Tpm::new(dir.clone(), null_logger()) {
             Ok(t) => t,
             Err(e) => {
@@ -561,59 +592,122 @@ mod tests {
             }
         };
 
-        let crb = &tpm.crb;
+        libtpms_took_the_crb_buffer_size();
+        power_on(&tpm.crb);
+        get_random_returns_eight_random_bytes(&tpm.crb);
+        a_start_while_a_command_runs_is_ignored(&tpm.crb);
+        an_oversize_command_header_is_refused(&tpm.crb);
+        concurrent_starts_leave_the_tpm_working(&tpm.crb);
 
-        // 1. Acquire locality 0.
+        drop(tpm);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `MAX_COMMAND_SIZE` and `MAX_RESPONSE_SIZE` inside libtpms follow
+    /// this value. Left at the library default of 4096 it would build
+    /// responses the CRB buffer cannot hold.
+    fn libtpms_took_the_crb_buffer_size() {
+        // SAFETY: a zero request only reports the current value.
+        let negotiated = unsafe {
+            vmm_tpm_sys::TPMLIB_SetBufferSize(
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(negotiated as usize, BUF_LEN, "negotiated buffer size");
+    }
+
+    /// Acquire locality 0, clear tpmIdle and start the TPM, the way the
+    /// Linux `tpm_crb` driver does.
+    fn power_on(crb: &Crb) {
         write_reg(crb, REG_LOC_CTRL, LOC_CTRL_REQ_ACCESS);
         assert_ne!(read_reg(crb, REG_LOC_STS) & LOC_STS_GRANTED, 0);
-
-        // 2. Clear tpmIdle so we can submit commands.
         write_reg(crb, REG_CTRL_REQ, CTRL_REQ_CMD_READY);
 
-        // 3. TPM2_Startup(TPM_SU_CLEAR) — every TPM needs this once
-        //    after power-on. 12 bytes:
-        //       tag=8001  size=0000000C  cc=00000144  startup=0000
-        let startup: [u8; 12] = [
-            0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x44, 0x00,
-            0x00,
-        ];
-        write_buffer(crb, &startup);
-        write_reg(crb, REG_CTRL_START, CTRL_START_INVOKE);
-        // Command runs synchronously inside the START write handler;
-        // the bit clears before the call returns.
-        assert_eq!(read_reg(crb, REG_CTRL_START) & CTRL_START_INVOKE, 0);
-        let resp = read_buffer(crb, 10);
-        let rc = u32::from_be_bytes([resp[6], resp[7], resp[8], resp[9]]);
+        write_buffer(crb, &STARTUP);
+        submit(crb);
+        let rc = response_code(crb);
         assert_eq!(rc, 0, "TPM2_Startup rc: {rc:#x}");
+    }
 
-        // 4. TPM2_GetRandom(8) — request 8 random bytes.
-        let cmd: [u8; 12] = [
-            0x80, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x01, 0x7B, 0x00,
-            0x08,
-        ];
-        write_buffer(crb, &cmd);
-        write_reg(crb, REG_CTRL_START, CTRL_START_INVOKE);
-        assert_eq!(read_reg(crb, REG_CTRL_START) & CTRL_START_INVOKE, 0);
+    fn get_random_returns_eight_random_bytes(crb: &Crb) {
+        write_buffer(crb, &GET_RANDOM_8);
+        submit(crb);
 
-        // Response framing:
-        //   tag(2) size(4) rc(4) randomSize(2) random(8) = 20 bytes
+        // tag(2) size(4) rc(4) randomSize(2) random(8) = 20 bytes.
         let resp = read_buffer(crb, 20);
         assert_eq!(&resp[0..2], &[0x80, 0x01], "tag");
         let size = u32::from_be_bytes([resp[2], resp[3], resp[4], resp[5]]);
         assert_eq!(size, 20, "frame size");
         let rc = u32::from_be_bytes([resp[6], resp[7], resp[8], resp[9]]);
         assert_eq!(rc, 0, "GetRandom rc: {rc:#x}");
-        let random_size = u16::from_be_bytes([resp[10], resp[11]]);
-        assert_eq!(random_size, 8, "randomSize echo");
-        // Sanity: the 8 random bytes should not all be zero.
+        assert_eq!(u16::from_be_bytes([resp[10], resp[11]]), 8, "randomSize");
         let random = &resp[12..20];
-        assert!(
-            random.iter().any(|&b| b != 0),
-            "random bytes all zero: {random:?}",
+        assert!(random.iter().any(|&b| b != 0), "all zero: {random:?}");
+    }
+
+    /// libtpms has no locking, so a second command must not start while
+    /// one is in flight. A latched INVOKE is what marks that.
+    fn a_start_while_a_command_runs_is_ignored(crb: &Crb) {
+        write_buffer(crb, &GET_RANDOM_8);
+        // Stand in for another vCPU inside TPMLIB_Process.
+        crb.state().ctrl_start |= CTRL_START_INVOKE;
+
+        write_reg(crb, REG_CTRL_START, CTRL_START_INVOKE);
+
+        assert_eq!(
+            read_buffer(crb, GET_RANDOM_8.len()),
+            GET_RANDOM_8,
+            "the command was replaced by a response, so it ran twice",
+        );
+        assert_ne!(
+            read_reg(crb, REG_CTRL_START) & CTRL_START_INVOKE,
+            0,
+            "INVOKE cleared under the command that still holds it",
         );
 
-        // Cleanup: drop the per-test state dir.
-        drop(tpm);
-        let _ = std::fs::remove_dir_all(&dir);
+        crb.state().ctrl_start &= !CTRL_START_INVOKE;
+        submit(crb);
+        let rc = response_code(crb);
+        assert_eq!(rc, 0, "the same command after the latch cleared: {rc:#x}");
+    }
+
+    /// A commandSize header past the buffer reaches libtpms as a short
+    /// command, which the library itself answers.
+    fn an_oversize_command_header_is_refused(crb: &Crb) {
+        let mut cmd = GET_RANDOM_8;
+        cmd[2..6].copy_from_slice(&0x4000u32.to_be_bytes());
+        write_buffer(crb, &cmd);
+        submit(crb);
+
+        let rc = response_code(crb);
+        assert_eq!(rc, TPM_RC_COMMAND_SIZE, "oversize command rc: {rc:#x}");
+    }
+
+    /// Four threads writing START is what two vCPUs do. Before the
+    /// command lock this raced libtpms' global TPM state; a TPM left in
+    /// failure mode answers every later command with a non-zero code.
+    fn concurrent_starts_leave_the_tpm_working(crb: &Crb) {
+        write_buffer(crb, &GET_RANDOM_8);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..25 {
+                        write_reg(crb, REG_CTRL_START, CTRL_START_INVOKE);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            read_reg(crb, REG_CTRL_START) & CTRL_START_INVOKE,
+            0,
+            "INVOKE left latched, so the guest would wait forever",
+        );
+        write_buffer(crb, &GET_RANDOM_8);
+        submit(crb);
+        let rc = response_code(crb);
+        assert_eq!(rc, 0, "TPM stopped answering after the races: {rc:#x}");
     }
 }

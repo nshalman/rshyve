@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Virtual TPM 2.0 device for vmmnew.
+//! Virtual TPM 2.0 device.
 //!
 //! Backend: vendored libtpms (TCG-compliant TPM 2.0 emulator) running
 //! in-process via the `vmm_tpm_sys` FFI.
@@ -13,6 +13,18 @@
 //! parses the TPM2 ACPI table, finds the Control Area, drives the
 //! CRB, and gets responses backed by libtpms with NV state persisted
 //! to a per-VM directory on the host filesystem.
+//!
+//! # libtpms is not thread-safe
+//!
+//! libtpms holds the whole TPM in C globals (the TCG reference code's
+//! `g_*`/`s_*` state and the NV image) and takes no locks. Two threads
+//! in `TPMLIB_Process` would corrupt that state and race the NV files.
+//! It is also a single instance per process, so there is one [`Tpm`] per
+//! process and one VM per process.
+//!
+//! [`Crb`] is the only caller, and it serialises commands on its own
+//! mutex; a guest drives it from any vCPU. Anything else that calls
+//! into libtpms later must hold that same lock.
 
 pub mod acpi;
 mod callbacks;
@@ -27,8 +39,11 @@ pub use crate::acpi::build_tpm2_table;
 pub use crate::crb::{Crb, CRB_BASE, CRB_REGION_LEN};
 
 use vmm_tpm_sys::{
-    TPMLIB_ChooseTPMVersion, TPMLIB_MainInit, TPMLIB_TPMVersion, TPM_SUCCESS,
+    TPMLIB_ChooseTPMVersion, TPMLIB_MainInit, TPMLIB_SetBufferSize,
+    TPMLIB_TPMVersion, TPM_SUCCESS,
 };
+
+use crate::crb::BUF_LEN;
 
 /// Top-level TPM device. Owns the CRB frontend; libtpms backend is
 /// initialized once at construction time (process-global state).
@@ -46,17 +61,41 @@ impl Tpm {
         callbacks::register(state_dir.clone(), log.clone())
             .map_err(TpmError::CallbackInit)?;
 
+        // SAFETY: libtpms takes no arguments here and this is the only
+        // caller in the process. Order is fixed by the library: choose
+        // the version, size the buffers, then initialise.
         let rc = unsafe {
             TPMLIB_ChooseTPMVersion(TPMLIB_TPMVersion::TPMLIB_TPM_VERSION_2)
         };
         if rc != TPM_SUCCESS {
             return Err(TpmError::Libtpms("ChooseTPMVersion", rc));
         }
+
+        // Without this the library keeps its 4096-byte default, larger
+        // than the CRB buffer, and would build responses that do not
+        // fit. Telling it the real size makes it enforce the limit.
+        let wanted = u32::try_from(BUF_LEN).expect("CRB buffer fits in u32");
+        // SAFETY: both out-parameters point at live locals.
+        let mut min = 0u32;
+        let mut max = 0u32;
+        let negotiated =
+            unsafe { TPMLIB_SetBufferSize(wanted, &mut min, &mut max) };
+        if negotiated != wanted {
+            return Err(TpmError::BufferSize {
+                wanted,
+                negotiated,
+                min,
+                max,
+            });
+        }
+
+        // SAFETY: the callbacks are registered and the version chosen.
         let rc = unsafe { TPMLIB_MainInit() };
         if rc != TPM_SUCCESS {
             return Err(TpmError::Libtpms("MainInit", rc));
         }
-        info!(log, "vTPM 2.0 ready"; "state_dir" => %state_dir.display());
+        info!(log, "vTPM 2.0 ready";
+            "state_dir" => %state_dir.display(), "buffer" => negotiated);
 
         Ok(Self {
             crb: Arc::new(Crb::new(log)),
@@ -70,4 +109,14 @@ pub enum TpmError {
     CallbackInit(#[source] std::io::Error),
     #[error("libtpms {0} returned rc={1:#x}")]
     Libtpms(&'static str, u32),
+    #[error(
+        "libtpms would not take a {wanted}-byte buffer: got {negotiated}, \
+         limits {min}..={max}"
+    )]
+    BufferSize {
+        wanted: u32,
+        negotiated: u32,
+        min: u32,
+        max: u32,
+    },
 }

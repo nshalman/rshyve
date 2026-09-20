@@ -10,7 +10,6 @@
 
 use std::io::{Error, ErrorKind, Result};
 
-#[cfg(target_os = "illumos")]
 mod sys;
 
 /// Bytes in an Ethernet address.
