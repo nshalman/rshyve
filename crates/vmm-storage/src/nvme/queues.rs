@@ -4,14 +4,20 @@
 
 //! Queue state and completion posting.
 
+use std::io;
+
 use vmm_core::mem::MemCtx;
 use vmm_devices::pci::msix::MsixTable;
 
 use super::bits::*;
 
-// ---------------------------------------------------------------------------
-// Queue structures
-// ---------------------------------------------------------------------------
+/// One queue as the driver created it.
+///
+/// A queue slot is reused as soon as the driver deletes and recreates
+/// it, so work in flight names the instance it was submitted against.
+/// A completion whose instance is gone belongs to a queue the driver
+/// has already freed.
+pub(super) type QueueInstance = u64;
 
 pub(super) struct SubQueue {
     /// Guest physical address of the queue base.
@@ -24,6 +30,7 @@ pub(super) struct SubQueue {
     pub(super) tail: u16,
     /// Associated completion queue ID.
     pub(super) cq_id: u16,
+    pub(super) instance: QueueInstance,
 }
 
 pub(super) struct CompQueue {
@@ -39,6 +46,9 @@ pub(super) struct CompQueue {
     pub(super) phase: bool,
     /// MSI-X interrupt vector for this CQ.
     pub(super) iv: u16,
+    /// Whether the driver asked for an interrupt on this CQ.
+    pub(super) ien: bool,
+    pub(super) instance: QueueInstance,
 }
 
 pub(super) fn io_queue_index(qid: u16) -> Option<usize> {
@@ -71,6 +81,35 @@ pub(super) struct NvmeState {
 
     // Configuration
     pub(super) num_io_queues: u16,
+
+    /// Source of [`QueueInstance`] values. Never reset, so an instance
+    /// is unique for the life of the controller.
+    pub(super) instances: QueueInstance,
+}
+
+impl NvmeState {
+    /// Take the queues away from the driver and from anything in
+    /// flight against them.
+    pub(super) fn retire_queues(&mut self) {
+        self.admin_sq = None;
+        self.admin_cq = None;
+        for sq in &mut self.io_sqs {
+            *sq = None;
+        }
+        for cq in &mut self.io_cqs {
+            *cq = None;
+        }
+    }
+
+    pub(super) fn next_instance(&mut self) -> QueueInstance {
+        self.instances += 1;
+        self.instances
+    }
+
+    pub(super) fn set_shst(&mut self, shst: u32) {
+        self.csts = (self.csts & !(CSTS_SHST_MASK << CSTS_SHST_SHIFT))
+            | (shst << CSTS_SHST_SHIFT);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +117,9 @@ pub(super) struct NvmeState {
 // ---------------------------------------------------------------------------
 
 /// Post a completion queue entry to guest memory and fire MSI-X.
+///
+/// An error means the CQE could not be written, which loses the
+/// completion: the caller reports a fatal controller status.
 pub(super) fn post_completion(
     mem: &MemCtx,
     msix: &MsixTable,
@@ -87,10 +129,10 @@ pub(super) fn post_completion(
     sq_head: u16,
     cid: u16,
     status: u16,
-) {
+) -> io::Result<()> {
     let cq = match cq_opt.as_mut() {
         Some(cq) => cq,
-        None => return,
+        None => return Ok(()),
     };
 
     // Check if CQ is full: (tail + 1) % size == head
@@ -101,11 +143,16 @@ pub(super) fn post_completion(
     };
     if next_tail == cq.head {
         // CQ full -- drop the completion (guest must drain the queue)
-        return;
+        return Ok(());
     }
 
     let cqe_offset = u64::from(cq.tail) * CQE_SIZE as u64;
-    let cqe_gpa = cq.base + cqe_offset;
+    let Some(cqe_gpa) = cq.base.checked_add(cqe_offset) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CQ base wraps",
+        ));
+    };
 
     // Build CQE (16 bytes)
     let mut cqe = [0u8; CQE_SIZE];
@@ -126,24 +173,26 @@ pub(super) fn post_completion(
     cqe[CQE_STATUS..CQE_STATUS + 2]
         .copy_from_slice(&status_with_phase.to_le_bytes());
 
-    // Write CQE to guest memory
-    let _ = mem.write(cqe_gpa, &cqe);
+    mem.write(cqe_gpa, &cqe)?;
 
     // Advance CQ tail and toggle phase on wrap
-    let iv = cq.iv;
+    let (iv, ien) = (cq.iv, cq.ien);
     cq.tail += 1;
     if cq.tail >= cq.size {
         cq.tail = 0;
         cq.phase = !cq.phase;
     }
 
-    // Fire MSI-X interrupt
-    msix.fire(iv);
+    if ien {
+        msix.fire(iv);
+    }
+    Ok(())
 }
 
-/// Whether a guest-supplied queue base may be used: page-aligned and
-/// non-zero. A malicious guest could otherwise point a queue at the
-/// MMIO region of another device.
+/// Whether a guest-supplied queue base may be used.
+///
+/// Queues are contiguous (CAP.CQR is set), so the base must be page
+/// aligned. Zero is never a queue.
 pub(super) fn valid_queue_base(prp1: u64) -> bool {
     prp1 != 0 && (prp1 & 0xFFF) == 0
 }
@@ -165,6 +214,7 @@ impl Default for NvmeState {
             ctrl_ident: [0u8; IDENT_CTRL_SIZE],
             ns_ident: [0u8; IDENT_NS_SIZE],
             num_io_queues: MAX_IO_QUEUES as u16,
+            instances: 0,
         }
     }
 }

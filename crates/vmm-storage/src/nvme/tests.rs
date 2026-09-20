@@ -96,6 +96,26 @@ impl TestBackend {
             .store(delay.as_micros() as u64, Ordering::Relaxed);
     }
 
+    /// Stop every transfer inside the backend until [`Self::release`].
+    fn hold(&self) {
+        self.state.lock().expect("backend lock").held = true;
+    }
+
+    fn release(&self) {
+        let mut st = self.state.lock().expect("backend lock");
+        st.held = false;
+        self.cv.notify_all();
+    }
+
+    /// Transfers that have entered the backend, ever.
+    fn started(&self) -> usize {
+        self.state.lock().expect("backend lock").started
+    }
+
+    fn in_flight(&self) -> usize {
+        self.state.lock().expect("backend lock").in_flight
+    }
+
     /// Block until `n` transfers are inside the backend.
     fn wait_in_flight(&self, n: usize) {
         let mut st = self.state.lock().expect("backend lock");
@@ -264,7 +284,13 @@ impl Harness {
 
     /// Program the admin queues and set CC.EN with the entry sizes a
     /// real driver writes.
-    fn enable(&self) {
+    ///
+    /// The controller builds fresh admin queues, so the harness starts
+    /// its own head, tail and phase over too.
+    fn enable(&mut self) {
+        self.admin_tail = 0;
+        self.admin_cq_head = 0;
+        self.admin_phase = true;
         self.reg_write32(
             REG_AQA,
             u32::from(ADMIN_QDEPTH - 1) | (u32::from(ADMIN_QDEPTH - 1) << 16),
@@ -352,9 +378,6 @@ impl Harness {
         self.sink.0.lock().expect("sink lock").len()
     }
 }
-
-const CQ_PC: u32 = 1;
-const CQ_IEN: u32 = 1 << 1;
 
 #[derive(Default, Clone, Copy)]
 struct Sqe {
@@ -524,7 +547,7 @@ fn admin_cq_wraps_and_flips_phase() {
 
 #[test]
 fn admin_doorbell_beyond_queue_size_is_ignored() {
-    let h = Harness::new();
+    let mut h = Harness::new();
     h.enable();
     let entry = ASQ;
     let sqe = Sqe {
@@ -804,6 +827,115 @@ fn pause_quiesces_the_workers_under_steady_guest_io() {
     assert!(quiesced, "pause did not quiesce the workers under load");
 }
 
+/// Release the backend once a reset reaches its drain.
+///
+/// The reset blocks on the vCPU thread that wrote the register, so the
+/// transfer it is waiting for has to be let go from somewhere else.
+/// Returns whether a drain ever started.
+fn release_on_drain(
+    gate: Arc<QuiesceGate>,
+    backend: Arc<TestBackend>,
+) -> std::thread::JoinHandle<bool> {
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        let mut drained = false;
+        while start.elapsed() < WAIT {
+            if gate.drain_count() > 0 {
+                drained = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        backend.release();
+        drained
+    })
+}
+
+#[test]
+fn a_reset_waits_for_the_transfer_it_interrupts() {
+    let (mut h, backend) = Harness::held();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    backend.hold();
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::read(8, 8, 0x50000, 0x52000), 0x77);
+    backend.wait_in_flight(1);
+
+    let releaser =
+        release_on_drain(Arc::clone(&h.ctrl.gate), Arc::clone(&backend));
+    h.reg_write32(REG_CC, 0);
+    let quiet = backend.in_flight();
+    let drained = releaser.join().expect("releaser");
+
+    assert!(drained, "the reset did not drain the workers");
+    assert_eq!(quiet, 0, "CC.EN cleared with a transfer still in flight");
+    assert_eq!(h.csts() & CSTS_RDY, 0);
+    assert_eq!(backend.started(), 1);
+    // The interrupted command never completes: its queues are gone.
+    assert_eq!(h.read_guest(CQ1, CQE_SIZE), vec![0u8; CQE_SIZE]);
+}
+
+#[test]
+fn a_reset_drops_queued_io_instead_of_completing_it_into_new_queues() {
+    let (mut h, backend) = Harness::held();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    // Park the workers so the command stays in the channel across the
+    // reset, the way a busy controller leaves work behind.
+    h.ctrl.pause();
+    assert!(h.ctrl.gate.wait_quiesced(WAIT), "workers did not park");
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::read(8, 8, 0x50000, 0x52000), 0x99);
+
+    h.reg_write32(REG_CC, 0);
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    h.ctrl.resume();
+
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::read(0, 1, 0x50000, 0), 0x21);
+    let cqe = h.wait_cqe(CQ1, 0, true);
+    assert_eq!(cqe.cid, 0x21, "a command from before the reset completed");
+    assert_eq!(cqe.status(), Status::SUCCESS);
+    assert_eq!(backend.started(), 1, "the dropped command still ran");
+}
+
+#[test]
+fn deleting_and_recreating_an_io_queue_drops_the_old_commands() {
+    let (mut h, backend) = Harness::held();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    h.ctrl.pause();
+    assert!(h.ctrl.gate.wait_quiesced(WAIT), "workers did not park");
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::read(8, 8, 0x50000, 0x52000), 0x99);
+
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_DELETE_IO_SQ,
+        cdw10: 1,
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::SUCCESS, "delete SQ");
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_CREATE_IO_SQ,
+        prp1: SQ1,
+        cdw10: 1 | (u32::from(IO_QDEPTH - 1) << 16),
+        cdw11: (1 << 16) | CQ_PC,
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::SUCCESS, "recreate SQ");
+    h.ctrl.resume();
+
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::read(0, 1, 0x50000, 0), 0x21);
+    let cqe = h.wait_cqe(CQ1, 0, true);
+    assert_eq!(cqe.cid, 0x21, "a command from the deleted queue completed");
+    assert_eq!(backend.started(), 1, "the dropped command still ran");
+}
+
 #[test]
 fn halt_joins_the_io_workers() {
     let (h, backend) = Harness::held();
@@ -877,20 +1009,41 @@ fn status_code_encoding() {
 }
 
 #[test]
-fn create_io_sq_with_cq_id_zero_is_rejected() {
-    let mut state = NvmeState::default();
-    let qid = 1u32;
-    let qsize = 1u32 << 16;
-    let cq_id = 0u32 << 16;
+fn create_io_sq_naming_the_admin_cq_is_rejected() {
+    let mut h = Harness::new();
+    h.enable();
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_CREATE_IO_SQ,
+        prp1: SQ1,
+        cdw10: 1 | (u32::from(IO_QDEPTH - 1) << 16),
+        cdw11: CQ_PC,
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::of(SC_CQ_INVALID | SC_DNR));
+}
 
-    let status = NvmeController::admin_create_io_sq(
-        &mut state,
-        0x1000,
-        qid | qsize,
-        cq_id,
-    );
-
-    assert_eq!(status, (SC_CQ_INVALID | SC_DNR, 0));
+#[test]
+fn create_io_queue_larger_than_the_controller_allows_is_rejected() {
+    let mut h = Harness::new();
+    h.enable();
+    // 0-based, so this asks for 65536 entries.
+    let cdw10 = 1 | (u32::from(u16::MAX) << 16);
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_CREATE_IO_CQ,
+        prp1: CQ1,
+        cdw10,
+        cdw11: CQ_IEN | CQ_PC,
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::of(SC_INVALID_QUEUE_SIZE | SC_DNR));
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_CREATE_IO_SQ,
+        prp1: SQ1,
+        cdw10,
+        cdw11: 1 << 16 | CQ_PC,
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::of(SC_INVALID_QUEUE_SIZE | SC_DNR));
 }
 
 #[test]
@@ -910,27 +1063,5 @@ fn num_queues_max_request_stays_nonzero() {
     assert_eq!(
         NvmeController::admin_get_features(&state, u32::from(FEAT_NUM_QUEUES),),
         set_result
-    );
-}
-
-#[test]
-fn create_io_queues_reject_max_qsize_without_overflow() {
-    let cdw10 = 1 | (u32::from(u16::MAX) << 16);
-
-    let mut cq_state = NvmeState::default();
-    assert_eq!(
-        NvmeController::admin_create_io_cq(&mut cq_state, 0x1000, cdw10, 0,),
-        (SC_INVALID_QUEUE_SIZE | SC_DNR, 0)
-    );
-
-    let mut sq_state = NvmeState::default();
-    assert_eq!(
-        NvmeController::admin_create_io_sq(
-            &mut sq_state,
-            0x1000,
-            cdw10,
-            1 << 16,
-        ),
-        (SC_INVALID_QUEUE_SIZE | SC_DNR, 0)
     );
 }

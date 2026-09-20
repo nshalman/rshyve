@@ -12,7 +12,7 @@ use vmm_core::mem::{GuestIoVec, MemCtx};
 
 use super::bits::*;
 use super::prp::prp_to_iovec;
-use super::queues::io_queue_index;
+use super::queues::{io_queue_index, NvmeState, QueueInstance};
 use super::{Geometry, NvmeController};
 
 /// The store a namespace is backed by.
@@ -50,6 +50,11 @@ pub(super) struct IoRequest {
     pub(super) sqid: u16,
     pub(super) cid: u16,
     pub(super) cq_id: u16,
+    /// The queue instances this command was submitted against. A
+    /// request whose instances are gone names pages and a CQ slot the
+    /// driver has taken back.
+    pub(super) sq_instance: QueueInstance,
+    pub(super) cq_instance: QueueInstance,
     /// Force Unit Access. Identify advertises VWC=1, so a FUA write
     /// must reach stable storage before its completion.
     pub(super) fua: bool,
@@ -64,13 +69,22 @@ impl NvmeController {
         let Some(idx) = io_queue_index(qid) else {
             return;
         };
-
-        let sq = match &mut st.io_sqs[idx] {
-            Some(sq) => sq,
-            None => return,
+        let Some((cq_id, sq_instance)) =
+            st.io_sqs[idx].as_ref().map(|sq| (sq.cq_id, sq.instance))
+        else {
+            return;
+        };
+        // Nothing submitted here can complete without its CQ.
+        let Some(cq_instance) = io_queue_index(cq_id)
+            .and_then(|cq_idx| st.io_cqs[cq_idx].as_ref())
+            .map(|cq| cq.instance)
+        else {
+            return;
         };
 
-        let cq_id = sq.cq_id;
+        let Some(sq) = st.io_sqs[idx].as_mut() else {
+            return;
+        };
         if new_tail >= sq.size {
             return;
         }
@@ -81,10 +95,12 @@ impl NvmeController {
 
         while sq.head != sq.tail {
             let sqe_offset = u64::from(sq.head) * SQE_SIZE as u64;
-            let sqe_gpa = sq.base + sqe_offset;
-
             let mut sqe_buf = [0u8; SQE_SIZE];
-            if mem.read(sqe_gpa, &mut sqe_buf).is_err() {
+            let fetched = match sq.base.checked_add(sqe_offset) {
+                Some(gpa) => mem.read(gpa, &mut sqe_buf).is_ok(),
+                None => false,
+            };
+            if !fetched {
                 sq.head = (sq.head + 1) % sq.size;
                 continue;
             }
@@ -135,6 +151,8 @@ impl NvmeController {
                 sqid: qid,
                 cid,
                 cq_id,
+                sq_instance,
+                cq_instance,
                 fua,
             });
         }
@@ -142,16 +160,35 @@ impl NvmeController {
         // Drop the state lock before sending to channel
         drop(st);
 
-        // Send requests to worker threads
         let tx_guard = self.io_tx.lock().expect("nvme: io_tx lock");
-        if let Some(tx) = tx_guard.as_ref() {
-            for req in requests {
-                // If the channel is disconnected, the workers have exited.
-                // Silently drop the request.
-                let _ = tx.send(req);
+        let Some(tx) = tx_guard.as_ref() else {
+            slog::warn!(self.log, "nvme: I/O dropped, the workers are gone";
+                "count" => requests.len());
+            return;
+        };
+        for req in requests {
+            if let Err(error) = tx.send(req) {
+                slog::warn!(self.log, "nvme: I/O dropped, the workers are gone";
+                    "cid" => error.0.cid);
             }
         }
     }
+}
+
+/// Whether the queues a request named are still the ones the driver
+/// has.
+///
+/// A request that outlived its queue must not touch guest memory or
+/// post a completion: those pages and that CQ slot belong to whatever
+/// the driver put there next.
+pub(super) fn queues_current(st: &NvmeState, req: &IoRequest) -> bool {
+    let sq_live = io_queue_index(req.sqid)
+        .and_then(|idx| st.io_sqs[idx].as_ref())
+        .is_some_and(|sq| sq.instance == req.sq_instance);
+    let cq_live = io_queue_index(req.cq_id)
+        .and_then(|idx| st.io_cqs[idx].as_ref())
+        .is_some_and(|cq| cq.instance == req.cq_instance);
+    sq_live && cq_live
 }
 
 /// Execute a single I/O request (Read, Write, or Flush).

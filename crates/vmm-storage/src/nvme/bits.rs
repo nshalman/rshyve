@@ -172,6 +172,13 @@ pub const CQE_SQID: usize = 10; // SQ Identifier (u16)
 pub const CQE_CID: usize = 12; // Command Identifier (u16)
 pub const CQE_STATUS: usize = 14; // Status Field (u16, includes phase bit)
 
+// ── Create I/O Queue command fields (CDW11) ────────────────────
+
+/// Physically Contiguous. Always set: CAP.CQR requires it.
+pub const CQ_PC: u32 = 1 << 0;
+/// Interrupts Enabled for this completion queue.
+pub const CQ_IEN: u32 = 1 << 1;
+
 // ── Queue limits ───────────────────────────────────────────────
 
 pub const MAX_IO_QUEUES: usize = 15;

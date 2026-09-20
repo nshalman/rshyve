@@ -27,6 +27,7 @@ use std::fs::File;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use vmm_core::common::RWOp;
 use vmm_core::hdl::VmmHdl;
@@ -52,6 +53,11 @@ use workers::io_worker;
 
 /// Matches the C bhyve blockif thread count.
 const NUM_WORKERS: usize = 8;
+
+/// How long a reset waits for the transfers already moving guest
+/// memory. Past this the controller reports a fatal status: the driver
+/// is about to reuse pages a worker still holds.
+const WORKER_FENCE_BUDGET: Duration = Duration::from_secs(5);
 
 /// MSI-X capability offset in PCI config space.
 const MSIX_CAP_OFFSET: u8 = 0x40;
@@ -233,6 +239,7 @@ impl NvmeController {
             ctrl_ident,
             ns_ident,
             num_io_queues: MAX_IO_QUEUES as u16,
+            instances: 0,
         };
 
         let (tx, rx) = mpsc::channel::<IoRequest>();
@@ -279,6 +286,20 @@ impl NvmeController {
         *ctrl.workers.lock().expect("nvme: workers lock") = workers;
 
         ctrl
+    }
+
+    /// Wait for the transfers that are already moving guest memory.
+    ///
+    /// Call with the state lock dropped: a worker needs it to post its
+    /// completion before it can park. Returns whether the workers
+    /// stopped inside the budget.
+    pub(super) fn fence_workers(&self) -> bool {
+        let _drain = self.gate.drain_scope();
+        if self.gate.wait_quiesced(WORKER_FENCE_BUDGET) {
+            return true;
+        }
+        slog::error!(self.log, "nvme: I/O workers did not stop for a reset");
+        false
     }
 
     /// Disconnect the I/O channel and wait for the workers.
@@ -554,6 +575,10 @@ impl Lifecycle for NvmeController {
         st.acq_base = mig.acq_base;
         st.num_io_queues = mig.num_io_queues.clamp(1, MAX_IO_QUEUES as u16);
 
+        // One fresh instance for every imported queue: nothing from
+        // before the import may complete into one.
+        let instance = st.next_instance();
+
         // Restore admin queues
         st.admin_sq = mig.admin_sq.as_ref().map(|sq| SubQueue {
             base: sq.base,
@@ -561,6 +586,7 @@ impl Lifecycle for NvmeController {
             head: sq.head,
             tail: sq.tail,
             cq_id: sq.cq_id,
+            instance,
         });
         st.admin_cq = mig.admin_cq.as_ref().map(|cq| CompQueue {
             base: cq.base,
@@ -569,6 +595,8 @@ impl Lifecycle for NvmeController {
             tail: cq.tail,
             phase: cq.phase,
             iv: cq.iv,
+            ien: true,
+            instance,
         });
 
         // Restore I/O queues
@@ -580,6 +608,7 @@ impl Lifecycle for NvmeController {
                     head: sq.head,
                     tail: sq.tail,
                     cq_id: sq.cq_id,
+                    instance,
                 });
             }
         }
@@ -592,6 +621,8 @@ impl Lifecycle for NvmeController {
                     tail: cq.tail,
                     phase: cq.phase,
                     iv: cq.iv,
+                    ien: true,
+                    instance,
                 });
             }
         }

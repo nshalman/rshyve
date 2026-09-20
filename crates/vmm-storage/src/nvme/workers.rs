@@ -10,7 +10,8 @@ use std::time::Duration;
 use vmm_core::mem::MemCtx;
 use vmm_devices::QuiesceGate;
 
-use super::io::{process_io_request, IoBackend, IoRequest};
+use super::bits::CSTS_CFS;
+use super::io::{process_io_request, queues_current, IoBackend, IoRequest};
 use super::queues::{io_queue_index, post_completion};
 use super::NvmeController;
 
@@ -59,6 +60,16 @@ pub(super) fn io_worker(
             return;
         };
 
+        // A reset or a Delete Queue between the submission and here
+        // took the pages back; the fence in those paths waits for
+        // whatever got past this check.
+        if !queues_current(&ctrl.state.lock().expect("nvme: state lock"), &req)
+        {
+            slog::debug!(ctrl.log, "nvme: dropped I/O for a retired queue";
+                "sqid" => req.sqid, "cid" => req.cid);
+            continue;
+        }
+
         let mem = MemCtx::new(Arc::clone(&ctrl.physmap));
         let status = process_io_request(
             &req,
@@ -68,27 +79,30 @@ pub(super) fn io_worker(
             ctrl.geometry,
         );
 
-        let sq_head = {
-            let st = ctrl.state.lock().expect("nvme: state lock");
-            if let Some(idx) = io_queue_index(req.sqid) {
-                st.io_sqs[idx].as_ref().map(|sq| sq.head).unwrap_or(0)
-            } else {
-                0
-            }
-        };
-
         let mut st = ctrl.state.lock().expect("nvme: state lock");
-        if let Some(cq_idx) = io_queue_index(req.cq_id) {
-            post_completion(
-                &mem,
-                &ctrl.msix,
-                &mut st.io_cqs[cq_idx],
-                0,
-                req.sqid,
-                sq_head,
-                req.cid,
-                status,
-            );
+        if !queues_current(&st, &req) {
+            continue;
+        }
+        let sq_head = io_queue_index(req.sqid)
+            .and_then(|idx| st.io_sqs[idx].as_ref())
+            .map_or(0, |sq| sq.head);
+        let Some(cq_idx) = io_queue_index(req.cq_id) else {
+            continue;
+        };
+        if let Err(error) = post_completion(
+            &mem,
+            &ctrl.msix,
+            &mut st.io_cqs[cq_idx],
+            0,
+            req.sqid,
+            sq_head,
+            req.cid,
+            status,
+        ) {
+            // The driver will never see this command finish.
+            slog::error!(ctrl.log, "nvme: I/O CQE write failed";
+                "error" => %error);
+            st.csts |= CSTS_CFS;
         }
     }
 }

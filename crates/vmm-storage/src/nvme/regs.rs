@@ -12,8 +12,10 @@ use vmm_core::mmio::MmioFn;
 use vmm_devices::pci::device::PciDevice;
 use vmm_devices::pci::BarN;
 
+use vmm_devices::{FlushIntent, Lifecycle};
+
 use super::bits::*;
-use super::queues::{io_queue_index, CompQueue, NvmeState, SubQueue};
+use super::queues::{io_queue_index, valid_queue_base, CompQueue, SubQueue};
 use super::NvmeController;
 
 // ---------------------------------------------------------------------------
@@ -79,11 +81,17 @@ impl NvmeController {
 
     /// Handle BAR0 MMIO access (controller registers and doorbells).
     pub(super) fn bar0_rw(&self, offset: usize, rwo: RWOp<'_>) {
-        if offset < REG_DOORBELL_BASE {
-            self.reg_rw(offset, rwo);
-        } else {
+        if offset >= REG_DOORBELL_BASE {
             self.doorbell_rw(offset, rwo);
+            return;
         }
+        // A CC transition fences the worker pool, which cannot happen
+        // under the state lock: a worker needs it to finish.
+        if let (REG_CC, RWOp::Write(wo)) = (offset, &rwo) {
+            self.write_cc(wo.read_u32());
+            return;
+        }
+        self.reg_rw(offset, rwo);
     }
 
     /// Handle controller register reads/writes (offsets 0x00..0x38).
@@ -134,11 +142,6 @@ impl NvmeController {
             RWOp::Write(wo) => {
                 let val32 = wo.read_u32();
                 match offset {
-                    REG_CC => {
-                        let old_cc = st.cc;
-                        st.cc = val32;
-                        self.handle_cc_write(&mut st, old_cc, val32);
-                    }
                     REG_AQA if (st.cc & CC_EN) == 0 => st.aqa = val32,
                     REG_ASQ if (st.cc & CC_EN) == 0 => {
                         if wo.len() == 8 {
@@ -171,53 +174,144 @@ impl NvmeController {
         }
     }
 
-    /// Handle CC register write transitions (enable/disable/shutdown).
-    fn handle_cc_write(&self, st: &mut NvmeState, old_cc: u32, new_cc: u32) {
+    /// Apply a CC write and whichever controller transition it asks for.
+    ///
+    /// Runs without the state lock held so a disable or a shutdown can
+    /// wait for the workers.
+    fn write_cc(&self, new_cc: u32) {
+        let old_cc = self.state.lock().expect("nvme: state lock").cc;
         let was_enabled = (old_cc & CC_EN) != 0;
         let now_enabled = (new_cc & CC_EN) != 0;
-
-        if !was_enabled && now_enabled {
-            // Controller enable: set up admin queues
-            let asqs = (st.aqa & AQA_ASQS_MASK) + 1;
-            let acqs = ((st.aqa >> AQA_ACQS_SHIFT) & AQA_ACQS_MASK) + 1;
-
-            st.admin_sq = Some(SubQueue {
-                base: st.asq_base,
-                size: asqs as u16,
-                head: 0,
-                tail: 0,
-                cq_id: 0,
-            });
-            st.admin_cq = Some(CompQueue {
-                base: st.acq_base,
-                size: acqs as u16,
-                head: 0,
-                tail: 0,
-                phase: true,
-                iv: 0,
-            });
-
-            st.csts |= CSTS_RDY;
-        } else if was_enabled && !now_enabled {
-            // Controller disable: tear down all queues
-            st.admin_sq = None;
-            st.admin_cq = None;
-            for sq in &mut st.io_sqs {
-                *sq = None;
-            }
-            for cq in &mut st.io_cqs {
-                *cq = None;
-            }
-            st.csts &= !CSTS_RDY;
-        }
-
-        // Handle shutdown notification
         let shn = (new_cc >> CC_SHN_SHIFT) & CC_SHN_MASK;
-        if shn != SHST_NORMAL {
-            // Acknowledge shutdown complete
-            st.csts = (st.csts & !(CSTS_SHST_MASK << CSTS_SHST_SHIFT))
-                | (SHST_COMPLETE << CSTS_SHST_SHIFT);
+        let old_shn = (old_cc >> CC_SHN_SHIFT) & CC_SHN_MASK;
+
+        if shn != SHST_NORMAL && old_shn == SHST_NORMAL {
+            self.shutdown(new_cc);
         }
+        if was_enabled && !now_enabled {
+            self.disable(new_cc);
+        } else if !was_enabled && now_enabled {
+            self.enable(new_cc);
+        } else {
+            self.state.lock().expect("nvme: state lock").cc = new_cc;
+        }
+    }
+
+    /// Bring the controller up, or refuse the configuration.
+    ///
+    /// A controller that cannot honour CC reports a fatal status
+    /// instead of RDY: fetching 64-byte SQEs from a queue the driver
+    /// sized for something else would read whatever follows it.
+    fn enable(&self, new_cc: u32) {
+        let mut st = self.state.lock().expect("nvme: state lock");
+        st.cc = new_cc;
+
+        let asqs = (st.aqa & AQA_ASQS_MASK) + 1;
+        let acqs = ((st.aqa >> AQA_ACQS_SHIFT) & AQA_ACQS_MASK) + 1;
+        let supported = (new_cc >> CC_IOSQES_SHIFT) & CC_IOSQES_MASK
+            == SQE_SIZE_LOG2
+            && (new_cc >> CC_IOCQES_SHIFT) & CC_IOCQES_MASK == CQE_SIZE_LOG2
+            && (new_cc >> CC_MPS_SHIFT) & CC_MPS_MASK == 0
+            && (new_cc >> CC_CSS_SHIFT) & CC_CSS_MASK == 0;
+        if !supported
+            || asqs < 2
+            || acqs < 2
+            || !self.queue_base_ok(st.asq_base, asqs, SQE_SIZE)
+            || !self.queue_base_ok(st.acq_base, acqs, CQE_SIZE)
+        {
+            slog::warn!(self.log, "nvme: refused CC.EN";
+                "cc" => format!("{new_cc:#x}"),
+                "aqa" => format!("{:#x}", st.aqa));
+            st.csts |= CSTS_CFS;
+            return;
+        }
+
+        let instance = st.next_instance();
+        st.admin_sq = Some(SubQueue {
+            base: st.asq_base,
+            size: asqs as u16,
+            head: 0,
+            tail: 0,
+            cq_id: ADMIN_QUEUE_ID,
+            instance,
+        });
+        let instance = st.next_instance();
+        st.admin_cq = Some(CompQueue {
+            base: st.acq_base,
+            size: acqs as u16,
+            head: 0,
+            tail: 0,
+            phase: true,
+            iv: 0,
+            ien: true,
+            instance,
+        });
+        st.csts &= !CSTS_CFS;
+        st.csts |= CSTS_RDY;
+    }
+
+    /// Take the controller down.
+    ///
+    /// The queues go first so nothing new is admitted, then the fence
+    /// waits for the transfers already moving guest memory: the driver
+    /// is free to reuse those pages once RDY clears.
+    fn disable(&self, new_cc: u32) {
+        self.state.lock().expect("nvme: state lock").retire_queues();
+        let fenced = self.fence_workers();
+
+        let mut st = self.state.lock().expect("nvme: state lock");
+        st.cc = new_cc;
+        st.csts &= !CSTS_RDY;
+        // A controller reset returns the shutdown status to normal.
+        st.set_shst(SHST_NORMAL);
+        if !fenced {
+            st.csts |= CSTS_CFS;
+        }
+    }
+
+    /// Carry out a shutdown notification.
+    ///
+    /// The driver takes SHST complete as its licence to cut power, so
+    /// nothing may still be in flight and the write cache the Identify
+    /// data advertises has to be on stable storage first.
+    fn shutdown(&self, new_cc: u32) {
+        {
+            let mut st = self.state.lock().expect("nvme: state lock");
+            st.cc = new_cc;
+            st.set_shst(SHST_OCCURRING);
+            st.retire_queues();
+        }
+
+        let flushed = self.flush_backing(FlushIntent::Durable);
+        if let Err(error) = &flushed {
+            slog::error!(self.log, "nvme: shutdown flush failed";
+                "error" => %error);
+        }
+
+        let mut st = self.state.lock().expect("nvme: state lock");
+        st.set_shst(SHST_COMPLETE);
+        if flushed.is_err() {
+            st.csts |= CSTS_CFS;
+        }
+    }
+
+    /// Whether a guest queue base may hold `entries` entries.
+    ///
+    /// The first entry must be mapped; the rest are checked as they are
+    /// read, so a queue that legally straddles two memory regions is
+    /// not refused here.
+    pub(super) fn queue_base_ok(
+        &self,
+        base: u64,
+        entries: u32,
+        entry: usize,
+    ) -> bool {
+        valid_queue_base(base)
+            && u64::from(entries)
+                .checked_mul(entry as u64)
+                .and_then(|span| base.checked_add(span))
+                .is_some()
+            && self.physmap.lookup(base, entry).is_some()
     }
 
     /// Handle doorbell writes (offsets 0x1000+).

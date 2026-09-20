@@ -11,8 +11,7 @@ use vmm_core::mem::MemCtx;
 use super::bits::*;
 use super::prp::write_to_prp;
 use super::queues::{
-    io_queue_index, post_completion, valid_queue_base, CompQueue, NvmeState,
-    SubQueue,
+    io_queue_index, post_completion, CompQueue, NvmeState, SubQueue,
 };
 use super::NvmeController;
 
@@ -47,12 +46,16 @@ impl NvmeController {
                     break;
                 }
                 let sqe_offset = u64::from(sq.head) * SQE_SIZE as u64;
-                (sq.base + sqe_offset, sq.head, sq.size)
+                (sq.base.checked_add(sqe_offset), sq.head, sq.size)
             };
 
             let mut sqe_buf = [0u8; SQE_SIZE];
-            if mem.read(sqe_gpa, &mut sqe_buf).is_err() {
-                // Advance head past the bad entry
+            let fetched = match sqe_gpa {
+                Some(gpa) => mem.read(gpa, &mut sqe_buf).is_ok(),
+                None => false,
+            };
+            if !fetched {
+                // Advance head past the entry that cannot be read.
                 if let Some(sq) = &mut st.admin_sq {
                     sq.head = (sq.head + 1) % sq.size;
                 }
@@ -87,13 +90,20 @@ impl NvmeController {
                 sq.head = sq_head;
             }
 
-            // Now process the command with full NvmeState access
-            let (status, cdw0) = self.process_admin_cmd(
-                &mut st, &mem, opcode, cid, nsid, prp1, prp2, cdw10, cdw11,
+            let (status, cdw0, fence) = self.process_admin_cmd(
+                &mut st, &mem, opcode, nsid, prp1, prp2, cdw10, cdw11,
             );
 
-            // Write CQE to admin CQ
-            post_completion(
+            if fence {
+                drop(st);
+                let fenced = self.fence_workers();
+                st = self.state.lock().expect("nvme: state lock");
+                if !fenced {
+                    st.csts |= CSTS_CFS;
+                }
+            }
+
+            if let Err(error) = post_completion(
                 &mem,
                 &self.msix,
                 &mut st.admin_cq,
@@ -102,33 +112,42 @@ impl NvmeController {
                 sq_head,
                 cid,
                 status,
-            );
+            ) {
+                // The driver will never see this command finish.
+                slog::error!(self.log, "nvme: admin CQE write failed";
+                    "error" => %error);
+                st.csts |= CSTS_CFS;
+            }
         }
     }
 
-    /// Process a single admin command. Returns (status, cdw0_result).
+    /// Process a single admin command.
+    ///
+    /// Returns the status, the command-specific result, and whether the
+    /// completion must wait for the worker pool: Delete Queue may only
+    /// complete once the commands it took away have finished.
     fn process_admin_cmd(
         &self,
         st: &mut NvmeState,
         mem: &MemCtx,
         opcode: u8,
-        cid: u16,
         nsid: u32,
         prp1: u64,
         prp2: u64,
         cdw10: u32,
         cdw11: u32,
-    ) -> (u16, u32) {
-        let _ = cid;
-        match opcode {
+    ) -> (u16, u32, bool) {
+        let deletes_a_queue =
+            matches!(opcode, ADMIN_OPC_DELETE_IO_SQ | ADMIN_OPC_DELETE_IO_CQ);
+        let (status, cdw0) = match opcode {
             ADMIN_OPC_IDENTIFY => {
                 self.admin_identify(st, mem, nsid, prp1, prp2, cdw10)
             }
             ADMIN_OPC_CREATE_IO_CQ => {
-                Self::admin_create_io_cq(st, prp1, cdw10, cdw11)
+                self.admin_create_io_cq(st, prp1, cdw10, cdw11)
             }
             ADMIN_OPC_CREATE_IO_SQ => {
-                Self::admin_create_io_sq(st, prp1, cdw10, cdw11)
+                self.admin_create_io_sq(st, prp1, cdw10, cdw11)
             }
             ADMIN_OPC_DELETE_IO_SQ => self.admin_delete_io_sq(st, cdw10),
             ADMIN_OPC_DELETE_IO_CQ => self.admin_delete_io_cq(st, cdw10),
@@ -149,7 +168,8 @@ impl NvmeController {
                 (SC_SUCCESS, 0)
             }
             _ => (SC_INVALID_OPCODE | (SC_DNR), 0),
-        }
+        };
+        (status, cdw0, deletes_a_queue && status == SC_SUCCESS)
     }
 
     /// Identify command (CNS 0 = namespace, CNS 1 = controller).
@@ -183,6 +203,7 @@ impl NvmeController {
 
     /// Create I/O Completion Queue.
     pub(super) fn admin_create_io_cq(
+        &self,
         st: &mut NvmeState,
         prp1: u64,
         cdw10: u32,
@@ -203,11 +224,11 @@ impl NvmeController {
         if st.io_cqs[idx].is_some() {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
-
-        if !valid_queue_base(prp1) {
+        if !self.queue_base_ok(prp1, qsize.into(), CQE_SIZE) {
             return (SC_INVALID_FIELD | SC_DNR, 0);
         }
 
+        let instance = st.next_instance();
         st.io_cqs[idx] = Some(CompQueue {
             base: prp1,
             size: qsize,
@@ -215,6 +236,8 @@ impl NvmeController {
             tail: 0,
             phase: true,
             iv,
+            ien: true,
+            instance,
         });
 
         (SC_SUCCESS, 0)
@@ -222,6 +245,7 @@ impl NvmeController {
 
     /// Create I/O Submission Queue.
     pub(super) fn admin_create_io_sq(
+        &self,
         st: &mut NvmeState,
         prp1: u64,
         cdw10: u32,
@@ -250,16 +274,18 @@ impl NvmeController {
             return (SC_CQ_INVALID | SC_DNR, 0);
         }
 
-        if !valid_queue_base(prp1) {
+        if !self.queue_base_ok(prp1, qsize.into(), SQE_SIZE) {
             return (SC_INVALID_FIELD | SC_DNR, 0);
         }
 
+        let instance = st.next_instance();
         st.io_sqs[idx] = Some(SubQueue {
             base: prp1,
             size: qsize,
             head: 0,
             tail: 0,
             cq_id,
+            instance,
         });
 
         (SC_SUCCESS, 0)
