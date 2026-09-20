@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 
 use crate::initramfs;
 use crate::manifest::{Manifest, ResolvedConsole};
+use crate::status::{self, PayloadStatus};
 
 /// PID of the running VMM child, read by the signal handler.
 /// 0 means there is no child yet.
@@ -43,7 +44,10 @@ pub struct VmmInvocation {
 
 pub struct LaunchOutcome {
     /// Exit code from the VMM. `None` when it died from a signal.
-    pub exit_code: Option<i32>,
+    pub vmm_exit_code: Option<i32>,
+    /// What init reported for the payload. `None` when the VMM ended
+    /// before init wrote its marker.
+    pub payload: Option<PayloadStatus>,
 }
 
 /// The fhrun-owned kernel cmdline.
@@ -166,20 +170,40 @@ pub fn launch(manifest: &Manifest) -> Result<LaunchOutcome> {
 
     install_signal_handlers();
 
+    // The VMM's stdout is piped, not inherited: the payload's status
+    // travels on it as a COM2 marker line, so fhrun has to read it.
     let mut child: Child = Command::new(&inv.program)
         .args(&inv.args)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawn vmm: {}", inv.program.display()))?;
 
     CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
-    let status = child.wait().context("wait for vmm")?;
+    let vmm_stdout = child.stdout.take().context("vmm stdout is not piped")?;
+    let pump = std::thread::Builder::new()
+        .name("vmm-stdout".to_string())
+        .spawn(move || status::pump(vmm_stdout, std::io::stdout()))
+        .context("spawn the stdout pump")?;
+    let vmm_status = child.wait().context("wait for vmm")?;
     CHILD_PID.store(0, Ordering::SeqCst);
+    // The pump ends at EOF, which the VMM's exit closes.
+    let payload = match pump.join() {
+        Ok(Ok(payload)) => payload,
+        Ok(Err(e)) => {
+            eprintln!("fhrun: reading vmm stdout: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("fhrun: the stdout pump panicked");
+            None
+        }
+    };
 
     Ok(LaunchOutcome {
-        exit_code: status.code(),
+        vmm_exit_code: vmm_status.code(),
+        payload,
     })
 }
 
