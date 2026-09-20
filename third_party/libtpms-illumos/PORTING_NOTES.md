@@ -38,13 +38,16 @@ Set in the cargo `build.rs` (do not edit configure.ac):
 
 ```
 CFLAGS="-D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -D__EXTENSIONS__"
-./autogen.sh --with-openssl --with-tpm2 --disable-hardening
+./autogen.sh --with-openssl --with-tpm2
 ```
 
 * `_POSIX_C_SOURCE=200809L` exposes `dprintf`/`vdprintf`.
 * `__EXTENSIONS__` keeps illumos compatibility extensions visible.
-* `--disable-hardening` strips the `-Wl,-z,now` and other Linux-specific
-  hardening flags that gcc on illumos rejects.
+* Hardening stays enabled. It gives the guest-facing command parser
+  `-fstack-protector-strong` and `-D_FORTIFY_SOURCE=2`. Each flag is
+  behind an autoconf probe, so one the illumos toolchain refuses is
+  dropped on its own. `HARDENING_LDFLAGS` (`-Wl,-z,relro`, `-Wl,-z,now`)
+  only reaches a shared-library link, and this build is static.
 
 ## Updating to a newer libtpms
 
