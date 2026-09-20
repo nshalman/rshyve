@@ -5,7 +5,9 @@
 # the guest init after switch_root.
 #
 # POSIX shell only: the image may provide busybox ash or dash, and
-# neither awk nor bash can be assumed.
+# neither awk nor bash can be assumed, so there is no `pipefail` to set.
+# `errexit` is deliberately off: a failed check has to be recorded as a
+# FAIL and the remaining checks still have to run.
 
 pass=0
 fail=0
