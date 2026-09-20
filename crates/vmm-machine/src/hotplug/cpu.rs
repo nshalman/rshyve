@@ -293,7 +293,7 @@ impl CpuHotplugEngine {
 
     /// Stop the drain thread and wait for it.
     pub fn shutdown(&self) {
-        self.thread.shutdown();
+        self.thread.shutdown(super::DRAIN_JOIN_BUDGET);
     }
 }
 

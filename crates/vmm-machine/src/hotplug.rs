@@ -71,6 +71,20 @@ use self::mem::{MemHotplugEngine, MemHotplugError, MemWindow};
 /// expiring aborts the removal instead of forcing it.
 const UNPLUG_BUDGET: Duration = Duration::from_secs(5);
 
+/// How much longer than its drain budget one unplug may take.
+///
+/// `prepare_unplug` ends in `halt()`, which it does not bound and
+/// cannot: viona's `VNA_IOC_DELETE` is an untimed `cv_wait` that heeds
+/// no signal. The slack covers an ordinary release; past it the drain
+/// thread stops waiting so every later eject is still answered.
+const UNPLUG_HALT_SLACK: Duration = Duration::from_secs(5);
+
+/// How long [`HotplugEngine::close`] waits for the drain thread.
+///
+/// A thread abandoned inside a device release must not hold the
+/// teardown one step short of the VM destroy.
+const DRAIN_JOIN_BUDGET: Duration = Duration::from_secs(5);
+
 /// How often the engine looks for an eject the guest has run.
 const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -194,6 +208,9 @@ struct Core {
     regs: Arc<PciHotplug>,
     vm: Arc<dyn VmPause>,
     budget: Duration,
+    /// How much longer than `budget` one unplug may take, to cover the
+    /// unbounded `halt()` at the end of it.
+    halt_slack: Duration,
     /// Set by [`HotplugEngine::close`] once the guest has stopped.
     /// Every entry point reads it, the way `VcpuThreads::close` refuses
     /// a late CPU add.
@@ -356,20 +373,47 @@ impl Core {
         let paused_here =
             lifecycle.lifecycle_state() != Some(IndicatedState::Pause);
 
-        if let Err(e) = prepare_unplug(&lifecycle, self.budget) {
+        match unplug_bounded(
+            &lifecycle,
+            self.budget,
+            self.budget.saturating_add(self.halt_slack),
+            &self.log,
+        ) {
+            Unplug::Done => {}
             // Never forced. The device keeps running, keeps its slot and
             // keeps its backing file. `prepare_unplug` already paused
             // it, so the abort has to undo that: a device left paused
             // never serves the guest again, which is a silent hang
             // rather than a refused removal.
-            warn!(self.log, "eject aborted: the device did not quiesce";
-                "id" => &device.id, "error" => format!("{e:?}"));
-            self.abort_eject(
-                &device.id,
-                slot,
-                paused_here.then_some(&lifecycle),
-            );
-            return;
+            Unplug::Kept { reason, paused } => {
+                warn!(self.log, "eject aborted: the device did not quiesce";
+                    "id" => &device.id, "error" => reason);
+                self.abort_eject(
+                    &device.id,
+                    slot,
+                    (paused_here && paused).then_some(&lifecycle),
+                );
+                return;
+            }
+            // The release is still running on a thread this one let go
+            // of. Nothing may touch the slot: a worker can still be
+            // inside a transport callback on the device that is leaving,
+            // and its state reads `Halt` from the first instant of a
+            // release that has not happened.
+            Unplug::InFlight => {
+                error!(self.log, "eject abandoned: the device release did \
+                    not return inside its budget";
+                    "id" => &device.id, "bdf" => %bdf);
+                if let Err(e) = self.registry.set_state(
+                    &device.id,
+                    SlotState::RemovePending,
+                    SlotState::Ejecting,
+                ) {
+                    error!(self.log, "an abandoned eject left the slot as \
+                        it was"; "id" => &device.id, "error" => %e);
+                }
+                return;
+            }
         }
 
         // The compare-and-swap comes after the quiesce, not before it:
@@ -544,6 +588,7 @@ impl HotplugEngine {
             regs: pci_regs,
             vm,
             budget: UNPLUG_BUDGET,
+            halt_slack: UNPLUG_HALT_SLACK,
             closed: AtomicBool::new(false),
             log: log.clone(),
         });
@@ -580,6 +625,7 @@ impl HotplugEngine {
 
     /// Refuse every later add and removal, and stop the drain thread.
     ///
+    ///
     /// Teardown calls this before it takes its list of devices. An add
     /// that landed after that list attaches a device the halt sweep
     /// never sees, and the `vmm_drv` lease it holds then parks
@@ -587,18 +633,83 @@ impl HotplugEngine {
     /// the process.
     pub fn close(&self) {
         self.core.closed.store(true, Ordering::Release);
-        self.thread.shutdown();
+        self.thread.shutdown(DRAIN_JOIN_BUDGET);
     }
 
     /// Stop the drain thread and wait for it.
     pub fn shutdown(&self) {
-        self.thread.shutdown();
+        self.thread.shutdown(DRAIN_JOIN_BUDGET);
     }
 }
 
 impl Drop for HotplugEngine {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// What a bounded unplug preparation ended in.
+enum Unplug {
+    /// The device gave up its resources; the slot can be taken apart.
+    Done,
+    /// The device keeps its slot and goes on running. `paused` is true
+    /// when the preparation got as far as pausing it, so the abort has
+    /// to undo that.
+    Kept { reason: String, paused: bool },
+    /// Past its budget with the release still in flight.
+    InFlight,
+}
+
+/// Run [`prepare_unplug`] with a bound on it.
+///
+/// `prepare_unplug` bounds the drain wait and then calls `halt()`, which
+/// it cannot bound: viona's `VNA_IOC_DELETE` waits for each ring worker
+/// in a `cv_wait` that heeds no signal. Run inline, one such halt parks
+/// the drain thread, so every later eject on the VM goes unanswered and
+/// teardown's join never returns. The work therefore goes on a thread
+/// this one can let go of, the way the teardown halt sweep does.
+fn unplug_bounded(
+    device: &Arc<dyn vmm_devices::Lifecycle>,
+    drain_budget: Duration,
+    total_budget: Duration,
+    log: &Logger,
+) -> Unplug {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let work = Arc::clone(device);
+    let spawned = std::thread::Builder::new()
+        .name("device-unplug".into())
+        .spawn(move || {
+            // A closed channel means the caller stopped waiting, which
+            // is the case this bound exists for.
+            drop(tx.send(prepare_unplug(&work, drain_budget)));
+        });
+    if let Err(e) = spawned {
+        // Nothing ran, so the device is still running and keeps its
+        // slot. Running the unplug here instead would put the untimed
+        // halt on the drain thread, which is what this avoids.
+        warn!(log, "could not start a device unplug thread";
+            "device" => device.type_name(), "error" => %e);
+        return Unplug::Kept {
+            reason: format!("no unplug thread: {e}"),
+            paused: false,
+        };
+    }
+
+    match rx.recv_timeout(total_budget) {
+        Ok(Ok(())) => Unplug::Done,
+        Ok(Err(e)) => Unplug::Kept {
+            reason: format!("{e:?}"),
+            paused: true,
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Unplug::InFlight,
+        // The thread went without sending, so the release neither
+        // finished nor reported. Treat it as in flight: the slot is the
+        // thing that must not be touched either way.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            error!(log, "the device unplug thread ended with no result";
+                "device" => device.type_name());
+            Unplug::InFlight
+        }
     }
 }
 

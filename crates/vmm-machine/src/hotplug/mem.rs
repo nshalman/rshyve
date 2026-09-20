@@ -468,11 +468,9 @@ impl MemHotplugEngine {
         self.drain.refuse_ejects();
     }
 
-    /// Stop the drain thread and wait for it, then answer a request
-    /// that arrived last.
+    /// Stop the drain thread and wait for it.
     pub fn shutdown(&self) {
-        self.thread.shutdown();
-        self.refuse_ejects();
+        self.thread.shutdown(super::DRAIN_JOIN_BUDGET);
     }
 }
 

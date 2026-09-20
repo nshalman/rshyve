@@ -67,6 +67,10 @@ struct StubLifecycle {
     /// What `lifecycle_state` reports. `None` is a device that tracks
     /// no state, which is what most backends do.
     state: Option<IndicatedState>,
+    /// A halt that does not return, as viona's `VNA_IOC_DELETE` does
+    /// when a ring worker will not stop. Cleared so the test thread is
+    /// not left spinning.
+    halt_wedges: AtomicBool,
 }
 
 impl StubLifecycle {
@@ -77,6 +81,19 @@ impl StubLifecycle {
             halted: AtomicBool::new(false),
             resumes: AtomicUsize::new(0),
             state: None,
+            halt_wedges: AtomicBool::new(false),
+        })
+    }
+
+    /// A device whose release never returns.
+    fn wedged_halt() -> Arc<Self> {
+        Arc::new(Self {
+            quiesces: true,
+            paused: AtomicBool::new(false),
+            halted: AtomicBool::new(false),
+            resumes: AtomicUsize::new(0),
+            state: None,
+            halt_wedges: AtomicBool::new(true),
         })
     }
 
@@ -89,6 +106,7 @@ impl StubLifecycle {
             halted: AtomicBool::new(false),
             resumes: AtomicUsize::new(0),
             state: Some(IndicatedState::Pause),
+            halt_wedges: AtomicBool::new(false),
         })
     }
 
@@ -119,6 +137,9 @@ impl Lifecycle for StubLifecycle {
     }
     fn halt(&self) {
         self.halted.store(true, Ordering::Release);
+        while self.halt_wedges.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -190,6 +211,7 @@ impl Fixture {
                 vm: Arc::clone(&vm) as Arc<dyn VmPause>,
                 // Short, so the abort path does not slow the suite.
                 budget: Duration::from_millis(20),
+                halt_slack: Duration::from_millis(20),
                 closed: AtomicBool::new(false),
                 log: null_log(),
             },
@@ -891,6 +913,39 @@ fn a_slot_on_its_way_out_is_not_replayed() {
         .set_state(&id, SlotState::Ejecting, SlotState::Absent)
         .expect("absent");
     assert!(hotplug_specs(&fixture.registry).is_empty());
+}
+
+/// viona's release is an untimed `cv_wait` that heeds no signal. Run on
+/// the drain thread it would answer no later eject, and teardown's join
+/// would never return.
+#[test]
+fn a_release_that_never_returns_does_not_park_the_drain_thread() {
+    let fixture = Fixture::new();
+    let lifecycle = StubLifecycle::wedged_halt();
+    let (added, device, _) =
+        fixture.add_with("5,virtio-blk,/added", Arc::clone(&lifecycle));
+    let id = added.expect("added");
+    fixture.core.request_remove(&id).expect("requested");
+    fixture.guest_ejects(5);
+
+    let started = std::time::Instant::now();
+    fixture.core.drain_ejects();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the drain took {:?}",
+        started.elapsed(),
+    );
+    // The slot is not taken apart: a worker can still be inside the
+    // device that is leaving.
+    assert_eq!(
+        fixture.registry.get_by_id(&id).map(|d| d.state),
+        Some(SlotState::Ejecting),
+    );
+    assert_eq!(device.regions_detached.load(Ordering::Acquire), 0);
+    assert_eq!(lifecycle.resumes.load(Ordering::Acquire), 0);
+
+    lifecycle.halt_wedges.store(false, Ordering::Release);
 }
 
 /// Teardown takes its device list once. Anything added after that is

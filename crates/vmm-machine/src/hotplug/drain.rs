@@ -65,14 +65,20 @@ impl DrainThread {
         lock(&self.thread).is_none()
     }
 
-    /// Stop the thread and wait for it.
-    pub(super) fn shutdown(&self) {
+    /// Stop the thread and wait up to `budget` for it.
+    ///
+    /// Bounded because a tick can be inside a device release that does
+    /// not return, and teardown calls this one step short of the VM
+    /// destroy. An abandoned thread holds only a weak reference to its
+    /// engine, so it ends on its own once the engine is dropped.
+    pub(super) fn shutdown(&self, budget: Duration) {
         self.stop.stop();
         let handle = lock(&self.thread).take();
         if let Some(handle) = handle {
-            if handle.join().is_err() {
-                error!(self.log, "the drain thread panicked";
-                    "thread" => self.name);
+            if !vmm_core::thread::join_bounded(vec![handle], budget) {
+                error!(self.log, "the drain thread did not return inside \
+                    its budget"; "thread" => self.name,
+                    "budget_secs" => budget.as_secs());
             }
         }
     }
@@ -144,7 +150,32 @@ mod tests {
         let (_ticks, thread) = ticking();
         // Returns, which is the whole test: a thread that ignored the
         // flag would hang the join.
-        thread.shutdown();
+        thread.shutdown(Duration::from_secs(5));
+    }
+
+    /// A tick inside a device release that never returns must not hold
+    /// teardown one step short of the VM destroy.
+    #[test]
+    fn a_tick_that_never_returns_does_not_hold_the_shutdown() {
+        let wedged = Arc::new(());
+        let thread = DrainThread::spawn(
+            "drain-wedged",
+            &wedged,
+            |_: &()| loop {
+                thread::sleep(Duration::from_millis(50));
+            },
+            &null_log(),
+            "no test drain thread",
+        );
+
+        let started = std::time::Instant::now();
+        thread.shutdown(Duration::from_millis(100));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the shutdown took {:?}",
+            started.elapsed(),
+        );
     }
 
     #[test]
