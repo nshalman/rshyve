@@ -16,7 +16,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,6 +64,8 @@ pub(super) struct VsockShared {
     pub(super) sockets: Mutex<HashMap<ConnKey, Arc<UnixStream>>>,
     /// Answers CONTROL requests. Empty until the binary installs a sink.
     pub(super) control: ControlSlot,
+    /// CONTROL sessions running now, held to `MAX_CONTROL_SESSIONS`.
+    pub(super) control_sessions: AtomicUsize,
     pub(super) socket_path: PathBuf,
     /// Threads serving one host connection each, and the slots
     /// promised to threads not yet started. Bounds the thread count for

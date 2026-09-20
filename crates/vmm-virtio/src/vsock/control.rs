@@ -30,9 +30,6 @@
 //! mem-list    -> OK 1 boot,1073741824,present
 //! ```
 //!
-//! Wave 2 adds `device-add <spec>` and `device-remove <id>` at the same
-//! shape: `OK <id>` on success, `ERR <reason>` on refusal.
-//!
 //! # Trust
 //!
 //! The socket is 0600 in a 0700 directory, so the peer is already the
@@ -87,6 +84,23 @@ const RESPONSE_BUDGET: Duration = Duration::from_millis(500);
 /// included, for the life of the VM. A peer with nothing to say in
 /// this long has nothing to say.
 pub(super) const HANDSHAKE_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long an established session may say nothing before it loses its
+/// place.
+///
+/// The session thread is one of the capped reader slots, so a peer that
+/// opens CONTROL and then idles holds a slot every later CONNECT needs.
+/// Minutes, not seconds: an operator tool may hold a session open
+/// between commands, and losing one costs only a reconnect.
+pub(super) const CONTROL_IDLE_BUDGET: Duration = Duration::from_secs(300);
+
+/// How many CONTROL sessions may run at once.
+///
+/// The idle budget alone does not stop starvation: a peer that sends one
+/// byte inside every budget keeps its slot for ever. A quota of its own
+/// does, and it is small because one operator tool is the expected
+/// caller.
+pub(super) const MAX_CONTROL_SESSIONS: usize = 4;
 
 /// Longest value written back for one field. An id comes from the `-s`
 /// arguments, so an operator can make it long; the response line stays
@@ -464,6 +478,7 @@ pub(super) fn run_control_session(
     shutdown: &AtomicBool,
     mut stream: UnixStream,
     log: &slog::Logger,
+    idle_budget: Duration,
 ) {
     // Each refusal below writes one line and closes. The write is best
     // effort: the peer may already be gone, and there is nothing else to
@@ -478,9 +493,15 @@ pub(super) fn run_control_session(
     }
 
     loop {
-        // No deadline: an established session may idle between
-        // requests, and shutdown is what ends it.
-        match read_line_bounded(&mut stream, shutdown, CONTROL_LINE_MAX, None) {
+        // An established session may idle between requests, but not
+        // without end: this thread holds one of the capped reader
+        // slots, and a peer that never speaks again must give it back.
+        match read_line_bounded(
+            &mut stream,
+            shutdown,
+            CONTROL_LINE_MAX,
+            Some(Instant::now() + idle_budget),
+        ) {
             LineRead::Line(request) => {
                 let answer = answer_line(sink.as_ref(), &request);
                 if write_line(&mut stream, framed(&answer)).is_err() {
@@ -574,7 +595,27 @@ mod tests {
         let (client, server) = UnixStream::pair().expect("socketpair");
         let slot = slot.clone();
         let handle = thread::spawn(move || {
-            run_control_session(&slot, &shutdown, server, &null_log());
+            run_control_session(
+                &slot,
+                &shutdown,
+                server,
+                &null_log(),
+                CONTROL_IDLE_BUDGET,
+            );
+        });
+        (client, handle)
+    }
+
+    /// The same, with an idle budget the test can outlast.
+    fn session_with_idle(
+        slot: &ControlSlot,
+        shutdown: Arc<AtomicBool>,
+        idle: Duration,
+    ) -> (UnixStream, thread::JoinHandle<()>) {
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        let slot = slot.clone();
+        let handle = thread::spawn(move || {
+            run_control_session(&slot, &shutdown, server, &null_log(), idle);
         });
         (client, handle)
     }
@@ -750,13 +791,40 @@ mod tests {
         handle.join().expect("session thread ends on the flag");
     }
 
+    /// An established session used to read with no deadline at all, so
+    /// a peer that opened CONTROL and then said nothing held one of the
+    /// capped reader slots until the VM shut down. Enough such peers and
+    /// every later CONNECT was refused in silence.
+    #[test]
+    fn an_idle_session_loses_its_slot() {
+        let slot = installed(Arc::new(EchoSink));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (client, handle) = session_with_idle(
+            &slot,
+            Arc::clone(&shutdown),
+            Duration::from_millis(50),
+        );
+
+        let mut reader = BufReader::new(client);
+        let mut banner = String::new();
+        reader.read_line(&mut banner).expect("banner");
+        assert_eq!(banner.trim_end(), "OK control");
+
+        // Nothing is sent from here, and the shutdown flag stays clear:
+        // only the idle budget can end this.
+        assert_session_closed(&mut reader);
+        handle
+            .join()
+            .expect("session thread ends on its idle budget");
+        assert!(!shutdown.load(Ordering::Acquire));
+    }
+
     /// A peer that sends nothing must not park the thread.
     ///
     /// The reader owns its own poll timeout, so a caller that forgets to
-    /// arm one still gets a bounded read. The CONNECT path in
-    /// `device.rs` reads its opening line with no timeout at all, and a
-    /// connection that is not in the socket table yet is out of reach of
-    /// the halt sweep.
+    /// arm one still gets a bounded read. A connection that is not in
+    /// the socket table yet is out of reach of the halt sweep, so
+    /// nothing else would wake it.
     #[test]
     fn a_silent_peer_does_not_park_the_reader() {
         let (_client, mut server) = UnixStream::pair().expect("socketpair");

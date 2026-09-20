@@ -21,6 +21,7 @@
 
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -28,6 +29,7 @@ use slog::debug;
 use vmm_core::unixsock::write_all_bounded;
 
 use super::shared::{VsockShared, HOST_WRITE_TIMEOUT};
+use crate::vsock::control::MAX_CONTROL_SESSIONS;
 use crate::vsock::mux::MAX_CONNS;
 use crate::vsock::packet::ConnKey;
 
@@ -158,6 +160,34 @@ impl VsockShared {
         })
     }
 
+    /// Take a place among the CONTROL sessions, or refuse.
+    ///
+    /// CONTROL shares the reader table with every CONNECT, and an
+    /// established session may idle, so without a quota of its own a
+    /// handful of idle CONTROL peers can take every slot and leave the
+    /// operator unable to connect at all.
+    pub(super) fn reserve_control_session(
+        &self,
+    ) -> Option<ControlSessionSlot<'_>> {
+        let mut held = self.control_sessions.load(Ordering::Acquire);
+        loop {
+            if held >= MAX_CONTROL_SESSIONS {
+                return None;
+            }
+            match self.control_sessions.compare_exchange_weak(
+                held,
+                held + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ControlSessionSlot(&self.control_sessions))
+                }
+                Err(now) => held = now,
+            }
+        }
+    }
+
     /// Record a thread in the reader table.
     ///
     /// Tests use this to fill the table without an accept; production
@@ -176,6 +206,15 @@ impl VsockShared {
     /// Take every reader handle, for the halt join.
     pub(super) fn take_readers(&self) -> Vec<JoinHandle<()>> {
         std::mem::take(&mut self.readers.lock().expect("reader lock").handles)
+    }
+}
+
+/// One CONTROL session's place in the quota that verb has.
+pub(super) struct ControlSessionSlot<'a>(&'a AtomicUsize);
+
+impl Drop for ControlSessionSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

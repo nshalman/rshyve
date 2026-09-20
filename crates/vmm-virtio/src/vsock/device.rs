@@ -113,6 +113,7 @@ impl VirtioVsock {
             interrupt: Arc::new(IntrSlot::new()),
             sockets: Mutex::new(HashMap::new()),
             control: ControlSlot::default(),
+            control_sessions: std::sync::atomic::AtomicUsize::new(0),
             socket_path: socket_path.to_path_buf(),
             readers: Mutex::new(Default::default()),
             shutdown: Arc::new(AtomicBool::new(false)),

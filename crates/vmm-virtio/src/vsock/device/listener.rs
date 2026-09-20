@@ -25,7 +25,8 @@ use vmm_core::unixsock::write_all_bounded;
 
 use super::shared::{VsockShared, HOST_WRITE_TIMEOUT};
 use crate::vsock::control::{
-    read_line_bounded, run_control_session, LineRead, HANDSHAKE_BUDGET,
+    read_line_bounded, run_control_session, LineRead, CONTROL_IDLE_BUDGET,
+    HANDSHAKE_BUDGET,
 };
 use crate::vsock::packet::ConnKey;
 
@@ -115,12 +116,25 @@ pub(super) fn handle_host_connect(
     };
     match classify_host_line(&line) {
         HostVerb::Connect(port) => start_host_connection(shared, stream, port),
-        HostVerb::Control => run_control_session(
-            &shared.control,
-            &shared.shutdown,
-            stream,
-            &shared.log,
-        ),
+        HostVerb::Control => match shared.reserve_control_session() {
+            Some(_session) => run_control_session(
+                &shared.control,
+                &shared.shutdown,
+                stream,
+                &shared.log,
+                CONTROL_IDLE_BUDGET,
+            ),
+            None => {
+                warn!(shared.log, "virtio-vsock CONTROL refused";
+                    "reason" => "too many sessions");
+                // Best effort: the peer may already be gone.
+                let _ = write_all_bounded(
+                    &stream,
+                    b"ERR too many control sessions\n",
+                    HOST_WRITE_TIMEOUT,
+                );
+            }
+        },
         HostVerb::Unknown => {
             // Best effort: the peer may already be gone, and the
             // connection ends either way. Bounded, because a peer that

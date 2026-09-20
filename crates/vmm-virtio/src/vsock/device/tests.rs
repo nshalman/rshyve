@@ -16,7 +16,7 @@ use crate::socket_halt::{HALT_BUDGET, HALT_JOIN_ROUNDS};
 use crate::vsock::control::{read_line_bounded, LineRead, HANDSHAKE_BUDGET};
 use crate::vsock::mux::MAX_CONNS;
 use crate::vsock::packet::ConnKey;
-use std::io::{self, Read};
+use std::io::{self, BufRead as _, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -822,6 +822,43 @@ fn a_reset_waits_out_a_delivery_already_inside() {
     drop(session);
     resetter.join().expect("reset thread");
     assert!(finished.load(Ordering::Acquire));
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// CONTROL shares the reader table with every CONNECT, and an
+/// established session is allowed to idle, so a few idle CONTROL peers
+/// could take every slot and leave the operator unable to connect at
+/// all. The verb has a quota of its own.
+#[test]
+fn control_sessions_are_held_to_their_own_quota() {
+    use crate::vsock::control::MAX_CONTROL_SESSIONS;
+    use std::io::Write as _;
+
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    let held: Vec<_> = (0..MAX_CONTROL_SESSIONS)
+        .map(|_| {
+            vsock
+                .shared
+                .reserve_control_session()
+                .expect("a free control slot")
+        })
+        .collect();
+
+    let (mut peer, device_end) = UnixStream::pair().expect("socketpair");
+    peer.write_all(b"CONTROL\n").expect("send the verb");
+    handle_host_connect(Arc::clone(&vsock.shared), device_end);
+
+    let mut answer = String::new();
+    io::BufReader::new(&peer)
+        .read_line(&mut answer)
+        .expect("read the refusal");
+    assert_eq!(answer.trim_end(), "ERR too many control sessions");
+
+    // A slot given back admits the next session.
+    drop(held);
+    assert!(vsock.shared.reserve_control_session().is_some());
 
     vsock.halt();
     let _ = std::fs::remove_dir_all(&dir);
