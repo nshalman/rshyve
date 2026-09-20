@@ -110,7 +110,11 @@ jobs:
       # it was written for. The compile that means anything for them is
       # the one against the real target, so it is this job and not the
       # host one. firehyve rides along: it has no C dependencies, so it
-      # cross-compiles.
+      # cross-compiles, and this is the only job that compiles it for the
+      # target. usdt's probe macros expand from a HOST-built usdt-impl,
+      # so on a linux runner they are no-ops: every line of firehyve is
+      # checked, but not the illumos DTrace codegen, which the build host
+      # covers.
       - run: >
           cargo clippy --locked --target x86_64-unknown-illumos --all-targets
           -p bhyve_api_sys -p bhyve_api -p viona_api
@@ -269,18 +273,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y autoconf automake libtool pkg-config libssl-dev
-      # firehyve has no C dependencies, so it type-checks against the
-      # real target. usdt's probe macros expand from a HOST-built
-      # usdt-impl, so on a linux runner they expand to no-ops: this
-      # checks every line of firehyve but not the illumos DTrace codegen
-      # path, which is covered on the build host.
-      - run: >
-          cargo check --locked --all-targets
-          --target x86_64-unknown-illumos -p firehyve
-      # rshyve additionally pulls zstd-sys and the libtpms autotools
-      # build, which need a C toolchain for the target, and
-      # there is no illumos cross-cc here. The host target compiles those
-      # natively instead, which still type-checks every line of rshyve.
+      # firehyve compiles against the real target in the clippy-illumos
+      # job, which is a superset of a check. rshyve cannot: it pulls
+      # zstd-sys and the libtpms autotools build, which need a C
+      # toolchain for the target and there is no illumos cross-cc here.
+      # The host target compiles those natively instead, which still
+      # type-checks every line of rshyve.
       #
       # `test`, not `check`: rshyve and firehyve hold 236 tests that no
       # job in this workflow ran. The control socket authorization
