@@ -171,6 +171,8 @@ pub const SC_INVALID_FIELD: u16 = 0x0002;
 pub const SC_DATA_XFER_ERROR: u16 = 0x0004;
 pub const SC_INTERNAL_ERROR: u16 = 0x0006;
 pub const SC_INVALID_NS: u16 = 0x000B;
+/// I/O command set specific generic status, NVMe 1.4 figure 127.
+pub const SC_WRITE_TO_RO_RANGE: u16 = 0x0082;
 
 // Command specific status, NVMe 1.4 figure 128. Bits 10:8 carry the
 // status code type, so these read as SCT=1, SC=n.
@@ -320,6 +322,7 @@ pub const IDENT_NS_SIZE: usize = 4096;
 pub fn build_identify_namespace(
     total_blocks: u64,
     block_size: u32,
+    read_only: bool,
 ) -> [u8; IDENT_NS_SIZE] {
     let mut data = [0u8; IDENT_NS_SIZE];
 
@@ -329,6 +332,11 @@ pub fn build_identify_namespace(
     data[8..16].copy_from_slice(&total_blocks.to_le_bytes());
     // NUSE - Namespace Utilization (bytes 16-23)
     data[16..24].copy_from_slice(&total_blocks.to_le_bytes());
+
+    // NSATTR - Namespace Attributes (byte 99), bit 0 = write protected
+    if read_only {
+        data[99] = 1;
+    }
 
     // NLBAF - Number of LBA Formats (byte 25), 0-based
     data[25] = 0; // 1 format (index 0)
@@ -375,14 +383,14 @@ mod tests {
 
     #[test]
     fn identify_namespace_capacity() {
-        let data = build_identify_namespace(1000, 512);
+        let data = build_identify_namespace(1000, 512, false);
         let nsze = u64::from_le_bytes(data[0..8].try_into().unwrap());
         assert_eq!(nsze, 1000);
     }
 
     #[test]
     fn identify_namespace_block_size() {
-        let data = build_identify_namespace(1000, 4096);
+        let data = build_identify_namespace(1000, 4096, false);
         let lbaf0 = u32::from_le_bytes(data[128..132].try_into().unwrap());
         let lbads = (lbaf0 >> 16) & 0xFF;
         assert_eq!(lbads, 12); // log2(4096) = 12

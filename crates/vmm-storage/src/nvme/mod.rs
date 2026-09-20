@@ -192,8 +192,11 @@ impl NvmeController {
             // One controller per instance, and CNTLID 0 is reserved.
             u16::from(instance_id) + 1,
         );
-        let ns_ident =
-            build_identify_namespace(geometry.total_blocks, block_size);
+        let ns_ident = build_identify_namespace(
+            geometry.total_blocks,
+            block_size,
+            read_only,
+        );
 
         // CQR: contiguous queues only. TO: 500 ms. DSTRD, MPSMIN and
         // MPSMAX are zero: 4-byte doorbells, 4 KiB pages.

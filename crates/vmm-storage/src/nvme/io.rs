@@ -240,7 +240,7 @@ pub(super) fn process_io_request(
         }
         NVM_OPC_WRITE => {
             if read_only {
-                return SC_DATA_XFER_ERROR;
+                return SC_WRITE_TO_RO_RANGE | SC_DNR;
             }
             let Ok(iov) = prp_to_iovec(mem, req.prp1, req.prp2, byte_count)
             else {

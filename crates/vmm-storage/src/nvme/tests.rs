@@ -204,9 +204,22 @@ impl Harness {
         Self::with_backend(Arc::clone(&file), file)
     }
 
+    fn read_only() -> Self {
+        let file = Arc::new(backing_file());
+        Self::build(Arc::clone(&file), file, true)
+    }
+
     fn with_backend(
         file: Arc<std::fs::File>,
         backend: Arc<dyn super::io::IoBackend>,
+    ) -> Self {
+        Self::build(file, backend, false)
+    }
+
+    fn build(
+        file: Arc<std::fs::File>,
+        backend: Arc<dyn super::io::IoBackend>,
+        read_only: bool,
     ) -> Self {
         let physmap =
             Arc::new(PhysMap::new_anon(0, GUEST_RAM).expect("anon guest RAM"));
@@ -214,7 +227,7 @@ impl Harness {
         let ctrl = NvmeController::build(NvmeParts {
             file,
             backend,
-            read_only: false,
+            read_only,
             instance_id: 1,
             physmap: Arc::clone(&physmap),
             msi: Arc::clone(&sink) as Arc<dyn MsiSink>,
@@ -755,6 +768,28 @@ fn prp_list_entry_with_a_page_offset_is_refused() {
     assert_eq!(cqe.status(), Status::of(SC_DATA_XFER_ERROR));
     // Nothing was transferred: the walk fails before any lookup.
     assert!(h.read_guest(0x60000, PAGE_SIZE).iter().all(|&b| b == 0xAA));
+}
+
+#[test]
+fn a_read_only_namespace_reports_write_protection() {
+    let mut h = Harness::read_only();
+    h.enable();
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_IDENTIFY,
+        nsid: 1,
+        prp1: 0x20000,
+        prp2: 0x21000,
+        cdw10: u32::from(IDENTIFY_CNS_NAMESPACE),
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::SUCCESS);
+    assert_eq!(h.read_guest(0x20000 + 99, 1), vec![1], "NSATTR");
+
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::write(0, 1, 0x50000, 0), 0x51);
+    let cqe = h.wait_cqe(CQ1, 0, true);
+    assert_eq!(cqe.status(), Status::of(SC_WRITE_TO_RO_RANGE | SC_DNR));
 }
 
 #[test]
