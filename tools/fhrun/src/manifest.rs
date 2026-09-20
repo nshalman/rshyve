@@ -147,6 +147,30 @@ pub struct GuestConsole {
     pub role: Option<String>,
 }
 
+/// Refuse an `extra_files` key the cpio name cannot carry as written.
+///
+/// A NUL ends the name early, so the guest would get a different file
+/// from the one named. `..` is resolved by the kernel's unpacker against
+/// the archive root, so it cannot escape, but it still puts the file
+/// somewhere the manifest does not say.
+fn check_archive_name(dest: &str) -> anyhow::Result<()> {
+    if dest.is_empty() {
+        anyhow::bail!("extra_files key must not be empty");
+    }
+    if dest.starts_with('/') {
+        anyhow::bail!("extra_files key must be relative (got {dest})");
+    }
+    if dest.as_bytes().contains(&0) {
+        anyhow::bail!("extra_files key must not contain NUL (got {dest:?})");
+    }
+    if dest.split('/').any(|part| part == ".." || part == ".") {
+        anyhow::bail!(
+            "extra_files key must not contain '.' or '..' (got {dest})"
+        );
+    }
+    Ok(())
+}
+
 fn default_workdir() -> String {
     "/".to_string()
 }
@@ -258,9 +282,7 @@ impl Manifest {
             anyhow::bail!("manifest.init not a file: {}", self.init.display());
         }
         for (dest, src) in &self.extra_files {
-            if dest.starts_with('/') {
-                anyhow::bail!("extra_files key must be relative (got {dest})");
-            }
+            check_archive_name(dest)?;
             if !src.is_file() {
                 anyhow::bail!(
                     "extra_files[{dest}] missing on host: {}",
@@ -396,6 +418,37 @@ mod tests {
             vmm: default_vmm(),
             kernel_extra_cmdline: String::new(),
         }
+    }
+
+    /// The key becomes a cpio name verbatim. A NUL ends it early and
+    /// `..` or `.` moves the file, so the guest would not get the path
+    /// the manifest names.
+    ///
+    /// Mutation this kills: checking only the leading slash.
+    #[test]
+    fn validate_rejects_an_extra_files_key_a_cpio_name_cannot_carry() {
+        let files = TestFiles::new();
+        for key in ["", "/abs", "a\0b", "../x", "a/../b", "./x", "a/."] {
+            let mut m = manifest(&files);
+            m.extra_files.insert(key.to_string(), files.bin.clone());
+            let err = m
+                .validate()
+                .expect_err(&format!("key {key:?} must be refused"));
+            assert!(
+                err.to_string().contains("extra_files key"),
+                "{key:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_nested_extra_files_key() {
+        let files = TestFiles::new();
+        let mut m = manifest(&files);
+        m.extra_files
+            .insert("lib/x86_64/libc.so".to_string(), files.bin.clone());
+
+        m.validate().expect("a nested relative key is fine");
     }
 
     #[test]

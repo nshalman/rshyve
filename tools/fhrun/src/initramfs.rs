@@ -54,17 +54,14 @@ pub fn build(manifest: &Manifest) -> Result<Vec<u8>> {
         let meta = std::fs::metadata(src).with_context(|| {
             format!("stat extra_file {}: {}", dest, src.display())
         })?;
-        // POSIX mode bits: keep the low 9, force "regular file" type
-        // (0o100_000), and AND with rwxr-xr-x to keep group/other
-        // read+exec aligned.
+        // Keep the source's own bits, add read for group and other, and
+        // add exec for all three when the owner had it. The guest runs
+        // one process, so a copy the payload cannot read would only
+        // fail at run time.
         use std::os::unix::fs::PermissionsExt;
         let src_mode = meta.permissions().mode() & 0o777;
-        let mode = if src_mode & 0o100 != 0 {
-            // The source has an exec bit, so the copy is executable.
-            0o100_000 | (src_mode | 0o755)
-        } else {
-            0o100_000 | (src_mode | 0o644)
-        };
+        let base = if src_mode & 0o100 != 0 { 0o755 } else { 0o644 };
+        let mode = 0o100_000 | src_mode | base;
         extras.push((dest.clone(), data, mode));
     }
 
