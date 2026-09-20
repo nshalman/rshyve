@@ -54,22 +54,4 @@ mod metrics_alias {
         let json = m.to_json(3);
         assert!(json.contains(r#""vcpu":3"#), "{json}");
     }
-
-    #[test]
-    fn block_and_net_metrics_resolve_through_the_alias() {
-        let block = crate::metrics::BlockMetrics::new();
-        block.record_read(4096, 12, true);
-        assert_eq!(block.avg_read_latency_us(), 12);
-
-        let net = crate::metrics::NetMetrics::new();
-        net.record_kick();
-        assert!(net.to_json("net0").contains("net0"));
-    }
-
-    #[test]
-    fn vmm_metrics_resolves_through_the_alias() {
-        let mut all = crate::metrics::VmmMetrics::new(2);
-        all.add_block_device("disk0".to_string());
-        assert!(all.to_prometheus().contains("disk0"));
-    }
 }

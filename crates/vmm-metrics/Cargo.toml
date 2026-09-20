@@ -9,5 +9,7 @@ license = "MPL-2.0"
 workspace = true
 
 [dependencies]
-serde.workspace = true
+vmm_core.workspace = true
+
+[dev-dependencies]
 serde_json.workspace = true
