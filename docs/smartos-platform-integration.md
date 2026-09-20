@@ -1,6 +1,6 @@
 # Shipping firehyve in the SmartOS platform image
 
-Investigated 2026-09-15 against the vnext build host. Everything below
+Investigated 2026-09-15 on the vnext build host. Everything below
 was run or read there, not inferred. The headline: firehyve builds
 clean on the platform toolchain in 42 seconds, the platform already
 ships a Rust project by the same mechanism, and the platform already
@@ -8,32 +8,22 @@ has a supported hook for running an alternative VMM per zone.
 
 ## 1. How the vnext platform is built today
 
-One build host, `vnext-build`, running `joyent_20250918T000550Z`.
+A smartos-live checkout at branch `vnext`, configured with a
+`configure-projects` file that adds the vnext-specific projects, built
+with `gmake iso usb tests-tar`. A nightly wrapper clones a fresh tree,
+builds it, and copies `output/platform-<stamp>.tgz` and
+`output-iso/platform-<stamp>.iso` on success.
 
-| Piece | Where |
-|---|---|
-| Source repos | `~/repos/{smartos-live,illumos-joyent,proteus}` |
-| Build tree | `~/builds/sl-vnext`, a fresh clone per build |
-| Project list | `~/builds/configure-projects-vnext` |
-| Drivers | `~/bin/{vnext-nightly,clone-and-build,smartos-artifacts}` |
-| Output | `output/platform-<stamp>.tgz`, `output-iso/platform-<stamp>.iso` |
-
-`clone-and-build` discards the previous tree, clones smartos-live at
-branch `vnext`, copies `configure-projects-vnext` over
-`configure-projects`, runs `./configure`, then
-`gmake iso usb tests-tar`. `vnext-nightly` wraps it with `~/nobuild`
-and `~/nopull` interlocks and copies artifacts on success.
-
-`configure-projects-vnext` today:
+`configure-projects` for vnext today:
 
 ```
 illumos-extra: master: origin
-illumos: vnext: /home/vnext/repos/illumos-joyent
+illumos: vnext: <local illumos-joyent checkout>
 local/kbmd: master: origin
 local/kvm-cmd: master: origin
 local/kvm: master: origin
 local/mdata-client: master: origin
-local/proteus: main: git@github.com:/TritonDataCenter/proteus
+local/proteus: main: https://github.com/TritonDataCenter/proteus
 local/ur-agent: master: origin
 ```
 
@@ -57,7 +47,7 @@ The wiring is entirely convention:
 A project therefore owes four things: a `Makefile` with `world`,
 `install`, `manifest`, `clean`, `test` and `update` targets; a
 `manifest` file; a `rust-toolchain.toml`; and a line in
-`configure-projects-vnext`.
+`configure-projects`.
 
 proteus gets its toolchain from smartos-live's own `deps/eng`:
 
@@ -88,7 +78,7 @@ Three files and one line. Nothing structural.
 | `rust-toolchain.toml` | **absent** |
 | `Makefile` (smartos-live project contract) | **absent** |
 | `manifest` | **absent** |
-| Line in `configure-projects-vnext` | **absent** |
+| Line in `configure-projects` | **absent** |
 
 The Makefile is deliberately separate from the normal cargo workflow
 and is used only when the repo is pulled into a platform build, exactly
@@ -102,9 +92,8 @@ platform bhyve that the brand still expects to find.
 
 ## 4. It already builds
 
-Cloned `TritonDataCenter/rust-bhyve` at `53a384b` onto the build host
-and built it with the stock 1.97.1 illumos toolchain already installed
-there:
+Cloned `TritonDataCenter/rust-bhyve` at `53a384b` onto a vnext build
+host and built it with the stock 1.97.1 illumos toolchain:
 
 ```
 cargo build --release -p firehyve
@@ -121,10 +110,6 @@ links only platform libraries plus `libgcc_s.so.1`, which the platform
 ships at `/usr/lib/amd64/libgcc_s.so.1` via illumos-extra, so the
 pkgsrc path seen in `ldd` on the build host is a build-host artifact
 and not a packaging problem.
-
-Toolchains already present on the host: 1.95.0, 1.97.1, and two
-nightlies, all `x86_64-unknown-illumos`. Disk free is 377 GB. GitHub is
-reachable and the agent authenticates as `triton-automation`.
 
 **The kernel interfaces line up.** The `vnext` illumos branch in the
 build tree carries:
@@ -214,7 +199,7 @@ Gaps, in rough order of how much they block a sandbox product:
 
 ## 7. Suggested first step
 
-Add the three files, add the `configure-projects-vnext` line, and take
+Add the three files, add the `configure-projects` line, and take
 one nightly. That produces a platform image with `/usr/sbin/firehyve`
 in it, which can be exercised immediately through the existing
 `/bhyve.zone` override without touching the brand. It is a small,
