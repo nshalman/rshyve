@@ -433,3 +433,169 @@ mod tests {
         check_topology(&src, &dst).expect_err("kind is part of identity");
     }
 }
+
+#[cfg(test)]
+mod pass_tests {
+    use super::*;
+    use crate::codec::PAGE_BATCH_FLAG_ZSTD;
+    use crate::protocol::PAGE_SIZE;
+    use crate::wire::Deadlines;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    use vmm_core::mem::PhysMap;
+
+    const RAM: usize = 64 * 1024;
+
+    fn memctx() -> MemCtx {
+        MemCtx::new(Arc::new(
+            PhysMap::new_anon(0, RAM).expect("anonymous guest memory"),
+        ))
+    }
+
+    fn status() -> Arc<Mutex<MigrationStatus>> {
+        Arc::new(Mutex::new(MigrationStatus::default()))
+    }
+
+    /// A connected pair of channels, source end first.
+    fn pair(deadlines: Deadlines) -> (Chan<UnixStream>, Chan<UnixStream>) {
+        let (a, b) = UnixStream::pair().expect("socket pair");
+        (
+            Chan::new(a, tungstenite::protocol::Role::Client, deadlines)
+                .expect("source channel"),
+            Chan::new(b, tungstenite::protocol::Role::Server, deadlines)
+                .expect("destination channel"),
+        )
+    }
+
+    fn page(fill: u8) -> Vec<u8> {
+        vec![fill; PAGE_SIZE]
+    }
+
+    fn read_page(memctx: &MemCtx, gpa: u64) -> Vec<u8> {
+        let mut out = vec![0u8; PAGE_SIZE];
+        crate::pages::read_pages(memctx, &[gpa], &mut out).expect("read back");
+        out
+    }
+
+    #[test]
+    fn a_whole_pass_lands_every_page_it_carried() {
+        // The phase machine had no end-to-end test at all, so a
+        // destination that dropped a sparse batch looked correct.
+        let (mut source, mut dest) = pair(Deadlines::default());
+        let sender = std::thread::spawn(move || {
+            // Contiguous.
+            source
+                .send(&Message::PageBatch {
+                    base_gpa: 0,
+                    page_count: 2,
+                    flags: 0,
+                    data: [page(0xAA), page(0xBB)].concat(),
+                })
+                .expect("contiguous batch");
+            // Sparse: the GPA list is the only thing that says where
+            // these pages go.
+            let gpas = vec![0x8000u64, 0xC000];
+            source.send(&Message::MemFetch(gpas)).expect("fetch");
+            source
+                .send(&Message::PageBatch {
+                    base_gpa: 0x8000,
+                    page_count: 2,
+                    flags: 0,
+                    data: [page(0xCC), page(0xDD)].concat(),
+                })
+                .expect("sparse batch");
+            source.send(&Message::MemEnd).expect("end of pass");
+            source.expect_mem_done().expect("the pass is acknowledged");
+            source.send(&Message::PauseSignal).expect("pause");
+            source
+        });
+        let memctx = memctx();
+        receive_pass(&mut dest, &memctx, &status(), PassEnd::PauseSignal)
+            .expect("a well-formed pass");
+        sender.join().expect("the sender finished");
+
+        assert_eq!(read_page(&memctx, 0), page(0xAA));
+        assert_eq!(read_page(&memctx, PAGE_SIZE as u64), page(0xBB));
+        assert_eq!(read_page(&memctx, 0x8000), page(0xCC));
+        assert_eq!(read_page(&memctx, 0xC000), page(0xDD));
+    }
+
+    #[test]
+    fn a_compressed_batch_lands_the_same_bytes() {
+        let (mut source, mut dest) = pair(Deadlines::default());
+        let raw = [page(0x11), page(0x22)].concat();
+        let data = zstd::bulk::compress(&raw, 1).expect("compress");
+        let sender = std::thread::spawn(move || {
+            source
+                .send(&Message::PageBatch {
+                    base_gpa: 0,
+                    page_count: 2,
+                    flags: PAGE_BATCH_FLAG_ZSTD,
+                    data,
+                })
+                .expect("batch");
+            source.send(&Message::MemEnd).expect("end");
+            source
+        });
+        let memctx = memctx();
+        receive_pass(&mut dest, &memctx, &status(), PassEnd::MemEnd)
+            .expect("a compressed pass");
+        sender.join().expect("the sender finished");
+        assert_eq!(read_page(&memctx, 0), page(0x11));
+    }
+
+    #[test]
+    fn anything_but_a_batch_after_a_fetch_is_refused() {
+        // A MemFetch commits the peer to exactly one PageBatch. Taking
+        // anything else silently discards the pages those GPAs stand
+        // for.
+        let (mut source, mut dest) = pair(Deadlines::default());
+        let sender = std::thread::spawn(move || {
+            source
+                .send(&Message::MemFetch(vec![0x8000]))
+                .expect("fetch");
+            source.send(&Message::MemEnd).expect("not a batch");
+            source
+        });
+        let error =
+            receive_pass(&mut dest, &memctx(), &status(), PassEnd::MemEnd)
+                .expect_err("a fetch without its batch");
+        assert!(
+            error.to_string().contains("PageBatch following MemFetch"),
+            "{error}",
+        );
+        sender.join().expect("the sender finished");
+    }
+
+    #[test]
+    fn a_pause_signal_does_not_end_the_final_pass() {
+        // The final pass ends at MemEnd. A peer that sends PauseSignal
+        // there is out of step, and taking it would leave the guest
+        // short of its last dirty pages.
+        let (mut source, mut dest) = pair(Deadlines::default());
+        let sender = std::thread::spawn(move || {
+            source.send(&Message::PauseSignal).expect("pause");
+            source
+        });
+        receive_pass(&mut dest, &memctx(), &status(), PassEnd::MemEnd)
+            .expect_err("a pause in the final pass");
+        sender.join().expect("the sender finished");
+    }
+
+    #[test]
+    fn a_silent_peer_does_not_hold_the_destination_for_ever() {
+        // After the pause the guest is stopped on both hosts, so every
+        // second of waiting is guest downtime.
+        let deadlines = Deadlines {
+            pre_pause: Duration::from_millis(200),
+            post_pause: Duration::from_millis(200),
+            ..Deadlines::default()
+        };
+        let (source, mut dest) = pair(deadlines);
+        let started = std::time::Instant::now();
+        receive_pass(&mut dest, &memctx(), &status(), PassEnd::MemEnd)
+            .expect_err("a peer that says nothing");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(source);
+    }
+}
