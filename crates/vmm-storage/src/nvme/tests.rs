@@ -480,6 +480,82 @@ fn io_write_reaches_the_backing_file() {
     assert!(buf.iter().all(|&b| b == 0x5A));
 }
 
+/// Write a PRP list entry at `gpa`.
+fn put_prp(h: &Harness, gpa: u64, entry: u64) {
+    h.mem().write(gpa, &entry.to_le_bytes()).expect("PRP entry");
+}
+
+#[test]
+fn io_read_follows_a_prp_list_that_chains_at_the_page_end() {
+    let mut h = Harness::new();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    // The list starts one entry short of its page end, so the walker
+    // must treat that last entry as a chain to the second list.
+    let first_page = 0x60000;
+    let list_a = 0x61FF8;
+    let list_b = 0x62000;
+    let (page_b, page_c) = (0x63000, 0x64000);
+    h.fill(0x60000, 5 * PAGE_SIZE, 0xAA);
+    put_prp(&h, list_a, list_b);
+    put_prp(&h, list_b, page_b);
+    put_prp(&h, list_b + 8, page_c);
+
+    let mut tail = 0;
+    io_submit(
+        &mut h,
+        &mut tail,
+        Sqe::read(0, 24, first_page, list_a),
+        0x33,
+    );
+    assert_eq!(h.wait_cqe(CQ1, 0, true).status(), Status::SUCCESS);
+
+    let expect: Vec<u8> = (0..24 * 512).map(backing_byte).collect();
+    assert_eq!(h.read_guest(first_page, PAGE_SIZE), expect[..PAGE_SIZE]);
+    assert_eq!(
+        h.read_guest(page_b, PAGE_SIZE),
+        expect[PAGE_SIZE..2 * PAGE_SIZE]
+    );
+    assert_eq!(h.read_guest(page_c, PAGE_SIZE), expect[2 * PAGE_SIZE..]);
+    // The page holding the first list is untouched past its entry.
+    assert!(h.read_guest(0x61000, 0xFF8).iter().all(|&b| b == 0xAA));
+}
+
+#[test]
+fn prp2_with_a_page_offset_is_refused() {
+    let mut h = Harness::new();
+    h.enable();
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_IDENTIFY,
+        prp1: 0x20800,
+        prp2: 0x22008,
+        cdw10: u32::from(IDENTIFY_CNS_CONTROLLER),
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::of(SC_DATA_XFER_ERROR));
+    assert!(h.read_guest(0x22000, PAGE_SIZE).iter().all(|&b| b == 0));
+}
+
+#[test]
+fn prp_list_entry_with_a_page_offset_is_refused() {
+    let mut h = Harness::new();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    let list = 0x61000;
+    h.fill(0x60000, 5 * PAGE_SIZE, 0xAA);
+    put_prp(&h, list, 0x63040);
+    put_prp(&h, list + 8, 0x64000);
+
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::read(0, 24, 0x60000, list), 0x34);
+    let cqe = h.wait_cqe(CQ1, 0, true);
+    assert_eq!(cqe.status(), Status::of(SC_DATA_XFER_ERROR));
+    // Nothing was transferred: the walk fails before any lookup.
+    assert!(h.read_guest(0x60000, PAGE_SIZE).iter().all(|&b| b == 0xAA));
+}
+
 #[test]
 fn io_read_past_the_namespace_is_refused() {
     let mut h = Harness::new();

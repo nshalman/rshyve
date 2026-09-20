@@ -49,15 +49,14 @@ pub(super) fn io_worker(
             }
         };
 
+        let mem = MemCtx::new(Arc::clone(&physmap));
         let status = process_io_request(
             &req,
             backend.as_ref(),
             read_only,
-            &physmap,
+            &mem,
             ctrl.geometry,
         );
-        // Post completion: need to lock state briefly to access the CQ
-        let mem = MemCtx::new(Arc::clone(&physmap));
         let sq_head = {
             let st = ctrl.state.lock().expect("nvme: state lock");
             if let Some(idx) = io_queue_index(req.sqid) {

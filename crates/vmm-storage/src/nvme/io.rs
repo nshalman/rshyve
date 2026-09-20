@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io;
 use std::sync::Arc;
 
-use vmm_core::mem::{GuestIoVec, MemCtx, PhysMap};
+use vmm_core::mem::{GuestIoVec, MemCtx};
 
 use super::bits::*;
 use super::prp::prp_to_iovec;
@@ -161,7 +161,7 @@ pub(super) fn process_io_request(
     req: &IoRequest,
     backend: &dyn IoBackend,
     read_only: bool,
-    physmap: &Arc<PhysMap>,
+    mem: &MemCtx,
     geometry: Geometry,
 ) -> u16 {
     if req.nsid != 1 {
@@ -192,7 +192,7 @@ pub(super) fn process_io_request(
 
     match req.opcode {
         NVM_OPC_READ => {
-            let Ok(iov) = prp_to_iovec(physmap, req.prp1, req.prp2, byte_count)
+            let Ok(iov) = prp_to_iovec(mem, req.prp1, req.prp2, byte_count)
             else {
                 return SC_DATA_XFER_ERROR;
             };
@@ -205,7 +205,7 @@ pub(super) fn process_io_request(
             if read_only {
                 return SC_DATA_XFER_ERROR;
             }
-            let Ok(iov) = prp_to_iovec(physmap, req.prp1, req.prp2, byte_count)
+            let Ok(iov) = prp_to_iovec(mem, req.prp1, req.prp2, byte_count)
             else {
                 return SC_DATA_XFER_ERROR;
             };
