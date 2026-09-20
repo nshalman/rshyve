@@ -17,6 +17,10 @@ const FADT_SIZE: u32 = 276;
 // FADT flag bits
 const FADT_WBINVD: u32 = 1 << 0;
 const FADT_PROC_C1: u32 = 1 << 2;
+/// No fixed power button: set means the OS looks for a control-method
+/// device instead of polling PM1_STS, which nothing here raises.
+const FADT_PWR_BUTTON: u32 = 1 << 4;
+/// No fixed sleep button, for the same reason.
 const FADT_SLP_BUTTON: u32 = 1 << 5;
 const FADT_TMR_VAL_EXT: u32 = 1 << 8;
 const FADT_RESET_REG_SUP: u32 = 1 << 10;
@@ -122,6 +126,7 @@ pub(super) fn build_fadt(
     // offset 112: Flags (u32 LE)
     let flags = FADT_WBINVD
         | FADT_PROC_C1
+        | FADT_PWR_BUTTON
         | FADT_SLP_BUTTON
         | FADT_TMR_VAL_EXT
         | FADT_RESET_REG_SUP
@@ -242,6 +247,17 @@ mod tests {
             assert_eq!(&fadt[0..4], b"FACP");
             assert!(verify_checksum(&fadt));
         }
+    }
+
+    #[test]
+    fn fadt_advertises_no_fixed_power_or_sleep_button() {
+        // Nothing raises PM1_PWRBTN_STS, so a guest told there is a
+        // fixed power button would wait on an SCI that never comes.
+        let fadt = build_fadt(0x1000, 0x2000, &no_hotplug());
+        let flags =
+            u32::from_le_bytes([fadt[112], fadt[113], fadt[114], fadt[115]]);
+        assert_ne!(flags & FADT_PWR_BUTTON, 0);
+        assert_ne!(flags & FADT_SLP_BUTTON, 0);
     }
 
     #[test]

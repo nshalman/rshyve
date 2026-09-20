@@ -686,7 +686,7 @@ mod tests {
         };
         let layout = generate_acpi_layout(2);
         let tables = (layout.tables.len(), fnv(&layout.tables));
-        assert_eq!(tables, (3301, 0x8f52_c456_b976_2c72));
+        assert_eq!(tables, (3301, 0x875d_3c87_2388_c502));
         let rsdp = (layout.rsdp.len(), fnv(&layout.rsdp));
         assert_eq!(rsdp, (RSDP_SIZE, 0x5ee2_e132_9368_597e));
     }
