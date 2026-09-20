@@ -27,7 +27,7 @@ use std::sync::Arc;
 use vmm_core::mem::PhysMap;
 
 use super::fuse::{self, bytes_of, push_val, read_at};
-use super::passthrough::{Passthrough, PtError};
+use super::passthrough::Passthrough;
 use crate::chain_io::{ChainReader, ChainWriter};
 use crate::queue::ChainBuf;
 
@@ -416,7 +416,6 @@ impl FuseServer {
         };
         let max = (rd.size as usize).min(MAX_MSG_SIZE);
         let mut out: Vec<u8> = Vec::with_capacity(max.min(64 * 1024));
-        let mut saw_err: Option<PtError> = None;
         let pt = &self.passthrough;
         let res = pt.readdir_each(rd.fh, rd.offset, |ino, name, dt, next| {
             let name_bytes = name.to_bytes();
@@ -431,13 +430,17 @@ impl FuseServer {
                 return false;
             }
             if with_plus {
-                let entry = match pt.lookup(header.nodeid, name) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        saw_err = Some(e);
-                        return false;
-                    }
-                };
+                // An entry the lookup refuses, a socket or a FIFO, one
+                // unlinked since the snapshot, or one past the inode
+                // cap, still goes out with nodeid 0. Linux takes that
+                // as "not cached" and looks the name up on its own, so
+                // it gets that entry's error rather than losing the
+                // whole listing to it. No lookup reference is left
+                // behind: only the entries the guest is told about
+                // take one.
+                let entry = pt
+                    .lookup(header.nodeid, name)
+                    .unwrap_or_else(|_| fuse::FuseEntryOut::default());
                 push_val(&mut out, &entry);
             }
             let d = fuse::FuseDirent {
@@ -454,9 +457,6 @@ impl FuseServer {
             true
         });
         if let Err(e) = res {
-            return Reply::Error(-e.to_errno());
-        }
-        if let Some(e) = saw_err {
             return Reply::Error(-e.to_errno());
         }
         Reply::Body(out)

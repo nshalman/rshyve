@@ -473,6 +473,134 @@ fn o_directory_on_the_wire_is_accepted_by_open() {
     assert_eq!(reply_error(&srv, &open_request(nodeid, flags)), 0);
 }
 
+// -------------------------------------------------------------------
+// Directory listings over the wire
+// -------------------------------------------------------------------
+
+/// Run one request through `handle` and return the whole reply.
+fn reply_bytes(srv: &FuseServer, req: &[u8]) -> Vec<u8> {
+    let physmap = anon();
+    seed(&physmap, REQ, req);
+    let bufs = vec![
+        ChainBuf::Readable {
+            addr: REQ,
+            len: req.len() as u32,
+        },
+        ChainBuf::Writable {
+            addr: RESP,
+            len: 0x2000,
+        },
+    ];
+    let written = handle(srv, &bufs, &physmap);
+    assert!(written as usize >= fuse::FUSE_OUT_HEADER_SIZE);
+    fetch(&physmap, RESP, written as usize)
+}
+
+fn header_only(
+    opcode: u32,
+    nodeid: u64,
+    body_len: usize,
+) -> fuse::FuseInHeader {
+    fuse::FuseInHeader {
+        len: (fuse::FUSE_IN_HEADER_SIZE + body_len) as u32,
+        opcode,
+        unique: 0x8080,
+        nodeid,
+        uid: 0,
+        gid: 0,
+        pid: 0,
+        padding: 0,
+    }
+}
+
+/// FUSE_OPENDIR of the root, returning the handle the reply carries.
+fn opendir_root(srv: &FuseServer) -> u64 {
+    let req = bytes_of(&header_only(fuse::FUSE_OPENDIR, fuse::FUSE_ROOT_ID, 0));
+    let out = reply_bytes(srv, &req);
+    let hdr: fuse::FuseOutHeader = read_at(&out).expect("out header");
+    assert_eq!(hdr.error, 0, "OPENDIR failed");
+    let open: fuse::FuseOpenOut =
+        read_at(&out[fuse::FUSE_OUT_HEADER_SIZE..]).expect("open out");
+    open.fh
+}
+
+/// One READDIRPLUS entry as the guest parses it.
+#[derive(Debug, PartialEq, Eq)]
+struct PlusEntry {
+    name: Vec<u8>,
+    nodeid: u64,
+}
+
+/// FUSE_READDIRPLUS of `fh` from offset 0, parsed the way
+/// `fs/fuse/readdir.c` walks the buffer. The error field is returned
+/// with the entries so a refused listing is visible as such.
+fn readdirplus(srv: &FuseServer, fh: u64) -> (i32, Vec<PlusEntry>) {
+    let body = fuse::FuseReadIn {
+        fh,
+        offset: 0,
+        size: 4096,
+        read_flags: 0,
+        lock_owner: 0,
+        flags: 0,
+        padding: 0,
+    };
+    let mut req = bytes_of(&header_only(
+        fuse::FUSE_READDIRPLUS,
+        fuse::FUSE_ROOT_ID,
+        size_of::<fuse::FuseReadIn>(),
+    ));
+    push_val(&mut req, &body);
+    let out = reply_bytes(srv, &req);
+    let hdr: fuse::FuseOutHeader = read_at(&out).expect("out header");
+
+    let mut entries = Vec::new();
+    let mut at = fuse::FUSE_OUT_HEADER_SIZE;
+    while at < out.len() {
+        let entry: fuse::FuseEntryOut = read_at(&out[at..]).expect("entry");
+        at += size_of::<fuse::FuseEntryOut>();
+        let dirent: fuse::FuseDirent = read_at(&out[at..]).expect("dirent");
+        let namelen = dirent.namelen as usize;
+        let name = out[at + fuse::FUSE_DIRENT_SIZE..][..namelen].to_vec();
+        at += fuse::dirent_size(namelen);
+        entries.push(PlusEntry {
+            name,
+            nodeid: entry.nodeid,
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    (hdr.error, entries)
+}
+
+fn mkfifo(path: &std::path::Path) {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .expect("path");
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
+}
+
+// The server advertises READDIRPLUS, so Linux lists a directory with
+// it. An entry the passthrough will not serve, here a FIFO, used to
+// fail the whole listing with ENOTSUP. It has to go out with nodeid 0
+// instead: Linux reads that as "look this one up yourself".
+#[test]
+fn readdirplus_lists_past_an_entry_the_passthrough_refuses() {
+    let dir = private_dir();
+    std::fs::write(dir.path().join("a"), b"x").expect("seed a");
+    mkfifo(&dir.path().join("fifo"));
+    std::fs::write(dir.path().join("z"), b"x").expect("seed z");
+    let srv = server_on(&dir, true);
+
+    let fh = opendir_root(&srv);
+    let (error, entries) = readdirplus(&srv, fh);
+
+    assert_eq!(error, 0, "the FIFO took the whole listing down");
+    let names: Vec<&[u8]> = entries.iter().map(|e| e.name.as_slice()).collect();
+    assert_eq!(names, [b"a".as_slice(), b"fifo", b"z"]);
+    assert_eq!(entries[1].nodeid, 0, "the FIFO was given a nodeid");
+    assert_ne!(entries[0].nodeid, 0, "a regular file lost its nodeid");
+    assert_ne!(entries[2].nodeid, 0, "the entry after the FIFO was lost");
+}
+
 // A DAX window would hand the guest a mapping of host files that
 // outlives the driver session: a device reset can take back the ring,
 // but not a mapping the guest already holds. The export offers none,
