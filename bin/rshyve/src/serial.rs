@@ -302,7 +302,11 @@ fn serve_socket_client(
     }
 
     info!(log, "serial client disconnected"; "port" => name);
-    let _: Result<_, _> = conns.send(None);
+    if conns.send(None).is_err() {
+        // The writer thread is gone, so there is no stream left to
+        // clear and nothing to report.
+        debug!(log, "serial writer is gone"; "port" => name);
+    }
 }
 
 /// Drain guest output into whichever client is connected.
