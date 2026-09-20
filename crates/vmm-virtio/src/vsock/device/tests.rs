@@ -239,6 +239,40 @@ fn rx_ring_full() -> (Arc<PhysMap>, Vec<VirtQueue>) {
     (physmap, vec![queue])
 }
 
+/// A transmit queue with EVENT_IDX on and every slot filled. The
+/// chains are device-readable, as a guest's outgoing packets are.
+fn tx_ring_full() -> (Arc<PhysMap>, Vec<VirtQueue>) {
+    let physmap = Arc::new(
+        PhysMap::new_anon(DESC_GPA, 0x2000).expect("create queue memory"),
+    );
+    let mut queue = VirtQueue::new(RING_SIZE);
+    queue.set_addr_modern(DESC_GPA, AVAIL_GPA, USED_GPA);
+    queue.set_event_idx(true);
+    for i in 0..RING_SIZE {
+        write_desc(
+            &physmap,
+            u64::from(i),
+            BUF_GPA + u64::from(i) * 64,
+            64,
+            0,
+            0,
+        );
+        physmap
+            .lookup(AVAIL_GPA + 4 + u64::from(i) * 2, 2)
+            .expect("mapped avail entry")
+            .write::<u16>(&i)
+            .expect("write avail entry");
+    }
+    physmap
+        .lookup(AVAIL_GPA + 2, 2)
+        .expect("mapped avail index")
+        .write::<u16>(&RING_SIZE)
+        .expect("write avail index");
+    // The transport indexes by queue number, so the transmit ring has
+    // to sit at its own index.
+    (physmap, vec![VirtQueue::new(RING_SIZE), queue])
+}
+
 /// The device's own "kick me past here" threshold, which lives at the
 /// end of the used ring (VIRTIO 1.3 sec 2.7.7).
 fn avail_event(physmap: &PhysMap) -> u16 {
@@ -945,6 +979,32 @@ fn the_reader_offers_every_byte_once_through_a_small_window() {
 /// Linux fills the whole ring the moment it probes, so this is the
 /// first pass, not a corner. Kills the mutation of arming only when
 /// the pass stopped short of the request cap.
+/// The transmit ring has the same trap as the receive ring: nothing
+/// returns to it without a guest kick, so a pass that stops on the
+/// request cap must still arm `avail_event` or the guest goes quiet
+/// and the device never sees the rest of the ring.
+#[test]
+fn a_transmit_ring_taken_whole_still_arms_the_next_kick() {
+    let (physmap, mut queues) = tx_ring_full();
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+
+    vsock.notify_queue(VSOCK_TX_QUEUE, &mut queues, &physmap);
+
+    assert_eq!(
+        used_idx(&physmap),
+        RING_SIZE,
+        "the whole ring should have been consumed",
+    );
+    assert_eq!(
+        avail_event(&physmap),
+        RING_SIZE,
+        "avail_event left behind the ring: the guest will never kick again",
+    );
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_ring_taken_whole_still_arms_the_next_kick() {
     let (physmap, mut queues) = rx_ring_full();

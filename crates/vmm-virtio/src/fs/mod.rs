@@ -515,12 +515,18 @@ impl VirtioDevice for VirtioFs {
                 }
             }
 
+            // Arm the kick on every path out, the cap included. The
+            // worker answers these requests off the vCPU, so nothing
+            // comes back to this ring on its own: a device that left
+            // `avail_event` unarmed at the cap told the guest to
+            // suppress its next kick, and was then never notified
+            // again. The queue is the cap, so hitting it means every
+            // descriptor is outstanding and the guest's next post is
+            // the index armed here.
             let hit_request_cap = popped >= max_requests;
-            if !hit_request_cap {
-                queue.update_used_event(physmap);
-            }
+            queue.update_used_event(physmap);
             // The no-progress check is what stops a guest-triggerable vCPU
-            // hang in this re-check loop (fixed for virtio-blk in b8b429e).
+            // hang in this re-check loop.
             if super::queue_drain_should_stop(
                 queue,
                 before,

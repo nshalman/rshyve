@@ -54,10 +54,12 @@ impl VirtioVsock {
                 queue.push_used(physmap, head, 0);
                 used = true;
             }
+            // Arm the kick on every path out, as the RX stash does:
+            // nothing returns to this ring without a guest kick, so a
+            // cap exit that left `avail_event` unarmed would suppress
+            // the kick the device needs to see the rest.
             let hit_request_cap = popped >= max_requests;
-            if !hit_request_cap {
-                queue.update_used_event(physmap);
-            }
+            queue.update_used_event(physmap);
             if queue_drain_should_stop(queue, before, hit_request_cap, physmap)
             {
                 break;
