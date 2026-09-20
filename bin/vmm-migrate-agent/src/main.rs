@@ -21,10 +21,24 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, ensure, Context};
 use clap::Parser;
+
+/// The byte the VMM reads as "the destination disk is current".
+const ZFS_BARRIER_OK: u8 = 0;
+/// Anything else fails the migration; this is what the agent sends.
+const ZFS_BARRIER_FAILED: u8 = 1;
+
+/// How long the barrier waits for the VMM to reach its pause.
+///
+/// Longer than the pre-copy convergence takes, and short enough that a
+/// wedged migration does not leave the agent running for ever.
+const BARRIER_WAIT: Duration = Duration::from_secs(1800);
+const BARRIER_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Parser, Debug)]
 #[command(name = "vmm-migrate-agent")]
@@ -121,9 +135,12 @@ fn main() -> anyhow::Result<()> {
             )
         }
         Cli::Dest { uuid, port } => {
+            // The uuid builds a path under the zone root, so it is
+            // checked here as it is on the source side.
+            check_name("uuid", &uuid)?;
             let mig_sock =
                 format!("/zones/{uuid}/root/tmp/vmm-migrate-data.sock");
-            run_dest(&uuid, port, &mig_sock)
+            run_dest(port, &mig_sock)
         }
     }
 }
@@ -138,6 +155,10 @@ fn now() -> String {
 
 /// Accept only the characters a dataset, a UUID, or a host name is
 /// made of. Anything else could reach the remote shell as syntax.
+///
+/// A leading `-` becomes an option to whatever the value is handed to
+/// (`--disk-dataset -R` reaches `zfs` as a flag), and `..` climbs out
+/// of the zone root the paths are built from.
 fn check_name(what: &str, value: &str) -> anyhow::Result<()> {
     ensure!(
         !value.is_empty()
@@ -146,6 +167,14 @@ fn check_name(what: &str, value: &str) -> anyhow::Result<()> {
                     || matches!(c, '_' | '-' | '.' | '/' | ':')
             }),
         "{what} {value:?} holds a character that is not allowed"
+    );
+    ensure!(
+        !value.starts_with('-'),
+        "{what} {value:?} would be read as an option"
+    );
+    ensure!(
+        !value.split('/').any(|part| part == ".."),
+        "{what} {value:?} traverses out of its directory"
     );
     Ok(())
 }
@@ -231,7 +260,11 @@ fn zfs_send_recv(
     Ok(())
 }
 
-/// Send one control command to the VMM and log its answer.
+/// Send one control command to the VMM and take its verdict.
+///
+/// A refused command means the migration never starts. Ignoring the
+/// answer left the agent waiting for a VMM connection that was never
+/// coming.
 fn control_command(
     ctl: &Path,
     command: &serde_json::Value,
@@ -241,11 +274,20 @@ fn control_command(
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     writeln!(stream, "{command}")?;
     let mut reply = String::new();
-    // The command has been delivered once the write returns; a slow
-    // or missing answer is worth a log line, not a failure.
-    if BufReader::new(&stream).read_line(&mut reply).is_ok() {
-        log(&format!("  VMM answered: {}", reply.trim_end()));
-    }
+    BufReader::new(&stream)
+        .read_line(&mut reply)
+        .context("the VMM did not answer the control command")?;
+    log(&format!("  VMM answered: {}", reply.trim_end()));
+    let parsed: serde_json::Value = serde_json::from_str(reply.trim_end())
+        .context("the VMM's answer is not JSON")?;
+    ensure!(
+        parsed.get("success").and_then(|v| v.as_bool()) == Some(true),
+        "the VMM refused the command: {}",
+        parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("no reason given"),
+    );
     Ok(())
 }
 
@@ -320,14 +362,18 @@ fn run_source(
     // Now that ZFS is synced, boot the dest VM. The VMM will see
     // --migrate-listen and connect to the dest agent's Unix socket.
     log("Phase 3.5: starting dest VM");
-    match ssh.remote(&["vmadm", "start", uuid]).status() {
-        Ok(st) if st.success() => log("  dest VM started"),
-        Ok(st) => log(&format!(
-            "  dest VM start exited {} (may be already running)",
-            st.code().unwrap_or(-1)
-        )),
-        Err(e) => log(&format!("  dest VM start failed to run: {e}")),
-    }
+    // A dest VM that did not start never connects to the dest agent,
+    // and the migration would wait on it for ever.
+    let started = ssh
+        .remote(&["vmadm", "start", uuid])
+        .status()
+        .context("run vmadm start on the destination")?;
+    ensure!(
+        started.success(),
+        "vmadm start {uuid} exited {} on the destination",
+        started.code().unwrap_or(-1),
+    );
+    log("  dest VM started");
     // Give the VMM a moment to boot and connect to the Unix socket
     std::thread::sleep(Duration::from_secs(3));
 
@@ -363,7 +409,6 @@ fn run_source(
         let barrier_listener =
             std::os::unix::net::UnixListener::bind(&barrier_gz_path)
                 .context("bind ZFS barrier socket")?;
-        barrier_listener.set_nonblocking(true).ok();
         log(&format!("  ZFS barrier at {barrier_gz_path}"));
 
         let trigger = serde_json::json!({
@@ -371,9 +416,9 @@ fn run_source(
             "target_addr": zone_mig_path,
             "zfs_barrier": barrier_zone_path,
         });
-        // Spawn background thread for post-pause ZFS barrier sync.
-        // Blocks on accept() until VMM connects (vCPUs paused), then
-        // does final ZFS incremental, then signals VMM to continue.
+        // The barrier thread waits for the VMM to connect, which is
+        // its signal that the vCPUs are paused. It then runs the final
+        // incremental and reports the verdict as one byte.
         let zfs_src = src_disk.to_string();
         let zfs_dst = dst_disk.to_string();
         let zfs_ssh = Ssh {
@@ -382,47 +427,26 @@ fn run_source(
         };
         let zfs_skip = skip_zfs;
         let barrier_cleanup = barrier_gz_path.clone();
+        let bridge_done = Arc::new(AtomicBool::new(false));
+        let barrier_giveup = Arc::clone(&bridge_done);
         let zfs_handle = std::thread::Builder::new()
             .name("zfs-barrier".into())
             .spawn(move || {
-                // Switch to blocking mode for accept
-                barrier_listener.set_nonblocking(false).ok();
-                barrier_listener.set_nonblocking(false).ok();
-                match barrier_listener.accept() {
-                    Ok((mut conn, _)) => {
-                        log("  ZFS barrier: VMM paused, starting final sync");
-                        if !zfs_skip {
-                            let snap = format!("{zfs_src}@vmm-mig-postpause");
-                            let fin = format!("{zfs_src}@vmm-mig-final");
-                            zfs_destroy_quiet(&snap);
-                            if let Err(e) = zfs(&["snapshot", &snap]) {
-                                log(&format!(
-                                    "  ZFS barrier: snapshot failed: {e}"
-                                ));
-                            } else if let Err(e) = zfs_send_recv(
-                                &["-i", &fin, &snap],
-                                &zfs_ssh,
-                                &zfs_dst,
-                            ) {
-                                log(&format!(
-                                    "  ZFS barrier: send failed: {e}"
-                                ));
-                            } else {
-                                log("  ZFS barrier: final incremental sent");
-                            }
-                        } else {
-                            log("  ZFS barrier: skipped (--skip-zfs)");
-                        }
-                        // Signal VMM to continue
-                        let _ = conn.write_all(&[1u8]);
-                    }
-                    Err(e) => {
-                        log(&format!("  ZFS barrier: accept failed: {e}"))
-                    }
-                }
+                let outcome = run_zfs_barrier(
+                    &barrier_listener,
+                    &barrier_giveup,
+                    &zfs_src,
+                    &zfs_dst,
+                    &zfs_ssh,
+                    zfs_skip,
+                );
+                // The socket is removed here whatever happened, so a
+                // migration that never reached the pause does not leave
+                // it behind.
                 let _ = std::fs::remove_file(&barrier_cleanup);
+                outcome
             })
-            .ok();
+            .context("spawn the ZFS barrier thread")?;
 
         log(&format!("  triggering: {trigger}"));
         control_command(ctl, &trigger)?;
@@ -437,15 +461,20 @@ fn run_source(
         let to_dest = tokio::io::copy(&mut ur, &mut tw);
         let from_dest = tokio::io::copy(&mut tr, &mut uw);
 
-        tokio::select! {
-            r = to_dest => log(&format!("  VMM→dest done: {:?}", r)),
-            r = from_dest => log(&format!("  dest→VMM done: {:?}", r)),
-        }
+        let bridged = tokio::select! {
+            r = to_dest => r.context("bridging VMM to dest"),
+            r = from_dest => r.context("bridging dest to VMM"),
+        };
 
+        // Whatever the bridge did, the barrier is not going to be
+        // reached again, so the thread stops waiting.
+        bridge_done.store(true, Ordering::Release);
         let _ = std::fs::remove_file(mig_sock);
-        if let Some(h) = zfs_handle {
-            let _ = h.join();
-        }
+        let barrier = zfs_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("the ZFS barrier thread panicked"))?;
+        bridged?;
+        barrier?;
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -458,7 +487,7 @@ fn run_source(
     Ok(())
 }
 
-fn run_dest(_uuid: &str, port: u16, mig_sock: &str) -> anyhow::Result<()> {
+fn run_dest(port: u16, mig_sock: &str) -> anyhow::Result<()> {
     log(&format!("Destination agent on port {port}"));
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -480,16 +509,21 @@ fn run_dest(_uuid: &str, port: u16, mig_sock: &str) -> anyhow::Result<()> {
 
         let (tcp, unix) = tokio::join!(
             async {
-                let (s, peer) = tcp_listener.accept().await.unwrap();
+                let (s, peer) = tcp_listener
+                    .accept()
+                    .await
+                    .context("accept the source agent")?;
                 log(&format!("  source agent connected from {peer}"));
-                s
+                Ok::<_, anyhow::Error>(s)
             },
             async {
-                let (s, _) = unix_listener.accept().await.unwrap();
+                let (s, _) =
+                    unix_listener.accept().await.context("accept the VMM")?;
                 log("  dest VMM connected");
-                s
+                Ok::<_, anyhow::Error>(s)
             }
         );
+        let (tcp, unix) = (tcp?, unix?);
 
         let (mut tr, mut tw) = tokio::io::split(tcp);
         let (mut ur, mut uw) = tokio::io::split(unix);
@@ -497,12 +531,147 @@ fn run_dest(_uuid: &str, port: u16, mig_sock: &str) -> anyhow::Result<()> {
         let to_vmm = tokio::io::copy(&mut tr, &mut uw);
         let from_vmm = tokio::io::copy(&mut ur, &mut tw);
 
-        tokio::select! {
-            r = to_vmm => log(&format!("  src→VMM done: {:?}", r)),
-            r = from_vmm => log(&format!("  VMM→src done: {:?}", r)),
-        }
+        let bridged = tokio::select! {
+            r = to_vmm => r.context("bridging source to VMM"),
+            r = from_vmm => r.context("bridging VMM to source"),
+        };
+        let _ = std::fs::remove_file(mig_sock);
+        bridged?;
 
         log("=== DEST MIGRATION COMPLETE ===");
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// Wait for the VMM to reach its pause, run the final incremental, and
+/// report the verdict as one byte.
+///
+/// The VMM treats anything but [`ZFS_BARRIER_OK`], a timeout, or a
+/// closed socket as a failed migration and resumes its guest, so a
+/// failure here never lets the destination take a disk that is older
+/// than the memory image.
+fn run_zfs_barrier(
+    listener: &std::os::unix::net::UnixListener,
+    give_up: &AtomicBool,
+    src_disk: &str,
+    dst_disk: &str,
+    ssh: &Ssh,
+    skip_zfs: bool,
+) -> anyhow::Result<()> {
+    let Some(mut conn) = accept_before(listener, give_up)? else {
+        // The migration never reached the pause. Nothing to sync, and
+        // the VMM is not waiting on a byte.
+        log("  ZFS barrier: the VMM never paused");
+        return Ok(());
+    };
+    log("  ZFS barrier: VMM paused, starting final sync");
+    let outcome = if skip_zfs {
+        log("  ZFS barrier: skipped (--skip-zfs)");
+        Ok(())
+    } else {
+        final_incremental(src_disk, dst_disk, ssh)
+    };
+    let status = match &outcome {
+        Ok(()) => ZFS_BARRIER_OK,
+        Err(e) => {
+            log(&format!("  ZFS barrier: {e:#}"));
+            ZFS_BARRIER_FAILED
+        }
+    };
+    conn.write_all(&[status])
+        .context("report the ZFS barrier verdict to the VMM")?;
+    outcome
+}
+
+/// One incremental from the pre-pause snapshot to a fresh one.
+fn final_incremental(
+    src_disk: &str,
+    dst_disk: &str,
+    ssh: &Ssh,
+) -> anyhow::Result<()> {
+    let snap = format!("{src_disk}@vmm-mig-postpause");
+    let fin = format!("{src_disk}@vmm-mig-final");
+    zfs_destroy_quiet(&snap);
+    zfs(&["snapshot", &snap])?;
+    zfs_send_recv(&["-i", &fin, &snap], ssh, dst_disk)?;
+    log("  ZFS barrier: final incremental sent");
+    Ok(())
+}
+
+/// Take one connection, or give up when `give_up` is set or the
+/// deadline passes.
+///
+/// A blocking `accept` here outlived every failed migration: the VMM
+/// never connects when the migration is refused, and the thread stayed
+/// in the call for ever.
+fn accept_before(
+    listener: &std::os::unix::net::UnixListener,
+    give_up: &AtomicBool,
+) -> anyhow::Result<Option<std::os::unix::net::UnixStream>> {
+    let deadline = std::time::Instant::now() + BARRIER_WAIT;
+    listener
+        .set_nonblocking(true)
+        .context("set the barrier listener non-blocking")?;
+    while std::time::Instant::now() < deadline {
+        if give_up.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match listener.accept() {
+            Ok((conn, _)) => {
+                conn.set_nonblocking(false)
+                    .context("set the barrier connection blocking")?;
+                return Ok(Some(conn));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(BARRIER_POLL);
+            }
+            Err(e) => {
+                return Err(e).context("accept on the ZFS barrier socket")
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_dataset_name_is_accepted() {
+        check_name("disk-dataset", "zones/abc-123/disk0").expect("plain name");
+        check_name("uuid", "3fe75ae1-8624-4764-80a3-2f4a332f3604")
+            .expect("a uuid");
+        check_name("dest-host", "10.0.0.1").expect("an address");
+    }
+
+    #[test]
+    fn a_leading_dash_is_refused() {
+        // `--disk-dataset -R` would reach zfs as a flag, locally and
+        // over ssh.
+        check_name("disk-dataset", "-R").expect_err("an option-looking value");
+        check_name("uuid", "-x").expect_err("an option-looking value");
+    }
+
+    #[test]
+    fn a_traversing_value_is_refused() {
+        // The paths are built as /zones/<uuid>/root/tmp/..., and the
+        // agent removes and binds files there.
+        check_name("uuid", "../../x").expect_err("traversal");
+        check_name("uuid", "..").expect_err("traversal");
+        check_name("disk-dataset", "zones/../../etc").expect_err("traversal");
+    }
+
+    #[test]
+    fn a_shell_metacharacter_is_refused() {
+        for value in ["a;b", "a b", "a$b", "a`b`", "a|b", "a&b", ""] {
+            check_name("uuid", value).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn a_dotted_snapshot_name_is_still_accepted() {
+        // `..` is refused as a whole path element, not as two dots.
+        check_name("disk-dataset", "zones/a.b/disk0").expect("dots are fine");
+    }
 }
