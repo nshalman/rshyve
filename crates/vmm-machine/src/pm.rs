@@ -28,7 +28,7 @@ use vmm_devices::hotplug::pci::{
 };
 use vmm_devices::pvpanic::{PvPanic, PVPANIC_IOPORT};
 
-use crate::hotplug::hot_add_window;
+use crate::hotplug::mem::hot_add_window;
 use crate::hotplug::mem::{MemHotplugEngine, MemWindow, DEFAULT_SLOT_SIZE};
 use crate::opts::VmOpts;
 use crate::registry::{DeviceRegistry, RegisteredDevice, RegistryError};

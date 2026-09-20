@@ -40,12 +40,13 @@ pub use firmware::{
     AcpiTables,
 };
 pub use hotplug::cpu::{CpuHotplugEngine, CpuHotplugError, CpuOnline};
+pub use hotplug::mem::hot_add_window;
 pub use hotplug::mem::{
     MemHotplugEngine, MemHotplugError, MemWindow, DEFAULT_SLOT_SIZE,
 };
 pub use hotplug::{
-    hot_add_window, hotplug_specs, start_cpu_hotplug, CpuSlots, HotplugEngine,
-    HotplugEngines, HotplugError, HotplugFactory,
+    hotplug_specs, start_cpu_hotplug, CpuSlots, HotplugEngine, HotplugEngines,
+    HotplugError, HotplugFactory,
 };
 pub use opts::VmOpts;
 pub use parse::{find_lpc_device, parse_bdf};
