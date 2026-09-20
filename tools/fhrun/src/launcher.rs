@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 
 use crate::initramfs;
 use crate::manifest::{Manifest, ResolvedConsole};
+use crate::status::{self, PayloadStatus};
 
 /// PID of the running VMM child, read by the signal handler.
 /// 0 means there is no child yet.
@@ -43,7 +44,10 @@ pub struct VmmInvocation {
 
 pub struct LaunchOutcome {
     /// Exit code from the VMM. `None` when it died from a signal.
-    pub exit_code: Option<i32>,
+    pub vmm_exit_code: Option<i32>,
+    /// What init reported for the payload. `None` when the VMM ended
+    /// before init wrote its marker.
+    pub payload: Option<PayloadStatus>,
 }
 
 /// The fhrun-owned kernel cmdline.
@@ -164,22 +168,49 @@ pub fn launch(manifest: &Manifest) -> Result<LaunchOutcome> {
         );
     }
 
-    install_signal_handlers();
+    // SIGINT and SIGTERM stay blocked until the handler is installed and
+    // the child pid is readable. Without this an operator's Ctrl-C in
+    // that window either ends fhrun and orphans the VMM, or reaches a
+    // handler that reads pid 0 and drops the signal. `Command` resets
+    // the mask in the child, so the VMM starts with both deliverable.
+    let mask = BlockedSignals::block(&[libc::SIGINT, libc::SIGTERM]);
 
+    // The VMM's stdout is piped, not inherited: the payload's status
+    // travels on it as a COM2 marker line, so fhrun has to read it.
     let mut child: Child = Command::new(&inv.program)
         .args(&inv.args)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawn vmm: {}", inv.program.display()))?;
 
     CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
-    let status = child.wait().context("wait for vmm")?;
+    install_signal_handlers();
+    drop(mask);
+    let vmm_stdout = child.stdout.take().context("vmm stdout is not piped")?;
+    let pump = std::thread::Builder::new()
+        .name("vmm-stdout".to_string())
+        .spawn(move || status::pump(vmm_stdout, std::io::stdout()))
+        .context("spawn the stdout pump")?;
+    let vmm_status = child.wait().context("wait for vmm")?;
     CHILD_PID.store(0, Ordering::SeqCst);
+    // The pump ends at EOF, which the VMM's exit closes.
+    let payload = match pump.join() {
+        Ok(Ok(payload)) => payload,
+        Ok(Err(e)) => {
+            eprintln!("fhrun: reading vmm stdout: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("fhrun: the stdout pump panicked");
+            None
+        }
+    };
 
     Ok(LaunchOutcome {
-        exit_code: status.code(),
+        vmm_exit_code: vmm_status.code(),
+        payload,
     })
 }
 
@@ -189,9 +220,44 @@ fn install_signal_handlers() {
     // The two-step cast (function to *const (), then to an integer)
     // avoids the `function_casts_as_integer` warning.
     let h = forward_signal as *const () as libc::sighandler_t;
+    // SAFETY: `forward_signal` reads one atomic and calls `kill`, both
+    // of which are async-signal-safe.
     unsafe {
         libc::signal(libc::SIGINT, h);
         libc::signal(libc::SIGTERM, h);
+    }
+}
+
+/// Signals held pending for the life of this value.
+struct BlockedSignals(libc::sigset_t);
+
+impl BlockedSignals {
+    fn block(signals: &[libc::c_int]) -> Self {
+        // SAFETY: both sets are whole `sigset_t` values owned here, and
+        // `pthread_sigmask` only reads `set` and writes `old`.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            for sig in signals {
+                libc::sigaddset(&mut set, *sig);
+            }
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+            Self(old)
+        }
+    }
+}
+
+impl Drop for BlockedSignals {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the mask this value replaced.
+        unsafe {
+            libc::pthread_sigmask(
+                libc::SIG_SETMASK,
+                &self.0,
+                std::ptr::null_mut(),
+            );
+        }
     }
 }
 
@@ -272,6 +338,44 @@ mod tests {
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    static USR2_SEEN: AtomicI32 = AtomicI32::new(0);
+
+    extern "C" fn count_usr2(sig: libc::c_int) {
+        USR2_SEEN.fetch_add(1, Ordering::SeqCst);
+        let _ = sig;
+    }
+
+    /// The spawn window relies on a blocked signal staying pending
+    /// until the guard is dropped. SIGUSR2 stands in for SIGINT so the
+    /// test harness keeps its own disposition.
+    ///
+    /// Mutation this kills: dropping the guard's `Drop`, or blocking
+    /// nothing.
+    #[test]
+    fn a_signal_raised_while_blocked_arrives_after_the_guard_goes() {
+        let h = count_usr2 as *const () as libc::sighandler_t;
+        // SAFETY: the handler touches one atomic, which is
+        // async-signal-safe.
+        unsafe { libc::signal(libc::SIGUSR2, h) };
+
+        let guard = BlockedSignals::block(&[libc::SIGUSR2]);
+        // SAFETY: raise takes a signal number and nothing else.
+        unsafe { libc::raise(libc::SIGUSR2) };
+        assert_eq!(
+            USR2_SEEN.load(Ordering::SeqCst),
+            0,
+            "a blocked signal was delivered"
+        );
+
+        drop(guard);
+
+        assert_eq!(
+            USR2_SEEN.load(Ordering::SeqCst),
+            1,
+            "the pending signal was lost"
+        );
     }
 
     #[test]

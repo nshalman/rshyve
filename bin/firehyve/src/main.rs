@@ -25,6 +25,11 @@ use vmm_virtio::vsock::control::{ControlSink, ControlSlot};
 /// `ttyS0`, which is why COM1 is always attached.
 use vmm_config::DEFAULT_CMDLINE;
 
+/// How long the exit path waits for the console writer thread. Bounded
+/// so a consumer that stopped reading cannot hold the VMM open.
+const CONSOLE_FLUSH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 fn version_string() -> String {
     let version = env!("CARGO_PKG_VERSION");
     let commit = env!("FIREHYVE_GIT_COMMIT");
@@ -384,7 +389,13 @@ fn main() -> ExitCode {
     let cli = Cli::parse_named("firehyve");
     let log = vmm_machine::entry::setup_logger("firehyve");
 
-    match run(cli, &log) {
+    let outcome = run(cli, &log);
+    // The guest's last COM2 bytes carry fhrun's payload status, and a
+    // writer thread holds them. Exiting here would drop them.
+    if !vmm_devices::uart::backend::flush_stdout(CONSOLE_FLUSH_TIMEOUT) {
+        warn!(log, "console output was still draining at exit");
+    }
+    match outcome {
         Ok(outcome) => vmm_machine::entry::exit_code(outcome, &log),
         Err(e) => {
             error!(log, "fatal error"; "error" => format!("{e:#}"));
@@ -398,32 +409,31 @@ mod tests {
     use super::*;
     use clap::FromArgMatches;
 
-    /// The zone brand reads the exit code, and the kernel rule is not
-    /// symmetric: `boot.c` sets ZONE_ATTR_INITRESTART0 on every bhyve
-    /// zone, the brand declares no <initreboot>, and
-    /// uts/common/os/exit.c restarts init only on `CLD_EXITED && what
-    /// == 0`. So exit 0 means "start the guest again" and anything else
-    /// means "halt the zone". A guest that powers itself off must not
-    /// take the first branch.
-    ///
-    /// The values are C bhyve's, from usr/src/cmd/bhyve/amd64/vmexit.c:
-    /// RESET 0, POWEROFF 1, HALT 2, TRIPLEFAULT 3.
+    /// The zone brand reads the exit code: `boot.c` sets
+    /// ZONE_ATTR_INITRESTART0 on every bhyve zone, so exit 0 restarts
+    /// the guest and anything else halts the zone. The mapping lives in
+    /// `vmm_machine::entry`, where its own tests pin every value; this
+    /// checks the function this binary calls, not a copy of it.
     #[test]
-    fn the_exit_codes_match_the_ones_the_zone_brand_reads() {
+    fn a_powered_off_guest_does_not_exit_zero() {
         use vmm_machine::RunOutcome;
-        let code = |o: RunOutcome| match o {
-            RunOutcome::Reboot => 0u8,
-            RunOutcome::PowerOff => 1,
-            RunOutcome::Halt => 2,
-            RunOutcome::TripleFault(_) => 3,
-            RunOutcome::GuestFault => 4,
-        };
-        assert_eq!(code(RunOutcome::Reboot), 0, "only a reboot may exit 0");
-        assert_eq!(code(RunOutcome::PowerOff), 1);
-        assert_eq!(code(RunOutcome::Halt), 2);
-        assert_eq!(code(RunOutcome::TripleFault(0)), 3);
-        // Sharing 2 with HALT would report a guest fault as a clean halt.
-        assert_ne!(code(RunOutcome::GuestFault), code(RunOutcome::Halt));
+        let log = quiet();
+        assert_eq!(
+            vmm_machine::entry::exit_code(RunOutcome::Reboot, &log),
+            ExitCode::SUCCESS
+        );
+        for outcome in [
+            RunOutcome::PowerOff,
+            RunOutcome::Halt,
+            RunOutcome::TripleFault(0),
+            RunOutcome::GuestFault,
+        ] {
+            assert_ne!(
+                vmm_machine::entry::exit_code(outcome, &log),
+                ExitCode::SUCCESS,
+                "{outcome:?} would restart the zone"
+            );
+        }
     }
 
     fn cli_from(args: &[&str]) -> Cli {

@@ -6,10 +6,12 @@
 //!
 //! The loop needs a wait it can leave. A blocking `accept` ends only
 //! when a client arrives, so halt would have to connect to the socket
-//! itself to wake it, and that connect has no bound: a same-uid peer
-//! that fills the listen backlog makes it wait for as long as it
-//! likes. So the listener is non-blocking and the loop polls it on a
-//! tick, re-reading the shutdown flag each time.
+//! itself to wake it, and halt must not depend on a peer. That connect
+//! is also not dependable: illumos `tl_conn_req` refuses it with
+//! ECONNREFUSED once the listener's backlog is full
+//! (uts/common/io/tl.c), which leaves the accept thread asleep. So the
+//! listener is non-blocking and the loop polls it on a tick,
+//! re-reading the shutdown flag each time.
 
 use std::io;
 use std::net::Shutdown;
