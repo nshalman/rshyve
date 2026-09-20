@@ -302,12 +302,6 @@ impl DeviceState {
                 // handled as write-1-to-clear but we have nothing clearable
                 // right now, so they are ignored.
             }
-            // 0x0C: Header Type (byte at offset 0x0E) — only the
-            // multi-function bit (0x80) is writable by the bus layer.
-            // Header type is byte 2 of this dword (offset 0x0E).
-            0x0C if byte_off == 2 && len == 1 => {
-                self.header_type = val as u8;
-            }
             // 0x10-0x24: BAR writes
             bar_off @ 0x10..=0x24
                 if (bar_off & 0x03) == 0 && byte_off == 0 && len == 4 =>
@@ -395,6 +389,25 @@ mod tests {
         let state = DeviceState::new(test_ident());
         let val = state.cfg_read(0x0E, 1);
         assert_eq!(val, bits::HEADER_TYPE_DEVICE as u32);
+    }
+
+    #[test]
+    fn the_guest_cannot_rewrite_the_header_type() {
+        // PCI makes it read-only; a guest that could set 0x01 would make
+        // every DeviceState device report itself as a bridge.
+        let mut state = DeviceState::new(test_ident());
+        for (off, len, val) in [
+            (0x0Eu8, 1u8, 0x81u32),
+            (0x0E, 2, 0x817F),
+            (0x0C, 4, 0x817F_0000),
+        ] {
+            state.cfg_write(off, len, val);
+            assert_eq!(
+                state.cfg_read(0x0E, 1),
+                u32::from(bits::HEADER_TYPE_DEVICE),
+                "write at {off:#x} width {len}"
+            );
+        }
     }
 
     #[test]
