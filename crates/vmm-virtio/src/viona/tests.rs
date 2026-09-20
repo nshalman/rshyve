@@ -142,6 +142,8 @@ struct TestLink {
     status: IntrStatus,
     /// Where the poll thread is held, once.
     park: Mutex<Option<Park>>,
+    /// A call a signal interrupts, and how many times left.
+    interrupted: Mutex<Option<(Op, usize)>>,
 }
 
 impl TestLink {
@@ -154,12 +156,23 @@ impl TestLink {
             locked: Mutex::new(Vec::new()),
             status: IntrStatus::default(),
             park: Mutex::new(None),
+            interrupted: Mutex::new(None),
         }
     }
 
     /// A link whose kernel refuses `ops` and answers the rest.
     fn failing(mut self, ops: &[Op]) -> Self {
         self.failing = ops.to_vec();
+        self
+    }
+
+    /// A link whose kernel takes a signal on the first `times` calls to
+    /// `op`, then answers it.
+    ///
+    /// `viona_ioc_ring_reset` waits with signals heeded, so this is a
+    /// reset the caller has to try again, not one the kernel refused.
+    fn interrupted_on(self, op: Op, times: usize) -> Self {
+        *self.interrupted.lock().expect("interrupted lock") = Some((op, times));
         self
     }
 
@@ -174,6 +187,17 @@ impl TestLink {
 
     /// What one call answers.
     fn result(&self, op: Op) -> std::io::Result<()> {
+        let mut interrupted =
+            self.interrupted.lock().expect("interrupted lock");
+        if let Some((signalled, left)) = interrupted.as_mut() {
+            if *signalled == op && *left > 0 {
+                *left -= 1;
+                return Err(std::io::Error::from(
+                    std::io::ErrorKind::Interrupted,
+                ));
+            }
+        }
+        drop(interrupted);
         if self.failing.contains(&op) {
             return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
         }
