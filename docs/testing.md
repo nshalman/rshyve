@@ -71,14 +71,6 @@ the GNU one: `export LIBTOOLIZE=glibtoolize`.
 
 ### Build on Headnode
 
-Do this one time if the host still holds the checkout with its old name.
-An rsync to the new path does not move the old `target/` cache, and a
-full rebuild on this host is slow.
-
-```bash
-ssh $VMM_HEADNODE 'test -d /opt/rust-bhyve || mv /opt/vmmnew /opt/rust-bhyve'
-```
-
 ```bash
 rsync -az --checksum --exclude target $VMM_SRC/ $VMM_HEADNODE:/opt/rust-bhyve/
 
@@ -251,7 +243,7 @@ See [tools/profile/README.md](../tools/profile/README.md) and
 ### Sync to Build Host
 
 ```bash
-rsync -az --exclude target $VMM_SRC/ $VMM_BUILD_HOST:/opt/vmmctl/
+rsync -az --exclude target $VMM_SRC/ $VMM_BUILD_HOST:/opt/rust-bhyve/
 ```
 
 ### Cross-Host Migration Test

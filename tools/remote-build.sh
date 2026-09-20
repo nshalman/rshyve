@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build and test vmmnew on the illumos build host.
+# Build and test rust-bhyve on the illumos build host.
 #
 # The rshyve binary only builds on illumos: vmm-tpm-sys drives an autotools
 # build of vendored libtpms, bhyve-api binds SunOS ioctls, and viona-api
