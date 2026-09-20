@@ -234,8 +234,9 @@ pub const MAX_XFER_BYTES: u64 = (1 << MDTS_LOG2_PAGES) * 4096;
 
 // ── MSI-X ──────────────────────────────────────────────────────
 
-/// Number of MSI-X vectors (1 per queue + 1 admin)
-pub const NVME_MSIX_COUNT: u16 = 17; // 1 admin + 16 I/O
+/// MSI-X vectors: the admin queue, every I/O queue the controller
+/// allows, and one the driver may ask for but never gets a queue for.
+pub const NVME_MSIX_COUNT: u16 = MAX_IO_QUEUES as u16 + 2;
 
 // ── BAR sizes ──────────────────────────────────────────────────
 
