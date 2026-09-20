@@ -23,7 +23,6 @@ vmm_boot.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 slog.workspace = true
-usdt.workspace = true
 
 # Deliberately absent, and enforced by deny-firehyve.toml:
 #   vmm_migrate vmm_tpm vmm_tpm_sys vmm_storage vmm_hid vmm_passthru

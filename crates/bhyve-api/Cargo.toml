@@ -14,5 +14,4 @@ workspace = true
 [dependencies]
 bhyve_api_sys.workspace = true
 libc.workspace = true
-strum = { workspace = true, features = ["derive"] }
 vmm_api_common.workspace = true
