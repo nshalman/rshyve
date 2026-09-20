@@ -212,10 +212,14 @@ impl NvmeController {
         let qid = (cdw10 & 0xFFFF) as u16;
         let qsize = ((cdw10 >> 16) & 0xFFFF) + 1; // Convert 0-based to 1-based
         let iv = ((cdw11 >> 16) & 0xFFFF) as u16;
+        let ien = (cdw11 & CQ_IEN) != 0;
 
         let Some(idx) = io_queue_index(qid) else {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         };
+        if qid > st.num_io_queues {
+            return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
+        }
         if qsize < 2 || qsize > u32::from(MAX_QUEUE_SIZE) {
             return (SC_INVALID_QUEUE_SIZE | SC_DNR, 0);
         }
@@ -223,6 +227,11 @@ impl NvmeController {
 
         if st.io_cqs[idx].is_some() {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
+        }
+        // A vector the table cannot hold would leave the driver polling
+        // a queue that never raises.
+        if iv >= NVME_MSIX_COUNT {
+            return (SC_INVALID_INTR_VECTOR | SC_DNR, 0);
         }
         if !self.queue_base_ok(prp1, qsize.into(), CQE_SIZE) {
             return (SC_INVALID_FIELD | SC_DNR, 0);
@@ -236,7 +245,7 @@ impl NvmeController {
             tail: 0,
             phase: true,
             iv,
-            ien: true,
+            ien,
             instance,
         });
 
@@ -258,6 +267,9 @@ impl NvmeController {
         let Some(idx) = io_queue_index(qid) else {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         };
+        if qid > st.num_io_queues {
+            return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
+        }
         if qsize < 2 || qsize > u32::from(MAX_QUEUE_SIZE) {
             return (SC_INVALID_QUEUE_SIZE | SC_DNR, 0);
         }

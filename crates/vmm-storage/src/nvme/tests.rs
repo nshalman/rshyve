@@ -1009,6 +1009,71 @@ fn status_code_encoding() {
 }
 
 #[test]
+fn create_io_cq_with_an_unbacked_interrupt_vector_is_rejected() {
+    let mut h = Harness::new();
+    h.enable();
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_CREATE_IO_CQ,
+        prp1: CQ1,
+        cdw10: 1 | (u32::from(IO_QDEPTH - 1) << 16),
+        cdw11: (u32::from(NVME_MSIX_COUNT) << 16) | CQ_IEN | CQ_PC,
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::of(SC_INVALID_INTR_VECTOR | SC_DNR));
+}
+
+#[test]
+fn a_polled_completion_queue_raises_no_interrupt() {
+    let mut h = Harness::new();
+    h.enable();
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_CREATE_IO_CQ,
+        prp1: CQ1,
+        cdw10: 1 | (u32::from(IO_QDEPTH - 1) << 16),
+        cdw11: (1 << 16) | CQ_PC,
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::SUCCESS);
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_CREATE_IO_SQ,
+        prp1: SQ1,
+        cdw10: 1 | (u32::from(IO_QDEPTH - 1) << 16),
+        cdw11: (1 << 16) | CQ_PC,
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::SUCCESS);
+
+    let admin_msi = h.msi_count();
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::read(0, 1, 0x50000, 0), 0x41);
+    assert_eq!(h.wait_cqe(CQ1, 0, true).cid, 0x41);
+    assert_eq!(h.msi_count(), admin_msi, "IEN was clear");
+}
+
+#[test]
+fn create_io_queue_past_the_allocation_is_rejected() {
+    let mut h = Harness::new();
+    h.enable();
+    // Ask for four queue pairs, 0-based in CDW11.
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_SET_FEATURES,
+        cdw10: u32::from(FEAT_NUM_QUEUES),
+        cdw11: 3 | (3 << 16),
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::SUCCESS);
+
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_CREATE_IO_CQ,
+        prp1: CQ1,
+        cdw10: 5 | (u32::from(IO_QDEPTH - 1) << 16),
+        cdw11: (1 << 16) | CQ_IEN | CQ_PC,
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::of(SC_INVALID_QUEUE_ID | SC_DNR));
+}
+
+#[test]
 fn create_io_sq_naming_the_admin_cq_is_rejected() {
     let mut h = Harness::new();
     h.enable();
