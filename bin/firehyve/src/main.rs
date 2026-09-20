@@ -25,6 +25,11 @@ use vmm_virtio::vsock::control::{ControlSink, ControlSlot};
 /// `ttyS0`, which is why COM1 is always attached.
 use vmm_config::DEFAULT_CMDLINE;
 
+/// How long the exit path waits for the console writer thread. Bounded
+/// so a consumer that stopped reading cannot hold the VMM open.
+const CONSOLE_FLUSH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 fn version_string() -> String {
     let version = env!("CARGO_PKG_VERSION");
     let commit = env!("FIREHYVE_GIT_COMMIT");
@@ -385,7 +390,13 @@ fn main() -> ExitCode {
     let cli = Cli::parse_named("firehyve");
     let log = vmm_machine::entry::setup_logger("firehyve");
 
-    match run(cli, &log) {
+    let outcome = run(cli, &log);
+    // The guest's last COM2 bytes carry fhrun's payload status, and a
+    // writer thread holds them. Exiting here would drop them.
+    if !vmm_devices::uart::backend::flush_stdout(CONSOLE_FLUSH_TIMEOUT) {
+        warn!(log, "console output was still draining at exit");
+    }
+    match outcome {
         Ok(outcome) => vmm_machine::entry::exit_code(outcome, &log),
         Err(e) => {
             error!(log, "fatal error"; "error" => format!("{e:#}"));

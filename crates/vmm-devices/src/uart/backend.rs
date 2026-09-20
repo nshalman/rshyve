@@ -18,16 +18,21 @@
 //!   stdio leaves the operator with a dead console.
 //!
 //! Both live here so the zone console has one implementation.
+//!
+//! Every stdout-bound port shares one writer thread, because the
+//! transmit sink runs on a vCPU thread with the UART lock held and may
+//! not wait for a consumer. See [`flush_stdout`].
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
-use slog::{info, warn};
+use slog::{info, warn, Logger};
 use vmm_core::poll::{wait_readable, Readiness};
 
 use super::lpc::LpcUart;
@@ -36,6 +41,12 @@ use super::lpc::LpcUart;
 /// A console whose reader has gone away fails on every byte, and an
 /// unbounded log would bury everything else in the zone log.
 const TX_ERROR_LOG_LIMIT: u32 = 3;
+
+/// Bytes the stdout pump holds for a consumer that has fallen behind.
+/// Past this the sink drops bytes rather than park the vCPU that wrote
+/// them: the guest keeps running with a gap in its console, which the
+/// log records, instead of stalling behind a pipe nobody reads.
+const STDOUT_QUEUE_CAP: usize = 64 * 1024;
 
 /// Receive poll timeout. Bounded so the thread notices a closed
 /// backend instead of parking for ever.
@@ -63,18 +74,18 @@ pub fn attach(
     uart: &Arc<LpcUart>,
     backend: SerialBackend<'_>,
     name: &str,
-    log: &slog::Logger,
+    log: &Logger,
 ) -> anyhow::Result<()> {
     match backend {
         SerialBackend::Stdio => {
-            attach_stdout(uart, name);
+            attach_stdout(uart, name, log)?;
             spawn_stdin_reader(uart, name)?;
             info!(log, "serial port connected"; "port" => name,
                 "backend" => "stdio");
             Ok(())
         }
         SerialBackend::StdoutOnly => {
-            attach_stdout(uart, name);
+            attach_stdout(uart, name, log)?;
             info!(log, "serial port connected"; "port" => name,
                 "backend" => "stdout");
             Ok(())
@@ -83,16 +94,189 @@ pub fn attach(
     }
 }
 
-/// Send this port's transmit bytes to stdout.
-fn attach_stdout(uart: &Arc<LpcUart>, name: &str) {
+/// Send this port's transmit bytes to stdout through the process pump.
+fn attach_stdout(
+    uart: &Arc<LpcUart>,
+    name: &str,
+    log: &Logger,
+) -> anyhow::Result<()> {
+    let pump = stdout_pump(log)
+        .map_err(|e| anyhow::anyhow!("cannot start the stdout pump: {e}"))?;
+    attach_pump(uart, name, &pump);
+    Ok(())
+}
+
+/// Install a sink that queues each byte on `pump`.
+///
+/// The sink runs on the vCPU thread with the UART lock held, so it
+/// must not wait: it queues and returns.
+fn attach_pump(uart: &Arc<LpcUart>, name: &str, pump: &Arc<OutputPump>) {
+    let pump = Arc::clone(pump);
     let port = name.to_string();
-    uart.set_tx_sink(Box::new(move |b: u8| {
-        let mut out = std::io::stdout();
-        if let Err(e) = out.write_all(&[b]) {
-            eprintln!("[serial] {port} stdout write error: {e}");
+    uart.set_tx_sink(Box::new(move |b: u8| pump.push(b, &port)));
+}
+
+/// Wait until every byte queued for stdout has been written, or
+/// `timeout` passes. Returns whether the queue drained.
+///
+/// A VMM that exits before the pump thread has written the guest's
+/// last bytes loses them, and those bytes carry the fhrun status
+/// marker. Call this before the process exits.
+pub fn flush_stdout(timeout: Duration) -> bool {
+    let pump = STDOUT_PUMP
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(Arc::clone));
+    match pump {
+        Some(pump) => pump.flush(timeout),
+        None => true,
+    }
+}
+
+/// The one pump every stdout port shares, so their bytes stay in the
+/// order the guest wrote them.
+static STDOUT_PUMP: Mutex<Option<Arc<OutputPump>>> = Mutex::new(None);
+
+fn stdout_pump(log: &Logger) -> std::io::Result<Arc<OutputPump>> {
+    let mut slot = STDOUT_PUMP
+        .lock()
+        .map_err(|_| std::io::Error::other("stdout pump lock poisoned"))?;
+    if let Some(pump) = slot.as_ref() {
+        return Ok(Arc::clone(pump));
+    }
+    let pump = OutputPump::start("stdout", std::io::stdout(), log.clone())?;
+    *slot = Some(Arc::clone(&pump));
+    Ok(pump)
+}
+
+struct OutputQueue {
+    buf: VecDeque<u8>,
+    /// Bytes the writer thread has taken but not yet written.
+    in_flight: usize,
+    /// Set once a write failed. The consumer is gone, so every later
+    /// byte is discarded rather than queued.
+    closed: bool,
+    dropped: u64,
+}
+
+/// A bounded queue drained to a writer by its own thread.
+struct OutputPump {
+    queue: Mutex<OutputQueue>,
+    changed: Condvar,
+    log: Logger,
+}
+
+impl OutputPump {
+    fn start<W: Write + Send + 'static>(
+        name: &str,
+        mut writer: W,
+        log: Logger,
+    ) -> std::io::Result<Arc<Self>> {
+        let pump = Arc::new(Self {
+            queue: Mutex::new(OutputQueue {
+                buf: VecDeque::new(),
+                in_flight: 0,
+                closed: false,
+                dropped: 0,
+            }),
+            changed: Condvar::new(),
+            log,
+        });
+        let worker = Arc::clone(&pump);
+        std::thread::Builder::new()
+            .name(format!("{name}-output"))
+            .spawn(move || worker.run(&mut writer))?;
+        Ok(pump)
+    }
+
+    /// Drain the queue until a write fails. Returning ends the thread,
+    /// because `push` queues nothing more once the queue is closed and
+    /// the condvar would never be signalled again.
+    fn run<W: Write>(&self, writer: &mut W) {
+        let mut chunk: Vec<u8> = Vec::new();
+        loop {
+            {
+                let mut queue = self.lock();
+                while queue.buf.is_empty() {
+                    queue = self
+                        .changed
+                        .wait(queue)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+                chunk.extend(queue.buf.drain(..));
+                queue.in_flight = chunk.len();
+            }
+            let result = writer.write_all(&chunk).and_then(|()| writer.flush());
+            chunk.clear();
+            let mut queue = self.lock();
+            queue.in_flight = 0;
+            if let Err(e) = result {
+                warn!(self.log, "serial output consumer gone"; "error" => %e);
+                queue.closed = true;
+                queue.buf.clear();
+                self.changed.notify_all();
+                return;
+            }
+            self.changed.notify_all();
         }
-        let _ = out.flush();
-    }));
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, OutputQueue> {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Queue one byte. Never waits: a full queue or a closed consumer
+    /// drops the byte, and the first drop is logged.
+    fn push(&self, b: u8, port: &str) {
+        let mut queue = self.lock();
+        if queue.closed {
+            return;
+        }
+        if queue.buf.len() >= STDOUT_QUEUE_CAP {
+            queue.dropped += 1;
+            if queue.dropped == 1 {
+                warn!(self.log, "serial output dropped";
+                    "port" => port,
+                    "reason" => "the stdout consumer is not keeping up",
+                    "note" => "later drops are counted, not logged");
+            }
+            return;
+        }
+        let was_idle = queue.buf.is_empty();
+        queue.buf.push_back(b);
+        if was_idle {
+            self.changed.notify_one();
+        }
+    }
+
+    fn flush(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut queue = self.lock();
+        loop {
+            if queue.closed || (queue.buf.is_empty() && queue.in_flight == 0) {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            queue = self
+                .changed
+                .wait_timeout(queue, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    #[cfg(test)]
+    fn dropped(&self) -> u64 {
+        self.lock().dropped
+    }
+
+    #[cfg(test)]
+    fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
 }
 
 /// Feed stdin into this port's receive FIFO.
@@ -126,7 +310,7 @@ fn attach_device(
     uart: &Arc<LpcUart>,
     path: &str,
     name: &str,
-    log: &slog::Logger,
+    log: &Logger,
 ) -> anyhow::Result<()> {
     // O_NONBLOCK on the open itself, so a device with no carrier does
     // not park the whole process here. It stays on the description, so
@@ -256,8 +440,8 @@ mod tests {
         }
     }
 
-    fn quiet_logger() -> slog::Logger {
-        slog::Logger::root(slog::Discard, slog::o!())
+    fn quiet_logger() -> Logger {
+        Logger::root(slog::Discard, slog::o!())
     }
 
     /// A pty pair, which is the shape `/dev/zconsole` has: zoneadmd
@@ -411,6 +595,104 @@ mod tests {
             text.contains("/nonexistent/nwboot/zconsole"),
             "error names no path: {text}"
         );
+    }
+
+    /// A pipe pair as raw files, the shape of a stdout that a parent
+    /// process reads.
+    fn pipe() -> (File, File) {
+        let mut fds = [0i32; 2];
+        // Safety: `fds` has room for the two descriptors.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        use std::os::fd::FromRawFd;
+        // Safety: both descriptors are fresh and owned by nothing else.
+        unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+    }
+
+    fn uart_on_pump(pump: &Arc<OutputPump>) -> (Arc<LpcUart>, PioBus) {
+        let (uart, bus) = uart_on_bus();
+        attach_pump(&uart, "com1", pump);
+        (uart, bus)
+    }
+
+    /// The vCPU writes the port with the UART lock held. A consumer
+    /// that stops reading must cost the guest bytes, not its vCPU.
+    ///
+    /// Mutation this kills: writing to the consumer from the sink.
+    #[test]
+    fn a_stalled_consumer_does_not_park_the_port_write() {
+        let (_reader, writer) = pipe();
+        let pump = OutputPump::start("test", writer, quiet_logger())
+            .expect("start the pump");
+        let (_uart, bus) = uart_on_pump(&pump);
+
+        // Well past any pipe buffer plus the queue.
+        let start = Instant::now();
+        for _ in 0..(4 * STDOUT_QUEUE_CAP) {
+            bus.handle_out(COM1_BASE, 1, u32::from(b'x'));
+        }
+
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "port writes waited on the consumer"
+        );
+        assert!(pump.dropped() > 0, "nothing was dropped, so what waited?");
+    }
+
+    /// A parent that closed its end of the pipe used to panic the
+    /// sink through `eprintln!`, which under panic=abort ended the
+    /// VMM on one guest byte.
+    ///
+    /// Mutation this kills: writing the byte from the sink, or keeping
+    /// the writer thread parked on a queue nothing will ever fill.
+    #[test]
+    fn a_closed_consumer_does_not_panic_the_sink() {
+        let (reader, writer) = pipe();
+        drop(reader);
+        let pump = OutputPump::start("test", writer, quiet_logger())
+            .expect("start the pump");
+        let (_uart, bus) = uart_on_pump(&pump);
+
+        for _ in 0..64 {
+            bus.handle_out(COM1_BASE, 1, u32::from(b'x'));
+        }
+        assert!(pump.flush(RX_DEADLINE), "flush did not return");
+
+        assert!(pump.is_closed(), "the broken pipe was not noticed");
+        bus.handle_out(COM1_BASE, 1, u32::from(b'x'));
+        // The worker holds the second reference, so it has ended.
+        let deadline = Instant::now() + RX_DEADLINE;
+        while Arc::strong_count(&pump) > 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            Arc::strong_count(&pump),
+            2,
+            "the writer thread is still parked"
+        );
+    }
+
+    /// Everything the guest wrote reaches the consumer, in order, and
+    /// `flush` does not return before it has.
+    #[test]
+    fn flush_waits_for_the_consumer_to_have_the_bytes() {
+        let (mut reader, writer) = pipe();
+        let pump = OutputPump::start("test", writer, quiet_logger())
+            .expect("start the pump");
+        let (_uart, bus) = uart_on_pump(&pump);
+        let want: Vec<u8> =
+            (0..200u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let collector = std::thread::spawn(move || {
+            let mut got = vec![0u8; 200];
+            reader.read_exact(&mut got).expect("read the bytes");
+            got
+        });
+
+        for b in &want {
+            bus.handle_out(COM1_BASE, 1, u32::from(*b));
+        }
+        assert!(pump.flush(RX_DEADLINE), "the queue did not drain");
+
+        assert_eq!(collector.join().expect("collector"), want);
     }
 
     /// A NUL in the path would truncate at the C boundary and open a
