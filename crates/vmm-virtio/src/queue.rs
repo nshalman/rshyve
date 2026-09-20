@@ -754,17 +754,22 @@ impl VirtQueue {
     /// Each indirect descriptor is 16 bytes. The table contains
     /// `len / 16` descriptors chained via NEXT flags. INDIRECT flag
     /// inside the table is invalid (VirtIO 1.3 sec 2.7.5.3.1).
+    ///
+    /// `budget` is how many descriptors the chain may still name: a
+    /// chain may not be longer than the ring (sec 2.7.5.3.1), and the
+    /// direct descriptors ahead of the table count towards that.
     fn walk_indirect_table(
         &self,
         physmap: &PhysMap,
         gpa: u64,
         len: u32,
+        budget: u16,
     ) -> Option<Vec<ChainBuf>> {
         let num_descs = len as usize / 16;
         if num_descs == 0 || !(len as usize).is_multiple_of(16) {
             return None;
         }
-        if num_descs > usize::from(self.size) {
+        if num_descs > usize::from(budget) {
             return None;
         }
 
@@ -837,11 +842,22 @@ impl VirtQueue {
                 if !self.indirect_supported {
                     return None;
                 }
-                // INDIRECT + NEXT is invalid (VirtIO 1.3 sec 2.7.5.3)
+                // INDIRECT + NEXT is invalid (VirtIO 1.3 sec 2.7.5.3.1)
                 if desc.has_next() {
                     return None;
                 }
-                return self.walk_indirect_table(physmap, desc.addr, desc.len);
+                // Sec 2.7.5.3.2: the device must handle zero or more
+                // normal descriptors followed by one indirect
+                // descriptor. The buffers ahead of the table belong to
+                // the same request, and a device that returned the
+                // table alone would read the request out of the wrong
+                // buffer. The table ends the chain, because INDIRECT
+                // and NEXT cannot be set together.
+                let budget = self.size - count + 1;
+                bufs.extend(self.walk_indirect_table(
+                    physmap, desc.addr, desc.len, budget,
+                )?);
+                break;
             }
 
             if desc.is_write() {
