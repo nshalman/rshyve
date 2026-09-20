@@ -161,15 +161,40 @@ impl NvmeController {
                 (SC_SUCCESS, 0)
             }
             ADMIN_OPC_GET_LOG_PAGE => {
-                // Minimal stub: return zeros
-                let len = ((cdw10 >> 16) as usize + 1) * 4;
-                let zeros = vec![0u8; len.min(4096)];
-                let _ = mem.write(prp1, &zeros);
-                (SC_SUCCESS, 0)
+                Self::admin_get_log_page(mem, prp1, prp2, cdw10)
             }
             _ => (SC_INVALID_OPCODE | (SC_DNR), 0),
         };
         (status, cdw0, deletes_a_queue && status == SC_SUCCESS)
+    }
+
+    /// Get Log Page.
+    ///
+    /// NUMD is 12 bits of dwords, NVMe 1.0e section 5.10. The split
+    /// NUMDL and NUMDU fields arrived in 1.2 and this controller
+    /// reports 1.0, so the upper bits of CDW10 stay reserved.
+    fn admin_get_log_page(
+        mem: &MemCtx,
+        prp1: u64,
+        prp2: u64,
+        cdw10: u32,
+    ) -> (u16, u32) {
+        let lid = (cdw10 & 0xFF) as u8;
+        let dwords = ((cdw10 >> 16) & 0xFFF) as usize + 1;
+        let Some(log) = build_log_page(lid) else {
+            return (SC_INVALID_LOG_PAGE | SC_DNR, 0);
+        };
+
+        // The host asks for whole dwords; whatever it asks for past the
+        // end of the log reads as zero.
+        let mut data = vec![0u8; dwords * 4];
+        let from_log = data.len().min(log.len());
+        data[..from_log].copy_from_slice(&log[..from_log]);
+
+        if write_to_prp(mem, prp1, prp2, &data).is_err() {
+            return (SC_DATA_XFER_ERROR, 0);
+        }
+        (SC_SUCCESS, 0)
     }
 
     /// Identify command (CNS 0 = namespace, CNS 1 = controller).

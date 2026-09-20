@@ -561,6 +561,47 @@ fn admin_doorbell_beyond_queue_size_is_ignored() {
     assert_eq!(h.msi_count(), 0);
 }
 
+#[test]
+fn get_log_page_stops_at_the_end_of_the_prp1_page() {
+    let mut h = Harness::new();
+    h.enable();
+
+    // 256 bytes left in the PRP1 page, so half the log goes to PRP2.
+    let prp1 = 0x20F00;
+    let prp2 = 0x22000;
+    h.fill(0x20000, 4 * PAGE_SIZE, 0xAA);
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_GET_LOG_PAGE,
+        prp1,
+        prp2,
+        cdw10: u32::from(LID_SMART) | (((LOG_SMART_SIZE as u32 / 4) - 1) << 16),
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::SUCCESS);
+
+    let expect = build_log_page(LID_SMART).expect("SMART log");
+    assert_eq!(h.read_guest(prp1, 256), expect[..256]);
+    assert_eq!(h.read_guest(prp2, 256), expect[256..]);
+    // The page after PRP1's is untouched.
+    assert!(h.read_guest(0x21000, PAGE_SIZE).iter().all(|&b| b == 0xAA));
+    // And so is the rest of the PRP2 page.
+    assert!(h.read_guest(prp2 + 256, 256).iter().all(|&b| b == 0xAA));
+}
+
+#[test]
+fn get_log_page_refuses_a_log_the_controller_does_not_have() {
+    let mut h = Harness::new();
+    h.enable();
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_GET_LOG_PAGE,
+        prp1: 0x20000,
+        cdw10: 0x7F | (0x7F << 16),
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::of(SC_INVALID_LOG_PAGE | SC_DNR));
+    assert!(h.read_guest(0x20000, 512).iter().all(|&b| b == 0));
+}
+
 // ---------------------------------------------------------------------------
 // I/O path
 // ---------------------------------------------------------------------------

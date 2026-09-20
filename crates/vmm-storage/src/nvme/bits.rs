@@ -110,6 +110,46 @@ pub const NVM_OPC_READ: u8 = 0x02;
 pub const IDENTIFY_CNS_NAMESPACE: u8 = 0x00;
 pub const IDENTIFY_CNS_CONTROLLER: u8 = 0x01;
 
+// ── Log page identifiers, NVMe 1.0e section 5.10 ───────────────
+
+pub const LID_ERROR_INFO: u8 = 0x01;
+pub const LID_SMART: u8 = 0x02;
+pub const LID_FIRMWARE_SLOT: u8 = 0x03;
+
+/// One Error Information log entry.
+pub const LOG_ERROR_SIZE: usize = 64;
+/// SMART / Health Information.
+pub const LOG_SMART_SIZE: usize = 512;
+/// Firmware Slot Information.
+pub const LOG_FIRMWARE_SIZE: usize = 512;
+
+/// Composite temperature this controller reports, in Kelvin.
+///
+/// Zero would read as absolute zero and put some drivers into a
+/// thermal warning path.
+pub const LOG_SMART_TEMP_K: u16 = 300;
+
+/// Build log page `lid`, or `None` when this controller has no such log.
+pub fn build_log_page(lid: u8) -> Option<Vec<u8>> {
+    match lid {
+        // No error has ever been logged, so the entry is all zero.
+        LID_ERROR_INFO => Some(vec![0u8; LOG_ERROR_SIZE]),
+        LID_SMART => {
+            let mut data = vec![0u8; LOG_SMART_SIZE];
+            data[1..3].copy_from_slice(&LOG_SMART_TEMP_K.to_le_bytes());
+            data[3] = 100; // Available spare, percent
+            data[4] = 10; // Available spare threshold, percent
+            Some(data)
+        }
+        LID_FIRMWARE_SLOT => {
+            let mut data = vec![0u8; LOG_FIRMWARE_SIZE];
+            data[0] = 1; // Active firmware: slot 1
+            Some(data)
+        }
+        _ => None,
+    }
+}
+
 // ── Feature IDs ────────────────────────────────────────────────
 
 pub const FEAT_ARBITRATION: u8 = 0x01;
