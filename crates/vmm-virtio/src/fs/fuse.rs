@@ -438,6 +438,145 @@ pub fn dirent_size(namelen: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Open flags
+// ---------------------------------------------------------------------------
+
+/// Linux `O_*` values, as `fuse_open_in.flags` and `fuse_create_in.flags`
+/// carry them.
+///
+/// The guest is Linux, so the numbers on the wire are Linux's whatever
+/// host this server runs on. The host's `libc::O_*` differ: on illumos
+/// `O_APPEND` is 0x08 and `O_EXCL` is 0x400, so masking the wire value
+/// with host constants turned a guest `O_CREAT|O_EXCL` into
+/// `O_CREAT|O_NONBLOCK` and a guest `O_APPEND` into `O_EXCL`.
+pub mod linux_oflags {
+    pub const O_ACCMODE: u32 = 0o3;
+    pub const O_RDONLY: u32 = 0o0;
+    pub const O_WRONLY: u32 = 0o1;
+    pub const O_RDWR: u32 = 0o2;
+    pub const O_CREAT: u32 = 0o100;
+    pub const O_EXCL: u32 = 0o200;
+    pub const O_NOCTTY: u32 = 0o400;
+    pub const O_TRUNC: u32 = 0o1000;
+    pub const O_APPEND: u32 = 0o2000;
+    pub const O_NONBLOCK: u32 = 0o4000;
+    pub const O_DSYNC: u32 = 0o10000;
+    pub const O_DIRECT: u32 = 0o40000;
+    pub const O_LARGEFILE: u32 = 0o100000;
+    pub const O_DIRECTORY: u32 = 0o200000;
+    pub const O_NOFOLLOW: u32 = 0o400000;
+    pub const O_NOATIME: u32 = 0o1000000;
+    pub const O_CLOEXEC: u32 = 0o2000000;
+    /// `O_SYNC` is `__O_SYNC | O_DSYNC` on Linux.
+    pub const O_SYNC: u32 = 0o4010000;
+}
+
+/// A guest's open flags, translated to the host's numbering.
+///
+/// Every bit the guest may set is either translated or named as
+/// ignored below; anything else is refused, so a flag this server has
+/// not thought about never reaches `openat` with a host meaning the
+/// guest did not ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenFlags {
+    /// One of the host's `O_RDONLY`, `O_WRONLY` or `O_RDWR`.
+    pub accmode: libc::c_int,
+    pub creat: bool,
+    pub excl: bool,
+    pub trunc: bool,
+    pub append: bool,
+    pub nonblock: bool,
+    pub sync: bool,
+    pub dsync: bool,
+    pub directory: bool,
+    pub nofollow: bool,
+}
+
+/// Linux bits with no effect on the host side of a passthrough.
+///
+/// `O_LARGEFILE` is the only file size on a 64-bit host, `O_NOATIME`
+/// and `O_DIRECT` are advisory, `O_NOCTTY` is for terminals, and
+/// `O_CLOEXEC` is set on every descriptor here regardless.
+const IGNORED_LINUX_OFLAGS: u32 = linux_oflags::O_LARGEFILE
+    | linux_oflags::O_NOATIME
+    | linux_oflags::O_DIRECT
+    | linux_oflags::O_NOCTTY
+    | linux_oflags::O_CLOEXEC;
+
+impl OpenFlags {
+    /// Translate Linux open flags. `Err` carries the bits this server
+    /// does not know.
+    pub fn from_linux(flags: u32) -> Result<Self, u32> {
+        use linux_oflags as lx;
+        let accmode = match flags & lx::O_ACCMODE {
+            lx::O_RDONLY => libc::O_RDONLY,
+            lx::O_WRONLY => libc::O_WRONLY,
+            lx::O_RDWR => libc::O_RDWR,
+            _ => return Err(flags & lx::O_ACCMODE),
+        };
+        let known = lx::O_ACCMODE
+            | lx::O_CREAT
+            | lx::O_EXCL
+            | lx::O_TRUNC
+            | lx::O_APPEND
+            | lx::O_NONBLOCK
+            | lx::O_SYNC
+            | lx::O_DSYNC
+            | lx::O_DIRECTORY
+            | lx::O_NOFOLLOW
+            | IGNORED_LINUX_OFLAGS;
+        let unknown = flags & !known;
+        if unknown != 0 {
+            return Err(unknown);
+        }
+        let has = |bit: u32| flags & bit == bit;
+        Ok(Self {
+            accmode,
+            creat: has(lx::O_CREAT),
+            excl: has(lx::O_EXCL),
+            trunc: has(lx::O_TRUNC),
+            append: has(lx::O_APPEND),
+            nonblock: has(lx::O_NONBLOCK),
+            sync: has(lx::O_SYNC),
+            dsync: has(lx::O_DSYNC),
+            directory: has(lx::O_DIRECTORY),
+            nofollow: has(lx::O_NOFOLLOW),
+        })
+    }
+
+    /// Whether this open can change the file.
+    ///
+    /// `O_TRUNC` truncates alongside `O_RDONLY` on illumos, so the
+    /// access mode alone does not say.
+    pub fn mutates(&self) -> bool {
+        self.accmode != libc::O_RDONLY || self.trunc || self.creat
+    }
+
+    /// The host flags for the data path: the access mode and the
+    /// modifiers that change how reads and writes behave. Creation
+    /// and lookup flags are the caller's to add.
+    pub fn host_io_flags(&self) -> libc::c_int {
+        let mut out = self.accmode;
+        if self.append {
+            out |= libc::O_APPEND;
+        }
+        if self.trunc {
+            out |= libc::O_TRUNC;
+        }
+        if self.nonblock {
+            out |= libc::O_NONBLOCK;
+        }
+        if self.sync {
+            out |= libc::O_SYNC;
+        }
+        if self.dsync {
+            out |= libc::O_DSYNC;
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers for zero-copy access
 // ---------------------------------------------------------------------------
 
@@ -488,10 +627,6 @@ pub fn push_val<T: Copy>(buf: &mut Vec<u8>, val: &T) {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Errno translation
@@ -661,6 +796,56 @@ mod tests {
         assert_eq!(back.uid, orig.uid);
         assert_eq!(back.gid, orig.gid);
         assert_eq!(back.pid, orig.pid);
+    }
+
+    // The literal Linux numbers, not `libc::O_*`: on illumos those are
+    // different values, and that difference is the bug this guards.
+    #[test]
+    fn linux_open_flags_translate_to_host_flags() {
+        let f = OpenFlags::from_linux(0o1 | 0o100 | 0o200).expect("known");
+        assert_eq!(f.accmode, libc::O_WRONLY);
+        assert!(f.creat && f.excl);
+        assert!(!f.append && !f.trunc);
+
+        let f = OpenFlags::from_linux(0o2 | 0o2000 | 0o1000).expect("known");
+        assert_eq!(f.accmode, libc::O_RDWR);
+        assert!(f.append && f.trunc);
+        assert_eq!(
+            f.host_io_flags(),
+            libc::O_RDWR | libc::O_APPEND | libc::O_TRUNC
+        );
+
+        let f = OpenFlags::from_linux(0o200000 | 0o400000).expect("known");
+        assert!(f.directory && f.nofollow);
+        assert_eq!(f.host_io_flags(), libc::O_RDONLY);
+
+        // O_SYNC carries the O_DSYNC bit on Linux; both are set then.
+        let f = OpenFlags::from_linux(0o4010000).expect("known");
+        assert!(f.sync && f.dsync);
+    }
+
+    #[test]
+    fn ignored_linux_open_flags_are_accepted() {
+        let f = OpenFlags::from_linux(
+            0o100000 | 0o1000000 | 0o40000 | 0o400 | 0o2000000,
+        )
+        .expect("known");
+        assert_eq!(f.host_io_flags(), libc::O_RDONLY);
+    }
+
+    #[test]
+    fn unknown_linux_open_flags_are_refused() {
+        // O_PATH, O_TMPFILE's own bit, and every bit above them.
+        for bits in [0o10000000u32, 0o20000000, 1 << 31, 0o3] {
+            assert_eq!(OpenFlags::from_linux(bits), Err(bits), "{bits:#o}");
+        }
+    }
+
+    #[test]
+    fn a_read_open_with_o_trunc_mutates() {
+        assert!(OpenFlags::from_linux(0o1000).expect("known").mutates());
+        assert!(!OpenFlags::from_linux(0).expect("known").mutates());
+        assert!(OpenFlags::from_linux(0o100).expect("known").mutates());
     }
 
     #[test]

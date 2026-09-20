@@ -457,22 +457,16 @@ impl Passthrough {
         Ok(buf)
     }
 
+    /// FUSE_OPEN. `flags` is the guest's Linux `O_*` value.
     pub fn open(&self, nodeid: u64, flags: u32) -> PtResult<u64> {
-        // Re-open the cached read-only inode fd with the guest's requested
-        // access mode (O_RDONLY / O_WRONLY / O_RDWR plus append/trunc/…).
-        let requested = flags as libc::c_int;
-        let accmode = requested & libc::O_ACCMODE;
-        // O_TRUNC destroys the file whatever the access mode says. POSIX
-        // leaves O_RDONLY | O_TRUNC undefined, and illumos truncates. A
-        // read-only share must answer EROFS the way a read-only mount does,
-        // so checking the access mode alone is not enough.
-        if self.read_only
-            && (accmode != libc::O_RDONLY || requested & libc::O_TRUNC != 0)
-        {
+        let flags = parse_open_flags(flags)?;
+        // A read-only share must answer EROFS the way a read-only mount
+        // does, and `mutates` knows that O_TRUNC destroys the file
+        // whatever the access mode says.
+        if self.read_only && flags.mutates() {
             return Err(PtError::ReadOnly);
         }
 
-        let read_only = self.read_only;
         let new_fd = self.with_inode(nodeid, |ino| {
             if ino.ftype != FileType::Regular {
                 return Err(PtError::Io(std::io::Error::from_raw_os_error(
@@ -482,17 +476,10 @@ impl Passthrough {
             let fd = ino.fd.ok_or_else(|| {
                 PtError::Io(std::io::Error::from_raw_os_error(libc::EBADF))
             })?;
-            // Drop flags we do not want to honor on reopen (notably
-            // O_CREAT, O_DIRECTORY, O_TMPFILE). O_APPEND and O_TRUNC only
-            // have meaning when writes are allowed, so a read-only share
-            // keeps neither. The guard above already refuses O_TRUNC; this
-            // keeps the flag away from the syscall even if that changes.
-            let mut keep = libc::O_NONBLOCK;
-            if !read_only {
-                keep |= libc::O_APPEND | libc::O_TRUNC;
-            }
-            let reopen_flags = accmode | (requested & keep);
-            reopen_fd(fd, reopen_flags)
+            // The data-path flags only. The file already exists and its
+            // identity is fixed by `fd`, so O_CREAT, O_EXCL, O_DIRECTORY
+            // and O_NOFOLLOW have nothing to say on a reopen.
+            reopen_fd(fd, flags.host_io_flags())
         })?;
 
         let mut handles = self.handles.lock().unwrap();
@@ -501,7 +488,8 @@ impl Passthrough {
         Ok(id)
     }
 
-    /// FUSE_CREATE: atomic create-and-open.
+    /// FUSE_CREATE: atomic create-and-open. `flags` is the guest's Linux
+    /// `O_*` value.
     pub fn create(
         &self,
         parent: u64,
@@ -514,20 +502,19 @@ impl Passthrough {
         if self.read_only {
             return Err(PtError::ReadOnly);
         }
+        let flags = parse_open_flags(flags)?;
 
         let parent_fd = self.parent_fd(parent)?;
 
-        let accmode = (flags as libc::c_int) & libc::O_ACCMODE;
-        let modifier = (flags as libc::c_int)
-            & (libc::O_APPEND
-                | libc::O_TRUNC
-                | libc::O_EXCL
-                | libc::O_NONBLOCK);
-        let open_flags = accmode
-            | modifier
+        // O_EXCL is the one creation flag with a meaning here: it is how
+        // a guest takes a lock file against another writer of the share.
+        let mut open_flags = flags.host_io_flags()
             | libc::O_CREAT
             | libc::O_NOFOLLOW
             | libc::O_CLOEXEC;
+        if flags.excl {
+            open_flags |= libc::O_EXCL;
+        }
         let effective_mode = (mode & !umask) & 0o7777;
 
         let fh_fd = unsafe {
@@ -1316,6 +1303,14 @@ pub fn validate_name(name: &[u8]) -> PtResult<()> {
     Ok(())
 }
 
+/// Translate the guest's Linux open flags, refusing bits this server
+/// does not know rather than guessing at a host meaning for them.
+fn parse_open_flags(flags: u32) -> PtResult<fuse::OpenFlags> {
+    fuse::OpenFlags::from_linux(flags).map_err(|_| {
+        PtError::Io(std::io::Error::from_raw_os_error(libc::EINVAL))
+    })
+}
+
 fn fstat(fd: RawFd) -> PtResult<libc::stat> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::fstat(fd, &mut st) };
@@ -1455,6 +1450,41 @@ fn get_errno() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fuse::linux_oflags as lx;
+
+    /// The host flags on an open file handle's descriptor.
+    #[cfg(unix)]
+    fn handle_fl(pt: &Passthrough, fh: u64) -> libc::c_int {
+        let handles = pt.handles.lock().expect("handles");
+        let Some(Handle::File { fd }) = handles.by_id.get(&fh) else {
+            panic!("no file handle {fh}");
+        };
+        let fl = unsafe { libc::fcntl(*fd, libc::F_GETFL) };
+        assert!(fl >= 0, "F_GETFL failed");
+        fl
+    }
+
+    // Linux O_APPEND is 0o2000, which illumos reads as O_EXCL. A create
+    // that masked the wire value with host constants lost the append
+    // and refused the name if it had appeared since LOOKUP.
+    #[cfg(unix)]
+    #[test]
+    fn o_append_on_the_wire_reaches_the_host_descriptor() {
+        let dir = private_dir();
+        let pt = Passthrough::new(dir.path(), false).expect("open temp");
+        let name = CString::new("log").expect("name");
+        let flags = lx::O_WRONLY | lx::O_CREAT | lx::O_APPEND;
+        let (_, fh, _) = pt
+            .create(fuse::FUSE_ROOT_ID, &name, flags, 0o644, 0)
+            .expect("create");
+        assert_ne!(handle_fl(&pt, fh) & libc::O_APPEND, 0, "append lost");
+
+        let flags = lx::O_WRONLY | lx::O_CREAT;
+        let (_, fh, _) = pt
+            .create(fuse::FUSE_ROOT_ID, &name, flags, 0o644, 0)
+            .expect("reopen");
+        assert_eq!(handle_fl(&pt, fh) & libc::O_APPEND, 0, "append invented");
+    }
 
     /// A private directory for one test.
     ///
@@ -1600,7 +1630,7 @@ mod tests {
         let name = CString::new("data.bin").expect("name");
 
         let (entry, fh, _) = pt
-            .create(fuse::FUSE_ROOT_ID, &name, libc::O_RDWR as u32, 0o644, 0)
+            .create(fuse::FUSE_ROOT_ID, &name, lx::O_RDWR, 0o644, 0)
             .expect("create");
         assert!(entry.nodeid > fuse::FUSE_ROOT_ID);
         pt.sync_all().expect("sync open handle");

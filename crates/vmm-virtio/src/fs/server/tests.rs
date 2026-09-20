@@ -5,6 +5,7 @@
 //! Wire-format tests for the FUSE dispatcher.
 
 use super::*;
+use fuse::linux_oflags as lx;
 
 const GPA: u64 = 0x20_0000;
 const LEN: usize = 0x4000;
@@ -303,7 +304,7 @@ fn the_same_mkdir_succeeds_on_a_writable_share() {
     assert!(dir.path().join("ordinary").is_dir());
 }
 
-/// FUSE_OPEN of `nodeid`, carrying the guest's open flags verbatim.
+/// FUSE_OPEN of `nodeid`, carrying the guest's Linux open flags verbatim.
 fn open_request(nodeid: u64, flags: u32) -> Vec<u8> {
     let body = fuse::FuseOpenIn { flags, unused: 0 };
     let hdr = fuse::FuseInHeader {
@@ -338,7 +339,7 @@ fn o_trunc_cannot_destroy_a_file_on_a_read_only_share() {
     let dir = private_dir();
     let srv = server_on(&dir, true);
     let nodeid = seeded_file(&dir, &srv);
-    let flags = (libc::O_RDONLY | libc::O_TRUNC) as u32;
+    let flags = lx::O_RDONLY | lx::O_TRUNC;
 
     assert_eq!(
         reply_error(&srv, &open_request(nodeid, flags)),
@@ -364,7 +365,7 @@ fn a_plain_read_open_still_works_on_a_read_only_share() {
     let dir = private_dir();
     let srv = server_on(&dir, true);
     let nodeid = seeded_file(&dir, &srv);
-    let flags = libc::O_RDONLY as u32;
+    let flags = lx::O_RDONLY;
     assert_eq!(reply_error(&srv, &open_request(nodeid, flags)), 0);
 }
 
@@ -374,11 +375,102 @@ fn o_trunc_still_works_on_a_writable_share() {
     let dir = private_dir();
     let srv = server_on(&dir, false);
     let nodeid = seeded_file(&dir, &srv);
-    let flags = (libc::O_WRONLY | libc::O_TRUNC) as u32;
+    let flags = lx::O_WRONLY | lx::O_TRUNC;
     assert_eq!(reply_error(&srv, &open_request(nodeid, flags)), 0);
     assert!(std::fs::read(dir.path().join("payload"))
         .expect("read back")
         .is_empty());
+}
+
+/// FUSE_CREATE of `name` under the root, carrying the guest's Linux open
+/// flags verbatim.
+fn create_request(name: &[u8], flags: u32) -> Vec<u8> {
+    let body = fuse::FuseCreateIn {
+        flags,
+        mode: 0o644,
+        umask: 0,
+        open_flags: 0,
+    };
+    let body_len = size_of::<fuse::FuseCreateIn>() + name.len() + 1;
+    let hdr = fuse::FuseInHeader {
+        len: (fuse::FUSE_IN_HEADER_SIZE + body_len) as u32,
+        opcode: fuse::FUSE_CREATE,
+        unique: 0x7070,
+        nodeid: fuse::FUSE_ROOT_ID,
+        uid: 0,
+        gid: 0,
+        pid: 0,
+        padding: 0,
+    };
+    let mut buf = bytes_of(&hdr);
+    push_val(&mut buf, &body);
+    buf.extend_from_slice(name);
+    buf.push(0);
+    buf
+}
+
+// The wire carries Linux numbers. On illumos `libc::O_EXCL` is 0x400,
+// which is Linux's O_APPEND, so a server that masked with host
+// constants let a second exclusive create of a lock file succeed.
+#[test]
+fn o_excl_on_the_wire_refuses_a_second_create() {
+    let dir = private_dir();
+    let srv = server_on(&dir, false);
+    let flags = lx::O_WRONLY | lx::O_CREAT | lx::O_EXCL;
+    assert_eq!(reply_error(&srv, &create_request(b"lock", flags)), 0);
+    assert_eq!(
+        reply_error(&srv, &create_request(b"lock", flags)),
+        -libc::EEXIST,
+        "the second exclusive create of the lock file succeeded"
+    );
+}
+
+// Without O_EXCL the same create reopens the existing file, so the
+// test above proves the flag was honored and not that create is
+// broken.
+#[test]
+fn a_create_without_o_excl_reopens_an_existing_file() {
+    let dir = private_dir();
+    let srv = server_on(&dir, false);
+    let flags = lx::O_WRONLY | lx::O_CREAT;
+    assert_eq!(reply_error(&srv, &create_request(b"plain", flags)), 0);
+    assert_eq!(reply_error(&srv, &create_request(b"plain", flags)), 0);
+}
+
+// O_NOFOLLOW and O_DIRECTORY are lookup flags the guest kernel has
+// already acted on. They must pass the translator rather than read as
+// unknown bits, or every `open(O_NOFOLLOW)` in the guest fails.
+#[test]
+fn lookup_flags_on_the_wire_are_accepted_by_create() {
+    let dir = private_dir();
+    let srv = server_on(&dir, false);
+    let flags = lx::O_RDWR | lx::O_CREAT | lx::O_NOFOLLOW | lx::O_LARGEFILE;
+    assert_eq!(reply_error(&srv, &create_request(b"nf", flags)), 0);
+    assert!(dir.path().join("nf").is_file());
+}
+
+// A bit this server has not translated must not reach `openat` with
+// whatever the host reads it as.
+#[test]
+fn an_unknown_open_flag_on_the_wire_is_refused() {
+    let dir = private_dir();
+    let srv = server_on(&dir, false);
+    let o_path = 0o10000000;
+    assert_eq!(
+        reply_error(&srv, &create_request(b"odd", lx::O_CREAT | o_path)),
+        -libc::EINVAL
+    );
+    assert!(!dir.path().join("odd").exists());
+}
+
+#[cfg(any(target_os = "illumos", target_os = "linux"))]
+#[test]
+fn o_directory_on_the_wire_is_accepted_by_open() {
+    let dir = private_dir();
+    let srv = server_on(&dir, true);
+    let nodeid = seeded_file(&dir, &srv);
+    let flags = lx::O_RDONLY | lx::O_DIRECTORY | lx::O_NOFOLLOW;
+    assert_eq!(reply_error(&srv, &open_request(nodeid, flags)), 0);
 }
 
 // A DAX window would hand the guest a mapping of host files that

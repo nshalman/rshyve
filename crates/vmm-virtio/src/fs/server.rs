@@ -347,13 +347,6 @@ impl FuseServer {
             Some(v) => v,
             None => return Reply::Error(-libc::EINVAL),
         };
-        // O_TRUNC truncates even alongside O_RDONLY on illumos, so the
-        // access mode alone does not say whether an open mutates.
-        let mutating = oi.flags & libc::O_ACCMODE as u32 != 0
-            || oi.flags & libc::O_TRUNC as u32 != 0;
-        if self.passthrough.is_read_only() && mutating {
-            return Reply::Error(-libc::EROFS);
-        }
         match self.passthrough.open(header.nodeid, oi.flags) {
             Ok(fh) => Reply::Body(bytes_of(&fuse::FuseOpenOut {
                 fh,
