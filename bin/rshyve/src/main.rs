@@ -1380,6 +1380,11 @@ fn setup_serial_socket(
     Ok(())
 }
 
+/// How long the exit path waits for the console writer thread. Bounded
+/// so a consumer that stopped reading cannot hold the VMM open.
+const CONSOLE_FLUSH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 /// Version string including git commit hash (set by build.rs).
 fn version_string() -> String {
     let version = env!("CARGO_PKG_VERSION");
@@ -1401,7 +1406,13 @@ fn main() -> ExitCode {
     let cli = Cli::parse_named("rshyve");
     let log = vmm_machine::entry::setup_logger("rshyve");
 
-    match run(cli, &log) {
+    let result = run(cli, &log);
+    // The console writer thread holds the guest's last bytes. Both the
+    // reexec below and a plain exit would drop them.
+    if !vmm_devices::uart::backend::flush_stdout(CONSOLE_FLUSH_TIMEOUT) {
+        warn!(log, "console output was still draining at exit");
+    }
+    match result {
         Ok(RunResult {
             outcome: RunOutcome::Reboot,
             hotplug_specs,
