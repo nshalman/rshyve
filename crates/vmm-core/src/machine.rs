@@ -18,9 +18,8 @@
 //!                └─────────────────┘
 //! ```
 
+use std::io;
 use std::sync::Arc;
-
-use anyhow::Context as _;
 
 use crate::hdl::{CreateOpts, VmmHdl};
 use crate::mem::{MemCtx, PhysMap, SegidAlloc, MMIO_HOLE_BASE, MMIO_HOLE_END};
@@ -234,8 +233,7 @@ impl Builder {
         // Arm the kernel reclaimer before any later step can fail. It is the
         // only thing that releases the instance if the process dies without
         // teardown.
-        hdl.set_autodestruct(true)
-            .context("failed to arm VM autodestruct")?;
+        arm_or_destroy(|| hdl.set_autodestruct(true), || hdl.destroy())?;
 
         let mut map = PhysMap::new();
 
@@ -255,5 +253,87 @@ impl Builder {
             num_cpus: self.num_cpus,
             mem_size: self.mem_size,
         })
+    }
+}
+
+/// Arm the kernel reclaimer, destroying the instance if it cannot be.
+///
+/// `VMM_CREATE_VM` has already published `/dev/vmm/<name>`. Dropping the
+/// handle unarmed leaves an instance no fd owns and no reclaimer will
+/// take, so the next start of the same name fails `EEXIST` until an
+/// operator destroys it by hand. `VmmHdl::create` does the same for the
+/// analogous failed open.
+///
+/// Both errors are kept: the arming failure says why the instance had to
+/// go, and a failed destroy says the operator still has one to clear.
+fn arm_or_destroy(
+    arm: impl FnOnce() -> io::Result<()>,
+    destroy: impl FnOnce() -> io::Result<()>,
+) -> anyhow::Result<()> {
+    let Err(refused) = arm() else {
+        return Ok(());
+    };
+    match destroy() {
+        Ok(()) => Err(anyhow::Error::new(refused)
+            .context("failed to arm VM autodestruct")),
+        Err(lost) => Err(anyhow::Error::new(refused).context(format!(
+            "failed to arm VM autodestruct, and the unowned instance \
+             could not be destroyed either: {lost}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn an_armed_reclaimer_destroys_nothing() {
+        let destroyed = Cell::new(false);
+
+        arm_or_destroy(
+            || Ok(()),
+            || {
+                destroyed.set(true);
+                Ok(())
+            },
+        )
+        .expect("arming succeeded");
+
+        assert!(!destroyed.get());
+    }
+
+    /// An instance left unarmed is reclaimed by nothing, so it has to be
+    /// destroyed here or an operator clears it by hand.
+    #[test]
+    fn a_refused_arming_destroys_the_instance() {
+        let destroyed = Cell::new(false);
+
+        let error = arm_or_destroy(
+            || Err(io::Error::from_raw_os_error(libc::EPERM)),
+            || {
+                destroyed.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("arming failed");
+
+        assert!(destroyed.get(), "the unowned instance must be destroyed");
+        assert!(format!("{error:#}").contains("autodestruct"), "{error:#}",);
+    }
+
+    #[test]
+    fn a_destroy_that_also_fails_reports_both() {
+        let error = arm_or_destroy(
+            || Err(io::Error::from_raw_os_error(libc::EPERM)),
+            || Err(io::Error::from_raw_os_error(libc::EBUSY)),
+        )
+        .expect_err("both failed");
+
+        let text = format!("{error:#}");
+        assert!(text.contains("autodestruct"), "{text}");
+        assert!(text.contains("could not be destroyed"), "{text}");
     }
 }
