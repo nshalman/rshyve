@@ -280,6 +280,22 @@ closed socket all as a failed migration and resumes its guest. A guest
 that resumed on the destination over an older disk had already
 acknowledged writes that disk never received.
 
+## Waking the guest
+
+The restore raises an interrupt on each live queue before the vCPUs
+start, and one more once they are running. The second one is the one
+that matters: a driver that is not running cannot take an interrupt,
+and after a migration the receive ring may hold no available buffers,
+so the driver has nothing to poll for and posts none until something
+wakes it.
+
+There used to be a third: a LAPIC injection of vector 0xEC on every
+vCPU. That is Linux's `LOCAL_TIMER_VECTOR` and an arbitrary vector
+anywhere else, so on Windows or illumos it delivered a spurious
+interrupt or hit a real handler. The LAPIC, its timer included, is
+migrated through `VDC_LAPIC` and the kernel re-arms it on `VM_RESUME`,
+so nothing needed the injection.
+
 ## Error Recovery
 
 A migration that fails once the guest is paused rolls the source back:

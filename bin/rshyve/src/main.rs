@@ -672,22 +672,6 @@ fn connect_migration_socket(
     anyhow::bail!("no migration socket at {path} after {RETRIES} tries")
 }
 
-/// After migration, inject a timer interrupt to restart the scheduler tick
-/// in the guest (nohz/tickless mode workaround).
-fn post_migration_timer_kick(machine: &Machine, log: &Logger) {
-    thread::sleep(std::time::Duration::from_millis(200));
-    for vcpu in machine.vcpus() {
-        match machine.hdl().lapic_irq(vcpu.id(), 0xEC) {
-            Ok(()) => {
-                info!(log, "post-migration timer kick"; "vcpu" => vcpu.id())
-            }
-            Err(e) => {
-                warn!(log, "timer kick failed"; "vcpu" => vcpu.id(), "error" => %e)
-            }
-        }
-    }
-}
-
 /// What the control socket leaves behind for the rest of `run`.
 #[derive(Default)]
 struct ControlSocket {
@@ -901,27 +885,30 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     );
     let vcpu_metrics = fleet.metrics.clone();
 
-    // Phase 10: Post-migration timer kick + delayed virtio interrupt
+    // Phase 10: wake the guest's virtio drivers once the vCPUs run.
+    //
+    // The restore raises an interrupt per live queue, but that one
+    // fires before the vCPUs start and a driver that is not running
+    // cannot take it. This second one reaches a running driver, which
+    // is what makes it process the caught-up used ring and post new
+    // receive buffers.
     if cli.migrate_listen.is_some() {
-        post_migration_timer_kick(&machine, log);
-
-        // Re-inject virtio interrupts periodically after vCPUs start.
-        // The initial post-restore interrupt fires before resume but
-        // may not be sufficient for virtio-blk (the guest's blk driver
-        // may need multiple interrupt cycles to fully process stale
-        // used ring entries and resume I/O).
         let devs = registry.lifecycle_devices();
-        thread::Builder::new()
+        let kick_log = log.clone();
+        if let Err(e) = thread::Builder::new()
             .name("post-migrate-virtio-kick".into())
             .spawn(move || {
-                for _ in 0..10 {
-                    thread::sleep(std::time::Duration::from_millis(100));
-                    for dev in &devs {
-                        dev.post_restore_kick();
-                    }
+                thread::sleep(std::time::Duration::from_millis(100));
+                for dev in &devs {
+                    dev.post_restore_kick();
                 }
             })
-            .ok();
+        {
+            // The guest keeps its rings; it may just not notice the
+            // entries waiting in them until it kicks a queue itself.
+            warn!(kick_log, "could not start the post-migration kick thread";
+                "error" => %e);
+        }
     }
 
     // Phase 11: Hotplug engines. Each owns the thread that answers the
