@@ -42,7 +42,6 @@ use std::time::Duration;
 
 use slog::{debug, error, info, warn, Logger};
 
-use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::{MMIO_HOLE_BASE, MMIO_HOLE_END};
 use vmm_devices::hotplug::mem::MAX_SLOTS as MEM_SLOTS;
 use vmm_devices::hotplug::pci::{is_hotpluggable_slot, PciHotplug};
@@ -52,6 +51,7 @@ use vmm_devices::IndicatedState;
 
 use crate::devspec;
 use crate::parse::parse_bdf;
+use crate::pause::{VmPause, VmPauseGate};
 use crate::pci::{
     CreatedPciDevice, OwnedPciCtx, PciDeviceCtx, PciDeviceHandle,
 };
@@ -168,25 +168,6 @@ impl fmt::Display for HotplugError {
 }
 
 impl std::error::Error for HotplugError {}
-
-/// Stops every vCPU while the PCI bus changes shape.
-///
-/// A trait, not the handle itself, so the teardown order can be tested
-/// without a live VM.
-pub trait VmPause: Send + Sync {
-    fn pause(&self) -> anyhow::Result<()>;
-    fn resume(&self) -> anyhow::Result<()>;
-}
-
-impl VmPause for VmmHdl {
-    fn pause(&self) -> anyhow::Result<()> {
-        VmmHdl::pause(self).map_err(anyhow::Error::from)
-    }
-
-    fn resume(&self) -> anyhow::Result<()> {
-        VmmHdl::resume(self).map_err(anyhow::Error::from)
-    }
-}
 
 /// Builds one device from its spec. The engine's seam onto a binary's
 /// catalog.
@@ -395,6 +376,7 @@ impl Core {
                 );
                 return;
             }
+
             // The release is still running on a thread this one let go
             // of. Nothing may touch the slot: a worker can still be
             // inside a transport callback on the device that is leaving,
@@ -431,7 +413,15 @@ impl Core {
             return;
         }
 
-        self.detach_paused(bdf, device.pci.as_ref());
+        if let Err(e) = self.detach_paused(bdf, device.pci.as_ref()) {
+            // The slot stays `Ejecting`: the device is quiesced and
+            // halted, so it serves the guest no more, but its regions
+            // are still registered and a vCPU may be inside one.
+            error!(self.log, "eject stopped: the VM would not pause for \
+                the bus change"; "id" => &device.id,
+                "error" => format!("{e:#}"));
+            return;
+        }
         if let Err(e) = self.registry.set_state(
             &device.id,
             SlotState::Ejecting,
@@ -511,26 +501,27 @@ impl Core {
                     "bdf" => %bdf, "error" => format!("{e:?}"));
             }
         }
-        self.detach_paused(bdf, pci);
+        if let Err(e) = self.detach_paused(bdf, pci) {
+            error!(self.log, "a rolled-back device is still on the bus";
+                "bdf" => %bdf, "error" => format!("{e:#}"));
+        }
     }
 
     /// Take a device off the bus with no vCPU inside a bus handler.
     ///
     /// The pause is what makes the region unregister safe: a vCPU can
-    /// be part-way through a BAR access on the device that is leaving.
-    /// Only a pause this call took is resumed, so a VM the operator
-    /// stopped is never started again from here.
-    fn detach_paused(&self, bdf: Bdf, pci: Option<&PciDeviceHandle>) {
-        let paused = match self.vm.pause() {
-            Ok(()) => true,
-            Err(e) => {
-                // Carry on: the guest has already let the device go, so
-                // leaving it half attached is worse than a racy detach.
-                error!(self.log, "failed to pause the VM for a bus change";
-                    "bdf" => %bdf, "error" => format!("{e:#}"));
-                false
-            }
-        };
+    /// be part-way through a BAR access on the device that is leaving,
+    /// so a pause that fails aborts the detach rather than stripping a
+    /// live device. The pause is a [`VmPauseGate`] hold, so an operator
+    /// pause already in force is not a failure and is not resumed here.
+    fn detach_paused(
+        &self,
+        bdf: Bdf,
+        pci: Option<&PciDeviceHandle>,
+    ) -> anyhow::Result<()> {
+        self.vm.pause().map_err(|e| {
+            e.context(format!("no pause for the bus change at {bdf}"))
+        })?;
 
         if let Some(device) = pci {
             device.detach_regions();
@@ -539,18 +530,23 @@ impl Core {
         // releases the reference the bus held.
         drop(self.bus.detach(&bdf));
 
-        if paused {
-            if let Err(e) = self.vm.resume() {
-                error!(self.log, "failed to resume the VM after a bus change";
-                    "bdf" => %bdf, "error" => format!("{e:#}"));
-            }
+        if let Err(e) = self.vm.resume() {
+            // The regions are already gone, so the change stands. A VM
+            // that will not resume is a kernel level failure this path
+            // cannot undo.
+            error!(self.log, "failed to resume the VM after a bus change";
+                "bdf" => %bdf, "error" => format!("{e:#}"));
         }
+        Ok(())
     }
 }
 
 /// The add and remove engine, and the thread that owns teardown.
 pub struct HotplugEngine {
     core: Arc<Core>,
+    /// The pause the bus change takes. Held here so the control plane
+    /// can take the same one.
+    gate: Arc<VmPauseGate>,
     ctx: Arc<OwnedPciCtx>,
     /// The binary's catalog. `Mutex` because it is `FnMut` and two
     /// control connections can ask at once.
@@ -574,11 +570,11 @@ impl HotplugEngine {
         // The bus and the VM handle come out of the context the catalog
         // builds against, so a device can never be detached from a bus
         // other than the one it was attached to.
-        let (bus, vm) = {
+        let (bus, gate) = {
             let borrowed = PciDeviceCtx::borrow_from(&ctx);
             (
                 Arc::clone(borrowed.chipset.pci_bus()),
-                Arc::clone(borrowed.vmm_hdl) as Arc<dyn VmPause>,
+                VmPauseGate::over_hdl(Arc::clone(borrowed.vmm_hdl)),
             )
         };
 
@@ -586,7 +582,7 @@ impl HotplugEngine {
             registry,
             bus,
             regs: pci_regs,
-            vm,
+            vm: Arc::clone(&gate) as Arc<dyn VmPause>,
             budget: UNPLUG_BUDGET,
             halt_slack: UNPLUG_HALT_SLACK,
             closed: AtomicBool::new(false),
@@ -602,6 +598,7 @@ impl HotplugEngine {
 
         Arc::new(Self {
             core,
+            gate,
             ctx,
             factory: Mutex::new(factory),
             thread,
@@ -621,6 +618,14 @@ impl HotplugEngine {
     /// has been asked.
     pub fn request_remove(&self, id: &str) -> Result<(), HotplugError> {
         self.core.request_remove(id)
+    }
+
+    /// The pause this engine takes when it changes the bus.
+    ///
+    /// The kernel keeps one pause flag per instance, so every userspace
+    /// path that stops the whole VM has to share this count.
+    pub fn pause_gate(&self) -> Arc<VmPauseGate> {
+        Arc::clone(&self.gate)
     }
 
     /// Refuse every later add and removal, and stop the drain thread.
@@ -875,6 +880,22 @@ pub struct HotplugEngines {
 }
 
 impl HotplugEngines {
+    /// The pause every path that stops the whole VM must take.
+    ///
+    /// The PCI engine's gate when the VM has one, because that engine is
+    /// the only other userspace owner of the kernel's single pause flag.
+    /// Without the engine there is no second owner, so a fresh gate over
+    /// the handle is the whole count.
+    pub fn pause_gate(
+        &self,
+        hdl: &Arc<vmm_core::hdl::VmmHdl>,
+    ) -> Arc<VmPauseGate> {
+        match self.pci.as_ref() {
+            Some(pci) => pci.pause_gate(),
+            None => VmPauseGate::over_hdl(Arc::clone(hdl)),
+        }
+    }
+
     /// Refuse every later request and stop every drain thread.
     ///
     /// Called from inside the event loop, before teardown takes its

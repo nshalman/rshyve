@@ -432,17 +432,19 @@ mod tests {
         });
 
         // Far more than any socket buffer, from a peer that never reads.
-        let started = Instant::now();
-        for _ in 0..(1 << 20) {
+        // The longest single write is what matters: a sink that waited
+        // would show the writer's whole budget in one of them, whatever
+        // else the machine is doing.
+        let mut slowest = Duration::ZERO;
+        for _ in 0..(64 << 10) {
+            let started = Instant::now();
             bus.handle_out(COM2_BASE, 1, u32::from(b'x'));
+            slowest = slowest.max(started.elapsed());
         }
-        let guest_time = started.elapsed();
 
-        // The sink never waits, so the write budget the writer spends on
-        // the stalled peer cannot show up here.
         assert!(
-            guest_time < Duration::from_secs(5),
-            "the guest writes took {guest_time:?}",
+            slowest < SOCKET_WRITE_BUDGET,
+            "one guest write took {slowest:?}",
         );
 
         // Dropping the UART drops the sink, and with it the only sender.

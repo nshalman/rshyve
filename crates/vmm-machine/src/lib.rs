@@ -19,6 +19,7 @@ pub mod hotplug;
 pub mod inventory;
 pub mod opts;
 pub mod parse;
+pub mod pause;
 pub mod pci;
 pub mod pm;
 pub mod provision;
@@ -44,10 +45,11 @@ pub use hotplug::mem::{
 };
 pub use hotplug::{
     hot_add_window, hotplug_specs, start_cpu_hotplug, CpuSlots, HotplugEngine,
-    HotplugEngines, HotplugError, HotplugFactory, VmPause,
+    HotplugEngines, HotplugError, HotplugFactory,
 };
 pub use opts::VmOpts;
 pub use parse::{find_lpc_device, parse_bdf};
+pub use pause::{VmPause, VmPauseGate};
 pub use pci::{
     attach_pci_devices, created, CreatedPciDevice, LifecycleHandle,
     PciAttachment, PciDeviceCtx, PciDeviceFactory, PciDeviceHandle,

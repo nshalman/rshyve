@@ -190,6 +190,9 @@ struct Fixture {
     bus: Arc<PciBus>,
     regs: Arc<PciHotplug>,
     vm: Arc<RecordingPause>,
+    /// The same gate the engine pauses through, so a test can hold the
+    /// pause the way an operator's `pause` command does.
+    gate: Arc<VmPauseGate>,
 }
 
 impl Fixture {
@@ -203,12 +206,13 @@ impl Fixture {
         let regs =
             PciHotplug::new(Arc::new(RecordingSink::default()), null_log());
         let vm = Arc::new(pause);
+        let gate = VmPauseGate::new(Arc::clone(&vm) as Arc<dyn VmPause>);
         Self {
             core: Core {
                 registry: Arc::clone(&registry),
                 bus: Arc::clone(&bus),
                 regs: Arc::clone(&regs),
-                vm: Arc::clone(&vm) as Arc<dyn VmPause>,
+                vm: Arc::clone(&gate) as Arc<dyn VmPause>,
                 // Short, so the abort path does not slow the suite.
                 budget: Duration::from_millis(20),
                 halt_slack: Duration::from_millis(20),
@@ -219,6 +223,7 @@ impl Fixture {
             bus,
             regs,
             vm,
+            gate,
         }
     }
 
@@ -530,16 +535,17 @@ fn the_vm_is_paused_around_the_region_unregister() {
 
     fixture
         .core
-        .detach_paused(bdf, Some(&(device as PciDeviceHandle)));
+        .detach_paused(bdf, Some(&(device as PciDeviceHandle)))
+        .expect("the VM pauses");
 
     assert_eq!(trace.steps(), ["vm-pause", "detach-regions", "vm-resume"]);
     assert!(fixture.slot_is_empty(5));
 }
 
+/// A vCPU can be part-way through a BAR access on the device that is
+/// leaving, so the detach needs the pause and must not proceed without.
 #[test]
-fn a_failed_pause_does_not_resume_the_vm() {
-    // An operator may have paused the VM. Resuming after a pause that
-    // never took would start it again behind their back.
+fn a_failed_pause_leaves_the_device_on_the_bus() {
     let fixture = Fixture::with_pause(RecordingPause {
         fails: true,
         ..RecordingPause::default()
@@ -550,10 +556,47 @@ fn a_failed_pause_does_not_resume_the_vm() {
         .try_attach(bdf, Arc::new(StubPci::default()) as Arc<dyn PciDevice>)
         .expect("the bus is empty");
 
-    fixture.core.detach_paused(bdf, None);
+    fixture
+        .core
+        .detach_paused(bdf, None)
+        .expect_err("a refused pause must refuse the detach");
 
-    assert!(fixture.slot_is_empty(5), "the device must still leave");
+    assert!(!fixture.slot_is_empty(5), "the device must keep its slot");
+    // Resuming after a pause that never took would start the VM behind
+    // an operator who paused it.
     assert_eq!(fixture.vm.resumes.load(Ordering::Acquire), 0);
+}
+
+/// The guest picks the moment it runs `_EJ0`. An operator pause inside
+/// that window used to be answered `EALREADY` and reported as failed.
+#[test]
+fn an_operator_pause_and_an_eject_share_one_kernel_pause() {
+    let trace = Arc::new(Trace::default());
+    let fixture = Fixture::with_pause(RecordingPause {
+        trace: Some(Arc::clone(&trace)),
+        ..RecordingPause::default()
+    });
+    let id = fixture.add("5,virtio-blk,/added").expect("added");
+    fixture.core.request_remove(&id).expect("requested");
+
+    // The operator pauses, and holds it across the whole eject.
+    fixture
+        .gate
+        .pause()
+        .expect("the operator pause is accepted");
+    fixture.guest_ejects(5);
+    fixture.core.drain_ejects();
+
+    assert!(fixture.slot_is_empty(5), "the eject must still finish");
+    assert_eq!(fixture.vm.pauses.load(Ordering::Acquire), 1);
+    // The VM stays stopped: the operator has not resumed it yet.
+    assert_eq!(fixture.vm.resumes.load(Ordering::Acquire), 0);
+    assert!(fixture.gate.is_held());
+
+    fixture.gate.resume().expect("the operator resumes");
+    assert_eq!(fixture.vm.resumes.load(Ordering::Acquire), 1);
+    // One pause and one resume reached the kernel for the two holders.
+    assert_eq!(trace.steps(), ["vm-pause", "vm-resume"]);
 }
 
 // ── Remove ──────────────────────────────────────────────────────────

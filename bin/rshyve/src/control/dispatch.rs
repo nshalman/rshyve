@@ -56,7 +56,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                     stuck,
                 ));
             }
-            match ctrl.hdl.pause() {
+            match ctrl.hold_pause() {
                 Ok(()) => {
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Paused);
@@ -78,7 +78,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             }
             // Resume device workers BEFORE vCPUs so interrupts can be delivered
             ctrl.resume_devices();
-            match ctrl.hdl.resume() {
+            match ctrl.release_pause() {
                 Ok(()) => {
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Running);

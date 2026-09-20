@@ -103,6 +103,14 @@ impl VmRunState {
 pub struct VmController {
     state: AtomicU8,
     hdl: Arc<VmmHdl>,
+    /// The pause `Command::Pause` takes.
+    ///
+    /// Shared with the PCI hot-add engine, because the kernel keeps one
+    /// pause flag per instance and the engine pauses the whole VM for
+    /// each bus change. The guest picks when that happens, so without
+    /// the shared count an operator `pause` landing inside an eject was
+    /// answered `EALREADY` and reported as failed.
+    pause_gate: Arc<vmm_machine::VmPauseGate>,
     physmap: Arc<PhysMap>,
     vm_name: String,
     num_cpus: u32,
@@ -162,9 +170,11 @@ impl VmController {
         log: Logger,
     ) -> Arc<Self> {
         let name = vm_name.to_string();
+        let pause_gate = hotplug.pause_gate(&hdl);
         Arc::new(Self {
             state: AtomicU8::new(VmRunState::Running as u8),
             hdl,
+            pause_gate,
             physmap,
             vm_name: name,
             num_cpus,
@@ -384,6 +394,17 @@ impl VmController {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    /// Take the operator's hold on the kernel pause.
+    fn hold_pause(&self) -> anyhow::Result<()> {
+        vmm_machine::VmPause::pause(self.pause_gate.as_ref())
+    }
+
+    /// Give up the operator's hold. The instance runs again once the
+    /// hot-unplug path has given up any hold of its own.
+    fn release_pause(&self) -> anyhow::Result<()> {
+        vmm_machine::VmPause::resume(self.pause_gate.as_ref())
     }
 
     /// Pause all devices: signal each to quiesce, then wait for all
