@@ -9,6 +9,7 @@
 //! posts an RX chain to put them in, the same way the console buffers
 //! host input.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -106,11 +107,6 @@ impl VsockMux {
         self.guest_cid
     }
 
-    /// A host port for a connection the guest did not name.
-    pub fn alloc_host_port(&self) -> u32 {
-        self.next_host_port.fetch_add(1, Ordering::Relaxed)
-    }
-
     /// Queue a packet for the guest. Returns false when the backlog is
     /// full, which tells the caller to stop reading its host socket.
     pub fn push_rx(&self, pkt: RxPacket) -> bool {
@@ -159,38 +155,55 @@ impl VsockMux {
         self.rx.lock().expect("rx lock").q.is_empty()
     }
 
-    /// Register a host-initiated connection and queue its REQUEST.
+    /// Register a host-initiated connection under an exact key and
+    /// queue its REQUEST.
     ///
-    /// Returns false when the table is at [`MAX_CONNS`]. Nothing is
-    /// registered and the guest is not told, so the caller has to close
-    /// the peer's socket: no answer will ever come for it.
-    ///
-    /// A caller that must write to the host socket first takes the two
-    /// steps apart: [`Self::reserve_host_connect`], then its own write,
-    /// then [`Self::announce_host_connect`].
+    /// Production allocates the host port instead, through
+    /// [`Self::reserve_host_connect`]; this is how a test names the
+    /// connection it is about to drive.
+    #[cfg(test)]
     pub fn start_host_connect(&self, key: ConnKey) -> bool {
-        if !self.reserve_host_connect(key) {
-            return false;
+        {
+            let mut conns = self.conns.lock().expect("conns lock");
+            if conns.contains_key(&key) || conns.len() >= MAX_CONNS {
+                return false;
+            }
+            conns.insert(key, VsockConn::new(State::Connecting));
         }
         self.announce_host_connect(key);
         true
     }
 
-    /// Take a slot for a host-initiated connection, without telling the
-    /// guest about it.
+    /// Take a slot for a host-initiated connection to `guest_port`, and
+    /// name it.
     ///
     /// The guest cannot reach the connection until
     /// [`Self::announce_host_connect`] queues its REQUEST, so the caller
-    /// owns the host socket alone until then. Returns false when the
+    /// owns the host socket alone until then. Returns None when the
     /// table is at [`MAX_CONNS`].
-    pub fn reserve_host_connect(&self, key: ConnKey) -> bool {
+    ///
+    /// The port is allocated and the slot taken under one lock, and a
+    /// key already in the table is skipped rather than replaced: the
+    /// guest names both ends of a connection it opens, so it can hold a
+    /// key in this range, and overwriting the entry would put two
+    /// connections in one.
+    pub fn reserve_host_connect(&self, guest_port: u32) -> Option<ConnKey> {
         let mut conns = self.conns.lock().expect("conns lock");
-        // Replacing a key the table already holds does not grow it.
-        if conns.len() >= MAX_CONNS && !conns.contains_key(&key) {
-            return false;
+        if conns.len() >= MAX_CONNS {
+            return None;
         }
-        conns.insert(key, VsockConn::new(State::Connecting));
-        true
+        for _ in 0..=MAX_CONNS {
+            let host_port = self.next_host_port.fetch_add(1, Ordering::Relaxed);
+            let key = ConnKey {
+                guest_port,
+                host_port,
+            };
+            if let Entry::Vacant(slot) = conns.entry(key) {
+                slot.insert(VsockConn::new(State::Connecting));
+                return Some(key);
+            }
+        }
+        None
     }
 
     /// Tell the guest about a slot taken by

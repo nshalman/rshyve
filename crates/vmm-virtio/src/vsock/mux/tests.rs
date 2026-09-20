@@ -423,13 +423,26 @@ fn control_packets_cannot_grow_the_rx_queue_without_bound() {
     assert_eq!(drain(&m).len(), RX_PACKETS_MAX);
 }
 
+/// A guest names both ends of a connection it opens, so it can take a
+/// key out of the ephemeral range. The allocator must step over it: an
+/// entry replaced here would put the host peer and the guest's own
+/// connection in one, and the first reader to exit would take both
+/// down.
 #[test]
-fn host_ports_are_unique() {
+fn a_host_port_the_guest_already_holds_is_skipped() {
     let m = mux();
-    let a = m.alloc_host_port();
-    let b = m.alloc_host_port();
-    assert_ne!(a, b);
-    assert!(a >= EPHEMERAL_PORT_BASE);
+    let a = m.reserve_host_connect(1024).expect("first");
+    assert_ne!(a.host_port, 0);
+    assert!(a.host_port >= EPHEMERAL_PORT_BASE);
+
+    // The guest opens the key this allocator would hand out next.
+    let taken = a.host_port + 1;
+    m.on_guest_packet(&guest_hdr(OP_REQUEST, 2048, taken), vec![]);
+    assert_eq!(m.conn_count(), 2);
+
+    let b = m.reserve_host_connect(2048).expect("second");
+    assert_ne!(b.host_port, taken, "the guest's connection was overwritten");
+    assert_eq!(m.conn_count(), 3, "a live connection was replaced");
 }
 
 /// The guest drops whatever arrives past the window it published,

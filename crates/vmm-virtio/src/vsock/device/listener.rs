@@ -155,16 +155,12 @@ pub(super) fn start_host_connection(
     stream: UnixStream,
     port: u32,
 ) {
-    let key = ConnKey {
-        guest_port: port,
-        host_port: shared.mux.alloc_host_port(),
-    };
     let s = stream;
     // The table is capped, and a peer told OK for a connection the mux
     // refused would wait on a guest that is never going to hear about
     // it. Reserving the slot answers that without letting the guest
     // reach the connection yet.
-    if !shared.mux.reserve_host_connect(key) {
+    let Some(key) = shared.mux.reserve_host_connect(port) else {
         // Best effort: the peer may already be gone.
         let _ = write_all_bounded(
             &s,
@@ -172,7 +168,7 @@ pub(super) fn start_host_connection(
             HOST_WRITE_TIMEOUT,
         );
         return;
-    }
+    };
     // This thread owns the socket until the REQUEST is queued. Once it
     // is, any thread's deliver_rx may hand it to the guest, the guest
     // may answer and send payload, and a vCPU may then be inside
