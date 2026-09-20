@@ -130,7 +130,7 @@ pub fn setup_fwcfg_and_acpi(
     // UEFI views in sync.
     write_legacy_acpi_tables(machine, &acpi_cfg, tpm_acpi, log);
 
-    write_smbios_tables(machine, &fwcfg, opts, num_cpus, mem_size, log);
+    write_smbios_tables(machine, &fwcfg, opts, num_cpus, mem_size, log)?;
 
     Ok((fwcfg, AcpiTables::at_bhyve_base()))
 }
@@ -185,9 +185,9 @@ pub fn write_smbios_tables(
     num_cpus: u32,
     mem_size: usize,
     log: &Logger,
-) {
+) -> anyhow::Result<()> {
     let smbios_config = if let Some(ref b_flag) = opts.smbios {
-        let mut cfg = smbios::parse_smbios_flag(b_flag);
+        let mut cfg = smbios::parse_smbios_flag(b_flag)?;
         cfg.vm_name = opts.vm_name.clone();
         cfg.uuid = opts.uuid.clone();
         cfg.num_cpus = num_cpus;
@@ -207,8 +207,11 @@ pub fn write_smbios_tables(
             family: None,
         }
     };
+    // The structure table has to stay clear of the legacy ACPI tables
+    // the loader writes right above it.
+    let window = (acpi::BHYVE_ACPI_BASE - SMBIOS_TABLE_GPA) as usize;
     let (smbios_anchor, smbios_tables) =
-        smbios::generate_smbios(&smbios_config);
+        smbios::generate_smbios(&smbios_config, window)?;
     fwcfg.insert_named("etc/smbios/smbios-anchor", smbios_anchor.clone());
     fwcfg.insert_named("etc/smbios/smbios-tables", smbios_tables.clone());
     info!(log, "SMBIOS tables added to fw_cfg";
@@ -248,6 +251,7 @@ pub fn write_smbios_tables(
             "tables" => format!("{:#x}", SMBIOS_TABLE_GPA),
         );
     }
+    Ok(())
 }
 
 #[cfg(test)]
