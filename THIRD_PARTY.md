@@ -17,63 +17,79 @@ file carries the detail needed to audit or refresh a component.
 **This project would not exist in its current form without Propolis.**
 The entire bhyve and viona kernel interface, the address-space manager,
 the PS/2 device models, and parts of the PCI, UART, and VM-exit layers
-originate there. About 3,500 significant lines are copied or derived, across 19 files.
+originate there.
 
-Similarity below is measured with ordered sequence comparison over
-non-trivial lines, so it reflects real derivation rather than shared
-Rust boilerplate. Every file listed carries an attribution header naming
-its upstream counterpart.
-
-Copied essentially verbatim:
-
-| File | Upstream |
+| | |
 |---|---|
-| `crates/bhyve-api/sys/src/vmm_data.rs` | `crates/bhyve-api/sys/src/vmm_data.rs` |
-| `crates/bhyve-api/sys/src/enums.rs` | `crates/bhyve-api/sys/src/enums.rs` |
-| `crates/bhyve-api/sys/src/ioctls.rs` | `crates/bhyve-api/sys/src/ioctls.rs` |
-| `crates/bhyve-api/src/lib.rs` | `crates/bhyve-api/src/lib.rs` |
-| `crates/viona-api/src/lib.rs` | `crates/viona-api/src/lib.rs` |
-| `crates/viona-api/src/ffi.rs` | `crates/viona-api/src/ffi.rs` |
-| `crates/dladm/src/sys.rs` | `crates/dladm/src/sys.rs` |
-| `crates/vmm-core/src/aspace.rs` | `lib/propolis/src/util/aspace.rs` |
-| `crates/vmm-hid/src/ps2/keysym.rs` | `crates/rfb/src/keysym.rs` |
-| `crates/vmm-hid/src/ps2/keyboard/mod.rs` | `lib/propolis/src/hw/ps2/keyboard/mod.rs` |
-| `crates/vmm-hid/src/ps2/keyboard/scan_code_1.rs` | same path upstream |
-| `crates/vmm-hid/src/ps2/keyboard/scan_code_2.rs` | same path upstream |
+| Measured against Propolis revision | `b428c40efae0be950e996f9dfd5ab8d02db59184` (2026-08-06) |
+| Files at or above 30% similarity | 19 |
+| Significant lines in those files | 3300 |
+| Verbatim / derived / partial | 6 / 6 / 7 |
 
-Substantially derived:
-
-| File | Similarity | Upstream |
-|---|---|---|
-| `crates/bhyve-api/sys/src/structs.rs` | 93% | `crates/bhyve-api/sys/src/structs.rs` |
-| `crates/vmm-devices/src/migrate.rs` | 79% | `lib/propolis/src/migrate.rs` |
-
-Partly derived:
-
-| File | Similarity | Upstream |
-|---|---|---|
-| `crates/vmm-devices/src/pci/bits.rs` | 53% | `lib/propolis/src/hw/pci/bits.rs` |
-| `crates/vmm-core/src/exits.rs` | 48% | `lib/propolis/src/exits.rs` |
-| `crates/vmm-hid/src/ps2/ctrl.rs` | 46% | `lib/propolis/src/hw/ps2/ctrl.rs` |
-| `crates/vmm-hid/src/ps2/kbd.rs` | split | `lib/propolis/src/hw/ps2/ctrl.rs` (`PS2Kbd`) |
-| `crates/vmm-hid/src/ps2/mouse.rs` | split | `lib/propolis/src/hw/ps2/ctrl.rs` (`PS2Mouse`) |
-| `crates/vmm-devices/src/pci/bar.rs` | 41% | `lib/propolis/src/hw/pci/bar.rs` |
-| `crates/vmm-core/src/intr_pins.rs` | 39% | `lib/propolis/src/intr_pins.rs` |
-| `crates/vmm-devices/src/uart/uart16550.rs` | 36% | `lib/propolis/src/hw/uart/uart16550.rs` |
-
-`kbd.rs` and `mouse.rs` hold the `PS2Kbd` and `PS2Mouse` models, which
-upstream keeps inside `ctrl.rs`. Splitting them across three files puts
-each below the 30% per-file reporting threshold, so the tool does not
-list them separately. They are derived all the same.
-
-Reproduce the whole table with:
+Reproduce every number and every row below with:
 
 ```sh
 tools/propolis-derivation.py /path/to/propolis
 ```
 
-Scores move as upstream moves, so record the Propolis revision measured
-whenever this table is regenerated.
+The tool prints the revision it measured. Record it in the table above
+whenever these rows are regenerated, because the scores move as upstream
+moves. Similarity is an ordered sequence ratio over non-trivial lines, so
+it reflects real derivation rather than shared Rust boilerplate. Every
+file listed carries an attribution header naming its upstream
+counterpart.
+
+Copied essentially verbatim (95% and above):
+
+| File | Similarity | Upstream |
+|---|---|---|
+| `crates/vmm-hid/src/ps2/keyboard/scan_code_2.rs` | 100% | `lib/propolis/src/hw/ps2/keyboard/scan_code_2.rs` |
+| `crates/vmm-hid/src/ps2/keyboard/scan_code_1.rs` | 100% | `lib/propolis/src/hw/ps2/keyboard/scan_code_1.rs` |
+| `crates/bhyve-api/sys/src/enums.rs` | 100% | same path upstream |
+| `crates/vmm-hid/src/ps2/keysym.rs` | 99% | `crates/rfb/src/keysym.rs` |
+| `crates/bhyve-api/sys/src/vmm_data.rs` | 99% | same path upstream |
+| `crates/bhyve-api/sys/src/ioctls.rs` | 96% | same path upstream |
+
+Substantially derived (60% to 95%):
+
+| File | Similarity | Upstream |
+|---|---|---|
+| `crates/vmm-hid/src/ps2/keyboard/mod.rs` | 94% | `lib/propolis/src/hw/ps2/keyboard/mod.rs` |
+| `crates/viona-api/src/ffi.rs` | 92% | same path upstream |
+| `crates/bhyve-api/sys/src/structs.rs` | 91% | same path upstream |
+| `crates/bhyve-api/src/lib.rs` | 78% | same path upstream |
+| `crates/vmm-core/src/aspace.rs` | 72% | `lib/propolis/src/util/aspace.rs` |
+| `crates/vmm-devices/src/migrate.rs` | 69% | `lib/propolis/src/migrate.rs` |
+
+Partly derived (30% to 60%):
+
+| File | Similarity | Upstream |
+|---|---|---|
+| `crates/vmm-devices/src/pci/bits.rs` | 51% | `lib/propolis/src/hw/pci/bits.rs` |
+| `crates/vmm-core/src/exits.rs` | 49% | `lib/propolis/src/exits.rs` |
+| `crates/vmm-hid/src/ps2/ctrl.rs` | 44% | `lib/propolis/src/hw/ps2/ctrl.rs` |
+| `crates/viona-api/src/lib.rs` | 42% | same path upstream |
+| `crates/vmm-devices/src/pci/bar.rs` | 41% | `lib/propolis/src/hw/pci/bar.rs` |
+| `crates/vmm-devices/src/uart/uart16550.rs` | 35% | `lib/propolis/src/hw/uart/uart16550.rs` |
+
+The tool also reports `crates/vmm-core/src/lib.rs` at 32%. That file has
+22 significant lines, all of them `pub mod` and `pub use` declarations,
+and it carries no upstream attribution header because it is not derived.
+It is a boilerplate coincidence at the reporting threshold, listed here
+so a reader who runs the tool is not left wondering.
+
+Derived but below the threshold, hand-added:
+
+| File | Upstream | Why it is under 30% |
+|---|---|---|
+| `crates/vmm-hid/src/ps2/kbd.rs` | `lib/propolis/src/hw/ps2/ctrl.rs` (`PS2Kbd`) | Split out of a file upstream keeps whole |
+| `crates/vmm-hid/src/ps2/mouse.rs` | `lib/propolis/src/hw/ps2/ctrl.rs` (`PS2Mouse`) | Same split |
+| `crates/dladm/src/sys.rs` | same path upstream | Rewritten around the same libdladm declarations |
+| `crates/vmm-core/src/intr_pins.rs` | `lib/propolis/src/intr_pins.rs` | Diverged; the pin trait and kernel calls are ours |
+
+Splitting `PS2Kbd` and `PS2Mouse` across three files puts each below the
+per-file reporting threshold, so the tool does not list them. They are
+derived all the same, and all four files carry an attribution header.
 
 ### Licensing
 
@@ -89,19 +105,11 @@ stripped.
 
 ### Shared defects
 
-Three defects fixed in this tree exist verbatim in upstream Propolis, in
-`lib/propolis/src/hw/ps2/ctrl.rs`:
-
-- controller RAM sized from an exclusive subtraction over an inclusive
-  command range (upstream `:294-295`),
-- the RAM write path taking its offset from the data byte instead of the
-  command prefix (upstream `:436-438`),
-- `assert_eq!(rwo.len(), 1)` in the port I/O handler, which a wide guest
-  access trips (upstream `:402`).
-
-Upstream also builds release with `panic = "abort"`, so the impact there
-is the same: an unprivileged guest can abort the VMM. Coordinate
-disclosure with Oxide before publishing this repository.
+A fix made here can apply upstream too, because parts of this tree are
+copies. Anything of that kind goes through the coordinated-disclosure
+process in `SECURITY.md`, and is described in this file only once
+upstream has fixed it or has agreed to publication. So this file names
+no trigger and no upstream line number, whatever its state today.
 
 ## Submodule: libtpms
 
@@ -203,12 +211,14 @@ MIT, Apache-2.0, BSD, and Zlib all require their notices to accompany
 binary redistribution. Any published binary artifact must ship a
 generated third-party license bundle alongside it.
 
-Not yet in place, and required before broad distribution: a `deny.toml`
-license and source policy, and a generated SBOM.
+`deny.toml` holds the license and source policy and CI runs
+`cargo deny check advisories bans licenses sources` against it. Still
+required before broad distribution: a generated SBOM published with each
+artifact.
 
 ## Unpinned inputs
 
-`kernel/build.sh` downloads a Linux kernel tarball from `cdn.kernel.org`
-with no checksum verification. It is a development convenience for the
-fast-boot experiment, not part of the VMM build, but it should either
-pin a digest or be removed before publication.
+`kernel/build.sh` verifies the Linux tarball against a SHA-256 recorded
+per kernel version and pins the Alpine build container by digest. It is
+a development convenience for the fast-boot experiment, not part of the
+VMM build, and its output is gitignored.

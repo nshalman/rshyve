@@ -18,11 +18,12 @@ the address space manager, and the PS/2 device models are from Propolis
 largely unchanged; parts of the PCI, UART, and VM-exit layers derive from it
 too. Both projects are MPL-2.0.
 
-Nineteen files, about 3,500 significant lines. Each carries a header
-naming its upstream counterpart, [THIRD_PARTY.md](THIRD_PARTY.md) lists
-them with measured similarity, and `tools/propolis-derivation.py`
-regenerates that list against a Propolis checkout so the claim can be
-checked rather than trusted.
+Nineteen files, 3300 significant lines, measured against Propolis
+`b428c40e`. Each carries a header naming its upstream counterpart,
+[THIRD_PARTY.md](THIRD_PARTY.md) lists them with measured similarity, and
+`tools/propolis-derivation.py` regenerates that list against a Propolis
+checkout so the claim can be checked rather than trusted. The tool
+prints the revision it measured.
 
 ## Quick Start
 
