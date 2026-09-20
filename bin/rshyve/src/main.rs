@@ -1073,13 +1073,14 @@ fn parse_and_create_pci_device(
                 .open(path)
                 .with_context(|| format!("failed to open disk: {}", path))?;
 
-            let nvme = vmm_storage::nvme::NvmeController::new(
+            let nvme = vmm_storage::nvme::NvmeController::new_with_logger(
                 file,
                 blk_opts.read_only,
                 bdf.dev(), // unique instance ID per slot
                 Arc::clone(physmap),
                 Arc::clone(vmm_hdl),
                 Arc::clone(bus_mmio),
+                log.new(slog::o!("component" => "nvme")),
             );
 
             chipset.try_attach_device(bdf, nvme.clone())?;
