@@ -5,9 +5,12 @@
 //! COM1 and COM2: the UARTs, their host-side backends, and the mdata
 //! agent that serves COM2 when argv names no backend for it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, TrySendError};
 use std::sync::Arc;
 use std::thread;
 
+use anyhow::Context;
 use slog::{info, warn, Logger};
 
 use vmm_config::Cli;
@@ -18,6 +21,41 @@ use vmm_devices::uart::lpc::{self, LpcUart};
 use vmm_machine::find_lpc_device;
 
 use crate::mdata;
+
+/// Guest output taken off the UART on the vCPU thread and handed to a
+/// consumer thread.
+///
+/// The TX sink runs inside the PIO handler with the UART lock held, so
+/// it may do nothing that waits. It pushes into a bounded channel and
+/// drops when the channel is full; the consumer blocks on the other
+/// end, so an idle port costs no wakeups.
+pub struct TxQueue {
+    pub bytes: Receiver<u8>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl TxQueue {
+    /// Install the sink on `uart`, buffering up to `capacity` bytes.
+    pub fn install(uart: &LpcUart, capacity: usize) -> Self {
+        let (tx, bytes) = mpsc::sync_channel(capacity);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&dropped);
+        uart.set_tx_sink(Box::new(move |b: u8| match tx.try_send(b) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            // The consumer is gone; there is nobody to count for.
+            Err(TrySendError::Disconnected(_)) => {}
+        }));
+        Self { bytes, dropped }
+    }
+
+    /// Bytes dropped since the last call.
+    pub fn take_dropped(&self) -> u64 {
+        self.dropped.swap(0, Ordering::Relaxed)
+    }
+}
 
 /// Create and attach COM1/COM2 UARTs, set up serial I/O paths, and
 /// optionally start the mdata agent on COM2.
@@ -55,7 +93,8 @@ pub fn setup_serial(
             cli.mdata_ssh_keys.as_deref(),
             cli.mdata_root_pw.as_deref(),
         ));
-        mdata::start_mdata_agent(com2.clone(), mdata_store, log.clone());
+        mdata::start_mdata_agent(com2.clone(), mdata_store, log.clone())
+            .context("failed to start the mdata agent")?;
         info!(log, "mdata agent started on COM2");
     }
 
