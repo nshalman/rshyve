@@ -61,7 +61,7 @@ use vmm_machine::{DeviceRegistry, HotplugEngines};
 
 use crate::host_state::HostLocalState;
 
-pub use listener::spawn_control_thread;
+pub use listener::{spawn_control_thread, ControlListener};
 
 // ── Error type ──────────────────────────────────────────────────────
 

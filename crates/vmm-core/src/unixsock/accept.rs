@@ -109,3 +109,108 @@ pub fn accept_loop(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use super::*;
+
+    /// A socket path this test owns, removed when it ends.
+    struct TestSocket(std::path::PathBuf);
+
+    impl TestSocket {
+        fn new(tag: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "vmm-accept-{tag}-{}-{id}.sock",
+                std::process::id(),
+            )))
+        }
+
+        fn bind(&self) -> UnixListener {
+            let _ = std::fs::remove_file(&self.0);
+            UnixListener::bind(&self.0).expect("bind a test socket")
+        }
+    }
+
+    impl Drop for TestSocket {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn null_log() -> Logger {
+        Logger::root(slog::Discard, slog::o!())
+    }
+
+    /// Halt must not have to connect to the socket to end this thread.
+    #[test]
+    fn the_loop_returns_when_shutdown_is_set() {
+        let socket = TestSocket::new("shutdown");
+        let listener = socket.bind();
+        let shutdown = AtomicBool::new(true);
+
+        let started = Instant::now();
+        accept_loop(listener, &shutdown, &null_log(), "test", |_| {
+            panic!("no client connected");
+        });
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the loop took {:?}",
+            started.elapsed(),
+        );
+    }
+
+    /// A peer that disconnects before the accept is one accept error on
+    /// illumos. One error must not take the listener away for good.
+    #[test]
+    fn a_peer_that_resets_before_accept_does_not_end_the_loop() {
+        let socket = TestSocket::new("reset");
+        let listener = socket.bind();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let served = Arc::new(AtomicUsize::new(0));
+        let accept_served = Arc::clone(&served);
+        let accept_shutdown = Arc::clone(&shutdown);
+        let thread = std::thread::spawn(move || {
+            accept_loop(
+                listener,
+                &accept_shutdown,
+                &null_log(),
+                "test",
+                move |mut stream| {
+                    accept_served.fetch_add(1, Ordering::Release);
+                    let mut request = [0u8; 4];
+                    if stream.read_exact(&mut request).is_ok() {
+                        let _ = stream.write_all(b"ok");
+                    }
+                },
+            );
+        });
+
+        for _ in 0..8 {
+            drop(UnixStream::connect(&socket.0).expect("connect and reset"));
+        }
+
+        let mut client =
+            UnixStream::connect(&socket.0).expect("connect a real client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set a test read timeout");
+        client.write_all(b"ping").expect("write a request");
+        let mut answer = [0u8; 2];
+        client.read_exact(&mut answer).expect("read the answer");
+
+        assert_eq!(&answer, b"ok");
+        assert!(served.load(Ordering::Acquire) > 0);
+
+        shutdown.store(true, Ordering::Release);
+        thread.join().expect("the accept thread must end");
+    }
+}

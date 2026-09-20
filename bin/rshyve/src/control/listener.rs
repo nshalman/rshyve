@@ -7,13 +7,13 @@
 use std::io::{self, BufRead, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use slog::{error, info, warn, Logger};
-use vmm_core::unixsock::write_all_bounded;
+use slog::{info, warn, Logger};
+use vmm_core::unixsock::{accept, write_all_bounded};
 
 use super::dispatch::dispatch;
 use super::protocol::{Command, Response};
@@ -31,36 +31,74 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// later client, including the one that stops or migrates the VM.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A running control listener.
+///
+/// Holding this keeps the accept loop alive, and dropping it closes it.
+/// Teardown has to be able to stop taking commands: a `device-add` that
+/// lands after the guest has stopped attaches a device the teardown
+/// sweep has already snapshotted past.
+pub struct ControlListener {
+    path: PathBuf,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ControlListener {
+    /// The socket file, for the caller that removes it at teardown.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Stop accepting and wait for the accept thread.
+    ///
+    /// Connections already being served are not interrupted; each one
+    /// has its own read and write deadline.
+    pub fn close(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            drop(handle.join());
+        }
+    }
+}
+
+impl Drop for ControlListener {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// Spawn the control socket listener thread.
 ///
-/// Binds a Unix domain socket at `path`, removes any stale socket
-/// file first. Returns the thread handle. The thread runs until the
-/// process exits.
+/// Binds a Unix domain socket at `path`, removing any stale socket file
+/// first.
 pub fn spawn_control_thread(
     path: &Path,
     ctrl: Arc<VmController>,
     log: Logger,
-) -> io::Result<(thread::JoinHandle<()>, PathBuf)> {
+) -> io::Result<ControlListener> {
     let listener = vmm_core::unixsock::bind_restricted(
         path,
         vmm_core::unixsock::SocketPolicy::default(),
     )?;
 
-    let sock_path = path.to_path_buf();
-    let cleanup_path = sock_path.clone();
-
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let thread_shutdown = Arc::clone(&shutdown);
     let handle = thread::Builder::new()
         .name("control".into())
         .spawn(move || {
             let connection_log = log.clone();
-            serve_connections(listener, log, move |stream| {
+            serve_connections(listener, &thread_shutdown, log, move |stream| {
                 if let Err(e) = handle_connection(&ctrl, &stream, &connection_log) {
                     warn!(connection_log, "control connection error"; "error" => %e);
                 }
             });
         })?;
 
-    Ok((handle, cleanup_path))
+    Ok(ControlListener {
+        path: path.to_path_buf(),
+        shutdown,
+        handle: Some(handle),
+    })
 }
 
 struct ConnectionGuard {
@@ -99,25 +137,26 @@ fn set_connection_deadlines(
     Ok(())
 }
 
-fn serve_connections<F>(listener: UnixListener, log: Logger, handler: F)
-where
+/// Accept clients until `shutdown`, one thread each.
+///
+/// The accept itself is the shared loop, which retries a transient
+/// error such as `EMFILE` with a backoff instead of ending: one accept
+/// error used to take the control socket away for the life of the VM.
+fn serve_connections<F>(
+    listener: UnixListener,
+    shutdown: &AtomicBool,
+    log: Logger,
+    handler: F,
+) where
     F: Fn(UnixStream) + Send + Sync + 'static,
 {
     let active = Arc::new(AtomicUsize::new(0));
     let handler = Arc::new(handler);
 
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!(log, "control accept error"; "error" => %e);
-                break;
-            }
-        };
-
+    accept::accept_loop(listener, shutdown, &log, "control", |stream| {
         if let Err(e) = set_connection_deadlines(&stream, &log) {
             warn!(log, "failed to set control connection deadlines"; "error" => %e);
-            continue;
+            return;
         }
 
         let Some(connection_guard) = acquire_connection(&active) else {
@@ -128,7 +167,7 @@ where
             ) {
                 warn!(log, "failed to reject excess control connection"; "error" => %e);
             }
-            continue;
+            return;
         };
 
         let handler = Arc::clone(&handler);
@@ -142,7 +181,7 @@ where
         {
             warn!(thread_log, "failed to spawn control connection thread"; "error" => %e);
         }
-    }
+    });
 }
 
 /// illumos global zone id. A global-zone peer already has full authority
@@ -336,7 +375,6 @@ fn handle_connection(
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
-    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
 
     #[test]
@@ -497,8 +535,10 @@ mod tests {
         let first_for_handler = Arc::clone(&first_connection);
         let (started_tx, started_rx) = mpsc::channel();
 
-        thread::spawn(move || {
-            serve_connections(listener, log, move |stream| {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let accept_shutdown = Arc::clone(&shutdown);
+        let accepting = thread::spawn(move || {
+            serve_connections(listener, &accept_shutdown, log, move |stream| {
                 if first_for_handler.swap(false, Ordering::AcqRel) {
                     started_tx.send(()).expect("signal first connection start");
                 }
@@ -528,6 +568,12 @@ mod tests {
             .expect("read second response");
 
         assert_eq!(response, "ok\n");
+
+        // A listener that could not be stopped would hold the socket
+        // open for the life of the process.
+        shutdown.store(true, Ordering::Release);
+        accepting.join().expect("the accept thread must end");
+
         std::fs::remove_file(&path).expect("remove control test socket");
         std::fs::remove_dir(&temp_dir).expect("remove control test directory");
     }

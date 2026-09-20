@@ -229,8 +229,8 @@ fn post_migration_timer_kick(machine: &Machine, log: &Logger) {
 /// What the control socket leaves behind for the rest of `run`.
 #[derive(Default)]
 struct ControlSocket {
-    /// The socket file to remove at teardown.
-    cleanup: Option<PathBuf>,
+    /// The listener. Dropping it stops the accept loop.
+    listener: Option<control::ControlListener>,
     /// How SIGTERM stops the VM. `None` without a control socket,
     /// which is the only kind of VM that cannot be paused.
     stop: Option<Arc<dyn vmm_machine::signal::GuestStop>>,
@@ -272,11 +272,11 @@ fn spawn_control_socket(
         log.clone(),
     );
     let stop = control::sigterm_stop(Arc::clone(&ctrl));
-    let (_handle, path) =
-        control::spawn_control_thread(sock_path, ctrl, log.clone())?;
-    info!(log, "control socket listening"; "path" => path.display().to_string());
+    let listener = control::spawn_control_thread(sock_path, ctrl, log.clone())?;
+    info!(log, "control socket listening";
+        "path" => listener.path().display().to_string());
     Ok(ControlSocket {
-        cleanup: Some(path),
+        listener: Some(listener),
         stop: Some(stop),
     })
 }
@@ -525,13 +525,17 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         &machine,
         fleet,
         &hotplug,
-        control_socket.cleanup.clone(),
+        control_socket
+            .listener
+            .as_ref()
+            .map(|listener| listener.path().to_path_buf()),
         &registry,
         log,
     );
 
-    // The control thread is never joined, so its handles would
-    // otherwise keep the drain threads alive past the event loop.
+    // Stop taking commands before the engines go: a request that lands
+    // after the VM is destroyed has nothing left to act on.
+    drop(control_socket);
     hotplug.shutdown();
 
     // Read after the engine stops, so a teardown that was in flight has
