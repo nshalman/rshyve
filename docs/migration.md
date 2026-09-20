@@ -54,9 +54,23 @@ Source                          Destination
   |                                 |  identity check, import,
   |                                 |  device workers start, resume
   |  7. Finish                      |
-  |<------- Okay -------------------|
-  |-------- Okay ------------------>|
+  |<------- Okay -------------------|  "I hold everything"
+  |-------- Okay ------------------>|  the source's commit
+  |                                 |  device workers start, resume
+  |<------- Okay -------------------|  "the guest is running here"
 ```
+
+The three-step finish is the handoff, and the order is the whole point.
+The destination says it holds everything; the source commits, which is
+its promise never to run the guest again; only then does the destination
+start the guest, and its last message is what lets a finished source be
+reaped. A destination that resumed before the commit would run a second
+copy of the guest against the same disk whenever the source rolled back.
+
+A source that has committed and then loses the peer stays paused and is
+never released: it cannot take the guest back, because the destination
+may be running it. The control socket reports the VM still migrating and
+an operator decides.
 
 The final dirty pass runs after every device worker has parked, so it
 is the last word on guest memory by construction. Before that change it

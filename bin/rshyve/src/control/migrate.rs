@@ -258,7 +258,7 @@ pub(super) fn migrate_source(
                         info!(mlog, "connecting to migration socket";
                         "path" => &path);
                         UnixStream::connect(&path)
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| SourceOutcome::Failed(e.to_string()))
                             .and_then(|stream| {
                                 run_source(
                                     stream, hdl, &memctx, config, hooks,
@@ -270,7 +270,7 @@ pub(super) fn migrate_source(
                         info!(mlog, "connecting to migration peer";
                         "target" => &addr);
                         TcpStream::connect(&addr)
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| SourceOutcome::Failed(e.to_string()))
                             .and_then(|stream| {
                                 run_source(
                                     stream, hdl, &memctx, config, hooks,
@@ -284,7 +284,17 @@ pub(super) fn migrate_source(
                         info!(mlog, "source migration complete");
                         ctrl_arc.finish_migrated_away(SOURCE_RELEASE_GRACE);
                     }
-                    Err(e) => {
+                    Err(SourceOutcome::Committed(why)) => {
+                        // The destination may already be running the
+                        // guest. Running it here too would put two
+                        // copies on one disk, so the VM stays paused
+                        // and migrating until an operator decides.
+                        error!(mlog, "the guest was handed over and the \
+                            destination never confirmed; this VM stays \
+                            paused and is NOT released";
+                            "error" => why);
+                    }
+                    Err(e @ SourceOutcome::Failed(_)) => {
                         error!(mlog, "source migration failed"; "error" => %e);
                         ctrl_arc.state.store(
                             VmRunState::Running as u8,
@@ -322,6 +332,34 @@ fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
     }
 }
 
+/// How a source migration ended, when it did not succeed.
+enum SourceOutcome {
+    /// The guest never left. The VM can run again here.
+    Failed(String),
+    /// The guest was handed over and the far side never confirmed. The
+    /// VM must not run again here.
+    Committed(String),
+}
+
+impl From<vmm_migrate::codec::MigrateError> for SourceOutcome {
+    fn from(error: vmm_migrate::codec::MigrateError) -> Self {
+        match error {
+            vmm_migrate::codec::MigrateError::Committed(why) => {
+                Self::Committed(why)
+            }
+            other => Self::Failed(other.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for SourceOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(why) | Self::Committed(why) => f.write_str(why),
+        }
+    }
+}
+
 fn run_source<S: vmm_migrate::wire::Transport>(
     stream: S,
     hdl: Arc<vmm_core::hdl::VmmHdl>,
@@ -330,11 +368,11 @@ fn run_source<S: vmm_migrate::wire::Transport>(
     hooks: vmm_migrate::source::SourceHooks,
     status: Arc<Mutex<vmm_migrate::MigrationStatus>>,
     log: &slog::Logger,
-) -> Result<(), String> {
+) -> Result<(), SourceOutcome> {
     vmm_migrate::source::run_source(
         stream, hdl, memctx, config, hooks, status, log,
     )
-    .map_err(|e| e.to_string())
+    .map_err(SourceOutcome::from)
 }
 
 pub(super) fn migrate_dest(

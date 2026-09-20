@@ -87,6 +87,12 @@ pub enum MigrateError {
     RemoteError(String),
     #[error("phase error: {0}")]
     Phase(String),
+    /// The source handed the guest over and then lost the peer.
+    ///
+    /// It cannot take the guest back: the destination may be running
+    /// it. The VM stays paused and an operator decides.
+    #[error("handed over but unconfirmed: {0}")]
+    Committed(String),
 }
 
 impl From<std::io::Error> for MigrateError {

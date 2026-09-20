@@ -145,14 +145,6 @@ fn run_inner<S: Transport>(
         return Err(e);
     }
 
-    // The workers were never started on this VM, and the guest is about
-    // to post I/O to every one of them.
-    (hooks.resume)();
-
-    slog::info!(log, "migration import complete, starting vCPUs");
-    hdl.resume()
-        .map_err(|e| MigrateError::Io(format!("resume: {e}")))?;
-
     // ── RamPull ──
     set_phase(status, MigrationPhase::RamPull);
     match chan.recv()? {
@@ -161,9 +153,24 @@ fn run_inner<S: Transport>(
     }
 
     // ── Finish ──
+    // Nothing starts until the source has promised never to run the
+    // guest again. Resuming before that commit runs a second copy of
+    // the guest against the same disk whenever the source rolls back.
     set_phase(status, MigrationPhase::Finish);
     chan.send(&Message::Okay)?;
     chan.expect_okay()?;
+
+    set_phase(status, MigrationPhase::Committed);
+    // The workers were never started on this VM, and the guest is about
+    // to post I/O to every one of them.
+    (hooks.resume)();
+    slog::info!(log, "migration import complete, starting vCPUs");
+    hdl.resume()
+        .map_err(|e| MigrateError::Io(format!("resume: {e}")))?;
+
+    // The source stays paused until this arrives, so it is what lets a
+    // finished source be reaped.
+    chan.send(&Message::Okay)?;
     chan.close();
     Ok(())
 }

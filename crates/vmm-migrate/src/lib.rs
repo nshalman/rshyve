@@ -36,8 +36,14 @@ pub enum MigrationPhase {
     DeviceState,
     /// Destination requests any missing pages.
     RamPull,
-    /// Handoff, destination resumes.
+    /// The destination says it holds everything.
     Finish,
+    /// The source has handed the guest over and cannot take it back.
+    ///
+    /// Past this point a rollback would run a second copy of the same
+    /// guest against the same disk, so the source stays paused however
+    /// the rest of the exchange ends.
+    Committed,
     /// Migration failed.
     Error,
 }
@@ -53,6 +59,7 @@ impl std::fmt::Display for MigrationPhase {
             Self::DeviceState => write!(f, "device-state"),
             Self::RamPull => write!(f, "ram-pull"),
             Self::Finish => write!(f, "finish"),
+            Self::Committed => write!(f, "committed"),
             Self::Error => write!(f, "error"),
         }
     }

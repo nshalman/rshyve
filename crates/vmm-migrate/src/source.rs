@@ -150,7 +150,13 @@ where
     E: std::fmt::Display,
     F: FnOnce() -> Result<(), E>,
 {
-    if result.is_err() && phase as u8 >= MigrationPhase::Pause as u8 {
+    // A failure before the pause changed nothing. One at or after the
+    // commit cannot be undone: the destination may be running the
+    // guest, so the source stays paused and an operator decides.
+    let rollback = (MigrationPhase::Pause as u8
+        ..MigrationPhase::Committed as u8)
+        .contains(&(phase as u8));
+    if result.is_err() && rollback {
         // Device workers must be available before vCPUs can issue more I/O.
         device_resume_fn();
         if let Err(error) = resume_vm() {
@@ -265,9 +271,22 @@ fn run_inner<S: Transport>(
     chan.send(&Message::MemEnd)?;
 
     // ── Finish ──
+    // Three steps, and the order is the whole point. The destination
+    // says it holds everything; this end commits, which is the promise
+    // never to run the guest again; only then does the destination
+    // start it. A destination that resumed before the commit would run
+    // a second copy of the guest against the same disk whenever this
+    // end rolled back.
     set_phase(status, MigrationPhase::Finish);
     chan.expect_okay()?;
     chan.send(&Message::Okay)?;
+
+    set_phase(status, MigrationPhase::Committed);
+    chan.expect_okay().map_err(|e| {
+        MigrateError::Committed(format!(
+            "the destination never confirmed it started the guest: {e}"
+        ))
+    })?;
 
     chan.close();
     Ok(())
@@ -539,6 +558,48 @@ mod tests {
         assert!(result.is_err());
         assert!(devices_resumed.load(Ordering::Acquire));
         assert!(vcpus_resumed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_committed_source_is_never_resumed() {
+        // The destination may be running the guest. Two copies against
+        // one disk is worse than a guest that needs an operator.
+        let resumed = Arc::new(AtomicBool::new(false));
+        let by_callback = Arc::clone(&resumed);
+        let resume_fn: DeviceResumeFn = Box::new(move || {
+            by_callback.store(true, Ordering::Release);
+        });
+        let result = finish_source(
+            Err(MigrateError::Committed("no confirmation".into())),
+            MigrationPhase::Committed,
+            &discard(),
+            resume_fn,
+            || -> Result<(), &'static str> {
+                panic!("a committed source must not resume its vCPUs")
+            },
+        );
+        assert!(result.is_err());
+        assert!(!resumed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_failure_in_finish_still_rolls_back() {
+        // Nothing was promised yet: the destination waits for the
+        // commit before it starts the guest.
+        let resumed = Arc::new(AtomicBool::new(false));
+        let by_callback = Arc::clone(&resumed);
+        let resume_fn: DeviceResumeFn = Box::new(move || {
+            by_callback.store(true, Ordering::Release);
+        });
+        let result = finish_source(
+            Err(MigrateError::WebSocket("closed".into())),
+            MigrationPhase::Finish,
+            &discard(),
+            resume_fn,
+            || Ok::<(), &'static str>(()),
+        );
+        assert!(result.is_err());
+        assert!(resumed.load(Ordering::Acquire));
     }
 
     #[test]
