@@ -714,6 +714,119 @@ fn payload_with_no_host_socket_tells_the_guest() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// What the guest's receive buffer holds now.
+fn rx_buf(physmap: &PhysMap) -> Vec<u8> {
+    let mut out = vec![0u8; 64];
+    physmap
+        .lookup(BUF_GPA, out.len())
+        .expect("mapped rx buffer")
+        .read_bytes(&mut out)
+        .expect("read rx buffer");
+    out
+}
+
+/// Delivery runs on reader and accept threads, outside the transport's
+/// register lock, so a reset can land between the pop of a chain and
+/// the write into it. The illumos legacy driver frees the vring on the
+/// status write, so a late write lands in whatever the guest has put
+/// in those pages since. A delivery therefore needs the reset's
+/// permission, exactly as virtio-fs's worker does.
+#[test]
+fn a_delivery_without_the_resets_permission_writes_nothing() {
+    const SENTINEL: u8 = 0x5a;
+
+    let (physmap, mut queues) = rx_ring();
+    write_desc(&physmap, 0, BUF_GPA, 64, crate::bits::VRING_DESC_F_WRITE, 0);
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+    physmap
+        .lookup(BUF_GPA, 64)
+        .expect("mapped rx buffer")
+        .write_bytes(&[SENTINEL; 64])
+        .expect("seed the rx buffer");
+
+    // The chain is posted under the transport lock, before the reset.
+    vsock.notify_queue(VSOCK_RX_QUEUE, &mut queues, &physmap);
+    assert_eq!(vsock.shared.pending_rx.lock().expect("pending").len(), 1);
+
+    let key = ConnKey {
+        guest_port: 1024,
+        host_port: 1,
+    };
+    assert!(vsock.shared.mux.start_host_connect(key));
+
+    // Admission shut, the way a reset shuts it before its drain.
+    vsock.shared.access.close();
+    vsock.shared.deliver_rx();
+
+    assert_eq!(
+        used_idx(&physmap),
+        0,
+        "a delivery published into the ring without permission",
+    );
+    assert_eq!(
+        rx_buf(&physmap),
+        vec![SENTINEL; 64],
+        "a delivery wrote into the chain without permission",
+    );
+    assert!(!vsock.shared.mux.rx_is_empty(), "the packet was consumed");
+
+    // The other half: the driver that follows must still be served, or
+    // the device has traded a stale write for a permanent stall.
+    vsock
+        .shared
+        .access
+        .reopen(vsock.shared.access.intr_session());
+    vsock.shared.deliver_rx();
+    assert_eq!(used_idx(&physmap), 1, "the running driver got nothing");
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other side of the guard: the reset has to wait for a delivery
+/// that was already inside, or it returns while a write into the ring
+/// is still running and the driver frees the pages under it.
+#[test]
+fn a_reset_waits_out_a_delivery_already_inside() {
+    let (physmap, _queues) = rx_ring();
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+
+    let session = vsock
+        .shared
+        .access
+        .enter_current()
+        .expect("a session is open");
+
+    let finished = Arc::new(AtomicBool::new(false));
+    let done = Arc::clone(&finished);
+    let device = Arc::clone(&vsock.shared);
+    let resetter = std::thread::spawn(move || {
+        device.access.close();
+        device.access.drain();
+        done.store(true, Ordering::Release);
+        device.access.reopen(device.access.intr_session());
+    });
+
+    // Admission shuts first, so this is the reset inside its drain and
+    // nowhere else.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while vsock.shared.access.is_open() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!vsock.shared.access.is_open(), "the reset never started");
+    assert!(
+        !finished.load(Ordering::Acquire),
+        "the reset returned while a delivery still held the ring",
+    );
+
+    drop(session);
+    resetter.join().expect("reset thread");
+    assert!(finished.load(Ordering::Acquire));
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // The RX handler and the transport session are two pieces of state a
 // reset changes one after the other, and a socket thread can be
 // between them. A packet delivered on the handler the reset dropped

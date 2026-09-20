@@ -106,6 +106,7 @@ impl VirtioVsock {
         let shared = Arc::new(VsockShared {
             mux: VsockMux::new(guest_cid),
             physmap,
+            access: crate::access::GuestAccess::new(),
             pending_rx: Mutex::new(VecDeque::new()),
             rx_completion: Mutex::new(None),
             delivery: Mutex::new(()),
@@ -212,6 +213,13 @@ impl VirtioDevice for VirtioVsock {
     }
 
     fn reset(&self) {
+        // Admission closes before the drain. A delivery refused before
+        // it takes the lock never queues on it, and `std::sync::RwLock`
+        // gives the writer no priority, so a host peer must not be able
+        // to put this vCPU behind it.
+        self.shared.access.close();
+        self.shared.access.drain();
+
         *self.negotiated_features.lock().expect("features lock") = 0;
         *self
             .shared
@@ -225,6 +233,11 @@ impl VirtioDevice for VirtioVsock {
             .lock()
             .expect("pending rx lock")
             .clear();
+        self.shared.access.reopen(
+            self.shared
+                .interrupt
+                .next_session(self.shared.access.intr_session()),
+        );
     }
 }
 

@@ -24,6 +24,7 @@ use std::time::Duration;
 use vmm_core::mem::PhysMap;
 use vmm_devices::QuiesceGate;
 
+use crate::access::GuestAccess;
 use crate::pci::intr::IntrSlot;
 use crate::queue::{ChainBuf, VirtioCompletion};
 use crate::vsock::control::ControlSlot;
@@ -42,6 +43,15 @@ pub(super) const HOST_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 pub(super) struct VsockShared {
     pub(super) mux: VsockMux,
     pub(super) physmap: Arc<PhysMap>,
+    /// Permission to write the driver's receive ring.
+    ///
+    /// Delivery runs on reader and accept threads, outside the
+    /// transport's register lock. The driver frees the vring as soon as
+    /// `reset` returns, so a write that began before the reset must not
+    /// land after it. A delivery holds this across the copy into the
+    /// chain and the used entry that follows, and nothing inside waits
+    /// on a host peer, so the vCPU's drain is bounded.
+    pub(super) access: GuestAccess,
     /// RX chains the guest has posted, waiting for a packet.
     pub(super) pending_rx: Mutex<VecDeque<(u16, Vec<ChainBuf>)>>,
     pub(super) rx_completion: Mutex<Option<Arc<VirtioCompletion>>>,
