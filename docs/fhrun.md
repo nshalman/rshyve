@@ -104,6 +104,18 @@ under `panic=-1` is how a kernel panic ends; `1` is a poweroff that
 init reached without a payload, such as a `bin` that cannot be
 executed. fhrun reports both on stderr and exits `1`.
 
+## Signals
+
+SIGINT and SIGTERM are forwarded to the VMM as SIGTERM, which is its
+ACPI power-button path, so the guest shuts down and the temporary
+directory is removed. Both stay blocked from before the VMM is spawned
+until fhrun knows its pid, so a Ctrl-C in that window is not lost.
+
+SIGKILL has no such path. fhrun dies without removing
+`$TMPDIR/fhrun-*/initramfs.cpio`, which holds the manifest `env`, and
+the VMM keeps running: illumos has no parent-death signal and fhrun
+records the child pid nowhere a sweeper could read it.
+
 ## fhrun-init
 
 `tools/fhrun-init` is a separate Cargo workspace with its own lockfile,
