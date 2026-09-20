@@ -1904,8 +1904,8 @@ dependencies = [
 name = "vmm_metrics"
 version = "0.1.0"
 dependencies = [
- "serde",
  "serde_json",
+ "vmm_core",
 ]
 
 [[package]]
