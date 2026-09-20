@@ -804,6 +804,38 @@ fn pause_quiesces_the_workers_under_steady_guest_io() {
     assert!(quiesced, "pause did not quiesce the workers under load");
 }
 
+#[test]
+fn halt_joins_the_io_workers() {
+    let (h, backend) = Harness::held();
+    let with_workers = Arc::strong_count(&backend);
+    assert!(
+        with_workers > super::NUM_WORKERS,
+        "the workers should hold the backend"
+    );
+
+    h.ctrl.halt();
+
+    assert_eq!(
+        Arc::strong_count(&backend),
+        with_workers - super::NUM_WORKERS,
+        "halt left workers running"
+    );
+}
+
+#[test]
+fn dropping_the_controller_exits_the_io_workers() {
+    let (h, backend) = Harness::held();
+    let with_workers = Arc::strong_count(&backend);
+
+    drop(h);
+
+    assert_eq!(
+        Arc::strong_count(&backend),
+        with_workers - super::NUM_WORKERS,
+        "the worker pool kept the controller alive"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Unit-level checks kept from before the harness
 // ---------------------------------------------------------------------------

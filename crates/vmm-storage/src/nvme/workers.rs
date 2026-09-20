@@ -4,11 +4,10 @@
 
 //! I/O worker threads.
 
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::Duration;
 
-use vmm_core::mem::{MemCtx, PhysMap};
-use vmm_devices::pci::msix::MsixTable;
+use vmm_core::mem::MemCtx;
 use vmm_devices::QuiesceGate;
 
 use super::io::{process_io_request, IoBackend, IoRequest};
@@ -21,15 +20,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Worker thread loop: reads I/O requests from the channel and executes them.
 ///
-/// Uses `pread`/`pwrite` on the raw fd for lock-free concurrent I/O.
-/// Each completed request posts a CQE to guest memory and fires MSI-X.
+/// The controller reference is weak so the worker pool never keeps the
+/// controller, its backing fd or its `DiskCache` alive.
 pub(super) fn io_worker(
     rx: Arc<Mutex<mpsc::Receiver<IoRequest>>>,
     backend: Arc<dyn IoBackend>,
     read_only: bool,
-    physmap: Arc<PhysMap>,
-    msix: Arc<MsixTable>,
-    ctrl: Arc<NvmeController>,
+    ctrl: Weak<NvmeController>,
     gate: Arc<QuiesceGate>,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
@@ -58,7 +55,11 @@ pub(super) fn io_worker(
         // transfer, so a drain covers the guest memory this touches.
         gate.park_if_paused();
 
-        let mem = MemCtx::new(Arc::clone(&physmap));
+        let Some(ctrl) = ctrl.upgrade() else {
+            return;
+        };
+
+        let mem = MemCtx::new(Arc::clone(&ctrl.physmap));
         let status = process_io_request(
             &req,
             backend.as_ref(),
@@ -80,7 +81,7 @@ pub(super) fn io_worker(
         if let Some(cq_idx) = io_queue_index(req.cq_id) {
             post_completion(
                 &mem,
-                &msix,
+                &ctrl.msix,
                 &mut st.io_cqs[cq_idx],
                 0,
                 req.sqid,

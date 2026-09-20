@@ -95,6 +95,8 @@ pub struct NvmeController {
     _cache: DiskCache,
     /// The backing store, kept for the durable flush.
     file: Arc<File>,
+    /// The I/O worker pool, joined by [`Self::stop_workers`].
+    workers: Mutex<Vec<thread::JoinHandle<()>>>,
     pub(super) geometry: Geometry,
     indicator: Indicator,
     pub(super) gate: Arc<QuiesceGate>,
@@ -249,6 +251,7 @@ impl NvmeController {
             log,
             _cache: cache,
             file,
+            workers: Mutex::new(Vec::with_capacity(NUM_WORKERS)),
             geometry,
             indicator: Indicator::new(),
             gate: Arc::clone(&gate),
@@ -257,25 +260,49 @@ impl NvmeController {
             Some(Arc::downgrade(&ctrl));
 
         let rx = Arc::new(Mutex::new(rx));
+        let mut workers = Vec::with_capacity(NUM_WORKERS);
         for i in 0..NUM_WORKERS {
             let rx = Arc::clone(&rx);
-            let physmap = Arc::clone(&physmap);
-            let msix = Arc::clone(&msix);
-            let state_ref = Arc::clone(&ctrl);
+            let weak = Arc::downgrade(&ctrl);
             let gate = Arc::clone(&gate);
             let backend = Arc::clone(&backend);
 
-            thread::Builder::new()
-                .name(format!("nvme-io-{}", i))
-                .spawn(move || {
-                    io_worker(
-                        rx, backend, read_only, physmap, msix, state_ref, gate,
-                    );
-                })
-                .expect("nvme: failed to spawn I/O worker thread");
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("nvme-io-{}", i))
+                    .spawn(move || {
+                        io_worker(rx, backend, read_only, weak, gate);
+                    })
+                    .expect("nvme: failed to spawn I/O worker thread"),
+            );
         }
+        *ctrl.workers.lock().expect("nvme: workers lock") = workers;
 
         ctrl
+    }
+
+    /// Disconnect the I/O channel and wait for the workers.
+    ///
+    /// Dropping the sender is the only thing that ends a worker, and
+    /// nothing else releases the backing fd or lets `DiskCache` put the
+    /// zvol write cache back the way it found it.
+    fn stop_workers(&self) {
+        drop(self.io_tx.lock().expect("nvme: io_tx lock").take());
+        // A parked worker never reaches the channel to see it close.
+        self.gate.resume();
+        let workers =
+            std::mem::take(&mut *self.workers.lock().expect("workers lock"));
+        for worker in workers {
+            if worker.join().is_err() {
+                slog::error!(self.log, "nvme: I/O worker panicked");
+            }
+        }
+    }
+}
+
+impl Drop for NvmeController {
+    fn drop(&mut self) {
+        self.stop_workers();
     }
 }
 
@@ -406,6 +433,7 @@ impl Lifecycle for NvmeController {
 
     fn halt(&self) {
         self.indicator.halt();
+        self.stop_workers();
     }
 
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
