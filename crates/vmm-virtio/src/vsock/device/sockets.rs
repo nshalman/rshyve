@@ -7,10 +7,13 @@
 //!
 //! # Invariants
 //!
-//! An entry leaves the socket table only for the socket that is in it
-//! now. The guest picks the key, so it can close a connection and open
-//! the same key again while an unlocked write is still running.
-//! Removing by key alone would drop the new connection's socket.
+//! A connection is named by its socket, not by its key. The guest
+//! picks the key, so it can close a connection and open the same key
+//! again while an unlocked write, or a reader thread that has not
+//! woken yet, still holds the old one. Every caller that acts on a
+//! connection it learned about earlier therefore names the socket it
+//! served, and [`VsockShared::release_socket`] refuses a key another
+//! connection has taken.
 //!
 //! The reader table bounds the thread count. The mux connection cap
 //! cannot: a peer that connects and sends no CONNECT line holds a
@@ -52,32 +55,53 @@ impl VsockShared {
             debug!(self.log, "virtio-vsock host write gave up";
                 "error" => %error);
             // A dead peer and one that stopped reading for
-            // HOST_WRITE_TIMEOUT are the same to the guest.
-            self.drop_socket_if_current(key, &stream);
+            // HOST_WRITE_TIMEOUT are the same to the guest, and the
+            // guest hears it here rather than when the reader wakes:
+            // the reader can no longer tell for a socket this took out
+            // of the table.
+            if self.release_socket(key, &stream) {
+                self.mux.queue_host_close(key);
+                self.deliver_rx();
+            }
         }
     }
 
     /// Take `key` out of the table and shut its socket down, so that
-    /// this connection's reader wakes and tells the guest it has gone.
+    /// this connection's reader wakes.
     ///
-    /// The entry goes only while `stream` still holds it. The guest
-    /// picks the key for a connection it opens, so it can close one
-    /// and reopen the same key while an unlocked write is running.
-    fn drop_socket_if_current(&self, key: ConnKey, stream: &Arc<UnixStream>) {
+    /// Returns whether the entry was still this socket's, which is the
+    /// caller's permission to speak for the connection. A key another
+    /// connection has taken, or one already released, answers false:
+    /// the guest picks the key and can reopen it while a write or a
+    /// reader thread still holds the old socket.
+    pub(super) fn release_socket(
+        &self,
+        key: ConnKey,
+        stream: &Arc<UnixStream>,
+    ) -> bool {
         let mut sockets = self.sockets.lock().expect("sockets lock");
-        if sockets
+        let ours = sockets
             .get(&key)
-            .is_some_and(|held| Arc::ptr_eq(held, stream))
-        {
+            .is_some_and(|held| Arc::ptr_eq(held, stream));
+        if ours {
             sockets.remove(&key);
         }
         drop(sockets);
         // The peer may already be gone; there is nothing to do.
         let _ = stream.shutdown(Shutdown::Both);
+        ours
     }
 
     /// Put a host socket in the table, ready to be written to.
-    pub(super) fn register_socket(&self, key: ConnKey, stream: UnixStream) {
+    ///
+    /// The caller hands the returned handle to the connection's reader
+    /// thread, so the reader and the table name one socket and the
+    /// reader can prove at exit that the connection is still its own.
+    pub(super) fn register_socket(
+        &self,
+        key: ConnKey,
+        stream: UnixStream,
+    ) -> Arc<UnixStream> {
         // Belt and braces only. This bounds a write on the platforms
         // where it works, and reports success and does nothing on
         // illumos, which is why `write_all_bounded` polls instead.
@@ -85,10 +109,12 @@ impl VsockShared {
             debug!(self.log, "virtio-vsock write timeout not set";
                 "error" => %error);
         }
+        let stream = Arc::new(stream);
         self.sockets
             .lock()
             .expect("sockets lock")
-            .insert(key, Arc::new(stream));
+            .insert(key, Arc::clone(&stream));
+        stream
     }
 
     pub(super) fn drop_socket(&self, key: ConnKey) {

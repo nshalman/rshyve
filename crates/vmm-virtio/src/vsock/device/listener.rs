@@ -139,9 +139,6 @@ pub(super) fn start_host_connection(
         host_port: shared.mux.alloc_host_port(),
     };
     let s = stream;
-    let Ok(peer) = s.try_clone() else {
-        return;
-    };
     // The table is capped, and a peer told OK for a connection the mux
     // refused would wait on a guest that is never going to hear about
     // it. Reserving the slot answers that without letting the guest
@@ -174,17 +171,17 @@ pub(super) fn start_host_connection(
         shared.mux.forget(key);
         return;
     }
-    shared.register_socket(key, peer);
+    let socket = shared.register_socket(key, s);
     shared.mux.announce_host_connect(key);
     shared.deliver_rx();
-    reader_loop(shared, key, s);
+    reader_loop(shared, key, socket);
 }
 
 /// Read from a connection's host socket until it closes.
 pub(super) fn reader_loop(
     shared: Arc<VsockShared>,
     key: ConnKey,
-    mut stream: UnixStream,
+    stream: Arc<UnixStream>,
 ) {
     // Arm the poll here rather than inherit whatever the CONNECT
     // handshake left on the socket: a timeout the loop did not ask for
@@ -196,7 +193,7 @@ pub(super) fn reader_loop(
         if shared.shutdown.load(Ordering::Acquire) {
             break;
         }
-        let n = match stream.read(&mut buf) {
+        let n = match (&*stream).read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -239,9 +236,13 @@ pub(super) fn reader_loop(
         }
     }
 
-    shared.mux.queue_host_close(key);
-    shared.drop_socket(key);
-    shared.deliver_rx();
+    // Only for the socket this reader served. The guest picks the key
+    // and can reopen it while this thread is still waking, and the
+    // connection that took the key must not die with this one.
+    if shared.release_socket(key, &stream) {
+        shared.mux.queue_host_close(key);
+        shared.deliver_rx();
+    }
 }
 
 /// Parse Firecracker's `CONNECT <port>` line.

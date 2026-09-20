@@ -827,6 +827,59 @@ fn a_reset_waits_out_a_delivery_already_inside() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A reader wakes when its own socket closes, and the guest may by then
+/// have closed that connection and opened another under the same key:
+/// it picks both ports, so a program that re-dials from a fixed local
+/// port reuses the key at once. A reader that tore the key down would
+/// kill the connection the guest had just opened.
+#[test]
+fn a_readers_exit_leaves_a_connection_that_reused_its_key_alone() {
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    let key = ConnKey {
+        guest_port: 1024,
+        host_port: 1,
+    };
+
+    // The connection this reader serves.
+    let (peer, device_end) = UnixStream::pair().expect("socketpair");
+    assert!(vsock.shared.mux.start_host_connect(key));
+    let served = vsock.shared.register_socket(key, device_end);
+
+    // The guest closes it, then opens the same key again.
+    vsock.shared.mux.forget(key);
+    vsock.shared.drop_socket(key);
+    let (_next_peer, next_end) = UnixStream::pair().expect("socketpair");
+    assert!(vsock.shared.mux.start_host_connect(key));
+    vsock.shared.register_socket(key, next_end);
+    while vsock.shared.mux.pop_rx().is_some() {}
+
+    // Only now does the old reader wake and run its exit.
+    drop(peer);
+    reader_loop(Arc::clone(&vsock.shared), key, served);
+
+    assert_eq!(
+        vsock.shared.mux.conn_count(),
+        1,
+        "the old reader forgot the connection that took its key",
+    );
+    assert!(
+        vsock.shared.mux.pop_rx().is_none(),
+        "the guest was told the connection it just opened had gone",
+    );
+    assert!(
+        vsock
+            .shared
+            .sockets
+            .lock()
+            .expect("sockets")
+            .contains_key(&key),
+        "the old reader dropped the new connection's socket",
+    );
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // The RX handler and the transport session are two pieces of state a
 // reset changes one after the other, and a socket thread can be
 // between them. A packet delivered on the handler the reset dropped
@@ -1025,7 +1078,9 @@ fn the_reader_offers_every_byte_once_through_a_small_window() {
 
     let reader = {
         let shared = Arc::clone(&vsock.shared);
-        std::thread::spawn(move || reader_loop(shared, key, device_end))
+        std::thread::spawn(move || {
+            reader_loop(shared, key, Arc::new(device_end))
+        })
     };
     // The host peer writes on its own thread: the socket buffer fills
     // long before the guest's window has taken the whole stream.
@@ -1092,6 +1147,28 @@ fn the_reader_offers_every_byte_once_through_a_small_window() {
 /// Linux fills the whole ring the moment it probes, so this is the
 /// first pass, not a corner. Kills the mutation of arming only when
 /// the pass stopped short of the request cap.
+#[test]
+fn a_ring_taken_whole_still_arms_the_next_kick() {
+    let (physmap, mut queues) = rx_ring_full();
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+
+    vsock.notify_queue(VSOCK_RX_QUEUE, &mut queues, &physmap);
+
+    assert_eq!(
+        vsock.shared.pending_rx.lock().expect("pending").len(),
+        usize::from(RING_SIZE),
+        "the whole ring should be stashed",
+    );
+    assert_eq!(
+        avail_event(&physmap),
+        RING_SIZE,
+        "avail_event left behind the ring: the guest will never kick again",
+    );
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The transmit ring has the same trap as the receive ring: nothing
 /// returns to it without a guest kick, so a pass that stops on the
 /// request cap must still arm `avail_event` or the guest goes quiet
@@ -1107,28 +1184,6 @@ fn a_transmit_ring_taken_whole_still_arms_the_next_kick() {
         used_idx(&physmap),
         RING_SIZE,
         "the whole ring should have been consumed",
-    );
-    assert_eq!(
-        avail_event(&physmap),
-        RING_SIZE,
-        "avail_event left behind the ring: the guest will never kick again",
-    );
-
-    vsock.halt();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn a_ring_taken_whole_still_arms_the_next_kick() {
-    let (physmap, mut queues) = rx_ring_full();
-    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
-
-    vsock.notify_queue(VSOCK_RX_QUEUE, &mut queues, &physmap);
-
-    assert_eq!(
-        vsock.shared.pending_rx.lock().expect("pending").len(),
-        usize::from(RING_SIZE),
-        "the whole ring should be stashed",
     );
     assert_eq!(
         avail_event(&physmap),

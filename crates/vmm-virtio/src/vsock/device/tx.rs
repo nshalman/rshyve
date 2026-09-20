@@ -128,17 +128,13 @@ impl VirtioVsock {
                 return;
             }
         };
-        let Ok(reader_stream) = stream.try_clone() else {
-            self.shared.mux.refuse_guest_connect(key);
-            return;
-        };
-        self.shared.register_socket(key, stream);
+        let socket = self.shared.register_socket(key, stream);
         self.shared.mux.accept_guest_connect(key);
 
         let shared = Arc::clone(&self.shared);
         if let Ok(handle) = std::thread::Builder::new()
             .name("vsock-reader".into())
-            .spawn(move || reader_loop(shared, key, reader_stream))
+            .spawn(move || reader_loop(shared, key, socket))
         {
             self.shared.track_reader(handle);
         }
