@@ -93,7 +93,12 @@ impl Mapping {
         hdl: &VmmHdl,
         offset: i64,
     ) -> Result<Self> {
-        assert!(size > 0, "mapping size must be non-zero");
+        if size == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "mapping size must be non-zero",
+            ));
+        }
 
         // Never map with EXEC into our process — only the guest sees EXEC.
         let mmap_prot = prot.intersection(Prot::RW);
@@ -164,6 +169,12 @@ impl SubMapping {
             len: mapping.len,
             prot: mapping.prot,
         }
+    }
+
+    /// Take away every permission not in `prot`.
+    pub(super) fn restrict(mut self, prot: Prot) -> Self {
+        self.prot = self.prot.intersection(prot);
+        self
     }
 
     /// The raw host pointer to the start of this mapping.

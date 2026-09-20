@@ -297,13 +297,15 @@ pub fn load_bootrom(
     )
     .context("failed to map the ROM and its scratch RAM")?;
 
-    let sub = map.lookup(layout.rom_gpa, layout.rom_size).ok_or_else(|| {
-        anyhow::anyhow!(
-            "ROM region at GPA {:#x} len {} not found after mapping",
-            layout.rom_gpa,
-            layout.rom_size,
-        )
-    })?;
+    let sub = map
+        .lookup_untracked(layout.rom_gpa, layout.rom_size)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "ROM region at GPA {:#x} len {} not found after mapping",
+                layout.rom_gpa,
+                layout.rom_size,
+            )
+        })?;
 
     sub.write_bytes(&rom.data)
         .context("failed to write bootrom data into guest memory")?;

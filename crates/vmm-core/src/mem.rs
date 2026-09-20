@@ -112,6 +112,10 @@ struct TrackedRun {
     /// The guest address the mapping starts at.
     gpa: u64,
     mapping: Arc<Mapping>,
+    /// What `lookup` lets a device do to the run. A ROM's run is the
+    /// writable devmem mapping, so the guest protection is applied
+    /// here, not by the mmap.
+    prot: Prot,
 }
 
 impl TrackedRun {
@@ -274,14 +278,14 @@ impl PhysMap {
                 rom_gpa,
                 rom_len,
                 RegionKind::Rom,
-                Prot::READ | Prot::EXEC,
+                guest_prot_for(RegionKind::Rom),
                 Placement::Firmware,
             )?;
             let ram = self.claim(
                 ram_gpa,
                 ram_len,
                 RegionKind::Ram,
-                Prot::RWX,
+                guest_prot_for(RegionKind::Ram),
                 Placement::Firmware,
             )?;
             hdl.create_memseg(segid, seg_len, &seg_name(segid))?;
@@ -407,19 +411,21 @@ impl PhysMap {
         kind: RegionKind,
     ) -> Result<()> {
         let publish = self.publish_gate();
-        let claim =
-            self.claim(gpa, len, kind, Prot::RWX, Placement::Firmware)?;
+        let prot = guest_prot_for(kind);
+        let claim = self.claim(gpa, len, kind, prot, Placement::Firmware)?;
         let direct = Arc::new(Mapping::anon(len)?);
         let (run_gpa, run_len) = self.run_bounds(gpa, len, kind);
         let tracked = if (run_gpa, run_len) == (gpa, len) {
             TrackedRun {
                 gpa,
                 mapping: Arc::clone(&direct),
+                prot,
             }
         } else {
             TrackedRun {
                 gpa: run_gpa,
                 mapping: Arc::new(Mapping::anon(run_len)?),
+                prot,
             }
         };
         self.publish_claim(publish, claim, RegionViews { tracked, direct });
@@ -448,6 +454,7 @@ impl PhysMap {
                 tracked: TrackedRun {
                     gpa,
                     mapping: Arc::new(Mapping::anon(len)?),
+                    prot: Prot::RWX,
                 },
                 direct: Arc::new(Mapping::anon(len)?),
             },
@@ -572,6 +579,9 @@ impl PhysMap {
     ///
     /// A range that runs from one RAM region into the next is answered,
     /// because both share one mapping. See [`TrackedRun`].
+    ///
+    /// The view carries the guest's protection, so a device cannot DMA
+    /// into a ROM. Propolis refuses the same in `region_covered`.
     pub fn lookup(&self, gpa: u64, len: usize) -> Option<SubMapping> {
         let end = gpa.checked_add(len as u64)?;
 
@@ -586,7 +596,9 @@ impl PhysMap {
         }
 
         let offset = (gpa - run.gpa) as usize;
-        SubMapping::new(&run.mapping).subregion(offset, len)
+        SubMapping::new(&run.mapping)
+            .subregion(offset, len)
+            .map(|view| view.restrict(run.prot))
     }
 
     /// Look up a range in the mapping of the memory segment itself.
@@ -716,12 +728,14 @@ impl RamClaim<'_> {
         // does not know about would be handed out a second time.
         match devmem_view(hdl, segid, segoff, len) {
             Ok(direct) => {
-                // A region the guest cannot write has nothing to track,
-                // and the bootrom loader needs `lookup` to stay
-                // writable, so it keeps one view.
+                // A region the guest cannot write has nothing to track.
+                // It keeps one view, with the guest's protection on it
+                // so that device DMA cannot write what the guest cannot.
+                // The bootrom loader writes through `lookup_untracked`.
                 let tracked = tracked.unwrap_or_else(|| TrackedRun {
                     gpa,
                     mapping: Arc::clone(&direct),
+                    prot: self.guest_prot,
                 });
                 map.publish_claim(
                     publish,
@@ -767,9 +781,7 @@ fn devmem_view(
 /// Map a run of the guest physical address space into this process.
 ///
 /// This is the view the kernel tracks. `None` for a region the guest
-/// cannot write: there is nothing to track, and the mapping would carry
-/// the guest's own read-only protection, which the bootrom loader needs
-/// `lookup` not to have.
+/// cannot write: there is nothing to track.
 fn tracked_view(
     hdl: &VmmHdl,
     gpa: u64,
@@ -789,7 +801,16 @@ fn tracked_view(
     Ok(Some(TrackedRun {
         gpa,
         mapping: Arc::new(Mapping::new(len, guest_prot, hdl, offset)?),
+        prot: guest_prot,
     }))
+}
+
+/// The protection the guest gets on a region of `kind`.
+fn guest_prot_for(kind: RegionKind) -> Prot {
+    match kind {
+        RegionKind::Rom => Prot::READ | Prot::EXEC,
+        RegionKind::Ram | RegionKind::Mmio => Prot::RWX,
+    }
 }
 
 impl Drop for RamClaim<'_> {
