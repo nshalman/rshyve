@@ -467,6 +467,10 @@ pub mod linux_oflags {
     pub const O_CLOEXEC: u32 = 0o2000000;
     /// `O_SYNC` is `__O_SYNC | O_DSYNC` on Linux.
     pub const O_SYNC: u32 = 0o4010000;
+    /// `__FMODE_EXEC`, which Linux sets on the open it does to execute
+    /// a file. It is not an `openat` flag; it only says why the kernel
+    /// is opening.
+    pub const FMODE_EXEC: u32 = 0o40;
 }
 
 /// A guest's open flags, translated to the host's numbering.
@@ -495,11 +499,16 @@ pub struct OpenFlags {
 /// `O_LARGEFILE` is the only file size on a 64-bit host, `O_NOATIME`
 /// and `O_DIRECT` are advisory, `O_NOCTTY` is for terminals, and
 /// `O_CLOEXEC` is set on every descriptor here regardless.
+///
+/// `__FMODE_EXEC` is not an open flag at all: Linux sets it on the open
+/// it performs to execute a file, and it reaches the server on every
+/// `execve` off a share. Refusing it fails the exec with EINVAL.
 const IGNORED_LINUX_OFLAGS: u32 = linux_oflags::O_LARGEFILE
     | linux_oflags::O_NOATIME
     | linux_oflags::O_DIRECT
     | linux_oflags::O_NOCTTY
-    | linux_oflags::O_CLOEXEC;
+    | linux_oflags::O_CLOEXEC
+    | linux_oflags::FMODE_EXEC;
 
 impl OpenFlags {
     /// Translate Linux open flags. `Err` carries the bits this server
@@ -820,6 +829,22 @@ mod tests {
         // O_SYNC carries the O_DSYNC bit on Linux; both are set then.
         let f = OpenFlags::from_linux(0o4010000).expect("known");
         assert!(f.sync && f.dsync);
+    }
+
+    /// Linux opens a binary for execution with `__FMODE_EXEC` set, so
+    /// refusing that bit fails every `execve` off a share with EINVAL.
+    /// A live guest caught this; no unit test did.
+    #[test]
+    fn an_exec_open_is_accepted() {
+        let exec = linux_oflags::O_RDONLY
+            | linux_oflags::O_LARGEFILE
+            | linux_oflags::FMODE_EXEC;
+
+        let f = OpenFlags::from_linux(exec).expect("an exec open is known");
+
+        assert_eq!(f.accmode, libc::O_RDONLY);
+        assert_eq!(f.host_io_flags(), libc::O_RDONLY);
+        assert!(!f.mutates(), "an exec open must not count as a write");
     }
 
     #[test]
