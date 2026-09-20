@@ -11,6 +11,10 @@ kernel/vmlinux-*
 /.codex/
 CLAUDE.local.md
 *.local.md
+.DS_Store
+
+# Run output from the lab scripts and the guest harnesses
+*.log
 
 # Operator-specific test configuration
 /.env
