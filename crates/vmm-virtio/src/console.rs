@@ -61,6 +61,18 @@ pub const CONSOLE_RX_BACKLOG_MAX: usize = 64 * 1024;
 /// Guest output is copied through a fixed buffer, so a descriptor
 /// length the guest picked never becomes an allocation size.
 const TX_CHUNK: usize = 4096;
+/// Bytes of guest output one kick may copy.
+///
+/// The drain runs inline on the vCPU under the transport lock, and
+/// the guest picks both the descriptor lengths and the number of
+/// chains. A ring of 128 chains, each naming 128 descriptors of 4 GiB,
+/// is tens of terabytes of copying for one notification: the vCPU
+/// stays in the VMM, every other vCPU that touches this device's
+/// registers waits on the transport lock, and a pause or teardown
+/// that needs that vCPU waits with them. Output past the bound is
+/// dropped, which the console already does whenever no client is
+/// attached.
+const TX_BYTES_PER_KICK: usize = 1024 * 1024;
 /// How long a client may stall before it loses its console.
 ///
 /// The transmit queue drains on the vCPU thread, so an unbounded write
@@ -493,6 +505,7 @@ impl VirtioConsole {
         let old_used_idx = queue.read_used_idx(physmap);
         let max_requests = usize::from(queue.size());
         let mut chunk = [0u8; TX_CHUNK];
+        let mut budget = TX_BYTES_PER_KICK;
 
         let popped = queue.drain_avail(physmap, max_requests, |queue, head| {
             if let Some(chain) = queue.collect_chain(physmap, head) {
@@ -500,26 +513,35 @@ impl VirtioConsole {
                     let ChainBuf::Readable { addr, len } = buf else {
                         continue;
                     };
-                    self.write_chain_buf(physmap, *addr, *len, &mut chunk);
+                    self.write_chain_buf(
+                        physmap,
+                        *addr,
+                        *len,
+                        &mut chunk,
+                        &mut budget,
+                    );
                 }
             }
-            // The chain is entirely device-readable, so the used
-            // length is zero.
+            // Heads keep going back on the used ring once the budget
+            // is gone: the ring has to drain either way, and only the
+            // copying is bounded.
             queue.push_used(physmap, head, 0);
         });
 
         popped > 0 && queue.should_notify_guest(physmap, old_used_idx)
     }
 
-    /// Copy one device-readable buffer out to the client, in chunks.
+    /// Copy one device-readable buffer out to the client, in chunks,
+    /// spending `budget` as it goes.
     fn write_chain_buf(
         &self,
         physmap: &PhysMap,
         addr: u64,
         len: u32,
         chunk: &mut [u8; TX_CHUNK],
+        budget: &mut usize,
     ) {
-        let mut remaining = len as usize;
+        let mut remaining = (len as usize).min(*budget);
         let mut offset = 0u64;
         while remaining > 0 {
             let n = remaining.min(TX_CHUNK);
@@ -533,6 +555,7 @@ impl VirtioConsole {
                 return;
             }
             self.shared.write_host(&chunk[..n]);
+            *budget -= n;
             offset = offset.saturating_add(n as u64);
             remaining = remaining.saturating_sub(n);
         }

@@ -299,6 +299,62 @@ fn host_bytes_reach_guest_memory() {
     console.halt();
 }
 
+/// The transmit drain runs on the vCPU under the transport lock, and
+/// the guest picks the descriptor lengths. One kick over a ring of
+/// 4 GiB descriptors is tens of terabytes of copying, during which the
+/// vCPU never leaves the VMM and every other vCPU that touches this
+/// device's registers waits behind it.
+#[test]
+fn a_transmit_kick_copies_at_most_its_byte_budget() {
+    const REGION: usize = 4 * 1024 * 1024;
+    const OVERSIZED: u32 = 3 * 1024 * 1024;
+
+    let physmap = Arc::new(
+        PhysMap::new_anon(DESC_GPA, REGION).expect("create guest memory"),
+    );
+    let mut tx_queue = VirtQueue::new(4);
+    tx_queue.set_addr_modern(DESC_GPA, AVAIL_GPA, USED_GPA);
+    tx_queue.set_event_idx(true);
+    write_desc(&physmap, 0, DATA_GPA, OVERSIZED, 0);
+    publish_avail(&physmap, 0, 0, 1);
+
+    let (_dir, console) = console_in_tempdir(Arc::clone(&physmap));
+    let (peer, device_end) = UnixStream::pair().expect("socketpair");
+    console.shared.replace_client(Some(device_end));
+
+    // Drain the peer so no write blocks, and count what arrives.
+    let reader = std::thread::spawn(move || {
+        let mut peer = peer;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0usize;
+        while let Ok(n) = peer.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        total
+    });
+
+    let mut queues = [VirtQueue::new(4), tx_queue];
+    console.notify_queue(CONSOLE_TX_QUEUE, &mut queues, &physmap);
+
+    // Shuts the device end down, so the reader sees the end of input.
+    console.shared.replace_client(None);
+    let copied = reader.join().expect("the reader finished");
+
+    assert_eq!(
+        copied, TX_BYTES_PER_KICK,
+        "one kick copied {copied} bytes of guest output",
+    );
+    assert_eq!(
+        queues[1].read_used_ring_idx(&physmap),
+        1,
+        "the head never went back, so the ring stalled",
+    );
+    console.halt();
+}
+
 #[test]
 fn reset_drops_posted_rx_chains() {
     let (physmap, rx_queue) = make_queue(4, 1, bits::VRING_DESC_F_WRITE, 8);
