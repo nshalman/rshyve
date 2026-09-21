@@ -288,6 +288,27 @@ jobs:
       # three packages has a bench or example target, so nothing that
       # `--all-targets` compiled is lost.
       - run: cargo test --locked -p rshyve -p firehyve
+      # rshyve is the VMM on the compute nodes and shares one stamp
+      # rule with firehyve, but only firehyve was ever run. The step
+      # above already links rshyve here, so this costs one relink.
+      - name: rshyve reports the commit it was built from
+        run: |
+          set -euo pipefail
+          rev="$(git rev-parse --short HEAD)"
+          TRITON_BUILD_REV="$rev" cargo build --locked -p rshyve
+          out="$(./target/debug/rshyve --version)"
+          echo "$out"
+          case "$out" in
+            *"($rev)") ;;
+            *) echo "expected a version naming $rev, got: $out" >&2; exit 1 ;;
+          esac
+          cargo build --locked -p rshyve
+          out="$(./target/debug/rshyve --version)"
+          echo "$out"
+          case "$out" in
+            *"(unstamped)") ;;
+            *) echo "expected the unstamped marker, got: $out" >&2; exit 1 ;;
+          esac
       # The vTPM crates ran in no job. They need the submodule and the
       # autotools deps this job already has, and their tests drive real
       # libtpms rather than a stub, so they belong here and nowhere
