@@ -360,7 +360,10 @@ fn attach_device(
 /// failed `tcgetattr` is not an error.
 fn make_raw(device: &File) {
     let fd = device.as_raw_fd();
-    // Safety: `tio` is a whole termios and `fd` is open for the calls.
+    // SAFETY: `device` keeps `fd` open for the whole block. `termios`
+    // is a repr(C) struct of integers and a byte array, so all zeroes is
+    // a valid instance, and `tcgetattr` fills it before `cfmakeraw` and
+    // `tcsetattr` read it. Each call touches only `tio`.
     unsafe {
         let mut tio: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut tio) == 0 {
@@ -444,6 +447,9 @@ mod tests {
         Logger::root(slog::Discard, slog::o!())
     }
 
+    /// Serializes the `ptsname` static buffer between test threads.
+    static PTSNAME: Mutex<()> = Mutex::new(());
+
     /// A pty pair, which is the shape `/dev/zconsole` has: zoneadmd
     /// holds the master, and the backend opens the slave by path.
     struct Pty {
@@ -460,7 +466,16 @@ mod tests {
                 .open("/dev/ptmx")
                 .expect("open /dev/ptmx");
             let fd = master.as_raw_fd();
-            // Safety: `fd` is the open master for the whole block.
+            // `ptsname` answers from libc's own static buffer, and the
+            // test harness runs tests on parallel threads, so the name
+            // is read under a lock and copied before it is released.
+            let _named = PTSNAME
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: `master` keeps `fd` open for the whole block.
+            // `ptsname` returns a pointer into that static buffer, which
+            // is checked non-null before it is read and copied while the
+            // lock is still held, so nothing can free or replace it.
             let slave_path = unsafe {
                 assert_eq!(libc::grantpt(fd), 0, "grantpt");
                 assert_eq!(libc::unlockpt(fd), 0, "unlockpt");
@@ -601,10 +616,13 @@ mod tests {
     /// process reads.
     fn pipe() -> (File, File) {
         let mut fds = [0i32; 2];
-        // Safety: `fds` has room for the two descriptors.
+        // SAFETY: `fds` is a live two-element array, which is exactly
+        // what pipe writes, and it writes nothing else.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
         use std::os::fd::FromRawFd;
-        // Safety: both descriptors are fresh and owned by nothing else.
+        // SAFETY: the call above succeeded, so both entries are open
+        // descriptors this frame alone owns. Each is handed to one
+        // `File`, so neither is closed twice.
         unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
     }
 
