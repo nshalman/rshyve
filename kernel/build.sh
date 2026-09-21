@@ -53,17 +53,29 @@ for frag in $EXTRA_CONFIG; do
     fi
 done
 
+# The suffix names the output files, so it must hold nothing that a path
+# or a shell reads as more than a name.
+case "$OUT_SUFFIX" in
+    *[!A-Za-z0-9._-]*)
+        echo "BUILD-FAIL: KERNEL_OUT_SUFFIX takes only [A-Za-z0-9._-]"
+        exit 1
+        ;;
+esac
+
 echo "=== Building Linux ${KERNEL_VERSION} fast-boot kernel ${EXTRA_CONFIG:+(+ $EXTRA_CONFIG)} ==="
 
-# The fragment list and the digest go in as environment variables rather
-# than being spliced into the script text, so a value with a quote or a
-# `$(...)` cannot run inside the container.
+# The fragment list, the digest and the output suffix go in as
+# environment variables rather than being spliced into the script text,
+# so a value with a quote or a `$(...)` cannot run inside the container.
+# KERNEL_VERSION is spliced, and is safe because it must match a key of
+# KERNEL_SHA256 above, which is a literal set.
 docker run --rm \
     --platform linux/amd64 \
     -v "${SCRIPT_DIR}:/build" \
     -w /tmp/kernel \
     -e "EXTRA=${EXTRA_CONFIG}" \
     -e "WANT_SHA256=${WANT_SHA256}" \
+    -e "OUT_SUFFIX=${OUT_SUFFIX}" \
     "$ALPINE_IMAGE" \
     sh -c "
 set -ex
@@ -106,7 +118,7 @@ grep -c '=m' .config | xargs printf 'Module options: %s (should be 0)\n'
 
 # The resolved config. Written before the compile, so a failed check
 # leaves behind the file that says why.
-cp .config /build/config-fastboot${OUT_SUFFIX}
+cp .config /build/config-fastboot\${OUT_SUFFIX}
 
 # olddefconfig silently drops an option whose dependencies are unmet.
 # Catch that here rather than after a full build and a failed boot. PVH
@@ -123,7 +135,7 @@ grep -q '^CONFIG_PVH=y' .config || {
 # keep the one-shot payload small, and a later fragment is meant to
 # override them.
 if [ -n \"\$EXTRA\" ]; then
-    sh /build/check-config.sh /build/config-fastboot${OUT_SUFFIX} /build \$EXTRA || {
+    sh /build/check-config.sh /build/config-fastboot\${OUT_SUFFIX} /build \$EXTRA || {
         echo 'BUILD-FAIL: the resolved config does not match the fragments'
         exit 1
     }
@@ -134,16 +146,16 @@ make ARCH=x86_64 -j\$(nproc) bzImage 2>&1 | tail -20
 
 # Copy output. --strip-all keeps allocatable sections, so the PT_NOTE
 # carrying the PVH entry survives.
-cp arch/x86_64/boot/bzImage /build/vmlinuz-fastboot${OUT_SUFFIX}
-objcopy --strip-all vmlinux /build/vmlinux-fastboot${OUT_SUFFIX}
+cp arch/x86_64/boot/bzImage /build/vmlinuz-fastboot\${OUT_SUFFIX}
+objcopy --strip-all vmlinux /build/vmlinux-fastboot\${OUT_SUFFIX}
 
-readelf -n /build/vmlinux-fastboot${OUT_SUFFIX} | grep -qi xen || {
+readelf -n /build/vmlinux-fastboot\${OUT_SUFFIX} | grep -qi xen || {
     echo 'BUILD-FAIL: vmlinux carries no Xen PVH note'
     exit 1
 }
 
-ls -la /build/vmlinuz-fastboot${OUT_SUFFIX} /build/vmlinux-fastboot${OUT_SUFFIX}
+ls -la /build/vmlinuz-fastboot\${OUT_SUFFIX} /build/vmlinux-fastboot\${OUT_SUFFIX}
 echo '=== Kernels built successfully ==='
-echo \"bzImage: \$(du -h /build/vmlinuz-fastboot${OUT_SUFFIX} | cut -f1)\"
-echo \"PVH ELF: \$(du -h /build/vmlinux-fastboot${OUT_SUFFIX} | cut -f1)\"
+echo \"bzImage: \$(du -h /build/vmlinuz-fastboot\${OUT_SUFFIX} | cut -f1)\"
+echo \"PVH ELF: \$(du -h /build/vmlinux-fastboot\${OUT_SUFFIX} | cut -f1)\"
 "
