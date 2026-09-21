@@ -49,19 +49,19 @@ their own lockfiles. CI covers them in jobs of their own.
 
 ### vmm-core
 
-- **`VmmHdl`** — safe wrapper over `/dev/vmm/{name}`. Every kernel ioctl
+- **`VmmHdl`**: safe wrapper over `/dev/vmm/{name}`. Every kernel ioctl
   is a typed method; there is no raw ioctl escape hatch.
-- **`PhysMap`** — guest physical address space manager. Tracks RAM, ROM
+- **`PhysMap`**: guest physical address space manager. Tracks RAM, ROM
   and MMIO regions as an interval map. `PhysMap::new_anon` gives tests a
   real address space with no kernel.
-- **`MemCtx`** / **`SubMapping`** — guest memory access, lifetime-bound
+- **`MemCtx`** / **`SubMapping`**: guest memory access, lifetime-bound
   and volatile. Every device read and write of guest memory goes through
   it.
-- **`Machine`** — the aggregate: `VmmHdl`, vCPUs, `PhysMap`, and the PIO
+- **`Machine`**: the aggregate: `VmmHdl`, vCPUs, `PhysMap`, and the PIO
   and MMIO buses.
-- **`Vcpu`** — per-vCPU register access, run state, and the `vm_run`
+- **`Vcpu`**: per-vCPU register access, run state, and the `vm_run`
   loop.
-- **`PioBus`** / **`MmioBus`** — exit dispatch to device handlers.
+- **`PioBus`** / **`MmioBus`**: exit dispatch to device handlers.
 
 ### vmm-machine
 
@@ -73,34 +73,34 @@ concrete PCI driver type; the binaries do.
 
 ### vmm-devices
 
-- **`Lifecycle`** — start, pause, resume, reset and migration hooks,
+- **`Lifecycle`**: start, pause, resume, reset and migration hooks,
   driven by the registry.
-- **`PciDevice`** — config space and BAR handling.
-- **`QuiesceGate`** — bounded wait for worker threads to stop touching
+- **`PciDevice`**: config space and BAR handling.
+- **`QuiesceGate`**: bounded wait for worker threads to stop touching
   guest memory, used by reset, teardown and migration.
 
 ### vmm-virtio
 
-- **`VirtioDevice`** — the device-side trait: `u64` feature bits, queue
+- **`VirtioDevice`**: the device-side trait: `u64` feature bits, queue
   notification, config space.
-- **`VirtioPciDevice<D>`** — the transitional PCI transport over any
+- **`VirtioPciDevice<D>`**: the transitional PCI transport over any
   `VirtioDevice`. BAR0 carries the legacy PIO registers and BAR2 the
   modern MMIO ones.
-- **`VirtQueue`** — descriptor chain collection, direct and indirect,
+- **`VirtQueue`**: descriptor chain collection, direct and indirect,
   and used-ring publication.
 
 ### vmm-migrate
 
-- **`Message`** / **`MessageType`** (`codec.rs`) — the wire frames.
-- **`Transport`** / **`Chan`** (`wire.rs`) — one byte stream, a Unix
+- **`Message`** / **`MessageType`** (`codec.rs`), the wire frames.
+- **`Transport`** / **`Chan`** (`wire.rs`), one byte stream, a Unix
   socket or a TCP socket, with a read deadline the protocol shortens
   once the guest is paused. Neither end starts an async runtime,
   because a bhyve-brand zone has no `/dev/poll`.
-- **`source`** / **`destination`** — the two ends of the one driver.
+- **`source`** / **`destination`**: the two ends of the one driver.
   The source pauses and flushes the devices and exports their state;
   the destination checks the topology, the CPU features and the device
   identities before it lets the guest run.
-- **`state`** — kernel state export and import over the vmm-data ioctls.
+- **`state`**: kernel state export and import over the vmm-data ioctls.
 
 ## Data flow
 

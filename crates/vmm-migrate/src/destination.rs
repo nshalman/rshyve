@@ -228,8 +228,8 @@ fn check_preamble(
     }
     Err(MigrateError::PreambleMismatch(format!(
         "this host lacks CPU features the guest already sees ({gap}); \
-         start the destination with --allow-cpu-feature-mismatch to \
-         accept the risk",
+         send migrate-dest with allow_cpu_feature_mismatch to accept \
+         the risk",
     )))
 }
 

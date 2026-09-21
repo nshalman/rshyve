@@ -128,7 +128,7 @@ accept.
 **To close:** a modern authenticated, encrypted console boundary for any
 remote use, and a documented tunnel requirement until then.
 
-### OSF-9 — No audit covers every guest-driven log site
+### OSF-9, No audit covers every guest-driven log site
 
 **Boundary:** guest to host. **Severity:** low (host disk and log
 pipeline, and evidence destruction).
@@ -154,7 +154,7 @@ device to use the bucket, so the next one can reintroduce the defect.
 **To close:** enumerate the guest-reachable log sites, put each behind
 the bucket or a latch, and give each a `CountingDrain` test.
 
-### OSF-10 — virtio-fs runs in the VMM process, not a sandbox
+### OSF-10, virtio-fs runs in the VMM process, not a sandbox
 
 **Boundary:** guest to host filesystem. **Severity:** medium.
 
@@ -183,7 +183,7 @@ does not, a helper process with a reduced privilege set and its own
 **Mitigation today:** export only directories whose contents the guest
 may read, and never a read-write share of anything the host trusts.
 
-### OSF-11 — The PCI passthrough audit has not run on real hardware
+### OSF-11, The PCI passthrough audit has not run on real hardware
 
 **Boundary:** guest to host. **Severity:** unknown.
 
@@ -210,8 +210,8 @@ whatever reading the source says.
 
 | Finding | Closed by |
 |---|---|
-| OSF-3 — CPU feature mismatch was warned about, not rejected, and the two implementations compared different leaves against unmasked host features | `Migrate device state by PCI identity over one driver` |
-| OSF-8 — Hyper-V enlightenment state was not migrated; `TIME_REF_COUNT` restarted from a process-local clock and ran backwards for the guest | `Migrate the Hyper-V enlightenment` |
+| OSF-3, CPU feature mismatch was warned about, not rejected, and the two implementations compared different leaves against unmasked host features | `Migrate device state by PCI identity over one driver` |
+| OSF-8, Hyper-V enlightenment state was not migrated; `TIME_REF_COUNT` restarted from a process-local clock and ran backwards for the guest | `Migrate the Hyper-V enlightenment` |
 | PS/2 controller RAM out-of-bounds index reachable from guest port I/O | `fix(ps2): guest-reachable out-of-bounds index in controller RAM` |
 | Virtio indirect descriptor table unbounded against queue size | `fix(virtio): bound indirect descriptor tables to the queue size` |
 | Migration `PageBatch` slice index abort and discarded guest-memory errors | `fix(migrate): validate and bound peer-controlled page transfers` |
