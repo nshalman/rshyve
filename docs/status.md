@@ -71,7 +71,7 @@ and a real init. What they do and do not show is in
 | Control socket (JSON/Unix) | Complete |
 | SIGTERM -> ACPI poweroff | Complete |
 | Built-in mdata agent (V2) | Complete (testing only; production uses external agent) |
-| CLI bhyve compatibility | Complete (all boot.c flags supported) |
+| CLI bhyve compatibility | The flags the brand's `boot.c` builds (`-H -U -B -c -m -A -S -s -l -o`) parse; `-A` does nothing, `-D`, `-k` and `--json-config` are refused |
 | Serial console (-l com1,stdio) | Complete |
 | Serial to device path (-l com1,/dev/zconsole) | Complete |
 | SMBIOS -B parsing | Complete (manufacturer, product, serial, etc.) |
@@ -100,7 +100,7 @@ and a real init. What they do and do not show is in
 
 | Requirement | Status |
 |-------------|--------|
-| All boot.c CLI flags | Supported |
+| The boot.c CLI flags (`-H -U -B -c -m -A -S -s -l -o`) | Parsed |
 | PCI slot assignments (0, 3-6, 29, 30, 31) | Supported |
 | SMBIOS "SmartDC HVM" for cloud-init detection | Default |
 | COM2 device path for external mdata agent | Supported |
@@ -111,6 +111,9 @@ and a real init. What they do and do not show is in
 ## Known limitations
 
 - `ahci-hd` not implemented (`ahci-cd` is); use virtio-blk or nvme for disks
+- Some device and LPC options parse and are then ignored, and an unknown
+  `-s` driver name is logged and skipped. [features.md](features.md#accepted-by-the-cli-and-then-ignored)
+  lists every one
 - FPU/XSAVE state not transferred during migration
 - Migration transport is unauthenticated and unencrypted; see SECURITY.md
 - NVList/zhyve.cmd reader not implemented (boot.c integration uses CLI flags directly)

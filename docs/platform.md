@@ -1,9 +1,13 @@
 # Platform Image Integration
 
-## Drop-in Replacement Strategy
+## Replacing the platform bhyve
 
-The `rshyve` binary is a drop-in replacement for `/usr/sbin/bhyve`. It
-accepts the same CLI flags that `boot.c` constructs.
+The `rshyve` binary takes the command line `boot.c` constructs, so it
+can stand in for `/usr/sbin/bhyve`. It is not a complete bhyve:
+`ahci-hd` is refused at startup, `-D`, `-k` and `--json-config` are
+refused rather than ignored, an unknown `-s` driver name is logged and
+skipped, and several device options parse and then do nothing
+([features.md](features.md#accepted-by-the-cli-and-then-ignored)).
 
 ### Integration Path
 
@@ -35,7 +39,10 @@ rshyve -H
   SYSbhyve-<did>
 ```
 
-All of these flags are supported by `rshyve`.
+`rshyve` parses every one of these and boots from them. Some of the
+trailing options are then ignored: `nodelete` and `sectorsize` on a
+disk, `vga=` on the framebuffer, and `tablet` on xHCI. `password=` is
+used as given and is not base64-decoded.
 
 ### PCI Slot Assignments (boot.c convention)
 

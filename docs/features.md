@@ -1,6 +1,6 @@
 # Feature reference
 
-`rshyve` and `firehyve` are two binaries built from one workspace. `rshyve` is a drop-in replacement for the illumos `bhyve(8)` command: UEFI firmware, NVMe, AHCI CD-ROM, a VNC framebuffer, PCI passthrough, a control socket, and live migration. `firehyve` is a microVM that boots a Linux kernel directly and links a deliberately smaller crate set; it attaches six virtio drivers, accepts the two chipset names and the two graphical-console names the bhyve zone brand always emits, and rejects everything else at startup instead of skipping it. Choose `firehyve` when the guest is a Linux kernel you supply and the device list is virtio only; choose `rshyve` for anything that needs firmware, a graphical console, or migration.
+`rshyve` and `firehyve` are two binaries built from one workspace. `rshyve` stands in for the illumos `bhyve(8)` command on the command line the zone brand builds: UEFI firmware, NVMe, AHCI CD-ROM, a VNC framebuffer, PCI passthrough, a control socket, and live migration. It is not all of bhyve, and the tables below separate what it implements from what it accepts and ignores and what it refuses. `firehyve` is a microVM that boots a Linux kernel directly and links a deliberately smaller crate set; it attaches six virtio drivers, accepts the two chipset names and the two graphical-console names the bhyve zone brand always emits, and rejects everything else at startup instead of skipping it. Choose `firehyve` when the guest is a Linux kernel you supply and the device list is virtio only; choose `rshyve` for anything that needs firmware, a graphical console, or migration.
 
 Everything below is traced to code. Where a shipped document contradicts the code, the code wins and the contradiction is listed at the end.
 
@@ -605,12 +605,11 @@ Absent, with no partial path:
 
 These parse without complaint and do nothing. Each one is a way to believe you configured something you did not.
 
+Three C bhyve flags are refused instead of ignored, so an operator who puts one in `bhyve_extra_opts` gets an error rather than a VM that is not what was asked for: `-D` (destroy on power-off), `-k` and `--json-config` (`crates/vmm-config/src/lib.rs:10`). `boot.c` passes none of the three. The instance is reclaimed when the process exits whatever `-D` would have said, because the VMM arms the kernel autodestruct flag on every VM.
+
 | Input | Reality |
 |---|---|
-| `--json-config <PATH>` | No reader exists anywhere in the tree (rshyve). firehyve at least rejects it. |
-| `-k` / `--config-file` | Declared in `crates/vmm-config/src/lib.rs`; no consumer. |
 | `-o` / `--config-option`, any key outside `hotplug.` | Passed over. `-o` is a free key space this VMM shares with vmadm. The two keys it does read are `hotplug.maxmem` and `hotplug.memslot`; a misspelled `hotplug.` key is a startup error rather than a silent drop (`crates/vmm-config/src/lib.rs:338`). |
-| `-D` / `--destroy-on-poweroff` | Declared at `crates/vmm-config/src/lib.rs:79` and read nowhere. A whole-tree grep finds only that line. vmadm and boot.c pass `-D`, so this is the one an operator is most likely to trust. The instance is in fact reclaimed when the process exits, because the VMM arms the kernel autodestruct flag, but that happens whether or not `-D` was given. |
 | `-A` / `--acpi` | Declared at `crates/vmm-config/src/lib.rs:91` and read nowhere. ACPI tables are built unconditionally, so the flag is redundant rather than harmful. |
 | `nvme,...,sectorsize=N` | Parsed by the shared block parser, then discarded. NVMe LBA is hardcoded 512. |
 | `nvme,...,num-queues=N`, `nvme,...,nodelete` | Parsed and discarded. |
@@ -657,7 +656,7 @@ These parse without complaint and do nothing. Each one is a way to believe you c
 
 **Two test gates still hold coverage off the platform that runs the code.** `bin/rshyve/src/peercred.rs:130` gates its test to Linux and macOS, so the control socket's peer check is untested on illumos, and `crates/vmm-core/tests/autodestruct.rs` is illumos only, so CI never runs it. Nothing compares per-crate test counts across platforms, so a new gate is invisible until somebody reads for it. The viona half of this gap is closed: `VionaInner` now holds one `Arc<dyn LinkOps>` on every platform (`f896980`), which took viona tests executing on illumos from 3 to 39 with no platform gate left, and `dfd478a` moved `LinkOps` into `viona-api` beside the `VionaFd` that implements it, so the illumos adapter sends its ioctls directly. [hardware-run.md](hardware-run.md#coverage-that-does-not-reach-illumos) carries the detail.
 
-**Dirty page tracking is on by default in rshyve** (`--track-dirty` defaults true; the real control is the `--no-track-dirty` opt-out), and it asks the kernel for `VCF_TRACK_DIRTY` at VM create. Nothing probes for hardware support first or degrades if the flag is refused.
+**Dirty page tracking is on by default in rshyve.** The only control is the `--no-track-dirty` opt-out; `--track-dirty` is gone, because it could never be false. Tracking asks the kernel for `VCF_TRACK_DIRTY` at VM create. Nothing probes for hardware support first or degrades if the flag is refused.
 
 **No part of the VMM constructs an async runtime any more.** TCP migration used to build a tokio runtime, which a bhyve-brand zone cannot run because it has no `/dev/poll`. Both transports are now the same blocking driver. An in-zone migration should still use the Unix socket with a global-zone agent bridging to the peer, because that keeps an unauthenticated protocol (OSF-1) off a listening TCP port; TCP from inside a zone is untested. `bin/rshyve/Cargo.toml` still declares tokio and no rshyve source file uses it. firehyve's crate graph contains no tokio at all.
 
@@ -682,13 +681,11 @@ Treat `STATUS.md` as historical. It still titles the project "vmmnew", predates 
 | virtio-blk options are `nodelete` and `sectorsize` | `docs/devices.md:59` | The parser also honors `ro` and `num-queues=N`; `num-queues` appears nowhere in the docs. `nodelete` is inert. |
 | "Automatically adds -S and -A when passthrough devices are present" | `docs/devices.md` | No such code. `cli.wire_memory` is read once and nothing inspects the `-s` specs. An operator relying on this runs passthrough over unwired memory. |
 | One device table with no per-binary column | `docs/devices.md` | firehyve accepts 8 of 13 drivers and hard-errors on the rest. `docs/cli.md:117` states this correctly. |
-| "firehyve `-l com2`: not attached" | `docs/cli.md:116` | COM2 is always attached, transmit only, mirrored to stdout (`bin/firehyve/src/console.rs:111`). The "no metadata agent" half is right. |
-| "`--track-dirty` enables dirty page tracking" | `docs/cli.md` | It defaults to true; the operator control is `--no-track-dirty`, which the doc does not mention. |
 | `--cpu-baseline` values are host, avx2, sse42 | `docs/cli.md:35` | `native`, `no-avx512`, `sse4.2` and `westmere` are also accepted, case insensitively. |
 | Bootrom grammar is `-l bootrom,<path>|uefi|bios` | `docs/cli.md:74` | The varfile field (`-l bootrom,<rom>,<varfile>`) is omitted entirely, as is the `=`-containing legacy-option field. |
 | Migration examples invoke a binary called `vmm` | `docs/migration.md` | The binary is `rshyve`. |
 | `--migrate-listen 0.0.0.0:4567` as the destination | `docs/migration.md`, `docs/cli.md` | Works only because the CLI flag applies no validation; the `migrate-dest` control command runs the same address through a validator that rejects `0.0.0.0`. Two entry points to one feature disagree. |
-| Control socket has 4-5 commands | `docs/cli.md` | Twenty-one exist (`bin/rshyve/src/control/protocol.rs`), nine of them the hotplug commands. `shutdown`, `reset`, `stop`, `migrate-dest`, `migrate-config`, `metrics` and `metrics-prometheus` are undocumented, as is `migrate-source`'s `zfs_barrier` field. |
+| The documented control commands are the whole set | `docs/cli.md` | Twenty-one exist (`bin/rshyve/src/control/protocol.rs`). `shutdown`, `reset`, `stop`, `migrate-dest`, `migrate-config`, `metrics` and `metrics-prometheus` are documented nowhere, as is `migrate-source`'s `zfs_barrier` field. |
 | `password=<b64>` for fbuf | `docs/platform.md:30` | The value is used verbatim; there is no base64 decode. `docs/devices.md:128` gets it right. |
 | `-s 30:1,xhci,tablet` selects the device | `docs/platform.md:31`, `docs/devices.md:130` | The config field is never read. |
 | Framebuffer/VNC and xHCI are "Complete" and at parity with C bhyve | `docs/status.md:36`, `docs/platform.md:191` | No VGA, no TCP listener, no `wait`, Raw encoding only, one client, one xHCI slot, no scroll wheel, no migration state. |

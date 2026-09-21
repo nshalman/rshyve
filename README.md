@@ -1,8 +1,15 @@
 # rshyve - Rust bhyve VMM for Triton/SmartOS
 
-A Rust userspace VMM for illumos bhyve, CLI-compatible with the C
-`bhyve` command so it can be dropped into a Triton/SmartOS compute node
-in its place. Designed with live migration as a first-class feature.
+A Rust userspace VMM for illumos bhyve. It takes the command line the
+bhyve brand builds, so a Triton/SmartOS zone can run it in place of the
+platform bhyve through the brand's `/bhyve.zone` override. Live
+migration is a first-class feature and C bhyve has none.
+
+It is not all of bhyve. `ahci-hd` is refused at startup, `-D`, `-k` and
+`--json-config` are refused rather than ignored, an unknown `-s` driver
+name is logged and skipped, and a number of device options parse and
+then do nothing. Each one is listed in
+[docs/features.md](docs/features.md#accepted-by-the-cli-and-then-ignored).
 
 **Experimental.** This is not production-supported software. Major
 architectural state is still missing (see
@@ -38,7 +45,8 @@ rshyve -c 2 -m 2G \
 
 ## What the workspace builds
 
-`rshyve` is the full bhyve-parity VMM described above. `firehyve` is a
+`rshyve` is the larger binary: the brand's flag grammar, UEFI boot,
+migration, the control socket and passthrough. `firehyve` is a
 microVM over the same crates: direct kernel boot, virtio devices, and a
 stdio serial console, with no UEFI, migration, control socket or
 passthrough. It shares the flag grammar and rejects what it cannot
