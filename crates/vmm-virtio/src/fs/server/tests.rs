@@ -574,6 +574,8 @@ fn readdirplus(srv: &FuseServer, fh: u64) -> (i32, Vec<PlusEntry>) {
 fn mkfifo(path: &std::path::Path) {
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .expect("path");
+    // SAFETY: `c` owns its NUL-terminated bytes for the whole call,
+    // which only reads them.
     let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
     assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
 }

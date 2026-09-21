@@ -1210,6 +1210,8 @@ fn an_accepted_socket_does_not_keep_the_non_blocking_flag() {
 
     let served = accepted_blocking(inherited).expect("the socket is usable");
 
+    // SAFETY: `served` owns the descriptor and outlives the call, and
+    // F_GETFL takes no pointer argument.
     let flags = unsafe { libc::fcntl(served.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0, "F_GETFL failed");
     assert_eq!(

@@ -59,6 +59,8 @@ pub fn raise_fd_limit() -> std::io::Result<libc::rlim_t> {
         rlim_cur: 0,
         rlim_max: 0,
     };
+    // SAFETY: `lim` is a live `rlimit` this frame owns, and getrlimit
+    // writes at most that one struct through the pointer.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -67,6 +69,7 @@ pub fn raise_fd_limit() -> std::io::Result<libc::rlim_t> {
         return Ok(lim.rlim_cur);
     }
     lim.rlim_cur = target;
+    // SAFETY: the same live struct, which setrlimit only reads.
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -93,7 +96,12 @@ pub(super) fn parse_open_flags(flags: u32) -> PtResult<fuse::OpenFlags> {
 }
 
 pub(super) fn fstat(fd: RawFd) -> PtResult<libc::stat> {
+    // SAFETY: `libc::stat` is a repr(C) struct of integers and arrays
+    // of them, so all zeroes is a valid instance.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is live for the call and fstat writes only that one
+    // struct. A descriptor that is no longer open answers EBADF and
+    // writes nothing.
     let rc = unsafe { libc::fstat(fd, &mut st) };
     if rc != 0 {
         return Err(last_os());
@@ -105,7 +113,10 @@ pub(super) fn fstatat_nofollow(
     parent: RawFd,
     name: &CStr,
 ) -> PtResult<libc::stat> {
+    // SAFETY: as in `fstat`, all zeroes is a valid `libc::stat`.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `name` is a `CStr`, so it is NUL-terminated, and the
+    // caller keeps it alive past the call. fstatat writes only `st`.
     let rc = unsafe {
         libc::fstatat(parent, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
     };
@@ -157,12 +168,16 @@ pub(super) fn open_child(
     };
     let fd = openat_nofollow(parent_fd, name, flags)?;
     let opened = fstat(fd).inspect_err(|_| {
+        // SAFETY: `openat_nofollow` returned `fd` on the line above and
+        // no table holds it yet, so this frame is its only owner.
         unsafe { libc::close(fd) };
     })?;
     if FileType::from_mode(opened.st_mode as u32) != Some(ftype)
         || opened.st_dev != probe.st_dev
         || opened.st_ino != probe.st_ino
     {
+        // SAFETY: `fd` never left this frame, so nothing else can close
+        // it and the number cannot yet name another file.
         unsafe { libc::close(fd) };
         return Err(errno(libc::ESTALE));
     }
@@ -174,6 +189,8 @@ pub(super) fn openat_nofollow(
     name: &CStr,
     flags: libc::c_int,
 ) -> PtResult<RawFd> {
+    // SAFETY: `name` is NUL-terminated and the caller owns it past the
+    // call, which only reads it.
     let fd = unsafe {
         libc::openat(
             parent,
@@ -227,6 +244,8 @@ fn nsec(val: i64) -> u32 {
 /// itself would then trip ELOOP.
 pub(super) fn reopen_fd(fd: RawFd, flags: libc::c_int) -> PtResult<RawFd> {
     let path = CString::new(format!("/proc/self/fd/{fd}")).unwrap();
+    // SAFETY: `path` owns its NUL-terminated bytes for the whole call,
+    // which only reads them.
     let new_fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
     if new_fd < 0 {
         return Err(last_os());
@@ -263,21 +282,29 @@ pub(super) fn build_timespec(
 // errno but doesn't let us clear it; we need the raw pointer for readdir.
 #[cfg(any(target_os = "illumos", target_os = "solaris"))]
 fn errno_ptr() -> *mut libc::c_int {
+    // SAFETY: the accessor takes no argument and returns the address of
+    // this thread's own errno, which libc keeps for the life of the
+    // thread.
     unsafe { libc::___errno() }
 }
 #[cfg(target_os = "linux")]
 fn errno_ptr() -> *mut libc::c_int {
+    // SAFETY: as above, the address of this thread's own errno.
     unsafe { libc::__errno_location() }
 }
 #[cfg(target_os = "macos")]
 fn errno_ptr() -> *mut libc::c_int {
+    // SAFETY: as above, the address of this thread's own errno.
     unsafe { libc::__error() }
 }
 
 pub(super) fn set_errno(v: i32) {
+    // SAFETY: `errno_ptr` gives this thread's own errno slot. It is
+    // aligned, initialized, and not freed while the thread runs.
     unsafe { *errno_ptr() = v };
 }
 
 pub(super) fn get_errno() -> i32 {
+    // SAFETY: the same slot, read from the thread that owns it.
     unsafe { *errno_ptr() }
 }

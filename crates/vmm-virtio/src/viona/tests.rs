@@ -451,6 +451,9 @@ fn stopping_a_poller_wakes_the_thread_and_waits_for_it() {
                 // A closed write end leaves the descriptor ready,
                 // so this returns once and does not spin. The
                 // timeout only stops a broken wake from hanging.
+                // SAFETY: `pfd` is one live `pollfd` and the count says
+                // one, so poll reads and writes only that element. The
+                // thread owns `stop`, so its descriptor stays open.
                 while unsafe { libc::poll(&mut pfd, 1, 10_000) } < 0 {
                     let err = std::io::Error::last_os_error();
                     assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);

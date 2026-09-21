@@ -18,6 +18,8 @@ fn handle_fl(pt: &Passthrough, fh: u64) -> libc::c_int {
     let Some(Handle::File { fd }) = handles.by_id.get(&fh) else {
         panic!("no file handle {fh}");
     };
+    // SAFETY: `fd` is borrowed out of the handle table, so the guard
+    // above keeps the descriptor open, and F_GETFL takes no pointer.
     let fl = unsafe { libc::fcntl(*fd, libc::F_GETFL) };
     assert!(fl >= 0, "F_GETFL failed");
     fl
@@ -164,6 +166,8 @@ fn a_second_opendir_of_the_same_directory_sees_the_same_entries() {
 #[cfg(unix)]
 fn mkfifo(dir: &Path, name: &str) {
     let path = path_cstring(&dir.join(name)).expect("fifo path");
+    // SAFETY: `path` owns its NUL-terminated bytes for the whole call,
+    // which only reads them.
     let rc = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
     assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
 }
@@ -385,6 +389,8 @@ fn the_fd_limit_is_raised_to_the_hard_limit() {
         rlim_cur: 0,
         rlim_max: 0,
     };
+    // SAFETY: `lim` is a live `rlimit` this frame owns, and getrlimit
+    // writes at most that one struct through the pointer.
     assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
     assert_eq!(lim.rlim_cur, soft);
     #[cfg(not(target_os = "macos"))]

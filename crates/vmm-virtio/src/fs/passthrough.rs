@@ -130,6 +130,8 @@ impl Passthrough {
         limits: PtLimits,
     ) -> PtResult<Self> {
         let cpath = path_cstring(path)?;
+        // SAFETY: `cpath` owns its NUL-terminated bytes for the whole
+        // call, which only reads them.
         let fd = unsafe {
             libc::open(
                 cpath.as_ptr(),
@@ -202,6 +204,8 @@ impl Passthrough {
         {
             // Close the fd we just opened; we keep the existing one.
             if let Some(fd) = fd_opt {
+                // SAFETY: `open_child` returned this descriptor and no
+                // table took it, so this frame is its only owner.
                 unsafe { libc::close(fd) };
             }
             if let Some(entry) = inodes.by_id.get_mut(&existing) {
@@ -211,6 +215,8 @@ impl Passthrough {
         } else {
             if inodes.by_id.len() >= self.limits.max_inodes {
                 if let Some(fd) = fd_opt {
+                    // SAFETY: the entry was never inserted, so nothing
+                    // but this frame holds the descriptor.
                     unsafe { libc::close(fd) };
                 }
                 return Err(errno(libc::ENFILE));
@@ -267,6 +273,10 @@ impl Passthrough {
             inodes.by_id.remove(&nodeid);
             inodes.by_devino.remove(&(dev, ino));
             if let Some(fd) = fd {
+                // SAFETY: the entry is already out of both tables, so
+                // this is the last owner of the descriptor. Only the
+                // FUSE worker closes a guest-held fd, so no syscall can
+                // be running on it.
                 unsafe { libc::close(fd) };
             }
             if let Some(p) = parent {
@@ -287,7 +297,12 @@ impl Passthrough {
         let fd = self.with_inode(nodeid, |ino| {
             ino.fd.ok_or_else(|| errno(libc::EBADF))
         })?;
+        // SAFETY: `libc::statvfs` is a repr(C) struct of integers, so
+        // all zeroes is a valid instance.
         let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `vfs` is live for the call and fstatvfs writes only
+        // that struct. A descriptor the worker has since closed answers
+        // EBADF and writes nothing.
         let rc = unsafe { libc::fstatvfs(fd, &mut vfs) };
         if rc != 0 {
             return Err(last_os());
@@ -331,6 +346,9 @@ impl Passthrough {
         })?;
 
         let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: `name` is a NUL-terminated `CString` this frame
+        // holds, and `buf.len()` bounds the write to the PATH_MAX bytes
+        // `buf` really owns. The return is clamped to that length below.
         let n = unsafe {
             libc::readlinkat(
                 pfd,
@@ -377,6 +395,8 @@ impl Passthrough {
         let handle = self.handles.lock().unwrap().remove(fh)?;
         match handle {
             Handle::File { fd, .. } => {
+                // SAFETY: `remove` took the handle out of the table, so
+                // this frame owns the descriptor alone.
                 unsafe { libc::close(fd) };
             }
             Handle::Dir { .. } => {
@@ -396,6 +416,9 @@ impl Passthrough {
             }
         };
         let mut buf = vec![0u8; size as usize];
+        // SAFETY: `buf` is a live allocation of `size` bytes and
+        // `buf.len()` bounds what pread may write into it. The return is
+        // clamped to that length below.
         let n = unsafe {
             libc::pread(
                 fd,
@@ -424,9 +447,12 @@ impl Passthrough {
             openat_nofollow(fd, DOT_DIR, libc::O_RDONLY | libc::O_DIRECTORY)
         })?;
 
-        // Consumes dir_fd.
+        // SAFETY: `dir_fd` is the descriptor `openat_nofollow` just
+        // returned and nothing else holds it, so fdopendir may take it.
         let dirp = unsafe { libc::fdopendir(dir_fd) };
         if dirp.is_null() {
+            // SAFETY: fdopendir failed, so it did not take `dir_fd` and
+            // this frame still owns it.
             unsafe { libc::close(dir_fd) };
             return Err(last_os());
         }
@@ -440,10 +466,14 @@ impl Passthrough {
         let mut entries = Vec::new();
         loop {
             set_errno(0);
+            // SAFETY: `dirp` is the stream fdopendir returned. Every
+            // path that closes it returns at once, so it is open here.
             let entp = unsafe { libc::readdir(dirp) };
             if entp.is_null() {
                 let errno = get_errno();
                 if errno != 0 {
+                    // SAFETY: `dirp` is still open and this is its only
+                    // close on the way out.
                     unsafe { libc::closedir(dirp) };
                     return Err(PtError::Io(
                         std::io::Error::from_raw_os_error(errno),
@@ -452,11 +482,15 @@ impl Passthrough {
                 break;
             }
 
+            // SAFETY: readdir returned non-null, so `entp` points at a
+            // `dirent` the stream owns. The borrow ends with this
+            // iteration, before the next readdir may reuse the storage.
             let dirent = unsafe { &*entp };
-            let name_ptr = dirent.d_name.as_ptr();
-            // SAFETY: d_name is NUL-terminated by dirent semantics.
-            let name_cstr =
-                unsafe { CStr::from_ptr(name_ptr as *const libc::c_char) };
+            let name_ptr = dirent.d_name.as_ptr() as *const libc::c_char;
+            // SAFETY: `d_name` is a NUL-terminated array inside that
+            // same `dirent`, so the string is in bounds and outlives the
+            // `CStr`, which is copied out before the next readdir.
+            let name_cstr = unsafe { CStr::from_ptr(name_ptr) };
             let name_bytes = name_cstr.to_bytes();
             if name_bytes == b"." || name_bytes == b".." {
                 // Skip — FUSE layer doesn't want these (client handles them).
@@ -470,13 +504,17 @@ impl Passthrough {
             };
             bytes = bytes.saturating_add(entry.cost());
             if bytes > budget {
+                // SAFETY: `dirp` is still open and this is its only
+                // close on the way out.
                 unsafe { libc::closedir(dirp) };
                 return Err(errno(libc::ENOMEM));
             }
             entries.push(entry);
         }
 
-        // closedir also closes the underlying fd.
+        // SAFETY: `dirp` is open here and closed once. closedir also
+        // closes the descriptor fdopendir took, so `dir_fd` needs no
+        // close of its own.
         unsafe { libc::closedir(dirp) };
 
         self.handles.lock().unwrap().insert(Handle::Dir {
@@ -490,6 +528,8 @@ impl Passthrough {
         match handle {
             Handle::Dir { .. } => Ok(()),
             Handle::File { fd, .. } => {
+                // SAFETY: `remove` took the handle out of the table, so
+                // this frame owns the descriptor alone.
                 unsafe { libc::close(fd) };
                 Err(errno(libc::EBADF))
             }
@@ -592,6 +632,11 @@ impl Passthrough {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for h in handles.by_id.values() {
             if let Handle::File { fd, .. } = h {
+                // SAFETY: the handle table is the only owner of these
+                // descriptors, and the table is emptied below so none is
+                // closed twice. `reap_retired_session` runs this on the
+                // FUSE worker, and `halt` only after joining it, so no
+                // syscall is in flight on one of them.
                 unsafe { libc::close(*fd) };
             }
         }
@@ -609,6 +654,9 @@ impl Passthrough {
                 return true;
             }
             if let Some(fd) = ino.fd {
+                // SAFETY: `retain` drops the entry that owns this
+                // descriptor, so the close is its last use. The root is
+                // returned above and keeps its own fd.
                 unsafe { libc::close(fd) };
             }
             false
@@ -627,6 +675,9 @@ impl Passthrough {
         let mut first: Option<std::io::Error> = None;
         for h in handles.by_id.values() {
             if let Handle::File { fd, .. } = h {
+                // SAFETY: fsync takes no pointer, and the handle table
+                // holds this descriptor open under the lock this loop
+                // still owns.
                 if unsafe { libc::fsync(*fd) } != 0 && first.is_none() {
                     first = Some(std::io::Error::last_os_error());
                 }
@@ -649,6 +700,9 @@ impl Drop for Passthrough {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for ino in inodes.by_id.values() {
             if let Some(fd) = ino.fd {
+                // SAFETY: `Drop` has the only reference to the tables,
+                // so each descriptor is closed once and nothing can be
+                // using it afterwards.
                 unsafe { libc::close(fd) };
             }
         }
@@ -658,6 +712,7 @@ impl Drop for Passthrough {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for h in handles.by_id.values() {
             if let Handle::File { fd, .. } = h {
+                // SAFETY: as above, the last owner of each descriptor.
                 unsafe { libc::close(*fd) };
             }
         }

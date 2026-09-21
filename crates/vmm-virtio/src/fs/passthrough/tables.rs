@@ -189,6 +189,9 @@ impl HandleTable {
     pub(super) fn insert(&mut self, handle: Handle) -> PtResult<u64> {
         if self.by_id.len() >= self.limits.max_handles {
             if let Handle::File { fd } = handle {
+                // SAFETY: `handle` was moved into this function and is
+                // refused, so it never reaches `by_id` and this frame is
+                // the descriptor's only owner.
                 unsafe { libc::close(fd) };
             }
             return Err(errno(libc::EMFILE));

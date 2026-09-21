@@ -51,6 +51,9 @@ impl Passthrough {
         }
         let effective_mode = (mode & !umask) & 0o7777;
 
+        // SAFETY: `name` is a NUL-terminated `CStr` the caller owns
+        // past the call, which only reads it. The variadic mode argument
+        // is required because `open_flags` carries O_CREAT.
         let fh_fd = unsafe {
             libc::openat(
                 parent_fd,
@@ -63,12 +66,17 @@ impl Passthrough {
             return Err(last_os());
         }
         let st = fstat(fh_fd).inspect_err(|_| {
+            // SAFETY: `fh_fd` is the descriptor the openat above
+            // returned and no table holds it yet, so this frame is its
+            // only owner.
             unsafe { libc::close(fh_fd) };
         })?;
         // O_CREAT opens whatever the name already holds, so the type
         // comes from the descriptor rather than from the assumption
         // that this call made a regular file.
         if FileType::from_mode(st.st_mode as u32) != Some(FileType::Regular) {
+            // SAFETY: `fh_fd` is still this frame's alone; the handle
+            // table never saw it.
             unsafe { libc::close(fh_fd) };
             return Err(PtError::UnsupportedType);
         }
@@ -79,15 +87,25 @@ impl Passthrough {
         // access to it can swap the name in between.
         let ino_fd = openat_nofollow(parent_fd, name, libc::O_RDONLY)
             .inspect_err(|_| {
+                // SAFETY: the second open failed, so `fh_fd` is the one
+                // descriptor this frame still owns.
                 unsafe { libc::close(fh_fd) };
             })?;
         let ino_st = fstat(ino_fd).inspect_err(|_| {
-            unsafe { libc::close(ino_fd) };
-            unsafe { libc::close(fh_fd) };
+            // SAFETY: both descriptors were opened above and neither is
+            // in a table yet, so this frame owns them both and each is
+            // closed once.
+            unsafe {
+                libc::close(ino_fd);
+                libc::close(fh_fd);
+            }
         })?;
         if ino_st.st_dev != st.st_dev || ino_st.st_ino != st.st_ino {
-            unsafe { libc::close(ino_fd) };
-            unsafe { libc::close(fh_fd) };
+            // SAFETY: as above, this frame is the only owner of both.
+            unsafe {
+                libc::close(ino_fd);
+                libc::close(fh_fd);
+            }
             return Err(errno(libc::ESTALE));
         }
 
@@ -97,6 +115,9 @@ impl Passthrough {
             if let Some(&existing) = inodes.by_devino.get(&(dev, ino)) {
                 // Surprisingly, this can happen with O_EXCL absent: guest
                 // may race two creates. Keep the existing ino_fd.
+                // SAFETY: the cached entry keeps its own descriptor,
+                // and `ino_fd` was never inserted, so this frame is its
+                // only owner.
                 unsafe { libc::close(ino_fd) };
                 if let Some(entry) = inodes.by_id.get_mut(&existing) {
                     entry.lookups = entry.lookups.saturating_add(1);
@@ -105,8 +126,12 @@ impl Passthrough {
             } else {
                 if inodes.by_id.len() >= self.limits.max_inodes {
                     drop(inodes);
-                    unsafe { libc::close(ino_fd) };
-                    unsafe { libc::close(fh_fd) };
+                    // SAFETY: neither descriptor reached a table, so
+                    // this frame owns both and closes each once.
+                    unsafe {
+                        libc::close(ino_fd);
+                        libc::close(fh_fd);
+                    }
                     return Err(errno(libc::ENFILE));
                 }
                 let id = inodes.alloc_id();
@@ -170,6 +195,8 @@ impl Passthrough {
         }
         let parent_fd = self.parent_fd(parent)?;
         let effective_mode = (mode & !umask) & 0o7777;
+        // SAFETY: `name` is NUL-terminated and owned by the caller past
+        // the call. O_CREAT is set, so the variadic mode is required.
         let fd = unsafe {
             libc::openat(
                 parent_fd,
@@ -185,6 +212,9 @@ impl Passthrough {
         if fd < 0 {
             return Err(last_os());
         }
+        // SAFETY: the node is on disk now and `fd` was only used to
+        // create it, so this frame is its only owner. `lookup` opens the
+        // name again for the inode table.
         unsafe { libc::close(fd) };
         self.lookup(parent, name)
     }
@@ -203,6 +233,8 @@ impl Passthrough {
         }
         let parent_fd = self.parent_fd(parent)?;
         let effective_mode = (mode & !umask) & 0o7777;
+        // SAFETY: `name` is NUL-terminated and outlives the call, which
+        // only reads it.
         let rc = unsafe {
             libc::mkdirat(
                 parent_fd,
@@ -223,6 +255,8 @@ impl Passthrough {
             return Err(PtError::ReadOnly);
         }
         let parent_fd = self.parent_fd(parent)?;
+        // SAFETY: `name` is NUL-terminated and outlives the call, which
+        // only reads it.
         let rc = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
         if rc != 0 {
             return Err(last_os());
@@ -237,6 +271,8 @@ impl Passthrough {
             return Err(PtError::ReadOnly);
         }
         let parent_fd = self.parent_fd(parent)?;
+        // SAFETY: `name` is NUL-terminated and outlives the call, which
+        // only reads it.
         let rc = unsafe {
             libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR)
         };
@@ -266,6 +302,8 @@ impl Passthrough {
         }
         let old_pfd = self.parent_fd(old_parent)?;
         let new_pfd = self.parent_fd(new_parent)?;
+        // SAFETY: both names are NUL-terminated `CStr`s the caller owns
+        // past the call, which only reads them.
         let rc = unsafe {
             libc::renameat(
                 old_pfd,
@@ -295,6 +333,8 @@ impl Passthrough {
             return Err(PtError::InvalidName(Vec::new()));
         }
         let parent_fd = self.parent_fd(parent)?;
+        // SAFETY: `target` and `name` are NUL-terminated `CStr`s the
+        // caller owns past the call, which only reads them.
         let rc = unsafe {
             libc::symlinkat(target.as_ptr(), parent_fd, name.as_ptr())
         };
@@ -327,6 +367,8 @@ impl Passthrough {
         // the old parent, so the name is not resolved a second time and
         // cannot have become another file in between.
         let path = CString::new(format!("/proc/self/fd/{old_fd}")).unwrap();
+        // SAFETY: `path` and `new_name` are NUL-terminated and live for
+        // the whole call, which only reads them.
         let rc = unsafe {
             libc::linkat(
                 libc::AT_FDCWD,
@@ -376,8 +418,11 @@ impl Passthrough {
         };
 
         if valid & fuse::FATTR_MODE != 0 {
-            let rc =
-                unsafe { libc::fchmod(fd, (mode & 0o7777) as libc::mode_t) };
+            let m = (mode & 0o7777) as libc::mode_t;
+            // SAFETY: fchmod takes no pointer. `fd` names a descriptor
+            // the handle or inode table holds open, and only the FUSE
+            // worker closes one of those.
+            let rc = unsafe { libc::fchmod(fd, m) };
             if rc != 0 {
                 return Err(last_os());
             }
@@ -393,12 +438,16 @@ impl Passthrough {
             } else {
                 (-1i32) as libc::gid_t
             };
+            // SAFETY: as above, no pointer crosses the boundary and the
+            // descriptor is held open by a table.
             let rc = unsafe { libc::fchown(fd, u, g) };
             if rc != 0 {
                 return Err(last_os());
             }
         }
         if valid & fuse::FATTR_SIZE != 0 {
+            // SAFETY: as above, no pointer crosses the boundary and the
+            // descriptor is held open by a table.
             let rc = unsafe { libc::ftruncate(fd, size as libc::off_t) };
             if rc != 0 {
                 return Err(last_os());
@@ -424,6 +473,8 @@ impl Passthrough {
                 mtime.1,
             );
             let times = [a, m];
+            // SAFETY: `times` is a live two-element array, which is
+            // exactly what futimens reads, and it only reads it.
             let rc = unsafe { libc::futimens(fd, times.as_ptr()) };
             if rc != 0 {
                 return Err(last_os());
@@ -447,6 +498,8 @@ impl Passthrough {
                 None => return Err(PtError::UnknownHandle(fh)),
             }
         };
+        // SAFETY: `data` is a live slice and `data.len()` bounds what
+        // pwrite may read from it. The call does not keep the pointer.
         let n = unsafe {
             libc::pwrite(
                 fd,
@@ -480,6 +533,8 @@ impl Passthrough {
                 target_os = "illumos",
                 target_os = "solaris"
             ))]
+            // SAFETY: fdatasync takes no pointer, and the handle table
+            // holds this descriptor open.
             unsafe {
                 libc::fdatasync(fd)
             }
@@ -488,10 +543,14 @@ impl Passthrough {
                 target_os = "illumos",
                 target_os = "solaris"
             )))]
+            // SAFETY: the host has no fdatasync; fsync takes no pointer
+            // and the handle table holds this descriptor open.
             unsafe {
                 libc::fsync(fd)
             }
         } else {
+            // SAFETY: fsync takes no pointer, and the handle table holds
+            // this descriptor open.
             unsafe { libc::fsync(fd) }
         };
         if rc != 0 {
