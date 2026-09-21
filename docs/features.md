@@ -603,9 +603,9 @@ Absent, with no partial path:
 
 ### Accepted by the CLI and then ignored
 
-These parse without complaint and do nothing. Each one is a way to believe you configured something you did not.
-
 Three C bhyve flags are refused instead of ignored, so an operator who puts one in `bhyve_extra_opts` gets an error rather than a VM that is not what was asked for: `-D` (destroy on power-off), `-k` and `--json-config` (`crates/vmm-config/src/lib.rs:10`). `boot.c` passes none of the three. The instance is reclaimed when the process exits whatever `-D` would have said, because the VMM arms the kernel autodestruct flag on every VM.
+
+These parse without complaint and do nothing. Each one is a way to believe you configured something you did not.
 
 | Input | Reality |
 |---|---|
