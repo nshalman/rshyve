@@ -73,7 +73,9 @@ fn bind_owned(
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
+    let mut created_parent = false;
     if let Some(parent) = parent {
+        created_parent = !parent.exists();
         let mut builder = DirBuilder::new();
         builder.recursive(true).mode(policy.dir_mode);
         builder.create(parent)?;
@@ -103,15 +105,25 @@ fn bind_owned(
         // chowned without following: the stale-socket check above
         // refused a symlink, and this keeps it refused.
         let give = || -> io::Result<()> {
-            if let Some(parent) = parent {
-                chown(parent, Some(owner.uid), Some(owner.gid))?;
+            // Only a directory this bind made changes hands: a shared
+            // parent given away would let the owner unlink what other
+            // processes keep there.
+            if created_parent {
+                if let Some(parent) = parent {
+                    chown(parent, Some(owner.uid), Some(owner.gid))?;
+                }
             }
             lchown(path, Some(owner.uid), Some(owner.gid))
         };
-        if let Err(error) = give() {
-            return Err(remove_after_error(path, error));
+        match give() {
+            Ok(()) => expected_uid = owner.uid,
+            // A zone's privilege floor has no file_chown. The socket then
+            // keeps the binding identity; the launcher gives the directory
+            // to the owner before boot, so the dropped process can still
+            // unlink and rebind under it.
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(error) => return Err(remove_after_error(path, error)),
         }
-        expected_uid = owner.uid;
     }
 
     verify_bound_path(path, policy.mode, expected_uid)?;
@@ -548,6 +560,24 @@ mod tests {
         assert_eq!(dir.uid(), owner.uid);
         assert_eq!(dir.gid(), owner.gid);
         assert_eq!(dir.permissions().mode() & 0o777, 0o700);
+    }
+
+    /// A parent that already existed is not given away: only the socket
+    /// changes hands.
+    #[test]
+    fn a_pre_existing_parent_keeps_its_owner() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let parent = temp.path().join("shared");
+        fs::create_dir(&parent).expect("create the parent first");
+        let before = fs::metadata(&parent).expect("stat parent").uid();
+        let path = parent.join("control.sock");
+        let owner = test_owner();
+
+        let _listener = bind_owned(&path, SocketPolicy::default(), Some(owner))
+            .expect("bind with an owner");
+
+        let dir = fs::metadata(&parent).expect("stat parent directory");
+        assert_eq!(dir.uid(), before);
     }
 
     /// Without an owner the bind leaves the process's own ids, so a
