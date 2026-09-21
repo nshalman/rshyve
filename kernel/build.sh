@@ -5,6 +5,7 @@
 # Usage: ./build.sh [kernel_version]
 # Output: ./vmlinuz-fastboot  bzImage, gzip self-decompressing
 #         ./vmlinux-fastboot  uncompressed ELF with the PVH entry note
+#         ./config-fastboot   the .config the two were built from
 #
 # KERNEL_EXTRA_CONFIG layers further config fragments on fastboot.config
 # and KERNEL_OUT_SUFFIX renames the output, which builds a variant
@@ -121,6 +122,23 @@ for frag in \$EXTRA; do
     done
 done
 
+# The same hazard in reverse, and the one that matters for a guest that
+# runs untrusted code: a fragment that turns an option OFF must win,
+# because olddefconfig turns a \"default y\" option back on. Nothing else
+# reports it. The kernel builds, boots, and carries the hole.
+#
+# Only the EXTRA fragments are read. fastboot.config states its own
+# \"is not set\" lines to keep the one-shot payload small, and a later
+# fragment is meant to override them.
+for frag in \$EXTRA; do
+    for sym in \$(sed -n 's/^# \(CONFIG_[A-Z0-9_]*\) is not set\$/\1/p' /build/\$frag); do
+        ! grep -q \"^\$sym=\" .config || {
+            echo \"BUILD-FAIL: \$sym was re-enabled by olddefconfig\"
+            exit 1
+        }
+    done
+done
+
 # Build
 make ARCH=x86_64 -j\$(nproc) bzImage 2>&1 | tail -20
 
@@ -128,6 +146,10 @@ make ARCH=x86_64 -j\$(nproc) bzImage 2>&1 | tail -20
 # carrying the PVH entry survives.
 cp arch/x86_64/boot/bzImage /build/vmlinuz-fastboot${OUT_SUFFIX}
 objcopy --strip-all vmlinux /build/vmlinux-fastboot${OUT_SUFFIX}
+
+# The resolved config, so a caller can assert on the options it asked
+# for without a container, and an operator can diff two guest kernels.
+cp .config /build/config-fastboot${OUT_SUFFIX}
 
 readelf -n /build/vmlinux-fastboot${OUT_SUFFIX} | grep -qi xen || {
     echo 'BUILD-FAIL: vmlinux carries no Xen PVH note'

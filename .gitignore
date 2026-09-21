@@ -5,6 +5,8 @@ target/
 kernel/linux-*.tar.xz*
 kernel/vmlinuz-*
 kernel/vmlinux-*
+kernel/config-fastboot*
+kernel/SHA256SUMS*
 
 # Agent and editor scratch state
 /.claude/
