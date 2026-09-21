@@ -32,7 +32,6 @@ mod input;
 mod mdata;
 mod msix;
 mod pcidev;
-mod peercred;
 mod reboot;
 mod secret;
 mod serial;

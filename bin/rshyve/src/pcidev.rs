@@ -74,7 +74,7 @@ pub fn init_pci_devices(
 /// SECURITY: this is the same closure argv drives, so a control request
 /// can name no driver and no path that a command line could not. It
 /// does open a host file that a socket peer chose, which is authority
-/// equal to argv. The peercred check in `control::listener` is what
+/// equal to argv. The peer gate in `vmm_core::unixsock::accept` is what
 /// grants it: the peer must share this process's uid and be in this
 /// zone or the global zone.
 pub fn hotplug_factory(

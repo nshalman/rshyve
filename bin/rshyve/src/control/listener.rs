@@ -18,7 +18,6 @@ use vmm_core::unixsock::{accept, write_all_bounded};
 use super::dispatch::dispatch;
 use super::protocol::{Command, Response};
 use super::{ControlError, VmController};
-use crate::peercred::PeerCred;
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 8;
@@ -184,27 +183,6 @@ fn serve_connections<F>(
     });
 }
 
-/// illumos global zone id. A global-zone peer already has full authority
-/// over this zone, so refusing it would protect nothing and would break
-/// a global-zone orchestrator, which drives the control socket of a VMM
-/// inside a zone.
-const GLOBAL_ZONEID: i32 = 0;
-
-fn peer_is_authorized(peer: &PeerCred, euid: u32, zoneid: Option<i32>) -> bool {
-    if peer.uid != euid {
-        return false;
-    }
-    match (peer.zoneid, zoneid) {
-        (Some(peer_zone), Some(own_zone)) => {
-            peer_zone == own_zone || peer_zone == GLOBAL_ZONEID
-        }
-        // Platforms without zones: the uid check is the whole policy.
-        (None, None) => true,
-        // One side reported a zone and the other did not. Fail closed.
-        _ => false,
-    }
-}
-
 fn request_too_large() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -283,14 +261,10 @@ fn handle_connection(
     stream: &UnixStream,
     log: &Logger,
 ) -> Result<(), ControlError> {
-    let peer = crate::peercred::peer_cred(stream)?;
-    let euid = unsafe { libc::geteuid() };
-    let zoneid = crate::peercred::process_zoneid()?;
-    if !peer_is_authorized(&peer, euid, zoneid) {
-        warn!(log, "rejected control connection"; "uid" => peer.uid);
-        return Ok(());
-    }
-
+    // The accept loop already applied the process peer policy
+    // (`vmm_core::unixsock::peercred`), so a socket that reaches here
+    // is this process's own uid in its zone, or root in the global
+    // zone.
     let mut reader = BufReader::new(stream);
     let mut request = Vec::with_capacity(256);
 
@@ -403,80 +377,6 @@ mod tests {
 
         assert!(present);
         assert_eq!(request.len(), MAX_REQUEST_BYTES - 1);
-    }
-
-    #[test]
-    fn peer_authorization_checks_uid_and_zone() {
-        let local = PeerCred {
-            uid: 42,
-            gid: 7,
-            zoneid: None,
-        };
-        let foreign_uid = PeerCred {
-            uid: 43,
-            gid: 7,
-            zoneid: None,
-        };
-        let same_zone = PeerCred {
-            uid: 42,
-            gid: 7,
-            zoneid: Some(3),
-        };
-        let foreign_zone = PeerCred {
-            uid: 42,
-            gid: 7,
-            zoneid: Some(4),
-        };
-
-        assert!(peer_is_authorized(&local, 42, None));
-        assert!(!peer_is_authorized(&foreign_uid, 42, None));
-        assert!(peer_is_authorized(&same_zone, 42, Some(3)));
-        assert!(!peer_is_authorized(&foreign_zone, 42, Some(3)));
-    }
-
-    #[test]
-    fn global_zone_peer_is_authorized_against_a_zoned_vmm() {
-        // A migration orchestrator runs in the GZ and drives the control
-        // socket of a VMM inside a zone. Rejecting it would break migration.
-        let gz_peer = PeerCred {
-            uid: 0,
-            gid: 0,
-            zoneid: Some(GLOBAL_ZONEID),
-        };
-        assert!(peer_is_authorized(&gz_peer, 0, Some(7)));
-
-        // A sibling zone is still refused.
-        let sibling = PeerCred {
-            uid: 0,
-            gid: 0,
-            zoneid: Some(8),
-        };
-        assert!(!peer_is_authorized(&sibling, 0, Some(7)));
-
-        // A GZ peer with the wrong uid is still refused.
-        let wrong_uid = PeerCred {
-            uid: 1,
-            gid: 0,
-            zoneid: Some(GLOBAL_ZONEID),
-        };
-        assert!(!peer_is_authorized(&wrong_uid, 0, Some(7)));
-    }
-
-    #[test]
-    fn mismatched_zone_reporting_fails_closed() {
-        let zoned = PeerCred {
-            uid: 0,
-            gid: 0,
-            zoneid: Some(0),
-        };
-        assert!(!peer_is_authorized(&zoned, 0, None));
-
-        let unzoned = PeerCred {
-            uid: 0,
-            gid: 0,
-            zoneid: None,
-        };
-        assert!(!peer_is_authorized(&unzoned, 0, Some(0)));
     }
 
     /// A client that stops reading must not hold its connection, and

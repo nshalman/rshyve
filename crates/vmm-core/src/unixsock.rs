@@ -6,6 +6,7 @@
 //! accept loop every listener in this workspace runs.
 
 pub mod accept;
+pub mod peercred;
 
 use std::fs::{self, DirBuilder, Permissions};
 use std::io;
