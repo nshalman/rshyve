@@ -790,3 +790,44 @@ intended to catch):
 - **SSH host key changed**: after reprovisioning, drop the stale entry with `ssh-keygen -R <host>` and verify the new fingerprint out of band. Do not disable host key checking.
 - **rsync doesn't trigger rebuild**: Use `--checksum` flag or `touch` changed source files
 - **fio "Unable to locate package"**: Need `apt-get update` + `add-apt-repository universe` first
+
+## M1: one command through a confined firehyve on a compute node
+
+Run 2026-09-21 on a prod-01 compute node (PI joyent_20260915T170752Z),
+firehyve `0.1.0 (3faf9c0-dirty)` from this branch as the init of a
+bhyve-brand zone through `/bhyve.zone`, the CI sandbox kernel
+(sha256 `23ddb7f2…`), an initramfs holding the guest agent as `/init`
+and busybox, and `bhyve-extra-opts`:
+
+    --kernel /tmp/k --initrd /tmp/i --cmdline-base64 <b64>
+    -s 17,virtio-vsock,/tmp/v.sock,cid=3 -S --no-track-dirty
+
+Observed:
+
+- `zoneadm boot` returned in 1264 ms; `/dev/vmm/SYSbhyve-5` present while
+  the zone ran and gone after halt.
+- firehyve: `virtio-vsock attached, socket: /tmp/v.sock, cid: 3, bdf: 0.17.0`;
+  `kernel loaded … load_us: 11102`; `privilege drop: on, sets:
+  E=P=L={file_read,proc_clock_highres} I={} uid=8123 gid=8123`; `ppriv` on
+  the process agreed, `ps` showed uid and gid 8123.
+- Guest: `Run /init as init process` at 0.46 s of guest time; the agent
+  logged `boot spec loaded sandbox_id=m1-probe` and listened on vsock port 1.
+- Host probe over the Firecracker socket protocol: `CONNECT 1` answered
+  `OK 49152`; Hello accepted; `Open{exec /bin/sh -c 'exit 7'}` returned
+  `exited exit_code=7`; the round trip took 14 ms. A Hello with a wrong
+  sandbox id was refused with `unauthorized`.
+
+Three facts the launcher must honour, found on this run:
+
+1. The zone needs `limitpriv=default,proc_setid`. The bhyve brand's default
+   limit set has no `proc_setid`, and the lock cannot put it into P.
+2. The brand floor has no `file_chown`, so the listener chown to the run-as
+   ids fails with EPERM. The bind now tolerates that; the launcher gives the
+   zone's `/tmp` to 8123:8123 before boot if the dropped process must be
+   able to unlink and rebind under it.
+3. zonecfg refuses a string attr above about 256 bytes (217 passed, 317
+   failed), so `bhyve-extra-opts` carries only a minimal spec; a full spec
+   needs another channel.
+
+Not exercised: the socket ownership branch of the peer policy (the socket
+stayed root-owned), a root disk, a NIC, and PTY.
