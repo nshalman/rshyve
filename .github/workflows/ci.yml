@@ -314,18 +314,42 @@ jobs:
       # resolves in no clone, because the build script ran git on a
       # build host that holds no repository. An operator who cannot map
       # a running VMM to a commit cannot tell which code runs a guest.
-      - name: no build script takes the revision from git
+      - run: tools/check-build-stamp.sh
+      # A gate nobody has watched fail is not known to work, and this
+      # one had two blind spots: it read the wrappers and not the file
+      # that holds the rule, and grep exits 2 on a missing file, which
+      # `if grep` reads as "no match". Both run here.
+      - name: the gate notices a build script that reads git, and one that moved
         run: |
           set -euo pipefail
-          for f in bin/firehyve/build.rs bin/rshyve/build.rs; do
-            if grep -nE 'rev-parse|process::Command|Command::new' "$f"; then
-              echo "$f reads the revision from git again" >&2
-              exit 1
-            fi
-          done
-      # rshyve is covered by the step above only. A release build of it
-      # here would drive the libtpms autotools build a second time, and
-      # both binaries share one build_rev.rs.
+          tmp="$(mktemp -d)"
+          saved="$tmp/saved.rs"
+          trap 'rm -rf "$tmp"' EXIT
+          git archive HEAD | tar -x -C "$tmp"
+          cd "$tmp"
+          tools/check-build-stamp.sh
+          rule=crates/vmm-machine/src/build_rev.rs
+          cp "$rule" "$saved"
+          printf 'fn f() { let _ = std::process::Command::new("git"); }\n' >> "$rule"
+          if tools/check-build-stamp.sh; then
+            echo "the gate passed with the shared rule reading git" >&2
+            exit 1
+          fi
+          cp "$saved" "$rule"
+          tools/check-build-stamp.sh
+          rm bin/rshyve/build.rs
+          if tools/check-build-stamp.sh; then
+            echo "the gate passed with a build script gone" >&2
+            exit 1
+          fi
+      # The driver half of the stamp decides what the binary names, and
+      # it has failed twice: a git that answered for the repository
+      # above the tree, and a status that local configuration blinded.
+      - run: tools/build-rev-test.sh
+      - run: shellcheck -S warning tools/*.sh
+      # rshyve shares the rule and is asserted in the `binaries` job: a
+      # release build of it here would drive the libtpms autotools
+      # build a second time.
       - name: a release build carries the commit it was built from
         run: |
           set -euo pipefail
@@ -338,7 +362,22 @@ jobs:
             *) echo "expected a version naming $rev, got: $out" >&2; exit 1 ;;
           esac
           [ "$(git cat-file -t "$rev")" = commit ]
-      # Watch the fallback before trusting the step above: a build the
+      # The driver builds from a working tree, not from a commit, so
+      # the marker it appends has to survive to the binary: an operator
+      # reading a bare commit name on a modified tree is told the wrong
+      # thing.
+      - name: a build from a changed tree says so
+        run: |
+          set -euo pipefail
+          rev="$(git rev-parse --short HEAD)-dirty"
+          TRITON_BUILD_REV="$rev" cargo build --locked --release -p firehyve
+          out="$(./target/release/firehyve --version)"
+          echo "$out"
+          case "$out" in
+            *"($rev)") ;;
+            *) echo "expected a version naming $rev, got: $out" >&2; exit 1 ;;
+          esac
+      # Watch the fallback before trusting the steps above: a build the
       # driver did not stamp must say so rather than name a commit it
       # cannot prove.
       - name: an unstamped build says unstamped
