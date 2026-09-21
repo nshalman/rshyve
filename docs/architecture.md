@@ -1,7 +1,9 @@
 # Architecture
 
-Two binaries over one set of library crates. `rshyve` is the full
-bhyve-parity VMM; `firehyve` is a microVM with a short device catalog.
+Two binaries over one set of library crates. `rshyve` is the larger
+one: the zone brand's flag grammar, UEFI boot, migration, the control
+socket and passthrough. `firehyve` is a microVM with a short device
+catalog.
 The crate split is what keeps them apart: `firehyve` has no dependency
 path to the parity-only crates, and CI enforces that with `cargo-deny`
 scoped to its manifest (`deny-firehyve.toml`).
