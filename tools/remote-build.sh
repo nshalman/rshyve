@@ -74,7 +74,8 @@ SSH=(ssh -o ConnectTimeout=15 -i "$KEY" "$HOST")
 
 # /opt/tools/bin and /opt/local/bin hold the pkgsrc toolchain (cargo, gcc,
 # autoconf, gmake, pkg-config); none of them are on root's default PATH.
-REMOTE_ENV="export PATH=/opt/tools/bin:/opt/local/bin:/usr/bin:/usr/sbin:\$PATH; cd $REMOTE_DIR"
+REMOTE_BASE="export PATH=/opt/tools/bin:/opt/local/bin:/usr/bin:/usr/sbin:\$PATH; cd $REMOTE_DIR"
+REMOTE_ENV="$REMOTE_BASE"
 # The value is spliced into a command a remote root shell parses. It
 # passed the object-name check above, so it carries no quote, and the
 # quotes here hold whatever a later caller sends to one word.
@@ -187,7 +188,10 @@ case "$cmd" in
         remote "./target/release/rshyve $*" 2>&1
         ;;
     sh)
-        remote "$*" 2>&1
+        # No sync and no lock, so the tree on the host is whatever the
+        # last caller left. A stamp from this driver's HEAD would name
+        # code that may not be there; leave it unstamped instead.
+        "${SSH[@]}" "$REMOTE_BASE; $*" 2>&1
         ;;
     -h|--help|help)
         usage
