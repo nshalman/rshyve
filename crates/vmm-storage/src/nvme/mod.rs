@@ -528,6 +528,7 @@ impl Lifecycle for NvmeController {
             tail: cq.tail,
             phase: cq.phase,
             iv: cq.iv,
+            ien: cq.ien,
         };
 
         slog::info!(self.log, "nvme: exporting controller state";
@@ -617,7 +618,7 @@ impl Lifecycle for NvmeController {
             tail: cq.tail,
             phase: cq.phase,
             iv: cq.iv,
-            ien: true,
+            ien: cq.ien,
             instance,
         };
 
@@ -681,10 +682,24 @@ fn check_nvme_state(
         Ok(())
     }
 
+    fn check_vector(what: &str, iv: u16) -> Result<(), DeviceStateError> {
+        // `MsixTable::fire` drops a vector the table does not hold, so
+        // the queue would never raise and its I/O would hang. Create
+        // I/O Completion Queue refuses the same value.
+        if iv >= NVME_MSIX_COUNT {
+            return Err(DeviceStateError::invalid(format!(
+                "{what} interrupt vector {iv} is outside \
+                 0..{NVME_MSIX_COUNT}",
+            )));
+        }
+        Ok(())
+    }
+
     let check_cq =
         |what: &str, cq: &NvmeMigrateCq| -> Result<(), DeviceStateError> {
             check_size(what, cq.size)?;
             check_cursors(what, cq.size, cq.head, cq.tail)?;
+            check_vector(what, cq.iv)?;
             check_base(what, cq.base)
         };
 
