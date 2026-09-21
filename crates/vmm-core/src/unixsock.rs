@@ -12,7 +12,7 @@ use std::fs::{self, DirBuilder, Permissions};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::{
-    DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt,
+    chown, lchown, DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt,
 };
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -20,6 +20,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::poll::wait_writable;
+use peercred::ListenerOwner;
 
 static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
@@ -46,18 +47,33 @@ impl Default for SocketPolicy {
 /// [`remove_stale_socket`] for what else may be at the path. Any failure
 /// after the socket is bound removes the socket path before the error
 /// is returned.
+///
+/// When the process peer policy names an owner, the path and its
+/// directory are given to it here, before the privilege drop that
+/// policy describes: a socket left root-owned would be one the dropped
+/// process can neither unlink nor rebind.
 pub fn bind_restricted(
     path: &Path,
     policy: SocketPolicy,
+) -> io::Result<UnixListener> {
+    bind_owned(path, policy, peercred::policy().owner)
+}
+
+/// [`bind_restricted`] with the owner given, so the chown can be tested
+/// without installing a process-wide policy.
+fn bind_owned(
+    path: &Path,
+    policy: SocketPolicy,
+    owner: Option<ListenerOwner>,
 ) -> io::Result<UnixListener> {
     let _guard = UMASK_LOCK
         .lock()
         .map_err(|_| io::Error::other("socket umask lock poisoned"))?;
 
-    if let Some(parent) = path
+    let parent = path
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
         let mut builder = DirBuilder::new();
         builder.recursive(true).mode(policy.dir_mode);
         builder.create(parent)?;
@@ -79,7 +95,26 @@ pub fn bind_restricted(
         return Err(remove_after_error(path, error));
     }
 
-    verify_bound_path(path, policy.mode, unsafe { libc::geteuid() })?;
+    // SAFETY: geteuid takes no argument and cannot fail.
+    let mut expected_uid = unsafe { libc::geteuid() };
+    if let Some(owner) = owner {
+        // The directory first: a socket the owner holds in a directory
+        // it cannot write is still one it cannot unlink. The socket is
+        // chowned without following: the stale-socket check above
+        // refused a symlink, and this keeps it refused.
+        let give = || -> io::Result<()> {
+            if let Some(parent) = parent {
+                chown(parent, Some(owner.uid), Some(owner.gid))?;
+            }
+            lchown(path, Some(owner.uid), Some(owner.gid))
+        };
+        if let Err(error) = give() {
+            return Err(remove_after_error(path, error));
+        }
+        expected_uid = owner.uid;
+    }
+
+    verify_bound_path(path, policy.mode, expected_uid)?;
     Ok(listener)
 }
 
@@ -471,6 +506,62 @@ mod tests {
             & 0o777;
 
         assert_eq!(mode, 0o700);
+    }
+
+    /// The identity to give a socket to in a test: a real second id
+    /// when the test runs as root, and otherwise the test's own, which
+    /// still runs the chown and the verify against the owner.
+    fn test_owner() -> ListenerOwner {
+        // SAFETY: geteuid and getegid take no argument and cannot fail.
+        let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        if euid == 0 {
+            ListenerOwner {
+                uid: 8123,
+                gid: 8123,
+            }
+        } else {
+            ListenerOwner {
+                uid: euid,
+                gid: egid,
+            }
+        }
+    }
+
+    /// The socket and its directory belong to the identity the process
+    /// will drop to, so the dropped process can still unlink and
+    /// rebind them.
+    #[test]
+    fn an_owner_takes_the_socket_and_its_directory() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let parent = temp.path().join("private");
+        let path = parent.join("control.sock");
+        let owner = test_owner();
+
+        let _listener = bind_owned(&path, SocketPolicy::default(), Some(owner))
+            .expect("bind with an owner");
+
+        let socket = fs::metadata(&path).expect("stat socket");
+        assert_eq!(socket.uid(), owner.uid);
+        assert_eq!(socket.gid(), owner.gid);
+        assert_eq!(socket.permissions().mode() & 0o777, 0o600);
+        let dir = fs::metadata(&parent).expect("stat parent directory");
+        assert_eq!(dir.uid(), owner.uid);
+        assert_eq!(dir.gid(), owner.gid);
+        assert_eq!(dir.permissions().mode() & 0o777, 0o700);
+    }
+
+    /// Without an owner the bind leaves the process's own ids, so a
+    /// binary that never drops changes nothing it did not create.
+    #[test]
+    fn no_owner_keeps_the_binding_identity() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("control.sock");
+
+        let _listener = bind_owned(&path, SocketPolicy::default(), None)
+            .expect("bind without an owner");
+
+        let socket = fs::metadata(&path).expect("stat socket");
+        assert_eq!(socket.uid(), unsafe { libc::geteuid() });
     }
 
     #[test]

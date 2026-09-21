@@ -5,25 +5,14 @@
 //! Peer credentials for every Unix socket this workspace listens on,
 //! and the one policy that admits a peer.
 //!
-//! # The fact the policy is built on
-//!
-//! On illumos `getpeerucred(3C)` returns the credential the connecting
-//! process held when it opened its endpoint (`tl_open` in
-//! `uts/common/io/tl.c` keeps `credp`, and `crgetzoneid` reads
-//! `cr_zone`). The path the peer connected through plays no part. So a
-//! global-zone process that connects to `/zones/<S>/root/tmp/x.sock`
-//! is reported with zone id 0, never with the zone's own id. A rule of
-//! "same zone id only" would refuse the CN agent on every connection.
-//! The rule here admits two peers and nothing else:
-//!
-//! - the process's own uid in its own zone, which after the sandbox
-//!   privilege drop is the VMM itself and nothing that did not escape
-//!   it;
-//! - uid 0 in the global zone, which already owns the zone.
-//!
-//! A platform without zones reports no zone id, and there the uid is
-//! the whole policy. One side reporting a zone and the other not is
-//! refused: a credential that cannot be compared admits nobody.
+//! The policy admits the process's own uid in its own zone, which after
+//! the sandbox drop is the VMM itself, and uid 0 in the global zone,
+//! which owns the zone. A global-zone peer is reported with zone id 0
+//! whatever path it connected through: `getpeerucred(3C)` returns the
+//! credential the peer held when it opened its endpoint, not one
+//! derived from the path. A same-zone-only rule would refuse the CN
+//! agent. A platform without zones checks the uid alone, and a
+//! credential that cannot be compared admits nobody.
 
 use std::io;
 use std::os::fd::AsRawFd;
@@ -41,28 +30,41 @@ pub struct PeerCred {
     pub zoneid: Option<i32>,
 }
 
-/// Who a listener in this process admits.
+/// The identity a process drops to after its listeners are bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListenerOwner {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Who a listener in this process admits, and who owns its path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerPolicy {
     /// The uid this process runs as, or will run as once it drops.
     pub uid: u32,
     /// This process's zone, or `None` on a platform without zones.
     pub zoneid: Option<i32>,
+    /// The ids every listener path and its directory are chowned to at
+    /// bind, when the process will drop to them. `None` keeps what the
+    /// bind made, which the process already owns.
+    pub owner: Option<ListenerOwner>,
 }
 
 impl PeerPolicy {
     /// The policy for this process, as it is now or as it will be
-    /// after a privilege drop to `run_as_uid`.
+    /// after a privilege drop to `run_as`.
     ///
     /// The devices bind their sockets before the drop, so the policy
-    /// has to name the uid the process ends at, not the one it starts
-    /// with.
-    pub fn for_process(run_as_uid: Option<u32>) -> io::Result<Self> {
+    /// has to name the identity the process ends at, not the one it
+    /// starts with: the accept loop admits that uid, and the bind gives
+    /// the path to it so the process can still unlink or rebind it.
+    pub fn for_process(run_as: Option<ListenerOwner>) -> io::Result<Self> {
         // SAFETY: geteuid takes no argument and cannot fail.
         let euid = unsafe { libc::geteuid() };
         Ok(Self {
-            uid: run_as_uid.unwrap_or(euid),
+            uid: run_as.map_or(euid, |owner| owner.uid),
             zoneid: process_zoneid()?,
+            owner: run_as,
         })
     }
 
@@ -100,6 +102,7 @@ pub fn policy() -> PeerPolicy {
     PeerPolicy::for_process(None).unwrap_or(PeerPolicy {
         uid: u32::MAX,
         zoneid: None,
+        owner: None,
     })
 }
 
@@ -287,6 +290,7 @@ mod tests {
         let policy = PeerPolicy {
             uid: 42,
             zoneid: None,
+            owner: None,
         };
         assert!(policy.admits(&unzoned(42)));
         assert!(!policy.admits(&unzoned(43)));
@@ -301,6 +305,7 @@ mod tests {
         let policy = PeerPolicy {
             uid: 8123,
             zoneid: Some(7),
+            owner: None,
         };
         assert!(policy.admits(&zoned(0, GLOBAL_ZONEID)));
     }
@@ -312,6 +317,7 @@ mod tests {
         let policy = PeerPolicy {
             uid: 8123,
             zoneid: Some(7),
+            owner: None,
         };
         assert!(policy.admits(&zoned(8123, 7)));
         assert!(!policy.admits(&zoned(0, 7)));
@@ -323,6 +329,7 @@ mod tests {
         let policy = PeerPolicy {
             uid: 8123,
             zoneid: Some(7),
+            owner: None,
         };
         // Not even the run-as uid: from the global zone only root owns
         // the zone.
@@ -335,6 +342,7 @@ mod tests {
         let policy = PeerPolicy {
             uid: 0,
             zoneid: Some(7),
+            owner: None,
         };
         assert!(!policy.admits(&zoned(0, 8)));
         assert!(!policy.admits(&zoned(8123, 8)));
@@ -347,6 +355,7 @@ mod tests {
         let policy = PeerPolicy {
             uid: 0,
             zoneid: Some(7),
+            owner: None,
         };
         assert!(policy.admits(&zoned(0, 7)));
         assert!(policy.admits(&zoned(0, GLOBAL_ZONEID)));
@@ -358,24 +367,32 @@ mod tests {
         let zoned_policy = PeerPolicy {
             uid: 0,
             zoneid: Some(0),
+            owner: None,
         };
         assert!(!zoned_policy.admits(&unzoned(0)));
 
         let unzoned_policy = PeerPolicy {
             uid: 0,
             zoneid: None,
+            owner: None,
         };
         assert!(!unzoned_policy.admits(&zoned(0, 0)));
     }
 
-    /// The policy names the uid the process ends at, because the
+    /// The policy names the identity the process ends at, because the
     /// sockets are bound before the drop.
     #[test]
-    fn the_process_policy_names_the_run_as_uid() {
-        let policy = PeerPolicy::for_process(Some(8123)).expect("policy");
+    fn the_process_policy_names_the_run_as_identity() {
+        let run_as = ListenerOwner {
+            uid: 8123,
+            gid: 8124,
+        };
+        let policy = PeerPolicy::for_process(Some(run_as)).expect("policy");
         assert_eq!(policy.uid, 8123);
+        assert_eq!(policy.owner, Some(run_as));
         let own = PeerPolicy::for_process(None).expect("policy");
         assert_eq!(own.uid, unsafe { libc::geteuid() });
+        assert_eq!(own.owner, None);
         assert_eq!(own.zoneid, process_zoneid().expect("zone"));
     }
 

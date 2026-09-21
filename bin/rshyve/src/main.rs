@@ -17,7 +17,7 @@ use vmm_boot::direct;
 use vmm_config::Cli;
 use vmm_core::machine::Machine;
 use vmm_core::msr::MsrHandler;
-use vmm_core::unixsock::peercred::{install_policy, PeerPolicy};
+use vmm_core::unixsock::peercred::{install_policy, ListenerOwner, PeerPolicy};
 use vmm_devices::InputBroker;
 use vmm_machine::privilege::{OpenWitness, PrivPlan, RunAs};
 use vmm_machine::{
@@ -375,9 +375,11 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         };
     // Before the first socket is bound, naming the uid the process
     // ends at.
-    if install_policy(PeerPolicy::for_process(privilege.run_as.map(|r| r.uid))?)
-        .is_err()
-    {
+    let owner = privilege.run_as.map(|r| ListenerOwner {
+        uid: r.uid,
+        gid: r.gid,
+    });
+    if install_policy(PeerPolicy::for_process(owner)?).is_err() {
         anyhow::bail!("the peer policy was installed twice");
     }
 

@@ -23,7 +23,7 @@ use std::time::Instant;
 use slog::{error, info, warn};
 
 use vmm_config::Cli;
-use vmm_core::unixsock::peercred::{install_policy, PeerPolicy};
+use vmm_core::unixsock::peercred::{install_policy, ListenerOwner, PeerPolicy};
 use vmm_machine::privilege::{
     LockReport, OpenWitness, PrivPlan, RunAs, SANDBOX_RUN_AS,
 };
@@ -275,9 +275,14 @@ fn install_control_sink(
 }
 
 /// Fix the peer policy for the life of the process, before any socket
-/// is bound and naming the uid the process ends at.
+/// is bound and naming the identity the process ends at. Every listener
+/// bound after this is chowned to that identity.
 fn install_peer_policy(hardening: &Hardening) -> anyhow::Result<()> {
-    let policy = PeerPolicy::for_process(hardening.run_as.map(|r| r.uid))?;
+    let owner = hardening.run_as.map(|r| ListenerOwner {
+        uid: r.uid,
+        gid: r.gid,
+    });
+    let policy = PeerPolicy::for_process(owner)?;
     install_policy(policy)
         .map_err(|_| anyhow::anyhow!("the peer policy was installed twice"))
 }
