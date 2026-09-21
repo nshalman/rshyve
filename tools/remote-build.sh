@@ -43,30 +43,19 @@ if printf '%s' "$REMOTE_DIR" | grep -qv '^[A-Za-z0-9_./-]*$'; then
 fi
 PROFILE="${VMM_BUILD_PROFILE:---release}"
 
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# git reports the real path, so the comparison in build_rev needs one.
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
+# shellcheck source=tools/build-rev.sh
+. "$SRC_DIR/tools/build-rev.sh"
 
 # The binary reports the revision it was built from, and that revision
 # must be computed here: sync_sources excludes .git, so the build host
-# holds no clone and git there answers for an unrelated repository or
-# not at all. A value that does not name an object is dropped rather
-# than sent, so the binary says `unstamped` instead of naming a commit
-# that resolves nowhere.
-build_rev() {
-    local rev changes
-    rev="$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null)" || return 0
-    # Untracked files reach the build host too, because rsync sends the
-    # working tree and not a commit. A status that cannot be read counts
-    # as changed: a bare commit name on a tree that may not match it is
-    # the failure this path exists to prevent.
-    if ! changes="$(git -C "$SRC_DIR" status --porcelain 2>/dev/null)" ||
-        [ -n "$changes" ]; then
-        rev="$rev-dirty"
-    fi
-    printf '%s' "$rev"
-}
-
-BUILD_REV="$(build_rev)"
-if ! printf '%s' "$BUILD_REV" | grep -Eq '^[0-9a-f]{7,40}(-dirty)?$'; then
+# holds no clone. A value that does not name an object is dropped
+# rather than sent, so the binary says `unstamped` instead of naming a
+# commit that resolves nowhere.
+BUILD_REV="$(build_rev "$SRC_DIR")"
+if ! is_object_name "$BUILD_REV"; then
     echo "BUILD-WARN: no source revision here; the binary will report" \
          "unstamped" >&2
     BUILD_REV=""
@@ -79,13 +68,19 @@ SSH=(ssh -o ConnectTimeout=15 -i "$KEY" "$HOST")
 # /opt/tools/bin and /opt/local/bin hold the pkgsrc toolchain (cargo, gcc,
 # autoconf, gmake, pkg-config); none of them are on root's default PATH.
 REMOTE_ENV="export PATH=/opt/tools/bin:/opt/local/bin:/usr/bin:/usr/sbin:\$PATH; cd $REMOTE_DIR"
-# The value is spliced into a command a remote root shell parses, and it
-# passed the object-name check above, so it holds no shell metacharacter.
+# The value is spliced into a command a remote root shell parses. It
+# passed the object-name check above, so it carries no quote, and the
+# quotes here hold whatever a later caller sends to one word.
 if [ -n "$BUILD_REV" ]; then
-    REMOTE_ENV="$REMOTE_ENV; export TRITON_BUILD_REV=$BUILD_REV"
+    REMOTE_ENV="$REMOTE_ENV; export TRITON_BUILD_REV='$BUILD_REV'"
 fi
 
-usage() { sed -n '3,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+# The help text is the header comment. A line range drifts when the
+# header changes, and it did: the old one printed `set -euo pipefail`.
+usage() {
+    sed -n -e '1,2d' -e '/^#/!q' -e 's/^# \{0,1\}//p' "${BASH_SOURCE[0]}"
+    exit 2
+}
 
 sync_sources() {
     # --checksum because rsync-over-ssh timestamps do not reliably invalidate
