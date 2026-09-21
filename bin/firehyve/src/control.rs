@@ -12,11 +12,15 @@
 //! device-list                  -> OK 2 virtio-blk@4,0.4.0,present ...
 //! cpu-list                     -> OK 4 0,present,boot 2,absent,hotplug ...
 //! mem-list                     -> OK 1 boot,1073741824,present
-//! device-add 5,virtio-blk,/d   -> OK virtio-blk@5
-//! device-remove virtio-blk@5   -> OK virtio-blk@5,remove-pending
 //! cpu-add 2                    -> OK 2,present
 //! mem-add 134217728            -> OK slot0,present
+//! status                       -> OK 8 state,running uptime_ms,12 ...
+//! metrics                      -> OK 7 uptime_ms,12 vcpu0.exits,40 ...
+//! halt                         -> OK halt,requested
 //! ```
+//!
+//! `status` and `metrics` answer `key,value` records only, so a client
+//! reads them as a map.
 //!
 //! `cpu-list` gives one record per CPU slot, `id,state,kind`. `kind`
 //! separates a boot CPU from a slot a hot-add can take, and `state` is
@@ -31,7 +35,7 @@
 //! `mem-add` takes BYTES, not the `-m` size grammar, so it means the
 //! same thing on both transports. The engine rounds up to a whole slot.
 //!
-//! # Add only
+//! # Add only, and no devices
 //!
 //! There is no `cpu-remove` and no `mem-remove` that does anything.
 //! illumos has no `vm_deactivate_cpu` and no `VM_FREE_MEMSEG`, so
@@ -39,42 +43,81 @@
 //! recognised and refused with that reason, because an operator will
 //! try them and "unknown command" does not say why.
 //!
+//! `device-add` and `device-remove` are gone from the grammar itself
+//! (`vmm_virtio::vsock::control`). The device set is fixed at boot:
+//! after the privilege lock this process holds no `file_write`, so it
+//! could not open a new backing file, and the PCI hotplug engine that
+//! served both verbs is not started. What went with them: the eject
+//! thread, the hot-add refusal list for the brand's display devices,
+//! and the rule that vsock could not be added at run time.
+//!
+//! `shutdown` is recognised and refused: a microVM has no ACPI power
+//! button, so a graceful stop is the guest agent's job over vsock.
+//! `halt` stops the VM now.
+//!
 //! # Trust
 //!
-//! SECURITY: `device-add` opens a host file the peer names, which is
-//! the same file-open authority argv has. It is not wider: the spec
-//! goes through the same catalog closure the `-s` pass uses, so no
-//! driver and no path becomes reachable that a command line could not
-//! express. Nothing here authorises the peer. The only thing that does
-//! is the host socket itself, which `vmm_core::unixsock` binds 0600
-//! inside a 0700 directory, so the peer is already this process's own
-//! user. rshyve, which has a control socket, adds a uid and zoneid
-//! peercred check on top.
+//! Nothing here authorises the peer. The host socket is 0600 in a
+//! 0700 directory, the accept loop applies the process peer policy
+//! (`vmm_core::unixsock::peercred`), and the session must present the
+//! launcher's token before its first verb. What reaches a sink has
+//! passed all three.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
+use vmm_devices::metrics::VcpuMetrics;
 use vmm_machine::inventory::{
-    cpu_inventory, MemWindowReport, CPU_HOTPLUG_OFF, MEM_HOTPLUG_OFF,
-    NO_CPU_REMOVE, NO_MEM_REMOVE,
+    cpu_inventory, CpuSlotState, MemWindowReport, CPU_HOTPLUG_OFF,
+    MEM_HOTPLUG_OFF, NO_CPU_REMOVE, NO_MEM_REMOVE,
 };
-use vmm_machine::{DeviceRegistry, HotplugEngines, HotplugError};
+use vmm_machine::signal::GuestStop;
+use vmm_machine::{DeviceRegistry, HotplugEngines};
 use vmm_virtio::vsock::control::{ControlReply, ControlRequest, ControlSink};
 
 /// Placeholder for a device that is not on the PCI bus.
 const NO_BDF: &str = "-";
+
+/// Why `shutdown` answers `ERR`.
+pub const NO_SHUTDOWN: &str = "shutdown is not supported: a microVM has \
+    no ACPI power button, so a graceful stop is the guest agent's job over \
+    vsock; halt stops the VM now";
+
+/// What the privilege lock left, for `status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivStatus {
+    pub locked: bool,
+    /// The floor, or empty when the lock was not applied.
+    pub floor: Vec<String>,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// The running machine, beyond its device list.
+pub struct Runtime {
+    /// How `halt` reaches the VM. The handle stop, since firehyve has
+    /// no pause to respect.
+    pub stop: Arc<dyn GuestStop>,
+    pub started: Instant,
+    /// The boot vCPUs' exit counters, in id order.
+    pub metrics: Vec<Arc<VcpuMetrics>>,
+    pub privilege: PrivStatus,
+}
 
 /// The machine, as the control commands see it.
 pub struct Inventory {
     registry: Arc<DeviceRegistry>,
     /// Each engine is `None` unless the VM was started with the option
     /// it needs, which is the only way the guest has an interface to
-    /// answer on.
+    /// answer on. `pci` is always `None` here: see the module doc.
     hotplug: HotplugEngines,
     num_cpus: u32,
     /// Every CPU slot the MADT describes. Equal to `num_cpus` unless
     /// `-c maxcpus=` asked for more.
     max_cpus: u32,
     mem_size: usize,
+    runtime: Runtime,
 }
 
 impl Inventory {
@@ -84,6 +127,7 @@ impl Inventory {
         num_cpus: u32,
         max_cpus: u32,
         mem_size: usize,
+        runtime: Runtime,
     ) -> Self {
         Self {
             registry,
@@ -91,35 +135,75 @@ impl Inventory {
             num_cpus,
             max_cpus,
             mem_size,
+            runtime,
         }
     }
 
-    /// Build one device and report the id `device-remove` takes.
-    fn device_add(&self, spec: &str) -> ControlReply {
-        let Some(engine) = self.hotplug.pci.as_ref() else {
-            return ControlReply::refused(HotplugError::Disabled.to_string());
-        };
-        match engine.add_device(spec) {
-            Ok(id) => ControlReply::record([id]),
-            Err(e) => ControlReply::refused(e.to_string()),
-        }
+    /// `key,value` records about the machine.
+    fn status(&self) -> ControlReply {
+        let inv = cpu_inventory(
+            self.num_cpus,
+            self.max_cpus,
+            self.hotplug.cpu.as_ref(),
+        );
+        let online = inv
+            .slots
+            .iter()
+            .filter(|slot| slot.state == CpuSlotState::Present)
+            .count();
+        let privilege = &self.runtime.privilege;
+        let pair = |key: &str, value: String| vec![key.to_string(), value];
+        ControlReply::list(vec![
+            pair("state", "running".to_string()),
+            pair("uptime_ms", self.uptime_ms().to_string()),
+            pair("cpus_online", online.to_string()),
+            pair("cpus_max", self.max_cpus.to_string()),
+            pair("mem_bytes", self.mem_size.to_string()),
+            pair(
+                "privilege",
+                if privilege.locked { "locked" } else { "open" }.to_string(),
+            ),
+            pair("priv_floor", privilege.floor.join(":")),
+            pair("uid", privilege.uid.to_string()),
+            pair("gid", privilege.gid.to_string()),
+        ])
     }
 
-    /// Ask the guest to give a device up.
-    ///
-    /// The answer says the request was recorded, not that the device is
-    /// gone: only the guest can finish an eject, and a guest that never
-    /// runs `_EJ0` leaves the slot pending for the life of the VM.
-    fn device_remove(&self, id: &str) -> ControlReply {
-        let Some(engine) = self.hotplug.pci.as_ref() else {
-            return ControlReply::refused(HotplugError::Disabled.to_string());
-        };
-        match engine.request_remove(id) {
+    fn uptime_ms(&self) -> u128 {
+        self.runtime.started.elapsed().as_millis()
+    }
+
+    /// `key,value` counters: the uptime and every vCPU's exit buckets.
+    fn metrics(&self) -> ControlReply {
+        let mut records =
+            vec![vec!["uptime_ms".to_string(), self.uptime_ms().to_string()]];
+        for (id, m) in self.runtime.metrics.iter().enumerate() {
+            for (name, counter) in [
+                ("exits", &m.exits),
+                ("exits_pio", &m.exits_pio),
+                ("exits_mmio", &m.exits_mmio),
+                ("exits_hlt", &m.exits_hlt),
+                ("exits_msr", &m.exits_msr),
+                ("exits_other", &m.exits_other),
+            ] {
+                records.push(vec![
+                    format!("vcpu{id}.{name}"),
+                    counter.load(Ordering::Relaxed).to_string(),
+                ]);
+            }
+        }
+        ControlReply::list(records)
+    }
+
+    /// Stop the VM now. The answer says the stop was requested; the
+    /// event loop reports the outcome through the exit code.
+    fn halt(&self) -> ControlReply {
+        match self.runtime.stop.halt() {
             Ok(()) => ControlReply::record([
-                id.to_string(),
-                vmm_machine::SlotState::RemovePending.to_string(),
+                "halt".to_string(),
+                "requested".to_string(),
             ]),
-            Err(e) => ControlReply::refused(e.to_string()),
+            Err(e) => ControlReply::refused(format!("halt failed: {e}")),
         }
     }
 
@@ -228,24 +312,27 @@ impl ControlSink for Inventory {
             ControlRequest::DeviceList => self.device_list(),
             ControlRequest::CpuList => self.cpu_list(),
             ControlRequest::MemList => self.mem_list(),
-            ControlRequest::DeviceAdd(spec) => self.device_add(&spec),
-            ControlRequest::DeviceRemove(id) => self.device_remove(&id),
             ControlRequest::CpuAdd(id) => self.cpu_add(id),
             ControlRequest::MemAdd(bytes) => self.mem_add(bytes),
             ControlRequest::CpuRemove => ControlReply::refused(NO_CPU_REMOVE),
             ControlRequest::MemRemove => ControlReply::refused(NO_MEM_REMOVE),
+            ControlRequest::Status => self.status(),
+            ControlRequest::Metrics => self.metrics(),
+            ControlRequest::Halt => self.halt(),
+            ControlRequest::Shutdown => ControlReply::refused(NO_SHUTDOWN),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
     use std::collections::BTreeSet;
 
     use vmm_machine::{
-        CpuHotplugEngine, CpuOnline, CpuSlots, DeviceRegistry,
+        CpuHotplugEngine, CpuOnline, CpuSlots, DeviceRegistry, HotplugError,
         RegisteredDevice, VcpuError,
     };
 
@@ -254,6 +341,42 @@ mod tests {
 
     fn line(inv: &Inventory, request: &str) -> String {
         answer_line(inv, request)
+    }
+
+    /// Records how the control plane asked for a stop.
+    #[derive(Default)]
+    struct FakeStop {
+        halts: AtomicUsize,
+        poweroffs: AtomicUsize,
+    }
+
+    impl GuestStop for FakeStop {
+        fn request_poweroff(&self) -> std::io::Result<()> {
+            self.poweroffs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn halt(&self) -> std::io::Result<()> {
+            self.halts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn runtime(stop: Arc<FakeStop>) -> Runtime {
+        Runtime {
+            stop,
+            started: Instant::now(),
+            metrics: vec![
+                Arc::new(VcpuMetrics::new()),
+                Arc::new(VcpuMetrics::new()),
+            ],
+            privilege: PrivStatus {
+                locked: true,
+                floor: vec!["file_read".into(), "proc_clock_highres".into()],
+                uid: 8123,
+                gid: 8123,
+            },
+        }
     }
 
     /// A machine with no hot-add engine at all. The default: without
@@ -265,6 +388,7 @@ mod tests {
             2,
             2,
             1_073_741_824,
+            runtime(Arc::new(FakeStop::default())),
         )
     }
 
@@ -358,6 +482,7 @@ mod tests {
             cpus.boot_cpus(),
             cpus.possible_cpus(),
             1_073_741_824,
+            runtime(Arc::new(FakeStop::default())),
         )
     }
 
@@ -426,6 +551,7 @@ mod tests {
             2,
             4,
             1_073_741_824,
+            runtime(Arc::new(FakeStop::default())),
         );
 
         assert_eq!(
@@ -593,15 +719,98 @@ mod tests {
         );
     }
 
+    /// The device set is fixed at boot, whatever the VM was started
+    /// with. No path a peer names is ever opened.
     #[test]
-    fn a_vm_without_hotplug_refuses_an_add_or_a_remove() {
-        // The default. Without --hotplug the guest has no interface to
-        // answer on, so the request is refused and nothing is opened.
-        let inv = inventory(DeviceRegistry::new());
-        let refused = "ERR this VM was not started with --hotplug";
+    fn device_add_is_refused_even_with_hotplug_on() {
+        let inv = inventory_with_cpus(FakeCpus::new(4, 2));
 
-        assert_eq!(line(&inv, "device-add 5,virtio-blk,/d.img"), refused);
-        assert_eq!(line(&inv, "device-remove virtio-blk@5"), refused);
+        let answer = line(&inv, "device-add 5,virtio-blk,/etc/shadow");
+        assert!(
+            answer.starts_with("ERR device-add is not supported"),
+            "{answer}"
+        );
+        let answer = line(&inv, "device-remove virtio-blk@5");
+        assert!(
+            answer.starts_with("ERR device-remove is not supported"),
+            "{answer}"
+        );
+    }
+
+    #[test]
+    fn status_is_a_map_of_the_machine() {
+        let inv = inventory_with_cpus(FakeCpus::new(4, 2));
+        let answer = line(&inv, "status");
+        let fields: Vec<&str> = answer.split(' ').collect();
+        assert_eq!(fields[0], "OK");
+        assert_eq!(fields[1], "9");
+        assert!(fields.contains(&"state,running"), "{answer}");
+        assert!(fields.contains(&"cpus_online,2"), "{answer}");
+        assert!(fields.contains(&"cpus_max,4"), "{answer}");
+        assert!(fields.contains(&"mem_bytes,1073741824"), "{answer}");
+        assert!(fields.contains(&"privilege,locked"), "{answer}");
+        assert!(
+            fields.contains(&"priv_floor,file_read:proc_clock_highres"),
+            "{answer}"
+        );
+        assert!(fields.contains(&"uid,8123"), "{answer}");
+        assert!(fields.contains(&"gid,8123"), "{answer}");
+        assert!(
+            fields.iter().any(|f| f.starts_with("uptime_ms,")),
+            "{answer}"
+        );
+    }
+
+    #[test]
+    fn status_shows_a_cpu_that_was_hot_added() {
+        let inv = inventory_with_cpus(FakeCpus::new(4, 2));
+        assert_eq!(line(&inv, "cpu-add 3"), "OK 3,present");
+        assert!(line(&inv, "status").contains("cpus_online,3"));
+    }
+
+    #[test]
+    fn metrics_reports_every_vcpu_exit_bucket() {
+        let inv = inventory(DeviceRegistry::new());
+        inv.runtime.metrics[1].record_exit(&vmm_core::exits::VmExitKind::Hlt);
+
+        let answer = line(&inv, "metrics");
+        let fields: Vec<&str> = answer.split(' ').collect();
+        // uptime plus six buckets for each of the two vCPUs.
+        assert_eq!(fields[1], "13", "{answer}");
+        assert!(fields.contains(&"vcpu0.exits,0"), "{answer}");
+        assert!(fields.contains(&"vcpu1.exits,1"), "{answer}");
+        assert!(fields.contains(&"vcpu1.exits_hlt,1"), "{answer}");
+        assert!(fields.contains(&"vcpu1.exits_pio,0"), "{answer}");
+    }
+
+    #[test]
+    fn halt_reaches_the_stop_and_says_so() {
+        let stop = Arc::new(FakeStop::default());
+        let inv = Inventory::new(
+            Arc::new(DeviceRegistry::new()),
+            HotplugEngines::default(),
+            2,
+            2,
+            1_073_741_824,
+            runtime(Arc::clone(&stop)),
+        );
+
+        assert_eq!(line(&inv, "halt"), "OK halt,requested");
+        assert_eq!(stop.halts.load(Ordering::SeqCst), 1);
+        // A hard stop, never the ACPI request a microVM cannot take.
+        assert_eq!(stop.poweroffs.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn shutdown_says_why_and_names_the_alternative() {
+        let inv = inventory(DeviceRegistry::new());
+        let answer = line(&inv, "shutdown");
+        assert!(
+            answer.starts_with("ERR shutdown is not supported"),
+            "{answer}"
+        );
+        assert!(answer.contains("guest agent"), "{answer}");
+        assert!(answer.contains("halt"), "{answer}");
     }
 
     #[test]
@@ -634,22 +843,9 @@ mod tests {
 
     #[test]
     fn a_hotplug_verb_needs_exactly_one_argument() {
-        // A device-add with no spec must not read as an empty spec, and
-        // a second field means the request was mis-quoted.
+        // A second field means the request was mis-quoted.
         let inv = inventory(DeviceRegistry::new());
 
-        assert_eq!(
-            line(&inv, "device-add"),
-            "ERR device-add needs one argument"
-        );
-        assert_eq!(
-            line(&inv, "device-remove"),
-            "ERR device-remove needs one argument"
-        );
-        assert_eq!(
-            line(&inv, "device-add 5,virtio-blk, /d.img"),
-            "ERR device-add takes one argument"
-        );
         assert_eq!(line(&inv, "cpu-add"), "ERR cpu-add needs one argument");
         assert_eq!(line(&inv, "mem-add"), "ERR mem-add needs one argument");
         assert_eq!(

@@ -22,7 +22,11 @@ vmm_machine.workspace = true
 vmm_boot.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+libc.workspace = true
 slog.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
 
 # Deliberately absent, and enforced by deny-firehyve.toml:
 #   vmm_migrate vmm_tpm vmm_tpm_sys vmm_storage vmm_hid vmm_passthru

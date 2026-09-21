@@ -433,7 +433,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "slog",
+ "tempfile",
  "vmm_boot",
  "vmm_config",
  "vmm_core",

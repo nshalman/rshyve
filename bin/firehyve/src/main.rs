@@ -5,21 +5,33 @@
 //! firehyve: a microVM built on the shared vmm crates.
 //!
 //! Direct-kernel boot, virtio devices only. No UEFI, no migration, no
-//! control socket, no PCI passthrough.
+//! control socket, no PCI passthrough, and no device added after boot.
+//! Once every device is open the privilege sets are locked and the
+//! process drops to a numeric uid (`vmm_machine::privilege`).
 
 mod console;
 mod control;
 mod devices;
 
 use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Instant;
 
 use slog::{error, info, warn};
 
 use vmm_config::Cli;
-use vmm_machine::{DeviceRegistry, HotplugEngine, HotplugEngines, VcpuSetup};
-use vmm_virtio::vsock::control::{ControlSink, ControlSlot};
+use vmm_core::unixsock::peercred::{install_policy, PeerPolicy};
+use vmm_machine::privilege::{
+    LockReport, OpenWitness, PrivPlan, RunAs, SANDBOX_RUN_AS,
+};
+use vmm_machine::signal::{GuestStop, HdlStop};
+use vmm_machine::{DeviceRegistry, HotplugEngines, VcpuSetup};
+use vmm_virtio::vsock::control::{ControlSink, ControlSlot, ControlToken};
+
+use control::{PrivStatus, Runtime};
 
 /// Kernel command line used when `--cmdline` is absent. It names
 /// `ttyS0`, which is why COM1 is always attached.
@@ -29,6 +41,130 @@ use vmm_config::DEFAULT_CMDLINE;
 /// so a consumer that stopped reading cannot hold the VMM open.
 const CONSOLE_FLUSH_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
+
+/// The sandbox path locks privileges unless told not to. rshyve
+/// defaults the other way, and each binary logs which it did.
+const PRIV_DROP_DEFAULT: bool = true;
+
+/// What the sandbox path adds over the flags the device catalog reads.
+#[derive(Debug)]
+struct Hardening {
+    priv_drop: bool,
+    /// The identity to end at. `Some` only with `priv_drop`.
+    run_as: Option<RunAs>,
+    /// The CONTROL peer token. `None` leaves CONTROL refused.
+    token: Option<ControlToken>,
+}
+
+/// Read the hardening flags and refuse what the lock would break.
+fn hardening_from_cli(
+    cli: &Cli,
+    log: &slog::Logger,
+) -> anyhow::Result<Hardening> {
+    let priv_drop = cli.priv_drop_or(PRIV_DROP_DEFAULT);
+    let run_as = if priv_drop {
+        cli.run_as_or(Some((SANDBOX_RUN_AS.uid, SANDBOX_RUN_AS.gid)))?
+            .map(|(uid, gid)| RunAs { uid, gid })
+    } else {
+        anyhow::ensure!(
+            cli.run_as_uid.is_none() && cli.run_as_gid.is_none(),
+            "--run-as-uid and --run-as-gid need --priv-drop"
+        );
+        None
+    };
+    if priv_drop {
+        // virtio-fs serves FUSE from this process and opens host files
+        // for the life of the VM. With file_write gone every write
+        // would fail after the lock, so a share is refused up front
+        // rather than left to break under the guest.
+        if let Some(spec) = cli
+            .pci_slot
+            .iter()
+            .find(|s| s.split(',').nth(1) == Some("virtio-fs"))
+        {
+            anyhow::bail!(
+                "virtio-fs cannot run under --priv-drop; remove '-s {spec}' \
+                 or pass --priv-drop=false"
+            );
+        }
+    }
+    let token = cli
+        .control_token_file
+        .as_deref()
+        .map(|path| load_control_token(path, log))
+        .transpose()?;
+    Ok(Hardening {
+        priv_drop,
+        run_as,
+        token,
+    })
+}
+
+/// Read the CONTROL peer token the launcher wrote.
+///
+/// Read once, before the lock. A file another uid can read is not a
+/// secret, so its mode is checked, not only its contents.
+fn load_control_token(
+    path: &Path,
+    log: &slog::Logger,
+) -> anyhow::Result<ControlToken> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        anyhow::anyhow!("--control-token-file {}: {e}", path.display())
+    })?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        anyhow::bail!(
+            "--control-token-file {} is mode {mode:#05o}; it must not be \
+             readable by group or other",
+            path.display()
+        );
+    }
+    let raw = std::fs::read(path).map_err(|e| {
+        anyhow::anyhow!("--control-token-file {}: {e}", path.display())
+    })?;
+    let token = ControlToken::parse(&raw).map_err(|reason| {
+        anyhow::anyhow!("--control-token-file {}: {reason}", path.display())
+    })?;
+    info!(log, "vsock CONTROL peer token loaded"; "file" => %path.display());
+    Ok(token)
+}
+
+/// Lock the privilege sets and drop, or say plainly that neither
+/// happened. One log line either way, because CI cannot run the
+/// syscalls and an operator has to be able to read which path a VMM
+/// took.
+fn apply_privilege_lock(
+    plan: Option<&PrivPlan>,
+    hardening: &Hardening,
+    witness: &OpenWitness,
+    log: &slog::Logger,
+) -> anyhow::Result<PrivStatus> {
+    let Some(plan) = plan else {
+        warn!(log, "privilege drop: off";
+            "reason" => "--priv-drop=false",
+            "inherited" => "unreduced");
+        // SAFETY: geteuid and getegid take no argument and cannot fail.
+        return Ok(PrivStatus {
+            locked: false,
+            floor: Vec::new(),
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        });
+    };
+    let report: LockReport = plan
+        .lock(witness, hardening.run_as)
+        .map_err(|e| anyhow::anyhow!("privilege drop failed: {e}"))?;
+    info!(log, "privilege drop: on"; "sets" => report.summary());
+    let (uid, gid) = report
+        .run_as
+        .map_or((0, 0), |run_as| (run_as.uid, run_as.gid));
+    Ok(PrivStatus {
+        locked: true,
+        floor: report.floor.iter().cloned().collect(),
+        uid,
+        gid,
+    })
+}
 
 fn version_string() -> String {
     let version = env!("CARGO_PKG_VERSION");
@@ -107,29 +243,43 @@ fn validate_cli(cli: &Cli, log: &slog::Logger) -> anyhow::Result<()> {
 /// Arm every vsock control slot with the machine inventory.
 ///
 /// Returns the sink so the caller can report that the interface is up,
-/// and `None` when the machine has no vsock device to serve it on.
+/// and `None` when the machine has no vsock device to serve it on or
+/// no token to guard it with. A slot left empty refuses CONTROL, so
+/// the verb fails closed rather than unauthenticated.
 fn install_control_sink(
     slots: &[ControlSlot],
+    token: Option<&ControlToken>,
     registry: &Arc<DeviceRegistry>,
     hotplug: HotplugEngines,
     num_cpus: u32,
     max_cpus: u32,
     mem_size: usize,
+    runtime: Runtime,
 ) -> Option<Arc<dyn ControlSink>> {
     if slots.is_empty() {
         return None;
     }
+    let token = token?;
     let sink: Arc<dyn ControlSink> = Arc::new(control::Inventory::new(
         Arc::clone(registry),
         hotplug,
         num_cpus,
         max_cpus,
         mem_size,
+        runtime,
     ));
     for slot in slots {
-        slot.install(Arc::clone(&sink));
+        slot.install(Arc::clone(&sink), token.clone());
     }
     Some(sink)
+}
+
+/// Fix the peer policy for the life of the process, before any socket
+/// is bound and naming the uid the process ends at.
+fn install_peer_policy(hardening: &Hardening) -> anyhow::Result<()> {
+    let policy = PeerPolicy::for_process(hardening.run_as.map(|r| r.uid))?;
+    install_policy(policy)
+        .map_err(|_| anyhow::anyhow!("the peer policy was installed twice"))
 }
 
 /// The phase sequence. Ordering is load-bearing: ACPI tables are written
@@ -144,6 +294,22 @@ fn run(
     // window is built here, before the VM exists, so a window an
     // operator cannot use costs no boot.
     validate_cli(&cli, log)?;
+    let started = Instant::now();
+    let hardening = hardening_from_cli(&cli, log)?;
+    // The inherited set is read now, before any device opens, and the
+    // lock runs once the last one has. A platform without privilege
+    // sets refuses here rather than boot unreduced.
+    let plan =
+        if hardening.priv_drop {
+            Some(PrivPlan::begin_from_process().map_err(|e| {
+                anyhow::anyhow!("privilege drop cannot start: {e}")
+            })?)
+        } else {
+            None
+        };
+    // Before the first socket is bound, and naming the uid the process
+    // ends at, because the peer gate runs for the life of the VM.
+    install_peer_policy(&hardening)?;
     // Resolved here, not at load time: a command line that is malformed
     // or supplied twice must cost no VM. `--cmdline-base64` is the form
     // the bhyve zone brand can carry, because it splits its only
@@ -244,17 +410,10 @@ fn run(
     // pushed here. Without this the GPE0 block takes no part in reset.
     vmm_machine::register_pm_devices(&attachment.registry, &timer_pm)?;
 
-    // The hotplug engine owns the thread that finishes an eject, so no
-    // teardown ever runs on a vCPU thread.
-    let pci_hotplug = timer_pm.hotplug.as_ref().map(|regs| {
-        HotplugEngine::start(
-            Arc::clone(&attachment.registry),
-            owned_ctx,
-            Arc::clone(&regs.pci),
-            devices::hotplug_factory(num_cpus),
-            log.new(slog::o!("component" => "hotplug")),
-        )
-    });
+    // No PCI hotplug engine: the device set is fixed at boot, so there
+    // is nothing to add and no eject to finish. CPU and memory hot-add
+    // keep their engines; neither opens a host file.
+    let pci_hotplug = None;
     let mem_hotplug = vmm_machine::start_mem_hotplug(
         mem_window,
         &machine,
@@ -272,7 +431,7 @@ fn run(
     // apart: they are the two largest items on the boot path and they
     // have different fixes, so one number for both hides which is
     // moving.
-    let t_read = std::time::Instant::now();
+    let t_read = Instant::now();
     let kernel = vmm_boot::BootImage::open(kernel_path)?;
     let initrd = cli
         .initrd
@@ -281,7 +440,7 @@ fn run(
         .transpose()?;
     let read_us = t_read.elapsed().as_micros() as u64;
 
-    let t_load = std::time::Instant::now();
+    let t_load = Instant::now();
     let entry = kernel.load(
         machine.memctx(),
         &cmdline,
@@ -313,6 +472,23 @@ fn run(
     // access.
     vmm_machine::provision::mark_provisioned(log);
 
+    // Phase 8b: lock. Every device is open, the kernel is loaded and
+    // the brand has its rename. From here the process holds file_read
+    // and its descriptors, and runs as a uid that cannot reopen
+    // /dev/vmm.
+    let witness = OpenWitness {
+        vmm_open: true,
+        expected_devices: devices::witness_ids(&cli.pci_slot),
+        present_devices: attachment
+            .registry
+            .list()
+            .into_iter()
+            .map(|device| device.id)
+            .collect(),
+    };
+    let privilege =
+        apply_privilege_lock(plan.as_ref(), &hardening, &witness, log)?;
+
     // Phase 9: run. The fleet, not the fixed set, because a CPU added
     // later has to join the same event channel and the same roster.
     let fleet = vmm_machine::spawn_vcpu_fleet(
@@ -341,6 +517,12 @@ fn run(
         cpu: cpu_hotplug,
         mem: mem_hotplug,
     };
+    let vcpu_metrics = fleet.metrics.clone();
+
+    // One stop for the signal path and the CONTROL halt verb: the
+    // handle stop, since firehyve has no pause to respect.
+    let stop: Arc<dyn GuestStop> =
+        Arc::new(HdlStop::new(machine.hdl().clone()));
 
     // firehyve has no control socket, so the inventory is served on the
     // vsock host socket. It lands here because the registry is complete
@@ -349,19 +531,29 @@ fn run(
     // to vsock first is refused, not misinformed.
     if install_control_sink(
         &control_slots,
+        hardening.token.as_ref(),
         &attachment.registry,
         hotplug.clone(),
         num_cpus,
         max_cpus,
         mem_size,
+        Runtime {
+            stop: Arc::clone(&stop),
+            started,
+            metrics: vcpu_metrics,
+            privilege,
+        },
     )
     .is_some()
     {
         info!(log, "vsock CONTROL enabled";
             "sockets" => control_slots.len());
+    } else if !control_slots.is_empty() {
+        warn!(log, "vsock CONTROL refused";
+            "reason" => "no --control-token-file; CONNECT still works");
     }
 
-    vmm_machine::install_sigterm_handler(&machine, log);
+    vmm_machine::signal::install_sigterm_handler_with(stop, log);
     let outcome = vmm_machine::run_fleet_event_loop(
         &machine,
         fleet,
@@ -487,18 +679,71 @@ mod tests {
         assert_eq!(setup.boot_cpus, hotplug.num_cpus);
     }
 
+    /// A stop nothing reaches: the tests here never halt a VM.
+    struct NoStop;
+
+    impl GuestStop for NoStop {
+        fn request_poweroff(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn halt(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn runtime() -> Runtime {
+        Runtime {
+            stop: Arc::new(NoStop),
+            started: Instant::now(),
+            metrics: Vec::new(),
+            privilege: PrivStatus {
+                locked: true,
+                floor: vec!["file_read".into()],
+                uid: 8123,
+                gid: 8123,
+            },
+        }
+    }
+
+    fn test_token() -> ControlToken {
+        ControlToken::parse(b"test-token-0123456789abcdef").expect("token")
+    }
+
     #[test]
     fn a_machine_with_no_vsock_device_arms_no_control_sink() {
         let registry = Arc::new(DeviceRegistry::new());
+        let token = test_token();
         assert!(install_control_sink(
             &[],
+            Some(&token),
             &registry,
             HotplugEngines::default(),
             2,
             2,
             1 << 30,
+            runtime(),
         )
         .is_none());
+    }
+
+    /// Without a token the slot stays empty, and an empty slot refuses
+    /// CONTROL. Nothing is served unauthenticated.
+    #[test]
+    fn a_vsock_device_without_a_token_arms_no_control_sink() {
+        let registry = Arc::new(DeviceRegistry::new());
+        let slots = vec![ControlSlot::default()];
+        assert!(install_control_sink(
+            &slots,
+            None,
+            &registry,
+            HotplugEngines::default(),
+            2,
+            2,
+            1 << 30,
+            runtime(),
+        )
+        .is_none());
+        assert!(slots[0].sink().is_none(), "the slot must stay empty");
     }
 
     #[test]
@@ -516,14 +761,17 @@ mod tests {
             ))
             .expect("insert");
         let slots = vec![ControlSlot::default(), ControlSlot::default()];
+        let token = test_token();
 
         let sink = install_control_sink(
             &slots,
+            Some(&token),
             &registry,
             HotplugEngines::default(),
             2,
             2,
             1 << 30,
+            runtime(),
         )
         .expect("armed");
 
@@ -709,6 +957,142 @@ mod tests {
                 .to_string();
             assert!(err.contains(want), "for {want} got: {err}");
         }
+    }
+
+    /// The sandbox path drops by default, to the fixed numeric id.
+    #[test]
+    fn the_drop_is_on_by_default_and_ends_at_8123() {
+        let cli = cli_from(&["firehyve", "--kernel", "/tmp/vmlinux", "guest"]);
+        let hardening = hardening_from_cli(&cli, &quiet()).expect("ok");
+        assert!(hardening.priv_drop);
+        assert_eq!(hardening.run_as, Some(SANDBOX_RUN_AS));
+        assert!(hardening.token.is_none());
+    }
+
+    #[test]
+    fn the_drop_can_be_turned_off_and_then_takes_no_identity() {
+        let cli = cli_from(&[
+            "firehyve",
+            "--kernel",
+            "/tmp/vmlinux",
+            "--priv-drop=false",
+            "guest",
+        ]);
+        let hardening = hardening_from_cli(&cli, &quiet()).expect("ok");
+        assert!(!hardening.priv_drop);
+        assert_eq!(hardening.run_as, None);
+
+        let cli = cli_from(&[
+            "firehyve",
+            "--kernel",
+            "/tmp/vmlinux",
+            "--priv-drop=false",
+            "--run-as-uid",
+            "5000",
+            "--run-as-gid",
+            "5000",
+            "guest",
+        ]);
+        let err = hardening_from_cli(&cli, &quiet())
+            .expect_err("an identity with no drop is a misconfiguration");
+        assert!(err.to_string().contains("--priv-drop"), "{err}");
+    }
+
+    #[test]
+    fn an_explicit_identity_replaces_the_default() {
+        let cli = cli_from(&[
+            "firehyve",
+            "--kernel",
+            "/tmp/vmlinux",
+            "--run-as-uid",
+            "5000",
+            "--run-as-gid",
+            "5001",
+            "guest",
+        ]);
+        let hardening = hardening_from_cli(&cli, &quiet()).expect("ok");
+        assert_eq!(
+            hardening.run_as,
+            Some(RunAs {
+                uid: 5000,
+                gid: 5001
+            })
+        );
+    }
+
+    /// virtio-fs opens host files for the life of the VM, which the
+    /// lock forbids. Refused up front, not left to fail under the
+    /// guest; allowed when the drop is off.
+    #[test]
+    fn virtio_fs_is_refused_under_the_drop() {
+        let base = [
+            "firehyve",
+            "--kernel",
+            "/tmp/vmlinux",
+            "-s",
+            "5,virtio-fs,tag=share,path=/export",
+        ];
+        let mut argv = base.to_vec();
+        argv.push("guest");
+        let err = hardening_from_cli(&cli_from(&argv), &quiet())
+            .expect_err("virtio-fs cannot run locked");
+        assert!(err.to_string().contains("virtio-fs"), "{err}");
+
+        let mut argv = base.to_vec();
+        argv.extend_from_slice(&["--priv-drop=false", "guest"]);
+        hardening_from_cli(&cli_from(&argv), &quiet())
+            .expect("allowed with the drop off");
+    }
+
+    #[test]
+    fn the_control_token_is_read_from_a_private_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("control.token");
+        std::fs::write(&path, b"0123456789abcdef-token\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod");
+
+        let cli = cli_from(&[
+            "firehyve",
+            "--kernel",
+            "/tmp/vmlinux",
+            "--control-token-file",
+            path.to_str().expect("utf8"),
+            "guest",
+        ]);
+        let hardening = hardening_from_cli(&cli, &quiet()).expect("ok");
+        assert!(hardening.token.is_some());
+    }
+
+    /// A token another uid can read is not a secret.
+    #[test]
+    fn a_world_readable_token_file_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("control.token");
+        std::fs::write(&path, b"0123456789abcdef-token").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod");
+
+        let err = load_control_token(&path, &quiet())
+            .expect_err("group or other can read it");
+        assert!(err.to_string().contains("mode"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_or_malformed_token_file_fails_the_boot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent");
+        assert!(load_control_token(&missing, &quiet()).is_err());
+
+        let short = dir.path().join("short");
+        std::fs::write(&short, b"tiny").expect("write");
+        std::fs::set_permissions(
+            &short,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod");
+        let err = load_control_token(&short, &quiet()).expect_err("too short");
+        assert!(err.to_string().contains("short"), "{err}");
     }
 
     #[test]
