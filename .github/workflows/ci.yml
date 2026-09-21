@@ -305,6 +305,53 @@ jobs:
           -p rshyve -p vmm_tpm -p vmm_tpm_sys
           -- -D warnings
 
+  build-stamp:
+    name: a release binary names a commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The firehyve in the platform image reported a commit that
+      # resolves in no clone, because the build script ran git on a
+      # build host that holds no repository. An operator who cannot map
+      # a running VMM to a commit cannot tell which code runs a guest.
+      - name: no build script takes the revision from git
+        run: |
+          set -euo pipefail
+          for f in bin/firehyve/build.rs bin/rshyve/build.rs; do
+            if grep -nE 'rev-parse|process::Command|Command::new' "$f"; then
+              echo "$f reads the revision from git again" >&2
+              exit 1
+            fi
+          done
+      # rshyve is covered by the step above only. A release build of it
+      # here would drive the libtpms autotools build a second time, and
+      # both binaries share one build_rev.rs.
+      - name: a release build carries the commit it was built from
+        run: |
+          set -euo pipefail
+          rev="$(git rev-parse --short HEAD)"
+          TRITON_BUILD_REV="$rev" cargo build --locked --release -p firehyve
+          out="$(./target/release/firehyve --version)"
+          echo "$out"
+          case "$out" in
+            *"($rev)") ;;
+            *) echo "expected a version naming $rev, got: $out" >&2; exit 1 ;;
+          esac
+          [ "$(git cat-file -t "$rev")" = commit ]
+      # Watch the fallback before trusting the step above: a build the
+      # driver did not stamp must say so rather than name a commit it
+      # cannot prove.
+      - name: an unstamped build says unstamped
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p firehyve
+          out="$(./target/release/firehyve --version)"
+          echo "$out"
+          case "$out" in
+            *"(unstamped)") ;;
+            *) echo "expected the unstamped marker, got: $out" >&2; exit 1 ;;
+          esac
+
   supply-chain:
     name: advisories, licenses, sources
     runs-on: ubuntu-latest
