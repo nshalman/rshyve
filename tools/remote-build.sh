@@ -52,11 +52,14 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # than sent, so the binary says `unstamped` instead of naming a commit
 # that resolves nowhere.
 build_rev() {
-    local rev
+    local rev changes
     rev="$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null)" || return 0
     # Untracked files reach the build host too, because rsync sends the
-    # working tree and not a commit.
-    if [ -n "$(git -C "$SRC_DIR" status --porcelain 2>/dev/null)" ]; then
+    # working tree and not a commit. A status that cannot be read counts
+    # as changed: a bare commit name on a tree that may not match it is
+    # the failure this path exists to prevent.
+    if ! changes="$(git -C "$SRC_DIR" status --porcelain 2>/dev/null)" ||
+        [ -n "$changes" ]; then
         rev="$rev-dirty"
     fi
     printf '%s' "$rev"
