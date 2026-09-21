@@ -4,49 +4,32 @@
 
 // The source revision that a VMM binary reports as its version.
 //
-// `bin/firehyve/build.rs` and `bin/rshyve/build.rs` `include!` this
-// file, and lib.rs compiles it again under `cfg(test)` so the rules
-// below are tested. A build script cannot import the crate it helps to
-// build, which is why the text is shared and not the compiled code.
-// Plain `//` comments only: an inner doc comment is an error at the
-// point of an `include!`.
+// The revision comes from the environment, never from git: the illumos
+// build host holds no clone, and a git there answers for the repository
+// the build directory sits under, or fails.
 //
-// The revision comes from the environment and never from git. The
-// illumos build host holds no clone, because tools/remote-build.sh
-// syncs the tree with `--exclude .git`. A `git rev-parse` there answers
-// for whatever repository the build directory sits under, or fails, and
-// the binary in the platform image then named a commit that resolves in
-// no clone. An operator who cannot map a running VMM to a commit cannot
-// tell which code runs a hostile guest.
+// `bin/firehyve/build.rs` and `bin/rshyve/build.rs` `include!` this
+// file, so plain `//` comments only: an inner doc comment is an error
+// at the point of an `include!`. lib.rs compiles it again under
+// `cfg(test)` so the rules below are tested.
 
-/// The variable the build driver sets to the source revision.
 const BUILD_REV_ENV: &str = "TRITON_BUILD_REV";
 
-/// The stamp of a build whose revision was not supplied.
-///
-/// A wrong commit is worse than no commit, so an absent or malformed
-/// value gives this marker and the CI gate refuses a release build that
-/// carries it.
+/// A wrong commit is worse than no commit.
 const UNSTAMPED_REV: &str = "unstamped";
 
-/// The marker the build driver appends when the tree has changes that
-/// no commit holds.
 const DIRTY_SUFFIX: &str = "-dirty";
 
-/// The shortest accepted abbreviation. git abbreviates to 7 digits by
-/// default and lengthens the name when 7 is ambiguous.
+/// git abbreviates to 7 digits and lengthens the name when 7 is
+/// ambiguous. 40 is a full SHA-1 name.
 const MIN_REV_LEN: usize = 7;
-
-/// A full SHA-1 object name.
 const MAX_REV_LEN: usize = 40;
 
-/// The revision to stamp into the binary, or [`UNSTAMPED_REV`].
 fn build_rev() -> String {
     let raw = std::env::var(BUILD_REV_ENV).unwrap_or_default();
     stamp(raw.trim()).to_owned()
 }
 
-/// `value` if it names an object, else [`UNSTAMPED_REV`].
 fn stamp(value: &str) -> &str {
     if is_object_name(value) {
         value
@@ -58,11 +41,8 @@ fn stamp(value: &str) -> &str {
 /// Is `value` an object name, with an optional dirty marker?
 ///
 /// The value is printed into a `cargo:rustc-env` directive, and cargo
-/// reads those one line at a time. A value that holds a newline would
-/// add directives of its own, such as a link argument, to every build
-/// that trusts the variable. Hex digits and one known suffix keep that
-/// closed, and the length bound keeps an over-long value out of the
-/// binary.
+/// reads those one line at a time, so a value holding a newline could
+/// add directives of its own to every build that trusts the variable.
 fn is_object_name(value: &str) -> bool {
     let core = value.strip_suffix(DIRTY_SUFFIX).unwrap_or(value);
     (MIN_REV_LEN..=MAX_REV_LEN).contains(&core.len())
@@ -87,8 +67,6 @@ mod tests {
         assert!(is_object_name(&format!("{}-dirty", "b".repeat(40))));
     }
 
-    /// A build the driver did not stamp must say so. Naming a commit
-    /// that resolves in no clone is the defect this replaces.
     #[test]
     fn an_absent_value_gives_the_marker() {
         assert_eq!(stamp(""), UNSTAMPED_REV);
@@ -111,8 +89,6 @@ mod tests {
         assert_eq!(stamp(&too_long), UNSTAMPED_REV);
     }
 
-    /// cargo reads build-script output one line at a time, so a value
-    /// holding a newline would add directives of its own.
     #[test]
     fn rejects_a_value_that_could_add_a_cargo_directive() {
         for bad in [
@@ -124,8 +100,8 @@ mod tests {
         }
     }
 
-    /// Whatever the environment holds, the stamp is an object name or
-    /// the marker. Nothing else can reach the version string.
+    /// Nothing the environment holds can reach the version string
+    /// except an object name or the marker.
     #[test]
     fn the_stamp_is_a_name_or_the_marker() {
         let rev = build_rev();
