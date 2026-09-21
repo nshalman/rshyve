@@ -712,6 +712,55 @@ fn a_backend_parked_across_a_reset_writes_nothing_into_the_ring() {
     );
 }
 
+// A driver may program one ring again without resetting the device,
+// and it frees the old ring as soon as it has. A request already with
+// the worker holds the old chain and the writer that names the old
+// ring, so dropping the cached writer does not reach it: the reply
+// went into pages the guest had taken back.
+#[test]
+fn a_reprogrammed_queue_keeps_a_stale_reply_out_of_the_old_ring() {
+    // Free, mapped ring memory past the fixture's own.
+    const NEW_DESC_GPA: u64 = 0x3000;
+    const NEW_AVAIL_GPA: u64 = 0x3100;
+    const NEW_USED_GPA: u64 = 0x3200;
+
+    let (physmap, mut queues, fs) = ring(8, 1);
+    let req = usize::from(FS_REQUEST_QUEUE);
+    seed_fuse_init(&physmap);
+    seed_reply_window(&physmap);
+    fs.start().expect("start");
+
+    let backend = ParkedBackend::install(&fs);
+    fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
+    backend.wait_until_inside();
+
+    // The same queue is programmed again while the request is out.
+    queues[req].set_addr_modern(NEW_DESC_GPA, NEW_AVAIL_GPA, NEW_USED_GPA);
+    fs.queue_addr_set(FS_REQUEST_QUEUE, &queues[req]);
+
+    backend.release();
+    wait_until_idle(&fs);
+
+    let old_used_idx = physmap
+        .lookup(USED_GPA + 2, 2)
+        .expect("mapped old used index")
+        .read::<u16>()
+        .expect("read old used index");
+    assert_eq!(
+        old_used_idx, 0,
+        "the reply was published into the ring the driver gave up"
+    );
+    assert!(
+        reply_window(&physmap).iter().all(|b| *b == REPLY_SENTINEL),
+        "the reply landed in guest pages the reprogram had released"
+    );
+    assert_eq!(
+        queues[req].read_used_ring_idx(&physmap),
+        0,
+        "a request of the old ring was answered on the new one"
+    );
+}
+
 // The illumos legacy driver writes the reset register once and does not
 // poll, so this runs on the vCPU. A host filesystem that never answers
 // must therefore not be in the wait: it would hold that vCPU for as

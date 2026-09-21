@@ -258,6 +258,54 @@ impl VirtioFs {
         }
         c
     }
+
+    /// End the retired generations, wait out the guest-memory sections
+    /// already inside them, and drop the used-ring writers they name.
+    ///
+    /// `queue` names the one ring a driver programmed again, or `None`
+    /// for a device reset. Dropping the cached writer is not enough on
+    /// either path: a request already with the worker holds a writer of
+    /// its own, the chain it was built from, and a generation that was
+    /// valid when it left the vCPU. Ending that generation and waiting
+    /// out the copies inside it is what keeps the reply out of pages
+    /// the guest has taken back.
+    ///
+    /// Admission closes before the wait, for every queue. A section
+    /// refused before it takes the lock never queues on it, and
+    /// `std::sync::RwLock` gives the writer no priority: a guest picks
+    /// how much stale work is waiting, and it must not be able to
+    /// starve this.
+    ///
+    /// The backing store is not waited for. A request inside it
+    /// finishes into host memory, fails the generation check, and
+    /// writes nothing.
+    fn retire_rings(&self, queue: Option<u16>) {
+        match queue {
+            Some(idx) => {
+                self.access.close_queue(idx);
+            }
+            None => self.access.close_all(),
+        }
+        self.access.drain();
+
+        {
+            let mut slots = self.completions.lock().expect("completion lock");
+            match queue {
+                Some(idx) => {
+                    if let Some(slot) = slots.get_mut(usize::from(idx)) {
+                        *slot = None;
+                    }
+                }
+                None => {
+                    for slot in slots.iter_mut() {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+        self.access
+            .reopen(self.interrupt.next_session(self.access.intr_session()));
+    }
 }
 
 /// State the FUSE worker shares with the device.
@@ -443,16 +491,10 @@ impl VirtioDevice for VirtioFs {
     }
 
     /// The handler snapshots the ring it was built on, so a ring the
-    /// driver programs again needs a new one.
+    /// driver programs again needs a new one, and the requests built
+    /// from the old ring are retired with it.
     fn queue_addr_set(&self, queue_idx: u16, _queue: &VirtQueue) {
-        if let Some(slot) = self
-            .completions
-            .lock()
-            .expect("completion lock")
-            .get_mut(usize::from(queue_idx))
-        {
-            *slot = None;
-        }
+        self.retire_rings(Some(queue_idx));
     }
 
     /// Collect the guest's chains and hand them to the worker.
@@ -577,26 +619,14 @@ impl VirtioDevice for VirtioFs {
     /// finishes into host memory, fails the generation check, and
     /// writes nothing.
     fn reset(&self) {
-        // Admission closes before the drain. A section refused before
-        // it takes the lock never queues on it, and `std::sync::RwLock`
-        // gives the writer no priority: a guest picks how much stale
-        // work is waiting, and it must not be able to starve this.
-        self.access.close_all();
-        self.access.drain();
-
         *self.negotiated_features.lock().expect("features lock") = 0;
-        for slot in self.completions.lock().expect("completion lock").iter_mut()
-        {
-            *slot = None;
-        }
         // The guest's fd tables are backing-store state, so this only
         // marks them and the worker closes them. Closing them here
         // would pull a descriptor out from under a syscall the worker
         // is inside. The mark goes up before admission reopens, so no
         // request of the next session is served against them.
         self.session_retired.store(true, Ordering::Release);
-        self.access
-            .reopen(self.interrupt.next_session(self.access.intr_session()));
+        self.retire_rings(None);
     }
 }
 
