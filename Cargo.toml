@@ -118,3 +118,7 @@ toml = "0.8"
 uuid = { version = "1.3", features = ["v4"] }
 des = "0.8"
 erased-serde = "0.4"
+# Proves at compile time that a type may be read from, or written to, a
+# byte buffer. A `Copy` bound cannot: it admits a type with padding, and
+# a type whose bit patterns are not all valid.
+zerocopy = { version = "0.8", features = ["derive"] }

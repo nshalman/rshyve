@@ -6,6 +6,13 @@
 //!
 //! Targets FUSE ABI 7.33. All on-the-wire structures are packed little-endian
 //! (host and guest are both little-endian on x86_64).
+//!
+//! Every wire struct derives the zerocopy traits. `IntoBytes` does not
+//! derive on a struct that has padding, so a field added in the wrong
+//! place fails to compile instead of putting uninitialized host bytes on
+//! the wire.
+
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 // ---------------------------------------------------------------------------
 // Protocol version
@@ -132,7 +139,7 @@ pub const FOPEN_STREAM: u32 = 1 << 4;
 
 /// Every FUSE request begins with this header.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseInHeader {
     pub len: u32,
     pub opcode: u32,
@@ -149,7 +156,7 @@ const _: () = assert!(size_of::<FuseInHeader>() == FUSE_IN_HEADER_SIZE);
 
 /// Every FUSE response begins with this header.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseOutHeader {
     pub len: u32,
     pub error: i32,
@@ -164,7 +171,7 @@ const _: () = assert!(size_of::<FuseOutHeader>() == FUSE_OUT_HEADER_SIZE);
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseAttr {
     pub ino: u64,
     pub size: u64,
@@ -187,7 +194,7 @@ pub struct FuseAttr {
 const _: () = assert!(size_of::<FuseAttr>() == 88);
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseEntryOut {
     pub nodeid: u64,
     pub generation: u64,
@@ -201,7 +208,7 @@ pub struct FuseEntryOut {
 const _: () = assert!(size_of::<FuseEntryOut>() == 128);
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseAttrOut {
     pub attr_valid: u64,
     pub attr_valid_nsec: u32,
@@ -216,7 +223,7 @@ const _: () = assert!(size_of::<FuseAttrOut>() == 104);
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseInitIn {
     pub major: u32,
     pub minor: u32,
@@ -225,7 +232,7 @@ pub struct FuseInitIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseInitOut {
     pub major: u32,
     pub minor: u32,
@@ -243,13 +250,13 @@ pub struct FuseInitOut {
 const _: () = assert!(size_of::<FuseInitOut>() == 64);
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseForgetIn {
     pub nlookup: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseGetattrIn {
     pub flags: u32,
     pub dummy: u32,
@@ -257,14 +264,14 @@ pub struct FuseGetattrIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseOpenIn {
     pub flags: u32,
     pub unused: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseOpenOut {
     pub fh: u64,
     pub open_flags: u32,
@@ -272,7 +279,7 @@ pub struct FuseOpenOut {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseReleaseIn {
     pub fh: u64,
     pub flags: u32,
@@ -281,7 +288,7 @@ pub struct FuseReleaseIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseReadIn {
     pub fh: u64,
     pub offset: u64,
@@ -293,7 +300,7 @@ pub struct FuseReadIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseWriteIn {
     pub fh: u64,
     pub offset: u64,
@@ -305,14 +312,14 @@ pub struct FuseWriteIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseWriteOut {
     pub size: u32,
     pub padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseFlushIn {
     pub fh: u64,
     pub unused: u32,
@@ -321,7 +328,7 @@ pub struct FuseFlushIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseFsyncIn {
     pub fh: u64,
     pub fsync_flags: u32,
@@ -329,28 +336,28 @@ pub struct FuseFsyncIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseAccessIn {
     pub mask: u32,
     pub padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseGetxattrIn {
     pub size: u32,
     pub padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseGetxattrOut {
     pub size: u32,
     pub padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseStatfsOut {
     pub blocks: u64,
     pub bfree: u64,
@@ -367,14 +374,14 @@ pub struct FuseStatfsOut {
 const _: () = assert!(size_of::<FuseStatfsOut>() == 80);
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseMkdirIn {
     pub mode: u32,
     pub umask: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseCreateIn {
     pub flags: u32,
     pub mode: u32,
@@ -383,14 +390,14 @@ pub struct FuseCreateIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseCreateOut {
     pub entry: FuseEntryOut,
     pub open: FuseOpenOut,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseSetattrIn {
     pub valid: u32,
     pub padding: u32,
@@ -411,7 +418,7 @@ pub struct FuseSetattrIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseRenameIn {
     pub newdir: u64,
 }
@@ -419,7 +426,7 @@ pub struct FuseRenameIn {
 /// Dirent header written by READDIR; followed by `namelen` bytes of name and
 /// padding to a 64-bit boundary.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseDirent {
     pub ino: u64,
     pub off: u64,
@@ -591,55 +598,30 @@ impl OpenFlags {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers for zero-copy access
+// Helpers for wire access
 // ---------------------------------------------------------------------------
+//
+// The bounds are the safety argument. `Copy` admits a type with padding,
+// whose padding bytes are uninitialized, and a type with invalid bit
+// patterns, such as `bool` or a reference. The caller picks the type, so
+// only a bound the compiler checks per type can refuse either one.
 
 /// Interpret a prefix of `buf` as `T` (little-endian packed).
 ///
-/// Returns `None` if `buf` is too short. Uses a bytewise copy so the result
-/// is valid even if `buf` is misaligned.
-pub fn read_at<T: Copy>(buf: &[u8]) -> Option<T> {
-    let need = size_of::<T>();
-    if buf.len() < need {
-        return None;
-    }
-    let mut out = std::mem::MaybeUninit::<T>::uninit();
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            buf.as_ptr(),
-            out.as_mut_ptr() as *mut u8,
-            need,
-        );
-        Some(out.assume_init())
-    }
+/// Returns `None` if `buf` is too short. Copies bytewise, so the result
+/// is correct even if `buf` is misaligned.
+pub fn read_at<T: FromBytes>(buf: &[u8]) -> Option<T> {
+    T::read_from_prefix(buf).ok().map(|(val, _rest)| val)
 }
 
-/// Serialize `val` by bytewise copy into a freshly allocated vector.
-pub fn bytes_of<T: Copy>(val: &T) -> Vec<u8> {
-    let len = size_of::<T>();
-    let mut v = vec![0u8; len];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            val as *const T as *const u8,
-            v.as_mut_ptr(),
-            len,
-        );
-    }
-    v
+/// Serialize `val` into a freshly allocated vector.
+pub fn bytes_of<T: IntoBytes + Immutable>(val: &T) -> Vec<u8> {
+    val.as_bytes().to_vec()
 }
 
-/// Append a `#[repr(C)] Copy` value to a byte buffer.
-pub fn push_val<T: Copy>(buf: &mut Vec<u8>, val: &T) {
-    let len = size_of::<T>();
-    let start = buf.len();
-    buf.resize(start + len, 0);
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            val as *const T as *const u8,
-            buf.as_mut_ptr().add(start),
-            len,
-        );
-    }
+/// Append a wire value to a byte buffer.
+pub fn push_val<T: IntoBytes + Immutable>(buf: &mut Vec<u8>, val: &T) {
+    buf.extend_from_slice(val.as_bytes());
 }
 
 // ---------------------------------------------------------------------------
@@ -810,6 +792,36 @@ mod tests {
         assert_eq!(back.uid, orig.uid);
         assert_eq!(back.gid, orig.gid);
         assert_eq!(back.pid, orig.pid);
+    }
+
+    /// The trait bounds must not change what the wire carries. Every
+    /// byte of the header, the `padding` field included, has to survive
+    /// `push_val` and come back, and no short prefix may read as a
+    /// header.
+    #[test]
+    fn push_val_then_read_at_reproduces_a_header() {
+        let orig = FuseInHeader {
+            len: FUSE_IN_HEADER_SIZE as u32,
+            opcode: FUSE_WRITE,
+            unique: 0x0102_0304_0506_0708,
+            nodeid: 0x1122_3344_5566_7788,
+            uid: 0xa1a2_a3a4,
+            gid: 0xb1b2_b3b4,
+            pid: 0xc1c2_c3c4,
+            padding: 0xd1d2_d3d4,
+        };
+
+        let mut buf = Vec::new();
+        push_val(&mut buf, &orig);
+        assert_eq!(buf.len(), FUSE_IN_HEADER_SIZE);
+
+        for short in 0..FUSE_IN_HEADER_SIZE {
+            let got: Option<FuseInHeader> = read_at(&buf[..short]);
+            assert!(got.is_none(), "{short} bytes must read as too short");
+        }
+
+        let back: FuseInHeader = read_at(&buf).expect("a full header");
+        assert_eq!(bytes_of(&back), buf);
     }
 
     // The literal Linux numbers, not `libc::O_*`: on illumos those are

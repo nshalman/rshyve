@@ -17,7 +17,6 @@ crates/vmm-hyperv 1
 crates/vmm-migrate 2
 crates/vmm-tpm 11
 crates/vmm-tpm-sys 2
-crates/vmm-virtio 3
 tools/fhrun 1
 tools/fhrun-init 20
 tools/virtiofs-test 51

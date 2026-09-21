@@ -1750,6 +1750,7 @@ dependencies = [
  "vmm_core",
  "vmm_devices",
  "vmm_devices_testsupport",
+ "zerocopy 0.8.48",
 ]
 
 [[package]]
