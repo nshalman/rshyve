@@ -106,7 +106,7 @@ impl VirtioVsock {
         let shared = Arc::new(VsockShared {
             mux: VsockMux::new(guest_cid),
             physmap,
-            access: crate::access::GuestAccess::new(),
+            access: crate::access::GuestAccess::new(VSOCK_NUM_QUEUES),
             pending_rx: Mutex::new(VecDeque::new()),
             rx_completion: Mutex::new(None),
             delivery: Mutex::new(()),
@@ -237,7 +237,7 @@ impl VirtioDevice for VirtioVsock {
         // it takes the lock never queues on it, and `std::sync::RwLock`
         // gives the writer no priority, so a host peer must not be able
         // to put this vCPU behind it.
-        self.shared.access.close();
+        self.shared.access.close_all();
         self.shared.access.drain();
 
         *self.negotiated_features.lock().expect("features lock") = 0;

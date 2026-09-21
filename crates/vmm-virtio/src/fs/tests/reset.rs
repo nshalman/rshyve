@@ -197,7 +197,7 @@ fn a_completion_from_the_closed_session_raises_nothing() {
 
     // Built the way a queue notification builds it: under permission.
     let handler = || {
-        let session = fs.access.enter_current().expect("a session is open");
+        let session = fs.access.enter_current(0).expect("a session is open");
         fs.get_completion(&session, FS_REQUEST_QUEUE, &queues[req])
     };
     let stale = handler();

@@ -43,7 +43,7 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(1);
 /// Hold guest access the way the worker holds it across a copy into
 /// or out of a chain.
 fn hold_guest_access(fs: &VirtioFs) -> Session<'_> {
-    fs.access.enter_current().expect("a session is open")
+    fs.access.enter_current(0).expect("a session is open")
 }
 
 #[derive(Default)]
@@ -824,7 +824,7 @@ fn a_stale_backlog_never_queues_on_the_reset_drain() {
 
     // A reset, stopped inside its drain: admission closed, the epoch
     // ended, and the exclusive side held.
-    fs.access.close();
+    fs.access.close_all();
     let drain = fs.access.hold_drain();
     fs.resume();
 
@@ -931,7 +931,7 @@ fn a_notification_refused_by_a_reset_touches_nothing() {
     // A reset has taken the ring. The drain is not held here: this
     // thread is the one calling in, and a gate that wrongly took the
     // reader lock would then wait on itself instead of failing.
-    fs.access.close();
+    fs.access.close_all();
 
     let did_work = fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
 

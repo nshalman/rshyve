@@ -55,7 +55,8 @@ impl VsockShared {
             // reset drains this section before it drops the handler, so
             // the one found here belongs to the driver being written
             // to.
-            let Some(_session) = self.access.enter_current() else {
+            let Some(_session) = self.access.enter_current(VSOCK_RX_QUEUE)
+            else {
                 return raise;
             };
             let completion = {

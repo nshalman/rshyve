@@ -243,7 +243,7 @@ fn a_reset_waits_for_a_delivery_already_inside_the_ring() {
     let held = console
         .shared
         .access
-        .enter_current()
+        .enter_current(CONSOLE_RX_QUEUE)
         .expect("a delivery is admitted");
     let finished = AtomicBool::new(false);
 
@@ -649,7 +649,7 @@ fn an_rx_completion_from_the_closed_session_raises_nothing() {
     let session = console
         .shared
         .access
-        .enter_current()
+        .enter_current(CONSOLE_RX_QUEUE)
         .expect("a delivery is admitted");
     let stale = console.ensure_rx_completion(&session, &rx_queue);
     drop(session);
@@ -672,7 +672,7 @@ fn an_rx_completion_from_the_closed_session_raises_nothing() {
     let session = console
         .shared
         .access
-        .enter_current()
+        .enter_current(CONSOLE_RX_QUEUE)
         .expect("a delivery is admitted");
     console.ensure_rx_completion(&session, &rx_queue).signal();
     drop(session);

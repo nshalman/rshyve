@@ -6,9 +6,11 @@
 //!
 //! One invariant holds the design together: a backing-store operation
 //! owns only host memory, and every guest-memory access needs
-//! permission for the request epoch, held until that access finishes.
-//! So a reset closes admission, ends the epoch, waits for the short
-//! guest-access sections, and returns. It never waits for the disk.
+//! permission for the ring generation it was authorised under, held
+//! until that access finishes. So a reset closes admission, ends every
+//! generation, waits for the short guest-access sections, and returns.
+//! It never waits for the disk. A driver that programs one ring again
+//! retires that ring's generation alone.
 //!
 //! Requests that reach the disk run on worker threads. Only the ones
 //! that touch guest memory alone, such as GET_ID, run inline on the
@@ -35,7 +37,7 @@ mod probes {
     fn vioblk_inline(head: u16, rtype: u32, sector: u64) {}
     fn vioblk_dispatch(head: u16, rtype: u32, sector: u64) {}
     fn vioblk_complete(head: u16, status: u8) {}
-    fn vioblk_reset_drain(epoch: u64) {}
+    fn vioblk_reset_drain(queue_idx: u32, generation: u64) {}
 }
 
 use super::bits;
@@ -49,7 +51,7 @@ mod io;
 mod tests;
 mod worker;
 
-use crate::access::{GuestAccess, Session};
+use crate::access::{GuestAccess, RingTag, Session};
 use crate::pci::intr::{BackendIntr, IntrSlot};
 use access::BackendBarrier;
 use io::{parse_header, write_status};
@@ -188,7 +190,7 @@ impl VirtioBlock {
         let ctx = WorkerCtx {
             physmap: Arc::clone(&physmap),
             gate: Arc::clone(&gate),
-            access: Arc::new(GuestAccess::new()),
+            access: Arc::new(GuestAccess::new(num_queues as usize)),
             backend: Arc::new(BackendBarrier::new()),
             #[cfg(test)]
             parks: Arc::new(worker::WorkerParks::default()),
@@ -301,31 +303,54 @@ impl VirtioBlock {
         c
     }
 
-    /// End the session that owns the rings, wait out the guest-memory
-    /// sections already inside it, and drop every used-ring writer.
+    /// End the generations that own the retired rings, wait out the
+    /// guest-memory sections already inside them, and drop the
+    /// used-ring writers they name.
     ///
-    /// Admission closes before the wait. A section refused before it
-    /// takes the lock never queues on it, and `std::sync::RwLock` gives
-    /// the writer no priority: a guest picks how much stale work is
-    /// waiting, and it must not be able to starve this.
+    /// `queue` names the one ring a driver programmed again, or `None`
+    /// for a device reset. A reprogrammed queue takes only its own
+    /// generation and its own writer: a request still in flight on
+    /// another queue names a ring the driver never gave up, and
+    /// discarding it leaves that request unanswered forever.
     ///
-    /// Every writer goes, not only the reprogrammed queue's: a writer
-    /// carries the interrupt session it was built in, so one kept past
-    /// the new session would have each raise refused and its queue
-    /// would stall with no way back but a device reset.
+    /// Admission closes before the wait, for every queue. A section
+    /// refused before it takes the lock never queues on it, and
+    /// `std::sync::RwLock` gives the writer no priority: a guest picks
+    /// how much stale work is waiting, and it must not be able to
+    /// starve this.
     ///
     /// This does not wait for the disk. A backend operation owns host
-    /// memory alone, so it is retired against the old epoch and left to
-    /// finish into buffers the next session discards. The wait covers
-    /// bounded copies and ring walks, which is what lets a vCPU run it.
-    fn retire_rings(&self) {
-        let epoch = self.ctx.access.close();
-        probes::vioblk_reset_drain!(|| epoch);
-        self.ctx.backend.retire(epoch);
+    /// memory alone, so it is retired and left to finish into buffers
+    /// the next generation discards. The wait covers bounded copies
+    /// and ring walks, which is what lets a vCPU run it.
+    fn retire_rings(&self, queue: Option<u16>) {
+        match queue {
+            Some(idx) => {
+                let generation = self.ctx.access.close_queue(idx);
+                probes::vioblk_reset_drain!(|| (u32::from(idx), generation));
+            }
+            None => {
+                self.ctx.access.close_all();
+                probes::vioblk_reset_drain!(|| (u32::MAX, 0));
+            }
+        }
+        self.ctx.backend.retire();
         self.ctx.access.drain();
 
-        for slot in self.completions.lock().expect("lock").iter_mut() {
-            *slot = None;
+        {
+            let mut slots = self.completions.lock().expect("lock");
+            match queue {
+                Some(idx) => {
+                    if let Some(slot) = slots.get_mut(usize::from(idx)) {
+                        *slot = None;
+                    }
+                }
+                None => {
+                    for slot in slots.iter_mut() {
+                        *slot = None;
+                    }
+                }
+            }
         }
         self.ctx.access.reopen(
             self.interrupt.next_session(self.ctx.access.intr_session()),
@@ -437,27 +462,26 @@ impl VirtioBlock {
     /// Hand a request to one of the queue's workers.
     fn dispatch(
         &self,
-        queue_idx: u16,
-        epoch: u64,
+        tag: RingTag,
         completion: &Arc<VirtioCompletion>,
         head: u16,
         header: &VirtioBlkReqHdr,
         chain: Vec<ChainBuf>,
     ) {
         probes::vioblk_dispatch!(|| (head, header.rtype, header.sector));
-        let base = queue_idx as usize * self.workers_per_queue;
-        let idx = self.next_worker[queue_idx as usize]
-            .fetch_add(1, Ordering::Relaxed)
+        let queue_idx = usize::from(tag.queue_idx());
+        let base = queue_idx * self.workers_per_queue;
+        let idx = self.next_worker[queue_idx].fetch_add(1, Ordering::Relaxed)
             % self.workers_per_queue;
         // A closed channel means the worker is gone during shutdown.
-        // The request carries an epoch, so nothing else has to undo.
+        // The request carries its ring, so nothing else has to undo.
         let _ = self.io_txs[base + idx].send(BlkIoRequest {
             rtype: header.rtype,
             sector: header.sector,
             chain,
             head,
             completion: Arc::clone(completion),
-            epoch,
+            tag,
         });
     }
 }
@@ -564,12 +588,12 @@ impl VirtioDevice for VirtioBlock {
             None => return false,
         };
 
-        let Some(session) = self.ctx.access.enter_current() else {
-            // A reset owns the ring. Its queue state goes with it.
+        let Some(session) = self.ctx.access.enter_current(queue_idx) else {
+            // A retirement owns the ring. Its queue state goes with it.
             return false;
         };
         let completion = self.get_completion(&session, queue_idx, queue);
-        let epoch = session.epoch();
+        let tag = session.tag();
 
         // Bound the work retained by one notification to the queue size.
         let max_requests = usize::from(queue.size());
@@ -622,7 +646,7 @@ impl VirtioDevice for VirtioBlock {
         drop(session);
 
         for (head, header, chain) in requests {
-            self.dispatch(queue_idx, epoch, &completion, head, &header, chain);
+            self.dispatch(tag, &completion, head, &header, chain);
         }
 
         raise
@@ -642,12 +666,12 @@ impl VirtioDevice for VirtioBlock {
     /// driver programs again needs a new one. A worker still holding
     /// the old handler finishes into the old ring, which the driver
     /// gave up when it moved.
-    fn queue_addr_set(&self, _queue_idx: u16, _queue: &VirtQueue) {
+    fn queue_addr_set(&self, queue_idx: u16, _queue: &VirtQueue) {
         // A driver may program a ring again without resetting the
         // device. Dropping the cached writer alone left every worker
         // that already holds one still able to publish into the ring
-        // the driver gave up, so the epoch ends here too.
-        self.retire_rings();
+        // the driver gave up, so this queue's generation ends here too.
+        self.retire_rings(Some(queue_idx));
     }
 
     /// Reset the device, and do not return until no worker can still
@@ -666,11 +690,12 @@ impl VirtioDevice for VirtioBlock {
     /// guest-memory sections alone. Each of those is a bounded copy or
     /// ring walk, so the wait needs no deadline and has none.
     ///
-    /// Ending the epoch stops any further raise for the old session.
-    /// A raise already past that check is abandoned, not waited for:
-    /// injection is a call into the kernel, and this runs on a vCPU.
+    /// Ending every generation stops any further raise for the old
+    /// session. A raise already past that check is abandoned, not
+    /// waited for: injection is a call into the kernel, and this runs
+    /// on a vCPU.
     fn reset(&self) {
-        self.retire_rings();
+        self.retire_rings(None);
     }
 }
 

@@ -755,7 +755,7 @@ fn a_delivery_without_the_resets_permission_writes_nothing() {
     assert!(vsock.shared.mux.start_host_connect(key));
 
     // Admission shut, the way a reset shuts it before its drain.
-    vsock.shared.access.close();
+    vsock.shared.access.close_all();
     vsock.shared.deliver_rx();
 
     assert_eq!(
@@ -794,14 +794,14 @@ fn a_reset_waits_out_a_delivery_already_inside() {
     let session = vsock
         .shared
         .access
-        .enter_current()
+        .enter_current(VSOCK_RX_QUEUE)
         .expect("a session is open");
 
     let finished = Arc::new(AtomicBool::new(false));
     let done = Arc::clone(&finished);
     let device = Arc::clone(&vsock.shared);
     let resetter = std::thread::spawn(move || {
-        device.access.close();
+        device.access.close_all();
         device.access.drain();
         done.store(true, Ordering::Release);
         device.access.reopen(device.access.intr_session());
