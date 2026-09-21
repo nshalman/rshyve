@@ -686,7 +686,7 @@ impl VirtioDevice for VirtioBlock {
     ///
     /// It is safe to run synchronously because it does not wait for the
     /// disk, and it does not wait for interrupt delivery either.
-    /// Admission closes, the epoch ends, and the wait covers the
+    /// Admission closes, every generation ends, and the wait covers the
     /// guest-memory sections alone. Each of those is a bounded copy or
     /// ring walk, so the wait needs no deadline and has none.
     ///

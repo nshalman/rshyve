@@ -315,10 +315,10 @@ fn a_reprogrammed_ring_gets_its_own_used_ring_writer() {
 /// A driver may program a ring again without resetting the device, and
 /// a worker with a request in flight holds its own `Arc` to the writer
 /// that names the old ring. Dropping the cached one leaves that worker
-/// publishing into memory the guest has taken back, so the epoch has to
-/// end with the ring.
+/// publishing into memory the guest has taken back, so the generation
+/// has to end with the ring.
 #[test]
-fn a_reprogrammed_ring_ends_the_epoch_that_named_it() {
+fn a_reprogrammed_ring_ends_the_generation_that_named_it() {
     const DESC_GPA: u64 = 0x1000;
     const AVAIL_GPA: u64 = 0x1100;
     const NEW_USED_GPA: u64 = 0x1400;

@@ -31,7 +31,10 @@ fn a_reply_raises_on_the_queue_it_belongs_to() {
     ));
 
     for queue_idx in [FS_HIPRIO_QUEUE, FS_REQUEST_QUEUE] {
-        let session = fs.access.enter_current(0).expect("a session is open");
+        let session = fs
+            .access
+            .enter_current(queue_idx)
+            .expect("a generation is open");
         let completion = fs.get_completion(
             &session,
             queue_idx,

@@ -102,7 +102,7 @@ fn read_payload<'a>(
 
 /// Validate one DISCARD or WRITE_ZEROES request against guest memory.
 ///
-/// The caller must hold guest-access permission for the request epoch.
+/// The caller must hold guest-access permission for the request's ring.
 pub(super) fn plan(
     limits: &DiskLimits,
     rtype: u32,

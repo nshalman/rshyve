@@ -43,7 +43,9 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(1);
 /// Hold guest access the way the worker holds it across a copy into
 /// or out of a chain.
 fn hold_guest_access(fs: &VirtioFs) -> Session<'_> {
-    fs.access.enter_current(0).expect("a session is open")
+    fs.access
+        .enter_current(FS_REQUEST_QUEUE)
+        .expect("a generation is open")
 }
 
 #[derive(Default)]
@@ -542,7 +544,7 @@ fn reset_never_parks_the_worker() {
 // because the worker holds raw fds from them across a FUSE syscall and
 // a number closed under it goes to the next thread in this process
 // that opens anything. The worker reaps them instead, once it sees the
-// epoch move.
+// mark go up.
 #[test]
 fn the_worker_reaps_the_fd_tables_a_reset_retired() {
     let dir = tempfile::tempdir().expect("export directory");
@@ -594,7 +596,7 @@ fn the_worker_reaps_the_fd_tables_a_reset_retired() {
     );
 }
 
-// A worker inside a copy has already passed its epoch check, so no
+// A worker inside a copy has already passed its generation check, so no
 // later check takes that copy back. The reset must not finish while
 // the worker holds the shared side, and it needs no deadline to say
 // so: the sections under that guard are bounded copies.
@@ -676,8 +678,8 @@ fn a_pause_that_lands_inside_a_reset_survives_it() {
 // The invariant, stated as a test: a backing-store call owns only host
 // memory, so a reset can end the driver session while one is running
 // and nothing it produces reaches the guest. The worker has already
-// copied the request out and passed its first epoch check, which is
-// the interleaving that matters.
+// copied the request out and passed its first generation check, which
+// is the interleaving that matters.
 #[test]
 fn a_backend_parked_across_a_reset_writes_nothing_into_the_ring() {
     let (physmap, mut queues, fs) = ring(8, 1);
@@ -871,8 +873,8 @@ fn a_stale_backlog_never_queues_on_the_reset_drain() {
         "the backlog never reached the worker"
     );
 
-    // A reset, stopped inside its drain: admission closed, the epoch
-    // ended, and the exclusive side held.
+    // A reset, stopped inside its drain: admission closed, every
+    // generation ended, and the exclusive side held.
     fs.access.close_all();
     let drain = fs.access.hold_drain();
     fs.resume();
