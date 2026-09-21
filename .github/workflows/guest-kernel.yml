@@ -73,6 +73,9 @@ jobs:
       # tools/*.sh only, so this job lints the scripts it runs.
       - run: shellcheck -S warning kernel/*.sh
 
+      # A gate nobody has watched fail is not known to work.
+      - run: kernel/check-config-test.sh
+
       # build.sh pulls a digest-pinned Alpine image from Docker Hub and
       # a kernel tarball from cdn.kernel.org, and verifies the tarball
       # against the SHA-256 it records. The tarball is not cached here:
