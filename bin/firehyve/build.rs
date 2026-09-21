@@ -1,32 +1,24 @@
-use std::process::Command;
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-fn find_git() -> &'static str {
-    for path in ["/opt/tools/bin/git", "/usr/bin/git", "git"] {
-        if Command::new(path).arg("--version").output().is_ok() {
-            return match path {
-                "/opt/tools/bin/git" => "/opt/tools/bin/git",
-                "/usr/bin/git" => "/usr/bin/git",
-                _ => "git",
-            };
-        }
-    }
-    "git"
-}
+//! Stamp the source revision into the binary.
+//!
+//! The build driver supplies the revision. This script runs no git,
+//! because the illumos build host holds no clone. See the shared file
+//! below for the failure that rule prevents.
+
+include!("../../crates/vmm-machine/src/build_rev.rs");
+
+/// Where the shared rule lives, relative to this package.
+const BUILD_REV_SRC: &str = "../../crates/vmm-machine/src/build_rev.rs";
 
 fn main() {
-    let output = Command::new(find_git())
-        .args(["rev-parse", "--short", "HEAD"])
-        .output();
+    // Cargo re-runs a build script only for the inputs it is told
+    // about. Without this line a stamped build after an unstamped one
+    // keeps the stale value.
+    println!("cargo:rerun-if-env-changed={BUILD_REV_ENV}");
+    println!("cargo:rerun-if-changed={BUILD_REV_SRC}");
 
-    let commit = match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
-        _ => "unknown".to_string(),
-    };
-
-    println!("cargo:rustc-env=FIREHYVE_GIT_COMMIT={commit}");
-
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/refs/");
+    println!("cargo:rustc-env=FIREHYVE_GIT_COMMIT={}", build_rev());
 }
