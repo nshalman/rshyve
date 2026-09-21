@@ -5,53 +5,30 @@
 //! The CONTROL verb on the vsock host socket.
 //!
 //! A host peer that sends `CONNECT <port>` is joined to a guest port. A
-//! peer that sends `CONTROL` is answered by the VMM itself, and nothing
-//! it sends ever reaches the guest mux. firehyve has no control socket
-//! of its own, so this is how an operator reads the machine.
-//!
-//! # Grammar
+//! peer that sends `CONTROL` is answered by the VMM itself and reaches
+//! no guest. firehyve has no control socket, so this is how an operator
+//! reads the machine.
 //!
 //! ```text
 //! open     = "CONTROL" LF
 //! banner   = "OK control" LF
-//! auth     = "auth" SP token LF          ; first request, always
 //! request  = verb *( SP argument ) LF
 //! response = ( "OK" *( SP field ) | "ERR" SP reason ) LF
 //! field    = value *( "," value )
 //! ```
 //!
 //! One request per line, one response line back. A list answer is
-//! `OK <count>` followed by one field per record, and a record is its
-//! values joined by commas, so a client splits on whitespace and then on
-//! commas. No value carries a space or a comma. A response line is
-//! bounded by [`RESPONSE_LINE_MAX`]; an answer that would exceed it is
-//! replaced by one refusal, never cut.
+//! `OK <count>` and one field per record; a record is its values
+//! joined by commas. No value carries a space or a comma. A response
+//! past [`RESPONSE_LINE_MAX`] is one refusal, never a cut list.
 //!
-//! ```text
-//! auth <token> -> OK auth
-//! device-list  -> OK 2 virtio-blk@4,0.4.0,present varstore,-,present
-//! cpu-list     -> OK 2 0,present 1,present
-//! mem-list     -> OK 1 boot,1073741824,present
-//! status       -> OK 6 state,running uptime_ms,1234 ...
-//! metrics      -> OK 7 uptime_ms,1234 vcpu0.exits,10 ...
-//! halt         -> OK halt,requested
-//! ```
-//!
-//! `device-add` and `device-remove` are recognised and refused: the
-//! device set is fixed at boot, and after the privilege lock the VMM
-//! could not open a new backing file anyway.
-//!
-//! # Trust
-//!
-//! Three gates, in order. The socket is 0600 in a 0700 directory. The
-//! accept loop applies the process peer policy, so the peer is the
-//! VMM's own uid in its zone or root in the global zone. Then the
-//! session's first line must carry the peer token the launcher gave
-//! the VMM, compared in constant time, and a session without it gets
-//! one refusal and closes. The request is still parsed as hostile
-//! input: the line is bounded, nothing parsed from it indexes
-//! anything, and a malformed verb is answered with one line and
-//! changes no state.
+//! Who may speak is decided before this module runs: the socket is
+//! 0600 in a 0700 directory and the accept loop applies the process
+//! peer policy (`vmm_core::unixsock::peercred`). There is no token.
+//! The only peer that can reach a path under the zone root is
+//! global-zone root, which the policy admits. A request is still
+//! hostile input: the line is bounded, nothing parsed from it indexes
+//! anything, and a malformed verb changes no state.
 
 use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
@@ -60,7 +37,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use constant_time_eq::constant_time_eq;
 use slog::warn;
 
 use vmm_core::unixsock::write_all_bounded;
@@ -76,8 +52,8 @@ use crate::pci::VirtioPciDevice;
 
 /// Longest request accepted, for the same reason the CONNECT line is
 /// capped: a peer that never sends a newline must not make the device
-/// read without bound. Wide enough for `auth` and its token.
-const CONTROL_LINE_MAX: usize = 512;
+/// read without bound. A request is one verb and at most one number.
+const CONTROL_LINE_MAX: usize = 128;
 
 /// Longest response line written back, newline excluded.
 ///
@@ -282,85 +258,6 @@ impl ControlReply {
     }
 }
 
-/// The shared secret a CONTROL peer must present before its first verb.
-///
-/// The launcher hands it to the VMM in a 0600 file named on the
-/// command line, never as a literal in argv: the zone brand offers no
-/// way to set the environment of a zone's init, and an argv literal is
-/// readable by every process in the zone through `psinfo`.
-#[derive(Clone)]
-pub struct ControlToken(Arc<[u8]>);
-
-/// Shortest token accepted. Below this a peer inside the session cap
-/// could enumerate it.
-pub const TOKEN_MIN: usize = 16;
-/// Longest token accepted, so the auth line stays inside the request
-/// cap.
-pub const TOKEN_MAX: usize = 128;
-
-impl ControlToken {
-    /// One token from its bytes: trailing newlines are dropped, and
-    /// what remains must be [`TOKEN_MIN`]..=[`TOKEN_MAX`] printable
-    /// ASCII with no whitespace, so the auth line splits where the
-    /// grammar says.
-    pub fn parse(raw: &[u8]) -> Result<Self, String> {
-        let mut end = raw.len();
-        while end > 0 && matches!(raw[end - 1], b'\n' | b'\r') {
-            end -= 1;
-        }
-        let token = &raw[..end];
-        if token.len() < TOKEN_MIN {
-            return Err(format!(
-                "control token is too short: {} bytes, at least {TOKEN_MIN}",
-                token.len()
-            ));
-        }
-        if token.len() > TOKEN_MAX {
-            return Err(format!(
-                "control token is too long: {} bytes, at most {TOKEN_MAX}",
-                token.len()
-            ));
-        }
-        if token.iter().any(|b| !b.is_ascii_graphic()) {
-            return Err(
-                "control token must be printable ASCII with no whitespace"
-                    .to_string(),
-            );
-        }
-        Ok(Self(Arc::from(token)))
-    }
-
-    /// Constant time, so a wrong token costs the same as a nearly
-    /// right one.
-    fn matches(&self, presented: &[u8]) -> bool {
-        constant_time_eq(&self.0, presented)
-    }
-}
-
-impl std::fmt::Debug for ControlToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ControlToken(<{} bytes>)", self.0.len())
-    }
-}
-
-/// What the first request line of a session must be.
-enum AuthLine<'a> {
-    /// `auth <token>`, exactly two fields.
-    Token(&'a str),
-    Malformed,
-    /// Any other verb, before the peer proved itself.
-    NotAuth,
-}
-
-fn auth_line(line: &str) -> AuthLine<'_> {
-    let mut fields = line.split_whitespace();
-    match (fields.next(), fields.next(), fields.next()) {
-        (Some("auth"), Some(token), None) => AuthLine::Token(token),
-        (Some("auth"), _, _) => AuthLine::Malformed,
-        _ => AuthLine::NotAuth,
-    }
-}
-
 /// One value, safe to put on the wire.
 ///
 /// The grammar separates records by spaces and values by commas, and an
@@ -424,41 +321,29 @@ pub fn answer_line(sink: &dyn ControlSink, line: &str) -> String {
     }
 }
 
-/// The device's sink and the token that guards it, filled in after the
-/// device exists.
+/// The device's sink, filled in after the device exists.
 ///
 /// The sink reads the device registry, and the registry is not complete
 /// until every device is attached, so the binary installs it once the
-/// attach pass returns. Until then a CONTROL request is refused. There
-/// is no way to install a sink without a token.
+/// attach pass returns. Until then a CONTROL request is refused.
 #[derive(Clone, Default)]
 pub struct ControlSlot {
-    sink: Arc<Mutex<Option<Installed>>>,
-}
-
-#[derive(Clone)]
-struct Installed {
-    sink: Arc<dyn ControlSink>,
-    token: ControlToken,
+    sink: Arc<Mutex<Option<Arc<dyn ControlSink>>>>,
 }
 
 impl ControlSlot {
-    /// Install the sink and the token. Called once, at startup.
-    pub fn install(&self, sink: Arc<dyn ControlSink>, token: ControlToken) {
+    /// Install the sink. Called once, at startup.
+    pub fn install(&self, sink: Arc<dyn ControlSink>) {
         // No panic on a host-facing path, for the same reason [`Self::sink`]
         // takes the poison tolerantly. The slot holds one `Option`, which a
         // panic elsewhere cannot leave half written, so the install goes
         // through the poison rather than dropping the sink in silence.
         let mut slot = self.sink.lock().unwrap_or_else(|e| e.into_inner());
-        *slot = Some(Installed { sink, token });
+        *slot = Some(sink);
     }
 
     /// The installed sink, or `None` while the slot is empty.
     pub fn sink(&self) -> Option<Arc<dyn ControlSink>> {
-        self.installed().map(|i| i.sink)
-    }
-
-    fn installed(&self) -> Option<Installed> {
         // No panic on a host-facing path: a poisoned lock reads as an
         // empty slot, which the caller refuses cleanly.
         self.sink.lock().ok().and_then(|guard| guard.clone())
@@ -620,54 +505,13 @@ pub(super) fn run_control_session(
     // Each refusal below writes one line and closes. The write is best
     // effort: the peer may already be gone, and there is nothing else to
     // report to.
-    let Some(Installed { sink, token }) = slot.installed() else {
+    let Some(sink) = slot.sink() else {
         warn!(log, "vsock CONTROL refused; no control sink installed");
         let _ = write_line(&mut stream, "ERR control interface not available");
         return;
     };
     if write_line(&mut stream, "OK control").is_err() {
         return;
-    }
-
-    // The first line proves the peer. One try: a wrong or missing
-    // token ends the session, so the session cap bounds the guesses.
-    match read_line_bounded(
-        &mut stream,
-        shutdown,
-        CONTROL_LINE_MAX,
-        Some(Instant::now() + HANDSHAKE_BUDGET),
-    ) {
-        LineRead::Line(line) => match auth_line(&line) {
-            AuthLine::Token(presented)
-                if token.matches(presented.as_bytes()) =>
-            {
-                if write_line(&mut stream, "OK auth").is_err() {
-                    return;
-                }
-            }
-            AuthLine::Token(_) => {
-                warn!(log, "vsock CONTROL refused; wrong peer token");
-                let _ = write_line(&mut stream, "ERR auth failed");
-                return;
-            }
-            AuthLine::Malformed => {
-                let _ = write_line(&mut stream, "ERR auth takes one token");
-                return;
-            }
-            AuthLine::NotAuth => {
-                let _ = write_line(&mut stream, "ERR auth required");
-                return;
-            }
-        },
-        LineRead::TooLong => {
-            let _ = write_line(&mut stream, "ERR request line too long");
-            return;
-        }
-        LineRead::NotUtf8 => {
-            let _ = write_line(&mut stream, "ERR request is not text");
-            return;
-        }
-        LineRead::Closed => return,
     }
 
     loop {
@@ -681,15 +525,7 @@ pub(super) fn run_control_session(
             Some(Instant::now() + idle_budget),
         ) {
             LineRead::Line(request) => {
-                // A second auth is not a request; it is answered
-                // rather than parsed as a verb, so it can never
-                // reach a sink.
-                let answer = match auth_line(&request) {
-                    AuthLine::NotAuth => answer_line(sink.as_ref(), &request),
-                    _ => {
-                        ControlReply::refused("already authenticated").render()
-                    }
-                };
+                let answer = answer_line(sink.as_ref(), &request);
                 if write_line(&mut stream, framed(&answer)).is_err() {
                     return;
                 }
@@ -775,12 +611,6 @@ mod tests {
         slog::Logger::root(slog::Discard, slog::o!())
     }
 
-    const TOKEN: &str = "test-token-0123456789abcdef";
-
-    fn token() -> ControlToken {
-        ControlToken::parse(TOKEN.as_bytes()).expect("a valid test token")
-    }
-
     /// Start a session over one end of a socket pair and give the test
     /// the other end plus the thread to join. The peer has not spoken.
     fn session_with_idle(
@@ -818,21 +648,19 @@ mod tests {
         String::from_utf8(line).expect("text")
     }
 
-    /// A session past the banner and the auth line.
+    /// A session past the banner.
     fn session(
         slot: &ControlSlot,
         shutdown: Arc<AtomicBool>,
     ) -> (UnixStream, thread::JoinHandle<()>) {
         let (mut client, handle) = session_raw(slot, shutdown);
         assert_eq!(read_line_raw(&mut client), "OK control");
-        write_line(&mut client, &format!("auth {TOKEN}")).expect("auth");
-        assert_eq!(read_line_raw(&mut client), "OK auth");
         (client, handle)
     }
 
     fn installed(sink: Arc<dyn ControlSink>) -> ControlSlot {
         let slot = ControlSlot::default();
-        slot.install(sink, token());
+        slot.install(sink);
         slot
     }
 
@@ -853,118 +681,22 @@ mod tests {
         handle.join().expect("session thread");
     }
 
-    /// The token is the third gate, after the socket mode and the peer
-    /// policy. A session that skips it gets nothing.
+    /// The first request is served straight after the banner: the peer
+    /// gate ran in the accept loop, and there is no second proof.
     #[test]
-    fn a_verb_before_auth_is_refused_and_closed() {
+    fn the_first_request_after_the_banner_is_served() {
         let slot = installed(Arc::new(EchoSink));
         let (mut client, handle) =
             session_raw(&slot, Arc::new(AtomicBool::new(false)));
 
         assert_eq!(read_line_raw(&mut client), "OK control");
-        write_line(&mut client, "device-list").expect("request");
-        let mut reader = BufReader::new(client);
-        let mut line = String::new();
-        reader.read_line(&mut line).expect("answer");
-
-        assert_eq!(line, "ERR auth required\n");
-        assert_session_closed(&mut reader);
-        handle.join().expect("session thread");
-    }
-
-    #[test]
-    fn a_wrong_token_is_refused_and_closed() {
-        let slot = installed(Arc::new(EchoSink));
-        let (mut client, handle) =
-            session_raw(&slot, Arc::new(AtomicBool::new(false)));
-
-        assert_eq!(read_line_raw(&mut client), "OK control");
-        // Same length, one byte off: the comparison is not a prefix
-        // match.
-        let wrong = format!("{}X", &TOKEN[..TOKEN.len() - 1]);
-        write_line(&mut client, &format!("auth {wrong}")).expect("auth");
-        let mut reader = BufReader::new(client);
-        let mut line = String::new();
-        reader.read_line(&mut line).expect("answer");
-
-        assert_eq!(line, "ERR auth failed\n");
-        assert_session_closed(&mut reader);
-        handle.join().expect("session thread");
-    }
-
-    #[test]
-    fn an_auth_line_with_the_wrong_shape_is_refused() {
-        for bad in ["auth", "auth a b"] {
-            let slot = installed(Arc::new(EchoSink));
-            let (mut client, handle) =
-                session_raw(&slot, Arc::new(AtomicBool::new(false)));
-            assert_eq!(read_line_raw(&mut client), "OK control");
-            write_line(&mut client, bad).expect("auth");
-            let mut reader = BufReader::new(client);
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("answer");
-            assert_eq!(line, "ERR auth takes one token\n", "for {bad:?}");
-            handle.join().expect("session thread");
-        }
-    }
-
-    /// A second auth is answered, not parsed, so no sink ever sees a
-    /// token.
-    #[test]
-    fn a_second_auth_is_refused_without_closing() {
-        let slot = installed(Arc::new(EchoSink));
-        let (mut client, handle) =
-            session(&slot, Arc::new(AtomicBool::new(false)));
-
-        write_line(&mut client, &format!("auth {TOKEN}")).expect("auth");
-        assert_eq!(read_line_raw(&mut client), "ERR already authenticated");
         write_line(&mut client, "device-list").expect("request");
         assert_eq!(read_line_raw(&mut client), "OK device-list");
+        // `auth` is not a verb any more, so it is a typo like any other.
+        write_line(&mut client, "auth whatever").expect("request");
+        assert_eq!(read_line_raw(&mut client), "ERR unknown command auth");
         drop(client);
         handle.join().expect("session thread");
-    }
-
-    /// A silent peer on the auth line holds a session slot until the
-    /// handshake budget, not for ever.
-    #[test]
-    fn a_peer_that_never_sends_auth_loses_the_session() {
-        let slot = installed(Arc::new(EchoSink));
-        let (mut client, handle) =
-            session_raw(&slot, Arc::new(AtomicBool::new(false)));
-        assert_eq!(read_line_raw(&mut client), "OK control");
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        thread::spawn(move || {
-            let _ = tx.send(handle.join().is_ok());
-        });
-        assert_eq!(
-            rx.recv_timeout(HANDSHAKE_BUDGET + Duration::from_secs(3)),
-            Ok(true),
-            "the session must end on the handshake budget"
-        );
-        drop(client);
-    }
-
-    #[test]
-    fn a_token_is_bounded_and_printable() {
-        assert!(ControlToken::parse(b"short").is_err());
-        assert!(ControlToken::parse(&[b'a'; TOKEN_MAX + 1]).is_err());
-        assert!(ControlToken::parse(b"has a space in it, yes").is_err());
-        assert!(ControlToken::parse(b"tab\there-0123456789abc").is_err());
-        assert!(ControlToken::parse(&[0xff; 32]).is_err());
-        // A trailing newline from an editor is not part of the token.
-        let token = ControlToken::parse(b"0123456789abcdef\n").expect("ok");
-        assert!(token.matches(b"0123456789abcdef"));
-        assert!(!token.matches(b"0123456789abcdef\n"));
-        assert!(!token.matches(b"0123456789abcde"));
-        assert!(!token.matches(b"0123456789abcdefg"));
-    }
-
-    #[test]
-    fn a_token_never_prints_itself() {
-        let token = ControlToken::parse(b"0123456789abcdef").expect("ok");
-        let shown = format!("{token:?}");
-        assert!(!shown.contains("0123456789abcdef"), "{shown}");
     }
 
     #[test]
@@ -1120,8 +852,6 @@ mod tests {
             Duration::from_millis(50),
         );
         assert_eq!(read_line_raw(&mut client), "OK control");
-        write_line(&mut client, &format!("auth {TOKEN}")).expect("auth");
-        assert_eq!(read_line_raw(&mut client), "OK auth");
 
         // Nothing is sent from here, and the shutdown flag stays clear:
         // only the idle budget can end this.
@@ -1249,7 +979,7 @@ mod tests {
         .join()
         .expect_err("the worker panics on purpose");
 
-        slot.install(Arc::new(EchoSink), token());
+        slot.install(Arc::new(EchoSink));
 
         // A poisoned lock must not kill the VMM, and must not swallow
         // the sink either.
@@ -1261,7 +991,7 @@ mod tests {
     fn an_empty_slot_hands_back_no_sink() {
         let slot = ControlSlot::default();
         assert!(slot.sink().is_none());
-        slot.install(Arc::new(EchoSink), token());
+        slot.install(Arc::new(EchoSink));
         assert!(slot.sink().is_some());
         // The clone shares the slot: the binary installs into a clone.
         assert!(slot.clone().sink().is_some());

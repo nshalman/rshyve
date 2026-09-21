@@ -347,10 +347,10 @@ pub struct Cli {
     /// then drop to --run-as-uid/--run-as-gid.
     ///
     /// `--priv-drop` alone means on; `--priv-drop=false` means off.
-    /// Left out, each binary picks its own default: on for firehyve,
-    /// off for rshyve. Either way the binary logs which it did. The
-    /// value needs `=`, because the zone brand puts the VM name right
-    /// after its extra options and a bare flag would swallow it.
+    /// rshyve defaults off and logs which it did. firehyve always
+    /// drops and refuses `=false`. The value needs `=`, because the
+    /// zone brand puts the VM name right after its extra options and
+    /// a bare flag would swallow it.
     #[arg(
         long,
         num_args = 0..=1,
@@ -368,16 +368,6 @@ pub struct Cli {
     /// The numeric gid to run as after the privilege lock.
     #[arg(long)]
     pub run_as_gid: Option<u32>,
-
-    /// A 0600 file holding the peer token every vsock CONTROL session
-    /// must present first.
-    ///
-    /// A file rather than a literal: the zone brand cannot set the
-    /// environment of a zone's init, and a literal in argv is readable
-    /// by every process in the zone through psinfo. Without this flag
-    /// the CONTROL verb is refused.
-    #[arg(long)]
-    pub control_token_file: Option<PathBuf>,
 
     /// VM name
     pub vm_name: String,
@@ -1049,21 +1039,6 @@ mod tests {
         assert!(cli.run_as_or(None).is_err());
         let cli = cli_from(&["firehyve", "guest"]);
         assert!(cli.run_as_or(Some((0, 8123))).is_err());
-    }
-
-    #[test]
-    fn the_control_token_comes_from_a_file_path() {
-        let cli = cli_from(&[
-            "firehyve",
-            "--control-token-file",
-            "/tmp/control.token",
-            "guest",
-        ]);
-        assert_eq!(
-            cli.control_token_file.as_deref(),
-            Some(std::path::Path::new("/tmp/control.token"))
-        );
-        assert_eq!(cli_from(&["firehyve", "guest"]).control_token_file, None);
     }
 
     #[test]

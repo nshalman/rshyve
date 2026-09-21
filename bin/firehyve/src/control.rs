@@ -4,9 +4,9 @@
 
 //! firehyve's answer to the vsock CONTROL verb.
 //!
-//! firehyve has no control socket, so the inventory an operator needs
-//! is served on the vsock host socket instead. The grammar lives in
-//! `vmm_virtio::vsock::control`; this file supplies the commands:
+//! firehyve has no control socket, so the machine is read on the vsock
+//! host socket. The grammar lives in `vmm_virtio::vsock::control`;
+//! this file supplies the commands:
 //!
 //! ```text
 //! device-list                  -> OK 2 virtio-blk@4,0.4.0,present ...
@@ -14,54 +14,26 @@
 //! mem-list                     -> OK 1 boot,1073741824,present
 //! cpu-add 2                    -> OK 2,present
 //! mem-add 134217728            -> OK slot0,present
-//! status                       -> OK 8 state,running uptime_ms,12 ...
+//! status                       -> OK 9 state,running uptime_ms,12 ...
 //! metrics                      -> OK 7 uptime_ms,12 vcpu0.exits,40 ...
 //! halt                         -> OK halt,requested
 //! ```
 //!
-//! `status` and `metrics` answer `key,value` records only, so a client
-//! reads them as a map.
+//! `status` and `metrics` answer `key,value` records only. `cpu-list`
+//! gives `id,state,kind` per MADT slot; `mem-list` gives
+//! `key,value,state`, and with a hot-add window also `window`,
+//! `slot-size`, `slot-count`, `slots-used` and `added`. `mem-add` takes
+//! BYTES, not the `-m` grammar, so it means the same on both transports.
 //!
-//! `cpu-list` gives one record per CPU slot, `id,state,kind`. `kind`
-//! separates a boot CPU from a slot a hot-add can take, and `state` is
-//! `present`, `absent`, or `consumed` for an id a failed add spent.
+//! `cpu-remove` and `mem-remove` are refused with the reason: illumos
+//! has no `vm_deactivate_cpu` and no `VM_FREE_MEMSEG`. `device-add` and
+//! `device-remove` are gone from the grammar: the device set is fixed
+//! at boot, and after the privilege lock no host file can be opened.
+//! `shutdown` is refused: a microVM has no ACPI power button, so a
+//! graceful stop is the guest agent's job over vsock, then `halt`.
 //!
-//! `mem-list` gives `key,value,state` records. Without a window that is
-//! the one boot record. With one it also reports `window`, `slot-size`,
-//! `slot-count`, `slots-used` and `added`, so an operator can see how
-//! much of the window is left. `value` is a byte count except in the
-//! two slot counts.
-//!
-//! `mem-add` takes BYTES, not the `-m` size grammar, so it means the
-//! same thing on both transports. The engine rounds up to a whole slot.
-//!
-//! # Add only, and no devices
-//!
-//! There is no `cpu-remove` and no `mem-remove` that does anything.
-//! illumos has no `vm_deactivate_cpu` and no `VM_FREE_MEMSEG`, so
-//! neither removal is possible at the kernel boundary. Both verbs are
-//! recognised and refused with that reason, because an operator will
-//! try them and "unknown command" does not say why.
-//!
-//! `device-add` and `device-remove` are gone from the grammar itself
-//! (`vmm_virtio::vsock::control`). The device set is fixed at boot:
-//! after the privilege lock this process holds no `file_write`, so it
-//! could not open a new backing file, and the PCI hotplug engine that
-//! served both verbs is not started. What went with them: the eject
-//! thread, the hot-add refusal list for the brand's display devices,
-//! and the rule that vsock could not be added at run time.
-//!
-//! `shutdown` is recognised and refused: a microVM has no ACPI power
-//! button, so a graceful stop is the guest agent's job over vsock.
-//! `halt` stops the VM now.
-//!
-//! # Trust
-//!
-//! Nothing here authorises the peer. The host socket is 0600 in a
-//! 0700 directory, the accept loop applies the process peer policy
-//! (`vmm_core::unixsock::peercred`), and the session must present the
-//! launcher's token before its first verb. What reaches a sink has
-//! passed all three.
+//! Nothing here authorises the peer; the socket mode and the accept
+//! loop's peer policy did that before a request reached a sink.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -87,8 +59,6 @@ pub const NO_SHUTDOWN: &str = "shutdown is not supported: a microVM has \
 /// What the privilege lock left, for `status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivStatus {
-    pub locked: bool,
-    /// The floor, or empty when the lock was not applied.
     pub floor: Vec<String>,
     pub uid: u32,
     pub gid: u32,
@@ -159,10 +129,7 @@ impl Inventory {
             pair("cpus_online", online.to_string()),
             pair("cpus_max", self.max_cpus.to_string()),
             pair("mem_bytes", self.mem_size.to_string()),
-            pair(
-                "privilege",
-                if privilege.locked { "locked" } else { "open" }.to_string(),
-            ),
+            pair("privilege", "locked".to_string()),
             pair("priv_floor", privilege.floor.join(":")),
             pair("uid", privilege.uid.to_string()),
             pair("gid", privilege.gid.to_string()),
@@ -371,7 +338,6 @@ mod tests {
                 Arc::new(VcpuMetrics::new()),
             ],
             privilege: PrivStatus {
-                locked: true,
                 floor: vec!["file_read".into(), "proc_clock_highres".into()],
                 uid: 8123,
                 gid: 8123,
