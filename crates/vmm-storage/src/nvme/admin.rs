@@ -94,14 +94,19 @@ impl NvmeController {
                 &mut st, &mem, opcode, nsid, prp1, prp2, cdw10, cdw11,
             );
 
-            if fence {
+            // Held across the completion: the driver takes a Delete
+            // Queue completion as licence to reuse the queue's pages.
+            let _fence = if fence {
                 drop(st);
-                let fenced = self.fence_workers();
+                let held = self.fence_workers(self.fences.reset);
                 st = self.state.lock().expect("nvme: state lock");
-                if !fenced {
-                    st.csts |= CSTS_CFS;
+                if held.is_none() {
+                    st.fail_fence();
                 }
-            }
+                held
+            } else {
+                None
+            };
 
             if let Err(error) = post_completion(
                 &mem,

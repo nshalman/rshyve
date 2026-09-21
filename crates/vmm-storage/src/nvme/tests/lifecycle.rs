@@ -146,6 +146,76 @@ fn shutdown_drains_before_it_reports_complete() {
     assert_eq!(backend.started(), 1);
 }
 
+/// A reset whose fence runs out must not report the controller ready
+/// for reuse. The worker still inside the backend is holding the guest
+/// pages the driver takes back the moment RDY clears.
+#[test]
+fn a_reset_that_times_out_leaves_the_controller_fatal() {
+    let (mut h, backend) = Harness::impatient();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    backend.hold();
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::read(8, 8, 0x50000, 0x52000), 0x77);
+    backend.wait_in_flight(1);
+
+    h.reg_write32(REG_CC, 0);
+
+    assert_eq!(backend.in_flight(), 1, "the transfer ended on its own");
+    assert_ne!(h.csts() & CSTS_RDY, 0, "RDY cleared over a live transfer");
+    assert_ne!(h.csts() & CSTS_CFS, 0, "a failed reset reported no fault");
+
+    // Admission stays closed: the controller does not come back up.
+    h.enable();
+    assert_ne!(h.csts() & CSTS_CFS, 0, "the fatal status was cleared");
+    h.sq_doorbell(1, 1);
+    assert_eq!(
+        backend.started(),
+        1,
+        "I/O was admitted after a failed reset"
+    );
+
+    backend.release();
+}
+
+/// SHST complete is the driver's licence to cut power and hand the
+/// pages a transfer names to something else, so a fence that runs out
+/// must not report it.
+#[test]
+fn a_shutdown_that_times_out_does_not_report_complete() {
+    let (mut h, backend) = Harness::impatient();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    backend.hold();
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::write(0, 1, 0x50000, 0), 0x61);
+    backend.wait_in_flight(1);
+
+    h.reg_write32(
+        REG_CC,
+        CC_EN
+            | (SQE_SIZE_LOG2 << CC_IOSQES_SHIFT)
+            | (CQE_SIZE_LOG2 << CC_IOCQES_SHIFT)
+            | (1 << CC_SHN_SHIFT),
+    );
+
+    assert_eq!(backend.in_flight(), 1, "the transfer ended on its own");
+    assert_ne!(
+        (h.csts() >> CSTS_SHST_SHIFT) & CSTS_SHST_MASK,
+        SHST_COMPLETE,
+        "shutdown reported complete over a live transfer"
+    );
+    assert_ne!(
+        h.csts() & CSTS_CFS,
+        0,
+        "a failed shutdown reported no fault"
+    );
+
+    backend.release();
+}
+
 #[test]
 fn a_reset_drops_queued_io_instead_of_completing_it_into_new_queues() {
     let (mut h, backend) = Harness::held();

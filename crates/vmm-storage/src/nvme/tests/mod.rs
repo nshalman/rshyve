@@ -17,7 +17,7 @@ use vmm_devices::{Lifecycle, QuiesceGate};
 
 use super::bits::*;
 use super::queues::NvmeState;
-use super::{NvmeController, NvmeParts};
+use super::{FenceBudgets, NvmeController, NvmeParts, FENCE_BUDGETS};
 
 mod admin;
 mod io;
@@ -31,6 +31,13 @@ const ASQ: u64 = 0x10000;
 const ACQ: u64 = 0x11000;
 const ADMIN_QDEPTH: u16 = 16;
 const WAIT: Duration = Duration::from_secs(5);
+
+/// Fence budgets a test can outlast. The shipped ones are seconds, and
+/// a test that proves what a missed deadline does has to wait one out.
+const SHORT_FENCES: FenceBudgets = FenceBudgets {
+    reset: Duration::from_millis(100),
+    shutdown: Duration::from_millis(100),
+};
 
 struct RecordingSink(Mutex<Vec<(u64, u64)>>);
 
@@ -195,11 +202,22 @@ impl super::io::IoBackend for TestBackend {
 impl Harness {
     /// A harness whose transfers the returned backend controls.
     fn held() -> (Self, Arc<TestBackend>) {
+        Self::held_with(FENCE_BUDGETS)
+    }
+
+    /// The same harness, with fence budgets a held transfer outlasts.
+    fn impatient() -> (Self, Arc<TestBackend>) {
+        Self::held_with(SHORT_FENCES)
+    }
+
+    fn held_with(fences: FenceBudgets) -> (Self, Arc<TestBackend>) {
         let file = Arc::new(backing_file());
         let backend = TestBackend::new(Arc::clone(&file));
-        let h = Self::with_backend(
+        let h = Self::build(
             file,
             Arc::clone(&backend) as Arc<dyn super::io::IoBackend>,
+            false,
+            fences,
         );
         (h, backend)
     }
@@ -211,20 +229,21 @@ impl Harness {
 
     fn read_only() -> Self {
         let file = Arc::new(backing_file());
-        Self::build(Arc::clone(&file), file, true)
+        Self::build(Arc::clone(&file), file, true, FENCE_BUDGETS)
     }
 
     fn with_backend(
         file: Arc<std::fs::File>,
         backend: Arc<dyn super::io::IoBackend>,
     ) -> Self {
-        Self::build(file, backend, false)
+        Self::build(file, backend, false, FENCE_BUDGETS)
     }
 
     fn build(
         file: Arc<std::fs::File>,
         backend: Arc<dyn super::io::IoBackend>,
         read_only: bool,
+        fences: FenceBudgets,
     ) -> Self {
         let physmap =
             Arc::new(PhysMap::new_anon(0, GUEST_RAM).expect("anon guest RAM"));
@@ -237,6 +256,7 @@ impl Harness {
             physmap: Arc::clone(&physmap),
             msi: Arc::clone(&sink) as Arc<dyn MsiSink>,
             bus_mmio: Arc::new(MmioBus::new()),
+            fences,
             log: slog::Logger::root(slog::Discard, slog::o!()),
         });
         ctrl.msix.set_enabled(true);
@@ -360,11 +380,25 @@ impl Harness {
         sq_base: u64,
         cq_base: u64,
     ) {
+        self.create_io_queues_with_irq(qid, depth, sq_base, cq_base, true);
+    }
+
+    /// The same pair, with `ien` deciding whether the CQ raises an
+    /// interrupt. A Linux poll queue clears it.
+    fn create_io_queues_with_irq(
+        &mut self,
+        qid: u16,
+        depth: u16,
+        sq_base: u64,
+        cq_base: u64,
+        ien: bool,
+    ) {
+        let irq = if ien { CQ_IEN } else { 0 };
         let cqe = self.admin(Sqe {
             opcode: ADMIN_OPC_CREATE_IO_CQ,
             prp1: cq_base,
             cdw10: u32::from(qid) | (u32::from(depth - 1) << 16),
-            cdw11: (u32::from(qid) << 16) | CQ_IEN | CQ_PC,
+            cdw11: (u32::from(qid) << 16) | irq | CQ_PC,
             ..Sqe::default()
         });
         assert_eq!(cqe.status(), Status::SUCCESS, "create CQ");
