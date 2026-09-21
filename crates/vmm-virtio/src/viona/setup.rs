@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use viona_api::{LinkOps, PromiscMode};
 
-use super::{RingState, VionaInner, VirtioViona, ETHERADDRL, NET_NUM_QUEUES};
+use super::{
+    PausedRing, RingState, VionaInner, VirtioViona, ETHERADDRL, NET_NUM_QUEUES,
+};
 use crate::pci::intr::IntrSlot;
 
 impl VirtioViona {
@@ -42,7 +44,7 @@ impl VirtioViona {
                 mac_addr,
                 dev_features,
                 negotiated_features: 0,
-                paused_rings: [None; NET_NUM_QUEUES],
+                paused_rings: [PausedRing::Running; NET_NUM_QUEUES],
                 ring_state: [RingState::Init; NET_NUM_QUEUES],
                 kick_refused: [false; NET_NUM_QUEUES],
                 deferred_poll: None,

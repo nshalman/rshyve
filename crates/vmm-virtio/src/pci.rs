@@ -853,7 +853,7 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
         vmm_devices::lifecycle::DeviceStateError,
     > {
         Ok(Some(DeviceMigrateState::Virtio(
-            self.export_migrate_queues(),
+            self.export_migrate_queues()?,
         )))
     }
 

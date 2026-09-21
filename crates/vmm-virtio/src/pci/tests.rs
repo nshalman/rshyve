@@ -127,9 +127,18 @@ struct TrackingVirtioDeviceState {
     notified: Vec<u16>,
 }
 
+/// The step of a restore whose backend refuses it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RefusedStep {
+    ResetRings,
+    RingState,
+}
+
 struct TrackingVirtioDevice {
     features: u64,
     state: Mutex<TrackingVirtioDeviceState>,
+    /// The restore step this backend refuses, if any.
+    refuses: Option<RefusedStep>,
 }
 
 impl VirtioDevice for TrackingVirtioDevice {
@@ -175,11 +184,14 @@ impl VirtioDevice for TrackingVirtioDevice {
         false
     }
 
-    fn reset_all_rings(&self) {
+    fn reset_all_rings(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
         self.state
             .lock()
             .expect("tracking state lock")
             .reset_all_rings += 1;
+        self.refusal(RefusedStep::ResetRings)
     }
 
     fn restore_ring_state(
@@ -193,7 +205,7 @@ impl VirtioDevice for TrackingVirtioDevice {
         used_idx: u16,
         msix_addr: u64,
         msix_data: u32,
-    ) {
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
         self.state
             .lock()
             .expect("tracking state lock")
@@ -209,6 +221,7 @@ impl VirtioDevice for TrackingVirtioDevice {
                 msix_addr,
                 msix_data,
             });
+        self.refusal(RefusedStep::RingState)
     }
 
     fn set_notify_addrs(&self, pio_port: u16, mmio_addr: u64) {
@@ -220,6 +233,21 @@ impl VirtioDevice for TrackingVirtioDevice {
     }
 
     fn reset(&self) {}
+}
+
+impl TrackingVirtioDevice {
+    /// What one restore step answers.
+    fn refusal(
+        &self,
+        step: RefusedStep,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        if self.refuses == Some(step) {
+            return Err(vmm_devices::lifecycle::DeviceStateError::Invalid(
+                format!("the backend refused {step:?}"),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Lifecycle for TrackingVirtioDevice {
@@ -236,6 +264,17 @@ pub(super) const MIGRATE_RING_LEN: usize = 0x8000;
 
 fn make_tracking_device() -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
     make_tracking_device_with_msix(None)
+}
+
+/// A device whose backend refuses one step of the restore.
+fn make_refusing_tracking_device(
+    step: RefusedStep,
+) -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
+    let physmap = Arc::new(
+        PhysMap::new_anon(MIGRATE_RING_GPA, MIGRATE_RING_LEN)
+            .expect("create guest memory"),
+    );
+    build_tracking_device(physmap, None, Some(step))
 }
 
 fn make_tracking_device_on(
@@ -260,12 +299,21 @@ fn make_tracking_device_full(
     physmap: Arc<PhysMap>,
     msix: Option<Arc<MsixTable>>,
 ) -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
+    build_tracking_device(physmap, msix, None)
+}
+
+fn build_tracking_device(
+    physmap: Arc<PhysMap>,
+    msix: Option<Arc<MsixTable>>,
+    refuses: Option<RefusedStep>,
+) -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
     let bus_pio = Arc::new(PioBus::new());
     let bus_mmio = Arc::new(MmioBus::new());
     VirtioPciDevice::new(
         TrackingVirtioDevice {
             features: bits::VIRTIO_F_VERSION_1,
             state: Mutex::new(TrackingVirtioDeviceState::default()),
+            refuses,
         },
         bits::VIRTIO_DEV_TYPE_BLOCK,
         1,
@@ -276,6 +324,78 @@ fn make_tracking_device_full(
         bus_pio,
         bus_mmio,
         msix,
+    )
+}
+
+/// A device that owns its ring cursors, the way viona does.
+///
+/// `None` is the read the kernel refused. Nothing userspace keeps
+/// stands in for cursors a kernel backend moves, so that has to reach
+/// the export's caller.
+struct KernelCursorDevice(Option<(u16, u16)>);
+
+impl VirtioDevice for KernelCursorDevice {
+    fn device_features(&self) -> u64 {
+        bits::VIRTIO_F_VERSION_1
+    }
+
+    fn set_features(&self, _features: u64) {}
+
+    fn cfg_read(&self, _offset: u16, _len: u8) -> u32 {
+        0
+    }
+
+    fn cfg_write(&self, _offset: u16, _val: u32, _len: u8) {}
+
+    fn process_queue(
+        &self,
+        _queue_idx: u16,
+        _queue: &mut VirtQueue,
+        _head: u16,
+        _physmap: &PhysMap,
+    ) -> u32 {
+        0
+    }
+
+    fn kernel_ring_indices(
+        &self,
+        queue_idx: u16,
+    ) -> Result<Option<(u16, u16)>, vmm_devices::lifecycle::DeviceStateError>
+    {
+        self.0.map(Some).ok_or_else(|| {
+            vmm_devices::lifecycle::DeviceStateError::Export(format!(
+                "ring {queue_idx} state read failed"
+            ))
+        })
+    }
+
+    fn reset(&self) {}
+}
+
+impl Lifecycle for KernelCursorDevice {
+    fn type_name(&self) -> &'static str {
+        "kernel-cursor-virtio"
+    }
+}
+
+fn make_kernel_cursor_device(
+    indices: Option<(u16, u16)>,
+) -> Arc<VirtioPciDevice<KernelCursorDevice>> {
+    let physmap = Arc::new(
+        PhysMap::new_anon(MIGRATE_RING_GPA, MIGRATE_RING_LEN)
+            .expect("create guest memory"),
+    );
+    VirtioPciDevice::new(
+        KernelCursorDevice(indices),
+        bits::VIRTIO_DEV_TYPE_NET,
+        1,
+        256,
+        8,
+        None,
+        physmap,
+        Arc::new(PioBus::new()),
+        Arc::new(MmioBus::new()),
+        None,
     )
 }
 

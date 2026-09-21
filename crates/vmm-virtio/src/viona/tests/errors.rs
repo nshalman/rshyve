@@ -55,7 +55,9 @@ fn restored_state() -> viona_api::vioc_ring_state {
 }
 
 /// Restore one ring, the way a migration destination does.
-fn restore(device: &crate::viona::VirtioViona) {
+fn restore(
+    device: &crate::viona::VirtioViona,
+) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
     VirtioDevice::restore_ring_state(
         device,
         RESTORED_RING,
@@ -67,7 +69,7 @@ fn restore(device: &crate::viona::VirtioViona) {
         5,
         MSG_ADDR,
         MSG_DATA,
-    );
+    )
 }
 
 /// An interrupt path that records the rings it was raised for.
@@ -142,14 +144,36 @@ fn a_reset_a_signal_interrupted_is_tried_again() {
     );
 }
 
+/// `EINTR` says only that this thread took a signal, so a device reset
+/// retries it. Destroying the link over one would cost a working guest
+/// its NIC for the life of the VM.
+#[test]
+fn a_device_reset_a_signal_interrupted_keeps_the_link() {
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).interrupted_on(Op::RingReset, 2);
+    let device = running_device(Arc::new(link));
+
+    VirtioDevice::reset(&device);
+
+    assert!(
+        !steps_of(&steps).contains(&Step::Delete),
+        "a signal cost the guest its link",
+    );
+    let inner = device.inner.lock().expect("viona lock");
+    assert!(!inner.halted);
+    assert_eq!(inner.ring_state, [RingState::Init; NET_NUM_QUEUES]);
+}
+
 /// A `DEVICE_STATUS` write of 0 publishes status 0 as soon as the
 /// backend returns, and an illumos driver reclaims the ring pages on
 /// the next line. A kernel ring the reset could not stop keeps reading
-/// and writing them, so it must not read back as unprogrammed:
-/// `RING_INIT` over a running ring only fails with `EBUSY`, which would
-/// leave the stale worker and the new addresses both in place.
+/// and writing them, and nothing short of `VNA_IOC_DELETE` stops it:
+/// that call resets every ring in a wait that ignores signals and
+/// cannot fail once it starts. Quarantining the ring and returning
+/// would tell the guest its pages are free while the kernel still has
+/// them.
 #[test]
-fn a_device_reset_the_kernel_refused_quarantines_the_ring() {
+fn a_device_reset_the_kernel_refused_destroys_the_link() {
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::RingReset]);
     let device = running_device(Arc::new(link));
@@ -157,16 +181,49 @@ fn a_device_reset_the_kernel_refused_quarantines_the_ring() {
     VirtioDevice::reset(&device);
 
     assert_eq!(
-        device.inner.lock().expect("viona lock").ring_state,
-        [RingState::Error; NET_NUM_QUEUES],
-        "a ring the kernel still runs read back as unprogrammed",
+        steps_of(&steps).last(),
+        Some(&Step::Delete),
+        "the reset published completion without stopping the kernel",
     );
+    let inner = device.inner.lock().expect("viona lock");
+    assert!(inner.halted, "the link was destroyed but the device ran on");
+    assert_eq!(
+        inner.ring_state,
+        [RingState::Init; NET_NUM_QUEUES],
+        "a destroyed link kept a ring the next kick could reach",
+    );
+    drop(inner);
 
+    // Nothing reaches the kernel after the destroy: the link is gone.
+    steps.lock().expect("steps lock").clear();
     VirtioDevice::queue_addr_set(&device, 1, &addressed_queue());
+    notify(&device, 1);
     assert_eq!(
         steps_of(&steps),
-        [Step::RingReset(0), Step::RingReset(1)],
-        "a quarantined ring was programmed over",
+        [],
+        "a destroyed link was programmed or kicked again",
+    );
+}
+
+/// The same hazard from the other side. A legacy driver retires a ring
+/// by writing `QUEUE_PFN = 0` and then frees the ring DMA, so a ring
+/// the kernel would not retire has to take the link with it.
+#[test]
+fn a_retire_the_kernel_refused_destroys_the_link() {
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).failing(&[Op::RingReset]);
+    let device = running_device(Arc::new(link));
+
+    VirtioDevice::queue_addr_set(&device, 1, &addressed_queue());
+
+    assert_eq!(
+        steps_of(&steps).last(),
+        Some(&Step::Delete),
+        "the kernel kept a ring whose pages the guest reclaims",
+    );
+    assert!(
+        device.inner.lock().expect("viona lock").halted,
+        "the link was destroyed but the device ran on",
     );
 }
 
@@ -205,16 +262,17 @@ fn refused_kicks_warn_once_and_leave_the_ring_in_service() {
 
 #[test]
 fn a_ring_state_the_kernel_refused_programs_nothing_after_it() {
-    // The restore stops at the first refusal. Carrying on would mark
-    // the ring ready, route an MSI-X message to a ring the kernel does
-    // not have, and kick a worker that was never started.
+    // The restore stops at the first refusal and reports it. Carrying
+    // on would mark the ring ready, route an MSI-X message to a ring
+    // the kernel does not have, and kick a worker that was never
+    // started.
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::RingSetState]);
     let device = device_with(Arc::new(link));
     device.inner.lock().expect("viona lock").negotiated_features =
         u64::from(VIRTIO_NET_F_MAC);
 
-    restore(&device);
+    restore(&device).expect_err("a refused ring state must fail the restore");
 
     assert_eq!(
         steps_of(&steps),
@@ -232,27 +290,58 @@ fn a_ring_state_the_kernel_refused_programs_nothing_after_it() {
 }
 
 #[test]
-fn a_message_the_kernel_refused_does_not_stop_the_restore() {
-    // MSI-X is the kernel's shortcut, not the only route: without it
-    // the poll thread still raises the interrupt. So the ring is ready
-    // and kicked either way, and a restore that stopped here would
-    // leave a migrated guest with a ring nobody kicks.
+fn a_message_the_kernel_refused_fails_the_restore() {
+    // A live device can fall back on the poll thread for this ring's
+    // interrupt, so a refused message there is a warning. A migration
+    // has a better answer: the source is still running, so the restore
+    // reports the refusal and the migration goes back to it rather than
+    // handing the guest a queue the kernel cannot signal.
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::RingSetMsi]);
     let device = running_device(Arc::new(link));
 
-    restore(&device);
+    restore(&device).expect_err("a refused message must fail the restore");
 
     assert_eq!(
         steps_of(&steps).last(),
-        Some(&Step::RingKick(RESTORED_RING)),
-        "a refused message left the restored ring unkicked",
+        Some(&Step::RingSetMsi {
+            ring: RESTORED_RING,
+            addr: MSG_ADDR,
+            msg: u64::from(MSG_DATA),
+        }),
+        "the restore carried on past a message the kernel refused",
     );
+}
+
+#[test]
+fn features_the_kernel_refused_fail_the_restore() {
+    // VERSION_1 is what puts the kernel rings in the modern layout the
+    // addresses are read in, so a ring programmed without it reads the
+    // wrong guest memory.
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).failing(&[Op::SetFeatures]);
+    let device = running_device(Arc::new(link));
+
+    restore(&device).expect_err("refused features must fail the restore");
+
     assert_eq!(
-        device.inner.lock().expect("viona lock").ring_state
-            [RESTORED_RING as usize],
-        RingState::Ready,
+        steps_of(&steps),
+        [Step::SetFeatures(u64::from(VIRTIO_NET_F_MAC))],
+        "the restore programmed a ring after the features were refused",
     );
+}
+
+#[test]
+fn a_ring_the_kernel_would_not_stop_fails_a_restore() {
+    // The destination stops every ring before it programs the state the
+    // source left. A worker still running reads a ring whose addresses
+    // change under it, so the refusal fails the migration.
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).failing(&[Op::RingPause]);
+    let device = running_device(Arc::new(link));
+
+    VirtioDevice::reset_all_rings(&device)
+        .expect_err("a ring that will not stop must fail the restore");
 }
 
 #[test]
@@ -263,7 +352,8 @@ fn a_halt_deletes_the_link_though_every_ring_reset_fails() {
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::RingReset]);
 
-    halt_link(&link, &null_log());
+    halt_link(&link, &null_log())
+        .expect("the delete stops the rings the resets could not");
 
     assert_eq!(
         steps_of(&steps),
@@ -272,20 +362,19 @@ fn a_halt_deletes_the_link_though_every_ring_reset_fails() {
 }
 
 #[test]
-fn a_ring_state_read_the_kernel_refused_has_no_answer() {
+fn a_ring_state_read_the_kernel_refused_fails_the_export() {
     // The indices are the kernel's alone: viona never moves the pair
-    // userspace keeps, so nothing stands in for them. The device says
-    // it has no answer rather than reporting a ring that moved
-    // nothing.
+    // userspace keeps, so nothing stands in for them. A pair invented
+    // here would resume the destination from a point the ring passed.
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::RingGetState]);
     let device = device_with(Arc::new(link));
 
-    assert_eq!(device.get_kernel_ring_state(1), None);
-    // What the trait can carry. The pair reads as a ring that moved
-    // nothing, and `ring_set_state` on the destination refuses the
-    // payload that makes.
-    assert_eq!(VirtioDevice::get_kernel_ring_indices(&device, 1), (0, 0));
+    device
+        .kernel_ring_state(1)
+        .expect_err("the kernel refused the read");
+    VirtioDevice::kernel_ring_indices(&device, 1)
+        .expect_err("a refused read must fail the export");
 }
 
 #[test]

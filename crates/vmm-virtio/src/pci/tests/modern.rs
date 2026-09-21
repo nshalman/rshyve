@@ -97,6 +97,77 @@ fn export_virtio_state_includes_pci_transport_state() {
     assert_eq!(state.pci.bar_addrs[BarN::BAR4 as usize], 0);
 }
 
+/// Program one queue and give userspace cursors the kernel never
+/// moved, so an export that fell back to them is visible.
+fn kernel_cursor_transport(
+    indices: Option<(u16, u16)>,
+) -> Arc<VirtioPciDevice<KernelCursorDevice>> {
+    let dev = make_kernel_cursor_device(indices);
+    let mut vs = dev.virtio_state.lock().expect("virtio lock");
+    vs.queues[0].set_addr_modern(DESC, AVAIL, USED);
+    vs.queues[0].set_last_avail_idx(9);
+    vs.queues[0].set_shadow_used_idx(3);
+    vs.queue_enabled[0] = true;
+    drop(vs);
+    dev
+}
+
+#[test]
+fn an_export_takes_a_kernel_used_cursor_of_zero() {
+    // Both cursors count in a u16 and wrap through zero, so zero is an
+    // ordinary used cursor. An export that read it as "no answer" would
+    // carry the cursors userspace keeps, which a kernel backend never
+    // moves, and the destination would resume from a point the ring
+    // passed long ago and replay its descriptors.
+    let dev = kernel_cursor_transport(Some((0x1234, 0)));
+
+    let state = exported(&dev);
+
+    assert_eq!(state.queues.len(), 1);
+    assert_eq!(
+        (state.queues[0].avail_idx, state.queues[0].used_idx),
+        (0x1234, 0),
+    );
+}
+
+#[test]
+fn an_export_fails_when_the_kernel_cursors_cannot_be_read() {
+    // The cursors are the kernel's alone. A payload built without them
+    // programs a destination ring that resumes from the wrong point, so
+    // the read has to fail the migration instead.
+    let dev = kernel_cursor_transport(None);
+
+    dev.export_migrate_state()
+        .expect_err("a refused cursor read must fail the export");
+}
+
+#[test]
+fn a_restore_fails_when_the_backend_cannot_stop_its_rings() {
+    // A worker the destination left running reads a ring whose
+    // addresses the restore is writing over.
+    let dev = make_refusing_tracking_device(RefusedStep::ResetRings);
+
+    dev.restore_migrate_state(&DeviceMigrateState::Virtio(transport(
+        bits::VIRTIO_F_VERSION_1,
+        vec![live_queue()],
+    )))
+    .expect_err("a backend that cannot stop its rings must fail the restore");
+}
+
+#[test]
+fn a_restore_fails_when_the_backend_refuses_a_ring_state() {
+    // The source commits on this answer and then discards its own VM.
+    // A destination that reported success would leave the guest a NIC
+    // that moves nothing, with nothing left to go back to.
+    let dev = make_refusing_tracking_device(RefusedStep::RingState);
+
+    dev.restore_migrate_state(&DeviceMigrateState::Virtio(transport(
+        bits::VIRTIO_F_VERSION_1,
+        vec![live_queue()],
+    )))
+    .expect_err("a refused ring state must fail the restore");
+}
+
 #[test]
 fn restore_virtio_state_replays_pci_transport_state() {
     let dev = make_tracking_device();
