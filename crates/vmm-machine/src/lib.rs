@@ -27,6 +27,7 @@ pub mod parse;
 pub mod pause;
 pub mod pci;
 pub mod pm;
+pub mod privilege;
 pub mod provision;
 pub mod registry;
 pub mod signal;
