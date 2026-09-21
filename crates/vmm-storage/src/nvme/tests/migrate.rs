@@ -47,6 +47,7 @@ fn good_payload() -> vmm_devices::lifecycle::NvmeMigrateState {
             tail: 5,
             phase: true,
             iv: 0,
+            ien: true,
         }),
         io_sqs: vec![Some(NvmeMigrateSq {
             base: 0x3000,
@@ -62,6 +63,7 @@ fn good_payload() -> vmm_devices::lifecycle::NvmeMigrateState {
             tail: 0,
             phase: true,
             iv: 1,
+            ien: true,
         })],
         num_io_queues: 1,
         pci: Default::default(),
@@ -135,6 +137,50 @@ fn a_submission_queue_whose_completion_queue_is_absent_is_refused() {
     let mut payload = good_payload();
     payload.io_sqs[0].as_mut().expect("io sq").cq_id = 9;
     check_nvme_state(&payload).expect_err("a CQ id past the table");
+}
+
+#[test]
+fn an_interrupt_vector_the_msix_table_cannot_hold_is_refused() {
+    // Create I/O Completion Queue refuses these, and `MsixTable::fire`
+    // drops them silently, so the imported queue would never raise.
+    let mut payload = good_payload();
+    payload.io_cqs[0].as_mut().expect("io cq").iv = NVME_MSIX_COUNT - 1;
+    check_nvme_state(&payload).expect("the last vector is fine");
+
+    payload.io_cqs[0].as_mut().expect("io cq").iv = NVME_MSIX_COUNT;
+    let error = check_nvme_state(&payload).expect_err("iv past the table");
+    assert!(error.to_string().contains("interrupt vector"), "{error}");
+
+    let mut payload = good_payload();
+    payload.admin_cq.as_mut().expect("admin cq").iv = u16::MAX;
+    check_nvme_state(&payload).expect_err("an admin vector past the table");
+}
+
+/// Linux gives its poll queues no interrupt, so a migration that
+/// restores one as interrupting sends the destination guest a message
+/// it never armed a handler for.
+#[test]
+fn a_polled_completion_queue_stays_polled_across_a_migration() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues_with_irq(1, IO_QDEPTH, SQ1, CQ1, false);
+    let state = src
+        .ctrl
+        .export_migrate_state()
+        .expect("export")
+        .expect("an enabled controller has state");
+
+    let mut dst = Harness::new();
+    dst.ctrl.restore_migrate_state(&state).expect("restore");
+
+    let before = dst.msi_count();
+    let mut tail = 0;
+    io_submit(&mut dst, &mut tail, Sqe::read(0, 1, 0x50000, 0), 0x31);
+    let cqe = dst.wait_cqe(CQ1, 0, true);
+
+    assert_eq!(cqe.cid, 0x31);
+    assert_eq!(cqe.status(), Status::SUCCESS);
+    assert_eq!(dst.msi_count(), before, "a polled CQ raised an interrupt");
 }
 
 #[test]

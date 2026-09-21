@@ -44,6 +44,7 @@ use vmm_devices::pci::device::{
 };
 use vmm_devices::pci::msix::{HdlMsiSink, MsiSink, MsixTable};
 use vmm_devices::pci::BarN;
+use vmm_devices::quiesce::DrainScope;
 use vmm_devices::{
     DeviceMigrateState, FlushError, FlushIntent, Lifecycle, QuiesceGate,
 };
@@ -56,10 +57,21 @@ use workers::io_worker;
 /// Matches the C bhyve blockif thread count.
 const NUM_WORKERS: usize = 8;
 
-/// How long a reset waits for the transfers already moving guest
-/// memory. Past this the controller reports a fatal status: the driver
-/// is about to reuse pages a worker still holds.
-const WORKER_FENCE_BUDGET: Duration = Duration::from_secs(5);
+/// How long a controller transition waits for the transfers already
+/// moving guest memory.
+#[derive(Clone, Copy)]
+pub(super) struct FenceBudgets {
+    /// A controller reset or a Delete Queue command.
+    pub(super) reset: Duration,
+    /// A shutdown, which flushes the write cache as well. This is the
+    /// budget the durable flush used to spend on its own quiesce.
+    pub(super) shutdown: Duration,
+}
+
+const FENCE_BUDGETS: FenceBudgets = FenceBudgets {
+    reset: Duration::from_secs(5),
+    shutdown: Duration::from_secs(30),
+};
 
 /// MSI-X capability offset in PCI config space.
 const MSIX_CAP_OFFSET: u8 = 0x40;
@@ -83,6 +95,7 @@ pub(super) struct NvmeParts {
     pub(super) physmap: Arc<PhysMap>,
     pub(super) msi: Arc<dyn MsiSink>,
     pub(super) bus_mmio: Arc<MmioBus>,
+    pub(super) fences: FenceBudgets,
     pub(super) log: slog::Logger,
 }
 
@@ -108,6 +121,7 @@ pub struct NvmeController {
     pub(super) geometry: Geometry,
     indicator: Indicator,
     pub(super) gate: Arc<QuiesceGate>,
+    pub(super) fences: FenceBudgets,
 }
 
 impl NvmeController {
@@ -154,6 +168,7 @@ impl NvmeController {
             physmap,
             msi: HdlMsiSink::new(hdl),
             bus_mmio,
+            fences: FENCE_BUDGETS,
             log,
         })
     }
@@ -167,6 +182,7 @@ impl NvmeController {
             physmap,
             msi,
             bus_mmio,
+            fences,
             log,
         } = parts;
 
@@ -246,6 +262,7 @@ impl NvmeController {
             ns_ident,
             num_io_queues: MAX_IO_QUEUES as u16,
             instances: 0,
+            fence_failed: false,
         };
 
         let (tx, rx) = mpsc::channel::<IoRequest>();
@@ -268,6 +285,7 @@ impl NvmeController {
             geometry,
             indicator: Indicator::new(),
             gate: Arc::clone(&gate),
+            fences,
         });
         *ctrl.self_ref.lock().expect("self_ref lock") =
             Some(Arc::downgrade(&ctrl));
@@ -294,18 +312,25 @@ impl NvmeController {
         ctrl
     }
 
-    /// Wait for the transfers that are already moving guest memory.
+    /// Hold the workers off until the transfers already moving guest
+    /// memory have finished.
     ///
     /// Call with the state lock dropped: a worker needs it to post its
-    /// completion before it can park. Returns whether the workers
-    /// stopped inside the budget.
-    pub(super) fn fence_workers(&self) -> bool {
-        let _drain = self.gate.drain_scope();
-        if self.gate.wait_quiesced(WORKER_FENCE_BUDGET) {
-            return true;
+    /// completion before it can park. The returned scope keeps new work
+    /// off the pool, so the caller holds it until it has published the
+    /// transition the fence protects. `None` means the budget passed
+    /// with a worker still able to reach guest pages.
+    #[must_use]
+    pub(super) fn fence_workers(
+        &self,
+        budget: Duration,
+    ) -> Option<DrainScope<'_>> {
+        let drain = self.gate.drain_scope();
+        if self.gate.wait_quiesced(budget) {
+            return Some(drain);
         }
         slog::error!(self.log, "nvme: I/O workers did not stop for a reset");
-        false
+        None
     }
 
     /// Disconnect the I/O channel and wait for the workers.
@@ -503,6 +528,7 @@ impl Lifecycle for NvmeController {
             tail: cq.tail,
             phase: cq.phase,
             iv: cq.iv,
+            ien: cq.ien,
         };
 
         slog::info!(self.log, "nvme: exporting controller state";
@@ -592,7 +618,7 @@ impl Lifecycle for NvmeController {
             tail: cq.tail,
             phase: cq.phase,
             iv: cq.iv,
-            ien: true,
+            ien: cq.ien,
             instance,
         };
 
@@ -656,10 +682,24 @@ fn check_nvme_state(
         Ok(())
     }
 
+    fn check_vector(what: &str, iv: u16) -> Result<(), DeviceStateError> {
+        // `MsixTable::fire` drops a vector the table does not hold, so
+        // the queue would never raise and its I/O would hang. Create
+        // I/O Completion Queue refuses the same value.
+        if iv >= NVME_MSIX_COUNT {
+            return Err(DeviceStateError::invalid(format!(
+                "{what} interrupt vector {iv} is outside \
+                 0..{NVME_MSIX_COUNT}",
+            )));
+        }
+        Ok(())
+    }
+
     let check_cq =
         |what: &str, cq: &NvmeMigrateCq| -> Result<(), DeviceStateError> {
             check_size(what, cq.size)?;
             check_cursors(what, cq.size, cq.head, cq.tail)?;
+            check_vector(what, cq.iv)?;
             check_base(what, cq.base)
         };
 

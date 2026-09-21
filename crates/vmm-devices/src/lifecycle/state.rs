@@ -215,4 +215,8 @@ pub struct NvmeMigrateCq {
     pub tail: u16,
     pub phase: bool,
     pub iv: u16,
+    /// Whether the driver asked for an interrupt on this queue. A Linux
+    /// poll queue has none, and restoring one as interrupting sends the
+    /// destination guest a message it never armed a handler for.
+    pub ien: bool,
 }

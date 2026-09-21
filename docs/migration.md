@@ -12,7 +12,7 @@ One driver serves both transports: a Unix socket inside a bhyve zone,
 where `/dev/poll` is unavailable and the GZ agent bridges to the peer,
 and a TCP socket elsewhere.
 
-The protocol identifier is `vmm-migrate-ron/1`. Both ends refuse
+The protocol identifier is `vmm-migrate-ron/2`. Both ends refuse
 anything else: there is no compatibility window, because a peer that
 reads a field as something else resumes a guest on state that is not
 its own. v1 put device identity on the wire; in v0 every virtio queue

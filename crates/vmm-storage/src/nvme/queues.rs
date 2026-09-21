@@ -85,6 +85,10 @@ pub(super) struct NvmeState {
     /// Source of [`QueueInstance`] values. Never reset, so an instance
     /// is unique for the life of the controller.
     pub(super) instances: QueueInstance,
+
+    /// Whether a fence deadline passed with a worker still able to
+    /// reach guest memory. Sticky: see [`Self::fail_fence`].
+    pub(super) fence_failed: bool,
 }
 
 impl NvmeState {
@@ -104,6 +108,18 @@ impl NvmeState {
     pub(super) fn next_instance(&mut self) -> QueueInstance {
         self.instances += 1;
         self.instances
+    }
+
+    /// Record a fence deadline that passed with a transfer still in
+    /// the backend.
+    ///
+    /// The controller is fatal from here and never comes back up. The
+    /// worker that missed the deadline can still read or write the
+    /// guest pages that a queue created after this would name, so
+    /// nothing may be admitted again.
+    pub(super) fn fail_fence(&mut self) {
+        self.fence_failed = true;
+        self.csts |= CSTS_CFS;
     }
 
     pub(super) fn set_shst(&mut self, shst: u32) {
@@ -215,6 +231,7 @@ impl Default for NvmeState {
             ns_ident: [0u8; IDENT_NS_SIZE],
             num_io_queues: MAX_IO_QUEUES as u16,
             instances: 0,
+            fence_failed: false,
         }
     }
 }
