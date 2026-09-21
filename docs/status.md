@@ -42,9 +42,9 @@ and a real init. What they do and do not show is in
 | NVMe | Complete | Async I/O, zero-copy, 8 workers, 2.8 GB/s |
 | virtio-net (viona) | Complete | Interrupt polling, promiscphys |
 | virtio-rnd | Complete | /dev/random entropy |
-| Framebuffer/VNC | Complete | Unix socket, password, resolution |
-| xHCI USB tablet | Complete | HID pointer device |
-| PCI passthrough | Partial | Intel VT-d only, no AMD IOMMU backend; MSI-X devices refused. Not security-audited (OSF-5). See [devices.md](devices.md#pci-passthrough) |
+| Framebuffer/VNC | Partial | Unix socket only, Raw encoding, one client; no VGA, no TCP, no `wait` |
+| xHCI USB tablet | Partial | One slot, absolute pointer, no scroll wheel, no migration state |
+| PCI passthrough | Partial | Intel VT-d only, no AMD IOMMU backend; MSI-X devices refused. Not fully audited (OSF-5) and never run with an assigned device (OSF-11). See [devices.md](devices.md#pci-passthrough) |
 | AHCI CD-ROM (`ahci-cd`) | Complete | ATAPI SCSI/MMC, zero-copy reads |
 | AHCI disk (`ahci-hd`) | Not implemented | Rejected at startup; use virtio-blk or nvme |
 | LAPIC/IOAPIC/PIC/PIT | Complete | Kernel-emulated |

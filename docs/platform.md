@@ -102,8 +102,19 @@ Add to the SmartOS platform build:
 
 - `libdladm.so` - VNIC name resolution (dladm_name2info)
 - `libcrypto-smartos.so.3` - the platform OpenSSL, used by the vTPM
-- Kernel: bhyve VMM module (API v5+, v18 recommended)
-- Kernel: viona module (interface v6)
+- Kernel: bhyve VMM module, API v18. Use v18: it is what the `vnext`
+  platform ships and the only version this tree has run on. Nothing
+  enforces a floor, so an older kernel starts and then fails at an
+  ioctl or gives less without saying so. What the code needs, if a node
+  runs something older: v5 for the CPUID control every VM uses, v8 for
+  the `VCF_TRACK_DIRTY` create flag rshyve asks for unless
+  `--no-track-dirty` is given, and v13 for live migration, which writes
+  state through vmm-data (v13), imports guest time data (v11) and
+  exports the RTC at data version 2 (v12). From v16 a vCPU exit also
+  reports which vCPU took a triple fault. No version below 18 has been
+  tried.
+- Kernel: viona module, interface v6. Nothing checks this one either, so
+  a mismatched module surfaces as a raw ioctl errno.
 
 Every one of these ships in a stock platform image. `rshyve` must not
 depend on anything else, because a platform image has no pkgsrc: a
@@ -193,10 +204,11 @@ runs it on every build.
 | virtio-blk | Yes | Yes |
 | NVMe | Yes | Yes (async, zero-copy) |
 | virtio-net (viona) | Yes | Yes |
-| AHCI | Yes | Fallback to virtio-blk |
-| Framebuffer/VNC | Yes | Yes (Unix socket) |
-| xHCI tablet | Yes | Yes |
-| PCI passthrough | Yes | Yes (Intel + AMD) |
+| AHCI CD-ROM (`ahci-cd`) | Yes | Yes (ATAPI, zero-copy reads) |
+| AHCI disk (`ahci-hd`) | Yes | No, refused at startup |
+| Framebuffer/VNC | Yes | Unix socket only: no TCP, no `wait`, no VGA, Raw encoding, one client |
+| xHCI tablet | Yes | One slot, absolute pointer, no scroll wheel |
+| PCI passthrough | Yes | Intel VT-d only. There is no AMD IOMMU backend, MSI-X devices are refused, and no assigned device has ever been run (OSF-11) |
 | Live migration | No | Yes |
 | CPUID masking | No | Yes (--cpu-baseline) |
 | Built-in mdata | No | Yes |
