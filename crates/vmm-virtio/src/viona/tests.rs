@@ -404,7 +404,7 @@ fn a_halt_resets_every_ring_before_it_deletes_the_link() {
     let steps = Steps::default();
     let link = TestLink::new(&steps);
 
-    halt_link(&link, &null_log());
+    halt_link(&link, &null_log()).expect("the delete succeeds");
 
     assert_eq!(
         steps_of(&steps),
@@ -413,13 +413,15 @@ fn a_halt_resets_every_ring_before_it_deletes_the_link() {
 }
 
 #[test]
-fn a_failed_delete_does_not_stop_the_halt() {
-    // Teardown has to reach VM_DESTROY_SELF whatever the link
-    // does, so the failure is reported and nothing is unwound.
+fn a_failed_delete_reaches_the_caller() {
+    // Teardown has to reach VM_DESTROY_SELF whatever the link does, so
+    // nothing is unwound here. The answer still carries the failure:
+    // the delete is what proves every kernel ring stopped, so a reset
+    // that escalated to it has to know.
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::Delete]);
 
-    halt_link(&link, &null_log());
+    halt_link(&link, &null_log()).expect_err("the kernel refused the delete");
 
     assert_eq!(steps_of(&steps).last(), Some(&Step::Delete));
 }

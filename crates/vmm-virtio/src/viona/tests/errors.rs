@@ -144,14 +144,36 @@ fn a_reset_a_signal_interrupted_is_tried_again() {
     );
 }
 
+/// `EINTR` says only that this thread took a signal, so a device reset
+/// retries it. Destroying the link over one would cost a working guest
+/// its NIC for the life of the VM.
+#[test]
+fn a_device_reset_a_signal_interrupted_keeps_the_link() {
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).interrupted_on(Op::RingReset, 2);
+    let device = running_device(Arc::new(link));
+
+    VirtioDevice::reset(&device);
+
+    assert!(
+        !steps_of(&steps).contains(&Step::Delete),
+        "a signal cost the guest its link",
+    );
+    let inner = device.inner.lock().expect("viona lock");
+    assert!(!inner.halted);
+    assert_eq!(inner.ring_state, [RingState::Init; NET_NUM_QUEUES]);
+}
+
 /// A `DEVICE_STATUS` write of 0 publishes status 0 as soon as the
 /// backend returns, and an illumos driver reclaims the ring pages on
 /// the next line. A kernel ring the reset could not stop keeps reading
-/// and writing them, so it must not read back as unprogrammed:
-/// `RING_INIT` over a running ring only fails with `EBUSY`, which would
-/// leave the stale worker and the new addresses both in place.
+/// and writing them, and nothing short of `VNA_IOC_DELETE` stops it:
+/// that call resets every ring in a wait that ignores signals and
+/// cannot fail once it starts. Quarantining the ring and returning
+/// would tell the guest its pages are free while the kernel still has
+/// them.
 #[test]
-fn a_device_reset_the_kernel_refused_quarantines_the_ring() {
+fn a_device_reset_the_kernel_refused_destroys_the_link() {
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::RingReset]);
     let device = running_device(Arc::new(link));
@@ -159,16 +181,49 @@ fn a_device_reset_the_kernel_refused_quarantines_the_ring() {
     VirtioDevice::reset(&device);
 
     assert_eq!(
-        device.inner.lock().expect("viona lock").ring_state,
-        [RingState::Error; NET_NUM_QUEUES],
-        "a ring the kernel still runs read back as unprogrammed",
+        steps_of(&steps).last(),
+        Some(&Step::Delete),
+        "the reset published completion without stopping the kernel",
     );
+    let inner = device.inner.lock().expect("viona lock");
+    assert!(inner.halted, "the link was destroyed but the device ran on");
+    assert_eq!(
+        inner.ring_state,
+        [RingState::Init; NET_NUM_QUEUES],
+        "a destroyed link kept a ring the next kick could reach",
+    );
+    drop(inner);
 
+    // Nothing reaches the kernel after the destroy: the link is gone.
+    steps.lock().expect("steps lock").clear();
     VirtioDevice::queue_addr_set(&device, 1, &addressed_queue());
+    notify(&device, 1);
     assert_eq!(
         steps_of(&steps),
-        [Step::RingReset(0), Step::RingReset(1)],
-        "a quarantined ring was programmed over",
+        [],
+        "a destroyed link was programmed or kicked again",
+    );
+}
+
+/// The same hazard from the other side. A legacy driver retires a ring
+/// by writing `QUEUE_PFN = 0` and then frees the ring DMA, so a ring
+/// the kernel would not retire has to take the link with it.
+#[test]
+fn a_retire_the_kernel_refused_destroys_the_link() {
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).failing(&[Op::RingReset]);
+    let device = running_device(Arc::new(link));
+
+    VirtioDevice::queue_addr_set(&device, 1, &addressed_queue());
+
+    assert_eq!(
+        steps_of(&steps).last(),
+        Some(&Step::Delete),
+        "the kernel kept a ring whose pages the guest reclaims",
+    );
+    assert!(
+        device.inner.lock().expect("viona lock").halted,
+        "the link was destroyed but the device ran on",
     );
 }
 
@@ -297,7 +352,8 @@ fn a_halt_deletes_the_link_though_every_ring_reset_fails() {
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::RingReset]);
 
-    halt_link(&link, &null_log());
+    halt_link(&link, &null_log())
+        .expect("the delete stops the rings the resets could not");
 
     assert_eq!(
         steps_of(&steps),
