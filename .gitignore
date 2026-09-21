@@ -6,6 +6,10 @@ kernel/linux-*.tar.xz*
 kernel/vmlinuz-*
 kernel/vmlinux-*
 kernel/config-fastboot*
+# The resolved config of the published guest kernel is tracked, because
+# it is the one small file that says which options went into the image,
+# and guest-kernel.yml diffs each build against it.
+!kernel/config-fastboot-sandbox
 kernel/SHA256SUMS*
 
 # Agent and editor scratch state

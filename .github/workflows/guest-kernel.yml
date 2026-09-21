@@ -10,14 +10,20 @@ name: guest kernel
 # Why it exists at all: .gitignore keeps kernel/vmlinux-* and
 # kernel/vmlinuz-* out of the tree, because the images are GPL-2.0 and
 # their source is not tracked. Without this workflow the only copy of a
-# guest kernel is on the machine that last ran build.sh, and no reader
-# can tell which fragments went into it.
+# guest kernel is on the machine that last ran build.sh. The resolved
+# config IS tracked, so a reader can tell which options went in, and the
+# step below fails when the build no longer produces it.
 #
 # What a green run proves: the fragment list composes, olddefconfig kept
-# every option the fragments asked for and dropped the one they asked it
+# every option the fragments asked for and dropped the two they asked it
 # to drop, the ELF carries the PVH note, and the image holds the SMP and
 # vsock code. It does NOT prove the kernel boots. Only a VMM on illumos
 # can show that.
+#
+# What it publishes: a push or a pull request produces a workflow
+# artifact that expires in 90 days. A durable copy needs a published
+# release, which this repository has never cut, so the attach job below
+# has never run.
 
 on:
   push:
@@ -42,7 +48,7 @@ env:
   # this list must keep:
   #
   #   sandbox.config last. kconfig keeps the LAST assignment of an
-  #   option, and sandbox.config is the fragment that switches one OFF.
+  #   option, and sandbox.config is the fragment that switches two OFF.
   #
   #   container.config and smp.config together. CONFIG_CPUSETS needs
   #   CGROUPS from the first and SMP from the second, and olddefconfig
@@ -62,6 +68,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # Both guards in this job are shell, and one of them runs inside
+      # the build container. ci.yml lints tools/*.sh and does not reach
+      # here, so this job lints its own.
+      - run: shellcheck -S warning kernel/*.sh
+
       # build.sh pulls a digest-pinned Alpine image from Docker Hub and
       # a kernel tarball from cdn.kernel.org, and verifies the tarball
       # against the SHA-256 it records. The tarball is not cached here:
@@ -74,38 +85,41 @@ jobs:
           KERNEL_OUT_SUFFIX="$OUT_SUFFIX" \
               ./build.sh "$KERNEL_VERSION"
 
-      # build.sh asserts this too, inside the container. It is repeated
-      # here on the config it wrote out, for two reasons: this step
-      # names the options the sandbox cannot run without, so a reader
-      # sees them, and it matches whole lines rather than prefixes.
+      # build.sh runs this same script inside the container, before the
+      # compile. It runs again here, on the config the build wrote out,
+      # so a build.sh that stops calling it cannot pass this workflow.
+      - name: the resolved config matches the fragments
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+
+          # hotplug.config sets CONFIG_SMP and CONFIG_NR_CPUS itself.
+          case " $FRAGMENTS " in
+            *" hotplug.config "*)
+              echo "FAIL: hotplug.config conflicts with smp.config on the CPU count"
+              exit 1
+              ;;
+          esac
+
+          ./check-config.sh "config-fastboot${OUT_SUFFIX}" . $FRAGMENTS
+
+      # The fragments say what this kernel asked for. This step says what
+      # the sandbox cannot run without, and it fails closed: an emptied
+      # or deleted sandbox.config brings both negatives back on by
+      # default, and the resolved config then fails here.
       #
-      # It reports every failure before it exits, so one run names every
+      # CONFIG_NR_CPUS is named on its own because it is not a "=y"
+      # option: a vCPU ceiling clamped to 1 would read as present.
+      #
+      # Every failure is reported before the exit, so one run names every
       # option that went missing.
-      - name: every option the fragments asked for survived olddefconfig
+      - name: the options the sandbox cannot run without
         working-directory: kernel
         run: |
           set -euo pipefail
           cfg="config-fastboot${OUT_SUFFIX}"
           rc=0
 
-          # hotplug.config sets CONFIG_SMP and CONFIG_NR_CPUS itself.
-          case " $FRAGMENTS " in
-            *" hotplug.config "*)
-              echo "FAIL: hotplug.config conflicts with smp.config on the CPU count"
-              rc=1
-              ;;
-          esac
-
-          # Everything the fragments turn on.
-          while read -r opt; do
-            [ -n "$opt" ] || continue
-            grep -Fxq "$opt" "$cfg" || { echo "FAIL: $opt is not in $cfg"; rc=1; }
-          done <<< "$(for f in $FRAGMENTS; do grep -o '^CONFIG_[A-Z0-9_]*=y' "$f" || true; done)"
-
-          # The options without which the sandbox has no control
-          # channel, no CPU accounting and no direct boot. CONFIG_NR_CPUS
-          # is named on its own: the loop above only reads "=y" lines, so
-          # a vCPU ceiling silently clamped to 1 would pass it.
           for opt in \
               CONFIG_PVH=y \
               CONFIG_SMP=y \
@@ -116,35 +130,34 @@ jobs:
             grep -Fxq "$opt" "$cfg" || { echo "FAIL: $opt is not in $cfg"; rc=1; }
           done
 
+          # The guest runs untrusted code, so an option that is OFF
+          # matters as much as one that is on. kernel/sandbox.config
+          # carries the reasoning for both.
+          for sym in CONFIG_VSOCKETS_LOOPBACK CONFIG_USER_NS; do
+            ! grep -q "^$sym=" "$cfg" || { echo "FAIL: $sym is set in $cfg"; rc=1; }
+          done
+
           exit $rc
 
-      # The guest runs untrusted code, so an option the fragments switch
-      # OFF matters as much as one they switch on. This is the check
-      # that fails closed if sandbox.config is emptied or deleted: an
-      # absent negative list is the same blind spot as a dropped option.
-      - name: the guest has no in-guest vsock path
+      # The resolved config is tracked, so a change to a fragment that
+      # reaches more options than it meant to shows up as a diff in a
+      # pull request rather than inside an expiring artifact.
+      - name: the resolved config matches the tracked copy
         working-directory: kernel
         run: |
           set -euo pipefail
           cfg="config-fastboot${OUT_SUFFIX}"
-          rc=0
-
-          negatives="$(sed -n 's/^# \(CONFIG_[A-Z0-9_]*\) is not set$/\1/p' sandbox.config)"
-          if [ -z "$negatives" ]; then
-            echo "FAIL: sandbox.config names no option to switch off"
+          if ! git ls-files --error-unmatch "$cfg" > /dev/null 2>&1; then
+            echo "NOTE: $cfg is not tracked yet."
+            echo "Take it from this run's artifact and commit it."
+            exit 0
+          fi
+          if ! git diff --quiet -- "$cfg"; then
+            echo "FAIL: the build no longer produces the tracked $cfg."
+            echo "Commit the new one if the change is intended."
+            git diff -- "$cfg"
             exit 1
           fi
-          grep -qx CONFIG_VSOCKETS_LOOPBACK <<< "$negatives" || {
-            echo "FAIL: sandbox.config no longer switches CONFIG_VSOCKETS_LOOPBACK off"
-            rc=1
-          }
-
-          while read -r sym; do
-            [ -n "$sym" ] || continue
-            ! grep -q "^$sym=" "$cfg" || { echo "FAIL: $sym is set in $cfg"; rc=1; }
-          done <<< "$negatives"
-
-          exit $rc
 
       # The config says what was asked for. These two say what is in the
       # image. objcopy --strip-all drops the symbol table but keeps the
@@ -154,7 +167,8 @@ jobs:
       # "smpboot: " is the pr_fmt prefix of arch/x86/kernel/smpboot.c,
       # which the x86 Makefile builds only under CONFIG_SMP. The
       # uniprocessor kernels in this tree carry none of it and the SMP
-      # ones carry 13 such strings.
+      # ones carry 13 such strings. It is not anchored at the line start:
+      # a printk literal carries the KERN_SOH prefix.
       #
       # "vmw_vsock_virtio_transport" is KBUILD_MODNAME for
       # net/vmw_vsock/virtio_transport.c, used as the virtio driver
@@ -207,12 +221,14 @@ jobs:
             kernel/SHA256SUMS${{ env.OUT_SUFFIX }}
 
   # A workflow artifact expires. A kernel a CN boots must not, so a
-  # published release gets its own copy.
+  # published release gets its own copy. This repository has cut no
+  # release, so this job has never run.
   attach:
     name: attach the kernel to the release
     needs: build
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
