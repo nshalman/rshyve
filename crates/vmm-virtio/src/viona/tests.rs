@@ -144,6 +144,8 @@ struct TestLink {
     park: Mutex<Option<Park>>,
     /// A call a signal interrupts, and how many times left.
     interrupted: Mutex<Option<(Op, usize)>>,
+    /// The used cursor `ring_get_state` reports has wrapped to zero.
+    wrapped_used: bool,
 }
 
 impl TestLink {
@@ -157,6 +159,7 @@ impl TestLink {
             status: IntrStatus::default(),
             park: Mutex::new(None),
             interrupted: Mutex::new(None),
+            wrapped_used: false,
         }
     }
 
@@ -207,6 +210,12 @@ impl TestLink {
     /// A link whose delete waits for `hold`.
     fn holding(self, hold: Hold) -> Self {
         *self.delete_hold.lock().expect("hold lock") = Some(hold);
+        self
+    }
+
+    /// A link whose used cursor has wrapped back to zero.
+    fn wrapped_used(mut self) -> Self {
+        self.wrapped_used = true;
         self
     }
 
@@ -301,7 +310,7 @@ impl LinkOps for TestLink {
         Ok(vioc_ring_state {
             vrs_index: ring,
             vrs_avail_idx: 0x1111 + ring,
-            vrs_used_idx: 0x2222 + ring,
+            vrs_used_idx: if self.wrapped_used { 0 } else { 0x2222 + ring },
             ..Default::default()
         })
     }

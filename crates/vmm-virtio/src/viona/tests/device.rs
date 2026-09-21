@@ -688,8 +688,23 @@ fn a_migration_source_reads_the_indices_the_kernel_reports() {
     let device = device_with(Arc::new(TestLink::new(&steps)));
 
     assert_eq!(
-        VirtioDevice::get_kernel_ring_indices(&device, 1),
-        (0x1112, 0x2223),
+        VirtioDevice::kernel_ring_indices(&device, 1).expect("reads"),
+        Some((0x1112, 0x2223)),
+    );
+}
+
+#[test]
+fn a_used_cursor_of_zero_is_still_the_kernel_answer() {
+    // Both cursors count in a u16 and wrap through zero. An export that
+    // read zero as "no answer" would swap in the cursors userspace
+    // keeps, which viona never moves, and the destination would resume
+    // from a point the ring passed long ago.
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps).wrapped_used()));
+
+    assert_eq!(
+        VirtioDevice::kernel_ring_indices(&device, 1).expect("reads"),
+        Some((0x1112, 0)),
     );
 }
 
@@ -704,7 +719,9 @@ fn a_halted_device_reads_no_ring_state() {
     device.halt();
     steps.lock().expect("steps lock").clear();
 
-    assert_eq!(device.get_kernel_ring_state(1), None);
+    device
+        .kernel_ring_state(1)
+        .expect_err("a destroyed link has no state to read");
 
     assert_eq!(
         steps_of(&steps),
@@ -721,19 +738,21 @@ fn a_migration_source_reads_the_state_of_the_ring_it_names() {
     let steps = Steps::default();
     let device = device_with(Arc::new(TestLink::new(&steps)));
 
-    assert_eq!(device.get_kernel_ring_state(1), Some((0x1112, 0x2223)));
+    assert_eq!(
+        device.kernel_ring_state(1).expect("reads"),
+        (0x1112, 0x2223),
+    );
 
     assert_eq!(steps_of(&steps), [Step::RingGetState(1)]);
 }
 
 #[test]
 fn a_restore_refuses_indices_no_running_ring_can_have_left() {
-    // The export answers with a pair of numbers and cannot say that
-    // the kernel refused the read, so a ring it could not read for
-    // arrives with a consumption cursor of 0 against a used index the
-    // export took from guest memory. Programmed as is, viona treats
-    // the whole available ring as unconsumed and hands the driver
-    // descriptors it has already reclaimed.
+    // The payload comes from an unauthenticated peer, so the pair may
+    // be anything. A cursor that claims more chains in flight than the
+    // ring has descriptors makes viona treat the whole available ring
+    // as unconsumed and hand the driver descriptors it has already
+    // reclaimed.
     let steps = Steps::default();
     let device = running_device(Arc::new(TestLink::new(&steps)));
 

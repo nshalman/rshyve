@@ -213,32 +213,33 @@ impl VirtioViona {
             "used_idx" => used_idx, "msi_addr" => msix_addr);
     }
 
-    /// Read one ring's indices for a migration export.
+    /// Read one ring's `(avail_idx, used_idx)` for a migration export.
     ///
-    /// `None` says the device has no answer. The indices are the
-    /// kernel's alone, and userspace holds nothing that stands in for
-    /// them: viona never moves the indices the [`VirtQueue`] keeps.
+    /// The indices are the kernel's alone, and userspace holds nothing
+    /// that stands in for them: viona never moves the indices the
+    /// [`VirtQueue`] keeps. So a failure here has to fail the export.
     ///
     /// [`VirtQueue`]: crate::queue::VirtQueue
-    pub fn get_kernel_ring_state(&self, queue_idx: u16) -> Option<(u16, u16)> {
+    pub fn kernel_ring_state(
+        &self,
+        queue_idx: u16,
+    ) -> Result<(u16, u16), DeviceStateError> {
         let inner = self.inner.lock().expect("viona lock");
         // The guard every other link caller carries. The link is gone,
         // and the halt holds no device lock while it destroys it, so
         // an ioctl issued here could wait out an untimed kernel call
         // with the lock every vCPU needs.
         if inner.halted {
-            slog::error!(inner.log(),
-                "viona ring state read after the link was destroyed";
-                "ring" => queue_idx);
-            return None;
+            return Err(DeviceStateError::Export(format!(
+                "viona ring {queue_idx} state read after the link was \
+                 destroyed"
+            )));
         }
         match inner.link_ref().ring_get_state(queue_idx) {
-            Ok(state) => Some((state.vrs_avail_idx, state.vrs_used_idx)),
-            Err(e) => {
-                slog::error!(inner.log(), "viona ring get state failed";
-                    "ring" => queue_idx, "error" => %e);
-                None
-            }
+            Ok(state) => Ok((state.vrs_avail_idx, state.vrs_used_idx)),
+            Err(e) => Err(DeviceStateError::Export(format!(
+                "viona ring {queue_idx} state read failed: {e}"
+            ))),
         }
     }
 }
@@ -252,15 +253,12 @@ impl VirtioViona {
 /// it has descriptors. Both cursors count in a u16 that wraps, so the
 /// difference wraps with them.
 ///
-/// WHY the destination checks: the export cannot report a failed index
-/// read to its caller (`get_kernel_ring_indices` answers with a pair
-/// of numbers and nothing else), so a ring the kernel refused to
-/// answer for reaches here as a cursor of 0 against a used index the
-/// export read out of guest memory. Programmed as is, viona finds
-/// every entry in the available ring unconsumed and hands the guest
-/// driver descriptors it has already reclaimed, which the driver
-/// reports as "id N is not a head!". The same check is what a
-/// migration source that is hostile, or simply older, meets.
+/// WHY the destination checks: the payload comes from an
+/// unauthenticated peer (OSF-1), so the pair may be anything. A cursor
+/// that claims more chains in flight than the ring has descriptors
+/// makes viona find entries in the available ring unconsumed and hand
+/// the guest driver descriptors it has already reclaimed, which the
+/// driver reports as "id N is not a head!".
 fn indices_hold(size: u16, avail_idx: u16, used_idx: u16) -> bool {
     avail_idx.wrapping_sub(used_idx) <= size
 }

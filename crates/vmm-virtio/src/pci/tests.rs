@@ -279,6 +279,78 @@ fn make_tracking_device_full(
     )
 }
 
+/// A device that owns its ring cursors, the way viona does.
+///
+/// `None` is the read the kernel refused. Nothing userspace keeps
+/// stands in for cursors a kernel backend moves, so that has to reach
+/// the export's caller.
+struct KernelCursorDevice(Option<(u16, u16)>);
+
+impl VirtioDevice for KernelCursorDevice {
+    fn device_features(&self) -> u64 {
+        bits::VIRTIO_F_VERSION_1
+    }
+
+    fn set_features(&self, _features: u64) {}
+
+    fn cfg_read(&self, _offset: u16, _len: u8) -> u32 {
+        0
+    }
+
+    fn cfg_write(&self, _offset: u16, _val: u32, _len: u8) {}
+
+    fn process_queue(
+        &self,
+        _queue_idx: u16,
+        _queue: &mut VirtQueue,
+        _head: u16,
+        _physmap: &PhysMap,
+    ) -> u32 {
+        0
+    }
+
+    fn kernel_ring_indices(
+        &self,
+        queue_idx: u16,
+    ) -> Result<Option<(u16, u16)>, vmm_devices::lifecycle::DeviceStateError>
+    {
+        self.0.map(Some).ok_or_else(|| {
+            vmm_devices::lifecycle::DeviceStateError::Export(format!(
+                "ring {queue_idx} state read failed"
+            ))
+        })
+    }
+
+    fn reset(&self) {}
+}
+
+impl Lifecycle for KernelCursorDevice {
+    fn type_name(&self) -> &'static str {
+        "kernel-cursor-virtio"
+    }
+}
+
+fn make_kernel_cursor_device(
+    indices: Option<(u16, u16)>,
+) -> Arc<VirtioPciDevice<KernelCursorDevice>> {
+    let physmap = Arc::new(
+        PhysMap::new_anon(MIGRATE_RING_GPA, MIGRATE_RING_LEN)
+            .expect("create guest memory"),
+    );
+    VirtioPciDevice::new(
+        KernelCursorDevice(indices),
+        bits::VIRTIO_DEV_TYPE_NET,
+        1,
+        256,
+        8,
+        None,
+        physmap,
+        Arc::new(PioBus::new()),
+        Arc::new(MmioBus::new()),
+        None,
+    )
+}
+
 /// An MSI-X table that needs no live vmm handle.
 pub(super) fn null_msix(count: u16) -> Arc<MsixTable> {
     struct NullSink;

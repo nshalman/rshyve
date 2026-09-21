@@ -154,10 +154,21 @@ pub trait VirtioDevice: Send + Sync + 'static {
     /// nothing.
     fn queue_addr_set(&self, _queue_idx: u16, _queue: &VirtQueue) {}
 
-    /// Get kernel ring indices for migration export. Returns (avail_idx, used_idx).
-    /// Software devices return the VirtQueue indices; kernel devices query the kernel.
-    fn get_kernel_ring_indices(&self, _queue_idx: u16) -> (u16, u16) {
-        (0, 0)
+    /// The `(avail_idx, used_idx)` a kernel backend holds for one ring.
+    ///
+    /// `None` says this device keeps no cursors of its own, so the
+    /// export reads them from the [`VirtQueue`] and guest memory. A
+    /// backend that owns them answers `Some` for every live ring, and
+    /// zero is an ordinary value in either position: both cursors count
+    /// in a u16 that wraps. An error fails the export, because the
+    /// userspace cursors are not a substitute for the ones the kernel
+    /// moved.
+    fn kernel_ring_indices(
+        &self,
+        _queue_idx: u16,
+    ) -> Result<Option<(u16, u16)>, vmm_devices::lifecycle::DeviceStateError>
+    {
+        Ok(None)
     }
 
     /// Reset all rings before migration restore. Kernel-accelerated

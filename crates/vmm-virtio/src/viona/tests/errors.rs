@@ -272,20 +272,19 @@ fn a_halt_deletes_the_link_though_every_ring_reset_fails() {
 }
 
 #[test]
-fn a_ring_state_read_the_kernel_refused_has_no_answer() {
+fn a_ring_state_read_the_kernel_refused_fails_the_export() {
     // The indices are the kernel's alone: viona never moves the pair
-    // userspace keeps, so nothing stands in for them. The device says
-    // it has no answer rather than reporting a ring that moved
-    // nothing.
+    // userspace keeps, so nothing stands in for them. A pair invented
+    // here would resume the destination from a point the ring passed.
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::RingGetState]);
     let device = device_with(Arc::new(link));
 
-    assert_eq!(device.get_kernel_ring_state(1), None);
-    // What the trait can carry. The pair reads as a ring that moved
-    // nothing, and `ring_set_state` on the destination refuses the
-    // payload that makes.
-    assert_eq!(VirtioDevice::get_kernel_ring_indices(&device, 1), (0, 0));
+    device
+        .kernel_ring_state(1)
+        .expect_err("the kernel refused the read");
+    VirtioDevice::kernel_ring_indices(&device, 1)
+        .expect_err("a refused read must fail the export");
 }
 
 #[test]

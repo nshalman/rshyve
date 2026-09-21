@@ -504,7 +504,7 @@ fn a_legacy_pfn_makes_its_queue_live_for_a_migration_export() {
     );
 
     assert!(queue_0_enabled(&dev));
-    let exported = dev.export_migrate_queues();
+    let exported = dev.export_migrate_queues().expect("exports");
     assert_eq!(
         exported.queues.len(),
         1,
@@ -525,7 +525,10 @@ fn a_legacy_pfn_makes_its_queue_live_for_a_migration_export() {
 
     assert!(!queue_0_enabled(&dev));
     assert!(
-        dev.export_migrate_queues().queues.is_empty(),
+        dev.export_migrate_queues()
+            .expect("exports")
+            .queues
+            .is_empty(),
         "a retired ring was still carried",
     );
 }

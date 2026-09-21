@@ -53,7 +53,9 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
 
     /// Snapshot the register file the driver programmed and every queue
     /// it configured.
-    pub(super) fn export_migrate_queues(&self) -> VirtioMigrateState {
+    pub(super) fn export_migrate_queues(
+        &self,
+    ) -> Result<VirtioMigrateState, DeviceStateError> {
         let vs = self.virtio_state.lock().expect("virtio lock");
         let modern = vs.guest_features & bits::VIRTIO_F_VERSION_1 != 0;
         let mut queues = Vec::new();
@@ -62,30 +64,28 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             if !q.is_configured() {
                 continue;
             }
-            let (k_avail, k_used) =
-                self.device.get_kernel_ring_indices(idx as u16);
-            // A software device keeps its completion cursor in
-            // VirtioCompletion, which writes the used ring directly and
-            // never moves the VirtQueue shadow. Guest memory is
-            // therefore the only place that cursor can be read from.
-            let used_idx = if k_used != 0 {
-                k_used
-            } else {
-                let guest_used = q.read_used_ring_idx(&self.physmap);
-                if guest_used != 0 {
-                    guest_used
-                } else {
-                    q.shadow_used_idx()
-                }
-            };
-            // A kernel ring's consumption cursor is the kernel's. The
-            // entries between it and the guest's avail idx are posted
-            // but unconsumed, and stay available on the destination.
-            let avail_idx = if k_used != 0 {
-                k_avail
-            } else {
-                q.last_avail_idx()
-            };
+            // A backend that owns its cursors answers for both, and the
+            // pair is taken whole: zero is an ordinary used cursor, so
+            // testing one against it would throw away a valid ring
+            // every time the 16-bit counter wrapped past it.
+            let (avail_idx, used_idx) =
+                match self.device.kernel_ring_indices(idx as u16)? {
+                    Some(pair) => pair,
+                    // A software device keeps its completion cursor in
+                    // VirtioCompletion, which writes the used ring directly
+                    // and never moves the VirtQueue shadow. Guest memory is
+                    // therefore the only place that cursor can be read
+                    // from.
+                    None => {
+                        let guest_used = q.read_used_ring_idx(&self.physmap);
+                        let used_idx = if guest_used != 0 {
+                            guest_used
+                        } else {
+                            q.shadow_used_idx()
+                        };
+                        (q.last_avail_idx(), used_idx)
+                    }
+                };
 
             let vector = self
                 .msix_queue_vectors
@@ -115,14 +115,14 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             });
         }
 
-        VirtioMigrateState {
+        Ok(VirtioMigrateState {
             status: vs.status,
             features: vs.guest_features,
             config_msix_vector: self.msix_config_vector.load(Ordering::Acquire),
             pci: self.pci_state.lock().expect("pci lock").migrate_state(),
             msix: self.msix.as_ref().map(|msix| msix.export_state()),
             queues,
-        }
+        })
     }
 
     /// Everything the payload must satisfy before any of it is applied.

@@ -422,13 +422,15 @@ impl VirtioDevice for VirtioViona {
         false
     }
 
-    fn get_kernel_ring_indices(&self, queue_idx: u16) -> (u16, u16) {
-        // The trait carries a pair of numbers and no way to say "no
-        // answer", and a device that has none reads here as a ring
-        // that moved nothing. The export then falls back to indices
-        // userspace keeps, which viona never moves. `ring_set_state`
-        // on the destination refuses the payload that makes.
-        self.get_kernel_ring_state(queue_idx).unwrap_or((0, 0))
+    fn kernel_ring_indices(
+        &self,
+        queue_idx: u16,
+    ) -> Result<Option<(u16, u16)>, vmm_devices::lifecycle::DeviceStateError>
+    {
+        // Always an answer or an error: viona owns both cursors of
+        // every ring it runs, and the pair userspace keeps stands in
+        // for neither.
+        self.kernel_ring_state(queue_idx).map(Some)
     }
 
     fn reset_all_rings(&self) {
