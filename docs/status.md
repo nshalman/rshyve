@@ -16,7 +16,7 @@ is in [hardware-run.md](hardware-run.md). Open security findings are in
 | SSH access via mdata-delivered keys | Working |
 | Guest gets IP via mdata sdc:nics | Working |
 | Cross-host migration (old CPU -> new CPU) | Working |
-| Cross-host migration (new CPU -> old CPU) | Needs `--cpu-baseline`; a mismatch is warned about, not rejected (OSF-3) |
+| Cross-host migration (new CPU -> old CPU) | Needs `--cpu-baseline`; without it the destination refuses the migration |
 | Same-host migration with busy workload | Working |
 | SIGTERM graceful shutdown | Working |
 | dd sequential read (NVMe, O_DIRECT) | 2.8 GB/s (matches C bhyve) |
@@ -83,7 +83,7 @@ and a real init. What they do and do not show is in
 | Same-host migration | Complete |
 | Cross-host (old->new CPU) | Complete |
 | Cross-host (new->old CPU) | Requires --cpu-baseline |
-| CPU feature check at preamble | Warns only, does not reject; the sync and async paths compare differently (OSF-3) |
+| CPU feature check at preamble | Rejects by default; `allow_cpu_feature_mismatch` on `migrate-dest` accepts the gap |
 | CPUID masking (--cpu-baseline) | Complete (host, avx2, sse42) |
 | RAM transfer (pre/post pause) | Complete |
 | Kernel device state | Complete (IOAPIC, ATPIT, ATPIC, HPET, RTC, PM Timer) |
@@ -91,7 +91,9 @@ and a real init. What they do and do not show is in
 | Per-vCPU run state (HALT/INIT/RUN) | Complete |
 | VMM_TIME adjustment (Propolis pattern) | Complete |
 | TSC frequency scaling | Complete |
-| Auto-resume on failure | Complete |
+| Auto-resume on failure | Complete (until the hand-over; past it the source stays paused) |
+| Emulated device state (virtio, NVMe) | Complete, matched by PCI address |
+| Hyper-V enlightenment state | Complete, no Windows guest behind it |
 | FPU/XSAVE state | Not yet implemented |
 
 ## Platform integration readiness
@@ -113,9 +115,6 @@ and a real init. What they do and do not show is in
 - Migration transport is unauthenticated and unencrypted; see SECURITY.md
 - NVList/zhyve.cmd reader not implemented (boot.c integration uses CLI flags directly)
 - Large VMs (>32 GB) not tested with migration
-- Hyper-V enlightenment state is not in the migration payload, so a
-  `--hyperv` guest's reference time restarts on the destination
-  (OSF-8)
 - virtio-net TX may show initial delay on first packet (viona interrupt poll startup)
 - A device reset has no bounded duration. Anything holding the bhyve VM
   write lock delays it, and memory hot-add holds that lock for 233 to
