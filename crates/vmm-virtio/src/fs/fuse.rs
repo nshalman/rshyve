@@ -459,6 +459,9 @@ pub mod linux_oflags {
     pub const O_APPEND: u32 = 0o2000;
     pub const O_NONBLOCK: u32 = 0o4000;
     pub const O_DSYNC: u32 = 0o10000;
+    /// `O_ASYNC`, also spelled `FASYNC`. Linux counts it among the
+    /// flags a file may be opened with and FUSE forwards it.
+    pub const O_ASYNC: u32 = 0o20000;
     pub const O_DIRECT: u32 = 0o40000;
     pub const O_LARGEFILE: u32 = 0o100000;
     pub const O_DIRECTORY: u32 = 0o200000;
@@ -500,6 +503,9 @@ pub struct OpenFlags {
 /// and `O_DIRECT` are advisory, `O_NOCTTY` is for terminals, and
 /// `O_CLOEXEC` is set on every descriptor here regardless.
 ///
+/// `O_ASYNC` asks for SIGIO on the guest's own descriptor, which is the
+/// guest kernel's business and not this server's.
+///
 /// `__FMODE_EXEC` is not an open flag at all: Linux sets it on the open
 /// it performs to execute a file, and it reaches the server on every
 /// `execve` off a share. Refusing it fails the exec with EINVAL.
@@ -508,6 +514,7 @@ const IGNORED_LINUX_OFLAGS: u32 = linux_oflags::O_LARGEFILE
     | linux_oflags::O_DIRECT
     | linux_oflags::O_NOCTTY
     | linux_oflags::O_CLOEXEC
+    | linux_oflags::O_ASYNC
     | linux_oflags::FMODE_EXEC;
 
 impl OpenFlags {
@@ -834,6 +841,18 @@ mod tests {
     /// Linux opens a binary for execution with `__FMODE_EXEC` set, so
     /// refusing that bit fails every `execve` off a share with EINVAL.
     /// A live guest caught this; no unit test did.
+    /// Linux counts O_ASYNC among the flags a file may be opened with,
+    /// and FUSE forwards it, so refusing it fails the open.
+    #[test]
+    fn an_async_open_is_accepted() {
+        let f =
+            OpenFlags::from_linux(linux_oflags::O_RDWR | linux_oflags::O_ASYNC)
+                .expect("an O_ASYNC open is known");
+
+        assert_eq!(f.accmode, libc::O_RDWR);
+        assert_eq!(f.host_io_flags(), libc::O_RDWR);
+    }
+
     #[test]
     fn an_exec_open_is_accepted() {
         let exec = linux_oflags::O_RDONLY
