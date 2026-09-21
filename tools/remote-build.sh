@@ -22,13 +22,20 @@
 #   tools/remote-build.sh sh 'arbitrary command'
 #
 # Override the target with VMM_BUILD_HOST / VMM_BUILD_KEY / VMM_BUILD_DIR.
+#
+# A command that syncs holds a lock on the build directory, so two
+# drivers cannot build each other's tree. VMM_BUILD_LOCK_WAIT sets how
+# many seconds to wait for that lock.
 
 set -euo pipefail
 
 # No defaults: the build host is site-specific and must not be baked in.
 HOST="${VMM_BUILD_HOST:?set VMM_BUILD_HOST to user@host of your illumos build host}"
 KEY="${VMM_BUILD_KEY:?set VMM_BUILD_KEY to the SSH key for that host}"
+# A trailing slash would put the lock below inside the synced tree,
+# where --delete removes it.
 REMOTE_DIR="${VMM_BUILD_DIR:-/opt/rust-bhyve}"
+REMOTE_DIR="${REMOTE_DIR%/}"
 
 # The value is spliced into a command that a remote root shell parses, so
 # it is constrained to an absolute path made of path characters. A space,
@@ -82,7 +89,46 @@ usage() {
     exit 2
 }
 
+# Two drivers that share $REMOTE_DIR interleave: one syncs, the other
+# syncs over it, and the first then builds the second's tree and stamps
+# its own revision on it. The binary would name a commit it was not
+# built from, which is the failure the stamp exists to end. The lock
+# holds from the sync to the end of the command.
+LOCK_DIR="$REMOTE_DIR.lock"
+LOCK_WAIT="${VMM_BUILD_LOCK_WAIT:-600}"
+case "$LOCK_WAIT" in
+    '' | *[!0-9]*)
+        echo "BUILD-FAIL: VMM_BUILD_LOCK_WAIT must be seconds" >&2; exit 1 ;;
+esac
+lock_held=""
+
+release_lock() {
+    [ -n "$lock_held" ] || return 0
+    lock_held=""
+    "${SSH[@]}" "rmdir $LOCK_DIR" >/dev/null 2>&1 || true
+}
+
+take_lock() {
+    local waited=0
+    until "${SSH[@]}" "mkdir $LOCK_DIR" >/dev/null 2>&1; do
+        if [ "$waited" -ge "$LOCK_WAIT" ]; then
+            echo "BUILD-FAIL: $HOST:$LOCK_DIR is held. Another build has" \
+                 "it, or one died; remove that directory to clear it." >&2
+            exit 1
+        fi
+        if [ "$waited" -eq 0 ]; then
+            echo "waiting for $HOST:$LOCK_DIR" >&2
+        fi
+        sleep 10
+        waited=$((waited + 10))
+    done
+    lock_held=1
+    trap release_lock EXIT
+    trap 'release_lock; exit 130' INT TERM
+}
+
 sync_sources() {
+    take_lock
     # --checksum because rsync-over-ssh timestamps do not reliably invalidate
     # cargo's fingerprints; without it edited files silently fail to rebuild.
     rsync -az --checksum --delete \

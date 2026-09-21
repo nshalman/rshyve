@@ -68,9 +68,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # Both guards in this job are shell, and one of them runs inside
-      # the build container. ci.yml lints tools/*.sh and does not reach
-      # here, so this job lints its own.
+      # The config guard is shell, and it also runs inside the build
+      # container where a failure costs a whole compile. ci.yml lints
+      # tools/*.sh only, so this job lints the scripts it runs.
       - run: shellcheck -S warning kernel/*.sh
 
       # build.sh pulls a digest-pinned Alpine image from Docker Hub and
