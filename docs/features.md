@@ -71,7 +71,7 @@ Markers: **yes** works, **caveat** works with a condition named in the matching 
 
 ### What firehyve rejects at startup
 
-`validate_cli` (`bin/firehyve/src/main.rs`) errors on: a missing `--kernel`, `--migrate-listen`, `--control-socket`, `--json-config`, every `--mdata-*` flag, `--vtpm`, `--vtpm-state-dir`, `--hyperv`, `--tsc-freq-hz`, and any `-s` spec containing a `bootindex=` token. `split_spec` (`bin/firehyve/src/devices.rs`) then rejects any PCI driver outside its `SUPPORTED` list.
+`validate_cli` (`bin/firehyve/src/main.rs`) errors on: a missing `--kernel`, `--migrate-listen`, `--control-socket`, `--json-config`, every `--mdata-*` flag, `--vtpm`, `--vtpm-state-dir`, `--hyperv`, `--tsc-freq-hz`, and any `-s` spec containing a `bootindex=` token; `hardening_from_cli` errors on `--priv-drop=false` and on a `virtio-fs` spec. `split_spec` (`bin/firehyve/src/devices.rs`) then rejects any PCI driver outside its `SUPPORTED` list.
 
 What the bhyve zone brand forces onto every zone is accepted instead, because refusing it would mean an unmodified brand could never start the binary. Each is logged at `warn` and changes no guest behaviour: `-l bootrom,<rom>` (nothing is loaded from it), a `-l com1`/`com2` backend firehyve cannot serve (the port falls back to inherited stdio, which zoneadmd copies into the zone log rather than the zone console), and the `fbuf` and `xhci` specs `add_fbuf` emits (the slots stay empty). COM1 does serve an absolute device path, so the brand's `/dev/zconsole` is a working console. The startup argv is the only place these are tolerated: a hot-add of `fbuf` or `xhci` over the `CONTROL` verb is refused.
 

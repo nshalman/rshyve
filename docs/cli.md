@@ -201,8 +201,7 @@ firehyve [OPTIONS] --kernel <PATH> <VM_NAME>
 | `-s ...,bootindex=N` | Rejected. A directly booted kernel has no firmware boot order |
 | Migration | Not supported: `--migrate-listen` and `--control-socket` are rejected |
 | `--hotplug` | Accepted for CPU and memory hot-add, with the same `-c maxcpus=` and `-o hotplug.*` options as rshyve. There is no PCI hot-add: the device set is fixed at boot. The commands arrive on the vsock `CONTROL` verb, so the VM also needs a `-s <slot>,virtio-vsock,<path>,cid=<n>` device or nothing can reach them |
-| `--priv-drop[=false]` | On by default. Once every device is open the privilege sets are locked to `file_read` (plus `proc_clock_highres` when inherited) and the process drops to `--run-as-uid`/`--run-as-gid`, default 8123:8123, a numeric id with no passwd entry. `--priv-drop=false` turns it off; the value needs `=` because the brand puts the VM name right after its extra options. Either way one log line says which happened. `virtio-fs` is refused under the drop |
-| `--control-token-file` | A 0600 file holding the token every `CONTROL` session must present first. Without it `CONTROL` is refused; `CONNECT` still works |
+| Privilege drop | Mandatory; `--priv-drop=false` is refused. Once every device is open the privilege sets are locked to `file_read` (plus `proc_clock_highres` when inherited) with the inheritable set cleared, and the process drops to `--run-as-uid`/`--run-as-gid`, default 8123:8123, a numeric id with no passwd entry. Every listener socket and its directory are chowned to that identity before the drop. One log line reports the sets and ids. `virtio-fs` is refused, because it opens host files for the life of the VM |
 | Other | `--vtpm`, `--hyperv` and `--json-config` are rejected |
 
 Example:
@@ -220,20 +219,18 @@ firehyve -c 2 -m 512M \
 firehyve has no control socket, so the machine is read on the host
 socket of a `virtio-vsock` device. A peer that sends `CONNECT <port>`
 is joined to a guest port; a peer that sends `CONTROL` is answered by
-the VMM itself and reaches no guest. The first request of a session
-must be `auth <token>`, the token from `--control-token-file`. One
-request per line, one response line back, `OK ...` or `ERR <reason>`.
+the VMM itself and reaches no guest. One request per line, one
+response line back, `OK ...` or `ERR <reason>`.
 
 ```
 CONTROL
-auth <token>                    -> OK auth
 device-list                     -> OK 2 virtio-blk@4,0.4.0,present ...
 cpu-list                        -> OK 4 0,present,boot 2,absent,hotplug ...
 cpu-add 2                       -> OK 2,present
 mem-list                        -> OK 1 boot,1073741824,present
 mem-add 134217728               -> OK slot0,present
 status                          -> OK 9 state,running uptime_ms,1234 cpus_online,2 ...
-metrics                         -> OK 13 uptime_ms,1234 vcpu0.exits,40 ...
+metrics                         -> OK 20 uptime_ms,1234 vcpus,2 total.exits,70 ... vcpu0.exits,40 ...
 halt                            -> OK halt,requested
 device-add 5,virtio-blk,/path   -> ERR device-add is not supported: ...
 shutdown                        -> ERR shutdown is not supported: ...
@@ -243,24 +240,30 @@ Every answer is one line, at most 16 KiB. A list answer is `OK
 <count>` followed by one field per record, and a record is its values
 joined by commas, so a client splits on whitespace and then on commas.
 No value carries a space or a comma. `status` and `metrics` answer
-`key,value` records only. `mem-add` takes BYTES on both transports,
-not the `-m` size grammar. `halt` is a hard stop: a microVM has no
-ACPI power button, so a graceful stop is the guest agent's job over
-vsock. `device-add` and `device-remove` are gone: the device set is
-fixed at boot, and after the privilege lock the VMM could not open a
-new backing file anyway.
+`key,value` records only. `metrics` gives the uptime, the vCPU count,
+each exit bucket summed over every vCPU (`total.*`, hot-added vCPUs
+included), then each vCPU's own buckets; the line at the 64-vCPU
+ceiling fits the cap. `mem-add` takes BYTES on both transports, not
+the `-m` size grammar. `halt` is the hard stop. `shutdown` is refused
+by name: a microVM has no ACPI power button, so a graceful stop is the
+guest agent's Shutdown frame over vsock, followed by `halt`.
+`device-add` and `device-remove` are gone: the device set is fixed at
+boot, and after the privilege lock the VMM could not open a new
+backing file anyway.
 
 The socket is the path in the device spec, for example
-`-s 9,virtio-vsock,/var/run/firehyve/guest.sock,cid=3`. Three gates
-stand in front of it: the socket is 0600 in a 0700 directory; the
-accept loop reads the peer's credentials with `getpeerucred(3C)` and
-admits the VMM's own uid in its own zone or uid 0 in the global zone
-(a global-zone peer connecting through a path under the zone root is
-reported with zone id 0, so that is the case the CN agent is); and the
-session's first line must carry the token.
+`-s 9,virtio-vsock,/var/run/firehyve/guest.sock,cid=3`. Two gates
+stand in front of it: the socket is 0600 in a 0700 directory, both
+owned by the run-as identity; and the accept loop reads the peer's
+credentials with `getpeerucred(3C)` and admits the VMM's own uid in
+its own zone or uid 0 in the global zone. A global-zone peer connecting
+through a path under the zone root is reported with zone id 0, so that
+is the case the CN agent is, and it is the only peer that can reach a
+path under the zone root. There is no token: after the lock it would
+protect nothing the peer gate does not.
 
 ```bash
-printf 'CONTROL\nauth %s\ncpu-add 2\n' "$(cat control.token)" \
+printf 'CONTROL\ncpu-add 2\n' \
   | socat - UNIX-CONNECT:/var/run/firehyve/guest.sock
 ```
 
