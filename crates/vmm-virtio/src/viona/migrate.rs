@@ -11,7 +11,7 @@
 
 use vmm_devices::lifecycle::DeviceStateError;
 
-use super::{RingState, VirtioViona, NET_NUM_QUEUES};
+use super::{PausedRing, RingState, VirtioViona, NET_NUM_QUEUES};
 
 impl VirtioViona {
     /// Stop every ring worker, so the indices this reads out hold
@@ -30,15 +30,28 @@ impl VirtioViona {
             return Ok(());
         }
         for ring in 0..NET_NUM_QUEUES as u16 {
-            // Read the state before the pause: the ring is running, so
-            // this is what a rollback has to put back.
-            let saved = inner.link_ref().ring_get_state(ring).ok();
             if let Err(e) = inner.link_ref().ring_pause(ring) {
                 return Err(DeviceStateError::Export(format!(
                     "viona ring {ring} pause failed: {e}"
                 )));
             }
-            inner.paused_rings[usize::from(ring)] = saved;
+            // The read comes after the pause. A running ring moves both
+            // cursors between the two calls, so a rollback taken from a
+            // read made first programs cursors the kernel has already
+            // passed and replays the descriptors between them.
+            let idx = usize::from(ring);
+            match inner.link_ref().ring_get_state(ring) {
+                Ok(state) => inner.paused_rings[idx] = PausedRing::Saved(state),
+                Err(e) => {
+                    // The ring is stopped and nothing can restart it: a
+                    // paused ring needs a reset plus a state write, and
+                    // the state is what the kernel just refused.
+                    inner.paused_rings[idx] = PausedRing::Lost;
+                    return Err(DeviceStateError::Export(format!(
+                        "viona ring {ring} state read failed: {e}"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -57,8 +70,17 @@ impl VirtioViona {
         let mut failed: Vec<String> = Vec::new();
         for ring in 0..NET_NUM_QUEUES as u16 {
             let idx = usize::from(ring);
-            let Some(state) = inner.paused_rings[idx].take() else {
-                continue;
+            let state = match std::mem::take(&mut inner.paused_rings[idx]) {
+                PausedRing::Running => continue,
+                // The export stopped this ring and holds nothing to
+                // restart it from, so the source guest keeps a dead
+                // ring whatever happens next. Reporting it is the only
+                // honest answer.
+                PausedRing::Lost => {
+                    failed.push(format!("ring {ring} has no saved state"));
+                    continue;
+                }
+                PausedRing::Saved(state) => state,
             };
             // The guest ran between the pause and the abort and may
             // have reset the device. Its rings are the driver's to

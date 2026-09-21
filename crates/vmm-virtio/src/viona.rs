@@ -97,6 +97,22 @@ enum RingState {
     Error,
 }
 
+/// What a migration export left a kernel ring in.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum PausedRing {
+    /// No export stopped this ring, or a rollback put it back already.
+    #[default]
+    Running,
+    /// Stopped, with the state a rollback programs back into it.
+    Saved(viona_api::vioc_ring_state),
+    /// Stopped, with no state to program back.
+    ///
+    /// Only a reset plus a state write restarts a paused ring, so this
+    /// ring stays stopped. A rollback reports it rather than skipping
+    /// it and leaving the guest a NIC that never moves again.
+    Lost,
+}
+
 /// VirtIO network device backed by the illumos viona kernel driver.
 ///
 /// Only illumos can open a link, so [`VirtioViona::new`] fails
@@ -150,7 +166,7 @@ struct VionaInner {
     /// A migration that fails after the pause has to put the rings
     /// back, and a kick cannot do it: the kernel answers EBUSY for a
     /// stopped ring. Only these saved addresses and indices can.
-    paused_rings: [Option<viona_api::vioc_ring_state>; NET_NUM_QUEUES],
+    paused_rings: [PausedRing; NET_NUM_QUEUES],
 
     /// Deferred interrupt poll state for migration destinations.
     /// Holds the logger so the poll thread can be started after ring

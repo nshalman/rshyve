@@ -867,10 +867,10 @@ fn a_halted_device_restores_no_ring() {
 
 #[test]
 fn an_export_pauses_every_ring_before_it_reads_them() {
-    // A ring the kernel still works on moves its indices while the
-    // source reads them, and the destination resumes from a cursor
-    // that was never true. The state is read before each pause,
-    // because that is what a rollback has to put back.
+    // A ring the kernel still works on moves both cursors while the
+    // source reads them. A rollback taken from a read made first
+    // programs cursors the kernel has already passed, and the ring
+    // replays the descriptors between them.
     let steps = Steps::default();
     let device = device_with(Arc::new(TestLink::new(&steps)));
 
@@ -879,12 +879,28 @@ fn an_export_pauses_every_ring_before_it_reads_them() {
     assert_eq!(
         steps_of(&steps),
         [
-            Step::RingGetState(0),
             Step::RingPause(0),
-            Step::RingGetState(1),
+            Step::RingGetState(0),
             Step::RingPause(1),
+            Step::RingGetState(1),
         ],
     );
+}
+
+#[test]
+fn an_export_that_cannot_read_a_paused_ring_fails_the_migration() {
+    // The ring is stopped with nothing to restart it from: a paused
+    // ring needs a reset plus a state write. Neither the export nor the
+    // rollback may report success over that.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(
+        TestLink::new(&steps).failing(&[Op::RingGetState]),
+    ));
+
+    VirtioDevice::pause_rings_for_export(&device)
+        .expect_err("a ring with no saved state must fail the migration");
+    VirtioDevice::resume_rings_after_migration(&device)
+        .expect_err("a ring that cannot be restarted must be reported");
 }
 
 #[test]
