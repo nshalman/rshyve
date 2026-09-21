@@ -11,6 +11,9 @@ Similarity is an ordered sequence ratio over non-trivial lines. Blank
 lines, comments, attributes, and anything under 12 characters are
 dropped first, because otherwise `}` and common `use` lines make every
 Rust file look 30% similar to every other one.
+
+Scores move as upstream moves, so the measured Propolis revision is
+printed with the table and must be recorded beside it in THIRD_PARTY.md.
 """
 
 import argparse
@@ -38,6 +41,18 @@ def significant(lines):
             continue
         out.append(s)
     return out
+
+
+def upstream_revision(root):
+    """The Propolis revision measured, so the table can be reproduced."""
+    got = subprocess.run(
+        ["git", "-C", root, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if got.returncode != 0:
+        return None
+    return got.stdout.strip() or None
 
 
 def load_upstream(root):
@@ -102,6 +117,8 @@ def main():
     if not upstream:
         sys.exit(f"no Rust sources found under {root}")
 
+    propolis_rev = upstream_revision(root)
+
     rows = []
     for path, mine in our_files(args.rev):
         if len(mine) < 20:
@@ -111,6 +128,7 @@ def main():
             rows.append((score, path, len(mine), name))
     rows.sort(reverse=True)
 
+    print(f"measured against Propolis {propolis_rev or '(not a git checkout)'}\n")
     print(f"{'score':>5}  {'kind':<9} {'file':<52} {'lines':>5}  upstream")
     for score, path, count, name in rows:
         kind = (

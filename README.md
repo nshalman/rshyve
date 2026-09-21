@@ -1,8 +1,15 @@
 # rshyve - Rust bhyve VMM for Triton/SmartOS
 
-A Rust userspace VMM for illumos bhyve, CLI-compatible with the C
-`bhyve` command so it can be dropped into a Triton/SmartOS compute node
-in its place. Designed with live migration as a first-class feature.
+A Rust userspace VMM for illumos bhyve. It takes the command line the
+bhyve brand builds, so a Triton/SmartOS zone can run it in place of the
+platform bhyve through the brand's `/bhyve.zone` override. Live
+migration is a first-class feature and C bhyve has none.
+
+It is not all of bhyve. `ahci-hd` is refused at startup, `-D`, `-k` and
+`--json-config` are refused rather than ignored, an unknown `-s` driver
+name is logged and skipped, and a number of device options parse and
+then do nothing. Each one is listed in
+[docs/features.md](docs/features.md#accepted-by-the-cli-and-then-ignored).
 
 **Experimental.** This is not production-supported software. Major
 architectural state is still missing (see
@@ -18,11 +25,12 @@ the address space manager, and the PS/2 device models are from Propolis
 largely unchanged; parts of the PCI, UART, and VM-exit layers derive from it
 too. Both projects are MPL-2.0.
 
-Nineteen files, about 3,500 significant lines. Each carries a header
-naming its upstream counterpart, [THIRD_PARTY.md](THIRD_PARTY.md) lists
-them with measured similarity, and `tools/propolis-derivation.py`
-regenerates that list against a Propolis checkout so the claim can be
-checked rather than trusted.
+Nineteen files, 3300 significant lines, measured against Propolis
+`b428c40e`. Each carries a header naming its upstream counterpart,
+[THIRD_PARTY.md](THIRD_PARTY.md) lists them with measured similarity, and
+`tools/propolis-derivation.py` regenerates that list against a Propolis
+checkout so the claim can be checked rather than trusted. The tool
+prints the revision it measured.
 
 ## Quick Start
 
@@ -35,19 +43,32 @@ rshyve -c 2 -m 2G \
   myvm
 ```
 
-## Two binaries
+## What the workspace builds
 
-`rshyve` is the full bhyve-parity VMM described above. `firehyve` is a
+`rshyve` is the larger binary: the brand's flag grammar, UEFI boot,
+migration, the control socket and passthrough. `firehyve` is a
 microVM over the same crates: direct kernel boot, virtio devices, and a
 stdio serial console, with no UEFI, migration, control socket or
 passthrough. It shares the flag grammar and rejects what it cannot
 honor at startup. See [docs/cli.md](docs/cli.md#firehyve).
 
+One smaller binary goes with them: `fhrun` runs a Linux binary inside a
+firehyve microVM like a child process (see
+[docs/fhrun.md](docs/fhrun.md)).
+
+Migration orchestration is not in this repository. The VMM implements
+the wire protocol and the control-socket verbs; replicating the disk and
+sequencing the two hosts belong to whatever drives it. The contract an
+orchestrator has to meet is in
+[docs/migration.md](docs/migration.md#the-zfs-barrier).
+
 ## Documentation
 
-- [Architecture](docs/architecture.md) - Crate structure and design
+- [Architecture](docs/architecture.md) - Workspace layout, key types, data flow
 - [CLI Reference](docs/cli.md) - All flags and options
+- [Feature status](docs/status.md) - What is tested and what is not
 - [Feature reference](docs/features.md) - What each binary supports, with limits and caveats
+- [Backlog](FEATURES_TODO.md) - What is not built yet, and why
 - [Devices](docs/devices.md) - Supported PCI and LPC devices
 - [Live Migration](docs/migration.md) - Cross-host VM migration
 - [Metadata Agent](docs/mdata.md) - Guest configuration via COM2
@@ -106,6 +127,12 @@ for the feature matrix and
 [docs/hardware-run.md](docs/hardware-run.md) for what a live guest
 showed, including the one platform limit it found: a device reset has
 no bounded duration on illumos.
+
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the build, what CI does and
+does not prove, the repository gates, and commit style.
+[CHANGELOG.md](CHANGELOG.md) records what an operator would notice.
 
 ## Security
 

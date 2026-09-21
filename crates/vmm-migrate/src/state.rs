@@ -12,24 +12,24 @@
 use bhyve_api::{
     vdi_field_entry_v1, vdi_version_entry_v1, vm_reg_name, VDC_ATPIC,
     VDC_ATPIT, VDC_HPET, VDC_IOAPIC, VDC_LAPIC, VDC_MSR, VDC_PM_TIMER, VDC_RTC,
-    VDC_VMM_TIME,
 };
 use slog;
 use std::mem::size_of;
-use std::slice;
 use std::sync::Arc;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::vcpu::Vcpu;
 
 use crate::codec::{
-    DevicePayload, DeviceState, MigrateError, TimeData, VcpuStatePayload,
+    DevicePayload, DeviceState, MigrateError, VcpuStatePayload,
 };
 
 mod checks;
+mod time;
+
+pub use time::{export_time_data, import_time_data};
 
 use checks::{
-    check_class_blob, check_device_state, parse_vcpu_regs, read_class_layouts,
-    RegWrite,
+    check_device_state, parse_vcpu_regs, read_class_layouts, RegWrite,
 };
 
 /// System device descriptors for state export/import.
@@ -302,139 +302,6 @@ fn read_field_entries(
     Ok(buf)
 }
 
-/// Export time synchronization data from the kernel.
-pub fn export_time_data(
-    hdl: &Arc<VmmHdl>,
-    log: &slog::Logger,
-) -> Result<TimeData, MigrateError> {
-    let vmm_time = read_class_all(hdl, VDC_VMM_TIME, 1)?;
-    slog::info!(log, "exported VMM_TIME"; "bytes" => vmm_time.len());
-    Ok(TimeData { vmm_time })
-}
-
-/// Import time synchronization data into the kernel.
-///
-/// This must be called before importing device state, because timers
-/// need the correct time base.
-pub fn import_time_data(
-    hdl: &Arc<VmmHdl>,
-    time: &TimeData,
-    log: &slog::Logger,
-) -> Result<(), MigrateError> {
-    use bhyve_api::vdi_time_info_v1;
-
-    // The payload is a raw vdi_time_info_v1 from the source kernel. A
-    // different length is a different struct, and reading it as ours
-    // would give nonsense timer targets.
-    let layouts = read_class_layouts(hdl)?;
-    check_class_blob(
-        &layouts,
-        "VMM_TIME",
-        VDC_VMM_TIME,
-        1,
-        time.vmm_time.len(),
-    )?;
-    if time.vmm_time.len() != size_of::<vdi_time_info_v1>() {
-        return Err(MigrateError::State(format!(
-            "VMM_TIME: payload has {} bytes, this build reads {}",
-            time.vmm_time.len(),
-            size_of::<vdi_time_info_v1>()
-        )));
-    }
-    let src: vdi_time_info_v1 = unsafe {
-        std::ptr::read_unaligned(
-            time.vmm_time.as_ptr() as *const vdi_time_info_v1
-        )
-    };
-
-    // Read destination's current host time snapshot
-    let dst = hdl
-        .data_op(VDC_VMM_TIME, 1)
-        .read::<vdi_time_info_v1>()
-        .map_err(|e| {
-            MigrateError::VmmData(format!("read dst VMM_TIME: {e:?}"))
-        })?;
-
-    // Adjust boot_hrtime for the destination host (Propolis pattern):
-    //
-    // guest_uptime = src.hrtime - src.boot_hrtime
-    // migrate_delta = dst_wall_clock - src_wall_clock  (clamped to 0)
-    // new_boot_hrtime = dst.hrtime - (guest_uptime + migrate_delta)
-    // new_guest_tsc = src.guest_tsc + tsc_ticks_during_migration
-    let guest_uptime = src.vt_hrtime - src.vt_boot_hrtime;
-
-    let src_wc_ns =
-        (src.vt_hres_sec as i64) * 1_000_000_000 + (src.vt_hres_ns as i64);
-    let dst_wc_ns =
-        (dst.vt_hres_sec as i64) * 1_000_000_000 + (dst.vt_hres_ns as i64);
-    let migrate_delta_ns = (dst_wc_ns - src_wc_ns).max(0);
-
-    let new_boot_hrtime = dst.vt_hrtime - (guest_uptime + migrate_delta_ns);
-
-    // Adjust guest TSC forward by migration duration.
-    // Use destination's freq for the TSC delta calculation when freqs differ,
-    // since the guest TSC will tick at the destination's rate.
-    let tsc_freq_for_delta = if dst.vt_guest_freq != src.vt_guest_freq {
-        dst.vt_guest_freq
-    } else {
-        src.vt_guest_freq
-    };
-    let tsc_delta = if tsc_freq_for_delta > 0 {
-        (migrate_delta_ns as u64) * tsc_freq_for_delta / 1_000_000_000
-    } else {
-        0
-    };
-    // Scale the source TSC to the destination's frequency
-    let scaled_guest_tsc =
-        if dst.vt_guest_freq != src.vt_guest_freq && src.vt_guest_freq > 0 {
-            (src.vt_guest_tsc as u128 * dst.vt_guest_freq as u128
-                / src.vt_guest_freq as u128) as u64
-        } else {
-            src.vt_guest_tsc
-        };
-    let new_guest_tsc = scaled_guest_tsc.wrapping_add(tsc_delta);
-
-    slog::info!(log, "VMM_TIME adjust";
-        "guest_uptime_ms" => guest_uptime / 1_000_000,
-        "migrate_delta_ms" => migrate_delta_ns / 1_000_000,
-        "boot_hrtime" => new_boot_hrtime,
-        "tsc_delta" => tsc_delta,
-    );
-
-    // Use destination's guest_freq if it differs from source.
-    // The kernel may reject writes with a mismatched frequency
-    // (EPERM). TSC frequency scaling is handled by the kernel.
-    let guest_freq = if dst.vt_guest_freq != src.vt_guest_freq {
-        slog::warn!(log, "TSC freq mismatch, using destination";
-            "src_freq_hz" => src.vt_guest_freq,
-            "dst_freq_hz" => dst.vt_guest_freq,
-        );
-        dst.vt_guest_freq
-    } else {
-        src.vt_guest_freq
-    };
-
-    let adjusted = vdi_time_info_v1 {
-        vt_guest_freq: guest_freq,
-        vt_guest_tsc: new_guest_tsc,
-        vt_boot_hrtime: new_boot_hrtime,
-        vt_hrtime: dst.vt_hrtime,
-        vt_hres_sec: dst.vt_hres_sec,
-        vt_hres_ns: dst.vt_hres_ns,
-    };
-
-    // Write adjusted time data
-    let adjusted_bytes: &[u8] = unsafe {
-        slice::from_raw_parts(
-            &adjusted as *const _ as *const u8,
-            size_of::<vdi_time_info_v1>(),
-        )
-    };
-    write_class_all(hdl, VDC_VMM_TIME, 1, adjusted_bytes)?;
-    slog::info!(log, "VMM_TIME import complete (adjusted)");
-    Ok(())
-}
-
 /// Export all kernel device state (per-vCPU + system devices).
 ///
 /// The VM must be paused before calling this to get a consistent
@@ -512,8 +379,8 @@ pub fn export_device_state(
     Ok(DeviceState {
         vcpus,
         devices,
-        virtio_queues: Vec::new(),
-        nvme_controllers: Vec::new(),
+        emulated: Vec::new(),
+        hyperv: None,
     })
 }
 
@@ -523,10 +390,17 @@ pub fn export_device_state(
 pub fn import_device_state(
     hdl: &Arc<VmmHdl>,
     state: &DeviceState,
+    num_cpus: u32,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     let layouts = read_class_layouts(hdl)?;
-    import_device_state_into(&KernelSink { hdl }, &layouts, state, log)
+    import_device_state_into(
+        &KernelSink { hdl },
+        &layouts,
+        state,
+        num_cpus,
+        log,
+    )
 }
 
 /// Check the payload against the local kernel, then apply all of it.
@@ -537,9 +411,10 @@ fn import_device_state_into(
     sink: &dyn ImportSink,
     layouts: &[vdi_version_entry_v1],
     state: &DeviceState,
+    num_cpus: u32,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
-    check_device_state(state, layouts)?;
+    check_device_state(state, layouts, num_cpus)?;
 
     // The payload carries no FPU/XSAVE state. OSF-2 in
     // docs/security/open-findings.md tracks the gap.
@@ -659,14 +534,61 @@ mod tests {
         import_with_layouts(state, &kernel_layouts())
     }
 
+    fn import_with_num_cpus(
+        state: &DeviceState,
+        num_cpus: u32,
+    ) -> (RecordingSink, Result<(), MigrateError>) {
+        let sink = RecordingSink::default();
+        let result = import_device_state_into(
+            &sink,
+            &kernel_layouts(),
+            state,
+            num_cpus,
+            &test_log(),
+        );
+        (sink, result)
+    }
+
     fn import_with_layouts(
         state: &DeviceState,
         layouts: &[vdi_version_entry_v1],
     ) -> (RecordingSink, Result<(), MigrateError>) {
         let sink = RecordingSink::default();
-        let result =
-            import_device_state_into(&sink, layouts, state, &test_log());
+        let num_cpus = state.vcpus.len() as u32;
+        let result = import_device_state_into(
+            &sink,
+            layouts,
+            state,
+            num_cpus,
+            &test_log(),
+        );
         (sink, result)
+    }
+
+    #[test]
+    fn the_vcpu_payload_count_must_equal_the_vm_cpu_count() {
+        // The kernel takes any id below VM_MAXCPU, so a payload for a
+        // vCPU this VM never activated writes state into one with no
+        // thread, and a missing one leaves that AP at reset.
+        let mut state = good_state();
+        state.vcpus.push(vcpu_payload(1));
+        let (sink, result) = import_with_num_cpus(&state, 1);
+        assert!(result.is_err(), "two payloads on a 1-CPU VM must fail");
+        assert!(sink.applied_nothing());
+
+        let (sink, result) = import_with_num_cpus(&good_state(), 2);
+        assert!(result.is_err(), "one payload on a 2-CPU VM must fail");
+        assert!(sink.applied_nothing());
+    }
+
+    #[test]
+    fn a_vcpu_id_past_the_cpu_count_is_refused() {
+        let mut state = good_state();
+        state.vcpus = vec![vcpu_payload(17)];
+        let (sink, result) = import_with_num_cpus(&state, 1);
+        let error = result.map(|_| ()).expect_err("vcpu 17 on a 1-CPU VM");
+        assert!(error.to_string().contains("outside 0..1"), "{error}");
+        assert!(sink.applied_nothing());
     }
 
     #[test]
@@ -711,7 +633,9 @@ mod tests {
         state.vcpus[0].msrs = msrs;
 
         let (sink, result) = import(&state);
-        let err = result.expect_err("unaligned MSR blob must fail");
+        let err = result
+            .map(|_| ())
+            .expect_err("unaligned MSR blob must fail");
         let text = err.to_string();
         assert!(text.contains("MSR"), "{text}");
         assert!(sink.applied_nothing(), "state applied before the check");
@@ -740,7 +664,9 @@ mod tests {
             }
         }
         let (sink, result) = import_with_layouts(&good_state(), &layouts);
-        let err = result.expect_err("unknown LAPIC version must fail");
+        let err = result
+            .map(|_| ())
+            .expect_err("unknown LAPIC version must fail");
         assert!(err.to_string().contains("LAPIC"), "{err}");
         assert!(sink.applied_nothing());
     }

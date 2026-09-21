@@ -33,27 +33,47 @@ impl VsockShared {
         if self.gate.is_paused() {
             return;
         }
-        let completion = {
-            let guard = self.rx_completion.lock().expect("rx completion lock");
-            match guard.as_ref() {
-                Some(c) => Arc::clone(c),
-                None => return,
-            }
-        };
+        // The raise goes outside the permission that wrote the ring:
+        // delivery is a call into the kernel and a reset must not wait
+        // on it. The handler names its own session, so a raise the
+        // reset overtook is refused by the transport.
+        if let Some(completion) = self.pair_rx() {
+            completion.signal();
+        }
+    }
 
+    /// Pair every queued packet with a posted chain, returning the
+    /// handler that owes the guest an interrupt.
+    fn pair_rx(&self) -> Option<Arc<VirtioCompletion>> {
         let _delivery = self.delivery.lock().expect("delivery lock");
-
+        let mut raise = None;
         loop {
             if self.mux.rx_is_empty() {
-                return;
+                return raise;
             }
+            // Taken per packet, and the handler is read inside it: a
+            // reset drains this section before it drops the handler, so
+            // the one found here belongs to the driver being written
+            // to.
+            let Some(_session) = self.access.enter_current(VSOCK_RX_QUEUE)
+            else {
+                return raise;
+            };
+            let completion = {
+                let guard =
+                    self.rx_completion.lock().expect("rx completion lock");
+                match guard.as_ref() {
+                    Some(c) => Arc::clone(c),
+                    None => return raise,
+                }
+            };
             let next = {
                 let mut pending =
                     self.pending_rx.lock().expect("pending rx lock");
                 pending.pop_front()
             };
             let Some((head, bufs)) = next else {
-                return;
+                return raise;
             };
             let Some(pkt) = self.mux.pop_rx() else {
                 // Nothing to send after all: give the chain back rather
@@ -62,11 +82,13 @@ impl VsockShared {
                     .lock()
                     .expect("pending rx lock")
                     .push_front((head, bufs));
-                return;
+                return raise;
             };
 
             let written = self.write_packet(&bufs, pkt);
-            completion.complete(head, written);
+            if completion.publish_batch(&[(head, written)]) {
+                raise = Some(completion);
+            }
         }
     }
 

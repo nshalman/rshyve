@@ -4,74 +4,57 @@
 
 //! PCI passthrough (PPT) device.
 //!
-//! Gives a real PCI function to the guest:
-//! 1. Open `/dev/pptN` and bind it to the VM.
-//! 2. Read physical config space and BAR information from hardware.
-//! 3. Map device MMIO BARs into guest physical address space with EPT
-//!    (`VM_MAP_PPTDEV_MMIO`), so guest MMIO goes to hardware with no
-//!    VM exit.
-//! 4. Interpose on config space. Only the command register, the BARs,
-//!    the interrupt line and the MSI capability have a handler. Every
-//!    other write is dropped.
-//! 5. Relay MSI through `VM_PPTDEV_MSI`. The kernel owns the physical
-//!    MSI registers and injects into the guest LAPIC.
-//! 6. Unbind on drop.
+//! Gives a real PCI function to the guest. MMIO BARs are mapped into
+//! guest physical address space with EPT (`VM_MAP_PPTDEV_MMIO`), so
+//! guest MMIO reaches the hardware with no VM exit. I/O BARs are
+//! trapped on the PIO bus and relayed through `PPT_BAR_READ` and
+//! `PPT_BAR_WRITE`. Config space is interposed, deny by default: the
+//! command register, the BARs, the interrupt line, the header type and
+//! the MSI capability have a handler, and every other write is dropped.
+//! The MSI capability is emulated in full (see [`msi`]); only its
+//! shadow values reach the kernel through `VM_PPTDEV_MSI`.
 //!
 //! # Limits
 //!
-//! **An MSI-X capable device is refused.** `update_bar_mappings` maps a
-//! full BAR, and on an MSI-X device that BAR holds the physical MSI-X
-//! table. illumos VT-d remaps DMA but not interrupts, so a guest that
-//! writes that table makes the device raise a guest-chosen vector on
-//! the host APIC. Linux gates the same hole behind
-//! `allow_unsafe_interrupts`; this refuses the device instead. To lift
-//! the refusal, carve the MSI-X table and PBA pages out of the mapped
-//! range, serve them from an emulated table on the MMIO bus, and
-//! program the hardware through `VM_PPTDEV_MSIX`. That work needs a
-//! host with a real assigned device to test against.
+//! **An MSI-X capable device is refused.** `apply_bar` maps a full BAR,
+//! and on an MSI-X device that BAR holds the physical MSI-X table.
+//! illumos VT-d remaps DMA but not interrupts, so a guest that writes
+//! that table makes the device raise a guest-chosen vector on the host
+//! APIC. Linux gates the same hole behind `allow_unsafe_interrupts`;
+//! this refuses the device instead.
 //!
-//! **`bar_rw` never runs.** Nothing registers this device on the MMIO
-//! or PIO bus, unlike `vmm_virtio::pci`, which registers its own BAR
-//! handlers. MMIO BARs do not need it, because EPT maps them. PIO BARs
-//! do, so a passthrough device with an I/O BAR decodes nothing.
+//! **An MMIO BAR smaller than a page is refused.** The kernel maps
+//! whole pages, and a sub-page BAR shares its page with whatever the
+//! platform placed next to it. The PPT driver relays only I/O BARs, so
+//! such a BAR cannot be trapped either.
 
-use std::fs::File;
-use std::io::Result;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::sync::{Arc, Mutex};
+use std::io::{Error, ErrorKind, Result};
+use std::sync::{Arc, Mutex, Weak};
 
-use bhyve_api::{
-    ioctls, ppt_bar_io, ppt_bar_query, ppt_cfg_io, PCI_ADDR_IO, PCI_ADDR_MEM32,
-    PCI_ADDR_MEM64,
-};
-use slog::{o, warn, Logger};
+use bhyve_api::{PCI_ADDR_IO, PCI_ADDR_MEM32, PCI_ADDR_MEM64};
+use slog::{warn, Logger};
 
 use vmm_core::common::RWOp;
 use vmm_core::hdl::VmmHdl;
+use vmm_core::pio::{PioBus, PioFn};
 
 use vmm_devices::pci::bar::{BarDefine, BAR_COUNT};
-use vmm_devices::pci::device::{DeviceState, PciDevice};
+use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use vmm_devices::pci::BarN;
 
 mod cfg;
+mod msi;
+mod ppt;
 
 use cfg::{
-    check_passthrough_supported, classify_cfg_write, msi_numvec,
-    scan_capabilities, CapLayout, CfgWrite,
+    check_passthrough_supported, classify_cfg_write, scan_capabilities,
+    CapLayout, CfgWrite,
 };
-
-// ── PCI capability constants ───────────────────────────────────────
+use msi::{MsiCap, MsiProgram};
+use ppt::{BarInfo, KernelPpt, PptOps};
 
 /// MSI capability: Message Control register offset within capability.
 const MSI_MSG_CTRL_OFF: u8 = 2;
-/// MSI capability: Message Address (lower 32 bits).
-const MSI_MSG_ADDR_OFF: u8 = 4;
-/// MSI capability: Message Data offset for 32-bit address variant.
-const MSI_MSG_DATA_32_OFF: u8 = 8;
-/// MSI capability: Message Upper Address (64-bit).
-const MSI_MSG_UPPER_ADDR_OFF: u8 = 8;
-/// MSI capability: Message Data offset for 64-bit address variant.
-const MSI_MSG_DATA_64_OFF: u8 = 12;
 /// MSI Message Control: MSI Enable.
 const MSI_MSG_CTRL_ENABLE: u16 = 1 << 0;
 /// MSI Message Control: 64-bit address capable.
@@ -79,118 +62,83 @@ const MSI_MSG_CTRL_64BIT: u16 = 1 << 7;
 /// MSI Message Control: per-vector masking capable.
 const MSI_MSG_CTRL_PVM: u16 = 1 << 8;
 
-/// PCI Command register bits we care about.
 const PCI_CMD_IO_EN: u16 = 1 << 0;
 const PCI_CMD_MMIO_EN: u16 = 1 << 1;
 
-/// PCI config space offsets this device interposes on.
 const CFG_COMMAND: u8 = 0x04;
 const CFG_STATUS: u8 = 0x06;
+const CFG_HEADER_TYPE: u8 = 0x0E;
 const CFG_BAR0: u8 = 0x10;
 const CFG_BAR5: u8 = 0x24;
 const CFG_CAP_PTR: usize = 0x34;
 const CFG_INTERRUPT_LINE: u8 = 0x3C;
+const CFG_INTERRUPT_PIN: usize = 0x3D;
 /// The first offset a capability may live at.
 const CFG_CAP_FIRST: u8 = 0x40;
 
-// ── PPT BAR info ───────────────────────────────────────────────────
+/// The kernel maps BARs in whole pages.
+const PAGE_SIZE: u64 = 4096;
 
-/// Cached information about one physical BAR.
-#[derive(Debug, Clone, Copy, Default)]
-struct BarInfo {
-    /// BAR type: `PCI_ADDR_IO`, `PCI_ADDR_MEM32`, or `PCI_ADDR_MEM64`.
-    bar_type: u32,
-    /// Host physical address (base) of the BAR.
-    hpa: u64,
-    /// Size of the BAR in bytes.
-    size: u64,
+/// Everything a guest access can change, under one lock so a command
+/// write and a BAR write from two vCPUs cannot interleave.
+struct Emulated {
+    /// Standard header: BAR addresses, interrupt line, header type.
+    state: DeviceState,
+    /// The full command register as the guest wrote it.
+    command: u16,
+    /// Guest windows the kernel holds mapped, by BAR: `(gpa, len)`.
+    mapped: [Option<(u64, u64)>; BAR_COUNT],
+    /// Ports registered on the PIO bus, by BAR.
+    ports: [Option<u16>; BAR_COUNT],
+    msi: Option<MsiCap>,
+    /// What the kernel last accepted through `VM_PPTDEV_MSI`.
+    msi_programmed: MsiProgram,
 }
 
-// ── Main struct ────────────────────────────────────────────────────
-
 /// PCI passthrough device.
-///
-/// Binds a real PCI function (`/dev/pptN`) to a VM and shows it to the
-/// guest. MMIO BARs go into guest physical address space with EPT.
-/// Config space is interposed, deny by default.
 pub struct PciPassthru {
-    /// The open `/dev/pptN`.
-    ppt: File,
-    /// VM handle for ioctls.
-    hdl: Arc<VmmHdl>,
-    /// Cached physical BAR information from the kernel.
+    ppt: Box<dyn PptOps>,
+    /// Physical BAR layout from the kernel, fixed for the device's life.
     bars: [BarInfo; BAR_COUNT],
-    /// Physical PCI config space cache (first 256 bytes).
+    /// Physical config space at bind time.
     phys_cfg: [u8; 256],
-    /// Capability layout of the physical device.
     caps: CapLayout,
-    /// MSI vector limit from the kernel. It bounds what a guest can
-    /// ask `VM_PPTDEV_MSI` for.
-    msi_limit: i32,
-    /// Standard PCI config header state (BAR addresses, command reg).
-    state: Mutex<DeviceState>,
-    /// Currently mapped BAR GPAs: `(gpa, len)` if mapped.
-    mapped_bars: Mutex<[Option<(u64, u64)>; BAR_COUNT]>,
-    /// Emulated PCI command register (shadow for MMIO_EN tracking).
-    command: Mutex<u16>,
-    /// Last MSI Enable bit the guest wrote. The bit itself never
-    /// reaches the hardware, so this is the only record of the intent.
-    msi_enabled: Mutex<bool>,
+    bus_pio: Arc<PioBus>,
+    /// For the PIO handlers, which must not keep the device alive.
+    weak: Weak<Self>,
+    inner: Mutex<Emulated>,
     log: Logger,
 }
 
 impl PciPassthru {
-    /// Create a new PCI passthrough device with no logging.
+    /// Open `ppt_path` (such as `/dev/ppt0`), bind it to the VM and
+    /// build the guest-visible device.
     ///
-    /// Prefer [`PciPassthru::new_with_logger`]. Without a logger a
-    /// dropped config-space write leaves no trace.
-    pub fn new(ppt_path: &str, hdl: Arc<VmmHdl>) -> Result<Arc<Self>> {
-        Self::new_with_logger(ppt_path, hdl, Logger::root(slog::Discard, o!()))
-    }
-
-    /// Create a new PCI passthrough device.
-    ///
-    /// Opens `ppt_path` (e.g. `/dev/ppt0`), binds it to the VM, and
-    /// reads physical config space and BAR information.
-    ///
-    /// Returns [`ErrorKind::Unsupported`] if the device advertises
-    /// MSI-X. See the module documentation for why.
-    pub fn new_with_logger(
+    /// Returns [`ErrorKind::Unsupported`] for a device this VMM cannot
+    /// isolate. See the module documentation.
+    pub fn new(
         ppt_path: &str,
         hdl: Arc<VmmHdl>,
+        bus_pio: Arc<PioBus>,
         log: Logger,
     ) -> Result<Arc<Self>> {
-        // std opens close-on-exec, so a guest-reset re-exec does not
-        // inherit the device.
-        let ppt = File::options().read(true).write(true).open(ppt_path)?;
+        let ppt = KernelPpt::open(ppt_path, hdl, log.clone())?;
+        Self::attach(Box::new(ppt), bus_pio, log)
+    }
 
-        hdl.bind_pptdev(ppt.as_fd())?;
+    /// Build the device over any backend. A failure drops the backend,
+    /// which gives the physical device back to the host.
+    fn attach(
+        ppt: Box<dyn PptOps>,
+        bus_pio: Arc<PioBus>,
+        log: Logger,
+    ) -> Result<Arc<Self>> {
+        let limits = ppt.limits()?;
 
-        // From here on every early return must give the device back to
-        // the host, so the bind is owned by a guard.
-        let bound = BoundPpt {
-            ppt: Some(ppt),
-            hdl: Arc::clone(&hdl),
-            log: log.clone(),
-        };
-        let ppt_fd = bound.fd();
-
-        let limits = hdl.pptdev_limits(ppt_fd)?;
-
-        // Read the full PCI config space (256 bytes) via PPT_CFG_READ.
         let mut phys_cfg = [0u8; 256];
-        for off in (0..256u64).step_by(4) {
-            let mut cfg_io = ppt_cfg_io {
-                pci_off: off,
-                pci_width: 4,
-                pci_data: 0,
-            };
-            // Safety: ppt_cfg_io is correct for PPT_CFG_READ.
-            // The ppt_fd is a valid /dev/pptN fd.
-            unsafe { ioctl_on_fd(ppt_fd, ioctls::PPT_CFG_READ, &mut cfg_io) }?;
-            let bytes = cfg_io.pci_data.to_le_bytes();
-            let idx = off as usize;
-            phys_cfg[idx..idx + 4].copy_from_slice(&bytes);
+        for off in (0..256usize).step_by(4) {
+            let val = ppt.cfg_read(off as u8, 4)?;
+            phys_cfg[off..off + 4].copy_from_slice(&val.to_le_bytes());
         }
 
         // Refuse the device before any BAR is mapped or any interrupt
@@ -198,26 +146,12 @@ impl PciPassthru {
         let caps = scan_capabilities(&phys_cfg);
         check_passthrough_supported(&caps)?;
 
-        // Query all 6 BARs.
         let mut bars = [BarInfo::default(); BAR_COUNT];
         for (i, bar) in bars.iter_mut().enumerate() {
-            let mut query = ppt_bar_query {
-                pbq_baridx: i as u32,
-                pbq_type: 0,
-                pbq_base: 0,
-                pbq_size: 0,
-            };
-            // Safety: ppt_bar_query is correct for PPT_BAR_QUERY.
-            unsafe { ioctl_on_fd(ppt_fd, ioctls::PPT_BAR_QUERY, &mut query) }?;
-            *bar = BarInfo {
-                bar_type: query.pbq_type,
-                hpa: query.pbq_base,
-                size: query.pbq_size,
-            };
+            *bar = ppt.bar_query(i)?.unwrap_or_default();
         }
 
-        // Build DeviceState from physical config space.
-        let ident = vmm_devices::pci::device::DeviceIdent {
+        let mut state = DeviceState::new(DeviceIdent {
             vendor_id: u16::from_le_bytes([phys_cfg[0], phys_cfg[1]]),
             device_id: u16::from_le_bytes([phys_cfg[2], phys_cfg[3]]),
             revision: phys_cfg[8],
@@ -226,240 +160,218 @@ impl PciPassthru {
             class: phys_cfg[0x0B],
             sub_vendor_id: u16::from_le_bytes([phys_cfg[0x2C], phys_cfg[0x2D]]),
             sub_device_id: u16::from_le_bytes([phys_cfg[0x2E], phys_cfg[0x2F]]),
-        };
-        let mut dev_state = DeviceState::new(ident);
-
-        // Define BARs in DeviceState based on physical BAR info.
-        let mut i = 0;
-        while i < BAR_COUNT {
-            let info = &bars[i];
-            if info.size == 0 {
-                i += 1;
-                continue;
-            }
-            if let Ok(bar_n) = BarN::try_from(i as u8) {
-                match info.bar_type {
-                    PCI_ADDR_IO => {
-                        if info.size <= u64::from(u16::MAX) {
-                            dev_state.define_bar(
-                                bar_n,
-                                BarDefine::Pio(info.size as u16),
-                            );
-                        }
-                        i += 1;
-                    }
-                    PCI_ADDR_MEM32 => {
-                        dev_state.define_bar(
-                            bar_n,
-                            BarDefine::Mmio(info.size as u32),
-                        );
-                        i += 1;
-                    }
-                    PCI_ADDR_MEM64 => {
-                        dev_state
-                            .define_bar(bar_n, BarDefine::Mmio64(info.size));
-                        i += 2; // 64-bit BAR consumes two slots
-                    }
-                    _ => {
-                        i += 1;
-                    }
-                }
-            } else {
-                i += 1;
+        });
+        for (i, info) in bars.iter().enumerate() {
+            if let Some(def) = bar_define(i, info)? {
+                let bar_n = BarN::try_from(i as u8)
+                    .map_err(|_| Error::from(ErrorKind::InvalidData))?;
+                state.define_bar(bar_n, def);
             }
         }
+        state.set_cap_ptr(phys_cfg[CFG_CAP_PTR]);
+        state.set_intr_pin(phys_cfg[CFG_INTERRUPT_PIN]);
+        state.set_intr_line(phys_cfg[usize::from(CFG_INTERRUPT_LINE)]);
+        state.cfg_write(
+            CFG_HEADER_TYPE,
+            1,
+            u32::from(phys_cfg[usize::from(CFG_HEADER_TYPE)]),
+        );
 
-        dev_state.set_cap_ptr(phys_cfg[CFG_CAP_PTR]);
+        let msi = MsiCap::from_cfg(
+            &phys_cfg,
+            caps.msi_cap_off,
+            caps.msi_cap_len,
+            limits.msi,
+        );
 
-        Ok(Arc::new(Self {
-            ppt: bound.release(),
-            hdl,
+        Ok(Arc::new_cyclic(|weak| Self {
+            ppt,
             bars,
             phys_cfg,
             caps,
-            msi_limit: limits.msi,
-            state: Mutex::new(dev_state),
-            mapped_bars: Mutex::new([None; BAR_COUNT]),
-            command: Mutex::new(0),
-            msi_enabled: Mutex::new(false),
+            bus_pio,
+            weak: weak.clone(),
+            inner: Mutex::new(Emulated {
+                state,
+                command: 0,
+                mapped: [None; BAR_COUNT],
+                ports: [None; BAR_COUNT],
+                msi,
+                msi_programmed: MsiProgram::default(),
+            }),
             log,
         }))
     }
 
-    // ── Internal helpers ───────────────────────────────────────────
-
-    /// Read a register from the physical device config space via ioctl.
-    fn ppt_cfg_read(&self, offset: u64, width: u32) -> Result<u32> {
-        let mut cfg_io = ppt_cfg_io {
-            pci_off: offset,
-            pci_width: width,
-            pci_data: 0,
-        };
-        // Safety: ppt_cfg_io is correct for PPT_CFG_READ on our ppt_fd.
-        unsafe {
-            ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_CFG_READ, &mut cfg_io)
-        }?;
-        Ok(cfg_io.pci_data)
+    fn lock(&self) -> std::sync::MutexGuard<'_, Emulated> {
+        self.inner.lock().expect("passthru lock")
     }
 
-    /// Write a register to the physical device config space via ioctl.
+    fn cached_dword(&self, dword_off: u8) -> u32 {
+        let i = usize::from(dword_off);
+        u32::from_le_bytes([
+            self.phys_cfg[i],
+            self.phys_cfg[i + 1],
+            self.phys_cfg[i + 2],
+            self.phys_cfg[i + 3],
+        ])
+    }
+
+    // ── BAR windows ────────────────────────────────────────────────
+
+    /// Bring the kernel window or PIO registration for one BAR in line
+    /// with the guest's BAR address and decode enables.
     ///
-    /// Every caller must first pass the offset through
-    /// [`classify_cfg_write`]. The illumos PPT driver does no filtering
-    /// of its own: `PPT_CFG_WRITE` is a raw `pci_config_put32`.
-    fn ppt_cfg_write(&self, offset: u64, width: u32, data: u32) -> Result<()> {
-        let mut cfg_io = ppt_cfg_io {
-            pci_off: offset,
-            pci_width: width,
-            pci_data: data,
-        };
-        // Safety: ppt_cfg_io is correct for PPT_CFG_WRITE on our ppt_fd.
-        unsafe {
-            ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_CFG_WRITE, &mut cfg_io)
-        }?;
-        Ok(())
-    }
-
-    /// Map a PPT device BAR into guest physical address space via EPT.
-    fn map_bar_mmio(&self, bar_idx: usize, gpa: u64, len: u64) -> Result<()> {
-        let hpa = self.bars[bar_idx].hpa;
-        self.hdl
-            .map_pptdev_mmio(self.ppt.as_fd(), gpa, hpa, len as usize)
-    }
-
-    /// Unmap a PPT device BAR from guest physical address space.
-    fn unmap_bar_mmio(&self, gpa: u64, len: u64) -> Result<()> {
-        self.hdl
-            .unmap_pptdev_mmio(self.ppt.as_fd(), gpa, len as usize)
-    }
-
-    /// Handle a BAR address change: unmap old mapping, create new one.
-    fn handle_bar_remap(&self, bar_idx: usize, new_gpa: u64, size: u64) {
-        let mut mapped = self.mapped_bars.lock().expect("mapped_bars lock");
-        let cmd = *self.command.lock().expect("command lock");
-        let mmio_enabled = (cmd & PCI_CMD_MMIO_EN) != 0;
-        let io_enabled = (cmd & PCI_CMD_IO_EN) != 0;
-
-        // Unmap old if present.
-        if let Some((old_g, old_len)) = mapped[bar_idx].take() {
-            self.report_unmap(old_g, old_len);
-        }
-
-        // Map new if the appropriate enable bit is set and address is valid.
-        if new_gpa == 0 || size == 0 {
+    /// A window that will not close is left recorded and nothing new
+    /// is opened for that BAR, so the guest never has two.
+    fn apply_bar(&self, inner: &mut Emulated, idx: usize) {
+        let info = self.bars[idx];
+        let Ok(bar_n) = BarN::try_from(idx as u8) else {
             return;
-        }
-
-        let bar_type = self.bars[bar_idx].bar_type;
-        let should_map = match bar_type {
-            PCI_ADDR_IO => io_enabled,
-            PCI_ADDR_MEM32 | PCI_ADDR_MEM64 => mmio_enabled,
+        };
+        let Some((_def, addr)) = inner.state.bars().get(bar_n) else {
+            return;
+        };
+        let enabled = match info.bar_type {
+            PCI_ADDR_IO => inner.command & PCI_CMD_IO_EN != 0,
+            PCI_ADDR_MEM32 | PCI_ADDR_MEM64 => {
+                inner.command & PCI_CMD_MMIO_EN != 0
+            }
             _ => false,
         };
+        let want = (enabled && addr != 0).then_some(addr);
 
-        if should_map && self.map_bar_mmio(bar_idx, new_gpa, size).is_ok() {
-            mapped[bar_idx] = Some((new_gpa, size));
-        }
-    }
-
-    /// Map or unmap all MMIO BARs based on the current command register.
-    fn update_bar_mappings(&self, old_cmd: u16, new_cmd: u16) {
-        let mmio_changed =
-            (old_cmd & PCI_CMD_MMIO_EN) != (new_cmd & PCI_CMD_MMIO_EN);
-        let io_changed = (old_cmd & PCI_CMD_IO_EN) != (new_cmd & PCI_CMD_IO_EN);
-
-        if !mmio_changed && !io_changed {
+        if info.bar_type == PCI_ADDR_IO {
+            let have = inner.ports[idx];
+            let want = want.and_then(|a| u16::try_from(a).ok());
+            if have == want {
+                return;
+            }
+            if let Some(port) = have {
+                if let Err(e) = self.bus_pio.unregister(port) {
+                    warn!(self.log, "passthru: PIO BAR unregister failed";
+                        "bar" => idx, "port" => format!("{port:#x}"),
+                        "error" => %e);
+                    return;
+                }
+                inner.ports[idx] = None;
+            }
+            if let Some(port) = want {
+                let Ok(len) = u16::try_from(info.size) else {
+                    return;
+                };
+                let weak = self.weak.clone();
+                let handler: Arc<PioFn> = Arc::new(move |offset, rwo| {
+                    if let Some(dev) = weak.upgrade() {
+                        dev.bar_rw(bar_n, usize::from(offset), rwo);
+                    }
+                });
+                match self.bus_pio.register(port, len, handler) {
+                    Ok(()) => inner.ports[idx] = Some(port),
+                    Err(e) => {
+                        warn!(self.log, "passthru: PIO BAR register failed";
+                            "bar" => idx, "port" => format!("{port:#x}"),
+                            "error" => %e);
+                    }
+                }
+            }
             return;
         }
 
-        let state = self.state.lock().expect("state lock");
-        let mut mapped = self.mapped_bars.lock().expect("mapped_bars lock");
-
-        for i in 0..BAR_COUNT {
-            let bar_info = &self.bars[i];
-            if bar_info.size == 0 {
-                continue;
+        let have = inner.mapped[idx];
+        let want = want.map(|gpa| (gpa, info.size));
+        if have == want {
+            return;
+        }
+        if let Some((gpa, len)) = have {
+            if let Err(e) = self.ppt.unmap_mmio(gpa, len) {
+                warn!(self.log, "passthru: BAR unmap failed, window still open";
+                    "bar" => idx, "gpa" => format!("{gpa:#x}"), "len" => len,
+                    "error" => %e);
+                return;
             }
-
-            let is_mmio =
-                matches!(bar_info.bar_type, PCI_ADDR_MEM32 | PCI_ADDR_MEM64);
-            let is_io = bar_info.bar_type == PCI_ADDR_IO;
-
-            if (is_mmio && !mmio_changed) || (is_io && !io_changed) {
-                continue;
-            }
-
-            if let Ok(bar_n) = BarN::try_from(i as u8) {
-                if let Some((_def, addr)) = state.bars().get(bar_n) {
-                    let now_enabled = if is_mmio {
-                        (new_cmd & PCI_CMD_MMIO_EN) != 0
-                    } else {
-                        (new_cmd & PCI_CMD_IO_EN) != 0
-                    };
-
-                    if now_enabled && addr != 0 {
-                        // Map.
-                        if mapped[i].is_none()
-                            && self.map_bar_mmio(i, addr, bar_info.size).is_ok()
-                        {
-                            mapped[i] = Some((addr, bar_info.size));
-                        }
-                    } else {
-                        // Unmap.
-                        if let Some((gpa, len)) = mapped[i].take() {
-                            self.report_unmap(gpa, len);
-                        }
-                    }
+            inner.mapped[idx] = None;
+        }
+        if let Some((gpa, len)) = want {
+            match self.ppt.map_mmio(gpa, info.hpa, len) {
+                Ok(()) => inner.mapped[idx] = Some((gpa, len)),
+                Err(e) => {
+                    warn!(self.log, "passthru: BAR map failed, guest cannot \
+                        reach the device";
+                        "bar" => idx, "gpa" => format!("{gpa:#x}"), "len" => len,
+                        "error" => %e);
                 }
             }
         }
     }
 
-    /// Unmap a BAR and say so if the kernel refuses.
+    fn apply_all_bars(&self, inner: &mut Emulated) {
+        for idx in 0..BAR_COUNT {
+            self.apply_bar(inner, idx);
+        }
+    }
+
+    /// Close every window and registration. Idempotent.
+    fn release_regions(&self, inner: &mut Emulated) {
+        inner.command &= !(PCI_CMD_IO_EN | PCI_CMD_MMIO_EN);
+        self.apply_all_bars(inner);
+    }
+
+    // ── Config-space write handlers ────────────────────────────────
+
+    /// Merge a guest write into the command register.
     ///
-    /// A failed unmap leaves the guest with an EPT window onto device
-    /// registers it no longer owns, so it must not pass in silence.
-    fn report_unmap(&self, gpa: u64, len: u64) {
-        if let Err(e) = self.unmap_bar_mmio(gpa, len) {
-            warn!(self.log, "passthru: BAR unmap failed, window still open";
-                "gpa" => format!("{gpa:#x}"),
-                "len" => len,
-                "error" => %e);
+    /// Bus mastering and the two decode enables must reach the device,
+    /// so this is the one header register written through.
+    fn cfg_write_command(&self, offset: u8, len: u8, val: u32) {
+        let mut inner = self.lock();
+        let new_cmd =
+            merge_bytes(u32::from(inner.command), offset, len, val) as u16;
+        inner.command = new_cmd;
+
+        if let Err(e) = self.ppt.cfg_write(CFG_COMMAND, 2, u32::from(new_cmd)) {
+            warn!(self.log, "passthru: command register write failed";
+                "value" => format!("{new_cmd:#06x}"), "error" => %e);
         }
+        self.apply_all_bars(&mut inner);
     }
 
-    /// Read from a BAR region at the given byte offset using PPT ioctl.
-    fn bar_io_read(&self, bar: u32, offset: u32, width: u32) -> u32 {
-        let mut io = ppt_bar_io {
-            pbi_bar: bar,
-            pbi_off: offset,
-            pbi_width: width,
-            pbi_data: 0,
+    /// Apply a guest BAR write to the emulated header, then remap.
+    ///
+    /// The value never reaches the hardware BAR. The device keeps the
+    /// host physical address the platform gave it.
+    fn cfg_write_bar(&self, offset: u8, len: u8, val: u32) {
+        let Ok(bar_n) = BarN::try_from(((offset & 0xFC) - CFG_BAR0) / 4) else {
+            return;
         };
-        // Safety: ppt_bar_io is correct for PPT_BAR_READ.
-        match unsafe {
-            ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_BAR_READ, &mut io)
-        } {
-            Ok(_) => io.pbi_data,
-            // An undecoded PCI read returns all ones.
-            Err(_) => u32::MAX,
-        }
+        let mut inner = self.lock();
+        let current = inner.state.bars().reg_read(bar_n);
+        let merged = merge_bytes(current, offset, len, val);
+        let Some(result) = inner.state.bar_write(bar_n, merged) else {
+            return;
+        };
+        self.apply_bar(&mut inner, result.bar as usize);
     }
 
-    /// Write to a BAR region at the given byte offset using PPT ioctl.
-    fn bar_io_write(&self, bar: u32, offset: u32, width: u32, data: u32) {
-        let mut io = ppt_bar_io {
-            pbi_bar: bar,
-            pbi_off: offset,
-            pbi_width: width,
-            pbi_data: data,
+    /// Update the MSI shadow and, when the effective values change,
+    /// the kernel. Nothing here touches the physical capability.
+    fn cfg_write_msi_cap(&self, offset: u8, len: u8, val: u32) {
+        let mut inner = self.lock();
+        let Some(msi) = inner.msi.as_mut() else {
+            return;
         };
-        // Safety: ppt_bar_io is correct for PPT_BAR_WRITE.
-        if let Err(e) = unsafe {
-            ioctl_on_fd(self.ppt.as_fd(), ioctls::PPT_BAR_WRITE, &mut io)
-        } {
-            warn!(self.log, "passthru: BAR I/O write failed";
-                "bar" => bar, "off" => offset, "error" => %e);
+        msi.write(offset, len, val);
+        let want = msi.program();
+        if want == inner.msi_programmed {
+            return;
+        }
+        match self.ppt.setup_msi(want.addr, want.data, want.numvec) {
+            Ok(()) => inner.msi_programmed = want,
+            Err(e) => {
+                warn!(self.log, "passthru: MSI setup failed, device keeps \
+                    its previous interrupt state";
+                    "numvec" => want.numvec, "error" => %e);
+            }
         }
     }
 }
@@ -467,70 +379,57 @@ impl PciPassthru {
 impl PciDevice for PciPassthru {
     fn cfg_read(&self, offset: u8, len: u8) -> u32 {
         let dword_off = offset & 0xFC;
-
-        match dword_off {
-            // Vendor ID / Device ID: return from cache.
-            0x00 => {
-                let val = u32::from_le_bytes([
-                    self.phys_cfg[0],
-                    self.phys_cfg[1],
-                    self.phys_cfg[2],
-                    self.phys_cfg[3],
-                ]);
-                extract_bytes(val, offset, len)
-            }
-
-            // Command register: return emulated value (low 16) +
-            // physical status (high 16).
+        let dword = match dword_off {
+            // Identity and class come from the bind-time cache.
+            0x00 | 0x08 | 0x2C => self.cached_dword(dword_off),
+            // Status is live hardware state; the command is what the
+            // guest wrote.
             CFG_COMMAND => {
-                let cmd = *self.command.lock().expect("command lock");
-                let status = self
-                    .ppt_cfg_read(u64::from(CFG_STATUS), 2)
-                    .unwrap_or(0) as u16;
-                let val = u32::from(cmd) | (u32::from(status) << 16);
-                extract_bytes(val, offset, len)
+                let cmd = self.lock().command;
+                let status = self.ppt.cfg_read(CFG_STATUS, 2).unwrap_or(0);
+                u32::from(cmd) | (status << 16)
             }
-
-            // Class / Revision: return from cache.
-            0x08 => {
-                let val = u32::from_le_bytes([
-                    self.phys_cfg[8],
-                    self.phys_cfg[9],
-                    self.phys_cfg[0x0A],
-                    self.phys_cfg[0x0B],
-                ]);
-                extract_bytes(val, offset, len)
+            // Header type is emulated; the bus sets its multi-function
+            // bit. The other three bytes are static hardware values.
+            0x0C => {
+                let header = self.lock().state.cfg_read(dword_off, 4);
+                (self.cached_dword(dword_off) & 0xFF00_FFFF)
+                    | (header & 0x00FF_0000)
             }
-
-            // BARs: return from DeviceState (guest-programmed values).
-            CFG_BAR0..=CFG_BAR5 => {
-                let state = self.state.lock().expect("state lock");
-                state.cfg_read(offset, len)
+            CFG_BAR0..=CFG_BAR5 => self.lock().state.cfg_read(dword_off, 4),
+            // Cardbus CIS, Expansion ROM and the reserved dword. The
+            // ROM BAR holds a host physical address, and no window is
+            // ever opened for it.
+            0x28 | 0x30 | 0x38 => 0,
+            0x34 => u32::from(self.phys_cfg[CFG_CAP_PTR]),
+            // Line and pin are emulated; Min_Gnt and Max_Lat are static.
+            0x3C => {
+                let header = self.lock().state.cfg_read(dword_off, 4);
+                (self.cached_dword(dword_off) & 0xFFFF_0000)
+                    | (header & 0x0000_FFFF)
             }
-
-            // Capabilities pointer: return from cache.
-            0x34 => {
-                let val = u32::from(self.phys_cfg[CFG_CAP_PTR]);
-                extract_bytes(val, offset, len)
+            _ if cfg::in_cap(offset, &self.caps) => {
+                return self
+                    .lock()
+                    .msi
+                    .as_ref()
+                    .map_or(0, |msi| msi.read(offset, len));
             }
-
-            // Everything else, the MSI capability included, reads the
-            // real device. Reads have no side effect on the host.
-            _ => self
-                .ppt_cfg_read(u64::from(offset), u32::from(len))
-                .unwrap_or(0xFFFF_FFFF),
-        }
+            // Anything else reads the real device. A config read has
+            // no side effect on the host.
+            _ => {
+                return self.ppt.cfg_read(offset, len).unwrap_or(0xFFFF_FFFF);
+            }
+        };
+        extract_bytes(dword, offset, len)
     }
 
     fn cfg_write(&self, offset: u8, len: u8, val: u32) {
         match classify_cfg_write(offset, len, &self.caps) {
             CfgWrite::Command => self.cfg_write_command(offset, len, val),
-            CfgWrite::Bar => self.cfg_write_bar(offset, val),
+            CfgWrite::Bar => self.cfg_write_bar(offset, len, val),
             CfgWrite::MsiCap => self.cfg_write_msi_cap(offset, len, val),
-            CfgWrite::InterruptLine => {
-                let mut state = self.state.lock().expect("state lock");
-                state.cfg_write(offset, len, val);
-            }
+            CfgWrite::Header => self.lock().state.cfg_write(offset, len, val),
             CfgWrite::Deny => {
                 warn!(self.log, "passthru: config write dropped";
                     "offset" => format!("{offset:#04x}"),
@@ -540,263 +439,118 @@ impl PciDevice for PciPassthru {
         }
     }
 
-    /// Never called: nothing registers this device on a bus.
-    ///
-    /// MMIO BARs do not need it, because EPT maps them straight to
-    /// hardware. A PIO BAR does, and until this device registers a PIO
-    /// handler its ports decode nothing.
+    /// Relay a trapped I/O BAR access. MMIO BARs never reach here:
+    /// EPT maps them straight to hardware.
     fn bar_rw(&self, bar: BarN, offset: usize, rwo: RWOp<'_>) {
-        let bar_idx = bar as usize;
-        let bar_info = &self.bars[bar_idx];
+        let idx = bar as usize;
+        let info = self.bars[idx];
+        let width = rwo.len();
+        let in_range = info.bar_type == PCI_ADDR_IO
+            && offset.checked_add(width).is_some_and(|end| {
+                u64::try_from(end).is_ok_and(|e| e <= info.size)
+            });
+        let Ok(offset) = u32::try_from(offset) else {
+            return;
+        };
+        let width_u8 = width as u8;
 
-        if bar_info.bar_type == PCI_ADDR_IO {
-            match rwo {
-                RWOp::Read(ro) => {
-                    let val = self.bar_io_read(
-                        bar_idx as u32,
-                        offset as u32,
-                        ro.len() as u32,
-                    );
-                    ro.write_dword(val)
-                }
-                RWOp::Write(wo) => {
-                    let data = wo.read_dword();
-                    self.bar_io_write(
-                        bar_idx as u32,
-                        offset as u32,
-                        wo.len() as u32,
-                        data,
-                    );
+        match rwo {
+            RWOp::Read(ro) => {
+                let val = if in_range {
+                    self.ppt.bar_read(idx, offset, width_u8).unwrap_or(u32::MAX)
+                } else {
+                    // An undecoded PCI read returns all ones.
+                    u32::MAX
+                };
+                match width {
+                    1 => ro.write_u8(val as u8),
+                    2 => ro.write_u16(val as u16),
+                    _ => ro.write_u32(val),
                 }
             }
-            return;
-        }
-
-        // An MMIO BAR reaching here is an unmapped region. An undecoded
-        // PCI read returns all ones.
-        if let RWOp::Read(ro) = rwo {
-            match ro.len() {
-                1 => ro.write_u8(0xFF),
-                2 => ro.write_u16(0xFFFF),
-                _ => ro.write_u32(0xFFFF_FFFF),
+            RWOp::Write(wo) => {
+                if !in_range {
+                    return;
+                }
+                let data = wo.read_dword();
+                if let Err(e) = self.ppt.bar_write(idx, offset, width_u8, data)
+                {
+                    warn!(self.log, "passthru: BAR I/O write failed";
+                        "bar" => idx, "off" => offset, "error" => %e);
+                }
             }
         }
     }
-}
 
-// ── Config-space write handlers ────────────────────────────────────
-
-impl PciPassthru {
-    /// Merge a guest write into the command register.
-    ///
-    /// Bus mastering and the two decode enables must reach the device,
-    /// so this is the one header register written through.
-    fn cfg_write_command(&self, offset: u8, len: u8, val: u32) {
-        let old_cmd = *self.command.lock().expect("command lock");
-        let byte_off = u32::from(offset & 0x03);
-        let mask = size_mask(len) << (byte_off * 8);
-        let merged =
-            (u32::from(old_cmd) & !mask) | ((val << (byte_off * 8)) & mask);
-        let new_cmd = merged as u16;
-        *self.command.lock().expect("command lock") = new_cmd;
-
-        if let Err(e) =
-            self.ppt_cfg_write(u64::from(CFG_COMMAND), 2, u32::from(new_cmd))
-        {
-            warn!(self.log, "passthru: command register write failed";
-                "value" => format!("{new_cmd:#06x}"), "error" => %e);
-        }
-
-        self.update_bar_mappings(old_cmd, new_cmd);
-    }
-
-    /// Apply a guest BAR write to the emulated header, then remap.
-    ///
-    /// The value never reaches the hardware BAR. The device keeps the
-    /// host physical address the platform gave it.
-    fn cfg_write_bar(&self, offset: u8, val: u32) {
-        let bar_idx = (offset - CFG_BAR0) / 4;
-        let Ok(bar_n) = BarN::try_from(bar_idx) else {
-            return;
-        };
-
-        let mut state = self.state.lock().expect("state lock");
-        let Some(result) = state.bar_write(bar_n, val) else {
-            return;
-        };
-        let idx = result.bar as usize;
-        let new_addr = result.new_addr;
-        let changed = result.old_addr != new_addr;
-        let size = result.def.size();
-        drop(state);
-
-        if changed {
-            self.handle_bar_remap(idx, new_addr, size);
-        }
-    }
-
-    /// Write to the MSI capability and program the real MSI.
-    ///
-    /// The MSI Enable bit is masked out of the write-through. The
-    /// kernel owns the physical MSI registers: `ppt_setup_msi` calls
-    /// `ddi_intr_enable`, which puts a host address and a host vector
-    /// there and sets Enable itself. Letting the guest set Enable would
-    /// open a window in which the device could post to a guest-chosen
-    /// host address, and illumos does not remap interrupts.
-    fn cfg_write_msi_cap(&self, offset: u8, len: u8, val: u32) {
-        let cap_off = self.caps.msi_cap_off;
-        let ctrl_off = cap_off.wrapping_add(MSI_MSG_CTRL_OFF);
-
-        // Track the guest's enable intent, then strip the bit.
-        let mut forwarded = val;
-        if offset <= ctrl_off && offset + len > ctrl_off {
-            let shift = u32::from(ctrl_off - offset) * 8;
-            let enable = u32::from(MSI_MSG_CTRL_ENABLE) << shift;
-            *self.msi_enabled.lock().expect("msi_enabled lock") =
-                (val & enable) != 0;
-            forwarded &= !enable;
-        }
-
-        if let Err(e) =
-            self.ppt_cfg_write(u64::from(offset), u32::from(len), forwarded)
-        {
-            warn!(self.log, "passthru: MSI capability write failed";
-                "offset" => format!("{offset:#04x}"), "error" => %e);
-            return;
-        }
-
-        let msg_ctrl =
-            self.ppt_cfg_read(u64::from(ctrl_off), 2).unwrap_or(0) as u16;
-        let is_64bit = (msg_ctrl & MSI_MSG_CTRL_64BIT) != 0;
-
-        let addr_lo = self
-            .ppt_cfg_read(u64::from(cap_off) + u64::from(MSI_MSG_ADDR_OFF), 4)
-            .unwrap_or(0);
-
-        let (addr, data) = if is_64bit {
-            let addr_hi = self
-                .ppt_cfg_read(
-                    u64::from(cap_off) + u64::from(MSI_MSG_UPPER_ADDR_OFF),
-                    4,
-                )
-                .unwrap_or(0);
-            let data = self
-                .ppt_cfg_read(
-                    u64::from(cap_off) + u64::from(MSI_MSG_DATA_64_OFF),
-                    2,
-                )
-                .unwrap_or(0);
-            let full_addr = u64::from(addr_lo) | (u64::from(addr_hi) << 32);
-            (full_addr, u64::from(data))
-        } else {
-            let data = self
-                .ppt_cfg_read(
-                    u64::from(cap_off) + u64::from(MSI_MSG_DATA_32_OFF),
-                    2,
-                )
-                .unwrap_or(0);
-            (u64::from(addr_lo), u64::from(data))
-        };
-
-        let enabled = *self.msi_enabled.lock().expect("msi_enabled lock");
-        let numvec = msi_numvec(msg_ctrl, enabled, self.msi_limit);
-
-        if let Err(e) =
-            self.hdl.pptdev_msi(self.ppt.as_fd(), addr, data, numvec)
-        {
-            warn!(self.log, "passthru: MSI setup failed, device has no \
-                interrupt";
-                "numvec" => numvec, "error" => %e);
-        }
-    }
-}
-
-// ── Device capability layout ───────────────────────────────────────
-// ── Bind guard and teardown ────────────────────────────────────────
-
-/// Gives a bound PPT device back to the host if `new` does not finish.
-///
-/// Without this, an error after `VM_BIND_PPTDEV` leaks the descriptor
-/// and leaves the device owned by a VM that never starts.
-struct BoundPpt {
-    /// `None` once the device took the file.
-    ppt: Option<File>,
-    hdl: Arc<VmmHdl>,
-    log: Logger,
-}
-
-impl BoundPpt {
-    fn fd(&self) -> BorrowedFd<'_> {
-        self.ppt.as_ref().expect("the guard holds the file").as_fd()
-    }
-
-    /// Give up ownership once the device is built.
-    fn release(mut self) -> File {
-        self.ppt.take().expect("the guard holds the file")
-    }
-}
-
-impl Drop for BoundPpt {
-    fn drop(&mut self) {
-        if let Some(ppt) = self.ppt.take() {
-            unbind_ppt(&ppt, &self.hdl, &self.log);
-        }
-    }
-}
-
-/// Unbind a PPT device from the VM. The caller's drop of `ppt` then
-/// closes it.
-fn unbind_ppt(ppt: &File, hdl: &VmmHdl, log: &Logger) {
-    if let Err(e) = hdl.unbind_pptdev(ppt.as_fd()) {
-        // Nothing else can run here, so the record is the only remedy:
-        // the device stays owned by the VM until the instance goes.
-        warn!(log, "passthru: unbind failed, device still held";
-            "error" => %e);
+    fn detach_regions(&self) {
+        let mut inner = self.lock();
+        self.release_regions(&mut inner);
     }
 }
 
 impl Drop for PciPassthru {
     fn drop(&mut self) {
-        let mapped = self.mapped_bars.lock().expect("mapped_bars lock");
-        let windows: Vec<(u64, u64)> =
-            mapped.iter().flatten().copied().collect();
-        drop(mapped);
-        for (gpa, len) in windows {
-            self.report_unmap(gpa, len);
-        }
-
-        unbind_ppt(&self.ppt, &self.hdl, &self.log);
+        // The windows go before the backend's unbind.
+        let mut inner = self.lock();
+        self.release_regions(&mut inner);
     }
 }
 
-// ── Ioctl helpers ──────────────────────────────────────────────────
+/// The emulated BAR for a physical one, or an error for a BAR this
+/// VMM cannot give to a guest.
+fn bar_define(idx: usize, info: &BarInfo) -> Result<Option<BarDefine>> {
+    if info.size == 0 {
+        return Ok(None);
+    }
+    let unsupported = |why: &str| {
+        Error::new(ErrorKind::Unsupported, format!("BAR{idx}: {why}"))
+    };
+    if !info.size.is_power_of_two() {
+        return Err(unsupported("size is not a power of two"));
+    }
+    match info.bar_type {
+        PCI_ADDR_IO => {
+            let size = u16::try_from(info.size)
+                .map_err(|_| unsupported("I/O BAR is larger than 64 KiB"))?;
+            Ok(Some(BarDefine::Pio(size)))
+        }
+        PCI_ADDR_MEM32 | PCI_ADDR_MEM64 => {
+            if info.size < PAGE_SIZE || !info.hpa.is_multiple_of(PAGE_SIZE) {
+                return Err(unsupported(
+                    "MMIO BAR is smaller than a page and cannot be \
+                     mapped without exposing its neighbours",
+                ));
+            }
+            if info.bar_type == PCI_ADDR_MEM32 {
+                let size = u32::try_from(info.size).map_err(|_| {
+                    unsupported("32-bit BAR is larger than 4 GiB")
+                })?;
+                Ok(Some(BarDefine::Mmio(size)))
+            } else {
+                Ok(Some(BarDefine::Mmio64(info.size)))
+            }
+        }
+        _ => Err(unsupported("unknown BAR type")),
+    }
+}
 
-/// Issue an ioctl on the PPT device fd.
-///
-/// # Safety
-///
-/// The caller must provide a `data` pointer to a struct that is correct
-/// for the given `cmd` ioctl number.
-unsafe fn ioctl_on_fd<T>(
-    fd: BorrowedFd<'_>,
-    cmd: i32,
-    data: &mut T,
-) -> Result<i32> {
-    vmm_api_common::ioctl(fd.as_raw_fd(), cmd, std::ptr::from_mut(data).cast())
+/// Merge a 1, 2 or 4 byte write at `offset` into a dword.
+fn merge_bytes(current: u32, offset: u8, len: u8, val: u32) -> u32 {
+    let shift = u32::from(offset & 0x03) * 8;
+    let mask = size_mask(len) << shift;
+    (current & !mask) | ((val << shift) & mask)
 }
 
 /// Extract bytes from a dword value based on the access offset and length.
 fn extract_bytes(dword: u32, offset: u8, len: u8) -> u32 {
-    let byte_off = (offset & 0x03) as u32;
+    let byte_off = u32::from(offset & 0x03);
     (dword >> (byte_off * 8)) & size_mask(len)
 }
 
-/// Build a bitmask for the given access width.
 fn size_mask(len: u8) -> u32 {
     match len {
         1 => 0xFF,
         2 => 0xFFFF,
-        4 => 0xFFFF_FFFF,
         _ => 0xFFFF_FFFF,
     }
 }

@@ -44,12 +44,16 @@ pub fn hcsparams1() -> u32 {
 
 /// Structural Parameters 2 (HCSPARAMS2) at offset 0x08.
 /// Bits [3:0] = IST (0 = no isochronous scheduling threshold)
-/// Bits [7:4] = ERST max (4 => 2^4=16 entries max)
+/// Bits [7:4] = ERST max (0 => 2^0 = 1 entry)
 /// Bits [25:21] = Max Scratchpad Bufs Hi = 0
 /// Bit  [26]    = SPR = 0
 /// Bits [31:27] = Max Scratchpad Bufs Lo = 0
-pub fn hcsparams2() -> u32 {
-    0x04 << 4 // ERST max = 4 (supports up to 16-entry ERST)
+///
+/// `setup_event_ring` reads ERST entry 0 and treats the ring as one
+/// segment, so advertising more would lose every event that falls in a
+/// segment the controller never walks.
+pub const fn hcsparams2() -> u32 {
+    0
 }
 
 /// Structural Parameters 3 (HCSPARAMS3) at offset 0x0C.
@@ -121,6 +125,11 @@ pub const CRCR_CS: u64 = 1 << 1; // Command Stop
 pub const CRCR_CA: u64 = 1 << 2; // Command Abort
 pub const CRCR_CRR: u64 = 1 << 3; // Command Ring Running
 pub const CRCR_PTR_MASK: u64 = !0x3F; // Pointer mask (64-byte aligned)
+
+/// ERSTBA pointer mask (64-byte aligned).
+pub const ERSTBA_PTR_MASK: u64 = !0x3F;
+/// ERDP pointer mask: bits 3:0 are DESI and the write-1-to-clear EHB.
+pub const ERDP_PTR_MASK: u64 = !0xF;
 
 // ---- Port Status Register offsets (relative to OP_BASE) -------------------
 

@@ -1,4 +1,4 @@
-vmm — a Rust bhyve userspace VMM for Triton/SmartOS
+rust-bhyve - rshyve and firehyve, Rust bhyve userspace VMMs for Triton/SmartOS
 Copyright (c) Edgecast Cloud, LLC
 
 This product is licensed under the Mozilla Public License, v. 2.0.
@@ -18,12 +18,14 @@ https://github.com/oxidecomputer/propolis
 This project is built on Propolis. The bhyve and viona kernel ioctl
 bindings, the address space manager, the PS/2 keyboard and controller
 models, and parts of the PCI, UART, and VM-exit layers are copied from
-or derived from it: 19 files and roughly 3,500 significant lines, 11 of
-them essentially verbatim.
+or derived from it.
 
-Each such file carries a header naming its upstream counterpart, and
-THIRD_PARTY.md lists them with measured similarity. Individual files
-retain their MPL Exhibit A headers.
+Measured against Propolis b428c40efae0be950e996f9dfd5ab8d02db59184:
+19 files at or above 30% similarity, 3300 significant lines, of which 6
+are essentially verbatim. Each such file carries a header naming its
+upstream counterpart. THIRD_PARTY.md lists every file with its measured
+similarity, and tools/propolis-derivation.py regenerates that list.
+Individual files retain their MPL Exhibit A headers.
 
 --------------------------------------------------------------------
 libtpms
@@ -33,7 +35,7 @@ Copyright (c) Trusted Computing Group and its contributors, 2022-2025
 Licensed under the 3-clause BSD license.
 https://github.com/stefanberger/libtpms
 
-A submodule at third_party/libtpms, statically linked into the vmm
+A submodule at third_party/libtpms, statically linked into the rshyve
 binary to provide the virtual TPM. The source is not redistributed here,
 so the full license text, covering all three grants, is reproduced at
 LICENSES/BSD-3-Clause-libtpms.txt.

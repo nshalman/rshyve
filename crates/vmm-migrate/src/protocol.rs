@@ -4,10 +4,22 @@
 
 //! Migration protocol implementation.
 //!
-//! Currently supports the RON v0 protocol (`vmm-migrate-ron/0`).
+//! One protocol version at a time: a wire-format change bumps
+//! [`PROTOCOL_RON`] and both ends refuse anything else. There is no
+//! compatibility window, because a peer that reads a field as
+//! something else resumes a guest on state that is not its own.
 
-/// Protocol identifier for the RON v0 migration format.
-pub const PROTOCOL_RON_V0: &str = "vmm-migrate-ron/0";
+/// Protocol identifier for the RON migration format.
+///
+/// v2 carries the NVMe completion queue interrupt-enable bit. A v1 peer
+/// has no field for it, and a destination that assumes one restores a
+/// polled queue as an interrupting one.
+///
+/// v1 put device identity on the wire. In v0 every virtio queue group
+/// was tagged slot 0 and the destination took the first group whose
+/// length matched its queue count, so two devices of one queue count
+/// restored each other's rings.
+pub const PROTOCOL_RON: &str = "vmm-migrate-ron/2";
 
 /// Page size used for dirty tracking (4 KiB).
 pub use vmm_core::common::PAGE_SIZE;

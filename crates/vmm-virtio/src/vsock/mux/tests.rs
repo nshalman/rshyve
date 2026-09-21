@@ -266,7 +266,10 @@ fn an_rst_for_an_unknown_connection_is_dropped() {
 }
 
 /// A guest may address any CID it likes. Only the host's own is
-/// routable here.
+/// routable here, and the refusal has to come from the host CID: the
+/// Linux driver drops a packet from anywhere else, so an RST sourced
+/// from the CID the guest named is lost and the guest keeps retrying
+/// instead of failing at once.
 #[test]
 fn a_packet_for_another_cid_is_refused() {
     let m = mux();
@@ -274,7 +277,10 @@ fn a_packet_for_another_cid_is_refused() {
     h.dst_cid = 99;
     let act = m.on_guest_packet(&h, vec![]);
     assert_eq!(act, GuestAction::None);
-    assert_eq!(drain(&m)[0].hdr.op, OP_RST);
+    let refusal = &drain(&m)[0].hdr;
+    assert_eq!(refusal.op, OP_RST);
+    assert_eq!(refusal.src_cid, CID_HOST, "the guest will drop this RST");
+    assert_eq!(refusal.dst_cid, GUEST_CID);
     assert_eq!(m.conn_count(), 0, "no connection for a foreign CID");
 }
 
@@ -417,18 +423,31 @@ fn control_packets_cannot_grow_the_rx_queue_without_bound() {
     assert_eq!(drain(&m).len(), RX_PACKETS_MAX);
 }
 
+/// A guest names both ends of a connection it opens, so it can take a
+/// key out of the ephemeral range. The allocator must step over it: an
+/// entry replaced here would put the host peer and the guest's own
+/// connection in one, and the first reader to exit would take both
+/// down.
 #[test]
-fn host_ports_are_unique() {
+fn a_host_port_the_guest_already_holds_is_skipped() {
     let m = mux();
-    let a = m.alloc_host_port();
-    let b = m.alloc_host_port();
-    assert_ne!(a, b);
-    assert!(a >= EPHEMERAL_PORT_BASE);
+    let a = m.reserve_host_connect(1024).expect("first");
+    assert_ne!(a.host_port, 0);
+    assert!(a.host_port >= EPHEMERAL_PORT_BASE);
+
+    // The guest opens the key this allocator would hand out next.
+    let taken = a.host_port + 1;
+    m.on_guest_packet(&guest_hdr(OP_REQUEST, 2048, taken), vec![]);
+    assert_eq!(m.conn_count(), 2);
+
+    let b = m.reserve_host_connect(2048).expect("second");
+    assert_ne!(b.host_port, taken, "the guest's connection was overwritten");
+    assert_eq!(m.conn_count(), 3, "a live connection was replaced");
 }
 
 /// The guest drops whatever arrives past the window it published,
-/// so the device must not send past it. Kills the mutation of
-/// queueing the whole buffer and leaving the window unread.
+/// so the device must not send past it. Fails if the device queues the
+/// whole buffer and leaves the window unread.
 #[test]
 fn the_host_sends_no_more_than_the_guest_advertised() {
     let m = mux();
@@ -457,9 +476,9 @@ fn the_host_sends_no_more_than_the_guest_advertised() {
 }
 
 /// A guest that has advertised nothing must get nothing, and the
-/// bytes must wait rather than be dropped. Kills the mutation of
-/// treating an empty window as room for one more packet, and the
-/// mutation of discarding what does not fit.
+/// bytes must wait rather than be dropped. Fails if an empty window is
+/// read as room for one more packet, or if what does not fit is
+/// discarded.
 #[test]
 fn zero_credit_queues_nothing_and_keeps_the_bytes() {
     let m = mux();
@@ -566,8 +585,8 @@ fn credit_returning_lets_the_rest_flow() {
 /// Credit is spent on bytes the guest will see. A packet the
 /// backlog refused never reaches it, so counting it would shut the
 /// window on bytes that were never sent and stall the connection
-/// for good. Kills the mutation of recording the send before the
-/// queue has taken the packet.
+/// for good. Fails if the send is recorded before the queue has taken
+/// the packet.
 #[test]
 fn a_packet_the_backlog_refused_spends_no_credit() {
     let m = mux();
@@ -602,8 +621,8 @@ fn a_packet_the_backlog_refused_spends_no_credit() {
 
 /// A connection nobody knows will never open a window, so the bytes
 /// must go rather than park the reader thread for the life of the
-/// VM. Kills the mutation of holding the buffer when the connection
-/// has gone, which leaves the reader loop waiting until shutdown.
+/// VM. Fails if the buffer is held after the connection has gone, which
+/// leaves the reader loop waiting until shutdown.
 #[test]
 fn payload_for_a_forgotten_connection_does_not_park_the_reader() {
     let m = mux();
@@ -683,8 +702,8 @@ fn payload_tells_the_guest_how_much_of_its_stream_we_took() {
 /// service that speaks first is the usual shape. Dropping the credit
 /// off that REQUEST leaves the window shut until the guest happens to
 /// send, which for such a service is never. The mirror of the zero
-/// window we used to put on a REQUEST of our own. Kills the mutation
-/// of building the connection without absorbing the REQUEST's credit.
+/// window this device puts on a REQUEST of its own. Fails if the
+/// connection is built without absorbing the REQUEST's credit.
 #[test]
 fn a_guest_request_opens_the_window_it_names() {
     let m = mux();

@@ -192,7 +192,6 @@ impl AhciCtrl {
             .get(2)
             .is_some_and(|status| u32::from(*status) & ATA_S_ERROR != 0)
         {
-            st.port.wait_for_clear = true;
             irq |= PXIS_TFES;
         }
         if irq != 0 && !st.port.is & irq != 0 {
@@ -388,6 +387,12 @@ impl AhciCtrl {
         let fis = build_d2h_fis(cfis, tfd, true);
         if tfd & ATA_S_ERROR == 0 {
             st.port.ci &= !(1u32 << slot);
+        } else {
+            // CI stays set for an error, so the slot belongs to the
+            // driver's CLO whether or not the FIS could be posted.
+            // Otherwise the dispatch loop finds the slot idle and runs
+            // the same command again, once per slot, per doorbell.
+            st.port.wait_for_clear = true;
         }
         st.port.tfd = tfd;
         self.write_fis(st, FIS_OFF_RFIS, &fis)
@@ -414,6 +419,7 @@ impl AhciCtrl {
         // An unreadable command cannot be repaired with CLO because there is
         // no command state to resume, so retaining CI would only wedge the HBA.
         st.port.ci &= !(1u32 << slot);
+        st.port.wait_for_clear = false;
         needs_intr
     }
 
@@ -728,33 +734,43 @@ mod tests {
     }
 
     #[test]
-    fn unmapped_fis_area_drops_error_fis_and_holds_ci() {
-        let ctrl = test_controller(Arc::new(PhysMap::new()));
-        let mut st = ctrl.state.lock().expect("ahci: state lock");
-        st.port.fb = TEST_FB as u32;
-        st.port.cmd = PXCMD_ST | PXCMD_CR | PXCMD_FRE | PXCMD_FR;
-        st.port.ci = 1;
+    fn an_unpostable_error_holds_the_slot_instead_of_rerunning_it() {
+        // Either an unmapped FIS area or FIS receive turned off stops
+        // the error FIS reaching the driver.
+        for cmd in [
+            PXCMD_ST | PXCMD_CR | PXCMD_FRE | PXCMD_FR,
+            PXCMD_ST | PXCMD_CR,
+        ] {
+            let ctrl = test_controller(Arc::new(PhysMap::new()));
+            let mut st = ctrl.state.lock().expect("ahci: state lock");
+            st.port.fb = TEST_FB as u32;
+            st.port.cmd = cmd;
+            st.port.ci = 1;
 
-        let needs_intr = ctrl.handle_command_fis(
-            &mut st,
-            0,
-            command_fis(ATA_ATA_IDENTIFY),
-            &[0; CMD_TBL_PRDT_OFF],
-            0,
-        );
+            let needs_intr = ctrl.handle_command_fis(
+                &mut st,
+                0,
+                command_fis(ATA_ATA_IDENTIFY),
+                &[0; CMD_TBL_PRDT_OFF],
+                0,
+            );
 
-        assert!(!needs_intr);
-        assert_eq!(st.port.tfd, TFD_ABORT);
-        assert_eq!(st.port.ci, 1);
-        assert_eq!(st.port.is, 0);
-        assert!(!st.port.wait_for_clear);
-        assert_eq!(
-            *ctrl
-                .completion_count
-                .lock()
-                .expect("ahci: completion test count lock"),
-            1,
-        );
+            assert!(!needs_intr);
+            assert_eq!(st.port.tfd, TFD_ABORT);
+            assert_eq!(st.port.ci, 1);
+            assert_eq!(st.port.is, 0);
+            assert!(st.port.wait_for_clear, "the slot was left runnable");
+
+            // A further doorbell must not run the same command again.
+            ctrl.handle_port(&mut st);
+            assert_eq!(
+                *ctrl
+                    .completion_count
+                    .lock()
+                    .expect("ahci: completion test count lock"),
+                1,
+            );
+        }
     }
 
     #[test]

@@ -5,10 +5,6 @@
 //! What this transport puts on the migration wire, and the order a
 //! restore puts it back in.
 //!
-//! An export is one record for each configured queue. Every record
-//! carries a copy of the config-space state, so a restore can start
-//! from any one of them.
-//!
 //! The order of the restore is the invariant this module owns. Nothing
 //! in it is a preference:
 //!
@@ -19,14 +15,23 @@
 //!    feature register handler, and a restore does not go through that
 //!    handler. A queue that never learns INDIRECT_DESC drops every
 //!    indirect chain in silence, which is all Linux virtio-blk I/O.
-//! 3. Ring addresses and indices, then the MSI-X table entry. The
-//!    backend is told to restore a ring only after both, because it
-//!    programs hardware from them.
-//! 4. An interrupt on each enabled queue, last. A driver that comes
-//!    back with its rings caught up has nothing to poll for. Without
-//!    the wake it posts no new receive buffers, and the kernel viona
+//! 3. Ring addresses and indices, then the MSI-X table. The backend is
+//!    told to restore a ring only after both, because it programs
+//!    hardware from them.
+//! 4. An interrupt on each live queue, last. A driver that comes back
+//!    with its rings caught up has nothing to poll for. Without the
+//!    wake it posts no new receive buffers, and the kernel viona
 //!    driver drops arriving packets with "no_space".
+//!
+//! Every field is checked before any of it is applied. The peer is
+//! unauthenticated (OSF-1), so a payload that the destination cannot
+//! hold has to fail the migration, not half-program a device.
 
+use std::sync::atomic::Ordering;
+
+use vmm_devices::lifecycle::{
+    DeviceStateError, MigratePciState, VirtioMigrateQueue, VirtioMigrateState,
+};
 use vmm_devices::pci::device::replay_migrate_pci_state;
 use vmm_devices::pci::BarN;
 
@@ -34,18 +39,10 @@ use super::bits;
 use super::{VirtioDevice, VirtioPciDevice};
 
 impl<D: VirtioDevice> VirtioPciDevice<D> {
-    /// Snapshot PCI BAR addresses and command bits for migration.
-    fn export_migrate_pci_state(
-        &self,
-    ) -> vmm_devices::lifecycle::VirtioMigratePciState {
-        self.pci_state.lock().expect("pci lock").migrate_state()
-    }
-
-    /// Replay BAR and command-register writes so bus registrations are restored.
-    fn restore_migrate_pci_state(
-        &self,
-        state: &vmm_devices::lifecycle::VirtioMigratePciState,
-    ) {
+    /// Replay BAR and command-register writes so bus registrations are
+    /// restored. The writes go through `cfg_write`, the same path a
+    /// guest BAR write takes, so the bus applies its own rules.
+    fn restore_migrate_pci_state(&self, state: &MigratePciState) {
         let writes = self
             .pci_state
             .lock()
@@ -54,300 +51,269 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         replay_migrate_pci_state(self, &writes, state.command);
     }
 
-    /// Snapshot every configured queue, plus the config-space
-    /// state a restore replays before it touches any of them.
+    /// Snapshot the register file the driver programmed and every queue
+    /// it configured.
     pub(super) fn export_migrate_queues(
         &self,
-    ) -> Vec<vmm_devices::lifecycle::VirtioMigrateQueue> {
-        use vmm_devices::lifecycle::VirtioMigrateQueue;
-        // Ring threads are already paused by pause_for_migration()
-        // which runs BEFORE vCPU pause. This ensures the guest's
-        // descriptor state is consistent with the kernel's indices.
+    ) -> Result<VirtioMigrateState, DeviceStateError> {
         let vs = self.virtio_state.lock().expect("virtio lock");
-        let pci_state = self.export_migrate_pci_state();
-        let mut result = Vec::new();
+        let modern = vs.guest_features & bits::VIRTIO_F_VERSION_1 != 0;
+        let mut queues = Vec::new();
         for idx in 0..self.num_queues as usize {
             let q = &vs.queues[idx];
-            if q.is_configured() {
-                let (k_avail, k_used) =
-                    self.device.get_kernel_ring_indices(idx as u16);
-                // For software devices (blk), read used_idx from guest
-                // memory because VirtioCompletion manages the used ring
-                // separately from VirtQueue's shadow_used_idx.
-                let used_idx = if k_used != 0 {
-                    k_used
-                } else {
-                    let guest_used = q.read_used_ring_idx(&self.physmap);
-                    if guest_used != 0 {
-                        guest_used
-                    } else {
-                        q.shadow_used_idx()
-                    }
-                };
-                // For kernel-managed queues (viona), use the kernel's
-                // actual consumed position (k_avail). The delta between
-                // k_avail and guest memory's avail_ring->idx represents
-                // entries the guest posted but the kernel hasn't consumed.
-                // On the dest, these entries are immediately available —
-                // their descriptors are valid (guest set them up, kernel
-                // hasn't touched them). Using guest memory's avail_ring->idx
-                // instead would make the dest kernel see 0 available
-                // entries, requiring complex workarounds.
-                let avail_idx = if k_used != 0 {
-                    k_avail
-                } else {
-                    q.last_avail_idx()
-                };
-
-                // Get MSI-X entry for this queue's vector
-                let vector = self
-                    .msix_queue_vectors
-                    .get(idx)
-                    .map(|a| a.load(std::sync::atomic::Ordering::Acquire))
-                    .unwrap_or(bits::VIRTIO_MSI_NO_VECTOR);
-                let (msix_addr, msix_data) = if let Some(ref msix) = self.msix {
-                    if vector != bits::VIRTIO_MSI_NO_VECTOR {
-                        msix.read_entry(vector)
-                    } else {
-                        (0, 0)
-                    }
-                } else {
-                    (0, 0)
-                };
-
-                result.push(VirtioMigrateQueue {
-                    pci_slot: 0,
-                    queue_idx: idx as u16,
-                    queue_size: q.size(),
-                    desc_addr: q.desc_addr(),
-                    avail_addr: q.avail_addr(),
-                    used_addr: q.used_addr(),
-                    enabled: vs
-                        .queue_enabled
-                        .get(idx)
-                        .copied()
-                        .unwrap_or(false),
-                    features: vs.guest_features,
-                    avail_idx,
-                    used_idx,
-                    msix_addr,
-                    msix_data: msix_data as u32,
-                    msix_vector: vector,
-                    pci_state: Some(pci_state.clone()),
-                });
-                // Detailed ring state dump for migration debugging
-                let guest_avail = q.read_avail_idx(&self.physmap);
-                let guest_used = q.read_used_ring_idx(&self.physmap);
-                eprintln!("[virtio-export] q={} k_avail={} k_used={} guest_avail={} guest_used={} export_avail={} export_used={}",
-                    idx, k_avail, k_used, guest_avail, guest_used, avail_idx, used_idx);
-                if k_used != 0 && k_avail == guest_avail {
-                    // Fully drained — dump avail ring entries to see descriptor IDs
-                    let qsize = q.size();
-                    let mut ids = Vec::new();
-                    for slot in 0..qsize.min(16) {
-                        let gpa = q.avail_addr() + 4 + u64::from(slot) * 2;
-                        if let Some(id) = self
-                            .physmap
-                            .lookup(gpa, 2)
-                            .and_then(|s| s.read::<u16>().ok())
-                        {
-                            ids.push(id);
-                        }
-                    }
-                    eprintln!(
-                        "[virtio-export] q={} DRAINED avail_ring[0..15]={:?}",
-                        idx, ids
-                    );
-                }
-            }
-        }
-        result
-    }
-
-    /// Rebuild the transport from an export, in the order the
-    /// module doc gives.
-    pub(super) fn restore_migrate_queues(
-        &self,
-        states: &[vmm_devices::lifecycle::VirtioMigrateQueue],
-    ) {
-        // Group by queue_idx=0 starts, find group matching our queue count
-        let my_nq = self.num_queues as usize;
-        let matching: Vec<_> = {
-            let mut groups: Vec<Vec<_>> = Vec::new();
-            let mut cur: Vec<_> = Vec::new();
-            for s in states {
-                if s.queue_idx == 0 && !cur.is_empty() {
-                    groups.push(std::mem::take(&mut cur));
-                }
-                cur.push(s.clone());
-            }
-            if !cur.is_empty() {
-                groups.push(cur);
-            }
-            groups
-                .into_iter()
-                .find(|g| g.len() == my_nq)
-                .unwrap_or_default()
-        };
-
-        if let Some(pci_state) =
-            matching.iter().find_map(|qs| qs.pci_state.as_ref())
-        {
-            eprintln!(
-                "[virtio-restore] restoring PCI: cmd={:#x} bars={:?}",
-                pci_state.command, pci_state.bar_addrs
-            );
-            self.restore_migrate_pci_state(pci_state);
-        } else {
-            eprintln!(
-                "[virtio-restore] NO pci_state in matching queues (nq={})",
-                my_nq
-            );
-        }
-
-        let mut vs = self.virtio_state.lock().expect("virtio lock");
-        self.device.reset_all_rings();
-
-        for qs in &matching {
-            let idx = qs.queue_idx as usize;
-            if idx >= vs.queues.len() {
+            if !q.is_configured() {
                 continue;
             }
+            // A backend that owns its cursors answers for both, and the
+            // pair is taken whole: zero is an ordinary used cursor, so
+            // testing one against it would throw away a valid ring
+            // every time the 16-bit counter wrapped past it.
+            let (avail_idx, used_idx) =
+                match self.device.kernel_ring_indices(idx as u16)? {
+                    Some(pair) => pair,
+                    // A software device keeps its completion cursor in
+                    // VirtioCompletion, which writes the used ring directly
+                    // and never moves the VirtQueue shadow. Guest memory is
+                    // therefore the only place that cursor can be read
+                    // from.
+                    None => {
+                        let guest_used = q.read_used_ring_idx(&self.physmap);
+                        let used_idx = if guest_used != 0 {
+                            guest_used
+                        } else {
+                            q.shadow_used_idx()
+                        };
+                        (q.last_avail_idx(), used_idx)
+                    }
+                };
 
-            if vs.guest_features == 0 && qs.features != 0 {
-                vs.guest_features = qs.features;
-                self.device.set_features(qs.features);
-                // Propagate ring feature flags to all queues — the
-                // normal guest write path does this in the feature
-                // register handler, but restore bypasses it. Without
-                // this, indirect_supported stays false and
-                // collect_chain() silently drops every indirect
-                // descriptor request (all Linux virtio-blk I/O).
-                let event_idx =
-                    qs.features & bits::VIRTIO_F_RING_EVENT_IDX != 0;
-                let indirect =
-                    qs.features & bits::VIRTIO_F_RING_INDIRECT_DESC != 0;
-                for q in &mut vs.queues {
-                    q.set_event_idx(event_idx);
-                    q.set_indirect_supported(indirect);
-                }
+            let vector = self
+                .msix_queue_vectors
+                .get(idx)
+                .map(|a| a.load(Ordering::Acquire))
+                .unwrap_or(bits::VIRTIO_MSI_NO_VECTOR);
+
+            queues.push(VirtioMigrateQueue {
+                queue_idx: idx as u16,
+                queue_size: q.size(),
+                desc_addr: q.desc_addr(),
+                avail_addr: q.avail_addr(),
+                used_addr: q.used_addr(),
+                // The legacy transport has no enable register: writing
+                // QUEUE_PFN is what makes the ring live. Reading
+                // `queue_enabled` alone migrates every legacy queue as
+                // dead, and the destination then skips its backend
+                // restore and its wake.
+                live: if modern {
+                    vs.queue_enabled.get(idx).copied().unwrap_or(false)
+                } else {
+                    true
+                },
+                avail_idx,
+                used_idx,
+                msix_vector: vector,
+            });
+        }
+
+        Ok(VirtioMigrateState {
+            status: vs.status,
+            features: vs.guest_features,
+            config_msix_vector: self.msix_config_vector.load(Ordering::Acquire),
+            pci: self.pci_state.lock().expect("pci lock").migrate_state(),
+            msix: self.msix.as_ref().map(|msix| msix.export_state()),
+            queues,
+        })
+    }
+
+    /// Everything the payload must satisfy before any of it is applied.
+    fn check_migrate_state(
+        &self,
+        state: &VirtioMigrateState,
+    ) -> Result<(), DeviceStateError> {
+        let nq = self.num_queues;
+        let table_len = self.msix.as_ref().map_or(0, |m| m.count());
+        if state.msix.is_some() != self.msix.is_some() {
+            return Err(DeviceStateError::invalid(format!(
+                "payload {} an MSI-X table, this device {} one",
+                if state.msix.is_some() {
+                    "has"
+                } else {
+                    "has no"
+                },
+                if self.msix.is_some() {
+                    "has"
+                } else {
+                    "has none"
+                },
+            )));
+        }
+        check_vector("config", state.config_msix_vector, table_len)?;
+
+        let vs = self.virtio_state.lock().expect("virtio lock");
+        let mut seen = vec![false; nq as usize];
+        for qs in &state.queues {
+            let idx = usize::from(qs.queue_idx);
+            if qs.queue_idx >= nq {
+                return Err(DeviceStateError::invalid(format!(
+                    "queue {} is past this device's {nq} queues",
+                    qs.queue_idx,
+                )));
             }
+            if std::mem::replace(&mut seen[idx], true) {
+                return Err(DeviceStateError::invalid(format!(
+                    "queue {} appears twice",
+                    qs.queue_idx,
+                )));
+            }
+            // A modern driver may shrink a ring below the maximum the
+            // device offers (sec 4.1.4.3.2), and the source exports the
+            // ring it actually ran. So the destination has to accept
+            // any size it could have offered, not only its maximum.
+            let max = vs.queues[idx].max_size();
+            let size = qs.queue_size;
+            if size == 0 || !size.is_power_of_two() || size > max {
+                return Err(DeviceStateError::invalid(format!(
+                    "queue {} has size {size}, not a power of two in \
+                     1..={max}",
+                    qs.queue_idx,
+                )));
+            }
+            // The difference between the cursors is the number of
+            // chains in flight, and a ring holds no more of those than
+            // it has descriptors. Both cursors wrap in a u16.
+            let in_flight = qs.avail_idx.wrapping_sub(qs.used_idx);
+            if in_flight > qs.queue_size {
+                return Err(DeviceStateError::invalid(format!(
+                    "queue {} reports {in_flight} chains in flight on a \
+                     {}-descriptor ring",
+                    qs.queue_idx, qs.queue_size,
+                )));
+            }
+            check_vector("queue", qs.msix_vector, table_len)?;
+            if qs.live {
+                // Built at the payload's size: the ring bounds the
+                // device reads and writes follow from that, not from
+                // the maximum this device offers.
+                let mut probe = crate::queue::VirtQueue::new(size);
+                probe.set_addr_modern(
+                    qs.desc_addr,
+                    qs.avail_addr,
+                    qs.used_addr,
+                );
+                probe.set_event_idx(
+                    state.features & bits::VIRTIO_F_RING_EVENT_IDX != 0,
+                );
+                probe.validate_addrs(&self.physmap).map_err(|error| {
+                    DeviceStateError::invalid(format!(
+                        "queue {} rings: {error}",
+                        qs.queue_idx,
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
 
+    /// Rebuild the transport from an export, in the order the module
+    /// doc gives.
+    pub(super) fn restore_migrate_queues(
+        &self,
+        state: &VirtioMigrateState,
+    ) -> Result<(), DeviceStateError> {
+        self.check_migrate_state(state)?;
+        self.restore_migrate_pci_state(&state.pci);
+
+        let mut vs = self.virtio_state.lock().expect("virtio lock");
+        self.device.reset_all_rings()?;
+
+        vs.guest_features = state.features;
+        self.device.set_features(state.features);
+        // The guest does this in the feature register handler, which a
+        // restore does not go through. A queue that never learns
+        // INDIRECT_DESC drops every indirect chain in silence.
+        let event_idx = state.features & bits::VIRTIO_F_RING_EVENT_IDX != 0;
+        let indirect = state.features & bits::VIRTIO_F_RING_INDIRECT_DESC != 0;
+        for q in &mut vs.queues {
+            q.set_event_idx(event_idx);
+            q.set_indirect_supported(indirect);
+        }
+
+        for qs in &state.queues {
+            let idx = usize::from(qs.queue_idx);
+            // The size goes in before the addresses. The device reads
+            // and writes `size` entries, so a ring restored at this
+            // device's maximum would walk past the one the source ran.
+            // The reset takes the queue back to unconfigured, which is
+            // the only state `set_size` accepts.
+            vs.queues[idx].reset();
+            vs.queues[idx].set_size(qs.queue_size).map_err(|error| {
+                DeviceStateError::invalid(format!(
+                    "queue {}: {error}",
+                    qs.queue_idx,
+                ))
+            })?;
             vs.queues[idx].set_addr_modern(
                 qs.desc_addr,
                 qs.avail_addr,
                 qs.used_addr,
             );
-            // Restore ring indices for software-emulated devices.
-            // set_addr_modern resets indices to 0, but after migration
-            // we need to continue from the source's position.
+            // set_addr_modern zeroes the cursors; the guest continues
+            // from where the source left them.
             vs.queues[idx].set_last_avail_idx(qs.avail_idx);
             vs.queues[idx].set_shadow_used_idx(qs.used_idx);
-            eprintln!("[virtio-restore] q={} avail_idx={} used_idx={} addrs={:#x}/{:#x}/{:#x}",
-                qs.queue_idx, qs.avail_idx, qs.used_idx,
-                qs.desc_addr, qs.avail_addr, qs.used_addr);
             if idx < vs.queue_desc.len() {
                 vs.queue_desc[idx] = qs.desc_addr;
                 vs.queue_avail[idx] = qs.avail_addr;
                 vs.queue_used[idx] = qs.used_addr;
             }
             if idx < vs.queue_enabled.len() {
-                vs.queue_enabled[idx] = qs.enabled;
+                vs.queue_enabled[idx] = qs.live;
             }
-
-            // Restore MSI-X vector mapping for this queue
-            if qs.msix_vector != bits::VIRTIO_MSI_NO_VECTOR {
-                if idx < vs.queue_msix_vectors.len() {
-                    vs.queue_msix_vectors[idx] = qs.msix_vector;
-                }
-                if let Some(a) = self.msix_queue_vectors.get(idx) {
-                    a.store(
-                        qs.msix_vector,
-                        std::sync::atomic::Ordering::Release,
-                    );
-                }
-                // Write the MSI-X table entry so fire() can inject the interrupt
-                if let Some(ref msix) = self.msix {
-                    msix.write_entry(
-                        qs.msix_vector,
-                        qs.msix_addr,
-                        qs.msix_data as u64,
-                    );
-                }
+            if idx < vs.queue_msix_vectors.len() {
+                vs.queue_msix_vectors[idx] = qs.msix_vector;
             }
-
-            if qs.enabled {
-                // Log ring state for debugging
-                let guest_avail_gpa = qs.avail_addr + 2;
-                let guest_used_gpa = qs.used_addr + 2;
-                let ga = self
-                    .physmap
-                    .lookup(guest_avail_gpa, 2)
-                    .and_then(|s| s.read::<u16>().ok())
-                    .unwrap_or(0);
-                let gu = self
-                    .physmap
-                    .lookup(guest_used_gpa, 2)
-                    .and_then(|s| s.read::<u16>().ok())
-                    .unwrap_or(0);
-                let avail_delta = ga.wrapping_sub(qs.avail_idx);
-                eprintln!(
-                    "[virtio-restore] q={} kernel(avail={} used={}) guest_mem(avail={} used={}) available={}",
-                    qs.queue_idx, qs.avail_idx, qs.used_idx, ga, gu, avail_delta,
-                );
-
-                self.device.restore_ring_state(
-                    qs.queue_idx,
-                    qs.queue_size,
-                    qs.desc_addr,
-                    qs.avail_addr,
-                    qs.used_addr,
-                    qs.avail_idx,
-                    qs.used_idx,
-                    qs.msix_addr,
-                    qs.msix_data,
-                );
+            if let Some(a) = self.msix_queue_vectors.get(idx) {
+                a.store(qs.msix_vector, Ordering::Release);
             }
         }
 
-        if !matching.is_empty() {
-            vs.status = bits::STATUS_DRIVER_OK
-                | bits::STATUS_FEATURES_OK
-                | bits::STATUS_DRIVER
-                | bits::STATUS_ACKNOWLEDGE;
+        // The status byte is the driver's, not ours. Synthesising
+        // DRIVER_OK tells a guest whose driver never finished the
+        // handshake that the device is ready.
+        vs.status = state.status;
+        vs.config_msix_vector = state.config_msix_vector;
+        self.msix_config_vector
+            .store(state.config_msix_vector, Ordering::Release);
 
-            // Enable MSI-X so fire() can deliver interrupts
-            if let Some(ref msix) = self.msix {
-                msix.set_enabled(true);
-            }
+        // Masks and pending bits come back with the table. An INTx
+        // guest arrives with MSI-X still disabled, which is where it
+        // has to stay: enabling it moves device config from 0x14 to
+        // 0x18 and routes every queue interrupt to NO_VECTOR.
+        if let (Some(msix), Some(table)) = (self.msix.as_ref(), &state.msix) {
+            msix.import_state(table).map_err(|error| {
+                DeviceStateError::invalid(format!("MSI-X table: {error}"))
+            })?;
         }
 
-        // Program notification addresses from current BAR state
-        let pci = self.pci_state.lock().expect("pci lock");
-        let bar0_port = pci
-            .bars()
-            .get(BarN::BAR0)
-            .and_then(|(def, addr)| {
-                if def.is_pio() {
-                    Some(addr as u16)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0);
-        let bar2_addr = pci
-            .bars()
-            .get(BarN::BAR2)
-            .and_then(
-                |(def, addr)| if def.is_mmio() { Some(addr) } else { None },
-            )
-            .unwrap_or(0);
-        drop(pci);
-        eprintln!(
-            "[virtio-restore] BAR0={:#x} BAR2={:#x}",
-            bar0_port, bar2_addr
-        );
+        for qs in &state.queues {
+            if !qs.live {
+                continue;
+            }
+            let (msix_addr, msix_data) = self.msix_entry(qs.msix_vector);
+            self.device.restore_ring_state(
+                qs.queue_idx,
+                qs.queue_size,
+                qs.desc_addr,
+                qs.avail_addr,
+                qs.used_addr,
+                qs.avail_idx,
+                qs.used_idx,
+                msix_addr,
+                msix_data,
+            )?;
+        }
 
+        let (bar0_port, bar2_addr) = self.notify_bases();
         if bar0_port != 0 || bar2_addr != 0 {
             let notify_pio = if bar0_port != 0 {
                 bar0_port + bits::LEGACY_REG_QUEUE_NOTIFY
@@ -362,25 +328,64 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             self.device.set_notify_addrs(notify_pio, notify_mmio);
         }
 
-        // Start the deferred interrupt poll thread now that rings,
-        // MSI-X vectors, and notification addresses are all programmed.
+        // Rings, vectors and notification addresses are all programmed.
         self.device.start_poll_deferred();
 
-        // Inject a post-restore interrupt on each queue to wake the
-        // guest driver. After migration, the rx ring may have no
-        // available buffers (avail_idx == used_idx). The guest driver
-        // needs an interrupt to process the "caught up" used ring and
-        // post new rx buffers. Without this, incoming packets are
-        // dropped with "no_space" in the kernel viona driver.
         drop(vs);
-        for qs in &matching {
-            if qs.enabled {
-                eprintln!(
-                    "[virtio-restore] injecting post-restore interrupt q={}",
-                    qs.queue_idx
-                );
+        // After migration the rx ring may hold no available buffers.
+        // The driver needs an interrupt to process the caught-up used
+        // ring and post new ones, or the kernel viona driver drops
+        // arriving packets with "no_space".
+        for qs in &state.queues {
+            if qs.live {
                 self.raise_queue_interrupt_current(qs.queue_idx);
             }
         }
+        Ok(())
     }
+
+    /// The MSI-X address and data a vector routes to, after the table
+    /// has been restored. `(0, 0)` when the queue has no vector.
+    fn msix_entry(&self, vector: u16) -> (u64, u32) {
+        if vector == bits::VIRTIO_MSI_NO_VECTOR {
+            return (0, 0);
+        }
+        match self.msix.as_ref() {
+            Some(msix) => {
+                let (addr, data) = msix.read_entry(vector);
+                (addr, data as u32)
+            }
+            None => (0, 0),
+        }
+    }
+
+    /// The PIO port and MMIO base the notification registers sit in.
+    fn notify_bases(&self) -> (u16, u64) {
+        let pci = self.pci_state.lock().expect("pci lock");
+        let bar0_port = pci
+            .bars()
+            .get(BarN::BAR0)
+            .and_then(|(def, addr)| def.is_pio().then_some(addr as u16))
+            .unwrap_or(0);
+        let bar2_addr = pci
+            .bars()
+            .get(BarN::BAR2)
+            .and_then(|(def, addr)| def.is_mmio().then_some(addr))
+            .unwrap_or(0);
+        (bar0_port, bar2_addr)
+    }
+}
+
+/// An MSI-X vector the destination's table cannot hold.
+fn check_vector(
+    what: &str,
+    vector: u16,
+    table_len: u16,
+) -> Result<(), DeviceStateError> {
+    if vector == bits::VIRTIO_MSI_NO_VECTOR || vector < table_len {
+        return Ok(());
+    }
+    Err(DeviceStateError::invalid(format!(
+        "{what} MSI-X vector {vector} is past the {table_len}-entry table",
+    )))
 }

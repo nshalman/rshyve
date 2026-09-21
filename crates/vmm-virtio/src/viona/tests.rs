@@ -142,6 +142,10 @@ struct TestLink {
     status: IntrStatus,
     /// Where the poll thread is held, once.
     park: Mutex<Option<Park>>,
+    /// A call a signal interrupts, and how many times left.
+    interrupted: Mutex<Option<(Op, usize)>>,
+    /// The used cursor `ring_get_state` reports has wrapped to zero.
+    wrapped_used: bool,
 }
 
 impl TestLink {
@@ -154,12 +158,24 @@ impl TestLink {
             locked: Mutex::new(Vec::new()),
             status: IntrStatus::default(),
             park: Mutex::new(None),
+            interrupted: Mutex::new(None),
+            wrapped_used: false,
         }
     }
 
     /// A link whose kernel refuses `ops` and answers the rest.
     fn failing(mut self, ops: &[Op]) -> Self {
         self.failing = ops.to_vec();
+        self
+    }
+
+    /// A link whose kernel takes a signal on the first `times` calls to
+    /// `op`, then answers it.
+    ///
+    /// `viona_ioc_ring_reset` waits with signals heeded, so this is a
+    /// reset the caller has to try again, not one the kernel refused.
+    fn interrupted_on(self, op: Op, times: usize) -> Self {
+        *self.interrupted.lock().expect("interrupted lock") = Some((op, times));
         self
     }
 
@@ -174,6 +190,17 @@ impl TestLink {
 
     /// What one call answers.
     fn result(&self, op: Op) -> std::io::Result<()> {
+        let mut interrupted =
+            self.interrupted.lock().expect("interrupted lock");
+        if let Some((signalled, left)) = interrupted.as_mut() {
+            if *signalled == op && *left > 0 {
+                *left -= 1;
+                return Err(std::io::Error::from(
+                    std::io::ErrorKind::Interrupted,
+                ));
+            }
+        }
+        drop(interrupted);
         if self.failing.contains(&op) {
             return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
         }
@@ -183,6 +210,12 @@ impl TestLink {
     /// A link whose delete waits for `hold`.
     fn holding(self, hold: Hold) -> Self {
         *self.delete_hold.lock().expect("hold lock") = Some(hold);
+        self
+    }
+
+    /// A link whose used cursor has wrapped back to zero.
+    fn wrapped_used(mut self) -> Self {
+        self.wrapped_used = true;
         self
     }
 
@@ -277,7 +310,7 @@ impl LinkOps for TestLink {
         Ok(vioc_ring_state {
             vrs_index: ring,
             vrs_avail_idx: 0x1111 + ring,
-            vrs_used_idx: 0x2222 + ring,
+            vrs_used_idx: if self.wrapped_used { 0 } else { 0x2222 + ring },
             ..Default::default()
         })
     }
@@ -371,7 +404,7 @@ fn a_halt_resets_every_ring_before_it_deletes_the_link() {
     let steps = Steps::default();
     let link = TestLink::new(&steps);
 
-    halt_link(&link, &null_log());
+    halt_link(&link, &null_log()).expect("the delete succeeds");
 
     assert_eq!(
         steps_of(&steps),
@@ -380,13 +413,15 @@ fn a_halt_resets_every_ring_before_it_deletes_the_link() {
 }
 
 #[test]
-fn a_failed_delete_does_not_stop_the_halt() {
-    // Teardown has to reach VM_DESTROY_SELF whatever the link
-    // does, so the failure is reported and nothing is unwound.
+fn a_failed_delete_reaches_the_caller() {
+    // Teardown has to reach VM_DESTROY_SELF whatever the link does, so
+    // nothing is unwound here. The answer still carries the failure:
+    // the delete is what proves every kernel ring stopped, so a reset
+    // that escalated to it has to know.
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::Delete]);
 
-    halt_link(&link, &null_log());
+    halt_link(&link, &null_log()).expect_err("the kernel refused the delete");
 
     assert_eq!(steps_of(&steps).last(), Some(&Step::Delete));
 }
@@ -416,6 +451,9 @@ fn stopping_a_poller_wakes_the_thread_and_waits_for_it() {
                 // A closed write end leaves the descriptor ready,
                 // so this returns once and does not spin. The
                 // timeout only stops a broken wake from hanging.
+                // SAFETY: `pfd` is one live `pollfd` and the count says
+                // one, so poll reads and writes only that element. The
+                // thread owns `stop`, so its descriptor stays open.
                 while unsafe { libc::poll(&mut pfd, 1, 10_000) } < 0 {
                     let err = std::io::Error::last_os_error();
                     assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);

@@ -82,18 +82,18 @@ fn write_harness(payload: &[u8]) -> DwzHarness {
 // priority, and a guest picks how much work is queued.
 #[test]
 fn admission_closes_before_the_drain() {
-    let access = GuestAccess::new();
-    let live = access.enter_current().expect("a section is inside");
-    let epoch = live.epoch();
+    let access = GuestAccess::new(1);
+    let live = access.enter_current(0).expect("a section is inside");
+    let tag = live.tag();
 
-    access.close();
+    access.close_all();
 
     assert!(
-        access.enter(epoch).is_none(),
+        access.enter(tag).is_none(),
         "a stale request queued on the lock the reset needs"
     );
     assert!(
-        access.enter_current().is_none(),
+        access.enter_current(0).is_none(),
         "a fresh request queued on the lock the reset needs"
     );
 
@@ -101,7 +101,7 @@ fn admission_closes_before_the_drain() {
     access.drain();
     access.reopen(IntrSession::INITIAL);
     assert!(
-        access.enter_current().is_some(),
+        access.enter_current(0).is_some(),
         "the next driver is shut out"
     );
 }
@@ -110,13 +110,13 @@ fn admission_closes_before_the_drain() {
 // one is live.
 #[test]
 fn a_reset_waits_for_a_live_guest_access_section() {
-    let access = GuestAccess::new();
-    let live = access.enter_current().expect("a section is inside");
+    let access = GuestAccess::new(1);
+    let live = access.enter_current(0).expect("a section is inside");
     let finished = AtomicBool::new(false);
 
     thread::scope(|scope| {
         scope.spawn(|| {
-            access.close();
+            access.close_all();
             access.drain();
             finished.store(true, Ordering::Release);
         });
@@ -441,12 +441,8 @@ fn a_worker_drops_requests_from_a_closed_session() {
     let completion = detached_completion(&queue, &physmap);
     let ctx = worker_ctx(&physmap);
 
-    // The requests are built for the session the reset then ends.
-    let epoch = ctx
-        .access
-        .enter_current()
-        .expect("a session is open")
-        .epoch();
+    // The requests are built for the generation the reset then ends.
+    let tag = current_tag(&ctx.access, 0);
     let (tx, rx) = mpsc::channel();
     for head in 0..5u16 {
         tx.send(BlkIoRequest {
@@ -468,11 +464,11 @@ fn a_worker_drops_requests_from_a_closed_session() {
             ],
             head,
             completion: Arc::clone(&completion),
-            epoch,
+            tag,
         })
         .expect("queue the request");
     }
-    assert_eq!(end_session(&ctx), epoch + 1);
+    end_session(&ctx);
     drop(tx);
 
     let mut file = tempfile::tempfile().expect("create tempfile");
@@ -538,15 +534,12 @@ fn a_worker_batch_does_not_span_a_reset() {
     let (live_queue, live) = ring(0x1300, 0x1400, 0x1500);
 
     let ctx = worker_ctx(&physmap);
-    let stale_epoch = ctx
-        .access
-        .enter_current()
-        .expect("a session is open")
-        .epoch();
-    let live_epoch = end_session(&ctx);
+    let stale_tag = current_tag(&ctx.access, 0);
+    end_session(&ctx);
+    let live_tag = current_tag(&ctx.access, 0);
 
     let request =
-        |head, completion: &Arc<VirtioCompletion>, epoch| BlkIoRequest {
+        |head, completion: &Arc<VirtioCompletion>, tag| BlkIoRequest {
             rtype: bits::VIRTIO_BLK_T_FLUSH,
             sector: 0,
             chain: vec![
@@ -561,15 +554,14 @@ fn a_worker_batch_does_not_span_a_reset() {
             ],
             head,
             completion: Arc::clone(completion),
-            epoch,
+            tag,
         };
 
     // The queue the guest left behind, then the one it built next.
     let (tx, rx) = mpsc::channel();
-    tx.send(request(0, &stale, stale_epoch))
-        .expect("send stale");
-    tx.send(request(1, &live, live_epoch)).expect("send live");
-    tx.send(request(2, &live, live_epoch)).expect("send live");
+    tx.send(request(0, &stale, stale_tag)).expect("send stale");
+    tx.send(request(1, &live, live_tag)).expect("send live");
+    tx.send(request(2, &live, live_tag)).expect("send live");
     drop(tx);
 
     let file = Arc::new(tempfile::tempfile().expect("create tempfile"));
@@ -657,11 +649,7 @@ fn an_interrupt_is_raised_outside_the_guest_access_section() {
 
     let ctx = worker_ctx(&physmap);
     let access = Arc::clone(&ctx.access);
-    let epoch = ctx
-        .access
-        .enter_current()
-        .expect("a session is open")
-        .epoch();
+    let tag = current_tag(&ctx.access, 0);
     let (tx, rx) = mpsc::channel();
     tx.send(BlkIoRequest {
         rtype: bits::VIRTIO_BLK_T_FLUSH,
@@ -678,7 +666,7 @@ fn an_interrupt_is_raised_outside_the_guest_access_section() {
         ],
         head: 0,
         completion,
-        epoch,
+        tag,
     })
     .expect("queue the request");
     drop(tx);
@@ -725,11 +713,12 @@ fn an_interrupt_is_raised_outside_the_guest_access_section() {
 // reset is complete.
 #[test]
 fn an_interrupt_from_a_closed_session_is_dropped() {
-    let access = GuestAccess::new();
-    let stale = access.enter_current().expect("a session is open").epoch();
-    let fresh = access.close();
+    let access = GuestAccess::new(1);
+    let stale = current_tag(&access, 0);
+    access.close_all();
     access.drain();
     access.reopen(IntrSession::INITIAL);
+    let fresh = current_tag(&access, 0);
 
     let fired = AtomicBool::new(false);
     access.deliver(stale, || fired.store(true, Ordering::Release));
@@ -836,12 +825,12 @@ fn completion_for(
     blk: &VirtioBlock,
     queue: &VirtQueue,
 ) -> Arc<VirtioCompletion> {
-    let session = blk.ctx.access.enter_current().expect("a session is open");
+    let session = blk.ctx.access.enter_current(0).expect("a session is open");
     blk.get_completion(&session, 0, queue)
 }
 
-// The device epoch and the transport session are separate counters,
-// and the gap between them is the whole bug. A worker's epoch check is
+// The ring generation and the transport session are separate counters,
+// and the gap between them is the whole bug. A worker's check is
 // one load; a whole reset can run after it passes, and "is admission
 // open now" then says yes again. What tells the two drivers apart is
 // the session the completion handler was built in, which the transport

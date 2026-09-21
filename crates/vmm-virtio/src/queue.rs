@@ -129,14 +129,38 @@ impl std::fmt::Display for QueueAddrError {
     }
 }
 
+/// Why the device refuses the ring size a driver wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueSizeError {
+    /// Zero, not a power of two, or larger than the device offered.
+    Invalid { size: u16, max: u16 },
+    /// The ring is programmed; its size is fixed until a reset.
+    Live,
+}
+
+impl std::fmt::Display for QueueSizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid { size, max } => write!(
+                f,
+                "queue size {size} is not a power of two in 1..={max}"
+            ),
+            Self::Live => write!(f, "queue size written on a programmed ring"),
+        }
+    }
+}
+
 /// A split virtqueue.
 ///
 /// Manages the descriptor table, available ring, and used ring for one
 /// queue. The queue addresses are set by the guest during device init
 /// via the legacy PCI transport (queue PFN register).
 pub struct VirtQueue {
-    /// Queue size (number of descriptors). Must be a power of 2.
+    /// The ring size in use. A modern driver may shrink it below
+    /// `max_size` before it enables the queue (sec 4.1.4.3.2).
     size: u16,
+    /// The size the device offers, and returns to on reset.
+    max_size: u16,
     /// Guest physical address of the descriptor table.
     desc_addr: u64,
     /// Guest physical address of the available ring.
@@ -177,6 +201,7 @@ impl VirtQueue {
         assert!(size <= MAX_QUEUE_SIZE, "queue size exceeds maximum");
         Self {
             size,
+            max_size: size,
             desc_addr: 0,
             avail_addr: 0,
             used_addr: 0,
@@ -197,6 +222,32 @@ impl VirtQueue {
     /// Get the queue size (number of descriptors).
     pub fn size(&self) -> u16 {
         self.size
+    }
+
+    /// The largest ring this queue offers, which is what it returns to
+    /// on reset.
+    pub fn max_size(&self) -> u16 {
+        self.max_size
+    }
+
+    /// Take the ring size a modern driver wrote.
+    ///
+    /// The driver may only shrink the ring, and only before it
+    /// programs the addresses: the device reads and writes `size`
+    /// entries, so a size that changes under a live ring walks past
+    /// the ring the driver allocated.
+    pub fn set_size(&mut self, size: u16) -> Result<(), QueueSizeError> {
+        if size == 0 || !size.is_power_of_two() || size > self.max_size {
+            return Err(QueueSizeError::Invalid {
+                size,
+                max: self.max_size,
+            });
+        }
+        if self.is_configured() {
+            return Err(QueueSizeError::Live);
+        }
+        self.size = size;
+        Ok(())
     }
 
     /// Returns true if the queue has been configured with valid addresses.
@@ -361,6 +412,7 @@ impl VirtQueue {
     /// Reset the queue state (called on device reset).
     pub fn reset(&mut self) {
         self.addrs_ok = None;
+        self.size = self.max_size;
         self.desc_addr = 0;
         self.avail_addr = 0;
         self.used_addr = 0;
@@ -513,6 +565,44 @@ impl VirtQueue {
         }
 
         Some(desc_idx)
+    }
+
+    /// Pop heads and hand each to `each`, until the ring is empty or
+    /// `max` heads have been taken. Returns how many were taken.
+    ///
+    /// `avail_event` is armed on every way out, the cap exit
+    /// included. With EVENT_IDX the guest kicks only when the index it
+    /// adds at is the one the device asked for (sec 2.7.7.2), so a
+    /// threshold left over from the previous drain is below every
+    /// index the guest adds at from now on, and the device is never
+    /// kicked again. A drain that fills its cap is the common case,
+    /// not a corner: Linux posts a whole ring of receive buffers when
+    /// it probes.
+    ///
+    /// After arming, `avail_idx` is read again. An entry the guest
+    /// added between the drain and the arm was judged against the old
+    /// threshold and may never be kicked (sec 2.7.10).
+    pub fn drain_avail(
+        &mut self,
+        physmap: &PhysMap,
+        max: usize,
+        mut each: impl FnMut(&mut VirtQueue, u16),
+    ) -> usize {
+        let mut popped = 0usize;
+        loop {
+            let before = self.last_avail_idx;
+            while popped < max {
+                let Some(head) = self.pop_avail(physmap) else {
+                    break;
+                };
+                popped += 1;
+                each(self, head);
+            }
+            self.update_used_event(physmap);
+            if queue_drain_should_stop(self, before, popped >= max, physmap) {
+                return popped;
+            }
+        }
     }
 
     /// Write `avail_event` in the used ring to suppress guest kicks.
@@ -670,17 +760,22 @@ impl VirtQueue {
     /// Each indirect descriptor is 16 bytes. The table contains
     /// `len / 16` descriptors chained via NEXT flags. INDIRECT flag
     /// inside the table is invalid (VirtIO 1.3 sec 2.7.5.3.1).
+    ///
+    /// `budget` is how many descriptors the chain may still name: a
+    /// chain may not be longer than the ring (sec 2.7.5.3.1), and the
+    /// direct descriptors ahead of the table count towards that.
     fn walk_indirect_table(
         &self,
         physmap: &PhysMap,
         gpa: u64,
         len: u32,
+        budget: u16,
     ) -> Option<Vec<ChainBuf>> {
         let num_descs = len as usize / 16;
         if num_descs == 0 || !(len as usize).is_multiple_of(16) {
             return None;
         }
-        if num_descs > usize::from(self.size) {
+        if num_descs > usize::from(budget) {
             return None;
         }
 
@@ -753,11 +848,22 @@ impl VirtQueue {
                 if !self.indirect_supported {
                     return None;
                 }
-                // INDIRECT + NEXT is invalid (VirtIO 1.3 sec 2.7.5.3)
+                // INDIRECT + NEXT is invalid (VirtIO 1.3 sec 2.7.5.3.1)
                 if desc.has_next() {
                     return None;
                 }
-                return self.walk_indirect_table(physmap, desc.addr, desc.len);
+                // Sec 2.7.5.3.1: the device must handle zero or more
+                // normal chained descriptors followed by a single
+                // indirect one. The buffers ahead of the table belong
+                // to the same request, so a device that returned the
+                // table alone would read the request out of the wrong
+                // buffer. The table ends the chain, because INDIRECT
+                // and NEXT cannot be set together.
+                let budget = self.size - count + 1;
+                bufs.extend(self.walk_indirect_table(
+                    physmap, desc.addr, desc.len, budget,
+                )?);
+                break;
             }
 
             if desc.is_write() {
@@ -781,6 +887,22 @@ impl VirtQueue {
 
         Some(bufs)
     }
+}
+
+/// Whether a drain that just armed `avail_event` is finished.
+///
+/// It stops when the last pass made no progress (an entry the device
+/// cannot read would otherwise spin it), when it hit its cap, or when
+/// the guest added nothing during the arm.
+pub(crate) fn queue_drain_should_stop(
+    queue: &VirtQueue,
+    before: u16,
+    hit_request_cap: bool,
+    physmap: &PhysMap,
+) -> bool {
+    queue.last_avail_idx() == before
+        || hit_request_cap
+        || !queue.has_new_avail(physmap)
 }
 
 /// VirtIO 1.3 sec 2.7.7.1 wrapping comparison for notification suppression.

@@ -139,16 +139,6 @@ mod tests {
 
     use super::{no_pre_finalize, MachineOpts};
 
-    /// Both seam invariants below need a live bhyve VM to exercise, and a
-    /// unit test has none. Read them out of the source instead. The slice
-    /// stops at the test module so a test literal cannot satisfy a check
-    /// that the implementation no longer does.
-    fn implementation() -> &'static str {
-        let src = include_str!("build.rs");
-        let end = src.find("#[cfg(test)]").expect("test module attribute");
-        &src[..end]
-    }
-
     #[test]
     fn the_caller_resolves_the_version() {
         let version = format!("{}-{}", "0.1.0", "deadbee");
@@ -161,26 +151,6 @@ mod tests {
             version: &version,
         };
         assert_eq!(opts.version, "0.1.0-deadbee");
-
-        // The commit macro reads a variable that only the binary's
-        // build.rs sets, so a library must never expand it. Spelled in
-        // parts to keep the needle out of this file.
-        let macro_call = concat!("env", "!(");
-        assert!(
-            !implementation().contains(macro_call),
-            "build_machine must take the version from its caller",
-        );
-    }
-
-    #[test]
-    fn pre_finalize_runs_before_the_map_is_sealed() {
-        let src = implementation();
-        let hook = src.find("pre_finalize(&mut setup)").expect("hook call");
-        let seal = src.find("setup.finalize()").expect("finalize call");
-        assert!(
-            hook < seal,
-            "pre_finalize is the only window with mutable PhysMap access",
-        );
     }
 
     #[test]

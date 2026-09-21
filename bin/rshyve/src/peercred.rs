@@ -52,7 +52,7 @@ pub fn peer_cred(stream: &UnixStream) -> io::Result<PeerCred> {
 #[cfg(target_os = "linux")]
 pub fn peer_cred(stream: &UnixStream) -> io::Result<PeerCred> {
     let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let mut len = size_of::<libc::ucred>() as libc::socklen_t;
     let result = unsafe {
         libc::getsockopt(
             stream.as_raw_fd(),
@@ -65,7 +65,7 @@ pub fn peer_cred(stream: &UnixStream) -> io::Result<PeerCred> {
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
-    if len as usize != std::mem::size_of::<libc::ucred>() {
+    if len as usize != size_of::<libc::ucred>() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "SO_PEERCRED returned an unexpected credential size",
@@ -126,7 +126,8 @@ pub fn process_zoneid() -> io::Result<Option<i32>> {
 
 // Only the Linux and macOS arms are exercisable from a plain unit test.
 // The illumos path needs a real zone to say anything interesting; the
-// authorization policy built on top of it is tested in control.rs.
+// authorization policy built on top of it is tested in
+// control/listener.rs.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;

@@ -1,6 +1,6 @@
 # Feature reference
 
-`rshyve` and `firehyve` are two binaries built from one workspace. `rshyve` is a drop-in replacement for the illumos `bhyve(8)` command: UEFI firmware, NVMe, AHCI CD-ROM, a VNC framebuffer, PCI passthrough, a control socket, and live migration. `firehyve` is a microVM that boots a Linux kernel directly and links a deliberately smaller crate set; it accepts eight PCI drivers and rejects everything else at startup instead of skipping it. Choose `firehyve` when the guest is a Linux kernel you supply and the device list is virtio only; choose `rshyve` for anything that needs firmware, a graphical console, or migration.
+`rshyve` and `firehyve` are two binaries built from one workspace. `rshyve` stands in for the illumos `bhyve(8)` command on the command line the zone brand builds: UEFI firmware, NVMe, AHCI CD-ROM, a VNC framebuffer, PCI passthrough, a control socket, and live migration. It is not all of bhyve, and the tables below separate what it implements from what it accepts and ignores and what it refuses. `firehyve` is a microVM that boots a Linux kernel directly and links a deliberately smaller crate set; it attaches six virtio drivers, accepts the two chipset names and the two graphical-console names the bhyve zone brand always emits, and rejects everything else at startup instead of skipping it. Choose `firehyve` when the guest is a Linux kernel you supply and the device list is virtio only; choose `rshyve` for anything that needs firmware, a graphical console, or migration.
 
 Everything below is traced to code. Where a shipped document contradicts the code, the code wins and the contradiction is listed at the end.
 
@@ -45,8 +45,8 @@ Markers: **yes** works, **caveat** works with a condition named in the matching 
 | USB keyboard | no | no | absent from the tree |
 | PS/2 mouse motion | no | no | `ps2/mouse.rs` `movement()` returns zeros |
 | **Migration and control** | | | |
-| Live migration, Unix socket path | exp | reject | `crates/vmm-migrate/src/sync_source.rs` |
-| Live migration, TCP path | exp, incomplete | reject | `crates/vmm-migrate/src/source.rs` (ships no device state) |
+| Live migration over a Unix socket | exp | reject | `crates/vmm-migrate/src/source.rs`, `destination.rs` |
+| Live migration over TCP | exp | reject | the same driver over `std::net::TcpStream` (`crates/vmm-migrate/src/wire.rs`) |
 | Control socket (`--control-socket`) | yes | reject | `bin/rshyve/src/control.rs`; `bin/firehyve/src/main.rs:46` |
 | Dirty page tracking | on by default | never | `bin/rshyve/src/main.rs:175`; `bin/firehyve/src/main.rs:116` |
 | **Hotplug (`--hotplug`, off by default)** | | | |
@@ -60,8 +60,8 @@ Markers: **yes** works, **caveat** works with a condition named in the matching 
 | Hotplug commands | control socket | vsock `CONTROL` verb, needs a `virtio-vsock` device | `bin/rshyve/src/control/dispatch.rs:202-252`; `bin/firehyve/src/control.rs:287-297` |
 | Migration after any hot-add, PCI included | reject | n/a | `bin/rshyve/src/control/migrate.rs:84,64` |
 | **Platform** | | | |
-| vTPM 2.0 (`--vtpm`) | caveat | reject | `crates/vmm-tpm/src/crb.rs`; `bin/firehyve/src/main.rs:53` |
-| Hyper-V enlightenments (`--hyperv`) | exp | reject | `crates/vmm-hyperv/src/lib.rs`; `main.rs:57` |
+| vTPM 2.0 (`--vtpm`) | caveat | reject | `crates/vmm-tpm/src/crb.rs`; `bin/firehyve/src/main.rs` `validate_cli` |
+| Hyper-V enlightenments (`--hyperv`) | exp | reject | `crates/vmm-hyperv/src/lib.rs`; `validate_cli` |
 | `--cpu-baseline` CPUID masking | yes | yes | `crates/vmm-core/src/cpuid.rs:32` |
 | PCI passthrough (`passthru,/dev/pptN`) | caveat | reject | Intel only, no MSI-X device; `crates/vmm-passthru/`; `bin/rshyve/src/main.rs:1412` |
 | `virtio-rnd` | yes | yes | `crates/vmm-virtio/src/attach.rs:341` |
@@ -71,7 +71,9 @@ Markers: **yes** works, **caveat** works with a condition named in the matching 
 
 ### What firehyve rejects at startup
 
-`validate_cli` (`bin/firehyve/src/main.rs:40-89`) errors on: a missing `--kernel`, `--migrate-listen`, `--control-socket`, `--json-config`, every `--mdata-*` flag, `--vtpm`, `--vtpm-state-dir`, `--hyperv`, `--tsc-freq-hz`, any `-l` argument beginning with the literal lowercase `bootrom,`, any `-l com1`/`com2` backend other than `stdio`, and any `-s` spec containing a `bootindex=` token. `bin/firehyve/src/devices.rs:54` then rejects any PCI driver outside its eight-name `SUPPORTED` list.
+`validate_cli` (`bin/firehyve/src/main.rs`) errors on: a missing `--kernel`, `--migrate-listen`, `--control-socket`, `--json-config`, every `--mdata-*` flag, `--vtpm`, `--vtpm-state-dir`, `--hyperv`, `--tsc-freq-hz`, and any `-s` spec containing a `bootindex=` token. `split_spec` (`bin/firehyve/src/devices.rs`) then rejects any PCI driver outside its `SUPPORTED` list.
+
+What the bhyve zone brand forces onto every zone is accepted instead, because refusing it would mean an unmodified brand could never start the binary. Each is logged at `warn` and changes no guest behaviour: `-l bootrom,<rom>` (nothing is loaded from it), a `-l com1`/`com2` backend firehyve cannot serve (the port falls back to inherited stdio, which zoneadmd copies into the zone log rather than the zone console), and the `fbuf` and `xhci` specs `add_fbuf` emits (the slots stay empty). COM1 does serve an absolute device path, so the brand's `/dev/zconsole` is a working console. The startup argv is the only place these are tolerated: a hot-add of `fbuf` or `xhci` over the `CONTROL` verb is refused.
 
 Because both binaries share one clap derive (`crates/vmm-config/src/lib.rs`), `firehyve --help` still lists the rshyve-only flags. The refusal happens at runtime, not in the parser.
 
@@ -429,17 +431,17 @@ Authorization is uid plus zone, not a capability: the peer's uid must equal the 
 
 ### Live migration
 
-Two implementations. The production path is the synchronous Unix-socket source and destination (`crates/vmm-migrate/src/sync_source.rs`), which uses `tungstenite` with no tokio because a bhyve-brand zone has no `/dev/poll`. The TCP path (`source.rs`, `destination.rs`) is tokio-based and described in its own comment as "for GZ or manual testing".
+One driver, over one transport trait. `crates/vmm-migrate/src/wire.rs` defines `Transport`, a `Read + Write` stream whose read deadline the protocol shortens once the guest is paused, and `source.rs` and `destination.rs` are generic over it. Two streams implement it: `UnixStream`, the only kind that works inside a bhyve-brand zone, where there is no `/dev/poll`, and `TcpStream` for a global-zone or lab run. Neither end starts an async runtime. The framing is `tungstenite` WebSocket binary frames carrying RON.
 
-**Only the Unix path carries emulated-device state.** `state::export_device_state` on the TCP path hardcodes `virtio_queues: Vec::new(), nvme_controllers: Vec::new()`, and the matching destination has no restore callback, so a TCP migration ships zero virtio ring state and zero NVMe state and the guest arrives with unprogrammed rings.
+The same driver serves both, so both carry the same state. An earlier tree had a second implementation for TCP that shipped no device state at all; it is gone.
 
-The Unix sequence is: full RAM pass, up to 5 dirty convergence iterations (500 ms apart, 1024-page threshold), pause devices, pause vCPUs, durable flush of every device, an optional ZFS barrier, a final dirty pass, then time data, device state and the exported queue state. If anything after pause fails, devices and vCPUs are resumed so the guest survives.
+The sequence is: full RAM pass, up to 5 dirty convergence iterations (500 ms apart, 1024-page threshold), pause devices, pause vCPUs, durable flush of every device, an optional ZFS barrier, a final dirty pass, then time data, device state and the exported queue state. If anything after pause fails, devices and vCPUs are resumed so the guest survives.
 
 Kernel state transferred: the ioapic, atpit, atpic, hpet, pm_timer and rtc system devices; per vCPU the 33 registers, 10 segment descriptors, MSRs, LAPIC, VMM_ARCH, run state and SIPI vector; and VMM time with boot_hrtime re-basing and TSC rescaling.
 
-Guarded refusals that work correctly: a vTPM, a bootrom variable store, or an `ahci-cd` device each block `migrate-source`; `--migrate-listen` combined with `--vtpm`, a varstore, or an `fbuf`/`ahci-cd` spec is a startup error. Note the asymmetry: `fbuf` blocks a destination but not a source, and `xhci` is on neither list, so a destination will accept an `xhci` spec and start with a fresh unrestored controller.
+Guarded refusals: a vTPM or a bootrom variable store blocks `migrate-source`, and so does any device whose state nothing carries, which is `ahci-cd`, `virtio-console`, `virtio-fs`, `virtio-vsock` and `xhci` (`UNMIGRATABLE`, `bin/rshyve/src/control/migrate.rs:152`). `--migrate-listen` combined with `--vtpm`, a varstore, or an `fbuf`/`ahci-cd` spec is a startup error. The remaining asymmetry is covered at the preamble rather than at startup: the two ends exchange their whole device set and a migration whose sets differ is refused before a page is accepted, so a destination holding a device the source has not cannot start the guest.
 
-`vmm-migrate-agent` is a separate binary that runs in the global zone and orchestrates the ZFS send/recv plus a Unix-to-TCP bridge. Its flags: `source --uuid --dest-host [--dest-port 4567] [--disk-dataset] [--dest-dataset] [--max-syncs 3] --ssh-key [--control-socket] [--skip-zfs]`, and `dest --uuid [--port 4567]`.
+Orchestration is not in this repository. Replicating the disk, sequencing the two hosts and bridging the transport belong to whatever drives the migration; this tree provides the VMM side, the control-socket verbs and the barrier contract (see [migration.md](migration.md#the-zfs-barrier)). `tools/vmm-migrate.sh` drives one end to end for lab use and is a test harness, not a supported component.
 
 ## Hotplug (both binaries)
 
@@ -601,14 +603,13 @@ Absent, with no partial path:
 
 ### Accepted by the CLI and then ignored
 
+Three C bhyve flags are refused instead of ignored, so an operator who puts one in `bhyve_extra_opts` gets an error rather than a VM that is not what was asked for: `-D` (destroy on power-off), `-k` and `--json-config` (`crates/vmm-config/src/lib.rs:10`). `boot.c` passes none of the three. The instance is reclaimed when the process exits whatever `-D` would have said, because the VMM arms the kernel autodestruct flag on every VM.
+
 These parse without complaint and do nothing. Each one is a way to believe you configured something you did not.
 
 | Input | Reality |
 |---|---|
-| `--json-config <PATH>` | No reader exists anywhere in the tree (rshyve). firehyve at least rejects it. |
-| `-k` / `--config-file` | Declared in `crates/vmm-config/src/lib.rs`; no consumer. |
 | `-o` / `--config-option`, any key outside `hotplug.` | Passed over. `-o` is a free key space this VMM shares with vmadm. The two keys it does read are `hotplug.maxmem` and `hotplug.memslot`; a misspelled `hotplug.` key is a startup error rather than a silent drop (`crates/vmm-config/src/lib.rs:338`). |
-| `-D` / `--destroy-on-poweroff` | Declared at `crates/vmm-config/src/lib.rs:79` and read nowhere. A whole-tree grep finds only that line. vmadm and boot.c pass `-D`, so this is the one an operator is most likely to trust. The instance is in fact reclaimed when the process exits, because the VMM arms the kernel autodestruct flag, but that happens whether or not `-D` was given. |
 | `-A` / `--acpi` | Declared at `crates/vmm-config/src/lib.rs:91` and read nowhere. ACPI tables are built unconditionally, so the flag is redundant rather than harmful. |
 | `nvme,...,sectorsize=N` | Parsed by the shared block parser, then discarded. NVMe LBA is hardcoded 512. |
 | `nvme,...,num-queues=N`, `nvme,...,nodelete` | Parsed and discarded. |
@@ -627,25 +628,25 @@ These parse without complaint and do nothing. Each one is a way to believe you c
 
 ## Known caveats
 
-**Live migration is experimental and its transport is unauthenticated and unencrypted.** Guest RAM, all vCPU register and MSR state, and device state cross the wire in cleartext with no peer identity, no session binding, no migration ID and no replay protection. The destination resumes whatever the first connecting peer sends, subject only to a `num_cpus` and `mem_size` equality check. `SECURITY.md` states this and `docs/security/open-findings.md` tracks it as OSF-1 (high). The only mitigation available today is external: migrate over a separately authenticated tunnel, ideally an SSH-forwarded Unix socket so the VMM never binds TCP. `vmm-migrate-agent` compounds this: it disables `StrictHostKeyChecking` and builds every command by string interpolation into `bash -c`, so a shell metacharacter in `--uuid`, `--dest-host` or a dataset name runs as root in the global zone (OSF-1b).
+**Live migration is experimental and its transport is unauthenticated and unencrypted.** Guest RAM, all vCPU register and MSR state, and device state cross the wire in cleartext with no peer identity, no session binding, no migration ID and no replay protection. The destination resumes whatever the first connecting peer sends. The preamble checks the CPU count, the memory size, the device set and the CPU features, and none of those is an identity check. `SECURITY.md` states this and `docs/security/open-findings.md` tracks it as OSF-1 (high). The only mitigation available today is external: migrate over a separately authenticated tunnel, ideally an SSH-forwarded Unix socket so the VMM never binds TCP.
 
 **A writable virtio-fs share is a root-equivalent grant over that subtree.** File operations run as the VMM's euid with no uid/gid squashing, and the guest chooses the uid, gid and mode on SETATTR, setuid bit included. Treat a read-write export the way you would treat handing the guest a root shell scoped to that directory. `ro` shares carry none of this: every mutating opcode returns EROFS, including an `O_TRUNC` open.
 
-**The CPU feature check never rejects.** Both destinations log "CPU feature mismatch (continuing)" and proceed. The sync destination, which is the one production uses, compares only leaf 7 and has no ignore masks. The comparison is also structurally wrong: the source sends baseline-masked guest features while the destination compares them against raw host features (OSF-3).
+**The destination refuses a CPU feature gap by default.** The comparison covers leaf 1 ECX and EDX, leaf 7 EBX, ECX and EDX, and the XCR0 component mask, and both ends report what their own `--cpu-baseline` leaves a guest, which is what the guest saw and what it will see (`crates/vmm-migrate/src/cpu.rs`). A destination missing any bit the source exposes fails the preamble before a page is taken. The `migrate-dest` control command takes an `allow_cpu_feature_mismatch` field that downgrades the refusal to a logged warning for that one migration; the guest then takes #UD on the first instruction this host lacks. A destination started with `--migrate-listen` never sets the field, so that path always refuses. The refusal text names a `--allow-cpu-feature-mismatch` command-line flag that does not exist.
 
-**Device identity is not carried across migration.** Exported virtio queue records all have `pci_slot` hardcoded to 0, and `restore_migrate_state` matches by queue-count grouping, taking the first group whose length equals the device's queue count. NVMe records carry no slot at all and every controller's state is applied to every device. Two virtio-blk disks with the same queue count, or two NVMe controllers, will not restore to the right devices. Separately, if the 30 second queue-export budget expires, empty device state is substituted and the migration continues after an error-level log naming the stuck devices.
+**Device state is carried by PCI address.** Each payload entry names the bus/device/function its device had on the source, and the destination restores by that address alone, for virtio transports and NVMe controllers alike (`crates/vmm-migrate/src/codec.rs`, `crates/vmm-virtio/src/pci/migrate.rs`). An entry for an address this VM has no device at, two entries for one address, or a local device with no entry each fail the migration before the guest runs, and the preamble compares the two device sets by kind and address first. Two virtio-blk disks with the same queue count no longer restore into each other. The export is a plain read taken after the pause, so a device that fails to export fails the migration instead of substituting empty state.
 
 **The vTPM ships two unpatched libtpms CVEs.** The vendored tree is libtpms at revision `521c5107` and carries CVE-2026-6726 (CVSS 8.5, `ObjectFlush()` leaves key material in a freed object slot) and CVE-2026-6727 (CVSS 8.3, `OaepDecode()` retains early-exit comparisons reachable from a guest-issued `TPM2_RSA_Decrypt`). Both are guest-to-host through the vTPM command interface, cross-referenced to CERT VU#431093, and recorded in `THIRD_PARTY.md:148-159` and OSF-4. `THIRD_PARTY.md` states both must be resolved before the vTPM is presented as production-ready.
 
 **A vTPM state directory and a UEFI `VARS.fd` are one unit of VM state.** Losing either makes the other useless. Nothing in the code enforces this; snapshots and backups must capture both together (`docs/testing.md:686`).
 
-**Hyper-V enlightenments have never been validated against an installed Windows workload** (`FEATURES_TODO.md:290`), and `--hyperv` is **not** blocked from migration even though no Hyper-V state is in the protocol. A migrated guest's overlay pages travel inside RAM while the MSR state describing them does not.
+**Hyper-V enlightenments have never been validated against an installed Windows workload** (`FEATURES_TODO.md:290`). Migration does carry the enlightenment: the source drops both overlay pages before the final RAM pass and exports GUEST_OS_ID, HYPERCALL, REFERENCE_TSC, the five crash parameters and the reference-time counter; the destination replays those MSR writes, which reinstalls the overlays, and refuses a payload carrying an enlightenment for a VM started without `--hyperv` (`crates/vmm-hyperv/src/lib.rs`, `crates/vmm-migrate/src/destination.rs`). That path has unit tests and no Windows guest behind it.
 
 **`-S` does not mean what its help text says.** It is documented as "Wire guest memory (don't swap)", but guest memory is mapped `VM_MEMMAP_F_WIRED` unconditionally. What `-S` actually does is set `VCF_RESERVOIR_MEM` at VM create, which means the host VMM reservoir must already be sized out of band. With an empty reservoir, VM create with `-S` fails.
 
 **Both binaries destroy a same-named VM instance on startup.** `force: true` is hardcoded, not a flag, and `VmmHdl::create` retries 20 times at 100 ms after a best-effort destroy. Do not reuse the name of a live VM.
 
-**No minimum bhyve API version is enforced.** The version is queried and logged, then execution continues. Real gates exist at v12 (sub-second RTC), v16 (triple-fault source) and v17 (`set_dirty_pages`, which returns Unsupported below that). On an older kernel the binaries start and degrade silently. v18 is the only version with test evidence behind it. The viona interface version is never checked at all, so a mismatched module surfaces as a raw ioctl errno.
+**No minimum bhyve API version is enforced.** The version is queried and logged, then execution continues. What the code actually depends on is v5 (CPUID control), v8 (the `VCF_TRACK_DIRTY` create flag), v11, v12 and v13 (the vmm-data reads and writes a migration makes, and the RTC at data version 2), and v16 for the suspend detail that names the vCPU which took a triple fault. The one explicit check, `set_dirty_pages` refusing below v17, guards a function nothing calls. On an older kernel the binaries start and then fail at an ioctl or give less without saying so. v18 is the only version with test evidence behind it. The viona interface version is never checked at all, so a mismatched module surfaces as a raw ioctl errno.
 
 **A vmm_drv lease that does not break keeps the process alive, and no watchdog can end it.** Teardown ends in `VM_DESTROY_SELF`. That ioctl reaches `vmm_lease_block`, which asks every vmm_drv lessee to give its lease up and then waits in an untimed `cv_wait` until the lease list is empty (`uts/intel/io/vmm/vmm_sol_dev.c`). The wait ends only when every lessee gives its lease up, and viona gives its up asynchronously: the expire callback returns `B_FALSE` and only signals the ring worker, which breaks the lease the next time it checks (`uts/intel/io/viona/viona_ring.c`). A worker that does not reach that check holds the lease, and the lease holds the destroy. `viona_tx_wait_outstanding` is one such point, an untimed wait on TX frames the MAC layer still holds; it is reachable only on a link with guest-memory loaning on, which is not the shipped configuration, because illumos defaults `viona_default_tx_copy` to true and this VMM never sets the parameter. The VMM bounds what it can: the destroy runs on its own thread with a 15 s budget, teardown logs `the VM destroy did not return inside its budget` and stops waiting, and the shutdown watchdog then calls `_exit(4)`. The process still stays. A thread in `cv_wait` does not carry `T_WAKEABLE`, so `pokelwps` cannot make it run and `exitlwps` waits for it (`uts/common/os/lwp.c`). No signal, `close` or `_exit` reaches it, `SIGKILL` included. The instance and its guest memory stay held until the lease breaks: release the downstream holder and teardown finishes on its own, otherwise only a node reboot frees the memory. Closing this needs a kernel change; see [FEATURES_TODO.md](../FEATURES_TODO.md#upstream-bound-the-vmm_drv-lease-wait) and the lab procedure in [docs/testing.md](testing.md#wedged-lease-teardown).
 
@@ -655,21 +656,21 @@ These parse without complaint and do nothing. Each one is a way to believe you c
 
 **Two test gates still hold coverage off the platform that runs the code.** `bin/rshyve/src/peercred.rs:130` gates its test to Linux and macOS, so the control socket's peer check is untested on illumos, and `crates/vmm-core/tests/autodestruct.rs` is illumos only, so CI never runs it. Nothing compares per-crate test counts across platforms, so a new gate is invisible until somebody reads for it. The viona half of this gap is closed: `VionaInner` now holds one `Arc<dyn LinkOps>` on every platform (`f896980`), which took viona tests executing on illumos from 3 to 39 with no platform gate left, and `dfd478a` moved `LinkOps` into `viona-api` beside the `VionaFd` that implements it, so the illumos adapter sends its ioctls directly. [hardware-run.md](hardware-run.md#coverage-that-does-not-reach-illumos) carries the detail.
 
-**Dirty page tracking is on by default in rshyve** (`--track-dirty` defaults true; the real control is the `--no-track-dirty` opt-out), and it asks the kernel for `VCF_TRACK_DIRTY` at VM create. Nothing probes for hardware support first or degrades if the flag is refused.
+**Dirty page tracking is on by default in rshyve.** The only control is the `--no-track-dirty` opt-out; `--track-dirty` is gone, because it could never be false. Tracking asks the kernel for `VCF_TRACK_DIRTY` at VM create. Nothing probes for hardware support first or degrades if the flag is refused.
 
-**TCP migration cannot run inside a bhyve-brand zone.** It constructs a tokio runtime, and the project's premise is that such a zone has no `/dev/poll`. Booting a guest, the control socket, the serial console and the VNC server all avoid tokio; only TCP migration does not. In-zone migration must use the Unix sync path with a global-zone agent bridging to TCP. firehyve's crate graph contains no tokio at all.
+**No part of the VMM constructs an async runtime any more.** TCP migration used to build a tokio runtime, which a bhyve-brand zone cannot run because it has no `/dev/poll`. Both transports are now the same blocking driver. An in-zone migration should still use the Unix socket with a global-zone agent bridging to the peer, because that keeps an unauthenticated protocol (OSF-1) off a listening TCP port; TCP from inside a zone is untested. `bin/rshyve/Cargo.toml` still declares tokio and no rshyve source file uses it. firehyve's crate graph contains no tokio at all.
 
 **CI type-checks; it does not link or boot.** A green run proves formatting, portable-crate clippy and tests, illumos type-checking of the FFI crates, a current lockfile, and the dependency and public-surface policies. It does not prove the VMM builds, boots a guest, or passes a platform test. USDT probe emission is a no-op on the Linux runner and is verified only on the build host. The stock-platform-image shared-library gate (`tools/check-needed.sh`) runs on the build host, not in CI, so CI never sees a real illumos ELF. `tools/check-ci-crates.sh`, the guard that asserts CI covers every portable crate, runs in the `ci-coverage` job. Every runtime claim in `docs/testing.md` is lab-verified against an untracked host list, not reproducible publicly.
 
-**The MSRV (1.94) is unverified for both shipping binaries.** The MSRV job's crate list omits `rshyve`, `firehyve`, `vmm_tpm`, `vmm_tpm_sys` and `vmm-migrate-agent`. There is no `rust-toolchain.toml`, and `tools/fhrun-init` declares no `rust-version` at all.
+**The MSRV (1.94) is unverified for both shipping binaries.** The MSRV job's crate list omits `rshyve`, `firehyve`, `vmm_tpm` and `vmm_tpm_sys`. There is no `rust-toolchain.toml`, and `tools/fhrun-init` declares no `rust-version` at all.
 
 **Build on a platform image no newer than the oldest node you deploy to.** `tools/check-needed.sh` pins `MAX_OPENSSL_SMARTOS=3.0.9`, because `ld.so.1` refuses a binary whose recorded `OPENSSL_SMARTOS_<ver>` the node's library does not define. The platform-OpenSSL link path is taken only when host and target match and `/lib/amd64/libcrypto-smartos.so.3` exists; a cross build silently falls back to pkg-config, which is the configuration that once produced a binary recording `NEEDED libcrypto.so.3` that no platform image ships.
 
-**virtio-fs and virtio-console lose backend state across a migration and neither is on the destination reject list.** In-flight FUSE requests, the console backlog and the attached client are gone, with no error.
+**virtio-fs, virtio-console, virtio-vsock and xhci carry no migration state at all, so a VM holding one cannot be a migration source.** `migrate-source` names the device and refuses. In-flight FUSE requests, the console backlog and the attached client have no place on the wire, and refusing is what keeps the guest from finding the device at reset on the far side.
 
 ## Documentation that contradicts the code
 
-Treat `STATUS.md` as historical. It still titles the project "vmmnew", predates the two-binary split, never mentions `firehyve`, `fhrun` or `vmm-migrate-agent`, and maps fbuf, xHCI, NVMe and passthru to a monolithic `crates/vmm-devices/` that no longer holds them.
+Treat `STATUS.md` as historical. It still titles the project "vmmnew", predates the two-binary split, never mentions `firehyve` or `fhrun`, and maps fbuf, xHCI, NVMe and passthru to a monolithic `crates/vmm-devices/` that no longer holds them.
 
 | Claim | Where | Reality |
 |---|---|---|
@@ -680,24 +681,17 @@ Treat `STATUS.md` as historical. It still titles the project "vmmnew", predates 
 | virtio-blk options are `nodelete` and `sectorsize` | `docs/devices.md:59` | The parser also honors `ro` and `num-queues=N`; `num-queues` appears nowhere in the docs. `nodelete` is inert. |
 | "Automatically adds -S and -A when passthrough devices are present" | `docs/devices.md` | No such code. `cli.wire_memory` is read once and nothing inspects the `-s` specs. An operator relying on this runs passthrough over unwired memory. |
 | One device table with no per-binary column | `docs/devices.md` | firehyve accepts 8 of 13 drivers and hard-errors on the rest. `docs/cli.md:117` states this correctly. |
-| "firehyve `-l com2`: not attached" | `docs/cli.md:116` | COM2 is always attached, transmit only, mirrored to stdout (`bin/firehyve/src/console.rs:111`). The "no metadata agent" half is right. |
-| "`--track-dirty` enables dirty page tracking" | `docs/cli.md` | It defaults to true; the operator control is `--no-track-dirty`, which the doc does not mention. |
 | `--cpu-baseline` values are host, avx2, sse42 | `docs/cli.md:35` | `native`, `no-avx512`, `sse4.2` and `westmere` are also accepted, case insensitively. |
 | Bootrom grammar is `-l bootrom,<path>|uefi|bios` | `docs/cli.md:74` | The varfile field (`-l bootrom,<rom>,<varfile>`) is omitted entirely, as is the `=`-containing legacy-option field. |
-| "The destination rejects a CPU feature mismatch with a detailed error" | `docs/migration.md` | Both destinations warn and continue. `docs/status.md` contradicts itself on the same page: line 13 says rejected, line 77 says warns only. |
-| Migration RAM flow is MemOffer/MemFetch/MemXfer | `docs/migration.md` | None of MemOffer, MemXfer or Page is ever sent. The real flow is PageBatch plus MemFetch, ended by MemEnd/MemDone. Five of the thirteen wire message types are decodable and never constructed. |
 | Migration examples invoke a binary called `vmm` | `docs/migration.md` | The binary is `rshyve`. |
 | `--migrate-listen 0.0.0.0:4567` as the destination | `docs/migration.md`, `docs/cli.md` | Works only because the CLI flag applies no validation; the `migrate-dest` control command runs the same address through a validator that rejects `0.0.0.0`. Two entry points to one feature disagree. |
-| Control socket has 4-5 commands | `docs/cli.md` | Twenty-one exist (`bin/rshyve/src/control/protocol.rs`), nine of them the hotplug commands. `shutdown`, `reset`, `stop`, `migrate-dest`, `migrate-config`, `metrics` and `metrics-prometheus` are undocumented, as is `migrate-source`'s `zfs_barrier` field. |
+| The documented control commands are the whole set | `docs/cli.md` | Twenty-one exist (`bin/rshyve/src/control/protocol.rs`). `shutdown`, `reset`, `stop`, `migrate-dest`, `migrate-config`, `metrics` and `metrics-prometheus` are documented nowhere, as is `migrate-source`'s `zfs_barrier` field. |
 | `password=<b64>` for fbuf | `docs/platform.md:30` | The value is used verbatim; there is no base64 decode. `docs/devices.md:128` gets it right. |
 | `-s 30:1,xhci,tablet` selects the device | `docs/platform.md:31`, `docs/devices.md:130` | The config field is never read. |
-| Framebuffer/VNC and xHCI are "Complete" and at parity with C bhyve | `docs/status.md:36`, `docs/platform.md:191` | No VGA, no TCP listener, no `wait`, Raw encoding only, one client, one xHCI slot, no scroll wheel, no migration state. |
 | "MSFT0101 DSDT device is still missing" | `FEATURES_TODO.md:10,30,117` | Landed. `crates/vmm-devices/src/acpi.rs:366` with five tests. |
 | "Keyboard input does not exist and pointer events are not connected" | `FEATURES_TODO.md:27` | Both wired. PS/2 keyboard at `bin/rshyve/src/input.rs`, tablet pointer at `main.rs:1205`. The same line's claim that wide framebuffer stores are fatal is also stale; BAR1 is devmem-backed. |
 | "xHCI advertises MaxSlots = 1" | `FEATURES_TODO.md:111` | `MAX_SLOTS = 64` at `crates/vmm-hid/src/xhci/bits.rs:32`, with a test. Only one slot is implemented, which is the real remaining limit. |
 | virtio-fs listed as a future idea | `FEATURES_TODO.md:272` | Implemented and wired into both catalogs. |
-| "`bhyve` API v5+" | `docs/platform.md` | Nothing implements a v5 floor. Real gates are v12, v16 and v17. |
-| "AHCI: fallback to virtio-blk" in the feature comparison | `docs/platform.md` | Contradicted by both the code and `docs/status.md` in the same repository. |
 | fhrun boot numbers reproducible from a manifest | `docs/firehyve-whitepaper.md:174` | The measured command line ("no `console=`", plus `no_timer_check noapictimer`) is unreachable: `launcher.rs:53` always emits `console=ttyS0` and `kernel_extra_cmdline` can only append. |
 | fhrun exit codes are 0/1/2 | `docs/fhrun.md:75` | The VMM's code passes through, and firehyve exits 2 on a guest fault and 3 on a triple fault, so 2 is ambiguous and 3 is undocumented. |
 | `guest_metadata` "reaches the payload untouched" | `docs/fhrun.md:102` | Nothing delivers it. The payload gets only argv and env; the metadata is readable only if the payload opens `/firehyve-spec.json` itself, which is mode 0644 inside the guest. |

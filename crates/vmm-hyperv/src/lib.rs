@@ -28,13 +28,16 @@ pub mod hypercall;
 pub mod overlay;
 pub mod tsc;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bhyve_api::vcpu_cpuid_entry;
 use slog::{info, warn, Logger};
 use vmm_core::mem::PhysMap;
 use vmm_core::msr::{MsrHandler, RdmsrOutcome, WrmsrOutcome};
+use vmm_core::ratelimit::TokenBucket;
+use vmm_devices::lifecycle::HypervMigrateState;
 
 use crate::bits::*;
 use crate::hypercall::MsrHypercallValue;
@@ -78,8 +81,20 @@ pub struct HyperV {
     physmap: Arc<PhysMap>,
     features: Features,
     boot: Instant,
+    /// Records a guest can earn by writing CRASH_CTL.
+    crash_log_budget: TokenBucket,
+    /// What `HV_X64_MSR_TIME_REF_COUNT` read when this VM started, in
+    /// 100 ns units.
+    ///
+    /// Zero for a VM that booted here. A migration destination takes
+    /// the source's last value, because the guest is told the counter
+    /// is monotonic and a fresh process clock runs it backwards.
+    ref_count_base: AtomicU64,
     inner: Mutex<Inner>,
 }
+
+const CRASH_LOG_BURST: u32 = 4;
+const CRASH_LOG_PERIOD: Duration = Duration::from_secs(15);
 
 struct Inner {
     msr_guest_os_id: u64,
@@ -116,6 +131,11 @@ impl HyperV {
             physmap,
             features,
             boot: Instant::now(),
+            crash_log_budget: TokenBucket::new(
+                CRASH_LOG_BURST,
+                CRASH_LOG_PERIOD,
+            ),
+            ref_count_base: AtomicU64::new(0),
             inner: Mutex::new(Inner::new()),
         })
     }
@@ -168,7 +188,17 @@ impl HyperV {
             leaf3 |= HvLeaf3Eax::PARTITION_REFERENCE_COUNTER;
             leaf3 |= HvLeaf3Eax::PARTITION_REFERENCE_TSC;
         }
-        entries.push(cpuid_entry(0x4000_0003, 0, leaf3.bits(), 0, 0, 0));
+        // EDX: the crash MSRs are always handled, and both Windows and
+        // Linux test this bit before they write them.
+        let leaf3_edx = HvLeaf3Edx::GUEST_CRASH_MSRS.bits();
+        entries.push(cpuid_entry(
+            0x4000_0003,
+            0,
+            leaf3.bits(),
+            0,
+            0,
+            leaf3_edx,
+        ));
 
         // 0x4000_0004: recommended guest behaviors.
         // EAX = RELAXED_TIMING (the watchdog suppression bit).
@@ -317,6 +347,10 @@ impl HyperV {
     }
 
     fn log_crash(&self, inner: &Inner) {
+        // CRASH_CTL is a guest WRMSR, so the record needs a cap.
+        if !self.crash_log_budget.take() {
+            return;
+        }
         info!(
             self.log,
             "Windows guest BSOD";
@@ -328,10 +362,54 @@ impl HyperV {
         );
     }
 
+    /// The partition reference counter, in 100 ns units.
+    ///
+    /// Continues from the base a migration import set, so it never
+    /// runs backwards for a guest that was told it is monotonic.
+    fn time_ref_count(&self) -> u64 {
+        let elapsed = u64::try_from(self.boot.elapsed().as_nanos() / 100)
+            .unwrap_or(u64::MAX);
+        self.ref_count_base
+            .load(Ordering::Relaxed)
+            .saturating_add(elapsed)
+    }
+
+    /// The guest-visible state a migration carries.
+    pub fn export_state(&self) -> HypervMigrateState {
+        let inner = self.inner.lock().unwrap();
+        HypervMigrateState {
+            guest_os_id: inner.msr_guest_os_id,
+            hypercall: inner.msr_hypercall.raw(),
+            reference_tsc: inner.msr_reference_tsc.raw(),
+            crash_p: inner.crash_p,
+            time_ref_count: self.time_ref_count(),
+        }
+    }
+
+    /// Put a source's enlightenment back.
+    ///
+    /// The MSR writes are replayed through the same handlers a guest
+    /// goes through, so both overlay pages are reinstalled from the
+    /// values rather than copied. GUEST_OS_ID goes first: the
+    /// hypercall page cannot become live before it (TLFS 3.13).
+    pub fn import_state(&self, state: &HypervMigrateState) {
+        self.ref_count_base
+            .store(state.time_ref_count, Ordering::Relaxed);
+        let mut inner = self.inner.lock().unwrap();
+        inner.crash_p = state.crash_p;
+        self.handle_wr_guest_os_id(&mut inner, state.guest_os_id);
+        self.handle_wr_hypercall(&mut inner, state.hypercall);
+        if self.features.reference_tsc {
+            self.handle_wr_reference_tsc(&mut inner, state.reference_tsc);
+        }
+    }
+
     /// Drop overlay pages and restore the original guest contents.
     ///
-    /// Called before VM reset and before live migration so the guest
-    /// memory image being copied does not contain our overlay data.
+    /// The migration source calls this before the final RAM pass, so
+    /// the memory image the destination receives holds the guest's own
+    /// bytes and not ours. The destination reinstalls both overlays
+    /// from the MSR values in [`Self::import_state`].
     pub fn pause_overlays(&self) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(ov) = inner.hypercall_overlay.take() {
@@ -340,13 +418,6 @@ impl HyperV {
         if let Some(ov) = inner.reference_tsc_overlay.take() {
             overlay::remove(&self.physmap, &ov);
         }
-    }
-
-    /// Reset all guest-visible state (called on guest reboot).
-    pub fn reset(&self) {
-        self.pause_overlays();
-        let mut inner = self.inner.lock().unwrap();
-        *inner = Inner::new();
     }
 }
 
@@ -368,8 +439,7 @@ impl MsrHandler for HyperV {
             // Read-only counter; gated on the reference-TSC feature
             // because TLFS leaf 0x4000_0003 EAX bit 1 governs both.
             HV_X64_MSR_TIME_REF_COUNT if self.features.reference_tsc => {
-                let elapsed_100ns = self.boot.elapsed().as_nanos() / 100;
-                RdmsrOutcome::Handled(elapsed_100ns as u64)
+                RdmsrOutcome::Handled(self.time_ref_count())
             }
             HV_X64_MSR_REFERENCE_TSC if self.features.reference_tsc => {
                 RdmsrOutcome::Handled(inner.msr_reference_tsc.raw())
@@ -482,5 +552,173 @@ fn cpuid_entry(
         vce_ecx: ecx,
         vce_edx: edx,
         _pad: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts the records a guest earns, so a test can show a WRMSR
+    /// loop does not log in that loop.
+    struct CountingDrain(Arc<AtomicUsize>);
+
+    impl slog::Drain for CountingDrain {
+        type Ok = ();
+        type Err = slog::Never;
+
+        fn log(
+            &self,
+            record: &slog::Record<'_>,
+            _values: &slog::OwnedKVList,
+        ) -> Result<(), Self::Err> {
+            if record.level().is_at_least(slog::Level::Info) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    fn hyperv(log: Logger) -> Arc<HyperV> {
+        HyperV::new(log, Arc::new(PhysMap::new()), Features::default())
+    }
+
+    fn counting() -> (Arc<HyperV>, Arc<AtomicUsize>) {
+        use slog::Drain;
+        let count = Arc::new(AtomicUsize::new(0));
+        let log = Logger::root(CountingDrain(count.clone()).fuse(), slog::o!());
+        (hyperv(log), count)
+    }
+
+    #[test]
+    fn the_crash_msrs_are_advertised_in_leaf_3_edx() {
+        // Windows and Linux both test this bit before they write the
+        // crash MSRs, so without it the BSOD payload never arrives.
+        let hv = hyperv(Logger::root(slog::Discard, slog::o!()));
+        let mut entries = Vec::new();
+        hv.add_cpuid(&mut entries);
+        let leaf3 = entries
+            .iter()
+            .find(|e| e.vce_function == 0x4000_0003)
+            .expect("leaf 0x4000_0003");
+        assert_ne!(leaf3.vce_edx & HvLeaf3Edx::GUEST_CRASH_MSRS.bits(), 0);
+    }
+
+    #[test]
+    fn a_crash_ctl_loop_cannot_flood_the_log() {
+        let (hv, count) = counting();
+        for _ in 0..1000 {
+            assert!(matches!(
+                hv.wrmsr(0, HV_X64_MSR_CRASH_CTL, HV_CRASH_CTL_NOTIFY),
+                WrmsrOutcome::Handled
+            ));
+        }
+        let logged = count.load(Ordering::Relaxed);
+        assert!(logged > 0, "the first crash must be reported");
+        assert!(logged <= CRASH_LOG_BURST as usize, "{logged} records");
+    }
+
+    #[test]
+    fn crash_ctl_without_notify_reports_nothing() {
+        let (hv, count) = counting();
+        assert!(matches!(
+            hv.wrmsr(0, HV_X64_MSR_CRASH_CTL, 0),
+            WrmsrOutcome::Handled
+        ));
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
+    /// Enough guest memory for both overlay pages.
+    const GPA: u64 = 0x1000;
+    const LEN: usize = 0x10000;
+
+    fn enlightenment() -> Arc<HyperV> {
+        let physmap =
+            Arc::new(PhysMap::new_anon(GPA, LEN).expect("guest memory"));
+        HyperV::new(
+            Logger::root(slog::Discard, slog::o!()),
+            physmap,
+            Features {
+                tsc_freq_hz: 3_000_000_000,
+                ..Features::default()
+            },
+        )
+    }
+
+    /// The hypercall MSR with the Enabled bit and a page at `gpa`.
+    fn hypercall_msr(gpa: u64) -> u64 {
+        gpa | MsrHypercallValue::ENABLED
+    }
+
+    /// What a guest RDMSR reads back. `RdmsrOutcome` carries no
+    /// equality, so the value is taken out here.
+    fn read(hv: &HyperV, msr: u32) -> u64 {
+        match hv.rdmsr(0, msr) {
+            RdmsrOutcome::Handled(value) => value,
+            other => panic!("msr {msr:#x} was not handled: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_msr_state_survives_an_export_and_import() {
+        let source = enlightenment();
+        source.wrmsr(0, HV_X64_MSR_GUEST_OS_ID, 0x8100_0000_0000_0001);
+        source.wrmsr(0, HV_X64_MSR_HYPERCALL, hypercall_msr(0x2000));
+        source.wrmsr(0, HV_X64_MSR_REFERENCE_TSC, 0x3000 | 1);
+        source.wrmsr(0, HV_X64_MSR_CRASH_P0, 0xDEAD);
+
+        let state = source.export_state();
+        let dest = enlightenment();
+        dest.import_state(&state);
+
+        assert_eq!(read(&dest, HV_X64_MSR_GUEST_OS_ID), 0x8100_0000_0000_0001);
+        assert_eq!(read(&dest, HV_X64_MSR_HYPERCALL), hypercall_msr(0x2000));
+        assert_eq!(read(&dest, HV_X64_MSR_CRASH_P0), 0xDEAD);
+    }
+
+    #[test]
+    fn the_hypercall_overlay_is_reinstalled_from_the_msr() {
+        // The source drops its overlays before the final RAM pass, so
+        // the destination has to rebuild the page rather than receive
+        // it.
+        let source = enlightenment();
+        source.wrmsr(0, HV_X64_MSR_GUEST_OS_ID, 1);
+        source.wrmsr(0, HV_X64_MSR_HYPERCALL, hypercall_msr(0x2000));
+        let state = source.export_state();
+
+        let dest = enlightenment();
+        dest.import_state(&state);
+        assert!(
+            dest.inner.lock().unwrap().hypercall_overlay.is_some(),
+            "the destination must hold the hypercall page",
+        );
+    }
+
+    #[test]
+    fn the_reference_counter_never_runs_backwards() {
+        // A monotonic partition counter that restarts at zero is a
+        // counter the guest sees go backwards.
+        let source = enlightenment();
+        let state = HypervMigrateState {
+            time_ref_count: 500_000_000,
+            ..source.export_state()
+        };
+
+        let dest = enlightenment();
+        assert!(dest.time_ref_count() < 500_000_000, "a fresh VM starts low");
+        dest.import_state(&state);
+        assert!(
+            dest.time_ref_count() >= 500_000_000,
+            "the counter must continue from the source's value",
+        );
+    }
+
+    #[test]
+    fn a_guest_that_never_used_the_enlightenment_carries_nothing() {
+        let state = enlightenment().export_state();
+        assert_eq!(state.guest_os_id, 0);
+        assert_eq!(state.hypercall, 0);
+        assert_eq!(state.crash_p, [0; 5]);
     }
 }

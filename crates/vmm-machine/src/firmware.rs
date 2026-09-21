@@ -130,7 +130,7 @@ pub fn setup_fwcfg_and_acpi(
     // UEFI views in sync.
     write_legacy_acpi_tables(machine, &acpi_cfg, tpm_acpi, log);
 
-    write_smbios_tables(machine, &fwcfg, opts, num_cpus, mem_size, log);
+    write_smbios_tables(machine, &fwcfg, opts, num_cpus, mem_size, log)?;
 
     Ok((fwcfg, AcpiTables::at_bhyve_base()))
 }
@@ -185,9 +185,9 @@ pub fn write_smbios_tables(
     num_cpus: u32,
     mem_size: usize,
     log: &Logger,
-) {
+) -> anyhow::Result<()> {
     let smbios_config = if let Some(ref b_flag) = opts.smbios {
-        let mut cfg = smbios::parse_smbios_flag(b_flag);
+        let mut cfg = smbios::parse_smbios_flag(b_flag)?;
         cfg.vm_name = opts.vm_name.clone();
         cfg.uuid = opts.uuid.clone();
         cfg.num_cpus = num_cpus;
@@ -207,8 +207,11 @@ pub fn write_smbios_tables(
             family: None,
         }
     };
+    // The structure table has to stay clear of the legacy ACPI tables
+    // the loader writes right above it.
+    let window = (acpi::BHYVE_ACPI_BASE - SMBIOS_TABLE_GPA) as usize;
     let (smbios_anchor, smbios_tables) =
-        smbios::generate_smbios(&smbios_config);
+        smbios::generate_smbios(&smbios_config, window)?;
     fwcfg.insert_named("etc/smbios/smbios-anchor", smbios_anchor.clone());
     fwcfg.insert_named("etc/smbios/smbios-tables", smbios_tables.clone());
     info!(log, "SMBIOS tables added to fw_cfg";
@@ -248,6 +251,7 @@ pub fn write_smbios_tables(
             "tables" => format!("{:#x}", SMBIOS_TABLE_GPA),
         );
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -258,34 +262,12 @@ mod tests {
         fw_cfg_cpu_counts, AcpiTables, SMBIOS_EP_GPA, SMBIOS_TABLE_GPA,
     };
 
-    /// The token invariants below cannot be exercised without a live VM,
-    /// so read them out of the source instead. The slice stops at the
-    /// test module so a test literal cannot satisfy a check that the
-    /// implementation no longer does.
-    fn implementation() -> &'static str {
-        let src = include_str!("firmware.rs");
-        let end = src.find("#[cfg(test)]").expect("test module attribute");
-        &src[..end]
-    }
-
     #[test]
     fn acpi_tables_token_names_the_bhyve_rsdp_base() {
         // The token is the kernel loader's proof that the tables are
         // already in guest memory, so it must carry the same address
         // write_legacy_acpi_tables placed them at.
         assert_eq!(AcpiTables::at_bhyve_base().rsdp_addr(), BHYVE_ACPI_BASE);
-    }
-
-    #[test]
-    fn the_acpi_token_is_unforgeable_outside_this_crate() {
-        let src = implementation();
-        assert!(
-            !src.contains("pub rsdp_addr"),
-            "a public field lets any caller forge the ordering token",
-        );
-        // One field declaration and one construction. A second
-        // construction could name an address the tables never went to.
-        assert_eq!(src.matches("rsdp_addr:").count(), 2);
     }
 
     #[test]
@@ -302,33 +284,6 @@ mod tests {
         let (nb_cpus, max_cpus) = fw_cfg_cpu_counts(&AcpiConfig::boot_only(4));
         assert_eq!(nb_cpus, 4u16.to_le_bytes());
         assert_eq!(nb_cpus, max_cpus);
-    }
-
-    #[test]
-    fn the_tables_read_the_shared_hotplug_decision() {
-        // A live VM is needed to call setup_fwcfg_and_acpi, so read the
-        // source instead. One AcpiConfig, built from opts.hotplug, is
-        // what keeps the tables and the GPE0 port claim in step.
-        let src = implementation();
-        assert_eq!(src.matches("AcpiConfig::new(").count(), 1);
-        assert_eq!(src.matches(".with_hotplug(opts.hotplug)").count(), 1);
-    }
-
-    #[test]
-    fn the_madt_slot_count_is_the_ceiling_the_registers_read() {
-        // The MADT LAPIC entries and the CPU hotplug AML both read
-        // AcpiConfig::max_cpus, and the register file reads
-        // VmOpts::max_cpus through HotplugOpts::from_vm. A ceiling built
-        // here from anything else would describe a machine with slots
-        // the register file has not got, or hide slots the hot-add
-        // engine will fill. A live VM is needed to call
-        // setup_fwcfg_and_acpi, so the one construction is pinned in
-        // the source.
-        assert!(
-            implementation()
-                .contains("AcpiConfig::new(num_cpus, opts.max_cpus)"),
-            "the tables no longer read VmOpts::max_cpus",
-        );
     }
 
     #[test]

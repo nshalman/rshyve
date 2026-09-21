@@ -19,7 +19,7 @@ use vmm_devices::QuiesceGate;
 use super::access::BackendBarrier;
 use super::io::{self, BOUNCE_BYTES};
 use super::{bits, discard, probes, ChainBuf, DiskLimits};
-use crate::access::GuestAccess;
+use crate::access::{GuestAccess, RingTag};
 use crate::queue::VirtioCompletion;
 
 /// Completions a worker gathers before it takes the `VirtioCompletion`
@@ -34,10 +34,10 @@ pub(super) struct BlkIoRequest {
     pub(super) chain: Vec<ChainBuf>,
     pub(super) head: u16,
     pub(super) completion: Arc<VirtioCompletion>,
-    /// Device epoch this request was dispatched under. A worker drops
-    /// the request when it no longer matches: the chain and the
+    /// Ring and generation this request was dispatched under. A worker
+    /// drops the request when it no longer matches: the chain and the
     /// completion both point at a ring the driver has since torn down.
-    pub(super) epoch: u64,
+    pub(super) tag: RingTag,
 }
 
 /// A one-shot hook a test installs to pin an interleaving.
@@ -188,7 +188,7 @@ fn run_batch(
     carried: &mut Option<BlkIoRequest>,
 ) {
     let completion = Arc::clone(&first.completion);
-    let epoch = first.epoch;
+    let tag = first.tag;
     done.clear();
 
     let mut next = Some(first);
@@ -205,7 +205,7 @@ fn run_batch(
             // A reset installs a fresh completion, so a request from
             // the other side of one must start its own pass.
             Ok(more)
-                if more.epoch == epoch
+                if more.tag == tag
                     && Arc::ptr_eq(&more.completion, &completion) =>
             {
                 next = Some(more)
@@ -218,7 +218,7 @@ fn run_batch(
         }
     }
 
-    publish(ctx, &completion, epoch, done);
+    publish(ctx, &completion, tag, done);
 }
 
 /// Publish the finished results, then raise the interrupt outside the
@@ -226,7 +226,7 @@ fn run_batch(
 fn publish(
     ctx: &WorkerCtx,
     completion: &Arc<VirtioCompletion>,
-    epoch: u64,
+    tag: RingTag,
     done: &[(u16, u32)],
 ) {
     if done.is_empty() {
@@ -237,7 +237,7 @@ fn publish(
     let raise = {
         // A reset between the last copy and here takes the ring away,
         // so the results go nowhere.
-        let Some(_session) = ctx.access.enter(epoch) else {
+        let Some(_session) = ctx.access.enter(tag) else {
             return;
         };
         completion.publish_batch(done)
@@ -245,7 +245,7 @@ fn publish(
     #[cfg(test)]
     run_park(&ctx.parks.before_raise);
     if raise {
-        ctx.access.deliver(epoch, || completion.signal());
+        ctx.access.deliver(tag, || completion.signal());
     }
 }
 
@@ -273,7 +273,7 @@ pub(super) fn run_request(
         _ => (bits::VIRTIO_BLK_S_UNSUPP, 1),
     };
 
-    let _session = ctx.access.enter(req.epoch)?;
+    let _session = ctx.access.enter(req.tag)?;
     io::write_status(&ctx.physmap, &req.chain, status);
     probes::vioblk_complete!(|| (req.head, status));
     Some((req.head, used_len))
@@ -309,7 +309,7 @@ fn read_request(
             return Some((bits::VIRTIO_BLK_S_IOERR, 1));
         };
         {
-            let _ticket = ctx.backend.admit(req.epoch, false)?;
+            let _ticket = ctx.backend.admit(&ctx.access, req.tag, false)?;
             #[cfg(test)]
             run_park(&ctx.parks.at_backend);
             // A short read or an error leaves the tail of the buffer
@@ -318,7 +318,7 @@ fn read_request(
                 return Some((bits::VIRTIO_BLK_S_IOERR, 1));
             }
         }
-        let _session = ctx.access.enter(req.epoch)?;
+        let _session = ctx.access.enter(req.tag)?;
         if !io::scatter(&ctx.physmap, &req.chain, moved, buf) {
             return Some((bits::VIRTIO_BLK_S_IOERR, 1));
         }
@@ -354,7 +354,7 @@ fn write_request(
         let buf = bounce.take(total - moved);
         let n = buf.len();
         {
-            let _session = ctx.access.enter(req.epoch)?;
+            let _session = ctx.access.enter(req.tag)?;
             // A partial snapshot would put the last request's bytes on
             // the disk, so the write is abandoned instead.
             if !io::gather(&ctx.physmap, &req.chain, moved, buf) {
@@ -364,7 +364,7 @@ fn write_request(
         let Some(at) = base.checked_add(moved as u64) else {
             return Some((bits::VIRTIO_BLK_S_IOERR, 1));
         };
-        let _ticket = ctx.backend.admit(req.epoch, true)?;
+        let _ticket = ctx.backend.admit(&ctx.access, req.tag, true)?;
         #[cfg(test)]
         run_park(&ctx.parks.at_backend);
         if !io::write_backend(file, at, buf) {
@@ -383,7 +383,7 @@ fn flush_request(
     // A flush commits what is already on the disk, so a stale one
     // cannot put the wrong bytes in a sector. It waits for the older
     // writes but does not hold the next session behind itself.
-    let _ticket = ctx.backend.admit(req.epoch, false)?;
+    let _ticket = ctx.backend.admit(&ctx.access, req.tag, false)?;
     if file.sync_data().is_ok() {
         Some((bits::VIRTIO_BLK_S_OK, 1))
     } else {
@@ -398,13 +398,13 @@ fn dwz_request(
     req: &BlkIoRequest,
 ) -> Option<(u8, u32)> {
     let plan = {
-        let _session = ctx.access.enter(req.epoch)?;
+        let _session = ctx.access.enter(req.tag)?;
         discard::plan(limits, req.rtype, &req.chain, &ctx.physmap)
     };
     match plan {
         discard::Plan::Settled(status) => Some((status, 1)),
         discard::Plan::Zero(ranges) => {
-            let _ticket = ctx.backend.admit(req.epoch, true)?;
+            let _ticket = ctx.backend.admit(&ctx.access, req.tag, true)?;
             Some((discard::zero(file, &ranges), 1))
         }
     }

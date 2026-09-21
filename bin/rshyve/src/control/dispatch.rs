@@ -24,7 +24,7 @@ use super::migrate::{
     migration_source_guard,
 };
 use super::protocol::{Command, Response};
-use super::{VmController, VmRunState};
+use super::{StopFailure, VmController, VmRunState};
 
 pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
     if let Some(response) =
@@ -56,7 +56,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                     stuck,
                 ));
             }
-            match ctrl.hdl.pause() {
+            match ctrl.hold_pause() {
                 Ok(()) => {
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Paused);
@@ -78,7 +78,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             }
             // Resume device workers BEFORE vCPUs so interrupts can be delivered
             ctrl.resume_devices();
-            match ctrl.hdl.resume() {
+            match ctrl.release_pause() {
                 Ok(()) => {
                     let mut r = Response::ok();
                     r.state = Some(VmRunState::Running);
@@ -93,55 +93,9 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             }
         }
 
-        Command::Shutdown => {
-            let cur = ctrl.state();
-            if cur != VmRunState::Running && cur != VmRunState::Paused {
-                return Response::err("VM is not running or paused");
-            }
-            // If paused, resume first so vCPUs can receive the suspend
-            if ctrl.begin_stop() {
-                // best-effort: if resume fails, suspend below will also fail
-                let _ = ctrl.hdl.resume();
-            }
+        Command::Shutdown => latch_stop(ctrl, SuspendHow::PowerOff, "shutdown"),
 
-            match ctrl.hdl.suspend(SuspendHow::PowerOff, 0) {
-                Ok(_) => {
-                    let mut r = Response::ok();
-                    r.state = Some(VmRunState::Stopping);
-                    r
-                }
-                Err(e) => {
-                    ctrl.state.store(cur as u8, Ordering::Release);
-                    error!(ctrl.log, "shutdown failed"; "error" => %e);
-                    Response::err("suspend ioctl failed")
-                }
-            }
-        }
-
-        Command::Reset => {
-            let cur = ctrl.state();
-            if cur != VmRunState::Running && cur != VmRunState::Paused {
-                return Response::err("VM is not running or paused");
-            }
-            // If paused, resume first so vCPUs can receive the suspend
-            if ctrl.begin_stop() {
-                // best-effort: if resume fails, suspend below will also fail
-                let _ = ctrl.hdl.resume();
-            }
-
-            match ctrl.hdl.suspend(SuspendHow::Reset, -1) {
-                Ok(_) => {
-                    let mut r = Response::ok();
-                    r.state = Some(VmRunState::Stopping);
-                    r
-                }
-                Err(e) => {
-                    ctrl.state.store(cur as u8, Ordering::Release);
-                    error!(ctrl.log, "reset failed"; "error" => %e);
-                    Response::err("suspend ioctl failed")
-                }
-            }
-        }
+        Command::Reset => latch_stop(ctrl, SuspendHow::Reset, "reset"),
 
         Command::Stop => {
             let cur = ctrl.state();
@@ -172,23 +126,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                 };
             }
 
-            if ctrl.begin_stop() {
-                // best-effort: if resume fails, suspend below will also fail
-                let _ = ctrl.hdl.resume();
-            }
-
-            match ctrl.hdl.suspend(SuspendHow::Halt, 0) {
-                Ok(_) => {
-                    let mut r = Response::ok();
-                    r.state = Some(VmRunState::Stopping);
-                    r
-                }
-                Err(e) => {
-                    ctrl.state.store(cur as u8, Ordering::Release);
-                    error!(ctrl.log, "stop failed"; "error" => %e);
-                    Response::err("suspend ioctl failed")
-                }
-            }
+            latch_stop(ctrl, SuspendHow::Halt, "stop")
         }
 
         Command::MigrateSource {
@@ -196,11 +134,15 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             zfs_barrier,
         } => migrate_source(ctrl, target_addr, zfs_barrier),
 
-        Command::MigrateDest { listen_addr } => migrate_dest(ctrl, listen_addr),
+        Command::MigrateDest {
+            listen_addr,
+            allow_cpu_feature_mismatch,
+        } => migrate_dest(ctrl, listen_addr, allow_cpu_feature_mismatch),
 
+        // The listener answers both of these itself, as raw text rather
+        // than a typed Response. This arm is what a listener that
+        // stopped doing so would fall back to.
         Command::Metrics | Command::MetricsPrometheus => {
-            // Metrics are returned as raw text, not via the typed
-            // Response struct. The caller handles this specially.
             let mut r = Response::ok();
             r.state = Some(ctrl.state());
             r
@@ -220,14 +162,16 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
         // share this process's uid and be in this zone or the global
         // zone.
         Command::DeviceAdd { spec } => match ctrl.hotplug.pci.as_ref() {
-            Some(engine) => added(engine.add_device(&spec)),
+            Some(engine) => hot_add(ctrl, || added(engine.add_device(&spec))),
             None => hotplug_disabled(),
         },
 
         // Advisory: the device leaves when the guest runs _EJ0, and
         // never before.
         Command::DeviceRemove { id } => match ctrl.hotplug.pci.as_ref() {
-            Some(engine) => removing(&id, engine.request_remove(&id)),
+            Some(engine) => {
+                hot_add(ctrl, || removing(&id, engine.request_remove(&id)))
+            }
             None => hotplug_disabled(),
         },
 
@@ -276,6 +220,42 @@ fn hot_add(ctrl: &VmController, add: impl FnOnce() -> Response) -> Response {
     match hot_add_blocked(ctrl.state()) {
         Some(refusal) => refusal,
         None => add(),
+    }
+}
+
+/// Latch a stop on a running or paused VM and report what happened.
+///
+/// One helper for `shutdown`, `reset` and `stop`: the three differ only
+/// in the `SuspendHow` they latch, and three copies of the ordering had
+/// already drifted from the one [`VmController::latch_stop`] documents.
+fn latch_stop(
+    ctrl: &Arc<VmController>,
+    how: SuspendHow,
+    what: &str,
+) -> Response {
+    let cur = ctrl.state();
+    if cur != VmRunState::Running && cur != VmRunState::Paused {
+        return Response::err("VM is not running or paused");
+    }
+
+    match ctrl.latch_stop(how) {
+        Ok(state) => {
+            let mut r = Response::ok();
+            r.state = Some(state);
+            r
+        }
+        Err(StopFailure::NotLatched(e)) => {
+            error!(ctrl.log, "{what} failed"; "error" => %e);
+            Response::err("suspend ioctl failed")
+        }
+        // The guest is going to stop; it just has not been let back
+        // into the kernel to see it. Saying the stop failed would send
+        // the operator after the wrong thing.
+        Err(StopFailure::NotReleased(e)) => {
+            error!(ctrl.log, "{what} latched but the VM did not resume";
+                "error" => %e);
+            Response::err("the stop is latched but the VM did not resume")
+        }
     }
 }
 

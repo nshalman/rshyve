@@ -94,9 +94,13 @@ fn main() {
     // The stamp records how the archive in OUT_DIR was built. OUT_DIR
     // survives a change to this file, so a bare "already built" marker
     // would keep handing back an archive linked against the wrong
-    // library, or compiled with flags this file no longer passes.
+    // library, or built with options this file no longer passes.
     let marker = build_dir.join(".vmm-tpm-built.stamp");
-    let fingerprint = format!("{}\ncflags {cflags}", crypto.fingerprint());
+    let fingerprint = format!(
+        "{}\ncflags {cflags}\nconfigure {}",
+        crypto.fingerprint(),
+        CONFIGURE_ARGS.join(" "),
+    );
     if std::fs::read_to_string(&marker).ok().as_deref() != Some(&fingerprint) {
         copy_tree(&src, &work_src);
         apply_patches(&patches, &work_src);
@@ -439,15 +443,9 @@ fn run_configure(
     }
 
     let mut cmd = Command::new(&configure);
-    cmd.args([
-        "--with-openssl",
-        "--with-tpm2",
-        "--disable-hardening",
-        "--enable-static",
-        "--disable-shared",
-    ])
-    .env("CFLAGS", &cflags)
-    .current_dir(build);
+    cmd.args(CONFIGURE_ARGS)
+        .env("CFLAGS", &cflags)
+        .current_dir(build);
     if !ldflags.is_empty() {
         cmd.env("LDFLAGS", &ldflags);
     }
@@ -457,6 +455,16 @@ fn run_configure(
     let status = cmd.status().expect("spawn configure");
     assert!(status.success(), "libtpms configure failed");
 }
+
+/// Hardening is left enabled: this C code parses guest TPM commands.
+/// Every flag it adds is behind an autoconf probe, so a compiler or
+/// linker that refuses one drops that one and keeps the rest.
+const CONFIGURE_ARGS: &[&str] = &[
+    "--with-openssl",
+    "--with-tpm2",
+    "--enable-static",
+    "--disable-shared",
+];
 
 /// Run pkg-config and return its trimmed stdout, or an empty string if
 /// it is missing or fails.

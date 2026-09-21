@@ -82,6 +82,13 @@ pub trait GuestStop: Send + Sync + 'static {
 /// over that socket.
 pub struct HdlStop(Arc<VmmHdl>);
 
+/// The `source` a suspend that did not come from a guest CPU carries.
+///
+/// `VM_SUSPEND` records it as the requesting vCPU, and the kernel reads
+/// -1 as "a device or the VMM". Zero names guest CPU 0, so a stop the
+/// operator asked for was reported against a CPU that did not ask.
+pub const SUSPEND_SOURCE_VMM: i32 = -1;
+
 impl HdlStop {
     pub fn new(hdl: Arc<VmmHdl>) -> Self {
         Self(hdl)
@@ -90,11 +97,15 @@ impl HdlStop {
 
 impl GuestStop for HdlStop {
     fn request_poweroff(&self) -> io::Result<()> {
-        self.0.suspend(SuspendHow::PowerOff, 0).map(|_| ())
+        self.0
+            .suspend(SuspendHow::PowerOff, SUSPEND_SOURCE_VMM)
+            .map(drop)
     }
 
     fn halt(&self) -> io::Result<()> {
-        self.0.suspend(SuspendHow::Halt, 0).map(|_| ())
+        self.0
+            .suspend(SuspendHow::Halt, SUSPEND_SOURCE_VMM)
+            .map(drop)
     }
 }
 
@@ -361,13 +372,22 @@ pub fn install_sigterm_handler(machine: &Machine, log: &Logger) {
 /// The same install over a caller-supplied stop.
 pub fn install_sigterm_handler_with(stop: Arc<dyn GuestStop>, log: &Logger) {
     let log_sig = log.clone();
-    // libc::signal returns SIG_ERR on failure; safe to ignore
-    let _ = unsafe {
+    // SAFETY: the handler only stores an atomic, which is
+    // async-signal-safe, and the cast is the one `signal` takes.
+    let installed = unsafe {
         libc::signal(
             libc::SIGTERM,
             sigterm_handler as *const () as libc::sighandler_t,
         )
     };
+    if installed == libc::SIG_ERR {
+        // SIGTERM keeps its default action, so `vmadm stop` kills the
+        // VMM outright: no teardown, no device halt, and the instance
+        // is left to autodestruct.
+        error!(log, "SIGTERM handler not installed; a stop will kill the \
+            VMM with no teardown";
+            "error" => %io::Error::last_os_error());
+    }
     thread::Builder::new()
         .name("shutdown-watchdog".into())
         .spawn(move || {

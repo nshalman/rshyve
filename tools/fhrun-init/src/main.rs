@@ -9,10 +9,20 @@
 //! 2. Read `/firehyve-spec.json`.
 //! 3. Bring up each NIC the spec describes, with its IPv4 address and,
 //!    for the first NIC that names one, a default route.
-//! 4. `execve()` the payload binary at `spec.bin` with `spec.args` and
-//!    the given environment. argv[0] is the binary's basename.
-//! 5. On any error, trigger ACPI poweroff through `/proc/sysrq-trigger`
-//!    so the VMM reports a clean shutdown.
+//! 4. Fork and `execve()` the payload binary at `spec.bin` with
+//!    `spec.args` and the given environment. argv[0] is the binary's
+//!    basename. Init stays PID 1 and reaps the payload and every
+//!    orphan it leaves.
+//! 5. Write the payload's wait status to `/dev/ttyS1` (COM2) as
+//!    `fhrun-init: payload exit <code>` or `fhrun-init: payload signal
+//!    <n>`, then trigger ACPI poweroff. `fhrun` reads that marker from
+//!    the VMM's stdout and exits with the payload's status. An init
+//!    error powers off with no marker, which `fhrun` reports as its own
+//!    failure.
+//!
+//! The payload must not be PID 1 itself: when PID 1 exits the kernel
+//! panics and, under `panic=-1`, reboots, so the VMM would report a
+//! reset and the status would be lost.
 //!
 //! Cross-compile target: `x86_64-unknown-linux-musl`. The init must be
 //! statically linked because the guest rootfs has no dynamic loader.
@@ -30,6 +40,11 @@ use crate::spec::GuestSpec;
 
 const SPEC_PATH: &str = "/firehyve-spec.json";
 
+/// Exit code the forked child uses when `execve` fails, following the
+/// shell convention: 127 when the binary is missing, 126 otherwise.
+const EXEC_NOT_FOUND: i32 = 127;
+const EXEC_FAILED: i32 = 126;
+
 fn main() -> ! {
     // The earliest point userspace can signal the host from, so it
     // brackets the same interval Firecracker's spec measures ("API call
@@ -41,15 +56,47 @@ fn main() -> ! {
     let _ = do_mount("devtmpfs", "/dev", "devtmpfs", 0);
     ttys1_ping("fhrun-init: init-start\n");
 
-    if let Err(e) = run() {
-        klog(&format!("fhrun-init: fatal: {e}"));
+    match run() {
+        Ok(status) => {
+            let marker = status.marker();
+            klog(&marker);
+            ttys1_ping(&format!("{marker}\n"));
+        }
+        Err(e) => klog(&format!("fhrun-init: fatal: {e}")),
     }
-    // Never return from PID 1. Trigger ACPI poweroff so the VMM sees a
-    // power-off suspend and exits with rc 0.
+    // Never return from PID 1: the kernel panics when init exits.
     poweroff();
 }
 
-fn run() -> Result<(), String> {
+/// How the payload ended, as `waitpid` reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadStatus {
+    Exited(i32),
+    Signaled(i32),
+}
+
+impl PayloadStatus {
+    fn from_wait_status(status: libc::c_int) -> Option<Self> {
+        if libc::WIFEXITED(status) {
+            Some(Self::Exited(libc::WEXITSTATUS(status)))
+        } else if libc::WIFSIGNALED(status) {
+            Some(Self::Signaled(libc::WTERMSIG(status)))
+        } else {
+            None
+        }
+    }
+
+    /// The line `fhrun` parses. Keep it in step with
+    /// `tools/fhrun/src/status.rs`.
+    fn marker(self) -> String {
+        match self {
+            Self::Exited(code) => format!("fhrun-init: payload exit {code}"),
+            Self::Signaled(sig) => format!("fhrun-init: payload signal {sig}"),
+        }
+    }
+}
+
+fn run() -> Result<PayloadStatus, String> {
     ttys1_ping("fhrun-init: stage-run\n");
     klog("fhrun-init: hello");
     ttys1_ping("fhrun-init: stage-klog\n");
@@ -112,9 +159,62 @@ fn run() -> Result<(), String> {
     // `console=` dropped from the cmdline for speed.
     signal_ready();
 
-    exec_user(&spec)?;
-    // Unreachable: exec_user returns only on failure.
-    Err("execve returned without error?".to_string())
+    run_payload(&spec)
+}
+
+/// Fork the payload, then reap children until the payload is among
+/// them.
+///
+/// Every orphan is re-parented to PID 1, so the wait loop takes any
+/// child and only stops on the payload's pid. Children still alive
+/// after that die with the poweroff.
+fn run_payload(spec: &GuestSpec) -> Result<PayloadStatus, String> {
+    let argv = exec_argv(spec)?;
+    // SAFETY: init has one thread, so no lock can be held across the
+    // fork and the child may allocate before it calls `execve`.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(format!("fork: {}", std::io::Error::last_os_error()));
+    }
+    if pid == 0 {
+        exec_child(spec, &argv);
+    }
+    klog(&format!("fhrun-init: payload pid {pid}: {}", spec.bin));
+
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: `status` is a valid out pointer for the call.
+        let reaped = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if reaped < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(format!("waitpid: {e}"));
+        }
+        if reaped != pid {
+            continue;
+        }
+        let Some(outcome) = PayloadStatus::from_wait_status(status) else {
+            // Stopped or continued: the payload is still there.
+            continue;
+        };
+        reap_orphans();
+        return Ok(outcome);
+    }
+}
+
+/// Collect every child that has already exited, without waiting on the
+/// ones that have not.
+fn reap_orphans() {
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: `status` is a valid out pointer for the call.
+        let reaped = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if reaped <= 0 {
+            return;
+        }
+    }
 }
 
 /// Best-effort readiness ping on /dev/ttyS1 (COM2). Boot never fails on
@@ -130,8 +230,10 @@ fn ttys1_ping(msg: &str) {
     // second open() of the still-open port does not deliver, and the fd
     // can never be closed anyway: the 8250 release path drains the TX
     // FIFO, and the virtual UART never signals transmission-complete,
-    // so close() would hang here forever. Leaking one fd is harmless
-    // for a one-shot init that is about to execve.
+    // so the last close() would hang forever. Init holds it until
+    // poweroff. O_CLOEXEC keeps the marker channel out of the payload;
+    // that close is not the last one, so it does not reach the release
+    // path.
     static FD: AtomicI32 = AtomicI32::new(-2);
 
     let mut fd = FD.load(Ordering::Relaxed);
@@ -140,11 +242,14 @@ fn ttys1_ping(msg: &str) {
         // O_NONBLOCK matters here: a blocking open() on a serial device
         // waits for DCD before it returns, and the virtual UART never
         // asserts it. Without this flag fhrun-init hangs forever right
-        // here, before it reaches exec_user().
+        // here, before it reaches the payload.
         fd = unsafe {
             libc::open(
                 path.as_ptr(),
-                libc::O_WRONLY | libc::O_NOCTTY | libc::O_NONBLOCK,
+                libc::O_WRONLY
+                    | libc::O_NOCTTY
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
             )
         };
         FD.store(fd, Ordering::Relaxed);
@@ -158,7 +263,7 @@ fn ttys1_ping(msg: &str) {
 }
 
 /// Wire up stdin/stdout/stderr to /dev/console before the payload is
-/// execve'd, so its prints land on the serial port the host mirrors.
+/// forked, so its prints land on the serial port the host mirrors.
 /// Without this the kernel opens stdio for PID 1 only, and the child
 /// inherits raw fds that need not be a tty.
 fn redirect_stdio() -> Result<(), String> {
@@ -245,37 +350,59 @@ fn chdir(dir: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn exec_user(spec: &GuestSpec) -> Result<(), String> {
-    let bin = CString::new(spec.bin.as_str()).unwrap();
+/// The C strings `execve` takes, built before the fork so the child
+/// allocates nothing.
+struct ExecArgv {
+    bin: CString,
+    argv: Vec<CString>,
+    envp: Vec<CString>,
+}
+
+fn exec_argv(spec: &GuestSpec) -> Result<ExecArgv, String> {
+    let bin = CString::new(spec.bin.as_str())
+        .map_err(|_| "bin path has NUL".to_string())?;
     let basename = Path::new(&spec.bin)
         .file_name()
         .map(|s| s.as_bytes().to_vec())
         .unwrap_or_else(|| spec.bin.as_bytes().to_vec());
-    let argv0 = CString::new(basename).unwrap();
+    let argv0 =
+        CString::new(basename).map_err(|_| "bin path has NUL".to_string())?;
 
-    // argv as Vec<CString> first, then a NULL-terminated array of
-    // pointers into it.
-    let mut argv_c: Vec<CString> = Vec::with_capacity(spec.args.len() + 1);
-    argv_c.push(argv0);
+    let mut argv: Vec<CString> = Vec::with_capacity(spec.args.len() + 1);
+    argv.push(argv0);
     for a in &spec.args {
-        argv_c.push(
+        argv.push(
             CString::new(a.as_str()).map_err(|_| "arg has NUL".to_string())?,
         );
     }
-    let mut argv_p: Vec<*const libc::c_char> =
-        argv_c.iter().map(|c| c.as_ptr()).collect();
-    argv_p.push(std::ptr::null());
+    let envp = build_env(&spec.env)?;
+    Ok(ExecArgv { bin, argv, envp })
+}
 
-    let envp_c = build_env(&spec.env)?;
+/// The forked child: replace this process with the payload, or exit
+/// with the shell's code for a failed exec.
+fn exec_child(spec: &GuestSpec, argv: &ExecArgv) -> ! {
+    let mut argv_p: Vec<*const libc::c_char> =
+        argv.argv.iter().map(|c| c.as_ptr()).collect();
+    argv_p.push(std::ptr::null());
     let mut envp_p: Vec<*const libc::c_char> =
-        envp_c.iter().map(|c| c.as_ptr()).collect();
+        argv.envp.iter().map(|c| c.as_ptr()).collect();
     envp_p.push(std::ptr::null());
 
-    klog(&format!("fhrun-init: execve {}", spec.bin));
-    let rc =
-        unsafe { libc::execve(bin.as_ptr(), argv_p.as_ptr(), envp_p.as_ptr()) };
+    // SAFETY: every pointer comes from a live `CString` in `argv`, and
+    // both arrays end in NULL.
+    unsafe {
+        libc::execve(argv.bin.as_ptr(), argv_p.as_ptr(), envp_p.as_ptr());
+    }
     let e = std::io::Error::last_os_error();
-    Err(format!("execve {}: rc={rc} err={e}", spec.bin))
+    klog(&format!("fhrun-init: execve {}: {e}", spec.bin));
+    let code = if e.raw_os_error() == Some(libc::ENOENT) {
+        EXEC_NOT_FOUND
+    } else {
+        EXEC_FAILED
+    };
+    // SAFETY: `_exit` takes no resources and never returns.
+    unsafe { libc::_exit(code) }
 }
 
 fn build_env(env: &BTreeMap<String, String>) -> Result<Vec<CString>, String> {
@@ -305,8 +432,10 @@ fn klog(msg: &str) {
         let _ = writeln!(f, "{msg}");
     } else {
         // Fall back to stderr so the message is still visible during
-        // early boot, before /dev is wired up.
-        eprintln!("{msg}");
+        // early boot, before /dev is wired up. `eprintln!` panics on
+        // a failed write, and a panic in PID 1 is a kernel panic.
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{msg}");
     }
 }
 
@@ -324,5 +453,35 @@ fn poweroff() -> ! {
     // exits.
     loop {
         unsafe { libc::pause() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wait_status(code: i32, sig: i32) -> libc::c_int {
+        (code << 8) | sig
+    }
+
+    #[test]
+    fn an_exit_is_reported_as_its_code() {
+        let status = PayloadStatus::from_wait_status(wait_status(3, 0));
+        assert_eq!(status, Some(PayloadStatus::Exited(3)));
+        assert_eq!(status.unwrap().marker(), "fhrun-init: payload exit 3");
+    }
+
+    #[test]
+    fn a_signal_death_is_reported_as_its_number() {
+        let status = PayloadStatus::from_wait_status(wait_status(0, 9));
+        assert_eq!(status, Some(PayloadStatus::Signaled(9)));
+        assert_eq!(status.unwrap().marker(), "fhrun-init: payload signal 9");
+    }
+
+    #[test]
+    fn a_stop_is_not_an_end() {
+        // WIFSTOPPED: low byte 0x7f, signal in the next byte.
+        let stopped = 0x7f | (libc::SIGSTOP << 8);
+        assert_eq!(PayloadStatus::from_wait_status(stopped), None);
     }
 }

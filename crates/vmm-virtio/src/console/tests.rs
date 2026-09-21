@@ -194,6 +194,78 @@ fn rx_notify_stashes_chains_without_completing_them() {
     console.halt();
 }
 
+/// Taking the guest's whole receive ring in one pass must still arm
+/// the kick. Linux posts a full ring at probe, so this is the first
+/// pass, and a device that leaves `avail_event` behind the ring is
+/// never kicked again: it spends the chains it holds and then holds
+/// every host byte for a guest it cannot reach.
+#[test]
+fn a_ring_taken_whole_still_arms_the_next_kick() {
+    let (physmap, rx_queue) = make_queue(4, 4, bits::VRING_DESC_F_WRITE, 8);
+    let avail_event_gpa =
+        rx_queue.used_addr() + 4 + u64::from(rx_queue.size()) * 8;
+    let (_dir, console) = console_in_tempdir(Arc::clone(&physmap));
+
+    let mut queues = [rx_queue, VirtQueue::new(4)];
+    console.notify_queue(CONSOLE_RX_QUEUE, &mut queues, &physmap);
+
+    assert_eq!(
+        console.shared.pending_rx.lock().expect("pending").len(),
+        4,
+        "the whole ring should be stashed",
+    );
+    assert_eq!(
+        physmap
+            .lookup(avail_event_gpa, 2)
+            .expect("mapped avail event")
+            .read::<u16>()
+            .expect("read avail event"),
+        4,
+        "avail_event left behind the ring: the guest will never kick again",
+    );
+    console.pause();
+    console.halt();
+}
+
+/// The reader thread copies host bytes into a guest chain and
+/// publishes a used entry, all outside the vCPU. The transport
+/// publishes status 0 the moment `reset` returns, and the illumos
+/// driver reclaims the ring DMA on the next line, so a delivery
+/// already inside the ring has to finish before the reset does.
+#[test]
+fn a_reset_waits_for_a_delivery_already_inside_the_ring() {
+    let (physmap, rx_queue) = make_queue(4, 1, bits::VRING_DESC_F_WRITE, 8);
+    let (_dir, console) = console_in_tempdir(Arc::clone(&physmap));
+    let mut queues = [rx_queue, VirtQueue::new(4)];
+    console.notify_queue(CONSOLE_RX_QUEUE, &mut queues, &physmap);
+
+    // Stands in for a reader thread inside `deliver_rx`.
+    let held = console
+        .shared
+        .access
+        .enter_current(CONSOLE_RX_QUEUE)
+        .expect("a delivery is admitted");
+    let finished = AtomicBool::new(false);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            VirtioDevice::reset(&console);
+            finished.store(true, Ordering::Release);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !finished.load(Ordering::Acquire),
+            "the reset returned while a delivery still held the ring",
+        );
+        drop(held);
+    });
+
+    assert!(finished.load(Ordering::Acquire));
+    // And the delivery that follows finds no ring to write.
+    assert!(console.shared.rx_completion.lock().expect("slot").is_none());
+    console.halt();
+}
+
 #[test]
 fn host_bytes_reach_guest_memory() {
     let (physmap, rx_queue) = make_queue(4, 1, bits::VRING_DESC_F_WRITE, 8);
@@ -224,6 +296,62 @@ fn host_bytes_reach_guest_memory() {
     assert!(raised.load(Ordering::Acquire) >= 1);
 
     console.pause();
+    console.halt();
+}
+
+/// The transmit drain runs on the vCPU under the transport lock, and
+/// the guest picks the descriptor lengths. One kick over a ring of
+/// 4 GiB descriptors is tens of terabytes of copying, during which the
+/// vCPU never leaves the VMM and every other vCPU that touches this
+/// device's registers waits behind it.
+#[test]
+fn a_transmit_kick_copies_at_most_its_byte_budget() {
+    const REGION: usize = 4 * 1024 * 1024;
+    const OVERSIZED: u32 = 3 * 1024 * 1024;
+
+    let physmap = Arc::new(
+        PhysMap::new_anon(DESC_GPA, REGION).expect("create guest memory"),
+    );
+    let mut tx_queue = VirtQueue::new(4);
+    tx_queue.set_addr_modern(DESC_GPA, AVAIL_GPA, USED_GPA);
+    tx_queue.set_event_idx(true);
+    write_desc(&physmap, 0, DATA_GPA, OVERSIZED, 0);
+    publish_avail(&physmap, 0, 0, 1);
+
+    let (_dir, console) = console_in_tempdir(Arc::clone(&physmap));
+    let (peer, device_end) = UnixStream::pair().expect("socketpair");
+    console.shared.replace_client(Some(device_end));
+
+    // Drain the peer so no write blocks, and count what arrives.
+    let reader = std::thread::spawn(move || {
+        let mut peer = peer;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0usize;
+        while let Ok(n) = peer.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        total
+    });
+
+    let mut queues = [VirtQueue::new(4), tx_queue];
+    console.notify_queue(CONSOLE_TX_QUEUE, &mut queues, &physmap);
+
+    // Shuts the device end down, so the reader sees the end of input.
+    console.shared.replace_client(None);
+    let copied = reader.join().expect("the reader finished");
+
+    assert_eq!(
+        copied, TX_BYTES_PER_KICK,
+        "one kick copied {copied} bytes of guest output",
+    );
+    assert_eq!(
+        queues[1].read_used_ring_idx(&physmap),
+        1,
+        "the head never went back, so the ring stalled",
+    );
     console.halt();
 }
 
@@ -518,7 +646,13 @@ fn an_rx_completion_from_the_closed_session_raises_nothing() {
         Arc::clone(&seen),
     ));
 
-    let stale = console.ensure_rx_completion(&rx_queue);
+    let session = console
+        .shared
+        .access
+        .enter_current(CONSOLE_RX_QUEUE)
+        .expect("a delivery is admitted");
+    let stale = console.ensure_rx_completion(&session, &rx_queue);
+    drop(session);
 
     // The whole reset, in the order the transport runs it: the session
     // ends first, then the backend resets, then admission reopens.
@@ -535,7 +669,13 @@ fn an_rx_completion_from_the_closed_session_raises_nothing() {
     // The other half, and it is the worse failure of the two: input
     // for the session running now has to get through, or the device
     // has traded a spurious interrupt for a guest that waits for ever.
-    console.ensure_rx_completion(&rx_queue).signal();
+    let session = console
+        .shared
+        .access
+        .enter_current(CONSOLE_RX_QUEUE)
+        .expect("a delivery is admitted");
+    console.ensure_rx_completion(&session, &rx_queue).signal();
+    drop(session);
     assert_eq!(
         seen.lock().expect("record lock").len(),
         1,

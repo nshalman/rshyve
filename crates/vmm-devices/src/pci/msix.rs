@@ -17,6 +17,41 @@
 
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
+/// One MSI-X table entry on the migration wire.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+pub struct MsixEntryState {
+    pub addr: u64,
+    pub data: u32,
+    /// Vector control word; bit 0 is the per-vector mask.
+    pub control: u32,
+}
+
+/// The whole table on the migration wire: Message Control, every
+/// entry with its mask, and the pending bits. A guest that masked a
+/// vector on the source must find it masked on the destination.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsixMigrateState {
+    pub enabled: bool,
+    pub func_masked: bool,
+    pub entries: Vec<MsixEntryState>,
+    pub pba: Vec<u64>,
+}
+
+/// An MSI-X payload the local table cannot hold.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MsixImportError {
+    #[error("payload has {payload} MSI-X entries, this device has {local}")]
+    EntryCount { payload: usize, local: usize },
+    #[error("payload has {payload} PBA words, this device has {local}")]
+    PbaLength { payload: usize, local: usize },
+    #[error("PBA marks vector {vector} pending, past the {count}-entry table")]
+    PbaPastTable { vector: usize, count: usize },
+}
+
 /// Deliver a message-signalled interrupt.
 ///
 /// Indirected through a trait so the table is unit-testable without a
@@ -199,8 +234,9 @@ impl MsixTable {
         self.inner.lock().expect("msix lock").enabled
     }
 
-    /// Enable MSI-X. Used during migration restore to set the enabled
-    /// state without going through PCI config writes.
+    /// Set the enable bit without a config write. A migration restore
+    /// goes through [`Self::import_state`]; this is for tests that
+    /// need a live table without a driver.
     pub fn set_enabled(&self, enabled: bool) {
         let mut inner = self.inner.lock().expect("msix lock");
         inner.enabled = enabled;
@@ -223,10 +259,9 @@ impl MsixTable {
         (addr, data)
     }
 
-    /// Write the address and data for a vector entry.
-    ///
-    /// Used during migration restore to program the MSI-X table with
-    /// the source's interrupt routing state.
+    /// Program and unmask one vector without a table write. A
+    /// migration restore goes through [`Self::import_state`], which
+    /// keeps the mask; this is for tests that need a live vector.
     pub fn write_entry(&self, vector: u16, addr: u64, data: u64) {
         let mut inner = self.inner.lock().expect("msix lock");
         let idx = vector as usize;
@@ -238,6 +273,73 @@ impl MsixTable {
         inner.entries[idx].data = data as u32;
         // Unmask the vector so it can fire
         inner.entries[idx].control &= !VECTOR_CTRL_MASK;
+    }
+
+    /// Every register a guest can observe, for the migration wire.
+    pub fn export_state(&self) -> MsixMigrateState {
+        let inner = self.inner.lock().expect("msix lock");
+        MsixMigrateState {
+            enabled: inner.enabled,
+            func_masked: inner.func_masked,
+            entries: inner
+                .entries
+                .iter()
+                .map(|e| MsixEntryState {
+                    addr: u64::from(e.addr_lo) | (u64::from(e.addr_hi) << 32),
+                    data: e.data,
+                    control: e.control,
+                })
+                .collect(),
+            pba: inner.pba.clone(),
+        }
+    }
+
+    /// Put a source's table back, masks and pending bits included.
+    ///
+    /// Nothing is delivered here. A pending bit stays pending until
+    /// the guest unmasks it, as it would have on the source. The
+    /// table is only written when the whole payload fits it.
+    pub fn import_state(
+        &self,
+        state: &MsixMigrateState,
+    ) -> Result<(), MsixImportError> {
+        let mut inner = self.inner.lock().expect("msix lock");
+        let count = inner.entries.len();
+        if state.entries.len() != count {
+            return Err(MsixImportError::EntryCount {
+                payload: state.entries.len(),
+                local: count,
+            });
+        }
+        if state.pba.len() != inner.pba.len() {
+            return Err(MsixImportError::PbaLength {
+                payload: state.pba.len(),
+                local: inner.pba.len(),
+            });
+        }
+        for (word, &bits) in state.pba.iter().enumerate() {
+            let mut bits = bits;
+            while bits != 0 {
+                let vector = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if vector >= count {
+                    return Err(MsixImportError::PbaPastTable {
+                        vector,
+                        count,
+                    });
+                }
+            }
+        }
+        for (entry, from) in inner.entries.iter_mut().zip(&state.entries) {
+            entry.addr_lo = from.addr as u32;
+            entry.addr_hi = (from.addr >> 32) as u32;
+            entry.data = from.data;
+            entry.control = from.control;
+        }
+        inner.pba.copy_from_slice(&state.pba);
+        inner.enabled = state.enabled;
+        inner.func_masked = state.func_masked;
+        Ok(())
     }
 
     /// Read from the MSI-X table BAR.
@@ -589,6 +691,82 @@ mod tests {
 
         assert!(sink.recorded().is_empty());
         assert_eq!(table.pba_read(0), 0);
+    }
+
+    #[test]
+    fn a_masked_vector_stays_masked_across_export_and_import() {
+        // Linux masks a vector while it moves its affinity. A vector
+        // that arrives unmasked fires an interrupt the guest believes
+        // cannot arrive.
+        let (source, _) = enabled_table(2);
+        source.table_write(0x10, 0xFEE0_1000);
+        source.table_write(0x18, 0x31);
+        source.table_write(0x1C, 0);
+        source.table_write(0x0, 0xFEE0_2000);
+        source.table_write(0x8, 0x41);
+        source.fire(0);
+        assert_eq!(source.pba_read(0) & 1, 1);
+
+        let (dest, sink) = enabled_table(2);
+        dest.import_state(&source.export_state())
+            .expect("a same-shape table imports");
+
+        assert_eq!(dest.export_state(), source.export_state());
+        dest.fire(0);
+        assert!(sink.recorded().is_empty(), "vector 0 is still masked");
+        dest.fire(1);
+        assert_eq!(sink.recorded(), vec![(0xFEE0_1000, 0x31)]);
+
+        // The pending bit the source recorded leaves on the unmask.
+        dest.table_write(0xC, 0);
+        assert_eq!(sink.recorded().len(), 2);
+        assert_eq!(sink.recorded()[1], (0xFEE0_2000, 0x41));
+    }
+
+    #[test]
+    fn import_keeps_intx_when_the_source_never_enabled_msix() {
+        let sink = RecordingSink::new();
+        let source = MsixTable::new(2, sink.clone());
+        let (dest, _) = enabled_table(2);
+        dest.import_state(&source.export_state()).expect("imports");
+        assert!(!dest.is_enabled());
+    }
+
+    #[test]
+    fn import_refuses_a_table_of_another_shape() {
+        let (source, _) = enabled_table(4);
+        let (dest, _) = enabled_table(2);
+        let before = dest.export_state();
+        assert_eq!(
+            dest.import_state(&source.export_state()),
+            Err(MsixImportError::EntryCount {
+                payload: 4,
+                local: 2
+            })
+        );
+        assert_eq!(
+            dest.export_state(),
+            before,
+            "a refused import writes nothing"
+        );
+
+        let mut state = dest.export_state();
+        state.pba[0] = 1 << 2;
+        assert_eq!(
+            dest.import_state(&state),
+            Err(MsixImportError::PbaPastTable {
+                vector: 2,
+                count: 2
+            })
+        );
+        state.pba = Vec::new();
+        assert_eq!(
+            dest.import_state(&state),
+            Err(MsixImportError::PbaLength {
+                payload: 0,
+                local: 1
+            })
+        );
     }
 
     #[test]

@@ -4,15 +4,12 @@
 
 //! Minimal cpio "newc" archive writer.
 //!
-//! The Linux kernel reads initramfs as a (possibly gzip'd) cpio archive in
-//! the SVR4 "newc" format. The format is dead simple: a 110-byte ASCII
-//! header per entry, followed by the NUL-terminated name (4-byte aligned),
-//! then file data (4-byte aligned). The archive ends with a sentinel entry
-//! named `TRAILER!!!`.
+//! The Linux kernel reads initramfs as a cpio archive in the SVR4
+//! "newc" format, ending with a sentinel entry named `TRAILER!!!`.
 //!
-//! We emit the archive uncompressed. The kernel handles uncompressed cpio
-//! initramfs natively, and skipping gzip avoids one host-side dep and one
-//! guest-side decompress step on every cold start.
+//! The archive is uncompressed. The kernel reads that natively, and
+//! skipping gzip saves one host dependency and one guest decompress on
+//! every cold start.
 
 use std::io::Write;
 
@@ -45,11 +42,8 @@ pub fn write_archive<W: Write>(
     out: &mut W,
     entries: &[Entry<'_>],
 ) -> std::io::Result<()> {
-    // Each regular file/dir/symlink gets a unique inode. The kernel
-    // doesn't strictly require uniqueness for initramfs (it deduplicates
-    // hardlinks by ino+dev pair, which we don't use), but giving each
-    // entry a fresh ino keeps `cpio -t` and friends happy if anyone
-    // inspects the archive.
+    // A fresh ino per entry so an unpacker that deduplicates hardlinks
+    // by ino+dev never merges two of these.
     let mut ino: u32 = 1;
     for e in entries {
         write_entry(out, e, ino)?;
@@ -68,6 +62,11 @@ fn write_entry<W: Write>(
     // namesize includes the trailing NUL.
     let namesize = name_bytes.len() + 1;
     let filesize = e.data.len();
+    // Both fields are 8 hex digits on the wire. A truncated length makes
+    // the kernel read the next header from the middle of this entry's
+    // data, so refuse instead of writing an archive that misparses.
+    let filesize32 = hex_field(filesize, "file size", e.name)?;
+    let namesize32 = hex_field(namesize, "name length", e.name)?;
 
     // Header is 6 bytes of magic plus 13 fields of 8 hex chars,
     // 110 bytes in total.
@@ -78,12 +77,12 @@ fn write_entry<W: Write>(
     write_hex8(out, 0)?; // gid
     write_hex8(out, 1)?; // nlink
     write_hex8(out, 0)?; // mtime
-    write_hex8(out, filesize as u32)?;
+    write_hex8(out, filesize32)?;
     write_hex8(out, 0)?; // devmajor
     write_hex8(out, 0)?; // devminor
     write_hex8(out, 0)?; // rdevmajor
     write_hex8(out, 0)?; // rdevminor
-    write_hex8(out, namesize as u32)?;
+    write_hex8(out, namesize32)?;
     write_hex8(out, 0)?; // check (unused for newc)
 
     // Name + NUL, then padding so total (header + name) is 4-byte aligned.
@@ -109,6 +108,16 @@ fn write_trailer<W: Write>(out: &mut W) -> std::io::Result<()> {
     // Trailer always has ino 0; some unpackers care.
     write_entry(out, &trailer, 0)?;
     Ok(())
+}
+
+/// Narrow a length to the width the newc header carries.
+fn hex_field(value: usize, field: &str, name: &str) -> std::io::Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("cpio entry '{name}': {field} {value} exceeds 4 GiB"),
+        )
+    })
 }
 
 fn write_hex8<W: Write>(out: &mut W, v: u32) -> std::io::Result<()> {
@@ -166,6 +175,29 @@ mod tests {
             .position(|w| w == b"TRAILER!!!")
             .expect("trailer present");
         assert!(trailer_pos > 0);
+    }
+
+    /// A length the header cannot carry would be written truncated,
+    /// and the kernel would then read the next header out of this
+    /// entry's data. The entry itself cannot be built in a test
+    /// without 4 GiB, so the guard is driven directly.
+    ///
+    /// Mutation this kills: `filesize as u32`.
+    #[test]
+    fn a_length_the_header_cannot_carry_is_refused() {
+        assert_eq!(
+            hex_field(u32::MAX as usize, "file size", "app").expect("in range"),
+            u32::MAX
+        );
+
+        let too_big = u32::MAX as usize + 1;
+        let err = hex_field(too_big, "file size", "app")
+            .expect_err("a 4 GiB entry must not be truncated");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let text = err.to_string();
+        assert!(text.contains("file size"), "names no field: {text}");
+        assert!(text.contains("app"), "names no entry: {text}");
     }
 
     #[test]

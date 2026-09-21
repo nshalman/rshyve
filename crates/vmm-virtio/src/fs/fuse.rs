@@ -6,8 +6,13 @@
 //!
 //! Targets FUSE ABI 7.33. All on-the-wire structures are packed little-endian
 //! (host and guest are both little-endian on x86_64).
+//!
+//! Every wire struct derives the zerocopy traits. `IntoBytes` does not
+//! derive on a struct that has padding, so a field added in the wrong
+//! place fails to compile instead of putting uninitialized host bytes on
+//! the wire.
 
-#![allow(dead_code)]
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 // ---------------------------------------------------------------------------
 // Protocol version
@@ -134,7 +139,7 @@ pub const FOPEN_STREAM: u32 = 1 << 4;
 
 /// Every FUSE request begins with this header.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseInHeader {
     pub len: u32,
     pub opcode: u32,
@@ -151,7 +156,7 @@ const _: () = assert!(size_of::<FuseInHeader>() == FUSE_IN_HEADER_SIZE);
 
 /// Every FUSE response begins with this header.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseOutHeader {
     pub len: u32,
     pub error: i32,
@@ -166,7 +171,7 @@ const _: () = assert!(size_of::<FuseOutHeader>() == FUSE_OUT_HEADER_SIZE);
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseAttr {
     pub ino: u64,
     pub size: u64,
@@ -189,7 +194,7 @@ pub struct FuseAttr {
 const _: () = assert!(size_of::<FuseAttr>() == 88);
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseEntryOut {
     pub nodeid: u64,
     pub generation: u64,
@@ -203,7 +208,7 @@ pub struct FuseEntryOut {
 const _: () = assert!(size_of::<FuseEntryOut>() == 128);
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseAttrOut {
     pub attr_valid: u64,
     pub attr_valid_nsec: u32,
@@ -218,7 +223,7 @@ const _: () = assert!(size_of::<FuseAttrOut>() == 104);
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseInitIn {
     pub major: u32,
     pub minor: u32,
@@ -227,7 +232,7 @@ pub struct FuseInitIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseInitOut {
     pub major: u32,
     pub minor: u32,
@@ -245,13 +250,13 @@ pub struct FuseInitOut {
 const _: () = assert!(size_of::<FuseInitOut>() == 64);
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseForgetIn {
     pub nlookup: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseGetattrIn {
     pub flags: u32,
     pub dummy: u32,
@@ -259,14 +264,14 @@ pub struct FuseGetattrIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseOpenIn {
     pub flags: u32,
     pub unused: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseOpenOut {
     pub fh: u64,
     pub open_flags: u32,
@@ -274,7 +279,7 @@ pub struct FuseOpenOut {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseReleaseIn {
     pub fh: u64,
     pub flags: u32,
@@ -283,7 +288,7 @@ pub struct FuseReleaseIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseReadIn {
     pub fh: u64,
     pub offset: u64,
@@ -295,7 +300,7 @@ pub struct FuseReadIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseWriteIn {
     pub fh: u64,
     pub offset: u64,
@@ -307,14 +312,14 @@ pub struct FuseWriteIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseWriteOut {
     pub size: u32,
     pub padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseFlushIn {
     pub fh: u64,
     pub unused: u32,
@@ -323,7 +328,7 @@ pub struct FuseFlushIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseFsyncIn {
     pub fh: u64,
     pub fsync_flags: u32,
@@ -331,28 +336,28 @@ pub struct FuseFsyncIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseAccessIn {
     pub mask: u32,
     pub padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseGetxattrIn {
     pub size: u32,
     pub padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseGetxattrOut {
     pub size: u32,
     pub padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseStatfsOut {
     pub blocks: u64,
     pub bfree: u64,
@@ -369,14 +374,14 @@ pub struct FuseStatfsOut {
 const _: () = assert!(size_of::<FuseStatfsOut>() == 80);
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseMkdirIn {
     pub mode: u32,
     pub umask: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseCreateIn {
     pub flags: u32,
     pub mode: u32,
@@ -385,14 +390,14 @@ pub struct FuseCreateIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseCreateOut {
     pub entry: FuseEntryOut,
     pub open: FuseOpenOut,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseSetattrIn {
     pub valid: u32,
     pub padding: u32,
@@ -413,7 +418,7 @@ pub struct FuseSetattrIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromBytes, Immutable, IntoBytes)]
 pub struct FuseRenameIn {
     pub newdir: u64,
 }
@@ -421,7 +426,7 @@ pub struct FuseRenameIn {
 /// Dirent header written by READDIR; followed by `namelen` bytes of name and
 /// padding to a 64-bit boundary.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, Immutable, IntoBytes)]
 pub struct FuseDirent {
     pub ino: u64,
     pub off: u64,
@@ -438,60 +443,186 @@ pub fn dirent_size(namelen: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers for zero-copy access
+// Open flags
 // ---------------------------------------------------------------------------
+
+/// Linux `O_*` values, as `fuse_open_in.flags` and `fuse_create_in.flags`
+/// carry them.
+///
+/// The guest is Linux, so the numbers on the wire are Linux's whatever
+/// host this server runs on. The host's `libc::O_*` differ: on illumos
+/// `O_APPEND` is 0x08 and `O_EXCL` is 0x400, so masking the wire value
+/// with host constants turned a guest `O_CREAT|O_EXCL` into
+/// `O_CREAT|O_NONBLOCK` and a guest `O_APPEND` into `O_EXCL`.
+pub mod linux_oflags {
+    pub const O_ACCMODE: u32 = 0o3;
+    pub const O_RDONLY: u32 = 0o0;
+    pub const O_WRONLY: u32 = 0o1;
+    pub const O_RDWR: u32 = 0o2;
+    pub const O_CREAT: u32 = 0o100;
+    pub const O_EXCL: u32 = 0o200;
+    pub const O_NOCTTY: u32 = 0o400;
+    pub const O_TRUNC: u32 = 0o1000;
+    pub const O_APPEND: u32 = 0o2000;
+    pub const O_NONBLOCK: u32 = 0o4000;
+    pub const O_DSYNC: u32 = 0o10000;
+    /// `O_ASYNC`, also spelled `FASYNC`. Linux counts it among the
+    /// flags a file may be opened with and FUSE forwards it.
+    pub const O_ASYNC: u32 = 0o20000;
+    pub const O_DIRECT: u32 = 0o40000;
+    pub const O_LARGEFILE: u32 = 0o100000;
+    pub const O_DIRECTORY: u32 = 0o200000;
+    pub const O_NOFOLLOW: u32 = 0o400000;
+    pub const O_NOATIME: u32 = 0o1000000;
+    pub const O_CLOEXEC: u32 = 0o2000000;
+    /// `O_SYNC` is `__O_SYNC | O_DSYNC` on Linux.
+    pub const O_SYNC: u32 = 0o4010000;
+    /// `__FMODE_EXEC`, which Linux sets on the open it does to execute
+    /// a file. It is not an `openat` flag; it only says why the kernel
+    /// is opening.
+    pub const FMODE_EXEC: u32 = 0o40;
+}
+
+/// A guest's open flags, translated to the host's numbering.
+///
+/// Every bit the guest may set is either translated or named as
+/// ignored below; anything else is refused, so a flag this server has
+/// not thought about never reaches `openat` with a host meaning the
+/// guest did not ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenFlags {
+    /// One of the host's `O_RDONLY`, `O_WRONLY` or `O_RDWR`.
+    pub accmode: libc::c_int,
+    pub creat: bool,
+    pub excl: bool,
+    pub trunc: bool,
+    pub append: bool,
+    pub nonblock: bool,
+    pub sync: bool,
+    pub dsync: bool,
+    pub directory: bool,
+    pub nofollow: bool,
+}
+
+/// Linux bits with no effect on the host side of a passthrough.
+///
+/// `O_LARGEFILE` is the only file size on a 64-bit host, `O_NOATIME`
+/// and `O_DIRECT` are advisory, `O_NOCTTY` is for terminals, and
+/// `O_CLOEXEC` is set on every descriptor here regardless.
+///
+/// `O_ASYNC` asks for SIGIO on the guest's own descriptor, which is the
+/// guest kernel's business and not this server's.
+///
+/// `__FMODE_EXEC` is not an open flag at all: Linux sets it on the open
+/// it performs to execute a file, and it reaches the server on every
+/// `execve` off a share. Refusing it fails the exec with EINVAL.
+const IGNORED_LINUX_OFLAGS: u32 = linux_oflags::O_LARGEFILE
+    | linux_oflags::O_NOATIME
+    | linux_oflags::O_DIRECT
+    | linux_oflags::O_NOCTTY
+    | linux_oflags::O_CLOEXEC
+    | linux_oflags::O_ASYNC
+    | linux_oflags::FMODE_EXEC;
+
+impl OpenFlags {
+    /// Translate Linux open flags. `Err` carries the bits this server
+    /// does not know.
+    pub fn from_linux(flags: u32) -> Result<Self, u32> {
+        use linux_oflags as lx;
+        let accmode = match flags & lx::O_ACCMODE {
+            lx::O_RDONLY => libc::O_RDONLY,
+            lx::O_WRONLY => libc::O_WRONLY,
+            lx::O_RDWR => libc::O_RDWR,
+            _ => return Err(flags & lx::O_ACCMODE),
+        };
+        let known = lx::O_ACCMODE
+            | lx::O_CREAT
+            | lx::O_EXCL
+            | lx::O_TRUNC
+            | lx::O_APPEND
+            | lx::O_NONBLOCK
+            | lx::O_SYNC
+            | lx::O_DSYNC
+            | lx::O_DIRECTORY
+            | lx::O_NOFOLLOW
+            | IGNORED_LINUX_OFLAGS;
+        let unknown = flags & !known;
+        if unknown != 0 {
+            return Err(unknown);
+        }
+        let has = |bit: u32| flags & bit == bit;
+        Ok(Self {
+            accmode,
+            creat: has(lx::O_CREAT),
+            excl: has(lx::O_EXCL),
+            trunc: has(lx::O_TRUNC),
+            append: has(lx::O_APPEND),
+            nonblock: has(lx::O_NONBLOCK),
+            sync: has(lx::O_SYNC),
+            dsync: has(lx::O_DSYNC),
+            directory: has(lx::O_DIRECTORY),
+            nofollow: has(lx::O_NOFOLLOW),
+        })
+    }
+
+    /// Whether this open can change the file.
+    ///
+    /// `O_TRUNC` truncates alongside `O_RDONLY` on illumos, so the
+    /// access mode alone does not say.
+    pub fn mutates(&self) -> bool {
+        self.accmode != libc::O_RDONLY || self.trunc || self.creat
+    }
+
+    /// The host flags for the data path: the access mode and the
+    /// modifiers that change how reads and writes behave. Creation
+    /// and lookup flags are the caller's to add.
+    pub fn host_io_flags(&self) -> libc::c_int {
+        let mut out = self.accmode;
+        if self.append {
+            out |= libc::O_APPEND;
+        }
+        if self.trunc {
+            out |= libc::O_TRUNC;
+        }
+        if self.nonblock {
+            out |= libc::O_NONBLOCK;
+        }
+        if self.sync {
+            out |= libc::O_SYNC;
+        }
+        if self.dsync {
+            out |= libc::O_DSYNC;
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for wire access
+// ---------------------------------------------------------------------------
+//
+// The bounds are the safety argument. `Copy` admits a type with padding,
+// whose padding bytes are uninitialized, and a type with invalid bit
+// patterns, such as `bool` or a reference. The caller picks the type, so
+// only a bound the compiler checks per type can refuse either one.
 
 /// Interpret a prefix of `buf` as `T` (little-endian packed).
 ///
-/// Returns `None` if `buf` is too short. Uses a bytewise copy so the result
-/// is valid even if `buf` is misaligned.
-pub fn read_at<T: Copy>(buf: &[u8]) -> Option<T> {
-    let need = size_of::<T>();
-    if buf.len() < need {
-        return None;
-    }
-    let mut out = std::mem::MaybeUninit::<T>::uninit();
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            buf.as_ptr(),
-            out.as_mut_ptr() as *mut u8,
-            need,
-        );
-        Some(out.assume_init())
-    }
+/// Returns `None` if `buf` is too short. Copies bytewise, so the result
+/// is correct even if `buf` is misaligned.
+pub fn read_at<T: FromBytes>(buf: &[u8]) -> Option<T> {
+    T::read_from_prefix(buf).ok().map(|(val, _rest)| val)
 }
 
-/// Serialize `val` by bytewise copy into a freshly allocated vector.
-pub fn bytes_of<T: Copy>(val: &T) -> Vec<u8> {
-    let len = size_of::<T>();
-    let mut v = vec![0u8; len];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            val as *const T as *const u8,
-            v.as_mut_ptr(),
-            len,
-        );
-    }
-    v
+/// Serialize `val` into a freshly allocated vector.
+pub fn bytes_of<T: IntoBytes + Immutable>(val: &T) -> Vec<u8> {
+    val.as_bytes().to_vec()
 }
 
-/// Append a `#[repr(C)] Copy` value to a byte buffer.
-pub fn push_val<T: Copy>(buf: &mut Vec<u8>, val: &T) {
-    let len = size_of::<T>();
-    let start = buf.len();
-    buf.resize(start + len, 0);
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            val as *const T as *const u8,
-            buf.as_mut_ptr().add(start),
-            len,
-        );
-    }
+/// Append a wire value to a byte buffer.
+pub fn push_val<T: IntoBytes + Immutable>(buf: &mut Vec<u8>, val: &T) {
+    buf.extend_from_slice(val.as_bytes());
 }
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Errno translation
@@ -661,6 +792,114 @@ mod tests {
         assert_eq!(back.uid, orig.uid);
         assert_eq!(back.gid, orig.gid);
         assert_eq!(back.pid, orig.pid);
+    }
+
+    /// The trait bounds must not change what the wire carries. Every
+    /// byte of the header, the `padding` field included, has to survive
+    /// `push_val` and come back, and no short prefix may read as a
+    /// header.
+    #[test]
+    fn push_val_then_read_at_reproduces_a_header() {
+        let orig = FuseInHeader {
+            len: FUSE_IN_HEADER_SIZE as u32,
+            opcode: FUSE_WRITE,
+            unique: 0x0102_0304_0506_0708,
+            nodeid: 0x1122_3344_5566_7788,
+            uid: 0xa1a2_a3a4,
+            gid: 0xb1b2_b3b4,
+            pid: 0xc1c2_c3c4,
+            padding: 0xd1d2_d3d4,
+        };
+
+        let mut buf = Vec::new();
+        push_val(&mut buf, &orig);
+        assert_eq!(buf.len(), FUSE_IN_HEADER_SIZE);
+
+        for short in 0..FUSE_IN_HEADER_SIZE {
+            let got: Option<FuseInHeader> = read_at(&buf[..short]);
+            assert!(got.is_none(), "{short} bytes must read as too short");
+        }
+
+        let back: FuseInHeader = read_at(&buf).expect("a full header");
+        assert_eq!(bytes_of(&back), buf);
+    }
+
+    // The literal Linux numbers, not `libc::O_*`: on illumos those are
+    // different values, and that difference is the bug this guards.
+    #[test]
+    fn linux_open_flags_translate_to_host_flags() {
+        let f = OpenFlags::from_linux(0o1 | 0o100 | 0o200).expect("known");
+        assert_eq!(f.accmode, libc::O_WRONLY);
+        assert!(f.creat && f.excl);
+        assert!(!f.append && !f.trunc);
+
+        let f = OpenFlags::from_linux(0o2 | 0o2000 | 0o1000).expect("known");
+        assert_eq!(f.accmode, libc::O_RDWR);
+        assert!(f.append && f.trunc);
+        assert_eq!(
+            f.host_io_flags(),
+            libc::O_RDWR | libc::O_APPEND | libc::O_TRUNC
+        );
+
+        let f = OpenFlags::from_linux(0o200000 | 0o400000).expect("known");
+        assert!(f.directory && f.nofollow);
+        assert_eq!(f.host_io_flags(), libc::O_RDONLY);
+
+        // O_SYNC carries the O_DSYNC bit on Linux; both are set then.
+        let f = OpenFlags::from_linux(0o4010000).expect("known");
+        assert!(f.sync && f.dsync);
+    }
+
+    /// Linux opens a binary for execution with `__FMODE_EXEC` set, so
+    /// refusing that bit fails every `execve` off a share with EINVAL.
+    /// A live guest caught this; no unit test did.
+    /// Linux counts O_ASYNC among the flags a file may be opened with,
+    /// and FUSE forwards it, so refusing it fails the open.
+    #[test]
+    fn an_async_open_is_accepted() {
+        let f =
+            OpenFlags::from_linux(linux_oflags::O_RDWR | linux_oflags::O_ASYNC)
+                .expect("an O_ASYNC open is known");
+
+        assert_eq!(f.accmode, libc::O_RDWR);
+        assert_eq!(f.host_io_flags(), libc::O_RDWR);
+    }
+
+    #[test]
+    fn an_exec_open_is_accepted() {
+        let exec = linux_oflags::O_RDONLY
+            | linux_oflags::O_LARGEFILE
+            | linux_oflags::FMODE_EXEC;
+
+        let f = OpenFlags::from_linux(exec).expect("an exec open is known");
+
+        assert_eq!(f.accmode, libc::O_RDONLY);
+        assert_eq!(f.host_io_flags(), libc::O_RDONLY);
+        assert!(!f.mutates(), "an exec open must not count as a write");
+    }
+
+    #[test]
+    fn ignored_linux_open_flags_are_accepted() {
+        let f = OpenFlags::from_linux(
+            0o100000 | 0o1000000 | 0o40000 | 0o400 | 0o2000000,
+        )
+        .expect("known");
+        assert_eq!(f.host_io_flags(), libc::O_RDONLY);
+    }
+
+    #[test]
+    fn unknown_linux_open_flags_are_refused() {
+        // O_PATH, O_TMPFILE's own bit, and every bit above them.
+        for bits in [0o10000000u32, 0o20000000, 1 << 31, 0o3] {
+            assert_eq!(OpenFlags::from_linux(bits), Err(bits), "{bits:#o}");
+        }
+    }
+
+    #[test]
+    fn a_read_open_with_o_trunc_mutates() {
+        assert!(OpenFlags::from_linux(0o1000).expect("known").mutates());
+        assert!(!OpenFlags::from_linux(0).expect("known").mutates());
+        assert!(OpenFlags::from_linux(0o100).expect("known").mutates());
     }
 
     #[test]

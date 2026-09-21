@@ -21,7 +21,6 @@
 //! is used when a device is created on a migration target and must
 //! import state before starting.
 
-use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -72,102 +71,13 @@ pub enum FlushError {
 /// A device that returns sooner costs only a budget nothing spends.
 pub const DEFAULT_HALT_BUDGET: Duration = Duration::from_secs(5);
 
-/// The state a migration carries for one device.
-///
-/// A device exports the variant it has, and a destination hands every
-/// device every entry: a device matches its own by shape. The wire
-/// format keeps one list per variant.
-#[derive(Debug, Clone)]
-pub enum DeviceMigrateState {
-    /// The queues of one virtio transport, in queue order.
-    VirtioQueues(Vec<VirtioMigrateQueue>),
-    Nvme(NvmeMigrateState),
-}
+mod state;
 
-/// Virtio PCI transport state for migration export/import.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VirtioMigratePciState {
-    /// PCI command register bits that gate BAR decoding and bus mastering.
-    pub command: u16,
-    /// BAR base addresses indexed by BAR number (BAR0..BAR5).
-    pub bar_addrs: [u64; 6],
-}
-
-/// Virtio queue state for migration export/import.
-///
-/// The `serde(default)` fields joined the wire format after the first
-/// release, so a source that predates them still decodes.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct VirtioMigrateQueue {
-    /// The PCI slot of the transport. Not yet on the wire: the device
-    /// exports 0, and a destination matches queue groups by count.
-    #[serde(default)]
-    pub pci_slot: u8,
-    pub queue_idx: u16,
-    pub queue_size: u16,
-    pub desc_addr: u64,
-    pub avail_addr: u64,
-    pub used_addr: u64,
-    pub enabled: bool,
-    pub features: u64,
-    #[serde(default)]
-    pub avail_idx: u16,
-    #[serde(default)]
-    pub used_idx: u16,
-    #[serde(default)]
-    pub msix_addr: u64,
-    #[serde(default)]
-    pub msix_data: u32,
-    /// MSI-X vector number for this queue (VIRTIO_MSI_NO_VECTOR = 0xFFFF if none).
-    #[serde(default = "no_msix_vector")]
-    pub msix_vector: u16,
-    #[serde(default)]
-    pub pci_state: Option<VirtioMigratePciState>,
-}
-
-fn no_msix_vector() -> u16 {
-    0xFFFF
-}
-
-/// NVMe controller state for migration export/import.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct NvmeMigrateState {
-    pub cc: u32,
-    pub csts: u32,
-    pub aqa: u32,
-    pub asq_base: u64,
-    pub acq_base: u64,
-    pub admin_sq: Option<NvmeMigrateSq>,
-    pub admin_cq: Option<NvmeMigrateCq>,
-    pub io_sqs: Vec<Option<NvmeMigrateSq>>,
-    pub io_cqs: Vec<Option<NvmeMigrateCq>>,
-    pub num_io_queues: u16,
-    pub pci_command: u16,
-    pub pci_bar_addrs: [u64; 6],
-    pub msix_entries: Vec<(u64, u64)>,
-    pub msix_enabled: bool,
-}
-
-/// NVMe submission queue state for migration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NvmeMigrateSq {
-    pub base: u64,
-    pub size: u16,
-    pub head: u16,
-    pub tail: u16,
-    pub cq_id: u16,
-}
-
-/// NVMe completion queue state for migration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NvmeMigrateCq {
-    pub base: u64,
-    pub size: u16,
-    pub head: u16,
-    pub tail: u16,
-    pub phase: bool,
-    pub iv: u16,
-}
+pub use state::{
+    DeviceMigrateState, DeviceStateError, DeviceStatePayload,
+    HypervMigrateState, MigratePciState, NvmeMigrateCq, NvmeMigrateSq,
+    NvmeMigrateState, VirtioMigrateQueue, VirtioMigrateState, WireBdf,
+};
 
 /// General trait for emulated devices in the system.
 ///
@@ -246,10 +156,13 @@ pub trait Lifecycle: Send + Sync + 'static {
         Migrator::Empty
     }
 
-    /// Pause device rings before vCPU pause for migration.
-    /// Kernel-accelerated devices (viona) pause their ring threads
-    /// so no entries are consumed between this call and state export.
-    fn pause_for_migration(&self) {}
+    /// Stop the kernel-side ring workers before the vCPUs pause, so
+    /// no entry is consumed between the pause and the export. Only a
+    /// device with rings in the kernel (viona) has anything to do.
+    /// A failure fails the migration.
+    fn pause_for_migration(&self) -> Result<(), DeviceStateError> {
+        Ok(())
+    }
 
     /// Flush any device-level writeback cache to durable storage.
     ///
@@ -271,14 +184,38 @@ pub trait Lifecycle: Send + Sync + 'static {
     }
 
     /// The state a migration carries for this device, or `None` for
-    /// a device with nothing to carry. Default: `None`.
-    fn export_migrate_state(&self) -> Option<DeviceMigrateState> {
-        None
+    /// a device with nothing to carry. A device that cannot read its
+    /// state answers with an error, which fails the migration.
+    fn export_migrate_state(
+        &self,
+    ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {
+        Ok(None)
     }
 
-    /// Take state a source exported. A device ignores a variant that
-    /// is not its own. Default: no-op.
-    fn restore_migrate_state(&self, _state: &DeviceMigrateState) {}
+    /// Take the state this device exported on the source. The caller
+    /// matched the payload to this device by identity, so a payload of
+    /// another kind is an error, and so is one with values this device
+    /// cannot hold.
+    fn restore_migrate_state(
+        &self,
+        state: &DeviceMigrateState,
+    ) -> Result<(), DeviceStateError> {
+        Err(DeviceStateError::WrongKind {
+            want: "none",
+            got: state.kind(),
+        })
+    }
+
+    /// Put back whatever [`Self::pause_for_migration`] stopped, after
+    /// a migration that failed once the guest was already paused.
+    ///
+    /// `resume` alone is not enough for a device whose rings live in
+    /// the kernel: the rings stay stopped and the guest resumes with a
+    /// dead device. A failure is reported but does not stop the
+    /// rollback, which must reach every other device.
+    fn resume_after_migration(&self) -> Result<(), DeviceStateError> {
+        Ok(())
+    }
 
     /// Post-restore kick: called after restore_migrate_state to wake
     /// rings and start interrupt polling. Default: no-op.

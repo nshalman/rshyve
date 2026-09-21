@@ -4,12 +4,10 @@
 
 //! The reset measured where the guest sees it, not at the drain.
 //!
-//! `GuestAccess::drain` is one step of `VirtioDevice::reset`, and a
-//! test pointed at it cannot see a wait the reset does after it. That
-//! is exactly where the wait used to be: a review timed the whole
-//! reset against a parked interrupt and got 1.000191292s where the
-//! drain alone measured nothing. Every measurement here brackets the
-//! whole call.
+//! `GuestAccess::drain` is one step of `VirtioDevice::reset`, so a test
+//! pointed at the drain cannot see a wait the reset does after it, and
+//! that is where an unbounded wait hides. Every measurement here
+//! brackets the whole call.
 
 use super::*;
 
@@ -36,8 +34,7 @@ fn time_reset(fs: &VirtioFs, release: &dyn Fn()) -> Duration {
     })
 }
 
-// The measurement the last review used to prove the reset unbounded,
-// repeated at the same boundary. A worker is held inside the interrupt
+// A worker is held inside the interrupt
 // callback, standing in for an injection the kernel has not finished.
 // The reset must not queue behind it: the illumos driver reclaims the
 // ring the moment its one register write returns.
@@ -185,7 +182,7 @@ fn the_notify_path_hands_the_interrupt_to_the_transport() {
 }
 
 // virtio-fs keeps the same two counters as virtio-blk, and the gap
-// between them is the same. The worker's epoch check is one load, and
+// between them is the same. The worker's check is one load, and
 // a whole reset can run after it passes. What keeps a reply off the
 // next driver is the session the completion handler was built in,
 // which the transport tests in the same step that admits the delivery.
@@ -200,7 +197,10 @@ fn a_completion_from_the_closed_session_raises_nothing() {
 
     // Built the way a queue notification builds it: under permission.
     let handler = || {
-        let session = fs.access.enter_current().expect("a session is open");
+        let session = fs
+            .access
+            .enter_current(FS_REQUEST_QUEUE)
+            .expect("a generation is open");
         fs.get_completion(&session, FS_REQUEST_QUEUE, &queues[req])
     };
     let stale = handler();

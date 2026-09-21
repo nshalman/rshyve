@@ -73,7 +73,7 @@ pub(super) fn addressed_queue() -> VirtQueue {
     queue
 }
 
-fn notify(device: &VirtioViona, queue_idx: u16) {
+pub(super) fn notify(device: &VirtioViona, queue_idx: u16) {
     let mut queues = [
         VirtQueue::new(NET_QUEUE_SIZE),
         VirtQueue::new(NET_QUEUE_SIZE),
@@ -101,6 +101,9 @@ fn recording_poller(steps: &Steps) -> Poller {
                 events: libc::POLLIN,
                 revents: 0,
             };
+            // SAFETY: `pfd` is one live `pollfd` and the count says one,
+            // so poll reads and writes only that element. The thread owns
+            // `stop`, so its descriptor stays open.
             while unsafe { libc::poll(&mut pfd, 1, 10_000) } < 0 {
                 let err = std::io::Error::last_os_error();
                 assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
@@ -377,6 +380,59 @@ fn a_queue_address_write_programs_that_ring() {
     );
 }
 
+/// A legacy driver retires a ring by writing `QUEUE_PFN = 0` and then
+/// frees the pages. A kernel ring left running reads and writes memory
+/// the guest has already put to another use.
+#[test]
+fn retiring_a_ring_resets_it_in_the_kernel() {
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+
+    // What `set_addr_legacy(0)` leaves behind: no addresses.
+    VirtioDevice::queue_addr_set(&device, 1, &VirtQueue::new(NET_QUEUE_SIZE));
+
+    assert_eq!(
+        steps_of(&steps),
+        [Step::RingReset(1)],
+        "the kernel kept the ring the driver retired",
+    );
+    assert_eq!(
+        device.inner.lock().expect("viona lock").ring_state[1],
+        RingState::Init,
+        "a retired ring stayed ready, so the next kick would reach it",
+    );
+}
+
+/// The kernel refuses `RING_INIT` unless the ring is reset, so a ring
+/// reprogrammed without a device reset has to be retired first or the
+/// new addresses never reach the kernel at all.
+#[test]
+fn reprogramming_a_ring_resets_it_before_programming_again() {
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+
+    VirtioDevice::queue_addr_set(&device, 1, &addressed_queue());
+
+    assert_eq!(
+        steps_of(&steps),
+        [
+            Step::RingReset(1),
+            Step::RingInit {
+                ring: 1,
+                size: NET_QUEUE_SIZE,
+                desc: 0x1_0000,
+                avail: 0x2_0000,
+                used: 0x3_0000,
+            },
+        ],
+        "the ring was programmed over while the kernel still ran it",
+    );
+    assert_eq!(
+        device.inner.lock().expect("viona lock").ring_state[1],
+        RingState::Ready,
+    );
+}
+
 #[test]
 fn a_halted_device_programs_no_ring() {
     // The halt destroys the link with the device lock dropped, so a
@@ -635,8 +691,23 @@ fn a_migration_source_reads_the_indices_the_kernel_reports() {
     let device = device_with(Arc::new(TestLink::new(&steps)));
 
     assert_eq!(
-        VirtioDevice::get_kernel_ring_indices(&device, 1),
-        (0x1112, 0x2223),
+        VirtioDevice::kernel_ring_indices(&device, 1).expect("reads"),
+        Some((0x1112, 0x2223)),
+    );
+}
+
+#[test]
+fn a_used_cursor_of_zero_is_still_the_kernel_answer() {
+    // Both cursors count in a u16 and wrap through zero. An export that
+    // read zero as "no answer" would swap in the cursors userspace
+    // keeps, which viona never moves, and the destination would resume
+    // from a point the ring passed long ago.
+    let steps = Steps::default();
+    let device = device_with(Arc::new(TestLink::new(&steps).wrapped_used()));
+
+    assert_eq!(
+        VirtioDevice::kernel_ring_indices(&device, 1).expect("reads"),
+        Some((0x1112, 0)),
     );
 }
 
@@ -651,7 +722,9 @@ fn a_halted_device_reads_no_ring_state() {
     device.halt();
     steps.lock().expect("steps lock").clear();
 
-    assert_eq!(device.get_kernel_ring_state(1), None);
+    device
+        .kernel_ring_state(1)
+        .expect_err("a destroyed link has no state to read");
 
     assert_eq!(
         steps_of(&steps),
@@ -668,19 +741,21 @@ fn a_migration_source_reads_the_state_of_the_ring_it_names() {
     let steps = Steps::default();
     let device = device_with(Arc::new(TestLink::new(&steps)));
 
-    assert_eq!(device.get_kernel_ring_state(1), Some((0x1112, 0x2223)));
+    assert_eq!(
+        device.kernel_ring_state(1).expect("reads"),
+        (0x1112, 0x2223),
+    );
 
     assert_eq!(steps_of(&steps), [Step::RingGetState(1)]);
 }
 
 #[test]
 fn a_restore_refuses_indices_no_running_ring_can_have_left() {
-    // The export answers with a pair of numbers and cannot say that
-    // the kernel refused the read, so a ring it could not read for
-    // arrives with a consumption cursor of 0 against a used index the
-    // export took from guest memory. Programmed as is, viona treats
-    // the whole available ring as unconsumed and hands the driver
-    // descriptors it has already reclaimed.
+    // The payload comes from an unauthenticated peer, so the pair may
+    // be anything. A cursor that claims more chains in flight than the
+    // ring has descriptors makes viona treat the whole available ring
+    // as unconsumed and hand the driver descriptors it has already
+    // reclaimed.
     let steps = Steps::default();
     let device = running_device(Arc::new(TestLink::new(&steps)));
 
@@ -695,7 +770,8 @@ fn a_restore_refuses_indices_no_running_ring_can_have_left() {
         900,
         0,
         0,
-    );
+    )
+    .expect_err("an impossible pair of indices must fail the restore");
 
     assert_eq!(
         steps_of(&steps),
@@ -723,7 +799,8 @@ fn a_restore_takes_indices_that_wrapped() {
         u16::MAX - 5,
         0,
         0,
-    );
+    )
+    .expect("a ring whose indices wrapped is restored");
 
     assert!(
         steps_of(&steps)
@@ -754,7 +831,8 @@ fn a_restore_programs_the_ring_and_its_interrupt() {
         5,
         0xFEE0_0000,
         0x21,
-    );
+    )
+    .expect("a sane payload restores");
 
     assert_eq!(
         steps_of(&steps),
@@ -787,6 +865,7 @@ fn a_restore_programs_the_ring_and_its_interrupt() {
 fn a_halted_device_restores_no_ring() {
     // A restore that races the halt would program a link that is
     // already destroyed, and mark the ring ready for the next kick.
+    // The ring is not programmed, so the restore says so.
     let steps = Steps::default();
     let device = device_with(Arc::new(TestLink::new(&steps)));
     device.halt();
@@ -803,7 +882,8 @@ fn a_halted_device_restores_no_ring() {
         5,
         0,
         0,
-    );
+    )
+    .expect_err("a destroyed link restores nothing");
 
     assert_eq!(
         steps_of(&steps),
@@ -814,15 +894,80 @@ fn a_halted_device_restores_no_ring() {
 
 #[test]
 fn an_export_pauses_every_ring_before_it_reads_them() {
-    // A ring the kernel still works on moves its indices while the
-    // source reads them, and the destination resumes from a cursor
-    // that was never true.
+    // A ring the kernel still works on moves both cursors while the
+    // source reads them. A rollback taken from a read made first
+    // programs cursors the kernel has already passed, and the ring
+    // replays the descriptors between them.
     let steps = Steps::default();
     let device = device_with(Arc::new(TestLink::new(&steps)));
 
-    VirtioDevice::pause_rings_for_export(&device);
+    VirtioDevice::pause_rings_for_export(&device).expect("pauses");
 
-    assert_eq!(steps_of(&steps), [Step::RingPause(0), Step::RingPause(1)]);
+    assert_eq!(
+        steps_of(&steps),
+        [
+            Step::RingPause(0),
+            Step::RingGetState(0),
+            Step::RingPause(1),
+            Step::RingGetState(1),
+        ],
+    );
+}
+
+#[test]
+fn an_export_that_cannot_read_a_paused_ring_fails_the_migration() {
+    // The ring is stopped with nothing to restart it from: a paused
+    // ring needs a reset plus a state write. Neither the export nor the
+    // rollback may report success over that.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(
+        TestLink::new(&steps).failing(&[Op::RingGetState]),
+    ));
+
+    VirtioDevice::pause_rings_for_export(&device)
+        .expect_err("a ring with no saved state must fail the migration");
+    VirtioDevice::resume_rings_after_migration(&device)
+        .expect_err("a ring that cannot be restarted must be reported");
+}
+
+#[test]
+fn a_rollback_puts_every_paused_ring_back_to_work() {
+    // A paused ring is VRS_STOP, and viona answers a guest kick on one
+    // with EBUSY, so only a reset plus a state write revives it. The
+    // source guest would otherwise resume with a dead NIC.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+
+    VirtioDevice::pause_rings_for_export(&device).expect("pauses");
+    steps.lock().expect("steps").clear();
+
+    VirtioDevice::resume_rings_after_migration(&device).expect("resumes");
+
+    let seen = steps_of(&steps);
+    assert!(
+        seen.contains(&Step::RingReset(0))
+            && seen.contains(&Step::RingReset(1)),
+        "{seen:?}",
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|s| matches!(s, Step::RingSetState { .. }))
+            .count(),
+        2,
+        "both rings get their saved state back: {seen:?}",
+    );
+}
+
+#[test]
+fn a_ring_that_will_not_pause_fails_the_migration() {
+    // The export would otherwise read indices that are still moving.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(
+        TestLink::new(&steps).failing(&[Op::RingPause]),
+    ));
+
+    VirtioDevice::pause_rings_for_export(&device)
+        .expect_err("a ring that stays running must fail the migration");
 }
 
 #[test]
@@ -833,7 +978,7 @@ fn a_restore_stops_every_ring_before_it_programs_them() {
     let steps = Steps::default();
     let device = running_device(Arc::new(TestLink::new(&steps)));
 
-    VirtioDevice::reset_all_rings(&device);
+    VirtioDevice::reset_all_rings(&device).expect("stops every ring");
 
     assert_eq!(
         steps_of(&steps),
@@ -856,7 +1001,8 @@ fn a_halted_device_pauses_no_ring() {
     device.halt();
     steps.lock().expect("steps lock").clear();
 
-    VirtioDevice::pause_rings_for_export(&device);
+    VirtioDevice::pause_rings_for_export(&device)
+        .expect("a halted device has nothing to pause");
 
     assert_eq!(
         steps_of(&steps),
@@ -874,7 +1020,8 @@ fn a_halted_device_resets_no_ring_for_a_restore() {
     device.halt();
     steps.lock().expect("steps lock").clear();
 
-    VirtioDevice::reset_all_rings(&device);
+    VirtioDevice::reset_all_rings(&device)
+        .expect("a halted device has nothing left to stop");
 
     assert_eq!(
         steps_of(&steps),

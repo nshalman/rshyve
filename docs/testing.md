@@ -71,14 +71,6 @@ the GNU one: `export LIBTOOLIZE=glibtoolize`.
 
 ### Build on Headnode
 
-Do this one time if the host still holds the checkout with its old name.
-An rsync to the new path does not move the old `target/` cache, and a
-full rebuild on this host is slow.
-
-```bash
-ssh $VMM_HEADNODE 'test -d /opt/rust-bhyve || mv /opt/vmmnew /opt/rust-bhyve'
-```
-
 ```bash
 rsync -az --checksum --exclude target $VMM_SRC/ $VMM_HEADNODE:/opt/rust-bhyve/
 
@@ -251,14 +243,14 @@ See [tools/profile/README.md](../tools/profile/README.md) and
 ### Sync to Build Host
 
 ```bash
-rsync -az --exclude target $VMM_SRC/ $VMM_BUILD_HOST:/opt/vmmctl/
+rsync -az --exclude target $VMM_SRC/ $VMM_BUILD_HOST:/opt/rust-bhyve/
 ```
 
 ### Cross-Host Migration Test
 
 ```bash
 # Source on nuc1 (old CPU)
-ssh -i $VMM_LAB_KEY $VMM_MIGRATE_HOST '... start VM with --track-dirty --control-socket ...'
+ssh -i $VMM_LAB_KEY $VMM_MIGRATE_HOST '... start VM with --control-socket ...'
 
 # Destination on headnode (new CPU)
 ssh $VMM_HEADNODE '... start VM with --migrate-listen 0.0.0.0:4567 ...'
@@ -685,16 +677,22 @@ tools/win-boot-test.sh wait 'Press any key to boot' 120
 tools/win-boot-test.sh send '\r'
 tools/win-boot-test.sh log 4000
 tools/win-boot-test.sh status
-VARS=/tmp/wintest-vars.fd tools/win-boot-test.sh vars
+VARS=/var/run/win-boot-test/wintest-vars.fd tools/win-boot-test.sh vars
 tools/win-boot-test.sh stop
 ```
+
+The disk image, the serial log, the console FIFO and the recorded VMM pid
+all live in `$RUNDIR`, which defaults to `/var/run/win-boot-test` at mode
+0700. `stop` kills the pid it recorded and destroys the VM by name; it
+does not `pkill rshyve`, because these nodes carry other people's live
+guests.
 
 To boot Windows Setup with the install ISO exposed as a CD-ROM, replace the
 fixed NVMe ISO namespace in the harness command with this attachment:
 
 ```bash
 /opt/rust-bhyve/target/release/rshyve -H -c 2 -m 4G \
-  -s 0,hostbridge -s 4,nvme,/tmp/wintest.img \
+  -s 0,hostbridge -s 4,nvme,/var/run/win-boot-test/wintest.img \
   -s 5,ahci-cd,/opt/winassets/winsrv2025-eval.iso \
   -s 31,lpc -l bootrom,/usr/share/bhyve/uefi-rom.bin -l com1,stdio wintest
 ```

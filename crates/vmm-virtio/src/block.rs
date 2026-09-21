@@ -6,9 +6,11 @@
 //!
 //! One invariant holds the design together: a backing-store operation
 //! owns only host memory, and every guest-memory access needs
-//! permission for the request epoch, held until that access finishes.
-//! So a reset closes admission, ends the epoch, waits for the short
-//! guest-access sections, and returns. It never waits for the disk.
+//! permission for the ring generation it was authorised under, held
+//! until that access finishes. So a reset closes admission, ends every
+//! generation, waits for the short guest-access sections, and returns.
+//! It never waits for the disk. A driver that programs one ring again
+//! retires that ring's generation alone.
 //!
 //! Requests that reach the disk run on worker threads. Only the ones
 //! that touch guest memory alone, such as GET_ID, run inline on the
@@ -35,12 +37,12 @@ mod probes {
     fn vioblk_inline(head: u16, rtype: u32, sector: u64) {}
     fn vioblk_dispatch(head: u16, rtype: u32, sector: u64) {}
     fn vioblk_complete(head: u16, status: u8) {}
-    fn vioblk_reset_drain(epoch: u64) {}
+    fn vioblk_reset_drain(queue_idx: u32, generation: u64) {}
 }
 
 use super::bits;
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
-use super::{queue_drain_should_stop, VirtioDevice};
+use super::VirtioDevice;
 
 mod access;
 mod discard;
@@ -49,7 +51,7 @@ mod io;
 mod tests;
 mod worker;
 
-use crate::access::{GuestAccess, Session};
+use crate::access::{GuestAccess, RingTag, Session};
 use crate::pci::intr::{BackendIntr, IntrSlot};
 use access::BackendBarrier;
 use io::{parse_header, write_status};
@@ -126,7 +128,6 @@ pub struct VirtioBlock {
     num_queues: u16,
     /// Number of I/O worker threads per queue.
     workers_per_queue: usize,
-    negotiated_features: Mutex<u64>,
     /// Per-worker I/O sender channels (flat: queue_idx * workers_per_queue + worker_idx).
     io_txs: Vec<mpsc::Sender<BlkIoRequest>>,
     /// Per-queue round-robin counter for dispatching to workers.
@@ -165,7 +166,11 @@ impl VirtioBlock {
         num_queues: u16,
     ) -> std::io::Result<Self> {
         let metadata = file.metadata()?;
-        let capacity = metadata.len() / u64::from(opts.sector_size);
+        // VirtIO 1.3 sec 5.2.4: capacity is in 512-byte sectors
+        // whatever `blk_size` is, and sec 5.2.6 puts the request
+        // sector in the same units. `sector_size` is the logical block
+        // size the guest is told to align to, not the unit of either.
+        let capacity = metadata.len() / bits::SECTOR_SIZE;
         let read_only = opts.read_only;
         let file = Arc::new(file);
 
@@ -185,7 +190,7 @@ impl VirtioBlock {
         let ctx = WorkerCtx {
             physmap: Arc::clone(&physmap),
             gate: Arc::clone(&gate),
-            access: Arc::new(GuestAccess::new()),
+            access: Arc::new(GuestAccess::new(num_queues as usize)),
             backend: Arc::new(BackendBarrier::new()),
             #[cfg(test)]
             parks: Arc::new(worker::WorkerParks::default()),
@@ -220,7 +225,6 @@ impl VirtioBlock {
             nodelete: opts.nodelete,
             num_queues,
             workers_per_queue,
-            negotiated_features: Mutex::new(0),
             io_txs,
             next_worker,
             physmap,
@@ -299,6 +303,60 @@ impl VirtioBlock {
         c
     }
 
+    /// End the generations that own the retired rings, wait out the
+    /// guest-memory sections already inside them, and drop the
+    /// used-ring writers they name.
+    ///
+    /// `queue` names the one ring a driver programmed again, or `None`
+    /// for a device reset. A reprogrammed queue takes only its own
+    /// generation and its own writer: a request still in flight on
+    /// another queue names a ring the driver never gave up, and
+    /// discarding it leaves that request unanswered forever.
+    ///
+    /// Admission closes before the wait, for every queue. A section
+    /// refused before it takes the lock never queues on it, and
+    /// `std::sync::RwLock` gives the writer no priority: a guest picks
+    /// how much stale work is waiting, and it must not be able to
+    /// starve this.
+    ///
+    /// This does not wait for the disk. A backend operation owns host
+    /// memory alone, so it is retired and left to finish into buffers
+    /// the next generation discards. The wait covers bounded copies
+    /// and ring walks, which is what lets a vCPU run it.
+    fn retire_rings(&self, queue: Option<u16>) {
+        match queue {
+            Some(idx) => {
+                let generation = self.ctx.access.close_queue(idx);
+                probes::vioblk_reset_drain!(|| (u32::from(idx), generation));
+            }
+            None => {
+                self.ctx.access.close_all();
+                probes::vioblk_reset_drain!(|| (u32::MAX, 0));
+            }
+        }
+        self.ctx.backend.retire();
+        self.ctx.access.drain();
+
+        {
+            let mut slots = self.completions.lock().expect("lock");
+            match queue {
+                Some(idx) => {
+                    if let Some(slot) = slots.get_mut(usize::from(idx)) {
+                        *slot = None;
+                    }
+                }
+                None => {
+                    for slot in slots.iter_mut() {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+        self.ctx.access.reopen(
+            self.interrupt.next_session(self.ctx.access.intr_session()),
+        );
+    }
+
     /// Check one chain and return its request header.
     ///
     /// On refusal the status byte is written and the used length the
@@ -358,17 +416,42 @@ impl VirtioBlock {
     ) -> (u8, u32) {
         match header.rtype {
             bits::VIRTIO_BLK_T_GET_ID => {
+                // The data segment is the chain without its header and
+                // its status byte, the same span `io::fold` and
+                // `discard::read_payload` take. Writing the ID into the
+                // status descriptor of a `[header, status]` chain
+                // reported a length that counted that byte twice, and
+                // `write_status` then overwrote the first byte of the
+                // answer.
+                let Some(data) = chain
+                    .len()
+                    .checked_sub(1)
+                    .and_then(|end| chain.get(1..end))
+                else {
+                    return (bits::VIRTIO_BLK_S_IOERR, 1);
+                };
                 let id = self.device_id();
-                // Write ID to the first writable buffer in the chain
-                for buf in chain {
-                    if let ChainBuf::Writable { addr, len } = buf {
-                        let n = (*len as usize).min(VIRTIO_BLK_ID_BYTES);
-                        if let Some(sub) = physmap.lookup(*addr, n) {
-                            // write to guest memory; no recovery if unmapped
-                            let _ = sub.write_bytes(&id[..n]);
-                        }
-                        return (bits::VIRTIO_BLK_S_OK, n as u32 + 1);
+                for buf in data {
+                    let ChainBuf::Writable { addr, len } = buf else {
+                        continue;
+                    };
+                    // A driver may pad the chain, so an empty buffer is
+                    // not the answer's buffer.
+                    let n = (*len as usize).min(VIRTIO_BLK_ID_BYTES);
+                    if n == 0 {
+                        continue;
                     }
+                    // A used length the device did not write tells the
+                    // guest that n bytes of device id are in a buffer
+                    // that still holds whatever was there before.
+                    let wrote = physmap
+                        .lookup(*addr, n)
+                        .is_some_and(|sub| sub.write_bytes(&id[..n]).is_ok());
+                    return if wrote {
+                        (bits::VIRTIO_BLK_S_OK, n as u32 + 1)
+                    } else {
+                        (bits::VIRTIO_BLK_S_IOERR, 1)
+                    };
                 }
                 (bits::VIRTIO_BLK_S_IOERR, 1)
             }
@@ -379,27 +462,26 @@ impl VirtioBlock {
     /// Hand a request to one of the queue's workers.
     fn dispatch(
         &self,
-        queue_idx: u16,
-        epoch: u64,
+        tag: RingTag,
         completion: &Arc<VirtioCompletion>,
         head: u16,
         header: &VirtioBlkReqHdr,
         chain: Vec<ChainBuf>,
     ) {
         probes::vioblk_dispatch!(|| (head, header.rtype, header.sector));
-        let base = queue_idx as usize * self.workers_per_queue;
-        let idx = self.next_worker[queue_idx as usize]
-            .fetch_add(1, Ordering::Relaxed)
+        let queue_idx = usize::from(tag.queue_idx());
+        let base = queue_idx * self.workers_per_queue;
+        let idx = self.next_worker[queue_idx].fetch_add(1, Ordering::Relaxed)
             % self.workers_per_queue;
         // A closed channel means the worker is gone during shutdown.
-        // The request carries an epoch, so nothing else has to undo.
+        // The request carries its ring, so nothing else has to undo.
         let _ = self.io_txs[base + idx].send(BlkIoRequest {
             rtype: header.rtype,
             sector: header.sector,
             chain,
             head,
             completion: Arc::clone(completion),
-            epoch,
+            tag,
         });
     }
 }
@@ -432,8 +514,10 @@ impl VirtioDevice for VirtioBlock {
         f
     }
 
-    fn set_features(&self, features: u64) {
-        *self.negotiated_features.lock().expect("lock") = features;
+    fn set_features(&self, _features: u64) {
+        // Every bit this device offers changes what the guest may ask
+        // for, not how the device answers, and the queues are told what
+        // was negotiated by the transport.
     }
 
     fn cfg_read(&self, offset: u16, len: u8) -> u32 {
@@ -493,13 +577,6 @@ impl VirtioDevice for VirtioBlock {
     /// put a call into the kernel on the reset's path. The transport
     /// drops the lock first. Workers raise their own completions:
     /// they hold no transport lock.
-    ///
-    /// EVENT_IDX re-check loop (VirtIO 1.3 sec 2.7.10):
-    /// After draining the ring and writing `used_event`, re-read
-    /// `avail_idx`. If the guest added entries during the race
-    /// window between our drain and the `used_event` write, the
-    /// guest may have decided not to kick, so the device must catch
-    /// those entries itself.
     fn notify_queue(
         &self,
         queue_idx: u16,
@@ -511,76 +588,54 @@ impl VirtioDevice for VirtioBlock {
             None => return false,
         };
 
-        let Some(session) = self.ctx.access.enter_current() else {
-            // A reset owns the ring. Its queue state goes with it.
+        let Some(session) = self.ctx.access.enter_current(queue_idx) else {
+            // A retirement owns the ring. Its queue state goes with it.
             return false;
         };
         let completion = self.get_completion(&session, queue_idx, queue);
-        let epoch = session.epoch();
+        let tag = session.tag();
 
-        // A guest can keep advancing avail_idx during the EVENT_IDX re-check.
         // Bound the work retained by one notification to the queue size.
         let max_requests = usize::from(queue.size());
         let mut requests: Vec<(u16, VirtioBlkReqHdr, Vec<ChainBuf>)> =
             Vec::with_capacity(max_requests);
         // Results already finished, published together at the end.
         let mut finished: Vec<(u16, u32)> = Vec::new();
-        let mut popped = 0usize;
 
-        loop {
-            let before = queue.last_avail_idx();
-            while popped < max_requests {
-                let Some(head) = queue.pop_avail(physmap) else {
-                    break;
-                };
-                popped += 1;
-
-                let chain = match queue.collect_chain(physmap, head) {
-                    Some(c) => c,
-                    None => {
-                        // `pop_avail` already took this head out of the
-                        // available ring, so it has to go back on the
-                        // used ring. Dropping it burns the descriptor
-                        // for the life of the device: the block layer
-                        // has no abort path for virtio-blk.
-                        finished.push((head, 0));
-                        continue;
-                    }
-                };
-
-                let header = match self.check_request(&chain, physmap) {
-                    Ok(header) => header,
-                    Err(len) => {
-                        finished.push((head, len));
-                        continue;
-                    }
-                };
-
-                if needs_backend(header.rtype) {
-                    requests.push((head, header, chain));
-                    continue;
+        queue.drain_avail(physmap, max_requests, |queue, head| {
+            let chain = match queue.collect_chain(physmap, head) {
+                Some(c) => c,
+                None => {
+                    // `pop_avail` already took this head out of the
+                    // available ring, so it has to go back on the
+                    // used ring. Dropping it burns the descriptor
+                    // for the life of the device: the block layer
+                    // has no abort path for virtio-blk.
+                    finished.push((head, 0));
+                    return;
                 }
+            };
 
-                probes::vioblk_inline!(|| (head, header.rtype, header.sector));
-                let (status, written) =
-                    self.local_request(&header, &chain, physmap);
-                write_status(physmap, &chain, status);
-                probes::vioblk_complete!(|| (head, status));
-                finished.push((head, written));
+            let header = match self.check_request(&chain, physmap) {
+                Ok(header) => header,
+                Err(len) => {
+                    finished.push((head, len));
+                    return;
+                }
+            };
+
+            if needs_backend(header.rtype) {
+                requests.push((head, header, chain));
+                return;
             }
 
-            // A cap exit leaves entries pending, so publishing avail_event
-            // would suppress a subsequent single-entry kick.
-            let hit_request_cap = popped >= max_requests;
-            if !hit_request_cap {
-                queue.update_used_event(physmap);
-            }
-            if queue_drain_should_stop(queue, before, hit_request_cap, physmap)
-            {
-                break;
-            }
-            // Guest added entries during race window; drain again.
-        }
+            probes::vioblk_inline!(|| (head, header.rtype, header.sector));
+            let (status, written) =
+                self.local_request(&header, &chain, physmap);
+            write_status(physmap, &chain, status);
+            probes::vioblk_complete!(|| (head, status));
+            finished.push((head, written));
+        });
 
         probes::vioblk_notify!(|| (
             queue_idx,
@@ -591,7 +646,7 @@ impl VirtioDevice for VirtioBlock {
         drop(session);
 
         for (head, header, chain) in requests {
-            self.dispatch(queue_idx, epoch, &completion, head, &header, chain);
+            self.dispatch(tag, &completion, head, &header, chain);
         }
 
         raise
@@ -607,6 +662,18 @@ impl VirtioDevice for VirtioBlock {
         0 // not called: notify_queue is overridden
     }
 
+    /// The handler snapshots the ring it was built on, so a ring the
+    /// driver programs again needs a new one. A worker still holding
+    /// the old handler finishes into the old ring, which the driver
+    /// gave up when it moved.
+    fn queue_addr_set(&self, queue_idx: u16, _queue: &VirtQueue) {
+        // A driver may program a ring again without resetting the
+        // device. Dropping the cached writer alone left every worker
+        // that already holds one still able to publish into the ring
+        // the driver gave up, so this queue's generation ends here too.
+        self.retire_rings(Some(queue_idx));
+    }
+
     /// Reset the device, and do not return until no worker can still
     /// write into the guest memory this ring used.
     ///
@@ -619,33 +686,16 @@ impl VirtioDevice for VirtioBlock {
     ///
     /// It is safe to run synchronously because it does not wait for the
     /// disk, and it does not wait for interrupt delivery either.
-    /// Admission closes, the epoch ends, and the wait covers the
+    /// Admission closes, every generation ends, and the wait covers the
     /// guest-memory sections alone. Each of those is a bounded copy or
     /// ring walk, so the wait needs no deadline and has none.
     ///
-    /// Ending the epoch stops any further raise for the old session.
-    /// A raise already past that check is abandoned, not waited for:
-    /// injection is a call into the kernel, and this runs on a vCPU.
+    /// Ending every generation stops any further raise for the old
+    /// session. A raise already past that check is abandoned, not
+    /// waited for: injection is a call into the kernel, and this runs
+    /// on a vCPU.
     fn reset(&self) {
-        // Close admission before the drain. A section refused before it
-        // takes the lock never queues on it, and `std::sync::RwLock`
-        // gives the writer no priority: a guest picks how much stale
-        // work is waiting, and it must not be able to starve this.
-        let epoch = self.ctx.access.close();
-        probes::vioblk_reset_drain!(|| epoch);
-        // No backend work is admitted for the old session from here.
-        // Operations already inside a syscall are counted until they
-        // end, and the next session's I/O waits behind them.
-        self.ctx.backend.retire(epoch);
-        self.ctx.access.drain();
-
-        *self.negotiated_features.lock().expect("lock") = 0;
-        for slot in self.completions.lock().expect("lock").iter_mut() {
-            *slot = None;
-        }
-        self.ctx.access.reopen(
-            self.interrupt.next_session(self.ctx.access.intr_session()),
-        );
+        self.retire_rings(None);
     }
 }
 

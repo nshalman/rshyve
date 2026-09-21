@@ -2,626 +2,600 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Migration destination protocol runner.
+//! The migration destination.
 //!
-//! Drives the destination side of a live migration: accepts the
-//! protocol negotiation, receives dirty RAM pages, imports device
-//! state, and resumes the VM.
+//! Every check happens before the guest runs: topology in the preamble,
+//! CPU features in the preamble, then the device payload's identity set
+//! against the local device set. A guest is only resumed once every
+//! device holds its own state.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use futures::sink::SinkExt;
-use futures::stream::StreamExt;
-use slog;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::WebSocketStream;
-
+use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::MemCtx;
+use vmm_devices::lifecycle::{
+    DeviceMigrateState, DeviceStateError, HypervMigrateState, WireBdf,
+};
 
 use crate::codec::{
-    DeviceState, Message, MigrateError, MigrationPreamble, ProtocolOffer,
-    ProtocolSelect, TimeData,
+    DeviceIdentity, DeviceState, Message, MigrateError, MigrationPreamble,
+    ProtocolOffer, ProtocolSelect, TimeData,
 };
+use crate::cpu;
 use crate::pages::apply_page_batch;
-use crate::protocol::PROTOCOL_RON_V0;
+use crate::protocol::PROTOCOL_RON;
 use crate::state;
+use crate::wire::{set_phase, unexpected, Chan, Deadlines, Transport};
 use crate::MigrationPhase;
 use crate::MigrationStatus;
 
-/// Run the destination side of live migration.
+/// Hand one device the state its counterpart on the source exported.
 ///
-/// Accepts a pre-established TCP connection from the source,
-/// upgrades to WebSocket (server role), and runs the full protocol.
+/// Called once per payload entry, with the entry already matched to a
+/// local device by PCI address.
+pub type DeviceRestoreFn = Box<
+    dyn Fn(WireBdf, &DeviceMigrateState) -> Result<(), DeviceStateError> + Send,
+>;
+
+/// Start the device workers once the import succeeded.
+pub type DeviceResumeFn = Box<dyn Fn() + Send>;
+
+/// Put the Hyper-V enlightenment back, reinstalling both overlay
+/// pages from the MSR values the source carried.
 ///
-/// On success, the VM is running with all source state restored.
-/// On failure, the VM is in an indeterminate state and should be
-/// destroyed by the caller.
-pub async fn run_destination<S>(
+/// Answers whether this VM has an enlightenment at all, so a payload
+/// that carries one for a VM started without `--hyperv` is refused
+/// rather than dropped.
+pub type HypervRestoreFn = Box<dyn Fn(&HypervMigrateState) -> bool + Send>;
+
+/// What the destination needs from its owner, beyond the stream.
+pub struct DestConfig {
+    pub num_cpus: u32,
+    pub mem_size: u64,
+    pub cpu_baseline: CpuBaseline,
+    /// Every local device that carries migration state. The payload's
+    /// identity set must equal this.
+    pub devices: Vec<DeviceIdentity>,
+    pub deadlines: Deadlines,
+    /// Accept a source whose guest saw CPU features this host lacks.
+    ///
+    /// The guest may already have executed one of those instructions,
+    /// and will take #UD on the next. Logged whenever it is used.
+    pub allow_cpu_feature_mismatch: bool,
+}
+
+/// The device hooks the import drives.
+pub struct DestHooks {
+    pub restore: DeviceRestoreFn,
+    pub resume: DeviceResumeFn,
+    pub hyperv: HypervRestoreFn,
+}
+
+pub fn run_destination<S: Transport>(
     stream: S,
     hdl: Arc<VmmHdl>,
     memctx: &MemCtx,
-    num_cpus: u32,
-    mem_size: u64,
+    config: DestConfig,
+    hooks: DestHooks,
     status: Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
-) -> Result<(), MigrateError>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    // Upgrade to WebSocket (server role)
-    let ws = tokio_tungstenite::accept_async_with_config(
+) -> Result<(), MigrateError> {
+    let mut chan = Chan::new(
         stream,
-        Some(crate::limits::ws_config()),
-    )
-    .await
-    .map_err(|e| {
-        MigrateError::WebSocket(format!("WebSocket accept failed: {e}"))
-    })?;
-
-    run_destination_inner(ws, &hdl, memctx, num_cpus, mem_size, &status, log)
-        .await
+        tungstenite::protocol::Role::Server,
+        config.deadlines,
+    )?;
+    run_inner(&mut chan, &hdl, memctx, &config, &hooks, &status, log)
 }
 
-/// Inner protocol driver.
-async fn run_destination_inner<S: AsyncRead + AsyncWrite + Unpin>(
-    mut ws: WebSocketStream<S>,
+fn run_inner<S: Transport>(
+    chan: &mut Chan<S>,
     hdl: &Arc<VmmHdl>,
     memctx: &MemCtx,
-    num_cpus: u32,
-    mem_size: u64,
+    config: &DestConfig,
+    hooks: &DestHooks,
     status: &Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
-    // ── Phase: Sync ────────────────────────────────────────────────
+    // ── Sync ──
     set_phase(status, MigrationPhase::Sync);
 
-    // Receive protocol offer
-    let offer_msg = recv(&mut ws).await?;
-    let offer_data = expect_serialized(offer_msg)?;
-    let offer: ProtocolOffer = Message::deserialize(&offer_data)?;
-
-    // Select our preferred protocol
-    if !offer.protocols.iter().any(|p| p == PROTOCOL_RON_V0) {
-        let err = MigrateError::ProtocolMismatch(format!(
-            "source offers {:?}, we require '{}'",
-            offer.protocols, PROTOCOL_RON_V0,
+    let offer: ProtocolOffer = chan.expect_serialized()?;
+    if !offer.protocols.iter().any(|p| p == PROTOCOL_RON) {
+        let err = MigrateError::ProtocolMismatch(crate::wire::peer_text(
+            &offer.protocols.join(","),
         ));
-        ws.send(Message::Error(err.clone()).encode()).await?;
+        chan.send(&Message::Error(err.clone()))?;
         return Err(err);
     }
+    chan.send(&Message::serialized(&ProtocolSelect {
+        protocol: PROTOCOL_RON.to_string(),
+    })?)?;
 
-    let sel = ProtocolSelect {
-        protocol: PROTOCOL_RON_V0.to_string(),
-    };
-    let sel_msg = Message::serialized(&sel)?;
-    ws.send(sel_msg.encode()).await?;
-
-    // Receive preamble
-    let pre_msg = recv(&mut ws).await?;
-    let pre_data = expect_serialized(pre_msg)?;
-    let preamble: MigrationPreamble = Message::deserialize(&pre_data)?;
-
-    // Validate compatibility. Both sides report their boot topology,
-    // so a CPU or memory the source hot-added is invisible here. The
-    // source refuses to start in that case.
-    if preamble.num_cpus != num_cpus {
-        let err = MigrateError::PreambleMismatch(format!(
-            "CPU count mismatch: source has {}, we have {}",
-            preamble.num_cpus, num_cpus,
-        ));
-        ws.send(Message::Error(err.clone()).encode()).await?;
+    let preamble: MigrationPreamble = chan.expect_serialized()?;
+    if let Err(err) = check_preamble(&preamble, config, log) {
+        chan.report_failure(&err, log);
         return Err(err);
     }
-    if preamble.mem_size != mem_size {
-        let err = MigrateError::PreambleMismatch(format!(
-            "memory size mismatch: source has {} bytes, we have {}",
-            preamble.mem_size, mem_size,
-        ));
-        ws.send(Message::Error(err.clone()).encode()).await?;
-        return Err(err);
-    }
+    chan.send(&Message::Okay)?;
 
-    // Check CPU feature compatibility: destination must support all
-    // features the source exposes to the guest.
-    if let Some(ref src_cpu) = preamble.cpu_features {
-        let (
-            dst_l1_ecx,
-            dst_l1_edx,
-            dst_l7_ebx,
-            dst_l7_ecx,
-            dst_l7_edx,
-            dst_xcr0,
-        ) = vmm_core::cpuid::query_host_features();
-
-        // Mask out deprecated/irrelevant features that don't affect
-        // guest instruction compatibility:
-        // - leaf7 EBX bit 2: SGX (enclave, not migrated)
-        // - leaf7 EBX bit 14: MPX (deprecated, removed from newer CPUs)
-        // - xcr0 bits 3,4: MPX BNDREGS/BNDCSR
-        const IGNORE_L7_EBX: u32 = (1 << 2) | (1 << 14);
-        const IGNORE_XCR0: u32 = (1 << 3) | (1 << 4);
-
-        let missing_l1_ecx = src_cpu.leaf1_ecx & !dst_l1_ecx;
-        let missing_l1_edx = src_cpu.leaf1_edx & !dst_l1_edx;
-        let missing_l7_ebx = (src_cpu.leaf7_ebx & !IGNORE_L7_EBX) & !dst_l7_ebx;
-        let missing_l7_ecx = src_cpu.leaf7_ecx & !dst_l7_ecx;
-        let missing_l7_edx = src_cpu.leaf7_edx & !dst_l7_edx;
-        let missing_xcr0 = (src_cpu.xcr0 & !IGNORE_XCR0) & !dst_xcr0;
-
-        if missing_l1_ecx != 0
-            || missing_l1_edx != 0
-            || missing_l7_ebx != 0
-            || missing_l7_ecx != 0
-            || missing_l7_edx != 0
-            || missing_xcr0 != 0
-        {
-            // Warn but continue — the source's --cpu-baseline already
-            // restricted guest-visible features. The preamble reports
-            // host features which may exceed the guest's actual view.
-            // A strict check would compare the VM's effective CPUID.
-            slog::warn!(log, "CPU feature mismatch (continuing)";
-                "leaf1_ecx" => format!("{missing_l1_ecx:#x}"),
-                "leaf1_edx" => format!("{missing_l1_edx:#x}"),
-                "leaf7_ebx" => format!("{missing_l7_ebx:#x}"),
-                "leaf7_ecx" => format!("{missing_l7_ecx:#x}"),
-                "leaf7_edx" => format!("{missing_l7_edx:#x}"),
-                "xcr0" => format!("{missing_xcr0:#x}"),
-            );
-        } else {
-            slog::info!(log, "CPU feature check passed");
-        }
-    }
-
-    // Preamble accepted
-    ws.send(Message::Okay.encode()).await?;
-
-    // ── Phase: RamPushPrePause ─────────────────────────────────────
-    // Receive RAM passes in a loop. The source sends one full pass
-    // then iterative dirty passes. When the source is ready to pause,
-    // it sends PauseSignal followed by one final post-pause pass.
+    // ── Pre-pause RAM passes ──
     set_phase(status, MigrationPhase::RamPushPrePause);
-    loop {
-        let pass_result = receive_ram_pass(&mut ws, memctx, status).await?;
-        match pass_result {
-            RamPassResult::MorePasses => {
-                // Source will send another pre-pause dirty pass
-                continue;
-            }
-            RamPassResult::PauseSignal => {
-                // Source has paused; next pass is the final one
-                break;
-            }
-        }
-    }
+    receive_pass(chan, memctx, status, PassEnd::PauseSignal)?;
 
-    // ── Phase: RamPushPostPause ───────────────────────────────────
-    // Final pass after source paused — no peek for PauseSignal needed.
+    // ── Post-pause final pass ──
     set_phase(status, MigrationPhase::RamPushPostPause);
-    receive_final_ram_pass(&mut ws, memctx, status).await?;
+    chan.enter_post_pause()?;
+    receive_pass(chan, memctx, status, PassEnd::MemEnd)?;
 
-    // Pause the VM before importing state. This is critical:
-    // the kernel's vlapic_data_write() checks vm_is_paused() and
-    // defers timer callout scheduling to VM_RESUME. Without this,
-    // the LAPIC timer is never re-armed after migration.
     slog::info!(log, "pausing VM before state import");
     hdl.pause()
-        .map_err(|e| MigrateError::Io(format!("pause before import: {e}")))?;
+        .map_err(|e| MigrateError::Io(format!("pause: {e}")))?;
 
-    // ── Phase: TimeData ───────────────────────────────────────────
-    // Time data MUST be imported before device state because LAPIC
-    // timer targets are normalized against boot_hrtime.
+    // ── TimeData ──
     set_phase(status, MigrationPhase::TimeData);
-    let time_msg = recv(&mut ws).await?;
-    let time_data_bytes = expect_serialized(time_msg)?;
-    let time_data: TimeData = Message::deserialize(&time_data_bytes)?;
+    let time_data: TimeData = chan.expect_serialized()?;
     if let Err(e) = state::import_time_data(hdl, &time_data, log) {
-        report_failure(&mut ws, &e, log).await;
+        chan.report_failure(&e, log);
         return Err(e);
     }
 
-    // ── Phase: DeviceState ────────────────────────────────────────
+    // ── DeviceState ──
     set_phase(status, MigrationPhase::DeviceState);
-    let dev_msg = recv(&mut ws).await?;
-    let dev_data_bytes = expect_serialized(dev_msg)?;
-    let device_state: DeviceState = Message::deserialize(&dev_data_bytes)?;
-
-    // This path has no device restore callback, so it cannot program
-    // virtio rings or NVMe queues. A guest that resumes without them
-    // has devices it cannot use, so refuse the payload instead.
-    if !device_state.virtio_queues.is_empty()
-        || !device_state.nvme_controllers.is_empty()
+    let dev_state: DeviceState = chan.expect_serialized()?;
+    if let Err(e) = restore_devices(&dev_state, config, hooks, log) {
+        chan.report_failure(&e, log);
+        return Err(e);
+    }
+    if let Err(e) =
+        state::import_device_state(hdl, &dev_state, config.num_cpus, log)
     {
-        let e = MigrateError::State(format!(
-            "payload has {} virtio queues and {} NVMe controllers, this \
-             destination path cannot restore them",
-            device_state.virtio_queues.len(),
-            device_state.nvme_controllers.len(),
-        ));
-        report_failure(&mut ws, &e, log).await;
+        chan.report_failure(&e, log);
         return Err(e);
     }
 
-    if let Err(e) = state::import_device_state(hdl, &device_state, log) {
-        report_failure(&mut ws, &e, log).await;
-        return Err(e);
-    }
-
-    // Resume the VM. This triggers vlapic_resume() in the kernel,
-    // which calls vlapic_callout_reset() to re-arm the LAPIC timer.
-    // Also resumes HPET, PIT, and RTC timers.
-    slog::info!(
-        log,
-        "resuming VM after state import (triggers timer re-arm)"
-    );
-    hdl.resume()
-        .map_err(|e| MigrateError::Io(format!("resume after import: {e}")))?;
-    slog::info!(log, "VM resumed successfully");
-
-    // ── Phase: RamPull ────────────────────────────────────────────
+    // ── RamPull ──
     set_phase(status, MigrationPhase::RamPull);
-    // Receive MemEnd from source (nothing to pull)
-    let pull_msg = recv(&mut ws).await?;
-    match pull_msg {
+    match chan.recv()? {
         Message::MemEnd => {}
-        other => {
-            return Err(MigrateError::UnexpectedMessage {
-                expected: "MemEnd".to_string(),
-                got: format!("{other:?}"),
-            });
-        }
+        other => return Err(unexpected("MemEnd", &other)),
     }
 
-    // ── Phase: Finish ─────────────────────────────────────────────
+    // ── Finish ──
+    // Nothing starts until the source has promised never to run the
+    // guest again. Resuming before that commit runs a second copy of
+    // the guest against the same disk whenever the source rolls back.
     set_phase(status, MigrationPhase::Finish);
+    chan.send(&Message::Okay)?;
+    chan.expect_okay()?;
 
-    // Signal that we are ready
-    ws.send(Message::Okay.encode()).await?;
+    set_phase(status, MigrationPhase::Committed);
+    // The workers were never started on this VM, and the guest is about
+    // to post I/O to every one of them.
+    (hooks.resume)();
+    slog::info!(log, "migration import complete, starting vCPUs");
+    hdl.resume()
+        .map_err(|e| MigrateError::Io(format!("resume: {e}")))?;
 
-    // Wait for source acknowledgement
-    let ack = recv(&mut ws).await?;
-    expect_okay(ack)?;
-
-    // Don't call hdl.resume() here — the destination VM was never
-    // paused (it was in init state). The caller (main.rs) will set
-    // each vCPU to VRS_RUN after this function returns.
-
-    // Close WebSocket cleanly
-    ws.close(None).await.ok();
-
+    // The source stays paused until this arrives, so it is what lets a
+    // finished source be reaped.
+    chan.send(&Message::Okay)?;
+    chan.close();
     Ok(())
 }
 
-/// Tell the source why the import stopped.
-///
-/// The source resumes the guest when the migration aborts. It needs the
-/// reason: a dropped connection alone does not say whether the state
-/// was rejected or the network failed.
-async fn report_failure<S: AsyncRead + AsyncWrite + Unpin>(
-    ws: &mut WebSocketStream<S>,
-    err: &MigrateError,
+/// Refuse a source this VM cannot stand in for, before a single page is
+/// accepted.
+fn check_preamble(
+    preamble: &MigrationPreamble,
+    config: &DestConfig,
     log: &slog::Logger,
-) {
-    slog::error!(log, "migration import failed"; "error" => %err);
-    if let Err(send_err) = ws.send(Message::Error(err.clone()).encode()).await {
-        slog::warn!(log, "could not report the failure to the source";
-            "error" => %send_err,
-        );
+) -> Result<(), MigrateError> {
+    // Both sides report their boot topology, so a CPU or memory the
+    // source hot-added is invisible here. The source refuses to start
+    // in that case, which is the only place the growth can be seen.
+    if preamble.num_cpus != config.num_cpus {
+        return Err(MigrateError::PreambleMismatch(format!(
+            "CPU count mismatch: source has {}, we have {}",
+            preamble.num_cpus, config.num_cpus,
+        )));
     }
+    if preamble.mem_size != config.mem_size {
+        return Err(MigrateError::PreambleMismatch(format!(
+            "memory size mismatch: source has {} bytes, we have {}",
+            preamble.mem_size, config.mem_size,
+        )));
+    }
+    check_topology(&preamble.devices, &config.devices)?;
+
+    let Some(ref src) = preamble.cpu_features else {
+        return Err(MigrateError::PreambleMismatch(
+            "source sent no CPU feature table".into(),
+        ));
+    };
+    let gap = cpu::missing(src, &cpu::local_features(config.cpu_baseline));
+    if gap.is_empty() {
+        slog::info!(log, "CPU feature check passed");
+        return Ok(());
+    }
+    if config.allow_cpu_feature_mismatch {
+        slog::warn!(log, "accepting a CPU feature mismatch by request; \
+            the guest takes #UD on an instruction this host lacks";
+            "missing" => %gap);
+        return Ok(());
+    }
+    Err(MigrateError::PreambleMismatch(format!(
+        "this host lacks CPU features the guest already sees ({gap}); \
+         send migrate-dest with allow_cpu_feature_mismatch to accept \
+         the risk",
+    )))
 }
 
-/// Result of receiving one RAM pass from the source.
-enum RamPassResult {
-    /// Source will send more pre-pause passes.
-    MorePasses,
-    /// Source has paused; the next pass is the final one.
-    PauseSignal,
-}
-
-/// Receive one RAM pass from the source.
+/// The device set the source carries must be the set this VM has.
 ///
-/// The source sends PageBatch messages (contiguous, compressed) and
-/// optionally MemFetch+PageBatch (sparse dirty pages) until MemEnd.
-/// After MemEnd, we ack with MemDone. Then we check if the next
-/// message is PauseSignal (source paused) or another RAM pass starts.
-async fn receive_ram_pass<S: AsyncRead + AsyncWrite + Unpin>(
-    ws: &mut WebSocketStream<S>,
-    memctx: &MemCtx,
-    status: &Arc<Mutex<MigrationStatus>>,
-) -> Result<RamPassResult, MigrateError> {
-    let mut sparse_gpas: Option<Vec<u64>> = None;
-
-    loop {
-        let msg = recv(ws).await?;
-        match msg {
-            Message::MemEnd => {
-                // This pass is done. Ack it.
-                ws.send(Message::MemDone.encode()).await?;
-
-                // Now wait for next action from source. Could be:
-                // - PauseSignal: source paused, final pass follows
-                // - MemEnd: empty convergence pass (0 dirty pages)
-                // - PageBatch/MemFetch: start of next dirty pass
-                loop {
-                    let next = recv(ws).await?;
-                    match next {
-                        Message::PauseSignal => {
-                            return Ok(RamPassResult::PauseSignal)
-                        }
-                        Message::MemEnd => {
-                            // Empty pass — ack and keep waiting
-                            ws.send(Message::MemDone.encode()).await?;
-                            continue;
-                        }
-                        Message::PageBatch {
-                            base_gpa,
-                            page_count,
-                            flags,
-                            data,
-                        } => {
-                            apply_page_batch(
-                                memctx, base_gpa, page_count, flags, &data,
-                                None, status,
-                            )?;
-                            continue_ram_pass(ws, memctx, status).await?;
-                            return Ok(RamPassResult::MorePasses);
-                        }
-                        Message::MemFetch(gpas) => {
-                            sparse_gpas = Some(gpas);
-                            continue_ram_pass_with_sparse(
-                                ws,
-                                memctx,
-                                status,
-                                &mut sparse_gpas,
-                            )
-                            .await?;
-                            return Ok(RamPassResult::MorePasses);
-                        }
-                        other => {
-                            return Err(MigrateError::UnexpectedMessage {
-                                expected: "PauseSignal, PageBatch, or MemEnd"
-                                    .to_string(),
-                                got: format!("{other:?}"),
-                            })
-                        }
-                    }
-                }
-            }
-            Message::PageBatch {
-                base_gpa,
-                page_count,
-                flags,
-                data,
-            } => {
-                // Contiguous batch of pages
-                apply_page_batch(
-                    memctx, base_gpa, page_count, flags, &data, None, status,
-                )?;
-            }
-            Message::MemFetch(gpas) => {
-                // Sparse dirty pages: GPA list followed by PageBatch
-                sparse_gpas = Some(gpas);
-            }
-            other => {
-                return Err(MigrateError::UnexpectedMessage {
-                    expected: "PageBatch, MemFetch, or MemEnd".to_string(),
-                    got: format!("{other:?}"),
-                });
-            }
-        }
-
-        // If we received a MemFetch, the next message should be a PageBatch
-        if let Some(ref gpas) = sparse_gpas {
-            let batch_msg = recv(ws).await?;
-            match batch_msg {
-                Message::PageBatch {
-                    base_gpa,
-                    page_count,
-                    flags,
-                    data,
-                } => {
-                    apply_page_batch(
-                        memctx,
-                        base_gpa,
-                        page_count,
-                        flags,
-                        &data,
-                        Some(gpas),
-                        status,
-                    )?;
-                }
-                other => {
-                    return Err(MigrateError::UnexpectedMessage {
-                        expected: "PageBatch after MemFetch".to_string(),
-                        got: format!("{other:?}"),
-                    });
-                }
-            }
-            sparse_gpas = None;
-        }
+/// A destination started with one disk fewer would otherwise resume the
+/// guest with that disk at reset and no error anywhere.
+fn check_topology(
+    source: &[DeviceIdentity],
+    local: &[DeviceIdentity],
+) -> Result<(), MigrateError> {
+    let named = |set: &[DeviceIdentity]| -> Vec<String> {
+        let mut v: Vec<String> = set.iter().map(|d| d.to_string()).collect();
+        v.sort();
+        v
+    };
+    let src = named(source);
+    let dst = named(local);
+    if src == dst {
+        return Ok(());
     }
+    let only_src: Vec<&String> =
+        src.iter().filter(|d| !dst.contains(d)).collect();
+    let only_dst: Vec<&String> =
+        dst.iter().filter(|d| !src.contains(d)).collect();
+    Err(MigrateError::PreambleMismatch(format!(
+        "device set mismatch: only on the source {only_src:?}, \
+         only here {only_dst:?}",
+    )))
 }
 
-/// Receive the final post-pause RAM pass. No peek for PauseSignal —
-/// just batches until MemEnd, then ack and return.
-async fn receive_final_ram_pass<S: AsyncRead + AsyncWrite + Unpin>(
-    ws: &mut WebSocketStream<S>,
+/// Give every device the state its counterpart exported, matched by PCI
+/// address alone.
+fn restore_devices(
+    dev_state: &DeviceState,
+    config: &DestConfig,
+    hooks: &DestHooks,
+    log: &slog::Logger,
+) -> Result<(), MigrateError> {
+    let expected: BTreeMap<WireBdf, &str> = config
+        .devices
+        .iter()
+        .map(|d| (d.bdf, d.kind.as_str()))
+        .collect();
+    let mut seen: BTreeMap<WireBdf, ()> = BTreeMap::new();
+    for entry in &dev_state.emulated {
+        if !expected.contains_key(&entry.bdf) {
+            return Err(MigrateError::State(format!(
+                "payload carries state for {}, which this VM has no device \
+                 at",
+                entry.bdf,
+            )));
+        }
+        if seen.insert(entry.bdf, ()).is_some() {
+            return Err(MigrateError::State(format!(
+                "payload carries two states for {}",
+                entry.bdf,
+            )));
+        }
+    }
+    // A device this VM has and the payload does not would resume at
+    // reset while the guest driver believes it configured.
+    if let Some(bdf) = expected.keys().find(|bdf| !seen.contains_key(bdf)) {
+        return Err(MigrateError::State(format!(
+            "payload carries no entry for {} ({})",
+            bdf, expected[bdf],
+        )));
+    }
+
+    if let Some(hyperv) = &dev_state.hyperv {
+        if !(hooks.hyperv)(hyperv) {
+            return Err(MigrateError::State(
+                "payload carries Hyper-V enlightenment state, and this VM \
+                 was not started with --hyperv"
+                    .into(),
+            ));
+        }
+    }
+
+    slog::info!(log, "restoring device state";
+        "devices" => dev_state.emulated.len());
+    for entry in &dev_state.emulated {
+        let Some(ref state) = entry.state else {
+            continue;
+        };
+        (hooks.restore)(entry.bdf, state).map_err(|error| {
+            MigrateError::State(format!("{}: {error}", entry.bdf))
+        })?;
+    }
+    Ok(())
+}
+
+/// What ends one RAM pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassEnd {
+    /// Keep taking passes until the source says it has paused.
+    PauseSignal,
+    /// Take exactly one pass: the final one.
+    MemEnd,
+}
+
+/// Take RAM passes until the pass end arrives.
+///
+/// A `MemFetch` commits the peer to sending exactly one `PageBatch`
+/// next, and the GPA list it carries is the only thing that says where
+/// those pages go. Anything else after it would silently discard them.
+fn receive_pass<S: Transport>(
+    chan: &mut Chan<S>,
     memctx: &MemCtx,
     status: &Arc<Mutex<MigrationStatus>>,
+    until: PassEnd,
 ) -> Result<(), MigrateError> {
-    let mut sparse_gpas: Option<Vec<u64>> = None;
+    let mut sparse: Option<Vec<u64>> = None;
     loop {
-        if let Some(ref gpas) = sparse_gpas {
-            let batch_msg = recv(ws).await?;
-            match batch_msg {
+        let msg = chan.recv()?;
+        match (msg, sparse.take()) {
+            (
                 Message::PageBatch {
                     base_gpa,
                     page_count,
                     flags,
                     data,
-                } => {
-                    apply_page_batch(
-                        memctx,
-                        base_gpa,
-                        page_count,
-                        flags,
-                        &data,
-                        Some(gpas),
-                        status,
-                    )?;
-                }
-                other => {
-                    return Err(MigrateError::UnexpectedMessage {
-                        expected: "PageBatch after MemFetch".to_string(),
-                        got: format!("{other:?}"),
-                    });
+                },
+                gpas,
+            ) => {
+                apply_page_batch(
+                    memctx,
+                    base_gpa,
+                    page_count,
+                    flags,
+                    &data,
+                    gpas.as_deref(),
+                    status,
+                )?;
+            }
+            (Message::MemFetch(gpas), None) => sparse = Some(gpas),
+            (Message::MemEnd, None) => {
+                chan.send(&Message::MemDone)?;
+                if until == PassEnd::MemEnd {
+                    return Ok(());
                 }
             }
-            sparse_gpas = None;
-        }
-
-        let msg = recv(ws).await?;
-        match msg {
-            Message::MemEnd => {
-                ws.send(Message::MemDone.encode()).await?;
+            (Message::PauseSignal, None) if until == PassEnd::PauseSignal => {
                 return Ok(());
             }
-            Message::PageBatch {
-                base_gpa,
-                page_count,
-                flags,
-                data,
-            } => {
-                apply_page_batch(
-                    memctx, base_gpa, page_count, flags, &data, None, status,
-                )?;
+            (other, Some(_)) => {
+                return Err(unexpected("PageBatch following MemFetch", &other));
             }
-            Message::MemFetch(gpas) => {
-                sparse_gpas = Some(gpas);
-            }
-            other => {
-                return Err(MigrateError::UnexpectedMessage {
-                    expected: "PageBatch, MemFetch, or MemEnd".to_string(),
-                    got: format!("{other:?}"),
-                });
+            (other, None) => {
+                return Err(unexpected(
+                    "PageBatch/MemFetch/MemEnd/PauseSignal",
+                    &other,
+                ));
             }
         }
     }
 }
 
-/// Continue receiving a RAM pass after we already consumed one message.
-async fn continue_ram_pass<S: AsyncRead + AsyncWrite + Unpin>(
-    ws: &mut WebSocketStream<S>,
-    memctx: &MemCtx,
-    status: &Arc<Mutex<MigrationStatus>>,
-) -> Result<(), MigrateError> {
-    let mut sparse_gpas: Option<Vec<u64>> = None;
-    continue_ram_pass_with_sparse(ws, memctx, status, &mut sparse_gpas).await
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ident(dev: u8, kind: &str) -> DeviceIdentity {
+        DeviceIdentity {
+            bdf: WireBdf {
+                bus: 0,
+                dev,
+                func: 0,
+            },
+            kind: kind.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_matching_device_set_is_accepted() {
+        let set = vec![ident(4, "nvme"), ident(5, "virtio-blk")];
+        check_topology(&set, &set).expect("same set");
+    }
+
+    #[test]
+    fn set_order_does_not_matter() {
+        let src = vec![ident(5, "virtio-blk"), ident(4, "nvme")];
+        let dst = vec![ident(4, "nvme"), ident(5, "virtio-blk")];
+        check_topology(&src, &dst).expect("same set, other order");
+    }
+
+    #[test]
+    fn a_destination_started_with_one_disk_fewer_is_refused() {
+        // The guest would otherwise arrive with that disk at reset and
+        // no error anywhere.
+        let src = vec![ident(4, "nvme"), ident(5, "virtio-blk")];
+        let dst = vec![ident(4, "nvme")];
+        let error = check_topology(&src, &dst).expect_err("must refuse");
+        assert!(error.to_string().contains("virtio-blk@0.5.0"), "{error}");
+    }
+
+    #[test]
+    fn a_device_of_another_kind_at_the_same_address_is_refused() {
+        let src = vec![ident(4, "nvme")];
+        let dst = vec![ident(4, "virtio-blk")];
+        check_topology(&src, &dst).expect_err("kind is part of identity");
+    }
 }
 
-async fn continue_ram_pass_with_sparse<S: AsyncRead + AsyncWrite + Unpin>(
-    ws: &mut WebSocketStream<S>,
-    memctx: &MemCtx,
-    status: &Arc<Mutex<MigrationStatus>>,
-    sparse_gpas: &mut Option<Vec<u64>>,
-) -> Result<(), MigrateError> {
-    loop {
-        // Handle pending sparse GPAs
-        if let Some(ref gpas) = sparse_gpas {
-            let batch_msg = recv(ws).await?;
-            match batch_msg {
-                Message::PageBatch {
-                    base_gpa,
-                    page_count,
-                    flags,
+#[cfg(test)]
+mod pass_tests {
+    use super::*;
+    use crate::codec::PAGE_BATCH_FLAG_ZSTD;
+    use crate::protocol::PAGE_SIZE;
+    use crate::wire::Deadlines;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    use vmm_core::mem::PhysMap;
+
+    const RAM: usize = 64 * 1024;
+
+    fn memctx() -> MemCtx {
+        MemCtx::new(Arc::new(
+            PhysMap::new_anon(0, RAM).expect("anonymous guest memory"),
+        ))
+    }
+
+    fn status() -> Arc<Mutex<MigrationStatus>> {
+        Arc::new(Mutex::new(MigrationStatus::default()))
+    }
+
+    /// A connected pair of channels, source end first.
+    fn pair(deadlines: Deadlines) -> (Chan<UnixStream>, Chan<UnixStream>) {
+        let (a, b) = UnixStream::pair().expect("socket pair");
+        (
+            Chan::new(a, tungstenite::protocol::Role::Client, deadlines)
+                .expect("source channel"),
+            Chan::new(b, tungstenite::protocol::Role::Server, deadlines)
+                .expect("destination channel"),
+        )
+    }
+
+    fn page(fill: u8) -> Vec<u8> {
+        vec![fill; PAGE_SIZE]
+    }
+
+    fn read_page(memctx: &MemCtx, gpa: u64) -> Vec<u8> {
+        let mut out = vec![0u8; PAGE_SIZE];
+        crate::pages::read_pages(memctx, &[gpa], &mut out).expect("read back");
+        out
+    }
+
+    #[test]
+    fn a_whole_pass_lands_every_page_it_carried() {
+        // The phase machine had no end-to-end test at all, so a
+        // destination that dropped a sparse batch looked correct.
+        let (mut source, mut dest) = pair(Deadlines::default());
+        let sender = std::thread::spawn(move || {
+            // Contiguous.
+            source
+                .send(&Message::PageBatch {
+                    base_gpa: 0,
+                    page_count: 2,
+                    flags: 0,
+                    data: [page(0xAA), page(0xBB)].concat(),
+                })
+                .expect("contiguous batch");
+            // Sparse: the GPA list is the only thing that says where
+            // these pages go.
+            let gpas = vec![0x8000u64, 0xC000];
+            source.send(&Message::MemFetch(gpas)).expect("fetch");
+            source
+                .send(&Message::PageBatch {
+                    base_gpa: 0x8000,
+                    page_count: 2,
+                    flags: 0,
+                    data: [page(0xCC), page(0xDD)].concat(),
+                })
+                .expect("sparse batch");
+            source.send(&Message::MemEnd).expect("end of pass");
+            source.expect_mem_done().expect("the pass is acknowledged");
+            source.send(&Message::PauseSignal).expect("pause");
+            source
+        });
+        let memctx = memctx();
+        receive_pass(&mut dest, &memctx, &status(), PassEnd::PauseSignal)
+            .expect("a well-formed pass");
+        sender.join().expect("the sender finished");
+
+        assert_eq!(read_page(&memctx, 0), page(0xAA));
+        assert_eq!(read_page(&memctx, PAGE_SIZE as u64), page(0xBB));
+        assert_eq!(read_page(&memctx, 0x8000), page(0xCC));
+        assert_eq!(read_page(&memctx, 0xC000), page(0xDD));
+    }
+
+    #[test]
+    fn a_compressed_batch_lands_the_same_bytes() {
+        let (mut source, mut dest) = pair(Deadlines::default());
+        let raw = [page(0x11), page(0x22)].concat();
+        let data = zstd::bulk::compress(&raw, 1).expect("compress");
+        let sender = std::thread::spawn(move || {
+            source
+                .send(&Message::PageBatch {
+                    base_gpa: 0,
+                    page_count: 2,
+                    flags: PAGE_BATCH_FLAG_ZSTD,
                     data,
-                } => {
-                    apply_page_batch(
-                        memctx,
-                        base_gpa,
-                        page_count,
-                        flags,
-                        &data,
-                        Some(gpas),
-                        status,
-                    )?;
-                }
-                other => {
-                    return Err(MigrateError::UnexpectedMessage {
-                        expected: "PageBatch after MemFetch".to_string(),
-                        got: format!("{other:?}"),
-                    });
-                }
-            }
-            *sparse_gpas = None;
-        }
-
-        let msg = recv(ws).await?;
-        match msg {
-            Message::MemEnd => {
-                ws.send(Message::MemDone.encode()).await?;
-                return Ok(());
-            }
-            Message::PageBatch {
-                base_gpa,
-                page_count,
-                flags,
-                data,
-            } => {
-                apply_page_batch(
-                    memctx, base_gpa, page_count, flags, &data, None, status,
-                )?;
-            }
-            Message::MemFetch(gpas) => {
-                *sparse_gpas = Some(gpas);
-            }
-            other => {
-                return Err(MigrateError::UnexpectedMessage {
-                    expected: "PageBatch, MemFetch, or MemEnd".to_string(),
-                    got: format!("{other:?}"),
-                });
-            }
-        }
+                })
+                .expect("batch");
+            source.send(&Message::MemEnd).expect("end");
+            source
+        });
+        let memctx = memctx();
+        receive_pass(&mut dest, &memctx, &status(), PassEnd::MemEnd)
+            .expect("a compressed pass");
+        sender.join().expect("the sender finished");
+        assert_eq!(read_page(&memctx, 0), page(0x11));
     }
-}
 
-/// Receive a single message from the WebSocket.
-async fn recv<S: AsyncRead + AsyncWrite + Unpin>(
-    ws: &mut WebSocketStream<S>,
-) -> Result<Message, MigrateError> {
-    let frame = ws.next().await.ok_or_else(|| {
-        MigrateError::WebSocket("connection closed unexpectedly".to_string())
-    })??;
-    Message::decode(frame)
-}
-
-/// Expect an Okay message; return error if anything else.
-fn expect_okay(msg: Message) -> Result<(), MigrateError> {
-    match msg {
-        Message::Okay => Ok(()),
-        Message::Error(e) => Err(MigrateError::RemoteError(e.to_string())),
-        other => Err(MigrateError::UnexpectedMessage {
-            expected: "Okay".to_string(),
-            got: format!("{other:?}"),
-        }),
+    #[test]
+    fn anything_but_a_batch_after_a_fetch_is_refused() {
+        // A MemFetch commits the peer to exactly one PageBatch. Taking
+        // anything else silently discards the pages those GPAs stand
+        // for.
+        let (mut source, mut dest) = pair(Deadlines::default());
+        let sender = std::thread::spawn(move || {
+            source
+                .send(&Message::MemFetch(vec![0x8000]))
+                .expect("fetch");
+            source.send(&Message::MemEnd).expect("not a batch");
+            source
+        });
+        let error =
+            receive_pass(&mut dest, &memctx(), &status(), PassEnd::MemEnd)
+                .expect_err("a fetch without its batch");
+        assert!(
+            error.to_string().contains("PageBatch following MemFetch"),
+            "{error}",
+        );
+        sender.join().expect("the sender finished");
     }
-}
 
-/// Expect a Serialized message; return the payload bytes.
-fn expect_serialized(msg: Message) -> Result<Vec<u8>, MigrateError> {
-    match msg {
-        Message::Serialized(data) => Ok(data),
-        Message::Error(e) => Err(MigrateError::RemoteError(e.to_string())),
-        other => Err(MigrateError::UnexpectedMessage {
-            expected: "Serialized".to_string(),
-            got: format!("{other:?}"),
-        }),
+    #[test]
+    fn a_pause_signal_does_not_end_the_final_pass() {
+        // The final pass ends at MemEnd. A peer that sends PauseSignal
+        // there is out of step, and taking it would leave the guest
+        // short of its last dirty pages.
+        let (mut source, mut dest) = pair(Deadlines::default());
+        let sender = std::thread::spawn(move || {
+            source.send(&Message::PauseSignal).expect("pause");
+            source
+        });
+        receive_pass(&mut dest, &memctx(), &status(), PassEnd::MemEnd)
+            .expect_err("a pause in the final pass");
+        sender.join().expect("the sender finished");
     }
-}
 
-/// Update the migration phase in shared status.
-fn set_phase(status: &Arc<Mutex<MigrationStatus>>, phase: MigrationPhase) {
-    if let Ok(mut s) = status.lock() {
-        s.phase = phase;
+    #[test]
+    fn a_silent_peer_does_not_hold_the_destination_for_ever() {
+        // After the pause the guest is stopped on both hosts, so every
+        // second of waiting is guest downtime.
+        let deadlines = Deadlines {
+            pre_pause: Duration::from_millis(200),
+            post_pause: Duration::from_millis(200),
+            ..Deadlines::default()
+        };
+        let (source, mut dest) = pair(deadlines);
+        let started = std::time::Instant::now();
+        receive_pass(&mut dest, &memctx(), &status(), PassEnd::MemEnd)
+            .expect_err("a peer that says nothing");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(source);
     }
 }

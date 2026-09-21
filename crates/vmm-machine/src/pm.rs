@@ -28,7 +28,7 @@ use vmm_devices::hotplug::pci::{
 };
 use vmm_devices::pvpanic::{PvPanic, PVPANIC_IOPORT};
 
-use crate::hotplug::hot_add_window;
+use crate::hotplug::mem::hot_add_window;
 use crate::hotplug::mem::{MemHotplugEngine, MemWindow, DEFAULT_SLOT_SIZE};
 use crate::opts::VmOpts;
 use crate::registry::{DeviceRegistry, RegisteredDevice, RegistryError};
@@ -161,8 +161,9 @@ pub struct TimerAndPmDevices {
 
 /// Claim the GPE0 register block, or nothing at all.
 ///
-/// `hotplug` must come from [`crate::firmware::hotplug_enabled`], the
-/// one decision the FADT and the DSDT also read. Without hotplug the
+/// `hotplug` must be the same `VmOpts::hotplug` the FADT and the DSDT
+/// read through [`crate::firmware::setup_fwcfg_and_acpi`]. Without
+/// hotplug the
 /// FADT publishes GPE0_BLK = 0 and the DSDT reserves no port, while it
 /// does advertise 0x0D00-0xFFFF as the PCI I/O window. 0xAFE0 is inside
 /// that window, so a VM that claimed the port would hold an address the

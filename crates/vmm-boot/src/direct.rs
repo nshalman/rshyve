@@ -26,6 +26,10 @@ use std::path::Path;
 
 use anyhow::{ensure, Context, Result};
 
+use crate::bsp::{
+    self, FlatSegments, CR0_ET, CR0_PE, GDT_DATA, RFLAGS_RESERVED_BIT1,
+    SEG_TYPE_CODE_XRA,
+};
 use crate::{BootVcpu, ImageBytes};
 use vmm_core::mem::MemCtx;
 use vmm_devices::acpi;
@@ -76,6 +80,12 @@ const VERSION_OFFSET: usize = 0x206;
 const PREF_ADDRESS_OFFSET: usize = 0x258;
 const XLOADFLAGS_OFFSET: usize = 0x236;
 const XLF_KERNEL_64: u16 = 1;
+/// Dword at 0x238: the longest command line this kernel will read.
+/// Valid from protocol 2.06; x86 kernels advertise
+/// `COMMAND_LINE_SIZE - 1`, which is 2047 today.
+const CMDLINE_SIZE_OFFSET: usize = 0x238;
+/// The limit before 2.06 added the field, for an image that leaves it 0.
+const CMDLINE_SIZE_LEGACY: u32 = 255;
 const SETUP_HEADER_END: usize = 0x290;
 
 // ── boot_params (zero page) offsets ────────────────────────────────
@@ -107,8 +117,6 @@ const PTE_PAGE_SIZE: u64 = 1 << 7; // 2MB large page
 
 // ── x86 control register bits ──────────────────────────────────────
 
-const CR0_PE: u64 = 1 << 0; // Protection Enable
-const CR0_ET: u64 = 1 << 4; // Extension Type (387 coprocessor)
 const CR0_NE: u64 = 1 << 5; // Numeric Error (native FPU error reporting)
 const CR0_PG: u64 = 1 << 31; // Paging
 
@@ -131,39 +139,11 @@ const EFER_LMA: u64 = 1 << 10; // Long Mode Active
 /// S=1, DPL=0, P=1, L=1, G=1
 const GDT_CODE64: u64 = 0x00AF_9B00_0000_FFFF;
 
-/// 64-bit data segment: Base=0, Limit=0xFFFFF, Type=0x03 (read/write/accessed),
-/// S=1, DPL=0, P=1, DB=1, G=1
-const GDT_DATA64: u64 = 0x00CF_9300_0000_FFFF;
-
-/// GDT selector for the 64-bit code segment (entry 1).
-const GDT_SEL_CODE64: u64 = 0x08;
-
-/// GDT selector for the 64-bit data segment (entry 2).
-const GDT_SEL_DATA64: u64 = 0x10;
-
 /// GDT byte size: 3 entries (null + code + data) * 8 bytes each.
 const GDT_SIZE: usize = 24;
 
 /// GDTR limit = GDT_SIZE - 1.
 const GDTR_LIMIT: u32 = (GDT_SIZE as u32) - 1;
-
-// ── Segment descriptor type bits ───────────────────────────────────
-//
-// These are the low 4 bits of the segment access byte.
-
-/// Execute/Read/Accessed (code segment).
-const SEG_TYPE_CODE_XRA: u32 = 0x0B;
-
-/// Read/Write/Accessed (data segment).
-const SEG_TYPE_DATA_RWA: u32 = 0x03;
-
-/// Busy 64-bit TSS.
-const SEG_TYPE_TSS_BUSY64: u32 = 0x0B;
-
-// ── Miscellaneous register values ──────────────────────────────────
-
-/// RFLAGS initial value: bit 1 is architecturally reserved as 1.
-const RFLAGS_RESERVED_BIT1: u64 = 0x02;
 
 // ── Parsed bzImage ──────────────────────────────────────────────────
 
@@ -177,6 +157,8 @@ pub struct KernelImage {
     version: u16,
     /// Preferred load address (typically 0x100_0000).
     pref_address: u64,
+    /// Longest command line this kernel reads, from `cmdline_size`.
+    cmdline_size: u32,
 }
 
 // Debug leaves out the image bytes. A derived one prints a whole
@@ -188,6 +170,7 @@ impl fmt::Debug for KernelImage {
             .field("setup_sects", &self.setup_sects)
             .field("version", &format_args!("{:#06x}", self.version))
             .field("pref_address", &format_args!("{:#x}", self.pref_address))
+            .field("cmdline_size", &self.cmdline_size)
             .finish()
     }
 }
@@ -260,12 +243,34 @@ impl KernelImage {
                 .unwrap(),
         );
 
+        let cmdline_size = u32::from_le_bytes(
+            data[CMDLINE_SIZE_OFFSET..CMDLINE_SIZE_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let cmdline_size = if cmdline_size == 0 {
+            CMDLINE_SIZE_LEGACY
+        } else {
+            cmdline_size
+        };
+
         Ok(Self {
             data,
             setup_sects,
             version,
             pref_address,
+            cmdline_size,
         })
+    }
+
+    /// Longest command line this kernel will read, in bytes.
+    ///
+    /// The kernel truncates at its own `COMMAND_LINE_SIZE` without a
+    /// word, so a longer line loses its tail (an `init=` at the end,
+    /// for example). `CMDLINE_MAX` is the guest-memory ceiling and
+    /// applies as well.
+    pub fn cmdline_limit(&self) -> usize {
+        (self.cmdline_size as usize).min(CMDLINE_MAX - 1)
     }
 
     /// 64-bit entry point address.
@@ -346,10 +351,11 @@ pub fn load_kernel(
         .context("failed to write kernel to guest memory")?;
 
     // 2. Write kernel command line
+    let cmdline_limit = kernel.cmdline_limit();
     ensure!(
-        cmdline.len() < CMDLINE_MAX,
-        "cmdline too long (max {})",
-        CMDLINE_MAX
+        cmdline.len() <= cmdline_limit,
+        "cmdline is {} bytes and this kernel reads at most {cmdline_limit}",
+        cmdline.len(),
     );
     let mut cmdline_buf = cmdline.as_bytes().to_vec();
     cmdline_buf.push(0); // NUL terminate
@@ -431,7 +437,7 @@ fn write_gdt(mem: &MemCtx) -> Result<()> {
     gdt[8..16].copy_from_slice(&GDT_CODE64.to_le_bytes());
 
     // Entry 2 (selector GDT_SEL_DATA64): 64-bit data segment
-    gdt[16..24].copy_from_slice(&GDT_DATA64.to_le_bytes());
+    gdt[16..24].copy_from_slice(&GDT_DATA.to_le_bytes());
 
     mem.write(GPA_GDT, &gdt).context("GDT")?;
     Ok(())
@@ -496,8 +502,7 @@ pub fn setup_direct_boot_bsp<V: BootVcpu + ?Sized>(
     entry_point: u64,
 ) -> Result<()> {
     use bhyve_api::{
-        seg_desc, vm_reg_name::*, SEG_ACCESS_DB, SEG_ACCESS_G, SEG_ACCESS_L,
-        SEG_ACCESS_P, SEG_ACCESS_S, SEG_ACCESS_UNUSABLE,
+        vm_reg_name::*, SEG_ACCESS_G, SEG_ACCESS_L, SEG_ACCESS_P, SEG_ACCESS_S,
     };
 
     vcpu.reboot_state().context("reboot_state")?;
@@ -508,107 +513,26 @@ pub fn setup_direct_boot_bsp<V: BootVcpu + ?Sized>(
     vcpu.set_reg(VM_REG_GUEST_CR4, CR4_PAE)?;
     vcpu.set_reg(VM_REG_GUEST_EFER, EFER_LMA | EFER_LME)?;
 
-    // 64-bit code segment
-    let code64_access = SEG_ACCESS_P
-        | SEG_ACCESS_S
-        | SEG_ACCESS_L
-        | SEG_ACCESS_G
-        | SEG_TYPE_CODE_XRA;
-    vcpu.set_segment_desc(
-        VM_REG_GUEST_CS,
-        &seg_desc {
-            base: 0,
-            limit: u32::MAX,
-            access: code64_access,
-        },
-    )?;
-    vcpu.set_reg(VM_REG_GUEST_CS, GDT_SEL_CODE64)?;
-
-    // Data segments
-    let data_access = SEG_ACCESS_P
-        | SEG_ACCESS_S
-        | SEG_ACCESS_DB
-        | SEG_ACCESS_G
-        | SEG_TYPE_DATA_RWA;
-    let data_desc = seg_desc {
-        base: 0,
-        limit: u32::MAX,
-        access: data_access,
-    };
-    for reg in [
-        VM_REG_GUEST_DS,
-        VM_REG_GUEST_ES,
-        VM_REG_GUEST_FS,
-        VM_REG_GUEST_GS,
-        VM_REG_GUEST_SS,
-    ] {
-        vcpu.set_segment_desc(reg, &data_desc)?;
-        vcpu.set_reg(reg, GDT_SEL_DATA64)?;
-    }
-
-    // GDTR
-    vcpu.set_segment_desc(
-        VM_REG_GUEST_GDTR,
-        &seg_desc {
-            base: GPA_GDT,
-            limit: GDTR_LIMIT,
-            access: 0,
+    bsp::program_flat_segments(
+        vcpu,
+        &FlatSegments {
+            // L, not D/B: this is a 64-bit code segment.
+            code_access: SEG_ACCESS_P
+                | SEG_ACCESS_S
+                | SEG_ACCESS_L
+                | SEG_ACCESS_G
+                | SEG_TYPE_CODE_XRA,
+            gdt_base: GPA_GDT,
+            gdt_limit: GDTR_LIMIT,
         },
     )?;
 
-    // TR (busy 64-bit TSS) — VMX requires a valid, present TR
-    vcpu.set_segment_desc(
-        VM_REG_GUEST_TR,
-        &seg_desc {
-            base: 0,
-            limit: u16::MAX as u32,
-            access: SEG_ACCESS_P | SEG_TYPE_TSS_BUSY64,
-        },
-    )?;
-    vcpu.set_reg(VM_REG_GUEST_TR, 0)?;
-
-    // LDTR — mark unusable (VMX requires UNUSABLE bit when not loaded)
-    vcpu.set_segment_desc(
-        VM_REG_GUEST_LDTR,
-        &seg_desc {
-            base: 0,
-            limit: 0,
-            access: SEG_ACCESS_UNUSABLE,
-        },
-    )?;
-    vcpu.set_reg(VM_REG_GUEST_LDTR, 0)?;
-
-    // IDTR — no IDT initially (kernel will set it up)
-    vcpu.set_segment_desc(
-        VM_REG_GUEST_IDTR,
-        &seg_desc {
-            base: 0,
-            limit: u16::MAX as u32,
-            access: 0,
-        },
-    )?;
-
-    // Entry point and boot protocol registers
     vcpu.set_reg(VM_REG_GUEST_RIP, entry_point)?;
-    vcpu.set_reg(VM_REG_GUEST_RSI, GPA_BOOT_PARAMS)?; // boot_params pointer
     vcpu.set_reg(VM_REG_GUEST_RFLAGS, RFLAGS_RESERVED_BIT1)?;
-    vcpu.set_reg(VM_REG_GUEST_RSP, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_RBP, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_RDI, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_RBX, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_RCX, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_RDX, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_RAX, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_R8, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_R9, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_R10, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_R11, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_R12, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_R13, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_R14, 0)?;
-    vcpu.set_reg(VM_REG_GUEST_R15, 0)?;
+    // The Linux 64-bit entry contract fixes RSI only.
+    vcpu.set_reg(VM_REG_GUEST_RSI, GPA_BOOT_PARAMS)?;
+    bsp::zero_gprs(vcpu, VM_REG_GUEST_RSI)?;
 
-    // Mark runnable
     vcpu.set_run_state(bhyve_api::VRS_RUN)?;
 
     Ok(())
@@ -620,11 +544,69 @@ pub fn setup_direct_boot_bsp<V: BootVcpu + ?Sized>(
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
+    use vmm_core::mem::PhysMap;
+
     use crate::recording::Write;
 
     /// Where a bzImage is loaded by default. The boot scratch ranges
     /// below must all stop before it.
     const GPA_KERNEL: u64 = 0x10_0000;
+
+    const MIB: usize = 1024 * 1024;
+
+    /// Minimal bzImage carrying `cmdline_size`, loaded at 1 MiB so a
+    /// small anonymous guest holds it.
+    fn bzimage(cmdline_size: u32) -> Vec<u8> {
+        let mut img = vec![0u8; 0x2_0000];
+        img[HEADER_MAGIC_OFFSET..HEADER_MAGIC_OFFSET + 4]
+            .copy_from_slice(&HEADER_MAGIC.to_le_bytes());
+        img[VERSION_OFFSET..VERSION_OFFSET + 2]
+            .copy_from_slice(&0x020Fu16.to_le_bytes());
+        img[XLOADFLAGS_OFFSET..XLOADFLAGS_OFFSET + 2]
+            .copy_from_slice(&XLF_KERNEL_64.to_le_bytes());
+        img[SETUP_HEADER_OFFSET] = 4;
+        img[PREF_ADDRESS_OFFSET..PREF_ADDRESS_OFFSET + 8]
+            .copy_from_slice(&(GPA_KERNEL).to_le_bytes());
+        img[CMDLINE_SIZE_OFFSET..CMDLINE_SIZE_OFFSET + 4]
+            .copy_from_slice(&cmdline_size.to_le_bytes());
+        img
+    }
+
+    fn load(kernel: &KernelImage, cmdline: &str) -> Result<u64> {
+        let map = PhysMap::new_anon(0, 32 * MIB).expect("anon guest RAM");
+        let mem = MemCtx::new(Arc::new(map));
+        load_kernel(&mem, kernel, cmdline, None, 32 * MIB, 0xF2400)
+    }
+
+    #[test]
+    fn the_command_line_bound_is_the_kernels_own() {
+        // The kernel truncates at COMMAND_LINE_SIZE without a word, so
+        // a 3000-byte line silently lost its tail.
+        let kernel = KernelImage::from_bytes(bzimage(2047)).expect("parses");
+        assert_eq!(kernel.cmdline_limit(), 2047);
+
+        load(&kernel, &"a".repeat(2047)).expect("at the limit");
+        let err = load(&kernel, &"a".repeat(2048))
+            .expect_err("past the kernel's own limit");
+        assert!(err.to_string().contains("2047"), "{err}");
+    }
+
+    #[test]
+    fn a_kernel_with_no_cmdline_size_gets_the_pre_2_06_limit() {
+        let kernel = KernelImage::from_bytes(bzimage(0)).expect("parses");
+        assert_eq!(kernel.cmdline_limit(), 255);
+        assert!(load(&kernel, &"a".repeat(256)).is_err());
+    }
+
+    #[test]
+    fn the_guest_memory_ceiling_still_caps_a_boastful_kernel() {
+        // A kernel may advertise more than the page the loader reserves.
+        let kernel =
+            KernelImage::from_bytes(bzimage(u32::MAX)).expect("parses");
+        assert_eq!(kernel.cmdline_limit(), CMDLINE_MAX - 1);
+    }
 
     #[test]
     fn page_table_structure() {
@@ -642,7 +624,7 @@ mod tests {
     fn gdt_entries() {
         let mut gdt = [0u8; GDT_SIZE];
         gdt[8..16].copy_from_slice(&GDT_CODE64.to_le_bytes());
-        gdt[16..24].copy_from_slice(&GDT_DATA64.to_le_bytes());
+        gdt[16..24].copy_from_slice(&GDT_DATA.to_le_bytes());
 
         // Null descriptor
         assert_eq!(&gdt[..8], &[0u8; 8]);
@@ -659,7 +641,7 @@ mod tests {
         );
         // Data64: check DB bit is set
         assert_ne!(
-            GDT_DATA64 & (1 << 54),
+            GDT_DATA & (1 << 54),
             0,
             "DB bit must be set for data segment"
         );
@@ -745,15 +727,15 @@ mod tests {
                 reg(VM_REG_GUEST_LDTR, 0),
                 desc(VM_REG_GUEST_IDTR, 0, 0xFFFF, 0),
                 reg(VM_REG_GUEST_RIP, ENTRY),
-                reg(VM_REG_GUEST_RSI, 0x7000), // boot_params
                 reg(VM_REG_GUEST_RFLAGS, 0x02),
-                reg(VM_REG_GUEST_RSP, 0),
-                reg(VM_REG_GUEST_RBP, 0),
-                reg(VM_REG_GUEST_RDI, 0),
+                reg(VM_REG_GUEST_RSI, 0x7000), // boot_params
+                reg(VM_REG_GUEST_RAX, 0),
                 reg(VM_REG_GUEST_RBX, 0),
                 reg(VM_REG_GUEST_RCX, 0),
                 reg(VM_REG_GUEST_RDX, 0),
-                reg(VM_REG_GUEST_RAX, 0),
+                reg(VM_REG_GUEST_RDI, 0),
+                reg(VM_REG_GUEST_RBP, 0),
+                reg(VM_REG_GUEST_RSP, 0),
                 reg(VM_REG_GUEST_R8, 0),
                 reg(VM_REG_GUEST_R9, 0),
                 reg(VM_REG_GUEST_R10, 0),

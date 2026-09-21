@@ -69,16 +69,7 @@ pub fn cfg_read_bytes(cfg: &[u8], offset: u16, len: u8) -> u32 {
     out
 }
 
-fn queue_drain_should_stop(
-    queue: &VirtQueue,
-    before: u16,
-    hit_request_cap: bool,
-    physmap: &PhysMap,
-) -> bool {
-    queue.last_avail_idx() == before
-        || hit_request_cap
-        || !queue.has_new_avail(physmap)
-}
+pub(crate) use queue::queue_drain_should_stop;
 
 /// Trait implemented by VirtIO backend devices.
 ///
@@ -146,66 +137,59 @@ pub trait VirtioDevice: Send + Sync + 'static {
             None => return false,
         };
 
-        // Record used_idx before processing for interrupt suppression.
         let old_used_idx = queue.read_used_idx(physmap);
-
-        let mut did_work = false;
         let max_requests = usize::from(queue.size());
-        let mut popped = 0usize;
-
-        // EVENT_IDX re-check loop (VirtIO 1.3 sec 2.7.10):
-        // After draining the ring and setting used_event, re-read
-        // avail_idx. If the guest added entries during the race
-        // window, it may have decided not to kick — so we must
-        // process them here. Bound the total work to one queue's
-        // worth and stop if pop_avail() cannot make forward progress.
-        loop {
-            let before = queue.last_avail_idx();
-            while popped < max_requests {
-                let Some(head) = queue.pop_avail(physmap) else {
-                    break;
-                };
-                popped += 1;
-                let written =
-                    self.process_queue(queue_idx, queue, head, physmap);
-                queue.push_used(physmap, head, written);
-                did_work = true;
-            }
-
-            let hit_request_cap = popped >= max_requests;
-            if !hit_request_cap {
-                queue.update_used_event(physmap);
-            }
-            if queue_drain_should_stop(queue, before, hit_request_cap, physmap)
-            {
-                break;
-            }
-        }
-
-        // With EVENT_IDX, suppress the interrupt unless the used
-        // index crossed the guest's avail_event threshold.
-        did_work && queue.should_notify_guest(physmap, old_used_idx)
+        let popped = queue.drain_avail(physmap, max_requests, |queue, head| {
+            let written = self.process_queue(queue_idx, queue, head, physmap);
+            queue.push_used(physmap, head, written);
+        });
+        popped > 0 && queue.should_notify_guest(physmap, old_used_idx)
     }
 
-    /// Called when the guest sets a queue address (PFN) during setup.
+    /// Called when the guest programs or retires a queue's ring.
     ///
-    /// Kernel-accelerated devices override this to inform the kernel
-    /// of the queue ring addresses. The default does nothing.
-    fn queue_addr_set(&self, _queue_idx: u16, _queue: &VirtQueue) {
-        // Default: nothing to do for software-emulated devices
+    /// Kernel-accelerated devices tell the kernel where the ring is.
+    /// Devices that keep a used-ring writer per queue drop it here,
+    /// because it names the ring it was built on. The default does
+    /// nothing.
+    fn queue_addr_set(&self, _queue_idx: u16, _queue: &VirtQueue) {}
+
+    /// The `(avail_idx, used_idx)` a kernel backend holds for one ring.
+    ///
+    /// `None` says this device keeps no cursors of its own, so the
+    /// export reads them from the [`VirtQueue`] and guest memory. A
+    /// backend that owns them answers `Some` for every live ring, and
+    /// zero is an ordinary value in either position: both cursors count
+    /// in a u16 that wraps. An error fails the export, because the
+    /// userspace cursors are not a substitute for the ones the kernel
+    /// moved.
+    fn kernel_ring_indices(
+        &self,
+        _queue_idx: u16,
+    ) -> Result<Option<(u16, u16)>, vmm_devices::lifecycle::DeviceStateError>
+    {
+        Ok(None)
     }
 
-    /// Get kernel ring indices for migration export. Returns (avail_idx, used_idx).
-    /// Software devices return the VirtQueue indices; kernel devices query the kernel.
-    fn get_kernel_ring_indices(&self, _queue_idx: u16) -> (u16, u16) {
-        (0, 0)
+    /// Stop every ring before a migration restore programs them.
+    ///
+    /// A worker the destination left running reads a ring whose
+    /// addresses change under it, so a failure here has to fail the
+    /// restore.
+    fn reset_all_rings(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        Ok(())
     }
 
-    /// Reset all rings before migration restore. Kernel-accelerated
-    /// devices pause and reset all ring processing.
-    fn reset_all_rings(&self) {}
-
-    /// Restore ring state after migration with current indices + MSI-X.
+    /// Program one ring's addresses, cursors and MSI-X message from a
+    /// migration payload.
+    ///
+    /// The source commits the migration on the strength of this
+    /// answer, so every state the backend could not program has to
+    /// reach the caller. A destination that reported success over one
+    /// hands the guest a NIC that moves nothing or interrupts nobody,
+    /// with no source left to go back to.
     fn restore_ring_state(
         &self,
         _queue_idx: u16,
@@ -217,13 +201,32 @@ pub trait VirtioDevice: Send + Sync + 'static {
         _used_idx: u16,
         _msix_addr: u64,
         _msix_data: u32,
-    ) {
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        Ok(())
     }
 
     /// Pause kernel ring threads for migration export.
-    /// Must be called after vCPU pause to quiesce kernel I/O before
-    /// reading ring state. Only kernel-accelerated devices need this.
-    fn pause_rings_for_export(&self) {}
+    ///
+    /// Runs before the vCPUs pause so no ring entry is consumed
+    /// between the pause and the export. A failure fails the
+    /// migration: the indices the export would read are moving.
+    fn pause_rings_for_export(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        Ok(())
+    }
+
+    /// Put the rings [`Self::pause_rings_for_export`] stopped back to
+    /// work, after a migration that failed past the pause.
+    ///
+    /// A paused kernel ring is `VRS_STOP`, and viona answers a guest
+    /// kick on one with EBUSY. Without this the source guest resumes
+    /// with a NIC whose rings never move again.
+    fn resume_rings_after_migration(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        Ok(())
+    }
 
     /// Program notification addresses after migration.
     fn set_notify_addrs(&self, _pio_port: u16, _mmio_addr: u64) {}
@@ -397,6 +400,14 @@ mod tests {
         assert_eq!(device.processed(), 2);
         assert_eq!(queues[0].last_avail_idx(), 2);
         assert!(queues[0].has_new_avail(&physmap));
+        // The cap exit must still arm the kick for the entries left.
+        let avail_event_gpa = USED_GPA + 4 + u64::from(queues[0].size()) * 8;
+        let avail_event = physmap
+            .lookup(avail_event_gpa, 2)
+            .expect("mapped avail event")
+            .read::<u16>()
+            .expect("read avail event");
+        assert_eq!(avail_event, 2);
     }
 
     #[test]

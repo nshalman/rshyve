@@ -4,6 +4,7 @@
 
 //! Guest boot protocols shared by every binary in this workspace.
 
+mod bsp;
 pub mod bytes;
 pub mod direct;
 pub mod elf;

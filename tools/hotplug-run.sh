@@ -42,7 +42,12 @@
 # Exits 0 only when the guest reported result=OK and every check this
 # run asked for is in the report as a PASS.
 
+# errexit is deliberately off: every status this script cares about it
+# checks itself, and a bare `grep` or `kill` that answers non-zero is
+# normal here. pipefail is on so a failing left-hand side of a pipe is
+# not hidden by a succeeding right-hand side.
 set -u
+set -o pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 

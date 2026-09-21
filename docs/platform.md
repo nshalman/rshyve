@@ -1,9 +1,13 @@
 # Platform Image Integration
 
-## Drop-in Replacement Strategy
+## Replacing the platform bhyve
 
-The `rshyve` binary is a drop-in replacement for `/usr/sbin/bhyve`. It
-accepts the same CLI flags that `boot.c` constructs.
+The `rshyve` binary takes the command line `boot.c` constructs, so it
+can stand in for `/usr/sbin/bhyve`. It is not a complete bhyve:
+`ahci-hd` is refused at startup, `-D`, `-k` and `--json-config` are
+refused rather than ignored, an unknown `-s` driver name is logged and
+skipped, and several device options parse and then do nothing
+([features.md](features.md#accepted-by-the-cli-and-then-ignored)).
 
 ### Integration Path
 
@@ -35,7 +39,10 @@ rshyve -H
   SYSbhyve-<did>
 ```
 
-All of these flags are supported by `rshyve`.
+`rshyve` parses every one of these and boots from them. Some of the
+trailing options are then ignored: `nodelete` and `sectorsize` on a
+disk, `vga=` on the framebuffer, and `tablet` on xHCI. `password=` is
+used as given and is not base64-decoded.
 
 ### PCI Slot Assignments (boot.c convention)
 
@@ -95,8 +102,19 @@ Add to the SmartOS platform build:
 
 - `libdladm.so` - VNIC name resolution (dladm_name2info)
 - `libcrypto-smartos.so.3` - the platform OpenSSL, used by the vTPM
-- Kernel: bhyve VMM module (API v5+, v18 recommended)
-- Kernel: viona module (interface v6)
+- Kernel: bhyve VMM module, API v18. Use v18: it is what the `vnext`
+  platform ships and the only version this tree has run on. Nothing
+  enforces a floor, so an older kernel starts and then fails at an
+  ioctl or gives less without saying so. What the code needs, if a node
+  runs something older: v5 for the CPUID control every VM uses, v8 for
+  the `VCF_TRACK_DIRTY` create flag rshyve asks for unless
+  `--no-track-dirty` is given, and v13 for live migration, which writes
+  state through vmm-data (v13), imports guest time data (v11) and
+  exports the RTC at data version 2 (v12). From v16 a vCPU exit also
+  reports which vCPU took a triple fault. No version below 18 has been
+  tried.
+- Kernel: viona module, interface v6. Nothing checks this one either, so
+  a mismatched module surfaces as a raw ioctl errno.
 
 Every one of these ships in a stock platform image. `rshyve` must not
 depend on anything else, because a platform image has no pkgsrc: a
@@ -186,10 +204,11 @@ runs it on every build.
 | virtio-blk | Yes | Yes |
 | NVMe | Yes | Yes (async, zero-copy) |
 | virtio-net (viona) | Yes | Yes |
-| AHCI | Yes | Fallback to virtio-blk |
-| Framebuffer/VNC | Yes | Yes (Unix socket) |
-| xHCI tablet | Yes | Yes |
-| PCI passthrough | Yes | Yes (Intel + AMD) |
+| AHCI CD-ROM (`ahci-cd`) | Yes | Yes (ATAPI, zero-copy reads) |
+| AHCI disk (`ahci-hd`) | Yes | No, refused at startup |
+| Framebuffer/VNC | Yes | Unix socket only: no TCP, no `wait`, no VGA, Raw encoding, one client |
+| xHCI tablet | Yes | One slot, absolute pointer, no scroll wheel |
+| PCI passthrough | Yes | Intel VT-d only. There is no AMD IOMMU backend, MSI-X devices are refused, and no assigned device has ever been run (OSF-11) |
 | Live migration | No | Yes |
 | CPUID masking | No | Yes (--cpu-baseline) |
 | Built-in mdata | No | Yes |

@@ -58,7 +58,7 @@ const SMBIOS_MDF_UNKNOWN: u16 = 0x0004;
 const ENTRY_POINT_LEN: u8 = 0x1F;
 
 /// Configuration for SMBIOS table generation.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct SmbiosConfig {
     /// VM name, used as the product name in Type 1.
     pub vm_name: String,
@@ -83,6 +83,24 @@ pub struct SmbiosConfig {
     pub family: Option<String>,
 }
 
+/// A `-B` value or a VM size this generator will not encode.
+#[derive(Debug, thiserror::Error)]
+pub enum SmbiosError {
+    /// An empty value would emit a bare NUL, which is the double-NUL
+    /// that ends a structure: the guest would read the strings that
+    /// follow as the next structure header.
+    #[error("-B {key}= is empty; SMBIOS has no empty string")]
+    EmptyValue { key: &'static str },
+    /// Type 17 and Type 19 describe the range `0..memory_mb`, which is
+    /// not a range when the VM has no memory.
+    #[error("SMBIOS needs a non-zero memory size")]
+    NoMemory,
+    /// The structure table has a fixed window below 1 MiB, and the
+    /// legacy ACPI tables sit right above it.
+    #[error("SMBIOS table is {len} bytes, and only {max} fit below the legacy ACPI tables")]
+    TableTooLarge { len: usize, max: usize },
+}
+
 /// Parse the bhyve `-B` SMBIOS string.
 ///
 /// Format: `type,key=value,key=value,...`
@@ -90,7 +108,7 @@ pub struct SmbiosConfig {
 ///
 /// Only type 1 (System Information) is supported. Other types are
 /// silently ignored.
-pub fn parse_smbios_flag(s: &str) -> SmbiosConfig {
+pub fn parse_smbios_flag(s: &str) -> Result<SmbiosConfig, SmbiosError> {
     let mut config = SmbiosConfig {
         vm_name: String::new(),
         uuid: None,
@@ -106,37 +124,33 @@ pub fn parse_smbios_flag(s: &str) -> SmbiosConfig {
 
     // First token is the type number
     let parts: Vec<&str> = s.splitn(2, ',').collect();
-    if parts.is_empty() {
-        return config;
-    }
 
     // Only handle type 1 (System Information)
-    let type_num = parts[0].trim();
-    if type_num != "1" {
-        return config;
+    if parts[0].trim() != "1" {
+        return Ok(config);
     }
 
     if let Some(kvs) = parts.get(1) {
         for kv in kvs.split(',') {
-            if let Some(eq) = kv.find('=') {
-                let key = &kv[..eq];
-                let val = &kv[eq + 1..];
-                match key {
-                    "manufacturer" => {
-                        config.manufacturer = Some(val.to_string())
-                    }
-                    "product" => config.product = Some(val.to_string()),
-                    "version" => config.version = Some(val.to_string()),
-                    "serial" => config.serial = Some(val.to_string()),
-                    "sku" => config.sku = Some(val.to_string()),
-                    "family" => config.family = Some(val.to_string()),
-                    _ => {}
-                }
+            let Some(eq) = kv.find('=') else { continue };
+            let (key, val) = (&kv[..eq], &kv[eq + 1..]);
+            let (field, name) = match key {
+                "manufacturer" => (&mut config.manufacturer, "manufacturer"),
+                "product" => (&mut config.product, "product"),
+                "version" => (&mut config.version, "version"),
+                "serial" => (&mut config.serial, "serial"),
+                "sku" => (&mut config.sku, "sku"),
+                "family" => (&mut config.family, "family"),
+                _ => continue,
+            };
+            if val.is_empty() {
+                return Err(SmbiosError::EmptyValue { key: name });
             }
+            *field = Some(val.to_string());
         }
     }
 
-    config
+    Ok(config)
 }
 
 /// Generate SMBIOS tables suitable for fw_cfg delivery.
@@ -146,7 +160,13 @@ pub fn parse_smbios_flag(s: &str) -> SmbiosConfig {
 ///   `etc/smbios/smbios-anchor`)
 /// - `tables`: the concatenated structure tables (goes into
 ///   `etc/smbios/smbios-tables`)
-pub fn generate_smbios(config: &SmbiosConfig) -> (Vec<u8>, Vec<u8>) {
+pub fn generate_smbios(
+    config: &SmbiosConfig,
+    max_table_len: usize,
+) -> Result<(Vec<u8>, Vec<u8>), SmbiosError> {
+    if config.memory_mb == 0 {
+        return Err(SmbiosError::NoMemory);
+    }
     let mut tables = Vec::with_capacity(1024);
     let mut handle: u16 = 0;
     let mut max_struct_size: u16 = 0;
@@ -196,11 +216,21 @@ pub fn generate_smbios(config: &SmbiosConfig) -> (Vec<u8>, Vec<u8>) {
     // Type 127 — End of Table
     emit(build_type127(&mut handle));
 
-    // Build the 31-byte entry point (anchor)
+    // The anchor records the length in 16 bits, and the writer puts the
+    // table in a fixed window under 1 MiB. Both bounds are the caller's
+    // to state; neither may be met by truncation.
+    let max_table_len = max_table_len.min(u16::MAX as usize);
+    if tables.len() > max_table_len {
+        return Err(SmbiosError::TableTooLarge {
+            len: tables.len(),
+            max: max_table_len,
+        });
+    }
+
     let anchor =
         build_entry_point(max_struct_size, tables.len() as u16, num_structures);
 
-    (anchor, tables)
+    Ok((anchor, tables))
 }
 
 // ── Structure builder helpers ────────────────────────────────────────
@@ -527,7 +557,7 @@ fn build_type16(config: &SmbiosConfig, handle: &mut u16) -> Vec<u8> {
     // formatted area covers through ndevs. For simplicity we use the
     // legacy size field when memory fits in 32-bit KB.
     // Rewrite the max capacity field if it fits.
-    let max_kb = config.memory_mb * 1024;
+    let max_kb = config.memory_mb.saturating_mul(1024);
     if max_kb <= 0x7FFF_FFFF {
         let offset = 4 + 3; // header + location/use/ecc
         buf[offset..offset + 4].copy_from_slice(&(max_kb as u32).to_le_bytes());
@@ -601,8 +631,9 @@ fn build_type19(
     let formatted_len = 27;
     let mut buf = start_struct(SMBIOS_TYPE_MEMARRAYMAP, formatted_len, h);
 
-    let mem_bytes = config.memory_mb * 1024 * 1024;
-    let mem_kb = config.memory_mb * 1024;
+    // generate_smbios refuses a zero size, so both ends are >= 1.
+    let mem_bytes = config.memory_mb.saturating_mul(1024 * 1024);
+    let mem_kb = config.memory_mb.saturating_mul(1024);
 
     if mem_kb <= 0xFFFF_FFFE {
         // Use KB-based addresses
@@ -735,193 +766,4 @@ fn fix_checksum_at(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn entry_point_signature() {
-        let config = SmbiosConfig {
-            vm_name: "test-vm".to_string(),
-            num_cpus: 1,
-            memory_mb: 256,
-            ..Default::default()
-        };
-        let (anchor, _tables) = generate_smbios(&config);
-
-        assert_eq!(anchor.len(), 31);
-        assert_eq!(&anchor[0x00..0x04], b"_SM_");
-        assert_eq!(&anchor[0x10..0x15], b"_DMI_");
-    }
-
-    #[test]
-    fn entry_point_checksums_valid() {
-        let config = SmbiosConfig {
-            vm_name: "test-vm".to_string(),
-            num_cpus: 2,
-            memory_mb: 1024,
-            ..Default::default()
-        };
-        let (anchor, _) = generate_smbios(&config);
-
-        // Entry point checksum (bytes 0x00..0x10)
-        let sum: u8 = anchor[0x00..0x10]
-            .iter()
-            .fold(0u8, |acc, &b| acc.wrapping_add(b));
-        assert_eq!(sum, 0, "entry point checksum invalid");
-
-        // Intermediate checksum (bytes 0x10..0x1F)
-        let sum: u8 = anchor[0x10..0x1F]
-            .iter()
-            .fold(0u8, |acc, &b| acc.wrapping_add(b));
-        assert_eq!(sum, 0, "intermediate checksum invalid");
-    }
-
-    #[test]
-    fn entry_point_version() {
-        let config = SmbiosConfig {
-            vm_name: "vm".to_string(),
-            num_cpus: 1,
-            memory_mb: 256,
-            ..Default::default()
-        };
-        let (anchor, _) = generate_smbios(&config);
-
-        assert_eq!(anchor[0x06], 2); // major
-        assert_eq!(anchor[0x07], 8); // minor
-        assert_eq!(anchor[0x1E], 0x28); // BCD revision
-    }
-
-    #[test]
-    fn tables_end_with_type127() {
-        let config = SmbiosConfig {
-            vm_name: "vm".to_string(),
-            num_cpus: 1,
-            memory_mb: 256,
-            ..Default::default()
-        };
-        let (_, tables) = generate_smbios(&config);
-
-        // The last structure should be Type 127 (End of Table).
-        // It is: type(1) + length(1) + handle(2) + double-NUL(2) = 6 bytes
-        assert!(tables.len() >= 6);
-        let eot_start = tables.len() - 6;
-        assert_eq!(tables[eot_start], SMBIOS_TYPE_EOT);
-        assert_eq!(tables[eot_start + 1], 4); // length = header only
-                                              // Double-NUL termination
-        assert_eq!(tables[tables.len() - 2], 0);
-        assert_eq!(tables[tables.len() - 1], 0);
-    }
-
-    #[test]
-    fn table_count_matches_entry_point() {
-        let config = SmbiosConfig {
-            vm_name: "vm".to_string(),
-            num_cpus: 4,
-            memory_mb: 2048,
-            ..Default::default()
-        };
-        let (anchor, _) = generate_smbios(&config);
-
-        let num_structs = u16::from_le_bytes([anchor[0x1C], anchor[0x1D]]);
-        // Types: 0, 1, 2, 3, 4*4, 16, 17, 19, 32, 127 = 13
-        assert_eq!(num_structs, 13);
-    }
-
-    #[test]
-    fn uuid_parsing() {
-        let uuid = parse_uuid(Some("12345678-1234-5678-9abc-def012345678"));
-        // First 4 bytes are LE of 0x12345678 → [0x78, 0x56, 0x34, 0x12]
-        assert_eq!(uuid[0], 0x78);
-        assert_eq!(uuid[1], 0x56);
-        assert_eq!(uuid[2], 0x34);
-        assert_eq!(uuid[3], 0x12);
-        // Bytes 4-5 are LE of 0x1234 → [0x34, 0x12]
-        assert_eq!(uuid[4], 0x34);
-        assert_eq!(uuid[5], 0x12);
-        // Bytes 6-7 are LE of 0x5678 → [0x78, 0x56]
-        assert_eq!(uuid[6], 0x78);
-        assert_eq!(uuid[7], 0x56);
-        // Remaining bytes are big-endian
-        assert_eq!(uuid[8], 0x9a);
-        assert_eq!(uuid[9], 0xbc);
-    }
-
-    #[test]
-    fn uuid_none_returns_zeroes() {
-        let uuid = parse_uuid(None);
-        assert_eq!(uuid, [0u8; 16]);
-    }
-
-    #[test]
-    fn uuid_invalid_returns_zeroes() {
-        let uuid = parse_uuid(Some("not-a-uuid"));
-        assert_eq!(uuid, [0u8; 16]);
-    }
-
-    #[test]
-    fn structures_have_double_nul_termination() {
-        let config = SmbiosConfig {
-            vm_name: "test".to_string(),
-            num_cpus: 1,
-            memory_mb: 256,
-            ..Default::default()
-        };
-        let (_, tables) = generate_smbios(&config);
-
-        // Walk structures and verify each ends with double-NUL
-        let mut offset = 0;
-        let mut count = 0;
-        while offset < tables.len() {
-            assert!(
-                offset + 4 <= tables.len(),
-                "not enough bytes for header at structure #{count}"
-            );
-            let stype = tables[offset];
-            let slen = tables[offset + 1] as usize;
-            assert!(
-                slen >= 4,
-                "structure #{count} (type {stype}) has length < 4"
-            );
-
-            // Skip past formatted area to string section
-            let mut pos = offset + slen;
-
-            // Find the double-NUL terminator: scan for two consecutive
-            // NUL bytes.
-            loop {
-                assert!(
-                    pos + 1 < tables.len(),
-                    "ran off end of table at structure #{count} (type {stype})"
-                );
-                if tables[pos] == 0 && tables[pos + 1] == 0 {
-                    pos += 2; // skip past the double-NUL
-                    break;
-                }
-                pos += 1;
-            }
-
-            count += 1;
-            offset = pos;
-
-            if stype == SMBIOS_TYPE_EOT {
-                break;
-            }
-        }
-
-        assert!(count > 0, "no structures found");
-    }
-
-    #[test]
-    fn table_length_matches_entry_point() {
-        let config = SmbiosConfig {
-            vm_name: "vm".to_string(),
-            num_cpus: 1,
-            memory_mb: 512,
-            ..Default::default()
-        };
-        let (anchor, tables) = generate_smbios(&config);
-
-        let recorded_len = u16::from_le_bytes([anchor[0x16], anchor[0x17]]);
-        assert_eq!(recorded_len as usize, tables.len());
-    }
-}
+mod tests;

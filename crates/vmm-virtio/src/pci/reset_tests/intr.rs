@@ -579,8 +579,7 @@ fn a_backend_raise_overtaken_by_a_whole_reset_delivers_nothing() {
     assert_ne!(isr(&dev), 0, "the running driver's ISR was left clear");
 }
 
-// The reviewer's interleaving, run concurrently rather than in
-// sequence. A backend authorises work under one session and the thread
+// The same interleaving run concurrently rather than in sequence. A backend authorises work under one session and the thread
 // that will raise for it is parked on the far side of that handoff,
 // before the transport admits anything. A whole reset then runs to
 // completion on the vCPU thread and the next driver comes up.

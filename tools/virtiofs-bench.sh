@@ -15,6 +15,7 @@
 # VMM start-up and the host's own scheduling noise.
 
 set -u
+set -o pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 RUNS="${1:-5}"

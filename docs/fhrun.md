@@ -74,14 +74,47 @@ should not pay for a dirty bitmap.
 
 ## Exit codes
 
-`0` when the VMM exited cleanly, `1` on an fhrun error or a VMM killed
-by a signal, `2` on a usage error.
+fhrun exits with the payload's status, like a shell would:
 
-The payload's own exit status does **not** propagate. `fhrun-init`
-`execve`s the payload and never reaps it; when the payload exits, init
-falls through to ACPI poweroff and the VMM reports a clean shutdown.
-Recovering the payload's status needs a return channel (vsock, or a
-writable virtio-fs) that does not exist yet.
+| code | meaning |
+|---|---|
+| `0..=255` | the payload's own exit code |
+| `128 + n` | the payload died from signal `n` |
+| `1` | fhrun failed: a bad manifest, a VMM that would not start, or a VMM that ended before init reported the payload |
+| `2` | usage error |
+
+`fhrun-init` stays PID 1, forks the payload, reaps it and every orphan
+it leaves, and writes one line to `/dev/ttyS1` (COM2):
+
+```
+fhrun-init: payload exit <code>
+fhrun-init: payload signal <n>
+```
+
+firehyve mirrors COM2 to its stdout, which fhrun pipes rather than
+inherits: it copies every byte to its own stdout and keeps the last
+marker it sees. Init then powers the VM off. The last marker wins
+because init writes after the payload is gone; a payload that prints a
+marker of its own only spoofs its own exit status, which it could set
+anyway.
+
+When no marker arrives the VMM's outcome is all there is, and none of
+its codes means the payload succeeded. A VMM exit `0` is a reset, which
+under `panic=-1` is how a kernel panic ends; `1` is a poweroff that
+init reached without a payload, such as a `bin` that cannot be
+executed. fhrun reports both on stderr and exits `1`.
+
+## Signals
+
+SIGINT and SIGTERM are forwarded to the VMM as SIGTERM, which is its
+ACPI power-button path, so the guest shuts down and the temporary
+directory is removed. Both stay blocked from before the VMM is spawned
+until fhrun knows its pid, so a Ctrl-C in that window is not lost.
+
+SIGKILL has no such path. fhrun dies without removing
+`$TMPDIR/fhrun-*/initramfs.cpio`, which holds the manifest `env`, and
+the VMM keeps running: illumos has no parent-death signal and fhrun
+records the child pid nowhere a sweeper could read it.
 
 ## fhrun-init
 

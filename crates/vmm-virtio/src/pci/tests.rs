@@ -123,11 +123,22 @@ struct TrackingVirtioDeviceState {
     notify_addrs: Vec<(u16, u64)>,
     restored_rings: Vec<RestoreRingCall>,
     reset_all_rings: usize,
+    /// The queue index of every kick the transport let through.
+    notified: Vec<u16>,
+}
+
+/// The step of a restore whose backend refuses it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RefusedStep {
+    ResetRings,
+    RingState,
 }
 
 struct TrackingVirtioDevice {
     features: u64,
     state: Mutex<TrackingVirtioDeviceState>,
+    /// The restore step this backend refuses, if any.
+    refuses: Option<RefusedStep>,
 }
 
 impl VirtioDevice for TrackingVirtioDevice {
@@ -159,11 +170,28 @@ impl VirtioDevice for TrackingVirtioDevice {
         0
     }
 
-    fn reset_all_rings(&self) {
+    fn notify_queue(
+        &self,
+        queue_idx: u16,
+        _queues: &mut [VirtQueue],
+        _physmap: &PhysMap,
+    ) -> bool {
+        self.state
+            .lock()
+            .expect("tracking state lock")
+            .notified
+            .push(queue_idx);
+        false
+    }
+
+    fn reset_all_rings(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
         self.state
             .lock()
             .expect("tracking state lock")
             .reset_all_rings += 1;
+        self.refusal(RefusedStep::ResetRings)
     }
 
     fn restore_ring_state(
@@ -177,7 +205,7 @@ impl VirtioDevice for TrackingVirtioDevice {
         used_idx: u16,
         msix_addr: u64,
         msix_data: u32,
-    ) {
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
         self.state
             .lock()
             .expect("tracking state lock")
@@ -193,6 +221,7 @@ impl VirtioDevice for TrackingVirtioDevice {
                 msix_addr,
                 msix_data,
             });
+        self.refusal(RefusedStep::RingState)
     }
 
     fn set_notify_addrs(&self, pio_port: u16, mmio_addr: u64) {
@@ -206,20 +235,85 @@ impl VirtioDevice for TrackingVirtioDevice {
     fn reset(&self) {}
 }
 
+impl TrackingVirtioDevice {
+    /// What one restore step answers.
+    fn refusal(
+        &self,
+        step: RefusedStep,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        if self.refuses == Some(step) {
+            return Err(vmm_devices::lifecycle::DeviceStateError::Invalid(
+                format!("the backend refused {step:?}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Lifecycle for TrackingVirtioDevice {
     fn type_name(&self) -> &'static str {
         "tracking-virtio"
     }
 }
 
+/// Guest memory the migration tests program their rings into. The
+/// restore refuses a ring that is not mapped, so the addresses have to
+/// be real.
+pub(super) const MIGRATE_RING_GPA: u64 = 0x1000;
+pub(super) const MIGRATE_RING_LEN: usize = 0x8000;
+
 fn make_tracking_device() -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
-    let physmap = Arc::new(PhysMap::new());
+    make_tracking_device_with_msix(None)
+}
+
+/// A device whose backend refuses one step of the restore.
+fn make_refusing_tracking_device(
+    step: RefusedStep,
+) -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
+    let physmap = Arc::new(
+        PhysMap::new_anon(MIGRATE_RING_GPA, MIGRATE_RING_LEN)
+            .expect("create guest memory"),
+    );
+    build_tracking_device(physmap, None, Some(step))
+}
+
+fn make_tracking_device_on(
+    physmap: Arc<PhysMap>,
+) -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
+    make_tracking_device_full(physmap, None)
+}
+
+/// Guest memory the migration tests need: restore refuses an unmapped
+/// ring, so these tests cannot use the empty map.
+fn make_tracking_device_with_msix(
+    msix: Option<Arc<MsixTable>>,
+) -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
+    let physmap = Arc::new(
+        PhysMap::new_anon(MIGRATE_RING_GPA, MIGRATE_RING_LEN)
+            .expect("create guest memory"),
+    );
+    make_tracking_device_full(physmap, msix)
+}
+
+fn make_tracking_device_full(
+    physmap: Arc<PhysMap>,
+    msix: Option<Arc<MsixTable>>,
+) -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
+    build_tracking_device(physmap, msix, None)
+}
+
+fn build_tracking_device(
+    physmap: Arc<PhysMap>,
+    msix: Option<Arc<MsixTable>>,
+    refuses: Option<RefusedStep>,
+) -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
     let bus_pio = Arc::new(PioBus::new());
     let bus_mmio = Arc::new(MmioBus::new());
     VirtioPciDevice::new(
         TrackingVirtioDevice {
             features: bits::VIRTIO_F_VERSION_1,
             state: Mutex::new(TrackingVirtioDeviceState::default()),
+            refuses,
         },
         bits::VIRTIO_DEV_TYPE_BLOCK,
         1,
@@ -229,8 +323,89 @@ fn make_tracking_device() -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
         physmap,
         bus_pio,
         bus_mmio,
+        msix,
+    )
+}
+
+/// A device that owns its ring cursors, the way viona does.
+///
+/// `None` is the read the kernel refused. Nothing userspace keeps
+/// stands in for cursors a kernel backend moves, so that has to reach
+/// the export's caller.
+struct KernelCursorDevice(Option<(u16, u16)>);
+
+impl VirtioDevice for KernelCursorDevice {
+    fn device_features(&self) -> u64 {
+        bits::VIRTIO_F_VERSION_1
+    }
+
+    fn set_features(&self, _features: u64) {}
+
+    fn cfg_read(&self, _offset: u16, _len: u8) -> u32 {
+        0
+    }
+
+    fn cfg_write(&self, _offset: u16, _val: u32, _len: u8) {}
+
+    fn process_queue(
+        &self,
+        _queue_idx: u16,
+        _queue: &mut VirtQueue,
+        _head: u16,
+        _physmap: &PhysMap,
+    ) -> u32 {
+        0
+    }
+
+    fn kernel_ring_indices(
+        &self,
+        queue_idx: u16,
+    ) -> Result<Option<(u16, u16)>, vmm_devices::lifecycle::DeviceStateError>
+    {
+        self.0.map(Some).ok_or_else(|| {
+            vmm_devices::lifecycle::DeviceStateError::Export(format!(
+                "ring {queue_idx} state read failed"
+            ))
+        })
+    }
+
+    fn reset(&self) {}
+}
+
+impl Lifecycle for KernelCursorDevice {
+    fn type_name(&self) -> &'static str {
+        "kernel-cursor-virtio"
+    }
+}
+
+fn make_kernel_cursor_device(
+    indices: Option<(u16, u16)>,
+) -> Arc<VirtioPciDevice<KernelCursorDevice>> {
+    let physmap = Arc::new(
+        PhysMap::new_anon(MIGRATE_RING_GPA, MIGRATE_RING_LEN)
+            .expect("create guest memory"),
+    );
+    VirtioPciDevice::new(
+        KernelCursorDevice(indices),
+        bits::VIRTIO_DEV_TYPE_NET,
+        1,
+        256,
+        8,
+        None,
+        physmap,
+        Arc::new(PioBus::new()),
+        Arc::new(MmioBus::new()),
         None,
     )
+}
+
+/// An MSI-X table that needs no live vmm handle.
+pub(super) fn null_msix(count: u16) -> Arc<MsixTable> {
+    struct NullSink;
+    impl vmm_devices::pci::msix::MsiSink for NullSink {
+        fn send(&self, _addr: u64, _data: u64) {}
+    }
+    Arc::new(MsixTable::new(count, Arc::new(NullSink)))
 }
 
 #[test]
@@ -698,15 +873,66 @@ fn features_ok_set_and_readable() {
     );
 }
 
+fn notified(dev: &VirtioPciDevice<TrackingVirtioDevice>) -> Vec<u16> {
+    dev.device
+        .state
+        .lock()
+        .expect("tracking state lock")
+        .notified
+        .clone()
+}
+
 #[test]
 fn queue_notify_ignored_before_driver_ok() {
     use vmm_core::common::WriteOp;
-    let dev = make_test_device();
+    let dev = make_tracking_device();
 
-    // Don't set DRIVER_OK status. Notify queue 0: it must do nothing.
-    // (Verifying no panic or crash)
     let wo = WriteOp::from_buf(&[0, 0]);
     dev.bar_rw(BarN::BAR0, 0x10, RWOp::Write(&wo));
+    assert!(notified(&dev).is_empty(), "a kick reached the backend");
+}
+
+/// A kick on a queue with no ring must not reach the backend. A
+/// backend builds its used-ring writer on the first kick, from the
+/// ring the queue holds, and keeps it for the session: built on
+/// address zero, it never writes the ring the driver programs next.
+#[test]
+fn a_kick_before_the_ring_is_programmed_never_reaches_the_backend() {
+    use vmm_core::common::WriteOp;
+    const RAM_GPA: u64 = 0x4000;
+    let physmap = Arc::new(
+        PhysMap::new_anon(RAM_GPA, 0x4000).expect("create guest memory"),
+    );
+    let dev = make_tracking_device_on(physmap);
+    let write = |reg: u16, val: &[u8]| {
+        let wo = WriteOp::from_buf(val);
+        dev.bar_rw(BarN::BAR0, usize::from(reg), RWOp::Write(&wo));
+    };
+    write(
+        bits::LEGACY_REG_DEVICE_STATUS,
+        &[bits::STATUS_ACKNOWLEDGE
+            | bits::STATUS_DRIVER
+            | bits::STATUS_DRIVER_OK],
+    );
+
+    write(bits::LEGACY_REG_QUEUE_NOTIFY, &[0, 0]);
+    assert!(
+        notified(&dev).is_empty(),
+        "a kick reached an unprogrammed queue"
+    );
+
+    let pfn = (RAM_GPA / vmm_core::common::PAGE_SIZE as u64) as u32;
+    write(bits::LEGACY_REG_QUEUE_PFN, &pfn.to_le_bytes());
+    write(bits::LEGACY_REG_QUEUE_NOTIFY, &[0, 0]);
+    assert_eq!(
+        notified(&dev),
+        vec![0],
+        "the kick after programming is lost"
+    );
+
+    write(bits::LEGACY_REG_QUEUE_PFN, &[0, 0, 0, 0]);
+    write(bits::LEGACY_REG_QUEUE_NOTIFY, &[0, 0]);
+    assert_eq!(notified(&dev), vec![0], "a kick reached a retired queue");
 }
 
 #[test]

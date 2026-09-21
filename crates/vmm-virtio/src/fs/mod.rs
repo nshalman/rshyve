@@ -22,7 +22,7 @@ use self::passthrough::Passthrough;
 use self::server::FuseServer;
 use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::VirtioDevice;
-use crate::access::{GuestAccess, Session};
+use crate::access::{GuestAccess, RingTag, Session};
 use crate::pci::intr::{BackendIntr, IntrSlot};
 use vmm_devices::lifecycle::{IndicatedState, Indicator};
 use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
@@ -69,9 +69,6 @@ fn run_park(slot: &ParkSlot) {
     }
 }
 
-/// The transport interrupt path, wired by the binary after
-/// `VirtioPciDevice::new`.
-///
 /// Parsed `-s <slot>,virtio-fs,<config>` options.
 #[derive(Debug, Clone)]
 pub struct VirtioFsOpts {
@@ -110,10 +107,10 @@ struct FsRequest {
     head: u16,
     bufs: Vec<ChainBuf>,
     completion: Arc<VirtioCompletion>,
-    /// Device epoch this request was queued under. The worker drops the
-    /// request when it no longer matches: the chain and the completion
-    /// both point at a ring the driver has since torn down.
-    epoch: u64,
+    /// Ring and generation this request was queued under. The worker
+    /// drops the request when it no longer matches: the chain and the
+    /// completion both point at a ring the driver has since torn down.
+    tag: RingTag,
 }
 
 pub struct VirtioFs {
@@ -155,6 +152,16 @@ impl VirtioFs {
         physmap: Arc<PhysMap>,
         log: slog::Logger,
     ) -> anyhow::Result<Self> {
+        // Process-wide, and idempotent, so every device may do it.
+        match passthrough::raise_fd_limit() {
+            Ok(soft) => {
+                slog::debug!(log, "virtio-fs fd limit"; "soft" => soft)
+            }
+            Err(error) => slog::warn!(
+                log,
+                "virtio-fs could not raise the fd limit"; "error" => %error
+            ),
+        }
         let pt = Passthrough::new(&opts.path, opts.read_only).map_err(|e| {
             anyhow::anyhow!(
                 "open passthrough root '{}': {}",
@@ -182,7 +189,7 @@ impl VirtioFs {
             physmap: Arc::clone(&physmap),
             gate: Arc::new(QuiesceGate::new(1)),
             shutdown: Arc::new(AtomicBool::new(false)),
-            access: Arc::new(GuestAccess::new()),
+            access: Arc::new(GuestAccess::new(FS_NUM_QUEUES)),
             inflight: Arc::new(AtomicUsize::new(0)),
             session_retired: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -251,6 +258,54 @@ impl VirtioFs {
         }
         c
     }
+
+    /// End the retired generations, wait out the guest-memory sections
+    /// already inside them, and drop the used-ring writers they name.
+    ///
+    /// `queue` names the one ring a driver programmed again, or `None`
+    /// for a device reset. Dropping the cached writer is not enough on
+    /// either path: a request already with the worker holds a writer of
+    /// its own, the chain it was built from, and a generation that was
+    /// valid when it left the vCPU. Ending that generation and waiting
+    /// out the copies inside it is what keeps the reply out of pages
+    /// the guest has taken back.
+    ///
+    /// Admission closes before the wait, for every queue. A section
+    /// refused before it takes the lock never queues on it, and
+    /// `std::sync::RwLock` gives the writer no priority: a guest picks
+    /// how much stale work is waiting, and it must not be able to
+    /// starve this.
+    ///
+    /// The backing store is not waited for. A request inside it
+    /// finishes into host memory, fails the generation check, and
+    /// writes nothing.
+    fn retire_rings(&self, queue: Option<u16>) {
+        match queue {
+            Some(idx) => {
+                self.access.close_queue(idx);
+            }
+            None => self.access.close_all(),
+        }
+        self.access.drain();
+
+        {
+            let mut slots = self.completions.lock().expect("completion lock");
+            match queue {
+                Some(idx) => {
+                    if let Some(slot) = slots.get_mut(usize::from(idx)) {
+                        *slot = None;
+                    }
+                }
+                None => {
+                    for slot in slots.iter_mut() {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+        self.access
+            .reopen(self.interrupt.next_session(self.access.intr_session()));
+    }
 }
 
 /// State the FUSE worker shares with the device.
@@ -260,8 +315,8 @@ struct FsWorkerCtx {
     physmap: Arc<PhysMap>,
     gate: Arc<QuiesceGate>,
     shutdown: Arc<AtomicBool>,
-    /// Permission to touch the guest's ring and chains, and the epoch
-    /// every request is tagged with; see [`FsRequest::epoch`].
+    /// Permission to touch the guest's ring and chains, and the ring
+    /// generation every request is tagged with; see [`FsRequest::tag`].
     ///
     /// The worker takes a session around each copy between host memory
     /// and a chain, and around the used entry that follows it.
@@ -281,8 +336,8 @@ struct FsWorkerCtx {
     /// Set by a reset, cleared by the worker once it has closed the
     /// retired session's fd tables.
     ///
-    /// A flag, not a comparison against `epoch`: the worker would have
-    /// to sample the epoch to have something to compare, and a reset
+    /// A flag, not a comparison against a generation: the worker would
+    /// have to sample one to have something to compare, and a reset
     /// that lands before that sample would then look like the session
     /// the worker started in.
     session_retired: Arc<AtomicBool>,
@@ -353,7 +408,7 @@ fn reap_retired_session(ctx: &FsWorkerCtx) {
 /// Run one FUSE request and publish its reply.
 ///
 /// Guest memory is touched twice, each time inside a session for the
-/// request's epoch: the request copied out, then the reply copied in
+/// request's ring: the request copied out, then the reply copied in
 /// together with its used entry. Both copies are bounded, by
 /// `MAX_MSG_SIZE` and by the chain's writable window, so a reset waits
 /// on neither for long.
@@ -369,7 +424,7 @@ fn serve_request(ctx: &FsWorkerCtx, req: &FsRequest) {
         // A reset already invalidated this chain and its completion.
         // The check comes before the lock: a refused request must not
         // be able to queue on the lock a resetting vCPU waits for.
-        let Some(_session) = ctx.access.enter(req.epoch) else {
+        let Some(_session) = ctx.access.enter(req.tag) else {
             return;
         };
         ctx.server.read_request(&req.bufs, &ctx.physmap)
@@ -383,7 +438,7 @@ fn serve_request(ctx: &FsWorkerCtx, req: &FsRequest) {
         // A reset landed while the backing store ran. The reply is
         // host memory, so dropping it here writes nothing into the
         // guest.
-        let Some(_session) = ctx.access.enter(req.epoch) else {
+        let Some(_session) = ctx.access.enter(req.tag) else {
             return;
         };
         let len = ctx.server.write_reply(&req.bufs, &ctx.physmap, reply);
@@ -393,7 +448,7 @@ fn serve_request(ctx: &FsWorkerCtx, req: &FsRequest) {
     // behind. A reset drains the sections above, and an interrupt
     // raised inside one puts the resetting vCPU behind it.
     if raise {
-        ctx.access.deliver(req.epoch, || req.completion.signal());
+        ctx.access.deliver(req.tag, || req.completion.signal());
     }
 }
 
@@ -435,13 +490,20 @@ impl VirtioDevice for VirtioFs {
         0
     }
 
+    /// The handler snapshots the ring it was built on, so a ring the
+    /// driver programs again needs a new one, and the requests built
+    /// from the old ring are retired with it.
+    fn queue_addr_set(&self, queue_idx: u16, _queue: &VirtQueue) {
+        self.retire_rings(Some(queue_idx));
+    }
+
     /// Collect the guest's chains and hand them to the worker.
     ///
     /// The ring walk runs under one guest-access session, so a reset
     /// takes the ring back from this the same way it takes it back
-    /// from the worker. The session also names the epoch every request
-    /// is tagged with, so a request cannot carry a session that ended
-    /// while it was being built.
+    /// from the worker. The session also names the generation every
+    /// request is tagged with, so a request cannot carry a generation
+    /// that ended while it was being built.
     ///
     /// Returns whether the heads answered inline need an interrupt.
     /// The transport raises it after it drops its register lock.
@@ -457,12 +519,12 @@ impl VirtioDevice for VirtioFs {
         let Some(tx) = self.work_tx.lock().expect("work lock").clone() else {
             return false;
         };
-        let Some(session) = self.access.enter_current() else {
+        let Some(session) = self.access.enter_current(queue_idx) else {
             // A reset owns the ring. Its queue state goes with it.
             return false;
         };
         let completion = self.get_completion(&session, queue_idx, queue);
-        let epoch = session.epoch();
+        let tag = session.tag();
 
         // A guest can keep advancing avail_idx during the EVENT_IDX
         // re-check. Bound the work retained by one notification to the
@@ -491,7 +553,7 @@ impl VirtioDevice for VirtioFs {
                     head,
                     bufs,
                     completion: Arc::clone(&completion),
-                    epoch,
+                    tag,
                 };
                 // Count the request before it can be received, so a reset
                 // never reads zero while one is already on its way.
@@ -505,12 +567,18 @@ impl VirtioDevice for VirtioFs {
                 }
             }
 
+            // Arm the kick on every path out, the cap included. The
+            // worker answers these requests off the vCPU, so nothing
+            // comes back to this ring on its own: a device that left
+            // `avail_event` unarmed at the cap told the guest to
+            // suppress its next kick, and was then never notified
+            // again. The queue is the cap, so hitting it means every
+            // descriptor is outstanding and the guest's next post is
+            // the index armed here.
             let hit_request_cap = popped >= max_requests;
-            if !hit_request_cap {
-                queue.update_used_event(physmap);
-            }
+            queue.update_used_event(physmap);
             // The no-progress check is what stops a guest-triggerable vCPU
-            // hang in this re-check loop (fixed for virtio-blk in b8b429e).
+            // hang in this re-check loop.
             if super::queue_drain_should_stop(
                 queue,
                 before,
@@ -543,33 +611,22 @@ impl VirtioDevice for VirtioFs {
     /// is one register write with no poll, and `virtio_shutdown`
     /// reclaims the DMA buffers straight after it.
     ///
-    /// It is both. Admission closes and the epoch ends, which drops
-    /// every request the worker has not started. The drain then covers
-    /// only the two bounded copies a request makes into and out of its
-    /// chain, so the wait ends on its own and needs no deadline. The
-    /// backing store is not waited for: a request inside it finishes
-    /// into host memory, fails the epoch check, and writes nothing.
+    /// It is both. Admission closes and every generation ends, which
+    /// drops every request the worker has not started. The drain then
+    /// covers only the two bounded copies a request makes into and out
+    /// of its chain, so the wait ends on its own and needs no deadline.
+    /// The backing store is not waited for: a request inside it
+    /// finishes into host memory, fails the generation check, and
+    /// writes nothing.
     fn reset(&self) {
-        // Admission closes before the drain. A section refused before
-        // it takes the lock never queues on it, and `std::sync::RwLock`
-        // gives the writer no priority: a guest picks how much stale
-        // work is waiting, and it must not be able to starve this.
-        self.access.close();
-        self.access.drain();
-
         *self.negotiated_features.lock().expect("features lock") = 0;
-        for slot in self.completions.lock().expect("completion lock").iter_mut()
-        {
-            *slot = None;
-        }
         // The guest's fd tables are backing-store state, so this only
         // marks them and the worker closes them. Closing them here
         // would pull a descriptor out from under a syscall the worker
         // is inside. The mark goes up before admission reopens, so no
         // request of the next session is served against them.
         self.session_retired.store(true, Ordering::Release);
-        self.access
-            .reopen(self.interrupt.next_session(self.access.intr_session()));
+        self.retire_rings(None);
     }
 }
 

@@ -15,7 +15,12 @@
 #
 # Exits 0 only when every mode reported result=OK.
 
+# errexit is deliberately off: every status this script cares about it
+# checks itself, and a bare `grep` or `kill` that answers non-zero is
+# normal here. pipefail is on so a failing left-hand side of a pipe is
+# not hidden by a succeeding right-hand side.
 set -u
+set -o pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 VM="${VMM_FIREHYVE_VM:-vfstest}"
@@ -59,8 +64,15 @@ if [ ! -d "$EXPORT" ]; then
     exit 1
 fi
 
+# Only the VM this script started. A `pkill` on the VMM path reaches
+# every zone on the node, and these nodes are shared with live guests.
+VM_PID=
 cleanup_vm() {
-    pkill -KILL -f "$FIREHYVE" 2>/dev/null
+    if [ -n "$VM_PID" ]; then
+        kill -KILL "$VM_PID" 2>/dev/null
+        wait "$VM_PID" 2>/dev/null
+        VM_PID=
+    fi
     bhyvectl --destroy --vm="$VM" >/dev/null 2>&1
 }
 
@@ -146,6 +158,7 @@ run_mode() {
         -l com1,stdio \
         "$VM" > "$log" 2>&1 &
     pid=$!
+    VM_PID=$pid
 
     waited=0
     limit=$((TIMEOUT_S * 5))
@@ -156,8 +169,6 @@ run_mode() {
         waited=$((waited + 1))
     done
 
-    kill -KILL $pid 2>/dev/null
-    wait $pid 2>/dev/null
     cleanup_vm
     stop_vsock_dial
     stop_vsock_echo
@@ -221,6 +232,7 @@ run_container() {
         -l com1,stdio \
         "$VM" > "$log" 2>&1 &
     pid=$!
+    VM_PID=$pid
 
     waited=0
     limit=$((TIMEOUT_S * 5))
@@ -231,8 +243,6 @@ run_container() {
         waited=$((waited + 1))
     done
 
-    kill -KILL $pid 2>/dev/null
-    wait $pid 2>/dev/null
     cleanup_vm
 
     grep -E "VFSTEST:|DOCKERTEST:" "$log" 2>/dev/null

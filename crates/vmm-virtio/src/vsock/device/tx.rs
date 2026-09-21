@@ -15,7 +15,7 @@
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
-use slog::debug;
+use slog::{debug, warn};
 use vmm_core::mem::PhysMap;
 
 use super::listener::reader_loop;
@@ -54,10 +54,12 @@ impl VirtioVsock {
                 queue.push_used(physmap, head, 0);
                 used = true;
             }
+            // Arm the kick on every path out, as the RX stash does:
+            // nothing returns to this ring without a guest kick, so a
+            // cap exit that left `avail_event` unarmed would suppress
+            // the kick the device needs to see the rest.
             let hit_request_cap = popped >= max_requests;
-            if !hit_request_cap {
-                queue.update_used_event(physmap);
-            }
+            queue.update_used_event(physmap);
             if queue_drain_should_stop(queue, before, hit_request_cap, physmap)
             {
                 break;
@@ -114,6 +116,16 @@ impl VirtioVsock {
 
     /// A guest-initiated connection: dial `<socket>_<port>` on the host.
     fn connect_out(&self, key: ConnKey, port: u32) {
+        // The reader table bounds the threads this device holds, and it
+        // is one table: a guest that opened connections outside it
+        // doubled the ceiling every other path is held to. Reserved
+        // before the dial, so nothing is opened that cannot be served.
+        let Some(slot) = self.shared.reserve_reader() else {
+            debug!(self.shared.log, "virtio-vsock refused a guest connect";
+                "reason" => "reader table full");
+            self.shared.mux.refuse_guest_connect(key);
+            return;
+        };
         let path = format!("{}_{}", self.shared.socket_path.display(), port);
         let stream = match UnixStream::connect(&path) {
             Ok(s) => s,
@@ -126,19 +138,26 @@ impl VirtioVsock {
                 return;
             }
         };
-        let Ok(reader_stream) = stream.try_clone() else {
-            self.shared.mux.refuse_guest_connect(key);
-            return;
-        };
-        self.shared.register_socket(key, stream);
+        let socket = self.shared.register_socket(key, stream);
         self.shared.mux.accept_guest_connect(key);
 
         let shared = Arc::clone(&self.shared);
-        if let Ok(handle) = std::thread::Builder::new()
+        let reader = Arc::clone(&socket);
+        match std::thread::Builder::new()
             .name("vsock-reader".into())
-            .spawn(move || reader_loop(shared, key, reader_stream))
+            .spawn(move || reader_loop(shared, key, reader))
         {
-            self.shared.track_reader(handle);
+            Ok(handle) => slot.fill(handle),
+            Err(error) => {
+                // Nothing would read this socket, and nothing would
+                // tell the guest the host end had gone, so the
+                // connection is undone rather than left accepted.
+                warn!(self.shared.log,
+                    "virtio-vsock reader thread not started";
+                    "error" => %error);
+                self.shared.release_socket(key, &socket);
+                self.shared.mux.refuse_guest_connect(key);
+            }
         }
     }
 }

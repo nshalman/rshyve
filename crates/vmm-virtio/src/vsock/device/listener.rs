@@ -20,11 +20,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use slog::{debug, warn};
 use vmm_core::unixsock::write_all_bounded;
 
 use super::shared::{VsockShared, HOST_WRITE_TIMEOUT};
 use crate::vsock::control::{
-    read_line_bounded, run_control_session, LineRead, HANDSHAKE_BUDGET,
+    read_line_bounded, run_control_session, LineRead, CONTROL_IDLE_BUDGET,
+    HANDSHAKE_BUDGET,
 };
 use crate::vsock::packet::ConnKey;
 
@@ -45,19 +47,25 @@ pub(super) fn accept_loop(shared: Arc<VsockShared>, listener: UnixListener) {
     let on_client = |stream: UnixStream| {
         // Every accepted connection costs a thread until its peer sends
         // a CONNECT line, which it need never do.
-        if !shared.reader_slot_free() {
+        let Some(slot) = shared.reserve_reader() else {
+            debug!(shared.log, "virtio-vsock refused a peer";
+                "reason" => "reader table full");
             let _ = stream.shutdown(Shutdown::Both);
             return;
-        }
+        };
         let conn_shared = Arc::clone(&shared);
         // One thread per pending connection: the CONNECT line is read
         // with a blocking read, and a client that never sends one must
         // not block every other client behind it.
-        if let Ok(handle) = std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("vsock-connect".into())
             .spawn(move || handle_host_connect(conn_shared, stream))
         {
-            shared.track_reader(handle);
+            // Dropping the slot gives it back, and the peer's socket
+            // goes with the closure, so it reads end of file.
+            Err(error) => warn!(shared.log,
+                "virtio-vsock connect thread not started"; "error" => %error),
+            Ok(handle) => slot.fill(handle),
         }
     };
     crate::socket_accept::accept_loop(
@@ -108,12 +116,25 @@ pub(super) fn handle_host_connect(
     };
     match classify_host_line(&line) {
         HostVerb::Connect(port) => start_host_connection(shared, stream, port),
-        HostVerb::Control => run_control_session(
-            &shared.control,
-            &shared.shutdown,
-            stream,
-            &shared.log,
-        ),
+        HostVerb::Control => match shared.reserve_control_session() {
+            Some(_session) => run_control_session(
+                &shared.control,
+                &shared.shutdown,
+                stream,
+                &shared.log,
+                CONTROL_IDLE_BUDGET,
+            ),
+            None => {
+                warn!(shared.log, "virtio-vsock CONTROL refused";
+                    "reason" => "too many sessions");
+                // Best effort: the peer may already be gone.
+                let _ = write_all_bounded(
+                    &stream,
+                    b"ERR too many control sessions\n",
+                    HOST_WRITE_TIMEOUT,
+                );
+            }
+        },
         HostVerb::Unknown => {
             // Best effort: the peer may already be gone, and the
             // connection ends either way. Bounded, because a peer that
@@ -134,19 +155,12 @@ pub(super) fn start_host_connection(
     stream: UnixStream,
     port: u32,
 ) {
-    let key = ConnKey {
-        guest_port: port,
-        host_port: shared.mux.alloc_host_port(),
-    };
     let s = stream;
-    let Ok(peer) = s.try_clone() else {
-        return;
-    };
     // The table is capped, and a peer told OK for a connection the mux
     // refused would wait on a guest that is never going to hear about
     // it. Reserving the slot answers that without letting the guest
     // reach the connection yet.
-    if !shared.mux.reserve_host_connect(key) {
+    let Some(key) = shared.mux.reserve_host_connect(port) else {
         // Best effort: the peer may already be gone.
         let _ = write_all_bounded(
             &s,
@@ -154,7 +168,7 @@ pub(super) fn start_host_connection(
             HOST_WRITE_TIMEOUT,
         );
         return;
-    }
+    };
     // This thread owns the socket until the REQUEST is queued. Once it
     // is, any thread's deliver_rx may hand it to the guest, the guest
     // may answer and send payload, and a vCPU may then be inside
@@ -174,17 +188,17 @@ pub(super) fn start_host_connection(
         shared.mux.forget(key);
         return;
     }
-    shared.register_socket(key, peer);
+    let socket = shared.register_socket(key, s);
     shared.mux.announce_host_connect(key);
     shared.deliver_rx();
-    reader_loop(shared, key, s);
+    reader_loop(shared, key, socket);
 }
 
 /// Read from a connection's host socket until it closes.
 pub(super) fn reader_loop(
     shared: Arc<VsockShared>,
     key: ConnKey,
-    mut stream: UnixStream,
+    stream: Arc<UnixStream>,
 ) {
     // Arm the poll here rather than inherit whatever the CONNECT
     // handshake left on the socket: a timeout the loop did not ask for
@@ -196,7 +210,7 @@ pub(super) fn reader_loop(
         if shared.shutdown.load(Ordering::Acquire) {
             break;
         }
-        let n = match stream.read(&mut buf) {
+        let n = match (&*stream).read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -239,9 +253,13 @@ pub(super) fn reader_loop(
         }
     }
 
-    shared.mux.queue_host_close(key);
-    shared.drop_socket(key);
-    shared.deliver_rx();
+    // Only for the socket this reader served. The guest picks the key
+    // and can reopen it while this thread is still waking, and the
+    // connection that took the key must not die with this one.
+    if shared.release_socket(key, &stream) {
+        shared.mux.queue_host_close(key);
+        shared.deliver_rx();
+    }
 }
 
 /// Parse Firecracker's `CONNECT <port>` line.

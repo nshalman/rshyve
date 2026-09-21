@@ -10,8 +10,10 @@
 //! on a host peer. Each join is bounded by the budget, not tested
 //! before it starts, so one wedged thread cannot hold teardown open.
 //! Every thread ends on the shutdown flag, so halt never connects to
-//! its own socket to wake the accept thread: a same-uid peer that
-//! fills the listen backlog can make that connect wait forever.
+//! its own socket to wake the accept thread: illumos `tl_conn_req`
+//! refuses that connect with ECONNREFUSED once the backlog is full
+//! (uts/common/io/tl.c), and a connection accepted while halting is a
+//! peer that gets no service.
 
 use std::path::Path;
 use std::thread::JoinHandle;

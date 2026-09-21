@@ -57,20 +57,12 @@ struct PciBusInner {
     slots: Box<PciSlots>,
 }
 
-/// Set or clear the multi-function bit in function 0's header type.
-///
-/// The caller must not hold the bus lock: a device config access can
-/// re-enter the PIO/MMIO buses.
-fn set_multifunc(func0: &Arc<dyn PciDevice>, multifunc: bool) {
-    let cur = func0.cfg_read(bits::REG_HEADER_TYPE, 1) as u8;
-    let new = if multifunc {
-        cur | bits::HEADER_TYPE_MULTIFUNC
-    } else {
-        cur & !bits::HEADER_TYPE_MULTIFUNC
-    };
-    if new != cur {
-        func0.cfg_write(bits::REG_HEADER_TYPE, 1, u32::from(new));
-    }
+/// Where the header-type byte sits in the value a read of `offset` for
+/// `len` bytes answers with, or `None` when the access misses it.
+fn header_type_shift(offset: u8, len: u8) -> Option<u32> {
+    let last = offset.checked_add(len)?;
+    (offset <= bits::REG_HEADER_TYPE && bits::REG_HEADER_TYPE < last)
+        .then(|| u32::from(bits::REG_HEADER_TYPE - offset) * 8)
 }
 
 impl PciBus {
@@ -106,27 +98,12 @@ impl PciBus {
         if bdf.bus() != ROOT_BUS {
             return Err(AttachError::NoSuchBus(bdf));
         }
-        let func0 = {
-            let mut inner = self.inner.lock().expect("PciBus lock poisoned");
-            let slot =
-                &mut inner.slots[bdf.dev() as usize][bdf.func() as usize];
-            if slot.is_some() {
-                return Err(AttachError::SlotOccupied(bdf));
-            }
-            *slot = Some(dev);
-
-            // A device at function > 0 is only scanned by the guest when
-            // function 0 reports multi-function.
-            if bdf.func() > 0 {
-                inner.slots[bdf.dev() as usize][0].clone()
-            } else {
-                None
-            }
-        };
-
-        if let Some(func0) = func0 {
-            set_multifunc(&func0, true);
+        let mut inner = self.inner.lock().expect("PciBus lock poisoned");
+        let slot = &mut inner.slots[bdf.dev() as usize][bdf.func() as usize];
+        if slot.is_some() {
+            return Err(AttachError::SlotOccupied(bdf));
         }
+        *slot = Some(dev);
         Ok(())
     }
 
@@ -138,26 +115,7 @@ impl PciBus {
             return None;
         }
         let mut inner = self.inner.lock().expect("PciBus lock poisoned");
-        let dev =
-            inner.slots[bdf.dev() as usize][bdf.func() as usize].take()?;
-
-        // The slot stops being multi-function when the last function > 0
-        // leaves.
-        let func0 = if bdf.func() > 0
-            && inner.slots[bdf.dev() as usize][1..]
-                .iter()
-                .all(Option::is_none)
-        {
-            inner.slots[bdf.dev() as usize][0].clone()
-        } else {
-            None
-        };
-        drop(inner);
-
-        if let Some(func0) = func0 {
-            set_multifunc(&func0, false);
-        }
-        Some(dev)
+        inner.slots[bdf.dev() as usize][bdf.func() as usize].take()
     }
 
     /// Read from PCI configuration space.
@@ -173,13 +131,23 @@ impl PciBus {
             return bus_float(len);
         }
         let inner = self.inner.lock().expect("PciBus lock poisoned");
-        match &inner.slots[bdf.dev() as usize][bdf.func() as usize] {
-            Some(dev) => {
-                let dev = Arc::clone(dev);
-                drop(inner);
-                dev.cfg_read(offset, len)
+        let slot = &inner.slots[bdf.dev() as usize];
+        let Some(dev) = slot[bdf.func() as usize].clone() else {
+            return bus_float(len);
+        };
+        // The slot owns the multi-function bit, not the device: only the
+        // bus knows which functions are populated, and PCI makes the
+        // header type read-only to the guest.
+        let multifunc =
+            bdf.func() == 0 && slot[1..].iter().any(Option::is_some);
+        drop(inner);
+
+        let val = dev.cfg_read(offset, len);
+        match header_type_shift(offset, len).filter(|_| multifunc) {
+            Some(shift) => {
+                val | (u32::from(bits::HEADER_TYPE_MULTIFUNC) << shift)
             }
-            None => bus_float(len),
+            None => val,
         }
     }
 
@@ -258,39 +226,44 @@ mod tests {
 
     use super::super::BarN;
 
-    /// Test device that stores the header type byte written to it.
+    /// Test device whose header type answers like a `DeviceState`: byte
+    /// 0x0E of the dword at 0x0C, and read-only.
     struct HeaderDevice {
-        header_type: Mutex<u8>,
+        writes: Mutex<Vec<(u8, u32)>>,
     }
 
     impl HeaderDevice {
         fn new() -> Self {
             Self {
-                header_type: Mutex::new(bits::HEADER_TYPE_DEVICE),
+                writes: Mutex::new(Vec::new()),
             }
         }
 
-        fn header_type(&self) -> u8 {
-            *self.header_type.lock().expect("header lock poisoned")
+        fn writes(&self) -> Vec<(u8, u32)> {
+            self.writes.lock().expect("write log poisoned").clone()
         }
     }
 
     impl PciDevice for HeaderDevice {
-        fn cfg_read(&self, offset: u8, _len: u8) -> u32 {
-            match offset {
-                bits::REG_HEADER_TYPE => u32::from(self.header_type()),
-                _ => 0,
+        fn cfg_read(&self, offset: u8, len: u8) -> u32 {
+            match header_type_shift(offset, len) {
+                Some(shift) => u32::from(bits::HEADER_TYPE_DEVICE) << shift,
+                None => 0,
             }
         }
 
         fn cfg_write(&self, offset: u8, _len: u8, val: u32) {
-            if offset == bits::REG_HEADER_TYPE {
-                *self.header_type.lock().expect("header lock poisoned") =
-                    val as u8;
-            }
+            self.writes
+                .lock()
+                .expect("write log poisoned")
+                .push((offset, val));
         }
 
         fn bar_rw(&self, _bar: BarN, _offset: usize, _rwo: RWOp<'_>) {}
+    }
+
+    fn header_type_of(bus: &PciBus, bdf: &Bdf) -> u8 {
+        bus.config_read(bdf, bits::REG_HEADER_TYPE, 1) as u8
     }
 
     #[test]
@@ -424,36 +397,55 @@ mod tests {
     #[test]
     fn attach_at_func1_sets_multifunc() {
         let bus = PciBus::new();
+        let bdf0 = Bdf::new_unchecked(0, 8, 0);
         let func0 = Arc::new(HeaderDevice::new());
-        bus.attach(Bdf::new_unchecked(0, 8, 0), func0.clone());
-        assert_eq!(func0.header_type(), bits::HEADER_TYPE_DEVICE);
+        bus.attach(bdf0, func0.clone());
+        assert_eq!(header_type_of(&bus, &bdf0), bits::HEADER_TYPE_DEVICE);
 
         bus.attach(Bdf::new_unchecked(0, 8, 1), Arc::new(HeaderDevice::new()));
         assert_eq!(
-            func0.header_type() & bits::HEADER_TYPE_MULTIFUNC,
+            header_type_of(&bus, &bdf0) & bits::HEADER_TYPE_MULTIFUNC,
             bits::HEADER_TYPE_MULTIFUNC
         );
+        // The bit is the bus's, so no config write reached the device.
+        assert!(func0.writes().is_empty());
+    }
+
+    #[test]
+    fn multifunc_shows_at_every_access_width_that_covers_the_byte() {
+        let bus = PciBus::new();
+        let bdf0 = Bdf::new_unchecked(0, 11, 0);
+        bus.attach(bdf0, Arc::new(HeaderDevice::new()));
+        bus.attach(Bdf::new_unchecked(0, 11, 1), Arc::new(HeaderDevice::new()));
+
+        let expect =
+            u32::from(bits::HEADER_TYPE_DEVICE | bits::HEADER_TYPE_MULTIFUNC);
+        assert_eq!(bus.config_read(&bdf0, 0x0C, 4), expect << 16);
+        assert_eq!(bus.config_read(&bdf0, 0x0E, 2), expect);
+        assert_eq!(bus.config_read(&bdf0, 0x0E, 1), expect);
+        // An access that stops short of byte 0x0E is untouched.
+        assert_eq!(bus.config_read(&bdf0, 0x0C, 2), 0);
     }
 
     #[test]
     fn detach_of_last_upper_func_clears_multifunc() {
         let bus = PciBus::new();
-        let func0 = Arc::new(HeaderDevice::new());
+        let bdf0 = Bdf::new_unchecked(0, 9, 0);
         let bdf1 = Bdf::new_unchecked(0, 9, 1);
         let bdf2 = Bdf::new_unchecked(0, 9, 2);
-        bus.attach(Bdf::new_unchecked(0, 9, 0), func0.clone());
+        bus.attach(bdf0, Arc::new(HeaderDevice::new()));
         bus.attach(bdf1, Arc::new(HeaderDevice::new()));
         bus.attach(bdf2, Arc::new(HeaderDevice::new()));
 
         // One function > 0 remains, so the slot is still multi-function.
         bus.detach(&bdf2).expect("func 2 was attached");
         assert_eq!(
-            func0.header_type() & bits::HEADER_TYPE_MULTIFUNC,
+            header_type_of(&bus, &bdf0) & bits::HEADER_TYPE_MULTIFUNC,
             bits::HEADER_TYPE_MULTIFUNC
         );
 
         bus.detach(&bdf1).expect("func 1 was attached");
-        assert_eq!(func0.header_type(), bits::HEADER_TYPE_DEVICE);
+        assert_eq!(header_type_of(&bus, &bdf0), bits::HEADER_TYPE_DEVICE);
     }
 
     #[test]
@@ -510,7 +502,6 @@ mod tests {
         let bus = PciBus::new();
         let dev = Arc::new(HeaderDevice::new());
         bus.attach(Bdf::new_unchecked(0, 4, 0), dev.clone());
-        let before = dev.header_type();
 
         bus.config_write(
             &Bdf::new_unchecked(7, 4, 0),
@@ -519,7 +510,7 @@ mod tests {
             0x5A,
         );
 
-        assert_eq!(dev.header_type(), before);
+        assert!(dev.writes().is_empty());
     }
 
     #[test]

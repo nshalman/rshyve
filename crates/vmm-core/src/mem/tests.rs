@@ -676,32 +676,35 @@ fn a_runtime_claim_refuses_a_range_the_kernel_would_refuse() {
     );
 }
 
+/// Every entry point that takes a range has to refuse one already
+/// taken. A second rule would drift from the first, and the run-time
+/// path is the one a control socket can reach.
 #[test]
-fn the_boot_and_run_time_paths_share_one_overlap_rule() {
-    // Two copies of the rule would drift, and the run-time copy is the
-    // one a control socket can reach. AddressSpace::check_free is the
-    // rule, PhysMap::claim is its only caller, and add_region,
-    // add_rom_with_ram_tail, add_region_anon and claim_ram all go
-    // through claim.
-    let src = include_str!("../mem.rs");
-    assert_eq!(src.matches("check_free(").count(), 2, "one rule, one call");
-    assert_eq!(
-        src.matches("space.check_free(").count(),
-        1,
-        "check_free is called from one place",
+fn every_path_that_takes_a_range_refuses_one_already_taken() {
+    const TAKEN: u64 = 0x2000_0000;
+    const LEN: usize = 0x2000;
+    // Overlaps the tail of the claimed range rather than matching it,
+    // so an equality check would not be enough to refuse it.
+    const OVERLAP: u64 = TAKEN + 0x1000;
+
+    let refused = |what: &str, r: Result<()>| {
+        let err = r.expect_err("a claimed range was taken twice");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::AlreadyExists,
+            "{what} refused for the wrong reason",
+        );
+    };
+
+    let map = PhysMap::new();
+    map.add_region_anon(TAKEN, LEN, RegionKind::Ram)
+        .expect("first claim");
+
+    refused(
+        "add_region_anon",
+        map.add_region_anon(OVERLAP, LEN, RegionKind::Ram),
     );
-    // add_rom_with_ram_tail takes two, and add_region, claim_ram,
-    // add_region_anon and add_region_split_anon one each.
-    assert_eq!(
-        src.matches("fn claim(").count(),
-        1,
-        "one way to take a range"
-    );
-    assert_eq!(
-        src.matches("self.claim(").count(),
-        6,
-        "every path that takes a range goes through claim",
-    );
+    refused("claim_ram", map.claim_ram(OVERLAP, LEN).map(|_| ()));
 }
 
 #[test]
@@ -812,25 +815,47 @@ fn a_bulk_read_of_guest_memory_leaves_the_tracked_view_alone() {
 }
 
 #[test]
-fn a_rom_region_stays_writable_through_lookup() {
-    // The guest cannot write a ROM, so there is nothing to track there,
-    // and the bootrom loader needs the writable view that `lookup` has
-    // always returned.
+fn a_rom_region_refuses_writes_through_lookup() {
+    // A guest cannot write its ROM, so a device it drives must not be
+    // able to DMA into it either. The bootrom loader takes the
+    // untracked view, which stays writable.
     let map = PhysMap::new();
     map.add_region_anon(0x1000, 0x1000, RegionKind::Rom)
+        .unwrap();
+
+    let err = map
+        .lookup(0x1000, 4)
+        .unwrap()
+        .write_bytes(&[1, 2, 3, 4])
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    let err = map
+        .lookup(0x1000, 4)
+        .unwrap()
+        .copy_in(&[1, 2, 3, 4])
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+
+    map.lookup_untracked(0x1000, 4)
+        .unwrap()
+        .write_bytes(&[1, 2, 3, 4])
+        .unwrap();
+
+    let mut got = [0u8; 4];
+    map.lookup(0x1000, 4).unwrap().read_bytes(&mut got).unwrap();
+    assert_eq!(got, [1, 2, 3, 4]);
+}
+
+#[test]
+fn a_ram_region_stays_writable_through_lookup() {
+    let map = PhysMap::new();
+    map.add_region_anon(0x1000, 0x1000, RegionKind::Ram)
         .unwrap();
 
     map.lookup(0x1000, 4)
         .unwrap()
         .write_bytes(&[1, 2, 3, 4])
         .unwrap();
-
-    let mut got = [0u8; 4];
-    map.lookup_untracked(0x1000, 4)
-        .unwrap()
-        .read_bytes(&mut got)
-        .unwrap();
-    assert_eq!(got, [1, 2, 3, 4]);
 }
 
 #[test]

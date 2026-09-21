@@ -1,6 +1,12 @@
-# Feature Status
+# Feature status
 
-## Tested Configurations
+The one status document for this project. The crate structure is in
+[architecture.md](architecture.md), per-device limits and caveats are in
+[features.md](features.md), and what a live guest actually established
+is in [hardware-run.md](hardware-run.md). Open security findings are in
+[security/open-findings.md](security/open-findings.md).
+
+## Tested configurations
 
 | Scenario | Result |
 |----------|--------|
@@ -10,7 +16,7 @@
 | SSH access via mdata-delivered keys | Working |
 | Guest gets IP via mdata sdc:nics | Working |
 | Cross-host migration (old CPU -> new CPU) | Working |
-| Cross-host migration (new CPU -> old CPU) | Rejected (CPU feature check) |
+| Cross-host migration (new CPU -> old CPU) | Needs `--cpu-baseline`; without it the destination refuses the migration |
 | Same-host migration with busy workload | Working |
 | SIGTERM graceful shutdown | Working |
 | dd sequential read (NVMe, O_DIRECT) | 2.8 GB/s (matches C bhyve) |
@@ -36,9 +42,9 @@ and a real init. What they do and do not show is in
 | NVMe | Complete | Async I/O, zero-copy, 8 workers, 2.8 GB/s |
 | virtio-net (viona) | Complete | Interrupt polling, promiscphys |
 | virtio-rnd | Complete | /dev/random entropy |
-| Framebuffer/VNC | Complete | Unix socket, password, resolution |
-| xHCI USB tablet | Complete | HID pointer device |
-| PCI passthrough | Partial | Intel VT-d only; MSI-X devices refused. See [devices.md](devices.md#pci-passthrough) |
+| Framebuffer/VNC | Partial | Unix socket only, Raw encoding, one client; no VGA, no TCP, no `wait` |
+| xHCI USB tablet | Partial | One slot, absolute pointer, no scroll wheel, no migration state |
+| PCI passthrough | Partial | Intel VT-d only, no AMD IOMMU backend; MSI-X devices refused. Not fully audited (OSF-5) and never run with an assigned device (OSF-11). See [devices.md](devices.md#pci-passthrough) |
 | AHCI CD-ROM (`ahci-cd`) | Complete | ATAPI SCSI/MMC, zero-copy reads |
 | AHCI disk (`ahci-hd`) | Not implemented | Rejected at startup; use virtio-blk or nvme |
 | LAPIC/IOAPIC/PIC/PIT | Complete | Kernel-emulated |
@@ -65,19 +71,19 @@ and a real init. What they do and do not show is in
 | Control socket (JSON/Unix) | Complete |
 | SIGTERM -> ACPI poweroff | Complete |
 | Built-in mdata agent (V2) | Complete (testing only; production uses external agent) |
-| CLI bhyve compatibility | Complete (all boot.c flags supported) |
+| CLI bhyve compatibility | The flags the brand's `boot.c` builds (`-H -U -B -c -m -A -S -s -l -o`) parse; `-A` does nothing, `-D`, `-k` and `--json-config` are refused |
 | Serial console (-l com1,stdio) | Complete |
 | Serial to device path (-l com1,/dev/zconsole) | Complete |
 | SMBIOS -B parsing | Complete (manufacturer, product, serial, etc.) |
 
-## Live Migration
+## Live migration
 
 | Feature | Status |
 |---------|--------|
 | Same-host migration | Complete |
 | Cross-host (old->new CPU) | Complete |
 | Cross-host (new->old CPU) | Requires --cpu-baseline |
-| CPU feature check at preamble | Warns only | Does not reject a mismatch; sync and async paths compare differently |
+| CPU feature check at preamble | Rejects by default; `allow_cpu_feature_mismatch` on `migrate-dest` accepts the gap |
 | CPUID masking (--cpu-baseline) | Complete (host, avx2, sse42) |
 | RAM transfer (pre/post pause) | Complete |
 | Kernel device state | Complete (IOAPIC, ATPIT, ATPIC, HPET, RTC, PM Timer) |
@@ -85,14 +91,16 @@ and a real init. What they do and do not show is in
 | Per-vCPU run state (HALT/INIT/RUN) | Complete |
 | VMM_TIME adjustment (Propolis pattern) | Complete |
 | TSC frequency scaling | Complete |
-| Auto-resume on failure | Complete |
+| Auto-resume on failure | Complete (until the hand-over; past it the source stays paused) |
+| Emulated device state (virtio, NVMe) | Complete, matched by PCI address |
+| Hyper-V enlightenment state | Complete, no Windows guest behind it |
 | FPU/XSAVE state | Not yet implemented |
 
-## Platform Integration Readiness
+## Platform integration readiness
 
 | Requirement | Status |
 |-------------|--------|
-| All boot.c CLI flags | Supported |
+| The boot.c CLI flags (`-H -U -B -c -m -A -S -s -l -o`) | Parsed |
 | PCI slot assignments (0, 3-6, 29, 30, 31) | Supported |
 | SMBIOS "SmartDC HVM" for cloud-init detection | Default |
 | COM2 device path for external mdata agent | Supported |
@@ -100,9 +108,12 @@ and a real init. What they do and do not show is in
 | Dirty page tracking for migration | Supported |
 | Control socket for migration commands | Supported |
 
-## Known Limitations
+## Known limitations
 
 - `ahci-hd` not implemented (`ahci-cd` is); use virtio-blk or nvme for disks
+- Some device and LPC options parse and are then ignored, and an unknown
+  `-s` driver name is logged and skipped. [features.md](features.md#accepted-by-the-cli-and-then-ignored)
+  lists every one
 - FPU/XSAVE state not transferred during migration
 - Migration transport is unauthenticated and unencrypted; see SECURITY.md
 - NVList/zhyve.cmd reader not implemented (boot.c integration uses CLI flags directly)
@@ -112,7 +123,7 @@ and a real init. What they do and do not show is in
   write lock delays it, and memory hot-add holds that lock for 233 to
   270 ms per GiB. See
   [hardware-run.md](hardware-run.md#why-a-device-reset-has-no-upper-bound)
-- The control socket's peer check runs on macOS and Linux only, the
-  autodestruct test runs on illumos only, and nothing compares
-  per-crate test counts across platforms. See
+- The control socket's peer check runs on macOS and Linux only and the
+  autodestruct test runs on illumos only, so neither runs on both.
+  `tools/check-test-parity.py` now fails CI when that set moves. See
   [hardware-run.md](hardware-run.md#coverage-that-does-not-reach-illumos)

@@ -61,3 +61,35 @@ pub fn exit_code(outcome: RunOutcome, log: &Logger) -> ExitCode {
         RunOutcome::GuestFault => ExitCode::from(4),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quiet() -> Logger {
+        Logger::root(slog::Discard, o!())
+    }
+
+    /// C bhyve's codes, from usr/src/cmd/bhyve/amd64/vmexit.c: RESET 0,
+    /// POWEROFF 1, HALT 2, TRIPLEFAULT 3. The kernel restarts a zone's
+    /// init only on exit 0, so only a reboot may map there.
+    #[test]
+    fn the_exit_codes_match_the_ones_the_zone_brand_reads() {
+        let log = quiet();
+        let cases = [
+            (RunOutcome::Reboot, 0u8),
+            (RunOutcome::PowerOff, 1),
+            (RunOutcome::Halt, 2),
+            (RunOutcome::TripleFault(0), 3),
+            // Distinct from HALT, or a guest fault reads as a clean halt.
+            (RunOutcome::GuestFault, 4),
+        ];
+        for (outcome, code) in cases {
+            assert_eq!(
+                exit_code(outcome, &log),
+                ExitCode::from(code),
+                "{outcome:?}"
+            );
+        }
+    }
+}

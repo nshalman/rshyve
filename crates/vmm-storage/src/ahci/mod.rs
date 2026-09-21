@@ -4,17 +4,18 @@
 
 //! Read-only AHCI ATAPI CD-ROM controller.
 //!
-//! This implementation deliberately diverges from
-//! `/opt/illumos-gate/usr/src/cmd/bhyve/common/pci_ahci.c`: it uses level
-//! INTx because this VMM has no MSI capability, exposes one port instead of
-//! bhyve's loop-created 32, re-resolves command-list and received-FIS memory
-//! instead of caching host pointers, and bounds-checks every guest-controlled
-//! address and length.
+//! This implementation deliberately diverges from C bhyve's
+//! `pci_ahci.c`: it uses level INTx because this VMM has no MSI
+//! capability, exposes one port instead of bhyve's loop-created 32,
+//! re-resolves command-list and received-FIS memory instead of caching
+//! host pointers, and bounds-checks every guest-controlled address and
+//! length.
 //!
-//! Those checks close guest-triggerable host SIGSEGV paths at
-//! `pci_ahci.c:636`, `:806`, `:975`, `:1883`, `:2160`, and `:2170`. Checked
-//! READ(12) sizing also avoids the reference's `u32` wrap at `:1477-1478`,
-//! while zero-length reads complete once instead of twice as at `:1473-1476`.
+//! Those checks close the guest-triggerable host SIGSEGV paths in the
+//! reference's `ahci_port_stop`, `ahci_handle_dsm_trim`,
+//! `ahci_handle_read_write` and `pci_ahci_ioreq_init`. Checked READ(12)
+//! sizing also avoids its `u32` wrap in `atapi_read`, and a
+//! zero-length read completes once here instead of twice.
 
 pub mod atapi;
 pub mod bits;

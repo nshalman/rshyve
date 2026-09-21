@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build and test vmmnew on the illumos build host.
+# Build and test rust-bhyve on the illumos build host.
 #
 # The rshyve binary only builds on illumos: vmm-tpm-sys drives an autotools
 # build of vendored libtpms, bhyve-api binds SunOS ioctls, and viona-api
@@ -28,6 +28,18 @@ set -euo pipefail
 HOST="${VMM_BUILD_HOST:?set VMM_BUILD_HOST to user@host of your illumos build host}"
 KEY="${VMM_BUILD_KEY:?set VMM_BUILD_KEY to the SSH key for that host}"
 REMOTE_DIR="${VMM_BUILD_DIR:-/opt/rust-bhyve}"
+
+# The value is spliced into a command that a remote root shell parses, so
+# it is constrained to an absolute path made of path characters. A space,
+# a quote or a `$(...)` would otherwise run as root on the node.
+case "$REMOTE_DIR" in
+    /*) ;;
+    *) echo "BUILD-FAIL: VMM_BUILD_DIR must be an absolute path" >&2; exit 1 ;;
+esac
+if printf '%s' "$REMOTE_DIR" | grep -qv '^[A-Za-z0-9_./-]*$'; then
+    echo "BUILD-FAIL: VMM_BUILD_DIR may hold only letters, digits, _ . / -" >&2
+    exit 1
+fi
 PROFILE="${VMM_BUILD_PROFILE:---release}"
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

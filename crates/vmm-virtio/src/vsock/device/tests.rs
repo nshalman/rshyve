@@ -16,7 +16,7 @@ use crate::socket_halt::{HALT_BUDGET, HALT_JOIN_ROUNDS};
 use crate::vsock::control::{read_line_bounded, LineRead, HANDSHAKE_BUDGET};
 use crate::vsock::mux::MAX_CONNS;
 use crate::vsock::packet::ConnKey;
-use std::io::{self, Read};
+use std::io::{self, BufRead as _, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -239,6 +239,40 @@ fn rx_ring_full() -> (Arc<PhysMap>, Vec<VirtQueue>) {
     (physmap, vec![queue])
 }
 
+/// A transmit queue with EVENT_IDX on and every slot filled. The
+/// chains are device-readable, as a guest's outgoing packets are.
+fn tx_ring_full() -> (Arc<PhysMap>, Vec<VirtQueue>) {
+    let physmap = Arc::new(
+        PhysMap::new_anon(DESC_GPA, 0x2000).expect("create queue memory"),
+    );
+    let mut queue = VirtQueue::new(RING_SIZE);
+    queue.set_addr_modern(DESC_GPA, AVAIL_GPA, USED_GPA);
+    queue.set_event_idx(true);
+    for i in 0..RING_SIZE {
+        write_desc(
+            &physmap,
+            u64::from(i),
+            BUF_GPA + u64::from(i) * 64,
+            64,
+            0,
+            0,
+        );
+        physmap
+            .lookup(AVAIL_GPA + 4 + u64::from(i) * 2, 2)
+            .expect("mapped avail entry")
+            .write::<u16>(&i)
+            .expect("write avail entry");
+    }
+    physmap
+        .lookup(AVAIL_GPA + 2, 2)
+        .expect("mapped avail index")
+        .write::<u16>(&RING_SIZE)
+        .expect("write avail index");
+    // The transport indexes by queue number, so the transmit ring has
+    // to sit at its own index.
+    (physmap, vec![VirtQueue::new(RING_SIZE), queue])
+}
+
 /// The device's own "kick me past here" threshold, which lives at the
 /// end of the used ring (VIRTIO 1.3 sec 2.7.7).
 fn avail_event(physmap: &PhysMap) -> u16 {
@@ -363,7 +397,7 @@ fn a_finished_reader_is_reaped_when_the_next_one_starts() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         vsock.shared.track_reader(std::thread::spawn(|| {}));
-        let live = vsock.shared.readers.lock().expect("reader lock").len();
+        let live = vsock.shared.reader_count();
         if live <= 2 || Instant::now() >= deadline {
             assert!(live <= 2, "{live} handles were kept");
             break;
@@ -680,6 +714,395 @@ fn payload_with_no_host_socket_tells_the_guest() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// What the guest's receive buffer holds now.
+fn rx_buf(physmap: &PhysMap) -> Vec<u8> {
+    let mut out = vec![0u8; 64];
+    physmap
+        .lookup(BUF_GPA, out.len())
+        .expect("mapped rx buffer")
+        .read_bytes(&mut out)
+        .expect("read rx buffer");
+    out
+}
+
+/// Delivery runs on reader and accept threads, outside the transport's
+/// register lock, so a reset can land between the pop of a chain and
+/// the write into it. The illumos legacy driver frees the vring on the
+/// status write, so a late write lands in whatever the guest has put
+/// in those pages since. A delivery therefore needs the reset's
+/// permission, exactly as virtio-fs's worker does.
+#[test]
+fn a_delivery_without_the_resets_permission_writes_nothing() {
+    const SENTINEL: u8 = 0x5a;
+
+    let (physmap, mut queues) = rx_ring();
+    write_desc(&physmap, 0, BUF_GPA, 64, crate::bits::VRING_DESC_F_WRITE, 0);
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+    physmap
+        .lookup(BUF_GPA, 64)
+        .expect("mapped rx buffer")
+        .write_bytes(&[SENTINEL; 64])
+        .expect("seed the rx buffer");
+
+    // The chain is posted under the transport lock, before the reset.
+    vsock.notify_queue(VSOCK_RX_QUEUE, &mut queues, &physmap);
+    assert_eq!(vsock.shared.pending_rx.lock().expect("pending").len(), 1);
+
+    let key = ConnKey {
+        guest_port: 1024,
+        host_port: 1,
+    };
+    assert!(vsock.shared.mux.start_host_connect(key));
+
+    // Admission shut, the way a reset shuts it before its drain.
+    vsock.shared.access.close_all();
+    vsock.shared.deliver_rx();
+
+    assert_eq!(
+        used_idx(&physmap),
+        0,
+        "a delivery published into the ring without permission",
+    );
+    assert_eq!(
+        rx_buf(&physmap),
+        vec![SENTINEL; 64],
+        "a delivery wrote into the chain without permission",
+    );
+    assert!(!vsock.shared.mux.rx_is_empty(), "the packet was consumed");
+
+    // The other half: the driver that follows must still be served, or
+    // the device has traded a stale write for a permanent stall.
+    vsock
+        .shared
+        .access
+        .reopen(vsock.shared.access.intr_session());
+    vsock.shared.deliver_rx();
+    assert_eq!(used_idx(&physmap), 1, "the running driver got nothing");
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other side of the guard: the reset has to wait for a delivery
+/// that was already inside, or it returns while a write into the ring
+/// is still running and the driver frees the pages under it.
+#[test]
+fn a_reset_waits_out_a_delivery_already_inside() {
+    let (physmap, _queues) = rx_ring();
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+
+    let session = vsock
+        .shared
+        .access
+        .enter_current(VSOCK_RX_QUEUE)
+        .expect("a session is open");
+
+    let finished = Arc::new(AtomicBool::new(false));
+    let done = Arc::clone(&finished);
+    let device = Arc::clone(&vsock.shared);
+    let resetter = std::thread::spawn(move || {
+        device.access.close_all();
+        device.access.drain();
+        done.store(true, Ordering::Release);
+        device.access.reopen(device.access.intr_session());
+    });
+
+    // Admission shuts first, so this is the reset inside its drain and
+    // nowhere else.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while vsock.shared.access.is_open() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!vsock.shared.access.is_open(), "the reset never started");
+    assert!(
+        !finished.load(Ordering::Acquire),
+        "the reset returned while a delivery still held the ring",
+    );
+
+    drop(session);
+    resetter.join().expect("reset thread");
+    assert!(finished.load(Ordering::Acquire));
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A driver may program the receive ring again without resetting the
+/// device, and it frees the old ring as soon as it has. A delivery
+/// already inside `pair_rx` holds the chain it took off the stash and
+/// the writer that names the old ring, so dropping the cached ones
+/// does not reach it: the reprogram has to wait it out.
+#[test]
+fn a_reprogrammed_rx_ring_waits_out_a_delivery_already_inside() {
+    const SENTINEL: u8 = 0x5a;
+    // Free, mapped ring memory past the fixture's own.
+    const NEW_DESC_GPA: u64 = 0x1900;
+    const NEW_AVAIL_GPA: u64 = 0x1A00;
+    const NEW_USED_GPA: u64 = 0x1B00;
+
+    let (physmap, mut queues) = rx_ring();
+    write_desc(&physmap, 0, BUF_GPA, 64, crate::bits::VRING_DESC_F_WRITE, 0);
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+    physmap
+        .lookup(BUF_GPA, 64)
+        .expect("mapped rx buffer")
+        .write_bytes(&[SENTINEL; 64])
+        .expect("seed the rx buffer");
+
+    // A chain on the stash and a packet waiting for it: what a
+    // delivery inside `pair_rx` holds.
+    vsock.notify_queue(VSOCK_RX_QUEUE, &mut queues, &physmap);
+    assert_eq!(vsock.shared.pending_rx.lock().expect("pending").len(), 1);
+    let key = ConnKey {
+        guest_port: 1024,
+        host_port: 1,
+    };
+    assert!(vsock.shared.mux.start_host_connect(key));
+
+    let mut reprogrammed = VirtQueue::new(RING_SIZE);
+    reprogrammed.set_addr_modern(NEW_DESC_GPA, NEW_AVAIL_GPA, NEW_USED_GPA);
+
+    let held = vsock
+        .shared
+        .access
+        .enter_current(VSOCK_RX_QUEUE)
+        .expect("a delivery is admitted");
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            vsock.queue_addr_set(VSOCK_RX_QUEUE, &reprogrammed);
+            finished.store(true, Ordering::Release);
+        });
+
+        // Admission shuts first, so past this the reprogram is inside
+        // its drain and nowhere else.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while vsock.shared.access.is_open() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !vsock.shared.access.is_open(),
+            "the reprogram never took the ring back"
+        );
+        assert!(
+            !finished.load(Ordering::Acquire),
+            "the reprogram returned while a delivery still held the old ring",
+        );
+        drop(held);
+    });
+    assert!(finished.load(Ordering::Acquire));
+
+    // The packet is still owed, and a delivery runs again now that
+    // admission is back. Nothing of it may reach the old ring.
+    vsock.shared.deliver_rx();
+    assert_eq!(
+        used_idx(&physmap),
+        0,
+        "a delivery published into the ring the driver gave up",
+    );
+    assert_eq!(
+        rx_buf(&physmap),
+        vec![SENTINEL; 64],
+        "a delivery wrote into the chain the driver gave up",
+    );
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// CONTROL shares the reader table with every CONNECT, and an
+/// established session is allowed to idle, so a few idle CONTROL peers
+/// could take every slot and leave the operator unable to connect at
+/// all. The verb has a quota of its own.
+#[test]
+fn control_sessions_are_held_to_their_own_quota() {
+    use crate::vsock::control::MAX_CONTROL_SESSIONS;
+    use std::io::Write as _;
+
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    let held: Vec<_> = (0..MAX_CONTROL_SESSIONS)
+        .map(|_| {
+            vsock
+                .shared
+                .reserve_control_session()
+                .expect("a free control slot")
+        })
+        .collect();
+
+    let (mut peer, device_end) = UnixStream::pair().expect("socketpair");
+    peer.write_all(b"CONTROL\n").expect("send the verb");
+    handle_host_connect(Arc::clone(&vsock.shared), device_end);
+
+    let mut answer = String::new();
+    io::BufReader::new(&peer)
+        .read_line(&mut answer)
+        .expect("read the refusal");
+    assert_eq!(answer.trim_end(), "ERR too many control sessions");
+
+    // A slot given back admits the next session.
+    drop(held);
+    assert!(vsock.shared.reserve_control_session().is_some());
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Host accepts are held to the reader table, and so are the guest's
+/// own connections: they cost the same thread and the same 64 KiB
+/// buffer. A guest allowed past it doubles the ceiling the device
+/// claims, and the refusal has to come before the dial, so nothing is
+/// opened on the host that cannot be served.
+#[test]
+fn a_guest_connect_is_held_to_the_reader_table() {
+    use crate::vsock::packet::{
+        VsockHdr, HDR_SIZE, OP_REQUEST, OP_RST, TYPE_STREAM,
+    };
+    use std::os::unix::net::UnixListener;
+
+    const GUEST_PORT: u32 = 1024;
+    const HOST_PORT: u32 = 5000;
+
+    let hdr = VsockHdr {
+        src_cid: 3,
+        dst_cid: crate::vsock::packet::CID_HOST,
+        src_port: GUEST_PORT,
+        dst_port: HOST_PORT,
+        len: 0,
+        type_: TYPE_STREAM,
+        op: OP_REQUEST,
+        flags: 0,
+        buf_alloc: 64 * 1024,
+        fwd_cnt: 0,
+    };
+
+    let physmap = Arc::new(
+        PhysMap::new_anon(DESC_GPA, 0x2000).expect("create queue memory"),
+    );
+    let mut queue = VirtQueue::new(RING_SIZE);
+    queue.set_addr_modern(DESC_GPA, AVAIL_GPA, USED_GPA);
+    write_desc(&physmap, 0, BUF_GPA, HDR_SIZE as u32, 0, 0);
+    physmap
+        .lookup(BUF_GPA, HDR_SIZE)
+        .expect("mapped packet")
+        .write_bytes(&hdr.to_bytes())
+        .expect("seed the packet");
+    physmap
+        .lookup(AVAIL_GPA + 4, 2)
+        .expect("mapped avail entry")
+        .write::<u16>(&0)
+        .expect("write avail entry");
+    physmap
+        .lookup(AVAIL_GPA + 2, 2)
+        .expect("mapped avail index")
+        .write::<u16>(&1)
+        .expect("write avail index");
+    let mut queues = vec![VirtQueue::new(RING_SIZE), queue];
+
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+    // A host listener the dial would reach, so a refusal can only come
+    // from the cap.
+    let port_path = PathBuf::from(format!(
+        "{}_{}",
+        vsock.socket_path().display(),
+        HOST_PORT
+    ));
+    let host = UnixListener::bind(&port_path).expect("bind the host port");
+    host.set_nonblocking(true).expect("non-blocking listener");
+
+    // Every slot promised to a thread, as a full table is.
+    let slots: Vec<_> = (0..MAX_CONNS)
+        .map(|_| vsock.shared.reserve_reader().expect("a free slot"))
+        .collect();
+
+    vsock.notify_queue(VSOCK_TX_QUEUE, &mut queues, &physmap);
+
+    let key = ConnKey {
+        guest_port: GUEST_PORT,
+        host_port: HOST_PORT,
+    };
+    assert_eq!(
+        vsock.shared.mux.conn_count(),
+        0,
+        "a connection was kept with no reader to serve it",
+    );
+    assert!(
+        !vsock
+            .shared
+            .sockets
+            .lock()
+            .expect("sockets")
+            .contains_key(&key),
+        "a host socket was registered past the reader cap",
+    );
+    let refusal = vsock
+        .shared
+        .mux
+        .pop_rx()
+        .expect("the guest was told nothing");
+    assert_eq!(refusal.hdr.op, OP_RST);
+    assert!(
+        matches!(host.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+        "the host port was dialled before the cap was tested",
+    );
+
+    drop(slots);
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A reader wakes when its own socket closes, and the guest may by then
+/// have closed that connection and opened another under the same key:
+/// it picks both ports, so a program that re-dials from a fixed local
+/// port reuses the key at once. A reader that tore the key down would
+/// kill the connection the guest had just opened.
+#[test]
+fn a_readers_exit_leaves_a_connection_that_reused_its_key_alone() {
+    let (dir, vsock) = test_vsock(Arc::new(PhysMap::new()));
+    let key = ConnKey {
+        guest_port: 1024,
+        host_port: 1,
+    };
+
+    // The connection this reader serves.
+    let (peer, device_end) = UnixStream::pair().expect("socketpair");
+    assert!(vsock.shared.mux.start_host_connect(key));
+    let served = vsock.shared.register_socket(key, device_end);
+
+    // The guest closes it, then opens the same key again.
+    vsock.shared.mux.forget(key);
+    vsock.shared.drop_socket(key);
+    let (_next_peer, next_end) = UnixStream::pair().expect("socketpair");
+    assert!(vsock.shared.mux.start_host_connect(key));
+    vsock.shared.register_socket(key, next_end);
+    while vsock.shared.mux.pop_rx().is_some() {}
+
+    // Only now does the old reader wake and run its exit.
+    drop(peer);
+    reader_loop(Arc::clone(&vsock.shared), key, served);
+
+    assert_eq!(
+        vsock.shared.mux.conn_count(),
+        1,
+        "the old reader forgot the connection that took its key",
+    );
+    assert!(
+        vsock.shared.mux.pop_rx().is_none(),
+        "the guest was told the connection it just opened had gone",
+    );
+    assert!(
+        vsock
+            .shared
+            .sockets
+            .lock()
+            .expect("sockets")
+            .contains_key(&key),
+        "the old reader dropped the new connection's socket",
+    );
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // The RX handler and the transport session are two pieces of state a
 // reset changes one after the other, and a socket thread can be
 // between them. A packet delivered on the handler the reset dropped
@@ -787,6 +1210,8 @@ fn an_accepted_socket_does_not_keep_the_non_blocking_flag() {
 
     let served = accepted_blocking(inherited).expect("the socket is usable");
 
+    // SAFETY: `served` owns the descriptor and outlives the call, and
+    // F_GETFL takes no pointer argument.
     let flags = unsafe { libc::fcntl(served.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0, "F_GETFL failed");
     assert_eq!(
@@ -878,7 +1303,9 @@ fn the_reader_offers_every_byte_once_through_a_small_window() {
 
     let reader = {
         let shared = Arc::clone(&vsock.shared);
-        std::thread::spawn(move || reader_loop(shared, key, device_end))
+        std::thread::spawn(move || {
+            reader_loop(shared, key, Arc::new(device_end))
+        })
     };
     // The host peer writes on its own thread: the socket buffer fills
     // long before the guest's window has taken the whole stream.
@@ -943,8 +1370,8 @@ fn the_reader_offers_every_byte_once_through_a_small_window() {
 /// needs a chain like any other packet.
 ///
 /// Linux fills the whole ring the moment it probes, so this is the
-/// first pass, not a corner. Kills the mutation of arming only when
-/// the pass stopped short of the request cap.
+/// first pass, not a corner. Fails if the kick is armed only when the
+/// pass stopped short of the request cap.
 #[test]
 fn a_ring_taken_whole_still_arms_the_next_kick() {
     let (physmap, mut queues) = rx_ring_full();
@@ -956,6 +1383,32 @@ fn a_ring_taken_whole_still_arms_the_next_kick() {
         vsock.shared.pending_rx.lock().expect("pending").len(),
         usize::from(RING_SIZE),
         "the whole ring should be stashed",
+    );
+    assert_eq!(
+        avail_event(&physmap),
+        RING_SIZE,
+        "avail_event left behind the ring: the guest will never kick again",
+    );
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The transmit ring has the same trap as the receive ring: nothing
+/// returns to it without a guest kick, so a pass that stops on the
+/// request cap must still arm `avail_event` or the guest goes quiet
+/// and the device never sees the rest of the ring.
+#[test]
+fn a_transmit_ring_taken_whole_still_arms_the_next_kick() {
+    let (physmap, mut queues) = tx_ring_full();
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+
+    vsock.notify_queue(VSOCK_TX_QUEUE, &mut queues, &physmap);
+
+    assert_eq!(
+        used_idx(&physmap),
+        RING_SIZE,
+        "the whole ring should have been consumed",
     );
     assert_eq!(
         avail_event(&physmap),

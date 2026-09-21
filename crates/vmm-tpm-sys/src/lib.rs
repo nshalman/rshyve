@@ -8,11 +8,11 @@
 //! because the libtpms public API is small and stable (the
 //! `TPMLIB_*` family in `libtpms/tpm_library.h`).
 //!
-//! The shared-library version of libtpms uses TLS for some of its
-//! internal command processing state, which means the same library
-//! instance cannot serve more than one VM in the same process. We
-//! always link statically and instantiate per-process; if vmmnew
-//! ever runs multiple VMs in one process, this module needs revisiting.
+//! libtpms keeps the whole TPM in process-global C state and takes no
+//! locks, so one instance serves one VM and one caller at a time. The
+//! link is always static and the instance is per process. Running more
+//! than one VM in a process needs this module revisited; `vmm_tpm::Crb`
+//! is what serialises the callers today.
 
 #![allow(non_camel_case_types, non_snake_case)]
 
@@ -64,6 +64,21 @@ extern "C" {
         command: *const u8,
         command_size: u32,
     ) -> TPM_RESULT;
+
+    /// Negotiate the largest command and response the TPM will accept.
+    ///
+    /// Call after `TPMLIB_ChooseTPMVersion` and before
+    /// `TPMLIB_MainInit`: the value becomes the reference code's
+    /// `MAX_COMMAND_SIZE` and `MAX_RESPONSE_SIZE`, so the library
+    /// answers an oversize command with `TPM_RC_COMMAND_SIZE` and never
+    /// builds a response the caller's buffer cannot hold. Returns the
+    /// size it settled on, clamped into `*min_size ..= *max_size`.
+    /// `wanted_size` 0 only reports the current value.
+    pub fn TPMLIB_SetBufferSize(
+        wanted_size: u32,
+        min_size: *mut u32,
+        max_size: *mut u32,
+    ) -> u32;
 
     /// Apply runtime profile (locality, established flag, …) before
     /// MainInit. Pass NULL for default behavior.

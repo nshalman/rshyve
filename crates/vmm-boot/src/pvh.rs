@@ -25,6 +25,10 @@ use anyhow::{ensure, Context, Result};
 use vmm_core::mem::MemCtx;
 use vmm_devices::acpi;
 
+use crate::bsp::{
+    self, FlatSegments, CR0_ET, CR0_PE, GDT_DATA, RFLAGS_RESERVED_BIT1,
+    SEG_TYPE_CODE_XRA,
+};
 use crate::direct::{CMDLINE_MAX, GPA_CMDLINE};
 use crate::{BootVcpu, InitrdImage, PvhKernel};
 
@@ -135,21 +139,8 @@ impl HvmModlistEntry {
 
 /// 32-bit code: base 0, limit 0xFFFFF, type 0x0B, S=1, P=1, D/B=1, G=1.
 const GDT_CODE32: u64 = 0x00CF_9B00_0000_FFFF;
-/// 32-bit data: base 0, limit 0xFFFFF, type 0x03, S=1, P=1, D/B=1, G=1.
-const GDT_DATA32: u64 = 0x00CF_9300_0000_FFFF;
-const GDT_SEL_CODE32: u64 = 0x08;
-const GDT_SEL_DATA32: u64 = 0x10;
 const PVH_GDT_SIZE: usize = 24;
 const PVH_GDTR_LIMIT: u32 = (PVH_GDT_SIZE as u32) - 1;
-
-// ── x86 register values ─────────────────────────────────────────────
-
-const CR0_PE: u64 = 1 << 0;
-const CR0_ET: u64 = 1 << 4;
-const SEG_TYPE_CODE_XRA: u32 = 0x0B;
-const SEG_TYPE_DATA_RWA: u32 = 0x03;
-const SEG_TYPE_TSS_BUSY: u32 = 0x0B;
-const RFLAGS_RESERVED_BIT1: u64 = 0x02;
 
 // ── Loading ─────────────────────────────────────────────────────────
 
@@ -232,7 +223,7 @@ pub fn load_pvh_kernel(
     // 4. GDT for the PVH trampoline.
     let mut gdt = [0u8; PVH_GDT_SIZE];
     gdt[8..16].copy_from_slice(&GDT_CODE32.to_le_bytes());
-    gdt[16..24].copy_from_slice(&GDT_DATA32.to_le_bytes());
+    gdt[16..24].copy_from_slice(&GDT_DATA.to_le_bytes());
     mem.write(PVH_GPA_GDT, &gdt)
         .context("failed to write GDT")?;
 
@@ -296,8 +287,7 @@ pub fn setup_pvh_bsp<V: BootVcpu + ?Sized>(
     entry32: u32,
 ) -> Result<()> {
     use bhyve_api::{
-        seg_desc, vm_reg_name::*, SEG_ACCESS_DB, SEG_ACCESS_G, SEG_ACCESS_P,
-        SEG_ACCESS_S, SEG_ACCESS_UNUSABLE,
+        vm_reg_name::*, SEG_ACCESS_DB, SEG_ACCESS_G, SEG_ACCESS_P, SEG_ACCESS_S,
     };
 
     vcpu.reboot_state().context("reboot_state")?;
@@ -307,101 +297,25 @@ pub fn setup_pvh_bsp<V: BootVcpu + ?Sized>(
     vcpu.set_reg(VM_REG_GUEST_CR4, 0)?;
     vcpu.set_reg(VM_REG_GUEST_EFER, 0)?;
 
-    let code_access = SEG_ACCESS_P
-        | SEG_ACCESS_S
-        | SEG_ACCESS_DB
-        | SEG_ACCESS_G
-        | SEG_TYPE_CODE_XRA;
-    vcpu.set_segment_desc(
-        VM_REG_GUEST_CS,
-        &seg_desc {
-            base: 0,
-            limit: u32::MAX,
-            access: code_access,
-        },
-    )?;
-    vcpu.set_reg(VM_REG_GUEST_CS, GDT_SEL_CODE32)?;
-
-    let data_access = SEG_ACCESS_P
-        | SEG_ACCESS_S
-        | SEG_ACCESS_DB
-        | SEG_ACCESS_G
-        | SEG_TYPE_DATA_RWA;
-    let data_desc = seg_desc {
-        base: 0,
-        limit: u32::MAX,
-        access: data_access,
-    };
-    for reg in [
-        VM_REG_GUEST_DS,
-        VM_REG_GUEST_ES,
-        VM_REG_GUEST_FS,
-        VM_REG_GUEST_GS,
-        VM_REG_GUEST_SS,
-    ] {
-        vcpu.set_segment_desc(reg, &data_desc)?;
-        vcpu.set_reg(reg, GDT_SEL_DATA32)?;
-    }
-
-    vcpu.set_segment_desc(
-        VM_REG_GUEST_GDTR,
-        &seg_desc {
-            base: PVH_GPA_GDT,
-            limit: PVH_GDTR_LIMIT,
-            access: 0,
-        },
-    )?;
-    // VMX needs a present TR and an unusable LDTR before entry.
-    vcpu.set_segment_desc(
-        VM_REG_GUEST_TR,
-        &seg_desc {
-            base: 0,
-            limit: u16::MAX as u32,
-            access: SEG_ACCESS_P | SEG_TYPE_TSS_BUSY,
-        },
-    )?;
-    vcpu.set_reg(VM_REG_GUEST_TR, 0)?;
-    vcpu.set_segment_desc(
-        VM_REG_GUEST_LDTR,
-        &seg_desc {
-            base: 0,
-            limit: 0,
-            access: SEG_ACCESS_UNUSABLE,
-        },
-    )?;
-    vcpu.set_reg(VM_REG_GUEST_LDTR, 0)?;
-    vcpu.set_segment_desc(
-        VM_REG_GUEST_IDTR,
-        &seg_desc {
-            base: 0,
-            limit: u16::MAX as u32,
-            access: 0,
+    bsp::program_flat_segments(
+        vcpu,
+        &FlatSegments {
+            // D/B, not L: the PVH entry is 32-bit protected mode.
+            code_access: SEG_ACCESS_P
+                | SEG_ACCESS_S
+                | SEG_ACCESS_DB
+                | SEG_ACCESS_G
+                | SEG_TYPE_CODE_XRA,
+            gdt_base: PVH_GPA_GDT,
+            gdt_limit: PVH_GDTR_LIMIT,
         },
     )?;
 
     vcpu.set_reg(VM_REG_GUEST_RIP, u64::from(entry32))?;
+    vcpu.set_reg(VM_REG_GUEST_RFLAGS, RFLAGS_RESERVED_BIT1)?;
     // The PVH ABI uses EBX, not ESI.
     vcpu.set_reg(VM_REG_GUEST_RBX, PVH_GPA_START_INFO)?;
-    vcpu.set_reg(VM_REG_GUEST_RFLAGS, RFLAGS_RESERVED_BIT1)?;
-    for reg in [
-        VM_REG_GUEST_RAX,
-        VM_REG_GUEST_RCX,
-        VM_REG_GUEST_RDX,
-        VM_REG_GUEST_RSI,
-        VM_REG_GUEST_RDI,
-        VM_REG_GUEST_RBP,
-        VM_REG_GUEST_RSP,
-        VM_REG_GUEST_R8,
-        VM_REG_GUEST_R9,
-        VM_REG_GUEST_R10,
-        VM_REG_GUEST_R11,
-        VM_REG_GUEST_R12,
-        VM_REG_GUEST_R13,
-        VM_REG_GUEST_R14,
-        VM_REG_GUEST_R15,
-    ] {
-        vcpu.set_reg(reg, 0)?;
-    }
+    bsp::zero_gprs(vcpu, VM_REG_GUEST_RBX)?;
 
     vcpu.set_run_state(bhyve_api::VRS_RUN)?;
     Ok(())
@@ -501,7 +415,7 @@ mod tests {
         // D/B set and L clear is what makes this 32-bit, not 64-bit.
         assert_ne!(GDT_CODE32 & (1 << 54), 0, "D/B must be set");
         assert_eq!(GDT_CODE32 & (1 << 53), 0, "L must be clear");
-        assert_ne!(GDT_DATA32 & (1 << 54), 0, "D/B must be set");
+        assert_ne!(GDT_DATA & (1 << 54), 0, "D/B must be set");
     }
 
     /// Every register write `setup_pvh_bsp` makes, in order.
@@ -554,8 +468,8 @@ mod tests {
                 reg(VM_REG_GUEST_LDTR, 0),
                 desc(VM_REG_GUEST_IDTR, 0, 0xFFFF, 0),
                 reg(VM_REG_GUEST_RIP, ENTRY32 as u64),
-                reg(VM_REG_GUEST_RBX, 0x1000), // hvm_start_info, not RSI
                 reg(VM_REG_GUEST_RFLAGS, 0x02),
+                reg(VM_REG_GUEST_RBX, 0x1000), // hvm_start_info, not RSI
                 reg(VM_REG_GUEST_RAX, 0),
                 reg(VM_REG_GUEST_RCX, 0),
                 reg(VM_REG_GUEST_RDX, 0),

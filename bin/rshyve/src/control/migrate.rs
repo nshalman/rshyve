@@ -4,6 +4,7 @@
 
 //! Migration command handlers and their address guards.
 
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -15,7 +16,6 @@ use slog::{error, info};
 
 use vmm_core::mem::MemCtx;
 use vmm_machine::HotplugEngines;
-use vmm_migrate::sync_source::DeviceFlushError;
 
 use super::protocol::{Command, Response};
 use super::{VmController, VmRunState};
@@ -60,24 +60,19 @@ fn growth(hotplug: &HotplugEngines) -> (usize, u64) {
 /// Why a VM whose device set no longer matches its boot `-s` list
 /// cannot be a migration source.
 ///
-/// Device identity on the migration wire is positional. The source
-/// tags every queue group with `pci_slot: 0` (`control/mod.rs`), the
-/// preamble device list is empty (`vmm-migrate/src/sync_source.rs`),
-/// and the destination claims the first queue group whose count equals
-/// its own (`vmm-virtio/src/pci/migrate.rs`). While the
-/// live set equals the boot `-s` list, both sides build the same
-/// devices in the same order, so the match is accidental but correct.
-/// A hot-add or an eject breaks that, and a guest would come up on the
-/// far side with another device's ring state. Refuse until device
-/// identity is on the wire.
+/// The destination is started from the boot `-s` list, so a device the
+/// guest gained since boot has nowhere to land. The wire names devices
+/// by PCI address now, so the destination would refuse the payload
+/// rather than restore the wrong state, but refusing here tells the
+/// operator which slots to remove before the guest is ever paused.
 fn device_set_changed(live_hotplug: &[String]) -> Option<String> {
     if live_hotplug.is_empty() {
         return None;
     }
     Some(format!(
-        "this VM hot-added {} device(s) since boot ({}); migration \
-         matches devices by position, so the destination would restore \
-         the wrong device state",
+        "this VM hot-added {} device(s) since boot ({}); a migration \
+         destination is built from the boot device list and would have \
+         none of them",
         live_hotplug.len(),
         live_hotplug.join(" "),
     ))
@@ -149,6 +144,57 @@ fn validate_migration_addr(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Devices that carry guest-visible state no migration puts back.
+///
+/// A guest whose driver configured one of these would find it at reset
+/// on the far side, with no error anywhere. The list is documented in
+/// docs/migration.md; grow it there and here together.
+const UNMIGRATABLE: &[&str] = &[
+    "ahci-cd",
+    "virtio-console",
+    "virtio-fs",
+    "virtio-vsock",
+    "xhci",
+];
+
+/// Why a VM carrying a device with unmigratable state cannot be a
+/// source.
+fn unmigratable_devices(
+    devices: &[vmm_migrate::codec::DeviceIdentity],
+) -> Option<String> {
+    let blocking: Vec<String> = devices
+        .iter()
+        .filter(|d| UNMIGRATABLE.contains(&d.kind.as_str()))
+        .map(|d| d.to_string())
+        .collect();
+    if blocking.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "no migration state is carried for {}; the guest would find \
+         the device at reset on the destination",
+        blocking.join(" "),
+    ))
+}
+
+/// Where a migration source connects to.
+enum MigrateTarget {
+    /// A Unix socket the GZ agent bridges to the peer. The only kind
+    /// that works inside a bhyve zone.
+    Unix(String),
+    Tcp(String),
+}
+
+impl MigrateTarget {
+    fn parse(target: &str) -> Result<Self, String> {
+        if target.starts_with('/') || target.ends_with(".sock") {
+            return Ok(Self::Unix(target.to_string()));
+        }
+        validate_migration_addr(target)?;
+        Ok(Self::Tcp(target.to_string()))
+    }
+}
+
 // ── Handlers ────────────────────────────────────────────────────────
 
 pub(super) fn migrate_source(
@@ -156,15 +202,10 @@ pub(super) fn migrate_source(
     target_addr: String,
     zfs_barrier: Option<String>,
 ) -> Response {
-    // Validate the target address to prevent SSRF. Require
-    // it to be a valid host:port and reject obviously-dangerous
-    // targets like localhost, link-local, and multicast.
-    // Skip TCP validation for Unix socket paths
-    if !target_addr.starts_with('/') && !target_addr.ends_with(".sock") {
-        if let Err(e) = validate_migration_addr(&target_addr) {
-            return Response::err(&format!("invalid target_addr: {e}"));
-        }
-    }
+    let target = match MigrateTarget::parse(&target_addr) {
+        Ok(target) => target,
+        Err(e) => return Response::err(&format!("invalid target_addr: {e}")),
+    };
 
     if !ctrl.transition(VmRunState::Running, VmRunState::Migrating) {
         return Response::err("VM must be running to start migration");
@@ -177,9 +218,11 @@ pub(super) fn migrate_source(
     let refused = {
         let _topology = ctrl.lock_topology();
         let (cpus, bytes) = growth(&ctrl.hotplug);
-        grown_since_boot(cpus, bytes).or_else(|| {
-            device_set_changed(&vmm_machine::hotplug_specs(&ctrl.registry))
-        })
+        grown_since_boot(cpus, bytes)
+            .or_else(|| {
+                device_set_changed(&vmm_machine::hotplug_specs(&ctrl.registry))
+            })
+            .or_else(|| unmigratable_devices(&ctrl.migrate_identities()))
     };
     if let Some(reason) = refused {
         ctrl.state
@@ -188,8 +231,6 @@ pub(super) fn migrate_source(
     }
 
     let status = Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
-
-    // Store status for later query
     if let Ok(mut ms) = ctrl.migrate_status.lock() {
         *ms = Some(Arc::clone(&status));
     }
@@ -197,173 +238,76 @@ pub(super) fn migrate_source(
     let ctrl_arc = Arc::clone(ctrl);
     let hdl = Arc::clone(&ctrl.hdl);
     let memctx = MemCtx::new(Arc::clone(&ctrl.physmap));
-    let num_cpus = ctrl.num_cpus;
-    let mem_size = ctrl.mem_size as u64;
     let mlog = ctrl.log.clone();
+    let config = vmm_migrate::source::SourceConfig {
+        num_cpus: ctrl.num_cpus,
+        mem_size: ctrl.mem_size as u64,
+        cpu_baseline: ctrl.cpu_baseline,
+        devices: ctrl.migrate_identities(),
+        deadlines: vmm_migrate::wire::Deadlines::default(),
+        zfs_barrier: zfs_barrier.map(PathBuf::from),
+    };
 
-    let is_unix =
-        target_addr.starts_with('/') || target_addr.ends_with(".sock");
-
-    if let Err(e) = thread::Builder::new().name("migrate-source".into()).spawn(
-        move || {
-            if is_unix {
-                // Synchronous path for Unix sockets (works in
-                // bhyve zones without /dev/poll).
-                info!(mlog, "connecting to migration socket";
-                    "path" => &target_addr);
-                let stream = match UnixStream::connect(&target_addr) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!(mlog, "connect failed";
-                            "path" => &target_addr, "error" => %e);
-                        ctrl_arc.state.store(
-                            VmRunState::Running as u8,
-                            Ordering::Release,
-                        );
-                        return;
+    if let Err(e) =
+        thread::Builder::new()
+            .name("migrate-source".into())
+            .spawn(move || {
+                let hooks = source_hooks(&ctrl_arc);
+                let outcome = match target {
+                    MigrateTarget::Unix(path) => {
+                        info!(mlog, "connecting to migration socket";
+                        "path" => &path);
+                        UnixStream::connect(&path)
+                            .map_err(|e| SourceOutcome::Failed(e.to_string()))
+                            .and_then(|stream| {
+                                run_source(
+                                    stream, hdl, &memctx, config, hooks,
+                                    status, &mlog,
+                                )
+                            })
+                    }
+                    MigrateTarget::Tcp(addr) => {
+                        info!(mlog, "connecting to migration peer";
+                        "target" => &addr);
+                        TcpStream::connect(&addr)
+                            .map_err(|e| SourceOutcome::Failed(e.to_string()))
+                            .and_then(|stream| {
+                                run_source(
+                                    stream, hdl, &memctx, config, hooks,
+                                    status, &mlog,
+                                )
+                            })
                     }
                 };
-
-                let ctrl_for_prepause = ctrl_arc.clone();
-                let pre_pause_fn: vmm_migrate::sync_source::DevicePrePauseFn =
-                    Box::new(move || {
-                        for dev in ctrl_for_prepause.lifecycle_devices() {
-                            dev.pause_for_migration();
-                        }
-                    });
-                let ctrl_for_flush = ctrl_arc.clone();
-                let flush_fn: vmm_migrate::sync_source::DeviceFlushFn =
-                    Box::new(move || {
-                        for dev in ctrl_for_flush.lifecycle_devices() {
-                            dev.flush_backing(
-                                vmm_devices::FlushIntent::Durable,
-                            )
-                            .map_err(|source| {
-                                DeviceFlushError {
-                                    device: dev.type_name(),
-                                    source,
-                                }
-                            })?;
-                        }
-                        Ok(())
-                    });
-                let ctrl_for_resume = ctrl_arc.clone();
-                let resume_fn: vmm_migrate::sync_source::DeviceResumeFn =
-                    Box::new(move || ctrl_for_resume.resume_devices());
-                let ctrl_for_export = ctrl_arc.clone();
-                let export_fn: vmm_migrate::sync_source::DeviceExportFn =
-                    Box::new(move || {
-                        match ctrl_for_export.export_device_queues() {
-                            Ok(export) => export,
-                            Err(error) => {
-                                error!(ctrl_for_export.log,
-                                    "device queue export failed";
-                                    "error" => %error);
-                                // DeviceExportFn is infallible until the
-                                // migration layer can propagate this error.
-                                // Empty state avoids racing live ring indices.
-                                vmm_migrate::sync_source::DeviceQueueExport {
-                                    virtio_queues: Vec::new(),
-                                    nvme_controllers: Vec::new(),
-                                }
-                            }
-                        }
-                    });
-                match vmm_migrate::sync_source::run_source_sync(
-                    stream,
-                    hdl,
-                    &memctx,
-                    num_cpus,
-                    mem_size,
-                    status,
-                    &mlog,
-                    ctrl_arc.cpu_baseline,
-                    pre_pause_fn,
-                    flush_fn,
-                    resume_fn,
-                    export_fn,
-                    zfs_barrier.map(PathBuf::from),
-                ) {
+                match outcome {
                     Ok(()) => {
                         info!(mlog, "source migration complete");
                         ctrl_arc.finish_migrated_away(SOURCE_RELEASE_GRACE);
                     }
-                    Err(e) => {
-                        error!(mlog, "source migration failed";
-                            "error" => %e);
+                    Err(SourceOutcome::Committed(why)) => {
+                        // The destination may already be running the
+                        // guest. Running it here too would put two
+                        // copies on one disk, so the VM stays paused
+                        // and migrating until an operator decides.
+                        error!(mlog, "the guest was handed over and the \
+                            destination never confirmed; this VM stays \
+                            paused and is NOT released";
+                            "error" => why);
+                    }
+                    Err(e @ SourceOutcome::Failed(_)) => {
+                        error!(mlog, "source migration failed"; "error" => %e);
                         ctrl_arc.state.store(
                             VmRunState::Running as u8,
                             Ordering::Release,
                         );
                     }
                 }
-            } else {
-                // Async path for TCP (GZ or manual testing)
-                let rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        error!(mlog, "tokio runtime failed"; "error" => %e);
-                        ctrl_arc.state.store(
-                            VmRunState::Running as u8,
-                            Ordering::Release,
-                        );
-                        return;
-                    }
-                };
-                rt.block_on(async {
-                    let stream = match tokio::net::TcpStream::connect(
-                        &target_addr,
-                    )
-                    .await
-                    {
-                        Ok(s) => vmm_migrate::MigrateStream::Tcp(s),
-                        Err(e) => {
-                            error!(mlog, "connect failed";
-                                "target" => &target_addr, "error" => %e);
-                            ctrl_arc.state.store(
-                                VmRunState::Running as u8,
-                                Ordering::Release,
-                            );
-                            return;
-                        }
-                    };
-                    match vmm_migrate::source::run_source(
-                        stream,
-                        hdl,
-                        &memctx,
-                        num_cpus,
-                        mem_size,
-                        status,
-                        &mlog,
-                        ctrl_arc.cpu_baseline,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            info!(mlog, "source migration complete");
-                            ctrl_arc.finish_migrated_away(SOURCE_RELEASE_GRACE);
-                        }
-                        Err(e) => {
-                            error!(mlog, "source migration failed";
-                                "error" => %e);
-                            ctrl_arc.state.store(
-                                VmRunState::Running as u8,
-                                Ordering::Release,
-                            );
-                        }
-                    }
-                });
-            }
-        },
-    ) {
+            })
+    {
         ctrl.state
             .store(VmRunState::Running as u8, Ordering::Release);
         return Response::err(&format!(
-            "failed to spawn migration thread: {}",
-            e
+            "failed to spawn migration thread: {e}"
         ));
     }
 
@@ -372,20 +316,82 @@ pub(super) fn migrate_source(
     r
 }
 
+/// The device hooks the source phases drive.
+fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
+    let for_pre_pause = Arc::clone(ctrl);
+    let for_flush = Arc::clone(ctrl);
+    let for_resume = Arc::clone(ctrl);
+    let for_export = Arc::clone(ctrl);
+    let for_hyperv = Arc::clone(ctrl);
+    vmm_migrate::source::SourceHooks {
+        pre_pause: Box::new(move || {
+            for_pre_pause.pause_devices_for_migration()
+        }),
+        flush: Box::new(move || for_flush.flush_devices_for_migration()),
+        resume: Box::new(move || for_resume.resume_devices_after_migration()),
+        export: Box::new(move || for_export.export_device_state()),
+        hyperv: Box::new(move || for_hyperv.export_hyperv()),
+    }
+}
+
+/// How a source migration ended, when it did not succeed.
+enum SourceOutcome {
+    /// The guest never left. The VM can run again here.
+    Failed(String),
+    /// The guest was handed over and the far side never confirmed. The
+    /// VM must not run again here.
+    Committed(String),
+}
+
+impl From<vmm_migrate::codec::MigrateError> for SourceOutcome {
+    fn from(error: vmm_migrate::codec::MigrateError) -> Self {
+        match error {
+            vmm_migrate::codec::MigrateError::Committed(why) => {
+                Self::Committed(why)
+            }
+            other => Self::Failed(other.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for SourceOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(why) | Self::Committed(why) => f.write_str(why),
+        }
+    }
+}
+
+fn run_source<S: vmm_migrate::wire::Transport>(
+    stream: S,
+    hdl: Arc<vmm_core::hdl::VmmHdl>,
+    memctx: &MemCtx,
+    config: vmm_migrate::source::SourceConfig,
+    hooks: vmm_migrate::source::SourceHooks,
+    status: Arc<Mutex<vmm_migrate::MigrationStatus>>,
+    log: &slog::Logger,
+) -> Result<(), SourceOutcome> {
+    vmm_migrate::source::run_source(
+        stream, hdl, memctx, config, hooks, status, log,
+    )
+    .map_err(SourceOutcome::from)
+}
+
 pub(super) fn migrate_dest(
     ctrl: &Arc<VmController>,
     listen_addr: String,
+    allow_cpu_feature_mismatch: bool,
 ) -> Response {
-    // Validate the listen address to prevent arbitrary port binding.
     if let Err(e) = validate_migration_addr(&listen_addr) {
         return Response::err(&format!("invalid listen_addr: {e}"));
     }
 
+    // Only a paused VM may take an import: the import writes every
+    // vCPU's registers and every device's rings, and a running guest
+    // would execute against half of them.
     let prev_state = ctrl.state();
-    if prev_state != VmRunState::Paused && prev_state != VmRunState::Running {
-        return Response::err(
-            "VM must be running or paused to receive migration",
-        );
+    if prev_state != VmRunState::Paused {
+        return Response::err("VM must be paused to receive migration");
     }
     ctrl.state
         .store(VmRunState::Migrating as u8, Ordering::Release);
@@ -398,103 +404,89 @@ pub(super) fn migrate_dest(
     let ctrl_arc = Arc::clone(ctrl);
     let hdl = Arc::clone(&ctrl.hdl);
     let memctx = MemCtx::new(Arc::clone(&ctrl.physmap));
-    let num_cpus = ctrl.num_cpus;
-    let mem_size = ctrl.mem_size as u64;
     let mlog = ctrl.log.clone();
+    let config = vmm_migrate::destination::DestConfig {
+        num_cpus: ctrl.num_cpus,
+        mem_size: ctrl.mem_size as u64,
+        cpu_baseline: ctrl.cpu_baseline,
+        devices: ctrl.migrate_identities(),
+        deadlines: vmm_migrate::wire::Deadlines::default(),
+        allow_cpu_feature_mismatch,
+    };
 
-    if let Err(e) = thread::Builder::new()
-        .name("migrate-dest".into())
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    error!(mlog, "failed to create tokio runtime"; "error" => %e);
-                    ctrl_arc.state.store(
-                        VmRunState::Stopped as u8,
-                        Ordering::Release,
-                    );
-                    return;
-                }
-            };
-
-            rt.block_on(async {
-                let listener = match tokio::net::TcpListener::bind(
-                    &listen_addr,
-                )
-                .await
-                {
-                    Ok(l) => l,
-                    Err(e) => {
-                        error!(mlog, "bind failed";
-                            "addr" => &listen_addr,
-                            "error" => %e,
-                        );
-                        ctrl_arc.state.store(
-                            VmRunState::Stopped as u8,
-                            Ordering::Release,
-                        );
-                        return;
-                    }
-                };
-
-                let (stream, peer) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!(mlog, "accept failed"; "error" => %e);
-                        ctrl_arc.state.store(
-                            VmRunState::Stopped as u8,
-                            Ordering::Release,
-                        );
-                        return;
-                    }
-                };
-
-                info!(mlog, "accepted migration connection"; "peer" => %peer);
-
-                match vmm_migrate::destination::run_destination(
-                    stream,
-                    hdl,
-                    &memctx,
-                    num_cpus,
-                    mem_size,
-                    status,
-                    &mlog,
-                )
-                .await
-                {
+    if let Err(e) =
+        thread::Builder::new()
+            .name("migrate-dest".into())
+            .spawn(move || {
+                let hooks = dest_hooks(&ctrl_arc);
+                let outcome =
+                    accept_one(&listen_addr, &mlog).and_then(|stream| {
+                        vmm_migrate::destination::run_destination(
+                            stream, hdl, &memctx, config, hooks, status, &mlog,
+                        )
+                        .map_err(|e| e.to_string())
+                    });
+                match outcome {
                     Ok(()) => {
-                        info!(mlog, "destination migration complete, VM running");
+                        info!(
+                            mlog,
+                            "destination migration complete, VM running"
+                        );
                         ctrl_arc.state.store(
                             VmRunState::Running as u8,
                             Ordering::Release,
                         );
                     }
                     Err(e) => {
-                        error!(mlog, "destination migration failed"; "error" => %e);
-                        ctrl_arc.state.store(
-                            VmRunState::Stopped as u8,
-                            Ordering::Release,
-                        );
+                        // The guest never left this VM's previous state, so
+                        // marking it Stopped would strand a live VM no
+                        // control command can reach.
+                        error!(mlog, "destination migration failed";
+                        "error" => %e);
+                        ctrl_arc
+                            .state
+                            .store(prev_state as u8, Ordering::Release);
                     }
                 }
-            });
-        })
+            })
     {
-        ctrl.state.store(
-            prev_state as u8,
-            Ordering::Release,
-        );
-        return Response::err(
-            &format!("failed to spawn migration thread: {}", e),
-        );
+        ctrl.state.store(prev_state as u8, Ordering::Release);
+        return Response::err(&format!(
+            "failed to spawn migration thread: {e}"
+        ));
     }
 
     let mut r = Response::ok();
     r.state = Some(VmRunState::Migrating);
     r
+}
+
+/// The device hooks the destination import drives.
+fn dest_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::destination::DestHooks {
+    let for_restore = Arc::clone(ctrl);
+    let for_resume = Arc::clone(ctrl);
+    let for_hyperv = Arc::clone(ctrl);
+    vmm_migrate::destination::DestHooks {
+        restore: Box::new(move |bdf, state| {
+            for_restore.restore_device_state(bdf, state)
+        }),
+        resume: Box::new(move || for_resume.resume_devices()),
+        hyperv: Box::new(move |state| for_hyperv.restore_hyperv(state)),
+    }
+}
+
+/// Bind, take one connection, and give the listener back.
+fn accept_one(
+    listen_addr: &str,
+    log: &slog::Logger,
+) -> Result<TcpStream, String> {
+    let listener = TcpListener::bind(listen_addr)
+        .map_err(|e| format!("bind {listen_addr}: {e}"))?;
+    info!(log, "waiting for migration"; "addr" => listen_addr);
+    let (stream, peer) =
+        listener.accept().map_err(|e| format!("accept: {e}"))?;
+    info!(log, "accepted migration connection"; "peer" => %peer);
+    Ok(stream)
 }
 
 pub(super) fn migrate_status(ctrl: &Arc<VmController>) -> Response {
@@ -655,14 +647,72 @@ mod tests {
 
     #[test]
     fn a_hot_added_device_cannot_be_a_migration_source() {
-        // Queue state is matched by position, so the destination would
-        // give the guest another device's rings.
+        // The destination is built from the boot device list, so it has
+        // nowhere to put a device the guest gained since.
         let reason =
             device_set_changed(&["5,virtio-blk,/added.img".to_string()])
                 .expect("an added device must block migration");
         assert!(reason.contains("hot-added 1 device(s)"), "{reason}");
         assert!(reason.contains("5,virtio-blk,/added.img"), "{reason}");
-        assert!(reason.contains("by position"), "{reason}");
+        assert!(reason.contains("boot device list"), "{reason}");
+    }
+
+    fn ident(dev: u8, kind: &str) -> vmm_migrate::codec::DeviceIdentity {
+        vmm_migrate::codec::DeviceIdentity {
+            bdf: vmm_devices::lifecycle::WireBdf {
+                bus: 0,
+                dev,
+                func: 0,
+            },
+            kind: kind.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_vm_with_only_migratable_devices_can_be_a_source() {
+        assert_eq!(unmigratable_devices(&[]), None);
+        assert_eq!(
+            unmigratable_devices(&[ident(4, "nvme"), ident(5, "virtio-blk")]),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_device_whose_state_is_not_carried_blocks_migration() {
+        // The guest driver would find the device at reset on the far
+        // side, with no error anywhere.
+        for kind in ["xhci", "ahci-cd", "virtio-fs", "virtio-vsock"] {
+            let reason = unmigratable_devices(&[ident(6, kind)])
+                .unwrap_or_else(|| panic!("{kind} must block migration"));
+            assert!(reason.contains(kind), "{reason}");
+            assert!(reason.contains("6.0"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn every_blocking_device_is_named_in_the_refusal() {
+        // An operator has to see all of them before they can retry.
+        let reason =
+            unmigratable_devices(&[ident(6, "xhci"), ident(7, "virtio-fs")])
+                .expect("two blocking devices");
+        assert!(reason.contains("xhci@0.6.0"), "{reason}");
+        assert!(reason.contains("virtio-fs@0.7.0"), "{reason}");
+    }
+
+    #[test]
+    fn a_unix_target_skips_the_tcp_address_check() {
+        // The GZ agent's socket path is not a host:port.
+        assert!(matches!(
+            MigrateTarget::parse("/tmp/vmm-migrate-data.sock"),
+            Ok(MigrateTarget::Unix(_)),
+        ));
+        assert!(matches!(
+            MigrateTarget::parse("192.0.2.10:4567"),
+            Ok(MigrateTarget::Tcp(_)),
+        ));
+        MigrateTarget::parse("127.0.0.1:4567")
+            .err()
+            .expect("loopback is refused");
     }
 
     #[test]

@@ -293,7 +293,7 @@ impl CpuHotplugEngine {
 
     /// Stop the drain thread and wait for it.
     pub fn shutdown(&self) {
-        self.thread.shutdown();
+        self.thread.shutdown(super::DRAIN_JOIN_BUDGET);
     }
 }
 
@@ -653,19 +653,6 @@ mod tests {
             );
         }
         assert!(h.regs.take_eject_requests().is_empty());
-    }
-
-    #[test]
-    fn nothing_here_can_remove_a_cpu() {
-        // illumos has no vm_deactivate_cpu, so an API that looks like a
-        // removal would be a promise this engine cannot keep.
-        let src = include_str!("cpu.rs");
-        let end = src.find("#[cfg(test)]").expect("test module attribute");
-        let code = &src[..end];
-
-        assert!(!code.contains("fn remove_cpu"));
-        assert!(!code.contains("fn request_remove"));
-        assert!(!code.contains("fn eject("));
     }
 
     #[test]

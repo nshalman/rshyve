@@ -12,11 +12,17 @@ commit that closed them.
 **Boundary:** migration peer to VMM. **Severity:** high in any
 deployment where the migration path is not already a trusted channel.
 
-The source connects to `ws://migration/live` in the clear
-(`crates/vmm-migrate/src/source.rs`), the destination accepts a raw
-WebSocket (`crates/vmm-migrate/src/destination.rs`), and the sync paths
-accept TCP or Unix streams with no protocol-level peer identity.
-`vmm-migrate-agent` binds `0.0.0.0` and accepts the first connection.
+`crates/vmm-migrate/src/source.rs` connects and
+`crates/vmm-migrate/src/destination.rs` accepts a raw WebSocket over a
+TCP or Unix stream with no protocol-level peer identity.
+A destination told to listen binds the address it is given and accepts
+the first connection.
+
+Every field the peer sends is now validated before it is applied, and a
+payload the destination cannot hold fails the migration rather than
+half-programming a device, so a malformed blob is a refused migration
+and not a corrupt guest. That bounds the damage; it is not
+authentication.
 
 Guest RAM, CPU state, and device state therefore have no
 confidentiality and no peer authentication unless an external control
@@ -31,37 +37,6 @@ TCP at all.
 
 **Mitigation today:** migrate only across a trusted network, over a
 tunnel established and authenticated by other means.
-
-### OSF-1b — vmm-migrate-agent builds privileged shell commands by interpolation
-
-**Boundary:** operator input to root in the global zone. **Severity:**
-high where the agent's arguments are not fully trusted.
-
-`bin/vmm-migrate-agent/src/main.rs` interpolates `--uuid`,
-`--dest-host`, `--disk-dataset`, `--dest-dataset`, and `--ssh-key` into
-command strings and runs them through `bash -c` in `sh()`. The agent is
-documented as running in the global zone, and the commands it builds are
-`zfs`, `ssh root@`, and `vmadm`, so a metacharacter in any of those
-values executes as root. Values beginning with `-` are also treated as
-options by the invoked programs, and the remote word is re-parsed by the
-destination's login shell.
-
-The agent additionally passes `-o StrictHostKeyChecking=no`, so the
-`zfs send` stream carrying guest disk contents is MITM-able.
-
-Separately, `sh()` runs pipelines without `pipefail` and checks a single
-exit status, so a truncated `zfs send` is invisible whenever the remote
-`zfs recv` exits 0. The agent then migrates RAM onto a short disk.
-
-**To close:** replace `sh()` with `std::process::Command` argument
-arrays, introduce validated newtypes for UUID, dataset, host, and key
-path so clap rejects bad input at parse time, quote the remote word
-explicitly, wait on both ends of every pipeline, restore host key
-verification, and replace the `echo | socat` control trigger with a
-direct Unix-socket client.
-
-**Mitigation today:** treat the agent's arguments as trusted input and
-invoke it only from automation that constructs them.
 
 ### OSF-2 — Migration does not transfer FPU/XSAVE state
 
@@ -81,25 +56,6 @@ and validate across a real cross-host migration with a continuous AVX
 workload. A malformed XSAVE blob can set reserved `XCOMP_BV` bits and
 fault the guest at its first `XRSTOR`, so this is worse to get wrong
 than to leave unimplemented.
-
-### OSF-3 — CPU feature mismatch is warned about, not rejected
-
-**Boundary:** correctness, guest-visible. **Severity:** medium.
-
-Both destinations log a CPU feature mismatch and continue. The two
-implementations also compare differently: the sync path, which is the
-one production uses, checks only CPUID leaf 7 and has no ignore masks
-for SGX/MPX, while the async path checks leaf 1, leaf 7, and xcr0.
-
-The comparison itself is also wrong in a way that produces false
-negatives: the source sends baseline-masked guest features while the
-destination compares against raw host features, so a migration from
-`--cpu-baseline host` to a narrower baseline reports a passing check and
-then hands a running guest a feature table with bits cleared.
-
-**To close:** one shared comparison over the full effective guest CPUID
-contract, then a policy decision on reject-by-default with an explicit,
-auditable override.
 
 ### OSF-4 — Vendored libtpms predates two CVE fixes
 
@@ -126,23 +82,30 @@ is the root of a BitLocker guest's disk encryption.
 
 **Boundary:** guest to host. **Severity:** unknown, potentially high.
 
-`crates/vmm-devices/src/passthru.rs` exposes physical device
-configuration space indexed by guest-controlled offsets, and contains
-the largest concentration of `unsafe` in the tree. It has not been
-systematically reviewed.
+`crates/vmm-passthru` exposes physical device configuration space
+indexed by guest-controlled offsets, and holds the largest
+concentration of `unsafe` in the tree.
 
-**To close:** a dedicated audit of the guest-offset arithmetic and the
-BAR mapping paths, plus a decision on whether to gate the device behind
-a non-default cargo feature for the initial release.
+Part of it has been read since this entry was written. Config-space
+writes are denied unless the device model handles them, an MSI-X device
+is refused outright because illumos VT-d does not remap interrupts, and
+the MSI capability is emulated (`fix(passthru): deny unhandled config
+writes and refuse MSI-X devices`). The BAR mapping and unmapping paths
+and the guest-offset arithmetic behind them have not had the same
+treatment.
+
+**To close:** audit the BAR mapping paths, and decide whether the
+device ships behind a non-default cargo feature for the initial
+release. OSF-11 covers the part no reading can settle.
 
 ### OSF-6 — Operational errors are discarded on non-migration paths
 
 **Boundary:** operational correctness. **Severity:** low to medium.
 
-Roughly 120 `let _ = ...` statements remain outside the migration page
-paths, some on device state and interrupt delivery. Each needs to be
-classified as either genuinely idempotent best-effort cleanup or a real
-error that should propagate.
+Around 75 `let _ = ...` statements remain outside the migration page
+paths and outside test modules, some on device state and interrupt
+delivery. Each needs to be classified as either genuinely idempotent
+best-effort cleanup or a real error that should propagate.
 
 **To close:** classify every site, propagate or deliberately log the
 rest, and add fault-injection tests for guest-memory, interrupt, queue,
@@ -165,10 +128,90 @@ accept.
 **To close:** a modern authenticated, encrypted console boundary for any
 remote use, and a documented tunnel requirement until then.
 
+### OSF-9, No audit covers every guest-driven log site
+
+**Boundary:** guest to host. **Severity:** low (host disk and log
+pipeline, and evidence destruction).
+
+A device path that writes one log record per guest action lets a guest
+write to the host log as fast as it can execute. The logger's async
+drain is a 128-entry channel with `DropAndReport`, so a flood also
+evicts the records that would explain an unrelated failure.
+
+The seam that answers this exists. `crates/vmm-core/src/ratelimit.rs`
+is a token bucket, one instance per log site so one noisy source cannot
+spend another's budget, and pvpanic, the COM2 serial writer, the mdata
+agent and the Hyper-V crash MSRs use it. The two viona paths latch
+instead: a refused ring kick logs once per run of refusals, and a
+refused ring init quarantines the ring until reset. Several crates
+carry a `CountingDrain` test asserting that N guest actions produce a
+bounded number of records.
+
+What is open is coverage. The `warn!` and `info!` sites reachable from
+a guest action have not been enumerated, and nothing obliges a new
+device to use the bucket, so the next one can reintroduce the defect.
+
+**To close:** enumerate the guest-reachable log sites, put each behind
+the bucket or a latch, and give each a `CountingDrain` test.
+
+### OSF-10, virtio-fs runs in the VMM process, not a sandbox
+
+**Boundary:** guest to host filesystem. **Severity:** medium.
+
+`crates/vmm-virtio/src/fs/passthrough.rs` serves FUSE requests from the
+VMM process itself. The isolation is the shared root fd, `*at()` calls
+with `O_NOFOLLOW`, name validation at LOOKUP, and refusal of device,
+FIFO and socket nodes. The two tables it keeps are capped, so a guest
+cannot pin host descriptors or host memory without bound:
+`crates/vmm-virtio/src/fs/passthrough/tables.rs` bounds cached inodes,
+open file and directory handles, and the bytes of directory snapshots,
+and a guest past a cap sees ENFILE or EMFILE the way it would on a full
+system (`Cap the host fds and memory one guest pins in virtio-fs`).
+
+Those caps are a mitigation, not the boundary. virtiofsd runs the same
+work in a separate process under a namespace or `pivot_root`, so a defect
+in path handling costs an attacker a sandbox rather than the VMM's whole
+address space and every fd in it. illumos has no seccomp and no mount
+namespaces, so the equivalent needs its own design.
+
+**To close:** decide whether virtio-fs ships in the VMM process at all.
+If it does, the argument for it needs writing down, together with a
+negative test set for every path-handling rule the module claims. If it
+does not, a helper process with a reduced privilege set and its own
+`root_fd`, talking to the device over a socket.
+
+**Mitigation today:** export only directories whose contents the guest
+may read, and never a read-write share of anything the host trusts.
+
+### OSF-11, The PCI passthrough audit has not run on real hardware
+
+**Boundary:** guest to host. **Severity:** unknown.
+
+OSF-5 records how far reading the source has got. What no reading can
+supply is a device: every conclusion about passthrough in this tree has
+been reached from the code and the PPT ioctl contract, never by
+assigning a physical function to a guest.
+
+Specifically unproven: that the config-space windows the guest sees match
+what reading the code concluded, that BAR mapping and unmapping survive a guest
+reset with DMA in flight, that the MSI-X refusal covers every device that
+advertises it, and that illumos VT-d remapping behaves as the module
+header assumes. There is no AMD IOMMU backend at all.
+
+**To close:** run a real assigned device: a NIC and a storage controller,
+each through guest boot, reset, reboot and VM destroy, with DMA active,
+on an Intel VT-d host. Record what was assigned and what was observed in
+`docs/hardware-run.md`. Until then treat `passthru` as experimental
+whatever reading the source says.
+
+**Mitigation today:** do not offer `-s N,passthru` to an untrusted guest.
+
 ## Resolved
 
 | Finding | Closed by |
 |---|---|
+| OSF-3, CPU feature mismatch was warned about, not rejected, and the two implementations compared different leaves against unmasked host features | `Migrate device state by PCI identity over one driver` |
+| OSF-8, Hyper-V enlightenment state was not migrated; `TIME_REF_COUNT` restarted from a process-local clock and ran backwards for the guest | `Migrate the Hyper-V enlightenment` |
 | PS/2 controller RAM out-of-bounds index reachable from guest port I/O | `fix(ps2): guest-reachable out-of-bounds index in controller RAM` |
 | Virtio indirect descriptor table unbounded against queue size | `fix(virtio): bound indirect descriptor tables to the queue size` |
 | Migration `PageBatch` slice index abort and discarded guest-memory errors | `fix(migrate): validate and bound peer-controlled page transfers` |

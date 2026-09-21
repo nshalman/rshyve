@@ -46,7 +46,8 @@ use std::sync::{Arc, Mutex};
 use slog::{debug, error, info, Logger};
 
 use vmm_core::hdl::VmmHdl;
-use vmm_core::mem::{PhysMap, SegidAlloc, MMIO_HOLE_END};
+use vmm_core::mem::{PhysMap, SegidAlloc, MMIO_HOLE_BASE, MMIO_HOLE_END};
+use vmm_devices::hotplug::mem::MAX_SLOTS as MEM_SLOTS;
 use vmm_devices::hotplug::mem::{
     MemHotplug, MemHotplugError as SlotError, MAX_SLOTS,
 };
@@ -468,11 +469,9 @@ impl MemHotplugEngine {
         self.drain.refuse_ejects();
     }
 
-    /// Stop the drain thread and wait for it, then answer a request
-    /// that arrived last.
+    /// Stop the drain thread and wait for it.
     pub fn shutdown(&self) {
-        self.thread.shutdown();
-        self.refuse_ejects();
+        self.thread.shutdown(super::DRAIN_JOIN_BUDGET);
     }
 }
 
@@ -489,3 +488,124 @@ fn slot_error(e: SlotError) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// The guest address window that hot-added memory goes in.
+///
+/// It starts above every RAM region the VM booted with. The machine
+/// builder maps `[0, min(mem, MMIO_HOLE_BASE))` and, for a bigger
+/// guest, `[MMIO_HOLE_END, MMIO_HOLE_END + mem - MMIO_HOLE_BASE)`, so
+/// the first free address is the top of that second range. The window
+/// is therefore always above 4 GiB and can never land in the 32-bit
+/// MMIO hole.
+///
+/// `slot_size` has to divide `max_mem`, and the quotient has to fit the
+/// [`MEM_SLOTS`] slots the register file and the AML describe. Both are
+/// refused here rather than silently clamped, because a window that
+/// claims more slots than the guest has would report free memory no add
+/// can reach.
+///
+/// The base is computed from `mem_size` because this runs before the VM
+/// exists. If that layout ever changed, the first add would be REFUSED
+/// and not misplaced: `PhysMap::claim_ram` checks the range against
+/// every published region before any ioctl runs.
+///
+/// The kernel puts a second, lower ceiling on this: one VM gets five
+/// memory segments (`vmm.c:179`) and boot spends some of them, so the
+/// real number of adds can be below the slot count. The engine reports
+/// that as it happens, because what boot spent depends on the devices.
+pub fn hot_add_window(
+    mem_size: usize,
+    max_mem: u64,
+    slot_size: u64,
+) -> Result<MemWindow, MemHotplugError> {
+    let bad = |reason: String| Err(MemHotplugError::BadWindow(reason));
+
+    if slot_size == 0 {
+        return bad("a slot size of 0 describes no memory".to_string());
+    }
+    let Ok(mem_size) = u64::try_from(mem_size) else {
+        return bad(format!("{mem_size} bytes of RAM does not fit a u64"));
+    };
+    let highmem = mem_size.saturating_sub(MMIO_HOLE_BASE);
+    let Some(base) = MMIO_HOLE_END.checked_add(highmem) else {
+        return bad(format!("{mem_size} bytes of RAM leaves no window"));
+    };
+    if !max_mem.is_multiple_of(slot_size) {
+        return bad(format!(
+            "a window of {max_mem:#x} does not divide into {slot_size:#x} slots",
+        ));
+    }
+    let slots = max_mem / slot_size;
+    if slots > MEM_SLOTS as u64 {
+        return bad(format!(
+            "a {max_mem:#x} window of {slot_size:#x} slots needs {slots} \
+             slots, and the guest has {MEM_SLOTS}; raise the slot size",
+        ));
+    }
+
+    MemWindow::new(base, max_mem, slot_size)
+}
+
+/// The hot-add window, which `hotplug/mem/tests.rs` does not cover
+/// because it is arithmetic and needs no engine.
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const SLOT: u64 = 128 * 1024 * 1024;
+
+    #[test]
+    fn the_window_starts_above_every_ram_region_the_vm_booted_with() {
+        // A window that overlapped high RAM would map a second segment
+        // over memory the guest is already using.
+        let small = hot_add_window(1024 * 1024 * 1024, GIB, SLOT)
+            .expect("1 GiB of RAM is all low memory");
+        assert_eq!(small.base(), MMIO_HOLE_END);
+
+        // 4 GiB of RAM is 3 GiB low and 1 GiB high, so high RAM ends at
+        // 5 GiB and the window starts there.
+        let big = hot_add_window(4 * 1024 * 1024 * 1024, GIB, SLOT)
+            .expect("4 GiB of RAM has a high half");
+        assert_eq!(big.base(), MMIO_HOLE_END + GIB);
+    }
+
+    #[test]
+    fn the_window_never_reaches_the_mmio_hole() {
+        for gib in [1u64, 3, 4, 8, 64] {
+            let window = hot_add_window((gib * GIB) as usize, GIB, SLOT)
+                .unwrap_or_else(|e| panic!("{gib} GiB: {e}"));
+            assert!(
+                window.base() >= MMIO_HOLE_END,
+                "{gib} GiB put the window at {:#x}",
+                window.base(),
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_the_guest_has_no_slots_for_is_refused() {
+        // 8 GiB of 128 MiB slots wants 64 slots and the AML declares 8.
+        // Clamping instead would report free memory no add can reach.
+        let refused =
+            hot_add_window(GIB as usize, 8 * GIB, SLOT).expect_err("64 slots");
+        assert!(
+            refused.to_string().contains("raise the slot size"),
+            "{refused}",
+        );
+
+        // The same window in slots the guest has.
+        let window = hot_add_window(GIB as usize, 8 * GIB, GIB)
+            .expect("8 slots of 1 GiB");
+        assert_eq!(window.slots(), 8);
+    }
+
+    #[test]
+    fn a_window_the_slot_size_does_not_divide_is_refused() {
+        let refused = hot_add_window(GIB as usize, GIB + 1, SLOT)
+            .expect_err("not a whole number of slots");
+        assert!(refused.to_string().contains("does not divide"), "{refused}");
+
+        assert!(hot_add_window(GIB as usize, GIB, 0).is_err());
+    }
+}

@@ -25,6 +25,11 @@ use vmm_virtio::vsock::control::{ControlSink, ControlSlot};
 /// `ttyS0`, which is why COM1 is always attached.
 use vmm_config::DEFAULT_CMDLINE;
 
+/// How long the exit path waits for the console writer thread. Bounded
+/// so a consumer that stopped reading cannot hold the VMM open.
+const CONSOLE_FLUSH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 fn version_string() -> String {
     let version = env!("CARGO_PKG_VERSION");
     let commit = env!("FIREHYVE_GIT_COMMIT");
@@ -46,10 +51,6 @@ fn validate_cli(cli: &Cli, log: &slog::Logger) -> anyhow::Result<()> {
     anyhow::ensure!(
         cli.control_socket.is_none(),
         "firehyve does not support --control-socket"
-    );
-    anyhow::ensure!(
-        cli.json_config.is_none(),
-        "firehyve does not support --json-config"
     );
     anyhow::ensure!(
         !cli.vtpm && cli.vtpm_state_dir.is_none(),
@@ -320,7 +321,10 @@ fn run(
         build.api_version,
         None,
         log,
-    );
+    )
+    .map_err(|e| {
+        anyhow::anyhow!("failed to start the boot vCPU threads: {e}")
+    })?;
     let cpu_hotplug = vmm_machine::start_cpu_hotplug(
         timer_pm.hotplug.as_ref(),
         VcpuSetup {
@@ -385,7 +389,13 @@ fn main() -> ExitCode {
     let cli = Cli::parse_named("firehyve");
     let log = vmm_machine::entry::setup_logger("firehyve");
 
-    match run(cli, &log) {
+    let outcome = run(cli, &log);
+    // The guest's last COM2 bytes carry fhrun's payload status, and a
+    // writer thread holds them. Exiting here would drop them.
+    if !vmm_devices::uart::backend::flush_stdout(CONSOLE_FLUSH_TIMEOUT) {
+        warn!(log, "console output was still draining at exit");
+    }
+    match outcome {
         Ok(outcome) => vmm_machine::entry::exit_code(outcome, &log),
         Err(e) => {
             error!(log, "fatal error"; "error" => format!("{e:#}"));
@@ -397,34 +407,33 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::FromArgMatches;
+    use clap::{FromArgMatches, Parser};
 
-    /// The zone brand reads the exit code, and the kernel rule is not
-    /// symmetric: `boot.c` sets ZONE_ATTR_INITRESTART0 on every bhyve
-    /// zone, the brand declares no <initreboot>, and
-    /// uts/common/os/exit.c restarts init only on `CLD_EXITED && what
-    /// == 0`. So exit 0 means "start the guest again" and anything else
-    /// means "halt the zone". A guest that powers itself off must not
-    /// take the first branch.
-    ///
-    /// The values are C bhyve's, from usr/src/cmd/bhyve/amd64/vmexit.c:
-    /// RESET 0, POWEROFF 1, HALT 2, TRIPLEFAULT 3.
+    /// The zone brand reads the exit code: `boot.c` sets
+    /// ZONE_ATTR_INITRESTART0 on every bhyve zone, so exit 0 restarts
+    /// the guest and anything else halts the zone. The mapping lives in
+    /// `vmm_machine::entry`, where its own tests pin every value; this
+    /// checks the function this binary calls, not a copy of it.
     #[test]
-    fn the_exit_codes_match_the_ones_the_zone_brand_reads() {
+    fn a_powered_off_guest_does_not_exit_zero() {
         use vmm_machine::RunOutcome;
-        let code = |o: RunOutcome| match o {
-            RunOutcome::Reboot => 0u8,
-            RunOutcome::PowerOff => 1,
-            RunOutcome::Halt => 2,
-            RunOutcome::TripleFault(_) => 3,
-            RunOutcome::GuestFault => 4,
-        };
-        assert_eq!(code(RunOutcome::Reboot), 0, "only a reboot may exit 0");
-        assert_eq!(code(RunOutcome::PowerOff), 1);
-        assert_eq!(code(RunOutcome::Halt), 2);
-        assert_eq!(code(RunOutcome::TripleFault(0)), 3);
-        // Sharing 2 with HALT would report a guest fault as a clean halt.
-        assert_ne!(code(RunOutcome::GuestFault), code(RunOutcome::Halt));
+        let log = quiet();
+        assert_eq!(
+            vmm_machine::entry::exit_code(RunOutcome::Reboot, &log),
+            ExitCode::SUCCESS
+        );
+        for outcome in [
+            RunOutcome::PowerOff,
+            RunOutcome::Halt,
+            RunOutcome::TripleFault(0),
+            RunOutcome::GuestFault,
+        ] {
+            assert_ne!(
+                vmm_machine::entry::exit_code(outcome, &log),
+                ExitCode::SUCCESS,
+                "{outcome:?} would restart the zone"
+            );
+        }
     }
 
     fn cli_from(args: &[&str]) -> Cli {
@@ -440,24 +449,42 @@ mod tests {
         slog::Logger::root(slog::Discard, slog::o!())
     }
 
+    /// The MADT slot count, the CPU register file and the hot-add engine
+    /// have to describe one machine. Each reads `VmOpts`, so a ceiling
+    /// that reached one of them and not the others would let the guest
+    /// see a register file describing a machine the tables do not.
     #[test]
-    fn one_cpu_ceiling_feeds_the_tables_the_registers_and_the_engine() {
-        // The MADT slot count, the CPU register file and the hot-add
-        // engine have to describe one machine. All three read
-        // VmOpts::max_cpus: the tables through setup_fwcfg_and_acpi, the
-        // register file through HotplugOpts::from_vm, and the engine
-        // through the VcpuSetup below. A hand-built HotplugOpts here
-        // would let the register file describe a different machine, so
-        // the phase sequence must not contain one.
-        let src = include_str!("main.rs");
-        let end = src.find("#[cfg(test)]").expect("test module attribute");
-        let code = &src[..end];
+    fn one_cpu_ceiling_feeds_the_registers_and_the_engine() {
+        let cli = Cli::try_parse_from([
+            "firehyve",
+            "-c",
+            "cpus=2,maxcpus=8",
+            "--hotplug",
+            "-m",
+            "512M",
+            "vm",
+        ])
+        .expect("a hotplug command line");
+        let opts = vmm_machine::VmOpts::from_cli(&cli).expect("vm options");
 
-        assert!(!code.contains("HotplugOpts {"), "a hand-built HotplugOpts");
-        // One read, so every other use of the ceiling in this file
-        // flows from the one local it is read into.
-        assert_eq!(code.matches("VmOpts::from_cli(").count(), 1);
-        assert_eq!(code.matches("cli.max_cpus()").count(), 0);
+        assert_eq!(opts.num_cpus, 2);
+        assert_eq!(opts.max_cpus, 8);
+
+        // The register file the guest reads.
+        let hotplug = vmm_machine::pm::HotplugOpts::from_vm(&opts);
+        assert_eq!(hotplug.max_cpus, opts.max_cpus);
+        assert_eq!(hotplug.num_cpus, opts.num_cpus);
+        assert!(hotplug.enabled);
+
+        // The engine that brings a vCPU online.
+        let setup = VcpuSetup {
+            max_cpus: opts.max_cpus,
+            boot_cpus: opts.num_cpus,
+            vmexit_on_hlt: cli.vmexit_on_hlt,
+            cpuid: None,
+        };
+        assert_eq!(setup.max_cpus, hotplug.max_cpus);
+        assert_eq!(setup.boot_cpus, hotplug.num_cpus);
     }
 
     #[test]
@@ -666,12 +693,11 @@ mod tests {
     #[test]
     fn the_refusals_that_protect_guest_behaviour_are_kept() {
         let base = ["firehyve", "--kernel", "/tmp/vmlinux"];
-        let cases: [(&str, &[&str]); 5] = [
+        let cases: [(&str, &[&str]); 4] = [
             ("--vtpm", &["--vtpm"]),
             ("--hyperv", &["--hyperv"]),
             ("--mdata-", &["--mdata-ssh-keys", "ssh-rsa AAAA"]),
             ("--control-socket", &["--control-socket", "/tmp/c.sock"]),
-            ("--json-config", &["--json-config", "/tmp/c.json"]),
         ];
         for (want, extra) in cases {
             let mut argv = base.to_vec();

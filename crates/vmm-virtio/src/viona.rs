@@ -62,6 +62,13 @@ pub const NET_QUEUE_SIZE: u16 = 256;
 /// Ethernet address length.
 const ETHERADDRL: usize = 6;
 
+/// How many times a ring reset is tried before its error is believed.
+///
+/// Only an interrupted reset is retried, and the kernel takes the
+/// signal at most once per delivery, so this bound is about ruling out
+/// a pathological signal storm, not about waiting the kernel out.
+const RESET_ATTEMPTS: usize = 8;
+
 // VirtIO net feature bits (from VirtIO 1.2 sec 5.1.3).
 const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
@@ -80,6 +87,34 @@ enum RingState {
     Init,
     /// `ring_init` succeeded; addresses are programmed in-kernel.
     Ready,
+    /// The kernel would not run this ring.
+    ///
+    /// No ioctl is issued for it until a device reset, which is the one
+    /// path back. The kernel runs a ring only after userspace programs
+    /// it, so a refusal never heals on its own, and the guest drives
+    /// both kicks and ring programming: one ioctl and one log line per
+    /// refusal is a host log flood at a rate the guest picks.
+    ///
+    /// A ring the kernel would not *retire* never reaches this state.
+    /// The kernel still holds its pages, so the link is destroyed
+    /// instead.
+    Error,
+}
+
+/// What a migration export left a kernel ring in.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum PausedRing {
+    /// No export stopped this ring, or a rollback put it back already.
+    #[default]
+    Running,
+    /// Stopped, with the state a rollback programs back into it.
+    Saved(viona_api::vioc_ring_state),
+    /// Stopped, with no state to program back.
+    ///
+    /// Only a reset plus a state write restarts a paused ring, so this
+    /// ring stays stopped. A rollback reports it rather than skipping
+    /// it and leaving the guest a NIC that never moves again.
+    Lost,
 }
 
 /// VirtIO network device backed by the illumos viona kernel driver.
@@ -124,6 +159,18 @@ struct VionaInner {
 
     /// Per-ring initialization state (RX=0, TX=1).
     ring_state: [RingState; NET_NUM_QUEUES],
+
+    /// The last kick this ring sent was refused.
+    ///
+    /// Holds the warning down to one line per run of refusals, which
+    /// the guest cannot lengthen by kicking faster.
+    kick_refused: [bool; NET_NUM_QUEUES],
+    /// Each ring's kernel state as it was when a migration paused it.
+    ///
+    /// A migration that fails after the pause has to put the rings
+    /// back, and a kick cannot do it: the kernel answers EBUSY for a
+    /// stopped ring. Only these saved addresses and indices can.
+    paused_rings: [PausedRing; NET_NUM_QUEUES],
 
     /// Deferred interrupt poll state for migration destinations.
     /// Holds the logger so the poll thread can be started after ring
@@ -183,7 +230,7 @@ impl VirtioViona {
     /// `ring_init`. Silently ignores kicks to unconfigured or
     /// out-of-range queues to prevent kernel NULL pointer dereferences
     /// in the mac layer.
-    fn ring_kick(inner: &VionaInner, queue_idx: u16) {
+    fn ring_kick(inner: &mut VionaInner, queue_idx: u16) {
         let idx = queue_idx as usize;
         // Only kick valid queues (RX=0, TX=1)
         if idx >= NET_NUM_QUEUES {
@@ -197,19 +244,74 @@ impl VirtioViona {
         if inner.ring_state[idx] != RingState::Ready {
             return;
         }
-        if let Err(e) = inner.link_ref().ring_kick(queue_idx) {
-            slog::warn!(inner.log(), "viona ring kick failed";
-                "ring" => queue_idx, "error" => %e);
+        match inner.link_ref().ring_kick(queue_idx) {
+            Ok(()) => inner.kick_refused[idx] = false,
+            // The kernel refuses a kick for any ring it is not running,
+            // and a guest can spin on QUEUE_NOTIFY, so one line per
+            // refusal is a log flood at a rate the guest picks. The
+            // ring is not quarantined: a migration export pauses the
+            // kernel rings and leaves this state at `Ready`, so an
+            // aborted export would otherwise leave a dead NIC behind.
+            Err(e) => {
+                if !inner.kick_refused[idx] {
+                    inner.kick_refused[idx] = true;
+                    slog::warn!(inner.log(), "viona ring kick refused";
+                        "ring" => queue_idx, "error" => %e);
+                }
+            }
         }
+    }
+
+    /// Reset one kernel ring, retrying while a signal interrupts it.
+    ///
+    /// `viona_ioc_ring_reset` waits with signals heeded, so `EINTR`
+    /// says nothing about the ring: only that this thread took a
+    /// signal. Treating it as a refusal would strand a ring the kernel
+    /// would have given back.
+    fn ring_reset_uninterrupted(
+        inner: &VionaInner,
+        queue_idx: u16,
+    ) -> std::io::Result<()> {
+        for _ in 1..RESET_ATTEMPTS {
+            match inner.link_ref().ring_reset(queue_idx) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                rc => return rc,
+            }
+        }
+        inner.link_ref().ring_reset(queue_idx)
     }
 
     /// Program the ring addresses for a queue into the kernel.
     ///
-    /// On success, marks the ring as `Ready` so that subsequent kicks
-    /// are forwarded to the kernel driver.
-    fn ring_init(inner: &mut VionaInner, queue_idx: u16, queue: &VirtQueue) {
+    /// A legacy driver retires a ring by writing `QUEUE_PFN = 0`, and
+    /// the kernel refuses `RING_INIT` on a ring that is not reset. So a
+    /// running kernel ring is retired first, whatever the driver wrote:
+    /// otherwise it keeps reading and writing pages the guest has
+    /// reclaimed, and the next programming attempt fails with the ring
+    /// still `Ready` on the old addresses.
+    ///
+    /// The answer names a ring the kernel would not retire. The guest
+    /// reclaims the pages of a ring it retires, so the caller has to
+    /// stop the link rather than leave the kernel on them.
+    fn ring_init(
+        inner: &mut VionaInner,
+        queue_idx: u16,
+        queue: &VirtQueue,
+    ) -> Option<(u16, std::io::Error)> {
+        let idx = queue_idx as usize;
+        if idx >= NET_NUM_QUEUES || inner.ring_state[idx] == RingState::Error {
+            return None;
+        }
+
+        if inner.ring_state[idx] == RingState::Ready {
+            if let Err(e) = Self::ring_reset_uninterrupted(inner, queue_idx) {
+                return Some((queue_idx, e));
+            }
+            inner.ring_state[idx] = RingState::Init;
+        }
+
         if !queue.is_configured() {
-            return;
+            return None;
         }
 
         // Use the actual addresses from VirtQueue: they hold for both
@@ -222,25 +324,31 @@ impl VirtioViona {
             queue.used_addr(),
         );
         match rc {
-            Ok(()) => {
-                let idx = queue_idx as usize;
-                if idx < NET_NUM_QUEUES {
-                    inner.ring_state[idx] = RingState::Ready;
-                }
+            Ok(()) => inner.ring_state[idx] = RingState::Ready,
+            // Userspace validated these addresses, so a refusal here is
+            // not something the driver can correct by writing them
+            // again. The kernel started no worker, so it holds no guest
+            // pages: quarantine until the device is reset.
+            Err(e) => {
+                slog::warn!(inner.log(),
+                    "viona ring init refused, quarantining";
+                    "ring" => queue_idx, "error" => %e);
+                inner.ring_state[idx] = RingState::Error;
             }
-            // The ring stays unready, so no kick reaches a ring the
-            // kernel does not have.
-            Err(e) => slog::warn!(inner.log(), "viona ring init failed";
-                "ring" => queue_idx, "error" => %e),
         }
+        None
     }
 
     /// Set negotiated features in the kernel driver.
-    fn set_kernel_features(inner: &VionaInner, features: u64) {
-        if let Err(e) = inner.link_ref().set_features(features) {
-            slog::warn!(inner.log(), "viona set features failed";
-                "features" => features, "error" => %e);
-        }
+    ///
+    /// The answer is returned: a migration restore reads the ring
+    /// addresses in the layout `VERSION_1` selects, so it cannot treat
+    /// a refusal as a warning.
+    fn set_kernel_features(
+        inner: &VionaInner,
+        features: u64,
+    ) -> std::io::Result<()> {
+        inner.link_ref().set_features(features)
     }
 }
 
@@ -268,7 +376,12 @@ impl VirtioDevice for VirtioViona {
             return;
         }
         inner.negotiated_features = features;
-        Self::set_kernel_features(&inner, features);
+        // The guest drives this one and can write the register again,
+        // so the refusal is reported and the driver decides.
+        if let Err(e) = Self::set_kernel_features(&inner, features) {
+            slog::warn!(inner.log(), "viona set features failed";
+                "features" => features, "error" => %e);
+        }
     }
 
     fn cfg_read(&self, offset: u16, len: u8) -> u32 {
@@ -318,25 +431,29 @@ impl VirtioDevice for VirtioViona {
         // Forward the notification to the kernel driver.
         // The kernel handles popping descriptors, processing packets,
         // and pushing used entries.
-        let inner = self.inner.lock().expect("viona lock poisoned");
-        Self::ring_kick(&inner, queue_idx);
+        let mut inner = self.inner.lock().expect("viona lock poisoned");
+        Self::ring_kick(&mut inner, queue_idx);
 
         // Return false: the kernel handles interrupts directly,
         // so the PCI transport should not raise a legacy interrupt.
         false
     }
 
-    fn get_kernel_ring_indices(&self, queue_idx: u16) -> (u16, u16) {
-        // The trait carries a pair of numbers and no way to say "no
-        // answer", and a device that has none reads here as a ring
-        // that moved nothing. The export then falls back to indices
-        // userspace keeps, which viona never moves. `ring_set_state`
-        // on the destination refuses the payload that makes.
-        self.get_kernel_ring_state(queue_idx).unwrap_or((0, 0))
+    fn kernel_ring_indices(
+        &self,
+        queue_idx: u16,
+    ) -> Result<Option<(u16, u16)>, vmm_devices::lifecycle::DeviceStateError>
+    {
+        // Always an answer or an error: viona owns both cursors of
+        // every ring it runs, and the pair userspace keeps stands in
+        // for neither.
+        self.kernel_ring_state(queue_idx).map(Some)
     }
 
-    fn reset_all_rings(&self) {
-        self.reset_all_rings();
+    fn reset_all_rings(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        self.reset_all_rings()
     }
 
     fn restore_ring_state(
@@ -350,15 +467,23 @@ impl VirtioDevice for VirtioViona {
         used_idx: u16,
         msix_addr: u64,
         msix_data: u32,
-    ) {
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
         self.ring_set_state(
             queue_idx, size, desc, avail, used, avail_idx, used_idx, msix_addr,
             msix_data,
-        );
+        )
     }
 
-    fn pause_rings_for_export(&self) {
-        self.pause_rings();
+    fn pause_rings_for_export(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        self.pause_rings()
+    }
+
+    fn resume_rings_after_migration(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        self.resume_rings()
     }
 
     fn set_notify_addrs(&self, pio_port: u16, mmio_addr: u64) {
@@ -372,34 +497,67 @@ impl VirtioDevice for VirtioViona {
     fn queue_addr_set(&self, queue_idx: u16, queue: &VirtQueue) {
         // When the guest programs a queue address, tell the kernel
         // where the ring structures live.
-        let mut inner = self.inner.lock().expect("viona lock poisoned");
-        // The halt destroys the link with this lock dropped, so a guest
-        // write can land in the middle of it. A ring marked ready then
-        // would let the next kick reach a link that is gone.
-        if inner.halted {
+        let stuck = {
+            let mut inner = self.inner.lock().expect("viona lock poisoned");
+            // The halt destroys the link with this lock dropped, so a
+            // guest write can land in the middle of it. A ring marked
+            // ready then would let the next kick reach a link that is
+            // gone.
+            if inner.halted {
+                return;
+            }
+            Self::ring_init(&mut inner, queue_idx, queue)
+        };
+
+        // A legacy driver frees the ring DMA after it writes
+        // QUEUE_PFN = 0, so a ring the kernel would not retire has to
+        // take the link with it.
+        let Some((ring, err)) = stuck else {
             return;
-        }
-        Self::ring_init(&mut inner, queue_idx, queue);
+        };
+        self.destroy_stopped_ring(ring, &err);
     }
 
     fn reset(&self) {
-        let mut inner = self.inner.lock().expect("viona lock poisoned");
-        // Same reason as `set_features`: no ioctl may be issued under
-        // this guard once the halt has let it go. The halt cleared
-        // both fields below already, and nothing can set them again.
-        if inner.halted {
-            return;
-        }
-        inner.negotiated_features = 0;
-        inner.ring_state = [RingState::Init; NET_NUM_QUEUES];
-
-        // Reset both rings in the kernel, so the worker stops before
-        // the guest programs the ring again.
-        for ring in 0..NET_NUM_QUEUES as u16 {
-            if let Err(e) = inner.link_ref().ring_reset(ring) {
-                slog::warn!(inner.log(), "viona ring reset failed";
-                    "ring" => ring, "error" => %e);
+        let stuck = {
+            let mut inner = self.inner.lock().expect("viona lock poisoned");
+            // Same reason as `set_features`: no ioctl may be issued
+            // under this guard once the halt has let it go. The halt
+            // cleared both fields below already, and nothing can set
+            // them again.
+            if inner.halted {
+                return;
             }
-        }
+            inner.negotiated_features = 0;
+            // A device reset is the way out of a quarantine, so the
+            // driver gets a warning again if the kernel refuses the new
+            // rings.
+            inner.kick_refused = [false; NET_NUM_QUEUES];
+
+            // Stop every kernel worker before the guest programs the
+            // rings again. The transport publishes DEVICE_STATUS 0 as
+            // soon as this returns, and an illumos driver reclaims the
+            // ring DMA on the next line, so a ring that is not proved
+            // stopped has to stop the whole link instead.
+            let mut stuck = None;
+            for ring in 0..NET_NUM_QUEUES as u16 {
+                match Self::ring_reset_uninterrupted(&inner, ring) {
+                    Ok(()) => inner.ring_state[ring as usize] = RingState::Init,
+                    Err(e) => {
+                        stuck = Some((ring, e));
+                        break;
+                    }
+                }
+            }
+            stuck
+        };
+
+        // The device lock is dropped first: the destroy joins the poll
+        // thread and sits in an untimed kernel call, and a vCPU holding
+        // this guard through that would block every other vCPU.
+        let Some((ring, err)) = stuck else {
+            return;
+        };
+        self.destroy_stopped_ring(ring, &err);
     }
 }

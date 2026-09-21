@@ -12,16 +12,15 @@ These flags match the existing C bhyve interface used by `boot.c`:
 
 | Flag | Description |
 |------|-------------|
-| `-c <N>` | CPU count (or `cpus=N,sockets=M,cores=C,threads=T`). Add `maxcpus=M` for hotplug CPU slots, see [Hotplug](#hotplug) |
+| `-c <N>` | CPU count, or `cpus=N`. Add `maxcpus=M` for hotplug CPU slots, see [Hotplug](#hotplug). `sockets=`, `cores=` and `threads=` are refused: this VMM programs one socket with one thread per core |
 | `-m <SIZE>` | Memory size. Bare number = MiB. Suffixes: K, M, G, T |
 | `-s <slot,driver[,config]>` | PCI device (repeatable). See [Devices](devices.md) |
 | `-l <device,config>` | LPC device (repeatable): `bootrom`, `com1`, `com2` |
 | `-U <UUID>` | VM UUID (SMBIOS Type 1 + mdata `sdc:uuid`) |
 | `-B <smbios>` | SMBIOS string: `1,manufacturer=X,product=Y,...` |
 | `-H` | Exit on HLT instruction |
-| `-D` | Destroy VM on power-off |
-| `-S` | Wire guest memory (no swap) |
-| `-A` | Generate ACPI tables |
+| `-S` | Draw guest memory from the VMM reservoir. C bhyve's `-S` means `memory.wired`, which is a different thing this VMM does not implement |
+| `-A` | Accepted because `boot.c` passes it; ACPI tables are always generated |
 | `-o <key=value>` | Config option (repeatable). Only `hotplug.maxmem` and `hotplug.memslot` are read; see [Hotplug](#hotplug). Any other key is passed over, but a misspelled `hotplug.` key is a startup error |
 
 ## New Flags
@@ -30,7 +29,7 @@ These flags match the existing C bhyve interface used by `boot.c`:
 
 | Flag | Description |
 |------|-------------|
-| `--track-dirty` | Enable dirty page tracking (required for migration) |
+| `--no-track-dirty` | Turn off dirty page tracking. It is on otherwise |
 | `--migrate-listen <ADDR:PORT>` | Destination mode: wait for incoming migration |
 | `--control-socket <PATH>` | Unix socket for management commands |
 | `--cpu-baseline <PROFILE>` | CPU feature mask: `host`, `avx2`, `sse42` |
@@ -182,8 +181,12 @@ answers with its state instead.
 
 `firehyve` is the second binary in this workspace: a microVM over the
 same crates, with a much smaller device surface. It shares this flag
-grammar, so a `-c/-m/-s/-l` command line reads the same, but it rejects
-at startup every flag it cannot honor rather than ignoring it.
+grammar, so a `-c/-m/-s/-l` command line reads the same. A flag that
+would change guest behaviour is rejected at startup rather than
+ignored. The exception is what the bhyve zone brand puts on every zone
+and offers no way to leave out: those are accepted, left unused and
+logged at `warn`, because refusing them would mean an unmodified brand
+could never start the binary.
 
 ```
 firehyve [OPTIONS] --kernel <PATH> <VM_NAME>
@@ -191,10 +194,10 @@ firehyve [OPTIONS] --kernel <PATH> <VM_NAME>
 
 | Difference | Detail |
 |------------|--------|
-| `--kernel` | Required. There is no UEFI path, so `-l bootrom,...` is rejected |
-| `-l com1` | `stdio` only. `/dev/zconsole` and `socket,<path>` are rejected |
-| `-l com2` | Not attached. There is no metadata agent, so `--mdata-*` is rejected |
-| `-s <slot>,<driver>` | `virtio-blk` (alias `virtio-blk-pci`), `virtio-net-viona`, `virtio-rnd`, `virtio-console`, `virtio-fs`, `virtio-vsock`, `hostbridge` and `lpc` only. `nvme`, `ahci-*`, `fbuf`, `xhci` and `passthru` are rejected, not skipped |
+| `--kernel` | Required. There is no UEFI path. `-l bootrom,<rom>`, which `boot.c` appends to every zone, is accepted and logged; nothing is loaded from the ROM |
+| `-l com1` | `stdio`, or an absolute device path such as the `/dev/zconsole` the brand names, which is served in both directions so `zlogin -C` works. Any other backend (`socket,<path>`, a relative path) falls back to stdio and is logged |
+| `-l com2` | Always attached, transmit only, mirrored to stdout as a marker channel for `fhrun-init`. A `com2,<backend>` from the argv is accepted and logged; there is no metadata agent, so `--mdata-*` is rejected |
+| `-s <slot>,<driver>` | `virtio-blk` (alias `virtio-blk-pci`), `virtio-net-viona`, `virtio-rnd`, `virtio-console`, `virtio-fs` and `virtio-vsock` are attached; `hostbridge` and `lpc` name what the chipset already made. `fbuf` and `xhci`, which the brand adds unless VNC is off, are accepted in the startup argv, left unattached and logged; a hot-add of either is refused. `nvme`, `ahci-*` and `passthru` are rejected, not skipped |
 | `-s ...,bootindex=N` | Rejected. A directly booted kernel has no firmware boot order |
 | Migration | Not supported: `--migrate-listen` and `--control-socket` are rejected |
 | `--hotplug` | Accepted, with the same `-c maxcpus=` and `-o hotplug.*` options as rshyve. The commands arrive on the vsock `CONTROL` verb, so the VM also needs a `-s <slot>,virtio-vsock,<path>,cid=<n>` device or nothing can reach them |
@@ -263,3 +266,11 @@ rshyve -H \
   -l com1,/dev/zconsole \
   SYSbhyve-$ZONENAME
 ```
+
+## Flags this VMM refuses
+
+`-D`, `-k` and `--json-config` are C bhyve flags this VMM does not
+implement, so it refuses them instead of ignoring them. `-D` (destroy on
+power-off) would change the lifecycle the zone brand relies on, and `-k`
+and `--json-config` name configuration files nothing here reads, so a VM
+would boot with defaults and no word about it.

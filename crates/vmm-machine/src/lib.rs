@@ -19,6 +19,7 @@ pub mod hotplug;
 pub mod inventory;
 pub mod opts;
 pub mod parse;
+pub mod pause;
 pub mod pci;
 pub mod pm;
 pub mod provision;
@@ -39,15 +40,17 @@ pub use firmware::{
     AcpiTables,
 };
 pub use hotplug::cpu::{CpuHotplugEngine, CpuHotplugError, CpuOnline};
+pub use hotplug::mem::hot_add_window;
 pub use hotplug::mem::{
     MemHotplugEngine, MemHotplugError, MemWindow, DEFAULT_SLOT_SIZE,
 };
 pub use hotplug::{
-    hot_add_window, hotplug_specs, start_cpu_hotplug, CpuSlots, HotplugEngine,
-    HotplugEngines, HotplugError, HotplugFactory, VmPause,
+    hotplug_specs, start_cpu_hotplug, CpuSlots, HotplugEngine, HotplugEngines,
+    HotplugError, HotplugFactory,
 };
 pub use opts::VmOpts;
 pub use parse::{find_lpc_device, parse_bdf};
+pub use pause::{VmPause, VmPauseGate};
 pub use pci::{
     attach_pci_devices, created, CreatedPciDevice, LifecycleHandle,
     PciAttachment, PciDeviceCtx, PciDeviceFactory, PciDeviceHandle,
@@ -59,16 +62,15 @@ pub use pm::{
 pub use registry::{
     DeviceRegistry, RegisteredDevice, RegistryError, SlotState,
 };
-pub use signal::{install_sigterm_handler, sigterm_flag, sigterm_received};
+pub use signal::{
+    install_sigterm_handler, sigterm_flag, sigterm_received, SUSPEND_SOURCE_VMM,
+};
 pub use teardown::{
-    join_vcpus_bounded, quiesce_devices, quiesce_registered_devices,
-    registry_named_devices, run_event_loop, run_event_loop_growable,
-    run_event_loop_registered, run_fleet_event_loop, RunOutcome, VcpuSet,
-    VcpuThreads,
+    registry_named_devices, run_fleet_event_loop, RunOutcome, VcpuThreads,
 };
 pub use vcpu::{
-    activate_all_vcpus, activate_one, activate_uefi_bsp_only, activate_vcpus,
-    check_aps_awaiting_sipi, set_halt_exit, spawn_vcpu_fleet, spawn_vcpus,
+    activate_one, activate_uefi_bsp_only, activate_vcpus,
+    check_aps_awaiting_sipi, set_halt_exit, spawn_vcpu_fleet,
     uefi_reset_targets, BspEntry, VcpuFleet,
 };
 pub use vcpu_tasks::{

@@ -2,10 +2,17 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! CPUID feature masking for cross-host migration compatibility.
+//! The CPUID table a VM programs through `VM_SET_CPUID`.
 //!
-//! Reads host CPUID values, applies a feature mask (baseline profile),
-//! and programs the masked entries into the kernel VMM via `VM_SET_CPUID`.
+//! The kernel's own CPUID handling (`vmm_cpuid.c`, the legacy path)
+//! rewrites the leaves that depend on the VM: the APIC IDs, the
+//! topology counts and the XSAVE limits. It does none of that for an
+//! explicit table, so this module has to. The table is built once from
+//! the host, with the topology of this VM in it, and every vCPU gets
+//! a copy with its own APIC ID.
+//!
+//! A baseline other than `Host` also masks the features above it, for
+//! migration between hosts of different generations.
 
 use bhyve_api::{
     vcpu_cpuid_entry, VCC_FLAG_INTEL_FALLBACK, VCE_FLAG_MATCH_INDEX,
@@ -18,13 +25,13 @@ use crate::hdl::VmmHdl;
 /// CPU baseline profiles for migration compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuBaseline {
-    /// No masking — pass through host CPUID as-is (default).
+    /// No masking: the host's features, as they are.
     Host,
     /// Mask out AVX-512 and related features.
     /// Compatible with any x86-64 host that has at least AVX2.
     Avx2,
     /// Mask out AVX-512, AVX2, FMA, BMI1/2, and other Haswell+ features.
-    /// Maximum compatibility — SSE4.2 baseline.
+    /// Maximum compatibility: SSE4.2 baseline.
     Sse42,
 }
 
@@ -46,19 +53,155 @@ impl std::str::FromStr for CpuBaseline {
     }
 }
 
-/// Read a CPUID leaf from the host CPU.
-///
-/// On non-x86_64 (cross-compile from macOS), returns zeros.
-fn host_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let result = std::arch::x86_64::__cpuid_count(leaf, subleaf);
-        (result.eax, result.ebx, result.ecx, result.edx)
+/// The four registers one CPUID query returns.
+type Regs = (u32, u32, u32, u32);
+
+/// A source of CPUID answers, so a table can be built from a recorded
+/// host in tests.
+pub trait CpuidSource {
+    fn cpuid(&self, leaf: u32, subleaf: u32) -> Regs;
+
+    /// The XCR0 bits the host itself has enabled, or `None` where that
+    /// cannot be read. The kernel only lets a guest use those.
+    fn enabled_xcr0(&self) -> Option<u64>;
+}
+
+/// The CPU this process runs on.
+pub struct HostCpu;
+
+impl CpuidSource for HostCpu {
+    fn cpuid(&self, leaf: u32, subleaf: u32) -> Regs {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let r = std::arch::x86_64::__cpuid_count(leaf, subleaf);
+            (r.eax, r.ebx, r.ecx, r.edx)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (leaf, subleaf);
+            (0, 0, 0, 0)
+        }
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (leaf, subleaf);
-        (0, 0, 0, 0)
+
+    fn enabled_xcr0(&self) -> Option<u64> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let (_, _, ecx1, _) = self.cpuid(1, 0);
+            if ecx1 & LEAF1_ECX_OSXSAVE == 0 {
+                return None;
+            }
+            // SAFETY: XGETBV(0) only faults when CR4.OSXSAVE is clear,
+            // and the OSXSAVE bit above says the OS has set it.
+            Some(unsafe { std::arch::x86_64::_xgetbv(0) })
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            None
+        }
+    }
+}
+
+// Leaf 1 bits the table sets or clears, as the kernel legacy path does.
+const LEAF1_ECX_MONITOR: u32 = 1 << 3;
+const LEAF1_ECX_VMX: u32 = 1 << 5;
+const LEAF1_ECX_SMX: u32 = 1 << 6;
+const LEAF1_ECX_EST: u32 = 1 << 7;
+const LEAF1_ECX_TM2: u32 = 1 << 8;
+const LEAF1_ECX_FMA: u32 = 1 << 12;
+const LEAF1_ECX_PDCM: u32 = 1 << 15;
+const LEAF1_ECX_TSC_DEADLINE: u32 = 1 << 24;
+#[cfg(target_arch = "x86_64")]
+const LEAF1_ECX_OSXSAVE: u32 = 1 << 27;
+const LEAF1_ECX_AVX: u32 = 1 << 28;
+const LEAF1_ECX_F16C: u32 = 1 << 29;
+const LEAF1_ECX_RDRAND: u32 = 1 << 30;
+const LEAF1_ECX_HYPERVISOR: u32 = 1 << 31;
+const LEAF1_EDX_MCE: u32 = 1 << 7;
+const LEAF1_EDX_MTRR: u32 = 1 << 12;
+const LEAF1_EDX_MCA: u32 = 1 << 14;
+const LEAF1_EDX_DS: u32 = 1 << 21;
+const LEAF1_EDX_ACPI: u32 = 1 << 22;
+const LEAF1_EDX_HTT: u32 = 1 << 28;
+const LEAF1_EDX_TM: u32 = 1 << 29;
+const LEAF1_EBX_APIC_ID_SHIFT: u32 = 24;
+const LEAF1_EBX_LOGICAL_COUNT_SHIFT: u32 = 16;
+
+/// Leaf 4 EAX: cache level, sharing count and cores per package.
+const LEAF4_EAX_LEVEL_SHIFT: u32 = 5;
+const LEAF4_EAX_SHARING_SHIFT: u32 = 14;
+const LEAF4_EAX_CORES_SHIFT: u32 = 26;
+const LEAF4_EAX_TYPE_MASK: u32 = 0x1F;
+const LEAF4_EAX_STATIC_MASK: u32 = 0x3FF;
+
+/// Leaf 0xB ECX[15:8] level types.
+const LEAF_B_TYPE_SMT: u32 = 1;
+const LEAF_B_TYPE_CORE: u32 = 2;
+
+/// The XSAVE area up to and including the SSE state.
+const XSAVE_LEGACY_SIZE: u32 = 576;
+/// The XCR0 components with a fixed place in the legacy area.
+const XCR0_LEGACY: u64 = 0b11;
+const XCR0_AVX: u64 = 1 << 2;
+const XCR0_AVX512: u64 = (1 << 5) | (1 << 6) | (1 << 7);
+const XCR0_AMX: u64 = (1 << 17) | (1 << 18);
+
+// Leaf 7 bits.
+const LEAF7_EBX_BMI1: u32 = 1 << 3;
+const LEAF7_EBX_AVX2: u32 = 1 << 5;
+const LEAF7_EBX_BMI2: u32 = 1 << 8;
+const LEAF7_EBX_AVX512: u32 = (1 << 16)
+    | (1 << 17)
+    | (1 << 21)
+    | (1 << 26)
+    | (1 << 27)
+    | (1 << 28)
+    | (1 << 30)
+    | (1 << 31);
+const LEAF7_ECX_AVX512: u32 =
+    (1 << 1) | (1 << 6) | (1 << 11) | (1 << 12) | (1 << 14);
+const LEAF7_EDX_AVX512_AMX: u32 =
+    (1 << 2) | (1 << 3) | (1 << 8) | (1 << 23) | (1 << 24) | (1 << 25);
+/// Leaf 7.1 EAX: AVX-VNNI (4), AVX-512_BF16 (5), AVX-IFMA (23).
+const LEAF7_1_EAX_VECTOR: u32 = (1 << 4) | (1 << 5) | (1 << 23);
+
+/// The feature bits a baseline takes away from the host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FeatureMask {
+    leaf1_ecx: u32,
+    leaf7_ebx: u32,
+    leaf7_ecx: u32,
+    leaf7_edx: u32,
+    leaf7_1_eax: u32,
+    xcr0: u64,
+}
+
+impl FeatureMask {
+    fn for_baseline(baseline: CpuBaseline) -> Self {
+        match baseline {
+            CpuBaseline::Host => Self::default(),
+            CpuBaseline::Avx2 => Self {
+                leaf7_ebx: LEAF7_EBX_AVX512,
+                leaf7_ecx: LEAF7_ECX_AVX512,
+                leaf7_edx: LEAF7_EDX_AVX512_AMX,
+                leaf7_1_eax: LEAF7_1_EAX_VECTOR,
+                xcr0: XCR0_AVX512 | XCR0_AMX,
+                ..Self::default()
+            },
+            CpuBaseline::Sse42 => Self {
+                leaf1_ecx: LEAF1_ECX_AVX
+                    | LEAF1_ECX_FMA
+                    | LEAF1_ECX_F16C
+                    | LEAF1_ECX_RDRAND,
+                leaf7_ebx: LEAF7_EBX_AVX512
+                    | LEAF7_EBX_BMI1
+                    | LEAF7_EBX_AVX2
+                    | LEAF7_EBX_BMI2,
+                leaf7_ecx: LEAF7_ECX_AVX512,
+                leaf7_edx: LEAF7_EDX_AVX512_AMX,
+                leaf7_1_eax: LEAF7_1_EAX_VECTOR,
+                xcr0: XCR0_AVX | XCR0_AVX512 | XCR0_AMX,
+            },
+        }
     }
 }
 
@@ -66,10 +209,7 @@ fn entry(
     func: u32,
     index: u32,
     flags: u32,
-    eax: u32,
-    ebx: u32,
-    ecx: u32,
-    edx: u32,
+    (eax, ebx, ecx, edx): Regs,
 ) -> vcpu_cpuid_entry {
     vcpu_cpuid_entry {
         vce_function: func,
@@ -83,236 +223,249 @@ fn entry(
     }
 }
 
-/// Build CPUID entries with the given baseline mask applied.
-///
-/// Reads host CPUID values and masks out features above the baseline.
-/// Returns a sorted Vec of entries suitable for `VmmHdl::set_cpuid`.
-pub fn build_cpuid_entries(baseline: CpuBaseline) -> Vec<vcpu_cpuid_entry> {
-    if baseline == CpuBaseline::Host {
-        return Vec::new();
-    }
+fn is_intel((_, ebx, ecx, edx): Regs) -> bool {
+    ebx == 0x756e_6547 && edx == 0x4965_6e69 && ecx == 0x6c65_746e
+}
 
+/// `ceil(log2(n))`: the bits an ID needs to count `n` things.
+fn id_width(n: u32) -> u32 {
+    n.next_power_of_two().trailing_zeros()
+}
+
+/// Build the table for `baseline` from `host`, for a VM of `num_cpus`
+/// vCPUs in one socket with one thread per core, which is the topology
+/// `set_topology` programs.
+///
+/// The entries are sorted for the kernel. The leaves that vary by
+/// vCPU still carry vCPU 0; [`specialize_for_vcpu`] fills in the rest.
+fn build_table(
+    host: &dyn CpuidSource,
+    baseline: CpuBaseline,
+    num_cpus: u32,
+) -> Vec<vcpu_cpuid_entry> {
+    let mask = FeatureMask::for_baseline(baseline);
     let mut entries = Vec::with_capacity(64);
 
-    // Leaf 0: max standard leaf + vendor string
-    let (max_leaf, ebx, ecx, edx) = host_cpuid(0, 0);
-    entries.push(entry(0, 0, 0, max_leaf, ebx, ecx, edx));
+    let leaf0 = host.cpuid(0, 0);
+    let max_leaf = leaf0.0;
+    let intel = is_intel(leaf0);
+    entries.push(entry(0, 0, 0, leaf0));
 
-    let is_intel = ebx == 0x756e_6547 // "Genu"
-        && edx == 0x4965_6e69         // "ineI"
-        && ecx == 0x6c65_746e; // "ntel"
+    entries.push(entry(1, 0, 0, leaf1(host.cpuid(1, 0), &mask, num_cpus)));
 
-    // Leaf 1: basic features
-    let (eax1, ebx1, mut ecx1, edx1) = host_cpuid(1, 0);
-    if baseline == CpuBaseline::Sse42 {
-        // Clear AVX (28), FMA (12), F16C (29), RDRAND (30)
-        ecx1 &= !(1 << 28 | 1 << 12 | 1 << 29 | 1 << 30);
-    }
-    entries.push(entry(1, 0, 0, eax1, ebx1, ecx1, edx1));
-
-    // Leaf 2: cache/TLB descriptors (Intel only)
-    if is_intel {
-        let (a, b, c, d) = host_cpuid(2, 0);
-        entries.push(entry(2, 0, 0, a, b, c, d));
+    if intel {
+        entries.push(entry(2, 0, 0, host.cpuid(2, 0)));
     }
 
-    // Leaf 4: deterministic cache (Intel, subleaf enumerated)
-    if is_intel && max_leaf >= 4 {
+    if intel && max_leaf >= 4 {
         for idx in 0..8u32 {
-            let (a, b, c, d) = host_cpuid(4, idx);
-            if a & 0x1f == 0 {
+            let regs = host.cpuid(4, idx);
+            if regs.0 & LEAF4_EAX_TYPE_MASK == 0 {
                 break;
             }
-            entries.push(entry(4, idx, VCE_FLAG_MATCH_INDEX, a, b, c, d));
+            let regs = leaf4(regs, num_cpus);
+            entries.push(entry(4, idx, VCE_FLAG_MATCH_INDEX, regs));
         }
     }
 
-    // Leaf 5: MONITOR/MWAIT
     if max_leaf >= 5 {
-        let (a, b, c, d) = host_cpuid(5, 0);
-        entries.push(entry(5, 0, 0, a, b, c, d));
+        entries.push(entry(5, 0, 0, host.cpuid(5, 0)));
     }
-
-    // Leaf 6: thermal/power
     if max_leaf >= 6 {
-        let (a, b, c, d) = host_cpuid(6, 0);
-        entries.push(entry(6, 0, 0, a, b, c, d));
+        entries.push(entry(6, 0, 0, host.cpuid(6, 0)));
     }
 
-    // Leaf 7, ECX=0: structured extended features — THE KEY LEAF
     if max_leaf >= 7 {
-        let (eax7, mut ebx7, mut ecx7, mut edx7) = host_cpuid(7, 0);
-
-        // AVX-512 bits in EBX
-        const AVX512_EBX: u32 = (1 << 16)
-            | (1 << 17)
-            | (1 << 21)
-            | (1 << 26)
-            | (1 << 27)
-            | (1 << 28)
-            | (1 << 30)
-            | (1 << 31);
-        // AVX-512 bits in ECX
-        const AVX512_ECX: u32 =
-            (1 << 1) | (1 << 6) | (1 << 11) | (1 << 12) | (1 << 14);
-        // AVX-512 + AMX bits in EDX
-        const AVX512_EDX: u32 =
-            (1 << 2) | (1 << 3) | (1 << 8) | (1 << 23) | (1 << 24) | (1 << 25);
-
-        match baseline {
-            CpuBaseline::Avx2 => {
-                ebx7 &= !AVX512_EBX;
-                ecx7 &= !AVX512_ECX;
-                edx7 &= !AVX512_EDX;
-            }
-            CpuBaseline::Sse42 => {
-                // Also mask AVX2 (5), BMI1 (3), BMI2 (8)
-                ebx7 &= !(AVX512_EBX | (1 << 3) | (1 << 5) | (1 << 8));
-                ecx7 &= !AVX512_ECX;
-                edx7 &= !AVX512_EDX;
-            }
-            CpuBaseline::Host => unreachable!(),
-        }
-
-        entries.push(entry(7, 0, VCE_FLAG_MATCH_INDEX, eax7, ebx7, ecx7, edx7));
-
-        // Leaf 7, ECX=1: AVX-512_BF16, AVX-VNNI, etc.
+        let (eax7, ebx7, ecx7, edx7) = host.cpuid(7, 0);
+        let regs = (
+            eax7,
+            ebx7 & !mask.leaf7_ebx,
+            ecx7 & !mask.leaf7_ecx,
+            edx7 & !mask.leaf7_edx,
+        );
+        entries.push(entry(7, 0, VCE_FLAG_MATCH_INDEX, regs));
         if eax7 >= 1 {
-            let (mut eax71, ebx71, ecx71, edx71) = host_cpuid(7, 1);
-            // AVX-512_BF16 (5), AVX-VNNI (4), AVX-IFMA (23)
-            eax71 &= !(1 << 4 | 1 << 5 | 1 << 23);
-            entries.push(entry(
-                7,
-                1,
-                VCE_FLAG_MATCH_INDEX,
-                eax71,
-                ebx71,
-                ecx71,
-                edx71,
-            ));
+            let (a, b, c, d) = host.cpuid(7, 1);
+            let regs = (a & !mask.leaf7_1_eax, b, c, d);
+            entries.push(entry(7, 1, VCE_FLAG_MATCH_INDEX, regs));
         }
     }
 
-    // Leaf 0xA: performance monitoring
-    if max_leaf >= 0xA {
-        let (a, b, c, d) = host_cpuid(0xA, 0);
-        entries.push(entry(0xA, 0, 0, a, b, c, d));
-    }
+    // Leaves 0xA and 0x15 are left to the empty entry, as the kernel
+    // zeroes them: the guest gets no PMU, and no crystal clock it could
+    // derive the local APIC frequency from.
 
-    // Leaf 0xB: extended topology (subleaf enumerated)
     if max_leaf >= 0xB {
-        for idx in 0..4u32 {
-            let (a, b, c, d) = host_cpuid(0xB, idx);
-            if a == 0 && b == 0 {
-                break;
-            }
-            entries.push(entry(0xB, idx, VCE_FLAG_MATCH_INDEX, a, b, c, d));
+        for (idx, regs) in leaf_b(num_cpus, 0).into_iter().enumerate() {
+            entries.push(entry(0xB, idx as u32, VCE_FLAG_MATCH_INDEX, regs));
         }
     }
 
-    // Leaf 0xD: XSAVE state — must match masked features
     if max_leaf >= 0xD {
-        let (mut eax_d0, _, _, edx_d0) = host_cpuid(0xD, 0);
-
-        match baseline {
-            CpuBaseline::Avx2 => {
-                // Clear AVX-512 opmask (5), hi256 (6), hi16_zmm (7), AMX (17,18)
-                eax_d0 &= !(1 << 5 | 1 << 6 | 1 << 7 | 1 << 17 | 1 << 18);
-            }
-            CpuBaseline::Sse42 => {
-                // Clear AVX (2), AVX-512 (5-7), AMX (17-18)
-                eax_d0 &=
-                    !(1 << 2 | 1 << 5 | 1 << 6 | 1 << 7 | 1 << 17 | 1 << 18);
-            }
-            CpuBaseline::Host => unreachable!(),
-        }
-
-        // Recalculate XSAVE area size
-        let mut xsave_size: u32 = 576; // x87 + SSE
-        if eax_d0 & (1 << 2) != 0 {
-            xsave_size = 832; // + AVX YMM hi128
-        }
-        let ebx_d0 = xsave_size;
-        let ecx_d0 = xsave_size;
-
-        entries.push(entry(
-            0xD,
-            0,
-            VCE_FLAG_MATCH_INDEX,
-            eax_d0,
-            ebx_d0,
-            ecx_d0,
-            edx_d0,
-        ));
-
-        // Subleaf 1: XSAVE features
-        let (a, b, c, d) = host_cpuid(0xD, 1);
-        entries.push(entry(0xD, 1, VCE_FLAG_MATCH_INDEX, a, b, c, d));
-
-        // Subleaf 2+: per-component info (only for enabled components)
-        for bit in 2..32u32 {
-            if eax_d0 & (1 << bit) == 0 {
-                continue;
-            }
-            let (a, b, c, d) = host_cpuid(0xD, bit);
-            if a == 0 {
-                continue;
-            }
-            entries.push(entry(0xD, bit, VCE_FLAG_MATCH_INDEX, a, b, c, d));
-        }
+        entries.extend(leaf_d(host, &mask));
     }
 
-    // Leaf 0x15: TSC/core crystal clock
-    if max_leaf >= 0x15 {
-        let (a, b, c, d) = host_cpuid(0x15, 0);
-        entries.push(entry(0x15, 0, 0, a, b, c, d));
-    }
-
-    // Leaf 0x16: processor frequency
     if max_leaf >= 0x16 {
-        let (a, b, c, d) = host_cpuid(0x16, 0);
-        entries.push(entry(0x16, 0, 0, a, b, c, d));
+        entries.push(entry(0x16, 0, 0, host.cpuid(0x16, 0)));
     }
 
-    // Extended leaves
-    let (max_ext, _, _, _) = host_cpuid(0x8000_0000, 0);
-    entries.push(entry(0x8000_0000, 0, 0, max_ext, 0, 0, 0));
-
-    if max_ext >= 0x8000_0001 {
-        let (a, b, c, d) = host_cpuid(0x8000_0001, 0);
-        entries.push(entry(0x8000_0001, 0, 0, a, b, c, d));
-    }
-
-    // Brand string (0x80000002-4)
-    for leaf in 0x8000_0002..=0x8000_0004 {
+    let (max_ext, _, _, _) = host.cpuid(0x8000_0000, 0);
+    entries.push(entry(0x8000_0000, 0, 0, (max_ext, 0, 0, 0)));
+    for leaf in 0x8000_0001..=0x8000_0007 {
         if max_ext >= leaf {
-            let (a, b, c, d) = host_cpuid(leaf, 0);
-            entries.push(entry(leaf, 0, 0, a, b, c, d));
+            entries.push(entry(leaf, 0, 0, host.cpuid(leaf, 0)));
         }
     }
-
-    // Cache info (0x80000005-6)
-    for leaf in 0x8000_0005..=0x8000_0006 {
-        if max_ext >= leaf {
-            let (a, b, c, d) = host_cpuid(leaf, 0);
-            entries.push(entry(leaf, 0, 0, a, b, c, d));
-        }
-    }
-
-    // Advanced power management
-    if max_ext >= 0x8000_0007 {
-        let (a, b, c, d) = host_cpuid(0x8000_0007, 0);
-        entries.push(entry(0x8000_0007, 0, 0, a, b, c, d));
-    }
-
-    // Address sizes
     if max_ext >= 0x8000_0008 {
-        let (a, b, c, d) = host_cpuid(0x8000_0008, 0);
-        entries.push(entry(0x8000_0008, 0, 0, a, b, c, d));
+        let regs = leaf_8000_0008(host.cpuid(0x8000_0008, 0), num_cpus);
+        entries.push(entry(0x8000_0008, 0, 0, regs));
+    }
+    if !intel && max_ext >= 0x8000_001E {
+        entries.push(entry(0x8000_001E, 0, 0, leaf_8000_001e(0)));
     }
 
     entries.sort_by(vcpu_cpuid_entry::eval_sort);
     entries
+}
+
+/// Leaf 1 with the VM's logical processor count, the hypervisor bit,
+/// and the features the kernel never lets a guest use.
+fn leaf1(
+    (eax, ebx, ecx, edx): Regs,
+    mask: &FeatureMask,
+    num_cpus: u32,
+) -> Regs {
+    let ebx = (ebx & 0x0000_FFFF)
+        | ((num_cpus & 0xFF) << LEAF1_EBX_LOGICAL_COUNT_SHIFT);
+    // MONITOR/MWAIT and TSC-deadline timers are not emulated; VMX, SMX
+    // and the power and debug features would trap or misbehave.
+    let ecx = (ecx
+        & !(LEAF1_ECX_MONITOR
+            | LEAF1_ECX_VMX
+            | LEAF1_ECX_SMX
+            | LEAF1_ECX_EST
+            | LEAF1_ECX_TM2
+            | LEAF1_ECX_PDCM
+            | LEAF1_ECX_TSC_DEADLINE
+            | mask.leaf1_ecx))
+        | LEAF1_ECX_HYPERVISOR;
+    // Windows refuses to boot without MCA, MCE and MTRR.
+    let edx = (edx & !(LEAF1_EDX_DS | LEAF1_EDX_ACPI | LEAF1_EDX_TM))
+        | LEAF1_EDX_MCA
+        | LEAF1_EDX_MCE
+        | LEAF1_EDX_MTRR
+        | LEAF1_EDX_HTT;
+    (eax, ebx, ecx, edx)
+}
+
+/// Leaf 4 with this VM's sharing: L1 and L2 belong to one core, L3
+/// and above to the whole package.
+fn leaf4((eax, ebx, ecx, edx): Regs, num_cpus: u32) -> Regs {
+    let level = (eax >> LEAF4_EAX_LEVEL_SHIFT) & 0x7;
+    let sharing = if level >= 3 { num_cpus - 1 } else { 0 };
+    let eax = (eax & LEAF4_EAX_STATIC_MASK)
+        | (sharing << LEAF4_EAX_SHARING_SHIFT)
+        | ((num_cpus - 1) << LEAF4_EAX_CORES_SHIFT);
+    (eax, ebx, ecx, edx)
+}
+
+/// Leaf 0xB for `vcpuid`: one thread per core, every core in one
+/// package. Subleaf 2 is the "no such level" answer the SDM asks for,
+/// so a guest walking up stops there and still reads its x2APIC ID.
+fn leaf_b(num_cpus: u32, vcpuid: u32) -> [Regs; 3] {
+    [
+        (0, 1, LEAF_B_TYPE_SMT << 8, vcpuid),
+        (
+            id_width(num_cpus),
+            num_cpus & 0xFFFF,
+            (LEAF_B_TYPE_CORE << 8) | 1,
+            vcpuid,
+        ),
+        (0, 0, 2, vcpuid),
+    ]
+}
+
+/// Leaf 0x8000_0008 with this VM's core count and APIC ID width.
+fn leaf_8000_0008((eax, ebx, ecx, edx): Regs, num_cpus: u32) -> Regs {
+    let ecx =
+        (ecx & !0xF0FF) | ((num_cpus - 1) & 0xFF) | (id_width(num_cpus) << 12);
+    (eax, ebx, ecx, edx)
+}
+
+/// Leaf 0x8000_001E for `vcpuid` on AMD: core `vcpuid`, one thread,
+/// one node.
+fn leaf_8000_001e(vcpuid: u32) -> Regs {
+    (vcpuid, vcpuid & 0xFF, 0, 0)
+}
+
+/// Leaf 0xD: the XSAVE components the guest may enable, the area they
+/// need, and one subleaf for each of them.
+///
+/// The kernel patches EBX of subleaves 0 and 1 at run time from the
+/// guest's XCR0, and nothing else, so every other value has to be
+/// right here. A component the guest can enable but cannot size, or a
+/// maximum too small for the components advertised, makes Linux
+/// disable XSAVE.
+fn leaf_d(host: &dyn CpuidSource, mask: &FeatureMask) -> Vec<vcpu_cpuid_entry> {
+    let (eax0, ebx0, _, edx0) = host.cpuid(0xD, 0);
+    let mut xcr0 = (u64::from(edx0) << 32 | u64::from(eax0)) & !mask.xcr0;
+    if let Some(enabled) = host.enabled_xcr0() {
+        xcr0 &= enabled;
+    }
+    let (eax1, ebx1, ecx1, edx1) = host.cpuid(0xD, 1);
+    let xss = u64::from(edx1) << 32 | u64::from(ecx1);
+
+    let mut components = Vec::new();
+    let mut max_size = XSAVE_LEGACY_SIZE;
+    for bit in 2..64u32 {
+        let in_xcr0 = xcr0 & (1 << bit) != 0;
+        if !in_xcr0 && xss & (1 << bit) == 0 {
+            continue;
+        }
+        let regs = host.cpuid(0xD, bit);
+        let (size, offset) = (regs.0, regs.1);
+        if size == 0 {
+            continue;
+        }
+        if in_xcr0 {
+            max_size = max_size.max(offset.saturating_add(size));
+        }
+        components.push(entry(0xD, bit, VCE_FLAG_MATCH_INDEX, regs));
+    }
+
+    let mut entries = vec![
+        entry(
+            0xD,
+            0,
+            VCE_FLAG_MATCH_INDEX,
+            (xcr0 as u32, ebx0, max_size, (xcr0 >> 32) as u32),
+        ),
+        entry(0xD, 1, VCE_FLAG_MATCH_INDEX, (eax1, ebx1, ecx1, edx1)),
+    ];
+    entries.extend(components);
+    entries
+}
+
+/// Give `entries` the APIC IDs of `vcpuid`.
+///
+/// The kernel's explicit path does not touch these (`vmm_cpuid.c`,
+/// `cpuid_apply_runtime_reg_state`), and a guest that sees the same ID
+/// on every CPU treats the machine as one core.
+fn specialize_for_vcpu(entries: &mut [vcpu_cpuid_entry], vcpuid: u32) {
+    for e in entries.iter_mut() {
+        match e.vce_function {
+            1 => {
+                e.vce_ebx = (e.vce_ebx & 0x00FF_FFFF)
+                    | ((vcpuid & 0xFF) << LEAF1_EBX_APIC_ID_SHIFT);
+            }
+            0xB => e.vce_edx = vcpuid,
+            0x8000_001E => {
+                let (a, b, c, d) = leaf_8000_001e(vcpuid);
+                (e.vce_eax, e.vce_ebx, e.vce_ecx, e.vce_edx) = (a, b, c, d);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The CPUID table one VM programs, built once and replayed per vCPU.
@@ -335,35 +488,38 @@ impl CpuidTable {
     /// CPUID from the host, so no vCPU needs an override.
     ///
     /// When `baseline == Host` and `extra` is non-empty, this builds a
-    /// full host-passthrough table first so the kernel does not lose
-    /// the standard leaves: `set_cpuid` replaces the kernel table
-    /// wholesale, so a partial override cannot be shipped.
+    /// full host table first so the kernel does not lose the standard
+    /// leaves: `set_cpuid` replaces the kernel table wholesale, so a
+    /// partial override cannot be shipped.
     pub fn build(
         baseline: CpuBaseline,
         extra: &[vcpu_cpuid_entry],
+        num_cpus: u32,
     ) -> Option<Self> {
-        let mut entries = if baseline == CpuBaseline::Host {
-            if extra.is_empty() {
-                return None;
-            }
-            build_passthrough_entries()
-        } else {
-            build_cpuid_entries(baseline)
-        };
+        Self::build_from(&HostCpu, baseline, extra, num_cpus)
+    }
 
+    /// [`Self::build`] from any CPUID source.
+    pub fn build_from(
+        host: &dyn CpuidSource,
+        baseline: CpuBaseline,
+        extra: &[vcpu_cpuid_entry],
+        num_cpus: u32,
+    ) -> Option<Self> {
+        if baseline == CpuBaseline::Host && extra.is_empty() {
+            return None;
+        }
+        let mut entries = build_table(host, baseline, num_cpus.max(1));
         if !extra.is_empty() {
             entries.extend_from_slice(extra);
             entries.sort_by(vcpu_cpuid_entry::eval_sort);
         }
-        if entries.is_empty() {
-            return None;
-        }
 
-        let (_, ebx, ecx, edx) = host_cpuid(0, 0);
-        let is_intel =
-            ebx == 0x756e_6547 && edx == 0x4965_6e69 && ecx == 0x6c65_746e;
-        let flags = if is_intel { VCC_FLAG_INTEL_FALLBACK } else { 0 };
-
+        let flags = if is_intel(host.cpuid(0, 0)) {
+            VCC_FLAG_INTEL_FALLBACK
+        } else {
+            0
+        };
         Some(Self { entries, flags })
     }
 
@@ -380,19 +536,32 @@ impl CpuidTable {
         self.flags
     }
 
+    /// The entries `vcpuid` is programmed with.
+    pub fn entries_for(&self, vcpuid: u32) -> Vec<vcpu_cpuid_entry> {
+        let mut entries = self.entries.clone();
+        specialize_for_vcpu(&mut entries, vcpuid);
+        entries
+    }
+
     /// Program the table into one vCPU.
     ///
-    /// The kernel copies the entries in, so each call needs its own
-    /// mutable copy. `vm_set_cpuid` does not need the vCPU to be
-    /// active (`vmm_cpuid.c:457`), which is what lets a hot-add
-    /// program the table before the activation it cannot undo.
+    /// `vm_set_cpuid` does not need the vCPU to be active
+    /// (`vmm_cpuid.c:457`), which is what lets a hot-add program the
+    /// table before the activation it cannot undo.
     pub fn apply_to(&self, hdl: &VmmHdl, vcpuid: i32) -> std::io::Result<()> {
-        let mut entries = self.entries.clone();
+        let id = u32::try_from(vcpuid).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("vCPU id {vcpuid} is negative"),
+            )
+        })?;
+        let mut entries = self.entries_for(id);
         hdl.set_cpuid(vcpuid, &mut entries, self.flags)
     }
 }
 
-/// The same pass, handing back the table it programmed.
+/// Build the table and program every boot vCPU with it, handing back
+/// the table for the vCPUs that come later.
 pub fn apply_cpuid_table(
     hdl: &VmmHdl,
     num_cpus: u32,
@@ -400,7 +569,7 @@ pub fn apply_cpuid_table(
     extra: &[vcpu_cpuid_entry],
     log: &slog::Logger,
 ) -> std::io::Result<Option<CpuidTable>> {
-    let Some(table) = CpuidTable::build(baseline, extra) else {
+    let Some(table) = CpuidTable::build(baseline, extra, num_cpus) else {
         return Ok(None);
     };
 
@@ -424,162 +593,43 @@ pub fn apply_cpuid_table(
     Ok(Some(table))
 }
 
-/// Build a full CPUID table from native host values, without applying
-/// any baseline masking. Used when a caller (e.g. the Hyper-V
-/// enlightenment) needs to inject hypervisor leaves on an otherwise
-/// `Host`-baseline VM.
-pub fn build_passthrough_entries() -> Vec<vcpu_cpuid_entry> {
-    // Sse42 reaches the same code path as Avx2 for the bulk of the
-    // table, so we just call build with Avx2 and unwind any masking
-    // that doesn't apply to a passthrough build by re-reading host
-    // CPUID for the affected leaves. Simpler: do a private build.
-    build_full_table_native()
-}
-
-fn build_full_table_native() -> Vec<vcpu_cpuid_entry> {
-    let mut entries = Vec::with_capacity(64);
-
-    let (max_leaf, ebx, ecx, edx) = host_cpuid(0, 0);
-    entries.push(entry(0, 0, 0, max_leaf, ebx, ecx, edx));
-
-    let is_intel =
-        ebx == 0x756e_6547 && edx == 0x4965_6e69 && ecx == 0x6c65_746e;
-
-    let (a, b, c, d) = host_cpuid(1, 0);
-    entries.push(entry(1, 0, 0, a, b, c, d));
-
-    if is_intel {
-        let (a, b, c, d) = host_cpuid(2, 0);
-        entries.push(entry(2, 0, 0, a, b, c, d));
-    }
-
-    if is_intel && max_leaf >= 4 {
-        for idx in 0..8u32 {
-            let (a, b, c, d) = host_cpuid(4, idx);
-            if a & 0x1f == 0 {
-                break;
-            }
-            entries.push(entry(4, idx, VCE_FLAG_MATCH_INDEX, a, b, c, d));
-        }
-    }
-
-    if max_leaf >= 5 {
-        let (a, b, c, d) = host_cpuid(5, 0);
-        entries.push(entry(5, 0, 0, a, b, c, d));
-    }
-    if max_leaf >= 6 {
-        let (a, b, c, d) = host_cpuid(6, 0);
-        entries.push(entry(6, 0, 0, a, b, c, d));
-    }
-    if max_leaf >= 7 {
-        let (a, b, c, d) = host_cpuid(7, 0);
-        entries.push(entry(7, 0, VCE_FLAG_MATCH_INDEX, a, b, c, d));
-    }
-    if max_leaf >= 0xB {
-        for idx in 0..8u32 {
-            let (a, b, c, d) = host_cpuid(0xB, idx);
-            if (b & 0xFFFF) == 0 {
-                break;
-            }
-            entries.push(entry(0xB, idx, VCE_FLAG_MATCH_INDEX, a, b, c, d));
-        }
-    }
-    if max_leaf >= 0xD {
-        let (a, b, c, d) = host_cpuid(0xD, 0);
-        entries.push(entry(0xD, 0, VCE_FLAG_MATCH_INDEX, a, b, c, d));
-        let (a2, b2, c2, d2) = host_cpuid(0xD, 1);
-        entries.push(entry(0xD, 1, VCE_FLAG_MATCH_INDEX, a2, b2, c2, d2));
-    }
-
-    let (max_ext, _, _, _) = host_cpuid(0x8000_0000, 0);
-    entries.push(entry(0x8000_0000, 0, 0, max_ext, 0, 0, 0));
-    if max_ext >= 0x8000_0001 {
-        let (a, b, c, d) = host_cpuid(0x8000_0001, 0);
-        entries.push(entry(0x8000_0001, 0, 0, a, b, c, d));
-    }
-    for leaf in [0x8000_0002, 0x8000_0003, 0x8000_0004] {
-        if max_ext >= leaf {
-            let (a, b, c, d) = host_cpuid(leaf, 0);
-            entries.push(entry(leaf, 0, 0, a, b, c, d));
-        }
-    }
-    if max_ext >= 0x8000_0007 {
-        let (a, b, c, d) = host_cpuid(0x8000_0007, 0);
-        entries.push(entry(0x8000_0007, 0, 0, a, b, c, d));
-    }
-    if max_ext >= 0x8000_0008 {
-        let (a, b, c, d) = host_cpuid(0x8000_0008, 0);
-        entries.push(entry(0x8000_0008, 0, 0, a, b, c, d));
-    }
-
-    entries.sort_by(vcpu_cpuid_entry::eval_sort);
-    entries
-}
-
-/// Query the host CPU's key feature bits for migration compatibility.
+/// The host's key feature bits, as a guest on `baseline` sees them.
 ///
-/// Returns (leaf1_ecx, leaf1_edx, leaf7_ebx, leaf7_ecx, leaf7_edx, xcr0).
-/// Query host CPU features with baseline masking applied.
-///
-/// Returns the same tuple as `query_host_features()` but with the
-/// given baseline mask applied. This reflects what the guest actually
-/// sees and should be sent in migration preambles.
+/// Returns (leaf1_ecx, leaf1_edx, leaf7_ebx, leaf7_ecx, leaf7_edx,
+/// xcr0). This is what a migration preamble compares.
 pub fn query_masked_features(
     baseline: CpuBaseline,
 ) -> (u32, u32, u32, u32, u32, u32) {
-    let (mut ecx1, edx1, mut ebx7, mut ecx7, mut edx7, mut xcr0) =
-        query_host_features();
-
-    if baseline == CpuBaseline::Sse42 {
-        ecx1 &= !(1 << 28 | 1 << 12 | 1 << 29 | 1 << 30);
-    }
-
-    if baseline != CpuBaseline::Host {
-        const AVX512_EBX: u32 = (1 << 16)
-            | (1 << 17)
-            | (1 << 21)
-            | (1 << 26)
-            | (1 << 27)
-            | (1 << 28)
-            | (1 << 30)
-            | (1 << 31);
-        const AVX512_ECX: u32 =
-            (1 << 1) | (1 << 6) | (1 << 11) | (1 << 12) | (1 << 14);
-        const AVX512_EDX: u32 =
-            (1 << 2) | (1 << 3) | (1 << 8) | (1 << 23) | (1 << 24) | (1 << 25);
-        // AVX-512 XCR0 components (ZMM/opmask)
-        const AVX512_XCR0: u32 = (1 << 5) | (1 << 6) | (1 << 7);
-
-        ebx7 &= !AVX512_EBX;
-        ecx7 &= !AVX512_ECX;
-        edx7 &= !AVX512_EDX;
-        xcr0 &= !AVX512_XCR0;
-
-        if baseline == CpuBaseline::Sse42 {
-            ebx7 &= !((1 << 3) | (1 << 5) | (1 << 8)); // BMI1, AVX2, BMI2
-            xcr0 &= !(1 << 2); // AVX YMM state
-        }
-    }
-
-    (ecx1, edx1, ebx7, ecx7, edx7, xcr0)
+    let (ecx1, edx1, ebx7, ecx7, edx7, xcr0) = query_host_features();
+    let mask = FeatureMask::for_baseline(baseline);
+    (
+        ecx1 & !mask.leaf1_ecx,
+        edx1,
+        ebx7 & !mask.leaf7_ebx,
+        ecx7 & !mask.leaf7_ecx,
+        edx7 & !mask.leaf7_edx,
+        xcr0 & !(mask.xcr0 as u32),
+    )
 }
 
+/// The host's key feature bits: (leaf1_ecx, leaf1_edx, leaf7_ebx,
+/// leaf7_ecx, leaf7_edx, xcr0).
 pub fn query_host_features() -> (u32, u32, u32, u32, u32, u32) {
-    let (_, _, ecx1, edx1) = host_cpuid(1, 0);
+    let host = HostCpu;
+    let (_, _, ecx1, edx1) = host.cpuid(1, 0);
 
-    let (max_leaf, _, _, _) = host_cpuid(0, 0);
+    let (max_leaf, _, _, _) = host.cpuid(0, 0);
     let (ebx7, ecx7, edx7) = if max_leaf >= 7 {
-        let (_, b, c, d) = host_cpuid(7, 0);
+        let (_, b, c, d) = host.cpuid(7, 0);
         (b, c, d)
     } else {
         (0, 0, 0)
     };
 
     let xcr0 = if max_leaf >= 0xD {
-        let (a, _, _, _) = host_cpuid(0xD, 0);
-        a
+        host.cpuid(0xD, 0).0
     } else {
-        0x3 // x87 + SSE minimum
+        XCR0_LEGACY as u32
     };
 
     (ecx1, edx1, ebx7, ecx7, edx7, xcr0)
@@ -587,68 +637,343 @@ pub fn query_host_features() -> (u32, u32, u32, u32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{entry, CpuBaseline, CpuidTable};
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A recorded Intel host: 0xD leaves 0..=0x1F, AVX and AVX-512
+    /// state, one extra subleaf-2 (AVX) at offset 576 and the AVX-512
+    /// components after it.
+    struct FakeHost {
+        leaves: HashMap<(u32, u32), Regs>,
+        enabled_xcr0: Option<u64>,
+    }
+
+    impl FakeHost {
+        fn intel() -> Self {
+            let mut leaves = HashMap::new();
+            leaves
+                .insert((0, 0), (0x1F, 0x756e_6547, 0x6c65_746e, 0x4965_6e69));
+            // 16 logical CPUs on the host, APIC ID 7 on the recording CPU.
+            leaves.insert(
+                (1, 0),
+                (0x000A_0655, 0x0710_0800, 0xFFFF_FFFF, 0xBFEB_FBFF),
+            );
+            leaves.insert((4, 0), (0x7C00_4121, 0, 0, 0)); // L1d: level 1
+            leaves.insert((4, 1), (0x7C00_4122, 0, 0, 0)); // L1i
+            leaves.insert((4, 2), (0x7C00_4143, 0, 0, 0)); // L2
+            leaves.insert((4, 3), (0x7C0F_C163, 0, 0, 0)); // L3
+            leaves.insert((4, 4), (0, 0, 0, 0));
+            leaves.insert((7, 0), (1, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF));
+            leaves.insert((7, 1), (0xFFFF_FFFF, 0, 0, 0));
+            // XCR0 supported: x87, SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM,
+            // PKRU (9), and AMX (17, 18).
+            let xcr0: u32 = 0b11 | (1 << 2) | (7 << 5) | (1 << 9) | (3 << 17);
+            leaves.insert((0xD, 0), (xcr0, 2696, 11008, 0));
+            leaves.insert((0xD, 1), (0xF, 2440, 0x100, 0)); // XSS: PT (8)
+            leaves.insert((0xD, 2), (256, 576, 0, 0));
+            leaves.insert((0xD, 5), (64, 1088, 0, 0));
+            leaves.insert((0xD, 6), (512, 1152, 0, 0));
+            leaves.insert((0xD, 7), (1024, 1664, 0, 0));
+            leaves.insert((0xD, 8), (128, 0, 1, 0)); // PT, supervisor
+            leaves.insert((0xD, 9), (8, 2688, 0, 0));
+            leaves.insert((0xD, 17), (64, 2752, 0, 0));
+            leaves.insert((0xD, 18), (8192, 2816, 0, 0));
+            leaves.insert((0x8000_0000, 0), (0x8000_0008, 0, 0, 0));
+            leaves.insert((0x8000_0008, 0), (0x3030, 0, 0xF0FF, 0));
+            Self {
+                leaves,
+                enabled_xcr0: None,
+            }
+        }
+
+        fn amd() -> Self {
+            let mut host = Self::intel();
+            host.leaves
+                .insert((0, 0), (0x10, 0x6874_7541, 0x444d_4163, 0x6974_6e65));
+            host.leaves.insert((0x8000_0000, 0), (0x8000_001F, 0, 0, 0));
+            host
+        }
+    }
+
+    impl CpuidSource for FakeHost {
+        fn cpuid(&self, leaf: u32, subleaf: u32) -> Regs {
+            self.leaves
+                .get(&(leaf, subleaf))
+                .copied()
+                .unwrap_or_default()
+        }
+
+        fn enabled_xcr0(&self) -> Option<u64> {
+            self.enabled_xcr0
+        }
+    }
+
+    fn find(t: &CpuidTable, func: u32, idx: u32) -> vcpu_cpuid_entry {
+        *t.entries
+            .iter()
+            .find(|e| e.vce_function == func && e.vce_index == idx)
+            .unwrap_or_else(|| panic!("no entry for {func:#x}.{idx}"))
+    }
+
+    fn find_for(
+        t: &CpuidTable,
+        vcpu: u32,
+        func: u32,
+        idx: u32,
+    ) -> vcpu_cpuid_entry {
+        t.entries_for(vcpu)
+            .into_iter()
+            .find(|e| e.vce_function == func && e.vce_index == idx)
+            .unwrap_or_else(|| panic!("no entry for {func:#x}.{idx}"))
+    }
 
     #[test]
     fn a_host_baseline_with_no_extra_entries_programs_nothing() {
         // The kernel answers CPUID from the host, so no vCPU needs an
         // override and a late vCPU needs no replay either.
-        assert!(CpuidTable::build(CpuBaseline::Host, &[]).is_none());
+        assert!(CpuidTable::build_from(
+            &FakeHost::intel(),
+            CpuBaseline::Host,
+            &[],
+            2
+        )
+        .is_none());
     }
 
     #[test]
     fn a_host_baseline_with_extra_entries_keeps_the_standard_leaves() {
         // VM_SET_CPUID replaces the kernel table wholesale, so an
         // extra leaf on its own would hide every standard leaf.
-        let extra = entry(0x4000_0000, 0, 0, 0x4000_0001, 0, 0, 0);
-        let table = CpuidTable::build(CpuBaseline::Host, &[extra])
-            .expect("extra entries need a table");
+        let extra = entry(0x4000_0000, 0, 0, (0x4000_0001, 0, 0, 0));
+        let table = CpuidTable::build_from(
+            &FakeHost::intel(),
+            CpuBaseline::Host,
+            &[extra],
+            2,
+        )
+        .expect("extra entries need a table");
 
-        assert!(table.len() > 1, "the standard leaves are still there");
+        assert!(table.len() > 1);
         assert!(table.entries.iter().any(|e| e.vce_function == 0x4000_0000));
         assert!(table.entries.iter().any(|e| e.vce_function == 0));
     }
 
     #[test]
-    fn a_masked_baseline_builds_a_table() {
-        let table = CpuidTable::build(CpuBaseline::Avx2, &[])
-            .expect("a masked baseline always programs a table");
+    fn every_vcpu_gets_its_own_apic_id() {
+        // The explicit kernel path does not patch the IDs, and Linux
+        // 6.9+ logs "APIC ID mismatch" and folds the topology to one
+        // core when every CPU reports the same one.
+        let table = CpuidTable::build_from(
+            &FakeHost::intel(),
+            CpuBaseline::Host,
+            &[entry(0x4000_0000, 0, 0, (0, 0, 0, 0))],
+            4,
+        )
+        .unwrap();
 
-        assert!(!table.is_empty());
+        for vcpu in 0..4 {
+            let l1 = find_for(&table, vcpu, 1, 0);
+            assert_eq!(l1.vce_ebx >> 24, vcpu, "leaf 1 APIC ID");
+            for sub in 0..3 {
+                assert_eq!(
+                    find_for(&table, vcpu, 0xB, sub).vce_edx,
+                    vcpu,
+                    "leaf 0xB x2APIC ID"
+                );
+            }
+        }
+        // The host's own APIC ID (7) is gone from every copy.
+        assert_ne!(find_for(&table, 0, 1, 0).vce_ebx >> 24, 7);
     }
 
     #[test]
-    fn every_vcpu_gets_the_same_table() {
-        // A vCPU added after boot must see what its siblings see. The
-        // table is one value, so a replay cannot drift from the boot
-        // pass.
-        let table = CpuidTable::build(CpuBaseline::Sse42, &[])
-            .expect("a masked baseline always programs a table");
-        let first = table.clone();
+    fn the_topology_leaves_describe_the_vm_not_the_host() {
+        let host = FakeHost::intel();
+        let table =
+            CpuidTable::build_from(&host, CpuBaseline::Avx2, &[], 6).unwrap();
 
-        assert_eq!(first.len(), table.len());
-        assert_eq!(first.flags(), table.flags());
-        assert!(first.entries.iter().zip(table.entries.iter()).all(
-            |(a, b)| a.vce_function == b.vce_function
-                && a.vce_index == b.vce_index
-                && a.vce_eax == b.vce_eax
+        let l1 = find(&table, 1, 0);
+        assert_eq!(
+            (l1.vce_ebx >> 16) & 0xFF,
+            6,
+            "logical processors per package"
+        );
+        assert_ne!(l1.vce_edx & LEAF1_EDX_HTT, 0);
+        assert_ne!(l1.vce_ecx & LEAF1_ECX_HYPERVISOR, 0);
+        assert_eq!(
+            l1.vce_ecx
+                & (LEAF1_ECX_VMX | LEAF1_ECX_MONITOR | LEAF1_ECX_TSC_DEADLINE),
+            0
+        );
+
+        // Leaf 0xB: no SMT, six cores in the package, three ID bits.
+        let b0 = find(&table, 0xB, 0);
+        assert_eq!(
+            (b0.vce_eax, b0.vce_ebx, b0.vce_ecx >> 8),
+            (0, 1, LEAF_B_TYPE_SMT)
+        );
+        let b1 = find(&table, 0xB, 1);
+        assert_eq!(
+            (b1.vce_eax, b1.vce_ebx, b1.vce_ecx >> 8),
+            (3, 6, LEAF_B_TYPE_CORE)
+        );
+        let b2 = find(&table, 0xB, 2);
+        assert_eq!((b2.vce_eax, b2.vce_ebx, b2.vce_ecx), (0, 0, 2));
+
+        // Leaf 4: L1/L2 private to a core, L3 shared by all six.
+        let l1d = find(&table, 4, 0);
+        assert_eq!((l1d.vce_eax >> 14) & 0xFFF, 0);
+        assert_eq!(l1d.vce_eax >> 26, 5);
+        let l3 = find(&table, 4, 3);
+        assert_eq!((l3.vce_eax >> 14) & 0xFFF, 5);
+
+        // 0x8000_0008: five more cores, three ID bits.
+        let ext8 = find(&table, 0x8000_0008, 0);
+        assert_eq!(ext8.vce_ecx & 0xFF, 5);
+        assert_eq!((ext8.vce_ecx >> 12) & 0xF, 3);
+    }
+
+    #[test]
+    fn an_amd_host_gets_a_per_vcpu_leaf_8000_001e() {
+        let table =
+            CpuidTable::build_from(&FakeHost::amd(), CpuBaseline::Avx2, &[], 2)
+                .unwrap();
+        assert_eq!(table.flags(), 0);
+        let e = find_for(&table, 1, 0x8000_001E, 0);
+        assert_eq!((e.vce_eax, e.vce_ebx & 0xFF), (1, 1));
+        assert!(
+            table.entries.iter().all(|e| e.vce_function != 2),
+            "leaf 2 is Intel only"
+        );
+    }
+
+    #[test]
+    fn leaf_d_lists_every_component_the_guest_may_enable() {
+        // Linux reads the size of every enabled component; a zero size
+        // fails paranoid_xstate_size_valid and XSAVE is disabled.
+        let table = CpuidTable::build_from(
+            &FakeHost::intel(),
+            CpuBaseline::Host,
+            &[entry(0x4000_0000, 0, 0, (0, 0, 0, 0))],
+            2,
+        )
+        .unwrap();
+
+        let d0 = find(&table, 0xD, 0);
+        let xcr0 = u64::from(d0.vce_eax) | u64::from(d0.vce_edx) << 32;
+        for bit in [2u32, 5, 6, 7, 9, 17, 18] {
+            assert_ne!(xcr0 & (1 << bit), 0, "component {bit} advertised");
+            let sub = find(&table, 0xD, bit);
+            assert_ne!(sub.vce_eax, 0, "component {bit} has a size");
+        }
+        // The supervisor component from XSS is described too.
+        assert_eq!(find(&table, 0xD, 8).vce_ecx & 1, 1);
+        // The maximum is the end of the highest user component, AMX
+        // tile data at 2816 + 8192, not the 832 the old builder wrote.
+        assert_eq!(d0.vce_ecx, 2816 + 8192);
+    }
+
+    #[test]
+    fn a_masked_baseline_drops_the_components_with_the_features() {
+        let table = CpuidTable::build_from(
+            &FakeHost::intel(),
+            CpuBaseline::Avx2,
+            &[],
+            2,
+        )
+        .unwrap();
+
+        let d0 = find(&table, 0xD, 0);
+        assert_eq!(d0.vce_eax & 0xE0, 0, "AVX-512 state is gone");
+        assert_eq!(d0.vce_eax & (3 << 17), 0, "AMX state is gone");
+        assert_ne!(d0.vce_eax & (1 << 2), 0, "AVX state stays");
+        assert_ne!(d0.vce_eax & (1 << 9), 0, "PKRU stays");
+        assert!(table.entries.iter().all(
+            |e| !(e.vce_function == 0xD && (5..=7).contains(&e.vce_index))
         ));
+        // PKRU ends at 2688 + 8; the AVX-512 components no longer count.
+        assert_eq!(d0.vce_ecx, 2696);
+
+        let l7 = find(&table, 7, 0);
+        assert_eq!(l7.vce_ebx & LEAF7_EBX_AVX512, 0);
+        assert_ne!(l7.vce_ebx & LEAF7_EBX_AVX2, 0);
+        assert_eq!(find(&table, 7, 1).vce_eax & LEAF7_1_EAX_VECTOR, 0);
+
+        let sse = CpuidTable::build_from(
+            &FakeHost::intel(),
+            CpuBaseline::Sse42,
+            &[],
+            2,
+        )
+        .unwrap();
+        let d0 = find(&sse, 0xD, 0);
+        assert_eq!(d0.vce_eax & (1 << 2), 0, "AVX state is gone");
+        assert_eq!(d0.vce_ecx, 2696);
+        assert_eq!(find(&sse, 1, 0).vce_ecx & LEAF1_ECX_AVX, 0);
+        assert_eq!(find(&sse, 7, 0).vce_ebx & LEAF7_EBX_AVX2, 0);
+    }
+
+    #[test]
+    fn the_guest_gets_no_xsave_state_the_host_did_not_enable() {
+        // The kernel only allows what is in the host's own XCR0.
+        let mut host = FakeHost::intel();
+        host.enabled_xcr0 = Some(0b111);
+        let table = CpuidTable::build_from(
+            &host,
+            CpuBaseline::Host,
+            &[entry(0x4000_0000, 0, 0, (0, 0, 0, 0))],
+            2,
+        )
+        .unwrap();
+        let d0 = find(&table, 0xD, 0);
+        assert_eq!(d0.vce_eax, 0b111);
+        assert_eq!(d0.vce_ecx, 576 + 256);
+    }
+
+    #[test]
+    fn the_pmu_and_crystal_leaves_stay_hidden() {
+        // The kernel zeroes 0xA and 0x15 so a guest cannot derive the
+        // local APIC frequency; the table leaves them to the empty entry.
+        let table = CpuidTable::build_from(
+            &FakeHost::intel(),
+            CpuBaseline::Avx2,
+            &[],
+            2,
+        )
+        .unwrap();
+        assert!(table
+            .entries
+            .iter()
+            .all(|e| e.vce_function != 0xA && e.vce_function != 0x15));
     }
 
     #[test]
     fn entries_stay_sorted_after_extra_entries_are_folded_in() {
         // The kernel needs the table in eval order.
-        let extra = entry(0x4000_0000, 0, 0, 1, 0, 0, 0);
-        let table = CpuidTable::build(CpuBaseline::Avx2, &[extra])
-            .expect("a masked baseline always programs a table");
+        let extra = entry(0x4000_0000, 0, 0, (1, 0, 0, 0));
+        let table = CpuidTable::build_from(
+            &FakeHost::intel(),
+            CpuBaseline::Avx2,
+            &[extra],
+            2,
+        )
+        .expect("a masked baseline always programs a table");
 
         let mut sorted = table.entries.clone();
-        sorted.sort_by(bhyve_api::vcpu_cpuid_entry::eval_sort);
-        let keys = |v: &[bhyve_api::vcpu_cpuid_entry]| {
+        sorted.sort_by(vcpu_cpuid_entry::eval_sort);
+        let keys = |v: &[vcpu_cpuid_entry]| {
             v.iter()
                 .map(|e| (e.vce_function, e.vce_index))
                 .collect::<Vec<_>>()
         };
         assert_eq!(keys(&table.entries), keys(&sorted));
+    }
+
+    #[test]
+    fn id_width_counts_the_bits_an_id_needs() {
+        assert_eq!(id_width(1), 0);
+        assert_eq!(id_width(2), 1);
+        assert_eq!(id_width(3), 2);
+        assert_eq!(id_width(64), 6);
     }
 }

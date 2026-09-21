@@ -70,11 +70,7 @@ fn request(
         chain,
         head: 0,
         completion: detached_completion(&queue, physmap),
-        epoch: ctx
-            .access
-            .enter_current()
-            .expect("a session is open")
-            .epoch(),
+        tag: current_tag(&ctx.access, 0),
     }
 }
 
@@ -281,7 +277,7 @@ fn a_request_past_the_buffer_moves_every_byte() {
         chain: read_chain,
         head: 7,
         completion: detached_completion(&queue, &physmap),
-        epoch: 0,
+        tag: current_tag(&ctx.access, 0),
     };
     let mut bounce = Bounce::new();
     assert_eq!(
@@ -311,7 +307,7 @@ fn a_request_past_the_buffer_moves_every_byte() {
         chain: write_chain,
         head: 8,
         completion: detached_completion(&queue, &physmap),
-        epoch: 0,
+        tag: current_tag(&ctx.access, 0),
     };
     assert_eq!(
         run_request(&out, &limits, &ctx, &mut bounce, &req),

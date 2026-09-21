@@ -2,189 +2,130 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! NVMe 1.0 controller device emulation.
+//! NVMe 1.0 controller with one namespace.
 //!
-//! Implements a single-namespace NVMe controller with MSI-X interrupt
-//! delivery and async I/O via worker threads. The vCPU thread submits
-//! I/O requests through a channel and returns immediately; worker
-//! threads perform file I/O, write completion queue entries to guest
-//! memory, and fire MSI-X interrupts.
+//! Admin commands run on the vCPU that rang the doorbell. I/O commands
+//! go through a channel to a pool of worker threads that move data
+//! straight between the backing file and the guest pages named by the
+//! PRPs, then post the completion and raise MSI-X.
 //!
-//! # Architecture
-//!
-//! - BAR0: 64-bit MMIO (16 KiB) for controller registers + doorbells
-//! - BAR4: MMIO for MSI-X table/PBA
-//! - MSI-X capability at config offset 0x40
-//! - Admin commands processed synchronously during doorbell write
-//! - I/O commands dispatched to a pool of 4 worker threads
-//! - File I/O uses `pread`/`pwrite` on the raw fd (lock-free)
+//! BAR0 holds the registers and doorbells, BAR4 the MSI-X table.
 
 pub mod bits;
 
+mod admin;
+mod io;
+mod prp;
+mod queues;
+mod regs;
+mod workers;
+
+#[cfg(test)]
+mod tests;
+
 use std::fs::File;
-use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use vmm_core::common::RWOp;
-
-/// Page size for NVMe PRP entries (4 KiB).
-use vmm_core::common::PAGE_SIZE;
 use vmm_core::hdl::VmmHdl;
-use vmm_core::mem::{GuestIoVec, MemCtx, PhysMap};
-use vmm_core::mmio::{MmioBus, MmioFn};
+use vmm_core::mem::PhysMap;
+use vmm_core::mmio::MmioBus;
 
 use vmm_devices::blkdev::DiskCache;
-use vmm_devices::lifecycle::Indicator;
+use vmm_devices::lifecycle::{
+    DeviceStateError, Indicator, NvmeMigrateCq, NvmeMigrateSq,
+};
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{
     replay_migrate_pci_state, DeviceIdent, DeviceState, PciDevice,
 };
-use vmm_devices::pci::msix::{HdlMsiSink, MsixTable};
+use vmm_devices::pci::msix::{HdlMsiSink, MsiSink, MsixTable};
 use vmm_devices::pci::BarN;
+use vmm_devices::quiesce::DrainScope;
 use vmm_devices::{
     DeviceMigrateState, FlushError, FlushIntent, Lifecycle, QuiesceGate,
 };
 
 use bits::*;
+use io::{IoBackend, IoRequest};
+use queues::{CompQueue, NvmeState, SubQueue};
+use workers::io_worker;
 
-/// Number of I/O worker threads (matches C bhyve's blockif thread count).
+/// Matches the C bhyve blockif thread count.
 const NUM_WORKERS: usize = 8;
+
+/// How long a controller transition waits for the transfers already
+/// moving guest memory.
+#[derive(Clone, Copy)]
+pub(super) struct FenceBudgets {
+    /// A controller reset or a Delete Queue command.
+    pub(super) reset: Duration,
+    /// A shutdown, which flushes the write cache as well. This is the
+    /// budget the durable flush used to spend on its own quiesce.
+    pub(super) shutdown: Duration,
+}
+
+const FENCE_BUDGETS: FenceBudgets = FenceBudgets {
+    reset: Duration::from_secs(5),
+    shutdown: Duration::from_secs(30),
+};
 
 /// MSI-X capability offset in PCI config space.
 const MSIX_CAP_OFFSET: u8 = 0x40;
 
-// ---------------------------------------------------------------------------
-// Queue structures
-// ---------------------------------------------------------------------------
-
-struct SubQueue {
-    /// Guest physical address of the queue base.
-    base: u64,
-    /// Number of entries (1-based, max entries).
-    size: u16,
-    /// Head pointer (consumer side, advanced by controller).
-    head: u16,
-    /// Tail pointer (updated by guest via doorbell write).
-    tail: u16,
-    /// Associated completion queue ID.
-    cq_id: u16,
+/// Namespace geometry, fixed for the life of the controller.
+#[derive(Clone, Copy)]
+pub(super) struct Geometry {
+    pub(super) block_size: u32,
+    pub(super) total_blocks: u64,
 }
 
-struct CompQueue {
-    /// Guest physical address of the queue base.
-    base: u64,
-    /// Number of entries (1-based, max entries).
-    size: u16,
-    /// Head pointer (updated by guest via doorbell write).
-    head: u16,
-    /// Tail pointer (producer side, advanced by controller).
-    tail: u16,
-    /// Phase tag — toggles on each wrap of the CQ.
-    phase: bool,
-    /// MSI-X interrupt vector for this CQ.
-    iv: u16,
+/// What a controller is built from.
+///
+/// Tests inject a recording MSI sink and a backend that stalls on
+/// demand; production passes the VM handle and the file itself.
+pub(super) struct NvmeParts {
+    pub(super) file: Arc<File>,
+    pub(super) backend: Arc<dyn IoBackend>,
+    pub(super) read_only: bool,
+    pub(super) instance_id: u8,
+    pub(super) physmap: Arc<PhysMap>,
+    pub(super) msi: Arc<dyn MsiSink>,
+    pub(super) bus_mmio: Arc<MmioBus>,
+    pub(super) fences: FenceBudgets,
+    pub(super) log: slog::Logger,
 }
-
-fn io_queue_index(qid: u16) -> Option<usize> {
-    let idx = usize::from(qid.checked_sub(1)?);
-    (idx < MAX_IO_QUEUES).then_some(idx)
-}
-
-// ---------------------------------------------------------------------------
-// I/O request submitted to worker threads
-// ---------------------------------------------------------------------------
-
-struct IoRequest {
-    opcode: u8,
-    nsid: u32,
-    slba: u64,
-    nlb: u32,
-    prp1: u64,
-    prp2: u64,
-    sqid: u16,
-    cid: u16,
-    cq_id: u16,
-    /// Force Unit Access (NVMe 5.13, CDW12 bit 30). When set on a write
-    /// we must fsync after pwritev so the data is durable before
-    /// completion — the contract we're on the hook for because the
-    /// Identify Controller page advertises VWC=1.
-    fua: bool,
-}
-
-// ---------------------------------------------------------------------------
-// NVMe controller state (under lock)
-// ---------------------------------------------------------------------------
-
-struct NvmeState {
-    // Controller registers
-    cap: u64,
-    cc: u32,
-    csts: u32,
-    aqa: u32,
-    asq_base: u64,
-    acq_base: u64,
-
-    // Queues
-    admin_sq: Option<SubQueue>,
-    admin_cq: Option<CompQueue>,
-    io_sqs: [Option<SubQueue>; MAX_IO_QUEUES],
-    io_cqs: [Option<CompQueue>; MAX_IO_QUEUES],
-
-    // Pre-built Identify data
-    ctrl_ident: [u8; IDENT_CTRL_SIZE],
-    ns_ident: [u8; IDENT_NS_SIZE],
-
-    // Configuration
-    num_io_queues: u16,
-    block_size: u32,
-    total_blocks: u64,
-}
-
-// ---------------------------------------------------------------------------
-// NVMe controller
-// ---------------------------------------------------------------------------
 
 /// NVMe 1.0 controller implementing the PCI device trait.
-///
-/// Provides a single namespace backed by a file, with MSI-X interrupts
-/// and async I/O via worker threads.
 pub struct NvmeController {
-    pci_state: Mutex<DeviceState>,
-    msix: Arc<MsixTable>,
+    pub(super) pci_state: Mutex<DeviceState>,
+    pub(super) msix: Arc<MsixTable>,
     state: Mutex<NvmeState>,
     io_tx: Mutex<Option<mpsc::Sender<IoRequest>>>,
-    physmap: Arc<PhysMap>,
-    /// MMIO bus for BAR registration/unregistration.
-    bus_mmio: Arc<MmioBus>,
-    /// Currently registered BAR0 base address (if any).
-    registered_bar0: Mutex<Option<u64>>,
-    /// Currently registered BAR4 base address (if any).
-    registered_bar4: Mutex<Option<u64>>,
+    pub(super) physmap: Arc<PhysMap>,
+    pub(super) bus_mmio: Arc<MmioBus>,
+    pub(super) registered_bar0: Mutex<Option<u64>>,
+    pub(super) registered_bar4: Mutex<Option<u64>>,
     /// Weak self-reference for MMIO handler closures.
-    self_ref: Mutex<Option<std::sync::Weak<Self>>>,
-    /// Structured logger for bus registration diagnostics.
-    log: slog::Logger,
+    pub(super) self_ref: Mutex<Option<std::sync::Weak<Self>>>,
+    pub(super) log: slog::Logger,
     /// Zvol write-cache control.
     _cache: DiskCache,
-    /// The backing store, shared with every I/O worker.
-    _file: Arc<File>,
-    /// Lifecycle state indicator.
+    /// The backing store, kept for the durable flush.
+    file: Arc<File>,
+    /// The I/O worker pool, joined by [`Self::stop_workers`].
+    workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    pub(super) geometry: Geometry,
     indicator: Indicator,
-    gate: Arc<QuiesceGate>,
+    pub(super) gate: Arc<QuiesceGate>,
+    pub(super) fences: FenceBudgets,
 }
 
 impl NvmeController {
     /// Create a new NVMe controller.
-    ///
-    /// # Arguments
-    ///
-    /// - `file`: Backing storage file (owned, moved into workers).
-    /// - `read_only`: If true, writes return an error status.
-    /// - `physmap`: Guest physical memory map (shared with workers).
-    /// - `hdl`: VMM handle for MSI-X interrupt delivery.
     ///
     /// Bus registration failures go to a discarding logger. Use
     /// [`new_with_logger`](Self::new_with_logger) to see them.
@@ -219,49 +160,69 @@ impl NvmeController {
         log: slog::Logger,
     ) -> Arc<Self> {
         let file = Arc::new(file);
+        Self::build(NvmeParts {
+            backend: Arc::clone(&file) as Arc<dyn IoBackend>,
+            file,
+            read_only,
+            instance_id,
+            physmap,
+            msi: HdlMsiSink::new(hdl),
+            bus_mmio,
+            fences: FENCE_BUDGETS,
+            log,
+        })
+    }
 
-        // Enable zvol writeback cache (DKIOCSETWCE=1). NVMe's protocol has
-        // explicit FLUSH semantics, matching the writeback contract. Must
-        // happen before any I/O so first writes hit the fast path.
+    pub(super) fn build(parts: NvmeParts) -> Arc<Self> {
+        let NvmeParts {
+            file,
+            backend,
+            read_only,
+            instance_id,
+            physmap,
+            msi,
+            bus_mmio,
+            fences,
+            log,
+        } = parts;
+
+        // NVMe has explicit FLUSH semantics, so the zvol may run
+        // writeback. Set before any I/O so first writes hit the fast path.
         let cache = DiskCache::new(Arc::clone(&file), read_only);
 
-        // Determine disk geometry
         let file_len = file
             .metadata()
             .expect("nvme: failed to stat backing file")
             .len();
         let block_size: u32 = 512;
-        let total_blocks = file_len / u64::from(block_size);
+        let geometry = Geometry {
+            block_size,
+            total_blocks: file_len / u64::from(block_size),
+        };
 
-        // Build Identify data structures with unique serial per instance
         let serial = format!("TRITON-NVME-{:04}", instance_id);
         let ctrl_ident = build_identify_controller(
             &serial,
             "Triton VMM NVMe Controller",
             "1.0.0",
-            1, // max_namespaces
-            9, // mdts: 2^9 pages = 2 MiB max transfer (matches C bhyve)
-            MAX_IO_QUEUES as u16,
+            1,
+            MDTS_LOG2_PAGES,
+            // One controller per instance, and CNTLID 0 is reserved.
+            u16::from(instance_id) + 1,
         );
-        let ns_ident = build_identify_namespace(total_blocks, block_size);
+        let ns_ident = build_identify_namespace(
+            geometry.total_blocks,
+            block_size,
+            read_only,
+        );
 
-        // Build CAP register value:
-        // MQES = MAX_QUEUE_SIZE - 1 (0-based)
-        // CQR = 1 (contiguous queues required)
-        // TO = 1 (500 ms timeout)
-        // DSTRD = 0 (4-byte doorbell stride)
-        // CSS = NVM command set
-        // MPSMIN = 0 (4 KiB)
-        // MPSMAX = 0 (4 KiB)
+        // CQR: contiguous queues only. TO: 500 ms. DSTRD, MPSMIN and
+        // MPSMAX are zero: 4-byte doorbells, 4 KiB pages.
         let cap: u64 = (u64::from(MAX_QUEUE_SIZE - 1) << CAP_MQES_SHIFT)
             | CAP_CQR
             | (1u64 << CAP_TO_SHIFT)
-            | (0u64 << CAP_DSTRD_SHIFT)
-            | CAP_CSS_NVM
-            | (0u64 << CAP_MPSMIN_SHIFT)
-            | (0u64 << CAP_MPSMAX_SHIFT);
+            | CAP_CSS_NVM;
 
-        // PCI identity for NVMe
         let ident = DeviceIdent {
             vendor_id: PCI_VENDOR_ID,
             device_id: PCI_DEVICE_ID,
@@ -274,24 +235,16 @@ impl NvmeController {
         };
 
         let mut pci_state = DeviceState::new(ident);
-        // BAR0: 32-bit MMIO, 16 KiB for registers + doorbells
-        // Using 32-bit to ensure the firmware places it in the
-        // 3-4 GB MMIO gap where EPT traps reliably.
+        // A 32-bit BAR0 keeps the firmware placing it in the 3-4 GiB
+        // MMIO gap, where EPT traps reliably.
         pci_state.define_bar(BarN::BAR0, BarDefine::Mmio(BAR0_SIZE as u32));
-        // BAR0 consumes BAR0+BAR1 (64-bit), so BAR4 for MSI-X table
 
-        // Create MSI-X table
-        let msix =
-            Arc::new(MsixTable::new(NVME_MSIX_COUNT, HdlMsiSink::new(hdl)));
+        let msix = Arc::new(MsixTable::new(NVME_MSIX_COUNT, msi));
         let msix_bar_size = msix.bar_size() as u32;
-
-        // BAR4: MMIO for MSI-X table + PBA
         pci_state.define_bar(
             BarN::BAR4,
             BarDefine::Mmio(msix_bar_size.next_power_of_two().max(4096)),
         );
-
-        // Set capabilities pointer to our MSI-X cap
         pci_state.set_cap_ptr(MSIX_CAP_OFFSET);
 
         let nvme_state = NvmeState {
@@ -308,13 +261,11 @@ impl NvmeController {
             ctrl_ident,
             ns_ident,
             num_io_queues: MAX_IO_QUEUES as u16,
-            block_size,
-            total_blocks,
+            instances: 0,
+            fence_failed: false,
         };
 
-        // Create the I/O submission channel
         let (tx, rx) = mpsc::channel::<IoRequest>();
-
         let gate = Arc::new(QuiesceGate::new(NUM_WORKERS));
 
         let ctrl = Arc::new(Self {
@@ -329,35 +280,88 @@ impl NvmeController {
             self_ref: Mutex::new(None),
             log,
             _cache: cache,
-            _file: Arc::clone(&file),
+            file,
+            workers: Mutex::new(Vec::with_capacity(NUM_WORKERS)),
+            geometry,
             indicator: Indicator::new(),
             gate: Arc::clone(&gate),
+            fences,
         });
-        // Store weak self-reference for MMIO closures
         *ctrl.self_ref.lock().expect("self_ref lock") =
             Some(Arc::downgrade(&ctrl));
 
-        // Spawn I/O worker threads
         let rx = Arc::new(Mutex::new(rx));
+        let mut workers = Vec::with_capacity(NUM_WORKERS);
         for i in 0..NUM_WORKERS {
             let rx = Arc::clone(&rx);
-            let physmap = Arc::clone(&physmap);
-            let msix = Arc::clone(&msix);
-            let state_ref = Arc::clone(&ctrl);
+            let weak = Arc::downgrade(&ctrl);
             let gate = Arc::clone(&gate);
-            let file = Arc::clone(&file);
+            let backend = Arc::clone(&backend);
 
-            thread::Builder::new()
-                .name(format!("nvme-io-{}", i))
-                .spawn(move || {
-                    io_worker(
-                        rx, file, read_only, physmap, msix, state_ref, gate,
-                    );
-                })
-                .expect("nvme: failed to spawn I/O worker thread");
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("nvme-io-{}", i))
+                    .spawn(move || {
+                        io_worker(rx, backend, read_only, weak, gate);
+                    })
+                    .expect("nvme: failed to spawn I/O worker thread"),
+            );
         }
+        *ctrl.workers.lock().expect("nvme: workers lock") = workers;
 
         ctrl
+    }
+
+    /// Hold the workers off until the transfers already moving guest
+    /// memory have finished.
+    ///
+    /// Call with the state lock dropped: a worker needs it to post its
+    /// completion before it can park. The returned scope keeps new work
+    /// off the pool, so the caller holds it until it has published the
+    /// transition the fence protects. `None` means the budget passed
+    /// with a worker still able to reach guest pages.
+    #[must_use]
+    pub(super) fn fence_workers(
+        &self,
+        budget: Duration,
+    ) -> Option<DrainScope<'_>> {
+        let drain = self.gate.drain_scope();
+        if self.gate.wait_quiesced(budget) {
+            return Some(drain);
+        }
+        slog::error!(self.log, "nvme: I/O workers did not stop for a reset");
+        None
+    }
+
+    /// Disconnect the I/O channel and wait for the workers.
+    ///
+    /// Dropping the sender is the only thing that ends a worker, and
+    /// nothing else releases the backing fd or lets `DiskCache` put the
+    /// zvol write cache back the way it found it.
+    fn stop_workers(&self) {
+        drop(self.io_tx.lock().expect("nvme: io_tx lock").take());
+        // A parked worker never reaches the channel to see it close.
+        self.gate.resume();
+        let workers =
+            std::mem::take(&mut *self.workers.lock().expect("workers lock"));
+        // A worker that held the last reference runs this from `Drop`,
+        // so its own handle is in the list. Joining the running thread
+        // would deadlock; it is on its way out either way.
+        let me = thread::current().id();
+        for worker in workers {
+            if worker.thread().id() == me {
+                continue;
+            }
+            if worker.join().is_err() {
+                slog::error!(self.log, "nvme: I/O worker panicked");
+            }
+        }
+    }
+}
+
+impl Drop for NvmeController {
+    fn drop(&mut self) {
+        self.stop_workers();
     }
 }
 
@@ -453,1136 +457,6 @@ impl PciDevice for NvmeController {
 }
 
 // ---------------------------------------------------------------------------
-// BAR0 handling: controller registers + doorbells
-// ---------------------------------------------------------------------------
-
-impl NvmeController {
-    /// Unregister a recorded MMIO base and clear the record.
-    fn release_mmio(&self, bar: BarN, reg: &mut Option<u64>) {
-        if let Some(addr) = reg.take() {
-            if let Err(e) = self.bus_mmio.unregister(addr) {
-                slog::warn!(self.log, "nvme: MMIO unregister failed";
-                    "bar" => ?bar,
-                    "addr" => format!("{addr:#x}"),
-                    "error" => %e);
-            }
-        }
-    }
-
-    /// Update MMIO bus registration for BAR0 and BAR4.
-    fn update_mmio_registration(self: &Arc<Self>) {
-        let pci = self.pci_state.lock().expect("nvme: pci lock");
-        let mmio_enabled = pci
-            .command()
-            .contains(vmm_devices::pci::bits::RegCmd::MMIO_EN);
-
-        // Register both BAR0 and BAR4 on the MMIO bus
-        for (bar, reg_mutex) in [
-            (BarN::BAR0, &self.registered_bar0),
-            (BarN::BAR4, &self.registered_bar4),
-        ] {
-            let mut reg = reg_mutex.lock().expect("bar reg lock");
-            self.release_mmio(bar, &mut reg);
-            if !mmio_enabled {
-                continue;
-            }
-            let Some((def, addr)) = pci.bars().get(bar) else {
-                continue;
-            };
-            if addr == 0 || !def.is_mmio() {
-                continue;
-            }
-            let size = def.size();
-            let dev = Arc::clone(self);
-            let handler: Arc<MmioFn> =
-                Arc::new(move |offset: usize, rwo: RWOp<'_>| {
-                    dev.bar_rw(bar, offset, rwo);
-                });
-            match self.bus_mmio.register(addr, size, handler) {
-                Ok(()) => *reg = Some(addr),
-                // The controller now decodes nothing on this BAR.
-                Err(e) => {
-                    slog::error!(self.log,
-                        "nvme: MMIO register failed, BAR dark";
-                        "bar" => ?bar,
-                        "addr" => format!("{addr:#x}"),
-                        "size" => size,
-                        "error" => %e);
-                }
-            }
-        }
-    }
-
-    /// Handle BAR0 MMIO access (controller registers and doorbells).
-    fn bar0_rw(&self, offset: usize, rwo: RWOp<'_>) {
-        if offset < REG_DOORBELL_BASE {
-            self.reg_rw(offset, rwo);
-        } else {
-            self.doorbell_rw(offset, rwo);
-        }
-    }
-
-    /// Handle controller register reads/writes (offsets 0x00..0x38).
-    fn reg_rw(&self, offset: usize, rwo: RWOp<'_>) {
-        let mut st = self.state.lock().expect("nvme: state lock");
-        match rwo {
-            RWOp::Read(ro) => {
-                let val = match offset {
-                    REG_CAP => {
-                        // 8-byte register; handle 4-byte aligned reads
-                        if ro.len() == 8 {
-                            ro.write_u64(st.cap);
-                            return;
-                        }
-                        st.cap as u32
-                    }
-                    0x04 => (st.cap >> 32) as u32, // CAP high dword
-                    REG_VS => NVME_VS_1_0,
-                    REG_INTMS => 0, // unused with MSI-X
-                    REG_INTMC => 0,
-                    REG_CC => st.cc,
-                    REG_CSTS => st.csts,
-                    REG_AQA => st.aqa,
-                    REG_ASQ => {
-                        if ro.len() == 8 {
-                            ro.write_u64(st.asq_base);
-                            return;
-                        }
-                        st.asq_base as u32
-                    }
-                    0x2C => (st.asq_base >> 32) as u32,
-                    REG_ACQ => {
-                        if ro.len() == 8 {
-                            ro.write_u64(st.acq_base);
-                            return;
-                        }
-                        st.acq_base as u32
-                    }
-                    0x34 => (st.acq_base >> 32) as u32,
-                    _ => 0,
-                };
-                if ro.len() == 8 {
-                    ro.write_u64(u64::from(val));
-                } else {
-                    ro.write_dword_at(val, offset);
-                }
-            }
-            RWOp::Write(wo) => {
-                let val32 = wo.read_u32();
-                match offset {
-                    REG_CC => {
-                        let old_cc = st.cc;
-                        st.cc = val32;
-                        self.handle_cc_write(&mut st, old_cc, val32);
-                    }
-                    REG_AQA if (st.cc & CC_EN) == 0 => st.aqa = val32,
-                    REG_ASQ if (st.cc & CC_EN) == 0 => {
-                        if wo.len() == 8 {
-                            st.asq_base = wo.read_u64();
-                        } else {
-                            st.asq_base = (st.asq_base & 0xFFFF_FFFF_0000_0000)
-                                | u64::from(val32);
-                        }
-                    }
-                    0x2C if (st.cc & CC_EN) == 0 => {
-                        st.asq_base = (st.asq_base & 0x0000_0000_FFFF_FFFF)
-                            | (u64::from(val32) << 32);
-                    }
-                    REG_ACQ if (st.cc & CC_EN) == 0 => {
-                        if wo.len() == 8 {
-                            st.acq_base = wo.read_u64();
-                        } else {
-                            st.acq_base = (st.acq_base & 0xFFFF_FFFF_0000_0000)
-                                | u64::from(val32);
-                        }
-                    }
-                    0x34 if (st.cc & CC_EN) == 0 => {
-                        st.acq_base = (st.acq_base & 0x0000_0000_FFFF_FFFF)
-                            | (u64::from(val32) << 32);
-                    }
-                    // INTMS, INTMC: ignored (MSI-X mode)
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    /// Handle CC register write transitions (enable/disable/shutdown).
-    fn handle_cc_write(&self, st: &mut NvmeState, old_cc: u32, new_cc: u32) {
-        let was_enabled = (old_cc & CC_EN) != 0;
-        let now_enabled = (new_cc & CC_EN) != 0;
-
-        if !was_enabled && now_enabled {
-            // Controller enable: set up admin queues
-            let asqs = (st.aqa & AQA_ASQS_MASK) + 1;
-            let acqs = ((st.aqa >> AQA_ACQS_SHIFT) & AQA_ACQS_MASK) + 1;
-
-            st.admin_sq = Some(SubQueue {
-                base: st.asq_base,
-                size: asqs as u16,
-                head: 0,
-                tail: 0,
-                cq_id: 0,
-            });
-            st.admin_cq = Some(CompQueue {
-                base: st.acq_base,
-                size: acqs as u16,
-                head: 0,
-                tail: 0,
-                phase: true,
-                iv: 0,
-            });
-
-            st.csts |= CSTS_RDY;
-        } else if was_enabled && !now_enabled {
-            // Controller disable: tear down all queues
-            st.admin_sq = None;
-            st.admin_cq = None;
-            for sq in &mut st.io_sqs {
-                *sq = None;
-            }
-            for cq in &mut st.io_cqs {
-                *cq = None;
-            }
-            st.csts &= !CSTS_RDY;
-        }
-
-        // Handle shutdown notification
-        let shn = (new_cc >> CC_SHN_SHIFT) & CC_SHN_MASK;
-        if shn != SHST_NORMAL {
-            // Acknowledge shutdown complete
-            st.csts = (st.csts & !(CSTS_SHST_MASK << CSTS_SHST_SHIFT))
-                | (SHST_COMPLETE << CSTS_SHST_SHIFT);
-        }
-    }
-
-    /// Handle doorbell writes (offsets 0x1000+).
-    ///
-    /// Doorbell layout (DSTRD=0, 4-byte stride):
-    /// - 0x1000 + (2*qid + 0) * 4 = SQ tail doorbell for queue qid
-    /// - 0x1000 + (2*qid + 1) * 4 = CQ head doorbell for queue qid
-    #[inline]
-    fn doorbell_rw(&self, offset: usize, rwo: RWOp<'_>) {
-        // Doorbells are write-only; reads return 0
-        let wo = match rwo {
-            RWOp::Write(wo) => wo,
-            RWOp::Read(ro) => {
-                ro.write_u32(0);
-                return;
-            }
-        };
-
-        let db_offset = offset - REG_DOORBELL_BASE;
-        let db_index = db_offset / 4;
-        let qid = (db_index / 2) as u16;
-        let is_sq = db_index.is_multiple_of(2);
-        let new_val = wo.read_u32() as u16;
-
-        if is_sq {
-            self.sq_doorbell(qid, new_val);
-        } else {
-            self.cq_doorbell(qid, new_val);
-        }
-    }
-
-    /// Handle SQ tail doorbell write: process new submissions.
-    #[inline]
-    fn sq_doorbell(&self, qid: u16, new_tail: u16) {
-        if qid == ADMIN_QUEUE_ID {
-            self.admin_sq_doorbell(new_tail);
-        } else {
-            self.io_sq_doorbell(qid, new_tail);
-        }
-    }
-
-    /// Handle CQ head doorbell write: update head pointer.
-    #[inline]
-    fn cq_doorbell(&self, qid: u16, new_head: u16) {
-        let mut st = self.state.lock().expect("nvme: state lock");
-        if qid == ADMIN_QUEUE_ID {
-            if let Some(cq) = &mut st.admin_cq {
-                if new_head < cq.size {
-                    cq.head = new_head;
-                }
-            }
-        } else {
-            if let Some(idx) = io_queue_index(qid) {
-                if let Some(cq) = &mut st.io_cqs[idx] {
-                    if new_head < cq.size {
-                        cq.head = new_head;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Process admin SQ doorbell: parse and execute admin commands inline.
-    fn admin_sq_doorbell(&self, new_tail: u16) {
-        let mem = MemCtx::new(Arc::clone(&self.physmap));
-        let mut st = self.state.lock().expect("nvme: state lock");
-
-        // Update the tail pointer (validate against queue size)
-        match &mut st.admin_sq {
-            Some(sq) => {
-                if new_tail >= sq.size {
-                    return;
-                }
-                sq.tail = new_tail;
-            }
-            None => return,
-        }
-
-        // Process entries in a loop, re-borrowing each iteration to
-        // avoid holding a mutable borrow on admin_sq across the call
-        // to process_admin_cmd (which borrows the full NvmeState).
-        loop {
-            // Read the next SQE from guest memory (borrow admin_sq briefly)
-            let (sqe_gpa, sq_head, sq_size) = {
-                let sq = match &st.admin_sq {
-                    Some(sq) => sq,
-                    None => return,
-                };
-                if sq.head == sq.tail {
-                    break;
-                }
-                let sqe_offset = u64::from(sq.head) * SQE_SIZE as u64;
-                (sq.base + sqe_offset, sq.head, sq.size)
-            };
-
-            let mut sqe_buf = [0u8; SQE_SIZE];
-            if mem.read(sqe_gpa, &mut sqe_buf).is_err() {
-                // Advance head past the bad entry
-                if let Some(sq) = &mut st.admin_sq {
-                    sq.head = (sq.head + 1) % sq.size;
-                }
-                continue;
-            }
-
-            let opcode = sqe_buf[SQE_OPC];
-            let cid =
-                u16::from_le_bytes([sqe_buf[SQE_CID], sqe_buf[SQE_CID + 1]]);
-            let nsid = u32::from_le_bytes(
-                sqe_buf[SQE_NSID..SQE_NSID + 4].try_into().expect("4 bytes"),
-            );
-            let prp1 = u64::from_le_bytes(
-                sqe_buf[SQE_PRP1..SQE_PRP1 + 8].try_into().expect("8 bytes"),
-            );
-            let prp2 = u64::from_le_bytes(
-                sqe_buf[SQE_PRP2..SQE_PRP2 + 8].try_into().expect("8 bytes"),
-            );
-            let cdw10 = u32::from_le_bytes(
-                sqe_buf[SQE_CDW10..SQE_CDW10 + 4]
-                    .try_into()
-                    .expect("4 bytes"),
-            );
-            let cdw11 = u32::from_le_bytes(
-                sqe_buf[SQE_CDW11..SQE_CDW11 + 4]
-                    .try_into()
-                    .expect("4 bytes"),
-            );
-
-            // Advance the SQ head
-            if let Some(sq) = &mut st.admin_sq {
-                sq.head = (sq_head + 1) % sq_size;
-            }
-
-            // Now process the command with full NvmeState access
-            let (status, cdw0) = self.process_admin_cmd(
-                &mut st, &mem, opcode, cid, nsid, prp1, prp2, cdw10, cdw11,
-            );
-
-            // Write CQE to admin CQ
-            post_completion(
-                &mem,
-                &self.msix,
-                &mut st.admin_cq,
-                cdw0,
-                ADMIN_QUEUE_ID,
-                sq_head,
-                cid,
-                status,
-            );
-        }
-    }
-
-    /// Process a single admin command. Returns (status, cdw0_result).
-    fn process_admin_cmd(
-        &self,
-        st: &mut NvmeState,
-        mem: &MemCtx,
-        opcode: u8,
-        cid: u16,
-        nsid: u32,
-        prp1: u64,
-        prp2: u64,
-        cdw10: u32,
-        cdw11: u32,
-    ) -> (u16, u32) {
-        let _ = cid;
-        match opcode {
-            ADMIN_OPC_IDENTIFY => {
-                self.admin_identify(st, mem, nsid, prp1, prp2, cdw10)
-            }
-            ADMIN_OPC_CREATE_IO_CQ => {
-                Self::admin_create_io_cq(st, prp1, cdw10, cdw11)
-            }
-            ADMIN_OPC_CREATE_IO_SQ => {
-                Self::admin_create_io_sq(st, prp1, cdw10, cdw11)
-            }
-            ADMIN_OPC_DELETE_IO_SQ => self.admin_delete_io_sq(st, cdw10),
-            ADMIN_OPC_DELETE_IO_CQ => self.admin_delete_io_cq(st, cdw10),
-            ADMIN_OPC_GET_FEATURES => Self::admin_get_features(st, cdw10),
-            ADMIN_OPC_SET_FEATURES => {
-                Self::admin_set_features(st, cdw10, cdw11)
-            }
-            ADMIN_OPC_ABORT => {
-                // Abort: always report "command not found" (success).
-                // CDW0 bit 0 = 0 means the command was not found (no abort).
-                (SC_SUCCESS, 0)
-            }
-            ADMIN_OPC_GET_LOG_PAGE => {
-                // Minimal stub: return zeros
-                let len = ((cdw10 >> 16) as usize + 1) * 4;
-                let zeros = vec![0u8; len.min(4096)];
-                let _ = mem.write(prp1, &zeros);
-                (SC_SUCCESS, 0)
-            }
-            _ => (SC_INVALID_OPCODE | (SC_DNR), 0),
-        }
-    }
-
-    /// Identify command (CNS 0 = namespace, CNS 1 = controller).
-    fn admin_identify(
-        &self,
-        st: &NvmeState,
-        mem: &MemCtx,
-        nsid: u32,
-        prp1: u64,
-        prp2: u64,
-        cdw10: u32,
-    ) -> (u16, u32) {
-        let cns = (cdw10 & 0xFF) as u8;
-        let data: &[u8] = match cns {
-            IDENTIFY_CNS_NAMESPACE => {
-                if nsid != 1 {
-                    return (SC_INVALID_NS | SC_DNR, 0);
-                }
-                &st.ns_ident
-            }
-            IDENTIFY_CNS_CONTROLLER => &st.ctrl_ident,
-            _ => return (SC_INVALID_FIELD | SC_DNR, 0),
-        };
-
-        // Write 4096 bytes to guest memory via PRP
-        if write_to_prp(mem, prp1, prp2, data).is_err() {
-            return (SC_DATA_XFER_ERROR, 0);
-        }
-        (SC_SUCCESS, 0)
-    }
-
-    /// Create I/O Completion Queue.
-    fn admin_create_io_cq(
-        st: &mut NvmeState,
-        prp1: u64,
-        cdw10: u32,
-        cdw11: u32,
-    ) -> (u16, u32) {
-        let qid = (cdw10 & 0xFFFF) as u16;
-        let qsize = ((cdw10 >> 16) & 0xFFFF) + 1; // Convert 0-based to 1-based
-        let iv = ((cdw11 >> 16) & 0xFFFF) as u16;
-
-        let Some(idx) = io_queue_index(qid) else {
-            return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-        };
-        if qsize < 2 || qsize > u32::from(MAX_QUEUE_SIZE) {
-            return (SC_INVALID_QUEUE_SIZE | SC_DNR, 0);
-        }
-        let qsize = qsize as u16;
-
-        if st.io_cqs[idx].is_some() {
-            return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-        }
-
-        if !valid_queue_base(prp1) {
-            return (SC_INVALID_FIELD | SC_DNR, 0);
-        }
-
-        st.io_cqs[idx] = Some(CompQueue {
-            base: prp1,
-            size: qsize,
-            head: 0,
-            tail: 0,
-            phase: true,
-            iv,
-        });
-
-        (SC_SUCCESS, 0)
-    }
-
-    /// Create I/O Submission Queue.
-    fn admin_create_io_sq(
-        st: &mut NvmeState,
-        prp1: u64,
-        cdw10: u32,
-        cdw11: u32,
-    ) -> (u16, u32) {
-        let qid = (cdw10 & 0xFFFF) as u16;
-        let qsize = ((cdw10 >> 16) & 0xFFFF) + 1;
-        let cq_id = ((cdw11 >> 16) & 0xFFFF) as u16;
-
-        let Some(idx) = io_queue_index(qid) else {
-            return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-        };
-        if qsize < 2 || qsize > u32::from(MAX_QUEUE_SIZE) {
-            return (SC_INVALID_QUEUE_SIZE | SC_DNR, 0);
-        }
-        let qsize = qsize as u16;
-
-        if st.io_sqs[idx].is_some() {
-            return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-        }
-
-        // Verify the associated CQ exists
-        let Some(cq_idx) = io_queue_index(cq_id) else {
-            return (SC_INVALID_FIELD | SC_DNR, 0);
-        };
-        if st.io_cqs[cq_idx].is_none() {
-            return (SC_INVALID_FIELD | SC_DNR, 0);
-        }
-
-        if !valid_queue_base(prp1) {
-            return (SC_INVALID_FIELD | SC_DNR, 0);
-        }
-
-        st.io_sqs[idx] = Some(SubQueue {
-            base: prp1,
-            size: qsize,
-            head: 0,
-            tail: 0,
-            cq_id,
-        });
-
-        (SC_SUCCESS, 0)
-    }
-
-    /// Delete I/O Submission Queue.
-    fn admin_delete_io_sq(&self, st: &mut NvmeState, cdw10: u32) -> (u16, u32) {
-        let qid = (cdw10 & 0xFFFF) as u16;
-        let Some(idx) = io_queue_index(qid) else {
-            return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-        };
-        if st.io_sqs[idx].is_none() {
-            return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-        }
-        st.io_sqs[idx] = None;
-        (SC_SUCCESS, 0)
-    }
-
-    /// Delete I/O Completion Queue.
-    fn admin_delete_io_cq(&self, st: &mut NvmeState, cdw10: u32) -> (u16, u32) {
-        let qid = (cdw10 & 0xFFFF) as u16;
-        let Some(idx) = io_queue_index(qid) else {
-            return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-        };
-        if st.io_cqs[idx].is_none() {
-            return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-        }
-        // Verify no SQs reference this CQ
-        for sq in st.io_sqs.iter().flatten() {
-            if sq.cq_id == qid {
-                return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
-            }
-        }
-        st.io_cqs[idx] = None;
-        (SC_SUCCESS, 0)
-    }
-
-    /// Get Features command.
-    fn admin_get_features(st: &NvmeState, cdw10: u32) -> (u16, u32) {
-        let fid = (cdw10 & 0xFF) as u8;
-        match fid {
-            FEAT_NUM_QUEUES => {
-                // CDW0 bits 31:16 = num CQs allocated (0-based)
-                // CDW0 bits 15:0  = num SQs allocated (0-based)
-                let nq = u32::from(st.num_io_queues.saturating_sub(1));
-                (SC_SUCCESS, nq | (nq << 16))
-            }
-            FEAT_VOLATILE_WC => {
-                // Volatile write cache: report enabled
-                (SC_SUCCESS, 1)
-            }
-            FEAT_TEMP_THRESHOLD | FEAT_ERROR_RECOVERY | FEAT_POWER_MGMT
-            | FEAT_ARBITRATION | FEAT_INTR_COALESCING
-            | FEAT_INTR_VECTOR_CFG | FEAT_WRITE_ATOMICITY
-            | FEAT_ASYNC_EVENT_CFG => (SC_SUCCESS, 0),
-            _ => (SC_INVALID_FIELD | SC_DNR, 0),
-        }
-    }
-
-    /// Set Features command.
-    fn admin_set_features(
-        st: &mut NvmeState,
-        cdw10: u32,
-        cdw11: u32,
-    ) -> (u16, u32) {
-        let fid = (cdw10 & 0xFF) as u8;
-        match fid {
-            FEAT_NUM_QUEUES => {
-                // Guest requests N SQs and N CQs (0-based in CDW11)
-                let requested_sq = (cdw11 & 0xFFFF) + 1;
-                let requested_cq = ((cdw11 >> 16) & 0xFFFF) + 1;
-                let max = MAX_IO_QUEUES as u32;
-                let alloc_sq = requested_sq.min(max);
-                let alloc_cq = requested_cq.min(max);
-                st.num_io_queues = alloc_sq.min(alloc_cq) as u16;
-                let result_sq = alloc_sq.saturating_sub(1);
-                let result_cq = alloc_cq.saturating_sub(1);
-                (SC_SUCCESS, result_sq | (result_cq << 16))
-            }
-            FEAT_VOLATILE_WC => (SC_SUCCESS, 0),
-            FEAT_TEMP_THRESHOLD | FEAT_ERROR_RECOVERY | FEAT_POWER_MGMT
-            | FEAT_ARBITRATION | FEAT_INTR_COALESCING
-            | FEAT_INTR_VECTOR_CFG | FEAT_WRITE_ATOMICITY
-            | FEAT_ASYNC_EVENT_CFG => (SC_SUCCESS, 0),
-            _ => (SC_INVALID_FIELD | SC_DNR, 0),
-        }
-    }
-
-    /// Process I/O SQ doorbell: parse SQEs and submit to worker channel.
-    fn io_sq_doorbell(&self, qid: u16, new_tail: u16) {
-        let mem = MemCtx::new(Arc::clone(&self.physmap));
-        let mut st = self.state.lock().expect("nvme: state lock");
-
-        let Some(idx) = io_queue_index(qid) else {
-            return;
-        };
-
-        let sq = match &mut st.io_sqs[idx] {
-            Some(sq) => sq,
-            None => return,
-        };
-
-        let cq_id = sq.cq_id;
-        if new_tail >= sq.size {
-            return;
-        }
-        sq.tail = new_tail;
-
-        // Collect all new SQEs before releasing the lock
-        let mut requests = Vec::new();
-
-        while sq.head != sq.tail {
-            let sqe_offset = u64::from(sq.head) * SQE_SIZE as u64;
-            let sqe_gpa = sq.base + sqe_offset;
-
-            let mut sqe_buf = [0u8; SQE_SIZE];
-            if mem.read(sqe_gpa, &mut sqe_buf).is_err() {
-                sq.head = (sq.head + 1) % sq.size;
-                continue;
-            }
-
-            let opcode = sqe_buf[SQE_OPC];
-            let cid =
-                u16::from_le_bytes([sqe_buf[SQE_CID], sqe_buf[SQE_CID + 1]]);
-            let nsid = u32::from_le_bytes(
-                sqe_buf[SQE_NSID..SQE_NSID + 4].try_into().expect("4 bytes"),
-            );
-            let prp1 = u64::from_le_bytes(
-                sqe_buf[SQE_PRP1..SQE_PRP1 + 8].try_into().expect("8 bytes"),
-            );
-            let prp2 = u64::from_le_bytes(
-                sqe_buf[SQE_PRP2..SQE_PRP2 + 8].try_into().expect("8 bytes"),
-            );
-            let cdw10 = u32::from_le_bytes(
-                sqe_buf[SQE_CDW10..SQE_CDW10 + 4]
-                    .try_into()
-                    .expect("4 bytes"),
-            );
-            let cdw12 = u32::from_le_bytes(
-                sqe_buf[SQE_CDW12..SQE_CDW12 + 4]
-                    .try_into()
-                    .expect("4 bytes"),
-            );
-
-            // For NVM Read/Write: CDW10-11 = SLBA (64-bit), CDW12 bits 15:0 = NLB (0-based)
-            let slba = u64::from(cdw10)
-                | (u64::from(u32::from_le_bytes(
-                    sqe_buf[SQE_CDW11..SQE_CDW11 + 4]
-                        .try_into()
-                        .expect("4 bytes"),
-                )) << 32);
-            let nlb = (cdw12 & 0xFFFF) + 1; // Convert 0-based to 1-based
-                                            // NVMe 5.13: CDW12 bit 30 = Force Unit Access.
-            let fua = (cdw12 & (1u32 << 30)) != 0;
-
-            sq.head = (sq.head + 1) % sq.size;
-
-            requests.push(IoRequest {
-                opcode,
-                nsid,
-                slba,
-                nlb,
-                prp1,
-                prp2,
-                sqid: qid,
-                cid,
-                cq_id,
-                fua,
-            });
-        }
-
-        // Drop the state lock before sending to channel
-        drop(st);
-
-        // Send requests to worker threads
-        let tx_guard = self.io_tx.lock().expect("nvme: io_tx lock");
-        if let Some(tx) = tx_guard.as_ref() {
-            for req in requests {
-                // If the channel is disconnected, the workers have exited.
-                // Silently drop the request.
-                let _ = tx.send(req);
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// BAR4 handling: MSI-X table
-// ---------------------------------------------------------------------------
-
-impl NvmeController {
-    /// Handle BAR4 MMIO access (MSI-X table + PBA).
-    fn bar4_rw(&self, offset: usize, rwo: RWOp<'_>) {
-        let pba_offset = self.msix.pba_offset();
-        match rwo {
-            RWOp::Read(ro) => {
-                let val = if offset >= pba_offset {
-                    self.msix.pba_read(offset - pba_offset)
-                } else {
-                    self.msix.table_read(offset)
-                };
-                ro.write_dword(val)
-            }
-            RWOp::Write(wo) => {
-                let val = wo.read_dword();
-                // The PBA is read-only to the guest.
-                if offset < pba_offset {
-                    self.msix.table_write(offset, val);
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Completion queue helpers
-// ---------------------------------------------------------------------------
-
-/// Post a completion queue entry to guest memory and fire MSI-X.
-fn post_completion(
-    mem: &MemCtx,
-    msix: &MsixTable,
-    cq_opt: &mut Option<CompQueue>,
-    cdw0: u32,
-    sqid: u16,
-    sq_head: u16,
-    cid: u16,
-    status: u16,
-) {
-    let cq = match cq_opt.as_mut() {
-        Some(cq) => cq,
-        None => return,
-    };
-
-    // Check if CQ is full: (tail + 1) % size == head
-    let next_tail = if cq.tail + 1 >= cq.size {
-        0
-    } else {
-        cq.tail + 1
-    };
-    if next_tail == cq.head {
-        // CQ full -- drop the completion (guest must drain the queue)
-        return;
-    }
-
-    let cqe_offset = u64::from(cq.tail) * CQE_SIZE as u64;
-    let cqe_gpa = cq.base + cqe_offset;
-
-    // Build CQE (16 bytes)
-    let mut cqe = [0u8; CQE_SIZE];
-
-    // DW0: command-specific result
-    cqe[CQE_DW0..CQE_DW0 + 4].copy_from_slice(&cdw0.to_le_bytes());
-    // DW1: reserved (already zero)
-
-    // DW2: SQ head pointer + SQ ID
-    cqe[CQE_SQHD..CQE_SQHD + 2].copy_from_slice(&sq_head.to_le_bytes());
-    cqe[CQE_SQID..CQE_SQID + 2].copy_from_slice(&sqid.to_le_bytes());
-
-    // DW3: CID + Status (with phase bit in bit 0 of status field)
-    cqe[CQE_CID..CQE_CID + 2].copy_from_slice(&cid.to_le_bytes());
-
-    // Status field: bits 15:1 = status code, bit 0 = phase
-    let status_with_phase = (status << 1) | if cq.phase { 1 } else { 0 };
-    cqe[CQE_STATUS..CQE_STATUS + 2]
-        .copy_from_slice(&status_with_phase.to_le_bytes());
-
-    // Write CQE to guest memory
-    let _ = mem.write(cqe_gpa, &cqe);
-
-    // Advance CQ tail and toggle phase on wrap
-    let iv = cq.iv;
-    cq.tail += 1;
-    if cq.tail >= cq.size {
-        cq.tail = 0;
-        cq.phase = !cq.phase;
-    }
-
-    // Fire MSI-X interrupt
-    msix.fire(iv);
-}
-
-// ---------------------------------------------------------------------------
-// PRP handling
-// ---------------------------------------------------------------------------
-
-/// Resolve PRP entries into a list of (guest_physical_addr, length) segments.
-///
-/// For NVMe, PRP entry 1 is the first page (possibly unaligned start),
-/// PRP entry 2 is either a second page or a PRP list page for larger
-/// transfers.
-fn prp_collect(
-    mem: &MemCtx,
-    prp1: u64,
-    prp2: u64,
-    total_len: usize,
-) -> io::Result<Vec<(u64, usize)>> {
-    let mut segments = Vec::new();
-    let mut remaining = total_len;
-
-    if remaining == 0 {
-        return Ok(segments);
-    }
-
-    // PRP1: first page, possibly unaligned
-    let offset_in_page = (prp1 as usize) & (PAGE_SIZE - 1);
-    let first_len = (PAGE_SIZE - offset_in_page).min(remaining);
-    segments.push((prp1, first_len));
-    remaining -= first_len;
-
-    if remaining == 0 {
-        return Ok(segments);
-    }
-
-    // If remaining fits in a single page, PRP2 is a direct page address
-    if remaining <= PAGE_SIZE {
-        segments.push((prp2, remaining));
-        return Ok(segments);
-    }
-
-    // PRP2 points to a PRP list page
-    // Each entry in the PRP list is an 8-byte physical address
-    let max_entries = PAGE_SIZE / 8;
-    let list_gpa = prp2;
-    let mut entry_idx = 0;
-
-    while remaining > 0 && entry_idx < max_entries {
-        let entry_gpa = list_gpa + (entry_idx as u64) * 8;
-        let mut addr_buf = [0u8; 8];
-        mem.read(entry_gpa, &mut addr_buf)?;
-        let page_addr = u64::from_le_bytes(addr_buf);
-
-        let seg_len = PAGE_SIZE.min(remaining);
-        segments.push((page_addr, seg_len));
-        remaining -= seg_len;
-        entry_idx += 1;
-    }
-
-    if remaining > 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "PRP list insufficient for transfer size",
-        ));
-    }
-
-    Ok(segments)
-}
-
-/// Resolve PRP entries into a scatter list over guest memory.
-///
-/// The list pins the guest pages, so the transfer goes straight to
-/// them: no intermediate buffer, no copies.
-fn prp_to_iovec(
-    physmap: &PhysMap,
-    prp1: u64,
-    prp2: u64,
-    total_len: usize,
-) -> io::Result<GuestIoVec> {
-    let mut result = GuestIoVec::with_capacity(16);
-    let mut remaining = total_len;
-
-    if remaining == 0 {
-        return Ok(result);
-    }
-
-    // PRP1: first page, possibly unaligned
-    let offset_in_page = (prp1 as usize) & (PAGE_SIZE - 1);
-    let first_len = (PAGE_SIZE - offset_in_page).min(remaining);
-    let sub = physmap.lookup(prp1, first_len).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "PRP1 unmapped")
-    })?;
-    result.push(sub);
-    remaining -= first_len;
-
-    if remaining == 0 {
-        return Ok(result);
-    }
-
-    // If remaining fits in a single page, PRP2 is a direct page address
-    if remaining <= PAGE_SIZE {
-        let sub = physmap.lookup(prp2, remaining).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "PRP2 unmapped")
-        })?;
-        result.push(sub);
-        return Ok(result);
-    }
-
-    // PRP2 points to a PRP list page — read entries from guest memory
-    let max_entries = PAGE_SIZE / 8;
-    let mut entry_idx = 0;
-
-    while remaining > 0 && entry_idx < max_entries {
-        let entry_gpa = prp2 + (entry_idx as u64) * 8;
-        // Read the 8-byte PRP list entry from guest memory
-        let entry_sub = physmap.lookup(entry_gpa, 8).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "PRP list unmapped")
-        })?;
-        let mut addr_buf = [0u8; 8];
-        entry_sub.read_bytes(&mut addr_buf)?;
-        let page_addr = u64::from_le_bytes(addr_buf);
-
-        let seg_len = PAGE_SIZE.min(remaining);
-        let sub = physmap.lookup(page_addr, seg_len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "PRP page unmapped")
-        })?;
-        result.push(sub);
-        remaining -= seg_len;
-        entry_idx += 1;
-    }
-
-    if remaining > 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "PRP list insufficient for transfer size",
-        ));
-    }
-
-    Ok(result)
-}
-
-/// Write data to guest memory using PRP entries (for Identify etc.).
-fn write_to_prp(
-    mem: &MemCtx,
-    prp1: u64,
-    prp2: u64,
-    data: &[u8],
-) -> io::Result<()> {
-    let segments = prp_collect(mem, prp1, prp2, data.len())?;
-    let mut offset = 0;
-    for (gpa, len) in segments {
-        mem.write(gpa, &data[offset..offset + len])?;
-        offset += len;
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// I/O worker thread
-// ---------------------------------------------------------------------------
-
-/// Whether a guest-supplied queue base may be used: page-aligned and
-/// non-zero. A malicious guest could otherwise point a queue at the
-/// MMIO region of another device.
-fn valid_queue_base(prp1: u64) -> bool {
-    prp1 != 0 && (prp1 & 0xFFF) == 0
-}
-
-/// Worker thread loop: reads I/O requests from the channel and executes them.
-///
-/// Uses `pread`/`pwrite` on the raw fd for lock-free concurrent I/O.
-/// Each completed request posts a CQE to guest memory and fires MSI-X.
-fn io_worker(
-    rx: Arc<Mutex<mpsc::Receiver<IoRequest>>>,
-    file: Arc<File>,
-    read_only: bool,
-    physmap: Arc<PhysMap>,
-    msix: Arc<MsixTable>,
-    ctrl: Arc<NvmeController>,
-    gate: Arc<QuiesceGate>,
-) {
-    use std::sync::mpsc::RecvTimeoutError;
-
-    loop {
-        // Acquire the receiver lock only to get the next message
-        let req = {
-            let rx_guard = rx.lock().expect("nvme: io_rx lock");
-            match rx_guard.recv_timeout(Duration::from_millis(50)) {
-                Ok(req) => req,
-                Err(RecvTimeoutError::Timeout) => {
-                    drop(rx_guard);
-                    gate.park_if_paused();
-                    continue;
-                }
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-        };
-
-        let status =
-            process_io_request(&req, &file, read_only, &physmap, &ctrl);
-        // Post completion: need to lock state briefly to access the CQ
-        let mem = MemCtx::new(Arc::clone(&physmap));
-        let sq_head = {
-            let st = ctrl.state.lock().expect("nvme: state lock");
-            if let Some(idx) = io_queue_index(req.sqid) {
-                st.io_sqs[idx].as_ref().map(|sq| sq.head).unwrap_or(0)
-            } else {
-                0
-            }
-        };
-
-        let mut st = ctrl.state.lock().expect("nvme: state lock");
-        if let Some(cq_idx) = io_queue_index(req.cq_id) {
-            post_completion(
-                &mem,
-                &msix,
-                &mut st.io_cqs[cq_idx],
-                0,
-                req.sqid,
-                sq_head,
-                req.cid,
-                status,
-            );
-        }
-    }
-}
-
-/// Execute a single I/O request (Read, Write, or Flush).
-///
-/// Returns the NVMe status code for the completion entry.
-fn process_io_request(
-    req: &IoRequest,
-    file: &File,
-    read_only: bool,
-    physmap: &Arc<PhysMap>,
-    ctrl: &NvmeController,
-) -> u16 {
-    // Validate namespace
-    if req.nsid != 1 {
-        return SC_INVALID_NS | SC_DNR;
-    }
-
-    let (block_size, total_blocks) = {
-        let st = ctrl.state.lock().expect("nvme: state lock");
-        (st.block_size, st.total_blocks)
-    };
-
-    let byte_count = match (req.nlb as u64).checked_mul(u64::from(block_size)) {
-        Some(n) => n as usize,
-        None => return SC_INVALID_FIELD | SC_DNR,
-    };
-    // MDTS check: 2^9 pages = 2 MiB max transfer
-    const MAX_XFER_SIZE: usize = (1 << 9) * 4096;
-    if byte_count > MAX_XFER_SIZE {
-        return SC_INVALID_FIELD | SC_DNR;
-    }
-    let byte_offset = match req.slba.checked_mul(u64::from(block_size)) {
-        Some(n) => n,
-        None => return SC_INVALID_FIELD | SC_DNR,
-    };
-
-    // Bounds check (overflow in addition means out of bounds)
-    if req
-        .slba
-        .checked_add(u64::from(req.nlb))
-        .is_none_or(|end| end > total_blocks)
-    {
-        return SC_INVALID_FIELD | SC_DNR;
-    }
-
-    match req.opcode {
-        NVM_OPC_READ => {
-            // Zero-copy: preadv directly into guest mmap'd pages
-            let Ok(iov) = prp_to_iovec(physmap, req.prp1, req.prp2, byte_count)
-            else {
-                return SC_DATA_XFER_ERROR;
-            };
-            match iov.read_from(file, byte_offset) {
-                Ok(n) if n == byte_count => SC_SUCCESS,
-                _ => SC_DATA_XFER_ERROR,
-            }
-        }
-        NVM_OPC_WRITE => {
-            if read_only {
-                return SC_DATA_XFER_ERROR;
-            }
-            // Zero-copy: pwritev directly from guest mmap'd pages
-            let Ok(iov) = prp_to_iovec(physmap, req.prp1, req.prp2, byte_count)
-            else {
-                return SC_DATA_XFER_ERROR;
-            };
-            match iov.write_to(file, byte_offset) {
-                Ok(n) if n == byte_count => {}
-                _ => return SC_DATA_XFER_ERROR,
-            }
-            // FUA: Identify Controller advertises VWC=1, so FUA writes
-            // must be durable before completion. Without this, a guest
-            // filesystem journal commit can report success while the data
-            // still lives in zvol writeback cache.
-            if req.fua && file.sync_data().is_err() {
-                return SC_INTERNAL_ERROR;
-            }
-            SC_SUCCESS
-        }
-        NVM_OPC_FLUSH => {
-            if file.sync_data().is_err() {
-                return SC_INTERNAL_ERROR;
-            }
-            SC_SUCCESS
-        }
-        _ => SC_INVALID_OPCODE | SC_DNR,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Default impl for Option arrays
-// ---------------------------------------------------------------------------
-
-// SubQueue and CompQueue don't implement Copy/Clone, so we need a manual
-// Default for the fixed-size arrays.
-impl Default for NvmeState {
-    fn default() -> Self {
-        // This is only used internally; the real init is in NvmeController::new
-        Self {
-            cap: 0,
-            cc: 0,
-            csts: 0,
-            aqa: 0,
-            asq_base: 0,
-            acq_base: 0,
-            admin_sq: None,
-            admin_cq: None,
-            io_sqs: Default::default(),
-            io_cqs: Default::default(),
-            ctrl_ident: [0u8; IDENT_CTRL_SIZE],
-            ns_ident: [0u8; IDENT_NS_SIZE],
-            num_io_queues: MAX_IO_QUEUES as u16,
-            block_size: 512,
-            total_blocks: 0,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Lifecycle implementation
 // ---------------------------------------------------------------------------
 
@@ -1618,380 +492,273 @@ impl Lifecycle for NvmeController {
 
     fn halt(&self) {
         self.indicator.halt();
+        self.stop_workers();
     }
 
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
-        vmm_devices::quiesce::flush_file(
-            &self.gate,
-            &self._file,
-            intent,
-            "nvme",
-        )
+        vmm_devices::quiesce::flush_file(&self.gate, &self.file, intent, "nvme")
     }
 
-    fn export_migrate_state(&self) -> Option<DeviceMigrateState> {
+    fn export_migrate_state(
+        &self,
+    ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {
         use vmm_devices::lifecycle::{
             NvmeMigrateCq, NvmeMigrateSq, NvmeMigrateState,
         };
 
         let st = self.state.lock().expect("nvme state lock");
 
-        // Only export if the controller is enabled (has active queues)
+        // A disabled controller has no queues, so there is nothing for
+        // the destination to put back.
         if (st.cc & CC_EN) == 0 {
-            return None;
+            return Ok(None);
         }
 
-        let admin_sq = st.admin_sq.as_ref().map(|sq| NvmeMigrateSq {
+        let wire_sq = |sq: &SubQueue| NvmeMigrateSq {
             base: sq.base,
             size: sq.size,
             head: sq.head,
             tail: sq.tail,
             cq_id: sq.cq_id,
-        });
-        let admin_cq = st.admin_cq.as_ref().map(|cq| NvmeMigrateCq {
+        };
+        let wire_cq = |cq: &CompQueue| NvmeMigrateCq {
             base: cq.base,
             size: cq.size,
             head: cq.head,
             tail: cq.tail,
             phase: cq.phase,
             iv: cq.iv,
-        });
-        let io_sqs = st
-            .io_sqs
-            .iter()
-            .map(|sq| {
-                sq.as_ref().map(|sq| NvmeMigrateSq {
-                    base: sq.base,
-                    size: sq.size,
-                    head: sq.head,
-                    tail: sq.tail,
-                    cq_id: sq.cq_id,
-                })
-            })
-            .collect();
-        let io_cqs = st
-            .io_cqs
-            .iter()
-            .map(|cq| {
-                cq.as_ref().map(|cq| NvmeMigrateCq {
-                    base: cq.base,
-                    size: cq.size,
-                    head: cq.head,
-                    tail: cq.tail,
-                    phase: cq.phase,
-                    iv: cq.iv,
-                })
-            })
-            .collect();
+            ien: cq.ien,
+        };
 
-        let pci = self.pci_state.lock().expect("pci lock").migrate_state();
-        let pci_command = pci.command;
-        let pci_bar_addrs = pci.bar_addrs;
+        slog::info!(self.log, "nvme: exporting controller state";
+            "cc" => format!("{:#x}", st.cc),
+            "csts" => format!("{:#x}", st.csts),
+            "aqa" => format!("{:#x}", st.aqa),
+            "io_queues" => st.num_io_queues,
+            "msix_enabled" => self.msix.is_enabled());
 
-        // Export MSI-X table entries
-        let msix_count = self.msix.count();
-        let msix_entries: Vec<(u64, u64)> =
-            (0..msix_count).map(|v| self.msix.read_entry(v)).collect();
-        let msix_enabled = self.msix.is_enabled();
-
-        eprintln!(
-            "[nvme-export] cc={:#x} csts={:#x} aqa={:#x} io_queues={} msix_enabled={}",
-            st.cc, st.csts, st.aqa, st.num_io_queues, msix_enabled,
-        );
-
-        Some(DeviceMigrateState::Nvme(NvmeMigrateState {
+        Ok(Some(DeviceMigrateState::Nvme(NvmeMigrateState {
             cc: st.cc,
             csts: st.csts,
             aqa: st.aqa,
             asq_base: st.asq_base,
             acq_base: st.acq_base,
-            admin_sq,
-            admin_cq,
-            io_sqs,
-            io_cqs,
+            admin_sq: st.admin_sq.as_ref().map(wire_sq),
+            admin_cq: st.admin_cq.as_ref().map(wire_cq),
+            io_sqs: st
+                .io_sqs
+                .iter()
+                .map(|sq| sq.as_ref().map(wire_sq))
+                .collect(),
+            io_cqs: st
+                .io_cqs
+                .iter()
+                .map(|cq| cq.as_ref().map(wire_cq))
+                .collect(),
             num_io_queues: st.num_io_queues,
-            pci_command,
-            pci_bar_addrs,
-            msix_entries,
-            msix_enabled,
-        }))
+            pci: self.pci_state.lock().expect("pci lock").migrate_state(),
+            msix: self.msix.export_state(),
+        })))
     }
 
-    fn restore_migrate_state(&self, state: &DeviceMigrateState) {
+    fn restore_migrate_state(
+        &self,
+        state: &DeviceMigrateState,
+    ) -> Result<(), DeviceStateError> {
         let DeviceMigrateState::Nvme(mig) = state else {
-            return;
+            return Err(DeviceStateError::WrongKind {
+                want: "nvme",
+                got: state.kind(),
+            });
         };
-        eprintln!(
-            "[nvme-restore] cc={:#x} csts={:#x} aqa={:#x} io_queues={} msix_enabled={}",
-            mig.cc, mig.csts, mig.aqa, mig.num_io_queues, mig.msix_enabled,
-        );
+        // Every field is checked before any of it is applied. The
+        // doorbell handlers divide by a queue size and index a ring by
+        // head and tail, so a payload the checks let through would
+        // abort the VMM on the guest's first doorbell write.
+        check_nvme_state(mig)?;
 
-        // Restore PCI BAR addresses and command register
+        slog::info!(self.log, "nvme: restoring controller state";
+            "cc" => format!("{:#x}", mig.cc),
+            "csts" => format!("{:#x}", mig.csts),
+            "aqa" => format!("{:#x}", mig.aqa),
+            "io_queues" => mig.num_io_queues);
+
         let bar_writes = self
             .pci_state
             .lock()
             .expect("pci lock")
-            .bar_replay_writes(&mig.pci_bar_addrs);
-        replay_migrate_pci_state(self, &bar_writes, mig.pci_command);
+            .bar_replay_writes(&mig.pci.bar_addrs);
+        replay_migrate_pci_state(self, &bar_writes, mig.pci.command);
 
-        // Restore controller state
         let mut st = self.state.lock().expect("nvme state lock");
         st.cc = mig.cc;
         st.csts = mig.csts;
         st.aqa = mig.aqa;
         st.asq_base = mig.asq_base;
         st.acq_base = mig.acq_base;
-        st.num_io_queues = mig.num_io_queues.clamp(1, MAX_IO_QUEUES as u16);
+        st.num_io_queues = mig.num_io_queues;
 
-        // Restore admin queues
-        st.admin_sq = mig.admin_sq.as_ref().map(|sq| SubQueue {
+        // One fresh instance for every imported queue: nothing from
+        // before the import may complete into one.
+        let instance = st.next_instance();
+
+        let live_sq = |sq: &NvmeMigrateSq| SubQueue {
             base: sq.base,
             size: sq.size,
             head: sq.head,
             tail: sq.tail,
             cq_id: sq.cq_id,
-        });
-        st.admin_cq = mig.admin_cq.as_ref().map(|cq| CompQueue {
+            instance,
+        };
+        let live_cq = |cq: &NvmeMigrateCq| CompQueue {
             base: cq.base,
             size: cq.size,
             head: cq.head,
             tail: cq.tail,
             phase: cq.phase,
             iv: cq.iv,
-        });
+            ien: cq.ien,
+            instance,
+        };
 
-        // Restore I/O queues
-        for (idx, sq_opt) in mig.io_sqs.iter().enumerate() {
-            if idx < MAX_IO_QUEUES {
-                st.io_sqs[idx] = sq_opt.as_ref().map(|sq| SubQueue {
-                    base: sq.base,
-                    size: sq.size,
-                    head: sq.head,
-                    tail: sq.tail,
-                    cq_id: sq.cq_id,
-                });
-            }
+        st.admin_sq = mig.admin_sq.as_ref().map(live_sq);
+        st.admin_cq = mig.admin_cq.as_ref().map(live_cq);
+        for (slot, wire) in st.io_sqs.iter_mut().zip(&mig.io_sqs) {
+            *slot = wire.as_ref().map(live_sq);
         }
-        for (idx, cq_opt) in mig.io_cqs.iter().enumerate() {
-            if idx < MAX_IO_QUEUES {
-                st.io_cqs[idx] = cq_opt.as_ref().map(|cq| CompQueue {
-                    base: cq.base,
-                    size: cq.size,
-                    head: cq.head,
-                    tail: cq.tail,
-                    phase: cq.phase,
-                    iv: cq.iv,
-                });
-            }
+        for (slot, wire) in st.io_cqs.iter_mut().zip(&mig.io_cqs) {
+            *slot = wire.as_ref().map(live_cq);
         }
         drop(st);
 
-        // Restore MSI-X table entries and enable flag
-        for (v, &(addr, data)) in mig.msix_entries.iter().enumerate() {
-            self.msix.write_entry(v as u16, addr, data);
-        }
-        self.msix.set_enabled(mig.msix_enabled);
+        self.msix.import_state(&mig.msix).map_err(|error| {
+            DeviceStateError::invalid(format!("MSI-X table: {error}"))
+        })
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Everything a controller payload must satisfy before any of it is
+/// applied, matching what the guest-facing create-queue commands
+/// enforce.
+fn check_nvme_state(
+    mig: &vmm_devices::lifecycle::NvmeMigrateState,
+) -> Result<(), DeviceStateError> {
+    use vmm_devices::lifecycle::{NvmeMigrateCq, NvmeMigrateSq};
 
-    struct NvmeQuiesceTestDevice {
-        gate: Arc<QuiesceGate>,
-    }
+    use self::queues::{io_queue_index, valid_queue_base};
 
-    impl Lifecycle for NvmeQuiesceTestDevice {
-        fn type_name(&self) -> &'static str {
-            "nvme"
+    fn check_size(what: &str, size: u16) -> Result<(), DeviceStateError> {
+        // The doorbell handlers take `% size`, so 0 divides by zero and
+        // aborts a VMM built with panic = "abort".
+        if !(2..=MAX_QUEUE_SIZE).contains(&size) {
+            return Err(DeviceStateError::invalid(format!(
+                "{what} size {size} is outside 2..={MAX_QUEUE_SIZE}",
+            )));
         }
+        Ok(())
+    }
 
-        fn is_quiesced(&self) -> bool {
-            self.gate.is_quiesced()
+    fn check_cursors(
+        what: &str,
+        size: u16,
+        head: u16,
+        tail: u16,
+    ) -> Result<(), DeviceStateError> {
+        if head >= size || tail >= size {
+            return Err(DeviceStateError::invalid(format!(
+                "{what} head {head} / tail {tail} outside a {size}-entry ring",
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_base(what: &str, base: u64) -> Result<(), DeviceStateError> {
+        if !valid_queue_base(base) {
+            return Err(DeviceStateError::invalid(format!(
+                "{what} base {base:#x} is zero or not page-aligned",
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_vector(what: &str, iv: u16) -> Result<(), DeviceStateError> {
+        // `MsixTable::fire` drops a vector the table does not hold, so
+        // the queue would never raise and its I/O would hang. Create
+        // I/O Completion Queue refuses the same value.
+        if iv >= NVME_MSIX_COUNT {
+            return Err(DeviceStateError::invalid(format!(
+                "{what} interrupt vector {iv} is outside \
+                 0..{NVME_MSIX_COUNT}",
+            )));
+        }
+        Ok(())
+    }
+
+    let check_cq =
+        |what: &str, cq: &NvmeMigrateCq| -> Result<(), DeviceStateError> {
+            check_size(what, cq.size)?;
+            check_cursors(what, cq.size, cq.head, cq.tail)?;
+            check_vector(what, cq.iv)?;
+            check_base(what, cq.base)
+        };
+
+    if !(1..=MAX_IO_QUEUES as u16).contains(&mig.num_io_queues) {
+        return Err(DeviceStateError::invalid(format!(
+            "num_io_queues {} is outside 1..={MAX_IO_QUEUES}",
+            mig.num_io_queues,
+        )));
+    }
+    if mig.io_sqs.len() > MAX_IO_QUEUES || mig.io_cqs.len() > MAX_IO_QUEUES {
+        return Err(DeviceStateError::invalid(format!(
+            "payload carries {} SQs and {} CQs, this controller has \
+             {MAX_IO_QUEUES} of each",
+            mig.io_sqs.len(),
+            mig.io_cqs.len(),
+        )));
+    }
+
+    if let Some(cq) = &mig.admin_cq {
+        check_cq("admin CQ", cq)?;
+    }
+    for (idx, cq) in mig.io_cqs.iter().enumerate() {
+        if let Some(cq) = cq {
+            check_cq(&format!("IO CQ {}", idx + 1), cq)?;
         }
     }
 
-    #[test]
-    fn quiesce_query_is_non_blocking_with_active_worker() {
-        let device: Arc<dyn Lifecycle> = Arc::new(NvmeQuiesceTestDevice {
-            gate: Arc::new(QuiesceGate::new(1)),
-        });
+    // A submission queue names the completion queue its results go to.
+    // An SQ whose CQ does not exist would post completions through a
+    // `None` slot, or into another queue's ring.
+    let cq_exists = |cq_id: u16| -> bool {
+        if cq_id == 0 {
+            return mig.admin_cq.is_some();
+        }
+        io_queue_index(cq_id)
+            .and_then(|idx| mig.io_cqs.get(idx))
+            .is_some_and(|slot| slot.is_some())
+    };
+    let check_sq =
+        |what: &str, sq: &NvmeMigrateSq| -> Result<(), DeviceStateError> {
+            check_size(what, sq.size)?;
+            check_cursors(what, sq.size, sq.head, sq.tail)?;
+            check_base(what, sq.base)?;
+            if !cq_exists(sq.cq_id) {
+                return Err(DeviceStateError::invalid(format!(
+                    "{what} posts to CQ {}, which the payload does not create",
+                    sq.cq_id,
+                )));
+            }
+            Ok(())
+        };
 
-        let probe = Arc::clone(&device);
-        assert!(!vmm_devices_testsupport::assert_query_non_blocking(
-            move || probe.is_quiesced()
-        ));
+    if let Some(sq) = &mig.admin_sq {
+        check_sq("admin SQ", sq)?;
     }
-
-    #[test]
-    fn cap_register_value() {
-        // Verify CAP register encoding
-        let mqes = MAX_QUEUE_SIZE - 1;
-        let cap: u64 = (u64::from(mqes) << CAP_MQES_SHIFT)
-            | CAP_CQR
-            | (1u64 << CAP_TO_SHIFT)
-            | CAP_CSS_NVM;
-        // MQES should be in bits 15:0
-        assert_eq!((cap & CAP_MQES_MASK) as u16, mqes);
-        // CQR bit 16
-        assert_ne!(cap & CAP_CQR, 0);
-        // CSS NVM bit 37
-        assert_ne!(cap & CAP_CSS_NVM, 0);
+    for (idx, sq) in mig.io_sqs.iter().enumerate() {
+        if let Some(sq) = sq {
+            check_sq(&format!("IO SQ {}", idx + 1), sq)?;
+        }
     }
-
-    #[test]
-    fn cqe_phase_bit_encoding() {
-        // Phase bit is bit 0 of the status word in CQE
-        let status: u16 = SC_SUCCESS;
-        let phase = true;
-        let encoded = (status << 1) | if phase { 1 } else { 0 };
-        assert_eq!(encoded & 1, 1); // phase set
-        assert_eq!(encoded >> 1, SC_SUCCESS);
-    }
-
-    #[test]
-    fn doorbell_index_calculation() {
-        // SQ tail doorbell for queue 0 is at offset 0x1000
-        let offset = REG_DOORBELL_BASE;
-        let db_offset = offset - REG_DOORBELL_BASE;
-        let db_index = db_offset / 4;
-        let qid = db_index / 2;
-        let is_sq = db_index.is_multiple_of(2);
-        assert_eq!(qid, 0);
-        assert!(is_sq);
-
-        // CQ head doorbell for queue 0 is at offset 0x1004
-        let offset = REG_DOORBELL_BASE + 4;
-        let db_offset = offset - REG_DOORBELL_BASE;
-        let db_index = db_offset / 4;
-        let qid = db_index / 2;
-        let is_sq = db_index.is_multiple_of(2);
-        assert_eq!(qid, 0);
-        assert!(!is_sq);
-
-        // SQ tail doorbell for queue 1 is at offset 0x1008
-        let offset = REG_DOORBELL_BASE + 8;
-        let db_offset = offset - REG_DOORBELL_BASE;
-        let db_index = db_offset / 4;
-        let qid = db_index / 2;
-        let is_sq = db_index.is_multiple_of(2);
-        assert_eq!(qid, 1);
-        assert!(is_sq);
-    }
-
-    #[test]
-    fn prp_single_page() {
-        // When total_len fits in one page, only PRP1 is used
-        // This is a structural test of the logic (can't test without MemCtx)
-        let offset_in_page = 0x100usize;
-        let _prp1_addr = 0x1000u64 + offset_in_page as u64;
-        let first_len = (PAGE_SIZE - offset_in_page).min(512);
-        assert_eq!(first_len, 512); // 512 < 3840
-    }
-
-    #[test]
-    fn status_code_encoding() {
-        // DNR flag should be bit 14
-        assert_eq!(SC_DNR, 1 << 14);
-        // Invalid opcode with DNR
-        let status = SC_INVALID_OPCODE | SC_DNR;
-        assert_ne!(status & SC_DNR, 0);
-        assert_eq!(status & !SC_DNR, SC_INVALID_OPCODE);
-    }
-
-    #[test]
-    fn create_io_cq_with_cq_id_zero_is_rejected() {
-        let mut state = NvmeState::default();
-        let qid = 1u32;
-        let qsize = 1u32 << 16;
-        let cq_id = 0u32 << 16;
-
-        let status = NvmeController::admin_create_io_sq(
-            &mut state,
-            0x1000,
-            qid | qsize,
-            cq_id,
-        );
-
-        assert_eq!(status, (SC_INVALID_FIELD | SC_DNR, 0));
-    }
-
-    #[test]
-    fn num_queues_max_request_stays_nonzero() {
-        let mut state = NvmeState::default();
-
-        let set_result = NvmeController::admin_set_features(
-            &mut state,
-            u32::from(FEAT_NUM_QUEUES),
-            u32::MAX,
-        );
-
-        let allocated = (MAX_IO_QUEUES as u32) - 1;
-        assert_eq!(set_result, (SC_SUCCESS, allocated | (allocated << 16)));
-        assert_eq!(state.num_io_queues, MAX_IO_QUEUES as u16);
-        assert_ne!(state.num_io_queues, 0);
-        assert_eq!(
-            NvmeController::admin_get_features(
-                &state,
-                u32::from(FEAT_NUM_QUEUES),
-            ),
-            set_result
-        );
-    }
-
-    #[test]
-    fn create_io_queues_reject_max_qsize_without_overflow() {
-        let cdw10 = 1 | (u32::from(u16::MAX) << 16);
-
-        let mut cq_state = NvmeState::default();
-        assert_eq!(
-            NvmeController::admin_create_io_cq(&mut cq_state, 0x1000, cdw10, 0,),
-            (SC_INVALID_QUEUE_SIZE | SC_DNR, 0)
-        );
-
-        let mut sq_state = NvmeState::default();
-        assert_eq!(
-            NvmeController::admin_create_io_sq(
-                &mut sq_state,
-                0x1000,
-                cdw10,
-                1 << 16,
-            ),
-            (SC_INVALID_QUEUE_SIZE | SC_DNR, 0)
-        );
-    }
-
-    #[test]
-    fn sector_overflow_checked_mul() {
-        // Verify that checked_mul catches overflow in sector arithmetic.
-        // slba near u64::MAX with block_size=512 would overflow.
-        let slba: u64 = u64::MAX / 512 + 1;
-        let block_size: u32 = 512;
-        assert!(slba.checked_mul(u64::from(block_size)).is_none());
-    }
-
-    #[test]
-    fn sector_bounds_checked_add() {
-        // slba + nlb overflow should be caught
-        let slba: u64 = u64::MAX;
-        let nlb: u16 = 1;
-        assert!(slba.checked_add(u64::from(nlb)).is_none());
-    }
-
-    #[test]
-    fn nlb_overflow_checked_mul() {
-        // nlb * block_size overflow should be caught
-        let nlb: u16 = u16::MAX;
-        let block_size: u32 = u32::MAX;
-        assert!((nlb as u64).checked_mul(u64::from(block_size)).is_some());
-        // This fits in u64, so the overflow is in byte_offset, not byte_count
-        // Verify the realistic case works
-        let nlb: u16 = 128;
-        let block_size: u32 = 512;
-        assert_eq!(
-            (nlb as u64).checked_mul(u64::from(block_size)),
-            Some(65536)
-        );
-    }
+    Ok(())
 }

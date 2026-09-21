@@ -16,8 +16,8 @@ use vmm_devices::pci::bits;
 
 use super::{
     CFG_BAR0, CFG_BAR5, CFG_CAP_FIRST, CFG_CAP_PTR, CFG_COMMAND,
-    CFG_INTERRUPT_LINE, CFG_STATUS, MSI_MSG_CTRL_64BIT, MSI_MSG_CTRL_OFF,
-    MSI_MSG_CTRL_PVM,
+    CFG_HEADER_TYPE, CFG_INTERRUPT_LINE, CFG_STATUS, MSI_MSG_CTRL_64BIT,
+    MSI_MSG_CTRL_OFF, MSI_MSG_CTRL_PVM,
 };
 
 /// Capability layout read from the physical device at bind time.
@@ -73,7 +73,9 @@ fn read_cfg_u16(phys_cfg: &[u8; 256], idx: usize) -> u16 {
 /// Walk the capability list of a cached config space.
 ///
 /// The list comes from hardware, so the walk is bounded and every index
-/// is checked. A malformed or cyclic chain must not panic the VMM.
+/// is checked. A malformed or cyclic chain must not panic the VMM. An
+/// MSI block that runs off the end of config space is not recorded:
+/// it cannot be emulated, and nothing else may serve it.
 pub(super) fn scan_capabilities(phys_cfg: &[u8; 256]) -> CapLayout {
     let mut caps = CapLayout::default();
     let mut ptr = phys_cfg[CFG_CAP_PTR];
@@ -91,8 +93,11 @@ pub(super) fn scan_capabilities(phys_cfg: &[u8; 256]) -> CapLayout {
             bits::CAP_ID_MSI => {
                 let ctrl =
                     read_cfg_u16(phys_cfg, idx + usize::from(MSI_MSG_CTRL_OFF));
-                caps.msi_cap_off = ptr;
-                caps.msi_cap_len = msi_cap_len(ctrl);
+                let len = msi_cap_len(ctrl);
+                if idx + usize::from(len) <= phys_cfg.len() {
+                    caps.msi_cap_off = ptr;
+                    caps.msi_cap_len = len;
+                }
             }
             bits::CAP_ID_MSIX => caps.msix_cap_off = ptr,
             _ => {}
@@ -130,25 +135,26 @@ pub(super) enum CfgWrite {
     Command,
     /// Emulated BAR in `DeviceState`. It never reaches the device.
     Bar,
-    /// MSI capability handler.
+    /// Emulated MSI capability. It never reaches the device.
     MsiCap,
-    /// Emulated interrupt line byte.
-    InterruptLine,
+    /// Emulated header byte: the interrupt line, or the header type
+    /// the bus sets when a second function joins the slot.
+    Header,
     /// Dropped. Nothing reaches the device.
     Deny,
 }
 
-/// Is the access inside a capability register block?
+/// Is the access inside the MSI capability block?
 ///
 /// The end is rounded up to a dword, because a driver reads and writes
 /// config space one dword at a time and the next capability always
 /// starts on a dword boundary.
-fn in_cap(offset: u8, cap_off: u8, cap_len: u8) -> bool {
-    if cap_off == 0 || cap_len == 0 {
+pub(super) fn in_cap(offset: u8, caps: &CapLayout) -> bool {
+    if caps.msi_cap_off == 0 || caps.msi_cap_len == 0 {
         return false;
     }
-    let start = usize::from(cap_off);
-    let end = (start + usize::from(cap_len)).div_ceil(4) * 4;
+    let start = usize::from(caps.msi_cap_off);
+    let end = (start + usize::from(caps.msi_cap_len)).div_ceil(4) * 4;
     usize::from(offset) >= start && usize::from(offset) < end
 }
 
@@ -181,12 +187,9 @@ pub(super) fn classify_cfg_write(
         // sends the low 16 bits and nothing else.
         CFG_COMMAND if offset < CFG_STATUS => CfgWrite::Command,
         CFG_BAR0..=CFG_BAR5 => CfgWrite::Bar,
-        CFG_INTERRUPT_LINE if offset == CFG_INTERRUPT_LINE => {
-            CfgWrite::InterruptLine
-        }
-        _ if in_cap(offset, caps.msi_cap_off, caps.msi_cap_len) => {
-            CfgWrite::MsiCap
-        }
+        CFG_INTERRUPT_LINE if offset == CFG_INTERRUPT_LINE => CfgWrite::Header,
+        0x0C if offset == CFG_HEADER_TYPE && len == 1 => CfgWrite::Header,
+        _ if in_cap(offset, caps) => CfgWrite::MsiCap,
         _ => CfgWrite::Deny,
     }
 }
@@ -199,10 +202,10 @@ mod tests {
     fn fake_phys_cfg() -> [u8; 256] {
         let mut cfg = [0u8; 256];
 
-        // Vendor ID = 0x10DE (NVIDIA)
+        // Vendor ID
         cfg[0] = 0xDE;
         cfg[1] = 0x10;
-        // Device ID = 0x2330 (H100)
+        // Device ID
         cfg[2] = 0x30;
         cfg[3] = 0x23;
 
@@ -272,23 +275,6 @@ mod tests {
         cfg
     }
     #[test]
-    fn parse_vendor_device_from_cfg() {
-        let cfg = fake_phys_cfg();
-        let vendor = u16::from_le_bytes([cfg[0], cfg[1]]);
-        let device = u16::from_le_bytes([cfg[2], cfg[3]]);
-        assert_eq!(vendor, 0x10DE);
-        assert_eq!(device, 0x2330);
-    }
-
-    #[test]
-    fn parse_class_revision_from_cfg() {
-        let cfg = fake_phys_cfg();
-        assert_eq!(cfg[8], 0xA1); // revision
-        assert_eq!(cfg[0x0B], 0x03); // class (Display)
-        assert_eq!(cfg[0x0A], 0x02); // subclass
-    }
-
-    #[test]
     fn scan_finds_both_capabilities() {
         let caps = scan_capabilities(&fake_phys_cfg());
         assert_eq!(caps.msix_cap_off, 0x60);
@@ -322,8 +308,22 @@ mod tests {
         cfg[0x34] = 0xFF;
         cfg[0xFF] = bits::CAP_ID_MSI;
         let caps = scan_capabilities(&cfg);
-        // The header runs off the end. The read is short, not a panic.
-        assert_eq!(caps.msi_cap_off, 0xFF);
+        // The block runs off the end, so it cannot be emulated and is
+        // not recorded. The read is short, not a panic.
+        assert_eq!(caps.msi_cap_off, 0);
+        assert_eq!(caps.msi_cap_len, 0);
+    }
+
+    /// The MSI block never reaches past 0xFF, so every offset inside it
+    /// is a valid config offset.
+    #[test]
+    fn msi_block_that_fits_at_the_top_is_kept() {
+        let mut cfg = fake_phys_cfg();
+        cfg[0x34] = 0xF4;
+        cfg[0xF4] = bits::CAP_ID_MSI;
+        let caps = scan_capabilities(&cfg);
+        assert_eq!(caps.msi_cap_off, 0xF4);
+        assert_eq!(classify_cfg_write(0xFC, 4, &caps), CfgWrite::MsiCap);
         assert_eq!(caps.msi_cap_len, 10);
     }
 
@@ -419,8 +419,19 @@ mod tests {
         assert_eq!(classify_cfg_write(0x04, 2, &caps), CfgWrite::Command);
         assert_eq!(classify_cfg_write(0x10, 4, &caps), CfgWrite::Bar);
         assert_eq!(classify_cfg_write(0x24, 4, &caps), CfgWrite::Bar);
-        assert_eq!(classify_cfg_write(0x3C, 1, &caps), CfgWrite::InterruptLine);
+        assert_eq!(classify_cfg_write(0x3C, 1, &caps), CfgWrite::Header);
+        assert_eq!(classify_cfg_write(0x0E, 1, &caps), CfgWrite::Header);
         assert_eq!(classify_cfg_write(0x74, 4, &caps), CfgWrite::MsiCap);
+    }
+
+    /// BIST and the cache line register share the dword with the
+    /// header type; only the header type byte has a handler.
+    #[test]
+    fn cfg_write_denies_the_rest_of_the_header_type_dword() {
+        let caps = scan_capabilities(&fake_phys_cfg_msi_only());
+        assert_eq!(classify_cfg_write(0x0C, 4, &caps), CfgWrite::Deny);
+        assert_eq!(classify_cfg_write(0x0F, 1, &caps), CfgWrite::Deny);
+        assert_eq!(classify_cfg_write(0x0E, 2, &caps), CfgWrite::Deny);
     }
 
     /// A guest that clears MSI Enable must tear the vectors down, not

@@ -104,11 +104,16 @@ impl VsockHdr {
         b
     }
 
-    /// Build a reply on the connection this header arrived on, with the
-    /// addresses swapped.
+    /// Build a reply on the connection this header arrived on.
+    ///
+    /// Addressed back to the sender, and always sourced from
+    /// [`CID_HOST`]. The Linux driver drops a packet that does not come
+    /// from the host CID, so a reply sourced from whatever CID the guest
+    /// wrote in `dst_cid` never arrives and the guest retries until it
+    /// gives up.
     pub fn reply(&self, op: u16) -> Self {
         Self {
-            src_cid: self.dst_cid,
+            src_cid: CID_HOST,
             dst_cid: self.src_cid,
             src_port: self.dst_port,
             dst_port: self.src_port,
@@ -197,11 +202,19 @@ mod tests {
         assert_eq!(VsockHdr::from_bytes(&buf), Some(sample()));
     }
 
+    /// A reply goes back to the sender's ports, and always comes from
+    /// the host CID: the guest picks `dst_cid`, and a reply that echoed
+    /// it would be dropped by the driver.
     #[test]
-    fn reply_swaps_the_addresses() {
-        let r = sample().reply(OP_RESPONSE);
-        assert_eq!(r.src_cid, 3);
-        assert_eq!(r.dst_cid, CID_HOST);
+    fn a_reply_answers_the_sender_from_the_host_cid() {
+        let from_guest = VsockHdr {
+            src_cid: 3,
+            dst_cid: 9999,
+            ..sample()
+        };
+        let r = from_guest.reply(OP_RESPONSE);
+        assert_eq!(r.src_cid, CID_HOST);
+        assert_eq!(r.dst_cid, 3);
         assert_eq!(r.src_port, 1024);
         assert_eq!(r.dst_port, 0xdead_beef);
         assert_eq!(r.op, OP_RESPONSE);
