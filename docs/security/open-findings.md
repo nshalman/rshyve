@@ -82,23 +82,30 @@ is the root of a BitLocker guest's disk encryption.
 
 **Boundary:** guest to host. **Severity:** unknown, potentially high.
 
-`crates/vmm-devices/src/passthru.rs` exposes physical device
-configuration space indexed by guest-controlled offsets, and contains
-the largest concentration of `unsafe` in the tree. It has not been
-systematically reviewed.
+`crates/vmm-passthru` exposes physical device configuration space
+indexed by guest-controlled offsets, and holds the largest
+concentration of `unsafe` in the tree.
 
-**To close:** a dedicated audit of the guest-offset arithmetic and the
-BAR mapping paths, plus a decision on whether to gate the device behind
-a non-default cargo feature for the initial release.
+Part of it has been read since this entry was written. Config-space
+writes are denied unless the device model handles them, an MSI-X device
+is refused outright because illumos VT-d does not remap interrupts, and
+the MSI capability is emulated (`fix(passthru): deny unhandled config
+writes and refuse MSI-X devices`). The BAR mapping and unmapping paths
+and the guest-offset arithmetic behind them have not had the same
+treatment.
+
+**To close:** audit the BAR mapping paths, and decide whether the
+device ships behind a non-default cargo feature for the initial
+release. OSF-11 covers the part no reading can settle.
 
 ### OSF-6 — Operational errors are discarded on non-migration paths
 
 **Boundary:** operational correctness. **Severity:** low to medium.
 
-Roughly 120 `let _ = ...` statements remain outside the migration page
-paths, some on device state and interrupt delivery. Each needs to be
-classified as either genuinely idempotent best-effort cleanup or a real
-error that should propagate.
+Around 75 `let _ = ...` statements remain outside the migration page
+paths and outside test modules, some on device state and interrupt
+delivery. Each needs to be classified as either genuinely idempotent
+best-effort cleanup or a real error that should propagate.
 
 **To close:** classify every site, propagate or deliberately log the
 rest, and add fault-injection tests for guest-memory, interrupt, queue,
@@ -121,68 +128,45 @@ accept.
 **To close:** a modern authenticated, encrypted console boundary for any
 remote use, and a documented tunnel requirement until then.
 
-### OSF-8 — Hyper-V enlightenment state does not cross a migration
+### OSF-9 — No audit covers every guest-driven log site
 
-**Boundary:** correctness, guest-visible. **Severity:** high for a
-`--hyperv` Windows guest. **Status:** pending verification.
+**Boundary:** guest to host. **Severity:** low (host disk and log
+pipeline, and evidence destruction).
 
-`crates/vmm-hyperv/src/lib.rs` keeps every piece of enlightenment state
-in one `Mutex<Inner>` built zeroed, and derives reference time from an
-`Instant` taken when the instance was constructed.
-`crates/vmm-migrate/src/codec.rs` carries no Hyper-V payload, and
-`bin/rshyve/src/main.rs` builds a fresh instance on the destination. So a
-nominally successful migration restarts `TIME_REF_COUNT` at zero,
-violating the monotonicity the guest is promised, and loses
-`HV_X64_MSR_GUEST_OS_ID`, `HV_X64_MSR_HYPERCALL`,
-`HV_X64_MSR_REFERENCE_TSC` and the five guest-readable crash parameters.
-The overlay pages themselves travel inside guest RAM, so the guest keeps
-pages whose describing MSRs the destination has forgotten.
+A device path that writes one log record per guest action lets a guest
+write to the host log as fast as it can execute. The logger's async
+drain is a 128-entry channel with `DropAndReport`, so a flood also
+evicts the records that would explain an unrelated failure.
 
-`--hyperv` is not refused for migration, so nothing warns.
+The seam that answers this exists. `crates/vmm-core/src/ratelimit.rs`
+is a token bucket, one instance per log site so one noisy source cannot
+spend another's budget, and pvpanic, the COM2 serial writer, the mdata
+agent and the Hyper-V crash MSRs use it. The two viona paths latch
+instead: a refused ring kick logs once per run of refusals, and a
+refused ring init quarantines the ring until reset. Several crates
+carry a `CountingDrain` test asserting that N guest actions produce a
+bounded number of records.
 
-**To close:** export and import the three configuration MSRs, the crash
-parameters, and a reference-time offset rather than a raw `Instant`;
-remove the overlays before the final RAM copy and reinstall them after
-import, propagating any failure; then migrate a live Windows guest under
-a continuous time-reading workload and confirm `TIME_REF_COUNT` does not
-go backwards. Until then, refuse migration for a VM started with
-`--hyperv`.
+What is open is coverage. The `warn!` and `info!` sites reachable from
+a guest action have not been enumerated, and nothing obliges a new
+device to use the bucket, so the next one can reintroduce the defect.
 
-**Mitigation today:** do not migrate a `--hyperv` guest.
-
-### OSF-9 — A guest can flood the host log on several device paths
-
-**Boundary:** guest to host. **Severity:** medium (host disk and log
-pipeline, and evidence destruction). **Status:** pending verification.
-
-Several device paths write one log record per guest action with no rate
-limit and no latch, so a guest that repeats the action writes to the host
-log as fast as it can execute: pvpanic writes, COM2 bytes the guest does
-not drain, and refused viona kicks and ring inits are the ones found.
-Each is being fixed where it was found. This entry records the class,
-because the tree has no shared answer to it: no rate-limiting drain, no
-"log once per state change" helper, and no test convention, so the next
-device to log on a guest-driven path reintroduces it.
-
-The logger's async drain is a 128-entry channel with `DropAndReport`, so
-a flood also evicts the records that would explain an unrelated failure.
-
-**To close:** one rate-limited or latched logging seam for guest-driven
-events, used by every device that logs on such a path, and a
-`CountingDrain` test per device asserting that N guest actions produce a
-bounded number of records. Then re-audit every `warn!` and `info!`
-reachable from a guest action.
+**To close:** enumerate the guest-reachable log sites, put each behind
+the bucket or a latch, and give each a `CountingDrain` test.
 
 ### OSF-10 — virtio-fs runs in the VMM process, not a sandbox
 
 **Boundary:** guest to host filesystem. **Severity:** medium.
-**Status:** pending verification.
 
 `crates/vmm-virtio/src/fs/passthrough.rs` serves FUSE requests from the
 VMM process itself. The isolation is the shared root fd, `*at()` calls
 with `O_NOFOLLOW`, name validation at LOOKUP, and refusal of device,
-FIFO and socket nodes. Caps on cached inodes and open handles are being
-added so a guest cannot pin host descriptors without bound.
+FIFO and socket nodes. The two tables it keeps are capped, so a guest
+cannot pin host descriptors or host memory without bound:
+`crates/vmm-virtio/src/fs/passthrough/tables.rs` bounds cached inodes,
+open file and directory handles, and the bytes of directory snapshots,
+and a guest past a cap sees ENFILE or EMFILE the way it would on a full
+system (`Cap the host fds and memory one guest pins in virtio-fs`).
 
 Those caps are a mitigation, not the boundary. virtiofsd runs the same
 work in a separate process under a namespace or `pivot_root`, so a defect
@@ -202,16 +186,14 @@ may read, and never a read-write share of anything the host trusts.
 ### OSF-11 — The PCI passthrough audit has not run on real hardware
 
 **Boundary:** guest to host. **Severity:** unknown.
-**Status:** pending verification.
 
-OSF-5 records that passthrough was unaudited. A source audit of the
-guest-offset arithmetic and the BAR mapping paths closes the reading part
-of that. What no audit can supply is a device: every conclusion about
-passthrough in this tree has been reached by reading code and the PPT
-ioctl contract, never by assigning a physical function to a guest.
+OSF-5 records how far reading the source has got. What no reading can
+supply is a device: every conclusion about passthrough in this tree has
+been reached from the code and the PPT ioctl contract, never by
+assigning a physical function to a guest.
 
 Specifically unproven: that the config-space windows the guest sees match
-what the audit concluded, that BAR mapping and unmapping survive a guest
+what reading the code concluded, that BAR mapping and unmapping survive a guest
 reset with DMA in flight, that the MSI-X refusal covers every device that
 advertises it, and that illumos VT-d remapping behaves as the module
 header assumes. There is no AMD IOMMU backend at all.
@@ -220,7 +202,7 @@ header assumes. There is no AMD IOMMU backend at all.
 each through guest boot, reset, reboot and VM destroy, with DMA active,
 on an Intel VT-d host. Record what was assigned and what was observed in
 `docs/hardware-run.md`. Until then treat `passthru` as experimental
-whatever the source audit says.
+whatever reading the source says.
 
 **Mitigation today:** do not offer `-s N,passthru` to an untrusted guest.
 
@@ -229,7 +211,7 @@ whatever the source audit says.
 | Finding | Closed by |
 |---|---|
 | OSF-3 — CPU feature mismatch was warned about, not rejected, and the two implementations compared different leaves against unmasked host features | `Migrate device state by PCI identity over one driver` |
-| Hyper-V enlightenment state was not migrated; `TIME_REF_COUNT` restarted from a process-local clock and ran backwards for the guest | `Migrate the Hyper-V enlightenment` |
+| OSF-8 — Hyper-V enlightenment state was not migrated; `TIME_REF_COUNT` restarted from a process-local clock and ran backwards for the guest | `Migrate the Hyper-V enlightenment` |
 | PS/2 controller RAM out-of-bounds index reachable from guest port I/O | `fix(ps2): guest-reachable out-of-bounds index in controller RAM` |
 | Virtio indirect descriptor table unbounded against queue size | `fix(virtio): bound indirect descriptor tables to the queue size` |
 | Migration `PageBatch` slice index abort and discarded guest-memory errors | `fix(migrate): validate and bound peer-controlled page transfers` |
