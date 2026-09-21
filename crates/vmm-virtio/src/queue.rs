@@ -224,6 +224,12 @@ impl VirtQueue {
         self.size
     }
 
+    /// The largest ring this queue offers, which is what it returns to
+    /// on reset.
+    pub fn max_size(&self) -> u16 {
+        self.max_size
+    }
+
     /// Take the ring size a modern driver wrote.
     ///
     /// The driver may only shrink the ring, and only before it
