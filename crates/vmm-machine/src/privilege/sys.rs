@@ -18,7 +18,7 @@ mod illumos {
         getppriv, setppriv, PrivOp, PrivPtype, PrivSet, Privilege,
     };
 
-    use super::super::{PrivError, PrivNames, Step, Which};
+    use super::super::{PrivError, PrivNames, RunAs, Step, Which};
 
     /// The names this module can put in or read out of a set.
     ///
@@ -113,6 +113,7 @@ mod illumos {
             Which::Permitted => PrivPtype::Permitted,
             Which::Limit => PrivPtype::Limit,
             Which::Effective => PrivPtype::Effective,
+            Which::Inheritable => PrivPtype::Inheritable,
         }
     }
 
@@ -131,7 +132,7 @@ mod illumos {
 
     fn verify(
         expected: &PrivNames,
-        uid: Option<u32>,
+        run_as: Option<RunAs>,
         step: &Step,
     ) -> Result<(), PrivError> {
         let want = set_from(expected, step)?;
@@ -144,11 +145,30 @@ mod illumos {
                 });
             }
         }
-        if let Some(expected) = uid {
-            // SAFETY: geteuid takes no argument and cannot fail.
-            let actual = unsafe { libc::geteuid() };
-            if actual != expected {
-                return Err(PrivError::UidNotDropped { expected, actual });
+        let inheritable =
+            getppriv(PrivPtype::Inheritable).map_err(|e| syscall(step, e))?;
+        if !inheritable.is_empty() {
+            return Err(PrivError::Verify {
+                which: Which::Inheritable,
+                expected: PrivNames::new(),
+            });
+        }
+        if let Some(run_as) = run_as {
+            // SAFETY: geteuid and getegid take no argument and cannot
+            // fail.
+            let uid = unsafe { libc::geteuid() };
+            if uid != run_as.uid {
+                return Err(PrivError::UidNotDropped {
+                    expected: run_as.uid,
+                    actual: uid,
+                });
+            }
+            let gid = unsafe { libc::getegid() };
+            if gid != run_as.gid {
+                return Err(PrivError::GidNotDropped {
+                    expected: run_as.gid,
+                    actual: gid,
+                });
             }
         }
         Ok(())
@@ -194,7 +214,9 @@ mod illumos {
                 Step::SetUid(uid) => {
                     check(unsafe { libc::setuid(*uid) }, step)?
                 }
-                Step::Verify(expected, uid) => verify(expected, *uid, step)?,
+                Step::Verify(expected, run_as) => {
+                    verify(expected, *run_as, step)?
+                }
             }
         }
         Ok(())

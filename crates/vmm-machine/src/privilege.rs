@@ -5,39 +5,21 @@
 //! The privilege plan: what the VMM keeps once every device is open.
 //!
 //! The shape is the platform bhyve's (`cmd/bhyve/common/privileges.c`
-//! in illumos): snapshot the inherited effective set at startup, build
-//! the floor from it, and after the last device is open set PERMITTED,
-//! then LIMIT, then EFFECTIVE. This tree adds one step that binary does
-//! not have: a setuid to a fixed numeric id after the lock, so the
-//! process can no longer open the 0600 root:sys device nodes it
-//! started from.
+//! in illumos): snapshot the effective set at startup, and after the
+//! last device is open set P, L and E to the floor and clear I. This
+//! tree then setuids to a fixed numeric id, so the process cannot
+//! reopen the 0600 root:sys device nodes it started from.
 //!
-//! # The floor
+//! The floor is `file_read`, plus `proc_clock_highres` when inherited.
+//! `file_write` goes with the rest, so no host path can be opened for
+//! writing or connected to after the lock; everything the VMM still
+//! touches is a descriptor it already holds. `proc_setid` rides in P
+//! and E until the setuid is done and is turned off last: setppriv
+//! makes the process privilege aware, so the kernel keeps E and P
+//! across the setuid.
 //!
-//! `file_read` and, when the process inherited it, `proc_clock_highres`.
-//! Nothing else: `file_write` goes, so no host path can be opened for
-//! writing or connected to after the lock (`secpolicy_vnode_access2`
-//! refuses VWRITE outright without it, whatever the DAC bits say);
-//! `proc_fork`, `proc_exec`, `net_access` and the rest of the basic
-//! set go with it. Everything the VMM still touches is a descriptor it
-//! already holds.
-//!
-//! # The setuid
-//!
-//! `setuid` from 0 needs `proc_setid` in E, and the kernel keeps E and
-//! P across the call once the process is privilege aware
-//! (`priv_reset_PA` acts only with `PRIV_AWARE_RESET`, which nothing
-//! here sets). So the lock keeps `proc_setid` in P and E, does the
-//! setgroups, setgid and setuid, and turns it off last. L is set to
-//! the floor at once: L bounds P only across exec, so it may go below
-//! P for the few calls in between.
-//!
-//! # What is pure and what is not
-//!
-//! The plan, its steps and the open-device gate are pure and unit
-//! tested on every platform. The syscalls live in [`sys`] and are only
-//! exercised on illumos; CI cannot prove them, so the binaries log
-//! which way they went.
+//! The plan and its steps are pure and tested on every platform. The
+//! syscalls live in [`sys`] and run only on illumos.
 
 pub mod sys;
 
@@ -81,6 +63,7 @@ pub enum Which {
     Permitted,
     Limit,
     Effective,
+    Inheritable,
 }
 
 impl fmt::Display for Which {
@@ -89,6 +72,7 @@ impl fmt::Display for Which {
             Self::Permitted => "P",
             Self::Limit => "L",
             Self::Effective => "E",
+            Self::Inheritable => "I",
         })
     }
 }
@@ -105,9 +89,9 @@ pub enum Step {
     SetGroups(Vec<u32>),
     SetGid(u32),
     SetUid(u32),
-    /// `getppriv` on E, P and L must each equal this set, and the
-    /// effective uid must be this one when given.
-    Verify(PrivNames, Option<u32>),
+    /// `getppriv` on E, P and L must each equal this set, I must be
+    /// empty, and the effective ids must be these when given.
+    Verify(PrivNames, Option<RunAs>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -123,10 +107,12 @@ pub enum PrivError {
     /// A syscall of the lock failed. The process cannot continue: its
     /// privilege state is between two steps of a plan.
     Syscall { step: String, error: String },
-    /// A set read back after the lock is not the floor.
+    /// A set read back after the lock is not what the plan set.
     Verify { which: Which, expected: PrivNames },
     /// The effective uid after the setuid is not the run-as uid.
     UidNotDropped { expected: u32, actual: u32 },
+    /// The effective gid after the setgid is not the run-as gid.
+    GidNotDropped { expected: u32, actual: u32 },
     /// This platform has no privilege sets.
     Unsupported,
 }
@@ -153,12 +139,15 @@ impl fmt::Display for PrivError {
             }
             Self::Verify { which, expected } => write!(
                 f,
-                "privilege set {which} is not the floor after the lock \
+                "privilege set {which} is not what the lock set \
                  (expected {})",
                 render(expected)
             ),
             Self::UidNotDropped { expected, actual } => {
                 write!(f, "effective uid is {actual} after setuid({expected})")
+            }
+            Self::GidNotDropped { expected, actual } => {
+                write!(f, "effective gid is {actual} after setgid({expected})")
             }
             Self::Unsupported => {
                 write!(f, "this platform has no privilege sets to lock")
@@ -251,9 +240,11 @@ impl PrivPlan {
 
     /// The syscalls of the lock, in order.
     ///
-    /// With a `run_as`, `proc_setid` rides in P and E until the setuid
-    /// is done and is turned off last. Without one, the three sets go
-    /// straight to the floor.
+    /// P, then L, then E, then I cleared. With a `run_as`, `proc_setid`
+    /// rides in P and E until the setuid is done and is turned off
+    /// last. I is cleared before the setuid: it is only read at exec,
+    /// which the floor forbids, but a set that is not the specified
+    /// state is a regression the verify has to see.
     pub fn steps(&self, run_as: Option<RunAs>) -> Vec<Step> {
         let floor = self.floor.clone();
         let Some(run_as) = run_as else {
@@ -261,6 +252,7 @@ impl PrivPlan {
                 Step::Set(Which::Permitted, floor.clone()),
                 Step::Set(Which::Limit, floor.clone()),
                 Step::Set(Which::Effective, floor.clone()),
+                Step::Set(Which::Inheritable, PrivNames::new()),
                 Step::Verify(floor, None),
             ];
         };
@@ -270,11 +262,12 @@ impl PrivPlan {
             Step::Set(Which::Permitted, with_setid.clone()),
             Step::Set(Which::Limit, floor.clone()),
             Step::Set(Which::Effective, with_setid),
+            Step::Set(Which::Inheritable, PrivNames::new()),
             Step::SetGroups(vec![run_as.gid]),
             Step::SetGid(run_as.gid),
             Step::SetUid(run_as.uid),
             Step::Off(Which::Permitted, names(&[PROC_SETID])),
-            Step::Verify(floor, Some(run_as.uid)),
+            Step::Verify(floor, Some(run_as)),
         ]
     }
 
@@ -308,12 +301,12 @@ impl LockReport {
     pub fn summary(&self) -> String {
         match self.run_as {
             Some(run_as) => format!(
-                "E=P=L={} uid={} gid={}",
+                "E=P=L={} I={{}} uid={} gid={}",
                 render(&self.floor),
                 run_as.uid,
                 run_as.gid
             ),
-            None => format!("E=P=L={}", render(&self.floor)),
+            None => format!("E=P=L={} I={{}}", render(&self.floor)),
         }
     }
 }
@@ -388,9 +381,10 @@ mod tests {
         }
     }
 
-    /// The order the platform bhyve uses: P, then L, then E.
+    /// The order the platform bhyve uses: P, then L, then E, and then
+    /// I cleared, which that binary leaves at the basic set.
     #[test]
-    fn the_lock_without_a_drop_sets_p_then_l_then_e() {
+    fn the_lock_without_a_drop_sets_p_then_l_then_e_and_clears_i() {
         let plan = PrivPlan::begin(brand_floor()).expect("plan");
         let floor = plan.floor().clone();
         assert_eq!(
@@ -399,6 +393,7 @@ mod tests {
                 Step::Set(Which::Permitted, floor.clone()),
                 Step::Set(Which::Limit, floor.clone()),
                 Step::Set(Which::Effective, floor.clone()),
+                Step::Set(Which::Inheritable, PrivNames::new()),
                 Step::Verify(floor, None),
             ]
         );
@@ -420,13 +415,36 @@ mod tests {
                 Step::Set(Which::Permitted, with_setid.clone()),
                 Step::Set(Which::Limit, floor.clone()),
                 Step::Set(Which::Effective, with_setid),
+                Step::Set(Which::Inheritable, PrivNames::new()),
                 Step::SetGroups(vec![8123]),
                 Step::SetGid(8123),
                 Step::SetUid(8123),
                 Step::Off(Which::Permitted, names(&[PROC_SETID])),
-                Step::Verify(floor, Some(8123)),
+                Step::Verify(floor, Some(SANDBOX_RUN_AS)),
             ]
         );
+    }
+
+    /// Mutation this kills: dropping the I step, or setting I to
+    /// anything but empty. Either way an exec, were one ever possible,
+    /// would start with the basic set.
+    #[test]
+    fn the_inheritable_set_is_cleared_with_or_without_a_drop() {
+        let plan = PrivPlan::begin(brand_floor()).expect("plan");
+        for run_as in [None, Some(SANDBOX_RUN_AS)] {
+            let steps = plan.steps(run_as);
+            let cleared = steps
+                .iter()
+                .filter(|step| {
+                    matches!(step, Step::Set(Which::Inheritable, set) if set.is_empty())
+                })
+                .count();
+            assert_eq!(cleared, 1, "{run_as:?}: {steps:?}");
+            assert!(
+                matches!(steps.last(), Some(Step::Verify(_, _))),
+                "the verify comes last and reads I"
+            );
+        }
     }
 
     /// Mutation this kills: turning `proc_setid` off before the setuid,
@@ -522,13 +540,13 @@ mod tests {
         };
         assert_eq!(
             report.summary(),
-            "E=P=L={file_read,proc_clock_highres} uid=8123 gid=8123"
+            "E=P=L={file_read,proc_clock_highres} I={} uid=8123 gid=8123"
         );
         let report = LockReport {
             floor: names(&[FILE_READ]),
             run_as: None,
         };
-        assert_eq!(report.summary(), "E=P=L={file_read}");
+        assert_eq!(report.summary(), "E=P=L={file_read} I={}");
     }
 
     /// The lock is not something a unit test may run: on illumos it
