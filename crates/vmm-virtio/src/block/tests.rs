@@ -12,7 +12,7 @@ use super::worker::{
     blk_io_worker, run_request, BlkIoRequest, Bounce, WorkerCtx, WorkerParks,
 };
 use super::*;
-use crate::access::GuestAccess;
+use crate::access::{GuestAccess, RingTag};
 use crate::pci::intr::{IntrGate, IntrSession};
 
 mod barrier;
@@ -39,13 +39,26 @@ fn detached_completion(
 
 /// A worker context wired to `physmap`, with a fresh session.
 fn worker_ctx(physmap: &Arc<PhysMap>) -> WorkerCtx {
+    worker_ctx_queues(physmap, 1)
+}
+
+/// The same, for a device with more than one virtqueue.
+fn worker_ctx_queues(physmap: &Arc<PhysMap>, num_queues: usize) -> WorkerCtx {
     WorkerCtx {
         physmap: Arc::clone(physmap),
         gate: Arc::new(QuiesceGate::new(1)),
-        access: Arc::new(GuestAccess::new()),
+        access: Arc::new(GuestAccess::new(num_queues)),
         backend: Arc::new(BackendBarrier::new()),
         parks: Arc::new(WorkerParks::default()),
     }
+}
+
+/// The tag work dispatched on `queue` now would carry.
+fn current_tag(access: &GuestAccess, queue: u16) -> RingTag {
+    access
+        .enter_current(queue)
+        .expect("a generation is open")
+        .tag()
 }
 
 #[test]
@@ -302,10 +315,10 @@ fn a_reprogrammed_ring_gets_its_own_used_ring_writer() {
 /// A driver may program a ring again without resetting the device, and
 /// a worker with a request in flight holds its own `Arc` to the writer
 /// that names the old ring. Dropping the cached one leaves that worker
-/// publishing into memory the guest has taken back, so the epoch has to
-/// end with the ring.
+/// publishing into memory the guest has taken back, so the generation
+/// has to end with the ring.
 #[test]
-fn a_reprogrammed_ring_ends_the_epoch_that_named_it() {
+fn a_reprogrammed_ring_ends_the_generation_that_named_it() {
     const DESC_GPA: u64 = 0x1000;
     const AVAIL_GPA: u64 = 0x1100;
     const NEW_USED_GPA: u64 = 0x1400;
@@ -317,23 +330,18 @@ fn a_reprogrammed_ring_ends_the_epoch_that_named_it() {
     // What a worker holds while its request is in flight. The session
     // is dropped here: one held across the reprogram would deadlock
     // against the drain, which is the property `reset` relies on too.
-    let epoch = block
-        .ctx
-        .access
-        .enter_current()
-        .expect("the device admits guest access")
-        .epoch();
+    let tag = current_tag(&block.ctx.access, 0);
 
     queues[0].set_addr_modern(DESC_GPA, AVAIL_GPA, NEW_USED_GPA);
     block.queue_addr_set(0, &queues[0]);
 
     assert!(
-        block.ctx.access.enter(epoch).is_none(),
-        "a worker from the retired epoch can still reach guest memory",
+        block.ctx.access.enter(tag).is_none(),
+        "a worker from the retired generation can still reach guest memory",
     );
     assert!(
-        block.ctx.access.enter_current().is_some(),
-        "the device took no new session, so nothing can run again",
+        block.ctx.access.enter_current(0).is_some(),
+        "the device took no new generation, so nothing can run again",
     );
 }
 
@@ -742,13 +750,12 @@ fn wait_for(what: &str, ready: impl Fn() -> bool) {
     }
 }
 
-/// End the current driver session, the way `VirtioDevice::reset` does.
-fn end_session(ctx: &WorkerCtx) -> u64 {
-    let epoch = ctx.access.close();
-    ctx.backend.retire(epoch);
+/// End every driver generation, the way `VirtioDevice::reset` does.
+fn end_session(ctx: &WorkerCtx) {
+    ctx.access.close_all();
+    ctx.backend.retire();
     ctx.access.drain();
     ctx.access.reopen(IntrSession::INITIAL);
-    epoch
 }
 
 /// Drive one request through and return its status byte. Worker

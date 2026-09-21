@@ -755,7 +755,7 @@ fn a_delivery_without_the_resets_permission_writes_nothing() {
     assert!(vsock.shared.mux.start_host_connect(key));
 
     // Admission shut, the way a reset shuts it before its drain.
-    vsock.shared.access.close();
+    vsock.shared.access.close_all();
     vsock.shared.deliver_rx();
 
     assert_eq!(
@@ -794,14 +794,14 @@ fn a_reset_waits_out_a_delivery_already_inside() {
     let session = vsock
         .shared
         .access
-        .enter_current()
+        .enter_current(VSOCK_RX_QUEUE)
         .expect("a session is open");
 
     let finished = Arc::new(AtomicBool::new(false));
     let done = Arc::clone(&finished);
     let device = Arc::clone(&vsock.shared);
     let resetter = std::thread::spawn(move || {
-        device.access.close();
+        device.access.close_all();
         device.access.drain();
         done.store(true, Ordering::Release);
         device.access.reopen(device.access.intr_session());
@@ -822,6 +822,89 @@ fn a_reset_waits_out_a_delivery_already_inside() {
     drop(session);
     resetter.join().expect("reset thread");
     assert!(finished.load(Ordering::Acquire));
+
+    vsock.halt();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A driver may program the receive ring again without resetting the
+/// device, and it frees the old ring as soon as it has. A delivery
+/// already inside `pair_rx` holds the chain it took off the stash and
+/// the writer that names the old ring, so dropping the cached ones
+/// does not reach it: the reprogram has to wait it out.
+#[test]
+fn a_reprogrammed_rx_ring_waits_out_a_delivery_already_inside() {
+    const SENTINEL: u8 = 0x5a;
+    // Free, mapped ring memory past the fixture's own.
+    const NEW_DESC_GPA: u64 = 0x1900;
+    const NEW_AVAIL_GPA: u64 = 0x1A00;
+    const NEW_USED_GPA: u64 = 0x1B00;
+
+    let (physmap, mut queues) = rx_ring();
+    write_desc(&physmap, 0, BUF_GPA, 64, crate::bits::VRING_DESC_F_WRITE, 0);
+    let (dir, vsock) = test_vsock(Arc::clone(&physmap));
+    physmap
+        .lookup(BUF_GPA, 64)
+        .expect("mapped rx buffer")
+        .write_bytes(&[SENTINEL; 64])
+        .expect("seed the rx buffer");
+
+    // A chain on the stash and a packet waiting for it: what a
+    // delivery inside `pair_rx` holds.
+    vsock.notify_queue(VSOCK_RX_QUEUE, &mut queues, &physmap);
+    assert_eq!(vsock.shared.pending_rx.lock().expect("pending").len(), 1);
+    let key = ConnKey {
+        guest_port: 1024,
+        host_port: 1,
+    };
+    assert!(vsock.shared.mux.start_host_connect(key));
+
+    let mut reprogrammed = VirtQueue::new(RING_SIZE);
+    reprogrammed.set_addr_modern(NEW_DESC_GPA, NEW_AVAIL_GPA, NEW_USED_GPA);
+
+    let held = vsock
+        .shared
+        .access
+        .enter_current(VSOCK_RX_QUEUE)
+        .expect("a delivery is admitted");
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            vsock.queue_addr_set(VSOCK_RX_QUEUE, &reprogrammed);
+            finished.store(true, Ordering::Release);
+        });
+
+        // Admission shuts first, so past this the reprogram is inside
+        // its drain and nowhere else.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while vsock.shared.access.is_open() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !vsock.shared.access.is_open(),
+            "the reprogram never took the ring back"
+        );
+        assert!(
+            !finished.load(Ordering::Acquire),
+            "the reprogram returned while a delivery still held the old ring",
+        );
+        drop(held);
+    });
+    assert!(finished.load(Ordering::Acquire));
+
+    // The packet is still owed, and a delivery runs again now that
+    // admission is back. Nothing of it may reach the old ring.
+    vsock.shared.deliver_rx();
+    assert_eq!(
+        used_idx(&physmap),
+        0,
+        "a delivery published into the ring the driver gave up",
+    );
+    assert_eq!(
+        rx_buf(&physmap),
+        vec![SENTINEL; 64],
+        "a delivery wrote into the chain the driver gave up",
+    );
 
     vsock.halt();
     let _ = std::fs::remove_dir_all(&dir);

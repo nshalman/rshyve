@@ -182,7 +182,7 @@ fn the_notify_path_hands_the_interrupt_to_the_transport() {
 }
 
 // virtio-fs keeps the same two counters as virtio-blk, and the gap
-// between them is the same. The worker's epoch check is one load, and
+// between them is the same. The worker's check is one load, and
 // a whole reset can run after it passes. What keeps a reply off the
 // next driver is the session the completion handler was built in,
 // which the transport tests in the same step that admits the delivery.
@@ -197,7 +197,10 @@ fn a_completion_from_the_closed_session_raises_nothing() {
 
     // Built the way a queue notification builds it: under permission.
     let handler = || {
-        let session = fs.access.enter_current().expect("a session is open");
+        let session = fs
+            .access
+            .enter_current(FS_REQUEST_QUEUE)
+            .expect("a generation is open");
         fs.get_completion(&session, FS_REQUEST_QUEUE, &queues[req])
     };
     let stale = handler();

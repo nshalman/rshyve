@@ -129,7 +129,7 @@ impl ConsoleShared {
         // so a delivery that started before the reset has to finish
         // inside it. The work here is bounded by the stash and the
         // backlog cap, which is what lets a vCPU wait for it.
-        let Some(_session) = self.access.enter_current() else {
+        let Some(_session) = self.access.enter_current(CONSOLE_RX_QUEUE) else {
             return;
         };
         let completion = {
@@ -365,7 +365,7 @@ impl VirtioConsole {
             backlog: Mutex::new(VecDeque::new()),
             pending_rx: Mutex::new(VecDeque::new()),
             rx_completion: Mutex::new(None),
-            access: Arc::new(GuestAccess::new()),
+            access: Arc::new(GuestAccess::new(CONSOLE_NUM_QUEUES)),
             interrupt: Arc::new(IntrSlot::new()),
             readers: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
@@ -437,7 +437,8 @@ impl VirtioConsole {
 
     /// Pop RX chains and hold them until host bytes arrive.
     fn stash_rx(&self, queue: &mut VirtQueue, physmap: &PhysMap) {
-        let Some(session) = self.shared.access.enter_current() else {
+        let Some(session) = self.shared.access.enter_current(CONSOLE_RX_QUEUE)
+        else {
             // A reset owns the ring. Its queue state goes with it.
             return;
         };
@@ -488,7 +489,9 @@ impl VirtioConsole {
     /// no priority, so a host peer that writes fast enough could
     /// otherwise starve a vCPU waiting here.
     fn retire_rx_ring(&self) {
-        self.shared.access.close();
+        // The RX ring is the only one a delivery ever writes, so its
+        // generation is the whole of what this takes back.
+        self.shared.access.close_queue(CONSOLE_RX_QUEUE);
         self.shared.access.drain();
         self.shared.forget_rx_ring();
         self.shared.access.reopen(

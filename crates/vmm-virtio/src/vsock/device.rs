@@ -106,7 +106,7 @@ impl VirtioVsock {
         let shared = Arc::new(VsockShared {
             mux: VsockMux::new(guest_cid),
             physmap,
-            access: crate::access::GuestAccess::new(),
+            access: crate::access::GuestAccess::new(VSOCK_NUM_QUEUES),
             pending_rx: Mutex::new(VecDeque::new()),
             rx_completion: Mutex::new(None),
             delivery: Mutex::new(()),
@@ -152,6 +152,53 @@ impl VirtioVsock {
 
     pub fn socket_path(&self) -> &Path {
         &self.shared.socket_path
+    }
+
+    /// End the retired generations, wait out the deliveries already
+    /// inside them, and drop everything that named the receive ring.
+    ///
+    /// `queue` names the one ring a driver programmed again, or `None`
+    /// for a device reset. Only the receive ring has state to drop:
+    /// the transmit queue is served inline on the vCPU, and the event
+    /// queue is never used.
+    ///
+    /// Dropping the handler and the stash is not enough. A delivery
+    /// already inside `pair_rx` holds a handler of its own and a chain
+    /// it has taken off the stash, under a generation that was valid
+    /// when it started. Ending that generation and waiting out the
+    /// delivery is what keeps the packet out of pages the guest has
+    /// taken back.
+    ///
+    /// Admission closes before the wait. A delivery refused before it
+    /// takes the lock never queues on it, and `std::sync::RwLock`
+    /// gives the writer no priority, so a host peer must not be able
+    /// to put this vCPU behind it.
+    fn retire_rings(&self, queue: Option<u16>) {
+        match queue {
+            Some(idx) => {
+                self.shared.access.close_queue(idx);
+            }
+            None => self.shared.access.close_all(),
+        }
+        self.shared.access.drain();
+
+        *self
+            .shared
+            .rx_completion
+            .lock()
+            .expect("rx completion lock") = None;
+        // Chains posted before the retirement are dropped, not
+        // completed: the guest abandons its rings and reposts.
+        self.shared
+            .pending_rx
+            .lock()
+            .expect("pending rx lock")
+            .clear();
+        self.shared.access.reopen(
+            self.shared
+                .interrupt
+                .next_session(self.shared.access.intr_session()),
+        );
     }
 }
 
@@ -215,49 +262,17 @@ impl VirtioDevice for VirtioVsock {
 
     /// The handler snapshots the ring it was built on, so a ring the
     /// driver programs again needs a new one, and the chains stashed
-    /// from the old ring go with it.
+    /// from the old ring are retired with it.
     fn queue_addr_set(&self, queue_idx: u16, _queue: &VirtQueue) {
         if queue_idx != VSOCK_RX_QUEUE {
             return;
         }
-        *self
-            .shared
-            .rx_completion
-            .lock()
-            .expect("rx completion lock") = None;
-        self.shared
-            .pending_rx
-            .lock()
-            .expect("pending rx lock")
-            .clear();
+        self.retire_rings(Some(queue_idx));
     }
 
     fn reset(&self) {
-        // Admission closes before the drain. A delivery refused before
-        // it takes the lock never queues on it, and `std::sync::RwLock`
-        // gives the writer no priority, so a host peer must not be able
-        // to put this vCPU behind it.
-        self.shared.access.close();
-        self.shared.access.drain();
-
         *self.negotiated_features.lock().expect("features lock") = 0;
-        *self
-            .shared
-            .rx_completion
-            .lock()
-            .expect("rx completion lock") = None;
-        // Chains posted before the reset are dropped, not completed:
-        // the guest abandons its rings across a reset and reposts.
-        self.shared
-            .pending_rx
-            .lock()
-            .expect("pending rx lock")
-            .clear();
-        self.shared.access.reopen(
-            self.shared
-                .interrupt
-                .next_session(self.shared.access.intr_session()),
-        );
+        self.retire_rings(None);
     }
 }
 

@@ -43,7 +43,9 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(1);
 /// Hold guest access the way the worker holds it across a copy into
 /// or out of a chain.
 fn hold_guest_access(fs: &VirtioFs) -> Session<'_> {
-    fs.access.enter_current().expect("a session is open")
+    fs.access
+        .enter_current(FS_REQUEST_QUEUE)
+        .expect("a generation is open")
 }
 
 #[derive(Default)]
@@ -542,7 +544,7 @@ fn reset_never_parks_the_worker() {
 // because the worker holds raw fds from them across a FUSE syscall and
 // a number closed under it goes to the next thread in this process
 // that opens anything. The worker reaps them instead, once it sees the
-// epoch move.
+// mark go up.
 #[test]
 fn the_worker_reaps_the_fd_tables_a_reset_retired() {
     let dir = tempfile::tempdir().expect("export directory");
@@ -594,7 +596,7 @@ fn the_worker_reaps_the_fd_tables_a_reset_retired() {
     );
 }
 
-// A worker inside a copy has already passed its epoch check, so no
+// A worker inside a copy has already passed its generation check, so no
 // later check takes that copy back. The reset must not finish while
 // the worker holds the shared side, and it needs no deadline to say
 // so: the sections under that guard are bounded copies.
@@ -676,8 +678,8 @@ fn a_pause_that_lands_inside_a_reset_survives_it() {
 // The invariant, stated as a test: a backing-store call owns only host
 // memory, so a reset can end the driver session while one is running
 // and nothing it produces reaches the guest. The worker has already
-// copied the request out and passed its first epoch check, which is
-// the interleaving that matters.
+// copied the request out and passed its first generation check, which
+// is the interleaving that matters.
 #[test]
 fn a_backend_parked_across_a_reset_writes_nothing_into_the_ring() {
     let (physmap, mut queues, fs) = ring(8, 1);
@@ -709,6 +711,55 @@ fn a_backend_parked_across_a_reset_writes_nothing_into_the_ring() {
         raised.load(Ordering::Acquire),
         0,
         "the closed session's interrupt reached the next driver"
+    );
+}
+
+// A driver may program one ring again without resetting the device,
+// and it frees the old ring as soon as it has. A request already with
+// the worker holds the old chain and the writer that names the old
+// ring, so dropping the cached writer does not reach it: the reply
+// went into pages the guest had taken back.
+#[test]
+fn a_reprogrammed_queue_keeps_a_stale_reply_out_of_the_old_ring() {
+    // Free, mapped ring memory past the fixture's own.
+    const NEW_DESC_GPA: u64 = 0x3000;
+    const NEW_AVAIL_GPA: u64 = 0x3100;
+    const NEW_USED_GPA: u64 = 0x3200;
+
+    let (physmap, mut queues, fs) = ring(8, 1);
+    let req = usize::from(FS_REQUEST_QUEUE);
+    seed_fuse_init(&physmap);
+    seed_reply_window(&physmap);
+    fs.start().expect("start");
+
+    let backend = ParkedBackend::install(&fs);
+    fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
+    backend.wait_until_inside();
+
+    // The same queue is programmed again while the request is out.
+    queues[req].set_addr_modern(NEW_DESC_GPA, NEW_AVAIL_GPA, NEW_USED_GPA);
+    fs.queue_addr_set(FS_REQUEST_QUEUE, &queues[req]);
+
+    backend.release();
+    wait_until_idle(&fs);
+
+    let old_used_idx = physmap
+        .lookup(USED_GPA + 2, 2)
+        .expect("mapped old used index")
+        .read::<u16>()
+        .expect("read old used index");
+    assert_eq!(
+        old_used_idx, 0,
+        "the reply was published into the ring the driver gave up"
+    );
+    assert!(
+        reply_window(&physmap).iter().all(|b| *b == REPLY_SENTINEL),
+        "the reply landed in guest pages the reprogram had released"
+    );
+    assert_eq!(
+        queues[req].read_used_ring_idx(&physmap),
+        0,
+        "a request of the old ring was answered on the new one"
     );
 }
 
@@ -822,9 +873,9 @@ fn a_stale_backlog_never_queues_on_the_reset_drain() {
         "the backlog never reached the worker"
     );
 
-    // A reset, stopped inside its drain: admission closed, the epoch
-    // ended, and the exclusive side held.
-    fs.access.close();
+    // A reset, stopped inside its drain: admission closed, every
+    // generation ended, and the exclusive side held.
+    fs.access.close_all();
     let drain = fs.access.hold_drain();
     fs.resume();
 
@@ -931,7 +982,7 @@ fn a_notification_refused_by_a_reset_touches_nothing() {
     // A reset has taken the ring. The drain is not held here: this
     // thread is the one calling in, and a gate that wrongly took the
     // reader lock would then wait on itself instead of failing.
-    fs.access.close();
+    fs.access.close_all();
 
     let did_work = fs.notify_queue(FS_REQUEST_QUEUE, &mut queues, &physmap);
 

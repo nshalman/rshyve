@@ -383,18 +383,100 @@ fn a_duplicate_queue_is_refused() {
     .expect_err("queue 0 twice");
 }
 
+/// A modern driver may shrink a ring below the size the device offers
+/// (VirtIO 1.3 sec 4.1.4.3.2), and the source exports the ring it
+/// actually ran. A destination that demanded its own maximum refused
+/// that payload outright; one that took the payload without calling
+/// `set_size` would then walk 256 entries of a 128-entry ring.
 #[test]
-fn a_queue_of_another_size_is_refused() {
+fn a_ring_the_driver_shrank_migrates_at_the_size_it_ran() {
+    let source = make_tracking_device();
+    // The driver's own register writes, in the order it makes them:
+    // the size before the addresses.
+    write_modern_u16(&source, bits::COMMON_CFG_QUEUE_SELECT, 0);
+    write_modern_u16(&source, bits::COMMON_CFG_QUEUE_SIZE, 128);
+    {
+        let mut vs = source.virtio_state.lock().expect("virtio lock");
+        vs.guest_features = bits::VIRTIO_F_VERSION_1;
+        vs.queues[0].set_addr_modern(DESC, AVAIL, USED);
+        vs.queue_enabled[0] = true;
+        vs.status = bits::STATUS_ACKNOWLEDGE
+            | bits::STATUS_DRIVER
+            | bits::STATUS_FEATURES_OK
+            | bits::STATUS_DRIVER_OK;
+    }
+
+    let state = exported(&source);
+    assert_eq!(
+        state.queues[0].queue_size, 128,
+        "the export reported a ring the source never ran"
+    );
+
+    let dest = make_tracking_device();
+    dest.restore_migrate_state(&DeviceMigrateState::Virtio(state))
+        .expect("a 128-entry ring on a 256-entry device restores");
+
+    assert_eq!(
+        dest.virtio_state.lock().expect("virtio lock").queues[0].size(),
+        128,
+        "the destination would walk past the ring the guest allocated",
+    );
+    assert_eq!(
+        dest.device.state.lock().expect("lock").restored_rings[0].size,
+        128,
+        "the backend was told a ring size the guest never programmed",
+    );
+
+    // And the restored ring is live: a guest kick reaches the backend,
+    // and another export round-trips the size a chained migration
+    // needs.
+    let wo = vmm_core::common::WriteOp::from_buf(&0u16.to_le_bytes());
+    dest.bar_rw(
+        BarN::BAR0,
+        usize::from(bits::LEGACY_REG_QUEUE_NOTIFY),
+        RWOp::Write(&wo),
+    );
+    assert_eq!(
+        notified(&dest),
+        vec![0],
+        "a kick never reached the restored ring"
+    );
+    assert_eq!(exported(&dest).queues[0].queue_size, 128);
+}
+
+#[test]
+fn a_queue_larger_than_the_device_offers_is_refused() {
     let dev = make_tracking_device();
     let mut queue = live_queue();
-    queue.queue_size = 128;
+    queue.queue_size = 512;
     let error = dev
         .restore_migrate_state(&DeviceMigrateState::Virtio(transport(
             bits::VIRTIO_F_VERSION_1,
             vec![queue],
         )))
-        .expect_err("128 against this device's 256");
-    assert!(error.to_string().contains("queue is 256"), "{error}");
+        .expect_err("512 against this device's 256");
+    assert!(error.to_string().contains("1..=256"), "{error}");
+    assert_eq!(
+        dev.device.state.lock().expect("lock").restored_rings.len(),
+        0,
+        "a refused payload programs no ring",
+    );
+}
+
+#[test]
+fn a_queue_size_that_is_not_a_power_of_two_is_refused() {
+    for bad in [0u16, 48, 255] {
+        let dev = make_tracking_device();
+        let mut queue = live_queue();
+        queue.queue_size = bad;
+        let error = dev
+            .restore_migrate_state(&DeviceMigrateState::Virtio(transport(
+                bits::VIRTIO_F_VERSION_1,
+                vec![queue],
+            )))
+            .expect_err("a ring no driver could have programmed");
+        assert!(error.to_string().contains("1..=256"), "{error}");
+    }
 }
 
 #[test]
@@ -616,15 +698,15 @@ fn modern_device_status() {
     assert_eq!(ro.buf()[0], bits::STATUS_ACKNOWLEDGE);
 }
 
-fn read_modern_u16(dev: &VirtioPciDevice<TestVirtioDevice>, off: u16) -> u16 {
+fn read_modern_u16<D: VirtioDevice>(dev: &VirtioPciDevice<D>, off: u16) -> u16 {
     use vmm_core::common::ReadOp;
     let mut ro = ReadOp::new(2);
     dev.bar_rw(BarN::BAR2, usize::from(off), RWOp::Read(&mut ro));
     u16::from_le_bytes([ro.buf()[0], ro.buf()[1]])
 }
 
-fn write_modern_u16(
-    dev: &VirtioPciDevice<TestVirtioDevice>,
+fn write_modern_u16<D: VirtioDevice>(
+    dev: &VirtioPciDevice<D>,
     off: u16,
     val: u16,
 ) {

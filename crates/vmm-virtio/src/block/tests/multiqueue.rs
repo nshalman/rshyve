@@ -2,13 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Tests for interrupt routing on a multiqueue device.
+//! Tests for a multiqueue device: interrupt routing, and what one
+//! queue's retirement does to the others.
 //!
 //! MSI-X gives each virtqueue its own vector, and a Linux guest binds
 //! one handler per vector that examines only its own ring. A
 //! completion signalled under the wrong queue index therefore reaches
 //! no handler at all, and the request never finishes. INTx hides this,
 //! because the shared handler walks every ring on the device.
+
+use std::sync::atomic::AtomicBool;
 
 use super::*;
 
@@ -101,6 +104,19 @@ fn mq_harness(num_queues: u16) -> MqHarness {
 /// and completed there. That is the path every real disk request
 /// takes, and the only one that raises its own interrupt.
 fn read_on_queue(h: &mut MqHarness, queue_idx: u16) {
+    post_read_on_queue(h, queue_idx);
+    await_read_on_queue(h, queue_idx);
+    // The worker publishes the used entry and raises after it, so the
+    // record is not there yet when the ring says the read is done.
+    let seen = Arc::clone(&h.seen);
+    wait_for("the completion raised no interrupt", || {
+        !seen.lock().expect("record lock").is_empty()
+    });
+}
+
+/// Publish a one-sector read on `queue_idx` and kick the device,
+/// without waiting for it to finish.
+fn post_read_on_queue(h: &mut MqHarness, queue_idx: u16) {
     let ring = mq_ring(queue_idx);
 
     let header = VirtioBlkReqHdr {
@@ -148,6 +164,11 @@ fn read_on_queue(h: &mut MqHarness, queue_idx: u16) {
     poke(&h.physmap, ring.avail + 2, &1u16.to_le_bytes());
 
     h.block.notify_queue(queue_idx, &mut h.queues, &h.physmap);
+}
+
+/// Wait for `queue_idx`'s read to finish and check what the guest sees.
+fn await_read_on_queue(h: &MqHarness, queue_idx: u16) {
+    let ring = mq_ring(queue_idx);
 
     let physmap = Arc::clone(&h.physmap);
     let used = ring.used;
@@ -159,12 +180,6 @@ fn read_on_queue(h: &mut MqHarness, queue_idx: u16) {
             .read_bytes(&mut idx)
             .expect("read used index");
         u16::from_le_bytes(idx) == 1
-    });
-    // The worker publishes the used entry and raises after it, so the
-    // record is not there yet when the ring says the read is done.
-    let seen = Arc::clone(&h.seen);
-    wait_for("the completion raised no interrupt", || {
-        !seen.lock().expect("record lock").is_empty()
     });
 
     let mut status = [0u8; 1];
@@ -230,4 +245,56 @@ fn a_single_queue_completion_still_raises_on_queue_zero() {
     let mut h = mq_harness(1);
     read_on_queue(&mut h, 0);
     assert_eq!(drain_seen(&h), vec![0]);
+}
+
+// A driver programs each ring separately, so queue 0's addresses can be
+// written while queue 1 has a request at the disk. That request names a
+// ring the driver never gave up and still owes the guest a used entry
+// and a status byte. A device-wide retirement here discards it, and the
+// guest waits for it for ever.
+#[test]
+fn reprogramming_one_queue_keeps_anothers_request() {
+    // Free, mapped ring memory past both queues' own.
+    const NEW_DESC: u64 = MQ_BASE_GPA + 2 * MQ_STRIDE;
+    const NEW_AVAIL: u64 = NEW_DESC + 0x100;
+    const NEW_USED: u64 = NEW_DESC + 0x200;
+
+    let mut h = mq_harness(2);
+
+    // Hold queue 1's read at the disk, with no guest-access permission
+    // taken, which is where a real request spends its time.
+    let parked = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    {
+        let parked = Arc::clone(&parked);
+        let release = Arc::clone(&release);
+        *h.block
+            .ctx
+            .parks
+            .at_backend
+            .lock()
+            .expect("park lock poisoned") = Some(Arc::new(move || {
+            parked.store(true, Ordering::Release);
+            while !release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }));
+    }
+
+    post_read_on_queue(&mut h, 1);
+    wait_for("queue 1's read never reached the disk", || {
+        parked.load(Ordering::Acquire)
+    });
+
+    // Queue 0 is reprogrammed while that read is still out.
+    h.queues[0].set_addr_modern(NEW_DESC, NEW_AVAIL, NEW_USED);
+    h.block.queue_addr_set(0, &h.queues[0]);
+
+    release.store(true, Ordering::Release);
+    await_read_on_queue(&h, 1);
+    assert_eq!(
+        drain_seen(&h),
+        vec![1],
+        "queue 1's completion raised on the wrong queue, or not at all"
+    );
 }

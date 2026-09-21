@@ -165,13 +165,17 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     qs.queue_idx,
                 )));
             }
-            // The destination is built from the same command line, so
-            // its own queue size is the only one it can serve.
-            let own = vs.queues[idx].size();
-            if qs.queue_size != own {
+            // A modern driver may shrink a ring below the maximum the
+            // device offers (sec 4.1.4.3.2), and the source exports the
+            // ring it actually ran. So the destination has to accept
+            // any size it could have offered, not only its maximum.
+            let max = vs.queues[idx].max_size();
+            let size = qs.queue_size;
+            if size == 0 || !size.is_power_of_two() || size > max {
                 return Err(DeviceStateError::invalid(format!(
-                    "queue {} has size {}, this device's queue is {own}",
-                    qs.queue_idx, qs.queue_size,
+                    "queue {} has size {size}, not a power of two in \
+                     1..={max}",
+                    qs.queue_idx,
                 )));
             }
             // The difference between the cursors is the number of
@@ -187,7 +191,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             }
             check_vector("queue", qs.msix_vector, table_len)?;
             if qs.live {
-                let mut probe = crate::queue::VirtQueue::new(own);
+                // Built at the payload's size: the ring bounds the
+                // device reads and writes follow from that, not from
+                // the maximum this device offers.
+                let mut probe = crate::queue::VirtQueue::new(size);
                 probe.set_addr_modern(
                     qs.desc_addr,
                     qs.avail_addr,
@@ -233,6 +240,18 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
 
         for qs in &state.queues {
             let idx = usize::from(qs.queue_idx);
+            // The size goes in before the addresses. The device reads
+            // and writes `size` entries, so a ring restored at this
+            // device's maximum would walk past the one the source ran.
+            // The reset takes the queue back to unconfigured, which is
+            // the only state `set_size` accepts.
+            vs.queues[idx].reset();
+            vs.queues[idx].set_size(qs.queue_size).map_err(|error| {
+                DeviceStateError::invalid(format!(
+                    "queue {}: {error}",
+                    qs.queue_idx,
+                ))
+            })?;
             vs.queues[idx].set_addr_modern(
                 qs.desc_addr,
                 qs.avail_addr,
