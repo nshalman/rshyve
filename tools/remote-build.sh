@@ -44,6 +44,30 @@ PROFILE="${VMM_BUILD_PROFILE:---release}"
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# The binary reports the revision it was built from, and that revision
+# must be computed here: sync_sources excludes .git, so the build host
+# holds no clone and git there answers for an unrelated repository or
+# not at all. A value that does not name an object is dropped rather
+# than sent, so the binary says `unstamped` instead of naming a commit
+# that resolves nowhere.
+build_rev() {
+    local rev
+    rev="$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null)" || return 0
+    # Untracked files reach the build host too, because rsync sends the
+    # working tree and not a commit.
+    if [ -n "$(git -C "$SRC_DIR" status --porcelain 2>/dev/null)" ]; then
+        rev="$rev-dirty"
+    fi
+    printf '%s' "$rev"
+}
+
+BUILD_REV="$(build_rev)"
+if ! printf '%s' "$BUILD_REV" | grep -Eq '^[0-9a-f]{7,40}(-dirty)?$'; then
+    echo "BUILD-WARN: no source revision here; the binary will report" \
+         "unstamped" >&2
+    BUILD_REV=""
+fi
+
 # Host key verification stays on. Add the build host to known_hosts once,
 # after checking its fingerprint out of band.
 SSH=(ssh -o ConnectTimeout=15 -i "$KEY" "$HOST")
@@ -51,6 +75,11 @@ SSH=(ssh -o ConnectTimeout=15 -i "$KEY" "$HOST")
 # /opt/tools/bin and /opt/local/bin hold the pkgsrc toolchain (cargo, gcc,
 # autoconf, gmake, pkg-config); none of them are on root's default PATH.
 REMOTE_ENV="export PATH=/opt/tools/bin:/opt/local/bin:/usr/bin:/usr/sbin:\$PATH; cd $REMOTE_DIR"
+# The value is spliced into a command a remote root shell parses, and it
+# passed the object-name check above, so it holds no shell metacharacter.
+if [ -n "$BUILD_REV" ]; then
+    REMOTE_ENV="$REMOTE_ENV; export TRITON_BUILD_REV=$BUILD_REV"
+fi
 
 usage() { sed -n '3,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 
