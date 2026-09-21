@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 use slog::{debug, error, info, warn, Logger};
 
 use vmm_devices::hotplug::cpu::CpuHotplug;
+use vmm_devices::metrics::VcpuMetrics;
 
 use super::drain::DrainThread;
 use super::lock;
@@ -102,6 +103,11 @@ pub trait CpuOnline: Send + Sync {
     fn boot_cpus(&self) -> u32;
     fn is_online(&self, id: u32) -> bool;
     fn add_vcpu(&self, id: u32) -> Result<(), VcpuError>;
+    /// The exit counters of every CPU added since boot, by id. A set
+    /// with no threads behind it has none.
+    fn added_metrics(&self) -> Vec<(u32, Arc<VcpuMetrics>)> {
+        Vec::new()
+    }
 }
 
 impl CpuOnline for VcpuRegistry {
@@ -119,6 +125,10 @@ impl CpuOnline for VcpuRegistry {
 
     fn add_vcpu(&self, id: u32) -> Result<(), VcpuError> {
         VcpuRegistry::add_vcpu(self, id)
+    }
+
+    fn added_metrics(&self) -> Vec<(u32, Arc<VcpuMetrics>)> {
+        VcpuRegistry::added_metrics(self)
     }
 }
 

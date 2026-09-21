@@ -15,7 +15,7 @@
 //! cpu-add 2                    -> OK 2,present
 //! mem-add 134217728            -> OK slot0,present
 //! status                       -> OK 9 state,running uptime_ms,12 ...
-//! metrics                      -> OK 7 uptime_ms,12 vcpu0.exits,40 ...
+//! metrics                      -> OK 20 uptime_ms,12 vcpus,2 total.exits,40 vcpu0.exits,30 ...
 //! halt                         -> OK halt,requested
 //! ```
 //!
@@ -39,6 +39,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
+use vmm_config::MAX_VCPUS;
 use vmm_devices::metrics::VcpuMetrics;
 use vmm_machine::inventory::{
     cpu_inventory, CpuSlotState, MemWindowReport, CPU_HOTPLUG_OFF,
@@ -46,10 +47,56 @@ use vmm_machine::inventory::{
 };
 use vmm_machine::signal::GuestStop;
 use vmm_machine::{DeviceRegistry, HotplugEngines};
-use vmm_virtio::vsock::control::{ControlReply, ControlRequest, ControlSink};
+use vmm_virtio::vsock::control::{
+    ControlReply, ControlRequest, ControlSink, RESPONSE_LINE_MAX,
+};
 
 /// Placeholder for a device that is not on the PCI bus.
 const NO_BDF: &str = "-";
+
+/// The exit buckets `metrics` reports for every vCPU, in wire order.
+const EXIT_BUCKETS: [&str; 6] = [
+    "exits",
+    "exits_pio",
+    "exits_mmio",
+    "exits_hlt",
+    "exits_msr",
+    "exits_other",
+];
+
+/// How many vCPUs get their own records in `metrics`. The totals cover
+/// every vCPU whatever this is; this bounds the line, and the ids a
+/// hot-add can take are below the same ceiling.
+const PER_VCPU_MAX: usize = MAX_VCPUS as usize;
+
+/// The longest `metrics` line: every counter at `u64::MAX` on every
+/// CPU slot. Sized here so the ceiling cannot grow past the response
+/// cap without this file noticing.
+const METRICS_LINE_WORST: usize = {
+    let digits = 20; // u64::MAX
+    let sep = 2; // the space before a record and the comma in it
+    let head = "OK ".len() + digits;
+    let uptime = sep + "uptime_ms".len() + digits;
+    let count = sep + "vcpus".len() + digits;
+    let bucket = "exits_other".len();
+    let totals = EXIT_BUCKETS.len() * (sep + "total.".len() + bucket + digits);
+    let id_digits = digits_of(PER_VCPU_MAX);
+    let per_vcpu = PER_VCPU_MAX
+        * EXIT_BUCKETS.len()
+        * (sep + "vcpu".len() + id_digits + ".".len() + bucket + digits);
+    head + uptime + count + totals + per_vcpu
+};
+
+const _: () = assert!(METRICS_LINE_WORST <= RESPONSE_LINE_MAX);
+
+const fn digits_of(mut n: usize) -> usize {
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
 
 /// Why `shutdown` answers `ERR`.
 pub const NO_SHUTDOWN: &str = "shutdown is not supported: a microVM has \
@@ -136,30 +183,23 @@ impl Inventory {
         ])
     }
 
-    fn uptime_ms(&self) -> u128 {
-        self.runtime.started.elapsed().as_millis()
+    fn uptime_ms(&self) -> u64 {
+        u64::try_from(self.runtime.started.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
     }
 
-    /// `key,value` counters: the uptime and every vCPU's exit buckets.
+    /// `key,value` counters: the uptime, the vCPU count, every exit
+    /// bucket summed over the vCPUs, then each vCPU's own buckets.
     fn metrics(&self) -> ControlReply {
-        let mut records =
-            vec![vec!["uptime_ms".to_string(), self.uptime_ms().to_string()]];
-        for (id, m) in self.runtime.metrics.iter().enumerate() {
-            for (name, counter) in [
-                ("exits", &m.exits),
-                ("exits_pio", &m.exits_pio),
-                ("exits_mmio", &m.exits_mmio),
-                ("exits_hlt", &m.exits_hlt),
-                ("exits_msr", &m.exits_msr),
-                ("exits_other", &m.exits_other),
-            ] {
-                records.push(vec![
-                    format!("vcpu{id}.{name}"),
-                    counter.load(Ordering::Relaxed).to_string(),
-                ]);
-            }
+        let mut vcpus: Vec<(u32, Arc<VcpuMetrics>)> = (0u32..)
+            .zip(self.runtime.metrics.iter())
+            .map(|(id, m)| (id, Arc::clone(m)))
+            .collect();
+        if let Some(cpus) = self.hotplug.cpu.as_ref() {
+            vcpus.extend(cpus.added_metrics());
         }
-        ControlReply::list(records)
+        vcpus.sort_by_key(|(id, _)| *id);
+        ControlReply::list(metrics_records(self.uptime_ms(), &vcpus))
     }
 
     /// Stop the VM now. The answer says the stop was requested; the
@@ -256,6 +296,52 @@ impl Inventory {
     }
 }
 
+/// The `metrics` records for these vCPUs.
+///
+/// Split from the inventory so the wire shape can be tested at the
+/// CPU ceiling. The totals sum every vCPU; the per-vCPU records stop
+/// at [`PER_VCPU_MAX`].
+fn metrics_records(
+    uptime_ms: u64,
+    vcpus: &[(u32, Arc<VcpuMetrics>)],
+) -> Vec<Vec<String>> {
+    let pair = |key: String, value: u64| vec![key, value.to_string()];
+    let buckets = |m: &VcpuMetrics| -> [u64; 6] {
+        [
+            m.exits.load(Ordering::Relaxed),
+            m.exits_pio.load(Ordering::Relaxed),
+            m.exits_mmio.load(Ordering::Relaxed),
+            m.exits_hlt.load(Ordering::Relaxed),
+            m.exits_msr.load(Ordering::Relaxed),
+            m.exits_other.load(Ordering::Relaxed),
+        ]
+    };
+
+    let mut totals = [0u64; 6];
+    let mut per_vcpu = Vec::with_capacity(vcpus.len().min(PER_VCPU_MAX) * 6);
+    for (n, (id, m)) in vcpus.iter().enumerate() {
+        let counts = buckets(m);
+        for (total, count) in totals.iter_mut().zip(counts) {
+            *total = total.saturating_add(count);
+        }
+        if n < PER_VCPU_MAX {
+            for (name, count) in EXIT_BUCKETS.iter().zip(counts) {
+                per_vcpu.push(pair(format!("vcpu{id}.{name}"), count));
+            }
+        }
+    }
+
+    let mut records = vec![
+        pair("uptime_ms".to_string(), uptime_ms),
+        pair("vcpus".to_string(), vcpus.len() as u64),
+    ];
+    for (name, total) in EXIT_BUCKETS.iter().zip(totals) {
+        records.push(pair(format!("total.{name}"), total));
+    }
+    records.extend(per_vcpu);
+    records
+}
+
 /// What `mem-list` says about the hot-add window.
 ///
 /// Split from the engine so the wire shape can be tested: every part of
@@ -293,10 +379,9 @@ impl ControlSink for Inventory {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
-
-    use std::collections::BTreeSet;
 
     use vmm_machine::{
         CpuHotplugEngine, CpuOnline, CpuSlots, DeviceRegistry, HotplugError,
@@ -364,6 +449,8 @@ mod tests {
         possible: u32,
         boot: u32,
         online: Mutex<BTreeSet<u32>>,
+        /// The counters of the CPUs added here, as a registry keeps them.
+        added: Mutex<BTreeMap<u32, Arc<VcpuMetrics>>>,
         refuse: Option<VcpuError>,
     }
 
@@ -373,6 +460,7 @@ mod tests {
                 possible,
                 boot,
                 online: Mutex::new((0..boot).collect()),
+                added: Mutex::new(BTreeMap::new()),
                 refuse: None,
             })
         }
@@ -382,12 +470,20 @@ mod tests {
                 possible,
                 boot,
                 online: Mutex::new((0..boot).collect()),
+                added: Mutex::new(BTreeMap::new()),
                 refuse: Some(error),
             })
         }
 
         fn online(&self) -> std::sync::MutexGuard<'_, BTreeSet<u32>> {
             self.online.lock().expect("test lock")
+        }
+
+        fn added(
+            &self,
+        ) -> std::sync::MutexGuard<'_, BTreeMap<u32, Arc<VcpuMetrics>>>
+        {
+            self.added.lock().expect("test lock")
         }
     }
 
@@ -409,7 +505,15 @@ mod tests {
                 return Err(error);
             }
             self.online().insert(id);
+            self.added().insert(id, Arc::new(VcpuMetrics::new()));
             Ok(())
+        }
+
+        fn added_metrics(&self) -> Vec<(u32, Arc<VcpuMetrics>)> {
+            self.added()
+                .iter()
+                .map(|(id, m)| (*id, Arc::clone(m)))
+                .collect()
         }
     }
 
@@ -735,18 +839,107 @@ mod tests {
     }
 
     #[test]
-    fn metrics_reports_every_vcpu_exit_bucket() {
+    fn metrics_reports_the_totals_and_every_vcpu_exit_bucket() {
         let inv = inventory(DeviceRegistry::new());
         inv.runtime.metrics[1].record_exit(&vmm_core::exits::VmExitKind::Hlt);
+        inv.runtime.metrics[0].record_exit(&vmm_core::exits::VmExitKind::Hlt);
 
         let answer = line(&inv, "metrics");
         let fields: Vec<&str> = answer.split(' ').collect();
-        // uptime plus six buckets for each of the two vCPUs.
-        assert_eq!(fields[1], "13", "{answer}");
-        assert!(fields.contains(&"vcpu0.exits,0"), "{answer}");
+        // uptime, the count, six totals, six buckets for each of two.
+        assert_eq!(fields[1], "20", "{answer}");
+        assert!(fields.contains(&"vcpus,2"), "{answer}");
+        assert!(fields.contains(&"total.exits,2"), "{answer}");
+        assert!(fields.contains(&"total.exits_hlt,2"), "{answer}");
+        assert!(fields.contains(&"total.exits_pio,0"), "{answer}");
+        assert!(fields.contains(&"vcpu0.exits,1"), "{answer}");
         assert!(fields.contains(&"vcpu1.exits,1"), "{answer}");
         assert!(fields.contains(&"vcpu1.exits_hlt,1"), "{answer}");
         assert!(fields.contains(&"vcpu1.exits_pio,0"), "{answer}");
+    }
+
+    /// A CPU brought online after boot counts like the boot set: its
+    /// exits are in the totals and it has its own records.
+    #[test]
+    fn metrics_includes_a_vcpu_that_was_hot_added() {
+        let cpus = FakeCpus::new(4, 2);
+        let inv = inventory_with_cpus(Arc::clone(&cpus));
+        assert_eq!(line(&inv, "cpu-add 3"), "OK 3,present");
+        cpus.added()[&3].record_exit(&vmm_core::exits::VmExitKind::Hlt);
+
+        let answer = line(&inv, "metrics");
+        let fields: Vec<&str> = answer.split(' ').collect();
+        assert_eq!(fields[1], "26", "{answer}");
+        assert!(fields.contains(&"vcpus,3"), "{answer}");
+        assert!(fields.contains(&"total.exits,1"), "{answer}");
+        assert!(fields.contains(&"total.exits_hlt,1"), "{answer}");
+        assert!(fields.contains(&"vcpu3.exits,1"), "{answer}");
+        assert!(fields.contains(&"vcpu3.exits_hlt,1"), "{answer}");
+        // Boot vCPUs first, then the added one, in id order.
+        let vcpu0 = fields.iter().position(|f| f.starts_with("vcpu0."));
+        let vcpu3 = fields.iter().position(|f| f.starts_with("vcpu3."));
+        assert!(vcpu0 < vcpu3, "{answer}");
+    }
+
+    /// The line at the CPU ceiling with every counter at its widest
+    /// still fits the response cap, so `metrics` can never answer with
+    /// the refusal a list past the cap gets.
+    #[test]
+    fn metrics_at_the_cpu_ceiling_fits_the_response_cap() {
+        let vcpus: Vec<(u32, Arc<VcpuMetrics>)> = (0..MAX_VCPUS)
+            .map(|id| {
+                let m = VcpuMetrics::new();
+                for counter in [
+                    &m.exits,
+                    &m.exits_pio,
+                    &m.exits_mmio,
+                    &m.exits_hlt,
+                    &m.exits_msr,
+                    &m.exits_other,
+                ] {
+                    counter.store(u64::MAX, Ordering::Relaxed);
+                }
+                (id, Arc::new(m))
+            })
+            .collect();
+
+        let line =
+            ControlReply::list(metrics_records(u64::MAX, &vcpus)).render();
+
+        assert!(
+            line.starts_with("OK 392 uptime_ms,18446744073709551615 "),
+            "{line}"
+        );
+        assert!(line.len() <= METRICS_LINE_WORST, "{}", line.len());
+        assert!(line.len() <= RESPONSE_LINE_MAX, "{}", line.len());
+        // The totals saturate rather than wrap.
+        assert!(
+            line.contains(" total.exits,18446744073709551615 "),
+            "{line}"
+        );
+        let last = format!("vcpu{}.exits_other,{}", MAX_VCPUS - 1, u64::MAX);
+        assert!(line.ends_with(&last), "{line}");
+    }
+
+    /// Past the per-vCPU bound the totals still count every vCPU.
+    #[test]
+    fn metrics_totals_cover_vcpus_past_the_per_vcpu_bound() {
+        let vcpus: Vec<(u32, Arc<VcpuMetrics>)> = (0..=PER_VCPU_MAX as u32)
+            .map(|id| {
+                let m = VcpuMetrics::new();
+                m.record_exit(&vmm_core::exits::VmExitKind::Hlt);
+                (id, Arc::new(m))
+            })
+            .collect();
+
+        let records = metrics_records(0, &vcpus);
+
+        let total = format!("{}", PER_VCPU_MAX + 1);
+        assert!(records.contains(&vec!["total.exits".to_string(), total]));
+        assert!(!records
+            .iter()
+            .any(|r| r[0].starts_with(&format!("vcpu{PER_VCPU_MAX}."))));
+        assert_eq!(records.len(), 2 + 6 + 6 * PER_VCPU_MAX);
     }
 
     #[test]
