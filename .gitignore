@@ -6,6 +6,7 @@ kernel/linux-*.tar.xz*
 kernel/vmlinuz-*
 kernel/vmlinux-*
 kernel/config-fastboot*
+kernel/*.candidate
 # The resolved config of the published guest kernel is tracked, because
 # it is the one small file that says which options went into the image,
 # and guest-kernel.yml diffs each build against it.

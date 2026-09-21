@@ -80,6 +80,11 @@ case_ "an option that went missing" 1 clamped.config on.config prose.config off.
 case_ "no space after the hash" 1 re-enabled.config on.config nospace.config
 case_ "a trailing space" 1 re-enabled.config on.config trailing.config
 case_ "prose is not an option" 0 resolved.config prose.config
+# A base fragment given with -s: its malformed line still fails, but
+# its values are not asserted, so a later fragment may override them.
+case_ "syntax-only still catches the malformed line" 1 resolved.config -s nospace.config on.config
+case_ "syntax-only does not assert values" 0 re-enabled.config -s off.config on.config
+case_ "syntax-only alone passes" 0 resolved.config -s off.config
 case_ "a fragment that is not there" 1 resolved.config gone.config
 case_ "a config that is not there" 1 gone.config on.config
 

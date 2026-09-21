@@ -1,7 +1,11 @@
 #!/bin/sh
 # Check a resolved kernel .config against the fragments that made it.
 #
-# Usage: check-config.sh <resolved .config> <fragment dir> <fragment>...
+# Usage: check-config.sh <resolved .config> <fragment dir> [-s <fragment>]... <fragment>...
+#
+# A fragment given with -s is scanned for the malformed negative line
+# only; its values are not asserted. That is for a base fragment whose
+# "is not set" lines a later fragment is meant to override.
 #
 # kconfig drops an option whose dependencies are unmet and says nothing,
 # and it turns a "default y" option back on for the same reason. Both
@@ -16,7 +20,7 @@
 set -eu
 
 if [ $# -lt 3 ]; then
-    echo "usage: $0 <resolved .config> <fragment dir> <fragment>..." >&2
+    echo "usage: $0 <resolved .config> <fragment dir> [-s <fragment>]... <fragment>..." >&2
     exit 2
 fi
 
@@ -24,6 +28,13 @@ cfg=$1
 dir=$2
 shift 2
 rc=0
+
+syntax_only=
+while [ "${1:-}" = "-s" ]; do
+    [ $# -ge 2 ] || { echo "usage: -s needs a fragment name" >&2; exit 2; }
+    syntax_only="$syntax_only $2"
+    shift 2
+done
 
 if [ ! -f "$cfg" ]; then
     echo "FAIL: no resolved config at $cfg"
@@ -34,7 +45,7 @@ fi
 # space after the hash (scripts/kconfig/confdata.c tests line[1] == ' ').
 # Every other spelling is a plain comment, so the option comes back on
 # and nothing reports it.
-for frag in "$@"; do
+for frag in $syntax_only "$@"; do
     path="$dir/$frag"
     if [ ! -f "$path" ]; then
         echo "FAIL: no config fragment at $path"
@@ -55,6 +66,8 @@ done
 # read in order and only the last line for each symbol is asserted. A
 # fragment that turns off what an earlier one turned on is the whole
 # point of the ordering rule, and must not read as a dropped option.
+[ $# -gt 0 ] || exit 0
+
 want=$(mktemp)
 trap 'rm -f "$want"' EXIT
 for frag in "$@"; do

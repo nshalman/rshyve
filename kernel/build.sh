@@ -116,9 +116,10 @@ echo '=== Config summary ==='
 grep -c '=y' .config | xargs printf 'Static options: %s\n'
 grep -c '=m' .config | xargs printf 'Module options: %s (should be 0)\n'
 
-# The resolved config. Written before the compile, so a failed check
-# leaves behind the file that says why.
-cp .config /build/config-fastboot\${OUT_SUFFIX}
+# The resolved config. A candidate until the compile succeeds, so a
+# failed run cannot dirty the tracked copy; the candidate stays behind
+# to say why.
+cp .config /build/config-fastboot\${OUT_SUFFIX}.candidate
 
 # olddefconfig silently drops an option whose dependencies are unmet.
 # Catch that here rather than after a full build and a failed boot. PVH
@@ -131,14 +132,24 @@ grep -q '^CONFIG_PVH=y' .config || {
 
 # Every option the EXTRA fragments ask for, in both directions, and the
 # malformed negative line that kconfig would read as a comment.
-# fastboot.config is not given: it states its own \"is not set\" lines to
-# keep the one-shot payload small, and a later fragment is meant to
-# override them.
-if [ -n \"\$EXTRA\" ]; then
-    sh /build/check-config.sh /build/config-fastboot\${OUT_SUFFIX} /build \$EXTRA || {
-        echo 'BUILD-FAIL: the resolved config does not match the fragments'
-        exit 1
-    }
+# fastboot.config gets the malformed-line scan only: a later fragment is
+# meant to override its \"is not set\" lines, so their values are not
+# asserted.
+sh /build/check-config.sh /build/config-fastboot\${OUT_SUFFIX}.candidate /build \
+    -s fastboot.config \$EXTRA || {
+    echo 'BUILD-FAIL: the resolved config does not match the fragments'
+    exit 1
+}
+
+# A kernel named sandbox runs hostile code. These two stay off whatever
+# fragment list a caller passed, so a short list cannot produce one.
+if [ \"\${OUT_SUFFIX}\" = -sandbox ]; then
+    for sym in CONFIG_USER_NS CONFIG_VSOCKETS_LOOPBACK; do
+        if grep -q \"^\$sym=\" .config; then
+            echo \"BUILD-FAIL: \$sym is on in a sandbox kernel\"
+            exit 1
+        fi
+    done
 fi
 
 # Build
@@ -148,6 +159,7 @@ make ARCH=x86_64 -j\$(nproc) bzImage 2>&1 | tail -20
 # carrying the PVH entry survives.
 cp arch/x86_64/boot/bzImage /build/vmlinuz-fastboot\${OUT_SUFFIX}
 objcopy --strip-all vmlinux /build/vmlinux-fastboot\${OUT_SUFFIX}
+mv /build/config-fastboot\${OUT_SUFFIX}.candidate /build/config-fastboot\${OUT_SUFFIX}
 
 # The notes go to a file first. grep -q exits at its first match, so a
 # producer in a pipeline takes a SIGPIPE, and this check would then fail

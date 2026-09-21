@@ -104,7 +104,7 @@ jobs:
               ;;
           esac
 
-          ./check-config.sh "config-fastboot${OUT_SUFFIX}" . $FRAGMENTS
+          ./check-config.sh "config-fastboot${OUT_SUFFIX}" . -s fastboot.config $FRAGMENTS
 
       # The fragments say what this kernel asked for. This step says what
       # the sandbox cannot run without, and it fails closed: an emptied
