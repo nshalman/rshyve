@@ -149,7 +149,11 @@ make ARCH=x86_64 -j\$(nproc) bzImage 2>&1 | tail -20
 cp arch/x86_64/boot/bzImage /build/vmlinuz-fastboot\${OUT_SUFFIX}
 objcopy --strip-all vmlinux /build/vmlinux-fastboot\${OUT_SUFFIX}
 
-readelf -n /build/vmlinux-fastboot\${OUT_SUFFIX} | grep -qi xen || {
+# The notes go to a file first. grep -q exits at its first match, so a
+# producer in a pipeline takes a SIGPIPE, and this check would then fail
+# on a GOOD image under any shell that sets pipefail.
+readelf -n /build/vmlinux-fastboot\${OUT_SUFFIX} > /tmp/pvh-notes.txt
+grep -qi xen /tmp/pvh-notes.txt || {
     echo 'BUILD-FAIL: vmlinux carries no Xen PVH note'
     exit 1
 }
