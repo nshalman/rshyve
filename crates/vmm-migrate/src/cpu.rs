@@ -10,8 +10,6 @@
 //! comparison rejects by default: a guest that already executed an
 //! instruction the destination lacks takes #UD in kernel context, which
 //! no error path can recover.
-//!
-//! Closes OSF-3 in docs/security/open-findings.md.
 
 use vmm_core::cpuid::{query_masked_features, CpuBaseline};
 

@@ -446,8 +446,8 @@ fn a_host_port_the_guest_already_holds_is_skipped() {
 }
 
 /// The guest drops whatever arrives past the window it published,
-/// so the device must not send past it. Kills the mutation of
-/// queueing the whole buffer and leaving the window unread.
+/// so the device must not send past it. Fails if the device queues the
+/// whole buffer and leaves the window unread.
 #[test]
 fn the_host_sends_no_more_than_the_guest_advertised() {
     let m = mux();
@@ -476,9 +476,9 @@ fn the_host_sends_no_more_than_the_guest_advertised() {
 }
 
 /// A guest that has advertised nothing must get nothing, and the
-/// bytes must wait rather than be dropped. Kills the mutation of
-/// treating an empty window as room for one more packet, and the
-/// mutation of discarding what does not fit.
+/// bytes must wait rather than be dropped. Fails if an empty window is
+/// read as room for one more packet, or if what does not fit is
+/// discarded.
 #[test]
 fn zero_credit_queues_nothing_and_keeps_the_bytes() {
     let m = mux();
@@ -585,8 +585,8 @@ fn credit_returning_lets_the_rest_flow() {
 /// Credit is spent on bytes the guest will see. A packet the
 /// backlog refused never reaches it, so counting it would shut the
 /// window on bytes that were never sent and stall the connection
-/// for good. Kills the mutation of recording the send before the
-/// queue has taken the packet.
+/// for good. Fails if the send is recorded before the queue has taken
+/// the packet.
 #[test]
 fn a_packet_the_backlog_refused_spends_no_credit() {
     let m = mux();
@@ -621,8 +621,8 @@ fn a_packet_the_backlog_refused_spends_no_credit() {
 
 /// A connection nobody knows will never open a window, so the bytes
 /// must go rather than park the reader thread for the life of the
-/// VM. Kills the mutation of holding the buffer when the connection
-/// has gone, which leaves the reader loop waiting until shutdown.
+/// VM. Fails if the buffer is held after the connection has gone, which
+/// leaves the reader loop waiting until shutdown.
 #[test]
 fn payload_for_a_forgotten_connection_does_not_park_the_reader() {
     let m = mux();
@@ -702,8 +702,8 @@ fn payload_tells_the_guest_how_much_of_its_stream_we_took() {
 /// service that speaks first is the usual shape. Dropping the credit
 /// off that REQUEST leaves the window shut until the guest happens to
 /// send, which for such a service is never. The mirror of the zero
-/// window we used to put on a REQUEST of our own. Kills the mutation
-/// of building the connection without absorbing the REQUEST's credit.
+/// window this device puts on a REQUEST of its own. Fails if the
+/// connection is built without absorbing the REQUEST's credit.
 #[test]
 fn a_guest_request_opens_the_window_it_names() {
     let m = mux();

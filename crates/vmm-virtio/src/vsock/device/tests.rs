@@ -1285,8 +1285,8 @@ fn the_reader_offers_every_byte_once_through_a_small_window() {
 /// needs a chain like any other packet.
 ///
 /// Linux fills the whole ring the moment it probes, so this is the
-/// first pass, not a corner. Kills the mutation of arming only when
-/// the pass stopped short of the request cap.
+/// first pass, not a corner. Fails if the kick is armed only when the
+/// pass stopped short of the request cap.
 #[test]
 fn a_ring_taken_whole_still_arms_the_next_kick() {
     let (physmap, mut queues) = rx_ring_full();

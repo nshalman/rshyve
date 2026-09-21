@@ -4,12 +4,10 @@
 
 //! The reset measured where the guest sees it, not at the drain.
 //!
-//! `GuestAccess::drain` is one step of `VirtioDevice::reset`, and a
-//! test pointed at it cannot see a wait the reset does after it. That
-//! is exactly where the wait used to be: a review timed the whole
-//! reset against a parked interrupt and got 1.000191292s where the
-//! drain alone measured nothing. Every measurement here brackets the
-//! whole call.
+//! `GuestAccess::drain` is one step of `VirtioDevice::reset`, so a test
+//! pointed at the drain cannot see a wait the reset does after it, and
+//! that is where an unbounded wait hides. Every measurement here
+//! brackets the whole call.
 
 use super::*;
 
@@ -36,8 +34,7 @@ fn time_reset(fs: &VirtioFs, release: &dyn Fn()) -> Duration {
     })
 }
 
-// The measurement the last review used to prove the reset unbounded,
-// repeated at the same boundary. A worker is held inside the interrupt
+// A worker is held inside the interrupt
 // callback, standing in for an injection the kernel has not finished.
 // The reset must not queue behind it: the illumos driver reclaims the
 // ring the moment its one register write returns.

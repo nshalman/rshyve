@@ -407,7 +407,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::FromArgMatches;
+    use clap::{FromArgMatches, Parser};
 
     /// The zone brand reads the exit code: `boot.c` sets
     /// ZONE_ATTR_INITRESTART0 on every bhyve zone, so exit 0 restarts
@@ -449,24 +449,42 @@ mod tests {
         slog::Logger::root(slog::Discard, slog::o!())
     }
 
+    /// The MADT slot count, the CPU register file and the hot-add engine
+    /// have to describe one machine. Each reads `VmOpts`, so a ceiling
+    /// that reached one of them and not the others would let the guest
+    /// see a register file describing a machine the tables do not.
     #[test]
-    fn one_cpu_ceiling_feeds_the_tables_the_registers_and_the_engine() {
-        // The MADT slot count, the CPU register file and the hot-add
-        // engine have to describe one machine. All three read
-        // VmOpts::max_cpus: the tables through setup_fwcfg_and_acpi, the
-        // register file through HotplugOpts::from_vm, and the engine
-        // through the VcpuSetup below. A hand-built HotplugOpts here
-        // would let the register file describe a different machine, so
-        // the phase sequence must not contain one.
-        let src = include_str!("main.rs");
-        let end = src.find("#[cfg(test)]").expect("test module attribute");
-        let code = &src[..end];
+    fn one_cpu_ceiling_feeds_the_registers_and_the_engine() {
+        let cli = Cli::try_parse_from([
+            "firehyve",
+            "-c",
+            "cpus=2,maxcpus=8",
+            "--hotplug",
+            "-m",
+            "512M",
+            "vm",
+        ])
+        .expect("a hotplug command line");
+        let opts = vmm_machine::VmOpts::from_cli(&cli).expect("vm options");
 
-        assert!(!code.contains("HotplugOpts {"), "a hand-built HotplugOpts");
-        // One read, so every other use of the ceiling in this file
-        // flows from the one local it is read into.
-        assert_eq!(code.matches("VmOpts::from_cli(").count(), 1);
-        assert_eq!(code.matches("cli.max_cpus()").count(), 0);
+        assert_eq!(opts.num_cpus, 2);
+        assert_eq!(opts.max_cpus, 8);
+
+        // The register file the guest reads.
+        let hotplug = vmm_machine::pm::HotplugOpts::from_vm(&opts);
+        assert_eq!(hotplug.max_cpus, opts.max_cpus);
+        assert_eq!(hotplug.num_cpus, opts.num_cpus);
+        assert!(hotplug.enabled);
+
+        // The engine that brings a vCPU online.
+        let setup = VcpuSetup {
+            max_cpus: opts.max_cpus,
+            boot_cpus: opts.num_cpus,
+            vmexit_on_hlt: cli.vmexit_on_hlt,
+            cpuid: None,
+        };
+        assert_eq!(setup.max_cpus, hotplug.max_cpus);
+        assert_eq!(setup.boot_cpus, hotplug.num_cpus);
     }
 
     #[test]
