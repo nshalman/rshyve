@@ -17,9 +17,11 @@ use vmm_boot::direct;
 use vmm_config::Cli;
 use vmm_core::machine::Machine;
 use vmm_core::msr::MsrHandler;
+use vmm_core::unixsock::peercred::{install_policy, PeerPolicy};
 use vmm_devices::InputBroker;
+use vmm_machine::privilege::{OpenWitness, PrivPlan, RunAs};
 use vmm_machine::{
-    DeviceRegistry, HotplugEngine, HotplugEngines, RegisteredDevice,
+    devspec, DeviceRegistry, HotplugEngine, HotplugEngines, RegisteredDevice,
     RunOutcome, VcpuSetup,
 };
 
@@ -296,6 +298,60 @@ fn spawn_control_socket(
 /// What `run` hands `main`.
 ///
 /// The hot-added specs travel with the outcome because only `run` can
+/// rshyve keeps its inherited privileges unless told otherwise: the
+/// control socket, migration and the vTPM all open host files after
+/// start, and the drop would break them.
+const PRIV_DROP_DEFAULT: bool = false;
+
+/// The privilege lock rshyve was asked for, checked against the
+/// features the lock would break.
+#[derive(Debug, PartialEq, Eq)]
+struct PrivRequest {
+    drop: bool,
+    run_as: Option<RunAs>,
+}
+
+/// Read `--priv-drop` and refuse it beside a feature that opens host
+/// files after start. Pure, so the rule is testable without a VM.
+fn priv_request(cli: &Cli) -> anyhow::Result<PrivRequest> {
+    let drop = cli.priv_drop_or(PRIV_DROP_DEFAULT);
+    if !drop {
+        anyhow::ensure!(
+            cli.run_as_uid.is_none() && cli.run_as_gid.is_none(),
+            "--run-as-uid and --run-as-gid need --priv-drop"
+        );
+        return Ok(PrivRequest { drop, run_as: None });
+    }
+    let blockers: Vec<&str> = [
+        ("--control-socket", cli.control_socket.is_some()),
+        ("--migrate-listen", cli.migrate_listen.is_some()),
+        ("--vtpm", cli.vtpm),
+        ("--mdata-root-pw-file", cli.mdata_root_pw_file.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, set)| set.then_some(flag))
+    .collect();
+    anyhow::ensure!(
+        blockers.is_empty(),
+        "--priv-drop cannot be combined with {}: each opens host files \
+         after the lock",
+        blockers.join(", ")
+    );
+    let run_as = cli.run_as_or(None)?.map(|(uid, gid)| RunAs { uid, gid });
+    Ok(PrivRequest { drop, run_as })
+}
+
+/// What the argv attached, for the lock's open-device witness.
+fn witness_ids(specs: &[String]) -> Vec<String> {
+    specs
+        .iter()
+        .filter(|spec| {
+            !matches!(spec.split(',').nth(1), Some("hostbridge" | "lpc") | None)
+        })
+        .map(|spec| devspec::device_id(spec))
+        .collect()
+}
+
 /// see the registry, and only `main` has argv to rebuild.
 struct RunResult {
     outcome: RunOutcome,
@@ -304,6 +360,27 @@ struct RunResult {
 }
 
 fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
+    // The inherited set is read before any device opens; the lock runs
+    // after the last one. Off by default here, and said so.
+    let privilege = priv_request(&cli)?;
+    let plan =
+        if privilege.drop {
+            Some(PrivPlan::begin_from_process().map_err(|e| {
+                anyhow::anyhow!("privilege drop cannot start: {e}")
+            })?)
+        } else {
+            info!(log, "privilege drop: off";
+            "reason" => "rshyve default; pass --priv-drop to lock");
+            None
+        };
+    // Before the first socket is bound, naming the uid the process
+    // ends at.
+    if install_policy(PeerPolicy::for_process(privilege.run_as.map(|r| r.uid))?)
+        .is_err()
+    {
+        anyhow::bail!("the peer policy was installed twice");
+    }
+
     // Read once. The MADT slot count, the CPU register file and the
     // hot-add engine all read this, so the guest cannot be told about
     // a slot no engine can fill.
@@ -439,6 +516,24 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     // this rename, not on the process, and gives up after 300 s. C
     // bhyve does it at the same point, bhyverun.c:915.
     vmm_machine::provision::mark_provisioned(log);
+
+    // Phase 8b: lock, when asked. Every device is open and the brand
+    // has its rename.
+    if let Some(plan) = plan.as_ref() {
+        let witness = OpenWitness {
+            vmm_open: true,
+            expected_devices: witness_ids(&cli.pci_slot),
+            present_devices: registry
+                .list()
+                .into_iter()
+                .map(|device| device.id)
+                .collect(),
+        };
+        let report = plan
+            .lock(&witness, privilege.run_as)
+            .map_err(|e| anyhow::anyhow!("privilege drop failed: {e}"))?;
+        info!(log, "privilege drop: on"; "sets" => report.summary());
+    }
 
     // Phase 9: Spawn vCPU threads. The fleet, not the fixed set,
     // because a CPU added later joins the same event channel and the
@@ -630,6 +725,73 @@ mod tests {
             .try_get_matches_from(args)
             .expect("argv parses");
         Cli::from_arg_matches(&matches).expect("from_arg_matches")
+    }
+
+    #[test]
+    fn the_drop_is_off_by_default_for_rshyve() {
+        let cli = cli_from(&["rshyve", "guest"]);
+        assert_eq!(
+            priv_request(&cli).unwrap(),
+            PrivRequest {
+                drop: false,
+                run_as: None
+            }
+        );
+    }
+
+    #[test]
+    fn the_drop_can_be_asked_for_with_or_without_an_identity() {
+        let cli = cli_from(&["rshyve", "--priv-drop", "guest"]);
+        assert_eq!(
+            priv_request(&cli).unwrap(),
+            PrivRequest {
+                drop: true,
+                run_as: None
+            }
+        );
+        let cli = cli_from(&[
+            "rshyve",
+            "--priv-drop",
+            "--run-as-uid",
+            "5000",
+            "--run-as-gid",
+            "5000",
+            "guest",
+        ]);
+        assert_eq!(
+            priv_request(&cli).unwrap().run_as,
+            Some(RunAs {
+                uid: 5000,
+                gid: 5000
+            })
+        );
+    }
+
+    /// Each of these opens a host file after start, which the lock
+    /// forbids. Refused up front and named, not left to fail later.
+    #[test]
+    fn the_drop_is_refused_beside_a_feature_it_would_break() {
+        for (flag, extra) in [
+            ("--control-socket", vec!["--control-socket", "/tmp/c.sock"]),
+            ("--migrate-listen", vec!["--migrate-listen", "0.0.0.0:1"]),
+            ("--vtpm", vec!["--vtpm"]),
+        ] {
+            let mut argv = vec!["rshyve", "--priv-drop"];
+            argv.extend(extra);
+            argv.push("guest");
+            let err = priv_request(&cli_from(&argv)).expect_err(flag);
+            assert!(err.to_string().contains(flag), "{flag}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_witness_skips_the_chipset_names() {
+        let specs: Vec<String> =
+            ["0,hostbridge", "4,virtio-blk,/d.img", "31,lpc"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(witness_ids(&specs), vec!["virtio-blk@4"]);
     }
 
     /// The bhyve zone brand splits its only pass-through attr on
