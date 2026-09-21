@@ -41,7 +41,11 @@ TRITON_BUILD_REV="$(git rev-parse --short HEAD)" \
     cargo build --locked --release -p firehyve
 ```
 
-CI refuses a release build that reports `unstamped`.
+CI proves that a stamped build names its commit, that a build from a
+changed tree keeps the `-dirty` marker, and that an unstamped build says
+so. It cannot refuse one: a packaging path that does not set the
+variable ships a binary reporting `unstamped`, so every path that builds
+a binary for a platform image has to set it.
 
 ## What runs where
 
