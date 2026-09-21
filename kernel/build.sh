@@ -104,40 +104,30 @@ echo '=== Config summary ==='
 grep -c '=y' .config | xargs printf 'Static options: %s\n'
 grep -c '=m' .config | xargs printf 'Module options: %s (should be 0)\n'
 
+# The resolved config. Written before the compile, so a failed check
+# leaves behind the file that says why.
+cp .config /build/config-fastboot${OUT_SUFFIX}
+
 # olddefconfig silently drops an option whose dependencies are unmet.
-# Catch that here rather than after a full build and a failed boot.
+# Catch that here rather than after a full build and a failed boot. PVH
+# comes from fastboot.config, which check-config.sh is not given, so it
+# is named on its own.
 grep -q '^CONFIG_PVH=y' .config || {
     echo 'BUILD-FAIL: CONFIG_PVH was dropped by olddefconfig'
     exit 1
 }
 
-# Same check for every option the fragment asked for. olddefconfig drops
-# an option whose dependencies are unmet without saying so.
-for frag in \$EXTRA; do
-    for opt in \$(grep -o '^CONFIG_[A-Z0-9_]*=y' /build/\$frag); do
-        grep -q \"^\$opt\" .config || {
-            echo \"BUILD-FAIL: \$opt was dropped by olddefconfig\"
-            exit 1
-        }
-    done
-done
-
-# The same hazard in reverse, and the one that matters for a guest that
-# runs untrusted code: a fragment that turns an option OFF must win,
-# because olddefconfig turns a \"default y\" option back on. Nothing else
-# reports it. The kernel builds, boots, and carries the hole.
-#
-# Only the EXTRA fragments are read. fastboot.config states its own
-# \"is not set\" lines to keep the one-shot payload small, and a later
-# fragment is meant to override them.
-for frag in \$EXTRA; do
-    for sym in \$(sed -n 's/^# \(CONFIG_[A-Z0-9_]*\) is not set\$/\1/p' /build/\$frag); do
-        ! grep -q \"^\$sym=\" .config || {
-            echo \"BUILD-FAIL: \$sym was re-enabled by olddefconfig\"
-            exit 1
-        }
-    done
-done
+# Every option the EXTRA fragments ask for, in both directions, and the
+# malformed negative line that kconfig would read as a comment.
+# fastboot.config is not given: it states its own \"is not set\" lines to
+# keep the one-shot payload small, and a later fragment is meant to
+# override them.
+if [ -n \"\$EXTRA\" ]; then
+    sh /build/check-config.sh /build/config-fastboot${OUT_SUFFIX} /build \$EXTRA || {
+        echo 'BUILD-FAIL: the resolved config does not match the fragments'
+        exit 1
+    }
+fi
 
 # Build
 make ARCH=x86_64 -j\$(nproc) bzImage 2>&1 | tail -20
@@ -146,10 +136,6 @@ make ARCH=x86_64 -j\$(nproc) bzImage 2>&1 | tail -20
 # carrying the PVH entry survives.
 cp arch/x86_64/boot/bzImage /build/vmlinuz-fastboot${OUT_SUFFIX}
 objcopy --strip-all vmlinux /build/vmlinux-fastboot${OUT_SUFFIX}
-
-# The resolved config, so a caller can assert on the options it asked
-# for without a container, and an operator can diff two guest kernels.
-cp .config /build/config-fastboot${OUT_SUFFIX}
 
 readelf -n /build/vmlinux-fastboot${OUT_SUFFIX} | grep -qi xen || {
     echo 'BUILD-FAIL: vmlinux carries no Xen PVH note'
