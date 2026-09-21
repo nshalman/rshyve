@@ -45,8 +45,8 @@ Markers: **yes** works, **caveat** works with a condition named in the matching 
 | USB keyboard | no | no | absent from the tree |
 | PS/2 mouse motion | no | no | `ps2/mouse.rs` `movement()` returns zeros |
 | **Migration and control** | | | |
-| Live migration, Unix socket path | exp | reject | `crates/vmm-migrate/src/sync_source.rs` |
-| Live migration, TCP path | exp, incomplete | reject | `crates/vmm-migrate/src/source.rs` (ships no device state) |
+| Live migration over a Unix socket | exp | reject | `crates/vmm-migrate/src/source.rs`, `destination.rs` |
+| Live migration over TCP | exp | reject | the same driver over `std::net::TcpStream` (`crates/vmm-migrate/src/wire.rs`) |
 | Control socket (`--control-socket`) | yes | reject | `bin/rshyve/src/control.rs`; `bin/firehyve/src/main.rs:46` |
 | Dirty page tracking | on by default | never | `bin/rshyve/src/main.rs:175`; `bin/firehyve/src/main.rs:116` |
 | **Hotplug (`--hotplug`, off by default)** | | | |
@@ -431,15 +431,15 @@ Authorization is uid plus zone, not a capability: the peer's uid must equal the 
 
 ### Live migration
 
-Two implementations. The production path is the synchronous Unix-socket source and destination (`crates/vmm-migrate/src/sync_source.rs`), which uses `tungstenite` with no tokio because a bhyve-brand zone has no `/dev/poll`. The TCP path (`source.rs`, `destination.rs`) is tokio-based and described in its own comment as "for GZ or manual testing".
+One driver, over one transport trait. `crates/vmm-migrate/src/wire.rs` defines `Transport`, a `Read + Write` stream whose read deadline the protocol shortens once the guest is paused, and `source.rs` and `destination.rs` are generic over it. Two streams implement it: `UnixStream`, the only kind that works inside a bhyve-brand zone, where there is no `/dev/poll`, and `TcpStream` for a global-zone or lab run. Neither end starts an async runtime. The framing is `tungstenite` WebSocket binary frames carrying RON.
 
-**Only the Unix path carries emulated-device state.** `state::export_device_state` on the TCP path hardcodes `virtio_queues: Vec::new(), nvme_controllers: Vec::new()`, and the matching destination has no restore callback, so a TCP migration ships zero virtio ring state and zero NVMe state and the guest arrives with unprogrammed rings.
+The same driver serves both, so both carry the same state. An earlier tree had a second implementation for TCP that shipped no device state at all; it is gone.
 
-The Unix sequence is: full RAM pass, up to 5 dirty convergence iterations (500 ms apart, 1024-page threshold), pause devices, pause vCPUs, durable flush of every device, an optional ZFS barrier, a final dirty pass, then time data, device state and the exported queue state. If anything after pause fails, devices and vCPUs are resumed so the guest survives.
+The sequence is: full RAM pass, up to 5 dirty convergence iterations (500 ms apart, 1024-page threshold), pause devices, pause vCPUs, durable flush of every device, an optional ZFS barrier, a final dirty pass, then time data, device state and the exported queue state. If anything after pause fails, devices and vCPUs are resumed so the guest survives.
 
 Kernel state transferred: the ioapic, atpit, atpic, hpet, pm_timer and rtc system devices; per vCPU the 33 registers, 10 segment descriptors, MSRs, LAPIC, VMM_ARCH, run state and SIPI vector; and VMM time with boot_hrtime re-basing and TSC rescaling.
 
-Guarded refusals that work correctly: a vTPM, a bootrom variable store, or an `ahci-cd` device each block `migrate-source`; `--migrate-listen` combined with `--vtpm`, a varstore, or an `fbuf`/`ahci-cd` spec is a startup error. Note the asymmetry: `fbuf` blocks a destination but not a source, and `xhci` is on neither list, so a destination will accept an `xhci` spec and start with a fresh unrestored controller.
+Guarded refusals: a vTPM or a bootrom variable store blocks `migrate-source`, and so does any device whose state nothing carries, which is `ahci-cd`, `virtio-console`, `virtio-fs`, `virtio-vsock` and `xhci` (`UNMIGRATABLE`, `bin/rshyve/src/control/migrate.rs:152`). `--migrate-listen` combined with `--vtpm`, a varstore, or an `fbuf`/`ahci-cd` spec is a startup error. The remaining asymmetry is covered at the preamble rather than at startup: the two ends exchange their whole device set and a migration whose sets differ is refused before a page is accepted, so a destination holding a device the source has not cannot start the guest.
 
 Orchestration is not in this repository. Replicating the disk, sequencing the two hosts and bridging the transport belong to whatever drives the migration; this tree provides the VMM side, the control-socket verbs and the barrier contract (see [migration.md](migration.md#the-zfs-barrier)). `tools/vmm-migrate.sh` drives one end to end for lab use and is a test harness, not a supported component.
 

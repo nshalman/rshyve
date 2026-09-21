@@ -90,13 +90,15 @@ concrete PCI driver type; the binaries do.
 ### vmm-migrate
 
 - **`Message`** / **`MessageType`** (`codec.rs`) — the wire frames.
-- **`source`** / **`destination`** — the WebSocket protocol.
-- **`sync_source`** / **`sync_destination`** — the stream protocol that
-  production uses, which also flushes storage and exports device state.
+- **`Transport`** / **`Chan`** (`wire.rs`) — one byte stream, a Unix
+  socket or a TCP socket, with a read deadline the protocol shortens
+  once the guest is paused. Neither end starts an async runtime,
+  because a bhyve-brand zone has no `/dev/poll`.
+- **`source`** / **`destination`** — the two ends of the one driver.
+  The source pauses and flushes the devices and exports their state;
+  the destination checks the topology, the CPU features and the device
+  identities before it lets the guest run.
 - **`state`** — kernel state export and import over the vmm-data ioctls.
-
-The two protocols are not equivalent; `docs/security/open-findings.md`
-records what the async path leaves out.
 
 ## Data flow
 
