@@ -55,7 +55,9 @@ fn restored_state() -> viona_api::vioc_ring_state {
 }
 
 /// Restore one ring, the way a migration destination does.
-fn restore(device: &crate::viona::VirtioViona) {
+fn restore(
+    device: &crate::viona::VirtioViona,
+) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
     VirtioDevice::restore_ring_state(
         device,
         RESTORED_RING,
@@ -67,7 +69,7 @@ fn restore(device: &crate::viona::VirtioViona) {
         5,
         MSG_ADDR,
         MSG_DATA,
-    );
+    )
 }
 
 /// An interrupt path that records the rings it was raised for.
@@ -205,16 +207,17 @@ fn refused_kicks_warn_once_and_leave_the_ring_in_service() {
 
 #[test]
 fn a_ring_state_the_kernel_refused_programs_nothing_after_it() {
-    // The restore stops at the first refusal. Carrying on would mark
-    // the ring ready, route an MSI-X message to a ring the kernel does
-    // not have, and kick a worker that was never started.
+    // The restore stops at the first refusal and reports it. Carrying
+    // on would mark the ring ready, route an MSI-X message to a ring
+    // the kernel does not have, and kick a worker that was never
+    // started.
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::RingSetState]);
     let device = device_with(Arc::new(link));
     device.inner.lock().expect("viona lock").negotiated_features =
         u64::from(VIRTIO_NET_F_MAC);
 
-    restore(&device);
+    restore(&device).expect_err("a refused ring state must fail the restore");
 
     assert_eq!(
         steps_of(&steps),
@@ -232,27 +235,58 @@ fn a_ring_state_the_kernel_refused_programs_nothing_after_it() {
 }
 
 #[test]
-fn a_message_the_kernel_refused_does_not_stop_the_restore() {
-    // MSI-X is the kernel's shortcut, not the only route: without it
-    // the poll thread still raises the interrupt. So the ring is ready
-    // and kicked either way, and a restore that stopped here would
-    // leave a migrated guest with a ring nobody kicks.
+fn a_message_the_kernel_refused_fails_the_restore() {
+    // A live device can fall back on the poll thread for this ring's
+    // interrupt, so a refused message there is a warning. A migration
+    // has a better answer: the source is still running, so the restore
+    // reports the refusal and the migration goes back to it rather than
+    // handing the guest a queue the kernel cannot signal.
     let steps = Steps::default();
     let link = TestLink::new(&steps).failing(&[Op::RingSetMsi]);
     let device = running_device(Arc::new(link));
 
-    restore(&device);
+    restore(&device).expect_err("a refused message must fail the restore");
 
     assert_eq!(
         steps_of(&steps).last(),
-        Some(&Step::RingKick(RESTORED_RING)),
-        "a refused message left the restored ring unkicked",
+        Some(&Step::RingSetMsi {
+            ring: RESTORED_RING,
+            addr: MSG_ADDR,
+            msg: u64::from(MSG_DATA),
+        }),
+        "the restore carried on past a message the kernel refused",
     );
+}
+
+#[test]
+fn features_the_kernel_refused_fail_the_restore() {
+    // VERSION_1 is what puts the kernel rings in the modern layout the
+    // addresses are read in, so a ring programmed without it reads the
+    // wrong guest memory.
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).failing(&[Op::SetFeatures]);
+    let device = running_device(Arc::new(link));
+
+    restore(&device).expect_err("refused features must fail the restore");
+
     assert_eq!(
-        device.inner.lock().expect("viona lock").ring_state
-            [RESTORED_RING as usize],
-        RingState::Ready,
+        steps_of(&steps),
+        [Step::SetFeatures(u64::from(VIRTIO_NET_F_MAC))],
+        "the restore programmed a ring after the features were refused",
     );
+}
+
+#[test]
+fn a_ring_the_kernel_would_not_stop_fails_a_restore() {
+    // The destination stops every ring before it programs the state the
+    // source left. A worker still running reads a ring whose addresses
+    // change under it, so the refusal fails the migration.
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).failing(&[Op::RingPause]);
+    let device = running_device(Arc::new(link));
+
+    VirtioDevice::reset_all_rings(&device)
+        .expect_err("a ring that will not stop must fail the restore");
 }
 
 #[test]

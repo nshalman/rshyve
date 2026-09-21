@@ -171,11 +171,25 @@ pub trait VirtioDevice: Send + Sync + 'static {
         Ok(None)
     }
 
-    /// Reset all rings before migration restore. Kernel-accelerated
-    /// devices pause and reset all ring processing.
-    fn reset_all_rings(&self) {}
+    /// Stop every ring before a migration restore programs them.
+    ///
+    /// A worker the destination left running reads a ring whose
+    /// addresses change under it, so a failure here has to fail the
+    /// restore.
+    fn reset_all_rings(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        Ok(())
+    }
 
-    /// Restore ring state after migration with current indices + MSI-X.
+    /// Program one ring's addresses, cursors and MSI-X message from a
+    /// migration payload.
+    ///
+    /// The source commits the migration on the strength of this
+    /// answer, so every state the backend could not program has to
+    /// reach the caller. A destination that reported success over one
+    /// hands the guest a NIC that moves nothing or interrupts nobody,
+    /// with no source left to go back to.
     fn restore_ring_state(
         &self,
         _queue_idx: u16,
@@ -187,7 +201,8 @@ pub trait VirtioDevice: Send + Sync + 'static {
         _used_idx: u16,
         _msix_addr: u64,
         _msix_data: u32,
-    ) {
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        Ok(())
     }
 
     /// Pause kernel ring threads for migration export.

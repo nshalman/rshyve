@@ -127,9 +127,18 @@ struct TrackingVirtioDeviceState {
     notified: Vec<u16>,
 }
 
+/// The step of a restore whose backend refuses it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RefusedStep {
+    ResetRings,
+    RingState,
+}
+
 struct TrackingVirtioDevice {
     features: u64,
     state: Mutex<TrackingVirtioDeviceState>,
+    /// The restore step this backend refuses, if any.
+    refuses: Option<RefusedStep>,
 }
 
 impl VirtioDevice for TrackingVirtioDevice {
@@ -175,11 +184,14 @@ impl VirtioDevice for TrackingVirtioDevice {
         false
     }
 
-    fn reset_all_rings(&self) {
+    fn reset_all_rings(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
         self.state
             .lock()
             .expect("tracking state lock")
             .reset_all_rings += 1;
+        self.refusal(RefusedStep::ResetRings)
     }
 
     fn restore_ring_state(
@@ -193,7 +205,7 @@ impl VirtioDevice for TrackingVirtioDevice {
         used_idx: u16,
         msix_addr: u64,
         msix_data: u32,
-    ) {
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
         self.state
             .lock()
             .expect("tracking state lock")
@@ -209,6 +221,7 @@ impl VirtioDevice for TrackingVirtioDevice {
                 msix_addr,
                 msix_data,
             });
+        self.refusal(RefusedStep::RingState)
     }
 
     fn set_notify_addrs(&self, pio_port: u16, mmio_addr: u64) {
@@ -220,6 +233,21 @@ impl VirtioDevice for TrackingVirtioDevice {
     }
 
     fn reset(&self) {}
+}
+
+impl TrackingVirtioDevice {
+    /// What one restore step answers.
+    fn refusal(
+        &self,
+        step: RefusedStep,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        if self.refuses == Some(step) {
+            return Err(vmm_devices::lifecycle::DeviceStateError::Invalid(
+                format!("the backend refused {step:?}"),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Lifecycle for TrackingVirtioDevice {
@@ -236,6 +264,17 @@ pub(super) const MIGRATE_RING_LEN: usize = 0x8000;
 
 fn make_tracking_device() -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
     make_tracking_device_with_msix(None)
+}
+
+/// A device whose backend refuses one step of the restore.
+fn make_refusing_tracking_device(
+    step: RefusedStep,
+) -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
+    let physmap = Arc::new(
+        PhysMap::new_anon(MIGRATE_RING_GPA, MIGRATE_RING_LEN)
+            .expect("create guest memory"),
+    );
+    build_tracking_device(physmap, None, Some(step))
 }
 
 fn make_tracking_device_on(
@@ -260,12 +299,21 @@ fn make_tracking_device_full(
     physmap: Arc<PhysMap>,
     msix: Option<Arc<MsixTable>>,
 ) -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
+    build_tracking_device(physmap, msix, None)
+}
+
+fn build_tracking_device(
+    physmap: Arc<PhysMap>,
+    msix: Option<Arc<MsixTable>>,
+    refuses: Option<RefusedStep>,
+) -> Arc<VirtioPciDevice<TrackingVirtioDevice>> {
     let bus_pio = Arc::new(PioBus::new());
     let bus_mmio = Arc::new(MmioBus::new());
     VirtioPciDevice::new(
         TrackingVirtioDevice {
             features: bits::VIRTIO_F_VERSION_1,
             state: Mutex::new(TrackingVirtioDeviceState::default()),
+            refuses,
         },
         bits::VIRTIO_DEV_TYPE_BLOCK,
         1,

@@ -332,11 +332,15 @@ impl VirtioViona {
     }
 
     /// Set negotiated features in the kernel driver.
-    fn set_kernel_features(inner: &VionaInner, features: u64) {
-        if let Err(e) = inner.link_ref().set_features(features) {
-            slog::warn!(inner.log(), "viona set features failed";
-                "features" => features, "error" => %e);
-        }
+    ///
+    /// The answer is returned: a migration restore reads the ring
+    /// addresses in the layout `VERSION_1` selects, so it cannot treat
+    /// a refusal as a warning.
+    fn set_kernel_features(
+        inner: &VionaInner,
+        features: u64,
+    ) -> std::io::Result<()> {
+        inner.link_ref().set_features(features)
     }
 }
 
@@ -364,7 +368,12 @@ impl VirtioDevice for VirtioViona {
             return;
         }
         inner.negotiated_features = features;
-        Self::set_kernel_features(&inner, features);
+        // The guest drives this one and can write the register again,
+        // so the refusal is reported and the driver decides.
+        if let Err(e) = Self::set_kernel_features(&inner, features) {
+            slog::warn!(inner.log(), "viona set features failed";
+                "features" => features, "error" => %e);
+        }
     }
 
     fn cfg_read(&self, offset: u16, len: u8) -> u32 {
@@ -433,8 +442,10 @@ impl VirtioDevice for VirtioViona {
         self.kernel_ring_state(queue_idx).map(Some)
     }
 
-    fn reset_all_rings(&self) {
-        self.reset_all_rings();
+    fn reset_all_rings(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        self.reset_all_rings()
     }
 
     fn restore_ring_state(
@@ -448,11 +459,11 @@ impl VirtioDevice for VirtioViona {
         used_idx: u16,
         msix_addr: u64,
         msix_data: u32,
-    ) {
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
         self.ring_set_state(
             queue_idx, size, desc, avail, used, avail_idx, used_idx, msix_addr,
             msix_data,
-        );
+        )
     }
 
     fn pause_rings_for_export(

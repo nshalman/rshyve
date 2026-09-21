@@ -142,6 +142,33 @@ fn an_export_fails_when_the_kernel_cursors_cannot_be_read() {
 }
 
 #[test]
+fn a_restore_fails_when_the_backend_cannot_stop_its_rings() {
+    // A worker the destination left running reads a ring whose
+    // addresses the restore is writing over.
+    let dev = make_refusing_tracking_device(RefusedStep::ResetRings);
+
+    dev.restore_migrate_state(&DeviceMigrateState::Virtio(transport(
+        bits::VIRTIO_F_VERSION_1,
+        vec![live_queue()],
+    )))
+    .expect_err("a backend that cannot stop its rings must fail the restore");
+}
+
+#[test]
+fn a_restore_fails_when_the_backend_refuses_a_ring_state() {
+    // The source commits on this answer and then discards its own VM.
+    // A destination that reported success would leave the guest a NIC
+    // that moves nothing, with nothing left to go back to.
+    let dev = make_refusing_tracking_device(RefusedStep::RingState);
+
+    dev.restore_migrate_state(&DeviceMigrateState::Virtio(transport(
+        bits::VIRTIO_F_VERSION_1,
+        vec![live_queue()],
+    )))
+    .expect_err("a refused ring state must fail the restore");
+}
+
+#[test]
 fn restore_virtio_state_replays_pci_transport_state() {
     let dev = make_tracking_device();
     let command = vmm_devices::pci::bits::RegCmd::IO_EN

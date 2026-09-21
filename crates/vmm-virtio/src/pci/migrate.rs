@@ -217,7 +217,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         self.restore_migrate_pci_state(&state.pci);
 
         let mut vs = self.virtio_state.lock().expect("virtio lock");
-        self.device.reset_all_rings();
+        self.device.reset_all_rings()?;
 
         vs.guest_features = state.features;
         self.device.set_features(state.features);
@@ -291,7 +291,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 qs.used_idx,
                 msix_addr,
                 msix_data,
-            );
+            )?;
         }
 
         let (bar0_port, bar2_addr) = self.notify_bases();

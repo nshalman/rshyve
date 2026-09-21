@@ -108,29 +108,41 @@ impl VirtioViona {
     }
 
     /// Reset all viona rings (pause + reset). Call before ring_set_state.
-    pub fn reset_all_rings(&self) {
+    ///
+    /// A ring the kernel still runs would read its own addresses while
+    /// the restore writes new ones over them, so a refusal here fails
+    /// the migration.
+    pub fn reset_all_rings(&self) -> Result<(), DeviceStateError> {
         let inner = self.inner.lock().expect("viona lock");
         // The halt reset every ring already, and it holds no device
         // lock while it destroys the link.
         if inner.halted {
-            return;
+            return Ok(());
         }
         for ring in 0..NET_NUM_QUEUES as u16 {
             if let Err(e) = inner.link_ref().ring_pause(ring) {
-                slog::warn!(inner.log(), "viona ring pause failed";
-                    "ring" => ring, "error" => %e);
+                return Err(DeviceStateError::Invalid(format!(
+                    "viona ring {ring} pause failed: {e}"
+                )));
             }
             if let Err(e) = inner.link_ref().ring_reset(ring) {
-                slog::warn!(inner.log(), "viona ring reset failed";
-                    "ring" => ring, "error" => %e);
+                return Err(DeviceStateError::Invalid(format!(
+                    "viona ring {ring} reset failed: {e}"
+                )));
             }
         }
+        Ok(())
     }
 
     /// Restore ring state after migration.
     ///
     /// This programs ring addresses AND indices into the kernel, unlike
     /// ring_init which resets indices to 0.
+    ///
+    /// Every failure below reaches the caller. The source commits the
+    /// migration on this answer and then discards its own VM, so a
+    /// destination that reported success over a refused ioctl leaves
+    /// the guest a NIC nothing can put right.
     pub fn ring_set_state(
         &self,
         queue_idx: u16,
@@ -142,25 +154,33 @@ impl VirtioViona {
         used_idx: u16,
         msix_addr: u64,
         msix_data: u32,
-    ) {
+    ) -> Result<(), DeviceStateError> {
         let mut inner = self.inner.lock().expect("viona lock");
-        let log = inner.log();
         // A restore that races the halt must not program a link that
         // is already destroyed.
         if inner.halted {
-            return;
+            return Err(DeviceStateError::Invalid(format!(
+                "viona ring {queue_idx} restore after the link was destroyed"
+            )));
         }
         if !indices_hold(size, avail_idx, used_idx) {
-            slog::error!(log, "viona ring state refused: the indices \
-                cannot come from a running ring";
-                "ring" => queue_idx, "size" => size,
-                "avail_idx" => avail_idx, "used_idx" => used_idx);
-            return;
+            return Err(DeviceStateError::Invalid(format!(
+                "viona ring {queue_idx} indices cannot come from a running \
+                 ring: size {size}, avail_idx {avail_idx}, used_idx {used_idx}"
+            )));
         }
 
         // Set features (VERSION_1 sets l_modern in kernel)
         if inner.negotiated_features != 0 {
-            Self::set_kernel_features(&inner, inner.negotiated_features);
+            let features = inner.negotiated_features;
+            Self::set_kernel_features(&inner, features).map_err(|e| {
+                // VERSION_1 is what puts the kernel rings in the modern
+                // layout the addresses below are read in, so a ring
+                // programmed without it reads the wrong memory.
+                DeviceStateError::Invalid(format!(
+                    "viona features {features:#x} refused: {e}"
+                ))
+            })?;
         }
 
         // vrs_avail_idx sets vr_cur_aidx, the kernel's consumption
@@ -184,9 +204,9 @@ impl VirtioViona {
             vrs_qaddr_used: used,
         };
         if let Err(e) = inner.link_ref().ring_set_state(&state) {
-            slog::error!(log, "viona ring set state failed";
-                "ring" => queue_idx, "error" => %e);
-            return;
+            return Err(DeviceStateError::Invalid(format!(
+                "viona ring {queue_idx} set state failed: {e}"
+            )));
         }
 
         let idx = queue_idx as usize;
@@ -202,15 +222,18 @@ impl VirtioViona {
                 u64::from(msix_data),
             );
             if let Err(e) = msi_rc {
-                slog::warn!(log, "viona ring set msi failed";
-                    "ring" => queue_idx, "error" => %e);
+                return Err(DeviceStateError::Invalid(format!(
+                    "viona ring {queue_idx} set msi failed: {e}"
+                )));
             }
         }
 
         Self::ring_kick(&mut inner, queue_idx);
+        let log = inner.log();
         slog::info!(log, "viona ring state restored";
             "ring" => queue_idx, "avail_idx" => avail_idx,
             "used_idx" => used_idx, "msi_addr" => msix_addr);
+        Ok(())
     }
 
     /// Read one ring's `(avail_idx, used_idx)` for a migration export.

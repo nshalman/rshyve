@@ -767,7 +767,8 @@ fn a_restore_refuses_indices_no_running_ring_can_have_left() {
         900,
         0,
         0,
-    );
+    )
+    .expect_err("an impossible pair of indices must fail the restore");
 
     assert_eq!(
         steps_of(&steps),
@@ -795,7 +796,8 @@ fn a_restore_takes_indices_that_wrapped() {
         u16::MAX - 5,
         0,
         0,
-    );
+    )
+    .expect("a ring whose indices wrapped is restored");
 
     assert!(
         steps_of(&steps)
@@ -826,7 +828,8 @@ fn a_restore_programs_the_ring_and_its_interrupt() {
         5,
         0xFEE0_0000,
         0x21,
-    );
+    )
+    .expect("a sane payload restores");
 
     assert_eq!(
         steps_of(&steps),
@@ -859,6 +862,7 @@ fn a_restore_programs_the_ring_and_its_interrupt() {
 fn a_halted_device_restores_no_ring() {
     // A restore that races the halt would program a link that is
     // already destroyed, and mark the ring ready for the next kick.
+    // The ring is not programmed, so the restore says so.
     let steps = Steps::default();
     let device = device_with(Arc::new(TestLink::new(&steps)));
     device.halt();
@@ -875,7 +879,8 @@ fn a_halted_device_restores_no_ring() {
         5,
         0,
         0,
-    );
+    )
+    .expect_err("a destroyed link restores nothing");
 
     assert_eq!(
         steps_of(&steps),
@@ -970,7 +975,7 @@ fn a_restore_stops_every_ring_before_it_programs_them() {
     let steps = Steps::default();
     let device = running_device(Arc::new(TestLink::new(&steps)));
 
-    VirtioDevice::reset_all_rings(&device);
+    VirtioDevice::reset_all_rings(&device).expect("stops every ring");
 
     assert_eq!(
         steps_of(&steps),
@@ -1012,7 +1017,8 @@ fn a_halted_device_resets_no_ring_for_a_restore() {
     device.halt();
     steps.lock().expect("steps lock").clear();
 
-    VirtioDevice::reset_all_rings(&device);
+    VirtioDevice::reset_all_rings(&device)
+        .expect("a halted device has nothing left to stop");
 
     assert_eq!(
         steps_of(&steps),
