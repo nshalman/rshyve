@@ -17,6 +17,7 @@
 #   tools/remote-build.sh check
 #   tools/remote-build.sh needed             # stock-PI dependency gate
 #   tools/remote-build.sh sync               # push sources, build nothing
+#   tools/remote-build.sh rev                # the revision a build stamps
 #   tools/remote-build.sh run -- -H -c 2 ... # run the built rshyve
 #   tools/remote-build.sh sh 'arbitrary command'
 #
@@ -81,7 +82,7 @@ if [ -n "$BUILD_REV" ]; then
     REMOTE_ENV="$REMOTE_ENV; export TRITON_BUILD_REV=$BUILD_REV"
 fi
 
-usage() { sed -n '3,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '3,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 
 sync_sources() {
     # --checksum because rsync-over-ssh timestamps do not reliably invalidate
@@ -101,6 +102,10 @@ case "$cmd" in
     sync)
         sync_sources
         echo "synced $SRC_DIR -> $HOST:$REMOTE_DIR"
+        ;;
+    rev)
+        # What the next build stamps into the binary, before it runs.
+        echo "${BUILD_REV:-unstamped}"
         ;;
     build)
         sync_sources
