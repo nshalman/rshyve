@@ -322,6 +322,16 @@ fn priv_request(cli: &Cli) -> anyhow::Result<PrivRequest> {
         );
         return Ok(PrivRequest { drop, run_as: None });
     }
+    // virtio-fs serves FUSE from this process and opens host files for
+    // the life of the VM, which the floor has no file_write for.
+    // firehyve refuses the same combination.
+    if let Some(spec) = cli
+        .pci_slot
+        .iter()
+        .find(|spec| devspec::parts(spec).driver == "virtio-fs")
+    {
+        anyhow::bail!("virtio-fs cannot run under the privilege lock; remove '-s {spec}'");
+    }
     let blockers: Vec<&str> = [
         ("--control-socket", cli.control_socket.is_some()),
         ("--migrate-listen", cli.migrate_listen.is_some()),
@@ -346,7 +356,11 @@ fn witness_ids(specs: &[String]) -> Vec<String> {
     specs
         .iter()
         .filter(|spec| {
-            !matches!(spec.split(',').nth(1), Some("hostbridge" | "lpc") | None)
+            // The same grammar the attachment parser reads, which trims
+            // the driver. An untrimmed compare here would put the
+            // chipset of `-s "0, hostbridge"` into the witness, and the
+            // lock would then refuse to start a VM whose argv is legal.
+            !matches!(devspec::parts(spec).driver, "hostbridge" | "lpc" | "")
         })
         .map(|spec| devspec::device_id(spec))
         .collect()
@@ -357,6 +371,9 @@ struct RunResult {
     outcome: RunOutcome,
     /// `-s` specs for the devices an operator added while the VM ran.
     hotplug_specs: Vec<String>,
+    /// Whether the privilege lock ran. A locked process has no
+    /// `proc_exec`, so the reboot path must not try to re-exec itself.
+    locked: bool,
 }
 
 fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
@@ -660,6 +677,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     outcome.map(|outcome| RunResult {
         outcome,
         hotplug_specs,
+        locked: privilege.drop,
     })
 }
 
@@ -697,9 +715,25 @@ fn main() -> ExitCode {
         warn!(log, "console output was still draining at exit");
     }
     match result {
+        // A locked process cannot re-exec: the floor has no proc_exec,
+        // so the call would fail and the guest's reset would read as a
+        // crash. Report the reset instead and let whatever started this
+        // process start it again.
+        Ok(RunResult {
+            outcome: RunOutcome::Reboot,
+            locked: true,
+            ..
+        }) => {
+            info!(
+                log,
+                "guest reset under the privilege lock; exiting for a restart"
+            );
+            vmm_machine::entry::exit_code(RunOutcome::Reboot, &log)
+        }
         Ok(RunResult {
             outcome: RunOutcome::Reboot,
             hotplug_specs,
+            ..
         }) => reexec_for_reboot(
             &exe,
             &args,
@@ -794,6 +828,35 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect();
         assert_eq!(witness_ids(&specs), vec!["virtio-blk@4"]);
+    }
+
+    /// The attachment parser trims the driver, so the witness must too:
+    /// a chipset named with a space would otherwise be expected in the
+    /// registry it never enters, and the lock would refuse a legal argv.
+    #[test]
+    fn a_spaced_chipset_stays_out_of_the_witness() {
+        let specs = vec![
+            "0, hostbridge".to_string(),
+            "31, lpc".to_string(),
+            "4, virtio-blk,/dev/zvol/rdsk/z/disk0".to_string(),
+        ];
+        assert_eq!(witness_ids(&specs), vec!["virtio-blk@4"]);
+    }
+
+    /// virtio-fs opens host files for the life of the VM, which the
+    /// floor has no file_write for. firehyve refuses the same pair.
+    #[test]
+    fn virtio_fs_is_refused_under_the_lock() {
+        let cli = Cli::try_parse_named(
+            "rshyve",
+            ["rshyve", "--priv-drop", "-s", "5,virtio-fs,/export", "guest"],
+        )
+        .expect("argv parses");
+        let error = priv_request(&cli).expect_err("virtio-fs must be refused");
+        assert!(
+            error.to_string().contains("virtio-fs"),
+            "the refusal names the device: {error}"
+        );
     }
 
     /// The bhyve zone brand splits its only pass-through attr on
