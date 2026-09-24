@@ -1,0 +1,254 @@
+name: guest kernel
+
+# Builds the Linux guest kernel a sandbox VM boots, and publishes it.
+#
+# Why it is a workflow and not a build-host task: kernel/build.sh
+# composes its config fragments inside a digest-pinned linux/amd64
+# container, and the illumos build host has no container runtime. Every
+# other job in this repository already runs on ubuntu-latest.
+#
+# Why it exists at all: .gitignore keeps kernel/vmlinux-* and
+# kernel/vmlinuz-* out of the tree, because the images are GPL-2.0 and
+# their source is not tracked. Without this workflow the only copy of a
+# guest kernel is on the machine that last ran build.sh. The resolved
+# config IS tracked, so a reader can tell which options went in, and the
+# step below fails when the build no longer produces it.
+#
+# What a green run proves: the fragment list composes, olddefconfig kept
+# every option the fragments asked for and dropped the two they asked it
+# to drop, the ELF carries the PVH note, and the image holds the SMP and
+# vsock code. It does NOT prove the kernel boots. Only a VMM on illumos
+# can show that.
+#
+# What it publishes: a push or a pull request produces a workflow
+# artifact that expires in 90 days. A durable copy needs a published
+# release, which this repository has never cut, so the attach job below
+# has never run.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - kernel/**
+      - .github/workflows/guest-kernel.yml
+  pull_request:
+    paths:
+      - kernel/**
+      - .github/workflows/guest-kernel.yml
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  KERNEL_VERSION: "6.12.13"
+  # kernel/sandbox.config records why each fragment is here. Two rules
+  # this list must keep:
+  #
+  #   sandbox.config last. kconfig keeps the LAST assignment of an
+  #   option, and sandbox.config is the fragment that switches two OFF.
+  #
+  #   container.config and smp.config together. CONFIG_CPUSETS needs
+  #   CGROUPS from the first and SMP from the second, and olddefconfig
+  #   drops it without a word when either is missing.
+  #
+  # hotplug.config must stay out: it sets CONFIG_SMP and CONFIG_NR_CPUS
+  # itself, so with smp.config the vCPU ceiling would follow fragment
+  # order. The assertion step below fails if it is ever added here.
+  FRAGMENTS: "container.config vsock.config smp.config rng.config virtiofs.config sandbox.config"
+  OUT_SUFFIX: "-sandbox"
+
+jobs:
+  build:
+    name: sandbox guest kernel
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The config guard is shell, and it also runs inside the build
+      # container where a failure costs a whole compile. ci.yml lints
+      # tools/*.sh only, so this job lints the scripts it runs.
+      - run: shellcheck -S warning kernel/*.sh
+
+      # A gate nobody has watched fail is not known to work.
+      - run: kernel/check-config-test.sh
+
+      # build.sh pulls a digest-pinned Alpine image from Docker Hub and
+      # a kernel tarball from cdn.kernel.org, and verifies the tarball
+      # against the SHA-256 it records. The tarball is not cached here:
+      # a cache entry would be one more thing to trust, and the download
+      # is small next to the compile.
+      - name: build the kernel
+        working-directory: kernel
+        run: |
+          KERNEL_EXTRA_CONFIG="$FRAGMENTS" \
+          KERNEL_OUT_SUFFIX="$OUT_SUFFIX" \
+              ./build.sh "$KERNEL_VERSION"
+
+      # build.sh runs this same script inside the container, before the
+      # compile. It runs again here, on the config the build wrote out,
+      # so a build.sh that stops calling it cannot pass this workflow.
+      - name: the resolved config matches the fragments
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+
+          # hotplug.config sets CONFIG_SMP and CONFIG_NR_CPUS itself.
+          case " $FRAGMENTS " in
+            *" hotplug.config "*)
+              echo "FAIL: hotplug.config conflicts with smp.config on the CPU count"
+              exit 1
+              ;;
+          esac
+
+          ./check-config.sh "config-fastboot${OUT_SUFFIX}" . -s fastboot.config $FRAGMENTS
+
+      # The fragments say what this kernel asked for. This step says what
+      # the sandbox cannot run without, and it fails closed: an emptied
+      # or deleted sandbox.config brings both negatives back on by
+      # default, and the resolved config then fails here.
+      #
+      # CONFIG_NR_CPUS is named on its own because it is not a "=y"
+      # option: a vCPU ceiling clamped to 1 would read as present.
+      #
+      # Every failure is reported before the exit, so one run names every
+      # option that went missing.
+      - name: the options the sandbox cannot run without
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          cfg="config-fastboot${OUT_SUFFIX}"
+          rc=0
+
+          for opt in \
+              CONFIG_PVH=y \
+              CONFIG_SMP=y \
+              CONFIG_NR_CPUS=8 \
+              CONFIG_CPUSETS=y \
+              CONFIG_VSOCKETS=y \
+              CONFIG_VIRTIO_VSOCKETS=y; do
+            grep -Fxq "$opt" "$cfg" || { echo "FAIL: $opt is not in $cfg"; rc=1; }
+          done
+
+          # The guest runs untrusted code, so an option that is OFF
+          # matters as much as one that is on. kernel/sandbox.config
+          # carries the reasoning for both.
+          for sym in CONFIG_VSOCKETS_LOOPBACK CONFIG_USER_NS; do
+            ! grep -q "^$sym=" "$cfg" || { echo "FAIL: $sym is set in $cfg"; rc=1; }
+          done
+
+          exit $rc
+
+      # The resolved config is tracked, so a change to a fragment that
+      # reaches more options than it meant to shows up as a diff in a
+      # pull request rather than inside an expiring artifact.
+      - name: the resolved config matches the tracked copy
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          cfg="config-fastboot${OUT_SUFFIX}"
+          if ! git ls-files --error-unmatch "$cfg" > /dev/null 2>&1; then
+            echo "NOTE: $cfg is not tracked yet."
+            echo "Take it from this run's artifact and commit it."
+            exit 0
+          fi
+          if ! git diff --quiet -- "$cfg"; then
+            echo "FAIL: the build no longer produces the tracked $cfg."
+            echo "Commit the new one if the change is intended."
+            git diff -- "$cfg"
+            exit 1
+          fi
+
+      # The config says what was asked for. These two say what is in the
+      # image. objcopy --strip-all drops the symbol table but keeps the
+      # allocatable sections, so the printk and driver-name literals in
+      # .rodata survive.
+      #
+      # "smpboot: " is the pr_fmt prefix of arch/x86/kernel/smpboot.c,
+      # which the x86 Makefile builds only under CONFIG_SMP. The
+      # uniprocessor kernels in this tree carry none of it and the SMP
+      # ones carry 13 such strings. It is not anchored at the line start:
+      # a printk literal carries the KERN_SOH prefix.
+      #
+      # "vmw_vsock_virtio_transport" is KBUILD_MODNAME for
+      # net/vmw_vsock/virtio_transport.c, used as the virtio driver
+      # name, so it appears only when CONFIG_VIRTIO_VSOCKETS is built.
+      - name: the image carries the PVH note, the SMP code and the vsock transport
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          img="vmlinux-fastboot${OUT_SUFFIX}"
+          rc=0
+
+          # Each producer writes to a file first. Piping into `grep -q`
+          # under `pipefail` fails on a GOOD image: grep exits at the
+          # first match, the producer takes a SIGPIPE, and the pipeline
+          # reports the signal.
+          notes="$RUNNER_TEMP/notes.txt"
+          text="$RUNNER_TEMP/strings.txt"
+          readelf -n "$img" > "$notes"
+          strings -a "$img" > "$text"
+
+          grep -qi xen "$notes" || { echo "FAIL: no PVH note in $img"; rc=1; }
+          grep -q 'smpboot: ' "$text" || { echo "FAIL: no SMP boot code in $img"; rc=1; }
+          grep -q 'vmw_vsock_virtio_transport' "$text" || {
+            echo "FAIL: no virtio vsock transport in $img"
+            rc=1
+          }
+          exit $rc
+
+      # The digests travel with the images, so an operator can tell
+      # which kernel a CN is running without trusting the file name.
+      # Both this and the upload run even when a check above failed: the
+      # config-drift step tells the reader to take the new config from
+      # the artifact, which is only there if a failing run still uploads.
+      - name: record the digests
+        if: always()
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          sha256sum \
+              "vmlinux-fastboot${OUT_SUFFIX}" \
+              "vmlinuz-fastboot${OUT_SUFFIX}" \
+              "config-fastboot${OUT_SUFFIX}" \
+              | tee "SHA256SUMS${OUT_SUFFIX}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: guest-kernel${{ env.OUT_SUFFIX }}
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            kernel/vmlinux-fastboot${{ env.OUT_SUFFIX }}
+            kernel/vmlinuz-fastboot${{ env.OUT_SUFFIX }}
+            kernel/config-fastboot${{ env.OUT_SUFFIX }}
+            kernel/SHA256SUMS${{ env.OUT_SUFFIX }}
+
+  # A workflow artifact expires. A kernel a CN boots must not, so a
+  # published release gets its own copy. This repository has cut no
+  # release, so this job has never run.
+  attach:
+    name: attach the kernel to the release
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: guest-kernel${{ env.OUT_SUFFIX }}
+          path: out
+      # The tag arrives as an environment value rather than inside the
+      # script text, so it cannot be read as shell.
+      - name: upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" out/* --clobber

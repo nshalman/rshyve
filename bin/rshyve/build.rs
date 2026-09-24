@@ -1,37 +1,29 @@
-use std::process::Command;
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-fn find_git() -> &'static str {
-    for path in ["/opt/tools/bin/git", "/usr/bin/git", "git"] {
-        if Command::new(path).arg("--version").output().is_ok() {
-            return path;
-        }
-    }
-    "git"
-}
+//! Stamp the source revision into the binary.
+//!
+//! The build driver supplies the revision. This script runs no git,
+//! because the illumos build host holds no clone. See the shared file
+//! below for the failure that rule prevents.
+//!
+//! No runpath is emitted here on purpose. The pkgsrc gcc driver already
+//! injects /opt/local/lib into every binary it links, and vmm-tpm-sys
+//! resolves OpenSSL from the platform image, so an extra `-Wl,-R` only
+//! duplicated an entry that was already there.
+
+include!("../../crates/vmm-machine/src/build_rev.rs");
+
+/// Where the shared rule lives, relative to this package.
+const BUILD_REV_SRC: &str = "../../crates/vmm-machine/src/build_rev.rs";
 
 fn main() {
-    let git = find_git();
+    // Cargo re-runs a build script only for the inputs it is told
+    // about. Without this line a stamped build after an unstamped one
+    // keeps the stale value.
+    println!("cargo:rerun-if-env-changed={BUILD_REV_ENV}");
+    println!("cargo:rerun-if-changed={BUILD_REV_SRC}");
 
-    // Embed git commit hash at compile time
-    let output = Command::new(git)
-        .args(["rev-parse", "--short", "HEAD"])
-        .output();
-
-    let commit = match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
-        _ => "unknown".to_string(),
-    };
-
-    println!("cargo:rustc-env=VMM_GIT_COMMIT={commit}");
-
-    // Rerun if git HEAD changes
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/refs/");
-
-    // No runpath is emitted here on purpose. The pkgsrc gcc driver
-    // already injects /opt/local/lib into every binary it links, and
-    // vmm-tpm-sys resolves OpenSSL from the platform image, so an
-    // extra -Wl,-R only duplicated an entry that was already there.
+    println!("cargo:rustc-env=VMM_GIT_COMMIT={}", build_rev());
 }

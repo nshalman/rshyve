@@ -28,6 +28,25 @@ root `Cargo.toml`, autoconf, automake, libtool, pkg-config, gmake, gcc
 and OpenSSL development files. A macOS or Linux host needs the same set
 with `make` in place of `gmake`. DTrace is not needed to build.
 
+### The version stamp
+
+`--version` reports the revision the build driver put in
+`TRITON_BUILD_REV`, or `unstamped`. No build script runs git: the
+illumos build host holds no clone, and a binary that named a commit
+resolving in no clone is the defect this replaces.
+`tools/remote-build.sh` sets the variable. A build by hand sets it too:
+
+```bash
+TRITON_BUILD_REV="$(git rev-parse --short HEAD)" \
+    cargo build --locked --release -p firehyve
+```
+
+CI proves that a stamped build names its commit, that a build from a
+changed tree keeps the `-dirty` marker, and that an unstamped build says
+so. It cannot refuse one: a packaging path that does not set the
+variable ships a binary reporting `unstamped`, so every path that builds
+a binary for a platform image has to set it.
+
 ## What runs where
 
 `rshyve` links only on illumos: `bhyve-api` binds SunOS ioctls and

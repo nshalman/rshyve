@@ -10,6 +10,11 @@
 //! its own `run()` naming the phase SEQUENCE, because that ordering is
 //! load-bearing.
 
+// `bin/firehyve/build.rs` and `bin/rshyve/build.rs` include this file
+// rather than importing it, so its tests only run from here.
+#[cfg(test)]
+mod build_rev;
+
 pub mod build;
 pub mod chipset;
 pub mod devspec;

@@ -5,6 +5,7 @@
 # Usage: ./build.sh [kernel_version]
 # Output: ./vmlinuz-fastboot  bzImage, gzip self-decompressing
 #         ./vmlinux-fastboot  uncompressed ELF with the PVH entry note
+#         ./config-fastboot   the .config the two were built from
 #
 # KERNEL_EXTRA_CONFIG layers further config fragments on fastboot.config
 # and KERNEL_OUT_SUFFIX renames the output, which builds a variant
@@ -52,17 +53,29 @@ for frag in $EXTRA_CONFIG; do
     fi
 done
 
+# The suffix names the output files, so it must hold nothing that a path
+# or a shell reads as more than a name.
+case "$OUT_SUFFIX" in
+    *[!A-Za-z0-9._-]*)
+        echo "BUILD-FAIL: KERNEL_OUT_SUFFIX takes only [A-Za-z0-9._-]"
+        exit 1
+        ;;
+esac
+
 echo "=== Building Linux ${KERNEL_VERSION} fast-boot kernel ${EXTRA_CONFIG:+(+ $EXTRA_CONFIG)} ==="
 
-# The fragment list and the digest go in as environment variables rather
-# than being spliced into the script text, so a value with a quote or a
-# `$(...)` cannot run inside the container.
+# The fragment list, the digest and the output suffix go in as
+# environment variables rather than being spliced into the script text,
+# so a value with a quote or a `$(...)` cannot run inside the container.
+# KERNEL_VERSION is spliced, and is safe because it must match a key of
+# KERNEL_SHA256 above, which is a literal set.
 docker run --rm \
     --platform linux/amd64 \
     -v "${SCRIPT_DIR}:/build" \
     -w /tmp/kernel \
     -e "EXTRA=${EXTRA_CONFIG}" \
     -e "WANT_SHA256=${WANT_SHA256}" \
+    -e "OUT_SUFFIX=${OUT_SUFFIX}" \
     "$ALPINE_IMAGE" \
     sh -c "
 set -ex
@@ -103,39 +116,62 @@ echo '=== Config summary ==='
 grep -c '=y' .config | xargs printf 'Static options: %s\n'
 grep -c '=m' .config | xargs printf 'Module options: %s (should be 0)\n'
 
+# The resolved config. A candidate until the compile succeeds, so a
+# failed run cannot dirty the tracked copy; the candidate stays behind
+# to say why.
+cp .config /build/config-fastboot\${OUT_SUFFIX}.candidate
+
 # olddefconfig silently drops an option whose dependencies are unmet.
-# Catch that here rather than after a full build and a failed boot.
+# Catch that here rather than after a full build and a failed boot. PVH
+# comes from fastboot.config, which check-config.sh is not given, so it
+# is named on its own.
 grep -q '^CONFIG_PVH=y' .config || {
     echo 'BUILD-FAIL: CONFIG_PVH was dropped by olddefconfig'
     exit 1
 }
 
-# Same check for every option the fragment asked for. olddefconfig drops
-# an option whose dependencies are unmet without saying so.
-for frag in \$EXTRA; do
-    for opt in \$(grep -o '^CONFIG_[A-Z0-9_]*=y' /build/\$frag); do
-        grep -q \"^\$opt\" .config || {
-            echo \"BUILD-FAIL: \$opt was dropped by olddefconfig\"
+# Every option the EXTRA fragments ask for, in both directions, and the
+# malformed negative line that kconfig would read as a comment.
+# fastboot.config gets the malformed-line scan only: a later fragment is
+# meant to override its \"is not set\" lines, so their values are not
+# asserted.
+sh /build/check-config.sh /build/config-fastboot\${OUT_SUFFIX}.candidate /build \
+    -s fastboot.config \$EXTRA || {
+    echo 'BUILD-FAIL: the resolved config does not match the fragments'
+    exit 1
+}
+
+# A kernel named sandbox runs hostile code. These two stay off whatever
+# fragment list a caller passed, so a short list cannot produce one.
+if [ \"\${OUT_SUFFIX}\" = -sandbox ]; then
+    for sym in CONFIG_USER_NS CONFIG_VSOCKETS_LOOPBACK; do
+        if grep -q \"^\$sym=\" .config; then
+            echo \"BUILD-FAIL: \$sym is on in a sandbox kernel\"
             exit 1
-        }
+        fi
     done
-done
+fi
 
 # Build
 make ARCH=x86_64 -j\$(nproc) bzImage 2>&1 | tail -20
 
 # Copy output. --strip-all keeps allocatable sections, so the PT_NOTE
 # carrying the PVH entry survives.
-cp arch/x86_64/boot/bzImage /build/vmlinuz-fastboot${OUT_SUFFIX}
-objcopy --strip-all vmlinux /build/vmlinux-fastboot${OUT_SUFFIX}
+cp arch/x86_64/boot/bzImage /build/vmlinuz-fastboot\${OUT_SUFFIX}
+objcopy --strip-all vmlinux /build/vmlinux-fastboot\${OUT_SUFFIX}
+mv /build/config-fastboot\${OUT_SUFFIX}.candidate /build/config-fastboot\${OUT_SUFFIX}
 
-readelf -n /build/vmlinux-fastboot${OUT_SUFFIX} | grep -qi xen || {
+# The notes go to a file first. grep -q exits at its first match, so a
+# producer in a pipeline takes a SIGPIPE, and this check would then fail
+# on a GOOD image under any shell that sets pipefail.
+readelf -n /build/vmlinux-fastboot\${OUT_SUFFIX} > /tmp/pvh-notes.txt
+grep -qi xen /tmp/pvh-notes.txt || {
     echo 'BUILD-FAIL: vmlinux carries no Xen PVH note'
     exit 1
 }
 
-ls -la /build/vmlinuz-fastboot${OUT_SUFFIX} /build/vmlinux-fastboot${OUT_SUFFIX}
+ls -la /build/vmlinuz-fastboot\${OUT_SUFFIX} /build/vmlinux-fastboot\${OUT_SUFFIX}
 echo '=== Kernels built successfully ==='
-echo \"bzImage: \$(du -h /build/vmlinuz-fastboot${OUT_SUFFIX} | cut -f1)\"
-echo \"PVH ELF: \$(du -h /build/vmlinux-fastboot${OUT_SUFFIX} | cut -f1)\"
+echo \"bzImage: \$(du -h /build/vmlinuz-fastboot\${OUT_SUFFIX} | cut -f1)\"
+echo \"PVH ELF: \$(du -h /build/vmlinux-fastboot\${OUT_SUFFIX} | cut -f1)\"
 "
