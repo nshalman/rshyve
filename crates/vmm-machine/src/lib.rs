@@ -31,6 +31,7 @@ pub mod provision;
 pub mod registry;
 pub mod signal;
 pub mod teardown;
+pub mod topology;
 pub mod vcpu;
 pub mod vcpu_tasks;
 pub mod vcpus;
@@ -73,6 +74,7 @@ pub use signal::{
 pub use teardown::{
     registry_named_devices, run_fleet_event_loop, RunOutcome, VcpuThreads,
 };
+pub use topology::TopologyLock;
 pub use vcpu::{
     activate_one, activate_uefi_bsp_only, activate_vcpus,
     check_aps_awaiting_sipi, set_halt_exit, spawn_vcpu_fleet,

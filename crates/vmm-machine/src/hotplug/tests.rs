@@ -150,11 +150,17 @@ struct RecordingPause {
     resumes: AtomicUsize,
     fails: bool,
     trace: Option<Arc<Trace>>,
+    /// Set when a pause found this lock held.
+    topology: Option<TopologyLock>,
+    paused_under_topology: AtomicBool,
 }
 
 impl VmPause for RecordingPause {
     fn pause(&self) -> anyhow::Result<()> {
         self.pauses.fetch_add(1, Ordering::AcqRel);
+        if self.topology.as_ref().is_some_and(TopologyLock::is_held) {
+            self.paused_under_topology.store(true, Ordering::Release);
+        }
         if self.fails {
             anyhow::bail!("pause refused");
         }
@@ -218,6 +224,7 @@ impl Fixture {
                 halt_slack: Duration::from_millis(20),
                 closed: AtomicBool::new(false),
                 drains: AtomicBool::new(true),
+                topology: TopologyLock::default(),
                 log: null_log(),
             },
             registry,
@@ -690,6 +697,27 @@ fn a_guest_eject_no_operator_asked_for_is_refused() {
     // The slot is offered back, so the guest re-binds its driver and
     // the slot is ejectable again.
     assert_eq!(fixture.slot_up_bits(), 1 << 5);
+}
+
+#[test]
+fn an_eject_changes_the_bus_under_the_topology_lock() {
+    // Migration reads the device set under this lock. An eject that
+    // removed a device outside it could change the set between the
+    // source's refusal check and its device export.
+    let topology = TopologyLock::default();
+    let mut fixture = Fixture::with_pause(RecordingPause {
+        topology: Some(topology.clone()),
+        ..RecordingPause::default()
+    });
+    fixture.core.topology = topology;
+    let id = fixture.add("5,virtio-blk,/disk").expect("added");
+    fixture.core.request_remove(&id).expect("requested");
+
+    fixture.guest_ejects(5);
+    fixture.core.drain_ejects();
+
+    assert!(fixture.registry.get_by_id(&id).is_none(), "not ejected");
+    assert!(fixture.vm.paused_under_topology.load(Ordering::Acquire));
 }
 
 #[test]
