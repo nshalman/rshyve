@@ -40,6 +40,7 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::PhysMap;
 use vmm_core::mmio::MmioBus;
 
+use vmm_devices::blkdev::DiskSync;
 use vmm_devices::lifecycle::{DeviceStateError, Indicator};
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
@@ -87,7 +88,7 @@ pub(super) struct Geometry {
 /// What a controller is built from.
 ///
 /// Tests inject a recording MSI sink and a backend that stalls on
-/// demand; production passes the VM handle and the file itself.
+/// demand; production passes the VM handle and the disk itself.
 pub(super) struct NvmeParts {
     pub(super) backend: BackendFactory,
     pub(super) read_only: bool,
@@ -156,8 +157,9 @@ pub struct NvmeController {
 impl NvmeController {
     /// Create a new NVMe controller.
     ///
-    /// Bus registration failures go to a discarding logger. Use
-    /// [`new_with_logger`](Self::new_with_logger) to see them.
+    /// Bus registration and write cache warnings go to a discarding
+    /// logger. Use [`new_with_logger`](Self::new_with_logger) to see
+    /// them.
     pub fn new(
         file: File,
         read_only: bool,
@@ -165,7 +167,7 @@ impl NvmeController {
         physmap: Arc<PhysMap>,
         hdl: Arc<VmmHdl>,
         bus_mmio: Arc<MmioBus>,
-    ) -> Arc<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         Self::new_with_logger(
             file,
             read_only,
@@ -178,7 +180,7 @@ impl NvmeController {
     }
 
     /// Create a new NVMe controller with a logger for bus registration
-    /// diagnostics.
+    /// diagnostics and zvol write cache warnings.
     pub fn new_with_logger(
         file: File,
         read_only: bool,
@@ -187,15 +189,15 @@ impl NvmeController {
         hdl: Arc<VmmHdl>,
         bus_mmio: Arc<MmioBus>,
         log: slog::Logger,
-    ) -> Arc<Self> {
-        let file = Arc::new(file);
+    ) -> anyhow::Result<Arc<Self>> {
+        // Turns a zvol's write cache on before any I/O, so first writes
+        // already hit the fast path.
+        let disk = Arc::new(DiskSync::new(Arc::new(file), read_only, &log)?);
         let backend = WorkerPool::factory(
-            Arc::clone(&file),
-            file as Arc<dyn IoBackend>,
-            read_only,
+            Arc::clone(&disk),
+            disk as Arc<dyn IoBackend>,
             log.clone(),
-        )
-        .expect("nvme: failed to stat backing file");
+        )?;
         Self::with_backend(
             backend,
             NvmeConfig::default(),
@@ -206,7 +208,6 @@ impl NvmeController {
             bus_mmio,
             log,
         )
-        .expect("nvme: the default namespace asks nothing of its backend")
     }
 
     /// Fails when `config` reports no volatile write cache and the
@@ -376,8 +377,8 @@ fn initial_state(
 
 impl Drop for NvmeController {
     fn drop(&mut self) {
-        // Nothing else releases the backing fd or lets the backend put
-        // the zvol write cache back the way it found it.
+        // Nothing else releases the backing fd or lets `DiskSync` turn
+        // off a zvol write cache it turned on.
         self.backend.halt();
     }
 }

@@ -4,12 +4,13 @@
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use vmm_core::common::{RWOp, ReadOp, WriteOp, PAGE_SIZE};
 use vmm_core::mem::{MemCtx, PhysMap};
 use vmm_core::mmio::MmioBus;
+use vmm_devices::blkdev::DiskSync;
 use vmm_devices::pci::device::PciDevice;
 use vmm_devices::pci::msix::MsiSink;
 use vmm_devices::pci::BarN;
@@ -140,13 +141,24 @@ fn backing_file() -> std::fs::File {
     file
 }
 
+fn backing_disk() -> Arc<DiskSync> {
+    Arc::new(
+        DiskSync::new(
+            Arc::new(backing_file()),
+            false,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .expect("classify"),
+    )
+}
+
 /// A backend whose transfers the test controls.
 ///
 /// A held transfer stands in for a slow disk: the test can stop every
 /// worker inside the backend and then do to the controller whatever a
 /// guest could do while its I/O is outstanding.
 struct TestBackend {
-    file: Arc<std::fs::File>,
+    disk: Arc<DiskSync>,
     delay_us: AtomicU64,
     state: Mutex<BackendState>,
     cv: Condvar,
@@ -162,9 +174,9 @@ struct BackendState {
 }
 
 impl TestBackend {
-    fn new(file: Arc<std::fs::File>) -> Arc<Self> {
+    fn new(disk: Arc<DiskSync>) -> Arc<Self> {
         Arc::new(Self {
-            file,
+            disk,
             delay_us: AtomicU64::new(0),
             state: Mutex::new(BackendState::default()),
             cv: Condvar::new(),
@@ -181,8 +193,15 @@ impl TestBackend {
         self.state.lock().expect("backend lock").held = true;
     }
 
+    /// [`Self::hold`], released when the scope drops, so a failed
+    /// assertion does not leave a worker blocked in the backend.
+    fn hold_scope(&self) -> HoldScope<'_> {
+        self.hold();
+        HoldScope(self)
+    }
+
     fn release(&self) {
-        let mut st = self.state.lock().expect("backend lock");
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         st.held = false;
         self.cv.notify_all();
     }
@@ -206,11 +225,13 @@ impl TestBackend {
                 .wait_timeout(st, Duration::from_millis(50))
                 .expect("backend lock");
             st = next;
-            assert!(
-                !timeout.timed_out() || start.elapsed() < WAIT,
-                "only {} of {n} transfers started",
-                st.in_flight
-            );
+            if timeout.timed_out() && start.elapsed() >= WAIT {
+                let started = st.in_flight;
+                // Panicking with the lock held would poison it for the
+                // workers.
+                drop(st);
+                panic!("only {started} of {n} transfers started");
+            }
         }
     }
 
@@ -236,6 +257,14 @@ impl TestBackend {
     }
 }
 
+struct HoldScope<'a>(&'a TestBackend);
+
+impl Drop for HoldScope<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 impl super::io::IoBackend for TestBackend {
     fn read_at(
         &self,
@@ -243,7 +272,7 @@ impl super::io::IoBackend for TestBackend {
         offset: u64,
     ) -> std::io::Result<usize> {
         self.enter();
-        let done = iov.read_from(&self.file, offset);
+        let done = iov.read_from(self.disk.file(), offset);
         self.leave();
         done
     }
@@ -254,14 +283,14 @@ impl super::io::IoBackend for TestBackend {
         offset: u64,
     ) -> std::io::Result<usize> {
         self.enter();
-        let done = iov.write_to(&self.file, offset);
+        let done = iov.write_to(self.disk.file(), offset);
         self.leave();
         done
     }
 
     fn sync(&self) -> std::io::Result<()> {
         self.enter();
-        let done = self.file.sync_data();
+        let done = self.disk.sync();
         self.leave();
         done
     }
@@ -419,10 +448,10 @@ impl Harness {
     }
 
     fn held_with(fences: FenceBudgets) -> (Self, Arc<TestBackend>) {
-        let file = Arc::new(backing_file());
-        let backend = TestBackend::new(Arc::clone(&file));
+        let disk = backing_disk();
+        let backend = TestBackend::new(Arc::clone(&disk));
         let h = Self::build(
-            file,
+            disk,
             Arc::clone(&backend) as Arc<dyn super::io::IoBackend>,
             false,
             fences,
@@ -431,31 +460,31 @@ impl Harness {
     }
 
     fn new() -> Self {
-        let file = Arc::new(backing_file());
-        Self::with_backend(Arc::clone(&file), file)
+        let disk = backing_disk();
+        Self::with_backend(Arc::clone(&disk), disk)
     }
 
     fn read_only() -> Self {
-        let file = Arc::new(backing_file());
-        Self::build(Arc::clone(&file), file, true, FENCE_BUDGETS)
+        let disk = backing_disk();
+        Self::build(Arc::clone(&disk), disk, true, FENCE_BUDGETS)
     }
 
     fn with_backend(
-        file: Arc<std::fs::File>,
+        disk: Arc<DiskSync>,
         backend: Arc<dyn super::io::IoBackend>,
     ) -> Self {
-        Self::build(file, backend, false, FENCE_BUDGETS)
+        Self::build(disk, backend, false, FENCE_BUDGETS)
     }
 
     fn build(
-        file: Arc<std::fs::File>,
+        disk: Arc<DiskSync>,
         backend: Arc<dyn super::io::IoBackend>,
         read_only: bool,
         fences: FenceBudgets,
     ) -> Self {
         let log = slog::Logger::root(slog::Discard, slog::o!());
-        let backend = WorkerPool::factory(file, backend, read_only, log)
-            .expect("worker pool");
+        let backend =
+            WorkerPool::factory(disk, backend, log).expect("worker pool");
         Self::from_factory(backend, read_only, fences, NvmeConfig::default())
             .expect("controller")
     }

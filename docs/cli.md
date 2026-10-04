@@ -113,7 +113,7 @@ Format: `[bus:]dev[:func],driver[,config...]`
 
 Examples:
 ```
--s 4,nvme,/dev/zvol/dsk/zones/disk0
+-s 4,nvme,/dev/zvol/rdsk/zones/disk0
 -s 6,virtio-net-viona,net0,promiscphys
 -s 0:5:0,passthru,/dev/ppt0
 -s 30:0,fbuf,vga=off,unix=/tmp/vm.vnc

@@ -31,7 +31,7 @@
 # Knobs. VMM_HOTPLUG_DISK names a device on the operator's own node and
 # has no default; every other knob does:
 #
-#   VMM_HOTPLUG_DISK       block device or file to hot-add    (required)
+#   VMM_HOTPLUG_DISK       raw disk device or file to hot-add (required)
 #   VMM_HOTPLUG_FIREHYVE   VMM to run                         ($DIR/firehyve)
 #   VMM_HOTPLUG_KERNEL     hotplug guest kernel               ($DIR/vmlinux-hotplug)
 #   VMM_HOTPLUG_INITRD     initramfs holding the guest init   ($DIR/initramfs-virtiofs.cpio)
@@ -132,7 +132,7 @@ done
 # do.
 if wants disk; then
     if [ -z "$DISK" ]; then
-        echo "RUN-FAIL: set VMM_HOTPLUG_DISK to a block device or file to hot-add"
+        echo "RUN-FAIL: set VMM_HOTPLUG_DISK to a raw disk device (rdsk) or file to hot-add"
         echo "  it is read, never written, and it must not be in use by another VM"
         exit 1
     fi
@@ -148,7 +148,6 @@ fi
 disk_size() {
     case "$1" in
         /dev/zvol/rdsk/*) zfs get -Hpo value volsize "${1#/dev/zvol/rdsk/}" 2>/dev/null ;;
-        /dev/zvol/dsk/*) zfs get -Hpo value volsize "${1#/dev/zvol/dsk/}" 2>/dev/null ;;
         *) [ -f "$1" ] && wc -c < "$1" | tr -d ' ' ;;
     esac
 }

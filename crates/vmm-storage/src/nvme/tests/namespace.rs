@@ -126,10 +126,10 @@ fn no_write_cache_needs_a_backend_whose_writes_are_durable() {
     .expect("a buffering backend with no cache reported");
     assert!(error.to_string().contains("durable"), "{error}");
 
-    let file = Arc::new(backing_file());
+    let disk = backing_disk();
     let log = slog::Logger::root(slog::Discard, slog::o!());
-    let pool = WorkerPool::factory(Arc::clone(&file), file, false, log)
-        .expect("worker pool");
+    let pool =
+        WorkerPool::factory(Arc::clone(&disk), disk, log).expect("worker pool");
     assert!(
         Harness::from_factory(pool, false, FENCE_BUDGETS, NO_CACHE_4K).is_err()
     );

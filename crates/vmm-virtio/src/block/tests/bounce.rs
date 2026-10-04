@@ -75,16 +75,16 @@ fn request(
     }
 }
 
-fn backing(bytes: &[u8]) -> File {
+fn backing(bytes: &[u8]) -> Arc<DiskSync> {
     let mut file = tempfile::tempfile().expect("create tempfile");
     file.write_all(bytes).expect("fill the backing file");
     file.flush().expect("flush the backing file");
-    file
+    disk(file)
 }
 
-fn read_backing(file: &File, len: usize) -> Vec<u8> {
+fn read_backing(disk: &DiskSync, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
-    file.read_exact_at(&mut out, 0).expect("read back");
+    disk.file().read_exact_at(&mut out, 0).expect("read back");
     out
 }
 
