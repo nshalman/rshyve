@@ -164,7 +164,7 @@ firehyve -c 2 -m 512M \
 
 `parse_blk_config` (`crates/vmm-virtio/src/attach.rs:55`) parses exactly those four keys. Defaults: writable, `sectorsize` 512, `num-queues` = `min(num_vcpus, 4)` floored at 1. `sectorsize=N` is applied only if N is a power of two in 512..=65536; `num-queues=N` only if N is in 1..=8. Out-of-range values are discarded with no diagnostic and the default stands.
 
-The backing store is opened as a plain file: a raw image, a zvol device node, or an ISO all work. Capacity comes from `fstat` alone; there is no `DKIOCGMEDIAINFO` fallback anywhere in the tree, so a backing store whose stat size is 0 presents as a zero-capacity disk. Transport is transitional PCI (device id 0x1001 with modern capability structures), ring size 128, MSI-X vectors `num_queues + 1`.
+The backing store is opened as a plain file: a raw image, a zvol raw node (`/dev/zvol/rdsk/...`), or an ISO all work; a writable block node is refused (see [Disk flush and write cache](#disk-flush-and-write-cache)). Capacity comes from `fstat` alone; there is no `DKIOCGMEDIAINFO` fallback anywhere in the tree, so a backing store whose stat size is 0 presents as a zero-capacity disk. Transport is transitional PCI (device id 0x1001 with modern capability structures), ring size 128, MSI-X vectors `num_queues + 1`.
 
 `ro` is enforced three times: the file is opened without write, `VIRTIO_BLK_F_RO` is set, and `T_OUT` returns `VIRTIO_BLK_S_IOERR` (`block.rs:315,272,646`). It also suppresses DISCARD advertisement and skips the zvol write-cache ioctl.
 
@@ -201,9 +201,22 @@ Real ATAPI over an Intel ICH8 AHCI controller (vendor 0x8086, device 0x2821, BAR
 
 SCSI/MMC commands implemented: TEST UNIT READY, REQUEST SENSE, INQUIRY, START/STOP UNIT, PREVENT/ALLOW MEDIUM REMOVAL, READ CAPACITY, READ(10), READ TOC (formats 0 and 1; formats 2 and 3 return ILLEGAL REQUEST), GET EVENT STATUS NOTIFICATION, MODE SENSE(10) pages 0x01 and 0x2A, REPORT LUNS, READ(12). Everything else is an ILLEGAL REQUEST.
 
-### zvol write cache
+### Disk flush and write cache
 
-Any writable virtio-blk or NVMe backing fd gets a best-effort `DKIOCGETWCE`/`DKIOCSETWCE` pass (`crates/vmm-devices/src/blkdev.rs:47`). Regular files and non-disk backing stores are skipped silently. The original value is restored on drop. Skipped entirely under `ro`. `ahci-cd` does not use it.
+A writable virtio-blk or NVMe backing fd is handled by type (`crates/vmm-devices/src/blkdev.rs`). Skipped entirely under `ro`. `ahci-cd` does not use it.
+
+- **Regular file**: guest flushes call fsync.
+- **Block device** (`/dev/zvol/dsk/...`, `/dev/dsk/...`, `/dev/lofi/...`): refused when writable. For a `dsk` path under `/dev` the error names the raw node to use; for `/dev/lofi` it says to use a zvol, since raw lofi is refused too; for any other path it says to use the raw (character) node. Specfs answers ENOTTY to every disk ioctl on a block node, and writes wait in its page cache (full MAXBSIZE blocks also start async writeback). fsync drains that cache and tries the device flush but hides both errors, and after one ENOTSUP or ENOTTY it never flushes the node again. A read-only block node is allowed.
+- **zvol character device** (`/dev/zvol/rdsk/...`), found by the driver's `DKIOCINFO` drive name `zvol`, not by path: the write cache is turned on (`DKIOCSETWCE=1`, best effort) for speed. Every guest flush sends `DKIOCFLUSHWRITECACHE`, which on a zvol always commits the ZIL, and every error goes back to the guest. On drop, the cache is turned off if it was off when this open checked (best effort). Two opens can both see it off, both turn it on and both turn it off; that is harmless because every zvol flush commits the ZIL (with `sync=disabled` nothing commits and the cache state changes nothing either). A failed cache change is logged as a warning. If the process dies without running drop, the cache stays on until the zvol minor is recreated, which is safe for the same reason.
+- **Any other character device** (`/dev/rdsk/...`): the write cache is never changed. `DKIOCGETWCE` answering anything but on, off, ENOTSUP or ENOTTY refuses the disk. If it reads on, `DKIOCSETWCE=1` is sent once to refresh sd's own copy of the cache state (sd answers a flush with success and sends nothing while that copy says off), and the disk is refused if that call fails (sd answers EINVAL when the cache mode is not changeable or `sd.conf` disables the cache). Then `DKIOCFLUSHWRITECACHE` is probed:
+  - The probe works: every guest flush sends the ioctl and every error goes back to the guest.
+  - The probe answers ENOTSUP (the driver says it has no cache, for example an NVMe namespace without a volatile write cache): accepted, with no-op flushes, only if `DKIOCGETWCE` read off or answered ENOTSUP or ENOTTY. If it read on, the disk has a volatile cache it cannot flush and is refused. This trusts a driver that answers ENOTSUP to have no volatile cache (for example vioblk without the FLUSH feature in a nested guest).
+  - The probe answers ENOTTY (the driver does not know the flush ioctl): refused. Raw lofi (`/dev/rlofi/...`) is one: it can wrap an sd or NVMe device, and its fsync of that device goes through specfs, which drops the device flush result. Attach it read-only or use a zvol.
+  - Any other errno from the probe refuses the disk.
+
+  Every refusal says what to do next: attach the disk read-only, turn its write cache off, or use a zvol.
+
+The probe result is decided once, at open. If the cache is turned on out of band after that (a uscsi MODE SELECT, a drive reset that restores WCE=1, an NVMe passthrough SET FEATURES), the driver's own flag can go stale and later flushes can be no-ops. Userland cannot detect this, and every user of the flush ioctl has the same exposure. sd's `suppress_cache_flush` setting also makes flushes no-ops by design.
 
 ## Network
 

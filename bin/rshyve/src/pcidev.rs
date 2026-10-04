@@ -177,6 +177,7 @@ fn parse_and_create_pci_device(
                 num_vcpus,
                 lintr,
                 &virtio_ctx,
+                log,
             )?;
             chipset.try_attach_device(bdf, pci_dev.clone())?;
             info!(log, "virtio-blk attached";
@@ -214,12 +215,11 @@ fn parse_and_create_pci_device(
                 anyhow::bail!("nvme requires a disk path");
             }
             let (path, blk_opts) = devspec::parse_blk_config(config);
-            use std::fs::OpenOptions;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(!blk_opts.read_only)
-                .open(path)
-                .with_context(|| format!("failed to open disk: {}", path))?;
+            let file = vmm_devices::blkdev::open_disk(
+                std::path::Path::new(path),
+                blk_opts.read_only,
+            )
+            .with_context(|| format!("failed to open disk: {}", path))?;
 
             let nvme = vmm_storage::nvme::NvmeController::new_with_logger(
                 file,
@@ -228,8 +228,12 @@ fn parse_and_create_pci_device(
                 Arc::clone(physmap),
                 Arc::clone(vmm_hdl),
                 Arc::clone(bus_mmio),
-                log.new(slog::o!("component" => "nvme")),
-            );
+                log.new(slog::o!(
+                    "component" => "nvme",
+                    "path" => path.to_string(),
+                )),
+            )
+            .with_context(|| format!("failed to create nvme for: {path}"))?;
 
             chipset.try_attach_device(bdf, nvme.clone())?;
             info!(log, "nvme attached";
@@ -527,7 +531,7 @@ mod tests {
     #[test]
     fn specs_have_ahci_cd_reads_the_driver_field() {
         let specs = vec![
-            "4,virtio-blk,/dev/dsk/test".to_string(),
+            "4,virtio-blk,/dev/rdsk/test".to_string(),
             "5,ahci-cd,/x.iso".to_string(),
         ];
 
@@ -560,7 +564,7 @@ mod tests {
     #[test]
     fn reject_unmigratable_destination_allows_normal_specs() {
         let specs = vec![
-            "4,virtio-blk,/dev/dsk/test".to_string(),
+            "4,virtio-blk,/dev/rdsk/test".to_string(),
             "5,nvme,/tmp/fbuf".to_string(),
         ];
 

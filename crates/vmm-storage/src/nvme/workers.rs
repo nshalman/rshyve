@@ -4,8 +4,10 @@
 
 //! I/O worker threads.
 
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
+
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 use vmm_core::mem::MemCtx;
 use vmm_devices::QuiesceGate;
@@ -22,34 +24,25 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Worker thread loop: reads I/O requests from the channel and executes them.
 ///
 /// The controller reference is weak so the worker pool never keeps the
-/// controller, its backing fd or its `DiskCache` alive.
+/// controller alive. The backend still holds the fd, so the write cache
+/// is restored only once every worker has exited.
 pub(super) fn io_worker(
-    rx: Arc<Mutex<mpsc::Receiver<IoRequest>>>,
+    rx: Receiver<IoRequest>,
     backend: Arc<dyn IoBackend>,
     read_only: bool,
     ctrl: Weak<NvmeController>,
     gate: Arc<QuiesceGate>,
 ) {
-    use std::sync::mpsc::RecvTimeoutError;
-
     loop {
         // Park before taking new work. A guest that keeps the channel
         // non-empty would otherwise never let a worker reach the gate,
         // and an operator pause would time out under load.
         gate.park_if_paused();
 
-        let req = {
-            let rx_guard = rx.lock().expect("nvme: io_rx lock");
-            // A pause taken while this thread waited for the receiver
-            // must not cost the poll interval for every other worker.
-            if gate.is_paused() {
-                continue;
-            }
-            match rx_guard.recv_timeout(POLL_INTERVAL) {
-                Ok(req) => req,
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
+        let req = match rx.recv_timeout(POLL_INTERVAL) {
+            Ok(req) => req,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
         };
 
         // A pause between the dequeue and the transfer stops the

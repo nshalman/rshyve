@@ -35,6 +35,19 @@ changed default, a removed feature, or a security fix.
   ([docs/architecture.md](docs/architecture.md)), one feature reference
   ([docs/features.md](docs/features.md)) and one backlog
   ([FEATURES_TODO.md](FEATURES_TODO.md)).
+- A writable virtio-blk or NVMe backing disk is refused when:
+  - it is a block device node (`/dev/dsk/...`, `/dev/zvol/dsk/...`,
+    `/dev/lofi/...`), because specfs hides flush errors; use the raw
+    node (a zvol in place of lofi) or attach it read-only;
+  - `DKIOCGETWCE` fails with an errno other than ENOTSUP or ENOTTY;
+  - its write cache is on and refreshing it with `DKIOCSETWCE` fails;
+  - its write cache is on and the flush probe answers ENOTSUP;
+  - the flush probe answers ENOTTY (raw lofi, for example) or any errno
+    but ENOTSUP.
+
+  A disk whose driver answers the probe with ENOTSUP and whose cache is
+  off or not controllable is accepted with no-op flushes. Only a zvol's
+  write cache is changed; other disks are left as found.
 
 ### Security
 

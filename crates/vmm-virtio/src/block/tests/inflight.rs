@@ -69,6 +69,7 @@ impl Rig {
             1,
             LIMIT,
             GRACE,
+            &slog::Logger::root(slog::Discard, slog::o!()),
         )
         .expect("create VirtioBlock");
 

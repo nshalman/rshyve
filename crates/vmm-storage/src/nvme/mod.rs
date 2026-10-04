@@ -24,7 +24,6 @@ mod workers;
 mod tests;
 
 use std::fs::File;
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -34,7 +33,7 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::PhysMap;
 use vmm_core::mmio::MmioBus;
 
-use vmm_devices::blkdev::DiskCache;
+use vmm_devices::blkdev::DiskSync;
 use vmm_devices::lifecycle::{
     DeviceStateError, Indicator, NvmeMigrateCq, NvmeMigrateSq,
 };
@@ -86,9 +85,9 @@ pub(super) struct Geometry {
 /// What a controller is built from.
 ///
 /// Tests inject a recording MSI sink and a backend that stalls on
-/// demand; production passes the VM handle and the file itself.
+/// demand; production passes the VM handle and the disk itself.
 pub(super) struct NvmeParts {
-    pub(super) file: Arc<File>,
+    pub(super) disk: Arc<DiskSync>,
     pub(super) backend: Arc<dyn IoBackend>,
     pub(super) read_only: bool,
     pub(super) instance_id: u8,
@@ -104,7 +103,7 @@ pub struct NvmeController {
     pub(super) pci_state: Mutex<DeviceState>,
     pub(super) msix: Arc<MsixTable>,
     state: Mutex<NvmeState>,
-    io_tx: Mutex<Option<mpsc::Sender<IoRequest>>>,
+    io_tx: Mutex<Option<crossbeam_channel::Sender<IoRequest>>>,
     pub(super) physmap: Arc<PhysMap>,
     pub(super) bus_mmio: Arc<MmioBus>,
     pub(super) registered_bar0: Mutex<Option<u64>>,
@@ -112,10 +111,8 @@ pub struct NvmeController {
     /// Weak self-reference for MMIO handler closures.
     pub(super) self_ref: Mutex<Option<std::sync::Weak<Self>>>,
     pub(super) log: slog::Logger,
-    /// Zvol write-cache control.
-    _cache: DiskCache,
     /// The backing store, kept for the durable flush.
-    file: Arc<File>,
+    disk: Arc<DiskSync>,
     /// The I/O worker pool, joined by [`Self::stop_workers`].
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
     pub(super) geometry: Geometry,
@@ -127,8 +124,9 @@ pub struct NvmeController {
 impl NvmeController {
     /// Create a new NVMe controller.
     ///
-    /// Bus registration failures go to a discarding logger. Use
-    /// [`new_with_logger`](Self::new_with_logger) to see them.
+    /// Bus registration and write cache warnings go to a discarding
+    /// logger. Use [`new_with_logger`](Self::new_with_logger) to see
+    /// them.
     pub fn new(
         file: File,
         read_only: bool,
@@ -136,7 +134,7 @@ impl NvmeController {
         physmap: Arc<PhysMap>,
         hdl: Arc<VmmHdl>,
         bus_mmio: Arc<MmioBus>,
-    ) -> Arc<Self> {
+    ) -> std::io::Result<Arc<Self>> {
         Self::new_with_logger(
             file,
             read_only,
@@ -149,7 +147,7 @@ impl NvmeController {
     }
 
     /// Create a new NVMe controller with a logger for bus registration
-    /// diagnostics.
+    /// diagnostics and zvol write cache warnings.
     pub fn new_with_logger(
         file: File,
         read_only: bool,
@@ -158,11 +156,13 @@ impl NvmeController {
         hdl: Arc<VmmHdl>,
         bus_mmio: Arc<MmioBus>,
         log: slog::Logger,
-    ) -> Arc<Self> {
-        let file = Arc::new(file);
-        Self::build(NvmeParts {
-            backend: Arc::clone(&file) as Arc<dyn IoBackend>,
-            file,
+    ) -> std::io::Result<Arc<Self>> {
+        // Turns a zvol's write cache on before any I/O, so first writes
+        // already hit the fast path.
+        let disk = Arc::new(DiskSync::new(Arc::new(file), read_only, &log)?);
+        Ok(Self::build(NvmeParts {
+            backend: Arc::clone(&disk) as Arc<dyn IoBackend>,
+            disk,
             read_only,
             instance_id,
             physmap,
@@ -170,12 +170,12 @@ impl NvmeController {
             bus_mmio,
             fences: FENCE_BUDGETS,
             log,
-        })
+        }))
     }
 
     pub(super) fn build(parts: NvmeParts) -> Arc<Self> {
         let NvmeParts {
-            file,
+            disk,
             backend,
             read_only,
             instance_id,
@@ -186,11 +186,8 @@ impl NvmeController {
             log,
         } = parts;
 
-        // NVMe has explicit FLUSH semantics, so the zvol may run
-        // writeback. Set before any I/O so first writes hit the fast path.
-        let cache = DiskCache::new(Arc::clone(&file), read_only);
-
-        let file_len = file
+        let file_len = disk
+            .file()
             .metadata()
             .expect("nvme: failed to stat backing file")
             .len();
@@ -265,7 +262,7 @@ impl NvmeController {
             fence_failed: false,
         };
 
-        let (tx, rx) = mpsc::channel::<IoRequest>();
+        let (tx, rx) = crossbeam_channel::unbounded::<IoRequest>();
         let gate = Arc::new(QuiesceGate::new(NUM_WORKERS));
 
         let ctrl = Arc::new(Self {
@@ -279,8 +276,7 @@ impl NvmeController {
             registered_bar4: Mutex::new(None),
             self_ref: Mutex::new(None),
             log,
-            _cache: cache,
-            file,
+            disk,
             workers: Mutex::new(Vec::with_capacity(NUM_WORKERS)),
             geometry,
             indicator: Indicator::new(),
@@ -290,10 +286,9 @@ impl NvmeController {
         *ctrl.self_ref.lock().expect("self_ref lock") =
             Some(Arc::downgrade(&ctrl));
 
-        let rx = Arc::new(Mutex::new(rx));
         let mut workers = Vec::with_capacity(NUM_WORKERS);
         for i in 0..NUM_WORKERS {
-            let rx = Arc::clone(&rx);
+            let rx = rx.clone();
             let weak = Arc::downgrade(&ctrl);
             let gate = Arc::clone(&gate);
             let backend = Arc::clone(&backend);
@@ -336,8 +331,8 @@ impl NvmeController {
     /// Disconnect the I/O channel and wait for the workers.
     ///
     /// Dropping the sender is the only thing that ends a worker, and
-    /// nothing else releases the backing fd or lets `DiskCache` put the
-    /// zvol write cache back the way it found it.
+    /// nothing else releases the backing fd or lets `DiskSync` turn off
+    /// a zvol write cache it turned on.
     fn stop_workers(&self) {
         drop(self.io_tx.lock().expect("nvme: io_tx lock").take());
         // A parked worker never reaches the channel to see it close.
@@ -496,7 +491,7 @@ impl Lifecycle for NvmeController {
     }
 
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
-        vmm_devices::quiesce::flush_file(&self.gate, &self.file, intent, "nvme")
+        vmm_devices::quiesce::flush_file(&self.gate, &self.disk, intent, "nvme")
     }
 
     fn export_migrate_state(
