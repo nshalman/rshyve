@@ -323,8 +323,12 @@ impl Core {
         if self.is_closed() {
             return;
         }
+        let _topology = self.topology.lock();
+        // A held eject stays in the register file for a later pass.
+        if self.topology.ejects_held() {
+            return;
+        }
         for slot in self.regs.take_eject_requests() {
-            let _topology = self.topology.lock();
             self.eject(slot);
         }
     }

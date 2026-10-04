@@ -701,9 +701,8 @@ fn a_guest_eject_no_operator_asked_for_is_refused() {
 
 #[test]
 fn an_eject_changes_the_bus_under_the_topology_lock() {
-    // Migration reads the device set under this lock. An eject that
-    // removed a device outside it could change the set between the
-    // source's refusal check and its device export.
+    // A pause, resume or migration claim reads the device set under
+    // this lock, so an eject must not change the set while one runs.
     let topology = TopologyLock::default();
     let mut fixture = Fixture::with_pause(RecordingPause {
         topology: Some(topology.clone()),
@@ -718,6 +717,49 @@ fn an_eject_changes_the_bus_under_the_topology_lock() {
 
     assert!(fixture.registry.get_by_id(&id).is_none(), "not ejected");
     assert!(fixture.vm.paused_under_topology.load(Ordering::Acquire));
+}
+
+#[test]
+fn a_held_eject_waits_until_the_hold_ends() {
+    // A migration import restores state into the device set it was
+    // admitted with. An eject during the import would take one away.
+    let fixture = Fixture::new();
+    let id = fixture.add("5,virtio-blk,/disk").expect("added");
+    fixture.core.request_remove(&id).expect("requested");
+    let topology = fixture.core.topology.clone();
+    topology.hold_ejects(&topology.lock(), true);
+
+    fixture.guest_ejects(5);
+    fixture.core.drain_ejects();
+    assert!(
+        fixture.registry.get_by_id(&id).is_some(),
+        "ejected while held"
+    );
+
+    topology.hold_ejects(&topology.lock(), false);
+    fixture.core.drain_ejects();
+    assert!(
+        fixture.registry.get_by_id(&id).is_none(),
+        "the eject was lost"
+    );
+}
+
+#[test]
+fn a_poisoned_free_topology_lock_is_not_held() {
+    let topology = TopologyLock::default();
+    let poisoner = topology.clone();
+    let _ = std::thread::spawn(move || {
+        let _guard = poisoner.lock();
+        panic!("poison the lock");
+    })
+    .join();
+
+    assert!(!topology.is_held());
+    let _guard = topology.lock();
+    let other = topology.clone();
+    assert!(std::thread::spawn(move || other.is_held())
+        .join()
+        .expect("join"));
 }
 
 #[test]
