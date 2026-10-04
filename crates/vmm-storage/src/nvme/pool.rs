@@ -8,12 +8,12 @@
 //! straight between the store and the guest pages and reports each
 //! request to the sink as it finishes.
 
-use std::fs::File;
 use std::io;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-use vmm_devices::blkdev::DiskCache;
+use crossbeam_channel::{Receiver, Sender};
+use vmm_devices::blkdev::DiskSync;
 use vmm_devices::{FlushError, FlushIntent};
 
 use super::backend::{
@@ -27,51 +27,45 @@ use super::io::IoBackend;
 pub(super) const NUM_WORKERS: usize = 8;
 
 pub(super) struct WorkerPool {
-    tx: Mutex<Option<mpsc::Sender<BlockRequest>>>,
+    tx: Mutex<Option<Sender<BlockRequest>>>,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
-    file: Arc<File>,
+    /// Dropped after the workers stop, so a zvol write cache is turned
+    /// back off only once nothing writes through it.
+    disk: Arc<DiskSync>,
     capacity: u64,
     durable: bool,
+    sink: Arc<dyn CompletionSink>,
     log: slog::Logger,
-    /// Zvol write-cache control. Dropped after the workers stop, so
-    /// the cache is put back only once nothing writes through it.
-    _cache: DiskCache,
 }
 
 impl WorkerPool {
-    /// The workers hold the only references to `io`, so the pool never
-    /// keeps the store open past its own end.
+    /// The pool keeps no `io` of its own, so the store closes once the
+    /// workers and `disk` are gone.
     pub(super) fn factory(
-        file: Arc<File>,
+        disk: Arc<DiskSync>,
         io: Arc<dyn IoBackend>,
-        read_only: bool,
         log: slog::Logger,
     ) -> io::Result<BackendFactory> {
-        let capacity = file.metadata()?.len();
+        let capacity = disk.file().metadata()?.len();
         Ok(Box::new(move |sink| {
-            Arc::new(Self::spawn(file, io, read_only, capacity, sink, log))
+            Arc::new(Self::spawn(disk, io, capacity, sink, log))
                 as Arc<dyn AsyncBackend>
         }))
     }
 
     fn spawn(
-        file: Arc<File>,
+        disk: Arc<DiskSync>,
         io: Arc<dyn IoBackend>,
-        read_only: bool,
         capacity: u64,
         sink: Arc<dyn CompletionSink>,
         log: slog::Logger,
     ) -> Self {
-        // NVMe has explicit FLUSH semantics, so the zvol may run
-        // writeback. Set before any I/O so first writes hit the fast path.
-        let cache = DiskCache::new(Arc::clone(&file), read_only);
         let durable = io.durable_writes();
 
-        let (tx, rx) = mpsc::channel::<BlockRequest>();
-        let rx = Arc::new(Mutex::new(rx));
+        let (tx, rx) = crossbeam_channel::unbounded::<BlockRequest>();
         let workers = (0..NUM_WORKERS)
             .map(|i| {
-                let rx = Arc::clone(&rx);
+                let rx = rx.clone();
                 let io = Arc::clone(&io);
                 let sink = Arc::clone(&sink);
                 thread::Builder::new()
@@ -84,11 +78,11 @@ impl WorkerPool {
         Self {
             tx: Mutex::new(Some(tx)),
             workers: Mutex::new(workers),
-            file,
+            disk,
             capacity,
             durable,
+            sink,
             log,
-            _cache: cache,
         }
     }
 
@@ -135,21 +129,21 @@ impl AsyncBackend for WorkerPool {
     }
 
     fn submit(&self, req: BlockRequest) {
-        let tx = self.tx.lock().expect("nvme: pool tx lock");
-        let sent = match tx.as_ref() {
+        let sent = match self.tx.lock().expect("nvme: pool tx lock").as_ref() {
             Some(tx) => tx.send(req).map_err(|error| error.0.id()),
             None => Err(req.id()),
         };
         if let Err(id) = sent {
-            // The controller admits nothing after halt, so this is a
-            // worker that died, and the request will never complete.
-            slog::error!(self.log, "nvme: I/O dropped, the workers are gone";
+            // No worker will ever take it, and its tag stays taken until
+            // it completes.
+            slog::error!(self.log, "nvme: I/O failed, the workers are gone";
                 "queue" => id.queue(), "tag" => id.tag());
+            self.sink.complete(&[(id, BlockStatus::Internal)]);
         }
     }
 
     fn flush(&self, intent: FlushIntent) -> Result<(), FlushError> {
-        vmm_devices::quiesce::sync_file(&self.file, intent, "nvme")
+        vmm_devices::quiesce::sync_file(&self.disk, intent, "nvme")
     }
 
     fn halt(&self) {
@@ -158,18 +152,11 @@ impl AsyncBackend for WorkerPool {
 }
 
 fn worker(
-    rx: &Mutex<mpsc::Receiver<BlockRequest>>,
+    rx: &Receiver<BlockRequest>,
     io: &dyn IoBackend,
     sink: &dyn CompletionSink,
 ) {
-    loop {
-        let req = {
-            let rx = rx.lock().expect("nvme: pool rx lock");
-            match rx.recv() {
-                Ok(req) => req,
-                Err(mpsc::RecvError) => return,
-            }
-        };
+    while let Ok(req) = rx.recv() {
         let status = run(&req, io);
         sink.complete(&[(req.id(), status)]);
     }

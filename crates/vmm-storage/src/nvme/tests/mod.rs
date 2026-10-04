@@ -4,12 +4,13 @@
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use vmm_core::common::{RWOp, ReadOp, WriteOp, PAGE_SIZE};
 use vmm_core::mem::{MemCtx, PhysMap};
 use vmm_core::mmio::MmioBus;
+use vmm_devices::blkdev::DiskSync;
 use vmm_devices::pci::device::PciDevice;
 use vmm_devices::pci::msix::MsiSink;
 use vmm_devices::pci::BarN;
@@ -59,6 +60,10 @@ struct RecordingSink {
     sent: Mutex<Vec<(u64, u64)>>,
     ctrl: OnceLock<std::sync::Weak<NvmeController>>,
     under_lock: AtomicU64,
+    /// While set, `send` records its message and then waits, as a slow
+    /// interrupt path would.
+    gate: Mutex<bool>,
+    gate_cv: Condvar,
 }
 
 impl MsiSink for RecordingSink {
@@ -72,7 +77,43 @@ impl MsiSink for RecordingSink {
             }
         }
         self.sent.lock().expect("sink lock").push((addr, data));
+        let mut closed = self.gate.lock().expect("gate lock");
+        self.gate_cv.notify_all();
+        while *closed {
+            closed = self.gate_cv.wait(closed).expect("gate lock");
+        }
     }
+}
+
+impl RecordingSink {
+    fn close_gate(&self) {
+        *self.gate.lock().expect("gate lock") = true;
+    }
+
+    fn open_gate(&self) {
+        *self.gate.lock().expect("gate lock") = false;
+        self.gate_cv.notify_all();
+    }
+
+    /// Wait until `n` messages have been sent.
+    fn wait_sent(&self, n: usize) {
+        let start = Instant::now();
+        while self.sent.lock().expect("sink lock").len() < n {
+            assert!(start.elapsed() < WAIT, "fewer than {n} MSIs in {WAIT:?}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// Join `thread`, failing the test instead of hanging when it has not
+/// finished within `budget`.
+fn join_within<T>(thread: std::thread::JoinHandle<T>, budget: Duration) -> T {
+    let start = Instant::now();
+    while !thread.is_finished() {
+        assert!(start.elapsed() < budget, "still running after {budget:?}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    thread.join().expect("thread panicked")
 }
 
 /// One controller over anonymous guest RAM and a patterned temp file.
@@ -100,13 +141,24 @@ fn backing_file() -> std::fs::File {
     file
 }
 
+fn backing_disk() -> Arc<DiskSync> {
+    Arc::new(
+        DiskSync::new(
+            Arc::new(backing_file()),
+            false,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .expect("classify"),
+    )
+}
+
 /// A backend whose transfers the test controls.
 ///
 /// A held transfer stands in for a slow disk: the test can stop every
 /// worker inside the backend and then do to the controller whatever a
 /// guest could do while its I/O is outstanding.
 struct TestBackend {
-    file: Arc<std::fs::File>,
+    disk: Arc<DiskSync>,
     delay_us: AtomicU64,
     state: Mutex<BackendState>,
     cv: Condvar,
@@ -122,9 +174,9 @@ struct BackendState {
 }
 
 impl TestBackend {
-    fn new(file: Arc<std::fs::File>) -> Arc<Self> {
+    fn new(disk: Arc<DiskSync>) -> Arc<Self> {
         Arc::new(Self {
-            file,
+            disk,
             delay_us: AtomicU64::new(0),
             state: Mutex::new(BackendState::default()),
             cv: Condvar::new(),
@@ -141,8 +193,15 @@ impl TestBackend {
         self.state.lock().expect("backend lock").held = true;
     }
 
+    /// [`Self::hold`], released when the scope drops, so a failed
+    /// assertion does not leave a worker blocked in the backend.
+    fn hold_scope(&self) -> HoldScope<'_> {
+        self.hold();
+        HoldScope(self)
+    }
+
     fn release(&self) {
-        let mut st = self.state.lock().expect("backend lock");
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         st.held = false;
         self.cv.notify_all();
     }
@@ -166,11 +225,13 @@ impl TestBackend {
                 .wait_timeout(st, Duration::from_millis(50))
                 .expect("backend lock");
             st = next;
-            assert!(
-                !timeout.timed_out() || start.elapsed() < WAIT,
-                "only {} of {n} transfers started",
-                st.in_flight
-            );
+            if timeout.timed_out() && start.elapsed() >= WAIT {
+                let started = st.in_flight;
+                // Panicking with the lock held would poison it for the
+                // workers.
+                drop(st);
+                panic!("only {started} of {n} transfers started");
+            }
         }
     }
 
@@ -196,6 +257,14 @@ impl TestBackend {
     }
 }
 
+struct HoldScope<'a>(&'a TestBackend);
+
+impl Drop for HoldScope<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 impl super::io::IoBackend for TestBackend {
     fn read_at(
         &self,
@@ -203,7 +272,7 @@ impl super::io::IoBackend for TestBackend {
         offset: u64,
     ) -> std::io::Result<usize> {
         self.enter();
-        let done = iov.read_from(&self.file, offset);
+        let done = iov.read_from(self.disk.file(), offset);
         self.leave();
         done
     }
@@ -214,14 +283,14 @@ impl super::io::IoBackend for TestBackend {
         offset: u64,
     ) -> std::io::Result<usize> {
         self.enter();
-        let done = iov.write_to(&self.file, offset);
+        let done = iov.write_to(self.disk.file(), offset);
         self.leave();
         done
     }
 
     fn sync(&self) -> std::io::Result<()> {
         self.enter();
-        let done = self.file.sync_data();
+        let done = self.disk.sync();
         self.leave();
         done
     }
@@ -239,6 +308,9 @@ struct Manual {
     durable: bool,
     /// Finish each request inside `submit`, on the caller's thread.
     inline: AtomicBool,
+    /// On the next `submit`, finish what is queued from inside it
+    /// first, as a ring backend reaping its completions does.
+    reap_on_submit: AtomicBool,
 }
 
 impl Manual {
@@ -261,6 +333,7 @@ impl Manual {
             depth,
             durable,
             inline: AtomicBool::new(false),
+            reap_on_submit: AtomicBool::new(false),
         })
     }
 
@@ -342,6 +415,12 @@ impl AsyncBackend for ManualBackend {
             .lock()
             .expect("queues lock")
             .push(req.id().queue());
+        if self.0.reap_on_submit.swap(false, Ordering::Relaxed) {
+            let reaped = self.0.take();
+            let done: Vec<_> =
+                reaped.iter().map(|r| (r.id(), self.0.run(r))).collect();
+            self.0.sink().complete(&done);
+        }
         if self.0.inline.load(Ordering::Relaxed) {
             let status = self.0.run(&req);
             self.0.sink().complete(&[(req.id(), status)]);
@@ -369,10 +448,10 @@ impl Harness {
     }
 
     fn held_with(fences: FenceBudgets) -> (Self, Arc<TestBackend>) {
-        let file = Arc::new(backing_file());
-        let backend = TestBackend::new(Arc::clone(&file));
+        let disk = backing_disk();
+        let backend = TestBackend::new(Arc::clone(&disk));
         let h = Self::build(
-            file,
+            disk,
             Arc::clone(&backend) as Arc<dyn super::io::IoBackend>,
             false,
             fences,
@@ -381,31 +460,31 @@ impl Harness {
     }
 
     fn new() -> Self {
-        let file = Arc::new(backing_file());
-        Self::with_backend(Arc::clone(&file), file)
+        let disk = backing_disk();
+        Self::with_backend(Arc::clone(&disk), disk)
     }
 
     fn read_only() -> Self {
-        let file = Arc::new(backing_file());
-        Self::build(Arc::clone(&file), file, true, FENCE_BUDGETS)
+        let disk = backing_disk();
+        Self::build(Arc::clone(&disk), disk, true, FENCE_BUDGETS)
     }
 
     fn with_backend(
-        file: Arc<std::fs::File>,
+        disk: Arc<DiskSync>,
         backend: Arc<dyn super::io::IoBackend>,
     ) -> Self {
-        Self::build(file, backend, false, FENCE_BUDGETS)
+        Self::build(disk, backend, false, FENCE_BUDGETS)
     }
 
     fn build(
-        file: Arc<std::fs::File>,
+        disk: Arc<DiskSync>,
         backend: Arc<dyn super::io::IoBackend>,
         read_only: bool,
         fences: FenceBudgets,
     ) -> Self {
         let log = slog::Logger::root(slog::Discard, slog::o!());
-        let backend = WorkerPool::factory(file, backend, read_only, log)
-            .expect("worker pool");
+        let backend =
+            WorkerPool::factory(disk, backend, log).expect("worker pool");
         Self::from_factory(backend, read_only, fences, NvmeConfig::default())
             .expect("controller")
     }

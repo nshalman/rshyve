@@ -1732,6 +1732,7 @@ name = "vmm_storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossbeam-channel",
  "slog",
  "tempfile",
  "vmm_core",

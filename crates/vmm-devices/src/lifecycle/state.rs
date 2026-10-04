@@ -200,12 +200,15 @@ pub struct NvmeMigrateState {
     pub namespace: Option<NvmeMigrateNamespace>,
 }
 
-/// A destination must show the same shape: the guest's partition tables
-/// and flush habits depend on it.
+/// A destination must show the same namespace: the guest's partition
+/// tables, flush habits and mounts depend on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NvmeMigrateNamespace {
     pub block_size: u32,
     pub volatile_write_cache: bool,
+    /// NSZE, in blocks.
+    pub total_blocks: u64,
+    pub read_only: bool,
 }
 
 /// NVMe submission queue state for migration.

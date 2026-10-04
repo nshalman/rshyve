@@ -65,11 +65,9 @@ pub fn virtio_blk(
     num_vcpus: u32,
     lintr: Option<LintrCfg>,
     ctx: &VirtioAttachCtx<'_>,
+    log: &slog::Logger,
 ) -> anyhow::Result<Arc<VirtioPciDevice<VirtioBlock>>> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(!opts.read_only)
-        .open(path)
+    let file = vmm_devices::blkdev::open_disk(path, opts.read_only)
         .with_context(|| format!("failed to open disk: {}", path.display()))?;
 
     // A zvol has one SPA sync pipeline, so beyond ~4 queues there is no
@@ -78,10 +76,16 @@ pub fn virtio_blk(
         .num_queues
         .unwrap_or_else(|| std::cmp::min(num_vcpus as u16, 4).max(1));
 
-    let blk = VirtioBlock::new(file, opts, Arc::clone(ctx.physmap), num_queues)
-        .with_context(|| {
-            format!("failed to create virtio-blk for: {}", path.display())
-        })?;
+    let blk = VirtioBlock::new_with_logger(
+        file,
+        opts,
+        Arc::clone(ctx.physmap),
+        num_queues,
+        &log.new(slog::o!("path" => path.display().to_string())),
+    )
+    .with_context(|| {
+        format!("failed to create virtio-blk for: {}", path.display())
+    })?;
 
     let cfg_size = blk.config_size();
     // One MSI-X vector per queue, plus one for config change.

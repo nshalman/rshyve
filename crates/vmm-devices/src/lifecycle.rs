@@ -181,7 +181,7 @@ pub trait Lifecycle: Send + Sync + 'static {
     /// the ZFS barrier is hit. Teardown uses [`FlushIntent::BestEffort`].
     /// Default: no-op.
     ///
-    /// With zvol `DKIOCSETWCE=1` (enabled by `blkdev::DiskCache`), writes
+    /// With zvol `DKIOCSETWCE=1` (enabled by `blkdev::DiskSync`), writes
     /// return OK from the zvol cache without hitting the ZFS pool. A
     /// `zfs send` incremental only captures pool state, so any buffered
     /// writes not fsynced before the send would be lost on the destination.

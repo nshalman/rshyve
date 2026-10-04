@@ -522,7 +522,7 @@ NvmeControllerState {
     pci_bar_addrs: [u64; 6],            // PCI BAR addresses
     msix_entries: Vec<(u64, u64)>,      // Per-vector (addr, data)
     msix_enabled: bool,
-    namespace: Option<NvmeNamespace>,   // v3: block size and VWC
+    namespace: Option<NvmeNamespace>,   // v3: block size, VWC, size, RO
 }
 ```
 
@@ -538,9 +538,9 @@ A completion that finds its CQ full is held rather than dropped, and
 keeps its command's tag, so the controller admits no more than the
 backend's queue depth. Held completions travel in `held` and are
 written on the destination when the guest's CQ head doorbell frees
-space. A restore refuses a namespace of another block size or write
-cache setting: the guest's partition tables and flush habits depend on
-both.
+space. A restore refuses a namespace of another block size, write
+cache setting, capacity or write protection: the guest's partition
+tables, flush habits and mounts depend on them.
 
 ### CQ Tail Handling
 

@@ -554,3 +554,92 @@ fn an_io_sq_that_posts_to_the_admin_cq_is_refused() {
     payload.admin_sq.as_mut().expect("admin sq").cq_id = 1;
     check_nvme_state(&payload).expect_err("admin SQ on an I/O CQ");
 }
+
+/// Their completions would be matched against the queues the import
+/// replaces.
+#[test]
+fn a_restore_onto_a_controller_with_commands_in_flight_is_refused() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let state = export(&src);
+
+    let manual = Manual::new(IO_QDEPTH);
+    let mut dst = Harness::manual(&manual);
+    dst.enable();
+    dst.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut tail = 0;
+    submit_on(&dst, 1, SQ1, &mut tail, Sqe::read(0, 1, 0x50000, 0), 0x81);
+    assert_eq!(manual.queued(), 1);
+
+    let error = dst
+        .ctrl
+        .restore_migrate_state(&state)
+        .expect_err("a command is in flight");
+    assert!(error.to_string().contains("in flight"), "{error}");
+}
+
+/// Only a CQ head doorbell writes a held completion otherwise, and a
+/// guest waiting on this one has nothing to consume.
+#[test]
+fn a_held_completion_with_room_in_its_cq_goes_in_on_resume() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut state = nvme(export(&src));
+    state.io_cqs[0].as_mut().expect("CQ 1").held = vec![held(1, 0x99)];
+
+    let dst = Harness::new();
+    dst.ctrl
+        .restore_migrate_state(&vmm_devices::DeviceMigrateState::Nvme(state))
+        .expect("restore");
+    dst.ctrl.resume();
+    let cqe = dst.wait_cqe(CQ1, 0, true);
+    assert_eq!((cqe.cid, cqe.sqid), (0x99, 1));
+}
+
+/// A controller holds at most its depth per SQ, so the wire bound must
+/// take the most any backend depth allows.
+#[test]
+fn the_most_held_completions_a_controller_can_make_restore() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut state = nvme(export(&src));
+    let cq = state.io_cqs[0].as_mut().expect("CQ 1");
+    cq.held = (0..MAX_QUEUE_SIZE).map(|cid| held(1, cid)).collect();
+
+    let dst = Harness::manual(&Manual::new(u16::MAX));
+    dst.ctrl
+        .restore_migrate_state(&vmm_devices::DeviceMigrateState::Nvme(
+            state.clone(),
+        ))
+        .expect("a full queue of held completions");
+
+    state.io_cqs[0]
+        .as_mut()
+        .expect("CQ 1")
+        .held
+        .push(held(1, 0));
+    check_nvme_state(&state).expect_err("one past the wire bound");
+}
+
+#[test]
+fn a_refused_msix_table_changes_nothing() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut state = nvme(export(&src));
+    state.msix.entries.push(Default::default());
+
+    let dst = Harness::new();
+    let error = dst
+        .ctrl
+        .restore_migrate_state(&vmm_devices::DeviceMigrateState::Nvme(state))
+        .expect_err("one entry too many");
+    assert!(error.to_string().contains("MSI-X"), "{error}");
+    let st = dst.ctrl.lock();
+    assert_eq!(st.cc, 0, "the controller registers were applied");
+    assert!(st.admin_sq.is_none(), "the admin queue was applied");
+    assert!(!st.admission.paused, "admission was paused");
+}

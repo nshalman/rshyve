@@ -140,6 +140,10 @@ pub(super) struct Liveness {
 /// Holds the PRPs, not the pages. A backend maps them only when it
 /// moves the data, and only while the request's queues exist: after a
 /// Delete Queue or a reset those pages are the driver's again.
+///
+/// Not to be used once the request is completed. The check here sees
+/// only the queues, and the driver may reuse the pages as soon as it
+/// reads the completion.
 pub struct GuestData {
     pub(super) mem: MemCtx,
     pub(super) prp1: u64,
@@ -239,8 +243,8 @@ pub trait AsyncBackend: Send + Sync + 'static {
     /// In bytes.
     fn capacity(&self) -> u64;
 
-    /// Requests one guest queue may have in flight. The rest wait in the
-    /// guest's submission queue.
+    /// Requests one guest queue may have in flight, at most 4096. The
+    /// rest wait in the guest's submission queue.
     fn queue_depth(&self) -> u16;
 
     /// Guest I/O queues this backend serves, at most 15.
@@ -255,7 +259,8 @@ pub trait AsyncBackend: Send + Sync + 'static {
 
     /// Runs with the controller lock held, on a vCPU thread or a sink
     /// caller, so it must not block on I/O. It may complete the request
-    /// before it returns.
+    /// before it returns. Nothing of `req` may touch guest memory after
+    /// its completion.
     fn submit(&self, req: BlockRequest);
 
     /// Called with nothing in flight.

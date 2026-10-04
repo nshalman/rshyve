@@ -14,6 +14,7 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use vmm_core::mem::PhysMap;
+use vmm_devices::blkdev::DiskSync;
 use vmm_devices::QuiesceGate;
 
 use super::access::BackendBarrier;
@@ -156,13 +157,13 @@ pub(super) fn needs_backend(rtype: u32) -> bool {
 /// cannot land on a descriptor the host has reopened.
 pub(super) fn blk_io_worker(
     rx: mpsc::Receiver<BlkIoRequest>,
-    file: Arc<File>,
+    disk: Arc<DiskSync>,
     limits: DiskLimits,
     ctx: WorkerCtx,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
 
-    let file = &*file;
+    let disk = &*disk;
 
     let mut bounce = Bounce::new();
     let mut done = Pass::new();
@@ -195,7 +196,7 @@ pub(super) fn blk_io_worker(
 
         run_batch(
             &rx,
-            file,
+            disk,
             &limits,
             &ctx,
             &mut bounce,
@@ -235,7 +236,7 @@ impl Pass {
 #[allow(clippy::too_many_arguments)]
 fn run_batch(
     rx: &mpsc::Receiver<BlkIoRequest>,
-    file: &File,
+    disk: &DiskSync,
     limits: &DiskLimits,
     ctx: &WorkerCtx,
     bounce: &mut Bounce,
@@ -251,7 +252,7 @@ fn run_batch(
     let mut count = 0usize;
     while let Some(mut req) = next.take() {
         count += 1;
-        if let Some(entry) = run_request(file, limits, ctx, bounce, &req) {
+        if let Some(entry) = run_request(disk, limits, ctx, bounce, &req) {
             done.entries.push(entry);
         }
         done.charges.push(std::mem::take(&mut req.charge));
@@ -326,19 +327,20 @@ fn publish(
 /// `None` means the request belongs to a session that has ended. It
 /// publishes nothing and writes nothing into guest memory.
 pub(super) fn run_request(
-    file: &File,
+    disk: &DiskSync,
     limits: &DiskLimits,
     ctx: &WorkerCtx,
     bounce: &mut Bounce,
     req: &BlkIoRequest,
 ) -> Option<(u16, u32)> {
+    let file: &File = disk.file();
     let (status, used_len) = match req.rtype {
         bits::VIRTIO_BLK_T_IN => read_request(file, ctx, bounce, req)?,
         bits::VIRTIO_BLK_T_OUT if !limits.read_only => {
             write_request(file, ctx, bounce, req)?
         }
         bits::VIRTIO_BLK_T_OUT => (bits::VIRTIO_BLK_S_IOERR, 1),
-        bits::VIRTIO_BLK_T_FLUSH => flush_request(file, ctx, req)?,
+        bits::VIRTIO_BLK_T_FLUSH => flush_request(disk, ctx, req)?,
         bits::VIRTIO_BLK_T_DISCARD | bits::VIRTIO_BLK_T_WRITE_ZEROES => {
             dwz_request(file, limits, ctx, req)?
         }
@@ -465,7 +467,7 @@ fn write_request(
 }
 
 fn flush_request(
-    file: &File,
+    disk: &DiskSync,
     ctx: &WorkerCtx,
     req: &BlkIoRequest,
 ) -> Option<(u8, u32)> {
@@ -473,7 +475,7 @@ fn flush_request(
     // cannot put the wrong bytes in a sector. It waits for the older
     // writes but does not hold the next session behind itself.
     let _ticket = ctx.backend.admit(&ctx.access, req.tag, false)?;
-    if file.sync_data().is_ok() {
+    if disk.sync().is_ok() {
         Some((bits::VIRTIO_BLK_S_OK, 1))
     } else {
         Some((bits::VIRTIO_BLK_S_IOERR, 1))

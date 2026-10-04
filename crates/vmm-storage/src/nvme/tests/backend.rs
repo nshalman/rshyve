@@ -200,7 +200,14 @@ fn a_backend_may_complete_inside_submit() {
             slot,
         );
     }
-    h.sq_doorbell(1, 2);
+    // Run off this thread: a sink that takes the lock the submitter
+    // holds would deadlock it.
+    let ctrl = Arc::clone(&h.ctrl);
+    let doorbell = std::thread::spawn(move || {
+        let wo = WriteOp::from_buf(&2u32.to_le_bytes());
+        ctrl.bar_rw(BarN::BAR0, REG_DOORBELL_BASE + 8, RWOp::Write(&wo));
+    });
+    join_within(doorbell, WAIT);
 
     for slot in 0..2u16 {
         let cqe = h.wait_cqe(CQ1, slot, true);
@@ -209,4 +216,53 @@ fn a_backend_may_complete_inside_submit() {
     assert_eq!(manual.queued(), 0);
     let expect: Vec<u8> = (512..1024).map(backing_byte).collect();
     assert_eq!(h.read_guest(0x50000, 512), expect);
+}
+
+/// A completion reaped inside `submit` can free the tag another queue
+/// stopped for, and that queue has no doorbell coming.
+#[test]
+fn a_tag_freed_inside_submit_readmits_the_queue_that_waited_for_it() {
+    let manual = Manual::new(1);
+    let mut h = Harness::manual(&manual);
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    h.create_io_queues(2, IO_QDEPTH, SQ2, CQ2);
+
+    let (mut t1, mut t2) = (0, 0);
+    submit_on(&h, 2, SQ2, &mut t2, Sqe::read(0, 1, 0x60000, 0), 0x21);
+    submit_on(&h, 2, SQ2, &mut t2, Sqe::read(1, 1, 0x60000, 0), 0x22);
+    assert_eq!(manual.queued(), 1, "SQ 2 admitted past its depth");
+
+    manual.reap_on_submit.store(true, Ordering::Relaxed);
+    submit_on(&h, 1, SQ1, &mut t1, Sqe::read(0, 1, 0x50000, 0), 0x11);
+    assert_eq!(h.wait_cqe(CQ2, 0, true).cid, 0x21);
+    assert_eq!(
+        manual.submitted_queues(),
+        vec![2, 1, 2],
+        "SQ 2 waited for a doorbell after its tag came back"
+    );
+}
+
+/// A request the pool cannot hand to a worker still completes, or its
+/// tag and the drains that count it wait forever.
+#[test]
+fn io_the_pool_cannot_run_fails_instead_of_staying_in_flight() {
+    let mut h = Harness::new();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    h.ctrl.backend.halt();
+
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::read(0, 1, 0x50000, 0), 0x91);
+    let cqe = h.wait_cqe(CQ1, 0, true);
+    assert_eq!(cqe.cid, 0x91);
+    assert_eq!(cqe.status(), Status::of(SC_INTERNAL_ERROR));
+    assert_eq!(h.ctrl.counts.in_flight.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn a_backend_depth_past_the_migration_bound_is_capped() {
+    let manual = Manual::new(u16::MAX);
+    let h = Harness::manual(&manual);
+    assert_eq!(h.ctrl.depth, MAX_QUEUE_SIZE);
 }

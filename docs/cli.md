@@ -113,7 +113,7 @@ Format: `[bus:]dev[:func],driver[,config...]`
 
 Examples:
 ```
--s 4,nvme,/dev/zvol/dsk/zones/disk0
+-s 4,nvme,/dev/zvol/rdsk/zones/disk0
 -s 5,nvme,mantablock=/var/run/mantablock/<uuid>.sock,volume=<uuid>
 -s 6,virtio-net-viona,net0,promiscphys
 -s 0:5:0,passthru,/dev/ppt0

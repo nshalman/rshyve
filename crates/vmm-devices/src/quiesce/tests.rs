@@ -41,7 +41,6 @@ fn one_drain_scope_does_not_end_another() {
 
 struct FlushTestDevice {
     gate: QuiesceGate,
-    file: File,
     sync_calls: Arc<AtomicUsize>,
     sync_delay: Duration,
     budgets: FlushBudgets,
@@ -55,7 +54,6 @@ impl FlushTestDevice {
     ) -> Self {
         Self {
             gate: QuiesceGate::new(workers),
-            file: tempfile::tempfile().expect("create flush test file"),
             sync_calls: Arc::new(AtomicUsize::new(0)),
             sync_delay,
             budgets,
@@ -73,12 +71,11 @@ impl Lifecycle for FlushTestDevice {
         let sync_delay = self.sync_delay;
         flush_file_with(
             &self.gate,
-            &self.file,
             intent,
             self.type_name(),
             self.budgets,
             || true,
-            move |_file| {
+            move || {
                 sync_calls.fetch_add(1, Ordering::AcqRel);
                 thread::sleep(sync_delay);
                 Ok(())
@@ -312,12 +309,11 @@ fn a_flush_waits_for_work_the_gate_does_not_count() {
     let device = FlushTestDevice::new(0, Duration::ZERO, SHORT_BUDGETS);
     let result = flush_file_with(
         &device.gate,
-        &device.file,
         FlushIntent::Durable,
         "flush-test",
         SHORT_BUDGETS,
         || false,
-        |_file| panic!("synced with work in flight"),
+        || panic!("synced with work in flight"),
     );
     assert!(matches!(result, Err(FlushError::NotQuiesced("flush-test"))));
 }
@@ -504,7 +500,16 @@ fn durable_flush_syncs_a_real_file() {
     file.write_all(b"durable data")
         .expect("write durable flush file");
 
-    let result = flush_file(&gate, &file, FlushIntent::Durable, "real-file");
+    let disk = Arc::new(
+        DiskSync::new(
+            Arc::new(file),
+            false,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .expect("classify"),
+    );
+
+    let result = flush_file(&gate, &disk, FlushIntent::Durable, "real-file");
 
     assert!(result.is_ok());
 }
@@ -514,24 +519,30 @@ fn sync_file_runs_without_a_gate() {
     let mut file = tempfile::tempfile().expect("create sync file");
     file.write_all(b"drained by the device")
         .expect("write sync file");
+    let disk = Arc::new(
+        DiskSync::new(
+            Arc::new(file),
+            false,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .expect("classify"),
+    );
 
-    sync_file(&file, FlushIntent::Durable, "self-drained")
+    sync_file(&disk, FlushIntent::Durable, "self-drained")
         .expect("durable sync");
-    sync_file(&file, FlushIntent::BestEffort, "self-drained")
+    sync_file(&disk, FlushIntent::BestEffort, "self-drained")
         .expect("best-effort sync");
 }
 
 #[test]
 fn sync_file_keeps_the_best_effort_watchdog() {
-    let file = tempfile::tempfile().expect("create sync file");
     let started = Instant::now();
 
     let result = sync_file_with(
-        &file,
         FlushIntent::BestEffort,
         "self-drained",
         SHORT_BUDGETS,
-        |_file| {
+        || {
             thread::sleep(Duration::from_secs(5));
             Ok(())
         },

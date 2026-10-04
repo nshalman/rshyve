@@ -126,10 +126,10 @@ fn no_write_cache_needs_a_backend_whose_writes_are_durable() {
     .expect("a buffering backend with no cache reported");
     assert!(error.to_string().contains("durable"), "{error}");
 
-    let file = Arc::new(backing_file());
+    let disk = backing_disk();
     let log = slog::Logger::root(slog::Discard, slog::o!());
-    let pool = WorkerPool::factory(Arc::clone(&file), file, false, log)
-        .expect("worker pool");
+    let pool =
+        WorkerPool::factory(Arc::clone(&disk), disk, log).expect("worker pool");
     assert!(
         Harness::from_factory(pool, false, FENCE_BUDGETS, NO_CACHE_4K).is_err()
     );
@@ -153,6 +153,8 @@ fn a_restore_onto_another_namespace_shape_is_refused() {
         Some(NvmeMigrateNamespace {
             block_size: 4096,
             volatile_write_cache: false,
+            total_blocks: BACKING_BLOCKS * 512 / 4096,
+            read_only: false,
         })
     );
 
@@ -173,4 +175,55 @@ fn a_restore_onto_another_namespace_shape_is_refused() {
         .ctrl
         .restore_migrate_state(&v2)
         .expect("a v2 payload onto the v2 shape");
+}
+
+fn exported(h: &mut Harness) -> vmm_devices::lifecycle::NvmeMigrateState {
+    h.enable();
+    match h.ctrl.export_migrate_state() {
+        Ok(Some(vmm_devices::DeviceMigrateState::Nvme(state))) => state,
+        other => panic!("no NVMe state: {other:?}"),
+    }
+}
+
+/// A guest whose disk shrank reads past its end; one that grew has a
+/// partition table that no longer reaches the last block.
+#[test]
+fn a_restore_onto_another_capacity_is_refused() {
+    let mut state = exported(&mut Harness::new());
+    let ns = state.namespace.as_mut().expect("v3 carries the namespace");
+    assert_eq!(ns.total_blocks, BACKING_BLOCKS);
+    ns.total_blocks += 1;
+
+    let error = Harness::new()
+        .ctrl
+        .restore_migrate_state(&vmm_devices::DeviceMigrateState::Nvme(state))
+        .expect_err("one block more on the source");
+    assert!(error.to_string().contains("total_blocks"), "{error}");
+}
+
+/// A guest that mounted a read-only disk would see its writes fail,
+/// and one that mounted it writable could write a disk shared as
+/// read-only.
+#[test]
+fn a_restore_onto_another_write_protection_is_refused() {
+    let state = exported(&mut Harness::read_only());
+    assert!(state.namespace.expect("namespace").read_only);
+    let state = vmm_devices::DeviceMigrateState::Nvme(state);
+
+    let error = Harness::new()
+        .ctrl
+        .restore_migrate_state(&state)
+        .expect_err("read-only source, writable destination");
+    assert!(error.to_string().contains("read_only"), "{error}");
+    Harness::read_only()
+        .ctrl
+        .restore_migrate_state(&state)
+        .expect("the same protection");
+
+    let state = exported(&mut Harness::new());
+    let state = vmm_devices::DeviceMigrateState::Nvme(state);
+    Harness::read_only()
+        .ctrl
+        .restore_migrate_state(&state)
+        .expect_err("writable source, read-only destination");
 }
