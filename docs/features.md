@@ -205,10 +205,11 @@ SCSI/MMC commands implemented: TEST UNIT READY, REQUEST SENSE, INQUIRY, START/ST
 
 A writable virtio-blk or NVMe backing fd is handled by type (`crates/vmm-devices/src/blkdev.rs`). Skipped entirely under `ro`. `ahci-cd` does not use it.
 
-- **Regular file or block device** (`/dev/zvol/dsk/...`): guest flushes call fsync. Specfs refuses every ioctl on a block node with ENOTTY, and block writes go through the specfs page cache that only fsync writes out. fsync does not return the device flush error, so use the raw node (`/dev/zvol/rdsk/...`), as Triton does.
-- **Character device** (`/dev/zvol/rdsk/...`): probed once at open with `DKIOCFLUSHWRITECACHE`.
-  - The probe works: if the write cache is off, it is turned on (`DKIOCSETWCE=1`, best effort) and the flush is probed again, because sd answers a flush with success and sends nothing while the cache is off. Every guest flush then sends the ioctl and every error goes back to the guest.
-  - A probe answers ENOTSUP or ENOTTY: the disk cannot flush. The write cache is turned off if it is on and read back. Guest flushes are then no-ops. The disk is refused if the cache cannot be confirmed off, unless `DKIOCGETWCE` itself answers ENOTSUP or ENOTTY (no cache control).
+- **Regular file**: guest flushes call fsync.
+- **Block device** (`/dev/zvol/dsk/...`, `/dev/dsk/...`, `/dev/lofi/...`): refused when writable, with an error that names the raw node to use. Specfs answers ENOTTY to every disk ioctl on a block node, and writes wait in its page cache (full MAXBSIZE blocks also start async writeback). fsync drains that cache and tries the device flush but hides both errors, and after one ENOTSUP or ENOTTY it never flushes the node again. A read-only block node is allowed.
+- **Character device** (`/dev/zvol/rdsk/...`): probed at open with `DKIOCFLUSHWRITECACHE`, and probed again with the write cache on.
+  - The first probe works: if `DKIOCGETWCE` reads off, the cache is turned on (`DKIOCSETWCE=1`, best effort) and this open owns it. If it reads on, `DKIOCSETWCE=1` is sent anyway, because sd keeps its own copy of the cache state and answers a flush with success and sends nothing while that copy says off. Then the flush is probed again. Every later guest flush sends the ioctl and every error goes back to the guest.
+  - A probe answers ENOTSUP or ENOTTY: the disk cannot flush. Guest flushes are then no-ops, so the cache must be off. On the first probe, a cache read back off is left alone, and a cache read back on is turned off and read back. If `DKIOCGETWCE` answers ENOTSUP or ENOTTY on that first read, the disk has no cache control and is accepted. On the second probe the cache is always turned off and read back. A read-back that is not "off", including ENOTSUP or ENOTTY after `DKIOCGETWCE` already worked in this open, refuses the disk.
   - Any other errno, on either probe, refuses the disk.
   - On drop, a write cache this open turned on is turned off. A cache turned off because the disk cannot flush stays off. The cache is device-global, so it only ever moves toward off for other opens of the same device.
 
