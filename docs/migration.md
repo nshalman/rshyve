@@ -12,16 +12,24 @@ One driver serves both transports: a Unix socket inside a bhyve zone,
 where `/dev/poll` is unavailable and the GZ agent bridges to the peer,
 and a TCP socket elsewhere.
 
-The protocol identifier is `vmm-migrate-ron/3`, and a source offers
-only that. A destination also takes `vmm-migrate-ron/2`, whose payload
-is a strict subset: v3 adds the NVMe completions held for a full guest
-completion queue, which a v2 source dropped, and the NVMe namespace
-shape, of which a v2 source had one (512-byte blocks, volatile write
-cache). A v2 payload restores with none held, onto that shape only. Anything older is refused, because a peer that reads a field
+The protocol identifier is `vmm-migrate-ron/4`. A source offers v4 and
+v3, and a destination also takes `vmm-migrate-ron/3` and
+`vmm-migrate-ron/2`, whose payloads are strict subsets. A v3 destination
+skips the v4 store field and assumes a host file, so a source that lands
+on v3 refuses any disk on another store before it sends the device
+state. A file-backed VM can therefore still move to a host that predates
+v4. v4 names the store under each NVMe namespace (a host file, or a
+MantaBlock volume by UUID), so a destination on another store refuses
+the payload, and an unknown store does not decode; a v3 or v2 payload
+names none, which means a host file. v3 adds the NVMe completions held
+for a full guest completion queue, which a v2 source dropped, and the
+NVMe namespace shape, of which a v2 source had one (512-byte blocks,
+volatile write cache). A v2 payload restores with none held, onto that
+shape only. Anything older is refused, because a peer that reads a field
 as something else resumes a guest on state that is not its own. v1 put
 device identity on the wire; in v0 every virtio queue group was tagged
-slot 0 and the destination took the first group whose length matched
-its own queue count.
+slot 0 and the destination took the first group whose length matched its
+own queue count.
 
 ```
 Source                          Destination
@@ -55,8 +63,7 @@ Source                          Destination
   |                                 |
   |  6. DeviceState (kernel + emulated devices)
   |-------- DeviceState ----------->|
-  |                                 |  identity check, import,
-  |                                 |  device workers start, resume
+  |                                 |  identity check, import
   |  7. Finish                      |
   |<------- Okay -------------------|  "I hold everything"
   |-------- Okay ------------------>|  the source's commit
@@ -74,7 +81,56 @@ copy of the guest against the same disk whenever the source rolled back.
 A source that has committed and then loses the peer stays paused and is
 never released: it cannot take the guest back, because the destination
 may be running it. The control socket reports the VM still migrating and
-an operator decides.
+an operator decides; `stop` reaps it.
+
+A stop (SIGTERM or `stop`) during a migration latches the suspend at
+once. Before the commit it also cancels the migration. The migration
+thread checks for the cancel before every forward send, and every 50 ms
+while it waits for a connect, a name lookup, an accept or the durable
+flush. The stop shuts every socket the migration opened, the ZFS
+barrier's too, so a send or a read blocked on a quiet peer fails. This
+end tells the peer and gives up, and the source rolls back. Two waits
+are not cut short: the device quiesce, at most 30 seconds, and the vCPU
+and kernel ring pause ioctls. A stop that finds the vCPU pause running
+waits up to 10 seconds for it, then answers busy.
+
+Connects are non-blocking, so a stop closes a connect still in progress
+on the migration thread itself. Only a name lookup runs on a thread of
+its own, and one the stop left behind holds no socket and ends when the
+resolver answers. A durable flush the stop left behind finishes the
+device it is on and then stops. Teardown waits for it before it touches
+a device, under the same clock as the rest of teardown. If that clock
+runs out, the process ends the way the SIGTERM watchdog ends it, and
+teardown never runs beside the flush.
+
+After a side's commit, a stop lets the handover finish, and shuts the
+sockets only after 30 seconds, because a send has no deadline on
+illumos. A stop on the destination after it told the source it was
+ready still ends the destination, and the guest does not start there.
+If the source committed, it stays paused, and the guest runs on
+neither host until an operator acts on the source. The source has no
+way yet to take the guest back; see
+[issue #29](https://github.com/TritonDataCenter/rust-bhyve/issues/29).
+
+On either side the pause is given back, and teardown starts, only when
+the migration thread ends, so teardown never runs under it. A release
+that fails then is retried at once, then four times 2 seconds apart,
+then every 30 seconds. Once the fast tries are spent, `status` reports
+it and the VM stays `stopping`:
+
+```json
+{"success":true,"state":"stopping",...,"release_stuck":true}
+```
+
+The field goes as soon as the pause is given back. If releases keep
+failing for 5 minutes, the VMM logs why and ends itself the way the
+SIGTERM watchdog does, so the zone's restart policy and the instance's
+autodestruct clean up.
+
+If a migration's rollback or final resume cannot release the vCPUs and
+the device workers will not park again, the VM goes to `faulted`. So
+does an operator `resume` that fails the same way. A faulted VM takes
+only `stop`, so `paused` always means parked devices.
 
 The final dirty pass runs after every device worker has parked, so it
 is the last word on guest memory by construction. Before that change it
@@ -161,7 +217,8 @@ returned the vector registers instead.
 
 Per NVMe controller: CC, CSTS, AQA, the admin queue bases, every admin
 and I/O queue pair with its size, cursors, phase and vector, the PCI
-command and BAR bases, and the MSI-X table.
+command and BAR bases, the MSI-X table, the namespace shape, and the
+store under the namespace.
 
 For a VM started with `--hyperv`: `HV_X64_MSR_GUEST_OS_ID`,
 `HV_X64_MSR_HYPERCALL`, `HV_X64_MSR_REFERENCE_TSC`, the five crash MSRs,
@@ -233,6 +290,13 @@ A VM that hot-added a CPU, memory, or a device since boot is also
 refused: the destination is built from the boot command line and would
 have none of them.
 
+An NVMe disk on a MantaBlock volume is refused on both sides, by
+`migrate-source`, by `migrate-dest`, and by `--migrate-listen` at
+startup, whether the disk was there at boot or hot-added. The source
+holds the volume's attachment and nothing hands it over yet, so a
+destination that attached too would make two owners of one volume. The
+controller refuses its own export and restore as well.
+
 ## Usage
 
 ### Source Side
@@ -284,6 +348,13 @@ closed socket all as a failed migration and resumes its guest. A guest
 that resumed on the destination over an older disk had already
 acknowledged writes that disk never received.
 
+A stop can close the barrier socket at any point: before the connect
+completes, after it completes and before the agent answers, or while
+the agent is still writing its byte. The agent is not part of this
+repository, so this is a requirement on it: a connection that closes
+before the agent sends its byte is an abort. The agent must not take it
+as a go-ahead, and must not start or finish a switchover because of it.
+
 ## Waking the guest
 
 The restore raises an interrupt on each live queue before the vCPUs
@@ -311,8 +382,31 @@ answers EBUSY for one, so a guest kick cannot revive it. Only the reset
 plus state write the rollback does can, which is why `resume` alone left
 the source guest with a dead NIC.
 
-A `migrate-dest` that fails puts the VM back in the state it was in.
-Marking it `Stopped` stranded a live guest that no control command could
-reach.
+A `migrate-dest` that fails does not go back to `paused`: the import
+may have written part of the guest, and the source may roll back and
+run it. The VM goes to one of three states:
+
+| State | When | Takes |
+|-------|------|-------|
+| `import-failed` | it failed before it told the source it was ready | `migrate-dest` again, or `stop` |
+| `import-in-doubt` | it told the source it was ready and never heard the commit | `resume` with `"force":true`, or `stop` |
+| `import-committed` | the source's commit arrived and the last step failed | `resume`, or `stop` |
+
+In doubt, the source may have committed, and this VM may hold the only
+copy of the guest. Look at the source first. If it rolled back and runs
+the guest, stop this VM. If the source does not run the guest, make sure
+it is stopped, then resume with force:
+`{"command":"resume","force":true}`. A `stop` here discards what may be
+the only copy.
+
+`import-committed` holds the only copy of the guest: the source has
+committed and stays paused. It refuses another `migrate-dest`, which
+would overwrite that copy. A plain `resume` is safe. A failure after the
+commit whose devices would not park again ends `faulted`.
+
+These states, and the stop and cancel handling above, apply only to a
+`migrate-dest` sent on the control socket. An import started at boot
+with `--migrate-listen` has no control plane yet: a stop does not
+cancel it, and a failed import fails the start.
 
 The destination VM should be destroyed by the caller.

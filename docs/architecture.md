@@ -33,6 +33,7 @@ crates/vmm-config/          CLI parsing, bhyve flag-compatible
 crates/vmm-metrics/         Counters the binaries publish
 
 crates/vmm-storage/         AHCI and NVMe                        rshyve only
+crates/vmm-mantablock/      NVMe backend on the MantaBlock ring  rshyve only
 crates/vmm-hid/             xHCI, PS/2, framebuffer and VNC      rshyve only
 crates/vmm-passthru/        PCI passthrough                      rshyve only
 crates/vmm-migrate/         Migration protocol and state         rshyve only

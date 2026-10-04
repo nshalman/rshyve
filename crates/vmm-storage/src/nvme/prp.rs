@@ -134,6 +134,100 @@ pub(super) fn prp_to_iovec(
     Ok(iov)
 }
 
+/// The guest runs a transfer's PRPs name, read once, so a backend that
+/// moves the transfer in pieces does not walk the PRP list per piece.
+#[derive(Debug, Clone, Default)]
+pub struct Segments {
+    /// `(start in the transfer, gpa, len)`.
+    runs: Vec<(usize, u64, usize)>,
+    len: usize,
+}
+
+impl Segments {
+    /// Bytes the runs cover.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Calls `f` with each mapped run of `len` bytes from `at`, and where
+    /// the run falls in those `len` bytes.
+    fn for_range(
+        &self,
+        mem: &MemCtx,
+        at: usize,
+        len: usize,
+        mut f: impl FnMut(&SubMapping, std::ops::Range<usize>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let end = at
+            .checked_add(len)
+            .filter(|&end| end <= self.len)
+            .ok_or_else(|| invalid("range is past the transfer"))?;
+        let mut i = self
+            .runs
+            .partition_point(|&(start, _, _)| start <= at)
+            .saturating_sub(1);
+        let mut pos = at;
+        while pos < end {
+            let &(start, gpa, seg) =
+                self.runs.get(i).ok_or_else(|| invalid("short PRP walk"))?;
+            let off = pos - start;
+            let n = (seg - off).min(end - pos);
+            let gpa = gpa
+                .checked_add(off as u64)
+                .ok_or_else(|| invalid("PRP address wraps"))?;
+            let sub = mem
+                .lookup(gpa, n)
+                .ok_or_else(|| invalid("PRP names unmapped memory"))?;
+            f(&sub, pos - at..pos - at + n)?;
+            pos += n;
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// The plain copy of [`copy_from_prp`], of part of the transfer.
+    pub(super) fn copy_out_at(
+        &self,
+        mem: &MemCtx,
+        at: usize,
+        dst: &mut [u8],
+    ) -> io::Result<()> {
+        self.for_range(mem, at, dst.len(), |sub, range| {
+            sub.copy_out(&mut dst[range])
+        })
+    }
+
+    pub(super) fn copy_in_at(
+        &self,
+        mem: &MemCtx,
+        at: usize,
+        src: &[u8],
+    ) -> io::Result<()> {
+        self.for_range(mem, at, src.len(), |sub, range| {
+            sub.copy_in(&src[range])
+        })
+    }
+}
+
+pub(super) fn prp_segments(
+    mem: &MemCtx,
+    prp1: u64,
+    prp2: u64,
+    len: usize,
+) -> io::Result<Segments> {
+    let mut segs = Segments::default();
+    let mut walk = PrpWalk::new(mem, prp1, prp2, len);
+    while let Some((gpa, seg)) = walk.next_segment()? {
+        segs.runs.push((segs.len, gpa, seg));
+        segs.len += seg;
+    }
+    Ok(segs)
+}
+
 /// Write `data` to the pages the PRPs name.
 pub(super) fn write_to_prp(
     mem: &MemCtx,
@@ -209,4 +303,61 @@ pub(super) fn copy_to_prp(
             .ok_or_else(|| invalid("PRP walk overran the transfer"))?;
         sub.copy_in(part)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use vmm_core::mem::PhysMap;
+
+    use super::*;
+
+    #[test]
+    fn segments_copy_any_range_of_a_prp_list_transfer() {
+        let mem = MemCtx::new(Arc::new(PhysMap::new_anon(0, 0x10000).unwrap()));
+        // PRP1 four bytes short of a page end, then a list of three
+        // pages out of order, the last one partly used.
+        let list = [0x2000u64, 0x5000, 0x3000];
+        let bytes: Vec<u8> =
+            list.iter().flat_map(|e| e.to_le_bytes()).collect();
+        mem.write(0x8000, &bytes).unwrap();
+        let len = 4 + 2 * PAGE_SIZE + 1000;
+        let segs = prp_segments(&mem, 0x0ffc, 0x8000, len).unwrap();
+        assert_eq!(
+            segs.runs,
+            vec![
+                (0, 0x0ffc, 4),
+                (4, 0x2000, PAGE_SIZE),
+                (4 + PAGE_SIZE, 0x5000, PAGE_SIZE),
+                (4 + 2 * PAGE_SIZE, 0x3000, 1000),
+            ]
+        );
+        assert_eq!(segs.len(), len);
+
+        let mut model = vec![0u8; len];
+        for (n, (at, piece)) in [
+            (0, len),
+            (2, 7),
+            (3, PAGE_SIZE + 2),
+            (4 + PAGE_SIZE - 1, 1002),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let src: Vec<u8> = (0..piece).map(|i| (i * 7 + n) as u8).collect();
+            segs.copy_in_at(&mem, at, &src).unwrap();
+            model[at..at + piece].copy_from_slice(&src);
+        }
+        let mut whole = vec![0u8; len];
+        copy_from_prp(&mem, 0x0ffc, 0x8000, len, &mut whole).unwrap();
+        assert_eq!(whole, model);
+        let mut piece = vec![0u8; PAGE_SIZE + 10];
+        segs.copy_out_at(&mem, 1, &mut piece).unwrap();
+        assert_eq!(piece, model[1..PAGE_SIZE + 11]);
+
+        assert!(segs.copy_out_at(&mem, len - 1, &mut [0; 2]).is_err());
+        assert!(segs.copy_in_at(&mem, usize::MAX, &[0]).is_err());
+        assert!(segs.copy_in_at(&mem, len, &[]).is_ok());
+    }
 }

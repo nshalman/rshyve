@@ -13,6 +13,7 @@ vmm_core.workspace = true
 vmm_devices.workspace = true
 bhyve_api.workspace = true
 ron.workspace = true
+rustix = { version = "1", features = ["event", "fs", "net"] }
 serde.workspace = true
 slog.workspace = true
 thiserror.workspace = true

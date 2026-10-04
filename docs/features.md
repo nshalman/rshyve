@@ -179,7 +179,10 @@ The guest-visible serial from `VIRTIO_BLK_T_GET_ID` is the constant string `vmm-
 
 ```
 -s <slot>,nvme,<path>[,ro]
+-s <slot>,nvme,mantablock=<socket>,volume=<uuid>[,allow-volatile][,spin-us=<n>]
 ```
+
+The second form puts the namespace on a MantaBlock volume, with 4 KiB blocks and no write cache when the engine's writes are durable. It is parsed strictly; see [cli.md](cli.md#nvme-on-a-mantablock-volume). The rest of this section is about the first form.
 
 The arm calls the shared `parse_blk_config`, so `nodelete`, `sectorsize=` and `num-queues=` all **parse and are then discarded**. Only `read_only` reaches `NvmeController::new` (`bin/rshyve/src/main.rs:1077`). The arm builds the default `NvmeConfig`, 512-byte LBA and a volatile write cache. `NvmeConfig` can choose 4 KiB and no cache for a backend whose writes are durable, but no option reaches it from the command line, so `sectorsize=4096` silently yields a 512-byte-LBA namespace.
 

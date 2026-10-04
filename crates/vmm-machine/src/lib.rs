@@ -23,6 +23,7 @@ pub mod firmware;
 pub mod hotplug;
 pub mod inventory;
 pub mod opts;
+pub mod outside;
 pub mod parse;
 pub mod pause;
 pub mod pci;
@@ -31,6 +32,7 @@ pub mod provision;
 pub mod registry;
 pub mod signal;
 pub mod teardown;
+pub mod topology;
 pub mod vcpu;
 pub mod vcpu_tasks;
 pub mod vcpus;
@@ -54,6 +56,9 @@ pub use hotplug::{
     HotplugError, HotplugFactory,
 };
 pub use opts::VmOpts;
+pub use outside::{
+    flush_durable, Drain, OutsideFlushError, OutsideGuard, OutsideWork,
+};
 pub use parse::{find_lpc_device, parse_bdf};
 pub use pause::{VmPause, VmPauseGate};
 pub use pci::{
@@ -68,11 +73,13 @@ pub use registry::{
     DeviceRegistry, RegisteredDevice, RegistryError, SlotState,
 };
 pub use signal::{
-    install_sigterm_handler, sigterm_flag, sigterm_received, SUSPEND_SOURCE_VMM,
+    exit_wedged, install_sigterm_handler, sigterm_flag, sigterm_received,
+    terminate_wedged, SUSPEND_SOURCE_VMM,
 };
 pub use teardown::{
     registry_named_devices, run_fleet_event_loop, RunOutcome, VcpuThreads,
 };
+pub use topology::TopologyLock;
 pub use vcpu::{
     activate_one, activate_uefi_bsp_only, activate_vcpus,
     check_aps_awaiting_sipi, set_halt_exit, spawn_vcpu_fleet,

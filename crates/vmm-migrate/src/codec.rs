@@ -734,15 +734,127 @@ mod tests {
 
     #[test]
     fn a_v2_nvme_payload_decodes_with_nothing_held() {
-        let v3 = nvme_cq(Vec::new());
-        let text = ron::ser::to_string(&v3).expect("encode");
+        let v4 = nvme_cq(Vec::new());
+        let text = ron::ser::to_string(&v4).expect("encode");
         assert!(text.contains(",held:[]"), "{text}");
         assert!(text.contains(",namespace:None"), "{text}");
-        let v2 = text.replace(",held:[]", "").replace(",namespace:None", "");
+        assert!(text.contains(",backend:None"), "{text}");
+        let v2 = text
+            .replace(",held:[]", "")
+            .replace(",namespace:None", "")
+            .replace(",backend:None", "");
 
         let decoded: DeviceStatePayload =
             Message::deserialize(v2.as_bytes()).expect("decode v2");
-        assert_eq!(decoded, v3);
+        assert_eq!(decoded, v4);
+    }
+
+    fn with_backend(
+        backend: vmm_devices::lifecycle::NvmeMigrateBackend,
+    ) -> DeviceStatePayload {
+        let mut payload = nvme_cq(Vec::new());
+        if let Some(DeviceMigrateState::Nvme(state)) = payload.state.as_mut() {
+            state.backend = Some(backend);
+        }
+        payload
+    }
+
+    #[test]
+    fn an_nvme_store_survives_the_wire() {
+        use vmm_devices::lifecycle::NvmeMigrateBackend;
+        for backend in [
+            NvmeMigrateBackend::File,
+            NvmeMigrateBackend::MantaBlock {
+                volume: "6f1c2a8e-0000-4000-8000-000000000001"
+                    .parse()
+                    .expect("a UUID"),
+            },
+        ] {
+            let payload = with_backend(backend);
+            let msg = Message::serialized(&payload).expect("encode");
+            let Message::Serialized(data) = roundtrip(&msg) else {
+                panic!("expected Serialized");
+            };
+            let decoded: DeviceStatePayload =
+                Message::deserialize(&data).expect("decode");
+            assert_eq!(decoded, payload);
+        }
+    }
+
+    fn on_volume(volume: &str) -> String {
+        let text = ron::ser::to_string(&with_backend(
+            vmm_devices::lifecycle::NvmeMigrateBackend::File,
+        ))
+        .expect("encode");
+        let named = text.replace(
+            "backend:Some(File)",
+            &format!("backend:Some(MantaBlock(volume:{volume:?}))"),
+        );
+        assert_ne!(named, text);
+        named
+    }
+
+    #[test]
+    fn a_volume_that_is_not_a_uuid_is_refused() {
+        // The name reaches the destination's log in a refusal, so only
+        // a UUID may get that far.
+        for volume in ["", "vol-1", "6f1c2a8e\n\u{1b}[2J"] {
+            Message::deserialize::<DeviceStatePayload>(
+                on_volume(volume).as_bytes(),
+            )
+            .expect_err(volume);
+        }
+    }
+
+    #[test]
+    fn a_volume_is_the_same_in_either_case() {
+        let lower: DeviceStatePayload = Message::deserialize(
+            on_volume("6f1c2a8e-0000-4000-8000-00000000abcd").as_bytes(),
+        )
+        .expect("lower case");
+        let upper: DeviceStatePayload = Message::deserialize(
+            on_volume("6F1C2A8E-0000-4000-8000-00000000ABCD").as_bytes(),
+        )
+        .expect("upper case");
+        assert_eq!(lower, upper);
+    }
+
+    #[test]
+    fn a_v3_decoder_skips_the_store() {
+        // A source offers v3 on the strength of this: a v3 build's
+        // decoder has no `backend` field and must not fail on one.
+        #[derive(Serialize)]
+        struct V4 {
+            num_io_queues: u16,
+            backend: Option<vmm_devices::lifecycle::NvmeMigrateBackend>,
+        }
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct V3 {
+            num_io_queues: u16,
+        }
+        let v4 = V4 {
+            num_io_queues: 3,
+            backend: Some(vmm_devices::lifecycle::NvmeMigrateBackend::File),
+        };
+        let msg = Message::serialized(&v4).expect("encode");
+        let Message::Serialized(data) = roundtrip(&msg) else {
+            panic!("expected Serialized");
+        };
+        let v3: V3 = Message::deserialize(&data).expect("decode as v3");
+        assert_eq!(v3, V3 { num_io_queues: 3 });
+    }
+
+    #[test]
+    fn an_unknown_nvme_store_is_refused() {
+        let text = ron::ser::to_string(&with_backend(
+            vmm_devices::lifecycle::NvmeMigrateBackend::File,
+        ))
+        .expect("encode");
+        let unknown = text.replace("backend:Some(File)", "backend:Some(Nfs)");
+        assert_ne!(unknown, text);
+
+        Message::deserialize::<DeviceStatePayload>(unknown.as_bytes())
+            .expect_err("a store this build does not know");
     }
 
     #[test]

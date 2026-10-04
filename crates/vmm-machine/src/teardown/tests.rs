@@ -25,11 +25,13 @@ use vmm_devices::Lifecycle as _;
 use super::{
     destroy_bounded_with, device_work, halt_bounded_with, halt_budget_for,
     halt_devices, join_vcpus_bounded, quiesce_devices, shutdown_after_exit,
-    spawn_halt, teardown_budget, teardown_budget_for, HaltWork, RunOutcome,
-    VcpuSet, VcpuThreads, DESTROY_BUDGET, FLUSH_BUDGET_PER_DEVICE,
-    HALT_OVERRUN_SLACK, HALT_SPAWN_ATTEMPTS, QUIESCE_BUDGET, ROSTER_POLL,
-    TEARDOWN_BUDGET_MAX, TEARDOWN_BUDGET_MIN, VCPU_JOIN_BUDGET,
+    spawn_halt, teardown_budget, teardown_budget_for, wait_outside, HaltWork,
+    RunOutcome, VcpuSet, VcpuThreads, Watchdog, DESTROY_BUDGET,
+    FLUSH_BUDGET_PER_DEVICE, HALT_OVERRUN_SLACK, HALT_SPAWN_ATTEMPTS,
+    QUIESCE_BUDGET, ROSTER_POLL, TEARDOWN_BUDGET_MAX, TEARDOWN_BUDGET_MIN,
+    VCPU_JOIN_BUDGET,
 };
+use crate::outside::OutsideWork;
 use crate::vcpu_tasks::VcpuEvent;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -164,14 +166,18 @@ fn run_teardown(devices: &[NamedDevice], steps: &Steps) -> Option<Duration> {
     shutdown_after_exit(
         VcpuSet::Fixed(Vec::new()),
         devices,
+        &OutsideWork::default(),
         None,
         move || {
             push(&destroy_steps, "destroy");
             Ok(())
         },
-        |budget| {
-            push(&arm_steps, "arm");
-            *armed.lock().expect("armed lock") = Some(budget);
+        Watchdog {
+            arm: |budget| {
+                push(&arm_steps, "arm");
+                *armed.lock().expect("armed lock") = Some(budget);
+            },
+            give_up: || panic!("nothing ran outside teardown"),
         },
         &null_log(),
     );
@@ -949,3 +955,5 @@ fn a_halt_the_budget_ran_out_on_is_reported_as_not_returned() {
     );
     assert_eq!(steps_of(&steps), vec!["blocked-halt"]);
 }
+
+mod outside;

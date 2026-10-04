@@ -246,6 +246,109 @@ pub fn parse_ahci_cd_path(config: &str) -> anyhow::Result<&str> {
     Ok(path)
 }
 
+/// What an `nvme` spec names.
+#[derive(Debug, Clone)]
+pub enum NvmeSpec<'a> {
+    /// A disk file or zvol, in the virtio-blk grammar.
+    File(&'a str, VirtioBlockOpts),
+    /// A MantaBlock volume, reached through the engine on this CN.
+    MantaBlock(MantaBlockOpts),
+}
+
+/// An NVMe namespace on a MantaBlock volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MantaBlockOpts {
+    /// The engine's Unix socket for the volume.
+    pub socket: PathBuf,
+    pub volume: uuid::Uuid,
+    /// Take an engine whose writes are not durable when they complete.
+    pub allow_volatile: bool,
+    /// How long a completion thread polls before it sleeps, in µs.
+    pub spin_us: Option<u32>,
+}
+
+/// More would keep a CPU busy for little gain.
+const MAX_SPIN_US: u32 = 10_000;
+
+const MANTABLOCK_KEYS: [&str; 4] =
+    ["mantablock=", "volume=", "allow-volatile", "spin-us="];
+
+/// Parse an nvme config: `path[,blk options]`, or
+/// `mantablock=<socket>,volume=<uuid>[,allow-volatile][,spin-us=<n>]`.
+///
+/// The MantaBlock form is new, so an unknown option there is an error.
+pub fn parse_nvme_config(config: &str) -> anyhow::Result<NvmeSpec<'_>> {
+    anyhow::ensure!(!config.is_empty(), "nvme requires a disk path");
+    if config.starts_with("mantablock=") {
+        return parse_mantablock_config(config).map(NvmeSpec::MantaBlock);
+    }
+    // The file grammar ignores unknown options. Without this check a
+    // misplaced ring option would boot the guest on the file instead.
+    if let Some(opt) = config
+        .split(',')
+        .skip(1)
+        .find(|o| MANTABLOCK_KEYS.iter().any(|k| o.starts_with(k)))
+    {
+        anyhow::bail!("nvme: '{opt}' needs mantablock=<socket> first");
+    }
+    let (path, opts) = parse_blk_config(config);
+    Ok(NvmeSpec::File(path, opts))
+}
+
+fn parse_mantablock_config(config: &str) -> anyhow::Result<MantaBlockOpts> {
+    let mut socket: Option<PathBuf> = None;
+    let mut volume: Option<uuid::Uuid> = None;
+    let mut allow_volatile = false;
+    let mut spin_us: Option<u32> = None;
+    for opt in config.split(',') {
+        if opt.is_empty() {
+            anyhow::bail!("nvme: an empty mantablock option in '{config}'");
+        } else if let Some(v) = opt.strip_prefix("mantablock=") {
+            anyhow::ensure!(socket.is_none(), "nvme: mantablock= given twice");
+            let path = PathBuf::from(v);
+            // A relative path would resolve against the cwd of rshyve,
+            // which the zone sets, not the operator.
+            anyhow::ensure!(
+                path.is_absolute(),
+                "nvme: mantablock= needs an absolute socket path, got '{v}'"
+            );
+            socket = Some(path);
+        } else if let Some(v) = opt.strip_prefix("volume=") {
+            anyhow::ensure!(volume.is_none(), "nvme: volume= given twice");
+            let id = uuid::Uuid::parse_str(v)
+                .map_err(|_| anyhow::anyhow!("nvme: bad volume '{v}'"))?;
+            anyhow::ensure!(!id.is_nil(), "nvme: the nil volume is not one");
+            volume = Some(id);
+        } else if opt == "allow-volatile" {
+            allow_volatile = true;
+        } else if let Some(v) = opt.strip_prefix("spin-us=") {
+            anyhow::ensure!(spin_us.is_none(), "nvme: spin-us= given twice");
+            let n = v
+                .parse::<u32>()
+                .ok()
+                .filter(|&n| n <= MAX_SPIN_US)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "nvme: spin-us= takes 0 to {MAX_SPIN_US}, got '{v}'"
+                    )
+                })?;
+            spin_us = Some(n);
+        } else {
+            anyhow::bail!("nvme: unknown mantablock option '{opt}'");
+        }
+    }
+    Ok(MantaBlockOpts {
+        socket: socket.ok_or_else(|| {
+            anyhow::anyhow!("nvme requires mantablock=<socket>")
+        })?,
+        volume: volume.ok_or_else(|| {
+            anyhow::anyhow!("nvme: mantablock= requires volume=<uuid>")
+        })?,
+        allow_volatile,
+        spin_us,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use vmm_virtio::fs::FS_QUEUE_SIZE_DEFAULT;
@@ -425,5 +528,85 @@ mod tests {
         let error = parse_ahci_cd_path("/x.iso,rw").unwrap_err();
         assert_eq!(error.to_string(), "ahci-cd takes no options, got 'rw'");
         assert_eq!(parse_ahci_cd_path("/x.iso").expect("path"), "/x.iso");
+    }
+
+    const VOL: &str = "6c1e3b8e-2f43-4d0c-9a51-3f0f5b0d8a11";
+
+    #[test]
+    fn nvme_with_a_path_is_the_file_disk_it_always_was() {
+        let spec =
+            parse_nvme_config("/dev/zvol/rdsk/tank/d0,ro,bogus").expect("file");
+        let NvmeSpec::File(path, opts) = spec else {
+            panic!("not the file form: {spec:?}");
+        };
+        assert_eq!(path, "/dev/zvol/rdsk/tank/d0");
+        assert!(opts.read_only);
+        let error = parse_nvme_config("").unwrap_err();
+        assert_eq!(error.to_string(), "nvme requires a disk path");
+    }
+
+    #[test]
+    fn a_ring_option_after_a_path_is_refused() {
+        for opt in ["mantablock=/s", "volume=x", "allow-volatile"] {
+            let error = parse_nvme_config(&format!("/disk,{opt}")).unwrap_err();
+            assert!(error.to_string().contains(opt), "{error}");
+        }
+    }
+
+    #[test]
+    fn nvme_on_a_mantablock_volume() {
+        let config = format!("mantablock=/var/run/mb/{VOL}.sock,volume={VOL}");
+        let spec = parse_nvme_config(&config).expect("ring");
+        let NvmeSpec::MantaBlock(opts) = spec else {
+            panic!("not the ring form: {spec:?}");
+        };
+        assert_eq!(
+            opts.socket,
+            PathBuf::from(format!("/var/run/mb/{VOL}.sock"))
+        );
+        assert_eq!(opts.volume.to_string(), VOL);
+        assert!(!opts.allow_volatile);
+        assert_eq!(opts.spin_us, None);
+
+        let config =
+            format!("mantablock=/s,volume={VOL},allow-volatile,spin-us=0");
+        let spec = parse_nvme_config(&config).expect("ring");
+        assert!(matches!(
+            spec,
+            NvmeSpec::MantaBlock(MantaBlockOpts {
+                allow_volatile: true,
+                spin_us: Some(0),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_mantablock_spec_is_strict() {
+        let bad = [
+            ("mantablock=/s".to_string(), "requires volume="),
+            ("mantablock=s,volume=x".to_string(), "absolute"),
+            (format!("mantablock=/s,volume={VOL},ro"), "unknown"),
+            ("mantablock=/s,volume=nope".to_string(), "bad volume"),
+            (
+                "mantablock=/s,volume=00000000-0000-0000-0000-000000000000"
+                    .to_string(),
+                "nil",
+            ),
+            (format!("mantablock=/s,volume={VOL},volume={VOL}"), "twice"),
+            (format!("mantablock=/s,mantablock=/t,volume={VOL}"), "twice"),
+            (format!("mantablock=/s,volume={VOL},spin-us=10001"), "0 to"),
+            (format!("mantablock=/s,volume={VOL},spin-us=-1"), "0 to"),
+            (
+                format!("mantablock=/s,volume={VOL},spin-us=5,spin-us=5"),
+                "twice",
+            ),
+            (format!("mantablock=/s,,volume={VOL}"), "empty"),
+            (format!("mantablock=/s,volume={VOL},"), "empty"),
+        ];
+        for (config, why) in bad {
+            let error = parse_nvme_config(&config).unwrap_err().to_string();
+            assert!(error.contains(why), "{config}: {error}");
+        }
     }
 }

@@ -72,6 +72,13 @@ for lifecycle management and state export/import during migration.
 - `NvmeConfig` picks 512-byte or 4 KiB logical blocks and whether a
   volatile write cache is reported; no cache needs a backend whose
   writes are durable. The `nvme` driver uses 512 bytes and a cache
+- On a MantaBlock volume (`nvme,mantablock=<socket>,volume=<uuid>`),
+  I/O goes to the MantaBlock engine on the same CN over a
+  shared-memory ring (`crates/vmm-mantablock`). The namespace has
+  4 KiB blocks and reports no write cache only when the engine says
+  every write is durable when it completes. Otherwise rshyve refuses
+  the volume unless `allow-volatile` is given. See
+  [cli.md](cli.md#nvme-on-a-mantablock-volume)
 - MDTS=9 (2 MiB max transfer)
 - Sequential read: ~2.8 GB/s (matches C bhyve)
 
@@ -97,6 +104,7 @@ for lifecycle management and state export/import during migration.
 -s 4,virtio-blk,/path/to/disk,sectorsize=4096  # 4K sectors
 -s 4,virtio-blk,/path/to/disk,ro         # read-only
 -s 4,nvme,/path/to/disk                  # NVMe (recommended)
+-s 5,nvme,mantablock=/path/to/engine.sock,volume=<uuid>  # MantaBlock
 ```
 
 ## Serial Details

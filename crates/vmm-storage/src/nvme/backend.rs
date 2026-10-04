@@ -13,10 +13,12 @@ use std::io;
 use std::sync::Arc;
 
 use vmm_core::mem::{GuestIoVec, MemCtx};
+use vmm_devices::lifecycle::NvmeMigrateBackend;
 use vmm_devices::{FlushError, FlushIntent};
 
 use super::bits::*;
 use super::prp;
+pub use super::prp::Segments;
 use super::queues::{QueueEpochs, QueueInstance};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -199,6 +201,37 @@ impl GuestData {
         self.check_live()?;
         prp::copy_to_prp(&self.mem, self.prp1, self.prp2, self.len, src)
     }
+
+    /// The guest runs, for a backend that moves the data in pieces with
+    /// [`Self::copy_from_guest_at`] and [`Self::copy_to_guest_at`].
+    pub fn segments(&self) -> io::Result<Segments> {
+        self.check_live()?;
+        prp::prp_segments(&self.mem, self.prp1, self.prp2, self.len)
+    }
+
+    /// Copies `dst.len()` bytes of the transfer from `at`. `segs` must
+    /// come from this request.
+    pub fn copy_from_guest_at(
+        &self,
+        segs: &Segments,
+        at: usize,
+        dst: &mut [u8],
+    ) -> io::Result<()> {
+        self.check_live()?;
+        segs.copy_out_at(&self.mem, at, dst)
+    }
+
+    /// Copies `src` into the transfer at `at`. `segs` must come from
+    /// this request.
+    pub fn copy_to_guest_at(
+        &self,
+        segs: &Segments,
+        at: usize,
+        src: &[u8],
+    ) -> io::Result<()> {
+        self.check_live()?;
+        segs.copy_in_at(&self.mem, at, src)
+    }
 }
 
 pub trait CompletionSink: Send + Sync + 'static {
@@ -223,6 +256,18 @@ pub trait AsyncBackend: Send + Sync + 'static {
     /// A namespace that reports no volatile write cache needs this.
     fn durable_writes(&self) -> bool {
         false
+    }
+
+    /// The store a migration payload names, so a destination on another
+    /// store refuses it.
+    fn identity(&self) -> NvmeMigrateBackend {
+        NvmeMigrateBackend::File
+    }
+
+    /// False while a migration cannot hand this store to the
+    /// destination.
+    fn migratable(&self) -> bool {
+        true
     }
 
     /// Runs with the controller lock held, on a vCPU thread or a sink

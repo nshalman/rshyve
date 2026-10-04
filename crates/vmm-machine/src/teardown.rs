@@ -17,6 +17,7 @@ use vmm_core::machine::Machine;
 use vmm_devices::quiesce::{wait_all_quiesced_named, NamedDevice};
 
 use crate::hotplug::HotplugEngines;
+use crate::outside::{Drain, OutsideWork};
 use crate::registry::DeviceRegistry;
 use crate::vcpu::VcpuFleet;
 use crate::vcpu_tasks::VcpuEvent;
@@ -670,12 +671,29 @@ fn run_event_loop_with(
     shutdown_after_exit(
         vcpus,
         &registry_named_devices(registry),
+        registry.outside_work(),
         control_cleanup.as_deref(),
         move || hdl.destroy(),
-        crate::signal::arm_teardown_deadline,
+        Watchdog {
+            arm: crate::signal::arm_teardown_deadline,
+            give_up: || {
+                crate::signal::exit_wedged(OUTSIDE_WORK_WEDGED, log);
+            },
+        },
         log,
     );
     outcome
+}
+
+const OUTSIDE_WORK_WEDGED: &str =
+    "device work teardown must wait for did not end inside its deadline";
+
+/// The terminal watchdog as teardown sees it.
+struct Watchdog<A, G> {
+    /// Push the deadline the watchdog holds teardown to.
+    arm: A,
+    /// End the process now. Does not return in production.
+    give_up: G,
 }
 
 /// Everything teardown does once the guest has stopped.
@@ -683,12 +701,13 @@ fn run_event_loop_with(
 /// The order is the fix for the destroy wedge, not a preference:
 ///
 /// 1. arm the clock, before any step that cannot be interrupted;
-/// 2. quiesce, so no device is still writing;
-/// 3. join the vCPU threads, so no guest access races the halt;
-/// 4. halt the devices, which gives back the in-kernel state;
-/// 5. destroy the VM.
+/// 2. wait out device work on threads teardown does not own;
+/// 3. quiesce, so no device is still writing;
+/// 4. join the vCPU threads, so no guest access races the halt;
+/// 5. halt the devices, which gives back the in-kernel state;
+/// 6. destroy the VM.
 ///
-/// Step 4 before step 5 is what keeps the destroy out of
+/// Step 5 before step 6 is what keeps the destroy out of
 /// `vmm_lease_block`. See [`halt_devices`].
 ///
 /// Every step runs under the clock armed in step 1, and no step waits
@@ -700,9 +719,10 @@ fn run_event_loop_with(
 fn shutdown_after_exit(
     vcpus: VcpuSet<'_>,
     devices: &[NamedDevice],
+    outside: &OutsideWork,
     control_cleanup: Option<&Path>,
     destroy: impl FnOnce() -> io::Result<()> + Send + 'static,
-    arm_deadline: impl FnOnce(Duration),
+    watchdog: Watchdog<impl Fn(Duration), impl FnOnce()>,
     log: &Logger,
 ) {
     // The flush and the halt below are synchronous backend calls, one
@@ -710,7 +730,11 @@ fn shutdown_after_exit(
     // kernel. None can be interrupted from here, so the terminal
     // watchdog keeps a clock across the whole teardown and is given a
     // budget that scales with the work.
-    arm_deadline(teardown_budget(devices));
+    let budget = teardown_budget(devices);
+    (watchdog.arm)(budget);
+    if !wait_outside(outside, budget, watchdog, log) {
+        return;
+    }
 
     // A wedged backend must not prevent release of the bhyve instance.
     let _report = quiesce_named(devices, log);
@@ -732,6 +756,31 @@ fn shutdown_after_exit(
     // ordered after quiesce, vCPU join and device halt.
     if destroy_bounded_with(destroy, DESTROY_BUDGET, log) {
         info!(log, "VM shutdown complete");
+    }
+}
+
+/// Wait out device work teardown does not own. False when it would not
+/// end and the process was sent to the hard exit.
+fn wait_outside(
+    outside: &OutsideWork,
+    budget: Duration,
+    watchdog: Watchdog<impl Fn(Duration), impl FnOnce()>,
+    log: &Logger,
+) -> bool {
+    // Running beside work we cannot stop would race it on the same
+    // devices, so a wait that runs out ends the process instead.
+    match outside.close(budget) {
+        Drain::Idle => true,
+        Drain::Waited => {
+            (watchdog.arm)(budget);
+            true
+        }
+        Drain::TimedOut => {
+            error!(log, "device work outside teardown did not end";
+                "waited_secs" => budget.as_secs());
+            (watchdog.give_up)();
+            false
+        }
     }
 }
 

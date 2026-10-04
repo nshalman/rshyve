@@ -15,6 +15,8 @@ use std::sync::{Arc, RwLock};
 use vmm_devices::pci::{Bdf, PciDevice};
 use vmm_devices::Lifecycle;
 
+use crate::outside::OutsideWork;
+
 /// Where a slot is in the eject sequence.
 ///
 /// An operator request marks the slot `RemovePending`, the guest
@@ -186,6 +188,7 @@ impl fmt::Debug for RegisteredDevice {
 /// completion for one, and a held lock would deadlock it.
 pub struct DeviceRegistry {
     inner: RwLock<Vec<RegisteredDevice>>,
+    outside: OutsideWork,
 }
 
 impl Default for DeviceRegistry {
@@ -198,7 +201,14 @@ impl DeviceRegistry {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(Vec::new()),
+            outside: OutsideWork::default(),
         }
+    }
+
+    /// Device work on threads teardown does not own. Teardown waits it
+    /// out before it touches a device.
+    pub fn outside_work(&self) -> &OutsideWork {
+        &self.outside
     }
 
     /// Register a device, refusing a duplicate id or BDF.

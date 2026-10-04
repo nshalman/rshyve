@@ -13,7 +13,7 @@ use vmm_storage::ahci::media::IsoMedia;
 use vmm_storage::ahci::AhciCtrl;
 use vmm_storage::nvme::backend::{
     AsyncBackend, BackendFactory, BlockRequest, BlockStatus, CompletionSink,
-    RequestId,
+    RequestId, Segments,
 };
 use vmm_storage::nvme::{LbaSize, MsiPolicy, NvmeConfig, NvmeController};
 
@@ -50,6 +50,10 @@ impl AsyncBackend for OutsideBackend {
     fn submit(&self, req: BlockRequest) {
         let _ = (req.op(), req.lba(), req.blocks(), req.byte_offset());
         let _ = (req.id().queue(), req.id().tag(), req.data().is_live());
+        let segs: Segments = req.data().segments().unwrap_or_default();
+        let mut head = [0u8; 8];
+        let _ = req.data().copy_from_guest_at(&segs, 0, &mut head);
+        let _ = req.data().copy_to_guest_at(&segs, segs.len(), &[]);
         self.sink.complete(&[(req.id(), BlockStatus::Success)]);
     }
 
