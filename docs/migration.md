@@ -63,8 +63,7 @@ Source                          Destination
   |                                 |
   |  6. DeviceState (kernel + emulated devices)
   |-------- DeviceState ----------->|
-  |                                 |  identity check, import,
-  |                                 |  device workers start, resume
+  |                                 |  identity check, import
   |  7. Finish                      |
   |<------- Okay -------------------|  "I hold everything"
   |-------- Okay ------------------>|  the source's commit
@@ -85,16 +84,32 @@ may be running it. The control socket reports the VM still migrating and
 an operator decides; `stop` reaps it.
 
 A stop (SIGTERM or `stop`) during a migration latches the suspend at
-once. Before the commit it also cancels the migration and shuts its
-socket, so a thread blocked on a quiet peer returns at once: this end
-tells the peer and gives up, and the source rolls back. A destination
-still waiting for its source gives up as well. After a side's commit,
-a stop lets the handover finish, and shuts the socket only after 30
-seconds, because a send has no deadline on illumos. On either side the
-pause is given back, and teardown starts, only when the migration
-thread ends, so teardown never runs under it. A release that fails
-then is retried every 2 seconds, and after five tries every 30
-seconds, until it works.
+once. Before the commit it also cancels the migration. The migration
+thread checks for the cancel before every send, and every 50 ms while
+it waits for a connect, a name lookup, an accept or the durable flush.
+The stop shuts every socket the migration opened, the ZFS barrier's
+too, so a send or a read blocked on a quiet peer fails. This end tells
+the peer and gives up, and the source rolls back. Two waits are not
+cut short: the device quiesce, at most 30 seconds, and the vCPU and
+kernel ring pause ioctls. A stop that finds the vCPU pause running
+waits up to 10 seconds for it, then answers busy. A connect, a name lookup or a durable sync the stop left
+behind runs to its end on its own thread. A name lookup is bounded only
+by the resolver, and a durable sync keeps its device's workers parked
+until it returns.
+
+After a side's commit, a stop lets the handover finish, and shuts the
+sockets only after 30 seconds, because a send has no deadline on
+illumos. A stop on the destination after it told the source it was
+ready still ends the destination, and the guest does not start there.
+If the source committed, it stays paused, and the guest runs on
+neither host until an operator acts on the source.
+
+On either side the pause is given back, and teardown starts, only when
+the migration thread ends, so teardown never runs under it. A release
+that fails then is retried at once, then four times 2 seconds apart,
+then every 30 seconds until it works. Once the fast tries are spent,
+`status` reports `"release_stuck":true`, and the VM can stay
+`stopping` until the release works.
 
 If a migration's rollback or final resume cannot release the vCPUs and
 the device workers will not park again, the VM goes to `faulted`. So
@@ -346,18 +361,29 @@ the source guest with a dead NIC.
 
 A `migrate-dest` that fails does not go back to `paused`: the import
 may have written part of the guest, and the source may roll back and
-run it. The VM goes to one of two states:
+run it. The VM goes to one of three states:
 
 | State | When | Takes |
 |-------|------|-------|
 | `import-failed` | it failed before it told the source it was ready | `migrate-dest` again, or `stop` |
 | `import-in-doubt` | it told the source it was ready and never heard the commit | `resume` with `"force":true`, or `stop` |
+| `import-committed` | the source's commit arrived and the last step failed | `resume`, or `stop` |
 
 In doubt, the source may have committed, and this VM may hold the only
 copy of the guest. Look at the source first. If it rolled back and runs
-the guest, stop this VM. If it committed, make sure it is stopped, then
-send `{"command":"resume","force":true}` here. A `stop` here discards
-what may be the only copy. A failure after the commit arrived keeps the
-old rule: `paused` when the devices parked again, `faulted` when not.
+the guest, stop this VM. If the source does not run the guest, make sure
+it is stopped, then resume with force:
+`{"command":"resume","force":true}`. A `stop` here discards what may be
+the only copy.
+
+`import-committed` holds the only copy of the guest: the source has
+committed and stays paused. It refuses another `migrate-dest`, which
+would overwrite that copy. A plain `resume` is safe. A failure after the
+commit whose devices would not park again ends `faulted`.
+
+These states, and the stop and cancel handling above, apply only to a
+`migrate-dest` sent on the control socket. An import started at boot
+with `--migrate-listen` has no control plane yet: a stop does not
+cancel it, and a failed import fails the start.
 
 The destination VM should be destroyed by the caller.
