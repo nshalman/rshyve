@@ -26,7 +26,8 @@ changed default, a removed feature, or a security fix.
 - Repository gates: public-surface, unsafe-comment, CI-coverage,
   dependency-boundary and test-parity, each with a CI self-test.
 - `vmm-mantablock`, an NVMe backend that sends I/O to the MantaBlock
-  engine over a shared-memory ring. Not yet wired into `rshyve`.
+  engine over a shared-memory ring. `rshyve` uses it for
+  `-s <slot>,nvme,mantablock=<socket>,volume=<uuid>`.
 
 ### Changed
 

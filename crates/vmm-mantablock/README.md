@@ -1,8 +1,8 @@
 # vmm-mantablock
 
 The NVMe backend for a MantaBlock volume. It sends guest I/O to the
-MantaBlock engine on the same CN over a shared-memory ring, as MantaBlock
-spec 37 (the ring spec) defines. The engine is in the manta-storage
+MantaBlock engine on the same CN over a shared-memory ring, as the
+`manta-block-ring` crate defines it. The engine is in the manta-storage
 repository.
 
 rshyve uses it for `-s <slot>,nvme,mantablock=<socket>,volume=<uuid>`.
@@ -27,21 +27,38 @@ See [docs/cli.md](../../docs/cli.md#nvme-on-a-mantablock-volume).
   per-queue list and goes when a completion frees one.
 - Runs one completion thread per queue. It takes every completion on the
   ring in one pass, checks each one (tag in flight, op id matches, status
-  known) and reports the pass to the controller in one call, so the
-  controller raises one MSI for the batch.
+  known, reserved bytes zero) and reports the pass to the controller in
+  one call, so the controller raises one MSI for the batch. A pass with
+  more completions than tags means the engine is lost. A run of wake-ups
+  that find no completion makes the thread sleep 1 ms between wakes.
 - Runs one control thread: Ping every 100 ms, and the engine counts as
   lost with no Pong in 1 s or a request on the ring for longer than the
-  I/O limit (30 s by default).
+  I/O limit (30 s by default). It takes at most 64 frames per tick, so a
+  flood cannot keep it from its timers. On halt it waits for Detached at
+  most the control deadline (5 s).
 - Reports a durable namespace (VWC 0) only when AttachOk says every write
   is durable. It completes Flush itself then, as the spec says. An engine
   whose writes are not durable is refused unless `allow_volatile` is set,
   for tests and measurement; Flush and FUA then go to the engine.
 
-## What S2 leaves out
+## Trust
+
+The engine runs in the global zone and already holds all of the
+volume's data, so it is trusted. The checks above defend against an
+engine bug, not a hostile engine: a buggy engine must not corrupt guest
+memory or hang the VMM.
+
+One thing is not defended: the region is a shared file mapping, and a
+fault on it raises SIGBUS in rshyve. The engine must not shrink the
+region file while it is attached, and must not leave it sparse on a
+tmpfs that can run out of space. rshyve checks the file's length once,
+before it maps it, and does nothing about SIGBUS after that.
+
+## Not done yet
 
 - **The remote path.** When the engine is lost, every request held fails
-  with an internal error. Spec 37 wants them kept and replayed over
-  NVMe-oF to another engine (S5). For that reason write data is not kept
+  with an internal error. The plan is to keep them and replay them over
+  NVMe-oF to an engine on another CN. Until then write data is not kept
   past the copy into the ring.
 - **Reattach.** Each attach asks for a new generation.
 - **Migration.** rshyve refuses a ring disk on a migration destination.
@@ -70,16 +87,19 @@ The unit tests play the engine in-process over a real shared mapping and
 real pipes, so they can send completions the real engine never would.
 
 `tests/engine.rs` runs the real `mantablock-engine` with a file volume
-and a null volume. CI has no engine, so these tests are ignored by
-default. Build an engine that pins the same ring commit and name it:
+and a null volume. The engine is in manta-storage, which is a private
+repository, so CI cannot build it and these tests are ignored by
+default. Run them by hand before a change to this crate or to the ring
+pin merges. Check out the manta-storage commit whose `Cargo.toml` pins
+the same `manta-block-ring` rev as the root `Cargo.toml` here, then:
 
 ```bash
 cargo build -p manta-block-engine        # in manta-storage
 MANTABLOCK_ENGINE=<manta-storage>/target/debug/mantablock-engine \
-  cargo test -p vmm_mantablock -- --ignored
+  cargo test -p vmm_mantablock -- --include-ignored
 ```
 
-Run with `--ignored`, these tests fail without `MANTABLOCK_ENGINE`
+Run that way, these tests fail without `MANTABLOCK_ENGINE`
 rather than pass without the engine.
 
 The `controller::` tests in `tests/engine/controller.rs` build the NVMe

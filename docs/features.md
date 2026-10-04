@@ -179,7 +179,7 @@ The guest-visible serial from `VIRTIO_BLK_T_GET_ID` is the constant string `vmm-
 
 ```
 -s <slot>,nvme,<path>[,ro]
--s <slot>,nvme,mantablock=<socket>,volume=<uuid>[,allow-volatile]
+-s <slot>,nvme,mantablock=<socket>,volume=<uuid>[,allow-volatile][,spin-us=<n>]
 ```
 
 The second form puts the namespace on a MantaBlock volume, with 4 KiB blocks and no write cache when the engine's writes are durable. It is parsed strictly; see [cli.md](cli.md#nvme-on-a-mantablock-volume). The rest of this section is about the first form.

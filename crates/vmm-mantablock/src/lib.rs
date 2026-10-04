@@ -69,7 +69,8 @@ pub struct Config {
     /// before it sleeps. The next completion after a sleep waits for a
     /// pipe wake-up, about 15 µs, so this should cover one engine batch.
     /// While completions come closer together than this, the thread
-    /// keeps one CPU busy; idle, it costs nothing.
+    /// keeps one CPU busy; idle, it sleeps and wakes every 50 ms to look
+    /// for a halt.
     pub spin: Duration,
     /// Take an engine whose writes are not durable when they complete.
     /// For tests and measurement: the namespace must then show a
