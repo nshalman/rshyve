@@ -125,7 +125,7 @@ Examples:
 ### NVMe on a MantaBlock volume
 
 ```
--s <slot>,nvme,mantablock=<socket>,volume=<uuid>[,allow-volatile]
+-s <slot>,nvme,mantablock=<socket>,volume=<uuid>[,allow-volatile][,spin-us=<n>]
 ```
 
 When the first field after `nvme` is `mantablock=`, the namespace is a
@@ -138,6 +138,7 @@ whose first field is a path is the file disk it always was.
 | `mantablock=<socket>` | Required, first. The engine's socket for the volume |
 | `volume=<uuid>` | Required. The volume to attach |
 | `allow-volatile` | Take an engine whose writes are not durable when they complete. For tests and measurement |
+| `spin-us=<n>` | How long each queue's completion thread polls after its last completion before it sleeps, 0 to 10000 µs. Default 50. While I/O comes faster than this, the thread keeps one CPU busy; a sleep costs about 15 µs of latency on the next completion |
 
 The namespace has 4 KiB logical blocks. It reports no volatile write
 cache when the engine says every write is durable when it completes.

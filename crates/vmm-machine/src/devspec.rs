@@ -263,12 +263,18 @@ pub struct MantaBlockOpts {
     pub volume: uuid::Uuid,
     /// Take an engine whose writes are not durable when they complete.
     pub allow_volatile: bool,
+    /// How long a completion thread polls before it sleeps, in µs.
+    pub spin_us: Option<u32>,
 }
 
-const MANTABLOCK_KEYS: [&str; 3] = ["mantablock=", "volume=", "allow-volatile"];
+/// More would keep a CPU busy for little gain.
+const MAX_SPIN_US: u32 = 10_000;
+
+const MANTABLOCK_KEYS: [&str; 4] =
+    ["mantablock=", "volume=", "allow-volatile", "spin-us="];
 
 /// Parse an nvme config: `path[,blk options]`, or
-/// `mantablock=<socket>,volume=<uuid>[,allow-volatile]`.
+/// `mantablock=<socket>,volume=<uuid>[,allow-volatile][,spin-us=<n>]`.
 ///
 /// The MantaBlock form is new, so an unknown option there is an error.
 pub fn parse_nvme_config(config: &str) -> anyhow::Result<NvmeSpec<'_>> {
@@ -293,6 +299,7 @@ fn parse_mantablock_config(config: &str) -> anyhow::Result<MantaBlockOpts> {
     let mut socket: Option<PathBuf> = None;
     let mut volume: Option<uuid::Uuid> = None;
     let mut allow_volatile = false;
+    let mut spin_us: Option<u32> = None;
     for opt in config.split(',').filter(|o| !o.is_empty()) {
         if let Some(v) = opt.strip_prefix("mantablock=") {
             anyhow::ensure!(socket.is_none(), "nvme: mantablock= given twice");
@@ -312,6 +319,18 @@ fn parse_mantablock_config(config: &str) -> anyhow::Result<MantaBlockOpts> {
             volume = Some(id);
         } else if opt == "allow-volatile" {
             allow_volatile = true;
+        } else if let Some(v) = opt.strip_prefix("spin-us=") {
+            anyhow::ensure!(spin_us.is_none(), "nvme: spin-us= given twice");
+            let n = v
+                .parse::<u32>()
+                .ok()
+                .filter(|&n| n <= MAX_SPIN_US)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "nvme: spin-us= takes 0 to {MAX_SPIN_US}, got '{v}'"
+                    )
+                })?;
+            spin_us = Some(n);
         } else {
             anyhow::bail!("nvme: unknown mantablock option '{opt}'");
         }
@@ -324,6 +343,7 @@ fn parse_mantablock_config(config: &str) -> anyhow::Result<MantaBlockOpts> {
             anyhow::anyhow!("nvme: mantablock= requires volume=<uuid>")
         })?,
         allow_volatile,
+        spin_us,
     })
 }
 
@@ -544,13 +564,16 @@ mod tests {
         );
         assert_eq!(opts.volume.to_string(), VOL);
         assert!(!opts.allow_volatile);
+        assert_eq!(opts.spin_us, None);
 
-        let config = format!("mantablock=/s,volume={VOL},allow-volatile");
+        let config =
+            format!("mantablock=/s,volume={VOL},allow-volatile,spin-us=0");
         let spec = parse_nvme_config(&config).expect("ring");
         assert!(matches!(
             spec,
             NvmeSpec::MantaBlock(MantaBlockOpts {
                 allow_volatile: true,
+                spin_us: Some(0),
                 ..
             })
         ));
@@ -570,6 +593,12 @@ mod tests {
             ),
             (format!("mantablock=/s,volume={VOL},volume={VOL}"), "twice"),
             (format!("mantablock=/s,mantablock=/t,volume={VOL}"), "twice"),
+            (format!("mantablock=/s,volume={VOL},spin-us=10001"), "0 to"),
+            (format!("mantablock=/s,volume={VOL},spin-us=-1"), "0 to"),
+            (
+                format!("mantablock=/s,volume={VOL},spin-us=5,spin-us=5"),
+                "twice",
+            ),
         ];
         for (config, why) in bad {
             let error = parse_nvme_config(&config).unwrap_err().to_string();

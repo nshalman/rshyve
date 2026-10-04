@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use slog::{info, warn, Logger};
@@ -432,6 +433,9 @@ fn mantablock_nvme(
         log.clone(),
     );
     cfg.allow_volatile = opts.allow_volatile;
+    if let Some(us) = opts.spin_us {
+        cfg.spin = Duration::from_micros(u64::from(us));
+    }
     let conn = vmm_mantablock::connect(cfg).with_context(|| {
         format!(
             "nvme: cannot attach volume {} at {}",
