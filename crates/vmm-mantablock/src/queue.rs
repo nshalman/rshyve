@@ -5,120 +5,31 @@
 //! One guest queue on its ring pair: the requests it holds, the parts it
 //! has on the ring, and the checks every completion must pass.
 //!
-//! The vCPU thread in `submit` and the queue's completion thread share
-//! this state under one lock. Neither calls the sink with it held: the
-//! sink may call `submit` again on the same thread.
+//! The submission side (`sq`) is the one producer of the SQ. The vCPU
+//! takes it in `submit`; the completion thread takes it only to post what
+//! waits for a free tag. The completion thread alone consumes the CQ.
+//! Between the two there is the tag table, which needs no lock, and one
+//! small lock per request, held to change it or move its data.
+//!
+//! Lock order: `sq`, then a request. Nothing calls the sink with either
+//! held: the sink may call `submit` again on the same thread.
 
 use std::collections::VecDeque;
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::sync::atomic::{fence, AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use manta_block_ring::layout::{PAGE, SQE_BYTES};
-use manta_block_ring::{
-    BadCompletion, Cqe, Op, Outstanding, Producer, Region, Sqe,
-};
+use manta_block_ring::{Cqe, Op, Producer, Region, Sqe};
 use vmm_storage::nvme::backend::{BlockOp, BlockStatus};
 
 use crate::copy::{self, Span, Stage};
 use crate::ids::Seqs;
 use crate::job::{block_status, Job};
+use crate::out::{Lost, Out, Owner, Waiter};
 use crate::split::Slots;
+use crate::tags::{Part, Tags};
 use crate::wake;
-
-/// Why the engine counts as lost.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Lost {
-    /// An index moved in a way no correct engine moves it.
-    Broken(u16),
-    /// The SQ had no room for a request within the depth.
-    Full(u16),
-    /// A completion that matches no request in flight.
-    Completion(u16, BadCompletion),
-    /// A wake-up pipe closed or failed.
-    Pipe(u16),
-    /// The queue ran out of sequence numbers.
-    Exhausted(u16),
-    /// The control socket closed, failed or carried an Error.
-    Control(String),
-    /// No Pong within the heartbeat limit.
-    Heartbeat,
-    /// A request stayed on the ring past the I/O limit.
-    Stalled,
-}
-
-impl std::fmt::Display for Lost {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self, f)
-    }
-}
-
-/// A request the ring makes for itself, and the thread that waits on it.
-#[derive(Debug, Default)]
-pub(crate) struct Waiter {
-    status: Mutex<Option<BlockStatus>>,
-    cv: Condvar,
-}
-
-impl Waiter {
-    fn set(&self, s: BlockStatus) {
-        if let Ok(mut g) = self.status.lock() {
-            *g = Some(s);
-            self.cv.notify_all();
-        }
-    }
-
-    /// Waits until the request ends or `until` passes.
-    pub(crate) fn wait(&self, until: Instant) -> Option<BlockStatus> {
-        let mut g = self.status.lock().ok()?;
-        loop {
-            if let Some(s) = *g {
-                return Some(s);
-            }
-            let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return None;
-            }
-            g = self.cv.wait_timeout(g, left).ok()?.0;
-        }
-    }
-}
-
-enum Owner<J> {
-    Guest(J),
-    Internal(Arc<Waiter>),
-}
-
-/// What finished under the lock, to report once it is released.
-pub(crate) struct Out<Id> {
-    pub(crate) done: Vec<(Id, BlockStatus)>,
-    woken: Vec<(Arc<Waiter>, BlockStatus)>,
-}
-
-impl<Id> Default for Out<Id> {
-    fn default() -> Self {
-        Self {
-            done: Vec::new(),
-            woken: Vec::new(),
-        }
-    }
-}
-
-impl<Id> Out<Id> {
-    fn finish<J: Job<Id = Id>>(&mut self, owner: Owner<J>, s: BlockStatus) {
-        match owner {
-            Owner::Guest(job) => self.done.push((job.id(), s)),
-            Owner::Internal(w) => self.woken.push((w, s)),
-        }
-    }
-
-    /// Wakes the ring's own waiters. The guest's go to the sink.
-    pub(crate) fn wake_internal(&mut self) {
-        for (w, s) in self.woken.drain(..) {
-            w.set(s);
-        }
-    }
-}
 
 struct Req<J: Job> {
     owner: Owner<J>,
@@ -136,37 +47,45 @@ struct Req<J: Job> {
     status: BlockStatus,
     /// Guest memory, for a read or write.
     pages: Option<J::Pages>,
-    /// In the pending queue.
+    /// In the pending queue, or on its way there. The submission side
+    /// then finishes it, not the completion thread.
     queued: bool,
 }
 
-struct Part {
-    req: usize,
-    first: u32,
-    blocks: u32,
-    seq: u64,
-    posted: Instant,
+/// The SQ producer and what only it uses.
+struct SqSide {
+    sq: Producer<SQE_BYTES>,
+    wake_engine: OwnedFd,
+    seqs: Seqs,
+    /// The sequence each tag carries while it is not free.
+    opened: Vec<u64>,
+    /// Requests with something left to put on the ring, oldest first.
+    pending: VecDeque<usize>,
+    stage: Stage,
+}
+
+/// What the completion thread keeps between batches.
+pub(crate) struct CqSide {
+    stage: Stage,
+    /// Tags to free, one bit each.
+    freed: Vec<u64>,
+    /// Requests to put in the pending queue.
+    kicks: Vec<usize>,
 }
 
 pub(crate) struct QueueRing<J: Job> {
     q: u16,
     region: Arc<Region>,
-    sq: Producer<SQE_BYTES>,
-    wake_engine: OwnedFd,
     slots: Slots,
-    seqs: Seqs,
-    outstanding: Outstanding,
-    /// By ring tag.
-    parts: Vec<Option<Part>>,
-    free: Vec<u16>,
-    /// By guest tag; the last one is the ring's own.
-    reqs: Vec<Option<Req<J>>>,
-    /// Requests with something left to put on the ring, oldest first.
-    pending: VecDeque<usize>,
-    stage: Stage,
     durable: bool,
     volume_blocks: u64,
-    dead: bool,
+    sq: Mutex<SqSide>,
+    tags: Tags,
+    /// By guest tag; the last one is the ring's own.
+    reqs: Vec<Mutex<Option<Req<J>>>>,
+    /// The pending queue holds a request waiting for a free tag.
+    waiting: AtomicBool,
+    dead: AtomicBool,
 }
 
 impl<J: Job> QueueRing<J> {
@@ -177,7 +96,6 @@ impl<J: Job> QueueRing<J> {
         wake_engine: OwnedFd,
         slots: Slots,
         generation: u64,
-        depth: u32,
         durable: bool,
         volume_blocks: u64,
     ) -> Option<Self> {
@@ -186,37 +104,44 @@ impl<J: Job> QueueRing<J> {
         Some(Self {
             q,
             region,
-            sq,
-            wake_engine,
             slots,
-            seqs: Seqs::new(generation, q),
-            outstanding: Outstanding::new(depth),
-            parts: (0..tags).map(|_| None).collect(),
-            free: (0..slots.tags).rev().collect(),
-            reqs: (0..=tags).map(|_| None).collect(),
-            pending: VecDeque::new(),
-            stage: Stage::new(),
             durable,
             volume_blocks,
-            dead: false,
+            sq: Mutex::new(SqSide {
+                sq,
+                wake_engine,
+                seqs: Seqs::new(generation, q),
+                opened: vec![0; tags],
+                pending: VecDeque::new(),
+                stage: Stage::new(),
+            }),
+            tags: Tags::new(slots.tags),
+            reqs: (0..=tags).map(|_| Mutex::new(None)).collect(),
+            waiting: AtomicBool::new(false),
+            dead: AtomicBool::new(false),
         })
     }
 
-    /// Takes one guest request. Never blocks: what does not fit on the
-    /// ring now waits in the pending queue for a free tag.
+    pub(crate) fn cq_side(&self) -> CqSide {
+        CqSide {
+            stage: Stage::new(),
+            freed: vec![0; self.tags.words()],
+            kicks: Vec::new(),
+        }
+    }
+
+    /// Takes one guest request. Never blocks on I/O: what does not fit on
+    /// the ring now waits in the pending queue for a free tag.
     pub(crate) fn submit(
-        &mut self,
+        &self,
         job: J,
         out: &mut Out<J::Id>,
     ) -> Result<(), Lost> {
-        if self.dead {
-            out.finish(Owner::Guest(job), BlockStatus::Internal);
-            return Ok(());
-        }
         let slot = usize::from(job.tag());
-        if slot >= usize::from(self.slots.tags) || self.reqs[slot].is_some() {
-            // The controller admits at most the depth this ring reports,
-            // with tags unique in flight.
+        if slot >= usize::from(self.slots.tags)
+            || self.dead.load(Ordering::Acquire)
+        {
+            // The controller admits at most the depth this ring reports.
             out.finish(Owner::Guest(job), BlockStatus::Internal);
             return Ok(());
         }
@@ -231,23 +156,46 @@ impl<J: Job> QueueRing<J> {
                 return Ok(());
             }
         };
-        self.queue(slot, Req::new(Owner::Guest(job), shape));
-        self.pump(out)
+        self.take(slot, Req::new(Owner::Guest(job), shape), out)
     }
 
     /// Sends a flush of the ring's own. One at a time.
     pub(crate) fn flush(
-        &mut self,
+        &self,
         w: Arc<Waiter>,
         out: &mut Out<J::Id>,
     ) -> Result<(), Lost> {
         let slot = usize::from(self.slots.tags);
-        if self.dead || self.reqs[slot].is_some() {
-            out.finish::<J>(Owner::Internal(w), BlockStatus::Internal);
+        self.take(slot, Req::new(Owner::Internal(w), Shape::flush()), out)
+    }
+
+    /// Holds `req` in `slot` and puts what it can on the ring.
+    fn take(
+        &self,
+        slot: usize,
+        mut req: Req<J>,
+        out: &mut Out<J::Id>,
+    ) -> Result<(), Lost> {
+        let mut sq = lock(&self.sq)?;
+        // `fail_all` sets `dead` under `sq`, so nothing is held after it.
+        if self.dead.load(Ordering::Acquire) {
+            out.finish(req.owner, BlockStatus::Internal);
             return Ok(());
         }
-        self.queue(slot, Req::new(Owner::Internal(w), Shape::flush()));
-        self.pump(out)
+        {
+            let mut held = lock(&self.reqs[slot])?;
+            if held.is_some() {
+                // Tags are unique in flight, and the ring's own flush
+                // goes one at a time.
+                drop(held);
+                out.finish(req.owner, BlockStatus::Internal);
+                return Ok(());
+            }
+            req.queued = true;
+            *held = Some(req);
+        }
+        sq.pending.push_back(slot);
+        self.pump(&mut sq, out)
     }
 
     /// The request in ring terms. `Ok(None)` when there is nothing to send.
@@ -291,61 +239,66 @@ impl<J: Job> QueueRing<J> {
         }))
     }
 
-    fn queue(&mut self, slot: usize, mut req: Req<J>) {
-        req.queued = true;
-        self.reqs[slot] = Some(req);
-        self.pending.push_back(slot);
-    }
-
     /// Puts what it can of the pending queue on the ring, oldest first,
     /// then wakes the engine if it sleeps.
-    fn pump(&mut self, out: &mut Out<J::Id>) -> Result<(), Lost> {
+    fn pump(&self, sq: &mut SqSide, out: &mut Out<J::Id>) -> Result<(), Lost> {
+        if self.dead.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let mut posted = false;
-        while let Some(&slot) = self.pending.front() {
-            let Some(req) = self.reqs[slot].as_mut() else {
-                self.pending.pop_front();
+        while let Some(&slot) = sq.pending.front() {
+            let mut held = lock(&self.reqs[slot])?;
+            let Some(req) = held.as_mut() else {
+                sq.pending.pop_front();
                 continue;
             };
-            let data =
-                req.next < req.blocks && req.status == BlockStatus::Success;
-            let flush = !data
-                && req.flush_after
-                && req.in_ring == 0
-                && req.status == BlockStatus::Success;
+            let ok = req.status == BlockStatus::Success;
+            let data = ok && req.next < req.blocks;
+            let flush = !data && ok && req.flush_after && req.in_ring == 0;
             if !data && !flush {
                 req.queued = false;
-                self.pending.pop_front();
-                self.settle(slot, out);
+                sq.pending.pop_front();
+                settle(&mut held, out);
                 continue;
             }
-            let Some(tag) = self.free.pop() else { break };
-            match self.post(slot, tag, flush) {
+            let Some(tag) = self.tags.claim() else {
+                drop(held);
+                // Pairs with the fence in `complete`: either it sees
+                // `waiting`, or this sees the tag it freed.
+                self.waiting.store(true, Ordering::Relaxed);
+                fence(Ordering::SeqCst);
+                if self.tags.any_free() {
+                    continue;
+                }
+                break;
+            };
+            match self.post(sq, slot, req, tag, flush) {
                 Ok(()) => posted = true,
                 Err(Posted::Copy(s)) => {
-                    self.free.push(tag);
-                    if let Some(req) = self.reqs[slot].as_mut() {
-                        req.status = s;
-                    }
+                    self.tags.unclaim(tag);
+                    req.status = s;
                 }
                 Err(Posted::Lost(l)) => return Err(l),
             }
         }
-        if posted && self.sq.publish() {
-            wake::wake(&self.wake_engine).map_err(|_| Lost::Pipe(self.q))?;
+        if sq.pending.is_empty() {
+            self.waiting.store(false, Ordering::Relaxed);
+        }
+        if posted && sq.sq.publish() {
+            wake::wake(&sq.wake_engine).map_err(|_| Lost::Pipe(self.q))?;
         }
         Ok(())
     }
 
-    /// Puts one part of the request in `slot` on the ring under `tag`.
+    /// Puts one part of `req`, in `slot`, on the ring under `tag`.
     fn post(
-        &mut self,
+        &self,
+        sq: &mut SqSide,
         slot: usize,
+        req: &mut Req<J>,
         tag: u16,
         flush: bool,
     ) -> Result<(), Posted> {
-        let Some(req) = self.reqs[slot].as_mut() else {
-            return Err(Posted::Copy(BlockStatus::Internal));
-        };
         let page = self.slots.page(tag);
         let (first, blocks) = if flush {
             (0, 0)
@@ -364,42 +317,42 @@ impl<J: Job> QueueRing<J> {
                 blocks,
             };
             // The engine reads the buffer only after the tail moves, and
-            // the tail store below releases these stores.
-            copy::to_ring(&self.region, job, pages, span, &mut self.stage)
+            // the tail store in `publish` releases these stores.
+            copy::to_ring(&self.region, job, pages, span, &mut sq.stage)
                 .map_err(Posted::Copy)?;
         }
-        let (id, watermark) = self
+        let id = sq
             .seqs
             .open()
             .map_err(|_| Posted::Lost(Lost::Exhausted(self.q)))?;
+        sq.opened[usize::from(tag)] = id.seq;
+        let watermark = self.tags.oldest_open(&sq.opened).unwrap_or(id.seq);
+        let queued_at = now_ns();
+        // Before the push: a completion for this tag can come as soon as
+        // the engine sees the entry.
+        let part = Part {
+            req: slot,
+            first,
+            blocks,
+        };
+        self.tags.open(tag, id.low(), part, queued_at);
         let e = Sqe {
             op_id: id.to_u128(),
             lba: if flush { 0 } else { req.lba + u64::from(first) },
             blocks,
             buf_page: if flush { 0 } else { page },
             watermark,
-            queued_at: now_ns(),
+            queued_at,
             tag,
             op: if flush { Op::Flush } else { req.op } as u8,
             flags: 0,
             reserved: [0; 12],
         };
-        match self.sq.try_push(&e.encode()) {
+        match sq.sq.try_push(&e.encode()) {
             Ok(true) => {}
             Ok(false) => return Err(Posted::Lost(Lost::Full(self.q))),
             Err(_) => return Err(Posted::Lost(Lost::Broken(self.q))),
         }
-        // Tags come from the free list, so the slot is always empty.
-        if !self.outstanding.insert(tag, id) {
-            return Err(Posted::Lost(Lost::Full(self.q)));
-        }
-        self.parts[usize::from(tag)] = Some(Part {
-            req: slot,
-            first,
-            blocks,
-            seq: id.seq,
-            posted: Instant::now(),
-        });
         if flush {
             req.flush_after = false;
         } else {
@@ -409,107 +362,144 @@ impl<J: Job> QueueRing<J> {
         Ok(())
     }
 
-    /// A completion that matches no part in flight means the engine is
-    /// lost.
+    /// Takes one batch from the CQ. A completion that matches no part in
+    /// flight means the engine is lost.
     pub(crate) fn complete(
-        &mut self,
+        &self,
         cqes: &[Cqe],
+        cq: &mut CqSide,
         out: &mut Out<J::Id>,
     ) -> Result<(), Lost> {
-        if self.dead {
+        if self.dead.load(Ordering::Acquire) {
             return Ok(());
         }
         for c in cqes {
-            self.outstanding
+            let part = self
+                .tags
                 .complete(c)
                 .map_err(|e| Lost::Completion(self.q, e))?;
-            let tag = usize::from(c.tag);
-            // `outstanding` holds exactly the tags `parts` does.
-            let Some(part) = self.parts.get_mut(tag).and_then(Option::take)
-            else {
-                return Err(Lost::Completion(
-                    self.q,
-                    BadCompletion::Tag(c.tag),
-                ));
-            };
-            self.free.push(c.tag);
-            self.seqs.close(part.seq);
-            self.land(c, &part, out);
+            self.land(c, part, cq, out)?;
+            let t = usize::from(c.tag);
+            cq.freed[t / 64] |= 1 << (t % 64);
         }
-        self.pump(out)
+        self.tags.release(&mut cq.freed);
+        fence(Ordering::SeqCst);
+        if cq.kicks.is_empty() && !self.waiting.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut sq = lock(&self.sq)?;
+        if self.dead.load(Ordering::Acquire) {
+            cq.kicks.clear();
+            return Ok(());
+        }
+        sq.pending.extend(cq.kicks.drain(..));
+        self.pump(&mut sq, out)
     }
 
     /// One part is back: move its data and finish the request if it was
     /// the last.
-    fn land(&mut self, c: &Cqe, part: &Part, out: &mut Out<J::Id>) {
-        let Some(req) = self.reqs[part.req].as_mut() else {
-            return;
+    fn land(
+        &self,
+        c: &Cqe,
+        part: Part,
+        cq: &mut CqSide,
+        out: &mut Out<J::Id>,
+    ) -> Result<(), Lost> {
+        let mut held = lock(&self.reqs[part.req])?;
+        // `fail_all` may have finished it already.
+        let Some(req) = held.as_mut() else {
+            return Ok(());
         };
         req.in_ring -= 1;
         let mut s = block_status(c.status);
         if s == BlockStatus::Success && req.op == Op::Read && part.blocks > 0 {
-            s = read_back(
-                &self.region,
-                self.q,
-                self.slots,
-                c.tag,
-                part,
-                req,
-                &mut self.stage,
-            );
+            s = match (&req.owner, &req.pages) {
+                (Owner::Guest(job), Some(pages)) => {
+                    let span = Span {
+                        q: self.q,
+                        page: self.slots.page(c.tag),
+                        first: part.first,
+                        blocks: part.blocks,
+                    };
+                    match copy::from_ring(
+                        &self.region,
+                        job,
+                        pages,
+                        span,
+                        &mut cq.stage,
+                    ) {
+                        Ok(()) => BlockStatus::Success,
+                        Err(s) => s,
+                    }
+                }
+                _ => BlockStatus::Internal,
+            };
         }
         if s != BlockStatus::Success && req.status == BlockStatus::Success {
             req.status = s;
         }
-        if !req.queued {
-            self.settle(part.req, out);
+        if !req.queued && settle(&mut held, out) == Settled::Queue {
+            cq.kicks.push(part.req);
         }
-    }
-
-    /// Finishes the request in `slot` if nothing of it is left on the
-    /// ring or to send, or queues its flush.
-    fn settle(&mut self, slot: usize, out: &mut Out<J::Id>) {
-        let Some(req) = self.reqs[slot].as_mut() else {
-            return;
-        };
-        let ok = req.status == BlockStatus::Success;
-        if req.in_ring > 0 || (ok && req.next < req.blocks) {
-            return;
-        }
-        if ok && req.flush_after {
-            if !req.queued {
-                req.queued = true;
-                self.pending.push_back(slot);
-            }
-            return;
-        }
-        let Some(req) = self.reqs[slot].take() else {
-            return;
-        };
-        if req.queued {
-            self.pending.retain(|&s| s != slot);
-        }
-        out.finish(req.owner, req.status);
+        Ok(())
     }
 
     /// The engine is lost: fail everything held, and take nothing more.
-    pub(crate) fn fail_all(&mut self, out: &mut Out<J::Id>) {
-        self.dead = true;
-        self.pending.clear();
-        for p in &mut self.parts {
-            *p = None;
-        }
-        for r in &mut self.reqs {
-            if let Some(req) = r.take() {
+    pub(crate) fn fail_all(&self, out: &mut Out<J::Id>) {
+        // A poisoned lock still guards what must fail.
+        let mut sq = self.sq.lock().unwrap_or_else(|e| e.into_inner());
+        self.dead.store(true, Ordering::Release);
+        sq.pending.clear();
+        for r in &self.reqs {
+            let mut held = r.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(req) = held.take() {
                 out.finish(req.owner, BlockStatus::Internal);
             }
         }
     }
 
-    /// When the oldest part on the ring was sent.
-    pub(crate) fn oldest(&self) -> Option<Instant> {
-        self.parts.iter().flatten().map(|p| p.posted).min()
+    /// When the oldest part on the ring was sent, in monotonic ns.
+    pub(crate) fn oldest(&self) -> Option<u64> {
+        self.tags.oldest_posted()
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Settled {
+    Done,
+    /// Its flush is still to send; it was marked queued.
+    Queue,
+    Waiting,
+}
+
+/// Finishes the request in `held` if nothing of it is left on the ring
+/// or to send, or marks it for its flush.
+fn settle<J: Job>(
+    held: &mut MutexGuard<'_, Option<Req<J>>>,
+    out: &mut Out<J::Id>,
+) -> Settled {
+    let Some(req) = held.as_mut() else {
+        return Settled::Done;
+    };
+    let ok = req.status == BlockStatus::Success;
+    if req.in_ring > 0 || (ok && req.next < req.blocks) {
+        return Settled::Waiting;
+    }
+    if ok && req.flush_after {
+        req.queued = true;
+        return Settled::Queue;
+    }
+    if let Some(req) = held.take() {
+        out.finish(req.owner, req.status);
+    }
+    Settled::Done
+}
+
+/// A poisoned lock means a thread panicked inside the ring code; its
+/// state is not to be trusted, so the engine counts as lost.
+fn lock<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>, Lost> {
+    m.lock()
+        .map_err(|_| Lost::Control("queue lock poisoned".into()))
 }
 
 enum Posted {
@@ -558,33 +548,8 @@ impl<J: Job> Req<J> {
     }
 }
 
-/// Copies a finished read part out of the ring to the guest.
-fn read_back<J: Job>(
-    region: &Region,
-    q: u16,
-    slots: Slots,
-    tag: u16,
-    part: &Part,
-    req: &Req<J>,
-    stage: &mut Stage,
-) -> BlockStatus {
-    let (Owner::Guest(job), Some(pages)) = (&req.owner, &req.pages) else {
-        return BlockStatus::Internal;
-    };
-    let span = Span {
-        q,
-        page: slots.page(tag),
-        first: part.first,
-        blocks: part.blocks,
-    };
-    match copy::from_ring(region, job, pages, span, stage) {
-        Ok(()) => BlockStatus::Success,
-        Err(s) => s,
-    }
-}
-
-/// Monotonic time in ns, for the engine's probes only.
-fn now_ns() -> u64 {
+/// Monotonic time in ns.
+pub(crate) fn now_ns() -> u64 {
     let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     (t.tv_sec as u64)
         .wrapping_mul(1_000_000_000)

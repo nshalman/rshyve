@@ -24,6 +24,9 @@ use crate::split::Slots;
 use crate::wake::{adopt, End};
 use crate::{Config, Job, Ring, Sink};
 
+mod scatter;
+mod stress;
+
 const GEN: u64 = 0x51;
 const BLOCKS: u64 = 256;
 
@@ -156,6 +159,24 @@ fn setup_for<J: Job<Id = u32>>(
     max_blocks: u32,
     durable: bool,
 ) -> (Arc<Ring<J>>, Arc<Calls>, Engine) {
+    let calls = Arc::new(Calls::default());
+    let (ring, engine) = setup_with(
+        depth,
+        buf_pages,
+        max_blocks,
+        durable,
+        Arc::clone(&calls) as _,
+    );
+    (ring, calls, engine)
+}
+
+fn setup_with<J: Job<Id = u32>>(
+    depth: u32,
+    buf_pages: u32,
+    max_blocks: u32,
+    durable: bool,
+    sink: Arc<dyn Sink<u32>>,
+) -> (Arc<Ring<J>>, Engine) {
     let g = Geometry::new(1, depth, buf_pages).unwrap();
     let file = tempfile::tempfile().unwrap();
     file.set_len(g.region_len() as u64).unwrap();
@@ -186,8 +207,7 @@ fn setup_for<J: Job<Id = u32>>(
     let log = slog::Logger::root(slog::Discard, slog::o!());
     let mut cfg = Config::new("unused".into(), uuid::Uuid::nil(), log);
     cfg.spin = 10;
-    let calls = Arc::new(Calls::default());
-    let ring = Ring::start(att, None, &cfg, Arc::clone(&calls) as _);
+    let ring = Ring::start(att, None, &cfg, sink);
     let engine = Engine {
         sq: theirs.sq_consumer(0).unwrap(),
         cq: theirs.cq_producer(0).unwrap(),
@@ -197,7 +217,7 @@ fn setup_for<J: Job<Id = u32>>(
         disk: vec![0; BLOCKS as usize * PAGE],
         seen: Vec::new(),
     };
-    (ring, calls, engine)
+    (ring, engine)
 }
 
 impl Engine {
@@ -361,7 +381,9 @@ fn requests_beyond_the_free_tags_wait_and_then_go() {
     }
     // Never more on the ring than the tags.
     let mut served = 0;
+    let until = Instant::now() + Duration::from_secs(5);
     while served < 9 {
+        assert!(Instant::now() < until, "only {served} of 9 parts sent");
         let got = eng.take(16);
         assert!(got.len() <= 4);
         let cqes: Vec<_> = got.iter().map(|e| eng.serve(e).encode()).collect();
@@ -442,6 +464,9 @@ fn lie(bytes: impl Fn(&Sqe) -> [u8; CQE_BYTES]) {
     // Nothing more is sent to a lost engine.
     ring.submit(job(3, 2, BlockOp::Read, 0, pattern(1, 0)));
     assert_eq!(calls.wait_for(3)[2], (3, BlockStatus::Internal));
+    // Nor does a request that needs no ring succeed.
+    ring.submit(job(4, 3, BlockOp::Flush, 0, Vec::new()));
+    assert_eq!(calls.wait_for(4)[3], (4, BlockStatus::Internal));
     assert!(eng.take(8).is_empty());
 }
 
@@ -495,162 +520,4 @@ fn halt_fails_what_is_held_and_stops_the_threads() {
     ring.halt();
     assert_eq!(calls.all(), vec![(1, BlockStatus::Internal)]);
     ring.halt();
-}
-
-/// Guest memory as uneven runs scattered over a larger buffer, the way
-/// a PRP1 offset and a PRP list lay it out.
-struct Scatter {
-    id: u32,
-    tag: u16,
-    op: BlockOp,
-    off: u64,
-    backing: Arc<Mutex<Vec<u8>>>,
-    /// `(where in the backing, len)`, in transfer order.
-    runs: Vec<(usize, usize)>,
-}
-
-impl Scatter {
-    fn new(id: u32, tag: u16, op: BlockOp, lba: u64, blocks: usize) -> Self {
-        let mut runs = Vec::new();
-        let (mut left, mut at, mut i) = (blocks * PAGE, 64, 0usize);
-        while left > 0 {
-            // Dword multiples that never line up with a page.
-            let n = [4, 4092, 4096, 1000, 3096, 12, 6000][i % 7].min(left);
-            runs.push((at, n));
-            at += n + 4 * (i + 1);
-            left -= n;
-            i += 1;
-        }
-        Self {
-            id,
-            tag,
-            op,
-            off: lba * PAGE as u64,
-            backing: Arc::new(Mutex::new(vec![0; at])),
-            runs,
-        }
-    }
-
-    fn put(&self, data: &[u8]) {
-        let mut b = self.backing.lock().unwrap();
-        let mut at = 0;
-        for &(pos, n) in &self.runs {
-            b[pos..pos + n].copy_from_slice(&data[at..at + n]);
-            at += n;
-        }
-    }
-
-    fn get(&self) -> Vec<u8> {
-        let b = self.backing.lock().unwrap();
-        self.runs
-            .iter()
-            .flat_map(|&(pos, n)| b[pos..pos + n].iter().copied())
-            .collect()
-    }
-
-    /// Calls `f` with each backing range of transfer bytes
-    /// `at..at + len`, and where it falls in those bytes.
-    fn each(
-        &self,
-        at: usize,
-        len: usize,
-        mut f: impl FnMut(std::ops::Range<usize>, std::ops::Range<usize>),
-    ) {
-        let mut start = 0;
-        for &(pos, n) in &self.runs {
-            let lo = at.max(start);
-            let hi = (at + len).min(start + n);
-            if lo < hi {
-                f(pos + lo - start..pos + hi - start, lo - at..hi - at);
-            }
-            start += n;
-        }
-    }
-}
-
-impl Job for Scatter {
-    type Id = u32;
-    type Pages = ();
-
-    fn id(&self) -> u32 {
-        self.id
-    }
-
-    fn queue(&self) -> u16 {
-        1
-    }
-
-    fn tag(&self) -> u16 {
-        self.tag
-    }
-
-    fn op(&self) -> BlockOp {
-        self.op
-    }
-
-    fn byte_offset(&self) -> u64 {
-        self.off
-    }
-
-    fn len(&self) -> usize {
-        self.runs.iter().map(|r| r.1).sum()
-    }
-
-    fn pages(&self) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn copy_from_guest(
-        &self,
-        _: &(),
-        at: usize,
-        dst: &mut [u8],
-    ) -> io::Result<()> {
-        let b = self.backing.lock().unwrap();
-        self.each(at, dst.len(), |from, to| dst[to].copy_from_slice(&b[from]));
-        Ok(())
-    }
-
-    fn copy_to_guest(&self, _: &(), at: usize, src: &[u8]) -> io::Result<()> {
-        let mut b = self.backing.lock().unwrap();
-        self.each(at, src.len(), |to, from| b[to].copy_from_slice(&src[from]));
-        Ok(())
-    }
-}
-
-#[test]
-fn split_parts_copy_straight_between_misaligned_guest_runs_and_slots() {
-    // Five pages per slot and four tags: 13 blocks go as 5, 5 and 3.
-    let (ring, calls, mut eng) = setup_for::<Scatter>(4, 32, 5, true);
-    let data = pattern(13, 0x5a);
-    let w = Scatter::new(1, 0, BlockOp::Write { fua: false }, 40, 13);
-    w.put(&data);
-    ring.submit(w);
-    let parts = eng.take_n(3);
-    assert_eq!(
-        parts.iter().map(|e| e.blocks).collect::<Vec<_>>(),
-        vec![5, 5, 3]
-    );
-    let cqes: Vec<_> = parts.iter().map(|e| eng.serve(e).encode()).collect();
-    eng.post(&cqes);
-    calls.wait_for(1);
-    assert_eq!(&eng.disk[40 * PAGE..53 * PAGE], &data[..]);
-
-    let r = Arc::new(Scatter::new(2, 1, BlockOp::Read, 40, 13));
-    ring.submit(Scatter {
-        backing: Arc::clone(&r.backing),
-        runs: r.runs.clone(),
-        ..Scatter::new(2, 1, BlockOp::Read, 40, 13)
-    });
-    eng.serve_all(3);
-    assert_eq!(calls.wait_for(2)[1], (2, BlockStatus::Success));
-    assert_eq!(r.get(), data);
-    // Nothing lands between the runs.
-    let b = r.backing.lock().unwrap();
-    let mut next = 0;
-    for &(pos, n) in &r.runs {
-        assert!(b[next..pos].iter().all(|&x| x == 0));
-        next = pos + n;
-    }
-    assert!(b[next..].iter().all(|&x| x == 0));
 }

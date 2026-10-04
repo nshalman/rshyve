@@ -34,10 +34,12 @@ mod control;
 mod copy;
 mod ids;
 mod job;
+mod out;
 mod queue;
 mod reaper;
 mod ring;
 mod split;
+mod tags;
 mod wake;
 
 #[cfg(test)]

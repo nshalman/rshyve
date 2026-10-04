@@ -6,7 +6,7 @@
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -16,11 +16,12 @@ use vmm_storage::nvme::backend::{AsyncBackend, BlockRequest, BlockStatus};
 use crate::attach::Attached;
 use crate::conn::Conn;
 use crate::job::{Job, Sink};
-use crate::queue::{Lost, Out, QueueRing, Waiter};
+use crate::out::{Lost, Out, Waiter};
+use crate::queue::QueueRing;
 use crate::{control, reaper, Config};
 
 pub(crate) struct Shared<J: Job> {
-    pub(crate) queues: Vec<Mutex<QueueRing<J>>>,
+    pub(crate) queues: Vec<QueueRing<J>>,
     sink: Arc<dyn Sink<J::Id>>,
     lost: AtomicBool,
     /// Halt has started: a closed pipe or socket is then expected.
@@ -31,13 +32,8 @@ pub(crate) struct Shared<J: Job> {
 }
 
 impl<J: Job> Shared<J> {
-    pub(crate) fn queue(
-        &self,
-        q: usize,
-    ) -> Option<MutexGuard<'_, QueueRing<J>>> {
-        // A poisoned lock means a thread panicked inside the ring code;
-        // its state is not to be trusted, so the queue counts as gone.
-        self.queues.get(q)?.lock().ok()
+    pub(crate) fn queue(&self, q: usize) -> Option<&QueueRing<J>> {
+        self.queues.get(q)
     }
 
     /// Reports what finished. Never called with a queue lock held.
@@ -72,20 +68,16 @@ impl<J: Job> Shared<J> {
     }
 
     fn fail_all(&self) {
-        for q in 0..self.queues.len() {
+        for q in &self.queues {
             let mut out = Out::default();
-            if let Some(mut g) = self.queue(q) {
-                g.fail_all(&mut out);
-            }
+            q.fail_all(&mut out);
             self.finish(out);
         }
     }
 
-    /// When the oldest request on any ring was sent.
-    pub(crate) fn oldest(&self) -> Option<Instant> {
-        (0..self.queues.len())
-            .filter_map(|q| self.queue(q)?.oldest())
-            .min()
+    /// When the oldest request on any ring was sent, in monotonic ns.
+    pub(crate) fn oldest(&self) -> Option<u64> {
+        self.queues.iter().filter_map(QueueRing::oldest).min()
     }
 }
 
@@ -117,7 +109,6 @@ impl<J: Job> Ring<J> {
             slots,
             pipes,
         } = att;
-        let depth = region.geometry().depth();
         let mut queues = Vec::new();
         let mut reapers = Vec::new();
         for (q, p) in (0u16..).zip(pipes) {
@@ -127,13 +118,12 @@ impl<J: Job> Ring<J> {
                 p.wake_engine,
                 slots,
                 generation,
-                depth,
                 durable,
                 volume_blocks,
             );
             let cq = region.cq_consumer(q);
             if let (Some(ring), Some(cq)) = (ring, cq) {
-                queues.push(Mutex::new(ring));
+                queues.push(ring);
                 reapers.push((q, cq, p.wake_me));
             }
         }
@@ -192,7 +182,7 @@ impl<J: Job> Ring<J> {
         let mut out = Out::default();
         let q = usize::from(job.queue()).checked_sub(1);
         let lost = match q.and_then(|q| self.shared.queue(q)) {
-            Some(mut g) => g.submit(job, &mut out).err(),
+            Some(ring) => ring.submit(job, &mut out).err(),
             None => {
                 out.done.push((job.id(), BlockStatus::Internal));
                 None
@@ -242,7 +232,7 @@ impl<J: Job> Ring<J> {
         let w = Arc::new(Waiter::default());
         let mut out = Out::default();
         let lost = match self.shared.queue(0) {
-            Some(mut g) => g.flush(Arc::clone(&w), &mut out).err(),
+            Some(ring) => ring.flush(Arc::clone(&w), &mut out).err(),
             None => return Err(io::Error::other("no queue")),
         };
         self.shared.finish(out);

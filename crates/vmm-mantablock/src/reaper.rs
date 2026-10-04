@@ -15,7 +15,8 @@ use manta_block_ring::layout::CQE_BYTES;
 use manta_block_ring::{BadCompletion, Consumer, Cqe};
 
 use crate::job::Job;
-use crate::queue::{Lost, Out};
+use crate::out::{Lost, Out};
+use crate::queue::{CqSide, QueueRing};
 use crate::ring::Shared;
 use crate::wake::{self, Waited};
 
@@ -29,9 +30,14 @@ pub(crate) fn run<J: Job>(
     wake_me: &OwnedFd,
     spin: u32,
 ) {
+    let Some(ring) = shared.queue(usize::from(q)) else {
+        return;
+    };
+    let mut side = ring.cq_side();
+    let mut cqes = Vec::new();
     let mut empty = 0u32;
     while !shared.stopping() {
-        match reap(shared, q, &mut cq) {
+        match reap(shared, ring, q, &mut cq, &mut cqes, &mut side) {
             Ok(0) => {}
             Ok(_) => {
                 empty = 0;
@@ -54,7 +60,9 @@ pub(crate) fn run<J: Job>(
         cq.woke();
         if waited == Waited::Gone {
             // Take what the engine finished before it closed its end.
-            if let Err(why) = reap(shared, q, &mut cq) {
+            if let Err(why) =
+                reap(shared, ring, q, &mut cq, &mut cqes, &mut side)
+            {
                 return shared.lose(why);
             }
             if !shared.halted() {
@@ -67,10 +75,13 @@ pub(crate) fn run<J: Job>(
 
 fn reap<J: Job>(
     shared: &Shared<J>,
+    ring: &QueueRing<J>,
     q: u16,
     cq: &mut Consumer<CQE_BYTES>,
+    cqes: &mut Vec<Cqe>,
+    side: &mut CqSide,
 ) -> Result<usize, Lost> {
-    let mut cqes = Vec::new();
+    cqes.clear();
     let mut bad = None;
     loop {
         match cq.pop() {
@@ -94,10 +105,7 @@ fn reap<J: Job>(
     // Each entry is copied out, so the slots go back at once.
     cq.release();
     let mut out = Out::default();
-    let done = match shared.queue(usize::from(q)) {
-        Some(mut g) => g.complete(&cqes, &mut out),
-        None => Err(Lost::Control("queue lock poisoned".into())),
-    };
+    let done = ring.complete(cqes, side, &mut out);
     shared.finish(out);
     done?;
     bad.map_or(Ok(cqes.len()), Err)

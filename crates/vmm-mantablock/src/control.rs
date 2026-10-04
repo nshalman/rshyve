@@ -13,7 +13,8 @@ use manta_block_ring::control::Message;
 
 use crate::conn::{Conn, Polled};
 use crate::job::Job;
-use crate::queue::Lost;
+use crate::out::Lost;
+use crate::queue::now_ns;
 use crate::ring::Shared;
 use crate::Config;
 
@@ -68,9 +69,10 @@ fn watch<J: Job>(
         if now.duration_since(last_pong) > t.heartbeat_limit {
             return Err(Lost::Heartbeat);
         }
+        let io_limit = u64::try_from(t.io_limit.as_nanos()).unwrap_or(u64::MAX);
         if shared
             .oldest()
-            .is_some_and(|o| now.duration_since(o) > t.io_limit)
+            .is_some_and(|o| now_ns().saturating_sub(o) > io_limit)
         {
             return Err(Lost::Stalled);
         }
