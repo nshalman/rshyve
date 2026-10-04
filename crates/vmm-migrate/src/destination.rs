@@ -28,7 +28,7 @@ use crate::pages::apply_page_batch;
 use crate::protocol::select_protocol;
 use crate::state;
 use crate::wire::{
-    not_cancelled, set_phase, unexpected, Chan, Deadlines, Transport,
+    cancel_or, not_cancelled, set_phase, unexpected, Chan, Deadlines, Transport,
 };
 use crate::MigrationPhase;
 use crate::MigrationStatus;
@@ -151,7 +151,9 @@ fn run_inner<S: Transport>(
     receive_pass(chan, memctx, hooks.gate.as_ref(), status, PassEnd::MemEnd)?;
 
     slog::info!(log, "pausing VM before state import");
-    (hooks.pause_vm)().map_err(|e| MigrateError::Io(format!("pause: {e}")))?;
+    (hooks.pause_vm)().map_err(|e| {
+        cancel_or(hooks.gate.as_ref(), MigrateError::Io(format!("pause: {e}")))
+    })?;
 
     // ── TimeData ──
     set_phase(status, MigrationPhase::TimeData);

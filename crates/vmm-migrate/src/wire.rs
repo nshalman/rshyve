@@ -33,7 +33,8 @@ pub fn peer_text(s: &str) -> String {
 /// protocol moves as the phases change.
 ///
 /// Read deadlines only. `SO_SNDTIMEO` reports success on illumos and
-/// the write still blocks forever, so a send deadline would be a lie.
+/// the write still blocks forever, so the owner frees a blocked send by
+/// shutting the socket down.
 pub trait Transport: Read + Write {
     fn set_read_deadline(&self, budget: Duration) -> std::io::Result<()>;
 }
@@ -208,12 +209,23 @@ fn expect_serialized(msg: Message) -> Result<Vec<u8>, MigrateError> {
     }
 }
 
-/// Give up once a stop has cancelled the migration.
 pub fn not_cancelled(gate: &dyn crate::StopGate) -> Result<(), MigrateError> {
     if gate.cancelled() {
         return Err(crate::cancelled());
     }
     Ok(())
+}
+
+/// A stop refuses the migration's own pause and resume. That is a
+/// cancel, which the peer has to hear about.
+pub fn cancel_or(
+    gate: &dyn crate::StopGate,
+    error: MigrateError,
+) -> MigrateError {
+    if gate.cancelled() {
+        return crate::cancelled();
+    }
+    error
 }
 
 pub fn set_phase(status: &Arc<Mutex<MigrationStatus>>, phase: MigrationPhase) {

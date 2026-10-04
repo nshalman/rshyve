@@ -44,7 +44,9 @@ use crate::pages::{
 };
 use crate::protocol::{payload_refusal, PageIter, PAGE_SIZE, SOURCE_OFFER};
 use crate::state;
-use crate::wire::{not_cancelled, set_phase, Chan, Deadlines, Transport};
+use crate::wire::{
+    cancel_or, not_cancelled, set_phase, Chan, Deadlines, Transport,
+};
 use crate::MigrationPhase;
 use crate::MigrationStatus;
 use crate::StopGate;
@@ -258,7 +260,9 @@ fn run_inner<S: Transport>(
     chan.enter_post_pause()?;
     device_pre_pause_fn()
         .map_err(|e| MigrateError::State(format!("device pause: {e}")))?;
-    pause_vm().map_err(|e| MigrateError::Io(format!("pause: {e}")))?;
+    pause_vm().map_err(|e| {
+        cancel_or(gate, MigrateError::Io(format!("pause: {e}")))
+    })?;
     not_cancelled(gate)?;
 
     // zvol WCE=1 means writes the guest was told were complete may
@@ -305,6 +309,7 @@ fn run_inner<S: Transport>(
 
     // ── RamPull (none needed) ──
     set_phase(status, MigrationPhase::RamPull);
+    not_cancelled(gate)?;
     chan.send(&Message::MemEnd)?;
 
     hand_over(chan, gate, status)
@@ -403,8 +408,7 @@ fn push_ram_all<S: Transport>(
             off += count;
         }
     }
-    chan.send(&Message::MemEnd)?;
-    chan.expect_mem_done()
+    end_pass(chan, gate)
 }
 
 fn push_ram<S: Transport>(
@@ -423,27 +427,49 @@ fn push_ram<S: Transport>(
         let mut bm = vec![0u8; bm_len];
         hdl.track_dirty_pages(gpa, len, &mut bm)
             .map_err(|e| MigrateError::Io(format!("track_dirty: {e}")))?;
-
-        let mut batch: Vec<u64> = Vec::with_capacity(BATCH_SIZE);
-        for dirty_gpa in PageIter::new(&bm, gpa, len) {
-            batch.push(dirty_gpa);
-            total += 1;
-            if batch.len() >= BATCH_SIZE {
-                not_cancelled(gate)?;
-                send_batch_sparse(chan, memctx, &batch, status)?;
-                batch.clear();
-            }
-        }
-        if !batch.is_empty() {
-            send_batch_sparse(chan, memctx, &batch, status)?;
-        }
+        total += send_dirty(PageIter::new(&bm, gpa, len), gate, |batch| {
+            send_batch_sparse(chan, memctx, batch, status)
+        })?;
     }
     if let Ok(mut s) = status.lock() {
         s.dirty_pages_remaining = total;
     }
-    chan.send(&Message::MemEnd)?;
-    chan.expect_mem_done()?;
+    end_pass(chan, gate)?;
     Ok(total)
+}
+
+/// Send `pages` in batches and count them.
+fn send_dirty(
+    pages: impl Iterator<Item = u64>,
+    gate: &dyn StopGate,
+    mut send: impl FnMut(&[u64]) -> Result<(), MigrateError>,
+) -> Result<u64, MigrateError> {
+    let mut total = 0;
+    let mut batch: Vec<u64> = Vec::with_capacity(BATCH_SIZE);
+    for gpa in pages {
+        batch.push(gpa);
+        total += 1;
+        if batch.len() >= BATCH_SIZE {
+            not_cancelled(gate)?;
+            send(&batch)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        not_cancelled(gate)?;
+        send(&batch)?;
+    }
+    Ok(total)
+}
+
+fn end_pass<S: Transport>(
+    chan: &mut Chan<S>,
+    gate: &dyn StopGate,
+) -> Result<(), MigrateError> {
+    not_cancelled(gate)?;
+    chan.send(&Message::MemEnd)?;
+    not_cancelled(gate)?;
+    chan.expect_mem_done()
 }
 
 fn send_batch<S: Transport>(
@@ -775,6 +801,64 @@ mod tests {
         assert_eq!(gate.commits.load(Ordering::Acquire), 1);
         assert_eq!(phase(&status), MigrationPhase::Committed);
         peer.join().expect("the destination finished");
+    }
+
+    #[test]
+    fn a_cancel_stops_the_last_partial_batch() {
+        let gate = Gate {
+            cancel: true,
+            ..Gate::default()
+        };
+        let mut sent = 0;
+        let error = send_dirty((0..10).map(|p| p * 4096), &gate, |_| {
+            sent += 1;
+            Ok(())
+        })
+        .expect_err("cancelled");
+        assert!(crate::is_cancel(&error), "{error}");
+        assert_eq!(sent, 0);
+    }
+
+    #[test]
+    fn every_dirty_page_is_sent_once() {
+        let mut sizes = Vec::new();
+        let total = send_dirty(
+            (0..(BATCH_SIZE as u64 + 6)).map(|p| p * 4096),
+            &Gate::default(),
+            |batch| {
+                sizes.push(batch.len());
+                Ok(())
+            },
+        )
+        .expect("sent");
+        assert_eq!(total, BATCH_SIZE as u64 + 6);
+        assert_eq!(sizes, [BATCH_SIZE, 6]);
+    }
+
+    #[test]
+    fn a_cancelled_pass_sends_no_mem_end() {
+        let (mut source, mut dest) = pair();
+        let gate = Gate {
+            cancel: true,
+            ..Gate::default()
+        };
+        let error = end_pass(&mut source, &gate).expect_err("cancelled");
+        assert!(crate::is_cancel(&error), "{error}");
+        drop(source);
+        assert!(dest.recv().is_err(), "the destination heard a MemEnd");
+    }
+
+    #[test]
+    fn a_pause_a_stop_refused_is_a_cancel() {
+        let gate = Gate {
+            cancel: true,
+            ..Gate::default()
+        };
+        let error = cancel_or(&gate, MigrateError::Io("pause: refused".into()));
+        assert!(crate::is_cancel(&error), "{error}");
+        let error =
+            cancel_or(&Gate::default(), MigrateError::Io("pause: EIO".into()));
+        assert!(!crate::is_cancel(&error), "{error}");
     }
 
     #[test]
