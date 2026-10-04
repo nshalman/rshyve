@@ -343,6 +343,11 @@ fn end_process(reason: &'static str, give_up: impl FnOnce(), log: &Logger) {
     give_up();
 }
 
+/// End a VMM that cannot finish a stop, the way the watchdog does.
+pub fn exit_wedged(reason: &'static str, log: &Logger) {
+    end_process(reason, terminal_exit, log);
+}
+
 /// End the process without the exit path a wedged VMM can block in.
 ///
 /// `exit` runs the atexit handlers and flushes stdio, either of which

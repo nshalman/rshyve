@@ -46,7 +46,7 @@ use crate::pages::{
 };
 use crate::protocol::{payload_refusal, PageIter, PAGE_SIZE, SOURCE_OFFER};
 use crate::state;
-use crate::wait::unless_cancelled;
+use crate::wait::{unless_cancelled, Abandoned};
 use crate::wire::{
     cancel_or, not_cancelled, set_phase, Chan, Deadlines, Transport,
 };
@@ -76,15 +76,23 @@ pub type DeviceExportFn = Box<
 /// Flush device writeback caches. Called after the vCPU pause has
 /// quiesced the vCPUs and before the ZFS barrier, so `zfs send` sees
 /// every write the guest was told was complete.
+///
+/// Runs on a helper a stop can leave behind, so it must stop between
+/// devices once [`Abandoned`] is set.
 pub type DeviceFlushFn =
-    Box<dyn FnOnce() -> Result<(), DeviceFlushError> + Send>;
+    Box<dyn FnOnce(&Abandoned) -> Result<(), DeviceFlushError> + Send>;
 
-/// One device's backing store could not be flushed.
+/// Why the backing stores were not all flushed.
 #[derive(Debug, thiserror::Error)]
-#[error("{device}: {source}")]
-pub struct DeviceFlushError {
-    pub device: &'static str,
-    pub source: FlushError,
+pub enum DeviceFlushError {
+    #[error("{device}: {source}")]
+    Device {
+        device: &'static str,
+        source: FlushError,
+    },
+    /// The flush ended before it reached every device.
+    #[error("{0}")]
+    Stopped(String),
 }
 
 /// Put the devices back to work after a migration that failed once the
@@ -275,17 +283,14 @@ fn run_inner<S: Transport>(
 
     // zvol WCE=1 means writes the guest was told were complete may
     // still sit in cache. `zfs send` ships only committed pool state.
-    // A durable sync has no deadline. It runs on its own thread so a
-    // stop is not held behind it; one left behind ends on its own.
+    // A durable sync has no deadline, so a stop does not wait for it.
+    // One left behind stops after its current device, and teardown
+    // waits for it.
     slog::info!(log, "flushing device backing caches");
-    unless_cancelled(
-        "migrate-flush",
-        || gate.cancelled(),
-        |_| device_flush_fn(),
-    )?
-    .map_err(|error| {
-        MigrateError::Io(format!("device flush failed: {error}"))
-    })?;
+    unless_cancelled("migrate-flush", || gate.cancelled(), device_flush_fn)?
+        .map_err(|error| {
+            MigrateError::Io(format!("device flush failed: {error}"))
+        })?;
 
     if let Some(barrier) = config.zfs_barrier.as_deref() {
         zfs_barrier_wait(barrier, config.deadlines.zfs_barrier, gate, log)?;

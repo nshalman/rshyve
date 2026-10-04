@@ -460,7 +460,9 @@ fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
             for_pre_pause.run.parking_devices();
             for_pre_pause.pause_devices_for_migration()
         }),
-        flush: Box::new(move || for_flush.flush_devices_for_migration()),
+        flush: Box::new(move |left| {
+            for_flush.flush_devices_for_migration(left)
+        }),
         resume: Box::new(move || {
             for_resume.resume_devices_after_migration();
             for_resume.run.devices_resumed();

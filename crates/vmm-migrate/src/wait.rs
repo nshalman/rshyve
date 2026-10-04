@@ -27,8 +27,9 @@ impl Abandoned {
 
 /// Run `work` on its own thread, and wait for it until `cancelled`.
 ///
-/// Work left behind runs to its end and its result is dropped, so it
-/// must hold nothing the stop needs back.
+/// Work left behind keeps running and its result is dropped. It must
+/// stop at [`Abandoned`], and hold nothing the stop needs back unless
+/// teardown waits for it.
 pub fn unless_cancelled<T: Send + 'static>(
     name: &str,
     cancelled: impl Fn() -> bool,

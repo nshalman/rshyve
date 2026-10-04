@@ -248,12 +248,6 @@ impl VmController {
         })
     }
 
-    /// Lifecycle handles, cloned out of the registry so no registry lock
-    /// is held while a device runs.
-    fn lifecycle_devices(&self) -> Vec<Arc<dyn vmm_devices::Lifecycle>> {
-        self.registry.lifecycle_devices()
-    }
-
     /// The same set, each handle carrying its registry id so a stuck
     /// device is named by id and not by a type two devices share.
     fn named_devices(&self) -> Vec<NamedDevice> {
@@ -340,15 +334,18 @@ impl VmController {
     /// state.
     fn flush_devices_for_migration(
         &self,
+        left: &vmm_migrate::wait::Abandoned,
     ) -> Result<(), vmm_migrate::source::DeviceFlushError> {
-        for dev in self.lifecycle_devices() {
-            dev.flush_backing(vmm_devices::FlushIntent::Durable)
-                .map_err(|source| vmm_migrate::source::DeviceFlushError {
-                    device: dev.type_name(),
-                    source,
-                })?;
-        }
-        Ok(())
+        use vmm_machine::OutsideFlushError as Outside;
+        use vmm_migrate::source::DeviceFlushError;
+        vmm_machine::flush_durable(&self.registry, || left.get()).map_err(
+            |error| match error {
+                Outside::Device { device, source } => {
+                    DeviceFlushError::Device { device, source }
+                }
+                other => DeviceFlushError::Stopped(other.to_string()),
+            },
+        )
     }
 
     /// Read every device's state out. A pure read: the pause already

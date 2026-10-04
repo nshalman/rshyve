@@ -23,6 +23,7 @@ pub mod firmware;
 pub mod hotplug;
 pub mod inventory;
 pub mod opts;
+pub mod outside;
 pub mod parse;
 pub mod pause;
 pub mod pci;
@@ -55,6 +56,9 @@ pub use hotplug::{
     HotplugError, HotplugFactory,
 };
 pub use opts::VmOpts;
+pub use outside::{
+    flush_durable, Drain, OutsideFlushError, OutsideGuard, OutsideWork,
+};
 pub use parse::{find_lpc_device, parse_bdf};
 pub use pause::{VmPause, VmPauseGate};
 pub use pci::{
@@ -69,7 +73,8 @@ pub use registry::{
     DeviceRegistry, RegisteredDevice, RegistryError, SlotState,
 };
 pub use signal::{
-    install_sigterm_handler, sigterm_flag, sigterm_received, SUSPEND_SOURCE_VMM,
+    exit_wedged, install_sigterm_handler, sigterm_flag, sigterm_received,
+    SUSPEND_SOURCE_VMM,
 };
 pub use teardown::{
     registry_named_devices, run_fleet_event_loop, RunOutcome, VcpuThreads,
