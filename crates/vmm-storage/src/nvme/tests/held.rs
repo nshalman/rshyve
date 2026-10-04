@@ -95,6 +95,8 @@ fn the_admin_queue_waits_in_the_sq_while_its_cq_is_full() {
 
     let last = ACQ + u64::from(ADMIN_QDEPTH - 1) * CQE_SIZE as u64;
     assert_eq!(h.read_guest(last, CQE_SIZE), vec![0; 16], "CQ overrun");
+    let head = h.ctrl.lock().admin_sq.as_ref().expect("admin SQ").head;
+    assert_eq!(head, ADMIN_QDEPTH - 1, "ran a command with no CQ room");
 
     h.cq_doorbell(ADMIN_QUEUE_ID, ADMIN_QDEPTH - 1);
     let cqe = Cqe::decode(&h.read_guest(last, CQE_SIZE));

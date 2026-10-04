@@ -250,11 +250,7 @@ impl NvmeController {
         let deadline = Instant::now() + budget;
         st.drain_waiters += 1;
         let done = loop {
-            // An MSI still on its way counts too: a reset that cleared
-            // the pending bits under it would leave one set for a
-            // driver that is gone.
-            let raising = self.counts.raising.load(Ordering::Acquire) > 0;
-            if !busy(&st) && !raising {
+            if !busy(&st) {
                 break true;
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -277,7 +273,13 @@ impl NvmeController {
         budget: Duration,
     ) -> (Locked<'a>, bool) {
         st.admission.draining += 1;
-        self.drain(st, budget, |st| st.in_flight() > 0)
+        // An MSI still on its way counts too: a reset that cleared the
+        // pending bits under it would leave one set for a driver that
+        // is gone.
+        self.drain(st, budget, |st| {
+            st.in_flight() > 0
+                || self.counts.raising.load(Ordering::Acquire) > 0
+        })
     }
 
     /// End a [`Self::drain_all`], and admit what the guest queued

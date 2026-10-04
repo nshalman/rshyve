@@ -131,8 +131,12 @@ impl NvmeController {
                 let (next, drained) =
                     self.drain(st, self.fences.reset, |st| fence.busy(st));
                 st = next;
+                // Linux frees the queue's pages on any Delete Queue
+                // completion, error status included. A fatal controller
+                // posts none; the driver times out and resets.
                 if !drained {
                     st.fail_fence();
+                    break;
                 }
                 // A reset while the lock was released took this admin
                 // queue away; its completion belongs to no ring now.
@@ -441,7 +445,6 @@ impl NvmeController {
             FEAT_VOLATILE_WC if !st.volatile_write_cache => {
                 (SC_INVALID_FIELD | SC_DNR, 0)
             }
-            // WCE: the cache is enabled.
             FEAT_VOLATILE_WC => (SC_SUCCESS, 1),
             FEAT_TEMP_THRESHOLD | FEAT_ERROR_RECOVERY | FEAT_POWER_MGMT
             | FEAT_ARBITRATION | FEAT_INTR_COALESCING

@@ -149,7 +149,7 @@ fn export_waits_for_the_command_in_flight() {
     std::thread::sleep(Duration::from_millis(50));
     assert!(!exporter.is_finished(), "export ran over a live command");
     backend.release();
-    let state = match exporter.join().expect("exporter") {
+    let state = match join_within(exporter, WAIT) {
         Ok(Some(vmm_devices::DeviceMigrateState::Nvme(state))) => state,
         other => panic!("no NVMe state: {other:?}"),
     };
@@ -289,4 +289,85 @@ fn a_delete_waits_for_its_own_queue_not_the_one_after_it() {
     manual.sink().complete(&[(old.id(), BlockStatus::Success)]);
     deleter.join().expect("deleter");
     assert_eq!(h.csts() & CSTS_CFS, 0, "the new queue failed the delete");
+}
+
+/// Linux frees the queue's pages on any Delete Queue completion, so one
+/// whose commands outlast the deadline gets none.
+#[test]
+fn a_delete_that_times_out_posts_no_completion() {
+    let (mut h, backend) = Harness::impatient();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    backend.hold();
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::read(0, 8, 0x50000, 0), 0x54);
+    backend.wait_in_flight(1);
+
+    let t = h.admin_tail;
+    let delete = Sqe {
+        opcode: ADMIN_OPC_DELETE_IO_SQ,
+        cdw10: 1,
+        ..Sqe::default()
+    };
+    put_sqe(&h, ASQ, t, delete, 0xD2);
+    h.sq_doorbell(ADMIN_QUEUE_ID, t + 1);
+
+    let slot = ACQ + h.admin_cq_head as u64 * CQE_SIZE as u64;
+    let cqe = Cqe::decode(&h.read_guest(slot, CQE_SIZE));
+    let csts = h.csts();
+    // Before any assert: dropping the controller joins the worker.
+    backend.release();
+    assert_ne!(cqe.phase, h.admin_phase, "completed over a live transfer");
+    assert_ne!(csts & CSTS_CFS, 0, "the controller is not fatal");
+}
+
+/// A reset while a Delete Queue drains gives the driver a new admin
+/// queue, which never sent that command.
+#[test]
+fn a_delete_completion_stays_out_of_an_admin_queue_made_during_its_drain() {
+    let manual = Manual::new(IO_QDEPTH);
+    let mut h = Harness::manual(&manual);
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut tail = 0;
+    submit_on(&h, 1, SQ1, &mut tail, Sqe::read(0, 1, 0x50000, 0), 0x01);
+    let req = manual.take().pop().expect("one request");
+
+    let t = h.admin_tail;
+    let delete = Sqe {
+        opcode: ADMIN_OPC_DELETE_IO_SQ,
+        cdw10: 1,
+        ..Sqe::default()
+    };
+    put_sqe(&h, ASQ, t, delete, 0xD3);
+    let deleter = {
+        let ctrl = Arc::clone(&h.ctrl);
+        std::thread::spawn(move || {
+            let wo = WriteOp::from_buf(&u32::from(t + 1).to_le_bytes());
+            ctrl.bar_rw(BarN::BAR0, REG_DOORBELL_BASE, RWOp::Write(&wo));
+        })
+    };
+    let start = Instant::now();
+    while h.ctrl.drain_count() == 0 {
+        assert!(start.elapsed() < WAIT, "the delete never drained");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // What a reset and a new CC.EN leave behind, in one lock hold so
+    // the deleter cannot look in between.
+    {
+        let mut st = h.ctrl.lock();
+        h.ctrl.finish_now(&mut st, &h.mem(), req.id(), SC_SUCCESS);
+        let instance = st.next_instance();
+        st.admin_cq.as_mut().expect("admin CQ").instance = instance;
+    }
+    join_within(deleter, WAIT);
+
+    let slot = ACQ + h.admin_cq_head as u64 * CQE_SIZE as u64;
+    assert_eq!(
+        h.read_guest(slot, CQE_SIZE),
+        vec![0; CQE_SIZE],
+        "the delete completed into the new admin queue"
+    );
 }

@@ -76,3 +76,82 @@ fn admin_completions_raise_outside_the_lock_too() {
     assert_eq!(h.msi_count(), 3, "two admin completions and one I/O");
     assert_eq!(h.sink.under_lock.load(Ordering::Relaxed), 0);
 }
+
+/// A reset clears the pending bits once it has drained, so an MSI
+/// still on its way would set one after it for a driver that is gone.
+#[test]
+fn a_reset_waits_for_an_msi_on_its_way() {
+    let manual = Manual::new(IO_QDEPTH);
+    let mut h = Harness::manual(&manual);
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut tail = 0;
+    submit_on(&h, 1, SQ1, &mut tail, Sqe::read(0, 1, 0x50000, 0), 0x41);
+
+    let before = h.msi_count();
+    h.sink.close_gate();
+    let completer = {
+        let manual = Arc::clone(&manual);
+        std::thread::spawn(move || manual.complete_all())
+    };
+    h.sink.wait_sent(before + 1);
+
+    let resetter = {
+        let ctrl = Arc::clone(&h.ctrl);
+        std::thread::spawn(move || {
+            let wo = WriteOp::from_buf(&0u32.to_le_bytes());
+            ctrl.bar_rw(BarN::BAR0, REG_CC, RWOp::Write(&wo));
+        })
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    let early = resetter.is_finished();
+    h.sink.open_gate();
+    join_within(completer, WAIT);
+    join_within(resetter, WAIT);
+
+    assert!(!early, "the reset finished under an MSI on its way");
+    assert_eq!(h.csts() & CSTS_RDY, 0);
+}
+
+/// The quiesce query reads two counters without the lock. From the
+/// moment a command leaves flight until its MSI is out, one of them
+/// must be up. The gap is a few instructions wide, so this samples it
+/// many times.
+#[test]
+fn quiet_is_never_reported_before_the_msi_goes_out() {
+    let manual = Manual::new(IO_QDEPTH);
+    let mut h = Harness::manual(&manual);
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    let mut tail = 0;
+    for round in 0..2000u32 {
+        h.ctrl.resume();
+        let cid = (round % u32::from(IO_QDEPTH)) as u16;
+        submit_on(&h, 1, SQ1, &mut tail, Sqe::read(0, 1, 0x50000, 0), cid);
+        let req = manual.take().pop().expect("one request");
+        h.ctrl.pause();
+        let sent = h.msi_count();
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let poller = {
+            let ctrl = Arc::clone(&h.ctrl);
+            let sink = Arc::clone(&h.sink);
+            let ready = Arc::clone(&ready);
+            std::thread::spawn(move || {
+                ready.store(true, Ordering::Release);
+                while !ctrl.is_quiesced() {
+                    std::hint::spin_loop();
+                }
+                sink.sent.lock().expect("sink lock").len()
+            })
+        };
+        while !ready.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        manual.sink().complete(&[(req.id(), BlockStatus::Success)]);
+        let seen = join_within(poller, WAIT);
+        assert_eq!(seen, sent + 1, "quiet before the MSI, round {round}");
+        h.cq_doorbell(1, tail);
+    }
+}

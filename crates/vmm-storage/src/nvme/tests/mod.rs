@@ -59,6 +59,10 @@ struct RecordingSink {
     sent: Mutex<Vec<(u64, u64)>>,
     ctrl: OnceLock<std::sync::Weak<NvmeController>>,
     under_lock: AtomicU64,
+    /// While set, `send` records its message and then waits, as a slow
+    /// interrupt path would.
+    gate: Mutex<bool>,
+    gate_cv: Condvar,
 }
 
 impl MsiSink for RecordingSink {
@@ -72,7 +76,43 @@ impl MsiSink for RecordingSink {
             }
         }
         self.sent.lock().expect("sink lock").push((addr, data));
+        let mut closed = self.gate.lock().expect("gate lock");
+        self.gate_cv.notify_all();
+        while *closed {
+            closed = self.gate_cv.wait(closed).expect("gate lock");
+        }
     }
+}
+
+impl RecordingSink {
+    fn close_gate(&self) {
+        *self.gate.lock().expect("gate lock") = true;
+    }
+
+    fn open_gate(&self) {
+        *self.gate.lock().expect("gate lock") = false;
+        self.gate_cv.notify_all();
+    }
+
+    /// Wait until `n` messages have been sent.
+    fn wait_sent(&self, n: usize) {
+        let start = Instant::now();
+        while self.sent.lock().expect("sink lock").len() < n {
+            assert!(start.elapsed() < WAIT, "fewer than {n} MSIs in {WAIT:?}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// Join `thread`, failing the test instead of hanging when it has not
+/// finished within `budget`.
+fn join_within<T>(thread: std::thread::JoinHandle<T>, budget: Duration) -> T {
+    let start = Instant::now();
+    while !thread.is_finished() {
+        assert!(start.elapsed() < budget, "still running after {budget:?}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    thread.join().expect("thread panicked")
 }
 
 /// One controller over anonymous guest RAM and a patterned temp file.
