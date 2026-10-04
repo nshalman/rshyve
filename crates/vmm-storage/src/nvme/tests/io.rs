@@ -32,10 +32,10 @@ fn io_read_through_prp1_and_prp2_returns_the_backing_bytes() {
 
 #[test]
 fn io_write_reaches_the_backing_file() {
-    let file = Arc::new(backing_file());
+    let disk = backing_disk();
     let mut h = Harness::with_backend(
-        Arc::clone(&file),
-        Arc::clone(&file) as Arc<dyn crate::nvme::io::IoBackend>,
+        Arc::clone(&disk),
+        Arc::clone(&disk) as Arc<dyn crate::nvme::io::IoBackend>,
     );
     h.enable();
     h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
@@ -47,7 +47,9 @@ fn io_write_reaches_the_backing_file() {
 
     use std::os::unix::fs::FileExt;
     let mut buf = [0u8; 512];
-    file.read_exact_at(&mut buf, 100 * 512).expect("read back");
+    disk.file()
+        .read_exact_at(&mut buf, 100 * 512)
+        .expect("read back");
     assert!(buf.iter().all(|&b| b == 0x5A));
 }
 

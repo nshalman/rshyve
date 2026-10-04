@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use vmm_core::common::{RWOp, ReadOp, WriteOp, PAGE_SIZE};
 use vmm_core::mem::{MemCtx, PhysMap};
 use vmm_core::mmio::MmioBus;
+use vmm_devices::blkdev::DiskSync;
 use vmm_devices::pci::device::PciDevice;
 use vmm_devices::pci::msix::MsiSink;
 use vmm_devices::pci::BarN;
@@ -70,6 +71,10 @@ fn backing_file() -> std::fs::File {
     let bytes: Vec<u8> = (0..BACKING_BLOCKS * 512).map(backing_byte).collect();
     file.write_all(&bytes).expect("fill backing file");
     file
+}
+
+fn backing_disk() -> Arc<DiskSync> {
+    Arc::new(DiskSync::new(Arc::new(backing_file())).expect("classify"))
 }
 
 /// A backend whose transfers the test controls.
@@ -228,10 +233,10 @@ impl Harness {
     }
 
     fn held_with(fences: FenceBudgets) -> (Self, Arc<TestBackend>) {
-        let file = Arc::new(backing_file());
-        let backend = TestBackend::new(Arc::clone(&file));
+        let disk = backing_disk();
+        let backend = TestBackend::new(Arc::clone(disk.file()));
         let h = Self::build(
-            file,
+            disk,
             Arc::clone(&backend) as Arc<dyn super::io::IoBackend>,
             false,
             fences,
@@ -240,24 +245,24 @@ impl Harness {
     }
 
     fn new() -> Self {
-        let file = Arc::new(backing_file());
-        Self::with_backend(Arc::clone(&file), file)
+        let disk = backing_disk();
+        Self::with_backend(Arc::clone(&disk), disk)
     }
 
     fn read_only() -> Self {
-        let file = Arc::new(backing_file());
-        Self::build(Arc::clone(&file), file, true, FENCE_BUDGETS)
+        let disk = backing_disk();
+        Self::build(Arc::clone(&disk), disk, true, FENCE_BUDGETS)
     }
 
     fn with_backend(
-        file: Arc<std::fs::File>,
+        disk: Arc<DiskSync>,
         backend: Arc<dyn super::io::IoBackend>,
     ) -> Self {
-        Self::build(file, backend, false, FENCE_BUDGETS)
+        Self::build(disk, backend, false, FENCE_BUDGETS)
     }
 
     fn build(
-        file: Arc<std::fs::File>,
+        disk: Arc<DiskSync>,
         backend: Arc<dyn super::io::IoBackend>,
         read_only: bool,
         fences: FenceBudgets,
@@ -266,7 +271,7 @@ impl Harness {
             Arc::new(PhysMap::new_anon(0, GUEST_RAM).expect("anon guest RAM"));
         let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
         let ctrl = NvmeController::build(NvmeParts {
-            file,
+            disk,
             backend,
             read_only,
             instance_id: 1,

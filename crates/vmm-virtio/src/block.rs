@@ -26,7 +26,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use vmm_devices::blkdev::DiskCache;
+use vmm_devices::blkdev::{DiskCache, DiskSync};
 use vmm_devices::lifecycle::Indicator;
 use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
 
@@ -152,7 +152,7 @@ pub struct VirtioBlock {
     /// outlives a device that is dropped while a syscall is running.
     /// A worker holding a bare fd number would resume against whatever
     /// the host reopened on it.
-    file: Arc<File>,
+    disk: Arc<DiskSync>,
     /// Lifecycle state indicator.
     indicator: Indicator,
     gate: Arc<QuiesceGate>,
@@ -218,11 +218,11 @@ impl VirtioBlock {
         // size the guest is told to align to, not the unit of either.
         let capacity = metadata.len() / bits::SECTOR_SIZE;
         let read_only = opts.read_only;
-        let file = Arc::new(file);
+        let disk = Arc::new(DiskSync::new(Arc::new(file))?);
 
         // Enable zvol writeback cache (DKIOCSETWCE=1). Must happen before
         // any I/O so the first guest writes already hit the fast path.
-        let cache = DiskCache::new(Arc::clone(&file), read_only);
+        let cache = DiskCache::new(Arc::clone(disk.file()), read_only);
 
         // Workers per queue: NUM_WORKERS for single queue, 2 per queue for MQ.
         let limits = DiskLimits {
@@ -250,12 +250,12 @@ impl VirtioBlock {
             for i in 0..workers_per_queue {
                 let (tx, rx) = mpsc::channel::<BlkIoRequest>();
                 let ctx = ctx.clone();
-                let file = Arc::clone(&file);
+                let disk = Arc::clone(&disk);
 
                 thread::Builder::new()
                     .name(format!("virtio-blk-q{q}-io-{i}"))
                     .spawn(move || {
-                        blk_io_worker(rx, file, limits, ctx);
+                        blk_io_worker(rx, disk, limits, ctx);
                     })
                     .expect("failed to spawn virtio-blk I/O worker");
 
@@ -280,7 +280,7 @@ impl VirtioBlock {
             interrupt: Arc::new(IntrSlot::new()),
             completions: Mutex::new(completions),
             _cache: cache,
-            file,
+            disk,
             indicator: Indicator::new(),
             gate,
             pause_grace,
@@ -820,7 +820,7 @@ impl Lifecycle for VirtioBlock {
         let budget = &self.ctx.budget;
         let flushed = vmm_devices::quiesce::flush_file_when(
             &self.gate,
-            &self.file,
+            &self.disk,
             intent,
             "virtio-blk",
             || budget.is_idle(),

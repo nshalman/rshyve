@@ -4,11 +4,11 @@
 
 //! I/O submission and execution.
 
-use std::fs::File;
 use std::io;
 use std::sync::Arc;
 
 use vmm_core::mem::{GuestIoVec, MemCtx};
+use vmm_devices::blkdev::DiskSync;
 
 use super::bits::*;
 use super::prp::prp_to_iovec;
@@ -17,7 +17,7 @@ use super::{Geometry, NvmeController};
 
 /// The store a namespace is backed by.
 ///
-/// A trait rather than `File` so a test can hold a transfer open and
+/// A trait rather than [`DiskSync`] so a test can hold a transfer open and
 /// watch what a reset or a shutdown does with it.
 pub trait IoBackend: Send + Sync + 'static {
     fn read_at(&self, iov: &GuestIoVec, offset: u64) -> io::Result<usize>;
@@ -25,17 +25,17 @@ pub trait IoBackend: Send + Sync + 'static {
     fn sync(&self) -> io::Result<()>;
 }
 
-impl IoBackend for File {
+impl IoBackend for DiskSync {
     fn read_at(&self, iov: &GuestIoVec, offset: u64) -> io::Result<usize> {
-        iov.read_from(self, offset)
+        iov.read_from(self.file(), offset)
     }
 
     fn write_at(&self, iov: &GuestIoVec, offset: u64) -> io::Result<usize> {
-        iov.write_to(self, offset)
+        iov.write_to(self.file(), offset)
     }
 
     fn sync(&self) -> io::Result<()> {
-        self.sync_data()
+        DiskSync::sync(self)
     }
 }
 

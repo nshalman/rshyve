@@ -17,3 +17,7 @@
 # host runs them. See docs/testing.md.
 illumos-only  vmm_core:test:autodestruct  armed_autodestruct_reclaims_the_instance_on_close
 illumos-only  vmm_core:test:autodestruct  disarmed_autodestruct_keeps_the_instance
+
+# DKIOCFLUSHWRITECACHE exists only on illumos. Linux syncs a char
+# device with fdatasync, which /dev/null refuses with EINVAL.
+illumos-only  vmm_devices:lib:vmm_devices  blkdev::tests::a_char_device_that_fails_the_flush_reports_it

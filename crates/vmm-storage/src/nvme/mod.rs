@@ -33,7 +33,7 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::PhysMap;
 use vmm_core::mmio::MmioBus;
 
-use vmm_devices::blkdev::DiskCache;
+use vmm_devices::blkdev::{DiskCache, DiskSync};
 use vmm_devices::lifecycle::{
     DeviceStateError, Indicator, NvmeMigrateCq, NvmeMigrateSq,
 };
@@ -87,7 +87,7 @@ pub(super) struct Geometry {
 /// Tests inject a recording MSI sink and a backend that stalls on
 /// demand; production passes the VM handle and the file itself.
 pub(super) struct NvmeParts {
-    pub(super) file: Arc<File>,
+    pub(super) disk: Arc<DiskSync>,
     pub(super) backend: Arc<dyn IoBackend>,
     pub(super) read_only: bool,
     pub(super) instance_id: u8,
@@ -114,7 +114,7 @@ pub struct NvmeController {
     /// Zvol write-cache control.
     _cache: DiskCache,
     /// The backing store, kept for the durable flush.
-    file: Arc<File>,
+    disk: Arc<DiskSync>,
     /// The I/O worker pool, joined by [`Self::stop_workers`].
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
     pub(super) geometry: Geometry,
@@ -158,10 +158,13 @@ impl NvmeController {
         bus_mmio: Arc<MmioBus>,
         log: slog::Logger,
     ) -> Arc<Self> {
-        let file = Arc::new(file);
+        let disk = Arc::new(
+            DiskSync::new(Arc::new(file))
+                .expect("nvme: failed to stat backing file"),
+        );
         Self::build(NvmeParts {
-            backend: Arc::clone(&file) as Arc<dyn IoBackend>,
-            file,
+            backend: Arc::clone(&disk) as Arc<dyn IoBackend>,
+            disk,
             read_only,
             instance_id,
             physmap,
@@ -174,7 +177,7 @@ impl NvmeController {
 
     pub(super) fn build(parts: NvmeParts) -> Arc<Self> {
         let NvmeParts {
-            file,
+            disk,
             backend,
             read_only,
             instance_id,
@@ -187,9 +190,10 @@ impl NvmeController {
 
         // NVMe has explicit FLUSH semantics, so the zvol may run
         // writeback. Set before any I/O so first writes hit the fast path.
-        let cache = DiskCache::new(Arc::clone(&file), read_only);
+        let cache = DiskCache::new(Arc::clone(disk.file()), read_only);
 
-        let file_len = file
+        let file_len = disk
+            .file()
             .metadata()
             .expect("nvme: failed to stat backing file")
             .len();
@@ -279,7 +283,7 @@ impl NvmeController {
             self_ref: Mutex::new(None),
             log,
             _cache: cache,
-            file,
+            disk,
             workers: Mutex::new(Vec::with_capacity(NUM_WORKERS)),
             geometry,
             indicator: Indicator::new(),
@@ -494,7 +498,7 @@ impl Lifecycle for NvmeController {
     }
 
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
-        vmm_devices::quiesce::flush_file(&self.gate, &self.file, intent, "nvme")
+        vmm_devices::quiesce::flush_file(&self.gate, &self.disk, intent, "nvme")
     }
 
     fn export_migrate_state(

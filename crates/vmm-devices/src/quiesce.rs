@@ -3,13 +3,13 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::fmt;
-use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::blkdev::DiskSync;
 use crate::{FlushError, FlushIntent, Lifecycle};
 
 const DURABLE_QUIESCE_BUDGET: Duration = Duration::from_secs(30);
@@ -308,35 +308,29 @@ const FLUSH_BUDGETS: FlushBudgets = FlushBudgets {
 /// Best-effort syncs also fail if their watchdog expires.
 pub fn flush_file(
     gate: &QuiesceGate,
-    file: &File,
+    disk: &Arc<DiskSync>,
     intent: FlushIntent,
     device: &'static str,
 ) -> Result<(), FlushError> {
-    flush_file_when(gate, file, intent, device, || true)
+    flush_file_when(gate, disk, intent, device, || true)
 }
 
 /// [`flush_file`], with the sync also waiting for `idle`.
 pub fn flush_file_when(
     gate: &QuiesceGate,
-    file: &File,
+    disk: &Arc<DiskSync>,
     intent: FlushIntent,
     device: &'static str,
     idle: impl Fn() -> bool,
 ) -> Result<(), FlushError> {
-    flush_file_with(
-        gate,
-        file,
-        intent,
-        device,
-        FLUSH_BUDGETS,
-        idle,
-        File::sync_data,
-    )
+    let disk = Arc::clone(disk);
+    flush_file_with(gate, intent, device, FLUSH_BUDGETS, idle, move || {
+        disk.sync()
+    })
 }
 
 fn flush_file_with<F>(
     gate: &QuiesceGate,
-    file: &File,
     intent: FlushIntent,
     device: &'static str,
     budgets: FlushBudgets,
@@ -344,7 +338,7 @@ fn flush_file_with<F>(
     sync: F,
 ) -> Result<(), FlushError>
 where
-    F: FnOnce(&File) -> io::Result<()> + Send + 'static,
+    F: FnOnce() -> io::Result<()> + Send + 'static,
 {
     // The flush owns this claim and nothing else: a pause another
     // thread takes while the sync runs must outlive it.
@@ -359,19 +353,15 @@ where
     }
 
     let result = match intent {
-        FlushIntent::Durable => sync(file).map_err(FlushError::Sync),
+        FlushIntent::Durable => sync().map_err(FlushError::Sync),
         FlushIntent::BestEffort => {
-            let worker_file = match file.try_clone() {
-                Ok(file) => file,
-                Err(error) => return Err(FlushError::Sync(error)),
-            };
             let (tx, rx) = mpsc::channel();
             let worker = thread::Builder::new()
                 .name(format!("{device}-flush"))
                 .spawn(move || {
                     // The receiver may have timed out, leaving no observer for
                     // the eventual sync result.
-                    drop(tx.send(sync(&worker_file)));
+                    drop(tx.send(sync()));
                 });
             match worker {
                 Err(error) => Err(FlushError::Sync(error)),
