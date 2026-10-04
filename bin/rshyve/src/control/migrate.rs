@@ -457,10 +457,14 @@ fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
     let (pause_vm, resume_vm) = migration_pause_hooks(ctrl);
     vmm_migrate::source::SourceHooks {
         pre_pause: Box::new(move || {
+            for_pre_pause.run.parking_devices();
             for_pre_pause.pause_devices_for_migration()
         }),
         flush: Box::new(move || for_flush.flush_devices_for_migration()),
-        resume: Box::new(move || for_resume.resume_devices_after_migration()),
+        resume: Box::new(move || {
+            for_resume.resume_devices_after_migration();
+            for_resume.run.devices_resumed();
+        }),
         export: Box::new(move || for_export.export_device_state()),
         hyperv: Box::new(move || for_hyperv.export_hyperv()),
         pause_vm,
@@ -582,7 +586,6 @@ pub(super) fn migrate_dest(
                 let lease = MigrationLease::new(ctrl_arc.as_ref());
                 let hooks = dest_hooks(&ctrl_arc);
                 let run = &ctrl_arc.run;
-                let phase = Arc::clone(&status);
                 let outcome =
                     accept_one(&listen_addr, || run.cancelled(), &mlog)
                         .and_then(|stream| {
@@ -605,9 +608,7 @@ pub(super) fn migrate_dest(
                         end_migration(&ctrl_arc);
                     }
                     Err(e) => {
-                        let confirmed = phase.lock().is_ok_and(|s| {
-                            s.phase == vmm_migrate::MigrationPhase::Committed
-                        });
+                        let confirmed = ctrl_arc.source_committed();
                         error!(mlog, "destination migration failed";
                             "error" => %e, "source_committed" => confirmed);
                         ctrl_arc.ended(run.fail_import(confirmed, || {
@@ -639,7 +640,10 @@ fn dest_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::destination::DestHooks {
         restore: Box::new(move |bdf, state| {
             for_restore.restore_device_state(bdf, state)
         }),
-        resume: Box::new(move || for_resume.resume_devices()),
+        resume: Box::new(move || {
+            for_resume.resume_devices();
+            for_resume.run.devices_resumed();
+        }),
         hyperv: Box::new(move |state| for_hyperv.restore_hyperv(state)),
         pause_vm,
         resume_vm,

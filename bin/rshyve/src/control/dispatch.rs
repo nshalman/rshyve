@@ -201,12 +201,14 @@ fn resume_step(
 /// The state a resume starts from, or why there is none.
 ///
 /// A VM whose import is in doubt resumes only with `force`, once the
-/// operator has made sure the source did not keep the guest.
+/// operator has made sure the source did not keep the guest. One whose
+/// source committed resumes as a paused VM does.
 fn resume_from(
     state: VmRunState,
     force: bool,
 ) -> Result<VmRunState, &'static str> {
     match state {
+        VmRunState::ImportCommitted => Ok(state),
         VmRunState::ImportInDoubt if force => Ok(state),
         VmRunState::ImportInDoubt => Err(IN_DOUBT),
         VmRunState::ImportFailed => Err(IMPORT_FAILED),
@@ -941,5 +943,18 @@ mod tests {
             resume_from(VmRunState::Paused, true),
             Ok(VmRunState::Paused)
         );
+    }
+
+    #[test]
+    fn an_import_the_source_committed_to_resumes_plainly() {
+        // The source has committed and stays paused, so this is the
+        // only copy and nothing else can run it.
+        for force in [false, true] {
+            assert_eq!(
+                resume_from(VmRunState::ImportCommitted, force),
+                Ok(VmRunState::ImportCommitted)
+            );
+        }
+        assert_eq!(stop_refusal(VmRunState::ImportCommitted, false), None);
     }
 }

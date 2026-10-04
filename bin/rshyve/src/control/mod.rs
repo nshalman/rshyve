@@ -112,6 +112,10 @@ pub enum VmRunState {
     ImportFailed = 6,
     #[serde(rename = "import-in-doubt")]
     ImportInDoubt = 7,
+    /// An import the source committed to, whose last step failed. The
+    /// guest is here and nowhere else.
+    #[serde(rename = "import-committed")]
+    ImportCommitted = 8,
 }
 
 impl VmRunState {
@@ -125,6 +129,7 @@ impl VmRunState {
             5 => Self::Faulted,
             6 => Self::ImportFailed,
             7 => Self::ImportInDoubt,
+            8 => Self::ImportCommitted,
             _other => Self::Stopped,
         }
     }
@@ -425,6 +430,17 @@ impl VmController {
         self.run.get()
     }
 
+    /// Whether the migration's phase says the source committed.
+    fn source_committed(&self) -> bool {
+        self.migrate_status.lock().ok().is_some_and(|ms| {
+            ms.as_ref().is_some_and(|s| {
+                s.lock().is_ok_and(|s| {
+                    s.phase == vmm_migrate::MigrationPhase::Committed
+                })
+            })
+        })
+    }
+
     /// Whether this VM's guest now runs on another host.
     pub(super) fn migrated_away(&self) -> bool {
         self.migrated_away.load(Ordering::Acquire)
@@ -577,7 +593,11 @@ impl LeaseOwner for VmController {
             "a migration thread ended without closing its \
             claim"
         );
-        let end = self.run.abandon_migration(|| self.release_pause());
+        let end = self.run.abandon_migration(run_state::Abandoned {
+            confirmed: self.source_committed(),
+            resume_devices: || self.resume_devices_after_migration(),
+            release: || self.release_pause(),
+        });
         self.ended(end.map(|()| true));
     }
 }
@@ -916,6 +936,7 @@ mod tests {
             VmRunState::Faulted,
             VmRunState::ImportFailed,
             VmRunState::ImportInDoubt,
+            VmRunState::ImportCommitted,
         ] {
             assert_eq!(VmRunState::from_u8(state as u8), state);
         }
@@ -938,5 +959,7 @@ mod tests {
         assert_eq!(json, r#""import-failed""#);
         let json = serde_json::to_string(&VmRunState::ImportInDoubt).unwrap();
         assert_eq!(json, r#""import-in-doubt""#);
+        let json = serde_json::to_string(&VmRunState::ImportCommitted).unwrap();
+        assert_eq!(json, r#""import-committed""#);
     }
 }

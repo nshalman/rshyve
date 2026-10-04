@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Barrier};
 
 use VmRunState::{
-    Faulted, ImportFailed, ImportInDoubt, Migrating, Paused, Running, Stopped,
-    Stopping,
+    Faulted, ImportCommitted, ImportFailed, ImportInDoubt, Migrating, Paused,
+    Running, Stopped, Stopping,
 };
 
 fn import(run: &RunControl) -> Result<(), String> {
@@ -528,15 +528,8 @@ fn only_a_migrated_source_is_reaped() {
 
 #[test]
 fn a_migration_ends_in_the_state_its_pause_says() {
-    // A destination that failed after the source committed, before it
-    // resumed the guest.
+    // A destination that resumed the guest.
     let run = RunControl::new(Paused);
-    import(&run).expect("claim");
-    assert!(run.commit());
-    assert_eq!(run.fail_import(true, ok), Ok(true));
-    assert_eq!(run.get(), Paused);
-
-    // One that resumed the guest.
     import(&run).expect("claim");
     run.release_migration(ok, || true).expect("released");
     assert_eq!(run.end_migration(ok), Ok(true));
@@ -664,12 +657,31 @@ fn an_ended_migration_drops_its_wakers() {
     assert_eq!(Arc::strong_count(&socket), 1, "the socket clone leaked");
 }
 
-struct Owner(RunControl);
+struct Owner {
+    run: RunControl,
+    /// Whether the source's commit reached this import.
+    confirmed: bool,
+    resumed: AtomicUsize,
+}
+
+fn owner(run: RunControl) -> Owner {
+    Owner {
+        run,
+        confirmed: false,
+        resumed: AtomicUsize::new(0),
+    }
+}
 
 impl LeaseOwner for Owner {
     fn abandon(&self) {
-        self.0
-            .abandon_migration(|| -> Result<(), ()> { panic!("released") })
+        self.run
+            .abandon_migration(Abandoned {
+                confirmed: self.confirmed,
+                resume_devices: || {
+                    self.resumed.fetch_add(1, Ordering::AcqRel);
+                },
+                release: || -> Result<(), ()> { panic!("released") },
+            })
             .expect("abandoned");
     }
 }
@@ -684,30 +696,117 @@ fn unwind_with_a_lease(owner: &Owner) {
 
 #[test]
 fn an_unwound_migration_faults_a_vm_it_paused() {
-    let owner = Owner(parked_source());
+    let owner = owner(parked_source());
     unwind_with_a_lease(&owner);
-    assert_eq!(owner.0.get(), Faulted);
-    assert!(!owner.0.topology.ejects_held());
+    assert_eq!(owner.run.get(), Faulted);
+    assert!(!owner.run.topology.ejects_held());
 
     let calls = Calls::default();
-    stop(&owner.0, &calls).expect("stop");
+    stop(&owner.run, &calls).expect("stop");
     assert_eq!(calls.counts(), (0, 1, 1));
 }
 
 #[test]
 fn an_unwound_import_can_be_retried() {
-    let owner = Owner(RunControl::new(Paused));
-    import(&owner.0).expect("claim");
+    let owner = owner(RunControl::new(Paused));
+    import(&owner.run).expect("claim");
     unwind_with_a_lease(&owner);
-    assert_eq!(owner.0.get(), ImportFailed);
-    import(&owner.0).expect("retry");
+    assert_eq!(owner.run.get(), ImportFailed);
+    import(&owner.run).expect("retry");
+}
+
+#[test]
+fn an_unwind_after_the_devices_parked_puts_them_back() {
+    // The vCPUs still run, and would run against dead device rings.
+    let owner = owner(RunControl::new(Running));
+    owner.run.admit_source(|| None).expect("claim");
+    owner.run.parking_devices();
+    unwind_with_a_lease(&owner);
+    assert_eq!(owner.run.get(), Running);
+    assert_eq!(owner.resumed.load(Ordering::Acquire), 1);
+    assert!(!owner.run.topology.ejects_held());
+}
+
+#[test]
+fn an_unwind_after_a_rollback_resumed_the_devices_runs_the_vm() {
+    let owner = owner(RunControl::new(Running));
+    owner.run.admit_source(|| None).expect("claim");
+    owner.run.parking_devices();
+    owner.run.devices_resumed();
+    unwind_with_a_lease(&owner);
+    assert_eq!(owner.run.get(), Running);
+    assert_eq!(owner.resumed.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn an_unwound_import_that_said_it_was_ready_keeps_the_guest() {
+    // Faulted takes only a stop, which would discard what may be the
+    // only copy of the guest.
+    for (confirmed, to) in [(false, ImportInDoubt), (true, ImportCommitted)] {
+        let mut owner = owner(RunControl::new(Paused));
+        owner.confirmed = confirmed;
+        import(&owner.run).expect("claim");
+        assert!(owner.run.commit());
+        unwind_with_a_lease(&owner);
+        assert_eq!(owner.run.get(), to);
+        assert!(import(&owner.run).is_err(), "{to:?} took a retry");
+    }
+}
+
+#[test]
+fn an_unwound_import_whose_devices_started_is_faulted() {
+    let owner = owner(RunControl::new(Paused));
+    import(&owner.run).expect("claim");
+    assert!(owner.run.commit());
+    owner.run.devices_resumed();
+    unwind_with_a_lease(&owner);
+    assert_eq!(owner.run.get(), Faulted);
+}
+
+#[test]
+fn an_import_the_source_committed_to_takes_no_second_import() {
+    // The source stays paused, so another import would overwrite the
+    // only copy of the guest. A plain resume and a stop are safe.
+    let run = RunControl::new(Paused);
+    import(&run).expect("claim");
+    assert!(run.commit());
+    assert_eq!(run.fail_import(true, ok), Ok(true));
+    assert_eq!(run.get(), ImportCommitted);
+    assert!(run.held());
+    assert_eq!(import(&run), Err(HOLDS_THE_GUEST.to_string()));
+
+    run.change(ImportCommitted, Running, |held| {
+        *held = false;
+        step_ok()
+    })
+    .expect("resume");
+    assert_eq!(run.get(), Running);
+}
+
+#[test]
+fn a_committed_import_that_will_not_resume_is_kept_for_a_stop_or_resume() {
+    // The final resume failed and the devices parked again.
+    let run = RunControl::new(Paused);
+    import(&run).expect("claim");
+    assert!(run.commit());
+    run.devices_resumed();
+    assert_eq!(
+        run.release_migration(|| Err("EBUSY"), || true),
+        Err(Some("EBUSY"))
+    );
+    assert_eq!(run.fail_import(true, ok), Ok(true));
+    assert_eq!(run.get(), ImportCommitted);
+
+    let calls = Calls::default();
+    stop(&run, &calls).expect("stop");
+    assert_eq!(calls.counts(), (0, 1, 1));
 }
 
 #[test]
 fn a_released_lease_leaves_the_state_alone() {
-    let owner = Owner(parked_source());
+    let owner = owner(parked_source());
     MigrationLease::new(&owner).release();
-    assert_eq!(owner.0.get(), Migrating);
+    assert_eq!(owner.run.get(), Migrating);
 }
 
 #[test]

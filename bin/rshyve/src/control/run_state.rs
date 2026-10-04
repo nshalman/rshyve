@@ -15,6 +15,7 @@
 //! | `Faulted`   | pause held, devices may run; only a stop is taken    |
 //! | `ImportFailed`  | as `Paused`, guest half written; retry or stop   |
 //! | `ImportInDoubt` | as `Paused`; may hold the only copy of the guest |
+//! | `ImportCommitted` | as `Paused`; holds the only copy of the guest  |
 //!
 //! "Pause held" is this controller's hold on the kernel pause. Only a
 //! caller under `changing` takes or gives it back, so a stop always
@@ -55,6 +56,11 @@ pub(super) const IN_DOUBT: &str =
     "the import never heard the source commit; the source may have \
      handed over and this VM may hold the only copy of the guest. Check \
      the source, then resume with force, or stop";
+
+/// Why a VM that holds a committed import refuses another import.
+pub(super) const HOLDS_THE_GUEST: &str =
+    "the source committed and this VM holds the only copy of the guest; \
+     resume it, or stop";
 
 /// Why a VM whose import failed refuses a resume.
 pub(super) const IMPORT_FAILED: &str =
@@ -97,6 +103,9 @@ struct Hold {
     /// pause.
     migration: Option<Role>,
     committed: bool,
+    /// The migration's devices are parked. Set before the source parks
+    /// them, so an unwind part way still finds them.
+    parked: bool,
     /// A release failed and the devices could not be parked again.
     faulted: bool,
 }
@@ -141,6 +150,16 @@ pub(super) trait LeaseOwner {
     fn abandon(&self);
 }
 
+/// What an unwound migration thread left behind it.
+pub(super) struct Abandoned<R, D> {
+    /// The source's commit reached this import.
+    pub(super) confirmed: bool,
+    /// Puts back to work devices the migration parked.
+    pub(super) resume_devices: D,
+    /// Gives back the pause a stop left for the migration's end.
+    pub(super) release: R,
+}
+
 /// Held by a migration thread for as long as it may touch the VM, so
 /// an unwind still ends the claim, the eject hold and the pause.
 pub(super) struct MigrationLease<'a, O: LeaseOwner>(&'a O);
@@ -150,7 +169,6 @@ impl<'a, O: LeaseOwner> MigrationLease<'a, O> {
         Self(owner)
     }
 
-    /// The thread ended its migration itself.
     pub(super) fn release(self) {
         std::mem::forget(self);
     }
@@ -340,8 +358,12 @@ impl RunControl {
         };
         let topology = self.lock_topology();
         let from = self.get();
-        if from == VmRunState::ImportInDoubt {
-            return Err(IN_DOUBT.to_string());
+        match from {
+            VmRunState::ImportInDoubt => return Err(IN_DOUBT.to_string()),
+            VmRunState::ImportCommitted => {
+                return Err(HOLDS_THE_GUEST.to_string());
+            }
+            _ => {}
         }
         if from != VmRunState::Paused && from != VmRunState::ImportFailed {
             return Err(NOT_PAUSED.to_string());
@@ -364,6 +386,8 @@ impl RunControl {
     ) {
         hold.migration = Some(role);
         hold.committed = false;
+        // An import starts from a VM whose devices are parked.
+        hold.parked = role == Role::Dest;
         hold.faulted = false;
         self.cancel.store(false, Ordering::Release);
         *self.lock_wakers() = Wakers::default();
@@ -410,6 +434,16 @@ impl RunControl {
         if spawned.is_err() {
             wake(&self.wakers);
         }
+    }
+
+    /// The source is about to park its devices.
+    pub(super) fn parking_devices(&self) {
+        self.lock_changing().parked = true;
+    }
+
+    /// The migration put its devices back to work.
+    pub(super) fn devices_resumed(&self) {
+        self.lock_changing().parked = false;
     }
 
     /// Take the kernel pause for a migration. `Err(None)` when a stop
@@ -459,7 +493,9 @@ impl RunControl {
             return Ok(());
         }
         if let Err(e) = release() {
-            if !repark() {
+            if repark() {
+                hold.parked = true;
+            } else {
                 hold.faulted = true;
             }
             return Err(Some(e));
@@ -484,7 +520,7 @@ impl RunControl {
     }
 
     /// End an import that failed. `confirmed` when the source's commit
-    /// arrived, so this VM holds the guest.
+    /// arrived, so this VM holds the only copy of the guest.
     pub(super) fn fail_import<E>(
         &self,
         confirmed: bool,
@@ -492,10 +528,7 @@ impl RunControl {
     ) -> Result<bool, E> {
         self.end(
             |hold| match by_pause(hold) {
-                VmRunState::Paused if !confirmed && hold.committed => {
-                    VmRunState::ImportInDoubt
-                }
-                VmRunState::Paused if !confirmed => VmRunState::ImportFailed,
+                VmRunState::Paused => paused_import(hold, confirmed),
                 other => other,
             },
             release,
@@ -517,24 +550,29 @@ impl RunControl {
     }
 
     /// End a migration thread that unwound. Nothing says how far it
-    /// got, so a VM it paused is `Faulted`, unless it is an import that
-    /// had not yet said it was ready.
+    /// got. A VM it did not pause runs, with any devices it parked put
+    /// back to work. An import whose devices are still parked ends as a
+    /// failed import would. Anything else it paused is `Faulted`.
     pub(super) fn abandon_migration<E>(
         &self,
-        release: impl FnOnce() -> Result<(), E>,
+        left: Abandoned<impl FnOnce() -> Result<(), E>, impl FnOnce()>,
     ) -> Result<(), E> {
         let mut hold = self.lock_changing();
         let Some(role) = hold.migration else {
             return Ok(());
         };
         let to = if !hold.held {
+            if hold.parked {
+                (left.resume_devices)();
+                hold.parked = false;
+            }
             VmRunState::Running
-        } else if role == Role::Dest && !hold.committed {
-            VmRunState::ImportFailed
+        } else if role == Role::Dest && hold.parked && !hold.faulted {
+            paused_import(&hold, left.confirmed)
         } else {
             VmRunState::Faulted
         };
-        self.end_locked(&mut hold, |_| to, release).map(drop)
+        self.end_locked(&mut hold, |_| to, left.release).map(drop)
     }
 
     fn end<E>(
@@ -724,6 +762,17 @@ fn wake(wakers: &Mutex<Wakers>) {
     };
     for waker in list {
         waker();
+    }
+}
+
+/// Where an import that ended with its devices parked goes.
+fn paused_import(hold: &Hold, confirmed: bool) -> VmRunState {
+    if confirmed {
+        VmRunState::ImportCommitted
+    } else if hold.committed {
+        VmRunState::ImportInDoubt
+    } else {
+        VmRunState::ImportFailed
     }
 }
 
