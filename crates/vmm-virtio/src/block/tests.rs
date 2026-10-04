@@ -70,6 +70,7 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         read_only: true,
         nodelete: false,
         num_queues: 0,
+        features: AtomicU64::new(0),
         workers_per_queue: 0,
         io_txs: Vec::new(),
         next_worker: Vec::new(),

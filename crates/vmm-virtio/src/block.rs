@@ -21,7 +21,7 @@
 //! paths corrupt the used index.
 
 use std::fs::File;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -54,7 +54,7 @@ mod worker;
 use crate::access::{GuestAccess, RingTag, Session};
 use crate::pci::intr::{BackendIntr, IntrSlot};
 use access::BackendBarrier;
-use io::{parse_header, write_status};
+use io::{parse_header, write_status, ReqLimits};
 use worker::{blk_io_worker, needs_backend, BlkIoRequest, WorkerCtx};
 
 /// Default I/O workers for a single-queue virtio-blk device.
@@ -126,6 +126,9 @@ pub struct VirtioBlock {
     nodelete: bool,
     /// Number of request queues (1 = single queue, >1 = multiqueue).
     num_queues: u16,
+    /// Feature bits the driver accepted. They set which request limits
+    /// apply.
+    features: AtomicU64,
     /// Number of I/O worker threads per queue.
     workers_per_queue: usize,
     /// Per-worker I/O sender channels (flat: queue_idx * workers_per_queue + worker_idx).
@@ -224,6 +227,7 @@ impl VirtioBlock {
             read_only: opts.read_only,
             nodelete: opts.nodelete,
             num_queues,
+            features: AtomicU64::new(0),
             workers_per_queue,
             io_txs,
             next_worker,
@@ -379,7 +383,9 @@ impl VirtioBlock {
         };
         // Segment count and segment size are the guest's to pick, so
         // the advertised limits hold only where they are checked.
-        let Some(data_bytes) = io::span(chain) else {
+        let limits =
+            ReqLimits::negotiated(self.features.load(Ordering::Acquire));
+        let Some(data_bytes) = io::span(chain, &limits) else {
             return Err(refuse(chain));
         };
 
@@ -514,10 +520,10 @@ impl VirtioDevice for VirtioBlock {
         f
     }
 
-    fn set_features(&self, _features: u64) {
-        // Every bit this device offers changes what the guest may ask
-        // for, not how the device answers, and the queues are told what
-        // was negotiated by the transport.
+    fn set_features(&self, features: u64) {
+        // SEG_MAX and SIZE_MAX set the request limits. The queues are
+        // told what was negotiated by the transport.
+        self.features.store(features, Ordering::Release);
     }
 
     fn cfg_read(&self, offset: u16, len: u8) -> u32 {
@@ -696,6 +702,7 @@ impl VirtioDevice for VirtioBlock {
     /// on a vCPU.
     fn reset(&self) {
         self.retire_rings(None);
+        self.features.store(0, Ordering::Release);
     }
 }
 

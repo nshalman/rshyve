@@ -34,16 +34,62 @@ pub(super) const MAX_SEGMENTS: usize = SEG_MAX as usize;
 /// `size_max`, which is the most a driver that reads them can build.
 pub(super) const MAX_REQ_BYTES: usize = MAX_SEGMENTS * SIZE_MAX as usize;
 
-/// Fold the data segments of a chain, refusing one that runs past the
-/// advertised limits.
+/// Bytes one request may move when the driver did not agree to both
+/// limits. edk2's VirtioBlkDxe negotiates neither and puts a read of up
+/// to 1 GiB in one descriptor.
+pub(super) const MAX_UNLIMITED_REQ_BYTES: usize = 1 << 30;
+
+/// The bounds a request is held to.
+///
+/// VirtIO 1.3 sec 5.2.3: `seg_max` and `size_max` bind the driver only
+/// when it negotiated the feature bit. A driver that did not may send
+/// a larger segment, and refusing it fails a correct request. The
+/// firmware loads its boot file that way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReqLimits {
+    segments: usize,
+    seg_bytes: u32,
+    total: usize,
+}
+
+impl ReqLimits {
+    /// The bounds that apply when no segment limit was negotiated.
+    pub(super) const UNLIMITED: Self = Self {
+        segments: usize::MAX,
+        seg_bytes: u32::MAX,
+        total: MAX_UNLIMITED_REQ_BYTES,
+    };
+
+    /// The bounds for the negotiated feature bits.
+    pub(super) fn negotiated(features: u64) -> Self {
+        let seg_max = features & bits::VIRTIO_BLK_F_SEG_MAX != 0;
+        let size_max = features & bits::VIRTIO_BLK_F_SIZE_MAX != 0;
+        Self {
+            segments: if seg_max { MAX_SEGMENTS } else { usize::MAX },
+            seg_bytes: if size_max { SIZE_MAX } else { u32::MAX },
+            total: if seg_max && size_max {
+                MAX_REQ_BYTES
+            } else {
+                MAX_UNLIMITED_REQ_BYTES
+            },
+        }
+    }
+}
+
+/// Fold the data segments of a chain, refusing one that runs past
+/// `limits`.
 ///
 /// Publishing `size_max` and `seg_max` bounds nothing on its own. The
 /// guest builds the chain and picks both numbers, so they hold only
 /// where they are checked.
-fn fold(chain: &[ChainBuf], pick: impl Fn(&ChainBuf) -> bool) -> Option<usize> {
+fn fold(
+    chain: &[ChainBuf],
+    limits: &ReqLimits,
+    pick: impl Fn(&ChainBuf) -> bool,
+) -> Option<usize> {
     let end = chain.len().checked_sub(1)?;
     let data = chain.get(1..end)?;
-    if data.len() > MAX_SEGMENTS {
+    if data.len() > limits.segments {
         return None;
     }
     let mut total = 0usize;
@@ -54,11 +100,11 @@ fn fold(chain: &[ChainBuf], pick: impl Fn(&ChainBuf) -> bool) -> Option<usize> {
                 *len
             }
         };
-        if len > SIZE_MAX {
+        if len > limits.seg_bytes {
             return None;
         }
         total = total.checked_add(len as usize)?;
-        if total > MAX_REQ_BYTES {
+        if total > limits.total {
             return None;
         }
         if pick(buf) {
@@ -70,13 +116,16 @@ fn fold(chain: &[ChainBuf], pick: impl Fn(&ChainBuf) -> bool) -> Option<usize> {
 
 /// Bytes a chain names in either direction, which is what the
 /// sector-range check must cover.
-pub(super) fn span(chain: &[ChainBuf]) -> Option<usize> {
-    fold(chain, |_| true)
+pub(super) fn span(chain: &[ChainBuf], limits: &ReqLimits) -> Option<usize> {
+    fold(chain, limits, |_| true)
 }
 
 /// Bytes a chain moves in the request's own direction.
+///
+/// The chain passed [`span`] under the negotiated limits before it was
+/// dispatched, so only the loosest bound is checked again here.
 pub(super) fn transfer(chain: &[ChainBuf], writable: bool) -> Option<usize> {
-    fold(chain, |buf| {
+    fold(chain, &ReqLimits::UNLIMITED, |buf| {
         matches!(buf, ChainBuf::Writable { .. }) == writable
     })
 }

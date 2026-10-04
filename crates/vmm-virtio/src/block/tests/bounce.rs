@@ -337,18 +337,129 @@ fn a_chain_past_the_advertised_limits_is_refused() {
         .collect()
     };
 
+    let agreed = ReqLimits::negotiated(
+        bits::VIRTIO_BLK_F_SEG_MAX | bits::VIRTIO_BLK_F_SIZE_MAX,
+    );
     assert_eq!(
-        io::span(&build(io::MAX_SEGMENTS, SIZE_MAX)),
+        io::span(&build(io::MAX_SEGMENTS, SIZE_MAX), &agreed),
         Some(io::MAX_REQ_BYTES)
     );
     assert_eq!(
-        io::span(&build(io::MAX_SEGMENTS + 1, 512)),
+        io::span(&build(io::MAX_SEGMENTS + 1, 512), &agreed),
         None,
         "a chain past seg_max was accepted"
     );
     assert_eq!(
-        io::span(&build(1, SIZE_MAX + 1)),
+        io::span(&build(1, SIZE_MAX + 1), &agreed),
         None,
         "a segment past size_max was accepted"
+    );
+
+    // A driver that agreed to no limit is still held to the cap.
+    let none = ReqLimits::negotiated(0);
+    assert_eq!(none, ReqLimits::UNLIMITED);
+    assert_eq!(
+        io::span(&build(1, io::MAX_UNLIMITED_REQ_BYTES as u32 + 1), &none),
+        None,
+        "a request past the cap was accepted"
+    );
+    assert_eq!(
+        io::span(&build(2, io::MAX_UNLIMITED_REQ_BYTES as u32 / 2 + 1), &none),
+        None,
+        "two segments past the cap were accepted"
+    );
+}
+
+/// The read edk2 made to load the boot file: one 832 KiB descriptor.
+/// The firmware negotiates neither SEG_MAX nor SIZE_MAX, so the
+/// advertised limits do not bind it.
+const FIRMWARE_READ: usize = 0xd_0000;
+
+/// Header, one large data segment, status byte, as the firmware
+/// builds them.
+fn firmware_chain(hdr: u64, data: u64, status: u64) -> Vec<ChainBuf> {
+    vec![
+        ChainBuf::Readable {
+            addr: hdr,
+            len: BLK_REQ_HEADER_SIZE as u32,
+        },
+        ChainBuf::Writable {
+            addr: data,
+            len: FIRMWARE_READ as u32,
+        },
+        ChainBuf::Writable {
+            addr: status,
+            len: 1,
+        },
+    ]
+}
+
+#[test]
+fn a_segment_past_size_max_is_accepted_when_size_max_was_not_negotiated() {
+    let physmap = guest_memory();
+    let header = VirtioBlkReqHdr {
+        rtype: bits::VIRTIO_BLK_T_IN,
+        _reserved: 0,
+        sector: 0,
+    };
+    physmap
+        .lookup(HDR_GPA, BLK_REQ_HEADER_SIZE)
+        .expect("mapped request header")
+        .write(&header)
+        .expect("write request header");
+    let chain = firmware_chain(HDR_GPA, RECYCLED_GPA, STATUS_GPA);
+    let block = make_test_block(2 * FIRMWARE_READ as u64);
+
+    // What edk2's VirtioBlkDxe accepts of the offered bits.
+    block.set_features(bits::VIRTIO_BLK_F_FLUSH);
+    assert!(
+        block.check_request(&chain, &physmap).is_ok(),
+        "the firmware's boot file read was refused"
+    );
+
+    // Linux agrees to both limits and is held to them.
+    block.set_features(
+        bits::VIRTIO_BLK_F_FLUSH
+            | bits::VIRTIO_BLK_F_SEG_MAX
+            | bits::VIRTIO_BLK_F_SIZE_MAX,
+    );
+    assert!(block.check_request(&chain, &physmap).is_err());
+
+    // A reset forgets the last driver's agreement.
+    VirtioDevice::reset(&block);
+    assert!(block.check_request(&chain, &physmap).is_ok());
+}
+
+#[test]
+fn a_worker_reads_a_segment_past_size_max() {
+    let physmap =
+        Arc::new(PhysMap::new_anon(0x100000, 0x200000).expect("guest memory"));
+    let base = 0x100000u64;
+    let data = base + 0x10000;
+
+    let disk: Vec<u8> = (0..FIRMWARE_READ).map(|i| (i / 4096) as u8).collect();
+    let file = backing(&disk);
+    let ctx = worker_ctx(&physmap);
+    let limits = writable_disk((FIRMWARE_READ / SECTOR) as u64);
+    let mut queue = VirtQueue::new(8);
+    queue.set_addr_modern(base + 0x2000, base + 0x3000, base + 0x4000);
+
+    let req = BlkIoRequest {
+        rtype: bits::VIRTIO_BLK_T_IN,
+        sector: 0,
+        chain: firmware_chain(base, data, base + 0x1000),
+        head: 3,
+        completion: detached_completion(&queue, &physmap),
+        tag: current_tag(&ctx.access, 0),
+    };
+    let mut bounce = Bounce::new();
+    assert_eq!(
+        run_request(&file, &limits, &ctx, &mut bounce, &req),
+        Some((3, FIRMWARE_READ as u32 + 1))
+    );
+    assert_eq!(
+        peek(&physmap, data, FIRMWARE_READ),
+        disk,
+        "the boot file read lost bytes"
     );
 }
