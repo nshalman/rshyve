@@ -265,7 +265,6 @@ pub struct MantaBlockOpts {
     pub allow_volatile: bool,
 }
 
-/// Options only the MantaBlock form takes.
 const MANTABLOCK_KEYS: [&str; 3] = ["mantablock=", "volume=", "allow-volatile"];
 
 /// Parse an nvme config: `path[,blk options]`, or

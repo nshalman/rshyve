@@ -2,13 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The control thread: heartbeat, engine-loss detection and Detach
-//! (spec 37 §6, §8).
+//! The control thread: heartbeat, engine-loss detection and Detach.
 //!
-//! The engine counts as lost when the socket closes or carries an Error,
-//! when no Pong comes within the heartbeat limit, or when the oldest
-//! request on the ring is older than the I/O limit. A Pong alone does
-//! not show that the engine makes progress, so both checks run.
+//! A Pong does not show that the engine makes progress, so a request
+//! older than the I/O limit also counts as a lost engine.
 
 use std::time::{Duration, Instant};
 
@@ -23,7 +20,6 @@ use crate::Config;
 /// Longest wait before the thread looks at the halt flag again.
 const TICK: Duration = Duration::from_millis(50);
 
-/// The times the control thread keeps.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Timers {
     heartbeat: Duration,
@@ -51,11 +47,10 @@ pub(crate) fn run<J: Job>(shared: &Shared<J>, mut conn: Conn, t: Timers) {
     if shared.halted() && !shared.is_lost() {
         detach(shared, &mut conn, t);
     }
-    // Dropping `conn` closes the socket. An engine that did not finish
-    // Detach then ends the attachment on its own (spec 37 §7).
+    // An engine that did not finish Detach ends the attachment itself
+    // when the socket closes.
 }
 
-/// Runs the heartbeat until halt or loss.
 fn watch<J: Job>(
     shared: &Shared<J>,
     conn: &mut Conn,
@@ -111,8 +106,7 @@ fn watch<J: Job>(
     Ok(())
 }
 
-/// Sends Detach and waits for Detached: the engine sends it once no
-/// request is in it (spec 37 §6).
+/// The engine answers Detached only once no request is in it.
 fn detach<J: Job>(shared: &Shared<J>, conn: &mut Conn, t: Timers) {
     let until = Instant::now() + t.io_limit.max(t.deadline);
     if conn.send(&Message::Detach, until).is_err() {

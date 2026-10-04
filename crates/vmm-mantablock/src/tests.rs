@@ -233,7 +233,7 @@ impl Engine {
         }
     }
 
-    /// Publishes completions in one batch, waking rust-bhyve if it sleeps.
+    /// Publishes completions in one batch.
     fn post(&mut self, cqes: &[[u8; CQE_BYTES]]) {
         for c in cqes {
             assert!(self.cq.try_push(c).unwrap());

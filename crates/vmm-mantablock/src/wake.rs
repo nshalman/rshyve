@@ -2,11 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The wake-up pipes (spec 37 §2, §4).
+//! The wake-up pipes.
 //!
-//! Each side owns its own end of each pipe, so the engine cannot change
-//! the flags of ours. The ends arrive blocking; both are made
-//! non-blocking here, so a full pipe never stalls a vCPU in `submit`.
+//! The ends arrive blocking. Both are made non-blocking here, so a full
+//! pipe never stalls a vCPU in `submit`.
 
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -16,14 +15,12 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{FileType, OFlags};
 use rustix::io::Errno;
 
-/// Which end of a pipe a descriptor must be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum End {
     Read,
     Write,
 }
 
-/// Checks that `fd` is the `end` of a pipe and makes it non-blocking.
 pub(crate) fn adopt(fd: &OwnedFd, end: End) -> io::Result<()> {
     let st = rustix::fs::fstat(fd)?;
     if FileType::from_raw_mode(st.st_mode) != FileType::Fifo {
@@ -43,8 +40,7 @@ pub(crate) fn adopt(fd: &OwnedFd, end: End) -> io::Result<()> {
     Ok(())
 }
 
-/// Wakes the engine. A full pipe already holds a wake-up, which is
-/// enough. Any other failure means the engine closed its end.
+/// A full pipe already holds a wake-up, which is enough.
 pub(crate) fn wake(fd: &OwnedFd) -> io::Result<()> {
     loop {
         match rustix::io::write(fd, &[1u8]) {
@@ -55,7 +51,6 @@ pub(crate) fn wake(fd: &OwnedFd) -> io::Result<()> {
     }
 }
 
-/// How a wait on the pipe ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Waited {
     /// A wake-up came, or the time ran out. Look at the ring either way.
@@ -64,8 +59,7 @@ pub(crate) enum Waited {
     Gone,
 }
 
-/// Waits up to `limit` for a wake-up, then does one read of at most 64
-/// bytes, as the state machine says: an engine that fills the pipe
+/// One read of at most 64 bytes, so an engine that fills the pipe
 /// cannot keep this thread reading.
 pub(crate) fn wait(fd: &OwnedFd, limit: Duration) -> Waited {
     let ts = Timespec {

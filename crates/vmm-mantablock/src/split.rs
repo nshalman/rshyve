@@ -2,15 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! How a queue's buffer area is cut into slots, and how a request is cut
-//! into parts that fit them.
+//! Buffer slots, and requests cut into parts that fit them.
 //!
-//! Each ring tag owns one fixed slot of `part_blocks` pages. A request
-//! larger than one slot goes as several parts, each with its own tag.
-//! NVMe MDTS is 2 MiB and a backend cannot lower it (spec 37 §8), so this
-//! is the only way a large request fits a small buffer area.
+//! Each ring tag owns one fixed slot of `part_blocks` pages. NVMe MDTS
+//! is 2 MiB and a backend cannot lower it, so a larger request goes as
+//! several parts, each with its own tag.
 
-/// The slots of one queue, from what the engine granted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Slots {
     /// Ring tags in use: at most the ring depth.
@@ -39,18 +36,15 @@ impl Slots {
         })
     }
 
-    /// First buffer page of `tag`'s slot.
     pub(crate) fn page(&self, tag: u16) -> u32 {
         u32::from(tag) * self.part_blocks
     }
 
-    /// Parts a request of `blocks` blocks needs.
     pub(crate) fn parts(&self, blocks: u32) -> u32 {
         blocks.div_ceil(self.part_blocks)
     }
 
-    /// The next part of a request that has sent its first `next` blocks:
-    /// how many blocks it carries.
+    /// Blocks in the part that starts at block `next`.
     pub(crate) fn next_part(&self, blocks: u32, next: u32) -> u32 {
         blocks.saturating_sub(next).min(self.part_blocks)
     }

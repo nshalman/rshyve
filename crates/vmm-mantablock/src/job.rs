@@ -89,7 +89,6 @@ impl Job for BlockRequest {
     }
 }
 
-/// The controller's sink behind the [`Sink`] trait.
 pub(crate) struct Controller(pub(crate) Arc<dyn CompletionSink>);
 
 impl Sink<RequestId> for Controller {
@@ -98,7 +97,6 @@ impl Sink<RequestId> for Controller {
     }
 }
 
-/// The NVMe outcome of an engine status.
 pub(crate) fn block_status(s: Status) -> BlockStatus {
     match s {
         Status::Success => BlockStatus::Success,

@@ -2,12 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The control socket (spec 37 §2, §6).
+//! The control socket.
 //!
 //! illumos cannot bound a blocking AF_UNIX send in time, so the socket is
-//! non-blocking and every read and write waits with `poll` up to a
-//! deadline. Every read is a `recvmsg`, so a descriptor the engine sends
-//! with any frame is taken, and closed unless the frame is AttachOk.
+//! non-blocking and every read and write polls up to a deadline. Every
+//! read is a `recvmsg`, so a descriptor sent with any frame is taken and
+//! closed, not left queued on the socket.
 
 use std::io::{self, IoSliceMut};
 use std::mem::MaybeUninit;
@@ -35,13 +35,11 @@ const RECV_FLAGS: RecvFlags = RecvFlags::empty();
 /// Most descriptors any frame may carry: AttachOk with every queue.
 const MAX_FDS: usize = 1 + 2 * MAX_QUEUES as usize;
 
-/// One frame and the descriptors that came with it.
 pub(crate) struct Frame {
     pub(crate) msg: Message,
     pub(crate) fds: Vec<OwnedFd>,
 }
 
-/// A connection to the engine.
 pub(crate) struct Conn {
     s: UnixStream,
     buf: Vec<u8>,
@@ -62,7 +60,7 @@ impl Conn {
         })
     }
 
-    /// Sends `msg` before `deadline`. Returns its id.
+    /// Returns the frame id.
     pub(crate) fn send(
         &mut self,
         msg: &Message,
@@ -84,8 +82,7 @@ impl Conn {
         Ok(id)
     }
 
-    /// The next frame, waiting until `deadline`. `Ok(None)` when the
-    /// engine closed the socket between frames.
+    /// `Ok(None)` when the engine closed the socket between frames.
     pub(crate) fn recv(
         &mut self,
         deadline: Instant,
@@ -109,7 +106,6 @@ impl Conn {
         }
     }
 
-    /// As [`Conn::recv`], but `Ok(None)` also when nothing is there now.
     pub(crate) fn try_recv(&mut self) -> io::Result<Polled> {
         loop {
             if let Some((msg, _, used)) =
@@ -127,7 +123,7 @@ impl Conn {
         }
     }
 
-    /// Waits until the socket is readable or `deadline` passes.
+    /// A timeout is not an error here.
     pub(crate) fn readable(&self, deadline: Instant) -> io::Result<()> {
         match self.wait(PollFlags::IN, deadline) {
             Err(e) if e.kind() == io::ErrorKind::TimedOut => Ok(()),
@@ -135,7 +131,6 @@ impl Conn {
         }
     }
 
-    /// One `recvmsg`, keeping what it brought.
     fn read_some(&mut self) -> io::Result<Read> {
         let mut chunk = [0u8; MAX_FRAME];
         let mut space =
@@ -200,7 +195,6 @@ impl Conn {
     }
 }
 
-/// What [`Conn::try_recv`] found.
 pub(crate) enum Polled {
     Frame(Frame),
     Empty,
@@ -211,7 +205,6 @@ pub(crate) fn invalid(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
-/// What one `recvmsg` did.
 enum Read {
     Bytes,
     WouldBlock,

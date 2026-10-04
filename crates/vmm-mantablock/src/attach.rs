@@ -2,14 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Hello and Attach (spec 37 §6), and the checks on what comes back.
+//! Hello and Attach.
 //!
-//! rust-bhyve trusts the engine with this volume's data only. Nothing the
-//! engine sends is used before it is checked: the granted geometry must
-//! be no more than was asked and must give the region length the engine
-//! states, the descriptors must be a regular file and pipe ends of the
-//! right direction, the file must be long enough to map, and the region
-//! header must agree with AttachOk.
+//! The engine is trusted with this volume's data and nothing else, so
+//! nothing it sends is used before it is checked.
 
 #![allow(unsafe_code)]
 
@@ -31,7 +27,6 @@ use crate::conn::{invalid, Conn};
 use crate::split::Slots;
 use crate::wake::{adopt, End};
 
-/// What rust-bhyve asks the engine for.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Ask {
     pub(crate) volume: [u8; 16],
@@ -43,7 +38,6 @@ pub(crate) struct Ask {
     pub(crate) allow_volatile: bool,
 }
 
-/// One queue's wake-up pipe ends.
 pub(crate) struct Pipes {
     /// Write end of the engine's pipe.
     pub(crate) wake_engine: OwnedFd,
@@ -51,7 +45,6 @@ pub(crate) struct Pipes {
     pub(crate) wake_me: OwnedFd,
 }
 
-/// A checked attachment, mapped and ready for I/O.
 pub(crate) struct Attached {
     pub(crate) region: Arc<Region>,
     pub(crate) generation: u64,
@@ -61,7 +54,6 @@ pub(crate) struct Attached {
     pub(crate) pipes: Vec<Pipes>,
 }
 
-/// Runs Hello and Attach on `conn` and checks the reply.
 pub(crate) fn attach(
     conn: &mut Conn,
     ask: &Ask,
@@ -74,8 +66,7 @@ pub(crate) fn attach(
     };
     conn.send(&hello, deadline)?;
     match next(conn, deadline)? {
-        // Feature bits are agreed in Hello; this build asks for none, so
-        // an engine that grants one breaks the protocol (spec 37 §9).
+        // This build asks for no features, so a granted one is a bug.
         (Message::HelloAck { version, features }, fds)
             if version == PROTOCOL_VERSION
                 && features == 0
@@ -85,7 +76,7 @@ pub(crate) fn attach(
     conn.send(
         &Message::Attach(Attach {
             volume: ask.volume,
-            // S2 never reattaches: a fresh generation every time (§5).
+            // 0 asks for a new generation. There is no reattach yet.
             generation: 0,
             queues: ask.queues,
             depth: ask.depth,
@@ -160,7 +151,6 @@ fn refused(step: &str, m: &Message) -> io::Error {
     }
 }
 
-/// Checks a grant against what was asked. Returns the geometry.
 pub(crate) fn check_ok(ask: &Ask, ok: &AttachOk) -> Result<Geometry, String> {
     if ok.layout_version != LAYOUT_VERSION {
         return Err(format!("region layout {}", ok.layout_version));
@@ -181,12 +171,10 @@ pub(crate) fn check_ok(ask: &Ask, ok: &AttachOk) -> Result<Geometry, String> {
     if ok.volume_blocks == 0 {
         return Err("an empty volume".into());
     }
-    // The capacity in bytes must fit a u64.
     if ok.volume_blocks.checked_mul(4096).is_none() {
         return Err("the volume is too large".into());
     }
     if ok.flags & ATTACH_DURABLE == 0 && !ask.allow_volatile {
-        // v1 shows VWC 0, so every write must be durable (spec 37 §6).
         return Err("the engine's writes are not durable".into());
     }
     let g = Geometry::new(ok.queues, ok.depth, ok.buf_pages)
@@ -197,8 +185,8 @@ pub(crate) fn check_ok(ask: &Ask, ok: &AttachOk) -> Result<Geometry, String> {
     Ok(g)
 }
 
-/// Maps the region file. It must be a regular file at least as long as
-/// the geometry, or a later access past its end would raise SIGBUS.
+/// A file shorter than the geometry would raise SIGBUS on a later
+/// access past its end.
 fn map(fd: OwnedFd, geometry: Geometry) -> io::Result<Arc<Region>> {
     let st = rustix::fs::fstat(&fd)?;
     if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {

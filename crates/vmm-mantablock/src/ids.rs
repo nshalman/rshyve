@@ -2,17 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Request ids and the watermark of one queue (spec 37 §5).
+//! Request ids and the watermark of one queue.
 //!
-//! `op_id = generation << 64 | queue << 48 | seq`. The sequence starts at
-//! 0 for each queue in each generation and never repeats; the engine and
-//! the log both take a repeated op id as a replay.
+//! `op_id = generation << 64 | queue << 48 | seq`. The sequence must
+//! never repeat in a generation: the engine and the log take a repeated
+//! op id as a replay.
 
 use std::collections::BTreeSet;
 
 use manta_block_ring::OpId;
 
-/// Sequences of one ring queue.
 #[derive(Debug)]
 pub(crate) struct Seqs {
     generation: u64,
@@ -37,9 +36,8 @@ impl Seqs {
         }
     }
 
-    /// The id for the next request, and the watermark to send with it:
-    /// the lowest sequence this queue still holds without a completion,
-    /// this one included.
+    /// The watermark is the lowest sequence still open, this one
+    /// included.
     pub(crate) fn open(&mut self) -> Result<(OpId, u64), Exhausted> {
         let seq = self.next;
         if seq > OpId::MAX_SEQ {
@@ -56,7 +54,6 @@ impl Seqs {
         Ok((id, watermark))
     }
 
-    /// The request with `seq` has its completion.
     pub(crate) fn close(&mut self, seq: u64) {
         self.open.remove(&seq);
     }

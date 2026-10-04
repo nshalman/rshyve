@@ -3,26 +3,18 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! An NVMe backend that sends guest I/O to the MantaBlock engine over a
-//! shared-memory ring (MantaBlock spec 37, the ring spec).
+//! shared-memory ring.
 //!
-//! [`connect`] does Hello and Attach on the engine's socket, checks the
-//! grant, and maps the region. [`Connected::into_factory`] then gives the
-//! NVMe controller its backend: one submission and completion ring per
-//! guest queue, one completion thread per queue, and a control thread for
-//! the heartbeat.
+//! The engine never maps guest memory: data is copied between the guest
+//! and the queue's buffer area.
 //!
-//! The engine never maps guest memory (design decision 9): a write is
-//! copied from the guest into the queue's buffer area before its entry is
-//! published, and a read is copied out to the guest after its completion
-//! is taken. A request larger than one buffer slot goes as several parts.
-//!
-//! What S2 leaves out, on purpose:
+//! Not done yet:
 //!
 //! - **No remote path.** When the engine is lost, every request held
-//!   fails with an internal error. Spec 37 wants them kept and replayed
-//!   to another engine over NVMe-oF (S5); write data is therefore not
-//!   kept past the copy into the ring.
-//! - **No reattach.** Each attach asks for a new generation (spec 37 §5).
+//!   fails with an internal error. They are meant to be replayed to
+//!   another engine later, but write data is not kept past the copy into
+//!   the ring for that yet.
+//! - **No reattach.** Each attach asks for a new generation.
 //! - **No Pause message.** The controller drains every request before it
 //!   pauses, resets or exports, so the ring is empty by then.
 
@@ -73,8 +65,8 @@ pub struct Config {
     /// Empty polls before a completion thread sleeps.
     pub spin: u32,
     /// Take an engine whose writes are not durable when they complete.
-    /// The namespace must then show a volatile write cache. For tests
-    /// and measurement only: spec 37 v1 refuses such an engine.
+    /// For tests and measurement: the namespace must then show a
+    /// volatile write cache.
     pub allow_volatile: bool,
     /// How often to Ping.
     pub heartbeat: Duration,
@@ -151,9 +143,8 @@ impl Connected {
         self.att.durable
     }
 
-    /// The namespace this volume shows: 4 KiB blocks, as the ring moves
-    /// whole pages, and a volatile write cache unless every write is
-    /// durable when it completes.
+    /// 4 KiB blocks, as the ring moves whole pages, and a volatile write
+    /// cache unless every write is durable when it completes.
     pub fn nvme_config(&self) -> NvmeConfig {
         NvmeConfig {
             lba_size: LbaSize::B4096,

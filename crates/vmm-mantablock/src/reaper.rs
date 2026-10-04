@@ -2,13 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! One completion thread per queue (spec 37 §4).
+//! One completion thread per queue.
 //!
-//! It takes every completion the ring holds in one pass and reports them
-//! to the sink in one call, so the controller writes the batch and
-//! raises one MSI for it. When the ring stays empty for the spin budget
-//! it sleeps on its wake-up pipe, following the state machine: set idle,
-//! fence, look again, then wait.
+//! Every completion the ring holds goes to the sink in one call, so the
+//! controller raises one MSI for the batch. Before it sleeps, the thread
+//! must set idle, fence and look again, or it can miss a wake-up.
 
 use std::os::fd::OwnedFd;
 use std::time::Duration;
@@ -21,8 +19,7 @@ use crate::queue::{Lost, Out};
 use crate::ring::Shared;
 use crate::wake::{self, Waited};
 
-/// Longest sleep before the thread looks at the stop flag again. A
-/// wake-up the engine owes arrives well before it.
+/// Bounds how late the thread sees the stop flag.
 const NAP: Duration = Duration::from_millis(50);
 
 pub(crate) fn run<J: Job>(
@@ -68,8 +65,6 @@ pub(crate) fn run<J: Job>(
     }
 }
 
-/// Takes every completion on the ring and reports them in one batch.
-/// Returns how many there were.
 fn reap<J: Job>(
     shared: &Shared<J>,
     q: u16,

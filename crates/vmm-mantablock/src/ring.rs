@@ -19,8 +19,6 @@ use crate::job::{Job, Sink};
 use crate::queue::{Lost, Out, QueueRing, Waiter};
 use crate::{control, reaper, Config};
 
-/// State the vCPU threads, the completion threads and the control thread
-/// share.
 pub(crate) struct Shared<J: Job> {
     pub(crate) queues: Vec<Mutex<QueueRing<J>>>,
     sink: Arc<dyn Sink<J::Id>>,
@@ -62,11 +60,8 @@ impl<J: Job> Shared<J> {
         self.stop.load(Ordering::Acquire) || self.is_lost()
     }
 
-    /// The engine is lost (spec 37 §8). Every request held fails.
-    ///
-    /// S2 has no remote path: spec 37 wants the requests kept and
-    /// replayed over NVMe-oF to another engine (decision 6, option A),
-    /// which is S5. Until then the guest sees an internal error.
+    /// Every request held fails with an internal error. There is no
+    /// replay to another engine yet.
     pub(crate) fn lose(&self, why: Lost) {
         if self.lost.swap(true, Ordering::AcqRel) {
             return;

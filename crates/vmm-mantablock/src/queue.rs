@@ -25,7 +25,7 @@ use crate::job::{block_status, Job};
 use crate::split::Slots;
 use crate::wake;
 
-/// Why the engine counts as lost (spec 37 §8).
+/// Why the engine counts as lost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Lost {
     /// An index moved in a way no correct engine moves it.
@@ -148,7 +148,6 @@ struct Part {
     posted: Instant,
 }
 
-/// One queue's ring pair and what it holds.
 pub(crate) struct QueueRing<J: Job> {
     q: u16,
     region: Arc<Region>,
@@ -254,7 +253,7 @@ impl<J: Job> QueueRing<J> {
     /// The request in ring terms. `Ok(None)` when there is nothing to send.
     fn shape(&self, job: &J) -> Result<Option<Shape>, BlockStatus> {
         let op = match job.op() {
-            // Every completed write is already durable (spec 37 §6).
+            // Every completed write is already durable.
             BlockOp::Flush if self.durable => return Ok(None),
             BlockOp::Flush => return Ok(Some(Shape::flush())),
             BlockOp::Read => Op::Read,
@@ -266,7 +265,7 @@ impl<J: Job> QueueRing<J> {
         let len = job.len();
         let page = PAGE as u64;
         let off = job.byte_offset();
-        // Version 1 serves 4 KiB blocks only (spec 37 §8).
+        // The engine serves 4 KiB blocks only.
         if !off.is_multiple_of(page) || !len.is_multiple_of(PAGE) {
             return Err(BlockStatus::Internal);
         }
@@ -426,8 +425,8 @@ impl<J: Job> QueueRing<J> {
         Ok(())
     }
 
-    /// Takes the completions one reap found. Each must match a part in
-    /// flight; one that does not means the engine is lost.
+    /// A completion that matches no part in flight means the engine is
+    /// lost.
     pub(crate) fn complete(
         &mut self,
         cqes: &[Cqe],
