@@ -209,8 +209,9 @@ pub struct NvmeMigrateState {
 pub enum NvmeMigrateBackend {
     /// A host file or zvol. Paths differ between hosts, so none is kept.
     File,
-    /// A MantaBlock volume, by UUID.
-    MantaBlock { volume: String },
+    /// A MantaBlock volume. A UUID, so a payload naming anything else
+    /// does not decode and the name reaches no log unescaped.
+    MantaBlock { volume: uuid::Uuid },
 }
 
 impl fmt::Display for NvmeMigrateBackend {

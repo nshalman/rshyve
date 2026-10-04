@@ -205,7 +205,7 @@ impl<J: Job> Ring<J> {
     /// The volume, as a migration payload names it.
     pub fn identity(&self) -> NvmeMigrateBackend {
         NvmeMigrateBackend::MantaBlock {
-            volume: self.volume.to_string(),
+            volume: self.volume,
         }
     }
 

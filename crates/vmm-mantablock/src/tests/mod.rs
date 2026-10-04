@@ -427,9 +427,7 @@ fn a_ring_names_its_volume_and_refuses_migration() {
         });
     assert_eq!(
         ring.identity(),
-        vmm_devices::lifecycle::NvmeMigrateBackend::MantaBlock {
-            volume: volume.to_string(),
-        }
+        vmm_devices::lifecycle::NvmeMigrateBackend::MantaBlock { volume }
     );
     assert!(!ring.migratable());
 }

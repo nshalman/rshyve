@@ -765,7 +765,9 @@ mod tests {
         for backend in [
             NvmeMigrateBackend::File,
             NvmeMigrateBackend::MantaBlock {
-                volume: "6f1c2a8e-0000-4000-8000-000000000001".to_string(),
+                volume: "6f1c2a8e-0000-4000-8000-000000000001"
+                    .parse()
+                    .expect("a UUID"),
             },
         ] {
             let payload = with_backend(backend);
@@ -777,6 +779,44 @@ mod tests {
                 Message::deserialize(&data).expect("decode");
             assert_eq!(decoded, payload);
         }
+    }
+
+    fn on_volume(volume: &str) -> String {
+        let text = ron::ser::to_string(&with_backend(
+            vmm_devices::lifecycle::NvmeMigrateBackend::File,
+        ))
+        .expect("encode");
+        let named = text.replace(
+            "backend:Some(File)",
+            &format!("backend:Some(MantaBlock(volume:{volume:?}))"),
+        );
+        assert_ne!(named, text);
+        named
+    }
+
+    #[test]
+    fn a_volume_that_is_not_a_uuid_is_refused() {
+        // The name reaches the destination's log in a refusal, so only
+        // a UUID may get that far.
+        for volume in ["", "vol-1", "6f1c2a8e\n\u{1b}[2J"] {
+            Message::deserialize::<DeviceStatePayload>(
+                on_volume(volume).as_bytes(),
+            )
+            .expect_err(volume);
+        }
+    }
+
+    #[test]
+    fn a_volume_is_the_same_in_either_case() {
+        let lower: DeviceStatePayload = Message::deserialize(
+            on_volume("6f1c2a8e-0000-4000-8000-00000000abcd").as_bytes(),
+        )
+        .expect("lower case");
+        let upper: DeviceStatePayload = Message::deserialize(
+            on_volume("6F1C2A8E-0000-4000-8000-00000000ABCD").as_bytes(),
+        )
+        .expect("upper case");
+        assert_eq!(lower, upper);
     }
 
     #[test]
