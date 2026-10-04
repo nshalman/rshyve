@@ -8,7 +8,7 @@
 //! picks how much it posts. The budget is what keeps that wait short,
 //! and the kick is what keeps a ring it left work in from stalling.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use super::*;
 use crate::pci::notify::BackendKick;
@@ -38,11 +38,19 @@ struct Rig {
     hold: Arc<AtomicBool>,
     /// Bounce chunks that have reached the disk.
     chunks: Arc<AtomicUsize>,
+    /// Milliseconds each chunk takes at the disk.
+    slow_ms: Arc<AtomicU64>,
 }
 
 impl Rig {
     /// One queue holding a read of each length in `lens`, all posted.
     fn new(lens: &[usize]) -> Arc<Self> {
+        Self::build(bits::VIRTIO_BLK_T_IN, lens, budget::OVERSIZED_PAUSE_GRACE)
+    }
+
+    /// One queue holding a request of type `rtype` for each length in
+    /// `lens`, with `grace` as the pause grace.
+    fn build(rtype: u32, lens: &[usize], grace: Duration) -> Arc<Self> {
         let physmap =
             Arc::new(PhysMap::new_anon(BASE, MEM).expect("guest memory"));
         let file = tempfile::tempfile().expect("create tempfile");
@@ -54,6 +62,7 @@ impl Rig {
             Arc::clone(&physmap),
             1,
             LIMIT,
+            grace,
         )
         .expect("create VirtioBlock");
 
@@ -68,7 +77,7 @@ impl Rig {
                 .lookup(hdr, BLK_REQ_HEADER_SIZE)
                 .expect("mapped header")
                 .write(&VirtioBlkReqHdr {
-                    rtype: bits::VIRTIO_BLK_T_IN,
+                    rtype,
                     _reserved: 0,
                     sector,
                 })
@@ -84,7 +93,11 @@ impl Rig {
                 VirtqDesc {
                     addr: data,
                     len: len as u32,
-                    flags: bits::VRING_DESC_F_NEXT | bits::VRING_DESC_F_WRITE,
+                    flags: if rtype == bits::VIRTIO_BLK_T_IN {
+                        bits::VRING_DESC_F_NEXT | bits::VRING_DESC_F_WRITE
+                    } else {
+                        bits::VRING_DESC_F_NEXT
+                    },
                     next: first + 2,
                 },
                 VirtqDesc {
@@ -109,13 +122,18 @@ impl Rig {
 
         let hold = Arc::new(AtomicBool::new(false));
         let chunks = Arc::new(AtomicUsize::new(0));
-        let (held, seen) = (Arc::clone(&hold), Arc::clone(&chunks));
+        let slow_ms = Arc::new(AtomicU64::new(0));
+        let (held, seen, slow) =
+            (Arc::clone(&hold), Arc::clone(&chunks), Arc::clone(&slow_ms));
         *block.ctx.parks.each_backend.lock().expect("park lock") =
             Some(Arc::new(move || {
                 seen.fetch_add(1, Ordering::AcqRel);
                 while held.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(1));
                 }
+                thread::sleep(Duration::from_millis(
+                    slow.load(Ordering::Acquire),
+                ));
             }));
 
         let rig = Arc::new(Rig {
@@ -125,6 +143,7 @@ impl Rig {
             live: AtomicBool::new(true),
             hold,
             chunks,
+            slow_ms,
         });
         let weak = Arc::downgrade(&rig);
         rig.block.install_kick(BackendKick::new(move |queue_idx| {
@@ -163,6 +182,10 @@ impl Rig {
 
     fn chunks(&self) -> usize {
         self.chunks.load(Ordering::Acquire)
+    }
+
+    fn slow(&self, ms: u64) {
+        self.slow_ms.store(ms, Ordering::Release);
     }
 }
 
@@ -463,29 +486,144 @@ fn a_parked_worker_answers_a_request_that_reaches_it_late() {
     rig.block.resume();
 }
 
-/// A request larger than the budget is not bounded by it, so a pause
-/// stops it between bounce chunks. It stays owed, so the device does
-/// not report quiet, and the resume finishes it.
+/// A request larger than the budget is not bounded by it. The pause
+/// closes admission and lets that one request run on, so one that ends
+/// inside the grace does not fail the pause.
 #[test]
-fn a_pause_stops_a_request_past_the_budget_between_chunks() {
-    let big = 2 * LIMIT as usize;
-    let rig = Rig::new(&[big]);
-    rig.hold(true);
+fn a_pause_waits_for_a_request_past_the_budget_inside_the_grace() {
+    const BIG: usize = 4 * LIMIT as usize;
+    let rig = Rig::build(bits::VIRTIO_BLK_T_IN, &[BIG], Duration::from_secs(5));
+    rig.slow(10);
     rig.kick(0);
-    assert_eq!(rig.taken(), 1);
+    wait_for("the request never reached the disk", || rig.chunks() > 0);
 
     rig.block.pause();
-    rig.hold(false);
-    let gate = Arc::clone(&rig.block.gate);
-    wait_for("a worker kept running in a pause", || gate.is_quiesced());
-    thread::sleep(Duration::from_millis(100));
+    wait_for("the pause stopped a request inside the grace", || {
+        rig.block.is_quiesced()
+    });
+    assert_eq!(rig.used(), 1);
+    assert_eq!(rig.chunks(), BIG / REQ);
+    assert_eq!(peek(&rig.physmap, STATUS), bits::VIRTIO_BLK_S_OK);
+    assert_eq!(rig.in_flight(), (0, 0));
+    rig.block.resume();
+}
+
+/// One that runs past the grace stops between chunks, still owed, so
+/// the device does not report quiet and that pause fails. After the
+/// resume the request ends, and the next pause succeeds.
+#[test]
+fn a_request_past_the_grace_fails_the_pause_until_a_retry() {
+    const BIG: usize = 4 * LIMIT as usize;
+    let rig =
+        Rig::build(bits::VIRTIO_BLK_T_IN, &[BIG], Duration::from_millis(200));
+    // 16 chunks of 25 ms: 400 ms if nothing stops it.
+    rig.slow(25);
+    rig.kick(0);
+    wait_for("the request never reached the disk", || rig.chunks() > 0);
+
+    let at_pause = rig.chunks();
+    rig.block.pause();
+    thread::sleep(Duration::from_secs(1));
+    let moved = rig.chunks();
+    assert!(moved > at_pause, "the pause stopped it inside the grace");
+    assert!(moved < BIG / REQ, "it ran on past the grace");
     assert_eq!(rig.used(), 0, "the request ran on through the pause");
     assert!(!rig.block.is_quiesced(), "quiet with a request half done");
 
     rig.block.resume();
     wait_for("the resume did not finish the request", || rig.used() == 1);
     assert_eq!(peek(&rig.physmap, STATUS), bits::VIRTIO_BLK_S_OK);
+    rig.block.pause();
+    wait_for("the retry did not quiesce", || rig.block.is_quiesced());
     assert_eq!(rig.in_flight(), (0, 0));
+    rig.block.resume();
+}
+
+/// A flush must not sync while a request past the budget is part way
+/// through. A drain does not stop such a request, and the flush waits
+/// for it to end.
+#[test]
+fn a_flush_waits_for_a_write_past_the_budget() {
+    const BIG: usize = 4 * LIMIT as usize;
+    let rig = Rig::build(
+        bits::VIRTIO_BLK_T_OUT,
+        &[BIG],
+        budget::OVERSIZED_PAUSE_GRACE,
+    );
+    rig.slow(10);
+    rig.kick(0);
+    wait_for("the write never reached the disk", || rig.chunks() > 0);
+
+    rig.block
+        .flush_backing(FlushIntent::Durable)
+        .expect("flush the disk");
+    assert_eq!(rig.chunks(), BIG / REQ, "synced with the write half done");
+    assert_eq!(rig.used(), 1);
+    assert_eq!(peek(&rig.physmap, STATUS), bits::VIRTIO_BLK_S_OK);
+}
+
+/// A worker the drain parked can still take work that was on its way
+/// to it. The flush must wait for that work too.
+#[test]
+fn a_flush_waits_for_work_a_parked_worker_takes() {
+    let rig = Rig::new(&[REQ]);
+    let (at_tx, at_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let go_rx = Mutex::new(go_rx);
+    *rig.block
+        .ctx
+        .parks
+        .before_dispatch
+        .lock()
+        .expect("park lock") = Some(Arc::new(move || {
+        at_tx.send(()).expect("report the park");
+        go_rx
+            .lock()
+            .expect("go lock")
+            .recv()
+            .expect("wait for the test");
+    }));
+    let kicker = {
+        let rig = Arc::clone(&rig);
+        thread::spawn(move || rig.kick(0))
+    };
+    at_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the request never reached the dispatch");
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let flusher = {
+        let rig = Arc::clone(&rig);
+        thread::spawn(move || {
+            let flushed = rig.block.flush_backing(FlushIntent::Durable);
+            done_tx.send(rig.used()).expect("report the flush");
+            flushed
+        })
+    };
+    let gate = Arc::clone(&rig.block.gate);
+    wait_for("the drain did not park the workers", || gate.is_quiesced());
+
+    // The workers stay parked with the request queued, so the gate
+    // alone reads quiet.
+    let skip = &rig.block.ctx.parks.parked_skips_work;
+    skip.store(true, Ordering::Release);
+    go_tx.send(()).expect("release the dispatch");
+    kicker.join().expect("kick thread");
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the flush synced with a request queued to a worker"
+    );
+
+    skip.store(false, Ordering::Release);
+    assert_eq!(
+        done_rx.recv_timeout(Duration::from_secs(5)),
+        Ok(1),
+        "the flush synced before the request was answered"
+    );
+    flusher
+        .join()
+        .expect("flush thread")
+        .expect("flush the disk");
 }
 
 fn peek(physmap: &PhysMap, gpa: u64) -> u8 {

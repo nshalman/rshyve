@@ -18,6 +18,10 @@ const BEST_EFFORT_SYNC_BUDGET: Duration = Duration::from_secs(5);
 /// How often a parked worker looks for work handed to it before the
 /// pause.
 const PARK_POLL: Duration = Duration::from_millis(50);
+/// How often a wait for quiet looks at a condition the gate is not
+/// told about, such as work queued to a worker.
+const IDLE_POLL: Duration = Duration::from_millis(5);
+
 /// Shared pause/drain gate for devices with I/O worker threads.
 ///
 /// WHY a bool predicate and not a future: no caller in this tree is async
@@ -54,6 +58,9 @@ pub struct QuiesceGate {
 struct GateState {
     /// Producers inside [`QuiesceGate::admit`].
     takers: usize,
+    /// When the pause in force started. A pause taken while one is in
+    /// force keeps the first start.
+    paused_at: Option<Instant>,
 }
 
 /// A producer's permission to take work, from [`QuiesceGate::admit`].
@@ -94,7 +101,10 @@ impl QuiesceGate {
             drains: AtomicUsize::new(0),
             drains_started: AtomicUsize::new(0),
             active: AtomicUsize::new(workers),
-            state: Mutex::new(GateState { takers: 0 }),
+            state: Mutex::new(GateState {
+                takers: 0,
+                paused_at: None,
+            }),
             cv: Condvar::new(),
         }
     }
@@ -109,7 +119,10 @@ impl QuiesceGate {
     /// comes later backs out, and the wait is bounded by the takes
     /// already in progress.
     pub fn pause(&self) {
-        let s = self.state();
+        let mut s = self.state();
+        if !self.paused.load(Ordering::Acquire) {
+            s.paused_at = Some(Instant::now());
+        }
         self.paused.store(true, Ordering::Release);
         self.cv.notify_all();
         self.wait_for_takers(s);
@@ -139,7 +152,8 @@ impl QuiesceGate {
     }
 
     pub fn resume(&self) {
-        let _guard = self.state();
+        let mut s = self.state();
+        s.paused_at = None;
         self.paused.store(false, Ordering::Release);
         self.cv.notify_all();
     }
@@ -186,6 +200,11 @@ impl QuiesceGate {
     /// worker that parked for one pause may still be parked when the
     /// next one starts. The worker must finish that work, or the pause
     /// waits for it for ever.
+    ///
+    /// In a drain, such work can start after the drain saw every worker
+    /// parked. It was not answered before the drain began, so a flush
+    /// owes it nothing. A caller that must not sync beside it waits for
+    /// it with [`Self::wait_quiesced_and`].
     pub fn park_if_paused_or<T>(
         &self,
         mut poll: impl FnMut() -> Option<T>,
@@ -212,16 +231,62 @@ impl QuiesceGate {
         found
     }
 
+    /// Stop a worker part way through one request once a pause has
+    /// been in force for `grace`, until the resume.
+    ///
+    /// The worker stays counted as active. It holds a request half
+    /// done, so neither a pause nor a drain may see the gate quiet.
+    /// Only a pause stops it: a drain wants the request finished, not
+    /// held, and a flush that waits for it syncs all of it.
+    pub fn hold_in_transfer(&self, grace: Duration) {
+        if !self.paused.load(Ordering::Acquire) {
+            return;
+        }
+        let mut s = self.state();
+        while let Some(at) = s.paused_at {
+            if at.elapsed() < grace {
+                return;
+            }
+            s = self
+                .cv
+                .wait_timeout(s, PARK_POLL)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
     pub fn wait_quiesced(&self, budget: Duration) -> bool {
-        let guard = self.state();
-        drop(
-            self.cv
-                .wait_timeout_while(guard, budget, |_| {
-                    self.active.load(Ordering::Acquire) > 0
-                })
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-        self.active.load(Ordering::Acquire) == 0
+        self.wait_quiesced_and(budget, || true)
+    }
+
+    /// Wait for every worker to park and for `idle` to hold, together.
+    ///
+    /// `idle` is for work the gate does not count, such as requests
+    /// queued to a parked worker. It is polled with no lock held.
+    pub fn wait_quiesced_and(
+        &self,
+        budget: Duration,
+        idle: impl Fn() -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            drop(
+                self.cv
+                    .wait_timeout_while(
+                        self.state(),
+                        left.min(IDLE_POLL),
+                        |_| self.active.load(Ordering::Acquire) > 0,
+                    )
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+            if self.active.load(Ordering::Acquire) == 0 && idle() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
     }
 }
 
@@ -248,7 +313,28 @@ pub fn flush_file(
     intent: FlushIntent,
     device: &'static str,
 ) -> Result<(), FlushError> {
-    flush_file_with(gate, file, intent, device, FLUSH_BUDGETS, File::sync_data)
+    flush_file_when(gate, file, intent, device, || true)
+}
+
+/// [`flush_file`], for a device whose workers can hold work the gate
+/// does not count. The sync waits for `idle` as well, so no request
+/// the device took is still moving data when it runs.
+pub fn flush_file_when(
+    gate: &QuiesceGate,
+    file: &File,
+    intent: FlushIntent,
+    device: &'static str,
+    idle: impl Fn() -> bool,
+) -> Result<(), FlushError> {
+    flush_file_with(
+        gate,
+        file,
+        intent,
+        device,
+        FLUSH_BUDGETS,
+        idle,
+        File::sync_data,
+    )
 }
 
 fn flush_file_with<F>(
@@ -257,6 +343,7 @@ fn flush_file_with<F>(
     intent: FlushIntent,
     device: &'static str,
     budgets: FlushBudgets,
+    idle: impl Fn() -> bool,
     sync: F,
 ) -> Result<(), FlushError>
 where
@@ -270,7 +357,7 @@ where
         FlushIntent::Durable => budgets.durable_quiesce,
         FlushIntent::BestEffort => budgets.best_effort_quiesce,
     };
-    if !gate.wait_quiesced(quiesce_budget) {
+    if !gate.wait_quiesced_and(quiesce_budget, idle) {
         return Err(FlushError::NotQuiesced(device));
     }
 

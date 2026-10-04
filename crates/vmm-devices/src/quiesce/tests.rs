@@ -77,6 +77,7 @@ impl Lifecycle for FlushTestDevice {
             intent,
             self.type_name(),
             self.budgets,
+            || true,
             move |_file| {
                 sync_calls.fetch_add(1, Ordering::AcqRel);
                 thread::sleep(sync_delay);
@@ -253,6 +254,47 @@ fn a_stream_of_producers_cannot_starve_a_pause() {
     for producer in producers {
         producer.join().expect("producer thread");
     }
+}
+
+/// A request part way through runs on while a pause is young, and
+/// stops once the pause has lasted the grace. Held, it still counts
+/// as active, so the gate does not report quiet.
+#[test]
+fn a_transfer_is_held_only_after_the_grace() {
+    let gate = Arc::new(QuiesceGate::new(1));
+    gate.pause();
+    gate.hold_in_transfer(Duration::from_secs(60));
+
+    let held = {
+        let gate = Arc::clone(&gate);
+        thread::spawn(move || gate.hold_in_transfer(Duration::ZERO))
+    };
+    thread::sleep(Duration::from_millis(100));
+    assert!(!held.is_finished(), "a pause past its grace let it run");
+    assert!(!gate.wait_quiesced(Duration::from_millis(20)));
+
+    gate.resume();
+    held.join().expect("held worker");
+
+    // A drain wants the transfer finished, so it never holds one.
+    let drain = gate.drain_scope();
+    gate.hold_in_transfer(Duration::ZERO);
+    drop(drain);
+}
+
+#[test]
+fn a_flush_waits_for_work_the_gate_does_not_count() {
+    let device = FlushTestDevice::new(0, Duration::ZERO, SHORT_BUDGETS);
+    let result = flush_file_with(
+        &device.gate,
+        &device.file,
+        FlushIntent::Durable,
+        "flush-test",
+        SHORT_BUDGETS,
+        || false,
+        |_file| panic!("synced with work in flight"),
+    );
+    assert!(matches!(result, Err(FlushError::NotQuiesced("flush-test"))));
 }
 
 fn wait_until(ready: impl Fn() -> bool) {

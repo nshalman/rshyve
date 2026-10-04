@@ -52,6 +52,7 @@ fn worker_ctx_queues(physmap: &Arc<PhysMap>, num_queues: usize) -> WorkerCtx {
         backend: Arc::new(BackendBarrier::new()),
         budget: Budget::new(budget::INFLIGHT_BYTES),
         kick: Arc::new(KickSlot::new()),
+        pause_grace: budget::OVERSIZED_PAUSE_GRACE,
         parks: Arc::new(WorkerParks::default()),
     }
 }

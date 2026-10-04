@@ -24,6 +24,7 @@ use std::fs::File;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use vmm_devices::blkdev::DiskCache;
 use vmm_devices::lifecycle::Indicator;
@@ -183,6 +184,7 @@ impl VirtioBlock {
             physmap,
             num_queues,
             budget::INFLIGHT_BYTES,
+            budget::OVERSIZED_PAUSE_GRACE,
         )
     }
 
@@ -192,6 +194,7 @@ impl VirtioBlock {
         physmap: Arc<PhysMap>,
         num_queues: u16,
         inflight_bytes: u64,
+        pause_grace: Duration,
     ) -> std::io::Result<Self> {
         if num_queues > budget::MAX_QUEUES {
             return Err(std::io::Error::new(
@@ -231,6 +234,7 @@ impl VirtioBlock {
             backend: Arc::new(BackendBarrier::new()),
             budget: Budget::new(inflight_bytes),
             kick: Arc::new(KickSlot::new()),
+            pause_grace,
             #[cfg(test)]
             parks: Arc::new(worker::WorkerParks::default()),
         };
@@ -815,11 +819,17 @@ impl Lifecycle for VirtioBlock {
     }
 
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
-        let flushed = vmm_devices::quiesce::flush_file(
+        // A worker the drain parked can still take work queued to it,
+        // and a request past the budget runs on through a drain. The
+        // sync waits for both, so it never runs beside a request the
+        // device took.
+        let budget = &self.ctx.budget;
+        let flushed = vmm_devices::quiesce::flush_file_when(
             &self.gate,
             &self.file,
             intent,
             "virtio-blk",
+            || budget.is_idle(),
         );
         // The flush held the workers, so a kick in that window left its
         // chains in the ring. A pause still held drains them on resume.

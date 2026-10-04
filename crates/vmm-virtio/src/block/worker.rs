@@ -68,6 +68,9 @@ pub(super) struct WorkerParks {
     /// Reached on the vCPU with requests taken from the ring and not
     /// yet handed to a worker.
     pub(super) before_dispatch: ParkSlot,
+    /// While set, a parked worker leaves work queued to it, as one
+    /// that has not looked yet does.
+    pub(super) parked_skips_work: std::sync::atomic::AtomicBool,
 }
 
 /// Run a park point, if a test installed one, and clear it.
@@ -102,6 +105,8 @@ pub(super) struct WorkerCtx {
     pub(super) budget: Arc<Budget>,
     /// Drains a ring that gave chains back for want of budget.
     pub(super) kick: Arc<KickSlot>,
+    /// How long a pause lets a request past the budget run on.
+    pub(super) pause_grace: Duration,
     #[cfg(test)]
     pub(super) parks: Arc<WorkerParks>,
 }
@@ -173,7 +178,17 @@ pub(super) fn blk_io_worker(
             None => match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(r) => r,
                 Err(RecvTimeoutError::Timeout) => {
-                    carried = ctx.gate.park_if_paused_or(|| rx.try_recv().ok());
+                    carried = ctx.gate.park_if_paused_or(|| {
+                        #[cfg(test)]
+                        if ctx
+                            .parks
+                            .parked_skips_work
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            return None;
+                        }
+                        rx.try_recv().ok()
+                    });
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -336,16 +351,19 @@ pub(super) fn run_request(
     Some((req.head, used_len))
 }
 
-/// Stop a request larger than the whole budget at a chunk boundary
-/// while the device is paused, and go on after the resume.
+/// Stop a request larger than the whole budget between chunks once a
+/// pause has run for the grace, and go on after the resume.
 ///
 /// The budget bounds what a pause waits for, except for such a request,
-/// which may move up to 1 GiB. Its budget stays held while it waits, so
-/// the device does not report quiet, a pause fails at its deadline and
-/// can be tried again, and no export sees a request half done.
-fn park_between_chunks(ctx: &WorkerCtx, req: &BlkIoRequest, moved: usize) {
+/// which may move up to 1 GiB. The pause closes admission, so it waits
+/// for this one request alone, and most end inside the grace. One that
+/// does not stops with its budget held, so the device does not report
+/// quiet, that pause fails and can be tried again, and no export sees
+/// a request half done. A drain never stops it, so a flush that waits
+/// for it syncs all of it.
+fn hold_between_chunks(ctx: &WorkerCtx, req: &BlkIoRequest, moved: usize) {
     if moved != 0 && req.charge.is_alone() {
-        ctx.gate.park_if_paused();
+        ctx.gate.hold_in_transfer(ctx.pause_grace);
     }
 }
 
@@ -373,7 +391,7 @@ fn read_request(
 
     let mut moved = 0usize;
     while moved < total {
-        park_between_chunks(ctx, req, moved);
+        hold_between_chunks(ctx, req, moved);
         let buf = bounce.take(total - moved);
         let n = buf.len();
         let Some(at) = base.checked_add(moved as u64) else {
@@ -425,7 +443,7 @@ fn write_request(
 
     let mut moved = 0usize;
     while moved < total {
-        park_between_chunks(ctx, req, moved);
+        hold_between_chunks(ctx, req, moved);
         let buf = bounce.take(total - moved);
         let n = buf.len();
         {
