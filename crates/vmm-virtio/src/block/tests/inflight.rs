@@ -24,6 +24,12 @@ const HDRS: u64 = BASE + 0x3000;
 const STATUS: u64 = BASE + 0x4000;
 const DATA: u64 = BASE + 0x1_0000;
 const MEM: usize = 0x80_0000;
+/// The real policy cut to tenths: a 500 ms wait gives 300 ms.
+const GRACE: PauseGrace = PauseGrace::new(
+    Duration::from_millis(200),
+    Duration::from_millis(100),
+    Duration::from_millis(300),
+);
 
 /// A device behind a stand-in transport. The queue lock plays the
 /// transport lock, and the kick path takes it as the real one does.
@@ -45,12 +51,12 @@ struct Rig {
 impl Rig {
     /// One queue holding a read of each length in `lens`, all posted.
     fn new(lens: &[usize]) -> Arc<Self> {
-        Self::build(bits::VIRTIO_BLK_T_IN, lens, budget::OVERSIZED_PAUSE_GRACE)
+        Self::build(bits::VIRTIO_BLK_T_IN, lens)
     }
 
     /// One queue holding a request of type `rtype` for each length in
-    /// `lens`, with `grace` as the pause grace.
-    fn build(rtype: u32, lens: &[usize], grace: Duration) -> Arc<Self> {
+    /// `lens`.
+    fn build(rtype: u32, lens: &[usize]) -> Arc<Self> {
         let physmap =
             Arc::new(PhysMap::new_anon(BASE, MEM).expect("guest memory"));
         let file = tempfile::tempfile().expect("create tempfile");
@@ -62,7 +68,7 @@ impl Rig {
             Arc::clone(&physmap),
             1,
             LIMIT,
-            grace,
+            GRACE,
         )
         .expect("create VirtioBlock");
 
@@ -486,18 +492,18 @@ fn a_parked_worker_answers_a_request_that_reaches_it_late() {
     rig.block.resume();
 }
 
-/// A request larger than the budget is not bounded by it. The pause
-/// closes admission and lets that one request run on, so one that ends
-/// inside the grace does not fail the pause.
+/// The grace follows the caller's wait: a caller who waits long lets
+/// one large request finish where a short wait would stop it.
 #[test]
-fn a_pause_waits_for_a_request_past_the_budget_inside_the_grace() {
+fn a_long_wait_lets_a_request_past_the_budget_finish() {
     const BIG: usize = 4 * LIMIT as usize;
-    let rig = Rig::build(bits::VIRTIO_BLK_T_IN, &[BIG], Duration::from_secs(5));
-    rig.slow(10);
+    let rig = Rig::build(bits::VIRTIO_BLK_T_IN, &[BIG]);
+    // 16 chunks of 40 ms, well past the grace a pause with no wait gets.
+    rig.slow(40);
     rig.kick(0);
     wait_for("the request never reached the disk", || rig.chunks() > 0);
 
-    rig.block.pause();
+    rig.block.pause_within(Duration::from_secs(5));
     wait_for("the pause stopped a request inside the grace", || {
         rig.block.is_quiesced()
     });
@@ -508,21 +514,20 @@ fn a_pause_waits_for_a_request_past_the_budget_inside_the_grace() {
     rig.block.resume();
 }
 
-/// One that runs past the grace stops between chunks, still owed, so
-/// the device does not report quiet and that pause fails. After the
-/// resume the request ends, and the next pause succeeds.
+/// One that runs past a short wait's grace stops between chunks, still
+/// owed, so the device does not report quiet and that pause fails.
+/// After the resume the request ends, and the next pause succeeds.
 #[test]
-fn a_request_past_the_grace_fails_the_pause_until_a_retry() {
+fn a_short_wait_holds_a_request_past_its_grace_until_a_retry() {
     const BIG: usize = 4 * LIMIT as usize;
-    let rig =
-        Rig::build(bits::VIRTIO_BLK_T_IN, &[BIG], Duration::from_millis(200));
+    let rig = Rig::build(bits::VIRTIO_BLK_T_IN, &[BIG]);
     // 16 chunks of 25 ms: 400 ms if nothing stops it.
     rig.slow(25);
     rig.kick(0);
     wait_for("the request never reached the disk", || rig.chunks() > 0);
 
     let at_pause = rig.chunks();
-    rig.block.pause();
+    rig.block.pause_within(Duration::from_millis(300));
     thread::sleep(Duration::from_secs(1));
     let moved = rig.chunks();
     assert!(moved > at_pause, "the pause stopped it inside the grace");
@@ -533,10 +538,25 @@ fn a_request_past_the_grace_fails_the_pause_until_a_retry() {
     rig.block.resume();
     wait_for("the resume did not finish the request", || rig.used() == 1);
     assert_eq!(peek(&rig.physmap, STATUS), bits::VIRTIO_BLK_S_OK);
-    rig.block.pause();
+    rig.block.pause_within(Duration::from_millis(300));
     wait_for("the retry did not quiesce", || rig.block.is_quiesced());
     assert_eq!(rig.in_flight(), (0, 0));
     rig.block.resume();
+}
+
+#[test]
+fn the_grace_leaves_the_caller_time_for_the_rest() {
+    let grace = PauseGrace::DEFAULT;
+    assert_eq!(grace.within(Duration::from_secs(5)), Duration::from_secs(3));
+    assert_eq!(
+        grace.within(Duration::from_secs(30)),
+        Duration::from_secs(28)
+    );
+    assert_eq!(
+        grace.within(Duration::from_millis(20)),
+        Duration::from_secs(1)
+    );
+    assert_eq!(grace.unknown(), Duration::from_secs(3));
 }
 
 /// A flush must not sync while a request past the budget is part way
@@ -545,11 +565,7 @@ fn a_request_past_the_grace_fails_the_pause_until_a_retry() {
 #[test]
 fn a_flush_waits_for_a_write_past_the_budget() {
     const BIG: usize = 4 * LIMIT as usize;
-    let rig = Rig::build(
-        bits::VIRTIO_BLK_T_OUT,
-        &[BIG],
-        budget::OVERSIZED_PAUSE_GRACE,
-    );
+    let rig = Rig::build(bits::VIRTIO_BLK_T_OUT, &[BIG]);
     rig.slow(10);
     rig.kick(0);
     wait_for("the write never reached the disk", || rig.chunks() > 0);

@@ -57,7 +57,7 @@ use crate::access::{GuestAccess, RingTag, Session};
 use crate::pci::intr::{BackendIntr, IntrSlot};
 use crate::pci::notify::{BackendKick, KickSlot};
 use access::BackendBarrier;
-use budget::{Budget, Charge};
+use budget::{Budget, Charge, PauseGrace};
 use io::{parse_header, write_status, ReqLimits};
 use worker::{blk_io_worker, needs_backend, BlkIoRequest, WorkerCtx};
 
@@ -156,6 +156,7 @@ pub struct VirtioBlock {
     /// Lifecycle state indicator.
     indicator: Indicator,
     gate: Arc<QuiesceGate>,
+    pause_grace: PauseGrace,
     /// Shared with every I/O worker.
     ctx: WorkerCtx,
 }
@@ -184,7 +185,7 @@ impl VirtioBlock {
             physmap,
             num_queues,
             budget::INFLIGHT_BYTES,
-            budget::OVERSIZED_PAUSE_GRACE,
+            PauseGrace::DEFAULT,
         )
     }
 
@@ -194,7 +195,7 @@ impl VirtioBlock {
         physmap: Arc<PhysMap>,
         num_queues: u16,
         inflight_bytes: u64,
-        pause_grace: Duration,
+        pause_grace: PauseGrace,
     ) -> std::io::Result<Self> {
         if num_queues > budget::MAX_QUEUES {
             return Err(std::io::Error::new(
@@ -234,7 +235,6 @@ impl VirtioBlock {
             backend: Arc::new(BackendBarrier::new()),
             budget: Budget::new(inflight_bytes),
             kick: Arc::new(KickSlot::new()),
-            pause_grace,
             #[cfg(test)]
             parks: Arc::new(worker::WorkerParks::default()),
         };
@@ -278,6 +278,7 @@ impl VirtioBlock {
             file,
             indicator: Indicator::new(),
             gate,
+            pause_grace,
             ctx,
         })
     }
@@ -790,7 +791,12 @@ impl Lifecycle for VirtioBlock {
 
     fn pause(&self) {
         self.indicator.pause();
-        self.gate.pause();
+        self.gate.pause_with_grace(self.pause_grace.unknown());
+    }
+
+    fn pause_within(&self, budget: Duration) {
+        self.indicator.pause();
+        self.gate.pause_with_grace(self.pause_grace.within(budget));
     }
 
     /// The budget check matters: a worker can park with work still

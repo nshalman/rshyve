@@ -105,8 +105,6 @@ pub(super) struct WorkerCtx {
     pub(super) budget: Arc<Budget>,
     /// Drains a ring that gave chains back for want of budget.
     pub(super) kick: Arc<KickSlot>,
-    /// How long a pause lets a request past the budget run on.
-    pub(super) pause_grace: Duration,
     #[cfg(test)]
     pub(super) parks: Arc<WorkerParks>,
 }
@@ -360,7 +358,7 @@ pub(super) fn run_request(
 /// held, so the device stays not quiet and that pause fails.
 fn hold_between_chunks(ctx: &WorkerCtx, req: &BlkIoRequest, moved: usize) {
     if moved != 0 && req.charge.is_alone() {
-        ctx.gate.hold_in_transfer(ctx.pause_grace);
+        ctx.gate.hold_in_transfer();
     }
 }
 

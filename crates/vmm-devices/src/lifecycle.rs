@@ -121,6 +121,15 @@ pub trait Lifecycle: Send + Sync + 'static {
     /// work but must accept and queue new work from other devices.
     fn pause(&self) {}
 
+    /// [`pause`](Lifecycle::pause), from a caller that then waits up
+    /// to `budget` for [`is_quiesced`](Lifecycle::is_quiesced).
+    ///
+    /// A device that lets work already started run on for a while can
+    /// size that time to the wait, and not fail a long one early.
+    fn pause_within(&self, _budget: Duration) {
+        self.pause();
+    }
+
     /// Directs this device to resume servicing the guest after pausing.
     fn resume(&self) {}
 
@@ -484,7 +493,7 @@ pub fn prepare_unplug(
     }
 
     if state != Some(IndicatedState::Pause) {
-        dev.pause();
+        dev.pause_within(budget);
     }
 
     if !wait_device_quiesced(dev.as_ref(), budget) {

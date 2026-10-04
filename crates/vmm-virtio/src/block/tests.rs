@@ -52,7 +52,6 @@ fn worker_ctx_queues(physmap: &Arc<PhysMap>, num_queues: usize) -> WorkerCtx {
         backend: Arc::new(BackendBarrier::new()),
         budget: Budget::new(budget::INFLIGHT_BYTES),
         kick: Arc::new(KickSlot::new()),
-        pause_grace: budget::OVERSIZED_PAUSE_GRACE,
         parks: Arc::new(WorkerParks::default()),
     }
 }
@@ -85,6 +84,7 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         file,
         indicator: Indicator::new(),
         gate: Arc::new(QuiesceGate::new(1)),
+        pause_grace: PauseGrace::DEFAULT,
         ctx: worker_ctx(&Arc::new(PhysMap::new())),
     });
 

@@ -56,8 +56,10 @@ pub struct QuiesceGate {
 struct GateState {
     /// Live [`Admission`]s.
     takers: usize,
-    /// A pause taken while one is in force keeps the first start.
+    /// A pause taken while one is in force keeps the first start and
+    /// grace.
     paused_at: Option<Instant>,
+    grace: Duration,
 }
 
 /// A producer's permission to take work, from [`QuiesceGate::admit`].
@@ -101,6 +103,7 @@ impl QuiesceGate {
             state: Mutex::new(GateState {
                 takers: 0,
                 paused_at: None,
+                grace: Duration::ZERO,
             }),
             cv: Condvar::new(),
         }
@@ -113,9 +116,16 @@ impl QuiesceGate {
     /// In force before it waits, so only takes already in progress can
     /// delay it.
     pub fn pause(&self) {
+        self.pause_with_grace(Duration::ZERO);
+    }
+
+    /// [`Self::pause`], letting a transfer run on for `grace` before
+    /// [`Self::hold_in_transfer`] stops it.
+    pub fn pause_with_grace(&self, grace: Duration) {
         let mut s = self.state();
-        if !self.paused.load(Ordering::Acquire) {
+        if s.paused_at.is_none() {
             s.paused_at = Some(Instant::now());
+            s.grace = grace;
         }
         self.paused.store(true, Ordering::Release);
         self.cv.notify_all();
@@ -224,19 +234,19 @@ impl QuiesceGate {
         found
     }
 
-    /// Stop a worker in the middle of a request once a pause is `grace`
-    /// old, until the resume.
+    /// Stop a worker in the middle of a request once the pause has
+    /// lasted its grace, until the resume.
     ///
     /// The worker stays counted as active, so the gate does not read
     /// quiet with a request half done. A drain never stops it: a flush
     /// wants the request finished.
-    pub fn hold_in_transfer(&self, grace: Duration) {
+    pub fn hold_in_transfer(&self) {
         if !self.paused.load(Ordering::Acquire) {
             return;
         }
         let mut s = self.state();
         while let Some(at) = s.paused_at {
-            if at.elapsed() < grace {
+            if at.elapsed() < s.grace {
                 return;
             }
             s = self

@@ -221,30 +221,76 @@ fn a_waiting_pause_turns_new_producers_away() {
     }
 }
 
+/// A worker part way through a request: it moves on past the hold,
+/// says so, and parks as it would once the request is done.
+fn in_transfer(
+    gate: &Arc<QuiesceGate>,
+) -> (mpsc::Receiver<()>, thread::JoinHandle<()>) {
+    let gate = Arc::clone(gate);
+    let (tx, rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        gate.hold_in_transfer();
+        tx.send(()).expect("report the transfer");
+        gate.park_if_paused();
+    });
+    (rx, worker)
+}
+
 /// A request part way through runs on while a pause is young, and
 /// stops once the pause has lasted the grace. Held, it still counts
 /// as active, so the gate does not report quiet.
 #[test]
 fn a_transfer_is_held_only_after_the_grace() {
     let gate = Arc::new(QuiesceGate::new(1));
-    gate.pause();
-    gate.hold_in_transfer(Duration::from_secs(60));
-
-    let held = {
-        let gate = Arc::clone(&gate);
-        thread::spawn(move || gate.hold_in_transfer(Duration::ZERO))
-    };
-    thread::sleep(Duration::from_millis(100));
-    assert!(!held.is_finished(), "a pause past its grace let it run");
-    assert!(!gate.wait_quiesced(Duration::from_millis(20)));
-
+    gate.pause_with_grace(Duration::from_secs(60));
+    let (moved, worker) = in_transfer(&gate);
+    moved
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a pause inside its grace held the transfer");
+    assert!(gate.wait_quiesced(Duration::from_secs(5)));
     gate.resume();
-    held.join().expect("held worker");
+    worker.join().expect("worker");
+
+    gate.pause_with_grace(Duration::ZERO);
+    let (moved, worker) = in_transfer(&gate);
+    // Let through, the worker would park and the gate read quiet.
+    assert!(
+        !gate.wait_quiesced(Duration::from_millis(200)),
+        "a pause past its grace let the transfer run"
+    );
+    assert!(moved.try_recv().is_err());
+    gate.resume();
+    moved
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the resume did not free the transfer");
+    worker.join().expect("worker");
 
     // A drain wants the transfer finished, so it never holds one.
     let drain = gate.drain_scope();
-    gate.hold_in_transfer(Duration::ZERO);
+    let (moved, worker) = in_transfer(&gate);
+    moved
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a drain held the transfer");
+    assert!(gate.wait_quiesced(Duration::from_secs(5)));
     drop(drain);
+    worker.join().expect("worker");
+}
+
+/// A retry after a resume gets its own grace, not what is left of the
+/// last pause's.
+#[test]
+fn a_pause_after_a_resume_starts_a_fresh_grace() {
+    let gate = Arc::new(QuiesceGate::new(1));
+    gate.pause_with_grace(Duration::ZERO);
+    gate.resume();
+
+    gate.pause_with_grace(Duration::from_secs(60));
+    let (moved, worker) = in_transfer(&gate);
+    moved
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the retry was held on the last pause's grace");
+    gate.resume();
+    worker.join().expect("worker");
 }
 
 #[test]

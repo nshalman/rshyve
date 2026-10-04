@@ -787,6 +787,10 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
         Lifecycle::pause(&self.device)
     }
 
+    fn pause_within(&self, budget: std::time::Duration) {
+        Lifecycle::pause_within(&self.device, budget)
+    }
+
     fn is_quiesced(&self) -> bool {
         Lifecycle::is_quiesced(&self.device)
     }

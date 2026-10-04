@@ -27,11 +27,47 @@ pub(super) const INFLIGHT_BYTES: u64 = 64 << 20;
 /// How long a pause lets a request past the budget run on before it
 /// stops it between chunks.
 ///
-/// Under the 5 s operator pause budget, with 2 s left for the other
-/// devices and the budgeted backlog. A firmware boot file read, the
-/// usual such request, ends well inside it. One that does not fails
-/// the pause, which can be tried again after a resume.
-pub(super) const OVERSIZED_PAUSE_GRACE: Duration = Duration::from_secs(3);
+/// A firmware boot file read, the usual such request, ends well inside
+/// it. One that does not fails the pause, which can be tried again
+/// after a resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PauseGrace {
+    /// Left of the caller's wait for the other devices and the
+    /// budgeted backlog.
+    margin: Duration,
+    floor: Duration,
+    /// For a pause from a caller that gave no wait.
+    unknown: Duration,
+}
+
+impl PauseGrace {
+    pub(super) const DEFAULT: Self = Self {
+        margin: Duration::from_secs(2),
+        floor: Duration::from_secs(1),
+        unknown: Duration::from_secs(3),
+    };
+
+    #[cfg(test)]
+    pub(super) const fn new(
+        margin: Duration,
+        floor: Duration,
+        unknown: Duration,
+    ) -> Self {
+        Self {
+            margin,
+            floor,
+            unknown,
+        }
+    }
+
+    pub(super) fn within(self, budget: Duration) -> Duration {
+        budget.saturating_sub(self.margin).max(self.floor)
+    }
+
+    pub(super) fn unknown(self) -> Duration {
+        self.unknown
+    }
+}
 
 /// Requests one device may have in flight, whatever they cost.
 ///

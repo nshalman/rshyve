@@ -291,7 +291,7 @@ impl VmController {
             if named.device.lifecycle_state()
                 != Some(vmm_devices::IndicatedState::Pause)
             {
-                named.device.pause();
+                named.device.pause_within(MIGRATION_QUIESCE_BUDGET);
             }
         }
         let report = vmm_devices::quiesce::wait_all_quiesced_named(
@@ -708,7 +708,7 @@ fn pause_device_set(
         if named.device.lifecycle_state()
             != Some(vmm_devices::IndicatedState::Pause)
         {
-            named.device.pause();
+            named.device.pause_within(budget);
         }
     }
     let report = vmm_devices::quiesce::wait_all_quiesced_named(devices, budget);
