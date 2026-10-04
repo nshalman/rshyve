@@ -5,6 +5,9 @@ MantaBlock engine on the same CN over a shared-memory ring, as MantaBlock
 spec 37 (the ring spec) defines. The engine is in the manta-storage
 repository.
 
+rshyve uses it for `-s <slot>,nvme,mantablock=<socket>,volume=<uuid>`.
+See [docs/cli.md](../../docs/cli.md#nvme-on-a-mantablock-volume).
+
 ## What it does
 
 - Connects to the engine's Unix socket for the volume, does Hello and
@@ -41,8 +44,7 @@ repository.
   NVMe-oF to another engine (S5). For that reason write data is not kept
   past the copy into the ring.
 - **Reattach.** Each attach asks for a new generation.
-- **rshyve wiring.** The crate is outside the root workspace (see below),
-  so no binary uses it yet.
+- **Migration.** rshyve refuses a ring disk on a migration destination.
 
 ## The ring crate dependency
 

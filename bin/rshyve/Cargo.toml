@@ -23,6 +23,7 @@ vmm_hid.workspace = true
 vmm_passthru.workspace = true
 vmm_boot.workspace = true
 vmm_machine.workspace = true
+vmm_mantablock.workspace = true
 vmm_migrate.workspace = true
 vmm_hyperv.workspace = true
 vmm_tpm.workspace = true

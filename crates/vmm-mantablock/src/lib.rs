@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vmm_storage::nvme::backend::{AsyncBackend, BackendFactory, BlockRequest};
+use vmm_storage::nvme::{LbaSize, NvmeConfig};
 
 mod attach;
 mod conn;
@@ -148,6 +149,17 @@ impl Connected {
     /// Whether a write is durable when it completes.
     pub fn durable(&self) -> bool {
         self.att.durable
+    }
+
+    /// The namespace this volume shows: 4 KiB blocks, as the ring moves
+    /// whole pages, and a volatile write cache unless every write is
+    /// durable when it completes.
+    pub fn nvme_config(&self) -> NvmeConfig {
+        NvmeConfig {
+            lba_size: LbaSize::B4096,
+            volatile_write_cache: !self.att.durable,
+            ..NvmeConfig::default()
+        }
     }
 
     /// Starts the ring, reporting to `sink`.

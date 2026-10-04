@@ -118,8 +118,21 @@ fn reject_unmigratable_destination(
                 driver
             );
         }
+        // The source still holds the volume's attachment, and the ring
+        // has no handover yet.
+        if specs.iter().any(|spec| is_mantablock_nvme(spec)) {
+            anyhow::bail!(
+                "nvme on a MantaBlock volume is not supported on a \
+                 migration destination"
+            );
+        }
     }
     Ok(())
+}
+
+fn is_mantablock_nvme(spec: &str) -> bool {
+    let parts = devspec::parts(spec);
+    parts.driver == "nvme" && parts.config.starts_with("mantablock=")
 }
 
 fn reject_ahci_hd<T>() -> anyhow::Result<T> {
@@ -209,35 +222,45 @@ fn parse_and_create_pci_device(
             );
             Ok(vmm_machine::created(pci_dev))
         }
-        "nvme" => {
-            if config.is_empty() {
-                anyhow::bail!("nvme requires a disk path");
+        "nvme" => match devspec::parse_nvme_config(config)? {
+            devspec::NvmeSpec::File(path, blk_opts) => {
+                use std::fs::OpenOptions;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(!blk_opts.read_only)
+                    .open(path)
+                    .with_context(|| {
+                        format!("failed to open disk: {}", path)
+                    })?;
+
+                let nvme = vmm_storage::nvme::NvmeController::new_with_logger(
+                    file,
+                    blk_opts.read_only,
+                    bdf.dev(), // unique instance ID per slot
+                    Arc::clone(physmap),
+                    Arc::clone(vmm_hdl),
+                    Arc::clone(bus_mmio),
+                    log.new(slog::o!("component" => "nvme")),
+                );
+
+                chipset.try_attach_device(bdf, nvme.clone())?;
+                info!(log, "nvme attached";
+                    "bdf" => %bdf,
+                    "path" => path,
+                );
+                Ok(vmm_machine::created(nvme))
             }
-            let (path, blk_opts) = devspec::parse_blk_config(config);
-            use std::fs::OpenOptions;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(!blk_opts.read_only)
-                .open(path)
-                .with_context(|| format!("failed to open disk: {}", path))?;
-
-            let nvme = vmm_storage::nvme::NvmeController::new_with_logger(
-                file,
-                blk_opts.read_only,
-                bdf.dev(), // unique instance ID per slot
-                Arc::clone(physmap),
-                Arc::clone(vmm_hdl),
-                Arc::clone(bus_mmio),
-                log.new(slog::o!("component" => "nvme")),
-            );
-
-            chipset.try_attach_device(bdf, nvme.clone())?;
-            info!(log, "nvme attached";
-                "bdf" => %bdf,
-                "path" => path,
-            );
-            Ok(vmm_machine::created(nvme))
-        }
+            devspec::NvmeSpec::MantaBlock(opts) => {
+                let nvme = mantablock_nvme(&opts, bdf.dev(), ctx)?;
+                chipset.try_attach_device(bdf, nvme.clone())?;
+                info!(log, "nvme attached";
+                    "bdf" => %bdf,
+                    "volume" => %opts.volume,
+                    "socket" => %opts.socket.display(),
+                );
+                Ok(vmm_machine::created(nvme))
+            }
+        },
         "virtio-console" => {
             let path = devspec::parse_console_config(config)?;
             let lintr = chipset.route_lintr(&bdf);
@@ -391,6 +414,49 @@ fn parse_and_create_pci_device(
             Ok((None, None))
         }
     }
+}
+
+/// An NVMe controller on a MantaBlock volume, attached to the engine.
+fn mantablock_nvme(
+    opts: &devspec::MantaBlockOpts,
+    instance_id: u8,
+    ctx: &vmm_machine::PciDeviceCtx<'_>,
+) -> anyhow::Result<Arc<vmm_storage::nvme::NvmeController>> {
+    let log = ctx.log.new(slog::o!(
+        "component" => "nvme",
+        "volume" => opts.volume.to_string(),
+    ));
+    let mut cfg = vmm_mantablock::Config::new(
+        opts.socket.clone(),
+        opts.volume,
+        log.clone(),
+    );
+    cfg.allow_volatile = opts.allow_volatile;
+    let conn = vmm_mantablock::connect(cfg).with_context(|| {
+        format!(
+            "nvme: cannot attach volume {} at {}",
+            opts.volume,
+            opts.socket.display()
+        )
+    })?;
+    if !conn.durable() {
+        warn!(
+            log,
+            "nvme: the engine's writes are not durable, so the \
+                    guest sees a volatile write cache"
+        );
+    }
+    let config = conn.nvme_config();
+    vmm_storage::nvme::NvmeController::with_backend(
+        conn.into_factory(),
+        config,
+        false,
+        instance_id,
+        Arc::clone(ctx.physmap),
+        Arc::clone(ctx.vmm_hdl),
+        Arc::clone(ctx.bus_mmio),
+        log,
+    )
 }
 
 /// What an `fbuf` spec asks for.
@@ -555,6 +621,17 @@ mod tests {
             "fbuf is not supported on a migration destination"
         );
         assert!(reject_unmigratable_destination(false, &fbuf).is_ok());
+    }
+
+    #[test]
+    fn a_mantablock_nvme_cannot_be_a_migration_destination() {
+        let specs = vec![
+            "4,nvme,/disk".to_string(),
+            "5,nvme,mantablock=/s,volume=x,bootindex=1".to_string(),
+        ];
+        let error = reject_unmigratable_destination(true, &specs).unwrap_err();
+        assert!(error.to_string().contains("MantaBlock"), "{error}");
+        assert!(reject_unmigratable_destination(false, &specs).is_ok());
     }
 
     #[test]

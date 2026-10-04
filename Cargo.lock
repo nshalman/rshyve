@@ -1031,6 +1031,7 @@ dependencies = [
  "vmm_hid",
  "vmm_hyperv",
  "vmm_machine",
+ "vmm_mantablock",
  "vmm_migrate",
  "vmm_passthru",
  "vmm_storage",
