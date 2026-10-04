@@ -300,8 +300,10 @@ fn parse_mantablock_config(config: &str) -> anyhow::Result<MantaBlockOpts> {
     let mut volume: Option<uuid::Uuid> = None;
     let mut allow_volatile = false;
     let mut spin_us: Option<u32> = None;
-    for opt in config.split(',').filter(|o| !o.is_empty()) {
-        if let Some(v) = opt.strip_prefix("mantablock=") {
+    for opt in config.split(',') {
+        if opt.is_empty() {
+            anyhow::bail!("nvme: an empty mantablock option in '{config}'");
+        } else if let Some(v) = opt.strip_prefix("mantablock=") {
             anyhow::ensure!(socket.is_none(), "nvme: mantablock= given twice");
             let path = PathBuf::from(v);
             // A relative path would resolve against the cwd of rshyve,
@@ -599,6 +601,8 @@ mod tests {
                 format!("mantablock=/s,volume={VOL},spin-us=5,spin-us=5"),
                 "twice",
             ),
+            (format!("mantablock=/s,,volume={VOL}"), "empty"),
+            (format!("mantablock=/s,volume={VOL},"), "empty"),
         ];
         for (config, why) in bad {
             let error = parse_nvme_config(&config).unwrap_err().to_string();
