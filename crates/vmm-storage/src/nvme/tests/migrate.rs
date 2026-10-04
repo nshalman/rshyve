@@ -172,6 +172,7 @@ fn a_polled_completion_queue_stays_polled_across_a_migration() {
 
     let mut dst = Harness::new();
     dst.ctrl.restore_migrate_state(&state).expect("restore");
+    dst.ctrl.resume();
 
     let before = dst.msi_count();
     let mut tail = 0;
@@ -373,4 +374,73 @@ fn nlb_overflow_checked_mul() {
     let nlb: u16 = 128;
     let block_size: u32 = 512;
     assert_eq!((nlb as u64).checked_mul(u64::from(block_size)), Some(65536));
+}
+
+/// Copy guest RAM from one harness to another, as the RAM passes of a
+/// migration do.
+fn copy_ram(src: &Harness, dst: &Harness, gpa: u64, len: usize) {
+    dst.mem()
+        .write(gpa, &src.read_guest(gpa, len))
+        .expect("copy guest RAM");
+}
+
+fn export(h: &Harness) -> vmm_devices::DeviceMigrateState {
+    h.ctrl
+        .export_migrate_state()
+        .expect("export")
+        .expect("an enabled controller has state")
+}
+
+/// Commands the guest queued while the source was paused have no
+/// doorbell left to ring on the destination.
+#[test]
+fn a_restored_controller_runs_what_the_guest_left_queued_on_resume() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    src.ctrl.pause();
+    for slot in 0..2u16 {
+        put_sqe(
+            &src,
+            SQ1,
+            slot,
+            Sqe::read(u64::from(slot), 1, 0x50000, 0),
+            slot,
+        );
+    }
+    src.sq_doorbell(1, 2);
+    let state = export(&src);
+
+    let manual = Manual::new(IO_QDEPTH);
+    let dst = Harness::manual(&manual);
+    copy_ram(&src, &dst, SQ1, 2 * SQE_SIZE);
+    dst.ctrl.restore_migrate_state(&state).expect("restore");
+    assert_eq!(manual.queued(), 0, "a restore started I/O before resume");
+
+    dst.ctrl.resume();
+    assert_eq!(manual.queued(), 2, "resume left the commands queued");
+    manual.complete_all();
+    assert_eq!(dst.wait_cqe(CQ1, 0, true).cid, 0);
+    assert_eq!(dst.wait_cqe(CQ1, 1, true).cid, 1);
+}
+
+/// The destination must not touch the disk before the source commits,
+/// and a doorbell is the one way left to start the submit path.
+#[test]
+fn a_restored_controller_admits_nothing_before_resume() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let state = export(&src);
+
+    let manual = Manual::new(IO_QDEPTH);
+    let dst = Harness::manual(&manual);
+    dst.ctrl.restore_migrate_state(&state).expect("restore");
+    put_sqe(&dst, SQ1, 0, Sqe::read(0, 1, 0x50000, 0), 0x61);
+    dst.sq_doorbell(1, 1);
+
+    assert_eq!(manual.queued(), 0, "I/O ran before the commit");
+    assert!(dst.ctrl.is_quiesced());
+    dst.ctrl.resume();
+    assert_eq!(manual.queued(), 1);
 }

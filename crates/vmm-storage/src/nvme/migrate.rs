@@ -4,6 +4,8 @@
 
 //! Controller state a live migration carries.
 
+use std::sync::atomic::Ordering;
+
 use vmm_devices::lifecycle::{
     DeviceMigrateState, DeviceStateError, NvmeMigrateCq, NvmeMigrateSq,
     NvmeMigrateState,
@@ -177,6 +179,11 @@ impl NvmeController {
         for (idx, wire) in mig.io_cqs.iter().enumerate() {
             st.set_cq(idx, wire.as_ref().map(live_cq));
         }
+        // Nothing runs before the source has committed to never running
+        // the guest again: the two would share the disk. Resume opens
+        // admission and takes the commands the guest left queued.
+        st.admission.paused = true;
+        self.counts.paused.store(true, Ordering::Release);
         drop(st);
 
         self.msix.import_state(&mig.msix).map_err(|error| {
