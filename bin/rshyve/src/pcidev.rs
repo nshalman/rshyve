@@ -45,13 +45,7 @@ pub fn init_pci_devices(
 ) -> anyhow::Result<PciDeviceInventory> {
     let is_migrate = cli.migrate_listen.is_some();
 
-    reject_unmigratable_destination(is_migrate, &cli.pci_slot)?;
-
-    let mut specs: Vec<String> = Vec::with_capacity(cli.pci_slot.len());
-    for slot_spec in &cli.pci_slot {
-        let (device_spec, _) = bootorder::strip_bootindex(slot_spec)?;
-        specs.push(device_spec);
-    }
+    let specs = driver_specs(is_migrate, &cli.pci_slot)?;
     let has_ahci_cd = specs_have_ahci_cd(&specs);
 
     let owned = Arc::new(vmm_machine::pci::OwnedPciCtx::new(
@@ -90,6 +84,21 @@ pub fn hotplug_factory(
     })
 }
 
+/// The specs as the drivers see them, refused if this VM cannot take
+/// them. The checks read the stripped specs, so a `bootindex=` in any
+/// position cannot hide an option from them.
+fn driver_specs(
+    is_migrate_dest: bool,
+    raw: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let specs = raw
+        .iter()
+        .map(|spec| bootorder::strip_bootindex(spec).map(|(s, _)| s))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    reject_unmigratable_destination(is_migrate_dest, &specs)?;
+    Ok(specs)
+}
+
 fn pci_spec_driver(spec: &str) -> Option<&str> {
     Some(devspec::parts(spec).driver).filter(|driver| !driver.is_empty())
 }
@@ -105,6 +114,7 @@ fn specs_have_ahci_cd(specs: &[String]) -> bool {
         .any(|spec| pci_spec_driver(spec) == Some("ahci-cd"))
 }
 
+/// `specs` must be bootindex-stripped.
 fn reject_unmigratable_destination(
     is_migrate_dest: bool,
     specs: &[String],
@@ -633,13 +643,19 @@ mod tests {
 
     #[test]
     fn a_mantablock_nvme_cannot_be_a_migration_destination() {
-        let specs = vec![
-            "4,nvme,/disk".to_string(),
-            "5,nvme,mantablock=/s,volume=x,bootindex=1".to_string(),
-        ];
-        let error = reject_unmigratable_destination(true, &specs).unwrap_err();
-        assert!(error.to_string().contains("MantaBlock"), "{error}");
-        assert!(reject_unmigratable_destination(false, &specs).is_ok());
+        // bootindex= first once hid the ring option from the check.
+        for ring in [
+            "5,nvme,mantablock=/s,volume=x,bootindex=1",
+            "5,nvme,bootindex=1,mantablock=/s,volume=x",
+        ] {
+            let raw = vec!["4,nvme,/disk".to_string(), ring.to_string()];
+            let error = driver_specs(true, &raw).unwrap_err();
+            assert!(
+                error.to_string().contains("MantaBlock"),
+                "{ring}: {error}"
+            );
+            assert!(driver_specs(false, &raw).is_ok());
+        }
     }
 
     #[test]
