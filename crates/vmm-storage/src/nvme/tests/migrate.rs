@@ -8,7 +8,7 @@
 use super::*;
 use vmm_devices::lifecycle::{NvmeMigrateCq, NvmeMigrateSq};
 
-use crate::nvme::check_nvme_state;
+use crate::nvme::migrate::check_nvme_state;
 
 struct NvmeQuiesceTestDevice {
     gate: Arc<QuiesceGate>,
