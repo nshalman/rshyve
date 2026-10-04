@@ -228,7 +228,10 @@ fn parse_and_create_pci_device(
                 Arc::clone(physmap),
                 Arc::clone(vmm_hdl),
                 Arc::clone(bus_mmio),
-                log.new(slog::o!("component" => "nvme")),
+                log.new(slog::o!(
+                    "component" => "nvme",
+                    "path" => path.to_string(),
+                )),
             )
             .with_context(|| format!("failed to create nvme for: {path}"))?;
 

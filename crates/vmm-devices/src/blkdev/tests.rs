@@ -387,6 +387,11 @@ fn a_failed_refresh_is_refused() {
         assert!(err.to_string().contains("refresh"), "{err}");
         assert!(err.to_string().contains(&format!("os error {set}")));
         assert!(err.to_string().contains("turn the write cache off"));
+        assert_eq!(
+            err.to_string().contains("sd.conf"),
+            set == libc::EINVAL,
+            "{err}"
+        );
         assert_eq!(fake.calls(), 0, "not probed");
         assert_eq!(fake.sets(), [true]);
     }

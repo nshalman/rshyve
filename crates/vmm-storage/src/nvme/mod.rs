@@ -125,8 +125,8 @@ impl NvmeController {
     /// Create a new NVMe controller.
     ///
     /// Bus registration and write cache warnings go to a discarding
-    /// logger. Use
-    /// [`new_with_logger`](Self::new_with_logger) to see them.
+    /// logger. Use [`new_with_logger`](Self::new_with_logger) to see
+    /// them.
     pub fn new(
         file: File,
         read_only: bool,
@@ -147,7 +147,7 @@ impl NvmeController {
     }
 
     /// Create a new NVMe controller with a logger for bus registration
-    /// diagnostics.
+    /// diagnostics and zvol write cache warnings.
     pub fn new_with_logger(
         file: File,
         read_only: bool,

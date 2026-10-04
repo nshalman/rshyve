@@ -81,7 +81,7 @@ pub fn virtio_blk(
         opts,
         Arc::clone(ctx.physmap),
         num_queues,
-        log,
+        &log.new(slog::o!("path" => path.display().to_string())),
     )
     .with_context(|| {
         format!("failed to create virtio-blk for: {}", path.display())

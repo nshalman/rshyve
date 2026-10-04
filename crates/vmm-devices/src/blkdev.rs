@@ -69,8 +69,8 @@ enum Mode {
 }
 
 impl DiskSync {
-    /// Classify `file` and decide how it flushes. `log` takes the
-    /// best-effort zvol write cache changes that fail.
+    /// Classify `file` and decide how it flushes. Warnings for failed
+    /// zvol write cache changes go to `log`.
     pub fn new(
         file: Arc<File>,
         read_only: bool,
@@ -252,13 +252,14 @@ impl Device {
         // the probe or the probe may test nothing.
         if wce == Some(true) {
             ops.set_wce(true).map_err(|e| {
-                refuse(
-                    "write cache refresh failed",
-                    e,
+                let next = if e.raw_os_error() == Some(libc::EINVAL) {
                     "sd answers EINVAL when the cache mode is not \
                      changeable or sd.conf disables the cache; attach it \
-                     read-only, or turn the write cache off",
-                )
+                     read-only, or turn the write cache off"
+                } else {
+                    "attach it read-only, or turn the write cache off"
+                };
+                refuse("write cache refresh failed", e, next)
             })?;
         }
         // Decided once: a cache turned on out of band later can leave
