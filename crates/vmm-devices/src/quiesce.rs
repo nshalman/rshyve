@@ -302,6 +302,20 @@ const FLUSH_BUDGETS: FlushBudgets = FlushBudgets {
     best_effort_sync: BEST_EFFORT_SYNC_BUDGET,
 };
 
+/// How long a flush of `intent` waits for in-flight I/O to finish.
+pub fn quiesce_budget(intent: FlushIntent) -> Duration {
+    FLUSH_BUDGETS.quiesce(intent)
+}
+
+impl FlushBudgets {
+    fn quiesce(&self, intent: FlushIntent) -> Duration {
+        match intent {
+            FlushIntent::Durable => self.durable_quiesce,
+            FlushIntent::BestEffort => self.best_effort_quiesce,
+        }
+    }
+}
+
 /// Quiesce a block backend and sync its file according to the caller's intent.
 ///
 /// Returns an error without syncing if the workers miss their quiesce deadline.
@@ -334,6 +348,18 @@ pub fn flush_file_when(
     )
 }
 
+/// Sync a file the caller has already quiesced, according to `intent`.
+///
+/// For a device that drains its own I/O rather than parking workers on
+/// a [`QuiesceGate`]. A best-effort sync fails if its watchdog expires.
+pub fn sync_file(
+    file: &File,
+    intent: FlushIntent,
+    device: &'static str,
+) -> Result<(), FlushError> {
+    sync_file_with(file, intent, device, FLUSH_BUDGETS, File::sync_data)
+}
+
 fn flush_file_with<F>(
     gate: &QuiesceGate,
     file: &File,
@@ -350,15 +376,24 @@ where
     // thread takes while the sync runs must outlive it.
     let _drain = gate.drain_scope();
 
-    let quiesce_budget = match intent {
-        FlushIntent::Durable => budgets.durable_quiesce,
-        FlushIntent::BestEffort => budgets.best_effort_quiesce,
-    };
-    if !gate.wait_quiesced_and(quiesce_budget, idle) {
+    if !gate.wait_quiesced_and(budgets.quiesce(intent), idle) {
         return Err(FlushError::NotQuiesced(device));
     }
 
-    let result = match intent {
+    sync_file_with(file, intent, device, budgets, sync)
+}
+
+fn sync_file_with<F>(
+    file: &File,
+    intent: FlushIntent,
+    device: &'static str,
+    budgets: FlushBudgets,
+    sync: F,
+) -> Result<(), FlushError>
+where
+    F: FnOnce(&File) -> io::Result<()> + Send + 'static,
+{
+    match intent {
         FlushIntent::Durable => sync(file).map_err(FlushError::Sync),
         FlushIntent::BestEffort => {
             let worker_file = match file.try_clone() {
@@ -390,9 +425,7 @@ where
                 }
             }
         }
-    };
-
-    result
+    }
 }
 
 /// A device, with the id its owner knows it by.
