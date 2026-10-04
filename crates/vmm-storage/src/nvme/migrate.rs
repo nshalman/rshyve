@@ -12,6 +12,7 @@ use vmm_devices::lifecycle::{
     NvmeMigrateNamespace, NvmeMigrateSq, NvmeMigrateState,
 };
 use vmm_devices::pci::device::replay_migrate_pci_state;
+use vmm_devices::pci::msix::MsixImportError;
 
 use super::bits::*;
 use super::cq::{Cqe, Held};
@@ -119,6 +120,9 @@ impl NvmeController {
         // head and tail, so a payload the checks let through would
         // abort the VMM on the guest's first doorbell write.
         check_nvme_state(mig)?;
+        self.msix
+            .check_import_state(&mig.msix)
+            .map_err(msix_error)?;
         let local = self.namespace();
         // A v2 source carried no capacity or write protection, so only
         // its one shape can be checked.
@@ -226,10 +230,12 @@ impl NvmeController {
             .bar_replay_writes(&mig.pci.bar_addrs);
         replay_migrate_pci_state(self, &bar_writes, mig.pci.command);
 
-        self.msix.import_state(&mig.msix).map_err(|error| {
-            DeviceStateError::invalid(format!("MSI-X table: {error}"))
-        })
+        self.msix.import_state(&mig.msix).map_err(msix_error)
     }
+}
+
+fn msix_error(error: MsixImportError) -> DeviceStateError {
+    DeviceStateError::invalid(format!("MSI-X table: {error}"))
 }
 
 impl NvmeController {

@@ -63,7 +63,11 @@ impl NvmeController {
         // avoid holding a mutable borrow on admin_sq across the call
         // to process_admin_cmd (which borrows the full NvmeState).
         loop {
-            if !st.admin_cq.as_ref().is_some_and(CompQueue::has_room) {
+            // A queue created now could name pages a stuck transfer
+            // still writes.
+            if st.fence_failed
+                || !st.admin_cq.as_ref().is_some_and(CompQueue::has_room)
+            {
                 break;
             }
             // Read the next SQE from guest memory (borrow admin_sq briefly)

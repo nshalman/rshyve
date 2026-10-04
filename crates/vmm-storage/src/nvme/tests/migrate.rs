@@ -623,3 +623,23 @@ fn the_most_held_completions_a_controller_can_make_restore() {
         .push(held(1, 0));
     check_nvme_state(&state).expect_err("one past the wire bound");
 }
+
+#[test]
+fn a_refused_msix_table_changes_nothing() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut state = nvme(export(&src));
+    state.msix.entries.push(Default::default());
+
+    let dst = Harness::new();
+    let error = dst
+        .ctrl
+        .restore_migrate_state(&vmm_devices::DeviceMigrateState::Nvme(state))
+        .expect_err("one entry too many");
+    assert!(error.to_string().contains("MSI-X"), "{error}");
+    let st = dst.ctrl.lock();
+    assert_eq!(st.cc, 0, "the controller registers were applied");
+    assert!(st.admin_sq.is_none(), "the admin queue was applied");
+    assert!(!st.admission.paused, "admission was paused");
+}

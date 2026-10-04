@@ -39,8 +39,8 @@ pub(super) struct WorkerPool {
 }
 
 impl WorkerPool {
-    /// The workers hold the only references to `io`, so the pool never
-    /// keeps the store open past its own end.
+    /// The pool keeps no `io` of its own, so the store closes once the
+    /// workers and `disk` are gone.
     pub(super) fn factory(
         disk: Arc<DiskSync>,
         io: Arc<dyn IoBackend>,

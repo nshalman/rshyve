@@ -322,6 +322,51 @@ fn a_delete_that_times_out_posts_no_completion() {
     assert_ne!(csts & CSTS_CFS, 0, "the controller is not fatal");
 }
 
+/// After a missed fence the admin queue stops with the I/O queues.
+#[test]
+fn a_failed_fence_stops_the_admin_queue() {
+    let (mut h, backend) = Harness::impatient();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    backend.hold();
+    let mut tail = 0;
+    io_submit(&mut h, &mut tail, Sqe::read(0, 8, 0x50000, 0), 0x54);
+    backend.wait_in_flight(1);
+
+    let t = h.admin_tail;
+    let delete = Sqe {
+        opcode: ADMIN_OPC_DELETE_IO_SQ,
+        cdw10: 1,
+        ..Sqe::default()
+    };
+    put_sqe(&h, ASQ, t, delete, 0xD4);
+    h.sq_doorbell(ADMIN_QUEUE_ID, t + 1);
+
+    let create = Sqe {
+        opcode: ADMIN_OPC_CREATE_IO_CQ,
+        prp1: CQ2,
+        cdw10: 2 | (u32::from(IO_QDEPTH - 1) << 16),
+        cdw11: (2 << 16) | CQ_IEN | CQ_PC,
+        ..Sqe::default()
+    };
+    put_sqe(&h, ASQ, t + 1, create, 0xC4);
+    h.sq_doorbell(ADMIN_QUEUE_ID, t + 2);
+
+    let slot = ACQ + h.admin_cq_head as u64 * CQE_SIZE as u64;
+    let cqe = Cqe::decode(&h.read_guest(slot, CQE_SIZE));
+    let (created, head) = {
+        let st = h.ctrl.lock();
+        let sq = st.admin_sq.as_ref().expect("admin SQ");
+        (st.io_cqs[1].is_some(), sq.head)
+    };
+    // Before any assert: dropping the controller joins the worker.
+    backend.release();
+    assert_ne!(cqe.phase, h.admin_phase, "an admin command completed");
+    assert!(!created, "a CQ was created after the fence");
+    assert_eq!(head, t + 1, "the admin SQ moved past the fence");
+}
+
 /// A reset while a Delete Queue drains gives the driver a new admin
 /// queue, which never sent that command.
 #[test]

@@ -392,7 +392,9 @@ where
                 .name(format!("{device}-flush"))
                 .spawn(move || {
                     // The receiver may have timed out, leaving no observer for
-                    // the eventual sync result.
+                    // the eventual sync result. The sync can then hold the
+                    // last disk reference, so a zvol write cache is restored
+                    // late, on this thread; nothing writes through it by then.
                     drop(tx.send(sync()));
                 });
             match worker {
