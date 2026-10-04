@@ -24,6 +24,7 @@ use crate::split::Slots;
 use crate::wake::{adopt, End};
 use crate::{Config, Job, Ring, Sink};
 
+mod control;
 mod scatter;
 mod stress;
 
@@ -177,6 +178,19 @@ fn setup_with<J: Job<Id = u32>>(
     durable: bool,
     sink: Arc<dyn Sink<u32>>,
 ) -> (Arc<Ring<J>>, Engine) {
+    setup_full(depth, buf_pages, max_blocks, durable, sink, None, |_| {})
+}
+
+/// As [`setup_with`], with a control socket and the timers set by `tune`.
+fn setup_full<J: Job<Id = u32>>(
+    depth: u32,
+    buf_pages: u32,
+    max_blocks: u32,
+    durable: bool,
+    sink: Arc<dyn Sink<u32>>,
+    conn: Option<crate::conn::Conn>,
+    tune: impl FnOnce(&mut Config),
+) -> (Arc<Ring<J>>, Engine) {
     let g = Geometry::new(1, depth, buf_pages).unwrap();
     let file = tempfile::tempfile().unwrap();
     file.set_len(g.region_len() as u64).unwrap();
@@ -207,7 +221,8 @@ fn setup_with<J: Job<Id = u32>>(
     let log = slog::Logger::root(slog::Discard, slog::o!());
     let mut cfg = Config::new("unused".into(), uuid::Uuid::nil(), log);
     cfg.spin = Duration::from_micros(5);
-    let ring = Ring::start(att, None, &cfg, sink);
+    tune(&mut cfg);
+    let ring = Ring::start(att, conn, &cfg, sink);
     let engine = Engine {
         sq: theirs.sq_consumer(0).unwrap(),
         cq: theirs.cq_producer(0).unwrap(),

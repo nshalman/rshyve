@@ -50,7 +50,10 @@ pub(crate) struct Conn {
 
 impl Conn {
     pub(crate) fn connect(path: &Path) -> io::Result<Self> {
-        let s = UnixStream::connect(path)?;
+        Self::new(UnixStream::connect(path)?)
+    }
+
+    pub(crate) fn new(s: UnixStream) -> io::Result<Self> {
         s.set_nonblocking(true)?;
         Ok(Self {
             s,
@@ -71,7 +74,8 @@ impl Conn {
         let frame = msg.encode(id);
         let mut rest = &frame[..];
         while !rest.is_empty() {
-            match rustix::net::send(&self.s, rest, SendFlags::empty()) {
+            // A closed peer is an error here, not a signal.
+            match rustix::net::send(&self.s, rest, SendFlags::NOSIGNAL) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => rest = &rest[n..],
                 Err(Errno::AGAIN) => self.wait(PollFlags::OUT, deadline)?,
@@ -88,6 +92,10 @@ impl Conn {
         deadline: Instant,
     ) -> io::Result<Option<Frame>> {
         loop {
+            // A peer that keeps the socket readable never reaches `wait`.
+            if Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
             if let Some((msg, _, used)) =
                 Message::decode(&self.buf).map_err(invalid)?
             {

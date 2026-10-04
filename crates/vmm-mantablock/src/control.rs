@@ -21,6 +21,10 @@ use crate::Config;
 /// Longest wait before the thread looks at the halt flag again.
 const TICK: Duration = Duration::from_millis(50);
 
+/// Frames taken per tick, so an engine that floods the socket cannot keep
+/// the thread from its timers and the halt flag.
+const FRAMES_PER_TICK: usize = 64;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Timers {
     heartbeat: Duration,
@@ -79,7 +83,10 @@ fn watch<J: Job>(
         let until = next_ping.min(now + TICK);
         conn.readable(until)
             .map_err(|e| Lost::Control(format!("poll: {e}")))?;
-        loop {
+        for _ in 0..FRAMES_PER_TICK {
+            if shared.halted() || shared.is_lost() {
+                break;
+            }
             match conn.try_recv() {
                 Ok(Polled::Frame(f)) if !f.fds.is_empty() => {
                     return Err(Lost::Control(
@@ -108,9 +115,11 @@ fn watch<J: Job>(
     Ok(())
 }
 
-/// The engine answers Detached only once no request is in it.
+/// The engine answers Detached only once no request is in it. The wait is
+/// the control deadline, not the I/O limit: halt blocks VM stop, and what
+/// the engine still holds fails anyway.
 fn detach<J: Job>(shared: &Shared<J>, conn: &mut Conn, t: Timers) {
-    let until = Instant::now() + t.io_limit.max(t.deadline);
+    let until = Instant::now() + t.deadline;
     if conn.send(&Message::Detach, until).is_err() {
         return;
     }
