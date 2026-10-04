@@ -4,21 +4,20 @@
 
 //! Durable flush and write-cache control for a disk backing fd.
 //!
-//! Zvols default to write-through on illumos; every sync 4K write commits
-//! the ZIL. Writeback with guest-driven flushes is the difference between
-//! ~1k and ~50k+ 4K randwrite IOPS. Model lifted from Oxide's propolis
-//! (`lib/propolis/src/block/file.rs`): probe at open, enable writeback,
-//! turn it back off on Drop.
+//! Zvols default to write-through, so every sync write commits the ZIL;
+//! writeback with guest-driven flushes is what makes small writes fast.
 //!
 //! A disk that cannot flush is accepted only with its write cache
 //! confirmed off, or with no cache control at all. The write cache is
 //! device-global and other opens of the device may be attached, so this
 //! code only ever moves it toward off after open.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
 #[cfg(target_os = "illumos")]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(target_os = "illumos")]
@@ -38,6 +37,13 @@ pub(crate) trait DiskOps: Send + Sync {
     fn set_wce(&self, on: bool) -> io::Result<()>;
 }
 
+/// Open a disk backing path, refusing a writable block node by name.
+pub fn open_disk(path: &Path, read_only: bool) -> io::Result<File> {
+    let file = OpenOptions::new().read(true).write(!read_only).open(path)?;
+    check_not_block(file.metadata()?.mode(), read_only, Some(path))?;
+    Ok(file)
+}
+
 /// Makes completed writes on a backing fd durable.
 ///
 /// How is decided once, at open, together with the write cache state.
@@ -52,36 +58,25 @@ pub struct DiskSync {
 
 enum Mode {
     ReadOnly,
-    /// A regular file or a block device. On illumos `sync_data` is
-    /// fsync, and fsync of a ZFS file commits the ZIL. Specfs answers
-    /// ENOTTY to every ioctl on a block node, and writes to it wait in
-    /// the specfs page cache that only fsync pushes out. spec_fsync
-    /// drops the flush errno, so a failed flush on a block node cannot
-    /// reach us; that is why disk paths should name the rdsk node.
+    /// A regular file. On illumos `sync_data` is fsync, and fsync of a
+    /// ZFS file commits the ZIL.
     Fsync,
     #[cfg(any(target_os = "illumos", test))]
     Device(Device),
 }
 
 impl DiskSync {
-    /// Classify `file`, probe its flush and set its write cache.
-    ///
-    /// Only a writable character device is probed. It is refused when:
-    /// - the probe flush fails with an errno other than ENOTSUP or ENOTTY;
-    /// - it cannot flush and its write cache cannot be confirmed off;
-    /// - a flush fails with any other errno after the write cache was
-    ///   turned on.
+    /// Classify `file`, then probe its flush and set its write cache.
     pub fn new(file: Arc<File>, read_only: bool) -> io::Result<Self> {
+        let st_mode = file.metadata()?.mode();
         #[cfg(target_os = "illumos")]
         {
-            use std::os::unix::fs::MetadataExt;
-
-            let mode = file.metadata()?.mode();
             let ops = Arc::new(Dkioc(Arc::clone(&file)));
-            Self::build(file, mode, read_only, ops)
+            Self::build(file, st_mode, read_only, ops)
         }
         #[cfg(not(target_os = "illumos"))]
         {
+            check_not_block(st_mode, read_only, None)?;
             let mode = if read_only {
                 Mode::ReadOnly
             } else {
@@ -98,6 +93,7 @@ impl DiskSync {
         read_only: bool,
         ops: Arc<dyn DiskOps>,
     ) -> io::Result<Self> {
+        check_not_block(st_mode, read_only, None)?;
         let mode = if read_only {
             Mode::ReadOnly
         } else if st_mode & libc::S_IFMT == libc::S_IFCHR {
@@ -123,6 +119,49 @@ impl DiskSync {
     }
 }
 
+/// Refuse a writable block node. Specfs answers ENOTTY to every disk
+/// ioctl on it, and writes wait in its page cache (spec_write starts
+/// async writeback only for full MAXBSIZE blocks). spec_fsync drains
+/// that cache and tries the device flush but drops both errors, and
+/// after one ENOTSUP or ENOTTY it never flushes the node again.
+fn check_not_block(
+    st_mode: u32,
+    read_only: bool,
+    path: Option<&Path>,
+) -> io::Result<()> {
+    if read_only || st_mode & libc::S_IFMT != libc::S_IFBLK {
+        return Ok(());
+    }
+    let raw = match path.and_then(raw_node) {
+        Some(raw) => raw.display().to_string(),
+        None => "the raw (character) node".to_string(),
+    };
+    let msg = format!(
+        "a writable block device node cannot report flush errors; use \
+         {raw} or attach it read-only"
+    );
+    Err(io::Error::new(io::ErrorKind::InvalidInput, msg))
+}
+
+/// The raw node for an illumos block node path: `dsk` becomes `rdsk`
+/// and `lofi` becomes `rlofi`.
+fn raw_node(path: &Path) -> Option<PathBuf> {
+    let mut found = false;
+    let out = path
+        .components()
+        .map(|c| match c {
+            Component::Normal(n) if !found && (n == "dsk" || n == "lofi") => {
+                found = true;
+                let mut raw = std::ffi::OsString::from("r");
+                raw.push(n);
+                raw
+            }
+            c => c.as_os_str().to_os_string(),
+        })
+        .collect::<PathBuf>();
+    found.then_some(out)
+}
+
 #[cfg(any(target_os = "illumos", test))]
 struct Device {
     ops: Arc<dyn DiskOps>,
@@ -142,7 +181,8 @@ impl Device {
         match dev.ops.flush() {
             Ok(()) => {}
             Err(e) if cannot_flush(&e) => {
-                dev.cache_off_for_good()?;
+                dev.can_flush = false;
+                dev.cache_off_as_found()?;
                 return Ok(dev);
             }
             Err(e) => {
@@ -153,50 +193,63 @@ impl Device {
             }
         }
         // Best effort: a disk that flushes is safe either way.
-        if !matches!(dev.ops.get_wce(), Ok(false))
-            || dev.ops.set_wce(true).is_err()
-        {
-            return Ok(dev);
+        match dev.ops.get_wce() {
+            Ok(false) => {
+                if dev.ops.set_wce(true).is_err() {
+                    return Ok(dev);
+                }
+                dev.enabled_wce = true;
+            }
+            // sd keeps its own copy of the cache state, read at attach
+            // and refreshed only by SETWCE. While that copy says off it
+            // answers a flush with success and sends nothing, so the
+            // probe above may have tested nothing.
+            Ok(true) => {
+                let _ = dev.ops.set_wce(true);
+            }
+            Err(_) => return Ok(dev),
         }
-        dev.enabled_wce = true;
-        // sd answers the flush with success and sends nothing while the
-        // cache is off, so only this probe tests SYNCHRONIZE CACHE.
         match dev.ops.flush() {
             Ok(()) => Ok(dev),
             Err(e) if cannot_flush(&e) => {
-                dev.cache_off_for_good()?;
+                dev.can_flush = false;
+                dev.turn_cache_off()?;
                 dev.enabled_wce = false;
                 Ok(dev)
             }
-            // Drop turns the cache back off.
+            // Drop turns the cache back off if this open turned it on.
             Err(e) => Err(io::Error::new(
                 e.kind(),
-                format!("disk flush failed after write cache enable: {e}"),
+                format!("disk flush failed with its write cache on: {e}"),
             )),
         }
     }
 
-    /// Turn the write cache off and confirm it, for good: turning it
-    /// back on later could expose another open of this device that
-    /// also cannot flush.
-    fn cache_off_for_good(&mut self) -> io::Result<()> {
-        self.can_flush = false;
+    /// The first probe cannot flush and the cache is as this open found
+    /// it. GETWCE that is unsupported from the start means no cache
+    /// control at all: the nvme blkdev namespace without a volatile
+    /// cache answers this way.
+    fn cache_off_as_found(&self) -> io::Result<()> {
         match self.ops.get_wce() {
             Ok(false) => Ok(()),
-            // No write cache control: the nvme blkdev namespace without
-            // a volatile cache answers this way.
             Err(e) if cannot_flush(&e) => Ok(()),
             Err(e) => Err(refuse(e)),
-            Ok(true) => {
-                self.ops.set_wce(false).map_err(refuse)?;
-                if self.ops.get_wce().map_err(refuse)? {
-                    return Err(refuse(io::Error::other(
-                        "write cache still on after DKIOCSETWCE=0",
-                    )));
-                }
-                Ok(())
-            }
+            Ok(true) => self.turn_cache_off(),
         }
+    }
+
+    /// Turn the write cache off and read it back, for good: turning it
+    /// back on later could expose another open of this device that also
+    /// cannot flush. GETWCE worked earlier in this open, so any error on
+    /// the read-back, ENOTSUP and ENOTTY included, refuses the disk.
+    fn turn_cache_off(&self) -> io::Result<()> {
+        self.ops.set_wce(false).map_err(refuse)?;
+        if self.ops.get_wce().map_err(refuse)? {
+            return Err(refuse(io::Error::other(
+                "write cache still on after DKIOCSETWCE=0",
+            )));
+        }
+        Ok(())
     }
 
     fn sync(&self) -> io::Result<()> {
@@ -267,10 +320,6 @@ impl DiskOps for Dkioc {
     }
 }
 
-/// Typed wrapper around the variadic `libc::ioctl`.
-///
-/// Passes `&mut c_int` explicitly so the integer doesn't hit variadic
-/// type promotion and the kernel reads/writes the expected 4 bytes.
 #[cfg(target_os = "illumos")]
 fn dkioc_wce(
     fd: BorrowedFd<'_>,

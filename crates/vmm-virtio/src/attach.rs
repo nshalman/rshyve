@@ -66,10 +66,7 @@ pub fn virtio_blk(
     lintr: Option<LintrCfg>,
     ctx: &VirtioAttachCtx<'_>,
 ) -> anyhow::Result<Arc<VirtioPciDevice<VirtioBlock>>> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(!opts.read_only)
-        .open(path)
+    let file = vmm_devices::blkdev::open_disk(path, opts.read_only)
         .with_context(|| format!("failed to open disk: {}", path.display()))?;
 
     // A zvol has one SPA sync pipeline, so beyond ~4 queues there is no
