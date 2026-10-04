@@ -381,6 +381,24 @@ fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
         hyperv: Box::new(move || for_hyperv.export_hyperv()),
         pause_vm,
         resume_vm,
+        gate: Box::new(ControlGate(Arc::clone(ctrl))),
+    }
+}
+
+/// Lets a stop cancel this VM's migration before it commits.
+struct ControlGate(Arc<VmController>);
+
+impl vmm_migrate::StopGate for ControlGate {
+    fn cancelled(&self) -> bool {
+        self.0.run.cancelled()
+    }
+
+    fn commit(&self) -> Result<(), vmm_migrate::codec::MigrateError> {
+        if self.0.run.commit() {
+            Ok(())
+        } else {
+            Err(vmm_migrate::cancelled())
+        }
     }
 }
 
@@ -525,6 +543,7 @@ fn dest_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::destination::DestHooks {
         hyperv: Box::new(move |state| for_hyperv.restore_hyperv(state)),
         pause_vm,
         resume_vm,
+        gate: Box::new(ControlGate(Arc::clone(ctrl))),
     }
 }
 

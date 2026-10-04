@@ -4,11 +4,10 @@
 
 use super::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier};
-use std::time::Duration;
 
-use VmRunState::{Migrating, Paused, Running, Stopped, Stopping};
+use VmRunState::{Faulted, Migrating, Paused, Running, Stopped, Stopping};
 
 fn import(run: &RunControl) -> Result<(), String> {
     run.admit_import(|| None)
@@ -18,30 +17,38 @@ fn ok() -> Result<(), ()> {
     Ok(())
 }
 
+fn step_ok() -> Result<(), StepFailed<()>> {
+    Ok(())
+}
+
 /// Counts the calls a stop makes, so a test can say which ran.
 #[derive(Default)]
 struct Calls {
-    latches: AtomicUsize,
-    releases: AtomicUsize,
+    order: Mutex<Vec<&'static str>>,
 }
 
 impl Calls {
-    fn latch(&self) -> Result<(), &'static str> {
-        self.latches.fetch_add(1, Ordering::AcqRel);
+    fn note(&self, what: &'static str) -> Result<(), &'static str> {
+        self.order.lock().expect("calls").push(what);
         Ok(())
     }
 
-    fn release(&self) -> Result<(), &'static str> {
-        self.releases.fetch_add(1, Ordering::AcqRel);
-        Ok(())
+    fn count(&self, what: &str) -> usize {
+        self.order
+            .lock()
+            .expect("calls")
+            .iter()
+            .filter(|w| **w == what)
+            .count()
     }
 
-    fn latches(&self) -> usize {
-        self.latches.load(Ordering::Acquire)
-    }
-
-    fn releases(&self) -> usize {
-        self.releases.load(Ordering::Acquire)
+    /// Holds, latches and releases.
+    fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.count("hold"),
+            self.count("latch"),
+            self.count("release"),
+        )
     }
 }
 
@@ -49,7 +56,12 @@ fn stop(
     run: &RunControl,
     calls: &Calls,
 ) -> Result<(), StopFailure<&'static str>> {
-    run.stop(|| calls.latch(), || calls.release())
+    run.stop(
+        STOP_WAIT,
+        || calls.note("hold"),
+        || calls.note("latch"),
+        || calls.note("release"),
+    )
 }
 
 /// A source that got as far as its vCPU pause.
@@ -60,6 +72,13 @@ fn parked_source() -> RunControl {
     run
 }
 
+/// Wait until a stop on another thread is blocked on `changing`.
+fn wait_for_a_blocked_stop(run: &RunControl) {
+    while run.contended.load(Ordering::Acquire) == 0 {
+        std::thread::yield_now();
+    }
+}
+
 #[test]
 fn an_import_cannot_claim_a_vm_that_is_still_pausing() {
     // The state already says Paused while the devices are parking.
@@ -68,7 +87,7 @@ fn an_import_cannot_claim_a_vm_that_is_still_pausing() {
         assert_eq!(run.get(), Paused);
         assert_eq!(import(&run), Err(CHANGE_IN_PROGRESS.to_string()));
         *held = true;
-        ok()
+        step_ok()
     })
     .expect("pause");
 
@@ -82,7 +101,7 @@ fn an_import_cannot_claim_a_vm_that_is_resuming() {
     run.change(Paused, Running, |held| {
         assert_eq!(import(&run), Err(CHANGE_IN_PROGRESS.to_string()));
         *held = false;
-        ok()
+        step_ok()
     })
     .expect("resume");
 
@@ -95,9 +114,10 @@ fn a_resume_after_an_import_claim_leaves_it_migrating() {
     let run = RunControl::new(Paused);
     import(&run).expect("claim");
 
-    let resumed = run.change(Paused, Running, |_| -> Result<(), ()> {
-        panic!("a resume must not touch a migrating VM")
-    });
+    let resumed =
+        run.change(Paused, Running, |_| -> Result<(), StepFailed<()>> {
+            panic!("a resume must not touch a migrating VM")
+        });
 
     assert_eq!(resumed, Err(ChangeFailed::WrongState));
     assert_eq!(run.get(), Migrating);
@@ -141,6 +161,26 @@ fn a_refused_import_leaves_the_vm_paused() {
     let refused = run.admit_import(|| Some("blocked".to_string()));
     assert_eq!(refused, Err("blocked".to_string()));
     assert_eq!(run.get(), Paused);
+    assert!(!run.topology.ejects_held());
+}
+
+#[test]
+fn ejects_wait_for_the_whole_import() {
+    // The import restores into the device set it was admitted with.
+    let run = RunControl::new(Paused);
+    import(&run).expect("claim");
+    assert!(run.topology.ejects_held());
+
+    run.end_migration(ok).expect("ended");
+    assert!(!run.topology.ejects_held());
+}
+
+#[test]
+fn ejects_wait_for_a_migrated_source_to_hand_off() {
+    let run = parked_source();
+    assert!(run.topology.ejects_held());
+    run.hand_off(ok).expect("handed off");
+    assert!(!run.topology.ejects_held());
 }
 
 #[test]
@@ -153,6 +193,7 @@ fn a_source_refusal_runs_under_the_topology_lock_and_rolls_back() {
     });
     assert_eq!(refused, Err("grew".to_string()));
     assert_eq!(run.get(), Running);
+    assert!(!run.topology.ejects_held());
 }
 
 #[test]
@@ -172,46 +213,48 @@ fn a_source_cannot_claim_a_vm_that_is_resuming() {
         let claimed = run.admit_source(|| None);
         assert_eq!(claimed, Err(CHANGE_IN_PROGRESS.to_string()));
         *held = false;
-        ok()
+        step_ok()
     })
     .expect("resume");
     run.admit_source(|| None).expect("running");
 }
 
 #[test]
-fn a_rollback_leaves_a_stop_alone() {
-    // The signal-driven stop takes a migrating VM to Stopping.
+fn a_stop_during_a_source_refusal_waits_for_it() {
     let run = RunControl::new(Running);
-    run.admit_source(|| None).expect("claim");
-    assert!(run.transition(Migrating, Stopping));
-
-    assert_eq!(run.end_migration(ok), Ok(false));
-    assert_eq!(run.get(), Stopping);
-}
-
-#[test]
-fn a_stop_during_a_source_refusal_survives_it() {
-    let run = RunControl::new(Running);
-    let refused = run.admit_source(|| {
-        assert!(run.transition(Migrating, Stopping));
-        Some("grew".to_string())
+    let calls = Calls::default();
+    std::thread::scope(|s| {
+        let refused = run.admit_source(|| {
+            s.spawn(|| stop(&run, &calls).expect("stop"));
+            wait_for_a_blocked_stop(&run);
+            assert_eq!(calls.counts(), (0, 0, 0), "a stop ran inside it");
+            Some("grew".to_string())
+        });
+        assert!(refused.is_err());
     });
-    assert!(refused.is_err());
+    // The claim rolled back first, so the stop found a running VM.
+    assert_eq!(calls.counts(), (0, 1, 0));
     assert_eq!(run.get(), Stopping);
 }
 
 #[test]
-fn a_failed_pause_rolls_back_but_not_over_a_stop() {
+fn a_failed_pause_rolls_back_before_a_stop_runs() {
     let run = RunControl::new(Running);
-    let failed = run.change(Running, Paused, |_| Err("stuck"));
+    let failed =
+        run.change(Running, Paused, |_| Err(StepFailed::Undone("stuck")));
     assert_eq!(failed, Err(ChangeFailed::Step("stuck")));
     assert_eq!(run.get(), Running);
 
-    let failed = run.change(Running, Paused, |_| {
-        assert!(run.transition(Paused, Stopping));
-        Err("stuck")
+    let calls = Calls::default();
+    std::thread::scope(|s| {
+        let failed = run.change(Running, Paused, |_| {
+            s.spawn(|| stop(&run, &calls).expect("stop"));
+            wait_for_a_blocked_stop(&run);
+            Err(StepFailed::Undone("stuck"))
+        });
+        assert_eq!(failed, Err(ChangeFailed::Step("stuck")));
     });
-    assert_eq!(failed, Err(ChangeFailed::Step("stuck")));
+    assert_eq!(calls.counts(), (0, 1, 0));
     assert_eq!(run.get(), Stopping);
 }
 
@@ -225,17 +268,36 @@ fn a_stop_waits_for_a_pause_in_progress_and_releases_its_hold() {
     std::thread::scope(|s| {
         run.change(Running, Paused, |held| {
             s.spawn(|| stop(&run, &calls).expect("stop"));
-            std::thread::sleep(Duration::from_millis(100));
-            assert_eq!(calls.latches(), 0, "a stop ran inside a pause");
+            wait_for_a_blocked_stop(&run);
+            assert_eq!(calls.counts(), (0, 0, 0), "a stop ran inside a pause");
             *held = true;
-            ok()
+            step_ok()
         })
         .expect("pause");
     });
 
-    assert_eq!((calls.latches(), calls.releases()), (1, 1));
+    assert_eq!(calls.counts(), (0, 1, 1));
     assert_eq!(run.get(), Stopping);
     assert!(!run.held());
+}
+
+#[test]
+fn a_stop_gives_up_on_a_change_that_outlasts_its_wait() {
+    // The SIGTERM watchdog calls the stop, and its budgets must run.
+    let run = RunControl::new(Running);
+    run.change(Running, Paused, |held| {
+        std::thread::scope(|s| {
+            let late = s
+                .spawn(|| run.stop(Duration::from_millis(20), ok, ok, ok))
+                .join()
+                .expect("stop thread");
+            assert_eq!(late, Err(StopFailure::Busy));
+        });
+        *held = true;
+        step_ok()
+    })
+    .expect("pause");
+    assert_eq!(run.get(), Paused);
 }
 
 #[test]
@@ -246,51 +308,61 @@ fn a_pause_runs_under_the_topology_lock() {
     run.change(Running, Paused, |held| {
         assert!(run.topology.is_held(), "topology not held");
         *held = true;
-        ok()
+        step_ok()
     })
     .expect("pause");
 }
 
 #[test]
-fn a_finished_source_leaves_a_stop_in_charge() {
-    let run = parked_source();
+fn a_stop_parks_a_running_source_before_it_latches() {
+    // Its vCPUs would reach the suspend at once and teardown would run
+    // under the migration thread.
+    let run = RunControl::new(Running);
+    run.admit_source(|| None).expect("claim");
     let calls = Calls::default();
+
     stop(&run, &calls).expect("stop");
-    assert_eq!(calls.releases(), 1, "the stop released the source");
 
-    let retry = Calls::default();
-    assert_eq!(run.hand_off(|| retry.release()), Ok(false));
-    assert_eq!(run.get(), Stopping);
-    assert_eq!(retry.releases(), 0, "released twice");
-}
-
-#[test]
-fn a_finished_source_retries_a_release_its_stop_could_not_make() {
-    let run = parked_source();
-    let failed = run.stop(|| Ok(()), || Err("EBUSY"));
-    assert_eq!(failed, Err(StopFailure::NotReleased("EBUSY")));
+    assert_eq!(*calls.order.lock().expect("calls"), ["hold", "latch"]);
     assert!(run.held());
+    assert!(run.cancelled());
+    let refused = run.park_migration(|| -> Result<(), ()> {
+        panic!("paused a stopping VM")
+    });
+    assert_eq!(refused, Err(None));
 
-    let retry = Calls::default();
-    assert_eq!(run.hand_off(|| retry.release()), Ok(false));
-    assert_eq!(retry.releases(), 1);
+    let end = Calls::default();
+    assert_eq!(run.end_migration(|| end.note("release")), Ok(false));
+    assert_eq!(end.counts(), (0, 0, 1));
+    assert_eq!(run.get(), Stopping);
     assert!(!run.held());
 }
 
 #[test]
-fn a_finished_source_stays_paused() {
+fn a_stop_cancels_a_paused_source_and_leaves_the_release_to_it() {
     let run = parked_source();
-    assert_eq!(run.hand_off(ok), Ok(true));
-    assert_eq!(run.get(), Stopped);
-    assert!(run.held());
-
     let calls = Calls::default();
     stop(&run, &calls).expect("stop");
-    assert_eq!((calls.latches(), calls.releases()), (1, 1));
+    assert_eq!(calls.counts(), (0, 1, 0), "released under the migration");
+    assert!(run.cancelled());
+
+    assert!(!run.commit(), "committed after a stop");
+    assert_eq!(
+        run.release_migration(
+            || -> Result<(), ()> { panic!("released") },
+            || true
+        ),
+        Err(None)
+    );
+
+    let end = Calls::default();
+    assert_eq!(run.end_migration(|| end.note("release")), Ok(false));
+    assert_eq!(end.counts(), (0, 0, 1));
+    assert!(!run.held());
 }
 
 #[test]
-fn a_stop_releases_a_migrating_destination() {
+fn a_stop_cancels_an_import_and_leaves_the_release_to_it() {
     // The import runs on a VM the operator paused, so its vCPUs are
     // parked although the state is not Paused.
     let run = RunControl::new(Paused);
@@ -299,43 +371,123 @@ fn a_stop_releases_a_migrating_destination() {
 
     stop(&run, &calls).expect("stop");
 
-    assert_eq!((calls.latches(), calls.releases()), (1, 1));
-    assert!(!run.held());
-    assert_eq!(run.end_migration(ok), Ok(false));
+    assert_eq!(calls.counts(), (0, 1, 0));
+    assert!(run.cancelled());
+    assert!(!run.commit(), "committed after a stop");
+    let end = Calls::default();
+    assert_eq!(run.end_migration(|| end.note("release")), Ok(false));
+    assert_eq!(end.counts(), (0, 0, 1));
     assert_eq!(run.get(), Stopping);
 }
 
 #[test]
-fn a_stop_releases_a_source_once_it_paused() {
+fn a_second_stop_during_a_migration_releases_nothing() {
+    // The watchdog's halt follows its poweroff.
+    let run = RunControl::new(Paused);
+    import(&run).expect("claim");
+    stop(&run, &Calls::default()).expect("first");
+    let second = Calls::default();
+    stop(&run, &second).expect("second");
+    assert_eq!(second.counts(), (0, 0, 0));
+    assert!(run.held());
+}
+
+#[test]
+fn a_stop_after_the_destination_commit_leaves_it_to_finish() {
+    // The import still resumes the devices, so teardown has to wait.
+    let run = RunControl::new(Paused);
+    import(&run).expect("claim");
+    assert!(run.commit());
+    let calls = Calls::default();
+
+    stop(&run, &calls).expect("stop");
+
+    assert_eq!(calls.counts(), (0, 1, 0));
+    assert!(!run.cancelled());
+    assert_eq!(
+        run.release_migration(
+            || -> Result<(), ()> { panic!("released") },
+            || true
+        ),
+        Err(None)
+    );
+    let end = Calls::default();
+    assert_eq!(run.end_migration(|| end.note("release")), Ok(false));
+    assert_eq!(end.counts(), (0, 0, 1));
+}
+
+#[test]
+fn a_stop_after_the_source_commit_only_reaps_it() {
     let run = parked_source();
+    assert!(run.commit());
     let calls = Calls::default();
+
     stop(&run, &calls).expect("stop");
-    assert_eq!((calls.latches(), calls.releases()), (1, 1));
+
+    assert_eq!(calls.counts(), (0, 1, 1));
+    assert!(!run.cancelled());
+    let retry = Calls::default();
+    assert_eq!(run.hand_off(|| retry.note("release")), Ok(false));
+    assert_eq!(retry.counts(), (0, 0, 0), "released twice");
+    assert_eq!(run.get(), Stopping);
 }
 
 #[test]
-fn a_stop_does_not_resume_a_source_still_running() {
+fn a_failed_latch_gives_back_the_pause_a_stop_took() {
     let run = RunControl::new(Running);
     run.admit_source(|| None).expect("claim");
     let calls = Calls::default();
-    stop(&run, &calls).expect("stop");
-    assert_eq!((calls.latches(), calls.releases()), (1, 0));
-}
 
-#[test]
-fn a_migration_may_not_pause_a_vm_a_stop_owns() {
-    // The stop found nothing to release, so a pause taken now would
-    // hold the vCPUs away from the suspend.
-    let run = RunControl::new(Running);
-    run.admit_source(|| None).expect("claim");
-    stop(&run, &Calls::default()).expect("stop");
+    let failed = run.stop(
+        STOP_WAIT,
+        || calls.note("hold"),
+        || Err("EIO"),
+        || calls.note("release"),
+    );
 
-    let refused = run.park_migration(|| -> Result<(), ()> {
-        panic!("paused a stopping VM")
-    });
-
-    assert_eq!(refused, Err(None));
+    assert_eq!(failed, Err(StopFailure::NotLatched("EIO")));
+    assert_eq!(calls.counts(), (1, 0, 1));
+    assert_eq!(run.get(), Migrating);
     assert!(!run.held());
+    assert!(!run.cancelled());
+}
+
+#[test]
+fn a_finished_source_retries_a_release_its_stop_could_not_make() {
+    let run = parked_source();
+    assert!(run.commit());
+    let failed = run.stop(STOP_WAIT, ok, ok, || Err(()));
+    assert_eq!(failed, Err(StopFailure::NotReleased(())));
+    assert!(run.held());
+    assert!(run.must_reap());
+
+    let retry = Calls::default();
+    assert_eq!(run.hand_off(|| retry.note("release")), Ok(false));
+    assert_eq!(retry.counts(), (0, 0, 1));
+    assert!(!run.held());
+    assert!(!run.must_reap());
+}
+
+#[test]
+fn a_finished_source_stays_paused() {
+    let run = parked_source();
+    assert!(run.commit());
+    assert_eq!(run.hand_off(ok), Ok(true));
+    assert_eq!(run.get(), Stopped);
+    assert!(run.held());
+    assert!(run.must_reap());
+
+    let calls = Calls::default();
+    stop(&run, &calls).expect("stop");
+    assert_eq!(calls.counts(), (0, 1, 1));
+    assert!(!run.must_reap());
+}
+
+#[test]
+fn only_a_migrated_source_is_reaped() {
+    for state in [Running, Paused, Migrating, Faulted] {
+        assert!(!RunControl::new(state).must_reap(), "{state:?}");
+    }
 }
 
 #[test]
@@ -349,39 +501,77 @@ fn a_migration_ends_in_the_state_its_pause_says() {
 
     // One that resumed the guest.
     import(&run).expect("claim");
-    run.unpark(ok).expect("released");
+    run.release_migration(ok, || true).expect("released");
     assert_eq!(run.end_migration(ok), Ok(true));
     assert_eq!(run.get(), Running);
 
-    // A source whose rollback could not resume the vCPUs.
+    // A source whose rollback could not resume the vCPUs, and parked
+    // its devices again.
     let run = parked_source();
-    assert_eq!(run.unpark(|| Err("EBUSY")), Err("EBUSY"));
+    assert_eq!(
+        run.release_migration(|| Err("EBUSY"), || true),
+        Err(Some("EBUSY"))
+    );
     assert_eq!(run.end_migration(ok), Ok(true));
     assert_eq!(run.get(), Paused);
 }
 
 #[test]
-fn a_failed_suspend_puts_back_the_state_it_took() {
-    for from in [Running, Paused, Migrating, Stopped] {
-        let run = RunControl::new(from);
-        let failed = run.stop(|| Err("EIO"), || panic!("resumed"));
-        assert_eq!(failed, Err(StopFailure::NotLatched("EIO")), "{from:?}");
-        assert_eq!(run.get(), from);
-    }
+fn a_migration_whose_devices_will_not_park_again_ends_faulted() {
+    // Paused would let an import write into running devices.
+    let run = parked_source();
+    assert_eq!(
+        run.release_migration(|| Err("EBUSY"), || false),
+        Err(Some("EBUSY"))
+    );
+    assert_eq!(run.end_migration(ok), Ok(true));
+    assert_eq!(run.get(), Faulted);
+    assert!(run.held());
 }
 
 #[test]
-fn a_failed_suspend_rolls_back_by_compare_and_swap() {
-    let run = RunControl::new(Running);
-    let failed = run.stop(
-        || {
-            assert!(run.transition(Stopping, Stopped));
-            Err("EIO")
-        },
-        || panic!("resumed"),
+fn an_operator_resume_that_cannot_park_again_faults_the_vm() {
+    let run = RunControl::new(Paused);
+    let failed =
+        run.change(Paused, Running, |_| Err(StepFailed::Faulted("EBUSY")));
+    assert_eq!(failed, Err(ChangeFailed::Faulted("EBUSY")));
+    assert_eq!(run.get(), Faulted);
+}
+
+#[test]
+fn a_faulted_vm_takes_only_a_stop() {
+    let run = RunControl::new(Paused);
+    let _ = run.change(Paused, Running, |_| Err(StepFailed::Faulted(())));
+    assert_eq!(run.get(), Faulted);
+
+    assert!(import(&run).is_err());
+    assert!(run.admit_source(|| None).is_err());
+    let never = |_: &mut bool| -> Result<(), StepFailed<()>> {
+        panic!("a faulted VM changed")
+    };
+    assert_eq!(
+        run.change(Running, Paused, never),
+        Err(ChangeFailed::WrongState)
     );
-    assert!(failed.is_err());
-    assert_eq!(run.get(), Stopped);
+    assert_eq!(
+        run.change(Paused, Running, never),
+        Err(ChangeFailed::WrongState)
+    );
+
+    let calls = Calls::default();
+    stop(&run, &calls).expect("stop");
+    assert_eq!(calls.counts(), (0, 1, 1));
+    assert_eq!(run.get(), Stopping);
+}
+
+#[test]
+fn a_failed_suspend_puts_back_the_state_it_took() {
+    for from in [Running, Paused, Migrating, Stopped, Faulted] {
+        let run = RunControl::new(from);
+        let failed = run.stop(STOP_WAIT, ok, || Err(()), || panic!("resumed"));
+        assert_eq!(failed, Err(StopFailure::NotLatched(())), "{from:?}");
+        assert_eq!(run.get(), from);
+    }
 }
 
 #[test]
@@ -391,8 +581,8 @@ fn a_second_stop_leaves_the_work_to_the_first() {
     let second = Calls::default();
     stop(&run, &first).expect("first");
     stop(&run, &second).expect("second");
-    assert_eq!((first.latches(), first.releases()), (1, 1));
-    assert_eq!((second.latches(), second.releases()), (0, 0));
+    assert_eq!(first.counts(), (0, 1, 1));
+    assert_eq!(second.counts(), (0, 0, 0));
 }
 
 #[test]
@@ -400,12 +590,12 @@ fn a_later_stop_retries_a_release_the_first_could_not_make() {
     // The watchdog's halt follows its poweroff, so a second stop is
     // what gets a paused VM's vCPUs to the suspend after all.
     let run = RunControl::new(Paused);
-    let failed = run.stop(|| Ok(()), || Err("EBUSY"));
-    assert_eq!(failed, Err(StopFailure::NotReleased("EBUSY")));
+    let failed = run.stop(STOP_WAIT, ok, ok, || Err(()));
+    assert_eq!(failed, Err(StopFailure::NotReleased(())));
 
     let retry = Calls::default();
     stop(&run, &retry).expect("retried");
-    assert_eq!((retry.latches(), retry.releases()), (0, 1));
+    assert_eq!(retry.counts(), (0, 0, 1));
     assert!(!run.held());
 }
 
@@ -413,8 +603,10 @@ fn a_later_stop_retries_a_release_the_first_could_not_make() {
 fn a_panic_in_a_step_rolls_the_state_back() {
     let run = RunControl::new(Running);
     let panicked = catch_unwind(AssertUnwindSafe(|| {
-        let _ = run
-            .change(Running, Paused, |_| -> Result<(), ()> { panic!("step") });
+        let _ =
+            run.change(Running, Paused, |_| -> Result<(), StepFailed<()>> {
+                panic!("step")
+            });
     }));
     assert!(panicked.is_err());
     assert_eq!(run.get(), Running);
@@ -444,7 +636,7 @@ fn a_change_racing_a_stop_never_reports_the_wrong_state() {
         let paused = run.change(Running, Paused, |held| {
             started.store(true, Ordering::Release);
             *held = true;
-            ok()
+            step_ok()
         });
         assert_eq!(paused, Ok(()));
     });

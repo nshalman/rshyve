@@ -208,6 +208,14 @@ fn expect_serialized(msg: Message) -> Result<Vec<u8>, MigrateError> {
     }
 }
 
+/// Give up once a stop has cancelled the migration.
+pub fn not_cancelled(gate: &dyn crate::StopGate) -> Result<(), MigrateError> {
+    if gate.cancelled() {
+        return Err(crate::cancelled());
+    }
+    Ok(())
+}
+
 pub fn set_phase(status: &Arc<Mutex<MigrationStatus>>, phase: MigrationPhase) {
     if let Ok(mut s) = status.lock() {
         s.phase = phase;

@@ -199,6 +199,8 @@ fn run_migration_destination(
         }),
         pause_vm,
         resume_vm,
+        // Nothing can stop this VM before its control plane exists.
+        gate: Box::new(vmm_migrate::NoStop),
     };
 
     let status = Arc::new(std::sync::Mutex::new(

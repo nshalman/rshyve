@@ -82,7 +82,19 @@ copy of the guest against the same disk whenever the source rolled back.
 A source that has committed and then loses the peer stays paused and is
 never released: it cannot take the guest back, because the destination
 may be running it. The control socket reports the VM still migrating and
-an operator decides.
+an operator decides; `stop` reaps it.
+
+A stop (SIGTERM or `stop`) during a migration latches the suspend at
+once. Before the commit it also cancels the migration: this end tells
+the peer and gives up, and the source rolls back. After the source's
+commit, a stop on the source only reaps it. On either side the pause is
+given back, and teardown starts, only when the migration thread ends,
+so teardown never runs under it.
+
+If a migration's rollback or final resume cannot release the vCPUs and
+the device workers will not park again, the VM goes to `faulted`. So
+does an operator `resume` that fails the same way. A faulted VM takes
+only `stop`, so `paused` always means parked devices.
 
 The final dirty pass runs after every device worker has parked, so it
 is the last word on guest memory by construction. Before that change it

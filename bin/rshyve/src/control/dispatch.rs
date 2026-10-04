@@ -23,7 +23,7 @@ use super::migrate::{
     migration_source_guard,
 };
 use super::protocol::{Command, Response};
-use super::run_state::ChangeFailed;
+use super::run_state::{ChangeFailed, StepFailed, CHANGE_IN_PROGRESS};
 use super::{
     park_all, unpark_all, StopFailure, VmController, VmRunState,
     DEVICE_PAUSE_BUDGET,
@@ -58,7 +58,9 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                 r
             }
             Err(ChangeFailed::WrongState) => Response::err("VM is not running"),
-            Err(ChangeFailed::Step(why)) => Response::err(&why),
+            Err(ChangeFailed::Step(why) | ChangeFailed::Faulted(why)) => {
+                Response::err(&why)
+            }
         },
 
         Command::Resume => match ctrl.run.change(
@@ -72,42 +74,21 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                 r
             }
             Err(ChangeFailed::WrongState) => Response::err("VM is not paused"),
-            Err(ChangeFailed::Step(why)) => Response::err(&why),
+            Err(ChangeFailed::Step(why) | ChangeFailed::Faulted(why)) => {
+                Response::err(&why)
+            }
         },
 
-        Command::Shutdown => latch_stop(ctrl, SuspendHow::PowerOff, "shutdown"),
+        Command::Shutdown => guest_stop(ctrl, SuspendHow::PowerOff, "shutdown"),
 
-        Command::Reset => latch_stop(ctrl, SuspendHow::Reset, "reset"),
+        Command::Reset => guest_stop(ctrl, SuspendHow::Reset, "reset"),
 
         Command::Stop => {
-            let cur = ctrl.state();
-            let migrated_away = ctrl.migrated_away();
-            if let Some(refusal) = stop_refusal(cur, migrated_away) {
+            if let Some(refusal) =
+                stop_refusal(ctrl.state(), ctrl.migrated_away())
+            {
                 return Response::err(refusal);
             }
-            if migrated_away {
-                // The guest runs on another host now, so it must not be
-                // resumed first the way a live VM is.
-                return match ctrl.release_migrated_source() {
-                    Ok(()) => {
-                        let mut r = Response::ok();
-                        r.state = Some(VmRunState::Stopping);
-                        r
-                    }
-                    Err(e) => {
-                        // Back to Stopped so the release timer still
-                        // fires. Leaving it Stopping stands the timer
-                        // down and the zombie would outlive the node.
-                        ctrl.run.transition(
-                            VmRunState::Stopping,
-                            VmRunState::Stopped,
-                        );
-                        error!(ctrl.log, "stop failed"; "error" => %e);
-                        Response::err("suspend ioctl failed")
-                    }
-                };
-            }
-
             latch_stop(ctrl, SuspendHow::Halt, "stop")
         }
 
@@ -204,7 +185,10 @@ fn hot_add(ctrl: &VmController, add: impl FnOnce() -> Response) -> Response {
     }
 }
 
-fn pause_step(ctrl: &VmController, held: &mut bool) -> Result<(), String> {
+fn pause_step(
+    ctrl: &VmController,
+    held: &mut bool,
+) -> Result<(), StepFailed<String>> {
     park_all(
         &ctrl.named_devices(),
         DEVICE_PAUSE_BUDGET,
@@ -214,7 +198,10 @@ fn pause_step(ctrl: &VmController, held: &mut bool) -> Result<(), String> {
     )
 }
 
-fn resume_step(ctrl: &VmController, held: &mut bool) -> Result<(), String> {
+fn resume_step(
+    ctrl: &VmController,
+    held: &mut bool,
+) -> Result<(), StepFailed<String>> {
     unpark_all(
         &ctrl.named_devices(),
         DEVICE_PAUSE_BUDGET,
@@ -224,7 +211,20 @@ fn resume_step(ctrl: &VmController, held: &mut bool) -> Result<(), String> {
     )
 }
 
-/// Latch a stop on a running or paused VM and report what happened.
+/// `shutdown` and `reset`, which only a running or paused guest takes.
+fn guest_stop(
+    ctrl: &Arc<VmController>,
+    how: SuspendHow,
+    what: &str,
+) -> Response {
+    let cur = ctrl.state();
+    if cur != VmRunState::Running && cur != VmRunState::Paused {
+        return Response::err("VM is not running or paused");
+    }
+    latch_stop(ctrl, how, what)
+}
+
+/// Latch a stop and report what happened.
 ///
 /// One helper for `shutdown`, `reset` and `stop`: the three differ only
 /// in the `SuspendHow` they latch, and three copies of the ordering had
@@ -234,17 +234,13 @@ fn latch_stop(
     how: SuspendHow,
     what: &str,
 ) -> Response {
-    let cur = ctrl.state();
-    if cur != VmRunState::Running && cur != VmRunState::Paused {
-        return Response::err("VM is not running or paused");
-    }
-
     match ctrl.latch_stop(how) {
         Ok(state) => {
             let mut r = Response::ok();
             r.state = Some(state);
             r
         }
+        Err(StopFailure::Busy) => Response::err(CHANGE_IN_PROGRESS),
         Err(StopFailure::NotLatched(e)) => {
             error!(ctrl.log, "{what} failed"; "error" => %e);
             Response::err("suspend ioctl failed")
@@ -264,16 +260,14 @@ fn latch_stop(
 ///
 /// A source whose guest moved to another host is left paused and
 /// holding the whole guest memory, and no other command reaches that
-/// state. `stop` is what releases it.
+/// state. `stop` is what releases it. A stop on `Stopping` retries a
+/// release an earlier one could not make.
 fn stop_refusal(
     state: VmRunState,
     migrated_away: bool,
 ) -> Option<&'static str> {
     match state {
-        VmRunState::Stopped if migrated_away => None,
-        VmRunState::Stopped | VmRunState::Stopping => {
-            Some("VM is already stopped/stopping")
-        }
+        VmRunState::Stopped if !migrated_away => Some("VM is already stopped"),
         _ => None,
     }
 }
@@ -820,6 +814,7 @@ mod tests {
             VmRunState::Migrating,
             VmRunState::Stopping,
             VmRunState::Stopped,
+            VmRunState::Faulted,
         ] {
             let refusal =
                 hot_add_blocked(state).expect("only a running VM may grow");
@@ -873,20 +868,22 @@ mod tests {
 
     #[test]
     fn stop_refuses_a_vm_that_is_already_done() {
-        for state in [VmRunState::Stopped, VmRunState::Stopping] {
-            assert!(stop_refusal(state, false).is_some(), "{state:?}");
-        }
-        assert!(stop_refusal(VmRunState::Stopping, true).is_some());
+        assert!(stop_refusal(VmRunState::Stopped, false).is_some());
     }
 
     #[test]
     fn stop_reaches_a_live_vm_in_every_other_state() {
+        // Stopping is there so a stop can retry a release that failed,
+        // and Faulted because nothing else is taken there.
         for state in [
             VmRunState::Running,
             VmRunState::Paused,
             VmRunState::Migrating,
+            VmRunState::Stopping,
+            VmRunState::Faulted,
         ] {
             assert_eq!(stop_refusal(state, false), None, "{state:?}");
+            assert_eq!(stop_refusal(state, true), None, "{state:?}");
         }
     }
 }

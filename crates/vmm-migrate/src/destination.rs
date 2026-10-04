@@ -27,9 +27,12 @@ use crate::cpu;
 use crate::pages::apply_page_batch;
 use crate::protocol::select_protocol;
 use crate::state;
-use crate::wire::{set_phase, unexpected, Chan, Deadlines, Transport};
+use crate::wire::{
+    not_cancelled, set_phase, unexpected, Chan, Deadlines, Transport,
+};
 use crate::MigrationPhase;
 use crate::MigrationStatus;
+use crate::StopGate;
 use crate::VmPauseFn;
 
 /// Hand one device the state its counterpart on the source exported.
@@ -74,6 +77,7 @@ pub struct DestHooks {
     pub hyperv: HypervRestoreFn,
     pub pause_vm: VmPauseFn,
     pub resume_vm: VmPauseFn,
+    pub gate: Box<dyn StopGate>,
 }
 
 pub fn run_destination<S: Transport>(
@@ -90,7 +94,14 @@ pub fn run_destination<S: Transport>(
         tungstenite::protocol::Role::Server,
         config.deadlines,
     )?;
-    run_inner(&mut chan, &hdl, memctx, &config, &hooks, &status, log)
+    let result =
+        run_inner(&mut chan, &hdl, memctx, &config, &hooks, &status, log);
+    if let Err(error) = &result {
+        if crate::is_cancel(error) {
+            chan.report_failure(error, log);
+        }
+    }
+    result
 }
 
 fn run_inner<S: Transport>(
@@ -126,12 +137,18 @@ fn run_inner<S: Transport>(
 
     // ── Pre-pause RAM passes ──
     set_phase(status, MigrationPhase::RamPushPrePause);
-    receive_pass(chan, memctx, status, PassEnd::PauseSignal)?;
+    receive_pass(
+        chan,
+        memctx,
+        hooks.gate.as_ref(),
+        status,
+        PassEnd::PauseSignal,
+    )?;
 
     // ── Post-pause final pass ──
     set_phase(status, MigrationPhase::RamPushPostPause);
     chan.enter_post_pause()?;
-    receive_pass(chan, memctx, status, PassEnd::MemEnd)?;
+    receive_pass(chan, memctx, hooks.gate.as_ref(), status, PassEnd::MemEnd)?;
 
     slog::info!(log, "pausing VM before state import");
     (hooks.pause_vm)().map_err(|e| MigrateError::Io(format!("pause: {e}")))?;
@@ -147,6 +164,7 @@ fn run_inner<S: Transport>(
     // ── DeviceState ──
     set_phase(status, MigrationPhase::DeviceState);
     let dev_state: DeviceState = chan.expect_serialized()?;
+    not_cancelled(hooks.gate.as_ref())?;
     if let Err(e) = restore_devices(&dev_state, config, hooks, log) {
         chan.report_failure(&e, log);
         return Err(e);
@@ -165,11 +183,20 @@ fn run_inner<S: Transport>(
         other => return Err(unexpected("MemEnd", &other)),
     }
 
-    // ── Finish ──
-    // Nothing starts until the source has promised never to run the
-    // guest again. Resuming before that commit runs a second copy of
-    // the guest against the same disk whenever the source rolls back.
+    take_over(chan, hooks, status, log)
+}
+
+/// Nothing starts until the source has promised never to run the guest
+/// again. Resuming before that commit runs a second copy of the guest
+/// against the same disk whenever the source rolls back.
+fn take_over<S: Transport>(
+    chan: &mut Chan<S>,
+    hooks: &DestHooks,
+    status: &Arc<Mutex<MigrationStatus>>,
+    log: &slog::Logger,
+) -> Result<(), MigrateError> {
     set_phase(status, MigrationPhase::Finish);
+    hooks.gate.commit()?;
     chan.send(&Message::Okay)?;
     chan.expect_okay()?;
 
@@ -341,12 +368,14 @@ enum PassEnd {
 fn receive_pass<S: Transport>(
     chan: &mut Chan<S>,
     memctx: &MemCtx,
+    gate: &dyn StopGate,
     status: &Arc<Mutex<MigrationStatus>>,
     until: PassEnd,
 ) -> Result<(), MigrateError> {
     let mut sparse: Option<Vec<u64>> = None;
     loop {
         let msg = chan.recv()?;
+        not_cancelled(gate)?;
         match (msg, sparse.take()) {
             (
                 Message::PageBatch {
@@ -512,8 +541,14 @@ mod pass_tests {
             source
         });
         let memctx = memctx();
-        receive_pass(&mut dest, &memctx, &status(), PassEnd::PauseSignal)
-            .expect("a well-formed pass");
+        receive_pass(
+            &mut dest,
+            &memctx,
+            &crate::NoStop,
+            &status(),
+            PassEnd::PauseSignal,
+        )
+        .expect("a well-formed pass");
         sender.join().expect("the sender finished");
 
         assert_eq!(read_page(&memctx, 0), page(0xAA));
@@ -540,8 +575,14 @@ mod pass_tests {
             source
         });
         let memctx = memctx();
-        receive_pass(&mut dest, &memctx, &status(), PassEnd::MemEnd)
-            .expect("a compressed pass");
+        receive_pass(
+            &mut dest,
+            &memctx,
+            &crate::NoStop,
+            &status(),
+            PassEnd::MemEnd,
+        )
+        .expect("a compressed pass");
         sender.join().expect("the sender finished");
         assert_eq!(read_page(&memctx, 0), page(0x11));
     }
@@ -559,9 +600,14 @@ mod pass_tests {
             source.send(&Message::MemEnd).expect("not a batch");
             source
         });
-        let error =
-            receive_pass(&mut dest, &memctx(), &status(), PassEnd::MemEnd)
-                .expect_err("a fetch without its batch");
+        let error = receive_pass(
+            &mut dest,
+            &memctx(),
+            &crate::NoStop,
+            &status(),
+            PassEnd::MemEnd,
+        )
+        .expect_err("a fetch without its batch");
         assert!(
             error.to_string().contains("PageBatch following MemFetch"),
             "{error}",
@@ -579,8 +625,14 @@ mod pass_tests {
             source.send(&Message::PauseSignal).expect("pause");
             source
         });
-        receive_pass(&mut dest, &memctx(), &status(), PassEnd::MemEnd)
-            .expect_err("a pause in the final pass");
+        receive_pass(
+            &mut dest,
+            &memctx(),
+            &crate::NoStop,
+            &status(),
+            PassEnd::MemEnd,
+        )
+        .expect_err("a pause in the final pass");
         sender.join().expect("the sender finished");
     }
 
@@ -595,9 +647,89 @@ mod pass_tests {
         };
         let (source, mut dest) = pair(deadlines);
         let started = std::time::Instant::now();
-        receive_pass(&mut dest, &memctx(), &status(), PassEnd::MemEnd)
-            .expect_err("a peer that says nothing");
+        receive_pass(
+            &mut dest,
+            &memctx(),
+            &crate::NoStop,
+            &status(),
+            PassEnd::MemEnd,
+        )
+        .expect_err("a peer that says nothing");
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(source);
+    }
+
+    /// A gate a test can cancel, counting the commits it let through.
+    #[derive(Default)]
+    struct Gate {
+        cancel: bool,
+        commits: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StopGate for Gate {
+        fn cancelled(&self) -> bool {
+            self.cancel
+        }
+
+        fn commit(&self) -> Result<(), MigrateError> {
+            if self.cancel {
+                return Err(crate::cancelled());
+            }
+            self.commits
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    /// Hooks whose resumes may not run.
+    fn hooks(gate: Gate) -> DestHooks {
+        DestHooks {
+            restore: Box::new(|_, _| Ok(())),
+            resume: Box::new(|| panic!("devices resumed")),
+            hyperv: Box::new(|_| false),
+            pause_vm: Box::new(|| Ok(())),
+            resume_vm: Box::new(|| panic!("vCPUs resumed")),
+            gate: Box::new(gate),
+        }
+    }
+
+    fn discard() -> slog::Logger {
+        slog::Logger::root(slog::Discard, slog::o!())
+    }
+
+    #[test]
+    fn a_cancelled_destination_never_says_it_holds_everything() {
+        // Its Okay lets the source commit, and a stopped destination
+        // would leave the guest running nowhere.
+        let (mut source, mut dest) = pair(Deadlines::default());
+        let gate = Gate {
+            cancel: true,
+            ..Gate::default()
+        };
+
+        let error = take_over(&mut dest, &hooks(gate), &status(), &discard())
+            .expect_err("cancelled");
+
+        assert!(crate::is_cancel(&error), "{error}");
+        drop(dest);
+        assert!(source.recv().is_err(), "the source heard an Okay");
+    }
+
+    #[test]
+    fn a_destination_resumes_nothing_the_source_did_not_commit() {
+        let (mut source, mut dest) = pair(Deadlines::default());
+        let sender = std::thread::spawn(move || {
+            assert!(matches!(source.recv(), Ok(Message::Okay)));
+            source
+                .send(&Message::Error(MigrateError::Phase(
+                    "rolled back".into(),
+                )))
+                .expect("abort");
+            source
+        });
+
+        take_over(&mut dest, &hooks(Gate::default()), &status(), &discard())
+            .expect_err("the source rolled back");
+        sender.join().expect("the source finished");
     }
 }

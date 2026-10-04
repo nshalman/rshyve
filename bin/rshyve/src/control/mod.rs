@@ -81,7 +81,7 @@ use crate::host_state::HostLocalState;
 
 pub use listener::{spawn_control_thread, ControlListener};
 pub(crate) use migrate::device_blockers;
-use run_state::StopFailure;
+use run_state::{StepFailed, StopFailure};
 
 // ── Error type ──────────────────────────────────────────────────────
 
@@ -104,6 +104,9 @@ pub enum VmRunState {
     Stopping = 2,
     Stopped = 3,
     Migrating = 4,
+    /// A release failed and the devices could not be parked again.
+    /// Only a stop is taken.
+    Faulted = 5,
 }
 
 impl VmRunState {
@@ -114,6 +117,7 @@ impl VmRunState {
             2 => Self::Stopping,
             3 => Self::Stopped,
             4 => Self::Migrating,
+            5 => Self::Faulted,
             _other => Self::Stopped,
         }
     }
@@ -449,12 +453,18 @@ impl VmController {
             .name("migrated-source-release".into())
             .spawn(move || {
                 thread::sleep(grace);
-                if !grace_must_release(ctrl.state()) {
+                if !ctrl.run.must_reap() {
                     return;
                 }
                 warn!(ctrl.log, "releasing a migrated source nobody reaped";
                     "grace_secs" => grace.as_secs());
-                ctrl.log_failed_release();
+                reap_with_retries(
+                    REAP_ATTEMPTS,
+                    REAP_RETRY,
+                    || ctrl.run.must_reap(),
+                    || ctrl.release_migrated_source(),
+                    &ctrl.log,
+                );
             });
 
         if let Err(e) = spawned {
@@ -484,6 +494,8 @@ impl VmController {
     ) -> Result<VmRunState, StopFailure<io::Error>> {
         self.run
             .stop(
+                run_state::STOP_WAIT,
+                || self.hold_pause().map_err(io::Error::other),
                 || self.hdl.suspend(how, SUSPEND_SOURCE_VMM).map(drop),
                 || self.release_pause().map_err(io::Error::other),
             )
@@ -525,10 +537,30 @@ impl VmController {
             })
     }
 
+    /// A migration's vCPU release, after its devices were resumed.
+    /// Refused once a stop owns the VM.
     fn resume_for_migration(&self) -> io::Result<()> {
         self.run
-            .unpark(|| self.release_pause())
-            .map_err(io::Error::other)
+            .release_migration(
+                || self.release_pause(),
+                || self.repark_devices(),
+            )
+            .map_err(|e| match e {
+                Some(e) => io::Error::other(e),
+                None => io::Error::other(run_state::STOP_OWNS_VM),
+            })
+    }
+
+    /// Park the devices again under a pause that would not let go.
+    fn repark_devices(&self) -> bool {
+        match pause_device_set(&self.named_devices(), DEVICE_PAUSE_BUDGET) {
+            Ok(()) => true,
+            Err(stuck) => {
+                error!(self.log, "devices run under a held pause; the VM \
+                    is faulted until a stop"; "stuck" => ?stuck);
+                false
+            }
+        }
     }
 
     /// Resume all devices: wake parked workers.
@@ -560,12 +592,30 @@ impl GuestStop for ControlStop {
     }
 }
 
-/// Whether the grace timer must still release the VM itself.
-///
-/// False once something else moved it on, which is the operator `stop`
-/// that beat the timer to it.
-fn grace_must_release(state: VmRunState) -> bool {
-    state == VmRunState::Stopped
+/// The grace timer's tries at a release, and the wait between them.
+const REAP_ATTEMPTS: u32 = 5;
+const REAP_RETRY: Duration = Duration::from_secs(2);
+
+/// Release until it works, nothing is left to release, or the attempts
+/// run out.
+fn reap_with_retries<E: std::fmt::Display>(
+    attempts: u32,
+    delay: Duration,
+    must_reap: impl Fn() -> bool,
+    release: impl Fn() -> Result<(), E>,
+    log: &Logger,
+) {
+    for attempt in 1..=attempts {
+        match release() {
+            Ok(()) => return,
+            Err(e) => error!(log, "failed to release a migrated source";
+                "attempt" => attempt, "error" => %e),
+        }
+        if attempt == attempts || !must_reap() {
+            return;
+        }
+        thread::sleep(delay);
+    }
 }
 
 /// Park the devices, then take the kernel pause.
@@ -575,36 +625,43 @@ fn park_all(
     hold: impl FnOnce() -> anyhow::Result<()>,
     held: &mut bool,
     log: &Logger,
-) -> Result<(), String> {
+) -> Result<(), StepFailed<String>> {
     if let Err(stuck) = pause_device_set(devices, budget) {
-        return Err(format!("device pause timed out: {stuck:?}"));
+        return Err(StepFailed::Undone(format!(
+            "device pause timed out: {stuck:?}"
+        )));
     }
     if let Err(e) = hold() {
         resume_device_set(devices);
         error!(log, "pause failed"; "error" => %e);
-        return Err("pause ioctl failed".to_string());
+        return Err(StepFailed::Undone("pause ioctl failed".to_string()));
     }
     *held = true;
     Ok(())
 }
 
 /// Device workers resume before the vCPUs so interrupts can be
-/// delivered. A release that fails parks them again, so a VM that
-/// stays `Paused` has nothing running.
+/// delivered. A release that fails parks them again; if they will not
+/// park, the VM is faulted rather than called paused.
 fn unpark_all(
     devices: &[NamedDevice],
     budget: Duration,
     release: impl FnOnce() -> anyhow::Result<()>,
     held: &mut bool,
     log: &Logger,
-) -> Result<(), String> {
+) -> Result<(), StepFailed<String>> {
     resume_device_set(devices);
     if let Err(e) = release() {
         error!(log, "resume failed"; "error" => %e);
         if let Err(stuck) = pause_device_set(devices, budget) {
-            error!(log, "devices run under a paused VM"; "stuck" => ?stuck);
+            error!(log, "devices run under a held pause"; "stuck" => ?stuck);
+            return Err(StepFailed::Faulted(
+                "resume ioctl failed and the devices would not park again; \
+                 the VM is faulted and only a stop is taken"
+                    .to_string(),
+            ));
         }
-        return Err("resume ioctl failed".to_string());
+        return Err(StepFailed::Undone("resume ioctl failed".to_string()));
     }
     *held = false;
     Ok(())
@@ -786,16 +843,52 @@ mod tests {
     }
 
     #[test]
-    fn the_grace_timer_stands_down_once_something_else_acted() {
-        assert!(grace_must_release(VmRunState::Stopped));
-        for state in [
-            VmRunState::Running,
-            VmRunState::Paused,
-            VmRunState::Stopping,
-            VmRunState::Migrating,
-        ] {
-            assert!(!grace_must_release(state), "{state:?}");
-        }
+    fn the_grace_timer_retries_a_failed_release() {
+        // One failed release used to leave the zombie for ever.
+        let calls = AtomicUsize::new(0);
+        reap_with_retries(
+            5,
+            Duration::ZERO,
+            || true,
+            || match calls.fetch_add(1, Ordering::AcqRel) {
+                0 | 1 => Err("EBUSY"),
+                _ => Ok(()),
+            },
+            &discard(),
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn the_grace_timer_gives_up_in_bounds() {
+        let calls = AtomicUsize::new(0);
+        reap_with_retries(
+            4,
+            Duration::ZERO,
+            || true,
+            || {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Err("EBUSY")
+            },
+            &discard(),
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn the_grace_timer_stops_retrying_once_nothing_is_left() {
+        let calls = AtomicUsize::new(0);
+        reap_with_retries(
+            5,
+            Duration::ZERO,
+            || false,
+            || {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Err("EBUSY")
+            },
+            &discard(),
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 
     fn discard() -> Logger {
@@ -827,9 +920,31 @@ mod tests {
             &discard(),
         );
 
-        assert_eq!(failed, Err("resume ioctl failed".to_string()));
+        assert_eq!(
+            failed,
+            Err(StepFailed::Undone("resume ioctl failed".to_string()))
+        );
         assert!(held, "the pause is still ours");
         assert!(device.paused.load(Ordering::Acquire), "device left running");
+    }
+
+    #[test]
+    fn devices_that_will_not_park_again_fault_the_vm() {
+        // Paused would let an import write into running devices.
+        let device = never_quiesces();
+        let devices = named(None, device.clone());
+        let mut held = true;
+
+        let failed = unpark_all(
+            &devices,
+            Duration::from_millis(20),
+            || anyhow::bail!("VM_RESUME failed"),
+            &mut held,
+            &discard(),
+        );
+
+        assert!(matches!(failed, Err(StepFailed::Faulted(_))), "{failed:?}");
+        assert!(held);
     }
 
     #[test]
@@ -860,6 +975,7 @@ mod tests {
             VmRunState::Stopping,
             VmRunState::Stopped,
             VmRunState::Migrating,
+            VmRunState::Faulted,
         ] {
             assert_eq!(VmRunState::from_u8(state as u8), state);
         }

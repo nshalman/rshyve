@@ -38,6 +38,46 @@ pub fn hdl_pause_hooks(
     )
 }
 
+/// Why a migration a stop cancelled failed.
+pub const CANCELLED: &str = "a stop cancelled the migration";
+
+/// The error a cancelled migration ends with.
+pub fn cancelled() -> codec::MigrateError {
+    codec::MigrateError::Phase(CANCELLED.to_string())
+}
+
+/// Whether `error` is this end's own cancel, which the peer has not
+/// heard about yet.
+pub fn is_cancel(error: &codec::MigrateError) -> bool {
+    matches!(error, codec::MigrateError::Phase(why) if why == CANCELLED)
+}
+
+/// How the owner lets a stop cancel a migration that has not committed.
+pub trait StopGate: Send + Sync {
+    /// Whether a stop has cancelled the migration. Read often, to give
+    /// up early; [`StopGate::commit`] is the check that counts.
+    fn cancelled(&self) -> bool;
+
+    /// Claim the step this end cannot take back. Refused once a stop
+    /// has cancelled the migration; a stop after it no longer cancels.
+    /// Claimed before the send, because a send that fails may still
+    /// have reached the peer.
+    fn commit(&self) -> Result<(), codec::MigrateError>;
+}
+
+/// The gate for a VM with nothing that can stop it mid-migration.
+pub struct NoStop;
+
+impl StopGate for NoStop {
+    fn cancelled(&self) -> bool {
+        false
+    }
+
+    fn commit(&self) -> Result<(), codec::MigrateError> {
+        Ok(())
+    }
+}
+
 /// Migration phases, executed in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationPhase {
