@@ -297,6 +297,25 @@ fn a_flush_waits_for_work_the_gate_does_not_count() {
     assert!(matches!(result, Err(FlushError::NotQuiesced("flush-test"))));
 }
 
+/// Parked workers with work still out must not make the wait spin: it
+/// holds the lock a worker that takes that work needs.
+#[test]
+fn a_wait_for_idle_polls_and_does_not_spin() {
+    let gate = QuiesceGate::new(0);
+    let polls = AtomicUsize::new(0);
+    let budget = Duration::from_millis(100);
+
+    assert!(!gate.wait_quiesced_and(budget, || {
+        polls.fetch_add(1, Ordering::Relaxed);
+        false
+    }));
+
+    // A sleep never ends early, so this bound holds on any machine.
+    let most = (budget.as_millis() / IDLE_POLL.as_millis()) as usize + 2;
+    let polls = polls.load(Ordering::Relaxed);
+    assert!(polls <= most, "{polls} polls in {budget:?}");
+}
+
 fn wait_until(ready: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !ready() {

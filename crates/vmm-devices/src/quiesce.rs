@@ -263,18 +263,21 @@ impl QuiesceGate {
             let left = deadline.saturating_duration_since(Instant::now());
             drop(
                 self.cv
-                    .wait_timeout_while(
-                        self.state(),
-                        left.min(IDLE_POLL),
-                        |_| self.active.load(Ordering::Acquire) > 0,
-                    )
+                    .wait_timeout_while(self.state(), left, |_| {
+                        self.active.load(Ordering::Acquire) > 0
+                    })
                     .unwrap_or_else(PoisonError::into_inner),
             );
-            if self.active.load(Ordering::Acquire) == 0 && idle() {
+            let parked = self.active.load(Ordering::Acquire) == 0;
+            if parked && idle() {
                 return true;
             }
-            if Instant::now() >= deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 return false;
+            }
+            if parked {
+                thread::sleep(left.min(IDLE_POLL));
             }
         }
     }
