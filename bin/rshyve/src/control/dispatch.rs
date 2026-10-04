@@ -24,7 +24,10 @@ use super::migrate::{
 };
 use super::protocol::{Command, Response};
 use super::run_state::ChangeFailed;
-use super::{StopFailure, VmController, VmRunState};
+use super::{
+    park_all, unpark_all, StopFailure, VmController, VmRunState,
+    DEVICE_PAUSE_BUDGET,
+};
 
 pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
     if let Some(response) =
@@ -47,7 +50,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
         Command::Pause => match ctrl.run.change(
             VmRunState::Running,
             VmRunState::Paused,
-            || pause_step(ctrl),
+            |held| pause_step(ctrl, held),
         ) {
             Ok(()) => {
                 let mut r = Response::ok();
@@ -61,7 +64,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
         Command::Resume => match ctrl.run.change(
             VmRunState::Paused,
             VmRunState::Running,
-            || resume_step(ctrl),
+            |held| resume_step(ctrl, held),
         ) {
             Ok(()) => {
                 let mut r = Response::ok();
@@ -95,7 +98,10 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                         // Back to Stopped so the release timer still
                         // fires. Leaving it Stopping stands the timer
                         // down and the zombie would outlive the node.
-                        ctrl.run.set(VmRunState::Stopped);
+                        ctrl.run.transition(
+                            VmRunState::Stopping,
+                            VmRunState::Stopped,
+                        );
                         error!(ctrl.log, "stop failed"; "error" => %e);
                         Response::err("suspend ioctl failed")
                     }
@@ -186,11 +192,10 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
 
 /// Run one hot-add, if the VM is in a state that can take it.
 ///
-/// The topology lock is held for the whole add, and `migrate_source`
-/// takes the same lock after it claims the state. So an add either
-/// finishes before a migration reads the topology, or finds the VM
-/// migrating and is refused. Without both halves a hot-add could land
-/// on a VM whose destination is already being built.
+/// The topology lock is held for the whole add. `migrate-source` takes
+/// it after it claims the state, and `pause` before it, so an add
+/// either finishes before either reads the device set or finds the VM
+/// no longer running and is refused.
 fn hot_add(ctrl: &VmController, add: impl FnOnce() -> Response) -> Response {
     let _topology = ctrl.run.lock_topology();
     match hot_add_blocked(ctrl.state()) {
@@ -199,26 +204,24 @@ fn hot_add(ctrl: &VmController, add: impl FnOnce() -> Response) -> Response {
     }
 }
 
-/// Park the devices, then the vCPUs.
-fn pause_step(ctrl: &VmController) -> Result<(), String> {
-    if let Err(stuck) = ctrl.pause_devices() {
-        return Err(format!("device pause timed out: {stuck:?}"));
-    }
-    ctrl.hold_pause().map_err(|e| {
-        ctrl.resume_devices();
-        error!(ctrl.log, "pause failed"; "error" => %e);
-        "pause ioctl failed".to_string()
-    })
+fn pause_step(ctrl: &VmController, held: &mut bool) -> Result<(), String> {
+    park_all(
+        &ctrl.named_devices(),
+        DEVICE_PAUSE_BUDGET,
+        || ctrl.hold_pause(),
+        held,
+        &ctrl.log,
+    )
 }
 
-/// Device workers resume before the vCPUs so interrupts can be
-/// delivered.
-fn resume_step(ctrl: &VmController) -> Result<(), String> {
-    ctrl.resume_devices();
-    ctrl.release_pause().map_err(|e| {
-        error!(ctrl.log, "resume failed"; "error" => %e);
-        "resume ioctl failed".to_string()
-    })
+fn resume_step(ctrl: &VmController, held: &mut bool) -> Result<(), String> {
+    unpark_all(
+        &ctrl.named_devices(),
+        DEVICE_PAUSE_BUDGET,
+        || ctrl.release_pause(),
+        held,
+        &ctrl.log,
+    )
 }
 
 /// Latch a stop on a running or paused VM and report what happened.

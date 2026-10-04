@@ -47,6 +47,7 @@ use crate::state;
 use crate::wire::{set_phase, Chan, Deadlines, Transport};
 use crate::MigrationPhase;
 use crate::MigrationStatus;
+use crate::VmPauseFn;
 
 /// The byte the ZFS barrier reports when the final incremental landed.
 pub const ZFS_BARRIER_OK: u8 = 0;
@@ -66,7 +67,7 @@ pub type DeviceExportFn = Box<
     dyn FnOnce() -> Result<Vec<DeviceStatePayload>, DeviceStateError> + Send,
 >;
 
-/// Flush device writeback caches. Called after `hdl.pause()` has
+/// Flush device writeback caches. Called after the vCPU pause has
 /// quiesced the vCPUs and before the ZFS barrier, so `zfs send` sees
 /// every write the guest was told was complete.
 pub type DeviceFlushFn =
@@ -111,6 +112,8 @@ pub struct SourceHooks {
     pub export: DeviceExportFn,
     pub resume: DeviceResumeFn,
     pub hyperv: HypervExportFn,
+    pub pause_vm: VmPauseFn,
+    pub resume_vm: VmPauseFn,
 }
 
 pub fn run_source<S: Transport>(
@@ -138,6 +141,7 @@ pub fn run_source<S: Transport>(
         hooks.flush,
         hooks.export,
         hooks.hyperv,
+        &hooks.pause_vm,
         &status,
         log,
     );
@@ -146,7 +150,7 @@ pub fn run_source<S: Transport>(
         .lock()
         .map(|s| s.phase)
         .unwrap_or(MigrationPhase::Error);
-    finish_source(result, phase, log, resume, || hdl.resume())
+    finish_source(result, phase, log, resume, hooks.resume_vm)
 }
 
 /// Roll the source back when a migration failed after the pause.
@@ -189,6 +193,7 @@ fn run_inner<S: Transport>(
     device_flush_fn: DeviceFlushFn,
     device_export_fn: DeviceExportFn,
     hyperv_export_fn: HypervExportFn,
+    pause_vm: &VmPauseFn,
     status: &Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
@@ -243,8 +248,7 @@ fn run_inner<S: Transport>(
     chan.enter_post_pause()?;
     device_pre_pause_fn()
         .map_err(|e| MigrateError::State(format!("device pause: {e}")))?;
-    hdl.pause()
-        .map_err(|e| MigrateError::Io(format!("pause: {e}")))?;
+    pause_vm().map_err(|e| MigrateError::Io(format!("pause: {e}")))?;
 
     // zvol WCE=1 means writes the guest was told were complete may
     // still sit in cache. `zfs send` ships only committed pool state.

@@ -30,6 +30,7 @@ use crate::state;
 use crate::wire::{set_phase, unexpected, Chan, Deadlines, Transport};
 use crate::MigrationPhase;
 use crate::MigrationStatus;
+use crate::VmPauseFn;
 
 /// Hand one device the state its counterpart on the source exported.
 ///
@@ -71,6 +72,8 @@ pub struct DestHooks {
     pub restore: DeviceRestoreFn,
     pub resume: DeviceResumeFn,
     pub hyperv: HypervRestoreFn,
+    pub pause_vm: VmPauseFn,
+    pub resume_vm: VmPauseFn,
 }
 
 pub fn run_destination<S: Transport>(
@@ -131,8 +134,7 @@ fn run_inner<S: Transport>(
     receive_pass(chan, memctx, status, PassEnd::MemEnd)?;
 
     slog::info!(log, "pausing VM before state import");
-    hdl.pause()
-        .map_err(|e| MigrateError::Io(format!("pause: {e}")))?;
+    (hooks.pause_vm)().map_err(|e| MigrateError::Io(format!("pause: {e}")))?;
 
     // ── TimeData ──
     set_phase(status, MigrationPhase::TimeData);
@@ -176,7 +178,7 @@ fn run_inner<S: Transport>(
     // to post I/O to every one of them.
     (hooks.resume)();
     slog::info!(log, "migration import complete, starting vCPUs");
-    hdl.resume()
+    (hooks.resume_vm)()
         .map_err(|e| MigrateError::Io(format!("resume: {e}")))?;
 
     // The source stays paused until this arrives, so it is what lets a

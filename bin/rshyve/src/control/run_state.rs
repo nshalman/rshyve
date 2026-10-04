@@ -3,31 +3,49 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The VM's run state and the locks that order changes to it.
+//!
+//! | State       | Physically                                           |
+//! |-------------|------------------------------------------------------|
+//! | `Running`   | vCPUs and devices run                                |
+//! | `Paused`    | devices parked, pause held                           |
+//! | `Migrating` | dest: as `Paused`; source: runs until its own pause  |
+//! | `Stopped`   | a migrated-away source: devices parked, pause held   |
+//! | `Stopping`  | suspend latched, pause given back                    |
+//!
+//! "Pause held" is this controller's hold on the kernel pause. Only a
+//! caller under `changing` takes or gives it back, so a stop always
+//! knows whether it has a pause to release. Every move into or out of
+//! `Paused` and every stop runs under `changing`. A migration thread
+//! takes it only for its pause, its release and its end, and ends with
+//! a compare-and-swap so it never undoes a stop.
+//!
+//! Lock order is `changing`, then `topology`. Hot-add and eject take
+//! only `topology`, and nothing under it takes `changing`.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
+use vmm_machine::TopologyLock;
+
 use super::VmRunState;
 
-/// Why `migrate-source` or `migrate-dest` was refused while an operator
-/// pause or resume was still under way.
+/// Why `migrate-source` or `migrate-dest` was refused while another
+/// change held the VM.
 pub(super) const CHANGE_IN_PROGRESS: &str =
-    "a pause or resume is in progress; retry when it ends";
+    "another pause, resume, stop or migration is in progress; retry when \
+     it ends";
+
+/// Why a migration may not pause a VM a stop has claimed.
+pub(super) const STOP_OWNS_VM: &str = "a stop arrived during the migration";
 
 /// The run state, readable from any thread without a lock.
-///
-/// `pause` and `resume` publish their new state before the devices and
-/// vCPUs reach it, so a hot-add sees the change at once. The `changing`
-/// lock is held across the whole of each one, and a migration takes it
-/// before it claims the VM. A migration therefore never sees a state
-/// the devices have not reached.
-///
-/// Lock order is `changing`, then `topology`.
 pub(super) struct RunControl {
     state: AtomicU8,
-    changing: Mutex<()>,
-    /// Held by a hot-add for its whole run.
-    topology: Mutex<()>,
+    /// Whether this controller holds the kernel pause.
+    changing: Mutex<bool>,
+    /// Held across every change to the device set, and across a pause
+    /// or resume so neither sees a device arrive half way.
+    topology: TopologyLock,
 }
 
 /// How a pause or resume ended, when it did not.
@@ -40,27 +58,44 @@ pub(super) enum ChangeFailed<E> {
     Step(E),
 }
 
+/// Puts `from` back if the change does not finish, a panic included.
+struct Rollback<'a> {
+    run: &'a RunControl,
+    from: VmRunState,
+    to: VmRunState,
+}
+
+impl Rollback<'_> {
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Rollback<'_> {
+    fn drop(&mut self) {
+        self.run.transition(self.to, self.from);
+    }
+}
+
 impl RunControl {
+    #[cfg(test)]
     pub(super) fn new(state: VmRunState) -> Self {
+        Self::with_topology(state, TopologyLock::default())
+    }
+
+    pub(super) fn with_topology(
+        state: VmRunState,
+        topology: TopologyLock,
+    ) -> Self {
         Self {
             state: AtomicU8::new(state as u8),
-            changing: Mutex::new(()),
-            topology: Mutex::new(()),
+            changing: Mutex::new(state == VmRunState::Paused),
+            topology,
         }
     }
 
     pub(super) fn get(&self) -> VmRunState {
         VmRunState::from_u8(self.state.load(Ordering::Acquire))
-    }
-
-    /// Only for a caller that owns the current state, such as the stop
-    /// that moved the VM to `Stopping`.
-    pub(super) fn set(&self, state: VmRunState) {
-        self.state.store(state as u8, Ordering::Release);
-    }
-
-    pub(super) fn atomic(&self) -> &AtomicU8 {
-        &self.state
     }
 
     pub(super) fn transition(&self, from: VmRunState, to: VmRunState) -> bool {
@@ -75,13 +110,21 @@ impl RunControl {
     }
 
     pub(super) fn lock_topology(&self) -> MutexGuard<'_, ()> {
-        // Both locks guard a unit, which a panic cannot leave half
-        // written, so a poisoned one is taken rather than dropping a
-        // control request.
-        self.topology.lock().unwrap_or_else(|e| e.into_inner())
+        self.topology.lock()
     }
 
-    fn try_changing(&self) -> Option<MutexGuard<'_, ()>> {
+    #[cfg(test)]
+    fn held(&self) -> bool {
+        *self.lock_changing()
+    }
+
+    // One flag, which a panic cannot leave half written, so a poisoned
+    // lock is taken rather than dropping a control request.
+    fn lock_changing(&self) -> MutexGuard<'_, bool> {
+        self.changing.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn try_changing(&self) -> Option<MutexGuard<'_, bool>> {
         match self.changing.try_lock() {
             Ok(guard) => Some(guard),
             Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
@@ -91,23 +134,28 @@ impl RunControl {
 
     /// Run an operator pause or resume.
     ///
-    /// `to` is published before `step` runs, and on failure the state
-    /// goes back to `from` only if the VM is still in `to`: a stop that
-    /// took it over meanwhile must not be undone.
+    /// `step` gets the pause-held flag and must leave it true exactly
+    /// when the kernel pause is ours. On failure the state goes back to
+    /// `from` only if the VM is still in `to`.
     pub(super) fn change<E>(
         &self,
         from: VmRunState,
         to: VmRunState,
-        step: impl FnOnce() -> Result<(), E>,
+        step: impl FnOnce(&mut bool) -> Result<(), E>,
     ) -> Result<(), ChangeFailed<E>> {
-        let _changing = self.changing.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = self.lock_changing();
+        let _topology = self.lock_topology();
         if !self.transition(from, to) {
             return Err(ChangeFailed::WrongState);
         }
-        step().map_err(|e| {
-            self.transition(to, from);
-            ChangeFailed::Step(e)
-        })
+        let rollback = Rollback {
+            run: self,
+            from,
+            to,
+        };
+        step(&mut held).map_err(ChangeFailed::Step)?;
+        rollback.disarm();
+        Ok(())
     }
 
     /// Claim a running VM as a migration source.
@@ -125,24 +173,27 @@ impl RunControl {
         if !self.transition(VmRunState::Running, VmRunState::Migrating) {
             return Err("VM must be running to start migration".to_string());
         }
-        let refused = {
-            let _topology = self.lock_topology();
-            refusal()
+        let rollback = Rollback {
+            run: self,
+            from: VmRunState::Running,
+            to: VmRunState::Migrating,
         };
-        match refused {
-            Some(why) => {
-                self.end_migration(VmRunState::Running);
-                Err(why)
+        let _topology = self.lock_topology();
+        match refusal() {
+            Some(why) => Err(why),
+            None => {
+                rollback.disarm();
+                Ok(())
             }
-            None => Ok(()),
         }
     }
 
     /// Claim a paused VM for a migration import.
     ///
     /// The import writes every vCPU's registers and every device's
-    /// rings, so the VM must be paused and stay paused. The claim is a
-    /// compare-and-swap so two imports cannot both pass.
+    /// rings, so the VM must be paused and stay paused. The locks keep
+    /// two imports apart; the compare-and-swap keeps out a stop that
+    /// moved the VM on without them.
     pub(super) fn admit_import(
         &self,
         refusal: impl FnOnce() -> Option<String>,
@@ -164,182 +215,179 @@ impl RunControl {
         Ok(())
     }
 
-    /// Give up a migration's claim. False when the VM is no longer
-    /// migrating, which is a stop that arrived meanwhile and owns the
-    /// state now.
-    pub(super) fn end_migration(&self, to: VmRunState) -> bool {
-        self.transition(VmRunState::Migrating, to)
+    /// Take the kernel pause for a migration. `Err(None)` when a stop
+    /// owns the VM: it found no pause to release, so one taken now would
+    /// keep the vCPUs from its suspend.
+    pub(super) fn park_migration<E>(
+        &self,
+        hold: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), Option<E>> {
+        let mut held = self.lock_changing();
+        if self.get() != VmRunState::Migrating {
+            return Err(None);
+        }
+        if !*held {
+            hold().map_err(Some)?;
+            *held = true;
+        }
+        Ok(())
+    }
+
+    /// Give back the kernel pause, if this controller holds it.
+    pub(super) fn unpark<E>(
+        &self,
+        release: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut held = self.lock_changing();
+        give_back(&mut held, release)
+    }
+
+    /// End a migration's claim in the state its pause says: `Paused`
+    /// while the pause is held, `Running` once it is not.
+    ///
+    /// False when a stop owns the VM. `release` then retries a release
+    /// that stop could not make; its suspend is latched, so the vCPUs
+    /// go straight to the exit.
+    pub(super) fn end_migration<E>(
+        &self,
+        release: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let mut held = self.lock_changing();
+        let to = if *held {
+            VmRunState::Paused
+        } else {
+            VmRunState::Running
+        };
+        if self.transition(VmRunState::Migrating, to) {
+            return Ok(true);
+        }
+        self.release_for_stop(&mut held, release).map(|()| false)
+    }
+
+    /// Mark a source whose guest now runs elsewhere. The pause stays
+    /// held so the guest never runs here again.
+    ///
+    /// False, with the same retry as [`Self::end_migration`], when a
+    /// stop owns the VM.
+    pub(super) fn hand_off<E>(
+        &self,
+        release: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let mut held = self.lock_changing();
+        if self.transition(VmRunState::Migrating, VmRunState::Stopped) {
+            return Ok(true);
+        }
+        self.release_for_stop(&mut held, release).map(|()| false)
+    }
+
+    fn release_for_stop<E>(
+        &self,
+        held: &mut bool,
+        release: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        if self.get() == VmRunState::Stopping {
+            give_back(held, release)?;
+        }
+        Ok(())
+    }
+
+    /// Latch a stop and let a parked VM's vCPUs reach it.
+    ///
+    /// Under `changing`, so a pause in progress finishes first and the
+    /// stop sees the pause it took. A stop that finds `Stopping` only
+    /// retries a release the first one could not make.
+    pub(super) fn stop<E>(
+        &self,
+        latch: impl FnOnce() -> Result<(), E>,
+        release: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), StopFailure<E>> {
+        let mut held = self.lock_changing();
+        let Some(from) = self.claim_stop() else {
+            return give_back(&mut held, release)
+                .map_err(StopFailure::NotReleased);
+        };
+        let result = if *held {
+            release_paused_vm(latch, || give_back(&mut held, release))
+        } else {
+            latch().map_err(StopFailure::NotLatched)
+        };
+        if let Err(StopFailure::NotLatched(_)) = &result {
+            self.transition(VmRunState::Stopping, from);
+        }
+        result
+    }
+
+    /// The state the stop took the VM from, or `None` when another stop
+    /// already holds it.
+    fn claim_stop(&self) -> Option<VmRunState> {
+        let mut seen = self.state.load(Ordering::Acquire);
+        loop {
+            if VmRunState::from_u8(seen) == VmRunState::Stopping {
+                return None;
+            }
+            match self.state.compare_exchange(
+                seen,
+                VmRunState::Stopping as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(from) => return Some(VmRunState::from_u8(from)),
+                Err(now) => seen = now,
+            }
+        }
+    }
+}
+
+fn give_back<E>(
+    held: &mut bool,
+    release: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    if *held {
+        release()?;
+        *held = false;
+    }
+    Ok(())
+}
+
+/// Stop a paused VM without letting its guest run one more instruction.
+///
+/// The suspend is latched FIRST. A paused vCPU thread is retrying
+/// VM_RUN against EBUSY; the resume lets it back into the kernel, which
+/// sees the latched suspend and turns it straight around. Resuming
+/// first would run guest code against a disk the migration destination
+/// already owns. A suspend that fails is not followed by a resume, for
+/// the same reason.
+pub(super) fn release_paused_vm<E>(
+    suspend: impl FnOnce() -> Result<(), E>,
+    resume: impl FnOnce() -> Result<(), E>,
+) -> Result<(), StopFailure<E>> {
+    suspend().map_err(StopFailure::NotLatched)?;
+    resume().map_err(StopFailure::NotReleased)
+}
+
+/// Which step of a stop failed.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StopFailure<E> {
+    /// The suspend did not latch, so the VM is as it was.
+    NotLatched(E),
+    /// The suspend latched, but the parked VM was not let back into the
+    /// kernel, so its vCPUs have not seen the stop yet.
+    NotReleased(E),
+}
+
+impl<E> StopFailure<E> {
+    pub(super) fn into_inner(self) -> E {
+        match self {
+            StopFailure::NotLatched(e) | StopFailure::NotReleased(e) => e,
+        }
+    }
+}
+
+impl From<StopFailure<std::io::Error>> for std::io::Error {
+    fn from(failure: StopFailure<std::io::Error>) -> Self {
+        failure.into_inner()
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Arc, Barrier};
-
-    fn import(run: &RunControl) -> Result<(), String> {
-        run.admit_import(|| None)
-    }
-
-    #[test]
-    fn an_import_cannot_claim_a_vm_that_is_still_pausing() {
-        // The state already says Paused while the devices are parking.
-        let run = RunControl::new(VmRunState::Running);
-        run.change(VmRunState::Running, VmRunState::Paused, || {
-            assert_eq!(run.get(), VmRunState::Paused);
-            assert_eq!(import(&run), Err(CHANGE_IN_PROGRESS.to_string()));
-            Ok::<(), ()>(())
-        })
-        .expect("pause");
-
-        import(&run).expect("fully paused");
-        assert_eq!(run.get(), VmRunState::Migrating);
-    }
-
-    #[test]
-    fn an_import_cannot_claim_a_vm_that_is_resuming() {
-        let run = RunControl::new(VmRunState::Paused);
-        run.change(VmRunState::Paused, VmRunState::Running, || {
-            assert_eq!(import(&run), Err(CHANGE_IN_PROGRESS.to_string()));
-            Ok::<(), ()>(())
-        })
-        .expect("resume");
-
-        assert!(import(&run).is_err());
-        assert_eq!(run.get(), VmRunState::Running);
-    }
-
-    #[test]
-    fn a_resume_after_an_import_claim_leaves_it_migrating() {
-        let run = RunControl::new(VmRunState::Paused);
-        import(&run).expect("claim");
-
-        let resumed =
-            run.change(VmRunState::Paused, VmRunState::Running, || {
-                panic!("a resume must not touch a migrating VM")
-            });
-
-        assert_eq!(resumed, Err(ChangeFailed::<()>::WrongState));
-        assert_eq!(run.get(), VmRunState::Migrating);
-    }
-
-    #[test]
-    fn a_second_import_is_refused() {
-        let run = RunControl::new(VmRunState::Paused);
-        import(&run).expect("first");
-        assert!(import(&run).is_err());
-        assert_eq!(run.get(), VmRunState::Migrating);
-    }
-
-    #[test]
-    fn of_racing_imports_exactly_one_wins() {
-        for _ in 0..200 {
-            let run = Arc::new(RunControl::new(VmRunState::Paused));
-            let start = Arc::new(Barrier::new(2));
-            let racers: Vec<_> = (0..2)
-                .map(|_| {
-                    let run = Arc::clone(&run);
-                    let start = Arc::clone(&start);
-                    std::thread::spawn(move || {
-                        start.wait();
-                        import(&run).is_ok()
-                    })
-                })
-                .collect();
-            let wins = racers
-                .into_iter()
-                .map(|r| r.join().expect("racer"))
-                .filter(|won| *won)
-                .count();
-            assert_eq!(wins, 1);
-        }
-    }
-
-    #[test]
-    fn a_refused_import_leaves_the_vm_paused() {
-        let run = RunControl::new(VmRunState::Paused);
-        let refused = run.admit_import(|| Some("blocked".to_string()));
-        assert_eq!(refused, Err("blocked".to_string()));
-        assert_eq!(run.get(), VmRunState::Paused);
-    }
-
-    #[test]
-    fn a_source_refusal_runs_under_the_topology_lock_and_rolls_back() {
-        let run = RunControl::new(VmRunState::Running);
-        let refused = run.admit_source(|| {
-            assert_eq!(run.get(), VmRunState::Migrating);
-            assert!(run.topology.try_lock().is_err(), "topology not held");
-            Some("grew".to_string())
-        });
-        assert_eq!(refused, Err("grew".to_string()));
-        assert_eq!(run.get(), VmRunState::Running);
-    }
-
-    #[test]
-    fn an_import_refusal_runs_under_the_topology_lock() {
-        let run = RunControl::new(VmRunState::Paused);
-        run.admit_import(|| {
-            assert!(run.topology.try_lock().is_err(), "topology not held");
-            None
-        })
-        .expect("admitted");
-    }
-
-    #[test]
-    fn a_source_cannot_claim_a_vm_that_is_resuming() {
-        let run = RunControl::new(VmRunState::Paused);
-        run.change(VmRunState::Paused, VmRunState::Running, || {
-            let claimed = run.admit_source(|| None);
-            assert_eq!(claimed, Err(CHANGE_IN_PROGRESS.to_string()));
-            Ok::<(), ()>(())
-        })
-        .expect("resume");
-        run.admit_source(|| None).expect("running");
-    }
-
-    #[test]
-    fn a_rollback_leaves_a_stop_alone() {
-        // The signal-driven stop takes a migrating VM to Stopping.
-        let run = RunControl::new(VmRunState::Running);
-        run.admit_source(|| None).expect("claim");
-        assert!(run.transition(VmRunState::Migrating, VmRunState::Stopping));
-
-        assert!(!run.end_migration(VmRunState::Running));
-        assert_eq!(run.get(), VmRunState::Stopping);
-    }
-
-    #[test]
-    fn a_stop_during_a_source_refusal_survives_it() {
-        let run = RunControl::new(VmRunState::Running);
-        let refused =
-            run.admit_source(|| {
-                assert!(
-                    run.transition(VmRunState::Migrating, VmRunState::Stopping)
-                );
-                Some("grew".to_string())
-            });
-        assert!(refused.is_err());
-        assert_eq!(run.get(), VmRunState::Stopping);
-    }
-
-    #[test]
-    fn a_failed_pause_rolls_back_but_not_over_a_stop() {
-        let run = RunControl::new(VmRunState::Running);
-        let failed =
-            run.change(VmRunState::Running, VmRunState::Paused, || {
-                Err("stuck")
-            });
-        assert_eq!(failed, Err(ChangeFailed::Step("stuck")));
-        assert_eq!(run.get(), VmRunState::Running);
-
-        let failed =
-            run.change(VmRunState::Running, VmRunState::Paused, || {
-                assert!(
-                    run.transition(VmRunState::Paused, VmRunState::Stopping)
-                );
-                Err("stuck")
-            });
-        assert_eq!(failed, Err(ChangeFailed::Step("stuck")));
-        assert_eq!(run.get(), VmRunState::Stopping);
-    }
-}
+mod tests;

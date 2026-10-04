@@ -19,6 +19,25 @@ pub mod source;
 pub mod state;
 pub mod wire;
 
+/// Pauses or resumes the vCPUs.
+///
+/// A hook and not a direct `VM_PAUSE`, because the kernel keeps one
+/// pause flag per instance and the owner may already hold it, or share
+/// it with an operator pause and a hot-unplug.
+pub type VmPauseFn = Box<dyn Fn() -> std::io::Result<()> + Send>;
+
+/// The pair a VM with nothing else pausing it uses.
+pub fn hdl_pause_hooks(
+    hdl: &std::sync::Arc<vmm_core::hdl::VmmHdl>,
+) -> (VmPauseFn, VmPauseFn) {
+    let for_pause = std::sync::Arc::clone(hdl);
+    let for_resume = std::sync::Arc::clone(hdl);
+    (
+        Box::new(move || for_pause.pause()),
+        Box::new(move || for_resume.resume()),
+    )
+}
+
 /// Migration phases, executed in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationPhase {

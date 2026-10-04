@@ -332,12 +332,12 @@ pub(super) fn migrate_source(
                     }
                     Err(e @ SourceOutcome::Failed(_)) => {
                         error!(mlog, "source migration failed"; "error" => %e);
-                        end_migration(&ctrl_arc, VmRunState::Running);
+                        end_migration(&ctrl_arc);
                     }
                 }
             })
     {
-        end_migration(ctrl, VmRunState::Running);
+        end_migration(ctrl);
         return Response::err(&format!(
             "failed to spawn migration thread: {e}"
         ));
@@ -349,10 +349,17 @@ pub(super) fn migrate_source(
 }
 
 /// Hand the state back from `Migrating`, unless a stop owns it now.
-fn end_migration(ctrl: &VmController, to: VmRunState) {
-    if !ctrl.run.end_migration(to) {
-        info!(ctrl.log, "a stop arrived during the migration; it stands";
-            "state" => ?ctrl.state());
+fn end_migration(ctrl: &VmController) {
+    match ctrl.run.end_migration(|| ctrl.release_pause()) {
+        Ok(true) => {}
+        Ok(false) => {
+            info!(ctrl.log, "a stop arrived during the migration; it stands";
+                "state" => ?ctrl.state());
+        }
+        Err(e) => {
+            error!(ctrl.log, "a stopping VM would not resume to see its \
+                stop"; "error" => %e);
+        }
     }
 }
 
@@ -363,6 +370,7 @@ fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
     let for_resume = Arc::clone(ctrl);
     let for_export = Arc::clone(ctrl);
     let for_hyperv = Arc::clone(ctrl);
+    let (pause_vm, resume_vm) = migration_pause_hooks(ctrl);
     vmm_migrate::source::SourceHooks {
         pre_pause: Box::new(move || {
             for_pre_pause.pause_devices_for_migration()
@@ -371,7 +379,20 @@ fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
         resume: Box::new(move || for_resume.resume_devices_after_migration()),
         export: Box::new(move || for_export.export_device_state()),
         hyperv: Box::new(move || for_hyperv.export_hyperv()),
+        pause_vm,
+        resume_vm,
     }
+}
+
+fn migration_pause_hooks(
+    ctrl: &Arc<VmController>,
+) -> (vmm_migrate::VmPauseFn, vmm_migrate::VmPauseFn) {
+    let for_pause = Arc::clone(ctrl);
+    let for_resume = Arc::clone(ctrl);
+    (
+        Box::new(move || for_pause.pause_for_migration()),
+        Box::new(move || for_resume.resume_for_migration()),
+    )
 }
 
 /// How a source migration ended, when it did not succeed.
@@ -466,7 +487,7 @@ pub(super) fn migrate_dest(
                             mlog,
                             "destination migration complete, VM running"
                         );
-                        end_migration(&ctrl_arc, VmRunState::Running);
+                        end_migration(&ctrl_arc);
                     }
                     Err(e) => {
                         // The guest never left this VM's previous state, so
@@ -474,12 +495,12 @@ pub(super) fn migrate_dest(
                         // control command can reach.
                         error!(mlog, "destination migration failed";
                         "error" => %e);
-                        end_migration(&ctrl_arc, VmRunState::Paused);
+                        end_migration(&ctrl_arc);
                     }
                 }
             })
     {
-        end_migration(ctrl, VmRunState::Paused);
+        end_migration(ctrl);
         return Response::err(&format!(
             "failed to spawn migration thread: {e}"
         ));
@@ -495,12 +516,15 @@ fn dest_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::destination::DestHooks {
     let for_restore = Arc::clone(ctrl);
     let for_resume = Arc::clone(ctrl);
     let for_hyperv = Arc::clone(ctrl);
+    let (pause_vm, resume_vm) = migration_pause_hooks(ctrl);
     vmm_migrate::destination::DestHooks {
         restore: Box::new(move |bdf, state| {
             for_restore.restore_device_state(bdf, state)
         }),
         resume: Box::new(move || for_resume.resume_devices()),
         hyperv: Box::new(move |state| for_hyperv.restore_hyperv(state)),
+        pause_vm,
+        resume_vm,
     }
 }
 

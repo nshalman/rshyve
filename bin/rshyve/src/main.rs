@@ -168,6 +168,7 @@ fn run_migration_destination(
     let by_bdf = devices.clone();
     let for_resume: Vec<Arc<dyn vmm_devices::Lifecycle>> =
         registry.lifecycle_devices();
+    let (pause_vm, resume_vm) = vmm_migrate::hdl_pause_hooks(machine.hdl());
     let hooks = vmm_migrate::destination::DestHooks {
         restore: Box::new(move |bdf, state| {
             let device = by_bdf
@@ -196,6 +197,8 @@ fn run_migration_destination(
             // gone. A mismatch, not a silent drop.
             None => false,
         }),
+        pause_vm,
+        resume_vm,
     };
 
     let status = Arc::new(std::sync::Mutex::new(
