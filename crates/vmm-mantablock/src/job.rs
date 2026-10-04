@@ -14,13 +14,16 @@ use std::sync::Arc;
 
 use manta_block_ring::Status;
 use vmm_storage::nvme::backend::{
-    BlockOp, BlockRequest, BlockStatus, CompletionSink, RequestId,
+    BlockOp, BlockRequest, BlockStatus, CompletionSink, RequestId, Segments,
 };
 
 /// One guest I/O request.
 pub trait Job: Send + 'static {
     /// What the sink is told.
     type Id: Copy + Send + 'static;
+    /// The guest memory of a read or write, found once when the ring
+    /// takes the request.
+    type Pages: Send + 'static;
 
     /// Names the request to the sink.
     fn id(&self) -> Self::Id;
@@ -39,12 +42,24 @@ pub trait Job: Send + 'static {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    /// Copies the data of a write out of guest memory into `dst`, which
-    /// is [`Job::len`] bytes.
-    fn copy_from_guest(&self, dst: &mut [u8]) -> io::Result<()>;
-    /// Copies the data of a read into guest memory from `src`, which is
-    /// [`Job::len`] bytes.
-    fn copy_to_guest(&self, src: &[u8]) -> io::Result<()>;
+    /// Finds the guest memory of a read or write.
+    fn pages(&self) -> io::Result<Self::Pages>;
+    /// Copies `dst.len()` bytes of a write out of guest memory, from `at`
+    /// bytes into the transfer.
+    fn copy_from_guest(
+        &self,
+        pages: &Self::Pages,
+        at: usize,
+        dst: &mut [u8],
+    ) -> io::Result<()>;
+    /// Copies `src` into guest memory for a read, from `at` bytes into
+    /// the transfer.
+    fn copy_to_guest(
+        &self,
+        pages: &Self::Pages,
+        at: usize,
+        src: &[u8],
+    ) -> io::Result<()>;
 }
 
 /// Where finished requests go, in batches, from any thread.
@@ -55,6 +70,7 @@ pub trait Sink<Id>: Send + Sync + 'static {
 
 impl Job for BlockRequest {
     type Id = RequestId;
+    type Pages = Segments;
 
     fn id(&self) -> RequestId {
         BlockRequest::id(self)
@@ -80,12 +96,26 @@ impl Job for BlockRequest {
         self.data().len()
     }
 
-    fn copy_from_guest(&self, dst: &mut [u8]) -> io::Result<()> {
-        self.data().copy_from_guest(dst)
+    fn pages(&self) -> io::Result<Segments> {
+        self.data().segments()
     }
 
-    fn copy_to_guest(&self, src: &[u8]) -> io::Result<()> {
-        self.data().copy_to_guest(src)
+    fn copy_from_guest(
+        &self,
+        pages: &Segments,
+        at: usize,
+        dst: &mut [u8],
+    ) -> io::Result<()> {
+        self.data().copy_from_guest_at(pages, at, dst)
+    }
+
+    fn copy_to_guest(
+        &self,
+        pages: &Segments,
+        at: usize,
+        src: &[u8],
+    ) -> io::Result<()> {
+        self.data().copy_to_guest_at(pages, at, src)
     }
 }
 

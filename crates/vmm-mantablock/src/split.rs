@@ -40,10 +40,6 @@ impl Slots {
         u32::from(tag) * self.part_blocks
     }
 
-    pub(crate) fn parts(&self, blocks: u32) -> u32 {
-        blocks.div_ceil(self.part_blocks)
-    }
-
     /// Blocks in the part that starts at block `next`.
     pub(crate) fn next_part(&self, blocks: u32, next: u32) -> u32 {
         blocks.saturating_sub(next).min(self.part_blocks)
@@ -107,7 +103,11 @@ mod tests {
                 parts += 1;
             }
             assert_eq!(next, blocks);
-            assert_eq!(parts, s.parts(blocks), "{blocks} blocks");
+            assert_eq!(
+                parts,
+                blocks.div_ceil(s.part_blocks),
+                "{blocks} blocks"
+            );
             assert_eq!(s.next_part(blocks, blocks), 0);
         }
     }

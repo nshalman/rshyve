@@ -20,6 +20,7 @@ use manta_block_ring::{
 };
 use vmm_storage::nvme::backend::{BlockOp, BlockStatus};
 
+use crate::copy::{self, Span, Stage};
 use crate::ids::Seqs;
 use crate::job::{block_status, Job};
 use crate::split::Slots;
@@ -119,7 +120,7 @@ impl<Id> Out<Id> {
     }
 }
 
-struct Req<J> {
+struct Req<J: Job> {
     owner: Owner<J>,
     op: Op,
     lba: u64,
@@ -133,9 +134,8 @@ struct Req<J> {
     flush_after: bool,
     /// The first failure of any part.
     status: BlockStatus,
-    /// The whole request's data, when it goes as more than one part. A
-    /// write copies the guest data once, at submit.
-    bounce: Option<Vec<u8>>,
+    /// Guest memory, for a read or write.
+    pages: Option<J::Pages>,
     /// In the pending queue.
     queued: bool,
 }
@@ -163,7 +163,7 @@ pub(crate) struct QueueRing<J: Job> {
     reqs: Vec<Option<Req<J>>>,
     /// Requests with something left to put on the ring, oldest first.
     pending: VecDeque<usize>,
-    scratch: Vec<u8>,
+    stage: Stage,
     durable: bool,
     volume_blocks: u64,
     dead: bool,
@@ -195,7 +195,7 @@ impl<J: Job> QueueRing<J> {
             free: (0..slots.tags).rev().collect(),
             reqs: (0..=tags).map(|_| None).collect(),
             pending: VecDeque::new(),
-            scratch: vec![0; slots.part_blocks as usize * PAGE],
+            stage: Stage::new(),
             durable,
             volume_blocks,
             dead: false,
@@ -251,7 +251,7 @@ impl<J: Job> QueueRing<J> {
     }
 
     /// The request in ring terms. `Ok(None)` when there is nothing to send.
-    fn shape(&self, job: &J) -> Result<Option<Shape>, BlockStatus> {
+    fn shape(&self, job: &J) -> Result<Option<Shape<J>>, BlockStatus> {
         let op = match job.op() {
             // Every completed write is already durable.
             BlockOp::Flush if self.durable => return Ok(None),
@@ -280,23 +280,14 @@ impl<J: Job> QueueRing<J> {
         {
             return Err(BlockStatus::LbaOutOfRange);
         }
-        let bounce = if self.slots.parts(blocks) > 1 {
-            let mut b = vec![0; len];
-            if op == Op::Write {
-                job.copy_from_guest(&mut b)
-                    .map_err(|_| BlockStatus::DataTransfer)?;
-            }
-            Some(b)
-        } else {
-            None
-        };
+        let pages = job.pages().map_err(|_| BlockStatus::DataTransfer)?;
         let fua = matches!(job.op(), BlockOp::Write { fua: true });
         Ok(Some(Shape {
             op,
             lba,
             blocks,
             flush_after: fua && !self.durable,
-            bounce,
+            pages: Some(pages),
         }))
     }
 
@@ -362,27 +353,20 @@ impl<J: Job> QueueRing<J> {
             (req.next, self.slots.next_part(req.blocks, req.next))
         };
         if !flush && req.op == Op::Write {
-            let len = blocks as usize * PAGE;
-            let data = match &req.bounce {
-                Some(b) => {
-                    let at = first as usize * PAGE;
-                    &b[at..at + len]
-                }
-                None => {
-                    let Owner::Guest(job) = &req.owner else {
-                        return Err(Posted::Copy(BlockStatus::Internal));
-                    };
-                    let dst = &mut self.scratch[..len];
-                    job.copy_from_guest(dst)
-                        .map_err(|_| Posted::Copy(BlockStatus::DataTransfer))?;
-                    &self.scratch[..len]
-                }
+            let (Owner::Guest(job), Some(pages)) = (&req.owner, &req.pages)
+            else {
+                return Err(Posted::Copy(BlockStatus::Internal));
+            };
+            let span = Span {
+                q: self.q,
+                page,
+                first,
+                blocks,
             };
             // The engine reads the buffer only after the tail moves, and
             // the tail store below releases these stores.
-            if !self.region.write_buffer(self.q, page, data) {
-                return Err(Posted::Copy(BlockStatus::Internal));
-            }
+            copy::to_ring(&self.region, job, pages, span, &mut self.stage)
+                .map_err(Posted::Copy)?;
         }
         let (id, watermark) = self
             .seqs
@@ -471,7 +455,7 @@ impl<J: Job> QueueRing<J> {
                 c.tag,
                 part,
                 req,
-                &mut self.scratch,
+                &mut self.stage,
             );
         }
         if s != BlockStatus::Success && req.status == BlockStatus::Success {
@@ -499,22 +483,13 @@ impl<J: Job> QueueRing<J> {
             }
             return;
         }
-        let Some(mut req) = self.reqs[slot].take() else {
+        let Some(req) = self.reqs[slot].take() else {
             return;
         };
         if req.queued {
             self.pending.retain(|&s| s != slot);
         }
-        let mut s = req.status;
-        if s == BlockStatus::Success && req.op == Op::Read {
-            if let (Some(b), Owner::Guest(job)) = (&req.bounce, &req.owner) {
-                if job.copy_to_guest(b).is_err() {
-                    s = BlockStatus::DataTransfer;
-                }
-            }
-        }
-        req.bounce = None;
-        out.finish(req.owner, s);
+        out.finish(req.owner, req.status);
     }
 
     /// The engine is lost: fail everything held, and take nothing more.
@@ -544,15 +519,15 @@ enum Posted {
 }
 
 /// A request in ring terms, before it has an owner.
-struct Shape {
+struct Shape<J: Job> {
     op: Op,
     lba: u64,
     blocks: u32,
     flush_after: bool,
-    bounce: Option<Vec<u8>>,
+    pages: Option<J::Pages>,
 }
 
-impl Shape {
+impl<J: Job> Shape<J> {
     /// A flush carries no data; it goes as one part once the queue
     /// reaches it.
     fn flush() -> Self {
@@ -561,13 +536,13 @@ impl Shape {
             lba: 0,
             blocks: 0,
             flush_after: true,
-            bounce: None,
+            pages: None,
         }
     }
 }
 
-impl<J> Req<J> {
-    fn new(owner: Owner<J>, s: Shape) -> Self {
+impl<J: Job> Req<J> {
+    fn new(owner: Owner<J>, s: Shape<J>) -> Self {
         Self {
             owner,
             op: s.op,
@@ -577,45 +552,34 @@ impl<J> Req<J> {
             in_ring: 0,
             flush_after: s.flush_after,
             status: BlockStatus::Success,
-            bounce: s.bounce,
+            pages: s.pages,
             queued: false,
         }
     }
 }
 
-/// Copies a finished read part out of the ring: into the bounce buffer
-/// when the request has parts, else straight on to the guest.
+/// Copies a finished read part out of the ring to the guest.
 fn read_back<J: Job>(
     region: &Region,
     q: u16,
     slots: Slots,
     tag: u16,
     part: &Part,
-    req: &mut Req<J>,
-    scratch: &mut [u8],
+    req: &Req<J>,
+    stage: &mut Stage,
 ) -> BlockStatus {
-    let len = part.blocks as usize * PAGE;
-    let page = slots.page(tag);
-    match (&mut req.bounce, &req.owner) {
-        (Some(b), _) => {
-            let at = part.first as usize * PAGE;
-            if region.read_buffer(q, page, &mut b[at..at + len]) {
-                BlockStatus::Success
-            } else {
-                BlockStatus::Internal
-            }
-        }
-        (None, Owner::Guest(job)) => {
-            let dst = &mut scratch[..len];
-            if !region.read_buffer(q, page, dst) {
-                return BlockStatus::Internal;
-            }
-            match job.copy_to_guest(dst) {
-                Ok(()) => BlockStatus::Success,
-                Err(_) => BlockStatus::DataTransfer,
-            }
-        }
-        (None, Owner::Internal(_)) => BlockStatus::Internal,
+    let (Owner::Guest(job), Some(pages)) = (&req.owner, &req.pages) else {
+        return BlockStatus::Internal;
+    };
+    let span = Span {
+        q,
+        page: slots.page(tag),
+        first: part.first,
+        blocks: part.blocks,
+    };
+    match copy::from_ring(region, job, pages, span, stage) {
+        Ok(()) => BlockStatus::Success,
+        Err(s) => s,
     }
 }
 

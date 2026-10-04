@@ -146,6 +146,7 @@ struct TJob {
 
 impl Job for TJob {
     type Id = u32;
+    type Pages = ();
 
     fn id(&self) -> u32 {
         self.id
@@ -171,13 +172,22 @@ impl Job for TJob {
         self.mem.lock().unwrap().len()
     }
 
-    fn copy_from_guest(&self, dst: &mut [u8]) -> io::Result<()> {
-        dst.copy_from_slice(&self.mem.lock().unwrap());
+    fn pages(&self) -> io::Result<()> {
         Ok(())
     }
 
-    fn copy_to_guest(&self, src: &[u8]) -> io::Result<()> {
-        self.mem.lock().unwrap().copy_from_slice(src);
+    fn copy_from_guest(
+        &self,
+        _: &(),
+        at: usize,
+        dst: &mut [u8],
+    ) -> io::Result<()> {
+        dst.copy_from_slice(&self.mem.lock().unwrap()[at..at + dst.len()]);
+        Ok(())
+    }
+
+    fn copy_to_guest(&self, _: &(), at: usize, src: &[u8]) -> io::Result<()> {
+        self.mem.lock().unwrap()[at..at + src.len()].copy_from_slice(src);
         Ok(())
     }
 }

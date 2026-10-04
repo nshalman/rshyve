@@ -31,6 +31,7 @@ use vmm_storage::nvme::{LbaSize, NvmeConfig};
 mod attach;
 mod conn;
 mod control;
+mod copy;
 mod ids;
 mod job;
 mod queue;
