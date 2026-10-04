@@ -203,7 +203,14 @@ SCSI/MMC commands implemented: TEST UNIT READY, REQUEST SENSE, INQUIRY, START/ST
 
 ### zvol write cache
 
-Any writable virtio-blk or NVMe backing fd that is a disk device (char or block) is probed once at open with `DKIOCFLUSHWRITECACHE` (`crates/vmm-devices/src/blkdev.rs`). If the flush works, the write cache is turned on (`DKIOCSETWCE=1`) and every guest flush sends the ioctl. If it answers ENOTSUP or ENOTTY, the disk cannot flush: the write cache is turned off, and the disk is refused if the cache stays on. Guest flushes are then no-ops. Any other probe error refuses the disk. Regular files use fsync. The original cache state is restored on drop. Skipped entirely under `ro`. `ahci-cd` does not use it.
+A writable virtio-blk or NVMe backing fd is handled by type (`crates/vmm-devices/src/blkdev.rs`). Skipped entirely under `ro`. `ahci-cd` does not use it.
+
+- **Regular file or block device** (`/dev/zvol/dsk/...`): guest flushes call fsync. Specfs refuses every ioctl on a block node with ENOTTY, and block writes go through the specfs page cache that only fsync writes out. fsync does not return the device flush error, so use the raw node (`/dev/zvol/rdsk/...`), as Triton does.
+- **Character device** (`/dev/zvol/rdsk/...`): probed once at open with `DKIOCFLUSHWRITECACHE`.
+  - The probe works: if the write cache is off, it is turned on (`DKIOCSETWCE=1`, best effort) and the flush is probed again, because sd answers a flush with success and sends nothing while the cache is off. Every guest flush then sends the ioctl and every error goes back to the guest.
+  - A probe answers ENOTSUP or ENOTTY: the disk cannot flush. The write cache is turned off if it is on and read back. Guest flushes are then no-ops. The disk is refused if the cache cannot be confirmed off, unless `DKIOCGETWCE` itself answers ENOTSUP or ENOTTY (no cache control).
+  - Any other errno, on either probe, refuses the disk.
+  - On drop, a write cache this open turned on is turned off. A cache turned off because the disk cannot flush stays off. The cache is device-global, so it only ever moves toward off for other opens of the same device.
 
 ## Network
 
