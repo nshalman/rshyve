@@ -30,11 +30,13 @@ pub(crate) fn adopt(fd: &OwnedFd, end: End) -> io::Result<()> {
         return Err(bad("a wake-up descriptor is not a pipe"));
     }
     let fl = rustix::fs::fcntl_getfl(fd)?;
-    let want = match end {
-        End::Read => OFlags::RDONLY,
-        End::Write => OFlags::WRONLY,
+    // illumos pipes are STREAMS pipes: both ends are open for reading and
+    // writing, so only the wrong single direction is refused.
+    let wrong = match end {
+        End::Read => OFlags::WRONLY,
+        End::Write => OFlags::RDONLY,
     };
-    if fl & OFlags::RWMODE != want {
+    if fl & OFlags::RWMODE == wrong {
         return Err(bad("a wake-up pipe end has the wrong direction"));
     }
     rustix::fs::fcntl_setfl(fd, fl | OFlags::NONBLOCK)?;
@@ -99,8 +101,12 @@ mod tests {
     #[test]
     fn ends_are_checked_and_made_non_blocking() {
         let (rx, tx) = rustix::pipe::pipe().unwrap();
-        assert!(adopt(&rx, End::Write).is_err());
-        assert!(adopt(&tx, End::Read).is_err());
+        // Elsewhere each end goes one way; illumos pipes go both.
+        #[cfg(not(target_os = "illumos"))]
+        {
+            assert!(adopt(&rx, End::Write).is_err());
+            assert!(adopt(&tx, End::Read).is_err());
+        }
         adopt(&rx, End::Read).unwrap();
         adopt(&tx, End::Write).unwrap();
         // A full pipe does not block the waker.
