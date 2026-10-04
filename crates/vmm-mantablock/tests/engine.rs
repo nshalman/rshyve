@@ -25,6 +25,9 @@ use rustix::process::{kill_process, waitpid, Pid, Signal, WaitOptions};
 use vmm_mantablock::{connect, Config, Job, Ring, Sink};
 use vmm_storage::nvme::backend::{BlockOp, BlockStatus};
 
+#[path = "engine/controller.rs"]
+mod controller;
+
 const PAGE: usize = 4096;
 const BLOCKS: u64 = 4096;
 const FILE_VOL: &str = "00000000-0000-0000-0000-00000000f11e";

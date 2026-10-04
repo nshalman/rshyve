@@ -81,3 +81,9 @@ MANTABLOCK_ENGINE=<manta-storage>/target/debug/mantablock-engine \
 
 Run with `--ignored`, these tests fail without `MANTABLOCK_ENGINE`
 rather than pass without the engine.
+
+The `controller::` tests in `tests/engine/controller.rs` build the NVMe
+controller on the ring with `NvmeController::with_backend`, as rshyve
+does, and drive it through its registers. That constructor takes a VM
+handle, so they make a VM and need `/dev/vmm` and the privilege to
+make one: run them on the illumos build host.

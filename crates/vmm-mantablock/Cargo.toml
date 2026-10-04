@@ -17,6 +17,8 @@ vmm_devices.workspace = true
 vmm_storage.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
+vmm_core.workspace = true
 # The integration tests stop and kill the engine process.
 rustix = { version = "1", features = ["process"] }
 tempfile = "3"
