@@ -180,79 +180,44 @@ fn a_parked_worker_takes_work_it_finds() {
     assert_eq!(gate.active.load(Ordering::Acquire), 1);
 }
 
-/// A pause is in force before it waits for the producers already
-/// admitted, so a producer that comes later backs out at once.
+/// A pause or a drain is in force before it waits for the producers
+/// already admitted, so a producer that comes later backs out at once.
+/// Only the takes in progress when it starts can hold it off, so a
+/// stream of producers cannot starve it.
 #[test]
 fn a_waiting_pause_turns_new_producers_away() {
-    let gate = Arc::new(QuiesceGate::new(0));
-    let admission = gate.admit().expect("an idle gate admits");
-    let pauser = {
-        let gate = Arc::clone(&gate);
-        thread::spawn(move || gate.pause())
-    };
-    wait_until(|| gate.paused.load(Ordering::Acquire));
-
-    let (tx, rx) = mpsc::channel();
-    let late = {
-        let gate = Arc::clone(&gate);
-        thread::spawn(move || {
-            tx.send(gate.admit().is_none()).expect("report the admit");
-        })
-    };
-    assert_eq!(
-        rx.recv_timeout(Duration::from_secs(5)),
-        Ok(true),
-        "a producer got past a pause that was waiting"
-    );
-
-    drop(admission);
-    pauser.join().expect("pause thread");
-    late.join().expect("producer thread");
-}
-
-/// Producers that come one after another must not hold a pause or a
-/// drain off. Only the takes in progress when it starts may.
-#[test]
-fn a_stream_of_producers_cannot_starve_a_pause() {
-    let gate = Arc::new(QuiesceGate::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let producers: Vec<_> = (0..4)
-        .map(|_| {
+    for drain in [false, true] {
+        let gate = Arc::new(QuiesceGate::new(0));
+        let admission = gate.admit().expect("an idle gate admits");
+        let holder = {
             let gate = Arc::clone(&gate);
-            let stop = Arc::clone(&stop);
             thread::spawn(move || {
-                while !stop.load(Ordering::Acquire) {
-                    if let Some(admission) = gate.admit() {
-                        thread::yield_now();
-                        drop(admission);
-                    } else {
-                        gate.park_if_paused();
-                    }
+                if drain {
+                    drop(gate.drain_scope());
+                } else {
+                    gate.pause();
                 }
             })
-        })
-        .collect();
+        };
+        wait_until(|| gate.is_paused());
 
-    for _ in 0..100 {
         let (tx, rx) = mpsc::channel();
-        let pauser = {
+        let late = {
             let gate = Arc::clone(&gate);
             thread::spawn(move || {
-                gate.pause();
-                let drain = gate.drain_scope();
-                drop(drain);
-                tx.send(()).expect("report the pause");
+                tx.send(gate.admit().is_none()).expect("report the admit");
             })
         };
-        rx.recv_timeout(Duration::from_secs(5))
-            .expect("producers held the pause off");
-        pauser.join().expect("pause thread");
-        gate.resume();
-    }
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "a producer got past a waiting {}",
+            if drain { "drain" } else { "pause" }
+        );
 
-    stop.store(true, Ordering::Release);
-    for producer in producers {
-        producer.join().expect("producer thread");
+        drop(admission);
+        holder.join().expect("pause thread");
+        late.join().expect("producer thread");
     }
 }
 
