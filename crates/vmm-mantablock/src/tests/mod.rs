@@ -25,6 +25,7 @@ use crate::wake::{adopt, End};
 use crate::{Config, Job, Ring, Sink};
 
 mod control;
+mod faults;
 mod scatter;
 mod stress;
 

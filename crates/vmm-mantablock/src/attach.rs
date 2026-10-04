@@ -203,7 +203,9 @@ fn map(fd: OwnedFd, geometry: Geometry) -> io::Result<Arc<Region>> {
     // aligned by mmap. The Region keeps `map` until it drops, so the
     // mapping outlives every ring handle. This process reaches the bytes
     // only through the Region, which uses atomics, so the engine writing
-    // them at any time is sound.
+    // them at any time is sound. The engine is trusted not to shrink the
+    // file while attached, and not to leave it sparse on a tmpfs that can
+    // fill: either raises SIGBUS here, which nothing guards against.
     let region = unsafe { Region::with_owner(base, len, geometry, map) }
         .map_err(invalid)?;
     Ok(Arc::new(region))
@@ -287,5 +289,145 @@ mod tests {
         let f = tempfile::tempfile().unwrap();
         f.set_len(g.region_len() as u64).unwrap();
         assert!(map(OwnedFd::from(f), g).is_ok());
+    }
+
+    /// Plays the engine's side of Hello and Attach over a real socket,
+    /// sending `fds` with AttachOk.
+    fn engine(
+        theirs: std::os::unix::net::UnixStream,
+        reply: AttachOk,
+        fds: Vec<OwnedFd>,
+    ) -> std::thread::JoinHandle<()> {
+        use std::io::{IoSlice, Read, Write};
+        use std::mem::MaybeUninit;
+        use std::os::fd::{AsFd, BorrowedFd};
+
+        use rustix::net::{
+            SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
+        };
+
+        std::thread::spawn(move || {
+            let mut s = theirs;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            for step in 0..2 {
+                let msg = loop {
+                    if let Some((m, _, used)) = Message::decode(&buf).unwrap() {
+                        buf.drain(..used);
+                        break m;
+                    }
+                    let n = s.read(&mut chunk).unwrap();
+                    assert!(n > 0);
+                    buf.extend_from_slice(&chunk[..n]);
+                };
+                if step == 0 {
+                    assert!(matches!(msg, Message::Hello { .. }));
+                    let ack = Message::HelloAck {
+                        version: PROTOCOL_VERSION,
+                        features: 0,
+                    };
+                    s.write_all(&ack.encode(1)).unwrap();
+                    continue;
+                }
+                assert!(matches!(msg, Message::Attach(_)));
+                let frame = Message::AttachOk(reply.clone()).encode(2);
+                let borrowed: Vec<BorrowedFd<'_>> =
+                    fds.iter().map(|f| f.as_fd()).collect();
+                let mut space =
+                    [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(64))];
+                let mut anc = SendAncillaryBuffer::new(&mut space);
+                assert!(anc.push(SendAncillaryMessage::ScmRights(&borrowed)));
+                rustix::net::sendmsg(
+                    &s,
+                    &[IoSlice::new(&frame)],
+                    &mut anc,
+                    SendFlags::empty(),
+                )
+                .unwrap();
+            }
+            // Hold the socket until the other side is done with it.
+            let _ = s.read(&mut chunk);
+        })
+    }
+
+    /// A region file for `g` with its header, the AttachOk that names
+    /// it, and the ask that fits.
+    fn granted() -> (Ask, AttachOk, File) {
+        let g = Geometry::new(1, 16, 4).unwrap();
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(g.region_len() as u64).unwrap();
+        let region = map(OwnedFd::from(file.try_clone().unwrap()), g).unwrap();
+        region.write_header(&manta_block_ring::Header {
+            geometry: g,
+            volume_blocks: 100,
+            attach_generation: 9,
+        });
+        let ask = Ask {
+            volume: [1; 16],
+            queues: 1,
+            depth: 16,
+            buf_pages: 4,
+            max_blocks: 1,
+            allow_volatile: false,
+        };
+        let ok = AttachOk {
+            generation: 9,
+            queues: 1,
+            depth: 16,
+            buf_pages: 4,
+            max_blocks: 1,
+            volume_blocks: 100,
+            region_len: g.region_len() as u64,
+            layout_version: LAYOUT_VERSION,
+            flags: ATTACH_DURABLE,
+        };
+        (ask, ok, file)
+    }
+
+    fn attach_with(
+        fds: impl FnOnce(File) -> Vec<OwnedFd>,
+    ) -> io::Result<Attached> {
+        let (ask, ok, file) = granted();
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let eng = engine(theirs, ok, fds(file));
+        let mut conn = Conn::new(ours).unwrap();
+        let got = attach(
+            &mut conn,
+            &ask,
+            Instant::now() + std::time::Duration::from_secs(5),
+        );
+        drop(conn);
+        eng.join().unwrap();
+        got
+    }
+
+    #[test]
+    fn attach_takes_the_region_and_pipes_with_scm_rights() {
+        let att = attach_with(|file| {
+            let (_, engine_tx) = rustix::pipe::pipe().unwrap();
+            let (vmm_rx, _) = rustix::pipe::pipe().unwrap();
+            vec![OwnedFd::from(file), engine_tx, vmm_rx]
+        })
+        .unwrap();
+        assert_eq!((att.generation, att.pipes.len()), (9, 1));
+        assert!(att.durable);
+    }
+
+    #[test]
+    fn attach_refuses_the_wrong_descriptor_count() {
+        let e = attach_with(|file| vec![OwnedFd::from(file)]).err().unwrap();
+        assert!(e.to_string().contains("descriptors"), "{e}");
+    }
+
+    #[test]
+    fn attach_refuses_truncated_descriptors() {
+        // More than any frame may carry, so the control data is cut.
+        let e = attach_with(|file| {
+            let file = OwnedFd::from(file);
+            (0..40).map(|_| file.try_clone().unwrap()).collect()
+        })
+        .err()
+        .unwrap();
+        assert!(e.to_string().contains("truncated"), "{e}");
     }
 }

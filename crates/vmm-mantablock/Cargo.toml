@@ -23,9 +23,11 @@ vmm_core.workspace = true
 rustix = { version = "1", features = ["process"] }
 tempfile = "3"
 
-# The workspace lints, and two more: the public API is documented, and
-# an unwrap outside a test is a review question.
+# The workspace lints, and three more: the public API is documented, an
+# unwrap outside a test is a review question, and unsafe code is allowed
+# only in the modules that say so.
 [lints.rust]
+unsafe_code = "deny"
 rust_2018_idioms = { level = "warn", priority = -1 }
 unused_qualifications = "warn"
 missing_docs = "warn"
