@@ -33,7 +33,7 @@ crates/vmm-config/          CLI parsing, bhyve flag-compatible
 crates/vmm-metrics/         Counters the binaries publish
 
 crates/vmm-storage/         AHCI and NVMe                        rshyve only
-crates/vmm-mantablock/      NVMe backend over the MantaBlock ring (own workspace)
+crates/vmm-mantablock/      NVMe backend on the MantaBlock ring  rshyve only
 crates/vmm-hid/             xHCI, PS/2, framebuffer and VNC      rshyve only
 crates/vmm-passthru/        PCI passthrough                      rshyve only
 crates/vmm-migrate/         Migration protocol and state         rshyve only
@@ -45,11 +45,6 @@ crates/vmm-tpm-sys/         libtpms build and FFI                rshyve only
 `tools/fhrun-init` and `tools/virtiofs-test` are excluded from the root
 workspace: they cross-compile to `x86_64-unknown-linux-musl` and carry
 their own lockfiles. CI covers them in jobs of their own.
-
-`crates/vmm-mantablock` is excluded too: it takes the MantaBlock ring
-crate from a private git repository, pinned to a commit, and a member
-would put that source in the root lockfile. No CI job builds it yet; its
-README says how to build and test it.
 
 ## Key types
 

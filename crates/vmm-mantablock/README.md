@@ -46,25 +46,17 @@ repository.
 
 ## The ring crate dependency
 
-`manta-block-ring` is a git dependency pinned to a commit, so the two
-sides of the ring cannot drift. The repository is private, which is why
-this crate is its own Cargo workspace: as a member of the root one it
-would put that source in the root lockfile, and every CI job and
-`cargo deny` would need access to it.
+`manta-block-ring` comes from its public repository, pinned to a commit
+in the root `Cargo.toml`, so the two sides of the ring cannot drift. The
+engine pins the same commit. Moving the pin changes the ring contract:
+move both sides together.
 
-Cargo fetches the dependency over HTTPS. With git credentials that reach
-the repository:
-
-```bash
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test
-```
-
-Where GitHub is not reachable, patch the dependency to a local copy of
-the same commit. Do not commit the patch:
+To try an engine-side change to the ring crate before it has a commit,
+patch the dependency to a local checkout. Do not commit the patch:
 
 ```bash
-cargo test --config \
-  'patch."https://github.com/TritonDataCenter/manta-storage.git".manta-block-ring.path="<manta-storage>/crates/manta-block-ring"'
+cargo test -p vmm_mantablock --config \
+  'patch."https://github.com/TritonDataCenter/manta-block-ring".manta-block-ring.path="<manta-block-ring>"'
 ```
 
 Cargo then rewrites `Cargo.lock` locally, so `--locked` cannot be used
@@ -76,12 +68,14 @@ The unit tests play the engine in-process over a real shared mapping and
 real pipes, so they can send completions the real engine never would.
 
 `tests/engine.rs` runs the real `mantablock-engine` with a file volume
-and a null volume. Build the engine from the pinned commit and name it:
+and a null volume. CI has no engine, so these tests are ignored by
+default. Build an engine that pins the same ring commit and name it:
 
 ```bash
 cargo build -p manta-block-engine        # in manta-storage
-MANTABLOCK_ENGINE=<manta-storage>/target/debug/mantablock-engine cargo test
+MANTABLOCK_ENGINE=<manta-storage>/target/debug/mantablock-engine \
+  cargo test -p vmm_mantablock -- --ignored
 ```
 
-These tests fail without `MANTABLOCK_ENGINE`, rather than pass without
-running.
+Run with `--ignored`, these tests fail without `MANTABLOCK_ENGINE`
+rather than pass without the engine.

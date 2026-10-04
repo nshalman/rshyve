@@ -4,9 +4,11 @@
 
 //! The ring backend against the real `mantablock-engine` process.
 //!
-//! Set `MANTABLOCK_ENGINE` to the engine binary, built from the
-//! manta-storage commit `Cargo.toml` pins. These tests fail without it
-//! rather than pass without running.
+//! Each test is ignored by default, because CI has no engine. Set
+//! `MANTABLOCK_ENGINE` to the engine binary, built against the ring
+//! commit the root `Cargo.toml` pins, and run with `--ignored`. A test
+//! run that way fails without the variable rather than passes without
+//! the engine.
 
 #![allow(clippy::unwrap_used)]
 
@@ -235,6 +237,7 @@ fn attach(_lab: &Lab, cfg: Config) -> (Arc<Ring<TJob>>, Arc<Calls>) {
 }
 
 #[test]
+#[ignore = "runs the real engine: set MANTABLOCK_ENGINE, pass --ignored"]
 fn data_survives_the_ring_on_every_queue_and_size() {
     let lab = Lab::start();
     let (ring, calls) = attach(&lab, lab.config(FILE_VOL));
@@ -296,6 +299,7 @@ fn data_survives_the_ring_on_every_queue_and_size() {
 }
 
 #[test]
+#[ignore = "runs the real engine: set MANTABLOCK_ENGINE, pass --ignored"]
 fn completions_the_engine_publishes_together_reach_the_sink_together() {
     let lab = Lab::start();
     let (ring, calls) = attach(&lab, lab.config(FILE_VOL));
@@ -321,6 +325,7 @@ fn completions_the_engine_publishes_together_reach_the_sink_together() {
 }
 
 #[test]
+#[ignore = "runs the real engine: set MANTABLOCK_ENGINE, pass --ignored"]
 fn a_killed_engine_fails_what_is_held_and_everything_after() {
     let mut lab = Lab::start();
     let (ring, calls) = attach(&lab, lab.config(FILE_VOL));
@@ -351,6 +356,7 @@ fn a_killed_engine_fails_what_is_held_and_everything_after() {
 }
 
 #[test]
+#[ignore = "runs the real engine: set MANTABLOCK_ENGINE, pass --ignored"]
 fn a_hung_engine_is_lost_after_the_heartbeat_limit() {
     let lab = Lab::start();
     let mut cfg = lab.config(FILE_VOL);
@@ -369,6 +375,7 @@ fn a_hung_engine_is_lost_after_the_heartbeat_limit() {
 }
 
 #[test]
+#[ignore = "runs the real engine: set MANTABLOCK_ENGINE, pass --ignored"]
 fn a_volatile_engine_needs_consent_and_then_gets_flushes() {
     let lab = Lab::start();
     let err = connect(lab.config(NULL_VOL)).err().unwrap();
@@ -390,6 +397,7 @@ fn a_volatile_engine_needs_consent_and_then_gets_flushes() {
 }
 
 #[test]
+#[ignore = "runs the real engine: set MANTABLOCK_ENGINE, pass --ignored"]
 fn halt_detaches_so_the_volume_attaches_again() {
     let lab = Lab::start();
     let (ring, calls) = attach(&lab, lab.config(FILE_VOL));
@@ -425,6 +433,7 @@ fn halt_detaches_so_the_volume_attaches_again() {
 }
 
 #[test]
+#[ignore = "runs the real engine: set MANTABLOCK_ENGINE, pass --ignored"]
 fn a_volume_the_engine_does_not_serve_is_refused() {
     let lab = Lab::start();
     let mut cfg = lab.config(FILE_VOL);

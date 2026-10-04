@@ -22,6 +22,7 @@ members = [
     "crates/vmm-tpm-sys",
     "crates/vmm-tpm",
     "crates/vmm-machine",
+    "crates/vmm-mantablock",
     "bin/rshyve",
     "bin/firehyve",
     "tools/fhrun",
@@ -30,12 +31,9 @@ members = [
 # fhrun-init cross-compiles to x86_64-unknown-linux-musl and carries
 # its own workspace and lockfile. Excluding it keeps a host
 # `cargo build --workspace` off the Linux toolchain.
-# vmm-mantablock takes the ring crate from a private git repository;
-# as a member it would put that source in the root lockfile.
 exclude = [
     "tools/fhrun-init",
     "tools/virtiofs-test",
-    "crates/vmm-mantablock",
 ]
 
 [workspace.package]
@@ -96,8 +94,12 @@ vmm_hyperv = { path = "crates/vmm-hyperv" }
 vmm_tpm_sys = { path = "crates/vmm-tpm-sys" }
 vmm_tpm = { path = "crates/vmm-tpm" }
 vmm_machine = { path = "crates/vmm-machine" }
+vmm_mantablock = { path = "crates/vmm-mantablock" }
 
 # External dependencies
+# The engine pins the same commit. Move both together: a new commit can
+# change the ring layout.
+manta-block-ring = { git = "https://github.com/TritonDataCenter/manta-block-ring", rev = "c015c4c70cab1712ce732cd91e2fcc169f730bbc" }
 acpi_tables = "0.2.1"
 anyhow = "1.0"
 base64 = "0.21"

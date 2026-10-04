@@ -1,36 +1,28 @@
-# The ring backend for a MantaBlock volume. Its own workspace, outside the
-# root one: `manta-block-ring` comes from a private git repository, and a
-# workspace member would put that source in the root lockfile, which every
-# CI job and `cargo deny` resolve. See README.md for building without
-# access to that repository.
-
 [package]
 name = "vmm_mantablock"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version.workspace = true
 license = "MPL-2.0"
 publish = false
 description = "NVMe backend that sends I/O to the MantaBlock engine over a shared-memory ring"
 
-# Literal versions, not `.workspace = true`: this package inherits nothing
-# from the workspace above.
 [dependencies]
-# Pinned to a commit so the two sides of the ring cannot drift (spec 37
-# §10). Moving it is a change to the ring contract; review it as one.
-manta-block-ring = { git = "https://github.com/TritonDataCenter/manta-storage.git", rev = "038aa9743bfb84e78a5406e2960eba5b97c5ae35" }
-memmap2 = "0.9"
+manta-block-ring.workspace = true
+memmap2.workspace = true
 rustix = { version = "1", features = ["event", "fs", "net", "pipe", "time"] }
-slog = "2.7"
-uuid = "1.3"
-vmm_devices = { path = "../vmm-devices" }
-vmm_storage = { path = "../vmm-storage" }
+slog.workspace = true
+uuid.workspace = true
+vmm_devices.workspace = true
+vmm_storage.workspace = true
 
 [dev-dependencies]
 # The integration tests stop and kill the engine process.
 rustix = { version = "1", features = ["process"] }
 tempfile = "3"
 
+# The workspace lints, and two more: the public API is documented, and
+# an unwrap outside a test is a review question.
 [lints.rust]
 rust_2018_idioms = { level = "warn", priority = -1 }
 unused_qualifications = "warn"
@@ -42,8 +34,6 @@ suspicious = { level = "warn", priority = -1 }
 style = { level = "warn", priority = -1 }
 complexity = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
+assertions_on_constants = "allow"
 type_complexity = "allow"
 unwrap_used = "warn"
-
-# Marks this directory as its own workspace root.
-[workspace]
