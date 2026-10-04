@@ -181,3 +181,34 @@ fn a_deleted_queue_takes_its_pages_back_from_the_backend() {
     assert_eq!(h.read_guest(0x50000, PAGE_SIZE), vec![0xAA; PAGE_SIZE]);
     assert_eq!(h.read_guest(CQ1, CQE_SIZE), vec![0u8; CQE_SIZE]);
 }
+
+/// A ring backend may refuse a request the moment it sees it. It calls
+/// the sink from inside `submit`, on the vCPU thread that holds the
+/// controller lock, and that must not deadlock.
+#[test]
+fn a_backend_may_complete_inside_submit() {
+    let manual = Manual::new(IO_QDEPTH);
+    manual.inline.store(true, Ordering::Relaxed);
+    let mut h = Harness::manual(&manual);
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+
+    for slot in 0..2u16 {
+        put_sqe(
+            &h,
+            SQ1,
+            slot,
+            Sqe::read(u64::from(slot), 1, 0x50000, 0),
+            slot,
+        );
+    }
+    h.sq_doorbell(1, 2);
+
+    for slot in 0..2u16 {
+        let cqe = h.wait_cqe(CQ1, slot, true);
+        assert_eq!((cqe.cid, cqe.status()), (slot, Status::SUCCESS));
+    }
+    assert_eq!(manual.queued(), 0);
+    let expect: Vec<u8> = (512..1024).map(backing_byte).collect();
+    assert_eq!(h.read_guest(0x50000, 512), expect);
+}

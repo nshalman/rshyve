@@ -189,26 +189,30 @@ impl NvmeController {
                     op,
                     byte_offset,
                     len,
-                }) => self.backend.submit(BlockRequest {
-                    id,
-                    op,
-                    lba: if op == BlockOp::Flush { 0 } else { cmd.slba },
-                    blocks: if op == BlockOp::Flush { 0 } else { cmd.nlb },
-                    byte_offset,
-                    data: GuestData {
-                        mem: MemCtx::new(Arc::clone(&self.physmap)),
-                        prp1: cmd.prp1,
-                        prp2: cmd.prp2,
-                        len,
-                        live: Liveness {
-                            epochs: Arc::clone(&st.epochs),
-                            sq: idx,
-                            sq_instance,
-                            cq: cq_idx,
-                            cq_instance,
+                }) => self.submit(
+                    st,
+                    &mem,
+                    BlockRequest {
+                        id,
+                        op,
+                        lba: if op == BlockOp::Flush { 0 } else { cmd.slba },
+                        blocks: if op == BlockOp::Flush { 0 } else { cmd.nlb },
+                        byte_offset,
+                        data: GuestData {
+                            mem: MemCtx::new(Arc::clone(&self.physmap)),
+                            prp1: cmd.prp1,
+                            prp2: cmd.prp2,
+                            len,
+                            live: Liveness {
+                                epochs: Arc::clone(&st.epochs),
+                                sq: idx,
+                                sq_instance,
+                                cq: cq_idx,
+                                cq_instance,
+                            },
                         },
                     },
-                }),
+                ),
             }
         }
     }

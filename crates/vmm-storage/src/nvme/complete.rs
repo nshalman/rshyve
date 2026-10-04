@@ -4,13 +4,14 @@
 
 //! Finishing commands, and the drains that wait for them.
 
+use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use vmm_core::mem::MemCtx;
 
-use super::backend::{BlockStatus, CompletionSink, RequestId};
+use super::backend::{BlockRequest, BlockStatus, CompletionSink, RequestId};
 use super::bits::*;
 use super::cq::{post_or_hold, Cqe, Posted};
 use super::inflight::Admitted;
@@ -24,11 +25,28 @@ use super::NvmeController;
 /// the backend, alive.
 pub(super) struct Completions(pub(super) Weak<NvmeController>);
 
+thread_local! {
+    /// The controller this thread is submitting to, with its state lock
+    /// held. Zero when none.
+    static SUBMITTING: Cell<usize> = const { Cell::new(0) };
+}
+
 impl CompletionSink for Completions {
     fn complete(&self, done: &[(RequestId, BlockStatus)]) {
-        if let Some(ctrl) = self.0.upgrade() {
-            ctrl.complete(done);
+        let Some(ctrl) = self.0.upgrade() else {
+            return;
+        };
+        // A backend that finishes a request inside `submit` would take
+        // a lock this thread holds. Its completions wait for `submit`
+        // to return instead.
+        if SUBMITTING.get() == Arc::as_ptr(&ctrl) as usize {
+            ctrl.deferred
+                .lock()
+                .expect("nvme: deferred lock")
+                .extend(done);
+            return;
         }
+        ctrl.complete(done);
     }
 }
 
@@ -49,6 +67,34 @@ impl NvmeController {
     fn complete(&self, done: &[(RequestId, BlockStatus)]) {
         let mem = MemCtx::new(Arc::clone(&self.physmap));
         let mut st = self.lock();
+        self.finish_all(&mut st, &mem, done);
+        self.after_finish(&mut st);
+    }
+
+    /// Hand `req` to the backend, then finish whatever it completed
+    /// before returning.
+    pub(super) fn submit(
+        &self,
+        st: &mut NvmeState,
+        mem: &MemCtx,
+        req: BlockRequest,
+    ) {
+        let me = self as *const Self as usize;
+        let outer = SUBMITTING.replace(me);
+        self.backend.submit(req);
+        SUBMITTING.set(outer);
+        let done = std::mem::take(
+            &mut *self.deferred.lock().expect("nvme: deferred lock"),
+        );
+        self.finish_all(st, mem, &done);
+    }
+
+    fn finish_all(
+        &self,
+        st: &mut NvmeState,
+        mem: &MemCtx,
+        done: &[(RequestId, BlockStatus)],
+    ) {
         for &(id, status) in done {
             let Some(cmd) = io_queue_index(id.queue)
                 .and_then(|idx| st.inflight[idx].finish(id.tag, id.serial))
@@ -59,9 +105,8 @@ impl NvmeController {
                     "queue" => id.queue, "tag" => id.tag);
                 continue;
             };
-            self.post(&mut st, &mem, id, cmd, status.nvme(cmd.opcode));
+            self.post(st, mem, id, cmd, status.nvme(cmd.opcode));
         }
-        self.after_finish(&mut st);
     }
 
     /// Finish a command the controller ends itself, before a backend

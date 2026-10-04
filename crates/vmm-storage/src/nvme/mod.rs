@@ -137,6 +137,9 @@ pub struct NvmeController {
     state: Mutex<NvmeState>,
     /// Woken when a command leaves flight while a drain waits.
     drained: Condvar,
+    /// Completions a backend made inside `submit`, finished when it
+    /// returns.
+    deferred: Mutex<Vec<(backend::RequestId, backend::BlockStatus)>>,
     backend: Arc<dyn AsyncBackend>,
     pub(super) physmap: Arc<PhysMap>,
     pub(super) bus_mmio: Arc<MmioBus>,
@@ -277,6 +280,7 @@ impl NvmeController {
                 msix,
                 state: Mutex::new(state),
                 drained: Condvar::new(),
+                deferred: Mutex::new(Vec::new()),
                 backend,
                 physmap,
                 bus_mmio,

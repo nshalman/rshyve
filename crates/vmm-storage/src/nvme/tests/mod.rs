@@ -238,6 +238,8 @@ struct Manual {
     queues: Mutex<Vec<u16>>,
     depth: u16,
     durable: bool,
+    /// Finish each request inside `submit`, on the caller's thread.
+    inline: AtomicBool,
 }
 
 impl Manual {
@@ -260,6 +262,7 @@ impl Manual {
             queues: Mutex::new(Vec::new()),
             depth,
             durable,
+            inline: AtomicBool::new(false),
         })
     }
 
@@ -342,6 +345,11 @@ impl AsyncBackend for ManualBackend {
             .lock()
             .expect("queues lock")
             .push(req.id().queue());
+        if self.0.inline.load(Ordering::Relaxed) {
+            let status = self.0.run(&req);
+            self.0.sink().complete(&[(req.id(), status)]);
+            return;
+        }
         self.0.queued.lock().expect("queued lock").push(req);
     }
 

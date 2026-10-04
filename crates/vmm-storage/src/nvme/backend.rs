@@ -249,8 +249,8 @@ pub trait AsyncBackend: Send + Sync + 'static {
     ///
     /// Runs with the controller lock held, on a vCPU thread or on the
     /// thread that called the sink, so it must not block on I/O. It
-    /// must not call the sink before it returns: the sink takes the
-    /// same lock.
+    /// may complete the request before it returns; the controller
+    /// finishes such completions once it does.
     fn submit(&self, req: BlockRequest);
 
     /// Make every completed write durable. Nothing is in flight.
