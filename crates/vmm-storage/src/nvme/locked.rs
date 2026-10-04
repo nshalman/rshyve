@@ -89,6 +89,10 @@ impl DerefMut for Locked<'_> {
 
 impl Drop for Locked<'_> {
     fn drop(&mut self) {
-        self.raise_owed();
+        // Unwinding poisons the lock, and taking it again would turn
+        // one panic into an abort.
+        if !std::thread::panicking() {
+            self.raise_owed();
+        }
     }
 }

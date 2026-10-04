@@ -530,11 +530,7 @@ impl Lifecycle for NvmeController {
 
     fn halt(&self) {
         self.indicator.halt();
-        self.state
-            .lock()
-            .expect("nvme: state lock")
-            .admission
-            .halted = true;
+        self.lock().admission.halted = true;
         self.backend.halt();
     }
 
@@ -543,14 +539,13 @@ impl Lifecycle for NvmeController {
     /// Admission stays closed across both, so the flush covers every
     /// write the guest has seen complete.
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
-        let st = self.lock();
         let budget = vmm_devices::quiesce::quiesce_budget(intent);
-        let (st, drained) = self.drain_all(st, budget);
+        let (st, drained) = self.drain_all(self.lock(), budget);
+        // The sync can take seconds; completions need the lock.
+        drop(st);
         let result = if drained {
-            drop(st);
             self.backend.flush(intent)
         } else {
-            drop(st);
             Err(FlushError::NotQuiesced("nvme"))
         };
         self.reopen(&mut self.lock());
