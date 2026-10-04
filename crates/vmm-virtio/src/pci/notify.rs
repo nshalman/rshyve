@@ -83,6 +83,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
 
     /// Run one queue notification under the transport lock, then raise
     /// the interrupt with the lock dropped.
+    ///
+    /// Takes the guard by value because it releases it: the raise must
+    /// not hold the lock, and a refused queue hands it on to
+    /// `refuse_queue`.
     pub(super) fn notify(
         &self,
         mut vs: MutexGuard<'_, VirtioPciState>,
