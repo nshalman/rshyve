@@ -182,7 +182,7 @@ fn quiesce_named(
         if named.device.lifecycle_state()
             != Some(vmm_devices::IndicatedState::Pause)
         {
-            named.device.pause();
+            named.device.pause_within(QUIESCE_BUDGET);
         }
     }
 

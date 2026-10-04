@@ -18,6 +18,7 @@ use crate::pci::intr::{IntrGate, IntrSession};
 mod barrier;
 mod bounce;
 mod get_id;
+mod inflight;
 mod multiqueue;
 mod reset;
 
@@ -49,6 +50,8 @@ fn worker_ctx_queues(physmap: &Arc<PhysMap>, num_queues: usize) -> WorkerCtx {
         gate: Arc::new(QuiesceGate::new(1)),
         access: Arc::new(GuestAccess::new(num_queues)),
         backend: Arc::new(BackendBarrier::new()),
+        budget: Budget::new(budget::INFLIGHT_BYTES),
+        kick: Arc::new(KickSlot::new()),
         parks: Arc::new(WorkerParks::default()),
     }
 }
@@ -70,6 +73,7 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         read_only: true,
         nodelete: false,
         num_queues: 0,
+        features: AtomicU64::new(0),
         workers_per_queue: 0,
         io_txs: Vec::new(),
         next_worker: Vec::new(),
@@ -80,6 +84,7 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         file,
         indicator: Indicator::new(),
         gate: Arc::new(QuiesceGate::new(1)),
+        pause_grace: PauseGrace::DEFAULT,
         ctx: worker_ctx(&Arc::new(PhysMap::new())),
     });
 

@@ -71,6 +71,7 @@ fn request(
         head: 0,
         completion: detached_completion(&queue, physmap),
         tag: current_tag(&ctx.access, 0),
+        charge: Charge::default(),
     }
 }
 
@@ -278,6 +279,7 @@ fn a_request_past_the_buffer_moves_every_byte() {
         head: 7,
         completion: detached_completion(&queue, &physmap),
         tag: current_tag(&ctx.access, 0),
+        charge: Charge::default(),
     };
     let mut bounce = Bounce::new();
     assert_eq!(
@@ -308,6 +310,7 @@ fn a_request_past_the_buffer_moves_every_byte() {
         head: 8,
         completion: detached_completion(&queue, &physmap),
         tag: current_tag(&ctx.access, 0),
+        charge: Charge::default(),
     };
     assert_eq!(
         run_request(&out, &limits, &ctx, &mut bounce, &req),
@@ -320,35 +323,274 @@ fn a_request_past_the_buffer_moves_every_byte() {
 // checked, and the guest builds the chain.
 #[test]
 fn a_chain_past_the_advertised_limits_is_refused() {
-    // Header, `segs` data segments of `len` bytes, status byte.
-    let build = |segs: usize, len: u32| -> Vec<ChainBuf> {
-        std::iter::once(ChainBuf::Readable {
-            addr: HDR_GPA,
-            len: BLK_REQ_HEADER_SIZE as u32,
-        })
-        .chain((0..segs).map(|_| ChainBuf::Writable {
-            addr: RECYCLED_GPA,
-            len,
-        }))
-        .chain(std::iter::once(ChainBuf::Writable {
-            addr: STATUS_GPA,
-            len: 1,
-        }))
-        .collect()
-    };
-
+    let agreed = ReqLimits::negotiated(
+        bits::VIRTIO_BLK_F_SEG_MAX | bits::VIRTIO_BLK_F_SIZE_MAX,
+    );
     assert_eq!(
-        io::span(&build(io::MAX_SEGMENTS, SIZE_MAX)),
+        io::span(&segments(io::MAX_SEGMENTS, SIZE_MAX), &agreed),
         Some(io::MAX_REQ_BYTES)
     );
     assert_eq!(
-        io::span(&build(io::MAX_SEGMENTS + 1, 512)),
+        io::span(&segments(io::MAX_SEGMENTS + 1, 512), &agreed),
         None,
         "a chain past seg_max was accepted"
     );
     assert_eq!(
-        io::span(&build(1, SIZE_MAX + 1)),
+        io::span(&segments(1, SIZE_MAX + 1), &agreed),
         None,
         "a segment past size_max was accepted"
+    );
+
+    // A driver that agreed to no limit is still held to the cap.
+    let none = ReqLimits::negotiated(0);
+    assert_eq!(none, ReqLimits::UNLIMITED);
+    assert_eq!(
+        io::span(&segments(1, io::MAX_UNLIMITED_REQ_BYTES as u32 + 1), &none),
+        None,
+        "a request past the cap was accepted"
+    );
+    assert_eq!(
+        io::span(
+            &segments(2, io::MAX_UNLIMITED_REQ_BYTES as u32 / 2 + 1),
+            &none
+        ),
+        None,
+        "two segments past the cap were accepted"
+    );
+}
+
+/// The read edk2 made to load the boot file: one 832 KiB descriptor.
+/// The firmware negotiates neither SEG_MAX nor SIZE_MAX, so the
+/// advertised limits do not bind it.
+const FIRMWARE_READ: usize = 0xd_0000;
+
+/// Header, one large data segment, status byte, as the firmware
+/// builds them.
+fn firmware_chain(hdr: u64, data: u64, status: u64) -> Vec<ChainBuf> {
+    vec![
+        ChainBuf::Readable {
+            addr: hdr,
+            len: BLK_REQ_HEADER_SIZE as u32,
+        },
+        ChainBuf::Writable {
+            addr: data,
+            len: FIRMWARE_READ as u32,
+        },
+        ChainBuf::Writable {
+            addr: status,
+            len: 1,
+        },
+    ]
+}
+
+#[test]
+fn a_segment_past_size_max_is_accepted_when_size_max_was_not_negotiated() {
+    let physmap = guest_memory();
+    let header = VirtioBlkReqHdr {
+        rtype: bits::VIRTIO_BLK_T_IN,
+        _reserved: 0,
+        sector: 0,
+    };
+    physmap
+        .lookup(HDR_GPA, BLK_REQ_HEADER_SIZE)
+        .expect("mapped request header")
+        .write(&header)
+        .expect("write request header");
+    let chain = firmware_chain(HDR_GPA, RECYCLED_GPA, STATUS_GPA);
+    let block = make_test_block(2 * FIRMWARE_READ as u64);
+
+    // What edk2's VirtioBlkDxe accepts of the offered bits.
+    block.set_features(bits::VIRTIO_BLK_F_FLUSH);
+    assert!(
+        block.check_request(&chain, &physmap).is_ok(),
+        "the firmware's boot file read was refused"
+    );
+
+    // Linux agrees to both limits and is held to them.
+    block.set_features(
+        bits::VIRTIO_BLK_F_FLUSH
+            | bits::VIRTIO_BLK_F_SEG_MAX
+            | bits::VIRTIO_BLK_F_SIZE_MAX,
+    );
+    assert!(block.check_request(&chain, &physmap).is_err());
+
+    // A reset forgets the last driver's agreement.
+    VirtioDevice::reset(&block);
+    assert!(block.check_request(&chain, &physmap).is_ok());
+}
+
+#[test]
+fn a_worker_reads_a_segment_past_size_max() {
+    let physmap =
+        Arc::new(PhysMap::new_anon(0x100000, 0x200000).expect("guest memory"));
+    let base = 0x100000u64;
+    let data = base + 0x10000;
+
+    let disk: Vec<u8> = (0..FIRMWARE_READ).map(|i| (i / 4096) as u8).collect();
+    let file = backing(&disk);
+    let ctx = worker_ctx(&physmap);
+    let limits = writable_disk((FIRMWARE_READ / SECTOR) as u64);
+    let mut queue = VirtQueue::new(8);
+    queue.set_addr_modern(base + 0x2000, base + 0x3000, base + 0x4000);
+
+    let req = BlkIoRequest {
+        rtype: bits::VIRTIO_BLK_T_IN,
+        sector: 0,
+        chain: firmware_chain(base, data, base + 0x1000),
+        head: 3,
+        completion: detached_completion(&queue, &physmap),
+        tag: current_tag(&ctx.access, 0),
+        charge: Charge::default(),
+    };
+    let mut bounce = Bounce::new();
+    assert_eq!(
+        run_request(&file, &limits, &ctx, &mut bounce, &req),
+        Some((3, FIRMWARE_READ as u32 + 1))
+    );
+    assert_eq!(
+        peek(&physmap, data, FIRMWARE_READ),
+        disk,
+        "the boot file read lost bytes"
+    );
+}
+
+/// Header, `segs` data segments of `len` bytes, status byte.
+fn segments(segs: usize, len: u32) -> Vec<ChainBuf> {
+    std::iter::once(ChainBuf::Readable {
+        addr: HDR_GPA,
+        len: BLK_REQ_HEADER_SIZE as u32,
+    })
+    .chain((0..segs).map(|_| ChainBuf::Writable {
+        addr: RECYCLED_GPA,
+        len,
+    }))
+    .chain(std::iter::once(ChainBuf::Writable {
+        addr: STATUS_GPA,
+        len: 1,
+    }))
+    .collect()
+}
+
+// Each bit binds only its own limit, and the total drops to the
+// advertised product only when both bind it. A check that mixed the
+// two up would refuse a correct driver or let a large one through.
+#[test]
+fn seg_max_alone_bounds_the_segment_count_only() {
+    let limits = ReqLimits::negotiated(bits::VIRTIO_BLK_F_SEG_MAX);
+    assert_eq!(
+        io::span(&segments(io::MAX_SEGMENTS + 1, 512), &limits),
+        None,
+        "a chain past seg_max was accepted"
+    );
+    // One segment past both size_max and the two-limit total.
+    let len = io::MAX_REQ_BYTES as u32 + SECTOR as u32;
+    assert_eq!(
+        io::span(&segments(1, len), &limits),
+        Some(len as usize),
+        "size_max or the two-limit total held a driver that agreed to neither"
+    );
+}
+
+#[test]
+fn size_max_alone_bounds_the_segment_size_only() {
+    let limits = ReqLimits::negotiated(bits::VIRTIO_BLK_F_SIZE_MAX);
+    assert_eq!(
+        io::span(&segments(1, SIZE_MAX + 1), &limits),
+        None,
+        "a segment past size_max was accepted"
+    );
+    // One segment more than seg_max, each at size_max, so past the
+    // two-limit total too.
+    let segs = io::MAX_SEGMENTS + 1;
+    assert_eq!(
+        io::span(&segments(segs, SIZE_MAX), &limits),
+        Some(segs * SIZE_MAX as usize),
+        "seg_max or the two-limit total held a driver that agreed to neither"
+    );
+}
+
+// The cap is inclusive. The request is checked whole, against a disk
+// large enough that the sector range is not what refuses it.
+#[test]
+fn a_request_of_exactly_the_cap_is_accepted_and_one_sector_more_is_not() {
+    let physmap = guest_memory();
+    physmap
+        .lookup(HDR_GPA, BLK_REQ_HEADER_SIZE)
+        .expect("mapped request header")
+        .write(&VirtioBlkReqHdr {
+            rtype: bits::VIRTIO_BLK_T_IN,
+            _reserved: 0,
+            sector: 0,
+        })
+        .expect("write request header");
+    let block = make_test_block(2 * io::MAX_UNLIMITED_REQ_BYTES as u64);
+    block.set_features(bits::VIRTIO_BLK_F_FLUSH);
+
+    let cap = io::MAX_UNLIMITED_REQ_BYTES as u32;
+    assert_eq!(
+        block
+            .check_request(&segments(1, cap), &physmap)
+            .map(|(_, span)| span),
+        Ok(io::MAX_UNLIMITED_REQ_BYTES),
+        "a request of exactly the cap was refused"
+    );
+    assert!(
+        block
+            .check_request(&segments(1, cap + SECTOR as u32), &physmap)
+            .is_err(),
+        "a request one sector past the cap was accepted"
+    );
+    // The cap holds across segments, not only within one.
+    assert!(block
+        .check_request(&segments(2, cap / 2 + SECTOR as u32), &physmap)
+        .is_err());
+}
+
+// The write direction of the firmware case: one segment past size_max
+// is snapshotted and written whole.
+#[test]
+fn a_worker_writes_a_segment_past_size_max() {
+    let physmap =
+        Arc::new(PhysMap::new_anon(0x100000, 0x200000).expect("guest memory"));
+    let base = 0x100000u64;
+    let data = base + 0x10000;
+
+    let payload: Vec<u8> = (0..FIRMWARE_READ)
+        .map(|i| (i / 4096) as u8 ^ 0x5a)
+        .collect();
+    physmap
+        .lookup(data, FIRMWARE_READ)
+        .expect("mapped payload")
+        .write_bytes(&payload)
+        .expect("write payload");
+    let file = backing(&vec![0u8; FIRMWARE_READ]);
+    let ctx = worker_ctx(&physmap);
+    let limits = writable_disk((FIRMWARE_READ / SECTOR) as u64);
+    let mut queue = VirtQueue::new(8);
+    queue.set_addr_modern(base + 0x2000, base + 0x3000, base + 0x4000);
+
+    let mut chain = firmware_chain(base, data, base + 0x1000);
+    chain[1] = ChainBuf::Readable {
+        addr: data,
+        len: FIRMWARE_READ as u32,
+    };
+    let req = BlkIoRequest {
+        rtype: bits::VIRTIO_BLK_T_OUT,
+        sector: 0,
+        chain,
+        head: 4,
+        completion: detached_completion(&queue, &physmap),
+        tag: current_tag(&ctx.access, 0),
+        charge: Charge::default(),
+    };
+    let mut bounce = Bounce::new();
+    assert_eq!(
+        run_request(&file, &limits, &ctx, &mut bounce, &req),
+        Some((4, 1))
+    );
+    assert_eq!(
+        read_backing(&file, FIRMWARE_READ),
+        payload,
+        "the large write lost bytes"
     );
 }

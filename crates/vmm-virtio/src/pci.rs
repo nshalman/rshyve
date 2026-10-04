@@ -61,6 +61,7 @@ pub mod intr;
 mod legacy;
 mod migrate;
 mod modern;
+pub mod notify;
 
 use intr::IntrGate;
 use modern::CapOffsets;
@@ -784,6 +785,10 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
 
     fn pause(&self) {
         Lifecycle::pause(&self.device)
+    }
+
+    fn pause_within(&self, budget: std::time::Duration) {
+        Lifecycle::pause_within(&self.device, budget)
     }
 
     fn is_quiesced(&self) -> bool {
