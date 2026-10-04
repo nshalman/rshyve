@@ -750,22 +750,25 @@ fn an_idle_drain_does_not_take_the_topology_lock() {
     // this lock across slow device work.
     let fixture = Fixture::new();
     let topology = fixture.core.topology.clone();
-    let held = topology.lock();
-    let done = AtomicBool::new(false);
+    let let_go = AtomicBool::new(false);
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let (topology, let_go_ref) = (&topology, &let_go);
     std::thread::scope(|s| {
-        s.spawn(|| {
-            fixture.core.drain_ejects();
-            done.store(true, Ordering::Release);
+        s.spawn(move || {
+            let held = topology.lock();
+            held_tx.send(()).expect("held");
+            // Held until the drain is done; the timeout only keeps a
+            // drain that waits from hanging the test.
+            let _ = done_rx.recv_timeout(Duration::from_secs(60));
+            let_go_ref.store(true, Ordering::Release);
+            drop(held);
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !done.load(Ordering::Acquire)
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::yield_now();
-        }
-        let finished = done.load(Ordering::Acquire);
-        drop(held);
-        assert!(finished, "an empty drain waited on the topology lock");
+        held_rx.recv().expect("the lock is held");
+        fixture.core.drain_ejects();
+        let waited = let_go.load(Ordering::Acquire);
+        let _ = done_tx.send(());
+        assert!(!waited, "an empty drain waited on the topology lock");
     });
 }
 
