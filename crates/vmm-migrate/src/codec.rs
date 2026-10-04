@@ -732,9 +732,6 @@ mod tests {
         }
     }
 
-    /// A v2 source has no field for held completions, which it dropped
-    /// rather than hold, nor for the namespace shape, which it had one
-    /// of. Its payload decodes to none held and no shape named.
     #[test]
     fn a_v2_nvme_payload_decodes_with_nothing_held() {
         let v3 = nvme_cq(Vec::new());

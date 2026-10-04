@@ -19,11 +19,8 @@ use super::queues::{io_queue_index, CompQueue, NvmeState, SubQueue};
 use super::NvmeController;
 
 impl NvmeController {
-    /// The controller's state, once every command the guest submitted
-    /// has finished.
-    ///
-    /// A command in a backend has left its SQ and has no completion in
-    /// a CQ, so a payload taken around it loses it for good.
+    /// Drains first: a command in a backend has left its SQ and has no
+    /// CQE yet, so a payload taken around it would lose it.
     pub(super) fn export_state(
         &self,
     ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {
@@ -232,7 +229,6 @@ impl NvmeController {
     }
 }
 
-/// The one namespace shape a v2 source had.
 const V2_NAMESPACE: NvmeMigrateNamespace = NvmeMigrateNamespace {
     block_size: 512,
     volatile_write_cache: true,

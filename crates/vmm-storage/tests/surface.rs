@@ -29,8 +29,7 @@ fn _coerce_nvme(
     (dev.clone(), dev)
 }
 
-/// A backend built outside this crate, as a ring backend will be:
-/// everything it is handed and returns is public.
+/// Uses only public items, as a ring backend outside this crate must.
 struct OutsideBackend {
     sink: Arc<dyn CompletionSink>,
 }

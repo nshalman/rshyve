@@ -79,13 +79,10 @@ impl QueueEpochs {
     }
 }
 
-/// Who may put commands on the backend.
-///
 /// Checked and changed only under the state lock, so a drain that
 /// counts nothing in flight cannot be overtaken by an admission.
 #[derive(Default)]
 pub(super) struct Admission {
-    /// The control plane paused the device.
     pub(super) paused: bool,
     /// Resets, shutdowns, flushes and exports waiting for a drain.
     pub(super) draining: u32,
@@ -143,7 +140,6 @@ pub(super) struct NvmeState {
     pub(super) fence_failed: bool,
 
     pub(super) admission: Admission,
-    /// Per I/O SQ, the commands it has admitted.
     pub(super) inflight: [SqSlots; MAX_IO_QUEUES],
     /// I/O SQs that stopped at their depth, one bit each.
     pub(super) throttled: u16,
@@ -226,7 +222,6 @@ impl NvmeState {
         }
     }
 
-    /// The head of SQ `sqid`, as a completion reports it.
     pub(super) fn sq_head(&self, sqid: u16) -> u16 {
         let sq = if sqid == ADMIN_QUEUE_ID {
             self.admin_sq.as_ref()

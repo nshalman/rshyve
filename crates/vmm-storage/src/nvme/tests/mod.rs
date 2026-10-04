@@ -227,9 +227,8 @@ impl super::io::IoBackend for TestBackend {
     }
 }
 
-/// An async backend that keeps what it is given until the test says
-/// to finish it, and then finishes it from a thread of its own, the way
-/// a ring backend's completion thread would.
+/// Keeps what it is given until the test finishes it from another
+/// thread, as a ring backend's completion thread would.
 struct Manual {
     sink: OnceLock<Arc<dyn CompletionSink>>,
     disk: Mutex<Vec<u8>>,
@@ -247,7 +246,6 @@ impl Manual {
         Self::with(depth, false)
     }
 
-    /// A backend whose writes are durable when they complete.
     fn durable(depth: u16) -> Arc<Self> {
         Self::with(depth, true)
     }
@@ -287,7 +285,6 @@ impl Manual {
         std::mem::take(&mut *self.queued.lock().expect("queued lock"))
     }
 
-    /// Move one request's data and say how it went.
     fn run(&self, req: &BlockRequest) -> BlockStatus {
         let start = req.byte_offset() as usize;
         let end = start + req.data().len();
@@ -413,7 +410,6 @@ impl Harness {
             .expect("controller")
     }
 
-    /// A harness over the [`Manual`] backend the test drives.
     fn manual(manual: &Arc<Manual>) -> Self {
         Self::manual_with(manual, NvmeConfig::default())
     }
@@ -598,8 +594,6 @@ impl Harness {
         assert_eq!(cqe.status(), Status::SUCCESS, "create SQ");
     }
 
-    /// Create I/O CQ `qid` of `cq_depth` entries, then I/O SQ `qid` of
-    /// `sq_depth` entries posting to it.
     fn create_io_queues_sized(
         &mut self,
         qid: u16,
@@ -666,14 +660,12 @@ impl Harness {
         self.sink.sent.lock().expect("sink lock").len()
     }
 
-    /// The vector of every MSI sent, in order. The harness programs
-    /// each vector's data as its own number.
+    /// The harness programs each vector's data as its own number.
     fn msi_vectors(&self) -> Vec<u64> {
         let sent = self.sink.sent.lock().expect("sink lock");
         sent.iter().map(|&(_, data)| data).collect()
     }
 
-    /// Poll the quiesce query the way the control plane does.
     fn wait_quiesced(&self, budget: Duration) -> bool {
         let start = Instant::now();
         while !self.ctrl.is_quiesced() {
@@ -809,13 +801,12 @@ fn put_prp(h: &Harness, gpa: u64, entry: u64) {
 const SQ2: u64 = 0x32000;
 const CQ2: u64 = 0x42000;
 
-/// Write `sqe` into slot `slot` of the SQ at `sq_base`, ringing nothing.
+/// Rings no doorbell.
 fn put_sqe(h: &Harness, sq_base: u64, slot: u16, sqe: Sqe, cid: u16) {
     let entry = sq_base + u64::from(slot) * SQE_SIZE as u64;
     h.mem().write(entry, &sqe.encode(cid)).expect("write SQE");
 }
 
-/// Submit `sqe` on I/O queue `qid`, whose SQ is at `sq_base`.
 fn submit_on(
     h: &Harness,
     qid: u16,

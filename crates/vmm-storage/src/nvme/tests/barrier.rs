@@ -235,9 +235,8 @@ fn quiet_is_reported_only_once_the_finishing_lock_is_released() {
     assert_eq!(h.wait_cqe(CQ1, 0, true).cid, 0x61);
 }
 
-/// A Delete I/O SQ waits for its own commands only. The driver may
-/// create a new SQ in the slot while the delete drains, and the new
-/// queue's commands must not hold the delete up or fail it.
+/// The driver may create a new SQ in the slot while the delete drains;
+/// its commands must not hold the delete up or fail it.
 #[test]
 fn a_delete_waits_for_its_own_queue_not_the_one_after_it() {
     let manual = Manual::new(IO_QDEPTH);
@@ -274,7 +273,6 @@ fn a_delete_waits_for_its_own_queue_not_the_one_after_it() {
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    // A new SQ 1 and a command on it, while the old one drains.
     let create = Sqe {
         opcode: ADMIN_OPC_CREATE_IO_SQ,
         prp1: SQ2,

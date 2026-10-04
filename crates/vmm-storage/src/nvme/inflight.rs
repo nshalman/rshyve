@@ -11,7 +11,6 @@
 
 use super::queues::QueueInstance;
 
-/// What the controller needs to finish a command it handed out.
 #[derive(Clone, Copy)]
 pub(super) struct Admitted {
     pub(super) serial: u64,
@@ -44,7 +43,6 @@ impl SqSlots {
         self.in_flight
     }
 
-    /// Whether a command the backend has not finished matches `pred`.
     pub(super) fn any_in_flight(
         &self,
         pred: impl Fn(&Admitted) -> bool,
@@ -55,7 +53,6 @@ impl SqSlots {
         })
     }
 
-    /// Whether [`Self::admit`] would find a tag.
     pub(super) fn has_room(&self, depth: u16) -> bool {
         !self.free.is_empty() || self.slots.len() < usize::from(depth)
     }
@@ -73,8 +70,8 @@ impl SqSlots {
         Some(tag)
     }
 
-    /// A tag below `depth` for a new command, or `None` when the queue
-    /// already has `depth` commands the guest has not seen finish.
+    /// `None` when the queue already has `depth` commands the guest has
+    /// not seen finish.
     pub(super) fn admit(&mut self, depth: u16, cmd: Admitted) -> Option<u16> {
         let tag = self.take_tag(depth, Slot::InFlight(cmd))?;
         self.in_flight += 1;

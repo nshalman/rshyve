@@ -271,10 +271,9 @@ impl NvmeController {
     /// Take the controller down.
     ///
     /// The queues go first, so a command that finishes from here on
-    /// completes into nothing, and admission stays closed while every
-    /// command in flight finishes: the driver is free to reuse their
-    /// pages once RDY clears, and a backend must not hold one of them
-    /// into the next enable.
+    /// completes into nothing. Admission stays closed until every
+    /// command in flight finishes: the driver may reuse their pages once
+    /// RDY clears.
     fn disable(&self, new_cc: u32) {
         let mut st = self.lock();
         st.retire_queues();

@@ -29,7 +29,6 @@ pub(super) const NUM_WORKERS: usize = 8;
 pub(super) struct WorkerPool {
     tx: Mutex<Option<mpsc::Sender<BlockRequest>>>,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
-    /// The store the workers move data through, synced for a flush.
     file: Arc<File>,
     capacity: u64,
     durable: bool,
@@ -40,8 +39,6 @@ pub(super) struct WorkerPool {
 }
 
 impl WorkerPool {
-    /// A pool running `io`, whose store is `file`.
-    ///
     /// The workers hold the only references to `io`, so the pool never
     /// keeps the store open past its own end.
     pub(super) fn factory(
@@ -178,7 +175,6 @@ fn worker(
     }
 }
 
-/// Move one request's data between the store and the guest.
 fn run(req: &BlockRequest, io: &dyn IoBackend) -> BlockStatus {
     // A reset or a Delete Queue since the submission took the pages
     // back. The controller drops whatever this reports.

@@ -173,8 +173,6 @@ fn for_each_run(
     Ok(())
 }
 
-/// Copy the `len` bytes the PRPs name into `dst`.
-///
 /// A plain copy: the driver gave these pages to the device, so a torn
 /// read only tears data the guest itself is still changing.
 pub(super) fn copy_from_prp(
@@ -195,7 +193,6 @@ pub(super) fn copy_from_prp(
     })
 }
 
-/// Copy `src` into the `len` bytes the PRPs name.
 pub(super) fn copy_to_prp(
     mem: &MemCtx,
     prp1: u64,

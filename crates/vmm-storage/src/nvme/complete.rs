@@ -19,8 +19,6 @@ use super::locked::Locked;
 use super::queues::{io_queue_index, NvmeState};
 use super::NvmeController;
 
-/// The sink a backend completes into.
-///
 /// Weak, so a backend's threads never keep the controller, and with it
 /// the backend, alive.
 pub(super) struct Completions(pub(super) Weak<NvmeController>);
@@ -50,9 +48,8 @@ impl CompletionSink for Completions {
     }
 }
 
-/// Whether the queues a command was admitted on are still the ones
-/// the driver has. A completion for a queue it deleted or reset would
-/// land in a ring it has given to something else.
+/// A completion for a queue the driver deleted or reset would land in a
+/// ring it has given to something else.
 fn current(st: &NvmeState, idx: usize, cmd: &Admitted) -> bool {
     let sq_live = st.io_sqs[idx]
         .as_ref()
@@ -125,8 +122,7 @@ impl NvmeController {
         }
     }
 
-    /// Take a finished command out of flight and write its completion,
-    /// unless its queues are gone.
+    /// Writes no completion when the command's queues are gone.
     fn post(
         &self,
         st: &mut NvmeState,
@@ -185,9 +181,8 @@ impl NvmeController {
         }
     }
 
-    /// The CQ head doorbell: the guest has consumed completions up to
-    /// `new_head`, so what was held for want of space goes in now, and
-    /// the commands that waited for it are taken.
+    /// Completions held for want of space go in now, and the commands
+    /// that waited for them are admitted.
     pub(super) fn cq_head_doorbell(&self, qid: u16, new_head: u16) {
         let mem = MemCtx::new(Arc::clone(&self.physmap));
         let mut st = self.lock();
@@ -217,7 +212,6 @@ impl NvmeController {
         }
     }
 
-    /// Write whatever every CQ holds that now has space for it.
     pub(super) fn flush_all_held(&self, st: &mut NvmeState) {
         let mem = MemCtx::new(Arc::clone(&self.physmap));
         let cqs = std::iter::once(None).chain((0..MAX_IO_QUEUES).map(Some));

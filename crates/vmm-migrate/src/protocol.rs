@@ -4,20 +4,16 @@
 
 //! Migration protocol implementation.
 //!
-//! A wire-format change bumps [`PROTOCOL_RON`]. A source offers only
-//! that version. A destination also takes the one before it when that
-//! payload is a strict subset of this one: every field it has means the
-//! same thing, and every field it lacks has a default that says what
-//! the old source did. Anything older is refused, because a peer that
-//! reads a field as something else resumes a guest on state that is not
-//! its own.
+//! A wire-format change bumps [`PROTOCOL_RON`]. A destination also takes
+//! the previous version only while its payload is a strict subset of this
+//! one, with defaults that match what the old source did. Anything older
+//! is refused: a peer that reads a field as something else resumes a
+//! guest on state that is not its own.
 
 /// Protocol identifier for the RON migration format.
 ///
-/// v3 carries the NVMe completions held for a full guest completion
-/// queue, and the shape of each NVMe namespace. A v2 source dropped the
-/// held completions and had one namespace shape, so its payload
-/// restores with none held and that shape.
+/// v3 carries held NVMe completions and the NVMe namespace shape. A v2
+/// payload restores with none held and the one shape v2 had.
 ///
 /// v2 carries the NVMe completion queue interrupt-enable bit. A v1 peer
 /// has no field for it, and a destination that assumes one restores a

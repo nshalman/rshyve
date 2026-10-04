@@ -302,7 +302,6 @@ const FLUSH_BUDGETS: FlushBudgets = FlushBudgets {
     best_effort_sync: BEST_EFFORT_SYNC_BUDGET,
 };
 
-/// How long a flush of `intent` waits for in-flight I/O to finish.
 pub fn quiesce_budget(intent: FlushIntent) -> Duration {
     FLUSH_BUDGETS.quiesce(intent)
 }
@@ -348,10 +347,8 @@ pub fn flush_file_when(
     )
 }
 
-/// Sync a file the caller has already quiesced, according to `intent`.
-///
-/// For a device that drains its own I/O rather than parking workers on
-/// a [`QuiesceGate`]. A best-effort sync fails if its watchdog expires.
+/// Sync a file whose I/O the caller has already drained, with no
+/// [`QuiesceGate`]. A best-effort sync fails if its watchdog expires.
 pub fn sync_file(
     file: &File,
     intent: FlushIntent,

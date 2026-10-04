@@ -20,7 +20,6 @@ use super::bits::*;
 use super::queues::{CompQueue, NvmeState};
 use super::MsiPolicy;
 
-/// A completion the controller owes the guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Cqe {
     pub(super) cdw0: u32,
@@ -39,7 +38,6 @@ pub(super) struct Held {
     pub(super) tag: Option<u16>,
 }
 
-/// What became of a completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Posted {
     Written,
@@ -61,8 +59,6 @@ impl CompQueue {
         self.held.is_empty() && !self.is_full()
     }
 
-    /// Write `cqe` at the tail, then advance it, flipping the phase on
-    /// a wrap.
     fn write(
         &mut self,
         mem: &MemCtx,
@@ -107,7 +103,6 @@ pub(super) struct Irqs {
 }
 
 impl Irqs {
-    /// A completion went into CQ `qid`.
     fn note(&mut self, qid: u16, cq: &CompQueue) {
         if !cq.ien {
             return;
@@ -122,7 +117,6 @@ impl Irqs {
         self.owed.iter().all(|&(count, _)| count == 0)
     }
 
-    /// One MSI per CQ that got completions, or one per completion.
     pub(super) fn raise(&self, msix: &MsixTable, policy: MsiPolicy) {
         for &(count, vector) in &self.owed {
             let times = match policy {

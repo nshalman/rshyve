@@ -4,7 +4,6 @@
 
 //! What a controller shows the guest, chosen per device.
 
-/// The logical block size the namespace reports.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LbaSize {
     /// LBADS 9. What the file backend has always shown.

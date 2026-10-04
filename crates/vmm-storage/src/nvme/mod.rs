@@ -6,10 +6,8 @@
 //!
 //! Admin commands run on the vCPU that rang the doorbell. I/O commands
 //! go to an [`AsyncBackend`](backend::AsyncBackend), which completes
-//! them later from a thread of its own; the controller then writes the
-//! completion and raises MSI-X. By default the backend is a pool of
-//! worker threads moving data straight between the backing file and
-//! the guest pages the PRPs name.
+//! them later from a thread of its own. The default backend is a worker
+//! pool over the backing file.
 //!
 //! BAR0 holds the registers and doorbells, BAR4 the MSI-X table.
 
@@ -102,9 +100,7 @@ pub(super) struct NvmeParts {
     pub(super) log: slog::Logger,
 }
 
-/// Counters the quiesce query reads without the state lock.
-///
-/// Changed only under the state lock, so they agree with it there.
+/// Read without the state lock, but changed only under it.
 #[derive(Default)]
 struct Counts {
     /// Commands admitted and not yet finished, every queue.
@@ -113,8 +109,7 @@ struct Counts {
     /// it owed.
     raising: AtomicUsize,
     paused: AtomicBool,
-    /// Drains ever started, so a test can tell a drain from the idle
-    /// short cut.
+    /// Lets a test tell a drain from the idle short cut.
     drains: AtomicUsize,
 }
 
@@ -214,9 +209,6 @@ impl NvmeController {
         .expect("nvme: the default namespace asks nothing of its backend")
     }
 
-    /// A controller over `backend`, with the namespace `config`
-    /// describes.
-    ///
     /// Fails when `config` reports no volatile write cache and the
     /// backend's writes are not durable when they complete.
     pub fn with_backend(
@@ -307,14 +299,12 @@ impl NvmeController {
         Ok(ctrl)
     }
 
-    /// Drains started on this controller, ever.
     #[cfg(test)]
     pub(super) fn drain_count(&self) -> usize {
         self.counts.drains.load(Ordering::Relaxed)
     }
 }
 
-/// The PCI header: BAR0 for registers and doorbells, BAR4 for MSI-X.
 fn pci_header(msix: &MsixTable) -> DeviceState {
     let mut pci_state = DeviceState::new(DeviceIdent {
         vendor_id: PCI_VENDOR_ID,
@@ -338,8 +328,6 @@ fn pci_header(msix: &MsixTable) -> DeviceState {
     pci_state
 }
 
-/// Registers and Identify data for a controller that has never been
-/// enabled.
 fn initial_state(
     backend: &dyn AsyncBackend,
     geometry: Geometry,
@@ -534,10 +522,8 @@ impl Lifecycle for NvmeController {
         self.backend.halt();
     }
 
-    /// Wait for every command in flight, then make the backend durable.
-    ///
-    /// Admission stays closed across both, so the flush covers every
-    /// write the guest has seen complete.
+    /// Admission stays closed across the drain and the flush, so the
+    /// flush covers every write the guest has seen complete.
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
         let budget = vmm_devices::quiesce::quiesce_budget(intent);
         let (st, drained) = self.drain_all(self.lock(), budget);

@@ -381,8 +381,6 @@ fn nlb_overflow_checked_mul() {
     assert_eq!((nlb as u64).checked_mul(u64::from(block_size)), Some(65536));
 }
 
-/// Copy guest RAM from one harness to another, as the RAM passes of a
-/// migration do.
 fn copy_ram(src: &Harness, dst: &Harness, gpa: u64, len: usize) {
     dst.mem()
         .write(gpa, &src.read_guest(gpa, len))
@@ -466,8 +464,6 @@ fn held(sqid: u16, cid: u16) -> NvmeMigrateCqe {
     }
 }
 
-/// A completion held for a full CQ is still owed to the guest, so it
-/// moves with the guest and lands when the guest frees space there.
 #[test]
 fn held_completions_cross_a_migration() {
     let manual = Manual::new(IO_QDEPTH);

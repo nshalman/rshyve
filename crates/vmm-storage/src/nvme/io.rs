@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! I/O submission: the SQ tail doorbell, and the checks a command
-//! passes before a backend sees it.
+//! I/O submission, and the checks a command passes before a backend
+//! sees it.
 
 use std::fs::File;
 use std::io;
@@ -46,7 +46,6 @@ impl IoBackend for File {
     }
 }
 
-/// The fields of an NVM command SQE.
 struct NvmCmd {
     opcode: u8,
     cid: u16,
@@ -74,19 +73,17 @@ impl NvmCmd {
             opcode: sqe[SQE_OPC],
             cid: u16::from_le_bytes([sqe[SQE_CID], sqe[SQE_CID + 1]]),
             nsid: le_u32(sqe, SQE_NSID),
-            // CDW10 and CDW11 hold the 64-bit starting LBA.
             slba: le_u64(sqe, SQE_CDW10),
             // CDW12 bits 15:0 are the 0-based block count.
             nlb: (cdw12 & 0xFFFF) + 1,
             prp1: le_u64(sqe, SQE_PRP1),
             prp2: le_u64(sqe, SQE_PRP2),
-            // NVMe 5.13: CDW12 bit 30 is Force Unit Access.
+            // CDW12 bit 30 is Force Unit Access.
             fua: (cdw12 & (1u32 << 30)) != 0,
         }
     }
 }
 
-/// A command that passed its checks.
 struct Checked {
     op: BlockOp,
     byte_offset: u64,
@@ -94,7 +91,6 @@ struct Checked {
 }
 
 impl NvmeController {
-    /// The I/O SQ tail doorbell.
     pub(super) fn io_sq_doorbell(&self, qid: u16, new_tail: u16) {
         let Some(idx) = io_queue_index(qid) else {
             return;
@@ -110,13 +106,10 @@ impl NvmeController {
         self.admit(&mut st, idx);
     }
 
-    /// Hand the backend what the guest has queued on I/O SQ `idx`, as
-    /// far as admission and the queue's depth allow.
-    ///
-    /// The checks and the submit happen under the state lock, the same
-    /// lock that closing admission takes, so a drain that counted
-    /// nothing in flight is never overtaken. A command not admitted
-    /// stays in the guest's queue with the head on it.
+    /// The checks and the submit run under the state lock, which closing
+    /// admission also takes, so a drain that counted nothing in flight
+    /// is never overtaken. A command not admitted stays in the guest's
+    /// queue with the head on it.
     pub(super) fn admit(&self, st: &mut NvmeState, idx: usize) {
         if !st.admission.is_open() || st.fence_failed {
             return;
@@ -217,7 +210,6 @@ impl NvmeController {
         }
     }
 
-    /// Admit on every I/O SQ the guest has left commands in.
     pub(super) fn admit_all(&self, st: &mut NvmeState) {
         for idx in 0..MAX_IO_QUEUES {
             let pending =
@@ -228,7 +220,6 @@ impl NvmeController {
         }
     }
 
-    /// Check a command against the namespace, or say how it fails.
     fn check(&self, cmd: &NvmCmd) -> Result<Checked, u16> {
         if cmd.nsid != 1 {
             return Err(SC_INVALID_NS | SC_DNR);

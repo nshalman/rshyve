@@ -16,7 +16,6 @@ fn an_async_backend_completes_from_its_own_thread() {
     h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
     h.create_io_queues(2, IO_QDEPTH, SQ2, CQ2);
 
-    // A write on one queue, then a read of the same blocks on another.
     h.fill(0x50000, 2 * 512, 0x5A);
     let (mut t1, mut t2) = (0, 0);
     submit_on(&h, 1, SQ1, &mut t1, Sqe::write(40, 2, 0x50000, 0), 0x11);
@@ -182,9 +181,8 @@ fn a_deleted_queue_takes_its_pages_back_from_the_backend() {
     assert_eq!(h.read_guest(CQ1, CQE_SIZE), vec![0u8; CQE_SIZE]);
 }
 
-/// A ring backend may refuse a request the moment it sees it. It calls
-/// the sink from inside `submit`, on the vCPU thread that holds the
-/// controller lock, and that must not deadlock.
+/// A ring backend may refuse a request at once, calling the sink from
+/// inside `submit` while the vCPU thread holds the controller lock.
 #[test]
 fn a_backend_may_complete_inside_submit() {
     let manual = Manual::new(IO_QDEPTH);

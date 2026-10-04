@@ -2,13 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The controller state lock, which raises interrupts only once it is
-//! released.
-//!
-//! Completions are written under the lock and their interrupts noted;
-//! releasing the lock raises one MSI per completion queue for all of
-//! them. The guest can then run its handler without meeting the lock,
-//! and a batch costs one MSI per queue rather than one per completion.
+//! The controller state lock. Completions are written under it and
+//! their interrupts noted; releasing it raises one MSI per completion
+//! queue for all of them, so the guest's handler never meets the lock.
 
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
@@ -33,16 +29,12 @@ impl NvmeController {
 }
 
 impl Locked<'_> {
-    /// Publish the commands finished under the lock, then release it,
-    /// raise what is owed, and take it again. Returns whether the lock
-    /// was released.
+    /// Returns whether the lock was released to raise MSIs.
     ///
-    /// The quiesce counters change in one step under the lock, raising
-    /// counted before in-flight drops, so a lock-free reader never sees
-    /// a device quiet while a CQE it finished is still unwritten or its
-    /// MSI not yet raised. A drain does not finish while a raise is on
-    /// its way either, so a reset never clears the pending bits under
-    /// one.
+    /// `raising` goes up before `in_flight` drops, both under the lock,
+    /// so a lock-free reader never sees the device quiet while a CQE or
+    /// its MSI is still pending, and a reset never clears pending bits
+    /// under a raise.
     fn raise_owed(&mut self) -> bool {
         let Some(mut guard) = self.guard.take() else {
             return false;
@@ -69,11 +61,9 @@ impl Locked<'_> {
         true
     }
 
-    /// Wait for a completion to wake a drain, for at most `timeout`.
-    ///
-    /// Returns at once, without waiting, when raising what was owed
-    /// released the lock: a completion may have come and gone in that
-    /// gap, so the caller looks again before it sleeps.
+    /// Returns at once when raising what was owed released the lock: a
+    /// completion may have come in that gap, so the caller looks again
+    /// before it sleeps.
     pub(super) fn wait(&mut self, timeout: Duration) {
         if self.raise_owed() {
             return;

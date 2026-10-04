@@ -194,14 +194,14 @@ pub struct NvmeMigrateState {
     pub num_io_queues: u16,
     pub pci: MigratePciState,
     pub msix: MsixMigrateState,
-    /// What the namespace showed the guest. A v2 source had one shape
-    /// only, 512-byte blocks and a volatile write cache, and sends none.
+    /// `None` from a v2 source, whose only shape was 512-byte blocks and
+    /// a volatile write cache.
     #[serde(default)]
     pub namespace: Option<NvmeMigrateNamespace>,
 }
 
-/// The shape of an NVMe namespace. The guest's partition tables and
-/// flush habits depend on it, so a destination must show the same.
+/// A destination must show the same shape: the guest's partition tables
+/// and flush habits depend on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NvmeMigrateNamespace {
     pub block_size: u32,
@@ -231,14 +231,12 @@ pub struct NvmeMigrateCq {
     /// poll queue has none, and restoring one as interrupting sends the
     /// destination guest a message it never armed a handler for.
     pub ien: bool,
-    /// Completions waiting for the guest to free a slot, oldest first.
-    /// The destination writes them when the guest does. A v2 source
-    /// dropped them instead, so its payload has none.
+    /// Completions waiting for a free guest CQ slot, oldest first. Empty
+    /// from a v2 source, which dropped them.
     #[serde(default)]
     pub held: Vec<NvmeMigrateCqe>,
 }
 
-/// One completion an NVMe controller owes the guest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NvmeMigrateCqe {
     pub sqid: u16,

@@ -22,8 +22,7 @@ use super::NvmeController;
 /// completes.
 ///
 /// Named by instance: the lock is released while it waits, and the
-/// driver may create a new queue in the same slot meanwhile, whose
-/// commands this delete has nothing to do with.
+/// driver may create a new queue in the same slot meanwhile.
 #[derive(Clone, Copy)]
 enum Fence {
     Sq(usize, QueueInstance),
@@ -126,8 +125,7 @@ impl NvmeController {
             );
 
             // The driver takes a Delete Queue completion as licence to
-            // reuse the queue's pages, so every command that could
-            // still touch them finishes first.
+            // reuse the queue's pages, so their commands finish first.
             if let Some(fence) = fence {
                 let admin_cq = st.admin_cq.as_ref().map(|cq| cq.instance);
                 let (next, drained) =
