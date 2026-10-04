@@ -80,9 +80,13 @@ fn watch<J: Job>(
         {
             return Err(Lost::Stalled);
         }
-        let until = next_ping.min(now + TICK);
-        conn.readable(until)
-            .map_err(|e| Lost::Control(format!("poll: {e}")))?;
+        // Frames left over from a full budget are already read, and the
+        // socket may stay quiet until the next tick.
+        if !conn.frame_buffered() {
+            let until = next_ping.min(now + TICK);
+            conn.readable(until)
+                .map_err(|e| Lost::Control(format!("poll: {e}")))?;
+        }
         for _ in 0..FRAMES_PER_TICK {
             if shared.halted() || shared.is_lost() {
                 break;

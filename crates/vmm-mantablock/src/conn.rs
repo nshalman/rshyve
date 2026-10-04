@@ -92,16 +92,16 @@ impl Conn {
         deadline: Instant,
     ) -> io::Result<Option<Frame>> {
         loop {
-            // A peer that keeps the socket readable never reaches `wait`.
-            if Instant::now() >= deadline {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
             if let Some((msg, _, used)) =
                 Message::decode(&self.buf).map_err(invalid)?
             {
                 self.buf.drain(..used);
                 let fds = std::mem::take(&mut self.fds);
                 return Ok(Some(Frame { msg, fds }));
+            }
+            // A peer that keeps the socket readable never reaches `wait`.
+            if Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
             }
             match self.read_some()? {
                 Read::Bytes => {}
@@ -129,6 +129,12 @@ impl Conn {
                 Read::Eof => return Ok(Polled::Closed),
             }
         }
+    }
+
+    /// True when [`Self::try_recv`] would return without reading: a whole
+    /// frame is buffered, or bytes that will not decode.
+    pub(crate) fn frame_buffered(&self) -> bool {
+        !matches!(Message::decode(&self.buf), Ok(None))
     }
 
     /// A timeout is not an error here.

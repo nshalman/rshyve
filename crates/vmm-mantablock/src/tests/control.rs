@@ -115,3 +115,20 @@ fn a_request_past_the_io_limit_loses_the_engine() {
     assert_eq!(calls.wait_for(1), vec![(1, BlockStatus::Internal)]);
     assert!(ring.is_lost());
 }
+
+#[test]
+fn a_frame_already_read_is_returned_past_the_deadline() {
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    let mut conn = Conn::new(ours).unwrap();
+    let two: Vec<u8> = [Message::Pong, Message::Detached]
+        .iter()
+        .flat_map(|m| m.encode(0))
+        .collect();
+    theirs.write_all(&two).unwrap();
+    let soon = Instant::now() + Duration::from_secs(5);
+    assert_eq!(conn.recv(soon).unwrap().unwrap().msg, Message::Pong);
+    assert!(conn.frame_buffered());
+    let got = conn.recv(Instant::now()).unwrap().unwrap();
+    assert_eq!(got.msg, Message::Detached);
+    assert!(!conn.frame_buffered());
+}

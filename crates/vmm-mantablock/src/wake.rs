@@ -53,7 +53,7 @@ pub(crate) fn wake(fd: &OwnedFd) -> io::Result<()> {
     }
 }
 
-/// Reads per wake-up: with 4 KiB each, a full 64 KiB pipe.
+/// Reads per wake-up: with 4 KiB each, a full pipe.
 const DRAIN_READS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +98,8 @@ pub(crate) fn wait(fd: &OwnedFd, limit: Duration) -> Waited {
 /// Counts wake-ups that find nothing on the ring. One now and then is a
 /// race with `prepare_wait`; a run of them is an engine that writes the
 /// pipe without completing, and the thread then sleeps between wakes so
-/// it does not burn a CPU.
+/// it does not burn a CPU. Any completion resets the count, so an engine
+/// that completes once per run spends at most one CPU on wakes it sent.
 #[derive(Debug, Default)]
 pub(crate) struct Empty(u32);
 

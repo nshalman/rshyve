@@ -43,7 +43,6 @@ pub(crate) fn run<J: Job>(
     let mut last = Instant::now();
     let mut polls = 0u32;
     let mut empty = wake::Empty::default();
-    // Set by a wake-up, cleared by the next reap.
     let mut woke = false;
     while !shared.stopping() {
         let found = match reap(shared, ring, q, &mut cq, &mut cqes, &mut side) {

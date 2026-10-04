@@ -102,8 +102,8 @@ fn a_second_request_on_a_guest_tag_in_flight_fails_alone() {
     assert!(!ring.is_lost());
 }
 
-#[test]
-fn more_completions_in_a_pass_than_tags_is_an_overrun() {
+/// Takes one pass of `pushed` completions with 4 tags.
+fn take_pass(pushed: usize) -> (Option<Lost>, usize) {
     let g = Geometry::new(1, 8, 4).unwrap();
     let file = tempfile::tempfile().unwrap();
     file.set_len(g.region_len() as u64).unwrap();
@@ -118,14 +118,21 @@ fn more_completions_in_a_pass_than_tags_is_an_overrun() {
         durable_ns: 0,
     }
     .encode();
-    for _ in 0..5 {
+    for _ in 0..pushed {
         assert!(eng.try_push(&c).unwrap());
     }
     eng.publish();
     let mut cqes = Vec::new();
-    assert_eq!(
-        crate::reaper::take(&mut cq, &mut cqes, 4, 0),
-        Some(Lost::Overrun(0))
-    );
-    assert_eq!(cqes.len(), 4);
+    let lost = crate::reaper::take(&mut cq, &mut cqes, 4, 0);
+    (lost, cqes.len())
+}
+
+#[test]
+fn more_completions_in_a_pass_than_tags_is_an_overrun() {
+    assert_eq!(take_pass(5), (Some(Lost::Overrun(0)), 4));
+}
+
+#[test]
+fn as_many_completions_in_a_pass_as_tags_is_fine() {
+    assert_eq!(take_pass(4), (None, 4));
 }

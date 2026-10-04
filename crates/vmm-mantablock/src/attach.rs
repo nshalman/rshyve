@@ -205,7 +205,8 @@ fn map(fd: OwnedFd, geometry: Geometry) -> io::Result<Arc<Region>> {
     // only through the Region, which uses atomics, so the engine writing
     // them at any time is sound. The engine is trusted not to shrink the
     // file while attached, and not to leave it sparse on a tmpfs that can
-    // fill: either raises SIGBUS here, which nothing guards against.
+    // fill: either raises SIGBUS on a later access, which nothing guards
+    // against.
     let region = unsafe { Region::with_owner(base, len, geometry, map) }
         .map_err(invalid)?;
     Ok(Arc::new(region))
