@@ -6,11 +6,9 @@
 //!
 //! Zvols default to write-through, so every sync write commits the ZIL;
 //! writeback with guest-driven flushes is what makes small writes fast.
-//!
-//! A disk that cannot flush is accepted only with its write cache
-//! confirmed off, or with no cache control at all. The write cache is
-//! device-global and other opens of the device may be attached, so this
-//! code only ever moves it toward off after open.
+//! Only a zvol's write cache is ever changed: its flush always commits
+//! the ZIL, so neither cache state can make a flush silent. Any other
+//! disk is accepted only if it flushes or has no volatile cache on.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -23,6 +21,8 @@ use std::sync::Arc;
 #[cfg(target_os = "illumos")]
 const DKIOC: libc::c_int = 0x04 << 8; // 0x0400
 #[cfg(target_os = "illumos")]
+const DKIOCINFO: libc::c_int = DKIOC | 3; // 0x0403
+#[cfg(target_os = "illumos")]
 const DKIOCGETWCE: libc::c_int = DKIOC | 36; // 0x0424
 #[cfg(target_os = "illumos")]
 const DKIOCSETWCE: libc::c_int = DKIOC | 37; // 0x0425
@@ -32,6 +32,8 @@ const DKIOCFLUSHWRITECACHE: libc::c_int = DKIOC | 34; // 0x0422
 /// The disk ioctls the flush policy rests on, so tests can inject results.
 #[cfg(any(target_os = "illumos", test))]
 pub(crate) trait DiskOps: Send + Sync {
+    /// The drive name from DKIOCINFO (`dki_dname`).
+    fn drive_name(&self) -> io::Result<String>;
     fn flush(&self) -> io::Result<()>;
     fn get_wce(&self) -> io::Result<bool>;
     fn set_wce(&self, on: bool) -> io::Result<()>;
@@ -46,11 +48,11 @@ pub fn open_disk(path: &Path, read_only: bool) -> io::Result<File> {
 
 /// Makes completed writes on a backing fd durable.
 ///
-/// How is decided once, at open, together with the write cache state.
-/// A character disk device takes DKIOCFLUSHWRITECACHE rather than
-/// fsync(2): illumos fsync skips the flush when no I/O marked the device
-/// since the last one, so two flushes that race a write can both miss
-/// it, and it ignores the result of the flush it does send.
+/// How is decided once, at open. A character disk device takes
+/// DKIOCFLUSHWRITECACHE rather than fsync(2): illumos fsync skips the
+/// flush when no I/O marked the device since the last one, so two
+/// flushes that race a write can both miss it, and it ignores the
+/// result of the flush it does send.
 pub struct DiskSync {
     file: Arc<File>,
     mode: Mode,
@@ -66,7 +68,7 @@ enum Mode {
 }
 
 impl DiskSync {
-    /// Classify `file`, then probe its flush and set its write cache.
+    /// Classify `file` and decide how it flushes.
     pub fn new(file: Arc<File>, read_only: bool) -> io::Result<Self> {
         let st_mode = file.metadata()?.mode();
         #[cfg(target_os = "illumos")]
@@ -143,113 +145,96 @@ fn check_not_block(
     Err(io::Error::new(io::ErrorKind::InvalidInput, msg))
 }
 
-/// The raw node for an illumos block node path: `dsk` becomes `rdsk`
-/// and `lofi` becomes `rlofi`.
+/// The raw node for an illumos block node under /dev: the first `dsk`
+/// becomes `rdsk` and the first `lofi` becomes `rlofi`. The same names
+/// elsewhere are ordinary directories.
 fn raw_node(path: &Path) -> Option<PathBuf> {
+    let mut parts = path.components();
+    if parts.next() != Some(Component::RootDir)
+        || parts.next() != Some(Component::Normal("dev".as_ref()))
+    {
+        return None;
+    }
     let mut found = false;
-    let out = path
-        .components()
-        .map(|c| match c {
+    let mut out = PathBuf::from("/dev");
+    for c in parts {
+        match c {
             Component::Normal(n) if !found && (n == "dsk" || n == "lofi") => {
                 found = true;
                 let mut raw = std::ffi::OsString::from("r");
                 raw.push(n);
-                raw
+                out.push(raw);
             }
-            c => c.as_os_str().to_os_string(),
-        })
-        .collect::<PathBuf>();
+            Component::Normal(n) => out.push(n),
+            _ => return None,
+        }
+    }
     found.then_some(out)
 }
 
 #[cfg(any(target_os = "illumos", test))]
 struct Device {
     ops: Arc<dyn DiskOps>,
+    /// False only for a disk with no volatile cache on that cannot
+    /// flush; its flushes are no-ops.
     can_flush: bool,
-    /// This open turned the write cache on; Drop turns it off.
-    enabled_wce: bool,
+    /// A zvol whose write cache this open turned on.
+    restore_wce: bool,
 }
 
 #[cfg(any(target_os = "illumos", test))]
 impl Device {
     fn open(ops: Arc<dyn DiskOps>) -> io::Result<Self> {
-        let mut dev = Self {
+        // Any DKIOCINFO failure falls through to the strict path.
+        if ops.drive_name().is_ok_and(|n| n == "zvol") {
+            return Ok(Self::open_zvol(ops));
+        }
+        Self::open_disk(ops)
+    }
+
+    /// Best effort writeback. Another open of this zvol may restore
+    /// write-through under us or leave writeback on after us; either is
+    /// safe because a zvol flush always commits the ZIL.
+    fn open_zvol(ops: Arc<dyn DiskOps>) -> Self {
+        let restore_wce =
+            matches!(ops.get_wce(), Ok(false)) && ops.set_wce(true).is_ok();
+        Self {
             ops,
             can_flush: true,
-            enabled_wce: false,
+            restore_wce,
+        }
+    }
+
+    fn open_disk(ops: Arc<dyn DiskOps>) -> io::Result<Self> {
+        let wce = match ops.get_wce() {
+            Ok(on) => Some(on),
+            Err(e) if unsupported(&e) => None,
+            Err(e) => return Err(refuse("DKIOCGETWCE failed", e)),
         };
-        match dev.ops.flush() {
-            Ok(()) => {}
-            Err(e) if cannot_flush(&e) => {
-                dev.can_flush = false;
-                dev.cache_off_as_found()?;
-                return Ok(dev);
-            }
-            Err(e) => {
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!("disk write cache flush failed at open: {e}"),
+        // sd keeps its own copy of the cache state, read at attach and
+        // refreshed only by SETWCE. While that copy says off it answers
+        // a flush with success and sends nothing, so refresh it before
+        // the probe or the probe may test nothing.
+        if wce == Some(true) {
+            ops.set_wce(true)
+                .map_err(|e| refuse("write cache refresh failed", e))?;
+        }
+        let can_flush = match ops.flush() {
+            Ok(()) => true,
+            Err(e) if unsupported(&e) && wce != Some(true) => false,
+            Err(e) if unsupported(&e) => {
+                return Err(refuse(
+                    "write cache is on but the disk cannot flush it",
+                    e,
                 ))
             }
-        }
-        // Best effort: a disk that flushes is safe either way.
-        match dev.ops.get_wce() {
-            Ok(false) => {
-                if dev.ops.set_wce(true).is_err() {
-                    return Ok(dev);
-                }
-                dev.enabled_wce = true;
-            }
-            // sd keeps its own copy of the cache state, read at attach
-            // and refreshed only by SETWCE. While that copy says off it
-            // answers a flush with success and sends nothing, so the
-            // probe above may have tested nothing.
-            Ok(true) => {
-                let _ = dev.ops.set_wce(true);
-            }
-            Err(_) => return Ok(dev),
-        }
-        match dev.ops.flush() {
-            Ok(()) => Ok(dev),
-            Err(e) if cannot_flush(&e) => {
-                dev.can_flush = false;
-                dev.turn_cache_off()?;
-                dev.enabled_wce = false;
-                Ok(dev)
-            }
-            // Drop turns the cache back off if this open turned it on.
-            Err(e) => Err(io::Error::new(
-                e.kind(),
-                format!("disk flush failed with its write cache on: {e}"),
-            )),
-        }
-    }
-
-    /// The first probe cannot flush and the cache is as this open found
-    /// it. GETWCE that is unsupported from the start means no cache
-    /// control at all: the nvme blkdev namespace without a volatile
-    /// cache answers this way.
-    fn cache_off_as_found(&self) -> io::Result<()> {
-        match self.ops.get_wce() {
-            Ok(false) => Ok(()),
-            Err(e) if cannot_flush(&e) => Ok(()),
-            Err(e) => Err(refuse(e)),
-            Ok(true) => self.turn_cache_off(),
-        }
-    }
-
-    /// Turn the write cache off and read it back, for good: turning it
-    /// back on later could expose another open of this device that also
-    /// cannot flush. GETWCE worked earlier in this open, so any error on
-    /// the read-back, ENOTSUP and ENOTTY included, refuses the disk.
-    fn turn_cache_off(&self) -> io::Result<()> {
-        self.ops.set_wce(false).map_err(refuse)?;
-        if self.ops.get_wce().map_err(refuse)? {
-            return Err(refuse(io::Error::other(
-                "write cache still on after DKIOCSETWCE=0",
-            )));
-        }
-        Ok(())
+            Err(e) => return Err(refuse("flush failed at open", e)),
+        };
+        Ok(Self {
+            ops,
+            can_flush,
+            restore_wce: false,
+        })
     }
 
     fn sync(&self) -> io::Result<()> {
@@ -264,29 +249,22 @@ impl Device {
 #[cfg(any(target_os = "illumos", test))]
 impl Drop for Device {
     fn drop(&mut self) {
-        if self.enabled_wce {
+        if self.restore_wce {
             let _ = self.ops.set_wce(false);
         }
     }
 }
 
-/// ENOTSUP says SYNCHRONIZE CACHE is unsupported, not that no cache is
-/// on; ENOTTY only says the ioctl is unknown. Neither proves the write
-/// cache is off.
+/// ENOTSUP and ENOTTY: the driver has no such control. Neither proves
+/// the write cache is off.
 #[cfg(any(target_os = "illumos", test))]
-fn cannot_flush(e: &io::Error) -> bool {
+fn unsupported(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::ENOTSUP | libc::ENOTTY))
 }
 
 #[cfg(any(target_os = "illumos", test))]
-fn refuse(e: io::Error) -> io::Error {
-    io::Error::new(
-        e.kind(),
-        format!(
-            "disk cannot flush and its write cache could not be \
-             confirmed off: {e}"
-        ),
-    )
+fn refuse(what: &str, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("disk refused: {what}: {e}"))
 }
 
 /// The ioctls on a real fd.
@@ -295,6 +273,22 @@ struct Dkioc(Arc<File>);
 
 #[cfg(target_os = "illumos")]
 impl DiskOps for Dkioc {
+    fn drive_name(&self) -> io::Result<String> {
+        let mut info = DkCinfo::default();
+        // SAFETY: `info` lives through the call and matches the layout
+        // of struct dk_cinfo the kernel writes.
+        unsafe {
+            vmm_api_common::ioctl(
+                self.0.as_raw_fd(),
+                DKIOCINFO,
+                std::ptr::from_mut(&mut info).cast(),
+            )
+        }?;
+        let name = info.dki_dname.map(|c| c as u8);
+        let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        Ok(String::from_utf8_lossy(&name[..len]).into_owned())
+    }
+
     fn flush(&self) -> io::Result<()> {
         // SAFETY: a null argument asks for a synchronous flush; the
         // kernel reads nothing through it.
@@ -319,6 +313,30 @@ impl DiskOps for Dkioc {
         dkioc_wce(self.0.as_fd(), DKIOCSETWCE, &mut v)
     }
 }
+
+/// struct dk_cinfo from <sys/dkio.h>.
+#[cfg(target_os = "illumos")]
+#[repr(C)]
+#[derive(Default)]
+struct DkCinfo {
+    dki_cname: [libc::c_char; 16],
+    dki_ctype: libc::c_ushort,
+    dki_flags: libc::c_ushort,
+    dki_cnum: libc::c_ushort,
+    dki_addr: libc::c_uint,
+    dki_space: libc::c_uint,
+    dki_prio: libc::c_uint,
+    dki_vec: libc::c_uint,
+    dki_dname: [libc::c_char; 16],
+    dki_unit: libc::c_uint,
+    dki_slave: libc::c_uint,
+    dki_partition: libc::c_ushort,
+    dki_maxtransfer: libc::c_ushort,
+}
+
+// sizeof (struct dk_cinfo) from the illumos headers.
+#[cfg(target_os = "illumos")]
+const _: () = assert!(size_of::<DkCinfo>() == 68);
 
 #[cfg(target_os = "illumos")]
 fn dkioc_wce(

@@ -20,4 +20,4 @@ illumos-only  vmm_core:test:autodestruct  disarmed_autodestruct_keeps_the_instan
 
 # DKIOCFLUSHWRITECACHE exists only on illumos. Linux never probes a
 # device; it syncs every backing fd with fdatasync.
-illumos-only  vmm_devices:lib:vmm_devices  blkdev::tests::a_char_device_that_fails_the_probe_is_refused
+illumos-only  vmm_devices:lib:vmm_devices  blkdev::tests::a_char_device_that_fails_getwce_is_refused
