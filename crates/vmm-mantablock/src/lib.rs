@@ -65,8 +65,12 @@ pub struct Config {
     /// 4 KiB pages per buffer slot to ask for. A request larger than a
     /// slot goes as several parts.
     pub part_blocks: u32,
-    /// Empty polls before a completion thread sleeps.
-    pub spin: u32,
+    /// How long a completion thread polls after its last completion
+    /// before it sleeps. The next completion after a sleep waits for a
+    /// pipe wake-up, about 15 µs, so this should cover one engine batch.
+    /// While completions come closer together than this, the thread
+    /// keeps one CPU busy; idle, it costs nothing.
+    pub spin: Duration,
     /// Take an engine whose writes are not durable when they complete.
     /// For tests and measurement: the namespace must then show a
     /// volatile write cache.
@@ -92,7 +96,7 @@ impl Config {
             queues: 4,
             depth: 64,
             part_blocks: 32,
-            spin: 200,
+            spin: Duration::from_micros(50),
             allow_volatile: false,
             heartbeat: Duration::from_millis(100),
             heartbeat_limit: Duration::from_secs(1),

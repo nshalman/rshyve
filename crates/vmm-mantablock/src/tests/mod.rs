@@ -206,7 +206,7 @@ fn setup_with<J: Job<Id = u32>>(
     };
     let log = slog::Logger::root(slog::Discard, slog::o!());
     let mut cfg = Config::new("unused".into(), uuid::Uuid::nil(), log);
-    cfg.spin = 10;
+    cfg.spin = Duration::from_micros(5);
     let ring = Ring::start(att, None, &cfg, sink);
     let engine = Engine {
         sq: theirs.sq_consumer(0).unwrap(),

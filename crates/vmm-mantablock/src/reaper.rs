@@ -9,7 +9,7 @@
 //! must set idle, fence and look again, or it can miss a wake-up.
 
 use std::os::fd::OwnedFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use manta_block_ring::layout::CQE_BYTES;
 use manta_block_ring::{BadCompletion, Consumer, Cqe};
@@ -23,34 +23,43 @@ use crate::wake::{self, Waited};
 /// Bounds how late the thread sees the stop flag.
 const NAP: Duration = Duration::from_millis(50);
 
+/// Empty polls between clock reads: a read costs a few polls.
+const POLLS_PER_CLOCK: u32 = 16;
+
 pub(crate) fn run<J: Job>(
     shared: &Shared<J>,
     q: u16,
     mut cq: Consumer<CQE_BYTES>,
     wake_me: &OwnedFd,
-    spin: u32,
+    spin: Duration,
 ) {
     let Some(ring) = shared.queue(usize::from(q)) else {
         return;
     };
     let mut side = ring.cq_side();
     let mut cqes = Vec::new();
-    let mut empty = 0u32;
+    // The spin runs from the last completion, so a sleep that ends with
+    // nothing to take starts no new spin.
+    let mut last = Instant::now();
+    let mut polls = 0u32;
     while !shared.stopping() {
         match reap(shared, ring, q, &mut cq, &mut cqes, &mut side) {
             Ok(0) => {}
             Ok(_) => {
-                empty = 0;
+                last = Instant::now();
+                polls = 0;
                 continue;
             }
             Err(why) => return shared.lose(why),
         }
-        empty += 1;
-        if empty < spin {
+        polls += 1;
+        if !spin.is_zero()
+            && (!polls.is_multiple_of(POLLS_PER_CLOCK) || last.elapsed() < spin)
+        {
             std::hint::spin_loop();
             continue;
         }
-        empty = 0;
+        polls = 0;
         match cq.prepare_wait() {
             Ok(true) => {}
             Ok(false) => continue,
