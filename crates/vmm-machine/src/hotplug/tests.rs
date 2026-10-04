@@ -745,6 +745,31 @@ fn a_held_eject_waits_until_the_hold_ends() {
 }
 
 #[test]
+fn an_idle_drain_does_not_take_the_topology_lock() {
+    // The drain runs every tick, and a pause or migration claim holds
+    // this lock across slow device work.
+    let fixture = Fixture::new();
+    let topology = fixture.core.topology.clone();
+    let held = topology.lock();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            fixture.core.drain_ejects();
+            done.store(true, Ordering::Release);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done.load(Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let finished = done.load(Ordering::Acquire);
+        drop(held);
+        assert!(finished, "an empty drain waited on the topology lock");
+    });
+}
+
+#[test]
 fn a_poisoned_free_topology_lock_is_not_held() {
     let topology = TopologyLock::default();
     let poisoner = topology.clone();

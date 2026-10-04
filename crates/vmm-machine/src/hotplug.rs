@@ -320,7 +320,7 @@ impl Core {
         // the instant the VM powers off. An eject started then would
         // pause, quiesce and halt the same device the teardown sweep is
         // halting, from a second thread.
-        if self.is_closed() {
+        if self.is_closed() || !self.regs.has_eject_requests() {
             return;
         }
         let _topology = self.topology.lock();
