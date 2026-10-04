@@ -85,31 +85,47 @@ an operator decides; `stop` reaps it.
 
 A stop (SIGTERM or `stop`) during a migration latches the suspend at
 once. Before the commit it also cancels the migration. The migration
-thread checks for the cancel before every send, and every 50 ms while
-it waits for a connect, a name lookup, an accept or the durable flush.
-The stop shuts every socket the migration opened, the ZFS barrier's
-too, so a send or a read blocked on a quiet peer fails. This end tells
-the peer and gives up, and the source rolls back. Two waits are not
-cut short: the device quiesce, at most 30 seconds, and the vCPU and
-kernel ring pause ioctls. A stop that finds the vCPU pause running
-waits up to 10 seconds for it, then answers busy. A connect, a name lookup or a durable sync the stop left
-behind runs to its end on its own thread. A name lookup is bounded only
-by the resolver, and a durable sync keeps its device's workers parked
-until it returns.
+thread checks for the cancel before every forward send, and every 50 ms
+while it waits for a connect, a name lookup, an accept or the durable
+flush. The stop shuts every socket the migration opened, the ZFS
+barrier's too, so a send or a read blocked on a quiet peer fails. This
+end tells the peer and gives up, and the source rolls back. Two waits
+are not cut short: the device quiesce, at most 30 seconds, and the vCPU
+and kernel ring pause ioctls. A stop that finds the vCPU pause running
+waits up to 10 seconds for it, then answers busy.
+
+Connects are non-blocking, so a stop closes a connect still in progress
+on the migration thread itself. Only a name lookup runs on a thread of
+its own, and one the stop left behind holds no socket and ends when the
+resolver answers. A durable flush the stop left behind finishes the
+device it is on and then stops. Teardown waits for it before it touches
+a device, under the same clock as the rest of teardown. If that clock
+runs out, the process ends the way the SIGTERM watchdog ends it, and
+teardown never runs beside the flush.
 
 After a side's commit, a stop lets the handover finish, and shuts the
 sockets only after 30 seconds, because a send has no deadline on
 illumos. A stop on the destination after it told the source it was
 ready still ends the destination, and the guest does not start there.
 If the source committed, it stays paused, and the guest runs on
-neither host until an operator acts on the source.
+neither host until an operator acts on the source. The source has no
+way yet to take the guest back; see
+[issue #29](https://github.com/TritonDataCenter/rust-bhyve/issues/29).
 
 On either side the pause is given back, and teardown starts, only when
 the migration thread ends, so teardown never runs under it. A release
 that fails then is retried at once, then four times 2 seconds apart,
-then every 30 seconds until it works. Once the fast tries are spent,
-`status` reports `"release_stuck":true`, and the VM can stay
-`stopping` until the release works.
+then every 30 seconds. Once the fast tries are spent, `status` reports
+it and the VM stays `stopping`:
+
+```json
+{"success":true,"state":"stopping",...,"release_stuck":true}
+```
+
+The field goes as soon as the pause is given back. If releases keep
+failing for 5 minutes, the VMM logs why and ends itself the way the
+SIGTERM watchdog does, so the zone's restart policy and the instance's
+autodestruct clean up.
 
 If a migration's rollback or final resume cannot release the vCPUs and
 the device workers will not park again, the VM goes to `faulted`. So
@@ -331,6 +347,13 @@ The VMM treats a non-zero byte, a timeout, a connect failure, and a
 closed socket all as a failed migration and resumes its guest. A guest
 that resumed on the destination over an older disk had already
 acknowledged writes that disk never received.
+
+A stop can close the barrier socket at any point: before the connect
+completes, after it completes and before the agent answers, or while
+the agent is still writing its byte. The agent is not part of this
+repository, so this is a requirement on it: a connection that closes
+before the agent sends its byte is an abort. The agent must not take it
+as a go-ahead, and must not start or finish a switchover because of it.
 
 ## Waking the guest
 
