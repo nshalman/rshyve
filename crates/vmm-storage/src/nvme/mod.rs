@@ -513,6 +513,9 @@ impl Lifecycle for NvmeController {
         let mut st = self.lock();
         st.admission.paused = false;
         self.counts.paused.store(false, Ordering::Release);
+        // A payload may hold completions for a CQ with room, and only a
+        // CQ head doorbell writes them otherwise. A guest with nothing
+        // left to consume rings none.
         self.flush_all_held(&mut st);
         self.admit_all(&mut st);
         drop(st);

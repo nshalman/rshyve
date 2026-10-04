@@ -119,32 +119,18 @@ impl NvmeController {
         // head and tail, so a payload the checks let through would
         // abort the VMM on the guest's first doorbell write.
         check_nvme_state(mig)?;
-        let source = mig.namespace.unwrap_or(V2_NAMESPACE);
-        if source != self.namespace() {
+        let local = self.namespace();
+        // A v2 source carried no capacity or write protection, so only
+        // its one shape can be checked.
+        let source = mig.namespace.unwrap_or(NvmeMigrateNamespace {
+            block_size: 512,
+            volatile_write_cache: true,
+            ..local
+        });
+        if source != local {
             return Err(DeviceStateError::invalid(format!(
-                "the source namespace has {} byte blocks and VWC {}, this \
-                 one {} and {}",
-                source.block_size,
-                u8::from(source.volatile_write_cache),
-                self.geometry.block_size,
-                u8::from(self.config.volatile_write_cache),
+                "the source namespace is {source:?}, this one {local:?}",
             )));
-        }
-        {
-            let st = self.lock();
-            if mig.num_io_queues > st.max_io_queues {
-                return Err(DeviceStateError::invalid(format!(
-                    "num_io_queues {} is past the {} this backend serves",
-                    mig.num_io_queues, st.max_io_queues,
-                )));
-            }
-            // Their completions would be matched against queues the
-            // import is about to replace.
-            if st.in_flight() > 0 {
-                return Err(DeviceStateError::invalid(
-                    "the controller has commands in flight",
-                ));
-            }
         }
         // A held completion keeps its command's tag, and this backend
         // has only so many per queue.
@@ -161,20 +147,29 @@ impl NvmeController {
             )));
         }
 
+        // Checked and applied under one hold, so no command is admitted
+        // between the two.
+        let mut st = self.lock();
+        if mig.num_io_queues > st.max_io_queues {
+            return Err(DeviceStateError::invalid(format!(
+                "num_io_queues {} is past the {} this backend serves",
+                mig.num_io_queues, st.max_io_queues,
+            )));
+        }
+        // Their completions would be matched against queues the import
+        // is about to replace.
+        if st.in_flight() > 0 {
+            return Err(DeviceStateError::invalid(
+                "the controller has commands in flight",
+            ));
+        }
+
         slog::info!(self.log, "nvme: restoring controller state";
             "cc" => format!("{:#x}", mig.cc),
             "csts" => format!("{:#x}", mig.csts),
             "aqa" => format!("{:#x}", mig.aqa),
             "io_queues" => mig.num_io_queues);
 
-        let bar_writes = self
-            .pci_state
-            .lock()
-            .expect("pci lock")
-            .bar_replay_writes(&mig.pci.bar_addrs);
-        replay_migrate_pci_state(self, &bar_writes, mig.pci.command);
-
-        let mut st = self.lock();
         st.cc = mig.cc;
         st.csts = mig.csts;
         st.aqa = mig.aqa;
@@ -223,27 +218,32 @@ impl NvmeController {
         self.counts.paused.store(true, Ordering::Release);
         drop(st);
 
+        // After the checks, so a refused payload changes nothing.
+        let bar_writes = self
+            .pci_state
+            .lock()
+            .expect("pci lock")
+            .bar_replay_writes(&mig.pci.bar_addrs);
+        replay_migrate_pci_state(self, &bar_writes, mig.pci.command);
+
         self.msix.import_state(&mig.msix).map_err(|error| {
             DeviceStateError::invalid(format!("MSI-X table: {error}"))
         })
     }
 }
 
-const V2_NAMESPACE: NvmeMigrateNamespace = NvmeMigrateNamespace {
-    block_size: 512,
-    volatile_write_cache: true,
-};
-
 impl NvmeController {
     fn namespace(&self) -> NvmeMigrateNamespace {
         NvmeMigrateNamespace {
             block_size: self.geometry.block_size,
             volatile_write_cache: self.config.volatile_write_cache,
+            total_blocks: self.geometry.total_blocks,
+            read_only: self.read_only,
         }
     }
 
-    /// Put back the completions the source was holding, each with a tag
-    /// in its SQ as it had there. The payload passed its checks.
+    /// Put back the completions the source was holding, each with a free
+    /// tag in its SQ. The payload passed its checks.
     fn restore_held(&self, st: &mut NvmeState, mig: &NvmeMigrateState) {
         for (cq_id, wire) in wire_cqs(mig) {
             for held in &wire.held {
