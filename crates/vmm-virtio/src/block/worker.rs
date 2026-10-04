@@ -279,10 +279,10 @@ fn run_batch(
 
     publish(ctx, &completion, tag, &done.entries);
     done.charges.clear();
-    // The device can report quiet from here on, and a migration can
-    // export it. So nothing after the release may touch guest memory
-    // or answer a request: the kick only takes chains through
-    // admission, which a pause has closed.
+    // With the charges gone the device can report quiet and be
+    // exported. Nothing below may touch guest memory or answer a
+    // request; the kick takes chains only through admission, which a
+    // pause has closed.
     kick_starved(ctx);
 }
 
@@ -355,16 +355,9 @@ pub(super) fn run_request(
     Some((req.head, used_len))
 }
 
-/// Stop a request larger than the whole budget between chunks once a
-/// pause has run for the grace, and go on after the resume.
-///
-/// The budget bounds what a pause waits for, except for such a request,
-/// which may move up to 1 GiB. The pause closes admission, so it waits
-/// for this one request alone, and most end inside the grace. One that
-/// does not stops with its budget held, so the device does not report
-/// quiet, that pause fails and can be tried again, and no export sees
-/// a request half done. A drain never stops it, so a flush that waits
-/// for it syncs all of it.
+/// The budget does not bound a request past it, which may move 1 GiB.
+/// A pause lets it run for the grace, then stops it with its charge
+/// held, so the device stays not quiet and that pause fails.
 fn hold_between_chunks(ctx: &WorkerCtx, req: &BlkIoRequest, moved: usize) {
     if moved != 0 && req.charge.is_alone() {
         ctx.gate.hold_in_transfer(ctx.pause_grace);

@@ -38,20 +38,14 @@ pub(super) const MAX_REQ_BYTES: usize = MAX_SEGMENTS * SIZE_MAX as usize;
 /// limits. edk2's VirtioBlkDxe negotiates neither and puts a read of up
 /// to 1 GiB in one descriptor (`VerifyReadWriteRequest` refuses more).
 ///
-/// Not lower: the firmware FAT driver reads the aligned part of a file
-/// run straight from the disk (`FatAccessCache`), so loading a boot
-/// file or a unified kernel image is one read of its full size. GRUB's
-/// efidisk stops at 640 KiB, but firmware loads GRUB first. The
-/// budget does not bound such a request, so the worker stops it
-/// between chunks in a pause instead.
+/// Not lower: the firmware FAT driver reads a boot file or a unified
+/// kernel image in one read of its full size (`FatAccessCache`).
 pub(super) const MAX_UNLIMITED_REQ_BYTES: usize = 1 << 30;
 
 /// The bounds a request is held to.
 ///
-/// VirtIO 1.3 sec 5.2.3: `seg_max` and `size_max` bind the driver only
-/// when it negotiated the feature bit. A driver that did not may send
-/// a larger segment, and refusing it fails a correct request. The
-/// firmware loads its boot file that way.
+/// `seg_max` and `size_max` bind the driver only when it negotiated the
+/// feature bit. Firmware does not, and sends larger segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ReqLimits {
     segments: usize,
@@ -60,14 +54,12 @@ pub(super) struct ReqLimits {
 }
 
 impl ReqLimits {
-    /// The bounds that apply when no segment limit was negotiated.
     pub(super) const UNLIMITED: Self = Self {
         segments: usize::MAX,
         seg_bytes: u32::MAX,
         total: MAX_UNLIMITED_REQ_BYTES,
     };
 
-    /// The bounds for the negotiated feature bits.
     pub(super) fn negotiated(features: u64) -> Self {
         let seg_max = features & bits::VIRTIO_BLK_F_SEG_MAX != 0;
         let size_max = features & bits::VIRTIO_BLK_F_SIZE_MAX != 0;

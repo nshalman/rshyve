@@ -401,8 +401,7 @@ impl VirtioBlock {
         );
     }
 
-    /// Check one chain and return its request header and the data
-    /// bytes it names.
+    /// Check one chain and return its request header and data length.
     ///
     /// On refusal the status byte is written and the used length the
     /// guest is owed is returned. A refused head still goes back on the
@@ -534,12 +533,8 @@ impl VirtioBlock {
         });
     }
 
-    /// Drain every ring again, for chains left there while the device
-    /// was paused or short of budget.
-    ///
-    /// A drain of a ring with nothing new takes nothing, so this does
-    /// not need to know which rings hold work. A migration destination
-    /// cannot know: the starved marks stay on the source.
+    /// Drain every ring, not only the starved ones: a migration
+    /// destination does not have the source's starved marks.
     fn kick_all(&self) {
         for queue_idx in 0..self.num_queues {
             self.ctx.kick.kick(queue_idx);
@@ -576,8 +571,7 @@ impl VirtioDevice for VirtioBlock {
     }
 
     fn set_features(&self, features: u64) {
-        // SEG_MAX and SIZE_MAX set the request limits. The queues are
-        // told what was negotiated by the transport.
+        // The transport tells the queues what was negotiated.
         self.features.store(features, Ordering::Release);
     }
 
@@ -649,11 +643,9 @@ impl VirtioDevice for VirtioBlock {
             None => return false,
         };
 
-        // A pause waits for every request the device took, so the take
-        // and the hand-off to a worker happen under one admission. A
-        // pause that starts in between waits for the hand-off. Chains
-        // left in the ring are carried by a migration and drained on
-        // resume.
+        // Hold the admission until the hand-off to a worker. A pause
+        // waits for it, so it never sees parked workers with a request
+        // still on the way.
         let Some(_admission) = self.gate.admit() else {
             return false;
         };
@@ -801,9 +793,8 @@ impl Lifecycle for VirtioBlock {
         self.gate.pause();
     }
 
-    /// Quiet only once every request taken from a ring is answered. A
-    /// worker can park with work still queued to it, and a migration
-    /// that exported then would lose that work.
+    /// The budget check matters: a worker can park with work still
+    /// queued to it.
     fn is_quiesced(&self) -> bool {
         self.gate.is_quiesced() && self.ctx.budget.is_idle()
     }
@@ -819,10 +810,9 @@ impl Lifecycle for VirtioBlock {
     }
 
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
-        // A worker the drain parked can still take work queued to it,
-        // and a request past the budget runs on through a drain. The
-        // sync waits for both, so it never runs beside a request the
-        // device took.
+        // The gate alone is not enough: a parked worker can still take
+        // queued work, and a request past the budget runs on through a
+        // drain. The sync must not run beside either.
         let budget = &self.ctx.budget;
         let flushed = vmm_devices::quiesce::flush_file_when(
             &self.gate,
@@ -831,8 +821,7 @@ impl Lifecycle for VirtioBlock {
             "virtio-blk",
             || budget.is_idle(),
         );
-        // The flush held the workers, so a kick in that window left its
-        // chains in the ring. A pause still held drains them on resume.
+        // Kicks during the flush left their chains in the ring.
         if !self.gate.is_paused() {
             self.kick_all();
         }

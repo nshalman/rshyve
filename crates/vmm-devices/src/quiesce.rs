@@ -15,11 +15,10 @@ use crate::{FlushError, FlushIntent, Lifecycle};
 const DURABLE_QUIESCE_BUDGET: Duration = Duration::from_secs(30);
 const BEST_EFFORT_QUIESCE_BUDGET: Duration = Duration::from_secs(2);
 const BEST_EFFORT_SYNC_BUDGET: Duration = Duration::from_secs(5);
-/// How often a parked worker looks for work handed to it before the
-/// pause.
+/// A send to a worker does not wake the gate's condvar, so a parked
+/// worker polls for work.
 const PARK_POLL: Duration = Duration::from_millis(50);
-/// How often a wait for quiet looks at a condition the gate is not
-/// told about, such as work queued to a worker.
+/// An `idle` condition does not wake the condvar, so it is polled.
 const IDLE_POLL: Duration = Duration::from_millis(5);
 
 /// Shared pause/drain gate for devices with I/O worker threads.
@@ -47,19 +46,17 @@ pub struct QuiesceGate {
     /// few atomics fails a correct tree on a loaded machine.
     drains_started: AtomicUsize,
     active: AtomicUsize,
-    /// `paused` and `drains` change only under this lock, and
-    /// [`Self::admit`] reads them under it. So a pause or a drain that
-    /// has set its flag waits only for the producers admitted before
-    /// that, and a stream of new producers cannot hold it off.
+    /// `paused` and `drains` change under this lock and `admit` reads
+    /// them under it, so new producers cannot hold off a pause or a
+    /// drain that has set its flag.
     state: Mutex<GateState>,
     cv: Condvar,
 }
 
 struct GateState {
-    /// Producers inside [`QuiesceGate::admit`].
+    /// Live [`Admission`]s.
     takers: usize,
-    /// When the pause in force started. A pause taken while one is in
-    /// force keeps the first start.
+    /// A pause taken while one is in force keeps the first start.
     paused_at: Option<Instant>,
 }
 
@@ -113,11 +110,8 @@ impl QuiesceGate {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Hold the workers, then wait out the producers admitted before.
-    ///
-    /// The pause is in force before the wait starts, so a producer that
-    /// comes later backs out, and the wait is bounded by the takes
-    /// already in progress.
+    /// In force before it waits, so only takes already in progress can
+    /// delay it.
     pub fn pause(&self) {
         let mut s = self.state();
         if !self.paused.load(Ordering::Acquire) {
@@ -195,16 +189,15 @@ impl QuiesceGate {
     /// Park as [`Self::park_if_paused`] does, but leave the park early
     /// with the work `poll` finds.
     ///
-    /// Work can reach a parked worker: a producer admitted before a
-    /// pause hands its work on after the workers see the pause, and a
-    /// worker that parked for one pause may still be parked when the
-    /// next one starts. The worker must finish that work, or the pause
-    /// waits for it for ever.
+    /// Work can reach a parked worker: a producer admitted before the
+    /// pause hands it on after the workers park, or a worker parked for
+    /// one pause is still parked when the next starts. Left there, the
+    /// pause would wait for ever.
     ///
-    /// In a drain, such work can start after the drain saw every worker
-    /// parked. It was not answered before the drain began, so a flush
-    /// owes it nothing. A caller that must not sync beside it waits for
-    /// it with [`Self::wait_quiesced_and`].
+    /// In a drain, such work can start after the drain saw every
+    /// worker parked. None of it was answered before the drain, so a
+    /// flush owes it nothing; a caller that must not sync beside it
+    /// uses [`Self::wait_quiesced_and`].
     pub fn park_if_paused_or<T>(
         &self,
         mut poll: impl FnMut() -> Option<T>,
@@ -231,13 +224,12 @@ impl QuiesceGate {
         found
     }
 
-    /// Stop a worker part way through one request once a pause has
-    /// been in force for `grace`, until the resume.
+    /// Stop a worker in the middle of a request once a pause is `grace`
+    /// old, until the resume.
     ///
-    /// The worker stays counted as active. It holds a request half
-    /// done, so neither a pause nor a drain may see the gate quiet.
-    /// Only a pause stops it: a drain wants the request finished, not
-    /// held, and a flush that waits for it syncs all of it.
+    /// The worker stays counted as active, so the gate does not read
+    /// quiet with a request half done. A drain never stops it: a flush
+    /// wants the request finished.
     pub fn hold_in_transfer(&self, grace: Duration) {
         if !self.paused.load(Ordering::Acquire) {
             return;
@@ -259,10 +251,8 @@ impl QuiesceGate {
         self.wait_quiesced_and(budget, || true)
     }
 
-    /// Wait for every worker to park and for `idle` to hold, together.
-    ///
-    /// `idle` is for work the gate does not count, such as requests
-    /// queued to a parked worker. It is polled with no lock held.
+    /// [`Self::wait_quiesced`], and `idle` too, for work the gate does
+    /// not count. `idle` is called with no lock held.
     pub fn wait_quiesced_and(
         &self,
         budget: Duration,
@@ -316,9 +306,7 @@ pub fn flush_file(
     flush_file_when(gate, file, intent, device, || true)
 }
 
-/// [`flush_file`], for a device whose workers can hold work the gate
-/// does not count. The sync waits for `idle` as well, so no request
-/// the device took is still moving data when it runs.
+/// [`flush_file`], with the sync also waiting for `idle`.
 pub fn flush_file_when(
     gate: &QuiesceGate,
     file: &File,

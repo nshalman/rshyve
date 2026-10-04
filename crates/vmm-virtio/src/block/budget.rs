@@ -24,17 +24,13 @@ use super::{bits, discard};
 /// for is under a second.
 pub(super) const INFLIGHT_BYTES: u64 = 64 << 20;
 
-/// How long a pause lets a request larger than the whole budget run
-/// on before it stops the request between chunks.
+/// How long a pause lets a request past the budget run on before it
+/// stops it between chunks.
 ///
-/// The pause closes admission, so it waits for one such request at
-/// most, and back-to-back requests cannot hold every pause off. 3 s
-/// leaves 2 s of the 5 s operator pause budget for the other devices
-/// and for the budgeted backlog, which takes under 1 s on a slow
-/// pool. A firmware read of a boot file, the usual such request, is
-/// tens of MiB and ends well inside it. A request that does not end
-/// in time stops, still owed, so that pause fails and can be tried
-/// again after a resume.
+/// Under the 5 s operator pause budget, with 2 s left for the other
+/// devices and the budgeted backlog. A firmware boot file read, the
+/// usual such request, ends well inside it. One that does not fails
+/// the pause, which can be tried again after a resume.
 pub(super) const OVERSIZED_PAUSE_GRACE: Duration = Duration::from_secs(3);
 
 /// Requests one device may have in flight, whatever they cost.
@@ -51,7 +47,7 @@ pub(super) const MAX_REQUESTS: usize = 128;
 /// but each one is still a call to the backing store.
 pub(super) const MIN_COST: u64 = 4096;
 
-/// Most queues a budget can track.
+/// One bit per queue in a `u64` mask.
 pub(super) const MAX_QUEUES: u16 = u64::BITS as u16;
 
 /// Taken from a queue's ring and not yet finished.
@@ -175,11 +171,9 @@ impl Budget {
 
     /// Queues due for a kick, each returned once.
     ///
-    /// The queue kicked first gets the freed budget first, so the first
-    /// place goes round the due queues: it goes to the first due queue
-    /// after the last one to have it. Going round by queue number
-    /// instead would give it to the queue after a long gap nearly every
-    /// time.
+    /// The first queue gets the freed budget first, so first place goes
+    /// round the due queues. Going round queue numbers would favor the
+    /// queue after a long gap.
     pub(super) fn take_kicks(&self) -> Vec<u16> {
         let mut s = self.state();
         let mask = std::mem::take(&mut s.kick);
