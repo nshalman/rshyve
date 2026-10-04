@@ -6,9 +6,7 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{
-    mpsc, Arc, Condvar, Mutex, PoisonError, RwLock, RwLockReadGuard,
-};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,7 +18,6 @@ const BEST_EFFORT_SYNC_BUDGET: Duration = Duration::from_secs(5);
 /// How often a parked worker looks for work handed to it before the
 /// pause.
 const PARK_POLL: Duration = Duration::from_millis(50);
-
 /// Shared pause/drain gate for devices with I/O worker threads.
 ///
 /// WHY a bool predicate and not a future: no caller in this tree is async
@@ -46,18 +43,32 @@ pub struct QuiesceGate {
     /// few atomics fails a correct tree on a loaded machine.
     drains_started: AtomicUsize,
     active: AtomicUsize,
-    /// Held shared by each producer from its pause check until its work
-    /// is handed to a worker, and held alone to start a pause or a
-    /// drain. So once `pause` returns, no producer still holds work it
-    /// decided to take before the pause.
-    admission: RwLock<()>,
-    lock: Mutex<()>,
+    /// `paused` and `drains` change only under this lock, and
+    /// [`Self::admit`] reads them under it. So a pause or a drain that
+    /// has set its flag waits only for the producers admitted before
+    /// that, and a stream of new producers cannot hold it off.
+    state: Mutex<GateState>,
     cv: Condvar,
+}
+
+struct GateState {
+    /// Producers inside [`QuiesceGate::admit`].
+    takers: usize,
 }
 
 /// A producer's permission to take work, from [`QuiesceGate::admit`].
 pub struct Admission<'a> {
-    _guard: RwLockReadGuard<'a, ()>,
+    gate: &'a QuiesceGate,
+}
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        let mut s = self.gate.state();
+        s.takers -= 1;
+        if s.takers == 0 {
+            self.gate.cv.notify_all();
+        }
+    }
 }
 
 /// One caller's claim on the workers, released when it is dropped.
@@ -70,7 +81,7 @@ pub struct DrainScope<'a> {
 
 impl Drop for DrainScope<'_> {
     fn drop(&mut self) {
-        let _guard = self.gate.lock.lock().expect("quiesce gate lock");
+        let _guard = self.gate.state();
         self.gate.drains.fetch_sub(1, Ordering::AcqRel);
         self.gate.cv.notify_all();
     }
@@ -83,22 +94,33 @@ impl QuiesceGate {
             drains: AtomicUsize::new(0),
             drains_started: AtomicUsize::new(0),
             active: AtomicUsize::new(workers),
-            admission: RwLock::new(()),
-            lock: Mutex::new(()),
+            state: Mutex::new(GateState { takers: 0 }),
             cv: Condvar::new(),
         }
     }
 
-    pub fn pause(&self) {
-        let _admission = self.close_admission();
-        self.paused.store(true, Ordering::Release);
+    fn state(&self) -> MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Wait out every producer inside [`Self::admit`].
-    fn close_admission(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
-        self.admission
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
+    /// Hold the workers, then wait out the producers admitted before.
+    ///
+    /// The pause is in force before the wait starts, so a producer that
+    /// comes later backs out, and the wait is bounded by the takes
+    /// already in progress.
+    pub fn pause(&self) {
+        let s = self.state();
+        self.paused.store(true, Ordering::Release);
+        self.cv.notify_all();
+        self.wait_for_takers(s);
+    }
+
+    fn wait_for_takers(&self, s: MutexGuard<'_, GateState>) {
+        drop(
+            self.cv
+                .wait_while(s, |s| s.takers != 0)
+                .unwrap_or_else(PoisonError::into_inner),
+        );
     }
 
     /// Permission to take work and hand it to a worker, or `None` while
@@ -108,18 +130,16 @@ impl QuiesceGate {
     /// starts in that window waits for it, so it never finds the
     /// workers parked with work still on the way to them.
     pub fn admit(&self) -> Option<Admission<'_>> {
-        let guard = self
-            .admission
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut s = self.state();
         if self.is_paused() {
             return None;
         }
-        Some(Admission { _guard: guard })
+        s.takers += 1;
+        Some(Admission { gate: self })
     }
 
     pub fn resume(&self) {
-        let _guard = self.lock.lock().expect("quiesce gate lock");
+        let _guard = self.state();
         self.paused.store(false, Ordering::Release);
         self.cv.notify_all();
     }
@@ -130,10 +150,13 @@ impl QuiesceGate {
     /// pause taken by another thread while the scope is held survives
     /// the drop.
     pub fn drain_scope(&self) -> DrainScope<'_> {
-        let _admission = self.close_admission();
+        let s = self.state();
         self.drains_started.fetch_add(1, Ordering::Relaxed);
         self.drains.fetch_add(1, Ordering::AcqRel);
-        DrainScope { gate: self }
+        self.cv.notify_all();
+        let scope = DrainScope { gate: self };
+        self.wait_for_takers(s);
+        scope
     }
 
     /// How many drains have been started on this gate.
@@ -158,10 +181,11 @@ impl QuiesceGate {
     /// Park as [`Self::park_if_paused`] does, but leave the park early
     /// with the work `poll` finds.
     ///
-    /// Work can reach a parked worker: a worker that parked for one
-    /// pause may still be parked when the next one starts, and work
-    /// handed to it between the two waits there. The worker must
-    /// finish it, or the pause waits for it for ever.
+    /// Work can reach a parked worker: a producer admitted before a
+    /// pause hands its work on after the workers see the pause, and a
+    /// worker that parked for one pause may still be parked when the
+    /// next one starts. The worker must finish that work, or the pause
+    /// waits for it for ever.
     pub fn park_if_paused_or<T>(
         &self,
         mut poll: impl FnMut() -> Option<T>,
@@ -169,7 +193,7 @@ impl QuiesceGate {
         if !self.is_paused() {
             return None;
         }
-        let mut guard = self.lock.lock().expect("quiesce gate lock");
+        let mut guard = self.state();
         self.active.fetch_sub(1, Ordering::AcqRel);
         self.cv.notify_all();
         let mut found = None;
@@ -181,7 +205,7 @@ impl QuiesceGate {
             guard = self
                 .cv
                 .wait_timeout(guard, PARK_POLL)
-                .expect("quiesce gate lock")
+                .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
         self.active.fetch_add(1, Ordering::AcqRel);
@@ -189,13 +213,14 @@ impl QuiesceGate {
     }
 
     pub fn wait_quiesced(&self, budget: Duration) -> bool {
-        let guard = self.lock.lock().expect("quiesce gate lock");
-        let (_guard, _result) = self
-            .cv
-            .wait_timeout_while(guard, budget, |_| {
-                self.active.load(Ordering::Acquire) > 0
-            })
-            .expect("quiesce gate lock");
+        let guard = self.state();
+        drop(
+            self.cv
+                .wait_timeout_while(guard, budget, |_| {
+                    self.active.load(Ordering::Acquire) > 0
+                })
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         self.active.load(Ordering::Acquire) == 0
     }
 }

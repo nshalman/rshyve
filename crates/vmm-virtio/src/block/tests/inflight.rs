@@ -36,6 +36,8 @@ struct Rig {
     live: AtomicBool,
     /// Holds every request at the disk while set.
     hold: Arc<AtomicBool>,
+    /// Bounce chunks that have reached the disk.
+    chunks: Arc<AtomicUsize>,
 }
 
 impl Rig {
@@ -106,9 +108,11 @@ impl Rig {
         poke(&physmap, AVAIL + 2, &(lens.len() as u16).to_le_bytes());
 
         let hold = Arc::new(AtomicBool::new(false));
-        let held = Arc::clone(&hold);
+        let chunks = Arc::new(AtomicUsize::new(0));
+        let (held, seen) = (Arc::clone(&hold), Arc::clone(&chunks));
         *block.ctx.parks.each_backend.lock().expect("park lock") =
             Some(Arc::new(move || {
+                seen.fetch_add(1, Ordering::AcqRel);
                 while held.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(1));
                 }
@@ -120,6 +124,7 @@ impl Rig {
             block,
             live: AtomicBool::new(true),
             hold,
+            chunks,
         });
         let weak = Arc::downgrade(&rig);
         rig.block.install_kick(BackendKick::new(move |queue_idx| {
@@ -154,6 +159,10 @@ impl Rig {
 
     fn hold(&self, on: bool) {
         self.hold.store(on, Ordering::Release);
+    }
+
+    fn chunks(&self) -> usize {
+        self.chunks.load(Ordering::Acquire)
     }
 }
 
@@ -381,12 +390,13 @@ fn a_reset_gives_the_budget_back() {
 }
 
 /// A pause that lands after the device took a request and before it
-/// handed it to a worker. The workers can park in that window, and the
-/// request would then sit in a parked worker's queue while the device
-/// reported quiet, so a migration would export a ring cursor past a
-/// request nobody answers.
+/// handed it to a worker. The pause is in force at once, so the
+/// workers park while the request is still on its way to one of them.
+/// The parked worker must take it and answer it, and the device must
+/// not report quiet until it has: a migration that exported in that
+/// window would carry a ring cursor past a request nobody answers.
 #[test]
-fn a_pause_never_reports_quiet_with_a_request_on_the_way() {
+fn a_parked_worker_answers_a_request_that_reaches_it_late() {
     let rig = Rig::new(&[REQ]);
     let (at_tx, at_rx) = mpsc::channel::<()>();
     let (go_tx, go_rx) = mpsc::channel::<()>();
@@ -423,22 +433,29 @@ fn a_pause_never_reports_quiet_with_a_request_on_the_way() {
             paused_tx.send(()).expect("report the pause");
         })
     };
-    // Long enough for every worker to time out and park, had the pause
-    // gone ahead.
+    let gate = Arc::clone(&rig.block.gate);
+    wait_for("the workers did not park", || gate.is_quiesced());
     assert!(
-        paused_rx.recv_timeout(Duration::from_millis(300)).is_err(),
-        "the pause went ahead of a request on its way to a worker"
+        paused_rx.try_recv().is_err(),
+        "the pause returned with a request on its way to a worker"
     );
     assert!(!rig.block.is_quiesced(), "quiet with a request taken");
 
+    // Held at the disk, the request keeps the device from quiet after
+    // the parked worker has taken it.
+    rig.hold(true);
     go_tx.send(()).expect("release the dispatch");
     paused_rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("the pause never started");
+        .expect("the pause never returned");
     kicker.join().expect("kick thread");
     pauser.join().expect("pause thread");
     assert_eq!(rig.taken(), 1);
+    wait_for("the parked worker left the request", || rig.chunks() == 1);
+    thread::sleep(Duration::from_millis(100));
+    assert!(!rig.block.is_quiesced(), "quiet with a request at the disk");
 
+    rig.hold(false);
     wait_for("the device did not quiesce", || rig.block.is_quiesced());
     assert_eq!(rig.used(), 1, "quiet with the request unanswered");
     assert_eq!(peek(&rig.physmap, STATUS), bits::VIRTIO_BLK_S_OK);
