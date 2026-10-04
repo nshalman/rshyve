@@ -89,9 +89,10 @@ real pipes, so they can send completions the real engine never would.
 
 `tests/engine.rs` runs the real `mantablock-engine` with a file volume
 and a null volume. The engine is in manta-storage, which CI does not
-build, so these tests are ignored by default. Run them by hand before a change to this crate or to the ring
-pin merges. Check out the manta-storage commit whose `Cargo.toml` pins
-the same `manta-block-ring` rev as the root `Cargo.toml` here, then:
+build, so these tests are ignored by default. Run them by hand before a
+change to this crate or to the ring pin merges. Check out the
+manta-storage commit whose `Cargo.toml` pins the same `manta-block-ring`
+rev as the root `Cargo.toml` here, then:
 
 ```bash
 cargo build -p manta-block-engine        # in manta-storage

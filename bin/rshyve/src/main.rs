@@ -114,6 +114,18 @@ fn migrate_devices(
         .collect()
 }
 
+/// The spec check in pcidev already refused these. This one reads the
+/// devices themselves, so a driver that check does not know about is
+/// refused too.
+fn refuse_unmigratable_devices(
+    registry: &DeviceRegistry,
+) -> anyhow::Result<()> {
+    match control::device_blockers(registry) {
+        Some(why) => anyhow::bail!(why),
+        None => Ok(()),
+    }
+}
+
 /// Handle migration destination mode: activate vCPUs, take a migration
 /// connection, and import VM state from the source.
 fn run_migration_destination(
@@ -128,12 +140,7 @@ fn run_migration_destination(
 ) -> anyhow::Result<()> {
     info!(log, "migration destination mode"; "listen" => listen_addr);
 
-    // The spec check in pcidev already refused these. This one reads
-    // the devices themselves, so a driver that check does not know
-    // about is refused too.
-    if let Some(why) = control::device_blockers(registry) {
-        anyhow::bail!(why);
-    }
+    refuse_unmigratable_devices(registry)?;
 
     // Activate and reset vCPUs. The reset initializes the VMCS/VMCB
     // host-state fields. The migration import then overwrites the
@@ -707,6 +714,41 @@ mod tests {
             &vmm_boot::BootImage,
             &vmm_core::vcpu::Vcpu,
         ) -> anyhow::Result<()> = vmm_boot::BootImage::setup_bsp;
+    }
+
+    struct Blocks(Option<&'static str>);
+
+    impl vmm_devices::Lifecycle for Blocks {
+        fn type_name(&self) -> &'static str {
+            "nvme"
+        }
+
+        fn migration_blocker(&self) -> Option<String> {
+            self.0.map(str::to_string)
+        }
+    }
+
+    fn registry_of(blocker: Option<&'static str>) -> DeviceRegistry {
+        let registry = DeviceRegistry::new();
+        registry
+            .insert(RegisteredDevice::new(
+                "nvme@5",
+                vmm_machine::parse_bdf("5"),
+                None,
+                Some(Arc::new(Blocks(blocker))
+                    as Arc<dyn vmm_devices::Lifecycle>),
+                None,
+            ))
+            .expect("insert");
+        registry
+    }
+
+    #[test]
+    fn a_destination_refuses_a_device_that_cannot_migrate() {
+        let error = refuse_unmigratable_devices(&registry_of(Some("a ring")))
+            .expect_err("a blocker");
+        assert!(error.to_string().contains("nvme@5: a ring"), "{error}");
+        refuse_unmigratable_devices(&registry_of(None)).expect("no blocker");
     }
 
     #[test]

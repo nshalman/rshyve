@@ -146,6 +146,20 @@ fn is_mantablock_nvme(spec: &str) -> bool {
     parts.driver == "nvme" && parts.config.starts_with("mantablock=")
 }
 
+/// `driver_specs` refuses this first, with a clearer error.
+fn refuse_mantablock_destination(
+    opts: &devspec::MantaBlockOpts,
+    is_migrate_dest: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !is_migrate_dest,
+        "nvme on MantaBlock volume {} is not supported on a migration \
+         destination",
+        opts.volume
+    );
+    Ok(())
+}
+
 fn reject_ahci_hd<T>() -> anyhow::Result<T> {
     anyhow::bail!(
         "AHCI device type 'ahci-hd' is not implemented; use virtio-blk or nvme"
@@ -266,13 +280,7 @@ fn parse_and_create_pci_device(
                 Ok(vmm_machine::created(nvme))
             }
             devspec::NvmeSpec::MantaBlock(opts) => {
-                // driver_specs refuses this first, with a clearer error.
-                anyhow::ensure!(
-                    !is_migrate_dest,
-                    "nvme on MantaBlock volume {} is not supported on a \
-                     migration destination",
-                    opts.volume
-                );
+                refuse_mantablock_destination(&opts, is_migrate_dest)?;
                 let nvme = mantablock_nvme(&opts, bdf.dev(), ctx)?;
                 chipset.try_attach_device(bdf, nvme.clone())?;
                 info!(log, "nvme attached";
@@ -663,6 +671,25 @@ mod tests {
             );
             assert!(driver_specs(false, &raw).is_ok());
         }
+    }
+
+    #[test]
+    fn a_mantablock_disk_is_refused_on_a_destination_at_attach() {
+        let opts = devspec::MantaBlockOpts {
+            socket: "/s".into(),
+            volume: "6f1c2a8e-0000-4000-8000-000000000007"
+                .parse()
+                .expect("a UUID"),
+            allow_volatile: false,
+            spin_us: None,
+        };
+        let error = refuse_mantablock_destination(&opts, true)
+            .expect_err("a destination");
+        assert!(
+            error.to_string().contains(&opts.volume.to_string()),
+            "{error}"
+        );
+        refuse_mantablock_destination(&opts, false).expect("not a destination");
     }
 
     #[test]
