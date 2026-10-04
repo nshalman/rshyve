@@ -541,3 +541,20 @@ fn more_held_completions_than_the_local_depth_are_refused() {
         .expect_err("three held, depth two");
     assert!(error.to_string().contains("depth"), "{error}");
 }
+
+/// An I/O SQ posting to CQ 0 would put I/O completions, held ones
+/// included, in the admin ring.
+#[test]
+fn an_io_sq_that_posts_to_the_admin_cq_is_refused() {
+    let mut payload = good_payload();
+    payload.io_sqs[0].as_mut().expect("io sq").cq_id = 0;
+    let error = check_nvme_state(&payload).expect_err("I/O SQ on CQ 0");
+    assert!(error.to_string().contains("other kind"), "{error}");
+
+    payload.admin_cq.as_mut().expect("admin cq").held = vec![held(1, 9)];
+    check_nvme_state(&payload).expect_err("held I/O CQE in the admin CQ");
+
+    let mut payload = good_payload();
+    payload.admin_sq.as_mut().expect("admin sq").cq_id = 1;
+    check_nvme_state(&payload).expect_err("admin SQ on an I/O CQ");
+}

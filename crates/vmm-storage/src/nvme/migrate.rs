@@ -451,26 +451,37 @@ pub(super) fn check_nvme_state(
             .and_then(|idx| mig.io_cqs.get(idx))
             .is_some_and(|slot| slot.is_some())
     };
-    let check_sq =
-        |what: &str, sq: &NvmeMigrateSq| -> Result<(), DeviceStateError> {
-            check_size(what, sq.size)?;
-            check_cursors(what, sq.size, sq.head, sq.tail)?;
-            check_base(what, sq.base)?;
-            if !cq_exists(sq.cq_id) {
-                return Err(DeviceStateError::invalid(format!(
-                    "{what} posts to CQ {}, which the payload does not create",
-                    sq.cq_id,
-                )));
-            }
-            Ok(())
-        };
+    // The admin SQ posts to the admin CQ and an I/O SQ to an I/O CQ:
+    // Create I/O SQ refuses CQ 0, and an I/O completion in the admin
+    // ring would be read as an admin one.
+    let check_sq = |what: &str,
+                    sq: &NvmeMigrateSq,
+                    admin: bool|
+     -> Result<(), DeviceStateError> {
+        check_size(what, sq.size)?;
+        check_cursors(what, sq.size, sq.head, sq.tail)?;
+        check_base(what, sq.base)?;
+        if (sq.cq_id == ADMIN_QUEUE_ID) != admin {
+            return Err(DeviceStateError::invalid(format!(
+                "{what} posts to CQ {}, a queue of the other kind",
+                sq.cq_id,
+            )));
+        }
+        if !cq_exists(sq.cq_id) {
+            return Err(DeviceStateError::invalid(format!(
+                "{what} posts to CQ {}, which the payload does not create",
+                sq.cq_id,
+            )));
+        }
+        Ok(())
+    };
 
     if let Some(sq) = &mig.admin_sq {
-        check_sq("admin SQ", sq)?;
+        check_sq("admin SQ", sq, true)?;
     }
     for (idx, sq) in mig.io_sqs.iter().enumerate() {
         if let Some(sq) = sq {
-            check_sq(&format!("IO SQ {}", idx + 1), sq)?;
+            check_sq(&format!("IO SQ {}", idx + 1), sq, false)?;
         }
     }
     check_held(mig)
