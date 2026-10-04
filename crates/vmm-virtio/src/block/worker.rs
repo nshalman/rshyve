@@ -279,6 +279,10 @@ fn run_batch(
 
     publish(ctx, &completion, tag, &done.entries);
     done.charges.clear();
+    // The device can report quiet from here on, and a migration can
+    // export it. So nothing after the release may touch guest memory
+    // or answer a request: the kick only takes chains through
+    // admission, which a pause has closed.
     kick_starved(ctx);
 }
 
