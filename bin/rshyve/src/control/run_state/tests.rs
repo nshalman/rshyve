@@ -4,10 +4,13 @@
 
 use super::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Barrier};
 
-use VmRunState::{Faulted, Migrating, Paused, Running, Stopped, Stopping};
+use VmRunState::{
+    Faulted, ImportFailed, ImportInDoubt, Migrating, Paused, Running, Stopped,
+    Stopping,
+};
 
 fn import(run: &RunControl) -> Result<(), String> {
     run.admit_import(|| None)
@@ -417,19 +420,51 @@ fn a_stop_after_the_destination_commit_leaves_it_to_finish() {
 }
 
 #[test]
-fn a_stop_after_the_source_commit_only_reaps_it() {
+fn a_stop_after_the_source_commit_waits_for_the_handover() {
+    // A release now would let teardown cut off the commit the
+    // destination is waiting for.
     let run = parked_source();
     assert!(run.commit());
     let calls = Calls::default();
 
     stop(&run, &calls).expect("stop");
 
-    assert_eq!(calls.counts(), (0, 1, 1));
+    assert_eq!(calls.counts(), (0, 1, 0));
     assert!(!run.cancelled());
-    let retry = Calls::default();
-    assert_eq!(run.hand_off(|| retry.note("release")), Ok(false));
-    assert_eq!(retry.counts(), (0, 0, 0), "released twice");
+    let end = Calls::default();
+    assert_eq!(run.hand_off(|| end.note("release")), Ok(false));
+    assert_eq!(end.counts(), (0, 0, 1));
     assert_eq!(run.get(), Stopping);
+    assert!(!run.topology.ejects_held());
+}
+
+#[test]
+fn an_unconfirmed_source_lets_ejects_go_and_waits_for_a_stop() {
+    let run = parked_source();
+    assert!(run.commit());
+    assert_eq!(
+        run.end_committed(|| -> Result<(), ()> { panic!("released") }),
+        Ok(true)
+    );
+    assert_eq!(run.get(), Migrating);
+    assert!(run.held());
+    assert!(!run.topology.ejects_held());
+
+    let calls = Calls::default();
+    stop(&run, &calls).expect("stop");
+    assert_eq!(calls.counts(), (0, 1, 1));
+}
+
+#[test]
+fn an_unconfirmed_source_gives_a_stop_its_pause_back() {
+    let run = parked_source();
+    assert!(run.commit());
+    stop(&run, &Calls::default()).expect("stop");
+    let end = Calls::default();
+    assert_eq!(run.end_committed(|| end.note("release")), Ok(false));
+    assert_eq!(end.counts(), (0, 0, 1));
+    assert!(!run.held());
+    assert!(!run.topology.ejects_held());
 }
 
 #[test]
@@ -453,18 +488,19 @@ fn a_failed_latch_gives_back_the_pause_a_stop_took() {
 }
 
 #[test]
-fn a_finished_source_retries_a_release_its_stop_could_not_make() {
+fn a_release_the_handover_could_not_make_is_left_to_reap() {
     let run = parked_source();
     assert!(run.commit());
-    let failed = run.stop(STOP_WAIT, ok, ok, || Err(()));
-    assert_eq!(failed, Err(StopFailure::NotReleased(())));
+    stop(&run, &Calls::default()).expect("stop");
+    assert!(!run.must_reap(), "reaped under the migration");
+
+    assert_eq!(run.hand_off(|| Err("EBUSY")), Err("EBUSY"));
     assert!(run.held());
     assert!(run.must_reap());
 
     let retry = Calls::default();
-    assert_eq!(run.hand_off(|| retry.note("release")), Ok(false));
+    stop(&run, &retry).expect("retried");
     assert_eq!(retry.counts(), (0, 0, 1));
-    assert!(!run.held());
     assert!(!run.must_reap());
 }
 
@@ -492,11 +528,12 @@ fn only_a_migrated_source_is_reaped() {
 
 #[test]
 fn a_migration_ends_in_the_state_its_pause_says() {
-    // A destination that failed before it resumed the guest.
+    // A destination that failed after the source committed, before it
+    // resumed the guest.
     let run = RunControl::new(Paused);
     import(&run).expect("claim");
-    run.park_migration(ok).expect("already held");
-    assert_eq!(run.end_migration(ok), Ok(true));
+    assert!(run.commit());
+    assert_eq!(run.fail_import(true, ok), Ok(true));
     assert_eq!(run.get(), Paused);
 
     // One that resumed the guest.
@@ -514,6 +551,181 @@ fn a_migration_ends_in_the_state_its_pause_says() {
     );
     assert_eq!(run.end_migration(ok), Ok(true));
     assert_eq!(run.get(), Paused);
+}
+
+#[test]
+fn a_failed_import_takes_only_a_retry_or_a_stop() {
+    // The guest is half written, and the source may run it too.
+    let run = RunControl::new(Paused);
+    import(&run).expect("claim");
+    assert_eq!(run.fail_import(false, ok), Ok(true));
+    assert_eq!(run.get(), ImportFailed);
+    assert!(run.held());
+    assert!(!run.topology.ejects_held());
+
+    let never = |_: &mut bool| -> Result<(), StepFailed<()>> {
+        panic!("a failed import resumed")
+    };
+    assert_eq!(
+        run.change(Paused, Running, never),
+        Err(ChangeFailed::WrongState)
+    );
+    import(&run).expect("a retry");
+    assert_eq!(run.get(), Migrating);
+    assert_eq!(run.fail_import(false, ok), Ok(true));
+
+    let calls = Calls::default();
+    stop(&run, &calls).expect("stop");
+    assert_eq!(calls.counts(), (0, 1, 1));
+}
+
+#[test]
+fn an_import_that_said_it_was_ready_is_in_doubt() {
+    // The source may have committed, so this may be the only copy.
+    let run = RunControl::new(Paused);
+    import(&run).expect("claim");
+    assert!(run.commit());
+    assert_eq!(run.fail_import(false, ok), Ok(true));
+    assert_eq!(run.get(), ImportInDoubt);
+    assert_eq!(import(&run), Err(IN_DOUBT.to_string()));
+
+    run.change(ImportInDoubt, Running, |held| {
+        *held = false;
+        step_ok()
+    })
+    .expect("forced resume");
+    assert_eq!(run.get(), Running);
+}
+
+#[test]
+fn a_stopped_import_leaves_the_stop_in_charge() {
+    let run = RunControl::new(Paused);
+    import(&run).expect("claim");
+    stop(&run, &Calls::default()).expect("stop");
+    let end = Calls::default();
+    assert_eq!(run.fail_import(false, || end.note("release")), Ok(false));
+    assert_eq!(end.counts(), (0, 0, 1));
+    assert_eq!(run.get(), Stopping);
+}
+
+#[test]
+fn a_stop_wakes_a_migration_blocked_on_its_peer() {
+    let run = parked_source();
+    let woken = Arc::new(AtomicUsize::new(0));
+    let by_waker = Arc::clone(&woken);
+    run.on_cancel(Box::new(move || {
+        by_waker.fetch_add(1, Ordering::AcqRel);
+    }));
+    assert_eq!(woken.load(Ordering::Acquire), 0);
+
+    stop(&run, &Calls::default()).expect("stop");
+    assert_eq!(woken.load(Ordering::Acquire), 1);
+
+    // A socket opened after the stop is shut at once.
+    let late = Arc::clone(&woken);
+    run.on_cancel(Box::new(move || {
+        late.fetch_add(1, Ordering::AcqRel);
+    }));
+    assert_eq!(woken.load(Ordering::Acquire), 2);
+}
+
+#[test]
+fn a_stop_after_the_commit_lets_the_handover_finish() {
+    let run = parked_source();
+    let woken = Arc::new(AtomicBool::new(false));
+    let by_waker = Arc::clone(&woken);
+    run.on_cancel(Box::new(move || by_waker.store(true, Ordering::Release)));
+    assert!(run.commit());
+    stop(&run, &Calls::default()).expect("stop");
+    assert!(!woken.load(Ordering::Acquire));
+}
+
+#[test]
+fn a_handover_a_stop_waits_for_is_still_cut_off_in_time() {
+    // A send on illumos has no deadline of its own.
+    let run = parked_source();
+    let (tx, rx) = std::sync::mpsc::channel();
+    run.on_cancel(Box::new(move || {
+        let _ = tx.send(());
+    }));
+    run.wake_after(Duration::from_millis(10));
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("the sockets were never shut");
+    assert!(!run.cancelled(), "a committed handover was cancelled");
+}
+
+#[test]
+fn an_ended_migration_drops_its_wakers() {
+    let run = parked_source();
+    let socket = Arc::new(());
+    let held = Arc::clone(&socket);
+    run.on_cancel(Box::new(move || drop(held)));
+    run.end_migration(ok).expect("ended");
+    assert_eq!(Arc::strong_count(&socket), 1, "the socket clone leaked");
+}
+
+struct Owner(RunControl);
+
+impl LeaseOwner for Owner {
+    fn abandon(&self) {
+        self.0
+            .abandon_migration(|| -> Result<(), ()> { panic!("released") })
+            .expect("abandoned");
+    }
+}
+
+fn unwind_with_a_lease(owner: &Owner) {
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        let _lease = MigrationLease::new(owner);
+        panic!("migration thread");
+    }));
+    assert!(panicked.is_err());
+}
+
+#[test]
+fn an_unwound_migration_faults_a_vm_it_paused() {
+    let owner = Owner(parked_source());
+    unwind_with_a_lease(&owner);
+    assert_eq!(owner.0.get(), Faulted);
+    assert!(!owner.0.topology.ejects_held());
+
+    let calls = Calls::default();
+    stop(&owner.0, &calls).expect("stop");
+    assert_eq!(calls.counts(), (0, 1, 1));
+}
+
+#[test]
+fn an_unwound_import_can_be_retried() {
+    let owner = Owner(RunControl::new(Paused));
+    import(&owner.0).expect("claim");
+    unwind_with_a_lease(&owner);
+    assert_eq!(owner.0.get(), ImportFailed);
+    import(&owner.0).expect("retry");
+}
+
+#[test]
+fn a_released_lease_leaves_the_state_alone() {
+    let owner = Owner(parked_source());
+    MigrationLease::new(&owner).release();
+    assert_eq!(owner.0.get(), Migrating);
+}
+
+#[test]
+fn shutdown_does_not_take_a_migrating_vm() {
+    // The check runs under `changing`, so a migration claimed after a
+    // look at the state still refuses it.
+    let run = parked_source();
+    let calls = Calls::default();
+    let refused = run.stop_from(
+        STOP_WAIT,
+        |state| matches!(state, Running | Paused),
+        || calls.note("hold"),
+        || calls.note("latch"),
+        || calls.note("release"),
+    );
+    assert_eq!(refused, Err(StopFailure::WrongState(Migrating)));
+    assert_eq!(calls.counts(), (0, 0, 0));
+    assert_eq!(run.get(), Migrating);
 }
 
 #[test]

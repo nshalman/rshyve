@@ -23,7 +23,9 @@ use super::migrate::{
     migration_source_guard,
 };
 use super::protocol::{Command, Response};
-use super::run_state::{ChangeFailed, StepFailed, CHANGE_IN_PROGRESS};
+use super::run_state::{
+    ChangeFailed, StepFailed, CHANGE_IN_PROGRESS, IMPORT_FAILED, IN_DOUBT,
+};
 use super::{
     park_all, unpark_all, StopFailure, VmController, VmRunState,
     DEVICE_PAUSE_BUDGET,
@@ -63,34 +65,19 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             }
         },
 
-        Command::Resume => match ctrl.run.change(
-            VmRunState::Paused,
-            VmRunState::Running,
-            |held| resume_step(ctrl, held),
-        ) {
-            Ok(()) => {
-                let mut r = Response::ok();
-                r.state = Some(VmRunState::Running);
-                r
-            }
-            Err(ChangeFailed::WrongState) => Response::err("VM is not paused"),
-            Err(ChangeFailed::Step(why) | ChangeFailed::Faulted(why)) => {
-                Response::err(&why)
-            }
-        },
+        Command::Resume { force } => resume(ctrl, force),
 
         Command::Shutdown => guest_stop(ctrl, SuspendHow::PowerOff, "shutdown"),
 
         Command::Reset => guest_stop(ctrl, SuspendHow::Reset, "reset"),
 
-        Command::Stop => {
-            if let Some(refusal) =
-                stop_refusal(ctrl.state(), ctrl.migrated_away())
-            {
-                return Response::err(refusal);
-            }
-            latch_stop(ctrl, SuspendHow::Halt, "stop")
-        }
+        Command::Stop => latch_stop(
+            ctrl,
+            SuspendHow::Halt,
+            "stop",
+            |state| stop_refusal(state, ctrl.migrated_away()).is_none(),
+            "VM is already stopped",
+        ),
 
         Command::MigrateSource {
             target_addr,
@@ -211,17 +198,56 @@ fn resume_step(
     )
 }
 
+/// The state a resume starts from, or why there is none.
+///
+/// A VM whose import is in doubt resumes only with `force`, once the
+/// operator has made sure the source did not keep the guest.
+fn resume_from(
+    state: VmRunState,
+    force: bool,
+) -> Result<VmRunState, &'static str> {
+    match state {
+        VmRunState::ImportInDoubt if force => Ok(state),
+        VmRunState::ImportInDoubt => Err(IN_DOUBT),
+        VmRunState::ImportFailed => Err(IMPORT_FAILED),
+        _ => Ok(VmRunState::Paused),
+    }
+}
+
+fn resume(ctrl: &VmController, force: bool) -> Response {
+    let from = match resume_from(ctrl.state(), force) {
+        Ok(from) => from,
+        Err(why) => return Response::err(why),
+    };
+    match ctrl
+        .run
+        .change(from, VmRunState::Running, |held| resume_step(ctrl, held))
+    {
+        Ok(()) => {
+            let mut r = Response::ok();
+            r.state = Some(VmRunState::Running);
+            r
+        }
+        Err(ChangeFailed::WrongState) => Response::err("VM is not paused"),
+        Err(ChangeFailed::Step(why) | ChangeFailed::Faulted(why)) => {
+            Response::err(&why)
+        }
+    }
+}
+
 /// `shutdown` and `reset`, which only a running or paused guest takes.
 fn guest_stop(
     ctrl: &Arc<VmController>,
     how: SuspendHow,
     what: &str,
 ) -> Response {
-    let cur = ctrl.state();
-    if cur != VmRunState::Running && cur != VmRunState::Paused {
-        return Response::err("VM is not running or paused");
-    }
-    latch_stop(ctrl, how, what)
+    latch_stop(
+        ctrl,
+        how,
+        what,
+        |state| matches!(state, VmRunState::Running | VmRunState::Paused),
+        "VM is not running or paused",
+    )
 }
 
 /// Latch a stop and report what happened.
@@ -233,14 +259,17 @@ fn latch_stop(
     ctrl: &Arc<VmController>,
     how: SuspendHow,
     what: &str,
+    allowed: impl FnOnce(VmRunState) -> bool,
+    refusal: &str,
 ) -> Response {
-    match ctrl.latch_stop(how) {
+    match ctrl.latch_stop(how, allowed) {
         Ok(state) => {
             let mut r = Response::ok();
             r.state = Some(state);
             r
         }
         Err(StopFailure::Busy) => Response::err(CHANGE_IN_PROGRESS),
+        Err(StopFailure::WrongState(_)) => Response::err(refusal),
         Err(StopFailure::NotLatched(e)) => {
             error!(ctrl.log, "{what} failed"; "error" => %e);
             Response::err("suspend ioctl failed")
@@ -440,9 +469,9 @@ mod tests {
     use super::VmRunState;
     use super::{
         added, cpu_added, cpu_list, device_list, hot_add_blocked,
-        hotplug_disabled, mem_added, mem_list, removing, stop_refusal,
-        window_json, MemWindowReport, CPU_HOTPLUG_OFF, MEM_HOTPLUG_OFF,
-        NO_CPU_REMOVE, NO_MEM_REMOVE,
+        hotplug_disabled, mem_added, mem_list, removing, resume_from,
+        stop_refusal, window_json, MemWindowReport, CPU_HOTPLUG_OFF,
+        MEM_HOTPLUG_OFF, NO_CPU_REMOVE, NO_MEM_REMOVE,
     };
 
     /// A stand-in CPU set. Every step of a real add is an ioctl, so a
@@ -885,5 +914,32 @@ mod tests {
             assert_eq!(stop_refusal(state, false), None, "{state:?}");
             assert_eq!(stop_refusal(state, true), None, "{state:?}");
         }
+    }
+
+    #[test]
+    fn a_failed_import_never_resumes() {
+        // The guest is half written, and the source may run it too.
+        for force in [false, true] {
+            assert_eq!(
+                resume_from(VmRunState::ImportFailed, force),
+                Err(super::IMPORT_FAILED)
+            );
+        }
+    }
+
+    #[test]
+    fn an_import_in_doubt_resumes_only_when_forced() {
+        assert_eq!(
+            resume_from(VmRunState::ImportInDoubt, false),
+            Err(super::IN_DOUBT)
+        );
+        assert_eq!(
+            resume_from(VmRunState::ImportInDoubt, true),
+            Ok(VmRunState::ImportInDoubt)
+        );
+        assert_eq!(
+            resume_from(VmRunState::Paused, true),
+            Ok(VmRunState::Paused)
+        );
     }
 }

@@ -19,7 +19,7 @@
 //! |---------------|----------------------------------------------|
 //! | `status`      | Returns VM state, name, CPU count, memory    |
 //! | `pause`       | Pauses all vCPUs and kernel timers           |
-//! | `resume`      | Resumes a paused VM                          |
+//! | `resume`      | Resumes a paused VM; `force` for one in doubt |
 //! | `shutdown`    | Graceful ACPI poweroff (VM_SUSPEND_POWEROFF) |
 //! | `reset`       | Guest restart (VM_SUSPEND_RESET); VMM re-execs |
 //! | `stop`        | Immediate VM halt (VM_SUSPEND_HALT)          |
@@ -41,6 +41,7 @@ mod dispatch;
 mod listener;
 mod migrate;
 mod protocol;
+mod reap;
 mod run_state;
 
 /// How long the migration pause waits for every device worker to park.
@@ -81,7 +82,7 @@ use crate::host_state::HostLocalState;
 
 pub use listener::{spawn_control_thread, ControlListener};
 pub(crate) use migrate::device_blockers;
-use run_state::{StepFailed, StopFailure};
+use run_state::{LeaseOwner, StepFailed, StopFailure};
 
 // ── Error type ──────────────────────────────────────────────────────
 
@@ -107,6 +108,10 @@ pub enum VmRunState {
     /// A release failed and the devices could not be parked again.
     /// Only a stop is taken.
     Faulted = 5,
+    #[serde(rename = "import-failed")]
+    ImportFailed = 6,
+    #[serde(rename = "import-in-doubt")]
+    ImportInDoubt = 7,
 }
 
 impl VmRunState {
@@ -118,6 +123,8 @@ impl VmRunState {
             3 => Self::Stopped,
             4 => Self::Migrating,
             5 => Self::Faulted,
+            6 => Self::ImportFailed,
+            7 => Self::ImportInDoubt,
             _other => Self::Stopped,
         }
     }
@@ -423,78 +430,80 @@ impl VmController {
         self.migrated_away.load(Ordering::Acquire)
     }
 
-    /// Record that the guest left, and arm the release that follows.
+    /// Record that the guest left, then release the VM if nobody has
+    /// within `grace`. Runs on the migration thread.
     ///
     /// A finished source is left paused, so nothing the guest does can
-    /// end it and no other command reaches it. Without the timer an
+    /// end it and no other command reaches it. Without the release an
     /// orchestrator that dies mid-switchover leaves the node holding
     /// the whole guest memory of a VM that runs nowhere.
-    pub(super) fn finish_migrated_away(self: &Arc<Self>, grace: Duration) {
+    pub(super) fn finish_migrated_away(&self, grace: Duration) {
         self.migrated_away.store(true, Ordering::Release);
-        match self.run.hand_off(|| self.release_pause()) {
-            Ok(true) => {}
-            Ok(false) => {
-                info!(
-                    self.log,
-                    "a stop arrived during the migration; \
-                    it owns the VM"
-                );
-                return;
+        let handed = self.run.hand_off(|| self.release_pause());
+        if !self.ended(handed) {
+            return;
+        }
+        thread::sleep(grace);
+        if !self.run.must_reap() {
+            return;
+        }
+        warn!(self.log, "releasing a migrated source nobody reaped";
+            "grace_secs" => grace.as_secs());
+        self.retry_release();
+    }
+
+    /// Report how a migration's end went. False when a stop owns the
+    /// VM; a release the stop left that failed is retried here.
+    pub(super) fn ended(&self, end: anyhow::Result<bool>) -> bool {
+        match end {
+            Ok(ended) => {
+                if !ended {
+                    info!(self.log, "a stop arrived during the migration; \
+                        it owns the VM"; "state" => ?self.state());
+                }
+                ended
             }
             Err(e) => {
-                error!(self.log, "a stopping migrated source would not \
-                    resume to see its stop"; "error" => %e);
-                return;
+                error!(self.log, "a stopping VM would not resume to see \
+                    its stop"; "error" => %e);
+                self.retry_release();
+                false
             }
-        }
-
-        let ctrl = Arc::clone(self);
-        let spawned = thread::Builder::new()
-            .name("migrated-source-release".into())
-            .spawn(move || {
-                thread::sleep(grace);
-                if !ctrl.run.must_reap() {
-                    return;
-                }
-                warn!(ctrl.log, "releasing a migrated source nobody reaped";
-                    "grace_secs" => grace.as_secs());
-                reap_with_retries(
-                    REAP_ATTEMPTS,
-                    REAP_RETRY,
-                    || ctrl.run.must_reap(),
-                    || ctrl.release_migrated_source(),
-                    &ctrl.log,
-                );
-            });
-
-        if let Err(e) = spawned {
-            // No timer means no reaper, so release now. Leaking the
-            // guest's memory is worse than an early release of a VM
-            // whose guest has already gone.
-            error!(self.log, "no release timer for a migrated source";
-                "error" => %e);
-            self.log_failed_release();
         }
     }
 
-    /// End a VM whose guest now runs on another host.
+    /// Release a held pause until it works or nothing holds it.
+    fn retry_release(&self) {
+        reap::reap(
+            reap::CADENCE,
+            || self.run.must_reap(),
+            || self.release_migrated_source(),
+            &self.log,
+        );
+    }
+
+    /// End a VM whose guest now runs on another host, or give back a
+    /// pause a stop left held.
     pub(super) fn release_migrated_source(&self) -> io::Result<()> {
-        self.latch_stop(SuspendHow::Halt)
+        self.latch_stop(SuspendHow::Halt, |_| true)
             .map(drop)
             .map_err(Into::into)
     }
 
-    /// Latch `how` and report the state the VM is really in.
+    /// Latch `how` on a VM in a state `allowed` takes, and report the
+    /// state the VM is really in.
     ///
     /// A VM holding the pause is suspended first and resumed second,
     /// which is the order [`run_state::release_paused_vm`] documents.
     fn latch_stop(
         &self,
         how: SuspendHow,
+        allowed: impl FnOnce(VmRunState) -> bool,
     ) -> Result<VmRunState, StopFailure<io::Error>> {
         self.run
-            .stop(
+            .stop_from(
                 run_state::STOP_WAIT,
+                allowed,
                 || self.hold_pause().map_err(io::Error::other),
                 || self.hdl.suspend(how, SUSPEND_SOURCE_VMM).map(drop),
                 || self.release_pause().map_err(io::Error::other),
@@ -504,15 +513,7 @@ impl VmController {
 
     /// Latch `how` from a signal handler's stop.
     fn stop_for_signal(&self, how: SuspendHow) -> io::Result<()> {
-        self.latch_stop(how).map(drop).map_err(Into::into)
-    }
-
-    /// The same release from a path with nobody to hand an error to.
-    fn log_failed_release(&self) {
-        if let Err(e) = self.release_migrated_source() {
-            error!(self.log, "failed to release a migrated source";
-                "error" => %e);
-        }
+        self.latch_stop(how, |_| true).map(drop).map_err(Into::into)
     }
 
     /// Take this controller's hold on the kernel pause.
@@ -569,6 +570,18 @@ impl VmController {
     }
 }
 
+impl LeaseOwner for VmController {
+    fn abandon(&self) {
+        error!(
+            self.log,
+            "a migration thread ended without closing its \
+            claim"
+        );
+        let end = self.run.abandon_migration(|| self.release_pause());
+        self.ended(end.map(|()| true));
+    }
+}
+
 /// SIGTERM shutdown driven through the control plane.
 ///
 /// Only the control plane knows whether the VM is parked on the
@@ -589,32 +602,6 @@ impl GuestStop for ControlStop {
 
     fn halt(&self) -> io::Result<()> {
         self.0.stop_for_signal(SuspendHow::Halt)
-    }
-}
-
-/// The grace timer's tries at a release, and the wait between them.
-const REAP_ATTEMPTS: u32 = 5;
-const REAP_RETRY: Duration = Duration::from_secs(2);
-
-/// Release until it works, nothing is left to release, or the attempts
-/// run out.
-fn reap_with_retries<E: std::fmt::Display>(
-    attempts: u32,
-    delay: Duration,
-    must_reap: impl Fn() -> bool,
-    release: impl Fn() -> Result<(), E>,
-    log: &Logger,
-) {
-    for attempt in 1..=attempts {
-        match release() {
-            Ok(()) => return,
-            Err(e) => error!(log, "failed to release a migrated source";
-                "attempt" => attempt, "error" => %e),
-        }
-        if attempt == attempts || !must_reap() {
-            return;
-        }
-        thread::sleep(delay);
     }
 }
 
@@ -842,55 +829,6 @@ mod tests {
         assert_eq!(result, Err(StopFailure::NotReleased("EBUSY")));
     }
 
-    #[test]
-    fn the_grace_timer_retries_a_failed_release() {
-        // One failed release used to leave the zombie for ever.
-        let calls = AtomicUsize::new(0);
-        reap_with_retries(
-            5,
-            Duration::ZERO,
-            || true,
-            || match calls.fetch_add(1, Ordering::AcqRel) {
-                0 | 1 => Err("EBUSY"),
-                _ => Ok(()),
-            },
-            &discard(),
-        );
-        assert_eq!(calls.load(Ordering::Acquire), 3);
-    }
-
-    #[test]
-    fn the_grace_timer_gives_up_in_bounds() {
-        let calls = AtomicUsize::new(0);
-        reap_with_retries(
-            4,
-            Duration::ZERO,
-            || true,
-            || {
-                calls.fetch_add(1, Ordering::AcqRel);
-                Err("EBUSY")
-            },
-            &discard(),
-        );
-        assert_eq!(calls.load(Ordering::Acquire), 4);
-    }
-
-    #[test]
-    fn the_grace_timer_stops_retrying_once_nothing_is_left() {
-        let calls = AtomicUsize::new(0);
-        reap_with_retries(
-            5,
-            Duration::ZERO,
-            || false,
-            || {
-                calls.fetch_add(1, Ordering::AcqRel);
-                Err("EBUSY")
-            },
-            &discard(),
-        );
-        assert_eq!(calls.load(Ordering::Acquire), 1);
-    }
-
     fn discard() -> Logger {
         Logger::root(slog::Discard, slog::o!())
     }
@@ -976,6 +914,8 @@ mod tests {
             VmRunState::Stopped,
             VmRunState::Migrating,
             VmRunState::Faulted,
+            VmRunState::ImportFailed,
+            VmRunState::ImportInDoubt,
         ] {
             assert_eq!(VmRunState::from_u8(state as u8), state);
         }
@@ -994,5 +934,9 @@ mod tests {
         assert_eq!(json, r#""paused""#);
         let json = serde_json::to_string(&VmRunState::Migrating).unwrap();
         assert_eq!(json, r#""migrating""#);
+        let json = serde_json::to_string(&VmRunState::ImportFailed).unwrap();
+        assert_eq!(json, r#""import-failed""#);
+        let json = serde_json::to_string(&VmRunState::ImportInDoubt).unwrap();
+        assert_eq!(json, r#""import-in-doubt""#);
     }
 }

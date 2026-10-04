@@ -85,11 +85,16 @@ may be running it. The control socket reports the VM still migrating and
 an operator decides; `stop` reaps it.
 
 A stop (SIGTERM or `stop`) during a migration latches the suspend at
-once. Before the commit it also cancels the migration: this end tells
-the peer and gives up, and the source rolls back. After the source's
-commit, a stop on the source only reaps it. On either side the pause is
-given back, and teardown starts, only when the migration thread ends,
-so teardown never runs under it.
+once. Before the commit it also cancels the migration and shuts its
+socket, so a thread blocked on a quiet peer returns at once: this end
+tells the peer and gives up, and the source rolls back. A destination
+still waiting for its source gives up as well. After a side's commit,
+a stop lets the handover finish, and shuts the socket only after 30
+seconds, because a send has no deadline on illumos. On either side the
+pause is given back, and teardown starts, only when the migration
+thread ends, so teardown never runs under it. A release that fails
+then is retried every 2 seconds, and after five tries every 30
+seconds, until it works.
 
 If a migration's rollback or final resume cannot release the vCPUs and
 the device workers will not park again, the VM goes to `faulted`. So
@@ -339,8 +344,20 @@ answers EBUSY for one, so a guest kick cannot revive it. Only the reset
 plus state write the rollback does can, which is why `resume` alone left
 the source guest with a dead NIC.
 
-A `migrate-dest` that fails puts the VM back in the state it was in.
-Marking it `Stopped` stranded a live guest that no control command could
-reach.
+A `migrate-dest` that fails does not go back to `paused`: the import
+may have written part of the guest, and the source may roll back and
+run it. The VM goes to one of two states:
+
+| State | When | Takes |
+|-------|------|-------|
+| `import-failed` | it failed before it told the source it was ready | `migrate-dest` again, or `stop` |
+| `import-in-doubt` | it told the source it was ready and never heard the commit | `resume` with `"force":true`, or `stop` |
+
+In doubt, the source may have committed, and this VM may hold the only
+copy of the guest. Look at the source first. If it rolled back and runs
+the guest, stop this VM. If it committed, make sure it is stopped, then
+send `{"command":"resume","force":true}` here. A `stop` here discards
+what may be the only copy. A failure after the commit arrived keeps the
+old rule: `paused` when the devices parked again, `faulted` when not.
 
 The destination VM should be destroyed by the caller.

@@ -199,7 +199,7 @@ fn run_migration_destination(
         }),
         pause_vm,
         resume_vm,
-        // Nothing can stop this VM before its control plane exists.
+        // No control plane exists yet to cancel this import.
         gate: Box::new(vmm_migrate::NoStop),
     };
 

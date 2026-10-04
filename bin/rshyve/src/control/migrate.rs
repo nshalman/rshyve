@@ -4,20 +4,21 @@
 
 //! Migration command handlers and their address guards.
 
-use std::net::{TcpListener, TcpStream};
+use std::io;
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use slog::{error, info};
+use slog::{debug, error, info};
 
 use vmm_core::mem::MemCtx;
 use vmm_machine::HotplugEngines;
 
 use super::protocol::{Command, Response};
-use super::run_state::RunControl;
+use super::run_state::{MigrationLease, RunControl};
 use super::{VmController, VmRunState};
 use crate::host_state::HostLocalState;
 
@@ -27,6 +28,12 @@ use crate::host_state::HostLocalState;
 /// short enough that a wedged one does not leave the node holding a
 /// guest's whole memory for a VM that runs nowhere.
 const SOURCE_RELEASE_GRACE: Duration = Duration::from_secs(300);
+
+/// How long a source waits for each address of its peer to answer.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often a destination waiting for its source checks for a stop.
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
 
 pub(super) fn migration_source_guard(
     state: HostLocalState,
@@ -288,12 +295,15 @@ pub(super) fn migrate_source(
         thread::Builder::new()
             .name("migrate-source".into())
             .spawn(move || {
+                let lease = MigrationLease::new(ctrl_arc.as_ref());
                 let hooks = source_hooks(&ctrl_arc);
+                let run = &ctrl_arc.run;
                 let outcome = match target {
                     MigrateTarget::Unix(path) => {
                         info!(mlog, "connecting to migration socket";
                         "path" => &path);
                         UnixStream::connect(&path)
+                            .and_then(|s| shut_on_cancel(run, s, &mlog))
                             .map_err(|e| SourceOutcome::Failed(e.to_string()))
                             .and_then(|stream| {
                                 run_source(
@@ -305,7 +315,8 @@ pub(super) fn migrate_source(
                     MigrateTarget::Tcp(addr) => {
                         info!(mlog, "connecting to migration peer";
                         "target" => &addr);
-                        TcpStream::connect(&addr)
+                        connect_tcp(&addr, || run.cancelled())
+                            .and_then(|s| shut_on_cancel(run, s, &mlog))
                             .map_err(|e| SourceOutcome::Failed(e.to_string()))
                             .and_then(|stream| {
                                 run_source(
@@ -329,12 +340,16 @@ pub(super) fn migrate_source(
                             destination never confirmed; this VM stays \
                             paused and is NOT released";
                             "error" => why);
+                        ctrl_arc.ended(
+                            run.end_committed(|| ctrl_arc.release_pause()),
+                        );
                     }
                     Err(e @ SourceOutcome::Failed(_)) => {
                         error!(mlog, "source migration failed"; "error" => %e);
                         end_migration(&ctrl_arc);
                     }
                 }
+                lease.release();
             })
     {
         end_migration(ctrl);
@@ -350,17 +365,71 @@ pub(super) fn migrate_source(
 
 /// Hand the state back from `Migrating`, unless a stop owns it now.
 fn end_migration(ctrl: &VmController) {
-    match ctrl.run.end_migration(|| ctrl.release_pause()) {
-        Ok(true) => {}
-        Ok(false) => {
-            info!(ctrl.log, "a stop arrived during the migration; it stands";
-                "state" => ?ctrl.state());
+    ctrl.ended(ctrl.run.end_migration(|| ctrl.release_pause()));
+}
+
+/// A stream a stop can shut down from another thread.
+trait Shut: Sized + Send + 'static {
+    fn try_clone(&self) -> io::Result<Self>;
+    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+}
+
+impl Shut for TcpStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        TcpStream::try_clone(self)
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        TcpStream::shutdown(self, how)
+    }
+}
+
+impl Shut for UnixStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        UnixStream::try_clone(self)
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        UnixStream::shutdown(self, how)
+    }
+}
+
+/// Let a stop's cancel shut `stream` down. A send or receive blocked on
+/// a peer that went quiet returns at once, and the thread rolls back.
+fn shut_on_cancel<S: Shut>(
+    run: &RunControl,
+    stream: S,
+    log: &slog::Logger,
+) -> io::Result<S> {
+    let clone = stream.try_clone()?;
+    let log = log.clone();
+    run.on_cancel(Box::new(move || {
+        if let Err(e) = clone.shutdown(Shutdown::Both) {
+            debug!(log, "the migration socket was already closed";
+                "error" => %e);
         }
-        Err(e) => {
-            error!(ctrl.log, "a stopping VM would not resume to see its \
-                stop"; "error" => %e);
+    }));
+    Ok(stream)
+}
+
+/// Connect to the first address of `addr` that answers in time.
+fn connect_tcp(
+    addr: &str,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<TcpStream> {
+    let mut last = None;
+    for peer in addr.to_socket_addrs()? {
+        if cancelled() {
+            return Err(io::Error::other(vmm_migrate::CANCELLED));
+        }
+        match TcpStream::connect_timeout(&peer, CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = Some(e),
         }
     }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("{addr}: no address"))
+    }))
 }
 
 /// The device hooks the source phases drive.
@@ -491,14 +560,23 @@ pub(super) fn migrate_dest(
         thread::Builder::new()
             .name("migrate-dest".into())
             .spawn(move || {
+                let lease = MigrationLease::new(ctrl_arc.as_ref());
                 let hooks = dest_hooks(&ctrl_arc);
+                let run = &ctrl_arc.run;
+                let phase = Arc::clone(&status);
                 let outcome =
-                    accept_one(&listen_addr, &mlog).and_then(|stream| {
-                        vmm_migrate::destination::run_destination(
-                            stream, hdl, &memctx, config, hooks, status, &mlog,
-                        )
-                        .map_err(|e| e.to_string())
-                    });
+                    accept_one(&listen_addr, || run.cancelled(), &mlog)
+                        .and_then(|stream| {
+                            shut_on_cancel(run, stream, &mlog)
+                                .map_err(|e| e.to_string())
+                        })
+                        .and_then(|stream| {
+                            vmm_migrate::destination::run_destination(
+                                stream, hdl, &memctx, config, hooks, status,
+                                &mlog,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
                 match outcome {
                     Ok(()) => {
                         info!(
@@ -508,14 +586,17 @@ pub(super) fn migrate_dest(
                         end_migration(&ctrl_arc);
                     }
                     Err(e) => {
-                        // The guest never left this VM's previous state, so
-                        // marking it Stopped would strand a live VM no
-                        // control command can reach.
+                        let confirmed = phase.lock().is_ok_and(|s| {
+                            s.phase == vmm_migrate::MigrationPhase::Committed
+                        });
                         error!(mlog, "destination migration failed";
-                        "error" => %e);
-                        end_migration(&ctrl_arc);
+                            "error" => %e, "source_committed" => confirmed);
+                        ctrl_arc.ended(run.fail_import(confirmed, || {
+                            ctrl_arc.release_pause()
+                        }));
                     }
                 }
+                lease.release();
             })
     {
         end_migration(ctrl);
@@ -547,18 +628,40 @@ fn dest_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::destination::DestHooks {
     }
 }
 
-/// Bind, take one connection, and give the listener back.
+/// Bind, take one connection, and give the listener back. Gives up
+/// when `cancelled` says a stop arrived.
 fn accept_one(
     listen_addr: &str,
+    cancelled: impl Fn() -> bool,
     log: &slog::Logger,
 ) -> Result<TcpStream, String> {
     let listener = TcpListener::bind(listen_addr)
         .map_err(|e| format!("bind {listen_addr}: {e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("listen {listen_addr}: {e}"))?;
     info!(log, "waiting for migration"; "addr" => listen_addr);
-    let (stream, peer) =
-        listener.accept().map_err(|e| format!("accept: {e}"))?;
-    info!(log, "accepted migration connection"; "peer" => %peer);
-    Ok(stream)
+    loop {
+        if cancelled() {
+            return Err(vmm_migrate::CANCELLED.to_string());
+        }
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                info!(log, "accepted migration connection"; "peer" => %peer);
+                // illumos hands the listener's O_NONBLOCK to the new
+                // socket, and the protocol needs blocking reads.
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|e| format!("accept: {e}"))?;
+                return Ok(stream);
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("accept: {e}")),
+        }
+    }
 }
 
 pub(super) fn migrate_status(ctrl: &Arc<VmController>) -> Response {
@@ -955,5 +1058,65 @@ mod tests {
 
         let memory = grown_since_boot(0, 134_217_728).expect("added memory");
         assert!(memory.contains("134217728 bytes"), "{memory}");
+    }
+
+    fn discard() -> slog::Logger {
+        slog::Logger::root(slog::Discard, slog::o!())
+    }
+
+    #[test]
+    fn a_destination_stopped_before_any_source_connects_lets_go() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancel = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&cancel);
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(accept_one(
+                "0.0.0.0:0",
+                || seen.load(Ordering::Acquire),
+                &discard(),
+            ));
+        });
+
+        cancel.store(true, Ordering::Release);
+
+        let ended = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the accept outlived the stop");
+        assert_eq!(
+            ended.expect_err("no source connected"),
+            vmm_migrate::CANCELLED
+        );
+    }
+
+    #[test]
+    fn a_source_stopped_while_its_peer_stops_reading_lets_go() {
+        use std::io::Write as _;
+        let run = RunControl::new(VmRunState::Running);
+        run.admit_source(|| None).expect("claim");
+        let (ours, _peer) = UnixStream::pair().expect("socket pair");
+        let mut ours =
+            shut_on_cancel(&run, ours, &discard()).expect("registered");
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let chunk = vec![0u8; 1 << 16];
+            let error = loop {
+                if let Err(e) = ours.write_all(&chunk) {
+                    break e;
+                }
+            };
+            let _ = tx.send(error);
+        });
+
+        run.stop(
+            super::super::run_state::STOP_WAIT,
+            || Ok::<(), ()>(()),
+            || Ok(()),
+            || Ok(()),
+        )
+        .expect("stop");
+
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the send outlived the stop");
     }
 }
