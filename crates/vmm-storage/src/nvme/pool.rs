@@ -32,6 +32,7 @@ pub(super) struct WorkerPool {
     file: Arc<File>,
     capacity: u64,
     durable: bool,
+    sink: Arc<dyn CompletionSink>,
     log: slog::Logger,
     /// Zvol write-cache control. Dropped after the workers stop, so
     /// the cache is put back only once nothing writes through it.
@@ -87,6 +88,7 @@ impl WorkerPool {
             file,
             capacity,
             durable,
+            sink,
             log,
             _cache: cache,
         }
@@ -135,16 +137,16 @@ impl AsyncBackend for WorkerPool {
     }
 
     fn submit(&self, req: BlockRequest) {
-        let tx = self.tx.lock().expect("nvme: pool tx lock");
-        let sent = match tx.as_ref() {
+        let sent = match self.tx.lock().expect("nvme: pool tx lock").as_ref() {
             Some(tx) => tx.send(req).map_err(|error| error.0.id()),
             None => Err(req.id()),
         };
         if let Err(id) = sent {
-            // The controller admits nothing after halt, so this is a
-            // worker that died, and the request will never complete.
-            slog::error!(self.log, "nvme: I/O dropped, the workers are gone";
+            // No worker will ever take it, and its tag stays taken until
+            // it completes.
+            slog::error!(self.log, "nvme: I/O failed, the workers are gone";
                 "queue" => id.queue(), "tag" => id.tag());
+            self.sink.complete(&[(id, BlockStatus::Internal)]);
         }
     }
 

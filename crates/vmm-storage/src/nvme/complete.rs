@@ -84,6 +84,11 @@ impl NvmeController {
             &mut *self.deferred.lock().expect("nvme: deferred lock"),
         );
         self.finish_all(st, mem, &done);
+        // A tag freed here may belong to another queue that is waiting
+        // for one.
+        if !done.is_empty() {
+            self.after_finish(st);
+        }
     }
 
     fn finish_all(

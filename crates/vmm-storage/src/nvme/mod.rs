@@ -258,7 +258,10 @@ impl NvmeController {
                 total_blocks: backend.capacity() / u64::from(block_size),
             };
             // A depth of 0 would admit nothing and stall every queue.
-            let depth = backend.queue_depth().max(1);
+            // Past the largest queue a migration payload may hold
+            // completions for, a state this controller made would not
+            // restore.
+            let depth = backend.queue_depth().clamp(1, MAX_QUEUE_SIZE);
             let state = initial_state(
                 backend.as_ref(),
                 geometry,

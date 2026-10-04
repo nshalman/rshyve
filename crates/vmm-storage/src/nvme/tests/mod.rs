@@ -279,6 +279,9 @@ struct Manual {
     durable: bool,
     /// Finish each request inside `submit`, on the caller's thread.
     inline: AtomicBool,
+    /// On the next `submit`, finish what is queued from inside it
+    /// first, as a ring backend reaping its completions does.
+    reap_on_submit: AtomicBool,
 }
 
 impl Manual {
@@ -301,6 +304,7 @@ impl Manual {
             depth,
             durable,
             inline: AtomicBool::new(false),
+            reap_on_submit: AtomicBool::new(false),
         })
     }
 
@@ -382,6 +386,12 @@ impl AsyncBackend for ManualBackend {
             .lock()
             .expect("queues lock")
             .push(req.id().queue());
+        if self.0.reap_on_submit.swap(false, Ordering::Relaxed) {
+            let reaped = self.0.take();
+            let done: Vec<_> =
+                reaped.iter().map(|r| (r.id(), self.0.run(r))).collect();
+            self.0.sink().complete(&done);
+        }
         if self.0.inline.load(Ordering::Relaxed) {
             let status = self.0.run(&req);
             self.0.sink().complete(&[(req.id(), status)]);
