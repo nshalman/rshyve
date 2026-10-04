@@ -159,7 +159,7 @@ impl Rig {
 
 #[test]
 fn the_budget_refuses_past_its_limit_but_never_a_lone_request() {
-    let budget = Budget::new(LIMIT, 1);
+    let budget = Budget::new(LIMIT);
 
     let big = budget.charge(0, 2 * LIMIT).expect("a lone request runs");
     assert!(
@@ -183,7 +183,7 @@ fn the_budget_refuses_past_its_limit_but_never_a_lone_request() {
 
 #[test]
 fn a_starved_queue_is_due_once_half_the_budget_is_free() {
-    let budget = Budget::new(LIMIT, 4);
+    let budget = Budget::new(LIMIT);
     let mut charges: Vec<_> = (0..4)
         .map(|_| budget.charge(0, LIMIT / 4).expect("fits the budget"))
         .collect();
@@ -197,7 +197,7 @@ fn a_starved_queue_is_due_once_half_the_budget_is_free() {
 
     // With nothing in flight no later release would come, so the last
     // one releases the queue whatever is free.
-    let budget = Budget::new(LIMIT, 4);
+    let budget = Budget::new(LIMIT);
     let lone = budget.charge(0, 2 * LIMIT).expect("a lone request runs");
     assert!(budget.charge(1, 512).is_none());
     drop(lone);
@@ -209,7 +209,7 @@ fn a_starved_queue_is_due_once_half_the_budget_is_free() {
 #[test]
 fn work_with_no_data_bytes_is_still_bounded() {
     assert_eq!(budget::cost(bits::VIRTIO_BLK_T_FLUSH, 0), 0);
-    let budget = Budget::new(budget::INFLIGHT_BYTES, 1);
+    let budget = Budget::new(budget::INFLIGHT_BYTES);
     let charges: Vec<_> = (0..budget::MAX_REQUESTS)
         .map(|_| {
             budget
@@ -238,7 +238,7 @@ fn work_with_no_data_bytes_is_still_bounded() {
 /// while anything is in flight drains the ring only to give it back.
 #[test]
 fn a_head_past_the_budget_is_kicked_only_when_it_can_run() {
-    let budget = Budget::new(LIMIT, 2);
+    let budget = Budget::new(LIMIT);
     let mut charges: Vec<_> = (0..4)
         .map(|_| budget.charge(0, LIMIT / 8).expect("fits the budget"))
         .collect();
@@ -259,7 +259,7 @@ fn a_head_past_the_budget_is_kicked_only_when_it_can_run() {
 /// place takes turns.
 #[test]
 fn starved_queues_are_kicked_in_turn() {
-    let budget = Budget::new(LIMIT, 3);
+    let budget = Budget::new(LIMIT);
     let mut firsts = Vec::new();
     for _ in 0..3 {
         let full = budget.charge(0, LIMIT).expect("an idle budget");
@@ -272,6 +272,26 @@ fn starved_queues_are_kicked_in_turn() {
         firsts.push(kicks[0]);
     }
     assert_eq!(firsts, [0, 1, 2], "one queue always went first");
+}
+
+/// Turns go round the queues that are due, not round queue numbers.
+/// By number, the queue after a long gap would go first nearly every
+/// time.
+#[test]
+fn sparse_starved_queues_take_turns() {
+    let budget = Budget::new(LIMIT);
+    let mut firsts = Vec::new();
+    for _ in 0..4 {
+        let full = budget.charge(0, LIMIT).expect("an idle budget");
+        for queue in [0, 63] {
+            assert!(budget.charge(queue, LIMIT / 4).is_none());
+        }
+        drop(full);
+        let kicks = budget.take_kicks();
+        assert_eq!(kicks.len(), 2, "a starved queue was left out");
+        firsts.push(kicks[0]);
+    }
+    assert_eq!(firsts, [0, 63, 0, 63], "one queue always went first");
 }
 
 #[test]

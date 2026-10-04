@@ -51,8 +51,8 @@ struct State {
     /// Starved queues a completion has freed budget for and that no
     /// worker has kicked yet.
     kick: u64,
-    /// The queue the next kick starts from.
-    next_kick: u16,
+    /// The queue that went first in the last kick.
+    last_first: Option<u16>,
     #[cfg(test)]
     peak_bytes: u64,
     #[cfg(test)]
@@ -61,22 +61,20 @@ struct State {
 
 pub(super) struct Budget {
     limit: u64,
-    queues: u16,
     state: Mutex<State>,
 }
 
 impl Budget {
-    pub(super) fn new(limit: u64, queues: u16) -> Arc<Self> {
+    pub(super) fn new(limit: u64) -> Arc<Self> {
         Arc::new(Self {
             limit,
-            queues: queues.clamp(1, MAX_QUEUES),
             state: Mutex::new(State {
                 bytes: 0,
                 requests: 0,
                 starved: 0,
                 refused: [0; MAX_QUEUES as usize],
                 kick: 0,
-                next_kick: 0,
+                last_first: None,
                 #[cfg(test)]
                 peak_bytes: 0,
                 #[cfg(test)]
@@ -163,20 +161,23 @@ impl Budget {
 
     /// Queues due for a kick, each returned once.
     ///
-    /// The order starts one queue further on each time, so the queue
-    /// kicked first, which gets the freed budget first, takes turns.
+    /// The queue kicked first gets the freed budget first, so the first
+    /// place goes round the due queues: it goes to the first due queue
+    /// after the last one to have it. Going round by queue number
+    /// instead would give it to the queue after a long gap nearly every
+    /// time.
     pub(super) fn take_kicks(&self) -> Vec<u16> {
         let mut s = self.state();
         let mask = std::mem::take(&mut s.kick);
-        if mask == 0 {
-            return Vec::new();
+        let after = s.last_first.map_or(0, |q| {
+            mask & u64::MAX.checked_shl(u32::from(q) + 1).unwrap_or(0)
+        });
+        let order: Vec<u16> =
+            queues(after).chain(queues(mask & !after)).collect();
+        if let Some(&first) = order.first() {
+            s.last_first = Some(first);
         }
-        let start = s.next_kick;
-        s.next_kick = (start + 1) % self.queues;
-        (0..self.queues)
-            .map(|i| (start + i) % self.queues)
-            .filter(|&q| mask & queue_bit(q) != 0)
-            .collect()
+        order
     }
 
     /// Whether nothing is in flight. Never blocks: a contended lock

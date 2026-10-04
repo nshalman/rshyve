@@ -229,7 +229,7 @@ impl VirtioBlock {
             gate: Arc::clone(&gate),
             access: Arc::new(GuestAccess::new(num_queues as usize)),
             backend: Arc::new(BackendBarrier::new()),
-            budget: Budget::new(inflight_bytes, num_queues),
+            budget: Budget::new(inflight_bytes),
             kick: Arc::new(KickSlot::new()),
             #[cfg(test)]
             parks: Arc::new(worker::WorkerParks::default()),
