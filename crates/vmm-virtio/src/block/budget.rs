@@ -10,7 +10,7 @@
 //! posts, so the device takes no more than this budget and leaves the
 //! rest in the ring, where a migration carries it as ring state.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 
 use super::{bits, discard};
 
@@ -23,16 +23,36 @@ use super::{bits, discard};
 /// for is under a second.
 pub(super) const INFLIGHT_BYTES: u64 = 64 << 20;
 
+/// Requests one device may have in flight, whatever they cost.
+///
+/// One full ring of the size the transport gives virtio-blk (128), so
+/// a single-queue guest is never held below its own queue depth. With
+/// at most 16 workers that is 8 queued per worker, enough to keep each
+/// one busy. It also bounds a guest that posts one head many times
+/// before the device answers it: each copy holds a slot until it is
+/// done, and the guest gets the copies it asked for.
+pub(super) const MAX_REQUESTS: usize = 128;
+
+/// The least a request costs. FLUSH and DISCARD name no data bytes,
+/// but each one is still a call to the backing store.
+pub(super) const MIN_COST: u64 = 4096;
+
+/// Most queues a budget can track.
+pub(super) const MAX_QUEUES: u16 = u64::BITS as u16;
+
 /// Taken from a queue's ring and not yet finished.
-#[derive(Default)]
 struct State {
     bytes: u64,
     requests: usize,
     /// Queues that gave a chain back for want of budget, one bit each.
     starved: u64,
+    /// What each starved queue was refused for.
+    refused: [u64; MAX_QUEUES as usize],
     /// Starved queues a completion has freed budget for and that no
     /// worker has kicked yet.
     kick: u64,
+    /// The queue the next kick starts from.
+    next_kick: u16,
     #[cfg(test)]
     peak_bytes: u64,
     #[cfg(test)]
@@ -41,19 +61,43 @@ struct State {
 
 pub(super) struct Budget {
     limit: u64,
+    queues: u16,
     state: Mutex<State>,
 }
 
 impl Budget {
-    pub(super) fn new(limit: u64) -> Arc<Self> {
+    pub(super) fn new(limit: u64, queues: u16) -> Arc<Self> {
         Arc::new(Self {
             limit,
-            state: Mutex::new(State::default()),
+            queues: queues.clamp(1, MAX_QUEUES),
+            state: Mutex::new(State {
+                bytes: 0,
+                requests: 0,
+                starved: 0,
+                refused: [0; MAX_QUEUES as usize],
+                kick: 0,
+                next_kick: 0,
+                #[cfg(test)]
+                peak_bytes: 0,
+                #[cfg(test)]
+                peak_requests: 0,
+            }),
         })
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether a request of `cost` may join what is in flight.
+    ///
+    /// A request larger than the whole budget runs when nothing else is
+    /// in flight. Firmware reads its boot file in one such request, and
+    /// it would never run otherwise.
+    fn fits(&self, s: &State, cost: u64) -> bool {
+        s.requests == 0
+            || (s.requests < MAX_REQUESTS
+                && s.bytes.saturating_add(cost) <= self.limit)
     }
 
     /// Charge `cost` for a request on `queue`, or mark the queue
@@ -63,18 +107,16 @@ impl Budget {
     /// completion cannot slip between them and leave the queue waiting
     /// for a kick that never comes. A refusal needs work in flight, so
     /// a release always follows a mark.
-    ///
-    /// A request larger than the whole budget runs when nothing else is
-    /// in flight. Firmware reads its boot file in one such request, and
-    /// it would never run otherwise.
     pub(super) fn charge(
         self: &Arc<Self>,
         queue: u16,
         cost: u64,
     ) -> Option<Charge> {
+        let cost = cost.max(MIN_COST);
         let mut s = self.state();
-        if s.requests != 0 && s.bytes.saturating_add(cost) > self.limit {
+        if !self.fits(&s, cost) {
             s.starved |= queue_bit(queue);
+            s.refused[usize::from(queue)] = cost;
             return None;
         }
         s.bytes = s.bytes.saturating_add(cost);
@@ -87,27 +129,64 @@ impl Budget {
         Some(Charge {
             budget: Some(Arc::clone(self)),
             cost,
+            alone: cost > self.limit,
         })
     }
 
-    /// Give back `cost`. Starved queues become due for a kick once
-    /// half the budget is free, or once nothing is in flight.
+    /// Give back `cost`. A starved queue becomes due for a kick once
+    /// the head it was refused for fits, and half the budget is free
+    /// or nothing is in flight.
     ///
     /// Waiting for half keeps a saturated device from draining its
-    /// rings once per completion. Nothing in flight always releases
+    /// rings once per completion, and waiting for the refused head to
+    /// fit keeps a head larger than the budget from being drained and
+    /// refused on every completion. Nothing in flight always releases
     /// them: no later completion would.
     fn release(&self, cost: u64) {
         let mut s = self.state();
         s.bytes = s.bytes.saturating_sub(cost);
         s.requests = s.requests.saturating_sub(1);
-        if s.requests == 0 || s.bytes <= self.limit / 2 {
-            s.kick |= std::mem::take(&mut s.starved);
+        let low = s.requests == 0
+            || (s.bytes <= self.limit / 2 && s.requests <= MAX_REQUESTS / 2);
+        if !low {
+            return;
         }
+        let mut due = 0u64;
+        for queue in queues(s.starved) {
+            if self.fits(&s, s.refused[usize::from(queue)]) {
+                due |= queue_bit(queue);
+            }
+        }
+        s.starved &= !due;
+        s.kick |= due;
     }
 
-    /// Queues due for a kick, one bit each. Each is returned once.
-    pub(super) fn take_kicks(&self) -> u64 {
-        std::mem::take(&mut self.state().kick)
+    /// Queues due for a kick, each returned once.
+    ///
+    /// The order starts one queue further on each time, so the queue
+    /// kicked first, which gets the freed budget first, takes turns.
+    pub(super) fn take_kicks(&self) -> Vec<u16> {
+        let mut s = self.state();
+        let mask = std::mem::take(&mut s.kick);
+        if mask == 0 {
+            return Vec::new();
+        }
+        let start = s.next_kick;
+        s.next_kick = (start + 1) % self.queues;
+        (0..self.queues)
+            .map(|i| (start + i) % self.queues)
+            .filter(|&q| mask & queue_bit(q) != 0)
+            .collect()
+    }
+
+    /// Whether nothing is in flight. Never blocks: a contended lock
+    /// reads as busy, and the caller polls again.
+    pub(super) fn is_idle(&self) -> bool {
+        match self.state.try_lock() {
+            Ok(s) => s.requests == 0,
+            Err(TryLockError::Poisoned(p)) => p.into_inner().requests == 0,
+            Err(TryLockError::WouldBlock) => false,
+        }
     }
 
     /// (bytes, requests) in flight now.
@@ -131,7 +210,7 @@ fn queue_bit(queue: u16) -> u64 {
 }
 
 /// Bits of `mask`, as queue indexes.
-pub(super) fn queues(mut mask: u64) -> impl Iterator<Item = u16> {
+fn queues(mut mask: u64) -> impl Iterator<Item = u16> {
     std::iter::from_fn(move || {
         if mask == 0 {
             return None;
@@ -142,9 +221,6 @@ pub(super) fn queues(mut mask: u64) -> impl Iterator<Item = u16> {
     })
 }
 
-/// Most queues a budget can track.
-pub(super) const MAX_QUEUES: u16 = u64::BITS as u16;
-
 /// Budget one request holds until it is dropped.
 ///
 /// Every path a request can take ends in a drop: done, refused, from a
@@ -154,6 +230,15 @@ pub(super) const MAX_QUEUES: u16 = u64::BITS as u16;
 pub(super) struct Charge {
     budget: Option<Arc<Budget>>,
     cost: u64,
+    alone: bool,
+}
+
+impl Charge {
+    /// Whether this request costs more than the whole budget, so the
+    /// budget does not bound how long it runs.
+    pub(super) fn is_alone(&self) -> bool {
+        self.alone
+    }
 }
 
 impl Drop for Charge {
@@ -170,7 +255,8 @@ impl Drop for Charge {
 /// is 16 bytes per range and each range can zero up to its maximum,
 /// so the cost is that maximum per range the payload has room for. The
 /// worker refuses a payload with more ranges than that. DISCARD and
-/// FLUSH move no data.
+/// FLUSH move no data. [`Budget::charge`] raises each cost to at least
+/// [`MIN_COST`].
 pub(super) fn cost(rtype: u32, span: usize) -> u64 {
     match rtype {
         bits::VIRTIO_BLK_T_IN | bits::VIRTIO_BLK_T_OUT => span as u64,

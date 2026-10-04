@@ -36,7 +36,14 @@ pub(super) const MAX_REQ_BYTES: usize = MAX_SEGMENTS * SIZE_MAX as usize;
 
 /// Bytes one request may move when the driver did not agree to both
 /// limits. edk2's VirtioBlkDxe negotiates neither and puts a read of up
-/// to 1 GiB in one descriptor.
+/// to 1 GiB in one descriptor (`VerifyReadWriteRequest` refuses more).
+///
+/// Not lower: the firmware FAT driver reads the aligned part of a file
+/// run straight from the disk (`FatAccessCache`), so loading a boot
+/// file or a unified kernel image is one read of its full size. GRUB's
+/// efidisk stops at 640 KiB, but firmware loads GRUB first. The
+/// budget does not bound such a request, so the worker stops it
+/// between chunks in a pause instead.
 pub(super) const MAX_UNLIMITED_REQ_BYTES: usize = 1 << 30;
 
 /// The bounds a request is held to.

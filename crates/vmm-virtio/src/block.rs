@@ -229,7 +229,7 @@ impl VirtioBlock {
             gate: Arc::clone(&gate),
             access: Arc::new(GuestAccess::new(num_queues as usize)),
             backend: Arc::new(BackendBarrier::new()),
-            budget: Budget::new(inflight_bytes),
+            budget: Budget::new(inflight_bytes, num_queues),
             kick: Arc::new(KickSlot::new()),
             #[cfg(test)]
             parks: Arc::new(worker::WorkerParks::default()),
@@ -526,7 +526,7 @@ impl VirtioBlock {
             head,
             completion: Arc::clone(completion),
             tag,
-            _charge: charge,
+            charge,
         });
     }
 
@@ -645,11 +645,14 @@ impl VirtioDevice for VirtioBlock {
             None => return false,
         };
 
-        // A pause waits for every request the device took. Chains left
-        // in the ring are carried by a migration and drained on resume.
-        if self.gate.is_paused() {
+        // A pause waits for every request the device took, so the take
+        // and the hand-off to a worker happen under one admission. A
+        // pause that starts in between waits for the hand-off. Chains
+        // left in the ring are carried by a migration and drained on
+        // resume.
+        let Some(_admission) = self.gate.admit() else {
             return false;
-        }
+        };
 
         let Some(session) = self.ctx.access.enter_current(queue_idx) else {
             // A retirement owns the ring. Its queue state goes with it.
@@ -716,6 +719,8 @@ impl VirtioDevice for VirtioBlock {
         let raise = completion.publish_batch(&finished);
         drop(session);
 
+        #[cfg(test)]
+        worker::run_park(&self.ctx.parks.before_dispatch);
         for (head, header, chain, charge) in requests {
             self.dispatch(tag, &completion, head, &header, chain, charge);
         }
@@ -792,8 +797,11 @@ impl Lifecycle for VirtioBlock {
         self.gate.pause();
     }
 
+    /// Quiet only once every request taken from a ring is answered. A
+    /// worker can park with work still queued to it, and a migration
+    /// that exported then would lose that work.
     fn is_quiesced(&self) -> bool {
-        self.gate.is_quiesced()
+        self.gate.is_quiesced() && self.ctx.budget.is_idle()
     }
 
     fn resume(&self) {

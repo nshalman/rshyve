@@ -71,7 +71,7 @@ fn request(
         head: 0,
         completion: detached_completion(&queue, physmap),
         tag: current_tag(&ctx.access, 0),
-        _charge: Charge::default(),
+        charge: Charge::default(),
     }
 }
 
@@ -279,7 +279,7 @@ fn a_request_past_the_buffer_moves_every_byte() {
         head: 7,
         completion: detached_completion(&queue, &physmap),
         tag: current_tag(&ctx.access, 0),
-        _charge: Charge::default(),
+        charge: Charge::default(),
     };
     let mut bounce = Bounce::new();
     assert_eq!(
@@ -310,7 +310,7 @@ fn a_request_past_the_buffer_moves_every_byte() {
         head: 8,
         completion: detached_completion(&queue, &physmap),
         tag: current_tag(&ctx.access, 0),
-        _charge: Charge::default(),
+        charge: Charge::default(),
     };
     assert_eq!(
         run_request(&out, &limits, &ctx, &mut bounce, &req),
@@ -440,7 +440,7 @@ fn a_worker_reads_a_segment_past_size_max() {
         head: 3,
         completion: detached_completion(&queue, &physmap),
         tag: current_tag(&ctx.access, 0),
-        _charge: Charge::default(),
+        charge: Charge::default(),
     };
     let mut bounce = Bounce::new();
     assert_eq!(
@@ -581,7 +581,7 @@ fn a_worker_writes_a_segment_past_size_max() {
         head: 4,
         completion: detached_completion(&queue, &physmap),
         tag: current_tag(&ctx.access, 0),
-        _charge: Charge::default(),
+        charge: Charge::default(),
     };
     let mut bounce = Bounce::new();
     assert_eq!(

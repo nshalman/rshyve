@@ -465,7 +465,7 @@ fn a_worker_drops_requests_from_a_closed_session() {
             head,
             completion: Arc::clone(&completion),
             tag,
-            _charge: Charge::default(),
+            charge: Charge::default(),
         })
         .expect("queue the request");
     }
@@ -556,7 +556,7 @@ fn a_worker_batch_does_not_span_a_reset() {
             head,
             completion: Arc::clone(completion),
             tag,
-            _charge: Charge::default(),
+            charge: Charge::default(),
         };
 
     // The queue the guest left behind, then the one it built next.
@@ -669,7 +669,7 @@ fn an_interrupt_is_raised_outside_the_guest_access_section() {
         head: 0,
         completion,
         tag,
-        _charge: Charge::default(),
+        charge: Charge::default(),
     })
     .expect("queue the request");
     drop(tx);
