@@ -12,20 +12,24 @@ One driver serves both transports: a Unix socket inside a bhyve zone,
 where `/dev/poll` is unavailable and the GZ agent bridges to the peer,
 and a TCP socket elsewhere.
 
-The protocol identifier is `vmm-migrate-ron/4`, and a source offers
-only that. A destination also takes `vmm-migrate-ron/3` and
-`vmm-migrate-ron/2`, whose payloads are strict subsets. v4 names the
-store under each NVMe namespace (a host file, or a MantaBlock volume by
-UUID), so a destination on another store refuses the payload, and an
-unknown store does not decode; a v3 or v2 payload names none, which
-means a host file. v3 adds the NVMe completions held for a full guest
-completion queue, which a v2 source dropped, and the NVMe namespace
-shape, of which a v2 source had one (512-byte blocks, volatile write
-cache). A v2 payload restores with none held, onto that shape only. Anything older is refused, because a peer that reads a field
+The protocol identifier is `vmm-migrate-ron/4`. A source offers v4 and
+v3, and a destination also takes `vmm-migrate-ron/3` and
+`vmm-migrate-ron/2`, whose payloads are strict subsets. A v3 destination
+skips the v4 store field and assumes a host file, so a source that lands
+on v3 refuses any disk on another store before it sends the device
+state. A file-backed VM can therefore still move to a host that predates
+v4. v4 names the store under each NVMe namespace (a host file, or a
+MantaBlock volume by UUID), so a destination on another store refuses
+the payload, and an unknown store does not decode; a v3 or v2 payload
+names none, which means a host file. v3 adds the NVMe completions held
+for a full guest completion queue, which a v2 source dropped, and the
+NVMe namespace shape, of which a v2 source had one (512-byte blocks,
+volatile write cache). A v2 payload restores with none held, onto that
+shape only. Anything older is refused, because a peer that reads a field
 as something else resumes a guest on state that is not its own. v1 put
 device identity on the wire; in v0 every virtio queue group was tagged
-slot 0 and the destination took the first group whose length matched
-its own queue count.
+slot 0 and the destination took the first group whose length matched its
+own queue count.
 
 ```
 Source                          Destination

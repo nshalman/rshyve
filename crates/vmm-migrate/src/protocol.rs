@@ -9,6 +9,10 @@
 //! one, with defaults that match what the old source did. Anything older
 //! is refused: a peer that reads a field as something else resumes a
 //! guest on state that is not its own.
+//!
+//! A source offers an older version only while that version's decoder
+//! skips every new field, and [`payload_refusal`] stops any value the
+//! old destination would read as something else.
 
 /// Protocol identifier for the RON migration format.
 ///
@@ -33,6 +37,34 @@ pub const PROTOCOL_RON: &str = "vmm-migrate-ron/4";
 pub const PROTOCOL_RON_V3: &str = "vmm-migrate-ron/3";
 pub const PROTOCOL_RON_V2: &str = "vmm-migrate-ron/2";
 
+/// What a source offers, newest first.
+///
+/// v3 stays on offer so a file-backed VM can still move to a host that
+/// predates v4. A v3 destination skips the store field and assumes a
+/// host file, which is true unless [`payload_refusal`] says otherwise.
+pub const SOURCE_OFFER: [&str; 2] = [PROTOCOL_RON, PROTOCOL_RON_V3];
+
+/// Why `devices` cannot go to a destination that chose `protocol`.
+pub fn payload_refusal(
+    protocol: &str,
+    devices: &[DeviceStatePayload],
+) -> Option<String> {
+    if protocol != PROTOCOL_RON_V3 {
+        return None;
+    }
+    devices.iter().find_map(|d| match &d.state {
+        Some(DeviceMigrateState::Nvme(nvme)) => match &nvme.backend {
+            None | Some(NvmeMigrateBackend::File) => None,
+            Some(store) => Some(format!(
+                "the destination speaks {PROTOCOL_RON_V3}, which cannot \
+                 name {store} under the disk at {}",
+                d.bdf,
+            )),
+        },
+        _ => None,
+    })
+}
+
 /// The version a destination answers an offer with, newest first, or
 /// `None` when it can read none of them.
 pub fn select_protocol(offer: &[String]) -> Option<&'static str> {
@@ -40,6 +72,10 @@ pub fn select_protocol(offer: &[String]) -> Option<&'static str> {
         .into_iter()
         .find(|ours| offer.iter().any(|theirs| theirs == ours))
 }
+
+use vmm_devices::lifecycle::{
+    DeviceMigrateState, DeviceStatePayload, NvmeMigrateBackend,
+};
 
 /// Page size used for dirty tracking (4 KiB).
 pub use vmm_core::common::PAGE_SIZE;
@@ -119,6 +155,54 @@ mod tests {
     fn a_destination_takes_a_v3_source() {
         let v3 = offer(&[PROTOCOL_RON_V2, PROTOCOL_RON_V3]);
         assert_eq!(select_protocol(&v3), Some(PROTOCOL_RON_V3));
+    }
+
+    #[test]
+    fn a_new_source_reaches_an_old_destination() {
+        let ours = offer(&SOURCE_OFFER);
+        assert_eq!(select_protocol(&ours), Some(PROTOCOL_RON));
+        // What a v3 build's destination picks from the same offer.
+        let picked = [PROTOCOL_RON_V3, PROTOCOL_RON_V2]
+            .into_iter()
+            .find(|v| ours.iter().any(|o| o == v));
+        assert_eq!(picked, Some(PROTOCOL_RON_V3));
+    }
+
+    fn nvme_on(backend: Option<NvmeMigrateBackend>) -> DeviceStatePayload {
+        use vmm_devices::lifecycle::NvmeMigrateState;
+        DeviceStatePayload {
+            bdf: vmm_devices::lifecycle::WireBdf {
+                bus: 0,
+                dev: 4,
+                func: 0,
+            },
+            state: Some(DeviceMigrateState::Nvme(NvmeMigrateState {
+                backend,
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn only_host_files_go_to_a_v3_destination() {
+        let volume = NvmeMigrateBackend::MantaBlock {
+            volume: "6f1c2a8e-0000-4000-8000-000000000001"
+                .parse()
+                .expect("a UUID"),
+        };
+        for files in [None, Some(NvmeMigrateBackend::File)] {
+            let payload = [nvme_on(files)];
+            assert_eq!(payload_refusal(PROTOCOL_RON_V3, &payload), None);
+        }
+        let mut ring = nvme_on(Some(volume));
+        ring.bdf.dev = 5;
+        let at = ring.bdf.to_string();
+        let payload = [nvme_on(Some(NvmeMigrateBackend::File)), ring];
+        let why = payload_refusal(PROTOCOL_RON_V3, &payload)
+            .expect("a volume a v3 destination cannot check");
+        assert!(why.contains("MantaBlock volume 6f1c2a8e"), "{why}");
+        assert!(why.ends_with(&at), "{why}");
+        assert_eq!(payload_refusal(PROTOCOL_RON, &payload), None);
     }
 
     #[test]

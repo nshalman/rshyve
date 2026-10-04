@@ -42,7 +42,7 @@ use crate::limits::{BATCH_SIZE, ZSTD_LEVEL};
 use crate::pages::{
     are_contiguous, build_contiguous_gpas, page_buffer_len, read_pages,
 };
-use crate::protocol::{PageIter, PAGE_SIZE, PROTOCOL_RON};
+use crate::protocol::{payload_refusal, PageIter, PAGE_SIZE, SOURCE_OFFER};
 use crate::state;
 use crate::wire::{set_phase, Chan, Deadlines, Transport};
 use crate::MigrationPhase;
@@ -196,11 +196,11 @@ fn run_inner<S: Transport>(
     set_phase(status, MigrationPhase::Sync);
 
     chan.send(&Message::serialized(&ProtocolOffer {
-        protocols: vec![PROTOCOL_RON.to_string()],
+        protocols: SOURCE_OFFER.iter().map(|v| v.to_string()).collect(),
     })?)?;
 
     let sel: ProtocolSelect = chan.expect_serialized()?;
-    if sel.protocol != PROTOCOL_RON {
+    if !SOURCE_OFFER.contains(&sel.protocol.as_str()) {
         return Err(MigrateError::ProtocolMismatch(crate::wire::peer_text(
             &sel.protocol,
         )));
@@ -279,6 +279,9 @@ fn run_inner<S: Transport>(
     let mut dev_state = state::export_device_state(hdl, config.num_cpus, log)?;
     dev_state.emulated = device_export_fn()
         .map_err(|e| MigrateError::State(format!("device export: {e}")))?;
+    if let Some(why) = payload_refusal(&sel.protocol, &dev_state.emulated) {
+        return Err(MigrateError::State(why));
+    }
     dev_state.hyperv = hyperv;
     slog::info!(log, "exporting device state";
         "devices" => dev_state.emulated.len());

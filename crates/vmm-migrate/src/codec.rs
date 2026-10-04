@@ -820,6 +820,31 @@ mod tests {
     }
 
     #[test]
+    fn a_v3_decoder_skips_the_store() {
+        // A source offers v3 on the strength of this: a v3 build's
+        // decoder has no `backend` field and must not fail on one.
+        #[derive(Serialize)]
+        struct V4 {
+            num_io_queues: u16,
+            backend: Option<vmm_devices::lifecycle::NvmeMigrateBackend>,
+        }
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct V3 {
+            num_io_queues: u16,
+        }
+        let v4 = V4 {
+            num_io_queues: 3,
+            backend: Some(vmm_devices::lifecycle::NvmeMigrateBackend::File),
+        };
+        let msg = Message::serialized(&v4).expect("encode");
+        let Message::Serialized(data) = roundtrip(&msg) else {
+            panic!("expected Serialized");
+        };
+        let v3: V3 = Message::deserialize(&data).expect("decode as v3");
+        assert_eq!(v3, V3 { num_io_queues: 3 });
+    }
+
+    #[test]
     fn an_unknown_nvme_store_is_refused() {
         let text = ron::ser::to_string(&with_backend(
             vmm_devices::lifecycle::NvmeMigrateBackend::File,
