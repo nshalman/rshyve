@@ -99,7 +99,7 @@ vmm_mantablock = { path = "crates/vmm-mantablock" }
 # External dependencies
 # The engine pins the same commit. Move both together: a new commit can
 # change the ring layout.
-manta-block-ring = { git = "https://github.com/TritonDataCenter/manta-block-ring", rev = "9b2e6a026de363e35b82fb77863b7adbd98fcecf" }
+manta-block-ring = { git = "https://github.com/TritonDataCenter/manta-block-ring", rev = "c0e4fc309156ee542b7052e9ca5ed7d586b77a32" }
 acpi_tables = "0.2.1"
 anyhow = "1.0"
 base64 = "0.21"
