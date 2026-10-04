@@ -61,6 +61,7 @@ pub mod intr;
 mod legacy;
 mod migrate;
 mod modern;
+pub mod notify;
 
 use intr::IntrGate;
 use modern::CapOffsets;

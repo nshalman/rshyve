@@ -252,30 +252,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             }
             0x2000 => {
                 // Notification register: guest writes queue index
-                let queue_idx = val as u16;
-                let Some(mut vs) = self.lock_for_write() else {
+                let Some(vs) = self.lock_for_write() else {
                     return;
                 };
-                if !Self::can_notify(&vs, queue_idx) {
-                    return;
-                }
-                let did_work = self.device.notify_queue(
-                    queue_idx,
-                    &mut vs.queues,
-                    &self.physmap,
-                );
-                if Self::queue_needs_reset(&vs, queue_idx) {
-                    // The queue logged its own reason when it refused.
-                    self.refuse_queue(vs, queue_idx as usize, None);
-                    return;
-                }
-                if did_work {
-                    // Sampled under the guard, so a reset that ends
-                    // this session is always the later of the two.
-                    let session = self.intr.session();
-                    drop(vs);
-                    self.raise_queue_interrupt_in(session, queue_idx);
-                }
+                self.notify(vs, val as u16);
             }
             0x3000 => {} // ISR is read-only
             _ => {}
