@@ -177,6 +177,54 @@ fn unmigratable_devices(
     ))
 }
 
+/// Every device that says no migration can carry it, named by its
+/// registry id. Read from the live registry, so a disk hot-added since
+/// boot counts as well.
+pub(crate) fn device_blockers(
+    registry: &vmm_machine::DeviceRegistry,
+) -> Option<String> {
+    let blocking: Vec<String> = registry
+        .list()
+        .into_iter()
+        .filter_map(|slot| {
+            let why = slot.lifecycle?.migration_blocker()?;
+            Some(format!("{}: {why}", slot.id))
+        })
+        .collect();
+    if blocking.is_empty() {
+        return None;
+    }
+    Some(format!("this VM cannot migrate: {}", blocking.join("; ")))
+}
+
+/// Why this VM cannot be a migration source, or `None`.
+fn source_refusal(
+    hotplug: &HotplugEngines,
+    registry: &vmm_machine::DeviceRegistry,
+    identities: &[vmm_migrate::codec::DeviceIdentity],
+) -> Option<String> {
+    let (cpus, bytes) = growth(hotplug);
+    device_blockers(registry)
+        .or_else(|| grown_since_boot(cpus, bytes))
+        .or_else(|| device_set_changed(&vmm_machine::hotplug_specs(registry)))
+        .or_else(|| unmigratable_devices(identities))
+}
+
+/// Why this VM cannot take an import, or `None`.
+///
+/// Only a paused VM may take one: the import writes every vCPU's
+/// registers and every device's rings, and a running guest would execute
+/// against half of them.
+fn dest_refusal(
+    state: VmRunState,
+    registry: &vmm_machine::DeviceRegistry,
+) -> Option<String> {
+    if state != VmRunState::Paused {
+        return Some("VM must be paused to receive migration".to_string());
+    }
+    device_blockers(registry)
+}
+
 /// Where a migration source connects to.
 enum MigrateTarget {
     /// A Unix socket the GZ agent bridges to the peer. The only kind
@@ -217,12 +265,11 @@ pub(super) fn migrate_source(
     // Reading the topology before the state change would miss both.
     let refused = {
         let _topology = ctrl.lock_topology();
-        let (cpus, bytes) = growth(&ctrl.hotplug);
-        grown_since_boot(cpus, bytes)
-            .or_else(|| {
-                device_set_changed(&vmm_machine::hotplug_specs(&ctrl.registry))
-            })
-            .or_else(|| unmigratable_devices(&ctrl.migrate_identities()))
+        source_refusal(
+            &ctrl.hotplug,
+            &ctrl.registry,
+            &ctrl.migrate_identities(),
+        )
     };
     if let Some(reason) = refused {
         ctrl.state
@@ -386,15 +433,16 @@ pub(super) fn migrate_dest(
         return Response::err(&format!("invalid listen_addr: {e}"));
     }
 
-    // Only a paused VM may take an import: the import writes every
-    // vCPU's registers and every device's rings, and a running guest
-    // would execute against half of them.
-    let prev_state = ctrl.state();
-    if prev_state != VmRunState::Paused {
-        return Response::err("VM must be paused to receive migration");
-    }
-    ctrl.state
-        .store(VmRunState::Migrating as u8, Ordering::Release);
+    let prev_state = {
+        let _topology = ctrl.lock_topology();
+        let state = ctrl.state();
+        if let Some(why) = dest_refusal(state, &ctrl.registry) {
+            return Response::err(&why);
+        }
+        ctrl.state
+            .store(VmRunState::Migrating as u8, Ordering::Release);
+        state
+    };
 
     let status = Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
     if let Ok(mut ms) = ctrl.migrate_status.lock() {
@@ -751,6 +799,119 @@ mod tests {
 
         assert!(device_set_changed(&vmm_machine::hotplug_specs(&registry))
             .is_some());
+    }
+
+    /// An NVMe disk as the migration path sees it: a ring disk says it
+    /// cannot migrate, a file disk says nothing.
+    struct Disk(Option<&'static str>);
+
+    impl vmm_devices::Lifecycle for Disk {
+        fn type_name(&self) -> &'static str {
+            "nvme"
+        }
+
+        fn migration_blocker(&self) -> Option<String> {
+            self.0.map(str::to_string)
+        }
+    }
+
+    const RING: &str = "nvme on MantaBlock volume 6f1c2a8e-0000-4000-8000-000000000001 has no migration handover yet";
+
+    fn disk_at(
+        registry: &vmm_machine::DeviceRegistry,
+        slot: &str,
+        blocker: Option<&'static str>,
+        hot_added: bool,
+    ) {
+        let mut disk = vmm_machine::RegisteredDevice::new(
+            format!("nvme@{slot}"),
+            vmm_machine::parse_bdf(slot),
+            None,
+            Some(Arc::new(Disk(blocker)) as Arc<dyn vmm_devices::Lifecycle>),
+            Some(format!("{slot},nvme,mantablock=/s,volume=x")),
+        );
+        disk.hotpluggable = hot_added;
+        registry.insert(disk).expect("insert");
+    }
+
+    fn identities(
+        registry: &vmm_machine::DeviceRegistry,
+    ) -> Vec<vmm_migrate::codec::DeviceIdentity> {
+        registry
+            .list()
+            .into_iter()
+            .filter_map(|slot| Some(ident(slot.bdf?.dev(), "nvme")))
+            .collect()
+    }
+
+    fn assert_names_the_ring_disk(reason: Option<String>, slot: &str) {
+        let reason = reason.expect("a ring disk must block migration");
+        assert!(reason.contains(&format!("nvme@{slot}")), "{reason}");
+        assert!(reason.contains("MantaBlock volume 6f1c2a8e"), "{reason}");
+    }
+
+    #[test]
+    fn a_ring_disk_present_at_boot_blocks_migrate_dest() {
+        let registry = vmm_machine::DeviceRegistry::new();
+        disk_at(&registry, "4", None, false);
+        disk_at(&registry, "5", Some(RING), false);
+
+        assert_names_the_ring_disk(
+            dest_refusal(VmRunState::Paused, &registry),
+            "5",
+        );
+        assert_names_the_ring_disk(device_blockers(&registry), "5");
+    }
+
+    #[test]
+    fn a_hot_added_ring_disk_blocks_migrate_dest() {
+        let registry = vmm_machine::DeviceRegistry::new();
+        disk_at(&registry, "4", None, false);
+        disk_at(&registry, "6", Some(RING), true);
+
+        assert_names_the_ring_disk(
+            dest_refusal(VmRunState::Paused, &registry),
+            "6",
+        );
+    }
+
+    #[test]
+    fn a_ring_disk_blocks_migrate_source() {
+        for hot_added in [false, true] {
+            let registry = vmm_machine::DeviceRegistry::new();
+            disk_at(&registry, "5", Some(RING), hot_added);
+            let reason = source_refusal(
+                &HotplugEngines::default(),
+                &registry,
+                &identities(&registry),
+            );
+            assert_names_the_ring_disk(reason, "5");
+        }
+    }
+
+    #[test]
+    fn a_file_backed_nvme_vm_still_migrates() {
+        let registry = vmm_machine::DeviceRegistry::new();
+        disk_at(&registry, "4", None, false);
+
+        assert_eq!(device_blockers(&registry), None);
+        assert_eq!(dest_refusal(VmRunState::Paused, &registry), None);
+        assert_eq!(
+            source_refusal(
+                &HotplugEngines::default(),
+                &registry,
+                &identities(&registry),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn migrate_dest_still_needs_a_paused_vm() {
+        let registry = vmm_machine::DeviceRegistry::new();
+        let reason =
+            dest_refusal(VmRunState::Running, &registry).expect("a running VM");
+        assert!(reason.contains("paused"), "{reason}");
     }
 
     #[test]

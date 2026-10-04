@@ -266,6 +266,13 @@ fn parse_and_create_pci_device(
                 Ok(vmm_machine::created(nvme))
             }
             devspec::NvmeSpec::MantaBlock(opts) => {
+                // driver_specs refuses this first, with a clearer error.
+                anyhow::ensure!(
+                    !is_migrate_dest,
+                    "nvme on MantaBlock volume {} is not supported on a \
+                     migration destination",
+                    opts.volume
+                );
                 let nvme = mantablock_nvme(&opts, bdf.dev(), ctx)?;
                 chipset.try_attach_device(bdf, nvme.clone())?;
                 info!(log, "nvme attached";
@@ -643,7 +650,7 @@ mod tests {
 
     #[test]
     fn a_mantablock_nvme_cannot_be_a_migration_destination() {
-        // bootindex= first once hid the ring option from the check.
+        // bootindex= in either position must not hide the ring option.
         for ring in [
             "5,nvme,mantablock=/s,volume=x,bootindex=1",
             "5,nvme,bootindex=1,mantablock=/s,volume=x",

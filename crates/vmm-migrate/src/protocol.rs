@@ -12,6 +12,10 @@
 
 /// Protocol identifier for the RON migration format.
 ///
+/// v4 names the store under each NVMe namespace, so a destination on
+/// another store or another MantaBlock volume refuses the payload. A v3
+/// or v2 payload names none, which means a host file.
+///
 /// v3 carries held NVMe completions and the NVMe namespace shape. A v2
 /// payload restores with none held and the one shape v2 had.
 ///
@@ -23,15 +27,16 @@
 /// was tagged slot 0 and the destination took the first group whose
 /// length matched its queue count, so two devices of one queue count
 /// restored each other's rings.
-pub const PROTOCOL_RON: &str = "vmm-migrate-ron/3";
+pub const PROTOCOL_RON: &str = "vmm-migrate-ron/4";
 
-/// The previous version, which a destination still takes.
+/// Older versions a destination still takes.
+pub const PROTOCOL_RON_V3: &str = "vmm-migrate-ron/3";
 pub const PROTOCOL_RON_V2: &str = "vmm-migrate-ron/2";
 
 /// The version a destination answers an offer with, newest first, or
 /// `None` when it can read none of them.
 pub fn select_protocol(offer: &[String]) -> Option<&'static str> {
-    [PROTOCOL_RON, PROTOCOL_RON_V2]
+    [PROTOCOL_RON, PROTOCOL_RON_V3, PROTOCOL_RON_V2]
         .into_iter()
         .find(|ours| offer.iter().any(|theirs| theirs == ours))
 }
@@ -100,7 +105,7 @@ mod tests {
 
     #[test]
     fn a_destination_prefers_the_current_version() {
-        let both = offer(&[PROTOCOL_RON_V2, PROTOCOL_RON]);
+        let both = offer(&[PROTOCOL_RON_V2, PROTOCOL_RON_V3, PROTOCOL_RON]);
         assert_eq!(select_protocol(&both), Some(PROTOCOL_RON));
     }
 
@@ -108,6 +113,12 @@ mod tests {
     fn a_destination_takes_a_v2_source() {
         let v2 = offer(&[PROTOCOL_RON_V2]);
         assert_eq!(select_protocol(&v2), Some(PROTOCOL_RON_V2));
+    }
+
+    #[test]
+    fn a_destination_takes_a_v3_source() {
+        let v3 = offer(&[PROTOCOL_RON_V2, PROTOCOL_RON_V3]);
+        assert_eq!(select_protocol(&v3), Some(PROTOCOL_RON_V3));
     }
 
     #[test]

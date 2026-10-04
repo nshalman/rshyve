@@ -152,7 +152,8 @@ path (`nvme,/disk,volume=...`) is an error too, so a misplaced option
 cannot boot the guest on the file. If the engine cannot be reached or
 refuses the volume, rshyve does not start.
 
-A VM with such a disk cannot be a migration destination yet.
+A VM with such a disk cannot migrate yet, as a source or as a
+destination.
 
 ## LPC Device Syntax
 

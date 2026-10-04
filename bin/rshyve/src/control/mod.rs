@@ -76,6 +76,7 @@ use vmm_machine::{DeviceRegistry, HotplugEngines, SUSPEND_SOURCE_VMM};
 use crate::host_state::HostLocalState;
 
 pub use listener::{spawn_control_thread, ControlListener};
+pub(crate) use migrate::device_blockers;
 
 // ── Error type ──────────────────────────────────────────────────────
 

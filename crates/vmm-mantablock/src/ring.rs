@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use vmm_devices::lifecycle::NvmeMigrateBackend;
 use vmm_devices::{FlushError, FlushIntent};
 use vmm_storage::nvme::backend::{AsyncBackend, BlockRequest, BlockStatus};
 
@@ -89,6 +90,7 @@ pub struct Ring<J: Job> {
     capacity: u64,
     depth: u16,
     durable: bool,
+    volume: uuid::Uuid,
     io_limit: Duration,
     /// One flush of the ring's own at a time.
     flushing: Mutex<()>,
@@ -172,6 +174,7 @@ impl<J: Job> Ring<J> {
             capacity: volume_blocks * 4096,
             depth: slots.tags,
             durable,
+            volume: cfg.volume,
             io_limit: cfg.io_limit,
             flushing: Mutex::new(()),
         })
@@ -197,6 +200,20 @@ impl<J: Job> Ring<J> {
     /// Bytes the volume holds.
     pub fn capacity(&self) -> u64 {
         self.capacity
+    }
+
+    /// The volume, as a migration payload names it.
+    pub fn identity(&self) -> NvmeMigrateBackend {
+        NvmeMigrateBackend::MantaBlock {
+            volume: self.volume.to_string(),
+        }
+    }
+
+    /// Always false. The source holds the volume's attachment and
+    /// nothing hands it over yet, so a destination that attached as well
+    /// would make two owners.
+    pub fn migratable(&self) -> bool {
+        false
     }
 
     /// Requests one queue may have in flight: one per buffer slot.
@@ -301,6 +318,14 @@ impl AsyncBackend for Ring<BlockRequest> {
 
     fn durable_writes(&self) -> bool {
         self.durable
+    }
+
+    fn identity(&self) -> NvmeMigrateBackend {
+        Ring::identity(self)
+    }
+
+    fn migratable(&self) -> bool {
+        Ring::migratable(self)
     }
 
     fn submit(&self, req: BlockRequest) {

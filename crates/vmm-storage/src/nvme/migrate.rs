@@ -8,11 +8,12 @@ use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 
 use vmm_devices::lifecycle::{
-    DeviceMigrateState, DeviceStateError, NvmeMigrateCq, NvmeMigrateCqe,
-    NvmeMigrateNamespace, NvmeMigrateSq, NvmeMigrateState,
+    DeviceMigrateState, DeviceStateError, NvmeMigrateBackend, NvmeMigrateCq,
+    NvmeMigrateCqe, NvmeMigrateNamespace, NvmeMigrateSq, NvmeMigrateState,
 };
 use vmm_devices::pci::device::replay_migrate_pci_state;
 use vmm_devices::pci::msix::MsixImportError;
+use vmm_devices::Lifecycle;
 
 use super::bits::*;
 use super::cq::{Cqe, Held};
@@ -25,6 +26,11 @@ impl NvmeController {
     pub(super) fn export_state(
         &self,
     ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {
+        // Before the enabled check: a disabled controller exports
+        // nothing, and the source would still hold the attachment.
+        if let Some(why) = self.migration_blocker() {
+            return Err(DeviceStateError::Export(why));
+        }
         let st = self.lock();
         let (mut st, drained) = self.drain_all(st, self.fences.reset);
         let state = if drained {
@@ -102,6 +108,7 @@ impl NvmeController {
             pci: self.pci_state.lock().expect("pci lock").migrate_state(),
             msix: self.msix.export_state(),
             namespace: Some(self.namespace()),
+            backend: Some(self.backend.identity()),
         }))
     }
 
@@ -123,6 +130,16 @@ impl NvmeController {
         self.msix
             .check_import_state(&mig.msix)
             .map_err(msix_error)?;
+        if let Some(why) = self.migration_blocker() {
+            return Err(DeviceStateError::Invalid(why));
+        }
+        let source = mig.backend.clone().unwrap_or(NvmeMigrateBackend::File);
+        let local = self.backend.identity();
+        if source != local {
+            return Err(DeviceStateError::invalid(format!(
+                "the source disk is on {source}, this one on {local}",
+            )));
+        }
         let local = self.namespace();
         // A v2 source carried no capacity or write protection, so only
         // its one shape can be checked.

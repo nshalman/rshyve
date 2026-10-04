@@ -4,7 +4,7 @@
 
 //! The namespace shape a device chooses: block size and write cache.
 
-use vmm_devices::lifecycle::NvmeMigrateNamespace;
+use vmm_devices::lifecycle::{NvmeMigrateBackend, NvmeMigrateNamespace};
 
 use super::*;
 
@@ -226,4 +226,68 @@ fn a_restore_onto_another_write_protection_is_refused() {
         .ctrl
         .restore_migrate_state(&state)
         .expect_err("writable source, read-only destination");
+}
+
+fn volume(name: &str) -> NvmeMigrateBackend {
+    NvmeMigrateBackend::MantaBlock {
+        volume: name.to_string(),
+    }
+}
+
+fn on_store(store: NvmeMigrateBackend) -> Harness {
+    Harness::manual(&Manual::on_store(store, true))
+}
+
+fn restore(
+    h: &Harness,
+    state: vmm_devices::lifecycle::NvmeMigrateState,
+) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+    h.ctrl
+        .restore_migrate_state(&vmm_devices::DeviceMigrateState::Nvme(state))
+}
+
+/// Two volumes of one shape pass every namespace check, so only the
+/// store tells them apart.
+#[test]
+fn a_restore_onto_another_store_is_refused() {
+    let file = exported(&mut Harness::new());
+    assert_eq!(file.backend, Some(NvmeMigrateBackend::File));
+    restore(&on_store(NvmeMigrateBackend::File), file.clone())
+        .expect("file to file");
+
+    let error = restore(&on_store(volume("a")), file.clone())
+        .expect_err("file to a volume");
+    assert!(error.to_string().contains("MantaBlock volume a"), "{error}");
+
+    let on_a = exported(&mut on_store(volume("a")));
+    assert_eq!(on_a.backend, Some(volume("a")));
+    restore(&on_store(volume("a")), on_a.clone()).expect("the same volume");
+    restore(&on_store(volume("b")), on_a.clone()).expect_err("another volume");
+    restore(&Harness::new(), on_a).expect_err("a volume to a file");
+}
+
+/// A v3 source had only host files.
+#[test]
+fn a_payload_without_a_store_is_a_file() {
+    let mut state = exported(&mut Harness::new());
+    state.backend = None;
+    restore(&Harness::new(), state.clone()).expect("a v3 payload");
+    restore(&on_store(volume("a")), state).expect_err("onto a volume");
+}
+
+/// The source keeps its attachment, so a destination that attached as
+/// well would make two owners of one volume.
+#[test]
+fn a_store_that_cannot_migrate_refuses_export_and_restore() {
+    let store = Manual::on_store(volume("a"), false);
+    let h = Harness::manual(&store);
+    let why = h.ctrl.migration_blocker().expect("a blocker");
+    assert!(why.contains("MantaBlock volume a"), "{why}");
+    // Disabled: the export would otherwise be an empty `None`.
+    let error = h.ctrl.export_migrate_state().expect_err("export");
+    assert!(error.to_string().contains("MantaBlock volume a"), "{error}");
+
+    let on_a = exported(&mut on_store(volume("a")));
+    restore(&h, on_a).expect_err("restore");
+    assert_eq!(Harness::new().ctrl.migration_blocker(), None);
 }

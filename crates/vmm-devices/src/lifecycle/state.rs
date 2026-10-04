@@ -198,6 +198,30 @@ pub struct NvmeMigrateState {
     /// a volatile write cache.
     #[serde(default)]
     pub namespace: Option<NvmeMigrateNamespace>,
+    /// `None` from a v3 or older source, which had only host files.
+    #[serde(default)]
+    pub backend: Option<NvmeMigrateBackend>,
+}
+
+/// What holds a namespace's blocks. Two volumes of one shape pass every
+/// namespace check, so the destination also needs the same store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NvmeMigrateBackend {
+    /// A host file or zvol. Paths differ between hosts, so none is kept.
+    File,
+    /// A MantaBlock volume, by UUID.
+    MantaBlock { volume: String },
+}
+
+impl fmt::Display for NvmeMigrateBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File => f.write_str("a host file"),
+            Self::MantaBlock { volume } => {
+                write!(f, "MantaBlock volume {volume}")
+            }
+        }
+    }
 }
 
 /// A destination must show the same namespace: the guest's partition

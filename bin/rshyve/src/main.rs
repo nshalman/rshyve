@@ -128,6 +128,13 @@ fn run_migration_destination(
 ) -> anyhow::Result<()> {
     info!(log, "migration destination mode"; "listen" => listen_addr);
 
+    // The spec check in pcidev already refused these. This one reads
+    // the devices themselves, so a driver that check does not know
+    // about is refused too.
+    if let Some(why) = control::device_blockers(registry) {
+        anyhow::bail!(why);
+    }
+
     // Activate and reset vCPUs. The reset initializes the VMCS/VMCB
     // host-state fields. The migration import then overwrites the
     // guest-state fields with the source's values.

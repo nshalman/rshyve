@@ -417,6 +417,24 @@ fn requests_beyond_the_free_tags_wait_and_then_go() {
 }
 
 #[test]
+fn a_ring_names_its_volume_and_refuses_migration() {
+    let volume =
+        uuid::Uuid::from_u128(0x1234_5678_9abc_def0_1122_3344_5566_7788);
+    let calls = Arc::new(Calls::default());
+    let (ring, _eng) =
+        setup_full::<TJob>(8, 8, 1, true, Arc::clone(&calls) as _, None, |c| {
+            c.volume = volume
+        });
+    assert_eq!(
+        ring.identity(),
+        vmm_devices::lifecycle::NvmeMigrateBackend::MantaBlock {
+            volume: volume.to_string(),
+        }
+    );
+    assert!(!ring.migratable());
+}
+
+#[test]
 fn flush_is_free_when_writes_are_durable() {
     let (ring, calls, eng) = setup(8, 8, 1, true);
     ring.submit(job(7, 0, BlockOp::Flush, 0, Vec::new()));

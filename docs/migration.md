@@ -12,9 +12,13 @@ One driver serves both transports: a Unix socket inside a bhyve zone,
 where `/dev/poll` is unavailable and the GZ agent bridges to the peer,
 and a TCP socket elsewhere.
 
-The protocol identifier is `vmm-migrate-ron/3`, and a source offers
-only that. A destination also takes `vmm-migrate-ron/2`, whose payload
-is a strict subset: v3 adds the NVMe completions held for a full guest
+The protocol identifier is `vmm-migrate-ron/4`, and a source offers
+only that. A destination also takes `vmm-migrate-ron/3` and
+`vmm-migrate-ron/2`, whose payloads are strict subsets. v4 names the
+store under each NVMe namespace (a host file, or a MantaBlock volume by
+UUID), so a destination on another store refuses the payload, and an
+unknown store does not decode; a v3 or v2 payload names none, which
+means a host file. v3 adds the NVMe completions held for a full guest
 completion queue, which a v2 source dropped, and the NVMe namespace
 shape, of which a v2 source had one (512-byte blocks, volatile write
 cache). A v2 payload restores with none held, onto that shape only. Anything older is refused, because a peer that reads a field
@@ -161,7 +165,8 @@ returned the vector registers instead.
 
 Per NVMe controller: CC, CSTS, AQA, the admin queue bases, every admin
 and I/O queue pair with its size, cursors, phase and vector, the PCI
-command and BAR bases, and the MSI-X table.
+command and BAR bases, the MSI-X table, the namespace shape, and the
+store under the namespace.
 
 For a VM started with `--hyperv`: `HV_X64_MSR_GUEST_OS_ID`,
 `HV_X64_MSR_HYPERCALL`, `HV_X64_MSR_REFERENCE_TSC`, the five crash MSRs,
@@ -232,6 +237,13 @@ guest and refusing would block every VM:
 A VM that hot-added a CPU, memory, or a device since boot is also
 refused: the destination is built from the boot command line and would
 have none of them.
+
+An NVMe disk on a MantaBlock volume is refused on both sides, by
+`migrate-source`, by `migrate-dest`, and by `--migrate-listen` at
+startup, whether the disk was there at boot or hot-added. The source
+holds the volume's attachment and nothing hands it over yet, so a
+destination that attached too would make two owners of one volume. The
+controller refuses its own export and restore as well.
 
 ## Usage
 

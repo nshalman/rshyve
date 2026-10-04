@@ -73,6 +73,7 @@ fn good_payload() -> NvmeMigrateState {
         pci: Default::default(),
         msix: Default::default(),
         namespace: None,
+        backend: None,
     }
 }
 

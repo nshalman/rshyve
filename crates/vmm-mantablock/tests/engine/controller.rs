@@ -16,8 +16,10 @@ use vmm_core::common::{RWOp, ReadOp, WriteOp};
 use vmm_core::hdl::{CreateOpts, VmmHdl};
 use vmm_core::mem::{MemCtx, PhysMap};
 use vmm_core::mmio::MmioBus;
+use vmm_devices::lifecycle::{DeviceMigrateState, NvmeMigrateState};
 use vmm_devices::pci::device::PciDevice;
 use vmm_devices::pci::BarN;
+use vmm_devices::Lifecycle;
 use vmm_storage::nvme::bits::*;
 use vmm_storage::nvme::{NvmeConfig, NvmeController};
 
@@ -235,6 +237,21 @@ fn a_durable_volume_is_a_4k_namespace_without_a_write_cache() {
     let mut back = vec![0; 2 * PAGE];
     d.mem.read(DATA, &mut back).unwrap();
     assert_eq!(back, data);
+}
+
+#[test]
+#[ignore = "needs MANTABLOCK_ENGINE and the privilege to make a VM"]
+fn a_ring_disk_refuses_every_migration() {
+    let lab = Lab::start();
+    let mut d = controller(&lab, FILE_VOL, false, None).unwrap();
+    d.enable();
+
+    let why = d.ctrl.migration_blocker().expect("a ring cannot migrate");
+    assert!(why.contains(FILE_VOL), "{why}");
+    let error = d.ctrl.export_migrate_state().unwrap_err();
+    assert!(error.to_string().contains(FILE_VOL), "{error}");
+    let file = DeviceMigrateState::Nvme(NvmeMigrateState::default());
+    d.ctrl.restore_migrate_state(&file).unwrap_err();
 }
 
 #[test]

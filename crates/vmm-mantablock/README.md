@@ -61,7 +61,8 @@ before it maps it, and does nothing about SIGBUS after that.
   NVMe-oF to an engine on another CN. Until then write data is not kept
   past the copy into the ring.
 - **Reattach.** Each attach asks for a new generation.
-- **Migration.** rshyve refuses a ring disk on a migration destination.
+- **Migration.** A VM with a ring disk cannot migrate, as a source or
+  as a destination.
 
 ## The ring crate dependency
 
@@ -87,9 +88,8 @@ The unit tests play the engine in-process over a real shared mapping and
 real pipes, so they can send completions the real engine never would.
 
 `tests/engine.rs` runs the real `mantablock-engine` with a file volume
-and a null volume. The engine is in manta-storage, which is a private
-repository, so CI cannot build it and these tests are ignored by
-default. Run them by hand before a change to this crate or to the ring
+and a null volume. The engine is in manta-storage, which CI does not
+build, so these tests are ignored by default. Run them by hand before a change to this crate or to the ring
 pin merges. Check out the manta-storage commit whose `Cargo.toml` pins
 the same `manta-block-ring` rev as the root `Cargo.toml` here, then:
 

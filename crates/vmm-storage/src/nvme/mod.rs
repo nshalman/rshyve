@@ -545,6 +545,16 @@ impl Lifecycle for NvmeController {
         result
     }
 
+    fn migration_blocker(&self) -> Option<String> {
+        if self.backend.migratable() {
+            return None;
+        }
+        Some(format!(
+            "nvme on {} has no migration handover yet",
+            self.backend.identity()
+        ))
+    }
+
     fn export_migrate_state(
         &self,
     ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {

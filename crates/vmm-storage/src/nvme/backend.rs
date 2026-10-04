@@ -13,6 +13,7 @@ use std::io;
 use std::sync::Arc;
 
 use vmm_core::mem::{GuestIoVec, MemCtx};
+use vmm_devices::lifecycle::NvmeMigrateBackend;
 use vmm_devices::{FlushError, FlushIntent};
 
 use super::bits::*;
@@ -255,6 +256,18 @@ pub trait AsyncBackend: Send + Sync + 'static {
     /// A namespace that reports no volatile write cache needs this.
     fn durable_writes(&self) -> bool {
         false
+    }
+
+    /// The store a migration payload names, so a destination on another
+    /// store refuses it.
+    fn identity(&self) -> NvmeMigrateBackend {
+        NvmeMigrateBackend::File
+    }
+
+    /// False while a migration cannot hand this store to the
+    /// destination.
+    fn migratable(&self) -> bool {
+        true
     }
 
     /// Runs with the controller lock held, on a vCPU thread or a sink

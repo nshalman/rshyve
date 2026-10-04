@@ -75,9 +75,9 @@ mod state;
 
 pub use state::{
     DeviceMigrateState, DeviceStateError, DeviceStatePayload,
-    HypervMigrateState, MigratePciState, NvmeMigrateCq, NvmeMigrateCqe,
-    NvmeMigrateNamespace, NvmeMigrateSq, NvmeMigrateState, VirtioMigrateQueue,
-    VirtioMigrateState, WireBdf,
+    HypervMigrateState, MigratePciState, NvmeMigrateBackend, NvmeMigrateCq,
+    NvmeMigrateCqe, NvmeMigrateNamespace, NvmeMigrateSq, NvmeMigrateState,
+    VirtioMigrateQueue, VirtioMigrateState, WireBdf,
 };
 
 /// General trait for emulated devices in the system.
@@ -164,6 +164,12 @@ pub trait Lifecycle: Send + Sync + 'static {
     /// Return the Migrator for exporting/importing this device's state.
     fn migrate(&'_ self) -> Migrator<'_> {
         Migrator::Empty
+    }
+
+    /// Why no migration can carry this device, or `None`. Every
+    /// migration entry point refuses a VM with a device that gives one.
+    fn migration_blocker(&self) -> Option<String> {
+        None
     }
 
     /// Stop the kernel-side ring workers before the vCPUs pause, so

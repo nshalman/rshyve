@@ -11,6 +11,7 @@ use vmm_core::common::{RWOp, ReadOp, WriteOp, PAGE_SIZE};
 use vmm_core::mem::{MemCtx, PhysMap};
 use vmm_core::mmio::MmioBus;
 use vmm_devices::blkdev::DiskSync;
+use vmm_devices::lifecycle::NvmeMigrateBackend;
 use vmm_devices::pci::device::PciDevice;
 use vmm_devices::pci::msix::MsiSink;
 use vmm_devices::pci::BarN;
@@ -311,6 +312,8 @@ struct Manual {
     /// On the next `submit`, finish what is queued from inside it
     /// first, as a ring backend reaping its completions does.
     reap_on_submit: AtomicBool,
+    store: NvmeMigrateBackend,
+    migratable: bool,
 }
 
 impl Manual {
@@ -323,7 +326,20 @@ impl Manual {
     }
 
     fn with(depth: u16, durable: bool) -> Arc<Self> {
+        Arc::new(Self::bare(depth, durable))
+    }
+
+    /// A backend that names `store` to a migration.
+    fn on_store(store: NvmeMigrateBackend, migratable: bool) -> Arc<Self> {
         Arc::new(Self {
+            store,
+            migratable,
+            ..Self::bare(IO_QDEPTH, false)
+        })
+    }
+
+    fn bare(depth: u16, durable: bool) -> Self {
+        Self {
             sink: OnceLock::new(),
             disk: Mutex::new(
                 (0..BACKING_BLOCKS * 512).map(backing_byte).collect(),
@@ -334,7 +350,9 @@ impl Manual {
             durable,
             inline: AtomicBool::new(false),
             reap_on_submit: AtomicBool::new(false),
-        })
+            store: NvmeMigrateBackend::File,
+            migratable: true,
+        }
     }
 
     fn factory(self: &Arc<Self>) -> BackendFactory {
@@ -407,6 +425,14 @@ impl AsyncBackend for ManualBackend {
 
     fn durable_writes(&self) -> bool {
         self.0.durable
+    }
+
+    fn identity(&self) -> NvmeMigrateBackend {
+        self.0.store.clone()
+    }
+
+    fn migratable(&self) -> bool {
+        self.0.migratable
     }
 
     fn submit(&self, req: BlockRequest) {
