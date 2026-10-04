@@ -57,9 +57,21 @@ for lifecycle management and state export/import during migration.
 ### NVMe
 
 - NVMe 1.0 specification compliant
-- 8 async worker threads with preadv/pwritev
+- I/O goes through an async storage interface (`nvme::backend`): the
+  controller admits a command to a backend, which completes it later
+  from a thread of its own. The default backend is 8 worker threads
+  with preadv/pwritev
 - Zero-copy I/O directly to/from guest memory
-- MSI-X interrupts
+- An admission barrier: pause, reset, flush and export wait for every
+  command in flight, and what the guest queues meanwhile stays in its
+  SQ until resume
+- A completion that finds the guest CQ full is held, never dropped,
+  and crosses a migration
+- MSI-X interrupts, one per completion queue per batch, raised after
+  the controller lock is released
+- `NvmeConfig` picks 512-byte or 4 KiB logical blocks and whether a
+  volatile write cache is reported; no cache needs a backend whose
+  writes are durable. The `nvme` driver uses 512 bytes and a cache
 - MDTS=9 (2 MiB max transfer)
 - Sequential read: ~2.8 GB/s (matches C bhyve)
 
