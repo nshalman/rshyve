@@ -105,6 +105,8 @@ pub enum OutsideFlushError {
     TearingDown,
     /// The caller gave up, so the devices left were not flushed.
     Abandoned,
+    /// A device's flush failed, so the devices after it were not
+    /// flushed.
     Device {
         device: &'static str,
         source: FlushError,

@@ -527,6 +527,14 @@ fn only_a_migrated_source_is_reaped() {
 }
 
 #[test]
+fn the_status_check_does_not_wait_for_a_busy_lock() {
+    let run = RunControl::new(Stopped);
+    assert_eq!(run.try_must_reap(), Some(true));
+    let _changing = run.lock_changing();
+    assert_eq!(run.try_must_reap(), None);
+}
+
+#[test]
 fn a_migration_ends_in_the_state_its_pause_says() {
     // A destination that resumed the guest.
     let run = RunControl::new(Paused);

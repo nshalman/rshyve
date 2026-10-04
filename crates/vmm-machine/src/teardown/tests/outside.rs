@@ -145,7 +145,11 @@ fn teardown_waits_for_an_abandoned_flush_and_the_flush_stops_early() {
     thread::scope(|s| {
         let tearing =
             s.spawn(|| teardown(&scene.registry, &scene.steps, &gave_up));
-        thread::sleep(Duration::from_millis(100));
+        let armed = Instant::now() + Duration::from_secs(10);
+        while !steps_of(&scene.steps).contains(&"arm") {
+            assert!(Instant::now() < armed, "teardown never armed");
+            thread::sleep(Duration::from_millis(5));
+        }
         assert!(!tearing.is_finished(), "teardown ran beside the flush");
         drop(scene.release);
     });

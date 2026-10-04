@@ -4,6 +4,7 @@
 
 //! Retrying a pause release that nobody else will retry.
 
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,38 +35,147 @@ const RELEASE_GIVE_UP: Duration = Duration::from_secs(300);
 /// How often a wait between retries looks for a release made elsewhere.
 const REAP_POLL: Duration = Duration::from_millis(250);
 
+type GiveUp = Box<dyn FnOnce() + Send>;
+
+enum Arm {
+    Armed(GiveUp),
+    Disarmed,
+    Fired,
+}
+
+type Shared = (Mutex<Arm>, Condvar);
+
+/// Runs `give_up` once its clock runs out, from a thread of its own,
+/// unless dropped first.
+///
+/// WHY a thread: a release can hang in its ioctl, and a check made by
+/// the reaper between releases would then never run.
+struct Deadline {
+    shared: Arc<Shared>,
+    at: Option<Instant>,
+}
+
+impl Deadline {
+    fn new(give_up: GiveUp) -> Self {
+        Self {
+            shared: Arc::new((Mutex::new(Arm::Armed(give_up)), Condvar::new())),
+            at: None,
+        }
+    }
+
+    /// Start the clock on the first call; return the time left.
+    fn start(&mut self, after: Duration, log: &Logger) -> Duration {
+        let at = *self.at.get_or_insert_with(|| {
+            let at = Instant::now() + after;
+            let shared = Arc::clone(&self.shared);
+            let spawned = thread::Builder::new()
+                .name("release-deadline".into())
+                .spawn(move || watch(&shared, at));
+            if let Err(e) = spawned {
+                // The reaper still fires it between releases.
+                error!(log, "no timer for the release deadline";
+                    "error" => %e);
+            }
+            at
+        });
+        at.saturating_duration_since(Instant::now())
+    }
+
+    fn fire(&self) {
+        fire(&self.shared);
+    }
+
+    fn fired(&self) -> bool {
+        matches!(*lock(&self.shared), Arm::Fired)
+    }
+}
+
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        let mut arm = lock(&self.shared);
+        if matches!(*arm, Arm::Armed(_)) {
+            *arm = Arm::Disarmed;
+        }
+        self.shared.1.notify_all();
+    }
+}
+
+fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Arm> {
+    shared.0.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn watch(shared: &Shared, at: Instant) {
+    let mut arm = lock(shared);
+    while matches!(*arm, Arm::Armed(_)) {
+        let left = at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            drop(arm);
+            fire(shared);
+            return;
+        }
+        arm = shared
+            .1
+            .wait_timeout(arm, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+}
+
+/// Run `give_up` unless it ran or was disarmed.
+fn fire(shared: &Shared) {
+    let mut arm = lock(shared);
+    if !matches!(*arm, Arm::Armed(_)) {
+        return;
+    }
+    if let Arm::Armed(give_up) = std::mem::replace(&mut *arm, Arm::Fired) {
+        drop(arm);
+        give_up();
+    }
+}
+
 /// Retry `release` while `must_reap`. `stuck` is told when the fast
 /// tries are spent, and again when the retries end. `give_up` runs once
-/// releases have failed for `give_up_after`; in production it does not
-/// return.
+/// `give_up_after` has passed since the first failed release, even when
+/// a release is still hung; in production it does not return.
 pub(super) fn reap<E: std::fmt::Display>(
     cadence: Cadence,
     must_reap: impl Fn() -> bool,
     release: impl Fn() -> Result<(), E>,
     stuck: impl Fn(bool),
-    give_up: impl FnOnce(),
+    give_up: impl FnOnce() + Send + 'static,
     log: &Logger,
 ) {
+    let mut deadline = {
+        let log = log.clone();
+        let secs = cadence.give_up_after.as_secs();
+        Deadline::new(Box::new(move || {
+            error!(log, "a held pause would not release; ending the \
+                process so the node gets the guest's memory back";
+                "failing_secs" => secs);
+            give_up();
+        }))
+    };
     let mut attempt: u64 = 0;
-    let mut failing_since = None;
-    while must_reap() {
+    loop {
+        if deadline.fired() {
+            // The status keeps saying why until the process ends.
+            return;
+        }
+        if !must_reap() {
+            break;
+        }
         attempt += 1;
         match release() {
             Ok(()) => break,
             Err(e) => error!(log, "failed to release a held pause";
                 "attempt" => attempt, "error" => %e),
         }
-        let failing = *failing_since.get_or_insert_with(Instant::now);
-        let left = cadence.give_up_after.saturating_sub(failing.elapsed());
+        let left = deadline.start(cadence.give_up_after, log);
         if left.is_zero() {
             if !must_reap() {
                 break;
             }
-            error!(log, "a held pause would not release; ending the \
-                process so the node gets the guest's memory back";
-                "attempts" => attempt,
-                "failing_secs" => failing.elapsed().as_secs());
-            give_up();
+            deadline.fire();
             return;
         }
         let wait = if attempt < u64::from(cadence.fast_tries) {
@@ -79,7 +189,7 @@ pub(super) fn reap<E: std::fmt::Display>(
             }
             cadence.slow
         };
-        sleep_while(wait.min(left), &must_reap);
+        sleep_while(wait.min(left), &|| !deadline.fired() && must_reap());
     }
     stuck(false);
 }
@@ -97,7 +207,8 @@ fn sleep_while(total: Duration, must_reap: &impl Fn() -> bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     const NOW: Cadence = Cadence {
         fast_tries: 2,
@@ -166,7 +277,7 @@ mod tests {
         // Otherwise a stopped VM sits in `stopping` with nothing saying
         // why.
         let calls = AtomicUsize::new(0);
-        let reports = std::sync::Mutex::new(Vec::new());
+        let reports = Mutex::new(Vec::new());
         reap(
             NOW,
             || true,
@@ -183,9 +294,10 @@ mod tests {
 
     #[test]
     fn a_release_that_fails_for_too_long_ends_the_process() {
-        let reports = std::sync::Mutex::new(Vec::new());
-        let gave_up = std::sync::atomic::AtomicBool::new(false);
+        let reports = Mutex::new(Vec::new());
+        let gave_up = Arc::new(AtomicBool::new(false));
         let calls = AtomicUsize::new(0);
+        let flag = Arc::clone(&gave_up);
         reap(
             Cadence {
                 give_up_after: Duration::from_millis(50),
@@ -198,7 +310,7 @@ mod tests {
                 Err("EBUSY")
             },
             |stuck| reports.lock().expect("reports").push(stuck),
-            || gave_up.store(true, Ordering::Release),
+            move || flag.store(true, Ordering::Release),
             &discard(),
         );
         assert!(gave_up.load(Ordering::Acquire));
@@ -208,8 +320,67 @@ mod tests {
     }
 
     #[test]
+    fn a_hung_release_still_ends_the_process() {
+        let (gave_up_tx, gave_up) = mpsc::channel();
+        let (unblock, blocked) = mpsc::channel::<()>();
+        let blocked = Mutex::new(blocked);
+        let reports = Mutex::new(Vec::new());
+        let calls = AtomicUsize::new(0);
+        thread::scope(|s| {
+            let reaper = s.spawn(|| {
+                reap(
+                    Cadence {
+                        give_up_after: Duration::from_millis(50),
+                        ..NOW
+                    },
+                    || true,
+                    || {
+                        if calls.fetch_add(1, Ordering::AcqRel) > 0 {
+                            let _ = blocked.lock().expect("blocked").recv();
+                        }
+                        Err("EBUSY")
+                    },
+                    |stuck| reports.lock().expect("reports").push(stuck),
+                    move || gave_up_tx.send(()).expect("gave up"),
+                    &discard(),
+                );
+            });
+            gave_up
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the deadline fired under a hung release");
+            assert!(!reaper.is_finished(), "the release returned");
+            drop(unblock);
+        });
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert!(!reports.lock().expect("reports").contains(&false));
+    }
+
+    #[test]
+    fn a_release_that_works_disarms_the_deadline() {
+        let gave_up = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&gave_up);
+        let calls = AtomicUsize::new(0);
+        reap(
+            Cadence {
+                give_up_after: Duration::from_millis(50),
+                ..NOW
+            },
+            || true,
+            || match calls.fetch_add(1, Ordering::AcqRel) {
+                0 => Err("EBUSY"),
+                _ => Ok(()),
+            },
+            |_| {},
+            move || flag.store(true, Ordering::Release),
+            &discard(),
+        );
+        thread::sleep(Duration::from_millis(200));
+        assert!(!gave_up.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn a_release_made_elsewhere_ends_the_wait_at_once() {
-        let held = std::sync::atomic::AtomicBool::new(true);
+        let held = AtomicBool::new(true);
         let started = Instant::now();
         thread::scope(|s| {
             s.spawn(|| {

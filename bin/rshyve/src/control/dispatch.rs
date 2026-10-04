@@ -288,17 +288,17 @@ fn latch_stop(
     }
 }
 
+/// What `status` adds for a stop that cannot give its pause back.
+fn stuck_data(stuck: bool) -> Option<serde_json::Value> {
+    stuck.then(|| serde_json::json!({ "release_stuck": true }))
+}
+
 /// Why `stop` cannot run now, or `None` when it can.
 ///
 /// A source whose guest moved to another host is left paused and
 /// holding the whole guest memory, and no other command reaches that
 /// state. `stop` is what releases it. A stop on `Stopping` retries a
 /// release an earlier one could not make.
-/// What `status` adds for a stop that cannot give its pause back.
-fn stuck_data(stuck: bool) -> Option<serde_json::Value> {
-    stuck.then(|| serde_json::json!({ "release_stuck": true }))
-}
-
 fn stop_refusal(
     state: VmRunState,
     migrated_away: bool,

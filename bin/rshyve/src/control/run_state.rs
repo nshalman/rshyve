@@ -628,7 +628,15 @@ impl RunControl {
     /// stopped it yet, or a stop latched and could not give the pause
     /// back.
     pub(super) fn must_reap(&self) -> bool {
-        let hold = self.lock_changing();
+        self.reap_due(&self.lock_changing())
+    }
+
+    /// [`Self::must_reap`], or `None` while the lock is taken.
+    pub(super) fn try_must_reap(&self) -> Option<bool> {
+        self.try_changing().map(|hold| self.reap_due(&hold))
+    }
+
+    fn reap_due(&self, hold: &Hold) -> bool {
         match self.get() {
             VmRunState::Stopped => true,
             VmRunState::Stopping => hold.held && hold.migration.is_none(),

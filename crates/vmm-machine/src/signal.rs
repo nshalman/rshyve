@@ -348,6 +348,12 @@ pub fn exit_wedged(reason: &'static str, log: &Logger) {
     end_process(reason, terminal_exit, log);
 }
 
+/// End the process with the watchdog's exit code, for a caller that
+/// already logged why.
+pub fn terminate_wedged() {
+    terminal_exit();
+}
+
 /// End the process without the exit path a wedged VMM can block in.
 ///
 /// `exit` runs the atexit handlers and flushes stdio, either of which

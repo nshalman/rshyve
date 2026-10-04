@@ -74,7 +74,7 @@ pub use registry::{
 };
 pub use signal::{
     exit_wedged, install_sigterm_handler, sigterm_flag, sigterm_received,
-    SUSPEND_SOURCE_VMM,
+    terminate_wedged, SUSPEND_SOURCE_VMM,
 };
 pub use teardown::{
     registry_named_devices, run_fleet_event_loop, RunOutcome, VcpuThreads,
