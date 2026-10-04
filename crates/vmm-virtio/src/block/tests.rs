@@ -40,7 +40,12 @@ fn detached_completion(
 
 fn disk(file: File) -> Arc<DiskSync> {
     Arc::new(
-        DiskSync::new(Arc::new(file), false).expect("classify backing file"),
+        DiskSync::new(
+            Arc::new(file),
+            false,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .expect("classify backing file"),
     )
 }
 

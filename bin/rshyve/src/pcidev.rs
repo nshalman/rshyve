@@ -177,6 +177,7 @@ fn parse_and_create_pci_device(
                 num_vcpus,
                 lintr,
                 &virtio_ctx,
+                log,
             )?;
             chipset.try_attach_device(bdf, pci_dev.clone())?;
             info!(log, "virtio-blk attached";

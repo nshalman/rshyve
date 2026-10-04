@@ -176,11 +176,29 @@ impl VirtioBlock {
         self.ctx.kick.install(kick);
     }
 
+    /// Write cache warnings go to a discarding logger. Use
+    /// [`new_with_logger`](Self::new_with_logger) to see them.
     pub fn new(
         file: File,
         opts: &VirtioBlockOpts,
         physmap: Arc<PhysMap>,
         num_queues: u16,
+    ) -> std::io::Result<Self> {
+        Self::new_with_logger(
+            file,
+            opts,
+            physmap,
+            num_queues,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+    }
+
+    pub fn new_with_logger(
+        file: File,
+        opts: &VirtioBlockOpts,
+        physmap: Arc<PhysMap>,
+        num_queues: u16,
+        log: &slog::Logger,
     ) -> std::io::Result<Self> {
         Self::with_budget(
             file,
@@ -189,6 +207,7 @@ impl VirtioBlock {
             num_queues,
             budget::INFLIGHT_BYTES,
             PauseGrace::DEFAULT,
+            log,
         )
     }
 
@@ -199,6 +218,7 @@ impl VirtioBlock {
         num_queues: u16,
         inflight_bytes: u64,
         pause_grace: PauseGrace,
+        log: &slog::Logger,
     ) -> std::io::Result<Self> {
         if num_queues > budget::MAX_QUEUES {
             return Err(std::io::Error::new(
@@ -216,9 +236,9 @@ impl VirtioBlock {
         // size the guest is told to align to, not the unit of either.
         let capacity = metadata.len() / bits::SECTOR_SIZE;
         let read_only = opts.read_only;
-        // Sets the write cache before any I/O, so first guest writes
-        // already hit the fast path.
-        let disk = Arc::new(DiskSync::new(Arc::new(file), read_only)?);
+        // Turns a zvol's write cache on before any I/O, so first guest
+        // writes already hit the fast path.
+        let disk = Arc::new(DiskSync::new(Arc::new(file), read_only, log)?);
 
         // Workers per queue: NUM_WORKERS for single queue, 2 per queue for MQ.
         let limits = DiskLimits {

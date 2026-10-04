@@ -124,7 +124,8 @@ pub struct NvmeController {
 impl NvmeController {
     /// Create a new NVMe controller.
     ///
-    /// Bus registration failures go to a discarding logger. Use
+    /// Bus registration and write cache warnings go to a discarding
+    /// logger. Use
     /// [`new_with_logger`](Self::new_with_logger) to see them.
     pub fn new(
         file: File,
@@ -156,9 +157,9 @@ impl NvmeController {
         bus_mmio: Arc<MmioBus>,
         log: slog::Logger,
     ) -> std::io::Result<Arc<Self>> {
-        // Sets the write cache before any I/O, so first writes already
-        // hit the fast path.
-        let disk = Arc::new(DiskSync::new(Arc::new(file), read_only)?);
+        // Turns a zvol's write cache on before any I/O, so first writes
+        // already hit the fast path.
+        let disk = Arc::new(DiskSync::new(Arc::new(file), read_only, &log)?);
         Ok(Self::build(NvmeParts {
             backend: Arc::clone(&disk) as Arc<dyn IoBackend>,
             disk,

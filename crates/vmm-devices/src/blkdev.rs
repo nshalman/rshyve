@@ -8,7 +8,8 @@
 //! writeback with guest-driven flushes is what makes small writes fast.
 //! Only a zvol's write cache is ever changed: its flush always commits
 //! the ZIL, so neither cache state can make a flush silent. Any other
-//! disk is accepted only if it flushes or has no volatile cache on.
+//! disk is accepted only if it flushes, or if its driver says it has no
+//! cache to flush and no volatile cache is on.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -68,16 +69,22 @@ enum Mode {
 }
 
 impl DiskSync {
-    /// Classify `file` and decide how it flushes.
-    pub fn new(file: Arc<File>, read_only: bool) -> io::Result<Self> {
+    /// Classify `file` and decide how it flushes. `log` takes the
+    /// best-effort zvol write cache changes that fail.
+    pub fn new(
+        file: Arc<File>,
+        read_only: bool,
+        log: &slog::Logger,
+    ) -> io::Result<Self> {
         let st_mode = file.metadata()?.mode();
         #[cfg(target_os = "illumos")]
         {
             let ops = Arc::new(Dkioc(Arc::clone(&file)));
-            Self::build(file, st_mode, read_only, ops)
+            Self::build(file, st_mode, read_only, ops, log)
         }
         #[cfg(not(target_os = "illumos"))]
         {
+            let _ = log;
             check_not_block(st_mode, read_only, None)?;
             let mode = if read_only {
                 Mode::ReadOnly
@@ -94,12 +101,13 @@ impl DiskSync {
         st_mode: u32,
         read_only: bool,
         ops: Arc<dyn DiskOps>,
+        log: &slog::Logger,
     ) -> io::Result<Self> {
         check_not_block(st_mode, read_only, None)?;
         let mode = if read_only {
             Mode::ReadOnly
         } else if st_mode & libc::S_IFMT == libc::S_IFCHR {
-            Mode::Device(Device::open(ops)?)
+            Mode::Device(Device::open(ops, log)?)
         } else {
             Mode::Fsync
         };
@@ -134,9 +142,13 @@ fn check_not_block(
     if read_only || st_mode & libc::S_IFMT != libc::S_IFBLK {
         return Ok(());
     }
-    let raw = match path.and_then(raw_node) {
-        Some(raw) => raw.display().to_string(),
-        None => "the raw (character) node".to_string(),
+    // Raw lofi fails its flush probe too, so do not point at it.
+    let raw = match path {
+        Some(p) if p.starts_with("/dev/lofi") => "a zvol".to_string(),
+        _ => match path.and_then(raw_node) {
+            Some(raw) => raw.display().to_string(),
+            None => "the raw (character) node".to_string(),
+        },
     };
     let msg = format!(
         "a writable block device node cannot report flush errors; use \
@@ -146,8 +158,7 @@ fn check_not_block(
 }
 
 /// The raw node for an illumos block node under /dev: the first `dsk`
-/// becomes `rdsk` and the first `lofi` becomes `rlofi`. The same names
-/// elsewhere are ordinary directories.
+/// becomes `rdsk`. The same name elsewhere is an ordinary directory.
 fn raw_node(path: &Path) -> Option<PathBuf> {
     let mut parts = path.components();
     if parts.next() != Some(Component::RootDir)
@@ -159,7 +170,7 @@ fn raw_node(path: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::from("/dev");
     for c in parts {
         match c {
-            Component::Normal(n) if !found && (n == "dsk" || n == "lofi") => {
+            Component::Normal(n) if !found && n == "dsk" => {
                 found = true;
                 let mut raw = std::ffi::OsString::from("r");
                 raw.push(n);
@@ -175,65 +186,117 @@ fn raw_node(path: &Path) -> Option<PathBuf> {
 #[cfg(any(target_os = "illumos", test))]
 struct Device {
     ops: Arc<dyn DiskOps>,
-    /// False only for a disk with no volatile cache on that cannot
-    /// flush; its flushes are no-ops.
+    /// False only for a disk whose driver says it has no volatile
+    /// cache to flush; its flushes are no-ops.
     can_flush: bool,
-    /// A zvol whose write cache this open turned on.
+    /// A zvol whose write cache was off when this open checked it.
+    /// Two opens can both see it off and both restore it; that is
+    /// harmless because every zvol flush commits the ZIL.
     restore_wce: bool,
+    log: slog::Logger,
 }
 
 #[cfg(any(target_os = "illumos", test))]
 impl Device {
-    fn open(ops: Arc<dyn DiskOps>) -> io::Result<Self> {
-        // Any DKIOCINFO failure falls through to the strict path.
+    fn open(ops: Arc<dyn DiskOps>, log: &slog::Logger) -> io::Result<Self> {
+        let log = log.clone();
         if ops.drive_name().is_ok_and(|n| n == "zvol") {
-            return Ok(Self::open_zvol(ops));
+            return Ok(Self::open_zvol(ops, log));
         }
-        Self::open_disk(ops)
+        Self::open_disk(ops, log)
     }
 
     /// Best effort writeback. Another open of this zvol may restore
     /// write-through under us or leave writeback on after us; either is
     /// safe because a zvol flush always commits the ZIL.
-    fn open_zvol(ops: Arc<dyn DiskOps>) -> Self {
-        let restore_wce =
-            matches!(ops.get_wce(), Ok(false)) && ops.set_wce(true).is_ok();
+    fn open_zvol(ops: Arc<dyn DiskOps>, log: slog::Logger) -> Self {
+        let restore_wce = match ops.get_wce() {
+            Ok(true) => false,
+            Ok(false) => match ops.set_wce(true) {
+                Ok(()) => true,
+                Err(e) => {
+                    slog::warn!(log, "zvol write cache stays off";
+                        "error" => %e);
+                    false
+                }
+            },
+            Err(e) => {
+                slog::warn!(log, "zvol write cache state unknown";
+                    "error" => %e);
+                false
+            }
+        };
         Self {
             ops,
             can_flush: true,
             restore_wce,
+            log,
         }
     }
 
-    fn open_disk(ops: Arc<dyn DiskOps>) -> io::Result<Self> {
+    fn open_disk(ops: Arc<dyn DiskOps>, log: slog::Logger) -> io::Result<Self> {
         let wce = match ops.get_wce() {
             Ok(on) => Some(on),
             Err(e) if unsupported(&e) => None,
-            Err(e) => return Err(refuse("DKIOCGETWCE failed", e)),
+            Err(e) => {
+                return Err(refuse(
+                    "DKIOCGETWCE failed",
+                    e,
+                    "attach it read-only, or use a zvol",
+                ))
+            }
         };
         // sd keeps its own copy of the cache state, read at attach and
         // refreshed only by SETWCE. While that copy says off it answers
         // a flush with success and sends nothing, so refresh it before
         // the probe or the probe may test nothing.
         if wce == Some(true) {
-            ops.set_wce(true)
-                .map_err(|e| refuse("write cache refresh failed", e))?;
+            ops.set_wce(true).map_err(|e| {
+                refuse(
+                    "write cache refresh failed",
+                    e,
+                    "sd answers EINVAL when the cache mode is not \
+                     changeable or sd.conf disables the cache; attach it \
+                     read-only, or turn the write cache off",
+                )
+            })?;
         }
+        // Decided once: a cache turned on out of band later can leave
+        // the driver's flag stale and its flushes silent.
         let can_flush = match ops.flush() {
             Ok(()) => true,
-            Err(e) if unsupported(&e) && wce != Some(true) => false,
-            Err(e) if unsupported(&e) => {
-                return Err(refuse(
-                    "write cache is on but the disk cannot flush it",
-                    e,
-                ))
-            }
-            Err(e) => return Err(refuse("flush failed at open", e)),
+            Err(e) => match e.raw_os_error() {
+                Some(libc::ENOTSUP) if wce != Some(true) => false,
+                Some(libc::ENOTSUP) => {
+                    return Err(refuse(
+                        "write cache is on but the disk cannot flush it",
+                        e,
+                        "attach it read-only, or turn the write cache off",
+                    ))
+                }
+                // Raw lofi: it may wrap a disk device, and specfs drops
+                // that device's flush result.
+                Some(libc::ENOTTY) => {
+                    return Err(refuse(
+                        "the device cannot report a flush",
+                        e,
+                        "attach it read-only, or use a zvol",
+                    ))
+                }
+                _ => {
+                    return Err(refuse(
+                        "flush failed at open",
+                        e,
+                        "attach it read-only, or use a zvol",
+                    ))
+                }
+            },
         };
         Ok(Self {
             ops,
             can_flush,
             restore_wce: false,
+            log,
         })
     }
 
@@ -250,7 +313,10 @@ impl Device {
 impl Drop for Device {
     fn drop(&mut self) {
         if self.restore_wce {
-            let _ = self.ops.set_wce(false);
+            if let Err(e) = self.ops.set_wce(false) {
+                slog::warn!(self.log, "zvol write cache left on";
+                    "error" => %e);
+            }
         }
     }
 }
@@ -263,8 +329,15 @@ fn unsupported(e: &io::Error) -> bool {
 }
 
 #[cfg(any(target_os = "illumos", test))]
-fn refuse(what: &str, e: io::Error) -> io::Error {
-    io::Error::new(e.kind(), format!("disk refused: {what}: {e}"))
+fn refuse(what: &str, e: io::Error, next: &str) -> io::Error {
+    io::Error::new(e.kind(), format!("disk refused: {what}: {e}; {next}"))
+}
+
+/// `dki_dname` up to its first NUL; all 16 bytes when it has none.
+#[cfg(any(target_os = "illumos", test))]
+fn dname(raw: &[u8]) -> String {
+    let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..len]).into_owned()
 }
 
 /// The ioctls on a real fd.
@@ -284,9 +357,7 @@ impl DiskOps for Dkioc {
                 std::ptr::from_mut(&mut info).cast(),
             )
         }?;
-        let name = info.dki_dname.map(|c| c as u8);
-        let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-        Ok(String::from_utf8_lossy(&name[..len]).into_owned())
+        Ok(dname(&info.dki_dname.map(|c| c as u8)))
     }
 
     fn flush(&self) -> io::Result<()> {
@@ -315,7 +386,8 @@ impl DiskOps for Dkioc {
 }
 
 /// struct dk_cinfo from <sys/dkio.h>.
-#[cfg(target_os = "illumos")]
+#[cfg(any(target_os = "illumos", test))]
+#[cfg_attr(not(target_os = "illumos"), allow(dead_code))]
 #[repr(C)]
 #[derive(Default)]
 struct DkCinfo {
@@ -334,8 +406,9 @@ struct DkCinfo {
     dki_maxtransfer: libc::c_ushort,
 }
 
-// sizeof (struct dk_cinfo) from the illumos headers.
-#[cfg(target_os = "illumos")]
+// sizeof (struct dk_cinfo) from the illumos headers. It has no longs,
+// so the size holds on any host.
+#[cfg(any(target_os = "illumos", test))]
 const _: () = assert!(size_of::<DkCinfo>() == 68);
 
 #[cfg(target_os = "illumos")]

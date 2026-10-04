@@ -500,8 +500,14 @@ fn durable_flush_syncs_a_real_file() {
     file.write_all(b"durable data")
         .expect("write durable flush file");
 
-    let disk =
-        Arc::new(DiskSync::new(Arc::new(file), false).expect("classify"));
+    let disk = Arc::new(
+        DiskSync::new(
+            Arc::new(file),
+            false,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .expect("classify"),
+    );
 
     let result = flush_file(&gate, &disk, FlushIntent::Durable, "real-file");
 

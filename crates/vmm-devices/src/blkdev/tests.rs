@@ -22,6 +22,8 @@ struct Fake {
     wce: Mutex<Result<bool, i32>>,
     /// The errno SETWCE answers, or `None` to accept.
     set_err: Option<i32>,
+    /// The errno SETWCE answers when turning the cache off.
+    off_err: Option<i32>,
     /// DKIOCINFO's drive name, or the errno it answers.
     name: Result<&'static str, i32>,
     sets: Mutex<Vec<bool>>,
@@ -34,6 +36,7 @@ impl Fake {
             flush_calls: AtomicUsize::new(0),
             wce: Mutex::new(wce),
             set_err: None,
+            off_err: None,
             name: Ok("sd"),
             sets: Mutex::new(Vec::new()),
         }
@@ -85,7 +88,7 @@ impl DiskOps for Fake {
 
     fn set_wce(&self, on: bool) -> io::Result<()> {
         self.sets.lock().unwrap().push(on);
-        if let Some(errno) = self.set_err {
+        if let Some(errno) = self.set_err.or(self.off_err.filter(|_| !on)) {
             return Err(io::Error::from_raw_os_error(errno));
         }
         *self.wce.lock().unwrap() = Ok(on);
@@ -93,12 +96,52 @@ impl DiskOps for Fake {
     }
 }
 
+/// Collects the messages logged through it.
+#[derive(Clone, Default)]
+struct Msgs(Arc<Mutex<Vec<String>>>);
+
+impl slog::Drain for Msgs {
+    type Ok = ();
+    type Err = slog::Never;
+
+    fn log(
+        &self,
+        record: &slog::Record<'_>,
+        _: &slog::OwnedKVList,
+    ) -> Result<(), slog::Never> {
+        self.0.lock().unwrap().push(record.msg().to_string());
+        Ok(())
+    }
+}
+
+impl Msgs {
+    fn logger(&self) -> slog::Logger {
+        slog::Logger::root(self.clone(), slog::o!())
+    }
+
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+fn discard() -> slog::Logger {
+    slog::Logger::root(slog::Discard, slog::o!())
+}
+
 fn backing() -> Arc<File> {
     Arc::new(tempfile::tempfile().expect("tempfile"))
 }
 
 fn open(st_mode: u32, fake: &Arc<Fake>) -> io::Result<DiskSync> {
-    DiskSync::build(backing(), st_mode, false, Arc::clone(fake) as _)
+    open_logged(st_mode, fake, &discard())
+}
+
+fn open_logged(
+    st_mode: u32,
+    fake: &Arc<Fake>,
+    log: &slog::Logger,
+) -> io::Result<DiskSync> {
+    DiskSync::build(backing(), st_mode, false, Arc::clone(fake) as _, log)
 }
 
 fn errno(r: io::Result<()>) -> Option<i32> {
@@ -109,7 +152,8 @@ fn errno(r: io::Result<()>) -> Option<i32> {
 fn a_regular_file_syncs() {
     let mut file = tempfile::tempfile().expect("tempfile");
     file.write_all(&[0x5A; 512]).expect("write");
-    let disk = DiskSync::new(Arc::new(file), false).expect("classify");
+    let disk =
+        DiskSync::new(Arc::new(file), false, &discard()).expect("classify");
     disk.sync().expect("sync a regular file");
 }
 
@@ -135,8 +179,14 @@ fn a_writable_block_node_is_refused() {
 #[test]
 fn a_read_only_block_node_is_allowed() {
     let fake = Arc::new(Fake::new(Ok(()), Ok(true)));
-    let disk = DiskSync::build(backing(), BLK, true, Arc::clone(&fake) as _)
-        .expect("open");
+    let disk = DiskSync::build(
+        backing(),
+        BLK,
+        true,
+        Arc::clone(&fake) as _,
+        &discard(),
+    )
+    .expect("open");
     disk.sync().expect("sync");
     assert_eq!(fake.calls(), 0);
     assert!(fake.sets().is_empty());
@@ -150,12 +200,13 @@ fn a_block_node_refusal_names_the_raw_node() {
             "/dev/zvol/rdsk/zones/vm0/disk0",
         ),
         ("/dev/dsk/c1t0d0p0", "/dev/rdsk/c1t0d0p0"),
-        ("/dev/lofi/3", "/dev/rlofi/3"),
+        ("/dev/lofi/3", "use a zvol"),
     ] {
         let err = check_not_block(BLK, false, Some(Path::new(blk)))
             .expect_err("refused");
         assert!(err.to_string().contains(raw), "{err}");
     }
+    assert_eq!(raw_node(Path::new("/dev/lofi/3")), None, "rlofi is refused");
     check_not_block(BLK, true, Some(Path::new("/dev/lofi/3")))
         .expect("read-only");
     check_not_block(CHR, false, Some(Path::new("/dev/rlofi/3")))
@@ -185,14 +236,20 @@ fn open_disk_takes_a_regular_file() {
     let path = dir.path().join("disk.img");
     std::fs::write(&path, [0u8; 512]).expect("write");
     let file = open_disk(&path, false).expect("open");
-    DiskSync::new(Arc::new(file), false).expect("classify");
+    DiskSync::new(Arc::new(file), false, &discard()).expect("classify");
 }
 
 #[test]
 fn a_read_only_disk_is_left_alone() {
     let fake = Arc::new(Fake::new(Err(libc::EIO), Ok(true)));
-    let disk = DiskSync::build(backing(), CHR, true, Arc::clone(&fake) as _)
-        .expect("open");
+    let disk = DiskSync::build(
+        backing(),
+        CHR,
+        true,
+        Arc::clone(&fake) as _,
+        &discard(),
+    )
+    .expect("open");
     disk.sync().expect("sync");
     assert_eq!(fake.calls(), 0);
     assert!(fake.sets().is_empty());
@@ -219,19 +276,32 @@ fn a_zvol_already_in_writeback_is_left_on() {
 }
 
 #[test]
-fn a_zvol_cache_change_is_best_effort() {
+fn a_zvol_cache_change_is_best_effort_and_logged() {
+    let msgs = Msgs::default();
     let fake = Arc::new(Fake {
         set_err: Some(libc::EACCES),
         ..Fake::zvol(Ok(false))
     });
-    let disk = open(CHR, &fake).expect("open");
+    let disk = open_logged(CHR, &fake, &msgs.logger()).expect("open");
     disk.sync().expect("sync");
     drop(disk);
     assert_eq!(fake.sets(), [true], "nothing to restore");
+    assert_eq!(msgs.take(), ["zvol write cache stays off"]);
 
     let fake = Arc::new(Fake::zvol(Err(libc::EIO)));
-    drop(open(CHR, &fake).expect("open"));
+    drop(open_logged(CHR, &fake, &msgs.logger()).expect("open"));
     assert!(fake.sets().is_empty());
+    assert_eq!(msgs.take(), ["zvol write cache state unknown"]);
+
+    let fake = Arc::new(Fake {
+        off_err: Some(libc::EIO),
+        ..Fake::zvol(Ok(false))
+    });
+    let disk = open_logged(CHR, &fake, &msgs.logger()).expect("open");
+    assert!(msgs.take().is_empty());
+    drop(disk);
+    assert_eq!(fake.sets(), [true, false]);
+    assert_eq!(msgs.take(), ["zvol write cache left on"]);
 }
 
 #[test]
@@ -316,6 +386,7 @@ fn a_failed_refresh_is_refused() {
         let err = open(CHR, &fake).err().expect("refused");
         assert!(err.to_string().contains("refresh"), "{err}");
         assert!(err.to_string().contains(&format!("os error {set}")));
+        assert!(err.to_string().contains("turn the write cache off"));
         assert_eq!(fake.calls(), 0, "not probed");
         assert_eq!(fake.sets(), [true]);
     }
@@ -337,29 +408,37 @@ fn a_flushing_disk_returns_every_flush_error() {
 }
 
 #[test]
-fn a_disk_that_cannot_flush_with_its_cache_off_skips_flushes() {
-    for probe in [libc::ENOTSUP, libc::ENOTTY] {
-        let fake = Arc::new(Fake::new(Err(probe), Ok(false)));
+fn a_disk_with_no_cache_and_its_cache_off_skips_flushes() {
+    let fake = Arc::new(Fake::new(Err(libc::ENOTSUP), Ok(false)));
+    let disk = open(CHR, &fake).expect("open");
+    for _ in 0..3 {
+        disk.sync().expect("no-op flush");
+    }
+    assert_eq!(fake.calls(), 1, "only the probe");
+    drop(disk);
+    assert!(fake.sets().is_empty());
+}
+
+#[test]
+fn a_disk_with_no_cache_and_no_cache_control_skips_flushes() {
+    for get in [libc::ENOTSUP, libc::ENOTTY] {
+        let fake = Arc::new(Fake::new(Err(libc::ENOTSUP), Err(get)));
         let disk = open(CHR, &fake).expect("open");
-        for _ in 0..3 {
-            disk.sync().expect("no-op flush");
-        }
-        assert_eq!(fake.calls(), 1, "only the probe");
-        drop(disk);
+        disk.sync().expect("no-op flush");
+        assert_eq!(fake.calls(), 1);
         assert!(fake.sets().is_empty());
     }
 }
 
+/// Raw lofi answers ENOTTY to both and may wrap a disk with a cache.
 #[test]
-fn a_disk_without_cache_control_skips_flushes() {
-    for get in [libc::ENOTSUP, libc::ENOTTY] {
-        for probe in [libc::ENOTSUP, libc::ENOTTY] {
-            let fake = Arc::new(Fake::new(Err(probe), Err(get)));
-            let disk = open(CHR, &fake).expect("open");
-            disk.sync().expect("no-op flush");
-            assert_eq!(fake.calls(), 1);
-            assert!(fake.sets().is_empty());
-        }
+fn a_disk_that_does_not_know_the_flush_ioctl_is_refused() {
+    for wce in [Err(libc::ENOTTY), Err(libc::ENOTSUP), Ok(false), Ok(true)] {
+        let fake = Arc::new(Fake::new(Err(libc::ENOTTY), wce));
+        let err = open(CHR, &fake).err().expect("refused");
+        assert!(err.to_string().contains("cannot report a flush"), "{err}");
+        assert!(err.to_string().contains("use a zvol"), "{err}");
+        assert_eq!(fake.calls(), 1, "only the probe");
     }
 }
 
@@ -374,13 +453,15 @@ fn a_flushing_disk_without_cache_control_takes_the_ioctl() {
 
 #[test]
 fn a_cache_on_that_cannot_flush_is_refused() {
-    for probe in [libc::ENOTSUP, libc::ENOTTY] {
-        let fake = Arc::new(Fake::new(Err(probe), Ok(true)));
-        let err = open(CHR, &fake).err().expect("refused");
-        assert!(err.to_string().contains("cannot flush"), "{err}");
-        assert_eq!(fake.sets(), [true], "refresh only");
-        assert_eq!(fake.wce(), Ok(true));
-    }
+    let fake = Arc::new(Fake::new(Err(libc::ENOTSUP), Ok(true)));
+    let err = open(CHR, &fake).err().expect("refused");
+    assert!(err.to_string().contains("cannot flush"), "{err}");
+    assert!(
+        err.to_string().contains("turn the write cache off"),
+        "{err}"
+    );
+    assert_eq!(fake.sets(), [true], "refresh only");
+    assert_eq!(fake.wce(), Ok(true));
 }
 
 #[test]
@@ -401,6 +482,7 @@ fn any_other_getwce_error_is_refused() {
         let fake = Arc::new(Fake::new(Ok(()), Err(get)));
         let err = open(CHR, &fake).err().expect("refused");
         assert!(err.to_string().contains(&format!("os error {get}")));
+        assert!(err.to_string().contains("attach it read-only"), "{err}");
         assert_eq!(fake.calls(), 0);
         assert!(fake.sets().is_empty());
     }
@@ -411,7 +493,7 @@ fn two_opens_of_a_disk_never_change_its_cache() {
     for (probe, wce) in [
         (Ok(()), Ok(false)),
         (Err(libc::ENOTSUP), Ok(false)),
-        (Err(libc::ENOTTY), Err(libc::ENOTTY)),
+        (Err(libc::ENOTSUP), Err(libc::ENOTTY)),
     ] {
         let fake = Arc::new(Fake::new(probe, wce).then_flush(&[probe]));
         let a = open(CHR, &fake).expect("open a");
@@ -452,6 +534,15 @@ fn concurrent_flushes_each_reach_the_disk() {
     assert_eq!(fake.calls(), 1 + THREADS * EACH);
 }
 
+#[test]
+fn dname_stops_at_the_first_nul() {
+    assert_eq!(dname(b"zvol\0\0\0\0\0\0\0\0\0\0\0\0"), "zvol");
+    assert_eq!(dname(b"zvol\0sd\0\0\0\0\0\0\0\0\0"), "zvol");
+    assert_eq!(dname(b"abcdefghijklmnop"), "abcdefghijklmnop");
+    assert_eq!(dname(&[0; 16]), "");
+    assert_eq!(dname(&[]), "");
+}
+
 /// /dev/null answers DKIOCINFO and DKIOCGETWCE with ENXIO.
 #[cfg(target_os = "illumos")]
 #[test]
@@ -460,7 +551,7 @@ fn a_char_device_that_fails_getwce_is_refused() {
         .write(true)
         .open("/dev/null")
         .expect("open /dev/null");
-    let err = DiskSync::new(Arc::new(file), false)
+    let err = DiskSync::new(Arc::new(file), false, &discard())
         .err()
         .expect("/dev/null accepted as a disk");
     assert!(err
