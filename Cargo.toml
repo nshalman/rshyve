@@ -30,7 +30,13 @@ members = [
 # fhrun-init cross-compiles to x86_64-unknown-linux-musl and carries
 # its own workspace and lockfile. Excluding it keeps a host
 # `cargo build --workspace` off the Linux toolchain.
-exclude = ["tools/fhrun-init", "tools/virtiofs-test"]
+# vmm-mantablock takes the ring crate from a private git repository;
+# as a member it would put that source in the root lockfile.
+exclude = [
+    "tools/fhrun-init",
+    "tools/virtiofs-test",
+    "crates/vmm-mantablock",
+]
 
 [workspace.package]
 # The oldest toolchain this is built with is the illumos build host's
