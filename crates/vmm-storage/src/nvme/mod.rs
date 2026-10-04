@@ -21,6 +21,7 @@ mod complete;
 mod cq;
 mod inflight;
 mod io;
+mod locked;
 mod migrate;
 mod pool;
 mod prp;
@@ -82,6 +83,19 @@ pub(super) struct Geometry {
     pub(super) total_blocks: u64,
 }
 
+/// How many MSIs a batch of completions raises.
+///
+/// A batch is every completion written under one hold of the state
+/// lock: one doorbell, one call to the completion sink.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MsiPolicy {
+    /// One per completion queue that got completions.
+    #[default]
+    PerBatch,
+    /// One per completion, to measure what batching saves.
+    PerCompletion,
+}
+
 /// What a controller is built from.
 ///
 /// Tests inject a recording MSI sink and a backend that stalls on
@@ -94,6 +108,7 @@ pub(super) struct NvmeParts {
     pub(super) msi: Arc<dyn MsiSink>,
     pub(super) bus_mmio: Arc<MmioBus>,
     pub(super) fences: FenceBudgets,
+    pub(super) msi_policy: MsiPolicy,
     pub(super) log: slog::Logger,
 }
 
@@ -104,6 +119,9 @@ pub(super) struct NvmeParts {
 struct Counts {
     /// Commands admitted and not yet finished, every queue.
     in_flight: AtomicUsize,
+    /// Threads between releasing the state lock and raising the MSIs
+    /// it owed.
+    raising: AtomicUsize,
     paused: AtomicBool,
     /// Drains ever started, so a test can tell a drain from the idle
     /// short cut.
@@ -122,6 +140,7 @@ impl Counts {
     fn quiesced(&self) -> bool {
         self.paused.load(Ordering::Acquire)
             && self.in_flight.load(Ordering::Acquire) == 0
+            && self.raising.load(Ordering::Acquire) == 0
     }
 }
 
@@ -147,6 +166,7 @@ pub struct NvmeController {
     indicator: Indicator,
     counts: Counts,
     pub(super) fences: FenceBudgets,
+    msi_policy: MsiPolicy,
 }
 
 impl NvmeController {
@@ -200,6 +220,7 @@ impl NvmeController {
             msi: HdlMsiSink::new(hdl),
             bus_mmio,
             fences: FENCE_BUDGETS,
+            msi_policy: MsiPolicy::default(),
             log,
         })
     }
@@ -213,6 +234,7 @@ impl NvmeController {
             msi,
             bus_mmio,
             fences,
+            msi_policy,
             log,
         } = parts;
 
@@ -253,6 +275,7 @@ impl NvmeController {
                 indicator: Indicator::new(),
                 counts: Counts::default(),
                 fences,
+                msi_policy,
             }
         })
     }
@@ -453,7 +476,7 @@ impl Lifecycle for NvmeController {
     /// takes nothing until [`Self::resume`].
     fn pause(&self) {
         self.indicator.pause();
-        let mut st = self.state.lock().expect("nvme: state lock");
+        let mut st = self.lock();
         st.admission.paused = true;
         self.counts.paused.store(true, Ordering::Release);
     }
@@ -466,7 +489,7 @@ impl Lifecycle for NvmeController {
     /// its doorbells are spent, and only a doorbell starts the submit
     /// path otherwise.
     fn resume(&self) {
-        let mut st = self.state.lock().expect("nvme: state lock");
+        let mut st = self.lock();
         st.admission.paused = false;
         self.counts.paused.store(false, Ordering::Release);
         self.flush_all_held(&mut st);
@@ -490,7 +513,7 @@ impl Lifecycle for NvmeController {
     /// Admission stays closed across both, so the flush covers every
     /// write the guest has seen complete.
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
-        let st = self.state.lock().expect("nvme: state lock");
+        let st = self.lock();
         let budget = vmm_devices::quiesce::quiesce_budget(intent);
         let (st, drained) = self.drain_all(st, budget);
         let result = if drained {
@@ -500,7 +523,7 @@ impl Lifecycle for NvmeController {
             drop(st);
             Err(FlushError::NotQuiesced("nvme"))
         };
-        self.reopen(&mut self.state.lock().expect("nvme: state lock"));
+        self.reopen(&mut self.lock());
         result
     }
 

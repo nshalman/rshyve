@@ -5,7 +5,7 @@
 //! Finishing commands, and the drains that wait for them.
 
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, MutexGuard, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use vmm_core::mem::MemCtx;
@@ -14,6 +14,7 @@ use super::backend::{BlockStatus, CompletionSink, RequestId};
 use super::bits::*;
 use super::cq::{post_or_hold, Cqe, Posted};
 use super::inflight::Admitted;
+use super::locked::Locked;
 use super::queues::{io_queue_index, NvmeState};
 use super::NvmeController;
 
@@ -47,7 +48,7 @@ fn current(st: &NvmeState, idx: usize, cmd: &Admitted) -> bool {
 impl NvmeController {
     fn complete(&self, done: &[(RequestId, BlockStatus)]) {
         let mem = MemCtx::new(Arc::clone(&self.physmap));
-        let mut st = self.state.lock().expect("nvme: state lock");
+        let mut st = self.lock();
         for &(id, status) in done {
             let Some(cmd) = io_queue_index(id.queue)
                 .and_then(|idx| st.inflight[idx].finish(id.tag, id.serial))
@@ -113,7 +114,8 @@ impl NvmeController {
                 st.io_cqs[cq_idx].as_mut().map(|cq| {
                     post_or_hold(
                         mem,
-                        &self.msix,
+                        &mut st.irqs,
+                        cmd.cq_id,
                         cq,
                         cqe,
                         sq_head,
@@ -144,7 +146,7 @@ impl NvmeController {
     /// the commands that waited for it are taken.
     pub(super) fn cq_head_doorbell(&self, qid: u16, new_head: u16) {
         let mem = MemCtx::new(Arc::clone(&self.physmap));
-        let mut st = self.state.lock().expect("nvme: state lock");
+        let mut st = self.lock();
         let idx = io_queue_index(qid);
         let cq = match idx {
             None if qid == ADMIN_QUEUE_ID => st.admin_cq.as_mut(),
@@ -159,7 +161,7 @@ impl NvmeController {
         }
         cq.head = new_head;
 
-        if let Err(error) = st.flush_held(&mem, &self.msix, idx) {
+        if let Err(error) = st.flush_held(&mem, idx) {
             slog::error!(self.log, "nvme: held CQE write failed";
                 "error" => %error);
             st.csts |= CSTS_CFS;
@@ -176,7 +178,7 @@ impl NvmeController {
         let mem = MemCtx::new(Arc::clone(&self.physmap));
         let cqs = std::iter::once(None).chain((0..MAX_IO_QUEUES).map(Some));
         for idx in cqs {
-            if let Err(error) = st.flush_held(&mem, &self.msix, idx) {
+            if let Err(error) = st.flush_held(&mem, idx) {
                 slog::error!(self.log, "nvme: held CQE write failed";
                     "error" => %error);
                 st.csts |= CSTS_CFS;
@@ -202,26 +204,26 @@ impl NvmeController {
     /// false.
     pub(super) fn drain<'a>(
         &'a self,
-        mut st: MutexGuard<'a, NvmeState>,
+        mut st: Locked<'a>,
         budget: Duration,
         busy: impl Fn(&NvmeState) -> bool,
-    ) -> (MutexGuard<'a, NvmeState>, bool) {
+    ) -> (Locked<'a>, bool) {
         self.counts.drains.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + budget;
         st.drain_waiters += 1;
         let done = loop {
-            if !busy(&st) {
+            // An MSI still on its way counts too: a reset that cleared
+            // the pending bits under it would leave one set for a
+            // driver that is gone.
+            let raising = self.counts.raising.load(Ordering::Acquire) > 0;
+            if !busy(&st) && !raising {
                 break true;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break false;
             }
-            st = self
-                .drained
-                .wait_timeout(st, left)
-                .expect("nvme: state lock")
-                .0;
+            st.wait(left);
         };
         st.drain_waiters -= 1;
         (st, done)
@@ -233,9 +235,9 @@ impl NvmeController {
     /// drain finished.
     pub(super) fn drain_all<'a>(
         &'a self,
-        mut st: MutexGuard<'a, NvmeState>,
+        mut st: Locked<'a>,
         budget: Duration,
-    ) -> (MutexGuard<'a, NvmeState>, bool) {
+    ) -> (Locked<'a>, bool) {
         st.admission.draining += 1;
         self.drain(st, budget, |st| st.in_flight() > 0)
     }

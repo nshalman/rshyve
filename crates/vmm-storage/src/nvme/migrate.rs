@@ -27,7 +27,7 @@ impl NvmeController {
     pub(super) fn export_state(
         &self,
     ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {
-        let st = self.state.lock().expect("nvme: state lock");
+        let st = self.lock();
         let (mut st, drained) = self.drain_all(st, self.fences.reset);
         let state = if drained {
             Ok(self.snapshot(&st))
@@ -122,7 +122,7 @@ impl NvmeController {
         // abort the VMM on the guest's first doorbell write.
         check_nvme_state(mig)?;
         {
-            let st = self.state.lock().expect("nvme: state lock");
+            let st = self.lock();
             if mig.num_io_queues > st.max_io_queues {
                 return Err(DeviceStateError::invalid(format!(
                     "num_io_queues {} is past the {} this backend serves",
@@ -165,7 +165,7 @@ impl NvmeController {
             .bar_replay_writes(&mig.pci.bar_addrs);
         replay_migrate_pci_state(self, &bar_writes, mig.pci.command);
 
-        let mut st = self.state.lock().expect("nvme: state lock");
+        let mut st = self.lock();
         st.cc = mig.cc;
         st.csts = mig.csts;
         st.aqa = mig.aqa;

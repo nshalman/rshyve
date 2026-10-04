@@ -22,7 +22,9 @@ use super::backend::{
 use super::bits::*;
 use super::pool::WorkerPool;
 use super::queues::NvmeState;
-use super::{FenceBudgets, NvmeController, NvmeParts, FENCE_BUDGETS};
+use super::{
+    FenceBudgets, MsiPolicy, NvmeController, NvmeParts, FENCE_BUDGETS,
+};
 
 mod admin;
 mod backend;
@@ -31,6 +33,7 @@ mod held;
 mod io;
 mod lifecycle;
 mod migrate;
+mod msi;
 
 /// Guest RAM the harness maps: enough for queues and a 2 MiB transfer.
 const GUEST_RAM: usize = 8 << 20;
@@ -47,11 +50,26 @@ const SHORT_FENCES: FenceBudgets = FenceBudgets {
     shutdown: Duration::from_millis(100),
 };
 
-struct RecordingSink(Mutex<Vec<(u64, u64)>>);
+/// Records every MSI, and whether the controller's state lock was
+/// held when it went out.
+#[derive(Default)]
+struct RecordingSink {
+    sent: Mutex<Vec<(u64, u64)>>,
+    ctrl: OnceLock<std::sync::Weak<NvmeController>>,
+    under_lock: AtomicU64,
+}
 
 impl MsiSink for RecordingSink {
     fn send(&self, addr: u64, data: u64) {
-        self.0.lock().expect("sink lock").push((addr, data));
+        let ctrl = self.ctrl.get().and_then(std::sync::Weak::upgrade);
+        if let Some(ctrl) = ctrl {
+            if let Err(std::sync::TryLockError::WouldBlock) =
+                ctrl.state.try_lock()
+            {
+                self.under_lock.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.sent.lock().expect("sink lock").push((addr, data));
     }
 }
 
@@ -366,23 +384,28 @@ impl Harness {
         let log = slog::Logger::root(slog::Discard, slog::o!());
         let backend = WorkerPool::factory(file, backend, read_only, log)
             .expect("worker pool");
-        Self::from_factory(backend, read_only, fences)
+        Self::from_factory(backend, read_only, fences, MsiPolicy::default())
     }
 
     /// A harness over the [`Manual`] backend the test drives.
     fn manual(manual: &Arc<Manual>) -> Self {
-        Self::from_factory(manual.factory(), false, FENCE_BUDGETS)
+        Self::manual_with(manual, MsiPolicy::default())
+    }
+
+    fn manual_with(manual: &Arc<Manual>, msi_policy: MsiPolicy) -> Self {
+        Self::from_factory(manual.factory(), false, FENCE_BUDGETS, msi_policy)
     }
 
     fn from_factory(
         backend: BackendFactory,
         read_only: bool,
         fences: FenceBudgets,
+        msi_policy: MsiPolicy,
     ) -> Self {
         let log = slog::Logger::root(slog::Discard, slog::o!());
         let physmap =
             Arc::new(PhysMap::new_anon(0, GUEST_RAM).expect("anon guest RAM"));
-        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+        let sink = Arc::new(RecordingSink::default());
         let ctrl = NvmeController::build(NvmeParts {
             backend,
             read_only,
@@ -391,8 +414,10 @@ impl Harness {
             msi: Arc::clone(&sink) as Arc<dyn MsiSink>,
             bus_mmio: Arc::new(MmioBus::new()),
             fences,
+            msi_policy,
             log,
         });
+        assert!(sink.ctrl.set(Arc::downgrade(&ctrl)).is_ok());
         ctrl.msix.set_enabled(true);
         for v in 0..NVME_MSIX_COUNT {
             ctrl.msix.write_entry(v, 0xFEE0_0000, u64::from(v));
@@ -611,7 +636,14 @@ impl Harness {
     }
 
     fn msi_count(&self) -> usize {
-        self.sink.0.lock().expect("sink lock").len()
+        self.sink.sent.lock().expect("sink lock").len()
+    }
+
+    /// The vector of every MSI sent, in order. The harness programs
+    /// each vector's data as its own number.
+    fn msi_vectors(&self) -> Vec<u64> {
+        let sent = self.sink.sent.lock().expect("sink lock");
+        sent.iter().map(|&(_, data)| data).collect()
     }
 
     /// Poll the quiesce query the way the control plane does.

@@ -5,12 +5,13 @@
 //! Admin command set.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, MutexGuard};
+use std::sync::Arc;
 
 use vmm_core::mem::MemCtx;
 
 use super::bits::*;
 use super::cq::{post_or_hold, Cqe};
+use super::locked::Locked;
 use super::prp::write_to_prp;
 use super::queues::{io_queue_index, CompQueue, NvmeState, SubQueue};
 use super::NvmeController;
@@ -35,7 +36,7 @@ impl Fence {
 impl NvmeController {
     /// Process admin SQ doorbell: parse and execute admin commands inline.
     pub(super) fn admin_sq_doorbell(&self, new_tail: u16) {
-        let mut st = self.state.lock().expect("nvme: state lock");
+        let mut st = self.lock();
         match &mut st.admin_sq {
             Some(sq) if new_tail < sq.size => sq.tail = new_tail,
             _ => return,
@@ -46,10 +47,7 @@ impl NvmeController {
     /// Run admin commands until the SQ is empty, or until the admin CQ
     /// has no space for another completion: those wait in the SQ for
     /// the CQ head doorbell.
-    pub(super) fn run_admin<'a>(
-        &'a self,
-        mut st: MutexGuard<'a, NvmeState>,
-    ) -> MutexGuard<'a, NvmeState> {
+    pub(super) fn run_admin<'a>(&'a self, mut st: Locked<'a>) -> Locked<'a> {
         let mem = MemCtx::new(Arc::clone(&self.physmap));
         // Process entries in a loop, re-borrowing each iteration to
         // avoid holding a mutable borrow on admin_sq across the call
@@ -136,10 +134,17 @@ impl NvmeController {
             };
             // A Delete Queue drain released the lock, so another vCPU
             // may have filled the CQ since the check above.
-            let posted = match st.admin_cq.as_mut() {
-                Some(cq) => {
-                    post_or_hold(&mem, &self.msix, cq, cqe, sq_head, None)
-                }
+            let state = &mut *st;
+            let posted = match state.admin_cq.as_mut() {
+                Some(cq) => post_or_hold(
+                    &mem,
+                    &mut state.irqs,
+                    ADMIN_QUEUE_ID,
+                    cq,
+                    cqe,
+                    sq_head,
+                    None,
+                ),
                 None => break,
             };
             if let Err(error) = posted {

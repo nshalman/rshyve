@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::bits::*;
-use super::cq::Held;
+use super::cq::{Held, Irqs};
 use super::inflight::SqSlots;
 
 /// One queue as the driver created it.
@@ -152,6 +152,8 @@ pub(super) struct NvmeState {
     pub(super) epochs: Arc<QueueEpochs>,
     /// Threads waiting in a drain, so a completion knows to wake one.
     pub(super) drain_waiters: u32,
+    /// Interrupts owed for completions written since the lock was taken.
+    pub(super) irqs: Irqs,
 }
 
 impl NvmeState {
@@ -294,6 +296,7 @@ impl Default for NvmeState {
             serial: 0,
             epochs: Arc::default(),
             drain_waiters: 0,
+            irqs: Irqs::default(),
         }
     }
 }

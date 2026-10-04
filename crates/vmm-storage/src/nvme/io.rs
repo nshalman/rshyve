@@ -99,7 +99,7 @@ impl NvmeController {
         let Some(idx) = io_queue_index(qid) else {
             return;
         };
-        let mut st = self.state.lock().expect("nvme: state lock");
+        let mut st = self.lock();
         let Some(sq) = st.io_sqs[idx].as_mut() else {
             return;
         };

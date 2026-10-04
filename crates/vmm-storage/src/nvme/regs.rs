@@ -97,7 +97,7 @@ impl NvmeController {
 
     /// Handle controller register reads/writes (offsets 0x00..0x38).
     fn reg_rw(&self, offset: usize, rwo: RWOp<'_>) {
-        let mut st = self.state.lock().expect("nvme: state lock");
+        let mut st = self.lock();
         match rwo {
             RWOp::Read(ro) => {
                 let val = match offset {
@@ -180,7 +180,7 @@ impl NvmeController {
     /// Runs without the state lock held so a disable or a shutdown can
     /// wait for the commands in flight.
     fn write_cc(&self, new_cc: u32) {
-        let old_cc = self.state.lock().expect("nvme: state lock").cc;
+        let old_cc = self.lock().cc;
         let was_enabled = (old_cc & CC_EN) != 0;
         let now_enabled = (new_cc & CC_EN) != 0;
         let shn = (new_cc >> CC_SHN_SHIFT) & CC_SHN_MASK;
@@ -194,7 +194,7 @@ impl NvmeController {
         } else if !was_enabled && now_enabled {
             self.enable(new_cc);
         } else {
-            self.state.lock().expect("nvme: state lock").cc = new_cc;
+            self.lock().cc = new_cc;
         }
     }
 
@@ -204,7 +204,7 @@ impl NvmeController {
     /// instead of RDY: fetching 64-byte SQEs from a queue the driver
     /// sized for something else would read whatever follows it.
     fn enable(&self, new_cc: u32) {
-        let mut st = self.state.lock().expect("nvme: state lock");
+        let mut st = self.lock();
         st.cc = new_cc;
 
         // A fence deadline has already passed on this controller, so a
@@ -276,7 +276,7 @@ impl NvmeController {
     /// pages once RDY clears, and a backend must not hold one of them
     /// into the next enable.
     fn disable(&self, new_cc: u32) {
-        let mut st = self.state.lock().expect("nvme: state lock");
+        let mut st = self.lock();
         st.retire_queues();
         let (mut st, drained) = self.drain_all(st, self.fences.reset);
         // The messages the PBA holds name a driver that is gone; left
@@ -302,7 +302,7 @@ impl NvmeController {
     /// nothing may still be in flight and the write cache the Identify
     /// data advertises has to be on stable storage first.
     fn shutdown(&self, new_cc: u32) {
-        let mut st = self.state.lock().expect("nvme: state lock");
+        let mut st = self.lock();
         st.cc = new_cc;
         st.set_shst(SHST_OCCURRING);
         st.retire_queues();
@@ -324,7 +324,7 @@ impl NvmeController {
                 "error" => %error);
         }
 
-        let mut st = self.state.lock().expect("nvme: state lock");
+        let mut st = self.lock();
         if flushed.is_err() {
             st.csts |= CSTS_CFS;
         } else {
