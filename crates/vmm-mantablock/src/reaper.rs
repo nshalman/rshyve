@@ -42,15 +42,23 @@ pub(crate) fn run<J: Job>(
     // nothing to take starts no new spin.
     let mut last = Instant::now();
     let mut polls = 0u32;
+    let mut empty = wake::Empty::default();
+    // Set by a wake-up, cleared by the next reap.
+    let mut woke = false;
     while !shared.stopping() {
-        match reap(shared, ring, q, &mut cq, &mut cqes, &mut side) {
-            Ok(0) => {}
-            Ok(_) => {
-                last = Instant::now();
-                polls = 0;
-                continue;
-            }
+        let found = match reap(shared, ring, q, &mut cq, &mut cqes, &mut side) {
+            Ok(n) => n > 0,
             Err(why) => return shared.lose(why),
+        };
+        if std::mem::take(&mut woke) || found {
+            if let Some(nap) = empty.after(found) {
+                std::thread::sleep(nap);
+            }
+        }
+        if found {
+            last = Instant::now();
+            polls = 0;
+            continue;
         }
         polls += 1;
         if !spin.is_zero()
@@ -67,17 +75,21 @@ pub(crate) fn run<J: Job>(
         }
         let waited = wake::wait(wake_me, NAP);
         cq.woke();
-        if waited == Waited::Gone {
-            // Take what the engine finished before it closed its end.
-            if let Err(why) =
-                reap(shared, ring, q, &mut cq, &mut cqes, &mut side)
-            {
-                return shared.lose(why);
+        match waited {
+            Waited::Woke => woke = true,
+            Waited::Timeout => {}
+            Waited::Gone => {
+                // Take what the engine finished before it closed its end.
+                if let Err(why) =
+                    reap(shared, ring, q, &mut cq, &mut cqes, &mut side)
+                {
+                    return shared.lose(why);
+                }
+                if !shared.halted() {
+                    shared.lose(Lost::Pipe(q));
+                }
+                return;
             }
-            if !shared.halted() {
-                shared.lose(Lost::Pipe(q));
-            }
-            return;
         }
     }
 }
@@ -90,24 +102,7 @@ fn reap<J: Job>(
     cqes: &mut Vec<Cqe>,
     side: &mut CqSide,
 ) -> Result<usize, Lost> {
-    cqes.clear();
-    let mut bad = None;
-    loop {
-        match cq.pop() {
-            Ok(Some(b)) => match Cqe::decode(&b) {
-                Ok(c) => cqes.push(c),
-                Err(e) => {
-                    bad = Some(Lost::Completion(q, BadCompletion::Entry(e)));
-                    break;
-                }
-            },
-            Ok(None) => break,
-            Err(_) => {
-                bad = Some(Lost::Broken(q));
-                break;
-            }
-        }
-    }
+    let bad = take(cq, cqes, usize::from(ring.tags()), q);
     if cqes.is_empty() {
         return bad.map_or(Ok(0), Err);
     }
@@ -118,4 +113,29 @@ fn reap<J: Job>(
     shared.finish(out);
     done?;
     bad.map_or(Ok(cqes.len()), Err)
+}
+
+/// Pops into `cqes` what the ring holds, and returns why the engine is
+/// lost if it is. Tags come back only after the pass, so a correct engine
+/// cannot have more than `tags` completions on the ring.
+pub(crate) fn take(
+    cq: &mut Consumer<CQE_BYTES>,
+    cqes: &mut Vec<Cqe>,
+    tags: usize,
+    q: u16,
+) -> Option<Lost> {
+    cqes.clear();
+    loop {
+        match cq.pop() {
+            Ok(Some(_)) if cqes.len() == tags => return Some(Lost::Overrun(q)),
+            Ok(Some(b)) => match Cqe::decode(&b) {
+                Ok(c) => cqes.push(c),
+                Err(e) => {
+                    return Some(Lost::Completion(q, BadCompletion::Entry(e)))
+                }
+            },
+            Ok(None) => return None,
+            Err(_) => return Some(Lost::Broken(q)),
+        }
+    }
 }

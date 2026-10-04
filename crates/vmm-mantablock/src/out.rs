@@ -19,6 +19,8 @@ pub(crate) enum Lost {
     Broken(u16),
     /// The SQ had no room for a request within the depth.
     Full(u16),
+    /// More completions in one pass than there are tags.
+    Overrun(u16),
     /// A completion that matches no request in flight.
     Completion(u16, BadCompletion),
     /// A wake-up pipe closed or failed.

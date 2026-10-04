@@ -122,6 +122,11 @@ impl<J: Job> QueueRing<J> {
         })
     }
 
+    /// Ring tags in use.
+    pub(crate) fn tags(&self) -> u16 {
+        self.slots.tags
+    }
+
     pub(crate) fn cq_side(&self) -> CqSide {
         CqSide {
             stage: Stage::new(),
