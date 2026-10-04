@@ -38,3 +38,7 @@ serde_json.workspace = true
 slog.workspace = true
 slog-term.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+rustix = { version = "1", features = ["net"] }
+tempfile = "3"

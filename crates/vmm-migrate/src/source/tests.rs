@@ -116,8 +116,10 @@ fn a_stop_frees_a_wait_on_a_silent_zfs_barrier() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("barrier.sock");
     let listener = UnixListener::bind(&path).expect("bind");
+    let (accepted_tx, accepted) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
+            let _ = accepted_tx.send(());
             std::thread::sleep(Duration::from_secs(20));
             drop(stream);
         }
@@ -125,7 +127,10 @@ fn a_stop_frees_a_wait_on_a_silent_zfs_barrier() {
     let gate = Arc::new(Stoppable::default());
     let stopper = Arc::clone(&gate);
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
+        // Stopped only once connected, so the stop lands on the read.
+        if accepted.recv_timeout(Duration::from_secs(10)).is_ok() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         stopper.stop();
     });
 

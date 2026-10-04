@@ -10,6 +10,7 @@
 //! async twin shipped no device state at all.
 
 pub mod codec;
+pub mod connect;
 pub mod cpu;
 pub mod destination;
 pub mod limits;

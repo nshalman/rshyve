@@ -22,7 +22,6 @@
 
 use std::io::Read;
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -377,14 +376,8 @@ fn zfs_barrier_wait(
 ) -> Result<(), MigrateError> {
     slog::info!(log, "waiting for post-pause ZFS sync";
         "barrier" => %barrier_path.display());
-    // A Unix connect blocks while the agent's backlog is full.
-    let path = barrier_path.to_path_buf();
-    let mut stream = unless_cancelled(
-        "zfs-barrier-connect",
-        || gate.cancelled(),
-        move |_| UnixStream::connect(path),
-    )?
-    .map_err(|e| {
+    let mut stream = crate::connect::unix(barrier_path, || gate.cancelled())?
+        .map_err(|e| {
         MigrateError::Io(format!("ZFS barrier connect failed: {e}"))
     })?;
     let clone = stream

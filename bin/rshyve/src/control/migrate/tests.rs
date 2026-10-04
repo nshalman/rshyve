@@ -426,23 +426,64 @@ fn a_source_stopped_while_its_peer_stops_reading_lets_go() {
         .expect("the send outlived the stop");
 }
 
+/// A listener whose backlog a few connects fill.
+fn short_listener(path: &Path) -> std::os::fd::OwnedFd {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
+    let fd = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)
+        .expect("socket");
+    rustix::net::bind(&fd, &SocketAddrUnix::new(path).expect("addr"))
+        .expect("bind");
+    rustix::net::listen(&fd, 1).expect("listen");
+    fd
+}
+
+/// Connections that fill `path`'s backlog, kept so it stays full.
+/// `None` where a full backlog refuses a connect instead, as illumos
+/// does: there no connect waits.
+fn fill_backlog(path: &Path) -> Option<Vec<UnixStream>> {
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        // A connect still waiting after a few checks found it full.
+        match vmm_migrate::connect::unix(path, || {
+            checks.fetch_add(1, std::sync::atomic::Ordering::AcqRel) > 3
+        }) {
+            Ok(Ok(stream)) => held.push(stream),
+            Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                return None;
+            }
+            Ok(Err(e)) => panic!("filling the backlog: {e}"),
+            Err(_) => return Some(held),
+        }
+    }
+    panic!("the backlog never filled");
+}
+
 #[test]
 fn a_source_stopped_while_it_connects_lets_go() {
-    use std::sync::mpsc;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("full.sock");
+    let _listener = short_listener(&path);
+    let held = fill_backlog(&path);
     let run = Arc::new(RunControl::new(VmRunState::Running));
     run.admit_source(|| None).expect("claim");
-    let (keep, never) = mpsc::channel::<()>();
+    if held.is_none() {
+        let error = connect_unix(&run, &path, &discard()).err();
+        assert!(error.is_some_and(|e| !e.contains(vmm_migrate::CANCELLED)));
+        return;
+    }
     let (tx, rx) = mpsc::channel();
     let connecting = Arc::clone(&run);
     thread::spawn(move || {
-        let _ = tx.send(
-            connect_unless_stopped(&connecting, &discard(), move |_| {
-                let _ = never.recv_timeout(Duration::from_secs(30));
-                UnixStream::pair().map(|(ours, _)| ours)
-            })
-            .err(),
-        );
+        let _ = tx.send(connect_unix(&connecting, &path, &discard()).err());
     });
+    // The backlog is full, so a connect still going after this waits.
+    assert_eq!(
+        rx.recv_timeout(Duration::from_millis(300)).err(),
+        Some(RecvTimeoutError::Timeout),
+        "the connect never waited"
+    );
 
     stop(&run);
 
@@ -451,5 +492,4 @@ fn a_source_stopped_while_it_connects_lets_go() {
         .expect("the connect outlived the stop")
         .expect("a stopped connect fails");
     assert!(error.contains(vmm_migrate::CANCELLED), "{error}");
-    drop(keep);
 }

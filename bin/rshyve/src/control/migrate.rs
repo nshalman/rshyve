@@ -7,7 +7,7 @@
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -17,7 +17,7 @@ use slog::{debug, error, info};
 use vmm_core::mem::MemCtx;
 use vmm_machine::HotplugEngines;
 
-use vmm_migrate::wait::{unless_cancelled, Abandoned};
+use vmm_migrate::wait::unless_cancelled;
 
 use super::protocol::{Command, Response};
 use super::run_state::{MigrationLease, RunControl};
@@ -304,30 +304,26 @@ pub(super) fn migrate_source(
                     MigrateTarget::Unix(path) => {
                         info!(mlog, "connecting to migration socket";
                         "path" => &path);
-                        connect_unless_stopped(run, &mlog, move |_| {
-                            UnixStream::connect(path)
-                        })
-                        .map_err(SourceOutcome::Failed)
-                        .and_then(|stream| {
-                            run_source(
-                                stream, hdl, &memctx, config, hooks, status,
-                                &mlog,
-                            )
-                        })
+                        connect_unix(run, Path::new(&path), &mlog)
+                            .map_err(SourceOutcome::Failed)
+                            .and_then(|stream| {
+                                run_source(
+                                    stream, hdl, &memctx, config, hooks,
+                                    status, &mlog,
+                                )
+                            })
                     }
                     MigrateTarget::Tcp(addr) => {
                         info!(mlog, "connecting to migration peer";
                         "target" => &addr);
-                        connect_unless_stopped(run, &mlog, move |left| {
-                            connect_tcp(&addr, left)
-                        })
-                        .map_err(SourceOutcome::Failed)
-                        .and_then(|stream| {
-                            run_source(
-                                stream, hdl, &memctx, config, hooks, status,
-                                &mlog,
-                            )
-                        })
+                        connect_tcp(run, addr, &mlog)
+                            .map_err(SourceOutcome::Failed)
+                            .and_then(|stream| {
+                                run_source(
+                                    stream, hdl, &memctx, config, hooks,
+                                    status, &mlog,
+                                )
+                            })
                     }
                 };
                 match outcome {
@@ -416,35 +412,51 @@ fn shut_on_stop<S: Shut>(
     Ok(stream)
 }
 
-/// Connect on a helper thread, so a stop frees this one at once. A Unix
-/// connect blocks on a full backlog, and a name lookup is bounded only
-/// by the resolver. A connect left behind drops its socket when it ends.
-fn connect_unless_stopped<S: Shut>(
+/// Connect to the GZ agent's socket, giving up on a stop.
+fn connect_unix(
     run: &RunControl,
+    path: &Path,
     log: &slog::Logger,
-    connect: impl FnOnce(&Abandoned) -> io::Result<S> + Send + 'static,
-) -> Result<S, String> {
-    let stream =
-        unless_cancelled("migrate-connect", || run.cancelled(), connect)
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+) -> Result<UnixStream, String> {
+    let stream = vmm_migrate::connect::unix(path, || run.cancelled())
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     shut_on_stop(run, stream, log).map_err(|e| e.to_string())
 }
 
-fn connect_tcp(addr: &str, left: &Abandoned) -> io::Result<TcpStream> {
+/// Connect to a TCP peer, giving up on a stop.
+///
+/// Only the name lookup runs on a helper thread: nothing can cut it
+/// short, and it holds no socket. One left behind ends on its own.
+fn connect_tcp(
+    run: &RunControl,
+    addr: String,
+    log: &slog::Logger,
+) -> Result<TcpStream, String> {
+    let lookup = addr.clone();
+    let peers = unless_cancelled(
+        "migrate-resolve",
+        || run.cancelled(),
+        move |_| lookup.to_socket_addrs().map(Vec::from_iter),
+    )
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{addr}: {e}"))?;
     let mut last = None;
-    for peer in addr.to_socket_addrs()? {
-        if left.get() {
-            return Err(io::Error::other(vmm_migrate::CANCELLED));
-        }
-        match TcpStream::connect_timeout(&peer, CONNECT_TIMEOUT) {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last = Some(e),
+    for peer in peers {
+        let connected =
+            vmm_migrate::connect::tcp(peer, CONNECT_TIMEOUT, || {
+                run.cancelled()
+            })
+            .map_err(|e| e.to_string())?;
+        match connected {
+            Ok(stream) => {
+                return shut_on_stop(run, stream, log)
+                    .map_err(|e| e.to_string())
+            }
+            Err(e) => last = Some(format!("{peer}: {e}")),
         }
     }
-    Err(last.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, format!("{addr}: no address"))
-    }))
+    Err(last.unwrap_or_else(|| format!("{addr}: no address")))
 }
 
 /// The device hooks the source phases drive.
