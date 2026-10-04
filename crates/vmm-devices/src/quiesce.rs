@@ -6,7 +6,9 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{
+    mpsc, Arc, Condvar, Mutex, PoisonError, RwLock, RwLockReadGuard,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,6 +17,9 @@ use crate::{FlushError, FlushIntent, Lifecycle};
 const DURABLE_QUIESCE_BUDGET: Duration = Duration::from_secs(30);
 const BEST_EFFORT_QUIESCE_BUDGET: Duration = Duration::from_secs(2);
 const BEST_EFFORT_SYNC_BUDGET: Duration = Duration::from_secs(5);
+/// How often a parked worker looks for work handed to it before the
+/// pause.
+const PARK_POLL: Duration = Duration::from_millis(50);
 
 /// Shared pause/drain gate for devices with I/O worker threads.
 ///
@@ -41,8 +46,18 @@ pub struct QuiesceGate {
     /// few atomics fails a correct tree on a loaded machine.
     drains_started: AtomicUsize,
     active: AtomicUsize,
+    /// Held shared by each producer from its pause check until its work
+    /// is handed to a worker, and held alone to start a pause or a
+    /// drain. So once `pause` returns, no producer still holds work it
+    /// decided to take before the pause.
+    admission: RwLock<()>,
     lock: Mutex<()>,
     cv: Condvar,
+}
+
+/// A producer's permission to take work, from [`QuiesceGate::admit`].
+pub struct Admission<'a> {
+    _guard: RwLockReadGuard<'a, ()>,
 }
 
 /// One caller's claim on the workers, released when it is dropped.
@@ -68,13 +83,39 @@ impl QuiesceGate {
             drains: AtomicUsize::new(0),
             drains_started: AtomicUsize::new(0),
             active: AtomicUsize::new(workers),
+            admission: RwLock::new(()),
             lock: Mutex::new(()),
             cv: Condvar::new(),
         }
     }
 
     pub fn pause(&self) {
+        let _admission = self.close_admission();
         self.paused.store(true, Ordering::Release);
+    }
+
+    /// Wait out every producer inside [`Self::admit`].
+    fn close_admission(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.admission
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Permission to take work and hand it to a worker, or `None` while
+    /// a pause or a drain holds the workers.
+    ///
+    /// Hold it until the work is in a worker's queue. A pause that
+    /// starts in that window waits for it, so it never finds the
+    /// workers parked with work still on the way to them.
+    pub fn admit(&self) -> Option<Admission<'_>> {
+        let guard = self
+            .admission
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.is_paused() {
+            return None;
+        }
+        Some(Admission { _guard: guard })
     }
 
     pub fn resume(&self) {
@@ -89,6 +130,7 @@ impl QuiesceGate {
     /// pause taken by another thread while the scope is held survives
     /// the drop.
     pub fn drain_scope(&self) -> DrainScope<'_> {
+        let _admission = self.close_admission();
         self.drains_started.fetch_add(1, Ordering::Relaxed);
         self.drains.fetch_add(1, Ordering::AcqRel);
         DrainScope { gate: self }
@@ -110,16 +152,40 @@ impl QuiesceGate {
     }
 
     pub fn park_if_paused(&self) {
+        let _: Option<()> = self.park_if_paused_or(|| None);
+    }
+
+    /// Park as [`Self::park_if_paused`] does, but leave the park early
+    /// with the work `poll` finds.
+    ///
+    /// Work can reach a parked worker: a worker that parked for one
+    /// pause may still be parked when the next one starts, and work
+    /// handed to it between the two waits there. The worker must
+    /// finish it, or the pause waits for it for ever.
+    pub fn park_if_paused_or<T>(
+        &self,
+        mut poll: impl FnMut() -> Option<T>,
+    ) -> Option<T> {
         if !self.is_paused() {
-            return;
+            return None;
         }
         let mut guard = self.lock.lock().expect("quiesce gate lock");
         self.active.fetch_sub(1, Ordering::AcqRel);
         self.cv.notify_all();
+        let mut found = None;
         while self.is_paused() {
-            guard = self.cv.wait(guard).expect("quiesce gate lock");
+            found = poll();
+            if found.is_some() {
+                break;
+            }
+            guard = self
+                .cv
+                .wait_timeout(guard, PARK_POLL)
+                .expect("quiesce gate lock")
+                .0;
         }
         self.active.fetch_add(1, Ordering::AcqRel);
+        found
     }
 
     pub fn wait_quiesced(&self, budget: Duration) -> bool {
@@ -460,6 +526,62 @@ mod tests {
             handle.join().expect("quiesce worker");
         }
         assert_eq!(gate.active.load(Ordering::Acquire), 2);
+    }
+
+    /// A producer that passed the pause check hands its work on before
+    /// the pause can start. Otherwise the workers park first, and the
+    /// work sits in a queue nobody serves while the pause reports quiet.
+    #[test]
+    fn a_pause_waits_for_an_admitted_producer() {
+        let gate = Arc::new(QuiesceGate::new(0));
+        let admission = gate.admit().expect("an idle gate admits");
+
+        let (tx, rx) = mpsc::channel();
+        let pauser = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || {
+                gate.pause();
+                tx.send(()).expect("report the pause");
+            })
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the pause started under an admitted producer"
+        );
+
+        drop(admission);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the pause did not start once the producer left");
+        pauser.join().expect("pause thread");
+        assert!(gate.admit().is_none(), "a paused gate admitted work");
+
+        // A drain closes admission the same way.
+        gate.resume();
+        let drain = gate.drain_scope();
+        assert!(gate.admit().is_none(), "a drain admitted work");
+        drop(drain);
+        assert!(gate.admit().is_some());
+    }
+
+    /// Work handed to a worker that is still parked has to run, or a
+    /// pause waits for it until its deadline.
+    #[test]
+    fn a_parked_worker_takes_work_it_finds() {
+        let gate = Arc::new(QuiesceGate::new(1));
+        gate.pause();
+        let (work_tx, work_rx) = mpsc::channel::<u32>();
+        let worker = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || {
+                gate.park_if_paused_or(|| work_rx.try_recv().ok())
+            })
+        };
+        assert!(gate.wait_quiesced(Duration::from_secs(5)));
+
+        work_tx.send(7).expect("hand over work");
+        assert_eq!(worker.join().expect("worker"), Some(7));
+        assert!(gate.is_paused(), "taking work ended the pause");
+        assert_eq!(gate.active.load(Ordering::Acquire), 1);
     }
 
     #[test]
