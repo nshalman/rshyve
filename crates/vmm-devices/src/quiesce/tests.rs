@@ -182,8 +182,6 @@ fn a_parked_worker_takes_work_it_finds() {
 
 /// A pause or a drain is in force before it waits for the producers
 /// already admitted, so a producer that comes later backs out at once.
-/// Only the takes in progress when it starts can hold it off, so a
-/// stream of producers cannot starve it.
 #[test]
 fn a_waiting_pause_turns_new_producers_away() {
     for drain in [false, true] {
@@ -291,6 +289,22 @@ fn a_pause_after_a_resume_starts_a_fresh_grace() {
         .expect("the retry was held on the last pause's grace");
     gate.resume();
     worker.join().expect("worker");
+}
+
+#[test]
+fn a_second_pause_keeps_the_first_start_and_grace() {
+    let gate = QuiesceGate::new(0);
+    gate.pause_with_grace(Duration::from_secs(60));
+    let first = gate.state().paused_at;
+    thread::sleep(Duration::from_millis(5));
+    gate.pause_with_grace(Duration::ZERO);
+    {
+        let s = gate.state();
+        assert_eq!(s.paused_at, first);
+        assert_eq!(s.grace, Duration::from_secs(60));
+    }
+    gate.resume();
+    assert!(gate.state().paused_at.is_none());
 }
 
 #[test]

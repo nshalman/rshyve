@@ -162,6 +162,11 @@ pub struct VirtioBlock {
 }
 
 impl VirtioBlock {
+    fn pause_for(&self, grace: Duration) {
+        self.indicator.pause();
+        self.gate.pause_with_grace(grace);
+    }
+
     /// Install the transport interrupt path once the transport exists.
     pub fn install_interrupt(&self, intr: Arc<BackendIntr>) {
         self.interrupt.install(intr);
@@ -787,13 +792,11 @@ impl Lifecycle for VirtioBlock {
     }
 
     fn pause(&self) {
-        self.indicator.pause();
-        self.gate.pause_with_grace(self.pause_grace.unknown());
+        self.pause_for(self.pause_grace.unknown());
     }
 
     fn pause_within(&self, budget: Duration) {
-        self.indicator.pause();
-        self.gate.pause_with_grace(self.pause_grace.within(budget));
+        self.pause_for(self.pause_grace.within(budget));
     }
 
     /// The budget check matters: a worker can park with work still

@@ -277,7 +277,8 @@ fn run_batch(
 
     publish(ctx, &completion, tag, &done.entries);
     done.charges.clear();
-    // The release is what marks starved rings due, so it goes first.
+    // The release is what marks starved rings due, so it goes first. The
+    // kick takes chains only through admission, which a pause has closed.
     kick_starved(ctx);
 }
 

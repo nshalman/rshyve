@@ -35,6 +35,8 @@ pub(super) struct PauseGrace {
     /// Left of the caller's wait for the other devices and the
     /// budgeted backlog.
     margin: Duration,
+    /// Below `margin + floor` the grace is half the wait instead, so it
+    /// always ends before the caller stops waiting.
     floor: Duration,
     /// For a pause from a caller that gave no wait.
     unknown: Duration,
@@ -61,7 +63,11 @@ impl PauseGrace {
     }
 
     pub(super) fn within(self, budget: Duration) -> Duration {
-        budget.saturating_sub(self.margin).max(self.floor)
+        if budget >= self.margin + self.floor {
+            budget - self.margin
+        } else {
+            budget / 2
+        }
     }
 
     pub(super) fn unknown(self) -> Duration {

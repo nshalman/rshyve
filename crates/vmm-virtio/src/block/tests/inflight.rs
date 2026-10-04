@@ -552,9 +552,10 @@ fn the_grace_leaves_the_caller_time_for_the_rest() {
         grace.within(Duration::from_secs(30)),
         Duration::from_secs(28)
     );
+    assert_eq!(grace.within(Duration::from_secs(3)), Duration::from_secs(1));
     assert_eq!(
         grace.within(Duration::from_millis(20)),
-        Duration::from_secs(1)
+        Duration::from_millis(10)
     );
     assert_eq!(grace.unknown(), Duration::from_secs(3));
 }
