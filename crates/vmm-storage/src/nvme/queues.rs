@@ -156,6 +156,9 @@ pub(super) struct NvmeState {
     pub(super) drain_waiters: u32,
     /// Interrupts owed for completions written since the lock was taken.
     pub(super) irqs: Irqs,
+    /// Commands finished since the lock was taken, still counted in
+    /// the lock-free in-flight count.
+    pub(super) retiring: usize,
 }
 
 impl NvmeState {
@@ -300,6 +303,7 @@ impl Default for NvmeState {
             epochs: Arc::default(),
             drain_waiters: 0,
             irqs: Irqs::default(),
+            retiring: 0,
         }
     }
 }

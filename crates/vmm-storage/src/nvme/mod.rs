@@ -123,10 +123,6 @@ impl Counts {
         self.in_flight.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn retired(&self) {
-        self.in_flight.fetch_sub(1, Ordering::AcqRel);
-    }
-
     fn quiesced(&self) -> bool {
         self.paused.load(Ordering::Acquire)
             && self.in_flight.load(Ordering::Acquire) == 0

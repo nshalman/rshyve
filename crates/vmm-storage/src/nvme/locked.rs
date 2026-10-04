@@ -33,34 +33,51 @@ impl NvmeController {
 }
 
 impl Locked<'_> {
-    /// Release the lock, raise what is owed, and take the lock again.
+    /// Publish the commands finished under the lock, then release it,
+    /// raise what is owed, and take it again. Returns whether the lock
+    /// was released.
     ///
-    /// A drain does not count as done while a raise is on its way, so
-    /// a reset never clears the pending bits under one.
-    fn raise_owed(&mut self) {
+    /// The quiesce counters change in one step under the lock, raising
+    /// counted before in-flight drops, so a lock-free reader never sees
+    /// a device quiet while a CQE it finished is still unwritten or its
+    /// MSI not yet raised. A drain does not finish while a raise is on
+    /// its way either, so a reset never clears the pending bits under
+    /// one.
+    fn raise_owed(&mut self) -> bool {
         let Some(mut guard) = self.guard.take() else {
-            return;
+            return false;
         };
+        let counts = &self.ctrl.counts;
+        let retired = std::mem::take(&mut guard.retiring);
         let irqs = std::mem::take(&mut guard.irqs);
         if irqs.is_empty() {
+            counts.in_flight.fetch_sub(retired, Ordering::AcqRel);
             self.guard = Some(guard);
-            return;
+            return false;
         }
         let ctrl = self.ctrl;
-        ctrl.counts.raising.fetch_add(1, Ordering::AcqRel);
+        counts.raising.fetch_add(1, Ordering::AcqRel);
+        counts.in_flight.fetch_sub(retired, Ordering::AcqRel);
         drop(guard);
         irqs.raise(&ctrl.msix, ctrl.config.msi_policy);
         let guard = ctrl.state.lock().expect("nvme: state lock");
-        ctrl.counts.raising.fetch_sub(1, Ordering::AcqRel);
+        counts.raising.fetch_sub(1, Ordering::AcqRel);
         if guard.drain_waiters > 0 {
             ctrl.drained.notify_all();
         }
         self.guard = Some(guard);
+        true
     }
 
     /// Wait for a completion to wake a drain, for at most `timeout`.
+    ///
+    /// Returns at once, without waiting, when raising what was owed
+    /// released the lock: a completion may have come and gone in that
+    /// gap, so the caller looks again before it sleeps.
     pub(super) fn wait(&mut self, timeout: Duration) {
-        self.raise_owed();
+        if self.raise_owed() {
+            return;
+        }
         let Some(guard) = self.guard.take() else {
             return;
         };

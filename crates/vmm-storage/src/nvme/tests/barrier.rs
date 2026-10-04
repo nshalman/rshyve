@@ -210,3 +210,27 @@ fn delete_sq_completes_only_once_its_commands_have() {
     assert_eq!(cqe.status(), Status::SUCCESS);
     assert_eq!(quiet, 0, "Delete SQ completed over a live transfer");
 }
+
+/// The control plane polls the quiesce query without the lock, so it
+/// must not see quiet while the thread that finished the last command
+/// still holds the lock writing its CQE.
+#[test]
+fn quiet_is_reported_only_once_the_finishing_lock_is_released() {
+    let manual = Manual::new(IO_QDEPTH);
+    let mut h = Harness::manual(&manual);
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut tail = 0;
+    submit_on(&h, 1, SQ1, &mut tail, Sqe::read(0, 1, 0x50000, 0), 0x61);
+    let req = manual.take().pop().expect("one request");
+    h.ctrl.pause();
+    assert!(!h.ctrl.is_quiesced());
+
+    let mut st = h.ctrl.lock();
+    h.ctrl.finish_now(&mut st, &h.mem(), req.id(), SC_SUCCESS);
+    assert!(!h.ctrl.is_quiesced(), "quiet with the CQE lock still held");
+    drop(st);
+
+    assert!(h.ctrl.is_quiesced());
+    assert_eq!(h.wait_cqe(CQ1, 0, true).cid, 0x61);
+}
