@@ -4,7 +4,6 @@
 
 //! Command dispatch: maps a decoded command to its handler.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use slog::error;
@@ -24,6 +23,7 @@ use super::migrate::{
     migration_source_guard,
 };
 use super::protocol::{Command, Response};
+use super::run_state::ChangeFailed;
 use super::{StopFailure, VmController, VmRunState};
 
 pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
@@ -44,54 +44,33 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             r
         }
 
-        Command::Pause => {
-            if !ctrl.transition(VmRunState::Running, VmRunState::Paused) {
-                return Response::err("VM is not running");
+        Command::Pause => match ctrl.run.change(
+            VmRunState::Running,
+            VmRunState::Paused,
+            || pause_step(ctrl),
+        ) {
+            Ok(()) => {
+                let mut r = Response::ok();
+                r.state = Some(VmRunState::Paused);
+                r
             }
-            if let Err(stuck) = ctrl.pause_devices() {
-                ctrl.state
-                    .store(VmRunState::Running as u8, Ordering::Release);
-                return Response::err(&format!(
-                    "device pause timed out: {:?}",
-                    stuck,
-                ));
-            }
-            match ctrl.hold_pause() {
-                Ok(()) => {
-                    let mut r = Response::ok();
-                    r.state = Some(VmRunState::Paused);
-                    r
-                }
-                Err(e) => {
-                    ctrl.resume_devices();
-                    ctrl.state
-                        .store(VmRunState::Running as u8, Ordering::Release);
-                    error!(ctrl.log, "pause failed"; "error" => %e);
-                    Response::err("pause ioctl failed")
-                }
-            }
-        }
+            Err(ChangeFailed::WrongState) => Response::err("VM is not running"),
+            Err(ChangeFailed::Step(why)) => Response::err(&why),
+        },
 
-        Command::Resume => {
-            if !ctrl.transition(VmRunState::Paused, VmRunState::Running) {
-                return Response::err("VM is not paused");
+        Command::Resume => match ctrl.run.change(
+            VmRunState::Paused,
+            VmRunState::Running,
+            || resume_step(ctrl),
+        ) {
+            Ok(()) => {
+                let mut r = Response::ok();
+                r.state = Some(VmRunState::Running);
+                r
             }
-            // Resume device workers BEFORE vCPUs so interrupts can be delivered
-            ctrl.resume_devices();
-            match ctrl.release_pause() {
-                Ok(()) => {
-                    let mut r = Response::ok();
-                    r.state = Some(VmRunState::Running);
-                    r
-                }
-                Err(e) => {
-                    ctrl.state
-                        .store(VmRunState::Paused as u8, Ordering::Release);
-                    error!(ctrl.log, "resume failed"; "error" => %e);
-                    Response::err("resume ioctl failed")
-                }
-            }
-        }
+            Err(ChangeFailed::WrongState) => Response::err("VM is not paused"),
+            Err(ChangeFailed::Step(why)) => Response::err(&why),
+        },
 
         Command::Shutdown => latch_stop(ctrl, SuspendHow::PowerOff, "shutdown"),
 
@@ -116,10 +95,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
                         // Back to Stopped so the release timer still
                         // fires. Leaving it Stopping stands the timer
                         // down and the zombie would outlive the node.
-                        ctrl.state.store(
-                            VmRunState::Stopped as u8,
-                            Ordering::Release,
-                        );
+                        ctrl.run.set(VmRunState::Stopped);
                         error!(ctrl.log, "stop failed"; "error" => %e);
                         Response::err("suspend ioctl failed")
                     }
@@ -216,11 +192,33 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
 /// migrating and is refused. Without both halves a hot-add could land
 /// on a VM whose destination is already being built.
 fn hot_add(ctrl: &VmController, add: impl FnOnce() -> Response) -> Response {
-    let _topology = ctrl.lock_topology();
+    let _topology = ctrl.run.lock_topology();
     match hot_add_blocked(ctrl.state()) {
         Some(refusal) => refusal,
         None => add(),
     }
+}
+
+/// Park the devices, then the vCPUs.
+fn pause_step(ctrl: &VmController) -> Result<(), String> {
+    if let Err(stuck) = ctrl.pause_devices() {
+        return Err(format!("device pause timed out: {stuck:?}"));
+    }
+    ctrl.hold_pause().map_err(|e| {
+        ctrl.resume_devices();
+        error!(ctrl.log, "pause failed"; "error" => %e);
+        "pause ioctl failed".to_string()
+    })
+}
+
+/// Device workers resume before the vCPUs so interrupts can be
+/// delivered.
+fn resume_step(ctrl: &VmController) -> Result<(), String> {
+    ctrl.resume_devices();
+    ctrl.release_pause().map_err(|e| {
+        error!(ctrl.log, "resume failed"; "error" => %e);
+        "resume ioctl failed".to_string()
+    })
 }
 
 /// Latch a stop on a running or paused VM and report what happened.

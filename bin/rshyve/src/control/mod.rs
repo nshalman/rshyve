@@ -41,6 +41,7 @@ mod dispatch;
 mod listener;
 mod migrate;
 mod protocol;
+mod run_state;
 
 /// How long the migration pause waits for every device worker to park.
 ///
@@ -116,7 +117,7 @@ impl VmRunState {
 
 /// Shared VM state, readable from any thread without locking.
 pub struct VmController {
-    state: AtomicU8,
+    run: run_state::RunControl,
     hdl: Arc<VmmHdl>,
     /// The pause `Command::Pause` takes.
     ///
@@ -150,11 +151,6 @@ pub struct VmController {
     /// it needs, which is the only way the guest has an interface to
     /// answer on.
     hotplug: HotplugEngines,
-    /// Serialises a change to the VM's CPU count or memory size against
-    /// the start of a migration. Both are rare, so holding it costs
-    /// nothing, and without it a migration can read the topology while
-    /// a hot-add is still in flight and leave the addition behind.
-    topology: Mutex<()>,
     /// Original CLI args for migrate-config reconstruction.
     cli_pci_slots: Vec<String>,
     cli_lpc: Vec<String>,
@@ -203,7 +199,7 @@ impl VmController {
         let name = vm_name.to_string();
         let pause_gate = hotplug.pause_gate(&hdl);
         Arc::new(Self {
-            state: AtomicU8::new(VmRunState::Running as u8),
+            run: run_state::RunControl::new(VmRunState::Running),
             hdl,
             pause_gate,
             physmap,
@@ -218,7 +214,6 @@ impl VmController {
             migrated_away: AtomicBool::new(false),
             has_ahci_cd: migration.has_ahci_cd,
             hotplug,
-            topology: Mutex::new(()),
             cli_pci_slots,
             cli_lpc,
             cpu_baseline,
@@ -409,7 +404,7 @@ impl VmController {
     }
 
     fn state(&self) -> VmRunState {
-        VmRunState::from_u8(self.state.load(Ordering::Acquire))
+        self.run.get()
     }
 
     /// Whether this VM's guest now runs on another host.
@@ -425,8 +420,7 @@ impl VmController {
     /// the whole guest memory of a VM that runs nowhere.
     pub(super) fn finish_migrated_away(self: &Arc<Self>, grace: Duration) {
         self.migrated_away.store(true, Ordering::Release);
-        self.state
-            .store(VmRunState::Stopped as u8, Ordering::Release);
+        self.run.set(VmRunState::Stopped);
 
         let ctrl = Arc::clone(self);
         let spawned = thread::Builder::new()
@@ -466,7 +460,7 @@ impl VmController {
     /// instance that is not paused, which is a kernel level mistake and
     /// not a userspace one.
     fn begin_stop(&self) -> StopOwner {
-        claim_stop(&self.state, self.migrated_away())
+        claim_stop(self.run.atomic(), self.migrated_away())
     }
 
     /// Latch `how` and report the state the VM is really in.
@@ -489,7 +483,7 @@ impl VmController {
                 match self.hdl.suspend(how, SUSPEND_SOURCE_VMM) {
                     Ok(_) => Ok(VmRunState::Stopping),
                     Err(e) => {
-                        self.state.store(from as u8, Ordering::Release);
+                        self.run.set(from);
                         Err(StopFailure::NotLatched(e))
                     }
                 }
@@ -501,7 +495,7 @@ impl VmController {
                 ) {
                     Ok(()) => Ok(VmRunState::Stopping),
                     Err(StopFailure::NotLatched(e)) => {
-                        self.state.store(from as u8, Ordering::Release);
+                        self.run.set(from);
                         Err(StopFailure::NotLatched(e))
                     }
                     // The stop is latched, so the VM is stopping even
@@ -524,30 +518,6 @@ impl VmController {
             error!(self.log, "failed to release a migrated source";
                 "error" => %e);
         }
-    }
-
-    /// Hold the topology still.
-    ///
-    /// A hot-add takes this and so does the start of a migration, which
-    /// is what stops one landing between the state change and the
-    /// topology read.
-    fn lock_topology(&self) -> std::sync::MutexGuard<'_, ()> {
-        // No panic on a control path. The value is a unit, which a
-        // panic elsewhere cannot leave half written, so the poison is
-        // taken rather than dropping the request.
-        self.topology.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Attempt a state transition via compare-and-swap.
-    fn transition(&self, from: VmRunState, to: VmRunState) -> bool {
-        self.state
-            .compare_exchange(
-                from as u8,
-                to as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
     }
 
     /// Take the operator's hold on the kernel pause.

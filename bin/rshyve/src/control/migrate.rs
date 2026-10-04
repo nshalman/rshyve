@@ -7,7 +7,6 @@
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -18,6 +17,7 @@ use vmm_core::mem::MemCtx;
 use vmm_machine::HotplugEngines;
 
 use super::protocol::{Command, Response};
+use super::run_state::RunControl;
 use super::{VmController, VmRunState};
 use crate::host_state::HostLocalState;
 
@@ -210,19 +210,22 @@ fn source_refusal(
         .or_else(|| unmigratable_devices(identities))
 }
 
-/// Why this VM cannot take an import, or `None`.
-///
-/// Only a paused VM may take one: the import writes every vCPU's
-/// registers and every device's rings, and a running guest would execute
-/// against half of them.
-fn dest_refusal(
-    state: VmRunState,
+/// Move a running VM to `Migrating`, or say why it cannot be a source.
+fn claim_source(
+    run: &RunControl,
+    hotplug: &HotplugEngines,
     registry: &vmm_machine::DeviceRegistry,
-) -> Option<String> {
-    if state != VmRunState::Paused {
-        return Some("VM must be paused to receive migration".to_string());
-    }
-    device_blockers(registry)
+    identities: impl FnOnce() -> Vec<vmm_migrate::codec::DeviceIdentity>,
+) -> Result<(), String> {
+    run.admit_source(|| source_refusal(hotplug, registry, &identities()))
+}
+
+/// Move a paused VM to `Migrating`, or say why it cannot take an import.
+fn claim_dest(
+    run: &RunControl,
+    registry: &vmm_machine::DeviceRegistry,
+) -> Result<(), String> {
+    run.admit_import(|| device_blockers(registry))
 }
 
 /// Where a migration source connects to.
@@ -255,26 +258,12 @@ pub(super) fn migrate_source(
         Err(e) => return Response::err(&format!("invalid target_addr: {e}")),
     };
 
-    if !ctrl.transition(VmRunState::Running, VmRunState::Migrating) {
-        return Response::err("VM must be running to start migration");
-    }
-
-    // The state comes first, then the topology under the lock a hot-add
-    // takes. An add that was in flight is therefore counted here, and
-    // one that arrives later finds the VM migrating and is refused.
-    // Reading the topology before the state change would miss both.
-    let refused = {
-        let _topology = ctrl.lock_topology();
-        source_refusal(
-            &ctrl.hotplug,
-            &ctrl.registry,
-            &ctrl.migrate_identities(),
-        )
-    };
-    if let Some(reason) = refused {
-        ctrl.state
-            .store(VmRunState::Running as u8, Ordering::Release);
-        return Response::err(&reason);
+    if let Err(why) =
+        claim_source(&ctrl.run, &ctrl.hotplug, &ctrl.registry, || {
+            ctrl.migrate_identities()
+        })
+    {
+        return Response::err(&why);
     }
 
     let status = Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
@@ -343,16 +332,12 @@ pub(super) fn migrate_source(
                     }
                     Err(e @ SourceOutcome::Failed(_)) => {
                         error!(mlog, "source migration failed"; "error" => %e);
-                        ctrl_arc.state.store(
-                            VmRunState::Running as u8,
-                            Ordering::Release,
-                        );
+                        end_migration(&ctrl_arc, VmRunState::Running);
                     }
                 }
             })
     {
-        ctrl.state
-            .store(VmRunState::Running as u8, Ordering::Release);
+        end_migration(ctrl, VmRunState::Running);
         return Response::err(&format!(
             "failed to spawn migration thread: {e}"
         ));
@@ -361,6 +346,14 @@ pub(super) fn migrate_source(
     let mut r = Response::ok();
     r.state = Some(VmRunState::Migrating);
     r
+}
+
+/// Hand the state back from `Migrating`, unless a stop owns it now.
+fn end_migration(ctrl: &VmController, to: VmRunState) {
+    if !ctrl.run.end_migration(to) {
+        info!(ctrl.log, "a stop arrived during the migration; it stands";
+            "state" => ?ctrl.state());
+    }
 }
 
 /// The device hooks the source phases drive.
@@ -433,16 +426,9 @@ pub(super) fn migrate_dest(
         return Response::err(&format!("invalid listen_addr: {e}"));
     }
 
-    let prev_state = {
-        let _topology = ctrl.lock_topology();
-        let state = ctrl.state();
-        if let Some(why) = dest_refusal(state, &ctrl.registry) {
-            return Response::err(&why);
-        }
-        ctrl.state
-            .store(VmRunState::Migrating as u8, Ordering::Release);
-        state
-    };
+    if let Err(why) = claim_dest(&ctrl.run, &ctrl.registry) {
+        return Response::err(&why);
+    }
 
     let status = Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
     if let Ok(mut ms) = ctrl.migrate_status.lock() {
@@ -480,10 +466,7 @@ pub(super) fn migrate_dest(
                             mlog,
                             "destination migration complete, VM running"
                         );
-                        ctrl_arc.state.store(
-                            VmRunState::Running as u8,
-                            Ordering::Release,
-                        );
+                        end_migration(&ctrl_arc, VmRunState::Running);
                     }
                     Err(e) => {
                         // The guest never left this VM's previous state, so
@@ -491,14 +474,12 @@ pub(super) fn migrate_dest(
                         // control command can reach.
                         error!(mlog, "destination migration failed";
                         "error" => %e);
-                        ctrl_arc
-                            .state
-                            .store(prev_state as u8, Ordering::Release);
+                        end_migration(&ctrl_arc, VmRunState::Paused);
                     }
                 }
             })
     {
-        ctrl.state.store(prev_state as u8, Ordering::Release);
+        end_migration(ctrl, VmRunState::Paused);
         return Response::err(&format!(
             "failed to spawn migration thread: {e}"
         ));
@@ -856,10 +837,9 @@ mod tests {
         disk_at(&registry, "4", None, false);
         disk_at(&registry, "5", Some(RING), false);
 
-        assert_names_the_ring_disk(
-            dest_refusal(VmRunState::Paused, &registry),
-            "5",
-        );
+        let run = RunControl::new(VmRunState::Paused);
+        assert_names_the_ring_disk(claim_dest(&run, &registry).err(), "5");
+        assert_eq!(run.get(), VmRunState::Paused);
         assert_names_the_ring_disk(device_blockers(&registry), "5");
     }
 
@@ -869,10 +849,9 @@ mod tests {
         disk_at(&registry, "4", None, false);
         disk_at(&registry, "6", Some(RING), true);
 
-        assert_names_the_ring_disk(
-            dest_refusal(VmRunState::Paused, &registry),
-            "6",
-        );
+        let run = RunControl::new(VmRunState::Paused);
+        assert_names_the_ring_disk(claim_dest(&run, &registry).err(), "6");
+        assert_eq!(run.get(), VmRunState::Paused);
     }
 
     #[test]
@@ -880,12 +859,15 @@ mod tests {
         for hot_added in [false, true] {
             let registry = vmm_machine::DeviceRegistry::new();
             disk_at(&registry, "5", Some(RING), hot_added);
-            let reason = source_refusal(
+            let run = RunControl::new(VmRunState::Running);
+            let reason = claim_source(
+                &run,
                 &HotplugEngines::default(),
                 &registry,
-                &identities(&registry),
+                || identities(&registry),
             );
-            assert_names_the_ring_disk(reason, "5");
+            assert_names_the_ring_disk(reason.err(), "5");
+            assert_eq!(run.get(), VmRunState::Running);
         }
     }
 
@@ -895,23 +877,29 @@ mod tests {
         disk_at(&registry, "4", None, false);
 
         assert_eq!(device_blockers(&registry), None);
-        assert_eq!(dest_refusal(VmRunState::Paused, &registry), None);
+        let dest = RunControl::new(VmRunState::Paused);
+        assert_eq!(claim_dest(&dest, &registry), Ok(()));
+        assert_eq!(dest.get(), VmRunState::Migrating);
+        let source = RunControl::new(VmRunState::Running);
         assert_eq!(
-            source_refusal(
+            claim_source(
+                &source,
                 &HotplugEngines::default(),
                 &registry,
-                &identities(&registry),
+                || identities(&registry),
             ),
-            None,
+            Ok(()),
         );
+        assert_eq!(source.get(), VmRunState::Migrating);
     }
 
     #[test]
     fn migrate_dest_still_needs_a_paused_vm() {
         let registry = vmm_machine::DeviceRegistry::new();
-        let reason =
-            dest_refusal(VmRunState::Running, &registry).expect("a running VM");
+        let run = RunControl::new(VmRunState::Running);
+        let reason = claim_dest(&run, &registry).expect_err("a running VM");
         assert!(reason.contains("paused"), "{reason}");
+        assert_eq!(run.get(), VmRunState::Running);
     }
 
     #[test]
