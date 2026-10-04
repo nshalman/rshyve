@@ -330,8 +330,8 @@ impl NvmeController {
     /// Disconnect the I/O channel and wait for the workers.
     ///
     /// Dropping the sender is the only thing that ends a worker, and
-    /// nothing else releases the backing fd or lets `DiskSync` put the
-    /// zvol write cache back the way it found it.
+    /// nothing else releases the backing fd or lets `DiskSync` turn off
+    /// a zvol write cache it turned on.
     fn stop_workers(&self) {
         drop(self.io_tx.lock().expect("nvme: io_tx lock").take());
         // A parked worker never reaches the channel to see it close.

@@ -24,6 +24,8 @@ struct Fake {
     set_err: Option<i32>,
     /// SETWCE accepts but the state does not change.
     set_ignored: bool,
+    /// After a SETWCE, GETWCE answers this errno.
+    get_err_after_set: Option<i32>,
     sets: Mutex<Vec<bool>>,
 }
 
@@ -35,6 +37,7 @@ impl Fake {
             wce: Mutex::new(wce),
             set_err: None,
             set_ignored: false,
+            get_err_after_set: None,
             sets: Mutex::new(Vec::new()),
         }
     }
@@ -75,8 +78,11 @@ impl DiskOps for Fake {
         if let Some(errno) = self.set_err {
             return Err(io::Error::from_raw_os_error(errno));
         }
-        if !self.set_ignored {
-            *self.wce.lock().unwrap() = Ok(on);
+        let mut wce = self.wce.lock().unwrap();
+        if let Some(errno) = self.get_err_after_set {
+            *wce = Err(errno);
+        } else if !self.set_ignored {
+            *wce = Ok(on);
         }
         Ok(())
     }
@@ -112,20 +118,28 @@ fn a_regular_file_never_takes_the_ioctl() {
 }
 
 #[test]
-fn block_and_char_devices_take_the_ioctl() {
-    for st_mode in [BLK, CHR] {
-        let fake = Arc::new(Fake::new(Ok(()), Ok(true)));
-        let disk = open(st_mode, &fake).expect("open");
-        assert_eq!(fake.calls(), 1, "probe");
-        disk.sync().expect("sync");
-        assert_eq!(fake.calls(), 2);
-    }
+fn a_block_device_takes_fsync() {
+    let fake = Arc::new(Fake::new(Err(libc::ENOTTY), Ok(true)));
+    let disk = open(BLK, &fake).expect("open");
+    disk.sync().expect("sync");
+    drop(disk);
+    assert_eq!(fake.calls(), 0);
+    assert!(fake.sets().is_empty());
+}
+
+#[test]
+fn a_char_device_takes_the_ioctl() {
+    let fake = Arc::new(Fake::new(Ok(()), Ok(true)));
+    let disk = open(CHR, &fake).expect("open");
+    assert_eq!(fake.calls(), 1, "probe");
+    disk.sync().expect("sync");
+    assert_eq!(fake.calls(), 2);
 }
 
 #[test]
 fn a_read_only_disk_is_left_alone() {
     let fake = Arc::new(Fake::new(Err(libc::EIO), Ok(true)));
-    let disk = DiskSync::build(backing(), BLK, true, Arc::clone(&fake) as _)
+    let disk = DiskSync::build(backing(), CHR, true, Arc::clone(&fake) as _)
         .expect("open");
     disk.sync().expect("sync");
     assert_eq!(fake.calls(), 0);
@@ -139,7 +153,7 @@ fn a_flushing_disk_returns_every_flush_error() {
         Err(libc::ENXIO),
         Err(libc::ENOTSUP),
     ]));
-    let disk = open(BLK, &fake).expect("open");
+    let disk = open(CHR, &fake).expect("open");
     assert_eq!(errno(disk.sync()), Some(libc::EIO));
     assert_eq!(errno(disk.sync()), Some(libc::ENXIO));
     assert_eq!(errno(disk.sync()), Some(libc::ENOTSUP));
@@ -152,8 +166,84 @@ fn a_flushing_disk_runs_writeback_and_restores_it() {
     let fake = Arc::new(Fake::new(Ok(()), Ok(false)));
     let disk = open(CHR, &fake).expect("open");
     assert_eq!(fake.wce(), Ok(true));
+    assert_eq!(fake.calls(), 2, "probed again with the cache on");
     drop(disk);
     assert_eq!(fake.sets(), [true, false]);
+    assert_eq!(fake.wce(), Ok(false));
+}
+
+#[test]
+fn a_disk_that_stops_flushing_with_its_cache_on_runs_without_it() {
+    for errno in [libc::ENOTSUP, libc::ENOTTY] {
+        let fake =
+            Arc::new(Fake::new(Ok(()), Ok(false)).then_flush(&[Err(errno)]));
+        let disk = open(CHR, &fake).expect("open");
+        assert_eq!(fake.wce(), Ok(false));
+        disk.sync().expect("no-op flush");
+        assert_eq!(fake.calls(), 2);
+        drop(disk);
+        assert_eq!(fake.sets(), [true, false]);
+        assert_eq!(fake.wce(), Ok(false));
+    }
+}
+
+#[test]
+fn a_disk_that_fails_a_flush_with_its_cache_on_is_refused() {
+    let fake =
+        Arc::new(Fake::new(Ok(()), Ok(false)).then_flush(&[Err(libc::EIO)]));
+    let err = open(CHR, &fake).err().expect("refused");
+    assert_eq!(err.raw_os_error(), None);
+    assert!(err.to_string().contains(&format!("os error {}", libc::EIO)));
+    assert_eq!(fake.sets(), [true, false]);
+    assert_eq!(fake.wce(), Ok(false));
+}
+
+#[test]
+fn a_flushing_disk_without_cache_control_is_accepted() {
+    let fake = Arc::new(Fake::new(Ok(()), Err(libc::EIO)));
+    let disk = open(CHR, &fake).expect("open");
+    disk.sync().expect("sync");
+    drop(disk);
+    assert!(fake.sets().is_empty());
+    assert_eq!(fake.calls(), 2);
+}
+
+#[test]
+fn a_flushing_disk_that_refuses_writeback_is_accepted() {
+    let fake = Arc::new(Fake {
+        set_err: Some(libc::EACCES),
+        ..Fake::new(Ok(()), Ok(false))
+    });
+    let disk = open(CHR, &fake).expect("open");
+    disk.sync().expect("sync");
+    drop(disk);
+    assert_eq!(fake.sets(), [true], "nothing to restore");
+    assert_eq!(fake.calls(), 2);
+}
+
+#[test]
+fn two_opens_only_move_the_cache_toward_off() {
+    // Can flush: B sees the cache A turned on and leaves it alone.
+    let fake = Arc::new(Fake::new(Ok(()), Ok(false)));
+    let a = open(CHR, &fake).expect("open a");
+    let b = open(CHR, &fake).expect("open b");
+    drop(a);
+    assert_eq!(fake.wce(), Ok(false));
+    b.sync().expect("b still flushes");
+    drop(b);
+    assert_eq!(fake.sets(), [true, false]);
+
+    // Cannot flush: A turns the cache off and never back on under B.
+    let fake = Arc::new(
+        Fake::new(Err(libc::ENOTSUP), Ok(true))
+            .then_flush(&[Err(libc::ENOTSUP)]),
+    );
+    let a = open(CHR, &fake).expect("open a");
+    let b = open(CHR, &fake).expect("open b");
+    drop(a);
+    assert_eq!(fake.wce(), Ok(false));
+    drop(b);
+    assert_eq!(fake.sets(), [false]);
     assert_eq!(fake.wce(), Ok(false));
 }
 
@@ -168,7 +258,7 @@ fn a_flushing_disk_already_in_writeback_is_not_touched() {
 fn a_disk_that_cannot_flush_with_its_cache_off_skips_flushes() {
     for probe in [libc::ENOTSUP, libc::ENOTTY] {
         let fake = Arc::new(Fake::new(Err(probe), Ok(false)));
-        let disk = open(BLK, &fake).expect("open");
+        let disk = open(CHR, &fake).expect("open");
         for _ in 0..3 {
             disk.sync().expect("no-op flush");
         }
@@ -192,13 +282,13 @@ fn a_disk_without_cache_control_skips_flushes() {
 #[test]
 fn a_disk_that_cannot_flush_has_its_cache_turned_off() {
     let fake = Arc::new(Fake::new(Err(libc::ENOTSUP), Ok(true)));
-    let disk = open(BLK, &fake).expect("open");
+    let disk = open(CHR, &fake).expect("open");
     assert_eq!(fake.wce(), Ok(false));
     disk.sync().expect("no-op flush");
     assert_eq!(fake.calls(), 1);
-    assert_eq!(fake.sets(), [false]);
     drop(disk);
-    assert_eq!(fake.sets(), [false, true], "restored on drop");
+    assert_eq!(fake.sets(), [false], "never turned back on");
+    assert_eq!(fake.wce(), Ok(false));
 }
 
 #[test]
@@ -207,26 +297,38 @@ fn a_disk_that_cannot_flush_or_turn_its_cache_off_is_refused() {
         set_err: Some(libc::EACCES),
         ..Fake::new(Err(libc::ENOTSUP), Ok(true))
     });
-    let err = open(BLK, &fake).err().expect("refused");
+    let err = open(CHR, &fake).err().expect("refused");
     assert!(err.to_string().contains("could not be confirmed off"));
     assert_eq!(fake.sets(), [false]);
     assert_eq!(fake.wce(), Ok(true));
 }
 
 #[test]
-fn a_cache_that_stays_on_is_refused_and_restored() {
+fn a_cache_that_stays_on_is_refused() {
     let fake = Arc::new(Fake {
         set_ignored: true,
         ..Fake::new(Err(libc::ENOTTY), Ok(true))
     });
     assert!(open(CHR, &fake).is_err());
-    assert_eq!(fake.sets(), [false, true]);
+    assert_eq!(fake.sets(), [false]);
+}
+
+#[test]
+fn an_unreadable_cache_after_turning_it_off_is_refused() {
+    let fake = Arc::new(Fake {
+        get_err_after_set: Some(libc::EIO),
+        ..Fake::new(Err(libc::ENOTSUP), Ok(true))
+    });
+    let err = open(CHR, &fake).err().expect("refused");
+    assert!(err.to_string().contains("could not be confirmed off"));
+    assert!(err.to_string().contains(&format!("os error {}", libc::EIO)));
+    assert_eq!(fake.sets(), [false]);
 }
 
 #[test]
 fn an_unreadable_cache_state_is_refused() {
     let fake = Arc::new(Fake::new(Err(libc::ENOTSUP), Err(libc::EIO)));
-    assert!(open(BLK, &fake).is_err());
+    assert!(open(CHR, &fake).is_err());
     assert!(fake.sets().is_empty());
 }
 
@@ -234,7 +336,7 @@ fn an_unreadable_cache_state_is_refused() {
 fn any_other_probe_error_is_refused() {
     for probe in [libc::ENXIO, libc::EIO, libc::EINVAL, libc::ENODEV] {
         let fake = Arc::new(Fake::new(Err(probe), Ok(false)));
-        let err = open(BLK, &fake).err().expect("refused");
+        let err = open(CHR, &fake).err().expect("refused");
         assert!(err.to_string().contains(&format!("os error {probe}")));
         assert!(fake.sets().is_empty());
     }
@@ -245,7 +347,7 @@ fn concurrent_flushes_each_reach_the_disk() {
     const THREADS: usize = 8;
     const EACH: usize = 100;
     let fake = Arc::new(Fake::new(Ok(()), Ok(true)));
-    let disk = Arc::new(open(BLK, &fake).expect("open"));
+    let disk = Arc::new(open(CHR, &fake).expect("open"));
     std::thread::scope(|s| {
         for _ in 0..THREADS {
             let disk = Arc::clone(&disk);

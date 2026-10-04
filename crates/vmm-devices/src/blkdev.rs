@@ -8,11 +8,12 @@
 //! the ZIL. Writeback with guest-driven flushes is the difference between
 //! ~1k and ~50k+ 4K randwrite IOPS. Model lifted from Oxide's propolis
 //! (`lib/propolis/src/block/file.rs`): probe at open, enable writeback,
-//! restore the device's original state on Drop.
+//! turn it back off on Drop.
 //!
-//! A disk that cannot flush never runs with its write cache on. Its
-//! flush ioctl answers ENOTSUP or ENOTTY whatever the cache state, so a
-//! flush may only be a no-op once the cache is known to be off or absent.
+//! A disk that cannot flush is accepted only with its write cache
+//! confirmed off, or with no cache control at all. The write cache is
+//! device-global and other opens of the device may be attached, so this
+//! code only ever moves it toward off after open.
 
 use std::fs::File;
 use std::io;
@@ -40,10 +41,10 @@ pub(crate) trait DiskOps: Send + Sync {
 /// Makes completed writes on a backing fd durable.
 ///
 /// How is decided once, at open, together with the write cache state.
-/// A disk device takes DKIOCFLUSHWRITECACHE rather than fsync(2):
-/// illumos fsync skips the flush when no I/O marked the device since
-/// the last one, so two flushes that race a write can both miss it, and
-/// it ignores the result of the flush it does send.
+/// A character disk device takes DKIOCFLUSHWRITECACHE rather than
+/// fsync(2): illumos fsync skips the flush when no I/O marked the device
+/// since the last one, so two flushes that race a write can both miss
+/// it, and it ignores the result of the flush it does send.
 pub struct DiskSync {
     file: Arc<File>,
     mode: Mode,
@@ -51,8 +52,12 @@ pub struct DiskSync {
 
 enum Mode {
     ReadOnly,
-    /// A regular file. On illumos `sync_data` is fsync, and fsync of a
-    /// ZFS file commits the ZIL, which is what a flush needs.
+    /// A regular file or a block device. On illumos `sync_data` is
+    /// fsync, and fsync of a ZFS file commits the ZIL. Specfs answers
+    /// ENOTTY to every ioctl on a block node, and writes to it wait in
+    /// the specfs page cache that only fsync pushes out. spec_fsync
+    /// drops the flush errno, so a failed flush on a block node cannot
+    /// reach us; that is why disk paths should name the rdsk node.
     Fsync,
     #[cfg(any(target_os = "illumos", test))]
     Device(Device),
@@ -61,8 +66,11 @@ enum Mode {
 impl DiskSync {
     /// Classify `file`, probe its flush and set its write cache.
     ///
-    /// Fails if the disk cannot flush and its write cache is on and
-    /// stays on, or if the probe fails for any other reason.
+    /// Only a writable character device is probed. It is refused when:
+    /// - the probe flush fails with an errno other than ENOTSUP or ENOTTY;
+    /// - it cannot flush and its write cache cannot be confirmed off;
+    /// - a flush fails with any other errno after the write cache was
+    ///   turned on.
     pub fn new(file: Arc<File>, read_only: bool) -> io::Result<Self> {
         #[cfg(target_os = "illumos")]
         {
@@ -92,7 +100,7 @@ impl DiskSync {
     ) -> io::Result<Self> {
         let mode = if read_only {
             Mode::ReadOnly
-        } else if is_disk(st_mode) {
+        } else if st_mode & libc::S_IFMT == libc::S_IFCHR {
             Mode::Device(Device::open(ops)?)
         } else {
             Mode::Fsync
@@ -116,16 +124,11 @@ impl DiskSync {
 }
 
 #[cfg(any(target_os = "illumos", test))]
-fn is_disk(st_mode: u32) -> bool {
-    matches!(st_mode & libc::S_IFMT, libc::S_IFCHR | libc::S_IFBLK)
-}
-
-#[cfg(any(target_os = "illumos", test))]
 struct Device {
     ops: Arc<dyn DiskOps>,
     can_flush: bool,
-    /// The write cache state to put back on Drop, if we changed it.
-    restore: Option<bool>,
+    /// This open turned the write cache on; Drop turns it off.
+    enabled_wce: bool,
 }
 
 #[cfg(any(target_os = "illumos", test))]
@@ -134,43 +137,65 @@ impl Device {
         let mut dev = Self {
             ops,
             can_flush: true,
-            restore: None,
+            enabled_wce: false,
         };
         match dev.ops.flush() {
-            Ok(()) => {
-                // Best effort: a disk that flushes is safe either way.
-                if matches!(dev.ops.get_wce(), Ok(false))
-                    && dev.ops.set_wce(true).is_ok()
-                {
-                    dev.restore = Some(false);
-                }
+            Ok(()) => {}
+            Err(e) if cannot_flush(&e) => {
+                dev.cache_off_for_good()?;
+                return Ok(dev);
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("disk write cache flush failed at open: {e}"),
+                ))
+            }
+        }
+        // Best effort: a disk that flushes is safe either way.
+        if !matches!(dev.ops.get_wce(), Ok(false))
+            || dev.ops.set_wce(true).is_err()
+        {
+            return Ok(dev);
+        }
+        dev.enabled_wce = true;
+        // sd answers the flush with success and sends nothing while the
+        // cache is off, so only this probe tests SYNCHRONIZE CACHE.
+        match dev.ops.flush() {
+            Ok(()) => Ok(dev),
+            Err(e) if cannot_flush(&e) => {
+                dev.cache_off_for_good()?;
+                dev.enabled_wce = false;
                 Ok(dev)
             }
-            Err(e) if cannot_flush(&e) => {
-                dev.can_flush = false;
-                match dev.ops.get_wce() {
-                    Ok(false) => Ok(dev),
-                    // No write cache control: the nvme blkdev namespace
-                    // without a volatile cache answers this way.
-                    Err(e) if cannot_flush(&e) => Ok(dev),
-                    Err(e) => Err(refuse(e)),
-                    Ok(true) => {
-                        dev.ops.set_wce(false).map_err(refuse)?;
-                        // From here Drop turns it back on, also on error.
-                        dev.restore = Some(true);
-                        if dev.ops.get_wce().map_err(refuse)? {
-                            return Err(refuse(io::Error::other(
-                                "write cache still on after DKIOCSETWCE=0",
-                            )));
-                        }
-                        Ok(dev)
-                    }
-                }
-            }
+            // Drop turns the cache back off.
             Err(e) => Err(io::Error::new(
                 e.kind(),
-                format!("disk write cache flush failed at open: {e}"),
+                format!("disk flush failed after write cache enable: {e}"),
             )),
+        }
+    }
+
+    /// Turn the write cache off and confirm it, for good: turning it
+    /// back on later could expose another open of this device that
+    /// also cannot flush.
+    fn cache_off_for_good(&mut self) -> io::Result<()> {
+        self.can_flush = false;
+        match self.ops.get_wce() {
+            Ok(false) => Ok(()),
+            // No write cache control: the nvme blkdev namespace without
+            // a volatile cache answers this way.
+            Err(e) if cannot_flush(&e) => Ok(()),
+            Err(e) => Err(refuse(e)),
+            Ok(true) => {
+                self.ops.set_wce(false).map_err(refuse)?;
+                if self.ops.get_wce().map_err(refuse)? {
+                    return Err(refuse(io::Error::other(
+                        "write cache still on after DKIOCSETWCE=0",
+                    )));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -186,8 +211,8 @@ impl Device {
 #[cfg(any(target_os = "illumos", test))]
 impl Drop for Device {
     fn drop(&mut self) {
-        if let Some(on) = self.restore {
-            let _ = self.ops.set_wce(on);
+        if self.enabled_wce {
+            let _ = self.ops.set_wce(false);
         }
     }
 }
