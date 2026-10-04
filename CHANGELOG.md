@@ -35,6 +35,13 @@ changed default, a removed feature, or a security fix.
   ([docs/architecture.md](docs/architecture.md)), one feature reference
   ([docs/features.md](docs/features.md)) and one backlog
   ([FEATURES_TODO.md](FEATURES_TODO.md)).
+- A writable block device node (`/dev/dsk/...`, `/dev/zvol/dsk/...`,
+  `/dev/lofi/...`) is refused as a virtio-blk or NVMe backing disk,
+  because specfs hides flush errors. Use the raw node or attach it
+  read-only.
+- A disk whose write cache is on but which cannot flush it is refused,
+  and so is a disk that fails the flush probe at open. Only a zvol's
+  write cache is changed; other disks are left as found.
 
 ### Security
 
