@@ -23,10 +23,9 @@ const IDLE_POLL: Duration = Duration::from_millis(5);
 
 /// Shared pause/drain gate for devices with I/O worker threads.
 ///
-/// WHY a bool predicate and not a future: no caller in this tree is async
-/// (`bin/rshyve/src/reboot.rs`, `bin/rshyve/src/control.rs` both drive it from a
-/// blocking thread), and a caller can only observe its own deadline if the
-/// callee cooperates by yielding. A predicate makes the blocking-inside-poll
+/// WHY a bool predicate and not a future: no caller in this tree is
+/// async, and a caller can only observe its own deadline if the callee
+/// cooperates by yielding. A predicate makes the blocking-inside-poll
 /// defect unrepresentable.
 pub struct QuiesceGate {
     paused: AtomicBool,
@@ -204,10 +203,7 @@ impl QuiesceGate {
     /// one pause is still parked when the next starts. Left there, the
     /// pause would wait for ever.
     ///
-    /// In a drain, such work can start after the drain saw every
-    /// worker parked. None of it was answered before the drain, so a
-    /// flush owes it nothing; a caller that must not sync beside it
-    /// uses [`Self::wait_quiesced_and`].
+    /// In a drain, a flush has to wait for such work itself.
     pub fn park_if_paused_or<T>(
         &self,
         mut poll: impl FnMut() -> Option<T>,

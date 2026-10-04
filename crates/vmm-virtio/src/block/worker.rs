@@ -277,10 +277,7 @@ fn run_batch(
 
     publish(ctx, &completion, tag, &done.entries);
     done.charges.clear();
-    // With the charges gone the device can report quiet and be
-    // exported. Nothing below may touch guest memory or answer a
-    // request; the kick takes chains only through admission, which a
-    // pause has closed.
+    // The release is what marks starved rings due, so it goes first.
     kick_starved(ctx);
 }
 

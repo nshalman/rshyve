@@ -83,7 +83,6 @@ pub(super) const MAX_REQUESTS: usize = 128;
 /// but each one is still a call to the backing store.
 pub(super) const MIN_COST: u64 = 4096;
 
-/// One bit per queue in a `u64` mask.
 pub(super) const MAX_QUEUES: u16 = u64::BITS as u16;
 
 /// Taken from a queue's ring and not yet finished.

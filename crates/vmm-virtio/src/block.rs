@@ -402,8 +402,6 @@ impl VirtioBlock {
         );
     }
 
-    /// Check one chain and return its request header and data length.
-    ///
     /// On refusal the status byte is written and the used length the
     /// guest is owed is returned. A refused head still goes back on the
     /// used ring: `pop_avail` has already taken it out of the available
@@ -572,7 +570,6 @@ impl VirtioDevice for VirtioBlock {
     }
 
     fn set_features(&self, features: u64) {
-        // The transport tells the queues what was negotiated.
         self.features.store(features, Ordering::Release);
     }
 
@@ -816,9 +813,7 @@ impl Lifecycle for VirtioBlock {
     }
 
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
-        // The gate alone is not enough: a parked worker can still take
-        // queued work, and a request past the budget runs on through a
-        // drain. The sync must not run beside either.
+        // A parked worker can still take queued work.
         let budget = &self.ctx.budget;
         let flushed = vmm_devices::quiesce::flush_file_when(
             &self.gate,
