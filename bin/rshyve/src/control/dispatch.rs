@@ -46,6 +46,9 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             r.num_cpus = Some(ctrl.num_cpus);
             r.memory_bytes = Some(ctrl.mem_size);
             r.uptime_secs = Some(ctrl.start_time.elapsed().as_secs());
+            if ctrl.release_stuck() {
+                r.data = Some(serde_json::json!({ "release_stuck": true }));
+            }
             r
         }
 

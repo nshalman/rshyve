@@ -165,6 +165,7 @@ pub struct VmController {
     /// Set once the guest has been handed to another host. The source
     /// must never run the guest again: the destination owns the disk.
     migrated_away: AtomicBool,
+    release_stuck: AtomicBool,
     /// AHCI state has no migration payload, so attached media blocks migration.
     has_ahci_cd: bool,
     /// Each engine is `None` unless the VM was started with the option
@@ -235,6 +236,7 @@ impl VmController {
             vcpu_metrics,
             registry,
             migrated_away: AtomicBool::new(false),
+            release_stuck: AtomicBool::new(false),
             has_ahci_cd: migration.has_ahci_cd,
             hotplug,
             cli_pci_slots,
@@ -488,14 +490,20 @@ impl VmController {
         }
     }
 
-    /// Release a held pause until it works or nothing holds it.
     fn retry_release(&self) {
         reap::reap(
             reap::CADENCE,
             || self.run.must_reap(),
             || self.release_migrated_source(),
+            |stuck| self.release_stuck.store(stuck, Ordering::Release),
             &self.log,
         );
+    }
+
+    /// A held pause the reaper has failed to give back past its fast
+    /// tries. The VM may sit in `stopping` until it works.
+    fn release_stuck(&self) -> bool {
+        self.release_stuck.load(Ordering::Acquire)
     }
 
     /// End a VM whose guest now runs on another host, or give back a
