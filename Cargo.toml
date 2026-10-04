@@ -96,6 +96,7 @@ acpi_tables = "0.2.1"
 anyhow = "1.0"
 base64 = "0.21"
 crc32fast = "1.4"
+crossbeam-channel = "0.5"
 ascii = { version = "1.1", default-features = false }
 usdt = { version = "0.5", default-features = false }
 bitflags = "2.4"

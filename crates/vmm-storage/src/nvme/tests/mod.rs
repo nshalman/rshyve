@@ -4,7 +4,7 @@
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use vmm_core::common::{RWOp, ReadOp, WriteOp, PAGE_SIZE};
@@ -113,8 +113,15 @@ impl TestBackend {
         self.state.lock().expect("backend lock").held = true;
     }
 
+    /// [`Self::hold`], released when the scope drops, so a failed
+    /// assertion does not leave a worker blocked in the backend.
+    fn hold_scope(&self) -> HoldScope<'_> {
+        self.hold();
+        HoldScope(self)
+    }
+
     fn release(&self) {
-        let mut st = self.state.lock().expect("backend lock");
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         st.held = false;
         self.cv.notify_all();
     }
@@ -138,11 +145,13 @@ impl TestBackend {
                 .wait_timeout(st, Duration::from_millis(50))
                 .expect("backend lock");
             st = next;
-            assert!(
-                !timeout.timed_out() || start.elapsed() < WAIT,
-                "only {} of {n} transfers started",
-                st.in_flight
-            );
+            if timeout.timed_out() && start.elapsed() >= WAIT {
+                let started = st.in_flight;
+                // Panicking with the lock held would poison it for the
+                // workers.
+                drop(st);
+                panic!("only {started} of {n} transfers started");
+            }
         }
     }
 
@@ -165,6 +174,14 @@ impl TestBackend {
         let mut st = self.state.lock().expect("backend lock");
         st.in_flight -= 1;
         self.cv.notify_all();
+    }
+}
+
+struct HoldScope<'a>(&'a TestBackend);
+
+impl Drop for HoldScope<'_> {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 

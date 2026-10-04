@@ -24,7 +24,6 @@ mod workers;
 mod tests;
 
 use std::fs::File;
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -104,7 +103,7 @@ pub struct NvmeController {
     pub(super) pci_state: Mutex<DeviceState>,
     pub(super) msix: Arc<MsixTable>,
     state: Mutex<NvmeState>,
-    io_tx: Mutex<Option<mpsc::Sender<IoRequest>>>,
+    io_tx: Mutex<Option<crossbeam_channel::Sender<IoRequest>>>,
     pub(super) physmap: Arc<PhysMap>,
     pub(super) bus_mmio: Arc<MmioBus>,
     pub(super) registered_bar0: Mutex<Option<u64>>,
@@ -265,7 +264,7 @@ impl NvmeController {
             fence_failed: false,
         };
 
-        let (tx, rx) = mpsc::channel::<IoRequest>();
+        let (tx, rx) = crossbeam_channel::unbounded::<IoRequest>();
         let gate = Arc::new(QuiesceGate::new(NUM_WORKERS));
 
         let ctrl = Arc::new(Self {
@@ -290,10 +289,9 @@ impl NvmeController {
         *ctrl.self_ref.lock().expect("self_ref lock") =
             Some(Arc::downgrade(&ctrl));
 
-        let rx = Arc::new(Mutex::new(rx));
         let mut workers = Vec::with_capacity(NUM_WORKERS);
         for i in 0..NUM_WORKERS {
-            let rx = Arc::clone(&rx);
+            let rx = rx.clone();
             let weak = Arc::downgrade(&ctrl);
             let gate = Arc::clone(&gate);
             let backend = Arc::clone(&backend);

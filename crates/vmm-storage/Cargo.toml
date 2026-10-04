@@ -12,6 +12,7 @@ workspace = true
 vmm_devices.workspace = true
 vmm_core.workspace = true
 anyhow.workspace = true
+crossbeam-channel.workspace = true
 slog.workspace = true
 
 [dev-dependencies]

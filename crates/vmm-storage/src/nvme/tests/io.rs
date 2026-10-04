@@ -213,3 +213,24 @@ fn command_specific_status_reaches_the_guest_with_sct_one() {
         }
     );
 }
+
+#[test]
+fn every_worker_can_hold_a_transfer_at_once() {
+    let (mut h, backend) = Harness::held();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let hold = backend.hold_scope();
+
+    let workers = crate::nvme::NUM_WORKERS;
+    let mut tail = 0;
+    for cid in 0..workers as u16 {
+        let prp = 0x50000 + u64::from(cid) * PAGE_SIZE as u64;
+        io_submit(&mut h, &mut tail, Sqe::read(u64::from(cid), 1, prp, 0), cid);
+    }
+    backend.wait_in_flight(workers);
+    drop(hold);
+
+    for i in 0..workers as u16 {
+        assert_eq!(h.wait_cqe(CQ1, i, true).status(), Status::SUCCESS);
+    }
+}
