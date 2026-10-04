@@ -27,6 +27,7 @@ use super::{FenceBudgets, NvmeController, NvmeParts, FENCE_BUDGETS};
 mod admin;
 mod backend;
 mod barrier;
+mod held;
 mod io;
 mod lifecycle;
 mod migrate;
@@ -540,6 +541,38 @@ impl Harness {
             prp1: sq_base,
             cdw10: u32::from(qid) | (u32::from(depth - 1) << 16),
             cdw11: (u32::from(qid) << 16) | CQ_PC,
+            ..Sqe::default()
+        });
+        assert_eq!(cqe.status(), Status::SUCCESS, "create SQ");
+    }
+
+    /// Create I/O CQ `qid` of `cq_depth` entries, then I/O SQ `qid` of
+    /// `sq_depth` entries posting to it.
+    fn create_io_queues_sized(
+        &mut self,
+        qid: u16,
+        sq_depth: u16,
+        cq_depth: u16,
+        sq_base: u64,
+        cq_base: u64,
+    ) {
+        let cqe = self.admin(Sqe {
+            opcode: ADMIN_OPC_CREATE_IO_CQ,
+            prp1: cq_base,
+            cdw10: u32::from(qid) | (u32::from(cq_depth - 1) << 16),
+            cdw11: (u32::from(qid) << 16) | CQ_IEN | CQ_PC,
+            ..Sqe::default()
+        });
+        assert_eq!(cqe.status(), Status::SUCCESS, "create CQ");
+        self.create_io_sq(qid, sq_depth, sq_base, qid);
+    }
+
+    fn create_io_sq(&mut self, qid: u16, depth: u16, base: u64, cq_id: u16) {
+        let cqe = self.admin(Sqe {
+            opcode: ADMIN_OPC_CREATE_IO_SQ,
+            prp1: base,
+            cdw10: u32::from(qid) | (u32::from(depth - 1) << 16),
+            cdw11: (u32::from(cq_id) << 16) | CQ_PC,
             ..Sqe::default()
         });
         assert_eq!(cqe.status(), Status::SUCCESS, "create SQ");

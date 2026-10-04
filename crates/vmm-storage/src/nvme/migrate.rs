@@ -4,6 +4,7 @@
 
 //! Controller state a live migration carries.
 
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 
 use vmm_devices::lifecycle::{
@@ -168,6 +169,7 @@ impl NvmeController {
             iv: cq.iv,
             ien: cq.ien,
             instance,
+            held: VecDeque::new(),
         };
 
         st.retire_queues();

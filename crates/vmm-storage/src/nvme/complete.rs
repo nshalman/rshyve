@@ -12,8 +12,9 @@ use vmm_core::mem::MemCtx;
 
 use super::backend::{BlockStatus, CompletionSink, RequestId};
 use super::bits::*;
+use super::cq::{post_or_hold, Cqe, Posted};
 use super::inflight::Admitted;
-use super::queues::{io_queue_index, post_completion, NvmeState};
+use super::queues::{io_queue_index, NvmeState};
 use super::NvmeController;
 
 /// The sink a backend completes into.
@@ -100,25 +101,74 @@ impl NvmeController {
             self.drained.notify_all();
         }
 
-        if let (true, Some(cq_idx)) = (current(st, idx, &cmd), cq_idx) {
-            let sq_head = st.io_sqs[idx].as_ref().map_or(0, |sq| sq.head);
-            if let Err(error) = post_completion(
-                mem,
-                &self.msix,
-                &mut st.io_cqs[cq_idx],
-                0,
-                id.queue,
-                sq_head,
-                cmd.cid,
-                status,
-            ) {
+        let posted = match cq_idx {
+            Some(cq_idx) if current(st, idx, &cmd) => {
+                let sq_head = st.sq_head(id.queue);
+                let cqe = Cqe {
+                    cdw0: 0,
+                    sqid: id.queue,
+                    cid: cmd.cid,
+                    status,
+                };
+                st.io_cqs[cq_idx].as_mut().map(|cq| {
+                    post_or_hold(
+                        mem,
+                        &self.msix,
+                        cq,
+                        cqe,
+                        sq_head,
+                        Some(id.tag),
+                    )
+                })
+            }
+            _ => None,
+        };
+        match posted {
+            // The tag goes back when the guest gets the completion.
+            Some(Ok(Posted::Held)) => {}
+            Some(Err(error)) => {
                 // The driver will never see this command finish.
                 slog::error!(self.log, "nvme: I/O CQE write failed";
                     "error" => %error);
                 st.csts |= CSTS_CFS;
+                st.inflight[idx].release(id.tag);
+            }
+            Some(Ok(Posted::Written)) | None => {
+                st.inflight[idx].release(id.tag);
             }
         }
-        st.inflight[idx].release(id.tag);
+    }
+
+    /// The CQ head doorbell: the guest has consumed completions up to
+    /// `new_head`, so what was held for want of space goes in now, and
+    /// the commands that waited for it are taken.
+    pub(super) fn cq_head_doorbell(&self, qid: u16, new_head: u16) {
+        let mem = MemCtx::new(Arc::clone(&self.physmap));
+        let mut st = self.state.lock().expect("nvme: state lock");
+        let idx = io_queue_index(qid);
+        let cq = match idx {
+            None if qid == ADMIN_QUEUE_ID => st.admin_cq.as_mut(),
+            None => None,
+            Some(idx) => st.io_cqs[idx].as_mut(),
+        };
+        let Some(cq) = cq else {
+            return;
+        };
+        if new_head >= cq.size {
+            return;
+        }
+        cq.head = new_head;
+
+        if let Err(error) = st.flush_held(&mem, &self.msix, idx) {
+            slog::error!(self.log, "nvme: held CQE write failed";
+                "error" => %error);
+            st.csts |= CSTS_CFS;
+        }
+        if idx.is_some() {
+            self.after_finish(&mut st);
+        } else if st.admin_sq.as_ref().is_some_and(|sq| sq.head != sq.tail) {
+            drop(self.run_admin(st));
+        }
     }
 
     /// Admit again on queues that stopped at their depth and now have

@@ -4,15 +4,15 @@
 
 //! Admin command set.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, MutexGuard};
 
 use vmm_core::mem::MemCtx;
 
 use super::bits::*;
+use super::cq::{post_or_hold, Cqe};
 use super::prp::write_to_prp;
-use super::queues::{
-    io_queue_index, post_completion, CompQueue, NvmeState, SubQueue,
-};
+use super::queues::{io_queue_index, CompQueue, NvmeState, SubQueue};
 use super::NvmeController;
 
 /// A deleted queue whose commands must finish before the Delete Queue
@@ -35,29 +35,34 @@ impl Fence {
 impl NvmeController {
     /// Process admin SQ doorbell: parse and execute admin commands inline.
     pub(super) fn admin_sq_doorbell(&self, new_tail: u16) {
-        let mem = MemCtx::new(Arc::clone(&self.physmap));
         let mut st = self.state.lock().expect("nvme: state lock");
-
-        // Update the tail pointer (validate against queue size)
         match &mut st.admin_sq {
-            Some(sq) => {
-                if new_tail >= sq.size {
-                    return;
-                }
-                sq.tail = new_tail;
-            }
-            None => return,
+            Some(sq) if new_tail < sq.size => sq.tail = new_tail,
+            _ => return,
         }
+        drop(self.run_admin(st));
+    }
 
+    /// Run admin commands until the SQ is empty, or until the admin CQ
+    /// has no space for another completion: those wait in the SQ for
+    /// the CQ head doorbell.
+    pub(super) fn run_admin<'a>(
+        &'a self,
+        mut st: MutexGuard<'a, NvmeState>,
+    ) -> MutexGuard<'a, NvmeState> {
+        let mem = MemCtx::new(Arc::clone(&self.physmap));
         // Process entries in a loop, re-borrowing each iteration to
         // avoid holding a mutable borrow on admin_sq across the call
         // to process_admin_cmd (which borrows the full NvmeState).
         loop {
+            if !st.admin_cq.as_ref().is_some_and(CompQueue::has_room) {
+                break;
+            }
             // Read the next SQE from guest memory (borrow admin_sq briefly)
             let (sqe_gpa, sq_head, sq_size) = {
                 let sq = match &st.admin_sq {
                     Some(sq) => sq,
-                    None => return,
+                    None => break,
                 };
                 if sq.head == sq.tail {
                     break;
@@ -123,22 +128,28 @@ impl NvmeController {
                 }
             }
 
-            if let Err(error) = post_completion(
-                &mem,
-                &self.msix,
-                &mut st.admin_cq,
+            let cqe = Cqe {
                 cdw0,
-                ADMIN_QUEUE_ID,
-                sq_head,
+                sqid: ADMIN_QUEUE_ID,
                 cid,
                 status,
-            ) {
+            };
+            // A Delete Queue drain released the lock, so another vCPU
+            // may have filled the CQ since the check above.
+            let posted = match st.admin_cq.as_mut() {
+                Some(cq) => {
+                    post_or_hold(&mem, &self.msix, cq, cqe, sq_head, None)
+                }
+                None => break,
+            };
+            if let Err(error) = posted {
                 // The driver will never see this command finish.
                 slog::error!(self.log, "nvme: admin CQE write failed";
                     "error" => %error);
                 st.csts |= CSTS_CFS;
             }
         }
+        st
     }
 
     /// Process a single admin command.
@@ -300,6 +311,7 @@ impl NvmeController {
                 iv,
                 ien,
                 instance,
+                held: VecDeque::new(),
             }),
         );
 

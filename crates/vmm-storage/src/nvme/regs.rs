@@ -4,6 +4,7 @@
 
 //! BAR0 register and doorbell decoding, BAR4 MSI-X window.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use vmm_core::common::RWOp;
@@ -15,7 +16,7 @@ use vmm_devices::pci::BarN;
 use vmm_devices::FlushIntent;
 
 use super::bits::*;
-use super::queues::{io_queue_index, valid_queue_base, CompQueue, SubQueue};
+use super::queues::{valid_queue_base, CompQueue, SubQueue};
 use super::NvmeController;
 
 // ---------------------------------------------------------------------------
@@ -261,6 +262,7 @@ impl NvmeController {
             iv: 0,
             ien: true,
             instance,
+            held: VecDeque::new(),
         });
         st.csts &= !CSTS_CFS;
         st.csts |= CSTS_RDY;
@@ -375,7 +377,7 @@ impl NvmeController {
         if is_sq {
             self.sq_doorbell(qid, new_val);
         } else {
-            self.cq_doorbell(qid, new_val);
+            self.cq_head_doorbell(qid, new_val);
         }
     }
 
@@ -386,27 +388,6 @@ impl NvmeController {
             self.admin_sq_doorbell(new_tail);
         } else {
             self.io_sq_doorbell(qid, new_tail);
-        }
-    }
-
-    /// Handle CQ head doorbell write: update head pointer.
-    #[inline]
-    fn cq_doorbell(&self, qid: u16, new_head: u16) {
-        let mut st = self.state.lock().expect("nvme: state lock");
-        if qid == ADMIN_QUEUE_ID {
-            if let Some(cq) = &mut st.admin_cq {
-                if new_head < cq.size {
-                    cq.head = new_head;
-                }
-            }
-        } else {
-            if let Some(idx) = io_queue_index(qid) {
-                if let Some(cq) = &mut st.io_cqs[idx] {
-                    if new_head < cq.size {
-                        cq.head = new_head;
-                    }
-                }
-            }
         }
     }
 

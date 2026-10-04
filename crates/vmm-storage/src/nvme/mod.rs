@@ -18,6 +18,7 @@ pub mod bits;
 
 mod admin;
 mod complete;
+mod cq;
 mod inflight;
 mod io;
 mod migrate;
