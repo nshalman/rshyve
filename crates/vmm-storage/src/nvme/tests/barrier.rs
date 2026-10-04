@@ -234,3 +234,61 @@ fn quiet_is_reported_only_once_the_finishing_lock_is_released() {
     assert!(h.ctrl.is_quiesced());
     assert_eq!(h.wait_cqe(CQ1, 0, true).cid, 0x61);
 }
+
+/// A Delete I/O SQ waits for its own commands only. The driver may
+/// create a new SQ in the slot while the delete drains, and the new
+/// queue's commands must not hold the delete up or fail it.
+#[test]
+fn a_delete_waits_for_its_own_queue_not_the_one_after_it() {
+    let manual = Manual::new(IO_QDEPTH);
+    let mut h = Harness::from_factory(
+        manual.factory(),
+        false,
+        SHORT_FENCES,
+        NvmeConfig::default(),
+    )
+    .expect("controller");
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut tail = 0;
+    submit_on(&h, 1, SQ1, &mut tail, Sqe::read(0, 1, 0x50000, 0), 0x01);
+    let old = manual.take().pop().expect("old request");
+
+    let t = h.admin_tail;
+    let delete = Sqe {
+        opcode: ADMIN_OPC_DELETE_IO_SQ,
+        cdw10: 1,
+        ..Sqe::default()
+    };
+    put_sqe(&h, ASQ, t, delete, 0xD1);
+    let deleter = {
+        let ctrl = Arc::clone(&h.ctrl);
+        std::thread::spawn(move || {
+            let wo = WriteOp::from_buf(&u32::from(t + 1).to_le_bytes());
+            ctrl.bar_rw(BarN::BAR0, REG_DOORBELL_BASE, RWOp::Write(&wo));
+        })
+    };
+    let start = Instant::now();
+    while h.ctrl.drain_count() == 0 {
+        assert!(start.elapsed() < WAIT, "the delete never drained");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // A new SQ 1 and a command on it, while the old one drains.
+    let create = Sqe {
+        opcode: ADMIN_OPC_CREATE_IO_SQ,
+        prp1: SQ2,
+        cdw10: 1 | (u32::from(IO_QDEPTH - 1) << 16),
+        cdw11: (1 << 16) | CQ_PC,
+        ..Sqe::default()
+    };
+    put_sqe(&h, ASQ, t + 1, create, 0xC1);
+    h.sq_doorbell(ADMIN_QUEUE_ID, t + 2);
+    let mut tail = 0;
+    submit_on(&h, 1, SQ2, &mut tail, Sqe::read(0, 1, 0x60000, 0), 0x02);
+    assert_eq!(manual.queued(), 1, "the new queue admitted nothing");
+
+    manual.sink().complete(&[(old.id(), BlockStatus::Success)]);
+    deleter.join().expect("deleter");
+    assert_eq!(h.csts() & CSTS_CFS, 0, "the new queue failed the delete");
+}

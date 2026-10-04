@@ -145,8 +145,6 @@ pub(super) struct NvmeState {
     pub(super) admission: Admission,
     /// Per I/O SQ, the commands it has admitted.
     pub(super) inflight: [SqSlots; MAX_IO_QUEUES],
-    /// Per I/O CQ, the admitted commands that will complete into it.
-    pub(super) cq_inflight: [u32; MAX_IO_QUEUES],
     /// I/O SQs that stopped at their depth, one bit each.
     pub(super) throttled: u16,
     /// Source of [`super::backend::RequestId`] serials.
@@ -297,7 +295,6 @@ impl Default for NvmeState {
             fence_failed: false,
             admission: Admission::default(),
             inflight: Default::default(),
-            cq_inflight: [0; MAX_IO_QUEUES],
             throttled: 0,
             serial: 0,
             epochs: Arc::default(),

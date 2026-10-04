@@ -169,7 +169,6 @@ impl NvmeController {
             let Some(tag) = st.inflight[idx].admit(self.depth, admitted) else {
                 return;
             };
-            st.cq_inflight[cq_idx] += 1;
             self.counts.admitted();
             let id = RequestId {
                 queue: idx as u16 + 1,

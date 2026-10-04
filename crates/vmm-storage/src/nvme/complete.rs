@@ -94,9 +94,6 @@ impl NvmeController {
             return;
         };
         let cq_idx = io_queue_index(cmd.cq_id);
-        if let Some(count) = cq_idx.and_then(|i| st.cq_inflight.get_mut(i)) {
-            *count = count.saturating_sub(1);
-        }
         // The lock-free count drops when the lock is released, once
         // this command's CQE is written.
         st.retiring += 1;

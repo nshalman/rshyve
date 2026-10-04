@@ -13,22 +13,33 @@ use super::bits::*;
 use super::cq::{post_or_hold, Cqe};
 use super::locked::Locked;
 use super::prp::write_to_prp;
-use super::queues::{io_queue_index, CompQueue, NvmeState, SubQueue};
+use super::queues::{
+    io_queue_index, CompQueue, NvmeState, QueueInstance, SubQueue,
+};
 use super::NvmeController;
 
 /// A deleted queue whose commands must finish before the Delete Queue
 /// completes.
+///
+/// Named by instance: the lock is released while it waits, and the
+/// driver may create a new queue in the same slot meanwhile, whose
+/// commands this delete has nothing to do with.
 #[derive(Clone, Copy)]
 enum Fence {
-    Sq(usize),
-    Cq(usize),
+    Sq(usize, QueueInstance),
+    Cq(u16, QueueInstance),
 }
 
 impl Fence {
     fn busy(self, st: &NvmeState) -> bool {
         match self {
-            Self::Sq(idx) => st.inflight[idx].in_flight() > 0,
-            Self::Cq(idx) => st.cq_inflight[idx] > 0,
+            Self::Sq(idx, instance) => st.inflight[idx]
+                .any_in_flight(|cmd| cmd.sq_instance == instance),
+            Self::Cq(cq_id, instance) => st.inflight.iter().any(|slots| {
+                slots.any_in_flight(|cmd| {
+                    cmd.cq_id == cq_id && cmd.cq_instance == instance
+                })
+            }),
         }
     }
 }
@@ -118,11 +129,17 @@ impl NvmeController {
             // reuse the queue's pages, so every command that could
             // still touch them finishes first.
             if let Some(fence) = fence {
+                let admin_cq = st.admin_cq.as_ref().map(|cq| cq.instance);
                 let (next, drained) =
                     self.drain(st, self.fences.reset, |st| fence.busy(st));
                 st = next;
                 if !drained {
                     st.fail_fence();
+                }
+                // A reset while the lock was released took this admin
+                // queue away; its completion belongs to no ring now.
+                if st.admin_cq.as_ref().map(|cq| cq.instance) != admin_cq {
+                    break;
                 }
             }
 
@@ -173,14 +190,16 @@ impl NvmeController {
         cdw10: u32,
         cdw11: u32,
     ) -> (u16, u32, Option<Fence>) {
-        let deleted =
-            io_queue_index((cdw10 & 0xFFFF) as u16).and_then(
-                |idx| match opcode {
-                    ADMIN_OPC_DELETE_IO_SQ => Some(Fence::Sq(idx)),
-                    ADMIN_OPC_DELETE_IO_CQ => Some(Fence::Cq(idx)),
-                    _ => None,
-                },
-            );
+        let qid = (cdw10 & 0xFFFF) as u16;
+        let deleted = io_queue_index(qid).and_then(|idx| match opcode {
+            ADMIN_OPC_DELETE_IO_SQ => st.io_sqs[idx]
+                .as_ref()
+                .map(|sq| Fence::Sq(idx, sq.instance)),
+            ADMIN_OPC_DELETE_IO_CQ => st.io_cqs[idx]
+                .as_ref()
+                .map(|cq| Fence::Cq(qid, cq.instance)),
+            _ => None,
+        });
         let (status, cdw0) = match opcode {
             ADMIN_OPC_IDENTIFY => {
                 self.admin_identify(st, mem, nsid, prp1, prp2, cdw10)

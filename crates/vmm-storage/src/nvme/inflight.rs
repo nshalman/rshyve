@@ -44,6 +44,17 @@ impl SqSlots {
         self.in_flight
     }
 
+    /// Whether a command the backend has not finished matches `pred`.
+    pub(super) fn any_in_flight(
+        &self,
+        pred: impl Fn(&Admitted) -> bool,
+    ) -> bool {
+        self.slots.iter().any(|slot| match slot {
+            Slot::InFlight(cmd) => pred(cmd),
+            _ => false,
+        })
+    }
+
     /// Whether [`Self::admit`] would find a tag.
     pub(super) fn has_room(&self, depth: u16) -> bool {
         !self.free.is_empty() || self.slots.len() < usize::from(depth)
