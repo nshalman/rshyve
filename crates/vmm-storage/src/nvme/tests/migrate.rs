@@ -72,6 +72,7 @@ fn good_payload() -> NvmeMigrateState {
         num_io_queues: 1,
         pci: Default::default(),
         msix: Default::default(),
+        namespace: None,
     }
 }
 

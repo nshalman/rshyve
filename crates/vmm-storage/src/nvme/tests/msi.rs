@@ -10,7 +10,11 @@ use super::*;
 /// backend in one call. Returns the vectors raised by that call.
 fn one_batch(policy: MsiPolicy) -> (Harness, Vec<u64>) {
     let manual = Manual::new(IO_QDEPTH);
-    let mut h = Harness::manual_with(&manual, policy);
+    let config = NvmeConfig {
+        msi_policy: policy,
+        ..NvmeConfig::default()
+    };
+    let mut h = Harness::manual_with(&manual, config);
     h.enable();
     h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
     h.create_io_queues(2, IO_QDEPTH, SQ2, CQ2);

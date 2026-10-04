@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 
 use vmm_devices::lifecycle::{
     DeviceMigrateState, DeviceStateError, NvmeMigrateCq, NvmeMigrateCqe,
-    NvmeMigrateSq, NvmeMigrateState,
+    NvmeMigrateNamespace, NvmeMigrateSq, NvmeMigrateState,
 };
 use vmm_devices::pci::device::replay_migrate_pci_state;
 
@@ -103,6 +103,7 @@ impl NvmeController {
             num_io_queues: st.num_io_queues,
             pci: self.pci_state.lock().expect("pci lock").migrate_state(),
             msix: self.msix.export_state(),
+            namespace: Some(self.namespace()),
         }))
     }
 
@@ -121,6 +122,17 @@ impl NvmeController {
         // head and tail, so a payload the checks let through would
         // abort the VMM on the guest's first doorbell write.
         check_nvme_state(mig)?;
+        let source = mig.namespace.unwrap_or(V2_NAMESPACE);
+        if source != self.namespace() {
+            return Err(DeviceStateError::invalid(format!(
+                "the source namespace has {} byte blocks and VWC {}, this \
+                 one {} and {}",
+                source.block_size,
+                u8::from(source.volatile_write_cache),
+                self.geometry.block_size,
+                u8::from(self.config.volatile_write_cache),
+            )));
+        }
         {
             let st = self.lock();
             if mig.num_io_queues > st.max_io_queues {
@@ -220,7 +232,20 @@ impl NvmeController {
     }
 }
 
+/// The one namespace shape a v2 source had.
+const V2_NAMESPACE: NvmeMigrateNamespace = NvmeMigrateNamespace {
+    block_size: 512,
+    volatile_write_cache: true,
+};
+
 impl NvmeController {
+    fn namespace(&self) -> NvmeMigrateNamespace {
+        NvmeMigrateNamespace {
+            block_size: self.geometry.block_size,
+            volatile_write_cache: self.config.volatile_write_cache,
+        }
+    }
+
     /// Put back the completions the source was holding, each with a tag
     /// in its SQ as it had there. The payload passed its checks.
     fn restore_held(&self, st: &mut NvmeState, mig: &NvmeMigrateState) {

@@ -179,6 +179,13 @@ impl NvmeController {
 
             match self.check(&cmd) {
                 Err(status) => self.finish_now(st, &mem, id, status),
+                // With no volatile cache every completed write is
+                // already durable, so there is nothing to flush.
+                Ok(Checked {
+                    op: BlockOp::Flush, ..
+                }) if !st.volatile_write_cache => {
+                    self.finish_now(st, &mem, id, SC_SUCCESS)
+                }
                 Ok(Checked {
                     op,
                     byte_offset,

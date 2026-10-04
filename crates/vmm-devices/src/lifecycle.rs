@@ -76,8 +76,8 @@ mod state;
 pub use state::{
     DeviceMigrateState, DeviceStateError, DeviceStatePayload,
     HypervMigrateState, MigratePciState, NvmeMigrateCq, NvmeMigrateCqe,
-    NvmeMigrateSq, NvmeMigrateState, VirtioMigrateQueue, VirtioMigrateState,
-    WireBdf,
+    NvmeMigrateNamespace, NvmeMigrateSq, NvmeMigrateState, VirtioMigrateQueue,
+    VirtioMigrateState, WireBdf,
 };
 
 /// General trait for emulated devices in the system.

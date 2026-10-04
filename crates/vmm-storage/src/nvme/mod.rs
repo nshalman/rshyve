@@ -18,6 +18,7 @@ pub mod bits;
 
 mod admin;
 mod complete;
+mod config;
 mod cq;
 mod inflight;
 mod io;
@@ -47,6 +48,8 @@ use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use vmm_devices::pci::msix::{HdlMsiSink, MsiSink, MsixTable};
 use vmm_devices::pci::BarN;
 use vmm_devices::{DeviceMigrateState, FlushError, FlushIntent, Lifecycle};
+
+pub use config::{LbaSize, MsiPolicy, NvmeConfig};
 
 use backend::{AsyncBackend, BackendFactory};
 use bits::*;
@@ -83,19 +86,6 @@ pub(super) struct Geometry {
     pub(super) total_blocks: u64,
 }
 
-/// How many MSIs a batch of completions raises.
-///
-/// A batch is every completion written under one hold of the state
-/// lock: one doorbell, one call to the completion sink.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum MsiPolicy {
-    /// One per completion queue that got completions.
-    #[default]
-    PerBatch,
-    /// One per completion, to measure what batching saves.
-    PerCompletion,
-}
-
 /// What a controller is built from.
 ///
 /// Tests inject a recording MSI sink and a backend that stalls on
@@ -108,7 +98,7 @@ pub(super) struct NvmeParts {
     pub(super) msi: Arc<dyn MsiSink>,
     pub(super) bus_mmio: Arc<MmioBus>,
     pub(super) fences: FenceBudgets,
-    pub(super) msi_policy: MsiPolicy,
+    pub(super) config: NvmeConfig,
     pub(super) log: slog::Logger,
 }
 
@@ -166,7 +156,7 @@ pub struct NvmeController {
     indicator: Indicator,
     counts: Counts,
     pub(super) fences: FenceBudgets,
-    msi_policy: MsiPolicy,
+    config: NvmeConfig,
 }
 
 impl NvmeController {
@@ -212,6 +202,34 @@ impl NvmeController {
             log.clone(),
         )
         .expect("nvme: failed to stat backing file");
+        Self::with_backend(
+            backend,
+            NvmeConfig::default(),
+            read_only,
+            instance_id,
+            physmap,
+            hdl,
+            bus_mmio,
+            log,
+        )
+        .expect("nvme: the default namespace asks nothing of its backend")
+    }
+
+    /// A controller over `backend`, with the namespace `config`
+    /// describes.
+    ///
+    /// Fails when `config` reports no volatile write cache and the
+    /// backend's writes are not durable when they complete.
+    pub fn with_backend(
+        backend: BackendFactory,
+        config: NvmeConfig,
+        read_only: bool,
+        instance_id: u8,
+        physmap: Arc<PhysMap>,
+        hdl: Arc<VmmHdl>,
+        bus_mmio: Arc<MmioBus>,
+        log: slog::Logger,
+    ) -> anyhow::Result<Arc<Self>> {
         Self::build(NvmeParts {
             backend,
             read_only,
@@ -220,12 +238,12 @@ impl NvmeController {
             msi: HdlMsiSink::new(hdl),
             bus_mmio,
             fences: FENCE_BUDGETS,
-            msi_policy: MsiPolicy::default(),
+            config,
             log,
         })
     }
 
-    pub(super) fn build(parts: NvmeParts) -> Arc<Self> {
+    pub(super) fn build(parts: NvmeParts) -> anyhow::Result<Arc<Self>> {
         let NvmeParts {
             backend,
             read_only,
@@ -234,16 +252,16 @@ impl NvmeController {
             msi,
             bus_mmio,
             fences,
-            msi_policy,
+            config,
             log,
         } = parts;
 
         let msix = Arc::new(MsixTable::new(NVME_MSIX_COUNT, msi));
         let pci_state = pci_header(&msix);
 
-        Arc::new_cyclic(|weak| {
+        let ctrl = Arc::new_cyclic(|weak| {
             let backend = backend(Arc::new(Completions(weak.clone())));
-            let block_size: u32 = 512;
+            let block_size = config.lba_size.bytes();
             let geometry = Geometry {
                 block_size,
                 total_blocks: backend.capacity() / u64::from(block_size),
@@ -253,6 +271,7 @@ impl NvmeController {
             let state = initial_state(
                 backend.as_ref(),
                 geometry,
+                config,
                 instance_id,
                 read_only,
             );
@@ -275,9 +294,17 @@ impl NvmeController {
                 indicator: Indicator::new(),
                 counts: Counts::default(),
                 fences,
-                msi_policy,
+                config,
             }
-        })
+        });
+        // Dropping the controller here halts the backend it built.
+        if !config.volatile_write_cache && !ctrl.backend.durable_writes() {
+            anyhow::bail!(
+                "nvme: no volatile write cache needs a backend whose \
+                 writes are durable when they complete"
+            );
+        }
+        Ok(ctrl)
     }
 
     /// Drains started on this controller, ever.
@@ -316,6 +343,7 @@ fn pci_header(msix: &MsixTable) -> DeviceState {
 fn initial_state(
     backend: &dyn AsyncBackend,
     geometry: Geometry,
+    config: NvmeConfig,
     instance_id: u8,
     read_only: bool,
 ) -> NvmeState {
@@ -328,6 +356,7 @@ fn initial_state(
         MDTS_LOG2_PAGES,
         // One controller per instance, and CNTLID 0 is reserved.
         u16::from(instance_id) + 1,
+        config.volatile_write_cache,
     );
     let ns_ident = build_identify_namespace(
         geometry.total_blocks,
@@ -349,6 +378,7 @@ fn initial_state(
         ns_ident,
         num_io_queues: max_queues,
         max_io_queues: max_queues,
+        volatile_write_cache: config.volatile_write_cache,
         ..NvmeState::default()
     }
 }

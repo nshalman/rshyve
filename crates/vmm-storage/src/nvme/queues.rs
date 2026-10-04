@@ -131,6 +131,8 @@ pub(super) struct NvmeState {
     pub(super) num_io_queues: u16,
     /// The I/O queues the backend serves, the most Set Features grants.
     pub(super) max_io_queues: u16,
+    /// Whether Identify reports a volatile write cache.
+    pub(super) volatile_write_cache: bool,
 
     /// Source of [`QueueInstance`] values. Never reset, so an instance
     /// is unique for the life of the controller.
@@ -287,6 +289,7 @@ impl Default for NvmeState {
             ns_ident: [0u8; IDENT_NS_SIZE],
             num_io_queues: MAX_IO_QUEUES as u16,
             max_io_queues: MAX_IO_QUEUES as u16,
+            volatile_write_cache: true,
             instances: 0,
             fence_failed: false,
             admission: Admission::default(),

@@ -420,10 +420,12 @@ impl NvmeController {
                 let nq = u32::from(st.num_io_queues.saturating_sub(1));
                 (SC_SUCCESS, nq | (nq << 16))
             }
-            FEAT_VOLATILE_WC => {
-                // Volatile write cache: report enabled
-                (SC_SUCCESS, 1)
+            // With no cache to report, the feature is not there to get.
+            FEAT_VOLATILE_WC if !st.volatile_write_cache => {
+                (SC_INVALID_FIELD | SC_DNR, 0)
             }
+            // WCE: the cache is enabled.
+            FEAT_VOLATILE_WC => (SC_SUCCESS, 1),
             FEAT_TEMP_THRESHOLD | FEAT_ERROR_RECOVERY | FEAT_POWER_MGMT
             | FEAT_ARBITRATION | FEAT_INTR_COALESCING
             | FEAT_INTR_VECTOR_CFG | FEAT_WRITE_ATOMICITY
@@ -451,6 +453,9 @@ impl NvmeController {
                 let result_sq = alloc_sq.saturating_sub(1);
                 let result_cq = alloc_cq.saturating_sub(1);
                 (SC_SUCCESS, result_sq | (result_cq << 16))
+            }
+            FEAT_VOLATILE_WC if !st.volatile_write_cache => {
+                (SC_INVALID_FIELD | SC_DNR, 0)
             }
             FEAT_VOLATILE_WC => (SC_SUCCESS, 0),
             FEAT_TEMP_THRESHOLD | FEAT_ERROR_RECOVERY | FEAT_POWER_MGMT

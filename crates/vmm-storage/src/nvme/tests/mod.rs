@@ -23,7 +23,8 @@ use super::bits::*;
 use super::pool::WorkerPool;
 use super::queues::NvmeState;
 use super::{
-    FenceBudgets, MsiPolicy, NvmeController, NvmeParts, FENCE_BUDGETS,
+    FenceBudgets, LbaSize, MsiPolicy, NvmeConfig, NvmeController, NvmeParts,
+    FENCE_BUDGETS,
 };
 
 mod admin;
@@ -34,6 +35,7 @@ mod io;
 mod lifecycle;
 mod migrate;
 mod msi;
+mod namespace;
 
 /// Guest RAM the harness maps: enough for queues and a 2 MiB transfer.
 const GUEST_RAM: usize = 8 << 20;
@@ -235,10 +237,20 @@ struct Manual {
     /// The queue of every request ever submitted, in order.
     queues: Mutex<Vec<u16>>,
     depth: u16,
+    durable: bool,
 }
 
 impl Manual {
     fn new(depth: u16) -> Arc<Self> {
+        Self::with(depth, false)
+    }
+
+    /// A backend whose writes are durable when they complete.
+    fn durable(depth: u16) -> Arc<Self> {
+        Self::with(depth, true)
+    }
+
+    fn with(depth: u16, durable: bool) -> Arc<Self> {
         Arc::new(Self {
             sink: OnceLock::new(),
             disk: Mutex::new(
@@ -247,6 +259,7 @@ impl Manual {
             queued: Mutex::new(Vec::new()),
             queues: Mutex::new(Vec::new()),
             depth,
+            durable,
         })
     }
 
@@ -319,6 +332,10 @@ impl AsyncBackend for ManualBackend {
         self.0.depth
     }
 
+    fn durable_writes(&self) -> bool {
+        self.0.durable
+    }
+
     fn submit(&self, req: BlockRequest) {
         self.0
             .queues
@@ -384,24 +401,26 @@ impl Harness {
         let log = slog::Logger::root(slog::Discard, slog::o!());
         let backend = WorkerPool::factory(file, backend, read_only, log)
             .expect("worker pool");
-        Self::from_factory(backend, read_only, fences, MsiPolicy::default())
+        Self::from_factory(backend, read_only, fences, NvmeConfig::default())
+            .expect("controller")
     }
 
     /// A harness over the [`Manual`] backend the test drives.
     fn manual(manual: &Arc<Manual>) -> Self {
-        Self::manual_with(manual, MsiPolicy::default())
+        Self::manual_with(manual, NvmeConfig::default())
     }
 
-    fn manual_with(manual: &Arc<Manual>, msi_policy: MsiPolicy) -> Self {
-        Self::from_factory(manual.factory(), false, FENCE_BUDGETS, msi_policy)
+    fn manual_with(manual: &Arc<Manual>, config: NvmeConfig) -> Self {
+        Self::from_factory(manual.factory(), false, FENCE_BUDGETS, config)
+            .expect("controller")
     }
 
     fn from_factory(
         backend: BackendFactory,
         read_only: bool,
         fences: FenceBudgets,
-        msi_policy: MsiPolicy,
-    ) -> Self {
+        config: NvmeConfig,
+    ) -> anyhow::Result<Self> {
         let log = slog::Logger::root(slog::Discard, slog::o!());
         let physmap =
             Arc::new(PhysMap::new_anon(0, GUEST_RAM).expect("anon guest RAM"));
@@ -414,15 +433,15 @@ impl Harness {
             msi: Arc::clone(&sink) as Arc<dyn MsiSink>,
             bus_mmio: Arc::new(MmioBus::new()),
             fences,
-            msi_policy,
+            config,
             log,
-        });
+        })?;
         assert!(sink.ctrl.set(Arc::downgrade(&ctrl)).is_ok());
         ctrl.msix.set_enabled(true);
         for v in 0..NVME_MSIX_COUNT {
             ctrl.msix.write_entry(v, 0xFEE0_0000, u64::from(v));
         }
-        Self {
+        Ok(Self {
             ctrl,
             physmap,
             sink,
@@ -430,7 +449,7 @@ impl Harness {
             admin_cq_head: 0,
             admin_phase: true,
             next_cid: 1,
-        }
+        })
     }
 
     fn mem(&self) -> MemCtx {

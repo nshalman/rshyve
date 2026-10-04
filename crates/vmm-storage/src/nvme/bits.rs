@@ -277,6 +277,7 @@ pub fn build_identify_controller(
     max_namespaces: u32,
     mdts: u8,
     cntlid: u16,
+    volatile_write_cache: bool,
 ) -> [u8; IDENT_CTRL_SIZE] {
     let mut data = [0u8; IDENT_CTRL_SIZE];
 
@@ -320,7 +321,7 @@ pub fn build_identify_controller(
 
     // VWC - Volatile Write Cache (byte 525)
     // Bit 0 = volatile write cache present
-    data[525] = 1;
+    data[525] = u8::from(volatile_write_cache);
 
     data
 }
@@ -379,15 +380,17 @@ mod tests {
 
     #[test]
     fn identify_controller_cntlid_survives_a_one_character_serial() {
-        let data = build_identify_controller("X", "VMM NVMe", "1.0", 1, 5, 7);
+        let data =
+            build_identify_controller("X", "VMM NVMe", "1.0", 1, 5, 7, true);
         let cntlid = u16::from_le_bytes(data[78..80].try_into().unwrap());
         assert_eq!(cntlid, 7);
     }
 
     #[test]
     fn identify_controller_serial() {
-        let data =
-            build_identify_controller("SN001", "VMM NVMe", "1.0", 1, 5, 2);
+        let data = build_identify_controller(
+            "SN001", "VMM NVMe", "1.0", 1, 5, 2, true,
+        );
         let sn = std::str::from_utf8(&data[4..24]).unwrap();
         assert!(sn.starts_with("SN001"));
     }

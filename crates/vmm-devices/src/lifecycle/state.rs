@@ -194,6 +194,18 @@ pub struct NvmeMigrateState {
     pub num_io_queues: u16,
     pub pci: MigratePciState,
     pub msix: MsixMigrateState,
+    /// What the namespace showed the guest. A v2 source had one shape
+    /// only, 512-byte blocks and a volatile write cache, and sends none.
+    #[serde(default)]
+    pub namespace: Option<NvmeMigrateNamespace>,
+}
+
+/// The shape of an NVMe namespace. The guest's partition tables and
+/// flush habits depend on it, so a destination must show the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NvmeMigrateNamespace {
+    pub block_size: u32,
+    pub volatile_write_cache: bool,
 }
 
 /// NVMe submission queue state for migration.

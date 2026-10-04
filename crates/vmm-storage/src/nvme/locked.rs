@@ -49,7 +49,7 @@ impl Locked<'_> {
         let ctrl = self.ctrl;
         ctrl.counts.raising.fetch_add(1, Ordering::AcqRel);
         drop(guard);
-        irqs.raise(&ctrl.msix, ctrl.msi_policy);
+        irqs.raise(&ctrl.msix, ctrl.config.msi_policy);
         let guard = ctrl.state.lock().expect("nvme: state lock");
         ctrl.counts.raising.fetch_sub(1, Ordering::AcqRel);
         if guard.drain_waiters > 0 {

@@ -15,7 +15,9 @@
 /// Protocol identifier for the RON migration format.
 ///
 /// v3 carries the NVMe completions held for a full guest completion
-/// queue. A v2 source dropped those, so its payload restores with none.
+/// queue, and the shape of each NVMe namespace. A v2 source dropped the
+/// held completions and had one namespace shape, so its payload
+/// restores with none held and that shape.
 ///
 /// v2 carries the NVMe completion queue interrupt-enable bit. A v1 peer
 /// has no field for it, and a destination that assumes one restores a
