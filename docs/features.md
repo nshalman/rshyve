@@ -203,7 +203,7 @@ SCSI/MMC commands implemented: TEST UNIT READY, REQUEST SENSE, INQUIRY, START/ST
 
 ### zvol write cache
 
-Any writable virtio-blk or NVMe backing fd gets a best-effort `DKIOCGETWCE`/`DKIOCSETWCE` pass (`crates/vmm-devices/src/blkdev.rs:47`). Regular files and non-disk backing stores are skipped silently. The original value is restored on drop. Skipped entirely under `ro`. `ahci-cd` does not use it.
+Any writable virtio-blk or NVMe backing fd that is a disk device (char or block) is probed once at open with `DKIOCFLUSHWRITECACHE` (`crates/vmm-devices/src/blkdev.rs`). If the flush works, the write cache is turned on (`DKIOCSETWCE=1`) and every guest flush sends the ioctl. If it answers ENOTSUP or ENOTTY, the disk cannot flush: the write cache is turned off, and the disk is refused if the cache stays on. Guest flushes are then no-ops. Any other probe error refuses the disk. Regular files use fsync. The original cache state is restored on drop. Skipped entirely under `ro`. `ahci-cd` does not use it.
 
 ## Network
 

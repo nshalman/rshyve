@@ -229,7 +229,8 @@ fn parse_and_create_pci_device(
                 Arc::clone(vmm_hdl),
                 Arc::clone(bus_mmio),
                 log.new(slog::o!("component" => "nvme")),
-            );
+            )
+            .with_context(|| format!("failed to create nvme for: {path}"))?;
 
             chipset.try_attach_device(bdf, nvme.clone())?;
             info!(log, "nvme attached";

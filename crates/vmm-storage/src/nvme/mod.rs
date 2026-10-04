@@ -33,7 +33,7 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::PhysMap;
 use vmm_core::mmio::MmioBus;
 
-use vmm_devices::blkdev::{DiskCache, DiskSync};
+use vmm_devices::blkdev::DiskSync;
 use vmm_devices::lifecycle::{
     DeviceStateError, Indicator, NvmeMigrateCq, NvmeMigrateSq,
 };
@@ -85,7 +85,7 @@ pub(super) struct Geometry {
 /// What a controller is built from.
 ///
 /// Tests inject a recording MSI sink and a backend that stalls on
-/// demand; production passes the VM handle and the file itself.
+/// demand; production passes the VM handle and the disk itself.
 pub(super) struct NvmeParts {
     pub(super) disk: Arc<DiskSync>,
     pub(super) backend: Arc<dyn IoBackend>,
@@ -111,8 +111,6 @@ pub struct NvmeController {
     /// Weak self-reference for MMIO handler closures.
     pub(super) self_ref: Mutex<Option<std::sync::Weak<Self>>>,
     pub(super) log: slog::Logger,
-    /// Zvol write-cache control.
-    _cache: DiskCache,
     /// The backing store, kept for the durable flush.
     disk: Arc<DiskSync>,
     /// The I/O worker pool, joined by [`Self::stop_workers`].
@@ -135,7 +133,7 @@ impl NvmeController {
         physmap: Arc<PhysMap>,
         hdl: Arc<VmmHdl>,
         bus_mmio: Arc<MmioBus>,
-    ) -> Arc<Self> {
+    ) -> std::io::Result<Arc<Self>> {
         Self::new_with_logger(
             file,
             read_only,
@@ -157,12 +155,11 @@ impl NvmeController {
         hdl: Arc<VmmHdl>,
         bus_mmio: Arc<MmioBus>,
         log: slog::Logger,
-    ) -> Arc<Self> {
-        let disk = Arc::new(
-            DiskSync::new(Arc::new(file))
-                .expect("nvme: failed to stat backing file"),
-        );
-        Self::build(NvmeParts {
+    ) -> std::io::Result<Arc<Self>> {
+        // Sets the write cache before any I/O, so first writes already
+        // hit the fast path.
+        let disk = Arc::new(DiskSync::new(Arc::new(file), read_only)?);
+        Ok(Self::build(NvmeParts {
             backend: Arc::clone(&disk) as Arc<dyn IoBackend>,
             disk,
             read_only,
@@ -172,7 +169,7 @@ impl NvmeController {
             bus_mmio,
             fences: FENCE_BUDGETS,
             log,
-        })
+        }))
     }
 
     pub(super) fn build(parts: NvmeParts) -> Arc<Self> {
@@ -187,10 +184,6 @@ impl NvmeController {
             fences,
             log,
         } = parts;
-
-        // NVMe has explicit FLUSH semantics, so the zvol may run
-        // writeback. Set before any I/O so first writes hit the fast path.
-        let cache = DiskCache::new(Arc::clone(disk.file()), read_only);
 
         let file_len = disk
             .file()
@@ -282,7 +275,6 @@ impl NvmeController {
             registered_bar4: Mutex::new(None),
             self_ref: Mutex::new(None),
             log,
-            _cache: cache,
             disk,
             workers: Mutex::new(Vec::with_capacity(NUM_WORKERS)),
             geometry,
@@ -338,7 +330,7 @@ impl NvmeController {
     /// Disconnect the I/O channel and wait for the workers.
     ///
     /// Dropping the sender is the only thing that ends a worker, and
-    /// nothing else releases the backing fd or lets `DiskCache` put the
+    /// nothing else releases the backing fd or lets `DiskSync` put the
     /// zvol write cache back the way it found it.
     fn stop_workers(&self) {
         drop(self.io_tx.lock().expect("nvme: io_tx lock").take());

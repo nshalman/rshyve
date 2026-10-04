@@ -74,7 +74,7 @@ fn backing_file() -> std::fs::File {
 }
 
 fn backing_disk() -> Arc<DiskSync> {
-    Arc::new(DiskSync::new(Arc::new(backing_file())).expect("classify"))
+    Arc::new(DiskSync::new(Arc::new(backing_file()), false).expect("classify"))
 }
 
 /// A backend whose transfers the test controls.

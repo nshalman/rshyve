@@ -26,7 +26,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use vmm_devices::blkdev::{DiskCache, DiskSync};
+use vmm_devices::blkdev::DiskSync;
 use vmm_devices::lifecycle::Indicator;
 use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
 
@@ -146,8 +146,6 @@ pub struct VirtioBlock {
     interrupt: Arc<IntrSlot>,
     /// Per-queue completion handlers, created on first notification.
     completions: Mutex<Vec<Option<Arc<VirtioCompletion>>>>,
-    /// Zvol write-cache control.
-    _cache: DiskCache,
     /// The backing store. Shared with every worker, so the descriptor
     /// outlives a device that is dropped while a syscall is running.
     /// A worker holding a bare fd number would resume against whatever
@@ -218,11 +216,9 @@ impl VirtioBlock {
         // size the guest is told to align to, not the unit of either.
         let capacity = metadata.len() / bits::SECTOR_SIZE;
         let read_only = opts.read_only;
-        let disk = Arc::new(DiskSync::new(Arc::new(file))?);
-
-        // Enable zvol writeback cache (DKIOCSETWCE=1). Must happen before
-        // any I/O so the first guest writes already hit the fast path.
-        let cache = DiskCache::new(Arc::clone(disk.file()), read_only);
+        // Sets the write cache before any I/O, so first guest writes
+        // already hit the fast path.
+        let disk = Arc::new(DiskSync::new(Arc::new(file), read_only)?);
 
         // Workers per queue: NUM_WORKERS for single queue, 2 per queue for MQ.
         let limits = DiskLimits {
@@ -279,7 +275,6 @@ impl VirtioBlock {
             physmap,
             interrupt: Arc::new(IntrSlot::new()),
             completions: Mutex::new(completions),
-            _cache: cache,
             disk,
             indicator: Indicator::new(),
             gate,

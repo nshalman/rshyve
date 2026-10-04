@@ -24,7 +24,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Worker thread loop: reads I/O requests from the channel and executes them.
 ///
 /// The controller reference is weak so the worker pool never keeps the
-/// controller, its backing fd or its `DiskCache` alive.
+/// controller alive. The backend still holds the fd, so the write cache
+/// is restored only once every worker has exited.
 pub(super) fn io_worker(
     rx: Receiver<IoRequest>,
     backend: Arc<dyn IoBackend>,

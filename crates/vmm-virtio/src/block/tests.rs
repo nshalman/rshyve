@@ -39,7 +39,9 @@ fn detached_completion(
 }
 
 fn disk(file: File) -> Arc<DiskSync> {
-    Arc::new(DiskSync::new(Arc::new(file)).expect("classify backing file"))
+    Arc::new(
+        DiskSync::new(Arc::new(file), false).expect("classify backing file"),
+    )
 }
 
 /// A worker context wired to `physmap`, with a fresh session.
@@ -84,7 +86,6 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         physmap: Arc::new(PhysMap::new()),
         interrupt: Arc::new(IntrSlot::new()),
         completions: Mutex::new(Vec::new()),
-        _cache: DiskCache::new(Arc::clone(disk.file()), true),
         disk,
         indicator: Indicator::new(),
         gate: Arc::new(QuiesceGate::new(1)),
