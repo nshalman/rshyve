@@ -11,19 +11,37 @@ use vmm_devices::lifecycle::{
 use vmm_devices::pci::device::replay_migrate_pci_state;
 
 use super::bits::*;
-use super::queues::{CompQueue, SubQueue};
+use super::queues::{CompQueue, NvmeState, SubQueue};
 use super::NvmeController;
 
 impl NvmeController {
+    /// The controller's state, once every command the guest submitted
+    /// has finished.
+    ///
+    /// A command in a backend has left its SQ and has no completion in
+    /// a CQ, so a payload taken around it loses it for good.
     pub(super) fn export_state(
         &self,
     ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {
-        let st = self.state.lock().expect("nvme state lock");
+        let st = self.state.lock().expect("nvme: state lock");
+        let (mut st, drained) = self.drain_all(st, self.fences.reset);
+        let state = if drained {
+            Ok(self.snapshot(&st))
+        } else {
+            Err(DeviceStateError::Export(format!(
+                "{} commands still in flight",
+                st.in_flight()
+            )))
+        };
+        self.reopen(&mut st);
+        state
+    }
 
+    fn snapshot(&self, st: &NvmeState) -> Option<DeviceMigrateState> {
         // A disabled controller has no queues, so there is nothing for
         // the destination to put back.
         if (st.cc & CC_EN) == 0 {
-            return Ok(None);
+            return None;
         }
 
         let wire_sq = |sq: &SubQueue| NvmeMigrateSq {
@@ -50,7 +68,7 @@ impl NvmeController {
             "io_queues" => st.num_io_queues,
             "msix_enabled" => self.msix.is_enabled());
 
-        Ok(Some(DeviceMigrateState::Nvme(NvmeMigrateState {
+        Some(DeviceMigrateState::Nvme(NvmeMigrateState {
             cc: st.cc,
             csts: st.csts,
             aqa: st.aqa,
@@ -71,7 +89,7 @@ impl NvmeController {
             num_io_queues: st.num_io_queues,
             pci: self.pci_state.lock().expect("pci lock").migrate_state(),
             msix: self.msix.export_state(),
-        })))
+        }))
     }
 
     pub(super) fn restore_state(
@@ -89,6 +107,22 @@ impl NvmeController {
         // head and tail, so a payload the checks let through would
         // abort the VMM on the guest's first doorbell write.
         check_nvme_state(mig)?;
+        {
+            let st = self.state.lock().expect("nvme: state lock");
+            if mig.num_io_queues > st.max_io_queues {
+                return Err(DeviceStateError::invalid(format!(
+                    "num_io_queues {} is past the {} this backend serves",
+                    mig.num_io_queues, st.max_io_queues,
+                )));
+            }
+            // Their completions would be matched against queues the
+            // import is about to replace.
+            if st.in_flight() > 0 {
+                return Err(DeviceStateError::invalid(
+                    "the controller has commands in flight",
+                ));
+            }
+        }
 
         slog::info!(self.log, "nvme: restoring controller state";
             "cc" => format!("{:#x}", mig.cc),
@@ -103,7 +137,7 @@ impl NvmeController {
             .bar_replay_writes(&mig.pci.bar_addrs);
         replay_migrate_pci_state(self, &bar_writes, mig.pci.command);
 
-        let mut st = self.state.lock().expect("nvme state lock");
+        let mut st = self.state.lock().expect("nvme: state lock");
         st.cc = mig.cc;
         st.csts = mig.csts;
         st.aqa = mig.aqa;
@@ -134,13 +168,14 @@ impl NvmeController {
             instance,
         };
 
+        st.retire_queues();
         st.admin_sq = mig.admin_sq.as_ref().map(live_sq);
         st.admin_cq = mig.admin_cq.as_ref().map(live_cq);
-        for (slot, wire) in st.io_sqs.iter_mut().zip(&mig.io_sqs) {
-            *slot = wire.as_ref().map(live_sq);
+        for (idx, wire) in mig.io_sqs.iter().enumerate() {
+            st.set_sq(idx, wire.as_ref().map(live_sq));
         }
-        for (slot, wire) in st.io_cqs.iter_mut().zip(&mig.io_cqs) {
-            *slot = wire.as_ref().map(live_cq);
+        for (idx, wire) in mig.io_cqs.iter().enumerate() {
+            st.set_cq(idx, wire.as_ref().map(live_cq));
         }
         drop(st);
 
@@ -225,6 +260,19 @@ pub(super) fn check_nvme_state(
              {MAX_IO_QUEUES} of each",
             mig.io_sqs.len(),
             mig.io_cqs.len(),
+        )));
+    }
+
+    // Create I/O Queue refuses an id past the count Set Features
+    // granted, so no payload from a real source carries one.
+    fn used<T>(slots: &[Option<T>]) -> usize {
+        slots.iter().rposition(Option::is_some).map_or(0, |i| i + 1)
+    }
+    let count = usize::from(mig.num_io_queues);
+    if used(&mig.io_sqs) > count || used(&mig.io_cqs) > count {
+        return Err(DeviceStateError::invalid(format!(
+            "a queue id is past num_io_queues {}",
+            mig.num_io_queues,
         )));
     }
 

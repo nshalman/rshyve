@@ -15,6 +15,23 @@ use super::queues::{
 };
 use super::NvmeController;
 
+/// A deleted queue whose commands must finish before the Delete Queue
+/// completes.
+#[derive(Clone, Copy)]
+enum Fence {
+    Sq(usize),
+    Cq(usize),
+}
+
+impl Fence {
+    fn busy(self, st: &NvmeState) -> bool {
+        match self {
+            Self::Sq(idx) => st.inflight[idx].in_flight() > 0,
+            Self::Cq(idx) => st.cq_inflight[idx] > 0,
+        }
+    }
+}
+
 impl NvmeController {
     /// Process admin SQ doorbell: parse and execute admin commands inline.
     pub(super) fn admin_sq_doorbell(&self, new_tail: u16) {
@@ -94,19 +111,17 @@ impl NvmeController {
                 &mut st, &mem, opcode, nsid, prp1, prp2, cdw10, cdw11,
             );
 
-            // Held across the completion: the driver takes a Delete
-            // Queue completion as licence to reuse the queue's pages.
-            let _fence = if fence {
-                drop(st);
-                let held = self.fence_workers(self.fences.reset);
-                st = self.state.lock().expect("nvme: state lock");
-                if held.is_none() {
+            // The driver takes a Delete Queue completion as licence to
+            // reuse the queue's pages, so every command that could
+            // still touch them finishes first.
+            if let Some(fence) = fence {
+                let (next, drained) =
+                    self.drain(st, self.fences.reset, |st| fence.busy(st));
+                st = next;
+                if !drained {
                     st.fail_fence();
                 }
-                held
-            } else {
-                None
-            };
+            }
 
             if let Err(error) = post_completion(
                 &mem,
@@ -128,9 +143,9 @@ impl NvmeController {
 
     /// Process a single admin command.
     ///
-    /// Returns the status, the command-specific result, and whether the
-    /// completion must wait for the worker pool: Delete Queue may only
-    /// complete once the commands it took away have finished.
+    /// Returns the status, the command-specific result, and the queue
+    /// whose commands the completion must wait for: Delete Queue may
+    /// only complete once the commands it took away have finished.
     fn process_admin_cmd(
         &self,
         st: &mut NvmeState,
@@ -141,9 +156,15 @@ impl NvmeController {
         prp2: u64,
         cdw10: u32,
         cdw11: u32,
-    ) -> (u16, u32, bool) {
-        let deletes_a_queue =
-            matches!(opcode, ADMIN_OPC_DELETE_IO_SQ | ADMIN_OPC_DELETE_IO_CQ);
+    ) -> (u16, u32, Option<Fence>) {
+        let deleted =
+            io_queue_index((cdw10 & 0xFFFF) as u16).and_then(
+                |idx| match opcode {
+                    ADMIN_OPC_DELETE_IO_SQ => Some(Fence::Sq(idx)),
+                    ADMIN_OPC_DELETE_IO_CQ => Some(Fence::Cq(idx)),
+                    _ => None,
+                },
+            );
         let (status, cdw0) = match opcode {
             ADMIN_OPC_IDENTIFY => {
                 self.admin_identify(st, mem, nsid, prp1, prp2, cdw10)
@@ -170,7 +191,7 @@ impl NvmeController {
             }
             _ => (SC_INVALID_OPCODE | (SC_DNR), 0),
         };
-        (status, cdw0, deletes_a_queue && status == SC_SUCCESS)
+        (status, cdw0, deleted.filter(|_| status == SC_SUCCESS))
     }
 
     /// Get Log Page.
@@ -268,16 +289,19 @@ impl NvmeController {
         }
 
         let instance = st.next_instance();
-        st.io_cqs[idx] = Some(CompQueue {
-            base: prp1,
-            size: qsize,
-            head: 0,
-            tail: 0,
-            phase: true,
-            iv,
-            ien,
-            instance,
-        });
+        st.set_cq(
+            idx,
+            Some(CompQueue {
+                base: prp1,
+                size: qsize,
+                head: 0,
+                tail: 0,
+                phase: true,
+                iv,
+                ien,
+                instance,
+            }),
+        );
 
         (SC_SUCCESS, 0)
     }
@@ -321,14 +345,17 @@ impl NvmeController {
         }
 
         let instance = st.next_instance();
-        st.io_sqs[idx] = Some(SubQueue {
-            base: prp1,
-            size: qsize,
-            head: 0,
-            tail: 0,
-            cq_id,
-            instance,
-        });
+        st.set_sq(
+            idx,
+            Some(SubQueue {
+                base: prp1,
+                size: qsize,
+                head: 0,
+                tail: 0,
+                cq_id,
+                instance,
+            }),
+        );
 
         (SC_SUCCESS, 0)
     }
@@ -342,7 +369,8 @@ impl NvmeController {
         if st.io_sqs[idx].is_none() {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
-        st.io_sqs[idx] = None;
+        st.set_sq(idx, None);
+        st.throttled &= !(1u16 << idx);
         (SC_SUCCESS, 0)
     }
 
@@ -361,7 +389,7 @@ impl NvmeController {
                 return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
             }
         }
-        st.io_cqs[idx] = None;
+        st.set_cq(idx, None);
         (SC_SUCCESS, 0)
     }
 
@@ -399,7 +427,7 @@ impl NvmeController {
                 // Guest requests N SQs and N CQs (0-based in CDW11)
                 let requested_sq = (cdw11 & 0xFFFF) + 1;
                 let requested_cq = ((cdw11 >> 16) & 0xFFFF) + 1;
-                let max = MAX_IO_QUEUES as u32;
+                let max = u32::from(st.max_io_queues);
                 let alloc_sq = requested_sq.min(max);
                 let alloc_cq = requested_cq.min(max);
                 st.num_io_queues = alloc_sq.min(alloc_cq) as u16;

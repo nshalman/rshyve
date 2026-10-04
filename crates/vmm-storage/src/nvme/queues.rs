@@ -5,11 +5,14 @@
 //! Queue state and completion posting.
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use vmm_core::mem::MemCtx;
 use vmm_devices::pci::msix::MsixTable;
 
 use super::bits::*;
+use super::inflight::SqSlots;
 
 /// One queue as the driver created it.
 ///
@@ -51,6 +54,51 @@ pub(super) struct CompQueue {
     pub(super) instance: QueueInstance,
 }
 
+/// The instance each I/O queue slot holds now, readable without the
+/// state lock. Zero is no queue.
+#[derive(Default)]
+pub(super) struct QueueEpochs {
+    sq: [AtomicU64; MAX_IO_QUEUES],
+    cq: [AtomicU64; MAX_IO_QUEUES],
+}
+
+impl QueueEpochs {
+    pub(super) fn is_current(
+        &self,
+        sq: usize,
+        sq_instance: QueueInstance,
+        cq: usize,
+        cq_instance: QueueInstance,
+    ) -> bool {
+        let live = |slots: &[AtomicU64], idx: usize, want: QueueInstance| {
+            slots
+                .get(idx)
+                .is_some_and(|e| e.load(Ordering::Acquire) == want)
+        };
+        live(&self.sq, sq, sq_instance) && live(&self.cq, cq, cq_instance)
+    }
+}
+
+/// Who may put commands on the backend.
+///
+/// Checked and changed only under the state lock, so a drain that
+/// counts nothing in flight cannot be overtaken by an admission.
+#[derive(Default)]
+pub(super) struct Admission {
+    /// The control plane paused the device.
+    pub(super) paused: bool,
+    /// Resets, shutdowns, flushes and exports waiting for a drain.
+    pub(super) draining: u32,
+    /// The backend is stopped for good.
+    pub(super) halted: bool,
+}
+
+impl Admission {
+    pub(super) fn is_open(&self) -> bool {
+        !self.paused && self.draining == 0 && !self.halted
+    }
+}
+
 pub(super) fn io_queue_index(qid: u16) -> Option<usize> {
     let idx = usize::from(qid.checked_sub(1)?);
     (idx < MAX_IO_QUEUES).then_some(idx)
@@ -81,6 +129,8 @@ pub(super) struct NvmeState {
 
     // Configuration
     pub(super) num_io_queues: u16,
+    /// The I/O queues the backend serves, the most Set Features grants.
+    pub(super) max_io_queues: u16,
 
     /// Source of [`QueueInstance`] values. Never reset, so an instance
     /// is unique for the life of the controller.
@@ -89,6 +139,19 @@ pub(super) struct NvmeState {
     /// Whether a fence deadline passed with a worker still able to
     /// reach guest memory. Sticky: see [`Self::fail_fence`].
     pub(super) fence_failed: bool,
+
+    pub(super) admission: Admission,
+    /// Per I/O SQ, the commands it has admitted.
+    pub(super) inflight: [SqSlots; MAX_IO_QUEUES],
+    /// Per I/O CQ, the admitted commands that will complete into it.
+    pub(super) cq_inflight: [u32; MAX_IO_QUEUES],
+    /// I/O SQs that stopped at their depth, one bit each.
+    pub(super) throttled: u16,
+    /// Source of [`super::backend::RequestId`] serials.
+    pub(super) serial: u64,
+    pub(super) epochs: Arc<QueueEpochs>,
+    /// Threads waiting in a drain, so a completion knows to wake one.
+    pub(super) drain_waiters: u32,
 }
 
 impl NvmeState {
@@ -97,12 +160,38 @@ impl NvmeState {
     pub(super) fn retire_queues(&mut self) {
         self.admin_sq = None;
         self.admin_cq = None;
-        for sq in &mut self.io_sqs {
-            *sq = None;
+        for idx in 0..MAX_IO_QUEUES {
+            self.set_sq(idx, None);
+            self.set_cq(idx, None);
         }
-        for cq in &mut self.io_cqs {
-            *cq = None;
-        }
+        self.throttled = 0;
+    }
+
+    /// Put `sq` in I/O SQ slot `idx`. Every change goes through here so
+    /// a request in a backend can tell its queue is gone.
+    pub(super) fn set_sq(&mut self, idx: usize, sq: Option<SubQueue>) {
+        let Some(slot) = self.io_sqs.get_mut(idx) else {
+            return;
+        };
+        let instance = sq.as_ref().map_or(0, |q| q.instance);
+        *slot = sq;
+        self.epochs.sq[idx].store(instance, Ordering::Release);
+    }
+
+    /// The same for I/O CQ slot `idx`.
+    pub(super) fn set_cq(&mut self, idx: usize, cq: Option<CompQueue>) {
+        let Some(slot) = self.io_cqs.get_mut(idx) else {
+            return;
+        };
+        let instance = cq.as_ref().map_or(0, |q| q.instance);
+        *slot = cq;
+        self.epochs.cq[idx].store(instance, Ordering::Release);
+    }
+
+    /// Commands every I/O SQ has admitted and the backend has not
+    /// finished.
+    pub(super) fn in_flight(&self) -> u32 {
+        self.inflight.iter().map(SqSlots::in_flight).sum()
     }
 
     pub(super) fn next_instance(&mut self) -> QueueInstance {
@@ -213,7 +302,6 @@ pub(super) fn valid_queue_base(prp1: u64) -> bool {
     prp1 != 0 && (prp1 & 0xFFF) == 0
 }
 
-#[cfg(test)]
 impl Default for NvmeState {
     fn default() -> Self {
         Self {
@@ -230,8 +318,16 @@ impl Default for NvmeState {
             ctrl_ident: [0u8; IDENT_CTRL_SIZE],
             ns_ident: [0u8; IDENT_NS_SIZE],
             num_io_queues: MAX_IO_QUEUES as u16,
+            max_io_queues: MAX_IO_QUEUES as u16,
             instances: 0,
             fence_failed: false,
+            admission: Admission::default(),
+            inflight: Default::default(),
+            cq_inflight: [0; MAX_IO_QUEUES],
+            throttled: 0,
+            serial: 0,
+            epochs: Arc::default(),
+            drain_waiters: 0,
         }
     }
 }

@@ -13,7 +13,7 @@
 use std::io;
 
 use vmm_core::common::PAGE_SIZE;
-use vmm_core::mem::{GuestIoVec, MemCtx};
+use vmm_core::mem::{GuestIoVec, MemCtx, SubMapping};
 
 const PAGE_OFFSET: u64 = PAGE_SIZE as u64 - 1;
 const ENTRIES_PER_LIST: u64 = PAGE_SIZE as u64 / 8;
@@ -148,4 +148,68 @@ pub(super) fn write_to_prp(
         offset += len;
     }
     Ok(())
+}
+
+/// Walk the PRPs of a `len`-byte transfer, one mapped run at a time.
+fn for_each_run(
+    mem: &MemCtx,
+    prp1: u64,
+    prp2: u64,
+    len: usize,
+    mut f: impl FnMut(&SubMapping, std::ops::Range<usize>) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut walk = PrpWalk::new(mem, prp1, prp2, len);
+    let mut offset = 0usize;
+    while let Some((gpa, seg)) = walk.next_segment()? {
+        let sub = mem
+            .lookup(gpa, seg)
+            .ok_or_else(|| invalid("PRP names unmapped memory"))?;
+        let end = offset
+            .checked_add(seg)
+            .ok_or_else(|| invalid("PRP walk overran the transfer"))?;
+        f(&sub, offset..end)?;
+        offset = end;
+    }
+    Ok(())
+}
+
+/// Copy the `len` bytes the PRPs name into `dst`.
+///
+/// A plain copy: the driver gave these pages to the device, so a torn
+/// read only tears data the guest itself is still changing.
+pub(super) fn copy_from_prp(
+    mem: &MemCtx,
+    prp1: u64,
+    prp2: u64,
+    len: usize,
+    dst: &mut [u8],
+) -> io::Result<()> {
+    if dst.len() != len {
+        return Err(invalid("buffer is not the transfer length"));
+    }
+    for_each_run(mem, prp1, prp2, len, |sub, range| {
+        let part = dst
+            .get_mut(range)
+            .ok_or_else(|| invalid("PRP walk overran the transfer"))?;
+        sub.copy_out(part)
+    })
+}
+
+/// Copy `src` into the `len` bytes the PRPs name.
+pub(super) fn copy_to_prp(
+    mem: &MemCtx,
+    prp1: u64,
+    prp2: u64,
+    len: usize,
+    src: &[u8],
+) -> io::Result<()> {
+    if src.len() != len {
+        return Err(invalid("buffer is not the transfer length"));
+    }
+    for_each_run(mem, prp1, prp2, len, |sub, range| {
+        let part = src
+            .get(range)
+            .ok_or_else(|| invalid("PRP walk overran the transfer"))?;
+        sub.copy_in(part)
+    })
 }

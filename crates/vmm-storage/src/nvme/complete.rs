@@ -1,0 +1,186 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Finishing commands, and the drains that wait for them.
+
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, MutexGuard, Weak};
+use std::time::{Duration, Instant};
+
+use vmm_core::mem::MemCtx;
+
+use super::backend::{BlockStatus, CompletionSink, RequestId};
+use super::bits::*;
+use super::inflight::Admitted;
+use super::queues::{io_queue_index, post_completion, NvmeState};
+use super::NvmeController;
+
+/// The sink a backend completes into.
+///
+/// Weak, so a backend's threads never keep the controller, and with it
+/// the backend, alive.
+pub(super) struct Completions(pub(super) Weak<NvmeController>);
+
+impl CompletionSink for Completions {
+    fn complete(&self, done: &[(RequestId, BlockStatus)]) {
+        if let Some(ctrl) = self.0.upgrade() {
+            ctrl.complete(done);
+        }
+    }
+}
+
+/// Whether the queues a command was admitted on are still the ones
+/// the driver has. A completion for a queue it deleted or reset would
+/// land in a ring it has given to something else.
+fn current(st: &NvmeState, idx: usize, cmd: &Admitted) -> bool {
+    let sq_live = st.io_sqs[idx]
+        .as_ref()
+        .is_some_and(|sq| sq.instance == cmd.sq_instance);
+    let cq_live = io_queue_index(cmd.cq_id)
+        .and_then(|cq_idx| st.io_cqs[cq_idx].as_ref())
+        .is_some_and(|cq| cq.instance == cmd.cq_instance);
+    sq_live && cq_live
+}
+
+impl NvmeController {
+    fn complete(&self, done: &[(RequestId, BlockStatus)]) {
+        let mem = MemCtx::new(Arc::clone(&self.physmap));
+        let mut st = self.state.lock().expect("nvme: state lock");
+        for &(id, status) in done {
+            let Some(cmd) = io_queue_index(id.queue)
+                .and_then(|idx| st.inflight[idx].finish(id.tag, id.serial))
+            else {
+                // A backend fault, not the guest's: the command it
+                // meant to finish is still waiting.
+                slog::warn!(self.log, "nvme: completion for no command";
+                    "queue" => id.queue, "tag" => id.tag);
+                continue;
+            };
+            self.post(&mut st, &mem, id, cmd, status.nvme(cmd.opcode));
+        }
+        self.after_finish(&mut st);
+    }
+
+    /// Finish a command the controller ends itself, before a backend
+    /// sees it.
+    pub(super) fn finish_now(
+        &self,
+        st: &mut NvmeState,
+        mem: &MemCtx,
+        id: RequestId,
+        status: u16,
+    ) {
+        if let Some(cmd) = io_queue_index(id.queue)
+            .and_then(|idx| st.inflight[idx].finish(id.tag, id.serial))
+        {
+            self.post(st, mem, id, cmd, status);
+        }
+    }
+
+    /// Take a finished command out of flight and write its completion,
+    /// unless its queues are gone.
+    fn post(
+        &self,
+        st: &mut NvmeState,
+        mem: &MemCtx,
+        id: RequestId,
+        cmd: Admitted,
+        status: u16,
+    ) {
+        let Some(idx) = io_queue_index(id.queue) else {
+            return;
+        };
+        let cq_idx = io_queue_index(cmd.cq_id);
+        if let Some(count) = cq_idx.and_then(|i| st.cq_inflight.get_mut(i)) {
+            *count = count.saturating_sub(1);
+        }
+        self.counts.retired();
+        if st.drain_waiters > 0 {
+            self.drained.notify_all();
+        }
+
+        if let (true, Some(cq_idx)) = (current(st, idx, &cmd), cq_idx) {
+            let sq_head = st.io_sqs[idx].as_ref().map_or(0, |sq| sq.head);
+            if let Err(error) = post_completion(
+                mem,
+                &self.msix,
+                &mut st.io_cqs[cq_idx],
+                0,
+                id.queue,
+                sq_head,
+                cmd.cid,
+                status,
+            ) {
+                // The driver will never see this command finish.
+                slog::error!(self.log, "nvme: I/O CQE write failed";
+                    "error" => %error);
+                st.csts |= CSTS_CFS;
+            }
+        }
+        st.inflight[idx].release(id.tag);
+    }
+
+    /// Admit again on queues that stopped at their depth and now have
+    /// room.
+    fn after_finish(&self, st: &mut NvmeState) {
+        let throttled = st.throttled;
+        for idx in 0..MAX_IO_QUEUES {
+            if throttled & (1u16 << idx) != 0
+                && st.inflight[idx].has_room(self.depth)
+            {
+                self.admit(st, idx);
+            }
+        }
+    }
+
+    /// Wait, with the state lock released, until `busy` turns false or
+    /// `budget` passes. Returns the lock and whether `busy` turned
+    /// false.
+    pub(super) fn drain<'a>(
+        &'a self,
+        mut st: MutexGuard<'a, NvmeState>,
+        budget: Duration,
+        busy: impl Fn(&NvmeState) -> bool,
+    ) -> (MutexGuard<'a, NvmeState>, bool) {
+        self.counts.drains.fetch_add(1, Ordering::Relaxed);
+        let deadline = Instant::now() + budget;
+        st.drain_waiters += 1;
+        let done = loop {
+            if !busy(&st) {
+                break true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break false;
+            }
+            st = self
+                .drained
+                .wait_timeout(st, left)
+                .expect("nvme: state lock")
+                .0;
+        };
+        st.drain_waiters -= 1;
+        (st, done)
+    }
+
+    /// Close admission and wait for every command in flight.
+    ///
+    /// Admission stays closed until [`Self::reopen`], whether or not the
+    /// drain finished.
+    pub(super) fn drain_all<'a>(
+        &'a self,
+        mut st: MutexGuard<'a, NvmeState>,
+        budget: Duration,
+    ) -> (MutexGuard<'a, NvmeState>, bool) {
+        st.admission.draining += 1;
+        self.drain(st, budget, |st| st.in_flight() > 0)
+    }
+
+    /// End a [`Self::drain_all`], and admit what the guest queued
+    /// while it ran.
+    pub(super) fn reopen(&self, st: &mut NvmeState) {
+        st.admission.draining -= 1;
+        self.admit_all(st);
+    }
+}

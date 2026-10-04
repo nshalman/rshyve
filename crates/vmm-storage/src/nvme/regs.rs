@@ -12,7 +12,7 @@ use vmm_core::mmio::MmioFn;
 use vmm_devices::pci::device::PciDevice;
 use vmm_devices::pci::BarN;
 
-use vmm_devices::{FlushIntent, Lifecycle};
+use vmm_devices::FlushIntent;
 
 use super::bits::*;
 use super::queues::{io_queue_index, valid_queue_base, CompQueue, SubQueue};
@@ -85,8 +85,8 @@ impl NvmeController {
             self.doorbell_rw(offset, rwo);
             return;
         }
-        // A CC transition fences the worker pool, which cannot happen
-        // under the state lock: a worker needs it to finish.
+        // A CC transition waits for the commands in flight, which
+        // cannot happen under the state lock: a completion needs it.
         if let (REG_CC, RWOp::Write(wo)) = (offset, &rwo) {
             self.write_cc(wo.read_u32());
             return;
@@ -177,7 +177,7 @@ impl NvmeController {
     /// Apply a CC write and whichever controller transition it asks for.
     ///
     /// Runs without the state lock held so a disable or a shutdown can
-    /// wait for the workers.
+    /// wait for the commands in flight.
     fn write_cc(&self, new_cc: u32) {
         let old_cc = self.state.lock().expect("nvme: state lock").cc;
         let was_enabled = (old_cc & CC_EN) != 0;
@@ -268,29 +268,30 @@ impl NvmeController {
 
     /// Take the controller down.
     ///
-    /// The queues go first so nothing new is admitted, then the fence
-    /// waits for the transfers already moving guest memory: the driver
-    /// is free to reuse those pages once RDY clears. The drain is held
-    /// until RDY is clear, so nothing is admitted in between.
+    /// The queues go first, so a command that finishes from here on
+    /// completes into nothing, and admission stays closed while every
+    /// command in flight finishes: the driver is free to reuse their
+    /// pages once RDY clears, and a backend must not hold one of them
+    /// into the next enable.
     fn disable(&self, new_cc: u32) {
-        self.state.lock().expect("nvme: state lock").retire_queues();
-        let fence = self.fence_workers(self.fences.reset);
+        let mut st = self.state.lock().expect("nvme: state lock");
+        st.retire_queues();
+        let (mut st, drained) = self.drain_all(st, self.fences.reset);
         // The messages the PBA holds name a driver that is gone; left
         // in place they leave on the next unmask.
         self.msix.clear_pending();
-
-        let mut st = self.state.lock().expect("nvme: state lock");
         st.cc = new_cc;
-        if fence.is_none() {
+        if drained {
+            st.csts &= !CSTS_RDY;
+            // A controller reset returns the shutdown status to normal.
+            st.set_shst(SHST_NORMAL);
+        } else {
             // RDY stays set. Clearing it is what tells the driver the
-            // pages a worker still holds are free to reuse, and the
+            // pages a backend still holds are free to reuse, and the
             // reset it would report never happened.
             st.fail_fence();
-            return;
         }
-        st.csts &= !CSTS_RDY;
-        // A controller reset returns the shutdown status to normal.
-        st.set_shst(SHST_NORMAL);
+        self.reopen(&mut st);
     }
 
     /// Carry out a shutdown notification.
@@ -299,22 +300,23 @@ impl NvmeController {
     /// nothing may still be in flight and the write cache the Identify
     /// data advertises has to be on stable storage first.
     fn shutdown(&self, new_cc: u32) {
-        {
-            let mut st = self.state.lock().expect("nvme: state lock");
-            st.cc = new_cc;
-            st.set_shst(SHST_OCCURRING);
-            st.retire_queues();
-        }
+        let mut st = self.state.lock().expect("nvme: state lock");
+        st.cc = new_cc;
+        st.set_shst(SHST_OCCURRING);
+        st.retire_queues();
 
-        // Held across the flush and the status write, so the shutdown
-        // the driver reads as complete covers every transfer. Without
-        // it the status is a guess.
-        let Some(_fence) = self.fence_workers(self.fences.shutdown) else {
-            self.state.lock().expect("nvme: state lock").fail_fence();
+        // Admission stays closed across the flush and the status
+        // write, so the shutdown the driver reads as complete covers
+        // every command.
+        let (mut st, drained) = self.drain_all(st, self.fences.shutdown);
+        if !drained {
+            st.fail_fence();
+            self.reopen(&mut st);
             return;
-        };
+        }
+        drop(st);
 
-        let flushed = self.flush_backing(FlushIntent::Durable);
+        let flushed = self.backend.flush(FlushIntent::Durable);
         if let Err(error) = &flushed {
             slog::error!(self.log, "nvme: shutdown flush failed";
                 "error" => %error);
@@ -323,9 +325,10 @@ impl NvmeController {
         let mut st = self.state.lock().expect("nvme: state lock");
         if flushed.is_err() {
             st.csts |= CSTS_CFS;
-            return;
+        } else {
+            st.set_shst(SHST_COMPLETE);
         }
-        st.set_shst(SHST_COMPLETE);
+        self.reopen(&mut st);
     }
 
     /// Whether a guest queue base may hold `entries` entries.

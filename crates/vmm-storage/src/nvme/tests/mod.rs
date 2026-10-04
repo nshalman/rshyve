@@ -4,7 +4,7 @@
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use vmm_core::common::{RWOp, ReadOp, WriteOp, PAGE_SIZE};
@@ -13,13 +13,20 @@ use vmm_core::mmio::MmioBus;
 use vmm_devices::pci::device::PciDevice;
 use vmm_devices::pci::msix::MsiSink;
 use vmm_devices::pci::BarN;
-use vmm_devices::{Lifecycle, QuiesceGate};
+use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
 
+use super::backend::{
+    AsyncBackend, BackendFactory, BlockOp, BlockRequest, BlockStatus,
+    CompletionSink,
+};
 use super::bits::*;
+use super::pool::WorkerPool;
 use super::queues::NvmeState;
 use super::{FenceBudgets, NvmeController, NvmeParts, FENCE_BUDGETS};
 
 mod admin;
+mod backend;
+mod barrier;
 mod io;
 mod lifecycle;
 mod migrate;
@@ -199,6 +206,116 @@ impl super::io::IoBackend for TestBackend {
     }
 }
 
+/// An async backend that keeps what it is given until the test says
+/// to finish it, and then finishes it from a thread of its own, the way
+/// a ring backend's completion thread would.
+struct Manual {
+    sink: OnceLock<Arc<dyn CompletionSink>>,
+    disk: Mutex<Vec<u8>>,
+    queued: Mutex<Vec<BlockRequest>>,
+    /// The queue of every request ever submitted, in order.
+    queues: Mutex<Vec<u16>>,
+    depth: u16,
+}
+
+impl Manual {
+    fn new(depth: u16) -> Arc<Self> {
+        Arc::new(Self {
+            sink: OnceLock::new(),
+            disk: Mutex::new(
+                (0..BACKING_BLOCKS * 512).map(backing_byte).collect(),
+            ),
+            queued: Mutex::new(Vec::new()),
+            queues: Mutex::new(Vec::new()),
+            depth,
+        })
+    }
+
+    fn factory(self: &Arc<Self>) -> BackendFactory {
+        let me = Arc::clone(self);
+        Box::new(move |sink| {
+            assert!(me.sink.set(sink).is_ok(), "one controller per backend");
+            Arc::new(ManualBackend(me)) as Arc<dyn AsyncBackend>
+        })
+    }
+
+    fn queued(&self) -> usize {
+        self.queued.lock().expect("queued lock").len()
+    }
+
+    fn submitted_queues(&self) -> Vec<u16> {
+        self.queues.lock().expect("queues lock").clone()
+    }
+
+    /// Take what is queued without finishing it.
+    fn take(&self) -> Vec<BlockRequest> {
+        std::mem::take(&mut *self.queued.lock().expect("queued lock"))
+    }
+
+    /// Move one request's data and say how it went.
+    fn run(&self, req: &BlockRequest) -> BlockStatus {
+        let start = req.byte_offset() as usize;
+        let end = start + req.data().len();
+        let mut disk = self.disk.lock().expect("disk lock");
+        let moved = match req.op() {
+            BlockOp::Read => req.data().copy_to_guest(&disk[start..end]),
+            BlockOp::Write { .. } => {
+                req.data().copy_from_guest(&mut disk[start..end])
+            }
+            BlockOp::Flush => Ok(()),
+        };
+        match moved {
+            Ok(()) => BlockStatus::Success,
+            Err(_) => BlockStatus::DataTransfer,
+        }
+    }
+
+    /// Finish every queued request in one call to the sink, from a
+    /// thread that is not the caller's.
+    fn complete_all(self: &Arc<Self>) {
+        let reqs = self.take();
+        let me = Arc::clone(self);
+        std::thread::spawn(move || {
+            let done: Vec<_> =
+                reqs.iter().map(|req| (req.id(), me.run(req))).collect();
+            me.sink().complete(&done);
+        })
+        .join()
+        .expect("completion thread");
+    }
+
+    fn sink(&self) -> &Arc<dyn CompletionSink> {
+        self.sink.get().expect("the controller gave a sink")
+    }
+}
+
+struct ManualBackend(Arc<Manual>);
+
+impl AsyncBackend for ManualBackend {
+    fn capacity(&self) -> u64 {
+        BACKING_BLOCKS * 512
+    }
+
+    fn queue_depth(&self) -> u16 {
+        self.0.depth
+    }
+
+    fn submit(&self, req: BlockRequest) {
+        self.0
+            .queues
+            .lock()
+            .expect("queues lock")
+            .push(req.id().queue());
+        self.0.queued.lock().expect("queued lock").push(req);
+    }
+
+    fn flush(&self, _intent: FlushIntent) -> Result<(), FlushError> {
+        Ok(())
+    }
+
+    fn halt(&self) {}
+}
+
 impl Harness {
     /// A harness whose transfers the returned backend controls.
     fn held() -> (Self, Arc<TestBackend>) {
@@ -245,11 +362,27 @@ impl Harness {
         read_only: bool,
         fences: FenceBudgets,
     ) -> Self {
+        let log = slog::Logger::root(slog::Discard, slog::o!());
+        let backend = WorkerPool::factory(file, backend, read_only, log)
+            .expect("worker pool");
+        Self::from_factory(backend, read_only, fences)
+    }
+
+    /// A harness over the [`Manual`] backend the test drives.
+    fn manual(manual: &Arc<Manual>) -> Self {
+        Self::from_factory(manual.factory(), false, FENCE_BUDGETS)
+    }
+
+    fn from_factory(
+        backend: BackendFactory,
+        read_only: bool,
+        fences: FenceBudgets,
+    ) -> Self {
+        let log = slog::Logger::root(slog::Discard, slog::o!());
         let physmap =
             Arc::new(PhysMap::new_anon(0, GUEST_RAM).expect("anon guest RAM"));
         let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
         let ctrl = NvmeController::build(NvmeParts {
-            file,
             backend,
             read_only,
             instance_id: 1,
@@ -257,7 +390,7 @@ impl Harness {
             msi: Arc::clone(&sink) as Arc<dyn MsiSink>,
             bus_mmio: Arc::new(MmioBus::new()),
             fences,
-            log: slog::Logger::root(slog::Discard, slog::o!()),
+            log,
         });
         ctrl.msix.set_enabled(true);
         for v in 0..NVME_MSIX_COUNT {
@@ -447,6 +580,18 @@ impl Harness {
     fn msi_count(&self) -> usize {
         self.sink.0.lock().expect("sink lock").len()
     }
+
+    /// Poll the quiesce query the way the control plane does.
+    fn wait_quiesced(&self, budget: Duration) -> bool {
+        let start = Instant::now();
+        while !self.ctrl.is_quiesced() {
+            if start.elapsed() >= budget {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -567,4 +712,27 @@ fn io_submit(h: &mut Harness, tail: &mut u16, sqe: Sqe, cid: u16) {
 /// Write a PRP list entry at `gpa`.
 fn put_prp(h: &Harness, gpa: u64, entry: u64) {
     h.mem().write(gpa, &entry.to_le_bytes()).expect("PRP entry");
+}
+
+const SQ2: u64 = 0x32000;
+const CQ2: u64 = 0x42000;
+
+/// Write `sqe` into slot `slot` of the SQ at `sq_base`, ringing nothing.
+fn put_sqe(h: &Harness, sq_base: u64, slot: u16, sqe: Sqe, cid: u16) {
+    let entry = sq_base + u64::from(slot) * SQE_SIZE as u64;
+    h.mem().write(entry, &sqe.encode(cid)).expect("write SQE");
+}
+
+/// Submit `sqe` on I/O queue `qid`, whose SQ is at `sq_base`.
+fn submit_on(
+    h: &Harness,
+    qid: u16,
+    sq_base: u64,
+    tail: &mut u16,
+    sqe: Sqe,
+    cid: u16,
+) {
+    put_sqe(h, sq_base, *tail, sqe, cid);
+    *tail = (*tail + 1) % IO_QDEPTH;
+    h.sq_doorbell(qid, *tail);
 }

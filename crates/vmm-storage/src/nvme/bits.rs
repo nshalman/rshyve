@@ -172,8 +172,14 @@ pub const SC_INVALID_FIELD: u16 = 0x0002;
 pub const SC_DATA_XFER_ERROR: u16 = 0x0004;
 pub const SC_INTERNAL_ERROR: u16 = 0x0006;
 pub const SC_INVALID_NS: u16 = 0x000B;
-/// I/O command set specific generic status, NVMe 1.4 figure 127.
+// I/O command set specific generic status, NVMe 1.4 figure 127.
+pub const SC_LBA_OUT_OF_RANGE: u16 = 0x0080;
+pub const SC_CAPACITY_EXCEEDED: u16 = 0x0081;
 pub const SC_WRITE_TO_RO_RANGE: u16 = 0x0082;
+
+// Media and data integrity errors, NVMe 1.4 figure 130: SCT=2.
+pub const SC_WRITE_FAULT: u16 = 0x0280;
+pub const SC_UNRECOVERED_READ: u16 = 0x0281;
 
 // Command specific status, NVMe 1.4 figure 128. Bits 10:8 carry the
 // status code type, so these read as SCT=1, SC=n.

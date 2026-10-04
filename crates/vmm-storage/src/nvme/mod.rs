@@ -5,29 +5,33 @@
 //! NVMe 1.0 controller with one namespace.
 //!
 //! Admin commands run on the vCPU that rang the doorbell. I/O commands
-//! go through a channel to a pool of worker threads that move data
-//! straight between the backing file and the guest pages named by the
-//! PRPs, then post the completion and raise MSI-X.
+//! go to an [`AsyncBackend`](backend::AsyncBackend), which completes
+//! them later from a thread of its own; the controller then writes the
+//! completion and raises MSI-X. By default the backend is a pool of
+//! worker threads moving data straight between the backing file and
+//! the guest pages the PRPs name.
 //!
 //! BAR0 holds the registers and doorbells, BAR4 the MSI-X table.
 
+pub mod backend;
 pub mod bits;
 
 mod admin;
+mod complete;
+mod inflight;
 mod io;
 mod migrate;
+mod pool;
 mod prp;
 mod queues;
 mod regs;
-mod workers;
 
 #[cfg(test)]
 mod tests;
 
 use std::fs::File;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use vmm_core::common::RWOp;
@@ -35,27 +39,24 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::PhysMap;
 use vmm_core::mmio::MmioBus;
 
-use vmm_devices::blkdev::DiskCache;
 use vmm_devices::lifecycle::{DeviceStateError, Indicator};
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use vmm_devices::pci::msix::{HdlMsiSink, MsiSink, MsixTable};
 use vmm_devices::pci::BarN;
-use vmm_devices::quiesce::DrainScope;
-use vmm_devices::{
-    DeviceMigrateState, FlushError, FlushIntent, Lifecycle, QuiesceGate,
-};
+use vmm_devices::{DeviceMigrateState, FlushError, FlushIntent, Lifecycle};
 
+use backend::{AsyncBackend, BackendFactory};
 use bits::*;
-use io::{IoBackend, IoRequest};
+use complete::Completions;
+use io::IoBackend;
+use pool::WorkerPool;
 use queues::NvmeState;
-use workers::io_worker;
 
-/// Matches the C bhyve blockif thread count.
-const NUM_WORKERS: usize = 8;
+#[cfg(test)]
+use pool::NUM_WORKERS;
 
-/// How long a controller transition waits for the transfers already
-/// moving guest memory.
+/// How long a controller transition waits for the commands in flight.
 #[derive(Clone, Copy)]
 pub(super) struct FenceBudgets {
     /// A controller reset or a Delete Queue command.
@@ -85,8 +86,7 @@ pub(super) struct Geometry {
 /// Tests inject a recording MSI sink and a backend that stalls on
 /// demand; production passes the VM handle and the file itself.
 pub(super) struct NvmeParts {
-    pub(super) file: Arc<File>,
-    pub(super) backend: Arc<dyn IoBackend>,
+    pub(super) backend: BackendFactory,
     pub(super) read_only: bool,
     pub(super) instance_id: u8,
     pub(super) physmap: Arc<PhysMap>,
@@ -96,12 +96,42 @@ pub(super) struct NvmeParts {
     pub(super) log: slog::Logger,
 }
 
+/// Counters the quiesce query reads without the state lock.
+///
+/// Changed only under the state lock, so they agree with it there.
+#[derive(Default)]
+struct Counts {
+    /// Commands admitted and not yet finished, every queue.
+    in_flight: AtomicUsize,
+    paused: AtomicBool,
+    /// Drains ever started, so a test can tell a drain from the idle
+    /// short cut.
+    drains: AtomicUsize,
+}
+
+impl Counts {
+    fn admitted(&self) {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn retired(&self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn quiesced(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+            && self.in_flight.load(Ordering::Acquire) == 0
+    }
+}
+
 /// NVMe 1.0 controller implementing the PCI device trait.
 pub struct NvmeController {
     pub(super) pci_state: Mutex<DeviceState>,
     pub(super) msix: Arc<MsixTable>,
     state: Mutex<NvmeState>,
-    io_tx: Mutex<Option<mpsc::Sender<IoRequest>>>,
+    /// Woken when a command leaves flight while a drain waits.
+    drained: Condvar,
+    backend: Arc<dyn AsyncBackend>,
     pub(super) physmap: Arc<PhysMap>,
     pub(super) bus_mmio: Arc<MmioBus>,
     pub(super) registered_bar0: Mutex<Option<u64>>,
@@ -109,15 +139,12 @@ pub struct NvmeController {
     /// Weak self-reference for MMIO handler closures.
     pub(super) self_ref: Mutex<Option<std::sync::Weak<Self>>>,
     pub(super) log: slog::Logger,
-    /// Zvol write-cache control.
-    _cache: DiskCache,
-    /// The backing store, kept for the durable flush.
-    file: Arc<File>,
-    /// The I/O worker pool, joined by [`Self::stop_workers`].
-    workers: Mutex<Vec<thread::JoinHandle<()>>>,
     pub(super) geometry: Geometry,
+    read_only: bool,
+    /// The most commands one I/O SQ may have admitted at once.
+    depth: u16,
     indicator: Indicator,
-    pub(super) gate: Arc<QuiesceGate>,
+    counts: Counts,
     pub(super) fences: FenceBudgets,
 }
 
@@ -157,9 +184,15 @@ impl NvmeController {
         log: slog::Logger,
     ) -> Arc<Self> {
         let file = Arc::new(file);
+        let backend = WorkerPool::factory(
+            Arc::clone(&file),
+            file as Arc<dyn IoBackend>,
+            read_only,
+            log.clone(),
+        )
+        .expect("nvme: failed to stat backing file");
         Self::build(NvmeParts {
-            backend: Arc::clone(&file) as Arc<dyn IoBackend>,
-            file,
+            backend,
             read_only,
             instance_id,
             physmap,
@@ -172,7 +205,6 @@ impl NvmeController {
 
     pub(super) fn build(parts: NvmeParts) -> Arc<Self> {
         let NvmeParts {
-            file,
             backend,
             read_only,
             instance_id,
@@ -183,182 +215,125 @@ impl NvmeController {
             log,
         } = parts;
 
-        // NVMe has explicit FLUSH semantics, so the zvol may run
-        // writeback. Set before any I/O so first writes hit the fast path.
-        let cache = DiskCache::new(Arc::clone(&file), read_only);
-
-        let file_len = file
-            .metadata()
-            .expect("nvme: failed to stat backing file")
-            .len();
-        let block_size: u32 = 512;
-        let geometry = Geometry {
-            block_size,
-            total_blocks: file_len / u64::from(block_size),
-        };
-
-        let serial = format!("TRITON-NVME-{:04}", instance_id);
-        let ctrl_ident = build_identify_controller(
-            &serial,
-            "Triton VMM NVMe Controller",
-            "1.0.0",
-            1,
-            MDTS_LOG2_PAGES,
-            // One controller per instance, and CNTLID 0 is reserved.
-            u16::from(instance_id) + 1,
-        );
-        let ns_ident = build_identify_namespace(
-            geometry.total_blocks,
-            block_size,
-            read_only,
-        );
-
-        // CQR: contiguous queues only. TO: 500 ms. DSTRD, MPSMIN and
-        // MPSMAX are zero: 4-byte doorbells, 4 KiB pages.
-        let cap: u64 = (u64::from(MAX_QUEUE_SIZE - 1) << CAP_MQES_SHIFT)
-            | CAP_CQR
-            | (1u64 << CAP_TO_SHIFT)
-            | CAP_CSS_NVM;
-
-        let ident = DeviceIdent {
-            vendor_id: PCI_VENDOR_ID,
-            device_id: PCI_DEVICE_ID,
-            class: PCI_CLASS_STORAGE,
-            subclass: PCI_SUBCLASS_NVM,
-            prog_if: PCI_PROGIF_NVME,
-            revision: 1,
-            sub_vendor_id: PCI_VENDOR_ID,
-            sub_device_id: PCI_DEVICE_ID,
-        };
-
-        let mut pci_state = DeviceState::new(ident);
-        // A 32-bit BAR0 keeps the firmware placing it in the 3-4 GiB
-        // MMIO gap, where EPT traps reliably.
-        pci_state.define_bar(BarN::BAR0, BarDefine::Mmio(BAR0_SIZE as u32));
-
         let msix = Arc::new(MsixTable::new(NVME_MSIX_COUNT, msi));
-        let msix_bar_size = msix.bar_size() as u32;
-        pci_state.define_bar(
-            BarN::BAR4,
-            BarDefine::Mmio(msix_bar_size.next_power_of_two().max(4096)),
-        );
-        pci_state.set_cap_ptr(MSIX_CAP_OFFSET);
+        let pci_state = pci_header(&msix);
 
-        let nvme_state = NvmeState {
-            cap,
-            cc: 0,
-            csts: 0,
-            aqa: 0,
-            asq_base: 0,
-            acq_base: 0,
-            admin_sq: None,
-            admin_cq: None,
-            io_sqs: Default::default(),
-            io_cqs: Default::default(),
-            ctrl_ident,
-            ns_ident,
-            num_io_queues: MAX_IO_QUEUES as u16,
-            instances: 0,
-            fence_failed: false,
-        };
-
-        let (tx, rx) = mpsc::channel::<IoRequest>();
-        let gate = Arc::new(QuiesceGate::new(NUM_WORKERS));
-
-        let ctrl = Arc::new(Self {
-            pci_state: Mutex::new(pci_state),
-            msix: Arc::clone(&msix),
-            state: Mutex::new(nvme_state),
-            io_tx: Mutex::new(Some(tx)),
-            physmap: Arc::clone(&physmap),
-            bus_mmio,
-            registered_bar0: Mutex::new(None),
-            registered_bar4: Mutex::new(None),
-            self_ref: Mutex::new(None),
-            log,
-            _cache: cache,
-            file,
-            workers: Mutex::new(Vec::with_capacity(NUM_WORKERS)),
-            geometry,
-            indicator: Indicator::new(),
-            gate: Arc::clone(&gate),
-            fences,
-        });
-        *ctrl.self_ref.lock().expect("self_ref lock") =
-            Some(Arc::downgrade(&ctrl));
-
-        let rx = Arc::new(Mutex::new(rx));
-        let mut workers = Vec::with_capacity(NUM_WORKERS);
-        for i in 0..NUM_WORKERS {
-            let rx = Arc::clone(&rx);
-            let weak = Arc::downgrade(&ctrl);
-            let gate = Arc::clone(&gate);
-            let backend = Arc::clone(&backend);
-
-            workers.push(
-                thread::Builder::new()
-                    .name(format!("nvme-io-{}", i))
-                    .spawn(move || {
-                        io_worker(rx, backend, read_only, weak, gate);
-                    })
-                    .expect("nvme: failed to spawn I/O worker thread"),
+        Arc::new_cyclic(|weak| {
+            let backend = backend(Arc::new(Completions(weak.clone())));
+            let block_size: u32 = 512;
+            let geometry = Geometry {
+                block_size,
+                total_blocks: backend.capacity() / u64::from(block_size),
+            };
+            // A depth of 0 would admit nothing and stall every queue.
+            let depth = backend.queue_depth().max(1);
+            let state = initial_state(
+                backend.as_ref(),
+                geometry,
+                instance_id,
+                read_only,
             );
-        }
-        *ctrl.workers.lock().expect("nvme: workers lock") = workers;
 
-        ctrl
+            Self {
+                pci_state: Mutex::new(pci_state),
+                msix,
+                state: Mutex::new(state),
+                drained: Condvar::new(),
+                backend,
+                physmap,
+                bus_mmio,
+                registered_bar0: Mutex::new(None),
+                registered_bar4: Mutex::new(None),
+                self_ref: Mutex::new(Some(weak.clone())),
+                log,
+                geometry,
+                read_only,
+                depth,
+                indicator: Indicator::new(),
+                counts: Counts::default(),
+                fences,
+            }
+        })
     }
 
-    /// Hold the workers off until the transfers already moving guest
-    /// memory have finished.
-    ///
-    /// Call with the state lock dropped: a worker needs it to post its
-    /// completion before it can park. The returned scope keeps new work
-    /// off the pool, so the caller holds it until it has published the
-    /// transition the fence protects. `None` means the budget passed
-    /// with a worker still able to reach guest pages.
-    #[must_use]
-    pub(super) fn fence_workers(
-        &self,
-        budget: Duration,
-    ) -> Option<DrainScope<'_>> {
-        let drain = self.gate.drain_scope();
-        if self.gate.wait_quiesced(budget) {
-            return Some(drain);
-        }
-        slog::error!(self.log, "nvme: I/O workers did not stop for a reset");
-        None
+    /// Drains started on this controller, ever.
+    #[cfg(test)]
+    pub(super) fn drain_count(&self) -> usize {
+        self.counts.drains.load(Ordering::Relaxed)
     }
+}
 
-    /// Disconnect the I/O channel and wait for the workers.
-    ///
-    /// Dropping the sender is the only thing that ends a worker, and
-    /// nothing else releases the backing fd or lets `DiskCache` put the
-    /// zvol write cache back the way it found it.
-    fn stop_workers(&self) {
-        drop(self.io_tx.lock().expect("nvme: io_tx lock").take());
-        // A parked worker never reaches the channel to see it close.
-        self.gate.resume();
-        let workers =
-            std::mem::take(&mut *self.workers.lock().expect("workers lock"));
-        // A worker that held the last reference runs this from `Drop`,
-        // so its own handle is in the list. Joining the running thread
-        // would deadlock; it is on its way out either way.
-        let me = thread::current().id();
-        for worker in workers {
-            if worker.thread().id() == me {
-                continue;
-            }
-            if worker.join().is_err() {
-                slog::error!(self.log, "nvme: I/O worker panicked");
-            }
-        }
+/// The PCI header: BAR0 for registers and doorbells, BAR4 for MSI-X.
+fn pci_header(msix: &MsixTable) -> DeviceState {
+    let mut pci_state = DeviceState::new(DeviceIdent {
+        vendor_id: PCI_VENDOR_ID,
+        device_id: PCI_DEVICE_ID,
+        class: PCI_CLASS_STORAGE,
+        subclass: PCI_SUBCLASS_NVM,
+        prog_if: PCI_PROGIF_NVME,
+        revision: 1,
+        sub_vendor_id: PCI_VENDOR_ID,
+        sub_device_id: PCI_DEVICE_ID,
+    });
+    // A 32-bit BAR0 keeps the firmware placing it in the 3-4 GiB MMIO
+    // gap, where EPT traps reliably.
+    pci_state.define_bar(BarN::BAR0, BarDefine::Mmio(BAR0_SIZE as u32));
+    let msix_bar_size = msix.bar_size() as u32;
+    pci_state.define_bar(
+        BarN::BAR4,
+        BarDefine::Mmio(msix_bar_size.next_power_of_two().max(4096)),
+    );
+    pci_state.set_cap_ptr(MSIX_CAP_OFFSET);
+    pci_state
+}
+
+/// Registers and Identify data for a controller that has never been
+/// enabled.
+fn initial_state(
+    backend: &dyn AsyncBackend,
+    geometry: Geometry,
+    instance_id: u8,
+    read_only: bool,
+) -> NvmeState {
+    let serial = format!("TRITON-NVME-{:04}", instance_id);
+    let ctrl_ident = build_identify_controller(
+        &serial,
+        "Triton VMM NVMe Controller",
+        "1.0.0",
+        1,
+        MDTS_LOG2_PAGES,
+        // One controller per instance, and CNTLID 0 is reserved.
+        u16::from(instance_id) + 1,
+    );
+    let ns_ident = build_identify_namespace(
+        geometry.total_blocks,
+        geometry.block_size,
+        read_only,
+    );
+
+    // CQR: contiguous queues only. TO: 500 ms. DSTRD, MPSMIN and MPSMAX
+    // are zero: 4-byte doorbells, 4 KiB pages.
+    let cap: u64 = (u64::from(MAX_QUEUE_SIZE - 1) << CAP_MQES_SHIFT)
+        | CAP_CQR
+        | (1u64 << CAP_TO_SHIFT)
+        | CAP_CSS_NVM;
+
+    let max_queues = backend.max_queues().clamp(1, MAX_IO_QUEUES as u16);
+    NvmeState {
+        cap,
+        ctrl_ident,
+        ns_ident,
+        num_io_queues: max_queues,
+        max_io_queues: max_queues,
+        ..NvmeState::default()
     }
 }
 
 impl Drop for NvmeController {
     fn drop(&mut self) {
-        self.stop_workers();
+        // Nothing else releases the backing fd or lets the backend put
+        // the zvol write cache back the way it found it.
+        self.backend.halt();
     }
 }
 
@@ -473,27 +448,58 @@ impl Lifecycle for NvmeController {
         Ok(())
     }
 
+    /// Close admission: the doorbell handler records the tail and
+    /// takes nothing until [`Self::resume`].
     fn pause(&self) {
         self.indicator.pause();
-        self.gate.pause();
+        let mut st = self.state.lock().expect("nvme: state lock");
+        st.admission.paused = true;
+        self.counts.paused.store(true, Ordering::Release);
     }
 
     fn is_quiesced(&self) -> bool {
-        self.gate.is_quiesced()
+        self.counts.quiesced()
     }
 
+    /// Open admission, and take what the guest queued while paused:
+    /// its doorbells are spent, and only a doorbell starts the submit
+    /// path otherwise.
     fn resume(&self) {
-        self.gate.resume();
+        let mut st = self.state.lock().expect("nvme: state lock");
+        st.admission.paused = false;
+        self.counts.paused.store(false, Ordering::Release);
+        self.admit_all(&mut st);
+        drop(st);
         self.indicator.resume();
     }
 
     fn halt(&self) {
         self.indicator.halt();
-        self.stop_workers();
+        self.state
+            .lock()
+            .expect("nvme: state lock")
+            .admission
+            .halted = true;
+        self.backend.halt();
     }
 
+    /// Wait for every command in flight, then make the backend durable.
+    ///
+    /// Admission stays closed across both, so the flush covers every
+    /// write the guest has seen complete.
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
-        vmm_devices::quiesce::flush_file(&self.gate, &self.file, intent, "nvme")
+        let st = self.state.lock().expect("nvme: state lock");
+        let budget = vmm_devices::quiesce::quiesce_budget(intent);
+        let (st, drained) = self.drain_all(st, budget);
+        let result = if drained {
+            drop(st);
+            self.backend.flush(intent)
+        } else {
+            drop(st);
+            Err(FlushError::NotQuiesced("nvme"))
+        };
+        self.reopen(&mut self.state.lock().expect("nvme: state lock"));
+        result
     }
 
     fn export_migrate_state(
