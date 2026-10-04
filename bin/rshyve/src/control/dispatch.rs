@@ -46,9 +46,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             r.num_cpus = Some(ctrl.num_cpus);
             r.memory_bytes = Some(ctrl.mem_size);
             r.uptime_secs = Some(ctrl.start_time.elapsed().as_secs());
-            if ctrl.release_stuck() {
-                r.data = Some(serde_json::json!({ "release_stuck": true }));
-            }
+            r.data = stuck_data(ctrl.release_stuck());
             r
         }
 
@@ -296,6 +294,11 @@ fn latch_stop(
 /// holding the whole guest memory, and no other command reaches that
 /// state. `stop` is what releases it. A stop on `Stopping` retries a
 /// release an earlier one could not make.
+/// What `status` adds for a stop that cannot give its pause back.
+fn stuck_data(stuck: bool) -> Option<serde_json::Value> {
+    stuck.then(|| serde_json::json!({ "release_stuck": true }))
+}
+
 fn stop_refusal(
     state: VmRunState,
     migrated_away: bool,
@@ -475,8 +478,8 @@ mod tests {
     use super::{
         added, cpu_added, cpu_list, device_list, hot_add_blocked,
         hotplug_disabled, mem_added, mem_list, removing, resume_from,
-        stop_refusal, window_json, MemWindowReport, CPU_HOTPLUG_OFF,
-        MEM_HOTPLUG_OFF, NO_CPU_REMOVE, NO_MEM_REMOVE,
+        stop_refusal, stuck_data, window_json, MemWindowReport,
+        CPU_HOTPLUG_OFF, MEM_HOTPLUG_OFF, NO_CPU_REMOVE, NO_MEM_REMOVE,
     };
 
     /// A stand-in CPU set. Every step of a real add is an ioctl, so a
@@ -959,5 +962,21 @@ mod tests {
             );
         }
         assert_eq!(stop_refusal(VmRunState::ImportCommitted, false), None);
+    }
+
+    #[test]
+    fn status_reports_a_stuck_release_beside_the_state() {
+        // `data` is flattened into the line.
+        let mut stuck = Response::ok();
+        stuck.state = Some(VmRunState::Stopping);
+        stuck.data = stuck_data(true);
+        assert_eq!(
+            line(stuck),
+            r#"{"success":true,"state":"stopping","release_stuck":true}"#
+        );
+
+        let mut fine = Response::ok();
+        fine.data = stuck_data(false);
+        assert_eq!(line(fine), r#"{"success":true}"#);
     }
 }

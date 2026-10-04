@@ -493,6 +493,7 @@ impl VmController {
             || self.run.must_reap(),
             || self.release_migrated_source(),
             |stuck| self.release_stuck.store(stuck, Ordering::Release),
+            || vmm_machine::exit_wedged(RELEASE_WEDGED, &self.log),
             &self.log,
         );
     }
@@ -500,7 +501,8 @@ impl VmController {
     /// A held pause the reaper has failed to give back past its fast
     /// tries. The VM may sit in `stopping` until it works.
     fn release_stuck(&self) -> bool {
-        self.release_stuck.load(Ordering::Acquire)
+        // The reaper sees a release made elsewhere only between retries.
+        self.release_stuck.load(Ordering::Acquire) && self.run.must_reap()
     }
 
     /// End a VM whose guest now runs on another host, or give back a
@@ -590,6 +592,8 @@ impl VmController {
         resume_device_set(&self.named_devices());
     }
 }
+
+const RELEASE_WEDGED: &str = "a held pause would not release";
 
 impl LeaseOwner for VmController {
     fn abandon(&self) {
