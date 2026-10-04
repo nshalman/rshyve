@@ -9,10 +9,10 @@
 //! one, with defaults that match what the old source did. Anything older
 //! is refused: a peer that reads a field as something else resumes a
 //! guest on state that is not its own.
-//!
-//! A source offers an older version only while that version's decoder
-//! skips every new field, and [`payload_refusal`] stops any value the
-//! old destination would read as something else.
+
+use vmm_devices::lifecycle::{
+    DeviceMigrateState, DeviceStatePayload, NvmeMigrateBackend,
+};
 
 /// Protocol identifier for the RON migration format.
 ///
@@ -72,10 +72,6 @@ pub fn select_protocol(offer: &[String]) -> Option<&'static str> {
         .into_iter()
         .find(|ours| offer.iter().any(|theirs| theirs == ours))
 }
-
-use vmm_devices::lifecycle::{
-    DeviceMigrateState, DeviceStatePayload, NvmeMigrateBackend,
-};
 
 /// Page size used for dirty tracking (4 KiB).
 pub use vmm_core::common::PAGE_SIZE;
