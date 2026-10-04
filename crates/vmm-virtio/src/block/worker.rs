@@ -17,9 +17,11 @@ use vmm_core::mem::PhysMap;
 use vmm_devices::QuiesceGate;
 
 use super::access::BackendBarrier;
+use super::budget::{self, Budget, Charge};
 use super::io::{self, BOUNCE_BYTES};
 use super::{bits, discard, probes, ChainBuf, DiskLimits};
 use crate::access::{GuestAccess, RingTag};
+use crate::pci::notify::KickSlot;
 use crate::queue::VirtioCompletion;
 
 /// Completions a worker gathers before it takes the `VirtioCompletion`
@@ -38,6 +40,8 @@ pub(super) struct BlkIoRequest {
     /// drops the request when it no longer matches: the chain and the
     /// completion both point at a ring the driver has since torn down.
     pub(super) tag: RingTag,
+    /// Budget the request holds until it is dropped.
+    pub(super) _charge: Charge,
 }
 
 /// A one-shot hook a test installs to pin an interleaving.
@@ -52,6 +56,9 @@ pub(super) struct WorkerParks {
     /// Reached where a request is about to call the backing store,
     /// with no guest-access permission held.
     pub(super) at_backend: ParkSlot,
+    /// Reached at the same point by every request, and never cleared.
+    /// Stands in for a slow disk.
+    pub(super) each_backend: ParkSlot,
     /// Reached with the guest side of a pass finished and its used
     /// entries not yet published.
     pub(super) before_publish: ParkSlot,
@@ -69,6 +76,15 @@ fn run_park(slot: &ParkSlot) {
     }
 }
 
+/// Run a hook that stays installed, if a test installed one.
+#[cfg(test)]
+fn run_each(slot: &ParkSlot) {
+    let hook = slot.lock().expect("park lock poisoned").clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// State every I/O worker shares with the device.
 #[derive(Clone)]
 pub(super) struct WorkerCtx {
@@ -79,6 +95,10 @@ pub(super) struct WorkerCtx {
     /// Keeps a write admitted before a reset from overtaking one the
     /// next driver sends to the same sector.
     pub(super) backend: Arc<BackendBarrier>,
+    /// Work the device has taken from its rings and not finished.
+    pub(super) budget: Arc<Budget>,
+    /// Drains a ring that gave chains back for want of budget.
+    pub(super) kick: Arc<KickSlot>,
     #[cfg(test)]
     pub(super) parks: Arc<WorkerParks>,
 }
@@ -219,6 +239,18 @@ fn run_batch(
     }
 
     publish(ctx, &completion, tag, done);
+    kick_starved(ctx);
+}
+
+/// Drain the rings that wait for the budget this pass gave back.
+///
+/// Runs with no guest-access permission held: a kick takes the
+/// transport lock, and a ring reprogram waits for permission while it
+/// holds that lock.
+fn kick_starved(ctx: &WorkerCtx) {
+    for queue_idx in budget::queues(ctx.budget.take_kicks()) {
+        ctx.kick.kick(queue_idx);
+    }
 }
 
 /// Publish the finished results, then raise the interrupt outside the
@@ -311,7 +343,10 @@ fn read_request(
         {
             let _ticket = ctx.backend.admit(&ctx.access, req.tag, false)?;
             #[cfg(test)]
-            run_park(&ctx.parks.at_backend);
+            {
+                run_park(&ctx.parks.at_backend);
+                run_each(&ctx.parks.each_backend);
+            }
             // A short read or an error leaves the tail of the buffer
             // holding the last request, so nothing is copied out.
             if !io::read_backend(file, at, buf) {
@@ -366,7 +401,10 @@ fn write_request(
         };
         let _ticket = ctx.backend.admit(&ctx.access, req.tag, true)?;
         #[cfg(test)]
-        run_park(&ctx.parks.at_backend);
+        {
+            run_park(&ctx.parks.at_backend);
+            run_each(&ctx.parks.each_backend);
+        }
         if !io::write_backend(file, at, buf) {
             return Some((bits::VIRTIO_BLK_S_IOERR, 1));
         }

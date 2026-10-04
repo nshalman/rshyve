@@ -18,6 +18,7 @@ use crate::pci::intr::{IntrGate, IntrSession};
 mod barrier;
 mod bounce;
 mod get_id;
+mod inflight;
 mod multiqueue;
 mod reset;
 
@@ -49,6 +50,8 @@ fn worker_ctx_queues(physmap: &Arc<PhysMap>, num_queues: usize) -> WorkerCtx {
         gate: Arc::new(QuiesceGate::new(1)),
         access: Arc::new(GuestAccess::new(num_queues)),
         backend: Arc::new(BackendBarrier::new()),
+        budget: Budget::new(budget::INFLIGHT_BYTES),
+        kick: Arc::new(KickSlot::new()),
         parks: Arc::new(WorkerParks::default()),
     }
 }

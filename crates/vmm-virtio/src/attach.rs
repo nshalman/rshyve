@@ -103,6 +103,8 @@ pub fn virtio_blk(
     // Workers raise through the transport so the interrupt takes the
     // MSI-X vector when the guest enabled it, and INTx otherwise.
     pci_dev.device().install_interrupt(pci_dev.backend_intr());
+    // A worker drains a ring it left chains in for want of budget.
+    pci_dev.device().install_kick(pci_dev.backend_kick());
 
     Ok(pci_dev)
 }
