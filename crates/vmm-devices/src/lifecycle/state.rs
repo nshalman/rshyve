@@ -194,6 +194,21 @@ pub struct NvmeMigrateState {
     pub num_io_queues: u16,
     pub pci: MigratePciState,
     pub msix: MsixMigrateState,
+    /// `None` from a v2 source, whose only shape was 512-byte blocks and
+    /// a volatile write cache.
+    #[serde(default)]
+    pub namespace: Option<NvmeMigrateNamespace>,
+}
+
+/// A destination must show the same namespace: the guest's partition
+/// tables, flush habits and mounts depend on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NvmeMigrateNamespace {
+    pub block_size: u32,
+    pub volatile_write_cache: bool,
+    /// NSZE, in blocks.
+    pub total_blocks: u64,
+    pub read_only: bool,
 }
 
 /// NVMe submission queue state for migration.
@@ -219,4 +234,17 @@ pub struct NvmeMigrateCq {
     /// poll queue has none, and restoring one as interrupting sends the
     /// destination guest a message it never armed a handler for.
     pub ien: bool,
+    /// Completions waiting for a free guest CQ slot, oldest first. Empty
+    /// from a v2 source, which dropped them.
+    #[serde(default)]
+    pub held: Vec<NvmeMigrateCqe>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NvmeMigrateCqe {
+    pub sqid: u16,
+    pub cid: u16,
+    /// The status field without its phase bit.
+    pub status: u16,
+    pub cdw0: u32,
 }

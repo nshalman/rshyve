@@ -6,9 +6,11 @@
 //! must satisfy before any of it reaches the live queues.
 
 use super::*;
-use vmm_devices::lifecycle::{NvmeMigrateCq, NvmeMigrateSq};
+use vmm_devices::lifecycle::{
+    NvmeMigrateCq, NvmeMigrateCqe, NvmeMigrateSq, NvmeMigrateState,
+};
 
-use crate::nvme::check_nvme_state;
+use crate::nvme::migrate::check_nvme_state;
 
 struct NvmeQuiesceTestDevice {
     gate: Arc<QuiesceGate>,
@@ -26,8 +28,8 @@ impl Lifecycle for NvmeQuiesceTestDevice {
 
 /// A controller payload with one admin queue pair and one I/O
 /// queue pair, all of it valid.
-fn good_payload() -> vmm_devices::lifecycle::NvmeMigrateState {
-    vmm_devices::lifecycle::NvmeMigrateState {
+fn good_payload() -> NvmeMigrateState {
+    NvmeMigrateState {
         cc: CC_EN,
         csts: 1,
         aqa: 0x003F_003F,
@@ -48,6 +50,7 @@ fn good_payload() -> vmm_devices::lifecycle::NvmeMigrateState {
             phase: true,
             iv: 0,
             ien: true,
+            held: Vec::new(),
         }),
         io_sqs: vec![Some(NvmeMigrateSq {
             base: 0x3000,
@@ -64,10 +67,12 @@ fn good_payload() -> vmm_devices::lifecycle::NvmeMigrateState {
             phase: true,
             iv: 1,
             ien: true,
+            held: Vec::new(),
         })],
         num_io_queues: 1,
         pci: Default::default(),
         msix: Default::default(),
+        namespace: None,
     }
 }
 
@@ -172,6 +177,7 @@ fn a_polled_completion_queue_stays_polled_across_a_migration() {
 
     let mut dst = Harness::new();
     dst.ctrl.restore_migrate_state(&state).expect("restore");
+    dst.ctrl.resume();
 
     let before = dst.msi_count();
     let mut tail = 0;
@@ -373,4 +379,267 @@ fn nlb_overflow_checked_mul() {
     let nlb: u16 = 128;
     let block_size: u32 = 512;
     assert_eq!((nlb as u64).checked_mul(u64::from(block_size)), Some(65536));
+}
+
+fn copy_ram(src: &Harness, dst: &Harness, gpa: u64, len: usize) {
+    dst.mem()
+        .write(gpa, &src.read_guest(gpa, len))
+        .expect("copy guest RAM");
+}
+
+fn export(h: &Harness) -> vmm_devices::DeviceMigrateState {
+    h.ctrl
+        .export_migrate_state()
+        .expect("export")
+        .expect("an enabled controller has state")
+}
+
+/// Commands the guest queued while the source was paused have no
+/// doorbell left to ring on the destination.
+#[test]
+fn a_restored_controller_runs_what_the_guest_left_queued_on_resume() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    src.ctrl.pause();
+    for slot in 0..2u16 {
+        put_sqe(
+            &src,
+            SQ1,
+            slot,
+            Sqe::read(u64::from(slot), 1, 0x50000, 0),
+            slot,
+        );
+    }
+    src.sq_doorbell(1, 2);
+    let state = export(&src);
+
+    let manual = Manual::new(IO_QDEPTH);
+    let dst = Harness::manual(&manual);
+    copy_ram(&src, &dst, SQ1, 2 * SQE_SIZE);
+    dst.ctrl.restore_migrate_state(&state).expect("restore");
+    assert_eq!(manual.queued(), 0, "a restore started I/O before resume");
+
+    dst.ctrl.resume();
+    assert_eq!(manual.queued(), 2, "resume left the commands queued");
+    manual.complete_all();
+    assert_eq!(dst.wait_cqe(CQ1, 0, true).cid, 0);
+    assert_eq!(dst.wait_cqe(CQ1, 1, true).cid, 1);
+}
+
+/// The destination must not touch the disk before the source commits,
+/// and a doorbell is the one way left to start the submit path.
+#[test]
+fn a_restored_controller_admits_nothing_before_resume() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let state = export(&src);
+
+    let manual = Manual::new(IO_QDEPTH);
+    let dst = Harness::manual(&manual);
+    dst.ctrl.restore_migrate_state(&state).expect("restore");
+    put_sqe(&dst, SQ1, 0, Sqe::read(0, 1, 0x50000, 0), 0x61);
+    dst.sq_doorbell(1, 1);
+
+    assert_eq!(manual.queued(), 0, "I/O ran before the commit");
+    assert!(dst.ctrl.is_quiesced());
+    dst.ctrl.resume();
+    assert_eq!(manual.queued(), 1);
+}
+
+fn nvme(state: vmm_devices::DeviceMigrateState) -> NvmeMigrateState {
+    match state {
+        vmm_devices::DeviceMigrateState::Nvme(state) => state,
+        other => panic!("not NVMe state: {other:?}"),
+    }
+}
+
+fn held(sqid: u16, cid: u16) -> NvmeMigrateCqe {
+    NvmeMigrateCqe {
+        sqid,
+        cid,
+        status: 0,
+        cdw0: 0,
+    }
+}
+
+#[test]
+fn held_completions_cross_a_migration() {
+    let manual = Manual::new(IO_QDEPTH);
+    let mut src = Harness::manual(&manual);
+    src.enable();
+    src.create_io_queues_sized(1, IO_QDEPTH, 2, SQ1, CQ1);
+    let mut tail = 0;
+    for cid in [0x71, 0x72] {
+        submit_on(&src, 1, SQ1, &mut tail, Sqe::read(0, 1, 0x50000, 0), cid);
+    }
+    manual.complete_all();
+    src.ctrl.pause();
+    let state = export(&src);
+    let cq = nvme(state.clone()).io_cqs[0].clone().expect("CQ 1");
+    assert_eq!(cq.held, vec![held(1, 0x72)]);
+
+    let dst = Harness::new();
+    copy_ram(&src, &dst, CQ1, 2 * CQE_SIZE);
+    dst.ctrl.restore_migrate_state(&state).expect("restore");
+    dst.ctrl.resume();
+    assert_eq!(dst.read_guest(CQ1 + CQE_SIZE as u64, CQE_SIZE), vec![0; 16]);
+
+    dst.cq_doorbell(1, 1);
+    let cqe = dst.wait_cqe(CQ1, 1, true);
+    assert_eq!((cqe.cid, cqe.sqid), (0x72, 1));
+    assert_eq!(cqe.status(), Status::SUCCESS);
+}
+
+#[test]
+fn a_held_completion_for_an_sq_that_posts_elsewhere_is_refused() {
+    let mut payload = good_payload();
+    payload.admin_cq.as_mut().expect("admin cq").held = vec![held(1, 9)];
+    let error = check_nvme_state(&payload).expect_err("SQ 1 posts to CQ 1");
+    assert!(error.to_string().contains("does not post"), "{error}");
+
+    let mut payload = good_payload();
+    payload.io_cqs[0].as_mut().expect("io cq").held = vec![held(2, 9)];
+    check_nvme_state(&payload).expect_err("there is no SQ 2");
+
+    let mut payload = good_payload();
+    payload.io_cqs[0].as_mut().expect("io cq").held = vec![held(1, 9)];
+    payload.admin_cq.as_mut().expect("admin cq").held = vec![held(0, 3)];
+    check_nvme_state(&payload).expect("both post where they are held");
+}
+
+#[test]
+fn a_held_status_wider_than_a_cqe_is_refused() {
+    let mut payload = good_payload();
+    payload.io_cqs[0].as_mut().expect("io cq").held = vec![NvmeMigrateCqe {
+        status: 0x8000,
+        ..held(1, 9)
+    }];
+    let error = check_nvme_state(&payload).expect_err("status bit 15");
+    assert!(error.to_string().contains("does not fit"), "{error}");
+}
+
+#[test]
+fn more_held_completions_than_the_local_depth_are_refused() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut state = nvme(export(&src));
+    state.io_cqs[0].as_mut().expect("CQ 1").held =
+        vec![held(1, 1), held(1, 2), held(1, 3)];
+
+    let manual = Manual::new(2);
+    let dst = Harness::manual(&manual);
+    let error = dst
+        .ctrl
+        .restore_migrate_state(&vmm_devices::DeviceMigrateState::Nvme(state))
+        .expect_err("three held, depth two");
+    assert!(error.to_string().contains("depth"), "{error}");
+}
+
+/// An I/O SQ posting to CQ 0 would put I/O completions, held ones
+/// included, in the admin ring.
+#[test]
+fn an_io_sq_that_posts_to_the_admin_cq_is_refused() {
+    let mut payload = good_payload();
+    payload.io_sqs[0].as_mut().expect("io sq").cq_id = 0;
+    let error = check_nvme_state(&payload).expect_err("I/O SQ on CQ 0");
+    assert!(error.to_string().contains("other kind"), "{error}");
+
+    payload.admin_cq.as_mut().expect("admin cq").held = vec![held(1, 9)];
+    check_nvme_state(&payload).expect_err("held I/O CQE in the admin CQ");
+
+    let mut payload = good_payload();
+    payload.admin_sq.as_mut().expect("admin sq").cq_id = 1;
+    check_nvme_state(&payload).expect_err("admin SQ on an I/O CQ");
+}
+
+/// Their completions would be matched against the queues the import
+/// replaces.
+#[test]
+fn a_restore_onto_a_controller_with_commands_in_flight_is_refused() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let state = export(&src);
+
+    let manual = Manual::new(IO_QDEPTH);
+    let mut dst = Harness::manual(&manual);
+    dst.enable();
+    dst.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut tail = 0;
+    submit_on(&dst, 1, SQ1, &mut tail, Sqe::read(0, 1, 0x50000, 0), 0x81);
+    assert_eq!(manual.queued(), 1);
+
+    let error = dst
+        .ctrl
+        .restore_migrate_state(&state)
+        .expect_err("a command is in flight");
+    assert!(error.to_string().contains("in flight"), "{error}");
+}
+
+/// Only a CQ head doorbell writes a held completion otherwise, and a
+/// guest waiting on this one has nothing to consume.
+#[test]
+fn a_held_completion_with_room_in_its_cq_goes_in_on_resume() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut state = nvme(export(&src));
+    state.io_cqs[0].as_mut().expect("CQ 1").held = vec![held(1, 0x99)];
+
+    let dst = Harness::new();
+    dst.ctrl
+        .restore_migrate_state(&vmm_devices::DeviceMigrateState::Nvme(state))
+        .expect("restore");
+    dst.ctrl.resume();
+    let cqe = dst.wait_cqe(CQ1, 0, true);
+    assert_eq!((cqe.cid, cqe.sqid), (0x99, 1));
+}
+
+/// A controller holds at most its depth per SQ, so the wire bound must
+/// take the most any backend depth allows.
+#[test]
+fn the_most_held_completions_a_controller_can_make_restore() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut state = nvme(export(&src));
+    let cq = state.io_cqs[0].as_mut().expect("CQ 1");
+    cq.held = (0..MAX_QUEUE_SIZE).map(|cid| held(1, cid)).collect();
+
+    let dst = Harness::manual(&Manual::new(u16::MAX));
+    dst.ctrl
+        .restore_migrate_state(&vmm_devices::DeviceMigrateState::Nvme(
+            state.clone(),
+        ))
+        .expect("a full queue of held completions");
+
+    state.io_cqs[0]
+        .as_mut()
+        .expect("CQ 1")
+        .held
+        .push(held(1, 0));
+    check_nvme_state(&state).expect_err("one past the wire bound");
+}
+
+#[test]
+fn a_refused_msix_table_changes_nothing() {
+    let mut src = Harness::new();
+    src.enable();
+    src.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let mut state = nvme(export(&src));
+    state.msix.entries.push(Default::default());
+
+    let dst = Harness::new();
+    let error = dst
+        .ctrl
+        .restore_migrate_state(&vmm_devices::DeviceMigrateState::Nvme(state))
+        .expect_err("one entry too many");
+    assert!(error.to_string().contains("MSI-X"), "{error}");
+    let st = dst.ctrl.lock();
+    assert_eq!(st.cc, 0, "the controller registers were applied");
+    assert!(st.admin_sq.is_none(), "the admin queue was applied");
+    assert!(!st.admission.paused, "admission was paused");
 }

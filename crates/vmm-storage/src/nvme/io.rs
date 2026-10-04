@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! I/O submission and execution.
+//! I/O submission, and the checks a command passes before a backend
+//! sees it.
 
 use std::io;
 use std::sync::Arc;
@@ -10,12 +11,13 @@ use std::sync::Arc;
 use vmm_core::mem::{GuestIoVec, MemCtx};
 use vmm_devices::blkdev::DiskSync;
 
+use super::backend::{BlockOp, BlockRequest, GuestData, Liveness, RequestId};
 use super::bits::*;
-use super::prp::prp_to_iovec;
-use super::queues::{io_queue_index, NvmeState, QueueInstance};
-use super::{Geometry, NvmeController};
+use super::inflight::Admitted;
+use super::queues::{io_queue_index, NvmeState};
+use super::NvmeController;
 
-/// The store a namespace is backed by.
+/// A synchronous store, run on the worker pool.
 ///
 /// A trait rather than [`DiskSync`] so a test can hold a transfer open and
 /// watch what a reset or a shutdown does with it.
@@ -23,6 +25,11 @@ pub trait IoBackend: Send + Sync + 'static {
     fn read_at(&self, iov: &GuestIoVec, offset: u64) -> io::Result<usize>;
     fn write_at(&self, iov: &GuestIoVec, offset: u64) -> io::Result<usize>;
     fn sync(&self) -> io::Result<()>;
+
+    /// Whether a write is durable when `write_at` returns.
+    fn durable_writes(&self) -> bool {
+        false
+    }
 }
 
 impl IoBackend for DiskSync {
@@ -39,49 +46,56 @@ impl IoBackend for DiskSync {
     }
 }
 
-/// One NVM command handed to a worker.
-pub(super) struct IoRequest {
-    pub(super) opcode: u8,
-    pub(super) nsid: u32,
-    pub(super) slba: u64,
-    pub(super) nlb: u32,
-    pub(super) prp1: u64,
-    pub(super) prp2: u64,
-    pub(super) sqid: u16,
-    pub(super) cid: u16,
-    pub(super) cq_id: u16,
-    /// The queue instances this command was submitted against. A
-    /// request whose instances are gone names pages and a CQ slot the
-    /// driver has taken back.
-    pub(super) sq_instance: QueueInstance,
-    pub(super) cq_instance: QueueInstance,
-    /// Force Unit Access. Identify advertises VWC=1, so a FUA write
-    /// must reach stable storage before its completion.
-    pub(super) fua: bool,
+struct NvmCmd {
+    opcode: u8,
+    cid: u16,
+    nsid: u32,
+    slba: u64,
+    /// 1-based.
+    nlb: u32,
+    prp1: u64,
+    prp2: u64,
+    fua: bool,
+}
+
+fn le_u32(sqe: &[u8; SQE_SIZE], at: usize) -> u32 {
+    u32::from_le_bytes([sqe[at], sqe[at + 1], sqe[at + 2], sqe[at + 3]])
+}
+
+fn le_u64(sqe: &[u8; SQE_SIZE], at: usize) -> u64 {
+    u64::from(le_u32(sqe, at)) | (u64::from(le_u32(sqe, at + 4)) << 32)
+}
+
+impl NvmCmd {
+    fn decode(sqe: &[u8; SQE_SIZE]) -> Self {
+        let cdw12 = le_u32(sqe, SQE_CDW12);
+        Self {
+            opcode: sqe[SQE_OPC],
+            cid: u16::from_le_bytes([sqe[SQE_CID], sqe[SQE_CID + 1]]),
+            nsid: le_u32(sqe, SQE_NSID),
+            slba: le_u64(sqe, SQE_CDW10),
+            // CDW12 bits 15:0 are the 0-based block count.
+            nlb: (cdw12 & 0xFFFF) + 1,
+            prp1: le_u64(sqe, SQE_PRP1),
+            prp2: le_u64(sqe, SQE_PRP2),
+            // CDW12 bit 30 is Force Unit Access.
+            fua: (cdw12 & (1u32 << 30)) != 0,
+        }
+    }
+}
+
+struct Checked {
+    op: BlockOp,
+    byte_offset: u64,
+    len: usize,
 }
 
 impl NvmeController {
-    /// Process I/O SQ doorbell: parse SQEs and submit to worker channel.
     pub(super) fn io_sq_doorbell(&self, qid: u16, new_tail: u16) {
-        let mem = MemCtx::new(Arc::clone(&self.physmap));
-        let mut st = self.state.lock().expect("nvme: state lock");
-
         let Some(idx) = io_queue_index(qid) else {
             return;
         };
-        let Some((cq_id, sq_instance)) =
-            st.io_sqs[idx].as_ref().map(|sq| (sq.cq_id, sq.instance))
-        else {
-            return;
-        };
-        // Nothing submitted here can complete without its CQ.
-        let Some(cq_instance) = io_queue_index(cq_id)
-            .and_then(|cq_idx| st.io_cqs[cq_idx].as_ref())
-            .map(|cq| cq.instance)
-        else {
-            return;
-        };
-
+        let mut st = self.lock();
         let Some(sq) = st.io_sqs[idx].as_mut() else {
             return;
         };
@@ -89,178 +103,161 @@ impl NvmeController {
             return;
         }
         sq.tail = new_tail;
+        self.admit(&mut st, idx);
+    }
 
-        // Collect all new SQEs before releasing the lock
-        let mut requests = Vec::new();
-
-        while sq.head != sq.tail {
-            let sqe_offset = u64::from(sq.head) * SQE_SIZE as u64;
-            let mut sqe_buf = [0u8; SQE_SIZE];
-            let fetched = match sq.base.checked_add(sqe_offset) {
-                Some(gpa) => mem.read(gpa, &mut sqe_buf).is_ok(),
-                None => false,
+    /// The checks and the submit run under the state lock, which closing
+    /// admission also takes, so a drain that counted nothing in flight
+    /// is never overtaken. A command not admitted stays in the guest's
+    /// queue with the head on it.
+    pub(super) fn admit(&self, st: &mut NvmeState, idx: usize) {
+        if !st.admission.is_open() || st.fence_failed {
+            return;
+        }
+        st.throttled &= !(1u16 << idx);
+        let mem = MemCtx::new(Arc::clone(&self.physmap));
+        loop {
+            let Some(sq) = st.io_sqs[idx].as_ref() else {
+                return;
             };
-            if !fetched {
-                sq.head = (sq.head + 1) % sq.size;
-                continue;
+            if sq.head == sq.tail {
+                return;
+            }
+            let (cq_id, sq_instance) = (sq.cq_id, sq.instance);
+            // Nothing submitted here can complete without its CQ.
+            let Some((cq_idx, cq_instance)) =
+                io_queue_index(cq_id).and_then(|cq_idx| {
+                    st.io_cqs[cq_idx].as_ref().map(|cq| (cq_idx, cq.instance))
+                })
+            else {
+                return;
+            };
+            if !st.inflight[idx].has_room(self.depth) {
+                st.throttled |= 1u16 << idx;
+                return;
             }
 
-            let opcode = sqe_buf[SQE_OPC];
-            let cid =
-                u16::from_le_bytes([sqe_buf[SQE_CID], sqe_buf[SQE_CID + 1]]);
-            let nsid = u32::from_le_bytes(
-                sqe_buf[SQE_NSID..SQE_NSID + 4].try_into().expect("4 bytes"),
-            );
-            let prp1 = u64::from_le_bytes(
-                sqe_buf[SQE_PRP1..SQE_PRP1 + 8].try_into().expect("8 bytes"),
-            );
-            let prp2 = u64::from_le_bytes(
-                sqe_buf[SQE_PRP2..SQE_PRP2 + 8].try_into().expect("8 bytes"),
-            );
-            let cdw10 = u32::from_le_bytes(
-                sqe_buf[SQE_CDW10..SQE_CDW10 + 4]
-                    .try_into()
-                    .expect("4 bytes"),
-            );
-            let cdw12 = u32::from_le_bytes(
-                sqe_buf[SQE_CDW12..SQE_CDW12 + 4]
-                    .try_into()
-                    .expect("4 bytes"),
-            );
-
-            // For NVM Read/Write: CDW10-11 = SLBA (64-bit), CDW12 bits 15:0 = NLB (0-based)
-            let slba = u64::from(cdw10)
-                | (u64::from(u32::from_le_bytes(
-                    sqe_buf[SQE_CDW11..SQE_CDW11 + 4]
-                        .try_into()
-                        .expect("4 bytes"),
-                )) << 32);
-            let nlb = (cdw12 & 0xFFFF) + 1; // Convert 0-based to 1-based
-                                            // NVMe 5.13: CDW12 bit 30 = Force Unit Access.
-            let fua = (cdw12 & (1u32 << 30)) != 0;
-
+            let Some(sq) = st.io_sqs[idx].as_mut() else {
+                return;
+            };
+            let entry =
+                sq.base.checked_add(u64::from(sq.head) * SQE_SIZE as u64);
             sq.head = (sq.head + 1) % sq.size;
+            let mut sqe = [0u8; SQE_SIZE];
+            if entry.is_none_or(|gpa| mem.read(gpa, &mut sqe).is_err()) {
+                continue;
+            }
+            let cmd = NvmCmd::decode(&sqe);
 
-            requests.push(IoRequest {
-                opcode,
-                nsid,
-                slba,
-                nlb,
-                prp1,
-                prp2,
-                sqid: qid,
-                cid,
+            st.serial += 1;
+            let serial = st.serial;
+            let admitted = Admitted {
+                serial,
+                cid: cmd.cid,
+                opcode: cmd.opcode,
                 cq_id,
                 sq_instance,
                 cq_instance,
-                fua,
-            });
+            };
+            let Some(tag) = st.inflight[idx].admit(self.depth, admitted) else {
+                return;
+            };
+            self.counts.admitted();
+            let id = RequestId {
+                queue: idx as u16 + 1,
+                tag,
+                serial,
+            };
+
+            match self.check(&cmd) {
+                Err(status) => self.finish_now(st, &mem, id, status),
+                // With no volatile cache every completed write is
+                // already durable, so there is nothing to flush.
+                Ok(Checked {
+                    op: BlockOp::Flush, ..
+                }) if !st.volatile_write_cache => {
+                    self.finish_now(st, &mem, id, SC_SUCCESS)
+                }
+                Ok(Checked {
+                    op,
+                    byte_offset,
+                    len,
+                }) => self.submit(
+                    st,
+                    &mem,
+                    BlockRequest {
+                        id,
+                        op,
+                        lba: if op == BlockOp::Flush { 0 } else { cmd.slba },
+                        blocks: if op == BlockOp::Flush { 0 } else { cmd.nlb },
+                        byte_offset,
+                        data: GuestData {
+                            mem: MemCtx::new(Arc::clone(&self.physmap)),
+                            prp1: cmd.prp1,
+                            prp2: cmd.prp2,
+                            len,
+                            live: Liveness {
+                                epochs: Arc::clone(&st.epochs),
+                                sq: idx,
+                                sq_instance,
+                                cq: cq_idx,
+                                cq_instance,
+                            },
+                        },
+                    },
+                ),
+            }
         }
+    }
 
-        // Drop the state lock before sending to channel
-        drop(st);
+    pub(super) fn admit_all(&self, st: &mut NvmeState) {
+        for idx in 0..MAX_IO_QUEUES {
+            let pending =
+                st.io_sqs[idx].as_ref().is_some_and(|sq| sq.head != sq.tail);
+            if pending {
+                self.admit(st, idx);
+            }
+        }
+    }
 
-        let tx_guard = self.io_tx.lock().expect("nvme: io_tx lock");
-        let Some(tx) = tx_guard.as_ref() else {
-            slog::warn!(self.log, "nvme: I/O dropped, the workers are gone";
-                "count" => requests.len());
-            return;
+    fn check(&self, cmd: &NvmCmd) -> Result<Checked, u16> {
+        if cmd.nsid != 1 {
+            return Err(SC_INVALID_NS | SC_DNR);
+        }
+        let block = u64::from(self.geometry.block_size);
+        let len = match u64::from(cmd.nlb).checked_mul(block) {
+            Some(n) if n <= MAX_XFER_BYTES => n as usize,
+            _ => return Err(SC_INVALID_FIELD | SC_DNR),
         };
-        for req in requests {
-            if let Err(error) = tx.send(req) {
-                slog::warn!(self.log, "nvme: I/O dropped, the workers are gone";
-                    "cid" => error.0.cid);
-            }
+        let Some(byte_offset) = cmd.slba.checked_mul(block) else {
+            return Err(SC_INVALID_FIELD | SC_DNR);
+        };
+        if cmd
+            .slba
+            .checked_add(u64::from(cmd.nlb))
+            .is_none_or(|end| end > self.geometry.total_blocks)
+        {
+            return Err(SC_INVALID_FIELD | SC_DNR);
         }
-    }
-}
-
-/// Whether the queues a request named are still the ones the driver
-/// has.
-///
-/// A request that outlived its queue must not touch guest memory or
-/// post a completion: those pages and that CQ slot belong to whatever
-/// the driver put there next.
-pub(super) fn queues_current(st: &NvmeState, req: &IoRequest) -> bool {
-    let sq_live = io_queue_index(req.sqid)
-        .and_then(|idx| st.io_sqs[idx].as_ref())
-        .is_some_and(|sq| sq.instance == req.sq_instance);
-    let cq_live = io_queue_index(req.cq_id)
-        .and_then(|idx| st.io_cqs[idx].as_ref())
-        .is_some_and(|cq| cq.instance == req.cq_instance);
-    sq_live && cq_live
-}
-
-/// Execute a single I/O request (Read, Write, or Flush).
-///
-/// Returns the NVMe status code for the completion entry.
-pub(super) fn process_io_request(
-    req: &IoRequest,
-    backend: &dyn IoBackend,
-    read_only: bool,
-    mem: &MemCtx,
-    geometry: Geometry,
-) -> u16 {
-    if req.nsid != 1 {
-        return SC_INVALID_NS | SC_DNR;
-    }
-
-    let Geometry {
-        block_size,
-        total_blocks,
-    } = geometry;
-
-    let byte_count = match u64::from(req.nlb).checked_mul(u64::from(block_size))
-    {
-        Some(n) if n <= MAX_XFER_BYTES => n as usize,
-        _ => return SC_INVALID_FIELD | SC_DNR,
-    };
-    let byte_offset = match req.slba.checked_mul(u64::from(block_size)) {
-        Some(n) => n,
-        None => return SC_INVALID_FIELD | SC_DNR,
-    };
-    if req
-        .slba
-        .checked_add(u64::from(req.nlb))
-        .is_none_or(|end| end > total_blocks)
-    {
-        return SC_INVALID_FIELD | SC_DNR;
-    }
-
-    match req.opcode {
-        NVM_OPC_READ => {
-            let Ok(iov) = prp_to_iovec(mem, req.prp1, req.prp2, byte_count)
-            else {
-                return SC_DATA_XFER_ERROR;
-            };
-            match backend.read_at(&iov, byte_offset) {
-                Ok(n) if n == byte_count => SC_SUCCESS,
-                _ => SC_DATA_XFER_ERROR,
+        let op = match cmd.opcode {
+            NVM_OPC_READ => BlockOp::Read,
+            NVM_OPC_WRITE if self.read_only => {
+                return Err(SC_WRITE_TO_RO_RANGE | SC_DNR);
             }
-        }
-        NVM_OPC_WRITE => {
-            if read_only {
-                return SC_WRITE_TO_RO_RANGE | SC_DNR;
+            NVM_OPC_WRITE => BlockOp::Write { fua: cmd.fua },
+            NVM_OPC_FLUSH => {
+                return Ok(Checked {
+                    op: BlockOp::Flush,
+                    byte_offset: 0,
+                    len: 0,
+                });
             }
-            let Ok(iov) = prp_to_iovec(mem, req.prp1, req.prp2, byte_count)
-            else {
-                return SC_DATA_XFER_ERROR;
-            };
-            match backend.write_at(&iov, byte_offset) {
-                Ok(n) if n == byte_count => {}
-                _ => return SC_DATA_XFER_ERROR,
-            }
-            if req.fua && backend.sync().is_err() {
-                return SC_INTERNAL_ERROR;
-            }
-            SC_SUCCESS
-        }
-        NVM_OPC_FLUSH => {
-            if backend.sync().is_err() {
-                return SC_INTERNAL_ERROR;
-            }
-            SC_SUCCESS
-        }
-        _ => SC_INVALID_OPCODE | SC_DNR,
+            _ => return Err(SC_INVALID_OPCODE | SC_DNR),
+        };
+        Ok(Checked {
+            op,
+            byte_offset,
+            len,
+        })
     }
 }

@@ -4,12 +4,16 @@
 
 //! Migration protocol implementation.
 //!
-//! One protocol version at a time: a wire-format change bumps
-//! [`PROTOCOL_RON`] and both ends refuse anything else. There is no
-//! compatibility window, because a peer that reads a field as
-//! something else resumes a guest on state that is not its own.
+//! A wire-format change bumps [`PROTOCOL_RON`]. A destination also takes
+//! the previous version only while its payload is a strict subset of this
+//! one, with defaults that match what the old source did. Anything older
+//! is refused: a peer that reads a field as something else resumes a
+//! guest on state that is not its own.
 
 /// Protocol identifier for the RON migration format.
+///
+/// v3 carries held NVMe completions and the NVMe namespace shape. A v2
+/// payload restores with none held and the one shape v2 had.
 ///
 /// v2 carries the NVMe completion queue interrupt-enable bit. A v1 peer
 /// has no field for it, and a destination that assumes one restores a
@@ -19,7 +23,18 @@
 /// was tagged slot 0 and the destination took the first group whose
 /// length matched its queue count, so two devices of one queue count
 /// restored each other's rings.
-pub const PROTOCOL_RON: &str = "vmm-migrate-ron/2";
+pub const PROTOCOL_RON: &str = "vmm-migrate-ron/3";
+
+/// The previous version, which a destination still takes.
+pub const PROTOCOL_RON_V2: &str = "vmm-migrate-ron/2";
+
+/// The version a destination answers an offer with, newest first, or
+/// `None` when it can read none of them.
+pub fn select_protocol(offer: &[String]) -> Option<&'static str> {
+    [PROTOCOL_RON, PROTOCOL_RON_V2]
+        .into_iter()
+        .find(|ours| offer.iter().any(|theirs| theirs == ours))
+}
 
 /// Page size used for dirty tracking (4 KiB).
 pub use vmm_core::common::PAGE_SIZE;
@@ -78,6 +93,29 @@ impl<'a> Iterator for PageIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn offer(versions: &[&str]) -> Vec<String> {
+        versions.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn a_destination_prefers_the_current_version() {
+        let both = offer(&[PROTOCOL_RON_V2, PROTOCOL_RON]);
+        assert_eq!(select_protocol(&both), Some(PROTOCOL_RON));
+    }
+
+    #[test]
+    fn a_destination_takes_a_v2_source() {
+        let v2 = offer(&[PROTOCOL_RON_V2]);
+        assert_eq!(select_protocol(&v2), Some(PROTOCOL_RON_V2));
+    }
+
+    #[test]
+    fn a_destination_refuses_anything_older() {
+        let old = offer(&["vmm-migrate-ron/1", "vmm-migrate-ron/0"]);
+        assert_eq!(select_protocol(&old), None);
+        assert_eq!(select_protocol(&[]), None);
+    }
 
     #[test]
     fn test_bitmap_size() {

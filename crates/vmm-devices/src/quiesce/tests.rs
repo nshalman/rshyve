@@ -515,6 +515,53 @@ fn durable_flush_syncs_a_real_file() {
 }
 
 #[test]
+fn sync_file_runs_without_a_gate() {
+    let mut file = tempfile::tempfile().expect("create sync file");
+    file.write_all(b"drained by the device")
+        .expect("write sync file");
+    let disk = Arc::new(
+        DiskSync::new(
+            Arc::new(file),
+            false,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .expect("classify"),
+    );
+
+    sync_file(&disk, FlushIntent::Durable, "self-drained")
+        .expect("durable sync");
+    sync_file(&disk, FlushIntent::BestEffort, "self-drained")
+        .expect("best-effort sync");
+}
+
+#[test]
+fn sync_file_keeps_the_best_effort_watchdog() {
+    let started = Instant::now();
+
+    let result = sync_file_with(
+        FlushIntent::BestEffort,
+        "self-drained",
+        SHORT_BUDGETS,
+        || {
+            thread::sleep(Duration::from_secs(5));
+            Ok(())
+        },
+    );
+
+    assert!(matches!(result, Err(FlushError::TimedOut)));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn quiesce_budget_follows_the_intent() {
+    assert_eq!(quiesce_budget(FlushIntent::Durable), DURABLE_QUIESCE_BUDGET);
+    assert_eq!(
+        quiesce_budget(FlushIntent::BestEffort),
+        BEST_EFFORT_QUIESCE_BUDGET
+    );
+}
+
+#[test]
 fn flush_restores_the_entry_pause_state() {
     let running = FlushTestDevice::new(0, Duration::ZERO, SHORT_BUDGETS);
     running

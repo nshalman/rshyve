@@ -12,12 +12,16 @@ One driver serves both transports: a Unix socket inside a bhyve zone,
 where `/dev/poll` is unavailable and the GZ agent bridges to the peer,
 and a TCP socket elsewhere.
 
-The protocol identifier is `vmm-migrate-ron/2`. Both ends refuse
-anything else: there is no compatibility window, because a peer that
-reads a field as something else resumes a guest on state that is not
-its own. v1 put device identity on the wire; in v0 every virtio queue
-group was tagged slot 0 and the destination took the first group whose
-length matched its own queue count.
+The protocol identifier is `vmm-migrate-ron/3`, and a source offers
+only that. A destination also takes `vmm-migrate-ron/2`, whose payload
+is a strict subset: v3 adds the NVMe completions held for a full guest
+completion queue, which a v2 source dropped, and the NVMe namespace
+shape, of which a v2 source had one (512-byte blocks, volatile write
+cache). A v2 payload restores with none held, onto that shape only. Anything older is refused, because a peer that reads a field
+as something else resumes a guest on state that is not its own. v1 put
+device identity on the wire; in v0 every virtio queue group was tagged
+slot 0 and the destination took the first group whose length matched
+its own queue count.
 
 ```
 Source                          Destination

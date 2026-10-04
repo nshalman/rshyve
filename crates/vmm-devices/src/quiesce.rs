@@ -302,6 +302,19 @@ const FLUSH_BUDGETS: FlushBudgets = FlushBudgets {
     best_effort_sync: BEST_EFFORT_SYNC_BUDGET,
 };
 
+pub fn quiesce_budget(intent: FlushIntent) -> Duration {
+    FLUSH_BUDGETS.quiesce(intent)
+}
+
+impl FlushBudgets {
+    fn quiesce(&self, intent: FlushIntent) -> Duration {
+        match intent {
+            FlushIntent::Durable => self.durable_quiesce,
+            FlushIntent::BestEffort => self.best_effort_quiesce,
+        }
+    }
+}
+
 /// Quiesce a block backend and sync its file according to the caller's intent.
 ///
 /// Returns an error without syncing if the workers miss their quiesce deadline.
@@ -329,6 +342,17 @@ pub fn flush_file_when(
     })
 }
 
+/// Sync a disk whose I/O the caller has already drained, with no
+/// [`QuiesceGate`]. A best-effort sync fails if its watchdog expires.
+pub fn sync_file(
+    disk: &Arc<DiskSync>,
+    intent: FlushIntent,
+    device: &'static str,
+) -> Result<(), FlushError> {
+    let disk = Arc::clone(disk);
+    sync_file_with(intent, device, FLUSH_BUDGETS, move || disk.sync())
+}
+
 fn flush_file_with<F>(
     gate: &QuiesceGate,
     intent: FlushIntent,
@@ -344,15 +368,23 @@ where
     // thread takes while the sync runs must outlive it.
     let _drain = gate.drain_scope();
 
-    let quiesce_budget = match intent {
-        FlushIntent::Durable => budgets.durable_quiesce,
-        FlushIntent::BestEffort => budgets.best_effort_quiesce,
-    };
-    if !gate.wait_quiesced_and(quiesce_budget, idle) {
+    if !gate.wait_quiesced_and(budgets.quiesce(intent), idle) {
         return Err(FlushError::NotQuiesced(device));
     }
 
-    let result = match intent {
+    sync_file_with(intent, device, budgets, sync)
+}
+
+fn sync_file_with<F>(
+    intent: FlushIntent,
+    device: &'static str,
+    budgets: FlushBudgets,
+    sync: F,
+) -> Result<(), FlushError>
+where
+    F: FnOnce() -> io::Result<()> + Send + 'static,
+{
+    match intent {
         FlushIntent::Durable => sync().map_err(FlushError::Sync),
         FlushIntent::BestEffort => {
             let (tx, rx) = mpsc::channel();
@@ -360,7 +392,9 @@ where
                 .name(format!("{device}-flush"))
                 .spawn(move || {
                     // The receiver may have timed out, leaving no observer for
-                    // the eventual sync result.
+                    // the eventual sync result. The sync can then hold the
+                    // last disk reference, so a zvol write cache is restored
+                    // late, on this thread; nothing writes through it by then.
                     drop(tx.send(sync()));
                 });
             match worker {
@@ -380,9 +414,7 @@ where
                 }
             }
         }
-    };
-
-    result
+    }
 }
 
 /// A device, with the id its owner knows it by.

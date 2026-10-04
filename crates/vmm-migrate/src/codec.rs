@@ -703,4 +703,63 @@ mod tests {
             other => panic!("expected Serialized, got {other:?}"),
         }
     }
+
+    fn nvme_cq(
+        held: Vec<vmm_devices::lifecycle::NvmeMigrateCqe>,
+    ) -> DeviceStatePayload {
+        use vmm_devices::lifecycle::{
+            DeviceMigrateState, NvmeMigrateCq, NvmeMigrateState, WireBdf,
+        };
+        DeviceStatePayload {
+            bdf: WireBdf {
+                bus: 0,
+                dev: 4,
+                func: 0,
+            },
+            state: Some(DeviceMigrateState::Nvme(NvmeMigrateState {
+                io_cqs: vec![Some(NvmeMigrateCq {
+                    base: 0x4000,
+                    size: 2,
+                    head: 0,
+                    tail: 1,
+                    phase: true,
+                    iv: 1,
+                    ien: true,
+                    held,
+                })],
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn a_v2_nvme_payload_decodes_with_nothing_held() {
+        let v3 = nvme_cq(Vec::new());
+        let text = ron::ser::to_string(&v3).expect("encode");
+        assert!(text.contains(",held:[]"), "{text}");
+        assert!(text.contains(",namespace:None"), "{text}");
+        let v2 = text.replace(",held:[]", "").replace(",namespace:None", "");
+
+        let decoded: DeviceStatePayload =
+            Message::deserialize(v2.as_bytes()).expect("decode v2");
+        assert_eq!(decoded, v3);
+    }
+
+    #[test]
+    fn held_nvme_completions_survive_the_wire() {
+        let held = vec![vmm_devices::lifecycle::NvmeMigrateCqe {
+            sqid: 1,
+            cid: 0x77,
+            status: 0x4004,
+            cdw0: 9,
+        }];
+        let payload = nvme_cq(held);
+        let msg = Message::serialized(&payload).expect("encode");
+        let Message::Serialized(data) = roundtrip(&msg) else {
+            panic!("expected Serialized");
+        };
+        let decoded: DeviceStatePayload =
+            Message::deserialize(&data).expect("decode");
+        assert_eq!(decoded, payload);
+    }
 }

@@ -4,12 +4,13 @@
 
 //! Queue state and completion posting.
 
-use std::io;
-
-use vmm_core::mem::MemCtx;
-use vmm_devices::pci::msix::MsixTable;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use super::bits::*;
+use super::cq::{Held, Irqs};
+use super::inflight::SqSlots;
 
 /// One queue as the driver created it.
 ///
@@ -49,6 +50,50 @@ pub(super) struct CompQueue {
     /// Whether the driver asked for an interrupt on this CQ.
     pub(super) ien: bool,
     pub(super) instance: QueueInstance,
+    /// Completions waiting for the guest to free a slot, oldest first.
+    pub(super) held: VecDeque<Held>,
+}
+
+/// The instance each I/O queue slot holds now, readable without the
+/// state lock. Zero is no queue.
+#[derive(Default)]
+pub(super) struct QueueEpochs {
+    sq: [AtomicU64; MAX_IO_QUEUES],
+    cq: [AtomicU64; MAX_IO_QUEUES],
+}
+
+impl QueueEpochs {
+    pub(super) fn is_current(
+        &self,
+        sq: usize,
+        sq_instance: QueueInstance,
+        cq: usize,
+        cq_instance: QueueInstance,
+    ) -> bool {
+        let live = |slots: &[AtomicU64], idx: usize, want: QueueInstance| {
+            slots
+                .get(idx)
+                .is_some_and(|e| e.load(Ordering::Acquire) == want)
+        };
+        live(&self.sq, sq, sq_instance) && live(&self.cq, cq, cq_instance)
+    }
+}
+
+/// Checked and changed only under the state lock, so a drain that
+/// counts nothing in flight cannot be overtaken by an admission.
+#[derive(Default)]
+pub(super) struct Admission {
+    pub(super) paused: bool,
+    /// Resets, shutdowns, flushes and exports waiting for a drain.
+    pub(super) draining: u32,
+    /// The backend is stopped for good.
+    pub(super) halted: bool,
+}
+
+impl Admission {
+    pub(super) fn is_open(&self) -> bool {
+        !self.paused && self.draining == 0 && !self.halted
+    }
 }
 
 pub(super) fn io_queue_index(qid: u16) -> Option<usize> {
@@ -81,6 +126,10 @@ pub(super) struct NvmeState {
 
     // Configuration
     pub(super) num_io_queues: u16,
+    /// The I/O queues the backend serves, the most Set Features grants.
+    pub(super) max_io_queues: u16,
+    /// Whether Identify reports a volatile write cache.
+    pub(super) volatile_write_cache: bool,
 
     /// Source of [`QueueInstance`] values. Never reset, so an instance
     /// is unique for the life of the controller.
@@ -89,6 +138,21 @@ pub(super) struct NvmeState {
     /// Whether a fence deadline passed with a worker still able to
     /// reach guest memory. Sticky: see [`Self::fail_fence`].
     pub(super) fence_failed: bool,
+
+    pub(super) admission: Admission,
+    pub(super) inflight: [SqSlots; MAX_IO_QUEUES],
+    /// I/O SQs that stopped at their depth, one bit each.
+    pub(super) throttled: u16,
+    /// Source of [`super::backend::RequestId`] serials.
+    pub(super) serial: u64,
+    pub(super) epochs: Arc<QueueEpochs>,
+    /// Threads waiting in a drain, so a completion knows to wake one.
+    pub(super) drain_waiters: u32,
+    /// Interrupts owed for completions written since the lock was taken.
+    pub(super) irqs: Irqs,
+    /// Commands finished since the lock was taken, still counted in
+    /// the lock-free in-flight count.
+    pub(super) retiring: usize,
 }
 
 impl NvmeState {
@@ -97,12 +161,80 @@ impl NvmeState {
     pub(super) fn retire_queues(&mut self) {
         self.admin_sq = None;
         self.admin_cq = None;
-        for sq in &mut self.io_sqs {
-            *sq = None;
+        for idx in 0..MAX_IO_QUEUES {
+            self.set_sq(idx, None);
+            self.set_cq(idx, None);
         }
-        for cq in &mut self.io_cqs {
-            *cq = None;
+        self.throttled = 0;
+    }
+
+    /// Put `sq` in I/O SQ slot `idx`. Every change goes through here so
+    /// a request in a backend can tell its queue is gone, and so the
+    /// completions the old queue had waiting go with it.
+    pub(super) fn set_sq(&mut self, idx: usize, sq: Option<SubQueue>) {
+        let Some(slot) = self.io_sqs.get_mut(idx) else {
+            return;
+        };
+        let instance = sq.as_ref().map_or(0, |q| q.instance);
+        let old = std::mem::replace(slot, sq);
+        self.epochs.sq[idx].store(instance, Ordering::Release);
+
+        let Some(old) = old else {
+            return;
+        };
+        let sqid = idx as u16 + 1;
+        let Some(cq) = io_queue_index(old.cq_id)
+            .and_then(|cq_idx| self.io_cqs[cq_idx].as_mut())
+        else {
+            return;
+        };
+        let (gone, kept) = std::mem::take(&mut cq.held)
+            .into_iter()
+            .partition(|held| held.cqe.sqid == sqid);
+        cq.held = kept;
+        self.release_held(gone);
+    }
+
+    /// The same for I/O CQ slot `idx`.
+    pub(super) fn set_cq(&mut self, idx: usize, cq: Option<CompQueue>) {
+        let Some(slot) = self.io_cqs.get_mut(idx) else {
+            return;
+        };
+        let instance = cq.as_ref().map_or(0, |q| q.instance);
+        let old = std::mem::replace(slot, cq);
+        self.epochs.cq[idx].store(instance, Ordering::Release);
+        if let Some(old) = old {
+            self.release_held(old.held);
         }
+    }
+
+    /// Give back the tags of completions that will never be written.
+    pub(super) fn release_held(
+        &mut self,
+        held: impl IntoIterator<Item = Held>,
+    ) {
+        for held in held {
+            let slots = io_queue_index(held.cqe.sqid)
+                .and_then(|idx| self.inflight.get_mut(idx));
+            if let (Some(slots), Some(tag)) = (slots, held.tag) {
+                slots.release(tag);
+            }
+        }
+    }
+
+    pub(super) fn sq_head(&self, sqid: u16) -> u16 {
+        let sq = if sqid == ADMIN_QUEUE_ID {
+            self.admin_sq.as_ref()
+        } else {
+            io_queue_index(sqid).and_then(|idx| self.io_sqs[idx].as_ref())
+        };
+        sq.map_or(0, |sq| sq.head)
+    }
+
+    /// Commands every I/O SQ has admitted and the backend has not
+    /// finished.
+    pub(super) fn in_flight(&self) -> u32 {
+        self.inflight.iter().map(SqSlots::in_flight).sum()
     }
 
     pub(super) fn next_instance(&mut self) -> QueueInstance {
@@ -128,83 +260,6 @@ impl NvmeState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Completion queue helpers
-// ---------------------------------------------------------------------------
-
-/// Post a completion queue entry to guest memory and fire MSI-X.
-///
-/// An error means the CQE could not be written, which loses the
-/// completion: the caller reports a fatal controller status.
-pub(super) fn post_completion(
-    mem: &MemCtx,
-    msix: &MsixTable,
-    cq_opt: &mut Option<CompQueue>,
-    cdw0: u32,
-    sqid: u16,
-    sq_head: u16,
-    cid: u16,
-    status: u16,
-) -> io::Result<()> {
-    let cq = match cq_opt.as_mut() {
-        Some(cq) => cq,
-        None => return Ok(()),
-    };
-
-    // Check if CQ is full: (tail + 1) % size == head
-    let next_tail = if cq.tail + 1 >= cq.size {
-        0
-    } else {
-        cq.tail + 1
-    };
-    if next_tail == cq.head {
-        // CQ full -- drop the completion (guest must drain the queue)
-        return Ok(());
-    }
-
-    let cqe_offset = u64::from(cq.tail) * CQE_SIZE as u64;
-    let Some(cqe_gpa) = cq.base.checked_add(cqe_offset) else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "CQ base wraps",
-        ));
-    };
-
-    // Build CQE (16 bytes)
-    let mut cqe = [0u8; CQE_SIZE];
-
-    // DW0: command-specific result
-    cqe[CQE_DW0..CQE_DW0 + 4].copy_from_slice(&cdw0.to_le_bytes());
-    // DW1: reserved (already zero)
-
-    // DW2: SQ head pointer + SQ ID
-    cqe[CQE_SQHD..CQE_SQHD + 2].copy_from_slice(&sq_head.to_le_bytes());
-    cqe[CQE_SQID..CQE_SQID + 2].copy_from_slice(&sqid.to_le_bytes());
-
-    // DW3: CID + Status (with phase bit in bit 0 of status field)
-    cqe[CQE_CID..CQE_CID + 2].copy_from_slice(&cid.to_le_bytes());
-
-    // Status field: bits 15:1 = status code, bit 0 = phase
-    let status_with_phase = (status << 1) | if cq.phase { 1 } else { 0 };
-    cqe[CQE_STATUS..CQE_STATUS + 2]
-        .copy_from_slice(&status_with_phase.to_le_bytes());
-
-    mem.write(cqe_gpa, &cqe)?;
-
-    // Advance CQ tail and toggle phase on wrap
-    let (iv, ien) = (cq.iv, cq.ien);
-    cq.tail += 1;
-    if cq.tail >= cq.size {
-        cq.tail = 0;
-        cq.phase = !cq.phase;
-    }
-
-    if ien {
-        msix.fire(iv);
-    }
-    Ok(())
-}
-
 /// Whether a guest-supplied queue base may be used.
 ///
 /// Queues are contiguous (CAP.CQR is set), so the base must be page
@@ -213,7 +268,6 @@ pub(super) fn valid_queue_base(prp1: u64) -> bool {
     prp1 != 0 && (prp1 & 0xFFF) == 0
 }
 
-#[cfg(test)]
 impl Default for NvmeState {
     fn default() -> Self {
         Self {
@@ -230,8 +284,18 @@ impl Default for NvmeState {
             ctrl_ident: [0u8; IDENT_CTRL_SIZE],
             ns_ident: [0u8; IDENT_NS_SIZE],
             num_io_queues: MAX_IO_QUEUES as u16,
+            max_io_queues: MAX_IO_QUEUES as u16,
+            volatile_write_cache: true,
             instances: 0,
             fence_failed: false,
+            admission: Admission::default(),
+            inflight: Default::default(),
+            throttled: 0,
+            serial: 0,
+            epochs: Arc::default(),
+            drain_waiters: 0,
+            irqs: Irqs::default(),
+            retiring: 0,
         }
     }
 }

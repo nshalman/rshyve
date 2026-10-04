@@ -181,7 +181,7 @@ The guest-visible serial from `VIRTIO_BLK_T_GET_ID` is the constant string `vmm-
 -s <slot>,nvme,<path>[,ro]
 ```
 
-The arm calls the shared `parse_blk_config`, so `nodelete`, `sectorsize=` and `num-queues=` all **parse and are then discarded**. Only `read_only` reaches `NvmeController::new` (`bin/rshyve/src/main.rs:1077`). Logical block size is hardcoded to 512 at `crates/vmm-storage/src/nvme/mod.rs:205`, so `sectorsize=4096` silently yields a 512-byte-LBA namespace.
+The arm calls the shared `parse_blk_config`, so `nodelete`, `sectorsize=` and `num-queues=` all **parse and are then discarded**. Only `read_only` reaches `NvmeController::new` (`bin/rshyve/src/main.rs:1077`). The arm builds the default `NvmeConfig`, 512-byte LBA and a volatile write cache. `NvmeConfig` can choose 4 KiB and no cache for a backend whose writes are durable, but no option reaches it from the command line, so `sectorsize=4096` silently yields a 512-byte-LBA namespace.
 
 One namespace, NSID must be 1. Zero-copy `preadv`/`pwritev` straight into guest pages, 8 worker threads, MDTS 9 (2 MiB), up to 15 I/O queues of up to 4096 entries. Admin commands implemented: Identify (CNS 0 and 1 only), Create/Delete IO SQ and CQ, Get/Set Features, Abort (always reports not found), Get Log Page (a stub that writes zeros). I/O opcodes: READ, WRITE, FLUSH. Dataset Management, Write Zeroes and Compare are absent and `ONCS` is correctly left at zero.
 
@@ -624,7 +624,7 @@ These parse without complaint and do nothing. Each one is a way to believe you c
 |---|---|
 | `-o` / `--config-option`, any key outside `hotplug.` | Passed over. `-o` is a free key space this VMM shares with vmadm. The two keys it does read are `hotplug.maxmem` and `hotplug.memslot`; a misspelled `hotplug.` key is a startup error rather than a silent drop (`crates/vmm-config/src/lib.rs:338`). |
 | `-A` / `--acpi` | Declared at `crates/vmm-config/src/lib.rs:91` and read nowhere. ACPI tables are built unconditionally, so the flag is redundant rather than harmful. |
-| `nvme,...,sectorsize=N` | Parsed by the shared block parser, then discarded. NVMe LBA is hardcoded 512. |
+| `nvme,...,sectorsize=N` | Parsed by the shared block parser, then discarded. The `nvme` arm always builds a 512-byte LBA. |
 | `nvme,...,num-queues=N`, `nvme,...,nodelete` | Parsed and discarded. |
 | `virtio-blk,...,nodelete` | Parsed, stored, never read (`block.rs:113`, `#[allow(dead_code)]`). |
 | virtio-blk DISCARD / WRITE_ZEROES | Feature bits are advertised on every writable disk and the handlers return OK without touching the file. `fstrim` reports success and does nothing. The related config fields at offset 0x24 and beyond read zero. |

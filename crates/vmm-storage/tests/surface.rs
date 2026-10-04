@@ -8,10 +8,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use vmm_devices::pci::device::PciDevice;
-use vmm_devices::Lifecycle;
+use vmm_devices::{FlushError, FlushIntent, Lifecycle};
 use vmm_storage::ahci::media::IsoMedia;
 use vmm_storage::ahci::AhciCtrl;
-use vmm_storage::nvme::NvmeController;
+use vmm_storage::nvme::backend::{
+    AsyncBackend, BackendFactory, BlockRequest, BlockStatus, CompletionSink,
+    RequestId,
+};
+use vmm_storage::nvme::{LbaSize, MsiPolicy, NvmeConfig, NvmeController};
 
 fn _coerce_ahci(
     dev: Arc<AhciCtrl>,
@@ -23,6 +27,60 @@ fn _coerce_nvme(
     dev: Arc<NvmeController>,
 ) -> (Arc<dyn PciDevice>, Arc<dyn Lifecycle>) {
     (dev.clone(), dev)
+}
+
+/// Uses only public items, as a ring backend outside this crate must.
+struct OutsideBackend {
+    sink: Arc<dyn CompletionSink>,
+}
+
+impl AsyncBackend for OutsideBackend {
+    fn capacity(&self) -> u64 {
+        1 << 20
+    }
+
+    fn queue_depth(&self) -> u16 {
+        64
+    }
+
+    fn durable_writes(&self) -> bool {
+        true
+    }
+
+    fn submit(&self, req: BlockRequest) {
+        let _ = (req.op(), req.lba(), req.blocks(), req.byte_offset());
+        let _ = (req.id().queue(), req.id().tag(), req.data().is_live());
+        self.sink.complete(&[(req.id(), BlockStatus::Success)]);
+    }
+
+    fn flush(&self, _intent: FlushIntent) -> Result<(), FlushError> {
+        Ok(())
+    }
+
+    fn halt(&self) {}
+}
+
+struct NoSink;
+
+impl CompletionSink for NoSink {
+    fn complete(&self, _done: &[(RequestId, BlockStatus)]) {}
+}
+
+#[test]
+fn a_backend_from_outside_the_crate_fits_the_interface() {
+    let factory: BackendFactory = Box::new(|sink| {
+        Arc::new(OutsideBackend { sink }) as Arc<dyn AsyncBackend>
+    });
+    let backend = factory(Arc::new(NoSink));
+    let config = NvmeConfig {
+        lba_size: LbaSize::B4096,
+        volatile_write_cache: false,
+        msi_policy: MsiPolicy::PerBatch,
+    };
+
+    assert_eq!(backend.max_queues(), 15);
+    assert!(backend.durable_writes() || config.volatile_write_cache);
+    assert_eq!(backend.capacity() / u64::from(config.lba_size.bytes()), 256);
 }
 
 #[test]

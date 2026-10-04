@@ -25,7 +25,7 @@ use crate::codec::{
 };
 use crate::cpu;
 use crate::pages::apply_page_batch;
-use crate::protocol::PROTOCOL_RON;
+use crate::protocol::select_protocol;
 use crate::state;
 use crate::wire::{set_phase, unexpected, Chan, Deadlines, Transport};
 use crate::MigrationPhase;
@@ -103,15 +103,15 @@ fn run_inner<S: Transport>(
     set_phase(status, MigrationPhase::Sync);
 
     let offer: ProtocolOffer = chan.expect_serialized()?;
-    if !offer.protocols.iter().any(|p| p == PROTOCOL_RON) {
+    let Some(protocol) = select_protocol(&offer.protocols) else {
         let err = MigrateError::ProtocolMismatch(crate::wire::peer_text(
             &offer.protocols.join(","),
         ));
         chan.send(&Message::Error(err.clone()))?;
         return Err(err);
-    }
+    };
     chan.send(&Message::serialized(&ProtocolSelect {
-        protocol: PROTOCOL_RON.to_string(),
+        protocol: protocol.to_string(),
     })?)?;
 
     let preamble: MigrationPreamble = chan.expect_serialized()?;
