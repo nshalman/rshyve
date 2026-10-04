@@ -106,8 +106,8 @@ Protocol negotiation and preamble exchange.
 
 ```
 Source                              Destination
-  |--- ProtocolOffer ["vmm-migrate-ron/2"] -->|
-  |<-- ProtocolSelect "vmm-migrate-ron/2" ----|
+  |--- ProtocolOffer ["vmm-migrate-ron/3"] -->|
+  |<-- ProtocolSelect "vmm-migrate-ron/3" ----|
   |--- MigrationPreamble (cpus, mem, devices, features) -->|
   |<-- Okay ----------------------------------|
 ```

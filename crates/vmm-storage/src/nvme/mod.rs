@@ -469,6 +469,7 @@ impl Lifecycle for NvmeController {
         let mut st = self.state.lock().expect("nvme: state lock");
         st.admission.paused = false;
         self.counts.paused.store(false, Ordering::Release);
+        self.flush_all_held(&mut st);
         self.admit_all(&mut st);
         drop(st);
         self.indicator.resume();

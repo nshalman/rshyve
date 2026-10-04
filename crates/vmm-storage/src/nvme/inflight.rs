@@ -70,6 +70,14 @@ impl SqSlots {
         Some(tag)
     }
 
+    /// A tag for a completion that arrives already held, as one
+    /// restored from a migration does.
+    pub(super) fn reserve_held(&mut self, depth: u16) -> Option<u16> {
+        let tag = self.take_tag(depth, Slot::Held)?;
+        self.held += 1;
+        Some(tag)
+    }
+
     /// End the command in `tag`, if `serial` still names it.
     ///
     /// The tag stays taken: the caller gives it back with

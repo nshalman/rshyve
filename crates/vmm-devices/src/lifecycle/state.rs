@@ -219,4 +219,19 @@ pub struct NvmeMigrateCq {
     /// poll queue has none, and restoring one as interrupting sends the
     /// destination guest a message it never armed a handler for.
     pub ien: bool,
+    /// Completions waiting for the guest to free a slot, oldest first.
+    /// The destination writes them when the guest does. A v2 source
+    /// dropped them instead, so its payload has none.
+    #[serde(default)]
+    pub held: Vec<NvmeMigrateCqe>,
+}
+
+/// One completion an NVMe controller owes the guest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NvmeMigrateCqe {
+    pub sqid: u16,
+    pub cid: u16,
+    /// The status field without its phase bit.
+    pub status: u16,
+    pub cdw0: u32,
 }

@@ -8,13 +8,14 @@ use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 
 use vmm_devices::lifecycle::{
-    DeviceMigrateState, DeviceStateError, NvmeMigrateCq, NvmeMigrateSq,
-    NvmeMigrateState,
+    DeviceMigrateState, DeviceStateError, NvmeMigrateCq, NvmeMigrateCqe,
+    NvmeMigrateSq, NvmeMigrateState,
 };
 use vmm_devices::pci::device::replay_migrate_pci_state;
 
 use super::bits::*;
-use super::queues::{CompQueue, NvmeState, SubQueue};
+use super::cq::{Cqe, Held};
+use super::queues::{io_queue_index, CompQueue, NvmeState, SubQueue};
 use super::NvmeController;
 
 impl NvmeController {
@@ -62,6 +63,16 @@ impl NvmeController {
             phase: cq.phase,
             iv: cq.iv,
             ien: cq.ien,
+            held: cq
+                .held
+                .iter()
+                .map(|held| NvmeMigrateCqe {
+                    sqid: held.cqe.sqid,
+                    cid: held.cqe.cid,
+                    status: held.cqe.status,
+                    cdw0: held.cqe.cdw0,
+                })
+                .collect(),
         };
 
         slog::info!(self.log, "nvme: exporting controller state";
@@ -126,6 +137,20 @@ impl NvmeController {
                 ));
             }
         }
+        // A held completion keeps its command's tag, and this backend
+        // has only so many per queue.
+        let held = held_per_sq(mig);
+        if let Some(sqid) = held
+            .iter()
+            .skip(1)
+            .position(|&n| n > usize::from(self.depth))
+        {
+            return Err(DeviceStateError::invalid(format!(
+                "SQ {} holds more completions than its depth {}",
+                sqid + 1,
+                self.depth,
+            )));
+        }
 
         slog::info!(self.log, "nvme: restoring controller state";
             "cc" => format!("{:#x}", mig.cc),
@@ -181,6 +206,7 @@ impl NvmeController {
         for (idx, wire) in mig.io_cqs.iter().enumerate() {
             st.set_cq(idx, wire.as_ref().map(live_cq));
         }
+        self.restore_held(&mut st, mig);
         // Nothing runs before the source has committed to never running
         // the guest again: the two would share the disk. Resume opens
         // admission and takes the commands the guest left queued.
@@ -194,13 +220,108 @@ impl NvmeController {
     }
 }
 
+impl NvmeController {
+    /// Put back the completions the source was holding, each with a tag
+    /// in its SQ as it had there. The payload passed its checks.
+    fn restore_held(&self, st: &mut NvmeState, mig: &NvmeMigrateState) {
+        for (cq_id, wire) in wire_cqs(mig) {
+            for held in &wire.held {
+                let tag = io_queue_index(held.sqid)
+                    .and_then(|idx| st.inflight[idx].reserve_held(self.depth));
+                let cq = match io_queue_index(cq_id) {
+                    None => st.admin_cq.as_mut(),
+                    Some(idx) => st.io_cqs[idx].as_mut(),
+                };
+                if let Some(cq) = cq {
+                    cq.held.push_back(Held {
+                        cqe: Cqe {
+                            cdw0: held.cdw0,
+                            sqid: held.sqid,
+                            cid: held.cid,
+                            status: held.status,
+                        },
+                        tag,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Every CQ in a payload with its queue id, the admin CQ first.
+fn wire_cqs(
+    mig: &NvmeMigrateState,
+) -> impl Iterator<Item = (u16, &NvmeMigrateCq)> {
+    let admin = mig.admin_cq.as_ref().map(|cq| (ADMIN_QUEUE_ID, cq));
+    let io = mig
+        .io_cqs
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, cq)| cq.as_ref().map(|cq| (idx as u16 + 1, cq)));
+    admin.into_iter().chain(io)
+}
+
+/// Held completions per SQ id, the admin SQ at 0. An id past the last
+/// I/O queue is counted nowhere; [`check_held`] refuses it.
+fn held_per_sq(mig: &NvmeMigrateState) -> [usize; MAX_IO_QUEUES + 1] {
+    let mut count = [0usize; MAX_IO_QUEUES + 1];
+    for (_, cq) in wire_cqs(mig) {
+        for held in &cq.held {
+            if let Some(n) = count.get_mut(usize::from(held.sqid)) {
+                *n += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Each held completion names an SQ that posts to its CQ, and has a
+/// status a CQE can carry beside the phase bit.
+fn check_held(mig: &NvmeMigrateState) -> Result<(), DeviceStateError> {
+    let posts_to = |sqid: u16, cq_id: u16| -> bool {
+        if sqid == ADMIN_QUEUE_ID {
+            return cq_id == ADMIN_QUEUE_ID && mig.admin_sq.is_some();
+        }
+        io_queue_index(sqid)
+            .and_then(|idx| mig.io_sqs.get(idx))
+            .and_then(Option::as_ref)
+            .is_some_and(|sq| sq.cq_id == cq_id)
+    };
+    for (cq_id, cq) in wire_cqs(mig) {
+        for held in &cq.held {
+            if !posts_to(held.sqid, cq_id) {
+                return Err(DeviceStateError::invalid(format!(
+                    "CQ {cq_id} holds a completion for SQ {}, which does \
+                     not post to it",
+                    held.sqid,
+                )));
+            }
+            if held.status > CQE_STATUS_MAX {
+                return Err(DeviceStateError::invalid(format!(
+                    "held status {:#x} does not fit a CQE",
+                    held.status,
+                )));
+            }
+        }
+    }
+    if held_per_sq(mig)
+        .iter()
+        .any(|&n| n > usize::from(MAX_QUEUE_SIZE))
+    {
+        return Err(DeviceStateError::invalid(format!(
+            "an SQ holds more than {MAX_QUEUE_SIZE} completions",
+        )));
+    }
+    Ok(())
+}
+
 /// Everything a controller payload must satisfy before any of it is
 /// applied, matching what the guest-facing create-queue commands
 /// enforce.
 pub(super) fn check_nvme_state(
     mig: &NvmeMigrateState,
 ) -> Result<(), DeviceStateError> {
-    use super::queues::{io_queue_index, valid_queue_base};
+    use super::queues::valid_queue_base;
 
     fn check_size(what: &str, size: u16) -> Result<(), DeviceStateError> {
         // The doorbell handlers take `% size`, so 0 divides by zero and
@@ -327,5 +448,5 @@ pub(super) fn check_nvme_state(
             check_sq(&format!("IO SQ {}", idx + 1), sq)?;
         }
     }
-    Ok(())
+    check_held(mig)
 }

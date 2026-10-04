@@ -192,6 +192,9 @@ pub const SC_INVALID_LOG_PAGE: u16 = 0x0109;
 /// Do Not Retry flag in status
 pub const SC_DNR: u16 = 1 << 14;
 
+/// The widest status a CQE holds: bit 0 of the field is the phase tag.
+pub const CQE_STATUS_MAX: u16 = 0x7FFF;
+
 // ── Submission Queue Entry (64 bytes) ──────────────────────────
 
 pub const SQE_SIZE: usize = 64;

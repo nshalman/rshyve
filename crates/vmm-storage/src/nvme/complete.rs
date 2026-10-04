@@ -171,6 +171,19 @@ impl NvmeController {
         }
     }
 
+    /// Write whatever every CQ holds that now has space for it.
+    pub(super) fn flush_all_held(&self, st: &mut NvmeState) {
+        let mem = MemCtx::new(Arc::clone(&self.physmap));
+        let cqs = std::iter::once(None).chain((0..MAX_IO_QUEUES).map(Some));
+        for idx in cqs {
+            if let Err(error) = st.flush_held(&mem, &self.msix, idx) {
+                slog::error!(self.log, "nvme: held CQE write failed";
+                    "error" => %error);
+                st.csts |= CSTS_CFS;
+            }
+        }
+    }
+
     /// Admit again on queues that stopped at their depth and now have
     /// room.
     fn after_finish(&self, st: &mut NvmeState) {
