@@ -613,7 +613,7 @@ fn a_stop_wakes_a_migration_blocked_on_its_peer() {
     let run = parked_source();
     let woken = Arc::new(AtomicUsize::new(0));
     let by_waker = Arc::clone(&woken);
-    run.on_cancel(Box::new(move || {
+    run.on_stop(Box::new(move || {
         by_waker.fetch_add(1, Ordering::AcqRel);
     }));
     assert_eq!(woken.load(Ordering::Acquire), 0);
@@ -623,7 +623,7 @@ fn a_stop_wakes_a_migration_blocked_on_its_peer() {
 
     // A socket opened after the stop is shut at once.
     let late = Arc::clone(&woken);
-    run.on_cancel(Box::new(move || {
+    run.on_stop(Box::new(move || {
         late.fetch_add(1, Ordering::AcqRel);
     }));
     assert_eq!(woken.load(Ordering::Acquire), 2);
@@ -634,7 +634,7 @@ fn a_stop_after_the_commit_lets_the_handover_finish() {
     let run = parked_source();
     let woken = Arc::new(AtomicBool::new(false));
     let by_waker = Arc::clone(&woken);
-    run.on_cancel(Box::new(move || by_waker.store(true, Ordering::Release)));
+    run.on_stop(Box::new(move || by_waker.store(true, Ordering::Release)));
     assert!(run.commit());
     stop(&run, &Calls::default()).expect("stop");
     assert!(!woken.load(Ordering::Acquire));
@@ -645,7 +645,7 @@ fn a_handover_a_stop_waits_for_is_still_cut_off_in_time() {
     // A send on illumos has no deadline of its own.
     let run = parked_source();
     let (tx, rx) = std::sync::mpsc::channel();
-    run.on_cancel(Box::new(move || {
+    run.on_stop(Box::new(move || {
         let _ = tx.send(());
     }));
     run.wake_after(Duration::from_millis(10));
@@ -659,7 +659,7 @@ fn an_ended_migration_drops_its_wakers() {
     let run = parked_source();
     let socket = Arc::new(());
     let held = Arc::clone(&socket);
-    run.on_cancel(Box::new(move || drop(held)));
+    run.on_stop(Box::new(move || drop(held)));
     run.end_migration(ok).expect("ended");
     assert_eq!(Arc::strong_count(&socket), 1, "the socket clone leaked");
 }

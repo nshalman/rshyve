@@ -124,35 +124,33 @@ fn run_inner<S: Transport>(
         chan.send(&Message::Error(err.clone()))?;
         return Err(err);
     };
-    chan.send(&Message::serialized(&ProtocolSelect {
-        protocol: protocol.to_string(),
-    })?)?;
+    let gate = hooks.gate.as_ref();
+    chan.send_uncommitted(
+        gate,
+        &Message::serialized(&ProtocolSelect {
+            protocol: protocol.to_string(),
+        })?,
+    )?;
 
     let preamble: MigrationPreamble = chan.expect_serialized()?;
     if let Err(err) = check_preamble(&preamble, config, log) {
         chan.report_failure(&err, log);
         return Err(err);
     }
-    chan.send(&Message::Okay)?;
+    chan.send_uncommitted(gate, &Message::Okay)?;
 
     // ── Pre-pause RAM passes ──
     set_phase(status, MigrationPhase::RamPushPrePause);
-    receive_pass(
-        chan,
-        memctx,
-        hooks.gate.as_ref(),
-        status,
-        PassEnd::PauseSignal,
-    )?;
+    receive_pass(chan, memctx, gate, status, PassEnd::PauseSignal)?;
 
     // ── Post-pause final pass ──
     set_phase(status, MigrationPhase::RamPushPostPause);
     chan.enter_post_pause()?;
-    receive_pass(chan, memctx, hooks.gate.as_ref(), status, PassEnd::MemEnd)?;
+    receive_pass(chan, memctx, gate, status, PassEnd::MemEnd)?;
 
     slog::info!(log, "pausing VM before state import");
     (hooks.pause_vm)().map_err(|e| {
-        cancel_or(hooks.gate.as_ref(), MigrateError::Io(format!("pause: {e}")))
+        cancel_or(gate, MigrateError::Io(format!("pause: {e}")))
     })?;
 
     // ── TimeData ──
@@ -166,7 +164,7 @@ fn run_inner<S: Transport>(
     // ── DeviceState ──
     set_phase(status, MigrationPhase::DeviceState);
     let dev_state: DeviceState = chan.expect_serialized()?;
-    not_cancelled(hooks.gate.as_ref())?;
+    not_cancelled(gate)?;
     if let Err(e) = restore_devices(&dev_state, config, hooks, log) {
         chan.report_failure(&e, log);
         return Err(e);
@@ -400,7 +398,7 @@ fn receive_pass<S: Transport>(
             }
             (Message::MemFetch(gpas), None) => sparse = Some(gpas),
             (Message::MemEnd, None) => {
-                chan.send(&Message::MemDone)?;
+                chan.send_uncommitted(gate, &Message::MemDone)?;
                 if until == PassEnd::MemEnd {
                     return Ok(());
                 }
@@ -681,6 +679,8 @@ mod pass_tests {
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             Ok(())
         }
+
+        fn on_stop(&self, _shut: Box<dyn FnOnce() + Send>) {}
     }
 
     /// Hooks whose resumes may not run.

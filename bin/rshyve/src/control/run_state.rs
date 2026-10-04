@@ -384,9 +384,10 @@ impl RunControl {
         lock_wakers(&self.wakers)
     }
 
-    /// Run `waker` when a stop cancels this migration, or now if one
-    /// already has.
-    pub(super) fn on_cancel(&self, waker: Waker) {
+    /// Run `waker` when a stop frees this migration's blocked I/O: at
+    /// the cancel, or once a committed handover ran out of time. Runs
+    /// now if that already happened.
+    pub(super) fn on_stop(&self, waker: Waker) {
         let mut wakers = self.lock_wakers();
         if wakers.fired {
             drop(wakers);

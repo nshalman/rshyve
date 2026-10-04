@@ -21,6 +21,8 @@
 //! run again.
 
 use std::io::Read;
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,6 +46,7 @@ use crate::pages::{
 };
 use crate::protocol::{payload_refusal, PageIter, PAGE_SIZE, SOURCE_OFFER};
 use crate::state;
+use crate::wait::unless_cancelled;
 use crate::wire::{
     cancel_or, not_cancelled, set_phase, Chan, Deadlines, Transport,
 };
@@ -211,9 +214,12 @@ fn run_inner<S: Transport>(
     // ── Sync ──
     set_phase(status, MigrationPhase::Sync);
 
-    chan.send(&Message::serialized(&ProtocolOffer {
-        protocols: SOURCE_OFFER.iter().map(|v| v.to_string()).collect(),
-    })?)?;
+    chan.send_uncommitted(
+        gate,
+        &Message::serialized(&ProtocolOffer {
+            protocols: SOURCE_OFFER.iter().map(|v| v.to_string()).collect(),
+        })?,
+    )?;
 
     let sel: ProtocolSelect = chan.expect_serialized()?;
     if !SOURCE_OFFER.contains(&sel.protocol.as_str()) {
@@ -224,12 +230,15 @@ fn run_inner<S: Transport>(
 
     let mut devices = config.devices.clone();
     devices.sort();
-    chan.send(&Message::serialized(&MigrationPreamble {
-        num_cpus: config.num_cpus,
-        mem_size: config.mem_size,
-        devices,
-        cpu_features: Some(cpu::local_features(config.cpu_baseline)),
-    })?)?;
+    chan.send_uncommitted(
+        gate,
+        &Message::serialized(&MigrationPreamble {
+            num_cpus: config.num_cpus,
+            mem_size: config.mem_size,
+            devices,
+            cpu_features: Some(cpu::local_features(config.cpu_baseline)),
+        })?,
+    )?;
     chan.expect_okay()?;
 
     // ── RamPushPrePause: send ALL pages ──
@@ -249,8 +258,7 @@ fn run_inner<S: Transport>(
         }
     }
 
-    not_cancelled(gate)?;
-    chan.send(&Message::PauseSignal)?;
+    chan.send_uncommitted(gate, &Message::PauseSignal)?;
 
     // ── Pause ──
     // From here the guest is stopped and every failure has to roll
@@ -267,13 +275,20 @@ fn run_inner<S: Transport>(
 
     // zvol WCE=1 means writes the guest was told were complete may
     // still sit in cache. `zfs send` ships only committed pool state.
+    // A durable sync has no deadline. It runs on its own thread so a
+    // stop is not held behind it; one left behind ends on its own.
     slog::info!(log, "flushing device backing caches");
-    device_flush_fn().map_err(|error| {
+    unless_cancelled(
+        "migrate-flush",
+        || gate.cancelled(),
+        |_| device_flush_fn(),
+    )?
+    .map_err(|error| {
         MigrateError::Io(format!("device flush failed: {error}"))
     })?;
 
     if let Some(barrier) = config.zfs_barrier.as_deref() {
-        zfs_barrier_wait(barrier, config.deadlines.zfs_barrier, log)?;
+        zfs_barrier_wait(barrier, config.deadlines.zfs_barrier, gate, log)?;
     }
 
     // The overlay pages go before the final pass: the destination
@@ -291,11 +306,10 @@ fn run_inner<S: Transport>(
     // ── TimeData ──
     set_phase(status, MigrationPhase::TimeData);
     let time_data = state::export_time_data(hdl, log)?;
-    chan.send(&Message::serialized(&time_data)?)?;
+    chan.send_uncommitted(gate, &Message::serialized(&time_data)?)?;
 
     // ── DeviceState ──
     set_phase(status, MigrationPhase::DeviceState);
-    not_cancelled(gate)?;
     let mut dev_state = state::export_device_state(hdl, config.num_cpus, log)?;
     dev_state.emulated = device_export_fn()
         .map_err(|e| MigrateError::State(format!("device export: {e}")))?;
@@ -305,12 +319,11 @@ fn run_inner<S: Transport>(
     dev_state.hyperv = hyperv;
     slog::info!(log, "exporting device state";
         "devices" => dev_state.emulated.len());
-    chan.send(&Message::serialized(&dev_state)?)?;
+    chan.send_uncommitted(gate, &Message::serialized(&dev_state)?)?;
 
     // ── RamPull (none needed) ──
     set_phase(status, MigrationPhase::RamPull);
-    not_cancelled(gate)?;
-    chan.send(&Message::MemEnd)?;
+    chan.send_uncommitted(gate, &Message::MemEnd)?;
 
     hand_over(chan, gate, status)
 }
@@ -354,20 +367,40 @@ fn hand_over<S: Transport>(
 fn zfs_barrier_wait(
     barrier_path: &Path,
     budget: Duration,
+    gate: &dyn StopGate,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     slog::info!(log, "waiting for post-pause ZFS sync";
         "barrier" => %barrier_path.display());
-    let mut stream = std::os::unix::net::UnixStream::connect(barrier_path)
-        .map_err(|e| {
-            MigrateError::Io(format!("ZFS barrier connect failed: {e}"))
-        })?;
+    // A Unix connect blocks while the agent's backlog is full.
+    let path = barrier_path.to_path_buf();
+    let mut stream = unless_cancelled(
+        "zfs-barrier-connect",
+        || gate.cancelled(),
+        move |_| UnixStream::connect(path),
+    )?
+    .map_err(|e| {
+        MigrateError::Io(format!("ZFS barrier connect failed: {e}"))
+    })?;
+    let clone = stream
+        .try_clone()
+        .map_err(|e| MigrateError::Io(format!("ZFS barrier socket: {e}")))?;
+    let shut_log = log.clone();
+    gate.on_stop(Box::new(move || {
+        if let Err(e) = clone.shutdown(Shutdown::Both) {
+            slog::debug!(shut_log, "the ZFS barrier was already closed";
+                "error" => %e);
+        }
+    }));
     stream.set_read_timeout(Some(budget)).map_err(|e| {
         MigrateError::Io(format!("ZFS barrier read timeout: {e}"))
     })?;
     let mut status = [0u8; 1];
     stream.read_exact(&mut status).map_err(|e| {
-        MigrateError::Io(format!("ZFS barrier reported nothing: {e}"))
+        cancel_or(
+            gate,
+            MigrateError::Io(format!("ZFS barrier reported nothing: {e}")),
+        )
     })?;
     if status[0] != ZFS_BARRIER_OK {
         return Err(MigrateError::Io(format!(
@@ -403,8 +436,7 @@ fn push_ram_all<S: Transport>(
         while off < num_pages {
             let count = BATCH_SIZE.min(num_pages - off);
             let base = gpa + (off * PAGE_SIZE) as u64;
-            not_cancelled(gate)?;
-            send_batch(chan, memctx, base, count, status)?;
+            send_batch(chan, memctx, gate, base, count, status)?;
             off += count;
         }
     }
@@ -428,7 +460,7 @@ fn push_ram<S: Transport>(
         hdl.track_dirty_pages(gpa, len, &mut bm)
             .map_err(|e| MigrateError::Io(format!("track_dirty: {e}")))?;
         total += send_dirty(PageIter::new(&bm, gpa, len), gate, |batch| {
-            send_batch_sparse(chan, memctx, batch, status)
+            send_batch_sparse(chan, memctx, gate, batch, status)
         })?;
     }
     if let Ok(mut s) = status.lock() {
@@ -438,7 +470,6 @@ fn push_ram<S: Transport>(
     Ok(total)
 }
 
-/// Send `pages` in batches and count them.
 fn send_dirty(
     pages: impl Iterator<Item = u64>,
     gate: &dyn StopGate,
@@ -466,8 +497,7 @@ fn end_pass<S: Transport>(
     chan: &mut Chan<S>,
     gate: &dyn StopGate,
 ) -> Result<(), MigrateError> {
-    not_cancelled(gate)?;
-    chan.send(&Message::MemEnd)?;
+    chan.send_uncommitted(gate, &Message::MemEnd)?;
     not_cancelled(gate)?;
     chan.expect_mem_done()
 }
@@ -475,6 +505,7 @@ fn end_pass<S: Transport>(
 fn send_batch<S: Transport>(
     chan: &mut Chan<S>,
     memctx: &MemCtx,
+    gate: &dyn StopGate,
     base_gpa: u64,
     count: usize,
     status: &Arc<Mutex<MigrationStatus>>,
@@ -484,12 +515,15 @@ fn send_batch<S: Transport>(
     let mut buf = vec![0u8; raw_size];
     read_pages(memctx, &gpas, &mut buf)?;
     let (data, flags) = compress(&buf);
-    chan.send(&Message::PageBatch {
-        base_gpa,
-        page_count: page_count(count)?,
-        flags,
-        data,
-    })?;
+    chan.send_uncommitted(
+        gate,
+        &Message::PageBatch {
+            base_gpa,
+            page_count: page_count(count)?,
+            flags,
+            data,
+        },
+    )?;
     if let Ok(mut s) = status.lock() {
         s.pages_transferred += count as u64;
         s.bytes_transferred += raw_size as u64;
@@ -500,6 +534,7 @@ fn send_batch<S: Transport>(
 fn send_batch_sparse<S: Transport>(
     chan: &mut Chan<S>,
     memctx: &MemCtx,
+    gate: &dyn StopGate,
     gpas: &[u64],
     status: &Arc<Mutex<MigrationStatus>>,
 ) -> Result<(), MigrateError> {
@@ -508,20 +543,23 @@ fn send_batch_sparse<S: Transport>(
     }
     let base = gpas[0];
     if are_contiguous(gpas) {
-        return send_batch(chan, memctx, base, gpas.len(), status);
+        return send_batch(chan, memctx, gate, base, gpas.len(), status);
     }
     let raw_size = page_buffer_len(gpas.len())?;
     let count = gpas.len();
     let mut buf = vec![0u8; raw_size];
     read_pages(memctx, gpas, &mut buf)?;
     let (data, flags) = compress(&buf);
-    chan.send(&Message::MemFetch(gpas.to_vec()))?;
-    chan.send(&Message::PageBatch {
-        base_gpa: base,
-        page_count: page_count(count)?,
-        flags,
-        data,
-    })?;
+    chan.send_uncommitted(gate, &Message::MemFetch(gpas.to_vec()))?;
+    chan.send_uncommitted(
+        gate,
+        &Message::PageBatch {
+            base_gpa: base,
+            page_count: page_count(count)?,
+            flags,
+            data,
+        },
+    )?;
     if let Ok(mut s) = status.lock() {
         s.pages_transferred += count as u64;
         s.bytes_transferred += raw_size as u64;
@@ -543,341 +581,4 @@ fn compress(raw: &[u8]) -> (Vec<u8>, u32) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write as _;
-    use std::os::unix::net::{UnixListener, UnixStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    fn discard() -> slog::Logger {
-        slog::Logger::root(slog::Discard, slog::o!())
-    }
-
-    /// A barrier socket that answers with `reply`, or with nothing when
-    /// `reply` is `None`.
-    fn barrier(reply: Option<u8>) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("barrier.sock");
-        let listener = UnixListener::bind(&path).expect("bind");
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                if let Some(byte) = reply {
-                    let _ = stream.write_all(&[byte]);
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        });
-        (dir, path)
-    }
-
-    #[test]
-    fn a_reported_zfs_failure_fails_the_migration() {
-        // The guest would resume on the destination having already
-        // acknowledged writes the destination disk never received.
-        let (_dir, path) = barrier(Some(1));
-        let error = zfs_barrier_wait(&path, Duration::from_secs(5), &discard())
-            .expect_err("a non-zero status must fail");
-        assert!(error.to_string().contains("reported failure"), "{error}");
-    }
-
-    #[test]
-    fn a_silent_zfs_barrier_fails_the_migration() {
-        let (_dir, path) = barrier(None);
-        let error =
-            zfs_barrier_wait(&path, Duration::from_millis(200), &discard())
-                .expect_err("a timeout must fail");
-        assert!(error.to_string().contains("reported nothing"), "{error}");
-    }
-
-    #[test]
-    fn a_missing_zfs_barrier_fails_the_migration() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = zfs_barrier_wait(
-            &dir.path().join("absent.sock"),
-            Duration::from_secs(1),
-            &discard(),
-        )
-        .expect_err("a missing socket must fail");
-        assert!(error.to_string().contains("connect failed"), "{error}");
-    }
-
-    #[test]
-    fn an_agreeing_zfs_barrier_lets_the_migration_go_on() {
-        let (_dir, path) = barrier(Some(ZFS_BARRIER_OK));
-        zfs_barrier_wait(&path, Duration::from_secs(5), &discard())
-            .expect("status 0 is the go-ahead");
-    }
-
-    #[test]
-    fn flush_failure_resumes_devices_and_vcpus() {
-        let result: Result<(), MigrateError> =
-            Err(MigrateError::Io("device flush failed".into()));
-        let devices_resumed = Arc::new(AtomicBool::new(false));
-        let vcpus_resumed = Arc::new(AtomicBool::new(false));
-        let devices_resumed_by_callback = Arc::clone(&devices_resumed);
-        let vcpus_resumed_by_callback = Arc::clone(&vcpus_resumed);
-        let devices_resumed_before_vcpus = Arc::clone(&devices_resumed);
-        let resume_fn: DeviceResumeFn = Box::new(move || {
-            devices_resumed_by_callback.store(true, Ordering::Release);
-        });
-
-        let result = finish_source(
-            result,
-            MigrationPhase::Pause,
-            &discard(),
-            resume_fn,
-            move || {
-                assert!(devices_resumed_before_vcpus.load(Ordering::Acquire));
-                vcpus_resumed_by_callback.store(true, Ordering::Release);
-                Ok::<(), &'static str>(())
-            },
-        );
-
-        assert!(result.is_err());
-        assert!(devices_resumed.load(Ordering::Acquire));
-        assert!(vcpus_resumed.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn a_committed_source_is_never_resumed() {
-        // The destination may be running the guest. Two copies against
-        // one disk is worse than a guest that needs an operator.
-        let resumed = Arc::new(AtomicBool::new(false));
-        let by_callback = Arc::clone(&resumed);
-        let resume_fn: DeviceResumeFn = Box::new(move || {
-            by_callback.store(true, Ordering::Release);
-        });
-        let result = finish_source(
-            Err(MigrateError::Committed("no confirmation".into())),
-            MigrationPhase::Committed,
-            &discard(),
-            resume_fn,
-            || -> Result<(), &'static str> {
-                panic!("a committed source must not resume its vCPUs")
-            },
-        );
-        assert!(result.is_err());
-        assert!(!resumed.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn a_failure_in_finish_still_rolls_back() {
-        // Nothing was promised yet: the destination waits for the
-        // commit before it starts the guest.
-        let resumed = Arc::new(AtomicBool::new(false));
-        let by_callback = Arc::clone(&resumed);
-        let resume_fn: DeviceResumeFn = Box::new(move || {
-            by_callback.store(true, Ordering::Release);
-        });
-        let result = finish_source(
-            Err(MigrateError::WebSocket("closed".into())),
-            MigrationPhase::Finish,
-            &discard(),
-            resume_fn,
-            || Ok::<(), &'static str>(()),
-        );
-        assert!(result.is_err());
-        assert!(resumed.load(Ordering::Acquire));
-    }
-
-    /// A gate a test can cancel, counting the commits it let through.
-    #[derive(Default)]
-    struct Gate {
-        cancel: bool,
-        commits: std::sync::atomic::AtomicUsize,
-    }
-
-    impl StopGate for Gate {
-        fn cancelled(&self) -> bool {
-            self.cancel
-        }
-
-        fn commit(&self) -> Result<(), MigrateError> {
-            if self.cancel {
-                return Err(crate::cancelled());
-            }
-            self.commits.fetch_add(1, Ordering::AcqRel);
-            Ok(())
-        }
-    }
-
-    /// A connected pair of channels, source end first.
-    fn pair() -> (Chan<UnixStream>, Chan<UnixStream>) {
-        let (a, b) = UnixStream::pair().expect("socket pair");
-        let deadlines = Deadlines {
-            post_pause: Duration::from_secs(5),
-            ..Deadlines::default()
-        };
-        (
-            Chan::new(a, tungstenite::protocol::Role::Client, deadlines)
-                .expect("source channel"),
-            Chan::new(b, tungstenite::protocol::Role::Server, deadlines)
-                .expect("destination channel"),
-        )
-    }
-
-    fn status() -> Arc<Mutex<MigrationStatus>> {
-        Arc::new(Mutex::new(MigrationStatus::default()))
-    }
-
-    fn phase(status: &Arc<Mutex<MigrationStatus>>) -> MigrationPhase {
-        status.lock().expect("status").phase
-    }
-
-    #[test]
-    fn a_cancelled_source_never_commits() {
-        let (mut source, mut dest) = pair();
-        dest.send(&Message::Okay)
-            .expect("the destination holds it all");
-        let gate = Gate {
-            cancel: true,
-            ..Gate::default()
-        };
-        let status = status();
-
-        let error =
-            hand_over(&mut source, &gate, &status).expect_err("cancelled");
-
-        assert!(crate::is_cancel(&error), "{error}");
-        assert_eq!(phase(&status), MigrationPhase::Finish, "not rolled back");
-        drop(source);
-        assert!(dest.recv().is_err(), "the destination heard a commit");
-    }
-
-    #[test]
-    fn a_destination_abort_rolls_the_source_back() {
-        let (mut source, mut dest) = pair();
-        dest.send(&Message::Error(crate::cancelled()))
-            .expect("abort");
-        let gate = Gate::default();
-        let status = status();
-
-        let error = hand_over(&mut source, &gate, &status)
-            .expect_err("the destination aborted");
-
-        assert_eq!(gate.commits.load(Ordering::Acquire), 0, "committed");
-        assert_eq!(phase(&status), MigrationPhase::Finish);
-        let rolled_back = Arc::new(AtomicBool::new(false));
-        let by_callback = Arc::clone(&rolled_back);
-        let _ = finish_source(
-            Err(error),
-            phase(&status),
-            &discard(),
-            Box::new(move || by_callback.store(true, Ordering::Release)),
-            || Ok::<(), &'static str>(()),
-        );
-        assert!(rolled_back.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn a_commit_the_peer_may_have_missed_is_never_rolled_back() {
-        // The destination may have the commit and be running the guest.
-        let (mut source, mut dest) = pair();
-        dest.send(&Message::Okay).expect("holds it all");
-        drop(dest);
-        let status = status();
-
-        let error = hand_over(&mut source, &Gate::default(), &status)
-            .expect_err("the peer left");
-
-        assert!(matches!(error, MigrateError::Committed(_)), "{error}");
-        assert_eq!(phase(&status), MigrationPhase::Committed);
-    }
-
-    #[test]
-    fn a_commit_goes_through_the_gate() {
-        let (mut source, mut dest) = pair();
-        let peer = std::thread::spawn(move || {
-            dest.send(&Message::Okay).expect("holds it all");
-            assert!(matches!(dest.recv(), Ok(Message::Okay)));
-            dest.send(&Message::Okay).expect("started");
-            dest
-        });
-        let gate = Gate::default();
-        let status = status();
-
-        hand_over(&mut source, &gate, &status).expect("handed over");
-
-        assert_eq!(gate.commits.load(Ordering::Acquire), 1);
-        assert_eq!(phase(&status), MigrationPhase::Committed);
-        peer.join().expect("the destination finished");
-    }
-
-    #[test]
-    fn a_cancel_stops_the_last_partial_batch() {
-        let gate = Gate {
-            cancel: true,
-            ..Gate::default()
-        };
-        let mut sent = 0;
-        let error = send_dirty((0..10).map(|p| p * 4096), &gate, |_| {
-            sent += 1;
-            Ok(())
-        })
-        .expect_err("cancelled");
-        assert!(crate::is_cancel(&error), "{error}");
-        assert_eq!(sent, 0);
-    }
-
-    #[test]
-    fn every_dirty_page_is_sent_once() {
-        let mut sizes = Vec::new();
-        let total = send_dirty(
-            (0..(BATCH_SIZE as u64 + 6)).map(|p| p * 4096),
-            &Gate::default(),
-            |batch| {
-                sizes.push(batch.len());
-                Ok(())
-            },
-        )
-        .expect("sent");
-        assert_eq!(total, BATCH_SIZE as u64 + 6);
-        assert_eq!(sizes, [BATCH_SIZE, 6]);
-    }
-
-    #[test]
-    fn a_cancelled_pass_sends_no_mem_end() {
-        let (mut source, mut dest) = pair();
-        let gate = Gate {
-            cancel: true,
-            ..Gate::default()
-        };
-        let error = end_pass(&mut source, &gate).expect_err("cancelled");
-        assert!(crate::is_cancel(&error), "{error}");
-        drop(source);
-        assert!(dest.recv().is_err(), "the destination heard a MemEnd");
-    }
-
-    #[test]
-    fn a_pause_a_stop_refused_is_a_cancel() {
-        let gate = Gate {
-            cancel: true,
-            ..Gate::default()
-        };
-        let error = cancel_or(&gate, MigrateError::Io("pause: refused".into()));
-        assert!(crate::is_cancel(&error), "{error}");
-        let error =
-            cancel_or(&Gate::default(), MigrateError::Io("pause: EIO".into()));
-        assert!(!crate::is_cancel(&error), "{error}");
-    }
-
-    #[test]
-    fn a_pre_pause_failure_does_not_resume_a_running_guest() {
-        // Nothing was paused yet, so a resume here would be a state
-        // change on a VM that never stopped.
-        let resumed = Arc::new(AtomicBool::new(false));
-        let by_callback = Arc::clone(&resumed);
-        let resume_fn: DeviceResumeFn = Box::new(move || {
-            by_callback.store(true, Ordering::Release);
-        });
-        let result = finish_source(
-            Err(MigrateError::Io("connect failed".into())),
-            MigrationPhase::Sync,
-            &discard(),
-            resume_fn,
-            || Ok::<(), &'static str>(()),
-        );
-        assert!(result.is_err());
-        assert!(!resumed.load(Ordering::Acquire));
-    }
-}
+mod tests;

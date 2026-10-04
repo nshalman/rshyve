@@ -17,6 +17,7 @@ pub mod pages;
 pub mod protocol;
 pub mod source;
 pub mod state;
+pub mod wait;
 pub mod wire;
 
 /// Pauses or resumes the vCPUs.
@@ -63,6 +64,10 @@ pub trait StopGate: Send + Sync {
     /// Claimed before the send, because a send that fails may still
     /// have reached the peer.
     fn commit(&self) -> Result<(), codec::MigrateError>;
+
+    /// Run `shut` when a stop frees this migration's blocked I/O, or at
+    /// once if one already has. It shuts a socket the migration opened.
+    fn on_stop(&self, shut: Box<dyn FnOnce() + Send>);
 }
 
 /// The gate for a VM with nothing that can stop it mid-migration.
@@ -76,6 +81,8 @@ impl StopGate for NoStop {
     fn commit(&self) -> Result<(), codec::MigrateError> {
         Ok(())
     }
+
+    fn on_stop(&self, _shut: Box<dyn FnOnce() + Send>) {}
 }
 
 /// Migration phases, executed in order.
