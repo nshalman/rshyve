@@ -92,6 +92,9 @@ pub struct Config {
     pub reattach: Duration,
     /// Where the ring logs.
     pub log: slog::Logger,
+    /// Time a reattach spends before it goes live, as a slow replay would.
+    #[cfg(test)]
+    pub(crate) replay_stall: Duration,
 }
 
 impl Config {
@@ -111,6 +114,8 @@ impl Config {
             deadline: Duration::from_secs(5),
             reattach: Duration::from_secs(30),
             log,
+            #[cfg(test)]
+            replay_stall: Duration::ZERO,
         }
     }
 }

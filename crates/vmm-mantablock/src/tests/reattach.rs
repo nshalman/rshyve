@@ -291,6 +291,35 @@ fn held_io_fails_when_no_engine_comes_back_in_time() {
 }
 
 #[test]
+fn a_replay_that_runs_past_the_bound_fails_held_io() {
+    let mut lab = lab(|c| {
+        c.reattach = Duration::from_millis(400);
+        c.replay_stall = Duration::from_millis(600);
+    });
+    lab.ring
+        .submit(job(1, 0, BlockOp::Write { fua: false }, 9, pattern(1, 9)));
+    lab.eng.take_n(1);
+    let t = Instant::now();
+    lab.lose();
+    let (_, mut eng) = lab.accept(geometry(), grant(geometry(), GEN));
+    assert_eq!(lab.calls.wait_for(1), vec![(1, BlockStatus::Internal)]);
+    assert!(
+        t.elapsed() >= Duration::from_millis(400),
+        "{:?}",
+        t.elapsed()
+    );
+    assert!(lab.ring.is_lost() && !lab.ring.is_held());
+    // Nothing more reaches the guest, and nothing new goes to the engine.
+    let sent = eng.take(8).len();
+    lab.ring.submit(job(2, 1, BlockOp::Read, 0, pattern(1, 0)));
+    assert_eq!(lab.calls.wait_for(2)[1], (2, BlockStatus::Internal));
+    assert!(sent <= 1);
+    assert!(eng.take(8).is_empty());
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(lab.calls.all().len(), 2);
+}
+
+#[test]
 fn a_flush_held_behind_writes_is_replayed_after_them() {
     let mut lab = lab(|_| {});
     for t in 0..3u16 {

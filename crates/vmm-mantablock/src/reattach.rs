@@ -34,6 +34,8 @@ pub(crate) struct Plan {
     grant: Grant,
     pub(crate) limit: Duration,
     deadline: Duration,
+    #[cfg(test)]
+    replay_stall: Duration,
 }
 
 impl Plan {
@@ -45,6 +47,8 @@ impl Plan {
             grant,
             limit: cfg.reattach,
             deadline: cfg.deadline,
+            #[cfg(test)]
+            replay_stall: cfg.replay_stall,
         }
     }
 }
@@ -142,7 +146,7 @@ fn once<J: Job>(
     }
     // Anything lost before this point was about the old attachment.
     shared.rehold();
-    match switch(shared, att) {
+    match switch(shared, plan, att, until) {
         Ok(()) => Ok(conn),
         Err(e) => {
             shared.rehold();
@@ -154,8 +158,14 @@ fn once<J: Job>(
 /// Replays on every queue, goes live, then starts the completion threads.
 fn switch<J: Job>(
     shared: &Arc<Shared<J>>,
+    plan: &Plan,
     att: Attached,
+    until: Instant,
 ) -> Result<(), Failed> {
+    #[cfg(test)]
+    std::thread::sleep(plan.replay_stall);
+    #[cfg(not(test))]
+    let _ = plan;
     let Attached { region, pipes, .. } = att;
     if pipes.len() != shared.queues.len() {
         return Err(Failed::Retry("queue count".into()));
@@ -175,6 +185,13 @@ fn switch<J: Job>(
             Err(why) => return Err(Failed::Retry(why.to_string())),
         }
         reapers.push((q, cq, p.wake_me));
+    }
+    // The replays may already be on the new ring; the engine may serve
+    // them, but the guest sees them fail, as a failed write allows.
+    if Instant::now() >= until {
+        return Err(Failed::Fatal(Lost::Internal(
+            "replayed past the reattach bound".into(),
+        )));
     }
     if !shared.resume(idle) {
         return Err(Failed::Retry("lost again during the reattach".into()));
