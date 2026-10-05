@@ -86,6 +86,25 @@ pub(crate) fn from_ring<J: Job>(
     Ok(())
 }
 
+/// Write data of a replay, from the old region into the same pages of
+/// the new one.
+pub(crate) fn between(
+    old: &Region,
+    new: &Region,
+    span: Span,
+    stage: &mut Stage,
+) -> Result<(), BlockStatus> {
+    for (page, _, len) in span.steps() {
+        let buf = &mut stage.0[..len];
+        if !old.read_buffer(span.q, page, buf)
+            || !new.write_buffer(span.q, page, buf)
+        {
+            return Err(BlockStatus::Internal);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -85,7 +85,7 @@ fn a_hung_engine_holds_halt_for_the_deadline_not_the_io_limit() {
 }
 
 /// Answers every Ping, and nothing else, until the socket closes.
-fn answer_pings(mut s: UnixStream) {
+pub(super) fn answer_pings(mut s: UnixStream) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {

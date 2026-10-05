@@ -78,6 +78,7 @@ impl Guest {
         };
         Some(TJob {
             id,
+            queue: 1,
             tag,
             op,
             off: if op == BlockOp::Flush {

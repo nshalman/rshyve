@@ -30,6 +30,8 @@ use crate::wake::{adopt, End};
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Ask {
     pub(crate) volume: [u8; 16],
+    /// 0 for a new one; else a reattach, which must get this one back.
+    pub(crate) generation: u64,
     pub(crate) queues: u16,
     pub(crate) depth: u32,
     pub(crate) buf_pages: u32,
@@ -50,8 +52,49 @@ pub(crate) struct Attached {
     pub(crate) generation: u64,
     pub(crate) volume_blocks: u64,
     pub(crate) durable: bool,
+    pub(crate) max_blocks: u32,
     pub(crate) slots: Slots,
     pub(crate) pipes: Vec<Pipes>,
+}
+
+/// What an attachment was granted. A reattach must get the same, as the
+/// held requests name its queues, tags and buffer pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Grant {
+    pub(crate) generation: u64,
+    pub(crate) geometry: Geometry,
+    pub(crate) volume_blocks: u64,
+    pub(crate) durable: bool,
+    pub(crate) max_blocks: u32,
+    pub(crate) slots: Slots,
+}
+
+impl Attached {
+    pub(crate) fn grant(&self) -> Grant {
+        Grant {
+            generation: self.generation,
+            geometry: *self.region.geometry(),
+            volume_blocks: self.volume_blocks,
+            durable: self.durable,
+            max_blocks: self.max_blocks,
+            slots: self.slots,
+        }
+    }
+}
+
+impl Grant {
+    /// The Attach that asks for this grant again.
+    pub(crate) fn ask(&self, volume: [u8; 16], allow_volatile: bool) -> Ask {
+        Ask {
+            volume,
+            generation: self.generation,
+            queues: self.geometry.queues(),
+            depth: self.geometry.depth(),
+            buf_pages: self.geometry.buf_pages(),
+            max_blocks: self.max_blocks,
+            allow_volatile,
+        }
+    }
 }
 
 pub(crate) fn attach(
@@ -76,8 +119,7 @@ pub(crate) fn attach(
     conn.send(
         &Message::Attach(Attach {
             volume: ask.volume,
-            // 0 asks for a new generation. There is no reattach yet.
-            generation: 0,
+            generation: ask.generation,
             queues: ask.queues,
             depth: ask.depth,
             buf_pages: ask.buf_pages,
@@ -123,6 +165,7 @@ pub(crate) fn attach(
         generation: ok.generation,
         volume_blocks: ok.volume_blocks,
         durable: ok.flags & ATTACH_DURABLE != 0,
+        max_blocks: ok.max_blocks,
         slots,
         pipes,
     })
@@ -157,6 +200,9 @@ pub(crate) fn check_ok(ask: &Ask, ok: &AttachOk) -> Result<Geometry, String> {
     }
     if ok.generation == 0 {
         return Err("generation 0".into());
+    }
+    if ask.generation != 0 && ok.generation != ask.generation {
+        return Err(format!("generation {} on a reattach", ok.generation));
     }
     if ok.queues > ask.queues
         || ok.depth > ask.depth
@@ -219,6 +265,7 @@ mod tests {
     fn ask() -> Ask {
         Ask {
             volume: [1; 16],
+            generation: 0,
             queues: 2,
             depth: 64,
             buf_pages: 1024,
@@ -272,6 +319,11 @@ mod tests {
             f(&mut o);
             assert!(check_ok(&ask(), &o).is_err(), "case {i}");
         }
+        let mut again = ask();
+        again.generation = 3;
+        assert!(check_ok(&again, &ok()).is_ok());
+        again.generation = 4;
+        assert!(check_ok(&again, &ok()).is_err());
         let mut volatile = ask();
         volatile.allow_volatile = true;
         let mut o = ok();
@@ -365,6 +417,7 @@ mod tests {
         });
         let ask = Ask {
             volume: [1; 16],
+            generation: 0,
             queues: 1,
             depth: 16,
             buf_pages: 4,

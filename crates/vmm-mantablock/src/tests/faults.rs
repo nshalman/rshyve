@@ -62,6 +62,7 @@ fn a_failed_read_part_writes_no_guest_memory() {
     let mem = Arc::new(Mutex::new(vec![0xee; 4 * PAGE]));
     ring.submit(TJob {
         id: 1,
+        queue: 1,
         tag: 0,
         op: BlockOp::Read,
         off: 0,

@@ -33,6 +33,16 @@ pub(crate) enum Lost {
     Heartbeat,
     /// A request stayed on the ring past the I/O limit.
     Stalled,
+    /// The ring itself failed: a poisoned lock or no thread.
+    Internal(String),
+}
+
+impl Lost {
+    /// True when a reattach cannot help: the generation has no sequence
+    /// left, or the ring's own state is not to be trusted.
+    pub(crate) fn fatal(&self) -> bool {
+        matches!(self, Self::Exhausted(_) | Self::Internal(_))
+    }
 }
 
 impl std::fmt::Display for Lost {

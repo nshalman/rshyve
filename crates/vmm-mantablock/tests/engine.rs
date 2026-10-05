@@ -52,25 +52,7 @@ impl Lab {
         ];
         let disk = tempfile::NamedTempFile::new().unwrap();
         disk.as_file().set_len(BLOCKS * PAGE as u64).unwrap();
-        let engine = Command::new(bin)
-            .arg("--socket-dir")
-            .arg(dirs[0].path())
-            .arg("--region-dir")
-            .arg(dirs[1].path())
-            .arg("--state-dir")
-            .arg(dirs[2].path())
-            .arg("--volume")
-            .arg(format!(
-                "{FILE_VOL},any,{BLOCKS},file:{}",
-                disk.path().display()
-            ))
-            .arg("--volume")
-            .arg(format!("{NULL_VOL},any,{BLOCKS},null"))
-            .arg("--allow-null")
-            .args(["--max-depth", "64", "--max-buf-pages", "512"])
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
+        let engine = spawn(&bin, &dirs, &disk);
         let socks = dirs[0].path().join("any");
         let lab = Self {
             engine,
@@ -78,12 +60,28 @@ impl Lab {
             disk,
             socks,
         };
+        lab.wait_for_sockets();
+        lab
+    }
+
+    fn wait_for_sockets(&self) {
         let until = Instant::now() + Duration::from_secs(10);
-        while !lab.sock(FILE_VOL).exists() || !lab.sock(NULL_VOL).exists() {
+        while !self.sock(FILE_VOL).exists() || !self.sock(NULL_VOL).exists() {
             assert!(Instant::now() < until, "the engine made no sockets");
             thread::sleep(Duration::from_millis(10));
         }
-        lab
+    }
+
+    /// Kills the engine and starts a new one on the same directories.
+    fn restart(&mut self) {
+        self.engine.kill().unwrap();
+        self.engine.wait().unwrap();
+        for vol in [FILE_VOL, NULL_VOL] {
+            let _ = std::fs::remove_file(self.sock(vol));
+        }
+        let bin = std::env::var_os("MANTABLOCK_ENGINE").unwrap();
+        self.engine = spawn(&bin, &self._dirs, &self.disk);
+        self.wait_for_sockets();
     }
 
     fn sock(&self, vol: &str) -> PathBuf {
@@ -126,6 +124,32 @@ impl Lab {
             .unwrap();
         b
     }
+}
+
+fn spawn(
+    bin: &std::ffi::OsStr,
+    dirs: &[tempfile::TempDir; 3],
+    disk: &tempfile::NamedTempFile,
+) -> Child {
+    Command::new(bin)
+        .arg("--socket-dir")
+        .arg(dirs[0].path())
+        .arg("--region-dir")
+        .arg(dirs[1].path())
+        .arg("--state-dir")
+        .arg(dirs[2].path())
+        .arg("--volume")
+        .arg(format!(
+            "{FILE_VOL},any,{BLOCKS},file:{}",
+            disk.path().display()
+        ))
+        .arg("--volume")
+        .arg(format!("{NULL_VOL},any,{BLOCKS},null"))
+        .arg("--allow-null")
+        .args(["--max-depth", "64", "--max-buf-pages", "512"])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap()
 }
 
 impl Drop for Lab {
@@ -341,7 +365,9 @@ fn completions_the_engine_publishes_together_reach_the_sink_together() {
 #[ignore = "runs the real engine: set MANTABLOCK_ENGINE, pass --ignored"]
 fn a_killed_engine_fails_what_is_held_and_everything_after() {
     let mut lab = Lab::start();
-    let (ring, calls) = attach(&lab, lab.config(FILE_VOL));
+    let mut cfg = lab.config(FILE_VOL);
+    cfg.reattach = Duration::ZERO;
+    let (ring, calls) = attach(&lab, cfg);
     lab.stop();
     for t in 0..4u16 {
         ring.submit(job(
@@ -374,6 +400,7 @@ fn a_hung_engine_is_lost_after_the_heartbeat_limit() {
     let lab = Lab::start();
     let mut cfg = lab.config(FILE_VOL);
     cfg.heartbeat_limit = Duration::from_millis(300);
+    cfg.reattach = Duration::ZERO;
     let (ring, calls) = attach(&lab, cfg);
     lab.stop();
     ring.submit(job(1, 1, 0, BlockOp::Read, 0, pattern(1, 0)));
@@ -454,4 +481,92 @@ fn a_volume_the_engine_does_not_serve_is_refused() {
     cfg.volume = NULL_VOL.parse().unwrap();
     let err = connect(cfg).err().unwrap();
     assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused, "{err}");
+}
+
+/// Writes on both queues, some split, sent while the engine is stopped.
+fn held_writes(ring: &Ring<TJob>) -> Vec<(u64, Vec<u8>)> {
+    let mut want = Vec::new();
+    for t in 0..6u16 {
+        let lba = 100 + 40 * u64::from(t);
+        let data = pattern(1 + 7 * usize::from(t), 0x40 + u32::from(t));
+        ring.submit(job(
+            u32::from(t),
+            1 + t % 2,
+            t,
+            BlockOp::Write { fua: false },
+            lba,
+            data.clone(),
+        ));
+        want.push((lba, data));
+    }
+    want
+}
+
+#[test]
+#[ignore = "runs the real engine: set MANTABLOCK_ENGINE, pass --ignored"]
+fn an_engine_lost_and_back_gets_the_held_writes_again() {
+    let lab = Lab::start();
+    let mut cfg = lab.config(FILE_VOL);
+    cfg.heartbeat_limit = Duration::from_millis(300);
+    cfg.reattach = Duration::from_secs(20);
+    let (ring, calls) = attach(&lab, cfg);
+    lab.stop();
+    let want = held_writes(&ring);
+    let until = Instant::now() + Duration::from_secs(5);
+    while !ring.is_held() {
+        assert!(Instant::now() < until, "the ring did not hold");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(calls.all().is_empty());
+    lab.resume();
+    let done = calls.wait_for(want.len(), Duration::from_secs(20));
+    assert!(
+        done.iter().all(|(_, s)| *s == BlockStatus::Success),
+        "{done:?}"
+    );
+    for (lba, data) in &want {
+        assert_eq!(&lab.on_disk(*lba, data.len() / PAGE), data, "lba {lba}");
+    }
+    assert!(!ring.is_held() && !ring.is_lost());
+    // And the new attachment serves new requests.
+    let mem = Arc::new(Mutex::new(vec![0; PAGE]));
+    ring.submit(TJob {
+        id: 50,
+        queue: 2,
+        tag: 9,
+        op: BlockOp::Read,
+        off: 100 * PAGE as u64,
+        mem: Arc::clone(&mem),
+    });
+    calls.wait_for(want.len() + 1, Duration::from_secs(5));
+    assert_eq!(*mem.lock().unwrap(), want[0].1);
+    ring.halt();
+    assert!(!ring.is_lost());
+}
+
+/// An engine that keeps no generation across a restart refuses the
+/// reattach, so held I/O fails at the bound. An engine that keeps it
+/// takes the replay instead, and this test changes with it.
+#[test]
+#[ignore = "runs the real engine: set MANTABLOCK_ENGINE, pass --ignored"]
+fn an_engine_restarted_without_the_generation_fails_held_io_at_the_bound() {
+    let mut lab = Lab::start();
+    let mut cfg = lab.config(FILE_VOL);
+    cfg.reattach = Duration::from_secs(2);
+    let (ring, calls) = attach(&lab, cfg);
+    lab.stop();
+    held_writes(&ring);
+    let t = Instant::now();
+    lab.restart();
+    let done = calls.wait_for(6, Duration::from_secs(10));
+    assert!(
+        t.elapsed() >= Duration::from_millis(1500),
+        "{:?}",
+        t.elapsed()
+    );
+    assert!(
+        done.iter().all(|(_, s)| *s == BlockStatus::Internal),
+        "{done:?}"
+    );
+    assert!(ring.is_lost());
 }

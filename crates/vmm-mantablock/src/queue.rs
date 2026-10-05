@@ -13,11 +13,16 @@
 //!
 //! Lock order: `sq`, then a request. Nothing calls the sink with either
 //! held: the sink may call `submit` again on the same thread.
+//!
+//! While the engine is lost the queue is held: it takes requests but puts
+//! nothing on the ring, and no completion thread runs. A reattach moves it
+//! to the new region and replays the parts in flight.
 
 use std::collections::VecDeque;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use manta_block_ring::layout::{PAGE, SQE_BYTES};
 use manta_block_ring::{Cqe, Op, Producer, Region, Sqe};
@@ -54,11 +59,14 @@ struct Req<J: Job> {
 
 /// The SQ producer and what only it uses.
 struct SqSide {
+    region: Arc<Region>,
     sq: Producer<SQE_BYTES>,
     wake_engine: OwnedFd,
     seqs: Seqs,
     /// The sequence each tag carries while it is not free.
     opened: Vec<u64>,
+    /// The entry each tag carries while it is not free, for a replay.
+    sent: Vec<Sqe>,
     /// Requests with something left to put on the ring, oldest first.
     pending: VecDeque<usize>,
     stage: Stage,
@@ -66,6 +74,7 @@ struct SqSide {
 
 /// What the completion thread keeps between batches.
 pub(crate) struct CqSide {
+    region: Arc<Region>,
     stage: Stage,
     /// Tags to free, one bit each.
     freed: Vec<u64>,
@@ -75,7 +84,6 @@ pub(crate) struct CqSide {
 
 pub(crate) struct QueueRing<J: Job> {
     q: u16,
-    region: Arc<Region>,
     slots: Slots,
     durable: bool,
     volume_blocks: u64,
@@ -85,6 +93,8 @@ pub(crate) struct QueueRing<J: Job> {
     reqs: Vec<Mutex<Option<Req<J>>>>,
     /// The pending queue holds a request waiting for a free tag.
     waiting: AtomicBool,
+    /// The engine is lost; nothing goes on the ring until a reattach.
+    held: AtomicBool,
     dead: AtomicBool,
 }
 
@@ -103,21 +113,23 @@ impl<J: Job> QueueRing<J> {
         let tags = usize::from(slots.tags);
         Some(Self {
             q,
-            region,
             slots,
             durable,
             volume_blocks,
             sq: Mutex::new(SqSide {
+                region,
                 sq,
                 wake_engine,
                 seqs: Seqs::new(generation, q),
                 opened: vec![0; tags],
+                sent: vec![Sqe::decode(&[0; SQE_BYTES]); tags],
                 pending: VecDeque::new(),
                 stage: Stage::new(),
             }),
             tags: Tags::new(slots.tags),
             reqs: (0..=tags).map(|_| Mutex::new(None)).collect(),
             waiting: AtomicBool::new(false),
+            held: AtomicBool::new(false),
             dead: AtomicBool::new(false),
         })
     }
@@ -127,8 +139,10 @@ impl<J: Job> QueueRing<J> {
         self.slots.tags
     }
 
-    pub(crate) fn cq_side(&self) -> CqSide {
+    /// For a completion thread on `region`.
+    pub(crate) fn cq_side(&self, region: Arc<Region>) -> CqSide {
         CqSide {
+            region,
             stage: Stage::new(),
             freed: vec![0; self.tags.words()],
             kicks: Vec::new(),
@@ -247,7 +261,9 @@ impl<J: Job> QueueRing<J> {
     /// Puts what it can of the pending queue on the ring, oldest first,
     /// then wakes the engine if it sleeps.
     fn pump(&self, sq: &mut SqSide, out: &mut Out<J::Id>) -> Result<(), Lost> {
-        if self.dead.load(Ordering::Acquire) {
+        if self.dead.load(Ordering::Acquire)
+            || self.held.load(Ordering::Acquire)
+        {
             return Ok(());
         }
         let mut posted = false;
@@ -323,13 +339,13 @@ impl<J: Job> QueueRing<J> {
             };
             // The engine reads the buffer only after the tail moves, and
             // the tail store in `publish` releases these stores.
-            copy::to_ring(&self.region, job, pages, span, &mut sq.stage)
+            copy::to_ring(&sq.region, job, pages, span, &mut sq.stage)
                 .map_err(Posted::Copy)?;
         }
-        let id = sq
-            .seqs
-            .open()
-            .map_err(|_| Posted::Lost(Lost::Exhausted(self.q)))?;
+        let Ok(id) = sq.seqs.open() else {
+            self.tags.abandon(tag);
+            return Err(Posted::Lost(Lost::Exhausted(self.q)));
+        };
         sq.opened[usize::from(tag)] = id.seq;
         let watermark = self.tags.oldest_open(&sq.opened).unwrap_or(id.seq);
         let queued_at = now_ns();
@@ -353,11 +369,16 @@ impl<J: Job> QueueRing<J> {
             flags: 0,
             reserved: [0; 12],
         };
-        match sq.sq.try_push(&e.encode()) {
-            Ok(true) => {}
-            Ok(false) => return Err(Posted::Lost(Lost::Full(self.q))),
-            Err(_) => return Err(Posted::Lost(Lost::Broken(self.q))),
+        let why = match sq.sq.try_push(&e.encode()) {
+            Ok(true) => None,
+            Ok(false) => Some(Lost::Full(self.q)),
+            Err(_) => Some(Lost::Broken(self.q)),
+        };
+        if let Some(why) = why {
+            self.tags.abandon(tag);
+            return Err(Posted::Lost(why));
         }
+        sq.sent[usize::from(tag)] = e;
         if flush {
             req.flush_after = false;
         } else {
@@ -378,27 +399,33 @@ impl<J: Job> QueueRing<J> {
         if self.dead.load(Ordering::Acquire) {
             return Ok(());
         }
+        let mut bad = None;
         for c in cqes {
-            let part = self
-                .tags
-                .complete(c)
-                .map_err(|e| Lost::Completion(self.q, e))?;
+            let part = match self.tags.complete(c) {
+                Ok(part) => part,
+                Err(e) => {
+                    bad = Some(Lost::Completion(self.q, e));
+                    break;
+                }
+            };
             self.land(c, part, cq, out)?;
             let t = usize::from(c.tag);
             cq.freed[t / 64] |= 1 << (t % 64);
         }
         self.tags.release(&mut cq.freed);
         fence(Ordering::SeqCst);
-        if cq.kicks.is_empty() && !self.waiting.load(Ordering::Relaxed) {
-            return Ok(());
+        // Even after a bad completion: a request landed before it may
+        // wait for its flush, and a reattach sends it from `pending`.
+        if !cq.kicks.is_empty() || self.waiting.load(Ordering::Relaxed) {
+            let mut sq = lock(&self.sq)?;
+            if self.dead.load(Ordering::Acquire) {
+                cq.kicks.clear();
+            } else {
+                sq.pending.extend(cq.kicks.drain(..));
+                self.pump(&mut sq, out)?;
+            }
         }
-        let mut sq = lock(&self.sq)?;
-        if self.dead.load(Ordering::Acquire) {
-            cq.kicks.clear();
-            return Ok(());
-        }
-        sq.pending.extend(cq.kicks.drain(..));
-        self.pump(&mut sq, out)
+        bad.map_or(Ok(()), Err)
     }
 
     /// One part is back: move its data and finish the request if it was
@@ -427,7 +454,7 @@ impl<J: Job> QueueRing<J> {
                         blocks: part.blocks,
                     };
                     match copy::from_ring(
-                        &self.region,
+                        &cq.region,
                         job,
                         pages,
                         span,
@@ -449,7 +476,93 @@ impl<J: Job> QueueRing<J> {
         Ok(())
     }
 
-    /// The engine is lost: fail everything held, and take nothing more.
+    /// The engine is lost: put nothing more on the ring. Under `sq`, so a
+    /// submission already past the check finishes first.
+    pub(crate) fn hold(&self) {
+        let _sq = self.sq.lock().unwrap_or_else(|e| e.into_inner());
+        self.held.store(true, Ordering::Release);
+    }
+
+    /// Moves the queue to a new attachment of the same grant. Replays
+    /// each part in flight, oldest first, with its op id and, for a
+    /// write, its data from the old region. The queue stays held: what
+    /// waits goes in [`QueueRing::kick`]. Only while no completion thread
+    /// runs on this queue. Returns how many parts and requests it held.
+    pub(crate) fn reattach(
+        &self,
+        region: Arc<Region>,
+        wake_engine: OwnedFd,
+        budget: &Budget,
+    ) -> Result<usize, Lost> {
+        let mut sq = lock(&self.sq)?;
+        if self.dead.load(Ordering::Acquire) {
+            return Ok(0);
+        }
+        let producer =
+            region.sq_producer(self.q).ok_or(Lost::Broken(self.q))?;
+        let mut open = self.tags.after_loss();
+        open.sort_by_key(|&t| sq.opened[usize::from(t)]);
+        let old = std::mem::replace(&mut sq.region, region);
+        sq.sq = producer;
+        sq.wake_engine = wake_engine;
+        let now = now_ns();
+        let watermark = open.first().map_or(0, |&t| sq.opened[usize::from(t)]);
+        // Every copy before any push: a reattach that fails after this
+        // copies from the new region next time.
+        for &tag in &open {
+            budget.step()?;
+            let SqSide {
+                region,
+                sent,
+                stage,
+                ..
+            } = &mut *sq;
+            let e = &mut sent[usize::from(tag)];
+            e.watermark = watermark;
+            e.queued_at = now;
+            if e.op != Op::Write as u8 {
+                continue;
+            }
+            let span = Span {
+                q: self.q,
+                page: e.buf_page,
+                first: 0,
+                blocks: e.blocks,
+            };
+            copy::between(&old, region, span, stage)
+                .map_err(|_| Lost::Internal("replay copy".into()))?;
+        }
+        drop(old);
+        for &tag in &open {
+            let bytes = sq.sent[usize::from(tag)].encode();
+            self.tags.repost(tag, now);
+            match sq.sq.try_push(&bytes) {
+                Ok(true) => {}
+                Ok(false) => return Err(Lost::Full(self.q)),
+                Err(_) => return Err(Lost::Broken(self.q)),
+            }
+        }
+        if !open.is_empty() && sq.sq.publish() {
+            wake::wake(&sq.wake_engine).map_err(|_| Lost::Pipe(self.q))?;
+        }
+        Ok(open.len() + sq.pending.len())
+    }
+
+    /// Ends a hold. Under `sq`, so a submission sees it or finds its
+    /// request pumped by [`QueueRing::kick`].
+    pub(crate) fn release(&self) {
+        let _sq = self.sq.lock().unwrap_or_else(|e| e.into_inner());
+        self.held.store(false, Ordering::Release);
+    }
+
+    /// Sends what waited while the queue was held.
+    pub(crate) fn kick(&self, out: &mut Out<J::Id>) -> Result<(), Lost> {
+        let mut sq = lock(&self.sq)?;
+        self.pump(&mut sq, out)
+    }
+
+    /// The engine is lost for good: fail everything held, and take
+    /// nothing more.
     pub(crate) fn fail_all(&self, out: &mut Out<J::Id>) {
         // A poisoned lock still guards what must fail.
         let mut sq = self.sq.lock().unwrap_or_else(|e| e.into_inner());
@@ -504,7 +617,7 @@ fn settle<J: Job>(
 /// state is not to be trusted, so the engine counts as lost.
 fn lock<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>, Lost> {
     m.lock()
-        .map_err(|_| Lost::Control("queue lock poisoned".into()))
+        .map_err(|_| Lost::Internal("queue lock poisoned".into()))
 }
 
 enum Posted {
@@ -550,6 +663,31 @@ impl<J: Job> Req<J> {
             pages: s.pages,
             queued: false,
         }
+    }
+}
+
+/// When a replay must be done.
+pub(crate) struct Budget {
+    pub(crate) until: Instant,
+    /// Time each replayed part takes, as a slow copy would.
+    #[cfg(test)]
+    pub(crate) stall: std::time::Duration,
+}
+
+impl Budget {
+    pub(crate) fn spent(&self) -> Result<(), Lost> {
+        if Instant::now() >= self.until {
+            return Err(Lost::Internal(
+                "replay past the reattach bound".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn step(&self) -> Result<(), Lost> {
+        #[cfg(test)]
+        std::thread::sleep(self.stall);
+        self.spent()
     }
 }
 

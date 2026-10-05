@@ -11,7 +11,7 @@
 
 use std::io::{self, IoSliceMut};
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Instant;
@@ -21,8 +21,8 @@ use manta_block_ring::layout::MAX_QUEUES;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
 use rustix::net::{
-    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
-    SendFlags,
+    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags,
+    ReturnFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
 };
 
 // illumos has no MSG_CMSG_CLOEXEC; there each descriptor gets
@@ -49,8 +49,24 @@ pub(crate) struct Conn {
 }
 
 impl Conn {
-    pub(crate) fn connect(path: &Path) -> io::Result<Self> {
-        Self::new(UnixStream::connect(path)?)
+    /// A blocking connect can wait for ever on a listener whose backlog
+    /// is full, so this one is bounded by `deadline`.
+    pub(crate) fn connect(path: &Path, deadline: Instant) -> io::Result<Self> {
+        let fd = rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            None,
+        )?;
+        match rustix::net::connect(&fd, &SocketAddrUnix::new(path)?) {
+            Ok(()) => {}
+            Err(Errno::INPROGRESS) => {
+                wait(fd.as_fd(), PollFlags::OUT, deadline)?;
+                rustix::net::sockopt::socket_error(&fd)??;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Self::new(UnixStream::from(fd))
     }
 
     pub(crate) fn new(s: UnixStream) -> io::Result<Self> {
@@ -192,20 +208,28 @@ impl Conn {
     }
 
     fn wait(&self, flags: PollFlags, deadline: Instant) -> io::Result<()> {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        let ts = Timespec {
-            tv_sec: left.as_secs() as _,
-            tv_nsec: left.subsec_nanos() as _,
-        };
-        let mut fds = [PollFd::from_borrowed_fd(self.s.as_fd(), flags)];
-        match rustix::event::poll(&mut fds, Some(&ts)) {
-            Ok(0) => Err(io::ErrorKind::TimedOut.into()),
-            Ok(_) | Err(Errno::INTR) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        wait(self.s.as_fd(), flags, deadline)
+    }
+}
+
+fn wait(
+    fd: BorrowedFd<'_>,
+    flags: PollFlags,
+    deadline: Instant,
+) -> io::Result<()> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    let ts = Timespec {
+        tv_sec: left.as_secs() as _,
+        tv_nsec: left.subsec_nanos() as _,
+    };
+    let mut fds = [PollFd::from_borrowed_fd(fd, flags)];
+    match rustix::event::poll(&mut fds, Some(&ts)) {
+        Ok(0) => Err(io::ErrorKind::TimedOut.into()),
+        Ok(_) | Err(Errno::INTR) => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
 

@@ -9,10 +9,11 @@
 //! must set idle, fence and look again, or it can miss a wake-up.
 
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use manta_block_ring::layout::CQE_BYTES;
-use manta_block_ring::{BadCompletion, Consumer, Cqe};
+use manta_block_ring::{BadCompletion, Consumer, Cqe, Region};
 
 use crate::job::Job;
 use crate::out::{Lost, Out};
@@ -30,13 +31,14 @@ pub(crate) fn run<J: Job>(
     shared: &Shared<J>,
     q: u16,
     mut cq: Consumer<CQE_BYTES>,
+    region: Arc<Region>,
     wake_me: &OwnedFd,
     spin: Duration,
 ) {
     let Some(ring) = shared.queue(usize::from(q)) else {
         return;
     };
-    let mut side = ring.cq_side();
+    let mut side = ring.cq_side(region);
     let mut cqes = Vec::new();
     // The spin runs from the last completion, so a sleep that ends with
     // nothing to take starts no new spin.
@@ -55,6 +57,7 @@ pub(crate) fn run<J: Job>(
             }
         }
         if found {
+            shared.progressed();
             last = Instant::now();
             polls = 0;
             continue;
@@ -84,7 +87,7 @@ pub(crate) fn run<J: Job>(
                 {
                     return shared.lose(why);
                 }
-                if !shared.halted() {
+                if !shared.halted() && !shared.stopping() {
                     shared.lose(Lost::Pipe(q));
                 }
                 return;
