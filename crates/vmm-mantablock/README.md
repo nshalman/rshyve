@@ -54,13 +54,29 @@ region file while it is attached, and must not leave it sparse on a
 tmpfs that can run out of space. rshyve checks the file's length once,
 before it maps it, and does nothing about SIGBUS after that.
 
+## Engine loss and reattach
+
+When the engine is lost (socket closed, no Pong, a stalled request, a
+completion that fails its checks), the ring holds every request. Guest
+I/O waits; nothing goes on the ring. The control thread connects to the
+same socket again with backoff, and sends Attach with the same
+generation. The new grant must equal the old one: same generation,
+geometry, size, durability and part size. Else the attempt is refused.
+
+On a reattach each part that was in flight is sent again, oldest first,
+with its own op id, so the engine can find it in its log. Write data
+comes from the old region, not from the guest. Then the requests that
+waited go on with new sequences. A part the engine completed but whose
+completion was not taken is sent again too.
+
+`Config::reattach` bounds the wait (30 s; zero fails at once). Past it,
+held I/O fails with an internal error. A reattach that sees no
+completion keeps the bound of the loss before it.
+
 ## Not done yet
 
-- **The remote path.** When the engine is lost, every request held fails
-  with an internal error. The plan is to keep them and replay them over
-  NVMe-oF to an engine on another CN. Until then write data is not kept
-  past the copy into the ring.
-- **Reattach.** Each attach asks for a new generation.
+- **The remote path.** Only the same engine socket is tried. The plan
+  is to replay over NVMe-oF to an engine on another CN.
 - **Migration.** A VM with a ring disk cannot migrate, as a source or
   as a destination.
 
