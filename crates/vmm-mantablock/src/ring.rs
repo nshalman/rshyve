@@ -149,6 +149,10 @@ impl<J: Job> Shared<J> {
         }
         self.progress.store(idle, Ordering::Relaxed);
         self.state.store(LIVE, Ordering::Release);
+        // Under `phase`, so a loss now holds them again after this.
+        for q in &self.queues {
+            q.release();
+        }
         true
     }
 

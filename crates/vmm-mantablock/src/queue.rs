@@ -22,6 +22,7 @@ use std::collections::VecDeque;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use manta_block_ring::layout::{PAGE, SQE_BYTES};
 use manta_block_ring::{Cqe, Op, Producer, Region, Sqe};
@@ -484,14 +485,14 @@ impl<J: Job> QueueRing<J> {
 
     /// Moves the queue to a new attachment of the same grant. Replays
     /// each part in flight, oldest first, with its op id and, for a
-    /// write, its data from the old region; then sends what waits. Only
-    /// while no completion thread runs on this queue. Returns how many
-    /// parts and requests it held.
+    /// write, its data from the old region. The queue stays held: what
+    /// waits goes in [`QueueRing::kick`]. Only while no completion thread
+    /// runs on this queue. Returns how many parts and requests it held.
     pub(crate) fn reattach(
         &self,
         region: Arc<Region>,
         wake_engine: OwnedFd,
-        out: &mut Out<J::Id>,
+        budget: &Budget,
     ) -> Result<usize, Lost> {
         let mut sq = lock(&self.sq)?;
         if self.dead.load(Ordering::Acquire) {
@@ -509,6 +510,7 @@ impl<J: Job> QueueRing<J> {
         // Every copy before any push: a reattach that fails after this
         // copies from the new region next time.
         for &tag in &open {
+            budget.step()?;
             let SqSide {
                 region,
                 sent,
@@ -540,13 +542,23 @@ impl<J: Job> QueueRing<J> {
                 Err(_) => return Err(Lost::Broken(self.q)),
             }
         }
-        let held = open.len() + sq.pending.len();
-        self.held.store(false, Ordering::Release);
         if !open.is_empty() && sq.sq.publish() {
             wake::wake(&sq.wake_engine).map_err(|_| Lost::Pipe(self.q))?;
         }
-        self.pump(&mut sq, out)?;
-        Ok(held)
+        Ok(open.len() + sq.pending.len())
+    }
+
+    /// Ends a hold. Under `sq`, so a submission sees it or finds its
+    /// request pumped by [`QueueRing::kick`].
+    pub(crate) fn release(&self) {
+        let _sq = self.sq.lock().unwrap_or_else(|e| e.into_inner());
+        self.held.store(false, Ordering::Release);
+    }
+
+    /// Sends what waited while the queue was held.
+    pub(crate) fn kick(&self, out: &mut Out<J::Id>) -> Result<(), Lost> {
+        let mut sq = lock(&self.sq)?;
+        self.pump(&mut sq, out)
     }
 
     /// The engine is lost for good: fail everything held, and take
@@ -651,6 +663,31 @@ impl<J: Job> Req<J> {
             pages: s.pages,
             queued: false,
         }
+    }
+}
+
+/// When a replay must be done.
+pub(crate) struct Budget {
+    pub(crate) until: Instant,
+    /// Time each replayed part takes, as a slow copy would.
+    #[cfg(test)]
+    pub(crate) stall: std::time::Duration,
+}
+
+impl Budget {
+    pub(crate) fn spent(&self) -> Result<(), Lost> {
+        if Instant::now() >= self.until {
+            return Err(Lost::Internal(
+                "replay past the reattach bound".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn step(&self) -> Result<(), Lost> {
+        #[cfg(test)]
+        std::thread::sleep(self.stall);
+        self.spent()
     }
 }
 

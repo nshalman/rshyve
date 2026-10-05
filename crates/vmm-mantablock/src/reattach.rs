@@ -17,6 +17,7 @@ use crate::attach::{self, Attached, Grant};
 use crate::conn::Conn;
 use crate::job::Job;
 use crate::out::{Lost, Out};
+use crate::queue::Budget;
 use crate::ring::Shared;
 use crate::Config;
 
@@ -155,44 +156,49 @@ fn once<J: Job>(
     }
 }
 
-/// Replays on every queue, goes live, then starts the completion threads.
+/// Replays on every queue, goes live, starts the completion threads,
+/// then sends what waited. Every queue stays held until all have
+/// replayed, so no new request reaches the engine before a replay.
 fn switch<J: Job>(
     shared: &Arc<Shared<J>>,
     plan: &Plan,
     att: Attached,
     until: Instant,
 ) -> Result<(), Failed> {
-    #[cfg(test)]
-    std::thread::sleep(plan.replay_stall);
+    let budget = Budget {
+        until,
+        #[cfg(test)]
+        stall: plan.replay_stall,
+    };
     #[cfg(not(test))]
     let _ = plan;
+    let fail = |why: Lost| {
+        if why.fatal() {
+            Failed::Fatal(why)
+        } else {
+            Failed::Retry(why.to_string())
+        }
+    };
     let Attached { region, pipes, .. } = att;
     if pipes.len() != shared.queues.len() {
         return Err(Failed::Retry("queue count".into()));
     }
     let mut reapers = Vec::with_capacity(pipes.len());
     let mut idle = true;
+    // On expiry the replays may already be on the new ring; the engine may
+    // serve them, but the guest sees them fail, as a failed write allows.
     for ((q, ring), p) in (0u16..).zip(&shared.queues).zip(pipes) {
+        budget.spent().map_err(fail)?;
         let cq = region
             .cq_consumer(q)
             .ok_or_else(|| Failed::Retry("no CQ".into()))?;
-        let mut out = Out::default();
-        let held = ring.reattach(Arc::clone(&region), p.wake_engine, &mut out);
-        shared.finish(out);
-        match held {
-            Ok(n) => idle &= n == 0,
-            Err(why) if why.fatal() => return Err(Failed::Fatal(why)),
-            Err(why) => return Err(Failed::Retry(why.to_string())),
-        }
+        let n = ring
+            .reattach(Arc::clone(&region), p.wake_engine, &budget)
+            .map_err(fail)?;
+        idle &= n == 0;
         reapers.push((q, cq, p.wake_me));
     }
-    // The replays may already be on the new ring; the engine may serve
-    // them, but the guest sees them fail, as a failed write allows.
-    if Instant::now() >= until {
-        return Err(Failed::Fatal(Lost::Internal(
-            "replayed past the reattach bound".into(),
-        )));
-    }
+    budget.spent().map_err(fail)?;
     if !shared.resume(idle) {
         return Err(Failed::Retry("lost again during the reattach".into()));
     }
@@ -200,6 +206,16 @@ fn switch<J: Job>(
         return Err(Failed::Fatal(Lost::Internal(
             "no thread for the ring".into(),
         )));
+    }
+    for ring in &shared.queues {
+        let mut out = Out::default();
+        let sent = ring.kick(&mut out);
+        shared.finish(out);
+        if let Err(why) = sent {
+            // Live now: an ordinary loss, which the control thread sees.
+            shared.lose(why);
+            break;
+        }
     }
     Ok(())
 }

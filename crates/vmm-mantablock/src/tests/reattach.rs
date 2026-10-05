@@ -23,7 +23,7 @@ use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
 use vmm_storage::nvme::backend::{BlockOp, BlockStatus};
 
 use super::control::answer_pings;
-use super::{job, pattern, setup_full, Calls, Engine, TJob, BLOCKS, GEN};
+use super::{job, pattern, setup_queues, Calls, Engine, TJob, BLOCKS, GEN};
 use crate::conn::Conn;
 use crate::{Config, Ring};
 
@@ -31,12 +31,14 @@ const DEPTH: u32 = 8;
 const BUF_PAGES: u32 = 16;
 const MAX_BLOCKS: u32 = 2;
 
-/// A volatile ring of one queue, its first engine, and the socket a
-/// reattach connects to.
+/// A volatile ring, its first engine, and the socket a reattach
+/// connects to.
 struct Lab {
     ring: Arc<Ring<TJob>>,
     calls: Arc<Calls>,
+    /// Queue 0 of the first engine; `more` has the other queues.
     eng: Engine,
+    more: Vec<Engine>,
     /// The first engine's end of the control socket.
     ctl: UnixStream,
     listener: UnixListener,
@@ -44,6 +46,10 @@ struct Lab {
 }
 
 fn lab(tune: impl FnOnce(&mut Config)) -> Lab {
+    lab_n(1, tune)
+}
+
+fn lab_n(queues: u16, tune: impl FnOnce(&mut Config)) -> Lab {
     let dir = tempfile::tempdir().unwrap();
     let path: PathBuf = dir.path().join("engine.sock");
     let listener = UnixListener::bind(&path).unwrap();
@@ -52,7 +58,8 @@ fn lab(tune: impl FnOnce(&mut Config)) -> Lab {
     let pings = theirs.try_clone().unwrap();
     thread::spawn(move || answer_pings(pings));
     let calls = Arc::new(Calls::default());
-    let (ring, eng) = setup_full(
+    let (ring, mut engines) = setup_queues(
+        queues,
         DEPTH,
         BUF_PAGES,
         MAX_BLOCKS,
@@ -66,10 +73,12 @@ fn lab(tune: impl FnOnce(&mut Config)) -> Lab {
             tune(c);
         },
     );
+    let eng = engines.remove(0);
     Lab {
         ring,
         calls,
         eng,
+        more: engines,
         ctl: theirs,
         listener,
         _dir: dir,
@@ -109,6 +118,12 @@ impl Lab {
     /// Takes the next reattach, answers it with `ok` and a new engine of
     /// geometry `g`, and returns the Attach and that engine.
     fn accept(&self, g: Geometry, ok: AttachOk) -> (Attach, Engine) {
+        let (ask, mut engines) = self.accept_all(g, ok);
+        (ask, engines.remove(0))
+    }
+
+    /// As [`Lab::accept`], with an engine for each queue.
+    fn accept_all(&self, g: Geometry, ok: AttachOk) -> (Attach, Vec<Engine>) {
         let until = Instant::now() + Duration::from_secs(5);
         let mut s = loop {
             match self.listener.accept() {
@@ -122,10 +137,10 @@ impl Lab {
         };
         s.set_nonblocking(false).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let (eng, fds) = Engine::new(g, ok.generation);
+        let (engines, fds) = Engine::all(g, ok.generation);
         let ask = handshake(&mut s, ok, &fds);
         thread::spawn(move || answer_pings(s));
-        (ask, eng)
+        (ask, engines)
     }
 }
 
@@ -156,7 +171,7 @@ fn handshake(s: &mut UnixStream, ok: AttachOk, fds: &[OwnedFd]) -> Attach {
     };
     let frame = Message::AttachOk(ok).encode(2);
     let borrowed: Vec<BorrowedFd<'_>> = fds.iter().map(|f| f.as_fd()).collect();
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(3))];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8))];
     let mut anc = SendAncillaryBuffer::new(&mut space);
     assert!(anc.push(SendAncillaryMessage::ScmRights(&borrowed)));
     rustix::net::sendmsg(
@@ -194,6 +209,7 @@ fn an_engine_back_within_the_bound_gets_each_held_part_once_in_order() {
     let r3 = Arc::new(Mutex::new(vec![0; PAGE]));
     lab.ring.submit(TJob {
         id: 3,
+        queue: 1,
         tag: 3,
         op: BlockOp::Read,
         off: 40 * PAGE as u64,
@@ -400,4 +416,72 @@ fn halt_while_held_fails_the_held_io_and_returns() {
     lab.ring.halt();
     assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     assert_eq!(lab.calls.all(), vec![(1, BlockStatus::Internal)]);
+}
+
+/// A write on guest queue `queue`.
+fn write_on(id: u32, queue: u16, tag: u16, lba: u64) -> TJob {
+    let mut j = job(id, tag, BlockOp::Write { fua: false }, lba, pattern(1, 3));
+    j.queue = queue;
+    j
+}
+
+#[test]
+fn new_io_waits_until_every_queue_has_replayed() {
+    let mut lab = lab_n(2, |c| c.replay_stall = Duration::from_millis(300));
+    lab.ring.submit(write_on(1, 1, 0, 10));
+    lab.ring.submit(write_on(2, 2, 0, 20));
+    lab.eng.take_n(1);
+    lab.more[0].take_n(1);
+    lab.lose();
+    let g = Geometry::new(2, DEPTH, BUF_PAGES).unwrap();
+    let (_, mut engines) = lab.accept_all(g, grant(g, GEN));
+    // Queue 0 has replayed; queue 1 is still in its slow copy.
+    let first = engines[0].take_n(1);
+    assert_eq!(first[0].lba, 10);
+    lab.ring.submit(write_on(3, 1, 1, 30));
+    thread::sleep(Duration::from_millis(100));
+    assert!(engines[0].take(8).is_empty(), "new I/O before a replay");
+    assert!(engines[1].take(8).is_empty());
+    let second = engines[1].take_n(1);
+    assert_eq!(second[0].lba, 20);
+    let new = engines[0].take_n(1);
+    assert_eq!(new[0].lba, 30);
+    for (e, reqs) in [(0, [first, new].concat()), (1, second)] {
+        let cqes: Vec<_> =
+            reqs.iter().map(|r| engines[e].serve(r).encode()).collect();
+        engines[e].post(&cqes);
+    }
+    let done = lab.calls.wait_for(3);
+    assert!(done.iter().all(|(_, s)| *s == BlockStatus::Success));
+}
+
+#[test]
+fn a_slow_replay_across_queues_fails_at_the_bound_not_after() {
+    // Four parts, 150 ms each: the bound passes during the third.
+    let mut lab = lab_n(2, |c| {
+        c.reattach = Duration::from_millis(400);
+        c.replay_stall = Duration::from_millis(150);
+    });
+    lab.ring.submit(write_on(1, 1, 0, 10));
+    for t in 0..3u16 {
+        lab.ring
+            .submit(write_on(2 + u32::from(t), 2, t, 20 + u64::from(t)));
+    }
+    lab.eng.take_n(1);
+    lab.more[0].take_n(3);
+    let t = Instant::now();
+    lab.lose();
+    let g = Geometry::new(2, DEPTH, BUF_PAGES).unwrap();
+    let (_, mut engines) = lab.accept_all(g, grant(g, GEN));
+    let done = lab.calls.wait_for(4);
+    let took = t.elapsed();
+    assert!(
+        done.iter().all(|(_, s)| *s == BlockStatus::Internal),
+        "{done:?}"
+    );
+    assert!(took >= Duration::from_millis(400), "{took:?}");
+    assert!(took < Duration::from_millis(560), "{took:?}");
+    assert!(lab.ring.is_lost());
+    // Queue 1 never published its replays.
+    assert!(engines[1].take(8).is_empty());
 }

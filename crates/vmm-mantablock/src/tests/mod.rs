@@ -36,6 +36,8 @@ const BLOCKS: u64 = 256;
 /// One request over its own guest buffer.
 struct TJob {
     id: u32,
+    /// The guest queue, from 1.
+    queue: u16,
     tag: u16,
     op: BlockOp,
     off: u64,
@@ -51,7 +53,7 @@ impl Job for TJob {
     }
 
     fn queue(&self) -> u16 {
-        1
+        self.queue
     }
 
     fn tag(&self) -> u16 {
@@ -122,8 +124,9 @@ impl Calls {
     }
 }
 
-/// The engine's side: the same file mapped a second time.
+/// The engine's side of one queue: the same file mapped a second time.
 struct Engine {
+    q: u16,
     region: Arc<Region>,
     sq: Consumer<SQE_BYTES>,
     cq: Producer<CQE_BYTES>,
@@ -193,21 +196,45 @@ fn setup_full<J: Job<Id = u32>>(
     conn: Option<crate::conn::Conn>,
     tune: impl FnOnce(&mut Config),
 ) -> (Arc<Ring<J>>, Engine) {
-    let g = Geometry::new(1, depth, buf_pages).unwrap();
-    let (engine, [region, wake_engine, wake_me]) = Engine::new(g, GEN);
-    adopt(&wake_engine, End::Write).unwrap();
-    adopt(&wake_me, End::Read).unwrap();
+    let (ring, mut engines) = setup_queues(
+        1, depth, buf_pages, max_blocks, durable, sink, conn, tune,
+    );
+    (ring, engines.remove(0))
+}
+
+/// As [`setup_full`], with `queues` queues and an engine for each.
+#[allow(clippy::too_many_arguments)]
+fn setup_queues<J: Job<Id = u32>>(
+    queues: u16,
+    depth: u32,
+    buf_pages: u32,
+    max_blocks: u32,
+    durable: bool,
+    sink: Arc<dyn Sink<u32>>,
+    conn: Option<crate::conn::Conn>,
+    tune: impl FnOnce(&mut Config),
+) -> (Arc<Ring<J>>, Vec<Engine>) {
+    let g = Geometry::new(queues, depth, buf_pages).unwrap();
+    let (engines, mut fds) = Engine::all(g, GEN);
+    let region = map(&std::fs::File::from(fds.remove(0)), g);
+    let mut pipes = Vec::new();
+    let mut it = fds.into_iter();
+    while let (Some(wake_engine), Some(wake_me)) = (it.next(), it.next()) {
+        adopt(&wake_engine, End::Write).unwrap();
+        adopt(&wake_me, End::Read).unwrap();
+        pipes.push(Pipes {
+            wake_engine,
+            wake_me,
+        });
+    }
     let att = Attached {
-        region: map(&std::fs::File::from(region), g),
+        region,
         generation: GEN,
         volume_blocks: BLOCKS,
         durable,
         max_blocks,
         slots: Slots::new(depth, buf_pages, max_blocks).unwrap(),
-        pipes: vec![Pipes {
-            wake_engine,
-            wake_me,
-        }],
+        pipes,
     };
     let log = slog::Logger::root(slog::Discard, slog::o!());
     let mut cfg = Config::new("unused".into(), uuid::Uuid::nil(), log);
@@ -215,14 +242,13 @@ fn setup_full<J: Job<Id = u32>>(
     cfg.reattach = Duration::ZERO;
     tune(&mut cfg);
     let ring = Ring::start(att, conn, &cfg, sink);
-    (ring, engine)
+    (ring, engines)
 }
 
 impl Engine {
-    /// An engine with a new region of one queue. Returns what AttachOk
-    /// carries: the region, the write end of the engine's pipe and the
-    /// read end of the VMM's.
-    fn new(g: Geometry, generation: u64) -> (Self, [OwnedFd; 3]) {
+    /// One engine per queue of a new region, and what AttachOk carries:
+    /// the region, then each queue's pipe ends.
+    fn all(g: Geometry, generation: u64) -> (Vec<Self>, Vec<OwnedFd>) {
         let file = tempfile::tempfile().unwrap();
         file.set_len(g.region_len() as u64).unwrap();
         let theirs = map(&file, g);
@@ -231,20 +257,27 @@ impl Engine {
             volume_blocks: BLOCKS,
             attach_generation: generation,
         });
-        let (engine_rx, engine_tx) = rustix::pipe::pipe().unwrap();
-        let (vmm_rx, vmm_tx) = rustix::pipe::pipe().unwrap();
-        adopt(&engine_rx, End::Read).unwrap();
-        adopt(&vmm_tx, End::Write).unwrap();
-        let engine = Engine {
-            sq: theirs.sq_consumer(0).unwrap(),
-            cq: theirs.cq_producer(0).unwrap(),
-            region: theirs,
-            wake_me: engine_rx,
-            wake_vmm: Some(vmm_tx),
-            disk: vec![0; BLOCKS as usize * PAGE],
-            seen: Vec::new(),
-        };
-        (engine, [OwnedFd::from(file), engine_tx, vmm_rx])
+        let mut engines = Vec::new();
+        let mut fds = vec![OwnedFd::from(file)];
+        for q in 0..g.queues() {
+            let (engine_rx, engine_tx) = rustix::pipe::pipe().unwrap();
+            let (vmm_rx, vmm_tx) = rustix::pipe::pipe().unwrap();
+            adopt(&engine_rx, End::Read).unwrap();
+            adopt(&vmm_tx, End::Write).unwrap();
+            engines.push(Engine {
+                q,
+                sq: theirs.sq_consumer(q).unwrap(),
+                cq: theirs.cq_producer(q).unwrap(),
+                region: Arc::clone(&theirs),
+                wake_me: engine_rx,
+                wake_vmm: Some(vmm_tx),
+                disk: vec![0; BLOCKS as usize * PAGE],
+                seen: Vec::new(),
+            });
+            fds.push(engine_tx);
+            fds.push(vmm_rx);
+        }
+        (engines, fds)
     }
 
     /// Takes every request on the ring, at most `max`.
@@ -280,11 +313,11 @@ impl Engine {
         match e.op {
             1 => {
                 let data = self.disk[at..at + len].to_vec();
-                assert!(self.region.write_buffer(0, e.buf_page, &data));
+                assert!(self.region.write_buffer(self.q, e.buf_page, &data));
             }
             2 => {
                 let mut data = vec![0; len];
-                assert!(self.region.read_buffer(0, e.buf_page, &mut data));
+                assert!(self.region.read_buffer(self.q, e.buf_page, &mut data));
                 self.disk[at..at + len].copy_from_slice(&data);
             }
             _ => {}
@@ -321,6 +354,7 @@ impl Engine {
 fn job(id: u32, tag: u16, op: BlockOp, lba: u64, data: Vec<u8>) -> TJob {
     TJob {
         id,
+        queue: 1,
         tag,
         op,
         off: lba * PAGE as u64,
@@ -349,6 +383,7 @@ fn writes_and_reads_round_trip_whole_and_split() {
     let back = Arc::new(Mutex::new(vec![0; 5 * PAGE]));
     ring.submit(TJob {
         id: 3,
+        queue: 1,
         tag: 0,
         op: BlockOp::Read,
         off: 20 * PAGE as u64,
