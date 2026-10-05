@@ -162,6 +162,40 @@ impl Tags {
         low
     }
 
+    /// Submission side, for a tag it opened and could not put on the ring.
+    pub(crate) fn abandon(&self, tag: u16) {
+        self.entries[usize::from(tag)]
+            .id
+            .store(EMPTY, Ordering::Relaxed);
+        self.unclaim(tag);
+    }
+
+    /// A replayed part starts a new I/O limit.
+    pub(crate) fn repost(&self, tag: u16, posted: u64) {
+        self.entries[usize::from(tag)]
+            .posted
+            .store(posted, Ordering::Relaxed);
+    }
+
+    /// Only while no completion thread runs. Frees each tag that was
+    /// emptied but not released, as a completion batch that failed half
+    /// way leaves them, and returns the tags still in flight.
+    pub(crate) fn after_loss(&self) -> Vec<u16> {
+        let mut open = Vec::new();
+        for (t, e) in self.entries.iter().enumerate() {
+            let word = &self.free[t / 64];
+            if word.load(Ordering::Acquire) & (1 << (t % 64)) != 0 {
+                continue;
+            }
+            if e.id.load(Ordering::Acquire) == EMPTY {
+                word.fetch_or(1 << (t % 64), Ordering::Release);
+            } else {
+                open.push(t as u16);
+            }
+        }
+        open
+    }
+
     /// When the oldest part in flight was posted.
     pub(crate) fn oldest_posted(&self) -> Option<u64> {
         self.entries
@@ -228,6 +262,25 @@ mod tests {
         assert!(t.complete(&cqe(tag, 5)).is_ok());
         // A second completion for the same part.
         assert_eq!(t.complete(&cqe(tag, 5)), Err(BadCompletion::Tag(tag)));
+    }
+
+    #[test]
+    fn after_a_loss_only_parts_in_flight_stay_taken() {
+        let t = Tags::new(4);
+        for seq in 0..3 {
+            let tag = t.claim().unwrap();
+            t.open(tag, seq, part(0), 0);
+        }
+        // Emptied, never released: a batch that failed half way.
+        t.complete(&cqe(1, 1)).unwrap();
+        // Claimed and given up.
+        let tag = t.claim().unwrap();
+        t.open(tag, 9, part(0), 0);
+        t.abandon(tag);
+        assert_eq!(t.after_loss(), vec![0, 2]);
+        assert_eq!(t.claim(), Some(1));
+        assert_eq!(t.claim(), Some(3));
+        assert_eq!(t.claim(), None);
     }
 
     #[test]

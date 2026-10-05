@@ -26,6 +26,7 @@ use crate::{Config, Job, Ring, Sink};
 
 mod control;
 mod faults;
+mod reattach;
 mod scatter;
 mod stress;
 
@@ -193,50 +194,59 @@ fn setup_full<J: Job<Id = u32>>(
     tune: impl FnOnce(&mut Config),
 ) -> (Arc<Ring<J>>, Engine) {
     let g = Geometry::new(1, depth, buf_pages).unwrap();
-    let file = tempfile::tempfile().unwrap();
-    file.set_len(g.region_len() as u64).unwrap();
-    let theirs = map(&file, g);
-    theirs.write_header(&Header {
-        geometry: g,
-        volume_blocks: BLOCKS,
-        attach_generation: GEN,
-    });
-    let ours = map(&file, g);
-    let (engine_rx, engine_tx) = rustix::pipe::pipe().unwrap();
-    let (vmm_rx, vmm_tx) = rustix::pipe::pipe().unwrap();
-    adopt(&engine_tx, End::Write).unwrap();
-    adopt(&vmm_rx, End::Read).unwrap();
-    adopt(&engine_rx, End::Read).unwrap();
-    adopt(&vmm_tx, End::Write).unwrap();
+    let (engine, [region, wake_engine, wake_me]) = Engine::new(g, GEN);
+    adopt(&wake_engine, End::Write).unwrap();
+    adopt(&wake_me, End::Read).unwrap();
     let att = Attached {
-        region: Arc::clone(&ours),
+        region: map(&std::fs::File::from(region), g),
         generation: GEN,
         volume_blocks: BLOCKS,
         durable,
+        max_blocks,
         slots: Slots::new(depth, buf_pages, max_blocks).unwrap(),
         pipes: vec![Pipes {
-            wake_engine: engine_tx,
-            wake_me: vmm_rx,
+            wake_engine,
+            wake_me,
         }],
     };
     let log = slog::Logger::root(slog::Discard, slog::o!());
     let mut cfg = Config::new("unused".into(), uuid::Uuid::nil(), log);
     cfg.spin = Duration::from_micros(5);
+    cfg.reattach = Duration::ZERO;
     tune(&mut cfg);
     let ring = Ring::start(att, conn, &cfg, sink);
-    let engine = Engine {
-        sq: theirs.sq_consumer(0).unwrap(),
-        cq: theirs.cq_producer(0).unwrap(),
-        region: theirs,
-        wake_me: engine_rx,
-        wake_vmm: Some(vmm_tx),
-        disk: vec![0; BLOCKS as usize * PAGE],
-        seen: Vec::new(),
-    };
     (ring, engine)
 }
 
 impl Engine {
+    /// An engine with a new region of one queue. Returns what AttachOk
+    /// carries: the region, the write end of the engine's pipe and the
+    /// read end of the VMM's.
+    fn new(g: Geometry, generation: u64) -> (Self, [OwnedFd; 3]) {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(g.region_len() as u64).unwrap();
+        let theirs = map(&file, g);
+        theirs.write_header(&Header {
+            geometry: g,
+            volume_blocks: BLOCKS,
+            attach_generation: generation,
+        });
+        let (engine_rx, engine_tx) = rustix::pipe::pipe().unwrap();
+        let (vmm_rx, vmm_tx) = rustix::pipe::pipe().unwrap();
+        adopt(&engine_rx, End::Read).unwrap();
+        adopt(&vmm_tx, End::Write).unwrap();
+        let engine = Engine {
+            sq: theirs.sq_consumer(0).unwrap(),
+            cq: theirs.cq_producer(0).unwrap(),
+            region: theirs,
+            wake_me: engine_rx,
+            wake_vmm: Some(vmm_tx),
+            disk: vec![0; BLOCKS as usize * PAGE],
+            seen: Vec::new(),
+        };
+        (engine, [OwnedFd::from(file), engine_tx, vmm_rx])
+    }
+
     /// Takes every request on the ring, at most `max`.
     fn take(&mut self, max: usize) -> Vec<Sqe> {
         let mut got = Vec::new();

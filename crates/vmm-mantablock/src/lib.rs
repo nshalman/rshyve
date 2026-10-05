@@ -8,13 +8,15 @@
 //! The engine never maps guest memory: data is copied between the guest
 //! and the queue's buffer area.
 //!
+//! When the engine is lost, the ring holds every request and reattaches
+//! to the engine's socket with the same generation for a bounded time.
+//! It replays what was in flight with the same op ids, the write data
+//! copied from the old region, then goes on. Past the bound, everything
+//! held fails with an internal error.
+//!
 //! Not done yet:
 //!
-//! - **No remote path.** When the engine is lost, every request held
-//!   fails with an internal error. They are meant to be replayed to
-//!   another engine later, but write data is not kept past the copy into
-//!   the ring for that yet.
-//! - **No reattach.** Each attach asks for a new generation.
+//! - **No remote path.** Only the same engine socket is tried.
 //! - **No Pause message.** The controller drains every request before it
 //!   pauses, resets or exports, so the ring is empty by then.
 
@@ -37,6 +39,7 @@ mod job;
 mod out;
 mod queue;
 mod reaper;
+mod reattach;
 mod ring;
 mod split;
 mod tags;
@@ -84,6 +87,9 @@ pub struct Config {
     pub io_limit: Duration,
     /// Time for Hello, Attach and each control message.
     pub deadline: Duration,
+    /// How long to hold I/O and try to reattach after the engine is lost.
+    /// Zero fails held I/O at once.
+    pub reattach: Duration,
     /// Where the ring logs.
     pub log: slog::Logger,
 }
@@ -103,6 +109,7 @@ impl Config {
             heartbeat_limit: Duration::from_secs(1),
             io_limit: Duration::from_secs(30),
             deadline: Duration::from_secs(5),
+            reattach: Duration::from_secs(30),
             log,
         }
     }
@@ -119,6 +126,7 @@ pub struct Connected {
 pub fn connect(cfg: Config) -> io::Result<Connected> {
     let ask = attach::Ask {
         volume: *cfg.volume.as_bytes(),
+        generation: 0,
         queues: cfg.queues.clamp(1, MAX_GUEST_QUEUES),
         depth: cfg.depth,
         buf_pages: cfg

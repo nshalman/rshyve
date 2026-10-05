@@ -2,11 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The control thread: heartbeat, engine-loss detection and Detach.
+//! The control thread: heartbeat, engine-loss detection, reattach and
+//! Detach.
 //!
 //! A Pong does not show that the engine makes progress, so a request
 //! older than the I/O limit also counts as a lost engine.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use manta_block_ring::control::Message;
@@ -15,6 +17,7 @@ use crate::conn::{Conn, Polled};
 use crate::job::Job;
 use crate::out::Lost;
 use crate::queue::now_ns;
+use crate::reattach::{self, Plan};
 use crate::ring::Shared;
 use crate::Config;
 
@@ -44,12 +47,35 @@ impl From<&Config> for Timers {
     }
 }
 
-pub(crate) fn run<J: Job>(shared: &Shared<J>, mut conn: Conn, t: Timers) {
-    if let Err(why) = watch(shared, &mut conn, t) {
-        shared.lose(why);
-        return;
+pub(crate) fn run<J: Job>(
+    shared: &Arc<Shared<J>>,
+    mut conn: Conn,
+    t: Timers,
+    plan: &Plan,
+) {
+    // When the held I/O fails. A reattach that sees no completion keeps
+    // the bound of the loss before it, so an engine that comes back and
+    // never serves cannot hold I/O for ever.
+    let mut until: Option<Instant> = None;
+    loop {
+        if let Err(why) = watch(shared, &mut conn, t) {
+            shared.lose(why);
+        }
+        if !shared.is_held() || shared.halted() {
+            break;
+        }
+        let now = Instant::now();
+        let bound = match until {
+            Some(u) if !shared.take_progress() => u,
+            _ => now + plan.limit,
+        };
+        until = Some(bound);
+        match reattach::run(shared, plan, conn, bound) {
+            Some(c) => conn = c,
+            None => return,
+        }
     }
-    if shared.halted() && !shared.is_lost() {
+    if shared.halted() && !shared.is_lost() && !shared.is_held() {
         detach(shared, &mut conn, t);
     }
     // An engine that did not finish Detach ends the attachment itself
@@ -63,7 +89,7 @@ fn watch<J: Job>(
 ) -> Result<(), Lost> {
     let mut last_pong = Instant::now();
     let mut next_ping = last_pong;
-    while !shared.halted() && !shared.is_lost() {
+    while !shared.halted() && !shared.stopping() {
         let now = Instant::now();
         if now >= next_ping {
             conn.send(&Message::Ping, now + t.deadline)
@@ -88,7 +114,7 @@ fn watch<J: Job>(
                 .map_err(|e| Lost::Control(format!("poll: {e}")))?;
         }
         for _ in 0..FRAMES_PER_TICK {
-            if shared.halted() || shared.is_lost() {
+            if shared.halted() || shared.stopping() {
                 break;
             }
             match conn.try_recv() {

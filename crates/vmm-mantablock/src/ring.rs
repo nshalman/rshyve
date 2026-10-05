@@ -5,11 +5,14 @@
 //! The ring backend: its queues, its threads, and how it ends.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use manta_block_ring::layout::CQE_BYTES;
+use manta_block_ring::{Consumer, Region};
 use vmm_devices::lifecycle::NvmeMigrateBackend;
 use vmm_devices::{FlushError, FlushIntent};
 use vmm_storage::nvme::backend::{AsyncBackend, BlockRequest, BlockStatus};
@@ -19,16 +22,42 @@ use crate::conn::Conn;
 use crate::job::{Job, Sink};
 use crate::out::{Lost, Out, Waiter};
 use crate::queue::QueueRing;
+use crate::reattach::Plan;
 use crate::{control, reaper, Config};
+
+const LIVE: u8 = 0;
+/// The engine is lost; requests wait for a reattach.
+const HELD: u8 = 1;
+/// The engine is lost for good; every request fails.
+const DEAD: u8 = 2;
+
+/// A completion thread to start: its queue, CQ and wake-up pipe.
+pub(crate) type Reaper = (u16, Consumer<CQE_BYTES>, OwnedFd);
+
+#[derive(Debug, Default)]
+struct Phase {
+    /// The engine was lost again while held, so a reattach in progress
+    /// must not go live.
+    again: bool,
+}
 
 pub(crate) struct Shared<J: Job> {
     pub(crate) queues: Vec<QueueRing<J>>,
     sink: Arc<dyn Sink<J::Id>>,
-    lost: AtomicBool,
+    /// LIVE, HELD or DEAD. Changed only under `phase`.
+    state: AtomicU8,
+    phase: Mutex<Phase>,
+    /// A control thread is there to reattach.
+    can_reattach: bool,
+    /// A completion came, or nothing was held, since the last reattach.
+    progress: AtomicBool,
     /// Halt has started: a closed pipe or socket is then expected.
     halted: AtomicBool,
     /// The completion threads return.
     stop: AtomicBool,
+    /// The completion threads of the current attachment.
+    reapers: Mutex<Vec<JoinHandle<()>>>,
+    spin: Duration,
     pub(crate) log: slog::Logger,
 }
 
@@ -46,7 +75,11 @@ impl<J: Job> Shared<J> {
     }
 
     pub(crate) fn is_lost(&self) -> bool {
-        self.lost.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) == DEAD
+    }
+
+    pub(crate) fn is_held(&self) -> bool {
+        self.state.load(Ordering::Acquire) == HELD
     }
 
     pub(crate) fn halted(&self) -> bool {
@@ -54,18 +87,128 @@ impl<J: Job> Shared<J> {
     }
 
     pub(crate) fn stopping(&self) -> bool {
-        self.stop.load(Ordering::Acquire) || self.is_lost()
+        self.stop.load(Ordering::Acquire)
+            || self.state.load(Ordering::Acquire) != LIVE
     }
 
-    /// Every request held fails with an internal error. There is no
-    /// replay to another engine yet.
+    fn phase(&self) -> MutexGuard<'_, Phase> {
+        self.phase.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The engine is lost. With a control thread, every request is held
+    /// for a reattach; else, or when a reattach cannot help, they fail.
     pub(crate) fn lose(&self, why: Lost) {
-        if self.lost.swap(true, Ordering::AcqRel) {
-            return;
+        let mut p = self.phase();
+        match self.state.load(Ordering::Acquire) {
+            DEAD => return,
+            HELD if !why.fatal() => {
+                p.again = true;
+                return;
+            }
+            LIVE if self.can_reattach && !why.fatal() && !self.halted() => {
+                // Lock order: `phase`, then each queue's `sq`.
+                self.state.store(HELD, Ordering::Release);
+                for q in &self.queues {
+                    q.hold();
+                }
+                drop(p);
+                slog::warn!(self.log, "mantablock: engine lost, holding I/O";
+                    "reason" => %why);
+                return;
+            }
+            _ => {}
         }
+        self.state.store(DEAD, Ordering::Release);
+        drop(p);
         slog::error!(self.log, "mantablock: engine lost, failing held I/O";
             "reason" => %why);
         self.fail_all();
+    }
+
+    /// Holds every queue again after a reattach that did not finish.
+    pub(crate) fn rehold(&self) {
+        let mut p = self.phase();
+        p.again = false;
+        for q in &self.queues {
+            q.hold();
+        }
+    }
+
+    /// Ends a reattach. False when the engine was lost again meanwhile:
+    /// every queue is then held again.
+    pub(crate) fn resume(&self, idle: bool) -> bool {
+        let mut p = self.phase();
+        if self.state.load(Ordering::Acquire) != HELD {
+            return false;
+        }
+        if std::mem::take(&mut p.again) {
+            for q in &self.queues {
+                q.hold();
+            }
+            return false;
+        }
+        self.progress.store(idle, Ordering::Relaxed);
+        self.state.store(LIVE, Ordering::Release);
+        true
+    }
+
+    /// Whether a completion came, or nothing was held, since the last
+    /// reattach. Clears it.
+    pub(crate) fn take_progress(&self) -> bool {
+        self.progress.swap(false, Ordering::Relaxed)
+    }
+
+    pub(crate) fn progressed(&self) {
+        if !self.progress.load(Ordering::Relaxed) {
+            self.progress.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Starts a completion thread for each queue of `region`. False if
+    /// one could not start.
+    pub(crate) fn spawn_reapers(
+        self: &Arc<Self>,
+        region: &Arc<Region>,
+        list: Vec<Reaper>,
+    ) -> bool {
+        let mut all = true;
+        let mut threads =
+            self.reapers.lock().unwrap_or_else(|e| e.into_inner());
+        for (q, cq, wake_me) in list {
+            let s = Arc::clone(self);
+            let region = Arc::clone(region);
+            let spin = self.spin;
+            match thread::Builder::new()
+                .name(format!("mantablock-cq-{q}"))
+                .spawn(move || reaper::run(&s, q, cq, region, &wake_me, spin))
+            {
+                Ok(t) => threads.push(t),
+                Err(_) => all = false,
+            }
+        }
+        all
+    }
+
+    /// Waits until every completion thread has returned, and joins them.
+    /// False if halt started first.
+    pub(crate) fn quiesce(&self) -> bool {
+        loop {
+            {
+                let mut t =
+                    self.reapers.lock().unwrap_or_else(|e| e.into_inner());
+                if t.iter().all(JoinHandle::is_finished) {
+                    for t in t.drain(..) {
+                        let _ = t.join();
+                    }
+                    return true;
+                }
+            }
+            // Halt joins them itself, and may run on one of them.
+            if self.halted() {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn fail_all(&self) {
@@ -85,8 +228,8 @@ impl<J: Job> Shared<J> {
 /// The NVMe backend over one MantaBlock attachment.
 pub struct Ring<J: Job> {
     shared: Arc<Shared<J>>,
-    /// The control thread, then one completion thread per queue.
-    threads: Mutex<(Option<JoinHandle<()>>, Vec<JoinHandle<()>>)>,
+    /// The control thread; the completion threads are in `shared`.
+    ctl: Mutex<Option<JoinHandle<()>>>,
     capacity: u64,
     depth: u16,
     durable: bool,
@@ -103,6 +246,7 @@ impl<J: Job> Ring<J> {
         cfg: &Config,
         sink: Arc<dyn Sink<J::Id>>,
     ) -> Arc<Self> {
+        let plan = Plan::new(cfg, att.grant());
         let Attached {
             region,
             generation,
@@ -110,6 +254,7 @@ impl<J: Job> Ring<J> {
             durable,
             slots,
             pipes,
+            ..
         } = att;
         let mut queues = Vec::new();
         let mut reapers = Vec::new();
@@ -132,31 +277,24 @@ impl<J: Job> Ring<J> {
         let shared = Arc::new(Shared {
             queues,
             sink,
-            lost: AtomicBool::new(false),
+            state: AtomicU8::new(LIVE),
+            phase: Mutex::new(Phase::default()),
+            can_reattach: conn.is_some() && !cfg.reattach.is_zero(),
+            progress: AtomicBool::new(true),
             halted: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            reapers: Mutex::new(Vec::new()),
+            spin: cfg.spin,
             log: cfg.log.clone(),
         });
-        let mut cqs = Vec::new();
         let mut ctl = None;
-        let mut failed = false;
-        for (q, cq, wake_me) in reapers {
-            let s = Arc::clone(&shared);
-            let spin = cfg.spin;
-            match thread::Builder::new()
-                .name(format!("mantablock-cq-{q}"))
-                .spawn(move || reaper::run(&s, q, cq, &wake_me, spin))
-            {
-                Ok(t) => cqs.push(t),
-                Err(_) => failed = true,
-            }
-        }
+        let mut failed = !shared.spawn_reapers(&region, reapers);
         if let Some(conn) = conn {
             let s = Arc::clone(&shared);
             let c = control::Timers::from(cfg);
             match thread::Builder::new()
                 .name("mantablock-ctl".into())
-                .spawn(move || control::run(&s, conn, c))
+                .spawn(move || control::run(&s, conn, c, &plan))
             {
                 Ok(t) => ctl = Some(t),
                 Err(_) => failed = true,
@@ -166,11 +304,11 @@ impl<J: Job> Ring<J> {
             // `start` cannot fail: the controller is already built. A
             // ring without its threads would hang every request, so fail
             // them instead.
-            shared.lose(Lost::Control("no thread for the ring".into()));
+            shared.lose(Lost::Internal("no thread for the ring".into()));
         }
         Arc::new(Self {
             shared,
-            threads: Mutex::new((ctl, cqs)),
+            ctl: Mutex::new(ctl),
             capacity: volume_blocks * 4096,
             depth: slots.tags,
             durable,
@@ -231,9 +369,14 @@ impl<J: Job> Ring<J> {
         self.durable
     }
 
-    /// True once the engine is lost.
+    /// True once the engine is lost for good.
     pub fn is_lost(&self) -> bool {
         self.shared.is_lost()
+    }
+
+    /// True while the engine is lost and I/O waits for a reattach.
+    pub fn is_held(&self) -> bool {
+        self.shared.is_held()
     }
 
     /// Makes every completed write durable. Only an engine whose writes
@@ -268,17 +411,19 @@ impl<J: Job> Ring<J> {
         if self.shared.halted.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (ctl, cqs) = match self.threads.lock() {
-            Ok(mut t) => std::mem::take(&mut *t),
-            Err(_) => (None, Vec::new()),
-        };
+        let ctl = self.ctl.lock().ok().and_then(|mut t| t.take());
         let me = thread::current().id();
         // The control thread goes first: it sends Detach, and the
-        // completion threads take what the engine finishes meanwhile.
+        // completion threads take what the engine finishes meanwhile. It
+        // starts no completion thread once it has returned.
         if let Some(t) = ctl {
             join(t, me, &self.shared.log);
         }
         self.shared.stop.store(true, Ordering::Release);
+        let cqs = match self.shared.reapers.lock() {
+            Ok(mut t) => std::mem::take(&mut *t),
+            Err(e) => std::mem::take(&mut *e.into_inner()),
+        };
         for t in cqs {
             join(t, me, &self.shared.log);
         }
