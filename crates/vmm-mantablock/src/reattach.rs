@@ -85,7 +85,7 @@ pub(crate) fn run<J: Job>(
             return None;
         }
         tries += 1;
-        match once(shared, plan, (now + plan.deadline).min(until)) {
+        match once(shared, plan, (now + plan.deadline).min(until), until) {
             Ok(conn) => {
                 slog::info!(shared.log, "mantablock: reattached";
                     "generation" => plan.grant.generation,
@@ -102,7 +102,10 @@ pub(crate) fn run<J: Job>(
                 last = why;
             }
         }
-        nap(shared, backoff.min(until.saturating_duration_since(now)));
+        nap(
+            shared,
+            backoff.min(until.saturating_duration_since(Instant::now())),
+        );
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
@@ -122,9 +125,10 @@ fn once<J: Job>(
     shared: &Arc<Shared<J>>,
     plan: &Plan,
     deadline: Instant,
+    until: Instant,
 ) -> Result<Conn, Failed> {
     let retry = |e: std::io::Error| Failed::Retry(e.to_string());
-    let mut conn = Conn::connect(&plan.socket).map_err(retry)?;
+    let mut conn = Conn::connect(&plan.socket, deadline).map_err(retry)?;
     let ask = plan.grant.ask(plan.volume, plan.allow_volatile);
     let att = attach::attach(&mut conn, &ask, deadline).map_err(retry)?;
     if att.grant() != plan.grant {
@@ -132,6 +136,9 @@ fn once<J: Job>(
             "the engine changed the grant: {:?}",
             att.grant()
         )));
+    }
+    if Instant::now() >= until {
+        return Err(Failed::Retry("attached past the bound".into()));
     }
     // Anything lost before this point was about the old attachment.
     shared.rehold();

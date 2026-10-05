@@ -136,8 +136,9 @@ pub fn connect(cfg: Config) -> io::Result<Connected> {
         max_blocks: cfg.part_blocks,
         allow_volatile: cfg.allow_volatile,
     };
-    let mut conn = conn::Conn::connect(&cfg.socket)?;
-    let att = attach::attach(&mut conn, &ask, Instant::now() + cfg.deadline)?;
+    let deadline = Instant::now() + cfg.deadline;
+    let mut conn = conn::Conn::connect(&cfg.socket, deadline)?;
+    let att = attach::attach(&mut conn, &ask, deadline)?;
     slog::info!(cfg.log, "mantablock: attached";
         "volume" => %cfg.volume,
         "generation" => att.generation,
