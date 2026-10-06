@@ -780,7 +780,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 [[package]]
 name = "manta-block-ring"
 version = "0.1.0"
-source = "git+https://github.com/TritonDataCenter/manta-block-ring?rev=6ea2c8db33f2a928aa91b7586402e0a695a8eae7#6ea2c8db33f2a928aa91b7586402e0a695a8eae7"
+source = "git+https://github.com/TritonDataCenter/manta-block-ring?rev=674466d7346a631e20d906b1138e2f7427bef8a4#674466d7346a631e20d906b1138e2f7427bef8a4"
 
 [[package]]
 name = "memchr"
