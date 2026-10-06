@@ -41,7 +41,7 @@ use vmm_core::mem::PhysMap;
 use vmm_core::mmio::MmioBus;
 
 use vmm_devices::blkdev::DiskSync;
-use vmm_devices::lifecycle::{DeviceStateError, Indicator};
+use vmm_devices::lifecycle::{DeviceStateError, Indicator, NvmeMigrateBackend};
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use vmm_devices::pci::msix::{HdlMsiSink, MsiSink, MsixTable};
@@ -557,10 +557,13 @@ impl Lifecycle for NvmeController {
         if self.backend.migratable() {
             return None;
         }
-        Some(format!(
-            "nvme on {} has no migration handover yet",
-            self.backend.identity()
-        ))
+        Some(match self.backend.identity() {
+            NvmeMigrateBackend::MantaBlock { volume } => format!(
+                "live migration of a MantaBlock disk is not supported yet \
+                 (volume {volume})"
+            ),
+            other => format!("nvme on {other} has no migration handover yet"),
+        })
     }
 
     fn export_migrate_state(
