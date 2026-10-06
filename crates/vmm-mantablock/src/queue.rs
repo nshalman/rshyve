@@ -28,10 +28,11 @@ use manta_block_ring::layout::{PAGE, SQE_BYTES};
 use manta_block_ring::{Cqe, Op, Producer, Region, Sqe};
 use vmm_storage::nvme::backend::{BlockOp, BlockStatus};
 
-use crate::copy::{self, Span, Stage};
+use crate::copy::{self, Bytes, Span, Stage};
 use crate::ids::Seqs;
 use crate::job::{block_status, Job};
 use crate::out::{Lost, Out, Owner, Waiter};
+use crate::shape::{data_span, part_bytes, zero_parts, ZeroPart};
 use crate::split::Slots;
 use crate::tags::{Part, Tags};
 use crate::wake;
@@ -40,7 +41,14 @@ struct Req<J: Job> {
     owner: Owner<J>,
     op: Op,
     lba: u64,
+    /// Blocks, or for a zeroing op its parts.
     blocks: u32,
+    /// Where the guest range starts in the first block, and its bytes; 0
+    /// bytes when it is every byte of the blocks.
+    head: u32,
+    len: u64,
+    /// A zeroing op's ring parts.
+    zero: Vec<ZeroPart>,
     /// Blocks already put on the ring.
     next: u32,
     /// Parts on the ring now.
@@ -82,11 +90,22 @@ pub(crate) struct CqSide {
     kicks: Vec<usize>,
 }
 
+/// What the queue checks a request against before it goes on the ring.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Volume {
+    /// 4 KiB blocks.
+    pub(crate) blocks: u64,
+    /// The logical sector: 512 or 4096.
+    pub(crate) sector: u32,
+    /// The engine takes deallocate and write zeroes.
+    pub(crate) zeroing: bool,
+}
+
 pub(crate) struct QueueRing<J: Job> {
     q: u16,
     slots: Slots,
     durable: bool,
-    volume_blocks: u64,
+    volume: Volume,
     sq: Mutex<SqSide>,
     tags: Tags,
     /// By guest tag; the last one is the ring's own.
@@ -107,7 +126,7 @@ impl<J: Job> QueueRing<J> {
         slots: Slots,
         generation: u64,
         durable: bool,
-        volume_blocks: u64,
+        volume: Volume,
     ) -> Option<Self> {
         let sq = region.sq_producer(q)?;
         let tags = usize::from(slots.tags);
@@ -115,7 +134,7 @@ impl<J: Job> QueueRing<J> {
             q,
             slots,
             durable,
-            volume_blocks,
+            volume,
             sq: Mutex::new(SqSide {
                 region,
                 sq,
@@ -225,25 +244,30 @@ impl<J: Job> QueueRing<J> {
             BlockOp::Flush => return Ok(Some(Shape::flush())),
             BlockOp::Read => Op::Read,
             BlockOp::Write { .. } => Op::Write,
+            BlockOp::Deallocate => return self.zeroing(job, Op::Deallocate),
+            BlockOp::WriteZeroes { deallocate } => {
+                let op = if deallocate {
+                    Op::Deallocate
+                } else {
+                    Op::WriteZeroes
+                };
+                return self.zeroing(job, op);
+            }
         };
         if job.is_empty() {
             return Ok(None);
         }
-        let len = job.len();
-        let page = PAGE as u64;
-        let off = job.byte_offset();
-        // The engine serves 4 KiB blocks only.
-        if !off.is_multiple_of(page) || !len.is_multiple_of(PAGE) {
+        let len = job.len() as u64;
+        let Some(sp) = data_span(job.byte_offset(), len, self.volume.sector)
+        else {
             return Err(BlockStatus::Internal);
-        }
-        let lba = off / page;
-        let blocks =
-            u32::try_from(len / PAGE).map_err(|_| BlockStatus::Internal)?;
+        };
         // The engine detaches on a request past the end, so it is never
         // sent one.
-        if lba
-            .checked_add(u64::from(blocks))
-            .is_none_or(|end| end > self.volume_blocks)
+        if sp
+            .lba
+            .checked_add(u64::from(sp.blocks))
+            .is_none_or(|end| end > self.volume.blocks)
         {
             return Err(BlockStatus::LbaOutOfRange);
         }
@@ -251,10 +275,54 @@ impl<J: Job> QueueRing<J> {
         let fua = matches!(job.op(), BlockOp::Write { fua: true });
         Ok(Some(Shape {
             op,
-            lba,
-            blocks,
+            lba: sp.lba,
+            blocks: sp.blocks,
+            head: sp.head,
+            len: sp.len,
+            zero: Vec::new(),
             flush_after: fua && !self.durable,
             pages: Some(pages),
+        }))
+    }
+
+    /// A deallocate or write zeroes: its ranges as ring parts, each
+    /// checked against the volume as the engine checks it.
+    fn zeroing(
+        &self,
+        job: &J,
+        op: Op,
+    ) -> Result<Option<Shape<J>>, BlockStatus> {
+        if !self.volume.zeroing {
+            return Err(BlockStatus::Unsupported);
+        }
+        let sector = u64::from(self.volume.sector);
+        let mut zero = Vec::new();
+        for (off, len) in job.zero_ranges() {
+            if !off.is_multiple_of(sector) || !len.is_multiple_of(sector) {
+                return Err(BlockStatus::Internal);
+            }
+            if off
+                .checked_add(len)
+                .is_none_or(|end| end > self.volume.blocks * PAGE as u64)
+            {
+                return Err(BlockStatus::LbaOutOfRange);
+            }
+            zero_parts(off, len, &mut zero);
+        }
+        if zero.is_empty() {
+            return Ok(None);
+        }
+        let parts =
+            u32::try_from(zero.len()).map_err(|_| BlockStatus::Internal)?;
+        Ok(Some(Shape {
+            op,
+            lba: 0,
+            blocks: parts,
+            head: 0,
+            len: 0,
+            zero,
+            flush_after: false,
+            pages: None,
         }))
     }
 
@@ -320,27 +388,58 @@ impl<J: Job> QueueRing<J> {
         tag: u16,
         flush: bool,
     ) -> Result<(), Posted> {
-        let page = self.slots.page(tag);
+        let zeroing = !flush && !req.zero.is_empty();
+        let page = if zeroing { 0 } else { self.slots.page(tag) };
         let (first, blocks) = if flush {
             (0, 0)
+        } else if zeroing {
+            (req.next, 1)
         } else {
             (req.next, self.slots.next_part(req.blocks, req.next))
         };
+        let mut range = (0u16, 0u32);
         if !flush && req.op == Op::Write {
             let (Owner::Guest(job), Some(pages)) = (&req.owner, &req.pages)
             else {
                 return Err(Posted::Copy(BlockStatus::Internal));
             };
-            let span = Span {
-                q: self.q,
-                page,
-                first,
-                blocks,
-            };
             // The engine reads the buffer only after the tail moves, and
             // the tail store in `publish` releases these stores.
-            copy::to_ring(&sq.region, job, pages, span, &mut sq.stage)
+            if req.len == 0 {
+                let span = Span {
+                    q: self.q,
+                    page,
+                    first,
+                    blocks,
+                };
+                copy::to_ring(&sq.region, job, pages, span, &mut sq.stage)
+                    .map_err(Posted::Copy)?;
+            } else {
+                let b = part_bytes(&req.span(), first, blocks);
+                let bytes = Bytes {
+                    q: self.q,
+                    buf: page as usize * PAGE + b.in_part,
+                    at: b.at,
+                    len: b.glen,
+                };
+                copy::to_ring_bytes(
+                    &sq.region,
+                    job,
+                    pages,
+                    bytes,
+                    &mut sq.stage,
+                )
                 .map_err(Posted::Copy)?;
+                range = (b.off, b.len);
+            }
+        }
+        let zp = if zeroing {
+            req.zero.get(first as usize).copied()
+        } else {
+            None
+        };
+        if let Some(z) = zp {
+            range = (z.off, z.len);
         }
         let Ok(id) = sq.seqs.open() else {
             self.tags.abandon(tag);
@@ -354,20 +453,27 @@ impl<J: Job> QueueRing<J> {
         let part = Part {
             req: slot,
             first,
-            blocks,
+            blocks: if zeroing { 0 } else { blocks },
         };
         self.tags.open(tag, id.low(), part, queued_at);
+        let (lba, part_blocks) = match zp {
+            Some(z) => (z.lba, z.blocks),
+            None if flush => (0, 0),
+            None => (req.lba + u64::from(first), blocks),
+        };
         let e = Sqe {
             op_id: id.to_u128(),
-            lba: if flush { 0 } else { req.lba + u64::from(first) },
-            blocks,
+            lba,
+            blocks: part_blocks,
             buf_page: if flush { 0 } else { page },
             watermark,
             queued_at,
             tag,
             op: if flush { Op::Flush } else { req.op } as u8,
             flags: 0,
-            reserved: [0; 12],
+            byte_off: range.0,
+            byte_len: range.1,
+            reserved: [0; 6],
         };
         let why = match sq.sq.try_push(&e.encode()) {
             Ok(true) => None,
@@ -447,19 +553,39 @@ impl<J: Job> QueueRing<J> {
         if s == BlockStatus::Success && req.op == Op::Read && part.blocks > 0 {
             s = match (&req.owner, &req.pages) {
                 (Owner::Guest(job), Some(pages)) => {
-                    let span = Span {
-                        q: self.q,
-                        page: self.slots.page(c.tag),
-                        first: part.first,
-                        blocks: part.blocks,
+                    let page = self.slots.page(c.tag);
+                    let r = if req.len == 0 {
+                        let span = Span {
+                            q: self.q,
+                            page,
+                            first: part.first,
+                            blocks: part.blocks,
+                        };
+                        copy::from_ring(
+                            &cq.region,
+                            job,
+                            pages,
+                            span,
+                            &mut cq.stage,
+                        )
+                    } else {
+                        let b =
+                            part_bytes(&req.span(), part.first, part.blocks);
+                        let bytes = Bytes {
+                            q: self.q,
+                            buf: page as usize * PAGE + b.in_part,
+                            at: b.at,
+                            len: b.glen,
+                        };
+                        copy::from_ring_bytes(
+                            &cq.region,
+                            job,
+                            pages,
+                            bytes,
+                            &mut cq.stage,
+                        )
                     };
-                    match copy::from_ring(
-                        &cq.region,
-                        job,
-                        pages,
-                        span,
-                        &mut cq.stage,
-                    ) {
+                    match r {
                         Ok(()) => BlockStatus::Success,
                         Err(s) => s,
                     }
@@ -631,6 +757,9 @@ struct Shape<J: Job> {
     op: Op,
     lba: u64,
     blocks: u32,
+    head: u32,
+    len: u64,
+    zero: Vec<ZeroPart>,
     flush_after: bool,
     pages: Option<J::Pages>,
 }
@@ -643,6 +772,9 @@ impl<J: Job> Shape<J> {
             op: Op::Flush,
             lba: 0,
             blocks: 0,
+            head: 0,
+            len: 0,
+            zero: Vec::new(),
             flush_after: true,
             pages: None,
         }
@@ -650,12 +782,24 @@ impl<J: Job> Shape<J> {
 }
 
 impl<J: Job> Req<J> {
+    fn span(&self) -> crate::shape::Span {
+        crate::shape::Span {
+            lba: self.lba,
+            blocks: self.blocks,
+            head: self.head,
+            len: self.len,
+        }
+    }
+
     fn new(owner: Owner<J>, s: Shape<J>) -> Self {
         Self {
             owner,
             op: s.op,
             lba: s.lba,
             blocks: s.blocks,
+            head: s.head,
+            len: s.len,
+            zero: s.zero,
             next: 0,
             in_ring: 0,
             flush_after: s.flush_after,

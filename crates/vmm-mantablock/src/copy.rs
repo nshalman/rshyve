@@ -86,6 +86,66 @@ pub(crate) fn from_ring<J: Job>(
     Ok(())
 }
 
+/// Where a sub-block part's guest bytes go: `len` bytes from byte `at` of
+/// the transfer, at byte `buf` of the queue's buffer area.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Bytes {
+    pub(crate) q: u16,
+    pub(crate) buf: usize,
+    pub(crate) at: usize,
+    pub(crate) len: usize,
+}
+
+impl Bytes {
+    /// Each step: its byte in the buffer area, where it starts in the
+    /// transfer, and its length.
+    fn steps(self) -> impl Iterator<Item = (usize, usize, usize)> {
+        let step = STEP_PAGES * PAGE;
+        (0..self.len).step_by(step).map(move |done| {
+            let n = (self.len - done).min(step);
+            (self.buf + done, self.at + done, n)
+        })
+    }
+}
+
+/// Write data of a sub-block part, guest to ring.
+pub(crate) fn to_ring_bytes<J: Job>(
+    region: &Region,
+    job: &J,
+    pages: &J::Pages,
+    b: Bytes,
+    stage: &mut Stage,
+) -> Result<(), BlockStatus> {
+    for (buf, at, len) in b.steps() {
+        let tmp = &mut stage.0[..len];
+        job.copy_from_guest(pages, at, tmp)
+            .map_err(|_| BlockStatus::DataTransfer)?;
+        if !region.write_buffer_at(b.q, buf, tmp) {
+            return Err(BlockStatus::Internal);
+        }
+    }
+    Ok(())
+}
+
+/// Read data of a sub-block part, ring to guest.
+pub(crate) fn from_ring_bytes<J: Job>(
+    region: &Region,
+    job: &J,
+    pages: &J::Pages,
+    b: Bytes,
+    stage: &mut Stage,
+) -> Result<(), BlockStatus> {
+    for (buf, at, len) in b.steps() {
+        let tmp = &mut stage.0[..len];
+        if !region.read_buffer_at(b.q, buf, tmp) {
+            return Err(BlockStatus::Internal);
+        }
+        job.copy_to_guest(pages, at, tmp)
+            .map_err(|_| BlockStatus::DataTransfer)?;
+    }
+    Ok(())
+}
+
 /// Write data of a replay, from the old region into the same pages of
 /// the new one.
 pub(crate) fn between(

@@ -16,7 +16,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use manta_block_ring::control::{
-    Attach, AttachOk, Message, ATTACH_DURABLE, PROTOCOL_VERSION,
+    feature, Attach, AttachOk, Message, ATTACH_DEALLOCATE, ATTACH_DURABLE,
+    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use manta_block_ring::layout::LAYOUT_VERSION;
 use manta_block_ring::{Geometry, Region};
@@ -51,6 +52,10 @@ pub(crate) struct Attached {
     pub(crate) region: Arc<Region>,
     pub(crate) generation: u64,
     pub(crate) volume_blocks: u64,
+    /// The volume's logical sector: 512 or 4096.
+    pub(crate) sector_bytes: u32,
+    /// The volume takes deallocate and write zeroes.
+    pub(crate) zeroing: bool,
     pub(crate) durable: bool,
     pub(crate) max_blocks: u32,
     pub(crate) slots: Slots,
@@ -64,6 +69,8 @@ pub(crate) struct Grant {
     pub(crate) generation: u64,
     pub(crate) geometry: Geometry,
     pub(crate) volume_blocks: u64,
+    pub(crate) sector_bytes: u32,
+    pub(crate) zeroing: bool,
     pub(crate) durable: bool,
     pub(crate) max_blocks: u32,
     pub(crate) slots: Slots,
@@ -75,6 +82,8 @@ impl Attached {
             generation: self.generation,
             geometry: *self.region.geometry(),
             volume_blocks: self.volume_blocks,
+            sector_bytes: self.sector_bytes,
+            zeroing: self.zeroing,
             durable: self.durable,
             max_blocks: self.max_blocks,
             slots: self.slots,
@@ -102,20 +111,26 @@ pub(crate) fn attach(
     ask: &Ask,
     deadline: Instant,
 ) -> io::Result<Attached> {
+    let offered = feature::SECTOR_512E | feature::DEALLOCATE;
     let hello = Message::Hello {
-        min_version: PROTOCOL_VERSION,
+        min_version: MIN_PROTOCOL_VERSION,
         max_version: PROTOCOL_VERSION,
-        features: 0,
+        features: offered,
     };
     conn.send(&hello, deadline)?;
-    match next(conn, deadline)? {
-        // This build asks for no features, so a granted one is a bug.
+    let features = match next(conn, deadline)? {
+        // A bit not offered, or a bit in version 1, is an engine bug.
         (Message::HelloAck { version, features }, fds)
-            if version == PROTOCOL_VERSION
-                && features == 0
-                && fds.is_empty() => {}
+            if (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
+                && features & !offered == 0
+                && (version >= 2 || features == 0)
+                && fds.is_empty() =>
+        {
+            conn.set_version(version);
+            features
+        }
         (m, _) => return Err(refused("Hello", &m)),
-    }
+    };
     conn.send(
         &Message::Attach(Attach {
             volume: ask.volume,
@@ -132,6 +147,13 @@ pub(crate) fn attach(
         (m, _) => return Err(attach_refused(&m)),
     };
     let geometry = check_ok(ask, &ok).map_err(invalid)?;
+    if ok.sector_bytes != 4096 && features & feature::SECTOR_512E == 0 {
+        return Err(invalid("a 512-byte volume without sector-512e"));
+    }
+    let zeroing = ok.flags & ATTACH_DEALLOCATE != 0;
+    if zeroing && features & feature::DEALLOCATE == 0 {
+        return Err(invalid("deallocate granted but not agreed"));
+    }
     let want = 1 + 2 * usize::from(geometry.queues());
     if fds.len() != want {
         return Err(invalid(format!(
@@ -164,6 +186,8 @@ pub(crate) fn attach(
         region,
         generation: ok.generation,
         volume_blocks: ok.volume_blocks,
+        sector_bytes: u32::from(ok.sector_bytes),
+        zeroing,
         durable: ok.flags & ATTACH_DURABLE != 0,
         max_blocks: ok.max_blocks,
         slots,
@@ -317,6 +341,7 @@ mod tests {
             region_len: g.region_len() as u64,
             layout_version: LAYOUT_VERSION,
             flags: ATTACH_DURABLE,
+            sector_bytes: 4096,
         }
     }
 
@@ -381,6 +406,7 @@ mod tests {
         theirs: std::os::unix::net::UnixStream,
         reply: AttachOk,
         fds: Vec<OwnedFd>,
+        (version, features): (u16, u64),
     ) -> std::thread::JoinHandle<()> {
         use std::io::{IoSlice, Read, Write};
         use std::mem::MaybeUninit;
@@ -396,25 +422,29 @@ mod tests {
             let mut chunk = [0u8; 4096];
             for step in 0..2 {
                 let msg = loop {
-                    if let Some((m, _, used)) = Message::decode(&buf).unwrap() {
+                    let v = if step == 0 { 1 } else { version };
+                    if let Some((m, _, used)) =
+                        Message::decode_as(&buf, v).unwrap()
+                    {
                         buf.drain(..used);
                         break m;
                     }
                     let n = s.read(&mut chunk).unwrap();
-                    assert!(n > 0);
+                    // The VMM may refuse the HelloAck and close.
+                    if n == 0 {
+                        return;
+                    }
                     buf.extend_from_slice(&chunk[..n]);
                 };
                 if step == 0 {
                     assert!(matches!(msg, Message::Hello { .. }));
-                    let ack = Message::HelloAck {
-                        version: PROTOCOL_VERSION,
-                        features: 0,
-                    };
+                    let ack = Message::HelloAck { version, features };
                     s.write_all(&ack.encode(1)).unwrap();
                     continue;
                 }
                 assert!(matches!(msg, Message::Attach(_)));
-                let frame = Message::AttachOk(reply.clone()).encode(2);
+                let frame =
+                    Message::AttachOk(reply.clone()).encode_as(2, version);
                 let borrowed: Vec<BorrowedFd<'_>> =
                     fds.iter().map(|f| f.as_fd()).collect();
                 let mut space =
@@ -465,6 +495,7 @@ mod tests {
             region_len: g.region_len() as u64,
             layout_version: LAYOUT_VERSION,
             flags: ATTACH_DURABLE,
+            sector_bytes: 4096,
         };
         (ask, ok, file)
     }
@@ -472,9 +503,20 @@ mod tests {
     fn attach_with(
         fds: impl FnOnce(File) -> Vec<OwnedFd>,
     ) -> io::Result<Attached> {
-        let (ask, ok, file) = granted();
+        attach_as((1, 0), |_| {}, fds)
+    }
+
+    /// As [`attach_with`], from an engine that agrees `hello` and
+    /// changes its AttachOk with `tweak`.
+    fn attach_as(
+        hello: (u16, u64),
+        tweak: impl FnOnce(&mut AttachOk),
+        fds: impl FnOnce(File) -> Vec<OwnedFd>,
+    ) -> io::Result<Attached> {
+        let (ask, mut ok, file) = granted();
+        tweak(&mut ok);
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        let eng = engine(theirs, ok, fds(file));
+        let eng = engine(theirs, ok, fds(file), hello);
         let mut conn = Conn::new(ours).unwrap();
         let got = attach(
             &mut conn,
@@ -496,6 +538,49 @@ mod tests {
         .unwrap();
         assert_eq!((att.generation, att.pipes.len()), (9, 1));
         assert!(att.durable);
+    }
+
+    fn three_fds(file: File) -> Vec<OwnedFd> {
+        let (_, engine_tx) = rustix::pipe::pipe().unwrap();
+        let (vmm_rx, _) = rustix::pipe::pipe().unwrap();
+        vec![OwnedFd::from(file), engine_tx, vmm_rx]
+    }
+
+    #[test]
+    fn a_version_2_engine_grants_512e_and_zeroing() {
+        let all = feature::SECTOR_512E | feature::DEALLOCATE;
+        let att = attach_as(
+            (2, all),
+            |ok| {
+                ok.sector_bytes = 512;
+                ok.flags |= ATTACH_DEALLOCATE;
+            },
+            three_fds,
+        )
+        .unwrap();
+        assert_eq!((att.sector_bytes, att.zeroing), (512, true));
+    }
+
+    #[test]
+    fn a_grant_beyond_what_hello_agreed_is_refused() {
+        let e = attach_as(
+            (2, feature::DEALLOCATE),
+            |ok| ok.sector_bytes = 512,
+            three_fds,
+        )
+        .err()
+        .unwrap();
+        assert!(e.to_string().contains("sector-512e"), "{e}");
+        let e = attach_as(
+            (2, feature::SECTOR_512E),
+            |ok| ok.flags |= ATTACH_DEALLOCATE,
+            three_fds,
+        )
+        .err()
+        .unwrap();
+        assert!(e.to_string().contains("deallocate"), "{e}");
+        let e = attach_as((2, 1 << 40), |_| {}, three_fds).err().unwrap();
+        assert!(e.to_string().contains("Hello"), "{e}");
     }
 
     #[test]

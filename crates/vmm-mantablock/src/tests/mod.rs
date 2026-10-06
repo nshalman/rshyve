@@ -28,6 +28,7 @@ mod control;
 mod faults;
 mod reattach;
 mod scatter;
+mod sectors;
 mod stress;
 
 const GEN: u64 = 0x51;
@@ -74,6 +75,15 @@ impl Job for TJob {
 
     fn pages(&self) -> io::Result<()> {
         Ok(())
+    }
+
+    /// A zeroing job names one range: its offset and its buffer's length.
+    fn zero_ranges(&self) -> Vec<(u64, u64)> {
+        if self.op.is_zeroing() {
+            vec![(self.off, self.mem.lock().unwrap().len() as u64)]
+        } else {
+            Vec::new()
+        }
     }
 
     fn copy_from_guest(
@@ -214,6 +224,32 @@ fn setup_queues<J: Job<Id = u32>>(
     conn: Option<crate::conn::Conn>,
     tune: impl FnOnce(&mut Config),
 ) -> (Arc<Ring<J>>, Vec<Engine>) {
+    setup_volume(
+        queues,
+        depth,
+        buf_pages,
+        max_blocks,
+        durable,
+        sink,
+        conn,
+        tune,
+        (4096, false),
+    )
+}
+
+/// As [`setup_queues`], on a volume of `(sector, zeroing)`.
+#[allow(clippy::too_many_arguments)]
+fn setup_volume<J: Job<Id = u32>>(
+    queues: u16,
+    depth: u32,
+    buf_pages: u32,
+    max_blocks: u32,
+    durable: bool,
+    sink: Arc<dyn Sink<u32>>,
+    conn: Option<crate::conn::Conn>,
+    tune: impl FnOnce(&mut Config),
+    (sector_bytes, zeroing): (u32, bool),
+) -> (Arc<Ring<J>>, Vec<Engine>) {
     let g = Geometry::new(queues, depth, buf_pages).unwrap();
     let (engines, mut fds) = Engine::all(g, GEN);
     let region = map(&std::fs::File::from(fds.remove(0)), g);
@@ -231,6 +267,8 @@ fn setup_queues<J: Job<Id = u32>>(
         region,
         generation: GEN,
         volume_blocks: BLOCKS,
+        sector_bytes,
+        zeroing,
         durable,
         max_blocks,
         slots: Slots::new(depth, buf_pages, max_blocks).unwrap(),
@@ -306,19 +344,31 @@ impl Engine {
         got
     }
 
-    /// Serves a request the way the real engine does.
+    /// Serves a request the way the real engine does: a byte range
+    /// merges into the blocks it names.
     fn serve(&mut self, e: &Sqe) -> Cqe {
         let at = e.lba as usize * PAGE;
         let len = e.blocks as usize * PAGE;
+        let (from, to) = if e.byte_len == 0 {
+            (0, len)
+        } else {
+            let off = usize::from(e.byte_off);
+            (off, off + e.byte_len as usize)
+        };
         match e.op {
             1 => {
+                assert_eq!(e.byte_len, 0, "a read with a range");
                 let data = self.disk[at..at + len].to_vec();
                 assert!(self.region.write_buffer(self.q, e.buf_page, &data));
             }
             2 => {
                 let mut data = vec![0; len];
                 assert!(self.region.read_buffer(self.q, e.buf_page, &mut data));
-                self.disk[at..at + len].copy_from_slice(&data);
+                self.disk[at + from..at + to].copy_from_slice(&data[from..to]);
+            }
+            4 | 5 => {
+                assert_eq!(e.buf_page, 0);
+                self.disk[at + from..at + to].fill(0);
             }
             _ => {}
         }
