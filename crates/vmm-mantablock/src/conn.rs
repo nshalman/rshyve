@@ -16,7 +16,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Instant;
 
-use manta_block_ring::control::{Message, MAX_FRAME};
+use manta_block_ring::control::{Message, HELLO_VERSION, MAX_FRAME};
 use manta_block_ring::layout::MAX_QUEUES;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
@@ -46,6 +46,8 @@ pub(crate) struct Conn {
     /// Descriptors received since the last whole frame.
     fds: Vec<OwnedFd>,
     next_id: u32,
+    /// Frames after HelloAck go in the agreed version.
+    version: u16,
 }
 
 impl Conn {
@@ -76,7 +78,13 @@ impl Conn {
             buf: Vec::new(),
             fds: Vec::new(),
             next_id: 1,
+            version: HELLO_VERSION,
         })
+    }
+
+    /// Every frame after this goes in `version`.
+    pub(crate) fn set_version(&mut self, version: u16) {
+        self.version = version;
     }
 
     /// Returns the frame id.
@@ -87,7 +95,7 @@ impl Conn {
     ) -> io::Result<u32> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        let frame = msg.encode(id);
+        let frame = msg.encode_as(id, self.version);
         let mut rest = &frame[..];
         while !rest.is_empty() {
             // A closed peer is an error here, not a signal.
@@ -109,7 +117,7 @@ impl Conn {
     ) -> io::Result<Option<Frame>> {
         loop {
             if let Some((msg, _, used)) =
-                Message::decode(&self.buf).map_err(invalid)?
+                Message::decode_as(&self.buf, self.version).map_err(invalid)?
             {
                 self.buf.drain(..used);
                 let fds = std::mem::take(&mut self.fds);
@@ -133,7 +141,7 @@ impl Conn {
     pub(crate) fn try_recv(&mut self) -> io::Result<Polled> {
         loop {
             if let Some((msg, _, used)) =
-                Message::decode(&self.buf).map_err(invalid)?
+                Message::decode_as(&self.buf, self.version).map_err(invalid)?
             {
                 self.buf.drain(..used);
                 let fds = std::mem::take(&mut self.fds);
@@ -150,7 +158,7 @@ impl Conn {
     /// True when [`Self::try_recv`] would return without reading: a whole
     /// frame is buffered, or bytes that will not decode.
     pub(crate) fn frame_buffered(&self) -> bool {
-        !matches!(Message::decode(&self.buf), Ok(None))
+        !matches!(Message::decode_as(&self.buf, self.version), Ok(None))
     }
 
     /// A timeout is not an error here.

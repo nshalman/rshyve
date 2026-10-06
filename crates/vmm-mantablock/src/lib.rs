@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vmm_storage::nvme::backend::{AsyncBackend, BackendFactory, BlockRequest};
-use vmm_storage::nvme::{LbaSize, NvmeConfig};
+use vmm_storage::nvme::{LbaSize, NsHints, NvmeConfig};
 
 mod attach;
 mod conn;
@@ -41,6 +41,7 @@ mod queue;
 mod reaper;
 mod reattach;
 mod ring;
+mod shape;
 mod split;
 mod tags;
 mod wake;
@@ -165,12 +166,28 @@ impl Connected {
         self.att.durable
     }
 
-    /// 4 KiB blocks, as the ring moves whole pages, and a volatile write
-    /// cache unless every write is durable when it completes.
+    /// The volume's logical sector, fixed at its create: 512 or 4096.
+    pub fn sector_bytes(&self) -> u32 {
+        self.att.sector_bytes
+    }
+
+    /// The volume's sector as the LBA size, its 4 KiB blocks as the
+    /// physical block, deallocate and write zeroes when the engine takes
+    /// them, and a volatile write cache unless every write is durable when
+    /// it completes.
     pub fn nvme_config(&self) -> NvmeConfig {
         NvmeConfig {
-            lba_size: LbaSize::B4096,
+            lba_size: if self.att.sector_bytes == 512 {
+                LbaSize::B512
+            } else {
+                LbaSize::B4096
+            },
             volatile_write_cache: !self.att.durable,
+            deallocate: self.att.zeroing,
+            hints: Some(NsHints {
+                physical_bytes: 4096,
+                optimal_write_bytes: self.att.slots.part_blocks * 4096,
+            }),
             ..NvmeConfig::default()
         }
     }

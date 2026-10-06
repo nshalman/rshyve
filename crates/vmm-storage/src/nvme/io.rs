@@ -14,6 +14,7 @@ use vmm_devices::blkdev::DiskSync;
 use super::backend::{BlockOp, BlockRequest, GuestData, Liveness, RequestId};
 use super::bits::*;
 use super::inflight::Admitted;
+use super::prp;
 use super::queues::{io_queue_index, NvmeState};
 use super::NvmeController;
 
@@ -48,6 +49,9 @@ impl IoBackend for DiskSync {
 
 struct NvmCmd {
     opcode: u8,
+    cdw10: u32,
+    cdw11: u32,
+    cdw12: u32,
     cid: u16,
     nsid: u32,
     slba: u64,
@@ -71,6 +75,9 @@ impl NvmCmd {
         let cdw12 = le_u32(sqe, SQE_CDW12);
         Self {
             opcode: sqe[SQE_OPC],
+            cdw10: le_u32(sqe, SQE_CDW10),
+            cdw11: le_u32(sqe, SQE_CDW11),
+            cdw12,
             cid: u16::from_le_bytes([sqe[SQE_CID], sqe[SQE_CID + 1]]),
             nsid: le_u32(sqe, SQE_NSID),
             slba: le_u64(sqe, SQE_CDW10),
@@ -88,6 +95,7 @@ struct Checked {
     op: BlockOp,
     byte_offset: u64,
     len: usize,
+    zero: Vec<(u64, u64)>,
 }
 
 impl NvmeController {
@@ -169,7 +177,7 @@ impl NvmeController {
                 serial,
             };
 
-            match self.check(&cmd) {
+            match self.check(&cmd, &mem) {
                 Err(status) => self.finish_now(st, &mem, id, status),
                 // With no volatile cache every completed write is
                 // already durable, so there is nothing to flush.
@@ -178,18 +186,40 @@ impl NvmeController {
                 }) if !st.volatile_write_cache => {
                     self.finish_now(st, &mem, id, SC_SUCCESS)
                 }
+                // A Dataset Management with nothing to deallocate.
+                Ok(Checked { op, ref zero, .. })
+                    if op.is_zeroing() && zero.is_empty() =>
+                {
+                    self.finish_now(st, &mem, id, SC_SUCCESS)
+                }
                 Ok(Checked {
                     op,
                     byte_offset,
                     len,
+                    zero,
                 }) => self.submit(
                     st,
                     &mem,
                     BlockRequest {
                         id,
                         op,
-                        lba: if op == BlockOp::Flush { 0 } else { cmd.slba },
-                        blocks: if op == BlockOp::Flush { 0 } else { cmd.nlb },
+                        // A Dataset Management names its blocks in
+                        // `zero`, not in its command words.
+                        lba: if op == BlockOp::Flush
+                            || op == BlockOp::Deallocate
+                        {
+                            0
+                        } else {
+                            cmd.slba
+                        },
+                        blocks: if op == BlockOp::Flush
+                            || op == BlockOp::Deallocate
+                        {
+                            0
+                        } else {
+                            cmd.nlb
+                        },
+                        zero,
                         byte_offset,
                         data: GuestData {
                             mem: MemCtx::new(Arc::clone(&self.physmap)),
@@ -220,14 +250,23 @@ impl NvmeController {
         }
     }
 
-    fn check(&self, cmd: &NvmCmd) -> Result<Checked, u16> {
+    fn check(&self, cmd: &NvmCmd, mem: &MemCtx) -> Result<Checked, u16> {
         if cmd.nsid != 1 {
             return Err(SC_INVALID_NS | SC_DNR);
         }
+        let zeroing = matches!(cmd.opcode, NVM_OPC_DSM | NVM_OPC_WRITE_ZEROES);
+        if zeroing && !self.config.deallocate {
+            return Err(SC_INVALID_OPCODE | SC_DNR);
+        }
+        if zeroing && self.read_only {
+            return Err(SC_WRITE_TO_RO_RANGE | SC_DNR);
+        }
+        if cmd.opcode == NVM_OPC_DSM {
+            return self.check_dsm(cmd, mem);
+        }
         let block = u64::from(self.geometry.block_size);
-        let len = match u64::from(cmd.nlb).checked_mul(block) {
-            Some(n) if n <= MAX_XFER_BYTES => n as usize,
-            _ => return Err(SC_INVALID_FIELD | SC_DNR),
+        let Some(bytes) = u64::from(cmd.nlb).checked_mul(block) else {
+            return Err(SC_INVALID_FIELD | SC_DNR);
         };
         let Some(byte_offset) = cmd.slba.checked_mul(block) else {
             return Err(SC_INVALID_FIELD | SC_DNR);
@@ -239,6 +278,22 @@ impl NvmeController {
         {
             return Err(SC_INVALID_FIELD | SC_DNR);
         }
+        if cmd.opcode == NVM_OPC_WRITE_ZEROES {
+            // No data moves, so MDTS does not apply.
+            return Ok(Checked {
+                op: BlockOp::WriteZeroes {
+                    deallocate: cmd.cdw12 & WZ_DEAC != 0,
+                    fua: cmd.fua,
+                },
+                byte_offset,
+                len: 0,
+                zero: vec![(byte_offset, bytes)],
+            });
+        }
+        let len = match bytes {
+            n if n <= MAX_XFER_BYTES => n as usize,
+            _ => return Err(SC_INVALID_FIELD | SC_DNR),
+        };
         let op = match cmd.opcode {
             NVM_OPC_READ => BlockOp::Read,
             NVM_OPC_WRITE if self.read_only => {
@@ -250,6 +305,7 @@ impl NvmeController {
                     op: BlockOp::Flush,
                     byte_offset: 0,
                     len: 0,
+                    zero: Vec::new(),
                 });
             }
             _ => return Err(SC_INVALID_OPCODE | SC_DNR),
@@ -258,6 +314,50 @@ impl NvmeController {
             op,
             byte_offset,
             len,
+            zero: Vec::new(),
         })
+    }
+
+    /// Dataset Management: the range list is read once, here, so the
+    /// guest cannot change it under the backend. Only the deallocate
+    /// attribute does anything; the others are hints.
+    fn check_dsm(&self, cmd: &NvmCmd, mem: &MemCtx) -> Result<Checked, u16> {
+        let done = |zero| {
+            Ok(Checked {
+                op: BlockOp::Deallocate,
+                byte_offset: 0,
+                len: 0,
+                zero,
+            })
+        };
+        if cmd.cdw11 & DSM_AD == 0 {
+            return done(Vec::new());
+        }
+        let ranges = (cmd.cdw10 & 0xff) as usize + 1;
+        let mut list = vec![0u8; ranges * DSM_RANGE_BYTES];
+        let len = list.len();
+        if prp::copy_from_prp(mem, cmd.prp1, cmd.prp2, len, &mut list).is_err()
+        {
+            return Err(SC_DATA_XFER_ERROR);
+        }
+        let block = u64::from(self.geometry.block_size);
+        let mut zero = Vec::with_capacity(ranges);
+        for r in list.chunks_exact(DSM_RANGE_BYTES) {
+            let nlb = u32::from_le_bytes([r[4], r[5], r[6], r[7]]);
+            let slba =
+                u64::from_le_bytes(r[8..16].try_into().unwrap_or([0; 8]));
+            if nlb == 0 {
+                continue;
+            }
+            if slba
+                .checked_add(u64::from(nlb))
+                .is_none_or(|end| end > self.geometry.total_blocks)
+            {
+                return Err(SC_LBA_OUT_OF_RANGE | SC_DNR);
+            }
+            // Both fit: the namespace size in bytes fits a u64.
+            zero.push((slba * block, u64::from(nlb) * block));
+        }
+        done(zero)
     }
 }

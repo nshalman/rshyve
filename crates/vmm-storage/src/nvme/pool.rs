@@ -196,5 +196,9 @@ fn run(req: &BlockRequest, io: &dyn IoBackend) -> BlockStatus {
             Ok(()) => BlockStatus::Success,
             Err(_) => BlockStatus::Internal,
         },
+        // The controller offers these only to a backend that takes them.
+        BlockOp::Deallocate | BlockOp::WriteZeroes { .. } => {
+            BlockStatus::Unsupported
+        }
     }
 }

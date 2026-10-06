@@ -44,6 +44,11 @@ pub trait Job: Send + 'static {
     }
     /// Finds the guest memory of a read or write.
     fn pages(&self) -> io::Result<Self::Pages>;
+    /// The byte ranges of a deallocate or write zeroes, as offset and
+    /// length.
+    fn zero_ranges(&self) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
     /// Copies `dst.len()` bytes of a write out of guest memory, from `at`
     /// bytes into the transfer.
     fn copy_from_guest(
@@ -98,6 +103,10 @@ impl Job for BlockRequest {
 
     fn pages(&self) -> io::Result<Segments> {
         self.data().segments()
+    }
+
+    fn zero_ranges(&self) -> Vec<(u64, u64)> {
+        BlockRequest::zero_ranges(self).to_vec()
     }
 
     fn copy_from_guest(

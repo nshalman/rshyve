@@ -14,9 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use manta_block_ring::control::{
-    Attach, AttachOk, Message, ATTACH_DURABLE, PROTOCOL_VERSION,
-};
+use manta_block_ring::control::{Attach, AttachOk, Message, ATTACH_DURABLE};
 use manta_block_ring::layout::{LAYOUT_VERSION, PAGE};
 use manta_block_ring::{Geometry, OpId, Sqe};
 use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
@@ -100,6 +98,7 @@ fn grant(g: Geometry, generation: u64) -> AttachOk {
         region_len: g.region_len() as u64,
         layout_version: LAYOUT_VERSION,
         flags: 0,
+        sector_bytes: 4096,
     }
 }
 
@@ -137,7 +136,7 @@ impl Lab {
         let mut buf = Vec::new();
         assert!(matches!(recv(&mut s, &mut buf), Message::Hello { .. }));
         let ack = Message::HelloAck {
-            version: PROTOCOL_VERSION,
+            version: 1,
             features: 0,
         };
         s.write_all(&ack.encode(1)).unwrap();
@@ -188,7 +187,7 @@ fn handshake(s: &mut UnixStream, ok: AttachOk, fds: &[OwnedFd]) -> Attach {
     let mut buf = Vec::new();
     assert!(matches!(recv(s, &mut buf), Message::Hello { .. }));
     let ack = Message::HelloAck {
-        version: PROTOCOL_VERSION,
+        version: 1,
         features: 0,
     };
     s.write_all(&ack.encode(1)).unwrap();

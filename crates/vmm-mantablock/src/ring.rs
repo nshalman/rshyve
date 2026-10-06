@@ -21,7 +21,7 @@ use crate::attach::Attached;
 use crate::conn::Conn;
 use crate::job::{Job, Sink};
 use crate::out::{Lost, Out, Waiter};
-use crate::queue::QueueRing;
+use crate::queue::{QueueRing, Volume};
 use crate::reattach::Plan;
 use crate::{control, reaper, Config};
 
@@ -255,11 +255,18 @@ impl<J: Job> Ring<J> {
             region,
             generation,
             volume_blocks,
+            sector_bytes,
+            zeroing,
             durable,
             slots,
             pipes,
             ..
         } = att;
+        let volume = Volume {
+            blocks: volume_blocks,
+            sector: sector_bytes,
+            zeroing,
+        };
         let mut queues = Vec::new();
         let mut reapers = Vec::new();
         for (q, p) in (0u16..).zip(pipes) {
@@ -270,7 +277,7 @@ impl<J: Job> Ring<J> {
                 slots,
                 generation,
                 durable,
-                volume_blocks,
+                volume,
             );
             let cq = region.cq_consumer(q);
             if let (Some(ring), Some(cq)) = (ring, cq) {

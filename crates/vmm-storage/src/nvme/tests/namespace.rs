@@ -12,6 +12,8 @@ const NO_CACHE_4K: NvmeConfig = NvmeConfig {
     lba_size: LbaSize::B4096,
     volatile_write_cache: false,
     msi_policy: MsiPolicy::PerBatch,
+    deallocate: false,
+    hints: None,
 };
 
 fn identify(h: &mut Harness, cns: u8) -> Vec<u8> {
