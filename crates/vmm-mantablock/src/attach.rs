@@ -129,7 +129,7 @@ pub(crate) fn attach(
     )?;
     let (ok, mut fds) = match next(conn, deadline)? {
         (Message::AttachOk(ok), fds) => (ok, fds),
-        (m, _) => return Err(refused("Attach", &m)),
+        (m, _) => return Err(attach_refused(&m)),
     };
     let geometry = check_ok(ask, &ok).map_err(invalid)?;
     let want = 1 + 2 * usize::from(geometry.queues());
@@ -192,6 +192,37 @@ fn refused(step: &str, m: &Message) -> io::Error {
         ),
         other => invalid(format!("{step}: unexpected reply {other:?}")),
     }
+}
+
+/// The engine's Error code for a generation it never takes again.
+const GENERATION: u16 = 4;
+
+/// An Attach the engine refused for good.
+#[derive(Debug)]
+struct Final(String);
+
+impl std::fmt::Display for Final {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Final {}
+
+fn attach_refused(m: &Message) -> io::Error {
+    let e = refused("Attach", m);
+    match m {
+        Message::Error {
+            code: GENERATION, ..
+        } => io::Error::new(e.kind(), Final(e.to_string())),
+        _ => e,
+    }
+}
+
+/// True when the engine refused the Attach for good, so a retry cannot
+/// help.
+pub(crate) fn is_final(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|e| e.is::<Final>())
 }
 
 pub(crate) fn check_ok(ask: &Ask, ok: &AttachOk) -> Result<Geometry, String> {
