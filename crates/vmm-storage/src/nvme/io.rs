@@ -203,8 +203,22 @@ impl NvmeController {
                     BlockRequest {
                         id,
                         op,
-                        lba: if op == BlockOp::Flush { 0 } else { cmd.slba },
-                        blocks: if op == BlockOp::Flush { 0 } else { cmd.nlb },
+                        // A Dataset Management names its blocks in
+                        // `zero`, not in its command words.
+                        lba: if op == BlockOp::Flush
+                            || op == BlockOp::Deallocate
+                        {
+                            0
+                        } else {
+                            cmd.slba
+                        },
+                        blocks: if op == BlockOp::Flush
+                            || op == BlockOp::Deallocate
+                        {
+                            0
+                        } else {
+                            cmd.nlb
+                        },
                         zero,
                         byte_offset,
                         data: GuestData {
@@ -269,6 +283,7 @@ impl NvmeController {
             return Ok(Checked {
                 op: BlockOp::WriteZeroes {
                     deallocate: cmd.cdw12 & WZ_DEAC != 0,
+                    fua: cmd.fua,
                 },
                 byte_offset,
                 len: 0,

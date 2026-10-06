@@ -244,14 +244,16 @@ impl<J: Job> QueueRing<J> {
             BlockOp::Flush => return Ok(Some(Shape::flush())),
             BlockOp::Read => Op::Read,
             BlockOp::Write { .. } => Op::Write,
-            BlockOp::Deallocate => return self.zeroing(job, Op::Deallocate),
-            BlockOp::WriteZeroes { deallocate } => {
+            BlockOp::Deallocate => {
+                return self.zeroing(job, Op::Deallocate, false)
+            }
+            BlockOp::WriteZeroes { deallocate, fua } => {
                 let op = if deallocate {
                     Op::Deallocate
                 } else {
                     Op::WriteZeroes
                 };
-                return self.zeroing(job, op);
+                return self.zeroing(job, op, fua);
             }
         };
         if job.is_empty() {
@@ -291,6 +293,7 @@ impl<J: Job> QueueRing<J> {
         &self,
         job: &J,
         op: Op,
+        fua: bool,
     ) -> Result<Option<Shape<J>>, BlockStatus> {
         if !self.volume.zeroing {
             return Err(BlockStatus::Unsupported);
@@ -321,7 +324,7 @@ impl<J: Job> QueueRing<J> {
             head: 0,
             len: 0,
             zero,
-            flush_after: false,
+            flush_after: fua && !self.durable,
             pages: None,
         }))
     }

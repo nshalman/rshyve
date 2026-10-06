@@ -72,6 +72,7 @@ fn deallocate_reaches_the_backend_as_byte_ranges() {
     // The empty range is dropped.
     assert_eq!(req.zero_ranges(), &[(512, 7 * 512), (64 * 512, 1024 * 512)]);
     assert_eq!(req.data().len(), 0);
+    assert_eq!((req.lba(), req.blocks()), (0, 0));
     let status = manual.run(&req);
     manual.sink().complete(&[(req.id(), status)]);
     assert_eq!(h.wait_cqe(CQ1, 0, true).status(), Status::SUCCESS);
@@ -95,9 +96,21 @@ fn write_zeroes_names_its_range_and_deallocate_bit() {
     submit_on(&h, 1, SQ1, &mut tail, write_zeroes(16, 8, false), 2);
     let reqs = manual.take();
     assert_eq!(reqs.len(), 2);
-    assert_eq!(reqs[0].op(), BlockOp::WriteZeroes { deallocate: true });
+    assert_eq!(
+        reqs[0].op(),
+        BlockOp::WriteZeroes {
+            deallocate: true,
+            fua: false
+        }
+    );
     assert_eq!(reqs[0].zero_ranges(), &[(9 * 512, 3 * 512)]);
-    assert_eq!(reqs[1].op(), BlockOp::WriteZeroes { deallocate: false });
+    assert_eq!(
+        reqs[1].op(),
+        BlockOp::WriteZeroes {
+            deallocate: false,
+            fua: false
+        }
+    );
     assert_eq!(reqs[1].zero_ranges(), &[(16 * 512, 8 * 512)]);
 }
 

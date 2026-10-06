@@ -122,7 +122,10 @@ fn deallocate_and_write_zeroes_go_as_zeroing_ops() {
     ring.submit(at(
         2,
         1,
-        BlockOp::WriteZeroes { deallocate: false },
+        BlockOp::WriteZeroes {
+            deallocate: false,
+            fua: false,
+        },
         20 * 4096,
         vec![0; 2 * SECTOR],
     ));
@@ -149,6 +152,36 @@ fn deallocate_and_write_zeroes_go_as_zeroing_ops() {
     assert!(eng.disk[20 * 4096 + 1024..21 * 4096]
         .iter()
         .all(|&b| b == 0xaa));
+}
+
+#[test]
+fn write_zeroes_with_fua_flushes_a_volatile_engine() {
+    let calls = Arc::new(Calls::default());
+    let (ring, mut engines) = setup_volume::<TJob>(
+        1,
+        8,
+        16,
+        2,
+        false,
+        Arc::clone(&calls) as _,
+        None,
+        |_| {},
+        (512, true),
+    );
+    let mut eng = engines.remove(0);
+    ring.submit(at(
+        1,
+        0,
+        BlockOp::WriteZeroes {
+            deallocate: false,
+            fua: true,
+        },
+        0,
+        vec![0; 4096],
+    ));
+    serve_until_done(&mut eng, &calls, 1);
+    let ops: Vec<u8> = eng.seen.iter().map(|e| e.op).collect();
+    assert_eq!(ops, vec![5, 3]);
 }
 
 #[test]

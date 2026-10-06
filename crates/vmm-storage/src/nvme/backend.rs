@@ -55,9 +55,10 @@ pub enum BlockOp {
     /// read as zeros after.
     Deallocate,
     /// The blocks read as zeros after; `deallocate` lets the store free
-    /// them.
+    /// them; `fua`: the zeros must be durable before it completes.
     WriteZeroes {
         deallocate: bool,
+        fua: bool,
     },
 }
 
