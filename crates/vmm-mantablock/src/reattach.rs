@@ -135,7 +135,13 @@ fn once<J: Job>(
     let retry = |e: std::io::Error| Failed::Retry(e.to_string());
     let mut conn = Conn::connect(&plan.socket, deadline).map_err(retry)?;
     let ask = plan.grant.ask(plan.volume, plan.allow_volatile);
-    let att = attach::attach(&mut conn, &ask, deadline).map_err(retry)?;
+    let att = attach::attach(&mut conn, &ask, deadline).map_err(|e| {
+        if attach::is_final(&e) {
+            Failed::Fatal(Lost::Refused(e.to_string()))
+        } else {
+            retry(e)
+        }
+    })?;
     if att.grant() != plan.grant {
         return Err(Failed::Retry(format!(
             "the engine changed the grant: {:?}",

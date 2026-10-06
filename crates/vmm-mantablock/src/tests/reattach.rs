@@ -124,8 +124,37 @@ impl Lab {
 
     /// As [`Lab::accept`], with an engine for each queue.
     fn accept_all(&self, g: Geometry, ok: AttachOk) -> (Attach, Vec<Engine>) {
+        let mut s = self.next_attempt();
+        let (engines, fds) = Engine::all(g, ok.generation);
+        let ask = handshake(&mut s, ok, &fds);
+        thread::spawn(move || answer_pings(s));
+        (ask, engines)
+    }
+
+    /// Takes the next reattach and answers its Attach with Error `code`.
+    fn refuse(&self, code: u16) -> Attach {
+        let mut s = self.next_attempt();
+        let mut buf = Vec::new();
+        assert!(matches!(recv(&mut s, &mut buf), Message::Hello { .. }));
+        let ack = Message::HelloAck {
+            version: PROTOCOL_VERSION,
+            features: 0,
+        };
+        s.write_all(&ack.encode(1)).unwrap();
+        let Message::Attach(ask) = recv(&mut s, &mut buf) else {
+            panic!("no Attach");
+        };
+        let no = Message::Error {
+            code,
+            text: "no".into(),
+        };
+        s.write_all(&no.encode(2)).unwrap();
+        ask
+    }
+
+    fn next_attempt(&self) -> UnixStream {
         let until = Instant::now() + Duration::from_secs(5);
-        let mut s = loop {
+        let s = loop {
             match self.listener.accept() {
                 Ok((s, _)) => break s,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -137,10 +166,7 @@ impl Lab {
         };
         s.set_nonblocking(false).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let (engines, fds) = Engine::all(g, ok.generation);
-        let ask = handshake(&mut s, ok, &fds);
-        thread::spawn(move || answer_pings(s));
-        (ask, engines)
+        s
     }
 }
 
@@ -403,6 +429,44 @@ fn a_hostile_engine_on_reattach_is_refused() {
     for mut bad in refused {
         assert!(bad.take(8).is_empty());
     }
+}
+
+/// The engine's Error codes for a final and a passing refusal.
+const GENERATION: u16 = 4;
+const BUSY: u16 = 5;
+
+#[test]
+fn a_generation_refusal_fails_held_io_at_once() {
+    let mut lab = lab(|_| {});
+    lab.ring
+        .submit(job(1, 0, BlockOp::Write { fua: false }, 9, pattern(1, 9)));
+    lab.eng.take_n(1);
+    let t = Instant::now();
+    lab.lose();
+    assert_eq!(lab.refuse(GENERATION).generation, GEN);
+    assert_eq!(lab.calls.wait_for(1), vec![(1, BlockStatus::Internal)]);
+    // Well inside the 5 s bound, with no attempt after the refusal.
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert!(lab.ring.is_lost() && !lab.ring.is_held());
+    thread::sleep(Duration::from_millis(100));
+    assert!(lab.listener.accept().is_err(), "tried again");
+    lab.ring.submit(job(2, 1, BlockOp::Read, 0, pattern(1, 0)));
+    assert_eq!(lab.calls.wait_for(2)[1], (2, BlockStatus::Internal));
+}
+
+#[test]
+fn other_refusals_are_retried_until_the_engine_takes_it() {
+    let mut lab = lab(|_| {});
+    lab.ring
+        .submit(job(1, 0, BlockOp::Write { fua: false }, 9, pattern(1, 9)));
+    lab.eng.take_n(1);
+    lab.lose();
+    lab.refuse(BUSY);
+    assert!(lab.ring.is_held());
+    let (_, mut eng) = lab.accept(geometry(), grant(geometry(), GEN));
+    eng.serve_all(1);
+    assert_eq!(lab.calls.wait_for(1), vec![(1, BlockStatus::Success)]);
+    assert_eq!(&eng.disk[9 * PAGE..10 * PAGE], &pattern(1, 9)[..]);
 }
 
 #[test]

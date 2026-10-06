@@ -35,13 +35,19 @@ pub(crate) enum Lost {
     Stalled,
     /// The ring itself failed: a poisoned lock or no thread.
     Internal(String),
+    /// The engine let go of the generation and never takes it again.
+    Refused(String),
 }
 
 impl Lost {
     /// True when a reattach cannot help: the generation has no sequence
-    /// left, or the ring's own state is not to be trusted.
+    /// left or was refused for good, or the ring's own state is not to be
+    /// trusted.
     pub(crate) fn fatal(&self) -> bool {
-        matches!(self, Self::Exhausted(_) | Self::Internal(_))
+        matches!(
+            self,
+            Self::Exhausted(_) | Self::Internal(_) | Self::Refused(_)
+        )
     }
 }
 
