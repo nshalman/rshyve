@@ -51,6 +51,21 @@ pub enum BlockOp {
         fua: bool,
     },
     Flush,
+    /// Dataset Management with deallocate: the ranges may be freed, and
+    /// read as zeros after.
+    Deallocate,
+    /// The blocks read as zeros after; `deallocate` lets the store free
+    /// them.
+    WriteZeroes {
+        deallocate: bool,
+    },
+}
+
+impl BlockOp {
+    /// True for an op that zeroes ranges and moves no data.
+    pub fn is_zeroing(self) -> bool {
+        matches!(self, Self::Deallocate | Self::WriteZeroes { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +111,8 @@ pub struct BlockRequest {
     pub(super) blocks: u32,
     pub(super) byte_offset: u64,
     pub(super) data: GuestData,
+    /// For a zeroing op: the byte ranges, as offset and length.
+    pub(super) zero: Vec<(u64, u64)>,
 }
 
 impl BlockRequest {
@@ -124,6 +141,12 @@ impl BlockRequest {
 
     pub fn data(&self) -> &GuestData {
         &self.data
+    }
+
+    /// The byte ranges a zeroing op names, each inside the namespace and
+    /// not empty; none for any other op.
+    pub fn zero_ranges(&self) -> &[(u64, u64)] {
+        &self.zero
     }
 }
 

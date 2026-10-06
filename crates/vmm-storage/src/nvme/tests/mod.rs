@@ -38,6 +38,7 @@ mod lifecycle;
 mod migrate;
 mod msi;
 mod namespace;
+mod zeroing;
 
 /// Guest RAM the harness maps: enough for queues and a 2 MiB transfer.
 const GUEST_RAM: usize = 8 << 20;
@@ -386,6 +387,12 @@ impl Manual {
                 req.data().copy_from_guest(&mut disk[start..end])
             }
             BlockOp::Flush => Ok(()),
+            BlockOp::Deallocate | BlockOp::WriteZeroes { .. } => {
+                for &(off, len) in req.zero_ranges() {
+                    disk[off as usize..(off + len) as usize].fill(0);
+                }
+                Ok(())
+            }
         };
         match moved {
             Ok(()) => BlockStatus::Success,

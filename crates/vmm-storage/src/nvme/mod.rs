@@ -48,6 +48,7 @@ use vmm_devices::pci::msix::{HdlMsiSink, MsiSink, MsixTable};
 use vmm_devices::pci::BarN;
 use vmm_devices::{DeviceMigrateState, FlushError, FlushIntent, Lifecycle};
 
+pub use bits::NsHints;
 pub use config::{LbaSize, MsiPolicy, NvmeConfig};
 
 use backend::{AsyncBackend, BackendFactory};
@@ -349,11 +350,18 @@ fn initial_state(
         // One controller per instance, and CNTLID 0 is reserved.
         u16::from(instance_id) + 1,
         config.volatile_write_cache,
+        if config.deallocate {
+            ONCS_DSM | ONCS_WRITE_ZEROES
+        } else {
+            0
+        },
     );
     let ns_ident = build_identify_namespace(
         geometry.total_blocks,
         geometry.block_size,
         read_only,
+        config.hints,
+        config.deallocate,
     );
 
     // CQR: contiguous queues only. TO: 500 ms. DSTRD, MPSMIN and MPSMAX

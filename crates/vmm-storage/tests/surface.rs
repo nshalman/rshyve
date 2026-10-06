@@ -80,6 +80,8 @@ fn a_backend_from_outside_the_crate_fits_the_interface() {
         lba_size: LbaSize::B4096,
         volatile_write_cache: false,
         msi_policy: MsiPolicy::PerBatch,
+        deallocate: false,
+        hints: None,
     };
 
     assert_eq!(backend.max_queues(), 15);

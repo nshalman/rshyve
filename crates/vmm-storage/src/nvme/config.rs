@@ -45,6 +45,15 @@ pub struct NvmeConfig {
     /// not say its writes are.
     pub volatile_write_cache: bool,
     pub msi_policy: MsiPolicy,
+    /// Offer Dataset Management (deallocate) and Write Zeroes. Only a
+    /// backend that takes [`BlockOp::Deallocate`] and
+    /// [`BlockOp::WriteZeroes`] sets it.
+    ///
+    /// [`BlockOp::Deallocate`]: super::backend::BlockOp::Deallocate
+    /// [`BlockOp::WriteZeroes`]: super::backend::BlockOp::WriteZeroes
+    pub deallocate: bool,
+    /// The physical block and optimal write size to report.
+    pub hints: Option<super::bits::NsHints>,
 }
 
 impl Default for NvmeConfig {
@@ -53,6 +62,8 @@ impl Default for NvmeConfig {
             lba_size: LbaSize::B512,
             volatile_write_cache: true,
             msi_policy: MsiPolicy::PerBatch,
+            deallocate: false,
+            hints: None,
         }
     }
 }
