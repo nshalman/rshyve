@@ -223,7 +223,7 @@ impl vmm_devices::Lifecycle for Disk {
     }
 }
 
-const RING: &str = "nvme on MantaBlock volume 6f1c2a8e-0000-4000-8000-000000000001 has no migration handover yet";
+const RING: &str = "live migration of a MantaBlock disk is not supported yet (volume 6f1c2a8e-0000-4000-8000-000000000001)";
 
 fn disk_at(
     registry: &vmm_machine::DeviceRegistry,
@@ -255,7 +255,13 @@ fn identities(
 fn assert_names_the_ring_disk(reason: Option<String>, slot: &str) {
     let reason = reason.expect("a ring disk must block migration");
     assert!(reason.contains(&format!("nvme@{slot}")), "{reason}");
-    assert!(reason.contains("MantaBlock volume 6f1c2a8e"), "{reason}");
+    assert!(
+        reason.contains(
+            "live migration of a MantaBlock disk is not supported yet"
+        ),
+        "{reason}"
+    );
+    assert!(reason.contains("6f1c2a8e"), "{reason}");
 }
 
 #[test]

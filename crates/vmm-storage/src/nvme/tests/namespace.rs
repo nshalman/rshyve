@@ -264,7 +264,7 @@ fn a_restore_onto_another_store_is_refused() {
     assert!(
         error
             .to_string()
-            .contains("MantaBlock volume 6f1c2a8e-0000-4000-8000-00000000000a"),
+            .contains("volume 6f1c2a8e-0000-4000-8000-00000000000a"),
         "{error}"
     );
 
@@ -291,16 +291,17 @@ fn a_store_that_cannot_migrate_refuses_export_and_restore() {
     let store = Manual::on_store(volume(0xa), false);
     let h = Harness::manual(&store);
     let why = h.ctrl.migration_blocker().expect("a blocker");
-    assert!(
-        why.contains("MantaBlock volume 6f1c2a8e-0000-4000-8000-00000000000a"),
-        "{why}"
+    assert_eq!(
+        why,
+        "live migration of a MantaBlock disk is not supported yet \
+         (volume 6f1c2a8e-0000-4000-8000-00000000000a)"
     );
     // Disabled: the export would otherwise be an empty `None`.
     let error = h.ctrl.export_migrate_state().expect_err("export");
     assert!(
         error
             .to_string()
-            .contains("MantaBlock volume 6f1c2a8e-0000-4000-8000-00000000000a"),
+            .contains("volume 6f1c2a8e-0000-4000-8000-00000000000a"),
         "{error}"
     );
 

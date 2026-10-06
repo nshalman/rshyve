@@ -133,8 +133,8 @@ fn reject_unmigratable_destination(
         // has no handover yet.
         if specs.iter().any(|spec| is_mantablock_nvme(spec)) {
             anyhow::bail!(
-                "nvme on a MantaBlock volume is not supported on a \
-                 migration destination"
+                "live migration of a MantaBlock disk is not supported yet; \
+                 this VM cannot start as a migration destination"
             );
         }
     }
@@ -153,8 +153,8 @@ fn refuse_mantablock_destination(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         !is_migrate_dest,
-        "nvme on MantaBlock volume {} is not supported on a migration \
-         destination",
+        "live migration of a MantaBlock disk is not supported yet \
+         (volume {}); this VM cannot start as a migration destination",
         opts.volume
     );
     Ok(())
@@ -666,7 +666,9 @@ mod tests {
             let raw = vec!["4,nvme,/disk".to_string(), ring.to_string()];
             let error = driver_specs(true, &raw).unwrap_err();
             assert!(
-                error.to_string().contains("MantaBlock"),
+                error.to_string().contains(
+                    "live migration of a MantaBlock disk is not supported yet"
+                ),
                 "{ring}: {error}"
             );
             assert!(driver_specs(false, &raw).is_ok());
