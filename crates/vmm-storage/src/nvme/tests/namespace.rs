@@ -264,7 +264,7 @@ fn a_restore_onto_another_store_is_refused() {
     assert!(
         error
             .to_string()
-            .contains("volume 6f1c2a8e-0000-4000-8000-00000000000a"),
+            .contains("MantaBlock volume 6f1c2a8e-0000-4000-8000-00000000000a"),
         "{error}"
     );
 
@@ -301,7 +301,7 @@ fn a_store_that_cannot_migrate_refuses_export_and_restore() {
     assert!(
         error
             .to_string()
-            .contains("volume 6f1c2a8e-0000-4000-8000-00000000000a"),
+            .contains("MantaBlock disk is not supported yet"),
         "{error}"
     );
 
