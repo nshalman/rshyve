@@ -7,7 +7,8 @@
 
 use super::*;
 use vmm_devices::lifecycle::{
-    NvmeMigrateCq, NvmeMigrateCqe, NvmeMigrateSq, NvmeMigrateState,
+    NvmeMigrateCq, NvmeMigrateCqe, NvmeMigrateQueueCounts, NvmeMigrateSq,
+    NvmeMigrateState,
 };
 
 use crate::nvme::migrate::check_nvme_state;
@@ -70,6 +71,7 @@ fn good_payload() -> NvmeMigrateState {
             held: Vec::new(),
         })],
         num_io_queues: 1,
+        io_queue_counts: None,
         pci: Default::default(),
         msix: Default::default(),
         namespace: None,
@@ -207,6 +209,39 @@ fn an_out_of_range_io_queue_count_is_refused() {
     check_nvme_state(&payload).expect_err("past the maximum");
 }
 
+fn second_cq(payload: &NvmeMigrateState) -> Option<NvmeMigrateCq> {
+    let mut cq = payload.io_cqs[0].clone().expect("CQ 1");
+    cq.base += 0x1000;
+    Some(cq)
+}
+
+#[test]
+fn separate_queue_counts_bound_each_kind() {
+    let mut payload = good_payload();
+    payload.num_io_queues = 2;
+    payload.io_queue_counts = Some(NvmeMigrateQueueCounts { sqs: 2, cqs: 1 });
+    check_nvme_state(&payload).expect("SQ 1 on CQ 1 fits");
+
+    payload.io_queue_counts = Some(NvmeMigrateQueueCounts { sqs: 2, cqs: 0 });
+    check_nvme_state(&payload).expect_err("zero CQs");
+
+    let mut past = good_payload();
+    past.io_cqs.push(second_cq(&past));
+    past.num_io_queues = 2;
+    past.io_queue_counts = Some(NvmeMigrateQueueCounts { sqs: 2, cqs: 1 });
+    check_nvme_state(&past).expect_err("CQ 2 is past one granted CQ");
+}
+
+#[test]
+fn a_source_with_one_count_bounds_both_kinds_with_it() {
+    let mut payload = good_payload();
+    payload.io_cqs.push(second_cq(&payload));
+    payload.num_io_queues = 1;
+    check_nvme_state(&payload).expect_err("CQ 2 is past the one count");
+    payload.num_io_queues = 2;
+    check_nvme_state(&payload).expect("both fit two");
+}
+
 #[test]
 fn quiesce_query_is_non_blocking_with_active_worker() {
     let device: Arc<dyn Lifecycle> = Arc::new(NvmeQuiesceTestDevice {
@@ -324,8 +359,8 @@ fn num_queues_max_request_stays_nonzero() {
 
     let allocated = (MAX_IO_QUEUES as u32) - 1;
     assert_eq!(set_result, (SC_SUCCESS, allocated | (allocated << 16)));
-    assert_eq!(state.num_io_queues, MAX_IO_QUEUES as u16);
-    assert_ne!(state.num_io_queues, 0);
+    assert_eq!(state.num_io_sqs, MAX_IO_QUEUES as u16);
+    assert_eq!(state.num_io_cqs, MAX_IO_QUEUES as u16);
     assert_eq!(
         NvmeController::admin_get_features(&state, u32::from(FEAT_NUM_QUEUES),),
         set_result

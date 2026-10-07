@@ -99,6 +99,11 @@ pub const ADMIN_OPC_IDENTIFY: u8 = 0x06;
 pub const ADMIN_OPC_ABORT: u8 = 0x08;
 pub const ADMIN_OPC_SET_FEATURES: u8 = 0x09;
 pub const ADMIN_OPC_GET_FEATURES: u8 = 0x0A;
+pub const ADMIN_OPC_ASYNC_EVENT_REQUEST: u8 = 0x0C;
+
+/// AERL in Identify Controller: the Asynchronous Event Requests the
+/// controller holds at once, 0-based.
+pub const AER_LIMIT: u8 = 0;
 
 // ── NVM I/O command opcodes ────────────────────────────────────
 
@@ -204,6 +209,7 @@ pub const SC_CQ_INVALID: u16 = 0x0100;
 pub const SC_INVALID_QUEUE_ID: u16 = 0x0101;
 pub const SC_INVALID_QUEUE_SIZE: u16 = 0x0102;
 pub const SC_INVALID_INTR_VECTOR: u16 = 0x0108;
+pub const SC_AER_LIMIT_EXCEEDED: u16 = 0x0105;
 pub const SC_INVALID_LOG_PAGE: u16 = 0x0109;
 
 /// Do Not Retry flag in status
@@ -325,6 +331,9 @@ pub fn build_identify_controller(
     // OACS - Optional Admin Command Support (bytes 256-257)
     // 0 = no optional admin commands
     data[256..258].copy_from_slice(&0u16.to_le_bytes());
+
+    // AERL - Asynchronous Event Request Limit (byte 259)
+    data[259] = AER_LIMIT;
 
     // SQES - Submission Queue Entry Size (byte 512)
     // Required = 6 (64 bytes), Maximum = 6

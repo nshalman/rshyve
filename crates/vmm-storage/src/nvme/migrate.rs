@@ -9,7 +9,8 @@ use std::sync::atomic::Ordering;
 
 use vmm_devices::lifecycle::{
     DeviceMigrateState, DeviceStateError, NvmeMigrateBackend, NvmeMigrateCq,
-    NvmeMigrateCqe, NvmeMigrateNamespace, NvmeMigrateSq, NvmeMigrateState,
+    NvmeMigrateCqe, NvmeMigrateNamespace, NvmeMigrateQueueCounts,
+    NvmeMigrateSq, NvmeMigrateState,
 };
 use vmm_devices::pci::device::replay_migrate_pci_state;
 use vmm_devices::pci::msix::MsixImportError;
@@ -83,7 +84,8 @@ impl NvmeController {
             "cc" => format!("{:#x}", st.cc),
             "csts" => format!("{:#x}", st.csts),
             "aqa" => format!("{:#x}", st.aqa),
-            "io_queues" => st.num_io_queues,
+            "io_sqs" => st.num_io_sqs,
+            "io_cqs" => st.num_io_cqs,
             "msix_enabled" => self.msix.is_enabled());
 
         Some(DeviceMigrateState::Nvme(NvmeMigrateState {
@@ -104,7 +106,11 @@ impl NvmeController {
                 .iter()
                 .map(|cq| cq.as_ref().map(wire_cq))
                 .collect(),
-            num_io_queues: st.num_io_queues,
+            num_io_queues: st.num_io_sqs.max(st.num_io_cqs),
+            io_queue_counts: Some(NvmeMigrateQueueCounts {
+                sqs: st.num_io_sqs,
+                cqs: st.num_io_cqs,
+            }),
             pci: self.pci_state.lock().expect("pci lock").migrate_state(),
             msix: self.msix.export_state(),
             namespace: Some(self.namespace()),
@@ -171,10 +177,11 @@ impl NvmeController {
         // Checked and applied under one hold, so no command is admitted
         // between the two.
         let mut st = self.lock();
-        if mig.num_io_queues > st.max_io_queues {
+        let (sqs, cqs) = granted_counts(mig);
+        if sqs.max(cqs) > st.max_io_queues {
             return Err(DeviceStateError::invalid(format!(
-                "num_io_queues {} is past the {} this backend serves",
-                mig.num_io_queues, st.max_io_queues,
+                "{sqs} SQs and {cqs} CQs are past the {} this backend serves",
+                st.max_io_queues,
             )));
         }
         // Their completions would be matched against queues the import
@@ -189,14 +196,16 @@ impl NvmeController {
             "cc" => format!("{:#x}", mig.cc),
             "csts" => format!("{:#x}", mig.csts),
             "aqa" => format!("{:#x}", mig.aqa),
-            "io_queues" => mig.num_io_queues);
+            "io_sqs" => sqs,
+            "io_cqs" => cqs);
 
         st.cc = mig.cc;
         st.csts = mig.csts;
         st.aqa = mig.aqa;
         st.asq_base = mig.asq_base;
         st.acq_base = mig.acq_base;
-        st.num_io_queues = mig.num_io_queues;
+        st.num_io_sqs = sqs;
+        st.num_io_cqs = cqs;
 
         // One fresh instance for every imported queue: nothing from
         // before the import may complete into one.
@@ -442,11 +451,19 @@ pub(super) fn check_nvme_state(
     fn used<T>(slots: &[Option<T>]) -> usize {
         slots.iter().rposition(Option::is_some).map_or(0, |i| i + 1)
     }
-    let count = usize::from(mig.num_io_queues);
-    if used(&mig.io_sqs) > count || used(&mig.io_cqs) > count {
+    let (sqs, cqs) = granted_counts(mig);
+    for (what, count) in [("SQ", sqs), ("CQ", cqs)] {
+        if !(1..=MAX_IO_QUEUES as u16).contains(&count) {
+            return Err(DeviceStateError::invalid(format!(
+                "the {what} count {count} is outside 1..={MAX_IO_QUEUES}",
+            )));
+        }
+    }
+    if used(&mig.io_sqs) > usize::from(sqs)
+        || used(&mig.io_cqs) > usize::from(cqs)
+    {
         return Err(DeviceStateError::invalid(format!(
-            "a queue id is past num_io_queues {}",
-            mig.num_io_queues,
+            "a queue id is past the {sqs} SQs and {cqs} CQs granted",
         )));
     }
 
@@ -504,4 +521,11 @@ pub(super) fn check_nvme_state(
         }
     }
     check_held(mig)
+}
+
+/// The granted (SQ, CQ) counts. A source without separate counts kept
+/// one for both.
+fn granted_counts(mig: &NvmeMigrateState) -> (u16, u16) {
+    mig.io_queue_counts
+        .map_or((mig.num_io_queues, mig.num_io_queues), |c| (c.sqs, c.cqs))
 }
