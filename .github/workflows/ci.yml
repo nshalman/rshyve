@@ -67,7 +67,9 @@ env:
 jobs:
   lock:
     name: lockfile is current
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: cargo metadata --locked --format-version 1 > /dev/null
@@ -76,7 +78,9 @@ jobs:
 
   fmt:
     name: rustfmt
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup component add rustfmt
@@ -84,7 +88,9 @@ jobs:
 
   clippy:
     name: clippy (portable crates)
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup component add clippy
@@ -98,7 +104,9 @@ jobs:
 
   clippy-illumos:
     name: clippy against the illumos target
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-illumos
@@ -123,7 +131,9 @@ jobs:
 
   cross-check:
     name: illumos bindings type-check
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-illumos
@@ -157,7 +167,9 @@ jobs:
 
   test:
     name: portable tests
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Codecs, bounds checks, device register models, and the migration
@@ -192,7 +204,9 @@ jobs:
 
   guest-init:
     name: guest init (musl)
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-linux-musl
@@ -210,7 +224,9 @@ jobs:
 
   guest-vsock-test:
     name: guest test harness (musl)
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-linux-musl
@@ -228,7 +244,9 @@ jobs:
 
   msrv:
     name: builds on the declared MSRV
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Cargo.toml is attacker-controlled on a fork pull request, so the
@@ -258,7 +276,9 @@ jobs:
 
   binaries:
     name: both binaries type-check
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       # The only job that builds rshyve, so the only one that needs the
       # libtpms submodule. Everything else names portable packages.
@@ -328,7 +348,9 @@ jobs:
 
   build-stamp:
     name: a release binary names a commit
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The firehyve in the platform image reported a commit that
@@ -414,7 +436,9 @@ jobs:
 
   supply-chain:
     name: advisories, licenses, sources
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
@@ -423,7 +447,9 @@ jobs:
 
   secrets:
     name: secret scan
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     env:
       # Pinned by version and digest. The gitleaks binary is MIT; the
       # gitleaks-action wrapper is deliberately not used because it
@@ -448,7 +474,9 @@ jobs:
 
   boundary:
     name: firehyve dependency boundary
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Scoping the crate graph to one workspace member is what makes
@@ -470,7 +498,9 @@ jobs:
 
   platform-deps:
     name: stock-PI dependency gate self-test
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The gate itself runs on the illumos build host, where rshyve is
@@ -493,7 +523,9 @@ jobs:
 
   public-surface:
     name: public surface guard
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -589,7 +621,9 @@ jobs:
 
   unsafe-safety:
     name: every unsafe block is justified
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # 280 unsafe blocks and 5 `// SAFETY:` comments is the first thing
@@ -626,7 +660,9 @@ jobs:
 
   ci-coverage:
     name: every portable crate is named by a job
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # A crate that no `-p` list names is unlinted and untested code
@@ -669,7 +705,9 @@ jobs:
 
   test-parity:
     name: illumos and CI compile the same tests
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-illumos
