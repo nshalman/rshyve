@@ -191,7 +191,12 @@ pub struct NvmeMigrateState {
     pub admin_cq: Option<NvmeMigrateCq>,
     pub io_sqs: Vec<Option<NvmeMigrateSq>>,
     pub io_cqs: Vec<Option<NvmeMigrateCq>>,
+    /// The larger of the two granted counts. A peer that keeps one
+    /// count for both reads only this, and accepts every live queue.
     pub num_io_queues: u16,
+    /// `None` from a source that kept one count for SQs and CQs.
+    #[serde(default)]
+    pub io_queue_counts: Option<NvmeMigrateQueueCounts>,
     pub pci: MigratePciState,
     pub msix: MsixMigrateState,
     /// `None` from a v2 source, whose only shape was 512-byte blocks and
@@ -201,6 +206,13 @@ pub struct NvmeMigrateState {
     /// `None` from a v3 or older source, which had only host files.
     #[serde(default)]
     pub backend: Option<NvmeMigrateBackend>,
+}
+
+/// The I/O SQs and CQs Set Features granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NvmeMigrateQueueCounts {
+    pub sqs: u16,
+    pub cqs: u16,
 }
 
 /// What holds a namespace's blocks. Two volumes of one shape pass every

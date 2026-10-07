@@ -309,7 +309,7 @@ impl NvmeController {
         let Some(idx) = io_queue_index(qid) else {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         };
-        if qid > st.num_io_queues {
+        if qid > st.num_io_cqs {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
         if qsize < 2 || qsize > u32::from(MAX_QUEUE_SIZE) {
@@ -363,7 +363,7 @@ impl NvmeController {
         let Some(idx) = io_queue_index(qid) else {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         };
-        if qid > st.num_io_queues {
+        if qid > st.num_io_sqs {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
         if qsize < 2 || qsize > u32::from(MAX_QUEUE_SIZE) {
@@ -442,8 +442,9 @@ impl NvmeController {
             FEAT_NUM_QUEUES => {
                 // CDW0 bits 31:16 = num CQs allocated (0-based)
                 // CDW0 bits 15:0  = num SQs allocated (0-based)
-                let nq = u32::from(st.num_io_queues.saturating_sub(1));
-                (SC_SUCCESS, nq | (nq << 16))
+                let sqs = u32::from(st.num_io_sqs.saturating_sub(1));
+                let cqs = u32::from(st.num_io_cqs.saturating_sub(1));
+                (SC_SUCCESS, sqs | (cqs << 16))
             }
             // With no cache to report, the feature is not there to get.
             FEAT_VOLATILE_WC if !st.volatile_write_cache => {
@@ -467,13 +468,14 @@ impl NvmeController {
         let fid = (cdw10 & 0xFF) as u8;
         match fid {
             FEAT_NUM_QUEUES => {
-                // Guest requests N SQs and N CQs (0-based in CDW11)
+                // SQ and CQ counts, each 0-based, in CDW11
                 let requested_sq = (cdw11 & 0xFFFF) + 1;
                 let requested_cq = ((cdw11 >> 16) & 0xFFFF) + 1;
                 let max = u32::from(st.max_io_queues);
                 let alloc_sq = requested_sq.min(max);
                 let alloc_cq = requested_cq.min(max);
-                st.num_io_queues = alloc_sq.min(alloc_cq) as u16;
+                st.num_io_sqs = alloc_sq as u16;
+                st.num_io_cqs = alloc_cq as u16;
                 let result_sq = alloc_sq.saturating_sub(1);
                 let result_cq = alloc_cq.saturating_sub(1);
                 (SC_SUCCESS, result_sq | (result_cq << 16))

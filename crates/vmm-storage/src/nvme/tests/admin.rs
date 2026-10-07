@@ -249,6 +249,67 @@ fn create_io_queue_past_the_allocation_is_rejected() {
 }
 
 #[test]
+fn more_sqs_than_cqs_can_all_be_created() {
+    // Windows' stornvme asks for 8 SQs on 4 CQs. Holding both counts
+    // to the smaller one refused SQ 5 to 8, and the driver failed to
+    // start: INACCESSIBLE_BOOT_DEVICE on an NVMe boot disk.
+    let mut h = Harness::new();
+    h.enable();
+    let granted = 7 | (3 << 16);
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_SET_FEATURES,
+        cdw10: u32::from(FEAT_NUM_QUEUES),
+        cdw11: granted,
+        ..Sqe::default()
+    });
+    assert_eq!((cqe.status(), cqe.dw0), (Status::SUCCESS, granted));
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_GET_FEATURES,
+        cdw10: u32::from(FEAT_NUM_QUEUES),
+        ..Sqe::default()
+    });
+    assert_eq!((cqe.status(), cqe.dw0), (Status::SUCCESS, granted));
+
+    let size = u32::from(IO_QDEPTH - 1) << 16;
+    let create_cq = |h: &mut Harness, qid: u32| {
+        h.admin(Sqe {
+            opcode: ADMIN_OPC_CREATE_IO_CQ,
+            prp1: CQ1 + u64::from(qid) * 0x1000,
+            cdw10: qid | size,
+            cdw11: (1 << 16) | CQ_IEN | CQ_PC,
+            ..Sqe::default()
+        })
+        .status()
+    };
+    let create_sq = |h: &mut Harness, qid: u32| {
+        h.admin(Sqe {
+            opcode: ADMIN_OPC_CREATE_IO_SQ,
+            prp1: SQ1 + u64::from(qid) * 0x1000,
+            cdw10: qid | size,
+            cdw11: ((((qid - 1) % 4) + 1) << 16) | CQ_PC,
+            ..Sqe::default()
+        })
+        .status()
+    };
+    for qid in 1..=4 {
+        assert_eq!(create_cq(&mut h, qid), Status::SUCCESS, "CQ {qid}");
+    }
+    assert_eq!(
+        create_cq(&mut h, 5),
+        Status::of(SC_INVALID_QUEUE_ID | SC_DNR),
+        "only four CQs were granted"
+    );
+    for qid in 1..=8 {
+        assert_eq!(create_sq(&mut h, qid), Status::SUCCESS, "SQ {qid}");
+    }
+    assert_eq!(
+        create_sq(&mut h, 9),
+        Status::of(SC_INVALID_QUEUE_ID | SC_DNR),
+        "only eight SQs were granted"
+    );
+}
+
+#[test]
 fn create_io_sq_naming_the_admin_cq_is_rejected() {
     let mut h = Harness::new();
     h.enable();
@@ -298,8 +359,8 @@ fn num_queues_max_request_stays_nonzero() {
 
     let allocated = (MAX_IO_QUEUES as u32) - 1;
     assert_eq!(set_result, (SC_SUCCESS, allocated | (allocated << 16)));
-    assert_eq!(state.num_io_queues, MAX_IO_QUEUES as u16);
-    assert_ne!(state.num_io_queues, 0);
+    assert_eq!(state.num_io_sqs, MAX_IO_QUEUES as u16);
+    assert_eq!(state.num_io_cqs, MAX_IO_QUEUES as u16);
     assert_eq!(
         NvmeController::admin_get_features(&state, u32::from(FEAT_NUM_QUEUES),),
         set_result

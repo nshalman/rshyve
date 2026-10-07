@@ -376,7 +376,8 @@ fn initial_state(
         cap,
         ctrl_ident,
         ns_ident,
-        num_io_queues: max_queues,
+        num_io_sqs: max_queues,
+        num_io_cqs: max_queues,
         max_io_queues: max_queues,
         volatile_write_cache: config.volatile_write_cache,
         ..NvmeState::default()

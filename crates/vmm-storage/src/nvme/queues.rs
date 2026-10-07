@@ -125,7 +125,10 @@ pub(super) struct NvmeState {
     pub(super) ns_ident: [u8; IDENT_NS_SIZE],
 
     // Configuration
-    pub(super) num_io_queues: u16,
+    /// The I/O SQs and CQs Set Features granted. A driver may ask for
+    /// more SQs than CQs, so the two counts are kept apart.
+    pub(super) num_io_sqs: u16,
+    pub(super) num_io_cqs: u16,
     /// The I/O queues the backend serves, the most Set Features grants.
     pub(super) max_io_queues: u16,
     /// Whether Identify reports a volatile write cache.
@@ -283,7 +286,8 @@ impl Default for NvmeState {
             io_cqs: Default::default(),
             ctrl_ident: [0u8; IDENT_CTRL_SIZE],
             ns_ident: [0u8; IDENT_NS_SIZE],
-            num_io_queues: MAX_IO_QUEUES as u16,
+            num_io_sqs: MAX_IO_QUEUES as u16,
+            num_io_cqs: MAX_IO_QUEUES as u16,
             max_io_queues: MAX_IO_QUEUES as u16,
             volatile_write_cache: true,
             instances: 0,
