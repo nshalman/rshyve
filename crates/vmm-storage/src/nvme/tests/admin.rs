@@ -309,6 +309,75 @@ fn more_sqs_than_cqs_can_all_be_created() {
     );
 }
 
+fn aer() -> Sqe {
+    Sqe {
+        opcode: ADMIN_OPC_ASYNC_EVENT_REQUEST,
+        ..Sqe::default()
+    }
+}
+
+#[test]
+fn an_async_event_request_is_held_without_a_completion() {
+    // Windows resubmits an AER the moment it completes. Failing it with
+    // Invalid Opcode pinned a vCPU on the admin queue.
+    let mut h = Harness::new();
+    h.enable();
+    h.submit_admin(aer());
+    assert_ne!(h.next_admin_cqe().phase, h.admin_phase, "no completion");
+
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_GET_FEATURES,
+        cdw10: u32::from(FEAT_NUM_QUEUES),
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::SUCCESS, "the queue moves on");
+}
+
+#[test]
+fn an_async_event_request_past_the_limit_is_refused() {
+    let mut h = Harness::new();
+    h.enable();
+    for _ in 0..=AER_LIMIT {
+        h.submit_admin(aer());
+    }
+    let cqe = h.admin(aer());
+    assert_eq!(cqe.status(), Status::of(SC_AER_LIMIT_EXCEEDED));
+}
+
+#[test]
+fn a_controller_reset_drops_the_held_requests() {
+    let mut h = Harness::new();
+    h.enable();
+    for _ in 0..=AER_LIMIT {
+        h.submit_admin(aer());
+    }
+    h.reg_write32(REG_CC, 0);
+    h.enable();
+    for _ in 0..=AER_LIMIT {
+        h.submit_admin(aer());
+    }
+    let cqe = h.admin(aer());
+    assert_eq!(
+        cqe.status(),
+        Status::of(SC_AER_LIMIT_EXCEEDED),
+        "the new controller holds a full set, and no more"
+    );
+}
+
+#[test]
+fn identify_reports_the_aer_limit() {
+    let mut h = Harness::new();
+    h.enable();
+    let cqe = h.admin(Sqe {
+        opcode: ADMIN_OPC_IDENTIFY,
+        prp1: 0x20000,
+        cdw10: u32::from(IDENTIFY_CNS_CONTROLLER),
+        ..Sqe::default()
+    });
+    assert_eq!(cqe.status(), Status::SUCCESS);
+    assert_eq!(h.read_guest(0x20000 + 259, 1), [AER_LIMIT]);
+}
+
 #[test]
 fn create_io_sq_naming_the_admin_cq_is_rejected() {
     let mut h = Harness::new();

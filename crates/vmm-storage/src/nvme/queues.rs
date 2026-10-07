@@ -146,6 +146,8 @@ pub(super) struct NvmeState {
     pub(super) inflight: [SqSlots; MAX_IO_QUEUES],
     /// I/O SQs that stopped at their depth, one bit each.
     pub(super) throttled: u16,
+    /// Asynchronous Event Requests held without a completion.
+    pub(super) aers_held: u8,
     /// Source of [`super::backend::RequestId`] serials.
     pub(super) serial: u64,
     pub(super) epochs: Arc<QueueEpochs>,
@@ -169,6 +171,20 @@ impl NvmeState {
             self.set_cq(idx, None);
         }
         self.throttled = 0;
+        self.aers_held = 0;
+    }
+
+    /// Hold an Asynchronous Event Request, if the limit allows.
+    ///
+    /// An AER completes only when an event happens, and this controller
+    /// raises none. Completing it with an error instead makes Windows
+    /// send it again at once, and the vCPU spins on the admin queue.
+    pub(super) fn hold_aer(&mut self) -> bool {
+        if self.aers_held > AER_LIMIT {
+            return false;
+        }
+        self.aers_held += 1;
+        true
     }
 
     /// Put `sq` in I/O SQ slot `idx`. Every change goes through here so
@@ -295,6 +311,7 @@ impl Default for NvmeState {
             admission: Admission::default(),
             inflight: Default::default(),
             throttled: 0,
+            aers_held: 0,
             serial: 0,
             epochs: Arc::default(),
             drain_waiters: 0,

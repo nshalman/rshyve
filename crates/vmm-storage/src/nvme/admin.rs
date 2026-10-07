@@ -123,6 +123,9 @@ impl NvmeController {
             if let Some(sq) = &mut st.admin_sq {
                 sq.head = sq_head;
             }
+            if opcode == ADMIN_OPC_ASYNC_EVENT_REQUEST && st.hold_aer() {
+                continue;
+            }
 
             let (status, cdw0, fence) = self.process_admin_cmd(
                 &mut st, &mem, opcode, nsid, prp1, prp2, cdw10, cdw11,
@@ -230,6 +233,8 @@ impl NvmeController {
             ADMIN_OPC_GET_LOG_PAGE => {
                 Self::admin_get_log_page(mem, prp1, prp2, cdw10)
             }
+            // Only reached past the limit: run_admin holds the rest.
+            ADMIN_OPC_ASYNC_EVENT_REQUEST => (SC_AER_LIMIT_EXCEEDED, 0),
             _ => (SC_INVALID_OPCODE | (SC_DNR), 0),
         };
         (status, cdw0, deleted.filter(|_| status == SC_SUCCESS))

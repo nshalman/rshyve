@@ -643,17 +643,8 @@ impl Harness {
 
     /// Submit one admin command and return its completion.
     fn admin(&mut self, sqe: Sqe) -> Cqe {
-        let cid = self.next_cid;
-        self.next_cid += 1;
-        let entry = ASQ + u64::from(self.admin_tail) * SQE_SIZE as u64;
-        self.mem()
-            .write(entry, &sqe.encode(cid))
-            .expect("write SQE");
-        self.admin_tail = (self.admin_tail + 1) % ADMIN_QDEPTH;
-        self.sq_doorbell(ADMIN_QUEUE_ID, self.admin_tail);
-
-        let slot = ACQ + self.admin_cq_head as u64 * CQE_SIZE as u64;
-        let cqe = Cqe::decode(&self.read_guest(slot, CQE_SIZE));
+        let cid = self.submit_admin(sqe);
+        let cqe = self.next_admin_cqe();
         assert_eq!(cqe.phase, self.admin_phase, "admin CQE phase");
         assert_eq!(cqe.cid, cid, "admin CQE cid");
         self.admin_cq_head += 1;
@@ -663,6 +654,26 @@ impl Harness {
         }
         self.cq_doorbell(ADMIN_QUEUE_ID, self.admin_cq_head as u16);
         cqe
+    }
+
+    /// Submit one admin command without waiting for a completion, and
+    /// return its command id.
+    fn submit_admin(&mut self, sqe: Sqe) -> u16 {
+        let cid = self.next_cid;
+        self.next_cid += 1;
+        let entry = ASQ + u64::from(self.admin_tail) * SQE_SIZE as u64;
+        self.mem()
+            .write(entry, &sqe.encode(cid))
+            .expect("write SQE");
+        self.admin_tail = (self.admin_tail + 1) % ADMIN_QDEPTH;
+        self.sq_doorbell(ADMIN_QUEUE_ID, self.admin_tail);
+        cid
+    }
+
+    /// The admin CQ slot the next completion lands in.
+    fn next_admin_cqe(&self) -> Cqe {
+        let slot = ACQ + self.admin_cq_head as u64 * CQE_SIZE as u64;
+        Cqe::decode(&self.read_guest(slot, CQE_SIZE))
     }
 
     /// Create I/O queue pair `qid` of `depth` entries with the SQ at
