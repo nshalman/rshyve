@@ -32,6 +32,31 @@ pub struct FpuArea {
     pub components: Vec<FpuComponent>,
 }
 
+/// The kernel's entries, each component once.
+///
+/// illumos `hma_fpu_describe_xsave_state` builds each bit with an `int`
+/// shift, so positions 32 to 63 alias 0 to 31: every component comes
+/// back twice, the second time with the size and offset of a CPUID
+/// subleaf that does not exist. The first entry for a bit is the real
+/// one, since the kernel walks the positions upward.
+fn unique_components(entries: &[vm_fpu_desc_entry]) -> Vec<FpuComponent> {
+    let mut seen = 0u64;
+    entries
+        .iter()
+        .filter(|e| e.vfde_feature.count_ones() == 1)
+        .filter(|e| {
+            let first = seen & e.vfde_feature == 0;
+            seen |= e.vfde_feature;
+            first
+        })
+        .map(|e| FpuComponent {
+            feature: e.vfde_feature,
+            size: e.vfde_size,
+            offset: e.vfde_off,
+        })
+        .collect()
+}
+
 impl VmmHdl {
     /// The XSAVE area layout of this host, for every component the host
     /// enabled in its own XCR0.
@@ -63,14 +88,7 @@ impl VmmHdl {
             size: usize::try_from(desc.vfd_req_size).map_err(|_| {
                 Error::new(ErrorKind::InvalidData, "FPU area size")
             })?,
-            components: entries
-                .iter()
-                .map(|e| FpuComponent {
-                    feature: e.vfde_feature,
-                    size: e.vfde_size,
-                    offset: e.vfde_off,
-                })
-                .collect(),
+            components: unique_components(&entries),
         })
     }
 
@@ -104,5 +122,59 @@ impl VmmHdl {
         // Safety: the kernel reads at most `len` bytes from `buf`.
         unsafe { self.inner.ioctl(ioctls::VM_SET_FPU, &mut req) }?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(feature: u64, size: u32, off: u32) -> vm_fpu_desc_entry {
+        vm_fpu_desc_entry {
+            vfde_feature: feature,
+            vfde_size: size,
+            vfde_off: off,
+        }
+    }
+
+    #[test]
+    fn an_aliased_component_is_kept_once() {
+        // What the kernel reports on an AVX host: positions 32 to 34
+        // alias 0 to 2, and subleaf 34 of leaf 0xD reads as zero.
+        let kernel = [
+            entry(1, 512, 0),
+            entry(2, 512, 0),
+            entry(4, 256, 576),
+            entry(1, 512, 0),
+            entry(2, 512, 0),
+            entry(4, 0, 0),
+        ];
+        assert_eq!(
+            unique_components(&kernel),
+            [
+                FpuComponent {
+                    feature: 1,
+                    size: 512,
+                    offset: 0
+                },
+                FpuComponent {
+                    feature: 2,
+                    size: 512,
+                    offset: 0
+                },
+                FpuComponent {
+                    feature: 4,
+                    size: 256,
+                    offset: 576
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sign_extended_bit_is_dropped() {
+        // Position 31 of the same `int` shift sign-extends.
+        let kernel = [entry(1, 512, 0), entry(0xFFFF_FFFF_8000_0000, 0, 0)];
+        assert_eq!(unique_components(&kernel).len(), 1);
     }
 }
