@@ -8,6 +8,7 @@
 //! A Pong does not show that the engine makes progress, so a request
 //! older than the I/O limit also counts as a lost engine.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -156,7 +157,10 @@ fn detach<J: Job>(shared: &Shared<J>, conn: &mut Conn, t: Timers) {
     loop {
         match conn.recv(until) {
             Ok(Some(f)) => match f.msg {
-                Message::Detached => return,
+                Message::Detached => {
+                    shared.detached.store(true, Ordering::Release);
+                    return;
+                }
                 Message::Pong => {}
                 m => {
                     slog::warn!(shared.log, "mantablock: detach answered";

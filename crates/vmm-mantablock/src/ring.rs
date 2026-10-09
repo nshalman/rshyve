@@ -55,6 +55,8 @@ pub(crate) struct Shared<J: Job> {
     halted: AtomicBool,
     /// The completion threads return.
     stop: AtomicBool,
+    /// The engine answered Detached.
+    pub(crate) detached: AtomicBool,
     /// The completion threads of the current attachment.
     reapers: Mutex<Vec<JoinHandle<()>>>,
     spin: Duration,
@@ -294,6 +296,7 @@ impl<J: Job> Ring<J> {
             progress: AtomicBool::new(true),
             halted: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            detached: AtomicBool::new(false),
             reapers: Mutex::new(Vec::new()),
             spin: cfg.spin,
             log: cfg.log.clone(),
@@ -358,11 +361,21 @@ impl<J: Job> Ring<J> {
         }
     }
 
-    /// Always false. The source holds the volume's attachment and
-    /// nothing hands it over yet, so a destination that attached as well
-    /// would make two owners.
+    /// Always false: a ring alone cannot be handed over. A
+    /// [`crate::Handover`] detaches it after the commit and attaches a
+    /// new one on the destination.
     pub fn migratable(&self) -> bool {
         false
+    }
+
+    /// As [`Self::halt`], and says whether the engine confirmed the
+    /// Detach. Requests still held fail.
+    pub fn detach(&self) -> io::Result<()> {
+        self.halt();
+        if self.shared.detached.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Err(io::Error::other("the engine did not confirm the Detach"))
     }
 
     /// Requests one queue may have in flight: one per buffer slot.

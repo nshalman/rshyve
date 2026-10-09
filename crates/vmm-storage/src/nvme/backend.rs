@@ -13,7 +13,7 @@ use std::io;
 use std::sync::Arc;
 
 use vmm_core::mem::{GuestIoVec, MemCtx};
-use vmm_devices::lifecycle::NvmeMigrateBackend;
+use vmm_devices::lifecycle::{BackingAttach, NvmeMigrateBackend};
 use vmm_devices::{FlushError, FlushIntent};
 
 use super::bits::*;
@@ -292,6 +292,36 @@ pub trait AsyncBackend: Send + Sync + 'static {
     /// destination.
     fn migratable(&self) -> bool {
         true
+    }
+
+    /// Why a migration should not carry this store, when an operator
+    /// may still accept the risk. Asked only when [`Self::migratable`]
+    /// is true.
+    fn migration_waivable(&self) -> Option<String> {
+        None
+    }
+
+    /// Options a migration destination adds to this disk's `-s` spec.
+    fn migration_spec_options(&self) -> Option<String> {
+        None
+    }
+
+    /// False while nothing is attached and no request may come.
+    fn attached(&self) -> bool {
+        true
+    }
+
+    /// Attach the store, retrying until `how.until`. Called with
+    /// nothing in flight and admission closed.
+    fn attach(&self, _how: &BackingAttach) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Give the store up and keep the backend for a later
+    /// [`Self::attach`]. Called with nothing in flight and admission
+    /// closed.
+    fn detach(&self) -> Result<(), String> {
+        Ok(())
     }
 
     /// Runs with the controller lock held, on a vCPU thread or a sink

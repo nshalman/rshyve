@@ -14,6 +14,10 @@
 //! copied from the old region, then goes on. Past the bound, everything
 //! held fails with an internal error.
 //!
+//! A live migration moves the disk through [`Handover`]: the source
+//! detaches after the commit, and the destination attaches a fresh ring
+//! before the guest runs (spec `61`).
+//!
 //! Not done yet:
 //!
 //! - **No remote path.** Only the same engine socket is tried.
@@ -28,12 +32,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vmm_storage::nvme::backend::{AsyncBackend, BackendFactory, BlockRequest};
-use vmm_storage::nvme::{LbaSize, NsHints, NvmeConfig};
+use vmm_storage::nvme::NvmeConfig;
 
 mod attach;
 mod conn;
 mod control;
 mod copy;
+mod handover;
 mod ids;
 mod job;
 mod out;
@@ -49,11 +54,20 @@ mod wake;
 #[cfg(test)]
 mod tests;
 
+pub use handover::{Handover, RingShape};
 pub use job::{Job, Sink};
 pub use ring::Ring;
 
 /// Most queues the NVMe controller serves.
 const MAX_GUEST_QUEUES: u16 = 15;
+
+/// Ring Hello feature: a fresh Attach takes a generation above every
+/// one the volume used on any CN (spec `61` §6.3 rule 1). Without it a
+/// migration destination may reuse an attachment id.
+///
+/// manta-block-ring does not name this bit yet. An engine that does not
+/// know it never sets it, as it answers only bits it knows.
+pub const MIGRATE_V1: u64 = 1 << 3;
 
 /// How to reach the engine and what to ask it for.
 #[derive(Clone)]
@@ -176,20 +190,17 @@ impl Connected {
     /// them, and a volatile write cache unless every write is durable when
     /// it completes.
     pub fn nvme_config(&self) -> NvmeConfig {
-        NvmeConfig {
-            lba_size: if self.att.sector_bytes == 512 {
-                LbaSize::B512
-            } else {
-                LbaSize::B4096
-            },
-            volatile_write_cache: !self.att.durable,
-            deallocate: self.att.zeroing,
-            hints: Some(NsHints {
-                physical_bytes: 4096,
-                optimal_write_bytes: self.att.slots.part_blocks * 4096,
-            }),
-            ..NvmeConfig::default()
-        }
+        self.shape().nvme_config()
+    }
+
+    /// What the guest sees of this attachment.
+    pub fn shape(&self) -> RingShape {
+        RingShape::of(&self.att)
+    }
+
+    /// Whether the engine agreed to [`MIGRATE_V1`].
+    pub fn migrate_v1(&self) -> bool {
+        self.att.migrate_v1
     }
 
     /// Starts the ring, reporting to `sink`.
@@ -197,11 +208,31 @@ impl Connected {
         Ring::start(self.att, Some(self.conn), &self.cfg, sink)
     }
 
-    /// The NVMe controller's backend.
+    /// The NVMe controller's backend, which a live migration can
+    /// detach and attach again.
+    pub fn into_handover_factory(self) -> BackendFactory {
+        Box::new(move |sink| {
+            let sink = Arc::new(job::Controller(sink));
+            Handover::<BlockRequest>::attached(self, sink)
+                as Arc<dyn AsyncBackend>
+        })
+    }
+
+    /// The NVMe controller's backend, with no handover.
     pub fn into_factory(self) -> BackendFactory {
         Box::new(move |sink| {
             let sink = Arc::new(job::Controller(sink));
             self.start::<BlockRequest>(sink) as Arc<dyn AsyncBackend>
         })
     }
+}
+
+/// The backend of a migration destination: `shape` as the source had
+/// it, and nothing attached until the guest is about to run.
+pub fn deferred_factory(cfg: Config, shape: RingShape) -> BackendFactory {
+    Box::new(move |sink| {
+        let sink = Arc::new(job::Controller(sink));
+        Handover::<BlockRequest>::deferred(cfg, shape, sink)
+            as Arc<dyn AsyncBackend>
+    })
 }

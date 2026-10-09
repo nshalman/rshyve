@@ -26,6 +26,7 @@ use crate::{Config, Job, Ring, Sink};
 
 mod control;
 mod faults;
+mod handover;
 mod reattach;
 mod scatter;
 mod sectors;
@@ -273,6 +274,7 @@ fn setup_volume<J: Job<Id = u32>>(
         max_blocks,
         slots: Slots::new(depth, buf_pages, max_blocks).unwrap(),
         pipes,
+        migrate_v1: false,
     };
     let log = slog::Logger::root(slog::Discard, slog::o!());
     let mut cfg = Config::new("unused".into(), uuid::Uuid::nil(), log);

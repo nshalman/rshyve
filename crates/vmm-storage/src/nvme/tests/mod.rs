@@ -32,6 +32,7 @@ use super::{
 mod admin;
 mod backend;
 mod barrier;
+mod handover;
 mod held;
 mod io;
 mod lifecycle;
@@ -315,6 +316,8 @@ struct Manual {
     reap_on_submit: AtomicBool,
     store: NvmeMigrateBackend,
     migratable: bool,
+    /// What `attached` reports; `attach` and `detach` set it.
+    attached: AtomicBool,
 }
 
 impl Manual {
@@ -353,6 +356,7 @@ impl Manual {
             reap_on_submit: AtomicBool::new(false),
             store: NvmeMigrateBackend::File,
             migratable: true,
+            attached: AtomicBool::new(true),
         }
     }
 
@@ -460,6 +464,23 @@ impl AsyncBackend for ManualBackend {
             return;
         }
         self.0.queued.lock().expect("queued lock").push(req);
+    }
+
+    fn attached(&self) -> bool {
+        self.0.attached.load(Ordering::Acquire)
+    }
+
+    fn attach(
+        &self,
+        _how: &vmm_devices::lifecycle::BackingAttach,
+    ) -> Result<(), String> {
+        self.0.attached.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn detach(&self) -> Result<(), String> {
+        self.0.attached.store(false, Ordering::Release);
+        Ok(())
     }
 
     fn flush(&self, _intent: FlushIntent) -> Result<(), FlushError> {

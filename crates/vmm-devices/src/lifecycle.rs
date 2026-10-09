@@ -55,6 +55,17 @@ pub enum FlushError {
     TimedOut,
 }
 
+/// How a backing store attaches before the guest runs again.
+#[derive(Debug, Clone, Copy)]
+pub struct BackingAttach {
+    /// Retry until this instant. On a migration destination the store
+    /// opens only after the orchestrator has moved it.
+    pub until: Instant,
+    /// Take a store that cannot prove a fresh attachment is new for the
+    /// volume. For a lab only: a reused attachment id can drop a write.
+    pub allow_unproven: bool,
+}
+
 /// The deadline a device halt holds itself to when it does not say.
 ///
 /// This value covers every halt in the tree that waits on purpose.
@@ -232,6 +243,42 @@ pub trait Lifecycle: Send + Sync + 'static {
     /// rollback, which must reach every other device.
     fn resume_after_migration(&self) -> Result<(), DeviceStateError> {
         Ok(())
+    }
+
+    /// Why a migration should not carry this device, when an operator
+    /// may still accept the risk for one migration. `None` otherwise.
+    fn migration_waivable(&self) -> Option<String> {
+        None
+    }
+
+    /// Options a migration destination must add to this device's `-s`
+    /// spec, or `None`.
+    fn migration_spec_options(&self) -> Option<String> {
+        None
+    }
+
+    /// Attach the backing store before the guest runs again: on a
+    /// migration destination after the source committed, or on a source
+    /// told to take the guest back. Called on a paused device with
+    /// nothing in flight. A device whose store is always attached does
+    /// nothing.
+    fn attach_backing(
+        &self,
+        _how: &BackingAttach,
+    ) -> Result<(), DeviceStateError> {
+        Ok(())
+    }
+
+    /// Give the backing store up after the source committed, without a
+    /// halt. Called on a paused device with nothing in flight.
+    fn detach_backing(&self) -> Result<(), DeviceStateError> {
+        Ok(())
+    }
+
+    /// False while the backing store is detached and the device must not
+    /// resume.
+    fn backing_attached(&self) -> bool {
+        true
     }
 
     /// Post-restore kick: called after restore_migrate_state to wake

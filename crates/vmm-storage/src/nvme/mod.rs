@@ -41,7 +41,9 @@ use vmm_core::mem::PhysMap;
 use vmm_core::mmio::MmioBus;
 
 use vmm_devices::blkdev::DiskSync;
-use vmm_devices::lifecycle::{DeviceStateError, Indicator, NvmeMigrateBackend};
+use vmm_devices::lifecycle::{
+    BackingAttach, DeviceStateError, Indicator, NvmeMigrateBackend,
+};
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use vmm_devices::pci::msix::{HdlMsiSink, MsiSink, MsixTable};
@@ -310,6 +312,27 @@ impl NvmeController {
     }
 }
 
+impl NvmeController {
+    /// The backend may change hands only with admission closed and
+    /// nothing in it. The check is not held over the change: admission
+    /// stays closed, so nothing new comes.
+    fn idle_for(&self, what: &str) -> Result<(), DeviceStateError> {
+        let st = self.lock();
+        if !st.admission.paused {
+            return Err(DeviceStateError::Invalid(format!(
+                "nvme: {what} needs a paused controller"
+            )));
+        }
+        if st.in_flight() > 0 {
+            return Err(DeviceStateError::Invalid(format!(
+                "nvme: {what} with {} commands in flight",
+                st.in_flight()
+            )));
+        }
+        Ok(())
+    }
+}
+
 fn pci_header(msix: &MsixTable) -> DeviceState {
     let mut pci_state = DeviceState::new(DeviceIdent {
         vendor_id: PCI_VENDOR_ID,
@@ -520,6 +543,15 @@ impl Lifecycle for NvmeController {
     /// its doorbells are spent, and only a doorbell starts the submit
     /// path otherwise.
     fn resume(&self) {
+        // A detached ring would fail every command the guest queued.
+        if !self.backend.attached() {
+            slog::error!(
+                self.log,
+                "nvme: the backing store is detached; \
+                admission stays closed"
+            );
+            return;
+        }
         let mut st = self.lock();
         st.admission.paused = false;
         self.counts.paused.store(false, Ordering::Release);
@@ -565,6 +597,31 @@ impl Lifecycle for NvmeController {
             ),
             other => format!("nvme on {other} has no migration handover yet"),
         })
+    }
+
+    fn migration_waivable(&self) -> Option<String> {
+        self.backend.migration_waivable()
+    }
+
+    fn migration_spec_options(&self) -> Option<String> {
+        self.backend.migration_spec_options()
+    }
+
+    fn backing_attached(&self) -> bool {
+        self.backend.attached()
+    }
+
+    fn attach_backing(
+        &self,
+        how: &BackingAttach,
+    ) -> Result<(), DeviceStateError> {
+        self.idle_for("attach")?;
+        self.backend.attach(how).map_err(DeviceStateError::Invalid)
+    }
+
+    fn detach_backing(&self) -> Result<(), DeviceStateError> {
+        self.idle_for("detach")?;
+        self.backend.detach().map_err(DeviceStateError::Invalid)
     }
 
     fn export_migrate_state(
