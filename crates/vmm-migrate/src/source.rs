@@ -453,16 +453,29 @@ fn run_inner<S: Transport>(
 
     // ── RamPull (none needed) ──
     set_phase(status, MigrationPhase::RamPull);
-    chan.send_uncommitted(gate, &Message::MemEnd)?;
+    end_ram(chan, gate, || check_clean(&mut track, memctx), log)?;
 
-    hand_over(
-        chan,
-        gate,
-        || check_clean(&mut track, memctx),
-        committed,
-        status,
-        log,
-    )
+    hand_over(chan, gate, committed, status, log)
+}
+
+/// Check that no guest page changed after the final pass, and only
+/// then end the RAM phase.
+///
+/// Nothing on this end writes guest memory after the device export, so
+/// a check here holds at the commit too. It comes before the
+/// destination says it holds everything: a failure after that would
+/// leave the destination unsure whether this end committed.
+fn end_ram<S: Transport>(
+    chan: &mut Chan<S>,
+    gate: &dyn StopGate,
+    clean: impl FnOnce() -> Result<(), MigrateError>,
+    log: &slog::Logger,
+) -> Result<(), MigrateError> {
+    if let Err(error) = clean() {
+        chan.report_failure(&error, log);
+        return Err(error);
+    }
+    chan.send_uncommitted(gate, &Message::MemEnd)
 }
 
 /// Three steps, and the order is the whole point. The destination says
@@ -473,17 +486,12 @@ fn run_inner<S: Transport>(
 fn hand_over<S: Transport>(
     chan: &mut Chan<S>,
     gate: &dyn StopGate,
-    clean: impl FnOnce() -> Result<(), MigrateError>,
     committed: CommittedFn,
     status: &Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     set_phase(status, MigrationPhase::Finish);
     chan.expect_okay()?;
-    if let Err(error) = clean() {
-        chan.report_failure(&error, log);
-        return Err(error);
-    }
     gate.commit()?;
 
     set_phase(status, MigrationPhase::Committed);
@@ -568,7 +576,7 @@ fn kernel_tracking(
     move |gpa, len, bm| hdl.track_dirty_pages(gpa, len, bm)
 }
 
-/// Refuse the commit while a guest page is still dirty.
+/// Refuse to hand over while a guest page is still dirty.
 ///
 /// Every writer stopped before the final pass, so a page dirty here is
 /// a write the destination never got. The bits this read clears do not

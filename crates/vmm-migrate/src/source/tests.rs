@@ -260,10 +260,6 @@ fn pair() -> (Chan<UnixStream>, Chan<UnixStream>) {
     )
 }
 
-fn clean() -> Result<(), MigrateError> {
-    Ok(())
-}
-
 fn no_hook() -> CommittedFn {
     Box::new(|| {})
 }
@@ -300,7 +296,7 @@ fn a_cancelled_source_never_commits() {
     let status = status();
 
     let error =
-        hand_over(&mut source, &gate, clean, no_hook(), &status, &discard())
+        hand_over(&mut source, &gate, no_hook(), &status, &discard())
             .expect_err("cancelled");
 
     assert!(crate::is_cancel(&error), "{error}");
@@ -318,7 +314,7 @@ fn a_destination_abort_rolls_the_source_back() {
     let status = status();
 
     let error =
-        hand_over(&mut source, &gate, clean, no_hook(), &status, &discard())
+        hand_over(&mut source, &gate, no_hook(), &status, &discard())
             .expect_err("the destination aborted");
 
     assert_eq!(gate.commits.load(Ordering::Acquire), 0, "committed");
@@ -347,7 +343,6 @@ fn a_commit_the_peer_may_have_missed_is_never_rolled_back() {
     let error = hand_over(
         &mut source,
         &Gate::default(),
-        clean,
         no_hook(),
         &status,
         &discard(),
@@ -370,7 +365,7 @@ fn a_commit_goes_through_the_gate() {
     let gate = Gate::default();
     let status = status();
 
-    hand_over(&mut source, &gate, clean, no_hook(), &status, &discard())
+    hand_over(&mut source, &gate, no_hook(), &status, &discard())
         .expect("handed over");
 
     assert_eq!(gate.commits.load(Ordering::Acquire), 1);
@@ -511,7 +506,6 @@ fn the_disks_are_given_up_right_after_the_commit() {
     hand_over(
         &mut source,
         &Gate::default(),
-        clean,
         hook,
         &status(),
         &discard(),
@@ -530,7 +524,6 @@ fn a_commit_that_may_be_lost_still_gives_the_disks_up() {
     let error = hand_over(
         &mut source,
         &Gate::default(),
-        clean,
         hook,
         &status(),
         &discard(),
@@ -549,7 +542,6 @@ fn no_commit_keeps_the_disks() {
     hand_over(
         &mut source,
         &Gate::default(),
-        clean,
         hook,
         &status(),
         &discard(),
@@ -787,28 +779,27 @@ fn a_page_dirty_at_the_commit_refuses_it() {
 }
 
 #[test]
-fn a_dirty_source_never_commits_and_tells_the_destination() {
+fn a_dirty_source_ends_before_the_destination_says_ready() {
+    // The destination hears the failure in place of the MemEnd, so it
+    // fails before it commits, not in doubt.
     let (mut source, mut dest) = pair();
-    dest.send(&Message::Okay).expect("holds it all");
-    let gate = Gate::default();
-    let status = status();
-    let (hook, calls) = counting();
-
-    let error = hand_over(
+    let error = end_ram(
         &mut source,
-        &gate,
+        &Gate::default(),
         || Err(MigrateError::State("1 guest pages left".into())),
-        hook,
-        &status,
         &discard(),
     )
     .expect_err("dirty");
-
     assert!(matches!(error, MigrateError::State(_)), "{error}");
-    assert_eq!(gate.commits.load(Ordering::Acquire), 0);
-    assert_eq!(calls.load(Ordering::Acquire), 0, "disks given up");
-    assert_eq!(phase(&status), MigrationPhase::Finish, "rolls back");
-    assert!(matches!(dest.recv(), Ok(Message::Error(_))));
+    assert!(
+        !matches!(dest.recv(), Ok(Message::MemEnd)),
+        "the destination heard a MemEnd"
+    );
+
+    let (mut source, mut dest) = pair();
+    end_ram(&mut source, &Gate::default(), || Ok(()), &discard())
+        .expect("clean");
+    assert!(matches!(dest.recv(), Ok(Message::MemEnd)));
 }
 
 #[test]
