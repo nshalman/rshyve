@@ -158,13 +158,8 @@ fn validate_migration_addr(addr: &str) -> Result<(), String> {
 /// A guest whose driver configured one of these would find it at reset
 /// on the far side, with no error anywhere. The list is documented in
 /// docs/migration.md; grow it there and here together.
-const UNMIGRATABLE: &[&str] = &[
-    "ahci-cd",
-    "virtio-console",
-    "virtio-fs",
-    "virtio-vsock",
-    "xhci",
-];
+const UNMIGRATABLE: &[&str] =
+    &["ahci-cd", "virtio-console", "virtio-fs", "virtio-vsock"];
 
 /// Why a VM carrying a device with unmigratable state cannot be a
 /// source.
@@ -367,6 +362,7 @@ pub(super) fn migrate_source(
         mem_size: ctrl.mem_size as u64,
         cpu_baseline: ctrl.cpu_baseline,
         devices: ctrl.migrate_identities(),
+        platform: crate::platform::identities(&ctrl.registry),
         deadlines: vmm_migrate::wire::Deadlines::default(),
         zfs_barrier: zfs_barrier.map(PathBuf::from),
         gate,
@@ -567,6 +563,7 @@ fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
     let for_flush = Arc::clone(ctrl);
     let for_resume = Arc::clone(ctrl);
     let for_export = Arc::clone(ctrl);
+    let for_platform = Arc::clone(ctrl);
     let for_hyperv = Arc::clone(ctrl);
     let for_committed = Arc::clone(ctrl);
     let (pause_vm, resume_vm) = migration_pause_hooks(ctrl);
@@ -583,6 +580,9 @@ fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
             for_resume.run.devices_resumed();
         }),
         export: Box::new(move || for_export.export_device_state()),
+        export_platform: Box::new(move || {
+            crate::platform::export(&for_platform.registry)
+        }),
         committed: Box::new(move || for_committed.detach_backing()),
         hyperv: Box::new(move || for_hyperv.export_hyperv()),
         pause_vm,
@@ -694,6 +694,7 @@ pub(super) fn migrate_dest(
         mem_size: ctrl.mem_size as u64,
         cpu_baseline: ctrl.cpu_baseline,
         devices: ctrl.migrate_identities(),
+        platform: crate::platform::identities(&ctrl.registry),
         deadlines: vmm_migrate::wire::Deadlines::default(),
         allow_cpu_feature_mismatch,
     };
@@ -789,6 +790,7 @@ fn connect_unix_patient(
 /// The device hooks the destination import drives.
 fn dest_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::destination::DestHooks {
     let for_restore = Arc::clone(ctrl);
+    let platform = crate::platform::devices(&ctrl.registry);
     let for_attach = Arc::clone(ctrl);
     let for_resume = Arc::clone(ctrl);
     let for_hyperv = Arc::clone(ctrl);
@@ -796,6 +798,9 @@ fn dest_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::destination::DestHooks {
     vmm_migrate::destination::DestHooks {
         restore: Box::new(move |bdf, state| {
             for_restore.restore_device_state(bdf, state)
+        }),
+        restore_platform: Box::new(move |id, state| {
+            crate::platform::restore(&platform, id, state)
         }),
         attach: Box::new(move || {
             for_attach

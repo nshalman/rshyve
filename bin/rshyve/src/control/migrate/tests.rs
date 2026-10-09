@@ -136,13 +136,16 @@ fn a_vm_with_only_migratable_devices_can_be_a_source() {
         unmigratable_devices(&[ident(4, "nvme"), ident(5, "virtio-blk")]),
         None,
     );
+    // Its controller state is carried since v9, so the VNC tablet no
+    // longer keeps a VM in place.
+    assert_eq!(unmigratable_devices(&[ident(30, "xhci")]), None);
 }
 
 #[test]
 fn a_device_whose_state_is_not_carried_blocks_migration() {
     // The guest driver would find the device at reset on the far
     // side, with no error anywhere.
-    for kind in ["xhci", "ahci-cd", "virtio-fs", "virtio-vsock"] {
+    for kind in ["virtio-console", "ahci-cd", "virtio-fs", "virtio-vsock"] {
         let reason = unmigratable_devices(&[ident(6, kind)])
             .unwrap_or_else(|| panic!("{kind} must block migration"));
         assert!(reason.contains(kind), "{reason}");
@@ -154,9 +157,9 @@ fn a_device_whose_state_is_not_carried_blocks_migration() {
 fn every_blocking_device_is_named_in_the_refusal() {
     // An operator has to see all of them before they can retry.
     let reason =
-        unmigratable_devices(&[ident(6, "xhci"), ident(7, "virtio-fs")])
+        unmigratable_devices(&[ident(6, "ahci-cd"), ident(7, "virtio-fs")])
             .expect("two blocking devices");
-    assert!(reason.contains("xhci@0.6.0"), "{reason}");
+    assert!(reason.contains("ahci-cd@0.6.0"), "{reason}");
     assert!(reason.contains("virtio-fs@0.7.0"), "{reason}");
 }
 

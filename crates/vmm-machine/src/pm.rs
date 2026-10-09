@@ -289,19 +289,46 @@ fn register_block(
 ///
 /// The registry is built by the PCI attach pass, which runs after this
 /// phase, so a binary calls this once that pass returns. Without it the
-/// GPE0 block takes no part in reset and its migration payload is never
-/// asked for.
+/// PM1 and GPE0 blocks and the hotplug latches take no part in reset,
+/// and a migration never asks for their state.
 ///
-/// The three hotplug register files are not here: none of them
-/// implements [`vmm_devices::Lifecycle`], so the registry has nothing to
-/// hold. They keep their latched events across a guest reset, which the
-/// re-exec in `rshyve` makes moot, because the replacement process
-/// builds new ones.
+/// The PCI hotplug block holds nothing a migration has to carry, so it
+/// is not here.
 pub fn register_pm_devices(
     registry: &DeviceRegistry,
     devs: &TimerAndPmDevices,
 ) -> Result<(), RegistryError> {
-    register_gpe0(registry, devs.gpe.as_ref().map(|gpe| &gpe.block))
+    register_platform(
+        registry,
+        "acpi/pm1",
+        Arc::clone(&devs.acpi_pm) as Arc<dyn vmm_devices::Lifecycle>,
+    )?;
+    register_gpe0(registry, devs.gpe.as_ref().map(|gpe| &gpe.block))?;
+    if let Some(hotplug) = &devs.hotplug {
+        if let Some(cpu) = &hotplug.cpu {
+            register_platform(
+                registry,
+                "acpi/cpu-hotplug",
+                Arc::clone(cpu) as Arc<dyn vmm_devices::Lifecycle>,
+            )?;
+        }
+        register_platform(
+            registry,
+            "acpi/mem-hotplug",
+            Arc::clone(&hotplug.mem) as Arc<dyn vmm_devices::Lifecycle>,
+        )?;
+    }
+    Ok(())
+}
+
+/// Register a device with no PCI address under `id`, which a migration
+/// uses as its name on the wire.
+pub fn register_platform(
+    registry: &DeviceRegistry,
+    id: &str,
+    device: Arc<dyn vmm_devices::Lifecycle>,
+) -> Result<(), RegistryError> {
+    registry.insert(RegisteredDevice::new(id, None, None, Some(device), None))
 }
 
 fn register_gpe0(
@@ -311,13 +338,11 @@ fn register_gpe0(
     let Some(block) = gpe else {
         return Ok(());
     };
-    registry.insert(RegisteredDevice::new(
+    register_platform(
+        registry,
         "acpi-gpe",
-        None,
-        None,
-        Some(Arc::clone(block) as Arc<dyn vmm_devices::Lifecycle>),
-        None,
-    ))
+        Arc::clone(block) as Arc<dyn vmm_devices::Lifecycle>,
+    )
 }
 
 /// Configure the ACPI PM timer, ISA IRQ trigger modes for SCI and PCI,

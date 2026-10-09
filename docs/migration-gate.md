@@ -197,8 +197,9 @@ write as a duplicate.
 
 ## Stream version
 
-The migration stream is `vmm-migrate-ron/8`, which adds the
-framebuffer state to v7. A source with a ring disk refuses a v6
-destination right after the protocol choice, before the pause. A VM
-with a framebuffer needs v8 at both ends. An older destination does
-not start with a ring disk on its `-s` list.
+The migration stream is `vmm-migrate-ron/9`, which adds the xHCI
+controller and the LPC and ACPI device state to v8. A source with a
+ring disk refuses a v6 destination right after the protocol choice,
+before the pause. Every VM has the COM1 and COM2 UARTs, so every VM
+needs v9 at both ends. An older destination does not start with a ring
+disk on its `-s` list.

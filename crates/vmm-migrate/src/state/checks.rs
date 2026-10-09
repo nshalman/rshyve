@@ -454,6 +454,7 @@ pub(crate) mod fixtures {
             devices: device_payloads(),
             emulated: Vec::new(),
             hyperv: None,
+            platform: Vec::new(),
         }
     }
 }

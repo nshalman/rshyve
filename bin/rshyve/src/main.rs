@@ -33,6 +33,7 @@ mod mdata;
 mod msix;
 mod pcidev;
 mod peercred;
+mod platform;
 mod reboot;
 mod ringcfg;
 mod secret;
@@ -158,11 +159,13 @@ fn run_migration_destination(
     }
 
     let devices = migrate_devices(registry);
+    let platform = platform::devices(registry);
     let config = vmm_migrate::destination::DestConfig {
         num_cpus,
         mem_size: mem_size as u64,
         cpu_baseline,
         devices: devices.iter().map(|(ident, _)| ident.clone()).collect(),
+        platform: platform.iter().map(|(ident, _)| ident.clone()).collect(),
         deadlines: vmm_migrate::wire::Deadlines::default(),
         // The control socket's migrate-dest carries the override. A VM
         // started this way has no operator to ask mid-migration.
@@ -186,6 +189,9 @@ fn run_migration_destination(
                     ))
                 })?;
             device.restore_migrate_state(state)
+        }),
+        restore_platform: Box::new(move |id, state| {
+            platform::restore(&platform, id, state)
         }),
         // The budget runs from the commit, not from the start.
         attach: Box::new(move || {
@@ -380,9 +386,9 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     let input = Arc::new(InputBroker::default());
 
     // Phase 4: Serial ports and mdata agent
-    let (_com1, _com2) =
+    let (com1, com2) =
         serial::setup_serial(&machine, &chipset_devs.pic, &cli, log)?;
-    let _ps2 = setup_ps2(
+    let ps2 = setup_ps2(
         &machine,
         &chipset_devs.pic,
         Arc::clone(&timer_pm_devs.suspend_sink),
@@ -391,7 +397,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     );
 
     // Phase 5: fw_cfg, ACPI tables, SMBIOS, E820, boot order
-    let (_fwcfg, acpi_tables) = vmm_machine::setup_fwcfg_and_acpi(
+    let (fwcfg, acpi_tables) = vmm_machine::setup_fwcfg_and_acpi(
         &machine,
         &vm_opts,
         num_cpus,
@@ -415,6 +421,20 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     // and its migration payload is never asked for.
     vmm_machine::register_pm_devices(&registry, &timer_pm_devs)
         .context("failed to register the PM devices")?;
+    // The same reason for the devices with no PCI address that the
+    // earlier phases built. Their ids are their names on the
+    // migration wire.
+    let lpc: [(&str, Arc<dyn vmm_devices::Lifecycle>); 5] = [
+        ("lpc/com1", com1),
+        ("lpc/com2", com2),
+        ("lpc/ps2", ps2),
+        ("chipset/i440fx", Arc::clone(&chipset_devs.chipset) as _),
+        ("fwcfg", fwcfg),
+    ];
+    for (id, device) in lpc {
+        vmm_machine::register_platform(&registry, id, device)
+            .with_context(|| format!("failed to register {id}"))?;
+    }
 
     if let Some(vs) = varstore.clone() {
         // The firmware phase builds the variable store, so it never

@@ -16,7 +16,8 @@ use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::MemCtx;
 use vmm_devices::lifecycle::{
-    DeviceMigrateState, DeviceStateError, HypervMigrateState, WireBdf,
+    DeviceMigrateState, DeviceStateError, HypervMigrateState, PlatformIdentity,
+    PlatformStatePayload, WireBdf,
 };
 
 use crate::codec::{
@@ -44,6 +45,12 @@ pub type DeviceRestoreFn = Box<
     dyn Fn(WireBdf, &DeviceMigrateState) -> Result<(), DeviceStateError> + Send,
 >;
 
+/// Give one device with no PCI address the state the source exported
+/// under the same registry id.
+pub type PlatformRestoreFn = Box<
+    dyn Fn(&str, &DeviceMigrateState) -> Result<(), DeviceStateError> + Send,
+>;
+
 /// Start the device workers once the import succeeded.
 pub type DeviceResumeFn = Box<dyn Fn() + Send>;
 
@@ -68,6 +75,8 @@ pub struct DestConfig {
     /// Every local device that carries migration state. The payload's
     /// identity set must equal this.
     pub devices: Vec<DeviceIdentity>,
+    /// The same for the devices with no PCI address.
+    pub platform: Vec<PlatformIdentity>,
     pub deadlines: Deadlines,
     /// Accept a source whose guest saw CPU features this host lacks.
     ///
@@ -79,6 +88,7 @@ pub struct DestConfig {
 /// The device hooks the import drives.
 pub struct DestHooks {
     pub restore: DeviceRestoreFn,
+    pub restore_platform: PlatformRestoreFn,
     pub attach: DeviceAttachFn,
     pub resume: DeviceResumeFn,
     pub hyperv: HypervRestoreFn,
@@ -131,7 +141,9 @@ fn run_inner<S: Transport>(
         chan.send(&Message::Error(err.clone()))?;
         return Err(err);
     };
-    if let Some(why) = protocol_blocker(protocol, &config.devices) {
+    if let Some(why) =
+        protocol_blocker(protocol, &config.devices, &config.platform)
+    {
         let err = MigrateError::ProtocolMismatch(why);
         chan.send(&Message::Error(err.clone()))?;
         return Err(err);
@@ -267,6 +279,7 @@ fn check_preamble(
         )));
     }
     check_topology(&preamble.devices, &config.devices)?;
+    check_topology(&preamble.platform, &config.platform)?;
 
     let Some(ref src) = preamble.cpu_features else {
         return Err(MigrateError::PreambleMismatch(
@@ -316,11 +329,11 @@ fn xsave_plan<'a>(
 ///
 /// A destination started with one disk fewer would otherwise resume the
 /// guest with that disk at reset and no error anywhere.
-fn check_topology(
-    source: &[DeviceIdentity],
-    local: &[DeviceIdentity],
+fn check_topology<T: std::fmt::Display>(
+    source: &[T],
+    local: &[T],
 ) -> Result<(), MigrateError> {
-    let named = |set: &[DeviceIdentity]| -> Vec<String> {
+    let named = |set: &[T]| -> Vec<String> {
         let mut v: Vec<String> = set.iter().map(|d| d.to_string()).collect();
         v.sort();
         v
@@ -369,14 +382,15 @@ fn restore_devices(
             )));
         }
     }
-    // The framebuffer always exports its state, and one restored from
-    // nothing would leave the guest's display undecoded.
+    // These always export a state, and one restored from nothing would
+    // leave the guest's driver talking to a device at reset.
     if let Some(entry) = dev_state.emulated.iter().find(|e| {
-        e.state.is_none() && expected[&e.bdf] == protocol::FRAMEBUFFER_KIND
+        e.state.is_none()
+            && protocol::ALWAYS_EXPORTS.contains(&expected[&e.bdf])
     }) {
         return Err(MigrateError::State(format!(
-            "payload carries no framebuffer state for {}",
-            entry.bdf,
+            "payload carries no {} state for {}",
+            expected[&entry.bdf], entry.bdf,
         )));
     }
     // A device this VM has and the payload does not would resume at
@@ -398,8 +412,11 @@ fn restore_devices(
         }
     }
 
+    check_platform_payload(&dev_state.platform, &config.platform)?;
+
     slog::info!(log, "restoring device state";
-        "devices" => dev_state.emulated.len());
+        "devices" => dev_state.emulated.len(),
+        "platform" => dev_state.platform.len());
     for entry in &dev_state.emulated {
         let Some(ref state) = entry.state else {
             continue;
@@ -407,6 +424,46 @@ fn restore_devices(
         (hooks.restore)(entry.bdf, state).map_err(|error| {
             MigrateError::State(format!("{}: {error}", entry.bdf))
         })?;
+    }
+    for entry in &dev_state.platform {
+        (hooks.restore_platform)(&entry.id, &entry.state).map_err(|error| {
+            MigrateError::State(format!(
+                "{}: {error}",
+                crate::wire::peer_text(&entry.id)
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Each local device with no PCI address takes exactly one state, and
+/// the payload names no other. A UART left at reset stalls the guest's
+/// console and its metadata channel.
+fn check_platform_payload(
+    payload: &[PlatformStatePayload],
+    local: &[PlatformIdentity],
+) -> Result<(), MigrateError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in payload {
+        if !local.iter().any(|l| l.id == entry.id) {
+            return Err(MigrateError::State(format!(
+                "payload carries state for {}, which this VM has no device \
+                 under",
+                crate::wire::peer_text(&entry.id),
+            )));
+        }
+        if !seen.insert(entry.id.as_str()) {
+            return Err(MigrateError::State(format!(
+                "payload carries two states for {}",
+                entry.id,
+            )));
+        }
+    }
+    if let Some(missing) = local.iter().find(|l| !seen.contains(l.id.as_str()))
+    {
+        return Err(MigrateError::State(format!(
+            "payload carries no entry for {missing}"
+        )));
     }
     Ok(())
 }
@@ -747,6 +804,7 @@ mod pass_tests {
     fn hooks(gate: Gate) -> DestHooks {
         DestHooks {
             restore: Box::new(|_, _| Ok(())),
+            restore_platform: Box::new(|_, _| Ok(())),
             attach: Box::new(|| panic!("disks attached")),
             resume: Box::new(|| panic!("devices resumed")),
             hyperv: Box::new(|_| false),
@@ -860,3 +918,6 @@ mod pass_tests {
         assert!(source.recv().is_err(), "the source heard a start");
     }
 }
+
+#[cfg(test)]
+mod platform_tests;

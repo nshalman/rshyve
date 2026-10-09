@@ -12,21 +12,27 @@ One driver serves both transports: a Unix socket inside a bhyve zone,
 where `/dev/poll` is unavailable and the GZ agent bridges to the peer,
 and a TCP socket elsewhere.
 
-The protocol identifier is `vmm-migrate-ron/8`. v8 adds the
-framebuffer state (see "Framebuffer" below). A source offers v8, v7 and
-v6, and a destination takes the newest it reads. A VM with a
-framebuffer moves only on v8: each end refuses an older peer at the
-protocol choice, before the pause. v7 has the v6 payload and says the
+The protocol identifier is `vmm-migrate-ron/9`. v9 adds the xHCI
+controller and the devices with no PCI address (see "xHCI tablet" and
+"Devices with no PCI address" below). A source offers v9, v8, v7 and
+v6, and a destination takes the newest it reads. Each end then checks
+that the chosen version carries everything this VM has, and refuses an
+older peer at the protocol choice, before the pause. Every VM has the
+COM1 and COM2 UARTs, so in practice every VM needs v9 at both ends.
+v8 added the framebuffer state. v7 has the v6 payload and says the
 destination attaches a MantaBlock ring disk after the commit (see
 [migration-gate.md](migration-gate.md)); a source with a ring disk
 refuses a v6 destination before it pauses. A peer on any other version
-is refused at negotiation. v6 carries each vCPU's FPU and XSAVE area with the source
-host's XSAVE layout, and the count of NVMe Asynchronous Event Requests a
-controller holds. A v4 peer carried no FPU state, so the guest resumed
-on the destination's FPU registers (OSF-2). v4 named the store under
-each NVMe namespace, v3 added held NVMe completions and the namespace
-shape, v2 the CQ interrupt-enable bit, and v1 device identity. v5 is
-reserved for virtio-gpu state (PR #15).
+is refused at negotiation. v6 carries each vCPU's FPU and XSAVE area
+with the source host's XSAVE layout, and the count of NVMe Asynchronous
+Event Requests a controller holds. A v4 peer carried no FPU state, so
+the guest resumed on the destination's FPU registers (OSF-2). v4 named
+the store under each NVMe namespace, v3 added held NVMe completions and
+the namespace shape, v2 the CQ interrupt-enable bit, and v1 device
+identity. v5 is reserved for virtio-gpu state (PR #15).
+
+Every PCI device header on the wire also carries the Interrupt Line
+the firmware wrote, since v9.
 
 ### Framebuffer
 
@@ -44,6 +50,63 @@ draws again.
 The VNC socket path and password come from the destination's own `-s`
 spec, which `migrate-config` gives. They are not on the wire. VNC
 clients of the source are dropped and reconnect to the destination.
+
+### xHCI tablet
+
+The `xhci` device (the VNC tablet) carries its PCI header (command,
+BARs and Interrupt Line), the operational, port and interrupter
+registers, the controller's cursors into the command ring, the event
+ring and both transfer rings, the slot state, whether the guest left
+an interrupt-IN TRB armed, and the tablet's position, buttons and USB
+settings. The device contexts and the rings are guest memory, which the
+RAM passes carry; this model writes no output device context.
+
+No transfer is in flight at the pause. Every ring is walked inline on
+the thread that rang the doorbell. The one writer of guest memory that
+runs when no vCPU does is a pointer event from VNC, and the pause holds
+it back: the report waits in the tablet. The destination restores the
+state paused, replays the BARs so BAR0 decodes again, and on its resume
+delivers a held report to the TRB the guest left armed. A source that
+rolls back does the same on its own resume.
+
+### Devices with no PCI address
+
+The LPC and ACPI devices that user space emulates travel in their own
+list, each under its registry id. The preamble names them, and the
+destination refuses a source whose set is not its own before it takes a
+page. Each device in the set must restore one state; a missing, extra
+or doubled entry fails the import.
+
+| Id | What is carried |
+|----|-----------------|
+| `lpc/com1`, `lpc/com2` | IER, LCR, MCR, LSR, MSR, the scratch register, the divisor latch, a THRE interrupt the guest has not taken, and both FIFOs with their bytes |
+| `lpc/ps2` | The i8042 command byte, output port, pending response and command, its RAM, and the keyboard and mouse buffers and settings |
+| `acpi/pm1` | PM1 status, enable and control (SCI_EN), and the reset register |
+| `acpi-gpe` | GPE0 status and enable |
+| `chipset/i440fx` | The 0xCF8 address latch, the PIRQ routing, the POST code, and both bridge headers |
+| `fwcfg` | The item selector and read offset |
+| `acpi/cpu-hotplug`, `acpi/mem-hotplug` | The slot selector, and the CPU command |
+
+The RTC and CMOS, the PIT, the i8259 pair, the I/O APIC, the HPET and
+the ACPI PM timer are in the kernel and travel as kernel payloads. A
+UART's IIR and interrupt line, and the GPE0 SCI, are computed again
+from the carried registers. The model has no FCR state.
+
+The UARTs, the i8042 and the xHCI take no host input while paused: a
+byte that landed after the kernel interrupt state was exported would
+raise a line the destination kernel never sees, and the port would
+stall. Host bytes offered during the pause are dropped; the console
+and the mdata agent retry. On the destination these devices stay
+paused from the restore to the resume. Their interrupt lines are set
+on restore only so this side's count of each line matches the level
+that the kernel import then puts back.
+
+TX bytes a UART still holds go out on the destination's resume, and the
+THRE interrupt that follows lets an interrupt-driven guest driver send
+on. Bytes the source had already handed to a host backend stay on the
+source. The mdata agent's own state is not carried: a request that was
+in flight is not answered, the guest's mdata client times out, and it
+negotiates again with the destination's agent.
 
 ### FPU and XSAVE state
 
@@ -298,7 +361,6 @@ error anywhere:
 
 | Device | What is lost |
 |--------|--------------|
-| `xhci` | Controller registers, every endpoint ring and its state |
 | `ahci-cd` | Port registers, command list, attached media |
 | `virtio-fs` | The FUSE session and every open handle in it |
 | `virtio-vsock` | Every open connection |
@@ -309,16 +371,6 @@ The list lives in `UNMIGRATABLE` in `bin/rshyve/src/control/migrate.rs`.
 Grow it there and here together. A `passthru` device has a PCI handle
 and no lifecycle, and `device_blockers` refuses any such device on the
 source and on the destination.
-
-These are carried as plain guest RAM only, and their device state is
-still lost. They are not refused, because the loss is recoverable by the
-guest and refusing would block every VM:
-
-- LPC UART: IER, LCR and the FIFO contents. A console loses buffered
-  bytes; the port works again at once.
-- i8042 / PS-2: controller and keyboard state.
-- `fw_cfg`: the selector, which only firmware reads.
-- ACPI PM1 and GPE: the event and enable registers.
 
 A VM that hot-added a CPU, memory, or a device since boot is also
 refused: the destination is built from the boot command line and would

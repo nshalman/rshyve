@@ -391,6 +391,7 @@ pub fn export_device_state(
         devices,
         emulated: Vec::new(),
         hyperv: None,
+        platform: Vec::new(),
     })
 }
 

@@ -66,8 +66,9 @@ pub use pci::{
     PciAttachment, PciDeviceCtx, PciDeviceFactory, PciDeviceHandle,
 };
 pub use pm::{
-    mem_hotplug_window, register_pm_devices, setup_timers_and_pm,
-    start_mem_hotplug, Gpe0, HotplugOpts, HotplugRegisters, TimerAndPmDevices,
+    mem_hotplug_window, register_platform, register_pm_devices,
+    setup_timers_and_pm, start_mem_hotplug, Gpe0, HotplugOpts,
+    HotplugRegisters, TimerAndPmDevices,
 };
 pub use registry::{
     DeviceRegistry, RegisteredDevice, RegistryError, SlotState,

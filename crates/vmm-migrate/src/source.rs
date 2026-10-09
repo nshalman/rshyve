@@ -32,7 +32,8 @@ use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::{MemCtx, RegionKind};
 use vmm_devices::lifecycle::{
-    DeviceStateError, DeviceStatePayload, HypervMigrateState,
+    DeviceStateError, DeviceStatePayload, HypervMigrateState, PlatformIdentity,
+    PlatformStatePayload,
 };
 use vmm_devices::FlushError;
 
@@ -76,6 +77,12 @@ pub type DevicePrePauseFn =
 /// already happened.
 pub type DeviceExportFn = Box<
     dyn FnOnce() -> Result<Vec<DeviceStatePayload>, DeviceStateError> + Send,
+>;
+
+/// Read out the state of every device with no PCI address, each under
+/// its registry id. A pure read, like [`DeviceExportFn`].
+pub type PlatformExportFn = Box<
+    dyn FnOnce() -> Result<Vec<PlatformStatePayload>, DeviceStateError> + Send,
 >;
 
 /// Flush device writeback caches. Called after the vCPU pause has
@@ -124,6 +131,8 @@ pub struct SourceConfig {
     /// Every device that carries migration state, so the destination
     /// can compare topology before it takes a page.
     pub devices: Vec<DeviceIdentity>,
+    /// The same for the devices with no PCI address.
+    pub platform: Vec<PlatformIdentity>,
     pub deadlines: Deadlines,
     /// Where the GZ agent reports the final ZFS incremental.
     pub zfs_barrier: Option<PathBuf>,
@@ -141,6 +150,7 @@ pub struct SourceHooks {
     pub pre_pause: DevicePrePauseFn,
     pub flush: DeviceFlushFn,
     pub export: DeviceExportFn,
+    pub export_platform: PlatformExportFn,
     pub resume: DeviceResumeFn,
     pub committed: CommittedFn,
     pub hyperv: HypervExportFn,
@@ -172,7 +182,7 @@ pub fn run_source<S: Transport>(
         &config,
         hooks.pre_pause,
         hooks.flush,
-        hooks.export,
+        (hooks.export, hooks.export_platform),
         hooks.hyperv,
         hooks.committed,
         &hooks.pause_vm,
@@ -245,7 +255,7 @@ fn run_inner<S: Transport>(
     config: &SourceConfig,
     device_pre_pause_fn: DevicePrePauseFn,
     device_flush_fn: DeviceFlushFn,
-    device_export_fn: DeviceExportFn,
+    (device_export_fn, platform_export_fn): (DeviceExportFn, PlatformExportFn),
     hyperv_export_fn: HypervExportFn,
     committed: CommittedFn,
     pause_vm: &VmPauseFn,
@@ -271,7 +281,9 @@ fn run_inner<S: Transport>(
     }
     // Found out here, not at the export: by then the gate may have said
     // go, and the source could not roll back by itself.
-    if let Some(why) = protocol_blocker(&sel.protocol, &config.devices) {
+    if let Some(why) =
+        protocol_blocker(&sel.protocol, &config.devices, &config.platform)
+    {
         return Err(MigrateError::ProtocolMismatch(why));
     }
     if config.handover && sel.protocol == PROTOCOL_RON_V6 {
@@ -284,6 +296,8 @@ fn run_inner<S: Transport>(
 
     let mut devices = config.devices.clone();
     devices.sort();
+    let mut platform = config.platform.clone();
+    platform.sort();
     let xsave = XsaveLayout::local(hdl)?;
     chan.send_uncommitted(
         gate,
@@ -291,6 +305,7 @@ fn run_inner<S: Transport>(
             num_cpus: config.num_cpus,
             mem_size: config.mem_size,
             devices,
+            platform,
             cpu_features: Some(cpu::local_features(config.cpu_baseline)),
             xsave: xsave.clone(),
         })?,
@@ -373,9 +388,12 @@ fn run_inner<S: Transport>(
         state::export_device_state(hdl, config.num_cpus, &xsave, log)?;
     dev_state.emulated = device_export_fn()
         .map_err(|e| MigrateError::State(format!("device export: {e}")))?;
+    dev_state.platform = platform_export_fn()
+        .map_err(|e| MigrateError::State(format!("device export: {e}")))?;
     dev_state.hyperv = hyperv;
     slog::info!(log, "exporting device state";
-        "devices" => dev_state.emulated.len());
+        "devices" => dev_state.emulated.len(),
+        "platform" => dev_state.platform.len());
     chan.send_uncommitted(gate, &Message::serialized(&dev_state)?)?;
 
     // ── RamPull (none needed) ──
