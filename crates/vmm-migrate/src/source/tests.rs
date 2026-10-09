@@ -810,3 +810,25 @@ fn a_dirty_source_never_commits_and_tells_the_destination() {
     assert_eq!(phase(&status), MigrationPhase::Finish, "rolls back");
     assert!(matches!(dest.recv(), Ok(Message::Error(_))));
 }
+
+#[test]
+fn a_page_the_source_cannot_read_fails_and_sends_nothing() {
+    // Propolis sends a zero page here. The guest would resume with that
+    // page wiped.
+    let memctx = firmware_layout(4 * PAGE_SIZE);
+    let (mut source, mut dest) = pair();
+    let unmapped = 0x10_0000_0000;
+    for gpas in [vec![0, unmapped], vec![unmapped]] {
+        let error = send_batch_sparse(
+            &mut source,
+            &memctx,
+            &Gate::default(),
+            &gpas,
+            &status(),
+        )
+        .expect_err("unmapped page");
+        assert!(error.to_string().contains("guest memory read"), "{error}");
+    }
+    drop(source);
+    assert!(dest.recv().is_err(), "a batch went out");
+}
