@@ -121,7 +121,7 @@ impl Framebuffer {
             .lock()
             .expect("fbuf: pci_state lock")
             .bar_replay_writes(&mig.pci.bar_addrs);
-        replay_migrate_pci_state(self, &bar_writes, mig.pci.command);
+        replay_migrate_pci_state(self, &bar_writes, &mig.pci);
         Ok(())
     }
 }

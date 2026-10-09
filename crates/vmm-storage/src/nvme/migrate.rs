@@ -256,7 +256,7 @@ impl NvmeController {
             .lock()
             .expect("pci lock")
             .bar_replay_writes(&mig.pci.bar_addrs);
-        replay_migrate_pci_state(self, &bar_writes, mig.pci.command);
+        replay_migrate_pci_state(self, &bar_writes, &mig.pci);
 
         self.msix.import_state(&mig.msix).map_err(msix_error)
     }

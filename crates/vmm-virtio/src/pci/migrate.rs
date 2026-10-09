@@ -48,7 +48,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             .lock()
             .expect("pci lock")
             .bar_replay_writes(&state.bar_addrs);
-        replay_migrate_pci_state(self, &writes, state.command);
+        replay_migrate_pci_state(self, &writes, state);
     }
 
     /// Snapshot the register file the driver programmed and every queue

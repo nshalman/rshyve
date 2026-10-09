@@ -55,17 +55,21 @@ pub trait PciDevice: Send + Sync + 'static {
 }
 
 /// Replay a migrated PCI header: the BAR writes from
-/// [`DeviceState::bar_replay_writes`], then the command register, so
-/// the bus registrations come back in the order the guest made them.
+/// [`DeviceState::bar_replay_writes`], the Interrupt Line, then the
+/// command register, so the bus registrations come back in the order
+/// the guest made them.
 pub fn replay_migrate_pci_state(
     dev: &dyn PciDevice,
     bar_writes: &[(u8, u32)],
-    command: u16,
+    pci: &MigratePciState,
 ) {
     for &(offset, value) in bar_writes {
         dev.cfg_write(offset, 4, value);
     }
-    dev.cfg_write(bits::REG_COMMAND, 2, u32::from(command));
+    if let Some(line) = pci.intr_line {
+        dev.cfg_write(bits::REG_INTR_LINE, 1, u32::from(line));
+    }
+    dev.cfg_write(bits::REG_COMMAND, 2, u32::from(pci.command));
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +163,7 @@ impl DeviceState {
         MigratePciState {
             command: self.command.bits(),
             bar_addrs,
+            intr_line: Some(self.intr_line),
         }
     }
 

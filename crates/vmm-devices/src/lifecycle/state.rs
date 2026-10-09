@@ -5,10 +5,11 @@
 //! The state a migration carries for one device.
 //!
 //! These types are the wire format. A device exports one of them, the
-//! migration layer ships it under the device's PCI address, and the
-//! destination hands it to the device at that same address. A field
-//! added here is a wire-format change and needs `PROTOCOL_RON` in
-//! `vmm-migrate` bumped with it.
+//! migration layer ships it under the device's PCI address, or under
+//! its registry id for a device with none, and the destination hands it
+//! to the device with that same name. A field added here is a
+//! wire-format change and needs `PROTOCOL_RON` in `vmm-migrate` bumped
+//! with it.
 
 use std::fmt;
 
@@ -16,6 +17,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::pci::msix::MsixMigrateState;
 use crate::pci::Bdf;
+
+mod platform;
+mod xhci;
+
+pub use platform::*;
+pub use xhci::*;
 
 /// A device's PCI address on the migration wire.
 ///
@@ -86,6 +93,15 @@ pub enum DeviceMigrateState {
     Virtio(VirtioMigrateState),
     Nvme(NvmeMigrateState),
     Fbuf(FbufMigrateState),
+    Xhci(XhciMigrateState),
+    Uart(UartMigrateState),
+    Ps2(Ps2MigrateState),
+    AcpiPm(AcpiPmMigrateState),
+    AcpiGpe(AcpiGpeMigrateState),
+    Chipset(ChipsetMigrateState),
+    FwCfg(FwCfgMigrateState),
+    CpuHotplug(CpuHotplugMigrateState),
+    MemHotplug(MemHotplugMigrateState),
 }
 
 impl DeviceMigrateState {
@@ -95,6 +111,15 @@ impl DeviceMigrateState {
             Self::Virtio(_) => "virtio",
             Self::Nvme(_) => "nvme",
             Self::Fbuf(_) => "fbuf",
+            Self::Xhci(_) => "xhci",
+            Self::Uart(_) => "uart",
+            Self::Ps2(_) => "ps2",
+            Self::AcpiPm(_) => "acpi-pm",
+            Self::AcpiGpe(_) => "acpi-gpe",
+            Self::Chipset(_) => "chipset",
+            Self::FwCfg(_) => "fwcfg",
+            Self::CpuHotplug(_) => "cpu-hotplug",
+            Self::MemHotplug(_) => "mem-hotplug",
         }
     }
 }
@@ -139,6 +164,10 @@ pub struct MigratePciState {
     pub command: u16,
     /// BAR base addresses indexed by BAR number (BAR0..BAR5).
     pub bar_addrs: [u64; 6],
+    /// The Interrupt Line the firmware wrote. `None` from a v8 or older
+    /// source.
+    #[serde(default)]
+    pub intr_line: Option<u8>,
 }
 
 /// The framebuffer: its header, the mode the guest set, and its VRAM.
@@ -171,7 +200,7 @@ impl fmt::Debug for FbufMigrateVram {
     }
 }
 
-mod wire_bytes {
+pub(crate) mod wire_bytes {
     use serde::de::{Deserializer, Error, SeqAccess, Visitor};
     use serde::Serializer;
     use std::fmt;

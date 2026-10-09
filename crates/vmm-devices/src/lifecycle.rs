@@ -85,11 +85,16 @@ pub const DEFAULT_HALT_BUDGET: Duration = Duration::from_secs(5);
 mod state;
 
 pub use state::{
-    DeviceMigrateState, DeviceStateError, DeviceStatePayload, FbufMigrateState,
-    FbufMigrateVram, HypervMigrateState, MigratePciState, NvmeMigrateBackend,
-    NvmeMigrateCq, NvmeMigrateCqe, NvmeMigrateNamespace,
-    NvmeMigrateQueueCounts, NvmeMigrateSq, NvmeMigrateState,
-    VirtioMigrateQueue, VirtioMigrateState, WireBdf,
+    AcpiGpeMigrateState, AcpiPmMigrateState, ChipsetMigrateState,
+    CpuHotplugMigrateState, DeviceMigrateState, DeviceStateError,
+    DeviceStatePayload, FbufMigrateState, FbufMigrateVram, FwCfgMigrateState,
+    HypervMigrateState, MemHotplugMigrateState, MigratePciState,
+    NvmeMigrateBackend, NvmeMigrateCq, NvmeMigrateCqe, NvmeMigrateNamespace,
+    NvmeMigrateQueueCounts, NvmeMigrateSq, NvmeMigrateState, PlatformIdentity,
+    PlatformStatePayload, Ps2KbdMigrateState, Ps2MigrateState,
+    Ps2MouseMigrateState, UartMigrateState, VirtioMigrateQueue,
+    VirtioMigrateState, WireBdf, XhciMigrateEventRing, XhciMigrateRing,
+    XhciMigrateState, XhciMigrateTablet,
 };
 
 /// General trait for emulated devices in the system.
@@ -218,6 +223,13 @@ pub trait Lifecycle: Send + Sync + 'static {
         &self,
     ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {
         Ok(None)
+    }
+
+    /// Whether a migration carries this device's state although it has
+    /// no PCI address. The wire then names it by its registry id, and
+    /// the destination must have a device under that id too.
+    fn migrates_by_id(&self) -> bool {
+        false
     }
 
     /// Take the state this device exported on the source. The caller
