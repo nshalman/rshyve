@@ -69,6 +69,28 @@ pub fn apply(cli: &mut Cli) -> anyhow::Result<()> {
     let cfg = parse(&bytes)
         .with_context(|| format!("ring config {}", path.display()))?;
     merge(cli, cfg);
+    refuse_shared_volumes(&cli.pci_slot)
+        .with_context(|| format!("ring config {}", path.display()))
+}
+
+/// Two disks on one volume would show the guest one disk twice and hand
+/// the volume over twice in a migration.
+fn refuse_shared_volumes(specs: &[String]) -> anyhow::Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for spec in specs {
+        let (stripped, _) = strip_bootindex(spec)?;
+        if !is_mantablock_nvme(&stripped) {
+            continue;
+        }
+        if let Some(volume) =
+            stripped.split(',').find_map(|f| f.strip_prefix("volume="))
+        {
+            anyhow::ensure!(
+                seen.insert(volume.to_ascii_lowercase()),
+                "volume {volume} has two ring disks"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -325,6 +347,20 @@ mod tests {
         read(&link, effective_uid()).expect_err("symlink");
         read(dir.path(), effective_uid()).expect_err("directory");
         read(Path::new("relative"), effective_uid()).expect_err("relative");
+    }
+
+    #[test]
+    fn one_volume_cannot_back_two_disks() {
+        let path = file(&body(&[disk(false)], "{}"), 0o600);
+        let other_slot = disk(false).replacen("7,", "8,", 1);
+        let mut c = cli(&[
+            "--ring-config",
+            path.to_str().expect("utf8"),
+            "-s",
+            &other_slot,
+        ]);
+        let err = apply(&mut c).expect_err("shared volume");
+        assert!(format!("{err:#}").contains("two ring disks"), "{err:#}");
     }
 
     #[test]
