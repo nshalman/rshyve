@@ -530,3 +530,124 @@ fn no_commit_keeps_the_disks() {
         .expect_err("the destination aborted");
     assert_eq!(calls.load(Ordering::Acquire), 0);
 }
+
+/// Guest RAM at 0, the firmware scratch RAM in the hole where the lab
+/// source failed, and the boot ROM.
+fn firmware_layout(ram: usize) -> MemCtx {
+    use vmm_core::mem::{PhysMap, RegionKind};
+    let map = PhysMap::new();
+    map.add_region_anon(0, ram, RegionKind::Ram).expect("RAM");
+    map.add_region_anon(0xFCC0_0000, 0x4000, RegionKind::Ram)
+        .expect("scratch RAM");
+    map.add_region_anon(0xFF00_0000, 0x1000, RegionKind::Rom)
+        .expect("ROM");
+    MemCtx::new(Arc::new(map))
+}
+
+fn no_tracking(_: u64, _: usize, _: &mut [u8]) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[test]
+fn the_full_pass_sends_guest_ram_only() {
+    // The fbuf VRAM is kernel device memory and never in the map; the
+    // scratch RAM and the ROM are, and must stay out of the stream.
+    const RAM: usize = 16 * PAGE_SIZE;
+    let memctx = firmware_layout(RAM);
+    let (mut source, mut dest) = pair();
+    let peer = std::thread::spawn(move || {
+        let mut pages = Vec::new();
+        loop {
+            match dest.recv().expect("message") {
+                Message::PageBatch {
+                    base_gpa,
+                    page_count,
+                    ..
+                } => pages.extend(
+                    (0..u64::from(page_count))
+                        .map(|i| base_gpa + i * PAGE_SIZE as u64),
+                ),
+                Message::MemEnd => break,
+                other => panic!("unexpected {}", other.name()),
+            }
+        }
+        dest.send(&Message::MemDone).expect("MemDone");
+        pages
+    });
+
+    push_ram_all(
+        &mut source,
+        &mut no_tracking,
+        &memctx,
+        &Gate::default(),
+        &status(),
+    )
+    .expect("full pass");
+
+    let pages = peer.join().expect("peer");
+    assert_eq!(pages.len(), RAM / PAGE_SIZE);
+    assert!(pages.iter().all(|&gpa| gpa < RAM as u64), "{pages:x?}");
+}
+
+#[test]
+fn a_peer_that_stops_reading_fails_the_pre_pause_push() {
+    // The lab source sat at ram-push-pre-pause for ten minutes after
+    // the destination died behind the agent's bridge.
+    const RAM: usize = 2048 * PAGE_SIZE;
+    let memctx = firmware_layout(RAM);
+    // Bytes zstd cannot shrink, so the socket buffer fills.
+    let mut noise = vec![0u8; RAM];
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for b in noise.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = x as u8;
+    }
+    memctx.write(0, &noise).expect("fill");
+
+    let (ours, _silent_peer) = UnixStream::pair().expect("pair");
+    let (stream, watch) =
+        crate::stall::watch(ours, Duration::from_millis(300), &discard())
+            .expect("watch");
+    let mut source = Chan::new(
+        stream,
+        tungstenite::protocol::Role::Client,
+        Deadlines::default(),
+    )
+    .expect("channel");
+    let status = status();
+    set_phase(&status, MigrationPhase::RamPushPrePause);
+
+    let started = std::time::Instant::now();
+    let error = push_ram_all(
+        &mut source,
+        &mut no_tracking,
+        &memctx,
+        &Gate::default(),
+        &status,
+    )
+    .expect_err("nobody reads");
+    let error = stalled_or(&watch, error);
+    record_failure(&status, &error);
+
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(error.to_string().contains("no progress"), "{error}");
+    let s = status.lock().expect("status");
+    assert_eq!(s.phase, MigrationPhase::Error);
+    assert!(s
+        .error
+        .as_deref()
+        .is_some_and(|e| e.contains("no progress")));
+}
+
+#[test]
+fn a_committed_failure_keeps_the_committed_phase() {
+    // The orchestrator reads `committed` to know the guest may be gone.
+    let status = status();
+    set_phase(&status, MigrationPhase::Committed);
+    record_failure(&status, &MigrateError::Committed("lost".into()));
+    let s = status.lock().expect("status");
+    assert_eq!(s.phase, MigrationPhase::Committed);
+    assert!(s.error.is_some());
+}

@@ -81,7 +81,7 @@ pub fn wait(
     }));
     slog::info!(log, "waiting at the cutover gate";
         "gate" => %path.display(), "budget_ms" => budget.as_millis());
-    match ask(stream, until, status) {
+    match ask(stream, until, status, stop) {
         Ok(Ok(())) => {
             slog::info!(log, "cutover gate: go");
             Ok(())
@@ -104,18 +104,23 @@ fn ask(
     mut stream: UnixStream,
     until: Instant,
     status: &Arc<Mutex<MigrationStatus>>,
+    stop: &dyn StopGate,
 ) -> Result<io::Result<()>, String> {
     write_line(&mut stream, &format!("READY {GATE_PROTOCOL}"), until)
         .map_err(|e| format!("READY: {e}"))?;
     let verdict = match read_line(&mut stream, until) {
-        Ok(line) => parse(&line),
+        Ok(line) => match parse(&line) {
+            Verdict::Go if !take_go(status, stop) => {
+                Verdict::Abort(crate::CANCELLED.into())
+            }
+            verdict => verdict,
+        },
         Err(e) => Verdict::Abort(format!("no answer: {e}")),
     };
     match verdict {
         Verdict::Go => {
             // Go holds from here even if the ACK is lost: the agent
             // reads the gate state back when it has no ACK.
-            set(status, GateState::Go);
             Ok(write_line(&mut stream, "ACK GO", until))
         }
         Verdict::Abort(why) => {
@@ -139,6 +144,22 @@ pub fn parse(line: &str) -> Verdict {
             crate::wire::peer_text(other)
         )),
     }
+}
+
+/// Record the go, unless a cancel came first.
+///
+/// The check and the record are one step under the status lock. An
+/// owner's cancel takes the same lock to check for a go, so exactly
+/// one of the two wins.
+fn take_go(status: &Arc<Mutex<MigrationStatus>>, stop: &dyn StopGate) -> bool {
+    let Ok(mut s) = status.lock() else {
+        return false;
+    };
+    if stop.cancelled() {
+        return false;
+    }
+    s.gate = GateState::Go;
+    true
 }
 
 fn set(status: &Arc<Mutex<MigrationStatus>>, gate: GateState) {

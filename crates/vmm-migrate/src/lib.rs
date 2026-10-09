@@ -18,6 +18,7 @@ pub mod limits;
 pub mod pages;
 pub mod protocol;
 pub mod source;
+pub mod stall;
 pub mod state;
 pub mod wait;
 pub mod wire;
@@ -42,8 +43,8 @@ pub fn hdl_pause_hooks(
     )
 }
 
-/// Why a migration a stop cancelled failed.
-pub const CANCELLED: &str = "a stop cancelled the migration";
+/// Why a migration a stop or `migrate-cancel` cancelled failed.
+pub const CANCELLED: &str = "the migration was cancelled";
 
 /// The error a cancelled migration ends with.
 pub fn cancelled() -> codec::MigrateError {
@@ -165,6 +166,8 @@ pub struct MigrationStatus {
     pub pages_transferred: u64,
     pub dirty_pages_remaining: u64,
     pub gate: GateState,
+    /// Why the migration failed. Set with [`MigrationPhase::Error`].
+    pub error: Option<String>,
 }
 
 impl Default for MigrationStatus {
@@ -175,6 +178,21 @@ impl Default for MigrationStatus {
             pages_transferred: 0,
             dirty_pages_remaining: 0,
             gate: GateState::None,
+            error: None,
         }
+    }
+}
+
+/// Show a failure in the status. A committed source keeps its phase:
+/// the orchestrator reads `committed` to know the guest may have moved.
+pub fn record_failure(
+    status: &std::sync::Mutex<MigrationStatus>,
+    error: &impl std::fmt::Display,
+) {
+    if let Ok(mut s) = status.lock() {
+        if s.phase != MigrationPhase::Committed {
+            s.phase = MigrationPhase::Error;
+        }
+        s.error = Some(error.to_string());
     }
 }

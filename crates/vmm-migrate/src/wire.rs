@@ -37,17 +37,38 @@ pub fn peer_text(s: &str) -> String {
 /// shutting the socket down.
 pub trait Transport: Read + Write {
     fn set_read_deadline(&self, budget: Duration) -> std::io::Result<()>;
+
+    /// Something another thread can call to shut this stream down, and
+    /// so free a send blocked on it.
+    fn shutter(&self) -> std::io::Result<Shutter>;
 }
+
+/// Shuts a stream down from another thread.
+pub type Shutter = Box<dyn FnOnce() + Send>;
 
 impl Transport for std::os::unix::net::UnixStream {
     fn set_read_deadline(&self, budget: Duration) -> std::io::Result<()> {
         self.set_read_timeout(Some(budget))
+    }
+
+    fn shutter(&self) -> std::io::Result<Shutter> {
+        let clone = self.try_clone()?;
+        Ok(Box::new(move || {
+            let _ = clone.shutdown(std::net::Shutdown::Both);
+        }))
     }
 }
 
 impl Transport for std::net::TcpStream {
     fn set_read_deadline(&self, budget: Duration) -> std::io::Result<()> {
         self.set_read_timeout(Some(budget))
+    }
+
+    fn shutter(&self) -> std::io::Result<Shutter> {
+        let clone = self.try_clone()?;
+        Ok(Box::new(move || {
+            let _ = clone.shutdown(std::net::Shutdown::Both);
+        }))
     }
 }
 
@@ -68,6 +89,9 @@ pub struct Deadlines {
     /// started the guest. A ring disk attaches on the destination only
     /// after the orchestrator moved its volume.
     pub started: Duration,
+    /// How long one send may make no progress before the source fails
+    /// the migration. See [`crate::stall`].
+    pub stall: Duration,
 }
 
 impl Default for Deadlines {
@@ -77,6 +101,7 @@ impl Default for Deadlines {
             post_pause: Duration::from_secs(30),
             zfs_barrier: Duration::from_secs(120),
             started: Duration::from_secs(150),
+            stall: Duration::from_secs(30),
         }
     }
 }

@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::VmmHdl;
-use vmm_core::mem::{MemCtx, RegionKind};
+use vmm_core::mem::MemCtx;
 use vmm_devices::lifecycle::{
     DeviceStateError, DeviceStatePayload, HypervMigrateState, PlatformIdentity,
     PlatformStatePayload,
@@ -49,6 +49,7 @@ use crate::pages::{
 use crate::protocol::{
     protocol_blocker, PageIter, PAGE_SIZE, PROTOCOL_RON_V6, SOURCE_OFFER,
 };
+use crate::record_failure;
 use crate::state;
 use crate::wait::{unless_cancelled, Abandoned};
 use crate::wire::{
@@ -168,6 +169,25 @@ pub fn run_source<S: Transport>(
     status: Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
+    let result = run_watched(stream, hdl, memctx, config, hooks, &status, log);
+    if let Err(error) = &result {
+        record_failure(&status, error);
+    }
+    result
+}
+
+fn run_watched<S: Transport>(
+    stream: S,
+    hdl: Arc<VmmHdl>,
+    memctx: &MemCtx,
+    config: SourceConfig,
+    hooks: SourceHooks,
+    status: &Arc<Mutex<MigrationStatus>>,
+    log: &slog::Logger,
+) -> Result<(), MigrateError> {
+    let (stream, watch) =
+        crate::stall::watch(stream, config.deadlines.stall, log)
+            .map_err(|e| MigrateError::Io(format!("stall watchdog: {e}")))?;
     let mut chan = Chan::new(
         stream,
         tungstenite::protocol::Role::Client,
@@ -187,9 +207,10 @@ pub fn run_source<S: Transport>(
         hooks.committed,
         &hooks.pause_vm,
         hooks.gate.as_ref(),
-        &status,
+        status,
         log,
     );
+    let result = result.map_err(|error| stalled_or(&watch, error));
     if let Err(error) = &result {
         if crate::is_cancel(error) {
             chan.report_failure(error, log);
@@ -201,6 +222,23 @@ pub fn run_source<S: Transport>(
         .map(|s| (s.phase, s.gate))
         .unwrap_or((MigrationPhase::Error, GateState::None));
     finish_source(result, phase, gate, log, resume, hooks.resume_vm)
+}
+
+/// A send the watchdog cut short fails with the stall, not with the
+/// broken pipe it caused.
+fn stalled_or(
+    watch: &crate::stall::Watch,
+    error: MigrateError,
+) -> MigrateError {
+    if !watch.stalled() {
+        return error;
+    }
+    match error {
+        MigrateError::Committed(why) => {
+            MigrateError::Committed(format!("{}: {why}", watch.reason()))
+        }
+        _ => MigrateError::Io(watch.reason()),
+    }
 }
 
 /// Roll the source back when a migration failed after the pause.
@@ -314,7 +352,8 @@ fn run_inner<S: Transport>(
 
     // ── RamPushPrePause: send ALL pages ──
     set_phase(status, MigrationPhase::RamPushPrePause);
-    push_ram_all(chan, hdl, memctx, gate, status)?;
+    let mut track = kernel_tracking(hdl);
+    push_ram_all(chan, &mut track, memctx, gate, status)?;
 
     // ── Iterative convergence ──
     const MAX_ITERS: u32 = 5;
@@ -322,7 +361,7 @@ fn run_inner<S: Transport>(
 
     for iter in 1..=MAX_ITERS {
         std::thread::sleep(Duration::from_millis(500));
-        let dirty = push_ram(chan, hdl, memctx, gate, status)?;
+        let dirty = push_ram(chan, &mut track, memctx, gate, status)?;
         slog::info!(log, "convergence"; "iter" => iter, "dirty" => dirty);
         if dirty <= CONVERGE_THRESHOLD {
             break;
@@ -374,7 +413,7 @@ fn run_inner<S: Transport>(
     // Every writer stopped in the pre-pause step, so this pass is the
     // last word on guest memory.
     set_phase(status, MigrationPhase::RamPushPostPause);
-    let final_dirty = push_ram(chan, hdl, memctx, gate, status)?;
+    let final_dirty = push_ram(chan, &mut track, memctx, gate, status)?;
     slog::info!(log, "post-pause"; "dirty" => final_dirty);
 
     // ── TimeData ──
@@ -492,22 +531,28 @@ fn zfs_barrier_wait(
     Ok(())
 }
 
+/// Reads and clears the kernel's dirty bitmap for `[gpa, gpa + len)`.
+type TrackFn<'a> = dyn FnMut(u64, usize, &mut [u8]) -> std::io::Result<()> + 'a;
+
+fn kernel_tracking(
+    hdl: &VmmHdl,
+) -> impl FnMut(u64, usize, &mut [u8]) -> std::io::Result<()> + '_ {
+    move |gpa, len, bm| hdl.track_dirty_pages(gpa, len, bm)
+}
+
 fn push_ram_all<S: Transport>(
     chan: &mut Chan<S>,
-    hdl: &Arc<VmmHdl>,
+    track: &mut TrackFn<'_>,
     memctx: &MemCtx,
     gate: &dyn StopGate,
     status: &Arc<Mutex<MigrationStatus>>,
 ) -> Result<(), MigrateError> {
-    for &(gpa, len, kind) in &memctx.regions() {
-        if kind != RegionKind::Ram {
-            continue;
-        }
+    for (gpa, len) in memctx.guest_ram() {
         let bm_len = crate::protocol::bitmap_size(len);
         let mut bm = vec![0u8; bm_len];
         // Failing here rather than on the next pass: tracking that does
         // not work costs a full RAM copy before it is noticed.
-        hdl.track_dirty_pages(gpa, len, &mut bm).map_err(|e| {
+        track(gpa, len, &mut bm).map_err(|e| {
             MigrateError::Io(format!("dirty tracking unavailable: {e}"))
         })?;
 
@@ -525,19 +570,16 @@ fn push_ram_all<S: Transport>(
 
 fn push_ram<S: Transport>(
     chan: &mut Chan<S>,
-    hdl: &VmmHdl,
+    track: &mut TrackFn<'_>,
     memctx: &MemCtx,
     gate: &dyn StopGate,
     status: &Arc<Mutex<MigrationStatus>>,
 ) -> Result<u64, MigrateError> {
     let mut total: u64 = 0;
-    for &(gpa, len, kind) in &memctx.regions() {
-        if kind != RegionKind::Ram {
-            continue;
-        }
+    for (gpa, len) in memctx.guest_ram() {
         let bm_len = crate::protocol::bitmap_size(len);
         let mut bm = vec![0u8; bm_len];
-        hdl.track_dirty_pages(gpa, len, &mut bm)
+        track(gpa, len, &mut bm)
             .map_err(|e| MigrateError::Io(format!("track_dirty: {e}")))?;
         total += send_dirty(PageIter::new(&bm, gpa, len), gate, |batch| {
             send_batch_sparse(chan, memctx, gate, batch, status)

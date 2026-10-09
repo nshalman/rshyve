@@ -204,6 +204,18 @@ fn a_stop_frees_the_wait_as_a_cancel() {
 }
 
 #[test]
+fn a_cancel_before_the_go_wins() {
+    // migrate-cancel checks for a go under the same lock.
+    let status = status();
+    let stop = Stop::default();
+    stop.fire();
+    assert!(!take_go(&status, &stop));
+    assert_ne!(gate_of(&status), GateState::Go);
+    assert!(take_go(&status, &Stop::default()));
+    assert_eq!(gate_of(&status), GateState::Go);
+}
+
+#[test]
 fn the_parse_takes_two_words_only() {
     assert_eq!(parse("GO"), Verdict::Go);
     assert!(matches!(parse("ABORT"), Verdict::Abort(_)));
