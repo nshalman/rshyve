@@ -167,6 +167,7 @@ fn run_migration_destination(
         devices: devices.iter().map(|(ident, _)| ident.clone()).collect(),
         platform: platform.iter().map(|(ident, _)| ident.clone()).collect(),
         deadlines: vmm_migrate::wire::Deadlines::default(),
+        hyperv: hyperv.is_some(),
         // The control socket's migrate-dest carries the override. A VM
         // started this way has no operator to ask mid-migration.
         allow_cpu_feature_mismatch: false,

@@ -704,6 +704,7 @@ pub(super) fn migrate_dest(
         devices: ctrl.migrate_identities(),
         platform: crate::platform::identities(&ctrl.registry),
         deadlines: vmm_migrate::wire::Deadlines::default(),
+        hyperv: ctrl.hyperv.is_some(),
         allow_cpu_feature_mismatch,
     };
 

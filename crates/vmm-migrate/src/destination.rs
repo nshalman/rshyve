@@ -78,6 +78,9 @@ pub struct DestConfig {
     /// The same for the devices with no PCI address.
     pub platform: Vec<PlatformIdentity>,
     pub deadlines: Deadlines,
+    /// Whether this VM was started with `--hyperv`. The payload must
+    /// carry the enlightenment exactly when it was.
+    pub hyperv: bool,
     /// Accept a source whose guest saw CPU features this host lacks.
     ///
     /// The guest may already have executed one of those instructions,
@@ -420,8 +423,7 @@ fn restore_devices(
     // These always export a state, and one restored from nothing would
     // leave the guest's driver talking to a device at reset.
     if let Some(entry) = dev_state.emulated.iter().find(|e| {
-        e.state.is_none()
-            && protocol::ALWAYS_EXPORTS.contains(&expected[&e.bdf])
+        e.state.is_none() && protocol::always_exports(expected[&e.bdf])
     }) {
         return Err(MigrateError::State(format!(
             "payload carries no {} state for {}",
@@ -437,6 +439,13 @@ fn restore_devices(
         )));
     }
 
+    if dev_state.hyperv.is_none() && config.hyperv {
+        return Err(MigrateError::State(
+            "payload carries no Hyper-V enlightenment state, and this VM \
+             was started with --hyperv"
+                .into(),
+        ));
+    }
     if let Some(hyperv) = &dev_state.hyperv {
         if !(hooks.hyperv)(hyperv) {
             return Err(MigrateError::State(
