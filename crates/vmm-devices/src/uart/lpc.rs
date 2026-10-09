@@ -30,6 +30,7 @@ use vmm_core::common::RWOp;
 use vmm_core::intr_pins::IntrPin;
 use vmm_core::pio::{PioBus, PioFn};
 
+use crate::lifecycle::{DeviceMigrateState, DeviceStateError};
 use crate::Lifecycle;
 
 use super::uart16550::Uart;
@@ -56,6 +57,10 @@ pub const COM2_IRQ: u8 = 3;
 struct UartState {
     uart: Uart,
     irq_pin: Arc<dyn IntrPin>,
+    /// Host input is refused while set. A byte that lands after the
+    /// kernel interrupt state is exported raises a line the destination
+    /// kernel never sees, and the port then stalls for good.
+    paused: bool,
 }
 
 impl UartState {
@@ -92,6 +97,7 @@ impl LpcUart {
             state: Mutex::new(UartState {
                 uart: Uart::new(),
                 irq_pin,
+                paused: false,
             }),
             tx_sink: Mutex::new(None),
         })
@@ -127,9 +133,12 @@ impl LpcUart {
     /// Feed a byte from an external source into the guest's RX path.
     ///
     /// Returns `true` if the byte was accepted, `false` if the RX FIFO
-    /// was full (byte dropped).
+    /// was full or the port is paused (byte dropped).
     pub fn input_byte(&self, data: u8) -> bool {
         let mut state = self.state.lock().unwrap();
+        if state.paused {
+            return false;
+        }
         let accepted = state.uart.data_write(data);
         state.sync_intr_pin();
         accepted
@@ -169,9 +178,14 @@ impl LpcUart {
             }
         }
 
-        // If a TX sink is set, drain all pending TX bytes synchronously.
-        // This provides C bhyve-style immediate serial output without
-        // buffering delays.
+        self.drain_to_sink(&mut state);
+        state.sync_intr_pin();
+    }
+
+    /// Hand every pending TX byte to the sink, if one is set. This
+    /// provides C bhyve-style immediate serial output without buffering
+    /// delays.
+    fn drain_to_sink(&self, state: &mut UartState) {
         if let Ok(sink) = self.tx_sink.lock() {
             if let Some(ref sink_fn) = *sink {
                 while let Some(b) = state.uart.data_read() {
@@ -179,14 +193,59 @@ impl LpcUart {
                 }
             }
         }
-
-        state.sync_intr_pin();
     }
 }
 
 impl Lifecycle for LpcUart {
     fn type_name(&self) -> &'static str {
         "lpc-uart"
+    }
+
+    fn pause(&self) {
+        self.state.lock().unwrap().paused = true;
+    }
+
+    /// Bytes a source carried in its TX FIFO go out here, and the THRE
+    /// interrupt that follows lets an interrupt-driven guest send on.
+    fn resume(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.paused = false;
+        self.drain_to_sink(&mut state);
+        state.sync_intr_pin();
+    }
+
+    fn migrates_by_id(&self) -> bool {
+        true
+    }
+
+    fn export_migrate_state(
+        &self,
+    ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {
+        let state = self.state.lock().unwrap();
+        Ok(Some(DeviceMigrateState::Uart(state.uart.export_state())))
+    }
+
+    /// Runs before the kernel interrupt state is imported, which then
+    /// sets the line level the source had. The pin is driven here only
+    /// so this side's own count of it matches that level.
+    ///
+    /// The port stays paused until [`Lifecycle::resume`], so no host
+    /// byte lands between this and that import.
+    fn restore_migrate_state(
+        &self,
+        state: &DeviceMigrateState,
+    ) -> Result<(), DeviceStateError> {
+        let DeviceMigrateState::Uart(mig) = state else {
+            return Err(DeviceStateError::WrongKind {
+                want: "uart",
+                got: state.kind(),
+            });
+        };
+        let mut state = self.state.lock().unwrap();
+        state.uart.import_state(mig)?;
+        state.paused = true;
+        state.sync_intr_pin();
+        Ok(())
     }
 }
 
@@ -300,6 +359,67 @@ mod tests {
         // Guest reads the byte -- pin should deassert.
         let _ = bus.handle_in(COM1_BASE, 1);
         assert!(!pin.is_asserted());
+    }
+
+    /// A source whose guest wrote with IER set and no backend took the
+    /// bytes yet: they are in the TX FIFO and THRE has been taken.
+    fn source_with_pending_tx() -> DeviceMigrateState {
+        let bus = PioBus::new();
+        let src = LpcUart::new(TestPin::new());
+        src.attach(&bus, COM2_BASE);
+        bus.handle_out(COM2_BASE + 1, 1, 0x03); // IER = ERBFI | ETBEI
+        for b in b"V2 21 " {
+            bus.handle_out(COM2_BASE, 1, u32::from(*b));
+        }
+        let _ = bus.handle_in(COM2_BASE + 2, 1); // the guest takes THRE
+        assert!(src.input_byte(b'!'));
+        src.pause();
+        assert!(!src.input_byte(b'?'), "a paused port takes no input");
+        src.export_migrate_state().expect("export").expect("state")
+    }
+
+    #[test]
+    fn pending_tx_with_ier_set_resumes_sending_on_the_target() {
+        let state = source_with_pending_tx();
+        let DeviceMigrateState::Uart(mig) = &state else {
+            panic!("not uart state");
+        };
+        assert_eq!(mig.tx, b"V2 21 ");
+        assert_eq!(mig.rx, b"!");
+
+        let pin = TestPin::new();
+        let bus = PioBus::new();
+        let dst = LpcUart::new(pin.clone());
+        dst.attach(&bus, COM2_BASE);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&sent);
+        dst.set_tx_sink(Box::new(move |b| sink.lock().unwrap().push(b)));
+
+        dst.restore_migrate_state(&state).expect("restore");
+        assert!(pin.is_asserted(), "the RX byte is pending");
+        assert!(!dst.input_byte(b'?'), "no host byte before the resume");
+        assert!(sent.lock().unwrap().is_empty());
+
+        dst.resume();
+        assert_eq!(*sent.lock().unwrap(), b"V2 21 ");
+        // The guest drains RX, and THRE is what is left: the cue for an
+        // interrupt-driven driver to write the rest.
+        assert_eq!(bus.handle_in(COM2_BASE, 1), u32::from(b'!'));
+        assert!(pin.is_asserted(), "THRE asks for more");
+        assert_eq!(bus.handle_in(COM2_BASE + 2, 1) & 0x0F, 0b0010);
+        bus.handle_out(COM2_BASE, 1, u32::from(b'\n'));
+        assert_eq!(sent.lock().unwrap().last(), Some(&b'\n'));
+        assert!(dst.input_byte(b'V'), "host input flows again");
+    }
+
+    #[test]
+    fn a_restore_of_another_kind_is_refused() {
+        let dst = LpcUart::new(TestPin::new());
+        let other = DeviceMigrateState::AcpiGpe(Default::default());
+        assert!(matches!(
+            dst.restore_migrate_state(&other),
+            Err(DeviceStateError::WrongKind { .. })
+        ));
     }
 
     #[test]
