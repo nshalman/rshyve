@@ -86,15 +86,11 @@ pub fn virtio_blk(
         .num_queues
         .unwrap_or_else(|| std::cmp::min(num_vcpus as u16, 4).max(1));
 
-    let blk = VirtioBlock::with_disk(
-        disk,
-        opts,
-        Arc::clone(ctx.physmap),
-        num_queues,
-    )
-    .with_context(|| {
-        format!("failed to create virtio-blk for: {}", path.display())
-    })?;
+    let blk =
+        VirtioBlock::with_disk(disk, opts, Arc::clone(ctx.physmap), num_queues)
+            .with_context(|| {
+                format!("failed to create virtio-blk for: {}", path.display())
+            })?;
 
     let cfg_size = blk.config_size();
     // One MSI-X vector per queue, plus one for config change.

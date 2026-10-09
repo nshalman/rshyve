@@ -35,6 +35,7 @@ mod barrier;
 mod handover;
 mod held;
 mod io;
+mod late;
 mod lifecycle;
 mod migrate;
 mod msi;

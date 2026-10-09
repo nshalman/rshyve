@@ -29,7 +29,10 @@ pub(super) struct LateFile {
 }
 
 impl LateFile {
-    pub(super) fn factory(disk: BackingDisk, log: slog::Logger) -> BackendFactory {
+    pub(super) fn factory(
+        disk: BackingDisk,
+        log: slog::Logger,
+    ) -> BackendFactory {
         Box::new(move |sink| {
             Arc::new(Self {
                 disk,
@@ -52,12 +55,18 @@ impl AsyncBackend for LateFile {
     }
 
     fn attached(&self) -> bool {
-        self.pool.read().unwrap_or_else(|e| e.into_inner()).is_some()
+        self.pool
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     fn attach(&self, how: &BackingAttach) -> Result<(), String> {
         if self.attached() {
             return Ok(());
+        }
+        if self.halted.load(Ordering::Acquire) {
+            return Err("the disk is halted".into());
         }
         self.disk.attach(how.until).map_err(|e| e.to_string())?;
         let disk = Arc::clone(self.disk.get().ok_or("the disk did not open")?);

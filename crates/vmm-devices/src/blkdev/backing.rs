@@ -61,7 +61,13 @@ impl BackingDisk {
         let file = open_disk(path, read_only)?;
         let capacity = file.metadata()?.len();
         let disk = DiskSync::new(Arc::new(file), read_only, log)?;
-        Ok(Self::with_disk(path, read_only, capacity, Arc::new(disk), log))
+        Ok(Self::with_disk(
+            path,
+            read_only,
+            capacity,
+            Arc::new(disk),
+            log,
+        ))
     }
 
     /// A store that is open already. For a caller that opened it itself.
@@ -71,7 +77,13 @@ impl BackingDisk {
         log: &slog::Logger,
     ) -> io::Result<Self> {
         let capacity = disk.file().metadata()?.len();
-        Ok(Self::with_disk(Path::new(""), read_only, capacity, disk, log))
+        Ok(Self::with_disk(
+            Path::new(""),
+            read_only,
+            capacity,
+            disk,
+            log,
+        ))
     }
 
     fn with_disk(
@@ -157,15 +169,16 @@ impl BackingDisk {
                         "path" => %self.path.display(), "tries" => tries);
                     return Ok(());
                 }
-                Err(e) if !transient(&e) => return Err(e),
+                Err(e) if !transient(&e) => return Err(self.named(e)),
                 Err(e) => e,
             };
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(io::Error::new(
+                let error = io::Error::new(
                     error.kind(),
                     format!("{error} (after {tries} tries)"),
-                ));
+                );
+                return Err(self.named(error));
             }
             thread::sleep(backoff.min(left));
             backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -173,24 +186,19 @@ impl BackingDisk {
     }
 
     fn open_checked(&self) -> io::Result<DiskSync> {
-        let file = open_disk(&self.path, self.read_only).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("open {}: {e}", self.path.display()),
-            )
-        })?;
+        let file = open_disk(&self.path, self.read_only)?;
         let now = file.metadata()?.len();
         if now != self.capacity {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "{} is {now} bytes; the guest has {} bytes",
-                    self.path.display(),
-                    self.capacity
-                ),
+                format!("{now} bytes; the guest has {} bytes", self.capacity),
             ));
         }
         DiskSync::new(Arc::new(file), self.read_only, &self.log)
+    }
+
+    fn named(&self, e: io::Error) -> io::Error {
+        io::Error::new(e.kind(), format!("open {}: {e}", self.path.display()))
     }
 }
 
@@ -221,8 +229,8 @@ mod tests {
     #[test]
     fn a_deferred_disk_holds_nothing_until_it_attaches() {
         let img = image(8192);
-        let disk = BackingDisk::deferred(img.path(), false, &log())
-            .expect("probe");
+        let disk =
+            BackingDisk::deferred(img.path(), false, &log()).expect("probe");
         assert_eq!(disk.capacity(), 8192);
         assert!(!disk.is_attached());
         assert!(disk.get().is_none());
@@ -257,8 +265,8 @@ mod tests {
     #[test]
     fn a_disk_that_changed_size_is_refused_at_once() {
         let img = image(8192);
-        let disk = BackingDisk::deferred(img.path(), false, &log())
-            .expect("probe");
+        let disk =
+            BackingDisk::deferred(img.path(), false, &log()).expect("probe");
         img.as_file().set_len(4096).expect("shrink");
 
         let started = Instant::now();

@@ -884,9 +884,9 @@ impl Lifecycle for VirtioBlock {
         &self,
         how: &BackingAttach,
     ) -> Result<(), DeviceStateError> {
-        self.disk.attach(how.until).map_err(|e| {
-            DeviceStateError::Invalid(format!("virtio-blk: {e}"))
-        })
+        self.disk
+            .attach(how.until)
+            .map_err(|e| DeviceStateError::Invalid(format!("virtio-blk: {e}")))
     }
 
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {

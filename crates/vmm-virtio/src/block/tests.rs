@@ -1109,3 +1109,35 @@ fn a_refused_chain_returns_its_descriptor() {
         0,
     );
 }
+
+#[test]
+fn a_destination_disk_opens_at_the_attach_and_a_failed_open_retries() {
+    use vmm_devices::lifecycle::BackingAttach;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("seed.img");
+    std::fs::write(&path, vec![0u8; 8192]).expect("write the image");
+    let log = slog::Logger::root(slog::Discard, slog::o!());
+    let opts = VirtioBlockOpts {
+        read_only: true,
+        ..VirtioBlockOpts::default()
+    };
+    let disk = BackingDisk::deferred(&path, true, &log).expect("probe");
+    let block =
+        VirtioBlock::with_disk(disk, &opts, Arc::new(PhysMap::new()), 1)
+            .expect("device");
+    assert!(!block.backing_attached());
+    assert_eq!(block.capacity, 16, "the size comes from the probe");
+
+    let now = || BackingAttach {
+        until: Instant::now(),
+        allow_unproven: false,
+    };
+    std::fs::remove_file(&path).expect("remove");
+    block.attach_backing(&now()).expect_err("no image");
+    assert!(!block.backing_attached());
+
+    std::fs::write(&path, vec![0u8; 8192]).expect("write the image");
+    block.attach_backing(&now()).expect("the retry");
+    assert!(block.backing_attached());
+}
