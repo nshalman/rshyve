@@ -687,6 +687,12 @@ pub(super) fn migrate_dest(
     if let Err(why) = claim_dest(&ctrl.run, &ctrl.registry) {
         return Response::err(&why);
     }
+    // A failed import may have installed them. The next RAM passes
+    // would land in the overlay pages, and an import at the same GPA
+    // keeps them.
+    if let Some(hyperv) = &ctrl.hyperv {
+        hyperv.pause_overlays();
+    }
 
     let status = Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
     if let Ok(mut ms) = ctrl.migrate_status.lock() {

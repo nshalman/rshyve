@@ -422,6 +422,9 @@ impl VmController {
     /// guest kick on a stopped ring with EBUSY, so the guest would come
     /// back with a dead NIC.
     fn resume_devices_after_migration(&self) {
+        if let Some(hyperv) = &self.hyperv {
+            hyperv.resume_overlays();
+        }
         let devices = self.named_devices();
         resume_device_set(&devices);
         for named in &devices {
