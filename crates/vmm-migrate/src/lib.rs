@@ -20,6 +20,7 @@ pub mod source;
 pub mod state;
 pub mod wait;
 pub mod wire;
+pub mod xsave;
 
 /// Pauses or resumes the vCPUs.
 ///

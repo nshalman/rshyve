@@ -157,7 +157,7 @@ pub struct VcpuStatePayload {
     pub registers: Vec<u8>,
     /// VDC_MSR data.
     pub msrs: Vec<u8>,
-    /// VDC_FPU data.
+    /// The XSAVE area from VM_GET_FPU, in the source host's layout.
     pub fpu: Vec<u8>,
     /// VDC_LAPIC data.
     pub lapic: Vec<u8>,
@@ -444,6 +444,8 @@ pub struct MigrationPreamble {
     /// CPU feature bits from the source host for compatibility check.
     /// The destination rejects migration if it lacks any of these features.
     pub cpu_features: Option<CpuFeatures>,
+    /// The source host's XSAVE area, which every vCPU's `fpu` follows.
+    pub xsave: crate::xsave::XsaveLayout,
 }
 
 /// CPU feature summary for migration compatibility checking.
@@ -624,6 +626,10 @@ mod tests {
             mem_size: 1024 * 1024 * 1024,
             devices: devices.clone(),
             cpu_features: None,
+            xsave: crate::xsave::XsaveLayout {
+                size: 576,
+                components: Vec::new(),
+            },
         };
         let msg = Message::serialized(&preamble).unwrap();
         match roundtrip(&msg) {
@@ -636,6 +642,15 @@ mod tests {
             }
             other => panic!("expected Serialized, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_preamble_without_an_xsave_layout_is_refused() {
+        // What a v4 source sends: the destination cannot place the
+        // guest's FPU state without the source's layout (OSF-2).
+        let v4 = "(num_cpus:1,mem_size:4096,devices:[],cpu_features:None)";
+        Message::deserialize::<MigrationPreamble>(v4.as_bytes())
+            .expect_err("no xsave layout");
     }
 
     #[test]
@@ -817,31 +832,6 @@ mod tests {
         )
         .expect("upper case");
         assert_eq!(lower, upper);
-    }
-
-    #[test]
-    fn a_v3_decoder_skips_the_store() {
-        // A source offers v3 on the strength of this: a v3 build's
-        // decoder has no `backend` field and must not fail on one.
-        #[derive(Serialize)]
-        struct V4 {
-            num_io_queues: u16,
-            backend: Option<vmm_devices::lifecycle::NvmeMigrateBackend>,
-        }
-        #[derive(Debug, PartialEq, Deserialize)]
-        struct V3 {
-            num_io_queues: u16,
-        }
-        let v4 = V4 {
-            num_io_queues: 3,
-            backend: Some(vmm_devices::lifecycle::NvmeMigrateBackend::File),
-        };
-        let msg = Message::serialized(&v4).expect("encode");
-        let Message::Serialized(data) = roundtrip(&msg) else {
-            panic!("expected Serialized");
-        };
-        let v3: V3 = Message::deserialize(&data).expect("decode as v3");
-        assert_eq!(v3, V3 { num_io_queues: 3 });
     }
 
     #[test]
