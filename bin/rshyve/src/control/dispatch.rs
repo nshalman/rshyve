@@ -19,8 +19,8 @@ use vmm_machine::{
 };
 
 use super::migrate::{
-    migrate_config, migrate_dest, migrate_resume_source, migrate_source,
-    migrate_status, migration_source_guard, SourceAsk,
+    migrate_cancel, migrate_config, migrate_dest, migrate_resume_source,
+    migrate_source, migrate_status, migration_source_guard, SourceAsk,
 };
 use super::protocol::{Command, Response};
 use super::run_state::{
@@ -103,6 +103,8 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
         } => migrate_dest(ctrl, listen_addr, allow_cpu_feature_mismatch),
 
         Command::MigrateResumeSource => migrate_resume_source(ctrl),
+
+        Command::MigrateCancel => migrate_cancel(ctrl),
 
         // The listener answers both of these itself, as raw text rather
         // than a typed Response. This arm is what a listener that

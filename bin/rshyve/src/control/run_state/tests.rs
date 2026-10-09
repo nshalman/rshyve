@@ -1039,3 +1039,43 @@ fn a_failed_order_keeps_the_source_held() {
     assert!(run.held());
     assert_eq!(run.resume_held(release_step), Ok(()));
 }
+
+#[test]
+fn migrate_cancel_frees_a_running_source_and_keeps_it_migrating() {
+    let run = RunControl::new(Running);
+    run.admit_source(|| None).expect("claim");
+    let woken = Arc::new(AtomicBool::new(false));
+    let by_waker = Arc::clone(&woken);
+    run.on_stop(Box::new(move || by_waker.store(true, Ordering::Release)));
+
+    run.cancel_source(|| false).expect("cancel");
+
+    assert!(woken.load(Ordering::Acquire), "the stream stayed open");
+    assert!(run.cancelled());
+    // No stop: the migration's own end gives the guest back.
+    assert_eq!(run.get(), Migrating);
+    assert!(!run.commit(), "a cancelled source committed");
+}
+
+#[test]
+fn migrate_cancel_is_refused_after_the_go() {
+    let run = parked_source();
+    assert_eq!(run.cancel_source(|| true), Err(PAST_THE_GATE));
+    assert!(!run.cancelled());
+}
+
+#[test]
+fn migrate_cancel_is_refused_after_the_commit() {
+    let run = parked_source();
+    assert!(run.commit());
+    assert_eq!(run.cancel_source(|| false), Err(PAST_THE_GATE));
+}
+
+#[test]
+fn migrate_cancel_needs_a_source() {
+    let run = RunControl::new(Running);
+    assert_eq!(run.cancel_source(|| false), Err(NO_SOURCE));
+    let run = RunControl::new(Paused);
+    import(&run).expect("import");
+    assert_eq!(run.cancel_source(|| false), Err(NO_SOURCE));
+}

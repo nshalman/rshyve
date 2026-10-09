@@ -109,16 +109,44 @@ that waits for an order:
 rshyve refuses it while the migration thread runs, and after the
 destination confirmed the start (the source is then `stopped`).
 
+### Cancel
+
+```json
+{"command":"migrate-cancel"}
+```
+
+Stops a source migration before the gate's go. rshyve closes the
+migration stream, the gate socket and the ZFS barrier socket at once.
+The migration fails with `the migration was cancelled`:
+
+- Before the pause, the guest never stopped and keeps running.
+- After the pause and before `GO`, rshyve rolls back and the guest runs
+  again.
+
+The destination sees the stream close and exits. Its guest never ran.
+
+rshyve refuses `migrate-cancel`:
+
+- When no source migration runs.
+- After the gate's go (`migrate_gate` is `go`), or after the commit.
+  Then use `migrate-resume-source` or a stop.
+
+A `GO` that arrives after the cancel is taken as an abort, and rshyve
+answers `ACK ABORT`.
+
 ### Status
 
-`migrate-status` has two more fields:
+`migrate-status` has these more fields:
 
 | Field | Values |
 |---|---|
 | `migrate_gate` | `none`, `waiting`, `go`, `abort` |
 | `migrate_rings` | `attached`, `attaching`, `detached`, `attach-failed`, `detach-failed`. Absent for a VM with no ring disk |
+| `migrate_error` | Why the migration failed. Absent until it fails |
 
-`migrate_phase` `committed` means the source committed.
+`migrate_phase` `committed` means the source committed. A source that
+fails before its commit shows `migrate_phase` `error`. A source that
+fails after its commit keeps `committed`.
 
 ## Gate exchange
 
@@ -162,6 +190,12 @@ Write the `committing` state of the VM migration record before you send
 | Source waits for the destination start after the commit | 150 s | fixed |
 | Destination waits for each ring disk to attach | 120 s | `--migrate-ring-attach-timeout-ms` |
 | Each Hello and Attach try | 5 s | fixed |
+| One source send that makes no progress | 30 s | fixed |
+
+A source send can block when the peer stops reading, for example when
+the destination died and the agent's bridge kept the socket open. After
+30 s with no progress, rshyve closes the stream and the migration
+fails. Before the pause the guest keeps running.
 
 The destination retries the attach (20 ms, doubling to 500 ms) while the
 volume socket does not exist or the engine refuses. A grant with

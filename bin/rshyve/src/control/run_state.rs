@@ -67,6 +67,13 @@ pub(super) const IMPORT_FAILED: &str =
     "the import failed part way and the guest is half written; send \
      migrate-dest again, or stop";
 
+/// Why `migrate-cancel` found nothing to cancel.
+pub(super) const NO_SOURCE: &str = "no source migration is running";
+
+/// Why `migrate-cancel` refused a source the gate let through.
+pub(super) const PAST_THE_GATE: &str =
+    "the gate said go; only migrate-resume-source or a stop ends this      migration now";
+
 /// How long a stop waits for a change in progress. The SIGTERM
 /// watchdog calls the stop, and its budgets do not run while it waits.
 pub(super) const STOP_WAIT: Duration = Duration::from_secs(10);
@@ -460,6 +467,30 @@ impl RunControl {
             hold().map_err(Some)?;
             state.held = true;
         }
+        Ok(())
+    }
+
+    /// Cancel a source migration that has not passed the gate, for
+    /// `migrate-cancel`. Its blocked I/O is freed at once and the guest
+    /// keeps running, or rolls back if it was already paused.
+    ///
+    /// `gone` says whether the gate said go. The caller holds the lock
+    /// the gate records its go under, so the answer stays true.
+    pub(super) fn cancel_source(
+        &self,
+        gone: impl FnOnce() -> bool,
+    ) -> Result<(), &'static str> {
+        let hold = self.lock_changing();
+        if self.get() != VmRunState::Migrating
+            || hold.migration != Some(Role::Source)
+        {
+            return Err(NO_SOURCE);
+        }
+        if hold.committed || gone() {
+            return Err(PAST_THE_GATE);
+        }
+        self.cancel.store(true, Ordering::Release);
+        wake(&self.wakers);
         Ok(())
     }
 

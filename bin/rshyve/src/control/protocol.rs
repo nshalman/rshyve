@@ -58,6 +58,10 @@ pub(super) enum Command {
     /// the gate's go or an unconfirmed commit.
     #[serde(rename = "migrate-resume-source")]
     MigrateResumeSource,
+    /// Abort a source migration before the gate's go. The guest keeps
+    /// running here.
+    #[serde(rename = "migrate-cancel")]
+    MigrateCancel,
     #[serde(rename = "migrate-status")]
     MigrateStatus,
     #[serde(rename = "migrate-config")]
@@ -109,6 +113,7 @@ impl Command {
             Self::MigrateSource { .. } => "migrate-source",
             Self::MigrateDest { .. } => "migrate-dest",
             Self::MigrateResumeSource => "migrate-resume-source",
+            Self::MigrateCancel => "migrate-cancel",
             Self::MigrateStatus => "migrate-status",
             Self::MigrateConfig => "migrate-config",
             Self::Metrics => "metrics",
@@ -309,6 +314,14 @@ mod tests {
             serde_json::from_str(r#"{"command":"migrate-resume-source"}"#)
                 .unwrap();
         assert!(matches!(cmd, Command::MigrateResumeSource));
+    }
+
+    #[test]
+    fn command_deserialize_migrate_cancel() {
+        let cmd: Command =
+            serde_json::from_str(r#"{"command":"migrate-cancel"}"#).unwrap();
+        assert!(matches!(cmd, Command::MigrateCancel));
+        assert_eq!(cmd.name(), "migrate-cancel");
     }
 
     #[test]

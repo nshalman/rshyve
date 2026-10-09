@@ -337,21 +337,26 @@ pub(super) fn migrate_source(
     };
     let zfs_barrier = ask.zfs_barrier;
 
-    if let Err(why) = claim_source(
-        &ctrl.run,
-        &ctrl.hotplug,
-        &ctrl.registry,
-        || ctrl.migrate_identities(),
-        ask.allow_unproven,
-    ) {
-        return Response::err(&why);
+    // The claim and the new status are one step, so a migrate-cancel
+    // never reads the last migration's gate for this one.
+    let status = Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
+    {
+        let mut slot = ctrl.migrate_status.lock();
+        if let Err(why) = claim_source(
+            &ctrl.run,
+            &ctrl.hotplug,
+            &ctrl.registry,
+            || ctrl.migrate_identities(),
+            ask.allow_unproven,
+        ) {
+            return Response::err(&why);
+        }
+        if let Ok(slot) = slot.as_mut() {
+            **slot = Some(Arc::clone(&status));
+        }
     }
     ctrl.set_allow_unproven(ask.allow_unproven);
-
-    let status = Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
-    if let Ok(mut ms) = ctrl.migrate_status.lock() {
-        *ms = Some(Arc::clone(&status));
-    }
+    let status_for_failure = Arc::clone(&status);
 
     let ctrl_arc = Arc::clone(ctrl);
     let hdl = Arc::clone(&ctrl.hdl);
@@ -426,6 +431,7 @@ pub(super) fn migrate_source(
                     {
                         // The orchestrator recorded the go. Only its
                         // order brings the guest back here.
+                        vmm_migrate::record_failure(&status_for_failure, &e);
                         error!(mlog, "source migration failed after the \
                             gate's go; this VM stays paused until \
                             migrate-resume-source or a stop";
@@ -435,6 +441,8 @@ pub(super) fn migrate_source(
                         );
                     }
                     Err(e @ SourceOutcome::Failed(_)) => {
+                        // A connect failure never reached the driver.
+                        vmm_migrate::record_failure(&status_for_failure, &e);
                         error!(mlog, "source migration failed"; "error" => %e);
                         end_migration(&ctrl_arc);
                     }
@@ -878,6 +886,34 @@ pub(super) fn migrate_resume_source(ctrl: &Arc<VmController>) -> Response {
     }
 }
 
+/// Abort a source migration before the gate's go. The stream closes
+/// at once and the guest keeps running here.
+pub(super) fn migrate_cancel(ctrl: &Arc<VmController>) -> Response {
+    let status = ctrl.migrate_status.lock().ok().and_then(|ms| ms.clone());
+    // Held across the cancel: the gate records its go under this lock,
+    // so a go and a cancel cannot both win.
+    let held = status.as_ref().map(|s| s.lock());
+    let gone = || {
+        held.as_ref().is_some_and(|s| {
+            s.as_ref()
+                .map_or(true, |s| s.gate == vmm_migrate::GateState::Go)
+        })
+    };
+    match ctrl.run.cancel_source(gone) {
+        Ok(()) => {
+            info!(
+                ctrl.log,
+                "migrate-cancel: the source migration is \
+                cancelled"
+            );
+            let mut r = Response::ok();
+            r.state = Some(ctrl.state());
+            r
+        }
+        Err(why) => Response::err(why),
+    }
+}
+
 pub(super) fn migrate_status(ctrl: &Arc<VmController>) -> Response {
     let phase_info = ctrl.migrate_status.lock().ok().and_then(|ms| {
         ms.as_ref().and_then(|s| s.lock().ok().map(|s| s.clone()))
@@ -893,6 +929,9 @@ pub(super) fn migrate_status(ctrl: &Arc<VmController>) -> Response {
             let mut data = serde_json::json!({
                 "migrate_gate": s.gate.to_string(),
             });
+            if let Some(why) = &s.error {
+                data["migrate_error"] = why.clone().into();
+            }
             if let Some(rings) = ctrl.rings_state() {
                 data["migrate_rings"] = rings.into();
             }
