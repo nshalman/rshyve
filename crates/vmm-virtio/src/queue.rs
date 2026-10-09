@@ -369,13 +369,17 @@ impl VirtQueue {
     /// For devices using VirtioCompletion (like virtio-blk), the
     /// VirtQueue's shadow_used_idx is never updated. This reads the
     /// actual used_ring->idx that VirtioCompletion wrote to guest memory.
+    ///
+    /// Takes the untracked view. The migration export calls this after
+    /// the final dirty pass, and a read fault on the tracked view marks
+    /// the page dirty, which fails the commit.
     pub fn read_used_ring_idx(&self, physmap: &PhysMap) -> u16 {
         if self.used_addr == 0 {
             return 0;
         }
         let gpa = self.used_addr + 2;
         physmap
-            .lookup(gpa, 2)
+            .lookup_untracked(gpa, 2)
             .and_then(|sub| sub.read::<u16>().ok())
             .unwrap_or(0)
     }
