@@ -45,7 +45,7 @@ impl VmController {
     }
 
     /// Whether this VM has a disk that changes hands.
-    fn has_handover_disks(&self) -> bool {
+    pub(super) fn has_handover_disks(&self) -> bool {
         self.named_devices()
             .iter()
             .any(|d| d.device.migration_spec_options().is_some())
@@ -73,7 +73,7 @@ impl VmController {
         let mut failed = Vec::new();
         for named in self.named_devices() {
             if let Err(e) = named.device.detach_backing() {
-                failed.push(format!("{}: {e}", label(named)));
+                failed.push(format!("{}: {e}", label(&named)));
             }
         }
         if !self.has_handover_disks() {

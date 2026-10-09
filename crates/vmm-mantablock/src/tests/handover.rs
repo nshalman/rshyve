@@ -109,10 +109,10 @@ fn answer_until_detach(s: &mut UnixStream) -> bool {
         while let Ok(Some((msg, _, used))) = Message::decode_as(&buf, 2) {
             buf.drain(..used);
             match msg {
-                Message::Ping => {
-                    if s.write_all(&Message::Pong.encode_as(0, 2)).is_err() {
-                        return false;
-                    }
+                Message::Ping
+                    if s.write_all(&Message::Pong.encode_as(0, 2)).is_err() =>
+                {
+                    return false;
                 }
                 Message::Detach => {
                     let reply = Message::Detached.encode_as(0, 2);

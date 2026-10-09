@@ -618,7 +618,8 @@ fn migrate_config_gives_a_ring_disk_its_shape_once() {
     let argv = [
         "4,nvme,/boot.img".to_string(),
         "5,nvme,mantablock=/s,volume=v,bootindex=1".to_string(),
-        "5,nvme,mantablock=/s,volume=v,ring-shape=1:9:512:1:1:1:1:1:-".to_string(),
+        "5,nvme,mantablock=/s,volume=v,ring-shape=1:9:512:1:1:1:1:1:-"
+            .to_string(),
     ];
     let slots = migrate_pci_slots(&argv, &registry);
     assert_eq!(slots[0], "4,nvme,/boot.img");
