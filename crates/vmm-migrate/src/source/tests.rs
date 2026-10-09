@@ -147,6 +147,14 @@ fn a_stop_frees_a_wait_on_a_silent_zfs_barrier() {
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
+/// A rollback after the device pause started.
+fn paused(devices: DeviceResumeFn) -> Rollback {
+    Rollback {
+        devices,
+        devices_paused: true,
+    }
+}
+
 #[test]
 fn flush_failure_resumes_devices_and_vcpus() {
     let result: Result<(), MigrateError> =
@@ -165,7 +173,7 @@ fn flush_failure_resumes_devices_and_vcpus() {
         MigrationPhase::Pause,
         GateState::None,
         &discard(),
-        resume_fn,
+        paused(resume_fn),
         move || {
             assert!(devices_resumed_before_vcpus.load(Ordering::Acquire));
             vcpus_resumed_by_callback.store(true, Ordering::Release);
@@ -192,7 +200,7 @@ fn a_committed_source_is_never_resumed() {
         MigrationPhase::Committed,
         GateState::None,
         &discard(),
-        resume_fn,
+        paused(resume_fn),
         || -> Result<(), &'static str> {
             panic!("a committed source must not resume its vCPUs")
         },
@@ -215,7 +223,7 @@ fn a_failure_in_finish_still_rolls_back() {
         MigrationPhase::Finish,
         GateState::None,
         &discard(),
-        resume_fn,
+        paused(resume_fn),
         || Ok::<(), &'static str>(()),
     );
     assert!(result.is_err());
@@ -326,7 +334,9 @@ fn a_destination_abort_rolls_the_source_back() {
         phase(&status),
         GateState::None,
         &discard(),
-        Box::new(move || by_callback.store(true, Ordering::Release)),
+        paused(Box::new(move || {
+            by_callback.store(true, Ordering::Release)
+        })),
         || Ok::<(), &'static str>(()),
     );
     assert!(rolled_back.load(Ordering::Acquire));
@@ -445,7 +455,7 @@ fn a_pre_pause_failure_does_not_resume_a_running_guest() {
         MigrationPhase::Sync,
         GateState::None,
         &discard(),
-        resume_fn,
+        paused(resume_fn),
         || Ok::<(), &'static str>(()),
     );
     assert!(result.is_err());
@@ -468,7 +478,9 @@ fn a_source_held_by_the_gate_is_never_resumed() {
             phase,
             GateState::Go,
             &discard(),
-            Box::new(move || by_callback.store(true, Ordering::Release)),
+            paused(Box::new(move || {
+                by_callback.store(true, Ordering::Release)
+            })),
             || -> Result<(), &'static str> {
                 panic!("a held source must not resume its vCPUs")
             },
@@ -487,7 +499,9 @@ fn an_aborted_gate_rolls_the_source_back() {
         MigrationPhase::Pause,
         GateState::Abort,
         &discard(),
-        Box::new(move || by_callback.store(true, Ordering::Release)),
+        paused(Box::new(move || {
+            by_callback.store(true, Ordering::Release)
+        })),
         || Ok::<(), &'static str>(()),
     );
     assert!(resumed.load(Ordering::Acquire));
@@ -769,13 +783,16 @@ fn a_page_dirty_at_the_commit_refuses_it() {
     const RAM: usize = 16 * PAGE_SIZE;
     let memctx = firmware_layout(RAM);
     let dirty = FakeDirty::default();
+    let owners = Owners::new(&memctx.guest_ram(), &[]);
     let mut track = |gpa, len, bm: &mut [u8]| dirty.track(gpa, len, bm);
-    check_clean(&mut track, &memctx).expect("nothing dirty");
+    check_clean(&mut track, &memctx, &owners).expect("nothing dirty");
 
     dirty.guest_write(&memctx, 5 * PAGE_SIZE as u64, 0x55);
     let mut track = |gpa, len, bm: &mut [u8]| dirty.track(gpa, len, bm);
-    let error = check_clean(&mut track, &memctx).expect_err("one page left");
+    let error =
+        check_clean(&mut track, &memctx, &owners).expect_err("one page left");
     assert!(error.to_string().contains("1 guest pages"), "{error}");
+    assert!(error.to_string().contains("0x5000 (RAM region 0"), "{error}");
 }
 
 #[test]
