@@ -111,6 +111,7 @@ pub(crate) fn create_pci_device(
                 &opts,
                 num_vcpus,
                 lintr,
+                false,
                 &actx,
                 ctx.log,
             )?;

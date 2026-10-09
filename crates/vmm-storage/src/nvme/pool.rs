@@ -53,7 +53,7 @@ impl WorkerPool {
         }))
     }
 
-    fn spawn(
+    pub(super) fn spawn(
         disk: Arc<DiskSync>,
         io: Arc<dyn IoBackend>,
         capacity: u64,

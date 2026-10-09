@@ -14,7 +14,7 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use vmm_core::mem::PhysMap;
-use vmm_devices::blkdev::DiskSync;
+use vmm_devices::blkdev::{BackingDisk, DiskSync};
 use vmm_devices::QuiesceGate;
 
 use super::access::BackendBarrier;
@@ -157,13 +157,11 @@ pub(super) fn needs_backend(rtype: u32) -> bool {
 /// cannot land on a descriptor the host has reopened.
 pub(super) fn blk_io_worker(
     rx: mpsc::Receiver<BlkIoRequest>,
-    disk: Arc<DiskSync>,
+    disk: Arc<BackingDisk>,
     limits: DiskLimits,
     ctx: WorkerCtx,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
-
-    let disk = &*disk;
 
     let mut bounce = Bounce::new();
     let mut done = Pass::new();
@@ -194,6 +192,11 @@ pub(super) fn blk_io_worker(
             },
         };
 
+        // `notify_queue` dispatches nothing before the store opens, and
+        // an open store stays open.
+        let Some(disk) = disk.get() else {
+            continue;
+        };
         run_batch(
             &rx,
             disk,

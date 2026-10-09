@@ -49,6 +49,12 @@ fn disk(file: File) -> Arc<DiskSync> {
     )
 }
 
+/// The store a worker serves, open from the start.
+fn worker_disk(disk: Arc<DiskSync>) -> Arc<BackingDisk> {
+    let log = slog::Logger::root(slog::Discard, slog::o!());
+    Arc::new(BackingDisk::from_disk(disk, false, &log).expect("an open disk"))
+}
+
 /// A worker context wired to `physmap`, with a fresh session.
 fn worker_ctx(physmap: &Arc<PhysMap>) -> WorkerCtx {
     worker_ctx_queues(physmap, 1)
@@ -91,7 +97,7 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         physmap: Arc::new(PhysMap::new()),
         interrupt: Arc::new(IntrSlot::new()),
         completions: Mutex::new(Vec::new()),
-        disk,
+        disk: worker_disk(disk),
         indicator: Indicator::new(),
         gate: Arc::new(QuiesceGate::new(1)),
         pause_grace: PauseGrace::DEFAULT,

@@ -481,7 +481,7 @@ fn a_worker_drops_requests_from_a_closed_session() {
         read_only: true,
         nodelete: true,
     };
-    thread::spawn(move || blk_io_worker(rx, file, limits, ctx))
+    thread::spawn(move || blk_io_worker(rx, worker_disk(file), limits, ctx))
         .join()
         .expect("the worker exits when the channel disconnects");
 
@@ -572,7 +572,7 @@ fn a_worker_batch_does_not_span_a_reset() {
         read_only: true,
         nodelete: true,
     };
-    thread::spawn(move || blk_io_worker(rx, file, limits, ctx))
+    thread::spawn(move || blk_io_worker(rx, worker_disk(file), limits, ctx))
         .join()
         .expect("the worker exits when the channel disconnects");
 
@@ -680,7 +680,7 @@ fn an_interrupt_is_raised_outside_the_guest_access_section() {
         read_only: false,
         nodelete: true,
     };
-    let worker = thread::spawn(move || blk_io_worker(rx, file, limits, ctx));
+    let worker = thread::spawn(move || blk_io_worker(rx, worker_disk(file), limits, ctx));
     wait_for("the worker never raised the interrupt", || {
         raising.load(Ordering::Acquire)
     });

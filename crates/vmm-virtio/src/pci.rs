@@ -820,6 +820,23 @@ impl<D: VirtioDevice + Lifecycle> Lifecycle for VirtioPciDevice<D> {
         Lifecycle::flush_backing(&self.device, intent)
     }
 
+    fn backing_attached(&self) -> bool {
+        Lifecycle::backing_attached(&self.device)
+    }
+
+    fn attach_backing(
+        &self,
+        how: &vmm_devices::lifecycle::BackingAttach,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        Lifecycle::attach_backing(&self.device, how)
+    }
+
+    fn detach_backing(
+        &self,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        Lifecycle::detach_backing(&self.device)
+    }
+
     fn post_restore_kick(&self) {
         // Re-inject interrupts on all enabled queues after vCPUs are
         // running. This ensures the guest's NAPI handler runs and

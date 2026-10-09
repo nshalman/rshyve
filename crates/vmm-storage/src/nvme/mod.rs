@@ -20,6 +20,7 @@ mod config;
 mod cq;
 mod inflight;
 mod io;
+mod late;
 mod locked;
 mod migrate;
 mod pool;
@@ -40,7 +41,7 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::PhysMap;
 use vmm_core::mmio::MmioBus;
 
-use vmm_devices::blkdev::DiskSync;
+use vmm_devices::blkdev::{BackingDisk, DiskSync};
 use vmm_devices::lifecycle::{
     BackingAttach, DeviceStateError, Indicator, NvmeMigrateBackend,
 };
@@ -201,6 +202,38 @@ impl NvmeController {
             disk as Arc<dyn IoBackend>,
             log.clone(),
         )?;
+        Self::with_backend(
+            backend,
+            NvmeConfig::default(),
+            read_only,
+            instance_id,
+            physmap,
+            hdl,
+            bus_mmio,
+            log,
+        )
+    }
+
+    /// A controller over a file or zvol. A `disk` that is not open yet,
+    /// on a migration destination, opens at
+    /// [`Lifecycle::attach_backing`] and holds no descriptor until then.
+    pub fn with_disk(
+        disk: BackingDisk,
+        instance_id: u8,
+        physmap: Arc<PhysMap>,
+        hdl: Arc<VmmHdl>,
+        bus_mmio: Arc<MmioBus>,
+        log: slog::Logger,
+    ) -> anyhow::Result<Arc<Self>> {
+        let read_only = disk.read_only();
+        let backend = match disk.get().cloned() {
+            Some(open) => WorkerPool::factory(
+                Arc::clone(&open),
+                open as Arc<dyn IoBackend>,
+                log.clone(),
+            )?,
+            None => late::LateFile::factory(disk, log.clone()),
+        };
         Self::with_backend(
             backend,
             NvmeConfig::default(),
