@@ -106,7 +106,7 @@ impl DiskSync {
         check_not_block(st_mode, read_only, None)?;
         let mode = if read_only {
             Mode::ReadOnly
-        } else if st_mode & libc::S_IFMT == libc::S_IFCHR {
+        } else if st_mode & ifmt::MASK == ifmt::CHR {
             Mode::Device(Device::open(ops, log)?)
         } else {
             Mode::Fsync
@@ -134,12 +134,27 @@ impl DiskSync {
 /// async writeback only for full MAXBSIZE blocks). spec_fsync drains
 /// that cache and tries the device flush but drops both errors, and
 /// after one ENOTSUP or ENOTTY it never flushes the node again.
+/// File-type bits, widened to the `u32` that `st_mode` arrives as.
+///
+/// `libc`'s `S_IF*` constants have type `mode_t`, which is 16-bit on some
+/// hosts (macOS) and 32-bit on others. Widen them once so no call site
+/// carries a cast that one host calls necessary and another redundant.
+#[allow(clippy::unnecessary_cast)]
+mod ifmt {
+    pub const MASK: u32 = libc::S_IFMT as u32;
+    pub const BLK: u32 = libc::S_IFBLK as u32;
+    #[cfg(any(target_os = "illumos", test))]
+    pub const CHR: u32 = libc::S_IFCHR as u32;
+    #[cfg(test)]
+    pub const REG: u32 = libc::S_IFREG as u32;
+}
+
 fn check_not_block(
     st_mode: u32,
     read_only: bool,
     path: Option<&Path>,
 ) -> io::Result<()> {
-    if read_only || st_mode & libc::S_IFMT != libc::S_IFBLK {
+    if read_only || st_mode & ifmt::MASK != ifmt::BLK {
         return Ok(());
     }
     // Raw lofi fails its flush probe too, so do not point at it.

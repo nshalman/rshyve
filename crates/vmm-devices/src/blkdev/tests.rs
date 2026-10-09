@@ -8,9 +8,9 @@ use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-const BLK: u32 = libc::S_IFBLK | 0o600;
-const CHR: u32 = libc::S_IFCHR | 0o600;
-const REG: u32 = libc::S_IFREG | 0o600;
+const BLK: u32 = ifmt::BLK | 0o600;
+const CHR: u32 = ifmt::CHR | 0o600;
+const REG: u32 = ifmt::REG | 0o600;
 
 /// Scripted ioctl results. Errnos are raw so a test reads like the
 /// driver's answer.
