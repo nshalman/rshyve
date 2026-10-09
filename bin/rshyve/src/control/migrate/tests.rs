@@ -499,3 +499,42 @@ fn a_source_stopped_while_it_connects_lets_go() {
         .expect("a stopped connect fails");
     assert!(error.contains(vmm_migrate::CANCELLED), "{error}");
 }
+
+struct PassthruStub;
+
+impl vmm_devices::pci::PciDevice for PassthruStub {
+    fn cfg_read(&self, _offset: u8, _len: u8) -> u32 {
+        0
+    }
+    fn cfg_write(&self, _offset: u8, _len: u8, _val: u32) {}
+    fn bar_rw(
+        &self,
+        _bar: vmm_devices::pci::BarN,
+        _offset: usize,
+        _rwo: vmm_core::common::RWOp<'_>,
+    ) {
+    }
+}
+
+#[test]
+fn a_passthru_device_blocks_migration() {
+    // passthru registers a PCI handle and no lifecycle, so no
+    // lifecycle blocker ever saw it.
+    let registry = vmm_machine::DeviceRegistry::new();
+    disk_at(&registry, "4", None, false);
+    registry
+        .insert(vmm_machine::RegisteredDevice::new(
+            "passthru@6",
+            vmm_machine::parse_bdf("6"),
+            Some(Arc::new(PassthruStub) as Arc<dyn vmm_devices::pci::PciDevice>),
+            None,
+            Some("6,passthru,/dev/ppt0".to_string()),
+        ))
+        .expect("insert passthru");
+
+    let reason = device_blockers(&registry).expect("passthru must block");
+    assert!(reason.contains("passthru@6"), "{reason}");
+    let dest = RunControl::new(VmRunState::Paused);
+    assert!(claim_dest(&dest, &registry).is_err());
+    assert_eq!(dest.get(), VmRunState::Paused);
+}
