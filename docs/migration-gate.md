@@ -50,6 +50,12 @@ connects to a Unix socket that the agent listens on. Two more flags:
 | `--migrate-ring-attach-timeout-ms` | Wait for each ring disk to attach after the commit. Default 120000 |
 | `--migrate-allow-unproven-engine` | Lab only. See "Engine check" |
 
+The shape is
+`ring-shape=1:<blocks>:<sector>:<queues>:<depth>:<buf_pages>:<tags>:<part_blocks>:<flags>`,
+with flags `d` (durable), `z` (zeroing), `dz` or `-`. Copy it as
+`migrate-config` gives it. The destination asks the engine for the same
+queues, depth and buffer, and refuses any other grant.
+
 `ring-shape=` is refused on a VM started without `--migrate-listen`.
 The control request `migrate-dest` refuses a VM with a ring disk: a VM
 that already runs attached its disks at boot, and the source still owns

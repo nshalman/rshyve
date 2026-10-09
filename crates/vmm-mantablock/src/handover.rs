@@ -40,6 +40,10 @@ pub struct RingShape {
     pub sector: u32,
     /// Queues granted.
     pub queues: u16,
+    /// Ring entries per queue granted.
+    pub depth: u32,
+    /// Pages of buffer area per queue granted.
+    pub buf_pages: u32,
     /// Requests one queue may have in flight.
     pub tags: u16,
     /// 4 KiB pages per buffer slot.
@@ -59,6 +63,8 @@ impl RingShape {
             blocks: att.volume_blocks,
             sector: att.sector_bytes,
             queues: u16::try_from(att.pipes.len()).unwrap_or(u16::MAX),
+            depth: att.region.geometry().depth(),
+            buf_pages: att.region.geometry().buf_pages(),
             tags: att.slots.tags,
             part_blocks: att.slots.part_blocks,
             durable: att.durable,
@@ -93,8 +99,8 @@ impl RingShape {
     }
 }
 
-/// `1:<blocks>:<sector>:<queues>:<tags>:<part_blocks>:<flags>`, where
-/// flags are `d` (durable) and `z` (zeroing), or `-` for neither.
+/// `1:<blocks>:<sector>:<queues>:<depth>:<buf_pages>:<tags>:<part_blocks>:<flags>`,
+/// where flags are `d` (durable) and `z` (zeroing), or `-` for neither.
 impl fmt::Display for RingShape {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut flags = String::new();
@@ -109,8 +115,14 @@ impl fmt::Display for RingShape {
         }
         write!(
             f,
-            "{SHAPE_V1}:{}:{}:{}:{}:{}:{flags}",
-            self.blocks, self.sector, self.queues, self.tags, self.part_blocks
+            "{SHAPE_V1}:{}:{}:{}:{}:{}:{}:{}:{flags}",
+            self.blocks,
+            self.sector,
+            self.queues,
+            self.depth,
+            self.buf_pages,
+            self.tags,
+            self.part_blocks
         )
     }
 }
@@ -123,8 +135,10 @@ impl FromStr for RingShape {
     fn from_str(s: &str) -> Result<Self, String> {
         let bad = |why: &str| format!("ring shape '{s}': {why}");
         let parts: Vec<&str> = s.split(':').collect();
-        let [v, blocks, sector, queues, tags, part, flags] = parts[..] else {
-            return Err(bad("needs 7 fields"));
+        let [v, blocks, sector, queues, depth, buf, tags, part, flags] =
+            parts[..]
+        else {
+            return Err(bad("needs 9 fields"));
         };
         if v != SHAPE_V1 {
             return Err(bad("unknown version"));
@@ -148,6 +162,14 @@ impl FromStr for RingShape {
             .ok()
             .filter(|q| (1..=MAX_GUEST_QUEUES).contains(q))
             .ok_or_else(|| bad("queues out of range"))?;
+        let depth = u32::try_from(num("depth", depth)?)
+            .ok()
+            .filter(|d| d.is_power_of_two() && *d <= 4096)
+            .ok_or_else(|| bad("depth is a power of 2 up to 4096"))?;
+        let buf_pages = u32::try_from(num("buffer pages", buf)?)
+            .ok()
+            .filter(|b| *b >= 1)
+            .ok_or_else(|| bad("buffer pages out of range"))?;
         let tags = u16::try_from(num("tags", tags)?)
             .ok()
             .filter(|t| *t >= 1)
@@ -167,6 +189,8 @@ impl FromStr for RingShape {
             blocks,
             sector,
             queues,
+            depth,
+            buf_pages,
             tags,
             part_blocks,
             durable,
@@ -210,10 +234,11 @@ impl<J: Job> Handover<J> {
         shape: RingShape,
         sink: Arc<dyn Sink<J::Id>>,
     ) -> Arc<Self> {
-        // Ask for what the source had, so an engine that granted it less
-        // there grants the same here.
+        // Ask for what the source was granted, so an engine that granted
+        // it less there grants the same here.
         cfg.queues = shape.queues;
-        cfg.depth = u32::from(shape.tags).next_power_of_two();
+        cfg.depth = shape.depth;
+        cfg.buf_pages = Some(shape.buf_pages);
         cfg.part_blocks = shape.part_blocks;
         Arc::new(Self {
             cfg,

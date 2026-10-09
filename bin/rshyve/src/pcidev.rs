@@ -716,7 +716,7 @@ mod tests {
             assert!(driver_specs(false, &raw).is_ok());
         }
         let shaped = vec![
-            "5,nvme,mantablock=/s,volume=x,ring-shape=1:256:4096:1:8:2:d"
+            "5,nvme,mantablock=/s,volume=x,ring-shape=1:256:4096:1:8:16:8:2:d"
                 .to_string(),
         ];
         assert!(driver_specs(true, &shaped).is_ok());
@@ -741,11 +741,11 @@ mod tests {
         assert!(error.to_string().contains(&none.volume.to_string()));
         assert_eq!(ring_shape(&none, false).expect("not a destination"), None);
 
-        let good = opts(Some("1:256:4096:1:8:2:d"));
+        let good = opts(Some("1:256:4096:1:8:16:8:2:d"));
         let shape = ring_shape(&good, true).expect("a shape").expect("some");
         // Elsewhere it would build a disk that never attaches.
         assert!(ring_shape(&good, false).is_err());
-        assert_eq!(shape.to_string(), "1:256:4096:1:8:2:d");
+        assert_eq!(shape.to_string(), "1:256:4096:1:8:16:8:2:d");
         assert!(ring_shape(&opts(Some("1:256")), true).is_err());
     }
 

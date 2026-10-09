@@ -86,14 +86,17 @@ fn connect(
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(Err(io::ErrorKind::TimedOut.into()));
         }
+        let slice = deadline.map_or(CANCEL_POLL, |d| {
+            CANCEL_POLL.min(d.saturating_duration_since(Instant::now()))
+        });
         match rustix::net::connect(&fd, addr) {
             Ok(()) | Err(Errno::ISCONN) => break,
             Err(Errno::INTR) => {}
             // Linux answers a full Unix backlog with EAGAIN and leaves
             // the socket unconnected, so the connect is simply retried.
-            Err(Errno::AGAIN) => thread::sleep(CANCEL_POLL),
+            Err(Errno::AGAIN) => thread::sleep(slice),
             Err(Errno::INPROGRESS | Errno::ALREADY) => {
-                if !writable(&fd, CANCEL_POLL) {
+                if !writable(&fd, slice) {
                     continue;
                 }
                 match rustix::net::sockopt::socket_error(&fd) {

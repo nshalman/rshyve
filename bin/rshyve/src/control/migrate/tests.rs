@@ -564,7 +564,7 @@ impl vmm_devices::Lifecycle for Unproven {
     }
 
     fn migration_spec_options(&self) -> Option<String> {
-        Some("ring-shape=1:256:4096:1:8:2:d".into())
+        Some("ring-shape=1:256:4096:1:8:16:8:2:d".into())
     }
 }
 
@@ -618,19 +618,19 @@ fn migrate_config_gives_a_ring_disk_its_shape_once() {
     let argv = [
         "4,nvme,/boot.img".to_string(),
         "5,nvme,mantablock=/s,volume=v,bootindex=1".to_string(),
-        "5,nvme,mantablock=/s,volume=v,ring-shape=1:9:512:1:1:1:-".to_string(),
+        "5,nvme,mantablock=/s,volume=v,ring-shape=1:9:512:1:1:1:1:1:-".to_string(),
     ];
     let slots = migrate_pci_slots(&argv, &registry);
     assert_eq!(slots[0], "4,nvme,/boot.img");
     assert_eq!(
         slots[1],
         "5,nvme,mantablock=/s,volume=v,bootindex=1,\
-         ring-shape=1:256:4096:1:8:2:d"
+         ring-shape=1:256:4096:1:8:16:8:2:d"
     );
     // A VM that was itself a destination: the old shape is replaced.
     assert_eq!(
         slots[2],
-        "5,nvme,mantablock=/s,volume=v,ring-shape=1:256:4096:1:8:2:d"
+        "5,nvme,mantablock=/s,volume=v,ring-shape=1:256:4096:1:8:16:8:2:d"
     );
 }
 

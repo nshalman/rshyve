@@ -53,6 +53,8 @@ fn shape() -> RingShape {
         blocks: BLOCKS,
         sector: 4096,
         queues: 1,
+        depth: DEPTH,
+        buf_pages: BUF_PAGES,
         tags: DEPTH as u16,
         part_blocks: MAX_BLOCKS,
         durable: true,
@@ -139,7 +141,7 @@ fn deferred(dir: &Path) -> (Arc<Handover<TJob>>, Arc<Calls>) {
 #[test]
 fn a_shape_reads_back_as_written_and_refuses_anything_else() {
     let s = shape();
-    assert_eq!(s.to_string(), "1:256:4096:1:8:2:d");
+    assert_eq!(s.to_string(), "1:256:4096:1:8:16:8:2:d");
     assert_eq!(s.to_string().parse::<RingShape>(), Ok(s));
     let both = RingShape {
         durable: true,
@@ -150,18 +152,20 @@ fn a_shape_reads_back_as_written_and_refuses_anything_else() {
     assert_eq!(both.to_string().parse::<RingShape>(), Ok(both));
     for bad in [
         "",
-        "2:256:4096:1:8:2:d",
-        "1:256:4096:1:8:2",
-        "1:256:4096:1:8:2:d:x",
-        "1:0:4096:1:8:2:d",
-        "1:256:1024:1:8:2:d",
-        "1:256:4096:0:8:2:d",
-        "1:256:4096:16:8:2:d",
-        "1:256:4096:1:0:2:d",
-        "1:256:4096:1:8:0:d",
-        "1:256:4096:1:8:2:zd",
-        "1:+256:4096:1:8:2:d",
-        "1:18446744073709551615:4096:1:8:2:d",
+        "2:256:4096:1:8:16:8:2:d",
+        "1:256:4096:1:8:16:8:2",
+        "1:256:4096:1:8:16:8:2:d:x",
+        "1:0:4096:1:8:16:8:2:d",
+        "1:256:1024:1:8:16:8:2:d",
+        "1:256:4096:0:8:16:8:2:d",
+        "1:256:4096:16:8:16:8:2:d",
+        "1:256:4096:1:6:16:8:2:d",
+        "1:256:4096:1:8:0:8:2:d",
+        "1:256:4096:1:8:16:0:2:d",
+        "1:256:4096:1:8:16:8:0:d",
+        "1:256:4096:1:8:16:8:2:zd",
+        "1:+256:4096:1:8:16:8:2:d",
+        "1:18446744073709551615:4096:1:8:16:8:2:d",
     ] {
         assert!(bad.parse::<RingShape>().is_err(), "took '{bad}'");
     }
@@ -195,8 +199,14 @@ fn a_destination_attaches_once_the_engine_opens_the_socket() {
     h.detach().expect("a confirmed Detach");
     let (ask, mut eng, detached) = engine.join().unwrap();
     assert!(detached);
-    // A fresh Attach, never a reattach of the source's generation.
+    // A fresh Attach, never a reattach of the source's generation, for
+    // what the source was granted.
     assert_eq!(ask.generation, 0);
+    assert_eq!(
+        (ask.queues, ask.depth, ask.buf_pages),
+        (1, DEPTH, BUF_PAGES)
+    );
+    assert_eq!(ask.max_blocks, MAX_BLOCKS);
     let got = eng.take(8);
     assert_eq!(got.len(), 1, "{got:?}");
     let _ = calls;

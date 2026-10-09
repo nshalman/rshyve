@@ -83,6 +83,9 @@ pub struct Config {
     /// 4 KiB pages per buffer slot to ask for. A request larger than a
     /// slot goes as several parts.
     pub part_blocks: u32,
+    /// Pages of buffer area per queue to ask for; `depth` times
+    /// `part_blocks` when `None`.
+    pub buf_pages: Option<u32>,
     /// How long a completion thread polls after its last completion
     /// before it sleeps. The next completion after a sleep waits for a
     /// pipe wake-up, about 15 µs, so this should cover one engine batch.
@@ -121,6 +124,7 @@ impl Config {
             queues: 4,
             depth: 64,
             part_blocks: 32,
+            buf_pages: None,
             spin: Duration::from_micros(50),
             allow_volatile: false,
             heartbeat: Duration::from_millis(100),
@@ -149,10 +153,13 @@ pub fn connect(cfg: Config) -> io::Result<Connected> {
         generation: 0,
         queues: cfg.queues.clamp(1, MAX_GUEST_QUEUES),
         depth: cfg.depth,
-        buf_pages: cfg
-            .depth
-            .checked_mul(cfg.part_blocks)
-            .ok_or_else(|| io::Error::other("depth times part size"))?,
+        buf_pages: match cfg.buf_pages {
+            Some(pages) => pages,
+            None => cfg
+                .depth
+                .checked_mul(cfg.part_blocks)
+                .ok_or_else(|| io::Error::other("depth times part size"))?,
+        },
         max_blocks: cfg.part_blocks,
         allow_volatile: cfg.allow_volatile,
     };
