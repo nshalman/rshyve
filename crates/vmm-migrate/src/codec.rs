@@ -173,6 +173,10 @@ pub struct VcpuStatePayload {
     /// SIPI vector (for APs in INIT/SIPI wait)
     #[serde(default)]
     pub sipi_vector: u8,
+    /// VDC_PMU_AMD data. Only an AMD source whose kernel has the class
+    /// sends it.
+    #[serde(default)]
+    pub pmu_amd: Option<Vec<u8>>,
 }
 
 fn default_run_state() -> u32 {

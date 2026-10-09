@@ -47,7 +47,8 @@ use crate::pages::{
     are_contiguous, build_contiguous_gpas, page_buffer_len, read_pages,
 };
 use crate::protocol::{
-    protocol_blocker, PageIter, PAGE_SIZE, PROTOCOL_RON_V6, SOURCE_OFFER,
+    protocol_blocker, PageIter, PAGE_SIZE, PROTOCOL_RON, PROTOCOL_RON_V6,
+    SOURCE_OFFER,
 };
 use crate::record_failure;
 use crate::state;
@@ -332,6 +333,15 @@ fn run_inner<S: Transport>(
         )));
     }
 
+    let current_peer = sel.protocol == PROTOCOL_RON;
+    if !current_peer && state::carries_pmu_amd(hdl)? {
+        return Err(MigrateError::ProtocolMismatch(format!(
+            "the destination speaks {}, which cannot carry the AMD PMU \
+             state; both ends need {PROTOCOL_RON}",
+            crate::wire::peer_text(&sel.protocol)
+        )));
+    }
+
     let mut devices = config.devices.clone();
     devices.sort();
     let mut platform = config.platform.clone();
@@ -423,8 +433,13 @@ fn run_inner<S: Transport>(
 
     // ── DeviceState ──
     set_phase(status, MigrationPhase::DeviceState);
-    let mut dev_state =
-        state::export_device_state(hdl, config.num_cpus, &xsave, log)?;
+    let mut dev_state = state::export_device_state(
+        hdl,
+        config.num_cpus,
+        &xsave,
+        current_peer,
+        log,
+    )?;
     dev_state.emulated = device_export_fn()
         .map_err(|e| MigrateError::State(format!("device export: {e}")))?;
     dev_state.platform = platform_export_fn()

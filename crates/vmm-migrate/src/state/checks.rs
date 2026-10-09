@@ -9,7 +9,7 @@
 
 use bhyve_api::{
     vdi_field_entry_v1, vdi_version_entry_v1, vm_reg_name, VDC_LAPIC, VDC_MSR,
-    VDC_VERSION,
+    VDC_PMU_AMD, VDC_VERSION,
 };
 use std::mem::size_of;
 use vmm_core::hdl::VmmHdl;
@@ -241,6 +241,7 @@ pub(super) fn check_device_state(
     state: &DeviceState,
     layouts: &[vdi_version_entry_v1],
     num_cpus: u32,
+    amd_host: bool,
 ) -> Result<(), MigrateError> {
     // One payload per vCPU, no more and no fewer. The kernel accepts
     // any id below VM_MAXCPU, so a payload for a vCPU this VM never
@@ -288,12 +289,38 @@ pub(super) fn check_device_state(
             1,
             vcpu.lapic.len(),
         )?;
+        if let Some(pmu) = &vcpu.pmu_amd {
+            // Only SVM keeps the state behind this class, though every
+            // v18 kernel lists it.
+            if !amd_host {
+                return Err(MigrateError::State(format!(
+                    "vcpu {id}: payload carries AMD PMU state, and this \
+                     host is not AMD"
+                )));
+            }
+            check_class_blob(
+                layouts,
+                &format!("vcpu {id} PMU_AMD"),
+                VDC_PMU_AMD,
+                1,
+                pmu.len(),
+            )?;
+        }
         if vcpu.registers.is_empty() {
             return Err(MigrateError::State(format!(
                 "vcpu {id}: register state is missing from the payload"
             )));
         }
         parse_vcpu_regs(id, &vcpu.registers)?;
+    }
+
+    // A source carries it for every vCPU or for none.
+    let with_pmu = state.vcpus.iter().filter(|v| v.pmu_amd.is_some()).count();
+    if with_pmu != 0 && with_pmu != state.vcpus.len() {
+        return Err(MigrateError::State(format!(
+            "payload carries AMD PMU state for {with_pmu} of {} vCPUs",
+            state.vcpus.len()
+        )));
     }
 
     let mut seen_class = std::collections::HashSet::new();
@@ -357,6 +384,9 @@ pub(crate) mod fixtures {
 
     pub(crate) const TEST_DEV_LEN: usize = 8;
 
+    pub(crate) const PMU_AMD_LEN: usize =
+        size_of::<bhyve_api::vdi_pmu_amd_v1>();
+
     /// An FXSAVE-only host: the legacy region and the XSAVE header.
     pub(crate) const TEST_XSAVE_LEN: usize = 576;
 
@@ -384,6 +414,7 @@ pub(crate) mod fixtures {
             entry(bhyve_api::VDC_VMM_ARCH, 1, 0, item),
             entry(VDC_LAPIC, 1, lapic_len, 0),
             entry(VDC_VMM_TIME, 1, 0, 0),
+            entry(VDC_PMU_AMD, 1, PMU_AMD_LEN as u16, 0),
         ];
         for &(_, class, version) in SYSTEM_DEVICES {
             out.push(entry(class, version, TEST_DEV_LEN as u16, 0));
@@ -433,6 +464,7 @@ pub(crate) mod fixtures {
             vmm_arch: field_entries(2),
             run_state: bhyve_api::VRS_RUN,
             sipi_vector: 0,
+            pmu_amd: None,
         }
     }
 

@@ -11,7 +11,8 @@
 
 use bhyve_api::{
     vdi_field_entry_v1, vdi_version_entry_v1, vm_reg_name, VDC_ATPIC,
-    VDC_ATPIT, VDC_HPET, VDC_IOAPIC, VDC_LAPIC, VDC_MSR, VDC_PM_TIMER, VDC_RTC,
+    VDC_ATPIT, VDC_HPET, VDC_IOAPIC, VDC_LAPIC, VDC_MSR, VDC_PMU_AMD,
+    VDC_PM_TIMER, VDC_RTC,
 };
 use slog;
 use std::mem::size_of;
@@ -68,6 +69,11 @@ const VCPU_REGS: &[vm_reg_name] = &[
     vm_reg_name::VM_REG_GUEST_CR2,
     vm_reg_name::VM_REG_GUEST_CR4,
     vm_reg_name::VM_REG_GUEST_DR7,
+    vm_reg_name::VM_REG_GUEST_DR0,
+    vm_reg_name::VM_REG_GUEST_DR1,
+    vm_reg_name::VM_REG_GUEST_DR2,
+    vm_reg_name::VM_REG_GUEST_DR3,
+    vm_reg_name::VM_REG_GUEST_DR6,
     vm_reg_name::VM_REG_GUEST_EFER,
     vm_reg_name::VM_REG_GUEST_XCR0,
     vm_reg_name::VM_REG_GUEST_CS,
@@ -97,12 +103,21 @@ const VCPU_SEG_DESCS: &[vm_reg_name] = &[
 
 /// Export all registers for a vCPU as (reg_id, value) pairs,
 /// plus segment descriptors as (reg_id, base, limit, access) tuples.
-fn export_vcpu_regs(vcpu: &Vcpu) -> Result<Vec<u8>, MigrateError> {
-    let mut data =
-        Vec::with_capacity(VCPU_REGS.len() * 12 + VCPU_SEG_DESCS.len() * 20);
+///
+/// The interrupt shadow goes last, and only to a current peer: an older
+/// one writes every register it reads and fails on a shadow the kernel
+/// cannot set.
+fn export_vcpu_regs(
+    vcpu: &Vcpu,
+    intr_shadow: bool,
+) -> Result<Vec<u8>, MigrateError> {
+    let mut data = Vec::with_capacity(
+        (VCPU_REGS.len() + 1) * 12 + VCPU_SEG_DESCS.len() * 20,
+    );
+    let shadow = intr_shadow.then_some(vm_reg_name::VM_REG_GUEST_INTR_SHADOW);
 
     // General registers: 4 bytes id + 8 bytes value = 12 bytes each
-    for &reg in VCPU_REGS {
+    for &reg in VCPU_REGS.iter().chain(shadow.iter()) {
         let val = vcpu.get_reg(reg).map_err(|e| {
             MigrateError::VmmData(format!("get_reg {:?}: {e}", reg))
         })?;
@@ -321,15 +336,17 @@ pub fn export_device_state(
     hdl: &Arc<VmmHdl>,
     num_cpus: u32,
     xsave: &XsaveLayout,
+    current_peer: bool,
     log: &slog::Logger,
 ) -> Result<DeviceState, MigrateError> {
+    let pmu_amd = current_peer && carries_pmu_amd(hdl)?;
     // Export per-vCPU state using individual register reads
     let mut vcpus = Vec::with_capacity(num_cpus as usize);
     for vcpuid in 0..num_cpus as i32 {
         let vcpu = Vcpu::new_for_thread(vcpuid, Arc::clone(hdl));
 
         // Registers via get_reg (reliable, avoids vmm-data field format issues)
-        let registers = export_vcpu_regs(&vcpu)?;
+        let registers = export_vcpu_regs(&vcpu, current_peer)?;
 
         // Every class below is required. A snapshot that silently
         // drops one resumes the guest with default state for it.
@@ -341,6 +358,10 @@ pub fn export_device_state(
             vcpuid,
             "VMM_ARCH",
         )?;
+
+        let pmu_amd = pmu_amd
+            .then(|| read_class_vcpu(hdl, VDC_PMU_AMD, 1, vcpuid))
+            .transpose()?;
 
         let fpu = vcpu.get_fpu(xsave.size()).map_err(|e| {
             MigrateError::VmmData(format!("get FPU vcpu={vcpuid}: {e}"))
@@ -368,6 +389,7 @@ pub fn export_device_state(
             vmm_arch,
             run_state,
             sipi_vector,
+            pmu_amd,
         });
     }
 
@@ -395,6 +417,19 @@ pub fn export_device_state(
     })
 }
 
+/// Whether this host's vCPUs have an AMD PMU state to carry.
+///
+/// The class is in every kernel's table from v18 on, Intel hosts
+/// included, but only SVM keeps the state behind it.
+pub fn carries_pmu_amd(hdl: &VmmHdl) -> Result<bool, MigrateError> {
+    if !crate::cpu::host_is_amd() {
+        return Ok(false);
+    }
+    Ok(read_class_layouts(hdl)?
+        .iter()
+        .any(|e| e.vve_class == VDC_PMU_AMD && e.vve_version == 1))
+}
+
 /// Import all kernel device state (per-vCPU + system devices).
 ///
 /// Time data must already be imported. The VM must be paused.
@@ -412,6 +447,7 @@ pub fn import_device_state(
         state,
         num_cpus,
         xsave,
+        crate::cpu::host_is_amd(),
         log,
     )
 }
@@ -426,9 +462,10 @@ fn import_device_state_into(
     state: &DeviceState,
     num_cpus: u32,
     xsave: &XsavePlan<'_>,
+    amd_host: bool,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
-    check_device_state(state, layouts, num_cpus)?;
+    check_device_state(state, layouts, num_cpus, amd_host)?;
     let fpu: Vec<Vec<u8>> = state
         .vcpus
         .iter()
@@ -455,8 +492,24 @@ fn import_device_state_into(
         let id = vcpu.vcpuid;
         sink.write_class(VDC_MSR, 1, Some(id), &vcpu.msrs)?;
         sink.write_class(VDC_LAPIC, 1, Some(id), &vcpu.lapic)?;
+        if let Some(pmu) = &vcpu.pmu_amd {
+            sink.write_class(VDC_PMU_AMD, 1, Some(id), pmu)?;
+        }
         for write in parse_vcpu_regs(id, &vcpu.registers)? {
-            sink.write_reg(id, write)?;
+            match write {
+                // VMX refuses to force a shadow on. The guest may then
+                // take an interrupt one instruction early, which beats
+                // failing a migration after the gate's go.
+                RegWrite::Reg(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, v)
+                    if v != 0 =>
+                {
+                    if let Err(e) = sink.write_reg(id, write) {
+                        slog::warn!(log, "the interrupt shadow was not \
+                            restored"; "vcpu" => id, "error" => %e);
+                    }
+                }
+                _ => sink.write_reg(id, write)?,
+            }
         }
         sink.set_fpu(id, fpu)?;
         // VRS_HALT is 0, so a halted vCPU must be restored too.
@@ -486,6 +539,8 @@ mod tests {
         regs: RefCell<Vec<(i32, String)>>,
         run_states: RefCell<Vec<(i32, u32, u8)>>,
         fpus: RefCell<Vec<(i32, usize)>>,
+        /// Answer a forced interrupt shadow the way VMX does.
+        vmx: bool,
     }
 
     impl RecordingSink {
@@ -526,6 +581,15 @@ mod tests {
             vcpuid: i32,
             write: RegWrite,
         ) -> Result<(), MigrateError> {
+            if self.vmx
+                && matches!(
+                    write,
+                    RegWrite::Reg(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, v)
+                        if v != 0
+                )
+            {
+                return Err(MigrateError::State("EINVAL".into()));
+            }
             self.regs.borrow_mut().push((vcpuid, format!("{write:?}")));
             Ok(())
         }
@@ -582,6 +646,7 @@ mod tests {
             state,
             num_cpus,
             &plan(&xsave),
+            false,
             &test_log(),
         );
         (sink, result)
@@ -600,9 +665,110 @@ mod tests {
             state,
             num_cpus,
             &plan(&xsave),
+            false,
             &test_log(),
         );
         (sink, result)
+    }
+
+    fn import_on(
+        sink: RecordingSink,
+        state: &DeviceState,
+        amd_host: bool,
+    ) -> (RecordingSink, Result<(), MigrateError>) {
+        let xsave = test_xsave();
+        let result = import_device_state_into(
+            &sink,
+            &kernel_layouts(),
+            state,
+            state.vcpus.len() as u32,
+            &plan(&xsave),
+            amd_host,
+            &test_log(),
+        );
+        (sink, result)
+    }
+
+    #[test]
+    fn the_debug_registers_and_the_shadow_are_carried() {
+        for reg in [
+            vm_reg_name::VM_REG_GUEST_DR0,
+            vm_reg_name::VM_REG_GUEST_DR1,
+            vm_reg_name::VM_REG_GUEST_DR2,
+            vm_reg_name::VM_REG_GUEST_DR3,
+            vm_reg_name::VM_REG_GUEST_DR6,
+            vm_reg_name::VM_REG_GUEST_DR7,
+        ] {
+            assert!(
+                VCPU_REGS.iter().any(|&r| r as i32 == reg as i32),
+                "{reg:?}"
+            );
+        }
+        // Sent apart, and last, so an older peer never sees it.
+        let shadow = vm_reg_name::VM_REG_GUEST_INTR_SHADOW as i32;
+        assert!(!VCPU_REGS.iter().any(|&r| r as i32 == shadow));
+    }
+
+    #[test]
+    fn a_shadow_vmx_cannot_force_does_not_fail_the_import() {
+        let mut state = good_state();
+        state.vcpus[0].registers = reg_blob(
+            &[
+                (vm_reg_name::VM_REG_GUEST_RAX, 1),
+                (vm_reg_name::VM_REG_GUEST_INTR_SHADOW, 1),
+            ],
+            &[],
+        );
+        let sink = RecordingSink {
+            vmx: true,
+            ..RecordingSink::default()
+        };
+        let (sink, result) = import_on(sink, &state, false);
+        result.expect("a lost shadow is a warning");
+        assert_eq!(sink.regs.borrow().len(), 1, "RAX still written");
+        assert!(sink.wrote_class(bhyve_api::VDC_VMM_ARCH, Some(0)));
+
+        // Clearing it is always taken.
+        state.vcpus[0].registers =
+            reg_blob(&[(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, 0)], &[]);
+        let sink = RecordingSink {
+            vmx: true,
+            ..RecordingSink::default()
+        };
+        let (sink, result) = import_on(sink, &state, false);
+        result.expect("cleared");
+        assert_eq!(sink.regs.borrow().len(), 1);
+    }
+
+    #[test]
+    fn amd_pmu_state_goes_only_to_an_amd_host() {
+        let mut state = good_state();
+        state.vcpus[0].pmu_amd = Some(vec![0u8; PMU_AMD_LEN]);
+
+        let (sink, result) = import_on(RecordingSink::default(), &state, true);
+        result.expect("AMD to AMD");
+        assert!(sink.wrote_class(VDC_PMU_AMD, Some(0)));
+
+        let (sink, result) = import_on(RecordingSink::default(), &state, false);
+        let error = result.map(|_| ()).expect_err("AMD state on Intel");
+        assert!(error.to_string().contains("not AMD"), "{error}");
+        assert!(sink.applied_nothing());
+
+        state.vcpus[0].pmu_amd = Some(vec![0u8; PMU_AMD_LEN - 1]);
+        let (sink, result) = import_on(RecordingSink::default(), &state, true);
+        result.map(|_| ()).expect_err("short PMU blob");
+        assert!(sink.applied_nothing());
+    }
+
+    #[test]
+    fn amd_pmu_state_is_for_every_vcpu_or_none() {
+        let mut state = good_state();
+        state.vcpus.push(vcpu_payload(1));
+        state.vcpus[1].pmu_amd = Some(vec![0u8; PMU_AMD_LEN]);
+        let (sink, result) = import_on(RecordingSink::default(), &state, true);
+        let error = result.map(|_| ()).expect_err("one of two");
+        assert!(error.to_string().contains("1 of 2"), "{error}");
+        assert!(sink.applied_nothing());
     }
 
     #[test]
