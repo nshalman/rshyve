@@ -158,10 +158,17 @@ fn run_inner<S: Transport>(
 
     let preamble: MigrationPreamble = chan.expect_serialized()?;
     let checked = XsaveLayout::local(hdl).and_then(|local| {
-        check_preamble(&preamble, config, &local, log).map(|()| local)
+        check_preamble(&preamble, config, &local, log)?;
+        let skew = check_clock(&preamble, protocol, log)?;
+        Ok((local, skew))
     });
     let local_xsave = match checked {
-        Ok(local) => local,
+        Ok((local, skew)) => {
+            if let Ok(mut s) = status.lock() {
+                s.clock_skew_ms = skew;
+            }
+            local
+        }
         Err(err) => {
             chan.report_failure(&err, log);
             return Err(err);
@@ -307,6 +314,34 @@ fn check_preamble(
          send migrate-dest with allow_cpu_feature_mismatch to accept \
          the risk",
     )))
+}
+
+/// The skew between the two hosts' clocks, or `None` from a source too
+/// old to send its clock.
+fn check_clock(
+    preamble: &MigrationPreamble,
+    protocol: &str,
+    log: &slog::Logger,
+) -> Result<Option<i64>, MigrateError> {
+    match preamble.wall_clock_ns {
+        Some(source) => {
+            crate::clock::check_skew(source, crate::clock::now_ns()?, log)
+                .map(Some)
+        }
+        None if protocol::at_least(protocol, protocol::PROTOCOL_RON) => {
+            Err(MigrateError::PreambleMismatch(
+                "the source sent no wall clock".into(),
+            ))
+        }
+        None => {
+            slog::warn!(
+                log,
+                "the source is too old to send its clock; \
+                the host clock skew is unknown"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// The XSAVE components the guest can use are the ones its source
@@ -549,6 +584,49 @@ mod tests {
             },
             kind: kind.to_string(),
         }
+    }
+
+    fn preamble(wall_clock_ns: Option<u64>) -> MigrationPreamble {
+        MigrationPreamble {
+            num_cpus: 1,
+            mem_size: 4096,
+            devices: Vec::new(),
+            platform: Vec::new(),
+            cpu_features: None,
+            xsave: XsaveLayout {
+                size: 576,
+                components: Vec::new(),
+            },
+            wall_clock_ns,
+        }
+    }
+
+    fn log() -> slog::Logger {
+        slog::Logger::root(slog::Discard, slog::o!())
+    }
+
+    #[test]
+    fn a_current_source_must_send_its_clock() {
+        let now = crate::clock::now_ns().expect("clock");
+        let skew =
+            check_clock(&preamble(Some(now)), protocol::PROTOCOL_RON, &log())
+                .expect("synced");
+        assert!(skew.is_some_and(|ms| ms.abs() < 1_000), "{skew:?}");
+
+        check_clock(&preamble(None), protocol::PROTOCOL_RON, &log())
+            .expect_err("no clock from a v10 source");
+        let old =
+            check_clock(&preamble(None), protocol::PROTOCOL_RON_V9, &log())
+                .expect("a v9 source has none");
+        assert_eq!(old, None);
+
+        let hour_behind = now - 3_600 * 1_000_000_000;
+        check_clock(
+            &preamble(Some(hour_behind)),
+            protocol::PROTOCOL_RON,
+            &log(),
+        )
+        .expect_err("an hour of skew");
     }
 
     #[test]

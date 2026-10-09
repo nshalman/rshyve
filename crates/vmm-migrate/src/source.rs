@@ -356,6 +356,7 @@ fn run_inner<S: Transport>(
             platform,
             cpu_features: Some(cpu::local_features(config.cpu_baseline)),
             xsave: xsave.clone(),
+            wall_clock_ns: Some(crate::clock::now_ns()?),
         })?,
     )?;
     chan.expect_okay()?;

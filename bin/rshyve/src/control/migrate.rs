@@ -932,6 +932,9 @@ pub(super) fn migrate_status(ctrl: &Arc<VmController>) -> Response {
             if let Some(why) = &s.error {
                 data["migrate_error"] = why.clone().into();
             }
+            if let Some(skew) = s.clock_skew_ms {
+                data["migrate_clock_skew_ms"] = skew.into();
+            }
             if let Some(rings) = ctrl.rings_state() {
                 data["migrate_rings"] = rings.into();
             }

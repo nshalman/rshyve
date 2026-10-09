@@ -458,6 +458,10 @@ pub struct MigrationPreamble {
     pub cpu_features: Option<CpuFeatures>,
     /// The source host's XSAVE area, which every vCPU's `fpu` follows.
     pub xsave: crate::xsave::XsaveLayout,
+    /// The source host's wall clock when it sent this, in ns since the
+    /// epoch. `None` from a v9 or older source. See [`crate::clock`].
+    #[serde(default)]
+    pub wall_clock_ns: Option<u64>,
 }
 
 /// CPU feature summary for migration compatibility checking.
@@ -647,6 +651,7 @@ mod tests {
                 size: 576,
                 components: Vec::new(),
             },
+            wall_clock_ns: Some(1_700_000_000_000_000_000),
         };
         let msg = Message::serialized(&preamble).unwrap();
         match roundtrip(&msg) {
@@ -657,6 +662,10 @@ mod tests {
                 assert_eq!(decoded.mem_size, 1024 * 1024 * 1024);
                 assert_eq!(decoded.devices, devices);
                 assert_eq!(decoded.platform, platform);
+                assert_eq!(
+                    decoded.wall_clock_ns,
+                    Some(1_700_000_000_000_000_000)
+                );
             }
             other => panic!("expected Serialized, got {other:?}"),
         }

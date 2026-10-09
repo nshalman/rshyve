@@ -73,6 +73,11 @@ fn adjust_time(
         .ok_or_else(|| bad("destination wall clock overflows"))?;
     // A source clock ahead of ours gives a negative delta, which is a
     // clock skew and not a migration that took negative time.
+    if dst_wc_ns < src_wc_ns {
+        slog::warn!(log, "the source clock is ahead of ours; the guest \
+            clock does not count the pause";
+            "ahead_ms" => (src_wc_ns - dst_wc_ns) / 1_000_000);
+    }
     let migrate_delta_ns = (dst_wc_ns - src_wc_ns).max(0);
     // A switchover takes seconds. A delta beyond the bound means the
     // two clocks disagree, or the peer made the number up; either way
