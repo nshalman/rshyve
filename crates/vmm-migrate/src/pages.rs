@@ -87,6 +87,16 @@ pub fn apply_page_batch(
         }
     };
 
+    // A page outside guest RAM is the source's mistake, so it is a
+    // protocol error and nothing of the batch is written.
+    let ram = memctx.guest_ram();
+    if let Some(&gpa) = gpas.iter().find(|&&gpa| !in_ram(&ram, gpa)) {
+        return Err(MigrateError::Codec(format!(
+            "protocol violation: page gpa={gpa:#x} is not a page of guest \
+             RAM",
+        )));
+    }
+
     // Preflight every destination before the first guest-memory mutation.
     // A zero-length SubMapping write checks protection without changing RAM.
     for &gpa in gpas {
@@ -112,6 +122,20 @@ pub fn apply_page_batch(
     }
 
     Ok(())
+}
+
+/// Whether `gpa` starts a page that lies whole in one of the `ram`
+/// ranges. An unaligned page would shift every byte of it.
+fn in_ram(ram: &[(u64, usize)], gpa: u64) -> bool {
+    if !gpa.is_multiple_of(PAGE_SIZE as u64) {
+        return false;
+    }
+    ram.iter().any(|&(base, len)| {
+        gpa >= base
+            && gpa
+                .checked_add(PAGE_SIZE as u64)
+                .is_some_and(|end| end <= base + len as u64)
+    })
 }
 
 pub fn read_pages(
@@ -178,4 +202,71 @@ pub(crate) fn are_contiguous(gpas: &[u64]) -> bool {
             .and_then(|offset| base_gpa.checked_add(offset))
             == Some(gpa)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vmm_core::mem::{PhysMap, RegionKind};
+
+    fn status() -> Arc<Mutex<MigrationStatus>> {
+        Arc::new(Mutex::new(MigrationStatus::default()))
+    }
+
+    #[test]
+    fn a_page_outside_guest_ram_is_a_protocol_error() {
+        // Mapped here on purpose: even then it is not guest RAM.
+        let map = PhysMap::new();
+        map.add_region_anon(0, 4 * PAGE_SIZE, RegionKind::Ram)
+            .expect("RAM");
+        map.add_region_anon(0xFCC0_0000, PAGE_SIZE, RegionKind::Ram)
+            .expect("scratch RAM");
+        let memctx = MemCtx::new(Arc::new(map));
+        let page = vec![0xAAu8; PAGE_SIZE];
+
+        let error = apply_page_batch(
+            &memctx,
+            0xFCC0_0000,
+            1,
+            0,
+            &page,
+            None,
+            &status(),
+        )
+        .expect_err("outside guest RAM");
+        assert!(matches!(error, MigrateError::Codec(_)), "{error}");
+        assert!(error.to_string().contains("0xfcc00000"), "{error}");
+
+        // A sparse batch with one bad page writes none of them.
+        let mut two = page.clone();
+        two.extend_from_slice(&page);
+        let gpas = [0, 0xFCC0_0000];
+        apply_page_batch(&memctx, 0, 2, 0, &two, Some(&gpas), &status())
+            .expect_err("one page outside guest RAM");
+        let mut first = vec![0u8; PAGE_SIZE];
+        memctx.read(0, &mut first).expect("read");
+        assert!(first.iter().all(|&b| b == 0));
+
+        apply_page_batch(
+            &memctx,
+            PAGE_SIZE as u64,
+            1,
+            0,
+            &page,
+            None,
+            &status(),
+        )
+        .expect("guest RAM takes the page");
+    }
+
+    #[test]
+    fn a_page_across_the_end_of_ram_is_refused() {
+        let ram = [(0x1000u64, 2 * PAGE_SIZE)];
+        assert!(in_ram(&ram, 0x1000));
+        assert!(in_ram(&ram, 0x2000));
+        assert!(!in_ram(&ram, 0x3000));
+        assert!(!in_ram(&ram, 0x0));
+        assert!(!in_ram(&ram, u64::MAX - 10));
+        assert!(!in_ram(&ram, 0x1001), "unaligned");
+    }
 }

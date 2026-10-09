@@ -650,6 +650,25 @@ impl PhysMap {
             .collect()
     }
 
+    /// The RAM a live migration moves, as `(gpa, len)`.
+    ///
+    /// The firmware scratch RAM in the 32-bit hole is left out. Only the
+    /// boot firmware uses it, and a migration destination does not load
+    /// the boot ROM, so it has no mapping there. Guest RAM is never in
+    /// the hole: the boot split stops below it and a run-time claim
+    /// refuses it.
+    pub fn guest_ram(&self) -> Vec<(u64, usize)> {
+        self.read_space()
+            .regions
+            .iter()
+            .filter(|r| {
+                r.kind == RegionKind::Ram
+                    && !(r.gpa < MMIO_HOLE_END && r.end() > MMIO_HOLE_BASE)
+            })
+            .map(|r| (r.gpa, r.len))
+            .collect()
+    }
+
     /// Total mapped memory in bytes (excluding MMIO reservations).
     pub fn total_memory(&self) -> usize {
         self.read_space()
