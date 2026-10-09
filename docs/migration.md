@@ -306,6 +306,11 @@ list has no DEBUGCTL, and no register gives it, so it is not carried
 VMM_ARCH carries the pending NMI, ExtINT, exception and interrupt
 info. It is written last, after the run state.
 
+The destination wants every register exactly once: the whole list from
+a v10 source, and the list without DR0 to DR3, DR6 and the shadow from
+a v9 one. A register left out would resume at the destination's reset
+value.
+
 From v10, the interrupt shadow goes too. VMX cannot force a shadow on
 (`vmx_setreg` answers EINVAL), so the destination logs a warning and
 goes on: the guest may take an interrupt one instruction early. That
@@ -350,6 +355,11 @@ that counter is monotonic.
 A payload carrying enlightenment state for a VM started without
 `--hyperv` is refused, and so is a payload without it for a VM started
 with `--hyperv`.
+
+A source that rolls back puts both overlay pages back from the MSR
+values. A destination that takes a new `migrate-dest` after a failed
+import drops the overlays of that import first, so the new RAM passes
+land in the guest's own pages.
 
 Every device on the wire must have exactly one entry, and the state in
 it must be of the device's own kind. An entry with no state is taken
@@ -405,10 +415,12 @@ kernel support and cannot drift.
 A page the source cannot read, or the destination cannot write, fails
 the migration. Nothing is sent or skipped in its place.
 
-Before it commits, the source reads the dirty bitmap once more. Every
-writer stopped before the final pass, so a dirty page there is a write
-the destination never got, and the source refuses the commit and rolls
-back.
+After the device export, the source reads the dirty bitmap once more.
+Every writer stopped before the final pass, so a dirty page there is a
+write the destination never got. The source then sends an error in
+place of the end of the RAM phase and rolls back. The check comes
+before the destination says it holds everything, so the destination
+fails cleanly and is not left in doubt.
 
 ## What migration does not carry
 
