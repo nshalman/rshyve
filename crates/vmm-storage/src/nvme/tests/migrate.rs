@@ -76,6 +76,7 @@ fn good_payload() -> NvmeMigrateState {
         msix: Default::default(),
         namespace: None,
         backend: None,
+        aers_held: 0,
     }
 }
 
@@ -678,4 +679,55 @@ fn a_refused_msix_table_changes_nothing() {
     assert_eq!(st.cc, 0, "the controller registers were applied");
     assert!(st.admin_sq.is_none(), "the admin queue was applied");
     assert!(!st.admission.paused, "admission was paused");
+}
+
+fn async_event_request() -> Sqe {
+    Sqe {
+        opcode: ADMIN_OPC_ASYNC_EVENT_REQUEST,
+        ..Sqe::default()
+    }
+}
+
+/// A destination that forgot the held AERs would take one more than
+/// AERL lets the guest send.
+#[test]
+fn held_async_event_requests_cross_a_migration() {
+    let mut src = Harness::new();
+    src.enable();
+    for _ in 0..=AER_LIMIT {
+        src.submit_admin(async_event_request());
+    }
+    src.ctrl.pause();
+    let state = export(&src);
+    assert_eq!(nvme(state.clone()).aers_held, AER_LIMIT + 1);
+
+    let mut dst = Harness::new();
+    dst.ctrl.restore_migrate_state(&state).expect("restore");
+    dst.ctrl.resume();
+    dst.admin_tail = src.admin_tail;
+    dst.admin_cq_head = src.admin_cq_head;
+    dst.admin_phase = src.admin_phase;
+    dst.next_cid = src.next_cid;
+    let cqe = dst.admin(async_event_request());
+    assert_eq!(cqe.status(), Status::of(SC_AER_LIMIT_EXCEEDED));
+}
+
+#[test]
+fn more_held_aers_than_the_limit_are_refused() {
+    let mut payload = good_payload();
+    payload.aers_held = AER_LIMIT + 1;
+    check_nvme_state(&payload).expect("the limit itself");
+    payload.aers_held = AER_LIMIT + 2;
+    check_nvme_state(&payload).expect_err("past the limit");
+}
+
+#[test]
+fn held_aers_without_an_admin_queue_are_refused() {
+    let mut payload = good_payload();
+    payload.aers_held = 1;
+    payload.admin_sq = None;
+    payload.io_sqs.clear();
+    payload.io_cqs.clear();
+    let error = check_nvme_state(&payload).expect_err("no admin SQ");
+    assert!(error.to_string().contains("admin SQ"), "{error}");
 }

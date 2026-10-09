@@ -115,6 +115,7 @@ impl NvmeController {
             msix: self.msix.export_state(),
             namespace: Some(self.namespace()),
             backend: Some(self.backend.identity()),
+            aers_held: st.aers_held,
         }))
     }
 
@@ -241,6 +242,7 @@ impl NvmeController {
             st.set_cq(idx, wire.as_ref().map(live_cq));
         }
         self.restore_held(&mut st, mig);
+        st.aers_held = mig.aers_held;
         // Nothing runs before the source has committed to never running
         // the guest again: the two would share the disk. Resume opens
         // admission and takes the commands the guest left queued.
@@ -520,7 +522,26 @@ pub(super) fn check_nvme_state(
             check_sq(&format!("IO SQ {}", idx + 1), sq, false)?;
         }
     }
-    check_held(mig)
+    check_held(mig)?;
+    check_aers(mig)
+}
+
+/// No more held AERs than AERL lets a driver send, and none without an
+/// admin queue to have sent them on.
+fn check_aers(mig: &NvmeMigrateState) -> Result<(), DeviceStateError> {
+    let limit = AER_LIMIT + 1;
+    if mig.aers_held > limit {
+        return Err(DeviceStateError::invalid(format!(
+            "{} held AERs, the limit is {limit}",
+            mig.aers_held,
+        )));
+    }
+    if mig.aers_held > 0 && mig.admin_sq.is_none() {
+        return Err(DeviceStateError::invalid(
+            "held AERs with no admin SQ to have sent them",
+        ));
+    }
+    Ok(())
 }
 
 /// The granted (SQ, CQ) counts. A source without separate counts kept
