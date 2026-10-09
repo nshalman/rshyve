@@ -260,6 +260,10 @@ fn pair() -> (Chan<UnixStream>, Chan<UnixStream>) {
     )
 }
 
+fn clean() -> Result<(), MigrateError> {
+    Ok(())
+}
+
 fn no_hook() -> CommittedFn {
     Box::new(|| {})
 }
@@ -295,8 +299,9 @@ fn a_cancelled_source_never_commits() {
     };
     let status = status();
 
-    let error = hand_over(&mut source, &gate, no_hook(), &status, &discard())
-        .expect_err("cancelled");
+    let error =
+        hand_over(&mut source, &gate, clean, no_hook(), &status, &discard())
+            .expect_err("cancelled");
 
     assert!(crate::is_cancel(&error), "{error}");
     assert_eq!(phase(&status), MigrationPhase::Finish, "not rolled back");
@@ -312,8 +317,9 @@ fn a_destination_abort_rolls_the_source_back() {
     let gate = Gate::default();
     let status = status();
 
-    let error = hand_over(&mut source, &gate, no_hook(), &status, &discard())
-        .expect_err("the destination aborted");
+    let error =
+        hand_over(&mut source, &gate, clean, no_hook(), &status, &discard())
+            .expect_err("the destination aborted");
 
     assert_eq!(gate.commits.load(Ordering::Acquire), 0, "committed");
     assert_eq!(phase(&status), MigrationPhase::Finish);
@@ -341,6 +347,7 @@ fn a_commit_the_peer_may_have_missed_is_never_rolled_back() {
     let error = hand_over(
         &mut source,
         &Gate::default(),
+        clean,
         no_hook(),
         &status,
         &discard(),
@@ -363,7 +370,7 @@ fn a_commit_goes_through_the_gate() {
     let gate = Gate::default();
     let status = status();
 
-    hand_over(&mut source, &gate, no_hook(), &status, &discard())
+    hand_over(&mut source, &gate, clean, no_hook(), &status, &discard())
         .expect("handed over");
 
     assert_eq!(gate.commits.load(Ordering::Acquire), 1);
@@ -501,8 +508,15 @@ fn the_disks_are_given_up_right_after_the_commit() {
         dest
     });
     let (hook, calls) = counting();
-    hand_over(&mut source, &Gate::default(), hook, &status(), &discard())
-        .expect("handed over");
+    hand_over(
+        &mut source,
+        &Gate::default(),
+        clean,
+        hook,
+        &status(),
+        &discard(),
+    )
+    .expect("handed over");
     assert_eq!(calls.load(Ordering::Acquire), 1);
     peer.join().expect("the destination finished");
 }
@@ -513,9 +527,15 @@ fn a_commit_that_may_be_lost_still_gives_the_disks_up() {
     dest.send(&Message::Okay).expect("holds it all");
     drop(dest);
     let (hook, calls) = counting();
-    let error =
-        hand_over(&mut source, &Gate::default(), hook, &status(), &discard())
-            .expect_err("the peer left");
+    let error = hand_over(
+        &mut source,
+        &Gate::default(),
+        clean,
+        hook,
+        &status(),
+        &discard(),
+    )
+    .expect_err("the peer left");
     assert!(matches!(error, MigrateError::Committed(_)), "{error}");
     assert_eq!(calls.load(Ordering::Acquire), 1);
 }
@@ -526,8 +546,15 @@ fn no_commit_keeps_the_disks() {
     dest.send(&Message::Error(crate::cancelled()))
         .expect("abort");
     let (hook, calls) = counting();
-    hand_over(&mut source, &Gate::default(), hook, &status(), &discard())
-        .expect_err("the destination aborted");
+    hand_over(
+        &mut source,
+        &Gate::default(),
+        clean,
+        hook,
+        &status(),
+        &discard(),
+    )
+    .expect_err("the destination aborted");
     assert_eq!(calls.load(Ordering::Acquire), 0);
 }
 
@@ -650,4 +677,136 @@ fn a_committed_failure_keeps_the_committed_phase() {
     let s = status.lock().expect("status");
     assert_eq!(s.phase, MigrationPhase::Committed);
     assert!(s.error.is_some());
+}
+
+/// The kernel's dirty bitmap, as a test drives it: a guest write marks
+/// a page, and a read clears what it reports.
+#[derive(Clone, Default)]
+struct FakeDirty(Arc<Mutex<std::collections::BTreeSet<u64>>>);
+
+impl FakeDirty {
+    fn guest_write(&self, memctx: &MemCtx, gpa: u64, fill: u8) {
+        memctx.write(gpa, &[fill; PAGE_SIZE]).expect("guest write");
+        self.0.lock().expect("bitmap").insert(gpa);
+    }
+
+    fn track(
+        &self,
+        gpa: u64,
+        len: usize,
+        bm: &mut [u8],
+    ) -> std::io::Result<()> {
+        let mut dirty = self.0.lock().expect("bitmap");
+        let end = gpa + len as u64;
+        for page in dirty.range(gpa..end) {
+            let bit = ((page - gpa) / PAGE_SIZE as u64) as usize;
+            bm[bit / 8] |= 1 << (bit % 8);
+        }
+        dirty.retain(|&p| p < gpa || p >= end);
+        Ok(())
+    }
+}
+
+/// One attempt's RAM passes into a fresh destination, which it hands
+/// back. `between` runs on the guest between the full and the dirty
+/// pass.
+fn ram_attempt(
+    memctx: &MemCtx,
+    dirty: &FakeDirty,
+    ram: usize,
+    between: impl FnOnce(),
+) -> MemCtx {
+    use crate::destination::{receive_pass, PassEnd};
+    let (mut source, mut dest) = pair();
+    let peer = std::thread::spawn(move || {
+        let memctx = MemCtx::new(Arc::new(
+            vmm_core::mem::PhysMap::new_anon(0, ram).expect("guest memory"),
+        ));
+        for _ in 0..2 {
+            receive_pass(
+                &mut dest,
+                &memctx,
+                &crate::NoStop,
+                &status(),
+                PassEnd::MemEnd,
+            )
+            .expect("pass");
+        }
+        memctx
+    });
+    let mut track = |gpa, len, bm: &mut [u8]| dirty.track(gpa, len, bm);
+    push_ram_all(&mut source, &mut track, memctx, &Gate::default(), &status())
+        .expect("full pass");
+    between();
+    push_ram(&mut source, &mut track, memctx, &Gate::default(), &status())
+        .expect("dirty pass");
+    peer.join().expect("destination")
+}
+
+fn image(memctx: &MemCtx, ram: usize) -> Vec<u8> {
+    let mut out = vec![0u8; ram];
+    memctx.read(0, &mut out).expect("read");
+    out
+}
+
+#[test]
+fn a_retry_after_a_failed_attempt_carries_its_writes() {
+    // Attempt one sends page 3 in its dirty pass, which clears the bit,
+    // and then fails. The guest never writes page 3 again. Attempt two
+    // goes to a new destination, so only a full first pass carries it.
+    const RAM: usize = 16 * PAGE_SIZE;
+    let memctx = firmware_layout(RAM);
+    let dirty = FakeDirty::default();
+    for page in 0..16u64 {
+        dirty.guest_write(&memctx, page * PAGE_SIZE as u64, page as u8);
+    }
+    let third = 3 * PAGE_SIZE as u64;
+
+    let failed = ram_attempt(&memctx, &dirty, RAM, || {
+        dirty.guest_write(&memctx, third, 0xB3);
+    });
+    drop(failed);
+    assert!(dirty.0.lock().expect("bitmap").is_empty());
+
+    let retry = ram_attempt(&memctx, &dirty, RAM, || {});
+    assert_eq!(image(&retry, RAM), image(&memctx, RAM));
+}
+
+#[test]
+fn a_page_dirty_at_the_commit_refuses_it() {
+    const RAM: usize = 16 * PAGE_SIZE;
+    let memctx = firmware_layout(RAM);
+    let dirty = FakeDirty::default();
+    let mut track = |gpa, len, bm: &mut [u8]| dirty.track(gpa, len, bm);
+    check_clean(&mut track, &memctx).expect("nothing dirty");
+
+    dirty.guest_write(&memctx, 5 * PAGE_SIZE as u64, 0x55);
+    let mut track = |gpa, len, bm: &mut [u8]| dirty.track(gpa, len, bm);
+    let error = check_clean(&mut track, &memctx).expect_err("one page left");
+    assert!(error.to_string().contains("1 guest pages"), "{error}");
+}
+
+#[test]
+fn a_dirty_source_never_commits_and_tells_the_destination() {
+    let (mut source, mut dest) = pair();
+    dest.send(&Message::Okay).expect("holds it all");
+    let gate = Gate::default();
+    let status = status();
+    let (hook, calls) = counting();
+
+    let error = hand_over(
+        &mut source,
+        &gate,
+        || Err(MigrateError::State("1 guest pages left".into())),
+        hook,
+        &status,
+        &discard(),
+    )
+    .expect_err("dirty");
+
+    assert!(matches!(error, MigrateError::State(_)), "{error}");
+    assert_eq!(gate.commits.load(Ordering::Acquire), 0);
+    assert_eq!(calls.load(Ordering::Acquire), 0, "disks given up");
+    assert_eq!(phase(&status), MigrationPhase::Finish, "rolls back");
+    assert!(matches!(dest.recv(), Ok(Message::Error(_))));
 }

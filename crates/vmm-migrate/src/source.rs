@@ -439,7 +439,14 @@ fn run_inner<S: Transport>(
     set_phase(status, MigrationPhase::RamPull);
     chan.send_uncommitted(gate, &Message::MemEnd)?;
 
-    hand_over(chan, gate, committed, status, log)
+    hand_over(
+        chan,
+        gate,
+        || check_clean(&mut track, memctx),
+        committed,
+        status,
+        log,
+    )
 }
 
 /// Three steps, and the order is the whole point. The destination says
@@ -450,12 +457,17 @@ fn run_inner<S: Transport>(
 fn hand_over<S: Transport>(
     chan: &mut Chan<S>,
     gate: &dyn StopGate,
+    clean: impl FnOnce() -> Result<(), MigrateError>,
     committed: CommittedFn,
     status: &Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     set_phase(status, MigrationPhase::Finish);
     chan.expect_okay()?;
+    if let Err(error) = clean() {
+        chan.report_failure(&error, log);
+        return Err(error);
+    }
     gate.commit()?;
 
     set_phase(status, MigrationPhase::Committed);
@@ -540,6 +552,36 @@ fn kernel_tracking(
     move |gpa, len, bm| hdl.track_dirty_pages(gpa, len, bm)
 }
 
+/// Refuse the commit while a guest page is still dirty.
+///
+/// Every writer stopped before the final pass, so a page dirty here is
+/// a write the destination never got. The bits this read clears do not
+/// matter: a failed attempt rolls back, and the next one starts with a
+/// full pass.
+fn check_clean(
+    track: &mut TrackFn<'_>,
+    memctx: &MemCtx,
+) -> Result<(), MigrateError> {
+    let mut left: u64 = 0;
+    for (gpa, len) in memctx.guest_ram() {
+        let mut bm = vec![0u8; crate::protocol::bitmap_size(len)];
+        track(gpa, len, &mut bm)
+            .map_err(|e| MigrateError::Io(format!("track_dirty: {e}")))?;
+        left += PageIter::new(&bm, gpa, len).count() as u64;
+    }
+    if left != 0 {
+        return Err(MigrateError::State(format!(
+            "{left} guest pages were written after the final pass"
+        )));
+    }
+    Ok(())
+}
+
+/// Always every page, whatever the dirty bitmap says.
+///
+/// A failed attempt cleared the bits of the pages it sent, and a
+/// destination of a new attempt holds none of them. A dirty-only first
+/// pass would leave those pages behind.
 fn push_ram_all<S: Transport>(
     chan: &mut Chan<S>,
     track: &mut TrackFn<'_>,

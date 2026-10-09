@@ -470,7 +470,7 @@ fn check_platform_payload(
 
 /// What ends one RAM pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PassEnd {
+pub(crate) enum PassEnd {
     /// Keep taking passes until the source says it has paused.
     PauseSignal,
     /// Take exactly one pass: the final one.
@@ -482,7 +482,7 @@ enum PassEnd {
 /// A `MemFetch` commits the peer to sending exactly one `PageBatch`
 /// next, and the GPA list it carries is the only thing that says where
 /// those pages go. Anything else after it would silently discard them.
-fn receive_pass<S: Transport>(
+pub(crate) fn receive_pass<S: Transport>(
     chan: &mut Chan<S>,
     memctx: &MemCtx,
     gate: &dyn StopGate,
