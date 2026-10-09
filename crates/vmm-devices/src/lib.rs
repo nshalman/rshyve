@@ -23,6 +23,7 @@ pub mod pci;
 pub mod pvpanic;
 pub mod quiesce;
 pub mod smbios;
+pub mod testdev;
 pub mod uart;
 
 /// Metrics live in their own crate. The alias keeps

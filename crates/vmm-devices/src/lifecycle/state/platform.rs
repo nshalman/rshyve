@@ -155,3 +155,8 @@ pub struct CpuHotplugMigrateState {
 pub struct MemHotplugMigrateState {
     pub selected: Option<u8>,
 }
+
+/// The fault-injection test device. It carries nothing: its payload
+/// only proves the device took part.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestFaultMigrateState {}
