@@ -265,16 +265,26 @@ pub struct MantaBlockOpts {
     pub allow_volatile: bool,
     /// How long a completion thread polls before it sleeps, in µs.
     pub spin_us: Option<u32>,
+    /// The ring shape the guest saw on the migration source, in the
+    /// text form of `vmm_mantablock::RingShape`. A destination builds
+    /// the disk from it and attaches only after the commit.
+    pub ring_shape: Option<String>,
 }
 
 /// More would keep a CPU busy for little gain.
 const MAX_SPIN_US: u32 = 10_000;
 
-const MANTABLOCK_KEYS: [&str; 4] =
-    ["mantablock=", "volume=", "allow-volatile", "spin-us="];
+const MANTABLOCK_KEYS: [&str; 5] = [
+    "mantablock=",
+    "volume=",
+    "allow-volatile",
+    "spin-us=",
+    "ring-shape=",
+];
 
 /// Parse an nvme config: `path[,blk options]`, or
-/// `mantablock=<socket>,volume=<uuid>[,allow-volatile][,spin-us=<n>]`.
+/// `mantablock=<socket>,volume=<uuid>[,allow-volatile][,spin-us=<n>]`
+/// `[,ring-shape=<shape>]`.
 ///
 /// The MantaBlock form is new, so an unknown option there is an error.
 pub fn parse_nvme_config(config: &str) -> anyhow::Result<NvmeSpec<'_>> {
@@ -300,6 +310,7 @@ fn parse_mantablock_config(config: &str) -> anyhow::Result<MantaBlockOpts> {
     let mut volume: Option<uuid::Uuid> = None;
     let mut allow_volatile = false;
     let mut spin_us: Option<u32> = None;
+    let mut ring_shape: Option<String> = None;
     for opt in config.split(',') {
         if opt.is_empty() {
             anyhow::bail!("nvme: an empty mantablock option in '{config}'");
@@ -333,6 +344,13 @@ fn parse_mantablock_config(config: &str) -> anyhow::Result<MantaBlockOpts> {
                     )
                 })?;
             spin_us = Some(n);
+        } else if let Some(v) = opt.strip_prefix("ring-shape=") {
+            anyhow::ensure!(
+                ring_shape.is_none(),
+                "nvme: ring-shape= given twice"
+            );
+            anyhow::ensure!(!v.is_empty(), "nvme: an empty ring-shape=");
+            ring_shape = Some(v.to_string());
         } else {
             anyhow::bail!("nvme: unknown mantablock option '{opt}'");
         }
@@ -346,6 +364,7 @@ fn parse_mantablock_config(config: &str) -> anyhow::Result<MantaBlockOpts> {
         })?,
         allow_volatile,
         spin_us,
+        ring_shape,
     })
 }
 

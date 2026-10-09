@@ -549,6 +549,40 @@ impl RunControl {
         self.release_for_stop(&mut hold, release).map(|()| false)
     }
 
+    /// Give a held source its guest back: one the gate said go to, or
+    /// one that committed and never heard the destination start. Its
+    /// migration thread has ended and it still holds the pause.
+    ///
+    /// `step` gets the pause-held flag, as in [`Self::change`].
+    pub(super) fn resume_held<E>(
+        &self,
+        step: impl FnOnce(&mut bool) -> Result<(), StepFailed<E>>,
+    ) -> Result<(), HeldFailed<E>> {
+        let mut hold = self.lock_changing();
+        if self.get() != VmRunState::Migrating {
+            return Err(HeldFailed::NotHeld);
+        }
+        if hold.migration.is_some() {
+            return Err(HeldFailed::Running);
+        }
+        if !hold.held {
+            return Err(HeldFailed::NotHeld);
+        }
+        match step(&mut hold.held) {
+            Ok(()) => {
+                hold.parked = false;
+                self.transition(VmRunState::Migrating, VmRunState::Running);
+                Ok(())
+            }
+            Err(StepFailed::Undone(e)) => Err(HeldFailed::Step(e)),
+            Err(StepFailed::Faulted(e)) => {
+                hold.faulted = true;
+                self.transition(VmRunState::Migrating, VmRunState::Faulted);
+                Err(HeldFailed::Step(e))
+            }
+        }
+    }
+
     /// End a migration thread that unwound. Nothing says how far it
     /// got. A VM it did not pause runs, with any devices it parked put
     /// back to work. An import whose devices are still parked ends as a
@@ -819,6 +853,17 @@ pub(super) fn release_paused_vm<E>(
 ) -> Result<(), StopFailure<E>> {
     suspend().map_err(StopFailure::NotLatched)?;
     resume().map_err(StopFailure::NotReleased)
+}
+
+/// Why a held source did not get its guest back.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum HeldFailed<E> {
+    /// Not a source that waits for the orchestrator's order.
+    NotHeld,
+    /// Its migration thread has not ended yet.
+    Running,
+    /// The step failed; the source is still held, or `Faulted`.
+    Step(E),
 }
 
 /// Which step of a stop failed.

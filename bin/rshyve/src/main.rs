@@ -128,9 +128,12 @@ fn refuse_unmigratable_devices(
 
 /// Handle migration destination mode: activate vCPUs, take a migration
 /// connection, and import VM state from the source.
+#[allow(clippy::too_many_arguments)]
 fn run_migration_destination(
     machine: &Machine,
     listen_addr: &str,
+    attach_budget: std::time::Duration,
+    allow_unproven: bool,
     num_cpus: u32,
     mem_size: usize,
     registry: &DeviceRegistry,
@@ -168,6 +171,7 @@ fn run_migration_destination(
     let by_bdf = devices.clone();
     let for_resume: Vec<Arc<dyn vmm_devices::Lifecycle>> =
         registry.lifecycle_devices();
+    let for_attach = for_resume.clone();
     let (pause_vm, resume_vm) = vmm_migrate::hdl_pause_hooks(machine.hdl());
     let hooks = vmm_migrate::destination::DestHooks {
         restore: Box::new(move |bdf, state| {
@@ -181,6 +185,18 @@ fn run_migration_destination(
                     ))
                 })?;
             device.restore_migrate_state(state)
+        }),
+        // The budget runs from the commit, not from the start.
+        attach: Box::new(move || {
+            let how = vmm_devices::lifecycle::BackingAttach {
+                until: std::time::Instant::now() + attach_budget,
+                allow_unproven,
+            };
+            for dev in for_attach.iter().filter(|d| !d.backing_attached()) {
+                dev.attach_backing(&how)
+                    .map_err(|e| format!("{}: {e}", dev.type_name()))?;
+            }
+            Ok(())
         }),
         resume: Box::new(move || {
             for dev in &for_resume {
@@ -429,6 +445,10 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         run_migration_destination(
             &machine,
             listen_addr,
+            std::time::Duration::from_millis(
+                cli.migrate_ring_attach_timeout_ms,
+            ),
+            cli.migrate_allow_unproven_engine,
             num_cpus,
             mem_size,
             &registry,

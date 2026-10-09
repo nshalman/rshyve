@@ -129,12 +129,16 @@ fn reject_unmigratable_destination(
                 driver
             );
         }
-        // The source still holds the volume's attachment, and the ring
-        // has no handover yet.
-        if specs.iter().any(|spec| is_mantablock_nvme(spec)) {
+        // Without the source's shape the placeholder would show the
+        // guest another disk.
+        if let Some(spec) = specs
+            .iter()
+            .find(|spec| is_mantablock_nvme(spec) && !has_ring_shape(spec))
+        {
             anyhow::bail!(
-                "live migration of a MantaBlock disk is not supported yet; \
-                 this VM cannot start as a migration destination"
+                "a MantaBlock disk on a migration destination needs \
+                 ring-shape=; take the -s list from the source's \
+                 migrate-config ({spec})"
             );
         }
     }
@@ -146,18 +150,32 @@ fn is_mantablock_nvme(spec: &str) -> bool {
     parts.driver == "nvme" && parts.config.starts_with("mantablock=")
 }
 
-/// `driver_specs` refuses this first, with a clearer error.
-fn refuse_mantablock_destination(
+fn has_ring_shape(spec: &str) -> bool {
+    devspec::parts(spec)
+        .config
+        .split(',')
+        .any(|opt| opt.starts_with("ring-shape="))
+}
+
+/// The shape a ring disk must have, if its spec names one. A
+/// destination must have one: `driver_specs` refuses that first, with a
+/// clearer error.
+fn ring_shape(
     opts: &devspec::MantaBlockOpts,
     is_migrate_dest: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<vmm_mantablock::RingShape>> {
+    let shape = opts
+        .ring_shape
+        .as_deref()
+        .map(str::parse::<vmm_mantablock::RingShape>)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("nvme: {e}"))?;
     anyhow::ensure!(
-        !is_migrate_dest,
-        "live migration of a MantaBlock disk is not supported yet \
-         (volume {}); this VM cannot start as a migration destination",
+        shape.is_some() || !is_migrate_dest,
+        "nvme: volume {} on a migration destination needs ring-shape=",
         opts.volume
     );
-    Ok(())
+    Ok(shape)
 }
 
 fn reject_ahci_hd<T>() -> anyhow::Result<T> {
@@ -280,8 +298,14 @@ fn parse_and_create_pci_device(
                 Ok(vmm_machine::created(nvme))
             }
             devspec::NvmeSpec::MantaBlock(opts) => {
-                refuse_mantablock_destination(&opts, is_migrate_dest)?;
-                let nvme = mantablock_nvme(&opts, bdf.dev(), ctx)?;
+                let shape = ring_shape(&opts, is_migrate_dest)?;
+                let nvme = mantablock_nvme(
+                    &opts,
+                    shape,
+                    is_migrate_dest,
+                    bdf.dev(),
+                    ctx,
+                )?;
                 chipset.try_attach_device(bdf, nvme.clone())?;
                 info!(log, "nvme attached";
                     "bdf" => %bdf,
@@ -446,9 +470,16 @@ fn parse_and_create_pci_device(
     }
 }
 
-/// An NVMe controller on a MantaBlock volume, attached to the engine.
+/// An NVMe controller on a MantaBlock volume.
+///
+/// A migration destination attaches nothing here: the source holds the
+/// volume until its commit, and the orchestrator moves the volume after
+/// it. The disk attaches before the guest runs. Any other VM attaches
+/// now, and a `shape` it was given must be what the engine grants.
 fn mantablock_nvme(
     opts: &devspec::MantaBlockOpts,
+    shape: Option<vmm_mantablock::RingShape>,
+    is_migrate_dest: bool,
     instance_id: u8,
     ctx: &vmm_machine::PciDeviceCtx<'_>,
 ) -> anyhow::Result<Arc<vmm_storage::nvme::NvmeController>> {
@@ -465,23 +496,44 @@ fn mantablock_nvme(
     if let Some(us) = opts.spin_us {
         cfg.spin = Duration::from_micros(u64::from(us));
     }
-    let conn = vmm_mantablock::connect(cfg).with_context(|| {
-        format!(
-            "nvme: cannot attach volume {} at {}",
-            opts.volume,
-            opts.socket.display()
-        )
-    })?;
-    if !conn.durable() {
-        warn!(
-            log,
-            "nvme: the engine's writes are not durable, so the \
+    let (backend, config) = match shape {
+        Some(shape) if is_migrate_dest => {
+            info!(log, "nvme: the volume attaches after the migration \
+                commits"; "shape" => %shape);
+            (
+                vmm_mantablock::deferred_factory(cfg, shape),
+                shape.nvme_config(),
+            )
+        }
+        _ => {
+            let conn = vmm_mantablock::connect(cfg).with_context(|| {
+                format!(
+                    "nvme: cannot attach volume {} at {}",
+                    opts.volume,
+                    opts.socket.display()
+                )
+            })?;
+            if let Some(want) = shape {
+                anyhow::ensure!(
+                    conn.shape() == want,
+                    "nvme: volume {} attached as {}, not ring-shape={want}",
+                    opts.volume,
+                    conn.shape()
+                );
+            }
+            if !conn.durable() {
+                warn!(
+                    log,
+                    "nvme: the engine's writes are not durable, so the \
                     guest sees a volatile write cache"
-        );
-    }
-    let config = conn.nvme_config();
+                );
+            }
+            let config = conn.nvme_config();
+            (conn.into_handover_factory(), config)
+        }
+    };
     vmm_storage::nvme::NvmeController::with_backend(
-        conn.into_factory(),
+        backend,
         config,
         false,
         instance_id,
@@ -657,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mantablock_nvme_cannot_be_a_migration_destination() {
+    fn a_mantablock_destination_needs_the_source_shape() {
         // bootindex= in either position must not hide the ring option.
         for ring in [
             "5,nvme,mantablock=/s,volume=x,bootindex=1",
@@ -666,32 +718,41 @@ mod tests {
             let raw = vec!["4,nvme,/disk".to_string(), ring.to_string()];
             let error = driver_specs(true, &raw).unwrap_err();
             assert!(
-                error.to_string().contains(
-                    "live migration of a MantaBlock disk is not supported yet"
-                ),
+                error.to_string().contains("ring-shape="),
                 "{ring}: {error}"
             );
             assert!(driver_specs(false, &raw).is_ok());
         }
+        let shaped = vec![
+            "5,nvme,mantablock=/s,volume=x,ring-shape=1:256:4096:1:8:2:d"
+                .to_string(),
+        ];
+        assert!(driver_specs(true, &shaped).is_ok());
     }
 
-    #[test]
-    fn a_mantablock_disk_is_refused_on_a_destination_at_attach() {
-        let opts = devspec::MantaBlockOpts {
+    fn opts(shape: Option<&str>) -> devspec::MantaBlockOpts {
+        devspec::MantaBlockOpts {
             socket: "/s".into(),
             volume: "6f1c2a8e-0000-4000-8000-000000000007"
                 .parse()
                 .expect("a UUID"),
             allow_volatile: false,
             spin_us: None,
-        };
-        let error = refuse_mantablock_destination(&opts, true)
-            .expect_err("a destination");
-        assert!(
-            error.to_string().contains(&opts.volume.to_string()),
-            "{error}"
-        );
-        refuse_mantablock_destination(&opts, false).expect("not a destination");
+            ring_shape: shape.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_ring_shape_is_parsed_strictly_and_required_on_a_destination() {
+        let none = opts(None);
+        let error = ring_shape(&none, true).expect_err("a destination");
+        assert!(error.to_string().contains(&none.volume.to_string()));
+        assert_eq!(ring_shape(&none, false).expect("not a destination"), None);
+
+        let good = opts(Some("1:256:4096:1:8:2:d"));
+        let shape = ring_shape(&good, true).expect("a shape").expect("some");
+        assert_eq!(shape.to_string(), "1:256:4096:1:8:2:d");
+        assert!(ring_shape(&opts(Some("1:256")), true).is_err());
     }
 
     #[test]

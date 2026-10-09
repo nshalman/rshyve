@@ -19,8 +19,8 @@ use vmm_machine::{
 };
 
 use super::migrate::{
-    migrate_config, migrate_dest, migrate_source, migrate_status,
-    migration_source_guard,
+    migrate_config, migrate_dest, migrate_resume_source, migrate_source,
+    migrate_status, migration_source_guard, DestAsk, SourceAsk,
 };
 use super::protocol::{Command, Response};
 use super::run_state::{
@@ -83,12 +83,36 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
         Command::MigrateSource {
             target_addr,
             zfs_barrier,
-        } => migrate_source(ctrl, target_addr, zfs_barrier),
+            gate,
+            gate_timeout_ms,
+            allow_engine_without_migrate_v1,
+        } => migrate_source(
+            ctrl,
+            target_addr,
+            SourceAsk {
+                zfs_barrier,
+                gate,
+                gate_timeout_ms,
+                allow_unproven: allow_engine_without_migrate_v1,
+            },
+        ),
 
         Command::MigrateDest {
             listen_addr,
             allow_cpu_feature_mismatch,
-        } => migrate_dest(ctrl, listen_addr, allow_cpu_feature_mismatch),
+            ring_attach_timeout_ms,
+            allow_engine_without_migrate_v1,
+        } => migrate_dest(
+            ctrl,
+            listen_addr,
+            DestAsk {
+                allow_cpu_feature_mismatch,
+                ring_attach_timeout_ms,
+                allow_unproven: allow_engine_without_migrate_v1,
+            },
+        ),
+
+        Command::MigrateResumeSource => migrate_resume_source(ctrl),
 
         // The listener answers both of these itself, as raw text rather
         // than a typed Response. This arm is what a listener that
@@ -186,10 +210,18 @@ fn pause_step(
     )
 }
 
+/// How long an operator resume waits for a detached ring disk.
+const RESUME_ATTACH_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 fn resume_step(
     ctrl: &VmController,
     held: &mut bool,
 ) -> Result<(), StepFailed<String>> {
+    // An import whose disks did not attach after the commit holds the
+    // only copy of the guest; it runs only once they are back.
+    ctrl.attach_backing(std::time::Instant::now() + RESUME_ATTACH_WAIT)
+        .map_err(StepFailed::Undone)?;
     unpark_all(
         &ctrl.named_devices(),
         DEVICE_PAUSE_BUDGET,

@@ -46,6 +46,9 @@ fn migrate_source_rejects_host_local_state() {
     let command = Command::MigrateSource {
         target_addr: "192.0.2.10:4567".to_string(),
         zfs_barrier: None,
+        gate: None,
+        gate_timeout_ms: None,
+        allow_engine_without_migrate_v1: false,
     };
 
     for state in [
@@ -74,6 +77,9 @@ fn migrate_source_rejects_ahci_cd() {
     let command = Command::MigrateSource {
         target_addr: "192.0.2.10:4567".to_string(),
         zfs_barrier: None,
+        gate: None,
+        gate_timeout_ms: None,
+        allow_engine_without_migrate_v1: false,
     };
 
     let response =
