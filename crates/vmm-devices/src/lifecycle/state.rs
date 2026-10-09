@@ -85,6 +85,7 @@ impl DeviceStateError {
 pub enum DeviceMigrateState {
     Virtio(VirtioMigrateState),
     Nvme(NvmeMigrateState),
+    Fbuf(FbufMigrateState),
 }
 
 impl DeviceMigrateState {
@@ -93,6 +94,7 @@ impl DeviceMigrateState {
         match self {
             Self::Virtio(_) => "virtio",
             Self::Nvme(_) => "nvme",
+            Self::Fbuf(_) => "fbuf",
         }
     }
 }
@@ -137,6 +139,84 @@ pub struct MigratePciState {
     pub command: u16,
     /// BAR base addresses indexed by BAR number (BAR0..BAR5).
     pub bar_addrs: [u64; 6],
+}
+
+/// The framebuffer: its header, the mode the guest set, and its VRAM.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FbufMigrateState {
+    pub pci: MigratePciState,
+    pub width: u16,
+    pub height: u16,
+    /// `None` when the source chose not to carry it. The destination
+    /// then shows black until the guest draws again.
+    pub vram: Option<FbufMigrateVram>,
+}
+
+/// The start of the VRAM, zstd-compressed. VRAM past `len` is zero.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FbufMigrateVram {
+    pub len: u32,
+    // RON writes a plain Vec<u8> as a list of decimal numbers, about
+    // four times the bytes. As bytes it is base64.
+    #[serde(with = "wire_bytes")]
+    pub zstd: Vec<u8>,
+}
+
+impl fmt::Debug for FbufMigrateVram {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FbufMigrateVram")
+            .field("len", &self.len)
+            .field("zstd_len", &self.zstd.len())
+            .finish()
+    }
+}
+
+mod wire_bytes {
+    use serde::de::{Deserializer, Error, SeqAccess, Visitor};
+    use serde::Serializer;
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(
+        bytes: &[u8],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        deserializer.deserialize_byte_buf(BytesVisitor)
+    }
+
+    struct BytesVisitor;
+
+    impl<'de> Visitor<'de> for BytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("bytes")
+        }
+
+        fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(v.to_vec())
+        }
+
+        fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(v)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Vec<u8>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(b) = seq.next_element()? {
+                out.push(b);
+            }
+            Ok(out)
+        }
+    }
 }
 
 /// One virtio PCI transport: the register file the driver programmed

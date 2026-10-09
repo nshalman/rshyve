@@ -18,6 +18,8 @@ des.workspace = true
 getrandom.workspace = true
 slog.workspace = true
 usdt = { workspace = true, features = ["asm"] }
+zstd = "0.13"
 
 [dev-dependencies]
+ron.workspace = true
 tempfile = "3"

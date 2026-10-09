@@ -1641,11 +1641,13 @@ dependencies = [
  "bitflags",
  "des",
  "getrandom 0.4.2",
+ "ron",
  "slog",
  "tempfile",
  "usdt",
  "vmm_core",
  "vmm_devices",
+ "zstd",
 ]
 
 [[package]]

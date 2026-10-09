@@ -25,7 +25,7 @@ use crate::codec::{
 };
 use crate::cpu;
 use crate::pages::apply_page_batch;
-use crate::protocol::select_protocol;
+use crate::protocol::{self, protocol_blocker, select_protocol};
 use crate::state;
 use crate::wire::{
     cancel_or, not_cancelled, set_phase, unexpected, Chan, Deadlines, Transport,
@@ -131,6 +131,11 @@ fn run_inner<S: Transport>(
         chan.send(&Message::Error(err.clone()))?;
         return Err(err);
     };
+    if let Some(why) = protocol_blocker(protocol, &config.devices) {
+        let err = MigrateError::ProtocolMismatch(why);
+        chan.send(&Message::Error(err.clone()))?;
+        return Err(err);
+    }
     let gate = hooks.gate.as_ref();
     chan.send_uncommitted(
         gate,
@@ -363,6 +368,16 @@ fn restore_devices(
                 entry.bdf,
             )));
         }
+    }
+    // The framebuffer always exports its state, and one restored from
+    // nothing would leave the guest's display undecoded.
+    if let Some(entry) = dev_state.emulated.iter().find(|e| {
+        e.state.is_none() && expected[&e.bdf] == protocol::FRAMEBUFFER_KIND
+    }) {
+        return Err(MigrateError::State(format!(
+            "payload carries no framebuffer state for {}",
+            entry.bdf,
+        )));
     }
     // A device this VM has and the payload does not would resume at
     // reset while the guest driver believes it configured.

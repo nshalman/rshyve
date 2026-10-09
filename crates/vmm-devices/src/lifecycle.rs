@@ -85,11 +85,11 @@ pub const DEFAULT_HALT_BUDGET: Duration = Duration::from_secs(5);
 mod state;
 
 pub use state::{
-    DeviceMigrateState, DeviceStateError, DeviceStatePayload,
-    HypervMigrateState, MigratePciState, NvmeMigrateBackend, NvmeMigrateCq,
-    NvmeMigrateCqe, NvmeMigrateNamespace, NvmeMigrateQueueCounts,
-    NvmeMigrateSq, NvmeMigrateState, VirtioMigrateQueue, VirtioMigrateState,
-    WireBdf,
+    DeviceMigrateState, DeviceStateError, DeviceStatePayload, FbufMigrateState,
+    FbufMigrateVram, HypervMigrateState, MigratePciState, NvmeMigrateBackend,
+    NvmeMigrateCq, NvmeMigrateCqe, NvmeMigrateNamespace,
+    NvmeMigrateQueueCounts, NvmeMigrateSq, NvmeMigrateState,
+    VirtioMigrateQueue, VirtioMigrateState, WireBdf,
 };
 
 /// General trait for emulated devices in the system.

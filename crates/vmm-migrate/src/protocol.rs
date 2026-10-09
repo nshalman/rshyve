@@ -10,9 +10,13 @@
 
 /// Protocol identifier for the RON migration format.
 ///
+/// v8 carries the framebuffer: its PCI header, mode and VRAM. A VM with
+/// a framebuffer moves only on v8, so it is refused at the protocol
+/// choice by an older peer and not resumed with a dead display.
+///
 /// v7 has the v6 payload. It says the destination attaches a MantaBlock
 /// ring disk after the commit, so a source with one moves only to a v7
-/// destination. A v6 peer still takes any other VM.
+/// or newer destination. A v6 peer still takes any other VM.
 ///
 /// v6 carries each vCPU's FPU and XSAVE area with the source host's
 /// layout, and the NVMe Asynchronous Event Requests a controller holds.
@@ -24,13 +28,20 @@
 /// v4 named the store under each NVMe namespace. v3 carried held NVMe
 /// completions and the namespace shape. v2 carried the CQ
 /// interrupt-enable bit. v1 put device identity on the wire.
-pub const PROTOCOL_RON: &str = "vmm-migrate-ron/7";
+pub const PROTOCOL_RON: &str = "vmm-migrate-ron/8";
 
-/// The version before, which differs only in the ring disk.
+/// The version before, which carries no framebuffer state.
+pub const PROTOCOL_RON_V7: &str = "vmm-migrate-ron/7";
+
+/// The version before that, which differs only in the ring disk.
 pub const PROTOCOL_RON_V6: &str = "vmm-migrate-ron/6";
 
 /// What a source offers, newest first.
-pub const SOURCE_OFFER: [&str; 2] = [PROTOCOL_RON, PROTOCOL_RON_V6];
+pub const SOURCE_OFFER: [&str; 3] =
+    [PROTOCOL_RON, PROTOCOL_RON_V7, PROTOCOL_RON_V6];
+
+/// The device kind of the framebuffer, as its `type_name` gives it.
+pub const FRAMEBUFFER_KIND: &str = "framebuffer";
 
 /// The version a destination answers an offer with, newest first, or
 /// `None` when it can read none of them.
@@ -38,6 +49,21 @@ pub fn select_protocol(offer: &[String]) -> Option<&'static str> {
     SOURCE_OFFER
         .into_iter()
         .find(|ours| offer.iter().any(|theirs| theirs == ours))
+}
+
+/// Why `protocol` cannot move a VM with `devices`, or `None`.
+pub fn protocol_blocker(
+    protocol: &str,
+    devices: &[crate::codec::DeviceIdentity],
+) -> Option<String> {
+    let has_fbuf = devices.iter().any(|d| d.kind == FRAMEBUFFER_KIND);
+    (has_fbuf && protocol != PROTOCOL_RON).then(|| {
+        format!(
+            "the peer speaks {}, which cannot carry the framebuffer; \
+             both ends need {PROTOCOL_RON}",
+            crate::wire::peer_text(protocol)
+        )
+    })
 }
 
 /// Page size used for dirty tracking (4 KiB).
@@ -144,6 +170,34 @@ mod tests {
         .into_iter()
         .find(|v| ours.iter().any(|o| o == v));
         assert_eq!(picked, None);
+    }
+
+    fn devices(kinds: &[&str]) -> Vec<crate::codec::DeviceIdentity> {
+        kinds
+            .iter()
+            .enumerate()
+            .map(|(dev, kind)| crate::codec::DeviceIdentity {
+                bdf: vmm_devices::lifecycle::WireBdf {
+                    bus: 0,
+                    dev: dev as u8,
+                    func: 0,
+                },
+                kind: kind.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_framebuffer_moves_only_on_the_current_version() {
+        let with = devices(&["virtio-net", FRAMEBUFFER_KIND]);
+        let without = devices(&["virtio-net", "nvme"]);
+
+        assert_eq!(protocol_blocker(PROTOCOL_RON, &with), None);
+        for old in [PROTOCOL_RON_V7, PROTOCOL_RON_V6] {
+            let why = protocol_blocker(old, &with).expect(old);
+            assert!(why.contains("framebuffer"), "{why}");
+            assert_eq!(protocol_blocker(old, &without), None);
+        }
     }
 
     #[test]

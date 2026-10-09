@@ -120,13 +120,9 @@ fn reject_unmigratable_destination(
     specs: &[String],
 ) -> anyhow::Result<()> {
     if is_migrate_dest {
-        if let Some(driver) = specs.iter().find_map(|spec| {
-            let driver = pci_spec_driver(spec)?;
-            matches!(driver, "fbuf" | "ahci-cd").then_some(driver)
-        }) {
+        if specs_have_ahci_cd(specs) {
             anyhow::bail!(
-                "{} is not supported on a migration destination",
-                driver
+                "ahci-cd is not supported on a migration destination"
             );
         }
         // Without the source's shape the placeholder would show the
@@ -689,15 +685,24 @@ mod tests {
     }
 
     #[test]
-    fn reject_unmigratable_destination_still_rejects_fbuf() {
-        let fbuf = vec!["30,fbuf,unix=/tmp/vm.vnc".to_string()];
+    fn a_triton_vm_is_accepted_on_a_migration_destination() {
+        // The -s list the bhyve brand gives every VM, plus a ring disk.
+        let raw: Vec<String> = [
+            "0,hostbridge,model=i440fx",
+            "3:0,virtio-net-viona,net0",
+            "4:0,virtio-rnd",
+            "7,nvme,mantablock=/mb/v.sock,volume=x,\
+             ring-shape=1:256:4096:1:8:16:8:2:d,bootindex=1",
+            "30:0,fbuf,vga=off,unix=/tmp/vm.vnc,password=cGFzcw==",
+            "30:1,xhci,tablet",
+            "31,lpc",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
-        let err = reject_unmigratable_destination(true, &fbuf).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "fbuf is not supported on a migration destination"
-        );
-        assert!(reject_unmigratable_destination(false, &fbuf).is_ok());
+        let specs = driver_specs(true, &raw).expect("a destination");
+        assert_eq!(specs.len(), raw.len());
     }
 
     #[test]

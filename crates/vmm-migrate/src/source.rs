@@ -45,7 +45,9 @@ use crate::limits::{BATCH_SIZE, ZSTD_LEVEL};
 use crate::pages::{
     are_contiguous, build_contiguous_gpas, page_buffer_len, read_pages,
 };
-use crate::protocol::{PageIter, PAGE_SIZE, PROTOCOL_RON, SOURCE_OFFER};
+use crate::protocol::{
+    protocol_blocker, PageIter, PAGE_SIZE, PROTOCOL_RON_V6, SOURCE_OFFER,
+};
 use crate::state;
 use crate::wait::{unless_cancelled, Abandoned};
 use crate::wire::{
@@ -269,7 +271,10 @@ fn run_inner<S: Transport>(
     }
     // Found out here, not at the export: by then the gate may have said
     // go, and the source could not roll back by itself.
-    if config.handover && sel.protocol != PROTOCOL_RON {
+    if let Some(why) = protocol_blocker(&sel.protocol, &config.devices) {
+        return Err(MigrateError::ProtocolMismatch(why));
+    }
+    if config.handover && sel.protocol == PROTOCOL_RON_V6 {
         return Err(MigrateError::ProtocolMismatch(format!(
             "the destination speaks {}, which cannot attach a disk after \
              the commit",

@@ -12,10 +12,13 @@ One driver serves both transports: a Unix socket inside a bhyve zone,
 where `/dev/poll` is unavailable and the GZ agent bridges to the peer,
 and a TCP socket elsewhere.
 
-The protocol identifier is `vmm-migrate-ron/7`. v7 has the v6 payload
-and says the destination attaches a MantaBlock ring disk after the
-commit (see [migration-gate.md](migration-gate.md)). A source offers v7
-and v6, and a destination takes either; a source with a ring disk
+The protocol identifier is `vmm-migrate-ron/8`. v8 adds the
+framebuffer state (see "Framebuffer" below). A source offers v8, v7 and
+v6, and a destination takes the newest it reads. A VM with a
+framebuffer moves only on v8: each end refuses an older peer at the
+protocol choice, before the pause. v7 has the v6 payload and says the
+destination attaches a MantaBlock ring disk after the commit (see
+[migration-gate.md](migration-gate.md)); a source with a ring disk
 refuses a v6 destination before it pauses. A peer on any other version
 is refused at negotiation. v6 carries each vCPU's FPU and XSAVE area with the source
 host's XSAVE layout, and the count of NVMe Asynchronous Event Requests a
@@ -24,6 +27,23 @@ on the destination's FPU registers (OSF-2). v4 named the store under
 each NVMe namespace, v3 added held NVMe completions and the namespace
 shape, v2 the CQ interrupt-enable bit, and v1 device identity. v5 is
 reserved for virtio-gpu state (PR #15).
+
+### Framebuffer
+
+The `fbuf` device carries its PCI header (command and BARs), the mode
+the guest set (width and height), and its VRAM. The VRAM is a separate
+16 MiB devmem segment, not guest RAM, so the RAM passes do not see it.
+The source reads it after the vCPUs pause, cuts it after the last page
+that is not zero, compresses it with zstd and sends it with the device
+state. A console or a plain desktop compresses to a few KiB. If the
+compressed VRAM is over 2 MiB, the source leaves it out so the device
+state stays under the message limit. The destination then starts with
+black VRAM and the right mode, and the screen comes back as the guest
+draws again.
+
+The VNC socket path and password come from the destination's own `-s`
+spec, which `migrate-config` gives. They are not on the wire. VNC
+clients of the source are dropped and reconnect to the destination.
 
 ### FPU and XSAVE state
 

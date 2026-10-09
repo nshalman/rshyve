@@ -197,7 +197,8 @@ write as a duplicate.
 
 ## Stream version
 
-The migration stream is `vmm-migrate-ron/7`. Its payload is the v4
-payload. A source with a ring disk refuses any other version right
-after the protocol choice, before the pause. An older destination does
+The migration stream is `vmm-migrate-ron/8`, which adds the
+framebuffer state to v7. A source with a ring disk refuses a v6
+destination right after the protocol choice, before the pause. A VM
+with a framebuffer needs v8 at both ends. An older destination does
 not start with a ring disk on its `-s` list.
