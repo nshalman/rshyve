@@ -131,6 +131,79 @@ pub(super) fn parse_vcpu_regs(
     Ok(out)
 }
 
+/// Registers a v9 source did not send.
+const V10_REGS: [vm_reg_name; 6] = [
+    vm_reg_name::VM_REG_GUEST_DR0,
+    vm_reg_name::VM_REG_GUEST_DR1,
+    vm_reg_name::VM_REG_GUEST_DR2,
+    vm_reg_name::VM_REG_GUEST_DR3,
+    vm_reg_name::VM_REG_GUEST_DR6,
+    vm_reg_name::VM_REG_GUEST_INTR_SHADOW,
+];
+
+/// Every register this build exports, each once, and nothing else. A
+/// register left out would resume at the destination's reset value.
+///
+/// A v9 source sends the list without [`V10_REGS`].
+fn check_register_set(
+    vcpuid: i32,
+    writes: &[RegWrite],
+    current_peer: bool,
+) -> Result<(), MigrateError> {
+    use std::collections::BTreeSet;
+    let id = |r: vm_reg_name| r as i32;
+    let mut want: BTreeSet<i32> =
+        super::VCPU_REGS.iter().map(|&r| id(r)).collect();
+    want.insert(id(vm_reg_name::VM_REG_GUEST_INTR_SHADOW));
+    if !current_peer {
+        for r in V10_REGS {
+            want.remove(&id(r));
+        }
+    }
+    let want_seg: BTreeSet<i32> =
+        super::VCPU_SEG_DESCS.iter().map(|&r| id(r)).collect();
+
+    let (mut regs, mut segs) = (BTreeSet::new(), BTreeSet::new());
+    for write in writes {
+        let (set, reg) = match *write {
+            RegWrite::Reg(reg, value) => {
+                // get_reg answers 0 or 1 on both VMX and SVM.
+                if matches!(reg, vm_reg_name::VM_REG_GUEST_INTR_SHADOW)
+                    && value > 1
+                {
+                    return Err(MigrateError::State(format!(
+                        "vcpu {vcpuid}: interrupt shadow {value:#x}"
+                    )));
+                }
+                (&mut regs, reg)
+            }
+            RegWrite::Seg(reg, ..) => (&mut segs, reg),
+        };
+        if !set.insert(id(reg)) {
+            return Err(MigrateError::State(format!(
+                "vcpu {vcpuid}: register {reg:?} appears twice"
+            )));
+        }
+    }
+    if regs != want || segs != want_seg {
+        let missing: Vec<i32> = want
+            .difference(&regs)
+            .chain(want_seg.difference(&segs))
+            .copied()
+            .collect();
+        let extra: Vec<i32> = regs
+            .difference(&want)
+            .chain(segs.difference(&want_seg))
+            .copied()
+            .collect();
+        return Err(MigrateError::State(format!(
+            "vcpu {vcpuid}: register set differs: missing ids {missing:?}, \
+             unexpected ids {extra:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// The vmm-data class shapes the local kernel registers, read from
 /// VDC_VERSION: one entry per (class, version) pair, with the total
 /// length the kernel expects (`vve_len_expect`, 0 when variable) and
@@ -242,6 +315,7 @@ pub(super) fn check_device_state(
     layouts: &[vdi_version_entry_v1],
     num_cpus: u32,
     amd_host: bool,
+    current_peer: bool,
 ) -> Result<(), MigrateError> {
     // One payload per vCPU, no more and no fewer. The kernel accepts
     // any id below VM_MAXCPU, so a payload for a vCPU this VM never
@@ -311,7 +385,8 @@ pub(super) fn check_device_state(
                 "vcpu {id}: register state is missing from the payload"
             )));
         }
-        parse_vcpu_regs(id, &vcpu.registers)?;
+        let writes = parse_vcpu_regs(id, &vcpu.registers)?;
+        check_register_set(id, &writes, current_peer)?;
     }
 
     // A source carries it for every vCPU or for none.
@@ -447,11 +522,23 @@ pub(crate) mod fixtures {
         data
     }
 
+    /// Every register a current source sends.
+    pub(crate) fn full_reg_blob(shadow: u64) -> Vec<u8> {
+        let mut regs: Vec<(vm_reg_name, u64)> = super::super::VCPU_REGS
+            .iter()
+            .map(|&r| (r, 0x1234))
+            .collect();
+        regs.push((vm_reg_name::VM_REG_GUEST_INTR_SHADOW, shadow));
+        reg_blob(&regs, super::super::VCPU_SEG_DESCS)
+    }
+
     pub(crate) fn default_reg_blob() -> Vec<u8> {
-        reg_blob(
-            &[(vm_reg_name::VM_REG_GUEST_RAX, 0x1234)],
-            &[vm_reg_name::VM_REG_GUEST_CS],
-        )
+        full_reg_blob(0)
+    }
+
+    /// The number of writes [`default_reg_blob`] decodes to.
+    pub(crate) fn full_reg_count() -> usize {
+        super::super::VCPU_REGS.len() + 1 + super::super::VCPU_SEG_DESCS.len()
     }
 
     pub(crate) fn vcpu_payload(vcpuid: i32) -> VcpuStatePayload {
@@ -509,6 +596,44 @@ mod tests {
         let mut blob = default_reg_blob();
         blob.push(0);
         assert!(parse_vcpu_regs(0, &blob).is_err());
+    }
+
+    fn decoded(blob: &[u8]) -> Vec<RegWrite> {
+        parse_vcpu_regs(0, blob).expect("decodes")
+    }
+
+    #[test]
+    fn the_register_set_must_be_whole() {
+        let full = decoded(&default_reg_blob());
+        check_register_set(0, &full, true).expect("current");
+        check_register_set(0, &full, false).expect_err("v9 sends no DRs");
+
+        let mut short = full.clone();
+        short.retain(|w| {
+            !matches!(w, RegWrite::Reg(vm_reg_name::VM_REG_GUEST_DR6, _))
+        });
+        let error = check_register_set(0, &short, true).expect_err("no DR6");
+        assert!(error.to_string().contains("missing"), "{error}");
+
+        let mut twice = full.clone();
+        twice.push(full[0]);
+        let error = check_register_set(0, &twice, true).expect_err("twice");
+        assert!(error.to_string().contains("twice"), "{error}");
+
+        let v9: Vec<RegWrite> = full
+            .iter()
+            .copied()
+            .filter(|w| {
+                !matches!(w, RegWrite::Reg(r, _)
+                    if V10_REGS.iter().any(|&n| n as i32 == *r as i32))
+            })
+            .collect();
+        check_register_set(0, &v9, false).expect("a v9 source");
+        check_register_set(0, &v9, true).expect_err("a v10 source sends all");
+
+        let bad = decoded(&full_reg_blob(7));
+        let error = check_register_set(0, &bad, true).expect_err("shadow 7");
+        assert!(error.to_string().contains("shadow"), "{error}");
     }
 
     #[test]

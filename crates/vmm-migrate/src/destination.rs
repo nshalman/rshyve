@@ -215,6 +215,7 @@ fn run_inner<S: Transport>(
         &dev_state,
         config.num_cpus,
         &xsave,
+        protocol == protocol::PROTOCOL_RON,
         log,
     ) {
         chan.report_failure(&e, log);

@@ -438,6 +438,7 @@ pub fn import_device_state(
     state: &DeviceState,
     num_cpus: u32,
     xsave: &XsavePlan<'_>,
+    current_peer: bool,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     let layouts = read_class_layouts(hdl)?;
@@ -447,7 +448,7 @@ pub fn import_device_state(
         state,
         num_cpus,
         xsave,
-        crate::cpu::host_is_amd(),
+        (crate::cpu::host_is_amd(), current_peer),
         log,
     )
 }
@@ -462,10 +463,10 @@ fn import_device_state_into(
     state: &DeviceState,
     num_cpus: u32,
     xsave: &XsavePlan<'_>,
-    amd_host: bool,
+    (amd_host, current_peer): (bool, bool),
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
-    check_device_state(state, layouts, num_cpus, amd_host)?;
+    check_device_state(state, layouts, num_cpus, amd_host, current_peer)?;
     let fpu: Vec<Vec<u8>> = state
         .vcpus
         .iter()
@@ -499,9 +500,9 @@ fn import_device_state_into(
             match write {
                 // VMX refuses to force a shadow on. The guest may then
                 // take an interrupt one instruction early, which beats
-                // failing a migration after the gate's go.
-                RegWrite::Reg(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, v)
-                    if v != 0 =>
+                // failing a migration after the gate's go. SVM takes it.
+                RegWrite::Reg(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, 1)
+                    if !amd_host =>
                 {
                     if let Err(e) = sink.write_reg(id, write) {
                         slog::warn!(log, "the interrupt shadow was not \
@@ -646,7 +647,7 @@ mod tests {
             state,
             num_cpus,
             &plan(&xsave),
-            false,
+            (false, true),
             &test_log(),
         );
         (sink, result)
@@ -665,7 +666,7 @@ mod tests {
             state,
             num_cpus,
             &plan(&xsave),
-            false,
+            (false, true),
             &test_log(),
         );
         (sink, result)
@@ -683,7 +684,7 @@ mod tests {
             state,
             state.vcpus.len() as u32,
             &plan(&xsave),
-            amd_host,
+            (amd_host, true),
             &test_log(),
         );
         (sink, result)
@@ -712,32 +713,33 @@ mod tests {
     #[test]
     fn a_shadow_vmx_cannot_force_does_not_fail_the_import() {
         let mut state = good_state();
-        state.vcpus[0].registers = reg_blob(
-            &[
-                (vm_reg_name::VM_REG_GUEST_RAX, 1),
-                (vm_reg_name::VM_REG_GUEST_INTR_SHADOW, 1),
-            ],
-            &[],
-        );
+        state.vcpus[0].registers = full_reg_blob(1);
         let sink = RecordingSink {
             vmx: true,
             ..RecordingSink::default()
         };
         let (sink, result) = import_on(sink, &state, false);
-        result.expect("a lost shadow is a warning");
-        assert_eq!(sink.regs.borrow().len(), 1, "RAX still written");
+        result.expect("a lost shadow is a warning on VMX");
+        assert_eq!(sink.regs.borrow().len(), full_reg_count() - 1);
         assert!(sink.wrote_class(bhyve_api::VDC_VMM_ARCH, Some(0)));
 
+        // On SVM a refused shadow is a real failure.
+        let sink = RecordingSink {
+            vmx: true,
+            ..RecordingSink::default()
+        };
+        let (_, result) = import_on(sink, &state, true);
+        result.map(|_| ()).expect_err("SVM takes a shadow");
+
         // Clearing it is always taken.
-        state.vcpus[0].registers =
-            reg_blob(&[(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, 0)], &[]);
+        state.vcpus[0].registers = full_reg_blob(0);
         let sink = RecordingSink {
             vmx: true,
             ..RecordingSink::default()
         };
         let (sink, result) = import_on(sink, &state, false);
         result.expect("cleared");
-        assert_eq!(sink.regs.borrow().len(), 1);
+        assert_eq!(sink.regs.borrow().len(), full_reg_count());
     }
 
     #[test]
@@ -823,7 +825,7 @@ mod tests {
         for &(_, class, _) in SYSTEM_DEVICES {
             assert!(sink.wrote_class(class, None), "class {class} not written");
         }
-        assert_eq!(sink.regs.borrow().len(), 2);
+        assert_eq!(sink.regs.borrow().len(), full_reg_count());
         assert_eq!(sink.run_states.borrow().len(), 1);
         assert_eq!(sink.fpus.borrow().as_slice(), &[(0, TEST_XSAVE_LEN)]);
     }
