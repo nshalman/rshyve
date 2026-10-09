@@ -295,57 +295,6 @@ impl MigrateTarget {
     }
 }
 
-/// An absolute path for a socket the agent listens on.
-fn agent_socket(path: &str) -> Result<PathBuf, String> {
-    let p = PathBuf::from(path);
-    if !p.is_absolute() || path.contains('\0') {
-        return Err(format!("'{path}' is not an absolute socket path"));
-    }
-    Ok(p)
-}
-
-/// The gate's wait, from the request. Refused rather than cut down, so
-/// an orchestrator learns its timeout was not used.
-fn gate_budget(ms: Option<u64>) -> Result<Duration, String> {
-    let Some(ms) = ms else {
-        return Ok(vmm_migrate::gate::DEFAULT_BUDGET);
-    };
-    let budget = Duration::from_millis(ms);
-    if budget.is_zero() || budget > vmm_migrate::gate::MAX_BUDGET {
-        return Err(format!(
-            "gate_timeout_ms must be 1 to {}",
-            vmm_migrate::gate::MAX_BUDGET.as_millis()
-        ));
-    }
-    Ok(budget)
-}
-
-/// How long an import waits for its ring disks after the commit.
-const RING_ATTACH_DEFAULT: Duration = Duration::from_secs(120);
-const RING_ATTACH_MAX: Duration = Duration::from_secs(600);
-
-fn ring_attach_budget(ms: Option<u64>) -> Result<Duration, String> {
-    let Some(ms) = ms else {
-        return Ok(RING_ATTACH_DEFAULT);
-    };
-    let budget = Duration::from_millis(ms);
-    if budget.is_zero() || budget > RING_ATTACH_MAX {
-        return Err(format!(
-            "ring_attach_timeout_ms must be 1 to {}",
-            RING_ATTACH_MAX.as_millis()
-        ));
-    }
-    Ok(budget)
-}
-
-/// What `migrate-source` asks for beyond the target.
-pub(super) struct SourceAsk {
-    pub(super) zfs_barrier: Option<String>,
-    pub(super) gate: Option<String>,
-    pub(super) gate_timeout_ms: Option<u64>,
-    pub(super) allow_unproven: bool,
-}
-
 // ── Handlers ────────────────────────────────────────────────────────
 
 pub(super) fn migrate_source(
@@ -690,13 +639,6 @@ fn run_source<S: vmm_migrate::wire::Transport>(
     .map_err(SourceOutcome::from)
 }
 
-/// What `migrate-dest` asks for beyond the address.
-pub(super) struct DestAsk {
-    pub(super) allow_cpu_feature_mismatch: bool,
-    pub(super) ring_attach_timeout_ms: Option<u64>,
-    pub(super) allow_unproven: bool,
-}
-
 pub(super) fn migrate_dest(
     ctrl: &Arc<VmController>,
     listen_addr: String,
@@ -924,10 +866,13 @@ pub(super) fn migrate_status(ctrl: &Arc<VmController>) -> Response {
             r.migrate_phase = Some(s.phase.to_string());
             r.migrate_bytes = Some(s.bytes_transferred);
             r.migrate_pages = Some(s.pages_transferred);
-            r.data = Some(serde_json::json!({
+            let mut data = serde_json::json!({
                 "migrate_gate": s.gate.to_string(),
-                "migrate_rings": ctrl.rings_state(),
-            }));
+            });
+            if let Some(rings) = ctrl.rings_state() {
+                data["migrate_rings"] = rings.into();
+            }
+            r.data = Some(data);
             r
         }
         None => {
@@ -998,6 +943,10 @@ fn with_destination_options(
     parts.push(&extra);
     parts.join(",")
 }
+
+mod ask;
+use ask::{agent_socket, gate_budget, ring_attach_budget, RING_ATTACH_DEFAULT};
+pub(super) use ask::{DestAsk, SourceAsk};
 
 #[cfg(test)]
 mod tests;

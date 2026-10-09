@@ -299,14 +299,13 @@ fn a_ring_disk_blocks_migrate_source() {
         let registry = vmm_machine::DeviceRegistry::new();
         disk_at(&registry, "5", Some(RING), hot_added);
         let run = RunControl::new(VmRunState::Running);
-        let reason =
-            claim_source(
-                &run,
-                &HotplugEngines::default(),
-                &registry,
-                || identities(&registry),
-                false,
-            );
+        let reason = claim_source(
+            &run,
+            &HotplugEngines::default(),
+            &registry,
+            || identities(&registry),
+            false,
+        );
         assert_names_the_ring_disk(reason.err(), "5");
         assert_eq!(run.get(), VmRunState::Running);
     }
