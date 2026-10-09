@@ -175,6 +175,13 @@ fn ring_shape(
         "nvme: volume {} on a migration destination needs ring-shape=",
         opts.volume
     );
+    // Only a destination may build a disk it does not attach.
+    anyhow::ensure!(
+        shape.is_none() || is_migrate_dest,
+        "nvme: ring-shape= is for a migration destination \
+         (--migrate-listen) only (volume {})",
+        opts.volume
+    );
     Ok(shape)
 }
 
@@ -299,13 +306,7 @@ fn parse_and_create_pci_device(
             }
             devspec::NvmeSpec::MantaBlock(opts) => {
                 let shape = ring_shape(&opts, is_migrate_dest)?;
-                let nvme = mantablock_nvme(
-                    &opts,
-                    shape,
-                    is_migrate_dest,
-                    bdf.dev(),
-                    ctx,
-                )?;
+                let nvme = mantablock_nvme(&opts, shape, bdf.dev(), ctx)?;
                 chipset.try_attach_device(bdf, nvme.clone())?;
                 info!(log, "nvme attached";
                     "bdf" => %bdf,
@@ -472,14 +473,13 @@ fn parse_and_create_pci_device(
 
 /// An NVMe controller on a MantaBlock volume.
 ///
-/// A migration destination attaches nothing here: the source holds the
-/// volume until its commit, and the orchestrator moves the volume after
-/// it. The disk attaches before the guest runs. Any other VM attaches
-/// now, and a `shape` it was given must be what the engine grants.
+/// With a `shape`, which only a migration destination has, nothing
+/// attaches here: the source holds the volume until its commit, and the
+/// orchestrator moves the volume after it. The disk attaches before the
+/// guest runs. Any other VM attaches now.
 fn mantablock_nvme(
     opts: &devspec::MantaBlockOpts,
     shape: Option<vmm_mantablock::RingShape>,
-    is_migrate_dest: bool,
     instance_id: u8,
     ctx: &vmm_machine::PciDeviceCtx<'_>,
 ) -> anyhow::Result<Arc<vmm_storage::nvme::NvmeController>> {
@@ -497,7 +497,7 @@ fn mantablock_nvme(
         cfg.spin = Duration::from_micros(u64::from(us));
     }
     let (backend, config) = match shape {
-        Some(shape) if is_migrate_dest => {
+        Some(shape) => {
             info!(log, "nvme: the volume attaches after the migration \
                 commits"; "shape" => %shape);
             (
@@ -505,7 +505,7 @@ fn mantablock_nvme(
                 shape.nvme_config(),
             )
         }
-        _ => {
+        None => {
             let conn = vmm_mantablock::connect(cfg).with_context(|| {
                 format!(
                     "nvme: cannot attach volume {} at {}",
@@ -513,14 +513,6 @@ fn mantablock_nvme(
                     opts.socket.display()
                 )
             })?;
-            if let Some(want) = shape {
-                anyhow::ensure!(
-                    conn.shape() == want,
-                    "nvme: volume {} attached as {}, not ring-shape={want}",
-                    opts.volume,
-                    conn.shape()
-                );
-            }
             if !conn.durable() {
                 warn!(
                     log,
@@ -751,6 +743,8 @@ mod tests {
 
         let good = opts(Some("1:256:4096:1:8:2:d"));
         let shape = ring_shape(&good, true).expect("a shape").expect("some");
+        // Elsewhere it would build a disk that never attaches.
+        assert!(ring_shape(&good, false).is_err());
         assert_eq!(shape.to_string(), "1:256:4096:1:8:2:d");
         assert!(ring_shape(&opts(Some("1:256")), true).is_err());
     }

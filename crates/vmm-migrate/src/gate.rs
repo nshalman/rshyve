@@ -65,7 +65,9 @@ pub fn wait(
 ) -> Result<(), MigrateError> {
     set(status, GateState::Waiting);
     let until = Instant::now() + budget.min(MAX_BUDGET);
-    let stream = crate::connect::unix(path, || stop.cancelled())?
+    // A listener with a full backlog must not hold a paused guest past
+    // the budget.
+    let stream = crate::connect::unix_until(path, until, || stop.cancelled())?
         .map_err(|e| abort(status, format!("gate connect: {e}")))?;
     let shut = stream
         .try_clone()

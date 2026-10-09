@@ -123,8 +123,12 @@ impl VmController {
         &self,
         until: Instant,
     ) -> Result<(), String> {
+        // The attach can take until `until`, so it runs outside the lock
+        // a stop needs. Checked first: a source whose destination took
+        // the guest must not attach its disks again.
+        self.run.held_source().map_err(held_refusal)?;
+        self.attach_backing(until)?;
         let resumed = self.run.resume_held(|held| {
-            self.attach_backing(until).map_err(StepFailed::Undone)?;
             self.resume_devices_after_migration();
             if let Err(e) = self.release_pause() {
                 error!(self.log, "resume failed"; "error" => %e);
@@ -144,16 +148,24 @@ impl VmController {
             *held = false;
             Ok(())
         });
-        resumed.map_err(|e| match e {
-            HeldFailed::NotHeld => "not a source waiting for the \
-                orchestrator's order: it never got the gate's go and an \
-                unconfirmed commit, or its destination confirmed the start"
-                .to_string(),
-            HeldFailed::Running => {
-                "the migration is still running; retry when it ends".to_string()
-            }
-            HeldFailed::Step(why) => why,
-        })
+        if let Err(HeldFailed::NotHeld | HeldFailed::Running) = &resumed {
+            // A stop took the VM while the disks attached.
+            self.detach_backing();
+        }
+        resumed.map_err(held_refusal)
+    }
+}
+
+fn held_refusal(e: HeldFailed<String>) -> String {
+    match e {
+        HeldFailed::NotHeld => "not a source waiting for the orchestrator's \
+            order: it never got the gate's go or an unconfirmed commit, or \
+            its destination confirmed the start"
+            .to_string(),
+        HeldFailed::Running => {
+            "the migration is still running; retry when it ends".to_string()
+        }
+        HeldFailed::Step(why) => why,
     }
 }
 

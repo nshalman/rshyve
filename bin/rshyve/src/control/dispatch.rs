@@ -20,7 +20,7 @@ use vmm_machine::{
 
 use super::migrate::{
     migrate_config, migrate_dest, migrate_resume_source, migrate_source,
-    migrate_status, migration_source_guard, DestAsk, SourceAsk,
+    migrate_status, migration_source_guard, SourceAsk,
 };
 use super::protocol::{Command, Response};
 use super::run_state::{
@@ -100,17 +100,7 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
         Command::MigrateDest {
             listen_addr,
             allow_cpu_feature_mismatch,
-            ring_attach_timeout_ms,
-            allow_engine_without_migrate_v1,
-        } => migrate_dest(
-            ctrl,
-            listen_addr,
-            DestAsk {
-                allow_cpu_feature_mismatch,
-                ring_attach_timeout_ms,
-                allow_unproven: allow_engine_without_migrate_v1,
-            },
-        ),
+        } => migrate_dest(ctrl, listen_addr, allow_cpu_feature_mismatch),
 
         Command::MigrateResumeSource => migrate_resume_source(ctrl),
 

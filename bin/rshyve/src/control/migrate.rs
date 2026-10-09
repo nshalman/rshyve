@@ -274,7 +274,33 @@ fn claim_dest(
     run: &RunControl,
     registry: &vmm_machine::DeviceRegistry,
 ) -> Result<(), String> {
-    run.admit_import(|| device_blockers(registry))
+    run.admit_import(|| {
+        device_blockers(registry).or_else(|| handover_import(registry))
+    })
+}
+
+/// A VM that is already running attached its ring disks at boot, and
+/// the source still owns those volumes. Only a VM started with
+/// `--migrate-listen` builds them detached.
+fn handover_import(registry: &vmm_machine::DeviceRegistry) -> Option<String> {
+    let rings: Vec<String> = registry
+        .list()
+        .into_iter()
+        .filter(|slot| {
+            slot.lifecycle
+                .as_ref()
+                .is_some_and(|d| d.migration_spec_options().is_some())
+        })
+        .map(|slot| slot.id)
+        .collect();
+    if rings.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "migrate-dest cannot take a MantaBlock disk ({}); start the \
+         destination with --migrate-listen",
+        rings.join(" ")
+    ))
 }
 
 /// Where a migration source connects to.
@@ -345,6 +371,7 @@ pub(super) fn migrate_source(
         zfs_barrier: zfs_barrier.map(PathBuf::from),
         gate,
         gate_budget,
+        handover: ctrl.has_handover_disks(),
     };
 
     if let Err(e) =
@@ -642,22 +669,16 @@ fn run_source<S: vmm_migrate::wire::Transport>(
 pub(super) fn migrate_dest(
     ctrl: &Arc<VmController>,
     listen_addr: String,
-    ask: DestAsk,
+    allow_cpu_feature_mismatch: bool,
 ) -> Response {
     let source = match MigrateTarget::parse(&listen_addr) {
         Ok(source) => source,
         Err(e) => return Response::err(&format!("invalid listen_addr: {e}")),
     };
-    let attach_budget = match ring_attach_budget(ask.ring_attach_timeout_ms) {
-        Ok(budget) => budget,
-        Err(e) => return Response::err(&e),
-    };
-    let allow_cpu_feature_mismatch = ask.allow_cpu_feature_mismatch;
 
     if let Err(why) = claim_dest(&ctrl.run, &ctrl.registry) {
         return Response::err(&why);
     }
-    ctrl.set_allow_unproven(ask.allow_unproven);
 
     let status = Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
     if let Ok(mut ms) = ctrl.migrate_status.lock() {
@@ -682,7 +703,7 @@ pub(super) fn migrate_dest(
             .name("migrate-dest".into())
             .spawn(move || {
                 let lease = MigrationLease::new(ctrl_arc.as_ref());
-                let hooks = dest_hooks(&ctrl_arc, attach_budget);
+                let hooks = dest_hooks(&ctrl_arc);
                 let run = &ctrl_arc.run;
                 let outcome = match source {
                     MigrateTarget::Unix(path) => {
@@ -766,10 +787,7 @@ fn connect_unix_patient(
 }
 
 /// The device hooks the destination import drives.
-fn dest_hooks(
-    ctrl: &Arc<VmController>,
-    attach_budget: Duration,
-) -> vmm_migrate::destination::DestHooks {
+fn dest_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::destination::DestHooks {
     let for_restore = Arc::clone(ctrl);
     let for_attach = Arc::clone(ctrl);
     let for_resume = Arc::clone(ctrl);
@@ -780,7 +798,8 @@ fn dest_hooks(
             for_restore.restore_device_state(bdf, state)
         }),
         attach: Box::new(move || {
-            for_attach.attach_backing(std::time::Instant::now() + attach_budget)
+            for_attach
+                .attach_backing(std::time::Instant::now() + RING_ATTACH_DEFAULT)
         }),
         resume: Box::new(move || {
             for_resume.resume_devices();
@@ -945,8 +964,8 @@ fn with_destination_options(
 }
 
 mod ask;
-use ask::{agent_socket, gate_budget, ring_attach_budget, RING_ATTACH_DEFAULT};
-pub(super) use ask::{DestAsk, SourceAsk};
+pub(super) use ask::SourceAsk;
+use ask::{agent_socket, gate_budget, RING_ATTACH_DEFAULT};
 
 #[cfg(test)]
 mod tests;

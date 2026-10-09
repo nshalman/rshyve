@@ -45,7 +45,7 @@ use crate::limits::{BATCH_SIZE, ZSTD_LEVEL};
 use crate::pages::{
     are_contiguous, build_contiguous_gpas, page_buffer_len, read_pages,
 };
-use crate::protocol::{PageIter, PAGE_SIZE, SOURCE_OFFER};
+use crate::protocol::{PageIter, PAGE_SIZE, PROTOCOL_RON, SOURCE_OFFER};
 use crate::state;
 use crate::wait::{unless_cancelled, Abandoned};
 use crate::wire::{
@@ -129,6 +129,9 @@ pub struct SourceConfig {
     pub gate: Option<PathBuf>,
     /// How long the gate waits for an answer.
     pub gate_budget: Duration,
+    /// A disk changes hands at the commit, which only a destination of
+    /// the current protocol does.
+    pub handover: bool,
 }
 
 /// The device lifecycle hooks the phases drive.
@@ -262,6 +265,15 @@ fn run_inner<S: Transport>(
     if !SOURCE_OFFER.contains(&sel.protocol.as_str()) {
         return Err(MigrateError::ProtocolMismatch(crate::wire::peer_text(
             &sel.protocol,
+        )));
+    }
+    // Found out here, not at the export: by then the gate may have said
+    // go, and the source could not roll back by itself.
+    if config.handover && sel.protocol != PROTOCOL_RON {
+        return Err(MigrateError::ProtocolMismatch(format!(
+            "the destination speaks {}, which cannot attach a disk after \
+             the commit",
+            crate::wire::peer_text(&sel.protocol)
         )));
     }
 

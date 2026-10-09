@@ -206,10 +206,15 @@ impl<J: Job> Handover<J> {
     /// The backend of a migration destination: the source's shape and
     /// nothing attached until [`Self::attach`].
     pub fn deferred(
-        cfg: Config,
+        mut cfg: Config,
         shape: RingShape,
         sink: Arc<dyn Sink<J::Id>>,
     ) -> Arc<Self> {
+        // Ask for what the source had, so an engine that granted it less
+        // there grants the same here.
+        cfg.queues = shape.queues;
+        cfg.depth = u32::from(shape.tags).next_power_of_two();
+        cfg.part_blocks = shape.part_blocks;
         Arc::new(Self {
             cfg,
             shape,

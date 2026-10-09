@@ -53,13 +53,6 @@ pub(super) enum Command {
         /// orchestrator has to ask for it per migration.
         #[serde(default)]
         allow_cpu_feature_mismatch: bool,
-        /// How long the import waits for each ring disk to attach after
-        /// the source committed.
-        #[serde(default)]
-        ring_attach_timeout_ms: Option<u64>,
-        /// Take a ring engine that does not report migrate-v1. Lab only.
-        #[serde(default)]
-        allow_engine_without_migrate_v1: bool,
     },
     /// The orchestrator's order that this source keeps the guest, after
     /// the gate's go or an unconfirmed commit.
@@ -311,22 +304,6 @@ mod tests {
         assert_eq!(gate.as_deref(), Some("/g.sock"));
         assert_eq!(gate_timeout_ms, Some(5000));
         assert!(allow_engine_without_migrate_v1);
-
-        let cmd: Command = serde_json::from_str(
-            r#"{"command":"migrate-dest","listen_addr":"/d.sock",
-                "ring_attach_timeout_ms":1000}"#,
-        )
-        .unwrap();
-        let Command::MigrateDest {
-            ring_attach_timeout_ms,
-            allow_engine_without_migrate_v1,
-            ..
-        } = cmd
-        else {
-            panic!("wrong command");
-        };
-        assert_eq!(ring_attach_timeout_ms, Some(1000));
-        assert!(!allow_engine_without_migrate_v1);
 
         let cmd: Command =
             serde_json::from_str(r#"{"command":"migrate-resume-source"}"#)

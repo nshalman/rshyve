@@ -554,6 +554,18 @@ impl RunControl {
     /// migration thread has ended and it still holds the pause.
     ///
     /// `step` gets the pause-held flag, as in [`Self::change`].
+    /// Whether [`Self::resume_held`] would take this VM now.
+    pub(super) fn held_source<E>(&self) -> Result<(), HeldFailed<E>> {
+        let hold = self.lock_changing();
+        if self.get() != VmRunState::Migrating || !hold.held {
+            return Err(HeldFailed::NotHeld);
+        }
+        if hold.migration.is_some() {
+            return Err(HeldFailed::Running);
+        }
+        Ok(())
+    }
+
     pub(super) fn resume_held<E>(
         &self,
         step: impl FnOnce(&mut bool) -> Result<(), StepFailed<E>>,

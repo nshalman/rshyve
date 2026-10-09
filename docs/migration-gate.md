@@ -50,15 +50,11 @@ connects to a Unix socket that the agent listens on. Two more flags:
 | `--migrate-ring-attach-timeout-ms` | Wait for each ring disk to attach after the commit. Default 120000 |
 | `--migrate-allow-unproven-engine` | Lab only. See "Engine check" |
 
-A paused VM can also take an import with `migrate-dest`. A
-`listen_addr` that is a path works the same way: rshyve connects to it.
-
-```json
-{"command":"migrate-dest",
- "listen_addr":"/var/run/rshyve/migrate.sock",
- "ring_attach_timeout_ms":120000,
- "allow_engine_without_migrate_v1":false}
-```
+`ring-shape=` is refused on a VM started without `--migrate-listen`.
+The control request `migrate-dest` refuses a VM with a ring disk: a VM
+that already runs attached its disks at boot, and the source still owns
+those volumes. `migrate-dest` takes a path `listen_addr` for other VMs,
+and then connects to it as `--migrate-listen` does.
 
 ### Source order
 
@@ -127,7 +123,7 @@ Write the `committing` state of the VM migration record before you send
 
 | What | Default | Where |
 |---|---|---|
-| Gate answer | 10 s, max 25 s | `gate_timeout_ms` |
+| Gate connect and answer | 10 s, max 25 s | `gate_timeout_ms` |
 | Source waits for the destination start after the commit | 150 s | fixed |
 | Destination waits for each ring disk to attach | 120 s | `--migrate-ring-attach-timeout-ms` |
 | Each Hello and Attach try | 5 s | fixed |
@@ -146,10 +142,9 @@ another shape stops the retries.
   generation. It checks that the grant has the shape the guest saw. No
   device resumes before every ring disk attached. Then the vCPUs start,
   and the destination tells the source it started.
-- If an attach fails, the destination keeps the guest paused. With
-  `--migrate-listen` the process exits; the source still holds the
-  paused guest. With `migrate-dest` the VM is `import-committed`, and a
-  `resume` tries the attach again first.
+- If an attach fails, the destination process exits and the guest
+  never runs there. The source still holds the paused guest: set the
+  record to `source` and send `migrate-resume-source`.
 
 ## Engine check
 
@@ -168,5 +163,6 @@ write as a duplicate.
 ## Stream version
 
 The migration stream is `vmm-migrate-ron/7`. Its payload is the v4
-payload. A source sends a ring disk only to a v7 destination. An older
-destination does not start with a ring disk on its `-s` list.
+payload. A source with a ring disk refuses any other version right
+after the protocol choice, before the pause. An older destination does
+not start with a ring disk on its `-s` list.

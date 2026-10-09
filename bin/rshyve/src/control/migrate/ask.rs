@@ -32,35 +32,13 @@ pub(super) fn gate_budget(ms: Option<u64>) -> Result<Duration, String> {
     Ok(budget)
 }
 
-/// How long an import waits for its ring disks after the commit.
+/// How long a disk may take to attach before a guest runs again.
 pub(super) const RING_ATTACH_DEFAULT: Duration = Duration::from_secs(120);
-pub(super) const RING_ATTACH_MAX: Duration = Duration::from_secs(600);
-
-pub(super) fn ring_attach_budget(ms: Option<u64>) -> Result<Duration, String> {
-    let Some(ms) = ms else {
-        return Ok(RING_ATTACH_DEFAULT);
-    };
-    let budget = Duration::from_millis(ms);
-    if budget.is_zero() || budget > RING_ATTACH_MAX {
-        return Err(format!(
-            "ring_attach_timeout_ms must be 1 to {}",
-            RING_ATTACH_MAX.as_millis()
-        ));
-    }
-    Ok(budget)
-}
 
 /// What `migrate-source` asks for beyond the target.
 pub(in crate::control) struct SourceAsk {
     pub(in crate::control) zfs_barrier: Option<String>,
     pub(in crate::control) gate: Option<String>,
     pub(in crate::control) gate_timeout_ms: Option<u64>,
-    pub(in crate::control) allow_unproven: bool,
-}
-
-/// What `migrate-dest` asks for beyond the address.
-pub(in crate::control) struct DestAsk {
-    pub(in crate::control) allow_cpu_feature_mismatch: bool,
-    pub(in crate::control) ring_attach_timeout_ms: Option<u64>,
     pub(in crate::control) allow_unproven: bool,
 }

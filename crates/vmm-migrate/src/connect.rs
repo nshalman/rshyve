@@ -39,6 +39,22 @@ pub fn unix(
         .map(UnixStream::from))
 }
 
+/// As [`unix`], giving up at `deadline` as well.
+pub fn unix_until(
+    path: &Path,
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+) -> Result<io::Result<UnixStream>, MigrateError> {
+    let addr = match SocketAddrUnix::new(path) {
+        Ok(addr) => addr,
+        Err(e) => return Ok(Err(e.into())),
+    };
+    Ok(
+        connect(AddressFamily::UNIX, &addr, Some(deadline), &cancelled)?
+            .map(UnixStream::from),
+    )
+}
+
 /// Connect to `addr` until `cancelled` or `timeout`.
 pub fn tcp(
     addr: SocketAddr,

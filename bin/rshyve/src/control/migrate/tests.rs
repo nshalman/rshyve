@@ -635,14 +635,11 @@ fn migrate_config_gives_a_ring_disk_its_shape_once() {
 }
 
 #[test]
-fn the_gate_and_attach_waits_are_bounded() {
+fn the_gate_wait_is_bounded() {
     assert_eq!(gate_budget(None), Ok(vmm_migrate::gate::DEFAULT_BUDGET));
     assert_eq!(gate_budget(Some(5000)), Ok(Duration::from_secs(5)));
     assert!(gate_budget(Some(0)).is_err());
     assert!(gate_budget(Some(25_001)).is_err());
-    assert_eq!(ring_attach_budget(None), Ok(RING_ATTACH_DEFAULT));
-    assert!(ring_attach_budget(Some(0)).is_err());
-    assert!(ring_attach_budget(Some(600_001)).is_err());
 }
 
 #[test]
@@ -650,4 +647,16 @@ fn the_gate_is_an_absolute_socket_path() {
     assert!(agent_socket("/var/run/gate.sock").is_ok());
     assert!(agent_socket("gate.sock").is_err());
     assert!(agent_socket("/var/run/a\0b").is_err());
+}
+
+#[test]
+fn a_running_vm_cannot_import_a_ring_disk() {
+    // It attached the volume at boot, and the source still owns it.
+    let registry = vmm_machine::DeviceRegistry::new();
+    unproven_at(&registry, "5");
+    let run = RunControl::new(VmRunState::Paused);
+    let why = claim_dest(&run, &registry).expect_err("a ring disk");
+    assert!(why.contains("nvme@5"), "{why}");
+    assert!(why.contains("--migrate-listen"), "{why}");
+    assert_eq!(run.get(), VmRunState::Paused);
 }
