@@ -20,6 +20,7 @@
 //! - Command ring, event ring, and per-endpoint transfer rings.
 
 pub mod bits;
+mod migrate;
 pub mod tablet;
 
 use std::sync::{Arc, Mutex, Weak};
@@ -28,6 +29,7 @@ use vmm_core::common::RWOp;
 use vmm_core::mem::PhysMap;
 use vmm_core::mmio::{MmioBus, MmioFn};
 
+use vmm_devices::lifecycle::DeviceStateError;
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use vmm_devices::pci::{BarN, IntrPin};
@@ -35,6 +37,13 @@ use vmm_devices::Lifecycle;
 
 use bits::*;
 use tablet::TabletDevice;
+
+/// Cap on the event ring size, so a malicious guest cannot set an
+/// enormous size that lets the enqueue pointer sweep across a huge
+/// range of guest physical addresses before wrapping. xHCI allows
+/// larger ERST entries, but 4096 entries (64 KiB of TRBs) is more than
+/// sufficient.
+const MAX_EVENT_RING_SIZE: u32 = 4096;
 
 /// Replace the low dword of a 64-bit register.
 fn merge_low_dword(reg: u64, val: u32) -> u64 {
@@ -126,6 +135,12 @@ struct XhciState {
     ep1_in_ring: TransferRing,
     /// Whether EP1 IN has pending TRBs queued by the guest.
     ep1_in_has_trbs: bool,
+
+    /// Pointer reports wait in the tablet while set. The remote console
+    /// thread is the one writer of guest memory that runs when no vCPU
+    /// does, and a write after the last RAM pass never reaches the
+    /// destination.
+    paused: bool,
 }
 
 impl XhciState {
@@ -165,6 +180,7 @@ impl XhciState {
             ep0_ring: TransferRing::new(),
             ep1_in_ring: TransferRing::new(),
             ep1_in_has_trbs: false,
+            paused: false,
         }
     }
 
@@ -469,12 +485,6 @@ impl XhciController {
         let base_hi = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
         let size = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
 
-        // Cap event ring size to prevent a malicious guest from setting
-        // an enormous size that allows the enqueue pointer to sweep across
-        // a huge range of guest physical addresses before wrapping.
-        // xHCI spec says ERST entries can define large rings, but 4096
-        // entries (64 KiB of TRBs) is more than sufficient.
-        const MAX_EVENT_RING_SIZE: u32 = 4096;
         if size == 0 || size > MAX_EVENT_RING_SIZE {
             return;
         }
@@ -941,7 +951,7 @@ impl XhciController {
     /// This is typically called after `tablet().pointer_event()`.
     pub fn notify_pointer_event(&self) {
         let mut st = self.state.lock().expect("xhci: state lock");
-        if st.ep1_in_has_trbs {
+        if st.ep1_in_has_trbs && !st.paused {
             self.process_ep1_in_transfer_ring(&mut st);
         }
     }
@@ -1418,6 +1428,35 @@ impl vmm_devices::PointerSink for XhciController {
 impl Lifecycle for XhciController {
     fn type_name(&self) -> &'static str {
         "xhci"
+    }
+
+    // Every ring is walked inline on the thread that rang the doorbell,
+    // so nothing is in flight once the lock is taken.
+    fn pause(&self) {
+        self.state.lock().expect("xhci: state lock").paused = true;
+    }
+
+    /// A report that came in while paused, or that the source carried,
+    /// goes to the TRB the guest left armed.
+    fn resume(&self) {
+        let mut st = self.state.lock().expect("xhci: state lock");
+        st.paused = false;
+        if st.ep1_in_has_trbs {
+            self.process_ep1_in_transfer_ring(&mut st);
+        }
+    }
+
+    fn export_migrate_state(
+        &self,
+    ) -> Result<Option<vmm_devices::DeviceMigrateState>, DeviceStateError> {
+        Ok(Some(self.export_state()))
+    }
+
+    fn restore_migrate_state(
+        &self,
+        state: &vmm_devices::DeviceMigrateState,
+    ) -> Result<(), DeviceStateError> {
+        self.restore_state(state)
     }
 }
 

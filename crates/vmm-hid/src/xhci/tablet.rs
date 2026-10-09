@@ -12,6 +12,8 @@
 
 use std::sync::Mutex;
 
+use vmm_devices::lifecycle::XhciMigrateTablet;
+
 use super::bits;
 
 // ---- USB descriptors (const byte arrays) ---------------------------------
@@ -232,6 +234,32 @@ impl TabletDevice {
         st.x = x.min(0x7FFF);
         st.y = y.min(0x7FFF);
         st.report_pending = true;
+    }
+
+    pub fn export_state(&self) -> XhciMigrateTablet {
+        let st = self.inner.lock().expect("tablet lock");
+        XhciMigrateTablet {
+            buttons: st.buttons,
+            x: st.x,
+            y: st.y,
+            report_pending: st.report_pending,
+            address: st.address,
+            configuration: st.configuration,
+            idle_rate: st.idle_rate,
+        }
+    }
+
+    /// Takes the values through the same clamps as the guest and
+    /// pointer paths.
+    pub fn import_state(&self, state: &XhciMigrateTablet) {
+        let mut st = self.inner.lock().expect("tablet lock");
+        st.buttons = state.buttons & 0x07;
+        st.x = state.x.min(0x7FFF);
+        st.y = state.y.min(0x7FFF);
+        st.report_pending = state.report_pending;
+        st.address = state.address & 0x7F;
+        st.configuration = state.configuration;
+        st.idle_rate = state.idle_rate;
     }
 
     /// Check whether a report is pending.
