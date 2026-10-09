@@ -13,6 +13,7 @@ pub mod codec;
 pub mod connect;
 pub mod cpu;
 pub mod destination;
+pub mod gate;
 pub mod limits;
 pub mod pages;
 pub mod protocol;
@@ -133,6 +134,29 @@ impl std::fmt::Display for MigrationPhase {
     }
 }
 
+/// Where a source is at its cutover gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GateState {
+    /// No gate, or not reached yet.
+    #[default]
+    None,
+    Waiting,
+    /// The orchestrator said go. The source never resumes by itself.
+    Go,
+    Abort,
+}
+
+impl std::fmt::Display for GateState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Waiting => "waiting",
+            Self::Go => "go",
+            Self::Abort => "abort",
+        })
+    }
+}
+
 /// Migration progress information.
 #[derive(Debug, Clone)]
 pub struct MigrationStatus {
@@ -140,6 +164,7 @@ pub struct MigrationStatus {
     pub bytes_transferred: u64,
     pub pages_transferred: u64,
     pub dirty_pages_remaining: u64,
+    pub gate: GateState,
 }
 
 impl Default for MigrationStatus {
@@ -149,6 +174,7 @@ impl Default for MigrationStatus {
             bytes_transferred: 0,
             pages_transferred: 0,
             dirty_pages_remaining: 0,
+            gate: GateState::None,
         }
     }
 }

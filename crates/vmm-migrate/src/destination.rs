@@ -47,6 +47,11 @@ pub type DeviceRestoreFn = Box<
 /// Start the device workers once the import succeeded.
 pub type DeviceResumeFn = Box<dyn Fn() + Send>;
 
+/// Attach every disk the source gave up at its commit. Runs after the
+/// commit and before any device resumes: a device resume alone can
+/// submit the writes the guest left queued.
+pub type DeviceAttachFn = Box<dyn Fn() -> Result<(), String> + Send>;
+
 /// Put the Hyper-V enlightenment back, reinstalling both overlay
 /// pages from the MSR values the source carried.
 ///
@@ -74,6 +79,7 @@ pub struct DestConfig {
 /// The device hooks the import drives.
 pub struct DestHooks {
     pub restore: DeviceRestoreFn,
+    pub attach: DeviceAttachFn,
     pub resume: DeviceResumeFn,
     pub hyperv: HypervRestoreFn,
     pub pause_vm: VmPauseFn,
@@ -213,6 +219,11 @@ fn take_over<S: Transport>(
     chan.expect_okay()?;
 
     set_phase(status, MigrationPhase::Committed);
+    (hooks.attach)().map_err(|e| {
+        slog::error!(log, "a disk did not attach after the commit; the \
+            guest stays paused here"; "error" => %e);
+        MigrateError::State(format!("attach after the commit: {e}"))
+    })?;
     // The workers were never started on this VM, and the guest is about
     // to post I/O to every one of them.
     (hooks.resume)();
@@ -721,6 +732,7 @@ mod pass_tests {
     fn hooks(gate: Gate) -> DestHooks {
         DestHooks {
             restore: Box::new(|_, _| Ok(())),
+            attach: Box::new(|| panic!("disks attached")),
             resume: Box::new(|| panic!("devices resumed")),
             hyperv: Box::new(|_| false),
             pause_vm: Box::new(|| Ok(())),
@@ -767,5 +779,69 @@ mod pass_tests {
         take_over(&mut dest, &hooks(Gate::default()), &status(), &discard())
             .expect_err("the source rolled back");
         sender.join().expect("the source finished");
+    }
+
+    /// Hooks that log each step, with an attach that answers `attached`.
+    fn logging(
+        attached: Result<(), String>,
+    ) -> (DestHooks, Arc<Mutex<Vec<&'static str>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (a, r, v) = (Arc::clone(&log), Arc::clone(&log), Arc::clone(&log));
+        let hooks = DestHooks {
+            attach: Box::new(move || {
+                a.lock().expect("log").push("attach");
+                attached.clone()
+            }),
+            resume: Box::new(move || r.lock().expect("log").push("devices")),
+            resume_vm: Box::new(move || {
+                v.lock().expect("log").push("vcpus");
+                Ok(())
+            }),
+            ..hooks(Gate::default())
+        };
+        (hooks, log)
+    }
+
+    /// A source that says it holds everything and commits.
+    fn committing(
+        mut source: Chan<UnixStream>,
+    ) -> std::thread::JoinHandle<Chan<UnixStream>> {
+        std::thread::spawn(move || {
+            assert!(matches!(source.recv(), Ok(Message::Okay)));
+            source.send(&Message::Okay).expect("commit");
+            source
+        })
+    }
+
+    #[test]
+    fn the_disks_attach_after_the_commit_and_before_any_resume() {
+        let (source, mut dest) = pair(Deadlines::default());
+        let sender = committing(source);
+        let (hooks, log) = logging(Ok(()));
+        let status = status();
+        take_over(&mut dest, &hooks, &status, &discard()).expect("taken over");
+        assert_eq!(*log.lock().expect("log"), ["attach", "devices", "vcpus"]);
+        let mut source = sender.join().expect("the source finished");
+        assert!(matches!(source.recv(), Ok(Message::Okay)), "no started");
+    }
+
+    #[test]
+    fn a_disk_that_does_not_attach_keeps_the_guest_paused() {
+        let (source, mut dest) = pair(Deadlines::default());
+        let sender = committing(source);
+        let (hooks, log) = logging(Err("no engine".into()));
+        let status = status();
+        let error = take_over(&mut dest, &hooks, &status, &discard())
+            .expect_err("no attach");
+        assert!(error.to_string().contains("no engine"), "{error}");
+        assert_eq!(*log.lock().expect("log"), ["attach"]);
+        // The source committed: this side holds the guest, and says so.
+        assert_eq!(
+            status.lock().expect("status").phase,
+            MigrationPhase::Committed
+        );
+        drop(dest);
+        let mut source = sender.join().expect("the source finished");
+        assert!(source.recv().is_err(), "the source heard a start");
     }
 }

@@ -64,6 +64,10 @@ pub struct Deadlines {
     pub post_pause: Duration,
     /// How long the source waits for the ZFS barrier to report.
     pub zfs_barrier: Duration,
+    /// How long a committed source waits for the destination to say it
+    /// started the guest. A ring disk attaches on the destination only
+    /// after the orchestrator moved its volume.
+    pub started: Duration,
 }
 
 impl Default for Deadlines {
@@ -72,6 +76,7 @@ impl Default for Deadlines {
             pre_pause: Duration::from_secs(300),
             post_pause: Duration::from_secs(30),
             zfs_barrier: Duration::from_secs(120),
+            started: Duration::from_secs(150),
         }
     }
 }
@@ -110,6 +115,17 @@ impl<S: Transport> Chan<S> {
             .map_err(|e| {
                 MigrateError::Io(format!("shorten read deadline: {e}"))
             })
+    }
+
+    /// Wait up to `d` for each read from here on.
+    pub fn set_read_deadline(
+        &mut self,
+        d: Duration,
+    ) -> Result<(), MigrateError> {
+        self.ws
+            .get_ref()
+            .set_read_deadline(d)
+            .map_err(|e| MigrateError::Io(format!("set read deadline: {e}")))
     }
 
     pub fn deadlines(&self) -> Deadlines {

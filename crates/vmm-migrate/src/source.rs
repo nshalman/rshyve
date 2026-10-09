@@ -13,12 +13,14 @@
 //! 3. Flush every backing store, then wait for the ZFS barrier. The
 //!    destination disk has to hold every write the guest was told was
 //!    complete before the guest resumes there.
-//! 4. Ship the last dirty pass, the time data and the device state.
-//! 5. Hand over.
+//! 4. Wait at the cutover gate for the orchestrator's go.
+//! 5. Ship the last dirty pass, the time data and the device state.
+//! 6. Hand over, then detach every disk the destination attaches anew.
 //!
 //! Anything that fails from step 1 on rolls the source back: devices
 //! resume, the rings a migration paused go back to work, and the vCPUs
-//! run again.
+//! run again. After the gate's go nothing rolls back: the source stays
+//! paused until the orchestrator tells it which side keeps the guest.
 
 use std::io::Read;
 use std::net::Shutdown;
@@ -50,6 +52,7 @@ use crate::wire::{
     cancel_or, not_cancelled, set_phase, Chan, Deadlines, Transport,
 };
 use crate::xsave::XsaveLayout;
+use crate::GateState;
 use crate::MigrationPhase;
 use crate::MigrationStatus;
 use crate::StopGate;
@@ -99,6 +102,11 @@ pub enum DeviceFlushError {
 /// guest was already paused.
 pub type DeviceResumeFn = Box<dyn Fn() + Send>;
 
+/// Runs once, right after the commit went out: give up every disk the
+/// destination attaches anew. The source cannot take the commit back,
+/// so a failure is the owner's to report.
+pub type CommittedFn = Box<dyn FnOnce() + Send>;
+
 /// Read the Hyper-V enlightenment out, and drop its overlay pages
 /// first so the RAM image carries the guest's own bytes.
 ///
@@ -117,6 +125,10 @@ pub struct SourceConfig {
     pub deadlines: Deadlines,
     /// Where the GZ agent reports the final ZFS incremental.
     pub zfs_barrier: Option<PathBuf>,
+    /// The cutover gate's socket. See [`crate::gate`].
+    pub gate: Option<PathBuf>,
+    /// How long the gate waits for an answer.
+    pub gate_budget: Duration,
 }
 
 /// The device lifecycle hooks the phases drive.
@@ -125,6 +137,7 @@ pub struct SourceHooks {
     pub flush: DeviceFlushFn,
     pub export: DeviceExportFn,
     pub resume: DeviceResumeFn,
+    pub committed: CommittedFn,
     pub hyperv: HypervExportFn,
     pub pause_vm: VmPauseFn,
     pub resume_vm: VmPauseFn,
@@ -156,6 +169,7 @@ pub fn run_source<S: Transport>(
         hooks.flush,
         hooks.export,
         hooks.hyperv,
+        hooks.committed,
         &hooks.pause_vm,
         hooks.gate.as_ref(),
         &status,
@@ -167,17 +181,18 @@ pub fn run_source<S: Transport>(
         }
     }
 
-    let phase = status
+    let (phase, gate) = status
         .lock()
-        .map(|s| s.phase)
-        .unwrap_or(MigrationPhase::Error);
-    finish_source(result, phase, log, resume, hooks.resume_vm)
+        .map(|s| (s.phase, s.gate))
+        .unwrap_or((MigrationPhase::Error, GateState::None));
+    finish_source(result, phase, gate, log, resume, hooks.resume_vm)
 }
 
 /// Roll the source back when a migration failed after the pause.
 fn finish_source<E, F>(
     result: Result<(), MigrateError>,
     phase: MigrationPhase,
+    gate: GateState,
     log: &slog::Logger,
     device_resume_fn: DeviceResumeFn,
     resume_vm: F,
@@ -188,10 +203,18 @@ where
 {
     // A failure before the pause changed nothing. One at or after the
     // commit cannot be undone: the destination may be running the
-    // guest, so the source stays paused and an operator decides.
-    let rollback = (MigrationPhase::Pause as u8
-        ..MigrationPhase::Committed as u8)
-        .contains(&(phase as u8));
+    // guest, so the source stays paused and an operator decides. After
+    // the gate's go the orchestrator's record says the guest may move,
+    // so only its order resumes the source.
+    let held = gate == GateState::Go;
+    let rollback = rollback_phase(phase) && !held;
+    if result.is_err() && held && rollback_phase(phase) {
+        slog::error!(
+            log,
+            "the migration failed after the gate's go; the \
+            source stays paused until the orchestrator orders it back"
+        );
+    }
     if result.is_err() && rollback {
         // Device workers must be available before vCPUs can issue more I/O.
         device_resume_fn();
@@ -204,6 +227,11 @@ where
     result
 }
 
+fn rollback_phase(phase: MigrationPhase) -> bool {
+    (MigrationPhase::Pause as u8..MigrationPhase::Committed as u8)
+        .contains(&(phase as u8))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_inner<S: Transport>(
     chan: &mut Chan<S>,
@@ -214,6 +242,7 @@ fn run_inner<S: Transport>(
     device_flush_fn: DeviceFlushFn,
     device_export_fn: DeviceExportFn,
     hyperv_export_fn: HypervExportFn,
+    committed: CommittedFn,
     pause_vm: &VmPauseFn,
     gate: &dyn StopGate,
     status: &Arc<Mutex<MigrationStatus>>,
@@ -268,8 +297,6 @@ fn run_inner<S: Transport>(
         }
     }
 
-    chan.send_uncommitted(gate, &Message::PauseSignal)?;
-
     // ── Pause ──
     // From here the guest is stopped and every failure has to roll
     // back, so the phase is recorded before the first step that can
@@ -297,6 +324,14 @@ fn run_inner<S: Transport>(
     if let Some(barrier) = config.zfs_barrier.as_deref() {
         zfs_barrier_wait(barrier, config.deadlines.zfs_barrier, gate, log)?;
     }
+
+    if let Some(path) = config.gate.as_deref() {
+        crate::gate::wait(path, config.gate_budget, gate, status, log)?;
+    }
+
+    // The destination holds its short post-pause deadline from this
+    // signal on, so it goes out only after the waits above.
+    chan.send_uncommitted(gate, &Message::PauseSignal)?;
 
     // The overlay pages go before the final pass: the destination
     // reinstalls them from the MSR values, so shipping ours would give
@@ -330,7 +365,7 @@ fn run_inner<S: Transport>(
     set_phase(status, MigrationPhase::RamPull);
     chan.send_uncommitted(gate, &Message::MemEnd)?;
 
-    hand_over(chan, gate, status)
+    hand_over(chan, gate, committed, status, log)
 }
 
 /// Three steps, and the order is the whole point. The destination says
@@ -341,18 +376,29 @@ fn run_inner<S: Transport>(
 fn hand_over<S: Transport>(
     chan: &mut Chan<S>,
     gate: &dyn StopGate,
+    committed: CommittedFn,
     status: &Arc<Mutex<MigrationStatus>>,
+    log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     set_phase(status, MigrationPhase::Finish);
     chan.expect_okay()?;
     gate.commit()?;
 
     set_phase(status, MigrationPhase::Committed);
-    chan.send(&Message::Okay).map_err(|e| {
+    let sent = chan.send(&Message::Okay);
+    // Whether or not the commit arrived, this end never runs the guest
+    // again by itself, and the destination cannot attach a disk this
+    // end still holds.
+    committed();
+    sent.map_err(|e| {
         MigrateError::Committed(format!(
             "the commit may not have reached the destination: {e}"
         ))
     })?;
+    if let Err(e) = chan.set_read_deadline(chan.deadlines().started) {
+        slog::warn!(log, "the wait for the start keeps the short deadline";
+            "error" => %e);
+    }
     chan.expect_okay().map_err(|e| {
         MigrateError::Committed(format!(
             "the destination never confirmed it started the guest: {e}"

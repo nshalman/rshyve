@@ -10,6 +10,10 @@
 
 /// Protocol identifier for the RON migration format.
 ///
+/// v7 has the v6 payload. It says the destination attaches a MantaBlock
+/// ring disk after the commit, so a source with one moves only to a v7
+/// destination. A v6 peer still takes any other VM.
+///
 /// v6 carries each vCPU's FPU and XSAVE area with the source host's
 /// layout, and the NVMe Asynchronous Event Requests a controller holds.
 /// A v4 destination resumed the guest with the destination's FPU state
@@ -20,18 +24,20 @@
 /// v4 named the store under each NVMe namespace. v3 carried held NVMe
 /// completions and the namespace shape. v2 carried the CQ
 /// interrupt-enable bit. v1 put device identity on the wire.
-pub const PROTOCOL_RON: &str = "vmm-migrate-ron/6";
+pub const PROTOCOL_RON: &str = "vmm-migrate-ron/7";
 
-/// What a source offers.
-pub const SOURCE_OFFER: [&str; 1] = [PROTOCOL_RON];
+/// The version before, which differs only in the ring disk.
+pub const PROTOCOL_RON_V6: &str = "vmm-migrate-ron/6";
 
-/// The version a destination answers an offer with, or `None` when it
-/// can read none of them.
+/// What a source offers, newest first.
+pub const SOURCE_OFFER: [&str; 2] = [PROTOCOL_RON, PROTOCOL_RON_V6];
+
+/// The version a destination answers an offer with, newest first, or
+/// `None` when it can read none of them.
 pub fn select_protocol(offer: &[String]) -> Option<&'static str> {
-    offer
-        .iter()
-        .any(|theirs| theirs == PROTOCOL_RON)
-        .then_some(PROTOCOL_RON)
+    SOURCE_OFFER
+        .into_iter()
+        .find(|ours| offer.iter().any(|theirs| theirs == ours))
 }
 
 /// Page size used for dirty tracking (4 KiB).
@@ -101,6 +107,15 @@ mod tests {
         let mixed = offer(&["vmm-migrate-ron/4", PROTOCOL_RON]);
         assert_eq!(select_protocol(&mixed), Some(PROTOCOL_RON));
         assert_eq!(select_protocol(&offer(&SOURCE_OFFER)), Some(PROTOCOL_RON));
+    }
+
+    #[test]
+    fn a_destination_takes_a_v6_source() {
+        let v6 = offer(&[PROTOCOL_RON_V6]);
+        assert_eq!(select_protocol(&v6), Some(PROTOCOL_RON_V6));
+        // What a v6 build's destination picks from this offer.
+        let ours = offer(&SOURCE_OFFER);
+        assert!(ours.iter().any(|o| o == PROTOCOL_RON_V6));
     }
 
     #[test]

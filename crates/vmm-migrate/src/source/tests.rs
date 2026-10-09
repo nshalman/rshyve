@@ -163,6 +163,7 @@ fn flush_failure_resumes_devices_and_vcpus() {
     let result = finish_source(
         result,
         MigrationPhase::Pause,
+        GateState::None,
         &discard(),
         resume_fn,
         move || {
@@ -189,6 +190,7 @@ fn a_committed_source_is_never_resumed() {
     let result = finish_source(
         Err(MigrateError::Committed("no confirmation".into())),
         MigrationPhase::Committed,
+        GateState::None,
         &discard(),
         resume_fn,
         || -> Result<(), &'static str> {
@@ -211,6 +213,7 @@ fn a_failure_in_finish_still_rolls_back() {
     let result = finish_source(
         Err(MigrateError::WebSocket("closed".into())),
         MigrationPhase::Finish,
+        GateState::None,
         &discard(),
         resume_fn,
         || Ok::<(), &'static str>(()),
@@ -257,6 +260,22 @@ fn pair() -> (Chan<UnixStream>, Chan<UnixStream>) {
     )
 }
 
+fn no_hook() -> CommittedFn {
+    Box::new(|| {})
+}
+
+/// A hook that counts its calls.
+fn counting() -> (CommittedFn, Arc<std::sync::atomic::AtomicUsize>) {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let by_hook = Arc::clone(&calls);
+    (
+        Box::new(move || {
+            by_hook.fetch_add(1, Ordering::AcqRel);
+        }),
+        calls,
+    )
+}
+
 fn status() -> Arc<Mutex<MigrationStatus>> {
     Arc::new(Mutex::new(MigrationStatus::default()))
 }
@@ -276,7 +295,8 @@ fn a_cancelled_source_never_commits() {
     };
     let status = status();
 
-    let error = hand_over(&mut source, &gate, &status).expect_err("cancelled");
+    let error = hand_over(&mut source, &gate, no_hook(), &status, &discard())
+        .expect_err("cancelled");
 
     assert!(crate::is_cancel(&error), "{error}");
     assert_eq!(phase(&status), MigrationPhase::Finish, "not rolled back");
@@ -292,7 +312,7 @@ fn a_destination_abort_rolls_the_source_back() {
     let gate = Gate::default();
     let status = status();
 
-    let error = hand_over(&mut source, &gate, &status)
+    let error = hand_over(&mut source, &gate, no_hook(), &status, &discard())
         .expect_err("the destination aborted");
 
     assert_eq!(gate.commits.load(Ordering::Acquire), 0, "committed");
@@ -302,6 +322,7 @@ fn a_destination_abort_rolls_the_source_back() {
     let _ = finish_source(
         Err(error),
         phase(&status),
+        GateState::None,
         &discard(),
         Box::new(move || by_callback.store(true, Ordering::Release)),
         || Ok::<(), &'static str>(()),
@@ -317,8 +338,14 @@ fn a_commit_the_peer_may_have_missed_is_never_rolled_back() {
     drop(dest);
     let status = status();
 
-    let error = hand_over(&mut source, &Gate::default(), &status)
-        .expect_err("the peer left");
+    let error = hand_over(
+        &mut source,
+        &Gate::default(),
+        no_hook(),
+        &status,
+        &discard(),
+    )
+    .expect_err("the peer left");
 
     assert!(matches!(error, MigrateError::Committed(_)), "{error}");
     assert_eq!(phase(&status), MigrationPhase::Committed);
@@ -336,7 +363,8 @@ fn a_commit_goes_through_the_gate() {
     let gate = Gate::default();
     let status = status();
 
-    hand_over(&mut source, &gate, &status).expect("handed over");
+    hand_over(&mut source, &gate, no_hook(), &status, &discard())
+        .expect("handed over");
 
     assert_eq!(gate.commits.load(Ordering::Acquire), 1);
     assert_eq!(phase(&status), MigrationPhase::Committed);
@@ -413,10 +441,92 @@ fn a_pre_pause_failure_does_not_resume_a_running_guest() {
     let result = finish_source(
         Err(MigrateError::Io("connect failed".into())),
         MigrationPhase::Sync,
+        GateState::None,
         &discard(),
         resume_fn,
         || Ok::<(), &'static str>(()),
     );
     assert!(result.is_err());
     assert!(!resumed.load(Ordering::Acquire));
+}
+
+#[test]
+fn a_source_held_by_the_gate_is_never_resumed() {
+    // The orchestrator recorded the go before it answered. Only its
+    // order may bring the guest back here.
+    for phase in [
+        MigrationPhase::RamPushPostPause,
+        MigrationPhase::DeviceState,
+        MigrationPhase::Finish,
+    ] {
+        let resumed = Arc::new(AtomicBool::new(false));
+        let by_callback = Arc::clone(&resumed);
+        let result = finish_source(
+            Err(MigrateError::WebSocket("closed".into())),
+            phase,
+            GateState::Go,
+            &discard(),
+            Box::new(move || by_callback.store(true, Ordering::Release)),
+            || -> Result<(), &'static str> {
+                panic!("a held source must not resume its vCPUs")
+            },
+        );
+        assert!(result.is_err());
+        assert!(!resumed.load(Ordering::Acquire), "{phase}");
+    }
+}
+
+#[test]
+fn an_aborted_gate_rolls_the_source_back() {
+    let resumed = Arc::new(AtomicBool::new(false));
+    let by_callback = Arc::clone(&resumed);
+    let _ = finish_source(
+        Err(MigrateError::Phase("cutover gate: abort".into())),
+        MigrationPhase::Pause,
+        GateState::Abort,
+        &discard(),
+        Box::new(move || by_callback.store(true, Ordering::Release)),
+        || Ok::<(), &'static str>(()),
+    );
+    assert!(resumed.load(Ordering::Acquire));
+}
+
+#[test]
+fn the_disks_are_given_up_right_after_the_commit() {
+    let (mut source, mut dest) = pair();
+    let peer = std::thread::spawn(move || {
+        dest.send(&Message::Okay).expect("holds it all");
+        assert!(matches!(dest.recv(), Ok(Message::Okay)));
+        dest.send(&Message::Okay).expect("started");
+        dest
+    });
+    let (hook, calls) = counting();
+    hand_over(&mut source, &Gate::default(), hook, &status(), &discard())
+        .expect("handed over");
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    peer.join().expect("the destination finished");
+}
+
+#[test]
+fn a_commit_that_may_be_lost_still_gives_the_disks_up() {
+    let (mut source, mut dest) = pair();
+    dest.send(&Message::Okay).expect("holds it all");
+    drop(dest);
+    let (hook, calls) = counting();
+    let error =
+        hand_over(&mut source, &Gate::default(), hook, &status(), &discard())
+            .expect_err("the peer left");
+    assert!(matches!(error, MigrateError::Committed(_)), "{error}");
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn no_commit_keeps_the_disks() {
+    let (mut source, mut dest) = pair();
+    dest.send(&Message::Error(crate::cancelled()))
+        .expect("abort");
+    let (hook, calls) = counting();
+    hand_over(&mut source, &Gate::default(), hook, &status(), &discard())
+        .expect_err("the destination aborted");
+    assert_eq!(calls.load(Ordering::Acquire), 0);
 }
