@@ -62,6 +62,35 @@ that already runs attached its disks at boot, and the source still owns
 those volumes. `migrate-dest` takes a path `listen_addr` for other VMs,
 and then connects to it as `--migrate-listen` does.
 
+### The ring config file
+
+The bhyve brand caps `bhyve-extra-opts` at about 250 bytes, and one ring
+disk with its shape takes about 240. So the agent puts the ring disks
+and the destination flags in a file in the zone root, and gives rshyve
+only `--ring-config <path>`:
+
+```json
+{"version":1,
+ "disks":["7,nvme,mantablock=/mb/<v>.sock,volume=<v>,ring-shape=1:..."],
+ "migrate":{"ring_attach_timeout_ms":120000,"allow_unproven_engine":false}}
+```
+
+| Field | Meaning |
+|---|---|
+| `version` | Must be 1. rshyve refuses any other version and any unknown field |
+| `disks` | `-s` specs, added after the command line's. Only `nvme,mantablock=` disks, at most 24 |
+| `migrate.ring_attach_timeout_ms` | As `--migrate-ring-attach-timeout-ms`. Range 1 to 3600000 |
+| `migrate.allow_unproven_engine` | As `--migrate-allow-unproven-engine`. Lab only |
+
+The path must be absolute and not a symbolic link. The file must be a
+regular file of rshyve's user (root), mode 0600 or tighter, and at most
+64 KiB. rshyve reads it at each start, also after a guest reset.
+
+Without `--migrate-listen`, rshyve removes `ring-shape=` from the file's
+disks, so a guest reset on the destination before the agent rewrites
+the file boots normally. A `ring-shape=` on the command line is still
+refused, as above.
+
 ### Source order
 
 ```json

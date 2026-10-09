@@ -280,6 +280,13 @@ pub struct Cli {
     #[arg(long)]
     pub migrate_allow_unproven_engine: bool,
 
+    /// A file of MantaBlock ring disks (`-s` specs) and migration
+    /// settings, read at start and merged into this command line. It
+    /// keeps the ring disks out of the brand's `bhyve-extra-opts`,
+    /// which one ring disk nearly fills. rshyve only.
+    #[arg(long)]
+    pub ring_config: Option<PathBuf>,
+
     /// Network config for mdata agent (JSON, e.g. from zone config).
     /// Format: '[{"ip":"10.0.0.5","netmask":"255.255.255.0","gateway":"10.0.0.1","primary":true}]'
     #[arg(long)]

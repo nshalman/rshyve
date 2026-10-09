@@ -145,7 +145,7 @@ fn reject_unmigratable_destination(
     Ok(())
 }
 
-fn is_mantablock_nvme(spec: &str) -> bool {
+pub(crate) fn is_mantablock_nvme(spec: &str) -> bool {
     let parts = devspec::parts(spec);
     parts.driver == "nvme" && parts.config.starts_with("mantablock=")
 }

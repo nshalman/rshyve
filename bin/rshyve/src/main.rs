@@ -34,6 +34,7 @@ mod msix;
 mod pcidev;
 mod peercred;
 mod reboot;
+mod ringcfg;
 mod secret;
 mod serial;
 mod varstore;
@@ -630,8 +631,12 @@ fn main() -> ExitCode {
     }
     vmm_machine::entry::register_probes("rshyve");
 
-    let cli = Cli::parse_named("rshyve");
+    let mut cli = Cli::parse_named("rshyve");
     let log = vmm_machine::entry::setup_logger("rshyve");
+    if let Err(e) = ringcfg::apply(&mut cli) {
+        slog::error!(log, "fatal error"; "error" => format!("{:#}", e));
+        return ExitCode::FAILURE;
+    }
 
     let result = run(cli, &log);
     // The console writer thread holds the guest's last bytes. Both the
