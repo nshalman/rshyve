@@ -12,9 +12,12 @@ One driver serves both transports: a Unix socket inside a bhyve zone,
 where `/dev/poll` is unavailable and the GZ agent bridges to the peer,
 and a TCP socket elsewhere.
 
-The protocol identifier is `vmm-migrate-ron/6`. Each end speaks only
-that version, and a peer on any other version is refused at
-negotiation. v6 carries each vCPU's FPU and XSAVE area with the source
+The protocol identifier is `vmm-migrate-ron/7`. v7 has the v6 payload
+and says the destination attaches a MantaBlock ring disk after the
+commit (see [migration-gate.md](migration-gate.md)). A source offers v7
+and v6, and a destination takes either; a source with a ring disk
+refuses a v6 destination before it pauses. A peer on any other version
+is refused at negotiation. v6 carries each vCPU's FPU and XSAVE area with the source
 host's XSAVE layout, and the count of NVMe Asynchronous Event Requests a
 controller holds. A v4 peer carried no FPU state, so the guest resumed
 on the destination's FPU registers (OSF-2). v4 named the store under
@@ -52,7 +55,6 @@ Source                          Destination
   |-------- PageBatch* ------------>|
   |-------- MemEnd ---------------->|
   |<------- MemDone ----------------|  (repeats until converged)
-  |-------- PauseSignal ----------->|
   |                                 |
   |  3. Pause
   |  device workers park            |
@@ -60,6 +62,8 @@ Source                          Destination
   |  vCPUs pause                    |
   |  backing stores flush           |
   |  ZFS barrier reports            |
+  |  cutover gate says GO           |
+  |-------- PauseSignal ----------->|
   |                                 |
   |  4. RamPushPostPause (final dirty pass)
   |-------- PageBatch* ------------>|
@@ -300,12 +304,11 @@ A VM that hot-added a CPU, memory, or a device since boot is also
 refused: the destination is built from the boot command line and would
 have none of them.
 
-An NVMe disk on a MantaBlock volume is refused on both sides, by
-`migrate-source`, by `migrate-dest`, and by `--migrate-listen` at
-startup, whether the disk was there at boot or hot-added. The source
-holds the volume's attachment and nothing hands it over yet, so a
-destination that attached too would make two owners of one volume. The
-controller refuses its own export and restore as well.
+An NVMe disk on a MantaBlock volume moves with a handover: the source
+detaches it after the commit, and the destination attaches it anew
+before the guest runs. The cutover gate, the destination `ring-shape=`
+option and the engine check are in
+[migration-gate.md](migration-gate.md).
 
 ## Usage
 

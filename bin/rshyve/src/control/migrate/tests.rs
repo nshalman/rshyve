@@ -300,9 +300,13 @@ fn a_ring_disk_blocks_migrate_source() {
         disk_at(&registry, "5", Some(RING), hot_added);
         let run = RunControl::new(VmRunState::Running);
         let reason =
-            claim_source(&run, &HotplugEngines::default(), &registry, || {
-                identities(&registry)
-            });
+            claim_source(
+                &run,
+                &HotplugEngines::default(),
+                &registry,
+                || identities(&registry),
+                false,
+            );
         assert_names_the_ring_disk(reason.err(), "5");
         assert_eq!(run.get(), VmRunState::Running);
     }
@@ -319,9 +323,13 @@ fn a_file_backed_nvme_vm_still_migrates() {
     assert_eq!(dest.get(), VmRunState::Migrating);
     let source = RunControl::new(VmRunState::Running);
     assert_eq!(
-        claim_source(&source, &HotplugEngines::default(), &registry, || {
-            identities(&registry)
-        },),
+        claim_source(
+            &source,
+            &HotplugEngines::default(),
+            &registry,
+            || identities(&registry),
+            false,
+        ),
         Ok(()),
     );
     assert_eq!(source.get(), VmRunState::Migrating);
@@ -543,4 +551,104 @@ fn a_passthru_device_blocks_migration() {
     let dest = RunControl::new(VmRunState::Paused);
     assert!(claim_dest(&dest, &registry).is_err());
     assert_eq!(dest.get(), VmRunState::Paused);
+
+/// A ring disk on an engine without migrate-v1, with its shape.
+struct Unproven;
+
+impl vmm_devices::Lifecycle for Unproven {
+    fn type_name(&self) -> &'static str {
+        "nvme"
+    }
+
+    fn migration_waivable(&self) -> Option<String> {
+        Some("the engine does not report migrate-v1".into())
+    }
+
+    fn migration_spec_options(&self) -> Option<String> {
+        Some("ring-shape=1:256:4096:1:8:2:d".into())
+    }
+}
+
+fn unproven_at(registry: &vmm_machine::DeviceRegistry, slot: &str) {
+    registry
+        .insert(vmm_machine::RegisteredDevice::new(
+            format!("nvme@{slot}"),
+            vmm_machine::parse_bdf(slot),
+            None,
+            Some(Arc::new(Unproven) as Arc<dyn vmm_devices::Lifecycle>),
+            None,
+        ))
+        .expect("insert");
+}
+
+#[test]
+fn an_unproven_engine_blocks_a_source_unless_the_operator_accepts_it() {
+    let registry = vmm_machine::DeviceRegistry::new();
+    unproven_at(&registry, "5");
+    assert_eq!(device_blockers(&registry), None);
+
+    let run = RunControl::new(VmRunState::Running);
+    let why = claim_source(
+        &run,
+        &HotplugEngines::default(),
+        &registry,
+        || identities(&registry),
+        false,
+    )
+    .expect_err("not accepted");
+    assert!(why.contains("nvme@5"), "{why}");
+    assert!(why.contains("allow_engine_without_migrate_v1"), "{why}");
+    assert_eq!(run.get(), VmRunState::Running);
+
+    assert_eq!(
+        claim_source(
+            &run,
+            &HotplugEngines::default(),
+            &registry,
+            || identities(&registry),
+            true,
+        ),
+        Ok(()),
+    );
+}
+
+#[test]
+fn migrate_config_gives_a_ring_disk_its_shape_once() {
+    let registry = vmm_machine::DeviceRegistry::new();
+    unproven_at(&registry, "5");
+    let argv = [
+        "4,nvme,/boot.img".to_string(),
+        "5,nvme,mantablock=/s,volume=v,bootindex=1".to_string(),
+        "5,nvme,mantablock=/s,volume=v,ring-shape=1:9:512:1:1:1:-".to_string(),
+    ];
+    let slots = migrate_pci_slots(&argv, &registry);
+    assert_eq!(slots[0], "4,nvme,/boot.img");
+    assert_eq!(
+        slots[1],
+        "5,nvme,mantablock=/s,volume=v,bootindex=1,\
+         ring-shape=1:256:4096:1:8:2:d"
+    );
+    // A VM that was itself a destination: the old shape is replaced.
+    assert_eq!(
+        slots[2],
+        "5,nvme,mantablock=/s,volume=v,ring-shape=1:256:4096:1:8:2:d"
+    );
+}
+
+#[test]
+fn the_gate_and_attach_waits_are_bounded() {
+    assert_eq!(gate_budget(None), Ok(vmm_migrate::gate::DEFAULT_BUDGET));
+    assert_eq!(gate_budget(Some(5000)), Ok(Duration::from_secs(5)));
+    assert!(gate_budget(Some(0)).is_err());
+    assert!(gate_budget(Some(25_001)).is_err());
+    assert_eq!(ring_attach_budget(None), Ok(RING_ATTACH_DEFAULT));
+    assert!(ring_attach_budget(Some(0)).is_err());
+    assert!(ring_attach_budget(Some(600_001)).is_err());
+}
+
+#[test]
+fn the_gate_is_an_absolute_socket_path() {
+    assert!(agent_socket("/var/run/gate.sock").is_ok());
+    assert!(agent_socket("gate.sock").is_err());
+    assert!(agent_socket("/var/run/a\0b").is_err());
 }
