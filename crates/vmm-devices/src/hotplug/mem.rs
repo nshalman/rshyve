@@ -457,6 +457,8 @@ const fn high32(value: u64) -> u32 {
     (value >> 32) as u32
 }
 
+mod migrate;
+
 #[cfg(test)]
 mod tests {
     use super::*;

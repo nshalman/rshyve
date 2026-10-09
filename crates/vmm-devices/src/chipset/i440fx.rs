@@ -26,6 +26,8 @@ use crate::pci::bus::{AttachError, PciBus};
 use crate::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use crate::pci::{BarN, Bdf, PioCfgDecoder};
 
+mod migrate;
+
 // ---------------------------------------------------------------------------
 // Intel device IDs
 // ---------------------------------------------------------------------------
@@ -56,6 +58,8 @@ pub struct I440FxChipset {
     pci_bus: Arc<PciBus>,
     cfg_decoder: PioCfgDecoder,
     post_code: AtomicU8,
+    hostbridge: Arc<Hostbridge>,
+    lpc_bridge: Arc<LpcBridge>,
     /// Shared PCI INTx routing state. `None` without a VM handle, which
     /// leaves [`route_lintr`](Self::route_lintr) with nothing to route to.
     intr_routes: Option<Arc<PciIntrRoutes>>,
@@ -78,19 +82,18 @@ impl I440FxChipset {
         let pci_bus = PciBus::new();
 
         // Host bridge at BDF 0.0.0
-        let hostbridge: Arc<dyn PciDevice> = Arc::new(Hostbridge::new());
+        let hostbridge = Arc::new(Hostbridge::new());
         let bdf_hb = Bdf::new_unchecked(0, 0, 0);
-        pci_bus.attach(bdf_hb, hostbridge);
+        pci_bus.attach(bdf_hb, Arc::clone(&hostbridge) as Arc<dyn PciDevice>);
 
         // Shared PIR registers: firmware writes these via LPC bridge config
         // space (0x60-0x63), PciIntrRoutes reads them at delivery time.
         let pir_regs = Arc::new(Mutex::new([0x80u8; PIR_COUNT]));
 
         // ISA/LPC bridge at BDF 0.1.0 with PIR routing
-        let lpc_pci: Arc<dyn PciDevice> =
-            Arc::new(LpcBridge::new(pir_regs.clone()));
+        let lpc_bridge = Arc::new(LpcBridge::new(pir_regs.clone()));
         let bdf_lpc = Bdf::new_unchecked(0, 1, 0);
-        pci_bus.attach(bdf_lpc, lpc_pci);
+        pci_bus.attach(bdf_lpc, Arc::clone(&lpc_bridge) as Arc<dyn PciDevice>);
 
         let intr_routes = hdl.map(|hdl| {
             PciIntrRoutes::new(
@@ -104,6 +107,8 @@ impl I440FxChipset {
             pci_bus,
             cfg_decoder: PioCfgDecoder::new(),
             post_code: AtomicU8::new(0),
+            hostbridge,
+            lpc_bridge,
             intr_routes,
         });
 

@@ -9,6 +9,7 @@
 use std::collections::VecDeque;
 
 use bitflags::bitflags;
+use vmm_devices::lifecycle::{DeviceStateError, Ps2MouseMigrateState};
 
 use super::ctrl::{
     probe_mouse_cmd, probe_mouse_data, probe_mouse_overflow,
@@ -198,6 +199,44 @@ impl PS2Mouse {
         self.resp(0x00);
     }
 }
+impl PS2Mouse {
+    pub(super) fn export_state(&self) -> Ps2MouseMigrateState {
+        Ps2MouseMigrateState {
+            buf: self.buf.iter().copied().collect(),
+            cur_cmd: self.cur_cmd,
+            status: self.status.bits(),
+            resolution: self.resolution,
+            sample_rate: self.sample_rate,
+        }
+    }
+
+    pub(super) fn import_state(
+        &mut self,
+        state: &Ps2MouseMigrateState,
+    ) -> Result<(), DeviceStateError> {
+        if state.buf.len() > PS2_KBD_BUFSZ {
+            return Err(DeviceStateError::invalid(format!(
+                "ps2: {} mouse bytes, the buffer holds {PS2_KBD_BUFSZ}",
+                state.buf.len()
+            )));
+        }
+        if let Some(cmd) = state.cur_cmd {
+            if !matches!(cmd, PS2M_CMD_SET_SAMP_RATE | PS2M_CMD_RESOLUTION_SET)
+            {
+                return Err(DeviceStateError::invalid(format!(
+                    "ps2: mouse command {cmd:#x} takes no second byte"
+                )));
+            }
+        }
+        self.buf = state.buf.iter().copied().collect();
+        self.cur_cmd = state.cur_cmd;
+        self.status = PS2MStatus::from_bits_truncate(state.status);
+        self.resolution = state.resolution;
+        self.sample_rate = state.sample_rate;
+        Ok(())
+    }
+}
+
 impl Default for PS2Mouse {
     fn default() -> Self {
         Self::new()

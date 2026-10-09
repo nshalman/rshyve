@@ -194,6 +194,11 @@ impl PioCfgDecoder {
         }
     }
 
+    /// Latch an address a migration carried.
+    pub fn set_addr(&self, addr: u32) {
+        *self.addr.lock().unwrap() = addr;
+    }
+
     /// Handle an access to the config data register (port 0xCFC-0xCFF).
     ///
     /// Decodes the previously latched address and calls `cb` with the
