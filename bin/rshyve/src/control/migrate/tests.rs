@@ -550,6 +550,7 @@ fn a_passthru_device_blocks_migration() {
     let dest = RunControl::new(VmRunState::Paused);
     assert!(claim_dest(&dest, &registry).is_err());
     assert_eq!(dest.get(), VmRunState::Paused);
+}
 
 /// A ring disk on an engine without migrate-v1, with its shape.
 struct Unproven;
