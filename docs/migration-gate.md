@@ -143,6 +143,7 @@ answers `ACK ABORT`.
 | `migrate_gate` | `none`, `waiting`, `go`, `abort` |
 | `migrate_rings` | `attached`, `attaching`, `detached`, `attach-failed`, `detach-failed`. Absent for a VM with no ring disk |
 | `migrate_error` | Why the migration failed. Absent until it fails |
+| `migrate_clock_skew_ms` | Destination only: how far its clock is ahead of the source's. Negative when behind |
 
 `migrate_phase` `committed` means the source committed. A source that
 fails before its commit shows `migrate_phase` `error`. A source that
@@ -231,9 +232,10 @@ write as a duplicate.
 
 ## Stream version
 
-The migration stream is `vmm-migrate-ron/9`, which adds the xHCI
-controller and the LPC and ACPI device state to v8. A source with a
-ring disk refuses a v6 destination right after the protocol choice,
-before the pause. Every VM has the COM1 and COM2 UARTs, so every VM
-needs v9 at both ends. An older destination does not start with a ring
+The migration stream is `vmm-migrate-ron/10`, which adds the source
+wall clock, the interrupt shadow, the AMD PMU state and the
+fault-injection test device to v9. A source with a ring disk refuses a
+v6 destination right after the protocol choice, before the pause.
+Every VM has the COM1 and COM2 UARTs, so every VM needs v9 or newer at
+both ends. An older destination does not start with a ring
 disk on its `-s` list.
