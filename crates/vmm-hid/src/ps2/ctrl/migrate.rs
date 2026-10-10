@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_controller_takes_keys_only_after_its_resume() {
+    fn a_restored_controller_holds_keys_until_its_resume() {
         let (bus, src) = attached();
         guest_setup(&bus);
         let (dst_bus, dst) = attached();
@@ -182,8 +182,8 @@ mod tests {
         dst.key_event(key(true));
         assert_eq!(dst_bus.handle_in(PORT_PS2_CMD_STATUS, 1) & 0x01, 0);
 
+        // The key typed during the pause is not lost.
         dst.resume();
-        dst.key_event(key(true));
         assert_eq!(dst_bus.handle_in(PORT_PS2_DATA, 1), 0x1E);
     }
 

@@ -358,10 +358,16 @@ struct PS2State {
     aux_pin: Option<Arc<dyn IntrPin>>,
     reset_sink: Option<Arc<dyn SuspendSink>>,
 
-    /// Remote console keys are dropped while set, so the buffer the
+    /// Remote console keys are held back while set, so the buffer the
     /// migration exports is the one the guest sees last.
     paused: bool,
+    /// Keys that came while paused, up to [`HELD_KEYS`]. They go to
+    /// the guest at the resume. A migration does not carry them.
+    held: std::collections::VecDeque<KeyEvent>,
 }
+
+/// A few seconds of typing.
+const HELD_KEYS: usize = 64;
 
 pub struct PS2Ctrl {
     state: Mutex<PS2State>,
@@ -405,8 +411,15 @@ impl PS2Ctrl {
     pub fn key_event(&self, ke: KeyEvent) {
         let mut state = self.state.lock().unwrap();
         if state.paused {
+            if state.held.len() < HELD_KEYS {
+                state.held.push_back(ke);
+            }
             return;
         }
+        self.deliver_key(&mut state, ke);
+    }
+
+    fn deliver_key(&self, state: &mut PS2State, ke: KeyEvent) {
         let translate = state.ctrl_cfg.contains(CtrlCfg::PRI_XLATE_EN);
         let key_rep = match KeyEventRep::try_from(ke) {
             Ok(kr) => kr,
@@ -458,7 +471,7 @@ impl PS2Ctrl {
         });
 
         state.pri_port.recv_scancode(scan_code);
-        self.update_intr(&mut state);
+        self.update_intr(state);
     }
 
     fn pio_rw(&self, port: u16, rwo: RWOp<'_>) {
@@ -693,7 +706,11 @@ impl Lifecycle for PS2Ctrl {
     }
 
     fn resume(&self) {
-        self.state.lock().unwrap().paused = false;
+        let mut state = self.state.lock().unwrap();
+        state.paused = false;
+        while let Some(ke) = state.held.pop_front() {
+            self.deliver_key(&mut state, ke);
+        }
     }
 
     fn migrates_by_id(&self) -> bool {

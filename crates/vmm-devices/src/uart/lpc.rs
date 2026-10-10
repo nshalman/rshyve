@@ -57,11 +57,17 @@ pub const COM2_IRQ: u8 = 3;
 struct UartState {
     uart: Uart,
     irq_pin: Arc<dyn IntrPin>,
-    /// Host input is refused while set. A byte that lands after the
+    /// Host input is held back while set. A byte that lands after the
     /// kernel interrupt state is exported raises a line the destination
     /// kernel never sees, and the port then stalls for good.
     paused: bool,
+    /// Input that came while paused, up to [`HELD_CAP`]. It reaches the
+    /// FIFO at the resume. A migration does not carry it.
+    held: std::collections::VecDeque<u8>,
 }
+
+/// The RX FIFO's size: the resume can place no more than that.
+const HELD_CAP: usize = 256;
 
 impl UartState {
     /// Drive the physical interrupt pin to match the UART's logical
@@ -98,6 +104,7 @@ impl LpcUart {
                 uart: Uart::new(),
                 irq_pin,
                 paused: false,
+                held: std::collections::VecDeque::new(),
             }),
             tx_sink: Mutex::new(None),
         })
@@ -133,11 +140,16 @@ impl LpcUart {
     /// Feed a byte from an external source into the guest's RX path.
     ///
     /// Returns `true` if the byte was accepted, `false` if the RX FIFO
-    /// was full or the port is paused (byte dropped).
+    /// was full, or the port is paused and its hold is full (byte
+    /// dropped).
     pub fn input_byte(&self, data: u8) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.paused {
-            return false;
+            if state.held.len() >= HELD_CAP {
+                return false;
+            }
+            state.held.push_back(data);
+            return true;
         }
         let accepted = state.uart.data_write(data);
         state.sync_intr_pin();
@@ -211,6 +223,12 @@ impl Lifecycle for LpcUart {
         let mut state = self.state.lock().unwrap();
         state.paused = false;
         self.drain_to_sink(&mut state);
+        // What the FIFO cannot take is dropped, as live input is.
+        while let Some(byte) = state.held.pop_front() {
+            if !state.uart.data_write(byte) {
+                state.held.clear();
+            }
+        }
         state.sync_intr_pin();
     }
 
@@ -374,7 +392,7 @@ mod tests {
         let _ = bus.handle_in(COM2_BASE + 2, 1); // the guest takes THRE
         assert!(src.input_byte(b'!'));
         src.pause();
-        assert!(!src.input_byte(b'?'), "a paused port takes no input");
+        assert!(src.input_byte(b'?'), "a paused port holds input");
         src.export_migrate_state().expect("export").expect("state")
     }
 
@@ -437,5 +455,31 @@ mod tests {
 
         uart.reset();
         assert!(!pin.is_asserted());
+    }
+
+    #[test]
+    fn input_while_paused_reaches_the_guest_at_the_resume() {
+        let bus = PioBus::new();
+        let uart = LpcUart::new(TestPin::new());
+        uart.attach(&bus, COM2_BASE);
+        uart.pause();
+        assert!(uart.input_byte(b'a'));
+        assert!(uart.input_byte(b'b'));
+        // Held, not in the FIFO, so an export cannot carry a byte that
+        // raised no interrupt.
+        assert_eq!(bus.handle_in(COM2_BASE + 5, 1) & 1, 0, "data ready");
+        uart.resume();
+        assert_eq!(bus.handle_in(COM2_BASE, 1), u32::from(b'a'));
+        assert_eq!(bus.handle_in(COM2_BASE, 1), u32::from(b'b'));
+    }
+
+    #[test]
+    fn the_hold_is_bounded() {
+        let uart = LpcUart::new(TestPin::new());
+        uart.pause();
+        for _ in 0..HELD_CAP {
+            assert!(uart.input_byte(b'x'));
+        }
+        assert!(!uart.input_byte(b'x'), "past the bound");
     }
 }
