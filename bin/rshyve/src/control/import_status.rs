@@ -248,9 +248,8 @@ mod tests {
     fn a_client_reads_the_phase_over_the_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("rs.sock");
-        let phase =
-            std::sync::Arc::new(std::sync::Mutex::new(MigrationPhase::Finish));
-        let read = std::sync::Arc::clone(&phase);
+        let phase = Arc::new(std::sync::Mutex::new(MigrationPhase::Finish));
+        let read = Arc::clone(&phase);
         let log = Logger::root(slog::Discard, slog::o!());
         let listener = spawn_import_status(
             &path,
