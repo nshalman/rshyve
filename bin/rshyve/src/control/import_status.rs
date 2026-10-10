@@ -13,7 +13,8 @@
 use std::io::BufReader;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::os::unix::fs::DirBuilderExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -50,14 +51,22 @@ pub fn spawn_import_status<P>(
 where
     P: Fn() -> MigrationPhase + Send + Sync + 'static,
 {
-    let first = bind(path)?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+    {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    let home = resolved_parent(path)?;
+    let first = bind(path, &home)?;
     let phase = Arc::new(phase);
     let shutdown = Arc::new(AtomicBool::new(false));
     let stop = Arc::clone(&shutdown);
     let at = path.to_path_buf();
     let handle = thread::Builder::new()
         .name("import-status".into())
-        .spawn(move || supervise(&at, first, &stop, &phase, &log))?;
+        .spawn(move || supervise(&at, &home, first, &stop, &phase, &log))?;
     Ok(ControlListener::from_parts(
         path.to_path_buf(),
         shutdown,
@@ -65,11 +74,58 @@ where
     ))
 }
 
-fn bind(path: &Path) -> std::io::Result<UnixListener> {
+/// Bind `path` for this process, whatever the received zone root left
+/// there.
+///
+/// The path is this VM's control socket, so any non-directory at it is
+/// removed first: a file or a socket served from inside the zone must
+/// not keep the status from binding. A parent that resolves anywhere
+/// but `home`, where it resolved at the first bind (a symlink the
+/// received zone root planted), is refused, so the bind cannot be sent
+/// elsewhere.
+fn bind(path: &Path, home: &Path) -> std::io::Result<UnixListener> {
+    let real = resolved_parent(path)?;
+    if real != home {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} now resolves to {}, not {}",
+                path.display(),
+                real.display(),
+                home.display()
+            ),
+        ));
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if !m.is_dir() => std::fs::remove_file(path)?,
+        _ => {}
+    }
     vmm_core::unixsock::bind_restricted(
         path,
         vmm_core::unixsock::SocketPolicy::default(),
     )
+}
+
+/// Where the directory that holds `path` really is.
+fn resolved_parent(path: &Path) -> std::io::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::canonicalize(parent)
+}
+
+/// The inode `path` names, once a connect through it reached
+/// `listener`. Read before and after the connect, so a swap in between
+/// is seen and nothing is taken for ours that is not.
+fn ours(path: &Path, listener: &UnixListener) -> Option<(u64, u64)> {
+    let before = named(path)?;
+    let probe = UnixStream::connect(path).ok()?;
+    listener.set_nonblocking(true).ok()?;
+    let reached = listener.accept().is_ok();
+    listener.set_nonblocking(false).ok()?;
+    drop(probe);
+    (reached && named(path) == Some(before)).then_some(before)
 }
 
 /// The file `path` names now, if any.
@@ -81,6 +137,7 @@ fn named(path: &Path) -> Option<(u64, u64)> {
 
 fn supervise<P>(
     path: &Path,
+    home: &Path,
     first: UnixListener,
     stop: &AtomicBool,
     phase: &Arc<P>,
@@ -92,7 +149,7 @@ fn supervise<P>(
     while !stop.load(Ordering::Acquire) {
         let listener = match next.take() {
             Some(l) => l,
-            None => match bind(path) {
+            None => match bind(path, home) {
                 Ok(l) => {
                     info!(log, "import status socket bound again";
                         "path" => %path.display());
@@ -106,8 +163,8 @@ fn supervise<P>(
                 }
             },
         };
-        // Unlinked again before it could be read: bind once more.
-        let Some(bound) = named(path) else {
+        // Unlinked or swapped before it could be checked: bind again.
+        let Some(bound) = ours(path, &listener) else {
             continue;
         };
         let round = Arc::new(AtomicBool::new(false));
@@ -279,5 +336,44 @@ mod tests {
         }
         assert_eq!(ask()["state"], "import-committed");
         drop(listener);
+    }
+
+    #[test]
+    fn a_file_left_at_the_path_does_not_block_the_bind() {
+        // A received zone root can hold anything at the socket path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rs.sock");
+        std::fs::write(&path, b"planted").expect("plant");
+        let home = resolved_parent(&path).expect("home");
+        let listener = bind(&path, &home).expect("bound over the file");
+        assert!(ours(&path, &listener).is_some());
+    }
+
+    #[test]
+    fn a_parent_swapped_for_a_link_is_refused() {
+        // The zone root recv replaced the directory with a link.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sockdir = dir.path().join("run");
+        std::fs::create_dir(&sockdir).expect("dir");
+        let path = sockdir.join("rs.sock");
+        let home = resolved_parent(&path).expect("home");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("dir");
+        std::fs::remove_dir(&sockdir).expect("rmdir");
+        std::os::unix::fs::symlink(&elsewhere, &sockdir).expect("link");
+        bind(&path, &home).expect_err("through a link");
+        assert!(!elsewhere.join("rs.sock").exists());
+    }
+
+    #[test]
+    fn a_socket_another_listener_owns_is_not_taken_for_ours() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rs.sock");
+        let home = resolved_parent(&path).expect("home");
+        let mine = bind(&path, &home).expect("bind");
+        // Swapped for another listener's socket after the bind.
+        std::fs::remove_file(&path).expect("unlink");
+        let _theirs = UnixListener::bind(&path).expect("theirs");
+        assert!(ours(&path, &mine).is_none());
     }
 }
