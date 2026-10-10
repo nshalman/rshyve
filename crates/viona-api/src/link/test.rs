@@ -58,7 +58,7 @@ struct Waiting {
 #[derive(Clone, Copy)]
 struct Tid(libc::pthread_t);
 
-// Safety: the value only names a thread, and every test that holds
+// SAFETY: the value only names a thread, and every test that holds
 // one waits for that thread to end before it drops the id.
 unsafe impl Send for Tid {}
 
@@ -72,7 +72,7 @@ fn spawn_wait(fd: VionaFd, stop: PipeReader) -> Waiting {
     std::thread::Builder::new()
         .name("wait-intr".into())
         .spawn(move || {
-            // Safety: pthread_self names the calling thread.
+            // SAFETY: pthread_self names the calling thread.
             let me = Tid(unsafe { libc::pthread_self() });
             named.send(me).expect("the test reads this");
             tx.send(fd.wait_intr(&stop))
@@ -100,7 +100,7 @@ fn tells_a_band_from_a_byte() -> bool {
         events: libc::POLLRDBAND,
         revents: 0,
     };
-    // Safety: one descriptor, open for this call, and the count
+    // SAFETY: one descriptor, open for this call, and the count
     // matches the array.
     let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
     assert!(ret >= 0, "poll: {}", std::io::Error::last_os_error());
@@ -133,7 +133,7 @@ fn sigusr1_interrupts_a_call() {
     extern "C" fn note(_sig: libc::c_int) {}
 
     INSTALLED.call_once(|| {
-        // Safety: the struct is initialized before the call, and the
+        // SAFETY: the struct is initialized before the call, and the
         // handler is a plain function that touches nothing.
         let rc = unsafe {
             let mut act: libc::sigaction = std::mem::zeroed();
@@ -650,7 +650,7 @@ fn a_signal_does_not_end_the_wait() {
     // signals land there. One is enough to end a wait that gives up.
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(10));
-        // Safety: the thread named itself above, and the assertion
+        // SAFETY: the thread named itself above, and the assertion
         // below reads the answer that says whether it is still there.
         let rc = unsafe { libc::pthread_kill(waiting.thread.0, libc::SIGUSR1) };
         // The thread sends its result before it leaves, so a thread
@@ -724,7 +724,7 @@ fn the_public_ioctl_calls_refuse_the_hook_commands() {
     let mut vim = vioc_notify_mmio::default();
 
     let iop = fd.ioctl_usize(VNA_IOC_SET_NOTIFY_IOP, 0x2000);
-    // Safety: the payload is one vioc_notify_mmio.
+    // SAFETY: the payload is one vioc_notify_mmio.
     let mmio = unsafe { fd.ioctl(VNA_IOC_SET_NOTIFY_MMIO, &mut vim) };
 
     assert_eq!(iop.unwrap_err().kind(), ErrorKind::PermissionDenied);

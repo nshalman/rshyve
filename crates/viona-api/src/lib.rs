@@ -122,7 +122,7 @@ impl Call {
             "cmd {cmd:#x} sent {} bytes",
             data.len(),
         );
-        // Safety: the bytes came from one T, and a Vec's buffer has
+        // SAFETY: the bytes came from one T, and a Vec's buffer has
         // no alignment to promise, so the read is unaligned.
         unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<T>()) }
     }
@@ -148,7 +148,7 @@ impl VionaFd {
             c_linkid: link_id,
             c_vmfd: vm.as_raw_fd(),
         };
-        // Safety: the kernel reads one vioc_create for this command.
+        // SAFETY: the kernel reads one vioc_create for this command.
         let _ = unsafe { self.ioctl(VNA_IOC_CREATE, &mut vna_create) }?;
         Ok(())
     }
@@ -181,7 +181,7 @@ impl VionaFd {
     /// processing.
     pub unsafe fn ioctl<T>(&self, cmd: i32, data: *mut T) -> Result<i32> {
         refuse_hook_cmd(cmd)?;
-        // Safety: the caller's contract is this function's.
+        // SAFETY: the caller's contract is this function's.
         unsafe { self.ioctl_any(cmd, data) }
     }
 
@@ -196,7 +196,7 @@ impl VionaFd {
         cmd: i32,
         data: *mut T,
     ) -> Result<i32> {
-        // Safety: the caller's contract is this function's.
+        // SAFETY: the caller's contract is this function's.
         unsafe { self.ioctl_any(cmd, data) }
     }
 
@@ -214,7 +214,7 @@ impl VionaFd {
             // command, so a caller that reads a copy-out reads a
             // value it did not send.
             //
-            // Safety: the caller's contract above says `data` points
+            // SAFETY: the caller's contract above says `data` points
             // at one initialized T, writable for the same length.
             // Every ioctl payload names its padding, so no byte read
             // here is uninitialized, and the bytes written back came
@@ -278,7 +278,7 @@ impl VionaFd {
 
     fn ioctl_raw(&self, cmd: i32, data: usize) -> Result<i32> {
         match &self.0 {
-            // Safety: every caller passes either a command that does
+            // SAFETY: every caller passes either a command that does
             // not read the data argument as a pointer, or the window
             // command with a null pointer, which the kernel checks
             // before any copyin.
@@ -301,7 +301,7 @@ impl VionaFd {
     /// Read the features the kernel driver offers.
     pub fn get_features(&self) -> Result<u64> {
         let mut feat: u64 = 0;
-        // Safety: the command copies out one u64, and that is what
+        // SAFETY: the command copies out one u64, and that is what
         // `feat` is.
         unsafe { self.ioctl(VNA_IOC_GET_FEATURES, &mut feat) }?;
         Ok(feat)

@@ -204,7 +204,7 @@ impl LinkOps for VionaFd {
             rim_qaddr_used: used,
             ..Default::default()
         };
-        // Safety: the command copies in one vioc_ring_init_modern, and
+        // SAFETY: the command copies in one vioc_ring_init_modern, and
         // that is what `rim` is.
         unsafe { self.ioctl(VNA_IOC_RING_INIT_MODERN, &mut rim) }?;
         Ok(())
@@ -227,7 +227,7 @@ impl LinkOps for VionaFd {
 
     fn ring_set_state(&self, state: &vioc_ring_state) -> Result<()> {
         let mut state = *state;
-        // Safety: the command copies in one vioc_ring_state, and that
+        // SAFETY: the command copies in one vioc_ring_state, and that
         // is what `state` is.
         unsafe { self.ioctl(VNA_IOC_RING_SET_STATE, &mut state) }?;
         Ok(())
@@ -238,7 +238,7 @@ impl LinkOps for VionaFd {
             vrs_index: ring,
             ..Default::default()
         };
-        // Safety: the command copies out one vioc_ring_state, and that
+        // SAFETY: the command copies out one vioc_ring_state, and that
         // is what `state` is.
         unsafe { self.ioctl(VNA_IOC_RING_GET_STATE, &mut state) }?;
         Ok(state)
@@ -251,7 +251,7 @@ impl LinkOps for VionaFd {
             rm_msg: msg,
             ..Default::default()
         };
-        // Safety: the command copies in one vioc_ring_msi, and that is
+        // SAFETY: the command copies in one vioc_ring_msi, and that is
         // what `msi` is.
         unsafe { self.ioctl(VNA_IOC_RING_SET_MSI, &mut msi) }?;
         Ok(())
@@ -259,7 +259,7 @@ impl LinkOps for VionaFd {
 
     fn set_features(&self, features: u64) -> Result<()> {
         let mut feat = features;
-        // Safety: the command copies in one u64, and that is what
+        // SAFETY: the command copies in one u64, and that is what
         // `feat` is.
         unsafe { self.ioctl(VNA_IOC_SET_FEATURES, &mut feat) }?;
         Ok(())
@@ -267,7 +267,7 @@ impl LinkOps for VionaFd {
 
     fn intr_status(&self) -> Result<IntrStatus> {
         let mut poll_data = vioc_intr_poll::default();
-        // Safety: the command copies out one vioc_intr_poll, and that
+        // SAFETY: the command copies out one vioc_intr_poll, and that
         // is what `poll_data` is.
         unsafe { self.ioctl(VNA_IOC_INTR_POLL, &mut poll_data) }?;
         Ok(poll_data.vip_status)
@@ -294,7 +294,7 @@ impl LinkOps for VionaFd {
                     revents: 0,
                 },
             ];
-            // Safety: both descriptors are open for this call, and the
+            // SAFETY: both descriptors are open for this call, and the
             // count matches the array.
             let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
             if ret < 0 {
@@ -344,7 +344,7 @@ impl LinkOps for VionaFd {
             vim_size: size,
             ..Default::default()
         };
-        // Safety: the command copies in one vioc_notify_mmio, and that
+        // SAFETY: the command copies in one vioc_notify_mmio, and that
         // is what `vim` is.
         unsafe { self.hook_ioctl(VNA_IOC_SET_NOTIFY_MMIO, &mut vim) }?;
         Ok(())
