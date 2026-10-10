@@ -11,14 +11,19 @@
 //! attach waits for a home that never comes and the import fails.
 
 use std::io::BufReader;
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
-use slog::{warn, Logger};
+use slog::{info, warn, Logger};
 use vmm_migrate::MigrationPhase;
 
 use super::listener::{
-    authorized, read_request, spawn_listener, write_error_response,
+    authorized, read_request, serve_connections, write_error_response,
     write_response, WRITE_TIMEOUT,
 };
 use super::protocol::{Command, Response};
@@ -28,7 +33,15 @@ const IMPORT_RUNNING: &str =
     "the migration import runs; only status and migrate-status are served \
      until the guest starts";
 
+/// How often the socket path is checked.
+const WATCH_EVERY: Duration = Duration::from_millis(200);
+
 /// Serve the import's phase at `path` until the listener drops.
+///
+/// The final `zfs recv` of the zone root at the cutover gate replaces
+/// the filesystem that holds `path`, which unlinks the socket while this
+/// process still listens on it. So the path is watched, and bound again
+/// when it no longer names the socket bound last.
 pub fn spawn_import_status<P>(
     path: &Path,
     phase: P,
@@ -37,13 +50,92 @@ pub fn spawn_import_status<P>(
 where
     P: Fn() -> MigrationPhase + Send + Sync + 'static,
 {
-    let connection_log = log.clone();
-    spawn_listener(path, log, move |stream| {
-        if let Err(e) = handle(&stream, &phase, &connection_log) {
-            warn!(connection_log, "import status connection error";
-                "error" => %e);
+    let first = bind(path)?;
+    let phase = Arc::new(phase);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let stop = Arc::clone(&shutdown);
+    let at = path.to_path_buf();
+    let handle = thread::Builder::new()
+        .name("import-status".into())
+        .spawn(move || supervise(&at, first, &stop, &phase, &log))?;
+    Ok(ControlListener::from_parts(
+        path.to_path_buf(),
+        shutdown,
+        handle,
+    ))
+}
+
+fn bind(path: &Path) -> std::io::Result<UnixListener> {
+    vmm_core::unixsock::bind_restricted(
+        path,
+        vmm_core::unixsock::SocketPolicy::default(),
+    )
+}
+
+/// The file `path` names now, if any.
+fn named(path: &Path) -> Option<(u64, u64)> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
+
+fn supervise<P>(
+    path: &Path,
+    first: UnixListener,
+    stop: &AtomicBool,
+    phase: &Arc<P>,
+    log: &Logger,
+) where
+    P: Fn() -> MigrationPhase + Send + Sync + 'static,
+{
+    let mut next = Some(first);
+    while !stop.load(Ordering::Acquire) {
+        let listener = match next.take() {
+            Some(l) => l,
+            None => match bind(path) {
+                Ok(l) => {
+                    info!(log, "import status socket bound again";
+                        "path" => %path.display());
+                    l
+                }
+                Err(e) => {
+                    warn!(log, "import status socket not bound";
+                        "path" => %path.display(), "error" => %e);
+                    thread::sleep(WATCH_EVERY);
+                    continue;
+                }
+            },
+        };
+        let bound = named(path);
+        let round = Arc::new(AtomicBool::new(false));
+        let serving = Arc::clone(&round);
+        let answer = Arc::clone(phase);
+        let connection_log = log.clone();
+        let accept_log = log.clone();
+        let accept = thread::Builder::new()
+            .name("import-status-accept".into())
+            .spawn(move || {
+                serve_connections(listener, &serving, accept_log, move |s| {
+                    if let Err(e) = handle(&s, &*answer, &connection_log) {
+                        warn!(connection_log, "import status connection error";
+                            "error" => %e);
+                    }
+                });
+            });
+        let accept = match accept {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(log, "no import status thread"; "error" => %e);
+                thread::sleep(WATCH_EVERY);
+                continue;
+            }
+        };
+        while !stop.load(Ordering::Acquire) && named(path) == bound {
+            thread::sleep(WATCH_EVERY);
         }
-    })
+        round.store(true, Ordering::Release);
+        let _ = accept.join();
+    }
 }
 
 fn handle<P>(
@@ -133,6 +225,16 @@ mod tests {
         assert_eq!(r["state"], "import-committed");
     }
 
+    /// The exact line the target agent reads; its tests hold the same.
+    #[test]
+    fn the_committed_answer_is_this_line() {
+        let r = answer(&Command::Status, MigrationPhase::Committed);
+        assert_eq!(
+            serde_json::to_string(&r).expect("json"),
+            r#"{"success":true,"state":"import-committed","migrate_phase":"committed"}"#
+        );
+    }
+
     #[test]
     fn nothing_but_status_runs_during_the_import() {
         for cmd in [Command::Stop, Command::MigrateResumeSource] {
@@ -165,6 +267,14 @@ mod tests {
         };
         assert_eq!(ask()["state"], "migrating");
         *phase.lock().expect("phase") = MigrationPhase::Committed;
+        assert_eq!(ask()["state"], "import-committed");
+        // As the final zfs recv of the zone root does.
+        std::fs::remove_file(&path).expect("unlink");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while UnixStream::connect(&path).is_err() {
+            assert!(std::time::Instant::now() < deadline, "not bound again");
+            thread::sleep(Duration::from_millis(20));
+        }
         assert_eq!(ask()["state"], "import-committed");
         drop(listener);
     }

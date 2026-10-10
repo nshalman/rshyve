@@ -44,6 +44,19 @@ pub struct ControlListener {
 }
 
 impl ControlListener {
+    /// A listener whose accept thread `handle` stops on `shutdown`.
+    pub(super) fn from_parts(
+        path: PathBuf,
+        shutdown: Arc<AtomicBool>,
+        handle: thread::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            path,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+
     /// The socket file, for the caller that removes it at teardown.
     pub fn path(&self) -> &Path {
         &self.path
@@ -85,7 +98,7 @@ pub fn spawn_control_thread(
 }
 
 /// Bind `path` and serve each client with `handler` on its own thread.
-pub(super) fn spawn_listener<F>(
+fn spawn_listener<F>(
     path: &Path,
     log: Logger,
     handler: F,
@@ -155,7 +168,7 @@ fn set_connection_deadlines(
 /// The accept itself is the shared loop, which retries a transient
 /// error such as `EMFILE` with a backoff instead of ending: one accept
 /// error used to take the control socket away for the life of the VM.
-fn serve_connections<F>(
+pub(super) fn serve_connections<F>(
     listener: UnixListener,
     shutdown: &AtomicBool,
     log: Logger,
