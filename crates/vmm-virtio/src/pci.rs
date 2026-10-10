@@ -283,6 +283,8 @@ pub struct VirtioPciDevice<D: VirtioDevice> {
     registered_bar2: Mutex<Option<u64>>,
     /// Currently registered BAR4 MMIO base address.
     registered_bar4: Mutex<Option<u64>>,
+    /// The notify addresses last given to the backend.
+    notify_sent: Mutex<(u16, u64)>,
     /// Weak self-reference for BAR registration closures.
     self_ref: Mutex<Option<std::sync::Weak<Self>>>,
     /// Structured logger for bus registration diagnostics.
@@ -456,6 +458,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             registered_bar: Mutex::new(None),
             registered_bar2: Mutex::new(None),
             registered_bar4: Mutex::new(None),
+            notify_sent: Mutex::new((0, 0)),
             self_ref: Mutex::new(None),
             log,
             queue_refusal_reported: std::sync::atomic::AtomicBool::new(false),

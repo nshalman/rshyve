@@ -228,7 +228,12 @@ pub trait VirtioDevice: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Program notification addresses after migration.
+    /// The queue notify addresses the guest decodes now, 0 for one it
+    /// does not.
+    ///
+    /// The transport calls this whenever a BAR or the command register
+    /// moves them, and after a migration restore. A backend that hooks
+    /// them in the kernel has to follow.
     fn set_notify_addrs(&self, _pio_port: u16, _mmio_addr: u64) {}
 
     /// Start the deferred interrupt poll thread after migration restore.

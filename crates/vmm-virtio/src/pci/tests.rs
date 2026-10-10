@@ -990,4 +990,5 @@ fn device_features_write_ignored() {
 }
 
 mod modern;
+mod notify;
 mod wired;

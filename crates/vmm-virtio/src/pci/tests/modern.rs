@@ -227,6 +227,9 @@ fn the_notify_hook_is_set_before_any_ring_runs() {
     let dev = make_tracking_device();
     let mut state = transport(bits::VIRTIO_F_VERSION_1, vec![live_queue()]);
     state.pci.bar_addrs = [0xC120, 0, 0xFEC0_0000, 0, 0, 0];
+    state.pci.command = (vmm_devices::pci::bits::RegCmd::IO_EN
+        | vmm_devices::pci::bits::RegCmd::MMIO_EN)
+        .bits();
     dev.restore_migrate_state(&DeviceMigrateState::Virtio(state))
         .expect("a sane payload restores");
     let tracked = dev.device.state.lock().expect("tracking state lock");

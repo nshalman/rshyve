@@ -33,7 +33,6 @@ use vmm_devices::lifecycle::{
     DeviceStateError, MigratePciState, VirtioMigrateQueue, VirtioMigrateState,
 };
 use vmm_devices::pci::device::replay_migrate_pci_state;
-use vmm_devices::pci::BarN;
 
 use super::bits;
 use super::{VirtioDevice, VirtioPciDevice};
@@ -295,25 +294,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             })?;
         }
 
-        // Before any ring runs: the notify hook takes the VM's write
-        // lock, which waits on every ring lease, and a running ring
-        // worker renews its lease with its ring lock held. On illumos
-        // that deadlocks in the kernel, and the process cannot be
-        // killed.
-        let (bar0_port, bar2_addr) = self.notify_bases();
-        if bar0_port != 0 || bar2_addr != 0 {
-            let notify_pio = if bar0_port != 0 {
-                bar0_port + bits::LEGACY_REG_QUEUE_NOTIFY
-            } else {
-                0
-            };
-            let notify_mmio = if bar2_addr != 0 {
-                bar2_addr + bits::MODERN_BAR_NOTIFY_OFFSET as u64
-            } else {
-                0
-            };
-            self.device.set_notify_addrs(notify_pio, notify_mmio);
-        }
+        // The BAR replay above gave the backend its notify addresses,
+        // so the hook is in place before any ring is restored and the
+        // backend does not have to stop rings to set it.
+        self.sync_notify_hook();
 
         for qs in &state.queues {
             if !qs.live {
@@ -362,22 +346,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             }
             None => (0, 0),
         }
-    }
-
-    /// The PIO port and MMIO base the notification registers sit in.
-    fn notify_bases(&self) -> (u16, u64) {
-        let pci = self.pci_state.lock().expect("pci lock");
-        let bar0_port = pci
-            .bars()
-            .get(BarN::BAR0)
-            .and_then(|(def, addr)| def.is_pio().then_some(addr as u16))
-            .unwrap_or(0);
-        let bar2_addr = pci
-            .bars()
-            .get(BarN::BAR2)
-            .and_then(|(def, addr)| def.is_mmio().then_some(addr))
-            .unwrap_or(0);
-        (bar0_port, bar2_addr)
     }
 }
 
