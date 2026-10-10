@@ -303,9 +303,8 @@ fn a_cancelled_source_never_commits() {
     };
     let status = status();
 
-    let error =
-        hand_over(&mut source, &gate, no_hook(), &status, &discard())
-            .expect_err("cancelled");
+    let error = hand_over(&mut source, &gate, no_hook(), &status, &discard())
+        .expect_err("cancelled");
 
     assert!(crate::is_cancel(&error), "{error}");
     assert_eq!(phase(&status), MigrationPhase::Finish, "not rolled back");
@@ -321,9 +320,8 @@ fn a_destination_abort_rolls_the_source_back() {
     let gate = Gate::default();
     let status = status();
 
-    let error =
-        hand_over(&mut source, &gate, no_hook(), &status, &discard())
-            .expect_err("the destination aborted");
+    let error = hand_over(&mut source, &gate, no_hook(), &status, &discard())
+        .expect_err("the destination aborted");
 
     assert_eq!(gate.commits.load(Ordering::Acquire), 0, "committed");
     assert_eq!(phase(&status), MigrationPhase::Finish);
@@ -334,9 +332,7 @@ fn a_destination_abort_rolls_the_source_back() {
         phase(&status),
         GateState::None,
         &discard(),
-        paused(Box::new(move || {
-            by_callback.store(true, Ordering::Release)
-        })),
+        paused(Box::new(move || by_callback.store(true, Ordering::Release))),
         || Ok::<(), &'static str>(()),
     );
     assert!(rolled_back.load(Ordering::Acquire));
@@ -499,9 +495,7 @@ fn an_aborted_gate_rolls_the_source_back() {
         MigrationPhase::Pause,
         GateState::Abort,
         &discard(),
-        paused(Box::new(move || {
-            by_callback.store(true, Ordering::Release)
-        })),
+        paused(Box::new(move || by_callback.store(true, Ordering::Release))),
         || Ok::<(), &'static str>(()),
     );
     assert!(resumed.load(Ordering::Acquire));
@@ -517,14 +511,8 @@ fn the_disks_are_given_up_right_after_the_commit() {
         dest
     });
     let (hook, calls) = counting();
-    hand_over(
-        &mut source,
-        &Gate::default(),
-        hook,
-        &status(),
-        &discard(),
-    )
-    .expect("handed over");
+    hand_over(&mut source, &Gate::default(), hook, &status(), &discard())
+        .expect("handed over");
     assert_eq!(calls.load(Ordering::Acquire), 1);
     peer.join().expect("the destination finished");
 }
@@ -535,14 +523,9 @@ fn a_commit_that_may_be_lost_still_gives_the_disks_up() {
     dest.send(&Message::Okay).expect("holds it all");
     drop(dest);
     let (hook, calls) = counting();
-    let error = hand_over(
-        &mut source,
-        &Gate::default(),
-        hook,
-        &status(),
-        &discard(),
-    )
-    .expect_err("the peer left");
+    let error =
+        hand_over(&mut source, &Gate::default(), hook, &status(), &discard())
+            .expect_err("the peer left");
     assert!(matches!(error, MigrateError::Committed(_)), "{error}");
     assert_eq!(calls.load(Ordering::Acquire), 1);
 }
@@ -553,14 +536,8 @@ fn no_commit_keeps_the_disks() {
     dest.send(&Message::Error(crate::cancelled()))
         .expect("abort");
     let (hook, calls) = counting();
-    hand_over(
-        &mut source,
-        &Gate::default(),
-        hook,
-        &status(),
-        &discard(),
-    )
-    .expect_err("the destination aborted");
+    hand_over(&mut source, &Gate::default(), hook, &status(), &discard())
+        .expect_err("the destination aborted");
     assert_eq!(calls.load(Ordering::Acquire), 0);
 }
 
@@ -792,7 +769,10 @@ fn a_page_dirty_at_the_commit_refuses_it() {
     let error =
         check_clean(&mut track, &memctx, &owners).expect_err("one page left");
     assert!(error.to_string().contains("1 guest pages"), "{error}");
-    assert!(error.to_string().contains("0x5000 (RAM region 0"), "{error}");
+    assert!(
+        error.to_string().contains("0x5000 (RAM region 0"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -840,3 +820,5 @@ fn a_page_the_source_cannot_read_fails_and_sends_nothing() {
     drop(source);
     assert!(dest.recv().is_err(), "a batch went out");
 }
+
+mod final_pass;
