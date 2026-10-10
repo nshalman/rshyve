@@ -26,7 +26,7 @@
 //! one thread rather than deadlock on it.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 /// A device whose kernel workers hold a lease on the VM.
@@ -96,6 +96,11 @@ pub struct RingGate {
     /// Outside the lock, so a member inside [`RingGate::exclusive`] can
     /// set it.
     tainted: AtomicBool,
+    /// Why the gate is tainted, for the VM status.
+    taint_why: Mutex<Option<String>>,
+    /// Devices left in the kernel because their rings could not be
+    /// stopped for the delete.
+    leaked: AtomicU32,
 }
 
 #[derive(Default)]
@@ -191,9 +196,31 @@ impl RingGate {
     ///
     /// Every later run, hold and exclusive section is refused: under a
     /// hold a run stops nothing, so it would take the write lock with
-    /// that worker alive.
-    pub fn taint(&self) {
+    /// that worker alive. The caller logs it; the status shows `why`.
+    pub fn taint(&self, why: &str) {
+        let mut slot = self.taint_why.lock().unwrap_or_else(|e| e.into_inner());
+        slot.get_or_insert_with(|| why.to_string());
         self.tainted.store(true, Ordering::Release);
+    }
+
+    /// Why the gate is tainted, or `None` while it is not.
+    pub fn tainted(&self) -> Option<String> {
+        if !self.tainted.load(Ordering::Acquire) {
+            return None;
+        }
+        let why = self.taint_why.lock().unwrap_or_else(|e| e.into_inner());
+        Some(why.clone().unwrap_or_default())
+    }
+
+    /// Count a device left in the kernel because its rings could not
+    /// be stopped to delete it.
+    pub fn note_leak(&self) {
+        self.leaked.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// How many devices [`Self::note_leak`] counted.
+    pub fn leaks(&self) -> u32 {
+        self.leaked.load(Ordering::Acquire)
     }
 
     /// Add a device. Under a hold it is stopped at once, so the hold

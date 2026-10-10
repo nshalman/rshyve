@@ -234,7 +234,11 @@ impl VirtioViona {
             }
             StopOne::Lost(e) => e,
             StopOne::Escaped(e) => {
-                rings.taint();
+                slog::error!(inner.log(), "viona ring reset refused after a \
+                    restore; the ring gate is tainted and no write-lock \
+                    ioctl may run on this VM";
+                    "ring" => ring, "error" => %e);
+                rings.taint(&format!("viona ring {ring} reset refused: {e}"));
                 e
             }
         };

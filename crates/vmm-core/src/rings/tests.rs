@@ -262,8 +262,10 @@ fn a_tainted_gate_refuses_everything_even_under_a_hold() {
     let gate = RingGate::new();
     let hold = gate.hold().expect("hold");
 
-    gate.taint();
+    assert_eq!(gate.tainted(), None);
+    gate.taint("ring 0 reset refused");
 
+    assert_eq!(gate.tainted().as_deref(), Some("ring 0 reset refused"));
     assert_eq!(gate.run(|_| ()), Err(GateError::Tainted));
     assert_eq!(gate.exclusive(|| ()), Err(GateError::Tainted));
     assert!(gate.hold().is_err());
@@ -288,10 +290,19 @@ fn a_caller_waiting_behind_a_taint_sees_it() {
     gate.exclusive(|| {
         queued_tx.send(()).expect("the waiter listens");
         std::thread::sleep(std::time::Duration::from_millis(50));
-        gate.taint();
+        gate.taint("test");
     })
     .expect("exclusive");
 
     assert_eq!(waiter.join().expect("waiter"), Some(GateError::Tainted));
     drop(hold);
+}
+
+#[test]
+fn leaks_are_counted_for_the_status() {
+    let gate = RingGate::new();
+    assert_eq!(gate.leaks(), 0);
+    gate.note_leak();
+    gate.note_leak();
+    assert_eq!(gate.leaks(), 2);
 }

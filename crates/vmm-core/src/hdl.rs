@@ -26,9 +26,10 @@ use bhyve_api::{
 
 use crate::common::PAGE_SIZE;
 use crate::mem::Prot;
-use crate::rings::{PausedRings, RingGate, RingsStopped};
+use crate::rings::{RingGate, RingsStopped};
 
 mod fpu;
+mod shared;
 mod vcpu;
 
 pub use fpu::{FpuArea, FpuComponent, MAX_FPU_AREA_LEN};
@@ -101,9 +102,8 @@ pub struct CreateOpts {
 pub struct VmmHdl {
     inner: VmmFd,
     name: String,
-    rings: Arc<RingGate>,
-    /// Keeps the rings stopped from `VM_PAUSE` to `VM_RESUME`.
-    paused_rings: PausedRings,
+    /// Shared with every other handle on this VM.
+    rings: Arc<shared::VmRings>,
 }
 
 impl VmmHdl {
@@ -166,22 +166,22 @@ impl VmmHdl {
     }
 
     fn with_fd(inner: VmmFd, name: &str) -> Self {
+        let rings = shared::for_vm(name, inner.as_fd());
         Self {
             inner,
             name: name.to_string(),
-            rings: RingGate::new(),
-            paused_rings: PausedRings::default(),
+            rings,
         }
     }
 
     /// The gate every write-lock ioctl on this VM goes through.
     pub fn rings(&self) -> &Arc<RingGate> {
-        &self.rings
+        &self.rings.gate
     }
 
     /// Refuse a proof made for another VM.
     fn proven(&self, rings: &RingsStopped<'_>) -> Result<()> {
-        if self.rings.proves(rings) {
+        if self.rings.gate.proves(rings) {
             return Ok(());
         }
         Err(Error::new(
@@ -440,7 +440,7 @@ impl VmmHdl {
     /// paused VM, and every write-lock ioctl in the pause would race
     /// it. A refusal pauses nothing.
     pub fn pause(&self) -> Result<()> {
-        self.paused_rings.pause(&self.rings, |rings| {
+        self.rings.paused.pause(&self.rings.gate, |rings| {
             self.proven(rings)?;
             self.inner.ioctl_usize(ioctls::VM_PAUSE, 0).map(drop)
         })
@@ -450,7 +450,7 @@ impl VmmHdl {
     ///
     /// A refused resume keeps the rings stopped with the VM.
     pub fn resume(&self) -> Result<()> {
-        self.paused_rings.resume(&self.rings, |rings| {
+        self.rings.paused.resume(&self.rings.gate, |rings| {
             self.proven(rings)?;
             self.inner.ioctl_usize(ioctls::VM_RESUME, 0).map(drop)
         })
