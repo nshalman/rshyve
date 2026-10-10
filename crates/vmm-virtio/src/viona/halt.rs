@@ -16,7 +16,7 @@ use vmm_core::rings::GateError;
 use super::{RingState, VirtioViona, NET_NUM_QUEUES};
 
 /// How long a halt waits for the gate to stop every ring before it
-/// deletes a link that may hold a hook.
+/// leaves a link that may hold a hook in the kernel.
 ///
 /// The usual refusal is another link in the middle of its own delete:
 /// its ring calls answer `ENXIO` until the delete ends.
@@ -93,18 +93,10 @@ impl VirtioViona {
     /// one.
     ///
     /// If the gate cannot stop the rings within [`GATE_WAIT`], or a
-    /// worker escaped it, the delete runs anyway. This is not safe, and
-    /// nothing in userspace can make it so: the same delete runs when
-    /// the process closes the descriptor (`viona_main.c`, `viona_close`)
-    /// with the hook still on and the same worker alive. Holding the
-    /// link back only moves the risk to exit, and leaves
-    /// `VM_DESTROY_SELF` waiting for the hold. How narrow it is: a ring
-    /// call is refused only with `ENXIO`, once a link or the VM hold is
-    /// on its way out (`viona_main.c`, `viona_ioctl`); a link on its way
-    /// out ends its own delete within the wait, and a hold marked for
-    /// release fails every lease renewal (`viona_ring.c`,
-    /// `viona_ring_lease_renew`), so no worker waits in one for the
-    /// write lock.
+    /// worker escaped it, the link is left in the kernel. A delete then
+    /// takes the write lock beside a live worker, which can hang the
+    /// host until a reboot. The leak is counted in the gate, so the VM
+    /// status shows it, and the link stays one the gate stops.
     pub(super) fn destroy_link(&self) -> std::io::Result<()> {
         let (link, log, poller, hooked) = {
             let mut inner = self.inner.lock().expect("viona lock poisoned");
@@ -144,9 +136,12 @@ impl VirtioViona {
         } else {
             halt_link(link.as_ref(), &log)
         };
-        // Whatever the delete answered, the link is not one the gate
-        // can stop again.
-        self.inner.lock().expect("viona lock").deleted = true;
+        // Only a delete that worked ended every worker. A link the
+        // delete refused, or one left in the kernel, keeps its place in
+        // the gate, which still has to stop it.
+        if rc.is_ok() {
+            self.inner.lock().expect("viona lock").deleted = true;
+        }
         rc
     }
 
@@ -170,9 +165,14 @@ impl VirtioViona {
                     waited += GATE_STEP;
                 }
                 Err(e) => {
-                    slog::error!(log, "viona rings did not stop before the \
-                        link delete"; "error" => %e);
-                    return halt_link(link, log);
+                    self.rings.note_leak();
+                    slog::error!(log, "viona rings did not stop, so the \
+                        link is LEFT IN THE KERNEL: a delete now could \
+                        hang the host"; "error" => %e);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ResourceBusy,
+                        format!("viona link left in the kernel: {e}"),
+                    ));
                 }
             }
         }

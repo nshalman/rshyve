@@ -346,6 +346,71 @@ fn a_halt_with_a_hook_waits_for_a_neighbour_to_stop() {
 }
 
 #[test]
+fn a_halt_that_cannot_stop_a_neighbour_leaves_the_link() {
+    // A delete with the hook on takes the write lock. With a worker of
+    // the neighbour alive, that can hang the host, so the link stays
+    // in the kernel and the gate counts it.
+    let gate = RingGate::new();
+    let mine = Steps::default();
+    let other = Steps::default();
+    let device = device_in(
+        Arc::new(TestLink::new(&mine).live_rings(NET_QUEUE_SIZE)),
+        Arc::clone(&gate),
+    );
+    VirtioDevice::set_notify_addrs(&device, PORT, WINDOW);
+    let _neighbour = device_in(
+        Arc::new(
+            TestLink::new(&other)
+                .live_rings(NET_QUEUE_SIZE)
+                .failing(&[Op::RingPause]),
+        ),
+        Arc::clone(&gate),
+    );
+    clear(&mine);
+
+    vmm_devices::Lifecycle::halt(&device);
+
+    let seen = steps_of(&mine);
+    assert!(!seen.contains(&Step::Delete), "{seen:?}");
+    assert!(!seen.contains(&Step::SetNotifyIop(0)), "{seen:?}");
+    assert_eq!(gate.leaks(), 1);
+    assert!(!device.inner.lock().expect("viona lock").deleted);
+}
+
+#[test]
+fn a_halt_on_a_tainted_gate_leaves_the_link() {
+    let steps = Steps::default();
+    let device = running_device(Arc::new(
+        TestLink::new(&steps).live_rings(NET_QUEUE_SIZE),
+    ));
+    VirtioDevice::set_notify_addrs(&device, PORT, WINDOW);
+    device.rings.taint("test");
+    clear(&steps);
+
+    vmm_devices::Lifecycle::halt(&device);
+
+    assert!(!steps_of(&steps).contains(&Step::Delete));
+    assert_eq!(device.rings.leaks(), 1);
+}
+
+#[test]
+fn a_refused_delete_keeps_the_link_in_the_gate() {
+    // The gate must still stop a link whose delete failed: its workers
+    // may be alive.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(
+        TestLink::new(&steps)
+            .live_rings(NET_QUEUE_SIZE)
+            .failing(&[Op::Delete]),
+    ));
+
+    vmm_devices::Lifecycle::halt(&device);
+
+    assert!(!device.inner.lock().expect("viona lock").deleted);
+    assert_eq!(device.rings.leaks(), 0);
+}
+
+#[test]
 fn a_hook_change_stops_the_rings_of_every_link_on_the_vm() {
     // The write lock expires every lease on the VM, not only this
     // link's.

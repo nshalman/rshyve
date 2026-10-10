@@ -42,7 +42,7 @@ impl KernelRings for GateMember {
             }
             Err(failed) => {
                 let why = failed.to_string();
-                VirtioViona::restart_rings(&mut inner, failed.resumed);
+                VirtioViona::resume_rings(&mut inner, failed.resumed);
                 Err(format!("viona {why}"))
             }
         }
@@ -60,15 +60,21 @@ impl KernelRings for GateMember {
             rings.discard();
             return;
         }
-        let resumed = rings.resume();
-        for &ring in &resumed.kick {
-            VirtioViona::route_again(&mut inner, ring);
-        }
-        VirtioViona::restart_rings(&mut inner, resumed);
+        VirtioViona::resume_rings(&mut inner, rings.resume());
     }
 }
 
 impl VirtioViona {
+    /// Route and kick the rings a quiesce put back. A reset dropped
+    /// their MSI-X routes, whether the gate let go or a quiesce rolled
+    /// back half way.
+    fn resume_rings(inner: &mut VionaInner, resumed: viona_api::Resumed) {
+        for &ring in &resumed.kick {
+            Self::route_again(inner, ring);
+        }
+        Self::restart_rings(inner, resumed);
+    }
+
     /// Give a ring the gate put back the MSI-X route a restore gave it.
     fn route_again(inner: &mut VionaInner, ring: u16) {
         let Some(&Some((addr, msg))) = inner.msi.get(usize::from(ring)) else {
