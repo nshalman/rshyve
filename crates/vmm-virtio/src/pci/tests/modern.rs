@@ -223,6 +223,17 @@ fn restore_virtio_state_replays_pci_transport_state() {
 }
 
 #[test]
+fn the_notify_hook_is_set_before_any_ring_runs() {
+    let dev = make_tracking_device();
+    let mut state = transport(bits::VIRTIO_F_VERSION_1, vec![live_queue()]);
+    state.pci.bar_addrs = [0xC120, 0, 0xFEC0_0000, 0, 0, 0];
+    dev.restore_migrate_state(&DeviceMigrateState::Virtio(state))
+        .expect("a sane payload restores");
+    let tracked = dev.device.state.lock().expect("tracking state lock");
+    assert_eq!(tracked.order, vec!["notify", "ring"]);
+}
+
+#[test]
 fn restore_virtio_state_propagates_ring_feature_flags() {
     let dev = make_tracking_device();
     let features = bits::VIRTIO_F_VERSION_1

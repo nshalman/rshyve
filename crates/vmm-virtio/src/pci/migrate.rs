@@ -295,6 +295,26 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             })?;
         }
 
+        // Before any ring runs: the notify hook takes the VM's write
+        // lock, which waits on every ring lease, and a running ring
+        // worker renews its lease with its ring lock held. On illumos
+        // that deadlocks in the kernel, and the process cannot be
+        // killed.
+        let (bar0_port, bar2_addr) = self.notify_bases();
+        if bar0_port != 0 || bar2_addr != 0 {
+            let notify_pio = if bar0_port != 0 {
+                bar0_port + bits::LEGACY_REG_QUEUE_NOTIFY
+            } else {
+                0
+            };
+            let notify_mmio = if bar2_addr != 0 {
+                bar2_addr + bits::MODERN_BAR_NOTIFY_OFFSET as u64
+            } else {
+                0
+            };
+            self.device.set_notify_addrs(notify_pio, notify_mmio);
+        }
+
         for qs in &state.queues {
             if !qs.live {
                 continue;
@@ -311,21 +331,6 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 msix_addr,
                 msix_data,
             )?;
-        }
-
-        let (bar0_port, bar2_addr) = self.notify_bases();
-        if bar0_port != 0 || bar2_addr != 0 {
-            let notify_pio = if bar0_port != 0 {
-                bar0_port + bits::LEGACY_REG_QUEUE_NOTIFY
-            } else {
-                0
-            };
-            let notify_mmio = if bar2_addr != 0 {
-                bar2_addr + bits::MODERN_BAR_NOTIFY_OFFSET as u64
-            } else {
-                0
-            };
-            self.device.set_notify_addrs(notify_pio, notify_mmio);
         }
 
         // Rings, vectors and notification addresses are all programmed.

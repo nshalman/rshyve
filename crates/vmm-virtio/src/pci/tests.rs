@@ -123,6 +123,8 @@ struct TrackingVirtioDeviceState {
     notify_addrs: Vec<(u16, u64)>,
     restored_rings: Vec<RestoreRingCall>,
     reset_all_rings: usize,
+    /// Ring restores and notify programming, in call order.
+    order: Vec<&'static str>,
     /// The queue index of every kick the transport let through.
     notified: Vec<u16>,
 }
@@ -206,30 +208,26 @@ impl VirtioDevice for TrackingVirtioDevice {
         msix_addr: u64,
         msix_data: u32,
     ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
-        self.state
-            .lock()
-            .expect("tracking state lock")
-            .restored_rings
-            .push(RestoreRingCall {
-                queue_idx,
-                size,
-                desc,
-                avail,
-                used,
-                avail_idx,
-                used_idx,
-                msix_addr,
-                msix_data,
-            });
+        let mut st = self.state.lock().expect("tracking state lock");
+        st.order.push("ring");
+        st.restored_rings.push(RestoreRingCall {
+            queue_idx,
+            size,
+            desc,
+            avail,
+            used,
+            avail_idx,
+            used_idx,
+            msix_addr,
+            msix_data,
+        });
         self.refusal(RefusedStep::RingState)
     }
 
     fn set_notify_addrs(&self, pio_port: u16, mmio_addr: u64) {
-        self.state
-            .lock()
-            .expect("tracking state lock")
-            .notify_addrs
-            .push((pio_port, mmio_addr));
+        let mut st = self.state.lock().expect("tracking state lock");
+        st.order.push("notify");
+        st.notify_addrs.push((pio_port, mmio_addr));
     }
 
     fn reset(&self) {}
