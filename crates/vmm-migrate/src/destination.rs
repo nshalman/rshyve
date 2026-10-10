@@ -109,13 +109,25 @@ pub fn run_destination<S: Transport>(
     status: Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
+    // A send has no deadline of its own (see `Transport`). A source that
+    // stops reading would hold this end, and its paused guest, forever.
+    let (stream, watch) =
+        crate::stall::watch(stream, config.deadlines.stall, log)
+            .map_err(|e| MigrateError::Io(format!("stall watchdog: {e}")))?;
     let mut chan = Chan::new(
         stream,
         tungstenite::protocol::Role::Server,
         config.deadlines,
     )?;
     let result =
-        run_inner(&mut chan, &hdl, memctx, &config, &hooks, &status, log);
+        run_inner(&mut chan, &hdl, memctx, &config, &hooks, &status, log)
+            .map_err(|e| {
+                if watch.stalled() {
+                    MigrateError::Io(watch.reason())
+                } else {
+                    e
+                }
+            });
     if let Err(error) = &result {
         if crate::is_cancel(error) {
             chan.report_failure(error, log);
@@ -162,15 +174,16 @@ fn run_inner<S: Transport>(
     let preamble: MigrationPreamble = chan.expect_serialized()?;
     let checked = XsaveLayout::local(hdl).and_then(|local| {
         check_preamble(&preamble, config, &local, log)?;
+        check_enlightenments(&preamble, config.hyperv, crate::cpu::host_is_amd())?;
         let skew = check_clock(&preamble, protocol, log)?;
         Ok((local, skew))
     });
-    let local_xsave = match checked {
+    let (local_xsave, skew_ms) = match checked {
         Ok((local, skew)) => {
             if let Ok(mut s) = status.lock() {
                 s.clock_skew_ms = skew;
             }
-            local
+            (local, skew)
         }
         Err(err) => {
             chan.report_failure(&err, log);
@@ -196,7 +209,7 @@ fn run_inner<S: Transport>(
     // ── TimeData ──
     set_phase(status, MigrationPhase::TimeData);
     let time_data: TimeData = chan.expect_serialized()?;
-    if let Err(e) = state::import_time_data(hdl, &time_data, log) {
+    if let Err(e) = state::import_time_data(hdl, &time_data, skew_ms, log) {
         chan.report_failure(&e, log);
         return Err(e);
     }
@@ -318,6 +331,31 @@ fn check_preamble(
          send migrate-dest with allow_cpu_feature_mismatch to accept \
          the risk",
     )))
+}
+
+/// Refuse, before any page moves, state the device state would refuse
+/// only after the whole RAM transfer.
+fn check_enlightenments(
+    preamble: &MigrationPreamble,
+    hyperv: bool,
+    amd_host: bool,
+) -> Result<(), MigrateError> {
+    if let Some(source) = preamble.hyperv {
+        if source != hyperv {
+            return Err(MigrateError::PreambleMismatch(format!(
+                "Hyper-V enlightenment: the source has it {}, this VM {}",
+                if source { "on" } else { "off" },
+                if hyperv { "on" } else { "off" },
+            )));
+        }
+    }
+    if preamble.pmu_amd == Some(true) && !amd_host {
+        return Err(MigrateError::PreambleMismatch(
+            "the source carries AMD PMU state, and this host is not AMD"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The skew between the two hosts' clocks, or `None` from a source too
@@ -608,7 +646,25 @@ mod tests {
                 components: Vec::new(),
             },
             wall_clock_ns,
+            hyperv: None,
+            pmu_amd: None,
         }
+    }
+
+    #[test]
+    fn enlightenments_are_checked_before_any_page() {
+        let mut p = preamble(None);
+        check_enlightenments(&p, true, false).expect("an old source");
+        p.hyperv = Some(true);
+        check_enlightenments(&p, true, false).expect("both on");
+        check_enlightenments(&p, false, false).expect_err("source only");
+        p.hyperv = Some(false);
+        check_enlightenments(&p, true, false).expect_err("here only");
+        p.pmu_amd = Some(true);
+        check_enlightenments(&p, false, true).expect("AMD to AMD");
+        let error = check_enlightenments(&p, false, false)
+            .expect_err("AMD PMU on Intel");
+        assert!(error.to_string().contains("not AMD"), "{error}");
     }
 
     fn log() -> slog::Logger {

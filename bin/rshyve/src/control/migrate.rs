@@ -373,6 +373,7 @@ pub(super) fn migrate_source(
         gate,
         gate_budget,
         handover: ctrl.has_handover_disks(),
+        hyperv: ctrl.hyperv.is_some(),
     };
 
     if let Err(e) =
@@ -767,6 +768,10 @@ pub(super) fn migrate_dest(
                 lease.release();
             })
     {
+        // Nothing was imported, so the guest keeps its own overlays.
+        if let Some(hyperv) = &ctrl.hyperv {
+            hyperv.resume_overlays();
+        }
         end_migration(ctrl);
         return Response::err(&format!(
             "failed to spawn migration thread: {e}"
@@ -791,7 +796,17 @@ fn connect_unix_patient(
 ) -> Result<UnixStream, String> {
     let until = std::time::Instant::now() + AGENT_SOCKET_WAIT;
     loop {
-        match connect_unix(run, path, log) {
+        // Bounded too: a listener with a full backlog holds a connect
+        // that has no deadline of its own.
+        let connected = vmm_migrate::connect::unix_until(path, until, || {
+            run.cancelled()
+        })
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.map_err(|e| format!("{}: {e}", path.display())))
+        .and_then(|stream| {
+            shut_on_stop(run, stream, log).map_err(|e| e.to_string())
+        });
+        match connected {
             Ok(stream) => return Ok(stream),
             Err(_) if run.cancelled() => {
                 return Err(vmm_migrate::CANCELLED.to_string())

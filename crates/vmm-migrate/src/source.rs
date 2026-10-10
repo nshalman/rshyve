@@ -157,6 +157,9 @@ pub struct SourceConfig {
     /// A disk changes hands at the commit, which only a destination of
     /// the current protocol does.
     pub handover: bool,
+    /// Whether the guest has the Hyper-V enlightenment, so the
+    /// destination can refuse before the RAM transfer.
+    pub hyperv: bool,
 }
 
 /// The device lifecycle hooks the phases drive.
@@ -396,7 +399,8 @@ fn run_inner<S: Transport>(
     }
 
     let current_peer = sel.protocol == PROTOCOL_RON;
-    if !current_peer && state::carries_pmu_amd(hdl)? {
+    let pmu_amd = state::carries_pmu_amd(hdl)?;
+    if !current_peer && pmu_amd {
         return Err(MigrateError::ProtocolMismatch(format!(
             "the destination speaks {}, which cannot carry the AMD PMU \
              state; both ends need {PROTOCOL_RON}",
@@ -419,6 +423,8 @@ fn run_inner<S: Transport>(
             cpu_features: Some(cpu::local_features(config.cpu_baseline)),
             xsave: xsave.clone(),
             wall_clock_ns: Some(crate::clock::now_ns()?),
+            hyperv: Some(config.hyperv),
+            pmu_amd: Some(pmu_amd),
         })?,
     )?;
     chan.expect_okay()?;
