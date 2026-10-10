@@ -26,6 +26,26 @@ use super::io::IoBackend;
 /// Matches the C bhyve blockif thread count.
 pub(super) const NUM_WORKERS: usize = 8;
 
+#[cfg(test)]
+thread_local! {
+    /// Fail the spawn of this worker on this thread.
+    pub(super) static FAIL_SPAWN: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn spawn_worker(
+    i: usize,
+    body: impl FnOnce() + Send + 'static,
+) -> io::Result<thread::JoinHandle<()>> {
+    #[cfg(test)]
+    if FAIL_SPAWN.with(|f| f.get()) == Some(i) {
+        return Err(io::Error::other("no thread for the test"));
+    }
+    thread::Builder::new()
+        .name(format!("nvme-io-{i}"))
+        .spawn(body)
+}
+
 pub(super) struct WorkerPool {
     tx: Mutex<Option<Sender<BlockRequest>>>,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
@@ -48,34 +68,49 @@ impl WorkerPool {
     ) -> io::Result<BackendFactory> {
         let capacity = disk.file().metadata()?.len();
         Ok(Box::new(move |sink| {
-            Arc::new(Self::spawn(disk, io, capacity, sink, log))
-                as Arc<dyn AsyncBackend>
+            Ok(Arc::new(Self::spawn(disk, io, capacity, sink, log)?)
+                as Arc<dyn AsyncBackend>)
         }))
     }
 
+    /// Fails when a worker thread cannot start. The ones that started
+    /// are stopped again, so nothing is left running.
     pub(super) fn spawn(
         disk: Arc<DiskSync>,
         io: Arc<dyn IoBackend>,
         capacity: u64,
         sink: Arc<dyn CompletionSink>,
         log: slog::Logger,
-    ) -> Self {
+    ) -> io::Result<Self> {
         let durable = io.durable_writes();
 
         let (tx, rx) = crossbeam_channel::unbounded::<BlockRequest>();
-        let workers = (0..NUM_WORKERS)
-            .map(|i| {
-                let rx = rx.clone();
-                let io = Arc::clone(&io);
-                let sink = Arc::clone(&sink);
-                thread::Builder::new()
-                    .name(format!("nvme-io-{i}"))
-                    .spawn(move || worker(&rx, io.as_ref(), sink.as_ref()))
-                    .expect("nvme: failed to spawn I/O worker thread")
-            })
-            .collect();
+        let mut workers = Vec::with_capacity(NUM_WORKERS);
+        for i in 0..NUM_WORKERS {
+            let rx = rx.clone();
+            let io = Arc::clone(&io);
+            let sink = Arc::clone(&sink);
+            let started = spawn_worker(i, move || {
+                worker(&rx, io.as_ref(), sink.as_ref())
+            });
+            match started {
+                Ok(handle) => workers.push(handle),
+                Err(e) => {
+                    // Dropping the sender ends the workers already up.
+                    drop(tx);
+                    for handle in workers {
+                        if handle.join().is_err() {
+                            slog::error!(log, "nvme: I/O worker panicked");
+                        }
+                    }
+                    slog::error!(log, "nvme: an I/O worker did not start";
+                        "error" => %e);
+                    return Err(e);
+                }
+            }
+        }
 
-        Self {
+        Ok(Self {
             tx: Mutex::new(Some(tx)),
             workers: Mutex::new(workers),
             disk,
@@ -83,7 +118,7 @@ impl WorkerPool {
             durable,
             sink,
             log,
-        }
+        })
     }
 
     /// Disconnect the channel and wait for the workers.

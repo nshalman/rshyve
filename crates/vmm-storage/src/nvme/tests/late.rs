@@ -118,3 +118,34 @@ fn a_halted_destination_never_opens_its_disk() {
         .expect_err("halted");
     assert!(!h.ctrl.backing_attached());
 }
+
+#[test]
+fn a_worker_that_will_not_start_fails_the_attach_and_a_retry_takes_it() {
+    // After the commit this process holds the only copy of the guest,
+    // so the attach fails and stays retryable instead of aborting.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = image(dir.path());
+    let mut h = destination(&path);
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    h.ctrl.pause();
+
+    super::super::pool::FAIL_SPAWN.with(|f| f.set(Some(3)));
+    let error = h
+        .ctrl
+        .attach_backing(&attach_by(Instant::now()))
+        .expect_err("a worker did not start");
+    super::super::pool::FAIL_SPAWN.with(|f| f.set(None));
+    assert!(error.to_string().contains("did not start"), "{error}");
+    assert!(!h.ctrl.backing_attached());
+
+    h.ctrl
+        .attach_backing(&attach_by(Instant::now()))
+        .expect("the retry");
+    assert!(h.ctrl.backing_attached());
+    let mut tail = 0;
+    submit_on(&h, 1, SQ1, &mut tail, Sqe::read(0, 1, 0x50000, 0), 4);
+    h.ctrl.resume();
+    let cqe = h.wait_cqe(CQ1, 0, true);
+    assert_eq!((cqe.cid, cqe.status()), (4, Status::SUCCESS));
+}

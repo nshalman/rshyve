@@ -34,13 +34,13 @@ impl LateFile {
         log: slog::Logger,
     ) -> BackendFactory {
         Box::new(move |sink| {
-            Arc::new(Self {
+            Ok(Arc::new(Self {
                 disk,
                 sink,
                 pool: RwLock::new(None),
                 halted: AtomicBool::new(false),
                 log,
-            }) as Arc<dyn AsyncBackend>
+            }) as Arc<dyn AsyncBackend>)
         })
     }
 }
@@ -76,13 +76,18 @@ impl AsyncBackend for LateFile {
             return Err("the disk is halted".into());
         }
         if slot.is_none() {
-            *slot = Some(WorkerPool::spawn(
+            // After the commit this process holds the only copy of the
+            // guest, so a thread that will not start fails the attach,
+            // which can be tried again, and never aborts.
+            let pool = WorkerPool::spawn(
                 Arc::clone(&disk),
                 disk as Arc<dyn IoBackend>,
                 self.disk.capacity(),
                 Arc::clone(&self.sink),
                 self.log.clone(),
-            ));
+            )
+            .map_err(|e| format!("nvme: the I/O workers did not start: {e}"))?;
+            *slot = Some(pool);
         }
         Ok(())
     }
