@@ -34,7 +34,7 @@ use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::VmmHdl;
@@ -49,6 +49,7 @@ use crate::codec::{
     DeviceIdentity, Message, MigrateError, MigrationPreamble, ProtocolOffer,
     ProtocolSelect, PAGE_BATCH_FLAG_ZSTD,
 };
+use crate::converge::Precopy;
 use crate::cpu;
 use crate::late::Owners;
 use crate::limits::{BATCH_SIZE, ZSTD_LEVEL};
@@ -407,14 +408,14 @@ fn run_inner<S: Transport>(
     push_ram_all(chan, &mut track, memctx, gate, status)?;
 
     // ── Iterative convergence ──
-    const MAX_ITERS: u32 = 5;
-    const CONVERGE_THRESHOLD: u64 = 1024;
-
-    for iter in 1..=MAX_ITERS {
-        std::thread::sleep(Duration::from_millis(500));
+    let mut precopy = Precopy::new();
+    for iter in 1.. {
+        let started = Instant::now();
         let dirty = push_ram(chan, &mut track, memctx, gate, status)?;
-        slog::info!(log, "convergence"; "iter" => iter, "dirty" => dirty);
-        if dirty <= CONVERGE_THRESHOLD {
+        let took = started.elapsed();
+        slog::info!(log, "convergence"; "iter" => iter, "dirty" => dirty,
+            "took_ms" => took.as_millis());
+        if precopy.done(dirty, took) {
             break;
         }
     }

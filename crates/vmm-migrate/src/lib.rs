@@ -12,6 +12,7 @@
 pub mod clock;
 pub mod codec;
 pub mod connect;
+mod converge;
 pub mod cpu;
 pub mod destination;
 pub mod gate;

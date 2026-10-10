@@ -134,7 +134,7 @@ fn a_stop_frees_a_wait_on_a_silent_zfs_barrier() {
         stopper.stop();
     });
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let error = zfs_barrier_wait(
         &path,
         Duration::from_secs(60),
@@ -630,7 +630,7 @@ fn a_peer_that_stops_reading_fails_the_pre_pause_push() {
     let status = status();
     set_phase(&status, MigrationPhase::RamPushPrePause);
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let error = push_ram_all(
         &mut source,
         &mut no_tracking,
