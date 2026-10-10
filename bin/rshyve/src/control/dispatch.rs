@@ -46,7 +46,9 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             r.num_cpus = Some(ctrl.num_cpus);
             r.memory_bytes = Some(ctrl.mem_size);
             r.uptime_secs = Some(ctrl.start_time.elapsed().as_secs());
-            r.data = stuck_data(ctrl.release_stuck());
+            let rings = ctrl.hdl.rings();
+            r.data =
+                status_data(ctrl.release_stuck(), rings.tainted(), rings.leaks());
             r
         }
 
@@ -210,10 +212,13 @@ fn resume_step(
     ctrl: &VmController,
     held: &mut bool,
 ) -> Result<(), StepFailed<String>> {
-    // An import whose disks did not attach after the commit holds the
-    // only copy of the guest; it runs only once they are back.
-    ctrl.attach_backing(std::time::Instant::now() + RESUME_ATTACH_WAIT)
-        .map_err(StepFailed::Undone)?;
+    // The disks attached before the change began; one that went away
+    // since keeps the guest paused.
+    if ctrl.named_devices().iter().any(|d| !d.device.backing_attached()) {
+        return Err(StepFailed::Undone(
+            "a disk is not attached; resume again".to_string(),
+        ));
+    }
     unpark_all(
         &ctrl.named_devices(),
         DEVICE_PAUSE_BUDGET,
@@ -246,6 +251,15 @@ fn resume(ctrl: &VmController, force: bool) -> Response {
         Ok(from) => from,
         Err(why) => return Response::err(why),
     };
+    // An import whose disks did not attach after the commit holds the
+    // only copy of the guest; it runs only once they are back. The
+    // attach can take its whole wait, so it runs before the state
+    // change, which a stop also needs.
+    if let Err(why) =
+        ctrl.attach_backing(std::time::Instant::now() + RESUME_ATTACH_WAIT)
+    {
+        return Response::err(&why);
+    }
     match ctrl
         .run
         .change(from, VmRunState::Running, |held| resume_step(ctrl, held))
@@ -312,9 +326,25 @@ fn latch_stop(
     }
 }
 
-/// What `status` adds for a stop that cannot give its pause back.
-fn stuck_data(stuck: bool) -> Option<serde_json::Value> {
-    stuck.then(|| serde_json::json!({ "release_stuck": true }))
+/// What `status` adds when something needs an operator: a stop that
+/// cannot give its pause back, a ring gate that refuses every
+/// write-lock ioctl, or a device left in the kernel.
+fn status_data(
+    stuck: bool,
+    tainted: Option<String>,
+    leaks: u32,
+) -> Option<serde_json::Value> {
+    let mut data = serde_json::Map::new();
+    if stuck {
+        data.insert("release_stuck".into(), true.into());
+    }
+    if let Some(why) = tainted {
+        data.insert("ring_gate_tainted".into(), why.into());
+    }
+    if leaks > 0 {
+        data.insert("ring_devices_leaked".into(), leaks.into());
+    }
+    (!data.is_empty()).then_some(serde_json::Value::Object(data))
 }
 
 /// Why `stop` cannot run now, or `None` when it can.
@@ -993,14 +1023,24 @@ mod tests {
         // `data` is flattened into the line.
         let mut stuck = Response::ok();
         stuck.state = Some(VmRunState::Stopping);
-        stuck.data = stuck_data(true);
+        stuck.data = status_data(true, None, 0);
         assert_eq!(
             line(stuck),
             r#"{"success":true,"state":"stopping","release_stuck":true}"#
         );
 
         let mut fine = Response::ok();
-        fine.data = stuck_data(false);
+        fine.data = status_data(false, None, 0);
         assert_eq!(line(fine), r#"{"success":true}"#);
+    }
+
+    #[test]
+    fn status_reports_a_tainted_gate_and_leaked_devices() {
+        let mut r = Response::ok();
+        r.data = status_data(false, Some("viona ring 1".into()), 2);
+        assert_eq!(
+            line(r),
+            r#"{"success":true,"ring_devices_leaked":2,"ring_gate_tainted":"viona ring 1"}"#
+        );
     }
 }
