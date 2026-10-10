@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::io::{BufRead, BufReader, Write as _};
+use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,7 +71,7 @@ fn agent(
         if answer.is_empty() {
             return lines;
         }
-        w.write_all(answer).expect("answer");
+        std::io::Write::write_all(&mut w, answer).expect("answer");
         loop {
             let mut line = String::new();
             match r.read_line(&mut line) {
