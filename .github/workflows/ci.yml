@@ -469,8 +469,12 @@ jobs:
           curl -sSfL "$url" -o gitleaks.tar.gz
           echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
           tar xzf gitleaks.tar.gz gitleaks
-      # Scans the working tree and the full history reachable from it.
-      - run: ./gitleaks detect --source . --config .gitleaks.toml --redact --no-banner
+      # Scans the history reachable from HEAD. Without --log-opts gitleaks
+      # runs `git log --all`, and fetch-depth 0 fetches every branch, so
+      # an unrelated branch could fail this PR.
+      - run: >
+          ./gitleaks detect --source . --config .gitleaks.toml --redact
+          --no-banner --log-opts=HEAD
 
   boundary:
     name: firehyve dependency boundary
