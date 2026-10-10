@@ -33,7 +33,7 @@ fn final_destination(
     })
 }
 
-fn no_owners(_: &()) -> Owners {
+fn no_owners(_: &u32) -> Owners {
     Owners::new(&[], &[])
 }
 
@@ -43,15 +43,16 @@ fn pause_and_pass(
     track: &mut TrackFn<'_>,
     pause_vm: &VmPauseFn,
     drain: DevicePrePauseFn,
-    export: impl FnOnce() -> Result<(), MigrateError>,
-) -> (Result<(), MigrateError>, MemCtx) {
+    export: impl Fn() -> Result<u32, MigrateError>,
+) -> (Result<(), MigrateError>, MemCtx, u32) {
     let (mut source, dest) = pair();
     let peer = final_destination(dest);
     let gate = Gate::default();
-    let paused = AtomicBool::new(false);
+    let paused = Paused::default();
     pause_guest(pause_vm, drain, &paused, &gate).expect("pause");
-    assert!(paused.load(Ordering::Acquire));
-    final_pass(
+    assert!(paused.vcpus.load(Ordering::Acquire));
+    assert!(paused.devices.load(Ordering::Acquire));
+    let (_, exported) = final_pass(
         &mut source,
         track,
         memctx,
@@ -63,7 +64,7 @@ fn pause_and_pass(
     )
     .expect("final pass");
     let clean = check_clean(track, memctx, &Owners::new(&[], &[]));
-    (clean, peer.join().expect("destination"))
+    (clean, peer.join().expect("destination"), exported)
 }
 
 #[test]
@@ -79,7 +80,7 @@ fn the_vcpus_pause_before_the_devices_drain() {
         by_devices.lock().expect("order").push("devices");
         Ok(())
     });
-    let paused = AtomicBool::new(false);
+    let paused = Paused::default();
     pause_guest(&pause_vm, drain, &paused, &Gate::default()).expect("pause");
     assert_eq!(*order.lock().expect("order"), ["vcpus", "devices"]);
 }
@@ -101,17 +102,18 @@ fn a_write_during_the_drain_goes_out_in_the_final_pass() {
     });
     let mut track = |gpa, len, bm: &mut [u8]| dirty.track(gpa, len, bm);
 
-    let (clean, dest) =
-        pause_and_pass(&memctx, &mut track, &pause_vm, drain, || Ok(()));
+    let (clean, dest, _) =
+        pause_and_pass(&memctx, &mut track, &pause_vm, drain, || Ok(1));
 
     clean.expect("nothing written after the pass");
     assert_eq!(image(&dest, RAM), image(&memctx, RAM));
 }
 
 #[test]
-fn a_write_by_the_export_goes_out_in_the_second_round() {
-    // A read through the tracked view marks the page dirty after the
-    // first round. The second round sends it while the guest is paused.
+fn a_late_write_goes_out_in_the_second_round() {
+    // A completion lands, or a tracked read marks a page, after the
+    // first round. The second round sends it while the guest is paused,
+    // and the devices are read again.
     let memctx = firmware_layout(RAM);
     let dirty = FakeDirty::default();
     dirty.guest_write(&memctx, page(2), 0x22);
@@ -119,14 +121,20 @@ fn a_write_by_the_export_goes_out_in_the_second_round() {
     let drain: DevicePrePauseFn = Box::new(|| Ok(()));
     let mut track = |gpa, len, bm: &mut [u8]| dirty.track(gpa, len, bm);
 
-    let (clean, dest) =
+    let exports = std::sync::atomic::AtomicU32::new(0);
+    let (clean, dest, exported) =
         pause_and_pass(&memctx, &mut track, &pause_vm, drain, || {
-            dirty.guest_write(&memctx, page(9), 0x99);
-            Ok(())
+            let n = exports.fetch_add(1, Ordering::AcqRel) + 1;
+            if n == 1 {
+                dirty.guest_write(&memctx, page(9), 0x99);
+            }
+            Ok(n)
         });
 
-    clean.expect("the second round carried the export's write");
+    clean.expect("the second round carried the late write");
     assert_eq!(image(&dest, RAM), image(&memctx, RAM));
+    // The state that goes out was read after the late write.
+    assert_eq!(exported, 2);
 }
 
 #[test]
@@ -143,8 +151,8 @@ fn a_writer_that_keeps_going_fails_the_commit() {
         found
     };
 
-    let (clean, _) =
-        pause_and_pass(&memctx, &mut track, &pause_vm, drain, || Ok(()));
+    let (clean, _, _) =
+        pause_and_pass(&memctx, &mut track, &pause_vm, drain, || Ok(1));
 
     let error = clean.expect_err("a writer is still running");
     assert!(error.to_string().contains("1 guest pages"), "{error}");
@@ -161,7 +169,7 @@ fn a_failed_vcpu_pause_leaves_the_devices_alone() {
         by_drain.store(true, Ordering::Release);
         Ok(())
     });
-    let paused = AtomicBool::new(false);
+    let paused = Paused::default();
 
     pause_guest(&pause_vm, drain, &paused, &Gate::default())
         .expect_err("the vCPUs would not pause");
@@ -176,9 +184,12 @@ fn a_failed_vcpu_pause_leaves_the_devices_alone() {
         &discard(),
         Rollback {
             devices: Box::new(move || by_resume.store(true, Ordering::Release)),
-            devices_paused: paused.load(Ordering::Acquire),
+            devices_paused: paused.devices.load(Ordering::Acquire),
+            vcpus_paused: paused.vcpus.load(Ordering::Acquire),
         },
-        || Ok::<(), &'static str>(()),
+        || -> Result<(), &'static str> {
+            panic!("a resume with no pause would give up another hold")
+        },
     );
     assert!(!resumed.load(Ordering::Acquire), "resumed a running device");
 }
@@ -191,8 +202,9 @@ fn a_failed_drain_resumes_the_devices() {
     let drain: DevicePrePauseFn = Box::new(|| {
         Err(DeviceStateError::Export("devices did not quiesce".into()))
     });
-    let paused = AtomicBool::new(false);
+    let paused = Paused::default();
     pause_guest(&pause_vm, drain, &paused, &Gate::default())
         .expect_err("drain failed");
-    assert!(paused.load(Ordering::Acquire));
+    assert!(paused.devices.load(Ordering::Acquire));
+    assert!(paused.vcpus.load(Ordering::Acquire));
 }

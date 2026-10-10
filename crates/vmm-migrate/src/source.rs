@@ -81,16 +81,15 @@ pub type DevicePrePauseFn =
     Box<dyn FnOnce() -> Result<(), DeviceStateError> + Send>;
 
 /// Read out every device's migration state. A pure read: the pause
-/// already happened.
-pub type DeviceExportFn = Box<
-    dyn FnOnce() -> Result<Vec<DeviceStatePayload>, DeviceStateError> + Send,
->;
+/// already happened. Called again when the final pass finds pages
+/// written after the first export.
+pub type DeviceExportFn =
+    Box<dyn Fn() -> Result<Vec<DeviceStatePayload>, DeviceStateError> + Send>;
 
 /// Read out the state of every device with no PCI address, each under
 /// its registry id. A pure read, like [`DeviceExportFn`].
-pub type PlatformExportFn = Box<
-    dyn FnOnce() -> Result<Vec<PlatformStatePayload>, DeviceStateError> + Send,
->;
+pub type PlatformExportFn =
+    Box<dyn Fn() -> Result<Vec<PlatformStatePayload>, DeviceStateError> + Send>;
 
 /// Flush device writeback caches. Called after the vCPU pause has
 /// quiesced the vCPUs and before the ZFS barrier, so `zfs send` sees
@@ -201,7 +200,7 @@ fn run_watched<S: Transport>(
     )?;
 
     let resume = hooks.resume;
-    let devices_paused = AtomicBool::new(false);
+    let paused = Paused::default();
     let result = run_inner(
         &mut chan,
         &hdl,
@@ -213,7 +212,7 @@ fn run_watched<S: Transport>(
         hooks.hyperv,
         hooks.committed,
         &hooks.pause_vm,
-        &devices_paused,
+        &paused,
         hooks.gate.as_ref(),
         status,
         log,
@@ -231,7 +230,8 @@ fn run_watched<S: Transport>(
         .unwrap_or((MigrationPhase::Error, GateState::None));
     let rollback = Rollback {
         devices: resume,
-        devices_paused: devices_paused.load(Ordering::Acquire),
+        devices_paused: paused.devices.load(Ordering::Acquire),
+        vcpus_paused: paused.vcpus.load(Ordering::Acquire),
     };
     finish_source(result, phase, gate, log, rollback, hooks.resume_vm)
 }
@@ -256,11 +256,21 @@ fn stalled_or(
 /// The emulated and the platform device state, as the export read it.
 type Exported = (Vec<DeviceStatePayload>, Vec<PlatformStatePayload>);
 
+/// What the pause has stopped so far.
+#[derive(Default)]
+struct Paused {
+    vcpus: AtomicBool,
+    devices: AtomicBool,
+}
+
 /// What a rollback puts back to work.
 struct Rollback {
     devices: DeviceResumeFn,
     /// The device pause started. A device never paused is left alone.
     devices_paused: bool,
+    /// The vCPU pause succeeded. A resume without it would give up a
+    /// pause another owner holds.
+    vcpus_paused: bool,
 }
 
 /// Roll the source back when a migration failed after the pause.
@@ -295,9 +305,11 @@ where
         if rollback_to.devices_paused {
             (rollback_to.devices)();
         }
-        if let Err(error) = resume_vm() {
-            slog::warn!(log, "failed to resume source VM after migration abort";
-                "error" => %error);
+        if rollback_to.vcpus_paused {
+            if let Err(error) = resume_vm() {
+                slog::warn!(log, "failed to resume source VM after \
+                    migration abort"; "error" => %error);
+            }
         }
     }
 
@@ -321,7 +333,7 @@ fn run_inner<S: Transport>(
     hyperv_export_fn: HypervExportFn,
     committed: CommittedFn,
     pause_vm: &VmPauseFn,
-    devices_paused: &AtomicBool,
+    paused: &Paused,
     gate: &dyn StopGate,
     status: &Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
@@ -409,7 +421,7 @@ fn run_inner<S: Transport>(
     // fail.
     set_phase(status, MigrationPhase::Pause);
     chan.enter_post_pause()?;
-    pause_guest(pause_vm, device_pre_pause_fn, devices_paused, gate)?;
+    pause_guest(pause_vm, device_pre_pause_fn, paused, gate)?;
 
     // zvol WCE=1 means writes the guest was told were complete may
     // still sit in cache. `zfs send` ships only committed pool state.
@@ -612,16 +624,17 @@ fn kernel_tracking(
 fn pause_guest(
     pause_vm: &VmPauseFn,
     device_pre_pause_fn: DevicePrePauseFn,
-    devices_paused: &AtomicBool,
+    paused: &Paused,
     gate: &dyn StopGate,
 ) -> Result<(), MigrateError> {
     pause_vm().map_err(|e| {
         cancel_or(gate, MigrateError::Io(format!("pause: {e}")))
     })?;
+    paused.vcpus.store(true, Ordering::Release);
     not_cancelled(gate)?;
     // Set before the call: a pause that fails half way still left
     // some devices paused, and the rollback must resume them.
-    devices_paused.store(true, Ordering::Release);
+    paused.devices.store(true, Ordering::Release);
     device_pre_pause_fn()
         .map_err(|e| MigrateError::State(format!("device pause: {e}")))
 }
@@ -631,8 +644,9 @@ fn pause_guest(
 /// One pass on the wire in two rounds, with the device export between
 /// them. A read through the tracked mapping marks a page dirty, and
 /// a late completion writes one. The second round sends those pages
-/// while the guest is still paused. A page still dirty after it fails
-/// the commit in [`check_clean`].
+/// while the guest is still paused, and the devices are exported again
+/// so their state matches that memory. A page still dirty after that
+/// fails the commit in [`check_clean`].
 #[allow(clippy::too_many_arguments)]
 fn final_pass<S: Transport, T>(
     chan: &mut Chan<S>,
@@ -640,12 +654,12 @@ fn final_pass<S: Transport, T>(
     memctx: &MemCtx,
     gate: &dyn StopGate,
     status: &Arc<Mutex<MigrationStatus>>,
-    export: impl FnOnce() -> Result<T, MigrateError>,
+    export: impl Fn() -> Result<T, MigrateError>,
     owners: impl FnOnce(&T) -> Owners,
     log: &slog::Logger,
 ) -> Result<(u64, T), MigrateError> {
     let mut sent = send_round(chan, track, memctx, gate, status)?;
-    let exported = export()?;
+    let mut exported = export()?;
     let late = dirty_pages(track, memctx)?;
     if !late.is_empty() {
         slog::warn!(log, "pages written after the first final round; \
@@ -655,6 +669,8 @@ fn final_pass<S: Transport, T>(
         sent += send_dirty(late.iter().copied(), gate, |batch| {
             send_batch_sparse(chan, memctx, gate, batch, status)
         })?;
+        // A real write moved a ring, so the first export is stale.
+        exported = export()?;
     }
     if let Ok(mut s) = status.lock() {
         s.dirty_pages_remaining = sent;

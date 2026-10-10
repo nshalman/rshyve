@@ -152,6 +152,7 @@ fn paused(devices: DeviceResumeFn) -> Rollback {
     Rollback {
         devices,
         devices_paused: true,
+        vcpus_paused: true,
     }
 }
 
