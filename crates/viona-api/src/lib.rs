@@ -17,7 +17,9 @@ mod ffi;
 mod link;
 
 pub use ffi::*;
-pub use link::{IntrStatus, IntrWait, LinkOps};
+pub use link::{
+    quiesce, IntrStatus, IntrWait, LinkOps, QuiesceFailed, Quiesced, Resumed,
+};
 
 pub const VIONA_DEV_PATH: &str = "/dev/viona";
 
@@ -178,6 +180,30 @@ impl VionaFd {
     /// any copyin/copyout actions which may occur as part of the ioctl
     /// processing.
     pub unsafe fn ioctl<T>(&self, cmd: i32, data: *mut T) -> Result<i32> {
+        refuse_hook_cmd(cmd)?;
+        // Safety: the caller's contract is this function's.
+        unsafe { self.ioctl_any(cmd, data) }
+    }
+
+    /// Change the notify hook. Only [`LinkOps`] calls this, behind a
+    /// [`Quiesced`] proof.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::ioctl`].
+    pub(crate) unsafe fn hook_ioctl<T>(
+        &self,
+        cmd: i32,
+        data: *mut T,
+    ) -> Result<i32> {
+        // Safety: the caller's contract is this function's.
+        unsafe { self.ioctl_any(cmd, data) }
+    }
+
+    /// # Safety
+    ///
+    /// As for [`Self::ioctl`].
+    unsafe fn ioctl_any<T>(&self, cmd: i32, data: *mut T) -> Result<i32> {
         match &self.0 {
             Chan::Dev(fp) => {
                 ioctl(fp.as_raw_fd(), cmd, data as *mut libc::c_void)
@@ -221,18 +247,41 @@ impl VionaFd {
     }
 
     pub fn ioctl_usize(&self, cmd: i32, data: usize) -> Result<i32> {
+        refuse_hook_cmd(cmd)?;
+        self.ioctl_usize_any(cmd, data)
+    }
+
+    /// Change the notify hook by value. Only [`LinkOps`] calls this,
+    /// behind a [`Quiesced`] proof.
+    pub(crate) fn hook_ioctl_usize(
+        &self,
+        cmd: i32,
+        data: usize,
+    ) -> Result<i32> {
+        // A null pointer is the one value the window command takes:
+        // it removes the window and copies nothing in.
+        if cmd == VNA_IOC_SET_NOTIFY_MMIO && data == 0 {
+            return self.ioctl_raw(cmd, 0);
+        }
+        self.ioctl_usize_any(cmd, data)
+    }
+
+    fn ioctl_usize_any(&self, cmd: i32, data: usize) -> Result<i32> {
         if !Self::ioctl_usize_safe(cmd) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "unsafe cmd provided",
             ));
         }
+        self.ioctl_raw(cmd, data)
+    }
+
+    fn ioctl_raw(&self, cmd: i32, data: usize) -> Result<i32> {
         match &self.0 {
-            // Safety: Since we are explicitly filtering for vmm ioctls
-            // which will not assume the data argument is a pointer for
-            // copyin/copyout, we can dismiss those dangers.  The caller
-            // is assumed to be cognizant of other potential side
-            // effects.
+            // Safety: every caller passes either a command that does
+            // not read the data argument as a pointer, or the window
+            // command with a null pointer, which the kernel checks
+            // before any copyin.
             Chan::Dev(fp) => unsafe {
                 ioctl(fp.as_raw_fd(), cmd, data as *mut libc::c_void)
             },
@@ -297,6 +346,20 @@ impl VionaFd {
         )
     }
 }
+/// The commands that change the notify hook.
+///
+/// They take the VM write lock, so they go only through [`LinkOps`],
+/// which asks for proof that no ring worker is alive.
+fn refuse_hook_cmd(cmd: i32) -> Result<()> {
+    if matches!(cmd, VNA_IOC_SET_NOTIFY_IOP | VNA_IOC_SET_NOTIFY_MMIO) {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "the notify hook changes only with the rings stopped",
+        ));
+    }
+    Ok(())
+}
+
 impl AsRawFd for VionaFd {
     fn as_raw_fd(&self) -> RawFd {
         self.file().as_raw_fd()

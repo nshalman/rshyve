@@ -19,13 +19,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
-use viona_api::{vioc_ring_state, IntrStatus, IntrWait, LinkOps, PromiscMode};
+use viona_api::{
+    vioc_ring_state, IntrStatus, IntrWait, LinkOps, PromiscMode, Quiesced,
+};
 
 use super::halt::{halt_link, stop_poller, Poller};
 use super::VirtioViona;
 
 mod device;
 mod errors;
+mod hook;
 mod intr;
 
 /// One kind of call the device makes into the kernel.
@@ -146,6 +149,9 @@ struct TestLink {
     interrupted: Mutex<Option<(Op, usize)>>,
     /// The used cursor `ring_get_state` reports has wrapped to zero.
     wrapped_used: bool,
+    /// The ring size `ring_get_state` reports. 0 is a ring the kernel
+    /// was never given.
+    ring_size: u16,
 }
 
 impl TestLink {
@@ -160,7 +166,15 @@ impl TestLink {
             park: Mutex::new(None),
             interrupted: Mutex::new(None),
             wrapped_used: false,
+            ring_size: 0,
         }
+    }
+
+    /// A link whose kernel holds a programmed ring of `size` in every
+    /// slot.
+    fn live_rings(mut self, size: u16) -> Self {
+        self.ring_size = size;
+        self
     }
 
     /// A link whose kernel refuses `ops` and answers the rest.
@@ -311,6 +325,7 @@ impl LinkOps for TestLink {
             vrs_index: ring,
             vrs_avail_idx: 0x1111 + ring,
             vrs_used_idx: if self.wrapped_used { 0 } else { 0x2222 + ring },
+            vrs_qsize: self.ring_size,
             ..Default::default()
         })
     }
@@ -352,11 +367,20 @@ impl LinkOps for TestLink {
         }
     }
 
-    fn set_notify_iop(&self, port: u16) -> std::io::Result<()> {
+    fn set_notify_iop(
+        &self,
+        _rings: &Quiesced<'_>,
+        port: u16,
+    ) -> std::io::Result<()> {
         self.answer(Op::SetNotifyIop, Step::SetNotifyIop(port))
     }
 
-    fn set_notify_mmio(&self, addr: u64, size: u32) -> std::io::Result<()> {
+    fn set_notify_mmio(
+        &self,
+        _rings: &Quiesced<'_>,
+        addr: u64,
+        size: u32,
+    ) -> std::io::Result<()> {
         self.answer(Op::SetNotifyMmio, Step::SetNotifyMmio { addr, size })
     }
 

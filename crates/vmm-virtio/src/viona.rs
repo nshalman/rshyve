@@ -20,6 +20,7 @@
 //! # Where the rest lives
 //!
 //! - [`halt`]: the teardown order, which gives the VM its hold back
+//! - [`hook`]: the kernel notify hook, and the ring stop around it
 //! - [`poll`]: the interrupt poll thread
 //! - [`migrate`]: the ring state a migration moves
 //! - [`setup`]: opening the link and pointing the kernel at it
@@ -39,6 +40,7 @@ use super::VirtioDevice;
 use viona_api::LinkOps;
 
 mod halt;
+mod hook;
 mod migrate;
 mod poll;
 mod setup;
@@ -185,6 +187,9 @@ struct VionaInner {
     /// `VirtioViona::new` is given none, so a halt reports through the
     /// first logger the device was handed.
     log: Option<slog::Logger>,
+
+    /// The kernel notify hook, and what the guest may still change.
+    hook: hook::NotifyHook,
 
     /// The link is destroyed. Nothing may program it again.
     halted: bool,

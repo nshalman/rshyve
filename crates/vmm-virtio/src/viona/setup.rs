@@ -50,37 +50,10 @@ impl VirtioViona {
                 deferred_poll: None,
                 poller: None,
                 log: None,
+                hook: Default::default(),
                 halted: false,
             }),
             interrupt: Arc::new(IntrSlot::new()),
-        }
-    }
-
-    /// Program the notification I/O port and MMIO address in the kernel.
-    ///
-    /// The kernel then takes the guest's ring kick itself, and the vCPU
-    /// does not leave to userspace for it.
-    pub fn set_notify_addrs(&self, pio_port: u16, mmio_addr: u64) {
-        let inner = self.inner.lock().expect("viona lock");
-        // A migration restore can land after the halt. The link is
-        // gone, and the halt holds no device lock while it destroys
-        // it, so an ioctl issued here could wait out an untimed
-        // kernel call with the lock held.
-        if inner.halted {
-            return;
-        }
-        if pio_port != 0 {
-            if let Err(e) = inner.link_ref().set_notify_iop(pio_port) {
-                slog::warn!(inner.log(), "viona set notify port failed";
-                    "port" => pio_port, "error" => %e);
-            }
-        }
-        if mmio_addr != 0 {
-            let rc = inner.link_ref().set_notify_mmio(mmio_addr, 0x1000);
-            if let Err(e) = rc {
-                slog::warn!(inner.log(), "viona set notify mmio failed";
-                    "addr" => mmio_addr, "error" => %e);
-            }
         }
     }
 

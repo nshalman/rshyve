@@ -1072,41 +1072,6 @@ fn a_halted_device_refuses_a_promiscuous_mode_change() {
 }
 
 #[test]
-fn a_notification_address_reaches_the_kernel() {
-    // With these the kernel takes the guest's kick itself and the vCPU
-    // does not leave to userspace. A port or an address that drifts
-    // sends the kick nowhere and stalls the ring.
-    let steps = Steps::default();
-    let device = device_with(Arc::new(TestLink::new(&steps)));
-
-    VirtioDevice::set_notify_addrs(&device, 0x2000, 0xC000_0000);
-
-    assert_eq!(
-        steps_of(&steps),
-        [
-            Step::SetNotifyIop(0x2000),
-            Step::SetNotifyMmio {
-                addr: 0xC000_0000,
-                size: 0x1000,
-            },
-        ],
-    );
-}
-
-#[test]
-fn an_unprogrammed_notification_address_is_not_sent() {
-    // A transport with no legacy BAR passes port 0, and one with no
-    // modern BAR passes address 0. Neither is an address the guest
-    // writes, and the kernel would take them as one.
-    let steps = Steps::default();
-    let device = device_with(Arc::new(TestLink::new(&steps)));
-
-    VirtioDevice::set_notify_addrs(&device, 0, 0);
-
-    assert_eq!(steps_of(&steps), []);
-}
-
-#[test]
 fn promiscuous_mode_follows_the_zone_config() {
     // A VM with allow_mac_spoofing needs every frame the physical link
     // carries. One without must not see its neighbours' traffic.
