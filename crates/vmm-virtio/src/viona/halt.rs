@@ -92,15 +92,19 @@ impl VirtioViona {
     /// write lock to delete, and once it is halted nothing can give it
     /// one.
     ///
-    /// If the gate cannot stop the rings within [`GATE_WAIT`], the delete
-    /// runs anyway, since teardown has to reach `VM_DESTROY_SELF`. A
-    /// quiesce fails only on a ring call the kernel refused, and a link
-    /// refuses them only with `ENXIO`, once that link or the VM hold is
-    /// on its way out (`viona_main.c`, `viona_ioctl`). A link on its
-    /// way out ends its own delete within the wait. A VM hold marked
-    /// for release fails every lease renewal (`viona_ring.c`,
+    /// If the gate cannot stop the rings within [`GATE_WAIT`], or a
+    /// worker escaped it, the delete runs anyway. This is not safe, and
+    /// nothing in userspace can make it so: the same delete runs when
+    /// the process closes the descriptor (`viona_main.c`, `viona_close`)
+    /// with the hook still on and the same worker alive. Holding the
+    /// link back only moves the risk to exit, and leaves
+    /// `VM_DESTROY_SELF` waiting for the hold. How narrow it is: a ring
+    /// call is refused only with `ENXIO`, once a link or the VM hold is
+    /// on its way out (`viona_main.c`, `viona_ioctl`); a link on its way
+    /// out ends its own delete within the wait, and a hold marked for
+    /// release fails every lease renewal (`viona_ring.c`,
     /// `viona_ring_lease_renew`), so no worker waits in one for the
-    /// write lock. That residue is the one case left, and it is logged.
+    /// write lock.
     pub(super) fn destroy_link(&self) -> std::io::Result<()> {
         let (link, log, poller, hooked) = {
             let mut inner = self.inner.lock().expect("viona lock poisoned");

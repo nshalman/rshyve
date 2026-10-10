@@ -269,3 +269,29 @@ fn a_tainted_gate_refuses_everything_even_under_a_hold() {
     assert!(gate.hold().is_err());
     drop(hold);
 }
+
+#[test]
+fn a_caller_waiting_behind_a_taint_sees_it() {
+    // The restore that taints runs inside `exclusive`. A run that
+    // queued behind it must not take the write lock afterwards.
+    let gate = RingGate::new();
+    let hold = gate.hold().expect("hold");
+    let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+    let waiter = {
+        let gate = Arc::clone(&gate);
+        std::thread::spawn(move || {
+            queued_rx.recv().expect("the restore is inside");
+            gate.run(|_| ()).err()
+        })
+    };
+
+    gate.exclusive(|| {
+        queued_tx.send(()).expect("the waiter listens");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        gate.taint();
+    })
+    .expect("exclusive");
+
+    assert_eq!(waiter.join().expect("waiter"), Some(GateError::Tainted));
+    drop(hold);
+}

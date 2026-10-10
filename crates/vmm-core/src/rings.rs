@@ -174,13 +174,17 @@ impl RingGate {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Enter the gate, unless a worker escaped it.
-    fn enter(&self) -> Result<Inside, GateError> {
-        let inside = Inside::enter()?;
+    /// Take the gate's lock, unless a worker escaped it.
+    ///
+    /// The taint is read under the lock: a member sets it from inside
+    /// [`Self::exclusive`], and a caller that waited behind that has to
+    /// see it.
+    fn lock_open(&self) -> Result<MutexGuard<'_, State>, GateError> {
+        let state = self.lock();
         if self.tainted.load(Ordering::Acquire) {
             return Err(GateError::Tainted);
         }
-        Ok(inside)
+        Ok(state)
     }
 
     /// Say that a worker this gate counts as stopped may be alive.
@@ -198,8 +202,8 @@ impl RingGate {
         &self,
         member: Weak<dyn KernelRings>,
     ) -> Result<(), GateError> {
-        let _inside = self.enter()?;
-        let mut state = self.lock();
+        let _inside = Inside::enter()?;
+        let mut state = self.lock_open()?;
         if state.holds > 0 {
             if let Some(m) = member.upgrade() {
                 m.stop().map_err(GateError::Busy)?;
@@ -216,8 +220,8 @@ impl RingGate {
         &self,
         f: impl FnOnce(&RingsStopped<'_>) -> R,
     ) -> Result<R, GateError> {
-        let _inside = self.enter()?;
-        let mut state = self.lock();
+        let _inside = Inside::enter()?;
+        let mut state = self.lock_open()?;
         let proof = RingsStopped { gate: self };
         if state.holds > 0 {
             return Ok(f(&proof));
@@ -241,15 +245,15 @@ impl RingGate {
     /// For a member that has to start a worker and stop it again while
     /// a hold says none run: no write-lock ioctl can come between.
     pub fn exclusive<R>(&self, f: impl FnOnce() -> R) -> Result<R, GateError> {
-        let _inside = self.enter()?;
-        let _state = self.lock();
+        let _inside = Inside::enter()?;
+        let _state = self.lock_open()?;
         Ok(f())
     }
 
     /// Keep every ring stopped until the answer is dropped.
     pub fn hold(self: &Arc<Self>) -> Result<RingHold, GateError> {
-        let _inside = self.enter()?;
-        let mut state = self.lock();
+        let _inside = Inside::enter()?;
+        let mut state = self.lock_open()?;
         if state.holds == 0 {
             let members = state.live();
             stop_all(&members)?;
