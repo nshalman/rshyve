@@ -168,9 +168,16 @@ pub(super) fn blk_io_worker(
     // Carries the one request a batch drain had to hand back because it
     // crossed a reset boundary.
     let mut carried: Option<BlkIoRequest> = None;
+    // Requests that came before the store opened. They wait for it
+    // rather than vanish with their descriptors still owed.
+    let mut waiting: std::collections::VecDeque<BlkIoRequest> =
+        std::collections::VecDeque::new();
 
     loop {
-        let req = match carried.take() {
+        let next = carried.take().or_else(|| {
+            disk.get().is_some().then(|| waiting.pop_front()).flatten()
+        });
+        let req = match next {
             Some(req) => req,
             None => match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(r) => r,
@@ -195,6 +202,7 @@ pub(super) fn blk_io_worker(
         // `notify_queue` dispatches nothing before the store opens, and
         // an open store stays open.
         let Some(disk) = disk.get() else {
+            waiting.push_back(req);
             continue;
         };
         run_batch(
