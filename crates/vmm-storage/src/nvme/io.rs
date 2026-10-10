@@ -342,7 +342,8 @@ impl NvmeController {
         }
         let block = u64::from(self.geometry.block_size);
         let mut zero = Vec::with_capacity(ranges);
-        for r in list.chunks_exact(DSM_RANGE_BYTES) {
+        let (whole, _) = list.as_chunks::<DSM_RANGE_BYTES>();
+        for r in whole {
             let nlb = u32::from_le_bytes([r[4], r[5], r[6], r[7]]);
             let slba =
                 u64::from_le_bytes(r[8..16].try_into().unwrap_or([0; 8]));
