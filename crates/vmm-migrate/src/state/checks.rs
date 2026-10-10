@@ -390,6 +390,7 @@ pub(super) fn check_device_state(
         }
         let writes = parse_vcpu_regs(id, &vcpu.registers)?;
         check_register_set(id, &writes, current_peer)?;
+        super::debugregs::check_debug_regs(id, &writes)?;
     }
 
     // A source carries it for every vCPU or for none.

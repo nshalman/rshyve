@@ -26,6 +26,7 @@ use crate::codec::{
 use crate::xsave::{XsaveLayout, XsavePlan};
 
 mod checks;
+mod debugregs;
 mod time;
 
 pub use time::{export_time_data, import_time_data};
@@ -223,12 +224,9 @@ trait ImportSink {
     ) -> Result<(), MigrateError>;
 
     /// Segment selectors are not written here. The plain register
-    /// list already carries CS through LDTR.
-    fn write_reg(
-        &self,
-        vcpuid: i32,
-        write: RegWrite,
-    ) -> Result<(), MigrateError>;
+    /// list already carries CS through LDTR. The kernel's error is
+    /// kept whole, because one errno is not a failure.
+    fn write_reg(&self, vcpuid: i32, write: RegWrite) -> std::io::Result<()>;
 
     fn set_run_state(
         &self,
@@ -275,31 +273,17 @@ impl ImportSink for KernelSink<'_> {
             .map_err(|e| fail(format!("{e:?}")))
     }
 
-    fn write_reg(
-        &self,
-        vcpuid: i32,
-        write: RegWrite,
-    ) -> Result<(), MigrateError> {
+    fn write_reg(&self, vcpuid: i32, write: RegWrite) -> std::io::Result<()> {
         let vcpu = self.vcpu(vcpuid);
         match write {
-            RegWrite::Reg(reg, value) => {
-                vcpu.set_reg(reg, value).map_err(|e| {
-                    MigrateError::State(format!(
-                        "vcpu {vcpuid}: set {reg:?}={value:#x}: {e}"
-                    ))
-                })
-            }
+            RegWrite::Reg(reg, value) => vcpu.set_reg(reg, value),
             RegWrite::Seg(reg, base, limit, access) => {
                 let desc = bhyve_api::seg_desc {
                     base,
                     limit,
                     access,
                 };
-                vcpu.set_segment_desc(reg, &desc).map_err(|e| {
-                    MigrateError::State(format!(
-                        "vcpu {vcpuid}: set {reg:?} descriptor: {e}"
-                    ))
-                })
+                vcpu.set_segment_desc(reg, &desc)
             }
         }
     }
@@ -522,19 +506,27 @@ fn import_device_state_into(
             sink.write_class(VDC_PMU_AMD, 1, Some(id), pmu)?;
         }
         for write in parse_vcpu_regs(id, &vcpu.registers)? {
-            match write {
-                // VMX refuses to force a shadow on. The guest may then
-                // take an interrupt one instruction early, which beats
-                // failing a migration after the gate's go. SVM takes it.
-                RegWrite::Reg(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, 1)
-                    if !amd_host =>
+            let write = debugregs::normalize(write, amd_host);
+            match (write, sink.write_reg(id, write)) {
+                (_, Ok(())) => {}
+                // VMX refuses to force a shadow on, with EINVAL. The
+                // guest may then take an interrupt one instruction
+                // early, which beats failing a migration after the
+                // gate's go. SVM takes it.
+                (
+                    RegWrite::Reg(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, 1),
+                    Err(e),
+                ) if !amd_host
+                    && e.kind() == std::io::ErrorKind::InvalidInput =>
                 {
-                    if let Err(e) = sink.write_reg(id, write) {
-                        slog::warn!(log, "the interrupt shadow was not \
-                            restored"; "vcpu" => id, "error" => %e);
-                    }
+                    slog::warn!(log, "the interrupt shadow was not \
+                        restored"; "vcpu" => id, "error" => %e);
                 }
-                _ => sink.write_reg(id, write)?,
+                (write, Err(e)) => {
+                    return Err(MigrateError::State(format!(
+                        "vcpu {id}: set {write:?}: {e}"
+                    )));
+                }
             }
         }
         sink.set_fpu(id, fpu)?;
@@ -567,6 +559,8 @@ mod tests {
         fpus: RefCell<Vec<(i32, usize)>>,
         /// Answer a forced interrupt shadow the way VMX does.
         vmx: bool,
+        /// A forced interrupt shadow fails with this instead.
+        shadow_fails_with: Option<std::io::ErrorKind>,
     }
 
     impl RecordingSink {
@@ -606,15 +600,18 @@ mod tests {
             &self,
             vcpuid: i32,
             write: RegWrite,
-        ) -> Result<(), MigrateError> {
-            if self.vmx
-                && matches!(
-                    write,
-                    RegWrite::Reg(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, v)
-                        if v != 0
-                )
-            {
-                return Err(MigrateError::State("EINVAL".into()));
+        ) -> std::io::Result<()> {
+            if matches!(
+                write,
+                RegWrite::Reg(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, v)
+                    if v != 0
+            ) {
+                if let Some(kind) = self.shadow_fails_with {
+                    return Err(kind.into());
+                }
+                if self.vmx {
+                    return Err(std::io::ErrorKind::InvalidInput.into());
+                }
             }
             self.regs.borrow_mut().push((vcpuid, format!("{write:?}")));
             Ok(())
@@ -765,6 +762,75 @@ mod tests {
         let (sink, result) = import_on(sink, &state, false);
         result.expect("cleared");
         assert_eq!(sink.regs.borrow().len(), full_reg_count());
+    }
+
+    #[test]
+    fn only_einval_on_the_shadow_is_forgiven() {
+        // Any other errno is a real failure, even on VMX.
+        let mut state = good_state();
+        state.vcpus[0].registers = full_reg_blob(1);
+        let sink = RecordingSink {
+            vmx: true,
+            shadow_fails_with: Some(std::io::ErrorKind::PermissionDenied),
+            ..RecordingSink::default()
+        };
+        let (_, result) = import_on(sink, &state, false);
+        result
+            .map(|_| ())
+            .expect_err("EPERM is not the VMX refusal");
+    }
+
+    /// A register blob from a current source with `over` in place of
+    /// the default values.
+    fn blob_with(over: &[(vm_reg_name, u64)]) -> Vec<u8> {
+        let regs: Vec<(vm_reg_name, u64)> = VCPU_REGS
+            .iter()
+            .map(|&r| {
+                let v = over
+                    .iter()
+                    .find(|(o, _)| *o as i32 == r as i32)
+                    .map_or(0, |&(_, v)| v);
+                (r, v)
+            })
+            .chain([(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, 0)])
+            .collect();
+        reg_blob(&regs, VCPU_SEG_DESCS)
+    }
+
+    #[test]
+    fn hostile_debug_registers_are_refused_before_anything_is_applied() {
+        for (reg, value) in [
+            (vm_reg_name::VM_REG_GUEST_DR6, 0x1_FFFF_0FF0),
+            (vm_reg_name::VM_REG_GUEST_DR7, 0x8000_0000_0000_0400),
+            (vm_reg_name::VM_REG_GUEST_DR0, 0x0000_8000_0000_0000),
+            (vm_reg_name::VM_REG_GUEST_DR2, 0xDEAD_BEEF_0000_0000),
+        ] {
+            for amd_host in [false, true] {
+                let mut state = good_state();
+                state.vcpus[0].registers = blob_with(&[(reg, value)]);
+                let (sink, result) =
+                    import_on(RecordingSink::default(), &state, amd_host);
+                let error = result.map(|_| ()).expect_err("hostile DR");
+                assert!(error.to_string().contains("cannot load"), "{error}");
+                assert!(sink.applied_nothing(), "{reg:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn imported_debug_registers_carry_their_architectural_bits() {
+        let mut state = good_state();
+        state.vcpus[0].registers = blob_with(&[
+            (vm_reg_name::VM_REG_GUEST_DR6, 0),
+            (vm_reg_name::VM_REG_GUEST_DR7, 0xF800),
+        ]);
+        let (sink, result) = import_on(RecordingSink::default(), &state, true);
+        result.expect("low reserved bits are fixed, not refused");
+        let regs = sink.regs.borrow();
+        let wrote = |want: &str| regs.iter().any(|(_, w)| w == want);
+        assert!(wrote("Reg(VM_REG_GUEST_DR6, 4294838256)"), "{regs:?}");
+        // Bit 13 (GD) stays; 11, 12, 14 and 15 clear on AMD; 10 sets.
+        assert!(wrote("Reg(VM_REG_GUEST_DR7, 9216)"), "{regs:?}");
     }
 
     #[test]
