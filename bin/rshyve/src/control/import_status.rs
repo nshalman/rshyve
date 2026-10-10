@@ -71,11 +71,11 @@ where
     let shutdown = Arc::new(AtomicBool::new(false));
     let stop = Arc::clone(&shutdown);
     let at = path.to_path_buf();
-    let handle = thread::Builder::new()
-        .name("import-status".into())
-        .spawn(move || {
+    let handle = thread::Builder::new().name("import-status".into()).spawn(
+        move || {
             supervise(&at, &home, (first, first_bound), &stop, &phase, &log)
-        })?;
+        },
+    )?;
     Ok(ControlListener::from_parts(
         path.to_path_buf(),
         shutdown,

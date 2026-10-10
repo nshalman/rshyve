@@ -811,7 +811,7 @@ mod tests {
                 let (sink, result) =
                     import_on(RecordingSink::default(), &state, amd_host);
                 let error = result.map(|_| ()).expect_err("hostile DR");
-                assert!(error.to_string().contains("cannot load"), "{error}");
+                assert!(error.to_string().contains("host can load"), "{error}");
                 assert!(sink.applied_nothing(), "{reg:?}");
             }
         }

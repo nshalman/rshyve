@@ -124,7 +124,7 @@ mod tests {
         ] {
             let error = check_debug_regs(0, &[reg(r, v)])
                 .expect_err("a value that faults in the host");
-            assert!(error.to_string().contains("cannot load"), "{error}");
+            assert!(error.to_string().contains("host can load"), "{error}");
         }
     }
 

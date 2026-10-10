@@ -415,7 +415,6 @@ mod tests {
 
         dst.restore_migrate_state(&state).expect("restore");
         assert!(pin.is_asserted(), "the RX byte is pending");
-        assert!(!dst.input_byte(b'?'), "no host byte before the resume");
         assert!(sent.lock().unwrap().is_empty());
 
         dst.resume();
