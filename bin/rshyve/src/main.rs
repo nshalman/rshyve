@@ -160,7 +160,7 @@ fn run_migration_destination(
     cpu_baseline: vmm_core::cpuid::CpuBaseline,
     hyperv: Option<Arc<vmm_hyperv::HyperV>>,
     log: &Logger,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<control::ControlListener>> {
     info!(log, "migration destination mode"; "listen" => listen_addr);
 
     refuse_unmigratable_devices(registry)?;
@@ -259,7 +259,7 @@ fn run_migration_destination(
 
     // Held until the import returns; the full control socket binds the
     // same path once the guest runs.
-    let _import_status = match control_socket {
+    let import_status = match control_socket {
         Some(path) => {
             let phase = Arc::clone(&status);
             Some(
@@ -313,7 +313,12 @@ fn run_migration_destination(
     // The interrupt kick happens after the vCPU threads are spawned:
     // one injected before the spawn is lost.
     info!(log, "migration import complete, starting vCPUs");
-    Ok(())
+    // Its thread takes up to a few hundred ms to see the stop, and the
+    // guest is still paused: the caller waits for it after the vCPUs run.
+    if let Some(l) = &import_status {
+        l.stop();
+    }
+    Ok(import_status)
 }
 
 /// Connect to the agent's socket, waiting for it to appear.
@@ -525,8 +530,9 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     )?;
 
     // Phase 8: vCPU activation (migration or normal)
+    let mut import_status = None;
     if let Some(ref listen_addr) = cli.migrate_listen {
-        run_migration_destination(
+        import_status = run_migration_destination(
             &machine,
             listen_addr,
             cli.control_socket.as_deref(),
@@ -637,7 +643,9 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         )?,
     };
 
-    // Phase 12: Control socket
+    // Phase 12: Control socket. The import status thread binds the same
+    // path again when the path changes, so it must be gone first.
+    drop(import_status);
     let control_socket = spawn_control_socket(
         &machine,
         &cli,

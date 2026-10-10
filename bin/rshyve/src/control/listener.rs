@@ -62,6 +62,11 @@ impl ControlListener {
         &self.path
     }
 
+    /// Tell the accept thread to stop, without waiting for it.
+    pub fn stop(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
     /// Stop accepting and wait for the accept thread.
     ///
     /// Connections already being served are not interrupted; each one

@@ -25,8 +25,10 @@ use crate::attach::{self, Attached};
 use crate::job::{Job, Sink};
 use crate::{connect, Config, Connected, Ring, MAX_GUEST_QUEUES};
 
-const FIRST_BACKOFF: Duration = Duration::from_millis(20);
-const MAX_BACKOFF: Duration = Duration::from_millis(500);
+// The guest stays paused until this attach, and a try where the engine
+// has no socket yet is one failed connect: so a short, flat retry.
+const FIRST_BACKOFF: Duration = Duration::from_millis(5);
+const MAX_BACKOFF: Duration = Duration::from_millis(20);
 /// The shortest Hello and Attach a retry near the deadline gets.
 const MIN_TRY: Duration = Duration::from_millis(200);
 
