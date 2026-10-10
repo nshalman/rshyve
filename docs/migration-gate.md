@@ -174,8 +174,11 @@ Rules:
 2. On an abort rshyve resumes the guest on the source. The migration
    fails. Nothing on the destination ran.
 3. rshyve records the go before it writes `ACK GO`. From then on it
-   never resumes the guest by itself. A failure keeps the guest paused
-   until `migrate-resume-source` or a stop.
+   does not resume the guest by itself. A failure keeps the guest
+   paused until `migrate-resume-source` or a stop. The exception is
+   the cutover deadline: with no commit 60 s after the go, rshyve sets
+   `migrate_gate` to `abort`, fails the migration and resumes the
+   guest. The destination cannot start without the commit.
 4. `GO` with no `ACK GO` is not an abort. Read `migrate_gate` to know.
 5. A stop of the VM closes the gate socket. Take that as an abort.
 
@@ -187,6 +190,7 @@ Write the `committing` state of the VM migration record before you send
 | What | Default | Where |
 |---|---|---|
 | Gate connect and answer | 10 s, max 25 s | `gate_timeout_ms` |
+| From the go to the source's commit | 60 s | fixed |
 | Source waits for the destination start after the commit | 150 s | fixed |
 | Destination waits for each ring disk to attach | 120 s | `--migrate-ring-attach-timeout-ms` |
 | Each Hello and Attach try | 5 s | fixed |

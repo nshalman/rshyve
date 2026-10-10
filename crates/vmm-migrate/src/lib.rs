@@ -12,6 +12,7 @@
 pub mod codec;
 pub mod connect;
 pub mod cpu;
+pub mod cutover;
 pub mod destination;
 pub mod gate;
 pub mod limits;
@@ -142,7 +143,8 @@ pub enum GateState {
     #[default]
     None,
     Waiting,
-    /// The orchestrator said go. The source never resumes by itself.
+    /// The orchestrator said go. The source does not resume by itself
+    /// unless the cutover deadline turns this into `Abort`.
     Go,
     Abort,
 }

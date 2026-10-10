@@ -92,6 +92,9 @@ pub struct Deadlines {
     /// How long one send may make no progress before the source fails
     /// the migration. See [`crate::stall`].
     pub stall: Duration,
+    /// The longest a source may stay paused from the gate's go to its
+    /// commit. See [`crate::cutover`].
+    pub cutover: Duration,
 }
 
 impl Default for Deadlines {
@@ -102,6 +105,7 @@ impl Default for Deadlines {
             zfs_barrier: Duration::from_secs(120),
             started: Duration::from_secs(150),
             stall: Duration::from_secs(30),
+            cutover: Duration::from_secs(60),
         }
     }
 }
