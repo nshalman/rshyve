@@ -144,9 +144,9 @@ Source                          Destination
   |<------- MemDone ----------------|  (repeats until converged)
   |                                 |
   |  3. Pause
-  |  device workers park            |
-  |  kernel rings stop              |
   |  vCPUs pause                    |
+  |  device workers drain and park  |
+  |  kernel rings stop              |
   |  backing stores flush           |
   |  ZFS barrier reports            |
   |  cutover gate says GO           |
@@ -154,6 +154,8 @@ Source                          Destination
   |                                 |
   |  4. RamPushPostPause (final dirty pass)
   |-------- PageBatch* ------------>|
+  |  device export                  |
+  |-------- PageBatch* ------------>|  pages dirtied since, if any
   |-------- MemEnd ---------------->|
   |<------- MemDone ----------------|
   |                                 |
@@ -235,6 +237,15 @@ The final dirty pass runs after every device worker has parked, so it
 is the last word on guest memory by construction. Before that change it
 ran while the console and vsock reader threads could still fill a
 receive ring.
+
+The vCPUs pause before the devices drain, as in Propolis, so the guest
+submits nothing new while in-flight requests complete. The device
+export runs inside the final pass, and the pass sends the pages dirtied
+since its first round before its `MemEnd`. Each read of the dirty bitmap
+drops the VMM's mappings of guest RAM, and the next fault through the
+tracked view marks the page dirty, even for a read. A page still dirty
+at the commit fails the migration, and the error names the first pages
+and the device ring each one belongs to.
 
 ### Read deadlines
 

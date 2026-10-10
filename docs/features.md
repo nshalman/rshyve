@@ -451,7 +451,7 @@ One driver, over one transport trait. `crates/vmm-migrate/src/wire.rs` defines `
 
 The same driver serves both, so both carry the same state. An earlier tree had a second implementation for TCP that shipped no device state at all; it is gone.
 
-The sequence is: full RAM pass, up to 5 dirty convergence iterations (500 ms apart, 1024-page threshold), pause devices, pause vCPUs, durable flush of every device, an optional ZFS barrier, a final dirty pass, then time data, device state and the exported queue state. If anything after pause fails, devices and vCPUs are resumed so the guest survives.
+The sequence is: full RAM pass, up to 5 dirty convergence iterations (500 ms apart, 1024-page threshold), pause vCPUs, pause and drain devices, durable flush of every device, an optional ZFS barrier, a final dirty pass with the device export inside it and one more round for pages dirtied since, then time data, device state and the exported queue state. If anything after pause fails, devices and vCPUs are resumed so the guest survives.
 
 Kernel state transferred: the ioapic, atpit, atpic, hpet, pm_timer and rtc system devices; per vCPU the 33 registers, 10 segment descriptors, MSRs, LAPIC, VMM_ARCH, run state and SIPI vector; and VMM time with boot_hrtime re-basing and TSC rescaling.
 
