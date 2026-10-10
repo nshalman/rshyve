@@ -98,6 +98,8 @@ impl VirtioViona {
             }
             Self::ring_kick(&mut inner, ring);
         }
+        // A BAR move during the export was held back.
+        Self::retry_hook(&mut inner);
         if failed.is_empty() {
             return Ok(());
         }

@@ -438,6 +438,7 @@ impl VirtioDevice for VirtioViona {
         // and pushing used entries.
         let mut inner = self.inner.lock().expect("viona lock poisoned");
         Self::ring_kick(&mut inner, queue_idx);
+        Self::retry_hook(&mut inner);
 
         // Return false: the kernel handles interrupts directly,
         // so the PCI transport should not raise a legacy interrupt.

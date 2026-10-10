@@ -42,6 +42,8 @@ impl HookAddrs {
 
 /// What the kernel hook is now, and what the guest may still change.
 pub(super) struct NotifyHook {
+    /// What the guest decodes now. The hook follows it when it can.
+    want: HookAddrs,
     /// `None` is a hook the kernel may or may not hold, after a call
     /// it refused. The next sync sends it again.
     pio: Option<u16>,
@@ -57,6 +59,7 @@ pub(super) struct NotifyHook {
 impl Default for NotifyHook {
     fn default() -> Self {
         Self {
+            want: HookAddrs::NONE,
             pio: Some(0),
             mmio: Some(0),
             tokens: BURST,
@@ -139,11 +142,29 @@ impl VirtioViona {
 
     pub(super) fn sync_hook(&self, want: HookAddrs, now: Instant) {
         let mut inner = self.inner.lock().expect("viona lock");
+        inner.hook.want = want;
+        Self::follow_hook(&mut inner, now);
+    }
+
+    /// Try again for a hook that lags what the guest decodes.
+    ///
+    /// A change can be refused, held back by an export, or spent from
+    /// the budget, and the guest may not move its BARs again. Its kicks
+    /// come through userspace while the hook lags, so each one is a
+    /// chance to catch up.
+    pub(super) fn retry_hook(inner: &mut VionaInner) {
+        if inner.hook.installed() != Some(inner.hook.want) {
+            Self::follow_hook(inner, Instant::now());
+        }
+    }
+
+    fn follow_hook(inner: &mut VionaInner, now: Instant) {
         // The halt destroys the link with this lock dropped, and the
         // delete removes the hook itself.
         if inner.halted {
             return;
         }
+        let want = inner.hook.want;
         let Some(target) = inner.hook.plan(want, now) else {
             return;
         };
@@ -153,7 +174,7 @@ impl VirtioViona {
                  userspace for now";
                 "pio" => want.pio, "mmio" => format!("{:#x}", want.mmio));
         }
-        Self::change_hook(&mut inner, target);
+        Self::change_hook(inner, target);
     }
 
     /// Stop the rings, change the hook, and start them again.
@@ -223,8 +244,15 @@ impl VirtioViona {
             }
         }
         for ring in resumed.kick {
-            if usize::from(ring) < NET_NUM_QUEUES {
-                Self::ring_kick(inner, ring);
+            let idx = usize::from(ring);
+            if idx >= NET_NUM_QUEUES {
+                continue;
+            }
+            Self::ring_kick(inner, ring);
+            // A ring that will not start may never see another guest
+            // kick, so the guest is told through the quarantine.
+            if inner.kick_refused[idx] {
+                inner.ring_state[idx] = RingState::Error;
             }
         }
     }

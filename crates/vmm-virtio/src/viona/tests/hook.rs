@@ -283,3 +283,79 @@ fn a_hook_change_waits_while_an_export_holds_the_rings() {
 
     assert_eq!(steps_of(&steps), []);
 }
+
+#[test]
+fn a_change_held_back_by_an_export_lands_when_the_export_lets_go() {
+    // Otherwise the hook stays on an address the guest gave away.
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).live_rings(NET_QUEUE_SIZE);
+    let device = running_device(Arc::new(link));
+    VirtioDevice::pause_rings_for_export(&device).expect("the rings pause");
+    VirtioDevice::set_notify_addrs(&device, PORT, WINDOW);
+    assert_eq!(hook_steps(&steps), []);
+
+    VirtioDevice::resume_rings_after_migration(&device)
+        .expect("the rings resume");
+
+    assert_eq!(
+        hook_steps(&steps),
+        [
+            Step::SetNotifyIop(PORT),
+            Step::SetNotifyMmio {
+                addr: WINDOW,
+                size: 0x1000
+            }
+        ],
+    );
+}
+
+#[test]
+fn a_throttled_hook_comes_back_on_a_kick_once_the_budget_refills() {
+    // A guest that stops moving its BARs does not write them again, so
+    // the kicks that now exit to userspace are what bring it back.
+    let steps = Steps::default();
+    let link = TestLink::new(&steps).live_rings(NET_QUEUE_SIZE);
+    let device = running_device(Arc::new(link));
+    let past = Instant::now()
+        .checked_sub(Duration::from_secs(5))
+        .expect("the clock is past five seconds");
+    for i in 0..40u16 {
+        let port = if i % 2 == 0 { PORT } else { PORT + 0x100 };
+        device.sync_hook(
+            HookAddrs {
+                pio: port,
+                mmio: WINDOW,
+            },
+            past,
+        );
+    }
+    steps.lock().expect("steps lock").clear();
+
+    super::device::notify(&device, 1);
+
+    assert_eq!(
+        hook_steps(&steps),
+        [
+            Step::SetNotifyIop(PORT + 0x100),
+            Step::SetNotifyMmio {
+                addr: WINDOW,
+                size: 0x1000
+            }
+        ],
+    );
+}
+
+#[test]
+fn a_restarted_ring_that_will_not_start_is_quarantined() {
+    // An RX ring may never see another guest kick.
+    let steps = Steps::default();
+    let link = TestLink::new(&steps)
+        .live_rings(NET_QUEUE_SIZE)
+        .failing(&[Op::RingKick]);
+    let device = running_device(Arc::new(link));
+
+    VirtioDevice::set_notify_addrs(&device, PORT, WINDOW);
+
+    let inner = device.inner.lock().expect("viona lock");
+    assert_eq!(inner.ring_state, [RingState::Error; 2]);
+}
