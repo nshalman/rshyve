@@ -261,7 +261,17 @@ fn resume(ctrl: &VmController, force: bool) -> Response {
     // An import whose disks did not attach after the commit holds the
     // only copy of the guest; it runs only once they are back. The
     // attach can take its whole wait, so it runs before the state
-    // change, which a stop also needs.
+    // change, which a stop also needs. Only a paused VM attaches: a
+    // held or migrated-away source must not take its disks back here.
+    let paused = matches!(
+        ctrl.state(),
+        VmRunState::Paused
+            | VmRunState::ImportCommitted
+            | VmRunState::ImportInDoubt
+    );
+    if !paused {
+        return Response::err("VM is not paused");
+    }
     if let Err(why) =
         ctrl.attach_backing(std::time::Instant::now() + RESUME_ATTACH_WAIT)
     {

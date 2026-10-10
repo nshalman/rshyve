@@ -76,7 +76,7 @@ where
 /// Bind `path` for this process, whatever the received zone root left
 /// there.
 ///
-/// The path is this VM's control socket, so any non-directory at it is
+/// The path is this VM's control socket, so whatever is at it is
 /// removed first: a file or a socket served from inside the zone must
 /// not keep the status from binding. A parent that resolves anywhere
 /// but `home`, where it resolved at the first bind (a symlink the
@@ -96,8 +96,10 @@ fn bind(path: &Path, home: &Path) -> std::io::Result<UnixListener> {
         ));
     }
     match std::fs::symlink_metadata(path) {
-        Ok(m) if !m.is_dir() => std::fs::remove_file(path)?,
-        _ => {}
+        // remove_dir_all does not follow links inside the tree.
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(_) => {}
     }
     vmm_core::unixsock::bind_restricted(
         path,
@@ -374,5 +376,15 @@ mod tests {
         std::fs::remove_file(&path).expect("unlink");
         let _theirs = UnixListener::bind(&path).expect("theirs");
         assert!(ours(&path, &mine).is_none());
+    }
+
+    #[test]
+    fn a_directory_left_at_the_path_does_not_block_the_bind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rs.sock");
+        std::fs::create_dir_all(path.join("inner")).expect("plant");
+        let home = resolved_parent(&path).expect("home");
+        let listener = bind(&path, &home).expect("bound over the dir");
+        assert!(ours(&path, &listener).is_some());
     }
 }
