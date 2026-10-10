@@ -1,0 +1,35 @@
+[package]
+name = "rust-bhyve-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MPL-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: libfuzzer-sys needs a nightly toolchain, and the
+# main workspace builds on stable.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ron = "0.8"
+tungstenite = "0.21"
+vmm_devices = { path = "../crates/vmm-devices" }
+vmm_migrate = { path = "../crates/vmm-migrate" }
+
+[[bin]]
+name = "device_migrate_state"
+path = "fuzz_targets/device_migrate_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "migrate_message"
+path = "fuzz_targets/migrate_message.rs"
+test = false
+doc = false
+bench = false
