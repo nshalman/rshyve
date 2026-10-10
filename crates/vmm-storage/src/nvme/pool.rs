@@ -29,6 +29,8 @@ pub(super) const NUM_WORKERS: usize = 8;
 #[cfg(test)]
 thread_local! {
     /// Fail the spawn of this worker on this thread.
+    // Some clippy releases flag a `const` initializer as not const.
+    #[allow(clippy::missing_const_for_thread_local)]
     pub(super) static FAIL_SPAWN: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
 }

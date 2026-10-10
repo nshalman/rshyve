@@ -117,6 +117,8 @@ impl State {
 }
 
 thread_local! {
+    // Some clippy releases flag a `const` initializer as not const.
+    #[allow(clippy::missing_const_for_thread_local)]
     static INSIDE: Cell<bool> = const { Cell::new(false) };
 }
 
