@@ -41,6 +41,7 @@ struct Shared {
 /// cannot fail. Dropping this stops the thread.
 pub struct Cutover {
     shared: Arc<Shared>,
+    status: Arc<Mutex<MigrationStatus>>,
     budget: Duration,
 }
 
@@ -58,18 +59,23 @@ impl Cutover {
             wake: Condvar::new(),
         });
         let watched = Arc::clone(&shared);
+        let for_watch = Arc::clone(&status);
         let log = log.clone();
         std::thread::Builder::new()
             .name("migrate-cutover".into())
             .spawn(move || {
-                if watch(&watched, &status) {
+                if watch(&watched, &for_watch) {
                     slog::error!(log, "no commit within the cutover \
                         deadline; the source rolls back";
                         "budget_s" => budget.as_secs());
                     shut();
                 }
             })?;
-        Ok(Self { shared, budget })
+        Ok(Self {
+            shared,
+            status,
+            budget,
+        })
     }
 
     /// Start the clock. Called once the gate said go, or where the
@@ -82,10 +88,11 @@ impl Cutover {
         }
     }
 
-    /// Claim the commit. Refused once the deadline fired.
+    /// Claim the commit. Refused once the deadline passed, whether or
+    /// not the watcher has woken for it yet.
     pub fn claim(&self) -> Result<(), MigrateError> {
         let mut state = lock(&self.shared);
-        if *state == State::Fired {
+        if fire_if_due(&mut state, &self.status) {
             return Err(self.error());
         }
         *state = State::Done;
@@ -97,7 +104,7 @@ impl Cutover {
     /// it never will.
     pub fn finish(&self) -> bool {
         let mut state = lock(&self.shared);
-        let fired = *state == State::Fired;
+        let fired = fire_if_due(&mut state, &self.status);
         *state = if fired { State::Fired } else { State::Done };
         self.shared.wake.notify_all();
         fired
@@ -151,6 +158,28 @@ fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, State> {
     shared.state.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Fire when the deadline has passed. True when it has fired, now or
+/// before.
+///
+/// Under the state lock, so a claim or a finish sees either no fire or
+/// a fire with the gate already marked: the owner then reads `abort`
+/// and rolls back.
+fn fire_if_due(state: &mut State, status: &Mutex<MigrationStatus>) -> bool {
+    match *state {
+        State::Fired => true,
+        State::Armed(until) if Instant::now() >= until => {
+            *state = State::Fired;
+            if let Ok(mut s) = status.lock() {
+                if s.gate == GateState::Go {
+                    s.gate = GateState::Abort;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Wait for the deadline. True when it fired.
 fn watch(shared: &Shared, status: &Mutex<MigrationStatus>) -> bool {
     let mut state = lock(shared);
@@ -161,20 +190,10 @@ fn watch(shared: &Shared, status: &Mutex<MigrationStatus>) -> bool {
                     shared.wake.wait(state).unwrap_or_else(|e| e.into_inner());
             }
             State::Armed(until) => {
-                let left = until.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    // Under the state lock, so a claim or a finish sees
-                    // either no fire or a fire with the gate already
-                    // marked: the owner then reads `abort` and rolls
-                    // back.
-                    *state = State::Fired;
-                    if let Ok(mut s) = status.lock() {
-                        if s.gate == GateState::Go {
-                            s.gate = GateState::Abort;
-                        }
-                    }
+                if fire_if_due(&mut state, status) {
                     return true;
                 }
+                let left = until.saturating_duration_since(Instant::now());
                 state = shared
                     .wake
                     .wait_timeout(state, left)
@@ -238,6 +257,17 @@ mod tests {
         assert_eq!(status.lock().expect("status").gate, GateState::Abort);
         assert!(cutover.claim().is_err());
         assert!(cutover.finish());
+    }
+
+    #[test]
+    fn a_late_claim_is_refused_even_before_the_watcher_wakes() {
+        // The watcher thread may run late; the deadline does not.
+        let (cutover, _, status) = started(Duration::from_millis(1));
+        cutover.arm();
+        std::thread::sleep(Duration::from_millis(20));
+        let refused = cutover.claim().is_err();
+        assert!(refused, "a commit after the deadline was taken");
+        assert_eq!(status.lock().expect("status").gate, GateState::Abort);
     }
 
     #[test]
