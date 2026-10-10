@@ -194,7 +194,7 @@ mod tests {
         dev.cfg_write(
             0x04,
             2,
-            u32::from(vmm_devices::pci::bits::RegCmd::MMIO_EN.bits()),
+            u32::from(RegCmd::MMIO_EN.bits()),
         );
     }
 

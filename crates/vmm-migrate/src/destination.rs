@@ -177,7 +177,7 @@ fn run_inner<S: Transport>(
         check_enlightenments(
             &preamble,
             config.hyperv,
-            crate::cpu::host_is_amd(),
+            cpu::host_is_amd(),
         )?;
         let skew = check_clock(&preamble, protocol, log)?;
         Ok((local, skew))

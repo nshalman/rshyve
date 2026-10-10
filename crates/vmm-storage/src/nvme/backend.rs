@@ -343,7 +343,7 @@ pub trait AsyncBackend: Send + Sync + 'static {
 pub type BackendFactory = Box<
     dyn FnOnce(
             Arc<dyn CompletionSink>,
-        ) -> std::io::Result<Arc<dyn AsyncBackend>>
+        ) -> io::Result<Arc<dyn AsyncBackend>>
         + Send,
 >;
 
