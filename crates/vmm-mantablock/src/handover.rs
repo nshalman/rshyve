@@ -26,9 +26,13 @@ use crate::job::{Job, Sink};
 use crate::{connect, Config, Connected, Ring, MAX_GUEST_QUEUES};
 
 // The guest stays paused until this attach, and a try where the engine
-// has no socket yet is one failed connect: so a short, flat retry.
+// has no socket yet is one failed connect: so a short, flat retry for
+// FAST_FOR, then a backoff, so an engine that stays unready is not
+// asked thousands of times.
 const FIRST_BACKOFF: Duration = Duration::from_millis(5);
-const MAX_BACKOFF: Duration = Duration::from_millis(20);
+const FAST_BACKOFF: Duration = Duration::from_millis(20);
+const FAST_FOR: Duration = Duration::from_secs(5);
+const MAX_BACKOFF: Duration = Duration::from_millis(500);
 /// The shortest Hello and Attach a retry near the deadline gets.
 const MIN_TRY: Duration = Duration::from_millis(200);
 
@@ -310,6 +314,7 @@ impl<J: Job> Handover<J> {
         }
         let mut backoff = FIRST_BACKOFF;
         let mut tries = 0u32;
+        let fast_until = Instant::now() + FAST_FOR;
         loop {
             if self.halted.load(Ordering::Acquire) {
                 return Err("the disk is halted".into());
@@ -332,7 +337,12 @@ impl<J: Job> Handover<J> {
                 ));
             }
             thread::sleep(backoff.min(left));
-            backoff = (backoff * 2).min(MAX_BACKOFF);
+            let cap = if Instant::now() < fast_until {
+                FAST_BACKOFF
+            } else {
+                MAX_BACKOFF
+            };
+            backoff = (backoff * 2).min(cap);
         }
     }
 
