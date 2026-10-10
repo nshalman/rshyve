@@ -41,9 +41,14 @@ pub(super) fn for_vm(name: &str, fd: BorrowedFd<'_>) -> Arc<VmRings> {
     };
     let mut vms = VMS.lock().unwrap_or_else(|e| e.into_inner());
     vms.retain(|(_, vm)| vm.strong_count() > 0);
+    // A node that could not be read (rdev 0) matches by name: two
+    // gates for one VM are worse than one gate for a name reused.
+    let same = |k: &Key| {
+        k.name == key.name && (k.rdev == key.rdev || k.rdev == 0 || key.rdev == 0)
+    };
     if let Some(vm) = vms
         .iter()
-        .find(|(k, _)| *k == key)
+        .find(|(k, _)| same(k))
         .and_then(|(_, vm)| vm.upgrade())
     {
         return vm;
