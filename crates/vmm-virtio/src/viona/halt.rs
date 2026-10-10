@@ -6,12 +6,22 @@
 
 use std::io::PipeWriter;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use vmm_devices::Lifecycle;
 
 use viona_api::LinkOps;
+use vmm_core::rings::GateError;
 
 use super::{RingState, VirtioViona, NET_NUM_QUEUES};
+
+/// How long a halt waits for the gate to stop every ring before it
+/// deletes a link that may hold a hook.
+///
+/// The usual refusal is another link in the middle of its own delete:
+/// its ring calls answer `ENXIO` until the delete ends.
+const GATE_WAIT: Duration = Duration::from_secs(2);
+const GATE_STEP: Duration = Duration::from_millis(20);
 
 /// The interrupt poll thread, while one is running.
 pub(super) struct Poller {
@@ -82,12 +92,15 @@ impl VirtioViona {
     /// write lock to delete, and once it is halted nothing can give it
     /// one.
     ///
-    /// If the gate cannot stop the rings, the delete runs anyway, since
-    /// teardown has to reach `VM_DESTROY_SELF`. A quiesce fails only on
-    /// a ring reset the kernel refused, and it refuses one only with
-    /// `ENXIO` once the link or the VM hold is on its way out
-    /// (`viona_main.c`, `viona_ioctl`). The workers then lose their
-    /// leases and leave, so a hook removal has nothing to wait on.
+    /// If the gate cannot stop the rings within [`GATE_WAIT`], the delete
+    /// runs anyway, since teardown has to reach `VM_DESTROY_SELF`. A
+    /// quiesce fails only on a ring call the kernel refused, and a link
+    /// refuses them only with `ENXIO`, once that link or the VM hold is
+    /// on its way out (`viona_main.c`, `viona_ioctl`). A link on its
+    /// way out ends its own delete within the wait. A VM hold marked
+    /// for release fails every lease renewal (`viona_ring.c`,
+    /// `viona_ring_lease_renew`), so no worker waits in one for the
+    /// write lock. That residue is the one case left, and it is logged.
     pub(super) fn destroy_link(&self) -> std::io::Result<()> {
         let (link, log, poller, hooked) = {
             let mut inner = self.inner.lock().expect("viona lock poisoned");
@@ -123,18 +136,7 @@ impl VirtioViona {
         stop_poller(poller, &log);
 
         let rc = if hooked {
-            self.rings
-                .run(|_| {
-                    Self::clear_hook(
-                        &mut self.inner.lock().expect("viona lock"),
-                    );
-                    halt_link(link.as_ref(), &log)
-                })
-                .unwrap_or_else(|e| {
-                    slog::error!(log, "viona rings did not stop before the \
-                        link delete"; "error" => %e);
-                    halt_link(link.as_ref(), &log)
-                })
+            self.delete_in_gate(link.as_ref(), &log)
         } else {
             halt_link(link.as_ref(), &log)
         };
@@ -142,6 +144,34 @@ impl VirtioViona {
         // can stop again.
         self.inner.lock().expect("viona lock").deleted = true;
         rc
+    }
+
+    /// Take the hook off and delete the link with every ring of the VM
+    /// stopped.
+    fn delete_in_gate(
+        &self,
+        link: &dyn LinkOps,
+        log: &slog::Logger,
+    ) -> std::io::Result<()> {
+        let mut waited = Duration::ZERO;
+        loop {
+            let ran = self.rings.run(|_| {
+                Self::clear_hook(&mut self.inner.lock().expect("viona lock"));
+                halt_link(link, log)
+            });
+            match ran {
+                Ok(rc) => return rc,
+                Err(GateError::Busy(_)) if waited < GATE_WAIT => {
+                    std::thread::sleep(GATE_STEP);
+                    waited += GATE_STEP;
+                }
+                Err(e) => {
+                    slog::error!(log, "viona rings did not stop before the \
+                        link delete"; "error" => %e);
+                    return halt_link(link, log);
+                }
+            }
+        }
     }
 
     /// Stop the kernel the one way that cannot fail, after a ring

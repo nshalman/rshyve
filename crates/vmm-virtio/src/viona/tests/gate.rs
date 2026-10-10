@@ -280,7 +280,69 @@ fn a_restored_ring_that_will_not_stop_fails_the_import() {
         device.inner.lock().expect("viona lock").ring_state[0],
         RingState::Error,
     );
+    // Under the hold a run stops nothing, so it would take the write
+    // lock beside that worker.
+    assert_eq!(
+        device.rings.run(|_| ()).err(),
+        Some(vmm_core::rings::GateError::Tainted),
+    );
     drop(hold);
+}
+
+#[test]
+fn a_restored_ring_that_will_not_pause_is_still_reset() {
+    // Only the reset ends the worker, so it is tried whatever the
+    // pause did. The state is lost, and the gate stays usable.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(TestLink::new(&steps)));
+    let hold = device.rings.hold().expect("the rings stop");
+    VirtioDevice::reset_all_rings(&device).expect("nothing to stop");
+    let link = Arc::new(TestLink::new(&steps).failing(&[Op::RingPause]));
+    device.inner.lock().expect("viona lock").link = link;
+    clear(&steps);
+
+    restore_result(&device, 0)
+        .expect_err("a ring whose state is lost fails the import");
+
+    assert_eq!(steps_of(&steps).last(), Some(&Step::RingReset(0)));
+    device.rings.run(|_| ()).expect("the gate is not tainted");
+    drop(hold);
+}
+
+#[test]
+fn a_halt_with_a_hook_waits_for_a_neighbour_to_stop() {
+    // A neighbour in the middle of its own delete refuses its ring
+    // calls for a moment. The hook comes off only once every ring of
+    // the VM is stopped.
+    let gate = RingGate::new();
+    let mine = Steps::default();
+    let other = Steps::default();
+    let device = device_in(
+        Arc::new(TestLink::new(&mine).live_rings(NET_QUEUE_SIZE)),
+        Arc::clone(&gate),
+    );
+    VirtioDevice::set_notify_addrs(&device, PORT, WINDOW);
+    let _neighbour = device_in(
+        Arc::new(
+            TestLink::new(&other)
+                .live_rings(NET_QUEUE_SIZE)
+                .interrupted_on(Op::RingPause, 9),
+        ),
+        Arc::clone(&gate),
+    );
+    clear(&mine);
+
+    vmm_devices::Lifecycle::halt(&device);
+
+    let seen = steps_of(&mine);
+    assert!(seen.contains(&Step::SetNotifyIop(0)), "{seen:?}");
+    assert_eq!(seen.last(), Some(&Step::Delete));
+    let theirs = steps_of(&other);
+    let paused = theirs.iter().filter(|s| **s == Step::RingPause(0)).count();
+    // One quiesce tries a pause eight times, so a ninth means the halt
+    // came back for a second one.
+    assert!(paused > 8, "the halt never tried again: {theirs:?}");
+    assert!(theirs.contains(&Step::RingReset(1)), "{theirs:?}");
 }
 
 #[test]
@@ -413,6 +475,24 @@ fn a_migration_carries_the_indices_the_source_hold_saw() {
         .collect();
     assert_eq!(started, indices);
     drop(src_hold);
+}
+
+fn restore_result(
+    device: &crate::viona::VirtioViona,
+    ring: u16,
+) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+    VirtioDevice::restore_ring_state(
+        device,
+        ring,
+        NET_QUEUE_SIZE,
+        0x1_0000,
+        0x2_0000,
+        0x3_0000,
+        7,
+        5,
+        0,
+        0,
+    )
 }
 
 fn restore(

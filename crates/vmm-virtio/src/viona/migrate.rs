@@ -11,6 +11,9 @@
 
 use vmm_devices::lifecycle::DeviceStateError;
 
+use vmm_core::rings::RingGate;
+
+use super::gate::{stop_one, StopOne};
 use super::{RingState, VionaInner, VirtioViona, NET_NUM_QUEUES};
 
 impl VirtioViona {
@@ -114,7 +117,7 @@ impl VirtioViona {
         self.rings
             .exclusive(|| {
                 let mut inner = self.inner.lock().expect("viona lock");
-                Self::restore_ring(&mut inner, state, msi)
+                Self::restore_ring(&mut inner, &self.rings, state, msi)
             })
             .map_err(|e| {
                 DeviceStateError::Invalid(format!(
@@ -125,6 +128,7 @@ impl VirtioViona {
 
     fn restore_ring(
         inner: &mut VionaInner,
+        rings: &RingGate,
         state: viona_api::vioc_ring_state,
         msi: Option<(u64, u64)>,
     ) -> Result<(), DeviceStateError> {
@@ -192,7 +196,7 @@ impl VirtioViona {
         // The worker the state write started goes first, whatever the
         // route did.
         if inner.stopped.is_some() {
-            Self::stop_restored(inner, queue_idx)?;
+            Self::stop_restored(inner, rings, queue_idx)?;
         }
         if let Err(e) = routed {
             return Err(DeviceStateError::Invalid(format!(
@@ -213,28 +217,36 @@ impl VirtioViona {
     /// what the kernel holds for the gate to start.
     ///
     /// A ring that will not stop fails the restore, and the import with
-    /// it: a worker alive under the hold is what the gate is there to
-    /// rule out.
+    /// it. One whose reset was refused may still have a worker, so the
+    /// gate is tainted: under the hold it would otherwise take the
+    /// write lock beside that worker.
     fn stop_restored(
         inner: &mut VionaInner,
+        rings: &RingGate,
         ring: u16,
     ) -> Result<(), DeviceStateError> {
-        match super::gate::stop_one(inner.link_ref(), ring) {
-            Ok(state) => {
+        let failed = match stop_one(inner.link_ref(), ring) {
+            StopOne::Kept(state) => {
                 if let Some(stopped) = inner.stopped.as_mut() {
                     stopped.set_saved(ring, Some(state));
                 }
-                Ok(())
+                return Ok(());
             }
-            Err(e) => {
-                if let Some(s) = inner.ring_state.get_mut(usize::from(ring)) {
-                    *s = RingState::Error;
-                }
-                Err(DeviceStateError::Invalid(format!(
-                    "viona ring {ring} did not stop after its restore: {e}"
-                )))
+            StopOne::Lost(e) => e,
+            StopOne::Escaped(e) => {
+                rings.taint();
+                e
             }
+        };
+        if let Some(stopped) = inner.stopped.as_mut() {
+            stopped.set_saved(ring, None);
         }
+        if let Some(s) = inner.ring_state.get_mut(usize::from(ring)) {
+            *s = RingState::Error;
+        }
+        Err(DeviceStateError::Invalid(format!(
+            "viona ring {ring} did not stop after its restore: {failed}"
+        )))
     }
 
     /// Read one ring's `(avail_idx, used_idx)` for a migration export.

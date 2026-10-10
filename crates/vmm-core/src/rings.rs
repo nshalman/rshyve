@@ -26,6 +26,7 @@
 //! one thread rather than deadlock on it.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 /// A device whose kernel workers hold a lease on the VM.
@@ -48,6 +49,9 @@ pub enum GateError {
     Busy(String),
     /// The gate was entered again from inside itself.
     Reentered,
+    /// A member started a worker it could not stop again. Nothing may
+    /// take the write lock on this VM any more.
+    Tainted,
 }
 
 impl std::fmt::Display for GateError {
@@ -57,6 +61,9 @@ impl std::fmt::Display for GateError {
                 write!(f, "the kernel rings did not stop: {why}")
             }
             Self::Reentered => f.write_str("the ring gate was entered twice"),
+            Self::Tainted => {
+                f.write_str("a kernel ring worker could not be stopped")
+            }
         }
     }
 }
@@ -68,6 +75,7 @@ impl From<GateError> for std::io::Error {
         let kind = match e {
             GateError::Busy(_) => std::io::ErrorKind::ResourceBusy,
             GateError::Reentered => std::io::ErrorKind::Deadlock,
+            GateError::Tainted => std::io::ErrorKind::ResourceBusy,
         };
         Self::new(kind, e)
     }
@@ -85,6 +93,9 @@ pub struct RingsStopped<'a> {
 #[derive(Default)]
 pub struct RingGate {
     state: Mutex<State>,
+    /// Outside the lock, so a member inside [`RingGate::exclusive`] can
+    /// set it.
+    tainted: AtomicBool,
 }
 
 #[derive(Default)]
@@ -163,13 +174,31 @@ impl RingGate {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Enter the gate, unless a worker escaped it.
+    fn enter(&self) -> Result<Inside, GateError> {
+        let inside = Inside::enter()?;
+        if self.tainted.load(Ordering::Acquire) {
+            return Err(GateError::Tainted);
+        }
+        Ok(inside)
+    }
+
+    /// Say that a worker this gate counts as stopped may be alive.
+    ///
+    /// Every later run, hold and exclusive section is refused: under a
+    /// hold a run stops nothing, so it would take the write lock with
+    /// that worker alive.
+    pub fn taint(&self) {
+        self.tainted.store(true, Ordering::Release);
+    }
+
     /// Add a device. Under a hold it is stopped at once, so the hold
     /// covers it too.
     pub fn register(
         &self,
         member: Weak<dyn KernelRings>,
     ) -> Result<(), GateError> {
-        let _inside = Inside::enter()?;
+        let _inside = self.enter()?;
         let mut state = self.lock();
         if state.holds > 0 {
             if let Some(m) = member.upgrade() {
@@ -187,7 +216,7 @@ impl RingGate {
         &self,
         f: impl FnOnce(&RingsStopped<'_>) -> R,
     ) -> Result<R, GateError> {
-        let _inside = Inside::enter()?;
+        let _inside = self.enter()?;
         let mut state = self.lock();
         let proof = RingsStopped { gate: self };
         if state.holds > 0 {
@@ -212,14 +241,14 @@ impl RingGate {
     /// For a member that has to start a worker and stop it again while
     /// a hold says none run: no write-lock ioctl can come between.
     pub fn exclusive<R>(&self, f: impl FnOnce() -> R) -> Result<R, GateError> {
-        let _inside = Inside::enter()?;
+        let _inside = self.enter()?;
         let _state = self.lock();
         Ok(f())
     }
 
     /// Keep every ring stopped until the answer is dropped.
     pub fn hold(self: &Arc<Self>) -> Result<RingHold, GateError> {
-        let _inside = Inside::enter()?;
+        let _inside = self.enter()?;
         let mut state = self.lock();
         if state.holds == 0 {
             let members = state.live();

@@ -254,3 +254,18 @@ fn a_refused_resume_keeps_the_rings_stopped_with_the_vm() {
     assert_eq!(take(&log), Vec::<String>::new());
     assert!(gate.is_held());
 }
+
+#[test]
+fn a_tainted_gate_refuses_everything_even_under_a_hold() {
+    // Under a hold a run stops nothing. A worker that escaped would be
+    // alive across the write lock.
+    let gate = RingGate::new();
+    let hold = gate.hold().expect("hold");
+
+    gate.taint();
+
+    assert_eq!(gate.run(|_| ()), Err(GateError::Tainted));
+    assert_eq!(gate.exclusive(|| ()), Err(GateError::Tainted));
+    assert!(gate.hold().is_err());
+    drop(hold);
+}

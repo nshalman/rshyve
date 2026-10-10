@@ -110,18 +110,32 @@ impl VirtioViona {
     }
 }
 
+/// What stopping one ring left behind.
+pub(super) enum StopOne {
+    /// The worker is gone and the state is kept.
+    Kept(viona_api::vioc_ring_state),
+    /// The worker is gone, and the state with it.
+    Lost(std::io::Error),
+    /// The reset was refused, so the worker may still be alive.
+    Escaped(std::io::Error),
+}
+
 /// Stop one ring the way a quiesce does, and read back what it holds.
 ///
 /// For a restore under a hold: the kernel checks the ring as it is
-/// programmed, and this takes the worker it started away again.
-pub(super) fn stop_one(
-    link: &dyn LinkOps,
-    ring: u16,
-) -> std::io::Result<viona_api::vioc_ring_state> {
-    retry(|| link.ring_pause(ring))?;
-    let state = link.ring_get_state(ring)?;
-    retry(|| link.ring_reset(ring))?;
-    Ok(state)
+/// programmed, and this takes the worker it started away again. The
+/// reset is tried whatever the pause did, because only the reset ends
+/// the worker.
+pub(super) fn stop_one(link: &dyn LinkOps, ring: u16) -> StopOne {
+    let read = retry(|| link.ring_pause(ring))
+        .and_then(|()| link.ring_get_state(ring));
+    if let Err(e) = retry(|| link.ring_reset(ring)) {
+        return StopOne::Escaped(e);
+    }
+    match read {
+        Ok(state) => StopOne::Kept(state),
+        Err(e) => StopOne::Lost(e),
+    }
 }
 
 fn retry(mut call: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
