@@ -9,15 +9,13 @@
 //! zvol at the cutover gate, while the destination VMM already runs. A
 //! zvol that is open refuses that receive with "dataset is busy".
 
-use std::fs::File;
 use std::io;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{check_not_block, open_disk, DiskSync};
+use super::{open_disk, DiskSync};
 
 const FIRST_BACKOFF: Duration = Duration::from_millis(20);
 const MAX_BACKOFF: Duration = Duration::from_millis(500);
@@ -109,18 +107,19 @@ impl BackingDisk {
     /// it for the guest.
     ///
     /// The probe holds the store for one open and one fstat, at VMM
-    /// start. The last increment comes later, at the gate.
+    /// start. The last increment comes later, at the gate. It opens in
+    /// the mode the attach uses, so a store this process cannot write
+    /// fails here, before the source gives the guest up.
     pub fn deferred(
         path: &Path,
         read_only: bool,
         log: &slog::Logger,
     ) -> io::Result<Self> {
-        let probe = File::open(path)?;
+        // open_disk also refuses a writable block node, which would
+        // fail at the attach.
+        let probe = open_disk(path, read_only)?;
         let meta = probe.metadata()?;
         drop(probe);
-        // A writable block node would fail at the attach, after the
-        // source has given the guest up.
-        check_not_block(meta.mode(), read_only, Some(path))?;
         slog::info!(log, "disk opens after the migration commits";
             "path" => %path.display(), "bytes" => meta.len());
         Ok(Self {
@@ -247,6 +246,14 @@ mod tests {
         let first = Arc::as_ptr(disk.get().expect("open"));
         disk.attach(Instant::now()).expect("again");
         assert_eq!(Arc::as_ptr(disk.get().expect("open")), first);
+    }
+
+    #[test]
+    fn a_store_the_attach_cannot_write_fails_the_probe() {
+        // A directory opens for reading but never for writing, even for
+        // root, so only a probe in the attach's mode sees it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(BackingDisk::deferred(dir.path(), false, &log()).is_err());
     }
 
     #[test]
