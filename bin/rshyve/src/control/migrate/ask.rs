@@ -32,8 +32,10 @@ pub(super) fn gate_budget(ms: Option<u64>) -> Result<Duration, String> {
     Ok(budget)
 }
 
-/// How long a disk may take to attach before a guest runs again.
-pub(super) const RING_ATTACH_DEFAULT: Duration = Duration::from_secs(120);
+/// How long a disk may take to attach before a guest runs again. No
+/// longer than the source waits for the start.
+pub(super) const RING_ATTACH_DEFAULT: Duration =
+    vmm_migrate::wire::MAX_DEST_ATTACH;
 
 /// What `migrate-source` asks for beyond the target.
 pub(in crate::control) struct SourceAsk {

@@ -47,7 +47,7 @@ connects to a Unix socket that the agent listens on. Two more flags:
 
 | Flag | Meaning |
 |---|---|
-| `--migrate-ring-attach-timeout-ms` | Wait for each ring disk to attach after the commit. Default 120000 |
+| `--migrate-ring-attach-timeout-ms` | Wait for each ring disk to attach after the commit. Default and maximum 120000, so it ends before the source stops waiting for the start (150 s) |
 | `--migrate-allow-unproven-engine` | Lab only. See "Engine check" |
 
 The shape is
@@ -79,8 +79,8 @@ only `--ring-config <path>`:
 |---|---|
 | `version` | Must be 1. rshyve refuses any other version and any unknown field |
 | `disks` | `-s` specs, added after the command line's. Only `nvme,mantablock=` disks, at most 24 |
-| `migrate.ring_attach_timeout_ms` | As `--migrate-ring-attach-timeout-ms`. Range 1 to 3600000 |
-| `migrate.allow_unproven_engine` | As `--migrate-allow-unproven-engine`. Lab only |
+| `migrate.ring_attach_timeout_ms` | As `--migrate-ring-attach-timeout-ms`. Range 1 to 120000 |
+| `migrate.allow_unproven_engine` | Only `false` is taken. The zone can write this file, so the lab flag is `--migrate-allow-unproven-engine` only |
 
 The path must be absolute and not a symbolic link. The file must be a
 regular file of rshyve's user (root), mode 0600 or tighter, and at most
