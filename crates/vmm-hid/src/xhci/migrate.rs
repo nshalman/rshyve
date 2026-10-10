@@ -92,9 +92,17 @@ impl XhciController {
             )));
         }
 
-        {
+        // Kept to put back if the BAR does not decode: a refused
+        // restore leaves the device as it was.
+        let pci_before = self
+            .pci_state
+            .lock()
+            .expect("xhci: pci_state lock")
+            .migrate_state();
+        let tablet_before = self.tablet.export_state();
+        let state_before = {
             let mut st = self.state.lock().expect("xhci: state lock");
-            *st = XhciState {
+            std::mem::replace(&mut *st, XhciState {
                 usbcmd: mig.usbcmd,
                 usbsts: mig.usbsts,
                 dnctrl: mig.dnctrl,
@@ -120,8 +128,8 @@ impl XhciController {
                 ep1_in_ring: ring_from_wire(&mig.ep1_in),
                 ep1_in_has_trbs: mig.ep1_in_armed,
                 paused: true,
-            };
-        }
+            })
+        };
         self.tablet.import_state(&mig.tablet);
 
         // Last, so BAR0 decodes only once the registers behind it hold
@@ -139,6 +147,14 @@ impl XhciController {
             && mig.pci.bar_addrs[0] != 0;
         let registered = *self.registered_bar0.lock().expect("xhci: bar0");
         if decodes && registered.is_none() {
+            *self.state.lock().expect("xhci: state lock") = state_before;
+            self.tablet.import_state(&tablet_before);
+            let back = self
+                .pci_state
+                .lock()
+                .expect("xhci: pci_state lock")
+                .bar_replay_writes(&pci_before.bar_addrs);
+            replay_migrate_pci_state(self, &back, &pci_before);
             return Err(DeviceStateError::invalid(format!(
                 "xhci: BAR0 at {:#x} does not decode",
                 mig.pci.bar_addrs[0]
