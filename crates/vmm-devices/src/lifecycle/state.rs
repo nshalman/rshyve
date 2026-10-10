@@ -181,21 +181,22 @@ pub struct FbufMigrateState {
     pub vram: Option<FbufMigrateVram>,
 }
 
-/// The start of the VRAM, zstd-compressed. VRAM past `len` is zero.
+/// The start of the VRAM, LZ4-compressed (block format). VRAM past
+/// `len` is zero.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FbufMigrateVram {
     pub len: u32,
     // RON writes a plain Vec<u8> as a list of decimal numbers, about
     // four times the bytes. As bytes it is base64.
     #[serde(with = "wire_bytes")]
-    pub zstd: Vec<u8>,
+    pub lz4: Vec<u8>,
 }
 
 impl fmt::Debug for FbufMigrateVram {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FbufMigrateVram")
             .field("len", &self.len)
-            .field("zstd_len", &self.zstd.len())
+            .field("lz4_len", &self.lz4.len())
             .finish()
     }
 }

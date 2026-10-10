@@ -28,8 +28,6 @@ use super::{
 /// draws again.
 const VRAM_WIRE_CAP: usize = 2 * 1024 * 1024;
 
-const ZSTD_LEVEL: i32 = 1;
-
 const PAGE: usize = 4096;
 
 impl Framebuffer {
@@ -59,21 +57,18 @@ impl Framebuffer {
             DeviceStateError::Export(format!("fbuf: read VRAM: {e}"))
         })?;
         let used = used_len(&buf);
-        let zstd =
-            zstd::bulk::compress(&buf[..used], ZSTD_LEVEL).map_err(|e| {
-                DeviceStateError::Export(format!("fbuf: compress VRAM: {e}"))
-            })?;
-        if zstd.len() > VRAM_WIRE_CAP {
+        let lz4 = lz4_flex::block::compress(&buf[..used]);
+        if lz4.len() > VRAM_WIRE_CAP {
             slog::warn!(self.log,
                 "fbuf: VRAM does not compress small enough, not carried";
-                "used" => used, "compressed" => zstd.len());
+                "used" => used, "compressed" => lz4.len());
             return Ok(None);
         }
         slog::info!(self.log, "fbuf: VRAM exported";
-            "used" => used, "compressed" => zstd.len());
+            "used" => used, "compressed" => lz4.len());
         Ok(Some(FbufMigrateVram {
             len: u32::try_from(used).expect("VRAM is 16 MiB"),
-            zstd,
+            lz4,
         }))
     }
 
@@ -139,8 +134,8 @@ fn decode_vram(vram: &FbufMigrateVram) -> Result<Vec<u8>, DeviceStateError> {
             "fbuf: VRAM of {len} bytes is past the {BAR1_SIZE} the device has"
         )));
     }
-    // The capacity bounds what a hostile frame can make us allocate.
-    let out = zstd::bulk::decompress(&vram.zstd, len).map_err(|e| {
+    // The size bounds what a hostile frame can make us allocate.
+    let out = lz4_flex::block::decompress(&vram.lz4, len).map_err(|e| {
         DeviceStateError::invalid(format!(
             "fbuf: VRAM does not decompress: {e}"
         ))
@@ -247,20 +242,20 @@ mod tests {
         });
         assert!(dst.restore_state(&bad_mode).is_err());
 
-        let big = zstd::bulk::compress(&vec![0u8; 2 * PAGE], 1).expect("z");
+        let big = lz4_flex::block::compress(&vec![0u8; 2 * PAGE]);
         for vram in [
             FbufMigrateVram {
                 len: BAR1_SIZE + 1,
-                zstd: big.clone(),
+                lz4: big.clone(),
             },
             // The header says less than the frame holds.
             FbufMigrateVram {
                 len: PAGE as u32,
-                zstd: big,
+                lz4: big,
             },
             FbufMigrateVram {
                 len: 16,
-                zstd: vec![1, 2, 3],
+                lz4: vec![1, 2, 3],
             },
         ] {
             let state = DeviceMigrateState::Fbuf(FbufMigrateState {
