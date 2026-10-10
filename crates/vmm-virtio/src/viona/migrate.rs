@@ -11,102 +11,30 @@
 
 use vmm_devices::lifecycle::DeviceStateError;
 
-use super::{PausedRing, RingState, VirtioViona, NET_NUM_QUEUES};
+use super::{RingState, VionaInner, VirtioViona, NET_NUM_QUEUES};
 
 impl VirtioViona {
-    /// Stop every ring worker, so the indices this reads out hold
-    /// still, and keep each ring's state for a rollback.
+    /// Check that the export reads rings that hold still.
     ///
-    /// A ring that could not be paused keeps consuming available
-    /// entries while the export reads its indices, so the failure has
-    /// to fail the migration.
+    /// The VM pause stops every ring through the gate before
+    /// `VM_PAUSE`, and keeps them stopped until `VM_RESUME`, so there is
+    /// nothing left to do here. A ring that is not held stopped would
+    /// move the indices under the export, and the pause it lacks would
+    /// have taken the VM write lock with a worker alive.
     pub(super) fn pause_rings(&self) -> Result<(), DeviceStateError> {
-        let mut inner = self.inner.lock().expect("viona lock");
-        // Same guard as the restore below. The halt drops the device
-        // lock and sits in an untimed kernel call, so a pause that got
-        // in could wait for that call inside the kernel while holding
-        // the lock every vCPU needs.
-        if inner.halted {
+        let inner = self.inner.lock().expect("viona lock");
+        if inner.halted || inner.stopped.is_some() {
             return Ok(());
         }
-        for ring in 0..NET_NUM_QUEUES as u16 {
-            if let Err(e) = inner.link_ref().ring_pause(ring) {
-                return Err(DeviceStateError::Export(format!(
-                    "viona ring {ring} pause failed: {e}"
-                )));
-            }
-            // The read comes after the pause. A running ring moves both
-            // cursors between the two calls, so a rollback taken from a
-            // read made first programs cursors the kernel has already
-            // passed and replays the descriptors between them.
-            let idx = usize::from(ring);
-            match inner.link_ref().ring_get_state(ring) {
-                Ok(state) => inner.paused_rings[idx] = PausedRing::Saved(state),
-                Err(e) => {
-                    // The ring is stopped and nothing can restart it: a
-                    // paused ring needs a reset plus a state write, and
-                    // the state is what the kernel just refused.
-                    inner.paused_rings[idx] = PausedRing::Lost;
-                    return Err(DeviceStateError::Export(format!(
-                        "viona ring {ring} state read failed: {e}"
-                    )));
-                }
-            }
-        }
-        Ok(())
+        Err(DeviceStateError::Export(
+            "viona rings are not held stopped; the VM pause comes first".into(),
+        ))
     }
 
-    /// Put the rings [`Self::pause_rings`] stopped back to work.
-    ///
-    /// A paused ring is `VRS_STOP` in the kernel, and
-    /// `viona_ioc_ring_kick` answers EBUSY for one, so a guest kick
-    /// cannot restart it. Only a reset followed by a state write can,
-    /// which is what this does from the state the pause saved.
+    /// The rings start again when the VM pause lets go of them, after
+    /// `VM_RESUME`. Nothing may start one sooner.
     pub(super) fn resume_rings(&self) -> Result<(), DeviceStateError> {
-        let mut inner = self.inner.lock().expect("viona lock");
-        if inner.halted {
-            return Ok(());
-        }
-        let mut failed: Vec<String> = Vec::new();
-        for ring in 0..NET_NUM_QUEUES as u16 {
-            let idx = usize::from(ring);
-            let state = match std::mem::take(&mut inner.paused_rings[idx]) {
-                PausedRing::Running => continue,
-                // The export stopped this ring and holds nothing to
-                // restart it from, so the source guest keeps a dead
-                // ring whatever happens next. Reporting it is the only
-                // honest answer.
-                PausedRing::Lost => {
-                    failed.push(format!("ring {ring} has no saved state"));
-                    continue;
-                }
-                PausedRing::Saved(state) => state,
-            };
-            // The guest ran between the pause and the abort and may
-            // have reset the device. Its rings are the driver's to
-            // program again, not ours to revive.
-            if inner.ring_state[idx] != RingState::Ready {
-                continue;
-            }
-            if let Err(e) = inner.link_ref().ring_reset(ring) {
-                failed.push(format!("ring {ring} reset: {e}"));
-                continue;
-            }
-            if let Err(e) = inner.link_ref().ring_set_state(&state) {
-                failed.push(format!("ring {ring} set state: {e}"));
-                continue;
-            }
-            Self::ring_kick(&mut inner, ring);
-        }
-        // A BAR move during the export was held back.
-        Self::retry_hook(&mut inner);
-        if failed.is_empty() {
-            return Ok(());
-        }
-        Err(DeviceStateError::Invalid(format!(
-            "viona rings stayed paused: {}",
-            failed.join("; ")
-        )))
+        Ok(())
     }
 
     /// Reset all viona rings (pause + reset). Call before ring_set_state.
@@ -115,10 +43,20 @@ impl VirtioViona {
     /// the restore writes new ones over them, so a refusal here fails
     /// the migration.
     pub fn reset_all_rings(&self) -> Result<(), DeviceStateError> {
-        let inner = self.inner.lock().expect("viona lock");
+        let mut inner = self.inner.lock().expect("viona lock");
         // The halt reset every ring already, and it holds no device
-        // lock while it destroys the link.
+        // lock while it destroys it.
         if inner.halted {
+            return Ok(());
+        }
+        // Under the gate the kernel rings are reset already. Forget
+        // what they held, so the gate starts only what is restored.
+        if let Some(stopped) = inner.stopped.as_mut() {
+            for ring in 0..NET_NUM_QUEUES as u16 {
+                stopped.set_saved(ring, None);
+            }
+            inner.ring_state = [RingState::Init; NET_NUM_QUEUES];
+            inner.msi = [None; NET_NUM_QUEUES];
             return Ok(());
         }
         for ring in 0..NET_NUM_QUEUES as u16 {
@@ -145,6 +83,12 @@ impl VirtioViona {
     /// migration on this answer and then discards its own VM, so a
     /// destination that reported success over a refused ioctl leaves
     /// the guest a NIC nothing can put right.
+    ///
+    /// The destination's VM pause holds the rings stopped. The ring is
+    /// still programmed here, so the kernel checks it before the
+    /// commit, and then stopped again for the gate to start after
+    /// `VM_RESUME`. The gate's lock keeps every write-lock ioctl out
+    /// while the worker lives.
     pub fn ring_set_state(
         &self,
         queue_idx: u16,
@@ -157,7 +101,36 @@ impl VirtioViona {
         msix_addr: u64,
         msix_data: u32,
     ) -> Result<(), DeviceStateError> {
-        let mut inner = self.inner.lock().expect("viona lock");
+        let state = viona_api::vioc_ring_state {
+            vrs_index: queue_idx,
+            vrs_avail_idx: avail_idx,
+            vrs_used_idx: used_idx,
+            vrs_qsize: size,
+            vrs_qaddr_desc: desc,
+            vrs_qaddr_avail: avail,
+            vrs_qaddr_used: used,
+        };
+        let msi = (msix_addr != 0).then_some((msix_addr, u64::from(msix_data)));
+        self.rings
+            .exclusive(|| {
+                let mut inner = self.inner.lock().expect("viona lock");
+                Self::restore_ring(&mut inner, state, msi)
+            })
+            .map_err(|e| {
+                DeviceStateError::Invalid(format!(
+                    "viona ring {queue_idx} restore: {e}"
+                ))
+            })?
+    }
+
+    fn restore_ring(
+        inner: &mut VionaInner,
+        state: viona_api::vioc_ring_state,
+        msi: Option<(u64, u64)>,
+    ) -> Result<(), DeviceStateError> {
+        let queue_idx = state.vrs_index;
+        let (size, avail_idx, used_idx) =
+            (state.vrs_qsize, state.vrs_avail_idx, state.vrs_used_idx);
         // A restore that races the halt must not program a link that
         // is already destroyed.
         if inner.halted {
@@ -175,7 +148,7 @@ impl VirtioViona {
         // Set features (VERSION_1 sets l_modern in kernel)
         if inner.negotiated_features != 0 {
             let features = inner.negotiated_features;
-            Self::set_kernel_features(&inner, features).map_err(|e| {
+            Self::set_kernel_features(inner, features).map_err(|e| {
                 // VERSION_1 is what puts the kernel rings in the modern
                 // layout the addresses below are read in, so a ring
                 // programmed without it reads the wrong memory.
@@ -196,15 +169,6 @@ impl VirtioViona {
         //
         // If avail_idx == used_idx (zero available buffers), the guest
         // driver must re-post buffers via the post-restore interrupt.
-        let state = viona_api::vioc_ring_state {
-            vrs_index: queue_idx,
-            vrs_avail_idx: avail_idx,
-            vrs_used_idx: used_idx,
-            vrs_qsize: size,
-            vrs_qaddr_desc: desc,
-            vrs_qaddr_avail: avail,
-            vrs_qaddr_used: used,
-        };
         if let Err(e) = inner.link_ref().ring_set_state(&state) {
             return Err(DeviceStateError::Invalid(format!(
                 "viona ring {queue_idx} set state failed: {e}"
@@ -214,28 +178,63 @@ impl VirtioViona {
         let idx = queue_idx as usize;
         if idx < NET_NUM_QUEUES {
             inner.ring_state[idx] = RingState::Ready;
+            inner.msi[idx] = msi;
         }
 
         // Program MSI-X interrupt delivery for this queue
-        if msix_addr != 0 {
-            let msi_rc = inner.link_ref().ring_set_msi(
-                queue_idx,
-                msix_addr,
-                u64::from(msix_data),
-            );
-            if let Err(e) = msi_rc {
-                return Err(DeviceStateError::Invalid(format!(
-                    "viona ring {queue_idx} set msi failed: {e}"
-                )));
+        let routed = match msi {
+            Some((addr, msg)) => {
+                inner.link_ref().ring_set_msi(queue_idx, addr, msg)
             }
+            None => Ok(()),
+        };
+
+        // The worker the state write started goes first, whatever the
+        // route did.
+        if inner.stopped.is_some() {
+            Self::stop_restored(inner, queue_idx)?;
+        }
+        if let Err(e) = routed {
+            return Err(DeviceStateError::Invalid(format!(
+                "viona ring {queue_idx} set msi failed: {e}"
+            )));
         }
 
-        Self::ring_kick(&mut inner, queue_idx);
+        Self::ring_kick(inner, queue_idx);
         let log = inner.log();
         slog::info!(log, "viona ring state restored";
             "ring" => queue_idx, "avail_idx" => avail_idx,
-            "used_idx" => used_idx, "msi_addr" => msix_addr);
+            "used_idx" => used_idx,
+            "msi_addr" => msi.map_or(0, |(addr, _)| addr));
         Ok(())
+    }
+
+    /// Take away the worker a restore under the gate started, and keep
+    /// what the kernel holds for the gate to start.
+    ///
+    /// A ring that will not stop fails the restore, and the import with
+    /// it: a worker alive under the hold is what the gate is there to
+    /// rule out.
+    fn stop_restored(
+        inner: &mut VionaInner,
+        ring: u16,
+    ) -> Result<(), DeviceStateError> {
+        match super::gate::stop_one(inner.link_ref(), ring) {
+            Ok(state) => {
+                if let Some(stopped) = inner.stopped.as_mut() {
+                    stopped.set_saved(ring, Some(state));
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(s) = inner.ring_state.get_mut(usize::from(ring)) {
+                    *s = RingState::Error;
+                }
+                Err(DeviceStateError::Invalid(format!(
+                    "viona ring {ring} did not stop after its restore: {e}"
+                )))
+            }
+        }
     }
 
     /// Read one ring's `(avail_idx, used_idx)` for a migration export.
@@ -259,6 +258,14 @@ impl VirtioViona {
                 "viona ring {queue_idx} state read after the link was \
                  destroyed"
             )));
+        }
+        // Under the gate the kernel ring is reset, and its indices are
+        // the ones the gate read when it stopped it. A ring it holds
+        // nothing for was never programmed.
+        if let Some(stopped) = inner.stopped.as_ref() {
+            return Ok(stopped
+                .saved(queue_idx)
+                .map_or((0, 0), |s| (s.vrs_avail_idx, s.vrs_used_idx)));
         }
         match inner.link_ref().ring_get_state(queue_idx) {
             Ok(state) => Ok((state.vrs_avail_idx, state.vrs_used_idx)),

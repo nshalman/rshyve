@@ -8,16 +8,17 @@
 //! exit. It has to follow the BARs: a hook left on an old address
 //! takes kicks meant for whatever the guest puts there next.
 //!
-//! Every change goes through [`viona_api::quiesce`] first, because the
-//! kernel takes the ring lock under the VM write lock and a live ring
-//! worker can deadlock the host against a hook change. A guest can move
+//! A hook change takes the VM write lock, so it runs inside the VM's
+//! ring gate, with every ring of every link stopped. A guest can move
 //! its BARs as often as it likes, so the changes are counted against a
 //! budget. A guest that spends it loses the hook, and its kicks go
 //! through userspace until the budget refills.
 
 use std::time::{Duration, Instant};
 
-use super::{PausedRing, RingState, VionaInner, VirtioViona, NET_NUM_QUEUES};
+use vmm_core::ratelimit::{Pace, Pacer};
+
+use super::{VionaInner, VirtioViona};
 
 /// The window the modern notify capability points the guest at.
 const NOTIFY_MMIO_SIZE: u32 = 0x1000;
@@ -46,14 +47,9 @@ pub(super) struct NotifyHook {
     want: HookAddrs,
     /// `None` is a hook the kernel may or may not hold, after a call
     /// it refused. The next sync sends it again.
-    pio: Option<u16>,
-    mmio: Option<u64>,
-    tokens: u32,
-    refilled: Option<Instant>,
-    /// The one clear allowed past the budget has been used.
-    clear_spent: bool,
-    throttled: bool,
-    throttle_reported: bool,
+    pub(super) pio: Option<u16>,
+    pub(super) mmio: Option<u64>,
+    pacer: Pacer,
 }
 
 impl Default for NotifyHook {
@@ -62,11 +58,7 @@ impl Default for NotifyHook {
             want: HookAddrs::NONE,
             pio: Some(0),
             mmio: Some(0),
-            tokens: BURST,
-            refilled: None,
-            clear_spent: false,
-            throttled: false,
-            throttle_reported: false,
+            pacer: Pacer::new(BURST, REFILL),
         }
     }
 }
@@ -77,6 +69,11 @@ impl NotifyHook {
             pio: self.pio?,
             mmio: self.mmio?,
         })
+    }
+
+    /// Whether the kernel may hold a hook that nothing has removed.
+    pub(super) fn maybe_installed(&self) -> bool {
+        self.installed() != Some(HookAddrs::NONE)
     }
 
     /// The hook to program for `want` at `now`, or `None` when nothing
@@ -93,39 +90,12 @@ impl NotifyHook {
         if self.installed() == Some(want) {
             return None;
         }
-        self.refill(now);
-        if self.tokens > 0 {
-            self.tokens -= 1;
-            self.clear_spent = false;
-            return Some(want);
+        let cleared = self.installed() == Some(HookAddrs::NONE);
+        match self.pacer.admit(now, cleared) {
+            Pace::Change => Some(want),
+            Pace::Clear => Some(HookAddrs::NONE),
+            Pace::Wait => None,
         }
-        if self.installed() == Some(HookAddrs::NONE) || self.clear_spent {
-            return None;
-        }
-        self.clear_spent = true;
-        self.throttled = true;
-        Some(HookAddrs::NONE)
-    }
-
-    fn refill(&mut self, now: Instant) {
-        let Some(last) = self.refilled else {
-            self.refilled = Some(now);
-            return;
-        };
-        let elapsed = now.saturating_duration_since(last);
-        let earned = elapsed.as_secs() / REFILL.as_secs();
-        if earned == 0 {
-            return;
-        }
-        let earned = u32::try_from(earned).unwrap_or(u32::MAX);
-        self.tokens = self.tokens.saturating_add(earned).min(BURST);
-        self.refilled = Some(now);
-    }
-
-    /// Whether the last plan was the throttle, the first time only.
-    fn first_throttle(&mut self) -> bool {
-        std::mem::take(&mut self.throttled)
-            && !std::mem::replace(&mut self.throttle_reported, true)
     }
 }
 
@@ -141,118 +111,121 @@ impl VirtioViona {
     }
 
     pub(super) fn sync_hook(&self, want: HookAddrs, now: Instant) {
-        let mut inner = self.inner.lock().expect("viona lock");
-        inner.hook.want = want;
-        Self::follow_hook(&mut inner, now);
+        let target = {
+            let mut inner = self.inner.lock().expect("viona lock");
+            inner.hook.want = want;
+            Self::plan_hook(&mut inner, now)
+        };
+        if let Some(target) = target {
+            self.change_hook(target);
+        }
     }
 
     /// Try again for a hook that lags what the guest decodes.
     ///
-    /// A change can be refused, held back by an export, or spent from
+    /// A change can be refused, held back by the gate, or spent from
     /// the budget, and the guest may not move its BARs again. Its kicks
     /// come through userspace while the hook lags, so each one is a
     /// chance to catch up.
-    pub(super) fn retry_hook(inner: &mut VionaInner) {
-        if inner.hook.installed() != Some(inner.hook.want) {
-            Self::follow_hook(inner, Instant::now());
+    pub(super) fn retry_hook(&self) {
+        let target = {
+            let mut inner = self.inner.lock().expect("viona lock");
+            if inner.hook.installed() == Some(inner.hook.want) {
+                return;
+            }
+            Self::plan_hook(&mut inner, Instant::now())
+        };
+        if let Some(target) = target {
+            self.change_hook(target);
         }
     }
 
-    fn follow_hook(inner: &mut VionaInner, now: Instant) {
+    fn plan_hook(inner: &mut VionaInner, now: Instant) -> Option<HookAddrs> {
         // The halt destroys the link with this lock dropped, and the
         // delete removes the hook itself.
         if inner.halted {
-            return;
+            return None;
         }
         let want = inner.hook.want;
-        let Some(target) = inner.hook.plan(want, now) else {
-            return;
-        };
-        if inner.hook.first_throttle() {
+        let target = inner.hook.plan(want, now)?;
+        if inner.hook.pacer.first_throttle() {
             slog::warn!(inner.log(),
                 "viona notify hook moved too often, kicks go through \
                  userspace for now";
                 "pio" => want.pio, "mmio" => format!("{:#x}", want.mmio));
         }
-        Self::change_hook(inner, target);
+        Some(target)
     }
 
-    /// Stop the rings, change the hook, and start them again.
+    /// Change the hook inside the ring gate.
     ///
-    /// The lock is held throughout: a kick or a ring init in between
-    /// would start a worker again.
-    fn change_hook(inner: &mut VionaInner, target: HookAddrs) {
-        // A migration export holds these stopped and owns their state.
-        // A restart here would move the indices it is reading.
-        if inner.paused_rings.iter().any(|r| *r != PausedRing::Running) {
-            slog::warn!(
-                inner.log(),
-                "viona notify hook not changed while an export holds the rings"
-            );
+    /// Called with no device lock held: the gate takes it to stop this
+    /// link.
+    fn change_hook(&self, target: HookAddrs) {
+        let ran = self.rings.run(|_| {
+            let mut inner = self.inner.lock().expect("viona lock");
+            Self::write_hook(&mut inner, target);
+        });
+        // The old hook stays. A guest network that stops is
+        // survivable; a host deadlock is not.
+        if let Err(e) = ran {
+            let inner = self.inner.lock().expect("viona lock");
+            slog::warn!(inner.log(),
+                "viona rings did not stop, notify hook unchanged";
+                "error" => %e);
+        }
+    }
+
+    /// Send the hook calls, with the proof the gate left this link.
+    ///
+    /// Only a gate run calls this.
+    fn write_hook(inner: &mut VionaInner, target: HookAddrs) {
+        if inner.halted {
             return;
         }
-        let link = inner.link();
-        let rings = match viona_api::quiesce(link.as_ref()) {
-            Ok(rings) => rings,
-            // The old hook stays. A guest network that stops is
-            // survivable; a host deadlock is not.
-            Err(failed) => {
-                slog::warn!(inner.log(),
-                    "viona rings did not stop, notify hook unchanged";
-                    "error" => %failed);
-                Self::restart_rings(inner, failed.resumed);
-                return;
-            }
-        };
+        Self::send_hook(inner, target);
+    }
 
-        if inner.hook.pio != Some(target.pio) {
-            match link.set_notify_iop(&rings, target.pio) {
-                Ok(()) => inner.hook.pio = Some(target.pio),
+    /// Take the hook off a link the halt is about to delete. Only a
+    /// gate run calls this.
+    pub(super) fn clear_hook(inner: &mut VionaInner) {
+        Self::send_hook(inner, HookAddrs::NONE);
+    }
+
+    fn send_hook(inner: &mut VionaInner, target: HookAddrs) {
+        let log = inner.log();
+        let VionaInner {
+            link,
+            stopped,
+            hook,
+            ..
+        } = inner;
+        let Some(rings) = stopped.as_ref() else {
+            // The gate stops every member before it runs anything, so
+            // this device is not in the gate it was given.
+            slog::error!(log, "viona rings not stopped, notify hook unchanged");
+            return;
+        };
+        if hook.pio != Some(target.pio) {
+            match link.set_notify_iop(rings, target.pio) {
+                Ok(()) => hook.pio = Some(target.pio),
                 Err(e) => {
-                    inner.hook.pio = None;
-                    slog::warn!(inner.log(), "viona set notify port failed";
+                    hook.pio = None;
+                    slog::warn!(log, "viona set notify port failed";
                         "port" => target.pio, "error" => %e);
                 }
             }
         }
-        if inner.hook.mmio != Some(target.mmio) {
-            let rc =
-                link.set_notify_mmio(&rings, target.mmio, NOTIFY_MMIO_SIZE);
+        if hook.mmio != Some(target.mmio) {
+            let rc = link.set_notify_mmio(rings, target.mmio, NOTIFY_MMIO_SIZE);
             match rc {
-                Ok(()) => inner.hook.mmio = Some(target.mmio),
+                Ok(()) => hook.mmio = Some(target.mmio),
                 Err(e) => {
-                    inner.hook.mmio = None;
-                    slog::warn!(inner.log(), "viona set notify mmio failed";
+                    hook.mmio = None;
+                    slog::warn!(log, "viona set notify mmio failed";
                         "addr" => format!("{:#x}", target.mmio),
                         "error" => %e);
                 }
-            }
-        }
-
-        let resumed = rings.resume();
-        Self::restart_rings(inner, resumed);
-    }
-
-    /// Kick the rings a quiesce put back, and quarantine the ones it
-    /// could not.
-    fn restart_rings(inner: &mut VionaInner, resumed: viona_api::Resumed) {
-        for (ring, e) in resumed.lost {
-            slog::warn!(inner.log(), "viona ring lost its state, quarantining";
-                "ring" => ring, "error" => %e);
-            if let Some(state) = inner.ring_state.get_mut(usize::from(ring)) {
-                *state = RingState::Error;
-            }
-        }
-        for ring in resumed.kick {
-            let idx = usize::from(ring);
-            if idx >= NET_NUM_QUEUES {
-                continue;
-            }
-            Self::ring_kick(inner, ring);
-            // A ring that will not start may never see another guest
-            // kick, so the guest is told through the quarantine.
-            if inner.kick_refused[idx] {
-                inner.ring_state[idx] = RingState::Error;
             }
         }
     }

@@ -28,6 +28,7 @@ use super::VirtioViona;
 
 mod device;
 mod errors;
+mod gate;
 mod hook;
 mod intr;
 
@@ -152,6 +153,10 @@ struct TestLink {
     /// The ring size `ring_get_state` reports. 0 is a ring the kernel
     /// was never given.
     ring_size: u16,
+    /// Keep what `ring_set_state` wrote and report it back, the way a
+    /// kernel does, until a reset clears it.
+    remember: bool,
+    remembered: Mutex<[Option<vioc_ring_state>; 2]>,
 }
 
 impl TestLink {
@@ -167,6 +172,29 @@ impl TestLink {
             interrupted: Mutex::new(None),
             wrapped_used: false,
             ring_size: 0,
+            remember: false,
+            remembered: Mutex::new([None; 2]),
+        }
+    }
+
+    /// A link whose rings hold the state written to them.
+    fn remembering(mut self) -> Self {
+        self.remember = true;
+        self
+    }
+
+    fn remembered(&self, ring: u16) -> Option<vioc_ring_state> {
+        if !self.remember {
+            return None;
+        }
+        let slots = self.remembered.lock().expect("remembered lock");
+        slots.get(usize::from(ring)).copied().flatten()
+    }
+
+    fn set_remembered(&self, ring: u16, state: Option<vioc_ring_state>) {
+        let mut slots = self.remembered.lock().expect("remembered lock");
+        if let Some(slot) = slots.get_mut(usize::from(ring)) {
+            *slot = state;
         }
     }
 
@@ -304,7 +332,9 @@ impl LinkOps for TestLink {
     }
 
     fn ring_reset(&self, ring: u16) -> std::io::Result<()> {
-        self.answer(Op::RingReset, Step::RingReset(ring))
+        self.answer(Op::RingReset, Step::RingReset(ring))?;
+        self.set_remembered(ring, None);
+        Ok(())
     }
 
     fn ring_pause(&self, ring: u16) -> std::io::Result<()> {
@@ -312,12 +342,17 @@ impl LinkOps for TestLink {
     }
 
     fn ring_set_state(&self, state: &vioc_ring_state) -> std::io::Result<()> {
-        self.answer(Op::RingSetState, Step::RingSetState(*state))
+        self.answer(Op::RingSetState, Step::RingSetState(*state))?;
+        self.set_remembered(state.vrs_index, Some(*state));
+        Ok(())
     }
 
     fn ring_get_state(&self, ring: u16) -> std::io::Result<vioc_ring_state> {
         self.push(Step::RingGetState(ring));
         self.result(Op::RingGetState)?;
+        if let Some(state) = self.remembered(ring) {
+            return Ok(state);
+        }
         // The indices a migration source reads out. Distinct, and
         // neither is the ring, so a caller that returns the wrong
         // field or swaps the pair is visible.
@@ -369,7 +404,7 @@ impl LinkOps for TestLink {
 
     fn set_notify_iop(
         &self,
-        _rings: &Quiesced<'_>,
+        _rings: &Quiesced,
         port: u16,
     ) -> std::io::Result<()> {
         self.answer(Op::SetNotifyIop, Step::SetNotifyIop(port))
@@ -377,7 +412,7 @@ impl LinkOps for TestLink {
 
     fn set_notify_mmio(
         &self,
-        _rings: &Quiesced<'_>,
+        _rings: &Quiesced,
         addr: u64,
         size: u32,
     ) -> std::io::Result<()> {

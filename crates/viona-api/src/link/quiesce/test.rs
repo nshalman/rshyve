@@ -5,7 +5,7 @@
 //! The order a quiesce stops and restarts rings in.
 
 use std::io::{ErrorKind, PipeReader, Result};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::{IntrStatus, IntrWait, PromiscMode};
@@ -106,10 +106,10 @@ impl LinkOps for Fake {
     fn wait_intr(&self, _: &PipeReader) -> Result<IntrWait> {
         unreachable!()
     }
-    fn set_notify_iop(&self, _: &Quiesced<'_>, _: u16) -> Result<()> {
+    fn set_notify_iop(&self, _: &Quiesced, _: u16) -> Result<()> {
         unreachable!()
     }
-    fn set_notify_mmio(&self, _: &Quiesced<'_>, _: u64, _: u32) -> Result<()> {
+    fn set_notify_mmio(&self, _: &Quiesced, _: u64, _: u32) -> Result<()> {
         unreachable!()
     }
     fn set_promisc(&self, _: PromiscMode) -> Result<()> {
@@ -126,9 +126,9 @@ use Call::*;
 fn every_ring_is_paused_read_and_reset_before_the_proof_exists() {
     // The read comes after the pause so the indices hold still, and
     // the reset comes last so the worker is gone.
-    let link = Fake::new(256);
+    let link = Arc::new(Fake::new(256));
 
-    let q = quiesce(&link).expect("nothing refused");
+    let q = quiesce(link.clone()).expect("nothing refused");
     assert_eq!(
         link.calls(),
         [
@@ -150,8 +150,8 @@ fn every_ring_is_paused_read_and_reset_before_the_proof_exists() {
 #[test]
 fn the_state_written_back_is_the_state_read_out() {
     // Indices that drift lose or replay packets.
-    let link = Fake::new(256);
-    let q = quiesce(&link).expect("nothing refused");
+    let link = Arc::new(Fake::new(256));
+    let q = quiesce(link.clone()).expect("nothing refused");
     assert_eq!(
         q.saved[0].map(|s| (s.vrs_avail_idx, s.vrs_used_idx)),
         Some((7, 5))
@@ -163,9 +163,9 @@ fn the_state_written_back_is_the_state_read_out() {
 fn a_ring_never_programmed_is_not_written_back() {
     // A state write with size 0 is refused by the kernel, and the ring
     // had no worker to stop.
-    let link = Fake::new(0);
+    let link = Arc::new(Fake::new(0));
 
-    let resumed = quiesce(&link).expect("nothing refused").resume();
+    let resumed = quiesce(link.clone()).expect("nothing refused").resume();
 
     assert!(!link.calls().iter().any(|c| matches!(c, SetState(_))));
     assert!(resumed.kick.is_empty());
@@ -175,10 +175,13 @@ fn a_ring_never_programmed_is_not_written_back() {
 fn a_refused_pause_puts_back_the_rings_already_stopped() {
     // Nothing may change the hook now. Ring 0 is reset already and
     // needs its state back; ring 1 is at most paused and needs a kick.
-    let link =
-        Fake::new(256).refusing(Pause(1), ErrorKind::ResourceBusy, usize::MAX);
+    let link = Arc::new(Fake::new(256).refusing(
+        Pause(1),
+        ErrorKind::ResourceBusy,
+        usize::MAX,
+    ));
 
-    let failed = quiesce(&link).err().expect("the pause was refused");
+    let failed = quiesce(link.clone()).err().expect("the pause was refused");
 
     assert_eq!((failed.ring, failed.step), (1, "pause"));
     assert_eq!(link.calls().last(), Some(&SetState(0)));
@@ -187,9 +190,10 @@ fn a_refused_pause_puts_back_the_rings_already_stopped() {
 
 #[test]
 fn a_refused_state_read_kicks_the_paused_ring() {
-    let link = Fake::new(256).refusing(GetState(0), ErrorKind::Other, 1);
+    let link =
+        Arc::new(Fake::new(256).refusing(GetState(0), ErrorKind::Other, 1));
 
-    let failed = quiesce(&link).err().expect("the read was refused");
+    let failed = quiesce(link.clone()).err().expect("the read was refused");
 
     assert_eq!(failed.step, "get state");
     assert!(!link.calls().contains(&Reset(0)));
@@ -200,9 +204,13 @@ fn a_refused_state_read_kicks_the_paused_ring() {
 fn a_refused_reset_loses_that_ring() {
     // Its worker may still be alive, so it cannot be restarted from a
     // state write, and the hook must not change.
-    let link = Fake::new(256).refusing(Reset(1), ErrorKind::Other, usize::MAX);
+    let link = Arc::new(Fake::new(256).refusing(
+        Reset(1),
+        ErrorKind::Other,
+        usize::MAX,
+    ));
 
-    let failed = quiesce(&link).err().expect("the reset was refused");
+    let failed = quiesce(link.clone()).err().expect("the reset was refused");
 
     assert_eq!(failed.step, "reset");
     assert_eq!(failed.resumed.kick, [0]);
@@ -212,9 +220,10 @@ fn a_refused_reset_loses_that_ring() {
 
 #[test]
 fn an_interrupted_reset_is_tried_again() {
-    let link = Fake::new(256).refusing(Reset(0), ErrorKind::Interrupted, 2);
+    let link =
+        Arc::new(Fake::new(256).refusing(Reset(0), ErrorKind::Interrupted, 2));
 
-    let q = quiesce(&link).expect("the reset got through");
+    let q = quiesce(link.clone()).expect("the reset got through");
 
     assert_eq!(link.calls().iter().filter(|c| **c == Reset(0)).count(), 3);
     drop(q.resume());
@@ -222,20 +231,51 @@ fn an_interrupted_reset_is_tried_again() {
 
 #[test]
 fn a_dropped_proof_still_writes_the_rings_back() {
-    let link = Fake::new(256);
+    let link = Arc::new(Fake::new(256));
 
-    drop(quiesce(&link).expect("nothing refused"));
+    drop(quiesce(link.clone()).expect("nothing refused"));
 
     assert_eq!(link.calls()[6..], [SetState(0), SetState(1)]);
 }
 
 #[test]
 fn a_proof_covers_only_its_own_link() {
-    let mine = Fake::new(0);
+    let mine = Arc::new(Fake::new(0));
     let other = Fake::new(0);
-    let q = quiesce(&mine).expect("nothing refused");
+    let q = quiesce(mine.clone()).expect("nothing refused");
 
-    assert!(q.covers(&mine));
+    assert!(q.covers(mine.as_ref()));
     assert!(!q.covers(&other));
     drop(q.resume());
+}
+
+#[test]
+fn a_ring_the_guest_programs_while_stopped_is_written_back_as_programmed() {
+    let link = Arc::new(Fake::new(256));
+    let mut q = quiesce(link.clone()).expect("nothing refused");
+    let fresh = vioc_ring_state {
+        vrs_index: 1,
+        vrs_qsize: 128,
+        ..Default::default()
+    };
+
+    q.set_saved(0, None);
+    q.set_saved(1, Some(fresh));
+    assert_eq!(q.saved(0), None);
+    assert_eq!(q.saved(1).map(|s| s.vrs_qsize), Some(128));
+
+    let resumed = q.resume();
+    assert_eq!(link.calls()[6..], [SetState(1)]);
+    assert_eq!(resumed.kick, [1]);
+}
+
+#[test]
+fn a_discarded_proof_writes_nothing_back() {
+    // The link is about to be destroyed; a state write would start a
+    // worker on it.
+    let link = Arc::new(Fake::new(256));
+
+    quiesce(link.clone()).expect("nothing refused").discard();
+
+    assert_eq!(link.calls().len(), 6);
 }

@@ -45,6 +45,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::common::PAGE_SIZE;
 use crate::hdl::VmmHdl;
+use crate::rings::RingsStopped;
 
 mod ctx;
 mod devmem;
@@ -270,7 +271,7 @@ impl PhysMap {
 
         let segid = self.next_segid;
         let mut created = false;
-        let result = (|| -> Result<()> {
+        let result = hdl.rings().run_io(|rings| {
             // Both ranges are claimed before the segment exists, so a
             // bad layout cannot spend a segment the kernel never gives
             // back.
@@ -288,11 +289,11 @@ impl PhysMap {
                 guest_prot_for(RegionKind::Ram),
                 Placement::Firmware,
             )?;
-            hdl.create_memseg(segid, seg_len, &seg_name(segid))?;
+            hdl.create_memseg(rings, segid, seg_len, &seg_name(segid))?;
             created = true;
-            rom.commit(hdl, segid, 0)?;
-            ram.commit(hdl, segid, ram_off)
-        })();
+            rom.commit(hdl, rings, segid, 0)?;
+            ram.commit(hdl, rings, segid, ram_off)
+        });
 
         if created {
             self.next_segid += 1;
@@ -310,13 +311,13 @@ impl PhysMap {
     ) -> Result<()> {
         let segid = self.next_segid;
         let mut created = false;
-        let result = (|| -> Result<()> {
+        let result = hdl.rings().run_io(|rings| {
             let claim =
                 self.claim(gpa, len, kind, guest_prot, Placement::Firmware)?;
-            hdl.create_memseg(segid, len, &seg_name(segid))?;
+            hdl.create_memseg(rings, segid, len, &seg_name(segid))?;
             created = true;
-            claim.commit(hdl, segid, 0)
-        })();
+            claim.commit(hdl, rings, segid, 0)
+        });
 
         // There is no ioctl that frees a segment, so one that was
         // created is spent whether or not its mapping worked.
@@ -719,7 +720,13 @@ impl RamClaim<'_> {
     ///
     /// `segoff` is the offset into the segment, which lets one segment
     /// back several regions.
-    pub fn commit(self, hdl: &VmmHdl, segid: i32, segoff: i64) -> Result<()> {
+    pub fn commit(
+        self,
+        hdl: &VmmHdl,
+        rings: &RingsStopped<'_>,
+        segid: i32,
+        segoff: i64,
+    ) -> Result<()> {
         if segoff < 0 || !(segoff as u64).is_multiple_of(PAGE_SIZE as u64) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
@@ -740,7 +747,7 @@ impl RamClaim<'_> {
         let tracked =
             tracked_view(hdl, run_gpa, run_len, self.kind, self.guest_prot)?;
 
-        hdl.map_memseg(segid, gpa, len, segoff, self.guest_prot)?;
+        hdl.map_memseg(rings, segid, gpa, len, segoff, self.guest_prot)?;
 
         // The guest can reach the memory from here on, so a failure has
         // to take the mapping back out. A guest mapping the physical map
@@ -763,7 +770,7 @@ impl RamClaim<'_> {
                 );
                 Ok(())
             }
-            Err(e) => match hdl.munmap_memseg(gpa, len) {
+            Err(e) => match hdl.munmap_memseg(rings, gpa, len) {
                 Ok(()) => Err(e),
                 Err(unmap) => {
                     // The guest still reaches memory with no region

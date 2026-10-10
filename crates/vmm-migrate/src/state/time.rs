@@ -187,12 +187,9 @@ pub fn import_time_data(
         )
     };
 
-    let dst = hdl
-        .data_op(VDC_VMM_TIME, 1)
-        .read::<vdi_time_info_v1>()
-        .map_err(|e| {
-            MigrateError::VmmData(format!("read dst VMM_TIME: {e:?}"))
-        })?;
+    let dst = super::with_vm_data(hdl, VDC_VMM_TIME, 1, "read dst", |op| {
+        op.read::<vdi_time_info_v1>()
+    })?;
 
     let adjusted = adjust_time(&src, &dst, log)?;
 

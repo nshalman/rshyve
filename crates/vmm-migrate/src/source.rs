@@ -6,7 +6,11 @@
 //!
 //! The order of the phases is the invariant this module owns:
 //!
-//! 1. Pause the vCPUs, so the guest submits nothing new.
+//! 1. Pause the vCPUs, so the guest submits nothing new. The VM pause
+//!    stops every kernel ring worker first and keeps them stopped
+//!    until the VM resumes: `VM_PAUSE`, the VM-wide state export and
+//!    `VM_RESUME` all take the VM write lock (see
+//!    [`vmm_core::rings`]).
 //! 2. Pause the devices and drain them: every request in flight
 //!    completes and writes its completion. Every thread that writes
 //!    guest memory has to be stopped before the last dirty pass, or
@@ -21,8 +25,8 @@
 //!    disk the destination attaches anew.
 //!
 //! Anything that fails from step 1 on rolls the source back: devices
-//! resume, the rings a migration paused go back to work, and the vCPUs
-//! run again. After the gate's go nothing rolls back: the source stays
+//! resume, the vCPUs run again, and the kernel rings start after
+//! them. After the gate's go nothing rolls back: the source stays
 //! paused until the orchestrator tells it which side keeps the guest.
 
 use std::io::Read;

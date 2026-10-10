@@ -73,8 +73,23 @@ impl VirtioViona {
     /// started (`viona_main.c`, `viona_ioc_delete`), so an `Ok` here
     /// proves no kernel thread reads or writes the guest ring pages any
     /// more.
+    ///
+    /// The delete removes a notify hook it finds before it resets any
+    /// ring, and that removal takes the VM write lock. So a link that
+    /// may hold a hook is deleted inside the ring gate, after the hook
+    /// is taken off with the proof the gate leaves: no worker of any
+    /// link on the VM is alive across it. A link with no hook takes no
+    /// write lock to delete, and once it is halted nothing can give it
+    /// one.
+    ///
+    /// If the gate cannot stop the rings, the delete runs anyway, since
+    /// teardown has to reach `VM_DESTROY_SELF`. A quiesce fails only on
+    /// a ring reset the kernel refused, and it refuses one only with
+    /// `ENXIO` once the link or the VM hold is on its way out
+    /// (`viona_main.c`, `viona_ioctl`). The workers then lose their
+    /// leases and leave, so a hook removal has nothing to wait on.
     pub(super) fn destroy_link(&self) -> std::io::Result<()> {
-        let (link, log, poller) = {
+        let (link, log, poller, hooked) = {
             let mut inner = self.inner.lock().expect("viona lock poisoned");
             // A second destroy has no link left. viona would treat it
             // as a no-op, but a repeated delete would also repeat the
@@ -91,16 +106,42 @@ impl VirtioViona {
             // delete finds no ring to send.
             inner.ring_state = [RingState::Init; NET_NUM_QUEUES];
             inner.negotiated_features = 0;
-            (inner.link(), inner.log(), inner.poller.take())
+            (
+                inner.link(),
+                inner.log(),
+                inner.poller.take(),
+                inner.hook.maybe_installed(),
+            )
         };
 
         // The poll thread reads the viona descriptor and calls back
         // into the PCI transport, so it must be gone before the link
         // is destroyed. The join needs the device lock dropped as well:
         // the thread may be inside that callback now, and it takes
-        // transport locks.
+        // transport locks. It is joined outside the gate too: a vCPU
+        // that holds a transport lock may be waiting for the gate.
         stop_poller(poller, &log);
-        halt_link(link.as_ref(), &log)
+
+        let rc = if hooked {
+            self.rings
+                .run(|_| {
+                    Self::clear_hook(
+                        &mut self.inner.lock().expect("viona lock"),
+                    );
+                    halt_link(link.as_ref(), &log)
+                })
+                .unwrap_or_else(|e| {
+                    slog::error!(log, "viona rings did not stop before the \
+                        link delete"; "error" => %e);
+                    halt_link(link.as_ref(), &log)
+                })
+        } else {
+            halt_link(link.as_ref(), &log)
+        };
+        // Whatever the delete answered, the link is not one the gate
+        // can stop again.
+        self.inner.lock().expect("viona lock").deleted = true;
+        rc
     }
 
     /// Stop the kernel the one way that cannot fail, after a ring

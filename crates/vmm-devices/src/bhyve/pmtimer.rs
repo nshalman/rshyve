@@ -36,7 +36,9 @@ impl BhyvePmTimer {
     /// PIO reads to this port by returning the timer value directly,
     /// without exiting to userspace.
     pub fn attach(&self) -> std::io::Result<()> {
-        self.hdl.pmtmr_locate(self.port)
+        self.hdl
+            .rings()
+            .run_io(|rings| self.hdl.pmtmr_locate(rings, self.port))
     }
 
     /// Get the PIO port this timer is configured for.

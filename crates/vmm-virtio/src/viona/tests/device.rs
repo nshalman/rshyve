@@ -13,6 +13,7 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use vmm_core::mem::PhysMap;
+use vmm_core::rings::RingGate;
 use vmm_devices::Lifecycle;
 
 use super::{null_log, steps_of, Hold, Op, Step, Steps, TestLink};
@@ -52,7 +53,16 @@ impl TestLink {
 /// The same constructor the illumos build uses once it has opened a
 /// link, so nothing here builds a device shape the product does not.
 pub(super) fn device_with(link: Arc<dyn LinkOps>) -> VirtioViona {
-    VirtioViona::with_link(link, TEST_MAC, VIRTIO_NET_F_MAC)
+    device_in(link, RingGate::new())
+}
+
+/// A device in a gate the test shares between devices.
+pub(super) fn device_in(
+    link: Arc<dyn LinkOps>,
+    rings: Arc<RingGate>,
+) -> VirtioViona {
+    VirtioViona::with_link(link, TEST_MAC, VIRTIO_NET_F_MAC, rings)
+        .expect("a fresh device joins the gate")
 }
 
 /// A device the guest has finished programming.
@@ -890,84 +900,6 @@ fn a_halted_device_restores_no_ring() {
         [],
         "a halted device programmed a ring in the kernel",
     );
-}
-
-#[test]
-fn an_export_pauses_every_ring_before_it_reads_them() {
-    // A ring the kernel still works on moves both cursors while the
-    // source reads them. A rollback taken from a read made first
-    // programs cursors the kernel has already passed, and the ring
-    // replays the descriptors between them.
-    let steps = Steps::default();
-    let device = device_with(Arc::new(TestLink::new(&steps)));
-
-    VirtioDevice::pause_rings_for_export(&device).expect("pauses");
-
-    assert_eq!(
-        steps_of(&steps),
-        [
-            Step::RingPause(0),
-            Step::RingGetState(0),
-            Step::RingPause(1),
-            Step::RingGetState(1),
-        ],
-    );
-}
-
-#[test]
-fn an_export_that_cannot_read_a_paused_ring_fails_the_migration() {
-    // The ring is stopped with nothing to restart it from: a paused
-    // ring needs a reset plus a state write. Neither the export nor the
-    // rollback may report success over that.
-    let steps = Steps::default();
-    let device = running_device(Arc::new(
-        TestLink::new(&steps).failing(&[Op::RingGetState]),
-    ));
-
-    VirtioDevice::pause_rings_for_export(&device)
-        .expect_err("a ring with no saved state must fail the migration");
-    VirtioDevice::resume_rings_after_migration(&device)
-        .expect_err("a ring that cannot be restarted must be reported");
-}
-
-#[test]
-fn a_rollback_puts_every_paused_ring_back_to_work() {
-    // A paused ring is VRS_STOP, and viona answers a guest kick on one
-    // with EBUSY, so only a reset plus a state write revives it. The
-    // source guest would otherwise resume with a dead NIC.
-    let steps = Steps::default();
-    let device = running_device(Arc::new(TestLink::new(&steps)));
-
-    VirtioDevice::pause_rings_for_export(&device).expect("pauses");
-    steps.lock().expect("steps").clear();
-
-    VirtioDevice::resume_rings_after_migration(&device).expect("resumes");
-
-    let seen = steps_of(&steps);
-    assert!(
-        seen.contains(&Step::RingReset(0))
-            && seen.contains(&Step::RingReset(1)),
-        "{seen:?}",
-    );
-    assert_eq!(
-        seen.iter()
-            .filter(|s| matches!(s, Step::RingSetState { .. }))
-            .count(),
-        2,
-        "both rings get their saved state back: {seen:?}",
-    );
-}
-
-#[test]
-fn a_ring_that_will_not_pause_fails_the_migration() {
-    // The export would otherwise read indices that are still moving.
-    let steps = Steps::default();
-    let device = running_device(Arc::new(
-        TestLink::new(&steps).failing(&[Op::RingPause]),
-    ));
-
-    VirtioDevice::pause_rings_for_export(&device)
-        .expect_err("a ring that stays running must fail the migration");
 }
 
 #[test]

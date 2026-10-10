@@ -19,8 +19,13 @@
 //!
 //! [`Quiesced`] is the proof that the sequence ran. The two hook calls
 //! on [`LinkOps`] take it, and only [`quiesce`] makes one.
+//!
+//! One link's proof is not enough for the VM write lock: every link on
+//! the VM has to be stopped. The caller that owns the VM decides that;
+//! this proof is what each link holds while it is stopped.
 
 use std::io::{Error, ErrorKind, Result};
+use std::sync::Arc;
 
 use super::LinkOps;
 use crate::{vioc_ring_state, VIONA_VQ_MAX};
@@ -38,10 +43,17 @@ const ATTEMPTS: usize = 8;
 /// The rings that held a programmed ring are written back by
 /// [`Self::resume`], or by the drop if the caller does not call it.
 #[must_use = "the rings stay stopped until this is resumed"]
-pub struct Quiesced<'a> {
-    link: &'a dyn LinkOps,
+pub struct Quiesced {
+    /// `None` for a recorder's proof, which has nothing to write back.
+    link: Option<Arc<dyn LinkOps>>,
+    /// The link's address, which is all [`Self::covers`] compares.
+    addr: usize,
     saved: [Option<vioc_ring_state>; RINGS],
     resumed: bool,
+}
+
+fn addr_of(link: &dyn LinkOps) -> usize {
+    std::ptr::from_ref(link).cast::<()>() as usize
 }
 
 /// What putting the rings back did.
@@ -76,15 +88,16 @@ impl std::fmt::Display for QuiesceFailed {
 /// the answer is resumed: a ring init or a kick in between starts a
 /// worker again.
 pub fn quiesce(
-    link: &dyn LinkOps,
-) -> std::result::Result<Quiesced<'_>, QuiesceFailed> {
+    link: Arc<dyn LinkOps>,
+) -> std::result::Result<Quiesced, QuiesceFailed> {
     let mut q = Quiesced {
-        link,
+        addr: addr_of(link.as_ref()),
+        link: Some(Arc::clone(&link)),
         saved: [None; RINGS],
         resumed: false,
     };
     for ring in 0..VIONA_VQ_MAX {
-        let fail = |q: &mut Quiesced<'_>, step, error, stuck: bool| {
+        let fail = |q: &mut Quiesced, step, error, stuck: bool| {
             let mut resumed = q.put_back();
             if stuck {
                 resumed.lost.push((ring, Error::other(step)));
@@ -127,15 +140,28 @@ fn retry(mut call: impl FnMut() -> Result<()>) -> Result<()> {
     call()
 }
 
-impl Quiesced<'_> {
+impl Quiesced {
     /// Whether this proof covers `link`.
     ///
     /// A proof made for one link says nothing about another.
     pub fn covers(&self, link: &dyn LinkOps) -> bool {
-        std::ptr::addr_eq(
-            self.link as *const dyn LinkOps,
-            link as *const dyn LinkOps,
-        )
+        self.addr == addr_of(link)
+    }
+
+    /// The state a ring will be written back with, or `None` for a ring
+    /// that will stay reset.
+    pub fn saved(&self, ring: u16) -> Option<vioc_ring_state> {
+        self.saved.get(usize::from(ring)).copied().flatten()
+    }
+
+    /// Change what a ring is written back with, for a guest that
+    /// programs or retires the ring while it is stopped.
+    ///
+    /// A state with no size is a ring left reset.
+    pub fn set_saved(&mut self, ring: u16, state: Option<vioc_ring_state>) {
+        if let Some(slot) = self.saved.get_mut(usize::from(ring)) {
+            *slot = state.filter(|s| s.vrs_qsize != 0);
+        }
     }
 
     /// Write back the state of every ring that held one.
@@ -143,16 +169,25 @@ impl Quiesced<'_> {
         self.put_back()
     }
 
+    /// Give the proof up and write nothing back, for a link that is
+    /// about to be destroyed.
+    pub fn discard(mut self) {
+        self.resumed = true;
+    }
+
     fn put_back(&mut self) -> Resumed {
         let mut out = Resumed::default();
         if std::mem::replace(&mut self.resumed, true) {
             return out;
         }
+        let Some(link) = self.link.as_ref() else {
+            return out;
+        };
         for (ring, state) in (0u16..).zip(self.saved.iter_mut()) {
             let Some(state) = state.take() else {
                 continue;
             };
-            match self.link.ring_set_state(&state) {
+            match link.ring_set_state(&state) {
                 Ok(()) => out.kick.push(ring),
                 Err(e) => out.lost.push((ring, e)),
             }
@@ -161,7 +196,7 @@ impl Quiesced<'_> {
     }
 }
 
-impl Drop for Quiesced<'_> {
+impl Drop for Quiesced {
     fn drop(&mut self) {
         // A caller that never resumed still gets its rings back. Nobody
         // is left to kick them, so a guest kick has to.
@@ -170,11 +205,12 @@ impl Drop for Quiesced<'_> {
 }
 
 #[cfg(test)]
-impl<'a> Quiesced<'a> {
+impl Quiesced {
     /// A proof for a recorder, which runs no ring worker.
-    pub(crate) fn for_recorder(link: &'a dyn LinkOps) -> Self {
+    pub(crate) fn for_recorder(link: &dyn LinkOps) -> Self {
         Self {
-            link,
+            link: None,
+            addr: addr_of(link),
             saved: [None; RINGS],
             resumed: true,
         }

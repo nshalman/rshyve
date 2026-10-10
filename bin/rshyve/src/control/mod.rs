@@ -330,8 +330,8 @@ impl VmController {
                 report.names()
             )));
         }
-        // The kernel rings last: a ring paused before its device's
-        // workers stop would still be asked for descriptors.
+        // The VM pause stopped the kernel rings already. This checks
+        // they still hold still before the export reads them.
         for named in &devices {
             named.device.pause_for_migration()?;
         }

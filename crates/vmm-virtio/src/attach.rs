@@ -136,10 +136,14 @@ pub fn virtio_viona(
     );
 
     use std::os::fd::AsFd;
-    let dev =
-        VirtioViona::new(vnic_name, ctx.hdl.as_fd()).with_context(|| {
-            format!("failed to create viona device for VNIC: {vnic_name}")
-        })?;
+    let dev = VirtioViona::new(
+        vnic_name,
+        ctx.hdl.as_fd(),
+        Arc::clone(ctx.hdl.rings()),
+    )
+    .with_context(|| {
+        format!("failed to create viona device for VNIC: {vnic_name}")
+    })?;
 
     if promiscphys {
         dev.set_promisc(true).with_context(|| {

@@ -212,11 +212,14 @@ fn check_register_set(
 pub(super) fn read_class_layouts(
     hdl: &VmmHdl,
 ) -> Result<Vec<vdi_version_entry_v1>, MigrateError> {
-    hdl.data_op(VDC_VERSION, 1)
-        .read_all::<vdi_version_entry_v1>()
-        .map_err(|e| {
-            MigrateError::State(format!("read local class versions: {e:?}"))
-        })
+    super::with_vm_data(
+        hdl,
+        VDC_VERSION,
+        1,
+        "read local class versions",
+        |op| op.read_all::<vdi_version_entry_v1>(),
+    )
+    .map_err(|e| MigrateError::State(e.to_string()))
 }
 
 /// Check one state blob against the local kernel's shape for its class.

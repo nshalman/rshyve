@@ -16,6 +16,7 @@ use bhyve_api::{ioctls, ppt_bar_io, ppt_bar_query, ppt_cfg_io};
 use slog::{warn, Logger};
 
 use vmm_core::hdl::{PptdevLimits, VmmHdl};
+use vmm_core::rings::RingsStopped;
 
 /// One physical BAR as the kernel reports it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -46,8 +47,19 @@ pub(crate) trait PptOps: Send + Sync {
         data: u32,
     ) -> Result<()>;
     fn limits(&self) -> Result<PptdevLimits>;
-    fn map_mmio(&self, gpa: u64, hpa: u64, len: u64) -> Result<()>;
-    fn unmap_mmio(&self, gpa: u64, len: u64) -> Result<()>;
+    fn map_mmio(
+        &self,
+        rings: &RingsStopped<'_>,
+        gpa: u64,
+        hpa: u64,
+        len: u64,
+    ) -> Result<()>;
+    fn unmap_mmio(
+        &self,
+        rings: &RingsStopped<'_>,
+        gpa: u64,
+        len: u64,
+    ) -> Result<()>;
     /// `numvec` of 0 tears the vectors down.
     fn setup_msi(&self, addr: u64, data: u64, numvec: i32) -> Result<()>;
 }
@@ -68,7 +80,8 @@ impl KernelPpt {
         // std opens close-on-exec, so a guest-reset re-exec does not
         // inherit the device.
         let ppt = File::options().read(true).write(true).open(path)?;
-        hdl.bind_pptdev(ppt.as_fd())?;
+        hdl.rings()
+            .run_io(|rings| hdl.bind_pptdev(rings, ppt.as_fd()))?;
         Ok(Self { ppt, hdl, log })
     }
 
@@ -79,7 +92,11 @@ impl KernelPpt {
 
 impl Drop for KernelPpt {
     fn drop(&mut self) {
-        if let Err(e) = self.hdl.unbind_pptdev(self.fd()) {
+        let unbound = self
+            .hdl
+            .rings()
+            .run_io(|rings| self.hdl.unbind_pptdev(rings, self.fd()));
+        if let Err(e) = unbound {
             // Nothing else can run here, so the record is the only
             // remedy: the device stays with the VM until it goes.
             warn!(self.log, "passthru: unbind failed, device still held";
@@ -168,14 +185,25 @@ impl PptOps for KernelPpt {
         self.hdl.pptdev_limits(self.fd())
     }
 
-    fn map_mmio(&self, gpa: u64, hpa: u64, len: u64) -> Result<()> {
+    fn map_mmio(
+        &self,
+        rings: &RingsStopped<'_>,
+        gpa: u64,
+        hpa: u64,
+        len: u64,
+    ) -> Result<()> {
         let len = usize::try_from(len).map_err(|_| ErrorKind::InvalidInput)?;
-        self.hdl.map_pptdev_mmio(self.fd(), gpa, hpa, len)
+        self.hdl.map_pptdev_mmio(rings, self.fd(), gpa, hpa, len)
     }
 
-    fn unmap_mmio(&self, gpa: u64, len: u64) -> Result<()> {
+    fn unmap_mmio(
+        &self,
+        rings: &RingsStopped<'_>,
+        gpa: u64,
+        len: u64,
+    ) -> Result<()> {
         let len = usize::try_from(len).map_err(|_| ErrorKind::InvalidInput)?;
-        self.hdl.unmap_pptdev_mmio(self.fd(), gpa, len)
+        self.hdl.unmap_pptdev_mmio(rings, self.fd(), gpa, len)
     }
 
     fn setup_msi(&self, addr: u64, data: u64, numvec: i32) -> Result<()> {

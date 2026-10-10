@@ -3,7 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The notify hook: rings stopped before it changes, started after,
-//! and a guest that moves its BARs in a loop held to a budget.
+//! and a guest that moves its BARs in a loop held to a budget. The
+//! gate itself is in `gate`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -257,46 +258,6 @@ fn a_guest_moving_its_bars_in_a_loop_is_held_to_a_budget() {
         },
         now + Duration::from_secs(1),
     );
-    assert_eq!(
-        hook_steps(&steps),
-        [
-            Step::SetNotifyIop(PORT),
-            Step::SetNotifyMmio {
-                addr: WINDOW,
-                size: 0x1000
-            }
-        ],
-    );
-}
-
-#[test]
-fn a_hook_change_waits_while_an_export_holds_the_rings() {
-    // The export reads indices from the stopped rings. A restart here
-    // would move them under it.
-    let steps = Steps::default();
-    let link = TestLink::new(&steps).live_rings(NET_QUEUE_SIZE);
-    let device = running_device(Arc::new(link));
-    VirtioDevice::pause_rings_for_export(&device).expect("the rings pause");
-    steps.lock().expect("steps lock").clear();
-
-    VirtioDevice::set_notify_addrs(&device, PORT, WINDOW);
-
-    assert_eq!(steps_of(&steps), []);
-}
-
-#[test]
-fn a_change_held_back_by_an_export_lands_when_the_export_lets_go() {
-    // Otherwise the hook stays on an address the guest gave away.
-    let steps = Steps::default();
-    let link = TestLink::new(&steps).live_rings(NET_QUEUE_SIZE);
-    let device = running_device(Arc::new(link));
-    VirtioDevice::pause_rings_for_export(&device).expect("the rings pause");
-    VirtioDevice::set_notify_addrs(&device, PORT, WINDOW);
-    assert_eq!(hook_steps(&steps), []);
-
-    VirtioDevice::resume_rings_after_migration(&device)
-        .expect("the rings resume");
-
     assert_eq!(
         hook_steps(&steps),
         [

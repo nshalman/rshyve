@@ -123,6 +123,12 @@ impl VirtioViona {
         let intr = Arc::clone(&self.interrupt);
         Self::poller_start(&mut inner, intr, log);
 
+        // Under the gate the rings are reset, and the gate kicks them
+        // when it starts them.
+        if inner.stopped.is_some() {
+            return;
+        }
+
         // Re-kick all rings after starting the poll thread. Programming
         // the ring state sets the indices but may not activate the
         // kernel ring worker. A second kick after the poll thread is

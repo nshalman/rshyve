@@ -144,17 +144,40 @@ fn export_vcpu_regs(
     Ok(data)
 }
 
+/// Run a VM-wide vmm-data transfer, which takes the VM write lock, in
+/// the ring gate.
+///
+/// Under the migration's VM pause the rings are held stopped already,
+/// and this stops nothing again.
+fn with_vm_data<T>(
+    hdl: &VmmHdl,
+    class: u16,
+    version: u16,
+    what: &str,
+    xfer: impl FnOnce(bhyve_api::VmmDataOp<'_>) -> bhyve_api::VmmDataResult<T>,
+) -> Result<T, MigrateError> {
+    let fail = |e: String| {
+        MigrateError::VmmData(format!(
+            "{what} class={class} version={version}: {e}"
+        ))
+    };
+    hdl.rings()
+        .run(|rings| {
+            let op = hdl
+                .vm_data_op(rings, class, version)
+                .map_err(|e| fail(e.to_string()))?;
+            xfer(op).map_err(|e| fail(format!("{e:?}")))
+        })
+        .map_err(|e| fail(e.to_string()))?
+}
+
 /// Read a vmm-data class/version as raw bytes (for system devices).
 fn read_class_all(
     hdl: &VmmHdl,
     class: u16,
     version: u16,
 ) -> Result<Vec<u8>, MigrateError> {
-    hdl.data_op(class, version).read_all::<u8>().map_err(|e| {
-        MigrateError::VmmData(format!(
-            "read_all class={class} version={version}: {e:?}"
-        ))
-    })
+    with_vm_data(hdl, class, version, "read_all", |op| op.read_all::<u8>())
 }
 
 /// Read a per-vCPU vmm-data class as raw bytes.
@@ -164,14 +187,15 @@ fn read_class_vcpu(
     version: u16,
     vcpuid: i32,
 ) -> Result<Vec<u8>, MigrateError> {
-    hdl.data_op(class, version)
-        .for_vcpu(vcpuid)
-        .read_all::<u8>()
-        .map_err(|e| {
-            MigrateError::VmmData(format!(
-            "read_vcpu class={class} version={version} vcpu={vcpuid}: {e:?}"
+    let fail = |e: String| {
+        MigrateError::VmmData(format!(
+            "read_vcpu class={class} version={version} vcpu={vcpuid}: {e}"
         ))
-        })
+    };
+    hdl.vcpu_data_op(vcpuid, class, version)
+        .map_err(|e| fail(e.to_string()))?
+        .read_all::<u8>()
+        .map_err(|e| fail(format!("{e:?}")))
 }
 
 /// Write raw bytes to a vmm-data class/version.
@@ -181,11 +205,7 @@ fn write_class_all(
     version: u16,
     data: &[u8],
 ) -> Result<(), MigrateError> {
-    hdl.data_op(class, version).write_many(data).map_err(|e| {
-        MigrateError::VmmData(format!(
-            "write class={class} version={version}: {e:?}"
-        ))
-    })
+    with_vm_data(hdl, class, version, "write", |op| op.write_many(data))
 }
 
 /// The kernel writes that a state import performs.
@@ -239,16 +259,20 @@ impl ImportSink for KernelSink<'_> {
         vcpuid: Option<i32>,
         data: &[u8],
     ) -> Result<(), MigrateError> {
-        let op = self.hdl.data_op(class, version);
-        let op = match vcpuid {
-            Some(id) => op.for_vcpu(id),
-            None => op,
+        let Some(id) = vcpuid else {
+            return write_class_all(self.hdl, class, version, data)
+                .map_err(|e| MigrateError::State(e.to_string()));
         };
-        op.write_many(data).map_err(|e| {
+        let fail = |e: String| {
             MigrateError::State(format!(
-                "write class={class} version={version} vcpu={vcpuid:?}: {e:?}"
+                "write class={class} version={version} vcpu={id}: {e}"
             ))
-        })
+        };
+        self.hdl
+            .vcpu_data_op(id, class, version)
+            .map_err(|e| fail(e.to_string()))?
+            .write_many(data)
+            .map_err(|e| fail(format!("{e:?}")))
     }
 
     fn write_reg(
@@ -309,13 +333,14 @@ fn read_field_entries(
     vcpuid: i32,
     what: &str,
 ) -> Result<Vec<u8>, MigrateError> {
+    let fail = |e: String| {
+        MigrateError::State(format!("export {what} vcpu={vcpuid}: {e}"))
+    };
     let entries = hdl
-        .data_op(class, 1)
-        .for_vcpu(vcpuid)
+        .vcpu_data_op(vcpuid, class, 1)
+        .map_err(|e| fail(e.to_string()))?
         .read_all::<vdi_field_entry_v1>()
-        .map_err(|e| {
-            MigrateError::State(format!("export {what} vcpu={vcpuid}: {e:?}"))
-        })?;
+        .map_err(|e| fail(format!("{e:?}")))?;
     let mut buf =
         Vec::with_capacity(entries.len() * size_of::<vdi_field_entry_v1>());
     for entry in &entries {

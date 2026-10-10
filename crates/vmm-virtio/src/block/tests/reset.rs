@@ -680,7 +680,9 @@ fn an_interrupt_is_raised_outside_the_guest_access_section() {
         read_only: false,
         nodelete: true,
     };
-    let worker = thread::spawn(move || blk_io_worker(rx, worker_disk(file), limits, ctx));
+    let worker = thread::spawn(move || {
+        blk_io_worker(rx, worker_disk(file), limits, ctx)
+    });
     wait_for("the worker never raised the interrupt", || {
         raising.load(Ordering::Acquire)
     });

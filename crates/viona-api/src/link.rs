@@ -151,7 +151,7 @@ pub trait LinkOps: Send + Sync {
     /// The kernel then takes the kick itself, and the vCPU does not
     /// leave to userspace for it. The call takes the VM write lock, so
     /// it needs `rings` to prove no ring worker is alive.
-    fn set_notify_iop(&self, rings: &Quiesced<'_>, port: u16) -> Result<()>;
+    fn set_notify_iop(&self, rings: &Quiesced, port: u16) -> Result<()>;
 
     /// Name the memory window the guest writes to kick a ring. An
     /// address of 0 removes the window.
@@ -159,7 +159,7 @@ pub trait LinkOps: Send + Sync {
     /// The modern transport counterpart of [`Self::set_notify_iop`].
     fn set_notify_mmio(
         &self,
-        rings: &Quiesced<'_>,
+        rings: &Quiesced,
         addr: u64,
         size: u32,
     ) -> Result<()>;
@@ -320,7 +320,7 @@ impl LinkOps for VionaFd {
         }
     }
 
-    fn set_notify_iop(&self, rings: &Quiesced<'_>, port: u16) -> Result<()> {
+    fn set_notify_iop(&self, rings: &Quiesced, port: u16) -> Result<()> {
         quiesced_here(rings, self)?;
         self.hook_ioctl_usize(VNA_IOC_SET_NOTIFY_IOP, port as usize)?;
         Ok(())
@@ -328,7 +328,7 @@ impl LinkOps for VionaFd {
 
     fn set_notify_mmio(
         &self,
-        rings: &Quiesced<'_>,
+        rings: &Quiesced,
         addr: u64,
         size: u32,
     ) -> Result<()> {
@@ -366,7 +366,7 @@ impl LinkOps for VionaFd {
 }
 
 /// Refuse a proof made for another link.
-fn quiesced_here(rings: &Quiesced<'_>, link: &VionaFd) -> Result<()> {
+fn quiesced_here(rings: &Quiesced, link: &VionaFd) -> Result<()> {
     if rings.covers(link) {
         return Ok(());
     }

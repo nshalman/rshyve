@@ -175,9 +175,13 @@ fn anonymous_devmem_segment_is_guestless() {
     let segment = DevMemSeg::new_anon(0x1000).unwrap();
     assert_eq!(segment.len(), 0x1000);
     assert_eq!(segment.mapped_gpa(), None);
-    segment.map_at(0x8000_0000).unwrap();
-    assert_eq!(segment.mapped_gpa(), None);
-    segment.unmap().unwrap();
+    let gate = crate::rings::RingGate::new();
+    gate.run(|rings| {
+        segment.map_at(rings, 0x8000_0000).unwrap();
+        assert_eq!(segment.mapped_gpa(), None);
+        segment.unmap(rings).unwrap();
+    })
+    .unwrap();
     assert_eq!(segment.mapped_gpa(), None);
 
     let data = [0x12, 0x34, 0x56, 0x78];
