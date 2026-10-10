@@ -43,12 +43,13 @@ use crate::limits::{BATCH_SIZE, ZSTD_LEVEL};
 use crate::pages::{
     are_contiguous, build_contiguous_gpas, page_buffer_len, read_pages,
 };
-use crate::protocol::{payload_refusal, PageIter, PAGE_SIZE, SOURCE_OFFER};
+use crate::protocol::{PageIter, PAGE_SIZE, SOURCE_OFFER};
 use crate::state;
 use crate::wait::{unless_cancelled, Abandoned};
 use crate::wire::{
     cancel_or, not_cancelled, set_phase, Chan, Deadlines, Transport,
 };
+use crate::xsave::XsaveLayout;
 use crate::MigrationPhase;
 use crate::MigrationStatus;
 use crate::StopGate;
@@ -237,6 +238,7 @@ fn run_inner<S: Transport>(
 
     let mut devices = config.devices.clone();
     devices.sort();
+    let xsave = XsaveLayout::local(hdl)?;
     chan.send_uncommitted(
         gate,
         &Message::serialized(&MigrationPreamble {
@@ -244,6 +246,7 @@ fn run_inner<S: Transport>(
             mem_size: config.mem_size,
             devices,
             cpu_features: Some(cpu::local_features(config.cpu_baseline)),
+            xsave: xsave.clone(),
         })?,
     )?;
     chan.expect_okay()?;
@@ -314,12 +317,10 @@ fn run_inner<S: Transport>(
 
     // ── DeviceState ──
     set_phase(status, MigrationPhase::DeviceState);
-    let mut dev_state = state::export_device_state(hdl, config.num_cpus, log)?;
+    let mut dev_state =
+        state::export_device_state(hdl, config.num_cpus, &xsave, log)?;
     dev_state.emulated = device_export_fn()
         .map_err(|e| MigrateError::State(format!("device export: {e}")))?;
-    if let Some(why) = payload_refusal(&sel.protocol, &dev_state.emulated) {
-        return Err(MigrateError::State(why));
-    }
     dev_state.hyperv = hyperv;
     slog::info!(log, "exporting device state";
         "devices" => dev_state.emulated.len());

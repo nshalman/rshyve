@@ -206,6 +206,10 @@ pub struct NvmeMigrateState {
     /// `None` from a v3 or older source, which had only host files.
     #[serde(default)]
     pub backend: Option<NvmeMigrateBackend>,
+    /// Asynchronous Event Requests held without a completion. The guest
+    /// counts them against AERL, so a destination that forgot them
+    /// would take one more than the guest believes it may send.
+    pub aers_held: u8,
 }
 
 /// The I/O SQs and CQs Set Features granted.

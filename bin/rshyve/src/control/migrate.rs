@@ -196,7 +196,15 @@ pub(crate) fn device_blockers(
         .list()
         .into_iter()
         .filter_map(|slot| {
-            let why = slot.lifecycle?.migration_blocker()?;
+            let why = match (&slot.pci, &slot.lifecycle) {
+                // passthru: the state is in host hardware, and its DMA
+                // writes are not dirty-tracked.
+                (Some(_), None) => {
+                    "a PCI device with no lifecycle carries no state".into()
+                }
+                (_, Some(lifecycle)) => lifecycle.migration_blocker()?,
+                (None, None) => return None,
+            };
             Some(format!("{}: {why}", slot.id))
         })
         .collect();

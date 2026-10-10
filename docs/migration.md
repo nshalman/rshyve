@@ -12,24 +12,32 @@ One driver serves both transports: a Unix socket inside a bhyve zone,
 where `/dev/poll` is unavailable and the GZ agent bridges to the peer,
 and a TCP socket elsewhere.
 
-The protocol identifier is `vmm-migrate-ron/4`. A source offers v4 and
-v3, and a destination also takes `vmm-migrate-ron/3` and
-`vmm-migrate-ron/2`, whose payloads are strict subsets. A v3 destination
-skips the v4 store field and assumes a host file, so a source that lands
-on v3 refuses any disk on another store before it sends the device
-state. A file-backed VM can therefore still move to a host that predates
-v4. v4 names the store under each NVMe namespace (a host file, or a
-MantaBlock volume by UUID), so a destination on another store refuses
-the payload, and an unknown store does not decode; a v3 or v2 payload
-names none, which means a host file. v3 adds the NVMe completions held
-for a full guest completion queue, which a v2 source dropped, and the
-NVMe namespace shape, of which a v2 source had one (512-byte blocks,
-volatile write cache). A v2 payload restores with none held, onto that
-shape only. Anything older is refused, because a peer that reads a field
-as something else resumes a guest on state that is not its own. v1 put
-device identity on the wire; in v0 every virtio queue group was tagged
-slot 0 and the destination took the first group whose length matched its
-own queue count.
+The protocol identifier is `vmm-migrate-ron/6`. Each end speaks only
+that version, and a peer on any other version is refused at
+negotiation. v6 carries each vCPU's FPU and XSAVE area with the source
+host's XSAVE layout, and the count of NVMe Asynchronous Event Requests a
+controller holds. A v4 peer carried no FPU state, so the guest resumed
+on the destination's FPU registers (OSF-2). v4 named the store under
+each NVMe namespace, v3 added held NVMe completions and the namespace
+shape, v2 the CQ interrupt-enable bit, and v1 device identity. v5 is
+reserved for virtio-gpu state (PR #15).
+
+### FPU and XSAVE state
+
+The preamble carries the source host's XSAVE layout from
+`VM_DESC_FPU_AREA`: the area size and the size and offset of each
+component the host enabled. Before it takes a page, the destination
+refuses the source if a component the guest was offered in XCR0 is not
+on this host at the same size and offset. `allow_cpu_feature_mismatch`
+does not change this.
+
+Each vCPU's area travels as `VM_GET_FPU` wrote it. The destination
+checks the length against the source layout, refuses a compacted area,
+reserved header bits, and components the source does not have, then
+copies each component to its offset in an area of the local size. A
+component the guest was never offered and this host cannot hold goes
+back to its initial state. All vCPUs are checked before any state is
+written, then `VM_SET_FPU` loads each area after the registers.
 
 ```
 Source                          Destination
@@ -271,9 +279,12 @@ error anywhere:
 | `virtio-fs` | The FUSE session and every open handle in it |
 | `virtio-vsock` | Every open connection |
 | `virtio-console` | Every open connection |
+| `passthru` | Host hardware state; DMA writes are not dirty-tracked |
 
 The list lives in `UNMIGRATABLE` in `bin/rshyve/src/control/migrate.rs`.
-Grow it there and here together.
+Grow it there and here together. A `passthru` device has a PCI handle
+and no lifecycle, and `device_blockers` refuses any such device on the
+source and on the destination.
 
 These are carried as plain guest RAM only, and their device state is
 still lost. They are not refused, because the loss is recoverable by the
@@ -284,7 +295,6 @@ guest and refusing would block every VM:
 - i8042 / PS-2: controller and keyboard state.
 - `fw_cfg`: the selector, which only firmware reads.
 - ACPI PM1 and GPE: the event and enable registers.
-- FPU and XSAVE state. See OSF-2.
 
 A VM that hot-added a CPU, memory, or a device since boot is also
 refused: the destination is built from the boot command line and would

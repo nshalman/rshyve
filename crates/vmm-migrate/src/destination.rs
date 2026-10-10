@@ -30,6 +30,7 @@ use crate::state;
 use crate::wire::{
     cancel_or, not_cancelled, set_phase, unexpected, Chan, Deadlines, Transport,
 };
+use crate::xsave::{XsaveLayout, XsavePlan};
 use crate::MigrationPhase;
 use crate::MigrationStatus;
 use crate::StopGate;
@@ -133,10 +134,16 @@ fn run_inner<S: Transport>(
     )?;
 
     let preamble: MigrationPreamble = chan.expect_serialized()?;
-    if let Err(err) = check_preamble(&preamble, config, log) {
-        chan.report_failure(&err, log);
-        return Err(err);
-    }
+    let checked = XsaveLayout::local(hdl).and_then(|local| {
+        check_preamble(&preamble, config, &local, log).map(|()| local)
+    });
+    let local_xsave = match checked {
+        Ok(local) => local,
+        Err(err) => {
+            chan.report_failure(&err, log);
+            return Err(err);
+        }
+    };
     chan.send_uncommitted(gate, &Message::Okay)?;
 
     // ── Pre-pause RAM passes ──
@@ -169,9 +176,14 @@ fn run_inner<S: Transport>(
         chan.report_failure(&e, log);
         return Err(e);
     }
-    if let Err(e) =
-        state::import_device_state(hdl, &dev_state, config.num_cpus, log)
-    {
+    let xsave = xsave_plan(&preamble, &local_xsave);
+    if let Err(e) = state::import_device_state(
+        hdl,
+        &dev_state,
+        config.num_cpus,
+        &xsave,
+        log,
+    ) {
         chan.report_failure(&e, log);
         return Err(e);
     }
@@ -220,6 +232,7 @@ fn take_over<S: Transport>(
 fn check_preamble(
     preamble: &MigrationPreamble,
     config: &DestConfig,
+    local_xsave: &XsaveLayout,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     // Both sides report their boot topology, so a CPU or memory the
@@ -244,6 +257,11 @@ fn check_preamble(
             "source sent no CPU feature table".into(),
         ));
     };
+    // Not covered by allow_cpu_feature_mismatch: a register this host
+    // has no place for cannot be put back at all.
+    xsave_plan(preamble, local_xsave)
+        .check()
+        .map_err(MigrateError::PreambleMismatch)?;
     let gap = cpu::missing(src, &cpu::local_features(config.cpu_baseline));
     if gap.is_empty() {
         slog::info!(log, "CPU feature check passed");
@@ -260,6 +278,22 @@ fn check_preamble(
          send migrate-dest with allow_cpu_feature_mismatch to accept \
          the risk",
     )))
+}
+
+/// The XSAVE components the guest can use are the ones its source
+/// offered it in XCR0.
+fn xsave_plan<'a>(
+    preamble: &'a MigrationPreamble,
+    local: &'a XsaveLayout,
+) -> XsavePlan<'a> {
+    XsavePlan {
+        source: &preamble.xsave,
+        local,
+        guest: preamble
+            .cpu_features
+            .as_ref()
+            .map_or(0, |f| u64::from(f.xcr0)),
+    }
 }
 
 /// The device set the source carries must be the set this VM has.
