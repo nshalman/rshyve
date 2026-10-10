@@ -59,13 +59,23 @@ where
     }
     let home = resolved_parent(path)?;
     let first = bind(path, &home)?;
+    // Checked here, before the caller announces the path: a client that
+    // connected first would take the probe's place.
+    let first_bound = ours(path, &first).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "{} does not reach the socket just bound",
+            path.display()
+        ))
+    })?;
     let phase = Arc::new(phase);
     let shutdown = Arc::new(AtomicBool::new(false));
     let stop = Arc::clone(&shutdown);
     let at = path.to_path_buf();
     let handle = thread::Builder::new()
         .name("import-status".into())
-        .spawn(move || supervise(&at, &home, first, &stop, &phase, &log))?;
+        .spawn(move || {
+            supervise(&at, &home, (first, first_bound), &stop, &phase, &log)
+        })?;
     Ok(ControlListener::from_parts(
         path.to_path_buf(),
         shutdown,
@@ -139,14 +149,16 @@ fn named(path: &Path) -> Option<(u64, u64)> {
 fn supervise<P>(
     path: &Path,
     home: &Path,
-    first: UnixListener,
+    first: (UnixListener, (u64, u64)),
     stop: &AtomicBool,
     phase: &Arc<P>,
     log: &Logger,
 ) where
     P: Fn() -> MigrationPhase + Send + Sync + 'static,
 {
+    let (first, first_bound) = first;
     let mut next = Some(first);
+    let mut checked = Some(first_bound);
     while !stop.load(Ordering::Acquire) {
         let listener = match next.take() {
             Some(l) => l,
@@ -165,7 +177,8 @@ fn supervise<P>(
             },
         };
         // Unlinked or swapped before it could be checked: bind again.
-        let Some(bound) = ours(path, &listener) else {
+        let Some(bound) = checked.take().or_else(|| ours(path, &listener))
+        else {
             continue;
         };
         let round = Arc::new(AtomicBool::new(false));
