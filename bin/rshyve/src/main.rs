@@ -116,21 +116,29 @@ fn migrate_devices(
         .collect()
 }
 
-/// The fault-injection device, when a lab flag asks for it.
+/// The fault-injection device, when a lab flag asks for it. Only a
+/// build with the `migrate-test-faults` feature has it; a release build
+/// refuses the flags.
 fn test_fault_device(
     cli: &Cli,
     log: &Logger,
-) -> Option<Arc<dyn vmm_devices::Lifecycle>> {
+) -> anyhow::Result<Option<Arc<dyn vmm_devices::Lifecycle>>> {
     let (exports, imports) =
         (cli.migrate_test_fail_exports, cli.migrate_test_fail_imports);
     if exports.is_none() && imports.is_none() {
-        return None;
+        return Ok(None);
     }
-    Some(vmm_devices::testdev::MigrateFault::new(
+    if !cfg!(any(test, feature = "migrate-test-faults")) {
+        anyhow::bail!(
+            "--migrate-test-fail-* needs a build with the \
+             migrate-test-faults feature"
+        );
+    }
+    Ok(Some(vmm_devices::testdev::MigrateFault::new(
         exports.unwrap_or(0),
         imports.unwrap_or(0),
         log,
-    ))
+    )))
 }
 
 /// The spec check in pcidev already refused these. This one reads the
@@ -495,7 +503,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         vmm_machine::register_platform(&registry, id, device)
             .with_context(|| format!("failed to register {id}"))?;
     }
-    if let Some(fault) = test_fault_device(&cli, log) {
+    if let Some(fault) = test_fault_device(&cli, log)? {
         vmm_machine::register_platform(
             &registry,
             vmm_devices::testdev::ID,
@@ -841,18 +849,24 @@ mod tests {
     #[test]
     fn only_a_fault_flag_adds_the_fault_device() {
         let log = Logger::root(slog::Discard, o!());
-        assert!(test_fault_device(&cli_from(&["rshyve", "vm"]), &log).is_none());
+        assert!(test_fault_device(&cli_from(&["rshyve", "vm"]), &log)
+            .expect("no flag")
+            .is_none());
         for flag in
             ["--migrate-test-fail-exports", "--migrate-test-fail-imports"]
         {
             let cli = cli_from(&["rshyve", flag, "0", "vm"]);
-            let dev = test_fault_device(&cli, &log).expect(flag);
+            let dev = test_fault_device(&cli, &log)
+                .expect(flag)
+                .expect(flag);
             assert_eq!(dev.type_name(), vmm_devices::testdev::KIND);
             assert!(dev.migrates_by_id());
         }
         let cli =
             cli_from(&["rshyve", "--migrate-test-fail-exports", "1", "vm"]);
-        let dev = test_fault_device(&cli, &log).expect("device");
+        let dev = test_fault_device(&cli, &log)
+            .expect("device")
+            .expect("device");
         assert!(dev.export_migrate_state().is_err());
         assert!(dev.export_migrate_state().is_ok());
     }
