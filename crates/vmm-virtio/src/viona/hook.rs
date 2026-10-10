@@ -183,6 +183,15 @@ impl VirtioViona {
         if inner.halted {
             return;
         }
+        // The guest moved its BARs again while the gate stopped the
+        // rings. The planned address is stale, so the hook comes off
+        // instead; a later sync puts it on what the guest decodes now.
+        let target = if target != HookAddrs::NONE && target != inner.hook.want
+        {
+            HookAddrs::NONE
+        } else {
+            target
+        };
         Self::send_hook(inner, target);
     }
 

@@ -116,9 +116,20 @@ pub fn quiesce(
         if let Err(e) = retry(|| link.ring_pause(ring)) {
             return Err(fail(&mut q, "pause", e, false));
         }
-        let state = match link.ring_get_state(ring) {
-            Ok(state) => state,
-            Err(e) => return Err(fail(&mut q, "get state", e, false)),
+        // A signal must not end the quiesce with the ring paused: the
+        // read is tried again like the pause and the reset are.
+        let mut state = None;
+        let read = retry(|| {
+            state = Some(link.ring_get_state(ring)?);
+            Ok(())
+        });
+        let state = match (read, state) {
+            (Ok(()), Some(state)) => state,
+            (Err(e), _) => return Err(fail(&mut q, "get state", e, false)),
+            (Ok(()), None) => {
+                let e = Error::other("no state read");
+                return Err(fail(&mut q, "get state", e, false));
+            }
         };
         if let Err(e) = retry(|| link.ring_reset(ring)) {
             return Err(fail(&mut q, "reset", e, true));

@@ -201,6 +201,20 @@ fn a_refused_state_read_kicks_the_paused_ring() {
 }
 
 #[test]
+fn an_interrupted_state_read_is_tried_again() {
+    let link = Arc::new(Fake::new(256).refusing(
+        GetState(0),
+        ErrorKind::Interrupted,
+        2,
+    ));
+
+    let q = quiesce(link.clone()).expect("the read got through");
+
+    assert!(q.saved(0).is_some());
+    drop(q);
+}
+
+#[test]
 fn a_refused_reset_loses_that_ring() {
     // Its worker may still be alive, so it cannot be restarted from a
     // state write, and the hook must not change.
