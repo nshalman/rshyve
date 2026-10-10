@@ -190,6 +190,9 @@ pub struct VmController {
     /// What `migrate-status` reports for the ring disks, once a
     /// migration moved them.
     rings: Mutex<Option<&'static str>>,
+    /// One `migrate-resume-source` at a time: a second one that found
+    /// the guest already running would detach its disks.
+    resuming_source: Mutex<()>,
     log: Logger,
 }
 
@@ -255,6 +258,7 @@ impl VmController {
             host_local_state: migration.host_local_state,
             allow_unproven: AtomicBool::new(false),
             rings: Mutex::new(None),
+            resuming_source: Mutex::new(()),
             log,
         })
     }

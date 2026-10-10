@@ -12,7 +12,7 @@
 use std::fmt;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -211,6 +211,9 @@ pub struct Handover<J: Job> {
     shape: RingShape,
     sink: Arc<dyn Sink<J::Id>>,
     ring: RwLock<Option<Arc<Ring<J>>>>,
+    /// One attach at a time, so two never both connect and race for
+    /// the slot.
+    attaching: Mutex<()>,
     /// The engine of the last attachment agreed to [`crate::MIGRATE_V1`].
     migrate_v1: AtomicBool,
     halted: AtomicBool,
@@ -228,6 +231,7 @@ impl<J: Job> Handover<J> {
             shape,
             sink,
             ring: RwLock::new(Some(ring)),
+            attaching: Mutex::new(()),
             migrate_v1: AtomicBool::new(migrate_v1),
             halted: AtomicBool::new(false),
         })
@@ -251,6 +255,7 @@ impl<J: Job> Handover<J> {
             shape,
             sink,
             ring: RwLock::new(None),
+            attaching: Mutex::new(()),
             migrate_v1: AtomicBool::new(false),
             halted: AtomicBool::new(false),
         })
@@ -309,6 +314,7 @@ impl<J: Job> Handover<J> {
     /// destination the engine opens the volume's socket only after the
     /// orchestrator moved the volume. The grant must have this shape.
     pub fn attach(&self, how: &BackingAttach) -> Result<(), String> {
+        let _one = self.attaching.lock().unwrap_or_else(|e| e.into_inner());
         if self.is_attached() {
             return Ok(());
         }
@@ -366,10 +372,19 @@ impl<J: Job> Handover<J> {
         let generation = c.att.generation;
         let ring = c.start(Arc::clone(&self.sink));
         let mut slot = self.ring.write().unwrap_or_else(|e| e.into_inner());
+        // A ring in the slot is never replaced: dropped under the lock,
+        // its completions would call back into a controller that
+        // submits under the same lock. Each refusal halts the new ring
+        // outside it.
         if self.halted.load(Ordering::Acquire) {
             drop(slot);
             ring.halt();
             return Err("the disk is halted".into());
+        }
+        if slot.is_some() {
+            drop(slot);
+            ring.halt();
+            return Err("a ring is attached already".into());
         }
         *slot = Some(ring);
         drop(slot);
