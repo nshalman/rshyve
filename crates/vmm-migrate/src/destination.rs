@@ -174,7 +174,11 @@ fn run_inner<S: Transport>(
     let preamble: MigrationPreamble = chan.expect_serialized()?;
     let checked = XsaveLayout::local(hdl).and_then(|local| {
         check_preamble(&preamble, config, &local, log)?;
-        check_enlightenments(&preamble, config.hyperv, crate::cpu::host_is_amd())?;
+        check_enlightenments(
+            &preamble,
+            config.hyperv,
+            crate::cpu::host_is_amd(),
+        )?;
         let skew = check_clock(&preamble, protocol, log)?;
         Ok((local, skew))
     });
@@ -351,8 +355,7 @@ fn check_enlightenments(
     }
     if preamble.pmu_amd == Some(true) && !amd_host {
         return Err(MigrateError::PreambleMismatch(
-            "the source carries AMD PMU state, and this host is not AMD"
-                .into(),
+            "the source carries AMD PMU state, and this host is not AMD".into(),
         ));
     }
     Ok(())

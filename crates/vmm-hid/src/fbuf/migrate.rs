@@ -311,7 +311,9 @@ mod tests {
         // Something else holds the address, so BAR0 cannot register.
         let squatter: std::sync::Arc<vmm_core::mmio::MmioFn> =
             std::sync::Arc::new(|_: usize, _: vmm_core::common::RWOp<'_>| {});
-        dst.bus_mmio.register(BAR0, 0x1000, squatter).expect("squat");
+        dst.bus_mmio
+            .register(BAR0, 0x1000, squatter)
+            .expect("squat");
         let error = dst.restore_state(&exported).expect_err("dark BAR0");
         assert!(error.to_string().contains("does not decode"), "{error}");
         assert_eq!((dst.width(), dst.height()), (1024, 768));

@@ -856,9 +856,7 @@ mod tests {
             ["--migrate-test-fail-exports", "--migrate-test-fail-imports"]
         {
             let cli = cli_from(&["rshyve", flag, "0", "vm"]);
-            let dev = test_fault_device(&cli, &log)
-                .expect(flag)
-                .expect(flag);
+            let dev = test_fault_device(&cli, &log).expect(flag).expect(flag);
             assert_eq!(dev.type_name(), vmm_devices::testdev::KIND);
             assert!(dev.migrates_by_id());
         }

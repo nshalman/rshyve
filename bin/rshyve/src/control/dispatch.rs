@@ -47,8 +47,11 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             r.memory_bytes = Some(ctrl.mem_size);
             r.uptime_secs = Some(ctrl.start_time.elapsed().as_secs());
             let rings = ctrl.hdl.rings();
-            r.data =
-                status_data(ctrl.release_stuck(), rings.tainted(), rings.leaks());
+            r.data = status_data(
+                ctrl.release_stuck(),
+                rings.tainted(),
+                rings.leaks(),
+            );
             r
         }
 
@@ -214,7 +217,11 @@ fn resume_step(
 ) -> Result<(), StepFailed<String>> {
     // The disks attached before the change began; one that went away
     // since keeps the guest paused.
-    if ctrl.named_devices().iter().any(|d| !d.device.backing_attached()) {
+    if ctrl
+        .named_devices()
+        .iter()
+        .any(|d| !d.device.backing_attached())
+    {
         return Err(StepFailed::Undone(
             "a disk is not attached; resume again".to_string(),
         ));

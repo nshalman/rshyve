@@ -11,9 +11,9 @@
 //! attach waits for a home that never comes and the import fails.
 
 use std::io::BufReader;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -51,8 +51,7 @@ pub fn spawn_import_status<P>(
 where
     P: Fn() -> MigrationPhase + Send + Sync + 'static,
 {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
-    {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)

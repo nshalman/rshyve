@@ -314,8 +314,11 @@ mod tests {
     #[test]
     fn an_attach_past_the_source_wait_is_refused() {
         let over = MAX_ATTACH_TIMEOUT_MS + 1;
-        parse(&body(&[], &format!(r#"{{"ring_attach_timeout_ms":{over}}}"#)))
-            .expect_err("over the source's wait");
+        parse(&body(
+            &[],
+            &format!(r#"{{"ring_attach_timeout_ms":{over}}}"#),
+        ))
+        .expect_err("over the source's wait");
         let flag = over.to_string();
         let mut c = cli(&["--migrate-ring-attach-timeout-ms", &flag]);
         apply(&mut c).expect_err("the flag is checked too");

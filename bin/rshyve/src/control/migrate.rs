@@ -798,14 +798,13 @@ fn connect_unix_patient(
     loop {
         // Bounded too: a listener with a full backlog holds a connect
         // that has no deadline of its own.
-        let connected = vmm_migrate::connect::unix_until(path, until, || {
-            run.cancelled()
-        })
-        .map_err(|e| e.to_string())
-        .and_then(|r| r.map_err(|e| format!("{}: {e}", path.display())))
-        .and_then(|stream| {
-            shut_on_stop(run, stream, log).map_err(|e| e.to_string())
-        });
+        let connected =
+            vmm_migrate::connect::unix_until(path, until, || run.cancelled())
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.map_err(|e| format!("{}: {e}", path.display())))
+                .and_then(|stream| {
+                    shut_on_stop(run, stream, log).map_err(|e| e.to_string())
+                });
         match connected {
             Ok(stream) => return Ok(stream),
             Err(_) if run.cancelled() => {
