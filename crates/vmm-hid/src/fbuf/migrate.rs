@@ -191,11 +191,7 @@ mod tests {
     fn program(dev: &Framebuffer) {
         dev.cfg_write(0x10, 4, BAR0 as u32);
         dev.cfg_write(0x14, 4, BAR1 as u32);
-        dev.cfg_write(
-            0x04,
-            2,
-            u32::from(RegCmd::MMIO_EN.bits()),
-        );
+        dev.cfg_write(0x04, 2, u32::from(RegCmd::MMIO_EN.bits()));
     }
 
     fn ron_round_trip(state: &DeviceMigrateState) -> DeviceMigrateState {

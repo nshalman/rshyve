@@ -174,11 +174,7 @@ fn run_inner<S: Transport>(
     let preamble: MigrationPreamble = chan.expect_serialized()?;
     let checked = XsaveLayout::local(hdl).and_then(|local| {
         check_preamble(&preamble, config, &local, log)?;
-        check_enlightenments(
-            &preamble,
-            config.hyperv,
-            cpu::host_is_amd(),
-        )?;
+        check_enlightenments(&preamble, config.hyperv, cpu::host_is_amd())?;
         let skew = check_clock(&preamble, protocol, log)?;
         Ok((local, skew))
     });

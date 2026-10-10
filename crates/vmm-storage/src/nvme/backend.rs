@@ -341,9 +341,7 @@ pub trait AsyncBackend: Send + Sync + 'static {
 /// Fails when the backend cannot start, for example a worker thread
 /// that will not spawn.
 pub type BackendFactory = Box<
-    dyn FnOnce(
-            Arc<dyn CompletionSink>,
-        ) -> io::Result<Arc<dyn AsyncBackend>>
+    dyn FnOnce(Arc<dyn CompletionSink>) -> io::Result<Arc<dyn AsyncBackend>>
         + Send,
 >;
 
