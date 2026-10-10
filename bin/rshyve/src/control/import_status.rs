@@ -106,7 +106,10 @@ fn supervise<P>(
                 }
             },
         };
-        let bound = named(path);
+        // Unlinked again before it could be read: bind once more.
+        let Some(bound) = named(path) else {
+            continue;
+        };
         let round = Arc::new(AtomicBool::new(false));
         let serving = Arc::clone(&round);
         let answer = Arc::clone(phase);
@@ -130,7 +133,7 @@ fn supervise<P>(
                 continue;
             }
         };
-        while !stop.load(Ordering::Acquire) && named(path) == bound {
+        while !stop.load(Ordering::Acquire) && named(path) == Some(bound) {
             thread::sleep(WATCH_EVERY);
         }
         round.store(true, Ordering::Release);
