@@ -23,6 +23,12 @@ use super::{RingState, VirtioViona, NET_NUM_QUEUES};
 const GATE_WAIT: Duration = Duration::from_secs(2);
 const GATE_STEP: Duration = Duration::from_millis(20);
 
+/// Links left in the kernel. Held for the life of the process: the
+/// last close of the descriptor runs the same delete (`viona_main.c`,
+/// `viona_close`), with no gate around it.
+static LEAKED: std::sync::Mutex<Vec<std::sync::Arc<dyn LinkOps>>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// The interrupt poll thread, while one is running.
 pub(super) struct Poller {
     /// Write end of the pipe that stops the thread.
@@ -132,7 +138,17 @@ impl VirtioViona {
         stop_poller(poller, &log);
 
         let rc = if hooked {
-            self.delete_in_gate(link.as_ref(), &log)
+            let rc = self.delete_in_gate(link.as_ref(), &log);
+            if rc
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::ResourceBusy)
+            {
+                LEAKED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(std::sync::Arc::clone(&link));
+            }
+            rc
         } else {
             halt_link(link.as_ref(), &log)
         };

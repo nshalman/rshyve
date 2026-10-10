@@ -133,8 +133,17 @@ pub(super) enum StopOne {
 /// reset is tried whatever the pause did, because only the reset ends
 /// the worker.
 pub(super) fn stop_one(link: &dyn LinkOps, ring: u16) -> StopOne {
+    let mut state = None;
     let read = retry(|| link.ring_pause(ring))
-        .and_then(|()| link.ring_get_state(ring));
+        .and_then(|()| {
+            retry(|| {
+                state = Some(link.ring_get_state(ring)?);
+                Ok(())
+            })
+        })
+        .and_then(|()| {
+            state.ok_or_else(|| std::io::Error::other("no state read"))
+        });
     if let Err(e) = retry(|| link.ring_reset(ring)) {
         return StopOne::Escaped(e);
     }
