@@ -39,6 +39,7 @@
 
 mod dispatch;
 mod handover;
+mod import_status;
 mod listener;
 mod migrate;
 mod protocol;
@@ -81,6 +82,7 @@ use vmm_machine::{DeviceRegistry, HotplugEngines, SUSPEND_SOURCE_VMM};
 
 use crate::host_state::HostLocalState;
 
+pub use import_status::spawn_import_status;
 pub use listener::{spawn_control_thread, ControlListener};
 pub(crate) use migrate::device_blockers;
 use run_state::{LeaseOwner, StepFailed, StopFailure};

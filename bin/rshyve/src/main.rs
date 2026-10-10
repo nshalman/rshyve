@@ -5,7 +5,7 @@
 //! vmm - New Rust-based bhyve VMM with live migration support.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
@@ -151,6 +151,7 @@ fn refuse_unmigratable_devices(
 fn run_migration_destination(
     machine: &Machine,
     listen_addr: &str,
+    control_socket: Option<&Path>,
     attach_budget: std::time::Duration,
     allow_unproven: bool,
     num_cpus: u32,
@@ -194,6 +195,10 @@ fn run_migration_destination(
     let for_resume: Vec<Arc<dyn vmm_devices::Lifecycle>> =
         registry.lifecycle_devices();
     let for_attach = for_resume.clone();
+    // Set before the attach failure returns, so the import status stops
+    // saying the import holds the guest before this process exits.
+    let attach_gave_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gave_up = Arc::clone(&attach_gave_up);
     let (pause_vm, resume_vm) = vmm_migrate::hdl_pause_hooks(machine.hdl());
     let hooks = vmm_migrate::destination::DestHooks {
         restore: Box::new(move |bdf, state| {
@@ -218,8 +223,10 @@ fn run_migration_destination(
                 allow_unproven,
             };
             for dev in for_attach.iter().filter(|d| !d.backing_attached()) {
-                dev.attach_backing(&how)
-                    .map_err(|e| format!("{}: {e}", dev.type_name()))?;
+                if let Err(e) = dev.attach_backing(&how) {
+                    gave_up.store(true, std::sync::atomic::Ordering::Release);
+                    return Err(format!("{}: {e}", dev.type_name()));
+                }
             }
             Ok(())
         }),
@@ -249,6 +256,36 @@ fn run_migration_destination(
     ));
     let memctx = vmm_core::mem::MemCtx::new(machine.physmap().clone());
     let hdl = machine.hdl().clone();
+
+    // Held until the import returns; the full control socket binds the
+    // same path once the guest runs.
+    let _import_status = match control_socket {
+        Some(path) => {
+            let phase = Arc::clone(&status);
+            Some(
+                control::spawn_import_status(
+                    path,
+                    move || {
+                        if attach_gave_up
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            return vmm_migrate::MigrationPhase::Error;
+                        }
+                        phase
+                            .lock()
+                            .map_or(vmm_migrate::MigrationPhase::Error, |s| {
+                                s.phase
+                            })
+                    },
+                    log.clone(),
+                )
+                .with_context(|| {
+                    format!("serve the import status at {}", path.display())
+                })?,
+            )
+        }
+        None => None,
+    };
 
     // One driver over either stream. A Unix socket is the only kind
     // that works inside a bhyve zone, where /dev/poll is unavailable;
@@ -492,6 +529,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         run_migration_destination(
             &machine,
             listen_addr,
+            cli.control_socket.as_deref(),
             std::time::Duration::from_millis(
                 cli.migrate_ring_attach_timeout_ms,
             ),

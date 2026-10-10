@@ -29,7 +29,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// life. A peer that stops reading would keep its slot for ever, and
 /// eight such peers would take the control socket away from every
 /// later client, including the one that stops or migrates the VM.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A running control listener.
 ///
@@ -76,6 +76,23 @@ pub fn spawn_control_thread(
     ctrl: Arc<VmController>,
     log: Logger,
 ) -> io::Result<ControlListener> {
+    let connection_log = log.clone();
+    spawn_listener(path, log, move |stream| {
+        if let Err(e) = handle_connection(&ctrl, &stream, &connection_log) {
+            warn!(connection_log, "control connection error"; "error" => %e);
+        }
+    })
+}
+
+/// Bind `path` and serve each client with `handler` on its own thread.
+pub(super) fn spawn_listener<F>(
+    path: &Path,
+    log: Logger,
+    handler: F,
+) -> io::Result<ControlListener>
+where
+    F: Fn(UnixStream) + Send + Sync + 'static,
+{
     let listener = vmm_core::unixsock::bind_restricted(
         path,
         vmm_core::unixsock::SocketPolicy::default(),
@@ -83,16 +100,12 @@ pub fn spawn_control_thread(
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_shutdown = Arc::clone(&shutdown);
-    let handle = thread::Builder::new()
-        .name("control".into())
-        .spawn(move || {
-            let connection_log = log.clone();
-            serve_connections(listener, &thread_shutdown, log, move |stream| {
-                if let Err(e) = handle_connection(&ctrl, &stream, &connection_log) {
-                    warn!(connection_log, "control connection error"; "error" => %e);
-                }
-            });
-        })?;
+    let handle =
+        thread::Builder::new()
+            .name("control".into())
+            .spawn(move || {
+                serve_connections(listener, &thread_shutdown, log, handler);
+            })?;
 
     Ok(ControlListener {
         path: path.to_path_buf(),
@@ -190,6 +203,21 @@ fn serve_connections<F>(
 /// inside a zone.
 const GLOBAL_ZONEID: i32 = 0;
 
+/// Whether the peer may drive this VM. A refusal is logged.
+pub(super) fn authorized(
+    stream: &UnixStream,
+    log: &Logger,
+) -> Result<bool, ControlError> {
+    let peer = crate::peercred::peer_cred(stream)?;
+    let euid = unsafe { libc::geteuid() };
+    let zoneid = crate::peercred::process_zoneid()?;
+    if !peer_is_authorized(&peer, euid, zoneid) {
+        warn!(log, "rejected control connection"; "uid" => peer.uid);
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn peer_is_authorized(peer: &PeerCred, euid: u32, zoneid: Option<i32>) -> bool {
     if peer.uid != euid {
         return false;
@@ -214,7 +242,7 @@ fn request_too_large() -> io::Error {
 
 /// Read one newline-delimited request without allowing `buf` to exceed the cap.
 /// Returns `false` only when EOF is reached before any request bytes are read.
-fn read_request<R: BufRead>(
+pub(super) fn read_request<R: BufRead>(
     reader: &mut R,
     buf: &mut Vec<u8>,
 ) -> io::Result<bool> {
@@ -257,7 +285,7 @@ fn read_request<R: BufRead>(
 /// is a file-status flag that the `BufReader` clone of this socket
 /// shares, so it would break the request reads. `write_all_bounded`
 /// polls for space instead.
-fn write_response(
+pub(super) fn write_response(
     stream: &UnixStream,
     payload: &[u8],
     budget: Duration,
@@ -265,7 +293,7 @@ fn write_response(
     write_all_bounded(stream, payload, budget)
 }
 
-fn write_error_response(
+pub(super) fn write_error_response(
     stream: &UnixStream,
     message: &str,
     budget: Duration,
@@ -283,11 +311,7 @@ fn handle_connection(
     stream: &UnixStream,
     log: &Logger,
 ) -> Result<(), ControlError> {
-    let peer = crate::peercred::peer_cred(stream)?;
-    let euid = unsafe { libc::geteuid() };
-    let zoneid = crate::peercred::process_zoneid()?;
-    if !peer_is_authorized(&peer, euid, zoneid) {
-        warn!(log, "rejected control connection"; "uid" => peer.uid);
+    if !authorized(stream, log)? {
         return Ok(());
     }
 
