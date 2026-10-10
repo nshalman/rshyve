@@ -71,7 +71,7 @@ fn agent(
         if answer.is_empty() {
             return lines;
         }
-        std::io::Write::write_all(&mut w, answer).expect("answer");
+        w.write_all(answer).expect("answer");
         loop {
             let mut line = String::new();
             match r.read_line(&mut line) {
