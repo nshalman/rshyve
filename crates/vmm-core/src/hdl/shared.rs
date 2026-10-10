@@ -44,7 +44,8 @@ pub(super) fn for_vm(name: &str, fd: BorrowedFd<'_>) -> Arc<VmRings> {
     // A node that could not be read (rdev 0) matches by name: two
     // gates for one VM are worse than one gate for a name reused.
     let same = |k: &Key| {
-        k.name == key.name && (k.rdev == key.rdev || k.rdev == 0 || key.rdev == 0)
+        k.name == key.name
+            && (k.rdev == key.rdev || k.rdev == 0 || key.rdev == 0)
     };
     if let Some(vm) = vms
         .iter()

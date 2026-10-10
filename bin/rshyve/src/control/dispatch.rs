@@ -549,7 +549,7 @@ mod tests {
     use super::{
         added, cpu_added, cpu_list, device_list, hot_add_blocked,
         hotplug_disabled, mem_added, mem_list, removing, resume_from,
-        stop_refusal, stuck_data, window_json, MemWindowReport,
+        stop_refusal, status_data, window_json, MemWindowReport,
         CPU_HOTPLUG_OFF, MEM_HOTPLUG_OFF, NO_CPU_REMOVE, NO_MEM_REMOVE,
     };
 
