@@ -26,8 +26,10 @@
 //!
 //! Anything that fails from step 1 on rolls the source back: devices
 //! resume, the vCPUs run again, and the kernel rings start after
-//! them. After the gate's go nothing rolls back: the source stays
-//! paused until the orchestrator tells it which side keeps the guest.
+//! them. After the gate's go a failure does not roll back: the source
+//! stays paused until the orchestrator tells it which side keeps the
+//! guest. The one exception is the cutover deadline: with no commit by
+//! then, the gate turns `abort` and the source rolls back.
 
 use std::io::Read;
 use std::net::Shutdown;
@@ -51,6 +53,7 @@ use crate::codec::{
 };
 use crate::converge::Precopy;
 use crate::cpu;
+use crate::cutover::{Cutover, Gated};
 use crate::late::Owners;
 use crate::limits::{BATCH_SIZE, ZSTD_LEVEL};
 use crate::pages::{
@@ -195,6 +198,15 @@ fn run_watched<S: Transport>(
     status: &Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
+    let cutover = Cutover::start(
+        config.deadlines.cutover,
+        stream
+            .shutter()
+            .map_err(|e| MigrateError::Io(format!("cutover deadline: {e}")))?,
+        Arc::clone(status),
+        log,
+    )
+    .map_err(|e| MigrateError::Io(format!("cutover deadline: {e}")))?;
     let (stream, watch) =
         crate::stall::watch(stream, config.deadlines.stall, log)
             .map_err(|e| MigrateError::Io(format!("stall watchdog: {e}")))?;
@@ -218,11 +230,19 @@ fn run_watched<S: Transport>(
         hooks.committed,
         &hooks.pause_vm,
         &paused,
-        hooks.gate.as_ref(),
+        &Gated {
+            inner: hooks.gate.as_ref(),
+            cutover: &cutover,
+        },
+        &cutover,
         status,
         log,
     );
-    let result = result.map_err(|error| stalled_or(&watch, error));
+    // Settled before the gate is read: from here the deadline cannot
+    // fire, so the rollback below and the gate agree.
+    cutover.finish();
+    let result =
+        result.map_err(|error| cutover.expired_or(stalled_or(&watch, error)));
     if let Err(error) = &result {
         if crate::is_cancel(error) {
             chan.report_failure(error, log);
@@ -340,6 +360,7 @@ fn run_inner<S: Transport>(
     pause_vm: &VmPauseFn,
     paused: &Paused,
     gate: &dyn StopGate,
+    cutover: &Cutover,
     status: &Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
@@ -446,6 +467,7 @@ fn run_inner<S: Transport>(
     if let Some(path) = config.gate.as_deref() {
         crate::gate::wait(path, config.gate_budget, gate, status, log)?;
     }
+    cutover.arm();
 
     // The destination holds its short post-pause deadline from this
     // signal on, so it goes out only after the waits above.

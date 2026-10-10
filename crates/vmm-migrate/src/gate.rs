@@ -15,9 +15,10 @@
 //! source -> agent   ACK GO | ACK ABORT
 //! ```
 //!
-//! After `ACK GO` the source never resumes the guest by itself. Any
-//! other answer, a closed socket or no answer within the budget is an
-//! abort: the source resumes. The orchestrator writes its own record
+//! After `ACK GO` the source does not resume the guest by itself,
+//! unless it has not committed by the cutover deadline (see
+//! [`crate::cutover`]). Any other answer, a closed socket or no answer
+//! within the budget is an abort: the source resumes. The orchestrator writes its own record
 //! before it sends `GO`, so `GO` without `ACK GO` is a state it must
 //! read back from the source, not assume. See `docs/migration-gate.md`.
 

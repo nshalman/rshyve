@@ -44,7 +44,7 @@ The `fbuf` device carries its PCI header (command and BARs), the mode
 the guest set (width and height), and its VRAM. The VRAM is a separate
 16 MiB devmem segment, not guest RAM, so the RAM passes do not see it.
 The source reads it after the vCPUs pause, cuts it after the last page
-that is not zero, compresses it with zstd and sends it with the device
+that is not zero, compresses it with LZ4 and sends it with the device
 state. A console or a plain desktop compresses to a few KiB. If the
 compressed VRAM is over 2 MiB, the source leaves it out so the device
 state stays under the message limit. The destination then starts with

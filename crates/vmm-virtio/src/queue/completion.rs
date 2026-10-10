@@ -168,6 +168,8 @@ impl VirtioCompletion {
         // Claimed with one read-modify-write, because two threads that
         // both read the last count and both subtract it wrap the
         // counter to u32::MAX and force every completion after that.
+        // `try_update` replaces fetch_update from Rust 1.95; MSRV is 1.94.
+        #[allow(deprecated)]
         let forced = self
             .force_intr_count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {

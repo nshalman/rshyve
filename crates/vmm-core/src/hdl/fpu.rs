@@ -62,7 +62,7 @@ impl VmmHdl {
     /// enabled in its own XCR0.
     pub fn fpu_area(&self) -> Result<FpuArea> {
         let mut desc = vm_fpu_desc::default();
-        // Safety: with no entries the kernel writes only the count and
+        // SAFETY: with no entries the kernel writes only the count and
         // the size into the struct.
         unsafe { self.inner.ioctl(ioctls::VM_DESC_FPU_AREA, &mut desc) }?;
         let count = desc.vfd_num_entries;
@@ -75,7 +75,7 @@ impl VmmHdl {
         let mut entries = vec![vm_fpu_desc_entry::default(); count as usize];
         desc.vfd_entry_data = entries.as_mut_ptr();
         desc.vfd_num_entries = count;
-        // Safety: the kernel writes at most `count` entries, and
+        // SAFETY: the kernel writes at most `count` entries, and
         // `entries` holds that many.
         unsafe { self.inner.ioctl(ioctls::VM_DESC_FPU_AREA, &mut desc) }?;
         if desc.vfd_num_entries != count {
@@ -104,7 +104,7 @@ impl VmmHdl {
             buf: buf.as_mut_ptr().cast(),
             len: buf.len() as u64,
         };
-        // Safety: the kernel writes at most `len` bytes into `buf`.
+        // SAFETY: the kernel writes at most `len` bytes into `buf`.
         unsafe { self.inner.ioctl(ioctls::VM_GET_FPU, &mut req) }?;
         Ok(())
     }
@@ -119,7 +119,7 @@ impl VmmHdl {
             buf: buf.as_ptr().cast_mut().cast(),
             len: buf.len() as u64,
         };
-        // Safety: the kernel reads at most `len` bytes from `buf`.
+        // SAFETY: the kernel reads at most `len` bytes from `buf`.
         unsafe { self.inner.ioctl(ioctls::VM_SET_FPU, &mut req) }?;
         Ok(())
     }

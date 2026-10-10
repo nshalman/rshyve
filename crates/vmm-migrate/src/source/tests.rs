@@ -503,6 +503,112 @@ fn an_aborted_gate_rolls_the_source_back() {
 }
 
 #[test]
+fn a_trickling_peer_after_the_go_rolls_the_source_back() {
+    // Each byte comes inside the read deadline, so only the cutover
+    // deadline ends the wait.
+    let (ours, mut peer) = UnixStream::pair().expect("pair");
+    let status = Arc::new(Mutex::new(MigrationStatus {
+        gate: GateState::Go,
+        ..MigrationStatus::default()
+    }));
+    let cutover = Cutover::start(
+        Duration::from_millis(300),
+        ours.shutter().expect("shutter"),
+        Arc::clone(&status),
+        &discard(),
+    )
+    .expect("cutover");
+    let deadlines = Deadlines {
+        post_pause: Duration::from_millis(500),
+        ..Deadlines::default()
+    };
+    let mut source =
+        Chan::new(ours, tungstenite::protocol::Role::Client, deadlines)
+            .expect("source channel");
+    source.enter_post_pause().expect("post-pause deadline");
+    let trickle = std::thread::spawn(move || {
+        // A binary frame that says 65535 bytes follow, then a byte at
+        // a time.
+        let _ = peer.write_all(&[0x82, 126, 0xff, 0xff]);
+        while peer.write_all(&[0]).is_ok() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    let gate = Gate::default();
+    cutover.arm();
+    let started = Instant::now();
+    let error = hand_over(
+        &mut source,
+        &Gated {
+            inner: &gate,
+            cutover: &cutover,
+        },
+        no_hook(),
+        &status,
+        &discard(),
+    )
+    .expect_err("the cutover ran out of time");
+    assert!(cutover.finish(), "the deadline did not fire");
+    let error = cutover.expired_or(error);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(error.to_string().contains("no commit within"), "{error}");
+    assert_eq!(gate.commits.load(Ordering::Acquire), 0);
+
+    let (phase, gate_state) = {
+        let s = status.lock().expect("status");
+        (s.phase, s.gate)
+    };
+    assert_eq!(gate_state, GateState::Abort);
+    let resumed = Arc::new(AtomicBool::new(false));
+    let by_callback = Arc::clone(&resumed);
+    let _ = finish_source(
+        Err(error),
+        phase,
+        gate_state,
+        &discard(),
+        paused(Box::new(move || by_callback.store(true, Ordering::Release))),
+        || Ok::<(), &'static str>(()),
+    );
+    assert!(resumed.load(Ordering::Acquire), "the source stayed paused");
+    trickle.join().expect("trickle");
+}
+
+#[test]
+fn a_commit_after_the_cutover_deadline_is_refused() {
+    let (mut source, mut dest) = pair();
+    let status = Arc::new(Mutex::new(MigrationStatus {
+        gate: GateState::Go,
+        ..MigrationStatus::default()
+    }));
+    let cutover = Cutover::start(
+        Duration::from_millis(50),
+        Box::new(|| {}),
+        Arc::clone(&status),
+        &discard(),
+    )
+    .expect("cutover");
+    cutover.arm();
+    std::thread::sleep(Duration::from_millis(300));
+    dest.send(&Message::Okay).expect("holds it all");
+    let gate = Gate::default();
+    let error = hand_over(
+        &mut source,
+        &Gated {
+            inner: &gate,
+            cutover: &cutover,
+        },
+        no_hook(),
+        &status,
+        &discard(),
+    )
+    .expect_err("too late to commit");
+    assert!(error.to_string().contains("no commit within"), "{error}");
+    assert_eq!(gate.commits.load(Ordering::Acquire), 0);
+    assert_ne!(phase(&status), MigrationPhase::Committed);
+}
+
+#[test]
 fn the_disks_are_given_up_right_after_the_commit() {
     let (mut source, mut dest) = pair();
     let peer = std::thread::spawn(move || {

@@ -142,6 +142,8 @@ impl Drop for ConnectionGuard {
     }
 }
 
+// `try_update` replaces this from Rust 1.95, and the MSRV is 1.94.
+#[allow(deprecated)]
 fn acquire_connection(active: &Arc<AtomicUsize>) -> Option<ConnectionGuard> {
     active
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
