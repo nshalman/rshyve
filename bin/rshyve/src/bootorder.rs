@@ -186,7 +186,8 @@ mod tests {
         );
         let (clean, index) = strip_bootindex(mb).unwrap();
         assert_eq!(index, Some(1));
-        let (bdf, driver, config) = vmm_machine::devspec::split(&clean).unwrap();
+        let (bdf, driver, config) =
+            vmm_machine::devspec::split(&clean).unwrap();
         assert_eq!((bdf.dev(), driver), (4, "nvme"));
         assert!(matches!(
             vmm_machine::devspec::parse_nvme_config(config),
