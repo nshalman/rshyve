@@ -247,7 +247,7 @@ fn supervise<P>(
             .name("import-status-accept".into())
             .spawn(move || {
                 serve_connections(listener, &serving, accept_log, move |s| {
-                    if let Err(e) = handle(&s, &*answer, &connection_log) {
+                    if let Err(e) = handle(&s, &*answer) {
                         warn!(connection_log, "import status connection error";
                             "error" => %e);
                     }
@@ -269,11 +269,7 @@ fn supervise<P>(
     }
 }
 
-fn handle<P>(
-    stream: &UnixStream,
-    phase: &P,
-    log: &Logger,
-) -> Result<(), ControlError>
+fn handle<P>(stream: &UnixStream, phase: &P) -> Result<(), ControlError>
 where
     P: Fn() -> MigrationPhase,
 {
