@@ -120,6 +120,10 @@ fn validate_cli(cli: &Cli, log: &slog::Logger) -> anyhow::Result<()> {
         "firehyve does not support --control-socket"
     );
     anyhow::ensure!(
+        cli.ring_config.is_none(),
+        "firehyve does not support --ring-config; MantaBlock disks are rshyve only"
+    );
+    anyhow::ensure!(
         !cli.vtpm && cli.vtpm_state_dir.is_none(),
         "firehyve does not support --vtpm; vTPM is rshyve only"
     );

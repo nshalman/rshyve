@@ -484,5 +484,7 @@ fn write_cmd_data(inner: &mut Inner, value: u32) {
     }
 }
 
+mod migrate;
+
 #[cfg(test)]
 mod tests;

@@ -140,13 +140,17 @@ pub struct DeviceState {
     /// The Hyper-V enlightenment, when the VM has one. Not a PCI
     /// device, so it travels beside the per-address payloads.
     pub hyperv: Option<HypervMigrateState>,
+    /// Devices with no PCI address, each under its registry id. Empty
+    /// from a v8 or older source.
+    #[serde(default)]
+    pub platform: Vec<PlatformStatePayload>,
 }
 
 /// The device state types are the device crate's own, so a device
 /// exports what the wire carries with nothing copied in between.
 pub use vmm_devices::lifecycle::{
     DeviceMigrateState, DeviceStatePayload, HypervMigrateState,
-    MigratePciState, WireBdf,
+    MigratePciState, PlatformIdentity, PlatformStatePayload, WireBdf,
 };
 
 /// State data for a single vCPU.
@@ -441,6 +445,10 @@ pub struct MigrationPreamble {
     pub mem_size: u64,
     /// Every device that carries migration state, sorted by address.
     pub devices: Vec<DeviceIdentity>,
+    /// Every device with no PCI address that carries state, sorted by
+    /// id. Empty from a v8 or older source.
+    #[serde(default)]
+    pub platform: Vec<PlatformIdentity>,
     /// CPU feature bits from the source host for compatibility check.
     /// The destination rejects migration if it lacks any of these features.
     pub cpu_features: Option<CpuFeatures>,
@@ -621,10 +629,15 @@ mod tests {
             },
             kind: "virtio-blk".to_string(),
         }];
+        let platform = vec![PlatformIdentity {
+            id: "lpc/com2".to_string(),
+            kind: "lpc-uart".to_string(),
+        }];
         let preamble = MigrationPreamble {
             num_cpus: 4,
             mem_size: 1024 * 1024 * 1024,
             devices: devices.clone(),
+            platform: platform.clone(),
             cpu_features: None,
             xsave: crate::xsave::XsaveLayout {
                 size: 576,
@@ -639,6 +652,7 @@ mod tests {
                 assert_eq!(decoded.num_cpus, 4);
                 assert_eq!(decoded.mem_size, 1024 * 1024 * 1024);
                 assert_eq!(decoded.devices, devices);
+                assert_eq!(decoded.platform, platform);
             }
             other => panic!("expected Serialized, got {other:?}"),
         }
@@ -703,6 +717,16 @@ mod tests {
                     )),
                 },
             ],
+            platform: vec![PlatformStatePayload {
+                id: "lpc/com1".to_string(),
+                state: DeviceMigrateState::Uart(
+                    vmm_devices::lifecycle::UartMigrateState {
+                        ier: 0x02,
+                        tx: b"login: ".to_vec(),
+                        ..Default::default()
+                    },
+                ),
+            }],
         };
         let msg = Message::serialized(&state).unwrap();
         match roundtrip(&msg) {
@@ -714,6 +738,7 @@ mod tests {
                     .map(|d| d.bdf.to_string())
                     .collect();
                 assert_eq!(addrs, ["0.4.0", "0.5.0"]);
+                assert_eq!(decoded.platform, state.platform);
             }
             other => panic!("expected Serialized, got {other:?}"),
         }

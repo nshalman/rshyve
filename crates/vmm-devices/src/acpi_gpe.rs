@@ -19,16 +19,13 @@
 
 use std::sync::{Arc, Mutex};
 
-use serde::{Deserialize, Serialize};
 use slog;
 use vmm_core::common::RWOp;
 use vmm_core::intr_pins::IntrPin;
 use vmm_core::pio::{PioBus, PioFn};
 
-use crate::lifecycle::Lifecycle;
-use crate::migrate::{
-    MigrateCtx, MigrateSingle, MigrateStateError, Migrator, PayloadOffer,
-    PayloadOutput, Schema, SchemaId,
+use crate::lifecycle::{
+    AcpiGpeMigrateState, DeviceMigrateState, DeviceStateError, Lifecycle,
 };
 
 /// Base I/O port of the GPE0 register block.
@@ -78,23 +75,6 @@ const GPE0_VALID: u16 =
 pub trait HotplugEventSink: Send + Sync {
     /// Set `bit` in GPE0_STS and update the SCI.
     fn raise(&self, bit: GpeBit);
-}
-
-/// Migration payload: the two GPE0 registers.
-///
-/// The SCI level is not carried. It follows from these registers, and
-/// the destination has its own PIC, so the import recomputes the line
-/// instead of trusting a level that was measured on the source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AcpiGpeV1 {
-    pub status: u16,
-    pub enable: u16,
-}
-
-impl<'de> Schema<'de> for AcpiGpeV1 {
-    fn id() -> SchemaId {
-        ("acpi-gpe", 1)
-    }
 }
 
 /// The GPE0 register block.
@@ -201,9 +181,12 @@ impl AcpiGpe {
     }
 
     /// The registers, for migration export.
-    fn export_registers(&self) -> AcpiGpeV1 {
+    ///
+    /// The SCI level is not carried. It follows from these registers,
+    /// so the import computes the line again.
+    fn export_registers(&self) -> AcpiGpeMigrateState {
         let inner = self.inner.lock().expect("gpe lock poisoned");
-        AcpiGpeV1 {
+        AcpiGpeMigrateState {
             status: inner.status,
             enable: inner.enable,
         }
@@ -214,7 +197,7 @@ impl AcpiGpe {
     /// The mask repeats the guest write path. A bit with no source has
     /// no `_Exx` method, so a status bit outside the mask would park a
     /// level that the guest can never lower.
-    fn import_registers(&self, state: AcpiGpeV1) {
+    fn import_registers(&self, state: &AcpiGpeMigrateState) {
         let mut inner = self.inner.lock().expect("gpe lock poisoned");
         inner.status = state.status & GPE0_VALID;
         inner.enable = state.enable & GPE0_VALID;
@@ -247,28 +230,30 @@ impl Lifecycle for AcpiGpe {
         self.recompute_sci(&inner);
     }
 
-    fn migrate(&'_ self) -> Migrator<'_> {
-        Migrator::Single(self)
-    }
-}
-
-impl MigrateSingle for AcpiGpe {
-    fn export(
-        &self,
-        _ctx: &MigrateCtx<'_>,
-    ) -> Result<PayloadOutput, MigrateStateError> {
-        Ok(self.export_registers().into())
+    fn migrates_by_id(&self) -> bool {
+        true
     }
 
-    fn import(
+    fn export_migrate_state(
         &self,
-        mut offer: PayloadOffer<'_>,
-        _ctx: &MigrateCtx<'_>,
-    ) -> Result<(), MigrateStateError> {
-        // The SCI is re-asserted here when the restored registers ask
-        // for it. A guest that migrated with an event pending would
-        // otherwise wait for a line the destination PIC never raised.
-        self.import_registers(offer.parse()?);
+    ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {
+        Ok(Some(DeviceMigrateState::AcpiGpe(self.export_registers())))
+    }
+
+    /// The SCI is asserted again here when the restored registers ask
+    /// for it. A guest that migrated with an event pending would
+    /// otherwise wait for a line the destination PIC never raised.
+    fn restore_migrate_state(
+        &self,
+        state: &DeviceMigrateState,
+    ) -> Result<(), DeviceStateError> {
+        let DeviceMigrateState::AcpiGpe(mig) = state else {
+            return Err(DeviceStateError::WrongKind {
+                want: "acpi-gpe",
+                got: state.kind(),
+            });
+        };
+        self.import_registers(mig);
         Ok(())
     }
 }
@@ -614,39 +599,17 @@ mod tests {
         );
     }
 
-    /// Empty guest memory. The GPE0 block reads none of it, but the
-    /// migration entry points still take a context.
-    fn migrate_mem() -> vmm_core::MemCtx {
-        vmm_core::MemCtx::new(Arc::new(vmm_core::PhysMap::new()))
-    }
-
-    fn migrator(gpe: &AcpiGpe) -> &dyn MigrateSingle {
-        match gpe.migrate() {
-            Migrator::Single(single) => single,
-            _ => panic!("the GPE0 block exports one payload"),
-        }
-    }
-
-    /// Move the registers the way the migration protocol does: export a
-    /// payload, serialise it, and offer the bytes to a second block.
+    /// Move the registers the way the migration protocol does: export,
+    /// serialise, and restore into a second block.
     fn migrate_registers(source: &AcpiGpe, dest: &AcpiGpe) {
-        let mem = migrate_mem();
-        let ctx = MigrateCtx { mem: &mem };
-
-        let output = migrator(source).export(&ctx).expect("export the block");
-        let bytes =
-            serde_json::to_string(&output.payload).expect("serialise state");
-
-        let mut de = serde_json::Deserializer::from_str(&bytes);
-        let offer = PayloadOffer {
-            kind: output.kind,
-            version: output.version,
-            payload: Box::new(<dyn erased_serde::Deserializer<'_>>::erase(
-                &mut de,
-            )),
-        };
-        migrator(dest)
-            .import(offer, &ctx)
+        let state = source
+            .export_migrate_state()
+            .expect("export the block")
+            .expect("a state");
+        let text = ron::ser::to_string(&state).expect("serialise state");
+        let state: DeviceMigrateState =
+            ron::de::from_str(&text).expect("deserialise state");
+        dest.restore_migrate_state(&state)
             .expect("import the block");
     }
 
@@ -712,7 +675,7 @@ mod tests {
     fn an_import_drops_bits_with_no_source() {
         let (_bus, dest, dest_pin) = attached();
 
-        dest.import_registers(AcpiGpeV1 {
+        dest.import_registers(&AcpiGpeMigrateState {
             status: u16::MAX,
             enable: u16::MAX,
         });
@@ -727,24 +690,14 @@ mod tests {
     #[test]
     fn an_import_of_the_wrong_payload_is_refused() {
         let (_bus, dest, _pin) = attached();
-        let mem = migrate_mem();
-        let ctx = MigrateCtx { mem: &mem };
-        let mut de = serde_json::Deserializer::from_str("{}");
-        let offer = PayloadOffer {
-            kind: "acpi-gpe",
-            version: AcpiGpeV1::id().1 + 1,
-            payload: Box::new(<dyn erased_serde::Deserializer<'_>>::erase(
-                &mut de,
-            )),
-        };
-
-        let error = migrator(&dest)
-            .import(offer, &ctx)
-            .expect_err("a version this build cannot read must be refused");
+        let other = DeviceMigrateState::AcpiPm(Default::default());
 
         assert!(matches!(
-            error,
-            MigrateStateError::UnexpectedPayload(kind, _) if kind == "acpi-gpe"
+            dest.restore_migrate_state(&other),
+            Err(DeviceStateError::WrongKind {
+                want: "acpi-gpe",
+                ..
+            })
         ));
     }
 

@@ -38,6 +38,7 @@
 //! unknown-command error would read as a typo.
 
 mod dispatch;
+mod handover;
 mod listener;
 mod migrate;
 mod protocol;
@@ -181,6 +182,12 @@ pub struct VmController {
     /// Its MSR state is migrated; nothing else touches it here.
     hyperv: Option<Arc<vmm_hyperv::HyperV>>,
     host_local_state: HostLocalState,
+    /// The last migration took ring engines that cannot prove a fresh
+    /// attach is new.
+    allow_unproven: AtomicBool,
+    /// What `migrate-status` reports for the ring disks, once a
+    /// migration moved them.
+    rings: Mutex<Option<&'static str>>,
     log: Logger,
 }
 
@@ -244,6 +251,8 @@ impl VmController {
             cpu_baseline,
             hyperv: migration.hyperv,
             host_local_state: migration.host_local_state,
+            allow_unproven: AtomicBool::new(false),
+            rings: Mutex::new(None),
             log,
         })
     }

@@ -158,13 +158,8 @@ fn validate_migration_addr(addr: &str) -> Result<(), String> {
 /// A guest whose driver configured one of these would find it at reset
 /// on the far side, with no error anywhere. The list is documented in
 /// docs/migration.md; grow it there and here together.
-const UNMIGRATABLE: &[&str] = &[
-    "ahci-cd",
-    "virtio-console",
-    "virtio-fs",
-    "virtio-vsock",
-    "xhci",
-];
+const UNMIGRATABLE: &[&str] =
+    &["ahci-cd", "virtio-console", "virtio-fs", "virtio-vsock"];
 
 /// Why a VM carrying a device with unmigratable state cannot be a
 /// source.
@@ -214,14 +209,43 @@ pub(crate) fn device_blockers(
     Some(format!("this VM cannot migrate: {}", blocking.join("; ")))
 }
 
+/// Every device whose migration an operator must accept first, unless
+/// `allowed`.
+pub(crate) fn waivable_blockers(
+    registry: &vmm_machine::DeviceRegistry,
+    allowed: bool,
+) -> Option<String> {
+    if allowed {
+        return None;
+    }
+    let blocking: Vec<String> = registry
+        .list()
+        .into_iter()
+        .filter_map(|slot| {
+            let why = slot.lifecycle?.migration_waivable()?;
+            Some(format!("{}: {why}", slot.id))
+        })
+        .collect();
+    if blocking.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "this VM cannot migrate: {}; send \
+         allow_engine_without_migrate_v1 to accept the risk",
+        blocking.join("; ")
+    ))
+}
+
 /// Why this VM cannot be a migration source, or `None`.
 fn source_refusal(
     hotplug: &HotplugEngines,
     registry: &vmm_machine::DeviceRegistry,
     identities: &[vmm_migrate::codec::DeviceIdentity],
+    allow_unproven: bool,
 ) -> Option<String> {
     let (cpus, bytes) = growth(hotplug);
     device_blockers(registry)
+        .or_else(|| waivable_blockers(registry, allow_unproven))
         .or_else(|| grown_since_boot(cpus, bytes))
         .or_else(|| device_set_changed(&vmm_machine::hotplug_specs(registry)))
         .or_else(|| unmigratable_devices(identities))
@@ -233,8 +257,11 @@ fn claim_source(
     hotplug: &HotplugEngines,
     registry: &vmm_machine::DeviceRegistry,
     identities: impl FnOnce() -> Vec<vmm_migrate::codec::DeviceIdentity>,
+    allow_unproven: bool,
 ) -> Result<(), String> {
-    run.admit_source(|| source_refusal(hotplug, registry, &identities()))
+    run.admit_source(|| {
+        source_refusal(hotplug, registry, &identities(), allow_unproven)
+    })
 }
 
 /// Move a paused VM to `Migrating`, or say why it cannot take an import.
@@ -242,7 +269,33 @@ fn claim_dest(
     run: &RunControl,
     registry: &vmm_machine::DeviceRegistry,
 ) -> Result<(), String> {
-    run.admit_import(|| device_blockers(registry))
+    run.admit_import(|| {
+        device_blockers(registry).or_else(|| handover_import(registry))
+    })
+}
+
+/// A VM that is already running attached its ring disks at boot, and
+/// the source still owns those volumes. Only a VM started with
+/// `--migrate-listen` builds them detached.
+fn handover_import(registry: &vmm_machine::DeviceRegistry) -> Option<String> {
+    let rings: Vec<String> = registry
+        .list()
+        .into_iter()
+        .filter(|slot| {
+            slot.lifecycle
+                .as_ref()
+                .is_some_and(|d| d.migration_spec_options().is_some())
+        })
+        .map(|slot| slot.id)
+        .collect();
+    if rings.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "migrate-dest cannot take a MantaBlock disk ({}); start the \
+         destination with --migrate-listen",
+        rings.join(" ")
+    ))
 }
 
 /// Where a migration source connects to.
@@ -268,25 +321,42 @@ impl MigrateTarget {
 pub(super) fn migrate_source(
     ctrl: &Arc<VmController>,
     target_addr: String,
-    zfs_barrier: Option<String>,
+    ask: SourceAsk,
 ) -> Response {
     let target = match MigrateTarget::parse(&target_addr) {
         Ok(target) => target,
         Err(e) => return Response::err(&format!("invalid target_addr: {e}")),
     };
+    let gate = match ask.gate.as_deref().map(agent_socket).transpose() {
+        Ok(gate) => gate,
+        Err(e) => return Response::err(&format!("invalid gate: {e}")),
+    };
+    let gate_budget = match gate_budget(ask.gate_timeout_ms) {
+        Ok(budget) => budget,
+        Err(e) => return Response::err(&e),
+    };
+    let zfs_barrier = ask.zfs_barrier;
 
-    if let Err(why) =
-        claim_source(&ctrl.run, &ctrl.hotplug, &ctrl.registry, || {
-            ctrl.migrate_identities()
-        })
-    {
-        return Response::err(&why);
-    }
-
+    // The claim and the new status are one step, so a migrate-cancel
+    // never reads the last migration's gate for this one.
     let status = Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
-    if let Ok(mut ms) = ctrl.migrate_status.lock() {
-        *ms = Some(Arc::clone(&status));
+    {
+        let mut slot = ctrl.migrate_status.lock();
+        if let Err(why) = claim_source(
+            &ctrl.run,
+            &ctrl.hotplug,
+            &ctrl.registry,
+            || ctrl.migrate_identities(),
+            ask.allow_unproven,
+        ) {
+            return Response::err(&why);
+        }
+        if let Ok(slot) = slot.as_mut() {
+            **slot = Some(Arc::clone(&status));
+        }
     }
+    ctrl.set_allow_unproven(ask.allow_unproven);
+    let status_for_failure = Arc::clone(&status);
 
     let ctrl_arc = Arc::clone(ctrl);
     let hdl = Arc::clone(&ctrl.hdl);
@@ -297,8 +367,12 @@ pub(super) fn migrate_source(
         mem_size: ctrl.mem_size as u64,
         cpu_baseline: ctrl.cpu_baseline,
         devices: ctrl.migrate_identities(),
+        platform: crate::platform::identities(&ctrl.registry),
         deadlines: vmm_migrate::wire::Deadlines::default(),
         zfs_barrier: zfs_barrier.map(PathBuf::from),
+        gate,
+        gate_budget,
+        handover: ctrl.has_handover_disks(),
     };
 
     if let Err(e) =
@@ -352,7 +426,23 @@ pub(super) fn migrate_source(
                             run.end_committed(|| ctrl_arc.release_pause()),
                         );
                     }
+                    Err(e @ SourceOutcome::Failed(_))
+                        if held_by_gate(&ctrl_arc) =>
+                    {
+                        // The orchestrator recorded the go. Only its
+                        // order brings the guest back here.
+                        vmm_migrate::record_failure(&status_for_failure, &e);
+                        error!(mlog, "source migration failed after the \
+                            gate's go; this VM stays paused until \
+                            migrate-resume-source or a stop";
+                            "error" => %e);
+                        ctrl_arc.ended(
+                            run.end_committed(|| ctrl_arc.release_pause()),
+                        );
+                    }
                     Err(e @ SourceOutcome::Failed(_)) => {
+                        // A connect failure never reached the driver.
+                        vmm_migrate::record_failure(&status_for_failure, &e);
                         error!(mlog, "source migration failed"; "error" => %e);
                         end_migration(&ctrl_arc);
                     }
@@ -369,6 +459,14 @@ pub(super) fn migrate_source(
     let mut r = Response::ok();
     r.state = Some(VmRunState::Migrating);
     r
+}
+
+/// Whether the gate said go and the source never committed.
+fn held_by_gate(ctrl: &VmController) -> bool {
+    ctrl.migration_status().is_some_and(|s| {
+        s.gate == vmm_migrate::GateState::Go
+            && s.phase != vmm_migrate::MigrationPhase::Committed
+    })
 }
 
 /// Hand the state back from `Migrating`, unless a stop owns it now.
@@ -473,7 +571,9 @@ fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
     let for_flush = Arc::clone(ctrl);
     let for_resume = Arc::clone(ctrl);
     let for_export = Arc::clone(ctrl);
+    let for_platform = Arc::clone(ctrl);
     let for_hyperv = Arc::clone(ctrl);
+    let for_committed = Arc::clone(ctrl);
     let (pause_vm, resume_vm) = migration_pause_hooks(ctrl);
     vmm_migrate::source::SourceHooks {
         pre_pause: Box::new(move || {
@@ -488,6 +588,10 @@ fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
             for_resume.run.devices_resumed();
         }),
         export: Box::new(move || for_export.export_device_state()),
+        export_platform: Box::new(move || {
+            crate::platform::export(&for_platform.registry)
+        }),
+        committed: Box::new(move || for_committed.detach_backing()),
         hyperv: Box::new(move || for_hyperv.export_hyperv()),
         pause_vm,
         resume_vm,
@@ -575,9 +679,10 @@ pub(super) fn migrate_dest(
     listen_addr: String,
     allow_cpu_feature_mismatch: bool,
 ) -> Response {
-    if let Err(e) = validate_migration_addr(&listen_addr) {
-        return Response::err(&format!("invalid listen_addr: {e}"));
-    }
+    let source = match MigrateTarget::parse(&listen_addr) {
+        Ok(source) => source,
+        Err(e) => return Response::err(&format!("invalid listen_addr: {e}")),
+    };
 
     if let Err(why) = claim_dest(&ctrl.run, &ctrl.registry) {
         return Response::err(&why);
@@ -597,6 +702,7 @@ pub(super) fn migrate_dest(
         mem_size: ctrl.mem_size as u64,
         cpu_baseline: ctrl.cpu_baseline,
         devices: ctrl.migrate_identities(),
+        platform: crate::platform::identities(&ctrl.registry),
         deadlines: vmm_migrate::wire::Deadlines::default(),
         allow_cpu_feature_mismatch,
     };
@@ -608,19 +714,32 @@ pub(super) fn migrate_dest(
                 let lease = MigrationLease::new(ctrl_arc.as_ref());
                 let hooks = dest_hooks(&ctrl_arc);
                 let run = &ctrl_arc.run;
-                let outcome =
-                    accept_one(&listen_addr, || run.cancelled(), &mlog)
-                        .and_then(|stream| {
-                            shut_on_stop(run, stream, &mlog)
+                let outcome = match source {
+                    MigrateTarget::Unix(path) => {
+                        connect_unix_patient(run, Path::new(&path), &mlog)
+                            .and_then(|stream| {
+                                vmm_migrate::destination::run_destination(
+                                    stream, hdl, &memctx, config, hooks,
+                                    status, &mlog,
+                                )
                                 .map_err(|e| e.to_string())
-                        })
-                        .and_then(|stream| {
-                            vmm_migrate::destination::run_destination(
-                                stream, hdl, &memctx, config, hooks, status,
-                                &mlog,
-                            )
-                            .map_err(|e| e.to_string())
-                        });
+                            })
+                    }
+                    MigrateTarget::Tcp(addr) => {
+                        accept_one(&addr, || run.cancelled(), &mlog)
+                            .and_then(|stream| {
+                                shut_on_stop(run, stream, &mlog)
+                                    .map_err(|e| e.to_string())
+                            })
+                            .and_then(|stream| {
+                                vmm_migrate::destination::run_destination(
+                                    stream, hdl, &memctx, config, hooks,
+                                    status, &mlog,
+                                )
+                                .map_err(|e| e.to_string())
+                            })
+                    }
+                };
                 match outcome {
                     Ok(()) => {
                         info!(
@@ -652,15 +771,48 @@ pub(super) fn migrate_dest(
     r
 }
 
+/// How long a destination waits for the agent's socket to appear. The
+/// agent and the request come together, so the socket may lag a little.
+const AGENT_SOCKET_WAIT: Duration = Duration::from_secs(15);
+
+/// Connect to the agent's socket, waiting for it to appear, and giving
+/// up on a stop.
+fn connect_unix_patient(
+    run: &RunControl,
+    path: &Path,
+    log: &slog::Logger,
+) -> Result<UnixStream, String> {
+    let until = std::time::Instant::now() + AGENT_SOCKET_WAIT;
+    loop {
+        match connect_unix(run, path, log) {
+            Ok(stream) => return Ok(stream),
+            Err(_) if run.cancelled() => {
+                return Err(vmm_migrate::CANCELLED.to_string())
+            }
+            Err(e) if std::time::Instant::now() >= until => return Err(e),
+            Err(_) => thread::sleep(ACCEPT_POLL),
+        }
+    }
+}
+
 /// The device hooks the destination import drives.
 fn dest_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::destination::DestHooks {
     let for_restore = Arc::clone(ctrl);
+    let platform = crate::platform::devices(&ctrl.registry);
+    let for_attach = Arc::clone(ctrl);
     let for_resume = Arc::clone(ctrl);
     let for_hyperv = Arc::clone(ctrl);
     let (pause_vm, resume_vm) = migration_pause_hooks(ctrl);
     vmm_migrate::destination::DestHooks {
         restore: Box::new(move |bdf, state| {
             for_restore.restore_device_state(bdf, state)
+        }),
+        restore_platform: Box::new(move |id, state| {
+            crate::platform::restore(&platform, id, state)
+        }),
+        attach: Box::new(move || {
+            for_attach
+                .attach_backing(std::time::Instant::now() + RING_ATTACH_DEFAULT)
         }),
         resume: Box::new(move || {
             for_resume.resume_devices();
@@ -709,6 +861,59 @@ fn accept_one(
     }
 }
 
+/// The orchestrator's `source` order: this VM keeps the guest.
+///
+/// Taken only by a source that may not resume by itself: one the gate
+/// said go to, or one that committed and never heard the destination
+/// start the guest. A source whose destination confirmed is `stopped`
+/// and refuses. After the commit the disks were given up, so each one
+/// attaches anew before any device resumes.
+pub(super) fn migrate_resume_source(ctrl: &Arc<VmController>) -> Response {
+    match ctrl
+        .resume_held_source(std::time::Instant::now() + RING_ATTACH_DEFAULT)
+    {
+        Ok(()) => {
+            info!(
+                ctrl.log,
+                "the orchestrator gave the guest back to \
+                this source; it runs again"
+            );
+            let mut r = Response::ok();
+            r.state = Some(VmRunState::Running);
+            r
+        }
+        Err(why) => Response::err(&why),
+    }
+}
+
+/// Abort a source migration before the gate's go. The stream closes
+/// at once and the guest keeps running here.
+pub(super) fn migrate_cancel(ctrl: &Arc<VmController>) -> Response {
+    let status = ctrl.migrate_status.lock().ok().and_then(|ms| ms.clone());
+    // Held across the cancel: the gate records its go under this lock,
+    // so a go and a cancel cannot both win.
+    let held = status.as_ref().map(|s| s.lock());
+    let gone = || {
+        held.as_ref().is_some_and(|s| {
+            s.as_ref()
+                .map_or(true, |s| s.gate == vmm_migrate::GateState::Go)
+        })
+    };
+    match ctrl.run.cancel_source(gone) {
+        Ok(()) => {
+            info!(
+                ctrl.log,
+                "migrate-cancel: the source migration is \
+                cancelled"
+            );
+            let mut r = Response::ok();
+            r.state = Some(ctrl.state());
+            r
+        }
+        Err(why) => Response::err(why),
+    }
+}
+
 pub(super) fn migrate_status(ctrl: &Arc<VmController>) -> Response {
     let phase_info = ctrl.migrate_status.lock().ok().and_then(|ms| {
         ms.as_ref().and_then(|s| s.lock().ok().map(|s| s.clone()))
@@ -721,6 +926,16 @@ pub(super) fn migrate_status(ctrl: &Arc<VmController>) -> Response {
             r.migrate_phase = Some(s.phase.to_string());
             r.migrate_bytes = Some(s.bytes_transferred);
             r.migrate_pages = Some(s.pages_transferred);
+            let mut data = serde_json::json!({
+                "migrate_gate": s.gate.to_string(),
+            });
+            if let Some(why) = &s.error {
+                data["migrate_error"] = why.clone().into();
+            }
+            if let Some(rings) = ctrl.rings_state() {
+                data["migrate_rings"] = rings.into();
+            }
+            r.data = Some(data);
             r
         }
         None => {
@@ -755,10 +970,46 @@ fn migrate_pci_slots(
     argv_slots: &[String],
     registry: &vmm_machine::DeviceRegistry,
 ) -> Vec<String> {
-    let mut slots = argv_slots.to_vec();
+    let mut slots: Vec<String> = argv_slots
+        .iter()
+        .map(|spec| with_destination_options(spec, registry))
+        .collect();
     slots.extend(vmm_machine::hotplug_specs(registry));
     slots
 }
+
+/// `spec` with the options its device says a destination needs, each
+/// in place of one of the same key the spec already had.
+fn with_destination_options(
+    spec: &str,
+    registry: &vmm_machine::DeviceRegistry,
+) -> String {
+    let id = vmm_machine::devspec::device_id(spec);
+    let Some(extra) = registry
+        .list()
+        .into_iter()
+        .find(|slot| slot.id == id)
+        .and_then(|slot| slot.lifecycle?.migration_spec_options())
+    else {
+        return spec.to_string();
+    };
+    let keys: Vec<&str> = extra
+        .split(',')
+        .filter_map(|opt| opt.split_once('=').map(|(k, _)| k))
+        .collect();
+    let mut parts: Vec<&str> = spec
+        .split(',')
+        .filter(|opt| {
+            !opt.split_once('=').is_some_and(|(k, _)| keys.contains(&k))
+        })
+        .collect();
+    parts.push(&extra);
+    parts.join(",")
+}
+
+mod ask;
+pub(super) use ask::SourceAsk;
+use ask::{agent_socket, gate_budget, RING_ATTACH_DEFAULT};
 
 #[cfg(test)]
 mod tests;

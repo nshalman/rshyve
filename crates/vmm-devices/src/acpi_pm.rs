@@ -22,6 +22,9 @@ use vmm_core::hdl::{SuspendHow, SuspendOutcome};
 use vmm_core::pio::{PioBus, PioFn};
 
 use crate::bhyve::pmtimer::PMBASE_DEFAULT as PMBASE;
+use crate::lifecycle::{
+    AcpiPmMigrateState, DeviceMigrateState, DeviceStateError, Lifecycle,
+};
 
 /// SMI Command port for ACPI enable/disable.
 const SMI_CMD_PORT: u16 = 0xB2;
@@ -282,6 +285,50 @@ impl AcpiPm {
     }
 }
 
+impl Lifecycle for AcpiPm {
+    fn type_name(&self) -> &'static str {
+        "acpi-pm"
+    }
+
+    fn migrates_by_id(&self) -> bool {
+        true
+    }
+
+    fn export_migrate_state(
+        &self,
+    ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {
+        let inner = self.inner.lock().expect("pm lock poisoned");
+        Ok(Some(DeviceMigrateState::AcpiPm(AcpiPmMigrateState {
+            pm1_status: inner.pm1_status,
+            pm1_enable: inner.pm1_enable,
+            pm1_control: inner.pm1_control,
+            reset_control: inner.reset_control,
+        })))
+    }
+
+    /// Takes the values through the guest write masks, and acts on
+    /// none of them: a sleep or reset request was acted on at the
+    /// source.
+    fn restore_migrate_state(
+        &self,
+        state: &DeviceMigrateState,
+    ) -> Result<(), DeviceStateError> {
+        let DeviceMigrateState::AcpiPm(mig) = state else {
+            return Err(DeviceStateError::WrongKind {
+                want: "acpi-pm",
+                got: state.kind(),
+            });
+        };
+        let mut inner = self.inner.lock().expect("pm lock poisoned");
+        inner.pm1_status = mig.pm1_status & PM1_STS_CLEARABLE;
+        inner.pm1_enable = mig.pm1_enable & PM1_EN_WRITABLE;
+        inner.pm1_control = (mig.pm1_control & PM1_SCI_EN)
+            | (mig.pm1_control & !(PM1_SLP_EN | PM1_ALWAYS_ZERO));
+        inner.reset_control = mig.reset_control;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +353,61 @@ mod tests {
 
     fn test_log() -> slog::Logger {
         slog::Logger::root(slog::Discard, slog::o!())
+    }
+
+    fn attached_pm() -> (PioBus, Arc<AcpiPm>, Arc<RecordingSink>) {
+        let bus = PioBus::new();
+        let sink = RecordingSink::new();
+        let sink_arg: Arc<dyn SuspendSink> = sink.clone();
+        let pm = AcpiPm::create_and_attach(&bus, sink_arg, test_log())
+            .expect("ACPI PM registers should attach");
+        (bus, pm, sink)
+    }
+
+    #[test]
+    fn sci_en_and_the_enables_survive_the_wire() {
+        let (bus, src, _) = attached_pm();
+        bus.handle_out(SMI_CMD_PORT, 1, u32::from(ACPI_ENABLE));
+        bus.handle_out(PMBASE + 2, 2, u32::from(PM1_PWRBTN_EN | PM1_GBL_EN));
+        let state = src.export_migrate_state().expect("export").expect("x");
+        let text = ron::ser::to_string(&state).expect("serialize");
+        let state: DeviceMigrateState = ron::de::from_str(&text).expect("de");
+
+        let (dst_bus, dst, dst_sink) = attached_pm();
+        dst.restore_migrate_state(&state).expect("restore");
+
+        assert_eq!(
+            dst_bus.handle_in(PMBASE + 4, 2) & u32::from(PM1_SCI_EN),
+            u32::from(PM1_SCI_EN)
+        );
+        assert_eq!(
+            dst_bus.handle_in(PMBASE + 2, 2),
+            u32::from(PM1_PWRBTN_EN | PM1_GBL_EN)
+        );
+        assert!(dst_sink.recorded().is_empty());
+    }
+
+    #[test]
+    fn a_restore_masks_bits_the_guest_cannot_set() {
+        let (bus, dst, sink) = attached_pm();
+        let state = DeviceMigrateState::AcpiPm(AcpiPmMigrateState {
+            pm1_status: u16::MAX,
+            pm1_enable: u16::MAX,
+            pm1_control: u16::MAX,
+            reset_control: 0x04,
+        });
+        dst.restore_migrate_state(&state).expect("restore");
+
+        assert_eq!(bus.handle_in(PMBASE, 2), u32::from(PM1_STS_CLEARABLE));
+        assert_eq!(bus.handle_in(PMBASE + 2, 2), u32::from(PM1_EN_WRITABLE));
+        let control = bus.handle_in(PMBASE + 4, 2) as u16;
+        assert_eq!(control & (PM1_SLP_EN | 0xC002), 0);
+        assert!(sink.recorded().is_empty(), "a restore suspends nothing");
+        assert!(dst
+            .restore_migrate_state(&DeviceMigrateState::AcpiGpe(
+                Default::default()
+            ))
+            .is_err());
     }
 
     fn attached_bus() -> (PioBus, Arc<RecordingSink>) {

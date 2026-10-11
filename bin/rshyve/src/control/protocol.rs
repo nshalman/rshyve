@@ -35,6 +35,15 @@ pub(super) enum Command {
         /// VMM connects after vCPU pause; agent writes back when ZFS done.
         #[serde(default)]
         zfs_barrier: Option<String>,
+        /// Unix socket of the cutover gate. See docs/migration-gate.md.
+        #[serde(default)]
+        gate: Option<String>,
+        /// How long the gate waits for GO or ABORT.
+        #[serde(default)]
+        gate_timeout_ms: Option<u64>,
+        /// Take a ring engine that does not report migrate-v1. Lab only.
+        #[serde(default)]
+        allow_engine_without_migrate_v1: bool,
     },
     #[serde(rename = "migrate-dest")]
     MigrateDest {
@@ -45,6 +54,14 @@ pub(super) enum Command {
         #[serde(default)]
         allow_cpu_feature_mismatch: bool,
     },
+    /// The orchestrator's order that this source keeps the guest, after
+    /// the gate's go or an unconfirmed commit.
+    #[serde(rename = "migrate-resume-source")]
+    MigrateResumeSource,
+    /// Abort a source migration before the gate's go. The guest keeps
+    /// running here.
+    #[serde(rename = "migrate-cancel")]
+    MigrateCancel,
     #[serde(rename = "migrate-status")]
     MigrateStatus,
     #[serde(rename = "migrate-config")]
@@ -95,6 +112,8 @@ impl Command {
             Self::Stop => "stop",
             Self::MigrateSource { .. } => "migrate-source",
             Self::MigrateDest { .. } => "migrate-dest",
+            Self::MigrateResumeSource => "migrate-resume-source",
+            Self::MigrateCancel => "migrate-cancel",
             Self::MigrateStatus => "migrate-status",
             Self::MigrateConfig => "migrate-config",
             Self::Metrics => "metrics",
@@ -268,6 +287,41 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(cmd, Command::MigrateDest { .. }));
+    }
+
+    #[test]
+    fn the_gate_and_ring_options_parse() {
+        let cmd: Command = serde_json::from_str(
+            r#"{"command":"migrate-source","target_addr":"/m.sock",
+                "gate":"/g.sock","gate_timeout_ms":5000,
+                "allow_engine_without_migrate_v1":true}"#,
+        )
+        .unwrap();
+        let Command::MigrateSource {
+            gate,
+            gate_timeout_ms,
+            allow_engine_without_migrate_v1,
+            ..
+        } = cmd
+        else {
+            panic!("wrong command");
+        };
+        assert_eq!(gate.as_deref(), Some("/g.sock"));
+        assert_eq!(gate_timeout_ms, Some(5000));
+        assert!(allow_engine_without_migrate_v1);
+
+        let cmd: Command =
+            serde_json::from_str(r#"{"command":"migrate-resume-source"}"#)
+                .unwrap();
+        assert!(matches!(cmd, Command::MigrateResumeSource));
+    }
+
+    #[test]
+    fn command_deserialize_migrate_cancel() {
+        let cmd: Command =
+            serde_json::from_str(r#"{"command":"migrate-cancel"}"#).unwrap();
+        assert!(matches!(cmd, Command::MigrateCancel));
+        assert_eq!(cmd.name(), "migrate-cancel");
     }
 
     #[test]

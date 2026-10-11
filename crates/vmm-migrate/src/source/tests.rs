@@ -163,6 +163,7 @@ fn flush_failure_resumes_devices_and_vcpus() {
     let result = finish_source(
         result,
         MigrationPhase::Pause,
+        GateState::None,
         &discard(),
         resume_fn,
         move || {
@@ -189,6 +190,7 @@ fn a_committed_source_is_never_resumed() {
     let result = finish_source(
         Err(MigrateError::Committed("no confirmation".into())),
         MigrationPhase::Committed,
+        GateState::None,
         &discard(),
         resume_fn,
         || -> Result<(), &'static str> {
@@ -211,6 +213,7 @@ fn a_failure_in_finish_still_rolls_back() {
     let result = finish_source(
         Err(MigrateError::WebSocket("closed".into())),
         MigrationPhase::Finish,
+        GateState::None,
         &discard(),
         resume_fn,
         || Ok::<(), &'static str>(()),
@@ -257,6 +260,22 @@ fn pair() -> (Chan<UnixStream>, Chan<UnixStream>) {
     )
 }
 
+fn no_hook() -> CommittedFn {
+    Box::new(|| {})
+}
+
+/// A hook that counts its calls.
+fn counting() -> (CommittedFn, Arc<std::sync::atomic::AtomicUsize>) {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let by_hook = Arc::clone(&calls);
+    (
+        Box::new(move || {
+            by_hook.fetch_add(1, Ordering::AcqRel);
+        }),
+        calls,
+    )
+}
+
 fn status() -> Arc<Mutex<MigrationStatus>> {
     Arc::new(Mutex::new(MigrationStatus::default()))
 }
@@ -276,7 +295,8 @@ fn a_cancelled_source_never_commits() {
     };
     let status = status();
 
-    let error = hand_over(&mut source, &gate, &status).expect_err("cancelled");
+    let error = hand_over(&mut source, &gate, no_hook(), &status, &discard())
+        .expect_err("cancelled");
 
     assert!(crate::is_cancel(&error), "{error}");
     assert_eq!(phase(&status), MigrationPhase::Finish, "not rolled back");
@@ -292,7 +312,7 @@ fn a_destination_abort_rolls_the_source_back() {
     let gate = Gate::default();
     let status = status();
 
-    let error = hand_over(&mut source, &gate, &status)
+    let error = hand_over(&mut source, &gate, no_hook(), &status, &discard())
         .expect_err("the destination aborted");
 
     assert_eq!(gate.commits.load(Ordering::Acquire), 0, "committed");
@@ -302,6 +322,7 @@ fn a_destination_abort_rolls_the_source_back() {
     let _ = finish_source(
         Err(error),
         phase(&status),
+        GateState::None,
         &discard(),
         Box::new(move || by_callback.store(true, Ordering::Release)),
         || Ok::<(), &'static str>(()),
@@ -317,8 +338,14 @@ fn a_commit_the_peer_may_have_missed_is_never_rolled_back() {
     drop(dest);
     let status = status();
 
-    let error = hand_over(&mut source, &Gate::default(), &status)
-        .expect_err("the peer left");
+    let error = hand_over(
+        &mut source,
+        &Gate::default(),
+        no_hook(),
+        &status,
+        &discard(),
+    )
+    .expect_err("the peer left");
 
     assert!(matches!(error, MigrateError::Committed(_)), "{error}");
     assert_eq!(phase(&status), MigrationPhase::Committed);
@@ -336,7 +363,8 @@ fn a_commit_goes_through_the_gate() {
     let gate = Gate::default();
     let status = status();
 
-    hand_over(&mut source, &gate, &status).expect("handed over");
+    hand_over(&mut source, &gate, no_hook(), &status, &discard())
+        .expect("handed over");
 
     assert_eq!(gate.commits.load(Ordering::Acquire), 1);
     assert_eq!(phase(&status), MigrationPhase::Committed);
@@ -413,10 +441,319 @@ fn a_pre_pause_failure_does_not_resume_a_running_guest() {
     let result = finish_source(
         Err(MigrateError::Io("connect failed".into())),
         MigrationPhase::Sync,
+        GateState::None,
         &discard(),
         resume_fn,
         || Ok::<(), &'static str>(()),
     );
     assert!(result.is_err());
     assert!(!resumed.load(Ordering::Acquire));
+}
+
+#[test]
+fn a_source_held_by_the_gate_is_never_resumed() {
+    // The orchestrator recorded the go before it answered. Only its
+    // order may bring the guest back here.
+    for phase in [
+        MigrationPhase::RamPushPostPause,
+        MigrationPhase::DeviceState,
+        MigrationPhase::Finish,
+    ] {
+        let resumed = Arc::new(AtomicBool::new(false));
+        let by_callback = Arc::clone(&resumed);
+        let result = finish_source(
+            Err(MigrateError::WebSocket("closed".into())),
+            phase,
+            GateState::Go,
+            &discard(),
+            Box::new(move || by_callback.store(true, Ordering::Release)),
+            || -> Result<(), &'static str> {
+                panic!("a held source must not resume its vCPUs")
+            },
+        );
+        assert!(result.is_err());
+        assert!(!resumed.load(Ordering::Acquire), "{phase}");
+    }
+}
+
+#[test]
+fn an_aborted_gate_rolls_the_source_back() {
+    let resumed = Arc::new(AtomicBool::new(false));
+    let by_callback = Arc::clone(&resumed);
+    let _ = finish_source(
+        Err(MigrateError::Phase("cutover gate: abort".into())),
+        MigrationPhase::Pause,
+        GateState::Abort,
+        &discard(),
+        Box::new(move || by_callback.store(true, Ordering::Release)),
+        || Ok::<(), &'static str>(()),
+    );
+    assert!(resumed.load(Ordering::Acquire));
+}
+
+#[test]
+fn a_trickling_peer_after_the_go_rolls_the_source_back() {
+    // Each byte comes inside the read deadline, so only the cutover
+    // deadline ends the wait.
+    let (ours, mut peer) = UnixStream::pair().expect("pair");
+    let status = Arc::new(Mutex::new(MigrationStatus {
+        gate: GateState::Go,
+        ..MigrationStatus::default()
+    }));
+    let cutover = Cutover::start(
+        Duration::from_millis(300),
+        ours.shutter().expect("shutter"),
+        Arc::clone(&status),
+        &discard(),
+    )
+    .expect("cutover");
+    let deadlines = Deadlines {
+        post_pause: Duration::from_millis(500),
+        ..Deadlines::default()
+    };
+    let mut source =
+        Chan::new(ours, tungstenite::protocol::Role::Client, deadlines)
+            .expect("source channel");
+    source.enter_post_pause().expect("post-pause deadline");
+    let trickle = std::thread::spawn(move || {
+        // A binary frame that says 65535 bytes follow, then a byte at
+        // a time.
+        let _ = peer.write_all(&[0x82, 126, 0xff, 0xff]);
+        while peer.write_all(&[0]).is_ok() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    let gate = Gate::default();
+    cutover.arm();
+    let started = std::time::Instant::now();
+    let error = hand_over(
+        &mut source,
+        &Gated {
+            inner: &gate,
+            cutover: &cutover,
+        },
+        no_hook(),
+        &status,
+        &discard(),
+    )
+    .expect_err("the cutover ran out of time");
+    assert!(cutover.finish(), "the deadline did not fire");
+    let error = cutover.expired_or(error);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(error.to_string().contains("no commit within"), "{error}");
+    assert_eq!(gate.commits.load(Ordering::Acquire), 0);
+
+    let (phase, gate_state) = {
+        let s = status.lock().expect("status");
+        (s.phase, s.gate)
+    };
+    assert_eq!(gate_state, GateState::Abort);
+    let resumed = Arc::new(AtomicBool::new(false));
+    let by_callback = Arc::clone(&resumed);
+    let _ = finish_source(
+        Err(error),
+        phase,
+        gate_state,
+        &discard(),
+        Box::new(move || by_callback.store(true, Ordering::Release)),
+        || Ok::<(), &'static str>(()),
+    );
+    assert!(resumed.load(Ordering::Acquire), "the source stayed paused");
+    trickle.join().expect("trickle");
+}
+
+#[test]
+fn a_commit_after_the_cutover_deadline_is_refused() {
+    let (mut source, mut dest) = pair();
+    let status = Arc::new(Mutex::new(MigrationStatus {
+        gate: GateState::Go,
+        ..MigrationStatus::default()
+    }));
+    let cutover = Cutover::start(
+        Duration::from_millis(50),
+        Box::new(|| {}),
+        Arc::clone(&status),
+        &discard(),
+    )
+    .expect("cutover");
+    cutover.arm();
+    std::thread::sleep(Duration::from_millis(300));
+    dest.send(&Message::Okay).expect("holds it all");
+    let gate = Gate::default();
+    let error = hand_over(
+        &mut source,
+        &Gated {
+            inner: &gate,
+            cutover: &cutover,
+        },
+        no_hook(),
+        &status,
+        &discard(),
+    )
+    .expect_err("too late to commit");
+    assert!(error.to_string().contains("no commit within"), "{error}");
+    assert_eq!(gate.commits.load(Ordering::Acquire), 0);
+    assert_ne!(phase(&status), MigrationPhase::Committed);
+}
+
+#[test]
+fn the_disks_are_given_up_right_after_the_commit() {
+    let (mut source, mut dest) = pair();
+    let peer = std::thread::spawn(move || {
+        dest.send(&Message::Okay).expect("holds it all");
+        assert!(matches!(dest.recv(), Ok(Message::Okay)));
+        dest.send(&Message::Okay).expect("started");
+        dest
+    });
+    let (hook, calls) = counting();
+    hand_over(&mut source, &Gate::default(), hook, &status(), &discard())
+        .expect("handed over");
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    peer.join().expect("the destination finished");
+}
+
+#[test]
+fn a_commit_that_may_be_lost_still_gives_the_disks_up() {
+    let (mut source, mut dest) = pair();
+    dest.send(&Message::Okay).expect("holds it all");
+    drop(dest);
+    let (hook, calls) = counting();
+    let error =
+        hand_over(&mut source, &Gate::default(), hook, &status(), &discard())
+            .expect_err("the peer left");
+    assert!(matches!(error, MigrateError::Committed(_)), "{error}");
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn no_commit_keeps_the_disks() {
+    let (mut source, mut dest) = pair();
+    dest.send(&Message::Error(crate::cancelled()))
+        .expect("abort");
+    let (hook, calls) = counting();
+    hand_over(&mut source, &Gate::default(), hook, &status(), &discard())
+        .expect_err("the destination aborted");
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+}
+
+/// Guest RAM at 0, the firmware scratch RAM in the hole where the lab
+/// source failed, and the boot ROM.
+fn firmware_layout(ram: usize) -> MemCtx {
+    use vmm_core::mem::{PhysMap, RegionKind};
+    let map = PhysMap::new();
+    map.add_region_anon(0, ram, RegionKind::Ram).expect("RAM");
+    map.add_region_anon(0xFCC0_0000, 0x4000, RegionKind::Ram)
+        .expect("scratch RAM");
+    map.add_region_anon(0xFF00_0000, 0x1000, RegionKind::Rom)
+        .expect("ROM");
+    MemCtx::new(Arc::new(map))
+}
+
+fn no_tracking(_: u64, _: usize, _: &mut [u8]) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[test]
+fn the_full_pass_sends_guest_ram_only() {
+    // The fbuf VRAM is kernel device memory and never in the map; the
+    // scratch RAM and the ROM are, and must stay out of the stream.
+    const RAM: usize = 16 * PAGE_SIZE;
+    let memctx = firmware_layout(RAM);
+    let (mut source, mut dest) = pair();
+    let peer = std::thread::spawn(move || {
+        let mut pages = Vec::new();
+        loop {
+            match dest.recv().expect("message") {
+                Message::PageBatch {
+                    base_gpa,
+                    page_count,
+                    ..
+                } => pages.extend(
+                    (0..u64::from(page_count))
+                        .map(|i| base_gpa + i * PAGE_SIZE as u64),
+                ),
+                Message::MemEnd => break,
+                other => panic!("unexpected {}", other.name()),
+            }
+        }
+        dest.send(&Message::MemDone).expect("MemDone");
+        pages
+    });
+
+    push_ram_all(
+        &mut source,
+        &mut no_tracking,
+        &memctx,
+        &Gate::default(),
+        &status(),
+    )
+    .expect("full pass");
+
+    let pages = peer.join().expect("peer");
+    assert_eq!(pages.len(), RAM / PAGE_SIZE);
+    assert!(pages.iter().all(|&gpa| gpa < RAM as u64), "{pages:x?}");
+}
+
+#[test]
+fn a_peer_that_stops_reading_fails_the_pre_pause_push() {
+    // The lab source sat at ram-push-pre-pause for ten minutes after
+    // the destination died behind the agent's bridge.
+    const RAM: usize = 2048 * PAGE_SIZE;
+    let memctx = firmware_layout(RAM);
+    // Bytes zstd cannot shrink, so the socket buffer fills.
+    let mut noise = vec![0u8; RAM];
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for b in noise.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = x as u8;
+    }
+    memctx.write(0, &noise).expect("fill");
+
+    let (ours, _silent_peer) = UnixStream::pair().expect("pair");
+    let (stream, watch) =
+        crate::stall::watch(ours, Duration::from_millis(300), &discard())
+            .expect("watch");
+    let mut source = Chan::new(
+        stream,
+        tungstenite::protocol::Role::Client,
+        Deadlines::default(),
+    )
+    .expect("channel");
+    let status = status();
+    set_phase(&status, MigrationPhase::RamPushPrePause);
+
+    let started = std::time::Instant::now();
+    let error = push_ram_all(
+        &mut source,
+        &mut no_tracking,
+        &memctx,
+        &Gate::default(),
+        &status,
+    )
+    .expect_err("nobody reads");
+    let error = stalled_or(&watch, error);
+    record_failure(&status, &error);
+
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(error.to_string().contains("no progress"), "{error}");
+    let s = status.lock().expect("status");
+    assert_eq!(s.phase, MigrationPhase::Error);
+    assert!(s
+        .error
+        .as_deref()
+        .is_some_and(|e| e.contains("no progress")));
+}
+
+#[test]
+fn a_committed_failure_keeps_the_committed_phase() {
+    // The orchestrator reads `committed` to know the guest may be gone.
+    let status = status();
+    set_phase(&status, MigrationPhase::Committed);
+    record_failure(&status, &MigrateError::Committed("lost".into()));
+    let s = status.lock().expect("status");
+    assert_eq!(s.phase, MigrationPhase::Committed);
+    assert!(s.error.is_some());
 }

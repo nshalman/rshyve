@@ -18,6 +18,9 @@ des.workspace = true
 getrandom.workspace = true
 slog.workspace = true
 usdt = { workspace = true, features = ["asm"] }
+# Pure Rust: a C codec here would stop the illumos cross-check.
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 
 [dev-dependencies]
+ron.workspace = true
 tempfile = "3"

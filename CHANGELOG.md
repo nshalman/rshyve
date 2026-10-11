@@ -28,6 +28,9 @@ changed default, a removed feature, or a security fix.
 - `vmm-mantablock`, an NVMe backend that sends I/O to the MantaBlock
   engine over a shared-memory ring. `rshyve` uses it for
   `-s <slot>,nvme,mantablock=<socket>,volume=<uuid>`.
+- `rshyve --ring-config <path>`: MantaBlock ring disks and migration
+  settings from a file, so a VM with several ring disks fits the brand's
+  `bhyve-extra-opts` limit. See `docs/migration-gate.md`.
 
 ### Changed
 

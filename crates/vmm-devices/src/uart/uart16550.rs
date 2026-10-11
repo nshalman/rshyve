@@ -39,9 +39,14 @@ use std::collections::VecDeque;
 
 use bitflags::bitflags;
 
+mod migrate;
+
 // ---------------------------------------------------------------------------
 // Public UART core
 // ---------------------------------------------------------------------------
+
+/// Bytes each FIFO holds.
+pub const FIFO_LEN: usize = 256;
 
 /// 16550 UART register state machine.
 pub struct Uart {
@@ -87,8 +92,8 @@ impl Uart {
             // entire V2 protocol frames (~100+ bytes) on both sides
             // to avoid dropping bytes between the guest serial driver
             // and the mdata agent polling loop.
-            rx_fifo: Fifo::new(256),
-            tx_fifo: Fifo::new(256),
+            rx_fifo: Fifo::new(FIFO_LEN),
+            tx_fifo: Fifo::new(FIFO_LEN),
         }
     }
 

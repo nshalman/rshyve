@@ -16,7 +16,8 @@ use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::MemCtx;
 use vmm_devices::lifecycle::{
-    DeviceMigrateState, DeviceStateError, HypervMigrateState, WireBdf,
+    DeviceMigrateState, DeviceStateError, HypervMigrateState, PlatformIdentity,
+    PlatformStatePayload, WireBdf,
 };
 
 use crate::codec::{
@@ -25,7 +26,7 @@ use crate::codec::{
 };
 use crate::cpu;
 use crate::pages::apply_page_batch;
-use crate::protocol::select_protocol;
+use crate::protocol::{self, protocol_blocker, select_protocol};
 use crate::state;
 use crate::wire::{
     cancel_or, not_cancelled, set_phase, unexpected, Chan, Deadlines, Transport,
@@ -44,8 +45,19 @@ pub type DeviceRestoreFn = Box<
     dyn Fn(WireBdf, &DeviceMigrateState) -> Result<(), DeviceStateError> + Send,
 >;
 
+/// Give one device with no PCI address the state the source exported
+/// under the same registry id.
+pub type PlatformRestoreFn = Box<
+    dyn Fn(&str, &DeviceMigrateState) -> Result<(), DeviceStateError> + Send,
+>;
+
 /// Start the device workers once the import succeeded.
 pub type DeviceResumeFn = Box<dyn Fn() + Send>;
+
+/// Attach every disk the source gave up at its commit. Runs after the
+/// commit and before any device resumes: a device resume alone can
+/// submit the writes the guest left queued.
+pub type DeviceAttachFn = Box<dyn Fn() -> Result<(), String> + Send>;
 
 /// Put the Hyper-V enlightenment back, reinstalling both overlay
 /// pages from the MSR values the source carried.
@@ -63,6 +75,8 @@ pub struct DestConfig {
     /// Every local device that carries migration state. The payload's
     /// identity set must equal this.
     pub devices: Vec<DeviceIdentity>,
+    /// The same for the devices with no PCI address.
+    pub platform: Vec<PlatformIdentity>,
     pub deadlines: Deadlines,
     /// Accept a source whose guest saw CPU features this host lacks.
     ///
@@ -74,6 +88,8 @@ pub struct DestConfig {
 /// The device hooks the import drives.
 pub struct DestHooks {
     pub restore: DeviceRestoreFn,
+    pub restore_platform: PlatformRestoreFn,
+    pub attach: DeviceAttachFn,
     pub resume: DeviceResumeFn,
     pub hyperv: HypervRestoreFn,
     pub pause_vm: VmPauseFn,
@@ -125,6 +141,13 @@ fn run_inner<S: Transport>(
         chan.send(&Message::Error(err.clone()))?;
         return Err(err);
     };
+    if let Some(why) =
+        protocol_blocker(protocol, &config.devices, &config.platform)
+    {
+        let err = MigrateError::ProtocolMismatch(why);
+        chan.send(&Message::Error(err.clone()))?;
+        return Err(err);
+    }
     let gate = hooks.gate.as_ref();
     chan.send_uncommitted(
         gate,
@@ -213,6 +236,11 @@ fn take_over<S: Transport>(
     chan.expect_okay()?;
 
     set_phase(status, MigrationPhase::Committed);
+    (hooks.attach)().map_err(|e| {
+        slog::error!(log, "a disk did not attach after the commit; the \
+            guest stays paused here"; "error" => %e);
+        MigrateError::State(format!("attach after the commit: {e}"))
+    })?;
     // The workers were never started on this VM, and the guest is about
     // to post I/O to every one of them.
     (hooks.resume)();
@@ -251,6 +279,7 @@ fn check_preamble(
         )));
     }
     check_topology(&preamble.devices, &config.devices)?;
+    check_topology(&preamble.platform, &config.platform)?;
 
     let Some(ref src) = preamble.cpu_features else {
         return Err(MigrateError::PreambleMismatch(
@@ -300,11 +329,11 @@ fn xsave_plan<'a>(
 ///
 /// A destination started with one disk fewer would otherwise resume the
 /// guest with that disk at reset and no error anywhere.
-fn check_topology(
-    source: &[DeviceIdentity],
-    local: &[DeviceIdentity],
+fn check_topology<T: std::fmt::Display>(
+    source: &[T],
+    local: &[T],
 ) -> Result<(), MigrateError> {
-    let named = |set: &[DeviceIdentity]| -> Vec<String> {
+    let named = |set: &[T]| -> Vec<String> {
         let mut v: Vec<String> = set.iter().map(|d| d.to_string()).collect();
         v.sort();
         v
@@ -353,6 +382,17 @@ fn restore_devices(
             )));
         }
     }
+    // These always export a state, and one restored from nothing would
+    // leave the guest's driver talking to a device at reset.
+    if let Some(entry) = dev_state.emulated.iter().find(|e| {
+        e.state.is_none()
+            && protocol::ALWAYS_EXPORTS.contains(&expected[&e.bdf])
+    }) {
+        return Err(MigrateError::State(format!(
+            "payload carries no {} state for {}",
+            expected[&entry.bdf], entry.bdf,
+        )));
+    }
     // A device this VM has and the payload does not would resume at
     // reset while the guest driver believes it configured.
     if let Some(bdf) = expected.keys().find(|bdf| !seen.contains_key(bdf)) {
@@ -372,8 +412,11 @@ fn restore_devices(
         }
     }
 
+    check_platform_payload(&dev_state.platform, &config.platform)?;
+
     slog::info!(log, "restoring device state";
-        "devices" => dev_state.emulated.len());
+        "devices" => dev_state.emulated.len(),
+        "platform" => dev_state.platform.len());
     for entry in &dev_state.emulated {
         let Some(ref state) = entry.state else {
             continue;
@@ -381,6 +424,46 @@ fn restore_devices(
         (hooks.restore)(entry.bdf, state).map_err(|error| {
             MigrateError::State(format!("{}: {error}", entry.bdf))
         })?;
+    }
+    for entry in &dev_state.platform {
+        (hooks.restore_platform)(&entry.id, &entry.state).map_err(|error| {
+            MigrateError::State(format!(
+                "{}: {error}",
+                crate::wire::peer_text(&entry.id)
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Each local device with no PCI address takes exactly one state, and
+/// the payload names no other. A UART left at reset stalls the guest's
+/// console and its metadata channel.
+fn check_platform_payload(
+    payload: &[PlatformStatePayload],
+    local: &[PlatformIdentity],
+) -> Result<(), MigrateError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in payload {
+        if !local.iter().any(|l| l.id == entry.id) {
+            return Err(MigrateError::State(format!(
+                "payload carries state for {}, which this VM has no device \
+                 under",
+                crate::wire::peer_text(&entry.id),
+            )));
+        }
+        if !seen.insert(entry.id.as_str()) {
+            return Err(MigrateError::State(format!(
+                "payload carries two states for {}",
+                entry.id,
+            )));
+        }
+    }
+    if let Some(missing) = local.iter().find(|l| !seen.contains(l.id.as_str()))
+    {
+        return Err(MigrateError::State(format!(
+            "payload carries no entry for {missing}"
+        )));
     }
     Ok(())
 }
@@ -721,6 +804,8 @@ mod pass_tests {
     fn hooks(gate: Gate) -> DestHooks {
         DestHooks {
             restore: Box::new(|_, _| Ok(())),
+            restore_platform: Box::new(|_, _| Ok(())),
+            attach: Box::new(|| panic!("disks attached")),
             resume: Box::new(|| panic!("devices resumed")),
             hyperv: Box::new(|_| false),
             pause_vm: Box::new(|| Ok(())),
@@ -768,4 +853,71 @@ mod pass_tests {
             .expect_err("the source rolled back");
         sender.join().expect("the source finished");
     }
+
+    /// Hooks that log each step, with an attach that answers `attached`.
+    fn logging(
+        attached: Result<(), String>,
+    ) -> (DestHooks, Arc<Mutex<Vec<&'static str>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (a, r, v) = (Arc::clone(&log), Arc::clone(&log), Arc::clone(&log));
+        let hooks = DestHooks {
+            attach: Box::new(move || {
+                a.lock().expect("log").push("attach");
+                attached.clone()
+            }),
+            resume: Box::new(move || r.lock().expect("log").push("devices")),
+            resume_vm: Box::new(move || {
+                v.lock().expect("log").push("vcpus");
+                Ok(())
+            }),
+            ..hooks(Gate::default())
+        };
+        (hooks, log)
+    }
+
+    /// A source that says it holds everything and commits.
+    fn committing(
+        mut source: Chan<UnixStream>,
+    ) -> std::thread::JoinHandle<Chan<UnixStream>> {
+        std::thread::spawn(move || {
+            assert!(matches!(source.recv(), Ok(Message::Okay)));
+            source.send(&Message::Okay).expect("commit");
+            source
+        })
+    }
+
+    #[test]
+    fn the_disks_attach_after_the_commit_and_before_any_resume() {
+        let (source, mut dest) = pair(Deadlines::default());
+        let sender = committing(source);
+        let (hooks, log) = logging(Ok(()));
+        let status = status();
+        take_over(&mut dest, &hooks, &status, &discard()).expect("taken over");
+        assert_eq!(*log.lock().expect("log"), ["attach", "devices", "vcpus"]);
+        let mut source = sender.join().expect("the source finished");
+        assert!(matches!(source.recv(), Ok(Message::Okay)), "no started");
+    }
+
+    #[test]
+    fn a_disk_that_does_not_attach_keeps_the_guest_paused() {
+        let (source, mut dest) = pair(Deadlines::default());
+        let sender = committing(source);
+        let (hooks, log) = logging(Err("no engine".into()));
+        let status = status();
+        let error = take_over(&mut dest, &hooks, &status, &discard())
+            .expect_err("no attach");
+        assert!(error.to_string().contains("no engine"), "{error}");
+        assert_eq!(*log.lock().expect("log"), ["attach"]);
+        // The source committed: this side holds the guest, and says so.
+        assert_eq!(
+            status.lock().expect("status").phase,
+            MigrationPhase::Committed
+        );
+        drop(dest);
+        let mut source = sender.join().expect("the source finished");
+        assert!(source.recv().is_err(), "the source heard a start");
+    }
 }
+
+#[cfg(test)]
+mod platform_tests;

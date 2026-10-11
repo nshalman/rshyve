@@ -22,7 +22,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::process::{kill_process, waitpid, Pid, Signal, WaitOptions};
-use vmm_mantablock::{connect, Config, Job, Ring, Sink};
+use vmm_devices::lifecycle::BackingAttach;
+use vmm_mantablock::{connect, Config, Handover, Job, Ring, Sink};
 use vmm_storage::nvme::backend::{BlockOp, BlockStatus};
 
 #[path = "engine/controller.rs"]
@@ -569,4 +570,92 @@ fn an_engine_restarted_without_the_generation_fails_held_io_at_the_bound() {
         "{done:?}"
     );
     assert!(ring.is_lost());
+}
+
+fn within(secs: u64, allow_unproven: bool) -> BackingAttach {
+    BackingAttach {
+        until: Instant::now() + Duration::from_secs(secs),
+        allow_unproven,
+    }
+}
+
+fn read_back(h: &Handover<TJob>, calls: &Calls, id: u32, lba: u64) -> Vec<u8> {
+    let mem = Arc::new(Mutex::new(vec![0; PAGE]));
+    let before = calls.all().len();
+    h.submit(TJob {
+        id,
+        queue: 1,
+        tag: 0,
+        op: BlockOp::Read,
+        off: lba * PAGE as u64,
+        mem: Arc::clone(&mem),
+    });
+    let done = calls.wait_for(before + 1, Duration::from_secs(5));
+    assert_eq!(done[before], (id, BlockStatus::Success));
+    let data = mem.lock().unwrap().clone();
+    data
+}
+
+#[test]
+#[ignore = "runs the real engine: set MANTABLOCK_ENGINE, pass --ignored"]
+fn a_migration_hands_the_volume_over_with_a_fresh_attach() {
+    let lab = Lab::start();
+    let src_calls = Arc::new(Calls::default());
+    let source = Handover::<TJob>::attached(
+        connect(lab.config(FILE_VOL)).unwrap(),
+        Arc::clone(&src_calls) as _,
+    );
+    source.submit(job(1, 1, 0, BlockOp::Write { fua: true }, 9, pattern(1, 9)));
+    src_calls.wait_for(1, Duration::from_secs(5));
+
+    // The commit: the source gives the volume up and the engine says so.
+    source.detach().expect("a confirmed Detach");
+    assert!(!source.is_attached());
+
+    let dst_calls = Arc::new(Calls::default());
+    let dest = Handover::<TJob>::deferred(
+        lab.config(FILE_VOL),
+        source.shape(),
+        Arc::clone(&dst_calls) as _,
+    );
+    // Today's engine does not report migrate-v1.
+    let why = dest.attach(&within(5, false)).expect_err("no migrate-v1");
+    assert!(why.contains("migrate-v1"), "{why}");
+    dest.attach(&within(5, true))
+        .expect("attach on the destination");
+    assert_eq!(read_back(&dest, &dst_calls, 2, 9), pattern(1, 9));
+
+    // The source gets it back the same way, once the destination gave
+    // it up.
+    dest.detach().expect("detach");
+    source.attach(&within(5, true)).expect("attach again");
+    assert_eq!(read_back(&source, &src_calls, 3, 9), pattern(1, 9));
+    source.halt();
+}
+
+#[test]
+#[ignore = "runs the real engine: set MANTABLOCK_ENGINE, pass --ignored"]
+fn a_destination_waits_for_the_engine_to_serve_the_volume() {
+    let mut lab = Lab::start();
+    let shape = connect(lab.config(FILE_VOL)).unwrap().shape();
+    lab.engine.kill().unwrap();
+    lab.engine.wait().unwrap();
+    for vol in [FILE_VOL, NULL_VOL] {
+        let _ = std::fs::remove_file(lab.sock(vol));
+    }
+    let calls = Arc::new(Calls::default());
+    let dest = Handover::<TJob>::deferred(
+        lab.config(FILE_VOL),
+        shape,
+        Arc::clone(&calls) as _,
+    );
+    let waiting = Arc::clone(&dest);
+    let t = thread::spawn(move || waiting.attach(&within(20, true)));
+    thread::sleep(Duration::from_millis(500));
+    assert!(!dest.is_attached());
+    let bin = std::env::var_os("MANTABLOCK_ENGINE").unwrap();
+    lab.engine = spawn(&bin, &lab._dirs, &lab.disk);
+    t.join().unwrap().expect("attached once the engine served");
+    assert!(dest.is_attached());
+    dest.halt();
 }

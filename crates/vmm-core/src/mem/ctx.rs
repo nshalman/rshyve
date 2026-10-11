@@ -122,8 +122,13 @@ impl MemCtx {
         self.map.lookup_untracked(gpa, len)
     }
 
-    /// Get all memory regions for migration dirty page tracking.
+    /// Get all memory regions, of every kind.
     pub fn regions(&self) -> Vec<(u64, usize, RegionKind)> {
         self.map.regions()
+    }
+
+    /// The RAM a live migration moves. See [`PhysMap::guest_ram`].
+    pub fn guest_ram(&self) -> Vec<(u64, usize)> {
+        self.map.guest_ram()
     }
 }

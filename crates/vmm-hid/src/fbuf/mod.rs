@@ -15,11 +15,15 @@
 //! socket. It reads pixels from the devmem host view and streams them
 //! to connected VNC clients using the RFB 3.8 protocol with Raw encoding.
 //!
+//! A migration carries the PCI header, the mode and the VRAM; see
+//! `migrate`.
+//!
 //! # PCI Identity
 //!
 //! - Vendor: `0xFB5D`, Device: `0x40FB`
 //! - Class: Display (0x03), Subclass: VGA (0x00)
 
+mod migrate;
 pub mod rfb;
 mod vnc;
 
@@ -35,10 +39,11 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::DevMemSeg;
 use vmm_core::mmio::{MmioBus, MmioFn};
 
+use vmm_devices::lifecycle::DeviceStateError;
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use vmm_devices::pci::BarN;
-use vmm_devices::{InputBroker, Lifecycle};
+use vmm_devices::{DeviceMigrateState, InputBroker, Lifecycle};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -502,9 +507,22 @@ impl Framebuffer {
 // ---------------------------------------------------------------------------
 
 impl Lifecycle for Framebuffer {
-    // The VNC thread holds no guest state that must drain or migrate.
+    // The VNC thread holds no guest state that must drain.
     fn type_name(&self) -> &'static str {
         "framebuffer"
+    }
+
+    fn export_migrate_state(
+        &self,
+    ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {
+        self.export_state().map(Some)
+    }
+
+    fn restore_migrate_state(
+        &self,
+        state: &DeviceMigrateState,
+    ) -> Result<(), DeviceStateError> {
+        self.restore_state(state)
     }
 
     fn halt(&self) {

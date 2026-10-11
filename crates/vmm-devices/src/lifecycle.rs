@@ -55,6 +55,17 @@ pub enum FlushError {
     TimedOut,
 }
 
+/// How a backing store attaches before the guest runs again.
+#[derive(Debug, Clone, Copy)]
+pub struct BackingAttach {
+    /// Retry until this instant. On a migration destination the store
+    /// opens only after the orchestrator has moved it.
+    pub until: Instant,
+    /// Take a store that cannot prove a fresh attachment is new for the
+    /// volume. For a lab only: a reused attachment id can drop a write.
+    pub allow_unproven: bool,
+}
+
 /// The deadline a device halt holds itself to when it does not say.
 ///
 /// This value covers every halt in the tree that waits on purpose.
@@ -74,11 +85,16 @@ pub const DEFAULT_HALT_BUDGET: Duration = Duration::from_secs(5);
 mod state;
 
 pub use state::{
-    DeviceMigrateState, DeviceStateError, DeviceStatePayload,
-    HypervMigrateState, MigratePciState, NvmeMigrateBackend, NvmeMigrateCq,
-    NvmeMigrateCqe, NvmeMigrateNamespace, NvmeMigrateQueueCounts,
-    NvmeMigrateSq, NvmeMigrateState, VirtioMigrateQueue, VirtioMigrateState,
-    WireBdf,
+    AcpiGpeMigrateState, AcpiPmMigrateState, ChipsetMigrateState,
+    CpuHotplugMigrateState, DeviceMigrateState, DeviceStateError,
+    DeviceStatePayload, FbufMigrateState, FbufMigrateVram, FwCfgMigrateState,
+    HypervMigrateState, MemHotplugMigrateState, MigratePciState,
+    NvmeMigrateBackend, NvmeMigrateCq, NvmeMigrateCqe, NvmeMigrateNamespace,
+    NvmeMigrateQueueCounts, NvmeMigrateSq, NvmeMigrateState, PlatformIdentity,
+    PlatformStatePayload, Ps2KbdMigrateState, Ps2MigrateState,
+    Ps2MouseMigrateState, UartMigrateState, VirtioMigrateQueue,
+    VirtioMigrateState, WireBdf, XhciMigrateEventRing, XhciMigrateRing,
+    XhciMigrateState, XhciMigrateTablet,
 };
 
 /// General trait for emulated devices in the system.
@@ -209,6 +225,13 @@ pub trait Lifecycle: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Whether a migration carries this device's state although it has
+    /// no PCI address. The wire then names it by its registry id, and
+    /// the destination must have a device under that id too.
+    fn migrates_by_id(&self) -> bool {
+        false
+    }
+
     /// Take the state this device exported on the source. The caller
     /// matched the payload to this device by identity, so a payload of
     /// another kind is an error, and so is one with values this device
@@ -232,6 +255,42 @@ pub trait Lifecycle: Send + Sync + 'static {
     /// rollback, which must reach every other device.
     fn resume_after_migration(&self) -> Result<(), DeviceStateError> {
         Ok(())
+    }
+
+    /// Why a migration should not carry this device, when an operator
+    /// may still accept the risk for one migration. `None` otherwise.
+    fn migration_waivable(&self) -> Option<String> {
+        None
+    }
+
+    /// Options a migration destination must add to this device's `-s`
+    /// spec, or `None`.
+    fn migration_spec_options(&self) -> Option<String> {
+        None
+    }
+
+    /// Attach the backing store before the guest runs again: on a
+    /// migration destination after the source committed, or on a source
+    /// told to take the guest back. Called on a paused device with
+    /// nothing in flight. A device whose store is always attached does
+    /// nothing.
+    fn attach_backing(
+        &self,
+        _how: &BackingAttach,
+    ) -> Result<(), DeviceStateError> {
+        Ok(())
+    }
+
+    /// Give the backing store up after the source committed, without a
+    /// halt. Called on a paused device with nothing in flight.
+    fn detach_backing(&self) -> Result<(), DeviceStateError> {
+        Ok(())
+    }
+
+    /// False while the backing store is detached and the device must not
+    /// resume.
+    fn backing_attached(&self) -> bool {
+        true
     }
 
     /// Post-restore kick: called after restore_migrate_state to wake

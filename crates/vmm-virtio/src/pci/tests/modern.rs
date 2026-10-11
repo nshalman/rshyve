@@ -179,6 +179,7 @@ fn restore_virtio_state_replays_pci_transport_state() {
     state.pci = vmm_devices::lifecycle::MigratePciState {
         command: command.bits(),
         bar_addrs: [0xC120, 0, 0xFEC0_0000, 0, 0, 0],
+        intr_line: Some(11),
     };
 
     dev.restore_migrate_state(&DeviceMigrateState::Virtio(state))
@@ -193,6 +194,7 @@ fn restore_virtio_state_replays_pci_transport_state() {
         dev.cfg_read(vmm_devices::pci::bits::REG_COMMAND, 2),
         u32::from(command.bits()),
     );
+    assert_eq!(dev.cfg_read(vmm_devices::pci::bits::REG_INTR_LINE, 1), 11);
 
     let tracked = dev.device.state.lock().expect("tracking state lock");
     assert_eq!(tracked.reset_all_rings, 1);

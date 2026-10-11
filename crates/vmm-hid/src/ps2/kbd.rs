@@ -8,6 +8,8 @@
 
 use std::collections::VecDeque;
 
+use vmm_devices::lifecycle::{DeviceStateError, Ps2KbdMigrateState};
+
 use super::ctrl::{
     probe_keyboard_cmd, probe_keyboard_data, probe_keyboard_overflow,
     probe_unknown_keyboard_cmd, PS2ScanCodeSet,
@@ -179,6 +181,59 @@ impl PS2Kbd {
         }
     }
 }
+impl PS2Kbd {
+    pub(super) fn export_state(&self) -> Ps2KbdMigrateState {
+        Ps2KbdMigrateState {
+            buf: self.buf.iter().copied().collect(),
+            cur_cmd: self.cur_cmd,
+            enabled: self.enabled,
+            led_status: self.led_status,
+            typematic: self.typematic,
+            scan_code_set: self.scan_code_set.as_byte(),
+        }
+    }
+
+    /// Checked whole before anything is applied, so a refused state
+    /// leaves the keyboard as it was.
+    pub(super) fn import_state(
+        &mut self,
+        state: &Ps2KbdMigrateState,
+    ) -> Result<(), DeviceStateError> {
+        if state.buf.len() > PS2_KBD_BUFSZ {
+            return Err(DeviceStateError::invalid(format!(
+                "ps2: {} keyboard bytes, the buffer holds {PS2_KBD_BUFSZ}",
+                state.buf.len()
+            )));
+        }
+        if let Some(cmd) = state.cur_cmd {
+            if !matches!(
+                cmd,
+                PS2K_CMD_SET_LEDS | PS2K_CMD_SCAN_CODE | PS2K_CMD_TYPEMATIC
+            ) {
+                return Err(DeviceStateError::invalid(format!(
+                    "ps2: keyboard command {cmd:#x} takes no second byte"
+                )));
+            }
+        }
+        let scan_code_set = match state.scan_code_set {
+            1 => PS2ScanCodeSet::Set1,
+            2 => PS2ScanCodeSet::Set2,
+            other => {
+                return Err(DeviceStateError::invalid(format!(
+                    "ps2: scan code set {other}"
+                )))
+            }
+        };
+        self.buf = state.buf.iter().copied().collect();
+        self.cur_cmd = state.cur_cmd;
+        self.enabled = state.enabled;
+        self.led_status = state.led_status & 0b111;
+        self.typematic = state.typematic & PS2K_TYPEMATIC_MASK;
+        self.scan_code_set = scan_code_set;
+        Ok(())
+    }
+}
+
 impl Default for PS2Kbd {
     fn default() -> Self {
         Self::new()

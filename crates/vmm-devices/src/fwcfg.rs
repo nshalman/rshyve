@@ -37,6 +37,10 @@ use std::sync::{Arc, Mutex};
 use vmm_core::common::RWOp;
 use vmm_core::pio::{PioBus, PioFn};
 
+use crate::lifecycle::{
+    DeviceMigrateState, DeviceStateError, FwCfgMigrateState, Lifecycle,
+};
+
 /// PIO port for the selector register.
 const FWCFG_PORT_SEL: u16 = 0x510;
 /// PIO port for the data register (documented here for reference;
@@ -244,9 +248,74 @@ impl FwCfg {
     }
 }
 
+/// Only the item cursor moves after boot. The items are rebuilt from
+/// the destination's own configuration, which must match the source's.
+impl Lifecycle for FwCfg {
+    fn type_name(&self) -> &'static str {
+        "fwcfg"
+    }
+
+    fn migrates_by_id(&self) -> bool {
+        true
+    }
+
+    fn export_migrate_state(
+        &self,
+    ) -> Result<Option<DeviceMigrateState>, DeviceStateError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(Some(DeviceMigrateState::FwCfg(FwCfgMigrateState {
+            selector: inner.cur_selector,
+            offset: inner.cur_offset as u64,
+        })))
+    }
+
+    fn restore_migrate_state(
+        &self,
+        state: &DeviceMigrateState,
+    ) -> Result<(), DeviceStateError> {
+        let DeviceMigrateState::FwCfg(mig) = state else {
+            return Err(DeviceStateError::WrongKind {
+                want: "fwcfg",
+                got: state.kind(),
+            });
+        };
+        let offset = usize::try_from(mig.offset).map_err(|_| {
+            DeviceStateError::invalid(format!(
+                "fwcfg: offset {} does not fit",
+                mig.offset
+            ))
+        })?;
+        let mut inner = self.inner.lock().unwrap();
+        inner.cur_selector = mig.selector;
+        inner.cur_offset = offset;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_in_progress_continues_on_the_destination() {
+        let src = FwCfg::new();
+        {
+            let mut inner = src.inner.lock().unwrap();
+            inner.cur_selector = SEL_SIGNATURE;
+            inner.cur_offset = 0;
+            assert_eq!(FwCfg::read_data_byte(&mut inner), b'Q');
+            assert_eq!(FwCfg::read_data_byte(&mut inner), b'E');
+        }
+        let state = src.export_migrate_state().expect("export").expect("x");
+        let text = ron::ser::to_string(&state).expect("serialize");
+        let state: DeviceMigrateState = ron::de::from_str(&text).expect("de");
+
+        let dst = FwCfg::new();
+        dst.restore_migrate_state(&state).expect("restore");
+        let mut inner = dst.inner.lock().unwrap();
+        assert_eq!(FwCfg::read_data_byte(&mut inner), b'M');
+        assert_eq!(FwCfg::read_data_byte(&mut inner), b'U');
+    }
 
     #[test]
     fn signature_item() {

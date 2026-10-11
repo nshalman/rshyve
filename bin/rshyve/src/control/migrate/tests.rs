@@ -46,6 +46,9 @@ fn migrate_source_rejects_host_local_state() {
     let command = Command::MigrateSource {
         target_addr: "192.0.2.10:4567".to_string(),
         zfs_barrier: None,
+        gate: None,
+        gate_timeout_ms: None,
+        allow_engine_without_migrate_v1: false,
     };
 
     for state in [
@@ -74,6 +77,9 @@ fn migrate_source_rejects_ahci_cd() {
     let command = Command::MigrateSource {
         target_addr: "192.0.2.10:4567".to_string(),
         zfs_barrier: None,
+        gate: None,
+        gate_timeout_ms: None,
+        allow_engine_without_migrate_v1: false,
     };
 
     let response =
@@ -130,13 +136,16 @@ fn a_vm_with_only_migratable_devices_can_be_a_source() {
         unmigratable_devices(&[ident(4, "nvme"), ident(5, "virtio-blk")]),
         None,
     );
+    // Its controller state is carried since v9, so the VNC tablet no
+    // longer keeps a VM in place.
+    assert_eq!(unmigratable_devices(&[ident(30, "xhci")]), None);
 }
 
 #[test]
 fn a_device_whose_state_is_not_carried_blocks_migration() {
     // The guest driver would find the device at reset on the far
     // side, with no error anywhere.
-    for kind in ["xhci", "ahci-cd", "virtio-fs", "virtio-vsock"] {
+    for kind in ["virtio-console", "ahci-cd", "virtio-fs", "virtio-vsock"] {
         let reason = unmigratable_devices(&[ident(6, kind)])
             .unwrap_or_else(|| panic!("{kind} must block migration"));
         assert!(reason.contains(kind), "{reason}");
@@ -148,9 +157,9 @@ fn a_device_whose_state_is_not_carried_blocks_migration() {
 fn every_blocking_device_is_named_in_the_refusal() {
     // An operator has to see all of them before they can retry.
     let reason =
-        unmigratable_devices(&[ident(6, "xhci"), ident(7, "virtio-fs")])
+        unmigratable_devices(&[ident(6, "ahci-cd"), ident(7, "virtio-fs")])
             .expect("two blocking devices");
-    assert!(reason.contains("xhci@0.6.0"), "{reason}");
+    assert!(reason.contains("ahci-cd@0.6.0"), "{reason}");
     assert!(reason.contains("virtio-fs@0.7.0"), "{reason}");
 }
 
@@ -293,10 +302,13 @@ fn a_ring_disk_blocks_migrate_source() {
         let registry = vmm_machine::DeviceRegistry::new();
         disk_at(&registry, "5", Some(RING), hot_added);
         let run = RunControl::new(VmRunState::Running);
-        let reason =
-            claim_source(&run, &HotplugEngines::default(), &registry, || {
-                identities(&registry)
-            });
+        let reason = claim_source(
+            &run,
+            &HotplugEngines::default(),
+            &registry,
+            || identities(&registry),
+            false,
+        );
         assert_names_the_ring_disk(reason.err(), "5");
         assert_eq!(run.get(), VmRunState::Running);
     }
@@ -313,9 +325,13 @@ fn a_file_backed_nvme_vm_still_migrates() {
     assert_eq!(dest.get(), VmRunState::Migrating);
     let source = RunControl::new(VmRunState::Running);
     assert_eq!(
-        claim_source(&source, &HotplugEngines::default(), &registry, || {
-            identities(&registry)
-        },),
+        claim_source(
+            &source,
+            &HotplugEngines::default(),
+            &registry,
+            || identities(&registry),
+            false,
+        ),
         Ok(()),
     );
     assert_eq!(source.get(), VmRunState::Migrating);
@@ -537,4 +553,115 @@ fn a_passthru_device_blocks_migration() {
     let dest = RunControl::new(VmRunState::Paused);
     assert!(claim_dest(&dest, &registry).is_err());
     assert_eq!(dest.get(), VmRunState::Paused);
+}
+
+/// A ring disk on an engine without migrate-v1, with its shape.
+struct Unproven;
+
+impl vmm_devices::Lifecycle for Unproven {
+    fn type_name(&self) -> &'static str {
+        "nvme"
+    }
+
+    fn migration_waivable(&self) -> Option<String> {
+        Some("the engine does not report migrate-v1".into())
+    }
+
+    fn migration_spec_options(&self) -> Option<String> {
+        Some("ring-shape=1:256:4096:1:8:16:8:2:d".into())
+    }
+}
+
+fn unproven_at(registry: &vmm_machine::DeviceRegistry, slot: &str) {
+    registry
+        .insert(vmm_machine::RegisteredDevice::new(
+            format!("nvme@{slot}"),
+            vmm_machine::parse_bdf(slot),
+            None,
+            Some(Arc::new(Unproven) as Arc<dyn vmm_devices::Lifecycle>),
+            None,
+        ))
+        .expect("insert");
+}
+
+#[test]
+fn an_unproven_engine_blocks_a_source_unless_the_operator_accepts_it() {
+    let registry = vmm_machine::DeviceRegistry::new();
+    unproven_at(&registry, "5");
+    assert_eq!(device_blockers(&registry), None);
+
+    let run = RunControl::new(VmRunState::Running);
+    let why = claim_source(
+        &run,
+        &HotplugEngines::default(),
+        &registry,
+        || identities(&registry),
+        false,
+    )
+    .expect_err("not accepted");
+    assert!(why.contains("nvme@5"), "{why}");
+    assert!(why.contains("allow_engine_without_migrate_v1"), "{why}");
+    assert_eq!(run.get(), VmRunState::Running);
+
+    assert_eq!(
+        claim_source(
+            &run,
+            &HotplugEngines::default(),
+            &registry,
+            || identities(&registry),
+            true,
+        ),
+        Ok(()),
+    );
+}
+
+#[test]
+fn migrate_config_gives_a_ring_disk_its_shape_once() {
+    let registry = vmm_machine::DeviceRegistry::new();
+    unproven_at(&registry, "5");
+    let argv = [
+        "4,nvme,/boot.img".to_string(),
+        "5,nvme,mantablock=/s,volume=v,bootindex=1".to_string(),
+        "5,nvme,mantablock=/s,volume=v,ring-shape=1:9:512:1:1:1:1:1:-"
+            .to_string(),
+    ];
+    let slots = migrate_pci_slots(&argv, &registry);
+    assert_eq!(slots[0], "4,nvme,/boot.img");
+    assert_eq!(
+        slots[1],
+        "5,nvme,mantablock=/s,volume=v,bootindex=1,\
+         ring-shape=1:256:4096:1:8:16:8:2:d"
+    );
+    // A VM that was itself a destination: the old shape is replaced.
+    assert_eq!(
+        slots[2],
+        "5,nvme,mantablock=/s,volume=v,ring-shape=1:256:4096:1:8:16:8:2:d"
+    );
+}
+
+#[test]
+fn the_gate_wait_is_bounded() {
+    assert_eq!(gate_budget(None), Ok(vmm_migrate::gate::DEFAULT_BUDGET));
+    assert_eq!(gate_budget(Some(5000)), Ok(Duration::from_secs(5)));
+    assert!(gate_budget(Some(0)).is_err());
+    assert!(gate_budget(Some(25_001)).is_err());
+}
+
+#[test]
+fn the_gate_is_an_absolute_socket_path() {
+    assert!(agent_socket("/var/run/gate.sock").is_ok());
+    assert!(agent_socket("gate.sock").is_err());
+    assert!(agent_socket("/var/run/a\0b").is_err());
+}
+
+#[test]
+fn a_running_vm_cannot_import_a_ring_disk() {
+    // It attached the volume at boot, and the source still owns it.
+    let registry = vmm_machine::DeviceRegistry::new();
+    unproven_at(&registry, "5");
+    let run = RunControl::new(VmRunState::Paused);
+    let why = claim_dest(&run, &registry).expect_err("a ring disk");
+    assert!(why.contains("nvme@5"), "{why}");
+    assert!(why.contains("--migrate-listen"), "{why}");
+    assert_eq!(run.get(), VmRunState::Paused);
 }

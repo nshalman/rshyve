@@ -16,12 +16,14 @@ use vmm_core::intr_pins::IntrPin;
 use vmm_core::pio::{PioBus, PioFn};
 
 use vmm_devices::acpi_pm::SuspendSink;
-use vmm_devices::lifecycle::Lifecycle;
+use vmm_devices::lifecycle::{DeviceStateError, Lifecycle};
 
 use super::kbd::PS2Kbd;
 use super::keyboard::{KeyEvent, KeyEventRep};
 use super::mouse::PS2Mouse;
 use super::{PORT_PS2_CMD_STATUS, PORT_PS2_DATA};
+
+mod migrate;
 
 /// PS/2 Controller (Intel 8042) Emulation
 ///
@@ -355,6 +357,10 @@ struct PS2State {
     pri_pin: Option<Arc<dyn IntrPin>>,
     aux_pin: Option<Arc<dyn IntrPin>>,
     reset_sink: Option<Arc<dyn SuspendSink>>,
+
+    /// Remote console keys are dropped while set, so the buffer the
+    /// migration exports is the one the guest sees last.
+    paused: bool,
 }
 
 pub struct PS2Ctrl {
@@ -398,6 +404,9 @@ impl PS2Ctrl {
 
     pub fn key_event(&self, ke: KeyEvent) {
         let mut state = self.state.lock().unwrap();
+        if state.paused {
+            return;
+        }
         let translate = state.ctrl_cfg.contains(CtrlCfg::PRI_XLATE_EN);
         let key_rep = match KeyEventRep::try_from(ke) {
             Ok(kr) => kr,
@@ -677,6 +686,31 @@ impl Lifecycle for PS2Ctrl {
 
     fn reset(&self) {
         PS2Ctrl::reset(self);
+    }
+
+    fn pause(&self) {
+        self.state.lock().unwrap().paused = true;
+    }
+
+    fn resume(&self) {
+        self.state.lock().unwrap().paused = false;
+    }
+
+    fn migrates_by_id(&self) -> bool {
+        true
+    }
+
+    fn export_migrate_state(
+        &self,
+    ) -> Result<Option<vmm_devices::DeviceMigrateState>, DeviceStateError> {
+        Ok(Some(self.export_state()))
+    }
+
+    fn restore_migrate_state(
+        &self,
+        state: &vmm_devices::DeviceMigrateState,
+    ) -> Result<(), DeviceStateError> {
+        self.restore_state(state)
     }
 }
 

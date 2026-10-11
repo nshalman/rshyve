@@ -962,3 +962,120 @@ fn a_change_racing_a_stop_never_reports_the_wrong_state() {
     assert_eq!(run.get(), Stopping);
     assert!(!run.held());
 }
+
+/// A step that releases the pause, as the resume of a held source does.
+fn release_step(held: &mut bool) -> Result<(), StepFailed<&'static str>> {
+    *held = false;
+    Ok(())
+}
+
+#[test]
+fn a_held_source_runs_again_only_on_the_order() {
+    // The gate's go, then a failure: the source keeps its pause.
+    let run = parked_source();
+    assert_eq!(
+        run.end_committed(|| -> Result<(), ()> { panic!("released") }),
+        Ok(true)
+    );
+    assert_eq!(run.get(), Migrating);
+    assert!(run.held());
+
+    assert_eq!(run.resume_held(release_step), Ok(()));
+    assert_eq!(run.get(), Running);
+    assert!(!run.held());
+    // Taken once only.
+    assert_eq!(run.resume_held(release_step), Err(HeldFailed::NotHeld));
+}
+
+#[test]
+fn a_committed_source_runs_again_only_on_the_order() {
+    let run = parked_source();
+    assert!(run.commit());
+    run.end_committed(|| -> Result<(), ()> { panic!("released") })
+        .expect("ended");
+    assert_eq!(run.resume_held(release_step), Ok(()));
+    assert_eq!(run.get(), Running);
+}
+
+#[test]
+fn the_order_waits_for_the_migration_thread() {
+    let run = parked_source();
+    assert_eq!(run.resume_held(release_step), Err(HeldFailed::Running));
+    assert_eq!(run.get(), Migrating);
+}
+
+#[test]
+fn a_source_whose_destination_started_refuses_the_order() {
+    let run = parked_source();
+    assert!(run.commit());
+    assert_eq!(run.hand_off(ok), Ok(true));
+    assert_eq!(run.resume_held(release_step), Err(HeldFailed::NotHeld));
+    assert_eq!(run.get(), Stopped);
+    assert!(run.held());
+}
+
+#[test]
+fn a_running_or_paused_vm_refuses_the_order() {
+    for state in [Running, Paused, ImportCommitted] {
+        let run = RunControl::new(state);
+        assert_eq!(
+            run.resume_held(release_step),
+            Err(HeldFailed::NotHeld),
+            "{state:?}"
+        );
+        assert_eq!(run.get(), state);
+    }
+}
+
+#[test]
+fn a_failed_order_keeps_the_source_held() {
+    let run = parked_source();
+    run.end_committed(ok).expect("ended");
+    let failed = run.resume_held(|_| -> Result<(), StepFailed<&str>> {
+        Err(StepFailed::Undone("no engine"))
+    });
+    assert_eq!(failed, Err(HeldFailed::Step("no engine")));
+    assert_eq!(run.get(), Migrating);
+    assert!(run.held());
+    assert_eq!(run.resume_held(release_step), Ok(()));
+}
+
+#[test]
+fn migrate_cancel_frees_a_running_source_and_keeps_it_migrating() {
+    let run = RunControl::new(Running);
+    run.admit_source(|| None).expect("claim");
+    let woken = Arc::new(AtomicBool::new(false));
+    let by_waker = Arc::clone(&woken);
+    run.on_stop(Box::new(move || by_waker.store(true, Ordering::Release)));
+
+    run.cancel_source(|| false).expect("cancel");
+
+    assert!(woken.load(Ordering::Acquire), "the stream stayed open");
+    assert!(run.cancelled());
+    // No stop: the migration's own end gives the guest back.
+    assert_eq!(run.get(), Migrating);
+    assert!(!run.commit(), "a cancelled source committed");
+}
+
+#[test]
+fn migrate_cancel_is_refused_after_the_go() {
+    let run = parked_source();
+    assert_eq!(run.cancel_source(|| true), Err(PAST_THE_GATE));
+    assert!(!run.cancelled());
+}
+
+#[test]
+fn migrate_cancel_is_refused_after_the_commit() {
+    let run = parked_source();
+    assert!(run.commit());
+    assert_eq!(run.cancel_source(|| false), Err(PAST_THE_GATE));
+}
+
+#[test]
+fn migrate_cancel_needs_a_source() {
+    let run = RunControl::new(Running);
+    assert_eq!(run.cancel_source(|| false), Err(NO_SOURCE));
+    let run = RunControl::new(Paused);
+    import(&run).expect("import");
+    assert_eq!(run.cancel_source(|| false), Err(NO_SOURCE));
+}

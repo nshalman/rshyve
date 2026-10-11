@@ -60,6 +60,8 @@ pub(crate) struct Attached {
     pub(crate) max_blocks: u32,
     pub(crate) slots: Slots,
     pub(crate) pipes: Vec<Pipes>,
+    /// The engine agreed to [`crate::MIGRATE_V1`].
+    pub(crate) migrate_v1: bool,
 }
 
 /// What an attachment was granted. A reattach must get the same, as the
@@ -111,7 +113,8 @@ pub(crate) fn attach(
     ask: &Ask,
     deadline: Instant,
 ) -> io::Result<Attached> {
-    let offered = feature::SECTOR_512E | feature::DEALLOCATE;
+    let offered =
+        feature::SECTOR_512E | feature::DEALLOCATE | crate::MIGRATE_V1;
     let hello = Message::Hello {
         min_version: MIN_PROTOCOL_VERSION,
         max_version: PROTOCOL_VERSION,
@@ -192,6 +195,7 @@ pub(crate) fn attach(
         max_blocks: ok.max_blocks,
         slots,
         pipes,
+        migrate_v1: features & crate::MIGRATE_V1 != 0,
     })
 }
 

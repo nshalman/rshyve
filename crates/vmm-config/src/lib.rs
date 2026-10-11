@@ -268,6 +268,25 @@ pub struct Cli {
     #[arg(long)]
     pub migrate_listen: Option<String>,
 
+    /// Migration destination: how long each MantaBlock ring disk may
+    /// take to attach after the source commits, in ms. The engine opens
+    /// the volume only after the orchestrator moved it.
+    #[arg(long, default_value_t = 120_000)]
+    pub migrate_ring_attach_timeout_ms: u64,
+
+    /// Migration destination: take a ring engine that does not report
+    /// migrate-v1. For a lab only: a reused attachment id can drop a
+    /// write.
+    #[arg(long)]
+    pub migrate_allow_unproven_engine: bool,
+
+    /// A file of MantaBlock ring disks (`-s` specs) and migration
+    /// settings, read at start and merged into this command line. It
+    /// keeps the ring disks out of the brand's `bhyve-extra-opts`,
+    /// which one ring disk nearly fills. rshyve only.
+    #[arg(long)]
+    pub ring_config: Option<PathBuf>,
+
     /// Network config for mdata agent (JSON, e.g. from zone config).
     /// Format: '[{"ip":"10.0.0.5","netmask":"255.255.255.0","gateway":"10.0.0.1","primary":true}]'
     #[arg(long)]

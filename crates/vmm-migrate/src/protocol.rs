@@ -10,6 +10,20 @@
 
 /// Protocol identifier for the RON migration format.
 ///
+/// v9 carries the xHCI controller, and the devices with no PCI address
+/// under their registry ids: the COM1 and COM2 UARTs, the i8042, the
+/// ACPI PM1 and GPE0 blocks, the i440FX latches, the fw_cfg cursor and
+/// the hotplug latches. Every VM has the UARTs, so in practice every VM
+/// moves only on v9. An older peer is refused at the protocol choice,
+/// before the pause.
+///
+/// v8 carries the framebuffer: its PCI header, mode and VRAM. A VM with
+/// a framebuffer moves only on v8 or newer.
+///
+/// v7 has the v6 payload. It says the destination attaches a MantaBlock
+/// ring disk after the commit, so a source with one moves only to a v7
+/// or newer destination.
+///
 /// v6 carries each vCPU's FPU and XSAVE area with the source host's
 /// layout, and the NVMe Asynchronous Event Requests a controller holds.
 /// A v4 destination resumed the guest with the destination's FPU state
@@ -20,18 +34,88 @@
 /// v4 named the store under each NVMe namespace. v3 carried held NVMe
 /// completions and the namespace shape. v2 carried the CQ
 /// interrupt-enable bit. v1 put device identity on the wire.
-pub const PROTOCOL_RON: &str = "vmm-migrate-ron/6";
+pub const PROTOCOL_RON: &str = "vmm-migrate-ron/9";
 
-/// What a source offers.
-pub const SOURCE_OFFER: [&str; 1] = [PROTOCOL_RON];
+/// The version before, which carries no xHCI or platform state.
+pub const PROTOCOL_RON_V8: &str = "vmm-migrate-ron/8";
 
-/// The version a destination answers an offer with, or `None` when it
-/// can read none of them.
+/// The version before that, which carries no framebuffer state.
+pub const PROTOCOL_RON_V7: &str = "vmm-migrate-ron/7";
+
+/// The oldest version taken, which differs from v7 only in the ring
+/// disk.
+pub const PROTOCOL_RON_V6: &str = "vmm-migrate-ron/6";
+
+/// What a source offers, newest first.
+pub const SOURCE_OFFER: [&str; 4] = [
+    PROTOCOL_RON,
+    PROTOCOL_RON_V8,
+    PROTOCOL_RON_V7,
+    PROTOCOL_RON_V6,
+];
+
+/// The device kind of the framebuffer, as its `type_name` gives it.
+pub const FRAMEBUFFER_KIND: &str = "framebuffer";
+
+/// The device kind of the xHCI controller.
+pub const XHCI_KIND: &str = "xhci";
+
+/// Device kinds that always export a state. A payload that carries
+/// none for one of them is refused.
+pub const ALWAYS_EXPORTS: [&str; 2] = [FRAMEBUFFER_KIND, XHCI_KIND];
+
+/// The version a destination answers an offer with, newest first, or
+/// `None` when it can read none of them.
 pub fn select_protocol(offer: &[String]) -> Option<&'static str> {
-    offer
-        .iter()
-        .any(|theirs| theirs == PROTOCOL_RON)
-        .then_some(PROTOCOL_RON)
+    SOURCE_OFFER
+        .into_iter()
+        .find(|ours| offer.iter().any(|theirs| theirs == ours))
+}
+
+/// The version number of one of [`SOURCE_OFFER`].
+fn version(protocol: &str) -> u32 {
+    protocol
+        .rsplit_once('/')
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Why `protocol` cannot move a VM with `devices` and `platform`, or
+/// `None`.
+pub fn protocol_blocker(
+    protocol: &str,
+    devices: &[crate::codec::DeviceIdentity],
+    platform: &[crate::codec::PlatformIdentity],
+) -> Option<String> {
+    let has = |kind: &str| devices.iter().any(|d| d.kind == kind);
+    let needs = [
+        (
+            has(FRAMEBUFFER_KIND),
+            PROTOCOL_RON_V8,
+            "the framebuffer".into(),
+        ),
+        (has(XHCI_KIND), PROTOCOL_RON, "the xHCI controller".into()),
+        (
+            !platform.is_empty(),
+            PROTOCOL_RON,
+            format!(
+                "the state of {}",
+                platform
+                    .iter()
+                    .map(|p| p.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        ),
+    ];
+    let (_, least, what) = needs.into_iter().find(|(needed, least, _)| {
+        *needed && version(protocol) < version(least)
+    })?;
+    Some(format!(
+        "the peer speaks {}, which cannot carry {what}; both ends need \
+         {least} or newer",
+        crate::wire::peer_text(protocol)
+    ))
 }
 
 /// Page size used for dirty tracking (4 KiB).
@@ -104,6 +188,15 @@ mod tests {
     }
 
     #[test]
+    fn a_destination_takes_a_v6_source() {
+        let v6 = offer(&[PROTOCOL_RON_V6]);
+        assert_eq!(select_protocol(&v6), Some(PROTOCOL_RON_V6));
+        // What a v6 build's destination picks from this offer.
+        let ours = offer(&SOURCE_OFFER);
+        assert!(ours.iter().any(|o| o == PROTOCOL_RON_V6));
+    }
+
+    #[test]
     fn a_destination_refuses_a_source_without_fpu_state() {
         // v5 is the virtio-gpu stream, and v4 and older carry no XSAVE
         // area (OSF-2).
@@ -129,6 +222,68 @@ mod tests {
         .into_iter()
         .find(|v| ours.iter().any(|o| o == v));
         assert_eq!(picked, None);
+    }
+
+    fn devices(kinds: &[&str]) -> Vec<crate::codec::DeviceIdentity> {
+        kinds
+            .iter()
+            .enumerate()
+            .map(|(dev, kind)| crate::codec::DeviceIdentity {
+                bdf: vmm_devices::lifecycle::WireBdf {
+                    bus: 0,
+                    dev: dev as u8,
+                    func: 0,
+                },
+                kind: kind.to_string(),
+            })
+            .collect()
+    }
+
+    fn platform(ids: &[&str]) -> Vec<crate::codec::PlatformIdentity> {
+        ids.iter()
+            .map(|id| crate::codec::PlatformIdentity {
+                id: id.to_string(),
+                kind: "lpc-uart".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_framebuffer_moves_on_v8_or_newer() {
+        let with = devices(&["virtio-net", FRAMEBUFFER_KIND]);
+        let without = devices(&["virtio-net", "nvme"]);
+
+        for new in [PROTOCOL_RON, PROTOCOL_RON_V8] {
+            assert_eq!(protocol_blocker(new, &with, &[]), None);
+        }
+        for old in [PROTOCOL_RON_V7, PROTOCOL_RON_V6] {
+            let why = protocol_blocker(old, &with, &[]).expect(old);
+            assert!(why.contains("framebuffer"), "{why}");
+            assert_eq!(protocol_blocker(old, &without, &[]), None);
+        }
+    }
+
+    #[test]
+    fn xhci_and_platform_state_move_only_on_the_current_version() {
+        let xhci = devices(&["virtio-net", XHCI_KIND]);
+        let uarts = platform(&["lpc/com1", "lpc/com2"]);
+
+        assert_eq!(protocol_blocker(PROTOCOL_RON, &xhci, &uarts), None);
+        for old in [PROTOCOL_RON_V8, PROTOCOL_RON_V7, PROTOCOL_RON_V6] {
+            let why = protocol_blocker(old, &xhci, &[]).expect(old);
+            assert!(why.contains("xHCI"), "{why}");
+            let why = protocol_blocker(old, &[], &uarts).expect(old);
+            assert!(why.contains("lpc/com1 lpc/com2"), "{why}");
+            assert!(why.contains(PROTOCOL_RON), "{why}");
+        }
+    }
+
+    #[test]
+    fn the_offer_is_newest_first() {
+        let versions: Vec<u32> =
+            SOURCE_OFFER.iter().map(|p| version(p)).collect();
+        assert_eq!(versions, [9, 8, 7, 6]);
+        assert_eq!(version("garbage"), 0);
     }
 
     #[test]

@@ -491,6 +491,22 @@ fn region_accounting_skips_mmio() {
 }
 
 #[test]
+fn guest_ram_leaves_out_the_hole_and_non_ram() {
+    // The lab source sent the firmware scratch RAM at 0xfcc00000, which
+    // a destination never maps.
+    let map = PhysMap::new();
+    insert_ram(&map, 0, 0x2000).unwrap();
+    insert_ram(&map, 0xFCC0_0000, 0x4000).unwrap();
+    map.add_region_anon(0xFF00_0000, 0x1000, RegionKind::Rom)
+        .unwrap();
+    map.add_region_anon(0xFE00_0000, 0x1000, RegionKind::Mmio)
+        .unwrap();
+    insert_ram(&map, MMIO_HOLE_END, 0x2000).unwrap();
+
+    assert_eq!(map.guest_ram(), vec![(0, 0x2000), (MMIO_HOLE_END, 0x2000)]);
+}
+
+#[test]
 fn overlapping_region_is_rejected() {
     let map = PhysMap::new();
     insert_ram(&map, 0x1000, 0x1000).unwrap();

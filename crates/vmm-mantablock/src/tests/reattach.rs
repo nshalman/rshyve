@@ -170,9 +170,14 @@ impl Lab {
 }
 
 fn recv(s: &mut UnixStream, buf: &mut Vec<u8>) -> Message {
+    recv_as(s, buf, 1)
+}
+
+/// The next frame, in the session's `version`.
+fn recv_as(s: &mut UnixStream, buf: &mut Vec<u8>, version: u16) -> Message {
     let mut chunk = [0u8; 4096];
     loop {
-        if let Some((m, _, used)) = Message::decode(buf).unwrap() {
+        if let Some((m, _, used)) = Message::decode_as(buf, version).unwrap() {
             buf.drain(..used);
             return m;
         }
@@ -184,17 +189,25 @@ fn recv(s: &mut UnixStream, buf: &mut Vec<u8>) -> Message {
 
 /// The engine's side of Hello and Attach, sending `fds` with AttachOk.
 fn handshake(s: &mut UnixStream, ok: AttachOk, fds: &[OwnedFd]) -> Attach {
+    handshake_with(s, ok, fds, 1, 0)
+}
+
+/// As [`handshake`], agreeing to `version` and `features`.
+pub(super) fn handshake_with(
+    s: &mut UnixStream,
+    ok: AttachOk,
+    fds: &[OwnedFd],
+    version: u16,
+    features: u64,
+) -> Attach {
     let mut buf = Vec::new();
     assert!(matches!(recv(s, &mut buf), Message::Hello { .. }));
-    let ack = Message::HelloAck {
-        version: 1,
-        features: 0,
-    };
+    let ack = Message::HelloAck { version, features };
     s.write_all(&ack.encode(1)).unwrap();
-    let Message::Attach(ask) = recv(s, &mut buf) else {
+    let Message::Attach(ask) = recv_as(s, &mut buf, version) else {
         panic!("no Attach");
     };
-    let frame = Message::AttachOk(ok).encode(2);
+    let frame = Message::AttachOk(ok).encode_as(2, version);
     let borrowed: Vec<BorrowedFd<'_>> = fds.iter().map(|f| f.as_fd()).collect();
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(8))];
     let mut anc = SendAncillaryBuffer::new(&mut space);
