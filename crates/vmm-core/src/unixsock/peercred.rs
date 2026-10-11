@@ -44,7 +44,7 @@ pub struct PeerPolicy {
     pub uid: u32,
     /// This process's zone, or `None` on a platform without zones.
     pub zoneid: Option<i32>,
-    /// The ids every listener path and its directory are chowned to at
+    /// The ids every listener socket is chowned to at
     /// bind, when the process will drop to them. `None` keeps what the
     /// bind made, which the process already owns.
     pub owner: Option<ListenerOwner>,
