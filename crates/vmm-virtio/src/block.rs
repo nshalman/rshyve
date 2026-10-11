@@ -21,11 +21,12 @@
 //! paths corrupt the used index.
 
 use std::fs::File;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
-use vmm_devices::blkdev::DiskCache;
+use vmm_devices::blkdev::DiskSync;
 use vmm_devices::lifecycle::Indicator;
 use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
 
@@ -41,10 +42,11 @@ mod probes {
 }
 
 use super::bits;
-use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
+use super::queue::{ChainBuf, Take, VirtQueue, VirtioCompletion};
 use super::VirtioDevice;
 
 mod access;
+mod budget;
 mod discard;
 mod io;
 #[cfg(test)]
@@ -53,8 +55,10 @@ mod worker;
 
 use crate::access::{GuestAccess, RingTag, Session};
 use crate::pci::intr::{BackendIntr, IntrSlot};
+use crate::pci::notify::{BackendKick, KickSlot};
 use access::BackendBarrier;
-use io::{parse_header, write_status};
+use budget::{Budget, Charge, PauseGrace};
+use io::{parse_header, write_status, ReqLimits};
 use worker::{blk_io_worker, needs_backend, BlkIoRequest, WorkerCtx};
 
 /// Default I/O workers for a single-queue virtio-blk device.
@@ -126,6 +130,9 @@ pub struct VirtioBlock {
     nodelete: bool,
     /// Number of request queues (1 = single queue, >1 = multiqueue).
     num_queues: u16,
+    /// Feature bits the driver accepted. They set which request limits
+    /// apply.
+    features: AtomicU64,
     /// Number of I/O worker threads per queue.
     workers_per_queue: usize,
     /// Per-worker I/O sender channels (flat: queue_idx * workers_per_queue + worker_idx).
@@ -139,32 +146,89 @@ pub struct VirtioBlock {
     interrupt: Arc<IntrSlot>,
     /// Per-queue completion handlers, created on first notification.
     completions: Mutex<Vec<Option<Arc<VirtioCompletion>>>>,
-    /// Zvol write-cache control.
-    _cache: DiskCache,
     /// The backing store. Shared with every worker, so the descriptor
     /// outlives a device that is dropped while a syscall is running.
     /// A worker holding a bare fd number would resume against whatever
     /// the host reopened on it.
-    file: Arc<File>,
+    disk: Arc<DiskSync>,
     /// Lifecycle state indicator.
     indicator: Indicator,
     gate: Arc<QuiesceGate>,
+    pause_grace: PauseGrace,
     /// Shared with every I/O worker.
     ctx: WorkerCtx,
 }
 
 impl VirtioBlock {
+    fn pause_for(&self, grace: Duration) {
+        self.indicator.pause();
+        self.gate.pause_with_grace(grace);
+    }
+
     /// Install the transport interrupt path once the transport exists.
     pub fn install_interrupt(&self, intr: Arc<BackendIntr>) {
         self.interrupt.install(intr);
     }
 
+    /// Install the path a worker drains a starved ring through, once
+    /// the transport exists.
+    pub fn install_kick(&self, kick: Arc<BackendKick>) {
+        self.ctx.kick.install(kick);
+    }
+
+    /// Write cache warnings go to a discarding logger. Use
+    /// [`new_with_logger`](Self::new_with_logger) to see them.
     pub fn new(
         file: File,
         opts: &VirtioBlockOpts,
         physmap: Arc<PhysMap>,
         num_queues: u16,
     ) -> std::io::Result<Self> {
+        Self::new_with_logger(
+            file,
+            opts,
+            physmap,
+            num_queues,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+    }
+
+    pub fn new_with_logger(
+        file: File,
+        opts: &VirtioBlockOpts,
+        physmap: Arc<PhysMap>,
+        num_queues: u16,
+        log: &slog::Logger,
+    ) -> std::io::Result<Self> {
+        Self::with_budget(
+            file,
+            opts,
+            physmap,
+            num_queues,
+            budget::INFLIGHT_BYTES,
+            PauseGrace::DEFAULT,
+            log,
+        )
+    }
+
+    fn with_budget(
+        file: File,
+        opts: &VirtioBlockOpts,
+        physmap: Arc<PhysMap>,
+        num_queues: u16,
+        inflight_bytes: u64,
+        pause_grace: PauseGrace,
+        log: &slog::Logger,
+    ) -> std::io::Result<Self> {
+        if num_queues > budget::MAX_QUEUES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "virtio-blk takes at most {} queues",
+                    budget::MAX_QUEUES
+                ),
+            ));
+        }
         let metadata = file.metadata()?;
         // VirtIO 1.3 sec 5.2.4: capacity is in 512-byte sectors
         // whatever `blk_size` is, and sec 5.2.6 puts the request
@@ -172,11 +236,9 @@ impl VirtioBlock {
         // size the guest is told to align to, not the unit of either.
         let capacity = metadata.len() / bits::SECTOR_SIZE;
         let read_only = opts.read_only;
-        let file = Arc::new(file);
-
-        // Enable zvol writeback cache (DKIOCSETWCE=1). Must happen before
-        // any I/O so the first guest writes already hit the fast path.
-        let cache = DiskCache::new(Arc::clone(&file), read_only);
+        // Turns a zvol's write cache on before any I/O, so first guest
+        // writes already hit the fast path.
+        let disk = Arc::new(DiskSync::new(Arc::new(file), read_only, log)?);
 
         // Workers per queue: NUM_WORKERS for single queue, 2 per queue for MQ.
         let limits = DiskLimits {
@@ -192,6 +254,8 @@ impl VirtioBlock {
             gate: Arc::clone(&gate),
             access: Arc::new(GuestAccess::new(num_queues as usize)),
             backend: Arc::new(BackendBarrier::new()),
+            budget: Budget::new(inflight_bytes),
+            kick: Arc::new(KickSlot::new()),
             #[cfg(test)]
             parks: Arc::new(worker::WorkerParks::default()),
         };
@@ -202,12 +266,12 @@ impl VirtioBlock {
             for i in 0..workers_per_queue {
                 let (tx, rx) = mpsc::channel::<BlkIoRequest>();
                 let ctx = ctx.clone();
-                let file = Arc::clone(&file);
+                let disk = Arc::clone(&disk);
 
                 thread::Builder::new()
                     .name(format!("virtio-blk-q{q}-io-{i}"))
                     .spawn(move || {
-                        blk_io_worker(rx, file, limits, ctx);
+                        blk_io_worker(rx, disk, limits, ctx);
                     })
                     .expect("failed to spawn virtio-blk I/O worker");
 
@@ -224,16 +288,17 @@ impl VirtioBlock {
             read_only: opts.read_only,
             nodelete: opts.nodelete,
             num_queues,
+            features: AtomicU64::new(0),
             workers_per_queue,
             io_txs,
             next_worker,
             physmap,
             interrupt: Arc::new(IntrSlot::new()),
             completions: Mutex::new(completions),
-            _cache: cache,
-            file,
+            disk,
             indicator: Indicator::new(),
             gate,
+            pause_grace,
             ctx,
         })
     }
@@ -357,8 +422,6 @@ impl VirtioBlock {
         );
     }
 
-    /// Check one chain and return its request header.
-    ///
     /// On refusal the status byte is written and the used length the
     /// guest is owed is returned. A refused head still goes back on the
     /// used ring: `pop_avail` has already taken it out of the available
@@ -367,7 +430,7 @@ impl VirtioBlock {
         &self,
         chain: &[ChainBuf],
         physmap: &PhysMap,
-    ) -> Result<VirtioBlkReqHdr, u32> {
+    ) -> Result<(VirtioBlkReqHdr, usize), u32> {
         let refuse = |chain: &[ChainBuf]| {
             write_status(physmap, chain, bits::VIRTIO_BLK_S_IOERR)
         };
@@ -379,7 +442,9 @@ impl VirtioBlock {
         };
         // Segment count and segment size are the guest's to pick, so
         // the advertised limits hold only where they are checked.
-        let Some(data_bytes) = io::span(chain) else {
+        let limits =
+            ReqLimits::negotiated(self.features.load(Ordering::Acquire));
+        let Some(data_bytes) = io::span(chain, &limits) else {
             return Err(refuse(chain));
         };
 
@@ -402,7 +467,7 @@ impl VirtioBlock {
                 return Err(refuse(chain));
             }
         }
-        Ok(header)
+        Ok((header, data_bytes))
     }
 
     /// Run a request that touches guest memory and nothing else.
@@ -467,6 +532,7 @@ impl VirtioBlock {
         head: u16,
         header: &VirtioBlkReqHdr,
         chain: Vec<ChainBuf>,
+        charge: Charge,
     ) {
         probes::vioblk_dispatch!(|| (head, header.rtype, header.sector));
         let queue_idx = usize::from(tag.queue_idx());
@@ -482,7 +548,16 @@ impl VirtioBlock {
             head,
             completion: Arc::clone(completion),
             tag,
+            charge,
         });
+    }
+
+    /// Drain every ring, not only the starved ones: a migration
+    /// destination does not have the source's starved marks.
+    fn kick_all(&self) {
+        for queue_idx in 0..self.num_queues {
+            self.ctx.kick.kick(queue_idx);
+        }
     }
 }
 
@@ -514,10 +589,8 @@ impl VirtioDevice for VirtioBlock {
         f
     }
 
-    fn set_features(&self, _features: u64) {
-        // Every bit this device offers changes what the guest may ask
-        // for, not how the device answers, and the queues are told what
-        // was negotiated by the transport.
+    fn set_features(&self, features: u64) {
+        self.features.store(features, Ordering::Release);
     }
 
     fn cfg_read(&self, offset: u16, len: u8) -> u32 {
@@ -588,6 +661,13 @@ impl VirtioDevice for VirtioBlock {
             None => return false,
         };
 
+        // Hold the admission until the hand-off to a worker. A pause
+        // waits for it, so it never sees parked workers with a request
+        // still on the way.
+        let Some(_admission) = self.gate.admit() else {
+            return false;
+        };
+
         let Some(session) = self.ctx.access.enter_current(queue_idx) else {
             // A retirement owns the ring. Its queue state goes with it.
             return false;
@@ -597,12 +677,12 @@ impl VirtioDevice for VirtioBlock {
 
         // Bound the work retained by one notification to the queue size.
         let max_requests = usize::from(queue.size());
-        let mut requests: Vec<(u16, VirtioBlkReqHdr, Vec<ChainBuf>)> =
+        let mut requests: Vec<(u16, VirtioBlkReqHdr, Vec<ChainBuf>, Charge)> =
             Vec::with_capacity(max_requests);
         // Results already finished, published together at the end.
         let mut finished: Vec<(u16, u32)> = Vec::new();
 
-        queue.drain_avail(physmap, max_requests, |queue, head| {
+        queue.drain_avail_until(physmap, max_requests, |queue, head| {
             let chain = match queue.collect_chain(physmap, head) {
                 Some(c) => c,
                 None => {
@@ -612,21 +692,28 @@ impl VirtioDevice for VirtioBlock {
                     // for the life of the device: the block layer
                     // has no abort path for virtio-blk.
                     finished.push((head, 0));
-                    return;
+                    return Take::Keep;
                 }
             };
 
-            let header = match self.check_request(&chain, physmap) {
-                Ok(header) => header,
+            let (header, span) = match self.check_request(&chain, physmap) {
+                Ok(checked) => checked,
                 Err(len) => {
                     finished.push((head, len));
-                    return;
+                    return Take::Keep;
                 }
             };
 
             if needs_backend(header.rtype) {
-                requests.push((head, header, chain));
-                return;
+                // Out of budget, the chain stays in the ring. The
+                // completion that frees budget kicks this queue.
+                let cost = budget::cost(header.rtype, span);
+                let Some(charge) = self.ctx.budget.charge(queue_idx, cost)
+                else {
+                    return Take::GiveBack;
+                };
+                requests.push((head, header, chain, charge));
+                return Take::Keep;
             }
 
             probes::vioblk_inline!(|| (head, header.rtype, header.sector));
@@ -635,6 +722,7 @@ impl VirtioDevice for VirtioBlock {
             write_status(physmap, &chain, status);
             probes::vioblk_complete!(|| (head, status));
             finished.push((head, written));
+            Take::Keep
         });
 
         probes::vioblk_notify!(|| (
@@ -645,8 +733,10 @@ impl VirtioDevice for VirtioBlock {
         let raise = completion.publish_batch(&finished);
         drop(session);
 
-        for (head, header, chain) in requests {
-            self.dispatch(tag, &completion, head, &header, chain);
+        #[cfg(test)]
+        worker::run_park(&self.ctx.parks.before_dispatch);
+        for (head, header, chain, charge) in requests {
+            self.dispatch(tag, &completion, head, &header, chain, charge);
         }
 
         raise
@@ -696,6 +786,7 @@ impl VirtioDevice for VirtioBlock {
     /// on a vCPU.
     fn reset(&self) {
         self.retire_rings(None);
+        self.features.store(0, Ordering::Release);
     }
 }
 
@@ -716,17 +807,23 @@ impl Lifecycle for VirtioBlock {
     }
 
     fn pause(&self) {
-        self.indicator.pause();
-        self.gate.pause();
+        self.pause_for(self.pause_grace.unknown());
     }
 
+    fn pause_within(&self, budget: Duration) {
+        self.pause_for(self.pause_grace.within(budget));
+    }
+
+    /// The budget check matters: a worker can park with work still
+    /// queued to it.
     fn is_quiesced(&self) -> bool {
-        self.gate.is_quiesced()
+        self.gate.is_quiesced() && self.ctx.budget.is_idle()
     }
 
     fn resume(&self) {
         self.gate.resume();
         self.indicator.resume();
+        self.kick_all();
     }
 
     fn halt(&self) {
@@ -734,11 +831,19 @@ impl Lifecycle for VirtioBlock {
     }
 
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
-        vmm_devices::quiesce::flush_file(
+        // A parked worker can still take queued work.
+        let budget = &self.ctx.budget;
+        let flushed = vmm_devices::quiesce::flush_file_when(
             &self.gate,
-            &self.file,
+            &self.disk,
             intent,
             "virtio-blk",
-        )
+            || budget.is_idle(),
+        );
+        // Kicks during the flush left their chains in the ring.
+        if !self.gate.is_paused() {
+            self.kick_all();
+        }
+        flushed
     }
 }

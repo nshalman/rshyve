@@ -36,7 +36,7 @@
 #     --source-dataset zones/vmm-test-disk \
 #     --dest-dataset zones/vmm-test-disk \
 #     --control-socket /tmp/vmm-testvm.sock \
-#     --vmm-args '-H -c 2 -m 1G -s 0,hostbridge -s 4,virtio-blk,/dev/zvol/dsk/zones/vmm-test-disk -s 6,virtio-net-viona,vmm_test0 -s 31,lpc -l bootrom,/usr/share/bhyve/uefi-rom.bin' \
+#     --vmm-args '-H -c 2 -m 1G -s 0,hostbridge -s 4,virtio-blk,/dev/zvol/rdsk/zones/vmm-test-disk -s 6,virtio-net-viona,vmm_test0 -s 31,lpc -l bootrom,/usr/share/bhyve/uefi-rom.bin' \
 #     --ssh-key ~/.ssh/id_lab
 
 set -o errexit

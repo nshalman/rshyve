@@ -4,20 +4,23 @@
 
 //! Migration command handlers and their address guards.
 
-use std::net::{TcpListener, TcpStream};
+use std::io;
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use slog::{error, info};
+use slog::{debug, error, info};
 
 use vmm_core::mem::MemCtx;
 use vmm_machine::HotplugEngines;
 
+use vmm_migrate::wait::unless_cancelled;
+
 use super::protocol::{Command, Response};
+use super::run_state::{MigrationLease, RunControl};
 use super::{VmController, VmRunState};
 use crate::host_state::HostLocalState;
 
@@ -27,6 +30,12 @@ use crate::host_state::HostLocalState;
 /// short enough that a wedged one does not leave the node holding a
 /// guest's whole memory for a VM that runs nowhere.
 const SOURCE_RELEASE_GRACE: Duration = Duration::from_secs(300);
+
+/// How long a source waits for each address of its peer to answer.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often a destination waiting for its source checks for a stop.
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
 
 pub(super) fn migration_source_guard(
     state: HostLocalState,
@@ -177,6 +186,65 @@ fn unmigratable_devices(
     ))
 }
 
+/// Every device that says no migration can carry it, named by its
+/// registry id. Read from the live registry, so a disk hot-added since
+/// boot counts as well.
+pub(crate) fn device_blockers(
+    registry: &vmm_machine::DeviceRegistry,
+) -> Option<String> {
+    let blocking: Vec<String> = registry
+        .list()
+        .into_iter()
+        .filter_map(|slot| {
+            let why = match (&slot.pci, &slot.lifecycle) {
+                // passthru: the state is in host hardware, and its DMA
+                // writes are not dirty-tracked.
+                (Some(_), None) => {
+                    "a PCI device with no lifecycle carries no state".into()
+                }
+                (_, Some(lifecycle)) => lifecycle.migration_blocker()?,
+                (None, None) => return None,
+            };
+            Some(format!("{}: {why}", slot.id))
+        })
+        .collect();
+    if blocking.is_empty() {
+        return None;
+    }
+    Some(format!("this VM cannot migrate: {}", blocking.join("; ")))
+}
+
+/// Why this VM cannot be a migration source, or `None`.
+fn source_refusal(
+    hotplug: &HotplugEngines,
+    registry: &vmm_machine::DeviceRegistry,
+    identities: &[vmm_migrate::codec::DeviceIdentity],
+) -> Option<String> {
+    let (cpus, bytes) = growth(hotplug);
+    device_blockers(registry)
+        .or_else(|| grown_since_boot(cpus, bytes))
+        .or_else(|| device_set_changed(&vmm_machine::hotplug_specs(registry)))
+        .or_else(|| unmigratable_devices(identities))
+}
+
+/// Move a running VM to `Migrating`, or say why it cannot be a source.
+fn claim_source(
+    run: &RunControl,
+    hotplug: &HotplugEngines,
+    registry: &vmm_machine::DeviceRegistry,
+    identities: impl FnOnce() -> Vec<vmm_migrate::codec::DeviceIdentity>,
+) -> Result<(), String> {
+    run.admit_source(|| source_refusal(hotplug, registry, &identities()))
+}
+
+/// Move a paused VM to `Migrating`, or say why it cannot take an import.
+fn claim_dest(
+    run: &RunControl,
+    registry: &vmm_machine::DeviceRegistry,
+) -> Result<(), String> {
+    run.admit_import(|| device_blockers(registry))
+}
+
 /// Where a migration source connects to.
 enum MigrateTarget {
     /// A Unix socket the GZ agent bridges to the peer. The only kind
@@ -207,27 +275,12 @@ pub(super) fn migrate_source(
         Err(e) => return Response::err(&format!("invalid target_addr: {e}")),
     };
 
-    if !ctrl.transition(VmRunState::Running, VmRunState::Migrating) {
-        return Response::err("VM must be running to start migration");
-    }
-
-    // The state comes first, then the topology under the lock a hot-add
-    // takes. An add that was in flight is therefore counted here, and
-    // one that arrives later finds the VM migrating and is refused.
-    // Reading the topology before the state change would miss both.
-    let refused = {
-        let _topology = ctrl.lock_topology();
-        let (cpus, bytes) = growth(&ctrl.hotplug);
-        grown_since_boot(cpus, bytes)
-            .or_else(|| {
-                device_set_changed(&vmm_machine::hotplug_specs(&ctrl.registry))
-            })
-            .or_else(|| unmigratable_devices(&ctrl.migrate_identities()))
-    };
-    if let Some(reason) = refused {
-        ctrl.state
-            .store(VmRunState::Running as u8, Ordering::Release);
-        return Response::err(&reason);
+    if let Err(why) =
+        claim_source(&ctrl.run, &ctrl.hotplug, &ctrl.registry, || {
+            ctrl.migrate_identities()
+        })
+    {
+        return Response::err(&why);
     }
 
     let status = Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
@@ -252,13 +305,15 @@ pub(super) fn migrate_source(
         thread::Builder::new()
             .name("migrate-source".into())
             .spawn(move || {
+                let lease = MigrationLease::new(ctrl_arc.as_ref());
                 let hooks = source_hooks(&ctrl_arc);
+                let run = &ctrl_arc.run;
                 let outcome = match target {
                     MigrateTarget::Unix(path) => {
                         info!(mlog, "connecting to migration socket";
                         "path" => &path);
-                        UnixStream::connect(&path)
-                            .map_err(|e| SourceOutcome::Failed(e.to_string()))
+                        connect_unix(run, Path::new(&path), &mlog)
+                            .map_err(SourceOutcome::Failed)
                             .and_then(|stream| {
                                 run_source(
                                     stream, hdl, &memctx, config, hooks,
@@ -269,8 +324,8 @@ pub(super) fn migrate_source(
                     MigrateTarget::Tcp(addr) => {
                         info!(mlog, "connecting to migration peer";
                         "target" => &addr);
-                        TcpStream::connect(&addr)
-                            .map_err(|e| SourceOutcome::Failed(e.to_string()))
+                        connect_tcp(run, addr, &mlog)
+                            .map_err(SourceOutcome::Failed)
                             .and_then(|stream| {
                                 run_source(
                                     stream, hdl, &memctx, config, hooks,
@@ -293,19 +348,19 @@ pub(super) fn migrate_source(
                             destination never confirmed; this VM stays \
                             paused and is NOT released";
                             "error" => why);
+                        ctrl_arc.ended(
+                            run.end_committed(|| ctrl_arc.release_pause()),
+                        );
                     }
                     Err(e @ SourceOutcome::Failed(_)) => {
                         error!(mlog, "source migration failed"; "error" => %e);
-                        ctrl_arc.state.store(
-                            VmRunState::Running as u8,
-                            Ordering::Release,
-                        );
+                        end_migration(&ctrl_arc);
                     }
                 }
+                lease.release();
             })
     {
-        ctrl.state
-            .store(VmRunState::Running as u8, Ordering::Release);
+        end_migration(ctrl);
         return Response::err(&format!(
             "failed to spawn migration thread: {e}"
         ));
@@ -316,6 +371,102 @@ pub(super) fn migrate_source(
     r
 }
 
+/// Hand the state back from `Migrating`, unless a stop owns it now.
+fn end_migration(ctrl: &VmController) {
+    ctrl.ended(ctrl.run.end_migration(|| ctrl.release_pause()));
+}
+
+/// A stream a stop can shut down from another thread.
+trait Shut: Sized + Send + 'static {
+    fn try_clone(&self) -> io::Result<Self>;
+    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+}
+
+impl Shut for TcpStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        TcpStream::try_clone(self)
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        TcpStream::shutdown(self, how)
+    }
+}
+
+impl Shut for UnixStream {
+    fn try_clone(&self) -> io::Result<Self> {
+        UnixStream::try_clone(self)
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        UnixStream::shutdown(self, how)
+    }
+}
+
+/// Let a stop shut `stream` down. A send or receive blocked on a peer
+/// that went quiet returns at once, and the thread rolls back.
+fn shut_on_stop<S: Shut>(
+    run: &RunControl,
+    stream: S,
+    log: &slog::Logger,
+) -> io::Result<S> {
+    let clone = stream.try_clone()?;
+    let log = log.clone();
+    run.on_stop(Box::new(move || {
+        if let Err(e) = clone.shutdown(Shutdown::Both) {
+            debug!(log, "the migration socket was already closed";
+                "error" => %e);
+        }
+    }));
+    Ok(stream)
+}
+
+/// Connect to the GZ agent's socket, giving up on a stop.
+fn connect_unix(
+    run: &RunControl,
+    path: &Path,
+    log: &slog::Logger,
+) -> Result<UnixStream, String> {
+    let stream = vmm_migrate::connect::unix(path, || run.cancelled())
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    shut_on_stop(run, stream, log).map_err(|e| e.to_string())
+}
+
+/// Connect to a TCP peer, giving up on a stop.
+///
+/// Only the name lookup runs on a helper thread: nothing can cut it
+/// short, and it holds no socket. One left behind ends on its own.
+fn connect_tcp(
+    run: &RunControl,
+    addr: String,
+    log: &slog::Logger,
+) -> Result<TcpStream, String> {
+    let lookup = addr.clone();
+    let peers = unless_cancelled(
+        "migrate-resolve",
+        || run.cancelled(),
+        move |_| lookup.to_socket_addrs().map(Vec::from_iter),
+    )
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{addr}: {e}"))?;
+    let mut last = None;
+    for peer in peers {
+        let connected =
+            vmm_migrate::connect::tcp(peer, CONNECT_TIMEOUT, || {
+                run.cancelled()
+            })
+            .map_err(|e| e.to_string())?;
+        match connected {
+            Ok(stream) => {
+                return shut_on_stop(run, stream, log)
+                    .map_err(|e| e.to_string())
+            }
+            Err(e) => last = Some(format!("{peer}: {e}")),
+        }
+    }
+    Err(last.unwrap_or_else(|| format!("{addr}: no address")))
+}
+
 /// The device hooks the source phases drive.
 fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
     let for_pre_pause = Arc::clone(ctrl);
@@ -323,15 +474,57 @@ fn source_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::source::SourceHooks {
     let for_resume = Arc::clone(ctrl);
     let for_export = Arc::clone(ctrl);
     let for_hyperv = Arc::clone(ctrl);
+    let (pause_vm, resume_vm) = migration_pause_hooks(ctrl);
     vmm_migrate::source::SourceHooks {
         pre_pause: Box::new(move || {
+            for_pre_pause.run.parking_devices();
             for_pre_pause.pause_devices_for_migration()
         }),
-        flush: Box::new(move || for_flush.flush_devices_for_migration()),
-        resume: Box::new(move || for_resume.resume_devices_after_migration()),
+        flush: Box::new(move |left| {
+            for_flush.flush_devices_for_migration(left)
+        }),
+        resume: Box::new(move || {
+            for_resume.resume_devices_after_migration();
+            for_resume.run.devices_resumed();
+        }),
         export: Box::new(move || for_export.export_device_state()),
         hyperv: Box::new(move || for_hyperv.export_hyperv()),
+        pause_vm,
+        resume_vm,
+        gate: Box::new(ControlGate(Arc::clone(ctrl))),
     }
+}
+
+/// Lets a stop cancel this VM's migration before it commits.
+struct ControlGate(Arc<VmController>);
+
+impl vmm_migrate::StopGate for ControlGate {
+    fn cancelled(&self) -> bool {
+        self.0.run.cancelled()
+    }
+
+    fn commit(&self) -> Result<(), vmm_migrate::codec::MigrateError> {
+        if self.0.run.commit() {
+            Ok(())
+        } else {
+            Err(vmm_migrate::cancelled())
+        }
+    }
+
+    fn on_stop(&self, shut: Box<dyn FnOnce() + Send>) {
+        self.0.run.on_stop(shut);
+    }
+}
+
+fn migration_pause_hooks(
+    ctrl: &Arc<VmController>,
+) -> (vmm_migrate::VmPauseFn, vmm_migrate::VmPauseFn) {
+    let for_pause = Arc::clone(ctrl);
+    let for_resume = Arc::clone(ctrl);
+    (
+        Box::new(move || for_pause.pause_for_migration()),
+        Box::new(move || for_resume.resume_for_migration()),
+    )
 }
 
 /// How a source migration ended, when it did not succeed.
@@ -386,15 +579,9 @@ pub(super) fn migrate_dest(
         return Response::err(&format!("invalid listen_addr: {e}"));
     }
 
-    // Only a paused VM may take an import: the import writes every
-    // vCPU's registers and every device's rings, and a running guest
-    // would execute against half of them.
-    let prev_state = ctrl.state();
-    if prev_state != VmRunState::Paused {
-        return Response::err("VM must be paused to receive migration");
+    if let Err(why) = claim_dest(&ctrl.run, &ctrl.registry) {
+        return Response::err(&why);
     }
-    ctrl.state
-        .store(VmRunState::Migrating as u8, Ordering::Release);
 
     let status = Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
     if let Ok(mut ms) = ctrl.migrate_status.lock() {
@@ -418,39 +605,43 @@ pub(super) fn migrate_dest(
         thread::Builder::new()
             .name("migrate-dest".into())
             .spawn(move || {
+                let lease = MigrationLease::new(ctrl_arc.as_ref());
                 let hooks = dest_hooks(&ctrl_arc);
+                let run = &ctrl_arc.run;
                 let outcome =
-                    accept_one(&listen_addr, &mlog).and_then(|stream| {
-                        vmm_migrate::destination::run_destination(
-                            stream, hdl, &memctx, config, hooks, status, &mlog,
-                        )
-                        .map_err(|e| e.to_string())
-                    });
+                    accept_one(&listen_addr, || run.cancelled(), &mlog)
+                        .and_then(|stream| {
+                            shut_on_stop(run, stream, &mlog)
+                                .map_err(|e| e.to_string())
+                        })
+                        .and_then(|stream| {
+                            vmm_migrate::destination::run_destination(
+                                stream, hdl, &memctx, config, hooks, status,
+                                &mlog,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
                 match outcome {
                     Ok(()) => {
                         info!(
                             mlog,
                             "destination migration complete, VM running"
                         );
-                        ctrl_arc.state.store(
-                            VmRunState::Running as u8,
-                            Ordering::Release,
-                        );
+                        end_migration(&ctrl_arc);
                     }
                     Err(e) => {
-                        // The guest never left this VM's previous state, so
-                        // marking it Stopped would strand a live VM no
-                        // control command can reach.
+                        let confirmed = ctrl_arc.source_committed();
                         error!(mlog, "destination migration failed";
-                        "error" => %e);
-                        ctrl_arc
-                            .state
-                            .store(prev_state as u8, Ordering::Release);
+                            "error" => %e, "source_committed" => confirmed);
+                        ctrl_arc.ended(run.fail_import(confirmed, || {
+                            ctrl_arc.release_pause()
+                        }));
                     }
                 }
+                lease.release();
             })
     {
-        ctrl.state.store(prev_state as u8, Ordering::Release);
+        end_migration(ctrl);
         return Response::err(&format!(
             "failed to spawn migration thread: {e}"
         ));
@@ -466,27 +657,56 @@ fn dest_hooks(ctrl: &Arc<VmController>) -> vmm_migrate::destination::DestHooks {
     let for_restore = Arc::clone(ctrl);
     let for_resume = Arc::clone(ctrl);
     let for_hyperv = Arc::clone(ctrl);
+    let (pause_vm, resume_vm) = migration_pause_hooks(ctrl);
     vmm_migrate::destination::DestHooks {
         restore: Box::new(move |bdf, state| {
             for_restore.restore_device_state(bdf, state)
         }),
-        resume: Box::new(move || for_resume.resume_devices()),
+        resume: Box::new(move || {
+            for_resume.resume_devices();
+            for_resume.run.devices_resumed();
+        }),
         hyperv: Box::new(move |state| for_hyperv.restore_hyperv(state)),
+        pause_vm,
+        resume_vm,
+        gate: Box::new(ControlGate(Arc::clone(ctrl))),
     }
 }
 
-/// Bind, take one connection, and give the listener back.
+/// Bind, take one connection, and give the listener back. Gives up
+/// when `cancelled` says a stop arrived.
 fn accept_one(
     listen_addr: &str,
+    cancelled: impl Fn() -> bool,
     log: &slog::Logger,
 ) -> Result<TcpStream, String> {
     let listener = TcpListener::bind(listen_addr)
         .map_err(|e| format!("bind {listen_addr}: {e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("listen {listen_addr}: {e}"))?;
     info!(log, "waiting for migration"; "addr" => listen_addr);
-    let (stream, peer) =
-        listener.accept().map_err(|e| format!("accept: {e}"))?;
-    info!(log, "accepted migration connection"; "peer" => %peer);
-    Ok(stream)
+    loop {
+        if cancelled() {
+            return Err(vmm_migrate::CANCELLED.to_string());
+        }
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                info!(log, "accepted migration connection"; "peer" => %peer);
+                // illumos hands the listener's O_NONBLOCK to the new
+                // socket, and the protocol needs blocking reads.
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|e| format!("accept: {e}"))?;
+                return Ok(stream);
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("accept: {e}")),
+        }
+    }
 }
 
 pub(super) fn migrate_status(ctrl: &Arc<VmController>) -> Response {
@@ -540,228 +760,5 @@ fn migrate_pci_slots(
     slots
 }
 
-// ── Tests ───────────────────────────────────────────────────────────
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_destination_is_told_about_a_hotplugged_device() {
-        // The destination imports the state of every registered device,
-        // so a device it was not told to create loses the guest a disk.
-        use vmm_machine::{DeviceRegistry, RegisteredDevice};
-
-        let registry = DeviceRegistry::new();
-        let mut added = RegisteredDevice::new(
-            "virtio-blk@5",
-            vmm_machine::parse_bdf("5"),
-            None,
-            None,
-            Some("5,virtio-blk,/added.img".to_string()),
-        );
-        added.hotpluggable = true;
-        registry.insert(added).expect("insert");
-
-        let slots = migrate_pci_slots(
-            &["4,nvme,/boot.img,bootindex=1".to_string()],
-            &registry,
-        );
-
-        assert_eq!(
-            slots,
-            ["4,nvme,/boot.img,bootindex=1", "5,virtio-blk,/added.img"],
-        );
-    }
-
-    #[test]
-    fn a_machine_with_no_hotplug_reports_its_own_argv() {
-        let argv = ["4,nvme,/boot.img".to_string()];
-        assert_eq!(
-            migrate_pci_slots(&argv, &vmm_machine::DeviceRegistry::new()),
-            argv,
-        );
-    }
-
-    #[test]
-    fn migrate_source_rejects_host_local_state() {
-        let command = Command::MigrateSource {
-            target_addr: "192.0.2.10:4567".to_string(),
-            zfs_barrier: None,
-        };
-
-        for state in [
-            HostLocalState::new(true, false),
-            HostLocalState::new(false, true),
-            HostLocalState::new(true, true),
-        ] {
-            let response = migration_source_guard(state, false, &command)
-                .expect("host-local state must block migration");
-            assert!(!response.success);
-            assert!(response
-                .error
-                .as_deref()
-                .expect("error response must explain rejection")
-                .contains("host-local state is not carried by migration"));
-        }
-
-        assert!(migration_source_guard(
-            HostLocalState::default(),
-            false,
-            &command
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn migrate_source_rejects_ahci_cd() {
-        let command = Command::MigrateSource {
-            target_addr: "192.0.2.10:4567".to_string(),
-            zfs_barrier: None,
-        };
-
-        let response =
-            migration_source_guard(HostLocalState::default(), true, &command)
-                .expect("AHCI CD must block migration");
-        assert!(!response.success);
-        assert_eq!(
-            response.error.as_deref(),
-            Some("ahci-cd is not supported on a migration source")
-        );
-    }
-
-    #[test]
-    fn a_vm_that_did_not_grow_can_still_migrate() {
-        // Starting with --hotplug is not the same as using it. A VM
-        // that added nothing has to keep the migration it had.
-        assert_eq!(growth(&HotplugEngines::default()), (0, 0));
-        assert_eq!(grown_since_boot(0, 0), None);
-    }
-
-    #[test]
-    fn a_boot_device_set_can_still_migrate() {
-        // Only a hot-added device changes the set. A VM that added
-        // nothing has to keep the migration it had.
-        assert_eq!(device_set_changed(&[]), None);
-    }
-
-    #[test]
-    fn a_hot_added_device_cannot_be_a_migration_source() {
-        // The destination is built from the boot device list, so it has
-        // nowhere to put a device the guest gained since.
-        let reason =
-            device_set_changed(&["5,virtio-blk,/added.img".to_string()])
-                .expect("an added device must block migration");
-        assert!(reason.contains("hot-added 1 device(s)"), "{reason}");
-        assert!(reason.contains("5,virtio-blk,/added.img"), "{reason}");
-        assert!(reason.contains("boot device list"), "{reason}");
-    }
-
-    fn ident(dev: u8, kind: &str) -> vmm_migrate::codec::DeviceIdentity {
-        vmm_migrate::codec::DeviceIdentity {
-            bdf: vmm_devices::lifecycle::WireBdf {
-                bus: 0,
-                dev,
-                func: 0,
-            },
-            kind: kind.to_string(),
-        }
-    }
-
-    #[test]
-    fn a_vm_with_only_migratable_devices_can_be_a_source() {
-        assert_eq!(unmigratable_devices(&[]), None);
-        assert_eq!(
-            unmigratable_devices(&[ident(4, "nvme"), ident(5, "virtio-blk")]),
-            None,
-        );
-    }
-
-    #[test]
-    fn a_device_whose_state_is_not_carried_blocks_migration() {
-        // The guest driver would find the device at reset on the far
-        // side, with no error anywhere.
-        for kind in ["xhci", "ahci-cd", "virtio-fs", "virtio-vsock"] {
-            let reason = unmigratable_devices(&[ident(6, kind)])
-                .unwrap_or_else(|| panic!("{kind} must block migration"));
-            assert!(reason.contains(kind), "{reason}");
-            assert!(reason.contains("6.0"), "{reason}");
-        }
-    }
-
-    #[test]
-    fn every_blocking_device_is_named_in_the_refusal() {
-        // An operator has to see all of them before they can retry.
-        let reason =
-            unmigratable_devices(&[ident(6, "xhci"), ident(7, "virtio-fs")])
-                .expect("two blocking devices");
-        assert!(reason.contains("xhci@0.6.0"), "{reason}");
-        assert!(reason.contains("virtio-fs@0.7.0"), "{reason}");
-    }
-
-    #[test]
-    fn a_unix_target_skips_the_tcp_address_check() {
-        // The GZ agent's socket path is not a host:port.
-        assert!(matches!(
-            MigrateTarget::parse("/tmp/vmm-migrate-data.sock"),
-            Ok(MigrateTarget::Unix(_)),
-        ));
-        assert!(matches!(
-            MigrateTarget::parse("192.0.2.10:4567"),
-            Ok(MigrateTarget::Tcp(_)),
-        ));
-        MigrateTarget::parse("127.0.0.1:4567")
-            .err()
-            .expect("loopback is refused");
-    }
-
-    #[test]
-    fn every_changed_slot_is_named_in_the_refusal() {
-        // An operator has to see which slots to remove before they can
-        // retry, so the message names all of them.
-        let reason = device_set_changed(&[
-            "5,virtio-blk,/a.img".to_string(),
-            "6,virtio-blk,/b.img".to_string(),
-        ])
-        .expect("two added devices must block migration");
-        assert!(reason.contains("5,virtio-blk,/a.img"), "{reason}");
-        assert!(reason.contains("6,virtio-blk,/b.img"), "{reason}");
-    }
-
-    #[test]
-    fn a_device_still_pending_removal_blocks_migration() {
-        // `hotplug_specs` keeps a slot the guest has not ejected, so it
-        // is still part of the live set and still unsafe to migrate.
-        use vmm_machine::{DeviceRegistry, RegisteredDevice, SlotState};
-
-        let registry = DeviceRegistry::new();
-        let mut added = RegisteredDevice::new(
-            "virtio-blk@5",
-            vmm_machine::parse_bdf("5"),
-            None,
-            None,
-            Some("5,virtio-blk,/added.img".to_string()),
-        );
-        added.hotpluggable = true;
-        let id = added.id.clone();
-        registry.insert(added).expect("insert");
-        registry
-            .set_state(&id, SlotState::Present, SlotState::RemovePending)
-            .expect("remove requested");
-
-        assert!(device_set_changed(&vmm_machine::hotplug_specs(&registry))
-            .is_some());
-    }
-
-    #[test]
-    fn a_vm_that_hot_added_cannot_be_a_migration_source() {
-        // The destination is built from the same command line, so the
-        // loss would show up as guest corruption on the far side and
-        // not as a failed migration.
-        let cpus = grown_since_boot(2, 0).expect("two added vCPUs");
-        assert!(cpus.contains("hot-added 2 vCPUs"), "{cpus}");
-
-        let memory = grown_since_boot(0, 134_217_728).expect("added memory");
-        assert!(memory.contains("134217728 bytes"), "{memory}");
-    }
-}
+mod tests;

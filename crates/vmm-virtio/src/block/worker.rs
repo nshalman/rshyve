@@ -14,12 +14,15 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use vmm_core::mem::PhysMap;
+use vmm_devices::blkdev::DiskSync;
 use vmm_devices::QuiesceGate;
 
 use super::access::BackendBarrier;
+use super::budget::{Budget, Charge};
 use super::io::{self, BOUNCE_BYTES};
 use super::{bits, discard, probes, ChainBuf, DiskLimits};
 use crate::access::{GuestAccess, RingTag};
+use crate::pci::notify::KickSlot;
 use crate::queue::VirtioCompletion;
 
 /// Completions a worker gathers before it takes the `VirtioCompletion`
@@ -38,6 +41,8 @@ pub(super) struct BlkIoRequest {
     /// drops the request when it no longer matches: the chain and the
     /// completion both point at a ring the driver has since torn down.
     pub(super) tag: RingTag,
+    /// Budget the request holds until its answer is published.
+    pub(super) charge: Charge,
 }
 
 /// A one-shot hook a test installs to pin an interleaving.
@@ -52,18 +57,36 @@ pub(super) struct WorkerParks {
     /// Reached where a request is about to call the backing store,
     /// with no guest-access permission held.
     pub(super) at_backend: ParkSlot,
+    /// Reached at the same point by every request, and never cleared.
+    /// Stands in for a slow disk.
+    pub(super) each_backend: ParkSlot,
     /// Reached with the guest side of a pass finished and its used
     /// entries not yet published.
     pub(super) before_publish: ParkSlot,
     /// Reached with the used entries published and the interrupt for
     /// them not yet raised.
     pub(super) before_raise: ParkSlot,
+    /// Reached on the vCPU with requests taken from the ring and not
+    /// yet handed to a worker.
+    pub(super) before_dispatch: ParkSlot,
+    /// While set, a parked worker leaves work queued to it, as one
+    /// that has not looked yet does.
+    pub(super) parked_skips_work: std::sync::atomic::AtomicBool,
 }
 
 /// Run a park point, if a test installed one, and clear it.
 #[cfg(test)]
-fn run_park(slot: &ParkSlot) {
+pub(super) fn run_park(slot: &ParkSlot) {
     let hook = slot.lock().expect("park lock poisoned").take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run a hook that stays installed, if a test installed one.
+#[cfg(test)]
+fn run_each(slot: &ParkSlot) {
+    let hook = slot.lock().expect("park lock poisoned").clone();
     if let Some(hook) = hook {
         hook();
     }
@@ -79,6 +102,10 @@ pub(super) struct WorkerCtx {
     /// Keeps a write admitted before a reset from overtaking one the
     /// next driver sends to the same sector.
     pub(super) backend: Arc<BackendBarrier>,
+    /// Work the device has taken from its rings and not finished.
+    pub(super) budget: Arc<Budget>,
+    /// Drains a ring that gave chains back for want of budget.
+    pub(super) kick: Arc<KickSlot>,
     #[cfg(test)]
     pub(super) parks: Arc<WorkerParks>,
 }
@@ -130,16 +157,16 @@ pub(super) fn needs_backend(rtype: u32) -> bool {
 /// cannot land on a descriptor the host has reopened.
 pub(super) fn blk_io_worker(
     rx: mpsc::Receiver<BlkIoRequest>,
-    file: Arc<File>,
+    disk: Arc<DiskSync>,
     limits: DiskLimits,
     ctx: WorkerCtx,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
 
-    let file = &*file;
+    let disk = &*disk;
 
     let mut bounce = Bounce::new();
-    let mut done: Vec<(u16, u32)> = Vec::with_capacity(BATCH_MAX);
+    let mut done = Pass::new();
     // Carries the one request a batch drain had to hand back because it
     // crossed a reset boundary.
     let mut carried: Option<BlkIoRequest> = None;
@@ -150,7 +177,17 @@ pub(super) fn blk_io_worker(
             None => match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(r) => r,
                 Err(RecvTimeoutError::Timeout) => {
-                    ctx.gate.park_if_paused();
+                    carried = ctx.gate.park_if_paused_or(|| {
+                        #[cfg(test)]
+                        if ctx
+                            .parks
+                            .parked_skips_work
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            return None;
+                        }
+                        rx.try_recv().ok()
+                    });
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -159,7 +196,7 @@ pub(super) fn blk_io_worker(
 
         run_batch(
             &rx,
-            file,
+            disk,
             &limits,
             &ctx,
             &mut bounce,
@@ -167,6 +204,26 @@ pub(super) fn blk_io_worker(
             req,
             &mut carried,
         );
+    }
+}
+
+/// The results of one pass, and the budget its requests hold until
+/// those results are published.
+///
+/// A request's budget is what tells a pause the request is still
+/// owed. Given back before the publish, a pause could see the device
+/// quiet while an answer is still missing from the used ring.
+struct Pass {
+    entries: Vec<(u16, u32)>,
+    charges: Vec<Charge>,
+}
+
+impl Pass {
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(BATCH_MAX),
+            charges: Vec::with_capacity(BATCH_MAX),
+        }
     }
 }
 
@@ -179,25 +236,26 @@ pub(super) fn blk_io_worker(
 #[allow(clippy::too_many_arguments)]
 fn run_batch(
     rx: &mpsc::Receiver<BlkIoRequest>,
-    file: &File,
+    disk: &DiskSync,
     limits: &DiskLimits,
     ctx: &WorkerCtx,
     bounce: &mut Bounce,
-    done: &mut Vec<(u16, u32)>,
+    done: &mut Pass,
     first: BlkIoRequest,
     carried: &mut Option<BlkIoRequest>,
 ) {
     let completion = Arc::clone(&first.completion);
     let tag = first.tag;
-    done.clear();
+    done.entries.clear();
 
     let mut next = Some(first);
     let mut count = 0usize;
-    while let Some(req) = next.take() {
+    while let Some(mut req) = next.take() {
         count += 1;
-        if let Some(entry) = run_request(file, limits, ctx, bounce, &req) {
-            done.push(entry);
+        if let Some(entry) = run_request(disk, limits, ctx, bounce, &req) {
+            done.entries.push(entry);
         }
+        done.charges.push(std::mem::take(&mut req.charge));
         if count >= BATCH_MAX {
             break;
         }
@@ -218,7 +276,22 @@ fn run_batch(
         }
     }
 
-    publish(ctx, &completion, tag, done);
+    publish(ctx, &completion, tag, &done.entries);
+    done.charges.clear();
+    // The release is what marks starved rings due, so it goes first. The
+    // kick takes chains only through admission, which a pause has closed.
+    kick_starved(ctx);
+}
+
+/// Drain the rings that wait for the budget this pass gave back.
+///
+/// Runs with no guest-access permission held: a kick takes the
+/// transport lock, and a ring reprogram waits for permission while it
+/// holds that lock.
+fn kick_starved(ctx: &WorkerCtx) {
+    for queue_idx in ctx.budget.take_kicks() {
+        ctx.kick.kick(queue_idx);
+    }
 }
 
 /// Publish the finished results, then raise the interrupt outside the
@@ -254,19 +327,20 @@ fn publish(
 /// `None` means the request belongs to a session that has ended. It
 /// publishes nothing and writes nothing into guest memory.
 pub(super) fn run_request(
-    file: &File,
+    disk: &DiskSync,
     limits: &DiskLimits,
     ctx: &WorkerCtx,
     bounce: &mut Bounce,
     req: &BlkIoRequest,
 ) -> Option<(u16, u32)> {
+    let file: &File = disk.file();
     let (status, used_len) = match req.rtype {
         bits::VIRTIO_BLK_T_IN => read_request(file, ctx, bounce, req)?,
         bits::VIRTIO_BLK_T_OUT if !limits.read_only => {
             write_request(file, ctx, bounce, req)?
         }
         bits::VIRTIO_BLK_T_OUT => (bits::VIRTIO_BLK_S_IOERR, 1),
-        bits::VIRTIO_BLK_T_FLUSH => flush_request(file, ctx, req)?,
+        bits::VIRTIO_BLK_T_FLUSH => flush_request(disk, ctx, req)?,
         bits::VIRTIO_BLK_T_DISCARD | bits::VIRTIO_BLK_T_WRITE_ZEROES => {
             dwz_request(file, limits, ctx, req)?
         }
@@ -277,6 +351,15 @@ pub(super) fn run_request(
     io::write_status(&ctx.physmap, &req.chain, status);
     probes::vioblk_complete!(|| (req.head, status));
     Some((req.head, used_len))
+}
+
+/// The budget does not bound a request past it, which may move 1 GiB.
+/// A pause lets it run for the grace, then stops it with its charge
+/// held, so the device stays not quiet and that pause fails.
+fn hold_between_chunks(ctx: &WorkerCtx, req: &BlkIoRequest, moved: usize) {
+    if moved != 0 && req.charge.is_alone() {
+        ctx.gate.hold_in_transfer();
+    }
 }
 
 /// Read from the disk into host memory, then copy that into the guest
@@ -303,6 +386,7 @@ fn read_request(
 
     let mut moved = 0usize;
     while moved < total {
+        hold_between_chunks(ctx, req, moved);
         let buf = bounce.take(total - moved);
         let n = buf.len();
         let Some(at) = base.checked_add(moved as u64) else {
@@ -311,7 +395,10 @@ fn read_request(
         {
             let _ticket = ctx.backend.admit(&ctx.access, req.tag, false)?;
             #[cfg(test)]
-            run_park(&ctx.parks.at_backend);
+            {
+                run_park(&ctx.parks.at_backend);
+                run_each(&ctx.parks.each_backend);
+            }
             // A short read or an error leaves the tail of the buffer
             // holding the last request, so nothing is copied out.
             if !io::read_backend(file, at, buf) {
@@ -351,6 +438,7 @@ fn write_request(
 
     let mut moved = 0usize;
     while moved < total {
+        hold_between_chunks(ctx, req, moved);
         let buf = bounce.take(total - moved);
         let n = buf.len();
         {
@@ -366,7 +454,10 @@ fn write_request(
         };
         let _ticket = ctx.backend.admit(&ctx.access, req.tag, true)?;
         #[cfg(test)]
-        run_park(&ctx.parks.at_backend);
+        {
+            run_park(&ctx.parks.at_backend);
+            run_each(&ctx.parks.each_backend);
+        }
         if !io::write_backend(file, at, buf) {
             return Some((bits::VIRTIO_BLK_S_IOERR, 1));
         }
@@ -376,7 +467,7 @@ fn write_request(
 }
 
 fn flush_request(
-    file: &File,
+    disk: &DiskSync,
     ctx: &WorkerCtx,
     req: &BlkIoRequest,
 ) -> Option<(u8, u32)> {
@@ -384,7 +475,7 @@ fn flush_request(
     // cannot put the wrong bytes in a sector. It waits for the older
     // writes but does not hold the next session behind itself.
     let _ticket = ctx.backend.admit(&ctx.access, req.tag, false)?;
-    if file.sync_data().is_ok() {
+    if disk.sync().is_ok() {
         Some((bits::VIRTIO_BLK_S_OK, 1))
     } else {
         Some((bits::VIRTIO_BLK_S_IOERR, 1))

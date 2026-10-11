@@ -191,9 +191,65 @@ pub struct NvmeMigrateState {
     pub admin_cq: Option<NvmeMigrateCq>,
     pub io_sqs: Vec<Option<NvmeMigrateSq>>,
     pub io_cqs: Vec<Option<NvmeMigrateCq>>,
+    /// The larger of the two granted counts. A peer that keeps one
+    /// count for both reads only this, and accepts every live queue.
     pub num_io_queues: u16,
+    /// `None` from a source that kept one count for SQs and CQs.
+    #[serde(default)]
+    pub io_queue_counts: Option<NvmeMigrateQueueCounts>,
     pub pci: MigratePciState,
     pub msix: MsixMigrateState,
+    /// `None` from a v2 source, whose only shape was 512-byte blocks and
+    /// a volatile write cache.
+    #[serde(default)]
+    pub namespace: Option<NvmeMigrateNamespace>,
+    /// `None` from a v3 or older source, which had only host files.
+    #[serde(default)]
+    pub backend: Option<NvmeMigrateBackend>,
+    /// Asynchronous Event Requests held without a completion. The guest
+    /// counts them against AERL, so a destination that forgot them
+    /// would take one more than the guest believes it may send.
+    pub aers_held: u8,
+}
+
+/// The I/O SQs and CQs Set Features granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NvmeMigrateQueueCounts {
+    pub sqs: u16,
+    pub cqs: u16,
+}
+
+/// What holds a namespace's blocks. Two volumes of one shape pass every
+/// namespace check, so the destination also needs the same store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NvmeMigrateBackend {
+    /// A host file or zvol. Paths differ between hosts, so none is kept.
+    File,
+    /// A MantaBlock volume. A UUID, so a payload naming anything else
+    /// does not decode and the name reaches no log unescaped.
+    MantaBlock { volume: uuid::Uuid },
+}
+
+impl fmt::Display for NvmeMigrateBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File => f.write_str("a host file"),
+            Self::MantaBlock { volume } => {
+                write!(f, "MantaBlock volume {volume}")
+            }
+        }
+    }
+}
+
+/// A destination must show the same namespace: the guest's partition
+/// tables, flush habits and mounts depend on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NvmeMigrateNamespace {
+    pub block_size: u32,
+    pub volatile_write_cache: bool,
+    /// NSZE, in blocks.
+    pub total_blocks: u64,
+    pub read_only: bool,
 }
 
 /// NVMe submission queue state for migration.
@@ -219,4 +275,17 @@ pub struct NvmeMigrateCq {
     /// poll queue has none, and restoring one as interrupting sends the
     /// destination guest a message it never armed a handler for.
     pub ien: bool,
+    /// Completions waiting for a free guest CQ slot, oldest first. Empty
+    /// from a v2 source, which dropped them.
+    #[serde(default)]
+    pub held: Vec<NvmeMigrateCqe>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NvmeMigrateCqe {
+    pub sqid: u16,
+    pub cid: u16,
+    /// The status field without its phase bit.
+    pub status: u16,
+    pub cdw0: u32,
 }

@@ -176,6 +176,10 @@ impl PciHotplug {
         self.sink.raise(GpeBit::Pci);
     }
 
+    pub fn has_eject_requests(&self) -> bool {
+        self.lock().eject_pending != 0
+    }
+
     /// Take the slots the guest asked to eject.
     ///
     /// The caller owns teardown for every slot returned. Each slot

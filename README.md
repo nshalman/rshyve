@@ -36,7 +36,7 @@ prints the revision it measured.
 
 ```bash
 rshyve -c 2 -m 2G \
-  -s 4,nvme,/dev/zvol/dsk/zones/disk0 \
+  -s 4,nvme,/dev/zvol/rdsk/zones/disk0 \
   -s 6,virtio-net-viona,net0 \
   -l bootrom,/usr/share/bhyve/uefi-rom.bin \
   -l com1,stdio \

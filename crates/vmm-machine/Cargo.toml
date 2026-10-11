@@ -21,6 +21,7 @@ slog.workspace = true
 slog-async.workspace = true
 slog-term.workspace = true
 usdt = { workspace = true, features = ["asm"] }
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

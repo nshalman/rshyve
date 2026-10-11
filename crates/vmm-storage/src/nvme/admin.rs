@@ -4,43 +4,77 @@
 
 //! Admin command set.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use vmm_core::mem::MemCtx;
 
 use super::bits::*;
+use super::cq::{post_or_hold, Cqe};
+use super::locked::Locked;
 use super::prp::write_to_prp;
 use super::queues::{
-    io_queue_index, post_completion, CompQueue, NvmeState, SubQueue,
+    io_queue_index, CompQueue, NvmeState, QueueInstance, SubQueue,
 };
 use super::NvmeController;
+
+/// A deleted queue whose commands must finish before the Delete Queue
+/// completes.
+///
+/// Named by instance: the lock is released while it waits, and the
+/// driver may create a new queue in the same slot meanwhile.
+#[derive(Clone, Copy)]
+enum Fence {
+    Sq(usize, QueueInstance),
+    Cq(u16, QueueInstance),
+}
+
+impl Fence {
+    fn busy(self, st: &NvmeState) -> bool {
+        match self {
+            Self::Sq(idx, instance) => st.inflight[idx]
+                .any_in_flight(|cmd| cmd.sq_instance == instance),
+            Self::Cq(cq_id, instance) => st.inflight.iter().any(|slots| {
+                slots.any_in_flight(|cmd| {
+                    cmd.cq_id == cq_id && cmd.cq_instance == instance
+                })
+            }),
+        }
+    }
+}
 
 impl NvmeController {
     /// Process admin SQ doorbell: parse and execute admin commands inline.
     pub(super) fn admin_sq_doorbell(&self, new_tail: u16) {
-        let mem = MemCtx::new(Arc::clone(&self.physmap));
-        let mut st = self.state.lock().expect("nvme: state lock");
-
-        // Update the tail pointer (validate against queue size)
+        let mut st = self.lock();
         match &mut st.admin_sq {
-            Some(sq) => {
-                if new_tail >= sq.size {
-                    return;
-                }
-                sq.tail = new_tail;
-            }
-            None => return,
+            Some(sq) if new_tail < sq.size => sq.tail = new_tail,
+            _ => return,
         }
+        drop(self.run_admin(st));
+    }
 
+    /// Run admin commands until the SQ is empty, or until the admin CQ
+    /// has no space for another completion: those wait in the SQ for
+    /// the CQ head doorbell.
+    pub(super) fn run_admin<'a>(&'a self, mut st: Locked<'a>) -> Locked<'a> {
+        let mem = MemCtx::new(Arc::clone(&self.physmap));
         // Process entries in a loop, re-borrowing each iteration to
         // avoid holding a mutable borrow on admin_sq across the call
         // to process_admin_cmd (which borrows the full NvmeState).
         loop {
+            // A queue created now could name pages a stuck transfer
+            // still writes.
+            if st.fence_failed
+                || !st.admin_cq.as_ref().is_some_and(CompQueue::has_room)
+            {
+                break;
+            }
             // Read the next SQE from guest memory (borrow admin_sq briefly)
             let (sqe_gpa, sq_head, sq_size) = {
                 let sq = match &st.admin_sq {
                     Some(sq) => sq,
-                    None => return,
+                    None => break,
                 };
                 if sq.head == sq.tail {
                     break;
@@ -89,48 +123,71 @@ impl NvmeController {
             if let Some(sq) = &mut st.admin_sq {
                 sq.head = sq_head;
             }
+            if opcode == ADMIN_OPC_ASYNC_EVENT_REQUEST && st.hold_aer() {
+                continue;
+            }
 
             let (status, cdw0, fence) = self.process_admin_cmd(
                 &mut st, &mem, opcode, nsid, prp1, prp2, cdw10, cdw11,
             );
 
-            // Held across the completion: the driver takes a Delete
-            // Queue completion as licence to reuse the queue's pages.
-            let _fence = if fence {
-                drop(st);
-                let held = self.fence_workers(self.fences.reset);
-                st = self.state.lock().expect("nvme: state lock");
-                if held.is_none() {
+            // The driver takes a Delete Queue completion as licence to
+            // reuse the queue's pages, so their commands finish first.
+            if let Some(fence) = fence {
+                let admin_cq = st.admin_cq.as_ref().map(|cq| cq.instance);
+                let (next, drained) =
+                    self.drain(st, self.fences.reset, |st| fence.busy(st));
+                st = next;
+                // Linux frees the queue's pages on any Delete Queue
+                // completion, error status included. A fatal controller
+                // posts none; the driver times out and resets.
+                if !drained {
                     st.fail_fence();
+                    break;
                 }
-                held
-            } else {
-                None
-            };
+                // A reset while the lock was released took this admin
+                // queue away; its completion belongs to no ring now.
+                if st.admin_cq.as_ref().map(|cq| cq.instance) != admin_cq {
+                    break;
+                }
+            }
 
-            if let Err(error) = post_completion(
-                &mem,
-                &self.msix,
-                &mut st.admin_cq,
+            let cqe = Cqe {
                 cdw0,
-                ADMIN_QUEUE_ID,
-                sq_head,
+                sqid: ADMIN_QUEUE_ID,
                 cid,
                 status,
-            ) {
+            };
+            // A Delete Queue drain released the lock, so another vCPU
+            // may have filled the CQ since the check above.
+            let state = &mut *st;
+            let posted = match state.admin_cq.as_mut() {
+                Some(cq) => post_or_hold(
+                    &mem,
+                    &mut state.irqs,
+                    ADMIN_QUEUE_ID,
+                    cq,
+                    cqe,
+                    sq_head,
+                    None,
+                ),
+                None => break,
+            };
+            if let Err(error) = posted {
                 // The driver will never see this command finish.
                 slog::error!(self.log, "nvme: admin CQE write failed";
                     "error" => %error);
                 st.csts |= CSTS_CFS;
             }
         }
+        st
     }
 
     /// Process a single admin command.
     ///
-    /// Returns the status, the command-specific result, and whether the
-    /// completion must wait for the worker pool: Delete Queue may only
-    /// complete once the commands it took away have finished.
+    /// Returns the status, the command-specific result, and the queue
+    /// whose commands the completion must wait for: Delete Queue may
+    /// only complete once the commands it took away have finished.
     fn process_admin_cmd(
         &self,
         st: &mut NvmeState,
@@ -141,9 +198,17 @@ impl NvmeController {
         prp2: u64,
         cdw10: u32,
         cdw11: u32,
-    ) -> (u16, u32, bool) {
-        let deletes_a_queue =
-            matches!(opcode, ADMIN_OPC_DELETE_IO_SQ | ADMIN_OPC_DELETE_IO_CQ);
+    ) -> (u16, u32, Option<Fence>) {
+        let qid = (cdw10 & 0xFFFF) as u16;
+        let deleted = io_queue_index(qid).and_then(|idx| match opcode {
+            ADMIN_OPC_DELETE_IO_SQ => st.io_sqs[idx]
+                .as_ref()
+                .map(|sq| Fence::Sq(idx, sq.instance)),
+            ADMIN_OPC_DELETE_IO_CQ => st.io_cqs[idx]
+                .as_ref()
+                .map(|cq| Fence::Cq(qid, cq.instance)),
+            _ => None,
+        });
         let (status, cdw0) = match opcode {
             ADMIN_OPC_IDENTIFY => {
                 self.admin_identify(st, mem, nsid, prp1, prp2, cdw10)
@@ -168,9 +233,11 @@ impl NvmeController {
             ADMIN_OPC_GET_LOG_PAGE => {
                 Self::admin_get_log_page(mem, prp1, prp2, cdw10)
             }
+            // Only reached past the limit: run_admin holds the rest.
+            ADMIN_OPC_ASYNC_EVENT_REQUEST => (SC_AER_LIMIT_EXCEEDED, 0),
             _ => (SC_INVALID_OPCODE | (SC_DNR), 0),
         };
-        (status, cdw0, deletes_a_queue && status == SC_SUCCESS)
+        (status, cdw0, deleted.filter(|_| status == SC_SUCCESS))
     }
 
     /// Get Log Page.
@@ -247,7 +314,7 @@ impl NvmeController {
         let Some(idx) = io_queue_index(qid) else {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         };
-        if qid > st.num_io_queues {
+        if qid > st.num_io_cqs {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
         if qsize < 2 || qsize > u32::from(MAX_QUEUE_SIZE) {
@@ -268,16 +335,20 @@ impl NvmeController {
         }
 
         let instance = st.next_instance();
-        st.io_cqs[idx] = Some(CompQueue {
-            base: prp1,
-            size: qsize,
-            head: 0,
-            tail: 0,
-            phase: true,
-            iv,
-            ien,
-            instance,
-        });
+        st.set_cq(
+            idx,
+            Some(CompQueue {
+                base: prp1,
+                size: qsize,
+                head: 0,
+                tail: 0,
+                phase: true,
+                iv,
+                ien,
+                instance,
+                held: VecDeque::new(),
+            }),
+        );
 
         (SC_SUCCESS, 0)
     }
@@ -297,7 +368,7 @@ impl NvmeController {
         let Some(idx) = io_queue_index(qid) else {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         };
-        if qid > st.num_io_queues {
+        if qid > st.num_io_sqs {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
         if qsize < 2 || qsize > u32::from(MAX_QUEUE_SIZE) {
@@ -321,14 +392,17 @@ impl NvmeController {
         }
 
         let instance = st.next_instance();
-        st.io_sqs[idx] = Some(SubQueue {
-            base: prp1,
-            size: qsize,
-            head: 0,
-            tail: 0,
-            cq_id,
-            instance,
-        });
+        st.set_sq(
+            idx,
+            Some(SubQueue {
+                base: prp1,
+                size: qsize,
+                head: 0,
+                tail: 0,
+                cq_id,
+                instance,
+            }),
+        );
 
         (SC_SUCCESS, 0)
     }
@@ -342,7 +416,8 @@ impl NvmeController {
         if st.io_sqs[idx].is_none() {
             return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
         }
-        st.io_sqs[idx] = None;
+        st.set_sq(idx, None);
+        st.throttled &= !(1u16 << idx);
         (SC_SUCCESS, 0)
     }
 
@@ -361,7 +436,7 @@ impl NvmeController {
                 return (SC_INVALID_QUEUE_ID | SC_DNR, 0);
             }
         }
-        st.io_cqs[idx] = None;
+        st.set_cq(idx, None);
         (SC_SUCCESS, 0)
     }
 
@@ -372,13 +447,15 @@ impl NvmeController {
             FEAT_NUM_QUEUES => {
                 // CDW0 bits 31:16 = num CQs allocated (0-based)
                 // CDW0 bits 15:0  = num SQs allocated (0-based)
-                let nq = u32::from(st.num_io_queues.saturating_sub(1));
-                (SC_SUCCESS, nq | (nq << 16))
+                let sqs = u32::from(st.num_io_sqs.saturating_sub(1));
+                let cqs = u32::from(st.num_io_cqs.saturating_sub(1));
+                (SC_SUCCESS, sqs | (cqs << 16))
             }
-            FEAT_VOLATILE_WC => {
-                // Volatile write cache: report enabled
-                (SC_SUCCESS, 1)
+            // With no cache to report, the feature is not there to get.
+            FEAT_VOLATILE_WC if !st.volatile_write_cache => {
+                (SC_INVALID_FIELD | SC_DNR, 0)
             }
+            FEAT_VOLATILE_WC => (SC_SUCCESS, 1),
             FEAT_TEMP_THRESHOLD | FEAT_ERROR_RECOVERY | FEAT_POWER_MGMT
             | FEAT_ARBITRATION | FEAT_INTR_COALESCING
             | FEAT_INTR_VECTOR_CFG | FEAT_WRITE_ATOMICITY
@@ -396,16 +473,20 @@ impl NvmeController {
         let fid = (cdw10 & 0xFF) as u8;
         match fid {
             FEAT_NUM_QUEUES => {
-                // Guest requests N SQs and N CQs (0-based in CDW11)
+                // SQ and CQ counts, each 0-based, in CDW11
                 let requested_sq = (cdw11 & 0xFFFF) + 1;
                 let requested_cq = ((cdw11 >> 16) & 0xFFFF) + 1;
-                let max = MAX_IO_QUEUES as u32;
+                let max = u32::from(st.max_io_queues);
                 let alloc_sq = requested_sq.min(max);
                 let alloc_cq = requested_cq.min(max);
-                st.num_io_queues = alloc_sq.min(alloc_cq) as u16;
+                st.num_io_sqs = alloc_sq as u16;
+                st.num_io_cqs = alloc_cq as u16;
                 let result_sq = alloc_sq.saturating_sub(1);
                 let result_cq = alloc_cq.saturating_sub(1);
                 (SC_SUCCESS, result_sq | (result_cq << 16))
+            }
+            FEAT_VOLATILE_WC if !st.volatile_write_cache => {
+                (SC_INVALID_FIELD | SC_DNR, 0)
             }
             FEAT_VOLATILE_WC => (SC_SUCCESS, 0),
             FEAT_TEMP_THRESHOLD | FEAT_ERROR_RECOVERY | FEAT_POWER_MGMT

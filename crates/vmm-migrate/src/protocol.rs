@@ -4,22 +4,35 @@
 
 //! Migration protocol implementation.
 //!
-//! One protocol version at a time: a wire-format change bumps
-//! [`PROTOCOL_RON`] and both ends refuse anything else. There is no
-//! compatibility window, because a peer that reads a field as
-//! something else resumes a guest on state that is not its own.
+//! A wire-format change bumps [`PROTOCOL_RON`]. Each end speaks only
+//! the current version: a peer that reads a field as something else, or
+//! leaves one out, resumes a guest on state that is not its own.
 
 /// Protocol identifier for the RON migration format.
 ///
-/// v2 carries the NVMe completion queue interrupt-enable bit. A v1 peer
-/// has no field for it, and a destination that assumes one restores a
-/// polled queue as an interrupting one.
+/// v6 carries each vCPU's FPU and XSAVE area with the source host's
+/// layout, and the NVMe Asynchronous Event Requests a controller holds.
+/// A v4 destination resumed the guest with the destination's FPU state
+/// (OSF-2), so no older version is accepted in either direction.
 ///
-/// v1 put device identity on the wire. In v0 every virtio queue group
-/// was tagged slot 0 and the destination took the first group whose
-/// length matched its queue count, so two devices of one queue count
-/// restored each other's rings.
-pub const PROTOCOL_RON: &str = "vmm-migrate-ron/2";
+/// v5 is reserved for the virtio-gpu work (PR #15).
+///
+/// v4 named the store under each NVMe namespace. v3 carried held NVMe
+/// completions and the namespace shape. v2 carried the CQ
+/// interrupt-enable bit. v1 put device identity on the wire.
+pub const PROTOCOL_RON: &str = "vmm-migrate-ron/6";
+
+/// What a source offers.
+pub const SOURCE_OFFER: [&str; 1] = [PROTOCOL_RON];
+
+/// The version a destination answers an offer with, or `None` when it
+/// can read none of them.
+pub fn select_protocol(offer: &[String]) -> Option<&'static str> {
+    offer
+        .iter()
+        .any(|theirs| theirs == PROTOCOL_RON)
+        .then_some(PROTOCOL_RON)
+}
 
 /// Page size used for dirty tracking (4 KiB).
 pub use vmm_core::common::PAGE_SIZE;
@@ -78,6 +91,45 @@ impl<'a> Iterator for PageIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn offer(versions: &[&str]) -> Vec<String> {
+        versions.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn a_destination_takes_the_current_version() {
+        let mixed = offer(&["vmm-migrate-ron/4", PROTOCOL_RON]);
+        assert_eq!(select_protocol(&mixed), Some(PROTOCOL_RON));
+        assert_eq!(select_protocol(&offer(&SOURCE_OFFER)), Some(PROTOCOL_RON));
+    }
+
+    #[test]
+    fn a_destination_refuses_a_source_without_fpu_state() {
+        // v5 is the virtio-gpu stream, and v4 and older carry no XSAVE
+        // area (OSF-2).
+        for old in [
+            "vmm-migrate-ron/5",
+            "vmm-migrate-ron/4",
+            "vmm-migrate-ron/3",
+        ] {
+            assert_eq!(select_protocol(&offer(&[old])), None, "{old}");
+        }
+        assert_eq!(select_protocol(&[]), None);
+    }
+
+    #[test]
+    fn an_old_destination_finds_nothing_it_reads_in_the_offer() {
+        // What a v4 build's destination picks from this offer.
+        let ours = offer(&SOURCE_OFFER);
+        let picked = [
+            "vmm-migrate-ron/4",
+            "vmm-migrate-ron/3",
+            "vmm-migrate-ron/2",
+        ]
+        .into_iter()
+        .find(|v| ours.iter().any(|o| o == v));
+        assert_eq!(picked, None);
+    }
 
     #[test]
     fn test_bitmap_size() {

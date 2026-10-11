@@ -99,12 +99,34 @@ pub const ADMIN_OPC_IDENTIFY: u8 = 0x06;
 pub const ADMIN_OPC_ABORT: u8 = 0x08;
 pub const ADMIN_OPC_SET_FEATURES: u8 = 0x09;
 pub const ADMIN_OPC_GET_FEATURES: u8 = 0x0A;
+pub const ADMIN_OPC_ASYNC_EVENT_REQUEST: u8 = 0x0C;
+
+/// AERL in Identify Controller: the Asynchronous Event Requests the
+/// controller holds at once, 0-based.
+pub const AER_LIMIT: u8 = 0;
 
 // ── NVM I/O command opcodes ────────────────────────────────────
 
 pub const NVM_OPC_FLUSH: u8 = 0x00;
 pub const NVM_OPC_WRITE: u8 = 0x01;
 pub const NVM_OPC_READ: u8 = 0x02;
+pub const NVM_OPC_WRITE_ZEROES: u8 = 0x08;
+pub const NVM_OPC_DSM: u8 = 0x09;
+
+/// Write Zeroes CDW12: the blocks may be deallocated.
+pub const WZ_DEAC: u32 = 1 << 25;
+/// Dataset Management CDW11: deallocate the ranges.
+pub const DSM_AD: u32 = 1 << 2;
+/// Bytes of one Dataset Management range.
+pub const DSM_RANGE_BYTES: usize = 16;
+
+/// ONCS: Dataset Management and Write Zeroes.
+pub const ONCS_DSM: u16 = 1 << 2;
+pub const ONCS_WRITE_ZEROES: u16 = 1 << 3;
+
+/// DLFEAT: deallocated blocks read as zeros, and Write Zeroes takes the
+/// deallocate bit.
+pub const DLFEAT_ZEROES_DEAC: u8 = 0x09;
 
 // ── Identify CNS values ────────────────────────────────────────
 
@@ -172,8 +194,14 @@ pub const SC_INVALID_FIELD: u16 = 0x0002;
 pub const SC_DATA_XFER_ERROR: u16 = 0x0004;
 pub const SC_INTERNAL_ERROR: u16 = 0x0006;
 pub const SC_INVALID_NS: u16 = 0x000B;
-/// I/O command set specific generic status, NVMe 1.4 figure 127.
+// I/O command set specific generic status.
+pub const SC_LBA_OUT_OF_RANGE: u16 = 0x0080;
+pub const SC_CAPACITY_EXCEEDED: u16 = 0x0081;
 pub const SC_WRITE_TO_RO_RANGE: u16 = 0x0082;
+
+// Media and data integrity errors, SCT=2.
+pub const SC_WRITE_FAULT: u16 = 0x0280;
+pub const SC_UNRECOVERED_READ: u16 = 0x0281;
 
 // Command specific status, NVMe 1.4 figure 128. Bits 10:8 carry the
 // status code type, so these read as SCT=1, SC=n.
@@ -181,10 +209,14 @@ pub const SC_CQ_INVALID: u16 = 0x0100;
 pub const SC_INVALID_QUEUE_ID: u16 = 0x0101;
 pub const SC_INVALID_QUEUE_SIZE: u16 = 0x0102;
 pub const SC_INVALID_INTR_VECTOR: u16 = 0x0108;
+pub const SC_AER_LIMIT_EXCEEDED: u16 = 0x0105;
 pub const SC_INVALID_LOG_PAGE: u16 = 0x0109;
 
 /// Do Not Retry flag in status
 pub const SC_DNR: u16 = 1 << 14;
+
+/// The widest status a CQE holds: bit 0 of the field is the phase tag.
+pub const CQE_STATUS_MAX: u16 = 0x7FFF;
 
 // ── Submission Queue Entry (64 bytes) ──────────────────────────
 
@@ -268,6 +300,8 @@ pub fn build_identify_controller(
     max_namespaces: u32,
     mdts: u8,
     cntlid: u16,
+    volatile_write_cache: bool,
+    oncs: u16,
 ) -> [u8; IDENT_CTRL_SIZE] {
     let mut data = [0u8; IDENT_CTRL_SIZE];
 
@@ -298,6 +332,9 @@ pub fn build_identify_controller(
     // 0 = no optional admin commands
     data[256..258].copy_from_slice(&0u16.to_le_bytes());
 
+    // AERL - Asynchronous Event Request Limit (byte 259)
+    data[259] = AER_LIMIT;
+
     // SQES - Submission Queue Entry Size (byte 512)
     // Required = 6 (64 bytes), Maximum = 6
     data[512] = (SQE_SIZE_LOG2 as u8) | ((SQE_SIZE_LOG2 as u8) << 4);
@@ -306,12 +343,15 @@ pub fn build_identify_controller(
     // Required = 4 (16 bytes), Maximum = 4
     data[513] = (CQE_SIZE_LOG2 as u8) | ((CQE_SIZE_LOG2 as u8) << 4);
 
+    // ONCS - Optional NVM Command Support (bytes 520-521)
+    data[520..522].copy_from_slice(&oncs.to_le_bytes());
+
     // NN - Number of Namespaces (bytes 516-519)
     data[516..520].copy_from_slice(&max_namespaces.to_le_bytes());
 
     // VWC - Volatile Write Cache (byte 525)
     // Bit 0 = volatile write cache present
-    data[525] = 1;
+    data[525] = u8::from(volatile_write_cache);
 
     data
 }
@@ -320,11 +360,23 @@ pub fn build_identify_controller(
 
 pub const IDENT_NS_SIZE: usize = 4096;
 
+/// The physical block and best write size a namespace reports, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NsHints {
+    /// The atomic unit and preferred write, deallocate granularity and
+    /// alignment.
+    pub physical_bytes: u32,
+    /// The optimal write size.
+    pub optimal_write_bytes: u32,
+}
+
 /// Build an Identify Namespace data structure.
 pub fn build_identify_namespace(
     total_blocks: u64,
     block_size: u32,
     read_only: bool,
+    hints: Option<NsHints>,
+    deallocate: bool,
 ) -> [u8; IDENT_NS_SIZE] {
     let mut data = [0u8; IDENT_NS_SIZE];
 
@@ -353,6 +405,34 @@ pub fn build_identify_namespace(
     let lbads = block_size.trailing_zeros() as u8; // e.g., 512 → 9, 4096 → 12
     data[128..132].copy_from_slice(&(u32::from(lbads) << 16).to_le_bytes());
 
+    if deallocate {
+        data[33] = DLFEAT_ZEROES_DEAC;
+    }
+    if let Some(h) = hints {
+        // 0-based counts of logical blocks.
+        let lbas = |bytes: u32| {
+            u16::try_from((bytes / block_size.max(1)).max(1) - 1)
+                .unwrap_or(u16::MAX)
+                .to_le_bytes()
+        };
+        let phys = lbas(h.physical_bytes);
+        // NSFEAT bit 1: NAWUN, NAWUPF and NACWU hold; bit 4: NPWG to NOWS.
+        data[24] = (1 << 1) | (1 << 4);
+        // NAWUN, NAWUPF; NACWU stays 0.
+        data[34..36].copy_from_slice(&phys);
+        data[36..38].copy_from_slice(&phys);
+        // NABSN, NABSPF: atomic writes do not cross a physical block;
+        // NABO stays 0.
+        data[40..42].copy_from_slice(&phys);
+        data[44..46].copy_from_slice(&phys);
+        // NPWG, NPWA, NPDG, NPDA, NOWS.
+        data[64..66].copy_from_slice(&phys);
+        data[66..68].copy_from_slice(&phys);
+        data[68..70].copy_from_slice(&phys);
+        data[70..72].copy_from_slice(&phys);
+        data[72..74].copy_from_slice(&lbas(h.optimal_write_bytes));
+    }
+
     data
 }
 
@@ -370,32 +450,80 @@ mod tests {
 
     #[test]
     fn identify_controller_cntlid_survives_a_one_character_serial() {
-        let data = build_identify_controller("X", "VMM NVMe", "1.0", 1, 5, 7);
+        let data =
+            build_identify_controller("X", "VMM NVMe", "1.0", 1, 5, 7, true, 0);
         let cntlid = u16::from_le_bytes(data[78..80].try_into().unwrap());
         assert_eq!(cntlid, 7);
     }
 
     #[test]
     fn identify_controller_serial() {
-        let data =
-            build_identify_controller("SN001", "VMM NVMe", "1.0", 1, 5, 2);
+        let data = build_identify_controller(
+            "SN001", "VMM NVMe", "1.0", 1, 5, 2, true, 0,
+        );
         let sn = std::str::from_utf8(&data[4..24]).unwrap();
         assert!(sn.starts_with("SN001"));
     }
 
     #[test]
     fn identify_namespace_capacity() {
-        let data = build_identify_namespace(1000, 512, false);
+        let data = build_identify_namespace(1000, 512, false, None, false);
         let nsze = u64::from_le_bytes(data[0..8].try_into().unwrap());
         assert_eq!(nsze, 1000);
     }
 
     #[test]
     fn identify_namespace_block_size() {
-        let data = build_identify_namespace(1000, 4096, false);
+        let data = build_identify_namespace(1000, 4096, false, None, false);
         let lbaf0 = u32::from_le_bytes(data[128..132].try_into().unwrap());
         let lbads = (lbaf0 >> 16) & 0xFF;
         assert_eq!(lbads, 12); // log2(4096) = 12
+    }
+
+    fn u16_at(d: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes([d[at], d[at + 1]])
+    }
+
+    #[test]
+    fn a_512e_namespace_reports_its_4k_physical_block() {
+        let hints = NsHints {
+            physical_bytes: 4096,
+            optimal_write_bytes: 32 * 4096,
+        };
+        let d = build_identify_namespace(1000, 512, false, Some(hints), true);
+        assert_eq!(d[24], 0x12);
+        assert_eq!(d[33], 0x09);
+        for at in [34, 36, 40, 44, 64, 66, 68, 70] {
+            assert_eq!(u16_at(&d, at), 7, "byte {at}");
+        }
+        assert_eq!(u16_at(&d, 38), 0);
+        assert_eq!(u16_at(&d, 42), 0);
+        assert_eq!(u16_at(&d, 72), 255);
+        let lbaf0 = u32::from_le_bytes(d[128..132].try_into().unwrap());
+        assert_eq!((lbaf0 >> 16) & 0xff, 9);
+        // 4Kn: one block is the unit, so the 0-based counts are 0.
+        let d = build_identify_namespace(1000, 4096, false, Some(hints), false);
+        assert_eq!((d[24], d[33]), (0x12, 0));
+        assert_eq!(u16_at(&d, 36), 0);
+        assert_eq!(u16_at(&d, 72), 31);
+        // No hints: none of it.
+        let d = build_identify_namespace(1000, 512, false, None, false);
+        assert!(d[24..74].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn oncs_is_reported() {
+        let d = build_identify_controller(
+            "S",
+            "M",
+            "1.0",
+            1,
+            5,
+            2,
+            false,
+            ONCS_DSM | ONCS_WRITE_ZEROES,
+        );
+        assert_eq!(u16_at(&d, 520), 0x0c);
     }
 
     #[test]

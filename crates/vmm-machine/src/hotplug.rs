@@ -56,6 +56,7 @@ use crate::pci::{
 use crate::registry::{
     DeviceRegistry, RegisteredDevice, RegistryError, SlotState,
 };
+use crate::topology::TopologyLock;
 use crate::vcpu::VcpuFleet;
 use crate::vcpus::{VcpuRegistry, VcpuSetup};
 
@@ -199,6 +200,9 @@ struct Core {
     /// works; a removal does not, because nothing would act on the
     /// guest's `_EJ0`.
     drains: AtomicBool,
+    /// The caller of `add` and `request_remove` holds it already; an
+    /// eject comes from the guest and takes it itself.
+    topology: TopologyLock,
     log: Logger,
 }
 
@@ -316,7 +320,12 @@ impl Core {
         // the instant the VM powers off. An eject started then would
         // pause, quiesce and halt the same device the teardown sweep is
         // halting, from a second thread.
-        if self.is_closed() {
+        if self.is_closed() || !self.regs.has_eject_requests() {
+            return;
+        }
+        let _topology = self.topology.lock();
+        // A held eject stays in the register file for a later pass.
+        if self.topology.ejects_held() {
             return;
         }
         for slot in self.regs.take_eject_requests() {
@@ -596,6 +605,7 @@ impl HotplugEngine {
             halt_slack: UNPLUG_HALT_SLACK,
             closed: AtomicBool::new(false),
             drains: AtomicBool::new(true),
+            topology: TopologyLock::default(),
             log: log.clone(),
         });
         let thread = DrainThread::spawn(
@@ -639,6 +649,11 @@ impl HotplugEngine {
     /// path that stops the whole VM has to share this count.
     pub fn pause_gate(&self) -> Arc<VmPauseGate> {
         Arc::clone(&self.gate)
+    }
+
+    /// The lock this engine's ejects take.
+    pub fn topology(&self) -> TopologyLock {
+        self.core.topology.clone()
     }
 
     /// Refuse every later add and removal, and stop the drain thread.
@@ -842,6 +857,14 @@ impl HotplugEngines {
             Some(pci) => pci.pause_gate(),
             None => VmPauseGate::over_hdl(Arc::clone(hdl)),
         }
+    }
+
+    /// The PCI engine's topology lock, or a lock of its own when no
+    /// engine can eject.
+    pub fn topology(&self) -> TopologyLock {
+        self.pci
+            .as_ref()
+            .map_or_else(TopologyLock::default, |pci| pci.topology())
     }
 
     /// Refuse every later request and stop every drain thread.

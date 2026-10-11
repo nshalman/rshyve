@@ -193,27 +193,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                 vs.queue_select = val as u16;
             }
             bits::LEGACY_REG_QUEUE_NOTIFY => {
-                let queue_idx = val as u16;
-                if !Self::can_notify(&vs, queue_idx) {
-                    return;
-                }
-                let did_work = self.device.notify_queue(
-                    queue_idx,
-                    &mut vs.queues,
-                    &self.physmap,
-                );
-                if Self::queue_needs_reset(&vs, queue_idx) {
-                    // The queue logged its own reason when it refused.
-                    self.refuse_queue(vs, queue_idx as usize, None);
-                    return;
-                }
-                if did_work {
-                    // Sampled under the guard, so a reset that ends
-                    // this session is always the later of the two.
-                    let session = self.intr.session();
-                    drop(vs);
-                    self.raise_queue_interrupt_in(session, queue_idx);
-                }
+                self.notify(vs, val as u16);
             }
             bits::LEGACY_REG_DEVICE_STATUS => {
                 let new_status = val as u8;

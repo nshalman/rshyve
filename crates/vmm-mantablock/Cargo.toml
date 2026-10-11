@@ -1,0 +1,43 @@
+[package]
+name = "vmm_mantablock"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+license = "MPL-2.0"
+publish = false
+description = "NVMe backend that sends I/O to the MantaBlock engine over a shared-memory ring"
+
+[dependencies]
+manta-block-ring.workspace = true
+memmap2.workspace = true
+rustix = { version = "1", features = ["event", "fs", "net", "pipe", "time"] }
+slog.workspace = true
+uuid.workspace = true
+vmm_devices.workspace = true
+vmm_storage.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+vmm_core.workspace = true
+# The integration tests stop and kill the engine process.
+rustix = { version = "1", features = ["process"] }
+tempfile = "3"
+
+# The workspace lints, and three more: the public API is documented, an
+# unwrap outside a test is a review question, and unsafe code is allowed
+# only in the modules that say so.
+[lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_qualifications = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+assertions_on_constants = "allow"
+type_complexity = "allow"
+unwrap_used = "warn"

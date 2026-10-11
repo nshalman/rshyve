@@ -304,32 +304,7 @@ impl MsixTable {
         state: &MsixMigrateState,
     ) -> Result<(), MsixImportError> {
         let mut inner = self.inner.lock().expect("msix lock");
-        let count = inner.entries.len();
-        if state.entries.len() != count {
-            return Err(MsixImportError::EntryCount {
-                payload: state.entries.len(),
-                local: count,
-            });
-        }
-        if state.pba.len() != inner.pba.len() {
-            return Err(MsixImportError::PbaLength {
-                payload: state.pba.len(),
-                local: inner.pba.len(),
-            });
-        }
-        for (word, &bits) in state.pba.iter().enumerate() {
-            let mut bits = bits;
-            while bits != 0 {
-                let vector = word * 64 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                if vector >= count {
-                    return Err(MsixImportError::PbaPastTable {
-                        vector,
-                        count,
-                    });
-                }
-            }
-        }
+        check_import(&inner, state)?;
         for (entry, from) in inner.entries.iter_mut().zip(&state.entries) {
             entry.addr_lo = from.addr as u32;
             entry.addr_hi = (from.addr >> 32) as u32;
@@ -340,6 +315,15 @@ impl MsixTable {
         inner.enabled = state.enabled;
         inner.func_masked = state.func_masked;
         Ok(())
+    }
+
+    /// Whether [`Self::import_state`] would take `state`. The table's
+    /// shape never changes, so the answer holds until the import.
+    pub fn check_import_state(
+        &self,
+        state: &MsixMigrateState,
+    ) -> Result<(), MsixImportError> {
+        check_import(&self.inner.lock().expect("msix lock"), state)
     }
 
     /// Read from the MSI-X table BAR.
@@ -519,6 +503,36 @@ impl MsixTable {
 ///
 /// Clears the PBA bit, so one recorded interrupt sends one message
 /// however many times the guest masks and unmasks the vector.
+fn check_import(
+    inner: &MsixInner,
+    state: &MsixMigrateState,
+) -> Result<(), MsixImportError> {
+    let count = inner.entries.len();
+    if state.entries.len() != count {
+        return Err(MsixImportError::EntryCount {
+            payload: state.entries.len(),
+            local: count,
+        });
+    }
+    if state.pba.len() != inner.pba.len() {
+        return Err(MsixImportError::PbaLength {
+            payload: state.pba.len(),
+            local: inner.pba.len(),
+        });
+    }
+    for (word, &bits) in state.pba.iter().enumerate() {
+        let mut bits = bits;
+        while bits != 0 {
+            let vector = word * 64 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            if vector >= count {
+                return Err(MsixImportError::PbaPastTable { vector, count });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn take_pending(inner: &mut MsixInner, idx: usize) -> Option<(u64, u64)> {
     if !inner.enabled || inner.func_masked {
         return None;

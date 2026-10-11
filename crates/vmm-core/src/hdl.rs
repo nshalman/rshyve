@@ -26,7 +26,10 @@ use bhyve_api::{
 use crate::common::PAGE_SIZE;
 use crate::mem::Prot;
 
+mod fpu;
 mod vcpu;
+
+pub use fpu::{FpuArea, FpuComponent, MAX_FPU_AREA_LEN};
 
 /// How a VM is asked to stop. The kernel latches the first request and
 /// answers `EALREADY` to the rest.

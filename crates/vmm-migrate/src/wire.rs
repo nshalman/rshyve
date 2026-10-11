@@ -33,7 +33,8 @@ pub fn peer_text(s: &str) -> String {
 /// protocol moves as the phases change.
 ///
 /// Read deadlines only. `SO_SNDTIMEO` reports success on illumos and
-/// the write still blocks forever, so a send deadline would be a lie.
+/// the write still blocks forever, so the owner frees a blocked send by
+/// shutting the socket down.
 pub trait Transport: Read + Write {
     fn set_read_deadline(&self, budget: Duration) -> std::io::Result<()>;
 }
@@ -125,6 +126,17 @@ impl<S: Transport> Chan<S> {
             .map_err(|e| MigrateError::WebSocket(e.to_string()))
     }
 
+    /// Every send before this end's commit goes through here, so
+    /// nothing goes out after a stop cancelled the migration.
+    pub fn send_uncommitted(
+        &mut self,
+        gate: &dyn crate::StopGate,
+        msg: &Message,
+    ) -> Result<(), MigrateError> {
+        not_cancelled(gate)?;
+        self.send(msg)
+    }
+
     pub fn recv(&mut self) -> Result<Message, MigrateError> {
         let frame = self
             .ws
@@ -208,6 +220,25 @@ fn expect_serialized(msg: Message) -> Result<Vec<u8>, MigrateError> {
     }
 }
 
+pub fn not_cancelled(gate: &dyn crate::StopGate) -> Result<(), MigrateError> {
+    if gate.cancelled() {
+        return Err(crate::cancelled());
+    }
+    Ok(())
+}
+
+/// A stop refuses the migration's own pause and resume. That is a
+/// cancel, which the peer has to hear about.
+pub fn cancel_or(
+    gate: &dyn crate::StopGate,
+    error: MigrateError,
+) -> MigrateError {
+    if gate.cancelled() {
+        return crate::cancelled();
+    }
+    error
+}
+
 pub fn set_phase(status: &Arc<Mutex<MigrationStatus>>, phase: MigrationPhase) {
     if let Ok(mut s) = status.lock() {
         s.phase = phase;
@@ -226,5 +257,42 @@ mod tests {
         let out = peer_text(&long);
         assert_eq!(out.len(), MAX_PEER_TEXT + 3);
         assert!(out.ends_with("..."));
+    }
+
+    struct Cancelled;
+
+    impl crate::StopGate for Cancelled {
+        fn cancelled(&self) -> bool {
+            true
+        }
+
+        fn commit(&self) -> Result<(), MigrateError> {
+            Err(crate::cancelled())
+        }
+
+        fn on_stop(&self, _shut: Box<dyn FnOnce() + Send>) {}
+    }
+
+    #[test]
+    fn nothing_uncommitted_goes_out_after_a_cancel() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let deadlines = Deadlines {
+            pre_pause: Duration::from_millis(200),
+            ..Deadlines::default()
+        };
+        let mut ours =
+            Chan::new(a, tungstenite::protocol::Role::Client, deadlines)
+                .expect("ours");
+        let mut peer =
+            Chan::new(b, tungstenite::protocol::Role::Server, deadlines)
+                .expect("peer");
+
+        let error = ours
+            .send_uncommitted(&Cancelled, &Message::Okay)
+            .expect_err("cancelled");
+
+        assert!(crate::is_cancel(&error), "{error}");
+        drop(ours);
+        assert!(peer.recv().is_err(), "the peer heard a send");
     }
 }

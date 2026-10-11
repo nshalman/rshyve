@@ -63,7 +63,9 @@ env:
 jobs:
   build:
     name: sandbox guest kernel
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -235,7 +237,9 @@ jobs:
     name: attach the kernel to the release
     needs: build
     if: github.event_name == 'release'
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     timeout-minutes: 10
     permissions:
       contents: write
