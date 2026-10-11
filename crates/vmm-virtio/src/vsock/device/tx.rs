@@ -13,6 +13,7 @@
 //! not put there, and cannot make the device allocate without bound.
 
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use slog::{debug, warn};
@@ -116,6 +117,17 @@ impl VirtioVsock {
 
     /// A guest-initiated connection: dial `<socket>_<port>` on the host.
     fn connect_out(&self, key: ConnKey, port: u32) {
+        if !crate::vsock::guest_connects_allowed() {
+            if !self.shared.warned_no_connects.swap(true, Ordering::AcqRel) {
+                warn!(
+                    self.shared.log,
+                    "virtio-vsock refuses guest connects \
+                    under the privilege lock"
+                );
+            }
+            self.shared.mux.refuse_guest_connect(key);
+            return;
+        }
         // The reader table bounds the threads this device holds, and it
         // is one table: a guest that opened connections outside it
         // doubled the ceiling every other path is held to. Reserved

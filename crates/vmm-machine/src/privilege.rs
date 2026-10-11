@@ -281,6 +281,8 @@ impl PrivPlan {
     ) -> Result<LockReport, PrivError> {
         witness.check()?;
         let steps = self.steps(run_as);
+        // Before the drop, so no guest connect fails between the two.
+        vmm_virtio::vsock::deny_guest_connects();
         sys::apply(&steps)?;
         Ok(LockReport {
             floor: self.floor.clone(),

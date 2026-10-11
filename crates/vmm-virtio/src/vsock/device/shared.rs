@@ -73,5 +73,7 @@ pub(super) struct VsockShared {
     pub(super) readers: Mutex<ReaderTable>,
     pub(super) shutdown: Arc<AtomicBool>,
     pub(super) gate: Arc<QuiesceGate>,
+    /// Set once the refusal of guest connects under the lock is logged.
+    pub(super) warned_no_connects: AtomicBool,
     pub(super) log: slog::Logger,
 }
