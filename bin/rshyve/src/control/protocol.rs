@@ -16,7 +16,12 @@ pub(super) enum Command {
     #[serde(rename = "pause")]
     Pause,
     #[serde(rename = "resume")]
-    Resume,
+    Resume {
+        /// Resume a VM whose import is in doubt. The operator has made
+        /// sure the source did not keep the guest.
+        #[serde(default)]
+        force: bool,
+    },
     #[serde(rename = "shutdown")]
     Shutdown,
     #[serde(rename = "reset")]
@@ -84,7 +89,7 @@ impl Command {
         match self {
             Self::Status => "status",
             Self::Pause => "pause",
-            Self::Resume => "resume",
+            Self::Resume { .. } => "resume",
             Self::Shutdown => "shutdown",
             Self::Reset => "reset",
             Self::Stop => "stop",
@@ -196,6 +201,17 @@ mod tests {
         let cmd: Command =
             serde_json::from_str(r#"{"command":"pause"}"#).unwrap();
         assert!(matches!(cmd, Command::Pause));
+    }
+
+    #[test]
+    fn a_plain_resume_is_not_forced() {
+        let cmd: Command =
+            serde_json::from_str(r#"{"command":"resume"}"#).unwrap();
+        assert!(matches!(cmd, Command::Resume { force: false }));
+        let cmd: Command =
+            serde_json::from_str(r#"{"command":"resume","force":true}"#)
+                .unwrap();
+        assert!(matches!(cmd, Command::Resume { force: true }));
     }
 
     #[test]

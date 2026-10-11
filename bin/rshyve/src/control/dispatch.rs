@@ -4,7 +4,6 @@
 
 //! Command dispatch: maps a decoded command to its handler.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use slog::error;
@@ -24,7 +23,13 @@ use super::migrate::{
     migration_source_guard,
 };
 use super::protocol::{Command, Response};
-use super::{StopFailure, VmController, VmRunState};
+use super::run_state::{
+    ChangeFailed, StepFailed, CHANGE_IN_PROGRESS, IMPORT_FAILED, IN_DOUBT,
+};
+use super::{
+    park_all, unpark_all, StopFailure, VmController, VmRunState,
+    DEVICE_PAUSE_BUDGET,
+};
 
 pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
     if let Some(response) =
@@ -41,93 +46,39 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
             r.num_cpus = Some(ctrl.num_cpus);
             r.memory_bytes = Some(ctrl.mem_size);
             r.uptime_secs = Some(ctrl.start_time.elapsed().as_secs());
+            r.data = stuck_data(ctrl.release_stuck());
             r
         }
 
-        Command::Pause => {
-            if !ctrl.transition(VmRunState::Running, VmRunState::Paused) {
-                return Response::err("VM is not running");
+        Command::Pause => match ctrl.run.change(
+            VmRunState::Running,
+            VmRunState::Paused,
+            |held| pause_step(ctrl, held),
+        ) {
+            Ok(()) => {
+                let mut r = Response::ok();
+                r.state = Some(VmRunState::Paused);
+                r
             }
-            if let Err(stuck) = ctrl.pause_devices() {
-                ctrl.state
-                    .store(VmRunState::Running as u8, Ordering::Release);
-                return Response::err(&format!(
-                    "device pause timed out: {:?}",
-                    stuck,
-                ));
+            Err(ChangeFailed::WrongState) => Response::err("VM is not running"),
+            Err(ChangeFailed::Step(why) | ChangeFailed::Faulted(why)) => {
+                Response::err(&why)
             }
-            match ctrl.hold_pause() {
-                Ok(()) => {
-                    let mut r = Response::ok();
-                    r.state = Some(VmRunState::Paused);
-                    r
-                }
-                Err(e) => {
-                    ctrl.resume_devices();
-                    ctrl.state
-                        .store(VmRunState::Running as u8, Ordering::Release);
-                    error!(ctrl.log, "pause failed"; "error" => %e);
-                    Response::err("pause ioctl failed")
-                }
-            }
-        }
+        },
 
-        Command::Resume => {
-            if !ctrl.transition(VmRunState::Paused, VmRunState::Running) {
-                return Response::err("VM is not paused");
-            }
-            // Resume device workers BEFORE vCPUs so interrupts can be delivered
-            ctrl.resume_devices();
-            match ctrl.release_pause() {
-                Ok(()) => {
-                    let mut r = Response::ok();
-                    r.state = Some(VmRunState::Running);
-                    r
-                }
-                Err(e) => {
-                    ctrl.state
-                        .store(VmRunState::Paused as u8, Ordering::Release);
-                    error!(ctrl.log, "resume failed"; "error" => %e);
-                    Response::err("resume ioctl failed")
-                }
-            }
-        }
+        Command::Resume { force } => resume(ctrl, force),
 
-        Command::Shutdown => latch_stop(ctrl, SuspendHow::PowerOff, "shutdown"),
+        Command::Shutdown => guest_stop(ctrl, SuspendHow::PowerOff, "shutdown"),
 
-        Command::Reset => latch_stop(ctrl, SuspendHow::Reset, "reset"),
+        Command::Reset => guest_stop(ctrl, SuspendHow::Reset, "reset"),
 
-        Command::Stop => {
-            let cur = ctrl.state();
-            let migrated_away = ctrl.migrated_away();
-            if let Some(refusal) = stop_refusal(cur, migrated_away) {
-                return Response::err(refusal);
-            }
-            if migrated_away {
-                // The guest runs on another host now, so it must not be
-                // resumed first the way a live VM is.
-                return match ctrl.release_migrated_source() {
-                    Ok(()) => {
-                        let mut r = Response::ok();
-                        r.state = Some(VmRunState::Stopping);
-                        r
-                    }
-                    Err(e) => {
-                        // Back to Stopped so the release timer still
-                        // fires. Leaving it Stopping stands the timer
-                        // down and the zombie would outlive the node.
-                        ctrl.state.store(
-                            VmRunState::Stopped as u8,
-                            Ordering::Release,
-                        );
-                        error!(ctrl.log, "stop failed"; "error" => %e);
-                        Response::err("suspend ioctl failed")
-                    }
-                };
-            }
-
-            latch_stop(ctrl, SuspendHow::Halt, "stop")
-        }
+        Command::Stop => latch_stop(
+            ctrl,
+            SuspendHow::Halt,
+            "stop",
+            |state| stop_refusal(state, ctrl.migrated_away()).is_none(),
+            "VM is already stopped",
+        ),
 
         Command::MigrateSource {
             target_addr,
@@ -210,20 +161,99 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
 
 /// Run one hot-add, if the VM is in a state that can take it.
 ///
-/// The topology lock is held for the whole add, and `migrate_source`
-/// takes the same lock after it claims the state. So an add either
-/// finishes before a migration reads the topology, or finds the VM
-/// migrating and is refused. Without both halves a hot-add could land
-/// on a VM whose destination is already being built.
+/// The topology lock is held for the whole add. `migrate-source` takes
+/// it after it claims the state, and `pause` before it, so an add
+/// either finishes before either reads the device set or finds the VM
+/// no longer running and is refused.
 fn hot_add(ctrl: &VmController, add: impl FnOnce() -> Response) -> Response {
-    let _topology = ctrl.lock_topology();
+    let _topology = ctrl.run.lock_topology();
     match hot_add_blocked(ctrl.state()) {
         Some(refusal) => refusal,
         None => add(),
     }
 }
 
-/// Latch a stop on a running or paused VM and report what happened.
+fn pause_step(
+    ctrl: &VmController,
+    held: &mut bool,
+) -> Result<(), StepFailed<String>> {
+    park_all(
+        &ctrl.named_devices(),
+        DEVICE_PAUSE_BUDGET,
+        || ctrl.hold_pause(),
+        held,
+        &ctrl.log,
+    )
+}
+
+fn resume_step(
+    ctrl: &VmController,
+    held: &mut bool,
+) -> Result<(), StepFailed<String>> {
+    unpark_all(
+        &ctrl.named_devices(),
+        DEVICE_PAUSE_BUDGET,
+        || ctrl.release_pause(),
+        held,
+        &ctrl.log,
+    )
+}
+
+/// The state a resume starts from, or why there is none.
+///
+/// A VM whose import is in doubt resumes only with `force`, once the
+/// operator has made sure the source did not keep the guest. One whose
+/// source committed resumes as a paused VM does.
+fn resume_from(
+    state: VmRunState,
+    force: bool,
+) -> Result<VmRunState, &'static str> {
+    match state {
+        VmRunState::ImportCommitted => Ok(state),
+        VmRunState::ImportInDoubt if force => Ok(state),
+        VmRunState::ImportInDoubt => Err(IN_DOUBT),
+        VmRunState::ImportFailed => Err(IMPORT_FAILED),
+        _ => Ok(VmRunState::Paused),
+    }
+}
+
+fn resume(ctrl: &VmController, force: bool) -> Response {
+    let from = match resume_from(ctrl.state(), force) {
+        Ok(from) => from,
+        Err(why) => return Response::err(why),
+    };
+    match ctrl
+        .run
+        .change(from, VmRunState::Running, |held| resume_step(ctrl, held))
+    {
+        Ok(()) => {
+            let mut r = Response::ok();
+            r.state = Some(VmRunState::Running);
+            r
+        }
+        Err(ChangeFailed::WrongState) => Response::err("VM is not paused"),
+        Err(ChangeFailed::Step(why) | ChangeFailed::Faulted(why)) => {
+            Response::err(&why)
+        }
+    }
+}
+
+/// `shutdown` and `reset`, which only a running or paused guest takes.
+fn guest_stop(
+    ctrl: &Arc<VmController>,
+    how: SuspendHow,
+    what: &str,
+) -> Response {
+    latch_stop(
+        ctrl,
+        how,
+        what,
+        |state| matches!(state, VmRunState::Running | VmRunState::Paused),
+        "VM is not running or paused",
+    )
+}
+
+/// Latch a stop and report what happened.
 ///
 /// One helper for `shutdown`, `reset` and `stop`: the three differ only
 /// in the `SuspendHow` they latch, and three copies of the ordering had
@@ -232,18 +262,17 @@ fn latch_stop(
     ctrl: &Arc<VmController>,
     how: SuspendHow,
     what: &str,
+    allowed: impl FnOnce(VmRunState) -> bool,
+    refusal: &str,
 ) -> Response {
-    let cur = ctrl.state();
-    if cur != VmRunState::Running && cur != VmRunState::Paused {
-        return Response::err("VM is not running or paused");
-    }
-
-    match ctrl.latch_stop(how) {
+    match ctrl.latch_stop(how, allowed) {
         Ok(state) => {
             let mut r = Response::ok();
             r.state = Some(state);
             r
         }
+        Err(StopFailure::Busy) => Response::err(CHANGE_IN_PROGRESS),
+        Err(StopFailure::WrongState(_)) => Response::err(refusal),
         Err(StopFailure::NotLatched(e)) => {
             error!(ctrl.log, "{what} failed"; "error" => %e);
             Response::err("suspend ioctl failed")
@@ -259,20 +288,23 @@ fn latch_stop(
     }
 }
 
+/// What `status` adds for a stop that cannot give its pause back.
+fn stuck_data(stuck: bool) -> Option<serde_json::Value> {
+    stuck.then(|| serde_json::json!({ "release_stuck": true }))
+}
+
 /// Why `stop` cannot run now, or `None` when it can.
 ///
 /// A source whose guest moved to another host is left paused and
 /// holding the whole guest memory, and no other command reaches that
-/// state. `stop` is what releases it.
+/// state. `stop` is what releases it. A stop on `Stopping` retries a
+/// release an earlier one could not make.
 fn stop_refusal(
     state: VmRunState,
     migrated_away: bool,
 ) -> Option<&'static str> {
     match state {
-        VmRunState::Stopped if migrated_away => None,
-        VmRunState::Stopped | VmRunState::Stopping => {
-            Some("VM is already stopped/stopping")
-        }
+        VmRunState::Stopped if !migrated_away => Some("VM is already stopped"),
         _ => None,
     }
 }
@@ -445,9 +477,9 @@ mod tests {
     use super::VmRunState;
     use super::{
         added, cpu_added, cpu_list, device_list, hot_add_blocked,
-        hotplug_disabled, mem_added, mem_list, removing, stop_refusal,
-        window_json, MemWindowReport, CPU_HOTPLUG_OFF, MEM_HOTPLUG_OFF,
-        NO_CPU_REMOVE, NO_MEM_REMOVE,
+        hotplug_disabled, mem_added, mem_list, removing, resume_from,
+        stop_refusal, stuck_data, window_json, MemWindowReport,
+        CPU_HOTPLUG_OFF, MEM_HOTPLUG_OFF, NO_CPU_REMOVE, NO_MEM_REMOVE,
     };
 
     /// A stand-in CPU set. Every step of a real add is an ioctl, so a
@@ -819,6 +851,7 @@ mod tests {
             VmRunState::Migrating,
             VmRunState::Stopping,
             VmRunState::Stopped,
+            VmRunState::Faulted,
         ] {
             let refusal =
                 hot_add_blocked(state).expect("only a running VM may grow");
@@ -872,20 +905,78 @@ mod tests {
 
     #[test]
     fn stop_refuses_a_vm_that_is_already_done() {
-        for state in [VmRunState::Stopped, VmRunState::Stopping] {
-            assert!(stop_refusal(state, false).is_some(), "{state:?}");
-        }
-        assert!(stop_refusal(VmRunState::Stopping, true).is_some());
+        assert!(stop_refusal(VmRunState::Stopped, false).is_some());
     }
 
     #[test]
     fn stop_reaches_a_live_vm_in_every_other_state() {
+        // Stopping is there so a stop can retry a release that failed,
+        // and Faulted because nothing else is taken there.
         for state in [
             VmRunState::Running,
             VmRunState::Paused,
             VmRunState::Migrating,
+            VmRunState::Stopping,
+            VmRunState::Faulted,
         ] {
             assert_eq!(stop_refusal(state, false), None, "{state:?}");
+            assert_eq!(stop_refusal(state, true), None, "{state:?}");
         }
+    }
+
+    #[test]
+    fn a_failed_import_never_resumes() {
+        // The guest is half written, and the source may run it too.
+        for force in [false, true] {
+            assert_eq!(
+                resume_from(VmRunState::ImportFailed, force),
+                Err(super::IMPORT_FAILED)
+            );
+        }
+    }
+
+    #[test]
+    fn an_import_in_doubt_resumes_only_when_forced() {
+        assert_eq!(
+            resume_from(VmRunState::ImportInDoubt, false),
+            Err(super::IN_DOUBT)
+        );
+        assert_eq!(
+            resume_from(VmRunState::ImportInDoubt, true),
+            Ok(VmRunState::ImportInDoubt)
+        );
+        assert_eq!(
+            resume_from(VmRunState::Paused, true),
+            Ok(VmRunState::Paused)
+        );
+    }
+
+    #[test]
+    fn an_import_the_source_committed_to_resumes_plainly() {
+        // The source has committed and stays paused, so this is the
+        // only copy and nothing else can run it.
+        for force in [false, true] {
+            assert_eq!(
+                resume_from(VmRunState::ImportCommitted, force),
+                Ok(VmRunState::ImportCommitted)
+            );
+        }
+        assert_eq!(stop_refusal(VmRunState::ImportCommitted, false), None);
+    }
+
+    #[test]
+    fn status_reports_a_stuck_release_beside_the_state() {
+        // `data` is flattened into the line.
+        let mut stuck = Response::ok();
+        stuck.state = Some(VmRunState::Stopping);
+        stuck.data = stuck_data(true);
+        assert_eq!(
+            line(stuck),
+            r#"{"success":true,"state":"stopping","release_stuck":true}"#
+        );
+
+        let mut fine = Response::ok();
+        fine.data = stuck_data(false);
+        assert_eq!(line(fine), r#"{"success":true}"#);
     }
 }

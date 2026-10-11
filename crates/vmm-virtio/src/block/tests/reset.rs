@@ -465,6 +465,7 @@ fn a_worker_drops_requests_from_a_closed_session() {
             head,
             completion: Arc::clone(&completion),
             tag,
+            charge: Charge::default(),
         })
         .expect("queue the request");
     }
@@ -474,7 +475,7 @@ fn a_worker_drops_requests_from_a_closed_session() {
     let mut file = tempfile::tempfile().expect("create tempfile");
     std::io::Write::write_all(&mut file, &[0xAB; SECTOR])
         .expect("fill the backing file");
-    let file = Arc::new(file);
+    let file = disk(file);
     let limits = DiskLimits {
         capacity: 1,
         read_only: true,
@@ -555,6 +556,7 @@ fn a_worker_batch_does_not_span_a_reset() {
             head,
             completion: Arc::clone(completion),
             tag,
+            charge: Charge::default(),
         };
 
     // The queue the guest left behind, then the one it built next.
@@ -564,7 +566,7 @@ fn a_worker_batch_does_not_span_a_reset() {
     tx.send(request(2, &live, live_tag)).expect("send live");
     drop(tx);
 
-    let file = Arc::new(tempfile::tempfile().expect("create tempfile"));
+    let file = disk(tempfile::tempfile().expect("create tempfile"));
     let limits = DiskLimits {
         capacity: 1,
         read_only: true,
@@ -667,11 +669,12 @@ fn an_interrupt_is_raised_outside_the_guest_access_section() {
         head: 0,
         completion,
         tag,
+        charge: Charge::default(),
     })
     .expect("queue the request");
     drop(tx);
 
-    let file = Arc::new(tempfile::tempfile().expect("create tempfile"));
+    let file = disk(tempfile::tempfile().expect("create tempfile"));
     let limits = DiskLimits {
         capacity: 1,
         read_only: false,
@@ -794,9 +797,14 @@ fn a_backing_store_read_never_runs_inline() {
         payload_writable: true,
         ..Default::default()
     });
-    park_workers(&h.block);
+    // Holding the worker at the disk makes an inline read the only way
+    // the used entry could land before the release.
+    let (reached, release) = park_at_backend(&h.block.ctx);
 
     h.block.notify_queue(0, &mut h.queues, &h.physmap);
+    wait_for("the read never reached a worker", || {
+        reached.load(Ordering::Acquire)
+    });
 
     assert_eq!(
         h.queues[0].read_used_ring_idx(&h.physmap),
@@ -804,7 +812,7 @@ fn a_backing_store_read_never_runs_inline() {
         "a backing-store read ran on the notifying thread"
     );
 
-    h.block.resume();
+    release.store(true, Ordering::Release);
     wait_for("the dispatched read never completed", || {
         h.queues[0].read_used_ring_idx(&h.physmap) == 1
     });

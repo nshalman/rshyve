@@ -38,8 +38,8 @@ For the high-level protocol overview and usage instructions, see
 The VMM is a Rust userspace process that runs inside a bhyve zone on illumos.
 It emulates the following devices:
 
-- **NVMe disk controller** -- 8 worker threads performing `preadv`/`pwritev`
-  against a ZFS zvol block device
+- **NVMe disk controller** -- an async storage backend; by default 8 worker
+  threads performing `preadv`/`pwritev` against a ZFS zvol block device
 - **Virtio-net via viona** -- kernel-accelerated networking where the illumos
   kernel owns the ring threads and processes packets directly
 - **Virtio-blk** -- userspace virtio block device using a hybrid sync/async
@@ -106,8 +106,8 @@ Protocol negotiation and preamble exchange.
 
 ```
 Source                              Destination
-  |--- ProtocolOffer ["vmm-migrate-ron/2"] -->|
-  |<-- ProtocolSelect "vmm-migrate-ron/2" ----|
+  |--- ProtocolOffer ["vmm-migrate-ron/4"] -->|
+  |<-- ProtocolSelect "vmm-migrate-ron/4" ----|
   |--- MigrationPreamble (cpus, mem, devices, features) -->|
   |<-- Okay ----------------------------------|
 ```
@@ -485,9 +485,24 @@ the kernel sees 227 immediately available rx buffers.
 
 ## NVMe Controller State Migration
 
-The NVMe controller is fully emulated in userspace with 8 I/O worker
-threads per controller. After migration, the controller must resume from
-the source's exact state.
+The NVMe controller is fully emulated in userspace. Its I/O goes to an
+async storage backend, by default 8 worker threads per controller. After
+migration, the controller must resume from the source's exact state.
+
+### Drain Before Export
+
+Pause closes the controller's admission barrier: the SQ doorbell records
+the tail and takes nothing, leaving the head on the first command not
+admitted. The device reports quiesced once every admitted command has
+completed and its MSI is raised. Export closes admission again and waits
+for the same thing, so no command is inside a backend, out of its SQ
+and with no CQE, when the state is read.
+
+The destination admits nothing after the restore, because the source
+has not yet committed to never running the guest again and the two
+would share the disk. Resume opens admission and runs the submit path
+once for every SQ whose head is not its tail: the guest rang those
+doorbells on the source.
 
 ### State Serialized
 
@@ -507,6 +522,7 @@ NvmeControllerState {
     pci_bar_addrs: [u64; 6],            // PCI BAR addresses
     msix_entries: Vec<(u64, u64)>,      // Per-vector (addr, data)
     msix_enabled: bool,
+    namespace: Option<NvmeNamespace>,   // v3: block size, VWC, size, RO
 }
 ```
 
@@ -514,8 +530,17 @@ Each submission queue (SQ) and completion queue (CQ) carries:
 
 ```rust
 NvmeSqState { base: u64, size: u16, head: u16, tail: u16, cq_id: u16 }
-NvmeCqState { base: u64, size: u16, head: u16, tail: u16, phase: bool, iv: u16 }
+NvmeCqState { base: u64, size: u16, head: u16, tail: u16, phase: bool, iv: u16,
+              ien: bool, held: Vec<NvmeCqe> }
 ```
+
+A completion that finds its CQ full is held rather than dropped, and
+keeps its command's tag, so the controller admits no more than the
+backend's queue depth. Held completions travel in `held` and are
+written on the destination when the guest's CQ head doorbell frees
+space. A restore refuses a namespace of another block size, write
+cache setting, capacity or write protection: the guest's partition
+tables, flush habits and mounts depend on them.
 
 ### CQ Tail Handling
 
@@ -838,7 +863,7 @@ the pre-pause convergence loop may need more iterations.
 | `crates/vmm-migrate/src/state.rs` | Kernel device state export/import (vmm-data API, register get/set) |
 | `crates/vmm-devices/src/virtio/pci.rs` | Virtio PCI transport: export/restore BAR state, feature flags, queue indices |
 | `crates/vmm-devices/src/virtio/viona.rs` | Viona kernel interface: RING_SET_STATE, RING_PAUSE, interrupt polling |
-| `crates/vmm-devices/src/nvme/mod.rs` | NVMe controller: export/restore registers, queues, MSI-X table |
+| `crates/vmm-storage/src/nvme/migrate.rs` | NVMe controller: drain, export/restore registers, queues, held completions |
 | `crates/vmm-devices/src/lifecycle.rs` | Lifecycle trait: pause_for_migration, export/restore hooks |
 | `bin/vmm/src/control.rs` | Control socket: migrate-source command, device queue export, pre-pause callback |
 | `bin/vmm/src/main.rs` | Destination restore callback, post-migrate interrupt kick thread |

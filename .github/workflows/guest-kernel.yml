@@ -63,7 +63,9 @@ env:
 jobs:
   build:
     name: sandbox guest kernel
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -202,7 +204,11 @@ jobs:
 
       # The digests travel with the images, so an operator can tell
       # which kernel a CN is running without trusting the file name.
+      # Both this and the upload run even when a check above failed: the
+      # config-drift step tells the reader to take the new config from
+      # the artifact, which is only there if a failing run still uploads.
       - name: record the digests
+        if: always()
         working-directory: kernel
         run: |
           set -euo pipefail
@@ -213,6 +219,7 @@ jobs:
               | tee "SHA256SUMS${OUT_SUFFIX}"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
         with:
           name: guest-kernel${{ env.OUT_SUFFIX }}
           if-no-files-found: error
@@ -230,7 +237,9 @@ jobs:
     name: attach the kernel to the release
     needs: build
     if: github.event_name == 'release'
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     timeout-minutes: 10
     permissions:
       contents: write

@@ -32,10 +32,10 @@ fn io_read_through_prp1_and_prp2_returns_the_backing_bytes() {
 
 #[test]
 fn io_write_reaches_the_backing_file() {
-    let file = Arc::new(backing_file());
+    let disk = backing_disk();
     let mut h = Harness::with_backend(
-        Arc::clone(&file),
-        Arc::clone(&file) as Arc<dyn crate::nvme::io::IoBackend>,
+        Arc::clone(&disk),
+        Arc::clone(&disk) as Arc<dyn crate::nvme::io::IoBackend>,
     );
     h.enable();
     h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
@@ -47,7 +47,9 @@ fn io_write_reaches_the_backing_file() {
 
     use std::os::unix::fs::FileExt;
     let mut buf = [0u8; 512];
-    file.read_exact_at(&mut buf, 100 * 512).expect("read back");
+    disk.file()
+        .read_exact_at(&mut buf, 100 * 512)
+        .expect("read back");
     assert!(buf.iter().all(|&b| b == 0x5A));
 }
 
@@ -212,4 +214,25 @@ fn command_specific_status_reaches_the_guest_with_sct_one() {
             dnr: true
         }
     );
+}
+
+#[test]
+fn every_worker_can_hold_a_transfer_at_once() {
+    let (mut h, backend) = Harness::held();
+    h.enable();
+    h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
+    let hold = backend.hold_scope();
+
+    let workers = crate::nvme::NUM_WORKERS;
+    let mut tail = 0;
+    for cid in 0..workers as u16 {
+        let prp = 0x50000 + u64::from(cid) * PAGE_SIZE as u64;
+        io_submit(&mut h, &mut tail, Sqe::read(u64::from(cid), 1, prp, 0), cid);
+    }
+    backend.wait_in_flight(workers);
+    drop(hold);
+
+    for i in 0..workers as u16 {
+        assert_eq!(h.wait_cqe(CQ1, i, true).status(), Status::SUCCESS);
+    }
 }

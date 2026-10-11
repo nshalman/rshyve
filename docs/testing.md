@@ -91,7 +91,7 @@ ssh $VMM_HEADNODE 'pkill -9 rshyve; /usr/sbin/bhyvectl --vm=testvm --destroy 2>/
 zfs rollback zones/vmm-test-disk@final 2>/dev/null; \
 nohup /opt/rust-bhyve/target/release/rshyve \
   -H -c 2 -m 1G \
-  -s 0,hostbridge -s 4,virtio-blk,/dev/zvol/dsk/zones/vmm-test-disk \
+  -s 0,hostbridge -s 4,virtio-blk,/dev/zvol/rdsk/zones/vmm-test-disk \
   -s 6,virtio-net-viona,vmm_test0 -s 31,lpc \
   -l bootrom,/usr/share/bhyve/uefi-rom.bin -l com1,stdio \
   --control-socket /tmp/vmm-testvm.sock \

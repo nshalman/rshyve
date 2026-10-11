@@ -129,6 +129,7 @@ pub(crate) fn create_pci_device(
                 num_vcpus,
                 lintr,
                 &actx,
+                ctx.log,
             )?;
             ctx.chipset.try_attach_device(bdf, dev.clone())?;
             info!(ctx.log, "virtio-blk attached";

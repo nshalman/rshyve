@@ -75,8 +75,10 @@ mod state;
 
 pub use state::{
     DeviceMigrateState, DeviceStateError, DeviceStatePayload,
-    HypervMigrateState, MigratePciState, NvmeMigrateCq, NvmeMigrateSq,
-    NvmeMigrateState, VirtioMigrateQueue, VirtioMigrateState, WireBdf,
+    HypervMigrateState, MigratePciState, NvmeMigrateBackend, NvmeMigrateCq,
+    NvmeMigrateCqe, NvmeMigrateNamespace, NvmeMigrateQueueCounts,
+    NvmeMigrateSq, NvmeMigrateState, VirtioMigrateQueue, VirtioMigrateState,
+    WireBdf,
 };
 
 /// General trait for emulated devices in the system.
@@ -121,6 +123,15 @@ pub trait Lifecycle: Send + Sync + 'static {
     /// work but must accept and queue new work from other devices.
     fn pause(&self) {}
 
+    /// [`pause`](Lifecycle::pause), from a caller that then waits up
+    /// to `budget` for [`is_quiesced`](Lifecycle::is_quiesced).
+    ///
+    /// A device that lets work already started run on for a while can
+    /// size that time to the wait, and not fail a long one early.
+    fn pause_within(&self, _budget: Duration) {
+        self.pause();
+    }
+
     /// Directs this device to resume servicing the guest after pausing.
     fn resume(&self) {}
 
@@ -156,6 +167,12 @@ pub trait Lifecycle: Send + Sync + 'static {
         Migrator::Empty
     }
 
+    /// Why no migration can carry this device, or `None`. Every
+    /// migration entry point refuses a VM with a device that gives one.
+    fn migration_blocker(&self) -> Option<String> {
+        None
+    }
+
     /// Stop the kernel-side ring workers before the vCPUs pause, so
     /// no entry is consumed between the pause and the export. Only a
     /// device with rings in the kernel (viona) has anything to do.
@@ -171,7 +188,7 @@ pub trait Lifecycle: Send + Sync + 'static {
     /// the ZFS barrier is hit. Teardown uses [`FlushIntent::BestEffort`].
     /// Default: no-op.
     ///
-    /// With zvol `DKIOCSETWCE=1` (enabled by `blkdev::DiskCache`), writes
+    /// With zvol `DKIOCSETWCE=1` (enabled by `blkdev::DiskSync`), writes
     /// return OK from the zvol cache without hitting the ZFS pool. A
     /// `zfs send` incremental only captures pool state, so any buffered
     /// writes not fsynced before the send would be lost on the destination.
@@ -484,7 +501,7 @@ pub fn prepare_unplug(
     }
 
     if state != Some(IndicatedState::Pause) {
-        dev.pause();
+        dev.pause_within(budget);
     }
 
     if !wait_device_quiesced(dev.as_ref(), budget) {

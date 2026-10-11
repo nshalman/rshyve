@@ -56,18 +56,6 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 # shellcheck source=tools/build-rev.sh
 . "$SRC_DIR/tools/build-rev.sh"
 
-# The binary reports the revision it was built from, and that revision
-# must be computed here: sync_sources excludes .git, so the build host
-# holds no clone. A value that does not name an object is dropped
-# rather than sent, so the binary says `unstamped` instead of naming a
-# commit that resolves nowhere.
-BUILD_REV="$(build_rev "$SRC_DIR")"
-if ! is_object_name "$BUILD_REV"; then
-    echo "BUILD-WARN: no source revision here; the binary will report" \
-         "unstamped" >&2
-    BUILD_REV=""
-fi
-
 # Host key verification stays on. Add the build host to known_hosts once,
 # after checking its fingerprint out of band.
 SSH=(ssh -o ConnectTimeout=15 -i "$KEY" "$HOST")
@@ -75,13 +63,27 @@ SSH=(ssh -o ConnectTimeout=15 -i "$KEY" "$HOST")
 # /opt/tools/bin and /opt/local/bin hold the pkgsrc toolchain (cargo, gcc,
 # autoconf, gmake, pkg-config); none of them are on root's default PATH.
 REMOTE_BASE="export PATH=/opt/tools/bin:/opt/local/bin:/usr/bin:/usr/sbin:\$PATH; cd $REMOTE_DIR"
-REMOTE_ENV="$REMOTE_BASE"
-# The value is spliced into a command a remote root shell parses. It
-# passed the object-name check above, so it carries no quote, and the
-# quotes here hold whatever a later caller sends to one word.
-if [ -n "$BUILD_REV" ]; then
-    REMOTE_ENV="$REMOTE_ENV; export TRITON_BUILD_REV='$BUILD_REV'"
-fi
+
+# The binary reports the revision it was built from, and that revision
+# must be computed here: sync_sources excludes .git, so the build host
+# holds no clone. A value that does not name an object is dropped
+# rather than sent, so the binary says `unstamped` instead of naming a
+# commit that resolves nowhere.
+stamp_rev() {
+    BUILD_REV="$(build_rev "$SRC_DIR")"
+    if ! is_object_name "$BUILD_REV"; then
+        echo "BUILD-WARN: no source revision here; the binary will report" \
+             "unstamped" >&2
+        BUILD_REV=""
+    fi
+    REMOTE_ENV="$REMOTE_BASE"
+    # The value is spliced into a command a remote root shell parses. It
+    # passed the object-name check above, so it carries no quote, and the
+    # quotes here hold whatever a later caller sends to one word.
+    if [ -n "$BUILD_REV" ]; then
+        REMOTE_ENV="$REMOTE_ENV; export TRITON_BUILD_REV='$BUILD_REV'"
+    fi
+}
 
 # The help text is the header comment. A line range drifts when the
 # header changes, and it did: the old one printed `set -euo pipefail`.
@@ -130,12 +132,22 @@ take_lock() {
 
 sync_sources() {
     take_lock
+    # Read under the lock, and again after the copy: a checkout that
+    # moved while this driver waited or copied would otherwise put one
+    # commit's name on another commit's tree.
+    stamp_rev
+    local synced_rev="$BUILD_REV"
     # --checksum because rsync-over-ssh timestamps do not reliably invalidate
     # cargo's fingerprints; without it edited files silently fail to rebuild.
     rsync -az --checksum --delete \
         --exclude target --exclude .git --exclude 'kernel/linux-*' \
         -e "ssh -i $KEY" \
         "$SRC_DIR/" "$HOST:$REMOTE_DIR/"
+    stamp_rev
+    if [ "$BUILD_REV" != "$synced_rev" ]; then
+        echo "BUILD-FAIL: the checkout changed during the sync; run it again" >&2
+        exit 1
+    fi
 }
 
 remote() { "${SSH[@]}" "$REMOTE_ENV; $*"; }
@@ -150,6 +162,7 @@ case "$cmd" in
         ;;
     rev)
         # What the next build stamps into the binary, before it runs.
+        stamp_rev
         echo "${BUILD_REV:-unstamped}"
         ;;
     build)

@@ -588,18 +588,44 @@ impl VirtQueue {
         max: usize,
         mut each: impl FnMut(&mut VirtQueue, u16),
     ) -> usize {
+        self.drain_avail_until(physmap, max, |queue, head| {
+            each(queue, head);
+            Take::Keep
+        })
+    }
+
+    /// [`Self::drain_avail`], but `each` may give a head back.
+    ///
+    /// A head given back stays in the available ring and the drain
+    /// stops there. The guest kicked for it already and will not kick
+    /// again, so the caller owns the next drain of this ring.
+    pub fn drain_avail_until(
+        &mut self,
+        physmap: &PhysMap,
+        max: usize,
+        mut each: impl FnMut(&mut VirtQueue, u16) -> Take,
+    ) -> usize {
         let mut popped = 0usize;
         loop {
             let before = self.last_avail_idx;
+            let mut gave_back = false;
             while popped < max {
                 let Some(head) = self.pop_avail(physmap) else {
                     break;
                 };
+                if each(self, head) == Take::GiveBack {
+                    // `pop_avail` moved the cursor by one for a valid
+                    // head, so one step back returns exactly that one.
+                    self.last_avail_idx = self.last_avail_idx.wrapping_sub(1);
+                    gave_back = true;
+                    break;
+                }
                 popped += 1;
-                each(self, head);
             }
             self.update_used_event(physmap);
-            if queue_drain_should_stop(self, before, popped >= max, physmap) {
+            if gave_back
+                || queue_drain_should_stop(self, before, popped >= max, physmap)
+            {
                 return popped;
             }
         }
@@ -887,6 +913,15 @@ impl VirtQueue {
 
         Some(bufs)
     }
+}
+
+/// What a drain does with the head it just took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Take {
+    /// The device owns the head and must put it on the used ring.
+    Keep,
+    /// The head goes back to the available ring, untouched.
+    GiveBack,
 }
 
 /// Whether a drain that just armed `avail_event` is finished.

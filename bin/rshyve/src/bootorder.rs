@@ -173,6 +173,28 @@ mod tests {
         assert_eq!(index, None);
     }
 
+    /// The firmware boots a MantaBlock disk by its slot, like any NVMe
+    /// disk, and the spec that reaches the device parser is the ring form.
+    #[test]
+    fn a_mantablock_disk_boots_by_its_bootindex() {
+        let mb = "4,nvme,mantablock=/var/run/mb/v.sock,\
+                  volume=6f1c3a52-6a51-4c5e-9d3b-0b8f8e0c2a11,bootindex=1";
+        let all = specs(&[mb, "5,ahci-cd,/install.iso,bootindex=2"]);
+        assert_eq!(
+            build_bootorder(&all).unwrap(),
+            b"/pci@i0cf8/pci@4,0\n/pci@i0cf8/pci@5,0\n"
+        );
+        let (clean, index) = strip_bootindex(mb).unwrap();
+        assert_eq!(index, Some(1));
+        let (bdf, driver, config) =
+            vmm_machine::devspec::split(&clean).unwrap();
+        assert_eq!((bdf.dev(), driver), (4, "nvme"));
+        assert!(matches!(
+            vmm_machine::devspec::parse_nvme_config(config),
+            Ok(vmm_machine::devspec::NvmeSpec::MantaBlock(_))
+        ));
+    }
+
     #[test]
     fn bootindex_with_explicit_func() {
         let result =

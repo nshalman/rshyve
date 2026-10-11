@@ -52,13 +52,13 @@ fn pause_quiesces_the_workers_under_steady_guest_io() {
     backend.wait_in_flight(1);
 
     h.ctrl.pause();
-    let quiesced = h.ctrl.gate.wait_quiesced(Duration::from_secs(2));
+    let quiesced = h.wait_quiesced(Duration::from_secs(2));
 
     stop.store(true, Ordering::Relaxed);
     submitter.join().expect("submitter");
     backend.set_delay(Duration::ZERO);
     h.ctrl.resume();
-    assert!(quiesced, "pause did not quiesce the workers under load");
+    assert!(quiesced, "pause did not quiesce the controller under load");
 }
 
 /// Release the backend once a reset reaches its drain.
@@ -67,14 +67,14 @@ fn pause_quiesces_the_workers_under_steady_guest_io() {
 /// transfer it is waiting for has to be let go from somewhere else.
 /// Returns whether a drain ever started.
 fn release_on_drain(
-    gate: Arc<QuiesceGate>,
+    ctrl: Arc<NvmeController>,
     backend: Arc<TestBackend>,
 ) -> std::thread::JoinHandle<bool> {
     std::thread::spawn(move || {
         let start = Instant::now();
         let mut drained = false;
         while start.elapsed() < WAIT {
-            if gate.drain_count() > 0 {
+            if ctrl.drain_count() > 0 {
                 drained = true;
                 break;
             }
@@ -96,13 +96,12 @@ fn a_reset_waits_for_the_transfer_it_interrupts() {
     io_submit(&mut h, &mut tail, Sqe::read(8, 8, 0x50000, 0x52000), 0x77);
     backend.wait_in_flight(1);
 
-    let releaser =
-        release_on_drain(Arc::clone(&h.ctrl.gate), Arc::clone(&backend));
+    let releaser = release_on_drain(Arc::clone(&h.ctrl), Arc::clone(&backend));
     h.reg_write32(REG_CC, 0);
     let quiet = backend.in_flight();
     let drained = releaser.join().expect("releaser");
 
-    assert!(drained, "the reset did not drain the workers");
+    assert!(drained, "the reset did not drain the controller");
     assert_eq!(quiet, 0, "CC.EN cleared with a transfer still in flight");
     assert_eq!(h.csts() & CSTS_RDY, 0);
     assert_eq!(backend.started(), 1);
@@ -121,8 +120,7 @@ fn shutdown_drains_before_it_reports_complete() {
     io_submit(&mut h, &mut tail, Sqe::write(0, 1, 0x50000, 0), 0x61);
     backend.wait_in_flight(1);
 
-    let releaser =
-        release_on_drain(Arc::clone(&h.ctrl.gate), Arc::clone(&backend));
+    let releaser = release_on_drain(Arc::clone(&h.ctrl), Arc::clone(&backend));
     h.reg_write32(
         REG_CC,
         CC_EN
@@ -133,7 +131,7 @@ fn shutdown_drains_before_it_reports_complete() {
     let quiet = backend.in_flight();
     let drained = releaser.join().expect("releaser");
 
-    assert!(drained, "the shutdown did not drain the workers");
+    assert!(drained, "the shutdown did not drain the controller");
     assert_eq!(quiet, 0, "SHST completed with a transfer still in flight");
     assert_eq!(
         (h.csts() >> CSTS_SHST_SHIFT) & CSTS_SHST_MASK,
@@ -225,7 +223,7 @@ fn a_reset_drops_queued_io_instead_of_completing_it_into_new_queues() {
     // Park the workers so the command stays in the channel across the
     // reset, the way a busy controller leaves work behind.
     h.ctrl.pause();
-    assert!(h.ctrl.gate.wait_quiesced(WAIT), "workers did not park");
+    assert!(h.wait_quiesced(WAIT), "the controller did not quiesce");
     let mut tail = 0;
     io_submit(&mut h, &mut tail, Sqe::read(8, 8, 0x50000, 0x52000), 0x99);
 
@@ -249,7 +247,7 @@ fn deleting_and_recreating_an_io_queue_drops_the_old_commands() {
     h.create_io_queues(1, IO_QDEPTH, SQ1, CQ1);
 
     h.ctrl.pause();
-    assert!(h.ctrl.gate.wait_quiesced(WAIT), "workers did not park");
+    assert!(h.wait_quiesced(WAIT), "the controller did not quiesce");
     let mut tail = 0;
     io_submit(&mut h, &mut tail, Sqe::read(8, 8, 0x50000, 0x52000), 0x99);
 
@@ -327,32 +325,17 @@ fn dropping_the_controller_exits_the_io_workers() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Unit-level checks kept from before the harness
-// ---------------------------------------------------------------------------
-
-struct NvmeQuiesceTestDevice {
-    gate: Arc<QuiesceGate>,
-}
-
-impl Lifecycle for NvmeQuiesceTestDevice {
-    fn type_name(&self) -> &'static str {
-        "nvme"
-    }
-
-    fn is_quiesced(&self) -> bool {
-        self.gate.is_quiesced()
-    }
-}
-
+/// The control plane polls the quiesce query against a deadline, so it
+/// must answer while a doorbell or a completion holds the state lock.
 #[test]
-fn quiesce_query_is_non_blocking_with_active_worker() {
-    let device: Arc<dyn Lifecycle> = Arc::new(NvmeQuiesceTestDevice {
-        gate: Arc::new(QuiesceGate::new(1)),
-    });
+fn quiesce_query_does_not_wait_for_the_state_lock() {
+    let h = Harness::new();
+    h.ctrl.pause();
+    let held = h.ctrl.state.lock().expect("state lock");
 
-    let probe = Arc::clone(&device);
-    assert!(!vmm_devices_testsupport::assert_query_non_blocking(
+    let probe = Arc::clone(&h.ctrl);
+    assert!(vmm_devices_testsupport::assert_query_non_blocking(
         move || probe.is_quiesced()
     ));
+    drop(held);
 }

@@ -113,13 +113,47 @@ Format: `[bus:]dev[:func],driver[,config...]`
 
 Examples:
 ```
--s 4,nvme,/dev/zvol/dsk/zones/disk0
+-s 4,nvme,/dev/zvol/rdsk/zones/disk0
+-s 5,nvme,mantablock=/var/run/mantablock/<uuid>.sock,volume=<uuid>
 -s 6,virtio-net-viona,net0,promiscphys
 -s 0:5:0,passthru,/dev/ppt0
 -s 30:0,fbuf,vga=off,unix=/tmp/vm.vnc
 -s 8,virtio-console,/var/run/rshyve/myvm/console.sock
 -s 12,virtio-fs,/export/shared,tag=shared,ro
 ```
+
+### NVMe on a MantaBlock volume
+
+```
+-s <slot>,nvme,mantablock=<socket>,volume=<uuid>[,allow-volatile][,spin-us=<n>]
+```
+
+When the first field after `nvme` is `mantablock=`, the namespace is a
+MantaBlock volume and not a file. rshyve connects to the engine's Unix
+socket at `<socket>` (an absolute path) and attaches `<uuid>`. A spec
+whose first field is a path is the file disk it always was.
+
+| Option | Meaning |
+|--------|---------|
+| `mantablock=<socket>` | Required, first. The engine's socket for the volume |
+| `volume=<uuid>` | Required. The volume to attach |
+| `allow-volatile` | Take an engine whose writes are not durable when they complete. For tests and measurement |
+| `spin-us=<n>` | How long each queue's completion thread polls after its last completion before it sleeps, 0 to 10000 µs. Default 50. While I/O comes faster than this, the thread keeps one CPU busy; a sleep costs about 15 µs of latency on the next completion |
+
+The namespace has 4 KiB logical blocks. It reports no volatile write
+cache when the engine says every write is durable when it completes.
+An engine that does not say so is refused at startup, unless
+`allow-volatile` is given: the namespace then reports a volatile write
+cache, and the guest sends flushes.
+
+The grammar is strict: an unknown option, a repeated option or a
+relative socket path is a startup error. A ring option after a file
+path (`nvme,/disk,volume=...`) is an error too, so a misplaced option
+cannot boot the guest on the file. If the engine cannot be reached or
+refuses the volume, rshyve does not start.
+
+A VM with such a disk cannot migrate yet, as a source or as a
+destination.
 
 ## LPC Device Syntax
 

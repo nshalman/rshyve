@@ -67,7 +67,9 @@ env:
 jobs:
   lock:
     name: lockfile is current
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: cargo metadata --locked --format-version 1 > /dev/null
@@ -76,7 +78,9 @@ jobs:
 
   fmt:
     name: rustfmt
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup component add rustfmt
@@ -84,7 +88,9 @@ jobs:
 
   clippy:
     name: clippy (portable crates)
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup component add clippy
@@ -92,13 +98,15 @@ jobs:
           cargo clippy --locked --all-targets
           -p vmm_api_common -p dladm -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
-          -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
+          -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid -p vmm_mantablock
           -p fhrun
           -- -D warnings
 
   clippy-illumos:
     name: clippy against the illumos target
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-illumos
@@ -123,7 +131,9 @@ jobs:
 
   cross-check:
     name: illumos bindings type-check
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-illumos
@@ -152,12 +162,14 @@ jobs:
           -p bhyve_api_sys -p bhyve_api -p viona_api -p dladm -p vmm_api_common
           -p vmm_config -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_boot -p vmm_metrics -p vmm_machine -p vmm_hyperv
-          -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
+          -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid -p vmm_mantablock
           -p fhrun
 
   test:
     name: portable tests
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Codecs, bounds checks, device register models, and the migration
@@ -176,7 +188,7 @@ jobs:
           cargo test --locked
           -p vmm_api_common -p dladm -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
-          -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
+          -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid -p vmm_mantablock
           -p fhrun -p bhyve_api_sys -p bhyve_api -p viona_api
       # Release is the profile that ships, and no job ran it. slog drops
       # `debug!` at compile time there and the optimiser changes what a
@@ -187,12 +199,14 @@ jobs:
           cargo test --locked --release
           -p vmm_api_common -p dladm -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
-          -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
+          -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid -p vmm_mantablock
           -p fhrun -p bhyve_api_sys -p bhyve_api -p viona_api
 
   guest-init:
     name: guest init (musl)
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-linux-musl
@@ -210,7 +224,9 @@ jobs:
 
   guest-vsock-test:
     name: guest test harness (musl)
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-linux-musl
@@ -228,7 +244,9 @@ jobs:
 
   msrv:
     name: builds on the declared MSRV
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Cargo.toml is attacker-controlled on a fork pull request, so the
@@ -253,12 +271,14 @@ jobs:
           cargo "+$MSRV" check --locked
           -p vmm_api_common -p dladm -p vmm_core -p vmm_devices -p vmm_devices_testsupport
           -p vmm_config -p vmm_migrate -p vmm_hyperv -p vmm_machine -p vmm_boot
-          -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid
+          -p vmm_metrics -p vmm_passthru -p vmm_virtio -p vmm_storage -p vmm_hid -p vmm_mantablock
           -p fhrun
 
   binaries:
     name: both binaries type-check
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       # The only job that builds rshyve, so the only one that needs the
       # libtpms submodule. Everything else names portable packages.
@@ -328,7 +348,9 @@ jobs:
 
   build-stamp:
     name: a release binary names a commit
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The firehyve in the platform image reported a commit that
@@ -414,7 +436,9 @@ jobs:
 
   supply-chain:
     name: advisories, licenses, sources
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
@@ -423,7 +447,9 @@ jobs:
 
   secrets:
     name: secret scan
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     env:
       # Pinned by version and digest. The gitleaks binary is MIT; the
       # gitleaks-action wrapper is deliberately not used because it
@@ -443,12 +469,18 @@ jobs:
           curl -sSfL "$url" -o gitleaks.tar.gz
           echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
           tar xzf gitleaks.tar.gz gitleaks
-      # Scans the working tree and the full history reachable from it.
-      - run: ./gitleaks detect --source . --config .gitleaks.toml --redact --no-banner
+      # Scans the history reachable from HEAD. Without --log-opts gitleaks
+      # runs `git log --all`, and fetch-depth 0 fetches every branch, so
+      # an unrelated branch could fail this PR.
+      - run: >
+          ./gitleaks detect --source . --config .gitleaks.toml --redact
+          --no-banner --log-opts=HEAD
 
   boundary:
     name: firehyve dependency boundary
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Scoping the crate graph to one workspace member is what makes
@@ -470,7 +502,9 @@ jobs:
 
   platform-deps:
     name: stock-PI dependency gate self-test
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The gate itself runs on the illumos build host, where rshyve is
@@ -493,7 +527,9 @@ jobs:
 
   public-surface:
     name: public surface guard
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -589,7 +625,9 @@ jobs:
 
   unsafe-safety:
     name: every unsafe block is justified
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # 280 unsafe blocks and 5 `// SAFETY:` comments is the first thing
@@ -626,7 +664,9 @@ jobs:
 
   ci-coverage:
     name: every portable crate is named by a job
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # A crate that no `-p` list names is unlinted and untested code
@@ -669,7 +709,9 @@ jobs:
 
   test-parity:
     name: illumos and CI compile the same tests
-    runs-on: ubuntu-latest
+    runs-on:
+      group: triton
+      labels: [self-hosted, APP]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add x86_64-unknown-illumos

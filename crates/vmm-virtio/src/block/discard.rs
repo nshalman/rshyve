@@ -27,7 +27,7 @@ use crate::bits;
 use crate::queue::ChainBuf;
 
 /// Size of one `struct virtio_blk_discard_write_zeroes`.
-const SEG_SIZE: usize = 16;
+pub(super) const SEG_SIZE: usize = 16;
 
 /// Segments accepted in one request of either kind. Published as
 /// `max_discard_seg` and `max_write_zeroes_seg`.

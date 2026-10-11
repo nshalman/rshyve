@@ -42,20 +42,14 @@ tunnel established and authenticated by other means.
 
 **Boundary:** correctness, guest-visible. **Severity:** high.
 
-`crates/vmm-migrate/src/state.rs` does not export or import FPU/XSAVE
-state. A guest using x87, SSE, or AVX state across a migration can
-observe corrupted registers.
+Protocol v6 exports each vCPU's area with `VM_GET_FPU` and imports it
+with `VM_SET_FPU` (`crates/vmm-migrate/src/xsave.rs`). The destination
+refuses a source whose guest-visible XSAVE components it cannot hold at
+the same size and offset, and checks each area's length and header
+before the kernel sees it. Peers on older versions are refused.
 
-The comment in `state.rs` claiming a `VM_GET_FPU` ioctl is needed is
-wrong: the bindings already exist in `crates/bhyve-api/sys/src/ioctls.rs`
-and `structs.rs`.
-
-**To close:** implement `get_fpu`/`set_fpu`/`fpu_area_desc`, reject a
-blob whose length does not match the local area size before the ioctl,
-and validate across a real cross-host migration with a continuous AVX
-workload. A malformed XSAVE blob can set reserved `XCOMP_BV` bits and
-fault the guest at its first `XRSTOR`, so this is worse to get wrong
-than to leave unimplemented.
+**To close:** validate across a real cross-host migration with a
+continuous AVX workload, then move this entry to "Resolved".
 
 ### OSF-4 — Vendored libtpms predates two CVE fixes
 

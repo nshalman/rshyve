@@ -140,6 +140,18 @@ impl Vcpu {
         self.hdl.vcpu_set_run_state(self.id, state, sipi_vector)
     }
 
+    /// Read the XSAVE area, `len` bytes: the host's area size.
+    pub fn get_fpu(&self, len: usize) -> std::io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        self.hdl.vcpu_get_fpu(self.id, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Load an XSAVE area in the host's standard format.
+    pub fn set_fpu(&self, area: &[u8]) -> std::io::Result<()> {
+        self.hdl.vcpu_set_fpu(self.id, area)
+    }
+
     /// Reset all vCPU state to x86 power-on defaults.
     ///
     /// This issues `VM_RESET_CPU` which initializes all registers,

@@ -21,6 +21,7 @@
 //! run again.
 
 use std::io::Read;
+use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -42,11 +43,17 @@ use crate::limits::{BATCH_SIZE, ZSTD_LEVEL};
 use crate::pages::{
     are_contiguous, build_contiguous_gpas, page_buffer_len, read_pages,
 };
-use crate::protocol::{PageIter, PAGE_SIZE, PROTOCOL_RON};
+use crate::protocol::{PageIter, PAGE_SIZE, SOURCE_OFFER};
 use crate::state;
-use crate::wire::{set_phase, Chan, Deadlines, Transport};
+use crate::wait::{unless_cancelled, Abandoned};
+use crate::wire::{
+    cancel_or, not_cancelled, set_phase, Chan, Deadlines, Transport,
+};
+use crate::xsave::XsaveLayout;
 use crate::MigrationPhase;
 use crate::MigrationStatus;
+use crate::StopGate;
+use crate::VmPauseFn;
 
 /// The byte the ZFS barrier reports when the final incremental landed.
 pub const ZFS_BARRIER_OK: u8 = 0;
@@ -66,18 +73,26 @@ pub type DeviceExportFn = Box<
     dyn FnOnce() -> Result<Vec<DeviceStatePayload>, DeviceStateError> + Send,
 >;
 
-/// Flush device writeback caches. Called after `hdl.pause()` has
+/// Flush device writeback caches. Called after the vCPU pause has
 /// quiesced the vCPUs and before the ZFS barrier, so `zfs send` sees
 /// every write the guest was told was complete.
+///
+/// Runs on a helper a stop can leave behind, so it must stop between
+/// devices once [`Abandoned`] is set.
 pub type DeviceFlushFn =
-    Box<dyn FnOnce() -> Result<(), DeviceFlushError> + Send>;
+    Box<dyn FnOnce(&Abandoned) -> Result<(), DeviceFlushError> + Send>;
 
-/// One device's backing store could not be flushed.
+/// Why the backing stores were not all flushed.
 #[derive(Debug, thiserror::Error)]
-#[error("{device}: {source}")]
-pub struct DeviceFlushError {
-    pub device: &'static str,
-    pub source: FlushError,
+pub enum DeviceFlushError {
+    #[error("{device}: {source}")]
+    Device {
+        device: &'static str,
+        source: FlushError,
+    },
+    /// The flush ended before it reached every device.
+    #[error("{0}")]
+    Stopped(String),
 }
 
 /// Put the devices back to work after a migration that failed once the
@@ -111,6 +126,9 @@ pub struct SourceHooks {
     pub export: DeviceExportFn,
     pub resume: DeviceResumeFn,
     pub hyperv: HypervExportFn,
+    pub pause_vm: VmPauseFn,
+    pub resume_vm: VmPauseFn,
+    pub gate: Box<dyn StopGate>,
 }
 
 pub fn run_source<S: Transport>(
@@ -138,15 +156,22 @@ pub fn run_source<S: Transport>(
         hooks.flush,
         hooks.export,
         hooks.hyperv,
+        &hooks.pause_vm,
+        hooks.gate.as_ref(),
         &status,
         log,
     );
+    if let Err(error) = &result {
+        if crate::is_cancel(error) {
+            chan.report_failure(error, log);
+        }
+    }
 
     let phase = status
         .lock()
         .map(|s| s.phase)
         .unwrap_or(MigrationPhase::Error);
-    finish_source(result, phase, log, resume, || hdl.resume())
+    finish_source(result, phase, log, resume, hooks.resume_vm)
 }
 
 /// Roll the source back when a migration failed after the pause.
@@ -189,18 +214,23 @@ fn run_inner<S: Transport>(
     device_flush_fn: DeviceFlushFn,
     device_export_fn: DeviceExportFn,
     hyperv_export_fn: HypervExportFn,
+    pause_vm: &VmPauseFn,
+    gate: &dyn StopGate,
     status: &Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     // ── Sync ──
     set_phase(status, MigrationPhase::Sync);
 
-    chan.send(&Message::serialized(&ProtocolOffer {
-        protocols: vec![PROTOCOL_RON.to_string()],
-    })?)?;
+    chan.send_uncommitted(
+        gate,
+        &Message::serialized(&ProtocolOffer {
+            protocols: SOURCE_OFFER.iter().map(|v| v.to_string()).collect(),
+        })?,
+    )?;
 
     let sel: ProtocolSelect = chan.expect_serialized()?;
-    if sel.protocol != PROTOCOL_RON {
+    if !SOURCE_OFFER.contains(&sel.protocol.as_str()) {
         return Err(MigrateError::ProtocolMismatch(crate::wire::peer_text(
             &sel.protocol,
         )));
@@ -208,17 +238,22 @@ fn run_inner<S: Transport>(
 
     let mut devices = config.devices.clone();
     devices.sort();
-    chan.send(&Message::serialized(&MigrationPreamble {
-        num_cpus: config.num_cpus,
-        mem_size: config.mem_size,
-        devices,
-        cpu_features: Some(cpu::local_features(config.cpu_baseline)),
-    })?)?;
+    let xsave = XsaveLayout::local(hdl)?;
+    chan.send_uncommitted(
+        gate,
+        &Message::serialized(&MigrationPreamble {
+            num_cpus: config.num_cpus,
+            mem_size: config.mem_size,
+            devices,
+            cpu_features: Some(cpu::local_features(config.cpu_baseline)),
+            xsave: xsave.clone(),
+        })?,
+    )?;
     chan.expect_okay()?;
 
     // ── RamPushPrePause: send ALL pages ──
     set_phase(status, MigrationPhase::RamPushPrePause);
-    push_ram_all(chan, hdl, memctx, status)?;
+    push_ram_all(chan, hdl, memctx, gate, status)?;
 
     // ── Iterative convergence ──
     const MAX_ITERS: u32 = 5;
@@ -226,14 +261,14 @@ fn run_inner<S: Transport>(
 
     for iter in 1..=MAX_ITERS {
         std::thread::sleep(Duration::from_millis(500));
-        let dirty = push_ram(chan, hdl, memctx, status)?;
+        let dirty = push_ram(chan, hdl, memctx, gate, status)?;
         slog::info!(log, "convergence"; "iter" => iter, "dirty" => dirty);
         if dirty <= CONVERGE_THRESHOLD {
             break;
         }
     }
 
-    chan.send(&Message::PauseSignal)?;
+    chan.send_uncommitted(gate, &Message::PauseSignal)?;
 
     // ── Pause ──
     // From here the guest is stopped and every failure has to roll
@@ -243,18 +278,24 @@ fn run_inner<S: Transport>(
     chan.enter_post_pause()?;
     device_pre_pause_fn()
         .map_err(|e| MigrateError::State(format!("device pause: {e}")))?;
-    hdl.pause()
-        .map_err(|e| MigrateError::Io(format!("pause: {e}")))?;
+    pause_vm().map_err(|e| {
+        cancel_or(gate, MigrateError::Io(format!("pause: {e}")))
+    })?;
+    not_cancelled(gate)?;
 
     // zvol WCE=1 means writes the guest was told were complete may
     // still sit in cache. `zfs send` ships only committed pool state.
+    // A durable sync has no deadline, so a stop does not wait for it.
+    // One left behind stops after its current device, and teardown
+    // waits for it.
     slog::info!(log, "flushing device backing caches");
-    device_flush_fn().map_err(|error| {
-        MigrateError::Io(format!("device flush failed: {error}"))
-    })?;
+    unless_cancelled("migrate-flush", || gate.cancelled(), device_flush_fn)?
+        .map_err(|error| {
+            MigrateError::Io(format!("device flush failed: {error}"))
+        })?;
 
     if let Some(barrier) = config.zfs_barrier.as_deref() {
-        zfs_barrier_wait(barrier, config.deadlines.zfs_barrier, log)?;
+        zfs_barrier_wait(barrier, config.deadlines.zfs_barrier, gate, log)?;
     }
 
     // The overlay pages go before the final pass: the destination
@@ -266,40 +307,52 @@ fn run_inner<S: Transport>(
     // Every writer stopped in the pre-pause step, so this pass is the
     // last word on guest memory.
     set_phase(status, MigrationPhase::RamPushPostPause);
-    let final_dirty = push_ram(chan, hdl, memctx, status)?;
+    let final_dirty = push_ram(chan, hdl, memctx, gate, status)?;
     slog::info!(log, "post-pause"; "dirty" => final_dirty);
 
     // ── TimeData ──
     set_phase(status, MigrationPhase::TimeData);
     let time_data = state::export_time_data(hdl, log)?;
-    chan.send(&Message::serialized(&time_data)?)?;
+    chan.send_uncommitted(gate, &Message::serialized(&time_data)?)?;
 
     // ── DeviceState ──
     set_phase(status, MigrationPhase::DeviceState);
-    let mut dev_state = state::export_device_state(hdl, config.num_cpus, log)?;
+    let mut dev_state =
+        state::export_device_state(hdl, config.num_cpus, &xsave, log)?;
     dev_state.emulated = device_export_fn()
         .map_err(|e| MigrateError::State(format!("device export: {e}")))?;
     dev_state.hyperv = hyperv;
     slog::info!(log, "exporting device state";
         "devices" => dev_state.emulated.len());
-    chan.send(&Message::serialized(&dev_state)?)?;
+    chan.send_uncommitted(gate, &Message::serialized(&dev_state)?)?;
 
     // ── RamPull (none needed) ──
     set_phase(status, MigrationPhase::RamPull);
-    chan.send(&Message::MemEnd)?;
+    chan.send_uncommitted(gate, &Message::MemEnd)?;
 
-    // ── Finish ──
-    // Three steps, and the order is the whole point. The destination
-    // says it holds everything; this end commits, which is the promise
-    // never to run the guest again; only then does the destination
-    // start it. A destination that resumed before the commit would run
-    // a second copy of the guest against the same disk whenever this
-    // end rolled back.
+    hand_over(chan, gate, status)
+}
+
+/// Three steps, and the order is the whole point. The destination says
+/// it holds everything; this end commits, which is the promise never to
+/// run the guest again; only then does the destination start it. A
+/// destination that resumed before the commit would run a second copy
+/// of the guest against the same disk whenever this end rolled back.
+fn hand_over<S: Transport>(
+    chan: &mut Chan<S>,
+    gate: &dyn StopGate,
+    status: &Arc<Mutex<MigrationStatus>>,
+) -> Result<(), MigrateError> {
     set_phase(status, MigrationPhase::Finish);
     chan.expect_okay()?;
-    chan.send(&Message::Okay)?;
+    gate.commit()?;
 
     set_phase(status, MigrationPhase::Committed);
+    chan.send(&Message::Okay).map_err(|e| {
+        MigrateError::Committed(format!(
+            "the commit may not have reached the destination: {e}"
+        ))
+    })?;
     chan.expect_okay().map_err(|e| {
         MigrateError::Committed(format!(
             "the destination never confirmed it started the guest: {e}"
@@ -319,20 +372,34 @@ fn run_inner<S: Transport>(
 fn zfs_barrier_wait(
     barrier_path: &Path,
     budget: Duration,
+    gate: &dyn StopGate,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     slog::info!(log, "waiting for post-pause ZFS sync";
         "barrier" => %barrier_path.display());
-    let mut stream = std::os::unix::net::UnixStream::connect(barrier_path)
+    let mut stream = crate::connect::unix(barrier_path, || gate.cancelled())?
         .map_err(|e| {
-            MigrateError::Io(format!("ZFS barrier connect failed: {e}"))
-        })?;
+        MigrateError::Io(format!("ZFS barrier connect failed: {e}"))
+    })?;
+    let clone = stream
+        .try_clone()
+        .map_err(|e| MigrateError::Io(format!("ZFS barrier socket: {e}")))?;
+    let shut_log = log.clone();
+    gate.on_stop(Box::new(move || {
+        if let Err(e) = clone.shutdown(Shutdown::Both) {
+            slog::debug!(shut_log, "the ZFS barrier was already closed";
+                "error" => %e);
+        }
+    }));
     stream.set_read_timeout(Some(budget)).map_err(|e| {
         MigrateError::Io(format!("ZFS barrier read timeout: {e}"))
     })?;
     let mut status = [0u8; 1];
     stream.read_exact(&mut status).map_err(|e| {
-        MigrateError::Io(format!("ZFS barrier reported nothing: {e}"))
+        cancel_or(
+            gate,
+            MigrateError::Io(format!("ZFS barrier reported nothing: {e}")),
+        )
     })?;
     if status[0] != ZFS_BARRIER_OK {
         return Err(MigrateError::Io(format!(
@@ -348,6 +415,7 @@ fn push_ram_all<S: Transport>(
     chan: &mut Chan<S>,
     hdl: &Arc<VmmHdl>,
     memctx: &MemCtx,
+    gate: &dyn StopGate,
     status: &Arc<Mutex<MigrationStatus>>,
 ) -> Result<(), MigrateError> {
     for &(gpa, len, kind) in &memctx.regions() {
@@ -367,18 +435,18 @@ fn push_ram_all<S: Transport>(
         while off < num_pages {
             let count = BATCH_SIZE.min(num_pages - off);
             let base = gpa + (off * PAGE_SIZE) as u64;
-            send_batch(chan, memctx, base, count, status)?;
+            send_batch(chan, memctx, gate, base, count, status)?;
             off += count;
         }
     }
-    chan.send(&Message::MemEnd)?;
-    chan.expect_mem_done()
+    end_pass(chan, gate)
 }
 
 fn push_ram<S: Transport>(
     chan: &mut Chan<S>,
     hdl: &VmmHdl,
     memctx: &MemCtx,
+    gate: &dyn StopGate,
     status: &Arc<Mutex<MigrationStatus>>,
 ) -> Result<u64, MigrateError> {
     let mut total: u64 = 0;
@@ -390,31 +458,53 @@ fn push_ram<S: Transport>(
         let mut bm = vec![0u8; bm_len];
         hdl.track_dirty_pages(gpa, len, &mut bm)
             .map_err(|e| MigrateError::Io(format!("track_dirty: {e}")))?;
-
-        let mut batch: Vec<u64> = Vec::with_capacity(BATCH_SIZE);
-        for dirty_gpa in PageIter::new(&bm, gpa, len) {
-            batch.push(dirty_gpa);
-            total += 1;
-            if batch.len() >= BATCH_SIZE {
-                send_batch_sparse(chan, memctx, &batch, status)?;
-                batch.clear();
-            }
-        }
-        if !batch.is_empty() {
-            send_batch_sparse(chan, memctx, &batch, status)?;
-        }
+        total += send_dirty(PageIter::new(&bm, gpa, len), gate, |batch| {
+            send_batch_sparse(chan, memctx, gate, batch, status)
+        })?;
     }
     if let Ok(mut s) = status.lock() {
         s.dirty_pages_remaining = total;
     }
-    chan.send(&Message::MemEnd)?;
-    chan.expect_mem_done()?;
+    end_pass(chan, gate)?;
     Ok(total)
+}
+
+fn send_dirty(
+    pages: impl Iterator<Item = u64>,
+    gate: &dyn StopGate,
+    mut send: impl FnMut(&[u64]) -> Result<(), MigrateError>,
+) -> Result<u64, MigrateError> {
+    let mut total = 0;
+    let mut batch: Vec<u64> = Vec::with_capacity(BATCH_SIZE);
+    for gpa in pages {
+        batch.push(gpa);
+        total += 1;
+        if batch.len() >= BATCH_SIZE {
+            not_cancelled(gate)?;
+            send(&batch)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        not_cancelled(gate)?;
+        send(&batch)?;
+    }
+    Ok(total)
+}
+
+fn end_pass<S: Transport>(
+    chan: &mut Chan<S>,
+    gate: &dyn StopGate,
+) -> Result<(), MigrateError> {
+    chan.send_uncommitted(gate, &Message::MemEnd)?;
+    not_cancelled(gate)?;
+    chan.expect_mem_done()
 }
 
 fn send_batch<S: Transport>(
     chan: &mut Chan<S>,
     memctx: &MemCtx,
+    gate: &dyn StopGate,
     base_gpa: u64,
     count: usize,
     status: &Arc<Mutex<MigrationStatus>>,
@@ -424,12 +514,15 @@ fn send_batch<S: Transport>(
     let mut buf = vec![0u8; raw_size];
     read_pages(memctx, &gpas, &mut buf)?;
     let (data, flags) = compress(&buf);
-    chan.send(&Message::PageBatch {
-        base_gpa,
-        page_count: page_count(count)?,
-        flags,
-        data,
-    })?;
+    chan.send_uncommitted(
+        gate,
+        &Message::PageBatch {
+            base_gpa,
+            page_count: page_count(count)?,
+            flags,
+            data,
+        },
+    )?;
     if let Ok(mut s) = status.lock() {
         s.pages_transferred += count as u64;
         s.bytes_transferred += raw_size as u64;
@@ -440,6 +533,7 @@ fn send_batch<S: Transport>(
 fn send_batch_sparse<S: Transport>(
     chan: &mut Chan<S>,
     memctx: &MemCtx,
+    gate: &dyn StopGate,
     gpas: &[u64],
     status: &Arc<Mutex<MigrationStatus>>,
 ) -> Result<(), MigrateError> {
@@ -448,20 +542,23 @@ fn send_batch_sparse<S: Transport>(
     }
     let base = gpas[0];
     if are_contiguous(gpas) {
-        return send_batch(chan, memctx, base, gpas.len(), status);
+        return send_batch(chan, memctx, gate, base, gpas.len(), status);
     }
     let raw_size = page_buffer_len(gpas.len())?;
     let count = gpas.len();
     let mut buf = vec![0u8; raw_size];
     read_pages(memctx, gpas, &mut buf)?;
     let (data, flags) = compress(&buf);
-    chan.send(&Message::MemFetch(gpas.to_vec()))?;
-    chan.send(&Message::PageBatch {
-        base_gpa: base,
-        page_count: page_count(count)?,
-        flags,
-        data,
-    })?;
+    chan.send_uncommitted(gate, &Message::MemFetch(gpas.to_vec()))?;
+    chan.send_uncommitted(
+        gate,
+        &Message::PageBatch {
+            base_gpa: base,
+            page_count: page_count(count)?,
+            flags,
+            data,
+        },
+    )?;
     if let Ok(mut s) = status.lock() {
         s.pages_transferred += count as u64;
         s.bytes_transferred += raw_size as u64;
@@ -483,160 +580,4 @@ fn compress(raw: &[u8]) -> (Vec<u8>, u32) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write as _;
-    use std::os::unix::net::UnixListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    fn discard() -> slog::Logger {
-        slog::Logger::root(slog::Discard, slog::o!())
-    }
-
-    /// A barrier socket that answers with `reply`, or with nothing when
-    /// `reply` is `None`.
-    fn barrier(reply: Option<u8>) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("barrier.sock");
-        let listener = UnixListener::bind(&path).expect("bind");
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                if let Some(byte) = reply {
-                    let _ = stream.write_all(&[byte]);
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        });
-        (dir, path)
-    }
-
-    #[test]
-    fn a_reported_zfs_failure_fails_the_migration() {
-        // The guest would resume on the destination having already
-        // acknowledged writes the destination disk never received.
-        let (_dir, path) = barrier(Some(1));
-        let error = zfs_barrier_wait(&path, Duration::from_secs(5), &discard())
-            .expect_err("a non-zero status must fail");
-        assert!(error.to_string().contains("reported failure"), "{error}");
-    }
-
-    #[test]
-    fn a_silent_zfs_barrier_fails_the_migration() {
-        let (_dir, path) = barrier(None);
-        let error =
-            zfs_barrier_wait(&path, Duration::from_millis(200), &discard())
-                .expect_err("a timeout must fail");
-        assert!(error.to_string().contains("reported nothing"), "{error}");
-    }
-
-    #[test]
-    fn a_missing_zfs_barrier_fails_the_migration() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = zfs_barrier_wait(
-            &dir.path().join("absent.sock"),
-            Duration::from_secs(1),
-            &discard(),
-        )
-        .expect_err("a missing socket must fail");
-        assert!(error.to_string().contains("connect failed"), "{error}");
-    }
-
-    #[test]
-    fn an_agreeing_zfs_barrier_lets_the_migration_go_on() {
-        let (_dir, path) = barrier(Some(ZFS_BARRIER_OK));
-        zfs_barrier_wait(&path, Duration::from_secs(5), &discard())
-            .expect("status 0 is the go-ahead");
-    }
-
-    #[test]
-    fn flush_failure_resumes_devices_and_vcpus() {
-        let result: Result<(), MigrateError> =
-            Err(MigrateError::Io("device flush failed".into()));
-        let devices_resumed = Arc::new(AtomicBool::new(false));
-        let vcpus_resumed = Arc::new(AtomicBool::new(false));
-        let devices_resumed_by_callback = Arc::clone(&devices_resumed);
-        let vcpus_resumed_by_callback = Arc::clone(&vcpus_resumed);
-        let devices_resumed_before_vcpus = Arc::clone(&devices_resumed);
-        let resume_fn: DeviceResumeFn = Box::new(move || {
-            devices_resumed_by_callback.store(true, Ordering::Release);
-        });
-
-        let result = finish_source(
-            result,
-            MigrationPhase::Pause,
-            &discard(),
-            resume_fn,
-            move || {
-                assert!(devices_resumed_before_vcpus.load(Ordering::Acquire));
-                vcpus_resumed_by_callback.store(true, Ordering::Release);
-                Ok::<(), &'static str>(())
-            },
-        );
-
-        assert!(result.is_err());
-        assert!(devices_resumed.load(Ordering::Acquire));
-        assert!(vcpus_resumed.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn a_committed_source_is_never_resumed() {
-        // The destination may be running the guest. Two copies against
-        // one disk is worse than a guest that needs an operator.
-        let resumed = Arc::new(AtomicBool::new(false));
-        let by_callback = Arc::clone(&resumed);
-        let resume_fn: DeviceResumeFn = Box::new(move || {
-            by_callback.store(true, Ordering::Release);
-        });
-        let result = finish_source(
-            Err(MigrateError::Committed("no confirmation".into())),
-            MigrationPhase::Committed,
-            &discard(),
-            resume_fn,
-            || -> Result<(), &'static str> {
-                panic!("a committed source must not resume its vCPUs")
-            },
-        );
-        assert!(result.is_err());
-        assert!(!resumed.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn a_failure_in_finish_still_rolls_back() {
-        // Nothing was promised yet: the destination waits for the
-        // commit before it starts the guest.
-        let resumed = Arc::new(AtomicBool::new(false));
-        let by_callback = Arc::clone(&resumed);
-        let resume_fn: DeviceResumeFn = Box::new(move || {
-            by_callback.store(true, Ordering::Release);
-        });
-        let result = finish_source(
-            Err(MigrateError::WebSocket("closed".into())),
-            MigrationPhase::Finish,
-            &discard(),
-            resume_fn,
-            || Ok::<(), &'static str>(()),
-        );
-        assert!(result.is_err());
-        assert!(resumed.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn a_pre_pause_failure_does_not_resume_a_running_guest() {
-        // Nothing was paused yet, so a resume here would be a state
-        // change on a VM that never stopped.
-        let resumed = Arc::new(AtomicBool::new(false));
-        let by_callback = Arc::clone(&resumed);
-        let resume_fn: DeviceResumeFn = Box::new(move || {
-            by_callback.store(true, Ordering::Release);
-        });
-        let result = finish_source(
-            Err(MigrateError::Io("connect failed".into())),
-            MigrationPhase::Sync,
-            &discard(),
-            resume_fn,
-            || Ok::<(), &'static str>(()),
-        );
-        assert!(result.is_err());
-        assert!(!resumed.load(Ordering::Acquire));
-    }
-}
+mod tests;

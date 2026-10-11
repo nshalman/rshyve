@@ -22,6 +22,7 @@ use vmm_core::vcpu::Vcpu;
 use crate::codec::{
     DevicePayload, DeviceState, MigrateError, VcpuStatePayload,
 };
+use crate::xsave::{XsaveLayout, XsavePlan};
 
 mod checks;
 mod time;
@@ -200,6 +201,8 @@ trait ImportSink {
         run_state: u32,
         sipi_vector: u8,
     ) -> Result<(), MigrateError>;
+
+    fn set_fpu(&self, vcpuid: i32, area: &[u8]) -> Result<(), MigrateError>;
 }
 
 /// Applies imported state to a live bhyve instance.
@@ -276,6 +279,12 @@ impl ImportSink for KernelSink<'_> {
                 ))
             })
     }
+
+    fn set_fpu(&self, vcpuid: i32, area: &[u8]) -> Result<(), MigrateError> {
+        self.vcpu(vcpuid).set_fpu(area).map_err(|e| {
+            MigrateError::State(format!("vcpu {vcpuid}: set FPU state: {e}"))
+        })
+    }
 }
 
 /// Read a per-vCPU field-entry class and serialize it for the wire.
@@ -311,6 +320,7 @@ fn read_field_entries(
 pub fn export_device_state(
     hdl: &Arc<VmmHdl>,
     num_cpus: u32,
+    xsave: &XsaveLayout,
     log: &slog::Logger,
 ) -> Result<DeviceState, MigrateError> {
     // Export per-vCPU state using individual register reads
@@ -332,9 +342,9 @@ pub fn export_device_state(
             "VMM_ARCH",
         )?;
 
-        // Not transferred yet. OSF-2 in docs/security/open-findings.md
-        // tracks this; the VM_GET_FPU/VM_SET_FPU bindings already exist.
-        let fpu = Vec::new();
+        let fpu = vcpu.get_fpu(xsave.size()).map_err(|e| {
+            MigrateError::VmmData(format!("get FPU vcpu={vcpuid}: {e}"))
+        })?;
 
         // Run state restores an AP that is in HLT or INIT, not running.
         let (run_state, sipi_vector) = vcpu.get_run_state().map_err(|e| {
@@ -391,6 +401,7 @@ pub fn import_device_state(
     hdl: &Arc<VmmHdl>,
     state: &DeviceState,
     num_cpus: u32,
+    xsave: &XsavePlan<'_>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     let layouts = read_class_layouts(hdl)?;
@@ -399,6 +410,7 @@ pub fn import_device_state(
         &layouts,
         state,
         num_cpus,
+        xsave,
         log,
     )
 }
@@ -412,13 +424,16 @@ fn import_device_state_into(
     layouts: &[vdi_version_entry_v1],
     state: &DeviceState,
     num_cpus: u32,
+    xsave: &XsavePlan<'_>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     check_device_state(state, layouts, num_cpus)?;
-
-    // The payload carries no FPU/XSAVE state. OSF-2 in
-    // docs/security/open-findings.md tracks the gap.
-    slog::warn!(log, "importing without FPU/XSAVE state");
+    let fpu: Vec<Vec<u8>> = state
+        .vcpus
+        .iter()
+        .map(|v| xsave.translate(v.vcpuid, &v.fpu))
+        .collect::<Result<_, _>>()
+        .map_err(MigrateError::State)?;
 
     // System devices first, in the local order: the IOAPIC must be
     // ready before the LAPICs, and the payload's order is the peer's
@@ -435,13 +450,14 @@ fn import_device_state_into(
     // Per vCPU: MSRs before the registers for GS_BASE, KERNEL_GS_BASE,
     // STAR and LSTAR. LAPIC before the registers so timer state is
     // correct. VMM_ARCH last, because it carries pending interrupts.
-    for vcpu in &state.vcpus {
+    for (vcpu, fpu) in state.vcpus.iter().zip(&fpu) {
         let id = vcpu.vcpuid;
         sink.write_class(VDC_MSR, 1, Some(id), &vcpu.msrs)?;
         sink.write_class(VDC_LAPIC, 1, Some(id), &vcpu.lapic)?;
         for write in parse_vcpu_regs(id, &vcpu.registers)? {
             sink.write_reg(id, write)?;
         }
+        sink.set_fpu(id, fpu)?;
         // VRS_HALT is 0, so a halted vCPU must be restored too.
         sink.set_run_state(id, vcpu.run_state, vcpu.sipi_vector)?;
         sink.write_class(bhyve_api::VDC_VMM_ARCH, 1, Some(id), &vcpu.vmm_arch)?;
@@ -468,6 +484,7 @@ mod tests {
         classes: RefCell<Vec<(u16, u16, Option<i32>, usize)>>,
         regs: RefCell<Vec<(i32, String)>>,
         run_states: RefCell<Vec<(i32, u32, u8)>>,
+        fpus: RefCell<Vec<(i32, usize)>>,
     }
 
     impl RecordingSink {
@@ -482,6 +499,7 @@ mod tests {
             self.classes.borrow().is_empty()
                 && self.regs.borrow().is_empty()
                 && self.run_states.borrow().is_empty()
+                && self.fpus.borrow().is_empty()
         }
     }
 
@@ -522,6 +540,23 @@ mod tests {
                 .push((vcpuid, run_state, sipi_vector));
             Ok(())
         }
+
+        fn set_fpu(
+            &self,
+            vcpuid: i32,
+            area: &[u8],
+        ) -> Result<(), MigrateError> {
+            self.fpus.borrow_mut().push((vcpuid, area.len()));
+            Ok(())
+        }
+    }
+
+    fn plan(xsave: &XsaveLayout) -> XsavePlan<'_> {
+        XsavePlan {
+            source: xsave,
+            local: xsave,
+            guest: 0x3,
+        }
     }
 
     fn test_log() -> slog::Logger {
@@ -539,11 +574,13 @@ mod tests {
         num_cpus: u32,
     ) -> (RecordingSink, Result<(), MigrateError>) {
         let sink = RecordingSink::default();
+        let xsave = test_xsave();
         let result = import_device_state_into(
             &sink,
             &kernel_layouts(),
             state,
             num_cpus,
+            &plan(&xsave),
             &test_log(),
         );
         (sink, result)
@@ -555,11 +592,13 @@ mod tests {
     ) -> (RecordingSink, Result<(), MigrateError>) {
         let sink = RecordingSink::default();
         let num_cpus = state.vcpus.len() as u32;
+        let xsave = test_xsave();
         let result = import_device_state_into(
             &sink,
             layouts,
             state,
             num_cpus,
+            &plan(&xsave),
             &test_log(),
         );
         (sink, result)
@@ -619,6 +658,31 @@ mod tests {
         }
         assert_eq!(sink.regs.borrow().len(), 2);
         assert_eq!(sink.run_states.borrow().len(), 1);
+        assert_eq!(sink.fpus.borrow().as_slice(), &[(0, TEST_XSAVE_LEN)]);
+    }
+
+    /// What a source that carries no FPU state sends. Resuming on the
+    /// destination's own FPU state is OSF-2.
+    #[test]
+    fn a_payload_without_fpu_state_is_refused() {
+        let mut state = good_state();
+        state.vcpus[0].fpu.clear();
+        let (sink, result) = import(&state);
+        let error = result.map(|_| ()).expect_err("no FPU state");
+        assert!(error.to_string().contains("vcpu 0 FPU"), "{error}");
+        assert!(sink.applied_nothing(), "state applied before the check");
+    }
+
+    /// A bad area on the last vCPU must stop the import before the
+    /// first vCPU is touched.
+    #[test]
+    fn a_bad_fpu_area_on_any_vcpu_applies_nothing() {
+        let mut state = good_state();
+        state.vcpus.push(vcpu_payload(1));
+        state.vcpus[1].fpu[520] = 1;
+        let (sink, result) = import_with_num_cpus(&state, 2);
+        result.map(|_| ()).expect_err("compacted XSAVE header");
+        assert!(sink.applied_nothing());
     }
 
     /// A destination kernel with a different `vdi_field_entry_v1` size

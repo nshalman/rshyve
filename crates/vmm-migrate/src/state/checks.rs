@@ -236,8 +236,7 @@ fn check_field_entry_blob(
 /// each blob the length that kernel expects, a register blob that
 /// decodes whole, and every system device class present exactly once.
 /// Not checked: the values inside the blobs, which only the kernel can
-/// judge, and the FPU/XSAVE state, which the payload never carries.
-/// See OSF-2 in docs/security/open-findings.md for that gap.
+/// judge. The XSAVE areas are checked by [`crate::xsave::XsavePlan`].
 pub(super) fn check_device_state(
     state: &DeviceState,
     layouts: &[vdi_version_entry_v1],
@@ -358,6 +357,24 @@ pub(crate) mod fixtures {
 
     pub(crate) const TEST_DEV_LEN: usize = 8;
 
+    /// An FXSAVE-only host: the legacy region and the XSAVE header.
+    pub(crate) const TEST_XSAVE_LEN: usize = 576;
+
+    pub(crate) fn test_xsave() -> crate::xsave::XsaveLayout {
+        use crate::xsave::{XsaveComponent, XsaveLayout};
+        XsaveLayout {
+            size: TEST_XSAVE_LEN as u32,
+            components: [1, 2]
+                .into_iter()
+                .map(|feature| XsaveComponent {
+                    feature,
+                    size: 512,
+                    offset: 0,
+                })
+                .collect(),
+        }
+    }
+
     /// The class table a matching destination kernel reports.
     pub(crate) fn kernel_layouts() -> Vec<vdi_version_entry_v1> {
         let item = size_of::<vdi_field_entry_v1>() as u16;
@@ -411,7 +428,7 @@ pub(crate) mod fixtures {
             vcpuid,
             registers: default_reg_blob(),
             msrs: field_entries(4),
-            fpu: Vec::new(),
+            fpu: vec![0u8; TEST_XSAVE_LEN],
             lapic: vec![0u8; size_of::<bhyve_api::vdi_lapic_v1>()],
             vmm_arch: field_entries(2),
             run_state: bhyve_api::VRS_RUN,

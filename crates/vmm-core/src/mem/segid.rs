@@ -49,6 +49,8 @@ impl SegidAlloc {
     ///
     /// Reporting exhaustion here gives startup a useful error instead
     /// of an unexplained `EINVAL` from `VM_ALLOC_MEMSEG`.
+    // `try_update` replaces this from Rust 1.95, and the MSRV is 1.94.
+    #[allow(deprecated)]
     pub fn alloc(&self) -> Option<i32> {
         self.next
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
