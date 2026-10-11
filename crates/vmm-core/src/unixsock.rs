@@ -81,6 +81,18 @@ fn bind_owned(
             .parent()
             .filter(|above| !above.as_os_str().is_empty())
         {
+            // A directory made here stays the binding identity's, which
+            // the owner could not search through to reach the socket.
+            if owner.is_some() && !above.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "{} must exist before a socket is given to the \
+                         run-as identity",
+                        above.display()
+                    ),
+                ));
+            }
             DirBuilder::new()
                 .recursive(true)
                 .mode(policy.dir_mode)
@@ -145,17 +157,33 @@ fn bind_owned(
 }
 
 /// Give the directory this bind made to `owner`, through a descriptor
-/// that did not follow a link. Whatever was swapped in after the mkdir
-/// is refused: a link fails the open, and a directory of another owner
-/// fails the check.
+/// that did not follow a link.
+///
+/// Only from a container no other user can rename entries in: in any
+/// other, a directory of ours could be swapped in after the mkdir and
+/// given away instead. A link fails the open, and a directory of
+/// another owner fails the check.
 fn give_created_dir(dir: &Path, owner: ListenerOwner) -> io::Result<()> {
+    // SAFETY: geteuid takes no argument and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let above = dir
+        .parent()
+        .filter(|above| !above.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let container = fs::metadata(above)?;
+    if !private_dir(container.uid(), container.mode(), euid) {
+        return Err(io::Error::other(format!(
+            "{} is writable by another user, so {} cannot be given away \
+             safely",
+            above.display(),
+            dir.display()
+        )));
+    }
     let handle = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(dir)?;
     let meta = handle.metadata()?;
-    // SAFETY: geteuid takes no argument and cannot fail.
-    let euid = unsafe { libc::geteuid() };
     if !meta.is_dir() || meta.uid() != euid {
         return Err(io::Error::other(format!(
             "{} is not the directory this bind made",
@@ -163,6 +191,12 @@ fn give_created_dir(dir: &Path, owner: ListenerOwner) -> io::Result<()> {
         )));
     }
     fchown(&handle, Some(owner.uid), Some(owner.gid))
+}
+
+/// Ours, and writable only by us or sticky. In a sticky directory no
+/// other user can rename or remove our entries.
+fn private_dir(uid: u32, mode: u32, euid: u32) -> bool {
+    uid == euid && (mode & 0o022 == 0 || mode & 0o1000 != 0)
 }
 
 /// The umask that keeps the socket within `mode` between its `bind`
@@ -612,6 +646,24 @@ mod tests {
 
         let dir = fs::metadata(&parent).expect("stat parent directory");
         assert_eq!(dir.uid(), before);
+    }
+
+    #[test]
+    fn only_a_container_no_one_else_can_rename_in_is_trusted() {
+        assert!(private_dir(0, 0o40755, 0));
+        assert!(private_dir(0, 0o41777, 0), "a sticky /tmp");
+        assert!(!private_dir(1000, 0o40755, 0), "another owner");
+        assert!(!private_dir(0, 0o40777, 0), "world writable, not sticky");
+        assert!(!private_dir(0, 0o40775, 0), "group writable");
+    }
+
+    #[test]
+    fn an_owner_needs_the_ancestors_to_exist() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("a").join("b").join("control.sock");
+        bind_owned(&path, SocketPolicy::default(), Some(test_owner()))
+            .expect_err("a missing ancestor");
+        assert!(!temp.path().join("a").exists());
     }
 
     /// A link in place of the parent is not taken for a directory this
