@@ -83,6 +83,7 @@ fn bind_owned(
         Some(_) => policy.dir_mode | 0o011,
         None => policy.dir_mode,
     };
+    let existed = parent.is_dir();
     DirBuilder::new()
         .recursive(true)
         .mode(dir_mode)
@@ -93,6 +94,11 @@ fn bind_owned(
         Some(owner) if trusted(parent)? => Some(owner),
         _ => None,
     };
+    // The umask can take the search bits off a directory made here.
+    // Set by path, so only on a secure one.
+    if give_to.is_some() && !existed {
+        fs::set_permissions(parent, Permissions::from_mode(dir_mode))?;
+    }
 
     remove_stale_socket(path)?;
 
@@ -142,10 +148,35 @@ fn secure_chain(dir: &Path) -> io::Result<bool> {
     let euid = unsafe { libc::geteuid() };
     for step in canonical.ancestors() {
         let meta = fs::symlink_metadata(step)?;
-        if !secure_step(meta.uid(), meta.mode(), euid) {
+        if !secure_step(meta.uid(), meta.mode(), euid) || !acl_trivial(step)? {
             return Ok(false);
         }
     }
+    Ok(true)
+}
+
+/// Whether `step` has no ACL beyond its mode bits. A ZFS ACL can let
+/// another user add or remove entries that the mode does not show.
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+fn acl_trivial(step: &Path) -> io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    #[link(name = "sec")]
+    unsafe extern "C" {
+        fn acl_trivial(path: *const libc::c_char) -> libc::c_int;
+    }
+    let c_path = std::ffi::CString::new(step.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("a path with a NUL byte"))?;
+    // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
+    match unsafe { acl_trivial(c_path.as_ptr()) } {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Only illumos ACLs are read; elsewhere the mode bits decide.
+#[cfg(not(any(target_os = "illumos", target_os = "solaris")))]
+fn acl_trivial(_step: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
@@ -629,6 +660,11 @@ mod tests {
         assert!(!secure_step(0, 0o41777, 0), "a sticky /tmp");
         assert!(!secure_step(1000, 0o40755, 0), "another owner");
         assert!(!secure_step(0, 0o40775, 0), "group writable");
+    }
+
+    #[test]
+    fn the_root_directory_has_a_trivial_acl() {
+        assert!(acl_trivial(Path::new("/")).expect("read the ACL"));
     }
 
     /// A link on the path is refused, even into a directory that is

@@ -287,8 +287,9 @@ backing file anyway.
 
 The socket is the path in the device spec, for example
 `-s 9,virtio-vsock,/var/run/firehyve/guest.sock,cid=3`. Two gates
-stand in front of it: the socket is 0600 in a 0700 directory, both
-owned by the run-as identity; and the accept loop reads the peer's
+stand in front of it: the socket is 0600 and owned by the run-as
+identity when no other user can write any directory on its path (a
+directory the VMM makes stays root-owned, mode 0711); and the accept loop reads the peer's
 credentials with `getpeerucred(3C)` and admits the VMM's own uid in
 its own zone or uid 0 in the global zone. A global-zone peer connecting
 through a path under the zone root is reported with zone id 0, so that
