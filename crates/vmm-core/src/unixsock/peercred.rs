@@ -57,7 +57,7 @@ impl PeerPolicy {
     /// The devices bind their sockets before the drop, so the policy
     /// has to name the identity the process ends at, not the one it
     /// starts with: the accept loop admits that uid, and the bind gives
-    /// the path to it so the process can still unlink or rebind it.
+    /// the path to it so a peer running as that uid can connect.
     pub fn for_process(run_as: Option<ListenerOwner>) -> io::Result<Self> {
         // SAFETY: geteuid takes no argument and cannot fail.
         let euid = unsafe { libc::geteuid() };
@@ -179,8 +179,18 @@ pub fn peer_cred(stream: &UnixStream) -> io::Result<PeerCred> {
             "the peer credential carries no zone id",
         ));
     }
+    // SAFETY: `cred` is a live credential from getpeerucred.
+    let uid = unsafe { libc::ucred_geteuid(cred.0) };
+    // -1 is "no uid in the credential", and must never match a policy.
+    if uid == libc::uid_t::MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the peer credential carries no uid",
+        ));
+    }
     Ok(PeerCred {
-        uid: unsafe { libc::ucred_geteuid(cred.0) },
+        uid,
+        // SAFETY: `cred` is a live credential from getpeerucred.
         gid: unsafe { libc::ucred_getegid(cred.0) },
         zoneid: Some(zoneid),
     })
@@ -223,9 +233,9 @@ pub fn peer_cred(stream: &UnixStream) -> io::Result<PeerCred> {
 pub fn peer_cred(stream: &UnixStream) -> io::Result<PeerCred> {
     let mut uid = 0;
     let mut gid = 0;
+    let fd = stream.as_raw_fd();
     // SAFETY: both out pointers are valid for the call.
-    let result =
-        unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    let result = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -391,6 +401,7 @@ mod tests {
         assert_eq!(policy.uid, 8123);
         assert_eq!(policy.owner, Some(run_as));
         let own = PeerPolicy::for_process(None).expect("policy");
+        // SAFETY: geteuid takes no argument and cannot fail.
         assert_eq!(own.uid, unsafe { libc::geteuid() });
         assert_eq!(own.owner, None);
         assert_eq!(own.zoneid, process_zoneid().expect("zone"));
@@ -406,8 +417,9 @@ mod tests {
 
         let cred = peer_cred(&left).expect("read peer credentials");
 
-        assert_eq!(cred.uid, unsafe { libc::geteuid() });
-        assert_eq!(cred.gid, unsafe { libc::getegid() });
+        // SAFETY: geteuid and getegid take no argument and cannot fail.
+        let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        assert_eq!((cred.uid, cred.gid), (euid, egid));
         assert_eq!(cred.zoneid, None);
     }
 

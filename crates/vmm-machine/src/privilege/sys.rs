@@ -154,8 +154,7 @@ mod illumos {
             });
         }
         if let Some(run_as) = run_as {
-            // SAFETY: geteuid and getegid take no argument and cannot
-            // fail.
+            // SAFETY: geteuid takes no argument and cannot fail.
             let uid = unsafe { libc::geteuid() };
             if uid != run_as.uid {
                 return Err(PrivError::UidNotDropped {
@@ -163,6 +162,7 @@ mod illumos {
                     actual: uid,
                 });
             }
+            // SAFETY: getegid takes no argument and cannot fail.
             let gid = unsafe { libc::getegid() };
             if gid != run_as.gid {
                 return Err(PrivError::GidNotDropped {
@@ -207,12 +207,15 @@ mod illumos {
                     };
                     check(ret, step)?;
                 }
-                // SAFETY: setgid and setuid take one integer each.
                 Step::SetGid(gid) => {
-                    check(unsafe { libc::setgid(*gid) }, step)?
+                    // SAFETY: setgid takes one integer.
+                    let ret = unsafe { libc::setgid(*gid) };
+                    check(ret, step)?
                 }
                 Step::SetUid(uid) => {
-                    check(unsafe { libc::setuid(*uid) }, step)?
+                    // SAFETY: setuid takes one integer.
+                    let ret = unsafe { libc::setuid(*uid) };
+                    check(ret, step)?
                 }
                 Step::Verify(expected, run_as) => {
                     verify(expected, *run_as, step)?
