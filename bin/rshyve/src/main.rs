@@ -349,7 +349,20 @@ fn priv_request(cli: &Cli) -> anyhow::Result<PrivRequest> {
         .iter()
         .find(|spec| devspec::parts(spec).driver == "virtio-fs")
     {
-        anyhow::bail!("virtio-fs cannot run under the privilege lock; remove '-s {spec}'");
+        anyhow::bail!(
+            "virtio-fs cannot run under the privilege lock; remove '-s {spec}'"
+        );
+    }
+    // A MantaBlock disk connects to the engine socket again after an
+    // engine restart, and a connect needs file_write.
+    if let Some(spec) = cli.pci_slot.iter().find(|spec| {
+        let parts = devspec::parts(spec);
+        parts.driver == "nvme" && parts.config.starts_with("mantablock=")
+    }) {
+        anyhow::bail!(
+            "a MantaBlock disk cannot run under the privilege lock; \
+             remove '-s {spec}'"
+        );
     }
     let blockers: Vec<&str> = [
         ("--control-socket", cli.control_socket.is_some()),
@@ -862,13 +875,36 @@ mod tests {
         assert_eq!(witness_ids(&specs), vec!["virtio-blk@4"]);
     }
 
+    #[test]
+    fn a_mantablock_disk_is_refused_under_the_lock() {
+        let cli = Cli::try_parse_named(
+            "rshyve",
+            [
+                "rshyve",
+                "--priv-drop",
+                "-s",
+                "4,nvme,mantablock=/mb/e.sock,volume=6f1c2a4e-3b5d-4e7f-8a9b-0c1d2e3f4a5b",
+                "guest",
+            ],
+        )
+        .expect("argv parses");
+        let error = priv_request(&cli).expect_err("MantaBlock must be refused");
+        assert!(error.to_string().contains("MantaBlock"), "{error}");
+    }
+
     /// virtio-fs opens host files for the life of the VM, which the
     /// floor has no file_write for. firehyve refuses the same pair.
     #[test]
     fn virtio_fs_is_refused_under_the_lock() {
         let cli = Cli::try_parse_named(
             "rshyve",
-            ["rshyve", "--priv-drop", "-s", "5,virtio-fs,/export", "guest"],
+            [
+                "rshyve",
+                "--priv-drop",
+                "-s",
+                "5,virtio-fs,/export",
+                "guest",
+            ],
         )
         .expect("argv parses");
         let error = priv_request(&cli).expect_err("virtio-fs must be refused");
