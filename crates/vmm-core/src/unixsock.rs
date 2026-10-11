@@ -87,6 +87,12 @@ fn bind_owned(
         .recursive(true)
         .mode(dir_mode)
         .create(parent)?;
+    // Decided before the bind: on a secure path no other user can swap
+    // a step between the bind and the chown.
+    let give_to = match owner {
+        Some(owner) if trusted(parent)? => Some(owner),
+        _ => None,
+    };
 
     remove_stale_socket(path)?;
 
@@ -107,22 +113,13 @@ fn bind_owned(
 
     // SAFETY: geteuid takes no argument and cannot fail.
     let mut expected_uid = unsafe { libc::geteuid() };
-    if let Some(owner) = owner {
-        // The chown goes by path, so only where no other user can swap
-        // a path step between the bind and the chown. Elsewhere the
-        // socket keeps the binding identity.
-        let give = || -> io::Result<bool> {
-            if !trusted(parent)? {
-                return Ok(false);
-            }
-            lchown(path, Some(owner.uid), Some(owner.gid))?;
-            Ok(true)
-        };
-        match give() {
-            Ok(true) => expected_uid = owner.uid,
-            Ok(false) => {}
+    // Elsewhere the socket keeps the binding identity. The run-as
+    // identity also needs search on every directory of the path.
+    if let Some(owner) = give_to {
+        match lchown(path, Some(owner.uid), Some(owner.gid)) {
+            Ok(()) => expected_uid = owner.uid,
             // A zone's privilege floor has no file_chown. The socket then
-            // keeps the binding identity, as it does above.
+            // keeps the binding identity too.
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
             Err(error) => return Err(remove_after_error(path, error)),
         }
@@ -353,8 +350,15 @@ fn verify_bound_path(
     expected_mode: u32,
     expected_uid: u32,
 ) -> io::Result<()> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
+    // Not followed: a link swapped in after the bind is not our socket.
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => metadata,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is no longer the bound socket", path.display()),
+            ))
+        }
         Err(error) => return Err(remove_after_error(path, error)),
     };
     let actual_mode = metadata.permissions().mode() & 0o777;
