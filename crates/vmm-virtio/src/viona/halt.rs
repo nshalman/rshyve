@@ -246,8 +246,8 @@ impl Lifecycle for VirtioViona {
     /// release and then waits for the leases to break in an untimed
     /// `cv_wait` (`vmm_sol_dev.c`, `vmm_drv_purge`). Releasing the last
     /// hold first clears `VMM_HELD`, and the purge skips that wait
-    /// altogether. The order below is Propolis's: stop the poller, kill
-    /// the rings, then delete the link.
+    /// altogether. The order below is the upstream reference VMM's: stop
+    /// the poller, kill the rings, then delete the link.
     ///
     /// This call is not bounded. The delete waits for each ring worker
     /// to stop, and does not heed signals, so it must run on the

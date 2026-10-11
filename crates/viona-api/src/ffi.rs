@@ -143,7 +143,7 @@ pub struct vioc_ring_state {
 pub const VIONA_PROMISC_NONE: i32 = 0;
 pub const VIONA_PROMISC_MULTI: i32 = 1;
 pub const VIONA_PROMISC_ALL: i32 = 2;
-// VIONA_PROMISC_ALL_VLAN = 3 (Oxide falcon-specific, omitted)
+// VIONA_PROMISC_ALL_VLAN = 3 (specific to one vendor's platform, omitted)
 
 /// What traffic the link passes to the guest.
 ///

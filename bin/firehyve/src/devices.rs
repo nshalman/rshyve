@@ -41,11 +41,29 @@ const SUPPORTED: &[&str] = &[
 /// serial console and has no frame buffer, so the slots stay empty.
 /// Refusing them would mean an unmodified brand can never start this
 /// binary.
-///
-/// This list is for the startup argv only. `hotplug_factory` refuses
-/// these names, because a hot-add that reports success and attaches
-/// nothing would be a lie.
 const IGNORED: &[&str] = &["fbuf", "xhci"];
+
+/// Names that attach nothing: the chipset owns two of them and the
+/// brand's display devices are ignored. Neither reaches the registry.
+fn attaches_nothing(driver: &str) -> bool {
+    IGNORED.contains(&driver) || matches!(driver, "hostbridge" | "lpc")
+}
+
+/// The registry ids the argv must have produced, for the privilege
+/// lock's open-device witness.
+///
+/// Every spec that attaches a device opened its backing file to get
+/// into the registry, so an id missing there is a device not open.
+pub(crate) fn witness_ids(specs: &[String]) -> Vec<String> {
+    specs
+        .iter()
+        .filter(|spec| {
+            split_spec(spec)
+                .is_ok_and(|(_, driver, _)| !attaches_nothing(driver))
+        })
+        .map(|spec| devspec::device_id(spec))
+        .collect()
+}
 
 fn unsupported_driver(driver: &str) -> anyhow::Error {
     anyhow::anyhow!(
@@ -73,8 +91,7 @@ pub(crate) fn split_spec(spec: &str) -> anyhow::Result<(Bdf, &str, &str)> {
 /// caller fills the slots once the device registry is complete.
 ///
 /// Every attach here is the fallible one. The panicking `attach_device`
-/// would take the whole VM down through a poisoned bus lock, and this
-/// runs on a control thread as well as on the startup path.
+/// would take the whole VM down through a poisoned bus lock.
 pub(crate) fn create_pci_device(
     spec: &str,
     num_vcpus: u32,
@@ -195,45 +212,6 @@ pub(crate) fn create_pci_device(
     }
 }
 
-/// Refuse a spec that only the startup argv may carry.
-///
-/// Split out of the factory so the policy is testable without a live
-/// VM: everything here is decided from the spec string alone.
-fn check_hot_add(spec: &str) -> anyhow::Result<()> {
-    let (_, driver, _) = split_spec(spec)?;
-    // Accepted in the startup argv because the brand forces it there.
-    // Hot-add is firehyve's own interface, so a name that attaches
-    // nothing is refused instead of reported as added.
-    anyhow::ensure!(
-        !IGNORED.contains(&driver),
-        "firehyve cannot add '{driver}' at run time: it has no frame buffer"
-    );
-    // A vsock control slot is armed once, at startup. One added later
-    // would hand the guest a socket that answers nothing.
-    anyhow::ensure!(
-        driver != "virtio-vsock",
-        "virtio-vsock cannot be added at run time: its CONTROL slot is \
-         armed at startup"
-    );
-    Ok(())
-}
-
-/// The catalog closure, bound to this VM and handed to the hotplug
-/// engine.
-///
-/// SECURITY: the same closure the boot-time `-s` pass drives, so a
-/// control request can name no driver and no path that a command line
-/// could not. See the trust note in `crate::control`.
-pub(crate) fn hotplug_factory(num_cpus: u32) -> vmm_machine::HotplugFactory {
-    Box::new(move |spec, ctx| {
-        check_hot_add(spec)?;
-        let mut slots = Vec::new();
-        let created = create_pci_device(spec, num_cpus, ctx, &mut slots)?;
-        debug_assert!(slots.is_empty(), "only vsock yields a control slot");
-        Ok(created)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,24 +272,27 @@ mod tests {
         }
     }
 
-    /// The startup relaxation must not reach hot-add. A hot-add that
-    /// reports success and attaches nothing would be a lie.
-    ///
-    /// Mutation this kills: dropping either guard from `check_hot_add`.
+    /// The lock's witness reads the ids the registry will hold, so a
+    /// name that attaches nothing must not be expected there.
     #[test]
-    fn a_display_device_is_still_refused_at_run_time() {
-        for driver in IGNORED {
-            let spec = format!("6,{driver}");
-            let err = check_hot_add(&spec)
-                .expect_err("an ignored startup name must not be hot-added");
-            assert!(err.to_string().contains(driver), "{driver}: {err}");
-        }
+    fn the_witness_expects_every_device_that_attaches() {
+        let specs: Vec<String> = [
+            "0,hostbridge",
+            "4,virtio-blk,/tmp/d.img",
+            "7,virtio-net-viona,net0",
+            "17,virtio-vsock,/tmp/v.sock,cid=3",
+            "30:0,fbuf,vga=off",
+            "30:1,xhci,tablet",
+            "31,lpc",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
-        let err = check_hot_add("6,virtio-vsock,/tmp/v.sock")
-            .expect_err("a vsock CONTROL slot is armed at startup only");
-        assert!(err.to_string().contains("CONTROL"), "{err}");
-
-        check_hot_add("6,virtio-rnd").expect("a real device is addable");
+        assert_eq!(
+            witness_ids(&specs),
+            vec!["virtio-blk@4", "virtio-net-viona@7", "virtio-vsock@17"]
+        );
     }
 
     #[test]

@@ -6,12 +6,12 @@
 #
 # Regenerate with: tools/check-safety-comments.py --write
 
-bin/rshyve 13
+bin/rshyve 1
 crates/bhyve-api 6
 crates/dladm 5
 crates/viona-api 1
 crates/vmm-boot 1
-crates/vmm-core 65
+crates/vmm-core 61
 crates/vmm-hid 2
 crates/vmm-hyperv 1
 crates/vmm-migrate 2

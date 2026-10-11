@@ -6,19 +6,22 @@
 //! accept loop every listener in this workspace runs.
 
 pub mod accept;
+pub mod peercred;
 
 use std::fs::{self, DirBuilder, Permissions};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::{
-    DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt,
+    lchown, DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt,
 };
+
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::poll::wait_writable;
+use peercred::ListenerOwner;
 
 static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
@@ -45,21 +48,83 @@ impl Default for SocketPolicy {
 /// [`remove_stale_socket`] for what else may be at the path. Any failure
 /// after the socket is bound removes the socket path before the error
 /// is returned.
+///
+/// When the process peer policy names an owner, the socket is given to
+/// it here, before the privilege drop that policy describes, so a peer
+/// running as that identity can connect. See [`secure_chain`] for where.
+/// The dropped process has no `file_write`, so it cannot unlink or
+/// rebind it; the next start clears a stale socket.
 pub fn bind_restricted(
     path: &Path,
     policy: SocketPolicy,
+) -> io::Result<UnixListener> {
+    bind_owned(path, policy, peercred::policy().owner, secure_chain)
+}
+
+/// [`bind_restricted`] with the owner given, so the chown can be tested
+/// without installing a process-wide policy.
+fn bind_owned(
+    path: &Path,
+    policy: SocketPolicy,
+    owner: Option<ListenerOwner>,
+    trusted: impl Fn(&Path) -> Option<PathBuf>,
 ) -> io::Result<UnixListener> {
     let _guard = UMASK_LOCK
         .lock()
         .map_err(|_| io::Error::other("socket umask lock poisoned"))?;
 
-    if let Some(parent) = path
+    let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        let mut builder = DirBuilder::new();
-        builder.recursive(true).mode(policy.dir_mode);
-        builder.create(parent)?;
+        .unwrap_or(Path::new("."));
+    // A directory made for an owner stays ours: the owner only needs to
+    // search it to connect, and one it owned could hide a swap.
+    let dir_mode = match owner {
+        Some(_) => policy.dir_mode | 0o011,
+        None => policy.dir_mode,
+    };
+    // For an owner only the last directory is made, with one mkdir, so
+    // `created` is exact and no directory above it is left unsearchable.
+    let created = match owner {
+        Some(_) => match DirBuilder::new().mode(dir_mode).create(parent) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("{}: {error}", parent.display()),
+                ))
+            }
+        },
+        None => {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(dir_mode)
+                .create(parent)?;
+            false
+        }
+    };
+    // Decided before the bind: on a secure path no other user can swap
+    // a step between the bind and the chown. Every step after this one
+    // uses the canonical path that was checked, so a link resolved here
+    // is not resolved again.
+    let secure = owner.and_then(|_| trusted(parent));
+    let give_to = secure.as_ref().and(owner);
+    let checked;
+    let path = match &secure {
+        Some(dir) => {
+            let name = path.file_name().ok_or_else(|| {
+                io::Error::other(format!("{} names no socket", path.display()))
+            })?;
+            checked = dir.join(name);
+            checked.as_path()
+        }
+        None => path,
+    };
+    // The umask can take the search bits off a directory made here.
+    // Set by path, so only on a secure one.
+    if let (Some(dir), true) = (&secure, created) {
+        fs::set_permissions(dir, Permissions::from_mode(dir_mode))?;
     }
 
     remove_stale_socket(path)?;
@@ -67,6 +132,7 @@ pub fn bind_restricted(
     // SAFETY: `umask` only reads its argument and returns the old mask.
     let old_umask = unsafe { libc::umask(socket_umask(policy.mode)) };
     let result = UnixListener::bind(path);
+    // SAFETY: `umask` only reads its argument and returns the old mask.
     unsafe {
         libc::umask(old_umask);
     }
@@ -78,8 +144,75 @@ pub fn bind_restricted(
         return Err(remove_after_error(path, error));
     }
 
-    verify_bound_path(path, policy.mode, unsafe { libc::geteuid() })?;
+    // SAFETY: geteuid takes no argument and cannot fail.
+    let mut expected_uid = unsafe { libc::geteuid() };
+    // Elsewhere the socket keeps the binding identity. The run-as
+    // identity also needs search on every directory of the path.
+    if let Some(owner) = give_to {
+        match lchown(path, Some(owner.uid), Some(owner.gid)) {
+            Ok(()) => expected_uid = owner.uid,
+            // A zone's privilege floor has no file_chown. The socket then
+            // keeps the binding identity too.
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(error) => return Err(remove_after_error(path, error)),
+        }
+    }
+
+    verify_bound_path(path, policy.mode, expected_uid)?;
     Ok(listener)
+}
+
+/// The canonical form of `dir` when no user but root and this one can
+/// change any step of it. Anything that cannot be read is not secure.
+fn secure_chain(dir: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(dir).ok()?;
+    // SAFETY: geteuid takes no argument and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    // From the root down, the ACL before the mode: a step is trusted
+    // only once every step above it is.
+    let steps: Vec<&Path> = canonical.ancestors().collect();
+    for step in steps.into_iter().rev() {
+        if !acl_trivial(step).ok()? {
+            return None;
+        }
+        let meta = fs::symlink_metadata(step).ok()?;
+        if !secure_step(meta.uid(), meta.mode(), euid) {
+            return None;
+        }
+    }
+    Some(canonical)
+}
+
+/// Whether `step` has no ACL beyond its mode bits. A ZFS ACL can let
+/// another user add or remove entries that the mode does not show.
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+fn acl_trivial(step: &Path) -> io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    #[link(name = "sec")]
+    unsafe extern "C" {
+        #[link_name = "acl_trivial"]
+        fn libsec_acl_trivial(path: *const libc::c_char) -> libc::c_int;
+    }
+    let c_path = std::ffi::CString::new(step.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("a path with a NUL byte"))?;
+    // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
+    match unsafe { libsec_acl_trivial(c_path.as_ptr()) } {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Only illumos ACLs are read; elsewhere the mode bits decide.
+#[cfg(not(any(target_os = "illumos", target_os = "solaris")))]
+fn acl_trivial(_step: &Path) -> io::Result<bool> {
+    Ok(true)
+}
+
+/// Owned by root or by us, and writable by nobody else. A sticky
+/// directory is not enough: another user can make the next step in it.
+fn secure_step(uid: u32, mode: u32, euid: u32) -> bool {
+    (uid == 0 || uid == euid) && mode & 0o022 == 0
 }
 
 /// The umask that keeps the socket within `mode` between its `bind`
@@ -257,7 +390,7 @@ const SEND_NOWAIT: libc::c_int = 0;
 
 /// Send what the socket will take now.
 fn send_nowait(fd: BorrowedFd<'_>, data: &[u8]) -> io::Result<usize> {
-    // Safety: `data` is a live slice for the length passed.
+    // SAFETY: `data` is a live slice for the length passed.
     let sent = unsafe {
         libc::send(
             fd.as_raw_fd(),
@@ -277,8 +410,15 @@ fn verify_bound_path(
     expected_mode: u32,
     expected_uid: u32,
 ) -> io::Result<()> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
+    // Not followed: a link swapped in after the bind is not our socket.
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => metadata,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is no longer the bound socket", path.display()),
+            ))
+        }
         Err(error) => return Err(remove_after_error(path, error)),
     };
     let actual_mode = metadata.permissions().mode() & 0o777;
@@ -472,6 +612,145 @@ mod tests {
         assert_eq!(mode, 0o700);
     }
 
+    /// The identity to give a socket to in a test: a real second id
+    /// when the test runs as root, and otherwise the test's own, which
+    /// still runs the chown and the verify against the owner.
+    fn test_owner() -> ListenerOwner {
+        // SAFETY: geteuid and getegid take no argument and cannot fail.
+        let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        if euid == 0 {
+            ListenerOwner {
+                uid: 8123,
+                gid: 8123,
+            }
+        } else {
+            ListenerOwner {
+                uid: euid,
+                gid: egid,
+            }
+        }
+    }
+
+    fn trust_all(dir: &Path) -> Option<PathBuf> {
+        fs::canonicalize(dir).ok()
+    }
+
+    fn trust_none(_: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    /// The socket belongs to the identity the process will drop to. Its
+    /// directory stays ours, searchable so that identity can connect.
+    #[test]
+    fn an_owner_takes_the_socket_and_can_reach_it() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let parent = temp.path().join("private");
+        let path = parent.join("control.sock");
+        let owner = test_owner();
+
+        let _listener =
+            bind_owned(&path, SocketPolicy::default(), Some(owner), trust_all)
+                .expect("bind with an owner");
+
+        let socket = fs::metadata(&path).expect("stat socket");
+        assert_eq!(socket.uid(), owner.uid);
+        assert_eq!(socket.gid(), owner.gid);
+        assert_eq!(socket.permissions().mode() & 0o777, 0o600);
+        let dir = fs::metadata(&parent).expect("stat parent directory");
+        // SAFETY: geteuid takes no argument and cannot fail.
+        assert_eq!(dir.uid(), unsafe { libc::geteuid() });
+        assert_eq!(dir.permissions().mode() & 0o011, 0o011);
+    }
+
+    /// Where the path is not safe from other users, the socket keeps
+    /// the binding identity.
+    #[test]
+    fn an_untrusted_path_keeps_the_binding_identity() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("control.sock");
+
+        let _listener = bind_owned(
+            &path,
+            SocketPolicy::default(),
+            Some(test_owner()),
+            trust_none,
+        )
+        .expect("bind with an owner");
+
+        let socket = fs::metadata(&path).expect("stat socket");
+        // SAFETY: geteuid takes no argument and cannot fail.
+        assert_eq!(socket.uid(), unsafe { libc::geteuid() });
+    }
+
+    #[test]
+    fn only_steps_no_one_else_can_write_are_secure() {
+        assert!(secure_step(0, 0o40755, 1000), "root's");
+        assert!(secure_step(1000, 0o40700, 1000), "ours");
+        assert!(!secure_step(0, 0o41777, 0), "a sticky /tmp");
+        assert!(!secure_step(1000, 0o40755, 0), "another owner");
+        assert!(!secure_step(0, 0o40775, 0), "group writable");
+    }
+
+    #[test]
+    fn an_owner_needs_the_directories_above_to_exist() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("a").join("b").join("control.sock");
+        bind_owned(
+            &path,
+            SocketPolicy::default(),
+            Some(test_owner()),
+            trust_all,
+        )
+        .expect_err("a missing directory above");
+        assert!(!temp.path().join("a").exists());
+    }
+
+    #[test]
+    fn the_root_directory_has_a_trivial_acl() {
+        assert!(acl_trivial(Path::new("/")).expect("read the ACL"));
+    }
+
+    /// A socket reached through a link is bound and given away at the
+    /// canonical path that was checked.
+    #[test]
+    fn a_trusted_path_is_used_in_its_canonical_form() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let target = temp.path().join("target");
+        fs::create_dir(&target).expect("create the target");
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+        let owner = test_owner();
+
+        let _listener = bind_owned(
+            &link.join("control.sock"),
+            SocketPolicy::default(),
+            Some(owner),
+            trust_all,
+        )
+        .expect("bind through the link");
+
+        let socket = fs::symlink_metadata(target.join("control.sock"))
+            .expect("bound in the target");
+        assert!(socket.file_type().is_socket());
+        assert_eq!(socket.uid(), owner.uid);
+    }
+
+    /// Without an owner the bind leaves the process's own ids, so a
+    /// binary that never drops changes nothing it did not create.
+    #[test]
+    fn no_owner_keeps_the_binding_identity() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("control.sock");
+
+        let _listener =
+            bind_owned(&path, SocketPolicy::default(), None, trust_all)
+                .expect("bind without an owner");
+
+        let socket = fs::metadata(&path).expect("stat socket");
+        // SAFETY: geteuid takes no argument and cannot fail.
+        assert_eq!(socket.uid(), unsafe { libc::geteuid() });
+    }
+
     #[test]
     fn bind_removes_stale_socket() {
         let temp = tempfile::tempdir().expect("create temporary directory");
@@ -554,6 +833,7 @@ mod tests {
             .expect("set deliberately unsafe mode");
 
         let result =
+            // SAFETY: geteuid takes no argument and cannot fail.
             verify_bound_path(&path, 0o600, unsafe { libc::geteuid() });
 
         assert!(result.is_err());

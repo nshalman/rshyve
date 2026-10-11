@@ -12,6 +12,10 @@
 //! (uts/common/io/tl.c), which leaves the accept thread asleep. So the
 //! listener is non-blocking and the loop polls it on a tick,
 //! re-reading the shutdown flag each time.
+//!
+//! Every accepted socket is checked against the process peer policy
+//! (`peercred`) before a caller sees it. The socket's mode is the first
+//! gate; this is the second, and it is the one that names the zone.
 
 use std::io;
 use std::net::Shutdown;
@@ -20,6 +24,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use super::peercred;
 use crate::poll::{wait_readable, Readiness};
 use slog::{debug, warn, Logger};
 
@@ -72,6 +77,7 @@ pub fn accept_loop(
     }
 
     let mut reported = false;
+    let mut refused_reported = false;
     while !shutdown.load(Ordering::Acquire) {
         match wait_readable(listener.as_fd(), ACCEPT_POLL) {
             Readiness::Readable => {}
@@ -106,6 +112,21 @@ pub fn accept_loop(
                 continue;
             }
         };
+        // A refused peer already passed the socket's DAC, so it is
+        // this uid or root. It is logged once per run of refusals, so
+        // a peer that reconnects in a loop cannot drive the log.
+        match peercred::admit(&stream) {
+            Ok(_) => refused_reported = false,
+            Err(refusal) => {
+                if !refused_reported {
+                    warn!(log, "refused a peer";
+                        "socket" => who, "reason" => %refusal);
+                    refused_reported = true;
+                }
+                let _ = stream.shutdown(Shutdown::Both);
+                continue;
+            }
+        }
         if let Some(stream) = accepted_blocking(stream) {
             on_client(stream);
         }

@@ -118,6 +118,7 @@ impl VirtioVsock {
             readers: Mutex::new(Default::default()),
             shutdown: Arc::new(AtomicBool::new(false)),
             gate: Arc::new(QuiesceGate::new(0)),
+            warned_no_connects: AtomicBool::new(false),
             log,
         });
 

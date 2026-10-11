@@ -24,8 +24,8 @@ use slog::{info, warn, Logger};
 use vmm_migrate::MigrationPhase;
 
 use super::listener::{
-    authorized, read_request, serve_connections, write_error_response,
-    write_response, WRITE_TIMEOUT,
+    read_request, serve_connections, write_error_response, write_response,
+    WRITE_TIMEOUT,
 };
 use super::protocol::{Command, Response};
 use super::{ControlError, ControlListener, VmRunState};
@@ -189,7 +189,7 @@ fn probe_queued(listener: &UnixListener, me: u32) -> bool {
         let Ok((conn, _)) = listener.accept() else {
             return false;
         };
-        if crate::peercred::peer_pid(&conn).ok() == Some(me) {
+        if vmm_core::unixsock::peercred::peer_pid(&conn).ok() == Some(me) {
             return true;
         }
     }
@@ -277,9 +277,7 @@ fn handle<P>(
 where
     P: Fn() -> MigrationPhase,
 {
-    if !authorized(stream, log)? {
-        return Ok(());
-    }
+    // The accept loop already applied the process peer policy.
     let mut reader = BufReader::new(stream);
     let mut request = Vec::with_capacity(256);
     loop {
