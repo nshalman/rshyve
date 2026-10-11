@@ -1608,6 +1608,7 @@ dependencies = [
  "bhyve_api",
  "bitflags",
  "libc",
+ "rustix",
  "slog",
  "tempfile",
  "thiserror 1.0.69",

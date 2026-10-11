@@ -10,11 +10,17 @@ pub mod peercred;
 
 use std::fs::{self, DirBuilder, Permissions};
 use std::io;
+use std::os::fd::OwnedFd;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::{
-    fchown, lchown, DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt,
-    PermissionsExt,
+    DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt,
 };
+
+use rustix::fs::{
+    chownat, fchown, fstat, mkdirat, openat, statat, AtFlags, FileType, Gid,
+    Mode, OFlags, Stat, Uid, CWD,
+};
+use rustix::io::Errno;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Mutex;
@@ -72,40 +78,21 @@ fn bind_owned(
         .lock()
         .map_err(|_| io::Error::other("socket umask lock poisoned"))?;
 
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    let mut created_parent = false;
-    if let Some(parent) = parent {
-        if let Some(above) = parent
-            .parent()
-            .filter(|above| !above.as_os_str().is_empty())
-        {
-            // A directory made here stays the binding identity's, which
-            // the owner could not search through to reach the socket.
-            if owner.is_some() && !above.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "{} must exist before a socket is given to the \
-                         run-as identity",
-                        above.display()
-                    ),
-                ));
+    let given = match owner {
+        Some(owner) => Some(open_socket_dir(path, policy, owner)?),
+        None => {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                DirBuilder::new()
+                    .recursive(true)
+                    .mode(policy.dir_mode)
+                    .create(parent)?;
             }
-            DirBuilder::new()
-                .recursive(true)
-                .mode(policy.dir_mode)
-                .create(above)?;
+            None
         }
-        // One mkdir, so "created" is exact: it fails on anything already
-        // at the path, a symlink included.
-        match DirBuilder::new().mode(policy.dir_mode).create(parent) {
-            Ok(()) => created_parent = true,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
+    };
 
     remove_stale_socket(path)?;
 
@@ -126,24 +113,10 @@ fn bind_owned(
 
     // SAFETY: geteuid takes no argument and cannot fail.
     let mut expected_uid = unsafe { libc::geteuid() };
-    if let Some(owner) = owner {
-        // The directory first: a socket the owner holds in a directory
-        // it cannot write is still one it cannot unlink. The socket is
-        // chowned without following: the stale-socket check above
-        // refused a symlink, and this keeps it refused.
-        let give = || -> io::Result<()> {
-            // Only a directory this bind made changes hands: a shared
-            // parent given away would let the owner unlink what other
-            // processes keep there.
-            if created_parent {
-                if let Some(parent) = parent {
-                    give_created_dir(parent, owner)?;
-                }
-            }
-            lchown(path, Some(owner.uid), Some(owner.gid))
-        };
-        match give() {
-            Ok(()) => expected_uid = owner.uid,
+    if let (Some(owner), Some(dir)) = (owner, given) {
+        match give_socket(&dir, path, owner) {
+            Ok(true) => expected_uid = owner.uid,
+            Ok(false) => {}
             // A zone's privilege floor has no file_chown. The socket then
             // keeps the binding identity, and the launcher gives the
             // directory to the owner before boot.
@@ -156,46 +129,124 @@ fn bind_owned(
     Ok(listener)
 }
 
-/// Give the directory this bind made to `owner`, through a descriptor
-/// that did not follow a link.
+/// The directory a socket given to an owner is bound in, held open so
+/// every later step acts on it and not on a path that can be swapped.
+struct SocketDir {
+    fd: OwnedFd,
+    /// No other user can add, rename or remove entries in it.
+    trusted: bool,
+}
+
+/// Open the socket's directory, making it if it is missing, and give a
+/// directory made here to `owner`.
 ///
-/// Only from a container no other user can rename entries in: in any
-/// other, a directory of ours could be swapped in after the mkdir and
-/// given away instead. A link fails the open, and a directory of
-/// another owner fails the check.
-fn give_created_dir(dir: &Path, owner: ListenerOwner) -> io::Result<()> {
+/// Every step after the first open goes through a descriptor, so a path
+/// component swapped later changes nothing. Only the last directory is
+/// made: one made above it would stay the binding identity's, which the
+/// owner could not search through to reach the socket. A made directory
+/// is given away only from a container no other user can rename entries
+/// in, or one of ours could be swapped in after the mkdir.
+fn open_socket_dir(
+    path: &Path,
+    policy: SocketPolicy,
+    owner: ListenerOwner,
+) -> io::Result<SocketDir> {
     // SAFETY: geteuid takes no argument and cannot fail.
     let euid = unsafe { libc::geteuid() };
-    let above = dir
+    let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let parent = path
         .parent()
-        .filter(|above| !above.as_os_str().is_empty())
+        .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let container = fs::metadata(above)?;
-    if !private_dir(container.uid(), container.mode(), euid) {
+    let (Some(above), Some(name)) = (
+        parent
+            .parent()
+            .filter(|above| !above.as_os_str().is_empty()),
+        parent.file_name(),
+    ) else {
+        let fd = openat(CWD, parent, dir_flags, Mode::empty())?;
+        let trusted = private_dir(&fstat(&fd)?, euid);
+        return Ok(SocketDir { fd, trusted });
+    };
+    let above = openat(CWD, above, dir_flags, Mode::empty())?;
+    let created =
+        match mkdirat(&above, name, Mode::from_raw_mode(policy.dir_mode)) {
+            Ok(()) => true,
+            Err(Errno::EXIST) => false,
+            Err(error) => return Err(error.into()),
+        };
+    let fd = openat(&above, name, dir_flags | OFlags::NOFOLLOW, Mode::empty())
+        .map_err(|error| {
+            io::Error::new(
+                io::Error::from(error).kind(),
+                format!("{} is not a plain directory", parent.display()),
+            )
+        })?;
+    let stat = fstat(&fd)?;
+    let trusted = if created {
+        private_dir(&fstat(&above)?, euid) && stat.st_uid == euid
+    } else {
+        private_dir(&stat, euid)
+    };
+    if created && trusted {
+        match fchown(&fd, Some(uid(owner.uid)), Some(gid(owner.gid))) {
+            Ok(()) => {}
+            Err(Errno::PERM) | Err(Errno::ACCESS) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(SocketDir { fd, trusted })
+}
+
+/// Give the socket just bound to `owner`. False when its directory is
+/// one another user could swap the socket in: it then stays ours.
+fn give_socket(
+    dir: &SocketDir,
+    path: &Path,
+    owner: ListenerOwner,
+) -> io::Result<bool> {
+    if !dir.trusted {
+        return Ok(false);
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("the socket path has no name"))?;
+    let stat = statat(&dir.fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    // SAFETY: geteuid takes no argument and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Socket
+        || stat.st_uid != euid
+    {
         return Err(io::Error::other(format!(
-            "{} is writable by another user, so {} cannot be given away \
-             safely",
-            above.display(),
-            dir.display()
+            "{} is not the socket this bind made",
+            path.display()
         )));
     }
-    let handle = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(dir)?;
-    let meta = handle.metadata()?;
-    if !meta.is_dir() || meta.uid() != euid {
-        return Err(io::Error::other(format!(
-            "{} is not the directory this bind made",
-            dir.display()
-        )));
-    }
-    fchown(&handle, Some(owner.uid), Some(owner.gid))
+    chownat(
+        &dir.fd,
+        name,
+        Some(uid(owner.uid)),
+        Some(gid(owner.gid)),
+        AtFlags::SYMLINK_NOFOLLOW,
+    )?;
+    Ok(true)
+}
+
+fn uid(raw: u32) -> Uid {
+    Uid::from_raw(raw)
+}
+
+fn gid(raw: u32) -> Gid {
+    Gid::from_raw(raw)
 }
 
 /// Ours, and writable only by us or sticky. In a sticky directory no
 /// other user can rename or remove our entries.
-fn private_dir(uid: u32, mode: u32, euid: u32) -> bool {
+fn private_dir(stat: &Stat, euid: u32) -> bool {
+    private_mode(stat.st_uid, stat.st_mode, euid)
+}
+
+fn private_mode(uid: u32, mode: u32, euid: u32) -> bool {
     uid == euid && (mode & 0o022 == 0 || mode & 0o1000 != 0)
 }
 
@@ -650,11 +701,11 @@ mod tests {
 
     #[test]
     fn only_a_container_no_one_else_can_rename_in_is_trusted() {
-        assert!(private_dir(0, 0o40755, 0));
-        assert!(private_dir(0, 0o41777, 0), "a sticky /tmp");
-        assert!(!private_dir(1000, 0o40755, 0), "another owner");
-        assert!(!private_dir(0, 0o40777, 0), "world writable, not sticky");
-        assert!(!private_dir(0, 0o40775, 0), "group writable");
+        assert!(private_mode(0, 0o40755, 0));
+        assert!(private_mode(0, 0o41777, 0), "a sticky /tmp");
+        assert!(!private_mode(1000, 0o40755, 0), "another owner");
+        assert!(!private_mode(0, 0o40777, 0), "world writable, not sticky");
+        assert!(!private_mode(0, 0o40775, 0), "group writable");
     }
 
     #[test]
@@ -676,8 +727,13 @@ mod tests {
         let parent = temp.path().join("link");
         std::os::unix::fs::symlink(&target, &parent).expect("link");
 
-        give_created_dir(&parent, test_owner())
-            .expect_err("a link is not followed");
+        bind_owned(
+            &parent.join("control.sock"),
+            SocketPolicy::default(),
+            Some(test_owner()),
+        )
+        .expect_err("a link is not followed");
+        assert!(!target.join("control.sock").exists());
     }
 
     /// Without an owner the bind leaves the process's own ids, so a
