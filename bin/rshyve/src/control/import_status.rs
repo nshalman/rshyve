@@ -118,21 +118,40 @@ fn bind(path: &Path, home: &Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Refuse a parent that no longer resolves to `home`.
+/// Refuse a parent that no longer resolves to `home`, or that another
+/// user could put a socket in.
 fn at_home(path: &Path, home: &Path) -> std::io::Result<()> {
     let real = resolved_parent(path)?;
-    if real == home {
-        return Ok(());
+    if real != home {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} now resolves to {}, not {}",
+                path.display(),
+                real.display(),
+                home.display()
+            ),
+        ));
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        format!(
-            "{} now resolves to {}, not {}",
-            path.display(),
-            real.display(),
-            home.display()
-        ),
-    ))
+    let meta = std::fs::metadata(&real)?;
+    // SAFETY: geteuid takes no argument and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !private_home(meta.uid(), meta.mode(), euid) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a directory only this user controls",
+                real.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Ours, and writable only by us or sticky. The zone's /tmp is the
+/// sticky case: another user there cannot remove or rename our socket.
+fn private_home(uid: u32, mode: u32, euid: u32) -> bool {
+    uid == euid && (mode & 0o022 == 0 || mode & 0o1000 != 0)
 }
 
 /// Where the directory that holds `path` really is.
@@ -451,7 +470,7 @@ mod tests {
         std::fs::create_dir(&elsewhere).expect("dir");
         let link = dir.path().join("run");
         std::os::unix::fs::symlink(&elsewhere, &link).expect("link");
-        let log = slog::Logger::root(slog::Discard, slog::o!());
+        let log = Logger::root(slog::Discard, slog::o!());
         let refused = spawn_import_status(
             &link.join("rs.sock"),
             || MigrationPhase::Sync,
@@ -459,6 +478,15 @@ mod tests {
         );
         assert!(refused.is_err());
         assert!(!elsewhere.join("rs.sock").exists());
+    }
+
+    #[test]
+    fn only_a_home_this_user_controls_is_taken() {
+        assert!(private_home(0, 0o40700, 0));
+        assert!(private_home(0, 0o41777, 0), "a sticky /tmp");
+        assert!(!private_home(1000, 0o40700, 0), "another owner");
+        assert!(!private_home(0, 0o40777, 0), "world writable, not sticky");
+        assert!(!private_home(0, 0o40770, 0), "group writable");
     }
 
     #[test]
