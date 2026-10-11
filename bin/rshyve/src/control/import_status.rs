@@ -56,6 +56,14 @@ where
             .recursive(true)
             .mode(0o700)
             .create(parent)?;
+        // A link here would make its target the home every later bind
+        // is held to.
+        if std::fs::symlink_metadata(parent)?.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} is a symbolic link", parent.display()),
+            ));
+        }
     }
     let home = resolved_parent(path)?;
     let first = bind(path, &home)?;
@@ -93,28 +101,38 @@ where
 /// received zone root planted), is refused, so the bind cannot be sent
 /// elsewhere.
 fn bind(path: &Path, home: &Path) -> std::io::Result<UnixListener> {
-    let real = resolved_parent(path)?;
-    if real != home {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "{} now resolves to {}, not {}",
-                path.display(),
-                real.display(),
-                home.display()
-            ),
-        ));
-    }
+    at_home(path, home)?;
     match std::fs::symlink_metadata(path) {
         // remove_dir_all does not follow links inside the tree.
         Ok(m) if m.is_dir() => std::fs::remove_dir_all(path)?,
         Ok(_) => std::fs::remove_file(path)?,
         Err(_) => {}
     }
-    vmm_core::unixsock::bind_restricted(
+    let listener = vmm_core::unixsock::bind_restricted(
         path,
         vmm_core::unixsock::SocketPolicy::default(),
-    )
+    )?;
+    // Again after the bind: a parent swapped in between sent it
+    // elsewhere.
+    at_home(path, home)?;
+    Ok(listener)
+}
+
+/// Refuse a parent that no longer resolves to `home`.
+fn at_home(path: &Path, home: &Path) -> std::io::Result<()> {
+    let real = resolved_parent(path)?;
+    if real == home {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "{} now resolves to {}, not {}",
+            path.display(),
+            real.display(),
+            home.display()
+        ),
+    ))
 }
 
 /// Where the directory that holds `path` really is.
@@ -133,10 +151,30 @@ fn ours(path: &Path, listener: &UnixListener) -> Option<(u64, u64)> {
     let before = named(path)?;
     let probe = UnixStream::connect(path).ok()?;
     listener.set_nonblocking(true).ok()?;
-    let reached = listener.accept().is_ok();
+    let reached = probe_queued(listener, std::process::id());
     listener.set_nonblocking(false).ok()?;
     drop(probe);
     (reached && named(path) == Some(before)).then_some(before)
+}
+
+/// The most connections one probe check takes off the queue.
+const PROBE_ACCEPTS: usize = 64;
+
+/// Whether a connection from process `me` is queued on `listener`.
+///
+/// A connection queued before the path was swapped can come first, and
+/// its peer can relay whatever the probe sends, so only the peer's pid
+/// tells the probe apart. Every other connection taken here is dropped.
+fn probe_queued(listener: &UnixListener, me: u32) -> bool {
+    for _ in 0..PROBE_ACCEPTS {
+        let Ok((conn, _)) = listener.accept() else {
+            return false;
+        };
+        if crate::peercred::peer_pid(&conn).ok() == Some(me) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The file `path` names now, if any.
@@ -389,6 +427,38 @@ mod tests {
         std::fs::remove_file(&path).expect("unlink");
         let _theirs = UnixListener::bind(&path).expect("theirs");
         assert!(ours(&path, &mine).is_none());
+    }
+
+    #[test]
+    fn a_connection_from_another_process_is_not_the_probe() {
+        // A peer that queued first and relays the probe's bytes still
+        // has its own pid.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rs.sock");
+        let home = resolved_parent(&path).expect("home");
+        let listener = bind(&path, &home).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let _queued = UnixStream::connect(&path).expect("connect");
+        assert!(!probe_queued(&listener, std::process::id() + 1));
+        let _probe = UnixStream::connect(&path).expect("connect");
+        assert!(probe_queued(&listener, std::process::id()));
+    }
+
+    #[test]
+    fn a_parent_that_is_a_link_is_refused_at_the_first_bind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("dir");
+        let link = dir.path().join("run");
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("link");
+        let log = slog::Logger::root(slog::Discard, slog::o!());
+        let refused = spawn_import_status(
+            &link.join("rs.sock"),
+            || MigrationPhase::Sync,
+            log,
+        );
+        assert!(refused.is_err());
+        assert!(!elsewhere.join("rs.sock").exists());
     }
 
     #[test]

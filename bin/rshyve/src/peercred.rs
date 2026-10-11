@@ -110,6 +110,97 @@ pub fn peer_cred(_stream: &UnixStream) -> io::Result<PeerCred> {
     ))
 }
 
+/// The pid of the process at the other end of `stream`.
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+pub fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: getpeerucred allocates the credential into `raw`, which
+    // is freed below on every path that set it.
+    let result = unsafe { libc::getpeerucred(stream.as_raw_fd(), &mut raw) };
+    if result != 0 || raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a live credential from getpeerucred, freed once
+    // here after its last use.
+    let pid = unsafe {
+        let pid = libc::ucred_getpid(raw);
+        libc::ucred_free(raw);
+        pid
+    };
+    u32::try_from(pid).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "the peer has no pid")
+    })
+}
+
+/// The pid of the process at the other end of `stream`.
+#[cfg(target_os = "linux")]
+pub fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
+    let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut len = size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` and `len` describe a buffer of the size the
+    // kernel writes for SO_PEERCRED.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len as usize != size_of::<libc::ucred>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_PEERCRED returned an unexpected credential size",
+        ));
+    }
+    // SAFETY: the kernel filled the whole struct, checked above.
+    let cred = unsafe { cred.assume_init() };
+    u32::try_from(cred.pid).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "the peer has no pid")
+    })
+}
+
+/// The pid of the process at the other end of `stream`.
+#[cfg(target_os = "macos")]
+pub fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
+    let mut pid: libc::pid_t = 0;
+    let mut len = size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: `pid` and `len` describe a buffer of the size the kernel
+    // writes for LOCAL_PEERPID.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            std::ptr::addr_of_mut!(pid).cast(),
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    u32::try_from(pid).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "the peer has no pid")
+    })
+}
+
+#[cfg(not(any(
+    target_os = "illumos",
+    target_os = "solaris",
+    target_os = "linux",
+    target_os = "macos",
+)))]
+pub fn peer_pid(_stream: &UnixStream) -> io::Result<u32> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Unix peer credentials are unsupported on this platform",
+    ))
+}
+
 #[cfg(any(target_os = "illumos", target_os = "solaris"))]
 pub fn process_zoneid() -> io::Result<Option<i32>> {
     unsafe extern "C" {
