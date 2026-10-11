@@ -362,6 +362,32 @@ pub struct Cli {
     #[arg(long)]
     pub hotplug: bool,
 
+    /// Lock the privilege sets to file_read once every device is open,
+    /// then drop to --run-as-uid/--run-as-gid.
+    ///
+    /// `--priv-drop` alone means on; `--priv-drop=false` means off.
+    /// rshyve defaults off and logs which it did. firehyve always
+    /// drops and refuses `=false`. The value needs `=`, because the
+    /// zone brand puts the VM name right after its extra options and
+    /// a bare flag would swallow it.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
+    pub priv_drop: Option<bool>,
+
+    /// The numeric uid to run as after the privilege lock. Both ids or
+    /// neither; the sandbox default is 8123, which has no passwd entry.
+    #[arg(long)]
+    pub run_as_uid: Option<u32>,
+
+    /// The numeric gid to run as after the privilege lock.
+    #[arg(long)]
+    pub run_as_gid: Option<u32>,
+
     /// VM name
     pub vm_name: String,
 }
@@ -523,6 +549,35 @@ impl Cli {
             || self
                 .config_opt(OPT_USE_RESERVOIR)
                 .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    }
+
+    /// Whether to lock privileges, with the binary's own default.
+    pub fn priv_drop_or(&self, default: bool) -> bool {
+        self.priv_drop.unwrap_or(default)
+    }
+
+    /// The identity to drop to, as `(uid, gid)`.
+    ///
+    /// Both flags or neither: one without the other would drop half
+    /// an identity, and `default` is what the binary uses when neither
+    /// is given. Uid 0 is refused, because a drop to root drops
+    /// nothing.
+    pub fn run_as_or(
+        &self,
+        default: Option<(u32, u32)>,
+    ) -> anyhow::Result<Option<(u32, u32)>> {
+        let ids = match (self.run_as_uid, self.run_as_gid) {
+            (Some(uid), Some(gid)) => Some((uid, gid)),
+            (None, None) => default,
+            _ => anyhow::bail!(
+                "--run-as-uid and --run-as-gid go together; give both or \
+                 neither"
+            ),
+        };
+        if let Some((0, _) | (_, 0)) = ids {
+            anyhow::bail!("--run-as-uid and --run-as-gid must not be 0");
+        }
+        Ok(ids)
     }
 
     /// Refuse a `hotplug.` key this tree does not read.
@@ -937,6 +992,72 @@ mod tests {
         assert!(parse_mem_size("").is_err());
         assert!(parse_mem_size("abc").is_err());
         assert!(parse_mem_size("-1M").is_err());
+    }
+
+    #[test]
+    fn priv_drop_is_on_off_or_the_binary_default() {
+        let cli = cli_from(&["firehyve", "guest"]);
+        assert_eq!(cli.priv_drop, None);
+        assert!(cli.priv_drop_or(true));
+        assert!(!cli.priv_drop_or(false));
+
+        let cli = cli_from(&["firehyve", "--priv-drop", "guest"]);
+        assert_eq!(cli.priv_drop, Some(true));
+        assert!(cli.priv_drop_or(false));
+
+        let cli = cli_from(&["rshyve", "--priv-drop=false", "guest"]);
+        assert_eq!(cli.priv_drop, Some(false));
+        assert!(!cli.priv_drop_or(true));
+
+        // The brand's argv ends with the VM name, so the bare flag
+        // must not take it as a value.
+        let cli = cli_from(&["firehyve", "--priv-drop=true", "guest"]);
+        assert_eq!(cli.vm_name, "guest");
+        assert_eq!(cli.priv_drop, Some(true));
+    }
+
+    #[test]
+    fn run_as_takes_both_ids_or_neither() {
+        let cli = cli_from(&["firehyve", "guest"]);
+        assert_eq!(
+            cli.run_as_or(Some((8123, 8123))).unwrap(),
+            Some((8123, 8123))
+        );
+        assert_eq!(cli.run_as_or(None).unwrap(), None);
+
+        let cli = cli_from(&[
+            "firehyve",
+            "--run-as-uid",
+            "5000",
+            "--run-as-gid",
+            "5001",
+            "guest",
+        ]);
+        assert_eq!(
+            cli.run_as_or(Some((8123, 8123))).unwrap(),
+            Some((5000, 5001))
+        );
+
+        let cli = cli_from(&["firehyve", "--run-as-uid", "5000", "guest"]);
+        let err = cli.run_as_or(None).expect_err("half an identity");
+        assert!(err.to_string().contains("both or neither"), "{err}");
+    }
+
+    /// A drop to root drops nothing, and the default must not be able
+    /// to smuggle one in either.
+    #[test]
+    fn run_as_root_is_refused() {
+        let cli = cli_from(&[
+            "firehyve",
+            "--run-as-uid",
+            "0",
+            "--run-as-gid",
+            "0",
+            "guest",
+        ]);
+        assert!(cli.run_as_or(None).is_err());
+        let cli = cli_from(&["firehyve", "guest"]);
+        assert!(cli.run_as_or(Some((0, 8123))).is_err());
     }
 
     #[test]

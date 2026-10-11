@@ -17,9 +17,11 @@ use vmm_boot::direct;
 use vmm_config::Cli;
 use vmm_core::machine::Machine;
 use vmm_core::msr::MsrHandler;
+use vmm_core::unixsock::peercred::{install_policy, ListenerOwner, PeerPolicy};
 use vmm_devices::InputBroker;
+use vmm_machine::privilege::{OpenWitness, PrivPlan, RunAs};
 use vmm_machine::{
-    DeviceRegistry, HotplugEngine, HotplugEngines, RegisteredDevice,
+    devspec, DeviceRegistry, HotplugEngine, HotplugEngines, RegisteredDevice,
     RunOutcome, VcpuSetup,
 };
 
@@ -32,7 +34,6 @@ mod input;
 mod mdata;
 mod msix;
 mod pcidev;
-mod peercred;
 mod platform;
 mod reboot;
 mod ringcfg;
@@ -339,14 +340,125 @@ fn spawn_control_socket(
 /// What `run` hands `main`.
 ///
 /// The hot-added specs travel with the outcome because only `run` can
+/// rshyve keeps its inherited privileges unless told otherwise: the
+/// control socket, migration and the vTPM all open host files after
+/// start, and the drop would break them.
+const PRIV_DROP_DEFAULT: bool = false;
+
+/// The privilege lock rshyve was asked for, checked against the
+/// features the lock would break.
+#[derive(Debug, PartialEq, Eq)]
+struct PrivRequest {
+    drop: bool,
+    run_as: Option<RunAs>,
+}
+
+/// Read `--priv-drop` and refuse it beside a feature that opens host
+/// files after start. Pure, so the rule is testable without a VM.
+fn priv_request(cli: &Cli) -> anyhow::Result<PrivRequest> {
+    let drop = cli.priv_drop_or(PRIV_DROP_DEFAULT);
+    if !drop {
+        anyhow::ensure!(
+            cli.run_as_uid.is_none() && cli.run_as_gid.is_none(),
+            "--run-as-uid and --run-as-gid need --priv-drop"
+        );
+        return Ok(PrivRequest { drop, run_as: None });
+    }
+    // virtio-fs serves FUSE from this process and opens host files for
+    // the life of the VM, which the floor has no file_write for.
+    // firehyve refuses the same combination.
+    if let Some(spec) = cli
+        .pci_slot
+        .iter()
+        .find(|spec| devspec::parts(spec).driver == "virtio-fs")
+    {
+        anyhow::bail!(
+            "virtio-fs cannot run under the privilege lock; remove '-s {spec}'"
+        );
+    }
+    // A MantaBlock disk connects to the engine socket again after an
+    // engine restart, and a connect needs file_write.
+    if let Some(spec) = cli.pci_slot.iter().find(|spec| {
+        let parts = devspec::parts(spec);
+        parts.driver == "nvme"
+            && parts
+                .config
+                .split(',')
+                .any(|field| field.trim().starts_with("mantablock="))
+    }) {
+        anyhow::bail!(
+            "a MantaBlock disk cannot run under the privilege lock; \
+             remove '-s {spec}'"
+        );
+    }
+    let blockers: Vec<&str> = [
+        ("--control-socket", cli.control_socket.is_some()),
+        ("--migrate-listen", cli.migrate_listen.is_some()),
+        ("--vtpm", cli.vtpm),
+        ("--mdata-root-pw-file", cli.mdata_root_pw_file.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, set)| set.then_some(flag))
+    .collect();
+    anyhow::ensure!(
+        blockers.is_empty(),
+        "--priv-drop cannot be combined with {}: each opens host files \
+         after the lock",
+        blockers.join(", ")
+    );
+    let run_as = cli.run_as_or(None)?.map(|(uid, gid)| RunAs { uid, gid });
+    Ok(PrivRequest { drop, run_as })
+}
+
+/// What the argv attached, for the lock's open-device witness.
+fn witness_ids(specs: &[String]) -> Vec<String> {
+    specs
+        .iter()
+        .filter(|spec| {
+            // The same grammar the attachment parser reads, which trims
+            // the driver. An untrimmed compare here would put the
+            // chipset of `-s "0, hostbridge"` into the witness, and the
+            // lock would then refuse to start a VM whose argv is legal.
+            !matches!(devspec::parts(spec).driver, "hostbridge" | "lpc" | "")
+        })
+        .map(|spec| devspec::device_id(spec))
+        .collect()
+}
+
 /// see the registry, and only `main` has argv to rebuild.
 struct RunResult {
     outcome: RunOutcome,
     /// `-s` specs for the devices an operator added while the VM ran.
     hotplug_specs: Vec<String>,
+    /// Whether the privilege lock ran. A locked process has no
+    /// `proc_exec`, so the reboot path must not try to re-exec itself.
+    locked: bool,
 }
 
 fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
+    // The inherited set is read before any device opens; the lock runs
+    // after the last one. Off by default here, and said so.
+    let privilege = priv_request(&cli)?;
+    let plan =
+        if privilege.drop {
+            Some(PrivPlan::begin_from_process().map_err(|e| {
+                anyhow::anyhow!("privilege drop cannot start: {e}")
+            })?)
+        } else {
+            info!(log, "privilege drop: off";
+            "reason" => "rshyve default; pass --priv-drop to lock");
+            None
+        };
+    // Before the first socket is bound, naming the uid the process
+    // ends at.
+    let owner = privilege.run_as.map(|r| ListenerOwner {
+        uid: r.uid,
+        gid: r.gid,
+    });
+    if install_policy(PeerPolicy::for_process(owner)?).is_err() {
+        anyhow::bail!("the peer policy was installed twice");
+    }
+
     // Read once. The MADT slot count, the CPU register file and the
     // hot-add engine all read this, so the guest cannot be told about
     // a slot no engine can fill.
@@ -501,6 +613,24 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     // bhyve does it at the same point, bhyverun.c:915.
     vmm_machine::provision::mark_provisioned(log);
 
+    // Phase 8b: lock, when asked. Every device is open and the brand
+    // has its rename.
+    if let Some(plan) = plan.as_ref() {
+        let witness = OpenWitness {
+            vmm_open: true,
+            expected_devices: witness_ids(&cli.pci_slot),
+            present_devices: registry
+                .list()
+                .into_iter()
+                .map(|device| device.id)
+                .collect(),
+        };
+        let report = plan
+            .lock(&witness, privilege.run_as)
+            .map_err(|e| anyhow::anyhow!("privilege drop failed: {e}"))?;
+        info!(log, "privilege drop: on"; "sets" => report.summary());
+    }
+
     // Phase 9: Spawn vCPU threads. The fleet, not the fixed set,
     // because a CPU added later joins the same event channel and the
     // same roster.
@@ -624,6 +754,7 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     outcome.map(|outcome| RunResult {
         outcome,
         hotplug_specs,
+        locked: privilege.drop,
     })
 }
 
@@ -665,9 +796,25 @@ fn main() -> ExitCode {
         warn!(log, "console output was still draining at exit");
     }
     match result {
+        // A locked process cannot re-exec: the floor has no proc_exec,
+        // so the call would fail and the guest's reset would read as a
+        // crash. Report the reset instead and let whatever started this
+        // process start it again.
+        Ok(RunResult {
+            outcome: RunOutcome::Reboot,
+            locked: true,
+            ..
+        }) => {
+            info!(
+                log,
+                "guest reset under the privilege lock; exiting for a restart"
+            );
+            vmm_machine::entry::exit_code(RunOutcome::Reboot, &log)
+        }
         Ok(RunResult {
             outcome: RunOutcome::Reboot,
             hotplug_specs,
+            ..
         }) => reexec_for_reboot(
             &exe,
             &args,
@@ -695,6 +842,138 @@ mod tests {
             .try_get_matches_from(args)
             .expect("argv parses");
         Cli::from_arg_matches(&matches).expect("from_arg_matches")
+    }
+
+    #[test]
+    fn the_drop_is_off_by_default_for_rshyve() {
+        let cli = cli_from(&["rshyve", "guest"]);
+        assert_eq!(
+            priv_request(&cli).unwrap(),
+            PrivRequest {
+                drop: false,
+                run_as: None
+            }
+        );
+    }
+
+    #[test]
+    fn the_drop_can_be_asked_for_with_or_without_an_identity() {
+        let cli = cli_from(&["rshyve", "--priv-drop", "guest"]);
+        assert_eq!(
+            priv_request(&cli).unwrap(),
+            PrivRequest {
+                drop: true,
+                run_as: None
+            }
+        );
+        let cli = cli_from(&[
+            "rshyve",
+            "--priv-drop",
+            "--run-as-uid",
+            "5000",
+            "--run-as-gid",
+            "5000",
+            "guest",
+        ]);
+        assert_eq!(
+            priv_request(&cli).unwrap().run_as,
+            Some(RunAs {
+                uid: 5000,
+                gid: 5000
+            })
+        );
+    }
+
+    /// Each of these opens a host file after start, which the lock
+    /// forbids. Refused up front and named, not left to fail later.
+    #[test]
+    fn the_drop_is_refused_beside_a_feature_it_would_break() {
+        for (flag, extra) in [
+            ("--control-socket", vec!["--control-socket", "/tmp/c.sock"]),
+            ("--migrate-listen", vec!["--migrate-listen", "0.0.0.0:1"]),
+            ("--vtpm", vec!["--vtpm"]),
+        ] {
+            let mut argv = vec!["rshyve", "--priv-drop"];
+            argv.extend(extra);
+            argv.push("guest");
+            let err = priv_request(&cli_from(&argv)).expect_err(flag);
+            assert!(err.to_string().contains(flag), "{flag}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_witness_skips_the_chipset_names() {
+        let specs: Vec<String> =
+            ["0,hostbridge", "4,virtio-blk,/d.img", "31,lpc"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(witness_ids(&specs), vec!["virtio-blk@4"]);
+    }
+
+    /// The attachment parser trims the driver, so the witness must too:
+    /// a chipset named with a space would otherwise be expected in the
+    /// registry it never enters, and the lock would refuse a legal argv.
+    #[test]
+    fn a_spaced_chipset_stays_out_of_the_witness() {
+        let specs = vec![
+            "0, hostbridge".to_string(),
+            "31, lpc".to_string(),
+            "4, virtio-blk,/dev/zvol/rdsk/z/disk0".to_string(),
+        ];
+        assert_eq!(witness_ids(&specs), vec!["virtio-blk@4"]);
+    }
+
+    #[test]
+    fn a_mantablock_disk_is_refused_under_the_lock() {
+        let cli = Cli::try_parse_named(
+            "rshyve",
+            [
+                "rshyve",
+                "--priv-drop",
+                "-s",
+                "4,nvme,mantablock=/mb/e.sock,volume=6f1c2a4e-3b5d-4e7f-8a9b-0c1d2e3f4a5b",
+                "guest",
+            ],
+        )
+        .expect("argv parses");
+        let error = priv_request(&cli).expect_err("MantaBlock must be refused");
+        assert!(error.to_string().contains("MantaBlock"), "{error}");
+        // The boot index can come first; the attach strips it anywhere.
+        let cli = Cli::try_parse_named(
+            "rshyve",
+            [
+                "rshyve",
+                "--priv-drop",
+                "-s",
+                "4,nvme,bootindex=1,mantablock=/mb/e.sock,volume=6f1c2a4e-3b5d-4e7f-8a9b-0c1d2e3f4a5b",
+                "guest",
+            ],
+        )
+        .expect("argv parses");
+        priv_request(&cli).expect_err("MantaBlock after a boot index");
+    }
+
+    /// virtio-fs opens host files for the life of the VM, which the
+    /// floor has no file_write for. firehyve refuses the same pair.
+    #[test]
+    fn virtio_fs_is_refused_under_the_lock() {
+        let cli = Cli::try_parse_named(
+            "rshyve",
+            [
+                "rshyve",
+                "--priv-drop",
+                "-s",
+                "5,virtio-fs,/export",
+                "guest",
+            ],
+        )
+        .expect("argv parses");
+        let error = priv_request(&cli).expect_err("virtio-fs must be refused");
+        assert!(
+            error.to_string().contains("virtio-fs"),
+            "the refusal names the device: {error}"
+        );
     }
 
     /// The bhyve zone brand splits its only pass-through attr on

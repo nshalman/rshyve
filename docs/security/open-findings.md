@@ -200,6 +200,31 @@ whatever reading the source says.
 
 **Mitigation today:** do not offer `-s N,passthru` to an untrusted guest.
 
+### OSF-12, viona takes any datalink id with no zone check
+
+**Boundary:** guest to host network, through the VMM process.
+**Severity:** high until the driver is changed.
+
+`VNA_IOC_CREATE` (`uts/intel/io/viona/viona_main.c`) accepts any
+datalink id the caller names and checks nothing about the zone the
+caller runs in. A bhyve-brand zone holds `/dev/viona` open for the life
+of the VM, so a VMM compromised from its guest can create a link on a
+datalink that belongs to the global zone or to another zone, which is
+L2 on the admin network. The platform bhyve is exposed the same way.
+
+The user-space controls in this tree bound the process, not the ioctl:
+after the privilege lock (`vmm_machine::privilege`) the process cannot
+open a new `/dev/viona` and runs as a numeric uid, but the descriptor
+it already holds still answers `VNA_IOC_CREATE` for any id.
+
+**To close:** the driver must refuse a datalink id whose zone is not
+the caller's, the way `dls` does for a zone's own links. That is a
+platform image change and is tracked in the control-plane tree, not
+here.
+
+**Mitigation today:** no document calls the zone a network boundary
+for a viona-backed guest until the driver change has rolled.
+
 ## Resolved
 
 | Finding | Closed by |

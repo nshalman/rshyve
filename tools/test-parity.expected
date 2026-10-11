@@ -21,3 +21,13 @@ illumos-only  vmm_core:test:autodestruct  disarmed_autodestruct_keeps_the_instan
 # DKIOCFLUSHWRITECACHE exists only on illumos. Linux never probes a
 # device; it syncs every backing fd with fdatasync.
 illumos-only  vmm_devices:lib:vmm_devices  blkdev::tests::a_char_device_that_fails_getwce_is_refused
+
+# On illumos the peer credential carries a zone id that a plain unit
+# test cannot set up, so these two run on the portable arms only. The
+# illumos path is covered by the lab boot in docs/testing.md.
+ci-only  vmm_core:lib:vmm_core  unixsock::peercred::tests::peer_credentials_match_current_process
+ci-only  vmm_core:lib:vmm_core  unixsock::peercred::tests::the_default_policy_admits_this_process
+
+# The refusal it tests is the path of a platform without privilege
+# sets. illumos has them, so it never takes that path.
+ci-only  vmm_machine:lib:vmm_machine  privilege::tests::a_platform_without_privilege_sets_refuses_to_lock
