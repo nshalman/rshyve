@@ -411,6 +411,27 @@ fn a_refused_delete_keeps_the_link_in_the_gate() {
 }
 
 #[test]
+fn a_removed_nic_whose_delete_failed_stays_in_the_gate() {
+    // Its workers may be alive, so a later write-lock call must still
+    // stop them after the device itself is dropped.
+    let steps = Steps::default();
+    let device = running_device(Arc::new(
+        TestLink::new(&steps)
+            .live_rings(NET_QUEUE_SIZE)
+            .failing(&[Op::Delete]),
+    ));
+    let gate = Arc::clone(&device.rings);
+    vmm_devices::Lifecycle::halt(&device);
+    drop(device);
+    clear(&steps);
+
+    gate.run(|_| ()).expect("run");
+
+    let seen = steps_of(&steps);
+    assert!(seen.contains(&Step::RingPause(0)), "{seen:?}");
+}
+
+#[test]
 fn a_hook_change_stops_the_rings_of_every_link_on_the_vm() {
     // The write lock expires every lease on the VM, not only this
     // link's.

@@ -5,15 +5,16 @@
 //! Giving the in-kernel link back before the VM is destroyed.
 
 use std::io::PipeWriter;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use vmm_devices::Lifecycle;
 
 use viona_api::LinkOps;
-use vmm_core::rings::GateError;
+use vmm_core::rings::{GateError, KernelRings};
 
-use super::{RingState, VirtioViona, NET_NUM_QUEUES};
+use super::{RingState, VionaInner, VirtioViona, NET_NUM_QUEUES};
 
 /// How long a halt waits for the gate to stop every ring before it
 /// leaves a link that may hold a hook in the kernel.
@@ -23,11 +24,18 @@ use super::{RingState, VirtioViona, NET_NUM_QUEUES};
 const GATE_WAIT: Duration = Duration::from_secs(2);
 const GATE_STEP: Duration = Duration::from_millis(20);
 
-/// Links left in the kernel. Held for the life of the process: the
+/// A link whose delete failed, kept with its gate member.
+struct Leaked {
+    _inner: Arc<Mutex<VionaInner>>,
+    _member: Arc<dyn KernelRings>,
+}
+
+/// Links whose delete failed. Held for the life of the process: the
 /// last close of the descriptor runs the same delete (`viona_main.c`,
-/// `viona_close`), with no gate around it.
-static LEAKED: std::sync::Mutex<Vec<std::sync::Arc<dyn LinkOps>>> =
-    std::sync::Mutex::new(Vec::new());
+/// `viona_close`), with no gate around it. The gate holds its members
+/// weakly, so the member is kept too, or a removed NIC would drop out
+/// of the gate with a worker still alive.
+static LEAKED: Mutex<Vec<Leaked>> = Mutex::new(Vec::new());
 
 /// The interrupt poll thread, while one is running.
 pub(super) struct Poller {
@@ -138,17 +146,7 @@ impl VirtioViona {
         stop_poller(poller, &log);
 
         let rc = if hooked {
-            let rc = self.delete_in_gate(link.as_ref(), &log);
-            if rc
-                .as_ref()
-                .is_err_and(|e| e.kind() == std::io::ErrorKind::ResourceBusy)
-            {
-                LEAKED
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(std::sync::Arc::clone(&link));
-            }
-            rc
+            self.delete_in_gate(link.as_ref(), &log)
         } else {
             halt_link(link.as_ref(), &log)
         };
@@ -157,6 +155,14 @@ impl VirtioViona {
         // the gate, which still has to stop it.
         if rc.is_ok() {
             self.inner.lock().expect("viona lock").deleted = true;
+        } else {
+            LEAKED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Leaked {
+                    _inner: Arc::clone(&self.inner),
+                    _member: Arc::clone(&self._member),
+                });
         }
         rc
     }
