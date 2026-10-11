@@ -83,11 +83,27 @@ fn bind_owned(
         Some(_) => policy.dir_mode | 0o011,
         None => policy.dir_mode,
     };
-    let existed = parent.is_dir();
-    DirBuilder::new()
-        .recursive(true)
-        .mode(dir_mode)
-        .create(parent)?;
+    // For an owner only the last directory is made, with one mkdir, so
+    // `created` is exact and no directory above it is left unsearchable.
+    let created = match owner {
+        Some(_) => match DirBuilder::new().mode(dir_mode).create(parent) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("{}: {error}", parent.display()),
+                ))
+            }
+        },
+        None => {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(dir_mode)
+                .create(parent)?;
+            false
+        }
+    };
     // Decided before the bind: on a secure path no other user can swap
     // a step between the bind and the chown.
     let give_to = match owner {
@@ -96,7 +112,7 @@ fn bind_owned(
     };
     // The umask can take the search bits off a directory made here.
     // Set by path, so only on a secure one.
-    if give_to.is_some() && !existed {
+    if give_to.is_some() && created {
         fs::set_permissions(parent, Permissions::from_mode(dir_mode))?;
     }
 
@@ -146,9 +162,15 @@ fn secure_chain(dir: &Path) -> io::Result<bool> {
     }
     // SAFETY: geteuid takes no argument and cannot fail.
     let euid = unsafe { libc::geteuid() };
-    for step in canonical.ancestors() {
+    // From the root down, the ACL before the mode: a step is trusted
+    // only once every step above it is.
+    let steps: Vec<&Path> = canonical.ancestors().collect();
+    for step in steps.into_iter().rev() {
+        if !acl_trivial(step)? {
+            return Ok(false);
+        }
         let meta = fs::symlink_metadata(step)?;
-        if !secure_step(meta.uid(), meta.mode(), euid) || !acl_trivial(step)? {
+        if !secure_step(meta.uid(), meta.mode(), euid) {
             return Ok(false);
         }
     }
@@ -660,6 +682,20 @@ mod tests {
         assert!(!secure_step(0, 0o41777, 0), "a sticky /tmp");
         assert!(!secure_step(1000, 0o40755, 0), "another owner");
         assert!(!secure_step(0, 0o40775, 0), "group writable");
+    }
+
+    #[test]
+    fn an_owner_needs_the_directories_above_to_exist() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("a").join("b").join("control.sock");
+        bind_owned(
+            &path,
+            SocketPolicy::default(),
+            Some(test_owner()),
+            trust_all,
+        )
+        .expect_err("a missing directory above");
+        assert!(!temp.path().join("a").exists());
     }
 
     #[test]
