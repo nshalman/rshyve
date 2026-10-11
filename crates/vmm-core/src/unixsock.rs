@@ -16,7 +16,7 @@ use std::os::unix::fs::{
 };
 
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -67,7 +67,7 @@ fn bind_owned(
     path: &Path,
     policy: SocketPolicy,
     owner: Option<ListenerOwner>,
-    trusted: impl Fn(&Path) -> io::Result<bool>,
+    trusted: impl Fn(&Path) -> Option<PathBuf>,
 ) -> io::Result<UnixListener> {
     let _guard = UMASK_LOCK
         .lock()
@@ -105,15 +105,26 @@ fn bind_owned(
         }
     };
     // Decided before the bind: on a secure path no other user can swap
-    // a step between the bind and the chown.
-    let give_to = match owner {
-        Some(owner) if trusted(parent)? => Some(owner),
-        _ => None,
+    // a step between the bind and the chown. Every step after this one
+    // uses the canonical path that was checked, so a link resolved here
+    // is not resolved again.
+    let secure = owner.and_then(|_| trusted(parent));
+    let give_to = secure.as_ref().and(owner);
+    let checked;
+    let path = match &secure {
+        Some(dir) => {
+            let name = path.file_name().ok_or_else(|| {
+                io::Error::other(format!("{} names no socket", path.display()))
+            })?;
+            checked = dir.join(name);
+            checked.as_path()
+        }
+        None => path,
     };
     // The umask can take the search bits off a directory made here.
     // Set by path, so only on a secure one.
-    if give_to.is_some() && created {
-        fs::set_permissions(parent, Permissions::from_mode(dir_mode))?;
+    if let (Some(dir), true) = (&secure, created) {
+        fs::set_permissions(dir, Permissions::from_mode(dir_mode))?;
     }
 
     remove_stale_socket(path)?;
@@ -151,30 +162,25 @@ fn bind_owned(
     Ok(listener)
 }
 
-/// Whether no user but root and this one can change any step of the
-/// path to `dir`. The path must already be canonical: a link on it
-/// could sit in a directory someone else controls.
-fn secure_chain(dir: &Path) -> io::Result<bool> {
-    let absolute = std::path::absolute(dir)?;
-    let canonical = fs::canonicalize(&absolute)?;
-    if canonical != absolute {
-        return Ok(false);
-    }
+/// The canonical form of `dir` when no user but root and this one can
+/// change any step of it. Anything that cannot be read is not secure.
+fn secure_chain(dir: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(dir).ok()?;
     // SAFETY: geteuid takes no argument and cannot fail.
     let euid = unsafe { libc::geteuid() };
     // From the root down, the ACL before the mode: a step is trusted
     // only once every step above it is.
     let steps: Vec<&Path> = canonical.ancestors().collect();
     for step in steps.into_iter().rev() {
-        if !acl_trivial(step)? {
-            return Ok(false);
+        if !acl_trivial(step).ok()? {
+            return None;
         }
-        let meta = fs::symlink_metadata(step)?;
+        let meta = fs::symlink_metadata(step).ok()?;
         if !secure_step(meta.uid(), meta.mode(), euid) {
-            return Ok(false);
+            return None;
         }
     }
-    Ok(true)
+    Some(canonical)
 }
 
 /// Whether `step` has no ACL beyond its mode bits. A ZFS ACL can let
@@ -184,12 +190,13 @@ fn acl_trivial(step: &Path) -> io::Result<bool> {
     use std::os::unix::ffi::OsStrExt;
     #[link(name = "sec")]
     unsafe extern "C" {
-        fn acl_trivial(path: *const libc::c_char) -> libc::c_int;
+        #[link_name = "acl_trivial"]
+        fn libsec_acl_trivial(path: *const libc::c_char) -> libc::c_int;
     }
     let c_path = std::ffi::CString::new(step.as_os_str().as_bytes())
         .map_err(|_| io::Error::other("a path with a NUL byte"))?;
     // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
-    match unsafe { acl_trivial(c_path.as_ptr()) } {
+    match unsafe { libsec_acl_trivial(c_path.as_ptr()) } {
         0 => Ok(true),
         1 => Ok(false),
         _ => Err(io::Error::last_os_error()),
@@ -624,12 +631,12 @@ mod tests {
         }
     }
 
-    fn trust_all(_: &Path) -> io::Result<bool> {
-        Ok(true)
+    fn trust_all(dir: &Path) -> Option<PathBuf> {
+        fs::canonicalize(dir).ok()
     }
 
-    fn trust_none(_: &Path) -> io::Result<bool> {
-        Ok(false)
+    fn trust_none(_: &Path) -> Option<PathBuf> {
+        None
     }
 
     /// The socket belongs to the identity the process will drop to. Its
@@ -703,16 +710,29 @@ mod tests {
         assert!(acl_trivial(Path::new("/")).expect("read the ACL"));
     }
 
-    /// A link on the path is refused, even into a directory that is
-    /// itself secure.
+    /// A socket reached through a link is bound and given away at the
+    /// canonical path that was checked.
     #[test]
-    fn a_path_through_a_link_is_not_secure() {
+    fn a_trusted_path_is_used_in_its_canonical_form() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let target = temp.path().join("target");
         fs::create_dir(&target).expect("create the target");
         let link = temp.path().join("link");
         std::os::unix::fs::symlink(&target, &link).expect("link");
-        assert!(!secure_chain(&link).expect("checked"));
+        let owner = test_owner();
+
+        let _listener = bind_owned(
+            &link.join("control.sock"),
+            SocketPolicy::default(),
+            Some(owner),
+            trust_all,
+        )
+        .expect("bind through the link");
+
+        let socket = fs::symlink_metadata(target.join("control.sock"))
+            .expect("bound in the target");
+        assert!(socket.file_type().is_socket());
+        assert_eq!(socket.uid(), owner.uid);
     }
 
     /// Without an owner the bind leaves the process's own ids, so a

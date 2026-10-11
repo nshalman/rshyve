@@ -235,7 +235,7 @@ firehyve [OPTIONS] --kernel <PATH> <VM_NAME>
 | `-s ...,bootindex=N` | Rejected. A directly booted kernel has no firmware boot order |
 | Migration | Not supported: `--migrate-listen` and `--control-socket` are rejected |
 | `--hotplug` | Accepted for CPU and memory hot-add, with the same `-c maxcpus=` and `-o hotplug.*` options as rshyve. There is no PCI hot-add: the device set is fixed at boot. The commands arrive on the vsock `CONTROL` verb, so the VM also needs a `-s <slot>,virtio-vsock,<path>,cid=<n>` device or nothing can reach them |
-| Privilege drop | Mandatory; `--priv-drop=false` is refused. Once every device is open the privilege sets are locked to `file_read` (plus `proc_clock_highres` when inherited) with the inheritable set cleared, and the process drops to `--run-as-uid`/`--run-as-gid`, default 8123:8123, a numeric id with no passwd entry. Before the drop, every listener socket is chowned to that identity when no other user can write any directory on its path; elsewhere it stays root-owned. A socket directory made by the VMM stays root-owned and searchable. One log line reports the sets and ids. `virtio-fs` is refused, because it opens host files for the life of the VM. A guest-initiated vsock connect to `<path>_<port>` is refused after the drop, because an AF_UNIX connect needs `file_write`; host-initiated connects still work. Give each VM its own run-as uid: listeners admit that uid, so two VMs that share one admit each other |
+| Privilege drop | Mandatory; `--priv-drop=false` is refused. Once every device is open the privilege sets are locked to `file_read` (plus `proc_clock_highres` when inherited) with the inheritable set cleared, and the process drops to `--run-as-uid`/`--run-as-gid`, default 8123:8123, a numeric id with no passwd entry. Before the drop, every listener socket is chowned to that identity when no other user can write any directory on its canonical path; elsewhere it stays root-owned. The run-as identity needs search on every directory of that path. One log line reports the sets and ids. `virtio-fs` is refused, because it opens host files for the life of the VM. A guest-initiated vsock connect to `<path>_<port>` is refused after the drop, because an AF_UNIX connect needs `file_write`; host-initiated connects still work. Give each VM its own run-as uid: listeners admit that uid, so two VMs that share one admit each other |
 | Other | `--vtpm`, `--hyperv` and `--json-config` are rejected |
 
 Example:
@@ -287,9 +287,11 @@ backing file anyway.
 
 The socket is the path in the device spec, for example
 `-s 9,virtio-vsock,/var/run/firehyve/guest.sock,cid=3`. Two gates
-stand in front of it: the socket is 0600 and owned by the run-as
-identity when no other user can write any directory on its path (a
-directory the VMM makes stays root-owned, mode 0711); and the accept loop reads the peer's
+stand in front of it: the socket is 0600, and it is owned by the
+run-as identity when no other user can write any directory on its
+canonical path (otherwise it stays root-owned). The VMM makes only the
+socket's own directory, which must sit in one that exists; on a secure
+path that directory stays root-owned with mode 0711. And the accept loop reads the peer's
 credentials with `getpeerucred(3C)` and admits the VMM's own uid in
 its own zone or uid 0 in the global zone. A global-zone peer connecting
 through a path under the zone root is reported with zone id 0, so that
