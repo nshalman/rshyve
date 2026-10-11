@@ -12,7 +12,8 @@ use std::fs::{self, DirBuilder, Permissions};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::{
-    chown, lchown, DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt,
+    fchown, lchown, DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt,
+    PermissionsExt,
 };
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -50,8 +51,9 @@ impl Default for SocketPolicy {
 ///
 /// When the process peer policy names an owner, the path and its
 /// directory are given to it here, before the privilege drop that
-/// policy describes: a socket left root-owned would be one the dropped
-/// process can neither unlink nor rebind.
+/// policy describes, so a peer running as that identity can connect.
+/// The dropped process has no `file_write`, so it cannot unlink or
+/// rebind either one; the next start clears a stale socket.
 pub fn bind_restricted(
     path: &Path,
     policy: SocketPolicy,
@@ -75,10 +77,22 @@ fn bind_owned(
         .filter(|parent| !parent.as_os_str().is_empty());
     let mut created_parent = false;
     if let Some(parent) = parent {
-        created_parent = !parent.exists();
-        let mut builder = DirBuilder::new();
-        builder.recursive(true).mode(policy.dir_mode);
-        builder.create(parent)?;
+        if let Some(above) = parent
+            .parent()
+            .filter(|above| !above.as_os_str().is_empty())
+        {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(policy.dir_mode)
+                .create(above)?;
+        }
+        // One mkdir, so "created" is exact: it fails on anything already
+        // at the path, a symlink included.
+        match DirBuilder::new().mode(policy.dir_mode).create(parent) {
+            Ok(()) => created_parent = true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
     }
 
     remove_stale_socket(path)?;
@@ -86,6 +100,7 @@ fn bind_owned(
     // SAFETY: `umask` only reads its argument and returns the old mask.
     let old_umask = unsafe { libc::umask(socket_umask(policy.mode)) };
     let result = UnixListener::bind(path);
+    // SAFETY: `umask` only reads its argument and returns the old mask.
     unsafe {
         libc::umask(old_umask);
     }
@@ -110,7 +125,7 @@ fn bind_owned(
             // processes keep there.
             if created_parent {
                 if let Some(parent) = parent {
-                    chown(parent, Some(owner.uid), Some(owner.gid))?;
+                    give_created_dir(parent, owner)?;
                 }
             }
             lchown(path, Some(owner.uid), Some(owner.gid))
@@ -118,9 +133,8 @@ fn bind_owned(
         match give() {
             Ok(()) => expected_uid = owner.uid,
             // A zone's privilege floor has no file_chown. The socket then
-            // keeps the binding identity; the launcher gives the directory
-            // to the owner before boot, so the dropped process can still
-            // unlink and rebind under it.
+            // keeps the binding identity, and the launcher gives the
+            // directory to the owner before boot.
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
             Err(error) => return Err(remove_after_error(path, error)),
         }
@@ -128,6 +142,27 @@ fn bind_owned(
 
     verify_bound_path(path, policy.mode, expected_uid)?;
     Ok(listener)
+}
+
+/// Give the directory this bind made to `owner`, through a descriptor
+/// that did not follow a link. Whatever was swapped in after the mkdir
+/// is refused: a link fails the open, and a directory of another owner
+/// fails the check.
+fn give_created_dir(dir: &Path, owner: ListenerOwner) -> io::Result<()> {
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)?;
+    let meta = handle.metadata()?;
+    // SAFETY: geteuid takes no argument and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !meta.is_dir() || meta.uid() != euid {
+        return Err(io::Error::other(format!(
+            "{} is not the directory this bind made",
+            dir.display()
+        )));
+    }
+    fchown(&handle, Some(owner.uid), Some(owner.gid))
 }
 
 /// The umask that keeps the socket within `mode` between its `bind`
@@ -305,7 +340,7 @@ const SEND_NOWAIT: libc::c_int = 0;
 
 /// Send what the socket will take now.
 fn send_nowait(fd: BorrowedFd<'_>, data: &[u8]) -> io::Result<usize> {
-    // Safety: `data` is a live slice for the length passed.
+    // SAFETY: `data` is a live slice for the length passed.
     let sent = unsafe {
         libc::send(
             fd.as_raw_fd(),
@@ -540,8 +575,7 @@ mod tests {
     }
 
     /// The socket and its directory belong to the identity the process
-    /// will drop to, so the dropped process can still unlink and
-    /// rebind them.
+    /// will drop to.
     #[test]
     fn an_owner_takes_the_socket_and_its_directory() {
         let temp = tempfile::tempdir().expect("create temporary directory");
@@ -580,6 +614,20 @@ mod tests {
         assert_eq!(dir.uid(), before);
     }
 
+    /// A link in place of the parent is not taken for a directory this
+    /// bind made, so nothing is given away through it.
+    #[test]
+    fn a_linked_parent_is_not_given_away() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let target = temp.path().join("target");
+        fs::create_dir(&target).expect("create the target");
+        let parent = temp.path().join("link");
+        std::os::unix::fs::symlink(&target, &parent).expect("link");
+
+        give_created_dir(&parent, test_owner())
+            .expect_err("a link is not followed");
+    }
+
     /// Without an owner the bind leaves the process's own ids, so a
     /// binary that never drops changes nothing it did not create.
     #[test]
@@ -591,6 +639,7 @@ mod tests {
             .expect("bind without an owner");
 
         let socket = fs::metadata(&path).expect("stat socket");
+        // SAFETY: geteuid takes no argument and cannot fail.
         assert_eq!(socket.uid(), unsafe { libc::geteuid() });
     }
 
@@ -676,6 +725,7 @@ mod tests {
             .expect("set deliberately unsafe mode");
 
         let result =
+            // SAFETY: geteuid takes no argument and cannot fail.
             verify_bound_path(&path, 0o600, unsafe { libc::geteuid() });
 
         assert!(result.is_err());
