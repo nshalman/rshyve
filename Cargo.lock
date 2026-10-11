@@ -684,6 +684,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "illumos-priv"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d536f13d2a7b69a9fe00c8bed9eafd2345a7f4e37d5f8a9756c588c9be6ff33"
+
+[[package]]
 name = "indexmap"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1666,6 +1672,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bhyve_api",
+ "illumos-priv",
  "libc",
  "slog",
  "slog-async",

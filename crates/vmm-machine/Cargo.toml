@@ -23,5 +23,10 @@ slog-term.workspace = true
 usdt = { workspace = true, features = ["asm"] }
 uuid.workspace = true
 
+# The privilege lock speaks setppriv(2) through the existing binding
+# rather than a hand-rolled FFI; it only exists on illumos.
+[target.'cfg(any(target_os = "illumos", target_os = "solaris"))'.dependencies]
+illumos-priv = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

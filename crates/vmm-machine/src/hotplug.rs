@@ -44,6 +44,7 @@ use slog::{debug, error, info, warn, Logger};
 
 use vmm_devices::hotplug::pci::{is_hotpluggable_slot, PciHotplug};
 use vmm_devices::lifecycle::prepare_unplug;
+use vmm_devices::metrics::VcpuMetrics;
 use vmm_devices::pci::{Bdf, PciBus};
 use vmm_devices::IndicatedState;
 
@@ -797,6 +798,11 @@ impl CpuSlots {
     /// no later add can take one back.
     pub fn consumed(&self) -> Vec<u32> {
         self.engine.consumed_cpus()
+    }
+
+    /// The exit counters of every CPU added since boot, in id order.
+    pub fn added_metrics(&self) -> Vec<(u32, Arc<VcpuMetrics>)> {
+        self.vcpus.added_metrics()
     }
 
     fn shutdown(&self) {

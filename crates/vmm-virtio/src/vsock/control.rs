@@ -5,11 +5,9 @@
 //! The CONTROL verb on the vsock host socket.
 //!
 //! A host peer that sends `CONNECT <port>` is joined to a guest port. A
-//! peer that sends `CONTROL` is answered by the VMM itself, and nothing
-//! it sends ever reaches the guest mux. firehyve has no control socket
-//! of its own, so this is how an operator reads the machine.
-//!
-//! # Grammar
+//! peer that sends `CONTROL` is answered by the VMM itself and reaches
+//! no guest. firehyve has no control socket, so this is how an operator
+//! reads the machine.
 //!
 //! ```text
 //! open     = "CONTROL" LF
@@ -20,23 +18,17 @@
 //! ```
 //!
 //! One request per line, one response line back. A list answer is
-//! `OK <count>` followed by one field per record, and a record is its
-//! values joined by commas, so a client splits on whitespace and then on
-//! commas. No value carries a space or a comma.
+//! `OK <count>` and one field per record; a record is its values
+//! joined by commas. No value carries a space or a comma. A response
+//! past [`RESPONSE_LINE_MAX`] is one refusal, never a cut list.
 //!
-//! ```text
-//! device-list -> OK 2 virtio-blk@4,0.4.0,present varstore,-,present
-//! cpu-list    -> OK 2 0,present 1,present
-//! mem-list    -> OK 1 boot,1073741824,present
-//! ```
-//!
-//! # Trust
-//!
-//! The socket is 0600 in a 0700 directory, so the peer is already the
-//! VMM's own user. It is still parsed as hostile input: the request line
-//! is bounded, nothing parsed from it indexes anything, and an
-//! unknown or malformed verb closes the connection with one error line
-//! and changes no state.
+//! Who may speak is decided before this module runs: the socket is
+//! 0600 in a 0700 directory and the accept loop applies the process
+//! peer policy (`vmm_core::unixsock::peercred`). There is no token.
+//! The only peer that can reach a path under the zone root is
+//! global-zone root, which the policy admits. A request is still
+//! hostile input: the line is bounded, nothing parsed from it indexes
+//! anything, and a malformed verb changes no state.
 
 use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
@@ -60,9 +52,15 @@ use crate::pci::VirtioPciDevice;
 
 /// Longest request accepted, for the same reason the CONNECT line is
 /// capped: a peer that never sends a newline must not make the device
-/// read without bound. Wider than the CONNECT line because Wave 2's
-/// `device-add` argument is a whole `-s` spec.
-const CONTROL_LINE_MAX: usize = 512;
+/// read without bound. A request is one verb and at most one number.
+const CONTROL_LINE_MAX: usize = 128;
+
+/// Longest response line written back, newline excluded.
+///
+/// A `cpu-list` on a 256-slot machine is about 5 KiB. An answer above
+/// this is a sink bug or a hostile id count, and either way the peer
+/// gets one refusal rather than a line with no end.
+pub const RESPONSE_LINE_MAX: usize = 16 * 1024;
 
 /// How long a blocked read waits before it looks at the shutdown flag.
 /// Without this, halt would wait for the peer instead of the guest.
@@ -124,10 +122,6 @@ pub enum ControlRequest {
     DeviceList,
     CpuList,
     MemList,
-    /// Add the device one `-s` spec names.
-    DeviceAdd(String),
-    /// Ask the guest to give up the device with this id.
-    DeviceRemove(String),
     CpuAdd(u32),
     /// Give the guest this many more bytes.
     MemAdd(u64),
@@ -135,7 +129,23 @@ pub enum ControlRequest {
     /// than reading as a typo the operator can fix.
     CpuRemove,
     MemRemove,
+    /// The machine as a list of `key,value` records.
+    Status,
+    /// Counters as `key,value` records.
+    Metrics,
+    /// Stop the VM now. There is no ACPI button in a microVM; a
+    /// graceful stop is the guest agent's job over vsock.
+    Halt,
+    /// Named so the answer can say that, rather than read as a typo.
+    Shutdown,
 }
+
+/// Why `device-add` and `device-remove` answer `ERR`.
+pub const NO_DEVICE_ADD: &str = "device-add is not supported: the device \
+    set is fixed at boot, and after the privilege lock no host file can \
+    be opened";
+pub const NO_DEVICE_REMOVE: &str = "device-remove is not supported: the \
+    device set is fixed at boot";
 
 impl ControlRequest {
     /// Parse one request line. The error is the reason the line is
@@ -153,12 +163,14 @@ impl ControlRequest {
             ("device-list", None, _) => Ok(Self::DeviceList),
             ("cpu-list", None, _) => Ok(Self::CpuList),
             ("mem-list", None, _) => Ok(Self::MemList),
-            ("device-add", Some(spec), None) => {
-                Ok(Self::DeviceAdd(spec.to_string()))
-            }
-            ("device-remove", Some(id), None) => {
-                Ok(Self::DeviceRemove(id.to_string()))
-            }
+            ("status", None, _) => Ok(Self::Status),
+            ("metrics", None, _) => Ok(Self::Metrics),
+            ("halt", None, _) => Ok(Self::Halt),
+            ("shutdown", None, _) => Ok(Self::Shutdown),
+            // Refused at the grammar, so no binary can wire them back
+            // without changing the contract every client reads.
+            ("device-add", _, _) => Err(NO_DEVICE_ADD.to_string()),
+            ("device-remove", _, _) => Err(NO_DEVICE_REMOVE.to_string()),
             // The id is never used as an index: the engine range-checks
             // it as well.
             ("cpu-add", Some(id), None) => id
@@ -173,19 +185,18 @@ impl ControlRequest {
             ("cpu-remove", _, _) => Ok(Self::CpuRemove),
             ("mem-remove", _, _) => Ok(Self::MemRemove),
             ("", _, _) => Err("empty request".to_string()),
-            ("device-list" | "cpu-list" | "mem-list", Some(_), _) => {
-                Err(format!("{} takes no argument", value(verb)))
-            }
             (
-                "device-add" | "device-remove" | "cpu-add" | "mem-add",
-                None,
+                "device-list" | "cpu-list" | "mem-list" | "status" | "metrics"
+                | "halt" | "shutdown",
+                Some(_),
                 _,
-            ) => Err(format!("{} needs one argument", value(verb))),
-            (
-                "device-add" | "device-remove" | "cpu-add" | "mem-add",
-                Some(_),
-                Some(_),
-            ) => Err(format!("{} takes one argument", value(verb))),
+            ) => Err(format!("{} takes no argument", value(verb))),
+            ("cpu-add" | "mem-add", None, _) => {
+                Err(format!("{} needs one argument", value(verb)))
+            }
+            ("cpu-add" | "mem-add", Some(_), Some(_)) => {
+                Err(format!("{} takes one argument", value(verb)))
+            }
             _ => Err(format!("unknown command {}", value(verb))),
         }
     }
@@ -219,8 +230,11 @@ impl ControlReply {
 
     /// The response line, with every value and the reason bounded and
     /// stripped down to what a terminal can show.
+    ///
+    /// A line past [`RESPONSE_LINE_MAX`] is replaced, not cut: a cut
+    /// list would read as a shorter, valid list.
     pub fn render(&self) -> String {
-        match self {
+        let line = match self {
             Self::Ok(records) => {
                 let mut out = String::from("OK");
                 for record in records {
@@ -228,10 +242,18 @@ impl ControlReply {
                     let record: Vec<String> =
                         record.iter().map(|v| value(v)).collect();
                     out.push_str(&record.join(","));
+                    if out.len() > RESPONSE_LINE_MAX {
+                        break;
+                    }
                 }
                 out
             }
             Self::Refused(reason) => format!("ERR {}", clean_reason(reason)),
+        };
+        if line.len() > RESPONSE_LINE_MAX {
+            format!("ERR response exceeds {RESPONSE_LINE_MAX} bytes")
+        } else {
+            line
         }
     }
 }
@@ -572,13 +594,16 @@ mod tests {
         }
     }
 
-    /// Answers with more than a socket buffer holds, so the write
-    /// cannot finish until the peer reads.
+    /// Answers with a line at the response cap, so a few pipelined
+    /// requests fill any socket buffer.
     struct BulkSink;
 
     impl ControlSink for BulkSink {
         fn handle(&self, _request: ControlRequest) -> ControlReply {
-            ControlReply::list(vec![vec!["x".repeat(FIELD_MAX)]; 20_000])
+            ControlReply::list(vec![
+                vec!["x".repeat(FIELD_MAX)];
+                RESPONSE_LINE_MAX / (FIELD_MAX + 1) - 2
+            ])
         }
     }
 
@@ -586,27 +611,8 @@ mod tests {
         slog::Logger::root(slog::Discard, slog::o!())
     }
 
-    /// Run a session against one end of a socket pair, and give the test
-    /// the other end plus the thread to join.
-    fn session(
-        slot: &ControlSlot,
-        shutdown: Arc<AtomicBool>,
-    ) -> (UnixStream, thread::JoinHandle<()>) {
-        let (client, server) = UnixStream::pair().expect("socketpair");
-        let slot = slot.clone();
-        let handle = thread::spawn(move || {
-            run_control_session(
-                &slot,
-                &shutdown,
-                server,
-                &null_log(),
-                CONTROL_IDLE_BUDGET,
-            );
-        });
-        (client, handle)
-    }
-
-    /// The same, with an idle budget the test can outlast.
+    /// Start a session over one end of a socket pair and give the test
+    /// the other end plus the thread to join. The peer has not spoken.
     fn session_with_idle(
         slot: &ControlSlot,
         shutdown: Arc<AtomicBool>,
@@ -620,6 +626,38 @@ mod tests {
         (client, handle)
     }
 
+    fn session_raw(
+        slot: &ControlSlot,
+        shutdown: Arc<AtomicBool>,
+    ) -> (UnixStream, thread::JoinHandle<()>) {
+        session_with_idle(slot, shutdown, CONTROL_IDLE_BUDGET)
+    }
+
+    /// One line, read a byte at a time so nothing pipelined behind it
+    /// is taken off the socket.
+    fn read_line_raw(stream: &mut UnixStream) -> String {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(1) if byte[0] == b'\n' => break,
+                Ok(1) => line.push(byte[0]),
+                other => panic!("the line ended early: {other:?}"),
+            }
+        }
+        String::from_utf8(line).expect("text")
+    }
+
+    /// A session past the banner.
+    fn session(
+        slot: &ControlSlot,
+        shutdown: Arc<AtomicBool>,
+    ) -> (UnixStream, thread::JoinHandle<()>) {
+        let (mut client, handle) = session_raw(slot, shutdown);
+        assert_eq!(read_line_raw(&mut client), "OK control");
+        (client, handle)
+    }
+
     fn installed(sink: Arc<dyn ControlSink>) -> ControlSlot {
         let slot = ControlSlot::default();
         slot.install(sink);
@@ -629,7 +667,8 @@ mod tests {
     #[test]
     fn control_with_no_sink_is_refused_and_closed() {
         let slot = ControlSlot::default();
-        let (client, handle) = session(&slot, Arc::new(AtomicBool::new(false)));
+        let (client, handle) =
+            session_raw(&slot, Arc::new(AtomicBool::new(false)));
 
         let mut reader = BufReader::new(client);
         let mut line = String::new();
@@ -642,6 +681,24 @@ mod tests {
         handle.join().expect("session thread");
     }
 
+    /// The first request is served straight after the banner: the peer
+    /// gate ran in the accept loop, and there is no second proof.
+    #[test]
+    fn the_first_request_after_the_banner_is_served() {
+        let slot = installed(Arc::new(EchoSink));
+        let (mut client, handle) =
+            session_raw(&slot, Arc::new(AtomicBool::new(false)));
+
+        assert_eq!(read_line_raw(&mut client), "OK control");
+        write_line(&mut client, "device-list").expect("request");
+        assert_eq!(read_line_raw(&mut client), "OK device-list");
+        // `auth` is not a verb any more, so it is a typo like any other.
+        write_line(&mut client, "auth whatever").expect("request");
+        assert_eq!(read_line_raw(&mut client), "ERR unknown command auth");
+        drop(client);
+        handle.join().expect("session thread");
+    }
+
     #[test]
     fn a_request_round_trips_through_the_sink() {
         let slot = installed(Arc::new(EchoSink));
@@ -650,12 +707,9 @@ mod tests {
 
         write_line(&mut client, "device-list").expect("request");
         let mut reader = BufReader::new(client.try_clone().expect("clone"));
-        let mut banner = String::new();
-        reader.read_line(&mut banner).expect("banner");
         let mut answer = String::new();
         reader.read_line(&mut answer).expect("answer");
 
-        assert_eq!(banner, "OK control\n");
         assert_eq!(answer, "OK device-list\n");
         drop(client);
         drop(reader);
@@ -673,8 +727,6 @@ mod tests {
         write_line(&mut client, "   ").expect("request");
         let mut reader = BufReader::new(client.try_clone().expect("clone"));
         let mut line = String::new();
-        reader.read_line(&mut line).expect("banner");
-        line.clear();
         reader.read_line(&mut line).expect("answer");
 
         assert_eq!(line, "ERR empty request\n");
@@ -696,8 +748,6 @@ mod tests {
             .expect("request");
         let mut reader = BufReader::new(client.try_clone().expect("clone"));
         let mut line = String::new();
-        reader.read_line(&mut line).expect("banner");
-        line.clear();
         reader.read_line(&mut line).expect("answer");
 
         assert_eq!(line, "ERR request line too long\n");
@@ -716,8 +766,6 @@ mod tests {
         client.write_all(&[0xff, 0xfe, b'\n']).expect("request");
         let mut reader = BufReader::new(client.try_clone().expect("clone"));
         let mut line = String::new();
-        reader.read_line(&mut line).expect("banner");
-        line.clear();
         reader.read_line(&mut line).expect("answer");
 
         assert_eq!(line, "ERR request is not text\n");
@@ -733,8 +781,6 @@ mod tests {
         write_line(&mut client, "device-list").expect("request");
         let mut reader = BufReader::new(client.try_clone().expect("clone"));
         let mut line = String::new();
-        reader.read_line(&mut line).expect("banner");
-        line.clear();
         reader.read_line(&mut line).expect("answer");
 
         assert_eq!(line, "OK first_smuggled\n");
@@ -754,9 +800,12 @@ mod tests {
         let (mut client, handle) =
             session(&slot, Arc::new(AtomicBool::new(false)));
 
-        // Nothing here reads the socket: the banner and the answer
-        // together have to fill it.
-        client.write_all(b"device-list\n").expect("request");
+        // Nothing here reads the socket after the auth: the answers
+        // have to fill it. Each is near the response cap, so a few
+        // hundred exceed any socket buffer.
+        client
+            .write_all(&b"device-list\n".repeat(256))
+            .expect("request");
 
         // The session is the thing under test, so it cannot be joined
         // here. One that never ended would park the test run.
@@ -783,12 +832,10 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (client, handle) = session(&slot, Arc::clone(&shutdown));
 
-        let mut reader = BufReader::new(client);
-        let mut banner = String::new();
-        reader.read_line(&mut banner).expect("banner");
         shutdown.store(true, Ordering::Release);
 
         handle.join().expect("session thread ends on the flag");
+        drop(client);
     }
 
     /// An established session used to read with no deadline at all, so
@@ -799,19 +846,16 @@ mod tests {
     fn an_idle_session_loses_its_slot() {
         let slot = installed(Arc::new(EchoSink));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let (client, handle) = session_with_idle(
+        let (mut client, handle) = session_with_idle(
             &slot,
             Arc::clone(&shutdown),
             Duration::from_millis(50),
         );
-
-        let mut reader = BufReader::new(client);
-        let mut banner = String::new();
-        reader.read_line(&mut banner).expect("banner");
-        assert_eq!(banner.trim_end(), "OK control");
+        assert_eq!(read_line_raw(&mut client), "OK control");
 
         // Nothing is sent from here, and the shutdown flag stays clear:
         // only the idle budget can end this.
+        let mut reader = BufReader::new(client);
         assert_session_closed(&mut reader);
         handle
             .join()
@@ -874,6 +918,54 @@ mod tests {
         assert_eq!(framed("OK first\nERR smuggled"), "OK first");
         assert_eq!(framed("OK first\r\nERR smuggled"), "OK first");
         assert_eq!(framed("\nERR smuggled"), "");
+    }
+
+    /// A list past the cap is one refusal, never a shorter list that
+    /// a client would read as complete.
+    #[test]
+    fn an_answer_past_the_response_cap_is_refused_whole() {
+        let big = ControlReply::list(vec![vec!["x".repeat(FIELD_MAX)]; 20_000]);
+        let line = big.render();
+        assert_eq!(
+            line,
+            format!("ERR response exceeds {RESPONSE_LINE_MAX} bytes")
+        );
+        assert!(line.len() <= RESPONSE_LINE_MAX);
+
+        let fits = ControlReply::list(vec![vec!["x".repeat(FIELD_MAX)]; 100]);
+        assert!(fits.render().starts_with("OK 100 "));
+    }
+
+    #[test]
+    fn device_add_and_remove_are_refused_at_the_grammar() {
+        for line in [
+            "device-add 5,virtio-blk,/etc/shadow",
+            "device-add",
+            "device-remove virtio-blk@5",
+        ] {
+            let err = ControlRequest::parse(line).expect_err(line);
+            assert!(err.contains("not supported"), "{line}: {err}");
+            assert!(err.contains("fixed at boot"), "{line}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_read_only_verbs_parse_and_take_no_argument() {
+        assert_eq!(ControlRequest::parse("status"), Ok(ControlRequest::Status));
+        assert_eq!(
+            ControlRequest::parse("metrics"),
+            Ok(ControlRequest::Metrics)
+        );
+        assert_eq!(ControlRequest::parse("halt"), Ok(ControlRequest::Halt));
+        assert_eq!(
+            ControlRequest::parse("shutdown"),
+            Ok(ControlRequest::Shutdown)
+        );
+        for verb in ["status", "metrics", "halt", "shutdown"] {
+            let err = ControlRequest::parse(&format!("{verb} now"))
+                .expect_err("an argument is refused");
+            assert_eq!(err, format!("{verb} takes no argument"));
+        }
     }
 
     #[test]

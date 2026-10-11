@@ -108,10 +108,10 @@ pub(super) fn dispatch(ctrl: &Arc<VmController>, cmd: Command) -> Response {
         // SECURITY: device-add takes a host path from a socket peer and
         // opens it. That is the same file-open authority argv has, and
         // it is deliberately not wider: the spec goes through the same
-        // catalog closure the `-s` pass uses. The peercred check in
-        // `listener` is the only thing that grants it, so the peer must
-        // share this process's uid and be in this zone or the global
-        // zone.
+        // catalog closure the `-s` pass uses. The peer gate in
+        // `vmm_core::unixsock::accept` is the only thing that grants
+        // it: the peer is this process's uid in this zone, or root in
+        // the global zone.
         Command::DeviceAdd { spec } => match ctrl.hotplug.pci.as_ref() {
             Some(engine) => hot_add(ctrl, || added(engine.add_device(&spec))),
             None => hotplug_disabled(),
