@@ -7,7 +7,8 @@
 //! The host kernel loads DR0-DR3 and DR6 with `mov` before it enters
 //! the guest, and DR7 goes through the VMCS or the VMCB. A set bit in
 //! 63:32 of DR6 or DR7 is a #GP in the host on that `mov`, or a failed
-//! entry, so it is refused. So is a DR0-DR3 that is not canonical. The
+//! entry, so it is refused. DR0-DR3 take any 64-bit value, canonical or
+//! not, so a guest can hold one that is not and still migrate. The
 //! reserved bits in 31:0 cannot fault; they are set to the values the
 //! Intel SDM (vol. 3, 18.2) and the AMD APM (vol. 2, 13.1) give.
 
@@ -27,45 +28,20 @@ const DR7_ONES: u64 = 1 << 10;
 const DR7_ZEROS: u64 = (1 << 12) | (1 << 14) | (1 << 15);
 /// DR7 bit 11 is RTM on Intel and reserved on AMD.
 const DR7_RTM: u64 = 1 << 11;
-const CR4_LA57: u64 = 1 << 12;
-
-fn is_dr03(reg: vm_reg_name) -> bool {
-    matches!(
-        reg,
-        vm_reg_name::VM_REG_GUEST_DR0
-            | vm_reg_name::VM_REG_GUEST_DR1
-            | vm_reg_name::VM_REG_GUEST_DR2
-            | vm_reg_name::VM_REG_GUEST_DR3
-    )
-}
-
-/// Whether `addr` is canonical for a `bits`-wide linear address.
-fn canonical(addr: u64, bits: u32) -> bool {
-    let shift = 64 - bits;
-    (((addr << shift) as i64) >> shift) as u64 == addr
-}
 
 /// Refuse debug register values that fault in the host.
 pub(super) fn check_debug_regs(
     vcpuid: i32,
     writes: &[RegWrite],
 ) -> Result<(), MigrateError> {
-    let la57 = writes.iter().any(|w| {
-        matches!(*w, RegWrite::Reg(vm_reg_name::VM_REG_GUEST_CR4, v)
-            if v & CR4_LA57 != 0)
-    });
-    let width = if la57 { 57 } else { 48 };
     for write in writes {
         let RegWrite::Reg(reg, value) = *write else {
             continue;
         };
-        let bad = match reg {
-            r if is_dr03(r) => !canonical(value, width),
-            vm_reg_name::VM_REG_GUEST_DR6 | vm_reg_name::VM_REG_GUEST_DR7 => {
-                value >> 32 != 0
-            }
-            _ => false,
-        };
+        let bad = matches!(
+            reg,
+            vm_reg_name::VM_REG_GUEST_DR6 | vm_reg_name::VM_REG_GUEST_DR7
+        ) && value >> 32 != 0;
         if bad {
             return Err(MigrateError::State(format!(
                 "vcpu {vcpuid}: {reg:?} {value:#x} is not a value the \
@@ -129,23 +105,15 @@ mod tests {
     }
 
     #[test]
-    fn a_non_canonical_breakpoint_address_is_refused() {
-        let cr4 = |v| reg(vm_reg_name::VM_REG_GUEST_CR4, v);
-        let dr0 = |v| reg(vm_reg_name::VM_REG_GUEST_DR0, v);
-        let dr3 = |v| reg(vm_reg_name::VM_REG_GUEST_DR3, v);
-        check_debug_regs(0, &[cr4(0), dr0(0xFFFF_8000_0000_1000)])
-            .expect("a kernel address");
-        check_debug_regs(0, &[cr4(0), dr0(0x0000_7FFF_FFFF_F000)])
-            .expect("a user address");
-        check_debug_regs(0, &[cr4(0), dr0(0x0000_8000_0000_0000)])
-            .expect_err("past 48 bits");
-        check_debug_regs(0, &[cr4(0), dr3(0x8000_0000_0000_0000)])
-            .expect_err("a hole address");
-        // Five-level paging widens the canonical range.
-        check_debug_regs(0, &[cr4(CR4_LA57), dr0(0x0000_8000_0000_0000)])
-            .expect("canonical in 57 bits");
-        check_debug_regs(0, &[cr4(CR4_LA57), dr3(0x0100_0000_0000_0000)])
-            .expect_err("past 57 bits");
+    fn any_breakpoint_address_is_taken() {
+        // MOV to DR0-DR3 does not check for a canonical address.
+        for v in [0xFFFF_8000_0000_1000, 0x0000_8000_0000_0000, u64::MAX] {
+            for r in
+                [vm_reg_name::VM_REG_GUEST_DR0, vm_reg_name::VM_REG_GUEST_DR3]
+            {
+                check_debug_regs(0, &[reg(r, v)]).expect("any address");
+            }
+        }
     }
 
     #[test]

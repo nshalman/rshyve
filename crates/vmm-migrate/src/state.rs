@@ -802,8 +802,6 @@ mod tests {
         for (reg, value) in [
             (vm_reg_name::VM_REG_GUEST_DR6, 0x1_FFFF_0FF0),
             (vm_reg_name::VM_REG_GUEST_DR7, 0x8000_0000_0000_0400),
-            (vm_reg_name::VM_REG_GUEST_DR0, 0x0000_8000_0000_0000),
-            (vm_reg_name::VM_REG_GUEST_DR2, 0xDEAD_BEEF_0000_0000),
         ] {
             for amd_host in [false, true] {
                 let mut state = good_state();
