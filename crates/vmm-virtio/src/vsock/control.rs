@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use slog::warn;
 
-use vmm_core::unixsock::write_all_bounded;
+use vmm_core::unixsock::{close_after_write, write_all_bounded};
 use vmm_devices::pci::msix::MsixTable;
 use vmm_devices::pci::LintrCfg;
 
@@ -502,15 +502,29 @@ pub(super) fn run_control_session(
     log: &slog::Logger,
     idle_budget: Duration,
 ) {
+    serve_control_session(slot, shutdown, &mut stream, log, idle_budget);
+    // Halt does not wait for a peer to close.
+    if !shutdown.load(Ordering::Acquire) {
+        close_after_write(stream, RESPONSE_BUDGET);
+    }
+}
+
+fn serve_control_session(
+    slot: &ControlSlot,
+    shutdown: &AtomicBool,
+    stream: &mut UnixStream,
+    log: &slog::Logger,
+    idle_budget: Duration,
+) {
     // Each refusal below writes one line and closes. The write is best
     // effort: the peer may already be gone, and there is nothing else to
     // report to.
     let Some(sink) = slot.sink() else {
         warn!(log, "vsock CONTROL refused; no control sink installed");
-        let _ = write_line(&mut stream, "ERR control interface not available");
+        let _ = write_line(stream, "ERR control interface not available");
         return;
     };
-    if write_line(&mut stream, "OK control").is_err() {
+    if write_line(stream, "OK control").is_err() {
         return;
     }
 
@@ -519,25 +533,25 @@ pub(super) fn run_control_session(
         // without end: this thread holds one of the capped reader
         // slots, and a peer that never speaks again must give it back.
         match read_line_bounded(
-            &mut stream,
+            stream,
             shutdown,
             CONTROL_LINE_MAX,
             Some(Instant::now() + idle_budget),
         ) {
             LineRead::Line(request) => {
                 let answer = answer_line(sink.as_ref(), &request);
-                if write_line(&mut stream, framed(&answer)).is_err() {
+                if write_line(stream, framed(&answer)).is_err() {
                     return;
                 }
             }
             // A truncated request cannot be resynchronised, so the
             // connection ends rather than acting on half a line.
             LineRead::TooLong => {
-                let _ = write_line(&mut stream, "ERR request line too long");
+                let _ = write_line(stream, "ERR request line too long");
                 return;
             }
             LineRead::NotUtf8 => {
-                let _ = write_line(&mut stream, "ERR request is not text");
+                let _ = write_line(stream, "ERR request is not text");
                 return;
             }
             LineRead::Closed => return,
