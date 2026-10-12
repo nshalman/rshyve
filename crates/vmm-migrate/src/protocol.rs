@@ -42,8 +42,9 @@
 pub const PROTOCOL_RON: &str = "vmm-migrate-ron/10";
 
 /// The version that added the wall clock, the interrupt shadow, the
-/// AMD PMU state and the fault-injection test device.
-pub const PROTOCOL_RON_V10: &str = PROTOCOL_RON;
+/// AMD PMU state and the fault-injection test device. A literal, so a
+/// later bump of [`PROTOCOL_RON`] does not move it.
+pub const PROTOCOL_RON_V10: &str = "vmm-migrate-ron/10";
 
 /// The version before, which carries no wall clock and no PMU state.
 pub const PROTOCOL_RON_V9: &str = "vmm-migrate-ron/9";
@@ -334,7 +335,7 @@ mod tests {
     // carrying the v10 state.
     #[test]
     fn a_v10_peer_still_counts_after_a_later_version() {
-        assert!(at_least(PROTOCOL_RON_V10, PROTOCOL_RON_V10));
+        assert!(at_least("vmm-migrate-ron/10", PROTOCOL_RON_V10));
         assert!(at_least("vmm-migrate-ron/11", PROTOCOL_RON_V10));
         assert!(!at_least(PROTOCOL_RON_V9, PROTOCOL_RON_V10));
         assert!(at_least(PROTOCOL_RON, PROTOCOL_RON_V10));
