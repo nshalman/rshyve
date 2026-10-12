@@ -11,6 +11,7 @@ pub mod acpi;
 pub mod acpi_gpe;
 pub mod acpi_pm;
 pub mod aml;
+pub mod audio;
 pub mod bhyve;
 pub mod blkdev;
 pub mod chipset;

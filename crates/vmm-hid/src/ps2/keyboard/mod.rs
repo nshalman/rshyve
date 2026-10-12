@@ -117,6 +117,138 @@ impl KeyEventRep {
     }
 }
 
+/// Scan Code Set 1 base values and their Set 2 twins, one row per
+/// distinct Set 1 value. The 8042's translation is byte by byte, so an
+/// extended key's base value maps the same way as the keypad key that
+/// shares it; the E0 prefix passes through.
+const SET1_TO_SET2: &[(u8, u8)] = &[
+    (SC1_ESCAPE, SC2_ESCAPE),
+    (SC1_1_EXCLAMATION, SC2_1_EXCLAMATION),
+    (SC1_2_AT, SC2_2_AT),
+    (SC1_3_HASH, SC2_3_HASH),
+    (SC1_4_DOLLAR, SC2_4_DOLLAR),
+    (SC1_5_PERCENT, SC2_5_PERCENT),
+    (SC1_6_CARET, SC2_6_CARET),
+    (SC1_7_AMPERSAND, SC2_7_AMPERSAND),
+    (SC1_8_ASTERISK, SC2_8_ASTERISK),
+    (SC1_9_LPAREN, SC2_9_LPAREN),
+    (SC1_0_RPAREN, SC2_0_RPAREN),
+    (SC1_DASH_UNDERSCORE, SC2_DASH_UNDERSCORE),
+    (SC1_EQUALS_PLUS, SC2_EQUALS_PLUS),
+    (SC1_BACKSPACE, SC2_BACKSPACE),
+    (SC1_TAB, SC2_TAB),
+    (SC1_Q, SC2_Q),
+    (SC1_W, SC2_W),
+    (SC1_E, SC2_E),
+    (SC1_R, SC2_R),
+    (SC1_T, SC2_T),
+    (SC1_Y, SC2_Y),
+    (SC1_U, SC2_U),
+    (SC1_I, SC2_I),
+    (SC1_O, SC2_O),
+    (SC1_P, SC2_P),
+    (SC1_LBRACKET_LCURLY, SC2_LBRACKET_LCURLY),
+    (SC1_RBRACKET_RCURLY, SC2_RBRACKET_RCURLY),
+    (SC1_ENTER, SC2_ENTER),
+    (SC1_CTRL_LEFT, SC2_CTRL_LEFT),
+    (SC1_A, SC2_A),
+    (SC1_S, SC2_S),
+    (SC1_D, SC2_D),
+    (SC1_F, SC2_F),
+    (SC1_G, SC2_G),
+    (SC1_H, SC2_H),
+    (SC1_J, SC2_J),
+    (SC1_K, SC2_K),
+    (SC1_L, SC2_L),
+    (SC1_SEMICOLON_COLON, SC2_SEMICOLON_COLON),
+    (SC1_QUOTE_DBLQUOTE, SC2_QUOTE_DBLQUOTE),
+    (SC1_BACKTICK_TILDE, SC2_BACKTICK_TILDE),
+    (SC1_SHIFT_LEFT, SC2_SHIFT_LEFT),
+    (SC1_BACKSLASH_PIPE, SC2_BACKSLASH_PIPE),
+    (SC1_Z, SC2_Z),
+    (SC1_X, SC2_X),
+    (SC1_C, SC2_C),
+    (SC1_V, SC2_V),
+    (SC1_B, SC2_B),
+    (SC1_N, SC2_N),
+    (SC1_M, SC2_M),
+    (SC1_COMMA_LESSTHAN, SC2_COMMA_LESSTHAN),
+    (SC1_PERIOD_GREATERTHAN, SC2_PERIOD_GREATERTHAN),
+    (SC1_KP_SLASH, SC2_KP_SLASH),
+    (SC1_SHIFT_RIGHT, SC2_SHIFT_RIGHT),
+    (SC1_PRINTSCREEN, SC2_PRINTSCREEN),
+    (SC1_ALT_RIGHT, SC2_ALT_RIGHT),
+    (SC1_SPACE, SC2_SPACE),
+    (SC1_CAPS_LOCK, SC2_CAPS_LOCK),
+    (SC1_F1, SC2_F1),
+    (SC1_F2, SC2_F2),
+    (SC1_F3, SC2_F3),
+    (SC1_F4, SC2_F4),
+    (SC1_F5, SC2_F5),
+    (SC1_F6, SC2_F6),
+    (SC1_F7, SC2_F7),
+    (SC1_F8, SC2_F8),
+    (SC1_F9, SC2_F9),
+    (SC1_F10, SC2_F10),
+    (SC1_NUM_LOCK, SC2_NUM_LOCK),
+    (SC1_SCROLL_LOCK, SC2_SCROLL_LOCK),
+    (SC1_HOME, SC2_HOME),
+    (SC1_8_UP, SC2_8_UP),
+    (SC1_PGUP, SC2_PGUP),
+    (SC1_KP_MINUS, SC2_KP_MINUS),
+    (SC1_LEFT, SC2_LEFT),
+    (SC1_5_CENTER, SC2_5_CENTER),
+    (SC1_RIGHT, SC2_RIGHT),
+    (SC1_KP_PLUS, SC2_KP_PLUS),
+    (SC1_1_END, SC2_1_END),
+    (SC1_DOWN, SC2_DOWN),
+    (SC1_3_PGDN, SC2_3_PGDN),
+    (SC1_INSERT, SC2_INSERT),
+    (SC1_DELETE, SC2_DELETE),
+    (SC1_F11, SC2_F11),
+    (SC1_F12, SC2_F12),
+    (SC1_SUPER_LEFT, SC2_SUPER_LEFT),
+    (SC1_SUPER_RIGHT, SC2_SUPER_RIGHT),
+    // No keysym here names these, but an RDP client sends them.
+    (SC1_ISO_BACKSLASH, SC2_ISO_BACKSLASH),
+    (SC1_MENU, SC2_MENU),
+];
+
+/// The Set 2 base value for a Set 1 base value, if the tables know it.
+pub(crate) fn set2_base(set1: u8) -> Option<u8> {
+    SET1_TO_SET2
+        .iter()
+        .find(|(one, _)| *one == set1)
+        .map(|(_, two)| *two)
+}
+
+/// The bytes a Scan Code Set 1 key event is in `set`, or `None` for a
+/// Set 1 value the tables do not know.
+pub(crate) fn scancode_bytes(
+    code: u8,
+    extended: bool,
+    is_pressed: bool,
+    set: PS2ScanCodeSet,
+) -> Option<Vec<u8>> {
+    let base = match set {
+        PS2ScanCodeSet::Set1 => code,
+        PS2ScanCodeSet::Set2 => set2_base(code)?,
+    };
+    let rep = KeyEventRep {
+        keysym_raw: 0,
+        is_pressed,
+        scan_code_1: ScanCodeBase {
+            base_val: code,
+            prefix: extended.then(|| vec![SC1_EXTENDED_PREFIX_0]),
+        },
+        scan_code_2: ScanCodeBase {
+            base_val: base,
+            prefix: extended.then(|| vec![SC2_EXTENDED_PREFIX_0]),
+        },
+    };
+    Some(rep.to_scan_code(set))
+}
+
 impl TryFrom<KeyEvent> for KeyEventRep {
     type Error = anyhow::Error;
 
@@ -347,5 +479,68 @@ impl TryFrom<KeyEvent> for KeyEventRep {
             scan_code_1: sc1,
             scan_code_2: sc2,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Set 2 guest gets the key a Set 1 code names: every key the
+    /// keysym table knows gives the same Set 2 value both ways.
+    #[test]
+    fn every_known_key_has_the_same_set_2_value_both_ways() {
+        let mut checked = 0;
+        for keysym_raw in 0..=0xFFFF {
+            let event = KeyEvent {
+                keysym_raw,
+                is_pressed: true,
+            };
+            let Ok(rep) = KeyEventRep::try_from(event) else {
+                continue;
+            };
+            assert_eq!(
+                set2_base(rep.scan_code_1.base_val),
+                Some(rep.scan_code_2.base_val),
+                "keysym {keysym_raw:#x}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 80, "only {checked} keysyms known");
+    }
+
+    /// Keys an RDP client sends that have no keysym here: the key left
+    /// of Z on an ISO keyboard, and Menu.
+    #[test]
+    fn the_iso_key_and_menu_reach_a_set_2_guest() {
+        let set2 = PS2ScanCodeSet::Set2;
+        assert_eq!(
+            scancode_bytes(SC1_ISO_BACKSLASH, false, true, set2),
+            Some(vec![0x61])
+        );
+        assert_eq!(
+            scancode_bytes(SC1_MENU, true, true, set2),
+            Some(vec![0xE0, 0x2F])
+        );
+        assert_eq!(
+            scancode_bytes(SC1_MENU, true, false, set2),
+            Some(vec![0xE0, 0xF0, 0x2F]),
+            "and its release"
+        );
+    }
+
+    /// A code the tables do not know reaches no Set 2 guest, rather
+    /// than as some other key.
+    #[test]
+    fn an_unknown_code_is_dropped_for_a_set_2_guest() {
+        assert_eq!(
+            scancode_bytes(0x7F, false, true, PS2ScanCodeSet::Set2),
+            None
+        );
+        assert_eq!(
+            scancode_bytes(0x7F, false, true, PS2ScanCodeSet::Set1),
+            Some(vec![0x7F]),
+            "Set 1 passes it as it came"
+        );
     }
 }

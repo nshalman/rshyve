@@ -187,6 +187,25 @@ mod tests {
         assert_eq!(dst_bus.handle_in(PORT_PS2_DATA, 1), 0x1E);
     }
 
+    /// RDP sends scan codes, and they wait for the resume as keysyms
+    /// do, in the order they came: a release after the export would
+    /// otherwise reach only the source, and leave the key held.
+    #[test]
+    fn a_restored_controller_holds_scan_codes_until_its_resume() {
+        let (bus, src) = attached();
+        guest_setup(&bus);
+        let (dst_bus, dst) = attached();
+        dst.restore_state(&src.export_state()).expect("restore");
+
+        dst.key_event(key(true));
+        dst.scancode_event(true, 0x30, false); // B
+        assert_eq!(dst_bus.handle_in(PORT_PS2_CMD_STATUS, 1) & 0x01, 0);
+
+        dst.resume();
+        assert_eq!(dst_bus.handle_in(PORT_PS2_DATA, 1), 0x1E);
+        assert_eq!(dst_bus.handle_in(PORT_PS2_DATA, 1), 0x30);
+    }
+
     #[test]
     fn a_hostile_state_is_refused_and_nothing_changes() {
         let (bus, dst) = attached();

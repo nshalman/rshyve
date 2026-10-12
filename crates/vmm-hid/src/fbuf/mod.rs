@@ -648,6 +648,8 @@ mod tests {
                 .expect("recording keyboard lock")
                 .push((down, keysym));
         }
+
+        fn scancode_event(&self, _down: bool, _code: u8, _extended: bool) {}
     }
 
     #[test]

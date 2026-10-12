@@ -17,6 +17,7 @@ use vmm_core::machine::Machine;
 use vmm_core::mem::{PhysMap, SegidAlloc};
 use vmm_core::mmio::MmioBus;
 use vmm_core::pio::PioBus;
+use vmm_devices::audio::AudioBroker;
 use vmm_devices::chipset::i440fx::I440FxChipset;
 use vmm_devices::InputBroker;
 
@@ -65,6 +66,9 @@ pub struct PciDeviceCtx<'a> {
     pub vmm_hdl: &'a Arc<VmmHdl>,
     pub segids: &'a SegidAlloc,
     pub input: &'a Arc<InputBroker>,
+    /// Where a sound device plays, and where a remote display server
+    /// that carries audio binds its sink.
+    pub audio: &'a Arc<AudioBroker>,
     pub log: &'a Logger,
 }
 
@@ -73,6 +77,7 @@ impl<'a> PciDeviceCtx<'a> {
         machine: &'a Machine,
         chipset: &'a I440FxChipset,
         input: &'a Arc<InputBroker>,
+        audio: &'a Arc<AudioBroker>,
         log: &'a Logger,
     ) -> Self {
         Self {
@@ -83,6 +88,7 @@ impl<'a> PciDeviceCtx<'a> {
             vmm_hdl: machine.hdl(),
             segids: machine.segids(),
             input,
+            audio,
             log,
         }
     }
@@ -97,6 +103,7 @@ impl<'a> PciDeviceCtx<'a> {
             vmm_hdl: &owned.vmm_hdl,
             segids: &owned.segids,
             input: &owned.input,
+            audio: &owned.audio,
             log: &owned.log,
         }
     }
@@ -115,6 +122,7 @@ pub struct OwnedPciCtx {
     vmm_hdl: Arc<VmmHdl>,
     segids: Arc<SegidAlloc>,
     input: Arc<InputBroker>,
+    audio: Arc<AudioBroker>,
     log: Logger,
 }
 
@@ -133,6 +141,7 @@ impl OwnedPciCtx {
             vmm_hdl: machine.hdl().clone(),
             segids: machine.segids().clone(),
             input: input.clone(),
+            audio: Arc::default(),
             log: log.clone(),
         }
     }

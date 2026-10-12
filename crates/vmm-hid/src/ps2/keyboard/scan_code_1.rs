@@ -130,3 +130,8 @@ pub const SC1_ALT_RIGHT: u8 = 0x38;
 
 pub const SC1_SUPER_LEFT: u8 = 0x5b;
 pub const SC1_SUPER_RIGHT: u8 = 0x5c;
+
+/// The key left of Z on an ISO keyboard.
+pub const SC1_ISO_BACKSLASH: u8 = 0x56;
+/// Menu, after the extended prefix.
+pub const SC1_MENU: u8 = 0x5d;

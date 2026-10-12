@@ -363,7 +363,20 @@ struct PS2State {
     paused: bool,
     /// Keys that came while paused, up to [`HELD_KEYS`]. They go to
     /// the guest at the resume. A migration does not carry them.
-    held: std::collections::VecDeque<KeyEvent>,
+    held: std::collections::VecDeque<HeldKey>,
+}
+
+/// A key held back while paused, as the remote console sent it.
+#[derive(Debug, Clone, Copy)]
+enum HeldKey {
+    /// By keysym, from VNC.
+    Sym(KeyEvent),
+    /// By Scan Code Set 1 make code, from RDP.
+    Code {
+        down: bool,
+        code: u8,
+        extended: bool,
+    },
 }
 
 /// A few seconds of typing.
@@ -409,14 +422,31 @@ impl PS2Ctrl {
     }
 
     pub fn key_event(&self, ke: KeyEvent) {
+        self.remote_key(HeldKey::Sym(ke));
+    }
+
+    /// A key from the remote console: held while paused, up to
+    /// [`HELD_KEYS`], else delivered now.
+    fn remote_key(&self, key: HeldKey) {
         let mut state = self.state.lock().unwrap();
         if state.paused {
             if state.held.len() < HELD_KEYS {
-                state.held.push_back(ke);
+                state.held.push_back(key);
             }
             return;
         }
-        self.deliver_key(&mut state, ke);
+        self.deliver(&mut state, key);
+    }
+
+    fn deliver(&self, state: &mut PS2State, key: HeldKey) {
+        match key {
+            HeldKey::Sym(ke) => self.deliver_key(state, ke),
+            HeldKey::Code {
+                down,
+                code,
+                extended,
+            } => self.deliver_scancode(state, down, code, extended),
+        }
     }
 
     fn deliver_key(&self, state: &mut PS2State, ke: KeyEvent) {
@@ -471,6 +501,39 @@ impl PS2Ctrl {
         });
 
         state.pri_port.recv_scancode(scan_code);
+        self.update_intr(state);
+    }
+
+    /// A key by Scan Code Set 1 make code, as RDP sends it, delivered in
+    /// the scan code set the guest reads. A code the tables do not know
+    /// is dropped, as an unknown keysym is.
+    pub fn scancode_event(&self, down: bool, code: u8, extended: bool) {
+        self.remote_key(HeldKey::Code {
+            down,
+            code,
+            extended,
+        });
+    }
+
+    fn deliver_scancode(
+        &self,
+        state: &mut PS2State,
+        down: bool,
+        code: u8,
+        extended: bool,
+    ) {
+        let set = if state.ctrl_cfg.contains(CtrlCfg::PRI_XLATE_EN) {
+            PS2ScanCodeSet::Set1
+        } else {
+            PS2ScanCodeSet::Set2
+        };
+        // The release is `down`; a make code never carries the flag.
+        let Some(bytes) =
+            super::keyboard::scancode_bytes(code & !0x80, extended, down, set)
+        else {
+            return;
+        };
+        state.pri_port.recv_scancode(bytes);
         self.update_intr(state);
     }
 
@@ -690,6 +753,10 @@ impl vmm_devices::KeyboardSink for PS2Ctrl {
             },
         );
     }
+
+    fn scancode_event(&self, down: bool, code: u8, extended: bool) {
+        PS2Ctrl::scancode_event(self, down, code, extended);
+    }
 }
 
 impl Lifecycle for PS2Ctrl {
@@ -708,8 +775,8 @@ impl Lifecycle for PS2Ctrl {
     fn resume(&self) {
         let mut state = self.state.lock().unwrap();
         state.paused = false;
-        while let Some(ke) = state.held.pop_front() {
-            self.deliver_key(&mut state, ke);
+        while let Some(held) = state.held.pop_front() {
+            self.deliver(&mut state, held);
         }
     }
 
@@ -1003,6 +1070,47 @@ mod tests {
 
         set2_ctrl.key_event(key(0xff53, true));
         assert_eq!(set2_bus.handle_in(PORT_PS2_DATA, 1), 0xe0);
+        assert_eq!(set2_bus.handle_in(PORT_PS2_DATA, 1), 0x74);
+    }
+
+    /// RDP sends Scan Code Set 1 make codes with an extended flag. A
+    /// guest that translates reads them as they are; one that does not
+    /// reads their Set 2 twins.
+    #[test]
+    fn scancodes_follow_the_guests_scan_code_set() {
+        let (set1_bus, set1_ctrl, _primary) = attached(None);
+        set_ctrl_cfg(&set1_bus, &CtrlCfg::PRI_XLATE_EN);
+        let set1 = |down, code, extended| {
+            vmm_devices::KeyboardSink::scancode_event(
+                set1_ctrl.as_ref(),
+                down,
+                code,
+                extended,
+            )
+        };
+        set1(true, 0x1e, false);
+        assert_eq!(set1_bus.handle_in(PORT_PS2_DATA, 1), 0x1e);
+        set1(false, 0x1e, false);
+        assert_eq!(set1_bus.handle_in(PORT_PS2_DATA, 1), 0x9e);
+        set1(true, 0x4d, true);
+        assert_eq!(set1_bus.handle_in(PORT_PS2_DATA, 1), 0xe0);
+        assert_eq!(set1_bus.handle_in(PORT_PS2_DATA, 1), 0x4d);
+
+        let (set2_bus, set2_ctrl, _primary) = attached(None);
+        set_ctrl_cfg(&set2_bus, &CtrlCfg::empty());
+        let set2 = |down, code, extended| {
+            vmm_devices::KeyboardSink::scancode_event(
+                set2_ctrl.as_ref(),
+                down,
+                code,
+                extended,
+            )
+        };
+        set2(true, 0x1e, false);
+        assert_eq!(set2_bus.handle_in(PORT_PS2_DATA, 1), 0x1c);
+        set2(false, 0x4d, true);
+        assert_eq!(set2_bus.handle_in(PORT_PS2_DATA, 1), 0xe0);
+        assert_eq!(set2_bus.handle_in(PORT_PS2_DATA, 1), 0xf0);
         assert_eq!(set2_bus.handle_in(PORT_PS2_DATA, 1), 0x74);
     }
 
