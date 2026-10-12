@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use slog::{info, warn, Logger};
-use vmm_core::unixsock::{accept, write_all_bounded};
+use vmm_core::unixsock::{accept, close_after_write, write_all_bounded};
 
 use super::dispatch::dispatch;
 use super::protocol::{Command, Response};
@@ -29,6 +29,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// eight such peers would take the control socket away from every
 /// later client, including the one that stops or migrates the VM.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a closing connection waits for the client to close first.
+/// It still holds its slot until then.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A running control listener.
 ///
@@ -90,6 +93,7 @@ pub fn spawn_control_thread(
                 if let Err(e) = handle_connection(&ctrl, &stream, &connection_log) {
                     warn!(connection_log, "control connection error"; "error" => %e);
                 }
+                close_after_write(stream, CLOSE_TIMEOUT);
             });
         })?;
 
@@ -168,6 +172,8 @@ fn serve_connections<F>(
             ) {
                 warn!(log, "failed to reject excess control connection"; "error" => %e);
             }
+            // A plain close: the accept thread must not wait for this
+            // peer to close as well.
             return;
         };
 

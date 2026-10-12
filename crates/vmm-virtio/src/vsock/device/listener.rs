@@ -11,7 +11,8 @@
 //! polls instead of blocking in `accept`, a peer that sends no verb is
 //! dropped on the handshake budget, and a reader's blocked `read` wakes
 //! on its own poll. So halt does not connect to a socket to wake a
-//! thread, and never waits on a host peer to tear the device down.
+//! thread. A refusal or an ended CONTROL session waits up to 500 ms
+//! for its peer to close, and only when halt has not begun.
 
 use std::io::{self, Read};
 use std::net::Shutdown;
@@ -21,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use slog::{debug, warn};
-use vmm_core::unixsock::write_all_bounded;
+use vmm_core::unixsock::{close_after_write, write_all_bounded};
 
 use super::shared::{VsockShared, HOST_WRITE_TIMEOUT};
 use crate::vsock::control::{
@@ -133,6 +134,7 @@ pub(super) fn handle_host_connect(
                     b"ERR too many control sessions\n",
                     HOST_WRITE_TIMEOUT,
                 );
+                close_refused(&shared, stream);
             }
         },
         HostVerb::Unknown => {
@@ -145,7 +147,15 @@ pub(super) fn handle_host_connect(
                 b"ERROR: expected CONNECT <port>\n",
                 HOST_WRITE_TIMEOUT,
             );
+            close_refused(&shared, stream);
         }
+    }
+}
+
+/// Close a socket after its refusal line, unless halt has begun.
+fn close_refused(shared: &VsockShared, stream: UnixStream) {
+    if !shared.shutdown.load(Ordering::Acquire) {
+        close_after_write(stream, HOST_WRITE_TIMEOUT);
     }
 }
 
@@ -167,6 +177,7 @@ pub(super) fn start_host_connection(
             b"ERROR: too many connections\n",
             HOST_WRITE_TIMEOUT,
         );
+        close_refused(&shared, s);
         return;
     };
     // This thread owns the socket until the REQUEST is queued. Once it

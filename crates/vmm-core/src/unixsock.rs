@@ -10,6 +10,7 @@ pub mod peercred;
 
 use std::fs::{self, DirBuilder, Permissions};
 use std::io;
+use std::net::Shutdown;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::{
     lchown, DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt,
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::poll::wait_writable;
+use crate::poll::{wait_readable, wait_writable, Readiness};
 use peercred::ListenerOwner;
 
 static UMASK_LOCK: Mutex<()> = Mutex::new(());
@@ -405,6 +406,94 @@ fn send_nowait(fd: BorrowedFd<'_>, data: &[u8]) -> io::Result<usize> {
     Ok(sent as usize)
 }
 
+/// Close a connection after its last write without losing that write.
+///
+/// A close on illumos can drop bytes the peer has not read yet, though
+/// every write returned `Ok`, and `SO_LINGER` does not stop it. In
+/// `tl` (io/tl.c):
+///
+/// - A close after `shutdown(Write)` sends the peer a disconnect, and
+///   `tl_discon_ind` flushes the peer's read queue first.
+/// - A close while data waits on this end's queue for a slow peer can
+///   race `tl_data`: it reads `te_closing` once, and its `TL_PUTBQ`
+///   then stops the drain in `tl_close_ser`.
+///
+/// So this end shuts down its writes and waits, up to `budget`, for
+/// the peer to close, which it does once it has read to the end. This
+/// needs a peer that does so: one that stops reading still loses what
+/// it left when the budget runs out. Bytes that the peer sends in the
+/// meantime are dropped.
+///
+/// A peer that already shut down its own writes gets a plain close, so
+/// the race above can still reach it. A shutdown would be worse: both
+/// ends are then idle, the close sends the flushing disconnect, and
+/// `poll` reports a hangup at once, so no wait can see the peer finish.
+/// The same holds for a peer that shuts down its writes after the
+/// check here but before it has read to the end.
+pub fn close_after_write(stream: UnixStream, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    let fd = stream.as_fd();
+    if drain_input(fd, deadline) != Drained::Empty {
+        return;
+    }
+    if stream.shutdown(Shutdown::Write).is_err() {
+        return;
+    }
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match wait_readable(fd, left) {
+            Readiness::Idle => continue,
+            Readiness::Gone => return,
+            Readiness::Readable => {}
+        }
+        if drain_input(fd, deadline) != Drained::Empty {
+            return;
+        }
+    }
+}
+
+/// What [`drain_input`] found.
+#[derive(Debug, PartialEq, Eq)]
+enum Drained {
+    /// Nothing more to read for now.
+    Empty,
+    /// The peer shut down its writes or closed.
+    Closed,
+    /// The read failed, or the deadline passed.
+    Stop,
+}
+
+/// Read and drop what the peer has sent, without waiting for more.
+fn drain_input(fd: BorrowedFd<'_>, deadline: Instant) -> Drained {
+    let mut scratch = [0u8; 4096];
+    loop {
+        if Instant::now() >= deadline {
+            return Drained::Stop;
+        }
+        // SAFETY: `scratch` is a live buffer for the length passed.
+        let got = unsafe {
+            libc::recv(
+                fd.as_raw_fd(),
+                scratch.as_mut_ptr().cast::<libc::c_void>(),
+                scratch.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        match got {
+            0 => return Drained::Closed,
+            n if n > 0 => {}
+            _ => match io::Error::last_os_error().kind() {
+                io::ErrorKind::WouldBlock => return Drained::Empty,
+                io::ErrorKind::Interrupted => {}
+                _ => return Drained::Stop,
+            },
+        }
+    }
+}
+
 fn verify_bound_path(
     path: &Path,
     expected_mode: u32,
@@ -563,6 +652,41 @@ mod tests {
 
         drop(hold);
         reader.join().expect("join the reader");
+    }
+
+    /// The writes that lost the last send on illumos: a short one, a
+    /// long one in chunks, then the close.
+    fn write_then_close(device: UnixStream, big: &[u8]) {
+        write_all_bounded(&device, &[1u8; 52], LIMIT).expect("short write");
+        write_all_bounded(&device, big, LIMIT).expect("long write");
+        close_after_write(device, LIMIT);
+    }
+
+    /// A plain close lost the tail in about one round in 3,000, and a
+    /// shutdown then a close in about one in 100.
+    #[test]
+    fn a_close_after_write_delivers_the_tail() {
+        let big = vec![7u8; 1_920_000];
+        for round in 0..300 {
+            let (mut peer, device) = UnixStream::pair().expect("socketpair");
+            let reader = std::thread::spawn(move || {
+                let mut got = Vec::new();
+                peer.read_to_end(&mut got).map(|_| got.len())
+            });
+            write_then_close(device, &big);
+            let got = reader.join().expect("join").expect("read");
+            assert_eq!(got, 52 + big.len(), "round {round}");
+        }
+    }
+
+    #[test]
+    fn a_peer_that_never_closes_does_not_hold_the_close() {
+        let (_peer, device) = UnixStream::pair().expect("socketpair");
+        let start = Instant::now();
+        close_after_write(device, BUDGET);
+        let took = start.elapsed();
+        assert!(took >= BUDGET, "returned before the budget: {took:?}");
+        assert!(took < LIMIT, "held past the limit: {took:?}");
     }
 
     /// A directory another thread creates while the bind holds the
