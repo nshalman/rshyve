@@ -94,7 +94,7 @@ an interrupt-IN TRB armed, and the tablet's position, buttons, wheel steps
 not yet reported and USB settings. The wheel is new in v13; a v12 peer
 drops it, losing the steps the guest had not yet read. The
 device contexts and the rings are guest memory, which the RAM passes
-carry; this model writes no output device context.
+carry, and the model keeps the output device context current there.
 
 No transfer is in flight at the pause. Every ring is walked inline on
 the thread that rang the doorbell. The one writer of guest memory that
@@ -127,12 +127,16 @@ the ACPI PM timer are in the kernel and travel as kernel payloads. A
 UART's IIR and interrupt line, and the GPE0 SCI, are computed again
 from the carried registers. The model has no FCR state.
 
-The UARTs, the i8042 and the xHCI take no host input while paused: a
-byte that landed after the kernel interrupt state was exported would
-raise a line the destination kernel never sees, and the port would
-stall. Host bytes offered during the pause are dropped; the console
-and the mdata agent retry. On the destination these devices stay
-paused from the restore to the resume. Their interrupt lines are set
+The UARTs, the i8042 and the xHCI pass no host input to the guest
+while paused: a byte that landed after the kernel interrupt state was
+exported would raise a line the destination kernel never sees, and the
+port would stall. Each holds the input for its resume instead. A UART
+holds up to 256 bytes, and the i8042 up to 64 keys and scan codes, in
+the order they came; past that, input is dropped. The xHCI tablet keeps
+its latest pointer position, buttons and unread wheel steps, which
+migrate with it. What a UART or the i8042 held on the source does not
+migrate; the console and the mdata agent retry. On the destination
+these devices stay paused from the restore to the resume. Their interrupt lines are set
 on restore only so this side's count of each line matches the level
 that the kernel import then puts back.
 

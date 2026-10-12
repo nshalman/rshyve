@@ -358,6 +358,8 @@ The device reports zero latency to the guest, so buffering in the RDP client is 
 
 **No options are parsed.** The config field is never read, so `,tablet`, `,keyboard` and nothing at all all produce the same single absolute-pointer tablet. The `,tablet` in the docs and in bhyve-shaped command lines is decorative.
 
+The controller migrates: its registers, ring cursors, slot and tablet state go on the wire, and the device contexts are in guest memory. While it is paused, a pointer event waits for the resume instead of writing guest memory.
+
 Intel 0x8086:0x1E31, BAR0 8 KiB MMIO, INTx only (no MSI or MSI-X). `HCSPARAMS1` advertises MaxSlots 64, but only one device slot is implemented: a second Enable Slot returns `TRB_CC_NO_SLOTS_AVAILABLE`. Two ports (USB2 disconnected, USB3 with the tablet), one interrupter, EP0 control and EP1 IN only.
 
 The tablet reports 3 buttons and 16-bit absolute X/Y. `bInterfaceSubClass` is 0, so there is no boot-protocol fallback for firmware that speaks only boot mouse. The report carries a wheel, driven by VNC buttons 4 and 5 and by RDP wheel events.
@@ -490,7 +492,7 @@ The sequence is: full RAM pass, dirty convergence passes back to back until one 
 
 Kernel state transferred: the ioapic, atpit, atpic, hpet, pm_timer and rtc system devices; per vCPU the 33 registers, 10 segment descriptors, MSRs, LAPIC, VMM_ARCH, run state and SIPI vector; and VMM time with boot_hrtime re-basing and TSC rescaling.
 
-Guarded refusals: a vTPM or a bootrom variable store blocks `migrate-source`, and so does any device whose state nothing carries, which is `ahci-cd`, `virtio-console`, `virtio-fs`, `virtio-vsock` and `xhci` (`UNMIGRATABLE`, `bin/rshyve/src/control/migrate.rs:152`). `--migrate-listen` combined with `--vtpm`, a varstore, or an `fbuf`/`ahci-cd` spec is a startup error. The remaining asymmetry is covered at the preamble rather than at startup: the two ends exchange their whole device set and a migration whose sets differ is refused before a page is accepted, so a destination holding a device the source has not cannot start the guest.
+Guarded refusals: a vTPM or a bootrom variable store blocks `migrate-source`, and so does any device whose state nothing carries, which is `ahci-cd`, `virtio-console`, `virtio-fs` and `virtio-vsock` (`UNMIGRATABLE`, `bin/rshyve/src/control/migrate.rs`). `--migrate-listen` combined with `--vtpm`, a varstore, or an `ahci-cd` spec is a startup error. The remaining asymmetry is covered at the preamble rather than at startup: the two ends exchange their whole device set and a migration whose sets differ is refused before a page is accepted, so a destination holding a device the source has not cannot start the guest.
 
 Orchestration is not in this repository. Replicating the disk, sequencing the two hosts and bridging the transport belong to whatever drives the migration; this tree provides the VMM side, the control-socket verbs and the barrier contract (see [migration.md](migration.md#the-zfs-barrier)). `tools/vmm-migrate.sh` drives one end to end for lab use and is a test harness, not a supported component.
 
@@ -645,7 +647,7 @@ Absent, with no partial path:
 - **A boot-protocol flag.** The kernel file decides. No multiboot, no raw vmlinux without a PVH note, no real-mode entry, no bzImage protocol older than 2.12, no 32-bit-only bzImage.
 - **Kernel relocation or KASLR placement**, initrd above 4 GiB, and multiple initrd modules.
 - **UEFI in firehyve**, in any form: no bootrom, no variable store, no CSM.
-- **Migration of the UEFI variable store, vTPM NV state, framebuffer state, xHCI state, AHCI state, Hyper-V state, virtio-fs state, virtio-console state, or LPC UART state.** The first three are hard refusals; the rest are simply not in the protocol and not on any reject list.
+- **Migration of the UEFI variable store, vTPM NV state, AHCI state, virtio-fs state, or virtio-console state.** `migrate-source` refuses a VM holding any of them.
 - **Migration of disk contents.** The protocol carries no block data. Disks move separately by ZFS send/recv, and only for ZFS zvols.
 - **FPU/XSAVE state transfer.** `state.rs` sets `let fpu = Vec::new();`.
 - **A migration cancel command**, migration IDs, expiry, and replay protection.
@@ -719,7 +721,7 @@ These parse without complaint and do nothing. Each one is a way to believe you c
 
 **Build on a platform image no newer than the oldest node you deploy to.** `tools/check-needed.sh` pins `MAX_OPENSSL_SMARTOS=3.0.9`, because `ld.so.1` refuses a binary whose recorded `OPENSSL_SMARTOS_<ver>` the node's library does not define. The platform-OpenSSL link path is taken only when host and target match and `/lib/amd64/libcrypto-smartos.so.3` exists; a cross build silently falls back to pkg-config, which is the configuration that once produced a binary recording `NEEDED libcrypto.so.3` that no platform image ships.
 
-**virtio-fs, virtio-console, virtio-vsock and xhci carry no migration state at all, so a VM holding one cannot be a migration source.** `migrate-source` names the device and refuses. In-flight FUSE requests, the console backlog and the attached client have no place on the wire, and refusing is what keeps the guest from finding the device at reset on the far side.
+**virtio-fs, virtio-console and virtio-vsock carry no migration state at all, so a VM holding one cannot be a migration source.** `migrate-source` names the device and refuses. In-flight FUSE requests, the console backlog and the attached client have no place on the wire, and refusing is what keeps the guest from finding the device at reset on the far side.
 
 ## Documentation that contradicts the code
 
