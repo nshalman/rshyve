@@ -42,8 +42,10 @@ and a real init. What they do and do not show is in
 | NVMe | Complete | Async I/O, zero-copy, 8 workers, 2.8 GB/s |
 | virtio-net (viona) | Complete | Interrupt polling, promiscphys |
 | virtio-rnd | Complete | /dev/random entropy |
-| Framebuffer/VNC | Partial | Unix socket only, Raw encoding, one client; no VGA, no TCP, no `wait` |
-| xHCI USB tablet | Partial | One slot, absolute pointer, no scroll wheel, no migration state |
+| Framebuffer/VNC | Partial | Unix socket only, Raw and ZRLE, changed tiles only, one client; no VGA, no TCP, no `wait` |
+| virtio-gpu | Experimental | 2D, one scanout; VNC and RDP (TLS, one account, one connection); guest-driven resize; migrates (clients reconnect); no firmware display, no 3D |
+| virtio-snd | Experimental | Playback only, 48 kHz stereo S16, heard over RDP; migrates |
+| xHCI USB tablet | Partial | One slot, absolute pointer with wheel, migrates |
 | PCI passthrough | Partial | Intel VT-d only, no AMD IOMMU backend; MSI-X devices refused. Not fully audited (OSF-5) and never run with an assigned device (OSF-11). See [devices.md](devices.md#pci-passthrough) |
 | AHCI CD-ROM (`ahci-cd`) | Complete | ATAPI SCSI/MMC, zero-copy reads |
 | AHCI disk (`ahci-hd`) | Not implemented | Rejected at startup; use virtio-blk or nvme |

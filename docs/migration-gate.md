@@ -236,10 +236,12 @@ write as a duplicate.
 
 ## Stream version
 
-The migration stream is `vmm-migrate-ron/12`, which has one framebuffer
-VRAM form and a required source wall clock. v10 added the source wall
-clock, the interrupt shadow, the AMD PMU state and the fault-injection
-test device to v9. A source with a ring disk refuses a
+The migration stream is `vmm-migrate-ron/13`, which adds virtio-gpu
+and virtio-snd state, and the tablet's unread wheel steps, to v12. v12
+has one framebuffer VRAM form and a required source wall clock. v10
+added the source wall clock, the interrupt shadow, the AMD PMU state
+and the fault-injection test device to v9. A source with a ring disk
+refuses a
 v6 destination right after the protocol choice, before the pause.
 Every VM has the COM1 and COM2 UARTs, so every VM needs v9 or newer at
 both ends. An older destination does not start with a ring

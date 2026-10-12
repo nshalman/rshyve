@@ -12,21 +12,26 @@ One driver serves both transports: a Unix socket inside a bhyve zone,
 where `/dev/poll` is unavailable and the GZ agent bridges to the peer,
 and a TCP socket elsewhere.
 
-The protocol identifier is `vmm-migrate-ron/12`. v12 has the v10
-payload, but the framebuffer VRAM is LZ4 only and the source must send
-its wall clock. Builds before v12 sent v8 to v10 with the VRAM as zstd
-or as LZ4, and v10 with or without the wall clock, under one version
-string. So to a v8 to v10 peer the source sends the VRAM in both forms,
-and from one the destination takes either form and no wall clock. v11
-is the virtio-gpu work's (PR #15) and is not offered. v10 adds the
-source host's wall clock to the preamble, the interrupt shadow, the AMD
-PMU state, and the fault-injection test device (see "Kernel Devices",
-"Host clock skew" and "Testing a retry" below). A source offers v12,
-v10, v9, v8, v7 and v6, and a destination takes the newest it reads. Each
-end then checks that the chosen version carries everything this VM
-has, and refuses an older peer at the protocol choice, before the
-pause. An AMD source with PMU state, or a VM with the test device,
-needs v10 at both ends. v9 added the xHCI controller and the devices
+The protocol identifier is `vmm-migrate-ron/13`. v13 adds the state a
+virtio device keeps behind its transport (see "virtio-gpu and
+virtio-snd" below) and the xHCI tablet's unread wheel steps. A VM with
+virtio-gpu or virtio-snd needs v13 at both ends; any other VM sends a
+payload a v12 peer reads, which ignores the wheel steps. v12 has the
+v10 payload, but the framebuffer VRAM is LZ4 only and the source must
+send its wall clock. Builds before v12 sent v8 to v10 with the VRAM as
+zstd or as LZ4, and v10 with or without the wall clock, under one
+version string. So to a v8 to v10 peer the source sends the VRAM in
+both forms, and from one the destination takes either form and no wall
+clock. v11 was never released: the virtio-gpu work (PR #15) held it
+before v12, and moved to v13. A source offers v13, v12, v10, v9, v8, v7
+and v6, and a destination takes the newest it reads. Each end then
+checks that the chosen version carries everything this VM has, and
+refuses an older peer at the protocol choice, before the pause. v10
+added the source host's wall clock to the preamble, the interrupt
+shadow, the AMD PMU state, and the fault-injection test device (see
+"Kernel Devices", "Host clock skew" and "Testing a retry" below). An
+AMD source with PMU state, or a VM with the test device, needs v10 or
+newer at both ends. v9 added the xHCI controller and the devices
 with no PCI address. Every VM has the COM1 and COM2 UARTs, so in
 practice every VM needs v9 or newer at both ends.
 v8 added the framebuffer state. v7 has the v6 payload and says the
@@ -39,7 +44,8 @@ Event Requests a controller holds. A v4 peer carried no FPU state, so
 the guest resumed on the destination's FPU registers (OSF-2). v4 named
 the store under each NVMe namespace, v3 added held NVMe completions and
 the namespace shape, v2 the CQ interrupt-enable bit, and v1 device
-identity. v5 is reserved for virtio-gpu state (PR #15).
+identity. v5 was the virtio-gpu work's own stream before it was built
+on v10 (PR #15), and is refused.
 
 Every PCI device header on the wire also carries the Interrupt Line
 the firmware wrote, since v9.
@@ -62,19 +68,37 @@ The VNC socket path and password come from the destination's own `-s`
 spec, which `migrate-config` gives. They are not on the wire. VNC
 clients of the source are dropped and reconnect to the destination.
 
+### virtio-gpu and virtio-snd
+
+virtio-gpu carries every resource (its id, size and backing page
+list), the scanout, the cursor and the size offered to the guest. The
+pixels are not on the wire: every resource is backed by guest pages,
+which the RAM passes carry, and the destination reads each one back
+from them and shows the scanout whole. virtio-snd carries the stream's
+parameters and state, so a running stream plays the guest's next
+message on the destination without a new START. Its pause hands back
+every queued message at once, unplayed, so the guest loses a fraction
+of a second of sound.
+
+VNC and RDP clients of the source are dropped and reconnect to the
+destination, which serves the display with its own `-s` options,
+certificate and password file.
+
 ### xHCI tablet
 
-The `xhci` device (the VNC tablet) carries its PCI header (command,
+The `xhci` device (the tablet VNC and RDP drive) carries its PCI header (command,
 BARs and Interrupt Line), the operational, port and interrupter
 registers, the controller's cursors into the command ring, the event
 ring and both transfer rings, the slot state, whether the guest left
-an interrupt-IN TRB armed, and the tablet's position, buttons and USB
-settings. The device contexts and the rings are guest memory, which the
-RAM passes carry; this model writes no output device context.
+an interrupt-IN TRB armed, and the tablet's position, buttons, wheel steps
+not yet reported and USB settings. The wheel is new in v13; a v12 peer
+drops it, losing the steps the guest had not yet read. The
+device contexts and the rings are guest memory, which the RAM passes
+carry; this model writes no output device context.
 
 No transfer is in flight at the pause. Every ring is walked inline on
 the thread that rang the doorbell. The one writer of guest memory that
-runs when no vCPU does is a pointer event from VNC, and the pause holds
+runs when no vCPU does is a pointer event from VNC or RDP, and the pause holds
 it back: the report waits in the tablet. The destination restores the
 state paused, replays the BARs so BAR0 decodes again, and on its resume
 delivers a held report to the TRB the guest left armed. A source that

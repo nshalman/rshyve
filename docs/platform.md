@@ -206,8 +206,8 @@ runs it on every build.
 | virtio-net (viona) | Yes | Yes |
 | AHCI CD-ROM (`ahci-cd`) | Yes | Yes (ATAPI, zero-copy reads) |
 | AHCI disk (`ahci-hd`) | Yes | No, refused at startup |
-| Framebuffer/VNC | Yes | Unix socket only: no TCP, no `wait`, no VGA, Raw encoding, one client |
-| xHCI tablet | Yes | One slot, absolute pointer, no scroll wheel |
+| Framebuffer/VNC | Yes | Unix socket only: no TCP, no `wait`, no VGA, Raw and ZRLE encodings, one client |
+| xHCI tablet | Yes | One slot, absolute pointer with a scroll wheel |
 | PCI passthrough | Yes | Intel VT-d only. There is no AMD IOMMU backend, MSI-X devices are refused, and no assigned device has ever been run (OSF-11) |
 | Live migration | No | Yes |
 | CPUID masking | No | Yes (--cpu-baseline) |

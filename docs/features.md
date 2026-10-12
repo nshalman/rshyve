@@ -37,11 +37,15 @@ Markers: **yes** works, **caveat** works with a condition named in the matching 
 | `virtio-fs` host passthrough | yes | yes | `crates/vmm-virtio/src/fs/` |
 | virtio-fs DAX, xattrs, ACLs, locking | no | no | `fs/server.rs:112` dispatch |
 | **Display** | | | |
-| `fbuf` framebuffer plus VNC on a Unix socket | caveat | reject | `crates/vmm-hid/src/fbuf/mod.rs:163` |
+| `fbuf` framebuffer plus VNC on a Unix socket | caveat | reject | `crates/vmm-hid/src/fbuf/mod.rs:116` |
+| `virtio-gpu` 2D display plus VNC on a Unix socket | exp | reject | `crates/vmm-virtio/src/gpu/mod.rs` |
+| RDP (TLS, one account) for a `virtio-gpu` display | exp | reject | `crates/vmm-rdp/` |
 | VNC over TCP, bhyve `wait`, VGA emulation | no | no | no `TcpListener` in `crates/vmm-hid`; no 0x3C0/0x3D4 handlers |
+| **Audio** | | | |
+| `virtio-snd` playback, heard over RDP | exp | reject | `crates/vmm-virtio/src/sound/mod.rs` |
 | **Input** | | | |
 | PS/2 keyboard (always present, no flag) | yes | no | `bin/rshyve/src/input.rs` `setup_ps2` |
-| `xhci` USB 3.0 with absolute tablet | caveat | reject | `crates/vmm-hid/src/xhci/mod.rs:198` |
+| `xhci` USB 3.0 with absolute tablet | caveat | reject | `crates/vmm-hid/src/xhci/mod.rs:249` |
 | USB keyboard | no | no | absent from the tree |
 | PS/2 mouse motion | no | no | `ps2/mouse.rs` `movement()` returns zeros |
 | **Migration and control** | | | |
@@ -89,7 +93,8 @@ Option strictness is not uniform, and this matters:
 |---|---|
 | `virtio-blk`, `virtio-blk-pci`, `nvme` | silently ignored (`attach.rs:78`) |
 | `virtio-net-viona` | silently ignored (`attach.rs:157`) |
-| `fbuf`, `passthru`, `xhci`, `virtio-rnd`, `hostbridge`, `lpc` | silently ignored or never read |
+| `passthru`, `xhci`, `virtio-rnd`, `hostbridge`, `lpc` | silently ignored or never read |
+| `fbuf` | hard error (`bin/rshyve/src/pcidev/display.rs`) |
 | `virtio-console` | hard error (`console.rs:346`) |
 | `virtio-fs` | hard error (`fs/mod.rs:117`) |
 | `ahci-cd` | hard error (`bin/rshyve/src/main.rs:966`) |
@@ -300,20 +305,50 @@ Path-escape defense is real and tested. `validate_name` (`fs/passthrough.rs:1318
 ### fbuf and VNC
 
 ```
--s <slot>[:<func>],fbuf[,unix=<path>][,password=<pw>][,w=<n>][,h=<n>]
+-s <slot>[:<func>],fbuf[,unix=<path>][,password-file=<path>][,password=<pw>][,w=<n>][,h=<n>][,vga=off]
 ```
 
-Those four keys are the whole parser (`bin/rshyve/src/main.rs:1163`). Defaults: socket `/var/run/rshyve/<vm_name>/vnc.sock`, no password, 1024x768. `w=abc` silently gives 1024. Every other key is ignored, **including `vga=`**: there is no VGA emulation to turn on, and `vga=on` does nothing. bhyve's `tcp=`, `rfb=` and `wait` are also ignored rather than rejected, so `-s 30:0,fbuf,tcp=0.0.0.0:5900` starts a VNC server on the default Unix socket with no diagnostic.
+Those keys are the whole parser (`bin/rshyve/src/pcidev/display.rs`). Defaults: socket `/var/run/rshyve/<vm_name>/vnc.sock`, no password, 1024x768. Any other key is a startup error naming it, and so is a size that does not parse or is 0. `vga=off` is accepted and does nothing, because there is no VGA emulation; `vga=on`, and bhyve's `tcp=`, `rfb=` and `wait`, are refused. `password-file=` reads the password from a file; `password=` still works, but puts it in argv and logs a warning saying so.
 
 PCI identity 0xFB5D:0x40FB matches C bhyve's `pci_fbuf`, so the OVMF bhyve GOP driver binds. BAR1 is a fixed 16 MiB XRGB8888 framebuffer backed by a devmem segment mapped into the guest, not a trapping MMIO region. Each fbuf consumes one VM memory segment; exhausting them fails attach.
 
-The RFB server always speaks 3.8 framing, always sends XRGB8888, and always sends a single full-screen Raw rectangle. `SetPixelFormat` and `SetEncodings` are parsed, warned about, and ignored; the `incremental` flag is discarded. The frame loop sleeps 33 ms and parses at most one client message per pass, so input is capped near 30 events per second. One client at a time, strictly sequential.
 
-Guest writes to BAR0 can change resolution (2-byte writes at 0x04 and 0x06, or one 4-byte write at 0x04) and are validated against the 16 MiB BAR, giving a 2048x2048 ceiling. The CLI `w=`/`h=` path skips that check; an oversized CLI resolution produces a vertically truncated picture rather than an error. A resolution change is never pushed to a connected client; there is no DesktopSize pseudo-encoding.
+Guest writes to BAR0 can change resolution (2-byte writes at 0x04 and 0x06, or one 4-byte write at 0x04) and are validated against the 16 MiB BAR, giving a 2048x2048 ceiling. The CLI `w=`/`h=` path skips that check; an oversized CLI resolution produces a vertically truncated picture rather than an error. A resolution change reaches a connected client that asked for the DesktopSize or ExtendedDesktopSize pseudo-encoding; a client asking to change the size is refused, since only the guest can.
+
+### The VNC server (fbuf and virtio-gpu)
+
+Both displays are served by one RFB server (`crates/vmm-hid/src/vnc/mod.rs`), which reads the pixels through the `DisplaySource` trait (`crates/vmm-devices/src/display.rs`). It speaks RFB 3.8 and always sends XRGB8888: `SetPixelFormat` is parsed and ignored, with a warning when the client asks for other than 32 bits per pixel, so a client that depends on its own format shows wrong colours. It sends Raw, or ZRLE when the client lists it. It answers an incremental update request only when something has changed, and then sends only the 64x64 tiles that differ from what that client last received. It sends a frame at most every 33 ms, and parses at most one client message per pass, so input is capped near 30 events per second. A client that lists ExtendedDesktopSize may ask for a new size; virtio-gpu passes the request to the guest, which decides, and fbuf refuses it. One client at a time, strictly sequential: a second connection waits.
 
 Authentication exists but is legacy RFB VncAuth. With no password the server offers only security type None and refuses a client that selects VncAuth; with a password it offers only VncAuth and refuses None, so there is no downgrade path. The password value is used verbatim (no base64) and the RFB DES scheme truncates it to 8 bytes. There is no transport encryption and no attempt rate limiting. The socket is 0600 in a 0700 directory with no peer-credential check, unlike the control socket.
 
-Clipboard text is read off the wire and thrown away. `Framebuffer::shutdown()` exists and nothing calls it, so the VNC thread lives until process exit and the socket file is left on disk until the next bind unlinks it.
+Clipboard text is read off the wire and thrown away. The server stops when its device halts; the socket file is left on disk until the next bind unlinks it.
+
+### virtio-gpu, VNC and RDP
+
+```
+-s <slot>[:<func>],virtio-gpu[,unix=<path>][,password-file=<path>][,password=<pw>][,w=<n>][,h=<n>]
+    [,rdp=<addr:port>|unix:<path>,rdp-cert=<pem>,rdp-key=<pem>,rdp-user=<name>,rdp-password-file=<path>]
+```
+
+A walkthrough of the whole setup, guest included, is in [remote-desktop.md](remote-desktop.md).
+
+A VirtIO 1.x GPU, 2D only: one scanout, no EDID, no 3D (`crates/vmm-virtio/src/gpu/mod.rs`). The guest renders into its own memory and tells the device which rectangle changed, so the servers send only that. `w=` and `h=` are the size the device offers the guest as preferred (default 1024x768), at most 128 MiB of pixels, the largest a migration destination takes; the guest picks its mode. The VNC keys are fbuf's, and the default socket is `/var/run/rshyve/<vm_name>/gpu-vnc.sock`. Linux's `virtio_gpu` driver binds it. The bhyve UEFI firmware has no virtio-gpu driver, so nothing is shown before the guest kernel's driver loads; keep an `fbuf` alongside to see firmware and boot loader.
+
+The RDP keys serve the same display over RDP (`crates/vmm-rdp/`, on IronRDP). RDP listens on TCP, or on a Unix socket bound mode 0600 with `rdp=unix:<path>`, and either way it is served only with TLS and one fixed account: all five keys are required together, and naming any of them without the rest is a startup error that lists what is missing. The password comes only from a file. `rdp=0.0.0.0:3389` listens on every address. The server sends the display as RemoteFX Progressive over the graphics pipeline (EGFX) when the client opens it, and otherwise over the classic bitmap path as RemoteFX or NSCodec; the macOS Windows App offers only NSCodec there. Keyboard input reaches the guest as PS/2 scan codes and the pointer and wheel through the xHCI tablet, so the VM needs an `xhci` device for the mouse. A client window resize is passed to the guest as a new preferred size. Guest audio, from a `virtio-snd` device, plays on the client.
+
+Limits of the RDP server: one connection at a time; no NLA (CredSSP), so a wrong password surfaces in some clients as a generic protocol error; no H.264 or other video codec, so full-screen video is bandwidth heavy; no clipboard; no multiple monitors. The guest's hardware cursor, which virtio-gpu receives on its cursor queue, goes to an RDP client as a 32-bit pointer update for the client to draw at its own mouse position; a guest that hides it hides the client's, and one past 96 pixels falls back to the client's default. VNC does not forward it yet, so a VNC client sees no pointer on a guest that uses the hardware cursor. IronRDP's logging is forwarded to the VMM's log at info; `VMM_RDP_TRACE=debug` (or `trace`) in the environment lets more through.
+
+virtio-gpu migrates on `vmm-migrate-ron/13`. Its resources, scanout, cursor and offered mode go with the transport; the pixels do not, because every resource is backed by guest pages, which the migration carries, and the destination reads each resource back from them. VNC and RDP clients are disconnected by the move and reconnect to the destination, which serves the display with its own `-s` options, certificate and password file.
+
+### virtio-snd
+
+```
+-s <slot>[:<func>],virtio-snd
+```
+
+A VirtIO sound device with one output stream, stereo signed 16-bit at 48 kHz, and no capture, jacks or controls (`crates/vmm-virtio/src/sound/mod.rs`). It takes no options. The guest's playback is paced in real time: the device hands each buffer back when a playback clock has run through it, and sends its audio on when the clock reaches it, so audio leaves the host in step with the guest's own audio clock. It is heard through the `virtio-gpu` RDP server when one runs, and is otherwise dropped. Linux's `virtio_snd` driver binds it; with PipeWire, the card is the default sink.
+
+The device reports zero latency to the guest, so buffering in the RDP client is not compensated for: over a slow link, audio may trail the picture. virtio-snd migrates on `vmm-migrate-ron/13`: a pause hands back every queued message at once, unplayed, so the guest loses a fraction of a second of sound, and the stream's parameters and state go with the transport.
 
 ### xHCI tablet
 
@@ -325,7 +360,7 @@ Clipboard text is read off the wire and thrown away. `Framebuffer::shutdown()` e
 
 Intel 0x8086:0x1E31, BAR0 8 KiB MMIO, INTx only (no MSI or MSI-X). `HCSPARAMS1` advertises MaxSlots 64, but only one device slot is implemented: a second Enable Slot returns `TRB_CC_NO_SLOTS_AVAILABLE`. Two ports (USB2 disconnected, USB3 with the tablet), one interrupter, EP0 control and EP1 IN only.
 
-The tablet reports 3 buttons and 16-bit absolute X/Y. `bInterfaceSubClass` is 0, so there is no boot-protocol fallback for firmware that speaks only boot mouse. The HID descriptor declares a wheel field but `get_report` always emits 0, so VNC scroll does nothing.
+The tablet reports 3 buttons and 16-bit absolute X/Y. `bInterfaceSubClass` is 0, so there is no boot-protocol fallback for firmware that speaks only boot mouse. The report carries a wheel, driven by VNC buttons 4 and 5 and by RDP wheel events.
 
 ### PS/2
 
@@ -576,6 +611,8 @@ The kernel command line is fhrun-owned and cannot be edited, only appended to: `
 | virtio-fs | `queue-size` 8..=1024 rounded up to a power of two (default 128), tag 36 bytes, max_write 512 KiB, max_background 64, 1 MiB per request body |
 | fbuf | BAR1 fixed at 16 MiB, so 2048x2048 max; 33 ms frame tick capping input near 30 events/s; VNC password truncated to 8 bytes; 1 client |
 | xHCI | MaxSlots 64 advertised, 1 implemented; BAR0 8 KiB; INTx only |
+| virtio-gpu | 1 scanout; 256 MiB of host memory across all resources; requests served on the notifying vCPU; 1 VNC client and 1 RDP connection |
+| virtio-snd | 1 output stream, 48 kHz stereo S16 only; a hardware buffer of at most 1 MiB |
 | vTPM | locality 0 only, 3968-byte command buffer, one VM per process |
 | Control socket | 8 concurrent connections, 64 KiB per request line, 30 s read, 10 s write |
 | PCI hotplug | slots 2..=31 on bus 0 function 0; 5 s quiesce budget per eject; the eject drain runs every 100 ms |
@@ -593,7 +630,8 @@ Absent, with no partial path:
 
 - **`ahci-hd`.** rshyve fails at startup with "AHCI device type 'ahci-hd' is not implemented; use virtio-blk or nvme" (`bin/rshyve/src/main.rs:974`). There is no AHCI hard-disk code in `crates/vmm-storage`; the module is ATAPI only.
 - **Any emulated NIC other than viona-backed virtio-net.** No e1000, rtl8139, vmxnet, tap, netgraph or slirp.
-- **virtio-scsi, virtio-9p, virtio-balloon, virtio-input, virtio-gpu.**
+- **virtio-scsi, virtio-9p, virtio-balloon, virtio-input.** virtio-gpu is 2D only: no 3D (virgl or venus).
+- **Audio capture**, and audio from an `fbuf` VM or one without RDP.
 - **PCI passthrough on an AMD host**, and passthrough of any device that advertises MSI-X. Neither is a gap in this VMM alone: illumos builds no `vmm_amdvi` module, and its VT-d driver does no interrupt remapping. See [PCI passthrough](#pci-passthrough-rshyve-only).
 - **Interrupt remapping for a passed-through device**, and therefore any equivalent of the Linux `allow_unsafe_interrupts` override. There is no knob to turn the MSI-X refusal off.
 - **Hot-remove of a CPU or of memory.** Both are impossible at the illumos kernel boundary, not merely unimplemented: there is no `vm_deactivate_cpu` and no `VM_FREE_MEMSEG`. Both commands exist and are refused with that reason. See [Hotplug](#hotplug-both-binaries). Hot-ADD of a PCI device, a CPU or memory is supported behind `--hotplug`, and PCI hot-remove works when the guest runs `_EJ0`.
@@ -631,8 +669,7 @@ These parse without complaint and do nothing. Each one is a way to believe you c
 | `nvme,...,num-queues=N`, `nvme,...,nodelete` | Parsed and discarded. |
 | `virtio-blk,...,nodelete` | Parsed, stored, never read (`block.rs:113`, `#[allow(dead_code)]`). |
 | virtio-blk DISCARD / WRITE_ZEROES | Feature bits are advertised on every writable disk and the handlers return OK without touching the file. `fstrim` reports success and does nothing. The related config fields at offset 0x24 and beyond read zero. |
-| `fbuf,...,vga=on` / `vga=off` / `vga=io` | Discarded. There is nothing to enable. |
-| `fbuf,...,tcp=...`, `fbuf,...,wait` | Ignored, not rejected. VNC still binds the default Unix socket. |
+| `fbuf,...,vga=off` | Accepted. There is no VGA to turn off. |
 | `xhci,tablet` / `xhci,keyboard` / anything | The config field is never read. |
 | `passthru,<path>,<anything>` | Only the first field is used. |
 | `virtio-rnd,<anything>` | The config is never read. |

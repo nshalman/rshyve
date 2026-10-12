@@ -19,6 +19,8 @@ marked "both" and fails at startup on the rest, naming the driver.
 | `ahci-cd` | rshyve | Storage | ATAPI CD-ROM, read only |
 | `ahci-hd` | neither | Storage | Not implemented. A hard startup error, not a fallback |
 | `fbuf` | rshyve | Display | Framebuffer with an RFB/VNC server on a Unix socket |
+| `virtio-gpu` | rshyve | Display | VirtIO 2D GPU with VNC on a Unix socket, and optionally RDP over TLS |
+| `virtio-snd` | rshyve | Audio | VirtIO sound, playback only, heard over the `virtio-gpu` RDP server |
 | `xhci` | rshyve | USB | xHCI USB 3.0 controller with an absolute tablet |
 | `passthru` | rshyve | Passthrough | PCI device passthrough via PPT |
 
