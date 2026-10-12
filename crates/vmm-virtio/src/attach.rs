@@ -30,6 +30,7 @@ use super::console::{
 use super::fs::{
     VirtioFs, VirtioFsOpts, FS_CONFIG_SIZE, FS_MSIX_VECTORS, FS_NUM_QUEUES,
 };
+use super::gpu::VirtioGpu;
 use super::pci::VirtioPciDevice;
 use super::rng::VirtioRng;
 use super::viona;
@@ -263,6 +264,73 @@ pub fn virtio_fs(
     Ok(pci_dev)
 }
 
+/// Build a virtio-gpu device and its PCI transport.
+///
+/// The device offers the guest one `width` x `height` display. The
+/// caller serves it from `pci_dev.device().display_handle()`.
+///
+/// The interrupt path is installed after `VirtioPciDevice::new`
+/// returns, since the device answers paced flips from its own thread.
+pub fn virtio_gpu(
+    width: u32,
+    height: u32,
+    lintr: Option<LintrCfg>,
+    ctx: &VirtioAttachCtx<'_>,
+    log: &slog::Logger,
+) -> anyhow::Result<Arc<VirtioPciDevice<VirtioGpu>>> {
+    let gpu =
+        VirtioGpu::new(width, height, Arc::clone(ctx.physmap), log.clone())?;
+    // Control and cursor queues, plus a config change vector.
+    let msix = Arc::new(MsixTable::new(3, ctx.msi_sink()));
+    Ok(gpu_transport(
+        gpu,
+        lintr,
+        ctx.physmap,
+        ctx.bus_pio,
+        ctx.bus_mmio,
+        Some(msix),
+    ))
+}
+
+/// The transport around `gpu`, wired to tell the driver of a new
+/// display size. Apart from [`virtio_gpu`] so a test can build it with
+/// no VM to deliver MSI-X to.
+fn gpu_transport(
+    gpu: VirtioGpu,
+    lintr: Option<LintrCfg>,
+    physmap: &Arc<PhysMap>,
+    bus_pio: &Arc<PioBus>,
+    bus_mmio: &Arc<MmioBus>,
+    msix: Option<Arc<MsixTable>>,
+) -> Arc<VirtioPciDevice<VirtioGpu>> {
+    let pci_dev = VirtioPciDevice::new(
+        gpu,
+        bits::VIRTIO_DEV_TYPE_GPU,
+        super::gpu::NUM_QUEUES,
+        256,
+        super::gpu::CONFIG_SIZE,
+        lintr,
+        Arc::clone(physmap),
+        Arc::clone(bus_pio),
+        Arc::clone(bus_mmio),
+        msix,
+    );
+    announce_size_changes(&pci_dev);
+    pci_dev.device().install_interrupt(pci_dev.backend_intr());
+    pci_dev
+}
+
+/// A new display size reaches the driver as a config change. Weak,
+/// because the device lives inside the transport.
+fn announce_size_changes(pci_dev: &Arc<VirtioPciDevice<VirtioGpu>>) {
+    let transport = Arc::downgrade(pci_dev);
+    pci_dev.device().on_config_change(Box::new(move || {
+        if let Some(transport) = transport.upgrade() {
+            transport.signal_config_change();
+        }
+    }));
+}
+
 /// Build a virtio-rnd device and its PCI transport.
 pub fn virtio_rng(
     lintr: Option<LintrCfg>,
@@ -282,4 +350,57 @@ pub fn virtio_rng(
         Arc::clone(ctx.bus_mmio),
         Some(msix),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use vmm_core::common::{RWOp, ReadOp, WriteOp};
+    use vmm_devices::display::DisplaySource;
+    use vmm_devices::pci::device::PciDevice;
+    use vmm_devices::pci::BarN;
+
+    use super::*;
+
+    fn read_u8(dev: &VirtioPciDevice<VirtioGpu>, bar: BarN, off: u16) -> u8 {
+        let mut ro = ReadOp::new(1);
+        dev.bar_rw(bar, usize::from(off), RWOp::Read(&mut ro));
+        ro.buf()[0]
+    }
+
+    /// A display server asking for a new size is announced to the
+    /// driver: a new config generation and the config change interrupt.
+    #[test]
+    fn a_requested_size_reaches_the_driver_as_a_config_change() {
+        let physmap = Arc::new(PhysMap::new());
+        let log = slog::Logger::root(slog::Discard, slog::o!());
+        let gpu = VirtioGpu::new(1024, 768, Arc::clone(&physmap), log)
+            .expect("a device");
+        let pci_dev = gpu_transport(
+            gpu,
+            None,
+            &physmap,
+            &Arc::new(PioBus::new()),
+            &Arc::new(MmioBus::new()),
+            None,
+        );
+        let ready = bits::STATUS_ACKNOWLEDGE
+            | bits::STATUS_DRIVER
+            | bits::STATUS_FEATURES_OK
+            | bits::STATUS_DRIVER_OK;
+        pci_dev.bar_rw(
+            BarN::BAR0,
+            usize::from(bits::LEGACY_REG_DEVICE_STATUS),
+            RWOp::Write(&WriteOp::from_buf(&[ready])),
+        );
+        let generation = || {
+            read_u8(&pci_dev, BarN::BAR2, bits::COMMON_CFG_CONFIG_GENERATION)
+        };
+        let before = generation();
+
+        assert!(pci_dev.device().display_handle().request_size(800, 600));
+
+        assert_eq!(generation(), before.wrapping_add(1));
+        let isr = read_u8(&pci_dev, BarN::BAR0, bits::LEGACY_REG_ISR_STATUS);
+        assert_eq!(isr & bits::ISR_CFG_CHANGE, bits::ISR_CFG_CHANGE);
+    }
 }

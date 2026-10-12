@@ -33,11 +33,14 @@ pub mod block;
 pub mod chain_io;
 pub mod console;
 pub mod fs;
+pub mod gpu;
 pub mod pci;
 pub mod queue;
 pub mod rng;
 pub(crate) mod socket_accept;
 mod socket_halt;
+#[cfg(test)]
+mod testlog;
 pub mod viona;
 pub mod vsock;
 

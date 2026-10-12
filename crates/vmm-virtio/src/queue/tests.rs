@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use super::*;
+use crate::testlog::CountingDrain;
 
 const INDIRECT_TABLE_GPA: u64 = 0x1000;
 
@@ -591,23 +592,6 @@ fn a_ring_inside_guest_memory_still_pops() {
 
     assert_eq!(queue.pop_avail(&physmap), Some(0));
     assert_eq!(queue.last_avail_idx(), 1);
-}
-
-/// Counts records, so a test can show a guest cannot drive the log.
-struct CountingDrain(Arc<std::sync::atomic::AtomicUsize>);
-
-impl slog::Drain for CountingDrain {
-    type Ok = ();
-    type Err = slog::Never;
-
-    fn log(
-        &self,
-        _record: &slog::Record<'_>,
-        _values: &slog::OwnedKVList,
-    ) -> Result<(), slog::Never> {
-        self.0.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
 }
 
 /// The refusal is reported, and reported once: a guest that keeps

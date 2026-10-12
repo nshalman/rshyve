@@ -238,6 +238,8 @@ pub const VIRTIO_DEV_TYPE_BALLOON: u16 = 5;
 pub const VIRTIO_DEV_TYPE_FS: u16 = 26;
 /// virtio-vsock (VIRTIO 1.3 5.10). Modern id only, like virtio-fs.
 pub const VIRTIO_DEV_TYPE_VSOCK: u16 = 19;
+/// virtio-gpu (VIRTIO 1.3 5.7). Modern id only, like virtio-fs.
+pub const VIRTIO_DEV_TYPE_GPU: u16 = 16;
 
 // ---------------------------------------------------------------------------
 // Transitional PCI device IDs (virtio 1.3 section 4.1.2.1)
@@ -302,6 +304,12 @@ pub const fn pci_class_for(dev_type: u16) -> (u8, u8) {
         // 0xFF, matching QEMU's virtio-rng-pci and the class the legacy
         // virtio table gives virtio-entropy.
         VIRTIO_DEV_TYPE_RNG => (vmm_devices::pci::bits::CLASS_OTHERS, 0),
+        // Display/other, matching QEMU's virtio-gpu-pci. Not VGA: the
+        // device decodes no legacy VGA ranges.
+        VIRTIO_DEV_TYPE_GPU => (
+            vmm_devices::pci::bits::CLASS_DISPLAY,
+            vmm_devices::pci::bits::SUBCLASS_DISPLAY_OTHER,
+        ),
         // Communication/other, matching QEMU's vhost-vsock-pci.
         VIRTIO_DEV_TYPE_VSOCK => (
             vmm_devices::pci::bits::CLASS_COMMUNICATION,
@@ -432,6 +440,19 @@ mod tests {
         assert_eq!(transitional_device_id(VIRTIO_DEV_TYPE_VSOCK), 0x1053);
     }
 
+    #[test]
+    fn gpu_is_a_modern_display_device() {
+        // 0x1040 + 16. virtio-gpu has no transitional id.
+        assert_eq!(transitional_device_id(VIRTIO_DEV_TYPE_GPU), 0x1050);
+        assert_eq!(
+            pci_class_for(VIRTIO_DEV_TYPE_GPU),
+            (
+                vmm_devices::pci::bits::CLASS_DISPLAY,
+                vmm_devices::pci::bits::SUBCLASS_DISPLAY_OTHER
+            )
+        );
+    }
+
     /// Linux skips a device whose class is 0 when it assigns BARs, so an
     /// unclassified device cannot be enabled on a direct kernel boot,
     /// where no firmware has placed the BARs already. Every device type
@@ -445,6 +466,7 @@ mod tests {
             VIRTIO_DEV_TYPE_FS,
             VIRTIO_DEV_TYPE_RNG,
             VIRTIO_DEV_TYPE_VSOCK,
+            VIRTIO_DEV_TYPE_GPU,
         ] {
             let (class, _) = pci_class_for(dev_type);
             assert_ne!(
