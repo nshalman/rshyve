@@ -330,6 +330,16 @@ mod tests {
         assert!(!at_least(PROTOCOL_RON_V9, PROTOCOL_RON));
     }
 
+    // A later bump of PROTOCOL_RON must not stop a v10 peer from
+    // carrying the v10 state.
+    #[test]
+    fn a_v10_peer_still_counts_after_a_later_version() {
+        assert!(at_least(PROTOCOL_RON_V10, PROTOCOL_RON_V10));
+        assert!(at_least("vmm-migrate-ron/11", PROTOCOL_RON_V10));
+        assert!(!at_least(PROTOCOL_RON_V9, PROTOCOL_RON_V10));
+        assert!(at_least(PROTOCOL_RON, PROTOCOL_RON_V10));
+    }
+
     #[test]
     fn the_offer_is_newest_first() {
         let versions: Vec<u32> =
