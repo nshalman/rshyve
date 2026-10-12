@@ -92,9 +92,9 @@ pub use state::{
     NvmeMigrateBackend, NvmeMigrateCq, NvmeMigrateCqe, NvmeMigrateNamespace,
     NvmeMigrateQueueCounts, NvmeMigrateSq, NvmeMigrateState, PlatformIdentity,
     PlatformStatePayload, Ps2KbdMigrateState, Ps2MigrateState,
-    Ps2MouseMigrateState, UartMigrateState, VirtioMigrateQueue,
-    VirtioMigrateState, WireBdf, XhciMigrateEventRing, XhciMigrateRing,
-    XhciMigrateState, XhciMigrateTablet,
+    Ps2MouseMigrateState, TestFaultMigrateState, UartMigrateState,
+    VirtioMigrateQueue, VirtioMigrateState, WireBdf, XhciMigrateEventRing,
+    XhciMigrateRing, XhciMigrateState, XhciMigrateTablet,
 };
 
 /// General trait for emulated devices in the system.

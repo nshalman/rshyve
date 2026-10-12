@@ -123,6 +123,15 @@ impl VmController {
         &self,
         until: Instant,
     ) -> Result<(), String> {
+        let _one = match self.resuming_source.try_lock() {
+            Ok(one) => one,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err("a migrate-resume-source is already running; \
+                    retry when it ends"
+                    .to_string());
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        };
         // The attach can take until `until`, so it runs outside the lock
         // a stop needs. Checked first: a source whose destination took
         // the guest must not attach its disks again.

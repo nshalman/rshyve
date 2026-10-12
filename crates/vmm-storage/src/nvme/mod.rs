@@ -20,6 +20,7 @@ mod config;
 mod cq;
 mod inflight;
 mod io;
+mod late;
 mod locked;
 mod migrate;
 mod pool;
@@ -40,7 +41,7 @@ use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::PhysMap;
 use vmm_core::mmio::MmioBus;
 
-use vmm_devices::blkdev::DiskSync;
+use vmm_devices::blkdev::{BackingDisk, DiskSync};
 use vmm_devices::lifecycle::{
     BackingAttach, DeviceStateError, Indicator, NvmeMigrateBackend,
 };
@@ -213,6 +214,38 @@ impl NvmeController {
         )
     }
 
+    /// A controller over a file or zvol. A `disk` that is not open yet,
+    /// on a migration destination, opens at
+    /// [`Lifecycle::attach_backing`] and holds no descriptor until then.
+    pub fn with_disk(
+        disk: BackingDisk,
+        instance_id: u8,
+        physmap: Arc<PhysMap>,
+        hdl: Arc<VmmHdl>,
+        bus_mmio: Arc<MmioBus>,
+        log: slog::Logger,
+    ) -> anyhow::Result<Arc<Self>> {
+        let read_only = disk.read_only();
+        let backend = match disk.get().cloned() {
+            Some(open) => WorkerPool::factory(
+                Arc::clone(&open),
+                open as Arc<dyn IoBackend>,
+                log.clone(),
+            )?,
+            None => late::LateFile::factory(disk, log.clone()),
+        };
+        Self::with_backend(
+            backend,
+            NvmeConfig::default(),
+            read_only,
+            instance_id,
+            physmap,
+            hdl,
+            bus_mmio,
+            log,
+        )
+    }
+
     /// Fails when `config` reports no volatile write cache and the
     /// backend's writes are not durable when they complete.
     pub fn with_backend(
@@ -254,8 +287,15 @@ impl NvmeController {
         let msix = Arc::new(MsixTable::new(NVME_MSIX_COUNT, msi));
         let pci_state = pci_header(&msix);
 
+        let mut unbuilt = None;
         let ctrl = Arc::new_cyclic(|weak| {
-            let backend = backend(Arc::new(Completions(weak.clone())));
+            let backend = match backend(Arc::new(Completions(weak.clone()))) {
+                Ok(backend) => backend,
+                Err(e) => {
+                    unbuilt = Some(e);
+                    Arc::new(backend::Unbuilt)
+                }
+            };
             let block_size = config.lba_size.bytes();
             let geometry = Geometry {
                 block_size,
@@ -296,6 +336,9 @@ impl NvmeController {
                 config,
             }
         });
+        if let Some(e) = unbuilt {
+            anyhow::bail!("nvme: the backend did not start: {e}");
+        }
         // Dropping the controller here halts the backend it built.
         if !config.volatile_write_cache && !ctrl.backend.durable_writes() {
             anyhow::bail!(

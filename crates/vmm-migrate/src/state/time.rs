@@ -43,9 +43,14 @@ const MAX_MIGRATE_DELTA_NS: i128 = 3_600 * 1_000_000_000;
 /// only guard on the result is that `boot_hrtime` is not in the future
 /// (`vmm.c`). A value that wrapped satisfies that and denormalizes
 /// every LAPIC, HPET and PIT target against garbage.
+///
+/// `skew_ns` is how far this host's wall clock is ahead of the
+/// source's, as measured at the preamble. It comes off the gap, so the
+/// guest clock moves by the pause and not by the hosts' disagreement.
 fn adjust_time(
     src: &bhyve_api::vdi_time_info_v1,
     dst: &bhyve_api::vdi_time_info_v1,
+    skew_ns: i128,
     log: &slog::Logger,
 ) -> Result<bhyve_api::vdi_time_info_v1, MigrateError> {
     use bhyve_api::vdi_time_info_v1;
@@ -71,9 +76,15 @@ fn adjust_time(
         .ok_or_else(|| bad("source wall clock overflows"))?;
     let dst_wc_ns = wall_ns(dst.vt_hres_sec, dst.vt_hres_ns)
         .ok_or_else(|| bad("destination wall clock overflows"))?;
-    // A source clock ahead of ours gives a negative delta, which is a
-    // clock skew and not a migration that took negative time.
-    let migrate_delta_ns = (dst_wc_ns - src_wc_ns).max(0);
+    let gap_ns = dst_wc_ns - src_wc_ns - skew_ns;
+    // A negative gap is skew the preamble did not see, not a migration
+    // that took negative time.
+    if gap_ns < 0 {
+        slog::warn!(log, "the source clock is ahead of ours; the guest \
+            clock does not count the pause";
+            "ahead_ms" => -gap_ns / 1_000_000);
+    }
+    let migrate_delta_ns = gap_ns.max(0);
     // A switchover takes seconds. A delta beyond the bound means the
     // two clocks disagree, or the peer made the number up; either way
     // every guest timer derived from it would be garbage.
@@ -154,6 +165,7 @@ fn adjust_time(
 pub fn import_time_data(
     hdl: &Arc<VmmHdl>,
     time: &TimeData,
+    skew_ms: Option<i64>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     use bhyve_api::vdi_time_info_v1;
@@ -182,14 +194,12 @@ pub fn import_time_data(
         )
     };
 
-    let dst = hdl
-        .data_op(VDC_VMM_TIME, 1)
-        .read::<vdi_time_info_v1>()
-        .map_err(|e| {
-            MigrateError::VmmData(format!("read dst VMM_TIME: {e:?}"))
-        })?;
+    let dst = super::with_vm_data(hdl, VDC_VMM_TIME, 1, "read dst", |op| {
+        op.read::<vdi_time_info_v1>()
+    })?;
 
-    let adjusted = adjust_time(&src, &dst, log)?;
+    let skew_ns = i128::from(skew_ms.unwrap_or(0)) * 1_000_000;
+    let adjusted = adjust_time(&src, &dst, skew_ns, log)?;
 
     // Write adjusted time data
     let adjusted_bytes: &[u8] = unsafe {
@@ -233,7 +243,7 @@ mod tests {
     fn time_adjust_carries_uptime_and_the_migration_gap() {
         let src = time(10_000_000_000, 1_000_000_000, 100, 0);
         let dst = time(50_000_000_000, 0, 102, 0);
-        let out = adjust_time(&src, &dst, &test_log()).expect("sane input");
+        let out = adjust_time(&src, &dst, 0, &test_log()).expect("sane input");
         // uptime 9 s plus a 2 s gap, taken off the destination's hrtime.
         assert_eq!(out.vt_boot_hrtime, 50_000_000_000 - 11_000_000_000);
         assert_eq!(out.vt_hrtime, dst.vt_hrtime);
@@ -242,10 +252,21 @@ mod tests {
     }
 
     #[test]
+    fn the_measured_skew_comes_off_the_gap() {
+        // This host is 5 s ahead; the pause took 2 s.
+        let src = time(10_000_000_000, 1_000_000_000, 100, 0);
+        let dst = time(50_000_000_000, 0, 107, 0);
+        let out = adjust_time(&src, &dst, 5_000_000_000, &test_log())
+            .expect("skewed");
+        assert_eq!(out.vt_boot_hrtime, 50_000_000_000 - 11_000_000_000);
+        assert_eq!(out.vt_guest_tsc, 1_000 + 6_000_000_000);
+    }
+
+    #[test]
     fn a_source_clock_ahead_of_ours_is_not_a_negative_migration() {
         let src = time(10_000_000_000, 0, 200, 0);
         let dst = time(50_000_000_000, 0, 100, 0);
-        let out = adjust_time(&src, &dst, &test_log()).expect("clock skew");
+        let out = adjust_time(&src, &dst, 0, &test_log()).expect("clock skew");
         assert_eq!(out.vt_boot_hrtime, 40_000_000_000);
         assert_eq!(out.vt_guest_tsc, 1_000);
     }
@@ -257,7 +278,7 @@ mod tests {
         // source clock far ahead of ours, so the delta clamps to 0.
         let src = time(10_000_000_000, 0, u64::MAX, 0);
         let dst = time(50_000_000_000, 0, 100, 0);
-        let out = adjust_time(&src, &dst, &test_log()).expect("clamped");
+        let out = adjust_time(&src, &dst, 0, &test_log()).expect("clamped");
         assert_eq!(out.vt_boot_hrtime, 40_000_000_000);
         assert_eq!(out.vt_guest_tsc, 1_000);
     }
@@ -269,7 +290,7 @@ mod tests {
         // switchover.
         let src = time(10_000_000_000, 0, 0, 0);
         let dst = time(50_000_000_000, 0, 1_700_000_000, 0);
-        let error = adjust_time(&src, &dst, &test_log())
+        let error = adjust_time(&src, &dst, 0, &test_log())
             .map(|_| ())
             .expect_err("a 54-year gap must be refused");
         assert!(error.to_string().contains("clocks differ"), "{error}");
@@ -279,7 +300,7 @@ mod tests {
     fn a_boot_hrtime_after_hrtime_is_refused() {
         let src = time(1_000, 2_000, 100, 0);
         let dst = time(50_000_000_000, 0, 100, 0);
-        let error = adjust_time(&src, &dst, &test_log())
+        let error = adjust_time(&src, &dst, 0, &test_log())
             .map(|_| ())
             .expect_err("uptime cannot be negative");
         assert!(error.to_string().contains("after hrtime"), "{error}");
@@ -289,7 +310,7 @@ mod tests {
     fn a_boot_hrtime_at_i64_min_does_not_wrap_the_subtraction() {
         let src = time(10_000_000_000, i64::MIN, 100, 0);
         let dst = time(50_000_000_000, 0, 100, 0);
-        adjust_time(&src, &dst, &test_log())
+        adjust_time(&src, &dst, 0, &test_log())
             .map(|_| ())
             .expect_err("i64::MIN boot_hrtime must be refused");
     }

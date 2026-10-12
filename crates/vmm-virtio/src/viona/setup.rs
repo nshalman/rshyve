@@ -8,10 +8,10 @@ use std::os::fd::BorrowedFd;
 use std::sync::{Arc, Mutex};
 
 use viona_api::{LinkOps, PromiscMode};
+use vmm_core::rings::{KernelRings, RingGate};
 
-use super::{
-    PausedRing, RingState, VionaInner, VirtioViona, ETHERADDRL, NET_NUM_QUEUES,
-};
+use super::gate::GateMember;
+use super::{RingState, VionaInner, VirtioViona, ETHERADDRL, NET_NUM_QUEUES};
 use crate::pci::intr::IntrSlot;
 
 impl VirtioViona {
@@ -21,67 +21,55 @@ impl VirtioViona {
     ///
     /// - `vnic_name` - Name of the VNIC (e.g., "vnic0")
     /// - `vm` - The VMM instance the link serves
+    /// - `rings` - That VM's ring gate
     ///
     /// # Errors
     ///
     /// Returns an error if the platform has no viona driver, if the
     /// VNIC link ID cannot be resolved, or if the viona device cannot
     /// be opened and associated with the VM.
-    pub fn new(vnic_name: &str, vm: BorrowedFd<'_>) -> std::io::Result<Self> {
+    pub fn new(
+        vnic_name: &str,
+        vm: BorrowedFd<'_>,
+        rings: Arc<RingGate>,
+    ) -> std::io::Result<Self> {
         let (link, mac_addr, dev_features) = open_link(vnic_name, vm)?;
-        Ok(Self::with_link(link, mac_addr, dev_features))
+        Self::with_link(link, mac_addr, dev_features, rings)
     }
 
-    /// A device around one link, before the guest has programmed it.
+    /// A device around one link, before the guest has programmed it,
+    /// with its rings in the VM's gate.
     pub(super) fn with_link(
         link: Arc<dyn LinkOps>,
         mac_addr: [u8; ETHERADDRL],
         dev_features: u32,
-    ) -> Self {
-        Self {
-            inner: Mutex::new(VionaInner {
-                link,
-                mac_addr,
-                dev_features,
-                negotiated_features: 0,
-                paused_rings: [PausedRing::Running; NET_NUM_QUEUES],
-                ring_state: [RingState::Init; NET_NUM_QUEUES],
-                kick_refused: [false; NET_NUM_QUEUES],
-                deferred_poll: None,
-                poller: None,
-                log: None,
-                halted: false,
-            }),
+        rings: Arc<RingGate>,
+    ) -> std::io::Result<Self> {
+        let inner = Arc::new(Mutex::new(VionaInner {
+            link,
+            mac_addr,
+            dev_features,
+            negotiated_features: 0,
+            ring_state: [RingState::Init; NET_NUM_QUEUES],
+            kick_refused: [false; NET_NUM_QUEUES],
+            stopped: None,
+            msi: [None; NET_NUM_QUEUES],
+            deferred_poll: None,
+            poller: None,
+            log: None,
+            hook: Default::default(),
+            halted: false,
+            deleted: false,
+        }));
+        let member: Arc<dyn KernelRings> =
+            Arc::new(GateMember(Arc::downgrade(&inner)));
+        rings.register(Arc::downgrade(&member))?;
+        Ok(Self {
+            inner,
+            rings,
+            _member: member,
             interrupt: Arc::new(IntrSlot::new()),
-        }
-    }
-
-    /// Program the notification I/O port and MMIO address in the kernel.
-    ///
-    /// The kernel then takes the guest's ring kick itself, and the vCPU
-    /// does not leave to userspace for it.
-    pub fn set_notify_addrs(&self, pio_port: u16, mmio_addr: u64) {
-        let inner = self.inner.lock().expect("viona lock");
-        // A migration restore can land after the halt. The link is
-        // gone, and the halt holds no device lock while it destroys
-        // it, so an ioctl issued here could wait out an untimed
-        // kernel call with the lock held.
-        if inner.halted {
-            return;
-        }
-        if pio_port != 0 {
-            if let Err(e) = inner.link_ref().set_notify_iop(pio_port) {
-                slog::warn!(inner.log(), "viona set notify port failed";
-                    "port" => pio_port, "error" => %e);
-            }
-        }
-        if mmio_addr != 0 {
-            let rc = inner.link_ref().set_notify_mmio(mmio_addr, 0x1000);
-            if let Err(e) = rc {
-                slog::warn!(inner.log(), "viona set notify mmio failed";
-                    "addr" => mmio_addr, "error" => %e);
-            }
-        }
+        })
     }
 
     /// Enable promiscuous mode on the viona device.

@@ -78,6 +78,9 @@ pub struct DestConfig {
     /// The same for the devices with no PCI address.
     pub platform: Vec<PlatformIdentity>,
     pub deadlines: Deadlines,
+    /// Whether this VM was started with `--hyperv`. The payload must
+    /// carry the enlightenment exactly when it was.
+    pub hyperv: bool,
     /// Accept a source whose guest saw CPU features this host lacks.
     ///
     /// The guest may already have executed one of those instructions,
@@ -106,13 +109,25 @@ pub fn run_destination<S: Transport>(
     status: Arc<Mutex<MigrationStatus>>,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
+    // A send has no deadline of its own (see `Transport`). A source that
+    // stops reading would hold this end, and its paused guest, forever.
+    let (stream, watch) =
+        crate::stall::watch(stream, config.deadlines.stall, log)
+            .map_err(|e| MigrateError::Io(format!("stall watchdog: {e}")))?;
     let mut chan = Chan::new(
         stream,
         tungstenite::protocol::Role::Server,
         config.deadlines,
     )?;
     let result =
-        run_inner(&mut chan, &hdl, memctx, &config, &hooks, &status, log);
+        run_inner(&mut chan, &hdl, memctx, &config, &hooks, &status, log)
+            .map_err(|e| {
+                if watch.stalled() {
+                    MigrateError::Io(watch.reason())
+                } else {
+                    e
+                }
+            });
     if let Err(error) = &result {
         if crate::is_cancel(error) {
             chan.report_failure(error, log);
@@ -158,10 +173,18 @@ fn run_inner<S: Transport>(
 
     let preamble: MigrationPreamble = chan.expect_serialized()?;
     let checked = XsaveLayout::local(hdl).and_then(|local| {
-        check_preamble(&preamble, config, &local, log).map(|()| local)
+        check_preamble(&preamble, config, &local, log)?;
+        check_enlightenments(&preamble, config.hyperv, cpu::host_is_amd())?;
+        let skew = check_clock(&preamble, protocol, log)?;
+        Ok((local, skew))
     });
-    let local_xsave = match checked {
-        Ok(local) => local,
+    let (local_xsave, skew_ms) = match checked {
+        Ok((local, skew)) => {
+            if let Ok(mut s) = status.lock() {
+                s.clock_skew_ms = skew;
+            }
+            (local, skew)
+        }
         Err(err) => {
             chan.report_failure(&err, log);
             return Err(err);
@@ -186,7 +209,7 @@ fn run_inner<S: Transport>(
     // ── TimeData ──
     set_phase(status, MigrationPhase::TimeData);
     let time_data: TimeData = chan.expect_serialized()?;
-    if let Err(e) = state::import_time_data(hdl, &time_data, log) {
+    if let Err(e) = state::import_time_data(hdl, &time_data, skew_ms, log) {
         chan.report_failure(&e, log);
         return Err(e);
     }
@@ -205,6 +228,7 @@ fn run_inner<S: Transport>(
         &dev_state,
         config.num_cpus,
         &xsave,
+        protocol::at_least(protocol, protocol::PROTOCOL_RON_V10),
         log,
     ) {
         chan.report_failure(&e, log);
@@ -309,6 +333,58 @@ fn check_preamble(
     )))
 }
 
+/// Refuse, before any page moves, state the device state would refuse
+/// only after the whole RAM transfer.
+fn check_enlightenments(
+    preamble: &MigrationPreamble,
+    hyperv: bool,
+    amd_host: bool,
+) -> Result<(), MigrateError> {
+    if let Some(source) = preamble.hyperv {
+        if source != hyperv {
+            return Err(MigrateError::PreambleMismatch(format!(
+                "Hyper-V enlightenment: the source has it {}, this VM {}",
+                if source { "on" } else { "off" },
+                if hyperv { "on" } else { "off" },
+            )));
+        }
+    }
+    if preamble.pmu_amd == Some(true) && !amd_host {
+        return Err(MigrateError::PreambleMismatch(
+            "the source carries AMD PMU state, and this host is not AMD".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The skew between the two hosts' clocks, or `None` from a source too
+/// old to send its clock.
+fn check_clock(
+    preamble: &MigrationPreamble,
+    protocol: &str,
+    log: &slog::Logger,
+) -> Result<Option<i64>, MigrateError> {
+    match preamble.wall_clock_ns {
+        Some(source) => {
+            crate::clock::check_skew(source, crate::clock::now_ns()?, log)
+                .map(Some)
+        }
+        None if protocol::at_least(protocol, protocol::PROTOCOL_RON_V10) => {
+            Err(MigrateError::PreambleMismatch(
+                "the source sent no wall clock".into(),
+            ))
+        }
+        None => {
+            slog::warn!(
+                log,
+                "the source is too old to send its clock; \
+                the host clock skew is unknown"
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// The XSAVE components the guest can use are the ones its source
 /// offered it in XCR0.
 fn xsave_plan<'a>(
@@ -385,8 +461,7 @@ fn restore_devices(
     // These always export a state, and one restored from nothing would
     // leave the guest's driver talking to a device at reset.
     if let Some(entry) = dev_state.emulated.iter().find(|e| {
-        e.state.is_none()
-            && protocol::ALWAYS_EXPORTS.contains(&expected[&e.bdf])
+        e.state.is_none() && protocol::always_exports(expected[&e.bdf])
     }) {
         return Err(MigrateError::State(format!(
             "payload carries no {} state for {}",
@@ -402,6 +477,13 @@ fn restore_devices(
         )));
     }
 
+    if dev_state.hyperv.is_none() && config.hyperv {
+        return Err(MigrateError::State(
+            "payload carries no Hyper-V enlightenment state, and this VM \
+             was started with --hyperv"
+                .into(),
+        ));
+    }
     if let Some(hyperv) = &dev_state.hyperv {
         if !(hooks.hyperv)(hyperv) {
             return Err(MigrateError::State(
@@ -470,7 +552,7 @@ fn check_platform_payload(
 
 /// What ends one RAM pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PassEnd {
+pub(crate) enum PassEnd {
     /// Keep taking passes until the source says it has paused.
     PauseSignal,
     /// Take exactly one pass: the final one.
@@ -482,7 +564,7 @@ enum PassEnd {
 /// A `MemFetch` commits the peer to sending exactly one `PageBatch`
 /// next, and the GPA list it carries is the only thing that says where
 /// those pages go. Anything else after it would silently discard them.
-fn receive_pass<S: Transport>(
+pub(crate) fn receive_pass<S: Transport>(
     chan: &mut Chan<S>,
     memctx: &MemCtx,
     gate: &dyn StopGate,
@@ -549,6 +631,67 @@ mod tests {
             },
             kind: kind.to_string(),
         }
+    }
+
+    fn preamble(wall_clock_ns: Option<u64>) -> MigrationPreamble {
+        MigrationPreamble {
+            num_cpus: 1,
+            mem_size: 4096,
+            devices: Vec::new(),
+            platform: Vec::new(),
+            cpu_features: None,
+            xsave: XsaveLayout {
+                size: 576,
+                components: Vec::new(),
+            },
+            wall_clock_ns,
+            hyperv: None,
+            pmu_amd: None,
+        }
+    }
+
+    #[test]
+    fn enlightenments_are_checked_before_any_page() {
+        let mut p = preamble(None);
+        check_enlightenments(&p, true, false).expect("an old source");
+        p.hyperv = Some(true);
+        check_enlightenments(&p, true, false).expect("both on");
+        check_enlightenments(&p, false, false).expect_err("source only");
+        p.hyperv = Some(false);
+        check_enlightenments(&p, true, false).expect_err("here only");
+        p.pmu_amd = Some(true);
+        check_enlightenments(&p, false, true).expect("AMD to AMD");
+        let error = check_enlightenments(&p, false, false)
+            .expect_err("AMD PMU on Intel");
+        assert!(error.to_string().contains("not AMD"), "{error}");
+    }
+
+    fn log() -> slog::Logger {
+        slog::Logger::root(slog::Discard, slog::o!())
+    }
+
+    #[test]
+    fn a_current_source_must_send_its_clock() {
+        let now = crate::clock::now_ns().expect("clock");
+        let skew =
+            check_clock(&preamble(Some(now)), protocol::PROTOCOL_RON, &log())
+                .expect("synced");
+        assert!(skew.is_some_and(|ms| ms.abs() < 1_000), "{skew:?}");
+
+        check_clock(&preamble(None), protocol::PROTOCOL_RON, &log())
+            .expect_err("no clock from a v10 source");
+        let old =
+            check_clock(&preamble(None), protocol::PROTOCOL_RON_V9, &log())
+                .expect("a v9 source has none");
+        assert_eq!(old, None);
+
+        let hour_behind = now - 3_600 * 1_000_000_000;
+        check_clock(
+            &preamble(Some(hour_behind)),
+            protocol::PROTOCOL_RON,
+            &log(),
+        )
+        .expect_err("an hour of skew");
     }
 
     #[test]

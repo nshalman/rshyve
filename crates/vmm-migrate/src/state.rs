@@ -11,7 +11,8 @@
 
 use bhyve_api::{
     vdi_field_entry_v1, vdi_version_entry_v1, vm_reg_name, VDC_ATPIC,
-    VDC_ATPIT, VDC_HPET, VDC_IOAPIC, VDC_LAPIC, VDC_MSR, VDC_PM_TIMER, VDC_RTC,
+    VDC_ATPIT, VDC_HPET, VDC_IOAPIC, VDC_LAPIC, VDC_MSR, VDC_PMU_AMD,
+    VDC_PM_TIMER, VDC_RTC,
 };
 use slog;
 use std::mem::size_of;
@@ -25,6 +26,7 @@ use crate::codec::{
 use crate::xsave::{XsaveLayout, XsavePlan};
 
 mod checks;
+mod debugregs;
 mod time;
 
 pub use time::{export_time_data, import_time_data};
@@ -68,6 +70,11 @@ const VCPU_REGS: &[vm_reg_name] = &[
     vm_reg_name::VM_REG_GUEST_CR2,
     vm_reg_name::VM_REG_GUEST_CR4,
     vm_reg_name::VM_REG_GUEST_DR7,
+    vm_reg_name::VM_REG_GUEST_DR0,
+    vm_reg_name::VM_REG_GUEST_DR1,
+    vm_reg_name::VM_REG_GUEST_DR2,
+    vm_reg_name::VM_REG_GUEST_DR3,
+    vm_reg_name::VM_REG_GUEST_DR6,
     vm_reg_name::VM_REG_GUEST_EFER,
     vm_reg_name::VM_REG_GUEST_XCR0,
     vm_reg_name::VM_REG_GUEST_CS,
@@ -97,12 +104,21 @@ const VCPU_SEG_DESCS: &[vm_reg_name] = &[
 
 /// Export all registers for a vCPU as (reg_id, value) pairs,
 /// plus segment descriptors as (reg_id, base, limit, access) tuples.
-fn export_vcpu_regs(vcpu: &Vcpu) -> Result<Vec<u8>, MigrateError> {
-    let mut data =
-        Vec::with_capacity(VCPU_REGS.len() * 12 + VCPU_SEG_DESCS.len() * 20);
+///
+/// The interrupt shadow goes last, and only to a v10 or newer peer: an older
+/// one writes every register it reads and fails on a shadow the kernel
+/// cannot set.
+fn export_vcpu_regs(
+    vcpu: &Vcpu,
+    intr_shadow: bool,
+) -> Result<Vec<u8>, MigrateError> {
+    let mut data = Vec::with_capacity(
+        (VCPU_REGS.len() + 1) * 12 + VCPU_SEG_DESCS.len() * 20,
+    );
+    let shadow = intr_shadow.then_some(vm_reg_name::VM_REG_GUEST_INTR_SHADOW);
 
     // General registers: 4 bytes id + 8 bytes value = 12 bytes each
-    for &reg in VCPU_REGS {
+    for &reg in VCPU_REGS.iter().chain(shadow.iter()) {
         let val = vcpu.get_reg(reg).map_err(|e| {
             MigrateError::VmmData(format!("get_reg {:?}: {e}", reg))
         })?;
@@ -129,17 +145,40 @@ fn export_vcpu_regs(vcpu: &Vcpu) -> Result<Vec<u8>, MigrateError> {
     Ok(data)
 }
 
+/// Run a VM-wide vmm-data transfer, which takes the VM write lock, in
+/// the ring gate.
+///
+/// Under the migration's VM pause the rings are held stopped already,
+/// and this stops nothing again.
+fn with_vm_data<T>(
+    hdl: &VmmHdl,
+    class: u16,
+    version: u16,
+    what: &str,
+    xfer: impl FnOnce(bhyve_api::VmmDataOp<'_>) -> bhyve_api::VmmDataResult<T>,
+) -> Result<T, MigrateError> {
+    let fail = |e: String| {
+        MigrateError::VmmData(format!(
+            "{what} class={class} version={version}: {e}"
+        ))
+    };
+    hdl.rings()
+        .run(|rings| {
+            let op = hdl
+                .vm_data_op(rings, class, version)
+                .map_err(|e| fail(e.to_string()))?;
+            xfer(op).map_err(|e| fail(format!("{e:?}")))
+        })
+        .map_err(|e| fail(e.to_string()))?
+}
+
 /// Read a vmm-data class/version as raw bytes (for system devices).
 fn read_class_all(
     hdl: &VmmHdl,
     class: u16,
     version: u16,
 ) -> Result<Vec<u8>, MigrateError> {
-    hdl.data_op(class, version).read_all::<u8>().map_err(|e| {
-        MigrateError::VmmData(format!(
-            "read_all class={class} version={version}: {e:?}"
-        ))
-    })
+    with_vm_data(hdl, class, version, "read_all", |op| op.read_all::<u8>())
 }
 
 /// Read a per-vCPU vmm-data class as raw bytes.
@@ -149,14 +188,15 @@ fn read_class_vcpu(
     version: u16,
     vcpuid: i32,
 ) -> Result<Vec<u8>, MigrateError> {
-    hdl.data_op(class, version)
-        .for_vcpu(vcpuid)
-        .read_all::<u8>()
-        .map_err(|e| {
-            MigrateError::VmmData(format!(
-            "read_vcpu class={class} version={version} vcpu={vcpuid}: {e:?}"
+    let fail = |e: String| {
+        MigrateError::VmmData(format!(
+            "read_vcpu class={class} version={version} vcpu={vcpuid}: {e}"
         ))
-        })
+    };
+    hdl.vcpu_data_op(vcpuid, class, version)
+        .map_err(|e| fail(e.to_string()))?
+        .read_all::<u8>()
+        .map_err(|e| fail(format!("{e:?}")))
 }
 
 /// Write raw bytes to a vmm-data class/version.
@@ -166,11 +206,7 @@ fn write_class_all(
     version: u16,
     data: &[u8],
 ) -> Result<(), MigrateError> {
-    hdl.data_op(class, version).write_many(data).map_err(|e| {
-        MigrateError::VmmData(format!(
-            "write class={class} version={version}: {e:?}"
-        ))
-    })
+    with_vm_data(hdl, class, version, "write", |op| op.write_many(data))
 }
 
 /// The kernel writes that a state import performs.
@@ -188,12 +224,9 @@ trait ImportSink {
     ) -> Result<(), MigrateError>;
 
     /// Segment selectors are not written here. The plain register
-    /// list already carries CS through LDTR.
-    fn write_reg(
-        &self,
-        vcpuid: i32,
-        write: RegWrite,
-    ) -> Result<(), MigrateError>;
+    /// list already carries CS through LDTR. The kernel's error is
+    /// kept whole, because one errno is not a failure.
+    fn write_reg(&self, vcpuid: i32, write: RegWrite) -> std::io::Result<()>;
 
     fn set_run_state(
         &self,
@@ -224,43 +257,33 @@ impl ImportSink for KernelSink<'_> {
         vcpuid: Option<i32>,
         data: &[u8],
     ) -> Result<(), MigrateError> {
-        let op = self.hdl.data_op(class, version);
-        let op = match vcpuid {
-            Some(id) => op.for_vcpu(id),
-            None => op,
+        let Some(id) = vcpuid else {
+            return write_class_all(self.hdl, class, version, data)
+                .map_err(|e| MigrateError::State(e.to_string()));
         };
-        op.write_many(data).map_err(|e| {
+        let fail = |e: String| {
             MigrateError::State(format!(
-                "write class={class} version={version} vcpu={vcpuid:?}: {e:?}"
+                "write class={class} version={version} vcpu={id}: {e}"
             ))
-        })
+        };
+        self.hdl
+            .vcpu_data_op(id, class, version)
+            .map_err(|e| fail(e.to_string()))?
+            .write_many(data)
+            .map_err(|e| fail(format!("{e:?}")))
     }
 
-    fn write_reg(
-        &self,
-        vcpuid: i32,
-        write: RegWrite,
-    ) -> Result<(), MigrateError> {
+    fn write_reg(&self, vcpuid: i32, write: RegWrite) -> std::io::Result<()> {
         let vcpu = self.vcpu(vcpuid);
         match write {
-            RegWrite::Reg(reg, value) => {
-                vcpu.set_reg(reg, value).map_err(|e| {
-                    MigrateError::State(format!(
-                        "vcpu {vcpuid}: set {reg:?}={value:#x}: {e}"
-                    ))
-                })
-            }
+            RegWrite::Reg(reg, value) => vcpu.set_reg(reg, value),
             RegWrite::Seg(reg, base, limit, access) => {
                 let desc = bhyve_api::seg_desc {
                     base,
                     limit,
                     access,
                 };
-                vcpu.set_segment_desc(reg, &desc).map_err(|e| {
-                    MigrateError::State(format!(
-                        "vcpu {vcpuid}: set {reg:?} descriptor: {e}"
-                    ))
-                })
+                vcpu.set_segment_desc(reg, &desc)
             }
         }
     }
@@ -294,13 +317,14 @@ fn read_field_entries(
     vcpuid: i32,
     what: &str,
 ) -> Result<Vec<u8>, MigrateError> {
+    let fail = |e: String| {
+        MigrateError::State(format!("export {what} vcpu={vcpuid}: {e}"))
+    };
     let entries = hdl
-        .data_op(class, 1)
-        .for_vcpu(vcpuid)
+        .vcpu_data_op(vcpuid, class, 1)
+        .map_err(|e| fail(e.to_string()))?
         .read_all::<vdi_field_entry_v1>()
-        .map_err(|e| {
-            MigrateError::State(format!("export {what} vcpu={vcpuid}: {e:?}"))
-        })?;
+        .map_err(|e| fail(format!("{e:?}")))?;
     let mut buf =
         Vec::with_capacity(entries.len() * size_of::<vdi_field_entry_v1>());
     for entry in &entries {
@@ -321,15 +345,17 @@ pub fn export_device_state(
     hdl: &Arc<VmmHdl>,
     num_cpus: u32,
     xsave: &XsaveLayout,
+    v10_peer: bool,
     log: &slog::Logger,
 ) -> Result<DeviceState, MigrateError> {
+    let pmu_amd = v10_peer && carries_pmu_amd(hdl)?;
     // Export per-vCPU state using individual register reads
     let mut vcpus = Vec::with_capacity(num_cpus as usize);
     for vcpuid in 0..num_cpus as i32 {
         let vcpu = Vcpu::new_for_thread(vcpuid, Arc::clone(hdl));
 
         // Registers via get_reg (reliable, avoids vmm-data field format issues)
-        let registers = export_vcpu_regs(&vcpu)?;
+        let registers = export_vcpu_regs(&vcpu, v10_peer)?;
 
         // Every class below is required. A snapshot that silently
         // drops one resumes the guest with default state for it.
@@ -341,6 +367,10 @@ pub fn export_device_state(
             vcpuid,
             "VMM_ARCH",
         )?;
+
+        let pmu_amd = pmu_amd
+            .then(|| read_class_vcpu(hdl, VDC_PMU_AMD, 1, vcpuid))
+            .transpose()?;
 
         let fpu = vcpu.get_fpu(xsave.size()).map_err(|e| {
             MigrateError::VmmData(format!("get FPU vcpu={vcpuid}: {e}"))
@@ -368,6 +398,7 @@ pub fn export_device_state(
             vmm_arch,
             run_state,
             sipi_vector,
+            pmu_amd,
         });
     }
 
@@ -395,6 +426,19 @@ pub fn export_device_state(
     })
 }
 
+/// Whether this host's vCPUs have an AMD PMU state to carry.
+///
+/// The class is in every kernel's table from v18 on, Intel hosts
+/// included, but only SVM keeps the state behind it.
+pub fn carries_pmu_amd(hdl: &VmmHdl) -> Result<bool, MigrateError> {
+    if !crate::cpu::host_is_amd() {
+        return Ok(false);
+    }
+    Ok(read_class_layouts(hdl)?
+        .iter()
+        .any(|e| e.vve_class == VDC_PMU_AMD && e.vve_version == 1))
+}
+
 /// Import all kernel device state (per-vCPU + system devices).
 ///
 /// Time data must already be imported. The VM must be paused.
@@ -403,6 +447,7 @@ pub fn import_device_state(
     state: &DeviceState,
     num_cpus: u32,
     xsave: &XsavePlan<'_>,
+    v10_peer: bool,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     let layouts = read_class_layouts(hdl)?;
@@ -412,6 +457,7 @@ pub fn import_device_state(
         state,
         num_cpus,
         xsave,
+        (crate::cpu::host_is_amd(), v10_peer),
         log,
     )
 }
@@ -426,9 +472,10 @@ fn import_device_state_into(
     state: &DeviceState,
     num_cpus: u32,
     xsave: &XsavePlan<'_>,
+    (amd_host, v10_peer): (bool, bool),
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
-    check_device_state(state, layouts, num_cpus)?;
+    check_device_state(state, layouts, num_cpus, amd_host, v10_peer)?;
     let fpu: Vec<Vec<u8>> = state
         .vcpus
         .iter()
@@ -455,8 +502,32 @@ fn import_device_state_into(
         let id = vcpu.vcpuid;
         sink.write_class(VDC_MSR, 1, Some(id), &vcpu.msrs)?;
         sink.write_class(VDC_LAPIC, 1, Some(id), &vcpu.lapic)?;
+        if let Some(pmu) = &vcpu.pmu_amd {
+            sink.write_class(VDC_PMU_AMD, 1, Some(id), pmu)?;
+        }
         for write in parse_vcpu_regs(id, &vcpu.registers)? {
-            sink.write_reg(id, write)?;
+            let write = debugregs::normalize(write, amd_host);
+            match (write, sink.write_reg(id, write)) {
+                (_, Ok(())) => {}
+                // VMX refuses to force a shadow on, with EINVAL. The
+                // guest may then take an interrupt one instruction
+                // early, which beats failing a migration after the
+                // gate's go. SVM takes it.
+                (
+                    RegWrite::Reg(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, 1),
+                    Err(e),
+                ) if !amd_host
+                    && e.kind() == std::io::ErrorKind::InvalidInput =>
+                {
+                    slog::warn!(log, "the interrupt shadow was not \
+                        restored"; "vcpu" => id, "error" => %e);
+                }
+                (write, Err(e)) => {
+                    return Err(MigrateError::State(format!(
+                        "vcpu {id}: set {write:?}: {e}"
+                    )));
+                }
+            }
         }
         sink.set_fpu(id, fpu)?;
         // VRS_HALT is 0, so a halted vCPU must be restored too.
@@ -486,6 +557,10 @@ mod tests {
         regs: RefCell<Vec<(i32, String)>>,
         run_states: RefCell<Vec<(i32, u32, u8)>>,
         fpus: RefCell<Vec<(i32, usize)>>,
+        /// Answer a forced interrupt shadow the way VMX does.
+        vmx: bool,
+        /// A forced interrupt shadow fails with this instead.
+        shadow_fails_with: Option<std::io::ErrorKind>,
     }
 
     impl RecordingSink {
@@ -525,7 +600,19 @@ mod tests {
             &self,
             vcpuid: i32,
             write: RegWrite,
-        ) -> Result<(), MigrateError> {
+        ) -> std::io::Result<()> {
+            if matches!(
+                write,
+                RegWrite::Reg(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, v)
+                    if v != 0
+            ) {
+                if let Some(kind) = self.shadow_fails_with {
+                    return Err(kind.into());
+                }
+                if self.vmx {
+                    return Err(std::io::ErrorKind::InvalidInput.into());
+                }
+            }
             self.regs.borrow_mut().push((vcpuid, format!("{write:?}")));
             Ok(())
         }
@@ -582,6 +669,7 @@ mod tests {
             state,
             num_cpus,
             &plan(&xsave),
+            (false, true),
             &test_log(),
         );
         (sink, result)
@@ -600,9 +688,178 @@ mod tests {
             state,
             num_cpus,
             &plan(&xsave),
+            (false, true),
             &test_log(),
         );
         (sink, result)
+    }
+
+    fn import_on(
+        sink: RecordingSink,
+        state: &DeviceState,
+        amd_host: bool,
+    ) -> (RecordingSink, Result<(), MigrateError>) {
+        let xsave = test_xsave();
+        let result = import_device_state_into(
+            &sink,
+            &kernel_layouts(),
+            state,
+            state.vcpus.len() as u32,
+            &plan(&xsave),
+            (amd_host, true),
+            &test_log(),
+        );
+        (sink, result)
+    }
+
+    #[test]
+    fn the_debug_registers_and_the_shadow_are_carried() {
+        for reg in [
+            vm_reg_name::VM_REG_GUEST_DR0,
+            vm_reg_name::VM_REG_GUEST_DR1,
+            vm_reg_name::VM_REG_GUEST_DR2,
+            vm_reg_name::VM_REG_GUEST_DR3,
+            vm_reg_name::VM_REG_GUEST_DR6,
+            vm_reg_name::VM_REG_GUEST_DR7,
+        ] {
+            assert!(
+                VCPU_REGS.iter().any(|&r| r as i32 == reg as i32),
+                "{reg:?}"
+            );
+        }
+        // Sent apart, and last, so an older peer never sees it.
+        let shadow = vm_reg_name::VM_REG_GUEST_INTR_SHADOW as i32;
+        assert!(!VCPU_REGS.iter().any(|&r| r as i32 == shadow));
+    }
+
+    #[test]
+    fn a_shadow_vmx_cannot_force_does_not_fail_the_import() {
+        let mut state = good_state();
+        state.vcpus[0].registers = full_reg_blob(1);
+        let sink = RecordingSink {
+            vmx: true,
+            ..RecordingSink::default()
+        };
+        let (sink, result) = import_on(sink, &state, false);
+        result.expect("a lost shadow is a warning on VMX");
+        assert_eq!(sink.regs.borrow().len(), full_reg_count() - 1);
+        assert!(sink.wrote_class(bhyve_api::VDC_VMM_ARCH, Some(0)));
+
+        // On SVM a refused shadow is a real failure.
+        let sink = RecordingSink {
+            vmx: true,
+            ..RecordingSink::default()
+        };
+        let (_, result) = import_on(sink, &state, true);
+        result.map(|_| ()).expect_err("SVM takes a shadow");
+
+        // Clearing it is always taken.
+        state.vcpus[0].registers = full_reg_blob(0);
+        let sink = RecordingSink {
+            vmx: true,
+            ..RecordingSink::default()
+        };
+        let (sink, result) = import_on(sink, &state, false);
+        result.expect("cleared");
+        assert_eq!(sink.regs.borrow().len(), full_reg_count());
+    }
+
+    #[test]
+    fn only_einval_on_the_shadow_is_forgiven() {
+        // Any other errno is a real failure, even on VMX.
+        let mut state = good_state();
+        state.vcpus[0].registers = full_reg_blob(1);
+        let sink = RecordingSink {
+            vmx: true,
+            shadow_fails_with: Some(std::io::ErrorKind::PermissionDenied),
+            ..RecordingSink::default()
+        };
+        let (_, result) = import_on(sink, &state, false);
+        result
+            .map(|_| ())
+            .expect_err("EPERM is not the VMX refusal");
+    }
+
+    /// A register blob from a current source with `over` in place of
+    /// the default values.
+    fn blob_with(over: &[(vm_reg_name, u64)]) -> Vec<u8> {
+        let regs: Vec<(vm_reg_name, u64)> = VCPU_REGS
+            .iter()
+            .map(|&r| {
+                let v = over
+                    .iter()
+                    .find(|(o, _)| *o as i32 == r as i32)
+                    .map_or(0, |&(_, v)| v);
+                (r, v)
+            })
+            .chain([(vm_reg_name::VM_REG_GUEST_INTR_SHADOW, 0)])
+            .collect();
+        reg_blob(&regs, VCPU_SEG_DESCS)
+    }
+
+    #[test]
+    fn hostile_debug_registers_are_refused_before_anything_is_applied() {
+        for (reg, value) in [
+            (vm_reg_name::VM_REG_GUEST_DR6, 0x1_FFFF_0FF0),
+            (vm_reg_name::VM_REG_GUEST_DR7, 0x8000_0000_0000_0400),
+        ] {
+            for amd_host in [false, true] {
+                let mut state = good_state();
+                state.vcpus[0].registers = blob_with(&[(reg, value)]);
+                let (sink, result) =
+                    import_on(RecordingSink::default(), &state, amd_host);
+                let error = result.map(|_| ()).expect_err("hostile DR");
+                assert!(error.to_string().contains("host can load"), "{error}");
+                assert!(sink.applied_nothing(), "{reg:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn imported_debug_registers_carry_their_architectural_bits() {
+        let mut state = good_state();
+        state.vcpus[0].registers = blob_with(&[
+            (vm_reg_name::VM_REG_GUEST_DR6, 0),
+            (vm_reg_name::VM_REG_GUEST_DR7, 0xF800),
+        ]);
+        let (sink, result) = import_on(RecordingSink::default(), &state, true);
+        result.expect("low reserved bits are fixed, not refused");
+        let regs = sink.regs.borrow();
+        let wrote = |want: &str| regs.iter().any(|(_, w)| w == want);
+        assert!(wrote("Reg(VM_REG_GUEST_DR6, 4294838256)"), "{regs:?}");
+        // Bit 13 (GD) stays; 11, 12, 14 and 15 clear on AMD; 10 sets.
+        assert!(wrote("Reg(VM_REG_GUEST_DR7, 9216)"), "{regs:?}");
+    }
+
+    #[test]
+    fn amd_pmu_state_goes_only_to_an_amd_host() {
+        let mut state = good_state();
+        state.vcpus[0].pmu_amd = Some(vec![0u8; PMU_AMD_LEN]);
+
+        let (sink, result) = import_on(RecordingSink::default(), &state, true);
+        result.expect("AMD to AMD");
+        assert!(sink.wrote_class(VDC_PMU_AMD, Some(0)));
+
+        let (sink, result) = import_on(RecordingSink::default(), &state, false);
+        let error = result.map(|_| ()).expect_err("AMD state on Intel");
+        assert!(error.to_string().contains("not AMD"), "{error}");
+        assert!(sink.applied_nothing());
+
+        state.vcpus[0].pmu_amd = Some(vec![0u8; PMU_AMD_LEN - 1]);
+        let (sink, result) = import_on(RecordingSink::default(), &state, true);
+        result.map(|_| ()).expect_err("short PMU blob");
+        assert!(sink.applied_nothing());
+    }
+
+    #[test]
+    fn amd_pmu_state_is_for_every_vcpu_or_none() {
+        let mut state = good_state();
+        state.vcpus.push(vcpu_payload(1));
+        state.vcpus[1].pmu_amd = Some(vec![0u8; PMU_AMD_LEN]);
+        let (sink, result) = import_on(RecordingSink::default(), &state, true);
+        let error = result.map(|_| ()).expect_err("one of two");
+        assert!(error.to_string().contains("1 of 2"), "{error}");
+        assert!(sink.applied_nothing());
     }
 
     #[test]
@@ -657,7 +914,7 @@ mod tests {
         for &(_, class, _) in SYSTEM_DEVICES {
             assert!(sink.wrote_class(class, None), "class {class} not written");
         }
-        assert_eq!(sink.regs.borrow().len(), 2);
+        assert_eq!(sink.regs.borrow().len(), full_reg_count());
         assert_eq!(sink.run_states.borrow().len(), 1);
         assert_eq!(sink.fpus.borrow().as_slice(), &[(0, TEST_XSAVE_LEN)]);
     }

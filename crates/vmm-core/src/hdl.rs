@@ -11,6 +11,7 @@
 
 use std::io::{Error, ErrorKind, Result};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bhyve_api::{
@@ -25,8 +26,10 @@ use bhyve_api::{
 
 use crate::common::PAGE_SIZE;
 use crate::mem::Prot;
+use crate::rings::{RingGate, RingsStopped};
 
 mod fpu;
+mod shared;
 mod vcpu;
 
 pub use fpu::{FpuArea, FpuComponent, MAX_FPU_AREA_LEN};
@@ -93,9 +96,14 @@ pub struct CreateOpts {
 /// Wraps the kernel `/dev/vmm/{name}` file descriptor and provides safe
 /// typed methods for all VM operations. The raw ioctl interface is
 /// private — all operations must go through the methods on this type.
+///
+/// Every method whose ioctl takes the VM write lock asks for a
+/// [`RingsStopped`] from this VM's [`RingGate`]. See [`crate::rings`].
 pub struct VmmHdl {
     inner: VmmFd,
     name: String,
+    /// Shared with every other handle on this VM.
+    rings: Arc<shared::VmRings>,
 }
 
 impl VmmHdl {
@@ -148,19 +156,38 @@ impl VmmHdl {
                 return Err(err);
             }
         };
-        Ok(Self {
-            inner: fd,
-            name: name.to_string(),
-        })
+        Ok(Self::with_fd(fd, name))
     }
 
     /// Open an existing VM instance.
     pub fn open(name: &str) -> Result<Self> {
         let fd = VmmFd::open(name)?;
-        Ok(Self {
-            inner: fd,
+        Ok(Self::with_fd(fd, name))
+    }
+
+    fn with_fd(inner: VmmFd, name: &str) -> Self {
+        let rings = shared::for_vm(name, inner.as_fd());
+        Self {
+            inner,
             name: name.to_string(),
-        })
+            rings,
+        }
+    }
+
+    /// The gate every write-lock ioctl on this VM goes through.
+    pub fn rings(&self) -> &Arc<RingGate> {
+        &self.rings.gate
+    }
+
+    /// Refuse a proof made for another VM.
+    fn proven(&self, rings: &RingsStopped<'_>) -> Result<()> {
+        if self.rings.gate.proves(rings) {
+            return Ok(());
+        }
+        Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "the rings of another VM were stopped",
+        ))
     }
 
     /// Get the VM name.
@@ -183,10 +210,12 @@ impl VmmHdl {
     /// maximum length.
     pub fn create_memseg(
         &self,
+        rings: &RingsStopped<'_>,
         segid: i32,
         len: usize,
         name: &str,
     ) -> Result<()> {
+        self.proven(rings)?;
         let name_bytes = name.as_bytes();
         if name_bytes.len() >= VM_MAX_SEG_NAMELEN {
             return Err(Error::new(
@@ -214,12 +243,14 @@ impl VmmHdl {
     /// Map a memory segment into the guest physical address space.
     pub fn map_memseg(
         &self,
+        rings: &RingsStopped<'_>,
         segid: i32,
         gpa: u64,
         len: usize,
         segoff: i64,
         prot: Prot,
     ) -> Result<()> {
+        self.proven(rings)?;
         let mut map = vm_memmap {
             gpa,
             segid,
@@ -245,7 +276,13 @@ impl VmmHdl {
     ///
     /// The kernel matches an exact `(gpa, len)` pair, so the caller must pass
     /// the same values used for [`Self::map_memseg`].
-    pub fn munmap_memseg(&self, gpa: u64, len: usize) -> Result<()> {
+    pub fn munmap_memseg(
+        &self,
+        rings: &RingsStopped<'_>,
+        gpa: u64,
+        len: usize,
+    ) -> Result<()> {
+        self.proven(rings)?;
         let mut arg = bhyve_api::vm_munmap { gpa, len };
         // Safety: vm_munmap is the correct struct for VM_MUNMAP_MEMSEG.
         unsafe { self.inner.ioctl(ioctls::VM_MUNMAP_MEMSEG, &mut arg) }?;
@@ -397,15 +434,26 @@ impl VmmHdl {
     }
 
     /// Pause the VM (all vCPUs and kernel timers).
+    ///
+    /// The kernel rings stop first and stay stopped until
+    /// [`Self::resume`]: a guest kick would otherwise start one under a
+    /// paused VM, and every write-lock ioctl in the pause would race
+    /// it. A refusal pauses nothing.
     pub fn pause(&self) -> Result<()> {
-        self.inner.ioctl_usize(ioctls::VM_PAUSE, 0)?;
-        Ok(())
+        self.rings.paused.pause(&self.rings.gate, |rings| {
+            self.proven(rings)?;
+            self.inner.ioctl_usize(ioctls::VM_PAUSE, 0).map(drop)
+        })
     }
 
-    /// Resume the VM after pause.
+    /// Resume the VM after pause, then start the kernel rings.
+    ///
+    /// A refused resume keeps the rings stopped with the VM.
     pub fn resume(&self) -> Result<()> {
-        self.inner.ioctl_usize(ioctls::VM_RESUME, 0)?;
-        Ok(())
+        self.rings.paused.resume(&self.rings.gate, |rings| {
+            self.proven(rings)?;
+            self.inner.ioctl_usize(ioctls::VM_RESUME, 0).map(drop)
+        })
     }
 
     /// Request VM destruction.
@@ -449,7 +497,12 @@ impl VmmHdl {
     }
 
     /// Tell the kernel which PIO port serves the ACPI PM timer.
-    pub fn pmtmr_locate(&self, port: u16) -> Result<()> {
+    pub fn pmtmr_locate(
+        &self,
+        rings: &RingsStopped<'_>,
+        port: u16,
+    ) -> Result<()> {
+        self.proven(rings)?;
         self.inner
             .ioctl_usize(ioctls::VM_PMTMR_LOCATE, usize::from(port))?;
         Ok(())
@@ -460,7 +513,12 @@ impl VmmHdl {
     // ---------------------------------------------------------------
 
     /// Bind an open `/dev/pptN` descriptor to this VM.
-    pub fn bind_pptdev(&self, pptfd: BorrowedFd<'_>) -> Result<()> {
+    pub fn bind_pptdev(
+        &self,
+        rings: &RingsStopped<'_>,
+        pptfd: BorrowedFd<'_>,
+    ) -> Result<()> {
+        self.proven(rings)?;
         let mut req = vm_pptdev {
             pptfd: pptfd.as_raw_fd(),
         };
@@ -470,7 +528,12 @@ impl VmmHdl {
     }
 
     /// Give a bound passthrough device back to the host.
-    pub fn unbind_pptdev(&self, pptfd: BorrowedFd<'_>) -> Result<()> {
+    pub fn unbind_pptdev(
+        &self,
+        rings: &RingsStopped<'_>,
+        pptfd: BorrowedFd<'_>,
+    ) -> Result<()> {
+        self.proven(rings)?;
         let mut req = vm_pptdev {
             pptfd: pptfd.as_raw_fd(),
         };
@@ -498,11 +561,13 @@ impl VmmHdl {
     /// guest at `gpa`.
     pub fn map_pptdev_mmio(
         &self,
+        rings: &RingsStopped<'_>,
         pptfd: BorrowedFd<'_>,
         gpa: u64,
         hpa: u64,
         len: usize,
     ) -> Result<()> {
+        self.proven(rings)?;
         let mut req = vm_pptdev_mmio {
             pptfd: pptfd.as_raw_fd(),
             gpa,
@@ -517,10 +582,12 @@ impl VmmHdl {
     /// Undo [`map_pptdev_mmio`](Self::map_pptdev_mmio) for `gpa`.
     pub fn unmap_pptdev_mmio(
         &self,
+        rings: &RingsStopped<'_>,
         pptfd: BorrowedFd<'_>,
         gpa: u64,
         len: usize,
     ) -> Result<()> {
+        self.proven(rings)?;
         let mut req = vm_pptdev_mmio {
             pptfd: pptfd.as_raw_fd(),
             gpa,
@@ -622,13 +689,33 @@ impl VmmHdl {
     // VMM data interface (state export/import for migration)
     // ---------------------------------------------------------------
 
-    /// Build a vmm-data read/write operation.
-    pub fn data_op(
-        &self,
+    /// Build a VM-wide vmm-data read or write.
+    ///
+    /// A VM-wide transfer takes the VM write lock (`vmm_sol_dev.c`,
+    /// `VM_DATA_READ` with a vCPU of -1). The operation cannot outlive
+    /// the proof.
+    pub fn vm_data_op<'a>(
+        &'a self,
+        rings: &'a RingsStopped<'a>,
         class: u16,
         version: u16,
-    ) -> bhyve_api::VmmDataOp<'_> {
-        self.inner.data_op(class, version)
+    ) -> Result<bhyve_api::VmmDataOp<'a>> {
+        self.proven(rings)?;
+        Ok(self.inner.data_op(class, version))
+    }
+
+    /// Build a vmm-data read or write for one vCPU, which takes only
+    /// that vCPU's lock.
+    pub fn vcpu_data_op(
+        &self,
+        vcpuid: i32,
+        class: u16,
+        version: u16,
+    ) -> Result<bhyve_api::VmmDataOp<'_>> {
+        let vcpu = u16::try_from(vcpuid).map_err(|_| {
+            Error::new(ErrorKind::InvalidInput, format!("no vCPU {vcpuid}"))
+        })?;
+        Ok(self.inner.data_op(class, version).for_vcpu(vcpu))
     }
 
     // ---------------------------------------------------------------

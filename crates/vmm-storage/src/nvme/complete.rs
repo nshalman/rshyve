@@ -26,6 +26,8 @@ pub(super) struct Completions(pub(super) Weak<NvmeController>);
 thread_local! {
     /// The controller this thread is submitting to, with its state lock
     /// held. Zero when none.
+    // Some clippy releases flag a `const` initializer as not const.
+    #[allow(clippy::missing_const_for_thread_local)]
     static SUBMITTING: Cell<usize> = const { Cell::new(0) };
 }
 

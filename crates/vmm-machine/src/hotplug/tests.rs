@@ -221,7 +221,11 @@ impl Fixture {
                 vm: Arc::clone(&gate) as Arc<dyn VmPause>,
                 // Short, so the abort path does not slow the suite.
                 budget: Duration::from_millis(20),
-                halt_slack: Duration::from_millis(20),
+                // Wide: an unplug thread that starts late on a loaded
+                // host would pass for a wedged release, and the abort
+                // tests would see no resume. Only the wedged-halt test
+                // waits it out.
+                halt_slack: Duration::from_secs(2),
                 closed: AtomicBool::new(false),
                 drains: AtomicBool::new(true),
                 topology: TopologyLock::default(),

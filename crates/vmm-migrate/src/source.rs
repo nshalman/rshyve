@@ -6,29 +6,37 @@
 //!
 //! The order of the phases is the invariant this module owns:
 //!
-//! 1. Pause the devices and wait for them to quiesce. Every thread that
-//!    writes guest memory has to be stopped before the last dirty pass,
-//!    or that pass ships a used ring the destination never sees filled.
-//! 2. Pause the vCPUs.
+//! 1. Pause the vCPUs, so the guest submits nothing new. The VM pause
+//!    stops every kernel ring worker first and keeps them stopped
+//!    until the VM resumes: `VM_PAUSE`, the VM-wide state export and
+//!    `VM_RESUME` all take the VM write lock (see
+//!    [`vmm_core::rings`]).
+//! 2. Pause the devices and drain them: every request in flight
+//!    completes and writes its completion. Every thread that writes
+//!    guest memory has to be stopped before the last dirty pass, or
+//!    that pass ships a used ring the destination never sees filled.
 //! 3. Flush every backing store, then wait for the ZFS barrier. The
 //!    destination disk has to hold every write the guest was told was
 //!    complete before the guest resumes there.
 //! 4. Wait at the cutover gate for the orchestrator's go.
-//! 5. Ship the last dirty pass, the time data and the device state.
-//! 6. Hand over, then detach every disk the destination attaches anew.
+//! 5. The final pass: send the dirty pages, export the devices, then
+//!    send what is dirty again. Then the time data and device state.
+//! 6. Check that no page is still dirty, hand over, then detach every
+//!    disk the destination attaches anew.
 //!
 //! Anything that fails from step 1 on rolls the source back: devices
-//! resume, the rings a migration paused go back to work, and the vCPUs
-//! run again. After the gate's go a failure does not roll back: the
-//! source stays paused until the orchestrator tells it which side keeps
-//! the guest. The one exception is the cutover deadline: with no commit
-//! by then, the gate turns `abort` and the source rolls back.
+//! resume, the vCPUs run again, and the kernel rings start after
+//! them. After the gate's go a failure does not roll back: the source
+//! stays paused until the orchestrator tells it which side keeps the
+//! guest. The one exception is the cutover deadline: with no commit by
+//! then, the gate turns `abort` and the source rolls back.
 
 use std::io::Read;
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vmm_core::cpuid::CpuBaseline;
 use vmm_core::hdl::VmmHdl;
@@ -43,14 +51,17 @@ use crate::codec::{
     DeviceIdentity, Message, MigrateError, MigrationPreamble, ProtocolOffer,
     ProtocolSelect, PAGE_BATCH_FLAG_ZSTD,
 };
+use crate::converge::Precopy;
 use crate::cpu;
 use crate::cutover::{Cutover, Gated};
+use crate::late::Owners;
 use crate::limits::{BATCH_SIZE, ZSTD_LEVEL};
 use crate::pages::{
     are_contiguous, build_contiguous_gpas, page_buffer_len, read_pages,
 };
 use crate::protocol::{
-    protocol_blocker, PageIter, PAGE_SIZE, PROTOCOL_RON_V6, SOURCE_OFFER,
+    at_least, protocol_blocker, PageIter, PAGE_SIZE, PROTOCOL_RON_V10,
+    PROTOCOL_RON_V6, SOURCE_OFFER,
 };
 use crate::record_failure;
 use crate::state;
@@ -69,7 +80,7 @@ use crate::VmPauseFn;
 pub const ZFS_BARRIER_OK: u8 = 0;
 
 /// Stop every device worker and every kernel ring, then wait for them
-/// to quiesce. Runs before the vCPUs pause.
+/// to quiesce. Runs after the vCPUs pause.
 ///
 /// A device that keeps running writes guest memory after the final
 /// dirty pass, and a kernel ring that keeps running moves the indices
@@ -78,16 +89,15 @@ pub type DevicePrePauseFn =
     Box<dyn FnOnce() -> Result<(), DeviceStateError> + Send>;
 
 /// Read out every device's migration state. A pure read: the pause
-/// already happened.
-pub type DeviceExportFn = Box<
-    dyn FnOnce() -> Result<Vec<DeviceStatePayload>, DeviceStateError> + Send,
->;
+/// already happened. Called again when the final pass finds pages
+/// written after the first export.
+pub type DeviceExportFn =
+    Box<dyn Fn() -> Result<Vec<DeviceStatePayload>, DeviceStateError> + Send>;
 
 /// Read out the state of every device with no PCI address, each under
 /// its registry id. A pure read, like [`DeviceExportFn`].
-pub type PlatformExportFn = Box<
-    dyn FnOnce() -> Result<Vec<PlatformStatePayload>, DeviceStateError> + Send,
->;
+pub type PlatformExportFn =
+    Box<dyn Fn() -> Result<Vec<PlatformStatePayload>, DeviceStateError> + Send>;
 
 /// Flush device writeback caches. Called after the vCPU pause has
 /// quiesced the vCPUs and before the ZFS barrier, so `zfs send` sees
@@ -147,6 +157,9 @@ pub struct SourceConfig {
     /// A disk changes hands at the commit, which only a destination of
     /// the current protocol does.
     pub handover: bool,
+    /// Whether the guest has the Hyper-V enlightenment, so the
+    /// destination can refuse before the RAM transfer.
+    pub hyperv: bool,
 }
 
 /// The device lifecycle hooks the phases drive.
@@ -207,6 +220,7 @@ fn run_watched<S: Transport>(
     )?;
 
     let resume = hooks.resume;
+    let paused = Paused::default();
     let result = run_inner(
         &mut chan,
         &hdl,
@@ -218,6 +232,7 @@ fn run_watched<S: Transport>(
         hooks.hyperv,
         hooks.committed,
         &hooks.pause_vm,
+        &paused,
         &Gated {
             inner: hooks.gate.as_ref(),
             cutover: &cutover,
@@ -241,7 +256,12 @@ fn run_watched<S: Transport>(
         .lock()
         .map(|s| (s.phase, s.gate))
         .unwrap_or((MigrationPhase::Error, GateState::None));
-    finish_source(result, phase, gate, log, resume, hooks.resume_vm)
+    let rollback = Rollback {
+        devices: resume,
+        devices_paused: paused.devices.load(Ordering::Acquire),
+        vcpus_paused: paused.vcpus.load(Ordering::Acquire),
+    };
+    finish_source(result, phase, gate, log, rollback, hooks.resume_vm)
 }
 
 /// A send the watchdog cut short fails with the stall, not with the
@@ -261,13 +281,33 @@ fn stalled_or(
     }
 }
 
+/// The emulated and the platform device state, as the export read it.
+type Exported = (Vec<DeviceStatePayload>, Vec<PlatformStatePayload>);
+
+/// What the pause has stopped so far.
+#[derive(Default)]
+struct Paused {
+    vcpus: AtomicBool,
+    devices: AtomicBool,
+}
+
+/// What a rollback puts back to work.
+struct Rollback {
+    devices: DeviceResumeFn,
+    /// The device pause started. A device never paused is left alone.
+    devices_paused: bool,
+    /// The vCPU pause succeeded. A resume without it would give up a
+    /// pause another owner holds.
+    vcpus_paused: bool,
+}
+
 /// Roll the source back when a migration failed after the pause.
 fn finish_source<E, F>(
     result: Result<(), MigrateError>,
     phase: MigrationPhase,
     gate: GateState,
     log: &slog::Logger,
-    device_resume_fn: DeviceResumeFn,
+    rollback_to: Rollback,
     resume_vm: F,
 ) -> Result<(), MigrateError>
 where
@@ -290,10 +330,14 @@ where
     }
     if result.is_err() && rollback {
         // Device workers must be available before vCPUs can issue more I/O.
-        device_resume_fn();
-        if let Err(error) = resume_vm() {
-            slog::warn!(log, "failed to resume source VM after migration abort";
-                "error" => %error);
+        if rollback_to.devices_paused {
+            (rollback_to.devices)();
+        }
+        if rollback_to.vcpus_paused {
+            if let Err(error) = resume_vm() {
+                slog::warn!(log, "failed to resume source VM after \
+                    migration abort"; "error" => %error);
+            }
         }
     }
 
@@ -317,6 +361,7 @@ fn run_inner<S: Transport>(
     hyperv_export_fn: HypervExportFn,
     committed: CommittedFn,
     pause_vm: &VmPauseFn,
+    paused: &Paused,
     gate: &dyn StopGate,
     cutover: &Cutover,
     status: &Arc<Mutex<MigrationStatus>>,
@@ -353,6 +398,16 @@ fn run_inner<S: Transport>(
         )));
     }
 
+    let v10_peer = at_least(&sel.protocol, PROTOCOL_RON_V10);
+    let pmu_amd = state::carries_pmu_amd(hdl)?;
+    if !v10_peer && pmu_amd {
+        return Err(MigrateError::ProtocolMismatch(format!(
+            "the destination speaks {}, which cannot carry the AMD PMU \
+             state; both ends need {PROTOCOL_RON_V10} or newer",
+            crate::wire::peer_text(&sel.protocol)
+        )));
+    }
+
     let mut devices = config.devices.clone();
     devices.sort();
     let mut platform = config.platform.clone();
@@ -367,6 +422,9 @@ fn run_inner<S: Transport>(
             platform,
             cpu_features: Some(cpu::local_features(config.cpu_baseline)),
             xsave: xsave.clone(),
+            wall_clock_ns: Some(crate::clock::now_ns()?),
+            hyperv: Some(config.hyperv),
+            pmu_amd: Some(pmu_amd),
         })?,
     )?;
     chan.expect_okay()?;
@@ -377,14 +435,14 @@ fn run_inner<S: Transport>(
     push_ram_all(chan, &mut track, memctx, gate, status)?;
 
     // ── Iterative convergence ──
-    const MAX_ITERS: u32 = 5;
-    const CONVERGE_THRESHOLD: u64 = 1024;
-
-    for iter in 1..=MAX_ITERS {
-        std::thread::sleep(Duration::from_millis(500));
+    let mut precopy = Precopy::new();
+    for iter in 1.. {
+        let started = Instant::now();
         let dirty = push_ram(chan, &mut track, memctx, gate, status)?;
-        slog::info!(log, "convergence"; "iter" => iter, "dirty" => dirty);
-        if dirty <= CONVERGE_THRESHOLD {
+        let took = started.elapsed();
+        slog::info!(log, "convergence"; "iter" => iter, "dirty" => dirty,
+            "took_ms" => took.as_millis());
+        if precopy.done(dirty, took) {
             break;
         }
     }
@@ -395,12 +453,7 @@ fn run_inner<S: Transport>(
     // fail.
     set_phase(status, MigrationPhase::Pause);
     chan.enter_post_pause()?;
-    device_pre_pause_fn()
-        .map_err(|e| MigrateError::State(format!("device pause: {e}")))?;
-    pause_vm().map_err(|e| {
-        cancel_or(gate, MigrateError::Io(format!("pause: {e}")))
-    })?;
-    not_cancelled(gate)?;
+    pause_guest(pause_vm, device_pre_pause_fn, paused, gate)?;
 
     // zvol WCE=1 means writes the guest was told were complete may
     // still sit in cache. `zfs send` ships only committed pool state.
@@ -432,11 +485,23 @@ fn run_inner<S: Transport>(
     let hyperv = hyperv_export_fn();
 
     // ── Post-pause dirty ──
-    // Every writer stopped in the pre-pause step, so this pass is the
-    // last word on guest memory.
+    // Every writer stopped in the pause, so this pass is the last word
+    // on guest memory. The device export runs inside it.
     set_phase(status, MigrationPhase::RamPushPostPause);
-    let final_dirty = push_ram(chan, &mut track, memctx, gate, status)?;
+    let export = || -> Result<Exported, MigrateError> {
+        let emulated = device_export_fn()
+            .map_err(|e| MigrateError::State(format!("device export: {e}")))?;
+        let platform = platform_export_fn()
+            .map_err(|e| MigrateError::State(format!("device export: {e}")))?;
+        Ok((emulated, platform))
+    };
+    let owners =
+        |(emulated, _): &Exported| Owners::new(&memctx.guest_ram(), emulated);
+    let (final_dirty, (emulated, platform)) = final_pass(
+        chan, &mut track, memctx, gate, status, export, owners, log,
+    )?;
     slog::info!(log, "post-pause"; "dirty" => final_dirty);
+    let owners = Owners::new(&memctx.guest_ram(), &emulated);
 
     // ── TimeData ──
     set_phase(status, MigrationPhase::TimeData);
@@ -445,12 +510,15 @@ fn run_inner<S: Transport>(
 
     // ── DeviceState ──
     set_phase(status, MigrationPhase::DeviceState);
-    let mut dev_state =
-        state::export_device_state(hdl, config.num_cpus, &xsave, log)?;
-    dev_state.emulated = device_export_fn()
-        .map_err(|e| MigrateError::State(format!("device export: {e}")))?;
-    dev_state.platform = platform_export_fn()
-        .map_err(|e| MigrateError::State(format!("device export: {e}")))?;
+    let mut dev_state = state::export_device_state(
+        hdl,
+        config.num_cpus,
+        &xsave,
+        v10_peer,
+        log,
+    )?;
+    dev_state.emulated = emulated;
+    dev_state.platform = platform;
     dev_state.hyperv = hyperv;
     slog::info!(log, "exporting device state";
         "devices" => dev_state.emulated.len(),
@@ -459,9 +527,29 @@ fn run_inner<S: Transport>(
 
     // ── RamPull (none needed) ──
     set_phase(status, MigrationPhase::RamPull);
-    chan.send_uncommitted(gate, &Message::MemEnd)?;
+    end_ram(chan, gate, || check_clean(&mut track, memctx, &owners), log)?;
 
     hand_over(chan, gate, committed, status, log)
+}
+
+/// Check that no guest page changed after the final pass, and only
+/// then end the RAM phase.
+///
+/// Nothing on this end writes guest memory after the device export, so
+/// a check here holds at the commit too. It comes before the
+/// destination says it holds everything: a failure after that would
+/// leave the destination unsure whether this end committed.
+fn end_ram<S: Transport>(
+    chan: &mut Chan<S>,
+    gate: &dyn StopGate,
+    clean: impl FnOnce() -> Result<(), MigrateError>,
+    log: &slog::Logger,
+) -> Result<(), MigrateError> {
+    if let Err(error) = clean() {
+        chan.report_failure(&error, log);
+        return Err(error);
+    }
+    chan.send_uncommitted(gate, &Message::MemEnd)
 }
 
 /// Three steps, and the order is the whole point. The destination says
@@ -562,6 +650,110 @@ fn kernel_tracking(
     move |gpa, len, bm| hdl.track_dirty_pages(gpa, len, bm)
 }
 
+/// Pause the vCPUs, then pause and drain the devices.
+///
+/// The vCPUs go first, as in Propolis: a guest that still runs keeps
+/// submitting to devices that are trying to drain.
+fn pause_guest(
+    pause_vm: &VmPauseFn,
+    device_pre_pause_fn: DevicePrePauseFn,
+    paused: &Paused,
+    gate: &dyn StopGate,
+) -> Result<(), MigrateError> {
+    pause_vm().map_err(|e| {
+        cancel_or(gate, MigrateError::Io(format!("pause: {e}")))
+    })?;
+    paused.vcpus.store(true, Ordering::Release);
+    not_cancelled(gate)?;
+    // Set before the call: a pause that fails half way still left
+    // some devices paused, and the rollback must resume them.
+    paused.devices.store(true, Ordering::Release);
+    device_pre_pause_fn()
+        .map_err(|e| MigrateError::State(format!("device pause: {e}")))
+}
+
+/// The last RAM pass, with the vCPUs and every device stopped.
+///
+/// One pass on the wire in two rounds, with the device export between
+/// them. A read through the tracked mapping marks a page dirty, and
+/// a late completion writes one. The second round sends those pages
+/// while the guest is still paused, and the devices are exported again
+/// so their state matches that memory. A page still dirty after that
+/// fails the commit in [`check_clean`].
+#[allow(clippy::too_many_arguments)]
+fn final_pass<S: Transport, T>(
+    chan: &mut Chan<S>,
+    track: &mut TrackFn<'_>,
+    memctx: &MemCtx,
+    gate: &dyn StopGate,
+    status: &Arc<Mutex<MigrationStatus>>,
+    export: impl Fn() -> Result<T, MigrateError>,
+    owners: impl FnOnce(&T) -> Owners,
+    log: &slog::Logger,
+) -> Result<(u64, T), MigrateError> {
+    let mut sent = send_round(chan, track, memctx, gate, status)?;
+    let mut exported = export()?;
+    let late = dirty_pages(track, memctx)?;
+    if !late.is_empty() {
+        slog::warn!(log, "pages written after the first final round; \
+            sending them again while paused";
+            "pages" => late.len(),
+            "first" => owners(&exported).describe(&late));
+        sent += send_dirty(late.iter().copied(), gate, |batch| {
+            send_batch_sparse(chan, memctx, gate, batch, status)
+        })?;
+        // A real write moved a ring, so the first export is stale.
+        exported = export()?;
+    }
+    if let Ok(mut s) = status.lock() {
+        s.dirty_pages_remaining = sent;
+    }
+    end_pass(chan, gate)?;
+    Ok((sent, exported))
+}
+
+/// Read and clear the dirty bitmap, and list every dirty page.
+fn dirty_pages(
+    track: &mut TrackFn<'_>,
+    memctx: &MemCtx,
+) -> Result<Vec<u64>, MigrateError> {
+    let mut pages = Vec::new();
+    for (gpa, len) in memctx.guest_ram() {
+        let mut bm = vec![0u8; crate::protocol::bitmap_size(len)];
+        track(gpa, len, &mut bm)
+            .map_err(|e| MigrateError::Io(format!("track_dirty: {e}")))?;
+        pages.extend(PageIter::new(&bm, gpa, len));
+    }
+    Ok(pages)
+}
+
+/// Refuse to hand over while a guest page is still dirty.
+///
+/// The final pass already sent one more round after the export, so a
+/// page dirty here was written by something that still runs while the
+/// guest is paused. The bits this read clears do not matter: a failed
+/// attempt rolls back, and the next one starts with a full pass.
+fn check_clean(
+    track: &mut TrackFn<'_>,
+    memctx: &MemCtx,
+    owners: &Owners,
+) -> Result<(), MigrateError> {
+    let left = dirty_pages(track, memctx)?;
+    if !left.is_empty() {
+        return Err(MigrateError::State(format!(
+            "{} guest pages were written after the final pass: {}",
+            left.len(),
+            owners.describe(&left)
+        )));
+    }
+    Ok(())
+}
+
+/// Always every page, whatever the dirty bitmap says.
+///
+/// A failed attempt cleared the bits of the pages it sent, and a
+/// destination of a new attempt holds none of them. A dirty-only first
+/// pass would leave those pages behind.
 fn push_ram_all<S: Transport>(
     chan: &mut Chan<S>,
     track: &mut TrackFn<'_>,
@@ -597,6 +789,22 @@ fn push_ram<S: Transport>(
     gate: &dyn StopGate,
     status: &Arc<Mutex<MigrationStatus>>,
 ) -> Result<u64, MigrateError> {
+    let total = send_round(chan, track, memctx, gate, status)?;
+    if let Ok(mut s) = status.lock() {
+        s.dirty_pages_remaining = total;
+    }
+    end_pass(chan, gate)?;
+    Ok(total)
+}
+
+/// Send every dirty page once, without ending the pass.
+fn send_round<S: Transport>(
+    chan: &mut Chan<S>,
+    track: &mut TrackFn<'_>,
+    memctx: &MemCtx,
+    gate: &dyn StopGate,
+    status: &Arc<Mutex<MigrationStatus>>,
+) -> Result<u64, MigrateError> {
     let mut total: u64 = 0;
     for (gpa, len) in memctx.guest_ram() {
         let bm_len = crate::protocol::bitmap_size(len);
@@ -607,10 +815,6 @@ fn push_ram<S: Transport>(
             send_batch_sparse(chan, memctx, gate, batch, status)
         })?;
     }
-    if let Ok(mut s) = status.lock() {
-        s.dirty_pages_remaining = total;
-    }
-    end_pass(chan, gate)?;
     Ok(total)
 }
 

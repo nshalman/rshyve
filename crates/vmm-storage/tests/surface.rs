@@ -73,9 +73,9 @@ impl CompletionSink for NoSink {
 #[test]
 fn a_backend_from_outside_the_crate_fits_the_interface() {
     let factory: BackendFactory = Box::new(|sink| {
-        Arc::new(OutsideBackend { sink }) as Arc<dyn AsyncBackend>
+        Ok(Arc::new(OutsideBackend { sink }) as Arc<dyn AsyncBackend>)
     });
-    let backend = factory(Arc::new(NoSink));
+    let backend = factory(Arc::new(NoSink)).expect("built");
     let config = NvmeConfig {
         lba_size: LbaSize::B4096,
         volatile_write_cache: false,

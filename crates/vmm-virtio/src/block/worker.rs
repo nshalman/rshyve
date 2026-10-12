@@ -14,7 +14,7 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use vmm_core::mem::PhysMap;
-use vmm_devices::blkdev::DiskSync;
+use vmm_devices::blkdev::{BackingDisk, DiskSync};
 use vmm_devices::QuiesceGate;
 
 use super::access::BackendBarrier;
@@ -157,22 +157,27 @@ pub(super) fn needs_backend(rtype: u32) -> bool {
 /// cannot land on a descriptor the host has reopened.
 pub(super) fn blk_io_worker(
     rx: mpsc::Receiver<BlkIoRequest>,
-    disk: Arc<DiskSync>,
+    disk: Arc<BackingDisk>,
     limits: DiskLimits,
     ctx: WorkerCtx,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
-
-    let disk = &*disk;
 
     let mut bounce = Bounce::new();
     let mut done = Pass::new();
     // Carries the one request a batch drain had to hand back because it
     // crossed a reset boundary.
     let mut carried: Option<BlkIoRequest> = None;
+    // Requests that came before the store opened. They wait for it
+    // rather than vanish with their descriptors still owed.
+    let mut waiting: std::collections::VecDeque<BlkIoRequest> =
+        std::collections::VecDeque::new();
 
     loop {
-        let req = match carried.take() {
+        let next = carried.take().or_else(|| {
+            disk.get().is_some().then(|| waiting.pop_front()).flatten()
+        });
+        let req = match next {
             Some(req) => req,
             None => match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(r) => r,
@@ -194,6 +199,12 @@ pub(super) fn blk_io_worker(
             },
         };
 
+        // `notify_queue` dispatches nothing before the store opens, and
+        // an open store stays open.
+        let Some(disk) = disk.get() else {
+            waiting.push_back(req);
+            continue;
+        };
         run_batch(
             &rx,
             disk,

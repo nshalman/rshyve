@@ -29,7 +29,8 @@
 //! (`vmm.c:880` and `vmm.c:944`). They are write-lock ioctls
 //! (`vmm_sol_dev.c:488`, `LOCK_WRITE_HOLD`), so the kernel drives every
 //! vCPU out with a `VM_EXITCODE_BOGUS` exit (`vmm.c:3444`) and freezes
-//! it for the length of the call.
+//! it for the length of the call. The kernel network rings do have to
+//! stop, which the VM's ring gate does around both calls.
 //! [`crate::vcpu_tasks`] treats that exit as a plain re-entry, so the
 //! run loop needs no change.
 //!
@@ -260,12 +261,19 @@ impl MemMapper for KernelMapper {
             .physmap
             .claim_ram(gpa, len)
             .map_err(|e| failed(e, false))?;
-        self.hdl
-            .create_memseg(segid, len, &format!("hotmem{segid}"))
-            .map_err(|e| failed(e, false))?;
-        claim
-            .commit(&self.hdl, segid, 0)
-            .map_err(|e| failed(e, true))
+        // Both ioctls take the VM write lock, so they run in one pass
+        // of the ring gate. A gate that will not stop the rings creates
+        // nothing.
+        let hdl = &self.hdl;
+        hdl.rings()
+            .run(|rings| {
+                hdl.create_memseg(rings, segid, len, &format!("hotmem{segid}"))
+                    .map_err(|e| failed(e, false))?;
+                claim
+                    .commit(hdl, rings, segid, 0)
+                    .map_err(|e| failed(e, true))
+            })
+            .map_err(|e| failed(e.into(), false))?
     }
 }
 

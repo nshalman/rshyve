@@ -29,6 +29,22 @@ pub fn local_features(baseline: CpuBaseline) -> CpuFeatures {
     }
 }
 
+/// Whether this host runs guests under AMD SVM, whose kernel keeps a
+/// PMU state per vCPU. Hygon parts use SVM too.
+pub fn host_is_amd() -> bool {
+    use vmm_core::cpuid::{CpuidSource, HostCpu};
+    let (_, ebx, ecx, edx) = HostCpu.cpuid(0, 0);
+    is_amd_vendor(ebx, ecx, edx)
+}
+
+fn is_amd_vendor(ebx: u32, ecx: u32, edx: u32) -> bool {
+    let mut vendor = [0u8; 12];
+    vendor[..4].copy_from_slice(&ebx.to_le_bytes());
+    vendor[4..8].copy_from_slice(&edx.to_le_bytes());
+    vendor[8..].copy_from_slice(&ecx.to_le_bytes());
+    matches!(&vendor, b"AuthenticAMD" | b"HygonGenuine")
+}
+
 /// The features the source exposes and the destination does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Missing {
@@ -89,6 +105,25 @@ mod tests {
             leaf7_ecx: 0,
             leaf7_edx: 0,
             xcr0,
+        }
+    }
+
+    fn vendor(name: &[u8; 12]) -> (u32, u32, u32) {
+        let word = |i: usize| {
+            u32::from_le_bytes(name[i..i + 4].try_into().expect("4 bytes"))
+        };
+        (word(0), word(8), word(4))
+    }
+
+    #[test]
+    fn the_vendor_string_reads_ebx_edx_ecx() {
+        for (name, amd) in [
+            (b"AuthenticAMD", true),
+            (b"HygonGenuine", true),
+            (b"GenuineIntel", false),
+        ] {
+            let (ebx, ecx, edx) = vendor(name);
+            assert_eq!(is_amd_vendor(ebx, ecx, edx), amd);
         }
     }
 

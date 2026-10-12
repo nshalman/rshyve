@@ -28,10 +28,10 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// life. A peer that stops reading would keep its slot for ever, and
 /// eight such peers would take the control socket away from every
 /// later client, including the one that stops or migrates the VM.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a closing connection waits for the client to close first.
 /// It still holds its slot until then.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A running control listener.
 ///
@@ -46,9 +46,27 @@ pub struct ControlListener {
 }
 
 impl ControlListener {
+    /// A listener whose accept thread `handle` stops on `shutdown`.
+    pub(super) fn from_parts(
+        path: PathBuf,
+        shutdown: Arc<AtomicBool>,
+        handle: thread::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            path,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+
     /// The socket file, for the caller that removes it at teardown.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Tell the accept thread to stop, without waiting for it.
+    pub fn stop(&self) {
+        self.shutdown.store(true, Ordering::Release);
     }
 
     /// Stop accepting and wait for the accept thread.
@@ -78,6 +96,24 @@ pub fn spawn_control_thread(
     ctrl: Arc<VmController>,
     log: Logger,
 ) -> io::Result<ControlListener> {
+    let connection_log = log.clone();
+    spawn_listener(path, log, move |stream| {
+        if let Err(e) = handle_connection(&ctrl, &stream, &connection_log) {
+            warn!(connection_log, "control connection error"; "error" => %e);
+        }
+        close_after_write(stream, CLOSE_TIMEOUT);
+    })
+}
+
+/// Bind `path` and serve each client with `handler` on its own thread.
+fn spawn_listener<F>(
+    path: &Path,
+    log: Logger,
+    handler: F,
+) -> io::Result<ControlListener>
+where
+    F: Fn(UnixStream) + Send + Sync + 'static,
+{
     let listener = vmm_core::unixsock::bind_restricted(
         path,
         vmm_core::unixsock::SocketPolicy::default(),
@@ -85,17 +121,12 @@ pub fn spawn_control_thread(
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_shutdown = Arc::clone(&shutdown);
-    let handle = thread::Builder::new()
-        .name("control".into())
-        .spawn(move || {
-            let connection_log = log.clone();
-            serve_connections(listener, &thread_shutdown, log, move |stream| {
-                if let Err(e) = handle_connection(&ctrl, &stream, &connection_log) {
-                    warn!(connection_log, "control connection error"; "error" => %e);
-                }
-                close_after_write(stream, CLOSE_TIMEOUT);
-            });
-        })?;
+    let handle =
+        thread::Builder::new()
+            .name("control".into())
+            .spawn(move || {
+                serve_connections(listener, &thread_shutdown, log, handler);
+            })?;
 
     Ok(ControlListener {
         path: path.to_path_buf(),
@@ -147,7 +178,7 @@ fn set_connection_deadlines(
 /// The accept itself is the shared loop, which retries a transient
 /// error such as `EMFILE` with a backoff instead of ending: one accept
 /// error used to take the control socket away for the life of the VM.
-fn serve_connections<F>(
+pub(super) fn serve_connections<F>(
     listener: UnixListener,
     shutdown: &AtomicBool,
     log: Logger,
@@ -200,7 +231,7 @@ fn request_too_large() -> io::Error {
 
 /// Read one newline-delimited request without allowing `buf` to exceed the cap.
 /// Returns `false` only when EOF is reached before any request bytes are read.
-fn read_request<R: BufRead>(
+pub(super) fn read_request<R: BufRead>(
     reader: &mut R,
     buf: &mut Vec<u8>,
 ) -> io::Result<bool> {
@@ -243,7 +274,7 @@ fn read_request<R: BufRead>(
 /// is a file-status flag that the `BufReader` clone of this socket
 /// shares, so it would break the request reads. `write_all_bounded`
 /// polls for space instead.
-fn write_response(
+pub(super) fn write_response(
     stream: &UnixStream,
     payload: &[u8],
     budget: Duration,
@@ -251,7 +282,7 @@ fn write_response(
     write_all_bounded(stream, payload, budget)
 }
 
-fn write_error_response(
+pub(super) fn write_error_response(
     stream: &UnixStream,
     message: &str,
     budget: Duration,

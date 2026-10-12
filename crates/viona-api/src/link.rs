@@ -34,8 +34,11 @@ use crate::{
     VNA_IOC_SET_PROMISC,
 };
 
+mod quiesce;
 #[cfg(test)]
 mod test;
+
+pub use quiesce::{quiesce, QuiesceFailed, Quiesced, Resumed};
 
 /// The band viona signals a pending interrupt in.
 ///
@@ -142,16 +145,24 @@ pub trait LinkOps: Send + Sync {
     /// that ends it on demand.
     fn wait_intr(&self, stop: &PipeReader) -> Result<IntrWait>;
 
-    /// Name the I/O port the guest writes to kick a ring.
+    /// Name the I/O port the guest writes to kick a ring, or 0 for
+    /// none.
     ///
     /// The kernel then takes the kick itself, and the vCPU does not
-    /// leave to userspace for it.
-    fn set_notify_iop(&self, port: u16) -> Result<()>;
+    /// leave to userspace for it. The call takes the VM write lock, so
+    /// it needs `rings` to prove no ring worker is alive.
+    fn set_notify_iop(&self, rings: &Quiesced, port: u16) -> Result<()>;
 
-    /// Name the memory address the guest writes to kick a ring.
+    /// Name the memory window the guest writes to kick a ring. An
+    /// address of 0 removes the window.
     ///
     /// The modern transport counterpart of [`Self::set_notify_iop`].
-    fn set_notify_mmio(&self, addr: u64, size: u32) -> Result<()>;
+    fn set_notify_mmio(
+        &self,
+        rings: &Quiesced,
+        addr: u64,
+        size: u32,
+    ) -> Result<()>;
 
     /// Set what traffic the link passes to the guest.
     fn set_promisc(&self, mode: PromiscMode) -> Result<()>;
@@ -193,7 +204,7 @@ impl LinkOps for VionaFd {
             rim_qaddr_used: used,
             ..Default::default()
         };
-        // Safety: the command copies in one vioc_ring_init_modern, and
+        // SAFETY: the command copies in one vioc_ring_init_modern, and
         // that is what `rim` is.
         unsafe { self.ioctl(VNA_IOC_RING_INIT_MODERN, &mut rim) }?;
         Ok(())
@@ -216,7 +227,7 @@ impl LinkOps for VionaFd {
 
     fn ring_set_state(&self, state: &vioc_ring_state) -> Result<()> {
         let mut state = *state;
-        // Safety: the command copies in one vioc_ring_state, and that
+        // SAFETY: the command copies in one vioc_ring_state, and that
         // is what `state` is.
         unsafe { self.ioctl(VNA_IOC_RING_SET_STATE, &mut state) }?;
         Ok(())
@@ -227,7 +238,7 @@ impl LinkOps for VionaFd {
             vrs_index: ring,
             ..Default::default()
         };
-        // Safety: the command copies out one vioc_ring_state, and that
+        // SAFETY: the command copies out one vioc_ring_state, and that
         // is what `state` is.
         unsafe { self.ioctl(VNA_IOC_RING_GET_STATE, &mut state) }?;
         Ok(state)
@@ -240,7 +251,7 @@ impl LinkOps for VionaFd {
             rm_msg: msg,
             ..Default::default()
         };
-        // Safety: the command copies in one vioc_ring_msi, and that is
+        // SAFETY: the command copies in one vioc_ring_msi, and that is
         // what `msi` is.
         unsafe { self.ioctl(VNA_IOC_RING_SET_MSI, &mut msi) }?;
         Ok(())
@@ -248,7 +259,7 @@ impl LinkOps for VionaFd {
 
     fn set_features(&self, features: u64) -> Result<()> {
         let mut feat = features;
-        // Safety: the command copies in one u64, and that is what
+        // SAFETY: the command copies in one u64, and that is what
         // `feat` is.
         unsafe { self.ioctl(VNA_IOC_SET_FEATURES, &mut feat) }?;
         Ok(())
@@ -256,7 +267,7 @@ impl LinkOps for VionaFd {
 
     fn intr_status(&self) -> Result<IntrStatus> {
         let mut poll_data = vioc_intr_poll::default();
-        // Safety: the command copies out one vioc_intr_poll, and that
+        // SAFETY: the command copies out one vioc_intr_poll, and that
         // is what `poll_data` is.
         unsafe { self.ioctl(VNA_IOC_INTR_POLL, &mut poll_data) }?;
         Ok(poll_data.vip_status)
@@ -283,7 +294,7 @@ impl LinkOps for VionaFd {
                     revents: 0,
                 },
             ];
-            // Safety: both descriptors are open for this call, and the
+            // SAFETY: both descriptors are open for this call, and the
             // count matches the array.
             let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
             if ret < 0 {
@@ -309,20 +320,33 @@ impl LinkOps for VionaFd {
         }
     }
 
-    fn set_notify_iop(&self, port: u16) -> Result<()> {
-        self.ioctl_usize(VNA_IOC_SET_NOTIFY_IOP, port as usize)?;
+    fn set_notify_iop(&self, rings: &Quiesced, port: u16) -> Result<()> {
+        quiesced_here(rings, self)?;
+        self.hook_ioctl_usize(VNA_IOC_SET_NOTIFY_IOP, port as usize)?;
         Ok(())
     }
 
-    fn set_notify_mmio(&self, addr: u64, size: u32) -> Result<()> {
+    fn set_notify_mmio(
+        &self,
+        rings: &Quiesced,
+        addr: u64,
+        size: u32,
+    ) -> Result<()> {
+        quiesced_here(rings, self)?;
+        // A null payload is how the kernel is told to remove the
+        // window (`viona_main.c`, `viona_ioc_set_notify_mmio`).
+        if addr == 0 {
+            self.hook_ioctl_usize(VNA_IOC_SET_NOTIFY_MMIO, 0)?;
+            return Ok(());
+        }
         let mut vim = vioc_notify_mmio {
             vim_address: addr,
             vim_size: size,
             ..Default::default()
         };
-        // Safety: the command copies in one vioc_notify_mmio, and that
+        // SAFETY: the command copies in one vioc_notify_mmio, and that
         // is what `vim` is.
-        unsafe { self.ioctl(VNA_IOC_SET_NOTIFY_MMIO, &mut vim) }?;
+        unsafe { self.hook_ioctl(VNA_IOC_SET_NOTIFY_MMIO, &mut vim) }?;
         Ok(())
     }
 
@@ -339,6 +363,17 @@ impl LinkOps for VionaFd {
         self.ioctl_usize(VNA_IOC_DELETE, 0)?;
         Ok(())
     }
+}
+
+/// Refuse a proof made for another link.
+fn quiesced_here(rings: &Quiesced, link: &VionaFd) -> Result<()> {
+    if rings.covers(link) {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "the rings of another link were stopped",
+    ))
 }
 
 /// What one `poll(2)` wakeup means, or `None` to wait again.

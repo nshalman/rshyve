@@ -44,7 +44,7 @@ pub(crate) fn calls(fd: &VionaFd) -> Vec<Call> {
 /// kernel could have written. Without this a caller reads the struct
 /// it sent, and a method that answers with a constant looks right.
 pub(crate) fn answers_with<T: Copy>(fd: &VionaFd, cmd: i32, value: T) {
-    // Safety: `value` is one initialized T, and every ioctl payload
+    // SAFETY: `value` is one initialized T, and every ioctl payload
     // names its padding, so no byte read here is uninitialized.
     let bytes = unsafe {
         std::slice::from_raw_parts(
@@ -188,7 +188,7 @@ fn the_create_call_sends_the_link_and_the_vm_where_the_kernel_reads_them() {
     let link_id: u32 = 0xAABB_CCDD;
     let vm_fd: RawFd = 0x0102_0304;
 
-    // Safety: a recorder never passes the descriptor to the kernel, so
+    // SAFETY: a recorder never passes the descriptor to the kernel, so
     // the number need not be open.
     let vm = unsafe { BorrowedFd::borrow_raw(vm_fd) };
     fd.create(link_id, vm).expect("a recorder answers");

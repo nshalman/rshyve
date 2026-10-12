@@ -134,7 +134,7 @@ fn a_stop_frees_a_wait_on_a_silent_zfs_barrier() {
         stopper.stop();
     });
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let error = zfs_barrier_wait(
         &path,
         Duration::from_secs(60),
@@ -145,6 +145,15 @@ fn a_stop_frees_a_wait_on_a_silent_zfs_barrier() {
 
     assert!(crate::is_cancel(&error), "{error}");
     assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+/// A rollback after the device pause started.
+fn paused(devices: DeviceResumeFn) -> Rollback {
+    Rollback {
+        devices,
+        devices_paused: true,
+        vcpus_paused: true,
+    }
 }
 
 #[test]
@@ -165,7 +174,7 @@ fn flush_failure_resumes_devices_and_vcpus() {
         MigrationPhase::Pause,
         GateState::None,
         &discard(),
-        resume_fn,
+        paused(resume_fn),
         move || {
             assert!(devices_resumed_before_vcpus.load(Ordering::Acquire));
             vcpus_resumed_by_callback.store(true, Ordering::Release);
@@ -192,7 +201,7 @@ fn a_committed_source_is_never_resumed() {
         MigrationPhase::Committed,
         GateState::None,
         &discard(),
-        resume_fn,
+        paused(resume_fn),
         || -> Result<(), &'static str> {
             panic!("a committed source must not resume its vCPUs")
         },
@@ -215,7 +224,7 @@ fn a_failure_in_finish_still_rolls_back() {
         MigrationPhase::Finish,
         GateState::None,
         &discard(),
-        resume_fn,
+        paused(resume_fn),
         || Ok::<(), &'static str>(()),
     );
     assert!(result.is_err());
@@ -324,7 +333,7 @@ fn a_destination_abort_rolls_the_source_back() {
         phase(&status),
         GateState::None,
         &discard(),
-        Box::new(move || by_callback.store(true, Ordering::Release)),
+        paused(Box::new(move || by_callback.store(true, Ordering::Release))),
         || Ok::<(), &'static str>(()),
     );
     assert!(rolled_back.load(Ordering::Acquire));
@@ -443,7 +452,7 @@ fn a_pre_pause_failure_does_not_resume_a_running_guest() {
         MigrationPhase::Sync,
         GateState::None,
         &discard(),
-        resume_fn,
+        paused(resume_fn),
         || Ok::<(), &'static str>(()),
     );
     assert!(result.is_err());
@@ -466,7 +475,9 @@ fn a_source_held_by_the_gate_is_never_resumed() {
             phase,
             GateState::Go,
             &discard(),
-            Box::new(move || by_callback.store(true, Ordering::Release)),
+            paused(Box::new(move || {
+                by_callback.store(true, Ordering::Release)
+            })),
             || -> Result<(), &'static str> {
                 panic!("a held source must not resume its vCPUs")
             },
@@ -485,7 +496,7 @@ fn an_aborted_gate_rolls_the_source_back() {
         MigrationPhase::Pause,
         GateState::Abort,
         &discard(),
-        Box::new(move || by_callback.store(true, Ordering::Release)),
+        paused(Box::new(move || by_callback.store(true, Ordering::Release))),
         || Ok::<(), &'static str>(()),
     );
     assert!(resumed.load(Ordering::Acquire));
@@ -526,7 +537,7 @@ fn a_trickling_peer_after_the_go_rolls_the_source_back() {
 
     let gate = Gate::default();
     cutover.arm();
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let error = hand_over(
         &mut source,
         &Gated {
@@ -556,7 +567,7 @@ fn a_trickling_peer_after_the_go_rolls_the_source_back() {
         phase,
         gate_state,
         &discard(),
-        Box::new(move || by_callback.store(true, Ordering::Release)),
+        paused(Box::new(move || by_callback.store(true, Ordering::Release))),
         || Ok::<(), &'static str>(()),
     );
     assert!(resumed.load(Ordering::Acquire), "the source stayed paused");
@@ -725,7 +736,7 @@ fn a_peer_that_stops_reading_fails_the_pre_pause_push() {
     let status = status();
     set_phase(&status, MigrationPhase::RamPushPrePause);
 
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let error = push_ram_all(
         &mut source,
         &mut no_tracking,
@@ -757,3 +768,164 @@ fn a_committed_failure_keeps_the_committed_phase() {
     assert_eq!(s.phase, MigrationPhase::Committed);
     assert!(s.error.is_some());
 }
+
+/// The kernel's dirty bitmap, as a test drives it: a guest write marks
+/// a page, and a read clears what it reports.
+#[derive(Clone, Default)]
+struct FakeDirty(Arc<Mutex<std::collections::BTreeSet<u64>>>);
+
+impl FakeDirty {
+    fn guest_write(&self, memctx: &MemCtx, gpa: u64, fill: u8) {
+        memctx.write(gpa, &[fill; PAGE_SIZE]).expect("guest write");
+        self.0.lock().expect("bitmap").insert(gpa);
+    }
+
+    fn track(
+        &self,
+        gpa: u64,
+        len: usize,
+        bm: &mut [u8],
+    ) -> std::io::Result<()> {
+        let mut dirty = self.0.lock().expect("bitmap");
+        let end = gpa + len as u64;
+        for page in dirty.range(gpa..end) {
+            let bit = ((page - gpa) / PAGE_SIZE as u64) as usize;
+            bm[bit / 8] |= 1 << (bit % 8);
+        }
+        dirty.retain(|&p| p < gpa || p >= end);
+        Ok(())
+    }
+}
+
+/// One attempt's RAM passes into a fresh destination, which it hands
+/// back. `between` runs on the guest between the full and the dirty
+/// pass.
+fn ram_attempt(
+    memctx: &MemCtx,
+    dirty: &FakeDirty,
+    ram: usize,
+    between: impl FnOnce(),
+) -> MemCtx {
+    use crate::destination::{receive_pass, PassEnd};
+    let (mut source, mut dest) = pair();
+    let peer = std::thread::spawn(move || {
+        let memctx = MemCtx::new(Arc::new(
+            vmm_core::mem::PhysMap::new_anon(0, ram).expect("guest memory"),
+        ));
+        for _ in 0..2 {
+            receive_pass(
+                &mut dest,
+                &memctx,
+                &crate::NoStop,
+                &status(),
+                PassEnd::MemEnd,
+            )
+            .expect("pass");
+        }
+        memctx
+    });
+    let mut track = |gpa, len, bm: &mut [u8]| dirty.track(gpa, len, bm);
+    push_ram_all(&mut source, &mut track, memctx, &Gate::default(), &status())
+        .expect("full pass");
+    between();
+    push_ram(&mut source, &mut track, memctx, &Gate::default(), &status())
+        .expect("dirty pass");
+    peer.join().expect("destination")
+}
+
+fn image(memctx: &MemCtx, ram: usize) -> Vec<u8> {
+    let mut out = vec![0u8; ram];
+    memctx.read(0, &mut out).expect("read");
+    out
+}
+
+#[test]
+fn a_retry_after_a_failed_attempt_carries_its_writes() {
+    // Attempt one sends page 3 in its dirty pass, which clears the bit,
+    // and then fails. The guest never writes page 3 again. Attempt two
+    // goes to a new destination, so only a full first pass carries it.
+    const RAM: usize = 16 * PAGE_SIZE;
+    let memctx = firmware_layout(RAM);
+    let dirty = FakeDirty::default();
+    for page in 0..16u64 {
+        dirty.guest_write(&memctx, page * PAGE_SIZE as u64, page as u8);
+    }
+    let third = 3 * PAGE_SIZE as u64;
+
+    let failed = ram_attempt(&memctx, &dirty, RAM, || {
+        dirty.guest_write(&memctx, third, 0xB3);
+    });
+    drop(failed);
+    assert!(dirty.0.lock().expect("bitmap").is_empty());
+
+    let retry = ram_attempt(&memctx, &dirty, RAM, || {});
+    assert_eq!(image(&retry, RAM), image(&memctx, RAM));
+}
+
+#[test]
+fn a_page_dirty_at_the_commit_refuses_it() {
+    const RAM: usize = 16 * PAGE_SIZE;
+    let memctx = firmware_layout(RAM);
+    let dirty = FakeDirty::default();
+    let owners = Owners::new(&memctx.guest_ram(), &[]);
+    let mut track = |gpa, len, bm: &mut [u8]| dirty.track(gpa, len, bm);
+    check_clean(&mut track, &memctx, &owners).expect("nothing dirty");
+
+    dirty.guest_write(&memctx, 5 * PAGE_SIZE as u64, 0x55);
+    let mut track = |gpa, len, bm: &mut [u8]| dirty.track(gpa, len, bm);
+    let error =
+        check_clean(&mut track, &memctx, &owners).expect_err("one page left");
+    assert!(error.to_string().contains("1 guest pages"), "{error}");
+    assert!(
+        error.to_string().contains("0x5000 (RAM region 0"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_dirty_source_ends_before_the_destination_says_ready() {
+    // The destination hears the failure in place of the MemEnd, so it
+    // fails before it commits, not in doubt.
+    let (mut source, mut dest) = pair();
+    let error = end_ram(
+        &mut source,
+        &Gate::default(),
+        || Err(MigrateError::State("1 guest pages left".into())),
+        &discard(),
+    )
+    .expect_err("dirty");
+    assert!(matches!(error, MigrateError::State(_)), "{error}");
+    assert!(
+        !matches!(dest.recv(), Ok(Message::MemEnd)),
+        "the destination heard a MemEnd"
+    );
+
+    let (mut source, mut dest) = pair();
+    end_ram(&mut source, &Gate::default(), || Ok(()), &discard())
+        .expect("clean");
+    assert!(matches!(dest.recv(), Ok(Message::MemEnd)));
+}
+
+#[test]
+fn a_page_the_source_cannot_read_fails_and_sends_nothing() {
+    // Propolis sends a zero page here. The guest would resume with that
+    // page wiped.
+    let memctx = firmware_layout(4 * PAGE_SIZE);
+    let (mut source, mut dest) = pair();
+    let unmapped = 0x10_0000_0000;
+    for gpas in [vec![0, unmapped], vec![unmapped]] {
+        let error = send_batch_sparse(
+            &mut source,
+            &memctx,
+            &Gate::default(),
+            &gpas,
+            &status(),
+        )
+        .expect_err("unmapped page");
+        assert!(error.to_string().contains("guest memory read"), "{error}");
+    }
+    drop(source);
+    assert!(dest.recv().is_err(), "a batch went out");
+}
+
+mod final_pass;

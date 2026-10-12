@@ -13,6 +13,7 @@ use std::sync::atomic::Ordering;
 use vmm_devices::lifecycle::{
     DeviceMigrateState, DeviceStateError, FbufMigrateState, FbufMigrateVram,
 };
+use vmm_devices::pci::bits::RegCmd;
 use vmm_devices::pci::device::replay_migrate_pci_state;
 
 use super::{
@@ -102,21 +103,50 @@ impl Framebuffer {
                 Vec::new()
             }
         };
-        // The whole segment, so an import into a used device leaves no
-        // stale pixels past the carried prefix.
-        vram.resize(self.fb.len(), 0);
-        self.fb.view().write_bytes(&vram).map_err(|e| {
-            DeviceStateError::invalid(format!("fbuf: write VRAM: {e}"))
-        })?;
-        self.resolution
-            .store(pack_resolution(mig.width, mig.height), Ordering::Release);
-
+        // The header first: a BAR that does not decode, or a VRAM that
+        // will not write, puts it back and leaves the device as it was.
+        // The guest is paused, so nothing reads BAR0 in between.
+        let pci_before = self
+            .pci_state
+            .lock()
+            .expect("fbuf: pci_state lock")
+            .migrate_state();
+        let put_back = || {
+            let back = self
+                .pci_state
+                .lock()
+                .expect("fbuf: pci_state lock")
+                .bar_replay_writes(&pci_before.bar_addrs);
+            replay_migrate_pci_state(self, &back, &pci_before);
+        };
         let bar_writes = self
             .pci_state
             .lock()
             .expect("fbuf: pci_state lock")
             .bar_replay_writes(&mig.pci.bar_addrs);
         replay_migrate_pci_state(self, &bar_writes, &mig.pci);
+        let decodes = mig.pci.command & RegCmd::MMIO_EN.bits() != 0
+            && mig.pci.bar_addrs[0] != 0;
+        let registered = *self.registered_bar0.lock().expect("fbuf: bar0");
+        if decodes && registered.is_none() {
+            put_back();
+            return Err(DeviceStateError::invalid(format!(
+                "fbuf: BAR0 at {:#x} does not decode",
+                mig.pci.bar_addrs[0]
+            )));
+        }
+
+        // The whole segment, so an import into a used device leaves no
+        // stale pixels past the carried prefix.
+        vram.resize(self.fb.len(), 0);
+        if let Err(e) = self.fb.view().write_bytes(&vram) {
+            put_back();
+            return Err(DeviceStateError::invalid(format!(
+                "fbuf: write VRAM: {e}"
+            )));
+        }
+        self.resolution
+            .store(pack_resolution(mig.width, mig.height), Ordering::Release);
         Ok(())
     }
 }
@@ -161,11 +191,7 @@ mod tests {
     fn program(dev: &Framebuffer) {
         dev.cfg_write(0x10, 4, BAR0 as u32);
         dev.cfg_write(0x14, 4, BAR1 as u32);
-        dev.cfg_write(
-            0x04,
-            2,
-            u32::from(vmm_devices::pci::bits::RegCmd::MMIO_EN.bits()),
-        );
+        dev.cfg_write(0x04, 2, u32::from(RegCmd::MMIO_EN.bits()));
     }
 
     fn ron_round_trip(state: &DeviceMigrateState) -> DeviceMigrateState {
@@ -268,6 +294,26 @@ mod tests {
         }
         // Nothing of the refused states was applied.
         assert_eq!((dst.width(), dst.height()), (1024, 768));
+    }
+
+    #[test]
+    fn a_bar_that_does_not_decode_fails_the_restore_and_changes_nothing() {
+        let src = make_test_dev();
+        program(&src);
+        src.bar0_write(super::super::memreg::WIDTH, 1280 | (800 << 16), 4);
+        let exported = src.export_state().expect("export");
+
+        let dst = make_test_dev();
+        // Something else holds the address, so BAR0 cannot register.
+        let squatter: std::sync::Arc<vmm_core::mmio::MmioFn> =
+            std::sync::Arc::new(|_: usize, _: vmm_core::common::RWOp<'_>| {});
+        dst.bus_mmio
+            .register(BAR0, 0x1000, squatter)
+            .expect("squat");
+        let error = dst.restore_state(&exported).expect_err("dark BAR0");
+        assert!(error.to_string().contains("does not decode"), "{error}");
+        assert_eq!((dst.width(), dst.height()), (1024, 768));
+        assert_eq!(dst.cfg_read(0x10, 4) & !0xF, 0);
     }
 
     #[test]

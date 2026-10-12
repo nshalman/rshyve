@@ -5,13 +5,37 @@
 //! Giving the in-kernel link back before the VM is destroyed.
 
 use std::io::PipeWriter;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use vmm_devices::Lifecycle;
 
 use viona_api::LinkOps;
+use vmm_core::rings::{GateError, KernelRings};
 
-use super::{RingState, VirtioViona, NET_NUM_QUEUES};
+use super::{RingState, VionaInner, VirtioViona, NET_NUM_QUEUES};
+
+/// How long a halt waits for the gate to stop every ring before it
+/// leaves a link that may hold a hook in the kernel.
+///
+/// The usual refusal is another link in the middle of its own delete:
+/// its ring calls answer `ENXIO` until the delete ends.
+const GATE_WAIT: Duration = Duration::from_secs(2);
+const GATE_STEP: Duration = Duration::from_millis(20);
+
+/// A link whose delete failed, kept with its gate member.
+struct Leaked {
+    _inner: Arc<Mutex<VionaInner>>,
+    _member: Arc<dyn KernelRings>,
+}
+
+/// Links whose delete failed. Held for the life of the process: the
+/// last close of the descriptor runs the same delete (`viona_main.c`,
+/// `viona_close`), with no gate around it. The gate holds its members
+/// weakly, so the member is kept too, or a removed NIC would drop out
+/// of the gate with a worker still alive.
+static LEAKED: Mutex<Vec<Leaked>> = Mutex::new(Vec::new());
 
 /// The interrupt poll thread, while one is running.
 pub(super) struct Poller {
@@ -73,8 +97,22 @@ impl VirtioViona {
     /// started (`viona_main.c`, `viona_ioc_delete`), so an `Ok` here
     /// proves no kernel thread reads or writes the guest ring pages any
     /// more.
+    ///
+    /// The delete removes a notify hook it finds before it resets any
+    /// ring, and that removal takes the VM write lock. So a link that
+    /// may hold a hook is deleted inside the ring gate, after the hook
+    /// is taken off with the proof the gate leaves: no worker of any
+    /// link on the VM is alive across it. A link with no hook takes no
+    /// write lock to delete, and once it is halted nothing can give it
+    /// one.
+    ///
+    /// If the gate cannot stop the rings within [`GATE_WAIT`], or a
+    /// worker escaped it, the link is left in the kernel. A delete then
+    /// takes the write lock beside a live worker, which can hang the
+    /// host until a reboot. The leak is counted in the gate, so the VM
+    /// status shows it, and the link stays one the gate stops.
     pub(super) fn destroy_link(&self) -> std::io::Result<()> {
-        let (link, log, poller) = {
+        let (link, log, poller, hooked) = {
             let mut inner = self.inner.lock().expect("viona lock poisoned");
             // A second destroy has no link left. viona would treat it
             // as a no-op, but a repeated delete would also repeat the
@@ -91,16 +129,75 @@ impl VirtioViona {
             // delete finds no ring to send.
             inner.ring_state = [RingState::Init; NET_NUM_QUEUES];
             inner.negotiated_features = 0;
-            (inner.link(), inner.log(), inner.poller.take())
+            (
+                inner.link(),
+                inner.log(),
+                inner.poller.take(),
+                inner.hook.maybe_installed(),
+            )
         };
 
         // The poll thread reads the viona descriptor and calls back
         // into the PCI transport, so it must be gone before the link
         // is destroyed. The join needs the device lock dropped as well:
         // the thread may be inside that callback now, and it takes
-        // transport locks.
+        // transport locks. It is joined outside the gate too: a vCPU
+        // that holds a transport lock may be waiting for the gate.
         stop_poller(poller, &log);
-        halt_link(link.as_ref(), &log)
+
+        let rc = if hooked {
+            self.delete_in_gate(link.as_ref(), &log)
+        } else {
+            halt_link(link.as_ref(), &log)
+        };
+        // Only a delete that worked ended every worker. A link the
+        // delete refused, or one left in the kernel, keeps its place in
+        // the gate, which still has to stop it.
+        if rc.is_ok() {
+            self.inner.lock().expect("viona lock").deleted = true;
+        } else {
+            LEAKED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Leaked {
+                    _inner: Arc::clone(&self.inner),
+                    _member: Arc::clone(&self._member),
+                });
+        }
+        rc
+    }
+
+    /// Take the hook off and delete the link with every ring of the VM
+    /// stopped.
+    fn delete_in_gate(
+        &self,
+        link: &dyn LinkOps,
+        log: &slog::Logger,
+    ) -> std::io::Result<()> {
+        let mut waited = Duration::ZERO;
+        loop {
+            let ran = self.rings.run(|_| {
+                Self::clear_hook(&mut self.inner.lock().expect("viona lock"));
+                halt_link(link, log)
+            });
+            match ran {
+                Ok(rc) => return rc,
+                Err(GateError::Busy(_)) if waited < GATE_WAIT => {
+                    std::thread::sleep(GATE_STEP);
+                    waited += GATE_STEP;
+                }
+                Err(e) => {
+                    self.rings.note_leak();
+                    slog::error!(log, "viona rings did not stop, so the \
+                        link is LEFT IN THE KERNEL: a delete now could \
+                        hang the host"; "error" => %e);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ResourceBusy,
+                        format!("viona link left in the kernel: {e}"),
+                    ));
+                }
+            }
+        }
     }
 
     /// Stop the kernel the one way that cannot fail, after a ring

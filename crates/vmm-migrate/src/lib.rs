@@ -9,12 +9,15 @@
 //! drivers for two transports drifted apart once already, and the
 //! async twin shipped no device state at all.
 
+pub mod clock;
 pub mod codec;
 pub mod connect;
+mod converge;
 pub mod cpu;
 pub mod cutover;
 pub mod destination;
 pub mod gate;
+mod late;
 pub mod limits;
 pub mod pages;
 pub mod protocol;
@@ -168,6 +171,9 @@ pub struct MigrationStatus {
     pub pages_transferred: u64,
     pub dirty_pages_remaining: u64,
     pub gate: GateState,
+    /// On a destination: how far this host's wall clock is ahead of the
+    /// source's, in ms. See [`clock`].
+    pub clock_skew_ms: Option<i64>,
     /// Why the migration failed. Set with [`MigrationPhase::Error`].
     pub error: Option<String>,
 }
@@ -180,6 +186,7 @@ impl Default for MigrationStatus {
             pages_transferred: 0,
             dirty_pages_remaining: 0,
             gate: GateState::None,
+            clock_skew_ms: None,
             error: None,
         }
     }

@@ -8,6 +8,7 @@ use std::io::Result;
 use std::sync::{Arc, Mutex};
 
 use crate::hdl::VmmHdl;
+use crate::rings::RingsStopped;
 
 use super::mapping::{Mapping, Prot, SubMapping};
 
@@ -32,7 +33,8 @@ impl DevMemSeg {
         name: &str,
         len: usize,
     ) -> Result<Self> {
-        hdl.create_memseg(segid, len, name)?;
+        hdl.rings()
+            .run_io(|rings| hdl.create_memseg(rings, segid, len, name))?;
         let offset = hdl.devmem_offset(segid)?;
         let host = Arc::new(Mapping::new(len, Prot::RW, &hdl, offset)?);
 
@@ -86,7 +88,7 @@ impl DevMemSeg {
     ///
     /// Mapping at the current GPA is idempotent. Kernel mapping errors are
     /// returned because a guest-selected GPA may collide with another region.
-    pub fn map_at(&self, gpa: u64) -> Result<()> {
+    pub fn map_at(&self, rings: &RingsStopped<'_>, gpa: u64) -> Result<()> {
         let Some(hdl) = &self.hdl else {
             return Ok(());
         };
@@ -99,7 +101,7 @@ impl DevMemSeg {
             return Ok(());
         }
 
-        hdl.map_memseg(self.segid, gpa, self.len, 0, Prot::RW)?;
+        hdl.map_memseg(rings, self.segid, gpa, self.len, 0, Prot::RW)?;
         *mapped = Some(gpa);
         Ok(())
     }
@@ -108,7 +110,7 @@ impl DevMemSeg {
     ///
     /// The recorded GPA and length are reused because the kernel requires the
     /// pair to match the original mapping exactly.
-    pub fn unmap(&self) -> Result<()> {
+    pub fn unmap(&self, rings: &RingsStopped<'_>) -> Result<()> {
         let Some(hdl) = &self.hdl else {
             return Ok(());
         };
@@ -122,6 +124,6 @@ impl DevMemSeg {
             return Ok(());
         };
 
-        hdl.munmap_memseg(gpa, self.len)
+        hdl.munmap_memseg(rings, gpa, self.len)
     }
 }

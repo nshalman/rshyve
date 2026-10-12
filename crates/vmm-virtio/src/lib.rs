@@ -205,30 +205,34 @@ pub trait VirtioDevice: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Pause kernel ring threads for migration export.
+    /// Check that the kernel rings hold still for a migration export.
     ///
-    /// Runs before the vCPUs pause so no ring entry is consumed
-    /// between the pause and the export. A failure fails the
-    /// migration: the indices the export would read are moving.
+    /// The VM pause stops them through the VM's ring gate before
+    /// `VM_PAUSE`. A failure fails the migration: the indices the
+    /// export would read are moving.
     fn pause_rings_for_export(
         &self,
     ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
         Ok(())
     }
 
-    /// Put the rings [`Self::pause_rings_for_export`] stopped back to
-    /// work, after a migration that failed past the pause.
+    /// The end of a migration that failed past the pause.
     ///
-    /// A paused kernel ring is `VRS_STOP`, and viona answers a guest
-    /// kick on one with EBUSY. Without this the source guest resumes
-    /// with a NIC whose rings never move again.
+    /// Kernel rings start again only when the VM pause lets go of
+    /// them, after `VM_RESUME`, so a backend whose rings live in the
+    /// gate has nothing to do here.
     fn resume_rings_after_migration(
         &self,
     ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
         Ok(())
     }
 
-    /// Program notification addresses after migration.
+    /// The queue notify addresses the guest decodes now, 0 for one it
+    /// does not.
+    ///
+    /// The transport calls this whenever a BAR or the command register
+    /// moves them, and after a migration restore. A backend that hooks
+    /// them in the kernel has to follow.
     fn set_notify_addrs(&self, _pio_port: u16, _mmio_addr: u64) {}
 
     /// Start the deferred interrupt poll thread after migration restore.

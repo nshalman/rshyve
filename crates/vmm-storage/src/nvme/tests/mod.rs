@@ -35,6 +35,7 @@ mod barrier;
 mod handover;
 mod held;
 mod io;
+mod late;
 mod lifecycle;
 mod migrate;
 mod msi;
@@ -364,7 +365,7 @@ impl Manual {
         let me = Arc::clone(self);
         Box::new(move |sink| {
             assert!(me.sink.set(sink).is_ok(), "one controller per backend");
-            Arc::new(ManualBackend(me)) as Arc<dyn AsyncBackend>
+            Ok(Arc::new(ManualBackend(me)) as Arc<dyn AsyncBackend>)
         })
     }
 

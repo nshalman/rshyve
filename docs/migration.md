@@ -12,13 +12,17 @@ One driver serves both transports: a Unix socket inside a bhyve zone,
 where `/dev/poll` is unavailable and the GZ agent bridges to the peer,
 and a TCP socket elsewhere.
 
-The protocol identifier is `vmm-migrate-ron/9`. v9 adds the xHCI
-controller and the devices with no PCI address (see "xHCI tablet" and
-"Devices with no PCI address" below). A source offers v9, v8, v7 and
-v6, and a destination takes the newest it reads. Each end then checks
-that the chosen version carries everything this VM has, and refuses an
-older peer at the protocol choice, before the pause. Every VM has the
-COM1 and COM2 UARTs, so in practice every VM needs v9 at both ends.
+The protocol identifier is `vmm-migrate-ron/10`. v10 adds the source
+host's wall clock to the preamble, the interrupt shadow, the AMD PMU
+state, and the fault-injection test device (see "Kernel Devices",
+"Host clock skew" and "Testing a retry" below). A source offers v10,
+v9, v8, v7 and v6, and a destination takes the newest it reads. Each
+end then checks that the chosen version carries everything this VM
+has, and refuses an older peer at the protocol choice, before the
+pause. An AMD source with PMU state, or a VM with the test device,
+needs v10 at both ends. v9 added the xHCI controller and the devices
+with no PCI address. Every VM has the COM1 and COM2 UARTs, so in
+practice every VM needs v9 or newer at both ends.
 v8 added the framebuffer state. v7 has the v6 payload and says the
 destination attaches a MantaBlock ring disk after the commit (see
 [migration-gate.md](migration-gate.md)); a source with a ring disk
@@ -140,9 +144,9 @@ Source                          Destination
   |<------- MemDone ----------------|  (repeats until converged)
   |                                 |
   |  3. Pause
-  |  device workers park            |
-  |  kernel rings stop              |
   |  vCPUs pause                    |
+  |  device workers drain and park  |
+  |  kernel rings stop              |
   |  backing stores flush           |
   |  ZFS barrier reports            |
   |  cutover gate says GO           |
@@ -150,6 +154,8 @@ Source                          Destination
   |                                 |
   |  4. RamPushPostPause (final dirty pass)
   |-------- PageBatch* ------------>|
+  |  device export                  |
+  |-------- PageBatch* ------------>|  pages dirtied since, if any
   |-------- MemEnd ---------------->|
   |<------- MemDone ----------------|
   |                                 |
@@ -232,6 +238,15 @@ is the last word on guest memory by construction. Before that change it
 ran while the console and vsock reader threads could still fill a
 receive ring.
 
+The vCPUs pause before the devices drain, as in Propolis, so the guest
+submits nothing new while in-flight requests complete. The device
+export runs inside the final pass, and the pass sends the pages dirtied
+since its first round before its `MemEnd`. Each read of the dirty bitmap
+drops the VMM's mappings of guest RAM, and the next fault through the
+tracked view marks the page dirty, even for a read. A page still dirty
+at the commit fails the migration, and the error names the first pages
+and the device ring each one belongs to.
+
 ### Read deadlines
 
 Every read has a deadline. Before the pause it is generous, because the
@@ -292,6 +307,30 @@ compatibility between different CPU generations:
 - Per-vCPU: registers, MSRs, LAPIC, VMM_ARCH
 - Per-vCPU: run state (HALT/INIT/RUN) and SIPI vector
 - VMM_TIME with boot_hrtime and TSC frequency adjustment
+
+The registers include DR0 to DR3, DR6 and DR7, so a guest debugger's
+hardware breakpoints survive. EFER travels twice: in the kernel's MSR
+list and as a register; both carry the same value. The kernel's MSR
+list has no DEBUGCTL, and no register gives it, so it is not carried
+(Propolis does not carry it either).
+
+VMM_ARCH carries the pending NMI, ExtINT, exception and interrupt
+info. It is written last, after the run state.
+
+The destination wants every register exactly once: the whole list from
+a v10 source, and the list without DR0 to DR3, DR6 and the shadow from
+a v9 one. A register left out would resume at the destination's reset
+value.
+
+From v10, the interrupt shadow goes too. VMX cannot force a shadow on
+(`vmx_setreg` answers EINVAL), so the destination logs a warning and
+goes on: the guest may take an interrupt one instruction early. That
+beats a failure after the gate's go, which leaves the source paused.
+
+From v10, an AMD source whose kernel lists `VDC_PMU_AMD` (bhyve v18)
+sends each vCPU's PMU state. Every v18 kernel lists the class, Intel
+included, but only SVM keeps the state, so the source reads it only on
+an AMD host, and a destination that is not AMD refuses it.
 ### Emulated Devices
 
 Per virtio PCI transport: the device status byte as the driver left it,
@@ -325,7 +364,19 @@ counter continues from the source's last value, because a guest is told
 that counter is monotonic.
 
 A payload carrying enlightenment state for a VM started without
-`--hyperv` is refused.
+`--hyperv` is refused, and so is a payload without it for a VM started
+with `--hyperv`.
+
+A source that rolls back puts both overlay pages back from the MSR
+values. A destination that takes a new `migrate-dest` after a failed
+import drops the overlays of that import first, so the new RAM passes
+land in the guest's own pages.
+
+Every device on the wire must have exactly one entry, and the state in
+it must be of the device's own kind. An entry with no state is taken
+only from a device that may have none, such as a disabled NVMe
+controller. A virtio device, the framebuffer and the xHCI controller
+always carry one.
 
 Every field is checked before any of it is applied: queue sizes against
 the device's own, cursors inside their ring, ring addresses mapped and
@@ -352,6 +403,35 @@ source field, and the kernel's only guard on the result is that
 `boot_hrtime` is not in the future, which a wrapped value satisfies. A
 wall-clock gap beyond an hour is refused as clock disagreement rather
 than migration time.
+
+### Host clock skew
+
+The guest clock moves by the skew between the two hosts: the time
+import counts the wall-clock gap as time the guest was paused. Propolis
+assumes synced clocks. From v10 the source sends its wall clock in the
+preamble, and the destination compares it with its own before a single
+page moves. It logs the skew, warns over 1 s, and refuses over 60 s.
+`migrate-status` on the destination shows it as
+`migrate_clock_skew_ms`, positive when the destination is ahead.
+
+## Guest memory
+
+The first pass sends every page of guest RAM, whatever the dirty
+bitmap says. A failed attempt cleared the bits of the pages it sent,
+and the destination of the next attempt holds none of them, so a
+dirty-only first pass would leave those pages behind. Propolis puts the
+bits back with `VNO_OP_SET_DIRTY` instead; a full first pass needs no
+kernel support and cannot drift.
+
+A page the source cannot read, or the destination cannot write, fails
+the migration. Nothing is sent or skipped in its place.
+
+After the device export, the source reads the dirty bitmap once more.
+Every writer stopped before the final pass, so a dirty page there is a
+write the destination never got. The source then sends an error in
+place of the end of the RAM phase and rolls back. The check comes
+before the destination says it holds everything, so the destination
+fails cleanly and is not left in doubt.
 
 ## What migration does not carry
 
@@ -495,3 +575,21 @@ with `--migrate-listen` has no control plane yet: a stop does not
 cancel it, and a failed import fails the start.
 
 The destination VM should be destroyed by the caller.
+
+## Testing a retry
+
+Two hidden flags add a device that fails a migration on purpose, for a
+lab or CI run:
+
+```
+--migrate-test-fail-exports N   # the first N exports fail
+--migrate-test-fail-imports N   # the first N imports fail
+```
+
+Either flag adds the device, under the id `test/migrate-fault`. It
+carries no state, and both ends need it, or the device set check
+refuses the migration: start the other end with the flag at 0. A
+failed export rolls the source back, unless the gate said go. A failed
+import ends the destination in `import-failed`, and the source rolls
+back. A retry then shows that the guest memory is whole. Propolis has
+the same device (`MigrationFailureDevice`).

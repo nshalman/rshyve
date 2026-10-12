@@ -39,8 +39,10 @@ const MAX_BYTES: u64 = 64 * 1024;
 /// More disks than PCI slots the brand leaves free.
 const MAX_DISKS: usize = 24;
 
-/// One hour. A longer attach wait is a typo, not a plan.
-const MAX_ATTACH_TIMEOUT_MS: u64 = 3_600_000;
+/// The source stops waiting for the start soon after this, so a
+/// longer attach could start a guest the source no longer counts on.
+const MAX_ATTACH_TIMEOUT_MS: u64 =
+    vmm_migrate::wire::MAX_DEST_ATTACH.as_millis() as u64;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,25 +58,38 @@ struct RingConfig {
 #[serde(deny_unknown_fields)]
 struct MigrateOpts {
     ring_attach_timeout_ms: Option<u64>,
+    /// Taken only as `false`. The zone can write this file, so it must
+    /// not turn on a lab flag; `--migrate-allow-unproven-engine` does.
     #[serde(default)]
     allow_unproven_engine: bool,
 }
 
-/// Read `cli.ring_config`, if given, and merge it into `cli`.
+/// Read `cli.ring_config`, if given, and merge it into `cli`. The
+/// checks on the result run with or without the file.
 pub fn apply(cli: &mut Cli) -> anyhow::Result<()> {
-    let Some(path) = cli.ring_config.clone() else {
-        return Ok(());
+    let from = match cli.ring_config.clone() {
+        Some(path) => {
+            let bytes = read(&path, effective_uid())?;
+            let cfg = parse(&bytes)
+                .with_context(|| format!("ring config {}", path.display()))?;
+            merge(cli, cfg);
+            format!("ring config {}", path.display())
+        }
+        None => "the command line".to_string(),
     };
-    let bytes = read(&path, effective_uid())?;
-    let cfg = parse(&bytes)
-        .with_context(|| format!("ring config {}", path.display()))?;
-    merge(cli, cfg);
-    refuse_shared_volumes(&cli.pci_slot)
-        .with_context(|| format!("ring config {}", path.display()))
+    refuse_shared_volumes(&cli.pci_slot).with_context(|| from.clone())?;
+    let ms = cli.migrate_ring_attach_timeout_ms;
+    anyhow::ensure!(
+        (1..=MAX_ATTACH_TIMEOUT_MS).contains(&ms),
+        "{from}: the ring attach timeout {ms} ms is not in \
+         1..={MAX_ATTACH_TIMEOUT_MS}"
+    );
+    Ok(())
 }
 
 /// Two disks on one volume would show the guest one disk twice and hand
-/// the volume over twice in a migration.
+/// the volume over twice in a migration. Volumes are compared as the
+/// device parses them, so two spellings of one UUID are one volume.
 fn refuse_shared_volumes(specs: &[String]) -> anyhow::Result<()> {
     let mut seen = std::collections::BTreeSet::new();
     for spec in specs {
@@ -82,14 +97,17 @@ fn refuse_shared_volumes(specs: &[String]) -> anyhow::Result<()> {
         if !is_mantablock_nvme(&stripped) {
             continue;
         }
-        if let Some(volume) =
-            stripped.split(',').find_map(|f| f.strip_prefix("volume="))
-        {
-            anyhow::ensure!(
-                seen.insert(volume.to_ascii_lowercase()),
-                "volume {volume} has two ring disks"
-            );
-        }
+        let (_, _, config) = vmm_machine::devspec::split(&stripped)?;
+        let vmm_machine::devspec::NvmeSpec::MantaBlock(opts) =
+            vmm_machine::devspec::parse_nvme_config(config)?
+        else {
+            continue;
+        };
+        anyhow::ensure!(
+            seen.insert(opts.volume),
+            "volume {} has two ring disks",
+            opts.volume
+        );
     }
     Ok(())
 }
@@ -185,6 +203,11 @@ fn parse(bytes: &[u8]) -> anyhow::Result<RingConfig> {
             "ring_attach_timeout_ms {ms} is not in 1..={MAX_ATTACH_TIMEOUT_MS}"
         );
     }
+    anyhow::ensure!(
+        !cfg.migrate.allow_unproven_engine,
+        "allow_unproven_engine is a lab flag for the command line only \
+         (--migrate-allow-unproven-engine)"
+    );
     Ok(cfg)
 }
 
@@ -205,7 +228,6 @@ fn merge(cli: &mut Cli, cfg: RingConfig) {
     if let Some(ms) = cfg.migrate.ring_attach_timeout_ms {
         cli.migrate_ring_attach_timeout_ms = ms;
     }
-    cli.migrate_allow_unproven_engine |= cfg.migrate.allow_unproven_engine;
 }
 
 fn without_ring_shape(spec: &str) -> String {
@@ -260,7 +282,7 @@ mod tests {
         let path = file(
             &body(
                 &[disk(true)],
-                r#"{"ring_attach_timeout_ms":300000,"allow_unproven_engine":true}"#,
+                r#"{"ring_attach_timeout_ms":90000,"allow_unproven_engine":false}"#,
             ),
             0o600,
         );
@@ -274,8 +296,32 @@ mod tests {
         ]);
         apply(&mut c).expect("applies");
         assert_eq!(c.pci_slot, vec!["0,hostbridge".to_string(), disk(true)]);
-        assert_eq!(c.migrate_ring_attach_timeout_ms, 300_000);
+        assert_eq!(c.migrate_ring_attach_timeout_ms, 90_000);
+        assert!(!c.migrate_allow_unproven_engine);
+    }
+
+    #[test]
+    fn the_file_cannot_turn_on_the_lab_flag() {
+        // The zone can write the file; only the command line may.
+        let err = parse(&body(&[], r#"{"allow_unproven_engine":true}"#))
+            .expect_err("lab flag from the file");
+        assert!(format!("{err:#}").contains("lab flag"), "{err:#}");
+        let mut c = cli(&["--migrate-allow-unproven-engine"]);
+        apply(&mut c).expect("the command line may");
         assert!(c.migrate_allow_unproven_engine);
+    }
+
+    #[test]
+    fn an_attach_past_the_source_wait_is_refused() {
+        let over = MAX_ATTACH_TIMEOUT_MS + 1;
+        parse(&body(
+            &[],
+            &format!(r#"{{"ring_attach_timeout_ms":{over}}}"#),
+        ))
+        .expect_err("over the source's wait");
+        let flag = over.to_string();
+        let mut c = cli(&["--migrate-ring-attach-timeout-ms", &flag]);
+        apply(&mut c).expect_err("the flag is checked too");
     }
 
     #[test]
@@ -360,6 +406,18 @@ mod tests {
             &other_slot,
         ]);
         let err = apply(&mut c).expect_err("shared volume");
+        assert!(format!("{err:#}").contains("two ring disks"), "{err:#}");
+    }
+
+    #[test]
+    fn two_spellings_of_one_volume_are_one_volume() {
+        // Checked with no file too: the command line alone can do it.
+        let upper = format!(
+            "8,nvme,mantablock=/mb/other.sock,volume={}",
+            VOL.to_uppercase().replace('-', "")
+        );
+        let mut c = cli(&["-s", &disk(false), "-s", &upper]);
+        let err = apply(&mut c).expect_err("one volume, two spellings");
         assert!(format!("{err:#}").contains("two ring disks"), "{err:#}");
     }
 

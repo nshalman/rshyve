@@ -227,8 +227,11 @@ impl<'a> VmmDataOp<'a> {
 impl VmmDataOp<'_> {
     /// Dictate that the vmm-data operation be performed in the context of a
     /// specific vCPU, rather than against the VM as a whole.
-    pub fn for_vcpu(mut self, vcpuid: i32) -> Self {
-        self.vcpuid = Some(vcpuid);
+    ///
+    /// Unsigned, so a caller cannot name -1, which the kernel reads as
+    /// the whole VM and serves under the VM write lock.
+    pub fn for_vcpu(mut self, vcpuid: u16) -> Self {
+        self.vcpuid = Some(i32::from(vcpuid));
         self
     }
 

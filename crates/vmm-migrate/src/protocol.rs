@@ -10,6 +10,11 @@
 
 /// Protocol identifier for the RON migration format.
 ///
+/// v10 carries the source host's wall clock in the preamble, the
+/// interrupt shadow, the AMD PMU state, and the fault-injection test
+/// device. An AMD source with a PMU state, or a VM with the test
+/// device, moves only on v10.
+///
 /// v9 carries the xHCI controller, and the devices with no PCI address
 /// under their registry ids: the COM1 and COM2 UARTs, the i8042, the
 /// ACPI PM1 and GPE0 blocks, the i440FX latches, the fw_cfg cursor and
@@ -34,12 +39,20 @@
 /// v4 named the store under each NVMe namespace. v3 carried held NVMe
 /// completions and the namespace shape. v2 carried the CQ
 /// interrupt-enable bit. v1 put device identity on the wire.
-pub const PROTOCOL_RON: &str = "vmm-migrate-ron/9";
+pub const PROTOCOL_RON: &str = "vmm-migrate-ron/10";
 
-/// The version before, which carries no xHCI or platform state.
+/// The version that added the wall clock, the interrupt shadow, the
+/// AMD PMU state and the fault-injection test device. A literal, so a
+/// later bump of [`PROTOCOL_RON`] does not move it.
+pub const PROTOCOL_RON_V10: &str = "vmm-migrate-ron/10";
+
+/// The version before, which carries no wall clock and no PMU state.
+pub const PROTOCOL_RON_V9: &str = "vmm-migrate-ron/9";
+
+/// The version before that, which carries no xHCI or platform state.
 pub const PROTOCOL_RON_V8: &str = "vmm-migrate-ron/8";
 
-/// The version before that, which carries no framebuffer state.
+/// Carries no framebuffer state.
 pub const PROTOCOL_RON_V7: &str = "vmm-migrate-ron/7";
 
 /// The oldest version taken, which differs from v7 only in the ring
@@ -47,8 +60,9 @@ pub const PROTOCOL_RON_V7: &str = "vmm-migrate-ron/7";
 pub const PROTOCOL_RON_V6: &str = "vmm-migrate-ron/6";
 
 /// What a source offers, newest first.
-pub const SOURCE_OFFER: [&str; 4] = [
+pub const SOURCE_OFFER: [&str; 5] = [
     PROTOCOL_RON,
+    PROTOCOL_RON_V9,
     PROTOCOL_RON_V8,
     PROTOCOL_RON_V7,
     PROTOCOL_RON_V6,
@@ -60,9 +74,18 @@ pub const FRAMEBUFFER_KIND: &str = "framebuffer";
 /// The device kind of the xHCI controller.
 pub const XHCI_KIND: &str = "xhci";
 
+/// The device kind of the fault-injection test device.
+pub const TEST_FAULT_KIND: &str = vmm_devices::testdev::KIND;
+
 /// Device kinds that always export a state. A payload that carries
 /// none for one of them is refused.
 pub const ALWAYS_EXPORTS: [&str; 2] = [FRAMEBUFFER_KIND, XHCI_KIND];
+
+/// Whether a device of `kind` always exports a state. A virtio device
+/// always carries its queues.
+pub fn always_exports(kind: &str) -> bool {
+    ALWAYS_EXPORTS.contains(&kind) || kind.starts_with("virtio-")
+}
 
 /// The version a destination answers an offer with, newest first, or
 /// `None` when it can read none of them.
@@ -70,6 +93,11 @@ pub fn select_protocol(offer: &[String]) -> Option<&'static str> {
     SOURCE_OFFER
         .into_iter()
         .find(|ours| offer.iter().any(|theirs| theirs == ours))
+}
+
+/// Whether `protocol` is `least` or newer.
+pub fn at_least(protocol: &str, least: &str) -> bool {
+    version(protocol) >= version(least)
 }
 
 /// The version number of one of [`SOURCE_OFFER`].
@@ -94,10 +122,19 @@ pub fn protocol_blocker(
             PROTOCOL_RON_V8,
             "the framebuffer".into(),
         ),
-        (has(XHCI_KIND), PROTOCOL_RON, "the xHCI controller".into()),
+        (
+            has(XHCI_KIND),
+            PROTOCOL_RON_V9,
+            "the xHCI controller".into(),
+        ),
+        (
+            platform.iter().any(|p| p.kind == TEST_FAULT_KIND),
+            PROTOCOL_RON_V10,
+            "the fault-injection test device".into(),
+        ),
         (
             !platform.is_empty(),
-            PROTOCOL_RON,
+            PROTOCOL_RON_V9,
             format!(
                 "the state of {}",
                 platform
@@ -264,25 +301,51 @@ mod tests {
     }
 
     #[test]
-    fn xhci_and_platform_state_move_only_on_the_current_version() {
+    fn xhci_and_platform_state_move_on_v9_or_newer() {
         let xhci = devices(&["virtio-net", XHCI_KIND]);
         let uarts = platform(&["lpc/com1", "lpc/com2"]);
 
-        assert_eq!(protocol_blocker(PROTOCOL_RON, &xhci, &uarts), None);
+        for new in [PROTOCOL_RON, PROTOCOL_RON_V9] {
+            assert_eq!(protocol_blocker(new, &xhci, &uarts), None);
+        }
         for old in [PROTOCOL_RON_V8, PROTOCOL_RON_V7, PROTOCOL_RON_V6] {
             let why = protocol_blocker(old, &xhci, &[]).expect(old);
             assert!(why.contains("xHCI"), "{why}");
             let why = protocol_blocker(old, &[], &uarts).expect(old);
             assert!(why.contains("lpc/com1 lpc/com2"), "{why}");
-            assert!(why.contains(PROTOCOL_RON), "{why}");
+            assert!(why.contains(PROTOCOL_RON_V9), "{why}");
         }
+    }
+
+    #[test]
+    fn the_test_device_moves_only_on_the_current_version() {
+        let mut with = platform(&["lpc/com1"]);
+        with.push(crate::codec::PlatformIdentity {
+            id: "test/fault".to_string(),
+            kind: TEST_FAULT_KIND.to_string(),
+        });
+        assert_eq!(protocol_blocker(PROTOCOL_RON, &[], &with), None);
+        let why = protocol_blocker(PROTOCOL_RON_V9, &[], &with).expect("v9");
+        assert!(why.contains("fault-injection"), "{why}");
+        assert!(at_least(PROTOCOL_RON, PROTOCOL_RON_V9));
+        assert!(!at_least(PROTOCOL_RON_V9, PROTOCOL_RON));
+    }
+
+    // A later bump of PROTOCOL_RON must not stop a v10 peer from
+    // carrying the v10 state.
+    #[test]
+    fn a_v10_peer_still_counts_after_a_later_version() {
+        assert!(at_least("vmm-migrate-ron/10", PROTOCOL_RON_V10));
+        assert!(at_least("vmm-migrate-ron/11", PROTOCOL_RON_V10));
+        assert!(!at_least(PROTOCOL_RON_V9, PROTOCOL_RON_V10));
+        assert!(at_least(PROTOCOL_RON, PROTOCOL_RON_V10));
     }
 
     #[test]
     fn the_offer_is_newest_first() {
         let versions: Vec<u32> =
             SOURCE_OFFER.iter().map(|p| version(p)).collect();
-        assert_eq!(versions, [9, 8, 7, 6]);
+        assert_eq!(versions, [10, 9, 8, 7, 6]);
         assert_eq!(version("garbage"), 0);
     }
 

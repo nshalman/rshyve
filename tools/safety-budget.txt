@@ -9,7 +9,7 @@
 bin/rshyve 1
 crates/bhyve-api 6
 crates/dladm 5
-crates/viona-api 19
+crates/viona-api 1
 crates/vmm-boot 1
 crates/vmm-core 61
 crates/vmm-hid 2

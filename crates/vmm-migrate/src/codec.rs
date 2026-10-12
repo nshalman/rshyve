@@ -173,6 +173,10 @@ pub struct VcpuStatePayload {
     /// SIPI vector (for APs in INIT/SIPI wait)
     #[serde(default)]
     pub sipi_vector: u8,
+    /// VDC_PMU_AMD data. Only an AMD source whose kernel has the class
+    /// sends it.
+    #[serde(default)]
+    pub pmu_amd: Option<Vec<u8>>,
 }
 
 fn default_run_state() -> u32 {
@@ -454,6 +458,18 @@ pub struct MigrationPreamble {
     pub cpu_features: Option<CpuFeatures>,
     /// The source host's XSAVE area, which every vCPU's `fpu` follows.
     pub xsave: crate::xsave::XsaveLayout,
+    /// The source host's wall clock when it sent this, in ns since the
+    /// epoch. `None` from a v9 or older source. See [`crate::clock`].
+    #[serde(default)]
+    pub wall_clock_ns: Option<u64>,
+    /// Whether the guest has the Hyper-V enlightenment. `None` from an
+    /// older source, which the device state then answers late.
+    #[serde(default)]
+    pub hyperv: Option<bool>,
+    /// Whether the source carries AMD PMU state, which only an AMD host
+    /// can take. `None` from an older source.
+    #[serde(default)]
+    pub pmu_amd: Option<bool>,
 }
 
 /// CPU feature summary for migration compatibility checking.
@@ -643,6 +659,9 @@ mod tests {
                 size: 576,
                 components: Vec::new(),
             },
+            wall_clock_ns: Some(1_700_000_000_000_000_000),
+            hyperv: Some(true),
+            pmu_amd: Some(false),
         };
         let msg = Message::serialized(&preamble).unwrap();
         match roundtrip(&msg) {
@@ -653,6 +672,10 @@ mod tests {
                 assert_eq!(decoded.mem_size, 1024 * 1024 * 1024);
                 assert_eq!(decoded.devices, devices);
                 assert_eq!(decoded.platform, platform);
+                assert_eq!(
+                    decoded.wall_clock_ns,
+                    Some(1_700_000_000_000_000_000)
+                );
             }
             other => panic!("expected Serialized, got {other:?}"),
         }

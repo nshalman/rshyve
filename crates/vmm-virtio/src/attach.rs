@@ -59,16 +59,26 @@ impl VirtioAttachCtx<'_> {
 /// The caller routes the INTx pin before this call and attaches the
 /// returned device to the chipset after it, so this function names no
 /// chipset type.
+///
+/// `defer_open` is for a migration destination: the disk is opened only
+/// when the device attaches its backing store, after the commit.
 pub fn virtio_blk(
     path: &Path,
     opts: &VirtioBlockOpts,
     num_vcpus: u32,
     lintr: Option<LintrCfg>,
+    defer_open: bool,
     ctx: &VirtioAttachCtx<'_>,
     log: &slog::Logger,
 ) -> anyhow::Result<Arc<VirtioPciDevice<VirtioBlock>>> {
-    let file = vmm_devices::blkdev::open_disk(path, opts.read_only)
-        .with_context(|| format!("failed to open disk: {}", path.display()))?;
+    let log = log.new(slog::o!("path" => path.display().to_string()));
+    let disk = vmm_devices::blkdev::BackingDisk::new(
+        path,
+        opts.read_only,
+        defer_open,
+        &log,
+    )
+    .with_context(|| format!("failed to open disk: {}", path.display()))?;
 
     // A zvol has one SPA sync pipeline, so beyond ~4 queues there is no
     // throughput gain.
@@ -76,16 +86,11 @@ pub fn virtio_blk(
         .num_queues
         .unwrap_or_else(|| std::cmp::min(num_vcpus as u16, 4).max(1));
 
-    let blk = VirtioBlock::new_with_logger(
-        file,
-        opts,
-        Arc::clone(ctx.physmap),
-        num_queues,
-        &log.new(slog::o!("path" => path.display().to_string())),
-    )
-    .with_context(|| {
-        format!("failed to create virtio-blk for: {}", path.display())
-    })?;
+    let blk =
+        VirtioBlock::with_disk(disk, opts, Arc::clone(ctx.physmap), num_queues)
+            .with_context(|| {
+                format!("failed to create virtio-blk for: {}", path.display())
+            })?;
 
     let cfg_size = blk.config_size();
     // One MSI-X vector per queue, plus one for config change.
@@ -131,10 +136,14 @@ pub fn virtio_viona(
     );
 
     use std::os::fd::AsFd;
-    let dev =
-        VirtioViona::new(vnic_name, ctx.hdl.as_fd()).with_context(|| {
-            format!("failed to create viona device for VNIC: {vnic_name}")
-        })?;
+    let dev = VirtioViona::new(
+        vnic_name,
+        ctx.hdl.as_fd(),
+        Arc::clone(ctx.hdl.rings()),
+    )
+    .with_context(|| {
+        format!("failed to create viona device for VNIC: {vnic_name}")
+    })?;
 
     if promiscphys {
         dev.set_promisc(true).with_context(|| {

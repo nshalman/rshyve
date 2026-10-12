@@ -26,12 +26,17 @@ struct State {
 
 impl TokenBucket {
     pub fn new(burst: u32, period: Duration) -> Self {
+        Self::starting_at(burst, period, Instant::now())
+    }
+
+    /// A full bucket whose refill counts from `start`.
+    pub fn starting_at(burst: u32, period: Duration, start: Instant) -> Self {
         Self {
             burst,
             period,
             state: Mutex::new(State {
                 tokens: burst,
-                refilled: Instant::now(),
+                refilled: start,
             }),
         }
     }
@@ -41,7 +46,8 @@ impl TokenBucket {
         self.take_at(Instant::now())
     }
 
-    fn take_at(&self, now: Instant) -> bool {
+    /// [`Self::take`] at a given time.
+    pub fn take_at(&self, now: Instant) -> bool {
         // The state is two integers a panic cannot leave half written.
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !self.period.is_zero() {
@@ -63,9 +69,98 @@ impl TokenBucket {
     }
 }
 
+/// What a paced change may do now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pace {
+    /// Make the change.
+    Change,
+    /// The budget is spent. Take down what the guest moved away from,
+    /// and put nothing new up.
+    Clear,
+    /// Change nothing until the budget refills.
+    Wait,
+}
+
+/// A budget for a change the guest can ask for at will and that costs
+/// the host more than the guest.
+///
+/// Past the budget the guest gets one clear, so nothing is left on an
+/// address it gave up, and then nothing until a token comes back. The
+/// caller tries again on the guest's next access.
+pub struct Pacer {
+    burst: u32,
+    period: Duration,
+    /// Made on the first change, so the refill counts from it.
+    bucket: Option<TokenBucket>,
+    clear_spent: bool,
+    throttled: bool,
+    reported: bool,
+}
+
+impl Pacer {
+    pub fn new(burst: u32, period: Duration) -> Self {
+        Self {
+            burst,
+            period,
+            bucket: None,
+            clear_spent: false,
+            throttled: false,
+            reported: false,
+        }
+    }
+
+    /// What may change at `now`. `cleared` says nothing is up already.
+    pub fn admit(&mut self, now: Instant, cleared: bool) -> Pace {
+        let (burst, period) = (self.burst, self.period);
+        let bucket = self.bucket.get_or_insert_with(|| {
+            TokenBucket::starting_at(burst, period, now)
+        });
+        if bucket.take_at(now) {
+            self.clear_spent = false;
+            return Pace::Change;
+        }
+        if cleared || self.clear_spent {
+            return Pace::Wait;
+        }
+        self.clear_spent = true;
+        self.throttled = true;
+        Pace::Clear
+    }
+
+    /// Whether the last answer was the first clear ever, so the caller
+    /// logs once per device and not at the guest's rate.
+    pub fn first_throttle(&mut self) -> bool {
+        std::mem::take(&mut self.throttled)
+            && !std::mem::replace(&mut self.reported, true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pacer_past_its_budget_clears_once_and_then_waits() {
+        let mut pacer = Pacer::new(2, Duration::from_secs(1));
+        let now = Instant::now();
+
+        assert_eq!(pacer.admit(now, false), Pace::Change);
+        assert_eq!(pacer.admit(now, false), Pace::Change);
+        assert_eq!(pacer.admit(now, false), Pace::Clear);
+        assert!(pacer.first_throttle());
+        assert_eq!(pacer.admit(now, false), Pace::Wait);
+        assert_eq!(pacer.admit(now, true), Pace::Wait);
+        assert!(!pacer.first_throttle());
+
+        let later = now + Duration::from_secs(2);
+        assert_eq!(pacer.admit(later, true), Pace::Change);
+    }
+
+    #[test]
+    fn nothing_up_needs_no_clear() {
+        let mut pacer = Pacer::new(0, Duration::from_secs(1));
+        assert_eq!(pacer.admit(Instant::now(), true), Pace::Wait);
+    }
 
     #[test]
     fn a_burst_is_admitted_and_then_refused() {
