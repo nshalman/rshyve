@@ -4204,6 +4204,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "usdt",
  "vmm_core",
  "vmm_devices",
 ]

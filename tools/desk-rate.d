@@ -1,0 +1,59 @@
+#!/usr/sbin/dtrace -qs
+/*
+ * Once a second: frames the RDP EGFX worker made, their encode time,
+ * the guest's fenced flips, and the pace virtio-gpu holds them to: the
+ * one the RDP server asks for, or the device's own with no client. The
+ * pace is "-" in a second the guest did not flip. Run as
+ *   dtrace -qs tools/desk-rate.d -p <rshyve pid>
+ *
+ * Attaching stops the process briefly to enable the probes: the guest
+ * and the client see about half a second of stall when it starts.
+ */
+vmm$target:::egfx_frame
+{
+	@frames = count();
+	@enc_avg = avg(arg0);
+	@enc_max = max(arg0);
+	@refused = sum(arg1 == 0);
+}
+
+/*
+ * Enabled, egfx_overlay has the RDP server draw the same measures over
+ * the picture, encode times in ms there, while this script runs.
+ */
+vmm$target:::egfx_overlay
+{
+	overlay = 1;
+}
+
+vmm$target:::gpu_flip
+{
+	@flips = count();
+	@held = sum(arg1);
+	pace = arg2 / 1000;
+}
+
+tick-1s
+{
+	printa("frames %@d/s  encode avg %@d us max %@d us  refused %@d", @frames, @enc_avg, @enc_max, @refused);
+	printa("  guest flips %@d/s  held %@d", @flips, @held);
+}
+
+tick-1s
+/pace/
+{
+	printf("  pace %d ms\n", pace);
+}
+
+tick-1s
+/!pace/
+{
+	printf("  pace -\n");
+}
+
+tick-1s
+{
+	clear(@frames); clear(@enc_avg); clear(@enc_max); clear(@refused);
+	clear(@flips); clear(@held);
+	pace = 0;
+}

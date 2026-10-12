@@ -44,10 +44,37 @@ use vmm_devices::display::{
 
 use crate::progressive::ProgressiveEncoder;
 
+/// DTrace probes for the frames the worker sends.
+#[usdt::provider(provider = "vmm")]
+mod probes {
+    /// The worker made a frame. `encode_us` is the time to render and
+    /// queue it; `taken` is 1 when the client has it (queued, or nothing
+    /// changed) and 0 when it was not queued: the client had too many
+    /// frames unacknowledged, or its connection or surface went away;
+    /// `pace_us` is the pace the guest is now asked for.
+    fn egfx_frame(encode_us: u64, taken: u8, pace_us: u64) {}
+    /// Enabled, the worker draws its numbers over the frames it sends;
+    /// see [`crate::overlay`].
+    fn egfx_overlay() {}
+}
+
+/// Whether DTrace has the `egfx_overlay` probe enabled: the probe's
+/// arguments are only made then.
+fn overlay_asked() -> bool {
+    let asked = std::cell::Cell::new(false);
+    probes::egfx_overlay!(|| asked.set(true));
+    asked.get()
+}
+
 /// How often the worker looks for changes, and the fastest it asks the
 /// guest to flip: 60 frames a second, what a client's display shows.
 /// Slower frames, or a client that falls behind, slow both.
 const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+/// A duration in whole microseconds, for a probe argument.
+fn micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
 
 /// The codec context the progressive frames use; one per surface.
 const CODEC_CONTEXT: u32 = 1;
@@ -109,6 +136,8 @@ struct Render {
     sent_surface: Option<u16>,
     /// How many tiles the last frame encoded.
     tiles_sent: usize,
+    /// Text drawn over each frame, while DTrace asks for it.
+    overlay: Option<String>,
 }
 
 /// A frame an update planned under the locks, to encode without them.
@@ -184,6 +213,7 @@ impl Egfx {
                 sent: Vec::new(),
                 sent_surface: None,
                 tiles_sent: 0,
+                overlay: None,
             }),
             log,
             failures: TokenBucket::new(ENCODE_LOG_BURST, ENCODE_LOG_PERIOD),
@@ -212,6 +242,17 @@ impl Egfx {
         source: Arc<dyn DisplaySource>,
         poll: Duration,
     ) -> std::io::Result<Worker> {
+        self.start_worker_with(source, poll, overlay_asked)
+    }
+
+    /// As [`Self::start_worker_polling`], drawing the worker's numbers
+    /// over its frames while `overlay` says so.
+    pub(crate) fn start_worker_with(
+        self: &Arc<Self>,
+        source: Arc<dyn DisplaySource>,
+        poll: Duration,
+        overlay: impl Fn() -> bool + Send + 'static,
+    ) -> std::io::Result<Worker> {
         let stop = Arc::new(AtomicBool::new(false));
         let changed = Arc::new(Changed::default());
         source.on_change(
@@ -224,18 +265,30 @@ impl Egfx {
             move || {
                 // Whether the guest is paced to this worker's frames.
                 let mut pace: Option<Pace> = None;
+                let mut stats = crate::overlay::Stats::new(Instant::now());
                 while !stopped.load(Ordering::Acquire) {
                     let began = Instant::now();
                     if egfx.active() {
                         if let Some(taken) = egfx.update(source.as_ref()) {
+                            let cost = began.elapsed();
                             let interval = pace
                                 .get_or_insert_with(Pace::default)
-                                .frame(began.elapsed(), taken);
+                                .frame(cost, taken);
+                            probes::egfx_frame!(|| (
+                                micros(cost),
+                                u8::from(taken),
+                                micros(interval)
+                            ));
                             source.pace(Some(interval));
+                            stats.frame(cost, taken, interval);
                         }
                     } else if pace.take().is_some() {
                         source.pace(None);
                     }
+                    stats.roll(Instant::now());
+                    egfx.set_overlay(
+                        overlay().then(|| stats.text().to_string()),
+                    );
                     thread::sleep(
                         FRAME_INTERVAL.saturating_sub(began.elapsed()),
                     );
@@ -246,6 +299,7 @@ impl Egfx {
                 if pace.is_some() {
                     source.pace(None);
                 }
+                egfx.set_overlay(None);
             },
         )?;
         Ok(Worker {
@@ -260,6 +314,28 @@ impl Egfx {
     pub(crate) fn active(&self) -> bool {
         let pipeline = self.lock().pipeline.clone();
         pipeline.is_some_and(|p| p.lock().expect("egfx: pipeline").is_ready())
+    }
+
+    /// Draw `text` over the frames from the next one on, or stop with
+    /// `None`. The corner it covers goes with the next frame either way.
+    pub(crate) fn set_overlay(&self, text: Option<String>) {
+        let mut render = self.render.lock().expect("egfx: render lock");
+        if render.overlay == text {
+            return;
+        }
+        let corner = [render.overlay.as_deref(), text.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(crate::overlay::area)
+            .reduce(Rect::union);
+        if let Some(corner) = corner {
+            let mut st = self.lock();
+            st.pending = Some(match st.pending {
+                Some(p) => p.union(corner),
+                None => corner,
+            });
+        }
+        render.overlay = text;
     }
 
     /// Send the display's changes over EGFX: a new surface when there is
@@ -527,10 +603,14 @@ fn encode(
         sent,
         sent_surface,
         tiles_sent,
+        overlay,
         ..
     } = render;
     pixels.resize(w as usize * h as usize * 4, 0);
     source.read_rect(whole, pixels)?;
+    if let Some(text) = overlay {
+        crate::overlay::draw(pixels, w, h, text);
+    }
     let tiles: Vec<(u32, u32)> = if *sent_surface == Some(frame.surface) {
         let view = |data| Pixels {
             data,
@@ -1175,14 +1255,38 @@ pub(crate) mod tests {
             .expect("stopping waited out the poll");
     }
 
+    /// Count the worker's passes through the overlay check it makes on
+    /// each, which asks for no overlay.
+    fn counting_passes() -> (Arc<AtomicUsize>, impl Fn() -> bool + Send) {
+        let passes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&passes);
+        (passes, move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            false
+        })
+    }
+
+    /// Wait up to 5 s for the worker to make `n` passes.
+    fn wait_passes(passes: &AtomicUsize, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while passes.load(Ordering::SeqCst) < n {
+            assert!(Instant::now() < deadline, "the worker stalled");
+            thread::sleep(MS * 10);
+        }
+    }
+
     /// With no client the worker asks nothing of the guest.
     #[test]
     fn a_worker_without_a_client_does_not_pace() {
         let h = Harness::new();
         let display = Arc::new(FakeDisplay::new(64, 48));
         let source: Arc<dyn DisplaySource> = display.clone();
-        let worker = h.egfx.start_worker(source).expect("a worker");
-        thread::sleep(FRAME_INTERVAL * 3);
+        let (passes, overlay) = counting_passes();
+        let worker = h
+            .egfx
+            .start_worker_with(source, FRAME_INTERVAL, overlay)
+            .expect("a worker");
+        wait_passes(&passes, 3);
         drop(worker);
         assert!(display.paced.lock().unwrap().is_empty());
     }
@@ -1198,6 +1302,114 @@ pub(crate) mod tests {
 
     fn tiles_sent(h: &Harness) -> usize {
         h.egfx.render.lock().unwrap().tiles_sent
+    }
+
+    /// The worker draws its numbers while the overlay is asked for, and
+    /// stops when it no longer is.
+    #[test]
+    fn the_overlay_follows_whether_it_is_asked_for() {
+        use std::time::Instant;
+
+        let h = Harness::new();
+        h.ready();
+        let display: Arc<dyn DisplaySource> =
+            Arc::new(FakeDisplay::new(64, 48));
+        let asked = Arc::new(AtomicBool::new(false));
+        let wanted = Arc::clone(&asked);
+        let passes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&passes);
+        let worker = h
+            .egfx
+            .start_worker_with(display, FRAME_INTERVAL, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                wanted.load(Ordering::SeqCst)
+            })
+            .expect("a worker");
+        let overlay = || h.egfx.render.lock().unwrap().overlay.clone();
+        let wait = |on: bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while overlay().is_some() != on {
+                assert!(Instant::now() < deadline, "overlay never {on}");
+                thread::sleep(MS * 10);
+            }
+        };
+
+        wait_passes(&passes, 3);
+        assert_eq!(overlay(), None, "not asked for");
+        asked.store(true, Ordering::SeqCst);
+        wait(true);
+        assert!(overlay().unwrap().contains("FPS"), "{:?}", overlay());
+        asked.store(false, Ordering::SeqCst);
+        wait(false);
+        drop(worker);
+    }
+
+    /// The pixel the client has at (x, y), as the display reads them.
+    fn sent_pixel(h: &Harness, x: u32, y: u32, width: u32) -> u32 {
+        let render = h.egfx.render.lock().unwrap();
+        let at = (y as usize * width as usize + x as usize) * 4;
+        u32::from_le_bytes(render.sent[at..at + 4].try_into().unwrap())
+    }
+
+    /// An overlay goes to the client with the next frame, even when the
+    /// display has not changed, and only in the tiles it covers.
+    #[test]
+    fn an_overlay_reaches_the_client_with_the_next_frame() {
+        let h = Harness::new();
+        h.ready();
+        let display = FakeDisplay::new(256, 128);
+        h.egfx.update(&display);
+        assert_eq!(h.frames(), 1);
+
+        h.egfx.set_overlay(Some("60 FPS".to_string()));
+        h.egfx.update(&display);
+        assert_eq!(h.frames(), 2, "a frame for the overlay alone");
+        let corner = crate::overlay::area("60 FPS");
+        let across = (corner.x + corner.width).div_ceil(TILE);
+        let down = (corner.y + corner.height).div_ceil(TILE);
+        assert_eq!(
+            tiles_sent(&h),
+            (across * down) as usize,
+            "only the tiles the corner covers"
+        );
+        assert_eq!(
+            sent_pixel(&h, corner.x, corner.y, 256),
+            0xFF00_0000,
+            "the box is black"
+        );
+        assert_ne!(display.pixel(corner.x, corner.y), 0xFF00_0000);
+    }
+
+    /// Taken away, the overlay's tiles go back to the display's own.
+    #[test]
+    fn a_removed_overlay_sends_the_display_back() {
+        let h = Harness::new();
+        h.ready();
+        let display = FakeDisplay::new(256, 128);
+        h.egfx.set_overlay(Some("60 FPS".to_string()));
+        h.egfx.update(&display);
+        let corner = crate::overlay::area("60 FPS");
+
+        h.egfx.set_overlay(None);
+        h.egfx.update(&display);
+        assert_eq!(h.frames(), 2);
+        assert_eq!(
+            sent_pixel(&h, corner.x, corner.y, 256),
+            display.pixel(corner.x, corner.y)
+        );
+    }
+
+    /// The same text again is no change, so no frame.
+    #[test]
+    fn the_same_overlay_again_sends_nothing() {
+        let h = Harness::new();
+        h.ready();
+        let display = FakeDisplay::new(256, 128);
+        h.egfx.set_overlay(Some("60 FPS".to_string()));
+        h.egfx.update(&display);
+        h.egfx.set_overlay(Some("60 FPS".to_string()));
+        h.egfx.update(&display);
+        assert_eq!(h.frames(), 1);
     }
 
     /// A page-flipping guest reports its whole display changed on every

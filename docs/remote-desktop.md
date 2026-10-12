@@ -153,6 +153,55 @@ a few pixels narrower than the client's window; where the rounding
 happens is not confirmed. A desktop that follows hotplug on its own
 needs no helper.
 
+## Measuring it
+
+rshyve carries DTrace probes for the display path, under the `vmm`
+provider like the others:
+
+| Probe | Fires when | Arguments |
+|-------|------------|-----------|
+| `egfx_frame` | the RDP EGFX worker made a frame | encode time (us), whether the client took it (0 when it had too many frames unacknowledged, or its connection went), the pace asked of the guest (us) |
+| `gpu_flip` | virtio-gpu got a fenced flush | descriptor head, whether its answer waits for the pacer, the pace (us) |
+| `gpu_flip_answer` | the pacer answered a flip that waited | descriptor head |
+| `egfx_overlay` | the RDP worker checks it on every pass of its loop, up to 60 a second; while it is enabled, the worker draws its numbers over the picture | none |
+
+A probe costs nothing until DTrace enables it, so a running VM can be
+measured as it is. `tools/desk-rate.d` prints once a second the frames
+made, their encode time, the guest's flips and the pace:
+
+```
+dtrace -qs tools/desk-rate.d -p $(pgrep -x rshyve)
+```
+
+Enabling the probes stops the process briefly, guest included: the
+frame in flight when the script starts took about half a second.
+
+The script also enables `egfx_overlay`, so the RDP client shows the
+same measures in the top-left corner of the picture while it runs,
+encode times in ms where the script prints us: frames made in the
+last second, refused ones included, the average and worst encode
+time, the
+pace and the frames refused. The text is drawn into the frame the RDP
+server encodes, not into the guest's display, and goes away when
+DTrace detaches. VNC clients do not see it. To show it without the
+script:
+
+```
+dtrace -n 'vmm$target:::egfx_overlay { overlay = 1; }' -p $(pgrep -x rshyve)
+```
+
+The pace: with no RDP client, virtio-gpu lets a Linux guest flip 30
+times a second. With one on the graphics pipeline (EGFX), the RDP
+server asks for the rate it is managing to send at, slower when frames
+take longer to encode or the client refuses them because it has too
+many unacknowledged, and the device holds the request between 60 and
+10 frames a second. The overlay's PACE is the request; desk-rate.d's
+pace is what the device applies. Measured on the lab host with 60 frames a
+second video: 60 frames a second in a 1520x913 window, at about 1 ms
+encode; 47 to 57 at 3440x1440 full screen, at 8 to 14 ms average
+encode, with the pace backing off for a second when the client fell
+behind.
+
 ## What has been checked
 
 With that guest, from the macOS Windows App over a LAN:

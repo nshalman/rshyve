@@ -58,6 +58,17 @@ use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::VirtioDevice;
 use protocol::*;
 
+/// DTrace probes for the flip pacing. `head` is the flip's descriptor
+/// head, so a script can pair an answer with the flip it answers.
+#[usdt::provider(provider = "vmm")]
+mod probes {
+    /// A fenced flush arrived. `held` is 1 when its answer waits for
+    /// the pacer, 0 when it went back at once; `interval_us` is the pace.
+    fn gpu_flip(head: u16, held: u8, interval_us: u64) {}
+    /// The pacer published a held flip's answer.
+    fn gpu_flip_answer(head: u16) {}
+}
+
 /// The control queue carries every 2D command.
 pub const QUEUE_CONTROL: u16 = 0;
 /// The cursor queue carries cursor updates and moves.
@@ -620,15 +631,20 @@ impl Pacing {
     fn hold(&self, tag: RingTag, head: u16, len: u32) -> bool {
         let mut flips = self.flips();
         let now = Instant::now();
+        let interval = self.interval();
+        let interval_us =
+            u64::try_from(interval.as_micros()).unwrap_or(u64::MAX);
         if flips.paused
             || (flips.waiting.is_empty()
                 && flips.next.is_none_or(|next| next <= now))
         {
-            flips.next = Some(now + self.interval());
+            flips.next = Some(now + interval);
+            probes::gpu_flip!(|| (head, 0, interval_us));
             return false;
         }
         flips.waiting.push(Waiting { tag, head, len });
         self.wake.notify_all();
+        probes::gpu_flip!(|| (head, 1, interval_us));
         true
     }
 
@@ -654,6 +670,7 @@ impl Pacing {
             if let (true, completion) = published {
                 self.access.deliver(w.tag, || completion.signal());
             }
+            probes::gpu_flip_answer!(|| w.head);
         }
     }
 }

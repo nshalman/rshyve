@@ -17,6 +17,7 @@ mod bridge;
 mod display;
 mod egfx;
 mod input;
+mod overlay;
 mod progressive;
 mod rlgr1;
 mod sound;
