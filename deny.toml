@@ -21,6 +21,20 @@ ignore = [
     # already in place if that changes. unused-ignored-advisory is "warn" rather
     # than "allow" precisely so this stays visible.
     { id = "RUSTSEC-2026-0097", reason = "Migration maintainers; review by 2026-11-17; tungstenite's log feature is disabled, and remediation requires upgrading the WebSocket pair together" },
+    # Owner: remote display maintainers. Review by 2026-12-31. The three
+    # entries below arrive with IronRDP (vmm_rdp) and have no fixed release.
+    #
+    # rsa 0.10.0-rc (the Marvin timing attack on PKCS#1 v1.5 decryption) is
+    # reached only through picky and sspi, IronRDP's certificate, CredSSP and
+    # Kerberos stack. vmm_rdp serves TLS through rustls on aws-lc and does not
+    # enable NLA, so no RSA decryption with its key should go through this
+    # crate. That is believed, NOT verified: confirm it before this lands.
+    { id = "RUSTSEC-2023-0071", reason = "Remote display maintainers; review by 2026-12-31; rsa reached only via IronRDP's picky/sspi, unverified as unreachable, no fixed release" },
+    # atomic-polyfill is archived; reached through heapless, iso7816 and
+    # winscard, sspi's smart-card support, on some targets only.
+    { id = "RUSTSEC-2023-0089", reason = "Remote display maintainers; review by 2026-12-31; archived, reached only via IronRDP, no maintained replacement upstream yet" },
+    # rustls-pemfile is archived; IronRDP's TLS helper reads PEM with it.
+    { id = "RUSTSEC-2025-0134", reason = "Remote display maintainers; review by 2026-12-31; archived, reached only via ironrdp-server's TLS helper" },
 ]
 
 [licenses]
@@ -29,6 +43,11 @@ allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
+    # BSD-3-Clause and ISC arrive with IronRDP (vmm_rdp): the dalek curves
+    # and subtle; rustls-webpki, untrusted, libloading, iso7816-tlv and
+    # aws-lc. Both are permissive, like the rest of this list.
+    "BSD-3-Clause",
+    "ISC",
     "MIT",
     "MPL-2.0",
     "Unicode-3.0",
@@ -60,6 +79,41 @@ skip-tree = [
     # The derive half of the zerocopy split above. acpi_tables turns on
     # zerocopy's derive feature at 0.8; dof already uses it at 0.7.
     { crate = "zerocopy-derive", depth = 1, reason = "follows the zerocopy 0.7/0.8 split" },
+]
+# IronRDP (vmm_rdp) brings release candidates of the RustCrypto stack and
+# its own rand, base64 and syn lines beside the versions the rest of the
+# tree uses. Each entry skips exactly one version that stack added, so a
+# new duplicate anywhere else still fails. Review by 2026-12-31, and drop
+# entries as IronRDP settles on released crates.
+skip = [
+    { crate = "base64@0.22.1", reason = "IronRDP" },
+    { crate = "base64@0.23.1", reason = "IronRDP" },
+    { crate = "bitflags@1.3.2", reason = "IronRDP" },
+    { crate = "block-buffer@0.12.1", reason = "IronRDP" },
+    { crate = "cipher@0.5.2", reason = "IronRDP" },
+    { crate = "const-oid@0.9.6", reason = "IronRDP" },
+    { crate = "cpufeatures@0.3.1", reason = "IronRDP" },
+    { crate = "crypto-common@0.2.2", reason = "IronRDP" },
+    { crate = "der@0.7.10", reason = "IronRDP" },
+    { crate = "des@0.9.0", reason = "IronRDP" },
+    { crate = "digest@0.11.3", reason = "IronRDP" },
+    { crate = "inout@0.2.2", reason = "IronRDP" },
+    { crate = "md-5@0.10.6", reason = "IronRDP" },
+    { crate = "num-bigint@0.3.3", reason = "IronRDP" },
+    { crate = "pem-rfc7468@0.7.0", reason = "IronRDP" },
+    { crate = "pkcs1@0.7.5", reason = "IronRDP" },
+    { crate = "rand@0.9.5", reason = "IronRDP" },
+    { crate = "rand@0.10.3", reason = "IronRDP" },
+    { crate = "rand_chacha@0.9.0", reason = "IronRDP" },
+    { crate = "rand_core@0.9.5", reason = "IronRDP" },
+    { crate = "rand_core@0.10.1", reason = "IronRDP" },
+    { crate = "sha1@0.11.0", reason = "IronRDP" },
+    { crate = "sha2@0.11.0", reason = "IronRDP" },
+    { crate = "spki@0.7.3", reason = "IronRDP" },
+    { crate = "syn@1.0.109", reason = "IronRDP" },
+    { crate = "syn@3.0.6", reason = "IronRDP" },
+    # ring 0.17, under rustls, asks for windows-sys ^0.52.
+    { crate = "windows-sys@0.52.0", reason = "IronRDP" },
 ]
 
 [sources]
