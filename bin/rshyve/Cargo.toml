@@ -7,6 +7,10 @@ license = "MPL-2.0"
 build = "build.rs"
 
 [features]
+default = ["rdp"]
+# RDP for virtio-gpu displays (vmm_rdp, on IronRDP). Off, a spec that
+# asks for RDP is refused.
+rdp = ["dep:vmm_rdp"]
 # Lab and CI only: the --migrate-test-fail-* flags and their device.
 # Off by default, so a release build refuses them.
 migrate-test-faults = []
@@ -25,6 +29,7 @@ vmm_devices.workspace = true
 vmm_virtio.workspace = true
 vmm_storage.workspace = true
 vmm_hid.workspace = true
+vmm_rdp = { workspace = true, optional = true }
 vmm_passthru.workspace = true
 vmm_boot.workspace = true
 vmm_machine.workspace = true

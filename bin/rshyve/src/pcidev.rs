@@ -21,7 +21,8 @@ use vmm_virtio::attach::{self, VirtioAttachCtx};
 use crate::{bootorder, msix};
 
 mod display;
-use display::{parse_fbuf_config, FbufConfig};
+
+use display::{parse_display_config, start_rdp, DisplayConfig, GPU_VNC_SOCKET};
 
 /// The registry, the AHCI-CD flag, and the plumbing a device needs to
 /// be built. The context outlives startup so hotplug can build one
@@ -122,9 +123,12 @@ fn reject_unmigratable_destination(
     specs: &[String],
 ) -> anyhow::Result<()> {
     if is_migrate_dest {
-        if specs_have_ahci_cd(specs) {
+        if let Some(driver) = specs.iter().find_map(|spec| {
+            let driver = pci_spec_driver(spec)?;
+            (driver == "ahci-cd").then_some(driver)
+        }) {
             anyhow::bail!(
-                "ahci-cd is not supported on a migration destination"
+                "{driver} is not supported on a migration destination"
             );
         }
         // Without the source's shape the placeholder would show the
@@ -361,6 +365,25 @@ fn parse_and_create_pci_device(
             );
             Ok(vmm_machine::created(pci_dev))
         }
+        "virtio-snd" => {
+            anyhow::ensure!(
+                config.is_empty(),
+                "virtio-snd takes no options, got {config:?}"
+            );
+            let lintr = chipset.route_lintr(&bdf);
+            let pci_dev = attach::virtio_snd(
+                Arc::clone(ctx.audio),
+                lintr,
+                &virtio_ctx,
+                log,
+            )?;
+            chipset.try_attach_device(bdf, pci_dev.clone())?;
+            info!(log, "virtio-snd attached";
+                "bdf" => %bdf,
+                "msix_vectors" => msix::vector_count(pci_dev.as_ref()),
+            );
+            Ok(vmm_machine::created(pci_dev))
+        }
         "fbuf" => {
             let segid = segids.alloc().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -369,12 +392,13 @@ fn parse_and_create_pci_device(
                 )
             })?;
 
-            let FbufConfig {
+            let DisplayConfig {
                 vnc_path,
                 vnc_password,
                 width,
                 height,
-            } = parse_fbuf_config(config, vm_name, log)?;
+                rdp: _,
+            } = parse_display_config("fbuf", "vnc.sock", config, vm_name, log)?;
 
             let fbuf = vmm_hid::fbuf::Framebuffer::new(
                 width,
@@ -394,6 +418,72 @@ fn parse_and_create_pci_device(
                 "resolution" => format!("{}x{}", width, height),
             );
             Ok(vmm_machine::created(fbuf))
+        }
+        "virtio-gpu" => {
+            let DisplayConfig {
+                vnc_path,
+                vnc_password,
+                width,
+                height,
+                rdp,
+            } = parse_display_config(
+                "virtio-gpu",
+                GPU_VNC_SOCKET,
+                config,
+                vm_name,
+                log,
+            )?;
+            let lintr = chipset.route_lintr(&bdf);
+            let pci_dev = attach::virtio_gpu(
+                u32::from(width),
+                u32::from(height),
+                lintr,
+                &virtio_ctx,
+                log,
+            )?;
+            // VNC and RDP each take the display's damage through a view
+            // of their own; from the device itself, one would take what
+            // the other never sees.
+            let shared = vmm_devices::display::SharedDisplay::new(
+                pci_dev.device().display_handle(),
+            );
+            let server = vmm_hid::vnc::VncServer::start(
+                "gpu-vnc",
+                shared.view(),
+                &vnc_path,
+                vnc_password,
+                Arc::clone(input),
+                log.new(slog::o!("component" => "virtio-gpu-vnc")),
+            )?;
+            let rdp_addr = rdp.as_ref().map(|r| r.addr.to_string());
+            let rdp_stop = match start_rdp(rdp, shared.view(), ctx, log) {
+                Ok(stop) => stop,
+                Err(e) => {
+                    server.shutdown();
+                    return Err(e);
+                }
+            };
+            let stop_servers = move || {
+                server.shutdown();
+                if let Some(stop) = rdp_stop {
+                    stop();
+                }
+            };
+            // A device that is not attached never halts, so its servers
+            // stop here.
+            if let Err(e) = chipset.try_attach_device(bdf, pci_dev.clone()) {
+                stop_servers();
+                return Err(e.into());
+            }
+            pci_dev.device().on_halt(Box::new(stop_servers));
+            info!(log, "virtio-gpu attached";
+                "bdf" => %bdf,
+                "vnc" => vnc_path.display().to_string(),
+                "rdp" => rdp_addr.unwrap_or_else(|| "off".to_string()),
+                "resolution" => format!("{}x{}", width, height),
+                "msix_vectors" => msix::vector_count(pci_dev.as_ref()),
+            );
+            Ok(vmm_machine::created(pci_dev))
         }
         "xhci" => {
             // xHCI USB controller with tablet device
@@ -643,6 +733,17 @@ mod tests {
         assert!(ring_shape(&good, false).is_err());
         assert_eq!(shape.to_string(), "1:256:4096:1:8:16:8:2:d");
         assert!(ring_shape(&opts(Some("1:256")), true).is_err());
+    }
+
+    /// virtio-gpu and virtio-snd carry their state with their
+    /// transports, so a destination may hold them.
+    #[test]
+    fn a_destination_may_hold_virtio_gpu_and_virtio_snd() {
+        let specs = vec![
+            "7,virtio-gpu,unix=/tmp/gpu.vnc".to_string(),
+            "8,virtio-snd".to_string(),
+        ];
+        assert!(reject_unmigratable_destination(true, &specs).is_ok());
     }
 
     #[test]

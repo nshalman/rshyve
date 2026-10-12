@@ -2903,6 +2903,7 @@ dependencies = [
  "vmm_mantablock",
  "vmm_migrate",
  "vmm_passthru",
+ "vmm_rdp",
  "vmm_storage",
  "vmm_tpm",
  "vmm_virtio",
