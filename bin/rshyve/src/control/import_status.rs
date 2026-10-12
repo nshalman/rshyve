@@ -21,11 +21,12 @@ use std::thread;
 use std::time::Duration;
 
 use slog::{info, warn, Logger};
+use vmm_core::unixsock::close_after_write;
 use vmm_migrate::MigrationPhase;
 
 use super::listener::{
     read_request, serve_connections, write_error_response, write_response,
-    WRITE_TIMEOUT,
+    CLOSE_TIMEOUT, WRITE_TIMEOUT,
 };
 use super::protocol::{Command, Response};
 use super::{ControlError, ControlListener, VmRunState};
@@ -251,6 +252,7 @@ fn supervise<P>(
                         warn!(connection_log, "import status connection error";
                             "error" => %e);
                     }
+                    close_after_write(s, CLOSE_TIMEOUT);
                 });
             });
         let accept = match accept {
