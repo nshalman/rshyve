@@ -827,6 +827,43 @@ mod tests {
         assert_eq!(decoded, state);
     }
 
+    /// The blob fields are optional on the wire: a GPU payload without
+    /// them decodes as having no blobs.
+    #[test]
+    fn a_gpu_payload_without_blobs_decodes_with_none() {
+        use vmm_devices::lifecycle::{
+            DeviceMigrateState, GpuMigrateScanout, GpuMigrateState,
+            VirtioDeviceMigrateState, VirtioMigrateState, WireBdf,
+        };
+        let now = DeviceStatePayload {
+            bdf: WireBdf {
+                bus: 0,
+                dev: 7,
+                func: 0,
+            },
+            state: Some(DeviceMigrateState::Virtio(VirtioMigrateState {
+                device: Some(VirtioDeviceMigrateState::Gpu(GpuMigrateState {
+                    scanout: Some(GpuMigrateScanout {
+                        resource_id: 1,
+                        width: 8,
+                        height: 6,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+        };
+        let text = ron::ser::to_string(&now).expect("encode");
+        assert!(text.contains(",blob:None"), "{text}");
+        assert!(text.contains(",blobs:[]"), "{text}");
+        let before = text.replace(",blob:None", "").replace(",blobs:[]", "");
+
+        let decoded: DeviceStatePayload =
+            Message::deserialize(before.as_bytes()).expect("decode");
+        assert_eq!(decoded, now);
+    }
+
     fn with_backend(
         backend: vmm_devices::lifecycle::NvmeMigrateBackend,
     ) -> DeviceStatePayload {

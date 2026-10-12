@@ -10,13 +10,19 @@
 
 /// Protocol identifier for the RON migration format.
 ///
+/// v13 carries the state a virtio device keeps behind its transport:
+/// virtio-gpu's resources, scanout and cursor, and virtio-snd's stream.
+/// A VM with either device moves only on v13. Any other VM sends the
+/// v12 payload.
+///
 /// v12 carries the v10 payload with the framebuffer VRAM only as LZ4,
 /// and needs the source's wall clock. Builds before it sent v8 to v10
 /// with the VRAM as zstd or as LZ4, and v10 with or without the wall
 /// clock, under the same string. To an older peer the source sends
 /// both VRAM forms; from one it takes either, and no wall clock.
 ///
-/// v11 is the virtio-gpu work's (PR #15), and is not offered here.
+/// v11 was never released: the virtio-gpu work (PR #15) held it
+/// before v12, and moved to v13. It is not offered.
 ///
 /// v10 carries the source host's wall clock in the preamble, the
 /// interrupt shadow, the AMD PMU state, and the fault-injection test
@@ -42,15 +48,21 @@
 /// A v4 destination resumed the guest with the destination's FPU state
 /// (OSF-2), so no older version is accepted in either direction.
 ///
-/// v5 is reserved for the virtio-gpu work (PR #15).
+/// v5 was the virtio-gpu work's own stream before it was built on v10
+/// (PR #15), and is refused.
 ///
 /// v4 named the store under each NVMe namespace. v3 carried held NVMe
 /// completions and the namespace shape. v2 carried the CQ
 /// interrupt-enable bit. v1 put device identity on the wire.
-pub const PROTOCOL_RON: &str = "vmm-migrate-ron/12";
+pub const PROTOCOL_RON: &str = "vmm-migrate-ron/13";
 
-/// The version that has one VRAM form and a wall clock without fail. A
-/// literal, so a later bump of [`PROTOCOL_RON`] does not move it.
+/// The version that added virtio-gpu and virtio-snd state. A literal,
+/// so a later bump of [`PROTOCOL_RON`] does not move it.
+pub const PROTOCOL_RON_V13: &str = "vmm-migrate-ron/13";
+
+/// The version before, which carries no virtio device state. It has
+/// one VRAM form and a wall clock without fail. A literal, so a later
+/// bump of [`PROTOCOL_RON`] does not move it.
 pub const PROTOCOL_RON_V12: &str = "vmm-migrate-ron/12";
 
 /// The version that added the wall clock, the interrupt shadow, the
@@ -72,8 +84,9 @@ pub const PROTOCOL_RON_V7: &str = "vmm-migrate-ron/7";
 pub const PROTOCOL_RON_V6: &str = "vmm-migrate-ron/6";
 
 /// What a source offers, newest first.
-pub const SOURCE_OFFER: [&str; 6] = [
+pub const SOURCE_OFFER: [&str; 7] = [
     PROTOCOL_RON,
+    PROTOCOL_RON_V12,
     PROTOCOL_RON_V10,
     PROTOCOL_RON_V9,
     PROTOCOL_RON_V8,
@@ -86,6 +99,12 @@ pub const FRAMEBUFFER_KIND: &str = "framebuffer";
 
 /// The device kind of the xHCI controller.
 pub const XHCI_KIND: &str = "xhci";
+
+/// The device kind of virtio-gpu.
+pub const GPU_KIND: &str = "virtio-gpu";
+
+/// The device kind of virtio-snd.
+pub const SOUND_KIND: &str = "virtio-snd";
 
 /// The device kind of the fault-injection test device.
 pub const TEST_FAULT_KIND: &str = vmm_devices::testdev::KIND;
@@ -139,6 +158,16 @@ pub fn protocol_blocker(
             has(XHCI_KIND),
             PROTOCOL_RON_V9,
             "the xHCI controller".into(),
+        ),
+        (
+            has(GPU_KIND),
+            PROTOCOL_RON_V13,
+            format!("{GPU_KIND}'s state"),
+        ),
+        (
+            has(SOUND_KIND),
+            PROTOCOL_RON_V13,
+            format!("{SOUND_KIND}'s stream"),
         ),
         (
             platform.iter().any(|p| p.kind == TEST_FAULT_KIND),
@@ -238,8 +267,8 @@ mod tests {
     }
 
     // v10 builds differ in the VRAM form and the wall clock, so both
-    // ends must still take v10 from each other, and v11 (PR #15) is
-    // not ours to pick.
+    // ends must still take v10 from each other, and v11, which was
+    // never released, is not ours to pick.
     #[test]
     fn a_v10_or_v11_peer_meets_this_build_at_v10() {
         let v10 = offer(&[
@@ -349,17 +378,51 @@ mod tests {
     }
 
     #[test]
-    fn the_test_device_moves_only_on_the_current_version() {
+    fn the_test_device_moves_on_v10_or_newer() {
         let mut with = platform(&["lpc/com1"]);
         with.push(crate::codec::PlatformIdentity {
             id: "test/fault".to_string(),
             kind: TEST_FAULT_KIND.to_string(),
         });
-        assert_eq!(protocol_blocker(PROTOCOL_RON, &[], &with), None);
+        for new in [PROTOCOL_RON, PROTOCOL_RON_V12, PROTOCOL_RON_V10] {
+            assert_eq!(protocol_blocker(new, &[], &with), None);
+        }
         let why = protocol_blocker(PROTOCOL_RON_V9, &[], &with).expect("v9");
         assert!(why.contains("fault-injection"), "{why}");
-        assert!(at_least(PROTOCOL_RON, PROTOCOL_RON_V9));
-        assert!(!at_least(PROTOCOL_RON_V9, PROTOCOL_RON));
+        assert!(at_least(PROTOCOL_RON, PROTOCOL_RON_V10));
+        assert!(at_least(PROTOCOL_RON_V10, PROTOCOL_RON_V9));
+        assert!(!at_least(PROTOCOL_RON_V9, PROTOCOL_RON_V10));
+    }
+
+    #[test]
+    fn gpu_and_sound_state_move_only_on_v13() {
+        let without = devices(&["virtio-net", XHCI_KIND]);
+        for kind in [GPU_KIND, SOUND_KIND] {
+            let with = devices(&["virtio-net", XHCI_KIND, kind]);
+            assert_eq!(protocol_blocker(PROTOCOL_RON, &with, &[]), None);
+            for old in [PROTOCOL_RON_V12, PROTOCOL_RON_V10, PROTOCOL_RON_V9] {
+                let why = protocol_blocker(old, &with, &[]).expect(old);
+                assert!(why.contains(kind), "{why}");
+                assert!(why.contains(PROTOCOL_RON), "{why}");
+                assert_eq!(protocol_blocker(old, &without, &[]), None);
+            }
+        }
+    }
+
+    // Nor a v13 peer from carrying virtio-gpu and virtio-snd state.
+    #[test]
+    fn a_v13_peer_still_carries_gpu_and_sound_after_a_later_version() {
+        for kind in [GPU_KIND, SOUND_KIND] {
+            let with = devices(&["virtio-net", kind]);
+            assert_eq!(protocol_blocker(PROTOCOL_RON_V13, &with, &[]), None);
+            assert_eq!(
+                protocol_blocker("vmm-migrate-ron/14", &with, &[]),
+                None
+            );
+            let why =
+                protocol_blocker(PROTOCOL_RON_V12, &with, &[]).expect("v12");
+            assert!(why.contains(PROTOCOL_RON_V13), "{why}");
+        }
     }
 
     // A later bump of PROTOCOL_RON must not stop a v10 peer from
@@ -376,7 +439,7 @@ mod tests {
     fn the_offer_is_newest_first() {
         let versions: Vec<u32> =
             SOURCE_OFFER.iter().map(|p| version(p)).collect();
-        assert_eq!(versions, [12, 10, 9, 8, 7, 6]);
+        assert_eq!(versions, [13, 12, 10, 9, 8, 7, 6]);
         assert_eq!(version("garbage"), 0);
     }
 

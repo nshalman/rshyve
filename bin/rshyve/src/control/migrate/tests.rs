@@ -139,6 +139,11 @@ fn a_vm_with_only_migratable_devices_can_be_a_source() {
     // Its controller state is carried since v9, so the VNC tablet no
     // longer keeps a VM in place.
     assert_eq!(unmigratable_devices(&[ident(30, "xhci")]), None);
+    // Their state goes with their transports since v13.
+    assert_eq!(
+        unmigratable_devices(&[ident(7, "virtio-gpu"), ident(8, "virtio-snd")]),
+        None,
+    );
 }
 
 #[test]
