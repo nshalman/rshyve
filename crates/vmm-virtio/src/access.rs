@@ -254,6 +254,15 @@ impl GuestAccess {
     pub(crate) fn hold_drain(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
         self.lock.write().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Whether a section is open now: a reset's drain would wait.
+    #[cfg(test)]
+    pub(crate) fn in_section(&self) -> bool {
+        matches!(
+            self.lock.try_write(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
 }
 #[cfg(test)]
 mod tests {

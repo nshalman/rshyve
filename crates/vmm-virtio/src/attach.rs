@@ -19,6 +19,7 @@ use vmm_core::mem::PhysMap;
 use vmm_core::mmio::MmioBus;
 use vmm_core::pio::PioBus;
 
+use vmm_devices::audio::AudioBroker;
 use vmm_devices::pci::msix::{HdlMsiSink, MsiSink, MsixTable};
 use vmm_devices::pci::LintrCfg;
 
@@ -33,6 +34,7 @@ use super::fs::{
 use super::gpu::VirtioGpu;
 use super::pci::VirtioPciDevice;
 use super::rng::VirtioRng;
+use super::sound::VirtioSound;
 use super::viona;
 use super::viona::VirtioViona;
 
@@ -329,6 +331,38 @@ fn announce_size_changes(pci_dev: &Arc<VirtioPciDevice<VirtioGpu>>) {
             transport.signal_config_change();
         }
     }));
+}
+
+/// Build a virtio-sound device and its PCI transport. The guest's
+/// playback goes to whatever sink `audio` has bound.
+///
+/// Ordering is load-bearing: the interrupt path is installed after
+/// `VirtioPciDevice::new` returns, since the device completes playback
+/// messages from its own thread.
+pub fn virtio_snd(
+    audio: Arc<AudioBroker>,
+    lintr: Option<LintrCfg>,
+    ctx: &VirtioAttachCtx<'_>,
+    log: &slog::Logger,
+) -> anyhow::Result<Arc<VirtioPciDevice<VirtioSound>>> {
+    let sound = VirtioSound::new(audio, Arc::clone(ctx.physmap), log.clone())?;
+    // Control, event, transmit and receive queues, plus a config change
+    // vector.
+    let msix = Arc::new(MsixTable::new(5, ctx.msi_sink()));
+    let pci_dev = VirtioPciDevice::new(
+        sound,
+        bits::VIRTIO_DEV_TYPE_SOUND,
+        super::sound::protocol::NUM_QUEUES,
+        256,
+        super::sound::CONFIG_SIZE,
+        lintr,
+        Arc::clone(ctx.physmap),
+        Arc::clone(ctx.bus_pio),
+        Arc::clone(ctx.bus_mmio),
+        Some(msix),
+    );
+    pci_dev.device().install_interrupt(pci_dev.backend_intr());
+    Ok(pci_dev)
 }
 
 /// Build a virtio-rnd device and its PCI transport.

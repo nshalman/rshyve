@@ -39,6 +39,7 @@ pub mod queue;
 pub mod rng;
 pub(crate) mod socket_accept;
 mod socket_halt;
+pub mod sound;
 #[cfg(test)]
 mod testlog;
 pub mod viona;

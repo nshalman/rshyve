@@ -23,3 +23,37 @@ impl slog::Drain for CountingDrain {
         Ok(())
     }
 }
+
+/// Records each record as its message and key=value pairs, so a test
+/// can see what was logged.
+#[derive(Clone, Default)]
+pub(crate) struct RecordingDrain(pub(crate) Arc<std::sync::Mutex<Vec<String>>>);
+
+impl slog::Drain for RecordingDrain {
+    type Ok = ();
+    type Err = slog::Never;
+
+    fn log(
+        &self,
+        record: &slog::Record<'_>,
+        _values: &slog::OwnedKVList,
+    ) -> Result<(), slog::Never> {
+        let mut line = Line(record.msg().to_string());
+        let _ = slog::KV::serialize(&record.kv(), record, &mut line);
+        self.0.lock().unwrap().push(line.0);
+        Ok(())
+    }
+}
+
+struct Line(String);
+
+impl slog::Serializer for Line {
+    fn emit_arguments(
+        &mut self,
+        key: slog::Key,
+        val: &std::fmt::Arguments<'_>,
+    ) -> slog::Result {
+        self.0.push_str(&format!(" {key}={val}"));
+        Ok(())
+    }
+}

@@ -184,6 +184,9 @@ pub const SUBCLASS_COMMUNICATION_OTHER: u8 = 0x80;
 // Sub-classes under CLASS_DISPLAY
 pub const SUBCLASS_DISPLAY_OTHER: u8 = 0x80;
 
+// Sub-classes under CLASS_MULTIMEDIA
+pub const SUBCLASS_MULTIMEDIA_AUDIO: u8 = 1;
+
 // Programming interfaces
 pub const PROGIF_SATA_AHCI_1_0: u8 = 1;
 pub const PROGIF_ENTERPRISE_NVME: u8 = 2;

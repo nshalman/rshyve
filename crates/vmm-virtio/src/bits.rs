@@ -240,6 +240,8 @@ pub const VIRTIO_DEV_TYPE_FS: u16 = 26;
 pub const VIRTIO_DEV_TYPE_VSOCK: u16 = 19;
 /// virtio-gpu (VIRTIO 1.3 5.7). Modern id only, like virtio-fs.
 pub const VIRTIO_DEV_TYPE_GPU: u16 = 16;
+/// virtio-sound (VIRTIO 1.3 5.14). Modern id only, like virtio-fs.
+pub const VIRTIO_DEV_TYPE_SOUND: u16 = 25;
 
 // ---------------------------------------------------------------------------
 // Transitional PCI device IDs (virtio 1.3 section 4.1.2.1)
@@ -309,6 +311,11 @@ pub const fn pci_class_for(dev_type: u16) -> (u8, u8) {
         VIRTIO_DEV_TYPE_GPU => (
             vmm_devices::pci::bits::CLASS_DISPLAY,
             vmm_devices::pci::bits::SUBCLASS_DISPLAY_OTHER,
+        ),
+        // Multimedia/audio, as QEMU's virtio-sound-pci sets it.
+        VIRTIO_DEV_TYPE_SOUND => (
+            vmm_devices::pci::bits::CLASS_MULTIMEDIA,
+            vmm_devices::pci::bits::SUBCLASS_MULTIMEDIA_AUDIO,
         ),
         // Communication/other, matching QEMU's vhost-vsock-pci.
         VIRTIO_DEV_TYPE_VSOCK => (
@@ -453,6 +460,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sound_is_a_modern_audio_device() {
+        // 0x1040 + 25. virtio-sound has no transitional id.
+        assert_eq!(transitional_device_id(VIRTIO_DEV_TYPE_SOUND), 0x1059);
+        assert_eq!(
+            pci_class_for(VIRTIO_DEV_TYPE_SOUND),
+            (
+                vmm_devices::pci::bits::CLASS_MULTIMEDIA,
+                vmm_devices::pci::bits::SUBCLASS_MULTIMEDIA_AUDIO
+            )
+        );
+    }
+
     /// Linux skips a device whose class is 0 when it assigns BARs, so an
     /// unclassified device cannot be enabled on a direct kernel boot,
     /// where no firmware has placed the BARs already. Every device type
@@ -467,6 +487,7 @@ mod tests {
             VIRTIO_DEV_TYPE_RNG,
             VIRTIO_DEV_TYPE_VSOCK,
             VIRTIO_DEV_TYPE_GPU,
+            VIRTIO_DEV_TYPE_SOUND,
         ] {
             let (class, _) = pci_class_for(dev_type);
             assert_ne!(
