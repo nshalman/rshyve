@@ -812,6 +812,21 @@ mod tests {
         assert_eq!(decoded, v4);
     }
 
+    /// A virtio device that keeps nothing behind its rings sends what a
+    /// v12 peer sends, and a v12 peer's payload decodes with no device
+    /// state, so a VM without virtio-gpu or virtio-snd moves either way.
+    #[test]
+    fn a_virtio_payload_without_device_state_is_the_v12_payload() {
+        use vmm_devices::lifecycle::VirtioMigrateState;
+        let state = DeviceMigrateState::Virtio(VirtioMigrateState::default());
+        let text = ron::ser::to_string(&state).expect("encode");
+        assert!(!text.contains("device"), "{text}");
+
+        let decoded: DeviceMigrateState =
+            Message::deserialize(text.as_bytes()).expect("decode v12");
+        assert_eq!(decoded, state);
+    }
+
     fn with_backend(
         backend: vmm_devices::lifecycle::NvmeMigrateBackend,
     ) -> DeviceStatePayload {

@@ -753,6 +753,28 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         drop(vs);
     }
 
+    /// Tell the driver the device-specific configuration changed.
+    ///
+    /// The generation moves on every change (VirtIO 1.3 sec 4.1.4.3), so
+    /// a driver reading the config across it retries. The configuration
+    /// change interrupt goes only to a driver at DRIVER_OK: one still
+    /// initializing reads the config anyway, and has no handler yet. A
+    /// reset in flight takes the config with it, so nothing is raised.
+    pub fn signal_config_change(&self) {
+        let Some(mut vs) = self.lock_for_write() else {
+            return;
+        };
+        vs.config_generation = vs.config_generation.wrapping_add(1);
+        if vs.status & bits::STATUS_DRIVER_OK == 0 {
+            return;
+        }
+        // Sampled under the guard, as set_needs_reset does, so a reset
+        // that follows is always the later of the two.
+        let session = self.intr.session();
+        drop(vs);
+        self.raise_config_interrupt_in(session);
+    }
+
     /// Signal the guest that the device needs a reset.
     ///
     /// A reset in flight takes the device down anyway, so the bit is

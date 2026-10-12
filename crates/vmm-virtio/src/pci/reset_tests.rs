@@ -574,3 +574,42 @@ fn a_reset_from_status_zero_still_reads_non_zero_while_it_drains() {
     write_status(&dev, bits::STATUS_ACKNOWLEDGE);
     assert_eq!(status(&dev), bits::STATUS_ACKNOWLEDGE);
 }
+
+fn config_generation(dev: &Dev) -> u8 {
+    let mut ro = ReadOp::new(1);
+    dev.bar_rw(
+        BarN::BAR2,
+        usize::from(bits::COMMON_CFG_CONFIG_GENERATION),
+        RWOp::Read(&mut ro),
+    );
+    ro.buf()[0]
+}
+
+// VirtIO 1.3 sec 4.1.4.3: a device changes config_generation whenever
+// its config changes, and sec 4.1.4.5 tells the driver through the
+// configuration change interrupt. virtio-gpu uses it to announce a new
+// display size.
+#[test]
+fn a_config_change_bumps_the_generation_and_interrupts() {
+    let (dev, _entered, _release) = make_device();
+    write_status(&dev, READY | bits::STATUS_DRIVER_OK);
+    let before = config_generation(&dev);
+
+    dev.signal_config_change();
+
+    assert_eq!(config_generation(&dev), before.wrapping_add(1));
+    assert_eq!(isr(&dev) & bits::ISR_CFG_CHANGE, bits::ISR_CFG_CHANGE);
+}
+
+// A driver that has not reached DRIVER_OK has no handler for the
+// change, and a reset in flight takes the config with it.
+#[test]
+fn a_config_change_before_driver_ok_raises_nothing() {
+    let (dev, _entered, _release) = make_device();
+    let before = config_generation(&dev);
+
+    dev.signal_config_change();
+
+    assert_eq!(config_generation(&dev), before.wrapping_add(1));
+    assert_eq!(isr(&dev), 0);
+}

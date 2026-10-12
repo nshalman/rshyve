@@ -65,7 +65,79 @@ fn transport(
         pci: Default::default(),
         msix: None,
         queues,
+        device: None,
     }
+}
+
+fn sound_state() -> vmm_devices::lifecycle::VirtioDeviceMigrateState {
+    vmm_devices::lifecycle::VirtioDeviceMigrateState::Sound(
+        vmm_devices::lifecycle::SoundMigrateState {
+            buffer_bytes: Some(4096),
+            prepared: true,
+            running: true,
+        },
+    )
+}
+
+/// The state a device keeps behind the transport goes out with the
+/// transport's own; a device that keeps none sends none.
+#[test]
+fn an_export_carries_the_state_behind_the_transport() {
+    let dev = make_tracking_device();
+    dev.device
+        .state
+        .lock()
+        .expect("tracking state lock")
+        .exports = Some(sound_state());
+    assert_eq!(exported(&dev).device, Some(sound_state()));
+    assert_eq!(exported(&make_test_device()).device, None);
+}
+
+#[test]
+fn a_restore_hands_the_device_its_state() {
+    let dev = make_tracking_device();
+    let mut state = transport(bits::VIRTIO_F_VERSION_1, vec![live_queue()]);
+    state.device = Some(sound_state());
+    dev.restore_migrate_state(&DeviceMigrateState::Virtio(state))
+        .expect("a sane payload restores");
+    let tracked = dev.device.state.lock().expect("tracking state lock");
+    assert_eq!(tracked.restored_device, vec![Some(sound_state())]);
+}
+
+/// The device checks its state before the transport applies anything,
+/// so a payload it refuses leaves the transport untouched.
+#[test]
+fn a_refused_device_state_fails_the_restore_before_the_transport_moves() {
+    let physmap = Arc::new(
+        PhysMap::new_anon(MIGRATE_RING_GPA, MIGRATE_RING_LEN)
+            .expect("create guest memory"),
+    );
+    let dev =
+        build_tracking_device(physmap, None, Some(RefusedStep::DeviceState));
+    let mut state = transport(bits::VIRTIO_F_VERSION_1, vec![live_queue()]);
+    state.device = Some(sound_state());
+    assert!(dev
+        .restore_migrate_state(&DeviceMigrateState::Virtio(state))
+        .is_err());
+    let tracked = dev.device.state.lock().expect("tracking state lock");
+    assert_eq!(tracked.reset_all_rings, 0);
+    assert!(tracked.set_features.is_empty());
+    assert!(tracked.restored_rings.is_empty());
+    drop(tracked);
+    assert_eq!(dev.virtio_state.lock().expect("virtio lock").status, 0);
+}
+
+/// A device that keeps no state refuses a payload that says it does:
+/// the peer is describing some other device.
+#[test]
+fn device_state_for_a_device_that_keeps_none_is_refused() {
+    let dev = make_test_device();
+    let mut state = transport(0, vec![]);
+    state.device = Some(sound_state());
+    let error = dev
+        .restore_migrate_state(&DeviceMigrateState::Virtio(state))
+        .expect_err("a stateless device has nowhere to put it");
+    assert!(error.to_string().contains("virtio-snd"), "{error}");
 }
 
 #[test]

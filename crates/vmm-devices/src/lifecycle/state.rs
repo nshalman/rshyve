@@ -294,6 +294,115 @@ pub struct VirtioMigrateState {
     pub msix: Option<MsixMigrateState>,
     /// Every configured queue, in queue order.
     pub queues: Vec<VirtioMigrateQueue>,
+    /// The state of the device behind the transport, for a device that
+    /// keeps any beyond its rings. Left off the wire when there is none,
+    /// so the payload is a v12 peer's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<VirtioDeviceMigrateState>,
+}
+
+/// The state a virtio device keeps behind its transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VirtioDeviceMigrateState {
+    Sound(SoundMigrateState),
+    Gpu(GpuMigrateState),
+}
+
+impl VirtioDeviceMigrateState {
+    /// The kind name the error messages use.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Sound(_) => "virtio-snd",
+            Self::Gpu(_) => "virtio-gpu",
+        }
+    }
+}
+
+/// A virtio-snd device's one output stream, as the driver set it up.
+///
+/// No message is in flight: a paused device has handed back every one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoundMigrateState {
+    /// The hardware buffer size SET_PARAMS accepted, if it has run.
+    pub buffer_bytes: Option<u32>,
+    /// Between PREPARE and RELEASE.
+    pub prepared: bool,
+    /// Between START and STOP.
+    pub running: bool,
+}
+
+/// A virtio-gpu device's resources, scanout and cursor.
+///
+/// The pixels are not carried: every resource the guest draws into is
+/// backed by guest pages, which the migration carries, and the
+/// destination reads each resource back from them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuMigrateState {
+    pub resources: Vec<GpuMigrateResource>,
+    pub scanout: Option<GpuMigrateScanout>,
+    pub cursor: Option<GpuMigrateCursor>,
+    /// The mode the device offers the guest for scanout 0.
+    pub preferred: (u32, u32),
+    /// Config `events_read`: events the driver has not cleared.
+    pub events: u32,
+    /// Blobs of guest memory; none when absent.
+    #[serde(default)]
+    pub blobs: Vec<GpuMigrateBlob>,
+}
+
+/// One blob of guest memory. Like a 2D resource's pixels, its contents
+/// are the guest pages the migration carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuMigrateBlob {
+    pub id: u32,
+    pub size: u64,
+    /// The guest pages it is, in order, as `(address, length)`.
+    pub backing: Vec<(u64, u32)>,
+}
+
+/// How a blob holds the image the scanout shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuMigrateBlobImage {
+    pub width: u32,
+    pub height: u32,
+    /// Bytes from one row to the next.
+    pub stride: u32,
+    /// Where the first row starts in the blob.
+    pub offset: u32,
+}
+
+/// One 2D resource.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuMigrateResource {
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    /// The guest pages behind it, in order, as `(address, length)`.
+    pub backing: Option<Vec<(u64, u32)>>,
+}
+
+/// Which rectangle of which resource scanout 0 shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuMigrateScanout {
+    pub resource_id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    /// The image, when the resource is a blob; none when absent.
+    #[serde(default)]
+    pub blob: Option<GpuMigrateBlobImage>,
+}
+
+/// The cursor image and where it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuMigrateCursor {
+    pub x: u32,
+    pub y: u32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+    /// 64x64 pixels, B8G8R8A8.
+    pub pixels: Vec<u8>,
 }
 
 /// One configured virtqueue.

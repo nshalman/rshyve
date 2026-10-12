@@ -227,6 +227,39 @@ pub trait VirtioDevice: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The state this device keeps behind its transport, for a
+    /// migration. `None`, the default, says it keeps none beyond its
+    /// rings. An error fails the export.
+    fn export_device_state(
+        &self,
+    ) -> Result<
+        Option<vmm_devices::lifecycle::VirtioDeviceMigrateState>,
+        vmm_devices::lifecycle::DeviceStateError,
+    > {
+        Ok(None)
+    }
+
+    /// Take back the state [`Self::export_device_state`] gave on the
+    /// source. The transport calls this before it applies anything of
+    /// its own, so an implementation checks the whole payload before it
+    /// changes anything: an error fails the restore. The default keeps
+    /// no state and refuses any.
+    fn restore_device_state(
+        &self,
+        state: Option<&vmm_devices::lifecycle::VirtioDeviceMigrateState>,
+        _physmap: &PhysMap,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        match state {
+            None => Ok(()),
+            Some(state) => {
+                Err(vmm_devices::lifecycle::DeviceStateError::invalid(format!(
+                    "payload carries {} state, and this device keeps none",
+                    state.kind()
+                )))
+            }
+        }
+    }
+
     /// The queue notify addresses the guest decodes now, 0 for one it
     /// does not.
     ///

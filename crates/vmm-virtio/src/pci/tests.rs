@@ -127,6 +127,11 @@ struct TrackingVirtioDeviceState {
     order: Vec<&'static str>,
     /// The queue index of every kick the transport let through.
     notified: Vec<u16>,
+    /// What the device exports as its own state.
+    exports: Option<vmm_devices::lifecycle::VirtioDeviceMigrateState>,
+    /// Every device state a restore handed over.
+    restored_device:
+        Vec<Option<vmm_devices::lifecycle::VirtioDeviceMigrateState>>,
 }
 
 /// The step of a restore whose backend refuses it.
@@ -134,6 +139,7 @@ struct TrackingVirtioDeviceState {
 enum RefusedStep {
     ResetRings,
     RingState,
+    DeviceState,
 }
 
 struct TrackingVirtioDevice {
@@ -228,6 +234,33 @@ impl VirtioDevice for TrackingVirtioDevice {
         let mut st = self.state.lock().expect("tracking state lock");
         st.order.push("notify");
         st.notify_addrs.push((pio_port, mmio_addr));
+    }
+
+    fn export_device_state(
+        &self,
+    ) -> Result<
+        Option<vmm_devices::lifecycle::VirtioDeviceMigrateState>,
+        vmm_devices::lifecycle::DeviceStateError,
+    > {
+        Ok(self
+            .state
+            .lock()
+            .expect("tracking state lock")
+            .exports
+            .clone())
+    }
+
+    fn restore_device_state(
+        &self,
+        state: Option<&vmm_devices::lifecycle::VirtioDeviceMigrateState>,
+        _physmap: &PhysMap,
+    ) -> Result<(), vmm_devices::lifecycle::DeviceStateError> {
+        self.state
+            .lock()
+            .expect("tracking state lock")
+            .restored_device
+            .push(state.cloned());
+        self.refusal(RefusedStep::DeviceState)
     }
 
     fn reset(&self) {}

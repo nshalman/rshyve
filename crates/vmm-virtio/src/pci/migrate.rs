@@ -8,6 +8,8 @@
 //! The order of the restore is the invariant this module owns. Nothing
 //! in it is a preference:
 //!
+//! 0. The device's own state, which the device checks whole before it
+//!    takes any of it. It reads nothing the steps below program.
 //! 1. Config space first. The BAR writes it replays are what put the
 //!    device back on the PIO and MMIO buses. A queue programmed
 //!    before them belongs to a device that decodes nothing.
@@ -121,6 +123,7 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
             pci: self.pci_state.lock().expect("pci lock").migrate_state(),
             msix: self.msix.as_ref().map(|msix| msix.export_state()),
             queues,
+            device: self.device.export_device_state()?,
         })
     }
 
@@ -220,6 +223,10 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
         state: &VirtioMigrateState,
     ) -> Result<(), DeviceStateError> {
         self.check_migrate_state(state)?;
+        // The device checks its own state whole before it takes it, so
+        // a payload it refuses fails here with nothing yet applied.
+        self.device
+            .restore_device_state(state.device.as_ref(), &self.physmap)?;
         self.restore_migrate_pci_state(&state.pci);
 
         let mut vs = self.virtio_state.lock().expect("virtio lock");

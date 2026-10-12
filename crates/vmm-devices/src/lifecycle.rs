@@ -88,13 +88,15 @@ pub use state::{
     AcpiGpeMigrateState, AcpiPmMigrateState, ChipsetMigrateState,
     CpuHotplugMigrateState, DeviceMigrateState, DeviceStateError,
     DeviceStatePayload, FbufMigrateState, FbufMigrateVram, FwCfgMigrateState,
-    HypervMigrateState, MemHotplugMigrateState, MigratePciState,
-    NvmeMigrateBackend, NvmeMigrateCq, NvmeMigrateCqe, NvmeMigrateNamespace,
-    NvmeMigrateQueueCounts, NvmeMigrateSq, NvmeMigrateState, PlatformIdentity,
-    PlatformStatePayload, Ps2KbdMigrateState, Ps2MigrateState,
-    Ps2MouseMigrateState, TestFaultMigrateState, UartMigrateState,
-    VirtioMigrateQueue, VirtioMigrateState, WireBdf, XhciMigrateEventRing,
-    XhciMigrateRing, XhciMigrateState, XhciMigrateTablet,
+    GpuMigrateBlob, GpuMigrateBlobImage, GpuMigrateCursor, GpuMigrateResource,
+    GpuMigrateScanout, GpuMigrateState, HypervMigrateState,
+    MemHotplugMigrateState, MigratePciState, NvmeMigrateBackend, NvmeMigrateCq,
+    NvmeMigrateCqe, NvmeMigrateNamespace, NvmeMigrateQueueCounts,
+    NvmeMigrateSq, NvmeMigrateState, PlatformIdentity, PlatformStatePayload,
+    Ps2KbdMigrateState, Ps2MigrateState, Ps2MouseMigrateState,
+    SoundMigrateState, TestFaultMigrateState, UartMigrateState,
+    VirtioDeviceMigrateState, VirtioMigrateQueue, VirtioMigrateState, WireBdf,
+    XhciMigrateEventRing, XhciMigrateRing, XhciMigrateState, XhciMigrateTablet,
 };
 
 /// General trait for emulated devices in the system.
