@@ -41,6 +41,10 @@
 /// interrupt-enable bit. v1 put device identity on the wire.
 pub const PROTOCOL_RON: &str = "vmm-migrate-ron/10";
 
+/// The version that added the wall clock, the interrupt shadow, the
+/// AMD PMU state and the fault-injection test device.
+pub const PROTOCOL_RON_V10: &str = PROTOCOL_RON;
+
 /// The version before, which carries no wall clock and no PMU state.
 pub const PROTOCOL_RON_V9: &str = "vmm-migrate-ron/9";
 
@@ -124,7 +128,7 @@ pub fn protocol_blocker(
         ),
         (
             platform.iter().any(|p| p.kind == TEST_FAULT_KIND),
-            PROTOCOL_RON,
+            PROTOCOL_RON_V10,
             "the fault-injection test device".into(),
         ),
         (
