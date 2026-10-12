@@ -105,7 +105,7 @@ const VCPU_SEG_DESCS: &[vm_reg_name] = &[
 /// Export all registers for a vCPU as (reg_id, value) pairs,
 /// plus segment descriptors as (reg_id, base, limit, access) tuples.
 ///
-/// The interrupt shadow goes last, and only to a current peer: an older
+/// The interrupt shadow goes last, and only to a v10 or newer peer: an older
 /// one writes every register it reads and fails on a shadow the kernel
 /// cannot set.
 fn export_vcpu_regs(
@@ -345,17 +345,17 @@ pub fn export_device_state(
     hdl: &Arc<VmmHdl>,
     num_cpus: u32,
     xsave: &XsaveLayout,
-    current_peer: bool,
+    v10_peer: bool,
     log: &slog::Logger,
 ) -> Result<DeviceState, MigrateError> {
-    let pmu_amd = current_peer && carries_pmu_amd(hdl)?;
+    let pmu_amd = v10_peer && carries_pmu_amd(hdl)?;
     // Export per-vCPU state using individual register reads
     let mut vcpus = Vec::with_capacity(num_cpus as usize);
     for vcpuid in 0..num_cpus as i32 {
         let vcpu = Vcpu::new_for_thread(vcpuid, Arc::clone(hdl));
 
         // Registers via get_reg (reliable, avoids vmm-data field format issues)
-        let registers = export_vcpu_regs(&vcpu, current_peer)?;
+        let registers = export_vcpu_regs(&vcpu, v10_peer)?;
 
         // Every class below is required. A snapshot that silently
         // drops one resumes the guest with default state for it.
@@ -447,7 +447,7 @@ pub fn import_device_state(
     state: &DeviceState,
     num_cpus: u32,
     xsave: &XsavePlan<'_>,
-    current_peer: bool,
+    v10_peer: bool,
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     let layouts = read_class_layouts(hdl)?;
@@ -457,7 +457,7 @@ pub fn import_device_state(
         state,
         num_cpus,
         xsave,
-        (crate::cpu::host_is_amd(), current_peer),
+        (crate::cpu::host_is_amd(), v10_peer),
         log,
     )
 }
@@ -472,10 +472,10 @@ fn import_device_state_into(
     state: &DeviceState,
     num_cpus: u32,
     xsave: &XsavePlan<'_>,
-    (amd_host, current_peer): (bool, bool),
+    (amd_host, v10_peer): (bool, bool),
     log: &slog::Logger,
 ) -> Result<(), MigrateError> {
-    check_device_state(state, layouts, num_cpus, amd_host, current_peer)?;
+    check_device_state(state, layouts, num_cpus, amd_host, v10_peer)?;
     let fpu: Vec<Vec<u8>> = state
         .vcpus
         .iter()

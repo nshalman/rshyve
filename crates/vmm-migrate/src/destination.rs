@@ -228,7 +228,7 @@ fn run_inner<S: Transport>(
         &dev_state,
         config.num_cpus,
         &xsave,
-        protocol == protocol::PROTOCOL_RON,
+        protocol::at_least(protocol, protocol::PROTOCOL_RON_V10),
         log,
     ) {
         chan.report_failure(&e, log);
@@ -369,7 +369,7 @@ fn check_clock(
             crate::clock::check_skew(source, crate::clock::now_ns()?, log)
                 .map(Some)
         }
-        None if protocol::at_least(protocol, protocol::PROTOCOL_RON) => {
+        None if protocol::at_least(protocol, protocol::PROTOCOL_RON_V10) => {
             Err(MigrateError::PreambleMismatch(
                 "the source sent no wall clock".into(),
             ))

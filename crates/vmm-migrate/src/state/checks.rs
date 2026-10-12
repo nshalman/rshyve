@@ -148,14 +148,14 @@ const V10_REGS: [vm_reg_name; 6] = [
 fn check_register_set(
     vcpuid: i32,
     writes: &[RegWrite],
-    current_peer: bool,
+    v10_peer: bool,
 ) -> Result<(), MigrateError> {
     use std::collections::BTreeSet;
     let id = |r: vm_reg_name| r as i32;
     let mut want: BTreeSet<i32> =
         super::VCPU_REGS.iter().map(|&r| id(r)).collect();
     want.insert(id(vm_reg_name::VM_REG_GUEST_INTR_SHADOW));
-    if !current_peer {
+    if !v10_peer {
         for r in V10_REGS {
             want.remove(&id(r));
         }
@@ -318,7 +318,7 @@ pub(super) fn check_device_state(
     layouts: &[vdi_version_entry_v1],
     num_cpus: u32,
     amd_host: bool,
-    current_peer: bool,
+    v10_peer: bool,
 ) -> Result<(), MigrateError> {
     // One payload per vCPU, no more and no fewer. The kernel accepts
     // any id below VM_MAXCPU, so a payload for a vCPU this VM never
@@ -389,7 +389,7 @@ pub(super) fn check_device_state(
             )));
         }
         let writes = parse_vcpu_regs(id, &vcpu.registers)?;
-        check_register_set(id, &writes, current_peer)?;
+        check_register_set(id, &writes, v10_peer)?;
         super::debugregs::check_debug_regs(id, &writes)?;
     }
 

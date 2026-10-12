@@ -60,8 +60,8 @@ use crate::pages::{
     are_contiguous, build_contiguous_gpas, page_buffer_len, read_pages,
 };
 use crate::protocol::{
-    protocol_blocker, PageIter, PAGE_SIZE, PROTOCOL_RON, PROTOCOL_RON_V6,
-    SOURCE_OFFER,
+    at_least, protocol_blocker, PageIter, PAGE_SIZE, PROTOCOL_RON_V10,
+    PROTOCOL_RON_V6, SOURCE_OFFER,
 };
 use crate::record_failure;
 use crate::state;
@@ -398,12 +398,12 @@ fn run_inner<S: Transport>(
         )));
     }
 
-    let current_peer = sel.protocol == PROTOCOL_RON;
+    let v10_peer = at_least(&sel.protocol, PROTOCOL_RON_V10);
     let pmu_amd = state::carries_pmu_amd(hdl)?;
-    if !current_peer && pmu_amd {
+    if !v10_peer && pmu_amd {
         return Err(MigrateError::ProtocolMismatch(format!(
             "the destination speaks {}, which cannot carry the AMD PMU \
-             state; both ends need {PROTOCOL_RON}",
+             state; both ends need {PROTOCOL_RON_V10} or newer",
             crate::wire::peer_text(&sel.protocol)
         )));
     }
@@ -514,7 +514,7 @@ fn run_inner<S: Transport>(
         hdl,
         config.num_cpus,
         &xsave,
-        current_peer,
+        v10_peer,
         log,
     )?;
     dev_state.emulated = emulated;
