@@ -14,6 +14,7 @@ pub mod aml;
 pub mod bhyve;
 pub mod blkdev;
 pub mod chipset;
+pub mod display;
 pub mod fwcfg;
 pub mod hotplug;
 pub mod input;
