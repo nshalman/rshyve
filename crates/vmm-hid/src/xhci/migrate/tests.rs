@@ -246,6 +246,7 @@ fn the_tablet_clamps_what_the_wire_says() {
             buttons: 0xFF,
             x: 0xFFFF,
             y: 0x8000,
+            wheel_buttons: 0xFF,
             address: 0xFF,
             ..Default::default()
         },
@@ -261,9 +262,10 @@ fn the_tablet_clamps_what_the_wire_says() {
             back.tablet.buttons,
             back.tablet.x,
             back.tablet.y,
+            back.tablet.wheel_buttons,
             back.tablet.address
         ),
-        (0x07, 0x7FFF, 0x7FFF, 0x7F)
+        (0x07, 0x7FFF, 0x7FFF, 0x18, 0x7F)
     );
 }
 

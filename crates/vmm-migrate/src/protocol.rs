@@ -12,8 +12,9 @@
 ///
 /// v13 carries the state a virtio device keeps behind its transport:
 /// virtio-gpu's resources, scanout and cursor, and virtio-snd's stream.
-/// A VM with either device moves only on v13. Any other VM sends the
-/// v12 payload.
+/// A VM with either device moves only on v13. Any other VM sends a
+/// payload a v12 peer reads: the tablet's wheel steps, also new, are
+/// fields it ignores.
 ///
 /// v12 carries the v10 payload with the framebuffer VRAM only as LZ4,
 /// and needs the source's wall clock. Builds before it sent v8 to v10

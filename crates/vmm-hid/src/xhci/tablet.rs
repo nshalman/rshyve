@@ -178,6 +178,10 @@ const HID_REPORT_DESC: [u8; 84] = [
 
 const HID_REPORT_DESC_LEN: usize = HID_REPORT_DESC.len();
 
+/// The wheel's Logical Maximum in the report descriptor, and the
+/// negative of its Logical Minimum.
+const WHEEL_MAX: i8 = 127;
+
 /// Size of the HID report: buttons(1) + X(2) + Y(2) + wheel(1) = 6 bytes.
 pub const REPORT_SIZE: usize = 6;
 
@@ -201,6 +205,10 @@ fn make_string_desc(s: &str) -> Vec<u8> {
 
 // ---- Tablet device state -------------------------------------------------
 
+/// VNC's wheel buttons in a pointer event's button mask.
+const WHEEL_UP: u8 = 1 << 3;
+const WHEEL_DOWN: u8 = 1 << 4;
+
 /// Internal mutable state for the tablet.
 struct TabletState {
     /// Current button state (bits 0-2).
@@ -209,6 +217,11 @@ struct TabletState {
     x: u16,
     /// Current Y position (0..0x7FFF).
     y: u16,
+    /// Wheel steps not yet reported: + up, - down.
+    wheel: i8,
+    /// The wheel buttons (bits 3 and 4) of the last event, so that a
+    /// press is one step however many events it lasts.
+    wheel_buttons: u8,
     /// Pending report ready to send.
     report_pending: bool,
     /// USB address assigned by SET_ADDRESS.
@@ -242,6 +255,8 @@ impl TabletDevice {
         Self {
             inner: Mutex::new(TabletState {
                 buttons: 0,
+                wheel: 0,
+                wheel_buttons: 0,
                 x: 0,
                 y: 0,
                 report_pending: false,
@@ -261,8 +276,19 @@ impl TabletDevice {
     /// or changes button state.
     ///
     /// Coordinates are absolute in the range [0, 0x7FFF].
+    /// Take a pointer event with VNC's button mask: bits 0-2 are the
+    /// buttons, and a press of bit 3 or 4 is a wheel step up or down.
     pub fn pointer_event(&self, buttons: u8, x: u16, y: u16) {
         let mut st = self.inner.lock().expect("tablet lock");
+        let pressed = buttons & !st.wheel_buttons;
+        if pressed & WHEEL_UP != 0 {
+            // i8 stops at 127, the descriptor's maximum.
+            st.wheel = st.wheel.saturating_add(1);
+        }
+        if pressed & WHEEL_DOWN != 0 {
+            st.wheel = st.wheel.saturating_sub(1).max(-WHEEL_MAX);
+        }
+        st.wheel_buttons = buttons & (WHEEL_UP | WHEEL_DOWN);
         st.buttons = buttons & 0x07; // only 3 buttons
         st.x = x.min(0x7FFF);
         st.y = y.min(0x7FFF);
@@ -275,6 +301,8 @@ impl TabletDevice {
             buttons: st.buttons,
             x: st.x,
             y: st.y,
+            wheel: st.wheel,
+            wheel_buttons: st.wheel_buttons,
             report_pending: st.report_pending,
             address: st.address,
             configuration: st.configuration,
@@ -289,6 +317,8 @@ impl TabletDevice {
         st.buttons = state.buttons & 0x07;
         st.x = state.x.min(0x7FFF);
         st.y = state.y.min(0x7FFF);
+        st.wheel = state.wheel.clamp(-WHEEL_MAX, WHEEL_MAX);
+        st.wheel_buttons = state.wheel_buttons & (WHEEL_UP | WHEEL_DOWN);
         st.report_pending = state.report_pending;
         st.address = state.address & 0x7F;
         st.configuration = state.configuration;
@@ -309,9 +339,15 @@ impl TabletDevice {
         st.report_pending = false;
         let x_bytes = st.x.to_le_bytes();
         let y_bytes = st.y.to_le_bytes();
+        // Relative: the steps since the last report, then none.
+        let wheel = std::mem::take(&mut st.wheel);
         [
-            st.buttons, x_bytes[0], x_bytes[1], y_bytes[0], y_bytes[1],
-            0, // wheel (always 0 for now)
+            st.buttons,
+            x_bytes[0],
+            x_bytes[1],
+            y_bytes[0],
+            y_bytes[1],
+            wheel as u8,
         ]
     }
 
@@ -576,6 +612,88 @@ mod tests {
     #[test]
     fn report_size() {
         assert_eq!(REPORT_SIZE, 6);
+    }
+
+    /// The wheel byte of the report, as the signed step count HID says.
+    fn wheel(report: [u8; REPORT_SIZE]) -> i8 {
+        report[5] as i8
+    }
+
+    /// VNC and RDP send a wheel step as a press of button 4 (up) or 5
+    /// (down), and the report carries it in its wheel byte, not in the
+    /// buttons.
+    #[test]
+    fn a_wheel_button_press_is_one_wheel_step() {
+        let tablet = TabletDevice::new();
+        tablet.pointer_event(1 << 3, 100, 100);
+        tablet.pointer_event(0, 100, 100);
+        let report = tablet.get_report();
+        assert_eq!(wheel(report), 1);
+        assert_eq!(report[0], 0, "no button held");
+        assert_eq!(wheel(tablet.get_report()), 0, "a step is reported once");
+
+        tablet.pointer_event(1 << 4, 100, 100);
+        tablet.pointer_event(0, 100, 100);
+        assert_eq!(wheel(tablet.get_report()), -1);
+    }
+
+    /// Steps the guest has not read yet add up rather than being lost.
+    #[test]
+    fn wheel_steps_accumulate_until_reported() {
+        let tablet = TabletDevice::new();
+        for _ in 0..3 {
+            tablet.pointer_event(1 << 3, 0, 0);
+            tablet.pointer_event(0, 0, 0);
+        }
+        assert_eq!(wheel(tablet.get_report()), 3);
+    }
+
+    /// Steps the guest has not read, and a wheel button still held, go
+    /// with a migration: the destination reports the steps and does not
+    /// take the held button for a new press.
+    #[test]
+    fn wheel_steps_and_a_held_wheel_button_survive_a_migration() {
+        let src = TabletDevice::new();
+        src.pointer_event(1 << 3, 0, 0);
+        src.pointer_event(0, 0, 0);
+        src.pointer_event(1 << 3, 0, 0);
+
+        let dst = TabletDevice::new();
+        dst.import_state(&src.export_state());
+        dst.pointer_event(1 << 3, 5, 5);
+        assert_eq!(wheel(dst.get_report()), 2);
+    }
+
+    /// The report descriptor says the wheel runs -127 to 127, so steps
+    /// the guest has not read stop there, both ways, and a restored count
+    /// is held to it too.
+    #[test]
+    fn wheel_steps_stay_in_the_descriptor_range() {
+        let tablet = TabletDevice::new();
+        for _ in 0..200 {
+            tablet.pointer_event(1 << 4, 0, 0);
+            tablet.pointer_event(0, 0, 0);
+        }
+        assert_eq!(wheel(tablet.get_report()), -127);
+        for _ in 0..200 {
+            tablet.pointer_event(1 << 3, 0, 0);
+            tablet.pointer_event(0, 0, 0);
+        }
+        assert_eq!(wheel(tablet.get_report()), 127);
+
+        let mut state = tablet.export_state();
+        state.wheel = i8::MIN;
+        tablet.import_state(&state);
+        assert_eq!(wheel(tablet.get_report()), -127);
+    }
+
+    /// Holding the wheel bit is one step, not one per event.
+    #[test]
+    fn a_held_wheel_button_steps_once() {
+        let tablet = TabletDevice::new();
+        tablet.pointer_event(1 << 3, 0, 0);
+        tablet.pointer_event(1 << 3, 10, 0);
+        assert_eq!(wheel(tablet.get_report()), 1);
     }
 
     #[test]

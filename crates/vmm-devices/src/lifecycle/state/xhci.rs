@@ -66,6 +66,13 @@ pub struct XhciMigrateTablet {
     pub buttons: u8,
     pub x: u16,
     pub y: u16,
+    /// Wheel steps the guest has not read. New in v13: a v12 peer
+    /// drops them, and a v12 payload has none.
+    #[serde(default)]
+    pub wheel: i8,
+    /// The wheel buttons held at the last pointer event. New in v13.
+    #[serde(default)]
+    pub wheel_buttons: u8,
     pub report_pending: bool,
     pub address: u8,
     pub configuration: u8,

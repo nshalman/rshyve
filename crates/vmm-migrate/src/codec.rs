@@ -827,6 +827,51 @@ mod tests {
         assert_eq!(decoded, state);
     }
 
+    /// The tablet's wheel state is new in v13. A v12 payload decodes
+    /// with no steps pending, and a v12 peer, whose tablet has no wheel
+    /// fields, reads a v13 payload and drops them.
+    #[test]
+    fn the_tablet_wheel_is_optional_on_the_wire() {
+        use vmm_devices::lifecycle::XhciMigrateTablet;
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct V12Tablet {
+            buttons: u8,
+            x: u16,
+            y: u16,
+            report_pending: bool,
+            address: u8,
+            configuration: u8,
+            idle_rate: u8,
+        }
+        let tablet = XhciMigrateTablet {
+            buttons: 1,
+            x: 0x100,
+            y: 0x200,
+            wheel: 2,
+            wheel_buttons: 0x08,
+            report_pending: true,
+            address: 3,
+            configuration: 1,
+            idle_rate: 0,
+        };
+        let text = ron::ser::to_string(&tablet).expect("encode");
+        let old: V12Tablet = ron::from_str(&text).expect("a v12 peer reads it");
+        assert_eq!((old.x, old.y, old.address), (0x100, 0x200, 3));
+
+        let v12 = text.replace(",wheel:2", "").replace(",wheel_buttons:8", "");
+        assert!(!v12.contains("wheel"), "{v12}");
+        let decoded: XhciMigrateTablet =
+            ron::from_str(&v12).expect("a v12 payload decodes");
+        assert_eq!(
+            decoded,
+            XhciMigrateTablet {
+                wheel: 0,
+                wheel_buttons: 0,
+                ..tablet
+            }
+        );
+    }
+
     /// The blob fields are optional on the wire: a GPU payload without
     /// them decodes as having no blobs.
     #[test]
