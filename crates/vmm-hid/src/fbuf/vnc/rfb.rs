@@ -56,6 +56,8 @@ pub const CLIENT_FB_UPDATE_REQUEST: u8 = 3;
 pub const CLIENT_KEY_EVENT: u8 = 4;
 pub const CLIENT_POINTER_EVENT: u8 = 5;
 pub const CLIENT_CUT_TEXT: u8 = 6;
+/// SetDesktopSize (ExtendedDesktopSize extension).
+pub const CLIENT_SET_DESKTOP_SIZE: u8 = 251;
 
 // ---------------------------------------------------------------------------
 // Encoding types
@@ -63,9 +65,25 @@ pub const CLIENT_CUT_TEXT: u8 = 6;
 
 pub const ENCODING_RAW: i32 = 0;
 
+/// ZRLE: zlib-compressed tiles (RFC 6143 7.7.6).
+pub const ENCODING_ZRLE: i32 = 16;
+
 /// DesktopSize pseudo-encoding: a client that lists it accepts a new
 /// framebuffer size in a rectangle header.
 pub const ENCODING_DESKTOP_SIZE: i32 = -223;
+
+/// ExtendedDesktopSize pseudo-encoding: a client that lists it may ask
+/// for a new size with SetDesktopSize, and is told sizes with a screen
+/// layout and the reason for the change.
+pub const ENCODING_EXTENDED_DESKTOP_SIZE: i32 = -308;
+
+/// ExtendedDesktopSize reasons (the rectangle's x).
+pub const EDS_REASON_SERVER: u16 = 0;
+pub const EDS_REASON_CLIENT: u16 = 1;
+
+/// ExtendedDesktopSize statuses (the rectangle's y).
+pub const EDS_STATUS_OK: u16 = 0;
+pub const EDS_STATUS_PROHIBITED: u16 = 1;
 
 /// How long a message body may take once its type byte is consumed.
 ///
@@ -341,7 +359,7 @@ pub fn read_client_init<R: Read>(r: &mut R) -> io::Result<u8> {
 // ---------------------------------------------------------------------------
 
 /// Header for a FramebufferUpdate rectangle.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RectHeader {
     pub x: u16,
     pub y: u16,
@@ -403,6 +421,37 @@ pub enum ClientMessage {
     PointerEvent { button_mask: u8, x: u16, y: u16 },
     /// ClientCutText.
     CutText(String),
+    /// SetDesktopSize. The screen layout is read and dropped: one
+    /// display has one screen.
+    SetDesktopSize { width: u16, height: u16 },
+}
+
+/// Write an ExtendedDesktopSize rectangle (RFB 7.8.2) describing one
+/// screen that covers a `width` x `height` framebuffer.
+pub fn write_extended_desktop_size<W: Write>(
+    w: &mut W,
+    reason: u16,
+    status: u16,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    w.write_all(
+        &RectHeader {
+            x: reason,
+            y: status,
+            width,
+            height,
+            encoding: ENCODING_EXTENDED_DESKTOP_SIZE,
+        }
+        .to_bytes(),
+    )?;
+    // Number of screens, 3 bytes padding.
+    w.write_all(&[1, 0, 0, 0])?;
+    // Screen: id, x, y, width, height, flags.
+    let mut screen = [0u8; 16];
+    screen[8..10].copy_from_slice(&width.to_be_bytes());
+    screen[10..12].copy_from_slice(&height.to_be_bytes());
+    w.write_all(&screen)
 }
 
 /// Whether an error is the socket's read timeout rather than a fault.
@@ -544,6 +593,18 @@ pub fn read_client_message<R: BufRead>(
             }
             let text = String::from_utf8_lossy(&text_buf).into_owned();
             Ok(Some(ClientMessage::CutText(text)))
+        }
+        CLIENT_SET_DESKTOP_SIZE => {
+            // 1 padding, 2 width, 2 height, 1 screen count, 1 padding,
+            // then 16 bytes a screen.
+            let mut hdr = [0u8; 7];
+            read_body(r, &mut hdr, deadline)?;
+            let mut screens = vec![0u8; usize::from(hdr[5]) * 16];
+            read_body(r, &mut screens, deadline)?;
+            Ok(Some(ClientMessage::SetDesktopSize {
+                width: u16::from_be_bytes([hdr[1], hdr[2]]),
+                height: u16::from_be_bytes([hdr[3], hdr[4]]),
+            }))
         }
         other => {
             // Unknown message type; we cannot parse the rest of the stream
@@ -698,6 +759,56 @@ mod tests {
             }
             _ => panic!("expected PointerEvent"),
         }
+    }
+
+    /// SetDesktopSize (RFB 7.5.8, message 251): the size, then a
+    /// screen layout the server may read or skip, which has to leave the
+    /// stream on the next message.
+    #[test]
+    fn parse_set_desktop_size() {
+        let mut data = vec![CLIENT_SET_DESKTOP_SIZE, 0];
+        data.extend_from_slice(&1600u16.to_be_bytes());
+        data.extend_from_slice(&900u16.to_be_bytes());
+        data.push(2); // number of screens
+        data.push(0); // padding
+        data.extend_from_slice(&[0u8; 32]); // two 16-byte screens
+        data.push(CLIENT_POINTER_EVENT);
+        data.extend_from_slice(&[0, 0, 1, 0, 2]);
+
+        let mut reader = BufReader::new(Cursor::new(data));
+        match read_client_message(&mut reader)
+            .expect("read")
+            .expect("some")
+        {
+            ClientMessage::SetDesktopSize { width, height } => {
+                assert_eq!((width, height), (1600, 900));
+            }
+            other => panic!("expected SetDesktopSize, got {other:?}"),
+        }
+        assert!(matches!(
+            read_client_message(&mut reader)
+                .expect("read")
+                .expect("some"),
+            ClientMessage::PointerEvent { x: 1, y: 2, .. }
+        ));
+    }
+
+    /// The ExtendedDesktopSize rectangle (RFB 7.8.2): reason in x,
+    /// status in y, then one screen covering the framebuffer.
+    #[test]
+    fn extended_desktop_size_rect_layout() {
+        let mut wire = Vec::new();
+        write_extended_desktop_size(&mut wire, 1, 0, 1600, 900).expect("write");
+        assert_eq!(wire.len(), 12 + 4 + 16);
+        assert_eq!(&wire[0..2], &1u16.to_be_bytes(), "reason");
+        assert_eq!(&wire[2..4], &0u16.to_be_bytes(), "status");
+        assert_eq!(&wire[4..6], &1600u16.to_be_bytes());
+        assert_eq!(&wire[6..8], &900u16.to_be_bytes());
+        assert_eq!(&wire[8..12], &ENCODING_EXTENDED_DESKTOP_SIZE.to_be_bytes());
+        assert_eq!(wire[12], 1, "one screen");
+        let screen = &wire[16..32];
+        assert_eq!(&screen[8..10], &1600u16.to_be_bytes());
+        assert_eq!(&screen[10..12], &900u16.to_be_bytes());
     }
 
     #[test]

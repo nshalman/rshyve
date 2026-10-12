@@ -24,13 +24,12 @@
 //! - Class: Display (0x03), Subclass: VGA (0x00)
 
 mod migrate;
-pub mod rfb;
-mod vnc;
+pub mod vnc;
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::io;
+use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use slog;
@@ -41,11 +40,14 @@ use vmm_core::mmio::{MmioBus, MmioFn};
 use vmm_core::ratelimit::{Pace, Pacer};
 use vmm_core::rings::RingGate;
 
+use vmm_devices::display::{DisplaySource, Rect};
 use vmm_devices::lifecycle::DeviceStateError;
 use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use vmm_devices::pci::BarN;
 use vmm_devices::{DeviceMigrateState, InputBroker, Lifecycle};
+
+use self::vnc::VncServer;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -88,12 +90,6 @@ fn resolution_fits(width: u16, height: u16) -> bool {
         .checked_mul(u64::from(height))
         .is_some_and(|n| n <= u64::from(BAR1_SIZE))
 }
-
-/// How long one send may wait for the VNC client to take bytes.
-///
-/// The VNC thread also runs the accept loop, so a client that stops
-/// reading costs every later viewer as well.
-const VNC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Mode registers (BAR0 layout)
@@ -144,23 +140,12 @@ pub struct Framebuffer {
     /// Weak self-reference for MMIO handler closures.
     self_ref: Mutex<Option<std::sync::Weak<Self>>>,
 
-    /// VNC password (None = no auth).
-    vnc_password: Option<String>,
-
-    /// Path to the VNC Unix socket.
-    vnc_path: PathBuf,
-
     /// Structured logger.
     log: slog::Logger,
 
-    /// Late-bound remote input destinations.
-    input: Arc<InputBroker>,
-
-    /// Flag to signal VNC thread to shut down.
-    shutdown: AtomicBool,
-
-    /// The VNC thread, so halt can wait for it to leave.
-    vnc_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    /// The VNC server showing this framebuffer. It holds the device,
+    /// so shutdown takes it to break the cycle.
+    vnc: Mutex<Option<Arc<VncServer>>>,
 }
 
 impl Framebuffer {
@@ -214,32 +199,23 @@ impl Framebuffer {
             bus_mmio,
             registered_bar0: Mutex::new(None),
             self_ref: Mutex::new(None),
-            vnc_password,
-            vnc_path: vnc_path.to_owned(),
-            log,
-            input,
-            shutdown: AtomicBool::new(false),
-            vnc_thread: Mutex::new(None),
+            log: log.clone(),
+            vnc: Mutex::new(None),
         });
 
         // Store weak self-reference for MMIO closures
         *dev.self_ref.lock().expect("fbuf: self_ref lock") =
             Some(Arc::downgrade(&dev));
 
-        let listener = vmm_core::unixsock::bind_restricted(
+        let server = VncServer::start(
+            "fbuf-vnc",
+            Arc::clone(&dev) as Arc<dyn DisplaySource>,
             vnc_path,
-            vmm_core::unixsock::SocketPolicy::default(),
+            vnc_password,
+            input,
+            log,
         )?;
-
-        // Start VNC server thread
-        let vnc_dev = Arc::clone(&dev);
-        let handle = thread::Builder::new()
-            .name("fbuf-vnc".into())
-            .spawn(move || {
-                vnc::server_loop(vnc_dev, listener);
-            })
-            .expect("fbuf: failed to spawn VNC server thread");
-        *dev.vnc_thread.lock().expect("fbuf: vnc thread lock") = Some(handle);
+        *dev.vnc.lock().expect("fbuf: vnc lock") = Some(server);
 
         Ok(dev)
     }
@@ -260,17 +236,62 @@ impl Framebuffer {
     /// a connected client, and holds this device and its 16 MiB segment
     /// alive until the process exits.
     pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
-        let handle = self
-            .vnc_thread
-            .lock()
-            .expect("fbuf: vnc thread lock")
-            .take();
-        if let Some(handle) = handle {
-            if handle.join().is_err() {
-                slog::warn!(self.log, "VNC server thread panicked");
-            }
+        let server = self.vnc.lock().expect("fbuf: vnc lock").take();
+        if let Some(server) = server {
+            server.shutdown();
         }
+    }
+}
+
+impl DisplaySource for Framebuffer {
+    /// One read of the resolution: a width and a height read apart can
+    /// straddle a resize and name a buffer neither mode has.
+    fn size(&self) -> (u32, u32) {
+        let packed = self.resolution.load(Ordering::Relaxed);
+        (
+            u32::from(unpack_width(packed)),
+            u32::from(unpack_height(packed)),
+        )
+    }
+
+    /// The guest writes devmem directly and nothing traps it, so every
+    /// frame is all damage.
+    fn take_damage(&self) -> Option<Rect> {
+        let (width, height) = self.size();
+        (width > 0 && height > 0).then_some(Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        })
+    }
+
+    fn read_rect(&self, r: Rect, dst: &mut [u8]) -> io::Result<()> {
+        let bad = |what| io::Error::new(io::ErrorKind::InvalidInput, what);
+        let (width, height) = self.size();
+        let fits = r.x.checked_add(r.width).is_some_and(|e| e <= width)
+            && r.y.checked_add(r.height).is_some_and(|e| e <= height);
+        if !fits {
+            return Err(bad("rectangle outside the framebuffer"));
+        }
+        let stride = width as usize * BYTES_PER_PIXEL as usize;
+        let row_bytes = r.width as usize * BYTES_PER_PIXEL as usize;
+        if dst.len() != row_bytes * r.height as usize {
+            return Err(bad("destination does not match the rectangle"));
+        }
+
+        // Rows are `stride` bytes apart in the segment, so a narrower
+        // rectangle is copied row by row.
+        let view = self.fb.view();
+        for row in 0..r.height as usize {
+            let at = (r.y as usize + row) * stride
+                + r.x as usize * BYTES_PER_PIXEL as usize;
+            let src = view.subregion(at, row_bytes).ok_or_else(|| {
+                bad("framebuffer update exceeds devmem bounds")
+            })?;
+            src.copy_out(&mut dst[row * row_bytes..][..row_bytes])?;
+        }
+        Ok(())
     }
 }
 
@@ -284,11 +305,6 @@ fn pack_resolution(width: u16, height: u16) -> u32 {
 
 fn unpack_width(packed: u32) -> u16 {
     (packed >> 16) as u16
-}
-
-fn scale_abs(v: u16, extent: u16) -> u16 {
-    let divisor = u32::from(extent.saturating_sub(1)).max(1);
-    ((u32::from(v) * 0x7FFF) / divisor).min(0x7FFF) as u16
 }
 
 fn unpack_height(packed: u32) -> u16 {
@@ -629,14 +645,14 @@ impl Lifecycle for Framebuffer {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[derive(Default)]
-    pub(super) struct RecordingKeyboard(Mutex<Vec<(bool, u32)>>);
+    pub(crate) struct RecordingKeyboard(Mutex<Vec<(bool, u32)>>);
 
     impl RecordingKeyboard {
-        pub(super) fn events(&self) -> Vec<(bool, u32)> {
+        pub(crate) fn events(&self) -> Vec<(bool, u32)> {
             self.0.lock().expect("recording keyboard lock").clone()
         }
     }
@@ -673,28 +689,43 @@ mod tests {
         assert_eq!(unpack_height(packed), 0);
     }
 
+    /// The width and height come from one read of the resolution: a pair
+    /// read half before and half after a resize can name a buffer far
+    /// larger than either mode, and a server allocates by it.
     #[test]
-    fn absolute_pointer_scaling() {
-        assert_eq!(scale_abs(0, 1024), 0);
-        assert_eq!(scale_abs(1023, 1024), 0x7FFF);
-
-        let midpoint = scale_abs(512, 1024);
-        assert!((0x3FE0..=0x4020).contains(&midpoint));
-    }
-
-    #[test]
-    fn absolute_pointer_scaling_handles_degenerate_extents() {
-        assert_eq!(scale_abs(0, 0), 0);
-        assert_eq!(scale_abs(5, 1), 0x7FFF);
-    }
-
-    #[test]
-    fn absolute_pointer_scaling_never_exceeds_tablet_range() {
-        for extent in [0, 1, 2, 768, 1024, u16::MAX] {
-            for value in 0..=u16::MAX {
-                assert!(scale_abs(value, extent) <= 0x7FFF);
+    fn size_is_one_resolution_never_half_of_two() {
+        use std::sync::atomic::AtomicBool;
+        let dev = make_test_dev();
+        let (a, b) = ((4000u16, 16u16), (16u16, 4000u16));
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipper = {
+            let dev = Arc::clone(&dev);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for (w, h) in [a, b] {
+                        dev.resolution
+                            .store(pack_resolution(w, h), Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+        dev.resolution
+            .store(pack_resolution(a.0, a.1), Ordering::Relaxed);
+        let mut mixed = None;
+        for _ in 0..2_000_000 {
+            let got = DisplaySource::size(&*dev);
+            let ok = [a, b]
+                .iter()
+                .any(|&(w, h)| got == (u32::from(w), u32::from(h)));
+            if !ok {
+                mixed = Some(got);
+                break;
             }
         }
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().expect("flipper");
+        assert_eq!(mixed, None, "a size made of two resolutions");
     }
 
     #[test]
@@ -866,7 +897,10 @@ mod tests {
     }
 
     /// Counts the times the gate stopped the VM's rings.
-    struct CountingRings(std::sync::atomic::AtomicUsize, AtomicBool);
+    struct CountingRings(
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicBool,
+    );
 
     impl vmm_core::rings::KernelRings for CountingRings {
         fn stop(&self) -> Result<(), String> {
@@ -886,7 +920,7 @@ mod tests {
         let dev = make_test_dev();
         let rings = Arc::new(CountingRings(
             std::sync::atomic::AtomicUsize::new(0),
-            AtomicBool::new(false),
+            std::sync::atomic::AtomicBool::new(false),
         ));
         dev.rings
             .register(Arc::downgrade(&rings) as std::sync::Weak<_>)
@@ -907,21 +941,69 @@ mod tests {
         assert_eq!(rings.0.load(Ordering::SeqCst), REMAP_BURST as usize);
     }
 
+    #[test]
+    fn read_rect_copies_a_sub_rectangle_and_refuses_one_outside() {
+        let dev = make_test_dev();
+        dev.bar0_write(memreg::WIDTH, 4 | (3 << 16), 4);
+        let px: Vec<u8> = (0..12u32).flat_map(|i| i.to_le_bytes()).collect();
+        dev.fb
+            .view()
+            .subregion(0, px.len())
+            .expect("in the segment")
+            .copy_in(&px)
+            .expect("write pixels");
+
+        let r = Rect {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        };
+        let mut out = vec![0u8; 16];
+        dev.read_rect(r, &mut out).expect("inside the framebuffer");
+        let got: Vec<u32> = out
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
+            .collect();
+        assert_eq!(got, [5, 6, 9, 10]);
+
+        let outside = Rect { x: 3, ..r };
+        assert!(dev.read_rect(outside, &mut out).is_err());
+        assert!(dev.read_rect(r, &mut out[..8]).is_err());
+    }
+
+    /// Change the resolution as a guest mode set would.
+    pub(crate) fn set_resolution(dev: &Framebuffer, width: u16, height: u16) {
+        dev.resolution
+            .store(pack_resolution(width, height), Ordering::Release);
+    }
+
+    /// Give `dev` a server, as `Framebuffer::new` does.
+    pub(crate) fn attach_server(dev: &Framebuffer, srv: Arc<VncServer>) {
+        *dev.vnc.lock().expect("fbuf: vnc lock") = Some(srv);
+    }
+
+    pub(crate) fn has_server(dev: &Framebuffer) -> bool {
+        dev.vnc.lock().expect("fbuf: vnc lock").is_some()
+    }
+
+    /// fbuf cannot see guest writes to its devmem, so every frame is
+    /// all damage.
+    #[test]
+    fn every_fbuf_frame_is_fully_damaged() {
+        let dev = make_test_dev();
+        let full = Rect {
+            x: 0,
+            y: 0,
+            width: 1024,
+            height: 768,
+        };
+        assert_eq!(dev.take_damage(), Some(full));
+        assert_eq!(dev.take_damage(), Some(full));
+    }
+
     /// Create a test device without starting the VNC server.
-    pub(super) fn make_test_dev() -> Arc<Framebuffer> {
-        make_test_dev_with_input(Arc::new(InputBroker::default()))
-    }
-
-    pub(super) fn make_test_dev_with_input(
-        input: Arc<InputBroker>,
-    ) -> Arc<Framebuffer> {
-        make_test_dev_at(input, PathBuf::from("/nonexistent/fbuf.vnc"))
-    }
-
-    pub(super) fn make_test_dev_at(
-        input: Arc<InputBroker>,
-        vnc_path: PathBuf,
-    ) -> Arc<Framebuffer> {
+    pub(crate) fn make_test_dev() -> Arc<Framebuffer> {
         let ident = DeviceIdent {
             vendor_id: PCI_VENDOR_ID,
             device_id: PCI_DEVICE_ID,
@@ -946,12 +1028,8 @@ mod tests {
             bus_mmio: Arc::new(MmioBus::new()),
             registered_bar0: Mutex::new(None),
             self_ref: Mutex::new(None),
-            vnc_password: None,
-            vnc_path,
             log: slog::Logger::root(slog::Discard, slog::o!()),
-            input,
-            shutdown: AtomicBool::new(false),
-            vnc_thread: Mutex::new(None),
+            vnc: Mutex::new(None),
         });
         *dev.self_ref.lock().expect("fbuf: self_ref lock") =
             Some(Arc::downgrade(&dev));
