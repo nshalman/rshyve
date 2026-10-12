@@ -24,7 +24,6 @@
 //! - Class: Display (0x03), Subclass: VGA (0x00)
 
 mod migrate;
-pub mod vnc;
 
 use std::io;
 use std::path::Path;
@@ -47,7 +46,7 @@ use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
 use vmm_devices::pci::BarN;
 use vmm_devices::{DeviceMigrateState, InputBroker, Lifecycle};
 
-use self::vnc::VncServer;
+use crate::vnc::VncServer;
 
 // ---------------------------------------------------------------------------
 // Constants

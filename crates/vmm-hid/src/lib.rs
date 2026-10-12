@@ -6,4 +6,5 @@
 
 pub mod fbuf;
 pub mod ps2;
+pub mod vnc;
 pub mod xhci;
