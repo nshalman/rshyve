@@ -129,11 +129,6 @@ impl DiskSync {
     }
 }
 
-/// Refuse a writable block node. Specfs answers ENOTTY to every disk
-/// ioctl on it, and writes wait in its page cache (spec_write starts
-/// async writeback only for full MAXBSIZE blocks). spec_fsync drains
-/// that cache and tries the device flush but drops both errors, and
-/// after one ENOTSUP or ENOTTY it never flushes the node again.
 /// File-type bits, widened to the `u32` that `st_mode` arrives as.
 ///
 /// `libc`'s `S_IF*` constants have type `mode_t`, which is 16-bit on some
@@ -149,6 +144,11 @@ mod ifmt {
     pub const REG: u32 = libc::S_IFREG as u32;
 }
 
+/// Refuse a writable block node. Specfs answers ENOTTY to every disk
+/// ioctl on it, and writes wait in its page cache (spec_write starts
+/// async writeback only for full MAXBSIZE blocks). spec_fsync drains
+/// that cache and tries the device flush but drops both errors, and
+/// after one ENOTSUP or ENOTTY it never flushes the node again.
 fn check_not_block(
     st_mode: u32,
     read_only: bool,
