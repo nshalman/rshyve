@@ -134,7 +134,7 @@ pub const ERDP_PTR_MASK: u64 = !0xF;
 // ---- Port Status Register offsets (relative to OP_BASE) -------------------
 
 /// Base of port register sets (each port = 16 bytes).
-pub const PORTSC_BASE: usize = 0x400 - OP_BASE;
+pub const PORTSC_BASE: usize = 0x400;
 
 /// Port register offsets within each 16-byte port set.
 pub const PORTSC_PORTSC: usize = 0x00;
@@ -207,30 +207,29 @@ pub const XCAP_BASE: usize = 0x600;
 /// Size of a Supported Protocol capability (16 bytes).
 pub const XCAP_PROTO_SIZE: usize = 16;
 
-/// Build a USB2 Supported Protocol extended capability.
+/// Build a Supported Protocol extended capability (xHCI 1.2 section 7.2).
 ///
-/// ID=2, Next=16 bytes, revision=2.0, name="USB ", port offset=1, port count=1
-pub fn xcap_usb2() -> [u32; 4] {
-    let id_next: u32 = 0x02 | ((XCAP_PROTO_SIZE as u32 / 4) << 8);
-    let rev_name0: u32 =
-        0x0200 | (u32::from(b'U') << 16) | (u32::from(b'S') << 24);
-    let name1: u32 = u32::from(b'B') | (u32::from(b' ') << 8);
-    // Port offset = 1, port count = 1
-    let ports: u32 = 1 | (1 << 8);
-    [id_next, rev_name0, name1, ports]
+/// - dword 0: ID 2, `next` (in dwords, 0 = last), minor revision 0,
+///   `major` revision
+/// - dword 1: name string "USB "
+/// - dword 2: compatible port offset `port`, port count 1, no protocol
+///   speed IDs (the default speeds for the revision apply)
+/// - dword 3: protocol slot type 0
+fn xcap_protocol(next: u32, major: u32, port: u32) -> [u32; 4] {
+    let id_next_rev: u32 = 0x02 | (next << 8) | (major << 24);
+    let name = u32::from_le_bytes(*b"USB ");
+    let ports: u32 = port | (1 << 8);
+    [id_next_rev, name, ports, 0]
 }
 
-/// Build a USB3 Supported Protocol extended capability.
-///
-/// ID=2, Next=0 (end of chain), revision=3.0, name="USB ", port offset=2, port count=1
+/// USB 2.0 on port 1; the next capability is USB3's, 16 bytes on.
+pub fn xcap_usb2() -> [u32; 4] {
+    xcap_protocol(XCAP_PROTO_SIZE as u32 / 4, 2, 1)
+}
+
+/// USB 3.0 on port 2; the last capability.
 pub fn xcap_usb3() -> [u32; 4] {
-    let id_next: u32 = 0x02; // Next = 0 (last capability)
-    let rev_name0: u32 =
-        0x0300 | (u32::from(b'U') << 16) | (u32::from(b'S') << 24);
-    let name1: u32 = u32::from(b'B') | (u32::from(b' ') << 8);
-    // Port offset = 2, port count = 1
-    let ports: u32 = 2 | (1 << 8);
-    [id_next, rev_name0, name1, ports]
+    xcap_protocol(0, 3, 2)
 }
 
 // ---- TRB (Transfer Request Block) definitions ----------------------------
@@ -244,6 +243,10 @@ pub const TRB_TYPE_MASK: u32 = 0x3F;
 
 // Cycle bit (bit 0 of dword 3)
 pub const TRB_CYCLE: u32 = 1 << 0;
+// Interrupt on Short Packet (bit 2 of dword 3, transfer TRBs)
+pub const TRB_ISP: u32 = 1 << 2;
+// Interrupt On Completion (bit 5 of dword 3, transfer TRBs)
+pub const TRB_IOC: u32 = 1 << 5;
 
 // ---- TRB types: Transfer ring ----
 
@@ -261,6 +264,7 @@ pub const TRB_TYPE_ADDRESS_DEVICE: u32 = 11;
 pub const TRB_TYPE_CONFIGURE_EP: u32 = 12;
 pub const TRB_TYPE_EVALUATE_CTX: u32 = 13;
 pub const TRB_TYPE_RESET_EP: u32 = 14;
+pub const TRB_TYPE_STOP_EP: u32 = 15;
 pub const TRB_TYPE_SET_TR_DEQUEUE: u32 = 16;
 pub const TRB_TYPE_NOOP_CMD: u32 = 23;
 
@@ -274,11 +278,13 @@ pub const TRB_TYPE_PORT_STATUS_CHANGE: u32 = 34;
 
 pub const TRB_CC_INVALID: u32 = 0;
 pub const TRB_CC_SUCCESS: u32 = 1;
+pub const TRB_CC_DATA_BUFFER_ERROR: u32 = 2;
 pub const TRB_CC_NO_SLOTS_AVAILABLE: u32 = 9;
 pub const TRB_CC_SHORT_PACKET: u32 = 13;
 pub const TRB_CC_TRB_ERROR: u32 = 5;
 pub const TRB_CC_STALL: u32 = 6;
 pub const TRB_CC_SLOT_NOT_ENABLED: u32 = 11;
+pub const TRB_CC_PARAMETER_ERROR: u32 = 17;
 
 // Setup Stage TRB fields
 pub const TRB_SETUP_IDT: u32 = 1 << 6; // Immediate Data in TRB
@@ -374,6 +380,9 @@ pub const USB_DT_INTERFACE: u8 = 4;
 pub const USB_DT_ENDPOINT: u8 = 5;
 pub const USB_DT_HID: u8 = 0x21;
 pub const USB_DT_HID_REPORT: u8 = 0x22;
+pub const USB_DT_BOS: u8 = 0x0F;
+pub const USB_DT_DEVICE_CAPABILITY: u8 = 0x10;
+pub const USB_DT_SS_ENDPOINT_COMP: u8 = 0x30;
 
 // USB request type direction bit
 pub const USB_DIR_IN: u8 = 0x80;
@@ -393,12 +402,25 @@ pub const EP_CTX_SIZE: usize = 32;
 /// Input context has an additional Input Control Context (32 bytes) prepended.
 pub const INPUT_CTRL_CTX_SIZE: usize = 32;
 
+/// Every context in a Device or Input Context is 32 bytes (HCCPARAMS1
+/// CSZ = 0).
+pub const CTX_SIZE: usize = 32;
+
+/// Configure Endpoint Command TRB dword 3 bit 9: Deconfigure.
+pub const CONFIGURE_EP_DC: u32 = 1 << 9;
+
 // Slot Context dword 3: Device Address (bits 7:0), Slot State (bits 31:27)
 pub const SLOT_STATE_SHIFT: u32 = 27;
 pub const SLOT_STATE_DISABLED: u32 = 0;
 pub const SLOT_STATE_DEFAULT: u32 = 1;
 pub const SLOT_STATE_ADDRESSED: u32 = 2;
 pub const SLOT_STATE_CONFIGURED: u32 = 3;
+
+// Endpoint Context dword 0: EP State (bits 2:0)
+pub const EP_STATE_MASK: u32 = 0x7;
+pub const EP_STATE_DISABLED: u32 = 0;
+pub const EP_STATE_RUNNING: u32 = 1;
+pub const EP_STATE_STOPPED: u32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -436,30 +458,50 @@ mod tests {
         assert_eq!(xecp * 4, XCAP_BASE as u32);
     }
 
+    /// The Supported Protocol layout of xHCI 1.2 section 7.2: revision
+    /// in the top half of dword 0, the name in dword 1, the port range
+    /// in dword 2 and the slot type in dword 3. Linux reads exactly
+    /// these fields; with the revision and ports anywhere else it finds
+    /// no root hub ports and refuses the controller.
+    fn assert_protocol(cap: [u32; 4], next: u32, major: u32, first_port: u32) {
+        // Capability ID 2, Supported Protocol.
+        assert_eq!(cap[0] & 0xFF, 2);
+        assert_eq!((cap[0] >> 8) & 0xFF, next, "next pointer");
+        assert_eq!((cap[0] >> 16) & 0xFF, 0, "minor revision");
+        assert_eq!(cap[0] >> 24, major, "major revision");
+        assert_eq!(cap[1], u32::from_le_bytes(*b"USB "), "name string");
+        assert_eq!(cap[2] & 0xFF, first_port, "compatible port offset");
+        assert_eq!((cap[2] >> 8) & 0xFF, 1, "compatible port count");
+        assert_eq!(cap[2] >> 28, 0, "no speed IDs: the defaults apply");
+        assert_eq!(cap[3] & 0x1F, 0, "protocol slot type");
+    }
+
     #[test]
     fn xcap_usb2_fields() {
-        let cap = xcap_usb2();
-        // Capability ID = 2
-        assert_eq!(cap[0] & 0xFF, 2);
-        // Next pointer = 4 (16 bytes / 4)
-        assert_eq!((cap[0] >> 8) & 0xFF, 4);
-        // Revision minor.major in dword1 low 16 bits
-        assert_eq!(cap[1] & 0xFFFF, 0x0200);
-        // Port offset = 1, count = 1
-        assert_eq!(cap[3] & 0xFF, 1);
-        assert_eq!((cap[3] >> 8) & 0xFF, 1);
+        // Next = 4 dwords, to the USB3 capability. Port 1.
+        assert_protocol(xcap_usb2(), 4, 2, 1);
     }
 
     #[test]
     fn xcap_usb3_fields() {
-        let cap = xcap_usb3();
-        assert_eq!(cap[0] & 0xFF, 2);
-        // Next = 0 (last)
-        assert_eq!((cap[0] >> 8) & 0xFF, 0);
-        assert_eq!(cap[1] & 0xFFFF, 0x0300);
-        // Port offset = 2, count = 1
-        assert_eq!(cap[3] & 0xFF, 2);
-        assert_eq!((cap[3] >> 8) & 0xFF, 1);
+        // Next = 0, the last capability. Port 2.
+        assert_protocol(xcap_usb3(), 0, 3, 2);
+    }
+
+    /// Every root hub port belongs to exactly one protocol, and together
+    /// they cover MaxPorts.
+    #[test]
+    fn xcap_ports_cover_max_ports_once() {
+        let max_ports = hcsparams1() >> 24;
+        let mut owners = vec![0; max_ports as usize + 1];
+        for cap in [xcap_usb2(), xcap_usb3()] {
+            let first = cap[2] & 0xFF;
+            let count = (cap[2] >> 8) & 0xFF;
+            for port in first..first + count {
+                owners[port as usize] += 1;
+            }
+        }
+        assert_eq!(&owners[1..], vec![1; max_ports as usize]);
     }
 
     #[test]
@@ -498,17 +540,20 @@ mod tests {
 
     #[test]
     fn portsc_base_alignment() {
-        // Port registers start at offset 0x400 from BAR0,
-        // which is 0x400 - 0x20 = 0x3E0 from operational base.
-        assert_eq!(PORTSC_BASE + OP_BASE, 0x400);
+        // xHCI 1.2 section 5.4.8: port register set n is at Operational
+        // Base + 0x400 + 0x10 * (n - 1). Linux's xhci_op_regs puts
+        // port_status_base at 0x400 too. With CAPLENGTH 0x20 that is BAR0
+        // offset 0x420; at 0x400 the guest reads port 1 as all zeroes.
+        assert_eq!(PORTSC_BASE, 0x400);
+        assert_eq!(PORTSC_BASE + OP_BASE, 0x420);
     }
 
     #[test]
     fn register_layout_no_overlap() {
         // Verify the register regions don't overlap
         let cap_end = CAPLENGTH as usize; // 0x20
-        let op_end = 0x400; // operational regs end at port base
-        let port_end = 0x400 + 2 * PORT_REG_SIZE; // 2 ports
+        let op_end = OP_BASE + PORTSC_BASE; // operational regs end at port base
+        let port_end = op_end + 2 * PORT_REG_SIZE; // 2 ports
         let db_start = DBOFF as usize; // 0x440
         let db_end = db_start + (usize::from(MAX_SLOTS) + 1) * DB_REG_SIZE;
         let rt_start = RTSOFF as usize; // 0x560

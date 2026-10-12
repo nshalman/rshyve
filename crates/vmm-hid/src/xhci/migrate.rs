@@ -19,6 +19,7 @@ use vmm_devices::pci::device::replay_migrate_pci_state;
 
 use super::bits::{
     CRCR_CRR, ERDP_PTR_MASK, ERSTBA_PTR_MASK, IMAN_IE, IMAN_IP, MAX_SLOTS,
+    USBSTS_EINT,
 };
 use super::{
     SlotState, TransferRing, XhciController, XhciState, MAX_EVENT_RING_SIZE,
@@ -162,6 +163,14 @@ impl XhciController {
                 "xhci: BAR0 at {:#x} does not decode",
                 mig.pci.bar_addrs[0]
             )));
+        }
+        // The line is up from an event until the driver clears EINT,
+        // and the kernel import puts that level back. Held here too, so
+        // the driver's clear lowers a line this side raised.
+        if mig.usbsts & USBSTS_EINT != 0 {
+            if let Some(pin) = &self.intr_pin {
+                pin.assert();
+            }
         }
         Ok(())
     }

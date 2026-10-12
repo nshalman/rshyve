@@ -19,15 +19,18 @@ use super::bits;
 // ---- USB descriptors (const byte arrays) ---------------------------------
 
 /// Device descriptor (18 bytes).
+///
+/// A USB 3.0 device, as bhyve's tablet is: the controller connects it on
+/// the USB3 root port at SuperSpeed, and the descriptor has to agree.
 const DEVICE_DESC: [u8; 18] = [
     18,                  // bLength
     bits::USB_DT_DEVICE, // bDescriptorType
     0x00,
-    0x02, // bcdUSB = 2.00
+    0x03, // bcdUSB = 3.00
     0x00, // bDeviceClass (defined at interface level)
     0x00, // bDeviceSubClass
     0x00, // bDeviceProtocol
-    64,   // bMaxPacketSize0
+    9,    // bMaxPacketSize0: 2^9 = 512, the only SuperSpeed value
     0x5D,
     0xFB, // idVendor = 0xFB5D (little-endian)
     0x01,
@@ -40,13 +43,14 @@ const DEVICE_DESC: [u8; 18] = [
     1,    // bNumConfigurations
 ];
 
-/// Configuration descriptor + interface + HID + endpoint (total 34 bytes).
-const CONFIG_DESC: [u8; 34] = [
+/// Configuration descriptor + interface + HID + endpoint + SuperSpeed
+/// endpoint companion (total 40 bytes).
+const CONFIG_DESC: [u8; 40] = [
     // Configuration descriptor (9 bytes)
     9,                   // bLength
     bits::USB_DT_CONFIG, // bDescriptorType
-    34,
-    0,    // wTotalLength = 34
+    40,
+    0,    // wTotalLength = 40
     1,    // bNumInterfaces
     1,    // bConfigurationValue
     0,    // iConfiguration
@@ -80,7 +84,36 @@ const CONFIG_DESC: [u8; 34] = [
     0x03,                  // bmAttributes (interrupt)
     8,
     0,  // wMaxPacketSize = 8
-    10, // bInterval (10 ms)
+    10, // bInterval: 2^(10-1) x 125 us at SuperSpeed, as bhyve's tablet
+    // SuperSpeed Endpoint Companion (6 bytes)
+    6,                             // bLength
+    bits::USB_DT_SS_ENDPOINT_COMP, // bDescriptorType
+    0,                             // bMaxBurst
+    0,                             // bmAttributes
+    8,
+    0, // wBytesPerInterval = 8, one report
+];
+
+/// BOS descriptor with the SuperSpeed USB device capability (15 bytes),
+/// which a USB 3.0 device must have. The values are bhyve's tablet's.
+const BOS_DESC: [u8; 15] = [
+    // BOS header (5 bytes)
+    5,                // bLength
+    bits::USB_DT_BOS, // bDescriptorType
+    15,
+    0, // wTotalLength = 15
+    1, // bNumDeviceCaps
+    // SuperSpeed USB device capability (10 bytes)
+    10,                             // bLength
+    bits::USB_DT_DEVICE_CAPABILITY, // bDescriptorType
+    3,                              // bDevCapabilityType: SuperSpeed USB
+    0,                              // bmAttributes: no LTM
+    0x08,
+    0x00, // wSpeedsSupported: SuperSpeed
+    3,    // bFunctionalitySupport: full function at SuperSpeed
+    0x0A, // bU1DevExitLat
+    0x20,
+    0x00, // wU2DevExitLat
 ];
 
 /// HID Report Descriptor for absolute pointer tablet.
@@ -411,6 +444,10 @@ impl TabletDevice {
                 let len = max_len.min(CONFIG_DESC.len());
                 Some(CONFIG_DESC[..len].to_vec())
             }
+            bits::USB_DT_BOS => {
+                let len = max_len.min(BOS_DESC.len());
+                Some(BOS_DESC[..len].to_vec())
+            }
             bits::USB_DT_STRING => {
                 let idx = desc_index as usize;
                 if idx < self.string_descs.len() {
@@ -453,9 +490,69 @@ mod tests {
 
     #[test]
     fn config_desc_total_length() {
-        assert_eq!(CONFIG_DESC.len(), 34);
         let total = u16::from_le_bytes([CONFIG_DESC[2], CONFIG_DESC[3]]);
-        assert_eq!(total, 34);
+        assert_eq!(usize::from(total), CONFIG_DESC.len());
+    }
+
+    /// The tablet sits on the USB3 port at SuperSpeed, so its device
+    /// descriptor has to say USB 3.0, and a SuperSpeed EP0 max packet
+    /// size is the exponent 9 (512 bytes). Linux refused 64 with
+    /// "Invalid ep0 maxpacket: 64" and never enumerated the tablet.
+    #[test]
+    fn device_desc_is_usb3() {
+        assert_eq!(
+            u16::from_le_bytes([DEVICE_DESC[2], DEVICE_DESC[3]]),
+            0x0300
+        );
+        assert_eq!(DEVICE_DESC[7], 9);
+    }
+
+    /// USB 3.2 section 9.6.7: every SuperSpeed endpoint descriptor is
+    /// followed by its SuperSpeed Endpoint Companion descriptor.
+    #[test]
+    fn the_endpoint_has_a_superspeed_companion() {
+        let endpoint = 9 + 9 + 9;
+        assert_eq!(CONFIG_DESC[endpoint + 1], bits::USB_DT_ENDPOINT);
+        let companion = endpoint + 7;
+        assert_eq!(CONFIG_DESC[companion], 6);
+        assert_eq!(CONFIG_DESC[companion + 1], bits::USB_DT_SS_ENDPOINT_COMP);
+        assert_eq!(CONFIG_DESC[companion + 2], 0, "bMaxBurst");
+        // wBytesPerInterval: one 8-byte report per interval.
+        assert_eq!(
+            u16::from_le_bytes([
+                CONFIG_DESC[companion + 4],
+                CONFIG_DESC[companion + 5]
+            ]),
+            8
+        );
+        assert_eq!(companion + 6, CONFIG_DESC.len());
+    }
+
+    /// A USB 3.0 device must answer GET_DESCRIPTOR(BOS) with at least
+    /// the SuperSpeed USB device capability (USB 3.2 section 9.6.2).
+    #[test]
+    fn handle_get_bos_descriptor() {
+        let tablet = TabletDevice::new();
+        let data = tablet
+            .handle_control(0x80, 6, u16::from(bits::USB_DT_BOS) << 8, 0, 255)
+            .expect("a BOS descriptor");
+        assert_eq!(data[0], 5);
+        assert_eq!(data[1], bits::USB_DT_BOS);
+        assert_eq!(
+            usize::from(u16::from_le_bytes([data[2], data[3]])),
+            data.len()
+        );
+        assert_eq!(data[4], 1, "one device capability");
+        let cap = &data[5..];
+        assert_eq!(cap[0], 10);
+        assert_eq!(cap[1], bits::USB_DT_DEVICE_CAPABILITY);
+        assert_eq!(cap[2], 3, "SuperSpeed USB device capability");
+
+        // Linux reads the 5-byte header first.
+        let head = tablet
+            .handle_control(0x80, 6, u16::from(bits::USB_DT_BOS) << 8, 0, 5)
+            .expect("the BOS header");
+        assert_eq!(head, data[..5]);
     }
 
     #[test]
@@ -532,7 +629,7 @@ mod tests {
         let result = tablet.handle_control(0x80, 6, 0x0200, 0, 255);
         assert!(result.is_some());
         let data = result.expect("descriptor");
-        assert_eq!(data.len(), 34);
+        assert_eq!(data.len(), CONFIG_DESC.len());
     }
 
     #[test]

@@ -398,10 +398,11 @@ fn parse_and_create_pci_device(
             // Config is just "tablet" (the attached USB device)
             let lintr = chipset.route_lintr(&bdf);
             let intr_pin = lintr.map(|(_, pin)| pin);
-            let xhci = vmm_hid::xhci::XhciController::new(
+            let xhci = vmm_hid::xhci::XhciController::new_with_logger(
                 Arc::clone(physmap),
                 Arc::clone(bus_mmio),
                 intr_pin,
+                log.new(slog::o!("component" => "xhci")),
             );
             chipset.try_attach_device(bdf, xhci.clone())?;
             input.set_pointer(xhci.clone());

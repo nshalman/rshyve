@@ -79,12 +79,13 @@ fn guest_setup(ctrl: &XhciController, ram: &PhysMap) {
         u64::from(USBCMD_RS | USBCMD_INTE),
     );
 
-    // A Normal TRB for one 6-byte report, cycle bit set.
+    // A Normal TRB for one 6-byte report, cycle bit set, asking for a
+    // Transfer Event on completion as a driver's interrupt-IN TRB does.
     let mut trb = [0u8; 16];
     trb[..8].copy_from_slice(&REPORT_BUF.to_le_bytes());
     trb[8..12].copy_from_slice(&6u32.to_le_bytes());
     trb[12..16].copy_from_slice(
-        &((TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | 1).to_le_bytes(),
+        &((TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC | 1).to_le_bytes(),
     );
     write_ram(ram, EP1_RING, &trb);
     let mut st = ctrl.state.lock().expect("state");
@@ -280,4 +281,36 @@ fn a_bar0_the_bus_refuses_fails_the_restore() {
         .expect("squatter");
     let error = dst.restore_state(&exported).expect_err("dark BAR0");
     assert!(error.to_string().contains("BAR0"), "{error}");
+}
+
+/// The line is held up from an event until the driver clears EINT. The
+/// kernel's interrupt state puts the level back on the destination, so
+/// a restore with EINT set holds the line there too: otherwise the
+/// driver's clear would lower a line this side never raised.
+#[test]
+fn a_pending_interrupt_holds_the_line_on_the_destination() {
+    use vmm_devices::pci::IntrPin;
+    let ram = Arc::new(PhysMap::new_anon(0, RAM_LEN).expect("guest memory"));
+    let src = controller(&ram);
+    guest_setup(&src, &ram);
+    let DeviceMigrateState::Xhci(mut pending) = src.export_state() else {
+        panic!("not xhci state");
+    };
+    pending.usbsts |= USBSTS_EINT;
+
+    for (usbsts, raised) in [(pending.usbsts, true), (0, false)] {
+        let pin = Arc::new(crate::xhci::tests::LevelPin::default());
+        let dst = XhciController::new(
+            Arc::clone(&ram),
+            Arc::new(MmioBus::new()),
+            Some(pin.clone() as Arc<dyn IntrPin>),
+        );
+        let state = XhciMigrateState {
+            usbsts,
+            ..pending.clone()
+        };
+        dst.restore_state(&DeviceMigrateState::Xhci(state))
+            .expect("restore");
+        assert_eq!(pin.is_asserted(), raised, "USBSTS {usbsts:#x}");
+    }
 }

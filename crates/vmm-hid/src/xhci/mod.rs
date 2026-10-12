@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, Weak};
 use vmm_core::common::RWOp;
 use vmm_core::mem::PhysMap;
 use vmm_core::mmio::{MmioBus, MmioFn};
+use vmm_core::ratelimit::TokenBucket;
 
 use vmm_devices::lifecycle::DeviceStateError;
 use vmm_devices::pci::bar::BarDefine;
@@ -44,6 +45,49 @@ use tablet::TabletDevice;
 /// larger ERST entries, but 4096 entries (64 KiB of TRBs) is more than
 /// sufficient.
 const MAX_EVENT_RING_SIZE: u32 = 4096;
+
+/// A command's completion code: Parameter Error when a context it reads
+/// or writes is not guest memory.
+fn context_written(written: bool) -> u32 {
+    if written {
+        TRB_CC_SUCCESS
+    } else {
+        TRB_CC_PARAMETER_ERROR
+    }
+}
+
+/// Failed commands logged: the guest chooses how often it makes them.
+const FAILURE_LOG_BURST: u32 = 4;
+const FAILURE_LOG_PERIOD: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// A Port Status Change Event TRB (xHCI 1.2 section 6.4.2.3): the Port
+/// ID is in dword 0 bits 31:24.
+fn port_status_change_trb(port_id: u8) -> RawTrb {
+    RawTrb {
+        dword0: u32::from(port_id) << 24,
+        dword1: 0,
+        dword2: TRB_CC_SUCCESS << 24,
+        dword3: TRB_TYPE_PORT_STATUS_CHANGE << TRB_TYPE_SHIFT,
+    }
+}
+
+/// Whether a transfer TRB that completed with `cc` gets a Transfer
+/// Event (xHCI 1.2 section 4.10.4): when it asked with IOC, when it
+/// asked for short packets with ISP and was short, and always on an
+/// error.
+fn transfer_event_due(dword3: u32, cc: u32) -> bool {
+    match cc {
+        TRB_CC_SUCCESS => dword3 & TRB_IOC != 0,
+        TRB_CC_SHORT_PACKET => dword3 & (TRB_IOC | TRB_ISP) != 0,
+        _ => true,
+    }
+}
+
+/// The Endpoint ID (DCI) a command TRB names, dword 3 bits 20:16.
+fn trb_ep_id(trb: &RawTrb) -> u8 {
+    ((trb.dword3 >> 16) & 0x1F) as u8
+}
 
 /// Replace the low dword of a 64-bit register.
 fn merge_low_dword(reg: u64, val: u32) -> u64 {
@@ -217,8 +261,10 @@ pub struct XhciController {
     intr_pin: Option<Arc<dyn IntrPin>>,
     /// Weak self-reference for MMIO handler closures.
     self_ref: Mutex<Option<Weak<Self>>>,
-    /// Structured logger for bus registration diagnostics.
+    /// Structured logger for bus registration and failed commands.
     log: slog::Logger,
+    /// Caps the failed commands logged.
+    failures: TokenBucket,
 }
 
 impl XhciController {
@@ -272,6 +318,7 @@ impl XhciController {
             intr_pin,
             self_ref: Mutex::new(None),
             log,
+            failures: TokenBucket::new(FAILURE_LOG_BURST, FAILURE_LOG_PERIOD),
         });
 
         // Store weak self-reference for MMIO closures
@@ -341,11 +388,16 @@ impl XhciController {
     // ---- Interrupt delivery ----------------------------------------------
 
     /// Assert the INTx interrupt to the guest.
+    ///
+    /// INTx is level-triggered, so the line stays up until the driver
+    /// clears USBSTS.EINT. A pulse is lost whenever it arrives while the
+    /// interrupt controller still waits for the previous EOI, and the
+    /// event it announced then goes unseen.
     fn assert_interrupt(&self, st: &mut XhciState) {
         st.usbsts |= USBSTS_EINT;
         st.iman |= IMAN_IP;
         if let Some(pin) = &self.intr_pin {
-            pin.pulse();
+            pin.assert();
         }
     }
 
@@ -380,8 +432,10 @@ impl XhciController {
 
         // Write TRB to guest memory
         let trb_bytes: [u8; TRB_SIZE] = unsafe { std::mem::transmute(trb) };
-        if let Some(sub) = self.physmap.lookup(gpa, TRB_SIZE) {
-            let _ = sub.write_bytes(&trb_bytes);
+        // The guest has no way to hear of this one, so the log does.
+        if !self.write_guest(gpa, &trb_bytes) && self.failures.take() {
+            slog::warn!(self.log, "xhci: the event ring is not guest memory";
+                "gpa" => format!("{gpa:#x}"));
         }
 
         // Advance enqueue pointer
@@ -405,6 +459,11 @@ impl XhciController {
         cc: u32,
         slot_id: u8,
     ) {
+        // A tablet the guest never sees then has a cause in the log.
+        if cc != TRB_CC_SUCCESS && self.failures.take() {
+            slog::warn!(self.log, "xhci: a command failed";
+                "completion_code" => cc, "slot" => slot_id);
+        }
         let event = RawTrb {
             dword0: cmd_trb_addr as u32,
             dword1: (cmd_trb_addr >> 32) as u32,
@@ -417,14 +476,7 @@ impl XhciController {
 
     /// Post a Port Status Change Event.
     fn post_port_status_change(&self, st: &mut XhciState, port_id: u8) {
-        let event = RawTrb {
-            dword0: 0,
-            dword1: 0,
-            dword2: TRB_CC_SUCCESS << 24,
-            dword3: (TRB_TYPE_PORT_STATUS_CHANGE << TRB_TYPE_SHIFT)
-                | (u32::from(port_id) << 24),
-        };
-        self.post_event(st, event);
+        self.post_event(st, port_status_change_trb(port_id));
     }
 
     /// Post a Transfer Event.
@@ -557,14 +609,16 @@ impl XhciController {
                             trb.slot_id(),
                         );
                     } else {
-                        // Read the input context to get EP0 transfer ring
                         let input_ctx_addr = trb.parameter() & !0xF;
-                        self.parse_input_context_for_ep0(st, input_ctx_addr);
-                        st.slot_state = SlotState::Addressed;
+                        let cc = self.address_device(
+                            st,
+                            trb.slot_id(),
+                            input_ctx_addr,
+                        );
                         self.post_cmd_completion(
                             st,
                             trb_addr,
-                            TRB_CC_SUCCESS,
+                            cc,
                             trb.slot_id(),
                         );
                     }
@@ -579,10 +633,39 @@ impl XhciController {
                             trb.slot_id(),
                         );
                     } else {
-                        // Parse input context for EP1 IN configuration
-                        let input_ctx_addr = trb.parameter() & !0xF;
-                        self.parse_input_context_for_ep1(st, input_ctx_addr);
-                        st.slot_state = SlotState::Configured;
+                        let cc = self.configure_endpoint(st, &trb);
+                        self.post_cmd_completion(
+                            st,
+                            trb_addr,
+                            cc,
+                            trb.slot_id(),
+                        );
+                    }
+                }
+
+                TRB_TYPE_EVALUATE_CTX => {
+                    let input_ctx_addr = trb.parameter() & !0xF;
+                    let cc = context_written(self.evaluate_output_ctx(
+                        st,
+                        trb.slot_id(),
+                        input_ctx_addr,
+                    ));
+                    self.post_cmd_completion(st, trb_addr, cc, trb.slot_id());
+                }
+
+                TRB_TYPE_DISABLE_SLOT => {
+                    if st.slot_state == SlotState::Disabled {
+                        self.post_cmd_completion(
+                            st,
+                            trb_addr,
+                            TRB_CC_SLOT_NOT_ENABLED,
+                            trb.slot_id(),
+                        );
+                    } else {
+                        st.slot_state = SlotState::Disabled;
+                        st.ep0_ring = TransferRing::new();
+                        st.ep1_in_ring = TransferRing::new();
+                        st.ep1_in_has_trbs = false;
                         self.post_cmd_completion(
                             st,
                             trb_addr,
@@ -592,7 +675,7 @@ impl XhciController {
                     }
                 }
 
-                TRB_TYPE_EVALUATE_CTX | TRB_TYPE_NOOP_CMD => {
+                TRB_TYPE_NOOP_CMD => {
                     self.post_cmd_completion(
                         st,
                         trb_addr,
@@ -601,36 +684,22 @@ impl XhciController {
                     );
                 }
 
-                TRB_TYPE_RESET_EP => {
-                    self.post_cmd_completion(
+                // Nothing here ever halts an endpoint, so a reset or a
+                // stop only has to leave it Stopped until the next
+                // doorbell.
+                TRB_TYPE_RESET_EP | TRB_TYPE_STOP_EP => {
+                    let cc = context_written(self.set_ep_state(
                         st,
-                        trb_addr,
-                        TRB_CC_SUCCESS,
                         trb.slot_id(),
-                    );
+                        trb_ep_id(&trb),
+                        EP_STATE_STOPPED,
+                    ));
+                    self.post_cmd_completion(st, trb_addr, cc, trb.slot_id());
                 }
 
                 TRB_TYPE_SET_TR_DEQUEUE => {
-                    let ep_id = ((trb.dword3 >> 16) & 0x1F) as u8;
-                    let new_deq = trb.parameter() & !0xF;
-                    let new_ccs = (trb.parameter() & 1) != 0;
-                    match ep_id {
-                        1 => {
-                            st.ep0_ring.dequeue = new_deq;
-                            st.ep0_ring.ccs = new_ccs;
-                        }
-                        3 => {
-                            st.ep1_in_ring.dequeue = new_deq;
-                            st.ep1_in_ring.ccs = new_ccs;
-                        }
-                        _ => {}
-                    }
-                    self.post_cmd_completion(
-                        st,
-                        trb_addr,
-                        TRB_CC_SUCCESS,
-                        trb.slot_id(),
-                    );
+                    let cc = self.set_tr_dequeue(st, &trb);
+                    self.post_cmd_completion(st, trb_addr, cc, trb.slot_id());
                 }
 
                 _ => {
@@ -649,6 +718,340 @@ impl XhciController {
         }
     }
 
+    // ---- Output Device Context ---------------------------------------------
+    //
+    // The controller owns the output Device Context the DCBAA names for
+    // each slot (xHCI 1.2 section 4.6): the slot state and USB address,
+    // and every endpoint's state and dequeue pointer. Linux reads it back
+    // and will not queue a transfer to an endpoint it finds Disabled.
+
+    /// Slot `slot_id`'s output Device Context. The DCBAA and its entries
+    /// are guest-written, so an address that is not guest memory yields
+    /// `None` and the context is simply not written.
+    fn output_ctx(&self, st: &XhciState, slot_id: u8) -> Option<u64> {
+        let entry = st.dcbaap.checked_add(u64::from(slot_id) * 8)?;
+        let mut buf = [0u8; 8];
+        self.physmap.lookup(entry, 8)?.read_bytes(&mut buf).ok()?;
+        let addr = u64::from_le_bytes(buf) & !0x3F;
+        (addr != 0).then_some(addr)
+    }
+
+    /// Context `index` of the context array at `base`, 32 bytes each.
+    fn read_ctx(&self, base: u64, index: u64) -> Option<[u32; 8]> {
+        let gpa = base.checked_add(index * CTX_SIZE as u64)?;
+        let mut buf = [0u8; CTX_SIZE];
+        self.physmap
+            .lookup(gpa, CTX_SIZE)?
+            .read_bytes(&mut buf)
+            .ok()?;
+        let mut ctx = [0u32; 8];
+        for (i, d) in ctx.iter_mut().enumerate() {
+            *d = u32::from_le_bytes([
+                buf[i * 4],
+                buf[i * 4 + 1],
+                buf[i * 4 + 2],
+                buf[i * 4 + 3],
+            ]);
+        }
+        Some(ctx)
+    }
+
+    /// Copy what fits of `data` to the driver's buffer of `len` bytes at
+    /// `gpa`: the transfer's completion code and residual length.
+    fn transfer_in(&self, gpa: u64, data: &[u8], len: u32) -> (u32, u32) {
+        let copy_len = data.len().min(len as usize);
+        if !self.write_guest(gpa, &data[..copy_len]) {
+            (TRB_CC_DATA_BUFFER_ERROR, len)
+        } else if copy_len < len as usize {
+            (TRB_CC_SHORT_PACKET, len - copy_len as u32)
+        } else {
+            (TRB_CC_SUCCESS, 0)
+        }
+    }
+
+    /// Write `bytes` to the driver's buffer at `gpa`. False when that is
+    /// not guest memory; nothing to write always succeeds.
+    fn write_guest(&self, gpa: u64, bytes: &[u8]) -> bool {
+        bytes.is_empty()
+            || self
+                .physmap
+                .lookup(gpa, bytes.len())
+                .is_some_and(|sub| sub.write_bytes(bytes).is_ok())
+    }
+
+    /// Write context `index` of the context array at `base`. False when
+    /// that is not guest memory.
+    fn write_ctx(&self, base: u64, index: u64, ctx: &[u32; 8]) -> bool {
+        let Some(gpa) = base.checked_add(index * CTX_SIZE as u64) else {
+            return false;
+        };
+        let mut buf = [0u8; CTX_SIZE];
+        for (i, d) in ctx.iter().enumerate() {
+            buf[i * 4..][..4].copy_from_slice(&d.to_le_bytes());
+        }
+        self.physmap
+            .lookup(gpa, CTX_SIZE)
+            .is_some_and(|sub| sub.write_bytes(&buf).is_ok())
+    }
+
+    /// Change one context of slot `slot_id`'s output context in place.
+    /// Index 0 is the slot context; index n is DCI n.
+    fn update_output_ctx(
+        &self,
+        st: &XhciState,
+        slot_id: u8,
+        index: u64,
+        f: impl FnOnce(&mut [u32; 8]),
+    ) -> bool {
+        let Some(out) = self.output_ctx(st, slot_id) else {
+            return false;
+        };
+        let Some(mut ctx) = self.read_ctx(out, index) else {
+            return false;
+        };
+        f(&mut ctx);
+        self.write_ctx(out, index, &ctx)
+    }
+
+    /// Change endpoint context `dci` of slot `slot_id`'s output context.
+    /// False when it could not be written; a DCI that names no endpoint
+    /// has nothing to write.
+    fn update_ep_ctx(
+        &self,
+        st: &XhciState,
+        slot_id: u8,
+        dci: u8,
+        f: impl FnOnce(&mut [u32; 8]),
+    ) -> bool {
+        !(1..=31).contains(&dci)
+            || self.update_output_ctx(st, slot_id, u64::from(dci), f)
+    }
+
+    fn set_ep_state(
+        &self,
+        st: &XhciState,
+        slot_id: u8,
+        dci: u8,
+        state: u32,
+    ) -> bool {
+        self.update_ep_ctx(st, slot_id, dci, |ep| {
+            ep[0] = (ep[0] & !EP_STATE_MASK) | state;
+        })
+    }
+
+    fn set_ep_dequeue(
+        &self,
+        st: &XhciState,
+        slot_id: u8,
+        dci: u8,
+        deq: u64,
+    ) -> bool {
+        self.update_ep_ctx(st, slot_id, dci, |ep| {
+            ep[2] = deq as u32;
+            ep[3] = (deq >> 32) as u32;
+        })
+    }
+
+    /// Record where the controller is on DCI `dci`'s ring (1 = EP0,
+    /// 3 = EP1 IN) in the output context. Linux reads it to learn where
+    /// a stopped or halted endpoint stopped.
+    fn sync_ep_dequeue(&self, st: &XhciState, dci: u8) {
+        let ring = match dci {
+            1 => &st.ep0_ring,
+            3 => &st.ep1_in_ring,
+            _ => return,
+        };
+        let deq = ring.dequeue | u64::from(ring.ccs);
+        self.set_ep_dequeue(st, 1, dci, deq);
+    }
+
+    fn set_slot_state(&self, st: &XhciState, slot_id: u8, state: u32) -> bool {
+        self.update_output_ctx(st, slot_id, 0, |slot| {
+            slot[3] = (slot[3] & !(0x1F << SLOT_STATE_SHIFT))
+                | (state << SLOT_STATE_SHIFT);
+        })
+    }
+
+    /// Set TR Dequeue Pointer; its completion code. The ring moves only
+    /// once the output context records it.
+    fn set_tr_dequeue(&self, st: &mut XhciState, trb: &RawTrb) -> u32 {
+        let ep_id = trb_ep_id(trb);
+        let new_deq = trb.parameter() & !0xF;
+        let new_ccs = (trb.parameter() & 1) != 0;
+        if !self.set_ep_dequeue(
+            st,
+            trb.slot_id(),
+            ep_id,
+            trb.parameter() & !0xE,
+        ) {
+            return TRB_CC_PARAMETER_ERROR;
+        }
+        match ep_id {
+            1 => {
+                st.ep0_ring.dequeue = new_deq;
+                st.ep0_ring.ccs = new_ccs;
+            }
+            3 => {
+                st.ep1_in_ring.dequeue = new_deq;
+                st.ep1_in_ring.ccs = new_ccs;
+            }
+            _ => {}
+        }
+        TRB_CC_SUCCESS
+    }
+
+    /// Address Device on an enabled slot; its completion code.
+    fn address_device(
+        &self,
+        st: &mut XhciState,
+        slot_id: u8,
+        input_ctx_addr: u64,
+    ) -> u32 {
+        if !self.address_output_ctx(st, slot_id, input_ctx_addr) {
+            return TRB_CC_PARAMETER_ERROR;
+        }
+        // Read the input context to get EP0 transfer ring
+        self.parse_input_context_for_ep0(st, input_ctx_addr);
+        st.slot_state = SlotState::Addressed;
+        TRB_CC_SUCCESS
+    }
+
+    /// Configure Endpoint on an enabled slot; its completion code.
+    fn configure_endpoint(&self, st: &mut XhciState, trb: &RawTrb) -> u32 {
+        let input_ctx_addr = trb.parameter() & !0xF;
+        if (trb.dword3 & CONFIGURE_EP_DC) != 0 {
+            // Deconfigure: the input context pointer is ignored.
+            if !self.deconfigure_output_ctx(st, trb.slot_id()) {
+                return TRB_CC_PARAMETER_ERROR;
+            }
+            st.slot_state = SlotState::Addressed;
+            return TRB_CC_SUCCESS;
+        }
+        if !self.configure_output_ctx(st, trb.slot_id(), input_ctx_addr) {
+            return TRB_CC_PARAMETER_ERROR;
+        }
+        // Parse input context for EP1 IN configuration
+        self.parse_input_context_for_ep1(st, input_ctx_addr);
+        st.slot_state = SlotState::Configured;
+        TRB_CC_SUCCESS
+    }
+
+    /// Address Device: the input slot and EP0 contexts become the output
+    /// ones, with the slot Addressed at USB address `slot_id` and EP0
+    /// Running. False when either context is not guest memory.
+    fn address_output_ctx(
+        &self,
+        st: &XhciState,
+        slot_id: u8,
+        input: u64,
+    ) -> bool {
+        let Some(out) = self.output_ctx(st, slot_id) else {
+            return false;
+        };
+        let (Some(mut slot), Some(mut ep0)) =
+            (self.read_ctx(input, 1), self.read_ctx(input, 2))
+        else {
+            return false;
+        };
+        slot[3] =
+            (SLOT_STATE_ADDRESSED << SLOT_STATE_SHIFT) | u32::from(slot_id);
+        ep0[0] = (ep0[0] & !EP_STATE_MASK) | EP_STATE_RUNNING;
+        self.write_ctx(out, 0, &slot) && self.write_ctx(out, 1, &ep0)
+    }
+
+    /// Configure Endpoint: every endpoint the input control context drops
+    /// is Disabled, every one it adds is copied in and Running, and the
+    /// slot is Configured. False when a context it needs is not guest
+    /// memory; the endpoints before that one may have changed.
+    fn configure_output_ctx(
+        &self,
+        st: &XhciState,
+        slot_id: u8,
+        input: u64,
+    ) -> bool {
+        let Some(out) = self.output_ctx(st, slot_id) else {
+            return false;
+        };
+        let Some(icc) = self.read_ctx(input, 0) else {
+            return false;
+        };
+        let (drop, add) = (icc[0], icc[1]);
+        for dci in 2..=31u64 {
+            if add & (1 << dci) != 0 {
+                let Some(mut ep) = self.read_ctx(input, dci + 1) else {
+                    return false;
+                };
+                ep[0] = (ep[0] & !EP_STATE_MASK) | EP_STATE_RUNNING;
+                if !self.write_ctx(out, dci, &ep) {
+                    return false;
+                }
+            } else if drop & (1 << dci) != 0 {
+                self.set_ep_state(st, slot_id, dci as u8, EP_STATE_DISABLED);
+            }
+        }
+        let Some(mut slot) = self.read_ctx(out, 0) else {
+            return false;
+        };
+        if add & 1 != 0 {
+            // The driver's slot fields, the controller's state and
+            // address.
+            let Some(input_slot) = self.read_ctx(input, 1) else {
+                return false;
+            };
+            slot[..3].copy_from_slice(&input_slot[..3]);
+        }
+        slot[3] = (slot[3] & !(0x1F << SLOT_STATE_SHIFT))
+            | (SLOT_STATE_CONFIGURED << SLOT_STATE_SHIFT);
+        self.write_ctx(out, 0, &slot)
+    }
+
+    /// Configure Endpoint with DC: every endpoint but EP0 is Disabled and
+    /// the slot goes back to Addressed. False when the output context
+    /// could not be written.
+    fn deconfigure_output_ctx(&self, st: &XhciState, slot_id: u8) -> bool {
+        (2..=31u8)
+            .all(|dci| self.set_ep_state(st, slot_id, dci, EP_STATE_DISABLED))
+            && self.set_slot_state(st, slot_id, SLOT_STATE_ADDRESSED)
+    }
+
+    /// Evaluate Context: EP0's max packet size, and the slot's max exit
+    /// latency and interrupter target, when the input control context
+    /// names them.
+    /// False when a context it needs is not guest memory.
+    fn evaluate_output_ctx(
+        &self,
+        st: &XhciState,
+        slot_id: u8,
+        input: u64,
+    ) -> bool {
+        let Some(icc) = self.read_ctx(input, 0) else {
+            return false;
+        };
+        let add = icc[1];
+        if add & 1 != 0 {
+            let Some(input_slot) = self.read_ctx(input, 1) else {
+                return false;
+            };
+            let written = self.update_output_ctx(st, slot_id, 0, |slot| {
+                slot[1] = (slot[1] & !0xFFFF) | (input_slot[1] & 0xFFFF);
+                slot[2] = (slot[2] & !(0x3FF << 22))
+                    | (input_slot[2] & (0x3FF << 22));
+            });
+            if !written {
+                return false;
+            }
+        }
+        if add & (1 << 1) != 0 {
+            let Some(input_ep0) = self.read_ctx(input, 2) else {
+                return false;
+            };
+            return self.update_output_ctx(st, slot_id, 1, |ep0| {
+                ep0[1] = (ep0[1] & 0xFFFF) | (input_ep0[1] & 0xFFFF_0000);
+            });
+        }
+        true
+    }
+
     /// Parse the Input Context to extract the EP0 transfer ring dequeue pointer.
     fn parse_input_context_for_ep0(
         &self,
@@ -659,8 +1062,11 @@ impl XhciController {
         //   [0x00..0x1F] Input Control Context
         //   [0x20..0x3F] Slot Context
         //   [0x40..0x5F] EP0 Context (DCI 1)
-        let ep0_ctx_addr =
-            input_ctx_addr + INPUT_CTRL_CTX_SIZE as u64 + SLOT_CTX_SIZE as u64;
+        let Some(ep0_ctx_addr) = input_ctx_addr
+            .checked_add(INPUT_CTRL_CTX_SIZE as u64 + SLOT_CTX_SIZE as u64)
+        else {
+            return;
+        };
 
         // EP Context dword 2 (offset 0x08): TR Dequeue Pointer low
         // EP Context dword 3 (offset 0x0C): TR Dequeue Pointer high
@@ -691,9 +1097,11 @@ impl XhciController {
         // configure DCI 3 at offset: InputCtrl + Slot + EP0 + EP1OUT = 0x80
         // Actually: DCI = 2*EP + direction, EP1 IN = 2*1+1 = 3
         // Context index = DCI, so offset = InputCtrl + DCI * 32
-        let ep1_in_ctx_addr = input_ctx_addr
-            + INPUT_CTRL_CTX_SIZE as u64
-            + 3 * EP_CTX_SIZE as u64; // DCI 3
+        let Some(ep1_in_ctx_addr) = input_ctx_addr
+            .checked_add(INPUT_CTRL_CTX_SIZE as u64 + 3 * EP_CTX_SIZE as u64)
+        else {
+            return;
+        };
 
         let mut buf = [0u8; EP_CTX_SIZE];
         if let Some(sub) = self.physmap.lookup(ep1_in_ctx_addr, EP_CTX_SIZE) {
@@ -716,6 +1124,12 @@ impl XhciController {
     ///
     /// Handles SETUP/DATA/STATUS stage TRBs for USB control transfers.
     fn process_ep0_transfer_ring(&self, st: &mut XhciState) {
+        self.walk_ep0_transfer_ring(st);
+        self.sync_ep_dequeue(st, 1);
+    }
+
+    /// Walk EP0's ring from its dequeue pointer.
+    fn walk_ep0_transfer_ring(&self, st: &mut XhciState) {
         for _ in 0..32 {
             let trb_addr = st.ep0_ring.dequeue;
             let trb = match self.read_trb(trb_addr) {
@@ -755,15 +1169,18 @@ impl XhciController {
                         w_length,
                     );
 
-                    // Complete the SETUP stage
-                    self.post_transfer_event(
-                        st,
-                        trb_addr,
-                        TRB_CC_SUCCESS,
-                        8, // SETUP is always 8 bytes
-                        1, // slot 1
-                        1, // EP0 = DCI 1
-                    );
+                    // Complete the SETUP stage. All 8 bytes moved, so
+                    // the residual is 0.
+                    if transfer_event_due(trb.dword3, TRB_CC_SUCCESS) {
+                        self.post_transfer_event(
+                            st,
+                            trb_addr,
+                            TRB_CC_SUCCESS,
+                            0,
+                            1, // slot 1
+                            1, // EP0 = DCI 1
+                        );
+                    }
 
                     // Advance past SETUP
                     st.ep0_ring.dequeue += TRB_SIZE as u64;
@@ -821,20 +1238,11 @@ impl XhciController {
                     if dir_in {
                         // IN data stage: copy response data to guest buffer
                         if let Some(ref data) = response {
-                            let copy_len =
-                                data.len().min(trb_transfer_len as usize);
-                            if let Some(sub) =
-                                self.physmap.lookup(data_buf_addr, copy_len)
-                            {
-                                let _ = sub.write_bytes(&data[..copy_len]);
-                            }
-                            residual = trb_transfer_len
-                                .saturating_sub(copy_len as u32);
-                            cc = if copy_len < trb_transfer_len as usize {
-                                TRB_CC_SHORT_PACKET
-                            } else {
-                                TRB_CC_SUCCESS
-                            };
+                            (cc, residual) = self.transfer_in(
+                                data_buf_addr,
+                                data,
+                                trb_transfer_len,
+                            );
                         } else {
                             // STALL
                             cc = TRB_CC_STALL;
@@ -847,7 +1255,11 @@ impl XhciController {
                         residual = 0;
                     }
 
-                    self.post_transfer_event(st, trb_addr, cc, residual, 1, 1);
+                    if transfer_event_due(trb.dword3, cc) {
+                        self.post_transfer_event(
+                            st, trb_addr, cc, residual, 1, 1,
+                        );
+                    }
                     st.ep0_ring.dequeue += TRB_SIZE as u64;
                 }
 
@@ -857,7 +1269,9 @@ impl XhciController {
                     } else {
                         TRB_CC_STALL
                     };
-                    self.post_transfer_event(st, trb_addr, cc, 0, 1, 1);
+                    if transfer_event_due(trb.dword3, cc) {
+                        self.post_transfer_event(st, trb_addr, cc, 0, 1, 1);
+                    }
                     st.ep0_ring.dequeue += TRB_SIZE as u64;
                     return;
                 }
@@ -874,6 +1288,12 @@ impl XhciController {
     /// If the tablet has a pending report and the guest has queued TRBs,
     /// copy the report into the guest buffer and post a transfer event.
     fn process_ep1_in_transfer_ring(&self, st: &mut XhciState) {
+        self.walk_ep1_in_transfer_ring(st);
+        self.sync_ep_dequeue(st, 3);
+    }
+
+    /// Walk EP1 IN's ring from its dequeue pointer.
+    fn walk_ep1_in_transfer_ring(&self, st: &mut XhciState) {
         if st.slot_state != SlotState::Configured {
             return;
         }
@@ -915,24 +1335,18 @@ impl XhciController {
                     let data_buf_addr = trb.parameter();
                     let trb_transfer_len = trb.transfer_length();
                     let report = self.tablet.get_report();
-                    let copy_len = report.len().min(trb_transfer_len as usize);
-
-                    if let Some(sub) =
-                        self.physmap.lookup(data_buf_addr, copy_len)
-                    {
-                        let _ = sub.write_bytes(&report[..copy_len]);
-                    }
-
-                    let residual =
-                        trb_transfer_len.saturating_sub(copy_len as u32);
-                    let cc = if copy_len < trb_transfer_len as usize {
-                        TRB_CC_SHORT_PACKET
-                    } else {
-                        TRB_CC_SUCCESS
-                    };
+                    let (cc, residual) = self.transfer_in(
+                        data_buf_addr,
+                        &report,
+                        trb_transfer_len,
+                    );
 
                     // EP1 IN = DCI 3
-                    self.post_transfer_event(st, trb_addr, cc, residual, 1, 3);
+                    if transfer_event_due(trb.dword3, cc) {
+                        self.post_transfer_event(
+                            st, trb_addr, cc, residual, 1, 3,
+                        );
+                    }
                     st.ep1_in_ring.dequeue += TRB_SIZE as u64;
                     st.ep1_in_has_trbs = false;
                     return;
@@ -1083,6 +1497,10 @@ impl XhciController {
                         if (val & USBCMD_HCRST) != 0 {
                             st.usbcmd = 0;
                             st.usbsts = USBSTS_HCH;
+                            // EINT is gone, so the line it held goes too.
+                            if let Some(pin) = &self.intr_pin {
+                                pin.deassert();
+                            }
                             st.crcr = 0;
                             st.dcbaap = 0;
                             st.config = 0;
@@ -1225,6 +1643,15 @@ impl XhciController {
                     // Doorbell 1: Device slot 1
                     1 => {
                         let ep_target = val & 0xFF;
+                        if matches!(ep_target, 1 | 3) {
+                            // A doorbell restarts a stopped endpoint.
+                            self.set_ep_state(
+                                &st,
+                                1,
+                                ep_target as u8,
+                                EP_STATE_RUNNING,
+                            );
+                        }
                         match ep_target {
                             // DCI 1 = EP0 (control, bidirectional)
                             1 => {
@@ -1466,6 +1893,8 @@ impl Lifecycle for XhciController {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use vmm_core::common::{ReadOp, WriteOp};
 
@@ -1519,6 +1948,690 @@ mod tests {
         let mut buf = [0u8; 8];
         buf[..len].copy_from_slice(ro.buf());
         u64::from_le_bytes(buf)
+    }
+
+    // ---- Output Device Context -------------------------------------------
+
+    /// Guest memory for a driver that has set up its rings: ERST, event
+    /// ring, command ring, DCBAA (slot 1's output context at OUT_CTX)
+    /// and an input context at IN_CTX.
+    const ERST_GPA: u64 = 0x2000;
+    const EVENT_RING_GPA: u64 = 0x3000;
+    const CMD_RING_GPA: u64 = 0x4000;
+    const DCBAA_GPA: u64 = 0x5000;
+    const OUT_CTX: u64 = 0x6000;
+    const IN_CTX: u64 = 0x7000;
+
+    struct Driver {
+        ctrl: Arc<XhciController>,
+        commands: u64,
+        /// Events the controller has posted so far.
+        events: u64,
+    }
+
+    impl Driver {
+        fn new() -> Self {
+            Self::with_ctrl(test_controller_with_ram())
+        }
+
+        fn with_ctrl(ctrl: Arc<XhciController>) -> Self {
+            write_erst_entry(&ctrl, ERST_GPA, EVENT_RING_GPA, 16);
+            write_reg(&ctrl, ERSTSZ_OFF, &1u32.to_le_bytes());
+            write_reg(&ctrl, ERSTBA_OFF, &ERST_GPA.to_le_bytes());
+            write_reg(
+                &ctrl,
+                OP_BASE + OP_CRCR,
+                &(CMD_RING_GPA | 1).to_le_bytes(),
+            );
+            write_reg(&ctrl, OP_BASE + OP_DCBAAP, &DCBAA_GPA.to_le_bytes());
+            write_ram(&ctrl, DCBAA_GPA + 8, &OUT_CTX.to_le_bytes());
+            Self {
+                ctrl,
+                commands: 0,
+                events: 0,
+            }
+        }
+
+        /// Post one command, ring doorbell 0 and return its completion
+        /// code.
+        fn command(
+            &mut self,
+            trb_type: u32,
+            parameter: u64,
+            dword3: u32,
+        ) -> u32 {
+            let trb = RawTrb {
+                dword0: parameter as u32,
+                dword1: (parameter >> 32) as u32,
+                dword2: 0,
+                dword3: (trb_type << TRB_TYPE_SHIFT) | dword3 | TRB_CYCLE,
+            };
+            let at = CMD_RING_GPA + self.commands * TRB_SIZE as u64;
+            write_ram(&self.ctrl, at, &trb_bytes(&trb));
+            write_reg(&self.ctrl, DBOFF as usize, &0u32.to_le_bytes());
+            let event = self
+                .read_dwords(EVENT_RING_GPA + self.events * TRB_SIZE as u64, 4);
+            self.commands += 1;
+            self.events += 1;
+            assert_eq!(
+                (event[3] >> TRB_TYPE_SHIFT) & 0x3F,
+                TRB_TYPE_CMD_COMPLETION,
+                "command {trb_type} got no completion"
+            );
+            event[2] >> 24
+        }
+
+        fn read_dwords(&self, gpa: u64, n: usize) -> Vec<u32> {
+            let mut buf = vec![0u8; n * 4];
+            self.ctrl
+                .physmap
+                .lookup(gpa, buf.len())
+                .expect("guest memory")
+                .read_bytes(&mut buf)
+                .expect("read guest memory");
+            buf.chunks(4)
+                .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
+                .collect()
+        }
+
+        /// Output context `index`: 0 is the slot, n is DCI n.
+        fn out(&self, index: u64) -> Vec<u32> {
+            self.read_dwords(OUT_CTX + index * 32, 8)
+        }
+
+        /// Input context `index`: 0 is input control, 1 the slot,
+        /// n + 1 is DCI n.
+        fn set_in(&self, index: u64, dwords: [u32; 8]) {
+            let bytes: Vec<u8> =
+                dwords.iter().flat_map(|d| d.to_le_bytes()).collect();
+            write_ram(&self.ctrl, IN_CTX + index * 32, &bytes);
+        }
+
+        fn slot1(&self) -> u32 {
+            1 << 24
+        }
+
+        /// Enable slot 1 and ask to address it with a control EP0 whose
+        /// ring is at 0x8000; the Address Device completion code.
+        fn address(&mut self) -> u32 {
+            assert_eq!(
+                self.command(TRB_TYPE_ENABLE_SLOT, 0, 0),
+                TRB_CC_SUCCESS
+            );
+            self.set_in(0, [0, 0b11, 0, 0, 0, 0, 0, 0]);
+            // Slot: one context entry, SuperSpeed.
+            self.set_in(1, [(1 << 27) | (4 << 20), 0, 0, 0, 0, 0, 0, 0]);
+            // EP0: control, max packet 512, dequeue 0x8000 with DCS 1.
+            self.set_in(2, [0, (4 << 3) | (512 << 16), 0x8001, 0, 8, 0, 0, 0]);
+            let slot = self.slot1();
+            self.command(TRB_TYPE_ADDRESS_DEVICE, IN_CTX, slot)
+        }
+
+        /// The slot's state as the controller holds it.
+        fn controller_slot_state(&self) -> SlotState {
+            self.ctrl.state.lock().expect("xhci: state lock").slot_state
+        }
+
+        /// Enable slot 1 and address it with a control EP0 whose ring
+        /// is at 0x8000.
+        fn addressed(&mut self) {
+            assert_eq!(self.address(), TRB_CC_SUCCESS);
+        }
+
+        /// Configure EP1 IN (DCI 3), interrupt, ring at 0x9000.
+        fn configured(&mut self) {
+            self.addressed();
+            self.set_in(0, [0, (1 << 0) | (1 << 3), 0, 0, 0, 0, 0, 0]);
+            self.set_in(1, [(3 << 27) | (4 << 20), 0, 0, 0, 0, 0, 0, 0]);
+            self.set_in(4, [0, (7 << 3) | (8 << 16), 0x9001, 0, 8, 0, 0, 0]);
+            let slot = self.slot1();
+            assert_eq!(
+                self.command(TRB_TYPE_CONFIGURE_EP, IN_CTX, slot),
+                TRB_CC_SUCCESS
+            );
+        }
+    }
+
+    fn trb_bytes(trb: &RawTrb) -> [u8; TRB_SIZE] {
+        let mut b = [0u8; TRB_SIZE];
+        for (i, d) in [trb.dword0, trb.dword1, trb.dword2, trb.dword3]
+            .iter()
+            .enumerate()
+        {
+            b[i * 4..][..4].copy_from_slice(&d.to_le_bytes());
+        }
+        b
+    }
+
+    fn slot_state(slot: &[u32]) -> u32 {
+        slot[3] >> 27
+    }
+
+    fn ep_state(ep: &[u32]) -> u32 {
+        ep[0] & 0x7
+    }
+
+    /// Linux reads the output context the controller writes: an EP0 it
+    /// finds Disabled gets "WARN urb submitted to disabled ep" and the
+    /// tablet never enumerates.
+    /// An input context pointer at the top of the address space is the
+    /// guest's to choose; adding the context offsets must not overflow.
+    #[test]
+    fn an_input_context_at_the_top_of_memory_is_survived() {
+        let mut d = Driver::new();
+        assert_eq!(d.command(TRB_TYPE_ENABLE_SLOT, 0, 0), TRB_CC_SUCCESS);
+        let top = 0xFFFF_FFFF_FFFF_FFF0;
+        let slot = d.slot1();
+        assert_eq!(
+            d.command(TRB_TYPE_ADDRESS_DEVICE, top, slot),
+            TRB_CC_PARAMETER_ERROR
+        );
+        assert_eq!(
+            d.command(TRB_TYPE_CONFIGURE_EP, top, slot),
+            TRB_CC_PARAMETER_ERROR
+        );
+        assert_eq!(d.controller_slot_state(), SlotState::Enabled);
+    }
+
+    #[test]
+    fn address_device_fills_the_output_context() {
+        let mut d = Driver::new();
+        d.addressed();
+
+        let slot = d.out(0);
+        assert_eq!(slot_state(&slot), SLOT_STATE_ADDRESSED);
+        assert_eq!(slot[3] & 0xFF, 1, "USB device address");
+        assert_eq!(slot[0], (1 << 27) | (4 << 20), "copied from input");
+
+        let ep0 = d.out(1);
+        assert_eq!(ep_state(&ep0), EP_STATE_RUNNING);
+        assert_eq!(ep0[1], (4 << 3) | (512 << 16));
+        assert_eq!(ep0[2], 0x8001);
+    }
+
+    #[test]
+    fn configure_endpoint_runs_the_added_endpoint() {
+        let mut d = Driver::new();
+        d.configured();
+
+        let slot = d.out(0);
+        assert_eq!(slot_state(&slot), SLOT_STATE_CONFIGURED);
+        assert_eq!(slot[0] >> 27, 3, "context entries from input");
+        assert_eq!(slot[3] & 0xFF, 1, "the address survives");
+        let ep = d.out(3);
+        assert_eq!(ep_state(&ep), EP_STATE_RUNNING);
+        assert_eq!(ep[1], (7 << 3) | (8 << 16));
+        assert_eq!(ep[2], 0x9001);
+    }
+
+    #[test]
+    fn deconfigure_returns_the_slot_to_addressed() {
+        let mut d = Driver::new();
+        d.configured();
+        // Configure Endpoint with DC (dword 3 bit 9).
+        let dword3 = d.slot1() | (1 << 9);
+        assert_eq!(d.command(TRB_TYPE_CONFIGURE_EP, 0, dword3), TRB_CC_SUCCESS);
+        assert_eq!(slot_state(&d.out(0)), SLOT_STATE_ADDRESSED);
+        assert_eq!(ep_state(&d.out(3)), EP_STATE_DISABLED);
+        assert_eq!(ep_state(&d.out(1)), EP_STATE_RUNNING, "EP0 stays");
+    }
+
+    /// Linux stops an endpoint to cancel a transfer. An unknown-command
+    /// error there leaves it unable to cancel anything.
+    #[test]
+    fn stop_endpoint_stops_it_and_a_doorbell_runs_it_again() {
+        let mut d = Driver::new();
+        d.configured();
+        let dword3 = d.slot1() | (3 << 16);
+        assert_eq!(d.command(TRB_TYPE_STOP_EP, 0, dword3), TRB_CC_SUCCESS);
+        assert_eq!(ep_state(&d.out(3)), EP_STATE_STOPPED);
+
+        // Ring slot 1's doorbell for DCI 3.
+        write_reg(&d.ctrl, DBOFF as usize + DB_REG_SIZE, &3u32.to_le_bytes());
+        assert_eq!(ep_state(&d.out(3)), EP_STATE_RUNNING);
+    }
+
+    /// Linux checks the dequeue pointer in the output context against
+    /// the one it asked for.
+    #[test]
+    fn set_tr_dequeue_records_the_pointer() {
+        let mut d = Driver::new();
+        d.configured();
+        let dword3 = d.slot1() | (3 << 16);
+        assert_eq!(d.command(TRB_TYPE_STOP_EP, 0, dword3), TRB_CC_SUCCESS);
+        assert_eq!(
+            d.command(TRB_TYPE_SET_TR_DEQUEUE, 0xA000 | 1, dword3),
+            TRB_CC_SUCCESS
+        );
+        let ep = d.out(3);
+        assert_eq!(ep[2], 0xA001);
+        assert_eq!(ep[3], 0);
+        assert_eq!(ep_state(&ep), EP_STATE_STOPPED);
+    }
+
+    #[test]
+    fn reset_endpoint_leaves_it_stopped() {
+        let mut d = Driver::new();
+        d.configured();
+        let dword3 = d.slot1() | (3 << 16);
+        assert_eq!(d.command(TRB_TYPE_RESET_EP, 0, dword3), TRB_CC_SUCCESS);
+        assert_eq!(ep_state(&d.out(3)), EP_STATE_STOPPED);
+    }
+
+    #[test]
+    fn evaluate_context_updates_ep0_max_packet_size() {
+        let mut d = Driver::new();
+        d.addressed();
+        d.set_in(0, [0, 1 << 1, 0, 0, 0, 0, 0, 0]);
+        d.set_in(2, [0, (4 << 3) | (64 << 16), 0, 0, 0, 0, 0, 0]);
+        let slot = d.slot1();
+        assert_eq!(
+            d.command(TRB_TYPE_EVALUATE_CTX, IN_CTX, slot),
+            TRB_CC_SUCCESS
+        );
+        let ep0 = d.out(1);
+        assert_eq!(ep0[1] >> 16, 64);
+        assert_eq!(ep0[2], 0x8001, "only the max packet size changes");
+        assert_eq!(ep_state(&ep0), EP_STATE_RUNNING);
+    }
+
+    /// Point slot 1's DCBAA entry outside guest memory.
+    fn lose_the_output_context(d: &Driver) {
+        write_ram(
+            &d.ctrl,
+            DCBAA_GPA + 8,
+            &0xFFFF_FFFF_FFFF_F000u64.to_le_bytes(),
+        );
+    }
+
+    /// A command whose output context the controller cannot write does
+    /// not report success: the driver would read back a context that
+    /// disagrees with what it was told.
+    #[test]
+    fn endpoint_commands_on_a_lost_output_context_fail() {
+        let mut d = Driver::new();
+        d.configured();
+        lose_the_output_context(&d);
+        let slot = d.slot1();
+        let dword3 = slot | (3 << 16);
+        d.set_in(0, [0, 1 << 1, 0, 0, 0, 0, 0, 0]);
+        d.set_in(2, [0, (4 << 3) | (64 << 16), 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            d.command(TRB_TYPE_EVALUATE_CTX, IN_CTX, slot),
+            TRB_CC_PARAMETER_ERROR
+        );
+        assert_eq!(
+            d.command(TRB_TYPE_STOP_EP, 0, dword3),
+            TRB_CC_PARAMETER_ERROR
+        );
+        assert_eq!(
+            d.command(TRB_TYPE_RESET_EP, 0, dword3),
+            TRB_CC_PARAMETER_ERROR
+        );
+        let ep1_dequeue = |d: &Driver| {
+            d.ctrl
+                .state
+                .lock()
+                .expect("xhci: state lock")
+                .ep1_in_ring
+                .dequeue
+        };
+        let before = ep1_dequeue(&d);
+        assert_eq!(
+            d.command(TRB_TYPE_SET_TR_DEQUEUE, 0xA000 | 1, dword3),
+            TRB_CC_PARAMETER_ERROR
+        );
+        let after = ep1_dequeue(&d);
+        assert_eq!(after, before, "the ring stays where the context says");
+        assert_eq!(
+            d.command(TRB_TYPE_CONFIGURE_EP, 0, slot | CONFIGURE_EP_DC),
+            TRB_CC_PARAMETER_ERROR,
+            "a deconfigure"
+        );
+        assert_eq!(d.controller_slot_state(), SlotState::Configured);
+    }
+
+    /// Counts warnings.
+    struct Warnings(Arc<AtomicUsize>);
+
+    impl slog::Drain for Warnings {
+        type Ok = ();
+        type Err = slog::Never;
+
+        fn log(
+            &self,
+            record: &slog::Record<'_>,
+            _values: &slog::OwnedKVList,
+        ) -> Result<(), slog::Never> {
+            if record.level() == slog::Level::Warning {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    /// A failed command reaches the log, so a tablet that never appears
+    /// has a cause there; a guest repeating it cannot fill the log.
+    #[test]
+    fn a_failed_command_is_logged_but_not_without_limit() {
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let log =
+            slog::Logger::root(Warnings(Arc::clone(&warnings)), slog::o!());
+        let physmap = PhysMap::new_anon(0, RAM_LEN).expect("guest memory");
+        let ctrl = XhciController::new_with_logger(
+            Arc::new(physmap),
+            Arc::new(MmioBus::new()),
+            None,
+            log,
+        );
+        let mut d = Driver::with_ctrl(ctrl);
+        d.configured();
+        lose_the_output_context(&d);
+        let dword3 = d.slot1() | (3 << 16);
+        assert_eq!(
+            d.command(TRB_TYPE_STOP_EP, 0, dword3),
+            TRB_CC_PARAMETER_ERROR
+        );
+        assert_eq!(warnings.load(Ordering::Relaxed), 1);
+        // The test's event ring holds 16, and nothing here wraps it.
+        for _ in 0..8 {
+            d.command(TRB_TYPE_STOP_EP, 0, dword3);
+        }
+        let logged = warnings.load(Ordering::Relaxed);
+        assert!(
+            (1..=FAILURE_LOG_BURST as usize).contains(&logged),
+            "{logged}"
+        );
+    }
+
+    /// The DCBAA entry is guest-written and may point anywhere.
+    #[test]
+    fn an_output_context_outside_guest_memory_is_not_written() {
+        let mut d = Driver::new();
+        write_ram(
+            &d.ctrl,
+            DCBAA_GPA + 8,
+            &0xFFFF_FFFF_FFFF_F000u64.to_le_bytes(),
+        );
+        assert_eq!(
+            d.address(),
+            TRB_CC_PARAMETER_ERROR,
+            "a context the controller cannot write is not a success"
+        );
+        assert_eq!(slot_state(&d.out(0)), 0, "the real OUT_CTX is untouched");
+        assert_eq!(d.controller_slot_state(), SlotState::Enabled);
+
+        d.set_in(0, [0, 0b1001, 0, 0, 0, 0, 0, 0]);
+        let slot = d.slot1();
+        assert_eq!(
+            d.command(TRB_TYPE_CONFIGURE_EP, IN_CTX, slot),
+            TRB_CC_PARAMETER_ERROR
+        );
+        assert_eq!(d.controller_slot_state(), SlotState::Enabled);
+    }
+
+    /// An INTx line that remembers its level.
+    #[derive(Default)]
+    pub(super) struct LevelPin(std::sync::atomic::AtomicBool);
+
+    impl IntrPin for LevelPin {
+        fn assert(&self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+
+        fn deassert(&self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+
+        fn is_asserted(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// PCI INTx is level-triggered. A pulse that arrives while the
+    /// interrupt controller still waits for the previous EOI is lost, and
+    /// with it the only event of a control transfer: Linux timed out
+    /// reading the tablet's descriptor ("error -110"). The line has to
+    /// stay up until the driver clears USBSTS.EINT.
+    #[test]
+    fn an_event_holds_intx_until_the_driver_clears_eint() {
+        let pin = Arc::new(LevelPin::default());
+        let physmap =
+            PhysMap::new_anon(0, RAM_LEN).expect("anonymous guest memory");
+        let ctrl = XhciController::new(
+            Arc::new(physmap),
+            Arc::new(MmioBus::new()),
+            Some(pin.clone() as Arc<dyn IntrPin>),
+        );
+        let mut d = Driver::with_ctrl(ctrl);
+        write_reg(
+            &d.ctrl,
+            RTSOFF as usize + IR0_BASE + IR_IMAN,
+            &IMAN_IE.to_le_bytes(),
+        );
+        write_reg(
+            &d.ctrl,
+            OP_BASE + OP_USBCMD,
+            &(USBCMD_RS | USBCMD_INTE).to_le_bytes(),
+        );
+        // Starting the controller posts the tablet's port event.
+        d.events += 1;
+        assert!(pin.is_asserted(), "an event raises the line");
+        write_reg(&d.ctrl, OP_BASE + OP_USBSTS, &USBSTS_EINT.to_le_bytes());
+        assert!(!pin.is_asserted(), "clearing EINT lowers it");
+
+        assert_eq!(d.command(TRB_TYPE_NOOP_CMD, 0, 0), TRB_CC_SUCCESS);
+        assert!(pin.is_asserted(), "and the next event raises it again");
+    }
+
+    /// A reset clears EINT, so it has to lower the line with it: a line
+    /// left high with no event behind it is an interrupt storm the
+    /// guest cannot acknowledge.
+    #[test]
+    fn host_controller_reset_lowers_intx() {
+        let pin = Arc::new(LevelPin::default());
+        let physmap =
+            PhysMap::new_anon(0, RAM_LEN).expect("anonymous guest memory");
+        let ctrl = XhciController::new(
+            Arc::new(physmap),
+            Arc::new(MmioBus::new()),
+            Some(pin.clone() as Arc<dyn IntrPin>),
+        );
+        let d = Driver::with_ctrl(ctrl);
+        write_reg(
+            &d.ctrl,
+            RTSOFF as usize + IR0_BASE + IR_IMAN,
+            &IMAN_IE.to_le_bytes(),
+        );
+        write_reg(
+            &d.ctrl,
+            OP_BASE + OP_USBCMD,
+            &(USBCMD_RS | USBCMD_INTE).to_le_bytes(),
+        );
+        assert!(pin.is_asserted());
+
+        write_reg(&d.ctrl, OP_BASE + OP_USBCMD, &USBCMD_HCRST.to_le_bytes());
+        assert!(!pin.is_asserted());
+        assert_eq!(
+            read_reg(&d.ctrl, OP_BASE + OP_USBSTS, 4) as u32 & USBSTS_EINT,
+            0
+        );
+    }
+
+    /// Linux disables the slot after a failed enumeration and asks for
+    /// a new one. Without Disable Slot the retry got "No Slots
+    /// Available".
+    #[test]
+    fn disable_slot_frees_the_slot_for_enable_slot() {
+        let mut d = Driver::new();
+        d.addressed();
+        let slot = d.slot1();
+        assert_eq!(d.command(TRB_TYPE_DISABLE_SLOT, 0, slot), TRB_CC_SUCCESS);
+        assert_eq!(d.command(TRB_TYPE_ENABLE_SLOT, 0, 0), TRB_CC_SUCCESS);
+    }
+
+    const EP0_RING: u64 = 0x8000;
+    const DATA_BUF: u64 = 0xA000;
+
+    /// Queue a GET_DESCRIPTOR(device) control transfer asking for
+    /// `w_length` bytes, laid out as Linux does: Setup without IOC, an
+    /// IN Data stage with ISP, a Status stage with IOC. Ring EP0.
+    fn get_device_descriptor(d: &Driver, w_length: u16) {
+        get_device_descriptor_into(d, w_length, DATA_BUF);
+    }
+
+    /// As `get_device_descriptor`, into the buffer at `buf`.
+    fn get_device_descriptor_into(d: &Driver, w_length: u16, buf: u64) {
+        let setup = RawTrb {
+            dword0: 0x80 | (6 << 8) | (0x0100 << 16),
+            dword1: u32::from(w_length) << 16,
+            dword2: 8,
+            dword3: (TRB_TYPE_SETUP_STAGE << TRB_TYPE_SHIFT)
+                | TRB_SETUP_IDT
+                | (3 << 16)
+                | TRB_CYCLE,
+        };
+        let data = RawTrb {
+            dword0: buf as u32,
+            dword1: (buf >> 32) as u32,
+            dword2: u32::from(w_length),
+            dword3: (TRB_TYPE_DATA_STAGE << TRB_TYPE_SHIFT)
+                | TRB_DATA_DIR_IN
+                | TRB_ISP
+                | TRB_CYCLE,
+        };
+        let status = RawTrb {
+            dword0: 0,
+            dword1: 0,
+            dword2: 0,
+            dword3: (TRB_TYPE_STATUS_STAGE << TRB_TYPE_SHIFT)
+                | TRB_IOC
+                | TRB_CYCLE,
+        };
+        for (i, trb) in [setup, data, status].iter().enumerate() {
+            write_ram(
+                &d.ctrl,
+                EP0_RING + (i * TRB_SIZE) as u64,
+                &trb_bytes(trb),
+            );
+        }
+        write_reg(&d.ctrl, DBOFF as usize + DB_REG_SIZE, &1u32.to_le_bytes());
+    }
+
+    /// Transfer events after the command completions, as (TRB pointer,
+    /// completion code, transfer length), up to the first empty slot.
+    fn transfer_events(d: &Driver) -> Vec<(u64, u32, u32)> {
+        let mut events = Vec::new();
+        for i in d.events..16 {
+            let e = d.read_dwords(EVENT_RING_GPA + i * TRB_SIZE as u64, 4);
+            if e[3] & TRB_CYCLE == 0 {
+                break;
+            }
+            assert_eq!(
+                (e[3] >> TRB_TYPE_SHIFT) & 0x3F,
+                TRB_TYPE_TRANSFER_EVENT
+            );
+            events.push((
+                u64::from(e[0]) | (u64::from(e[1]) << 32),
+                e[2] >> 24,
+                e[2] & 0xFF_FFFF,
+            ));
+        }
+        events
+    }
+
+    /// A descriptor the controller cannot write into the driver's buffer
+    /// is not reported as sent: the driver would parse what was there.
+    #[test]
+    fn a_data_stage_into_lost_memory_is_a_data_buffer_error() {
+        let mut d = Driver::new();
+        d.addressed();
+        get_device_descriptor_into(&d, 18, 0xFFFF_FFFF_FFFF_0000);
+        let events = transfer_events(&d);
+        assert!(
+            events.contains(&(
+                EP0_RING + TRB_SIZE as u64,
+                TRB_CC_DATA_BUFFER_ERROR,
+                18
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// The same for a tablet report.
+    #[test]
+    fn a_report_into_lost_memory_is_a_data_buffer_error() {
+        const EP1_RING: u64 = 0x9000;
+        let mut d = Driver::new();
+        d.configured();
+        let normal = RawTrb {
+            dword0: 0xFFFF_0000,
+            dword1: 0xFFFF_FFFF,
+            dword2: 6,
+            dword3: (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC | TRB_CYCLE,
+        };
+        write_ram(&d.ctrl, EP1_RING, &trb_bytes(&normal));
+        {
+            let mut st = d.ctrl.state.lock().expect("xhci: state lock");
+            st.ep1_in_ring = TransferRing {
+                base: EP1_RING,
+                dequeue: EP1_RING,
+                ccs: true,
+            };
+            st.ep1_in_has_trbs = true;
+        }
+        d.ctrl.tablet().pointer_event(0b001, 0x1234, 0x0567);
+        d.ctrl.notify_pointer_event();
+        let events = transfer_events(&d);
+        assert_eq!(events, [(EP1_RING, TRB_CC_DATA_BUFFER_ERROR, 6)]);
+    }
+
+    /// xHCI 1.2 section 4.10.4: a Transfer Event is posted for a TRB
+    /// with IOC, for a short packet on a TRB with ISP, or on an error.
+    /// An event for the Setup stage made Linux warn "Success on ctrl
+    /// setup TRB without IOC set?".
+    #[test]
+    fn a_control_transfer_posts_one_event_for_its_status_stage() {
+        let mut d = Driver::new();
+        d.addressed();
+        get_device_descriptor(&d, 18);
+
+        assert_eq!(
+            transfer_events(&d),
+            [(EP0_RING + 2 * TRB_SIZE as u64, TRB_CC_SUCCESS, 0)]
+        );
+        let desc = d.read_dwords(DATA_BUF, 1);
+        assert_eq!(desc[0] & 0xFF, 18, "bLength");
+    }
+
+    /// Linux reads the TR Dequeue Pointer in the output context to find
+    /// where the controller stopped, and moves past a stalled transfer
+    /// from there. Left at the ring start it walked a whole lap and sent
+    /// Set TR Dequeue to the start with DCS 0, where nothing was queued,
+    /// and the next request timed out.
+    #[test]
+    fn the_output_context_follows_the_ep0_dequeue_pointer() {
+        let mut d = Driver::new();
+        d.addressed();
+        get_device_descriptor(&d, 18);
+        let ep0 = d.out(1);
+        assert_eq!(ep0[2], (EP0_RING + 3 * TRB_SIZE as u64) as u32 | 1);
+        assert_eq!(ep0[3], 0);
+    }
+
+    #[test]
+    fn a_short_data_stage_with_isp_posts_its_own_event() {
+        let mut d = Driver::new();
+        d.addressed();
+        get_device_descriptor(&d, 64);
+
+        assert_eq!(
+            transfer_events(&d),
+            [
+                (EP0_RING + TRB_SIZE as u64, TRB_CC_SHORT_PACKET, 64 - 18),
+                (EP0_RING + 2 * TRB_SIZE as u64, TRB_CC_SUCCESS, 0),
+            ]
+        );
     }
 
     const ERSTBA_OFF: usize = RTSOFF as usize + IR0_BASE + IR_ERSTBA;
@@ -1621,6 +2734,19 @@ mod tests {
         let mut st = test_state();
         assert_eq!(st.enable_slot(), (TRB_CC_SUCCESS, 1));
         assert_eq!(st.enable_slot(), (TRB_CC_NO_SLOTS_AVAILABLE, 0));
+    }
+
+    /// xHCI 1.2 section 6.4.2.3: the Port ID is dword 0 bits 31:24. In
+    /// dword 3 it lands in reserved bits and Linux reads port 0, logs
+    /// "Port change event with invalid port ID 0" and drops the event.
+    #[test]
+    fn port_status_change_event_carries_the_port_id_in_dword0() {
+        let trb = port_status_change_trb(2);
+        assert_eq!(trb.dword0 >> 24, 2);
+        assert_eq!(trb.dword0 & 0x00FF_FFFF, 0);
+        assert_eq!(trb.dword2 >> 24, TRB_CC_SUCCESS);
+        assert_eq!(trb.trb_type(), TRB_TYPE_PORT_STATUS_CHANGE);
+        assert_eq!(trb.dword3 >> 16, 0, "dword 3 bits 31:16 are reserved");
     }
 
     #[test]
