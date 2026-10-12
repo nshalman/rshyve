@@ -1359,8 +1359,8 @@ impl XhciController {
         }
     }
 
-    /// Called when the VNC server has new pointer data and the device
-    /// should attempt to deliver it if TRBs are available.
+    /// Called when a remote display server has new pointer data and the
+    /// device should attempt to deliver it if TRBs are available.
     ///
     /// This is typically called after `tablet().pointer_event()`.
     pub fn notify_pointer_event(&self) {

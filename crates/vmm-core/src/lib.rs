@@ -19,6 +19,7 @@ pub mod cpuid;
 pub mod exits;
 pub mod hdl;
 pub mod intr_pins;
+pub mod listen;
 pub mod machine;
 pub mod mem;
 pub mod mmio;

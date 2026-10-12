@@ -144,10 +144,11 @@ for job in test msrv cross; do
     # Crates this one job may leave out, with the reason recorded at
     # the job itself. Everything else must be named.
     case "$job" in
-        # vmm_migrate pulls zstd-sys, which needs an illumos cross-cc
-        # the runner does not have. The host clippy and test jobs cover
-        # it, and its illumos paths are covered on the build host.
-        cross) allowed="vmm_migrate" ;;
+        # vmm_migrate pulls zstd-sys, and vmm_rdp zstd-sys and
+        # aws-lc-sys, which need an illumos cross-cc the runner does not
+        # have. The host clippy and test jobs cover them, and their
+        # illumos builds are covered on the build host.
+        cross) allowed="vmm_migrate vmm_rdp" ;;
         *) allowed="" ;;
     esac
     # The command is a folded YAML scalar: the marker line, then the

@@ -12,6 +12,7 @@ members = [
     "crates/vmm-virtio",
     "crates/vmm-storage",
     "crates/vmm-hid",
+    "crates/vmm-rdp",
     "crates/vmm-passthru",
     "crates/vmm-metrics",
     "crates/vmm-devices-testsupport",
@@ -82,6 +83,7 @@ dladm = { path = "crates/dladm" }
 vmm_api_common = { path = "crates/vmm-api-common" }
 vmm_core = { path = "crates/vmm-core" }
 vmm_devices = { path = "crates/vmm-devices" }
+vmm_rdp = { path = "crates/vmm-rdp" }
 vmm_virtio = { path = "crates/vmm-virtio" }
 vmm_storage = { path = "crates/vmm-storage" }
 vmm_hid = { path = "crates/vmm-hid" }
@@ -126,10 +128,31 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.21"
 toml = "0.8"
 uuid = { version = "1.3", features = ["v4"] }
+des = "0.8"
 # zlib for the VNC server's ZRLE encoding. The default backend is
 # miniz_oxide, pure Rust, so no C library joins the build.
 flate2 = "1"
-des = "0.8"
+# RDP server for remote displays. `helper` loads the TLS certificate and
+# key; async-trait and bytes appear in its handler traits.
+# `nscodec` is the only codec the macOS Windows App client offers.
+ironrdp-server = { version = "0.13", features = ["helper", "nscodec", "egfx"] }
+# The codec capability types the server advertises.
+ironrdp-pdu = "0.9"
+# The RemoteFX Progressive tile encoder and its decoder, for EGFX.
+ironrdp-graphics = "0.9"
+# EGFX: its pipeline server, and the DVC and SVC framing its output needs.
+ironrdp-egfx = "0.3"
+ironrdp-dvc = "0.8"
+ironrdp-svc = "0.8"
+ironrdp-core = "0.2"
+# The audio formats the rdpsnd channel offers.
+ironrdp-rdpsnd = "0.9"
+# The monitor layout type in RdpServerDisplay::request_layout.
+ironrdp-displaycontrol = "0.8"
+async-trait = "0.1"
+# IronRDP logs through tracing; vmm_rdp forwards it to slog.
+tracing = "0.1"
+bytes = "1"
 erased-serde = "0.4"
 # Proves at compile time that a type may be read from, or written to, a
 # byte buffer. A `Copy` bound cannot: it admits a type with padding, and

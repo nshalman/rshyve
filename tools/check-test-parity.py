@@ -71,7 +71,8 @@ ILLUMOS_TARGET = "x86_64-unknown-illumos"
 # package must do one or the other, so the lists are asserted below.
 UNREACHABLE = {
     "vmm_migrate": "zstd-sys compiles C for the target",
-    "rshyve": "zstd-sys and the vendored libtpms compile C for the target",
+    "vmm_rdp": "aws-lc-sys and zstd-sys compile C for the target",
+    "rshyve": "zstd-sys, aws-lc-sys and the vendored libtpms compile C for the target",
     "vmm_tpm": "the vendored libtpms needs an illumos host",
     "vmm_tpm_sys": "the vendored libtpms needs an illumos host",
 }

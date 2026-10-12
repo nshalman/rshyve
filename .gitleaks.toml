@@ -17,6 +17,9 @@ paths = [
   # Pinned upstream artifact digests, not credentials.
   '''^THIRD_PARTY\.md$''',
   '''^tools/fetch-edk2-bhyve\.sh$''',
+  # A throwaway self-signed key the RDP server's tests load for TLS.
+  # Nothing trusts it, and it guards nothing.
+  '''^crates/vmm-rdp/tests/fixtures/test-key\.pem$''',
 ]
 
 regexes = [

@@ -5,10 +5,10 @@
 //! USB HID tablet (absolute pointer) device.
 //!
 //! Presents a USB HID device with 3 buttons, 2-axis absolute pointer
-//! (16-bit X/Y, range 0..0x7FFF), and a scroll wheel.  The VNC server
-//! calls [`TabletDevice::pointer_event`] when the remote client moves
-//! the mouse or presses buttons; the xHCI controller then delivers the
-//! report to the guest via the interrupt IN endpoint.
+//! (16-bit X/Y, range 0..0x7FFF), and a scroll wheel.  A remote display
+//! server, VNC or RDP, calls [`TabletDevice::pointer_event`] when its
+//! client moves the mouse or presses buttons; the xHCI controller then
+//! delivers the report to the guest via the interrupt IN endpoint.
 
 use std::sync::Mutex;
 
@@ -272,12 +272,10 @@ impl TabletDevice {
         }
     }
 
-    /// Called by the VNC server when the remote client moves the pointer
-    /// or changes button state.
-    ///
-    /// Coordinates are absolute in the range [0, 0x7FFF].
-    /// Take a pointer event with VNC's button mask: bits 0-2 are the
+    /// Take a pointer event from a remote display server, with VNC's
+    /// button mask, which RDP's input is turned into: bits 0-2 are the
     /// buttons, and a press of bit 3 or 4 is a wheel step up or down.
+    /// Coordinates are absolute in the range [0, 0x7FFF].
     pub fn pointer_event(&self, buttons: u8, x: u16, y: u16) {
         let mut st = self.inner.lock().expect("tablet lock");
         let pressed = buttons & !st.wheel_buttons;
