@@ -16,7 +16,7 @@
 //!
 //! # Limits
 //!
-//! **An MSI-X capable device is refused.** `apply_bar` maps a full BAR,
+//! **An MSI-X capable device is refused.** `sync_bars` maps a full BAR,
 //! and on an MSI-X device that BAR holds the physical MSI-X table.
 //! illumos VT-d remaps DMA but not interrupts, so a guest that writes
 //! that table makes the device raise a guest-chosen vector on the host
@@ -30,6 +30,7 @@
 
 use std::io::{Error, ErrorKind, Result};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use bhyve_api::{PCI_ADDR_IO, PCI_ADDR_MEM32, PCI_ADDR_MEM64};
 use slog::{warn, Logger};
@@ -37,6 +38,8 @@ use slog::{warn, Logger};
 use vmm_core::common::RWOp;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::pio::{PioBus, PioFn};
+use vmm_core::ratelimit::{Pace, Pacer};
+use vmm_core::rings::{RingGate, RingsStopped};
 
 use vmm_devices::pci::bar::{BarDefine, BAR_COUNT};
 use vmm_devices::pci::device::{DeviceIdent, DeviceState, PciDevice};
@@ -79,6 +82,15 @@ const CFG_CAP_FIRST: u8 = 0x40;
 /// The kernel maps BARs in whole pages.
 const PAGE_SIZE: u64 = 4096;
 
+/// Window changes a guest gets at once. Each one stops every kernel
+/// ring of the VM, so a guest that moves its BARs in a loop is held to
+/// this. Firmware and an OS that size and enable each BAR use a few
+/// dozen at boot.
+const REMAP_BURST: u32 = 32;
+
+/// How often one more change is allowed once the burst is spent.
+const REMAP_REFILL: Duration = Duration::from_secs(1);
+
 /// Everything a guest access can change, under one lock so a command
 /// write and a BAR write from two vCPUs cannot interleave.
 struct Emulated {
@@ -93,11 +105,18 @@ struct Emulated {
     msi: Option<MsiCap>,
     /// What the kernel last accepted through `VM_PPTDEV_MSI`.
     msi_programmed: MsiProgram,
+    /// The budget for window changes.
+    pacer: Pacer,
+    /// The windows lag the guest's BARs, held back by the budget or by
+    /// the ring gate. The next config access tries again.
+    remap_pending: bool,
 }
 
 /// PCI passthrough device.
 pub struct PciPassthru {
     ppt: Box<dyn PptOps>,
+    /// Every window change takes the VM write lock, so it runs here.
+    rings: Arc<RingGate>,
     /// Physical BAR layout from the kernel, fixed for the device's life.
     bars: [BarInfo; BAR_COUNT],
     /// Physical config space at bind time.
@@ -122,14 +141,16 @@ impl PciPassthru {
         bus_pio: Arc<PioBus>,
         log: Logger,
     ) -> Result<Arc<Self>> {
+        let rings = Arc::clone(hdl.rings());
         let ppt = KernelPpt::open(ppt_path, hdl, log.clone())?;
-        Self::attach(Box::new(ppt), bus_pio, log)
+        Self::attach(Box::new(ppt), rings, bus_pio, log)
     }
 
     /// Build the device over any backend. A failure drops the backend,
     /// which gives the physical device back to the host.
     fn attach(
         ppt: Box<dyn PptOps>,
+        rings: Arc<RingGate>,
         bus_pio: Arc<PioBus>,
         log: Logger,
     ) -> Result<Arc<Self>> {
@@ -186,6 +207,7 @@ impl PciPassthru {
 
         Ok(Arc::new_cyclic(|weak| Self {
             ppt,
+            rings,
             bars,
             phys_cfg,
             caps,
@@ -198,6 +220,8 @@ impl PciPassthru {
                 ports: [None; BAR_COUNT],
                 msi,
                 msi_programmed: MsiProgram::default(),
+                pacer: Pacer::new(REMAP_BURST, REMAP_REFILL),
+                remap_pending: false,
             }),
             log,
         }))
@@ -219,72 +243,87 @@ impl PciPassthru {
 
     // ── BAR windows ────────────────────────────────────────────────
 
-    /// Bring the kernel window or PIO registration for one BAR in line
-    /// with the guest's BAR address and decode enables.
-    ///
-    /// A window that will not close is left recorded and nothing new
-    /// is opened for that BAR, so the guest never has two.
-    fn apply_bar(&self, inner: &mut Emulated, idx: usize) {
+    /// The window one BAR should have: `(gpa, len)`, or `None` for an
+    /// I/O BAR, an empty slot, or a BAR the guest does not decode.
+    fn mmio_want(&self, inner: &Emulated, idx: usize) -> Option<(u64, u64)> {
         let info = self.bars[idx];
+        if !matches!(info.bar_type, PCI_ADDR_MEM32 | PCI_ADDR_MEM64) {
+            return None;
+        }
+        let bar_n = BarN::try_from(idx as u8).ok()?;
+        let (_def, addr) = inner.state.bars().get(bar_n)?;
+        let enabled = inner.command & PCI_CMD_MMIO_EN != 0;
+        (enabled && addr != 0).then_some((addr, info.size))
+    }
+
+    /// Bring the PIO registration for one I/O BAR in line with the
+    /// guest's BAR address and decode enable.
+    fn apply_pio_bar(&self, inner: &mut Emulated, idx: usize) {
+        let info = self.bars[idx];
+        if info.bar_type != PCI_ADDR_IO {
+            return;
+        }
         let Ok(bar_n) = BarN::try_from(idx as u8) else {
             return;
         };
         let Some((_def, addr)) = inner.state.bars().get(bar_n) else {
             return;
         };
-        let enabled = match info.bar_type {
-            PCI_ADDR_IO => inner.command & PCI_CMD_IO_EN != 0,
-            PCI_ADDR_MEM32 | PCI_ADDR_MEM64 => {
-                inner.command & PCI_CMD_MMIO_EN != 0
-            }
-            _ => false,
-        };
-        let want = (enabled && addr != 0).then_some(addr);
-
-        if info.bar_type == PCI_ADDR_IO {
-            let have = inner.ports[idx];
-            let want = want.and_then(|a| u16::try_from(a).ok());
-            if have == want {
-                return;
-            }
-            if let Some(port) = have {
-                if let Err(e) = self.bus_pio.unregister(port) {
-                    warn!(self.log, "passthru: PIO BAR unregister failed";
-                        "bar" => idx, "port" => format!("{port:#x}"),
-                        "error" => %e);
-                    return;
-                }
-                inner.ports[idx] = None;
-            }
-            if let Some(port) = want {
-                let Ok(len) = u16::try_from(info.size) else {
-                    return;
-                };
-                let weak = self.weak.clone();
-                let handler: Arc<PioFn> = Arc::new(move |offset, rwo| {
-                    if let Some(dev) = weak.upgrade() {
-                        dev.bar_rw(bar_n, usize::from(offset), rwo);
-                    }
-                });
-                match self.bus_pio.register(port, len, handler) {
-                    Ok(()) => inner.ports[idx] = Some(port),
-                    Err(e) => {
-                        warn!(self.log, "passthru: PIO BAR register failed";
-                            "bar" => idx, "port" => format!("{port:#x}"),
-                            "error" => %e);
-                    }
-                }
-            }
+        let enabled = inner.command & PCI_CMD_IO_EN != 0;
+        let want = (enabled && addr != 0)
+            .then_some(addr)
+            .and_then(|a| u16::try_from(a).ok());
+        let have = inner.ports[idx];
+        if have == want {
             return;
         }
+        if let Some(port) = have {
+            if let Err(e) = self.bus_pio.unregister(port) {
+                warn!(self.log, "passthru: PIO BAR unregister failed";
+                    "bar" => idx, "port" => format!("{port:#x}"),
+                    "error" => %e);
+                return;
+            }
+            inner.ports[idx] = None;
+        }
+        if let Some(port) = want {
+            let Ok(len) = u16::try_from(info.size) else {
+                return;
+            };
+            let weak = self.weak.clone();
+            let handler: Arc<PioFn> = Arc::new(move |offset, rwo| {
+                if let Some(dev) = weak.upgrade() {
+                    dev.bar_rw(bar_n, usize::from(offset), rwo);
+                }
+            });
+            match self.bus_pio.register(port, len, handler) {
+                Ok(()) => inner.ports[idx] = Some(port),
+                Err(e) => {
+                    warn!(self.log, "passthru: PIO BAR register failed";
+                        "bar" => idx, "port" => format!("{port:#x}"),
+                        "error" => %e);
+                }
+            }
+        }
+    }
 
+    /// Bring the kernel window for one MMIO BAR to `want`.
+    ///
+    /// A window that will not close is left recorded and nothing new
+    /// is opened for that BAR, so the guest never has two.
+    fn apply_mmio_bar(
+        &self,
+        inner: &mut Emulated,
+        rings: &RingsStopped<'_>,
+        idx: usize,
+        want: Option<(u64, u64)>,
+    ) {
         let have = inner.mapped[idx];
-        let want = want.map(|gpa| (gpa, info.size));
         if have == want {
             return;
         }
         if let Some((gpa, len)) = have {
-            if let Err(e) = self.ppt.unmap_mmio(gpa, len) {
+            if let Err(e) = self.ppt.unmap_mmio(rings, gpa, len) {
                 warn!(self.log, "passthru: BAR unmap failed, window still open";
                     "bar" => idx, "gpa" => format!("{gpa:#x}"), "len" => len,
                     "error" => %e);
@@ -293,7 +332,7 @@ impl PciPassthru {
             inner.mapped[idx] = None;
         }
         if let Some((gpa, len)) = want {
-            match self.ppt.map_mmio(gpa, info.hpa, len) {
+            match self.ppt.map_mmio(rings, gpa, self.bars[idx].hpa, len) {
                 Ok(()) => inner.mapped[idx] = Some((gpa, len)),
                 Err(e) => {
                     warn!(self.log, "passthru: BAR map failed, guest cannot \
@@ -305,16 +344,78 @@ impl PciPassthru {
         }
     }
 
-    fn apply_all_bars(&self, inner: &mut Emulated) {
+    /// Bring every BAR in line with the guest's BAR addresses and
+    /// decode enables.
+    ///
+    /// A window change takes the VM write lock, so all of them run in
+    /// one pass of the ring gate. A guest pays for each pass from a
+    /// budget; past it the old windows close and no new one opens
+    /// until a later config access finds the budget refilled.
+    fn sync_bars(&self, inner: &mut Emulated) {
+        self.sync_bars_paced(inner, true);
+    }
+
+    fn sync_bars_paced(&self, inner: &mut Emulated, paced: bool) {
         for idx in 0..BAR_COUNT {
-            self.apply_bar(inner, idx);
+            self.apply_pio_bar(inner, idx);
+        }
+        let changes: Vec<(usize, Option<(u64, u64)>)> = (0..BAR_COUNT)
+            .map(|idx| (idx, self.mmio_want(inner, idx)))
+            .filter(|&(idx, want)| inner.mapped[idx] != want)
+            .collect();
+        if changes.is_empty() {
+            inner.remap_pending = false;
+            return;
+        }
+        let pace = if paced {
+            let cleared =
+                changes.iter().all(|&(i, _)| inner.mapped[i].is_none());
+            let pace = inner.pacer.admit(Instant::now(), cleared);
+            if inner.pacer.first_throttle() {
+                warn!(
+                    self.log,
+                    "passthru: BARs moved too often, windows \
+                    stay closed for now"
+                );
+            }
+            pace
+        } else {
+            Pace::Change
+        };
+        let close_only = match pace {
+            Pace::Change => false,
+            Pace::Clear => true,
+            Pace::Wait => {
+                inner.remap_pending = true;
+                return;
+            }
+        };
+        let ran = self.rings.run(|rings| {
+            for &(idx, want) in &changes {
+                let want = if close_only { None } else { want };
+                self.apply_mmio_bar(inner, rings, idx, want);
+            }
+        });
+        inner.remap_pending = close_only;
+        if let Err(e) = ran {
+            warn!(self.log, "passthru: BAR windows unchanged"; "error" => %e);
+            inner.remap_pending = true;
         }
     }
 
-    /// Close every window and registration. Idempotent.
+    /// Catch the windows up with the BARs, if a pass was held back.
+    fn retry_remap(&self) {
+        let mut inner = self.lock();
+        if inner.remap_pending {
+            self.sync_bars(&mut inner);
+        }
+    }
+
+    /// Close every window and registration. Idempotent, and not
+    /// paced: a device that is leaving must give its windows back.
     fn release_regions(&self, inner: &mut Emulated) {
         inner.command &= !(PCI_CMD_IO_EN | PCI_CMD_MMIO_EN);
-        self.apply_all_bars(inner);
+        self.sync_bars_paced(inner, false);
     }
 
     // ── Config-space write handlers ────────────────────────────────
@@ -333,7 +434,7 @@ impl PciPassthru {
             warn!(self.log, "passthru: command register write failed";
                 "value" => format!("{new_cmd:#06x}"), "error" => %e);
         }
-        self.apply_all_bars(&mut inner);
+        self.sync_bars(&mut inner);
     }
 
     /// Apply a guest BAR write to the emulated header, then remap.
@@ -347,10 +448,10 @@ impl PciPassthru {
         let mut inner = self.lock();
         let current = inner.state.bars().reg_read(bar_n);
         let merged = merge_bytes(current, offset, len, val);
-        let Some(result) = inner.state.bar_write(bar_n, merged) else {
+        if inner.state.bar_write(bar_n, merged).is_none() {
             return;
-        };
-        self.apply_bar(&mut inner, result.bar as usize);
+        }
+        self.sync_bars(&mut inner);
     }
 
     /// Update the MSI shadow and, when the effective values change,
@@ -378,6 +479,7 @@ impl PciPassthru {
 
 impl PciDevice for PciPassthru {
     fn cfg_read(&self, offset: u8, len: u8) -> u32 {
+        self.retry_remap();
         let dword_off = offset & 0xFC;
         let dword = match dword_off {
             // Identity and class come from the bind-time cache.
@@ -425,6 +527,7 @@ impl PciDevice for PciPassthru {
     }
 
     fn cfg_write(&self, offset: u8, len: u8, val: u32) {
+        self.retry_remap();
         match classify_cfg_write(offset, len, &self.caps) {
             CfgWrite::Command => self.cfg_write_command(offset, len, val),
             CfgWrite::Bar => self.cfg_write_bar(offset, len, val),

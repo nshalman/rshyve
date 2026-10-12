@@ -58,7 +58,7 @@ struct Waiting {
 #[derive(Clone, Copy)]
 struct Tid(libc::pthread_t);
 
-// Safety: the value only names a thread, and every test that holds
+// SAFETY: the value only names a thread, and every test that holds
 // one waits for that thread to end before it drops the id.
 unsafe impl Send for Tid {}
 
@@ -72,7 +72,7 @@ fn spawn_wait(fd: VionaFd, stop: PipeReader) -> Waiting {
     std::thread::Builder::new()
         .name("wait-intr".into())
         .spawn(move || {
-            // Safety: pthread_self names the calling thread.
+            // SAFETY: pthread_self names the calling thread.
             let me = Tid(unsafe { libc::pthread_self() });
             named.send(me).expect("the test reads this");
             tx.send(fd.wait_intr(&stop))
@@ -100,7 +100,7 @@ fn tells_a_band_from_a_byte() -> bool {
         events: libc::POLLRDBAND,
         revents: 0,
     };
-    // Safety: one descriptor, open for this call, and the count
+    // SAFETY: one descriptor, open for this call, and the count
     // matches the array.
     let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
     assert!(ret >= 0, "poll: {}", std::io::Error::last_os_error());
@@ -133,7 +133,7 @@ fn sigusr1_interrupts_a_call() {
     extern "C" fn note(_sig: libc::c_int) {}
 
     INSTALLED.call_once(|| {
-        // Safety: the struct is initialized before the call, and the
+        // SAFETY: the struct is initialized before the call, and the
         // handler is a plain function that touches nothing.
         let rc = unsafe {
             let mut act: libc::sigaction = std::mem::zeroed();
@@ -160,7 +160,8 @@ fn every_link_call_sends_the_command_its_name_says() {
     fd.ring_kick(1).expect("a recorder answers");
     fd.ring_pause(1).expect("a recorder answers");
     fd.ring_intr_clr(1).expect("a recorder answers");
-    fd.set_notify_iop(0x2000).expect("a recorder answers");
+    fd.set_notify_iop(&Quiesced::for_recorder(&fd), 0x2000)
+        .expect("a recorder answers");
     fd.set_promisc(PromiscMode::All)
         .expect("a recorder answers");
     fd.delete().expect("a recorder answers");
@@ -216,7 +217,7 @@ fn every_link_call_that_takes_a_struct_sends_the_command_its_name_says() {
         .expect("a recorder answers");
     fd.intr_status().expect("a recorder answers");
     fd.set_features(1).expect("a recorder answers");
-    fd.set_notify_mmio(0xC000_0000, 0x1000)
+    fd.set_notify_mmio(&Quiesced::for_recorder(&fd), 0xC000_0000, 0x1000)
         .expect("a recorder answers");
 
     assert_eq!(
@@ -370,7 +371,7 @@ fn a_notify_window_sends_its_address_and_its_size() {
     // out to userspace.
     let fd = recorder();
 
-    fd.set_notify_mmio(0xC000_0000, 0x1000)
+    fd.set_notify_mmio(&Quiesced::for_recorder(&fd), 0xC000_0000, 0x1000)
         .expect("a recorder answers");
 
     assert_eq!(
@@ -464,8 +465,10 @@ fn each_link_call_sends_exactly_one_ioctl() {
     fd.ring_set_msi(0, 1, 2).expect("a recorder answers");
     fd.set_features(1).expect("a recorder answers");
     fd.intr_status().expect("a recorder answers");
-    fd.set_notify_iop(1).expect("a recorder answers");
-    fd.set_notify_mmio(1, 2).expect("a recorder answers");
+    fd.set_notify_iop(&Quiesced::for_recorder(&fd), 1)
+        .expect("a recorder answers");
+    fd.set_notify_mmio(&Quiesced::for_recorder(&fd), 1, 2)
+        .expect("a recorder answers");
     fd.set_promisc(PromiscMode::None)
         .expect("a recorder answers");
     fd.delete().expect("a recorder answers");
@@ -493,8 +496,16 @@ fn every_link_call_reports_what_the_kernel_refused() {
         ("set_features", link.set_features(1).is_err()),
         ("intr_status", link.intr_status().is_err()),
         ("ring_intr_clr", link.ring_intr_clr(0).is_err()),
-        ("set_notify_iop", link.set_notify_iop(1).is_err()),
-        ("set_notify_mmio", link.set_notify_mmio(1, 2).is_err()),
+        (
+            "set_notify_iop",
+            link.set_notify_iop(&Quiesced::for_recorder(&link), 1)
+                .is_err(),
+        ),
+        (
+            "set_notify_mmio",
+            link.set_notify_mmio(&Quiesced::for_recorder(&link), 1, 2)
+                .is_err(),
+        ),
         ("set_promisc", link.set_promisc(PromiscMode::All).is_err()),
         ("delete", link.delete().is_err()),
     ];
@@ -639,7 +650,7 @@ fn a_signal_does_not_end_the_wait() {
     // signals land there. One is enough to end a wait that gives up.
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(10));
-        // Safety: the thread named itself above, and the assertion
+        // SAFETY: the thread named itself above, and the assertion
         // below reads the answer that says whether it is still there.
         let rc = unsafe { libc::pthread_kill(waiting.thread.0, libc::SIGUSR1) };
         // The thread sends its result before it leaves, so a thread
@@ -703,4 +714,49 @@ fn a_readable_link_with_no_interrupt_does_not_end_the_wait() {
     // Released either way, so the thread is never left parked.
     drop(stop_tx);
     assert_eq!(waited(&waiting), IntrWait::Stopped);
+}
+
+#[test]
+fn the_public_ioctl_calls_refuse_the_hook_commands() {
+    // A hook change takes the VM write lock, so only the LinkOps calls
+    // that ask for stopped rings may send one.
+    let fd = recorder();
+    let mut vim = vioc_notify_mmio::default();
+
+    let iop = fd.ioctl_usize(VNA_IOC_SET_NOTIFY_IOP, 0x2000);
+    // SAFETY: the payload is one vioc_notify_mmio.
+    let mmio = unsafe { fd.ioctl(VNA_IOC_SET_NOTIFY_MMIO, &mut vim) };
+
+    assert_eq!(iop.unwrap_err().kind(), ErrorKind::PermissionDenied);
+    assert_eq!(mmio.unwrap_err().kind(), ErrorKind::PermissionDenied);
+    assert_eq!(calls(&fd), []);
+}
+
+#[test]
+fn a_hook_change_refuses_a_proof_for_another_link() {
+    let fd = recorder();
+    let other = recorder();
+
+    let rc = fd.set_notify_iop(&Quiesced::for_recorder(&other), 0x2000);
+
+    assert_eq!(rc.unwrap_err().kind(), ErrorKind::PermissionDenied);
+    assert_eq!(calls(&fd), []);
+}
+
+#[test]
+fn removing_the_notify_window_sends_a_null_payload() {
+    // The kernel removes the window only for a null pointer. A payload
+    // with address 0 would hook a window at guest address 0.
+    let fd = recorder();
+
+    fd.set_notify_mmio(&Quiesced::for_recorder(&fd), 0, 0x1000)
+        .expect("a recorder answers");
+
+    assert_eq!(
+        calls(&fd),
+        [Call::Usize {
+            cmd: VNA_IOC_SET_NOTIFY_MMIO,
+            arg: 0
+        }],
+    );
 }

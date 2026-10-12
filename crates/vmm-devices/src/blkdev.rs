@@ -19,6 +19,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+mod backing;
+pub use backing::BackingDisk;
+
 #[cfg(target_os = "illumos")]
 const DKIOC: libc::c_int = 0x04 << 8; // 0x0400
 #[cfg(target_os = "illumos")]

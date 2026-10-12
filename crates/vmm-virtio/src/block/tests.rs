@@ -49,6 +49,12 @@ fn disk(file: File) -> Arc<DiskSync> {
     )
 }
 
+/// The store a worker serves, open from the start.
+fn worker_disk(disk: Arc<DiskSync>) -> Arc<BackingDisk> {
+    let log = slog::Logger::root(slog::Discard, slog::o!());
+    Arc::new(BackingDisk::from_disk(disk, false, &log).expect("an open disk"))
+}
+
 /// A worker context wired to `physmap`, with a fresh session.
 fn worker_ctx(physmap: &Arc<PhysMap>) -> WorkerCtx {
     worker_ctx_queues(physmap, 1)
@@ -91,7 +97,7 @@ fn quiesce_query_is_non_blocking_with_active_worker() {
         physmap: Arc::new(PhysMap::new()),
         interrupt: Arc::new(IntrSlot::new()),
         completions: Mutex::new(Vec::new()),
-        disk,
+        disk: worker_disk(disk),
         indicator: Indicator::new(),
         gate: Arc::new(QuiesceGate::new(1)),
         pause_grace: PauseGrace::DEFAULT,
@@ -1102,4 +1108,36 @@ fn a_refused_chain_returns_its_descriptor() {
             .expect("used length"),
         0,
     );
+}
+
+#[test]
+fn a_destination_disk_opens_at_the_attach_and_a_failed_open_retries() {
+    use vmm_devices::lifecycle::BackingAttach;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("seed.img");
+    std::fs::write(&path, vec![0u8; 8192]).expect("write the image");
+    let log = slog::Logger::root(slog::Discard, slog::o!());
+    let opts = VirtioBlockOpts {
+        read_only: true,
+        ..VirtioBlockOpts::default()
+    };
+    let disk = BackingDisk::deferred(&path, true, &log).expect("probe");
+    let block =
+        VirtioBlock::with_disk(disk, &opts, Arc::new(PhysMap::new()), 1)
+            .expect("device");
+    assert!(!block.backing_attached());
+    assert_eq!(block.capacity, 16, "the size comes from the probe");
+
+    let now = || BackingAttach {
+        until: Instant::now(),
+        allow_unproven: false,
+    };
+    std::fs::remove_file(&path).expect("remove");
+    block.attach_backing(&now()).expect_err("no image");
+    assert!(!block.backing_attached());
+
+    std::fs::write(&path, vec![0u8; 8192]).expect("write the image");
+    block.attach_backing(&now()).expect("the retry");
+    assert!(block.backing_attached());
 }

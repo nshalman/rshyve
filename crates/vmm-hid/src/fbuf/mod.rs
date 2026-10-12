@@ -31,13 +31,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slog;
 use vmm_core::common::RWOp;
 use vmm_core::hdl::VmmHdl;
 use vmm_core::mem::DevMemSeg;
 use vmm_core::mmio::{MmioBus, MmioFn};
+use vmm_core::ratelimit::{Pace, Pacer};
+use vmm_core::rings::RingGate;
 
 use vmm_devices::lifecycle::DeviceStateError;
 use vmm_devices::pci::bar::BarDefine;
@@ -51,6 +53,13 @@ use vmm_devices::{DeviceMigrateState, InputBroker, Lifecycle};
 
 /// PCI vendor ID for the framebuffer device.
 const PCI_VENDOR_ID: u16 = 0xFB5D;
+
+/// BAR1 moves a guest gets at once. Each one stops every kernel ring
+/// of the VM.
+const REMAP_BURST: u32 = 32;
+
+/// How often one more move is allowed once the burst is spent.
+const REMAP_REFILL: Duration = Duration::from_secs(1);
 
 /// PCI device ID for the framebuffer device.
 const PCI_DEVICE_ID: u16 = 0x40FB;
@@ -120,6 +129,12 @@ pub struct Framebuffer {
     /// Device memory segment backing BAR1.
     fb: DevMemSeg,
 
+    /// A BAR1 move takes the VM write lock, so it runs here.
+    rings: Arc<RingGate>,
+
+    /// The budget for BAR1 moves, and whether one is held back.
+    remap: Mutex<Remap>,
+
     /// MMIO bus for BAR registration/unregistration.
     bus_mmio: Arc<MmioBus>,
 
@@ -187,12 +202,15 @@ impl Framebuffer {
         pci_state.define_bar(BarN::BAR1, BarDefine::Mmio(BAR1_SIZE));
 
         let resolution = pack_resolution(width, height);
+        let rings = Arc::clone(hdl.rings());
         let fb = DevMemSeg::new(hdl, segid, "framebuffer", BAR1_SIZE as usize)?;
 
         let dev = Arc::new(Self {
             pci_state: Mutex::new(pci_state),
             resolution: AtomicU32::new(resolution),
             fb,
+            rings,
+            remap: Mutex::new(Remap::new()),
             bus_mmio,
             registered_bar0: Mutex::new(None),
             self_ref: Mutex::new(None),
@@ -283,11 +301,13 @@ fn unpack_height(packed: u32) -> u16 {
 
 impl PciDevice for Framebuffer {
     fn cfg_read(&self, offset: u8, len: u8) -> u32 {
+        self.retry_remap();
         let pci = self.pci_state.lock().expect("fbuf: pci_state lock");
         pci.cfg_read(offset, len)
     }
 
     fn cfg_write(&self, offset: u8, len: u8, val: u32) {
+        self.retry_remap();
         let mut pci = self.pci_state.lock().expect("fbuf: pci_state lock");
         pci.cfg_write(offset, len, val);
 
@@ -320,8 +340,26 @@ impl PciDevice for Framebuffer {
             self.release_mmio(&mut reg);
         }
         // BAR1 is a devmem segment, not a bus region, but it decodes
-        // guest addresses the same way.
-        self.remap_framebuffer(None);
+        // guest addresses the same way. A device that is leaving gives
+        // its window back whatever the budget says.
+        self.remap_framebuffer(None, false);
+    }
+}
+
+/// The budget for BAR1 moves.
+struct Remap {
+    pacer: Pacer,
+    /// The mapping lags the guest's BAR1. The next config access tries
+    /// again.
+    pending: bool,
+}
+
+impl Remap {
+    fn new() -> Self {
+        Self {
+            pacer: Pacer::new(REMAP_BURST, REMAP_REFILL),
+            pending: false,
+        }
     }
 }
 
@@ -343,21 +381,69 @@ impl Framebuffer {
     }
 
     /// Move the framebuffer devmem mapping to `want`, or unmap it.
-    fn remap_framebuffer(&self, want: Option<u64>) {
-        if self.fb.mapped_gpa() == want {
+    ///
+    /// The move takes the VM write lock, so it runs in the ring gate.
+    /// A `paced` move is one the guest asked for: past the budget the
+    /// old mapping goes once, and nothing new comes up until a later
+    /// config access finds the budget refilled.
+    fn remap_framebuffer(&self, want: Option<u64>, paced: bool) {
+        let mut remap = self.remap.lock().expect("fbuf: remap lock");
+        let have = self.fb.mapped_gpa();
+        if have == want {
+            remap.pending = false;
             return;
         }
-        if let Err(e) = self.fb.unmap() {
-            slog::warn!(self.log, "fbuf: framebuffer unmap failed"; "error" => %e);
-        }
-        if let Some(gpa) = want {
-            if let Err(e) = self.fb.map_at(gpa) {
-                // The guest may transiently select a GPA that overlaps ROM
-                // while sizing the BAR, so a rejected mapping is not fatal.
-                slog::warn!(self.log, "fbuf: framebuffer map failed, BAR1 undecoded";
-                    "gpa" => format!("{gpa:#x}"), "error" => %e);
+        let pace = if paced {
+            let pace = remap.pacer.admit(Instant::now(), have.is_none());
+            if remap.pacer.first_throttle() {
+                slog::warn!(
+                    self.log,
+                    "fbuf: BAR1 moved too often, \
+                    framebuffer unmapped for now"
+                );
             }
+            pace
+        } else {
+            Pace::Change
+        };
+        let target = match pace {
+            Pace::Change => want,
+            Pace::Clear => None,
+            Pace::Wait => {
+                remap.pending = true;
+                return;
+            }
+        };
+        let ran = self.rings.run(|rings| {
+            if let Err(e) = self.fb.unmap(rings) {
+                slog::warn!(self.log, "fbuf: framebuffer unmap failed"; "error" => %e);
+            }
+            if let Some(gpa) = target {
+                if let Err(e) = self.fb.map_at(rings, gpa) {
+                    // The guest may transiently select a GPA that overlaps ROM
+                    // while sizing the BAR, so a rejected mapping is not fatal.
+                    slog::warn!(self.log, "fbuf: framebuffer map failed, BAR1 undecoded";
+                        "gpa" => format!("{gpa:#x}"), "error" => %e);
+                }
+            }
+        });
+        remap.pending = target != want;
+        if let Err(e) = ran {
+            slog::warn!(self.log, "fbuf: framebuffer mapping unchanged"; "error" => %e);
+            remap.pending = true;
         }
+    }
+
+    /// Catch BAR1 up with the guest, if a move was held back.
+    fn retry_remap(&self) {
+        if !self.remap.lock().expect("fbuf: remap lock").pending {
+            return;
+        }
+        let want = {
+            let pci = self.pci_state.lock().expect("fbuf: pci lock");
+            bar1_want(&pci)
+        };
+        self.remap_framebuffer(want, true);
     }
 
     /// Update BAR0 MMIO registration and the BAR1 devmem mapping.
@@ -398,13 +484,21 @@ impl Framebuffer {
         }
         drop(reg);
 
-        let bar1_addr = pci
-            .bars()
-            .get(BarN::BAR1)
-            .map(|(_, addr)| addr)
-            .unwrap_or(0);
-        self.remap_framebuffer(bar1_target(mmio_enabled, bar1_addr));
+        self.remap_framebuffer(bar1_want(&pci), true);
     }
+}
+
+/// Where the guest decodes BAR1 now, if anywhere.
+fn bar1_want(pci: &DeviceState) -> Option<u64> {
+    let mmio_enabled = pci
+        .command()
+        .contains(vmm_devices::pci::bits::RegCmd::MMIO_EN);
+    let bar1_addr = pci
+        .bars()
+        .get(BarN::BAR1)
+        .map(|(_, addr)| addr)
+        .unwrap_or(0);
+    bar1_target(mmio_enabled, bar1_addr)
 }
 
 fn bar1_target(mmio_enabled: bool, addr: u64) -> Option<u64> {
@@ -769,6 +863,48 @@ mod tests {
         assert_eq!(bar1_target(false, addr), None);
     }
 
+    /// Counts the times the gate stopped the VM's rings.
+    struct CountingRings(std::sync::atomic::AtomicUsize, AtomicBool);
+
+    impl vmm_core::rings::KernelRings for CountingRings {
+        fn stop(&self) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn start(&self) {
+            self.1.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_bar1_move_runs_in_the_ring_gate_and_is_held_to_a_budget() {
+        // VM_MMAP_MEMSEG takes the VM write lock, and the guest picks
+        // how often BAR1 moves.
+        let dev = make_test_dev();
+        let rings = Arc::new(CountingRings(
+            std::sync::atomic::AtomicUsize::new(0),
+            AtomicBool::new(false),
+        ));
+        dev.rings
+            .register(Arc::downgrade(&rings) as std::sync::Weak<_>)
+            .expect("register");
+        dev.cfg_write(
+            0x04,
+            2,
+            u32::from(vmm_devices::pci::bits::RegCmd::MMIO_EN.bits()),
+        );
+
+        dev.cfg_write(0x14, 4, 0xE100_0000);
+        assert_eq!(rings.0.load(Ordering::SeqCst), 1);
+        assert!(rings.1.load(Ordering::SeqCst), "the rings never started");
+
+        for i in 0..1000u32 {
+            dev.cfg_write(0x14, 4, 0xE100_0000 + (i % 2) * 0x0100_0000);
+        }
+        assert_eq!(rings.0.load(Ordering::SeqCst), REMAP_BURST as usize);
+    }
+
     /// Create a test device without starting the VNC server.
     pub(super) fn make_test_dev() -> Arc<Framebuffer> {
         make_test_dev_with_input(Arc::new(InputBroker::default()))
@@ -803,6 +939,8 @@ mod tests {
             pci_state: Mutex::new(pci_state),
             resolution: AtomicU32::new(pack_resolution(1024, 768)),
             fb: DevMemSeg::new_anon(BAR1_SIZE as usize).unwrap(),
+            rings: RingGate::new(),
+            remap: Mutex::new(Remap::new()),
             bus_mmio: Arc::new(MmioBus::new()),
             registered_bar0: Mutex::new(None),
             self_ref: Mutex::new(None),

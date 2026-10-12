@@ -47,7 +47,7 @@ connects to a Unix socket that the agent listens on. Two more flags:
 
 | Flag | Meaning |
 |---|---|
-| `--migrate-ring-attach-timeout-ms` | Wait for each ring disk to attach after the commit. Default 120000 |
+| `--migrate-ring-attach-timeout-ms` | Wait for each ring disk to attach after the commit. Default and maximum 120000, so it ends before the source stops waiting for the start (150 s) |
 | `--migrate-allow-unproven-engine` | Lab only. See "Engine check" |
 
 The shape is
@@ -79,8 +79,8 @@ only `--ring-config <path>`:
 |---|---|
 | `version` | Must be 1. rshyve refuses any other version and any unknown field |
 | `disks` | `-s` specs, added after the command line's. Only `nvme,mantablock=` disks, at most 24 |
-| `migrate.ring_attach_timeout_ms` | As `--migrate-ring-attach-timeout-ms`. Range 1 to 3600000 |
-| `migrate.allow_unproven_engine` | As `--migrate-allow-unproven-engine`. Lab only |
+| `migrate.ring_attach_timeout_ms` | As `--migrate-ring-attach-timeout-ms`. Range 1 to 120000 |
+| `migrate.allow_unproven_engine` | Only `false` is taken. The zone can write this file, so the lab flag is `--migrate-allow-unproven-engine` only |
 
 The path must be absolute and not a symbolic link. The file must be a
 regular file of rshyve's user (root), mode 0600 or tighter, and at most
@@ -143,6 +143,7 @@ answers `ACK ABORT`.
 | `migrate_gate` | `none`, `waiting`, `go`, `abort` |
 | `migrate_rings` | `attached`, `attaching`, `detached`, `attach-failed`, `detach-failed`. Absent for a VM with no ring disk |
 | `migrate_error` | Why the migration failed. Absent until it fails |
+| `migrate_clock_skew_ms` | Destination only: how far its clock is ahead of the source's. Negative when behind |
 
 `migrate_phase` `committed` means the source committed. A source that
 fails before its commit shows `migrate_phase` `error`. A source that
@@ -235,9 +236,10 @@ write as a duplicate.
 
 ## Stream version
 
-The migration stream is `vmm-migrate-ron/9`, which adds the xHCI
-controller and the LPC and ACPI device state to v8. A source with a
-ring disk refuses a v6 destination right after the protocol choice,
-before the pause. Every VM has the COM1 and COM2 UARTs, so every VM
-needs v9 at both ends. An older destination does not start with a ring
+The migration stream is `vmm-migrate-ron/10`, which adds the source
+wall clock, the interrupt shadow, the AMD PMU state and the
+fault-injection test device to v9. A source with a ring disk refuses a
+v6 destination right after the protocol choice, before the pause.
+Every VM has the COM1 and COM2 UARTs, so every VM needs v9 or newer at
+both ends. An older destination does not start with a ring
 disk on its `-s` list.

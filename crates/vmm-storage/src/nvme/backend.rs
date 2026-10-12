@@ -338,5 +338,31 @@ pub trait AsyncBackend: Send + Sync + 'static {
 }
 
 /// Builds a backend around the sink it completes into.
-pub type BackendFactory =
-    Box<dyn FnOnce(Arc<dyn CompletionSink>) -> Arc<dyn AsyncBackend> + Send>;
+/// Fails when the backend cannot start, for example a worker thread
+/// that will not spawn.
+pub type BackendFactory = Box<
+    dyn FnOnce(Arc<dyn CompletionSink>) -> io::Result<Arc<dyn AsyncBackend>>
+        + Send,
+>;
+
+/// Stands in for a backend that failed to start, only until the
+/// controller that holds it is dropped. Nothing reaches it.
+pub(super) struct Unbuilt;
+
+impl AsyncBackend for Unbuilt {
+    fn capacity(&self) -> u64 {
+        0
+    }
+
+    fn queue_depth(&self) -> u16 {
+        1
+    }
+
+    fn submit(&self, _req: BlockRequest) {}
+
+    fn flush(&self, _intent: FlushIntent) -> Result<(), FlushError> {
+        Ok(())
+    }
+
+    fn halt(&self) {}
+}

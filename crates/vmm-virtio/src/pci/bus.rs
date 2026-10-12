@@ -37,7 +37,7 @@ use vmm_devices::pci::bar::BarDefine;
 use vmm_devices::pci::device::{DeviceState, PciDevice};
 use vmm_devices::pci::BarN;
 
-use super::{VirtioDevice, VirtioPciDevice};
+use super::{bits, VirtioDevice, VirtioPciDevice};
 
 impl<D: VirtioDevice> VirtioPciDevice<D> {
     /// Unregister the recorded BAR0 PIO base and clear the record.
@@ -62,6 +62,35 @@ impl<D: VirtioDevice> VirtioPciDevice<D> {
                     "error" => %e);
             }
         }
+    }
+
+    /// Give the backend the notify addresses the guest decodes now.
+    ///
+    /// Read from the registration records, so a BAR that is dark has
+    /// no notify address either. The lock is held across the call so
+    /// that, of two vCPUs moving BARs at once, the last to register is
+    /// the last one sent.
+    pub(super) fn sync_notify_hook(&self) {
+        let mut sent = self.notify_sent.lock().expect("notify lock");
+        let pio = self
+            .registered_bar
+            .lock()
+            .expect("bar lock poisoned")
+            .and_then(|port| port.checked_add(bits::LEGACY_REG_QUEUE_NOTIFY))
+            .unwrap_or(0);
+        let mmio = self
+            .registered_bar2
+            .lock()
+            .expect("bar2 lock")
+            .and_then(|addr| {
+                addr.checked_add(u64::from(bits::MODERN_BAR_NOTIFY_OFFSET))
+            })
+            .unwrap_or(0);
+        if *sent == (pio, mmio) {
+            return;
+        }
+        *sent = (pio, mmio);
+        self.device.set_notify_addrs(pio, mmio);
     }
 
     /// Update PIO bus registration for BAR0 based on current state.
@@ -222,6 +251,10 @@ impl<D: VirtioDevice> PciDevice for VirtioPciDevice<D> {
                 let pci_ref = arc_self.pci_state.lock().expect("pci lock");
                 arc_self.update_bar_registration(&pci_ref);
                 arc_self.update_mmio_registration(&pci_ref);
+                // The backend may stop its rings for this, so no PCI
+                // lock is held.
+                drop(pci_ref);
+                arc_self.sync_notify_hook();
             }
         }
     }

@@ -6,6 +6,11 @@ rust-version.workspace = true
 license = "MPL-2.0"
 build = "build.rs"
 
+[features]
+# Lab and CI only: the --migrate-test-fail-* flags and their device.
+# Off by default, so a release build refuses them.
+migrate-test-faults = []
+
 [[bin]]
 name = "rshyve"
 path = "src/main.rs"

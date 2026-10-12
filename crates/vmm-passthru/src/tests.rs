@@ -6,12 +6,14 @@
 //! backend.
 
 use std::io::{Error, ErrorKind, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use super::*;
 
 use vmm_core::common::{ReadOp, WriteOp};
 use vmm_core::hdl::PptdevLimits;
+use vmm_core::rings::KernelRings;
 use vmm_devices::pci::bits;
 
 /// A device with a 16 KiB MMIO BAR0, a 256-byte I/O BAR1, an empty
@@ -27,6 +29,28 @@ struct FakePpt {
     bar_reads: Mutex<Vec<(usize, u32, u8)>>,
     bar_writes: Mutex<Vec<(usize, u32, u8, u32)>>,
     fail_map: bool,
+    /// Ring stops and starts, and window changes, in order.
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+/// A kernel ring the gate stops, logging into the fake's events.
+struct Rings {
+    events: Arc<Mutex<Vec<&'static str>>>,
+    refuse: AtomicBool,
+}
+
+impl KernelRings for Rings {
+    fn stop(&self) -> std::result::Result<(), String> {
+        if self.refuse.load(Ordering::SeqCst) {
+            return Err("refused".into());
+        }
+        self.events.lock().unwrap().push("stop");
+        Ok(())
+    }
+
+    fn start(&self) {
+        self.events.lock().unwrap().push("start");
+    }
 }
 
 const MSI_OFF: usize = 0x70;
@@ -94,6 +118,7 @@ impl FakePpt {
             bar_reads: Mutex::new(Vec::new()),
             bar_writes: Mutex::new(Vec::new()),
             fail_map: false,
+            events: Arc::default(),
         }
     }
 }
@@ -158,15 +183,28 @@ impl PptOps for Shared {
         Ok(PptdevLimits { msi: 4, msix: 0 })
     }
 
-    fn map_mmio(&self, gpa: u64, hpa: u64, len: u64) -> Result<()> {
+    fn map_mmio(
+        &self,
+        _rings: &RingsStopped<'_>,
+        gpa: u64,
+        hpa: u64,
+        len: u64,
+    ) -> Result<()> {
         if self.0.fail_map {
             return Err(Error::from(ErrorKind::OutOfMemory));
         }
+        self.0.events.lock().unwrap().push("map");
         self.0.maps.lock().unwrap().push((gpa, hpa, len));
         Ok(())
     }
 
-    fn unmap_mmio(&self, gpa: u64, len: u64) -> Result<()> {
+    fn unmap_mmio(
+        &self,
+        _rings: &RingsStopped<'_>,
+        gpa: u64,
+        len: u64,
+    ) -> Result<()> {
+        self.0.events.lock().unwrap().push("unmap");
         self.0.unmaps.lock().unwrap().push((gpa, len));
         Ok(())
     }
@@ -186,15 +224,31 @@ fn null_log() -> Logger {
 }
 
 fn build(fake: FakePpt) -> (Arc<PciPassthru>, Arc<FakePpt>, Arc<PioBus>) {
+    let (dev, fake, bus, _) = build_with_rings(fake);
+    (dev, fake, bus)
+}
+
+/// A device on a gate that holds one recording ring.
+fn build_with_rings(
+    fake: FakePpt,
+) -> (Arc<PciPassthru>, Arc<FakePpt>, Arc<PioBus>, Arc<Rings>) {
     let fake = Arc::new(fake);
     let bus = Arc::new(PioBus::new());
+    let gate = RingGate::new();
+    let rings = Arc::new(Rings {
+        events: Arc::clone(&fake.events),
+        refuse: AtomicBool::new(false),
+    });
+    gate.register(Arc::downgrade(&rings) as Weak<dyn KernelRings>)
+        .expect("register");
     let dev = PciPassthru::attach(
         Box::new(Shared(Arc::clone(&fake))),
+        gate,
         Arc::clone(&bus),
         null_log(),
     )
     .expect("attach");
-    (dev, fake, bus)
+    (dev, fake, bus, rings)
 }
 
 fn write(dev: &PciPassthru, off: u8, len: u8, val: u32) {
@@ -243,11 +297,22 @@ fn a_bar_query_error_other_than_enoent_fails_construction() {
         fn limits(&self) -> Result<PptdevLimits> {
             self.0.limits()
         }
-        fn map_mmio(&self, g: u64, h: u64, l: u64) -> Result<()> {
-            self.0.map_mmio(g, h, l)
+        fn map_mmio(
+            &self,
+            r: &RingsStopped<'_>,
+            g: u64,
+            h: u64,
+            l: u64,
+        ) -> Result<()> {
+            self.0.map_mmio(r, g, h, l)
         }
-        fn unmap_mmio(&self, g: u64, l: u64) -> Result<()> {
-            self.0.unmap_mmio(g, l)
+        fn unmap_mmio(
+            &self,
+            r: &RingsStopped<'_>,
+            g: u64,
+            l: u64,
+        ) -> Result<()> {
+            self.0.unmap_mmio(r, g, l)
         }
         fn setup_msi(&self, a: u64, d: u64, n: i32) -> Result<()> {
             self.0.setup_msi(a, d, n)
@@ -255,6 +320,7 @@ fn a_bar_query_error_other_than_enoent_fails_construction() {
     }
     let err = PciPassthru::attach(
         Box::new(Broken(Shared(Arc::new(FakePpt::new())))),
+        RingGate::new(),
         Arc::new(PioBus::new()),
         null_log(),
     )
@@ -273,6 +339,7 @@ fn sub_page_mmio_bar_is_refused_at_bind() {
     });
     let err = PciPassthru::attach(
         Box::new(Shared(Arc::new(fake))),
+        RingGate::new(),
         Arc::new(PioBus::new()),
         null_log(),
     )
@@ -528,4 +595,66 @@ fn merge_and_extract_are_inverse_at_every_offset() {
     assert_eq!(merge_bytes(dword, 0x01, 1, 0xEE), 0x4433_EE11);
     assert_eq!(merge_bytes(dword, 0x02, 2, 0xBEEF), 0xBEEF_2211);
     assert_eq!(merge_bytes(dword, 0x00, 4, 0), 0);
+}
+
+#[test]
+fn a_window_moves_only_with_every_kernel_ring_stopped() {
+    // A window change takes the VM write lock, and a viona worker
+    // alive across it can deadlock the host.
+    let (dev, fake, _, _rings) = build_with_rings(FakePpt::new());
+    write(&dev, 0x10, 4, 0xC000_0000);
+    assert!(fake.events.lock().unwrap().is_empty(), "nothing to map");
+
+    write(&dev, 0x04, 2, u32::from(PCI_CMD_MMIO_EN));
+    write(&dev, 0x10, 4, 0xC100_0000);
+
+    assert_eq!(
+        *fake.events.lock().unwrap(),
+        ["stop", "map", "start", "stop", "unmap", "map", "start"]
+    );
+}
+
+#[test]
+fn a_ring_that_will_not_stop_moves_no_window_until_a_later_access() {
+    let (dev, fake, _, rings) = build_with_rings(FakePpt::new());
+    rings.refuse.store(true, Ordering::SeqCst);
+    write(&dev, 0x10, 4, 0xC000_0000);
+    write(&dev, 0x04, 2, u32::from(PCI_CMD_MMIO_EN));
+    assert!(
+        fake.maps.lock().unwrap().is_empty(),
+        "mapped with rings alive"
+    );
+
+    rings.refuse.store(false, Ordering::SeqCst);
+    read(&dev, 0x00, 4);
+
+    assert_eq!(
+        fake.maps.lock().unwrap().as_slice(),
+        &[(0xC000_0000, 0xF000_0000, 0x4000)]
+    );
+}
+
+#[test]
+fn a_guest_moving_its_bar_in_a_loop_is_held_to_a_budget() {
+    // Each move stops every kernel ring of the VM. Past the budget the
+    // window closes once, and then nothing moves.
+    let (dev, fake, _, _rings) = build_with_rings(FakePpt::new());
+    write(&dev, 0x04, 2, u32::from(PCI_CMD_MMIO_EN));
+    for i in 0..1000u32 {
+        let gpa = if i % 2 == 0 { 0xC000_0000 } else { 0xC100_0000 };
+        write(&dev, 0x10, 4, gpa);
+    }
+
+    let stops = fake
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| **e == "stop")
+        .count();
+    assert_eq!(stops, REMAP_BURST as usize + 1, "the burst and one clear");
+    assert_eq!(
+        fake.events.lock().unwrap().iter().rev().nth(1),
+        Some(&"unmap")
+    );
 }

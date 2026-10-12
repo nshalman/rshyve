@@ -5,7 +5,7 @@
 //! vmm - New Rust-based bhyve VMM with live migration support.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
@@ -117,6 +117,31 @@ fn migrate_devices(
         .collect()
 }
 
+/// The fault-injection device, when a lab flag asks for it. Only a
+/// build with the `migrate-test-faults` feature has it; a release build
+/// refuses the flags.
+fn test_fault_device(
+    cli: &Cli,
+    log: &Logger,
+) -> anyhow::Result<Option<Arc<dyn vmm_devices::Lifecycle>>> {
+    let (exports, imports) =
+        (cli.migrate_test_fail_exports, cli.migrate_test_fail_imports);
+    if exports.is_none() && imports.is_none() {
+        return Ok(None);
+    }
+    if !cfg!(any(test, feature = "migrate-test-faults")) {
+        anyhow::bail!(
+            "--migrate-test-fail-* needs a build with the \
+             migrate-test-faults feature"
+        );
+    }
+    Ok(Some(vmm_devices::testdev::MigrateFault::new(
+        exports.unwrap_or(0),
+        imports.unwrap_or(0),
+        log,
+    )))
+}
+
 /// The spec check in pcidev already refused these. This one reads the
 /// devices themselves, so a driver that check does not know about is
 /// refused too.
@@ -135,6 +160,7 @@ fn refuse_unmigratable_devices(
 fn run_migration_destination(
     machine: &Machine,
     listen_addr: &str,
+    control_socket: Option<&Path>,
     attach_budget: std::time::Duration,
     allow_unproven: bool,
     num_cpus: u32,
@@ -143,7 +169,7 @@ fn run_migration_destination(
     cpu_baseline: vmm_core::cpuid::CpuBaseline,
     hyperv: Option<Arc<vmm_hyperv::HyperV>>,
     log: &Logger,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<control::ControlListener>> {
     info!(log, "migration destination mode"; "listen" => listen_addr);
 
     refuse_unmigratable_devices(registry)?;
@@ -168,6 +194,7 @@ fn run_migration_destination(
         devices: devices.iter().map(|(ident, _)| ident.clone()).collect(),
         platform: platform.iter().map(|(ident, _)| ident.clone()).collect(),
         deadlines: vmm_migrate::wire::Deadlines::default(),
+        hyperv: hyperv.is_some(),
         // The control socket's migrate-dest carries the override. A VM
         // started this way has no operator to ask mid-migration.
         allow_cpu_feature_mismatch: false,
@@ -177,6 +204,10 @@ fn run_migration_destination(
     let for_resume: Vec<Arc<dyn vmm_devices::Lifecycle>> =
         registry.lifecycle_devices();
     let for_attach = for_resume.clone();
+    // Set before the attach failure returns, so the import status stops
+    // saying the import holds the guest before this process exits.
+    let attach_gave_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gave_up = Arc::clone(&attach_gave_up);
     let (pause_vm, resume_vm) = vmm_migrate::hdl_pause_hooks(machine.hdl());
     let hooks = vmm_migrate::destination::DestHooks {
         restore: Box::new(move |bdf, state| {
@@ -201,8 +232,10 @@ fn run_migration_destination(
                 allow_unproven,
             };
             for dev in for_attach.iter().filter(|d| !d.backing_attached()) {
-                dev.attach_backing(&how)
-                    .map_err(|e| format!("{}: {e}", dev.type_name()))?;
+                if let Err(e) = dev.attach_backing(&how) {
+                    gave_up.store(true, std::sync::atomic::Ordering::Release);
+                    return Err(format!("{}: {e}", dev.type_name()));
+                }
             }
             Ok(())
         }),
@@ -233,6 +266,36 @@ fn run_migration_destination(
     let memctx = vmm_core::mem::MemCtx::new(machine.physmap().clone());
     let hdl = machine.hdl().clone();
 
+    // Held until the import returns; the full control socket binds the
+    // same path once the guest runs.
+    let import_status = match control_socket {
+        Some(path) => {
+            let phase = Arc::clone(&status);
+            Some(
+                control::spawn_import_status(
+                    path,
+                    move || {
+                        if attach_gave_up
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            return vmm_migrate::MigrationPhase::Error;
+                        }
+                        phase
+                            .lock()
+                            .map_or(vmm_migrate::MigrationPhase::Error, |s| {
+                                s.phase
+                            })
+                    },
+                    log.clone(),
+                )
+                .with_context(|| {
+                    format!("serve the import status at {}", path.display())
+                })?,
+            )
+        }
+        None => None,
+    };
+
     // One driver over either stream. A Unix socket is the only kind
     // that works inside a bhyve zone, where /dev/poll is unavailable;
     // the GZ agent bridges it to the peer.
@@ -259,7 +322,12 @@ fn run_migration_destination(
     // The interrupt kick happens after the vCPU threads are spawned:
     // one injected before the spawn is lost.
     info!(log, "migration import complete, starting vCPUs");
-    Ok(())
+    // Its thread takes up to a few hundred ms to see the stop, and the
+    // guest is still paused: the caller waits for it after the vCPUs run.
+    if let Some(l) = &import_status {
+        l.stop();
+    }
+    Ok(import_status)
 }
 
 /// Connect to the agent's socket, waiting for it to appear.
@@ -547,6 +615,14 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         vmm_machine::register_platform(&registry, id, device)
             .with_context(|| format!("failed to register {id}"))?;
     }
+    if let Some(fault) = test_fault_device(&cli, log)? {
+        vmm_machine::register_platform(
+            &registry,
+            vmm_devices::testdev::ID,
+            fault,
+        )
+        .context("failed to register the migration fault device")?;
+    }
 
     if let Some(vs) = varstore.clone() {
         // The firmware phase builds the variable store, so it never
@@ -574,10 +650,12 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
     )?;
 
     // Phase 8: vCPU activation (migration or normal)
+    let mut import_status = None;
     if let Some(ref listen_addr) = cli.migrate_listen {
-        run_migration_destination(
+        import_status = run_migration_destination(
             &machine,
             listen_addr,
+            cli.control_socket.as_deref(),
             std::time::Duration::from_millis(
                 cli.migrate_ring_attach_timeout_ms,
             ),
@@ -703,7 +781,9 @@ fn run(cli: Cli, log: &Logger) -> anyhow::Result<RunResult> {
         )?,
     };
 
-    // Phase 12: Control socket
+    // Phase 12: Control socket. The import status thread binds the same
+    // path again when the path changes, so it must be gone first.
+    drop(import_status);
     let control_socket = spawn_control_socket(
         &machine,
         &cli,
@@ -1043,6 +1123,35 @@ mod tests {
             &vmm_boot::BootImage,
             &vmm_core::vcpu::Vcpu,
         ) -> anyhow::Result<()> = vmm_boot::BootImage::setup_bsp;
+    }
+
+    #[test]
+    fn only_a_fault_flag_adds_the_fault_device() {
+        let log = Logger::root(slog::Discard, o!());
+        assert!(test_fault_device(&cli_from(&["rshyve", "vm"]), &log)
+            .expect("no flag")
+            .is_none());
+        for flag in
+            ["--migrate-test-fail-exports", "--migrate-test-fail-imports"]
+        {
+            let cli = cli_from(&["rshyve", flag, "0", "vm"]);
+            let dev = test_fault_device(&cli, &log).expect(flag).expect(flag);
+            assert_eq!(dev.type_name(), vmm_devices::testdev::KIND);
+            assert!(dev.migrates_by_id());
+        }
+        let cli =
+            cli_from(&["rshyve", "--migrate-test-fail-exports", "1", "vm"]);
+        let dev = test_fault_device(&cli, &log)
+            .expect("device")
+            .expect("device");
+        assert!(dev.export_migrate_state().is_err());
+        assert!(dev.export_migrate_state().is_ok());
+    }
+
+    #[test]
+    fn the_fault_flags_stay_out_of_the_help() {
+        let help = Cli::command_named("rshyve").render_long_help().to_string();
+        assert!(!help.contains("migrate-test-fail"), "{help}");
     }
 
     struct Blocks(Option<&'static str>);

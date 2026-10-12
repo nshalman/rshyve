@@ -220,8 +220,8 @@ impl Connected {
     pub fn into_handover_factory(self) -> BackendFactory {
         Box::new(move |sink| {
             let sink = Arc::new(job::Controller(sink));
-            Handover::<BlockRequest>::attached(self, sink)
-                as Arc<dyn AsyncBackend>
+            Ok(Handover::<BlockRequest>::attached(self, sink)
+                as Arc<dyn AsyncBackend>)
         })
     }
 
@@ -229,7 +229,7 @@ impl Connected {
     pub fn into_factory(self) -> BackendFactory {
         Box::new(move |sink| {
             let sink = Arc::new(job::Controller(sink));
-            self.start::<BlockRequest>(sink) as Arc<dyn AsyncBackend>
+            Ok(self.start::<BlockRequest>(sink) as Arc<dyn AsyncBackend>)
         })
     }
 }
@@ -239,7 +239,7 @@ impl Connected {
 pub fn deferred_factory(cfg: Config, shape: RingShape) -> BackendFactory {
     Box::new(move |sink| {
         let sink = Arc::new(job::Controller(sink));
-        Handover::<BlockRequest>::deferred(cfg, shape, sink)
-            as Arc<dyn AsyncBackend>
+        Ok(Handover::<BlockRequest>::deferred(cfg, shape, sink)
+            as Arc<dyn AsyncBackend>)
     })
 }

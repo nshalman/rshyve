@@ -421,6 +421,21 @@ impl HyperV {
     }
 }
 
+impl HyperV {
+    /// Put back the overlays [`Self::pause_overlays`] dropped, from the
+    /// MSR values, after a migration that failed and resumes the source.
+    /// Without them the guest's hypercall page holds its own bytes.
+    pub fn resume_overlays(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let hypercall = inner.msr_hypercall.raw();
+        self.handle_wr_hypercall(&mut inner, hypercall);
+        if self.features.reference_tsc {
+            let tsc = inner.msr_reference_tsc.raw();
+            self.handle_wr_reference_tsc(&mut inner, tsc);
+        }
+    }
+}
+
 impl MsrHandler for HyperV {
     fn rdmsr(&self, vcpu_id: i32, msr: u32) -> RdmsrOutcome {
         if !is_hyperv_msr(msr) {
@@ -693,6 +708,34 @@ mod tests {
             dest.inner.lock().unwrap().hypercall_overlay.is_some(),
             "the destination must hold the hypercall page",
         );
+    }
+
+    fn page(hv: &HyperV, gpa: u64) -> Vec<u8> {
+        let mut out = vec![0u8; PAGE_SIZE];
+        hv.physmap
+            .lookup(gpa, PAGE_SIZE)
+            .expect("mapped")
+            .read_bytes(&mut out)
+            .expect("read");
+        out
+    }
+
+    #[test]
+    fn a_rolled_back_source_gets_its_hypercall_page_again() {
+        let hv = enlightenment();
+        hv.wrmsr(0, HV_X64_MSR_GUEST_OS_ID, 1);
+        hv.wrmsr(0, HV_X64_MSR_HYPERCALL, hypercall_msr(0x2000));
+        let stub = hypercall::build_page();
+        assert_eq!(page(&hv, 0x2000), stub.as_slice());
+
+        hv.pause_overlays();
+        assert_ne!(page(&hv, 0x2000), stub.as_slice(), "the guest's own");
+        hv.resume_overlays();
+        assert_eq!(page(&hv, 0x2000), stub.as_slice());
+        // Twice is harmless.
+        hv.resume_overlays();
+        assert_eq!(page(&hv, 0x2000), stub.as_slice());
+        assert_eq!(read(&hv, HV_X64_MSR_HYPERCALL), hypercall_msr(0x2000));
     }
 
     #[test]

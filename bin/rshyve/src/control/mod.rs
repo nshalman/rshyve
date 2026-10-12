@@ -39,6 +39,7 @@
 
 mod dispatch;
 mod handover;
+mod import_status;
 mod listener;
 mod migrate;
 mod protocol;
@@ -81,6 +82,7 @@ use vmm_machine::{DeviceRegistry, HotplugEngines, SUSPEND_SOURCE_VMM};
 
 use crate::host_state::HostLocalState;
 
+pub use import_status::spawn_import_status;
 pub use listener::{spawn_control_thread, ControlListener};
 pub(crate) use migrate::device_blockers;
 use run_state::{LeaseOwner, StepFailed, StopFailure};
@@ -188,6 +190,9 @@ pub struct VmController {
     /// What `migrate-status` reports for the ring disks, once a
     /// migration moved them.
     rings: Mutex<Option<&'static str>>,
+    /// One `migrate-resume-source` at a time: a second one that found
+    /// the guest already running would detach its disks.
+    resuming_source: Mutex<()>,
     log: Logger,
 }
 
@@ -253,6 +258,7 @@ impl VmController {
             host_local_state: migration.host_local_state,
             allow_unproven: AtomicBool::new(false),
             rings: Mutex::new(None),
+            resuming_source: Mutex::new(()),
             log,
         })
     }
@@ -328,8 +334,8 @@ impl VmController {
                 report.names()
             )));
         }
-        // The kernel rings last: a ring paused before its device's
-        // workers stop would still be asked for descriptors.
+        // The VM pause stopped the kernel rings already. This checks
+        // they still hold still before the export reads them.
         for named in &devices {
             named.device.pause_for_migration()?;
         }
@@ -422,6 +428,9 @@ impl VmController {
     /// guest kick on a stopped ring with EBUSY, so the guest would come
     /// back with a dead NIC.
     fn resume_devices_after_migration(&self) {
+        if let Some(hyperv) = &self.hyperv {
+            hyperv.resume_overlays();
+        }
         let devices = self.named_devices();
         resume_device_set(&devices);
         for named in &devices {

@@ -143,12 +143,14 @@ After the full push, iterative convergence passes send only dirty pages.
 The kernel's `VM_TRACK_DIRTY_PAGES` ioctl returns a bitmap of pages
 modified since the last query. Each pass:
 
-1. Sleep 500ms (let the guest dirty more pages, accumulate a meaningful delta)
-2. Query dirty bitmap
-3. Send dirty pages as sparse batches
-4. Log the dirty page count
+1. Query dirty bitmap
+2. Send dirty pages as sparse batches
+3. Log the dirty page count and how long the pass took
 
-Convergence stops when dirty pages drop below 1024, or after 5 iterations.
+The passes run back to back. The final pass, with the guest paused, sends
+what the guest wrote during the last one, so the guest pauses once a pass
+takes 50 ms or less, or finds no dirty page. Three passes that do not
+shrink by a tenth, 30 passes, or 30 s of passes also end the pre-copy.
 Between passes, both contiguous and sparse page batches are used: contiguous
 pages share a single `PageBatch` message; non-contiguous pages use a
 `MemFetch` message (list of GPAs) followed by a `PageBatch`.

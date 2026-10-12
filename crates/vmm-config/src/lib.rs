@@ -280,6 +280,16 @@ pub struct Cli {
     #[arg(long)]
     pub migrate_allow_unproven_engine: bool,
 
+    /// Lab and CI only: add a device that fails this many migration
+    /// exports, then works. Both ends need the device, so a VM started
+    /// with either of the two fault flags migrates only to another one.
+    #[arg(long, hide = true)]
+    pub migrate_test_fail_exports: Option<usize>,
+
+    /// Lab and CI only: the same device, failing this many imports.
+    #[arg(long, hide = true)]
+    pub migrate_test_fail_imports: Option<usize>,
+
     /// A file of MantaBlock ring disks (`-s` specs) and migration
     /// settings, read at start and merged into this command line. It
     /// keeps the ring disks out of the brand's `bhyve-extra-opts`,

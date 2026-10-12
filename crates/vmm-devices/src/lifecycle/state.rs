@@ -102,6 +102,7 @@ pub enum DeviceMigrateState {
     FwCfg(FwCfgMigrateState),
     CpuHotplug(CpuHotplugMigrateState),
     MemHotplug(MemHotplugMigrateState),
+    TestFault(TestFaultMigrateState),
 }
 
 impl DeviceMigrateState {
@@ -120,6 +121,7 @@ impl DeviceMigrateState {
             Self::FwCfg(_) => "fwcfg",
             Self::CpuHotplug(_) => "cpu-hotplug",
             Self::MemHotplug(_) => "mem-hotplug",
+            Self::TestFault(_) => crate::testdev::KIND,
         }
     }
 }

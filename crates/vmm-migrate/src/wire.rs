@@ -110,6 +110,13 @@ impl Default for Deadlines {
     }
 }
 
+/// The longest a destination may wait for its disks to attach after
+/// the commit. It must end well before the source's `started` wait:
+/// otherwise the source reports an unconfirmed start while the
+/// destination may still run the guest, and the orchestrator could give
+/// the guest back to the source too.
+pub const MAX_DEST_ATTACH: Duration = Duration::from_secs(120);
+
 /// The stream plus its phase-aware deadline, so no read can block
 /// forever with the guest paused.
 pub struct Chan<S: Transport> {
@@ -293,6 +300,13 @@ pub fn set_phase(status: &Arc<Mutex<MigrationStatus>>, phase: MigrationPhase) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_destination_attach_ends_before_the_source_stops_waiting() {
+        // Room for the resume and the confirmation after the attach.
+        let margin = Duration::from_secs(20);
+        assert!(MAX_DEST_ATTACH + margin <= Deadlines::default().started);
+    }
 
     #[test]
     fn peer_text_strips_control_bytes_and_bounds_length() {

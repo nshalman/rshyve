@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use vmm_devices::lifecycle::{
-    DeviceStatePayload, UartMigrateState, XhciMigrateState,
+    DeviceStatePayload, UartMigrateState, VirtioMigrateState, XhciMigrateState,
 };
 
 use super::*;
@@ -38,6 +38,7 @@ fn config(
         devices,
         platform,
         deadlines: Deadlines::default(),
+        hyperv: false,
         allow_cpu_feature_mismatch: false,
     }
 }
@@ -167,4 +168,108 @@ fn an_xhci_controller_with_no_state_is_refused() {
         &discard(),
     )
     .expect("restore");
+}
+
+#[test]
+fn a_virtio_device_with_no_state_is_refused() {
+    static RESTORED: AtomicUsize = AtomicUsize::new(0);
+    let bdf = WireBdf {
+        bus: 0,
+        dev: 4,
+        func: 0,
+    };
+    let local = vec![DeviceIdentity {
+        bdf,
+        kind: "virtio-blk".to_string(),
+    }];
+    let none = state(vec![DeviceStatePayload { bdf, state: None }], Vec::new());
+    let error = restore_devices(
+        &none,
+        &config(local.clone(), Vec::new()),
+        &hooks(&RESTORED),
+        &discard(),
+    )
+    .expect_err("no virtio state");
+    assert!(error.to_string().contains("no virtio-blk state"), "{error}");
+
+    let some = state(
+        vec![DeviceStatePayload {
+            bdf,
+            state: Some(DeviceMigrateState::Virtio(
+                VirtioMigrateState::default(),
+            )),
+        }],
+        Vec::new(),
+    );
+    restore_devices(
+        &some,
+        &config(local, Vec::new()),
+        &hooks(&RESTORED),
+        &discard(),
+    )
+    .expect("restore");
+}
+
+#[test]
+fn a_hyperv_vm_needs_the_enlightenment_in_the_payload() {
+    static RESTORED: AtomicUsize = AtomicUsize::new(0);
+    let mut local = config(Vec::new(), Vec::new());
+    local.hyperv = true;
+    let error = restore_devices(
+        &state(Vec::new(), Vec::new()),
+        &local,
+        &hooks(&RESTORED),
+        &discard(),
+    )
+    .expect_err("no Hyper-V state");
+    assert!(error.to_string().contains("--hyperv"), "{error}");
+
+    // And the other way: the hook answers that this VM has none.
+    let mut payload = state(Vec::new(), Vec::new());
+    payload.hyperv = Some(HypervMigrateState::default());
+    restore_devices(
+        &payload,
+        &config(Vec::new(), Vec::new()),
+        &hooks(&RESTORED),
+        &discard(),
+    )
+    .expect_err("Hyper-V state for a VM without it");
+}
+
+#[test]
+fn a_kind_mismatch_in_a_payload_is_refused() {
+    // The device answers for its own kind; the hook here plays one.
+    let bdf = WireBdf {
+        bus: 0,
+        dev: 4,
+        func: 0,
+    };
+    let local = vec![DeviceIdentity {
+        bdf,
+        kind: "virtio-blk".to_string(),
+    }];
+    static RESTORED: AtomicUsize = AtomicUsize::new(0);
+    let mut wrong = hooks(&RESTORED);
+    wrong.restore = Box::new(|_, state| match state {
+        DeviceMigrateState::Virtio(_) => Ok(()),
+        other => Err(DeviceStateError::WrongKind {
+            want: "virtio",
+            got: other.kind(),
+        }),
+    });
+    let payload = state(
+        vec![DeviceStatePayload {
+            bdf,
+            state: Some(DeviceMigrateState::Xhci(XhciMigrateState::default())),
+        }],
+        Vec::new(),
+    );
+    let error = restore_devices(
+        &payload,
+        &config(local, Vec::new()),
+        &wrong,
+        &discard(),
+    )
+    .expect_err("xhci state for a virtio device");
+    assert!(error.to_string().contains("xhci"), "{error}");
 }

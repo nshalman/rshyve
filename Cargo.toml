@@ -32,6 +32,7 @@ members = [
 # its own workspace and lockfile. Excluding it keeps a host
 # `cargo build --workspace` off the Linux toolchain.
 exclude = [
+    "fuzz",
     "tools/fhrun-init",
     "tools/virtiofs-test",
 ]

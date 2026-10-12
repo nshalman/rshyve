@@ -26,8 +26,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use vmm_devices::blkdev::DiskSync;
-use vmm_devices::lifecycle::Indicator;
+use vmm_devices::blkdev::{BackingDisk, DiskSync};
+use vmm_devices::lifecycle::{BackingAttach, DeviceStateError, Indicator};
 use vmm_devices::{FlushError, FlushIntent, Lifecycle, QuiesceGate};
 
 use vmm_core::mem::PhysMap;
@@ -150,7 +150,7 @@ pub struct VirtioBlock {
     /// outlives a device that is dropped while a syscall is running.
     /// A worker holding a bare fd number would resume against whatever
     /// the host reopened on it.
-    disk: Arc<DiskSync>,
+    disk: Arc<BackingDisk>,
     /// Lifecycle state indicator.
     indicator: Indicator,
     gate: Arc<QuiesceGate>,
@@ -211,6 +211,24 @@ impl VirtioBlock {
         )
     }
 
+    /// A device over `disk`, which a migration destination opens only
+    /// at [`Lifecycle::attach_backing`].
+    pub fn with_disk(
+        disk: BackingDisk,
+        opts: &VirtioBlockOpts,
+        physmap: Arc<PhysMap>,
+        num_queues: u16,
+    ) -> std::io::Result<Self> {
+        Self::build(
+            disk,
+            opts,
+            physmap,
+            num_queues,
+            budget::INFLIGHT_BYTES,
+            PauseGrace::DEFAULT,
+        )
+    }
+
     fn with_budget(
         file: File,
         opts: &VirtioBlockOpts,
@@ -219,6 +237,28 @@ impl VirtioBlock {
         inflight_bytes: u64,
         pause_grace: PauseGrace,
         log: &slog::Logger,
+    ) -> std::io::Result<Self> {
+        // Turns a zvol's write cache on before any I/O, so first guest
+        // writes already hit the fast path.
+        let disk = DiskSync::new(Arc::new(file), opts.read_only, log)?;
+        let disk = BackingDisk::from_disk(Arc::new(disk), opts.read_only, log)?;
+        Self::build(
+            disk,
+            opts,
+            physmap,
+            num_queues,
+            inflight_bytes,
+            pause_grace,
+        )
+    }
+
+    fn build(
+        disk: BackingDisk,
+        opts: &VirtioBlockOpts,
+        physmap: Arc<PhysMap>,
+        num_queues: u16,
+        inflight_bytes: u64,
+        pause_grace: PauseGrace,
     ) -> std::io::Result<Self> {
         if num_queues > budget::MAX_QUEUES {
             return Err(std::io::Error::new(
@@ -229,16 +269,13 @@ impl VirtioBlock {
                 ),
             ));
         }
-        let metadata = file.metadata()?;
         // VirtIO 1.3 sec 5.2.4: capacity is in 512-byte sectors
         // whatever `blk_size` is, and sec 5.2.6 puts the request
         // sector in the same units. `sector_size` is the logical block
         // size the guest is told to align to, not the unit of either.
-        let capacity = metadata.len() / bits::SECTOR_SIZE;
+        let capacity = disk.capacity() / bits::SECTOR_SIZE;
         let read_only = opts.read_only;
-        // Turns a zvol's write cache on before any I/O, so first guest
-        // writes already hit the fast path.
-        let disk = Arc::new(DiskSync::new(Arc::new(file), read_only, log)?);
+        let disk = Arc::new(disk);
 
         // Workers per queue: NUM_WORKERS for single queue, 2 per queue for MQ.
         let limits = DiskLimits {
@@ -660,6 +697,11 @@ impl VirtioDevice for VirtioBlock {
             Some(q) => q,
             None => return false,
         };
+        // The chains stay in the ring; the resume after the attach
+        // kicks every queue.
+        if !self.disk.is_attached() {
+            return false;
+        }
 
         // Hold the admission until the hand-off to a worker. A pause
         // waits for it, so it never sees parked workers with a request
@@ -821,6 +863,10 @@ impl Lifecycle for VirtioBlock {
     }
 
     fn resume(&self) {
+        // Nothing may reach a store that is not open yet.
+        if !self.disk.is_attached() {
+            return;
+        }
         self.gate.resume();
         self.indicator.resume();
         self.kick_all();
@@ -830,12 +876,29 @@ impl Lifecycle for VirtioBlock {
         self.indicator.halt();
     }
 
+    fn backing_attached(&self) -> bool {
+        self.disk.is_attached()
+    }
+
+    fn attach_backing(
+        &self,
+        how: &BackingAttach,
+    ) -> Result<(), DeviceStateError> {
+        self.disk
+            .attach(how.until)
+            .map_err(|e| DeviceStateError::Invalid(format!("virtio-blk: {e}")))
+    }
+
     fn flush_backing(&self, intent: FlushIntent) -> Result<(), FlushError> {
+        // Nothing was written to a store that never opened.
+        let Some(disk) = self.disk.get() else {
+            return Ok(());
+        };
         // A parked worker can still take queued work.
         let budget = &self.ctx.budget;
         let flushed = vmm_devices::quiesce::flush_file_when(
             &self.gate,
-            &self.disk,
+            disk,
             intent,
             "virtio-blk",
             || budget.is_idle(),

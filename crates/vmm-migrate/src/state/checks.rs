@@ -9,7 +9,7 @@
 
 use bhyve_api::{
     vdi_field_entry_v1, vdi_version_entry_v1, vm_reg_name, VDC_LAPIC, VDC_MSR,
-    VDC_VERSION,
+    VDC_PMU_AMD, VDC_VERSION,
 };
 use std::mem::size_of;
 use vmm_core::hdl::VmmHdl;
@@ -131,6 +131,79 @@ pub(super) fn parse_vcpu_regs(
     Ok(out)
 }
 
+/// Registers a v9 source did not send.
+const V10_REGS: [vm_reg_name; 6] = [
+    vm_reg_name::VM_REG_GUEST_DR0,
+    vm_reg_name::VM_REG_GUEST_DR1,
+    vm_reg_name::VM_REG_GUEST_DR2,
+    vm_reg_name::VM_REG_GUEST_DR3,
+    vm_reg_name::VM_REG_GUEST_DR6,
+    vm_reg_name::VM_REG_GUEST_INTR_SHADOW,
+];
+
+/// Every register this build exports, each once, and nothing else. A
+/// register left out would resume at the destination's reset value.
+///
+/// A v9 source sends the list without [`V10_REGS`].
+fn check_register_set(
+    vcpuid: i32,
+    writes: &[RegWrite],
+    v10_peer: bool,
+) -> Result<(), MigrateError> {
+    use std::collections::BTreeSet;
+    let id = |r: vm_reg_name| r as i32;
+    let mut want: BTreeSet<i32> =
+        super::VCPU_REGS.iter().map(|&r| id(r)).collect();
+    want.insert(id(vm_reg_name::VM_REG_GUEST_INTR_SHADOW));
+    if !v10_peer {
+        for r in V10_REGS {
+            want.remove(&id(r));
+        }
+    }
+    let want_seg: BTreeSet<i32> =
+        super::VCPU_SEG_DESCS.iter().map(|&r| id(r)).collect();
+
+    let (mut regs, mut segs) = (BTreeSet::new(), BTreeSet::new());
+    for write in writes {
+        let (set, reg) = match *write {
+            RegWrite::Reg(reg, value) => {
+                // get_reg answers 0 or 1 on both VMX and SVM.
+                if matches!(reg, vm_reg_name::VM_REG_GUEST_INTR_SHADOW)
+                    && value > 1
+                {
+                    return Err(MigrateError::State(format!(
+                        "vcpu {vcpuid}: interrupt shadow {value:#x}"
+                    )));
+                }
+                (&mut regs, reg)
+            }
+            RegWrite::Seg(reg, ..) => (&mut segs, reg),
+        };
+        if !set.insert(id(reg)) {
+            return Err(MigrateError::State(format!(
+                "vcpu {vcpuid}: register {reg:?} appears twice"
+            )));
+        }
+    }
+    if regs != want || segs != want_seg {
+        let missing: Vec<i32> = want
+            .difference(&regs)
+            .chain(want_seg.difference(&segs))
+            .copied()
+            .collect();
+        let extra: Vec<i32> = regs
+            .difference(&want)
+            .chain(segs.difference(&want_seg))
+            .copied()
+            .collect();
+        return Err(MigrateError::State(format!(
+            "vcpu {vcpuid}: register set differs: missing ids {missing:?}, \
+             unexpected ids {extra:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// The vmm-data class shapes the local kernel registers, read from
 /// VDC_VERSION: one entry per (class, version) pair, with the total
 /// length the kernel expects (`vve_len_expect`, 0 when variable) and
@@ -139,11 +212,14 @@ pub(super) fn parse_vcpu_regs(
 pub(super) fn read_class_layouts(
     hdl: &VmmHdl,
 ) -> Result<Vec<vdi_version_entry_v1>, MigrateError> {
-    hdl.data_op(VDC_VERSION, 1)
-        .read_all::<vdi_version_entry_v1>()
-        .map_err(|e| {
-            MigrateError::State(format!("read local class versions: {e:?}"))
-        })
+    super::with_vm_data(
+        hdl,
+        VDC_VERSION,
+        1,
+        "read local class versions",
+        |op| op.read_all::<vdi_version_entry_v1>(),
+    )
+    .map_err(|e| MigrateError::State(e.to_string()))
 }
 
 /// Check one state blob against the local kernel's shape for its class.
@@ -241,6 +317,8 @@ pub(super) fn check_device_state(
     state: &DeviceState,
     layouts: &[vdi_version_entry_v1],
     num_cpus: u32,
+    amd_host: bool,
+    v10_peer: bool,
 ) -> Result<(), MigrateError> {
     // One payload per vCPU, no more and no fewer. The kernel accepts
     // any id below VM_MAXCPU, so a payload for a vCPU this VM never
@@ -288,12 +366,40 @@ pub(super) fn check_device_state(
             1,
             vcpu.lapic.len(),
         )?;
+        if let Some(pmu) = &vcpu.pmu_amd {
+            // Only SVM keeps the state behind this class, though every
+            // v18 kernel lists it.
+            if !amd_host {
+                return Err(MigrateError::State(format!(
+                    "vcpu {id}: payload carries AMD PMU state, and this \
+                     host is not AMD"
+                )));
+            }
+            check_class_blob(
+                layouts,
+                &format!("vcpu {id} PMU_AMD"),
+                VDC_PMU_AMD,
+                1,
+                pmu.len(),
+            )?;
+        }
         if vcpu.registers.is_empty() {
             return Err(MigrateError::State(format!(
                 "vcpu {id}: register state is missing from the payload"
             )));
         }
-        parse_vcpu_regs(id, &vcpu.registers)?;
+        let writes = parse_vcpu_regs(id, &vcpu.registers)?;
+        check_register_set(id, &writes, v10_peer)?;
+        super::debugregs::check_debug_regs(id, &writes)?;
+    }
+
+    // A source carries it for every vCPU or for none.
+    let with_pmu = state.vcpus.iter().filter(|v| v.pmu_amd.is_some()).count();
+    if with_pmu != 0 && with_pmu != state.vcpus.len() {
+        return Err(MigrateError::State(format!(
+            "payload carries AMD PMU state for {with_pmu} of {} vCPUs",
+            state.vcpus.len()
+        )));
     }
 
     let mut seen_class = std::collections::HashSet::new();
@@ -357,6 +463,9 @@ pub(crate) mod fixtures {
 
     pub(crate) const TEST_DEV_LEN: usize = 8;
 
+    pub(crate) const PMU_AMD_LEN: usize =
+        size_of::<bhyve_api::vdi_pmu_amd_v1>();
+
     /// An FXSAVE-only host: the legacy region and the XSAVE header.
     pub(crate) const TEST_XSAVE_LEN: usize = 576;
 
@@ -384,6 +493,7 @@ pub(crate) mod fixtures {
             entry(bhyve_api::VDC_VMM_ARCH, 1, 0, item),
             entry(VDC_LAPIC, 1, lapic_len, 0),
             entry(VDC_VMM_TIME, 1, 0, 0),
+            entry(VDC_PMU_AMD, 1, PMU_AMD_LEN as u16, 0),
         ];
         for &(_, class, version) in SYSTEM_DEVICES {
             out.push(entry(class, version, TEST_DEV_LEN as u16, 0));
@@ -416,11 +526,23 @@ pub(crate) mod fixtures {
         data
     }
 
+    /// Every register a current source sends.
+    pub(crate) fn full_reg_blob(shadow: u64) -> Vec<u8> {
+        let mut regs: Vec<(vm_reg_name, u64)> = super::super::VCPU_REGS
+            .iter()
+            .map(|&r| (r, 0x1234))
+            .collect();
+        regs.push((vm_reg_name::VM_REG_GUEST_INTR_SHADOW, shadow));
+        reg_blob(&regs, super::super::VCPU_SEG_DESCS)
+    }
+
     pub(crate) fn default_reg_blob() -> Vec<u8> {
-        reg_blob(
-            &[(vm_reg_name::VM_REG_GUEST_RAX, 0x1234)],
-            &[vm_reg_name::VM_REG_GUEST_CS],
-        )
+        full_reg_blob(0)
+    }
+
+    /// The number of writes [`default_reg_blob`] decodes to.
+    pub(crate) fn full_reg_count() -> usize {
+        super::super::VCPU_REGS.len() + 1 + super::super::VCPU_SEG_DESCS.len()
     }
 
     pub(crate) fn vcpu_payload(vcpuid: i32) -> VcpuStatePayload {
@@ -433,6 +555,7 @@ pub(crate) mod fixtures {
             vmm_arch: field_entries(2),
             run_state: bhyve_api::VRS_RUN,
             sipi_vector: 0,
+            pmu_amd: None,
         }
     }
 
@@ -477,6 +600,44 @@ mod tests {
         let mut blob = default_reg_blob();
         blob.push(0);
         assert!(parse_vcpu_regs(0, &blob).is_err());
+    }
+
+    fn decoded(blob: &[u8]) -> Vec<RegWrite> {
+        parse_vcpu_regs(0, blob).expect("decodes")
+    }
+
+    #[test]
+    fn the_register_set_must_be_whole() {
+        let full = decoded(&default_reg_blob());
+        check_register_set(0, &full, true).expect("current");
+        check_register_set(0, &full, false).expect_err("v9 sends no DRs");
+
+        let mut short = full.clone();
+        short.retain(|w| {
+            !matches!(w, RegWrite::Reg(vm_reg_name::VM_REG_GUEST_DR6, _))
+        });
+        let error = check_register_set(0, &short, true).expect_err("no DR6");
+        assert!(error.to_string().contains("missing"), "{error}");
+
+        let mut twice = full.clone();
+        twice.push(full[0]);
+        let error = check_register_set(0, &twice, true).expect_err("twice");
+        assert!(error.to_string().contains("twice"), "{error}");
+
+        let v9: Vec<RegWrite> = full
+            .iter()
+            .copied()
+            .filter(|w| {
+                !matches!(w, RegWrite::Reg(r, _)
+                    if V10_REGS.iter().any(|&n| n as i32 == *r as i32))
+            })
+            .collect();
+        check_register_set(0, &v9, false).expect("a v9 source");
+        check_register_set(0, &v9, true).expect_err("a v10 source sends all");
+
+        let bad = decoded(&full_reg_blob(7));
+        let error = check_register_set(0, &bad, true).expect_err("shadow 7");
+        assert!(error.to_string().contains("shadow"), "{error}");
     }
 
     #[test]

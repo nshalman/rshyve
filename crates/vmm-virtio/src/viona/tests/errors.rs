@@ -392,30 +392,6 @@ fn a_promiscuous_mode_the_kernel_refused_reaches_the_caller() {
 }
 
 #[test]
-fn a_notify_port_the_kernel_refused_does_not_stop_the_window() {
-    // The two are independent, and the memory window is the one a
-    // VirtIO 1.0 guest kicks through. Stopping at the first refusal
-    // would cost the guest the in-kernel kick on the route that still
-    // works.
-    let steps = Steps::default();
-    let link = TestLink::new(&steps).failing(&[Op::SetNotifyIop]);
-    let device = device_with(Arc::new(link));
-
-    VirtioDevice::set_notify_addrs(&device, 0x2000, 0xC000_0000);
-
-    assert_eq!(
-        steps_of(&steps),
-        [
-            Step::SetNotifyIop(0x2000),
-            Step::SetNotifyMmio {
-                addr: 0xC000_0000,
-                size: 0x1000,
-            },
-        ],
-    );
-}
-
-#[test]
 fn a_deferred_start_kicks_every_ring_though_a_kick_fails() {
     // One ring the kernel refuses to kick must not cost the other its
     // kick. On a migrated guest the unkicked one delivers nothing

@@ -373,6 +373,7 @@ pub(super) fn migrate_source(
         gate,
         gate_budget,
         handover: ctrl.has_handover_disks(),
+        hyperv: ctrl.hyperv.is_some(),
     };
 
     if let Err(e) =
@@ -687,6 +688,12 @@ pub(super) fn migrate_dest(
     if let Err(why) = claim_dest(&ctrl.run, &ctrl.registry) {
         return Response::err(&why);
     }
+    // A failed import may have installed them. The next RAM passes
+    // would land in the overlay pages, and an import at the same GPA
+    // keeps them.
+    if let Some(hyperv) = &ctrl.hyperv {
+        hyperv.pause_overlays();
+    }
 
     let status = Arc::new(Mutex::new(vmm_migrate::MigrationStatus::default()));
     if let Ok(mut ms) = ctrl.migrate_status.lock() {
@@ -704,6 +711,7 @@ pub(super) fn migrate_dest(
         devices: ctrl.migrate_identities(),
         platform: crate::platform::identities(&ctrl.registry),
         deadlines: vmm_migrate::wire::Deadlines::default(),
+        hyperv: ctrl.hyperv.is_some(),
         allow_cpu_feature_mismatch,
     };
 
@@ -760,6 +768,10 @@ pub(super) fn migrate_dest(
                 lease.release();
             })
     {
+        // Nothing was imported, so the guest keeps its own overlays.
+        if let Some(hyperv) = &ctrl.hyperv {
+            hyperv.resume_overlays();
+        }
         end_migration(ctrl);
         return Response::err(&format!(
             "failed to spawn migration thread: {e}"
@@ -784,7 +796,16 @@ fn connect_unix_patient(
 ) -> Result<UnixStream, String> {
     let until = std::time::Instant::now() + AGENT_SOCKET_WAIT;
     loop {
-        match connect_unix(run, path, log) {
+        // Bounded too: a listener with a full backlog holds a connect
+        // that has no deadline of its own.
+        let connected =
+            vmm_migrate::connect::unix_until(path, until, || run.cancelled())
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.map_err(|e| format!("{}: {e}", path.display())))
+                .and_then(|stream| {
+                    shut_on_stop(run, stream, log).map_err(|e| e.to_string())
+                });
+        match connected {
             Ok(stream) => return Ok(stream),
             Err(_) if run.cancelled() => {
                 return Err(vmm_migrate::CANCELLED.to_string())
@@ -931,6 +952,9 @@ pub(super) fn migrate_status(ctrl: &Arc<VmController>) -> Response {
             });
             if let Some(why) = &s.error {
                 data["migrate_error"] = why.clone().into();
+            }
+            if let Some(skew) = s.clock_skew_ms {
+                data["migrate_clock_skew_ms"] = skew.into();
             }
             if let Some(rings) = ctrl.rings_state() {
                 data["migrate_rings"] = rings.into();

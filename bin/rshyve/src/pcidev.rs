@@ -235,6 +235,7 @@ fn parse_and_create_pci_device(
                 &blk_opts,
                 num_vcpus,
                 lintr,
+                is_migrate_dest,
                 &virtio_ctx,
                 log,
             )?;
@@ -271,23 +272,26 @@ fn parse_and_create_pci_device(
         }
         "nvme" => match devspec::parse_nvme_config(config)? {
             devspec::NvmeSpec::File(path, blk_opts) => {
-                let file = vmm_devices::blkdev::open_disk(
+                let disk_log = log.new(slog::o!(
+                    "component" => "nvme",
+                    "path" => path.to_string(),
+                ));
+                // A destination opens the disk only after the commit:
+                // an open zvol refuses the last zfs increment as busy.
+                let disk = vmm_devices::blkdev::BackingDisk::new(
                     std::path::Path::new(path),
                     blk_opts.read_only,
+                    is_migrate_dest,
+                    &disk_log,
                 )
-                .with_context(|| format!("failed to open disk: {}", path))?;
-
-                let nvme = vmm_storage::nvme::NvmeController::new_with_logger(
-                    file,
-                    blk_opts.read_only,
+                .with_context(|| format!("failed to open disk: {path}"))?;
+                let nvme = vmm_storage::nvme::NvmeController::with_disk(
+                    disk,
                     bdf.dev(), // unique instance ID per slot
                     Arc::clone(physmap),
                     Arc::clone(vmm_hdl),
                     Arc::clone(bus_mmio),
-                    log.new(slog::o!(
-                        "component" => "nvme",
-                        "path" => path.to_string(),
-                    )),
+                    disk_log,
                 )
                 .with_context(|| {
                     format!("failed to create nvme for: {path}")
