@@ -514,23 +514,31 @@ fn dispatch_client_message(
 
 /// Read what the client sent and act on it, folding the updates it asks
 /// for into `pending`. False once the client has closed the connection.
+///
+/// Every message already received is handled, not only the first: a
+/// client can ask for updates faster than frames go out, and its input
+/// would otherwise wait a frame interval behind each request.
 fn read_client_messages<R: Read>(
     dev: &VncServer,
     view: &mut ClientView,
     reader: &mut BufReader<R>,
     pending: &mut Option<UpdateRequest>,
 ) -> io::Result<bool> {
-    match rfb::read_client_message(reader) {
-        Ok(Some(msg)) => {
-            if let Some(req) = dispatch_client_message(dev, view, msg) {
-                *pending = Some(req.merge(*pending));
+    loop {
+        match rfb::read_client_message(reader) {
+            Ok(Some(msg)) => {
+                if let Some(req) = dispatch_client_message(dev, view, msg) {
+                    *pending = Some(req.merge(*pending));
+                }
             }
+            Ok(None) => return Ok(false),
+            Err(e) if rfb::is_read_timeout(&e) => return Ok(true),
+            Err(e) => return Err(e),
         }
-        Ok(None) => return Ok(false),
-        Err(e) if rfb::is_read_timeout(&e) => {}
-        Err(e) => return Err(e),
+        if reader.buffer().is_empty() {
+            return Ok(true);
+        }
     }
-    Ok(true)
 }
 
 /// Handle a single VNC client connection.
@@ -1084,6 +1092,39 @@ mod tests {
         )
         .is_none());
         assert_eq!(keyboard.events(), vec![(true, 0xff0d)]);
+    }
+
+    /// A client may send update requests far faster than frames go out,
+    /// as macOS Screen Sharing does. Whatever has arrived is handled in
+    /// one pass, so input behind the requests is not held for a frame
+    /// interval per message.
+    #[test]
+    fn messages_already_received_are_handled_together() {
+        let input = Arc::new(InputBroker::default());
+        let keyboard = Arc::new(RecordingKeyboard::default());
+        input.set_keyboard(keyboard.clone());
+        let dev = serve_with_input(&make_test_dev(), input);
+
+        let mut wire = Vec::new();
+        for _ in 0..500 {
+            // FramebufferUpdateRequest: incremental, 3440x1440 at 0,0
+            wire.extend_from_slice(&[3, 1, 0, 0, 0, 0, 0x0d, 0x70, 0x05, 0xa0]);
+        }
+        // KeyEvent: Return down
+        wire.extend_from_slice(&[4, 1, 0, 0, 0, 0, 0xff, 0x0d]);
+        let mut reader = BufReader::new(io::Cursor::new(wire));
+        let mut pending = None;
+
+        let open = read_client_messages(
+            &dev,
+            &mut announced(1024, 768),
+            &mut reader,
+            &mut pending,
+        )
+        .expect("read");
+        assert!(open);
+        assert_eq!(keyboard.events(), vec![(true, 0xff0d)]);
+        assert_eq!(pending, Some(UpdateRequest::Incremental));
     }
 
     /// Read what one full update put on the wire: the rectangle headers.
