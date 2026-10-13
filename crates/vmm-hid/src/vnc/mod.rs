@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use anyhow::Context;
 use vmm_core::unixsock::accept::accept_loop;
 use vmm_core::unixsock::write_all_bounded;
 use vmm_devices::display::{changed_tiles, DisplaySource, Pixels, Rect};
@@ -83,7 +84,8 @@ impl VncServer {
     ///
     /// # Errors
     ///
-    /// Returns an error if the socket cannot be bound.
+    /// Returns an error if the socket cannot be bound or the server's
+    /// thread cannot start.
     pub fn start(
         name: &str,
         source: Arc<dyn DisplaySource>,
@@ -99,10 +101,17 @@ impl VncServer {
         let srv = Arc::new(Self::new(source, path, password, input, log));
 
         let server = Arc::clone(&srv);
-        let handle = thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name(name.into())
-            .spawn(move || server_loop(server, listener))
-            .expect("vnc: failed to spawn VNC server thread");
+            .spawn(move || server_loop(server, listener));
+        let handle = match spawned {
+            Ok(handle) => handle,
+            Err(e) => {
+                // The thread that would have removed the socket never ran.
+                let _ = std::fs::remove_file(path);
+                return Err(e).context("vnc: spawning the server thread");
+            }
+        };
         *srv.thread.lock().expect("vnc: thread lock") = Some(handle);
 
         Ok(srv)
