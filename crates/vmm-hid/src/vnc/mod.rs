@@ -291,7 +291,10 @@ fn server_loop(srv: Arc<VncServer>, listener: UnixListener) {
         // The newest client wins: one whose connection went dead would
         // otherwise hold VNC for everyone until it timed out.
         if let Some(old) = current.take() {
-            slog::info!(srv.log, "VNC client replaced by a new one");
+            // One that already went away was logged as disconnected.
+            if !old.gone.load(Ordering::Acquire) {
+                slog::info!(srv.log, "VNC client replaced by a new one");
+            }
             old.end(&srv.log);
         }
         current = Client::serve(&srv, stream);
@@ -310,6 +313,8 @@ struct Client {
     /// from whatever it waits on.
     stream: UnixStream,
     thread: thread::JoinHandle<()>,
+    /// Set by the client's thread before it logs the disconnect.
+    gone: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -322,6 +327,8 @@ impl Client {
             }
         };
         let server = Arc::clone(srv);
+        let gone = Arc::new(AtomicBool::new(false));
+        let set_gone = Arc::clone(&gone);
         let spawned = thread::Builder::new().name("vnc-client".into()).spawn(
             move || {
                 slog::info!(server.log, "VNC client connected");
@@ -330,6 +337,7 @@ impl Client {
                         slog::warn!(server.log, "VNC client error"; "error" => %e);
                     }
                 }
+                set_gone.store(true, Ordering::Release);
                 slog::info!(server.log, "VNC client disconnected");
             },
         );
@@ -337,6 +345,7 @@ impl Client {
             Ok(thread) => Some(Self {
                 stream: ours,
                 thread,
+                gone,
             }),
             Err(e) => {
                 slog::warn!(srv.log, "VNC client not served"; "error" => %e);
@@ -2371,6 +2380,70 @@ mod tests {
         let mut rest = Vec::new();
         let ended = first.read_to_end(&mut rest);
         assert!(ended.is_ok(), "the first was dropped: {ended:?}");
+        srv.shutdown();
+    }
+
+    /// Records the messages logged to it.
+    struct Messages(Arc<Mutex<Vec<String>>>);
+
+    impl slog::Drain for Messages {
+        type Ok = ();
+        type Err = slog::Never;
+
+        fn log(
+            &self,
+            record: &slog::Record<'_>,
+            _values: &slog::OwnedKVList,
+        ) -> Result<(), slog::Never> {
+            self.0.lock().unwrap().push(record.msg().to_string());
+            Ok(())
+        }
+    }
+
+    /// Only a client still being served is logged as replaced: one that
+    /// already went away was logged as disconnected and is not replaced
+    /// by the next.
+    #[test]
+    fn only_a_client_still_served_is_logged_as_replaced() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let count = |msg: &str| {
+            messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == msg)
+                .count()
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("vnc.sock");
+        let srv = VncServer::start(
+            "vnc-replaced",
+            make_test_dev() as Arc<dyn DisplaySource>,
+            &path,
+            None,
+            Arc::new(InputBroker::default()),
+            slog::Logger::root(Messages(Arc::clone(&messages)), slog::o!()),
+        )
+        .expect("start");
+        let timeout = Some(Duration::from_secs(5));
+        let connect = || {
+            let mut client = UnixStream::connect(&path).expect("connect");
+            client.set_read_timeout(timeout).expect("timeout");
+            assert!(handshake(&mut client).is_ok(), "served");
+            client
+        };
+
+        drop(connect());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while count("VNC client disconnected") == 0 {
+            assert!(Instant::now() < deadline, "the first went away");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _second = connect();
+        assert_eq!(count("VNC client replaced by a new one"), 0);
+
+        let _third = connect();
+        assert_eq!(count("VNC client replaced by a new one"), 1);
         srv.shutdown();
     }
 
