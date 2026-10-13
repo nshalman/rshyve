@@ -45,8 +45,23 @@ const BYTES_PER_PIXEL: u64 = 4;
 /// reading costs every later viewer as well.
 const VNC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// VNC update interval (~30 fps).
+/// VNC update interval (~30 fps) for a display the guest cannot be paced
+/// on, fbuf: it reports its whole frame changed on every pass.
 const VNC_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// The update interval for a display that takes a pace: 60 frames a
+/// second, what a client's display shows, while the client keeps up; the
+/// guest is paced to what it gets.
+const FAST_FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+/// How often to look for a frame to send for `source`.
+fn frame_interval(source: &dyn DisplaySource) -> Duration {
+    if source.takes_pace() {
+        FAST_FRAME_INTERVAL
+    } else {
+        VNC_FRAME_INTERVAL
+    }
+}
 
 /// How long one poll for a client message waits. The same thread sends
 /// frames, so this bounds how late a frame can be.
@@ -91,10 +106,11 @@ struct ClientPace {
 }
 
 impl ClientPace {
-    fn new(source: Arc<dyn DisplaySource>) -> Self {
+    /// Paced no faster than `floor`, the server's own frame interval.
+    fn new(source: Arc<dyn DisplaySource>, floor: Duration) -> Self {
         Self {
             source,
-            pace: FramePace::new(VNC_FRAME_INTERVAL),
+            pace: FramePace::new(floor),
         }
     }
 
@@ -456,9 +472,10 @@ fn handle_vnc_client(
     // incremental request waits here until the display has damage.
     let mut pending: Option<UpdateRequest> = None;
     stream.set_read_timeout(Some(CLIENT_POLL))?;
-    let mut ticker = Ticker::new(Instant::now(), VNC_FRAME_INTERVAL);
+    let interval = frame_interval(dev.source.as_ref());
+    let mut ticker = Ticker::new(Instant::now(), interval);
     // Withdrawn when the client goes, however the loop ends.
-    let mut pace = ClientPace::new(Arc::clone(&dev.source));
+    let mut pace = ClientPace::new(Arc::clone(&dev.source), interval);
 
     while !dev.shutdown.load(Ordering::Relaxed) {
         match rfb::read_client_message(&mut reader) {
@@ -1977,9 +1994,28 @@ mod tests {
             Ok(())
         }
 
+        fn takes_pace(&self) -> bool {
+            true
+        }
+
         fn pace(&self, interval: Option<Duration>) {
             self.0.lock().unwrap().push(interval);
         }
+    }
+
+    /// A display the guest can be paced on is served at 60 frames a
+    /// second, so a client that keeps up may have the guest flip that
+    /// fast; one that cannot, fbuf, at 30, whatever it is asked.
+    #[test]
+    fn the_frame_interval_follows_whether_the_display_takes_a_pace() {
+        assert_eq!(
+            frame_interval(&PaceRecorder::default()),
+            FAST_FRAME_INTERVAL
+        );
+        assert_eq!(
+            frame_interval(make_test_dev().as_ref()),
+            VNC_FRAME_INTERVAL
+        );
     }
 
     /// A client's frames pace the guest to the rate they go out at, no
@@ -1989,14 +2025,15 @@ mod tests {
         let source = Arc::new(PaceRecorder::default());
         let ms = Duration::from_millis;
         {
-            let mut pace = ClientPace::new(Arc::clone(&source) as _);
+            let mut pace =
+                ClientPace::new(Arc::clone(&source) as _, FAST_FRAME_INTERVAL);
             pace.frame(ms(1));
             pace.frame(ms(90));
         }
         let asked = source.0.lock().unwrap().clone();
-        assert_eq!(asked[0], Some(VNC_FRAME_INTERVAL), "no faster than VNC");
+        assert_eq!(asked[0], Some(FAST_FRAME_INTERVAL), "no faster than VNC");
         assert!(
-            asked[1].is_some_and(|i| i > VNC_FRAME_INTERVAL),
+            asked[1].is_some_and(|i| i > FAST_FRAME_INTERVAL),
             "{asked:?}"
         );
         assert_eq!(asked.last(), Some(&None), "withdrawn: {asked:?}");

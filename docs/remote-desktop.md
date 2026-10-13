@@ -189,8 +189,8 @@ dtrace -n 'vmm$target:::egfx_overlay { overlay = 1; }' -p $(pgrep -x rshyve)
 ```
 
 The pace: with no client, virtio-gpu lets a Linux guest flip 30
-times a second. A VNC client asks for the rate its frames go out at, no
-faster than 30. With an RDP client on the graphics pipeline (EGFX), the
+times a second. A VNC client asks for the rate its frames go out at, up
+to 60. With an RDP client on the graphics pipeline (EGFX), the
 RDP server asks for the rate it is managing to send at, slower when frames
 take longer to encode or the client refuses them because it has too
 many unacknowledged, or because it has not read 32 MiB of frames and audio

@@ -114,6 +114,13 @@ pub trait DisplaySource: Send + Sync {
     /// the device's own pace; `None` withdraws the request. A device that
     /// cannot pace the guest ignores it, which is the default.
     fn pace(&self, _interval: Option<Duration>) {}
+
+    /// Whether [`pace`](Self::pace) reaches the guest, so a server may
+    /// run faster than its own default and pace the guest to what it
+    /// manages. False, the default, for a device that cannot.
+    fn takes_pace(&self) -> bool {
+        false
+    }
 }
 
 /// What a server hands a display to be woken by.
@@ -258,6 +265,10 @@ impl DisplaySource for DisplayView {
     fn pace(&self, interval: Option<Duration>) {
         *lock(&self.state.pace) = interval;
         self.shared.repace();
+    }
+
+    fn takes_pace(&self) -> bool {
+        self.shared.inner.takes_pace()
     }
 }
 

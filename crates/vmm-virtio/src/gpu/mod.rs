@@ -313,6 +313,10 @@ impl vmm_devices::display::DisplaySource for GpuDisplay {
         self.wakers.add(waker);
     }
 
+    fn takes_pace(&self) -> bool {
+        true
+    }
+
     fn pace(&self, interval: Option<Duration>) {
         let nanos = interval.map_or(0, |i| {
             u64::try_from(i.as_nanos()).unwrap_or(u64::MAX).max(1)
