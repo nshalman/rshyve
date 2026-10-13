@@ -10,6 +10,7 @@
 //! entry it repeats.
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -147,6 +148,13 @@ fn once<J: Job>(
             "the engine changed the grant: {:?}",
             att.grant()
         )));
+    }
+    // Before the bound check: a downgraded engine must clear it even when
+    // this attempt fails.
+    let was = shared.migrate_v1.swap(att.migrate_v1, Ordering::AcqRel);
+    if was != att.migrate_v1 {
+        slog::info!(shared.log, "mantablock: the engine changed migrate-v1";
+            "migrate_v1" => att.migrate_v1);
     }
     if Instant::now() >= until {
         return Err(Failed::Retry("attached past the bound".into()));

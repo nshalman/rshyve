@@ -214,8 +214,6 @@ pub struct Handover<J: Job> {
     /// One attach at a time, so two never both connect and race for
     /// the slot.
     attaching: Mutex<()>,
-    /// The engine of the last attachment agreed to [`crate::MIGRATE_V1`].
-    migrate_v1: AtomicBool,
     halted: AtomicBool,
 }
 
@@ -223,7 +221,6 @@ impl<J: Job> Handover<J> {
     /// The backend over an attachment made at device create.
     pub fn attached(c: Connected, sink: Arc<dyn Sink<J::Id>>) -> Arc<Self> {
         let shape = RingShape::of(&c.att);
-        let migrate_v1 = c.att.migrate_v1;
         let cfg = c.cfg.clone();
         let ring = c.start(Arc::clone(&sink));
         Arc::new(Self {
@@ -232,7 +229,6 @@ impl<J: Job> Handover<J> {
             sink,
             ring: RwLock::new(Some(ring)),
             attaching: Mutex::new(()),
-            migrate_v1: AtomicBool::new(migrate_v1),
             halted: AtomicBool::new(false),
         })
     }
@@ -256,7 +252,6 @@ impl<J: Job> Handover<J> {
             sink,
             ring: RwLock::new(None),
             attaching: Mutex::new(()),
-            migrate_v1: AtomicBool::new(false),
             halted: AtomicBool::new(false),
         })
     }
@@ -299,7 +294,9 @@ impl<J: Job> Handover<J> {
     /// Why a migration should not carry this disk unless the operator
     /// accepts the risk.
     pub fn waivable(&self) -> Option<String> {
-        if !self.is_attached() || self.migrate_v1.load(Ordering::Acquire) {
+        // The ring's flag, not one kept here: a reattach after an engine
+        // restart changes it.
+        if self.current().is_none_or(|ring| ring.migrate_v1()) {
             return None;
         }
         Some(format!(
@@ -388,7 +385,6 @@ impl<J: Job> Handover<J> {
         }
         *slot = Some(ring);
         drop(slot);
-        self.migrate_v1.store(v1, Ordering::Release);
         slog::info!(self.cfg.log, "mantablock: attached for the guest";
             "volume" => %self.cfg.volume,
             "generation" => generation,

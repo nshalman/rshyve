@@ -57,6 +57,10 @@ pub(crate) struct Shared<J: Job> {
     stop: AtomicBool,
     /// The engine answered Detached.
     pub(crate) detached: AtomicBool,
+    /// The engine of the current attachment agreed to
+    /// [`crate::MIGRATE_V1`]. Each reattach sets it again, as the engine
+    /// may have restarted on another build.
+    pub(crate) migrate_v1: AtomicBool,
     /// The completion threads of the current attachment.
     reapers: Mutex<Vec<JoinHandle<()>>>,
     spin: Duration,
@@ -262,6 +266,7 @@ impl<J: Job> Ring<J> {
             durable,
             slots,
             pipes,
+            migrate_v1,
             ..
         } = att;
         let volume = Volume {
@@ -297,6 +302,7 @@ impl<J: Job> Ring<J> {
             halted: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             detached: AtomicBool::new(false),
+            migrate_v1: AtomicBool::new(migrate_v1),
             reapers: Mutex::new(Vec::new()),
             spin: cfg.spin,
             log: cfg.log.clone(),
@@ -391,6 +397,12 @@ impl<J: Job> Ring<J> {
     /// Whether a write is durable when it completes.
     pub fn durable(&self) -> bool {
         self.durable
+    }
+
+    /// Whether the engine of the current attachment agreed to
+    /// [`crate::MIGRATE_V1`].
+    pub fn migrate_v1(&self) -> bool {
+        self.shared.migrate_v1.load(Ordering::Acquire)
     }
 
     /// True once the engine is lost for good.
