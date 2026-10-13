@@ -275,7 +275,8 @@ impl Egfx {
             move || {
                 // Whether the guest is paced to this worker's frames.
                 let mut pace: Option<FramePace> = None;
-                let mut stats = crate::overlay::Stats::new(Instant::now());
+                let mut stats =
+                    vmm_devices::overlay::Stats::new(Instant::now());
                 while !stopped.load(Ordering::Acquire) {
                     let began = Instant::now();
                     if egfx.active() {
@@ -343,7 +344,7 @@ impl Egfx {
         let corner = [render.overlay.as_deref(), text.as_deref()]
             .into_iter()
             .flatten()
-            .map(crate::overlay::area)
+            .map(vmm_devices::overlay::area)
             .reduce(Rect::union);
         if let Some(corner) = corner {
             let mut st = self.lock();
@@ -611,7 +612,7 @@ fn encode(
     pixels.resize(w as usize * h as usize * 4, 0);
     source.read_rect(whole, pixels)?;
     if let Some(text) = overlay {
-        crate::overlay::draw(pixels, w, h, text);
+        vmm_devices::overlay::draw(pixels, w, h, text);
     }
     let tiles: Vec<(u32, u32)> = if *sent_surface == Some(frame.surface) {
         let view = |data| Pixels {
@@ -1371,7 +1372,7 @@ pub(crate) mod tests {
         h.egfx.set_overlay(Some("60 FPS".to_string()));
         h.egfx.update(&display);
         assert_eq!(h.frames(), 2, "a frame for the overlay alone");
-        let corner = crate::overlay::area("60 FPS");
+        let corner = vmm_devices::overlay::area("60 FPS");
         let across = (corner.x + corner.width).div_ceil(TILE);
         let down = (corner.y + corner.height).div_ceil(TILE);
         assert_eq!(
@@ -1395,7 +1396,7 @@ pub(crate) mod tests {
         let display = FakeDisplay::new(256, 128);
         h.egfx.set_overlay(Some("60 FPS".to_string()));
         h.egfx.update(&display);
-        let corner = crate::overlay::area("60 FPS");
+        let corner = vmm_devices::overlay::area("60 FPS");
 
         h.egfx.set_overlay(None);
         h.egfx.update(&display);

@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use vmm_devices::display::Rect;
+use crate::display::Rect;
 
 /// Pixels per font pixel, so the text reads on a large display.
 const SCALE: u32 = 2;
@@ -31,7 +31,7 @@ const WHITE: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
 
 /// The rectangle `text` covers in the top-left corner of a frame, before
 /// it is clipped to the frame.
-pub(crate) fn area(text: &str) -> Rect {
+pub fn area(text: &str) -> Rect {
     let chars = text.chars().count() as u32;
     Rect {
         x: MARGIN,
@@ -44,7 +44,7 @@ pub(crate) fn area(text: &str) -> Rect {
 /// Draw `text`, white on a black box, into `pixels`, a `width` x
 /// `height` frame of 4-byte XRGB pixels. What falls outside the frame is
 /// left out.
-pub(crate) fn draw(pixels: &mut [u8], width: u32, height: u32, text: &str) {
+pub fn draw(pixels: &mut [u8], width: u32, height: u32, text: &str) {
     let r = area(text);
     let mut put = |x: u32, y: u32, color: [u8; 4]| {
         if x < width && y < height {
@@ -114,7 +114,7 @@ fn glyph(c: char) -> [u8; 7] {
 
 /// The worker's frames over the current second, and the text the last
 /// whole second made.
-pub(crate) struct Stats {
+pub struct Stats {
     since: Instant,
     frames: u32,
     refused: u32,
@@ -125,7 +125,7 @@ pub(crate) struct Stats {
 }
 
 impl Stats {
-    pub(crate) fn new(now: Instant) -> Self {
+    pub fn new(now: Instant) -> Self {
         Self {
             since: now,
             frames: 0,
@@ -139,12 +139,7 @@ impl Stats {
 
     /// Count a frame that took `cost` to make, which the client took or
     /// refused, after which the guest is asked for `pace`.
-    pub(crate) fn frame(
-        &mut self,
-        cost: Duration,
-        taken: bool,
-        pace: Duration,
-    ) {
+    pub fn frame(&mut self, cost: Duration, taken: bool, pace: Duration) {
         self.frames += 1;
         if !taken {
             self.refused += 1;
@@ -155,7 +150,7 @@ impl Stats {
     }
 
     /// At `now`, close the second if it is over and make its text.
-    pub(crate) fn roll(&mut self, now: Instant) {
+    pub fn roll(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.since);
         if elapsed < Duration::from_secs(1) {
             return;
@@ -180,7 +175,7 @@ impl Stats {
     }
 
     /// The text the last whole second made.
-    pub(crate) fn text(&self) -> &str {
+    pub fn text(&self) -> &str {
         &self.text
     }
 }

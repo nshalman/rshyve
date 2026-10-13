@@ -21,6 +21,7 @@ pub mod hotplug;
 pub mod input;
 pub mod lifecycle;
 pub mod migrate;
+pub mod overlay;
 pub mod pci;
 pub mod pvpanic;
 pub mod quiesce;
