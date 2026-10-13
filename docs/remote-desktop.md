@@ -77,6 +77,12 @@ Connect an RDP client to port 3389 as `console` with the password from
 the file. Expect the client to ask whether to trust the self-signed
 certificate.
 
+A VNC client connects to the Unix socket, through a forward for one on
+another machine. macOS Screen Sharing needs a VNC password: it will not
+connect to a server that offers none, and cannot send an empty one.
+Give the display `password-file=` for it; VNC authentication uses only
+the first 8 characters.
+
 The bhyve UEFI firmware has no virtio-gpu driver, so nothing appears
 until the guest kernel's `virtio_gpu` driver loads. The example boots
 the kernel directly; for a UEFI guest, add an `fbuf` to see the

@@ -308,7 +308,7 @@ Path-escape defense is real and tested. `validate_name` (`fs/passthrough.rs:1318
 -s <slot>[:<func>],fbuf[,unix=<path>][,password-file=<path>][,password=<pw>][,w=<n>][,h=<n>][,vga=off]
 ```
 
-Those keys are the whole parser (`bin/rshyve/src/pcidev/display.rs`). Defaults: socket `/var/run/rshyve/<vm_name>/vnc.sock`, no password, 1024x768. Any other key is a startup error naming it, and so is a size that does not parse or is 0. `vga=off` is accepted and does nothing, because there is no VGA emulation; `vga=on`, and bhyve's `tcp=`, `rfb=` and `wait`, are refused. `password-file=` reads the password from a file; `password=` still works, but puts it in argv and logs a warning saying so.
+Those keys are the whole parser (`bin/rshyve/src/pcidev/display.rs`). Defaults: socket `/var/run/rshyve/<vm_name>/vnc.sock`, no password, 1024x768. Any other key is a startup error naming it, and so is a size that does not parse or is 0. `vga=off` is accepted and does nothing, because there is no VGA emulation; `vga=on`, and bhyve's `tcp=`, `rfb=` and `wait`, are refused. `password-file=` reads the password from a file; `password=` still works, but puts it in argv and logs a warning saying so. macOS Screen Sharing connects only to a display with a password.
 
 PCI identity 0xFB5D:0x40FB matches C bhyve's `pci_fbuf`, so the OVMF bhyve GOP driver binds. BAR1 is a fixed 16 MiB XRGB8888 framebuffer backed by a devmem segment mapped into the guest, not a trapping MMIO region. Each fbuf consumes one VM memory segment; exhausting them fails attach.
 
