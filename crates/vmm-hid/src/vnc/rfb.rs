@@ -195,34 +195,41 @@ pub fn handshake_version<S: Read + Write>(stream: &mut S) -> io::Result<u16> {
     Ok(minor)
 }
 
-/// Perform the security handshake (server side, no auth).
+/// Perform the security handshake for a client that chose RFB 3.`minor`.
 ///
-/// Sends the security type list and reads the client's selection.
-/// If `password` is `Some`, offers VncAuth; otherwise offers None.
-/// Returns the selected security type.
+/// VncAuth when `password` is `Some`, otherwise None. From 3.7 the server
+/// lists the types and the client chooses; 3.3 (RFC 6143 appendix A)
+/// has the server send the one type as a U32, which macOS Screen Sharing
+/// asks for. A SecurityResult follows VncAuth in every version, and None
+/// only from 3.8. Returns the type used.
 pub fn handshake_security<S: Read + Write>(
     stream: &mut S,
     password: Option<&str>,
+    minor: u16,
 ) -> io::Result<u8> {
-    if let Some(_pw) = password {
-        // Only offer VncAuth when password is configured
-        stream.write_all(&[1, SECURITY_VNC_AUTH])?;
+    let offered = if password.is_some() {
+        SECURITY_VNC_AUTH
     } else {
-        // Offer only None
-        stream.write_all(&[1, SECURITY_NONE])?;
-    }
-    stream.flush()?;
-
-    // Read client's selected security type (1 byte)
-    let mut sel = [0u8; 1];
-    stream.read_exact(&mut sel)?;
-    let selected = sel[0];
+        SECURITY_NONE
+    };
+    let selected = if minor < 7 {
+        stream.write_all(&u32::from(offered).to_be_bytes())?;
+        stream.flush()?;
+        offered
+    } else {
+        stream.write_all(&[1, offered])?;
+        stream.flush()?;
+        let mut sel = [0u8; 1];
+        stream.read_exact(&mut sel)?;
+        sel[0]
+    };
 
     match selected {
         SECURITY_NONE if password.is_none() => {
-            // SecurityResult: OK (only when no password configured)
-            stream.write_all(&SECURITY_RESULT_OK.to_be_bytes())?;
-            stream.flush()?;
+            if minor >= 8 {
+                stream.write_all(&SECURITY_RESULT_OK.to_be_bytes())?;
+                stream.flush()?;
+            }
             Ok(SECURITY_NONE)
         }
         SECURITY_NONE => {
@@ -678,6 +685,70 @@ pub fn read_client_message<R: BufRead>(
 mod tests {
     use super::*;
     use std::io::{BufReader, Cursor};
+
+    /// A client that sends `input` and records what the server writes.
+    struct Script {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Script {
+        fn new(input: &[u8]) -> Self {
+            Self {
+                input: Cursor::new(input.to_vec()),
+                output: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for Script {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for Script {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// RFB 3.3 (RFC 6143 appendix A): the server chooses the security
+    /// type and sends it as a U32; the client sends no choice, and gets
+    /// no SecurityResult for None. macOS Screen Sharing answers 3.3.
+    #[test]
+    fn a_3_3_client_is_told_the_security_type() {
+        let mut client = Script::new(&[]);
+        let chosen = handshake_security(&mut client, None, 3).expect("none");
+        assert_eq!(chosen, SECURITY_NONE);
+        assert_eq!(client.output, [0, 0, 0, 1]);
+
+        // With a password: VNC authentication, its challenge, and the
+        // result of a wrong answer.
+        let mut client = Script::new(&[0; 16]);
+        let failed = handshake_security(&mut client, Some("secret"), 3);
+        assert!(failed.is_err());
+        assert_eq!(&client.output[..4], &[0, 0, 0, 2]);
+        assert_eq!(client.output.len(), 4 + 16 + 4);
+        assert_eq!(&client.output[20..], &[0, 0, 0, 1]);
+    }
+
+    /// RFB 3.7 lists the types and reads the client's choice, but sends
+    /// a SecurityResult for None only from 3.8 on.
+    #[test]
+    fn a_3_7_client_gets_no_result_for_none() {
+        let mut client = Script::new(&[SECURITY_NONE]);
+        handshake_security(&mut client, None, 7).expect("none");
+        assert_eq!(client.output, [1, SECURITY_NONE]);
+
+        let mut client = Script::new(&[SECURITY_NONE]);
+        handshake_security(&mut client, None, 8).expect("none");
+        assert_eq!(client.output, [1, SECURITY_NONE, 0, 0, 0, 0]);
+    }
 
     #[test]
     fn pixel_format_roundtrip() {

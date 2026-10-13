@@ -477,18 +477,19 @@ fn handle_vnc_client(
     // --- RFB handshake ---
 
     // Version handshake
-    rfb::handshake_version(&mut CombinedStream {
+    let minor = rfb::handshake_version(&mut CombinedStream {
         reader: &mut reader,
         writer: &mut writer,
     })?;
 
-    // Security handshake
+    // Security handshake, as the version the client chose has it
     rfb::handshake_security(
         &mut CombinedStream {
             reader: &mut reader,
             writer: &mut writer,
         },
         dev.password.as_deref(),
+        minor,
     )?;
 
     // ClientInit
