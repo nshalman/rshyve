@@ -615,6 +615,52 @@ fn an_unproven_engine_blocks_a_source_unless_the_operator_accepts_it() {
     );
 }
 
+/// A ring disk whose engine can change migrate-v1 under a live VM, as
+/// a reattach after an engine restart does.
+struct Restarted(Arc<std::sync::atomic::AtomicBool>);
+
+impl vmm_devices::Lifecycle for Restarted {
+    fn type_name(&self) -> &'static str {
+        "nvme"
+    }
+
+    fn migration_waivable(&self) -> Option<String> {
+        let proven = self.0.load(std::sync::atomic::Ordering::Acquire);
+        (!proven).then(|| "the engine does not report migrate-v1".into())
+    }
+}
+
+#[test]
+fn a_source_follows_migrate_v1_as_the_engine_changes() {
+    let registry = vmm_machine::DeviceRegistry::new();
+    let proven = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    registry
+        .insert(vmm_machine::RegisteredDevice::new(
+            "nvme@5",
+            vmm_machine::parse_bdf("5"),
+            None,
+            Some(Arc::new(Restarted(Arc::clone(&proven)))
+                as Arc<dyn vmm_devices::Lifecycle>),
+            None,
+        ))
+        .expect("insert");
+    let claim = || {
+        let run = RunControl::new(VmRunState::Running);
+        claim_source(
+            &run,
+            &HotplugEngines::default(),
+            &registry,
+            || identities(&registry),
+            false,
+        )
+    };
+    assert!(claim().is_err_and(|w| w.contains("nvme@5")));
+    proven.store(true, std::sync::atomic::Ordering::Release);
+    assert_eq!(claim(), Ok(()));
+    proven.store(false, std::sync::atomic::Ordering::Release);
+    assert!(claim().is_err_and(|w| w.contains("migrate-v1")));
+}
+
 #[test]
 fn migrate_config_gives_a_ring_disk_its_shape_once() {
     let registry = vmm_machine::DeviceRegistry::new();

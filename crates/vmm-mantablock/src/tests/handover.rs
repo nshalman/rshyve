@@ -6,6 +6,7 @@
 //! socket played by the test.
 
 use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -303,4 +304,63 @@ fn a_source_detaches_after_the_commit_and_attaches_again() {
     // The read went to the new ring, or failed in the halt.
     let sent = eng.take(8).len();
     assert!(sent == 1 || calls.status(2) == Some(BlockStatus::Internal));
+}
+
+/// An engine at `path` that stays up until the test shuts down the
+/// socket it gives back, as an engine restart does. Gives back the
+/// Attach too.
+fn serve_live(
+    path: PathBuf,
+    features: u64,
+) -> thread::JoinHandle<(manta_block_ring::control::Attach, UnixStream, Engine)>
+{
+    thread::spawn(move || {
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let (mut s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let (mut engines, fds) = Engine::all(geometry(), GENERATION);
+        let ask = handshake_with(&mut s, grant(), &fds, 2, features);
+        let mut pings = s.try_clone().unwrap();
+        thread::spawn(move || answer_until_detach(&mut pings));
+        (ask, s, engines.remove(0))
+    })
+}
+
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let until = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < until, "{what}");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_reattach_after_an_engine_restart_refreshes_migrate_v1() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("engine.sock");
+    let mut cfg = config(path.clone());
+    cfg.reattach = Duration::from_secs(5);
+    let calls = Arc::new(Calls::default());
+    let h = Handover::<TJob>::deferred(cfg, shape(), Arc::clone(&calls) as _);
+
+    let old = serve_live(path.clone(), 0);
+    h.attach(&within(5, true)).expect("allowed by the operator");
+    let (_, mut ctl, mut eng) = old.join().unwrap();
+    assert!(h.waivable().is_some_and(|w| w.contains("migrate-v1")));
+
+    // Upgrade, then downgrade: each reattach sets the flag again.
+    for (features, proven) in [(MIGRATE_V1, true), (0, false)] {
+        let next = serve_live(path.clone(), features);
+        ctl.shutdown(Shutdown::Both).unwrap();
+        drop(eng);
+        let (ask, s, e) = next.join().unwrap();
+        assert_eq!(ask.generation, GENERATION, "not a reattach");
+        wait_until("migrate-v1 did not change", || {
+            h.waivable().is_none() == proven
+        });
+        (ctl, eng) = (s, e);
+    }
+    h.halt();
+    drop(eng);
 }
