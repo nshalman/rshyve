@@ -450,6 +450,23 @@ fn send_framebuffer_update(
     scratch: &mut Vec<u8>,
     request: UpdateRequest,
 ) -> io::Result<bool> {
+    let sent = write_framebuffer_update(dev, writer, view, scratch, request)?;
+    // Pixels go out as they are written, and flush what came before
+    // them. An update with none, a pointer or a size answer alone, would
+    // otherwise wait in the buffer, and the client, its request answered,
+    // would ask for nothing more.
+    writer.flush()?;
+    Ok(sent)
+}
+
+/// [`send_framebuffer_update`] short of the flush.
+fn write_framebuffer_update(
+    dev: &Arc<VncServer>,
+    writer: &mut VncWriter<'_>,
+    view: &mut ClientView,
+    scratch: &mut Vec<u8>,
+    request: UpdateRequest,
+) -> io::Result<bool> {
     let (width, height) = dev.size();
 
     if width == 0 || height == 0 {
@@ -1787,6 +1804,37 @@ mod tests {
         assert_eq!(headers(&mut view)[0].4, ENCODING_CURSOR);
         *source.cursor.lock().unwrap() = (3, CursorShape::Default);
         assert_eq!(headers(&mut view), [empty]);
+    }
+
+    /// An update with no pixels in it, a pointer alone, reaches the
+    /// client when it is sent: the request it answers is done, and the
+    /// client asks for no more until it has it.
+    #[test]
+    fn an_update_without_pixels_is_not_left_in_the_buffer() {
+        let (source, dev) = pointed();
+        let (w, h) = source.size();
+        let mut view = announced(w as u16, h as u16);
+        view.cursor = true;
+        view.shadow = Some(vec![0; w as usize * h as usize * 4]);
+        *source.cursor.lock().unwrap() = (1, arrow());
+        let (_peer, server) =
+            UnixStream::pair().expect("create a VNC socket pair");
+        let mut writer = VncWriter::new(&server, Duration::from_secs(5));
+        let mut scratch = Vec::new();
+        let sent = send_framebuffer_update(
+            &dev,
+            &mut writer,
+            &mut view,
+            &mut scratch,
+            UpdateRequest::Incremental,
+        )
+        .expect("sent");
+        assert!(sent);
+        assert!(
+            writer.buf.is_empty(),
+            "{} bytes held back",
+            writer.buf.len()
+        );
     }
 
     /// A client that did not list the Cursor pseudo-encoding keeps its
