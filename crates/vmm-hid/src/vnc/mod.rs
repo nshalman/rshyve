@@ -216,6 +216,9 @@ struct ClientView {
     /// compares the damaged area against it and sends only the tiles
     /// that differ.
     shadow: Option<Vec<u8>>,
+    /// Whether a frame was skipped with the damage it took, so the next
+    /// update sends the whole display.
+    repaint: bool,
 }
 
 /// What a client asked for in a FramebufferUpdateRequest.
@@ -362,6 +365,7 @@ fn handle_vnc_client(
         use_zrle: false,
         zrle: None,
         shadow: None,
+        repaint: false,
     };
 
     // One thread serves both halves: it polls for client messages with a
@@ -491,7 +495,8 @@ fn send_framebuffer_update(
     };
 
     let damage = dev.source.take_damage();
-    let whole_update = announced || request == UpdateRequest::Full;
+    let whole_update =
+        announced || request == UpdateRequest::Full || view.repaint;
     let area = if whole_update {
         Some(whole)
     } else {
@@ -505,11 +510,15 @@ fn send_framebuffer_update(
     scratch.resize(row_bytes * area.height as usize, 0);
     match dev.source.read_rect(area, scratch) {
         Ok(()) => {}
-        // The display shrank since `size()`. Its resize damaged all of
-        // it, so the next frame repaints it; this one is skipped.
-        Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Ok(sent),
+        // The display shrank since `size()`, and the damage taken above
+        // goes with this frame: the next one repaints all of it.
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+            view.repaint = true;
+            return Ok(sent);
+        }
         Err(e) => return Err(e),
     }
+    view.repaint = false;
 
     let shadow_len = usize::from(view.width)
         * usize::from(view.height)
@@ -882,6 +891,7 @@ mod tests {
             use_zrle: false,
             zrle: None,
             shadow: None,
+            repaint: false,
         };
         let rects = sent_rects(&dev, &mut view);
         assert_eq!(rects.len(), 2, "{rects:?}");
@@ -1497,8 +1507,8 @@ mod tests {
     }
 
     /// A guest that shrinks its display between the size and the read
-    /// costs the client this frame, not its connection: the resize
-    /// damages the whole display, so the next frame repaints it.
+    /// costs the client this frame, not its connection: the next frame
+    /// repaints the whole display.
     #[test]
     fn a_resize_during_a_frame_skips_the_frame() {
         let fb = make_test_dev();
@@ -1515,6 +1525,54 @@ mod tests {
         assert!(rects.is_empty(), "{rects:?}");
     }
 
+    /// A display that says it is 8 rows taller than its pixels once,
+    /// and whose resize damaged it once, as virtio-gpu reports damage:
+    /// fbuf's whole-frame damage on every take would hide a lost one.
+    struct GrownOnce(Arc<Framebuffer>, AtomicBool, AtomicBool);
+
+    impl DisplaySource for GrownOnce {
+        fn size(&self) -> (u32, u32) {
+            let (w, h) = self.0.size();
+            let grown = self.1.swap(false, Ordering::SeqCst);
+            (w, if grown { h + 8 } else { h })
+        }
+
+        fn take_damage(&self) -> Option<Rect> {
+            let damaged = self.2.swap(false, Ordering::SeqCst);
+            self.0.take_damage().filter(|_| damaged)
+        }
+
+        fn read_rect(&self, r: Rect, dst: &mut [u8]) -> io::Result<()> {
+            self.0.read_rect(r, dst)
+        }
+    }
+
+    /// The skipped frame's damage was taken with it, so the next update
+    /// sends the whole display, damaged since or not: a client with no
+    /// DesktopSize would otherwise keep what it had.
+    #[test]
+    fn the_update_after_a_skipped_frame_is_whole() {
+        let fb = make_test_dev();
+        let (w, h) = fb.size();
+        let dev = Arc::new(VncServer::new(
+            Arc::new(GrownOnce(
+                Arc::clone(&fb),
+                AtomicBool::new(true),
+                AtomicBool::new(true),
+            )) as Arc<dyn DisplaySource>,
+            Path::new("/nonexistent/fbuf.vnc"),
+            None,
+            Arc::new(InputBroker::default()),
+            slog::Logger::root(slog::Discard, slog::o!()),
+        ));
+        let mut view = announced(w as u16, h as u16 + 8);
+        let skipped = sent_rects_for(&dev, &mut view, UpdateRequest::Full);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let next = sent_rects_for(&dev, &mut view, UpdateRequest::Incremental);
+        assert_eq!(next.len(), 1, "{next:?}");
+        assert_eq!((next[0].width, next[0].height), (w as u16, h as u16));
+    }
+
     /// A client that was told `width` x `height` and offered no
     /// DesktopSize.
     fn announced(width: u16, height: u16) -> ClientView {
@@ -1527,6 +1585,7 @@ mod tests {
             use_zrle: false,
             zrle: None,
             shadow: None,
+            repaint: false,
         }
     }
 }
