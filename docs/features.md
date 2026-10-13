@@ -611,9 +611,9 @@ The kernel command line is fhrun-owned and cannot be edited, only appended to: `
 | viona | 2 queues of 256, 3 MSI-X vectors |
 | virtio-console | 2 queues of 128, 64 KiB host-input backlog, 250 ms client write timeout, 1 client |
 | virtio-fs | `queue-size` 8..=1024 rounded up to a power of two (default 128), tag 36 bytes, max_write 512 KiB, max_background 64, 1 MiB per request body |
-| fbuf | BAR1 fixed at 16 MiB, so 2048x2048 max; 33 ms frame tick capping input near 30 events/s; VNC password truncated to 8 bytes; 1 client |
+| fbuf | BAR1 fixed at 16 MiB, so 2048x2048 max; 33 ms frame tick capping input near 30 events/s; VNC password truncated to 8 bytes; 1 client, a new one replacing it |
 | xHCI | MaxSlots 64 advertised, 1 implemented; BAR0 8 KiB; INTx only |
-| virtio-gpu | 1 scanout; 256 MiB of host memory across all resources; requests served on the notifying vCPU; 1 VNC client and 1 RDP connection; 32 MiB of RDP EGFX frames and audio unread by the client (frames wait, audio is dropped); 30 s for an RDP write to a client that stopped reading |
+| virtio-gpu | 1 scanout; 256 MiB of host memory across all resources; requests served on the notifying vCPU; 1 VNC client (a new one replaces it) and 1 RDP connection; 32 MiB of RDP EGFX frames and audio unread by the client (frames wait, audio is dropped); 30 s for an RDP write to a client that stopped reading |
 | virtio-snd | 1 output stream, 48 kHz stereo S16 only; a hardware buffer of at most 1 MiB |
 | vTPM | locality 0 only, 3968-byte command buffer, one VM per process |
 | Control socket | 8 concurrent connections, 64 KiB per request line, 30 s read, 10 s write |

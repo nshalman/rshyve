@@ -26,7 +26,8 @@ i8042         <--  PS/2 keyboard  <--- VNC, RDP (keys)
   audio on as its clock reaches it, so the sound leaves the host in step
   with the guest's own audio clock, which players time video against.
 - **The VNC server** serves the picture on a 0600 Unix socket: changed
-  64x64 tiles only, Raw or ZRLE, one client at a time.
+  64x64 tiles only, Raw or ZRLE, one client at a time: a new one
+  replaces the one before.
 - **The RDP server** (crate `vmm_rdp`, built on IronRDP) serves the
   picture, the sound and the input over TCP, with TLS and one fixed
   account. It sends the picture as RemoteFX Progressive over the

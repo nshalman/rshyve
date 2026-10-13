@@ -4,9 +4,10 @@
 
 //! The VNC server that streams a display over a unix socket.
 //!
-//! One thread serves the socket: it accepts one client at a time, polls
-//! that client for RFB messages and sends a frame when one is asked
-//! for. The pixels come from a [`DisplaySource`].
+//! One thread accepts on the socket, and serves one client at a time on
+//! a thread of its own, which polls it for RFB messages and sends a
+//! frame when one is asked for. A new client replaces the one before.
+//! The pixels come from a [`DisplaySource`].
 
 use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
@@ -285,17 +286,73 @@ fn server_loop(srv: Arc<VncServer>, listener: UnixListener) {
     slog::info!(srv.log, "VNC server listening"; "path" => ?srv.path);
 
     let log = srv.log.clone();
+    let mut current: Option<Client> = None;
     accept_loop(listener, &srv.shutdown, &log, "vnc", |stream| {
-        slog::info!(srv.log, "VNC client connected");
-        if let Err(e) = handle_vnc_client(&srv, stream) {
-            if !is_expected_disconnect(&e) {
-                slog::warn!(srv.log, "VNC client error"; "error" => %e);
-            }
+        // The newest client wins: one whose connection went dead would
+        // otherwise hold VNC for everyone until it timed out.
+        if let Some(old) = current.take() {
+            slog::info!(srv.log, "VNC client replaced by a new one");
+            old.end(&srv.log);
         }
-        slog::info!(srv.log, "VNC client disconnected");
+        current = Client::serve(&srv, stream);
     });
+    if let Some(client) = current.take() {
+        client.end(&srv.log);
+    }
 
     let _ = std::fs::remove_file(&srv.path);
+}
+
+/// The one client being served, on a thread of its own so the server
+/// goes on accepting.
+struct Client {
+    /// Shut down to end the connection, which wakes the client's thread
+    /// from whatever it waits on.
+    stream: UnixStream,
+    thread: thread::JoinHandle<()>,
+}
+
+impl Client {
+    fn serve(srv: &Arc<VncServer>, stream: UnixStream) -> Option<Self> {
+        let ours = match stream.try_clone() {
+            Ok(ours) => ours,
+            Err(e) => {
+                slog::warn!(srv.log, "VNC client not served"; "error" => %e);
+                return None;
+            }
+        };
+        let server = Arc::clone(srv);
+        let spawned = thread::Builder::new().name("vnc-client".into()).spawn(
+            move || {
+                slog::info!(server.log, "VNC client connected");
+                if let Err(e) = handle_vnc_client(&server, stream) {
+                    if !is_expected_disconnect(&e) {
+                        slog::warn!(server.log, "VNC client error"; "error" => %e);
+                    }
+                }
+                slog::info!(server.log, "VNC client disconnected");
+            },
+        );
+        match spawned {
+            Ok(thread) => Some(Self {
+                stream: ours,
+                thread,
+            }),
+            Err(e) => {
+                slog::warn!(srv.log, "VNC client not served"; "error" => %e);
+                None
+            }
+        }
+    }
+
+    /// End the connection and wait for its thread, so no two clients are
+    /// ever served at once.
+    fn end(self, log: &slog::Logger) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+        if self.thread.join().is_err() {
+            slog::warn!(log, "VNC client thread panicked");
+        }
+    }
 }
 
 /// Check if an error is an expected client disconnect.
@@ -2202,6 +2259,65 @@ mod tests {
             )
             .expect("read");
         assert_eq!(shown(&view), own, "the display's own pixel");
+    }
+
+    /// Run the RFB 3.8 handshake as a client of a server with no
+    /// password, up to the ServerInit; the framebuffer width it gives.
+    fn handshake(client: &mut UnixStream) -> io::Result<u16> {
+        use std::io::Read;
+
+        let mut version = [0u8; 12];
+        client.read_exact(&mut version)?;
+        client.write_all(b"RFB 003.008\n")?;
+        let mut types = [0u8; 2];
+        client.read_exact(&mut types)?;
+        client.write_all(&[rfb::SECURITY_NONE])?;
+        let mut result = [0u8; 4];
+        client.read_exact(&mut result)?;
+        client.write_all(&[1])?;
+        let mut init = [0u8; 24];
+        client.read_exact(&mut init)?;
+        let name_len =
+            u32::from_be_bytes(init[20..24].try_into().expect("4 bytes"));
+        let mut name = vec![0u8; name_len as usize];
+        client.read_exact(&mut name)?;
+        Ok(u16::from_be_bytes([init[0], init[1]]))
+    }
+
+    /// A client that connects while another is served takes over: the
+    /// one before it is dropped, so a viewer whose connection went dead
+    /// does not hold VNC for everyone until its timeout.
+    #[test]
+    fn the_newest_client_wins() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("vnc.sock");
+        let fb = make_test_dev();
+        let srv = VncServer::start(
+            "vnc-newest",
+            Arc::clone(&fb) as Arc<dyn DisplaySource>,
+            &path,
+            None,
+            Arc::new(InputBroker::default()),
+            slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .expect("start");
+        let timeout = Some(Duration::from_secs(5));
+
+        let mut first = UnixStream::connect(&path).expect("connect");
+        first.set_read_timeout(timeout).expect("timeout");
+        assert!(handshake(&mut first).is_ok(), "the first is served");
+
+        let mut second = UnixStream::connect(&path).expect("connect");
+        second.set_read_timeout(timeout).expect("timeout");
+        assert!(handshake(&mut second).is_ok(), "the newest is served");
+
+        // The first is closed: whatever it was sent, then the end.
+        let mut rest = Vec::new();
+        let ended = first.read_to_end(&mut rest);
+        assert!(ended.is_ok(), "the first was dropped: {ended:?}");
+        srv.shutdown();
     }
 
     /// A client that was told `width` x `height` and offered no
