@@ -216,9 +216,11 @@ fn run_inner<S: Transport>(
 
     // ── DeviceState ──
     set_phase(status, MigrationPhase::DeviceState);
-    let dev_state: DeviceState = chan.expect_serialized()?;
+    let mut dev_state: DeviceState = chan.expect_serialized()?;
     not_cancelled(gate)?;
-    if let Err(e) = restore_devices(&dev_state, config, hooks, log) {
+    if let Err(e) = crate::vram::accept(&mut dev_state.emulated)
+        .and_then(|()| restore_devices(&dev_state, config, hooks, log))
+    {
         chan.report_failure(&e, log);
         return Err(e);
     }
@@ -358,7 +360,7 @@ fn check_enlightenments(
 }
 
 /// The skew between the two hosts' clocks, or `None` from a source too
-/// old to send its clock.
+/// old to send its clock. Early v10 builds sent none.
 fn check_clock(
     preamble: &MigrationPreamble,
     protocol: &str,
@@ -369,7 +371,7 @@ fn check_clock(
             crate::clock::check_skew(source, crate::clock::now_ns()?, log)
                 .map(Some)
         }
-        None if protocol::at_least(protocol, protocol::PROTOCOL_RON_V10) => {
+        None if protocol::at_least(protocol, protocol::PROTOCOL_RON_V12) => {
             Err(MigrateError::PreambleMismatch(
                 "the source sent no wall clock".into(),
             ))
@@ -679,11 +681,11 @@ mod tests {
         assert!(skew.is_some_and(|ms| ms.abs() < 1_000), "{skew:?}");
 
         check_clock(&preamble(None), protocol::PROTOCOL_RON, &log())
-            .expect_err("no clock from a v10 source");
-        let old =
-            check_clock(&preamble(None), protocol::PROTOCOL_RON_V9, &log())
-                .expect("a v9 source has none");
-        assert_eq!(old, None);
+            .expect_err("no clock from a v12 source");
+        for old in [protocol::PROTOCOL_RON_V10, protocol::PROTOCOL_RON_V9] {
+            let skew = check_clock(&preamble(None), old, &log()).expect(old);
+            assert_eq!(skew, None, "{old}");
+        }
 
         let hour_behind = now - 3_600 * 1_000_000_000;
         check_clock(

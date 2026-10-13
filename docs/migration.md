@@ -12,11 +12,17 @@ One driver serves both transports: a Unix socket inside a bhyve zone,
 where `/dev/poll` is unavailable and the GZ agent bridges to the peer,
 and a TCP socket elsewhere.
 
-The protocol identifier is `vmm-migrate-ron/10`. v10 adds the source
-host's wall clock to the preamble, the interrupt shadow, the AMD PMU
-state, and the fault-injection test device (see "Kernel Devices",
-"Host clock skew" and "Testing a retry" below). A source offers v10,
-v9, v8, v7 and v6, and a destination takes the newest it reads. Each
+The protocol identifier is `vmm-migrate-ron/12`. v12 has the v10
+payload, but the framebuffer VRAM is LZ4 only and the source must send
+its wall clock. Builds before v12 sent v8 to v10 with the VRAM as zstd
+or as LZ4, and v10 with or without the wall clock, under one version
+string. So to a v8 to v10 peer the source sends the VRAM in both forms,
+and from one the destination takes either form and no wall clock. v11
+is the virtio-gpu work's (PR #15) and is not offered. v10 adds the
+source host's wall clock to the preamble, the interrupt shadow, the AMD
+PMU state, and the fault-injection test device (see "Kernel Devices",
+"Host clock skew" and "Testing a retry" below). A source offers v12,
+v10, v9, v8, v7 and v6, and a destination takes the newest it reads. Each
 end then checks that the chosen version carries everything this VM
 has, and refuses an older peer at the protocol choice, before the
 pause. An AMD source with PMU state, or a VM with the test device,
@@ -45,7 +51,8 @@ the guest set (width and height), and its VRAM. The VRAM is a separate
 16 MiB devmem segment, not guest RAM, so the RAM passes do not see it.
 The source reads it after the vCPUs pause, cuts it after the last page
 that is not zero, compresses it with LZ4 and sends it with the device
-state. A console or a plain desktop compresses to a few KiB. If the
+state. To a peer before v12 it also sends a zstd frame of the same
+bytes, so both kinds of older build read it. A console or a plain desktop compresses to a few KiB. If the
 compressed VRAM is over 2 MiB, the source leaves it out so the device
 state stays under the message limit. The destination then starts with
 black VRAM and the right mode, and the screen comes back as the guest
@@ -409,7 +416,7 @@ than migration time.
 The guest clock moves by the skew between the two hosts: the time
 import counts the wall-clock gap as time the guest was paused. Propolis
 assumes synced clocks. From v10 the source sends its wall clock in the
-preamble, and the destination compares it with its own before a single
+preamble (from v12 the destination refuses a source without it), and the destination compares it with its own before a single
 page moves. It logs the skew, warns over 1 s, and refuses over 60 s.
 `migrate-status` on the destination shows it as
 `migrate_clock_skew_ms`, positive when the destination is ahead.

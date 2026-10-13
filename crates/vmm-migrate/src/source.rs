@@ -497,7 +497,7 @@ fn run_inner<S: Transport>(
     };
     let owners =
         |(emulated, _): &Exported| Owners::new(&memctx.guest_ram(), emulated);
-    let (final_dirty, (emulated, platform)) = final_pass(
+    let (final_dirty, (mut emulated, platform)) = final_pass(
         chan, &mut track, memctx, gate, status, export, owners, log,
     )?;
     slog::info!(log, "post-pause"; "dirty" => final_dirty);
@@ -517,6 +517,7 @@ fn run_inner<S: Transport>(
         v10_peer,
         log,
     )?;
+    crate::vram::fit_for_peer(&sel.protocol, &mut emulated, log)?;
     dev_state.emulated = emulated;
     dev_state.platform = platform;
     dev_state.hyperv = hyperv;
