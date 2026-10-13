@@ -45,10 +45,28 @@ pub fn area(text: &str) -> Rect {
 /// `height` frame of 4-byte XRGB pixels. What falls outside the frame is
 /// left out.
 pub fn draw(pixels: &mut [u8], width: u32, height: u32, text: &str) {
+    let frame = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    draw_in(pixels, frame, text);
+}
+
+/// As [`draw`], into `pixels` that hold only `part` of the frame, as
+/// packed rows: the text lands where it would in the whole frame.
+pub fn draw_in(pixels: &mut [u8], part: Rect, text: &str) {
     let r = area(text);
     let mut put = |x: u32, y: u32, color: [u8; 4]| {
-        if x < width && y < height {
-            let at = (y as usize * width as usize + x as usize) * 4;
+        let inside = x >= part.x
+            && y >= part.y
+            && x - part.x < part.width
+            && y - part.y < part.height;
+        if inside {
+            let at = ((y - part.y) as usize * part.width as usize
+                + (x - part.x) as usize)
+                * 4;
             if let Some(px) = pixels.get_mut(at..at + 4) {
                 px.copy_from_slice(&color);
             }
@@ -189,6 +207,32 @@ mod tests {
     fn pixel(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
         let at = (y as usize * width as usize + x as usize) * 4;
         pixels[at..at + 4].try_into().expect("4 bytes")
+    }
+
+    /// Drawn into a buffer that holds only part of the frame, the text
+    /// lands where it would in the whole frame.
+    #[test]
+    fn a_part_of_the_frame_gets_its_part_of_the_text() {
+        let (w, h) = (200, 60);
+        let mut whole = vec![0x40; (w * h * 4) as usize];
+        draw(&mut whole, w, h, "60 FPS");
+        let part = Rect {
+            x: 13,
+            y: 9,
+            width: 50,
+            height: 20,
+        };
+        let mut pixels = vec![0x40; (part.width * part.height * 4) as usize];
+        draw_in(&mut pixels, part, "60 FPS");
+        for y in 0..part.height {
+            for x in 0..part.width {
+                assert_eq!(
+                    pixel(&pixels, part.width, x, y),
+                    pixel(&whole, w, part.x + x, part.y + y),
+                    "({x}, {y})"
+                );
+            }
+        }
     }
 
     /// The box is black, the glyphs white, and nothing outside the box

@@ -67,6 +67,47 @@ fn frame_interval(source: &dyn DisplaySource) -> Duration {
 /// frames, so this bounds how late a frame can be.
 const CLIENT_POLL: Duration = Duration::from_millis(5);
 
+/// DTrace probes for the frames the VNC server sends.
+#[usdt::provider(provider = "vmm")]
+mod probes {
+    /// The server sent a frame: `encode_us` to read, encode and write
+    /// it, after which the guest is asked for `pace_us`.
+    fn vnc_frame(encode_us: u64, pace_us: u64) {}
+    /// Enabled, the server draws its numbers over the frames it sends;
+    /// see [`vmm_devices::overlay`].
+    fn vnc_overlay() {}
+}
+
+/// Whether DTrace has the `vnc_overlay` probe enabled: the probe's
+/// arguments are only made then.
+fn overlay_asked() -> bool {
+    let asked = std::cell::Cell::new(false);
+    probes::vnc_overlay!(|| asked.set(true));
+    asked.get()
+}
+
+/// A duration in whole microseconds, for a probe argument.
+fn micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Draw `text` over the client's frames from the next update on, or
+/// stop with `None`. The corner it covered, or now covers, goes with the
+/// next update either way.
+fn show_overlay(view: &mut ClientView, text: Option<String>) {
+    if view.overlay == text {
+        return;
+    }
+    let corner = [view.overlay.as_deref(), text.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(vmm_devices::overlay::area)
+        .chain(view.overlay_corner)
+        .reduce(Rect::union);
+    view.overlay_corner = corner;
+    view.overlay = text;
+}
+
 /// Starts the server's passes a frame interval apart, whatever each one
 /// cost: a fixed sleep after the work would add the work to every frame.
 struct Ticker {
@@ -114,10 +155,12 @@ impl ClientPace {
         }
     }
 
-    /// A frame went to the client, and took `cost` to make and send.
-    fn frame(&mut self, cost: Duration) {
+    /// A frame went to the client, and took `cost` to make and send;
+    /// the interval the guest is now asked for.
+    fn frame(&mut self, cost: Duration) -> Duration {
         let interval = self.pace.frame(cost, true);
         self.source.pace(Some(interval));
+        interval
     }
 }
 
@@ -307,6 +350,10 @@ struct ClientView {
     /// Updates with pixels sent, so the loop can tell a frame from a
     /// pointer or a size alone.
     frames: u64,
+    /// The text drawn over the frames while DTrace asks for it.
+    overlay: Option<String>,
+    /// Where the overlay was or now is, to go with the next update.
+    overlay_corner: Option<Rect>,
 }
 
 /// What a client asked for in a FramebufferUpdateRequest.
@@ -465,6 +512,8 @@ fn handle_vnc_client(
         cursor_sent: None,
         cursor_shown: false,
         frames: 0,
+        overlay: None,
+        overlay_corner: None,
     };
 
     // One thread serves both halves: it polls for client messages with a
@@ -476,6 +525,7 @@ fn handle_vnc_client(
     let mut ticker = Ticker::new(Instant::now(), interval);
     // Withdrawn when the client goes, however the loop ends.
     let mut pace = ClientPace::new(Arc::clone(&dev.source), interval);
+    let mut stats = vmm_devices::overlay::Stats::new(Instant::now());
 
     while !dev.shutdown.load(Ordering::Relaxed) {
         match rfb::read_client_message(&mut reader) {
@@ -507,11 +557,20 @@ fn handle_vnc_client(
                 Err(e) => return Err(e),
             }
             if view.frames != frames {
-                pace.frame(began.elapsed());
+                let cost = began.elapsed();
+                let interval = pace.frame(cost);
+                probes::vnc_frame!(|| (micros(cost), micros(interval)));
+                stats.frame(cost, true, interval);
             }
         }
 
-        thread::sleep(ticker.sleep_after(Instant::now()));
+        let now = Instant::now();
+        stats.roll(now);
+        show_overlay(
+            &mut view,
+            overlay_asked().then(|| stats.text().to_string()),
+        );
+        thread::sleep(ticker.sleep_after(now));
     }
 
     // Clean shutdown
@@ -627,9 +686,16 @@ fn write_framebuffer_update(
     let whole_update =
         announced || request == UpdateRequest::Full || view.repaint;
     let area = if whole_update {
+        view.overlay_corner = None;
         Some(whole)
     } else {
-        damage.and_then(|d| clip(d, whole))
+        // The overlay's corner, where it changed, goes too.
+        let corner = view.overlay_corner.take();
+        [damage, corner]
+            .into_iter()
+            .flatten()
+            .reduce(Rect::union)
+            .and_then(|d| clip(d, whole))
     };
     let Some(area) = area else {
         return Ok(sent);
@@ -648,6 +714,10 @@ fn write_framebuffer_update(
         Err(e) => return Err(e),
     }
     view.repaint = false;
+    // Over the client's copy of the frame only; the guest's never has it.
+    if let Some(text) = &view.overlay {
+        vmm_devices::overlay::draw_in(scratch, area, text);
+    }
 
     let shadow_len = usize::from(view.width)
         * usize::from(view.height)
@@ -1078,6 +1148,8 @@ mod tests {
             cursor_sent: None,
             cursor_shown: false,
             frames: 0,
+            overlay: None,
+            overlay_corner: None,
         };
         let rects = sent_rects(&dev, &mut view);
         assert_eq!(rects.len(), 2, "{rects:?}");
@@ -2039,6 +2111,50 @@ mod tests {
         assert_eq!(asked.last(), Some(&None), "withdrawn: {asked:?}");
     }
 
+    /// The overlay goes over the corner with the next update, is not
+    /// sent again while its text stays, and when it goes the corner is
+    /// sent again with the display's own pixels.
+    #[test]
+    fn the_overlay_is_drawn_over_the_frames_while_it_is_shown() {
+        let (source, dev) = pointed();
+        let (w, h) = source.size();
+        let mut view = announced(w as u16, h as u16);
+        view.shadow = Some(vec![0x55; w as usize * h as usize * 4]);
+        let corner = vmm_devices::overlay::area("60 FPS");
+        let shown = |view: &ClientView| {
+            let at = ((corner.y + 1) as usize * w as usize
+                + (corner.x + 1) as usize)
+                * 4;
+            view.shadow.as_ref().expect("a shadow")[at..at + 4].to_vec()
+        };
+
+        show_overlay(&mut view, Some("60 FPS".to_string()));
+        let sent = sent_update(&dev, &mut view, UpdateRequest::Incremental);
+        assert!(!sent.is_empty(), "the corner goes with the next update");
+        assert_eq!(shown(&view), [0, 0, 0, 0xFF], "the box, black");
+
+        show_overlay(&mut view, Some("60 FPS".to_string()));
+        let again = sent_update(&dev, &mut view, UpdateRequest::Incremental);
+        assert!(again.is_empty(), "{again:?}");
+
+        show_overlay(&mut view, None);
+        let sent = sent_update(&dev, &mut view, UpdateRequest::Incremental);
+        assert!(!sent.is_empty(), "the corner goes back");
+        let mut own = vec![0; 4];
+        source
+            .read_rect(
+                Rect {
+                    x: corner.x + 1,
+                    y: corner.y + 1,
+                    width: 1,
+                    height: 1,
+                },
+                &mut own,
+            )
+            .expect("read");
+        assert_eq!(shown(&view), own, "the display's own pixel");
+    }
+
     /// A client that was told `width` x `height` and offered no
     /// DesktopSize.
     fn announced(width: u16, height: u16) -> ClientView {
@@ -2056,6 +2172,8 @@ mod tests {
             cursor_sent: None,
             cursor_shown: false,
             frames: 0,
+            overlay: None,
+            overlay_corner: None,
         }
     }
 }

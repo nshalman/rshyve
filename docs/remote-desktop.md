@@ -162,10 +162,13 @@ provider like the others:
 | `gpu_flip` | virtio-gpu got a fenced flush | descriptor head, whether its answer waits for the pacer, the pace (us) |
 | `gpu_flip_answer` | the pacer answered a flip that waited | descriptor head |
 | `egfx_overlay` | the RDP worker checks it on every pass of its loop, up to 60 a second; while it is enabled, the worker draws its numbers over the picture | none |
+| `vnc_frame` | the VNC server sent a frame | time to read, encode and write it (us), the pace asked of the guest (us) |
+| `vnc_overlay` | the VNC server checks it on every pass of its loop; while it is enabled, it draws its numbers over the picture | none |
 
 A probe costs nothing until DTrace enables it, so a running VM can be
 measured as it is. `tools/desk-rate.d` prints once a second the frames
-made, their encode time, the guest's flips and the pace:
+the RDP worker made and the VNC server sent, their encode time, the
+guest's flips and the pace:
 
 ```
 dtrace -qs tools/desk-rate.d -p $(pgrep -x rshyve)
@@ -174,18 +177,17 @@ dtrace -qs tools/desk-rate.d -p $(pgrep -x rshyve)
 Enabling the probes stops the process briefly, guest included: the
 frame in flight when the script starts took about half a second.
 
-The script also enables `egfx_overlay`, so the RDP client shows the
-same measures in the top-left corner of the picture while it runs,
-encode times in ms where the script prints us: frames made in the
-last second, refused ones included, the average and worst encode
-time, the
-pace and the frames refused. The text is drawn into the frame the RDP
-server encodes, not into the guest's display, and goes away when
-DTrace detaches. VNC clients do not see it. To show it without the
-script:
+The script also enables `egfx_overlay` and `vnc_overlay`, so the RDP
+and VNC clients each show their own server's measures in the top-left
+corner of the picture while it runs, encode times in ms where the
+script prints us: frames made in the last second, refused ones
+included, the average and worst encode time, the pace and the frames
+refused (always 0 for VNC). The text is drawn into the frames each
+server sends, not into the guest's display, and goes away when DTrace
+detaches. To show it without the script:
 
 ```
-dtrace -n 'vmm$target:::egfx_overlay { overlay = 1; }' -p $(pgrep -x rshyve)
+dtrace -n 'vmm$target:::egfx_overlay,vmm$target:::vnc_overlay { overlay = 1; }' -p $(pgrep -x rshyve)
 ```
 
 The pace: with no client, virtio-gpu lets a Linux guest flip 30
