@@ -15,13 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use vmm_core::unixsock::accept::accept_loop;
 use vmm_core::unixsock::write_all_bounded;
 use vmm_devices::display::{
-    changed_tiles, CursorShape, DisplaySource, Pixels, Rect,
+    changed_tiles, CursorShape, DisplaySource, FramePace, Pixels, Rect,
 };
 use vmm_devices::input::scale_to_tablet;
 use vmm_devices::InputBroker;
@@ -51,6 +51,65 @@ const VNC_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// How long one poll for a client message waits. The same thread sends
 /// frames, so this bounds how late a frame can be.
 const CLIENT_POLL: Duration = Duration::from_millis(5);
+
+/// Starts the server's passes a frame interval apart, whatever each one
+/// cost: a fixed sleep after the work would add the work to every frame.
+struct Ticker {
+    next: Instant,
+    interval: Duration,
+}
+
+impl Ticker {
+    fn new(start: Instant, interval: Duration) -> Self {
+        Self {
+            next: start + interval,
+            interval,
+        }
+    }
+
+    /// How long to sleep, at `now`, until the next pass starts. A pass
+    /// that ran past its frame starts the next at once, and the frames
+    /// count from then: a late one is not made up for.
+    fn sleep_after(&mut self, now: Instant) -> Duration {
+        let wait = self.next.saturating_duration_since(now);
+        if wait.is_zero() {
+            self.next = now + self.interval;
+        } else {
+            self.next += self.interval;
+        }
+        wait
+    }
+}
+
+/// While a client is connected, asks the display to have the guest flip
+/// no faster than the frames reach the client, as the RDP server does: a
+/// frame the guest makes faster is one no client sees. The request goes
+/// when this does.
+struct ClientPace {
+    source: Arc<dyn DisplaySource>,
+    pace: FramePace,
+}
+
+impl ClientPace {
+    fn new(source: Arc<dyn DisplaySource>) -> Self {
+        Self {
+            source,
+            pace: FramePace::new(VNC_FRAME_INTERVAL),
+        }
+    }
+
+    /// A frame went to the client, and took `cost` to make and send.
+    fn frame(&mut self, cost: Duration) {
+        let interval = self.pace.frame(cost, true);
+        self.source.pace(Some(interval));
+    }
+}
+
+impl Drop for ClientPace {
+    fn drop(&mut self) {
+        self.source.pace(None);
+    }
+}
 
 /// Desktop name sent to VNC clients.
 const VNC_DESKTOP_NAME: &str = "bhyve framebuffer";
@@ -229,6 +288,9 @@ struct ClientView {
     /// Whether the client draws a pointer image the guest gave, which a
     /// pointer the guest takes back must hide.
     cursor_shown: bool,
+    /// Updates with pixels sent, so the loop can tell a frame from a
+    /// pointer or a size alone.
+    frames: u64,
 }
 
 /// What a client asked for in a FramebufferUpdateRequest.
@@ -386,6 +448,7 @@ fn handle_vnc_client(
         cursor: false,
         cursor_sent: None,
         cursor_shown: false,
+        frames: 0,
     };
 
     // One thread serves both halves: it polls for client messages with a
@@ -393,6 +456,9 @@ fn handle_vnc_client(
     // incremental request waits here until the display has damage.
     let mut pending: Option<UpdateRequest> = None;
     stream.set_read_timeout(Some(CLIENT_POLL))?;
+    let mut ticker = Ticker::new(Instant::now(), VNC_FRAME_INTERVAL);
+    // Withdrawn when the client goes, however the loop ends.
+    let mut pace = ClientPace::new(Arc::clone(&dev.source));
 
     while !dev.shutdown.load(Ordering::Relaxed) {
         match rfb::read_client_message(&mut reader) {
@@ -409,6 +475,8 @@ fn handle_vnc_client(
         }
 
         if let Some(request) = pending {
+            let began = Instant::now();
+            let frames = view.frames;
             match send_framebuffer_update(
                 dev,
                 &mut writer,
@@ -421,9 +489,12 @@ fn handle_vnc_client(
                 Err(e) if is_expected_disconnect(&e) => break,
                 Err(e) => return Err(e),
             }
+            if view.frames != frames {
+                pace.frame(began.elapsed());
+            }
         }
 
-        thread::sleep(VNC_FRAME_INTERVAL);
+        thread::sleep(ticker.sleep_after(Instant::now()));
     }
 
     // Clean shutdown
@@ -596,6 +667,7 @@ fn write_framebuffer_update(
     };
 
     rfb::write_fb_update_header(writer, rects.len() as u16)?;
+    view.frames += 1;
     let mut pixels = Vec::new();
     let mut body = Vec::new();
     let mut zrle = view.zrle.as_mut().filter(|_| view.use_zrle);
@@ -988,6 +1060,7 @@ mod tests {
             cursor: false,
             cursor_sent: None,
             cursor_shown: false,
+            frames: 0,
         };
         let rects = sent_rects(&dev, &mut view);
         assert_eq!(rects.len(), 2, "{rects:?}");
@@ -1870,6 +1943,65 @@ mod tests {
         assert!(!view.cursor);
     }
 
+    /// A pass that ends early sleeps out the rest of its frame, so frames
+    /// start on the frame interval whatever each pass cost; one that
+    /// overran starts the next at once, without trying to catch up.
+    #[test]
+    fn the_ticker_keeps_the_frame_interval() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let mut ticker = Ticker::new(start, ms(33));
+        assert_eq!(ticker.sleep_after(start + ms(10)), ms(23));
+        // The next pass started at 33 ms.
+        assert_eq!(ticker.sleep_after(start + ms(40)), ms(26));
+        // A pass that ran to 120 ms is late: no sleep, and the one
+        // after counts from now.
+        assert_eq!(ticker.sleep_after(start + ms(120)), Duration::ZERO);
+        assert_eq!(ticker.sleep_after(start + ms(130)), ms(23));
+    }
+
+    /// A display that records what it was asked to pace to.
+    #[derive(Default)]
+    struct PaceRecorder(Mutex<Vec<Option<Duration>>>);
+
+    impl DisplaySource for PaceRecorder {
+        fn size(&self) -> (u32, u32) {
+            (0, 0)
+        }
+
+        fn take_damage(&self) -> Option<Rect> {
+            None
+        }
+
+        fn read_rect(&self, _r: Rect, _dst: &mut [u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn pace(&self, interval: Option<Duration>) {
+            self.0.lock().unwrap().push(interval);
+        }
+    }
+
+    /// A client's frames pace the guest to the rate they go out at, no
+    /// faster than VNC's own; the request goes with the client.
+    #[test]
+    fn a_client_paces_the_guest_while_it_is_connected() {
+        let source = Arc::new(PaceRecorder::default());
+        let ms = Duration::from_millis;
+        {
+            let mut pace = ClientPace::new(Arc::clone(&source) as _);
+            pace.frame(ms(1));
+            pace.frame(ms(90));
+        }
+        let asked = source.0.lock().unwrap().clone();
+        assert_eq!(asked[0], Some(VNC_FRAME_INTERVAL), "no faster than VNC");
+        assert!(
+            asked[1].is_some_and(|i| i > VNC_FRAME_INTERVAL),
+            "{asked:?}"
+        );
+        assert_eq!(asked.last(), Some(&None), "withdrawn: {asked:?}");
+    }
+
     /// A client that was told `width` x `height` and offered no
     /// DesktopSize.
     fn announced(width: u16, height: u16) -> ClientView {
@@ -1886,6 +2018,7 @@ mod tests {
             cursor: false,
             cursor_sent: None,
             cursor_shown: false,
+            frames: 0,
         }
     }
 }

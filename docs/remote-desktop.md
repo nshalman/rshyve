@@ -188,13 +188,14 @@ script:
 dtrace -n 'vmm$target:::egfx_overlay { overlay = 1; }' -p $(pgrep -x rshyve)
 ```
 
-The pace: with no RDP client, virtio-gpu lets a Linux guest flip 30
-times a second. With one on the graphics pipeline (EGFX), the RDP
-server asks for the rate it is managing to send at, slower when frames
+The pace: with no client, virtio-gpu lets a Linux guest flip 30
+times a second. A VNC client asks for the rate its frames go out at, no
+faster than 30. With an RDP client on the graphics pipeline (EGFX), the
+RDP server asks for the rate it is managing to send at, slower when frames
 take longer to encode or the client refuses them because it has too
 many unacknowledged, or because it has not read 32 MiB of frames and audio
-already sent, and the device holds the request between 60 and
-10 frames a second. The overlay's PACE is the request; desk-rate.d's
+already sent. The device takes the faster of the two requests and
+holds it between 60 and 10 frames a second. The overlay's PACE is the request; desk-rate.d's
 pace is what the device applies. Measured on the lab host with 60 frames a
 second video: 60 frames a second in a 1520x913 window, at about 1 ms
 encode; 47 to 57 at 3440x1440 full screen, at 8 to 14 ms average
