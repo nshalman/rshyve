@@ -512,6 +512,27 @@ fn dispatch_client_message(
     }
 }
 
+/// Read what the client sent and act on it, folding the updates it asks
+/// for into `pending`. False once the client has closed the connection.
+fn read_client_messages<R: Read>(
+    dev: &VncServer,
+    view: &mut ClientView,
+    reader: &mut BufReader<R>,
+    pending: &mut Option<UpdateRequest>,
+) -> io::Result<bool> {
+    match rfb::read_client_message(reader) {
+        Ok(Some(msg)) => {
+            if let Some(req) = dispatch_client_message(dev, view, msg) {
+                *pending = Some(req.merge(*pending));
+            }
+        }
+        Ok(None) => return Ok(false),
+        Err(e) if rfb::is_read_timeout(&e) => {}
+        Err(e) => return Err(e),
+    }
+    Ok(true)
+}
+
 /// Handle a single VNC client connection.
 fn handle_vnc_client(
     dev: &Arc<VncServer>,
@@ -587,17 +608,9 @@ fn handle_vnc_client(
     let mut stats = vmm_devices::overlay::Stats::new(Instant::now());
 
     while !dev.shutdown.load(Ordering::Relaxed) {
-        match rfb::read_client_message(&mut reader) {
-            Ok(Some(msg)) => {
-                if let Some(req) = dispatch_client_message(dev, &mut view, msg)
-                {
-                    pending = Some(req.merge(pending));
-                }
-            }
+        if !read_client_messages(dev, &mut view, &mut reader, &mut pending)? {
             // EOF: client disconnected
-            Ok(None) => break,
-            Err(e) if rfb::is_read_timeout(&e) => {}
-            Err(e) => return Err(e),
+            break;
         }
 
         if let Some(request) = pending {
