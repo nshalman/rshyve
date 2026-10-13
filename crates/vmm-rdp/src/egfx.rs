@@ -39,7 +39,7 @@ use ironrdp_svc::ChannelFlags;
 use tokio::sync::mpsc::UnboundedSender;
 use vmm_core::ratelimit::TokenBucket;
 use vmm_devices::display::{
-    changed_tiles, DisplaySource, DisplayWaker, Pixels, Rect, TILE,
+    changed_tiles, DisplaySource, DisplayWaker, FramePace, Pixels, Rect, TILE,
 };
 
 use crate::bridge::OutboundBacklog;
@@ -274,7 +274,7 @@ impl Egfx {
         let thread = thread::Builder::new().name("rdp-egfx".into()).spawn(
             move || {
                 // Whether the guest is paced to this worker's frames.
-                let mut pace: Option<Pace> = None;
+                let mut pace: Option<FramePace> = None;
                 let mut stats = crate::overlay::Stats::new(Instant::now());
                 while !stopped.load(Ordering::Acquire) {
                     let began = Instant::now();
@@ -282,7 +282,9 @@ impl Egfx {
                         if let Some(taken) = egfx.update(source.as_ref()) {
                             let cost = began.elapsed();
                             let interval = pace
-                                .get_or_insert_with(Pace::default)
+                                .get_or_insert_with(|| {
+                                    FramePace::new(FRAME_INTERVAL)
+                                })
                                 .frame(cost, taken);
                             probes::egfx_frame!(|| (
                                 micros(cost),
@@ -579,36 +581,6 @@ impl Egfx {
                 ));
             }
         }
-    }
-}
-
-/// The frame interval a worker sustains, which it asks the guest to
-/// flip no faster than: a frame the guest makes faster is one no client
-/// sees, and its vCPU time is spent for nothing.
-#[derive(Default)]
-struct Pace {
-    interval: Option<Duration>,
-}
-
-impl Pace {
-    /// Account a frame that took `cost` to make, which the client took
-    /// or refused, and return the interval to ask for.
-    ///
-    /// A frame costs at least the worker's own interval. A refused
-    /// frame lost its slot to the client's flow control as well: the
-    /// client acknowledges more slowly than the frames go out. The
-    /// average over the last few frames rides out a single slow one.
-    fn frame(&mut self, cost: Duration, taken: bool) -> Duration {
-        let mut sample = cost.max(FRAME_INTERVAL);
-        if !taken {
-            sample += FRAME_INTERVAL;
-        }
-        let interval = match self.interval {
-            Some(i) => (i * 3 + sample) / 4,
-            None => sample,
-        };
-        self.interval = Some(interval);
-        interval
     }
 }
 
@@ -1198,63 +1170,6 @@ pub(crate) mod tests {
     }
 
     const MS: Duration = Duration::from_millis(1);
-
-    /// Frames cheaper than the worker's own interval ask for that
-    /// interval: the guest need not flip faster than frames go out.
-    #[test]
-    fn cheap_frames_pace_the_guest_at_the_frame_interval() {
-        let mut pace = Pace::default();
-        for _ in 0..10 {
-            assert_eq!(pace.frame(MS, true), FRAME_INTERVAL);
-        }
-    }
-
-    /// Frames that take longer to make than the interval slow the guest
-    /// to the rate they go out at, smoothed over a few frames.
-    #[test]
-    fn slow_frames_slow_the_guest_to_their_cost() {
-        let mut pace = Pace::default();
-        assert_eq!(pace.frame(MS, true), FRAME_INTERVAL);
-        let mut asked = Vec::new();
-        for _ in 0..30 {
-            asked.push(pace.frame(MS * 60, true));
-        }
-        assert!(asked.windows(2).all(|w| w[0] <= w[1]), "{asked:?}");
-        assert!(asked[0] < MS * 60, "smoothed: {asked:?}");
-        let last = *asked.last().expect("asked");
-        assert!(last > MS * 59 && last <= MS * 60, "{last:?}");
-    }
-
-    /// A frame the client refused cost its slot: the client is slower
-    /// than the frames, so the guest is slowed further.
-    #[test]
-    fn refused_frames_slow_the_guest_further() {
-        let mut taken = Pace::default();
-        let mut refused = Pace::default();
-        for _ in 0..30 {
-            taken.frame(MS * 40, true);
-            refused.frame(MS * 40, false);
-        }
-        // By the slot it lost, one frame interval.
-        assert!(
-            refused.frame(MS * 40, false)
-                > taken.frame(MS * 40, true) + FRAME_INTERVAL - MS
-        );
-    }
-
-    /// Once frames are cheap again the guest speeds back up.
-    #[test]
-    fn the_pace_recovers() {
-        let mut pace = Pace::default();
-        for _ in 0..30 {
-            pace.frame(MS * 90, false);
-        }
-        let mut last = Duration::MAX;
-        for _ in 0..60 {
-            last = pace.frame(MS, true);
-        }
-        assert!(last < FRAME_INTERVAL + MS, "{last:?}");
-    }
 
     /// The worker asks the display to pace the guest while it sends,
     /// and withdraws the request when it stops.

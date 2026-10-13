@@ -345,12 +345,52 @@ pub fn changed_tiles(
     rects
 }
 
+/// The frame interval a server sustains, which it asks the guest to
+/// flip no faster than: a frame the guest makes faster is one no client
+/// sees, and its vCPU time is spent for nothing.
+pub struct FramePace {
+    /// The server's own frame interval, the fastest it asks for.
+    floor: Duration,
+    interval: Option<Duration>,
+}
+
+impl FramePace {
+    pub fn new(floor: Duration) -> Self {
+        Self {
+            floor,
+            interval: None,
+        }
+    }
+
+    /// Account a frame that took `cost` to make, which the client took
+    /// or refused, and return the interval to ask for.
+    ///
+    /// A frame costs at least the server's own interval. A refused frame
+    /// lost its slot to the client's flow control as well: the client
+    /// takes frames more slowly than they go out. The average over the
+    /// last few frames rides out a single slow one.
+    pub fn frame(&mut self, cost: Duration, taken: bool) -> Duration {
+        let mut sample = cost.max(self.floor);
+        if !taken {
+            sample += self.floor;
+        }
+        let interval = match self.interval {
+            Some(i) => (i * 3 + sample) / 4,
+            None => sample,
+        };
+        self.interval = Some(interval);
+        interval
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
     use super::*;
+
+    const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
     /// A display whose damage and pace the test sets and reads.
     #[derive(Default)]
@@ -527,5 +567,62 @@ mod tests {
         let mut px = [0u8; 4];
         view.read_rect(rect(7, 0, 1, 1), &mut px).expect("read");
         assert_eq!(px, [7; 4]);
+    }
+
+    /// Frames cheaper than the worker's own interval ask for that
+    /// interval: the guest need not flip faster than frames go out.
+    #[test]
+    fn cheap_frames_pace_the_guest_at_the_frame_interval() {
+        let mut pace = FramePace::new(FRAME_INTERVAL);
+        for _ in 0..10 {
+            assert_eq!(pace.frame(MS, true), FRAME_INTERVAL);
+        }
+    }
+
+    /// Frames that take longer to make than the interval slow the guest
+    /// to the rate they go out at, smoothed over a few frames.
+    #[test]
+    fn slow_frames_slow_the_guest_to_their_cost() {
+        let mut pace = FramePace::new(FRAME_INTERVAL);
+        assert_eq!(pace.frame(MS, true), FRAME_INTERVAL);
+        let mut asked = Vec::new();
+        for _ in 0..30 {
+            asked.push(pace.frame(MS * 60, true));
+        }
+        assert!(asked.windows(2).all(|w| w[0] <= w[1]), "{asked:?}");
+        assert!(asked[0] < MS * 60, "smoothed: {asked:?}");
+        let last = *asked.last().expect("asked");
+        assert!(last > MS * 59 && last <= MS * 60, "{last:?}");
+    }
+
+    /// A frame the client refused cost its slot: the client is slower
+    /// than the frames, so the guest is slowed further.
+    #[test]
+    fn refused_frames_slow_the_guest_further() {
+        let mut taken = FramePace::new(FRAME_INTERVAL);
+        let mut refused = FramePace::new(FRAME_INTERVAL);
+        for _ in 0..30 {
+            taken.frame(MS * 40, true);
+            refused.frame(MS * 40, false);
+        }
+        // By the slot it lost, one frame interval.
+        assert!(
+            refused.frame(MS * 40, false)
+                > taken.frame(MS * 40, true) + FRAME_INTERVAL - MS
+        );
+    }
+
+    /// Once frames are cheap again the guest speeds back up.
+    #[test]
+    fn the_pace_recovers() {
+        let mut pace = FramePace::new(FRAME_INTERVAL);
+        for _ in 0..30 {
+            pace.frame(MS * 90, false);
+        }
+        let mut last = Duration::MAX;
+        for _ in 0..60 {
+            last = pace.frame(MS, true);
+        }
+        assert!(last < FRAME_INTERVAL + MS, "{last:?}");
     }
 }
