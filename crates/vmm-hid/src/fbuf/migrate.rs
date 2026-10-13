@@ -21,13 +21,11 @@ use super::{
     BAR1_SIZE,
 };
 
-/// The largest compressed VRAM the device state carries.
-///
-/// The whole device state is one message of at most 8 MiB, and RON
-/// writes these bytes as base64. A VRAM that does not compress to this
-/// is left behind, and the destination shows black until the guest
-/// draws again.
-const VRAM_WIRE_CAP: usize = 2 * 1024 * 1024;
+/// A VRAM that does not compress to this is left behind, and the
+/// destination shows black until the guest draws again.
+const VRAM_WIRE_CAP: usize = FbufMigrateVram::WIRE_CAP;
+
+const _: () = assert!(BAR1_SIZE == FbufMigrateVram::MAX_LEN);
 
 const PAGE: usize = 4096;
 
@@ -70,6 +68,7 @@ impl Framebuffer {
         Ok(Some(FbufMigrateVram {
             len: u32::try_from(used).expect("VRAM is 16 MiB"),
             lz4,
+            zstd: Vec::new(),
         }))
     }
 
@@ -273,15 +272,18 @@ mod tests {
             FbufMigrateVram {
                 len: BAR1_SIZE + 1,
                 lz4: big.clone(),
+                ..Default::default()
             },
             // The header says less than the frame holds.
             FbufMigrateVram {
                 len: PAGE as u32,
                 lz4: big,
+                ..Default::default()
             },
             FbufMigrateVram {
                 len: 16,
                 lz4: vec![1, 2, 3],
+                ..Default::default()
             },
         ] {
             let state = DeviceMigrateState::Fbuf(FbufMigrateState {

@@ -12,6 +12,8 @@ workspace = true
 vmm_core.workspace = true
 vmm_devices.workspace = true
 bhyve_api.workspace = true
+# Pure Rust, as in vmm-hid, which makes the VRAM form.
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 ron.workspace = true
 rustix = { version = "1", features = ["event", "fs", "net"] }
 serde.workspace = true

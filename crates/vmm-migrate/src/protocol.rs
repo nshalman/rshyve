@@ -10,6 +10,14 @@
 
 /// Protocol identifier for the RON migration format.
 ///
+/// v12 carries the v10 payload with the framebuffer VRAM only as LZ4,
+/// and needs the source's wall clock. Builds before it sent v8 to v10
+/// with the VRAM as zstd or as LZ4, and v10 with or without the wall
+/// clock, under the same string. To an older peer the source sends
+/// both VRAM forms; from one it takes either, and no wall clock.
+///
+/// v11 is the virtio-gpu work's (PR #15), and is not offered here.
+///
 /// v10 carries the source host's wall clock in the preamble, the
 /// interrupt shadow, the AMD PMU state, and the fault-injection test
 /// device. An AMD source with a PMU state, or a VM with the test
@@ -39,7 +47,11 @@
 /// v4 named the store under each NVMe namespace. v3 carried held NVMe
 /// completions and the namespace shape. v2 carried the CQ
 /// interrupt-enable bit. v1 put device identity on the wire.
-pub const PROTOCOL_RON: &str = "vmm-migrate-ron/10";
+pub const PROTOCOL_RON: &str = "vmm-migrate-ron/12";
+
+/// The version that has one VRAM form and a wall clock without fail. A
+/// literal, so a later bump of [`PROTOCOL_RON`] does not move it.
+pub const PROTOCOL_RON_V12: &str = "vmm-migrate-ron/12";
 
 /// The version that added the wall clock, the interrupt shadow, the
 /// AMD PMU state and the fault-injection test device. A literal, so a
@@ -60,8 +72,9 @@ pub const PROTOCOL_RON_V7: &str = "vmm-migrate-ron/7";
 pub const PROTOCOL_RON_V6: &str = "vmm-migrate-ron/6";
 
 /// What a source offers, newest first.
-pub const SOURCE_OFFER: [&str; 5] = [
+pub const SOURCE_OFFER: [&str; 6] = [
     PROTOCOL_RON,
+    PROTOCOL_RON_V10,
     PROTOCOL_RON_V9,
     PROTOCOL_RON_V8,
     PROTOCOL_RON_V7,
@@ -224,6 +237,24 @@ mod tests {
         assert_eq!(select_protocol(&offer(&SOURCE_OFFER)), Some(PROTOCOL_RON));
     }
 
+    // v10 builds differ in the VRAM form and the wall clock, so both
+    // ends must still take v10 from each other, and v11 (PR #15) is
+    // not ours to pick.
+    #[test]
+    fn a_v10_or_v11_peer_meets_this_build_at_v10() {
+        let v10 = offer(&[
+            PROTOCOL_RON_V10,
+            PROTOCOL_RON_V9,
+            PROTOCOL_RON_V8,
+            PROTOCOL_RON_V7,
+            PROTOCOL_RON_V6,
+        ]);
+        assert_eq!(select_protocol(&v10), Some(PROTOCOL_RON_V10));
+        let v11 = offer(&["vmm-migrate-ron/11", PROTOCOL_RON_V10]);
+        assert_eq!(select_protocol(&v11), Some(PROTOCOL_RON_V10));
+        assert!(!SOURCE_OFFER.contains(&"vmm-migrate-ron/11"));
+    }
+
     #[test]
     fn a_destination_takes_a_v6_source() {
         let v6 = offer(&[PROTOCOL_RON_V6]);
@@ -345,7 +376,7 @@ mod tests {
     fn the_offer_is_newest_first() {
         let versions: Vec<u32> =
             SOURCE_OFFER.iter().map(|p| version(p)).collect();
-        assert_eq!(versions, [10, 9, 8, 7, 6]);
+        assert_eq!(versions, [12, 10, 9, 8, 7, 6]);
         assert_eq!(version("garbage"), 0);
     }
 

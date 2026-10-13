@@ -24,6 +24,7 @@ pub mod protocol;
 pub mod source;
 pub mod stall;
 pub mod state;
+mod vram;
 pub mod wait;
 pub mod wire;
 pub mod xsave;

@@ -1725,6 +1725,7 @@ name = "vmm_migrate"
 version = "0.1.0"
 dependencies = [
  "bhyve_api",
+ "lz4_flex",
  "ron",
  "rustix",
  "serde",

@@ -216,9 +216,14 @@ fn run_inner<S: Transport>(
 
     // ── DeviceState ──
     set_phase(status, MigrationPhase::DeviceState);
-    let dev_state: DeviceState = chan.expect_serialized()?;
+    let mut dev_state: DeviceState = chan.expect_serialized()?;
     not_cancelled(gate)?;
-    if let Err(e) = restore_devices(&dev_state, config, hooks, log) {
+    // The topology goes first: each VRAM conversion can allocate the
+    // whole VRAM, so only a device this VM has gets one.
+    if let Err(e) = check_entries(&dev_state, config)
+        .and_then(|()| crate::vram::accept(&mut dev_state.emulated))
+        .and_then(|()| restore_devices(&dev_state, config, hooks, log))
+    {
         chan.report_failure(&e, log);
         return Err(e);
     }
@@ -358,7 +363,7 @@ fn check_enlightenments(
 }
 
 /// The skew between the two hosts' clocks, or `None` from a source too
-/// old to send its clock.
+/// old to send its clock. Early v10 builds sent none.
 fn check_clock(
     preamble: &MigrationPreamble,
     protocol: &str,
@@ -369,7 +374,7 @@ fn check_clock(
             crate::clock::check_skew(source, crate::clock::now_ns()?, log)
                 .map(Some)
         }
-        None if protocol::at_least(protocol, protocol::PROTOCOL_RON_V10) => {
+        None if protocol::at_least(protocol, protocol::PROTOCOL_RON_V12) => {
             Err(MigrateError::PreambleMismatch(
                 "the source sent no wall clock".into(),
             ))
@@ -429,13 +434,11 @@ fn check_topology<T: std::fmt::Display>(
     )))
 }
 
-/// Give every device the state its counterpart exported, matched by PCI
-/// address alone.
-fn restore_devices(
+/// Every entry is at an address this VM has a device at, once, and every
+/// such device has an entry.
+fn check_entries(
     dev_state: &DeviceState,
     config: &DestConfig,
-    hooks: &DestHooks,
-    log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     let expected: BTreeMap<WireBdf, &str> = config
         .devices
@@ -476,6 +479,18 @@ fn restore_devices(
             bdf, expected[bdf],
         )));
     }
+    Ok(())
+}
+
+/// Give every device the state its counterpart exported, matched by PCI
+/// address alone.
+fn restore_devices(
+    dev_state: &DeviceState,
+    config: &DestConfig,
+    hooks: &DestHooks,
+    log: &slog::Logger,
+) -> Result<(), MigrateError> {
+    check_entries(dev_state, config)?;
 
     if dev_state.hyperv.is_none() && config.hyperv {
         return Err(MigrateError::State(
@@ -679,11 +694,11 @@ mod tests {
         assert!(skew.is_some_and(|ms| ms.abs() < 1_000), "{skew:?}");
 
         check_clock(&preamble(None), protocol::PROTOCOL_RON, &log())
-            .expect_err("no clock from a v10 source");
-        let old =
-            check_clock(&preamble(None), protocol::PROTOCOL_RON_V9, &log())
-                .expect("a v9 source has none");
-        assert_eq!(old, None);
+            .expect_err("no clock from a v12 source");
+        for old in [protocol::PROTOCOL_RON_V10, protocol::PROTOCOL_RON_V9] {
+            let skew = check_clock(&preamble(None), old, &log()).expect(old);
+            assert_eq!(skew, None, "{old}");
+        }
 
         let hour_behind = now - 3_600 * 1_000_000_000;
         check_clock(
