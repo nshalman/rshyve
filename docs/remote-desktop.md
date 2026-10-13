@@ -160,7 +160,7 @@ provider like the others:
 
 | Probe | Fires when | Arguments |
 |-------|------------|-----------|
-| `egfx_frame` | the RDP EGFX worker made a frame | encode time (us), whether the client took it (0 when it had too many frames unacknowledged, or its connection went), the pace asked of the guest (us) |
+| `egfx_frame` | the RDP EGFX worker made a frame | encode time (us), whether the client took it (0 when it had too many frames unacknowledged or 32 MiB of frames and audio unread, the encode failed, or its connection went), the pace asked of the guest (us) |
 | `gpu_flip` | virtio-gpu got a fenced flush | descriptor head, whether its answer waits for the pacer, the pace (us) |
 | `gpu_flip_answer` | the pacer answered a flip that waited | descriptor head |
 | `egfx_overlay` | the RDP worker checks it on every pass of its loop, up to 60 a second; while it is enabled, the worker draws its numbers over the picture | none |
@@ -194,7 +194,8 @@ The pace: with no RDP client, virtio-gpu lets a Linux guest flip 30
 times a second. With one on the graphics pipeline (EGFX), the RDP
 server asks for the rate it is managing to send at, slower when frames
 take longer to encode or the client refuses them because it has too
-many unacknowledged, and the device holds the request between 60 and
+many unacknowledged, or because it has not read 32 MiB of frames and audio
+already sent, and the device holds the request between 60 and
 10 frames a second. The overlay's PACE is the request; desk-rate.d's
 pace is what the device applies. Measured on the lab host with 60 frames a
 second video: 60 frames a second in a 1520x913 window, at about 1 ms

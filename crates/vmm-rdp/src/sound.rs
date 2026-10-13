@@ -25,6 +25,8 @@ use vmm_devices::audio::{
     PCM_RATE,
 };
 
+use crate::bridge::OutboundBacklog;
+
 /// How much audio one wave carries: 40 ms.
 ///
 /// The guest plays in buffers of about 10 ms, and IronRDP's server keeps
@@ -49,6 +51,9 @@ fn pcm_format() -> AudioFormat {
 #[derive(Default)]
 struct State {
     sender: Option<UnboundedSender<ServerEvent>>,
+    /// The connection's output not yet written to the client, which
+    /// each wave adds to.
+    backlog: Option<Arc<OutboundBacklog>>,
     streaming: bool,
     /// Audio gathered toward the next wave.
     pending: Vec<u8>,
@@ -104,6 +109,14 @@ impl AudioSink for Sound {
         let ms = self.epoch.elapsed().as_millis() as u32;
         while st.pending.len() >= WAVE_BYTES {
             let wave: Vec<u8> = st.pending.drain(..WAVE_BYTES).collect();
+            if let Some(backlog) = &st.backlog {
+                // IronRDP sends waves without waiting for the client to
+                // confirm them, so one far behind loses audio here.
+                if backlog.over_cap() {
+                    continue;
+                }
+                backlog.queued(wave.len());
+            }
             if let Some(sender) = &st.sender {
                 // A send fails only once the server has stopped.
                 let _ = sender.send(ServerEvent::Rdpsnd(
@@ -115,26 +128,41 @@ impl AudioSink for Sound {
 }
 
 /// Builds the handler for each connection's rdpsnd channel.
-pub(crate) struct Factory(pub(crate) Arc<Sound>);
+pub(crate) struct Factory {
+    sound: Arc<Sound>,
+    /// The connection's output not yet written to the client.
+    backlog: Arc<OutboundBacklog>,
+}
+
+impl Factory {
+    pub(crate) fn new(
+        sound: Arc<Sound>,
+        backlog: Arc<OutboundBacklog>,
+    ) -> Self {
+        Self { sound, backlog }
+    }
+}
 
 /// Each connection's server owns one, so the stream ends with the
 /// connection even when the client never closed its sound channel.
 impl Drop for Factory {
     fn drop(&mut self) {
-        self.0.end_session();
+        self.sound.end_session();
     }
 }
 
 impl ServerEventSender for Factory {
     fn set_sender(&mut self, sender: UnboundedSender<ServerEvent>) {
-        self.0.lock().sender = Some(sender);
+        let mut st = self.sound.lock();
+        st.sender = Some(sender);
+        st.backlog = Some(Arc::clone(&self.backlog));
     }
 }
 
 impl SoundServerFactory for Factory {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
         Box::new(Handler {
-            sound: Arc::clone(&self.0),
+            sound: Arc::clone(&self.sound),
             formats: [pcm_format()],
         })
     }
@@ -189,11 +217,13 @@ mod tests {
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
     use super::*;
+    use crate::bridge::OUTPUT_BACKLOG_CAP;
 
     /// A sound sink with its factory's sender set, as the server does.
     fn sound() -> (Arc<Sound>, Factory, UnboundedReceiver<ServerEvent>) {
         let sound = Sound::new();
-        let mut factory = Factory(Arc::clone(&sound));
+        let mut factory =
+            Factory::new(Arc::clone(&sound), Arc::new(OutboundBacklog::new()));
         let (tx, rx) = unbounded_channel();
         factory.set_sender(tx);
         (sound, factory, rx)
@@ -270,6 +300,33 @@ mod tests {
         let (sound, _factory, mut rx) = sound();
         sound.play(&vec![1; WAVE_BYTES]);
         assert!(waves(&mut rx).is_empty());
+    }
+
+    /// A client that has more than the cap unread gets no more audio:
+    /// IronRDP sends waves without waiting for the client to confirm
+    /// them, so nothing else holds them back.
+    #[test]
+    fn waves_are_dropped_while_the_client_has_too_much_unread() {
+        let (sound, factory, mut rx) = sound();
+        let _channel = negotiate(&factory, vec![pcm_format()]);
+        factory.backlog.queued(OUTPUT_BACKLOG_CAP as usize + 1);
+        sound.play(&vec![1; WAVE_BYTES]);
+        assert!(waves(&mut rx).is_empty(), "dropped over the cap");
+        assert_eq!(factory.backlog.bytes(), OUTPUT_BACKLOG_CAP + 1);
+
+        factory.backlog.written(OUTPUT_BACKLOG_CAP as usize);
+        sound.play(&vec![2; WAVE_BYTES]);
+        assert_eq!(waves(&mut rx), [vec![2; WAVE_BYTES]]);
+    }
+
+    /// A wave sent counts against its connection's backlog.
+    #[test]
+    fn a_wave_counts_against_the_connections_backlog() {
+        let (sound, factory, mut rx) = sound();
+        let _channel = negotiate(&factory, vec![pcm_format()]);
+        sound.play(&vec![1; WAVE_BYTES + 4]);
+        assert_eq!(waves(&mut rx).len(), 1);
+        assert_eq!(factory.backlog.bytes(), WAVE_BYTES as u64);
     }
 
     /// The guest plays in buffers of a few milliseconds, and the server

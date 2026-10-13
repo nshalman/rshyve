@@ -140,6 +140,7 @@ async fn serve(
     listener: bridge::Listener,
     mut new_server: impl FnMut(
         Arc<bridge::InboundBudget>,
+        Arc<bridge::OutboundBacklog>,
     ) -> ironrdp_server::RdpServer,
     log: &slog::Logger,
 ) {
@@ -165,16 +166,19 @@ async fn serve(
                 continue;
             }
         };
-        let budget = Arc::new(bridge::InboundBudget::new(PRE_LOGIN_BYTES));
-        let bridged = bridge::bridge(conn, &rt, log, Arc::clone(&budget));
-        let (stream, closer) = match bridged {
-            Ok(bridged) => bridged,
+        let Connection {
+            stream,
+            closer,
+            budget,
+            backlog,
+        } = match connect(conn, &rt, log) {
+            Ok(c) => c,
             Err(e) => {
                 slog::warn!(log, "RDP connection not bridged"; "error" => %e);
                 continue;
             }
         };
-        let mut server = new_server(Arc::clone(&budget));
+        let mut server = new_server(Arc::clone(&budget), backlog);
         tokio::select! {
             result = server.run_connection(stream) => {
                 if let Err(e) = result {
@@ -188,6 +192,40 @@ async fn serve(
         // Shuts the socket down, which ends the bridge threads.
         drop(closer);
     }
+}
+
+/// One accepted connection: the stream its server reads, and what the
+/// bridge shares with the server and the watchdog.
+struct Connection {
+    stream: tokio::io::DuplexStream,
+    closer: bridge::Closer,
+    budget: Arc<bridge::InboundBudget>,
+    /// Each connection's own: what the last one left unsent went with
+    /// its server.
+    backlog: Arc<bridge::OutboundBacklog>,
+}
+
+/// Bridge `conn`, with the budget and backlog its server is then given.
+fn connect(
+    conn: bridge::Conn,
+    rt: &tokio::runtime::Handle,
+    log: &slog::Logger,
+) -> std::io::Result<Connection> {
+    let budget = Arc::new(bridge::InboundBudget::new(PRE_LOGIN_BYTES));
+    let backlog = Arc::new(bridge::OutboundBacklog::new());
+    let (stream, closer) = bridge::bridge(
+        conn,
+        rt,
+        log,
+        Arc::clone(&budget),
+        Arc::clone(&backlog),
+    )?;
+    Ok(Connection {
+        stream,
+        closer,
+        budget,
+        backlog,
+    })
 }
 
 /// How often the listener is checked for a new connection.
@@ -308,33 +346,37 @@ impl RdpServer {
                 );
                 // Stops when this thread does.
                 let _egfx_worker = egfx_worker;
-                let new_server = |budget| {
-                    ironrdp_server::RdpServer::builder()
-                        .with_addr(addr)
-                        .with_tls(tls.clone())
-                        .with_input_handler(input::Input::new(
-                            Arc::clone(&input),
-                            Arc::clone(&source),
-                            log.clone(),
-                        ))
-                        .with_display_handler(display::Display {
-                            source: Arc::clone(&source),
-                            egfx: Some(Arc::clone(&egfx)),
-                            log: log.clone(),
-                        })
-                        .with_credential_validator(Some(Arc::new(Admit {
-                            account: credentials.clone(),
-                            budget,
-                        })))
-                        .with_bitmap_codecs(codecs.clone())
-                        .with_sound_factory(Some(Box::new(sound::Factory(
-                            Arc::clone(&sound),
-                        ))))
-                        .with_gfx_factory(Some(Box::new(egfx::Factory(
-                            Arc::clone(&egfx),
-                        ))))
-                        .build()
-                };
+                let new_server =
+                    |budget, backlog: Arc<bridge::OutboundBacklog>| {
+                        ironrdp_server::RdpServer::builder()
+                            .with_addr(addr)
+                            .with_tls(tls.clone())
+                            .with_input_handler(input::Input::new(
+                                Arc::clone(&input),
+                                Arc::clone(&source),
+                                log.clone(),
+                            ))
+                            .with_display_handler(display::Display {
+                                source: Arc::clone(&source),
+                                egfx: Some(Arc::clone(&egfx)),
+                                log: log.clone(),
+                            })
+                            .with_credential_validator(Some(Arc::new(Admit {
+                                account: credentials.clone(),
+                                budget,
+                            })))
+                            .with_bitmap_codecs(codecs.clone())
+                            .with_sound_factory(Some(Box::new(
+                                sound::Factory::new(
+                                    Arc::clone(&sound),
+                                    Arc::clone(&backlog),
+                                ),
+                            )))
+                            .with_gfx_factory(Some(Box::new(
+                                egfx::Factory::new(Arc::clone(&egfx), backlog),
+                            )))
+                            .build()
+                    };
                 runtime.block_on(async {
                     slog::info!(log, "RDP server listening"; "addr" => %listen);
                     tokio::select! {
@@ -437,8 +479,14 @@ mod tests {
         let log = slog::Logger::root(slog::Discard, slog::o!());
         let budget = Arc::new(bridge::InboundBudget::new(0));
         budget.lift();
-        let (server, closer) =
-            bridge::bridge(conn, rt.handle(), &log, budget).expect("bridge");
+        let (server, closer) = bridge::bridge(
+            conn,
+            rt.handle(),
+            &log,
+            budget,
+            Arc::new(bridge::OutboundBacklog::new()),
+        )
+        .expect("bridge");
         (dir, client, server, closer)
     }
 
@@ -453,6 +501,40 @@ mod tests {
         login: Duration::from_millis(300),
         write_stall: Duration::from_millis(300),
     };
+
+    /// The backlog a connection's server is given is the one its bridge
+    /// takes written bytes off: with two, frames would wait for good
+    /// once 32 MiB had gone out.
+    #[test]
+    fn a_connection_shares_one_backlog_with_its_bridge() {
+        use std::io::Read;
+        use tokio::io::AsyncWriteExt;
+
+        let rt = watch_runtime();
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("s");
+        let listener =
+            bridge::Listener::bind(&Listen::Unix(path.clone())).expect("bind");
+        let mut client =
+            std::os::unix::net::UnixStream::connect(&path).expect("connect");
+        let conn = loop {
+            if let Some(conn) = listener.try_accept().expect("accept") {
+                break conn;
+            }
+        };
+        let log = slog::Logger::root(slog::Discard, slog::o!());
+        let mut c = connect(conn, rt.handle(), &log).expect("bridged");
+        c.backlog.queued(5);
+        rt.block_on(c.stream.write_all(b"hello"))
+            .expect("server write");
+        let mut got = [0; 5];
+        client.read_exact(&mut got).expect("client read");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while c.backlog.bytes() != 0 {
+            assert!(Instant::now() < deadline, "never taken off");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     #[test]
     fn a_client_that_does_not_log_in_is_dropped() {

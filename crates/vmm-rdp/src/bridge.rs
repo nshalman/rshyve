@@ -195,6 +195,57 @@ impl InboundBudget {
     }
 }
 
+/// One connection's EGFX frame and audio bytes handed to the server
+/// loop, less what the bridge has written to the client. IronRDP queues
+/// those without limit: a client that suspends its frame
+/// acknowledgements is never held back by them, and waves go out
+/// unconfirmed. This is what keeps a client that reads slowly or not
+/// at all from growing the queue without end. The classic bitmap path
+/// needs no count: the server loop pulls its updates as it writes them.
+///
+/// The bridge's bytes also carry TLS and PDU framing and the small
+/// PDUs (pointer, input acknowledgements), so this is a little under
+/// what the client has not read.
+pub(crate) struct OutboundBacklog(AtomicU64);
+
+/// The EGFX frame and audio bytes a client may leave unread before more
+/// wait (frames) or are dropped (audio): a few seconds of a busy 4K
+/// display.
+pub(crate) const OUTPUT_BACKLOG_CAP: u64 = 32 << 20;
+
+impl OutboundBacklog {
+    pub(crate) fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    pub(crate) fn queued(&self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.0.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    /// The bridge writes every PDU, not only those counted in, so this
+    /// stops at nothing.
+    // `try_update` replaces this from Rust 1.95, and the MSRV is 1.94.
+    #[allow(deprecated)]
+    pub(crate) fn written(&self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let _ =
+            self.0
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    Some(left.saturating_sub(bytes))
+                });
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Whether the client has more than [`OUTPUT_BACKLOG_CAP`] unread.
+    pub(crate) fn over_cap(&self) -> bool {
+        self.bytes() > OUTPUT_BACKLOG_CAP
+    }
+}
+
 /// Shuts the socket down when dropped. That wakes both bridge threads
 /// whatever they are blocked on, including a write to a client that has
 /// stopped reading.
@@ -229,12 +280,13 @@ fn shutdown(conn: &Conn, log: &slog::Logger) {
 
 /// Carry `conn` to the returned stream until either side closes, until
 /// the returned [`Closer`] is dropped, or until the client overspends
-/// `budget`.
+/// `budget`. What reaches the client comes off `backlog`.
 pub(crate) fn bridge(
     conn: Conn,
     rt: &Handle,
     log: &slog::Logger,
     budget: Arc<InboundBudget>,
+    backlog: Arc<OutboundBacklog>,
 ) -> io::Result<(DuplexStream, Closer)> {
     conn.set_blocking()?;
     let writing = Arc::new(WriteClock::new());
@@ -303,6 +355,7 @@ pub(crate) fn bridge(
                             slog::debug!(log_out, "RDP client write failed"; "error" => %e);
                             break;
                         }
+                        backlog.written(n);
                     }
                 }
             }
@@ -327,6 +380,14 @@ mod tests {
     fn connected(
         rt: &tokio::runtime::Runtime,
     ) -> (tempfile::TempDir, UnixStream, DuplexStream, Closer) {
+        connected_with(rt, Arc::new(OutboundBacklog::new()))
+    }
+
+    /// As `connected`, with the written bytes taken off `backlog`.
+    fn connected_with(
+        rt: &tokio::runtime::Runtime,
+        backlog: Arc<OutboundBacklog>,
+    ) -> (tempfile::TempDir, UnixStream, DuplexStream, Closer) {
         let dir = tempfile::tempdir().expect("a temp dir");
         let listener =
             Listener::bind(&Listen::Unix(dir.path().join("s"))).expect("bind");
@@ -341,7 +402,7 @@ mod tests {
         let budget = Arc::new(InboundBudget::new(0));
         budget.lift();
         let (server, closer) =
-            bridge(conn, rt.handle(), &log, budget).expect("bridge");
+            bridge(conn, rt.handle(), &log, budget, backlog).expect("bridge");
         (dir, client, server, closer)
     }
 
@@ -385,8 +446,9 @@ mod tests {
         };
         let log = slog::Logger::root(slog::Discard, slog::o!());
         let budget = Arc::new(InboundBudget::new(1024));
+        let backlog = Arc::new(OutboundBacklog::new());
         let (mut server, _closer) =
-            bridge(conn, rt.handle(), &log, budget).expect("bridge");
+            bridge(conn, rt.handle(), &log, budget, backlog).expect("bridge");
 
         client.write_all(&[7u8; 512]).expect("within budget");
         let mut got = [0u8; 512];
@@ -432,15 +494,21 @@ mod tests {
     /// reading.
     fn fill(rt: &tokio::runtime::Runtime, server: &mut DuplexStream) {
         let chunk = vec![0u8; BUF];
-        let filled = rt.block_on(async {
-            tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    server.write_all(&chunk).await.expect("server write");
-                }
-            })
-            .await
-        });
-        assert!(filled.is_err(), "the writes should block on a full socket");
+        // Far more than the duplex and a socket buffer hold.
+        for _ in 0..(64 << 20) / BUF {
+            let wrote = rt.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_millis(500),
+                    server.write_all(&chunk),
+                )
+                .await
+            });
+            match wrote {
+                Ok(written) => written.expect("server write"),
+                Err(_) => return,
+            }
+        }
+        panic!("the writes never blocked on a full socket");
     }
 
     #[test]
@@ -449,8 +517,13 @@ mod tests {
         let (_dir, _client, mut server, closer) = connected(&rt);
         assert_eq!(closer.stalled_for(), None);
         fill(&rt, &mut server);
-        let stalled = closer.stalled_for().expect("a write is waiting");
-        assert!(stalled >= Duration::from_millis(500), "{stalled:?}");
+        assert!(closer.stalled_for().is_some(), "a write is waiting");
+        // The stall grows while the client does not read.
+        wait_for(|| {
+            closer
+                .stalled_for()
+                .is_some_and(|stalled| stalled >= Duration::from_millis(500))
+        });
     }
 
     /// A client that stops reading must not keep the socket open once
@@ -550,6 +623,39 @@ mod tests {
             .read_to_end(&mut rest)
             .expect("the bridge closes the socket");
         assert!(rest.is_empty());
+    }
+
+    /// What reaches the client comes off the backlog, which never goes
+    /// below nothing: the backlog counts frames and audio, and the
+    /// bridge carries every PDU.
+    #[test]
+    fn bytes_written_to_the_client_come_off_the_backlog() {
+        let rt = runtime();
+        let backlog = Arc::new(OutboundBacklog::new());
+        let (_dir, mut client, mut server, _closer) =
+            connected_with(&rt, Arc::clone(&backlog));
+        backlog.queued(10);
+
+        rt.block_on(server.write_all(b"world"))
+            .expect("server write");
+        let mut got = [0; 5];
+        client.read_exact(&mut got).expect("client read");
+        wait_for(|| backlog.bytes() == 5);
+
+        rt.block_on(server.write_all(b"0123456789"))
+            .expect("server write");
+        let mut got = [0; 10];
+        client.read_exact(&mut got).expect("client read");
+        wait_for(|| backlog.bytes() == 0);
+    }
+
+    /// Wait up to 5 s for `done`.
+    fn wait_for(done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out");
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]

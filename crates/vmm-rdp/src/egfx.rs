@@ -42,6 +42,7 @@ use vmm_devices::display::{
     changed_tiles, DisplaySource, DisplayWaker, Pixels, Rect, TILE,
 };
 
+use crate::bridge::OutboundBacklog;
 use crate::progressive::ProgressiveEncoder;
 
 /// DTrace probes for the frames the worker sends.
@@ -50,7 +51,8 @@ mod probes {
     /// The worker made a frame. `encode_us` is the time to render and
     /// queue it; `taken` is 1 when the client has it (queued, or nothing
     /// changed) and 0 when it was not queued: the client had too many
-    /// frames unacknowledged, or its connection or surface went away;
+    /// frames unacknowledged or too much unread, the encode failed, or
+    /// its connection or surface went away;
     /// `pace_us` is the pace the guest is now asked for.
     fn egfx_frame(encode_us: u64, taken: u8, pace_us: u64) {}
     /// Enabled, the worker draws its numbers over the frames it sends;
@@ -109,14 +111,21 @@ struct State {
     /// Counts connections, so an update notices a new one and starts
     /// its encoder over, and drops a frame planned for the last one.
     connection: u64,
+    /// The connection's output not yet written to the client.
+    backlog: Option<Arc<OutboundBacklog>>,
 }
 
 impl State {
-    /// Start over for a connection with `pipeline`, or for none: the
-    /// client has no surface, and a frame planned for the last one is
-    /// dropped.
-    fn new_connection(&mut self, pipeline: Option<GfxServerHandle>) {
+    /// Start over for a connection with `pipeline` and `backlog`, or
+    /// for none: the client has no surface, and a frame planned for the
+    /// last one is dropped.
+    fn new_connection(
+        &mut self,
+        pipeline: Option<GfxServerHandle>,
+        backlog: Option<Arc<OutboundBacklog>>,
+    ) {
         self.pipeline = pipeline;
+        self.backlog = backlog;
         self.surface = None;
         self.pending = None;
         self.connection += 1;
@@ -205,6 +214,7 @@ impl Egfx {
                 pending: None,
                 started: Instant::now(),
                 connection: 0,
+                backlog: None,
             }),
             render: Mutex::new(Render {
                 encoder: ProgressiveEncoder::new(),
@@ -310,6 +320,11 @@ impl Egfx {
         })
     }
 
+    /// Whether the client has more unread than the cap allows.
+    fn over_cap(&self) -> bool {
+        self.lock().backlog.as_ref().is_some_and(|b| b.over_cap())
+    }
+
     /// Whether the EGFX channel is ready to carry the display.
     pub(crate) fn active(&self) -> bool {
         let pipeline = self.lock().pipeline.clone();
@@ -344,6 +359,11 @@ impl Egfx {
     pub(crate) fn update(&self, source: &dyn DisplaySource) -> Option<bool> {
         let mut render = self.render.lock().expect("egfx: render lock");
         let frame = self.plan(&mut render, source)?;
+        // Refused as `queue` would refuse it, without the encode; the
+        // damage stays pending.
+        if self.over_cap() {
+            return Some(false);
+        }
         let encoded = encode(&mut render, &frame, source);
         let taken = self.finish(&frame, encoded);
         if taken {
@@ -486,7 +506,14 @@ impl Egfx {
                 st.pending = None;
                 true
             }
+            // The damage waits for the client to read what it has.
+            Ok(Some(_))
+                if st.backlog.as_ref().is_some_and(|b| b.over_cap()) =>
+            {
+                false
+            }
             Ok(Some(data)) => {
+                let len = data.len();
                 let ms = st.started.elapsed().as_millis() as u32;
                 // None: the client has too many frames in flight; the
                 // damage waits for the next round.
@@ -500,6 +527,9 @@ impl Egfx {
                     .is_some();
                 if queued {
                     st.pending = None;
+                    if let Some(backlog) = &st.backlog {
+                        backlog.queued(len);
+                    }
                 }
                 queued
             }
@@ -653,29 +683,39 @@ fn clip(r: Rect, bounds: Rect) -> Option<Rect> {
 }
 
 /// Hands IronRDP a pipeline per connection, and keeps its handle.
-pub(crate) struct Factory(pub(crate) Arc<Egfx>);
+pub(crate) struct Factory {
+    egfx: Arc<Egfx>,
+    /// The connection's output not yet written to the client.
+    backlog: Arc<OutboundBacklog>,
+}
+
+impl Factory {
+    pub(crate) fn new(egfx: Arc<Egfx>, backlog: Arc<OutboundBacklog>) -> Self {
+        Self { egfx, backlog }
+    }
+}
 
 /// Each connection's server owns one, so the pipeline ends with the
 /// connection even when the client never closed its EGFX channel, and a
 /// frame planned for it is dropped.
 impl Drop for Factory {
     fn drop(&mut self) {
-        let mut st = self.0.lock();
-        st.new_connection(None);
+        let mut st = self.egfx.lock();
+        st.new_connection(None, None);
         st.sender = None;
     }
 }
 
 impl ServerEventSender for Factory {
     fn set_sender(&mut self, sender: UnboundedSender<ServerEvent>) {
-        self.0.lock().sender = Some(sender);
+        self.egfx.lock().sender = Some(sender);
     }
 }
 
 impl GfxServerFactory for Factory {
     fn build_gfx_handler(&self) -> Box<dyn GraphicsPipelineHandler> {
         Box::new(Handler {
-            log: self.0.log.clone(),
+            log: self.egfx.log.clone(),
         })
     }
 
@@ -686,7 +726,10 @@ impl GfxServerFactory for Factory {
         let handle = Arc::new(Mutex::new(GraphicsPipelineServer::new(
             self.build_gfx_handler(),
         )));
-        self.0.lock().new_connection(Some(Arc::clone(&handle)));
+        self.egfx.lock().new_connection(
+            Some(Arc::clone(&handle)),
+            Some(Arc::clone(&self.backlog)),
+        );
         Some((GfxDvcBridge::new(Arc::clone(&handle)), handle))
     }
 }
@@ -722,6 +765,7 @@ pub(crate) mod tests {
     use vmm_devices::display::Rect;
 
     use super::*;
+    use crate::bridge::OUTPUT_BACKLOG_CAP;
     use crate::testsupport::FakeDisplay;
 
     const CHANNEL: u32 = 3;
@@ -733,6 +777,8 @@ pub(crate) mod tests {
         factory: Factory,
         handle: GfxServerHandle,
         events: UnboundedReceiver<ServerEvent>,
+        /// The connection's output not yet written.
+        backlog: Arc<OutboundBacklog>,
     }
 
     impl Harness {
@@ -743,7 +789,9 @@ pub(crate) mod tests {
         /// A harness whose EGFX logs to `log`.
         fn logged(log: slog::Logger) -> Self {
             let egfx = Egfx::new(log);
-            let mut factory = Factory(Arc::clone(&egfx));
+            let backlog = Arc::new(OutboundBacklog::new());
+            let mut factory =
+                Factory::new(Arc::clone(&egfx), Arc::clone(&backlog));
             let (tx, events) = ServerEvent::create_channel();
             factory.set_sender(tx);
             let (_bridge, handle) =
@@ -753,6 +801,7 @@ pub(crate) mod tests {
                 factory,
                 handle,
                 events,
+                backlog,
             }
         }
 
@@ -1067,6 +1116,49 @@ pub(crate) mod tests {
 
         assert_eq!(h.egfx.update(&display), Some(true));
         assert_eq!(h.frames(), 1);
+    }
+
+    /// Frames wait while the client has more than the cap unread: what
+    /// the server loop cannot write waits in memory. The damage is kept
+    /// for when it has read enough.
+    #[test]
+    fn frames_wait_while_the_client_has_too_much_unread() {
+        let h = Harness::new();
+        h.ready();
+        let display = FakeDisplay::new(64, 48);
+        let backlog = &h.backlog;
+        backlog.queued(OUTPUT_BACKLOG_CAP as usize + 1);
+        assert_eq!(h.egfx.update(&display), Some(false));
+        assert_eq!(h.frames(), 0);
+        assert_eq!(tiles_sent(&h), 0, "not encoded, only to be refused");
+
+        // Exactly the cap is not past it.
+        backlog.written(1);
+        assert_eq!(backlog.bytes(), OUTPUT_BACKLOG_CAP);
+        assert_eq!(h.egfx.update(&display), Some(true));
+        assert_eq!(h.frames(), 1);
+        assert!(backlog.bytes() > 1, "the frame sent counts too");
+    }
+
+    /// A connection's backlog is its own: what the last client left
+    /// unread went with its server, and holds back no frame of the next.
+    #[test]
+    fn a_new_connection_has_a_backlog_of_its_own() {
+        let h = Harness::new();
+        h.ready();
+        h.backlog.queued(OUTPUT_BACKLOG_CAP as usize + 1);
+        let Harness { egfx, factory, .. } = h;
+        drop(factory);
+
+        let backlog = Arc::new(OutboundBacklog::new());
+        let mut factory = Factory::new(Arc::clone(&egfx), Arc::clone(&backlog));
+        let (tx, _events) = ServerEvent::create_channel();
+        factory.set_sender(tx);
+        let (_bridge, handle) =
+            factory.build_server_with_handle().expect("a pipeline");
+        ready(&handle);
+        assert_eq!(egfx.update(&FakeDisplay::new(64, 48)), Some(true));
+        assert!(backlog.bytes() > 0, "the frame counts against its own");
     }
 
     /// A connection's server owns its factory, so the factory going
