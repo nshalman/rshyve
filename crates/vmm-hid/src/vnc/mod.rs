@@ -399,8 +399,9 @@ fn dispatch_client_message(
             None
         }
         ClientMessage::SetEncodings(encs) => {
-            if !encs.contains(&ENCODING_RAW) {
-                slog::warn!(dev.log, "client encodings do not include Raw, updates may not display correctly");
+            // Pixels go as ZRLE to a client that lists it, else as Raw.
+            if !encs.contains(&ENCODING_RAW) && !encs.contains(&ENCODING_ZRLE) {
+                slog::warn!(dev.log, "client encodings include neither Raw nor ZRLE; it is sent Raw");
             }
             view.desktop_size = encs.contains(&ENCODING_DESKTOP_SIZE);
             let cursor = encs.contains(&ENCODING_CURSOR);
@@ -2012,6 +2013,53 @@ mod tests {
         assert!(
             sent_update(&dev, &mut view, UpdateRequest::Incremental).is_empty()
         );
+    }
+
+    /// Counts the warnings logged to it.
+    struct Warnings(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl slog::Drain for Warnings {
+        type Ok = ();
+        type Err = slog::Never;
+
+        fn log(
+            &self,
+            record: &slog::Record<'_>,
+            _values: &slog::OwnedKVList,
+        ) -> Result<(), slog::Never> {
+            if record.level() == slog::Level::Warning {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+
+    /// A client that lists ZRLE without Raw is served ZRLE and needs no
+    /// warning: macOS Screen Sharing lists no Raw. One that lists neither
+    /// gets Raw it did not ask for, and that is worth a line.
+    #[test]
+    fn only_a_client_without_raw_or_zrle_is_warned_about() {
+        let warnings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dev = Arc::new(VncServer::new(
+            make_test_dev() as Arc<dyn DisplaySource>,
+            Path::new("/nonexistent/fbuf.vnc"),
+            None,
+            Arc::new(InputBroker::default()),
+            slog::Logger::root(Warnings(Arc::clone(&warnings)), slog::o!()),
+        ));
+        let mut view = announced(8, 8);
+        dispatch_client_message(
+            &dev,
+            &mut view,
+            ClientMessage::SetEncodings(vec![ENCODING_ZRLE, ENCODING_CURSOR]),
+        );
+        assert_eq!(warnings.load(Ordering::SeqCst), 0, "ZRLE alone");
+        dispatch_client_message(
+            &dev,
+            &mut view,
+            ClientMessage::SetEncodings(vec![ENCODING_CURSOR]),
+        );
+        assert_eq!(warnings.load(Ordering::SeqCst), 1, "neither");
     }
 
     /// SetEncodings with Cursor makes the client one that draws it.
