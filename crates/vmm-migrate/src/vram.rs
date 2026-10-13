@@ -32,22 +32,61 @@ pub(crate) fn fit_for_peer(
     }
     for vram in vrams(emulated) {
         let Some(v) = vram.as_mut() else { continue };
-        let raw = lz4_decompress(v)?;
-        let zstd = zstd::bulk::compress(&raw, ZSTD_LEVEL).map_err(|e| {
-            MigrateError::State(format!("fbuf: compress VRAM: {e}"))
-        })?;
-        if zstd.len() > FbufMigrateVram::WIRE_CAP {
-            slog::warn!(log,
-                "fbuf: VRAM does not compress small enough for an older \
-                 peer, not carried";
-                "used" => v.len, "compressed" => zstd.len());
-            *vram = None;
-            continue;
+        // The guest is paused here, so a VRAM that cannot be carried is
+        // left behind rather than failing the move.
+        match legacy_zstd(v) {
+            Ok(zstd) if zstd.len() <= FbufMigrateVram::WIRE_CAP => {
+                v.zstd = zstd;
+            }
+            Ok(zstd) => {
+                slog::warn!(log,
+                    "fbuf: VRAM does not compress small enough for an \
+                     older peer, not carried";
+                    "used" => v.len, "compressed" => zstd.len());
+                *vram = None;
+            }
+            Err(e) => {
+                slog::warn!(log, "fbuf: VRAM not carried"; "error" => %e);
+                *vram = None;
+            }
         }
-        v.zstd = zstd;
     }
     Ok(())
 }
+
+/// Leave behind each VRAM that carries both forms. For a device state
+/// that two forms push past the message limit.
+pub(crate) fn drop_both_forms(
+    emulated: &mut [DeviceStatePayload],
+    log: &slog::Logger,
+) -> bool {
+    let mut dropped = false;
+    for vram in vrams(emulated) {
+        if vram.as_ref().is_some_and(|v| !v.zstd.is_empty()) {
+            slog::warn!(
+                log,
+                "fbuf: device state too big for an older peer, VRAM not \
+                 carried"
+            );
+            *vram = None;
+            dropped = true;
+        }
+    }
+    dropped
+}
+
+fn legacy_zstd(v: &FbufMigrateVram) -> Result<Vec<u8>, MigrateError> {
+    let raw = lz4_decompress(v)?;
+    zstd::bulk::compress(&raw, ZSTD_LEVEL)
+        .map_err(|e| MigrateError::State(format!("fbuf: compress VRAM: {e}")))
+}
+
+// Both forms at the cap, as base64, leave room in one message for the
+// rest of the device state.
+const _: () = assert!(
+    2 * FbufMigrateVram::WIRE_CAP.div_ceil(3) * 4
+        <= crate::limits::MAX_SERIALIZED_BYTES - 2 * 1024 * 1024
+);
 
 /// Leave each VRAM with only its LZ4 form, from either form the source
 /// sent.

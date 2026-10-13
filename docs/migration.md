@@ -52,11 +52,11 @@ the guest set (width and height), and its VRAM. The VRAM is a separate
 The source reads it after the vCPUs pause, cuts it after the last page
 that is not zero, compresses it with LZ4 and sends it with the device
 state. To a peer before v12 it also sends a zstd frame of the same
-bytes, so both kinds of older build read it. A console or a plain desktop compresses to a few KiB. If the
-compressed VRAM is over 2 MiB, the source leaves it out so the device
-state stays under the message limit. The destination then starts with
-black VRAM and the right mode, and the screen comes back as the guest
-draws again.
+bytes, so both kinds of older build read it. A console or a plain
+desktop compresses to a few KiB. If the compressed VRAM is over 2 MiB,
+the source leaves it out so the device state stays under the message
+limit. The destination then starts with black VRAM and the right mode,
+and the screen comes back as the guest draws again.
 
 The VNC socket path and password come from the destination's own `-s`
 spec, which `migrate-config` gives. They are not on the wire. VNC
@@ -413,13 +413,14 @@ than migration time.
 
 ### Host clock skew
 
-The guest clock moves by the skew between the two hosts: the time
-import counts the wall-clock gap as time the guest was paused. Propolis
-assumes synced clocks. From v10 the source sends its wall clock in the
-preamble (from v12 the destination refuses a source without it), and the destination compares it with its own before a single
-page moves. It logs the skew, warns over 1 s, and refuses over 60 s.
-`migrate-status` on the destination shows it as
-`migrate_clock_skew_ms`, positive when the destination is ahead.
+The guest clock moves by the skew between the two hosts: the time import
+counts the wall-clock gap as time the guest was paused. Propolis assumes
+synced clocks. From v10 the source sends its wall clock in the preamble
+(from v12 the destination refuses a source without it), and the
+destination compares it with its own before a single page moves. It logs
+the skew, warns over 1 s, and refuses over 60 s. `migrate-status` on the
+destination shows it as `migrate_clock_skew_ms`, positive when the
+destination is ahead.
 
 ## Guest memory
 

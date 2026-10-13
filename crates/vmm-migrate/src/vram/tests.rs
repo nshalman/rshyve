@@ -231,3 +231,29 @@ fn a_hostile_zstd_vram_is_refused() {
         assert!(accept(&mut p).is_err(), "len {len}");
     }
 }
+
+#[test]
+fn a_vram_the_source_cannot_read_is_left_behind() {
+    let mut p = payload(Some(FbufMigrateVram {
+        len: PAGE as u32,
+        lz4: vec![1, 2, 3],
+        zstd: Vec::new(),
+    }));
+    fit_for_peer(PROTOCOL_RON_V10, &mut p, &log()).expect("fit");
+    match &p[0].state {
+        Some(DeviceMigrateState::Fbuf(f)) => assert!(f.vram.is_none()),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn only_a_vram_with_both_forms_is_dropped_for_size() {
+    let mut p = exported();
+    assert!(!drop_both_forms(&mut p, &log()), "lz4 only stays");
+    fit_for_peer(PROTOCOL_RON_V10, &mut p, &log()).expect("fit");
+    assert!(drop_both_forms(&mut p, &log()));
+    match &p[0].state {
+        Some(DeviceMigrateState::Fbuf(f)) => assert!(f.vram.is_none()),
+        other => panic!("{other:?}"),
+    }
+}

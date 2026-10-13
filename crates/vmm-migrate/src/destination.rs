@@ -218,7 +218,10 @@ fn run_inner<S: Transport>(
     set_phase(status, MigrationPhase::DeviceState);
     let mut dev_state: DeviceState = chan.expect_serialized()?;
     not_cancelled(gate)?;
-    if let Err(e) = crate::vram::accept(&mut dev_state.emulated)
+    // The topology goes first: each VRAM conversion can allocate the
+    // whole VRAM, so only a device this VM has gets one.
+    if let Err(e) = check_entries(&dev_state, config)
+        .and_then(|()| crate::vram::accept(&mut dev_state.emulated))
         .and_then(|()| restore_devices(&dev_state, config, hooks, log))
     {
         chan.report_failure(&e, log);
@@ -431,13 +434,11 @@ fn check_topology<T: std::fmt::Display>(
     )))
 }
 
-/// Give every device the state its counterpart exported, matched by PCI
-/// address alone.
-fn restore_devices(
+/// Every entry is at an address this VM has a device at, once, and every
+/// such device has an entry.
+fn check_entries(
     dev_state: &DeviceState,
     config: &DestConfig,
-    hooks: &DestHooks,
-    log: &slog::Logger,
 ) -> Result<(), MigrateError> {
     let expected: BTreeMap<WireBdf, &str> = config
         .devices
@@ -478,6 +479,18 @@ fn restore_devices(
             bdf, expected[bdf],
         )));
     }
+    Ok(())
+}
+
+/// Give every device the state its counterpart exported, matched by PCI
+/// address alone.
+fn restore_devices(
+    dev_state: &DeviceState,
+    config: &DestConfig,
+    hooks: &DestHooks,
+    log: &slog::Logger,
+) -> Result<(), MigrateError> {
+    check_entries(dev_state, config)?;
 
     if dev_state.hyperv.is_none() && config.hyperv {
         return Err(MigrateError::State(

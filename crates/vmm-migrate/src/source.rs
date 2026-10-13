@@ -55,7 +55,7 @@ use crate::converge::Precopy;
 use crate::cpu;
 use crate::cutover::{Cutover, Gated};
 use crate::late::Owners;
-use crate::limits::{BATCH_SIZE, ZSTD_LEVEL};
+use crate::limits::{BATCH_SIZE, MAX_SERIALIZED_BYTES, ZSTD_LEVEL};
 use crate::pages::{
     are_contiguous, build_contiguous_gpas, page_buffer_len, read_pages,
 };
@@ -524,7 +524,14 @@ fn run_inner<S: Transport>(
     slog::info!(log, "exporting device state";
         "devices" => dev_state.emulated.len(),
         "platform" => dev_state.platform.len());
-    chan.send_uncommitted(gate, &Message::serialized(&dev_state)?)?;
+    let mut msg = Message::serialized(&dev_state)?;
+    let too_big = |m: &Message| matches!(m, Message::Serialized(d) if d.len() > MAX_SERIALIZED_BYTES);
+    if too_big(&msg)
+        && crate::vram::drop_both_forms(&mut dev_state.emulated, log)
+    {
+        msg = Message::serialized(&dev_state)?;
+    }
+    chan.send_uncommitted(gate, &msg)?;
 
     // ── RamPull (none needed) ──
     set_phase(status, MigrationPhase::RamPull);
