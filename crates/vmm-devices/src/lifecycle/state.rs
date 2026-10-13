@@ -312,11 +312,18 @@ impl VirtioDeviceMigrateState {
     /// The kind name the error messages use.
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Sound(_) => "virtio-snd",
-            Self::Gpu(_) => "virtio-gpu",
+            Self::Sound(_) => SOUND_KIND,
+            Self::Gpu(_) => GPU_KIND,
         }
     }
 }
+
+/// virtio-snd's device kind: its `type_name`, and what the migration
+/// protocol looks for.
+pub const SOUND_KIND: &str = "virtio-snd";
+
+/// virtio-gpu's device kind, as [`SOUND_KIND`] is virtio-snd's.
+pub const GPU_KIND: &str = "virtio-gpu";
 
 /// A virtio-snd device's one output stream, as the driver set it up.
 ///

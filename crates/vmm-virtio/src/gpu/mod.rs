@@ -1913,7 +1913,7 @@ impl VirtioDevice for VirtioGpu {
             Some(VirtioDeviceMigrateState::Gpu(s)) => s,
             Some(other) => {
                 return Err(DeviceStateError::WrongKind {
-                    want: "virtio-gpu",
+                    want: vmm_devices::lifecycle::GPU_KIND,
                     got: other.kind(),
                 })
             }
@@ -2057,7 +2057,7 @@ impl VirtioDevice for VirtioGpu {
 
 impl Lifecycle for VirtioGpu {
     fn type_name(&self) -> &'static str {
-        "virtio-gpu"
+        vmm_devices::lifecycle::GPU_KIND
     }
 
     /// Answer every waiting flip, and every one that comes until the

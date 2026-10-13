@@ -101,10 +101,10 @@ pub const FRAMEBUFFER_KIND: &str = "framebuffer";
 pub const XHCI_KIND: &str = "xhci";
 
 /// The device kind of virtio-gpu.
-pub const GPU_KIND: &str = "virtio-gpu";
+pub const GPU_KIND: &str = vmm_devices::lifecycle::GPU_KIND;
 
 /// The device kind of virtio-snd.
-pub const SOUND_KIND: &str = "virtio-snd";
+pub const SOUND_KIND: &str = vmm_devices::lifecycle::SOUND_KIND;
 
 /// The device kind of the fault-injection test device.
 pub const TEST_FAULT_KIND: &str = vmm_devices::testdev::KIND;

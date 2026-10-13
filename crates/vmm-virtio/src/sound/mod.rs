@@ -840,7 +840,7 @@ impl VirtioDevice for VirtioSound {
             Some(VirtioDeviceMigrateState::Sound(s)) => s,
             Some(other) => {
                 return Err(DeviceStateError::WrongKind {
-                    want: "virtio-snd",
+                    want: vmm_devices::lifecycle::SOUND_KIND,
                     got: other.kind(),
                 })
             }
@@ -876,7 +876,7 @@ impl VirtioDevice for VirtioSound {
 
 impl Lifecycle for VirtioSound {
     fn type_name(&self) -> &'static str {
-        "virtio-snd"
+        vmm_devices::lifecycle::SOUND_KIND
     }
 
     /// Hand back every message, and every one that arrives until the

@@ -97,6 +97,7 @@ pub use state::{
     SoundMigrateState, TestFaultMigrateState, UartMigrateState,
     VirtioDeviceMigrateState, VirtioMigrateQueue, VirtioMigrateState, WireBdf,
     XhciMigrateEventRing, XhciMigrateRing, XhciMigrateState, XhciMigrateTablet,
+    GPU_KIND, SOUND_KIND,
 };
 
 /// General trait for emulated devices in the system.
