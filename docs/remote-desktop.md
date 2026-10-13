@@ -88,15 +88,13 @@ What the guest needs:
 
 - Linux with `virtio_gpu`, `virtio_snd`, `xhci_hcd` and `usbhid`.
 - A Wayland compositor or X server on the virtio-gpu output. Best is
-  one that puts the pointer on the hardware cursor plane: RDP then sends
-  the pointer's image to the client, which draws it at its own mouse
-  position with no round trip. Since Linux 6.8 virtio_gpu offers that
+  one that puts the pointer on the hardware cursor plane: RDP, and a VNC
+  client that takes the Cursor pseudo-encoding, then get the pointer's
+  image and draw it at their own mouse position with no round trip. Since Linux 6.8 virtio_gpu offers that
   plane only to a compositor that sets
   `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`; sway (wlroots) does. A
   compositor that draws the pointer into the picture works too, with
-  the pointer as laggy as the picture. VNC does not forward the
-  hardware cursor yet, so a VNC client sees no pointer on a guest that
-  uses it.
+  the pointer as laggy as the picture.
 - An audio server that opens the card, such as PipeWire with
   WirePlumber; with it, the VirtIO card is the default sink.
 

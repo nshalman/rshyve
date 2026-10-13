@@ -20,13 +20,15 @@ use std::time::Duration;
 use anyhow::Context;
 use vmm_core::unixsock::accept::accept_loop;
 use vmm_core::unixsock::write_all_bounded;
-use vmm_devices::display::{changed_tiles, DisplaySource, Pixels, Rect};
+use vmm_devices::display::{
+    changed_tiles, CursorShape, DisplaySource, Pixels, Rect,
+};
 use vmm_devices::input::scale_to_tablet;
 use vmm_devices::InputBroker;
 
 use rfb::{
     ClientMessage, PixelFormat, RectHeader, EDS_REASON_CLIENT,
-    EDS_REASON_SERVER, EDS_STATUS_OK, EDS_STATUS_PROHIBITED,
+    EDS_REASON_SERVER, EDS_STATUS_OK, EDS_STATUS_PROHIBITED, ENCODING_CURSOR,
     ENCODING_DESKTOP_SIZE, ENCODING_EXTENDED_DESKTOP_SIZE, ENCODING_RAW,
     ENCODING_ZRLE,
 };
@@ -219,6 +221,14 @@ struct ClientView {
     /// Whether a frame was skipped with the damage it took, so the next
     /// update sends the whole display.
     repaint: bool,
+    /// Whether the client listed the Cursor pseudo-encoding, and so draws
+    /// the guest's pointer itself.
+    cursor: bool,
+    /// The pointer's serial the client was last sent, if any.
+    cursor_sent: Option<u64>,
+    /// Whether the client draws a pointer image the guest gave, which a
+    /// pointer the guest takes back must hide.
+    cursor_shown: bool,
 }
 
 /// What a client asked for in a FramebufferUpdateRequest.
@@ -268,6 +278,13 @@ fn dispatch_client_message(
                 slog::warn!(dev.log, "client encodings do not include Raw, updates may not display correctly");
             }
             view.desktop_size = encs.contains(&ENCODING_DESKTOP_SIZE);
+            let cursor = encs.contains(&ENCODING_CURSOR);
+            if cursor && !view.cursor {
+                // A client that starts drawing the pointer needs it now.
+                view.cursor_sent = None;
+                view.cursor_shown = false;
+            }
+            view.cursor = cursor;
             let extended = encs.contains(&ENCODING_EXTENDED_DESKTOP_SIZE);
             if extended && !view.extended_desktop_size {
                 // The client sends SetDesktopSize only once it has seen
@@ -366,6 +383,9 @@ fn handle_vnc_client(
         zrle: None,
         shadow: None,
         repaint: false,
+        cursor: false,
+        cursor_sent: None,
+        cursor_shown: false,
     };
 
     // One thread serves both halves: it polls for client messages with a
@@ -481,6 +501,10 @@ fn send_framebuffer_update(
         sent = true;
     }
 
+    if view.cursor && send_cursor(dev, writer, view)? {
+        sent = true;
+    }
+
     // The rectangle may not exceed the client's framebuffer.
     let send_w = width.min(view.width);
     let send_h = height.min(view.height);
@@ -593,6 +617,49 @@ fn send_framebuffer_update(
         }
     }
 
+    Ok(true)
+}
+
+/// Send the guest's pointer to a client that draws it, if it changed
+/// since the client was last sent it; whether anything was sent.
+///
+/// A pointer the guest hides is the empty cursor. So is the default,
+/// once the client was sent an image: the guest then draws its own, or
+/// none, and the client would go on drawing the old one.
+fn send_cursor(
+    dev: &Arc<VncServer>,
+    writer: &mut VncWriter<'_>,
+    view: &mut ClientView,
+) -> io::Result<bool> {
+    let serial = dev.source.cursor_serial();
+    if view.cursor_sent == Some(serial) {
+        return Ok(false);
+    }
+    view.cursor_sent = Some(serial);
+    let shape = dev.source.cursor();
+    let image = match &shape {
+        CursorShape::Image(image) => {
+            let size = |v: u32| u16::try_from(v).ok();
+            match (
+                size(image.hot_x),
+                size(image.hot_y),
+                size(image.width),
+                size(image.height),
+            ) {
+                (Some(hx), Some(hy), Some(w), Some(h)) => {
+                    Some((hx, hy, w, h, &image.pixels[..]))
+                }
+                // No device makes one this large; it is not sent.
+                _ => return Ok(false),
+            }
+        }
+        CursorShape::Hidden => None,
+        CursorShape::Default if view.cursor_shown => None,
+        CursorShape::Default => return Ok(false),
+    };
+    view.cursor_shown = image.is_some();
+    rfb::write_fb_update_header(writer, 1)?;
+    rfb::write_cursor(writer, image)?;
     Ok(true)
 }
 
@@ -854,6 +921,15 @@ mod tests {
                     pixels = wire[at..at + len].to_vec();
                     at += len;
                 }
+                if rect.encoding == ENCODING_CURSOR {
+                    // Pixels, then a mask of whole bytes a row.
+                    let (w, h) =
+                        (usize::from(rect.width), usize::from(rect.height));
+                    let len =
+                        w * h * BYTES_PER_PIXEL as usize + w.div_ceil(8) * h;
+                    pixels = wire[at..at + len].to_vec();
+                    at += len;
+                }
                 rects.push((rect, pixels));
             }
         }
@@ -892,6 +968,9 @@ mod tests {
             zrle: None,
             shadow: None,
             repaint: false,
+            cursor: false,
+            cursor_sent: None,
+            cursor_shown: false,
         };
         let rects = sent_rects(&dev, &mut view);
         assert_eq!(rects.len(), 2, "{rects:?}");
@@ -1573,6 +1652,176 @@ mod tests {
         assert_eq!((next[0].width, next[0].height), (w as u16, h as u16));
     }
 
+    /// A display with a pointer the test sets, and damage only when the
+    /// test says.
+    struct Pointed {
+        fb: Arc<Framebuffer>,
+        cursor: Mutex<(u64, CursorShape)>,
+        damaged: AtomicBool,
+    }
+
+    impl DisplaySource for Pointed {
+        fn size(&self) -> (u32, u32) {
+            self.fb.size()
+        }
+
+        fn take_damage(&self) -> Option<Rect> {
+            let damaged = self.damaged.swap(false, Ordering::SeqCst);
+            self.fb.take_damage().filter(|_| damaged)
+        }
+
+        fn read_rect(&self, r: Rect, dst: &mut [u8]) -> io::Result<()> {
+            self.fb.read_rect(r, dst)
+        }
+
+        fn cursor_serial(&self) -> u64 {
+            self.cursor.lock().unwrap().0
+        }
+
+        fn cursor(&self) -> CursorShape {
+            self.cursor.lock().unwrap().1.clone()
+        }
+    }
+
+    fn pointed() -> (Arc<Pointed>, Arc<VncServer>) {
+        let source = Arc::new(Pointed {
+            fb: make_test_dev(),
+            cursor: Mutex::new((0, CursorShape::Default)),
+            damaged: AtomicBool::new(false),
+        });
+        let dev = Arc::new(VncServer::new(
+            Arc::clone(&source) as Arc<dyn DisplaySource>,
+            Path::new("/nonexistent/fbuf.vnc"),
+            None,
+            Arc::new(InputBroker::default()),
+            slog::Logger::root(slog::Discard, slog::o!()),
+        ));
+        (source, dev)
+    }
+
+    /// A 2x2 pointer with its hotspot at (1, 0): opaque red, clear,
+    /// clear, opaque blue.
+    fn arrow() -> CursorShape {
+        CursorShape::Image(Arc::new(vmm_devices::display::CursorImage {
+            width: 2,
+            height: 2,
+            hot_x: 1,
+            hot_y: 0,
+            pixels: vec![
+                0, 0, 255, 255, 0, 0, 0, 0, //
+                0, 0, 0, 0, 255, 0, 0, 255,
+            ],
+        }))
+    }
+
+    /// A client that draws the pointer gets the guest's image once, in
+    /// the server's pixel format, with its hotspot and a mask of the
+    /// opaque pixels; nothing more until the pointer changes.
+    #[test]
+    fn a_new_pointer_goes_to_a_client_that_draws_it() {
+        let (source, dev) = pointed();
+        let (w, h) = source.size();
+        let mut view = announced(w as u16, h as u16);
+        view.cursor = true;
+        view.shadow = Some(vec![0; w as usize * h as usize * 4]);
+        *source.cursor.lock().unwrap() = (1, arrow());
+
+        let sent = sent_update(&dev, &mut view, UpdateRequest::Incremental);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let (rect, data) = &sent[0];
+        assert_eq!(
+            (rect.x, rect.y, rect.width, rect.height, rect.encoding),
+            (1, 0, 2, 2, ENCODING_CURSOR)
+        );
+        assert_eq!(
+            data,
+            &[
+                0,
+                0,
+                255,
+                0,
+                0,
+                0,
+                0,
+                0, //
+                0,
+                0,
+                0,
+                0,
+                255,
+                0,
+                0,
+                0, //
+                0b1000_0000,
+                0b0100_0000,
+            ]
+        );
+        let again = sent_update(&dev, &mut view, UpdateRequest::Incremental);
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    /// A hidden pointer is an empty cursor; so is a pointer the guest
+    /// takes back after it gave one, which the client would otherwise go
+    /// on drawing. A client that never had one is sent nothing.
+    #[test]
+    fn a_hidden_or_taken_back_pointer_is_an_empty_cursor() {
+        use CursorShape;
+
+        let (source, dev) = pointed();
+        let (w, h) = source.size();
+        let mut view = announced(w as u16, h as u16);
+        view.cursor = true;
+        view.shadow = Some(vec![0; w as usize * h as usize * 4]);
+        let empty = (0, 0, 0, 0, ENCODING_CURSOR);
+        let headers = |view: &mut ClientView| {
+            sent_update(&dev, view, UpdateRequest::Incremental)
+                .into_iter()
+                .map(|(r, _)| (r.x, r.y, r.width, r.height, r.encoding))
+                .collect::<Vec<_>>()
+        };
+
+        assert!(headers(&mut view).is_empty(), "the default, never sent");
+        *source.cursor.lock().unwrap() = (1, CursorShape::Hidden);
+        assert_eq!(headers(&mut view), [empty]);
+        *source.cursor.lock().unwrap() = (2, arrow());
+        assert_eq!(headers(&mut view)[0].4, ENCODING_CURSOR);
+        *source.cursor.lock().unwrap() = (3, CursorShape::Default);
+        assert_eq!(headers(&mut view), [empty]);
+    }
+
+    /// A client that did not list the Cursor pseudo-encoding keeps its
+    /// own pointer, and is sent no cursor.
+    #[test]
+    fn a_client_without_the_cursor_encoding_is_sent_no_pointer() {
+        let (source, dev) = pointed();
+        let (w, h) = source.size();
+        let mut view = announced(w as u16, h as u16);
+        view.shadow = Some(vec![0; w as usize * h as usize * 4]);
+        *source.cursor.lock().unwrap() = (1, arrow());
+        assert!(
+            sent_update(&dev, &mut view, UpdateRequest::Incremental).is_empty()
+        );
+    }
+
+    /// SetEncodings with Cursor makes the client one that draws it.
+    #[test]
+    fn set_encodings_with_cursor_turns_it_on() {
+        let dev = serve(&make_test_dev());
+        let mut view = announced(8, 8);
+        dispatch_client_message(
+            &dev,
+            &mut view,
+            ClientMessage::SetEncodings(vec![ENCODING_RAW, ENCODING_CURSOR]),
+        );
+        assert!(view.cursor);
+        dispatch_client_message(
+            &dev,
+            &mut view,
+            ClientMessage::SetEncodings(vec![ENCODING_RAW]),
+        );
+        assert!(!view.cursor);
+    }
+
     /// A client that was told `width` x `height` and offered no
     /// DesktopSize.
     fn announced(width: u16, height: u16) -> ClientView {
@@ -1586,6 +1835,9 @@ mod tests {
             zrle: None,
             shadow: None,
             repaint: false,
+            cursor: false,
+            cursor_sent: None,
+            cursor_shown: false,
         }
     }
 }

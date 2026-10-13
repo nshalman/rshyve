@@ -68,6 +68,11 @@ pub const ENCODING_RAW: i32 = 0;
 /// ZRLE: zlib-compressed tiles (RFC 6143 7.7.6).
 pub const ENCODING_ZRLE: i32 = 16;
 
+/// Cursor pseudo-encoding (RFC 6143 7.8.1): a client that lists it draws
+/// the pointer itself, from an image and a 1-bit mask the server sends
+/// when the pointer changes.
+pub const ENCODING_CURSOR: i32 = -239;
+
 /// DesktopSize pseudo-encoding: a client that lists it accepts a new
 /// framebuffer size in a rectangle header.
 pub const ENCODING_DESKTOP_SIZE: i32 = -223;
@@ -424,6 +429,58 @@ pub enum ClientMessage {
     /// SetDesktopSize. The screen layout is read and dropped: one
     /// display has one screen.
     SetDesktopSize { width: u16, height: u16 },
+}
+
+/// Write a Cursor rectangle (RFB 7.8.1): `width` x `height` pixels with
+/// the hotspot at (`hot_x`, `hot_y`), from `bgra` (bytes B, G, R, A,
+/// rows top to bottom), as the server's XRGB8888 and a mask of the
+/// pixels whose alpha is at least half. `None` is the empty cursor,
+/// which hides the client's pointer.
+pub fn write_cursor<W: Write>(
+    w: &mut W,
+    cursor: Option<(u16, u16, u16, u16, &[u8])>,
+) -> io::Result<()> {
+    let Some((hot_x, hot_y, width, height, bgra)) = cursor else {
+        return w.write_all(
+            &RectHeader {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                encoding: ENCODING_CURSOR,
+            }
+            .to_bytes(),
+        );
+    };
+    let (cols, rows) = (usize::from(width), usize::from(height));
+    if bgra.len() != cols * rows * 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cursor pixels do not match its size",
+        ));
+    }
+    w.write_all(
+        &RectHeader {
+            x: hot_x,
+            y: hot_y,
+            width,
+            height,
+            encoding: ENCODING_CURSOR,
+        }
+        .to_bytes(),
+    )?;
+    let mut pixels = Vec::with_capacity(bgra.len());
+    let row_bytes = cols.div_ceil(8);
+    let mut mask = vec![0u8; row_bytes * rows];
+    for (i, px) in bgra.as_chunks::<4>().0.iter().enumerate() {
+        pixels.extend_from_slice(&[px[0], px[1], px[2], 0]);
+        if px[3] >= 0x80 {
+            let (row, col) = (i / cols, i % cols);
+            mask[row * row_bytes + col / 8] |= 0x80 >> (col % 8);
+        }
+    }
+    w.write_all(&pixels)?;
+    w.write_all(&mask)
 }
 
 /// Write an ExtendedDesktopSize rectangle (RFB 7.8.2) describing one
