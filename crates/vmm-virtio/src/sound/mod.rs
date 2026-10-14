@@ -45,6 +45,22 @@ use super::queue::{ChainBuf, VirtQueue, VirtioCompletion};
 use super::VirtioDevice;
 use protocol::*;
 
+/// DTrace probes for the playback path; `tools/audio-rate.d` reads
+/// them with the RDP server's.
+#[usdt::provider(provider = "vmm")]
+mod probes {
+    /// The guest's message was queued to play. `ahead_us` is the audio
+    /// already queued before it; `gap_us` is the silence before it when
+    /// the clock had run out, an underrun.
+    fn snd_tx(bytes: u64, ahead_us: u64, gap_us: u64) {}
+    /// The pacer sent a message's audio to the sink, `late_us` after it
+    /// was to start.
+    fn snd_play(bytes: u64, late_us: u64) {}
+    /// The pacer handed a message back, `late_us` after its audio had
+    /// played.
+    fn snd_done(late_us: u64) {}
+}
+
 pub const CONFIG_SIZE: u16 = 16;
 
 /// Largest hardware buffer a driver may ask for: over five seconds of
@@ -156,9 +172,12 @@ impl Playing {
     /// Queue a message to play once the audio before it has, and to go
     /// back once its own has.
     fn schedule(&mut self, tag: RingTag, head: u16, status: u64, pcm: Vec<u8>) {
-        let starts = self
-            .clock
-            .map_or_else(Instant::now, |c| c.max(Instant::now()));
+        let now = Instant::now();
+        probes::snd_tx!(|| {
+            let (ahead, gap) = lead(self.clock, now);
+            (pcm.len() as u64, micros(ahead), micros(gap))
+        });
+        let starts = self.clock.map_or(now, |c| c.max(now));
         let due = starts + play_time(pcm.len());
         self.clock = Some(due);
         self.queue.push_back(Pending {
@@ -592,6 +611,20 @@ fn chmap_info() -> ChmapInfo {
 }
 
 /// How long `bytes` of the one PCM format take to play.
+/// The audio queued ahead of a message scheduled at `now` on `clock`,
+/// and the silence before it when the clock has run out.
+fn lead(clock: Option<Instant>, now: Instant) -> (Duration, Duration) {
+    match clock {
+        Some(c) if c >= now => (c - now, Duration::ZERO),
+        Some(c) => (Duration::ZERO, now - c),
+        None => (Duration::ZERO, Duration::ZERO),
+    }
+}
+
+fn micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
+
 fn play_time(bytes: usize) -> Duration {
     Duration::from_nanos(
         bytes as u64 * 1_000_000_000 / u64::from(pcm_bytes_per_second()),
@@ -654,13 +687,22 @@ fn pace(shared: &Shared) {
             if p.starts > now {
                 break;
             }
-            sounding.extend(p.pcm.take());
+            if let Some(pcm) = p.pcm.take() {
+                probes::snd_play!(|| (
+                    pcm.len() as u64,
+                    micros(now.saturating_duration_since(p.starts))
+                ));
+                sounding.push(pcm);
+            }
         }
         let mut ready = Vec::new();
         while let Some(front) = playing.queue.front() {
             if front.due > now {
                 break;
             }
+            probes::snd_done!(|| micros(
+                now.saturating_duration_since(front.due)
+            ));
             ready.extend(playing.queue.pop_front());
         }
         if !sounding.is_empty() || !ready.is_empty() {

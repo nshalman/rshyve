@@ -27,6 +27,15 @@ use vmm_devices::audio::{
 
 use crate::bridge::OutboundBacklog;
 
+/// DTrace probes for the waves; `tools/audio-rate.d` reads them.
+#[usdt::provider(provider = "vmm")]
+mod probes {
+    /// A wave was made. `sent` is 1 when it went to the server loop and
+    /// 0 when it was dropped, the connection having `backlog` bytes
+    /// unread, over the cap.
+    fn rdpsnd_wave(bytes: u64, backlog: u64, sent: u8) {}
+}
+
 /// How much audio one wave carries: 40 ms.
 ///
 /// The guest plays in buffers of about 10 ms, and IronRDP's server keeps
@@ -113,10 +122,20 @@ impl AudioSink for Sound {
                 // IronRDP sends waves without waiting for the client to
                 // confirm them, so one far behind loses audio here.
                 if backlog.over_cap() {
+                    probes::rdpsnd_wave!(|| (
+                        wave.len() as u64,
+                        backlog.bytes(),
+                        0
+                    ));
                     continue;
                 }
                 backlog.queued(wave.len());
             }
+            probes::rdpsnd_wave!(|| (
+                wave.len() as u64,
+                st.backlog.as_ref().map_or(0, |b| b.bytes()),
+                1
+            ));
             if let Some(sender) = &st.sender {
                 // A send fails only once the server has stopped.
                 let _ = sender.send(ServerEvent::Rdpsnd(

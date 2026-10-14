@@ -195,6 +195,15 @@ impl InboundBudget {
     }
 }
 
+/// DTrace probes for what goes out to the client; `tools/audio-rate.d`
+/// reads them.
+#[usdt::provider(provider = "vmm")]
+mod probes {
+    /// The bridge wrote `bytes` to the client, which took `write_us`;
+    /// `backlog` is what the connection still has unwritten.
+    fn rdp_write(bytes: u64, write_us: u64, backlog: u64) {}
+}
+
 /// One connection's EGFX frame and audio bytes handed to the server
 /// loop, less what the bridge has written to the client. IronRDP queues
 /// those without limit: a client that suspends its frame
@@ -349,13 +358,20 @@ pub(crate) fn bridge(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         writing.start();
+                        let began = Instant::now();
                         let wrote = outbound.write_all(&buf[..n]);
+                        let took = began.elapsed();
                         writing.stop();
                         if let Err(e) = wrote {
                             slog::debug!(log_out, "RDP client write failed"; "error" => %e);
                             break;
                         }
                         backlog.written(n);
+                        probes::rdp_write!(|| (
+                            n as u64,
+                            u64::try_from(took.as_micros()).unwrap_or(u64::MAX),
+                            backlog.bytes()
+                        ));
                     }
                 }
             }

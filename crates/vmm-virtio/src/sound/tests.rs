@@ -1061,3 +1061,15 @@ fn a_stream_the_device_could_not_reach_is_refused() {
             .is_err()
     );
 }
+
+/// What `snd_tx` reports: the audio already queued ahead of a message,
+/// or, when the clock had run out, the silence before it.
+#[test]
+fn a_message_sees_the_audio_ahead_of_it_or_the_gap_before_it() {
+    let ms = Duration::from_millis;
+    let now = Instant::now() + ms(1000);
+    assert_eq!(lead(None, now), (Duration::ZERO, Duration::ZERO));
+    assert_eq!(lead(Some(now + ms(30)), now), (ms(30), Duration::ZERO));
+    assert_eq!(lead(Some(now), now), (Duration::ZERO, Duration::ZERO));
+    assert_eq!(lead(Some(now - ms(12)), now), (Duration::ZERO, ms(12)));
+}
