@@ -31,6 +31,9 @@ changed default, a removed feature, or a security fix.
 - `rshyve --ring-config <path>`: MantaBlock ring disks and migration
   settings from a file, so a VM with several ring disks fits the brand's
   `bhyve-extra-opts` limit. See `docs/migration-gate.md`.
+- `rshyve --migrate-protocols` prints the migration stream versions the
+  build speaks, one per line. The control plane uses it to find a version
+  both hosts speak before a live migration.
 
 ### Changed
 

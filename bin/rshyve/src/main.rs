@@ -850,6 +850,14 @@ fn version_string() -> String {
     format!("{version} ({commit})")
 }
 
+/// Whether the argv is `rshyve --migrate-protocols` and nothing else.
+/// The control plane runs it to find a common migration stream version
+/// between two hosts. It must be the only argument, so that it never
+/// ends a VM run by accident.
+fn migrate_protocols_requested(args: &[OsString]) -> bool {
+    matches!(args, [_, flag] if flag == "--migrate-protocols")
+}
+
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
     let exe = std::env::current_exe().unwrap_or_else(|_| {
@@ -858,6 +866,12 @@ fn main() -> ExitCode {
 
     if vmm_machine::entry::version_requested(&args) {
         println!("rshyve {}", version_string());
+        return ExitCode::SUCCESS;
+    }
+    if migrate_protocols_requested(&args) {
+        for protocol in vmm_migrate::protocol::SOURCE_OFFER {
+            println!("{protocol}");
+        }
         return ExitCode::SUCCESS;
     }
     vmm_machine::entry::register_probes("rshyve");
@@ -916,6 +930,29 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use clap::FromArgMatches;
+
+    fn argv(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn migrate_protocols_is_answered_only_alone() {
+        assert!(migrate_protocols_requested(&argv(&[
+            "rshyve",
+            "--migrate-protocols"
+        ])));
+        assert!(!migrate_protocols_requested(&argv(&["rshyve"])));
+        assert!(!migrate_protocols_requested(&argv(&[
+            "rshyve",
+            "--migrate-protocols",
+            "guest"
+        ])));
+        assert!(!migrate_protocols_requested(&argv(&[
+            "rshyve",
+            "-s",
+            "--migrate-protocols"
+        ])));
+    }
 
     fn cli_from(args: &[&str]) -> Cli {
         let matches = Cli::command_named("rshyve")

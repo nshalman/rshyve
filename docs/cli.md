@@ -33,6 +33,7 @@ These flags match the existing C bhyve interface used by `boot.c`:
 | `--migrate-listen <ADDR:PORT>` | Destination mode: wait for incoming migration |
 | `--control-socket <PATH>` | Unix socket for management commands |
 | `--cpu-baseline <PROFILE>` | CPU feature mask: `host`, `avx2`, `sse42` |
+| `--migrate-protocols` | Print the migration stream versions this build sends and takes, one per line, newest first, then exit. It must be the only argument |
 
 ### Hotplug
 
