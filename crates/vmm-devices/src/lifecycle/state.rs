@@ -185,13 +185,37 @@ pub struct FbufMigrateState {
 
 /// The start of the VRAM, LZ4-compressed (block format). VRAM past
 /// `len` is zero.
+///
+/// Builds before v12 sent v8 to v10 with only `zstd` (a zstd frame of
+/// the same bytes) or only `lz4`, under the same version string. A
+/// source sends both to a peer before v12, so either build reads it,
+/// and a destination takes either. `vmm-migrate` does the zstd side, so
+/// the device crates stay free of a C codec.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FbufMigrateVram {
     pub len: u32,
     // RON writes a plain Vec<u8> as a list of decimal numbers, about
     // four times the bytes. As bytes it is base64.
-    #[serde(with = "wire_bytes")]
+    #[serde(default, with = "wire_bytes")]
     pub lz4: Vec<u8>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "wire_bytes"
+    )]
+    pub zstd: Vec<u8>,
+}
+
+impl FbufMigrateVram {
+    /// The size of the VRAM segment, which bounds `len`.
+    pub const MAX_LEN: u32 = 16 * 1024 * 1024;
+
+    /// The largest compressed VRAM the device state carries, per field.
+    ///
+    /// The whole device state is one message of at most 8 MiB, and RON
+    /// writes these bytes as base64, so two fields at this cap still
+    /// fit.
+    pub const WIRE_CAP: usize = 2 * 1024 * 1024;
 }
 
 impl fmt::Debug for FbufMigrateVram {
@@ -199,6 +223,7 @@ impl fmt::Debug for FbufMigrateVram {
         f.debug_struct("FbufMigrateVram")
             .field("len", &self.len)
             .field("lz4_len", &self.lz4.len())
+            .field("zstd_len", &self.zstd.len())
             .finish()
     }
 }

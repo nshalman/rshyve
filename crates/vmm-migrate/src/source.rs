@@ -55,7 +55,7 @@ use crate::converge::Precopy;
 use crate::cpu;
 use crate::cutover::{Cutover, Gated};
 use crate::late::Owners;
-use crate::limits::{BATCH_SIZE, ZSTD_LEVEL};
+use crate::limits::{BATCH_SIZE, MAX_SERIALIZED_BYTES, ZSTD_LEVEL};
 use crate::pages::{
     are_contiguous, build_contiguous_gpas, page_buffer_len, read_pages,
 };
@@ -497,7 +497,7 @@ fn run_inner<S: Transport>(
     };
     let owners =
         |(emulated, _): &Exported| Owners::new(&memctx.guest_ram(), emulated);
-    let (final_dirty, (emulated, platform)) = final_pass(
+    let (final_dirty, (mut emulated, platform)) = final_pass(
         chan, &mut track, memctx, gate, status, export, owners, log,
     )?;
     slog::info!(log, "post-pause"; "dirty" => final_dirty);
@@ -517,13 +517,21 @@ fn run_inner<S: Transport>(
         v10_peer,
         log,
     )?;
+    crate::vram::fit_for_peer(&sel.protocol, &mut emulated, log)?;
     dev_state.emulated = emulated;
     dev_state.platform = platform;
     dev_state.hyperv = hyperv;
     slog::info!(log, "exporting device state";
         "devices" => dev_state.emulated.len(),
         "platform" => dev_state.platform.len());
-    chan.send_uncommitted(gate, &Message::serialized(&dev_state)?)?;
+    let mut msg = Message::serialized(&dev_state)?;
+    let too_big = |m: &Message| matches!(m, Message::Serialized(d) if d.len() > MAX_SERIALIZED_BYTES);
+    if too_big(&msg)
+        && crate::vram::drop_both_forms(&mut dev_state.emulated, log)
+    {
+        msg = Message::serialized(&dev_state)?;
+    }
+    chan.send_uncommitted(gate, &msg)?;
 
     // ── RamPull (none needed) ──
     set_phase(status, MigrationPhase::RamPull);

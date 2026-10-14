@@ -57,6 +57,10 @@ changed default, a removed feature, or a security fix.
   A disk whose driver answers the probe with ENOTSUP and whose cache is
   off or not controllable is accepted with no-op flushes. Only a zvol's
   write cache is changed; other disks are left as found.
+- The live migration stream is `vmm-migrate-ron/12`. Builds before it
+  sent the framebuffer VRAM as zstd or as LZ4, and v10 with or without
+  the source wall clock, under one version string. A v12 build sends
+  both VRAM forms to a v8 to v10 peer and takes either from one.
 
 ### Security
 
